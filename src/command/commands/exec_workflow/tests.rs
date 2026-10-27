@@ -3397,6 +3397,54 @@ fn discover_previous_dynamic_run_finds_both_halves() {
     assert_eq!(found.state.work_item, Some(12));
 }
 
+#[test]
+fn remote_dynamic_resume_finds_the_saved_run_under_the_clone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let clone = tmp.path().join("clone");
+    std::fs::create_dir_all(&clone).unwrap();
+    git_in(&clone, &["init"]);
+    let clone = clone.canonicalize().unwrap();
+    let mut session = Session::for_tests_isolated(&clone, &tmp.path().join("config-home"));
+    session.set_session_type(crate::data::session::SessionType::Remote {
+        repo_url: "https://example.com/repo.git".into(),
+        branch: "work".into(),
+        cloned_path: clone.clone(),
+    });
+    let cmd = ExecWorkflowCommand::new(
+        make_dynamic_flags(true, None, Some("0012"), None, false, None),
+        Engines::for_tests(&tmp.path().join("home")),
+        session,
+    );
+
+    let state_root = cmd.workflow_state_root_for(&clone);
+    assert_eq!(state_root, clone);
+    let workflow_path = crate::data::fs::WorkflowDirs::dynamic_workflow_path(&state_root, 12);
+    std::fs::create_dir_all(workflow_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &workflow_path,
+        "title = \"saved\"\nagent = \"claude\"\n\n[[step]]\nname = \"a\"\nprompt = \"go\"\n",
+    )
+    .unwrap();
+    let store = crate::data::workflow_state_store::WorkflowStateStore::at_git_root(&state_root);
+    let (mut state, _) = resume_fixture(&["a"], &[StepState::Pending]);
+    state.workflow_name = "saved".into();
+    state.work_item = Some(12);
+    store.save(&state).unwrap();
+
+    let mut frontend = FakeExecWorkflowFrontend::new()
+        .answering_resume(WorkflowResumeDecision::ResumeFrom("a".into()));
+    let outcome = cmd.offer_dynamic_resume(&clone, 12, &mut frontend).unwrap();
+    assert!(matches!(outcome, DynamicResumeOutcome::Resume(_)));
+    assert_eq!(frontend.resume_prompts.len(), 1);
+    assert_eq!(frontend.resume_prompts[0].workflow_name, "saved");
+    assert_eq!(
+        frontend.resume_prompts[0].worktree_path.as_deref(),
+        Some(clone.as_path())
+    );
+    assert!(workflow_path.exists());
+    assert!(store.load(Some(12), "saved").unwrap().is_some());
+}
+
 // ─── agentFlags through a real workflow run ──────────────────────────────
 
 /// A container-class runtime that records the agent argv of every launch the

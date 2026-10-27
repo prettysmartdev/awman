@@ -579,7 +579,7 @@ Teardown steps are defined in a `[[teardown]]` (TOML) or `teardown:` (YAML) arra
 | `run_shell` | `command` (string, required), `env` (object, optional) | Execute a shell command. |
 | `run_script` | `path` (string, required), `env` (object, optional) | Execute a shell script file. |
 | `commit_changes` | `message` (string, required), `add_all` (boolean, optional) | Commit staged changes. If `add_all` is `true`, runs `git add -A` first. |
-| `push_branch` | `remote` (string, optional), `branch` (string, optional) | Push the current branch to a remote. Omit both to use `git push` with defaults. |
+| `push_branch` | `remote` (string, optional), `branch` (string, optional) | Push the current branch to a remote and set it as the upstream (`git push -u`). `remote` defaults to `origin` and `branch` to the current branch (`HEAD`), so omitting both runs `git push -u -- origin HEAD`. The branch field accepts a branch name, not options or force refspecs. |
 | `create_pull_request` | `title` (string, optional), `body` (string, optional), `base` (string, optional) | Create a pull request using the GitHub CLI. If `base` is provided, it sets the branch the PR will be opened against (via the `--base` flag). Requires `gh` to be available in the base container image. |
 | `poll_ci` | `interval_secs` (integer, optional), `max_retries` (integer, optional) | Poll GitHub for the CI run status of the current branch. Waits for the CI run to complete. `interval_secs` controls the polling interval in seconds (default: 30). `max_retries` limits the number of polling attempts (default: 10). See [Polling CI status](#polling-ci-status) for details. |
 

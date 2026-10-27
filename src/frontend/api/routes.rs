@@ -30,9 +30,10 @@ use crate::command::session_create::{
 };
 use crate::command::session_setup::{SessionSetup, SessionSetupPresenter};
 use crate::data::execution_event::{EventPayload, ExecutionEvent};
-use crate::data::fs::api_db::NewSessionRow;
+use crate::data::fs::api_db::{NewSessionRow, RemoteSessionFields, SessionRecord};
 use crate::data::fs::api_db::{SessionCommandAdmission, SqliteSessionStore};
 use crate::data::fs::api_paths::ApiPaths;
+use crate::data::session::SessionKind;
 use crate::data::session_manager::SessionManager;
 use crate::data::session_setup_event::SessionSetupStatus;
 use crate::data::session_setup_event::SetupEventPayload;
@@ -101,6 +102,15 @@ struct CreateSessionRequest {
     /// Optional branch (defaults to remote default when `remote`).
     #[serde(default)]
     branch: Option<String>,
+    /// Remote only: start point for a branch that does not exist on origin.
+    #[serde(default)]
+    base_ref: Option<String>,
+    /// Remote only: branch names merged into the session branch at setup.
+    #[serde(default)]
+    merge_refs: Vec<String>,
+    /// Remote only: push the session branch after a successful command.
+    #[serde(default)]
+    push: bool,
 }
 
 #[derive(Serialize)]
@@ -116,6 +126,34 @@ struct SessionResponse {
     status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     closed_at: Option<String>,
+    session_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repo_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    branch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    base_ref: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    merge_refs: Vec<String>,
+    push: bool,
+}
+
+impl From<SessionRecord> for SessionResponse {
+    fn from(s: SessionRecord) -> Self {
+        Self {
+            id: s.id,
+            workdir: s.workdir,
+            created_at: s.created_at,
+            status: s.status,
+            closed_at: s.closed_at,
+            session_type: s.session_type,
+            repo_url: s.repo_url,
+            branch: s.branch,
+            base_ref: s.base_ref,
+            merge_refs: s.merge_refs,
+            push: s.push,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -286,6 +324,9 @@ async fn handle_create_session(
         workdir: body.workdir,
         repo_url: body.repo_url,
         branch: body.branch,
+        base_ref: body.base_ref,
+        merge_refs: body.merge_refs,
+        push: body.push,
     };
     let policy = SessionCreatePolicy::new(state.workdirs.clone(), session_dir.clone());
     let plan = match request.validate(&policy) {
@@ -294,6 +335,12 @@ async fn handle_create_session(
             return (session_create_error_status(&e), error_json(e.to_string())).into_response();
         }
     };
+    if let Err(e) = plan
+        .validate_merge_ref_kinds(Arc::clone(&state.engines.git_engine))
+        .await
+    {
+        return (session_create_error_status(&e), error_json(e.to_string())).into_response();
+    }
 
     // Create session storage directories (Layer 0).
     if let Err(e) = state.paths.prepare_session_dirs(&session_id) {
@@ -328,6 +375,27 @@ async fn handle_create_session(
             error_json("Failed to create session"),
         )
             .into_response();
+    }
+    // Record the remote inputs before setup starts, so a restored session
+    // keeps them (and the push stage can read `push` from the row).
+    if plan.kind == SessionKind::Remote {
+        if let Err(e) = state.store.set_remote_fields(
+            &session_id,
+            RemoteSessionFields {
+                repo_url: plan.repo_url.as_deref(),
+                branch: plan.branch.as_deref(),
+                base_ref: plan.base_ref.as_deref(),
+                merge_refs: &plan.merge_refs,
+                push: plan.push,
+            },
+        ) {
+            tracing::error!(error = %e, "Failed to record remote session fields");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_json("Failed to create session"),
+            )
+                .into_response();
+        }
     }
 
     let setup_bus = Arc::new(SessionSetupBus::new(256));
@@ -449,16 +517,8 @@ async fn handle_list_sessions(
 ) -> Response {
     match state.store.list_sessions_by_status(query.status.as_deref()) {
         Ok(sessions) => {
-            let list: Vec<SessionResponse> = sessions
-                .into_iter()
-                .map(|s| SessionResponse {
-                    id: s.id,
-                    workdir: s.workdir,
-                    created_at: s.created_at,
-                    status: s.status,
-                    closed_at: s.closed_at,
-                })
-                .collect();
+            let list: Vec<SessionResponse> =
+                sessions.into_iter().map(SessionResponse::from).collect();
             Json(serde_json::json!({ "sessions": list })).into_response()
         }
         Err(e) => {
@@ -477,14 +537,7 @@ async fn handle_get_session(
     AxumPath(id): AxumPath<String>,
 ) -> Response {
     match state.store.get_session(&id) {
-        Ok(Some(s)) => Json(SessionResponse {
-            id: s.id,
-            workdir: s.workdir,
-            created_at: s.created_at,
-            status: s.status,
-            closed_at: s.closed_at,
-        })
-        .into_response(),
+        Ok(Some(s)) => Json(SessionResponse::from(s)).into_response(),
         Ok(None) => (
             StatusCode::NOT_FOUND,
             error_json(format!("Session '{}' not found", id)),
@@ -525,7 +578,7 @@ async fn handle_close_session(
             message: "Session is already closing. Poll GET /v1/sessions/{id}/status to monitor.".to_string(),
         }).into_response(),
         Ok(CloseOutcome::Closed) => match state.store.get_session(&id) {
-            Ok(Some(session)) => Json(SessionResponse { id: session.id, workdir: session.workdir, created_at: session.created_at, status: session.status, closed_at: session.closed_at }).into_response(),
+            Ok(Some(session)) => Json(SessionResponse::from(session)).into_response(),
             _ => StatusCode::NO_CONTENT.into_response(),
         },
         Err(error) => {
@@ -1395,6 +1448,16 @@ mod tests {
             12,
             "route count mismatch — update EXPECTED_ROUTES"
         );
+    }
+
+    #[test]
+    fn create_session_request_defaults_remote_fields_when_omitted() {
+        let request: CreateSessionRequest =
+            serde_json::from_str(r#"{"session_type":"remote","repo_url":"git://example/repo"}"#)
+                .unwrap();
+        assert_eq!(request.base_ref, None);
+        assert!(request.merge_refs.is_empty());
+        assert!(!request.push);
     }
 
     #[tokio::test]

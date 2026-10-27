@@ -30,7 +30,7 @@ pub(crate) enum DynamicDiscoveryMiss {
     Unusable(String),
 }
 
-/// Look for a resumable dynamic run inside `worktree_path`.
+/// Look for a resumable dynamic run inside a worktree or remote clone.
 ///
 /// A run is resumable only as a pair — the leader's `workflow.toml` and the
 /// engine state that references it. Neither half present is
@@ -154,22 +154,22 @@ pub(crate) struct DynamicExecution {
     workflow: Workflow,
     workflow_path: PathBuf,
     work_item_context: WorkItemContext,
-    /// Session re-rooted at the worktree; agent/image validation runs against it.
+    /// Session rooted at the worktree or remote clone; agent/image validation uses it.
     worktree_session: Session,
     paths: crate::data::RepoDockerfilePaths,
     git_root_for_scope: PathBuf,
     cwd: PathBuf,
     base_session: Session,
     mount_path: PathBuf,
-    worktree_path: PathBuf,
-    lifecycle: WorktreeLifecycle,
+    worktree_path: Option<PathBuf>,
+    lifecycle: Option<WorktreeLifecycle>,
     worktree_git_mount: Option<crate::engine::container::options::OverlaySpec>,
     skip_state_resume_prompt: bool,
     frontend: SharedWorkflowFrontend,
 }
 
 /// Copy the leader's generated `workflow.toml` to its stable per-work-item path
-/// inside the worktree. Best-effort: a failure costs a later resume, never the
+/// inside the run checkout. Best-effort: a failure costs a later resume, never the
 /// run in progress.
 pub(crate) fn save_dynamic_workflow_copy(
     state_git_root: &Path,
@@ -306,30 +306,38 @@ impl ExecWorkflowCommand {
         };
 
         // ── Worktree prepare BEFORE launching the leader (WI-0092 §5). ──────
-        if base_session.session_type().is_remote() {
-            return Err(CommandError::Other(
-                "dynamic workflows are not supported for remote sessions".into(),
-            ));
-        }
-        let git_root = self
-            .engines
-            .git_engine
-            .resolve_root(&cwd)
-            .map_err(CommandError::from)?;
-        let lifecycle = WorktreeLifecycle::for_work_item(
-            Arc::clone(&self.engines.git_engine),
-            git_root,
-            wi_number,
-        )?;
+        let remote_clone = base_session.session_type().is_remote();
+        let lifecycle = if remote_clone {
+            frontend.write_message(UserMessage {
+                level: MessageLevel::Info,
+                text: "Skipping worktree creation for remote session — repo is already isolated."
+                    .into(),
+            });
+            None
+        } else {
+            let git_root = self
+                .engines
+                .git_engine
+                .resolve_root(&cwd)
+                .map_err(CommandError::from)?;
+            Some(WorktreeLifecycle::for_work_item(
+                Arc::clone(&self.engines.git_engine),
+                git_root,
+                wi_number,
+            )?)
+        };
 
         // ── Resumable previous run? (WI-0115 §2) ────────────────────────────
         //
         // A dynamic run stashes its generated workflow.toml beside the engine's
-        // state file inside its own worktree. Both survive a Ctrl-C abort and
-        // both die with the worktree, so an existing worktree is the one place
-        // worth looking before paying for another leader-design pass.
+        // state file inside its own worktree or remote clone. Both survive a
+        // Ctrl-C abort and both die with that checkout.
+        let resume_root = lifecycle
+            .as_ref()
+            .map(|lifecycle| lifecycle.worktree_path())
+            .unwrap_or(&git_root_for_scope);
         let resume_plan = match frontend
-            .with(|frontend| self.offer_dynamic_resume(&lifecycle, wi_number, frontend))?
+            .with(|frontend| self.offer_dynamic_resume(resume_root, wi_number, frontend))?
         {
             DynamicResumeOutcome::Resume(plan) => Some(plan),
             DynamicResumeOutcome::Fresh => None,
@@ -349,32 +357,44 @@ impl ExecWorkflowCommand {
             }
         };
 
-        let (lifecycle, worktree_path) = frontend
-            .prepare_worktree(
-                lifecycle,
-                // A confirmed resume is an answer to the existing-worktree
-                // question; asking it again would be the same question twice.
-                resume_plan.is_some().then_some(
+        let (lifecycle, run_root, worktree_path, worktree_git_mount) = match lifecycle {
+            Some(lifecycle) => {
+                // A confirmed resume answers the existing-worktree question.
+                let decision = resume_plan.is_some().then_some(
                     crate::command::commands::worktree_lifecycle::ExistingWorktreeDecision::Resume,
-                ),
-            )
-            .await?;
-        let mount_path = worktree_path.clone();
-        let worktree_git_mount = worktree_git_overlay(&mount_path)?;
-        let state_git_root = self.workflow_state_root_for(&worktree_path);
+                );
+                let (lifecycle, worktree_path) =
+                    frontend.prepare_worktree(lifecycle, decision).await?;
+                let worktree_git_mount = worktree_git_overlay(&worktree_path)?;
+                (
+                    Some(lifecycle),
+                    worktree_path.clone(),
+                    Some(worktree_path),
+                    worktree_git_mount,
+                )
+            }
+            None => {
+                // The clone has a real .git directory and no parent checkout
+                // to merge into. No git overlay or finalization is needed.
+                (None, git_root_for_scope.clone(), None, None)
+            }
+        };
+        let mount_path = run_root.clone();
+        let state_git_root = self.workflow_state_root_for(&run_root);
 
-        // Re-root a session at the worktree so the leader operates on the
-        // isolated checkout.
-        let leader_git_root = self
-            .engines
-            .git_engine
-            .resolve_root(&worktree_path)
-            .map_err(CommandError::from)?;
-        // The base session's builtin block, default agent, env and global
-        // config carry over: the worktree checkout lacks uncommitted edits.
-        let leader_session =
-            Session::open_worktree_for(worktree_path.clone(), leader_git_root, &self.session)
-                .map_err(|e| CommandError::Other(format!("opening worktree session: {e}")))?;
+        let leader_session = if remote_clone {
+            base_session.clone()
+        } else {
+            // Re-root at the worktree, carrying over the invoking session's
+            // builtin block, default agent, env and global config.
+            let leader_git_root = self
+                .engines
+                .git_engine
+                .resolve_root(&run_root)
+                .map_err(CommandError::from)?;
+            Session::open_worktree_for(run_root.clone(), leader_git_root, &self.session)
+                .map_err(|e| CommandError::Other(format!("opening worktree session: {e}")))?
+        };
 
         let paths = crate::data::RepoDockerfilePaths::new(&git_root_for_scope);
 
@@ -446,7 +466,7 @@ impl ExecWorkflowCommand {
             )
         })?;
 
-        // The work item path the leader sees is inside the mounted worktree.
+        // The work item path the leader sees is inside the mounted checkout.
         let wi_relative = wi_file
             .strip_prefix(&git_root_for_scope)
             .unwrap_or(&wi_file);
@@ -558,16 +578,9 @@ impl ExecWorkflowCommand {
             dynamic_cfg.as_ref().and_then(|d| d.guidance.as_deref()),
         );
 
-        // Record the worktree's clean baseline so we can detect a leader that
+        // Record the run checkout's baseline so we can detect a leader that
         // illicitly modifies source files (WI-0092 §7 mutation guard).
-        // `uncommitted_files` is `git status --porcelain` through the engine
-        // (F-39); comparing the `Vec<String>` is the same comparison the raw
-        // string was, without a second shell-out of our own.
-        let worktree_baseline = self
-            .engines
-            .git_engine
-            .uncommitted_files(&worktree_path)
-            .unwrap_or_default();
+        let run_baseline = self.engines.git_engine.checkout_fingerprint(&run_root)?;
 
         // ── Wrap the frontend so the agent run + yolo ticks can share it. ───
         let shared = frontend.clone();
@@ -630,7 +643,7 @@ impl ExecWorkflowCommand {
                     return Ok(ExecWorkflowOutcome {
                         workflow: format!("dynamic-{wi_number:04}"),
                         exit_code: None,
-                        worktree_used: true,
+                        worktree_used: worktree_path.is_some(),
                     });
                 }
                 LeaderDriveOutcome::Restart => {
@@ -647,16 +660,16 @@ impl ExecWorkflowCommand {
             }
 
             // Mutation guard: the leader may only write under the context dir.
-            let after = self
-                .engines
-                .git_engine
-                .uncommitted_files(&worktree_path)
-                .unwrap_or_default();
-            if after != worktree_baseline {
+            let after = self.engines.git_engine.checkout_fingerprint(&run_root)?;
+            if after != run_baseline {
+                let checkout = if remote_clone {
+                    "session clone"
+                } else {
+                    "worktree"
+                };
                 return Err(CommandError::Other(format!(
-                    "leader agent modified files in the worktree; dynamic pre-flight may only \
-                     write under the workflow context directory. Changed worktree status:\n{}",
-                    after.join("\n")
+                    "leader agent modified files in the {checkout}; dynamic pre-flight may only \
+                     write under the workflow context directory. The checkout's HEAD or file contents changed."
                 )));
             }
 
@@ -680,7 +693,7 @@ impl ExecWorkflowCommand {
             }
         };
 
-        // Stash the generated workflow inside the worktree so a failed run can
+        // Stash the generated workflow inside the checkout so a failed run can
         // be resumed without a second leader-design pass (WI-0115 §2).
         save_dynamic_workflow_copy(&state_git_root, wi_number, &generated_path);
 
@@ -724,20 +737,19 @@ impl ExecWorkflowCommand {
     /// `Fresh` clears the previous run and designs a new workflow, and `Cancel`
     /// backs out of the command with the previous run untouched.
     ///
-    /// `Fresh` is also the answer when there is no worktree to look inside;
-    /// when the worktree is there but the run cannot be reconstructed the user
+    /// `Fresh` is also the answer when there is no checkout to look inside;
+    /// when the checkout is there but the run cannot be reconstructed the user
     /// is told why before the fresh design starts.
     pub(crate) fn offer_dynamic_resume(
         &self,
-        lifecycle: &WorktreeLifecycle,
+        run_root: &Path,
         work_item: u32,
         frontend: &mut dyn ExecWorkflowCommandFrontend,
     ) -> Result<DynamicResumeOutcome, CommandError> {
-        let worktree_path = lifecycle.worktree_path();
-        if !worktree_path.exists() {
+        if !run_root.exists() {
             return Ok(DynamicResumeOutcome::Fresh);
         }
-        let state_root = self.workflow_state_root_for(worktree_path);
+        let state_root = self.workflow_state_root_for(run_root);
 
         let previous = match discover_previous_dynamic_run(&state_root, work_item) {
             Ok(p) => p,
@@ -772,7 +784,7 @@ impl ExecWorkflowCommand {
         let prompt = WorkflowResumePrompt::new(
             crate::engine::workflow::workflow_name_for(&previous.workflow),
             Some(work_item),
-            Some(worktree_path.to_path_buf()),
+            Some(run_root.to_path_buf()),
             true,
             completed_step_count(&previous.state),
             previous.state.step_states.len(),
@@ -911,8 +923,8 @@ impl ExecWorkflowCommand {
             work_item_context: Some(work_item_context),
             cli_typed,
             mount_path,
-            worktree_path: Some(worktree_path),
-            worktree_lifecycle: Some(lifecycle),
+            worktree_path,
+            worktree_lifecycle: lifecycle,
             worktree_git_mount,
             git_root_for_scope,
             cwd,

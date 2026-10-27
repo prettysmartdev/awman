@@ -42,6 +42,14 @@ pub struct SessionCreateRequest {
     pub repo_url: Option<String>,
     /// Optional branch to check out (remote only).
     pub branch: Option<String>,
+    /// Remote only. Branch, tag or sha the session branch is created from when
+    /// `branch` does not yet exist on origin.
+    pub base_ref: Option<String>,
+    /// Remote only. Branch names merged into the session branch, in order,
+    /// before the session is ready. Empty when absent.
+    pub merge_refs: Vec<String>,
+    /// Remote only. Push the session branch after a successful command.
+    pub push: bool,
 }
 
 /// The security policy a [`SessionCreateRequest`] is validated against. Carries
@@ -86,6 +94,40 @@ pub struct SessionCreatePlan {
     pub repo_url: Option<String>,
     /// Branch for remote sessions; `None` for local (or unspecified).
     pub branch: Option<String>,
+    /// Start point for a new session branch; `None` for local (or unspecified).
+    pub base_ref: Option<String>,
+    /// Branches merged into the session branch at setup; empty for local.
+    pub merge_refs: Vec<String>,
+    /// Push the session branch after a successful command; `false` for local.
+    pub push: bool,
+}
+
+impl SessionCreatePlan {
+    /// A bare tag and branch have the same spelling. Check advertised namespaces
+    /// before accepting tag-only merge targets; missing names still fail setup.
+    pub async fn validate_merge_ref_kinds(
+        &self,
+        git: std::sync::Arc<crate::engine::git::GitEngine>,
+    ) -> Result<(), CommandError> {
+        if self.merge_refs.is_empty() {
+            return Ok(());
+        }
+        let Some(url) = self.repo_url.clone() else {
+            return Ok(());
+        };
+        let refs = self.merge_refs.clone();
+        let invalid = tokio::task::spawn_blocking(move || git.tag_only_merge_ref(&url, &refs))
+            .await
+            .map_err(|e| CommandError::Other(e.to_string()))??;
+        if let Some(value) = invalid {
+            return Err(CommandError::SessionRefInvalid {
+                field: "merge_refs",
+                value,
+                reason: "a tag is not a branch on origin".into(),
+            });
+        }
+        Ok(())
+    }
 }
 
 impl SessionCreateRequest {
@@ -100,6 +142,11 @@ impl SessionCreateRequest {
     ///   the allowlist comparison so no frontend can bypass symlink resolution.
     /// - `remote` requires a non-empty `repo_url` whose scheme is on the
     ///   policy's accepted list.
+    /// - `base_ref`, `merge_refs` and `push` are remote-only
+    ///   ([`CommandError::SessionFieldRemoteOnly`]) and each requires `branch`
+    ///   ([`CommandError::SessionFieldRequiresBranch`]). `branch` and every
+    ///   `merge_refs` entry must pass [`is_valid_branch_name`]; `base_ref` must
+    ///   pass [`is_valid_ref_spelling`] ([`CommandError::SessionRefInvalid`]).
     pub fn validate(
         &self,
         policy: &SessionCreatePolicy,
@@ -114,6 +161,19 @@ impl SessionCreateRequest {
 
         match kind {
             SessionKind::Local => {
+                // The WI 0133 fields only act on awman's own clone. `repo_url`
+                // and `branch` stay silently ignored here, as they always were.
+                if self.base_ref.is_some() {
+                    return Err(CommandError::SessionFieldRemoteOnly { field: "base_ref" });
+                }
+                if !self.merge_refs.is_empty() {
+                    return Err(CommandError::SessionFieldRemoteOnly {
+                        field: "merge_refs",
+                    });
+                }
+                if self.push {
+                    return Err(CommandError::SessionFieldRemoteOnly { field: "push" });
+                }
                 let workdir_in = self
                     .workdir
                     .as_deref()
@@ -141,6 +201,9 @@ impl SessionCreateRequest {
                     cloned_path: None,
                     repo_url: None,
                     branch: None,
+                    base_ref: None,
+                    merge_refs: Vec::new(),
+                    push: false,
                 })
             }
             SessionKind::Remote => {
@@ -159,6 +222,64 @@ impl SessionCreateRequest {
                 if !scheme_ok {
                     return Err(CommandError::SessionRepoUrlInvalidScheme { url: repo_url });
                 }
+                let branch = match self.branch.as_deref().map(str::trim) {
+                    Some(b) => {
+                        branch_name_problem(b).map_or(Ok(()), |reason| {
+                            Err(CommandError::SessionRefInvalid {
+                                field: "branch",
+                                value: b.to_string(),
+                                reason,
+                            })
+                        })?;
+                        Some(b.to_string())
+                    }
+                    None => None,
+                };
+                // base_ref, merge_refs and push all act on "the session branch".
+                // Without one the clone sits on the default branch, and a push
+                // would go straight to it, so require it rather than document it.
+                let base_ref = match self.base_ref.as_deref().map(str::trim) {
+                    Some(b) => {
+                        if branch.is_none() {
+                            return Err(CommandError::SessionFieldRequiresBranch {
+                                field: "base_ref",
+                            });
+                        }
+                        ref_spelling_problem(b).map_or(Ok(()), |reason| {
+                            Err(CommandError::SessionRefInvalid {
+                                field: "base_ref",
+                                value: b.to_string(),
+                                reason,
+                            })
+                        })?;
+                        Some(b.to_string())
+                    }
+                    None => None,
+                };
+                if !self.merge_refs.is_empty() && branch.is_none() {
+                    return Err(CommandError::SessionFieldRequiresBranch {
+                        field: "merge_refs",
+                    });
+                }
+                let mut merge_refs = Vec::with_capacity(self.merge_refs.len());
+                for entry in &self.merge_refs {
+                    let r = entry.trim();
+                    let problem = branch_name_problem(r).or_else(|| {
+                        (r.len() >= 7 && r.len() <= 64 && r.bytes().all(|b| b.is_ascii_hexdigit()))
+                            .then(|| "a commit sha is not a branch name".to_string())
+                    });
+                    if let Some(reason) = problem {
+                        return Err(CommandError::SessionRefInvalid {
+                            field: "merge_refs",
+                            value: entry.clone(),
+                            reason,
+                        });
+                    }
+                    merge_refs.push(r.to_string());
+                }
+                if self.push && branch.is_none() {
+                    return Err(CommandError::SessionFieldRequiresBranch { field: "push" });
+                }
                 let folder = repo_folder_from_url(&repo_url);
                 let cloned = policy.clone_base_dir.join(&folder);
                 Ok(SessionCreatePlan {
@@ -166,7 +287,10 @@ impl SessionCreateRequest {
                     resolved_workdir: cloned.clone(),
                     cloned_path: Some(cloned),
                     repo_url: Some(repo_url),
-                    branch: self.branch.clone(),
+                    branch,
+                    base_ref,
+                    merge_refs,
+                    push: self.push,
                 })
             }
         }
@@ -192,6 +316,88 @@ pub fn repo_folder_from_url(url: &str) -> String {
     } else {
         safe
     }
+}
+
+/// Whether `name` is acceptable as a session `branch` or a `merge_refs` entry.
+///
+/// Pure and hermetic (no git spawn): `git check-ref-format --branch` restated,
+/// plus three awman rules. A sha is not a branch, a `refs/...` spelling is not
+/// a bare branch name, and an `origin/` prefix would double up because the
+/// merge target is already `origin/<name>`. Tag-only names are checked against
+/// the remote's advertisements by `validate_merge_ref_kinds` before acceptance.
+pub fn is_valid_branch_name(name: &str) -> bool {
+    branch_name_problem(name).is_none()
+}
+
+/// Whether `name` is acceptable as a `base_ref`: any branch, tag, sha or
+/// `origin/x`, so only the spellings that could never be a ref or that would
+/// inject a `git` option are refused. Git resolves it at setup.
+pub fn is_valid_ref_spelling(name: &str) -> bool {
+    ref_spelling_problem(name).is_none()
+}
+
+/// Shared by both ref rules: empty, control bytes, spaces, leading `-`.
+fn basic_ref_problem(name: &str) -> Option<String> {
+    if name.is_empty() {
+        return Some("must not be empty".to_string());
+    }
+    if name.bytes().any(|b| b < 0x20 || b == 0x7f) {
+        return Some("must not contain control characters".to_string());
+    }
+    if name.contains(' ') {
+        return Some("must not contain spaces".to_string());
+    }
+    if name.starts_with('-') {
+        return Some("must not start with '-'".to_string());
+    }
+    None
+}
+
+fn ref_spelling_problem(name: &str) -> Option<String> {
+    basic_ref_problem(name)
+}
+
+fn branch_name_problem(name: &str) -> Option<String> {
+    if let Some(problem) = basic_ref_problem(name) {
+        return Some(problem);
+    }
+    if let Some(c) = name
+        .chars()
+        .find(|c| matches!(c, '~' | '^' | ':' | '?' | '*' | '[' | '\\'))
+    {
+        return Some(format!("must not contain '{c}'"));
+    }
+    if name.contains("..") {
+        return Some("must not contain '..'".to_string());
+    }
+    if name.contains("@{") {
+        return Some("must not contain '@{'".to_string());
+    }
+    if name == "@" || name == "HEAD" {
+        return Some("must not be '@' or 'HEAD'".to_string());
+    }
+    if name.starts_with('/') || name.ends_with('/') || name.contains("//") {
+        return Some("must not start or end with '/' or contain '//'".to_string());
+    }
+    if name.ends_with('.') {
+        return Some("must not end with '.'".to_string());
+    }
+    if name
+        .split('/')
+        .any(|part| part.starts_with('.') || part.ends_with(".lock"))
+    {
+        return Some("no path component may start with '.' or end with '.lock'".to_string());
+    }
+    if (name.len() == 40 || name.len() == 64) && name.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Some("a commit sha is not a branch name".to_string());
+    }
+    if name.starts_with("refs/") {
+        return Some("give the bare branch name, not a 'refs/' path".to_string());
+    }
+    if name.starts_with("origin/") {
+        return Some("give the bare branch name; 'origin/' is implied".to_string());
+    }
+    None
 }
 
 #[cfg(test)]
@@ -274,6 +480,7 @@ mod validate_tests {
             workdir: workdir.map(|s| s.to_string()),
             repo_url: None,
             branch: None,
+            ..Default::default()
         }
     }
 
@@ -283,6 +490,7 @@ mod validate_tests {
             workdir: None,
             repo_url: repo_url.map(|s| s.to_string()),
             branch: Some("main".to_string()),
+            ..Default::default()
         }
     }
 
@@ -470,5 +678,162 @@ mod validate_tests {
             matches!(err, CommandError::SessionRepoUrlInvalidScheme { .. }),
             "got {err:?}"
         );
+    }
+
+    // ── WI 0133: base_ref / merge_refs / push ────────────────────────────────
+
+    fn remote_with(edit: impl FnOnce(&mut SessionCreateRequest)) -> SessionCreateRequest {
+        let mut req = remote(Some("https://host.invalid/org/repo.git"));
+        edit(&mut req);
+        req
+    }
+
+    #[test]
+    fn remote_only_fields_on_local_name_the_field() {
+        let workdir = tempfile::tempdir().unwrap();
+        let canon = workdir.path().canonicalize().unwrap();
+        let path = workdir.path().to_str().unwrap();
+        let cases: [(&str, Box<dyn Fn(&mut SessionCreateRequest)>); 3] = [
+            ("base_ref", Box::new(|r| r.base_ref = Some("main".into()))),
+            (
+                "merge_refs",
+                Box::new(|r| r.merge_refs = vec!["feat".into()]),
+            ),
+            ("push", Box::new(|r| r.push = true)),
+        ];
+        for (name, edit) in cases {
+            let mut req = local(Some(path));
+            edit(&mut req);
+            let err = req.validate(&policy(vec![canon.clone()])).unwrap_err();
+            assert!(
+                matches!(err, CommandError::SessionFieldRemoteOnly { field } if field == name),
+                "{name}: got {err:?}"
+            );
+            assert_eq!(err.http_status(), 400);
+        }
+    }
+
+    #[test]
+    fn remote_fields_require_branch() {
+        let cases: [(&str, Box<dyn Fn(&mut SessionCreateRequest)>); 3] = [
+            ("base_ref", Box::new(|r| r.base_ref = Some("main".into()))),
+            (
+                "merge_refs",
+                Box::new(|r| r.merge_refs = vec!["feat".into()]),
+            ),
+            ("push", Box::new(|r| r.push = true)),
+        ];
+        for (name, edit) in cases {
+            let req = remote_with(|r| {
+                r.branch = None;
+                edit(r);
+            });
+            let err = req.validate(&policy(vec![])).unwrap_err();
+            assert!(
+                matches!(err, CommandError::SessionFieldRequiresBranch { field } if field == name),
+                "{name}: got {err:?}"
+            );
+            assert_eq!(err.http_status(), 400);
+        }
+    }
+
+    #[test]
+    fn remote_plan_carries_the_new_fields() {
+        let plan = remote_with(|r| {
+            r.branch = Some(" feature/x ".into());
+            r.base_ref = Some("v1.2.0".into());
+            r.merge_refs = vec!["a".into(), " b ".into()];
+            r.push = true;
+        })
+        .validate(&policy(vec![]))
+        .unwrap();
+        assert_eq!(plan.branch.as_deref(), Some("feature/x"));
+        assert_eq!(plan.base_ref.as_deref(), Some("v1.2.0"));
+        assert_eq!(plan.merge_refs, vec!["a".to_string(), "b".to_string()]);
+        assert!(plan.push);
+    }
+
+    #[test]
+    fn merge_refs_refuse_shas_refs_and_origin_prefixes() {
+        for bad in [
+            "0123456789abcdef0123456789abcdef01234567",
+            "refs/tags/v1",
+            "refs/heads/main",
+            "origin/main",
+            "-x",
+            "a..b",
+            "a b",
+            "",
+        ] {
+            let err = remote_with(|r| r.merge_refs = vec![bad.into()])
+                .validate(&policy(vec![]))
+                .unwrap_err();
+            assert!(
+                matches!(&err, CommandError::SessionRefInvalid { field: "merge_refs", value, .. } if value == bad),
+                "{bad:?}: got {err:?}"
+            );
+            assert_eq!(err.http_status(), 400);
+        }
+    }
+
+    #[test]
+    fn invalid_branch_and_base_ref_are_refused() {
+        let err = remote_with(|r| r.branch = Some("--foo".into()))
+            .validate(&policy(vec![]))
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                CommandError::SessionRefInvalid {
+                    field: "branch",
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
+        let err = remote_with(|r| r.base_ref = Some("-b".into()))
+            .validate(&policy(vec![]))
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                CommandError::SessionRefInvalid {
+                    field: "base_ref",
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn branch_name_rule() {
+        for ok in ["main", "feature/x", "release-1.2", "a@b", "deadbeef"] {
+            assert!(is_valid_branch_name(ok), "{ok} should be valid");
+        }
+        for bad in [
+            "", "@", "a~b", "a^b", "a:b", "a?b", "a*b", "a[b", "a\\b", "a@{b", "/a", "a/", "a//b",
+            "a.", ".a", "a/.b", "a.lock", "a/b.lock", "refs/x", "origin/x", "-a", "a\tb",
+        ] {
+            assert!(!is_valid_branch_name(bad), "{bad:?} should be invalid");
+        }
+        let sha256 = "a".repeat(64);
+        assert!(!is_valid_branch_name(&sha256));
+    }
+
+    #[test]
+    fn ref_spelling_rule() {
+        for ok in [
+            "main",
+            "origin/main",
+            "v1.0",
+            "0123456789abcdef0123456789abcdef01234567",
+            "HEAD~2",
+        ] {
+            assert!(is_valid_ref_spelling(ok), "{ok} should be valid");
+        }
+        for bad in ["", "-x", "a b", "a\nb"] {
+            assert!(!is_valid_ref_spelling(bad), "{bad:?} should be invalid");
+        }
     }
 }

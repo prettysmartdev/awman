@@ -143,6 +143,8 @@ pub enum SessionSetupStatus {
     Initializing,
     CloningRepository,
     SettingUpBranch,
+    /// Merging the session's `merge_refs` into its branch (WI 0133).
+    MergingRefs,
     RunningReady,
     Ready,
     Failed,
@@ -158,9 +160,24 @@ impl SessionSetupStatus {
             Self::Initializing => "initializing",
             Self::CloningRepository => "cloning_repository",
             Self::SettingUpBranch => "setting_up_branch",
+            Self::MergingRefs => "merging_refs",
             Self::RunningReady => "running_ready",
             Self::Ready => "ready",
             Self::Failed => "failed",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SessionSetupStatus;
+
+    #[test]
+    fn merging_refs_serializes_with_snake_case_status_name() {
+        assert_eq!(
+            serde_json::to_string(&SessionSetupStatus::MergingRefs).unwrap(),
+            "\"merging_refs\""
+        );
+        assert_eq!(SessionSetupStatus::MergingRefs.as_str(), "merging_refs");
     }
 }

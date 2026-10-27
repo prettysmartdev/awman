@@ -23,7 +23,7 @@ pub struct SessionRecord {
     pub status: String,
     pub closed_at: Option<String>,
     /// Async setup status, one of `initializing`, `cloning_repository`,
-    /// `setting_up_branch`, `running_ready`, `ready`, `failed`. Set on
+    /// `setting_up_branch`, `merging_refs`, `running_ready`, `ready`, `failed`. Set on
     /// session creation; updated by the setup task; consulted by the
     /// job-submission guard and the server-restart cleanup.
     pub setup_status: String,
@@ -32,6 +32,31 @@ pub struct SessionRecord {
     /// For `remote` sessions, the resolved clone destination on disk so that
     /// failure cleanup can remove the partial clone.
     pub cloned_path: Option<String>,
+    /// For `remote` sessions, the repository URL the clone was made from.
+    /// `None` on rows written before WI 0133.
+    pub repo_url: Option<String>,
+    /// For `remote` sessions, the session branch. `None` when the session
+    /// stayed on the default branch, and on rows written before WI 0133.
+    pub branch: Option<String>,
+    /// For `remote` sessions, the start point a new session branch was cut
+    /// from, as the caller gave it.
+    pub base_ref: Option<String>,
+    /// For `remote` sessions, the branches merged in at setup, in order.
+    pub merge_refs: Vec<String>,
+    /// For `remote` sessions, whether a successful command pushes the branch.
+    pub push: bool,
+}
+
+/// The remote-session inputs recorded on a row right after it is inserted
+/// (WI 0133). Kept out of [`NewSessionRow`] so local-session callers do not
+/// have to spell out five fields that never apply to them.
+#[derive(Debug, Clone, Copy)]
+pub struct RemoteSessionFields<'a> {
+    pub repo_url: Option<&'a str>,
+    pub branch: Option<&'a str>,
+    pub base_ref: Option<&'a str>,
+    pub merge_refs: &'a [String],
+    pub push: bool,
 }
 
 /// The columns a new session row is created with.
@@ -115,7 +140,43 @@ impl std::fmt::Display for WorkerId {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CommandResult {
     pub exit_code: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_status: Option<u16>,
+    /// The stage that failed when the failure was not the command itself
+    /// (`"push"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage: Option<String>,
+    /// Present (possibly `null`) on every result of a session with
+    /// `push: true`; absent when the session does not push.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present"
+    )]
+    pub pushed: Option<Option<PushedRef>>,
+}
+
+/// What the push stage pushed after a successful command (WI 0133). `None`
+/// inside [`CommandResult::pushed`] means nothing was pushed.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PushedRef {
+    /// Always `"origin"` today.
+    pub remote: String,
+    pub branch: String,
+    pub sha: String,
+}
+
+/// Read a field that is present (even as `null`) as `Some(..)`, so a double
+/// `Option` round-trips absent / `null` / value. Absent fields fall back to
+/// `#[serde(default)]` and never reach this.
+fn deserialize_present<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    serde::Deserialize::deserialize(deserializer).map(Some)
 }
 
 /// Sqlite-backed session and command store.
@@ -193,6 +254,15 @@ impl SqliteSessionStore {
             "TEXT NOT NULL DEFAULT 'local'",
         )?;
         Self::add_column_if_missing(conn, "sessions", "cloned_path", "TEXT")?;
+        // WI 0133: the remote-session inputs, so a restored session keeps them.
+        // Pre-existing rows read back as no repo_url/branch/base_ref,
+        // `merge_refs` NULL → [] and `push` 0 → false.
+        Self::add_column_if_missing(conn, "sessions", "repo_url", "TEXT")?;
+        Self::add_column_if_missing(conn, "sessions", "branch", "TEXT")?;
+        Self::add_column_if_missing(conn, "sessions", "base_ref", "TEXT")?;
+        // JSON array of branch names; NULL means none.
+        Self::add_column_if_missing(conn, "sessions", "merge_refs", "TEXT")?;
+        Self::add_column_if_missing(conn, "sessions", "push", "INTEGER NOT NULL DEFAULT 0")?;
         Self::add_column_if_missing(conn, "commands", "worker_id", "TEXT")?;
         Self::add_column_if_missing(conn, "commands", "queued_at", "TEXT")?;
         Self::add_column_if_missing(conn, "commands", "result", "TEXT")?;
@@ -265,6 +335,39 @@ impl SqliteSessionStore {
         Ok(())
     }
 
+    /// Record a remote session's inputs on its row. Called right after
+    /// [`Self::insert_session_full`] and before setup starts. Returns whether
+    /// the row existed.
+    pub fn set_remote_fields(
+        &self,
+        id: &str,
+        fields: RemoteSessionFields<'_>,
+    ) -> Result<bool, DataError> {
+        let merge_refs = if fields.merge_refs.is_empty() {
+            None
+        } else {
+            Some(
+                serde_json::to_string(fields.merge_refs)
+                    .map_err(|e| DataError::Other(format!("encode merge_refs: {e}")))?,
+            )
+        };
+        let conn = self.lock();
+        let affected = conn.execute(
+            "UPDATE sessions SET repo_url = ?1, branch = ?2, base_ref = ?3, \
+                                 merge_refs = ?4, push = ?5 \
+             WHERE id = ?6",
+            params![
+                fields.repo_url,
+                fields.branch,
+                fields.base_ref,
+                merge_refs,
+                fields.push,
+                id
+            ],
+        )?;
+        Ok(affected > 0)
+    }
+
     /// Update the setup_status for a session. Returns true if the row was
     /// updated (i.e. the session exists).
     pub fn update_setup_status(&self, id: &str, setup_status: &str) -> Result<bool, DataError> {
@@ -280,7 +383,8 @@ impl SqliteSessionStore {
         let conn = self.lock();
         let mut stmt = conn.prepare(
             "SELECT id, workdir, created_at, status, closed_at, \
-                    setup_status, session_type, cloned_path \
+                    setup_status, session_type, cloned_path, \
+                    repo_url, branch, base_ref, merge_refs, push \
              FROM sessions WHERE id = ?1",
         )?;
         let mut rows = stmt.query_map(params![id], session_record_from_row)?;
@@ -311,7 +415,8 @@ impl SqliteSessionStore {
         let conn = self.lock();
         let mut stmt = conn.prepare(
             "SELECT id, workdir, created_at, status, closed_at, \
-                    setup_status, session_type, cloned_path \
+                    setup_status, session_type, cloned_path, \
+                    repo_url, branch, base_ref, merge_refs, push \
              FROM sessions ORDER BY created_at",
         )?;
         let rows = stmt.query_map([], session_record_from_row)?;
@@ -332,7 +437,8 @@ impl SqliteSessionStore {
         let conn = self.lock();
         let mut stmt = conn.prepare(
             "SELECT id, workdir, created_at, status, closed_at, \
-                    setup_status, session_type, cloned_path \
+                    setup_status, session_type, cloned_path, \
+                    repo_url, branch, base_ref, merge_refs, push \
              FROM sessions WHERE status = ?1 ORDER BY created_at",
         )?;
         let rows = stmt.query_map(params![status], session_record_from_row)?;
@@ -344,17 +450,18 @@ impl SqliteSessionStore {
     }
 
     /// Return every session whose `setup_status` is one of the non-terminal
-    /// values — `initializing`, `cloning_repository`, `setting_up_branch`,
+    /// values — `initializing`, `cloning_repository`, `setting_up_branch`, `merging_refs`,
     /// `running_ready`. Used at startup to mark them as `failed` (the setup
     /// task was killed by the restart).
     pub fn list_sessions_with_in_progress_setup(&self) -> Result<Vec<SessionRecord>, DataError> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
             "SELECT id, workdir, created_at, status, closed_at, \
-                    setup_status, session_type, cloned_path \
+                    setup_status, session_type, cloned_path, \
+                    repo_url, branch, base_ref, merge_refs, push \
              FROM sessions \
              WHERE setup_status IN ('initializing', 'cloning_repository', \
-                                    'setting_up_branch', 'running_ready') \
+                                    'setting_up_branch', 'merging_refs', 'running_ready') \
              ORDER BY created_at",
         )?;
         let rows = stmt.query_map([], session_record_from_row)?;
@@ -787,6 +894,14 @@ fn session_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionR
         setup_status: row.get(5)?,
         session_type: row.get(6)?,
         cloned_path: row.get(7)?,
+        repo_url: row.get(8)?,
+        branch: row.get(9)?,
+        base_ref: row.get(10)?,
+        merge_refs: row
+            .get::<_, Option<String>>(11)?
+            .and_then(|json| serde_json::from_str::<Vec<String>>(&json).ok())
+            .unwrap_or_default(),
+        push: row.get(12)?,
     })
 }
 
@@ -1103,10 +1218,139 @@ mod tests {
         assert_eq!(sessions[0].id, "legacy-id-1");
         assert_eq!(sessions[0].workdir, "/old/repo");
         assert_eq!(sessions[0].status, "active");
+        // WI 0133: a pre-existing row restores with no remote fields.
+        assert_eq!(sessions[0].repo_url, None);
+        assert_eq!(sessions[0].branch, None);
+        assert_eq!(sessions[0].base_ref, None);
+        assert!(sessions[0].merge_refs.is_empty());
+        assert!(!sessions[0].push);
 
         let cmd = store.get_command("cmd-1").unwrap().unwrap();
         assert_eq!(cmd.session_id, "legacy-id-1");
         assert_eq!(cmd.subcommand, "chat");
         assert_eq!(cmd.status, "pending");
+    }
+
+    // ─── WI 0133: remote session fields ───────────────────────────────────────
+
+    fn insert_remote(store: &SqliteSessionStore, id: &str) {
+        store
+            .insert_session_full(NewSessionRow {
+                id,
+                workdir: "/clones/repo",
+                created_at: "2026-10-27T00:00:00Z",
+                setup_status: SessionSetupStatus::Initializing,
+                kind: SessionKind::Remote,
+                cloned_path: Some("/clones/repo"),
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn remote_fields_round_trip() {
+        let (_tmp, store) = make_store();
+        insert_remote(&store, "r1");
+        let merge_refs = vec!["feat-a".to_string(), "feat-b".to_string()];
+        assert!(store
+            .set_remote_fields(
+                "r1",
+                RemoteSessionFields {
+                    repo_url: Some("https://host.invalid/o/r.git"),
+                    branch: Some("job-1"),
+                    base_ref: Some("v1.0"),
+                    merge_refs: &merge_refs,
+                    push: true,
+                },
+            )
+            .unwrap());
+        let rec = store.get_session("r1").unwrap().unwrap();
+        assert_eq!(
+            rec.repo_url.as_deref(),
+            Some("https://host.invalid/o/r.git")
+        );
+        assert_eq!(rec.branch.as_deref(), Some("job-1"));
+        assert_eq!(rec.base_ref.as_deref(), Some("v1.0"));
+        assert_eq!(rec.merge_refs, merge_refs);
+        assert!(rec.push);
+        // Every SELECT reads the same columns.
+        assert_eq!(store.list_sessions().unwrap()[0], rec);
+        assert_eq!(
+            store.list_sessions_by_status(Some("active")).unwrap()[0],
+            rec
+        );
+        assert_eq!(
+            store.list_sessions_with_in_progress_setup().unwrap()[0],
+            rec
+        );
+    }
+
+    #[test]
+    fn remote_fields_default_when_unset_and_missing_row_reports_false() {
+        let (_tmp, store) = make_store();
+        insert_remote(&store, "r2");
+        let rec = store.get_session("r2").unwrap().unwrap();
+        assert_eq!(rec.repo_url, None);
+        assert!(rec.merge_refs.is_empty());
+        assert!(!rec.push);
+        let fields = RemoteSessionFields {
+            repo_url: None,
+            branch: None,
+            base_ref: None,
+            merge_refs: &[],
+            push: false,
+        };
+        assert!(!store.set_remote_fields("nope", fields).unwrap());
+    }
+
+    #[test]
+    fn merging_refs_is_an_in_progress_setup_status() {
+        let (_tmp, store) = make_store();
+        insert_remote(&store, "r3");
+        store
+            .update_setup_status("r3", SessionSetupStatus::MergingRefs.as_str())
+            .unwrap();
+        let ids: Vec<_> = store
+            .list_sessions_with_in_progress_setup()
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(ids, vec!["r3".to_string()]);
+    }
+
+    #[test]
+    fn command_result_serialises_pushed_as_absent_null_or_value() {
+        let base = CommandResult {
+            exit_code: Some(0),
+            error: None,
+            error_status: None,
+            stage: None,
+            pushed: None,
+        };
+        assert_eq!(serde_json::to_string(&base).unwrap(), r#"{"exit_code":0}"#);
+        let null = CommandResult {
+            pushed: Some(None),
+            ..base.clone()
+        };
+        let json = serde_json::to_string(&null).unwrap();
+        assert_eq!(json, r#"{"exit_code":0,"pushed":null}"#);
+        assert_eq!(serde_json::from_str::<CommandResult>(&json).unwrap(), null);
+        let pushed = CommandResult {
+            pushed: Some(Some(PushedRef {
+                remote: "origin".into(),
+                branch: "b".into(),
+                sha: "abc".into(),
+            })),
+            ..base.clone()
+        };
+        let json = serde_json::to_string(&pushed).unwrap();
+        assert_eq!(
+            serde_json::from_str::<CommandResult>(&json).unwrap(),
+            pushed
+        );
+        assert_eq!(
+            serde_json::from_str::<CommandResult>(r#"{"exit_code":0}"#).unwrap(),
+            base
+        );
     }
 }

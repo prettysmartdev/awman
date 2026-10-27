@@ -184,6 +184,24 @@ pub enum CommandError {
     #[error("repo_url must use http(s), ssh, or git scheme")]
     SessionRepoUrlInvalidScheme { url: String },
 
+    /// `base_ref`, `merge_refs` or `push` given on a local session (WI 0133).
+    #[error("{field} is only valid when session_type is 'remote'")]
+    SessionFieldRemoteOnly { field: &'static str },
+
+    /// `base_ref`, `merge_refs` or `push` given on a remote session without
+    /// `branch`: they all act on the session branch (WI 0133).
+    #[error("{field} requires branch on a remote session")]
+    SessionFieldRequiresBranch { field: &'static str },
+
+    /// A `branch`, `base_ref` or `merge_refs` entry that is not an acceptable
+    /// ref spelling (WI 0133).
+    #[error("{field} '{value}' is not a valid git ref name: {reason}")]
+    SessionRefInvalid {
+        field: &'static str,
+        value: String,
+        reason: String,
+    },
+
     // ── Remote ────────────────────────────────────────────────────────────
     #[error("no remote session id; pass --session <id> or run `awman remote session start`")]
     RemoteSessionMissing,
@@ -362,6 +380,9 @@ impl CommandError {
         | CommandError::SessionRepoUrlRequired
         | CommandError::SessionRepoUrlEmpty
         | CommandError::SessionRepoUrlInvalidScheme { .. }
+        | CommandError::SessionFieldRemoteOnly { .. }
+        | CommandError::SessionFieldRequiresBranch { .. }
+        | CommandError::SessionRefInvalid { .. }
         | CommandError::AgentAmbiguous { .. }
         | CommandError::AgentReferenceEmpty => 2,
 

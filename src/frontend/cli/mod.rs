@@ -274,6 +274,9 @@ pub(crate) fn format_error(err: &CommandError) -> String {
         | CommandError::SessionRepoUrlRequired
         | CommandError::SessionRepoUrlEmpty
         | CommandError::SessionRepoUrlInvalidScheme { .. }
+        | CommandError::SessionFieldRemoteOnly { .. }
+        | CommandError::SessionFieldRequiresBranch { .. }
+        | CommandError::SessionRefInvalid { .. }
         | CommandError::AgentNotFound { .. }
         | CommandError::AgentNoLongerRunning { .. }
         | CommandError::AgentNotRunning { .. }

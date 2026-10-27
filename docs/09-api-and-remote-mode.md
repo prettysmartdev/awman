@@ -476,7 +476,7 @@ error: no log file found at ~/.awman/api/awman.log
 
 #### Session-setup verbosity
 
-While a session is being prepared (`cloning_repository`, `setting_up_branch`, `running_ready`), the server writes the full ready output — including container build lines, git command output, and state transitions — to the API log file. Each line is prefixed with the first 8 characters of the session id so you can grep one session out of a busy log:
+While a session is being prepared (`cloning_repository`, `setting_up_branch`, `merging_refs`, `running_ready`), the server writes the full ready output — including container build lines, git command output, and state transitions — to the API log file. Each line is prefixed with the first 8 characters of the session id so you can grep one session out of a busy log:
 
 ```sh
 grep '\[a1b2c3d4\]' ~/.awman/api/awman.log
@@ -720,9 +720,41 @@ Both types return immediately with a session UUID:
 { "session_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890" }
 ```
 
+**Remote session options** — a remote session body can also carry these optional fields, all of which require `branch`:
+
+```json
+{
+  "type": "remote",
+  "repo_url": "https://github.com/org/repo",
+  "branch": "feature/login-fix",
+  "base_ref": "release/2.4",
+  "merge_refs": ["feature/shared-types", "feature/api-client"],
+  "push": true
+}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `branch` | The session branch. If it exists on `origin`, the session continues it; otherwise it is created. |
+| `base_ref` | Branch, tag or commit the new session branch is created from. Defaults to `origin`'s default branch. If `branch` already exists on `origin`, setup fails (omit `base_ref` to continue it). |
+| `merge_refs` | Branch names on `origin`, merged into the session branch in order before the session becomes `ready`. |
+| `push` | When `true`, the session branch is committed and pushed to `origin` after each successful `exec` workflow or prompt command. Default `false`. |
+
+`base_ref`, `merge_refs` and `push` are only valid on remote sessions (a local session returns HTTP 400), and each requires `branch` (HTTP 400 otherwise). A `branch` or `merge_refs` entry that is not a valid git branch name, or a malformed `base_ref`, is also rejected with HTTP 400. Merge targets reject `HEAD`, hexadecimal commit spellings (including abbreviated SHAs), and names advertised only as tags. A name that exists as both a branch and a tag selects the branch. An entirely missing ref fails during setup.
+
+**Setup stages.** `GET /v1/sessions/:id/status` reports the stage the session is in: `initializing`, `cloning_repository`, `setting_up_branch`, `merging_refs`, `running_ready`, then `ready` (or `failed`). The `merging_refs` stage runs only when `merge_refs` is non-empty; each ref is merged as `origin/<ref>` in order, and progress is reported per ref. If a ref does not exist on `origin`, or a merge conflicts, setup fails, the error names the stage (for a conflict it lists the conflicting paths), and the clone is deleted. Merge commits use your git identity (`user.name` / `user.email`) when configured, and a built-in awman identity otherwise.
+
+**Pushing results.** With `push: true`, after an `exec prompt` or `exec workflow` command (including dynamic workflows) exits successfully, awman commits any leftover changes and pushes `HEAD` to `refs/heads/<branch>` on `origin`, setting an upstream and never forcing. Its workflow state JSON and saved dynamic TOML files are excluded even when already staged; their working files are preserved. Other repository files, including Dockerfiles generated during setup, are eligible leftovers. A fresh branch with no new work is not published; setup merge commits are published even if the command makes no edits. If `origin` already has the same commit, no second push is needed. A successful publication, including a workflow's own push during this command, is recorded as `pushed: {"remote": "origin", "branch": "...", "sha": "..."}`; a no-op reports `pushed: null`. Failed, aborted or paused commands are not automatically pushed.
+
+Commands share the clone's working state. Edits left by a failed command remain available for repair and are included if a later successful command leaves them in the clone. Workflow teardown runs before the automatic leftover commit: use `commit_changes` then `push_branch` before `create_pull_request` when the PR must already include those edits. A later automatic push updates the same branch.
+
+If the push fails (for example the branch moved on `origin`, or the credentials are rejected), the command ends with status `error`, exit code 1 and `stage: "push"`, with git's error text included. Local commits stay in the clone; nothing is retried or forced.
+
+The push runs on the server as the user running `awman api`, using that user's git credentials (SSH keys, credential helpers), until per-session credentials are available. Make sure that account can push to `repo_url`. Host push-back uses isolated Git metadata with hooks and repository-configured helpers disabled; the destination comes from the session's saved URL. Each host push-back Git operation times out after two minutes.
+
 **Local sessions** bind to an existing directory on the server. The directory must be in the allowlist (configured via `api.workDirs` in global config or `--workdirs` at startup). Workflows run directly in that directory.
 
-**Remote sessions** clone a git repository into an isolated directory on the server (`~/.awman/sessions/{session_id}/repo/`). Workflows run inside the clone. When the session is closed, the cloned directory is deleted, leaving no artifacts on the server. This is useful for running ephemeral CI jobs where you want to operate on a remote repo without setting up a local copy.
+**Remote sessions** clone a git repository into `<API root>/sessions/<session_id>/<repository-folder>` on the server. The API root is selected from `AWMAN_API_ROOT`, `AWMAN_CONFIG_HOME/api`, `XDG_DATA_HOME/awman/api`, then `~/.awman/api`, in that order. Workflows run inside the clone. Closing the session deletes the clone; command logs remain in API storage. This is useful for running ephemeral CI jobs without a local checkout.
 
 #### End-to-end example: Remote session workflow with setup and teardown
 
@@ -866,6 +898,8 @@ Error responses:
 | `workdir` not in allowlist (local) | 403 — includes `allowed_workdirs` list |
 | Invalid `type` field | 400 |
 | Missing required fields | 400 |
+| `base_ref`, `merge_refs` or `push` on a local session, or without `branch` | 400 |
+| Invalid branch or ref name | 400 |
 | Network error cloning repo (remote) | 500 |
 
 #### List sessions
@@ -910,7 +944,7 @@ curl -s http://localhost:9876/v1/sessions/<session-id> \
   -H 'Authorization: Bearer <api-key>'
 ```
 
-Returns the session record. Returns HTTP 404 if the ID does not exist.
+Returns the session record. For remote sessions this includes `repo_url`, `branch`, `base_ref`, `merge_refs` (omitted when empty) and `push`. Returns HTTP 404 if the ID does not exist.
 
 #### Close a session
 

@@ -12,7 +12,7 @@ Dynamic workflows are useful when:
 - You want a custom workflow per work item rather than reusing a generic template
 - You're running in fully autonomous mode and want end-to-end execution from a single command
 
-Dynamic mode always implies `--yolo`, `--worktree`, and a `context(workflow)` overlay. This means all agent work happens in an isolated Git worktree, and the leader and workflow steps share a context directory for coordination.
+Dynamic mode always implies `--yolo`, `--worktree`, and a `context(workflow)` overlay. Local runs use an isolated Git worktree; remote sessions reuse their isolated clone. The leader and workflow steps share a context directory for coordination.
 
 ---
 
@@ -44,7 +44,11 @@ When you run `exec workflow --dynamic`, awman follows these steps:
 8. **Build missing images** — for any agent referenced in the generated workflow that has a `Dockerfile.<agent>` but no built image, awman builds the image automatically before starting the workflow
 9. **Execute the workflow** — runs the generated workflow exactly as if you had written it yourself and passed it to `exec workflow --yolo --work-item 42`
 
-The leader agent cannot see or modify source files beyond the context directory — the worktree is mounted read-only when the runtime supports it, and any source-file modification by the leader aborts the dynamic run before the generated workflow is executed.
+The leader may write only in the context directory. The checkout is mounted read-only when the runtime supports it. A guard compares HEAD and source-file contents before and after the leader runs, including already dirty and untracked files; a change aborts the dynamic run before the generated workflow executes.
+
+### Dynamic workflows in remote sessions
+
+Dynamic workflows also run in [remote API sessions](09-api-and-remote-mode.md#create-a-session). A remote session already works inside its own throwaway clone, so no worktree is created: the leader and the generated workflow run against the clone, and the saved workflow and its progress live under the clone's `.awman/workflows/` until the session is closed. Nothing is squash-merged afterwards; the changes stay in the clone. Create the session with `push: true` to publish the session branch once the run succeeds.
 
 ---
 
