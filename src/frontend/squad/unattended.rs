@@ -36,8 +36,8 @@ use crate::command::commands::exec_workflow::{
 use crate::command::commands::mount_scope::{MountScopeDecision, MountScopeFrontend};
 use crate::command::commands::squad::evaluation::SquadRunFrontends;
 use crate::command::commands::worktree_lifecycle::{
-    ExistingWorktreeDecision, PostWorkflowWorktreeAction, PostWorkflowWorktreePrompt,
-    PreWorktreeDecision, WorktreeLifecycleFrontend, WorktreeMergeMode,
+    DirtyMergeTargetDecision, ExistingWorktreeDecision, MergeFailure, PostWorkflowWorktreeAction,
+    PostWorkflowWorktreePrompt, PreWorktreeDecision, WorktreeLifecycleFrontend, WorktreeMergeMode,
 };
 use crate::command::error::CommandError;
 use crate::command::headless::HeadlessDefaults;
@@ -697,6 +697,22 @@ impl WorktreeLifecycleFrontend for UnattendedFrontend {
 
     fn ask_merge_mode(&mut self, _branch: &str) -> Result<WorktreeMergeMode, CommandError> {
         Ok(self.headless.merge_mode())
+    }
+
+    fn ask_dirty_merge_target(
+        &mut self,
+        _target_branch: &str,
+        _files: &[String],
+        _suggested_message: &str,
+    ) -> Result<DirtyMergeTargetDecision, CommandError> {
+        Ok(self.headless.dirty_merge_target())
+    }
+
+    fn ask_launch_merge_fix_agent(
+        &mut self,
+        _failure: &MergeFailure,
+    ) -> Result<bool, CommandError> {
+        Ok(self.headless.launch_merge_fix_agent())
     }
 
     fn confirm_worktree_cleanup(

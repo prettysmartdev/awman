@@ -1,7 +1,9 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use super::ExecWorkflowCommandFrontend;
-use crate::command::commands::worktree_lifecycle::{ExistingWorktreeDecision, WorktreeLifecycle};
+use crate::command::commands::worktree_lifecycle::{
+    ExistingWorktreeDecision, FinalizeOutcome, FinalizePolicy, MergeFailure, WorktreeLifecycle,
+};
 use crate::command::error::CommandError;
 use crate::data::message::{UserMessage, UserMessageSink};
 use crate::engine::agent_runtime::frontend::AgentFrontend;
@@ -62,19 +64,45 @@ impl SharedWorkflowFrontend {
         .map_err(|error| CommandError::Other(format!("worktree prepare task failed: {error}")))?
     }
 
+    /// Runs `finalize` with the frontend locked. A requested merge-fix agent
+    /// is not run here: it reports through this same frontend, so the caller
+    /// runs it after this returns and then calls
+    /// [`Self::complete_merge_after_fix`].
     pub(crate) async fn finalize_worktree(
         &self,
-        lifecycle: WorktreeLifecycle,
+        lifecycle: &WorktreeLifecycle,
         had_error: bool,
-    ) -> Result<(), CommandError> {
+        policy: FinalizePolicy,
+    ) -> Result<FinalizeOutcome, CommandError> {
         let frontend = self.clone();
+        let lifecycle = lifecycle.clone();
         tokio::task::spawn_blocking(move || {
             frontend.with(|frontend| {
-                tokio::runtime::Handle::current().block_on(lifecycle.finalize(frontend, had_error))
+                tokio::runtime::Handle::current()
+                    .block_on(lifecycle.finalize(frontend, had_error, policy))
             })
         })
         .await
         .map_err(|error| CommandError::Other(format!("worktree finalize task failed: {error}")))?
+    }
+
+    pub(crate) async fn complete_merge_after_fix(
+        &self,
+        lifecycle: &WorktreeLifecycle,
+        failure: &MergeFailure,
+        agent_ran: bool,
+    ) -> Result<(), CommandError> {
+        let frontend = self.clone();
+        let lifecycle = lifecycle.clone();
+        let failure = failure.clone();
+        tokio::task::spawn_blocking(move || {
+            frontend.with(|frontend| {
+                tokio::runtime::Handle::current()
+                    .block_on(lifecycle.complete_merge_after_fix(frontend, &failure, agent_ran))
+            })
+        })
+        .await
+        .map_err(|error| CommandError::Other(format!("merge completion task failed: {error}")))?
     }
 
     pub(crate) fn report_workflow_context_path(&self, path: &std::path::Path) {

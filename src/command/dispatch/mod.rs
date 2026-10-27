@@ -1073,6 +1073,41 @@ pub(crate) fn parse_launch_mode(
     }
 }
 
+/// Typed `--on-dirty-merge-target`: `None` when not passed, so config and the
+/// host's headless default apply.
+pub(crate) fn parse_on_dirty_merge_target(
+    raw: Option<String>,
+    command: &[&str],
+) -> Result<Option<crate::data::config::repo::OnDirtyMergeTarget>, CommandError> {
+    raw.map(|value| {
+        value
+            .parse()
+            .map_err(|reason| CommandError::InvalidFlagValue {
+                command: command.iter().map(|part| (*part).to_string()).collect(),
+                flag: "on-dirty-merge-target".into(),
+                reason,
+            })
+    })
+    .transpose()
+}
+
+/// Typed `--on-merge-failure`: `None` when not passed.
+pub(crate) fn parse_on_merge_failure(
+    raw: Option<String>,
+    command: &[&str],
+) -> Result<Option<crate::data::config::repo::OnMergeFailure>, CommandError> {
+    raw.map(|value| {
+        value
+            .parse()
+            .map_err(|reason| CommandError::InvalidFlagValue {
+                command: command.iter().map(|part| (*part).to_string()).collect(),
+                flag: "on-merge-failure".into(),
+                reason,
+            })
+    })
+    .transpose()
+}
+
 /// Typed `--agent-flag` values: `None` when the flag was not passed (so config
 /// `agentFlags` applies), otherwise the list in order. Empty entries are
 /// rejected with the same rule config uses.

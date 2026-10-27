@@ -23,6 +23,7 @@ pub mod panic_log;
 pub mod path_guard;
 pub mod private_files;
 pub mod remote_slug;
+pub mod repo_file;
 pub mod skill_dirs;
 pub mod skill_library;
 pub mod squad_paths;

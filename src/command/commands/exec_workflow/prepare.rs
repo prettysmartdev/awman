@@ -7,7 +7,13 @@
 //! of `exec_workflow`, so it reaches that module's private items unchanged.
 
 use super::*;
-use crate::engine::workflow::PhaseStepRef;
+use crate::command::commands::worktree_lifecycle::{FinalizeOutcome, MergeFailure};
+use crate::data::config::effective::EffectiveConfig;
+use crate::data::merge_fix_prompt::{
+    render_merge_fix_prompt, MergeFixPromptVars, MERGE_FIX_PROMPT_MD,
+};
+use crate::data::session::AgentName;
+use crate::engine::workflow::{PhaseStepRef, RemediationAgentSpec};
 
 /// Emit the deprecation warning for `agent`, if its vendor has deprecated it.
 ///
@@ -243,6 +249,10 @@ pub(crate) async fn execute_prepared(
         skip_state_resume_prompt,
     } = prepared;
 
+    // Resolved from the invoking session: the worktree session's config is
+    // whatever was committed on the branch, not what the user has now.
+    let finalize_policy = finalize_policy(flags, &original_session);
+
     // When the run is inside an isolated worktree (--worktree, or implied by
     // --yolo/--dynamic), any `checkout_create_branch` setup step is redundant:
     // the worktree already put the run on its own branch. Skip-and-warn, not
@@ -315,6 +325,14 @@ pub(crate) async fn execute_prepared(
         workflow.agent.clone().or_else(|| flags.agent.clone()),
         flags.agent_flags.clone(),
     );
+
+    // A merge-fix agent (after a failed merge-back) mounts the parent
+    // checkout, not the worktree, so keep the invoking session to re-root it
+    // there; it is moved into the worktree session below.
+    let merge_fix_invoker = worktree_lifecycle
+        .as_ref()
+        .map(|_| original_session.clone());
+    let merge_fix_work_item = work_item_context.clone();
 
     // 8. Build the session for the engine.
     // When a worktree is active, re-root the session at the worktree so
@@ -401,7 +419,9 @@ pub(crate) async fn execute_prepared(
                 .find(|c| c.scope == crate::engine::overlay::ContextScope::Workflow)
                 .map(|c| c.permission)
         });
-    let (engine_result, step_counts) = {
+    // The engine outlives this block: a merge-fix agent after the worktree
+    // finalize runs through its agent launch path.
+    let (engine_result, step_counts, mut engine) = {
         let proxy = shared.clone();
         let factory = CommandLayerFactory {
             shared: shared.clone(),
@@ -447,6 +467,13 @@ pub(crate) async fn execute_prepared(
         engine.set_yolo(yolo);
         engine.set_parallel_group_prompts(crate::command::prompts::parallel_group_prompts());
         engine.set_workflow_context_permission(active_workflow_context_permission);
+        if let Err(e) = engine.declare_phase_steps(&setup_steps, &teardown_steps) {
+            shared.lock().unwrap().write_message(UserMessage {
+                level: MessageLevel::Error,
+                text: format!("exec workflow: failed to declare phase steps: {e}"),
+            });
+            return Err(CommandError::from(e));
+        }
 
         // Warn if the workflow will commit but git identity is not configured.
         if teardown_steps.iter().any(|s| {
@@ -711,7 +738,7 @@ pub(crate) async fn execute_prepared(
                 _ => {}
             }
         }
-        (result, (completed, failed))
+        (result, (completed, failed), engine)
     };
 
     // 9. PTY inactive — flush queued messages.
@@ -760,7 +787,29 @@ pub(crate) async fn execute_prepared(
 
     // 12. Worktree finalize.
     if let Some(lifecycle) = worktree_lifecycle {
-        let result = frontend.finalize_worktree(lifecycle, had_error).await;
+        let result = match frontend
+            .finalize_worktree(&lifecycle, had_error, finalize_policy)
+            .await
+        {
+            Ok(FinalizeOutcome::Done) => Ok(()),
+            Ok(FinalizeOutcome::MergeFixRequested(failure)) => {
+                // The frontend lock is released here: the agent reports
+                // through the same frontend (see `finalize_worktree`).
+                let agent_ran = run_merge_fix_agent(
+                    &mut engine,
+                    flags,
+                    merge_fix_invoker.as_ref(),
+                    &failure,
+                    merge_fix_work_item.as_ref(),
+                    &frontend,
+                )
+                .await;
+                frontend
+                    .complete_merge_after_fix(&lifecycle, &failure, agent_ran)
+                    .await
+            }
+            Err(e) => Err(e),
+        };
         if let Err(e) = result {
             frontend.with(|frontend| {
                 frontend.write_message(UserMessage {
@@ -794,6 +843,180 @@ pub(crate) async fn execute_prepared(
         exit_code,
         worktree_used: flags.worktree,
     })
+}
+
+/// The merge-fix agent's rendered prompt for `failure`.
+///
+/// The template is `worktree.mergeFix.promptTemplate` (a path relative to
+/// the git root) when configured, else the built-in
+/// [`MERGE_FIX_PROMPT_MD`]. A configured file that cannot be read is an
+/// error: silently falling back would run an agent with instructions the
+/// user did not choose.
+pub(crate) fn merge_fix_prompt(
+    config: &EffectiveConfig,
+    failure: &MergeFailure,
+    work_item: Option<&WorkItemContext>,
+) -> Result<crate::data::workflow_prompt_template::Substitution, CommandError> {
+    let template = match config.worktree_merge_fix_prompt_template() {
+        Some(relative) => {
+            let path = failure.git_root.join(&relative);
+            crate::data::fs::repo_file::read_template(
+                &failure.git_root,
+                std::path::Path::new(&relative),
+            )
+            .map_err(|e| {
+                CommandError::Other(format!(
+                    "reading worktree.mergeFix.promptTemplate {}: {e}",
+                    path.display()
+                ))
+            })?
+        }
+        None => MERGE_FIX_PROMPT_MD.to_string(),
+    };
+    Ok(render_merge_fix_prompt(
+        &template,
+        &MergeFixPromptVars {
+            merge_command: &failure.command,
+            merge_exit_code: failure.exit_code,
+            merge_output: &failure.output,
+            branch: &failure.branch,
+            target_branch: &failure.target_branch,
+            unmerged_paths: &failure.unmerged_paths,
+        },
+        work_item,
+    ))
+}
+
+/// The agent and model the merge-fix agent runs: `--agent`/`--model` when
+/// given, else the workflow's last step's, else the session's configured
+/// agent.
+pub(crate) fn merge_fix_agent(
+    flags: &ExecWorkflowCommandFlags,
+    last_step_agent: Option<AgentName>,
+    last_step_model: Option<String>,
+    session: &Session,
+) -> Result<(AgentName, Option<String>), CommandError> {
+    let agent = match &flags.agent {
+        Some(name) => AgentName::new(name.as_str()).map_err(CommandError::from)?,
+        None => match last_step_agent.or_else(|| session.default_agent().cloned()) {
+            Some(agent) => agent,
+            None => {
+                return Err(CommandError::Other(
+                    "no agent to run the merge fix with; pass --agent".to_string(),
+                ))
+            }
+        },
+    };
+    let model = flags.model.clone().or(last_step_model);
+    Ok((agent, model))
+}
+
+/// Run the merge-fix agent for a failed worktree merge-back and wait for it.
+/// Returns whether the agent ran; a failure to start it is reported and the
+/// caller falls back to keeping the worktree.
+///
+/// The agent runs in a container through the same launch path as an
+/// `on_failure` remediation agent (`WorkflowEngine::run_remediation_agent`),
+/// never on the host. Its session is re-rooted at the parent checkout's git
+/// root, where the merge is in progress — the normal mount scope.
+async fn run_merge_fix_agent(
+    engine: &mut WorkflowEngine,
+    flags: &ExecWorkflowCommandFlags,
+    invoker: Option<&Session>,
+    failure: &MergeFailure,
+    work_item: Option<&WorkItemContext>,
+    frontend: &SharedWorkflowFrontend,
+) -> bool {
+    let warn = |text: String| {
+        frontend.with(|frontend| {
+            frontend.write_message(UserMessage {
+                level: MessageLevel::Warning,
+                text,
+            })
+        })
+    };
+    let Some(invoker) = invoker else {
+        warn("merge-fix: no invoking session to mount the checkout with".to_string());
+        return false;
+    };
+    let mut session = match Session::open_worktree_for(
+        failure.git_root.clone(),
+        failure.git_root.clone(),
+        invoker,
+    ) {
+        Ok(session) => session,
+        Err(e) => {
+            warn(format!(
+                "merge-fix: opening a session at {}: {e}",
+                failure.git_root.display()
+            ));
+            return false;
+        }
+    };
+    session.set_flags(workflow_flag_config(flags));
+
+    let prompt = match merge_fix_prompt(&session.effective_config(), failure, work_item) {
+        Ok(prompt) => prompt,
+        Err(e) => {
+            warn(format!("merge-fix: {e}"));
+            return false;
+        }
+    };
+    for warning in prompt.warnings {
+        warn(format!("merge-fix: {warning}"));
+    }
+    let (agent, model) = match merge_fix_agent(
+        flags,
+        engine.last_step_agent(),
+        engine.last_step_model(),
+        &session,
+    ) {
+        Ok(resolved) => resolved,
+        Err(e) => {
+            warn(format!("merge-fix: {e}"));
+            return false;
+        }
+    };
+
+    frontend.with(|frontend| {
+        frontend.write_message(UserMessage {
+            level: MessageLevel::Info,
+            text: format!(
+                "launching {} to fix the merge of '{}' in {}",
+                agent.as_str(),
+                failure.branch,
+                failure.git_root.display()
+            ),
+        })
+    });
+    let spec = RemediationAgentSpec {
+        label: format!("merge-fix: {}", failure.branch),
+        prompt: prompt.rendered,
+        agent,
+        model,
+        extra_overlays: None,
+    };
+    // Same PTY bracketing as the engine run: messages queue while the
+    // agent owns the terminal and replay once it exits.
+    frontend.set_pty_active(true);
+    let result = engine.run_remediation_agent(&session, spec).await;
+    frontend.set_pty_active(false);
+    frontend.replay_queued();
+    match result {
+        Ok(exit_code) => {
+            tracing::info!(exit_code, "merge-fix agent exited");
+            true
+        }
+        Err(e @ crate::engine::workflow::RemediationAgentError::Launch(_)) => {
+            warn(format!("merge-fix: {e}"));
+            false
+        }
+        // The agent started; whatever it changed is verified as usual.
+        Err(e @ crate::engine::workflow::RemediationAgentError::Execution(_)) => {
+            warn(format!("merge-fix: {e}"));
+            true
+        }
+    }
 }
 
 pub(crate) fn workflow_flag_config(
@@ -897,6 +1120,24 @@ pub(crate) fn warn_context_workflow_in_phase(workflow: &Workflow, sink: &mut dyn
                 }
             }
         }
+    }
+}
+
+/// The merge-back policy for this run: flag > repo config > global config.
+/// `None` means "ask", which the frontend answers from its headless profile
+/// when nobody is attached.
+pub(crate) fn finalize_policy(
+    flags: &ExecWorkflowCommandFlags,
+    session: &Session,
+) -> FinalizePolicy {
+    let config = session.effective_config();
+    FinalizePolicy {
+        on_dirty_merge_target: flags
+            .on_dirty_merge_target
+            .or_else(|| config.worktree_on_dirty_merge_target()),
+        on_merge_failure: flags
+            .on_merge_failure
+            .or_else(|| config.worktree_merge_fix_on_failure()),
     }
 }
 

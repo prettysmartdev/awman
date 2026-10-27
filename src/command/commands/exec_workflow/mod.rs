@@ -10,7 +10,9 @@ use serde::Serialize;
 
 use crate::command::commands::launch_policy::LaunchPolicy;
 use crate::command::commands::mount_scope::MountScope;
-use crate::command::commands::worktree_lifecycle::{WorktreeLifecycle, WorktreeLifecycleFrontend};
+use crate::command::commands::worktree_lifecycle::{
+    FinalizePolicy, WorktreeLifecycle, WorktreeLifecycleFrontend,
+};
 use crate::command::commands::Command;
 use crate::command::commands::{parse_overlay_list, TypedOverlay};
 use crate::command::dispatch::{BuildContext, Engines};
@@ -64,6 +66,10 @@ pub struct ExecWorkflowCommandFlags {
     /// Raw `agent::model` string for the dynamic leader agent. Only valid with
     /// `--dynamic`.
     pub leader: Option<String>,
+    /// `--on-dirty-merge-target`; `None` lets config and the host default apply.
+    pub on_dirty_merge_target: Option<crate::data::config::repo::OnDirtyMergeTarget>,
+    /// `--on-merge-failure`; `None` lets config and the host default apply.
+    pub on_merge_failure: Option<crate::data::config::repo::OnMergeFailure>,
 }
 
 pub use crate::data::config::leader_spec::LeaderSpec;
@@ -372,6 +378,14 @@ impl ExecWorkflowCommand {
             },
             dynamic: ctx.flags.bool("dynamic"),
             leader: ctx.flags.string("leader"),
+            on_dirty_merge_target: crate::command::dispatch::parse_on_dirty_merge_target(
+                ctx.flags.string("on-dirty-merge-target"),
+                &ctx.path(),
+            )?,
+            on_merge_failure: crate::command::dispatch::parse_on_merge_failure(
+                ctx.flags.string("on-merge-failure"),
+                &ctx.path(),
+            )?,
         };
         validate_dynamic_flags(&flags)?;
         if !flags.dynamic && flags.workflow.is_none() {

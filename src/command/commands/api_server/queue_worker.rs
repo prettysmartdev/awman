@@ -9,7 +9,7 @@ use crate::command::dispatch::{CommandOutcome, Dispatch, Engines};
 use crate::data::execution_event::{
     CommandStatusKind, EventPayload, PhaseStatusKind, StepStatusKind,
 };
-use crate::data::fs::api_command_log::CommandLogWriter;
+use crate::data::fs::api_command_log::{CommandLogWriter, CommandStateWriter};
 use crate::data::fs::api_db::{CommandRecord, SqliteSessionStore};
 use crate::data::fs::api_paths::ApiPaths;
 use crate::data::session_manager::SessionManager;
@@ -67,6 +67,7 @@ pub trait ApiCommandFrontendFactory: Send + Sync {
         &self,
         cmd: &CommandRecord,
         event_bus: super::event_bus::EventBusSender,
+        state_writer: CommandStateWriter,
     ) -> Self::Frontend;
 }
 
@@ -247,7 +248,10 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
 
         // The API frontend supplies the presentation adapter through its
         // factory; Layer 2 owns everything around command execution.
-        let frontend = self.frontend_factory.frontend_for(&cmd, event_bus.sender());
+        let state_writer = CommandStateWriter::new(self.paths.clone(), &session_id, &command_id);
+        let frontend = self
+            .frontend_factory
+            .frontend_for(&cmd, event_bus.sender(), state_writer);
 
         // Look up the Session.
         let session = match self.sessions.get_by_key(&session_id) {

@@ -13,6 +13,35 @@ use tokio::io::AsyncWriteExt;
 use crate::data::error::DataError;
 use crate::data::execution_event::ExecutionEvent;
 use crate::data::fs::api_paths::ApiPaths;
+use crate::data::workflow_state::WorkflowState;
+
+/// Owns the filesystem side of a command's live workflow state so the API
+/// frontend never touches the filesystem itself. Synchronous because the
+/// engine reports state from its synchronous persistence path.
+pub struct CommandStateWriter {
+    paths: ApiPaths,
+    session_id: String,
+    command_id: String,
+}
+
+impl CommandStateWriter {
+    pub fn new(
+        paths: ApiPaths,
+        session_id: impl Into<String>,
+        command_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            paths,
+            session_id: session_id.into(),
+            command_id: command_id.into(),
+        }
+    }
+
+    pub fn write(&self, state: &WorkflowState) -> Result<(), DataError> {
+        self.paths
+            .write_command_workflow_state(&self.session_id, &self.command_id, state)
+    }
+}
 
 /// Owns the two open log files for one command run and appends to them as
 /// events arrive.

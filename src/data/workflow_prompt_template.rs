@@ -75,7 +75,7 @@ pub struct WorkItemContext {
     pub content: String,
 }
 
-fn replace_token<F: Fn(&str) -> String>(input: &str, token: &str, f: F) -> String {
+pub(crate) fn replace_token<F: Fn(&str) -> String>(input: &str, token: &str, f: F) -> String {
     let mut out = String::with_capacity(input.len());
     let mut rest = input;
     while let Some(idx) = rest.find(token) {

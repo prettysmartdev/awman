@@ -25,7 +25,7 @@
 //! | [`agent_setup`](HeadlessDefaults::agent_setup) | `d ? Setup : Abort` | `Setup` | `Setup` |
 //! | [`agent_auth_consent`](HeadlessDefaults::agent_auth_consent) | `Accept` | `Accept` | `DeclineOnce` |
 //! | [`confirm_resume`](HeadlessDefaults::confirm_resume) | `true` | `false` | `false` |
-//! | [`workflow_next_action`](HeadlessDefaults::workflow_next_action) | `can_launch_next ? LaunchNext : Abort` | `LaunchNext` | `LaunchNext` |
+//! | [`workflow_next_action`](HeadlessDefaults::workflow_next_action) | `can_launch_next ? LaunchNext : can_finish_workflow ? FinishWorkflow : Abort` | `LaunchNext` | `LaunchNext` |
 //! | [`yolo_tick`](HeadlessDefaults::yolo_tick) | `Continue` | `Continue` | `Continue` |
 //! | [`pre_worktree_uncommitted_files`](HeadlessDefaults::pre_worktree_uncommitted_files) | `Commit { message: m }` | `UseLastCommit` | `UseLastCommit` |
 //! | [`existing_worktree`](HeadlessDefaults::existing_worktree) | `Resume` | `Resume` | `Resume` |
@@ -33,6 +33,8 @@
 //! | [`worktree_commit_before_merge`](HeadlessDefaults::worktree_commit_before_merge) | `Some(m)` | `None` | `None` |
 //! | [`merge_mode`](HeadlessDefaults::merge_mode) | `Squash` | `LeaveBranch` | `LeaveBranch` |
 //! | [`confirm_worktree_cleanup`](HeadlessDefaults::confirm_worktree_cleanup) | `true` | `false` | `false` |
+//! | [`dirty_merge_target`](HeadlessDefaults::dirty_merge_target) | `Abort` | `Abort` *(unused)* | `Abort` |
+//! | [`launch_merge_fix_agent`](HeadlessDefaults::launch_merge_fix_agent) | `false` | `false` *(unused)* | `false` |
 //! | [`workflow_resume`](HeadlessDefaults::workflow_resume) | `sp` | `Fresh` | `sp` |
 //! | [`acp_permission`](HeadlessDefaults::acp_permission) | `Cancelled` | *(unused)* | `approve(options)` |
 //! | [`replace_aspec`](HeadlessDefaults::replace_aspec) | `false` | *(unused)* | `false` |
@@ -110,8 +112,8 @@ use crate::command::commands::exec_workflow::{WorkflowResumeDecision, WorkflowRe
 use crate::command::commands::mount_scope::MountScopeDecision;
 use crate::command::commands::specs::WorkItemKind;
 use crate::command::commands::worktree_lifecycle::{
-    ExistingWorktreeDecision, PostWorkflowWorktreeAction, PostWorkflowWorktreePrompt,
-    PreWorktreeDecision, WorktreeMergeMode,
+    DirtyMergeTargetDecision, ExistingWorktreeDecision, PostWorkflowWorktreeAction,
+    PostWorkflowWorktreePrompt, PreWorktreeDecision, WorktreeMergeMode,
 };
 use crate::data::config::repo::WorkItemsConfig;
 use crate::engine::acp::protocol::{PermissionDecision, PermissionOption};
@@ -212,10 +214,20 @@ impl HeadlessDefaults {
     }
 
     /// Answer for `WorkflowFrontend::show_workflow_control_board`.
+    ///
+    /// The API is the only host that answers `Abort` anywhere: a yolo run
+    /// always opens one board after its last step (`single_step.rs`), and
+    /// with nothing left to launch the API used to abort there, failing every
+    /// API-mode yolo workflow after all its steps had succeeded (WI 0132 A).
+    /// It now finishes when the board offers it. Failure boards never offer
+    /// `FinishWorkflow` (`compute_failure_actions`), so a failed step still
+    /// aborts.
     pub fn workflow_next_action(&self, available: &AvailableActions) -> NextAction {
         match self.profile {
-            Profile::Api if !available.can_launch_next => NextAction::Abort,
-            _ => NextAction::LaunchNext,
+            Profile::Api if available.can_launch_next => NextAction::LaunchNext,
+            Profile::Api if available.can_finish_workflow => NextAction::FinishWorkflow,
+            Profile::Api => NextAction::Abort,
+            Profile::Squad | Profile::Cli => NextAction::LaunchNext,
         }
     }
 
@@ -283,6 +295,22 @@ impl HeadlessDefaults {
     /// Answer for `WorktreeLifecycleFrontend::confirm_worktree_cleanup`.
     pub fn confirm_worktree_cleanup(&self) -> bool {
         matches!(self.profile, Profile::Api)
+    }
+
+    /// Answer for `WorktreeLifecycleFrontend::ask_dirty_merge_target`.
+    ///
+    /// Every profile aborts: a headless host never commits or stashes a
+    /// checkout's uncommitted work unless the client asked with
+    /// `--on-dirty-merge-target`. Squad never reaches it (its `merge_mode` is
+    /// `LeaveBranch`).
+    pub fn dirty_merge_target(&self) -> DirtyMergeTargetDecision {
+        DirtyMergeTargetDecision::Abort
+    }
+
+    /// Answer for `WorktreeLifecycleFrontend::ask_launch_merge_fix_agent`. An
+    /// API client opts in with `--on-merge-failure agent`.
+    pub fn launch_merge_fix_agent(&self) -> bool {
+        false
     }
 
     // ─── ACP ────────────────────────────────────────────────────────────────
@@ -429,7 +457,13 @@ mod tests {
             cli: "LaunchNext",
         },
         Row {
-            question: "workflow_next_action(can_launch_next = false)",
+            question: "workflow_next_action(can_launch_next = false, can_finish_workflow = true)",
+            api: "FinishWorkflow",
+            squad: "LaunchNext",
+            cli: "LaunchNext",
+        },
+        Row {
+            question: "workflow_next_action(can_launch_next = false, can_finish_workflow = false)",
             api: "Abort",
             squad: "LaunchNext",
             cli: "LaunchNext",
@@ -471,6 +505,18 @@ mod tests {
             cli: "false",
         },
         Row {
+            question: "dirty_merge_target",
+            api: "Abort",
+            squad: "Abort",
+            cli: "Abort",
+        },
+        Row {
+            question: "launch_merge_fix_agent",
+            api: "false",
+            squad: "false",
+            cli: "false",
+        },
+        Row {
             question: "workflow_resume(has a stop point)",
             api: "ResumeFrom(build)",
             squad: "Fresh",
@@ -494,9 +540,10 @@ mod tests {
     /// what it does with a *non-default* value: return it verbatim.
     const SQUAD_TASK_SCOPE: MountScopeDecision = MountScopeDecision::MountCurrentDirOnly;
 
-    fn available(can_launch_next: bool) -> AvailableActions {
+    fn available(can_launch_next: bool, can_finish_workflow: bool) -> AvailableActions {
         AvailableActions {
             can_launch_next,
+            can_finish_workflow,
             ..Default::default()
         }
     }
@@ -564,11 +611,15 @@ mod tests {
             ("confirm_resume", d.confirm_resume().to_string()),
             (
                 "workflow_next_action(can_launch_next = true)",
-                format!("{:?}", d.workflow_next_action(&available(true))),
+                format!("{:?}", d.workflow_next_action(&available(true, false))),
             ),
             (
-                "workflow_next_action(can_launch_next = false)",
-                format!("{:?}", d.workflow_next_action(&available(false))),
+                "workflow_next_action(can_launch_next = false, can_finish_workflow = true)",
+                format!("{:?}", d.workflow_next_action(&available(false, true))),
+            ),
+            (
+                "workflow_next_action(can_launch_next = false, can_finish_workflow = false)",
+                format!("{:?}", d.workflow_next_action(&available(false, false))),
             ),
             (
                 "pre_worktree_uncommitted_files",
@@ -596,6 +647,14 @@ mod tests {
             (
                 "confirm_worktree_cleanup",
                 d.confirm_worktree_cleanup().to_string(),
+            ),
+            (
+                "dirty_merge_target",
+                format!("{:?}", d.dirty_merge_target()),
+            ),
+            (
+                "launch_merge_fix_agent",
+                d.launch_merge_fix_agent().to_string(),
             ),
             (
                 "workflow_resume(has a stop point)",

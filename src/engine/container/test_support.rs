@@ -20,11 +20,62 @@ use crate::engine::agent_runtime::{Capabilities, ImageImportRequest, ImportedIma
 use crate::engine::container::background::BackgroundLaunchRequest;
 use crate::engine::error::EngineError;
 
+const DEFAULT_GENERATED_WORKFLOW: &str =
+    "[[steps]]\nname = \"generated\"\nagent = \"claude\"\nprompt = \"work\"\n";
+
 pub(crate) type HeldFrontends = Arc<Mutex<Vec<Box<dyn AgentFrontend>>>>;
 
 pub(crate) fn holding_runtime(frontends: HeldFrontends) -> Arc<ContainerRuntime> {
     Arc::new(ContainerRuntime::with_backend(Arc::new(HoldingBackend {
         frontends,
+        notices: Default::default(),
+        workflow_toml: None,
+        on_exec: None,
+        on_build: None,
+        on_start: None,
+    })))
+}
+
+/// Called with each command the holding backend is asked to run in a
+/// background container (the phase steps of a `run_shell` setup or teardown).
+pub(crate) type ExecHook = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// As [`holding_runtime`], but a dynamic-workflow leader "writes" `workflow_toml`
+/// instead of the one-step default, and every background `exec` is passed to
+/// `on_exec`.
+pub(crate) fn holding_runtime_with_workflow(
+    frontends: HeldFrontends,
+    workflow_toml: &str,
+    on_exec: ExecHook,
+) -> Arc<ContainerRuntime> {
+    Arc::new(ContainerRuntime::with_backend(Arc::new(HoldingBackend {
+        frontends,
+        notices: Default::default(),
+        workflow_toml: Some(workflow_toml.to_string()),
+        on_exec: Some(on_exec),
+        on_build: None,
+        on_start: None,
+    })))
+}
+
+pub(crate) type BuildHook =
+    Arc<dyn Fn(&ResolvedContainerOptions) -> Result<(), EngineError> + Send + Sync>;
+
+pub(crate) type StartHook = Arc<dyn Fn() -> Result<(), EngineError> + Send + Sync>;
+
+pub(crate) fn holding_runtime_with_hooks(
+    frontends: HeldFrontends,
+    workflow: &str,
+    on_exec: ExecHook,
+    on_build: BuildHook,
+    on_start: Option<StartHook>,
+) -> Arc<ContainerRuntime> {
+    Arc::new(ContainerRuntime::with_backend(Arc::new(HoldingBackend {
+        frontends,
+        workflow_toml: Some(workflow.into()),
+        on_exec: Some(on_exec),
+        on_build: Some(on_build),
+        on_start,
         notices: Default::default(),
     })))
 }
@@ -34,10 +85,16 @@ pub(super) struct HoldingBackend {
     frontends: HeldFrontends,
     /// Returned (once) by `take_notices`.
     pub(super) notices: Mutex<Vec<String>>,
+    /// The workflow a dynamic leader writes; `None` writes `DEFAULT_GENERATED_WORKFLOW`.
+    workflow_toml: Option<String>,
+    on_exec: Option<ExecHook>,
+    on_build: Option<BuildHook>,
+    on_start: Option<StartHook>,
 }
 
 struct HoldingInstance {
     frontends: HeldFrontends,
+    on_start: Option<StartHook>,
 }
 
 struct ImmediateExecution;
@@ -75,6 +132,9 @@ impl AgentInstance for HoldingInstance {
         self: Box<Self>,
         mut frontend: Box<dyn AgentFrontend>,
     ) -> Result<AgentExecution, EngineError> {
+        if let Some(hook) = &self.on_start {
+            hook()?;
+        }
         frontend.report_status(AgentStatus::Running {
             container_name: "held-container".into(),
         });
@@ -123,6 +183,9 @@ impl ContainerBackend for HoldingBackend {
         &self,
         options: ResolvedContainerOptions,
     ) -> Result<Box<dyn AgentInstance>, EngineError> {
+        if let Some(hook) = &self.on_build {
+            hook(&options)?;
+        }
         let squad_workspace = options
             .overlays
             .iter()
@@ -148,18 +211,22 @@ impl ContainerBackend for HoldingBackend {
             if overlay.host_path.join("workflow-usage.md").exists() {
                 std::fs::write(
                     overlay.host_path.join("workflow.toml"),
-                    "[[steps]]\nname = \"generated\"\nagent = \"claude\"\nprompt = \"work\"\n",
+                    self.workflow_toml
+                        .as_deref()
+                        .unwrap_or(DEFAULT_GENERATED_WORKFLOW),
                 )
                 .map_err(|error| EngineError::Other(error.to_string()))?;
             }
         }
         Ok(Box::new(HoldingInstance {
             frontends: self.frontends.clone(),
+            on_start: self.on_start.clone(),
         }))
     }
     fn attach(&self, _: &AgentHandle) -> Result<Box<dyn AgentInstance>, EngineError> {
         Ok(Box::new(HoldingInstance {
             frontends: self.frontends.clone(),
+            on_start: self.on_start.clone(),
         }))
     }
     fn list_running(&self, _: &Session) -> Result<Vec<AgentHandle>, EngineError> {
@@ -221,10 +288,13 @@ impl ContainerBackend for HoldingBackend {
     fn exec_in_background(
         &self,
         _: &str,
-        _: &str,
+        command: &str,
         _: &str,
         _: Option<&HashMap<String, String>>,
     ) -> Result<ExecOutput, EngineError> {
+        if let Some(on_exec) = &self.on_exec {
+            on_exec(command);
+        }
         Ok(ExecOutput {
             stdout: String::new(),
             stderr: String::new(),

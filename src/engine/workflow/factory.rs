@@ -34,6 +34,17 @@ pub trait AgentExecutionFactory: Send + Sync {
         runtime: &WorkflowRuntimeContext,
     ) -> Result<AgentExecution, EngineError>;
 
+    /// Launch an already rendered prompt. Template-rendering factories must
+    /// override this so diagnostic data is never interpreted as a template.
+    fn execution_for_rendered_step(
+        &self,
+        step: &WorkflowStep,
+        session: &Session,
+        runtime: &WorkflowRuntimeContext,
+    ) -> Result<AgentExecution, EngineError> {
+        self.execution_for_step(step, session, runtime)
+    }
+
     /// Inject an additional prompt into a running container rather than
     /// launching a new one. Returns `Ok(None)` when the runtime backend does
     /// not support prompt injection (engine then falls back to a fresh

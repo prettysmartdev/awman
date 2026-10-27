@@ -34,8 +34,9 @@ pub use overlays::{
     DirectorySpec, OverlayPermission, SkillSpec, TypedOverlay,
 };
 pub use repo::{
-    AgentAuthMode, ApiConfig, AuthRefreshConfig, DynamicWorkflowsConfig, LaunchMode, RemoteConfig,
-    RepoConfig, SquadConfig, WorkItemsConfig, REPO_CONFIG_FILENAME, REPO_CONFIG_SUBDIR,
+    AgentAuthMode, ApiConfig, AuthRefreshConfig, DynamicWorkflowsConfig, LaunchMode,
+    MergeFixConfig, OnDirtyMergeTarget, OnMergeFailure, RemoteConfig, RepoConfig, SquadConfig,
+    WorkItemsConfig, WorktreeConfig, REPO_CONFIG_FILENAME, REPO_CONFIG_SUBDIR,
 };
 pub use resolved_builtin::{BuiltinProcessConfig, ResolvedBuiltinConfig};
 pub use runtime_selection::{RuntimeSelection, UnknownRuntimeValue};

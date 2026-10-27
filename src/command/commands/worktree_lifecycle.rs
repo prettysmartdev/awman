@@ -10,9 +10,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::command::error::CommandError;
+use crate::data::config::repo::{OnDirtyMergeTarget, OnMergeFailure};
+use crate::data::merge_fix_prompt::has_conflict_markers;
 use crate::data::message::{MessageLevel, UserMessage};
-use crate::engine::error::EngineError;
-use crate::engine::git::{GitEngine, GitFrontend};
+use crate::engine::error::{EngineError, MergeFailedDetail};
+use crate::engine::git::{squash_commit_message, GitEngine, GitFrontend};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PreWorktreeDecision {
@@ -44,6 +46,166 @@ pub enum WorktreeMergeMode {
     Squash,
     /// Leave the branch (and worktree) alone.
     LeaveBranch,
+}
+
+/// What to do with uncommitted changes in the merge target (the parent
+/// checkout) before a worktree branch is merged into it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DirtyMergeTargetDecision {
+    /// Commit everything with this message, then merge.
+    Commit { message: String },
+    /// `git stash push --include-untracked`, then merge. Never popped.
+    Stash,
+    /// Do not merge; keep the worktree and branch.
+    Abort,
+}
+
+/// Flag/config-resolved answers for the merge-back questions. `None` (or
+/// `Ask`) consults the frontend, which answers from its headless profile when
+/// nobody is attached. Resolved in the command layer: flag > repo > global.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FinalizePolicy {
+    pub on_dirty_merge_target: Option<OnDirtyMergeTarget>,
+    pub on_merge_failure: Option<OnMergeFailure>,
+}
+
+/// Title of the dirty-merge-target dialog. Dialog copy lives here so the
+/// frontends only render it.
+pub const DIRTY_MERGE_TARGET_TITLE: &str = "Merge target has uncommitted changes";
+
+/// Shared choice and text-input copy for every interactive host.
+pub const DIRTY_MERGE_TARGET_KEYS: &[(char, &str)] =
+    &[('c', "Commit first"), ('s', "Stash"), ('a', "Abort")];
+pub const DIRTY_COMMIT_TITLE: &str = "Commit message";
+pub const DIRTY_COMMIT_PROMPT: &str = "Enter commit message (or press Enter to accept):";
+
+/// Only a submitted text response authorizes a commit; cancellation aborts.
+pub fn dirty_target_commit_message(
+    submitted: Option<&str>,
+    suggested: &str,
+) -> DirtyMergeTargetDecision {
+    match submitted {
+        Some(text) => DirtyMergeTargetDecision::Commit {
+            message: if text.trim().is_empty() {
+                suggested.into()
+            } else {
+                text.trim().into()
+            },
+        },
+        None => DirtyMergeTargetDecision::Abort,
+    }
+}
+
+/// Body of the dirty-merge-target dialog: the target branch and a listing of
+/// the dirty files (at most ten, then a count of the rest).
+pub fn dirty_merge_target_body(target_branch: &str, files: &[String]) -> String {
+    let mut body = format!(
+        "'{target_branch}' has {} uncommitted file(s); merging into it now could overwrite or mix in your edits:\n\n",
+        files.len()
+    );
+    body.push_str(
+        &files
+            .iter()
+            .take(10)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+    if files.len() > 10 {
+        body.push_str(&format!("\n... and {} more", files.len() - 10));
+    }
+    body
+}
+
+/// Everything a frontend and the merge-fix prompt need about a failed
+/// worktree merge-back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeFailure {
+    pub branch: String,
+    pub target_branch: String,
+    pub worktree_path: PathBuf,
+    pub git_root: PathBuf,
+    /// `true` for `git merge --squash`, which commits with
+    /// [`squash_commit_message`].
+    pub squash: bool,
+    /// The exact command that failed, as a user would type it.
+    pub command: String,
+    pub exit_code: i32,
+    /// stdout then stderr of the failed command.
+    pub output: String,
+    /// `git diff --name-only --diff-filter=U` right after the failure.
+    pub unmerged_paths: Vec<String>,
+    /// Staged paths before repair; non-conflicting changes must survive it.
+    pub staged_paths: Vec<String>,
+    /// Squash completion is only automatic while this HEAD is unchanged.
+    pub head_before_fix: String,
+    /// The merge touched the index: `MERGE_HEAD` existed right after the
+    /// failure, or the squash merge's changes were staged and only its
+    /// commit failed.
+    pub merge_in_progress: bool,
+}
+
+/// Lines of the failed command's output the dialog shows.
+pub const MERGE_FIX_PROMPT_OUTPUT_LINES: usize = 12;
+
+impl MergeFailure {
+    /// The merge touched the index (there is something to resolve) rather
+    /// than failing before it started (retry the command instead).
+    pub fn merge_started(&self) -> bool {
+        self.merge_in_progress || !self.unmerged_paths.is_empty()
+    }
+
+    /// Title of the launch-merge-fix-agent dialog. Dialog copy is built here
+    /// so TUI, CLI and API render the same words.
+    pub fn prompt_title(&self) -> String {
+        "Launch an agent to fix the merge? [y/N]".to_string()
+    }
+
+    /// Body of the launch-merge-fix-agent dialog: the failed command, its
+    /// exit code, the first `max_output_lines` lines of its output and the
+    /// unmerged paths.
+    pub fn prompt_body(&self, max_output_lines: usize) -> String {
+        let mut body = format!(
+            "Merging '{}' into '{}' failed.\n\n$ {}\nexit code {}\n",
+            self.branch, self.target_branch, self.command, self.exit_code
+        );
+        let lines: Vec<&str> = self.output.lines().collect();
+        for line in lines.iter().take(max_output_lines) {
+            body.push_str(line);
+            body.push('\n');
+        }
+        if lines.len() > max_output_lines {
+            body.push_str(&format!(
+                "... ({} more line(s))\n",
+                lines.len() - max_output_lines
+            ));
+        }
+        if !self.unmerged_paths.is_empty() {
+            body.push_str("\nUnmerged files:\n");
+            body.push_str(&self.unmerged_paths.join("\n"));
+            body.push('\n');
+        }
+        body.push_str(&format!(
+            "\nThe agent runs in a container on {}. Otherwise the worktree is kept at {} and the merge is left for you.",
+            self.git_root.display(),
+            self.worktree_path.display()
+        ));
+        body
+    }
+}
+
+/// What [`WorktreeLifecycle::finalize`] left for its caller to do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FinalizeOutcome {
+    /// The worktree is handled: merged and cleaned up, kept, discarded, or a
+    /// failed merge reported with no agent wanted.
+    Done,
+    /// The merge failed and an agent was requested (by policy or by the
+    /// frontend). The caller runs it — outside any lock on the frontend,
+    /// because the agent reports through the same frontend — then calls
+    /// [`WorktreeLifecycle::complete_merge_after_fix`]. The frontend has
+    /// already been told about the failure.
+    MergeFixRequested(Box<MergeFailure>),
 }
 
 /// Prebuilt dialog content for the post-workflow worktree-action prompt.
@@ -104,6 +266,21 @@ pub trait WorktreeLifecycleFrontend: GitFrontend + Send + Sync {
 
     fn ask_merge_mode(&mut self, branch: &str) -> Result<WorktreeMergeMode, CommandError>;
 
+    /// The merge target (parent checkout) has uncommitted changes. Commit
+    /// them, stash them, or abort the merge.
+    fn ask_dirty_merge_target(
+        &mut self,
+        target_branch: &str,
+        files: &[String],
+        suggested_message: &str,
+    ) -> Result<DirtyMergeTargetDecision, CommandError>;
+
+    /// A merge-back failed (and `report_merge_conflict` has been called).
+    /// `true` launches an agent to fix it; `false` keeps the worktree and
+    /// leaves the merge for the user. Render `failure.prompt_title()` and
+    /// `failure.prompt_body(..)`.
+    fn ask_launch_merge_fix_agent(&mut self, failure: &MergeFailure) -> Result<bool, CommandError>;
+
     fn confirm_worktree_cleanup(&mut self, branch: &str, path: &Path)
         -> Result<bool, CommandError>;
 
@@ -114,6 +291,7 @@ pub trait WorktreeLifecycleFrontend: GitFrontend + Send + Sync {
     fn report_worktree_kept(&mut self, path: &Path, branch: &str);
 }
 
+#[derive(Clone)]
 pub struct WorktreeLifecycle {
     git_engine: Arc<GitEngine>,
     git_root: PathBuf,
@@ -203,6 +381,11 @@ impl WorktreeLifecycle {
 
     pub fn branch(&self) -> &str {
         &self.branch
+    }
+
+    /// The parent checkout the branch is merged into.
+    pub fn git_root(&self) -> &Path {
+        &self.git_root
     }
 
     /// Compose the [`PostWorkflowWorktreePrompt`] handed to the frontend.
@@ -302,11 +485,102 @@ impl WorktreeLifecycle {
         Ok(self.worktree_path.clone())
     }
 
+    /// Check the merge target (the parent checkout) for uncommitted changes
+    /// and resolve them per `policy` or the frontend. Returns `Ok(())` when
+    /// the merge may proceed; an abort keeps the worktree and ends with
+    /// [`CommandError::MergeTargetDirty`], which is not a merge conflict.
+    fn prepare_merge_target(
+        &self,
+        frontend: &mut dyn WorktreeLifecycleFrontend,
+        policy: FinalizePolicy,
+    ) -> Result<(), CommandError> {
+        let files = self
+            .git_engine
+            .uncommitted_files_logged(&self.git_root, frontend)?;
+        if files.is_empty() {
+            return Ok(());
+        }
+        let target_branch = self
+            .git_engine
+            .current_branch(&self.git_root)
+            .unwrap_or_else(|| "current branch".to_string());
+        let suggested = format!(
+            "WIP: changes on {target_branch} before merging {}",
+            self.branch
+        );
+        let decision = match policy.on_dirty_merge_target {
+            None | Some(OnDirtyMergeTarget::Ask) => {
+                frontend.ask_dirty_merge_target(&target_branch, &files, &suggested)?
+            }
+            Some(OnDirtyMergeTarget::Commit) => {
+                DirtyMergeTargetDecision::Commit { message: suggested }
+            }
+            Some(OnDirtyMergeTarget::Stash) => DirtyMergeTargetDecision::Stash,
+            Some(OnDirtyMergeTarget::Fail) => DirtyMergeTargetDecision::Abort,
+        };
+        match decision {
+            DirtyMergeTargetDecision::Commit { message } => {
+                self.git_engine
+                    .commit_all_logged(&self.git_root, &message, frontend)?;
+                Ok(())
+            }
+            DirtyMergeTargetDecision::Stash => {
+                let message = format!("awman: before merging {}", self.branch);
+                match self
+                    .git_engine
+                    .stash_push_logged(&self.git_root, &message, frontend)
+                {
+                    Ok(()) => {
+                        frontend.write_message(UserMessage {
+                            level: MessageLevel::Info,
+                            text: format!(
+                                "stashed uncommitted changes on '{target_branch}' as stash@{{0}} ({message}); run `git stash pop` when you are ready to restore them"
+                            ),
+                        });
+                        Ok(())
+                    }
+                    Err(e) => {
+                        frontend.write_message(UserMessage {
+                            level: MessageLevel::Error,
+                            text: e.to_string(),
+                        });
+                        Err(self.merge_target_dirty(frontend, target_branch))
+                    }
+                }
+            }
+            DirtyMergeTargetDecision::Abort => {
+                Err(self.merge_target_dirty(frontend, target_branch))
+            }
+        }
+    }
+
+    fn merge_target_dirty(
+        &self,
+        frontend: &mut dyn WorktreeLifecycleFrontend,
+        target_branch: String,
+    ) -> CommandError {
+        frontend.report_worktree_kept(&self.worktree_path, &self.branch);
+        CommandError::MergeTargetDirty {
+            target_branch,
+            branch: self.branch.clone(),
+            worktree_path: self.worktree_path.clone(),
+        }
+    }
+
+    /// Ask what to do with the worktree and do it.
+    ///
+    /// A failed merge (a conflict or any other non-zero `git merge`) is
+    /// reported with `report_merge_conflict`; then, per
+    /// `policy.on_merge_failure` or the frontend, either `Ok(Done)` (the
+    /// worktree is kept and the merge left for the user, today's behaviour)
+    /// or `Ok(MergeFixRequested)`, after which the caller runs the merge-fix
+    /// agent and calls [`Self::complete_merge_after_fix`].
     pub async fn finalize(
         &self,
         frontend: &mut dyn WorktreeLifecycleFrontend,
         had_error: bool,
-    ) -> Result<(), CommandError> {
+        policy: FinalizePolicy,
+    ) -> Result<FinalizeOutcome, CommandError> {
         let prompt = self.build_post_workflow_prompt(had_error);
         let action = frontend.ask_post_workflow_action(&prompt)?;
         match action {
@@ -331,11 +605,12 @@ impl WorktreeLifecycle {
                 let squash = match mode {
                     WorktreeMergeMode::LeaveBranch => {
                         frontend.report_worktree_kept(&self.worktree_path, &self.branch);
-                        return Ok(());
+                        return Ok(FinalizeOutcome::Done);
                     }
                     WorktreeMergeMode::Squash => true,
                     WorktreeMergeMode::Merge => false,
                 };
+                self.prepare_merge_target(frontend, policy)?;
                 match self.git_engine.merge_branch_logged(
                     &self.git_root,
                     &self.branch,
@@ -343,29 +618,24 @@ impl WorktreeLifecycle {
                     squash,
                     frontend,
                 ) {
-                    Ok(()) => {
-                        if frontend.confirm_worktree_cleanup(&self.branch, &self.worktree_path)? {
-                            self.git_engine.remove_worktree_logged(
-                                &self.git_root,
-                                &self.worktree_path,
-                                frontend,
-                            )?;
-                            self.git_engine.delete_branch_logged(
-                                &self.git_root,
-                                &self.branch,
-                                frontend,
-                            )?;
-                            frontend.report_worktree_discarded(&self.branch);
-                        } else {
-                            frontend.report_worktree_kept(&self.worktree_path, &self.branch);
-                        }
-                    }
-                    Err(EngineError::MergeConflict { .. }) => {
+                    Ok(()) => self.cleanup_after_merge(frontend)?,
+                    Err(EngineError::MergeFailed(detail)) => {
+                        let failure = self.merge_failure(frontend, squash, *detail)?;
                         frontend.report_merge_conflict(
                             &self.branch,
                             &self.worktree_path,
                             &self.git_root,
                         );
+                        let launch = match policy.on_merge_failure {
+                            Some(OnMergeFailure::Keep) => false,
+                            Some(OnMergeFailure::Agent) => true,
+                            None | Some(OnMergeFailure::Ask) => {
+                                frontend.ask_launch_merge_fix_agent(&failure)?
+                            }
+                        };
+                        if launch {
+                            return Ok(FinalizeOutcome::MergeFixRequested(Box::new(failure)));
+                        }
                     }
                     Err(other) => return Err(CommandError::from(other)),
                 }
@@ -384,7 +654,270 @@ impl WorktreeLifecycle {
                 frontend.report_worktree_kept(&self.worktree_path, &self.branch);
             }
         }
+        Ok(FinalizeOutcome::Done)
+    }
+
+    /// The post-merge cleanup: ask, then remove the worktree and delete the
+    /// branch, or keep them.
+    fn cleanup_after_merge(
+        &self,
+        frontend: &mut dyn WorktreeLifecycleFrontend,
+    ) -> Result<(), CommandError> {
+        if frontend.confirm_worktree_cleanup(&self.branch, &self.worktree_path)? {
+            self.git_engine.remove_worktree_logged(
+                &self.git_root,
+                &self.worktree_path,
+                frontend,
+            )?;
+            self.git_engine
+                .delete_branch_logged(&self.git_root, &self.branch, frontend)?;
+            frontend.report_worktree_discarded(&self.branch);
+        } else {
+            frontend.report_worktree_kept(&self.worktree_path, &self.branch);
+        }
         Ok(())
+    }
+
+    /// Describe a failed merge: the command and its output from the engine
+    /// error, plus the index state right after it.
+    fn merge_failure(
+        &self,
+        frontend: &mut dyn WorktreeLifecycleFrontend,
+        squash: bool,
+        detail: MergeFailedDetail,
+    ) -> Result<MergeFailure, CommandError> {
+        let MergeFailedDetail {
+            command,
+            exit_code,
+            output,
+            ..
+        } = detail;
+        let unmerged_paths = self
+            .git_engine
+            .unmerged_paths_logged(&self.git_root, frontend)?;
+        // A squash merge whose commit failed has its changes staged: there is
+        // a merge to complete, not one to retry.
+        let squash_commit_failed = squash && command.starts_with("git commit");
+        let merge_in_progress = squash_commit_failed
+            || self
+                .git_engine
+                .merge_in_progress_logged(&self.git_root, frontend);
+        let staged_paths = self
+            .git_engine
+            .staged_paths_logged(&self.git_root, frontend)?;
+        let head_before_fix = self
+            .git_engine
+            .head_commit_logged(&self.git_root, frontend)?;
+        Ok(MergeFailure {
+            branch: self.branch.clone(),
+            target_branch: self
+                .git_engine
+                .current_branch(&self.git_root)
+                .unwrap_or_else(|| "current branch".to_string()),
+            worktree_path: self.worktree_path.clone(),
+            git_root: self.git_root.clone(),
+            squash,
+            command,
+            exit_code,
+            output,
+            unmerged_paths,
+            staged_paths,
+            head_before_fix,
+            merge_in_progress,
+        })
+    }
+
+    /// Finish a failed merge after the merge-fix agent exited. One attempt,
+    /// no loop.
+    ///
+    /// - `agent_ran == false` (the agent could not start): fall back to
+    ///   keeping the worktree and the merge state, as if no agent had been
+    ///   wanted, and return `Ok`.
+    /// - The merge never started (it failed before touching the index):
+    ///   retry the merge command once.
+    /// - Otherwise verify: no conflict markers in the originally unmerged
+    ///   files, stage them, no unmerged paths left. Then commit
+    ///   (`--no-edit` for a plain merge, [`squash_commit_message`] for a
+    ///   squash) and run the normal cleanup.
+    ///
+    /// Still broken: `report_merge_conflict`, keep the worktree and the merge
+    /// state, and return `Err(CommandError::MergeConflict)`. That an
+    /// unresolved merge is an error here, while a declined agent is `Ok`, is
+    /// deliberate: declining is today's behaviour; a fix the user asked for
+    /// that did not work must end the command as failed.
+    pub async fn complete_merge_after_fix(
+        &self,
+        frontend: &mut dyn WorktreeLifecycleFrontend,
+        failure: &MergeFailure,
+        agent_ran: bool,
+    ) -> Result<(), CommandError> {
+        if !agent_ran {
+            frontend.write_message(UserMessage {
+                level: MessageLevel::Warning,
+                text: format!(
+                    "merge-fix agent did not run; merge left unresolved in {} and worktree kept at {}",
+                    self.git_root.display(),
+                    self.worktree_path.display()
+                ),
+            });
+            frontend.report_worktree_kept(&self.worktree_path, &self.branch);
+            return Ok(());
+        }
+
+        if !failure.merge_started() {
+            return match self.git_engine.merge_branch_logged(
+                &self.git_root,
+                &self.branch,
+                &self.worktree_path,
+                failure.squash,
+                frontend,
+            ) {
+                Ok(()) => {
+                    self.report_merge_completed(frontend);
+                    self.cleanup_after_merge(frontend)
+                }
+                Err(EngineError::MergeFailed(_)) => {
+                    Err(self.merge_still_unresolved(frontend, "retrying the merge failed again"))
+                }
+                Err(other) => Err(CommandError::from(other)),
+            };
+        }
+
+        // A missing file can be a deliberate deletion; other read failures
+        // cannot prove the resolution safe.
+        let mut still_marked = Vec::new();
+        for path in &failure.unmerged_paths {
+            match std::fs::read(self.git_root.join(path)) {
+                Ok(bytes) if has_conflict_markers(&String::from_utf8_lossy(&bytes)) => {
+                    still_marked.push(path)
+                }
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(self
+                        .merge_still_unresolved(frontend, &format!("cannot inspect {path}: {e}")))
+                }
+            }
+        }
+        if !still_marked.is_empty() {
+            let list = still_marked
+                .iter()
+                .map(|p| p.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(self
+                .merge_still_unresolved(frontend, &format!("conflict markers remain in {list}")));
+        }
+
+        // The agent was told not to commit, and may not have staged either.
+        // A path one side deleted is staged as a deletion.
+        if let Err(e) =
+            self.git_engine
+                .stage_paths_logged(&self.git_root, &failure.unmerged_paths, frontend)
+        {
+            return Err(self.merge_still_unresolved(frontend, &e.to_string()));
+        }
+        let remaining = self
+            .git_engine
+            .unmerged_paths_logged(&self.git_root, frontend)?;
+        if !remaining.is_empty() {
+            return Err(self.merge_still_unresolved(
+                frontend,
+                &format!("unmerged paths remain: {}", remaining.join(", ")),
+            ));
+        }
+
+        let commit = if failure.squash {
+            if self
+                .git_engine
+                .head_commit_logged(&self.git_root, frontend)?
+                != failure.head_before_fix
+            {
+                return Err(self.merge_still_unresolved(
+                    frontend,
+                    "HEAD changed during squash repair; completion cannot be verified",
+                ));
+            }
+            let staged = self
+                .git_engine
+                .staged_paths_logged(&self.git_root, frontend)?;
+            if failure
+                .staged_paths
+                .iter()
+                .any(|path| !failure.unmerged_paths.contains(path) && !staged.contains(path))
+            {
+                return Err(self.merge_still_unresolved(frontend,
+                    "a non-conflicting staged squash change was discarded; completion cannot be verified"));
+            }
+            if self
+                .git_engine
+                .has_staged_changes_logged(&self.git_root, frontend)?
+            {
+                let message = squash_commit_message(&self.branch);
+                self.git_engine
+                    .commit_merge_logged(&self.git_root, Some(&message), frontend)
+            } else {
+                // An empty index can mean the agent discarded the squash or
+                // committed an unrelated result. There is no ancestry proof.
+                return Err(self.merge_still_unresolved(
+                    frontend,
+                    "no staged squash result remains; completion cannot be verified",
+                ));
+            }
+        } else if self
+            .git_engine
+            .merge_in_progress_logged(&self.git_root, frontend)
+        {
+            self.git_engine
+                .commit_merge_logged(&self.git_root, None, frontend)
+        } else if self
+            .git_engine
+            .is_merged_into_head_logged(&self.git_root, &self.branch, frontend)
+        {
+            // The agent committed the merge despite being told not to; the
+            // branch is in HEAD, which is what was wanted.
+            Ok(())
+        } else {
+            // No merge in progress and the branch is not merged: the merge
+            // state was thrown away (`git merge --abort`).
+            return Err(self.merge_still_unresolved(
+                frontend,
+                "the merge is no longer in progress and the branch is not merged",
+            ));
+        };
+        if let Err(e) = commit {
+            return Err(self.merge_still_unresolved(frontend, &e.to_string()));
+        }
+        self.report_merge_completed(frontend);
+        self.cleanup_after_merge(frontend)
+    }
+
+    fn report_merge_completed(&self, frontend: &mut dyn WorktreeLifecycleFrontend) {
+        frontend.write_message(UserMessage {
+            level: MessageLevel::Info,
+            text: format!("merge completed: '{}' merged", self.branch),
+        });
+    }
+
+    /// Report a merge the agent did not fix and build the command's error.
+    fn merge_still_unresolved(
+        &self,
+        frontend: &mut dyn WorktreeLifecycleFrontend,
+        reason: &str,
+    ) -> CommandError {
+        frontend.write_message(UserMessage {
+            level: MessageLevel::Error,
+            text: format!(
+                "merge still unresolved ({reason}); worktree kept at {}",
+                self.worktree_path.display()
+            ),
+        });
+        frontend.report_merge_conflict(&self.branch, &self.worktree_path, &self.git_root);
+        CommandError::MergeConflict {
+            branch: self.branch.clone(),
+            worktree_path: self.worktree_path.clone(),
+            git_root: self.git_root.clone(),
+        }
     }
 }
 
@@ -425,6 +958,10 @@ mod tests {
         commit_before_merge_response: Option<String>,
         merge_mode_response: WorktreeMergeMode,
         confirm_cleanup_response: bool,
+        dirty_merge_target_response: DirtyMergeTargetDecision,
+        dirty_merge_target_calls: Vec<(String, Vec<String>, String)>,
+        launch_merge_fix_response: bool,
+        launch_merge_fix_calls: Vec<MergeFailure>,
 
         messages: Vec<UserMessage>,
         worktree_created_calls: Vec<(PathBuf, String)>,
@@ -442,6 +979,10 @@ mod tests {
                 commit_before_merge_response: None,
                 merge_mode_response: WorktreeMergeMode::Squash,
                 confirm_cleanup_response: true,
+                dirty_merge_target_response: DirtyMergeTargetDecision::Abort,
+                dirty_merge_target_calls: vec![],
+                launch_merge_fix_response: false,
+                launch_merge_fix_calls: vec![],
                 messages: vec![],
                 worktree_created_calls: vec![],
                 merge_conflict_calls: vec![],
@@ -496,8 +1037,30 @@ mod tests {
             Ok(self.commit_before_merge_response.clone())
         }
 
+        fn ask_dirty_merge_target(
+            &mut self,
+            target_branch: &str,
+            files: &[String],
+            suggested_message: &str,
+        ) -> Result<DirtyMergeTargetDecision, CommandError> {
+            self.dirty_merge_target_calls.push((
+                target_branch.to_string(),
+                files.to_vec(),
+                suggested_message.to_string(),
+            ));
+            Ok(self.dirty_merge_target_response.clone())
+        }
+
         fn ask_merge_mode(&mut self, _branch: &str) -> Result<WorktreeMergeMode, CommandError> {
             Ok(self.merge_mode_response)
+        }
+
+        fn ask_launch_merge_fix_agent(
+            &mut self,
+            failure: &MergeFailure,
+        ) -> Result<bool, CommandError> {
+            self.launch_merge_fix_calls.push(failure.clone());
+            Ok(self.launch_merge_fix_response)
         }
 
         fn confirm_worktree_cleanup(
@@ -871,7 +1434,9 @@ mod tests {
         );
         let mut fe = RecordingWorktreeLifecycleFrontend::new();
         fe.post_workflow_action = PostWorkflowWorktreeAction::Keep;
-        let result = lifecycle.finalize(&mut fe, false).await;
+        let result = lifecycle
+            .finalize(&mut fe, false, FinalizePolicy::default())
+            .await;
         assert!(result.is_ok(), "finalize(Keep) must return Ok: {result:?}");
         assert_eq!(fe.kept_calls.len(), 1);
         assert_eq!(fe.kept_calls[0].0, wt_path);
@@ -899,7 +1464,9 @@ mod tests {
         );
         let mut fe = RecordingWorktreeLifecycleFrontend::new();
         fe.post_workflow_action = PostWorkflowWorktreeAction::Discard;
-        let result = lifecycle.finalize(&mut fe, false).await;
+        let result = lifecycle
+            .finalize(&mut fe, false, FinalizePolicy::default())
+            .await;
         assert!(
             result.is_ok(),
             "finalize(Discard) must return Ok: {result:?}"
@@ -942,7 +1509,9 @@ mod tests {
         fe.post_workflow_action = PostWorkflowWorktreeAction::Merge;
         fe.merge_mode_response = WorktreeMergeMode::Squash;
         fe.confirm_cleanup_response = true;
-        let result = lifecycle.finalize(&mut fe, false).await;
+        let result = lifecycle
+            .finalize(&mut fe, false, FinalizePolicy::default())
+            .await;
         assert!(result.is_ok(), "finalize(Merge) must return Ok: {result:?}");
         assert!(
             !wt_path.exists(),
@@ -954,6 +1523,66 @@ mod tests {
             "report_worktree_discarded must be called"
         );
         assert!(fe.merge_conflict_calls.is_empty());
+    }
+
+    /// A repo with a worktree branch holding one commit, and an untracked
+    /// file in the parent checkout so the merge target is dirty.
+    fn dirty_target_fixture(
+        branch: &str,
+    ) -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        WorktreeLifecycle,
+        PathBuf,
+    ) {
+        let repo = tempfile::tempdir().unwrap();
+        let wt_dir = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let git_root = repo.path().to_path_buf();
+        let wt_path = wt_dir.path().join("wt");
+        let engine = Arc::new(GitEngine::new());
+        engine.create_worktree(&git_root, &wt_path, branch).unwrap();
+        std::fs::write(wt_path.join("work.txt"), "done").unwrap();
+        engine
+            .commit_all(&wt_path, "work done in worktree")
+            .unwrap();
+        std::fs::write(git_root.join("scratch.txt"), "user edit").unwrap();
+        let lifecycle =
+            WorktreeLifecycle::new_for_test(engine, git_root, wt_path.clone(), branch.to_string());
+        (repo, wt_dir, lifecycle, wt_path)
+    }
+
+    #[tokio::test]
+    async fn finalize_dirty_merge_target_abort_keeps_worktree_and_is_not_a_conflict() {
+        let (_repo, _wt_dir, lifecycle, wt_path) = dirty_target_fixture("awman/dirty-abort");
+        let mut fe = RecordingWorktreeLifecycleFrontend::new();
+        fe.post_workflow_action = PostWorkflowWorktreeAction::Merge;
+        let result = lifecycle
+            .finalize(&mut fe, false, FinalizePolicy::default())
+            .await;
+        assert!(matches!(result, Err(CommandError::MergeTargetDirty { .. })));
+        assert!(wt_path.exists());
+        assert_eq!(fe.dirty_merge_target_calls.len(), 1);
+        assert!(fe.merge_conflict_calls.is_empty());
+        assert_eq!(fe.kept_calls.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn finalize_dirty_merge_target_stash_policy_stashes_and_merges() {
+        let (repo, _wt_dir, lifecycle, wt_path) = dirty_target_fixture("awman/dirty-stash");
+        let mut fe = RecordingWorktreeLifecycleFrontend::new();
+        fe.post_workflow_action = PostWorkflowWorktreeAction::Merge;
+        let policy = FinalizePolicy {
+            on_dirty_merge_target: Some(OnDirtyMergeTarget::Stash),
+            on_merge_failure: None,
+        };
+        let result = lifecycle.finalize(&mut fe, false, policy).await;
+        assert!(result.is_ok(), "{result:?}");
+        assert!(fe.dirty_merge_target_calls.is_empty(), "flag skips the ask");
+        assert!(!wt_path.exists());
+        assert!(!repo.path().join("scratch.txt").exists(), "stashed away");
+        assert!(repo.path().join("work.txt").exists(), "merged");
+        assert!(fe.messages.iter().any(|m| m.text.contains("git stash pop")));
     }
 
     #[tokio::test]
@@ -976,7 +1605,9 @@ mod tests {
         fe.commit_before_merge_response = Some("pre-merge commit".to_string());
         fe.merge_mode_response = WorktreeMergeMode::Squash;
         fe.confirm_cleanup_response = true;
-        let result = lifecycle.finalize(&mut fe, false).await;
+        let result = lifecycle
+            .finalize(&mut fe, false, FinalizePolicy::default())
+            .await;
         assert!(
             result.is_ok(),
             "finalize with pre-merge commit must succeed: {result:?}"
@@ -1009,7 +1640,9 @@ mod tests {
         fe.post_workflow_action = PostWorkflowWorktreeAction::Merge;
         fe.merge_mode_response = WorktreeMergeMode::Merge;
         fe.confirm_cleanup_response = true;
-        let result = lifecycle.finalize(&mut fe, false).await;
+        let result = lifecycle
+            .finalize(&mut fe, false, FinalizePolicy::default())
+            .await;
         assert!(
             result.is_ok(),
             "finalize(Merge, no squash) must return Ok: {result:?}"
@@ -1059,7 +1692,9 @@ mod tests {
         fe.merge_mode_response = WorktreeMergeMode::LeaveBranch;
         fe.commit_before_merge_response = Some("tidy up branch".to_string());
         let before = git_log_count(&wt_path);
-        let result = lifecycle.finalize(&mut fe, false).await;
+        let result = lifecycle
+            .finalize(&mut fe, false, FinalizePolicy::default())
+            .await;
         assert!(
             result.is_ok(),
             "finalize(LeaveBranch) must return Ok: {result:?}"
@@ -1141,8 +1776,23 @@ mod tests {
                 self.inner
                     .ask_worktree_commit_before_merge(branch, files, suggested_message)
             }
+            fn ask_dirty_merge_target(
+                &mut self,
+                target_branch: &str,
+                files: &[String],
+                suggested_message: &str,
+            ) -> Result<DirtyMergeTargetDecision, CommandError> {
+                self.inner
+                    .ask_dirty_merge_target(target_branch, files, suggested_message)
+            }
             fn ask_merge_mode(&mut self, branch: &str) -> Result<WorktreeMergeMode, CommandError> {
                 self.inner.ask_merge_mode(branch)
+            }
+            fn ask_launch_merge_fix_agent(
+                &mut self,
+                failure: &MergeFailure,
+            ) -> Result<bool, CommandError> {
+                self.inner.ask_launch_merge_fix_agent(failure)
             }
             fn confirm_worktree_cleanup(
                 &mut self,
@@ -1182,7 +1832,9 @@ mod tests {
             },
             received_had_error: None,
         };
-        let result = lifecycle.finalize(&mut fe, true).await;
+        let result = lifecycle
+            .finalize(&mut fe, true, FinalizePolicy::default())
+            .await;
         assert!(result.is_ok(), "finalize must return Ok: {result:?}");
         assert_eq!(
             fe.received_had_error,
@@ -1217,7 +1869,9 @@ mod tests {
         let mut fe = RecordingWorktreeLifecycleFrontend::new();
         fe.post_workflow_action = PostWorkflowWorktreeAction::Merge;
         fe.merge_mode_response = WorktreeMergeMode::Squash;
-        let result = lifecycle.finalize(&mut fe, false).await;
+        let result = lifecycle
+            .finalize(&mut fe, false, FinalizePolicy::default())
+            .await;
         assert!(result.is_ok(), "merge conflict must return Ok: {result:?}");
         assert_eq!(
             fe.merge_conflict_calls.len(),
@@ -1236,6 +1890,710 @@ mod tests {
             .stderr(std::process::Stdio::null())
             .status()
             .ok();
+    }
+
+    /// A conflicted merge with `on_merge_failure = Agent`: `finalize` hands
+    /// the failure back without asking, and `fix` stands in for the agent
+    /// between `finalize` and `complete_merge_after_fix`.
+    async fn conflicted_merge_with_fake_agent(
+        squash: bool,
+        fix: impl FnOnce(&Path),
+    ) -> (
+        RecordingWorktreeLifecycleFrontend,
+        MergeFailure,
+        Result<(), CommandError>,
+        PathBuf,
+        tempfile::TempDir,
+        tempfile::TempDir,
+    ) {
+        let repo = tempfile::tempdir().unwrap();
+        let wt_dir = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let git_root = repo.path().to_path_buf();
+        let wt_path = wt_dir.path().join("wt");
+        let branch = "awman/fix-branch";
+        let engine = Arc::new(GitEngine::new());
+        engine.create_worktree(&git_root, &wt_path, branch).unwrap();
+        std::fs::write(wt_path.join("README.md"), "branch version\n").unwrap();
+        std::fs::write(wt_path.join("feature-only.txt"), "feature\n").unwrap();
+        engine.commit_all(&wt_path, "branch change").unwrap();
+        std::fs::write(git_root.join("README.md"), "main version\n").unwrap();
+        engine.commit_all(&git_root, "main change").unwrap();
+
+        let lifecycle =
+            WorktreeLifecycle::new_for_test(engine, git_root.clone(), wt_path, branch.to_string());
+        let mut fe = RecordingWorktreeLifecycleFrontend::new();
+        fe.post_workflow_action = PostWorkflowWorktreeAction::Merge;
+        fe.merge_mode_response = if squash {
+            WorktreeMergeMode::Squash
+        } else {
+            WorktreeMergeMode::Merge
+        };
+        let policy = FinalizePolicy {
+            on_merge_failure: Some(OnMergeFailure::Agent),
+            ..FinalizePolicy::default()
+        };
+        let failure = match lifecycle.finalize(&mut fe, false, policy).await.unwrap() {
+            FinalizeOutcome::MergeFixRequested(failure) => *failure,
+            FinalizeOutcome::Done => panic!("a conflicted merge must request the agent"),
+        };
+        assert!(fe.launch_merge_fix_calls.is_empty(), "policy must not ask");
+        fix(&git_root);
+        let result = lifecycle
+            .complete_merge_after_fix(&mut fe, &failure, true)
+            .await;
+        (fe, failure, result, git_root, repo, wt_dir)
+    }
+
+    #[tokio::test]
+    async fn merge_fix_resolved_by_agent_commits_and_cleans_up() {
+        for squash in [false, true] {
+            let (fe, failure, result, git_root, _repo, _wt) =
+                conflicted_merge_with_fake_agent(squash, |root| {
+                    std::fs::write(root.join("README.md"), "both versions\n").unwrap();
+                })
+                .await;
+            assert_eq!(failure.unmerged_paths, vec!["README.md".to_string()]);
+            assert!(failure.merge_started());
+            result.unwrap_or_else(|e| panic!("squash={squash}: {e}"));
+            assert_eq!(fe.discarded_calls.len(), 1, "squash={squash}");
+            let log = SysCmd::new("git")
+                .args(["log", "-1", "--format=%s"])
+                .current_dir(&git_root)
+                .output()
+                .unwrap();
+            let subject = String::from_utf8_lossy(&log.stdout).trim().to_string();
+            let expected = if squash {
+                "Implement awman/fix-branch"
+            } else {
+                "Merge awman/fix-branch"
+            };
+            assert_eq!(subject, expected);
+        }
+    }
+
+    // ─── WI 0132 Part B: dirty merge target ───────────────────────────────────
+
+    fn git_out(dir: &Path, args: &[&str]) -> String {
+        let out = SysCmd::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn merging_frontend() -> RecordingWorktreeLifecycleFrontend {
+        let mut fe = RecordingWorktreeLifecycleFrontend::new();
+        fe.post_workflow_action = PostWorkflowWorktreeAction::Merge;
+        fe.merge_mode_response = WorktreeMergeMode::Squash;
+        fe
+    }
+
+    fn dirty_policy(choice: OnDirtyMergeTarget) -> FinalizePolicy {
+        FinalizePolicy {
+            on_dirty_merge_target: Some(choice),
+            on_merge_failure: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn finalize_clean_merge_target_merges_without_asking() {
+        let (repo, _wt_dir, lifecycle, wt_path) = dirty_target_fixture("awman/clean-target");
+        std::fs::remove_file(repo.path().join("scratch.txt")).unwrap();
+        let mut fe = merging_frontend();
+        // Even a policy that would fail a dirty target must not matter here.
+        let result = lifecycle
+            .finalize(&mut fe, false, dirty_policy(OnDirtyMergeTarget::Fail))
+            .await;
+        assert!(result.is_ok(), "{result:?}");
+        assert!(fe.dirty_merge_target_calls.is_empty());
+        assert!(repo.path().join("work.txt").exists());
+        assert!(!wt_path.exists());
+    }
+
+    #[tokio::test]
+    async fn finalize_dirty_target_commit_policy_commits_then_merges() {
+        let (repo, _wt_dir, lifecycle, wt_path) = dirty_target_fixture("awman/dirty-commit");
+        let mut fe = merging_frontend();
+        let result = lifecycle
+            .finalize(&mut fe, false, dirty_policy(OnDirtyMergeTarget::Commit))
+            .await;
+        assert!(result.is_ok(), "{result:?}");
+        assert!(fe.dirty_merge_target_calls.is_empty(), "flag skips the ask");
+        assert!(!wt_path.exists());
+        // The user's file is committed (not stashed, not lost) ...
+        assert!(repo.path().join("scratch.txt").exists());
+        assert_eq!(git_out(repo.path(), &["status", "--porcelain"]), "");
+        let tracked = git_out(repo.path(), &["ls-files"]);
+        assert!(tracked.contains("scratch.txt") && tracked.contains("work.txt"));
+        // ... in its own WIP commit, before the squash commit.
+        let log = git_out(repo.path(), &["log", "--format=%s"]);
+        let subjects: Vec<&str> = log.lines().collect();
+        assert!(subjects[0].starts_with("Implement awman/dirty-commit"));
+        assert!(subjects[1].starts_with("WIP: changes on"));
+        assert_eq!(git_out(repo.path(), &["stash", "list"]), "");
+    }
+
+    #[tokio::test]
+    async fn finalize_dirty_target_asked_commit_uses_the_chosen_message() {
+        let (repo, _wt_dir, lifecycle, _wt_path) = dirty_target_fixture("awman/dirty-ask-commit");
+        let mut fe = merging_frontend();
+        fe.dirty_merge_target_response = DirtyMergeTargetDecision::Commit {
+            message: "my own message".to_string(),
+        };
+        lifecycle
+            .finalize(&mut fe, false, FinalizePolicy::default())
+            .await
+            .unwrap();
+        assert_eq!(fe.dirty_merge_target_calls.len(), 1);
+        assert!(git_out(repo.path(), &["log", "--format=%s"]).contains("my own message"));
+    }
+
+    #[tokio::test]
+    async fn finalize_dirty_target_asked_stash_leaves_one_stash_entry_and_merges() {
+        let (repo, _wt_dir, lifecycle, wt_path) = dirty_target_fixture("awman/dirty-ask-stash");
+        let mut fe = merging_frontend();
+        fe.dirty_merge_target_response = DirtyMergeTargetDecision::Stash;
+        let result = lifecycle
+            .finalize(&mut fe, false, FinalizePolicy::default())
+            .await;
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(fe.dirty_merge_target_calls.len(), 1);
+        let stashes = git_out(repo.path(), &["stash", "list"]);
+        assert_eq!(stashes.lines().count(), 1, "{stashes}");
+        assert!(stashes.contains("awman: before merging awman/dirty-ask-stash"));
+        // The stash is never popped: the file stays out of the checkout.
+        assert!(!repo.path().join("scratch.txt").exists());
+        assert!(repo.path().join("work.txt").exists());
+        assert!(!wt_path.exists());
+    }
+
+    #[tokio::test]
+    async fn finalize_dirty_target_fail_policy_aborts_without_a_merge_attempt() {
+        let (repo, _wt_dir, lifecycle, wt_path) = dirty_target_fixture("awman/dirty-fail");
+        let mut fe = merging_frontend();
+        let result = lifecycle
+            .finalize(&mut fe, false, dirty_policy(OnDirtyMergeTarget::Fail))
+            .await;
+        let Err(CommandError::MergeTargetDirty {
+            target_branch,
+            branch,
+            worktree_path,
+        }) = result
+        else {
+            panic!("expected MergeTargetDirty");
+        };
+        assert!(!target_branch.is_empty());
+        assert_eq!(branch, "awman/dirty-fail");
+        assert_eq!(worktree_path, wt_path);
+        assert!(fe.dirty_merge_target_calls.is_empty(), "flag skips the ask");
+        assert!(wt_path.exists());
+        assert!(fe.merge_conflict_calls.is_empty());
+        assert!(fe.discarded_calls.is_empty());
+        assert_eq!(fe.kept_calls.len(), 1);
+        // No merge was attempted: nothing merged, nothing staged, no MERGE_HEAD.
+        assert!(!repo.path().join("work.txt").exists());
+        assert!(!git_out(repo.path(), &["status", "--porcelain"]).contains("work.txt"));
+        assert!(repo.path().join("scratch.txt").exists(), "user file intact");
+    }
+
+    #[tokio::test]
+    async fn finalize_dirty_target_abort_error_is_not_a_merge_conflict() {
+        let (_repo, _wt_dir, lifecycle, _wt_path) = dirty_target_fixture("awman/dirty-abort-kind");
+        let mut fe = merging_frontend();
+        let err = lifecycle
+            .finalize(&mut fe, false, FinalizePolicy::default())
+            .await
+            .unwrap_err();
+        assert!(!matches!(err, CommandError::MergeConflict { .. }));
+        assert!(
+            !err.to_string().to_lowercase().contains("conflict"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn finalize_untracked_only_target_counts_as_dirty() {
+        let (repo, _wt_dir, lifecycle, _wt_path) = dirty_target_fixture("awman/dirty-untracked");
+        // Only an untracked file: no tracked file is modified.
+        assert_eq!(
+            git_out(repo.path(), &["status", "--porcelain"]),
+            "?? scratch.txt"
+        );
+        let mut fe = merging_frontend();
+        let _ = lifecycle
+            .finalize(&mut fe, false, FinalizePolicy::default())
+            .await;
+        assert_eq!(fe.dirty_merge_target_calls.len(), 1);
+        assert!(fe.dirty_merge_target_calls[0]
+            .1
+            .iter()
+            .any(|f| f.contains("scratch.txt")));
+    }
+
+    #[tokio::test]
+    async fn finalize_modified_tracked_target_counts_as_dirty() {
+        let (repo, _wt_dir, lifecycle, _wt_path) = dirty_target_fixture("awman/dirty-tracked");
+        std::fs::remove_file(repo.path().join("scratch.txt")).unwrap();
+        std::fs::write(repo.path().join("README.md"), "edited").unwrap();
+        let mut fe = merging_frontend();
+        let _ = lifecycle
+            .finalize(&mut fe, false, FinalizePolicy::default())
+            .await;
+        assert_eq!(fe.dirty_merge_target_calls.len(), 1);
+        assert!(!fe.dirty_merge_target_calls[0].0.is_empty());
+        assert_eq!(fe.dirty_merge_target_calls[0].1.len(), 1);
+        assert!(fe.dirty_merge_target_calls[0].1[0].contains("README.md"));
+    }
+
+    #[tokio::test]
+    async fn finalize_failed_stash_becomes_abort() {
+        let (repo, _wt_dir, lifecycle, wt_path) = dirty_target_fixture("awman/dirty-stash-fails");
+        // A held index lock makes `git stash push` fail.
+        std::fs::write(repo.path().join(".git").join("index.lock"), "").unwrap();
+        let mut fe = merging_frontend();
+        let result = lifecycle
+            .finalize(&mut fe, false, dirty_policy(OnDirtyMergeTarget::Stash))
+            .await;
+        assert!(
+            matches!(result, Err(CommandError::MergeTargetDirty { .. })),
+            "{result:?}"
+        );
+        assert!(wt_path.exists());
+        assert_eq!(fe.kept_calls.len(), 1);
+        assert!(fe.merge_conflict_calls.is_empty());
+        assert!(fe.messages.iter().any(|m| m.level == MessageLevel::Error));
+        assert!(!fe.messages.iter().any(|m| m.text.contains("git stash pop")));
+        assert!(!repo.path().join("work.txt").exists(), "no merge attempt");
+    }
+
+    // ─── WI 0132 Part C: merge-fix agent ──────────────────────────────────────
+
+    /// A repo whose worktree branch conflicts with the parent's `README.md`.
+    fn conflict_fixture(branch: &str) -> (tempfile::TempDir, tempfile::TempDir, WorktreeLifecycle) {
+        let repo = tempfile::tempdir().unwrap();
+        let wt_dir = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let git_root = repo.path().to_path_buf();
+        let wt_path = wt_dir.path().join("wt");
+        let engine = Arc::new(GitEngine::new());
+        engine.create_worktree(&git_root, &wt_path, branch).unwrap();
+        std::fs::write(wt_path.join("README.md"), "branch version\n").unwrap();
+        engine.commit_all(&wt_path, "branch change").unwrap();
+        std::fs::write(git_root.join("README.md"), "main version\n").unwrap();
+        engine.commit_all(&git_root, "main change").unwrap();
+        let lifecycle = WorktreeLifecycle::new_for_test(engine, git_root, wt_path, branch.into());
+        (repo, wt_dir, lifecycle)
+    }
+
+    fn abort_merge(root: &Path) {
+        SysCmd::new("git")
+            .args(["merge", "--abort"])
+            .current_dir(root)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .ok();
+    }
+
+    #[tokio::test]
+    async fn finalize_conflict_with_agent_declined_reports_conflict_and_keeps_worktree() {
+        let (repo, _wt_dir, lifecycle) = conflict_fixture("awman/decline");
+        let mut fe = merging_frontend();
+        fe.launch_merge_fix_response = false;
+        let outcome = lifecycle
+            .finalize(&mut fe, false, FinalizePolicy::default())
+            .await
+            .unwrap();
+        assert!(matches!(outcome, FinalizeOutcome::Done));
+        assert_eq!(fe.merge_conflict_calls, vec!["awman/decline".to_string()]);
+        assert_eq!(fe.launch_merge_fix_calls.len(), 1);
+        let asked = &fe.launch_merge_fix_calls[0];
+        assert_eq!(asked.branch, "awman/decline");
+        assert!(asked.squash);
+        assert_eq!(asked.unmerged_paths, vec!["README.md".to_string()]);
+        assert!(asked.command.contains("git merge --squash"));
+        assert!(lifecycle.worktree_path.exists());
+        assert!(fe.discarded_calls.is_empty());
+        abort_merge(repo.path());
+    }
+
+    #[tokio::test]
+    async fn finalize_keep_policy_never_asks_and_agent_policy_never_asks() {
+        for (choice, expect_fix) in [(OnMergeFailure::Keep, false), (OnMergeFailure::Agent, true)] {
+            let (repo, _wt_dir, lifecycle) = conflict_fixture("awman/policy");
+            let mut fe = merging_frontend();
+            fe.launch_merge_fix_response = !expect_fix; // the opposite: must be ignored
+            let policy = FinalizePolicy {
+                on_dirty_merge_target: None,
+                on_merge_failure: Some(choice),
+            };
+            let outcome = lifecycle.finalize(&mut fe, false, policy).await.unwrap();
+            assert!(fe.launch_merge_fix_calls.is_empty(), "{choice:?} asked");
+            assert_eq!(fe.merge_conflict_calls.len(), 1, "{choice:?}");
+            assert_eq!(
+                matches!(outcome, FinalizeOutcome::MergeFixRequested(_)),
+                expect_fix,
+                "{choice:?}"
+            );
+            abort_merge(repo.path());
+        }
+    }
+
+    #[tokio::test]
+    async fn finalize_conflict_with_agent_accepted_requests_the_fix() {
+        let (repo, _wt_dir, lifecycle) = conflict_fixture("awman/accept");
+        let mut fe = merging_frontend();
+        fe.launch_merge_fix_response = true;
+        let outcome = lifecycle
+            .finalize(&mut fe, false, FinalizePolicy::default())
+            .await
+            .unwrap();
+        assert!(matches!(outcome, FinalizeOutcome::MergeFixRequested(_)));
+        assert_eq!(fe.launch_merge_fix_calls.len(), 1);
+        abort_merge(repo.path());
+    }
+
+    #[tokio::test]
+    async fn finalize_ask_policy_consults_the_frontend_for_both_questions() {
+        let (_repo, _wt_dir, lifecycle, _wt) = dirty_target_fixture("awman/ask-policy");
+        let mut fe = merging_frontend();
+        let policy = FinalizePolicy {
+            on_dirty_merge_target: Some(OnDirtyMergeTarget::Ask),
+            on_merge_failure: Some(OnMergeFailure::Ask),
+        };
+        let _ = lifecycle.finalize(&mut fe, false, policy).await;
+        assert_eq!(fe.dirty_merge_target_calls.len(), 1);
+
+        let (repo, _wt_dir, lifecycle) = conflict_fixture("awman/ask-policy-2");
+        let mut fe = merging_frontend();
+        lifecycle.finalize(&mut fe, false, policy).await.unwrap();
+        assert_eq!(fe.launch_merge_fix_calls.len(), 1);
+        abort_merge(repo.path());
+    }
+
+    #[tokio::test]
+    async fn merge_fix_agent_that_stages_the_files_itself_is_committed() {
+        let (fe, _failure, result, git_root, _repo, _wt) =
+            conflicted_merge_with_fake_agent(true, |root| {
+                std::fs::write(root.join("README.md"), "resolved\n").unwrap();
+                SysCmd::new("git")
+                    .args(["add", "README.md"])
+                    .current_dir(root)
+                    .status()
+                    .unwrap();
+            })
+            .await;
+        result.unwrap();
+        assert_eq!(fe.discarded_calls.len(), 1);
+        assert_eq!(git_out(&git_root, &["status", "--porcelain"]), "");
+        assert_eq!(
+            std::fs::read_to_string(git_root.join("README.md")).unwrap(),
+            "resolved\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_fix_agent_that_commits_itself_is_accepted() {
+        let (fe, _failure, result, git_root, _repo, _wt) =
+            conflicted_merge_with_fake_agent(false, |root| {
+                std::fs::write(root.join("README.md"), "resolved\n").unwrap();
+                for args in [vec!["add", "README.md"], vec!["commit", "--no-edit"]] {
+                    SysCmd::new("git")
+                        .args(args)
+                        .current_dir(root)
+                        .stdout(std::process::Stdio::null())
+                        .status()
+                        .unwrap();
+                }
+            })
+            .await;
+        result.unwrap();
+        assert_eq!(fe.discarded_calls.len(), 1);
+        assert_eq!(git_out(&git_root, &["status", "--porcelain"]), "");
+    }
+
+    #[tokio::test]
+    async fn merge_fix_unresolved_keeps_worktree_and_reports_the_conflict() {
+        let (fe, failure, result, git_root, _repo, _wt) =
+            conflicted_merge_with_fake_agent(false, |_| {}).await;
+        assert!(matches!(result, Err(CommandError::MergeConflict { .. })));
+        assert!(failure.worktree_path.exists());
+        assert!(fe.discarded_calls.is_empty());
+        assert!(fe
+            .messages
+            .iter()
+            .any(|m| m.level == MessageLevel::Error && m.text.contains("still unresolved")));
+        abort_merge(&git_root);
+    }
+
+    #[tokio::test]
+    async fn merge_fix_agent_failing_to_start_falls_back_to_keep() {
+        let (repo, _wt_dir, lifecycle) = conflict_fixture("awman/no-start");
+        let mut fe = merging_frontend();
+        let policy = FinalizePolicy {
+            on_dirty_merge_target: None,
+            on_merge_failure: Some(OnMergeFailure::Agent),
+        };
+        let FinalizeOutcome::MergeFixRequested(failure) =
+            lifecycle.finalize(&mut fe, false, policy).await.unwrap()
+        else {
+            panic!("expected a merge-fix request");
+        };
+        let result = lifecycle
+            .complete_merge_after_fix(&mut fe, &failure, false)
+            .await;
+        assert!(result.is_ok(), "{result:?}");
+        assert!(lifecycle.worktree_path.exists());
+        assert_eq!(fe.kept_calls.len(), 1);
+        assert!(fe.discarded_calls.is_empty());
+        assert!(fe.messages.iter().any(|m| m.level == MessageLevel::Warning));
+        abort_merge(repo.path());
+    }
+
+    #[tokio::test]
+    async fn merge_fix_makes_only_one_agent_attempt() {
+        let (repo, _wt_dir, lifecycle) = conflict_fixture("awman/one-shot");
+        let mut fe = merging_frontend();
+        fe.launch_merge_fix_response = true;
+        let FinalizeOutcome::MergeFixRequested(failure) = lifecycle
+            .finalize(&mut fe, false, FinalizePolicy::default())
+            .await
+            .unwrap()
+        else {
+            panic!("expected a merge-fix request");
+        };
+        // The agent leaves the markers; verification fails once, with no
+        // second ask and no second request.
+        let result = lifecycle
+            .complete_merge_after_fix(&mut fe, &failure, true)
+            .await;
+        assert!(matches!(result, Err(CommandError::MergeConflict { .. })));
+        assert_eq!(fe.launch_merge_fix_calls.len(), 1, "asked exactly once");
+        abort_merge(repo.path());
+    }
+
+    #[tokio::test]
+    async fn merge_fix_leaving_markers_is_still_unresolved() {
+        let (fe, _failure, result, git_root, _repo, _wt) =
+            conflicted_merge_with_fake_agent(false, |_| {}).await;
+        assert!(matches!(result, Err(CommandError::MergeConflict { .. })));
+        // Once from finalize, once for the failed verification.
+        assert_eq!(fe.merge_conflict_calls.len(), 2);
+        assert!(fe.discarded_calls.is_empty());
+        SysCmd::new("git")
+            .args(["merge", "--abort"])
+            .current_dir(&git_root)
+            .status()
+            .ok();
+    }
+    #[tokio::test]
+    async fn squash_repair_discarded_or_unstaged_result_keeps_branch_and_worktree() {
+        for mode in ["hard", "mixed", "committed", "committed-and-staged"] {
+            let (fe, failure, result, root, _repo, _wt) =
+                conflicted_merge_with_fake_agent(true, |root| {
+                    if mode.starts_with("committed") {
+                        std::fs::write(root.join("README.md"), "resolved\n").unwrap();
+                        git_out(root, &["add", "."]);
+                        git_out(root, &["commit", "-m", "agent squash"]);
+                        if mode == "committed-and-staged" {
+                            std::fs::write(root.join("README.md"), "another change\\n").unwrap();
+                            git_out(root, &["add", "README.md"]);
+                        }
+                    } else {
+                        git_out(
+                            root,
+                            &[
+                                "reset",
+                                if mode == "hard" { "--hard" } else { "--mixed" },
+                                "HEAD",
+                            ],
+                        );
+                        // A mixed reset can leave the conflict markers; resolve only
+                        // the conflict but leave the feature-only file unstaged.
+                        if mode == "mixed" {
+                            std::fs::write(root.join("README.md"), "resolved\n").unwrap();
+                        }
+                    }
+                })
+                .await;
+            assert!(
+                matches!(result, Err(CommandError::MergeConflict { .. })),
+                "{mode}: {result:?}"
+            );
+            assert!(failure.worktree_path.exists());
+            assert!(fe.discarded_calls.is_empty());
+            assert!(!git_out(&root, &["branch", "--list", &failure.branch]).is_empty());
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn merge_repair_preserves_literal_unicode_whitespace_and_magic_paths() {
+        let repo = tempfile::tempdir().unwrap();
+        let wt = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let names = [
+            ":(top)*",
+            "glob*.txt",
+            "café.txt",
+            " leading ",
+            "quote\".txt",
+            "tab\t.txt",
+            "line\n.txt",
+        ];
+        for name in names {
+            std::fs::write(repo.path().join(name), "base\n").unwrap();
+        }
+        std::fs::write(repo.path().join("private-tracked.txt"), "base\n").unwrap();
+        let engine = Arc::new(GitEngine::new());
+        engine.commit_all(repo.path(), "filenames").unwrap();
+        let wt_path = wt.path().join("wt");
+        engine
+            .create_worktree(repo.path(), &wt_path, "awman/filenames")
+            .unwrap();
+        for name in names {
+            std::fs::write(wt_path.join(name), "feature\n").unwrap();
+        }
+        engine.commit_all(&wt_path, "feature").unwrap();
+        for name in names {
+            std::fs::write(repo.path().join(name), "main\n").unwrap();
+        }
+        engine.commit_all(repo.path(), "main").unwrap();
+        let lifecycle = WorktreeLifecycle::new_for_test(
+            engine.clone(),
+            repo.path().into(),
+            wt_path.clone(),
+            "awman/filenames".into(),
+        );
+        let mut fe = merging_frontend();
+        fe.confirm_cleanup_response = true;
+        let FinalizeOutcome::MergeFixRequested(failure) = lifecycle
+            .finalize(
+                &mut fe,
+                false,
+                FinalizePolicy {
+                    on_merge_failure: Some(OnMergeFailure::Agent),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected conflicts");
+        };
+        let mut returned = failure.unmerged_paths.clone();
+        returned.sort();
+        let mut expected = names.map(str::to_string).to_vec();
+        expected.sort();
+        assert_eq!(returned, expected, "Git filenames must be lossless");
+        for name in names {
+            std::fs::write(repo.path().join(name), "resolved\n").unwrap();
+        }
+        std::fs::write(repo.path().join("private-draft.txt"), "private\n").unwrap();
+        std::fs::write(repo.path().join("private-tracked.txt"), "user edit\n").unwrap();
+        lifecycle
+            .complete_merge_after_fix(&mut fe, &failure, true)
+            .await
+            .unwrap();
+        assert!(!wt_path.exists());
+        assert_eq!(
+            git_out(repo.path(), &["show", "HEAD:private-tracked.txt"]),
+            "base"
+        );
+        assert!(git_out(repo.path(), &["ls-files", "private-draft.txt"]).is_empty());
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("private-tracked.txt")).unwrap(),
+            "user edit\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("private-draft.txt")).unwrap(),
+            "private\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn squash_failed_commit_then_discarded_index_is_not_success() {
+        use std::os::unix::fs::PermissionsExt;
+        let (repo, _wt, lifecycle, wt_path) = dirty_target_fixture("awman/failed-commit");
+        std::fs::remove_file(repo.path().join("scratch.txt")).unwrap();
+        let hook = repo.path().join(".git/hooks/pre-commit");
+        std::fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut fe = merging_frontend();
+        let FinalizeOutcome::MergeFixRequested(failure) = lifecycle
+            .finalize(
+                &mut fe,
+                false,
+                FinalizePolicy {
+                    on_merge_failure: Some(OnMergeFailure::Agent),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected commit failure");
+        };
+        assert!(failure.command.starts_with("git commit"));
+        git_out(repo.path(), &["reset", "--hard", "HEAD"]);
+        let result = lifecycle
+            .complete_merge_after_fix(&mut fe, &failure, true)
+            .await;
+        assert!(matches!(result, Err(CommandError::MergeConflict { .. })));
+        assert!(wt_path.exists());
+        assert!(fe.discarded_calls.is_empty());
+        assert!(!repo.path().join("work.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn failed_pre_index_merge_retries_once_after_agent_without_relaunching() {
+        for fix in [false, true] {
+            let (repo, _wt, lifecycle, wt_path) = dirty_target_fixture("awman/retry");
+            std::fs::remove_file(repo.path().join("scratch.txt")).unwrap();
+            // An existing MERGE_HEAD would count as started. A lock instead
+            // makes git fail before it touches the index.
+            let lock = repo.path().join(".git/index.lock");
+            std::fs::write(&lock, "").unwrap();
+            let mut fe = merging_frontend();
+            let FinalizeOutcome::MergeFixRequested(failure) = lifecycle
+                .finalize(
+                    &mut fe,
+                    false,
+                    FinalizePolicy {
+                        on_merge_failure: Some(OnMergeFailure::Agent),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap()
+            else {
+                panic!("expected pre-index failure");
+            };
+            assert!(!failure.merge_started());
+            if fix {
+                std::fs::remove_file(&lock).unwrap();
+            }
+            let before = fe.messages.len();
+            let result = lifecycle
+                .complete_merge_after_fix(&mut fe, &failure, true)
+                .await;
+            assert_eq!(result.is_ok(), fix, "{result:?}");
+            assert_eq!(wt_path.exists(), !fix);
+            assert_eq!(
+                fe.messages[before..]
+                    .iter()
+                    .filter(|m| m.text.contains("$ git merge --squash"))
+                    .count(),
+                1
+            );
+            assert!(
+                fe.launch_merge_fix_calls.is_empty(),
+                "agent policy never asks again"
+            );
+        }
     }
 }
 

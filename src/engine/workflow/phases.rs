@@ -9,6 +9,72 @@
 use super::*;
 
 impl WorkflowEngine {
+    /// Declare setup and teardown before either runs, with substituted
+    /// descriptions. A resumed phase with the same number of steps keeps its
+    /// recorded statuses, including a setup phase that will be skipped.
+    /// Persists once so clients immediately see the whole workflow.
+    pub fn declare_phase_steps(
+        &mut self,
+        setup: &[crate::data::workflow_definition::SetupStep],
+        teardown: &[crate::data::workflow_definition::TeardownStep],
+    ) -> Result<(), EngineError> {
+        {
+            let steps: Vec<_> = setup
+                .iter()
+                .map(|s| s.substitute(self.work_item_context.as_ref()))
+                .collect();
+            self.refresh_phase_states(PhaseKind::Setup, &steps);
+        }
+        {
+            let steps: Vec<_> = teardown
+                .iter()
+                .map(|s| s.substitute(self.work_item_context.as_ref()))
+                .collect();
+            self.refresh_phase_states(PhaseKind::Teardown, &steps);
+        }
+        if !self.state.setup_completed
+            && !setup.is_empty()
+            && self.state.current_phase == crate::data::workflow_state::WorkflowPhase::Main
+            && self
+                .state
+                .step_states
+                .values()
+                .all(|s| matches!(s, StepState::Pending))
+        {
+            self.state.current_phase = crate::data::workflow_state::WorkflowPhase::Setup;
+        }
+        self.persist()
+    }
+
+    /// Refresh descriptions without losing completed phase statuses on resume.
+    fn refresh_phase_states<S: PhaseStepSpec>(&mut self, kind: PhaseKind, steps: &[S]) {
+        use crate::data::workflow_state::{PhaseStepState, PhaseStepStatus};
+        let states = self.state.phase_step_states_mut(kind);
+        if states.len() == steps.len() {
+            for (state, step) in states.iter_mut().zip(steps) {
+                state.description = step.description();
+            }
+        } else {
+            *states = steps
+                .iter()
+                .map(|s| PhaseStepState {
+                    description: s.description(),
+                    status: PhaseStepStatus::Pending,
+                })
+                .collect();
+        }
+    }
+
+    /// Refresh declared descriptions and reset statuses on phase entry, since
+    /// resume re-runs every step. Rebuild only when the step count changed.
+    /// `steps` already have work-item substitution applied.
+    fn reset_or_rebuild_phase_states<S: PhaseStepSpec>(&mut self, kind: PhaseKind, steps: &[S]) {
+        self.refresh_phase_states(kind, steps);
+        for state in self.state.phase_step_states_mut(kind) {
+            state.status = crate::data::workflow_state::PhaseStepStatus::Pending;
+        }
+    }
+
     /// Run one shell phase, asking the caller for a fresh container per step.
     ///
     /// `container_for_step(step)` is invoked once per step (and again for
@@ -46,7 +112,7 @@ impl WorkflowEngine {
         S: PhaseStepSpec,
         F: FnMut(&PhaseStepRef) -> Result<Box<dyn AgentExec>, EngineError>,
     {
-        use crate::data::workflow_state::{PhaseStepState, PhaseStepStatus};
+        use crate::data::workflow_state::PhaseStepStatus;
 
         debug_assert_eq!(
             kind,
@@ -58,18 +124,12 @@ impl WorkflowEngine {
         let steps: Vec<S> = steps.iter().map(|s| s.substitute(wi_ctx)).collect();
 
         self.state.current_phase = kind.workflow_phase();
-        *self.state.phase_step_states_mut(kind) = steps
-            .iter()
-            .map(|s| PhaseStepState {
-                description: s.description(),
-                status: PhaseStepStatus::Pending,
-            })
-            .collect();
+        self.reset_or_rebuild_phase_states(kind, &steps);
         self.persist()?;
 
         let mut outcome = PhaseOutcome::default();
         for (idx, step) in steps.iter().enumerate() {
-            let desc = step.description();
+            let desc = self.state.phase_step_states(kind)[idx].description.clone();
             let abort = abort_flags.get(idx).copied().unwrap_or(false);
 
             self.state.phase_step_states_mut(kind)[idx].status = PhaseStepStatus::Running;
@@ -398,30 +458,80 @@ impl WorkflowEngine {
             .as_ref()
             .and_then(|f| self.prepare_phase_failure_file(f));
 
+        let substitution = crate::data::workflow_prompt_template::substitute_prompt(
+            &config.prompt,
+            self.work_item_context.as_ref(),
+        );
+        for warning in substitution.warnings {
+            self.msg_warning(warning);
+        }
         let prompt = match &artifacts {
-            Some(a) => a.prepend_preamble(&config.prompt),
-            None => config.prompt.clone(),
+            Some(a) => a.prepend_preamble(&substitution.rendered),
+            None => substitution.rendered,
         };
         let extra_overlays = artifacts
             .as_ref()
             .and_then(|a| a.extra_overlay.clone())
             .map(|o| vec![o]);
 
+        // Countdown label: say which phase step this agent is fixing.
+        let label = match &failure {
+            Some(f) => format!("on_failure: {}", f.step_name),
+            None => "on_failure".to_string(),
+        };
+        let spec = RemediationAgentSpec {
+            label,
+            prompt,
+            agent: agent_name,
+            model,
+            extra_overlays,
+        };
+        let session = self.session.clone();
+        let handle = tokio::runtime::Handle::current();
+        match handle.block_on(self.run_remediation_agent(&session, spec)) {
+            Ok(exit_code) => {
+                tracing::info!(exit_code, "on_failure agent completed (exit code ignored)");
+            }
+            Err(RemediationAgentError::Launch(e)) => {
+                self.msg_warning(format!("on_failure: failed to launch agent: {e}"));
+            }
+            Err(RemediationAgentError::Execution(e)) => {
+                self.msg_warning(format!("on_failure: agent execution error: {e}"));
+            }
+        }
+    }
+
+    /// Launch `spec` as an agent container through the engine's agent
+    /// factory, mounted for `session`, and wait for it: the `on_failure`
+    /// remediation agent of a phase step, or the merge-fix agent the command
+    /// layer runs after a failed worktree merge-back. The agent runs in a
+    /// container exactly like a workflow step — never on the host. Under
+    /// yolo a stuck agent gets the usual countdown. Returns the agent's exit
+    /// code.
+    ///
+    /// Async on purpose: the command layer awaits it directly. The sync
+    /// `launch_on_failure_agent` wrapper `block_on`s it, which is only legal
+    /// inside `run_phase`'s `block_in_place`.
+    pub async fn run_remediation_agent(
+        &mut self,
+        session: &Session,
+        spec: RemediationAgentSpec,
+    ) -> Result<i32, RemediationAgentError> {
         let synthetic_step = WorkflowStep {
             name: "__on_failure__".to_string(),
             depends_on: Vec::new(),
-            prompt_template: prompt,
-            agent: Some(agent_name_str.clone()),
-            model: model.clone(),
-            overlays: extra_overlays,
+            prompt_template: spec.prompt,
+            agent: Some(spec.agent.as_str().to_string()),
+            model: spec.model.clone(),
+            overlays: spec.extra_overlays,
             abort_on_failure: false,
         };
 
         let runtime = WorkflowRuntimeContext {
-            step_agent: agent_name,
-            step_model: model.clone(),
-            git_root: self.session.git_root().to_path_buf(),
-            session_id: self.session.id(),
+            step_agent: spec.agent.clone(),
+            step_model: spec.model.clone(),
+            git_root: session.git_root().to_path_buf(),
+            session_id: session.id(),
             workflow_invocation_id: self.state.invocation_id,
             workflow_step_info: None,
         };
@@ -432,36 +542,35 @@ impl WorkflowEngine {
         // factory's `take_io` find no channels and fail.
         self.frontend.report_step_interactive_launch(
             &synthetic_step,
-            &agent_name_str,
-            model.as_deref(),
+            spec.agent.as_str(),
+            spec.model.as_deref(),
         );
 
-        let execution =
-            match self
-                .agent_factory
-                .execution_for_step(&synthetic_step, &self.session, &runtime)
-            {
-                Ok(e) => e,
-                Err(e) => {
-                    self.msg_warning(format!("on_failure: failed to launch agent: {e}"));
-                    return;
-                }
-            };
+        let execution = self
+            .agent_factory
+            .execution_for_rendered_step(&synthetic_step, session, &runtime)
+            .map_err(RemediationAgentError::Launch)?;
 
-        // Countdown label: say which phase step this agent is fixing.
-        let label = match &failure {
-            Some(f) => format!("on_failure: {}", f.step_name),
-            None => "on_failure".to_string(),
-        };
-        let handle = tokio::runtime::Handle::current();
-        match handle.block_on(self.wait_on_failure_agent(execution, &label)) {
-            Ok(exit_code) => {
-                tracing::info!(exit_code, "on_failure agent completed (exit code ignored)");
-            }
-            Err(e) => {
-                self.msg_warning(format!("on_failure: agent execution error: {e}"));
-            }
-        }
+        self.wait_on_failure_agent(execution, &spec.label)
+            .await
+            .map_err(RemediationAgentError::Execution)
+    }
+
+    /// The last successfully launched workflow step's identity, independent
+    /// of UI focus. In a parallel group, launch order is source order; the
+    /// last launched member supplies repair defaults. `None` when no step launched in this
+    /// engine, e.g. a resumed run with every step already done.
+    pub fn last_step_agent(&self) -> Option<AgentName> {
+        self.last_launched_identity
+            .as_ref()
+            .map(|(agent, _)| agent.clone())
+    }
+
+    /// The model the most recently launched workflow step resolved to.
+    pub fn last_step_model(&self) -> Option<String> {
+        self.last_launched_identity
+            .as_ref()
+            .and_then(|(_, model)| model.clone())
     }
 
     /// Wait for an `on_failure` agent to finish. Under `--yolo` (which

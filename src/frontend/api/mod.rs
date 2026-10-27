@@ -9,6 +9,7 @@ use std::sync::Arc;
 use crate::command::commands::api_server::queue_worker::ApiCommandFrontendFactory;
 use crate::command::commands::api_server::{ApiServerRuntime, AuthMode};
 use crate::command::error::CommandError;
+use crate::data::fs::api_command_log::CommandStateWriter;
 
 /// Layer 3 construction of the concrete API presentation adapter.
 #[derive(Clone, Copy, Default)]
@@ -21,9 +22,11 @@ impl ApiCommandFrontendFactory for ApiFrontendFactory {
         &self,
         command: &crate::data::fs::api_db::CommandRecord,
         event_bus: crate::command::commands::api_server::event_bus::EventBusSender,
+        state_writer: CommandStateWriter,
     ) -> Self::Frontend {
         let args: Vec<String> = serde_json::from_str(&command.args).unwrap_or_default();
         command_frontend::ApiDispatchFrontend::new(&command.subcommand, &args, event_bus)
+            .with_state_writer(state_writer)
     }
 }
 

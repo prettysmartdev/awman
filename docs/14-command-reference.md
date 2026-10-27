@@ -263,6 +263,8 @@ Available via: CLI, TUI, API
 | `--dynamic` | bool | false | — | — | CLI, TUI, API | Have a leader agent design and run a workflow for --work-item. Implies --yolo, --worktree, and context(workflow); the positional workflow path must be omitted. |
 | `--leader` | string (optional) | — | — | — | CLI, TUI, API | Agent and model for the dynamic leader, as agent::model (e.g. claude::claude-opus-4-8). Only valid with --dynamic. |
 | `--max-concurrent` | usize (>= 1) | — | — | — | CLI, TUI, API | Cap on concurrently-running workflow steps (must be >= 1). |
+| `--on-dirty-merge-target` | enum: ask, commit, stash, fail | — | — | — | CLI, TUI, API | What to do when the merge target has uncommitted changes before a worktree branch is merged back. |
+| `--on-merge-failure` | enum: ask, agent, keep | — | — | — | CLI, TUI, API | What to do when merging a worktree branch back fails: ask, launch a fix agent, or keep the worktree. |
 
 ---
 
@@ -602,6 +604,8 @@ Available via: CLI, TUI
 | `--dynamic` | bool | false | — | — | CLI, TUI, API | Have a leader agent design and run a workflow for --work-item. Implies --yolo, --worktree, and context(workflow); the positional workflow path must be omitted. |
 | `--leader` | string (optional) | — | — | — | CLI, TUI, API | Agent and model for the dynamic leader, as agent::model (e.g. claude::claude-opus-4-8). Only valid with --dynamic. |
 | `--max-concurrent` | usize (>= 1) | — | — | — | CLI, TUI, API | Cap on concurrently-running workflow steps (must be >= 1). |
+| `--on-dirty-merge-target` | enum: ask, commit, stash, fail | — | — | — | CLI, TUI, API | What to do when the merge target has uncommitted changes before a worktree branch is merged back. |
+| `--on-merge-failure` | enum: ask, agent, keep | — | — | — | CLI, TUI, API | What to do when merging a worktree branch back fails: ask, launch a fix agent, or keep the worktree. |
 
 #### `awman remote exec prompt`
 

@@ -247,6 +247,24 @@ pub const CONFIG_FIELDS: &[ConfigFieldSpec] = &[
         sensitive: true,
         hint: None,
     },
+    f(
+        "worktree.onDirtyMergeTarget",
+        FieldScope::Both,
+        ConfigFieldKind::Enum,
+        Some("ask | commit | stash | fail"),
+    ),
+    f(
+        "worktree.mergeFix.onFailure",
+        FieldScope::Both,
+        ConfigFieldKind::Enum,
+        Some("ask | agent | keep"),
+    ),
+    f(
+        "worktree.mergeFix.promptTemplate",
+        FieldScope::Both,
+        ConfigFieldKind::String,
+        Some("path relative to the git root"),
+    ),
     // Dynamic-workflow config (WI-0095), repo-only.
     f(
         "dynamicWorkflows.defaultLeader",
