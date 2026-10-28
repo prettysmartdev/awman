@@ -446,6 +446,7 @@ impl Command for ExecWorkflowCommand {
             self.task_workspace.as_deref(),
             self.workflow_state_root.as_deref(),
             self.managed_session.as_ref(),
+            &self.cancel,
         )
         .await
     }

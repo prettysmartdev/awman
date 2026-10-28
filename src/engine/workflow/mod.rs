@@ -15,10 +15,11 @@ use std::time::{Duration, Instant};
 
 use futures_util::stream::FuturesUnordered;
 use futures_util::StreamExt;
+use tokio_util::sync::CancellationToken;
 
 use crate::data::config::effective::EffectiveConfig;
 use crate::data::prompt::Prompt;
-use crate::data::session::{AgentName, Session};
+use crate::data::session::{AgentHandle, AgentName, Session};
 use crate::data::workflow_dag::WorkflowDag;
 use crate::data::workflow_definition::{Workflow, WorkflowStep};
 use crate::data::workflow_state::{
@@ -203,6 +204,10 @@ struct ActiveParallelStep {
     /// The container's name, retained so a failure log can be named after it
     /// once the execution has been consumed by its wait future.
     container_name: String,
+    /// The container's runtime handle, retained so an external cancel can stop
+    /// it through the runtime (`AgentExecutionFactory::stop_agent`) after the
+    /// execution has moved into its wait future.
+    handle: AgentHandle,
     /// Rolling buffer of this container's recent combined stdout/stderr,
     /// extracted from the execution at launch so it outlives the wait future.
     /// `None` for runtimes without a byte-stream bridge (e.g. sandbox-class).
@@ -324,6 +329,10 @@ pub struct WorkflowEngine {
     /// handle rather than the engine's own clone, which is what makes the
     /// mirror visible to anyone else.
     session_mirror: Option<Arc<tokio::sync::RwLock<Session>>>,
+    /// Fired by an external cancel request (the API's
+    /// `POST /v1/commands/{id}/cancel`). Never fired unless a caller installs
+    /// one with [`WorkflowEngine::set_cancellation`].
+    cancel: CancellationToken,
 }
 
 impl WorkflowEngine {
@@ -689,6 +698,7 @@ impl WorkflowEngine {
             parallel_group_prompts: None,
             engine_rx: Some(rx),
             session_mirror: None,
+            cancel: CancellationToken::new(),
         }
     }
 
@@ -701,6 +711,67 @@ impl WorkflowEngine {
 
     pub fn state(&self) -> &WorkflowState {
         &self.state
+    }
+
+    /// Observe `token`: once it fires the run stops at the next observation
+    /// point with [`WorkflowOutcome::Cancelled`] (see [`WorkflowEngine::cancel_run`]).
+    pub fn set_cancellation(&mut self, token: CancellationToken) {
+        self.cancel = token;
+    }
+
+    pub fn cancel_requested(&self) -> bool {
+        self.cancel.is_cancelled()
+    }
+
+    /// Stop every live container, mark every unfinished step `Cancelled`, stamp
+    /// `state.cancelled_at`, persist, report `WorkflowOutcome::Cancelled`.
+    ///
+    /// Like `handle_abort` but reported as a cancel, and it never sets
+    /// `abort_on_failure_triggered`, so the command layer still runs teardown
+    /// in its cancelled mode. Idempotent: a second call finds no live
+    /// containers and only re-reports.
+    pub fn cancel_run(&mut self) -> Result<WorkflowOutcome, EngineError> {
+        self.stop_active_agents();
+        self.abort_on_failure_triggered = false;
+        self.msg_warning("Workflow cancelled");
+        for s in &self.workflow.steps {
+            if !self.state.completed_steps.contains(&s.name) {
+                self.state.set_status(&s.name, StepState::Cancelled);
+            }
+        }
+        if self.state.cancelled_at.is_none() {
+            self.state.cancelled_at = Some(chrono::Utc::now());
+        }
+        self.persist()?;
+        let outcome = WorkflowOutcome::Cancelled;
+        self.frontend.report_workflow_completed(&outcome);
+        Ok(outcome)
+    }
+
+    /// Kill every container still in `active_steps` and stop it through the
+    /// runtime, the way `awman agents kill` does. The `CancelHandle` unblocks
+    /// the wait task; `stop_agent` is what makes the container actually die.
+    fn stop_active_agents(&mut self) {
+        let slots: Vec<ActiveParallelStep> = self.active_steps.drain(..).collect();
+        for slot in &slots {
+            if let Some(ch) = &slot.cancel_handle {
+                let _ = ch.cancel();
+            } else if let Some(exec) = &slot.execution {
+                let _ = exec.cancel();
+            }
+            if slot.yolo_deadline.is_some() {
+                self.frontend
+                    .parallel_step_yolo_countdown_finished(&slot.step_name);
+            }
+            if let Err(e) = self.agent_factory.stop_agent(&slot.handle) {
+                tracing::warn!(
+                    step = %slot.step_name,
+                    container = %slot.container_name,
+                    error = %e,
+                    "cancel: stopping the step container failed"
+                );
+            }
+        }
     }
 
     /// Drive every step until the workflow finishes, the user pauses, or a
@@ -724,6 +795,9 @@ impl WorkflowEngine {
         self.frontend.report_workflow_progress(&initial_progress);
 
         loop {
+            if self.cancel_requested() {
+                return self.cancel_run();
+            }
             if self.state.is_complete() {
                 let progress = self.workflow_progress_info();
                 self.frontend.report_workflow_progress(&progress);
@@ -794,6 +868,24 @@ pub struct PhaseOutcome {
     pub aborted: bool,
     /// At least one step failed, whether or not it aborted the phase.
     pub any_failed: bool,
+    /// An external cancel stopped the phase, or it ran in cancelled mode
+    /// ([`WorkflowEngine::run_teardown_cancelled`]).
+    pub cancelled: bool,
+}
+
+/// How `run_phase_with` runs one phase: the public `run_phase` and
+/// `run_teardown_cancelled` differ only in these.
+#[derive(Debug, Clone, Default)]
+struct PhaseRunOptions {
+    /// Keep completed teardown entries when recovering an interrupted cancel.
+    resume: bool,
+    /// Per step: record it `Skipped` instead of running it. Missing entries
+    /// run.
+    skip: Vec<bool>,
+    /// Whether a failed step may launch its `on_failure` agent.
+    allow_remediation: bool,
+    /// Whether a cancel stops the phase before its next step.
+    observe_cancel: bool,
 }
 
 /// The setup/teardown step a phase container is being asked for. Handed to

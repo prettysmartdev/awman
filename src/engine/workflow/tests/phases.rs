@@ -219,6 +219,82 @@ fn run_teardown_continues_after_step_failure() {
 }
 
 #[test]
+fn cancelled_teardown_skips_publishing_steps_runs_cleanup_and_does_not_remediate() {
+    use crate::data::workflow_definition::TeardownStep;
+    use crate::data::workflow_state::PhaseStepStatus;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let session = make_session(&tmp);
+    let factory = FakeAgentExecutionFactory::always_success();
+    let launches = Arc::clone(&factory.execution_call_count);
+    let mut engine = make_engine(
+        &session,
+        make_workflow(
+            Some("cancel-teardown"),
+            Some("claude"),
+            vec![make_step("main", &[], None)],
+        ),
+        factory,
+        [],
+    );
+    let token = tokio_util::sync::CancellationToken::new();
+    engine.set_cancellation(token.clone());
+    token.cancel();
+    let steps = vec![
+        TeardownStep::PushBranch {
+            remote: None,
+            branch: None,
+        },
+        TeardownStep::CreatePullRequest {
+            title: None,
+            body: None,
+            base: None,
+        },
+        TeardownStep::PollCi {
+            interval_secs: None,
+            max_retries: None,
+        },
+        TeardownStep::RunShell {
+            command: "cleanup-one".into(),
+            env: None,
+        },
+        TeardownStep::CommitChanges {
+            message: "cleanup-two".into(),
+            add_all: true,
+        },
+    ];
+    let mocks = Arc::new(MockBackgroundContainer::with_results([
+        (String::new(), "cleanup error".into(), 1),
+        (String::new(), String::new(), 0),
+    ]));
+    let outcome = engine
+        .run_teardown_cancelled(&steps, &[false; 5], mocks.factory())
+        .unwrap();
+
+    assert!(outcome.cancelled);
+    assert_eq!(
+        mocks.calls(),
+        ["cleanup-one", "git add -A && git commit -m 'cleanup-two'"]
+    );
+    let statuses = &engine.state().teardown_step_states;
+    assert_eq!(statuses[0].status, PhaseStepStatus::Skipped);
+    assert_eq!(statuses[1].status, PhaseStepStatus::Skipped);
+    assert_eq!(statuses[2].status, PhaseStepStatus::Skipped);
+    assert_eq!(
+        statuses[3].status,
+        PhaseStepStatus::Failed {
+            error: "cleanup error".into()
+        }
+    );
+    assert_eq!(statuses[4].status, PhaseStepStatus::Succeeded);
+    assert_eq!(
+        launches.load(Ordering::Relaxed),
+        0,
+        "on_failure remediation must not launch"
+    );
+}
+
+#[test]
 fn run_teardown_aborts_on_abort_on_failure_step() {
     let tmp = tempfile::tempdir().unwrap();
     let mut engine = make_minimal_engine(&tmp);
@@ -2564,4 +2640,232 @@ async fn on_failure_agent_without_yolo_has_no_countdown() {
     assert!(started.is_empty(), "no countdown without yolo: {started:?}");
     assert!(!killed, "the agent must be left to finish on its own");
     assert_eq!(status, PhaseStepStatus::Succeeded);
+}
+
+#[test]
+fn cancel_during_normal_teardown_keeps_cleanup_and_skips_later_publication() {
+    use crate::data::workflow_definition::TeardownStep;
+    use crate::data::workflow_state::PhaseStepStatus;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut engine = make_minimal_engine(&tmp);
+    let token = tokio_util::sync::CancellationToken::new();
+    engine.set_cancellation(token.clone());
+    let steps = vec![
+        TeardownStep::RunShell {
+            command: "before-cancel".into(),
+            env: None,
+        },
+        TeardownStep::PushBranch {
+            remote: None,
+            branch: None,
+        },
+        TeardownStep::CreatePullRequest {
+            title: None,
+            body: None,
+            base: None,
+        },
+        TeardownStep::RunShell {
+            command: "cleanup".into(),
+            env: None,
+        },
+    ];
+    let mock = Arc::new(MockBackgroundContainer::always_success());
+    let mut factory = mock.factory();
+    let outcome = engine
+        .run_phase(PhaseKind::Teardown, &steps, &[false; 4], &[], |step| {
+            if step.index == 0 {
+                token.cancel();
+            }
+            factory(step)
+        })
+        .unwrap();
+    assert!(outcome.cancelled);
+    assert_eq!(mock.calls(), ["before-cancel", "cleanup"]);
+    assert_eq!(
+        engine.state().teardown_step_states[1].status,
+        PhaseStepStatus::Skipped
+    );
+    assert_eq!(
+        engine.state().teardown_step_states[2].status,
+        PhaseStepStatus::Skipped
+    );
+}
+
+#[test]
+fn cancelled_cleanup_recovery_keeps_completed_steps_and_resumes_interrupted_steps() {
+    use crate::data::workflow_definition::TeardownStep;
+    use crate::data::workflow_state::PhaseStepStatus;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut engine = make_minimal_engine(&tmp);
+    let steps = vec![
+        TeardownStep::RunShell {
+            command: "already-cleaned".into(),
+            env: None,
+        },
+        TeardownStep::RunShell {
+            command: "interrupted-cleanup".into(),
+            env: None,
+        },
+        TeardownStep::PushBranch {
+            remote: None,
+            branch: None,
+        },
+        TeardownStep::RunShell {
+            command: "remaining-cleanup".into(),
+            env: None,
+        },
+    ];
+    engine.declare_phase_steps(&[], &steps).unwrap();
+    engine.state.teardown_step_states[0].status = PhaseStepStatus::Succeeded;
+    engine.state.teardown_step_states[1].status = PhaseStepStatus::Running;
+    engine.cancel_run().unwrap();
+    let mock = Arc::new(MockBackgroundContainer::always_success());
+    engine
+        .resume_teardown_cancelled(&steps, &[false; 4], mock.factory())
+        .unwrap();
+    assert_eq!(mock.calls(), ["interrupted-cleanup", "remaining-cleanup"]);
+    assert_eq!(
+        engine.state().teardown_step_states[2].status,
+        PhaseStepStatus::Skipped
+    );
+    assert!(engine.state().teardown_completed);
+}
+
+#[test]
+fn setup_failure_racing_cancel_does_not_abort_or_remediate_and_allows_cleanup() {
+    use crate::data::workflow_definition::{RemediationConfig, SetupStep, TeardownStep};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut engine = make_minimal_engine(&tmp);
+    let token = tokio_util::sync::CancellationToken::new();
+    engine.set_cancellation(token.clone());
+    let failed = Arc::new(MockBackgroundContainer::with_results([(
+        String::new(),
+        "failure".into(),
+        1,
+    )]));
+    let mut factory = failed.factory();
+    let steps = [SetupStep::RunShell {
+        command: "setup".into(),
+        env: None,
+    }];
+    let remediation = RemediationConfig {
+        prompt: "repair".into(),
+        agent: Some("claude".into()),
+        model: None,
+        max_attempts: 2,
+    };
+    let outcome = engine
+        .run_phase(
+            PhaseKind::Setup,
+            &steps,
+            &[true],
+            &[Some(remediation)],
+            |step| {
+                token.cancel();
+                factory(step)
+            },
+        )
+        .unwrap();
+    assert!(outcome.cancelled);
+    assert!(!outcome.aborted);
+    assert!(!engine.abort_on_failure_triggered());
+    assert_eq!(failed.calls(), ["setup"]);
+    assert_eq!(engine.cancel_run().unwrap(), WorkflowOutcome::Cancelled);
+    let cleanup = Arc::new(MockBackgroundContainer::always_success());
+    engine
+        .run_teardown_cancelled(
+            &[TeardownStep::RunShell {
+                command: "cleanup".into(),
+                env: None,
+            }],
+            &[false],
+            cleanup.factory(),
+        )
+        .unwrap();
+    assert_eq!(cleanup.calls(), ["cleanup"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelling_setup_remediation_stops_agent_and_runs_cleanup_without_retry() {
+    use crate::data::workflow_definition::{RemediationConfig, SetupStep, TeardownStep};
+    let tmp = tempfile::tempdir().unwrap();
+    let session = make_session(&tmp);
+    let (backend_cancelled, completion) = make_blocking_entry();
+    let factory = BlockingFactory::new([(backend_cancelled.clone(), completion)]);
+    let stopped = factory.stopped.clone();
+    let launches = factory.execution_count.clone();
+    let workflow = make_workflow(
+        Some("cancel-setup-remediation"),
+        Some("claude"),
+        vec![make_step("main", &[], None)],
+    );
+    let mut engine = WorkflowEngine::new(
+        &session,
+        WorkflowSpec::new(workflow),
+        WorkflowEngineDeps {
+            frontend: Box::new(FakeWorkflowFrontend::new([])),
+            agent_factory: Box::new(factory),
+        },
+    )
+    .unwrap();
+    let token = tokio_util::sync::CancellationToken::new();
+    engine.set_cancellation(token.clone());
+    let task = tokio::spawn(async move {
+        tokio::task::block_in_place(|| {
+            let failed = Arc::new(MockBackgroundContainer::with_results([(
+                String::new(),
+                "failure".into(),
+                1,
+            )]));
+            let remediation = RemediationConfig {
+                prompt: "repair".into(),
+                agent: Some("claude".into()),
+                model: None,
+                max_attempts: 2,
+            };
+            let outcome = engine
+                .run_phase(
+                    PhaseKind::Setup,
+                    &[SetupStep::RunShell {
+                        command: "setup".into(),
+                        env: None,
+                    }],
+                    &[true],
+                    &[Some(remediation)],
+                    failed.factory(),
+                )
+                .unwrap();
+            assert!(outcome.cancelled);
+            assert!(!outcome.aborted);
+            assert!(!engine.abort_on_failure_triggered());
+            assert_eq!(
+                failed.calls(),
+                ["setup"],
+                "cancelled remediation retried setup"
+            );
+            engine.cancel_run().unwrap();
+            let cleanup = Arc::new(MockBackgroundContainer::always_success());
+            engine
+                .run_teardown_cancelled(
+                    &[TeardownStep::RunShell {
+                        command: "cleanup".into(),
+                        env: None,
+                    }],
+                    &[false],
+                    cleanup.factory(),
+                )
+                .unwrap();
+            assert_eq!(cleanup.calls(), ["cleanup"]);
+            assert!(engine.state().cancelled_at.is_some());
+        });
+    });
+    wait_for_execution_count(&launches, 1).await;
+    token.cancel();
+    tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stopped.lock().unwrap().len(), 1);
+    assert!(backend_cancelled.load(Ordering::Relaxed));
+    assert_eq!(launches.load(Ordering::Relaxed), 1);
 }

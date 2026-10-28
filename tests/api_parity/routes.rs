@@ -68,6 +68,9 @@ const EXPECTED_ROUTES: &[(&str, &str)] = &[
     ("GET", "/v1/sessions/:id/status"),
     ("GET", "/v1/sessions/:id/queue"),
     ("POST", "/v1/commands"),
+    ("GET", "/v1/commands"),
+    ("POST", "/v1/commands/:id/cancel"),
+    ("POST", "/v1/runs"),
     ("GET", "/v1/commands/:id/status"),
     ("GET", "/v1/commands/:id/logs"),
     ("GET", "/v1/workflows/:command_id"),
@@ -75,7 +78,7 @@ const EXPECTED_ROUTES: &[(&str, &str)] = &[
 
 #[test]
 fn expected_routes_table_is_non_empty() {
-    assert_eq!(EXPECTED_ROUTES.len(), 12);
+    assert_eq!(EXPECTED_ROUTES.len(), 15);
 }
 
 #[test]

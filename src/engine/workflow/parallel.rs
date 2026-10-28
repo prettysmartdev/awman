@@ -48,6 +48,8 @@ impl WorkflowEngine {
 
         let total = timing::YOLO_COUNTDOWN_DURATION;
         let mut failed: Vec<(String, i32)> = Vec::new();
+        // Cloned so the select below borrows nothing of `self` for it.
+        let cancel = self.cancel.clone();
 
         while !self.active_steps.is_empty() {
             tokio::select! {
@@ -64,10 +66,22 @@ impl WorkflowEngine {
                     {
                         continue;
                     }
+                    // Cancellation also wins over a runtime wait error, while
+                    // every slot still owns the handle needed to stop it.
+                    if self.cancel_requested() {
+                        return Ok(GroupOutcome::Ended(self.cancel_parallel_group()?));
+                    }
                     let exit = result?;
                     // Persist the buffered output on a genuine failure before the
                     // slot (which owns the tail + container name) is removed.
                     self.maybe_dump_step_failure(&name, exit.exit_code);
+                    // A failure that raced a cancel belongs to the cancelled
+                    // run: no auth relaunch, no abort policy (which would
+                    // suppress teardown). The slot is still active, so the
+                    // group cancel stops and removes it with the others.
+                    if exit.exit_code != 0 && self.cancel_requested() {
+                        return Ok(GroupOutcome::Ended(self.cancel_parallel_group()?));
+                    }
                     let auth_recovered = exit.exit_code != 0 && self.recover_auth_failure(&name)?;
                     self.remove_active_step(&name);
                     self.last_exit_info = Some(exit.clone());
@@ -89,6 +103,11 @@ impl WorkflowEngine {
                     self.persist()?;
                     let progress = self.workflow_progress_info();
                     self.frontend.report_workflow_progress(&progress);
+
+                    // Never launch a queued step once a cancel arrived.
+                    if self.cancel_requested() {
+                        return Ok(GroupOutcome::Ended(self.cancel_parallel_group()?));
+                    }
 
                     if auth_recovered {
                         // Put the same step back at the head of this parallel
@@ -119,6 +138,11 @@ impl WorkflowEngine {
                             self.launch_parallel_step(next, &mut waits, &stuck_tx, true)?;
                         }
                     }
+                }
+                // After `waits` (the loop is biased): a container that already
+                // exited is recorded first.
+                _ = cancel.cancelled() => {
+                    return Ok(GroupOutcome::Ended(self.cancel_parallel_group()?));
                 }
                 Some((name, event)) = stuck_rx.recv() => {
                     self.handle_parallel_stuck_event(&name, event);
@@ -213,6 +237,7 @@ impl WorkflowEngine {
         let stuck_sender = execution.stuck_sender();
         let cancel_handle = execution.cancel_handle();
         let container_name = execution.handle().name.clone();
+        let handle = execution.handle().clone();
         let output_tail = execution.output_tail();
 
         // Publish the per-step stuck sender so the frontend can subscribe for
@@ -271,6 +296,7 @@ impl WorkflowEngine {
             execution: None,
             cancel_handle,
             container_name,
+            handle,
             output_tail,
             awman_killed: false,
             stuck: false,
@@ -472,6 +498,25 @@ impl WorkflowEngine {
                 .report_parallel_step_exited(&s.step_name, KILLED_EXIT_CODE);
         }
         killed.into_iter().map(|s| s.step_name).collect()
+    }
+
+    /// An external cancel arrived while a parallel group runs: kill and stop
+    /// every live container, close the group, and end the run as
+    /// [`WorkflowOutcome::Cancelled`]. Unlike [`Self::abort_parallel_group`] it
+    /// does not set `abort_on_failure_triggered`, so cancelled teardown runs.
+    pub(super) fn cancel_parallel_group(&mut self) -> Result<WorkflowOutcome, EngineError> {
+        let live: Vec<String> = self
+            .active_steps
+            .iter()
+            .map(|s| s.step_name.clone())
+            .collect();
+        self.stop_active_agents();
+        for name in &live {
+            self.frontend
+                .report_parallel_step_exited(name, KILLED_EXIT_CODE);
+        }
+        self.frontend.report_parallel_group_finished();
+        self.cancel_run()
     }
 
     /// Kill every live container in the current parallel group and cancel all

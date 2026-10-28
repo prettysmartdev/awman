@@ -61,8 +61,25 @@ fn make_app_state(root: &std::path::Path) -> Arc<AppState> {
         global_config: std::sync::Arc::new(Default::default()),
     };
 
+    let store = Arc::new(store);
+
+    let lifecycle_store = awman::data::CommandLifecycleStore::open(Arc::clone(&store)).unwrap();
+
+    let setup_cancels = Arc::new(awman::command::commands::api_server::TokenRegistry::new());
+
+    let canceller = awman::command::commands::api_server::CommandCanceller::new(
+        Arc::clone(&store),
+        lifecycle_store.clone(),
+        Arc::new(awman::command::commands::api_server::TokenRegistry::new()),
+        Arc::clone(&setup_cancels),
+    );
+
     Arc::new(AppState {
-        store: Arc::new(store),
+        lifecycle_store,
+        setup_cancels,
+        canceller,
+
+        store,
         paths,
         workdirs: vec![],
         workdir_roots: Vec::new(),
@@ -1476,8 +1493,20 @@ async fn real_network_local_session_creation_succeeds() {
         credential_monitor: None,
         global_config: std::sync::Arc::new(Default::default()),
     };
+    let store = Arc::new(store);
+    let lifecycle_store = awman::data::CommandLifecycleStore::open(Arc::clone(&store)).unwrap();
+    let setup_cancels = Arc::new(awman::command::commands::api_server::TokenRegistry::new());
+    let canceller = awman::command::commands::api_server::CommandCanceller::new(
+        Arc::clone(&store),
+        lifecycle_store.clone(),
+        Arc::new(awman::command::commands::api_server::TokenRegistry::new()),
+        Arc::clone(&setup_cancels),
+    );
     let state = Arc::new(AppState {
-        store: Arc::new(store),
+        lifecycle_store,
+        setup_cancels,
+        canceller,
+        store,
         paths,
         workdirs: vec![workdir_path.clone()],
         workdir_roots: Vec::new(),

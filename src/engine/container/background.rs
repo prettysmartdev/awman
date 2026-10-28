@@ -29,6 +29,8 @@ pub struct BackgroundExecRequest<'a> {
 /// An idle setup/teardown container with per-session builtin settings.
 #[derive(Debug, Clone, Copy)]
 pub struct BackgroundLaunchRequest<'a> {
+    /// Explicit ownership name, when the caller needs restart discovery.
+    pub name: Option<&'a str>,
     /// The project's base image.
     pub image: &'a str,
     /// The workspace, mounted read-write at its own path.
@@ -151,12 +153,15 @@ impl AgentExec for BackgroundContainer {
 
 pub(super) fn default_start_background(
     cli: ContainerCli,
+    name: Option<&str>,
     image: &str,
     workdir: &Path,
     env: &HashMap<String, String>,
     overlays: &[OverlaySpec],
 ) -> Result<String, EngineError> {
-    let name = crate::engine::container::naming::generate_container_name();
+    let name = name
+        .map(str::to_owned)
+        .unwrap_or_else(crate::engine::container::naming::generate_container_name);
     let args = build_start_background_argv(&name, image, workdir, env, overlays);
 
     let mut command = Command::new(crate::engine::host_cli::program(cli.bin));
@@ -571,6 +576,7 @@ mod tests {
         let backend = Arc::new(RecordingBackend::default());
         let id = backend
             .start_background(&BackgroundLaunchRequest {
+                name: None,
                 image: "img",
                 workdir: std::path::Path::new("/w"),
                 env: &HashMap::new(),
@@ -599,6 +605,7 @@ mod tests {
         let backend = Arc::new(RecordingBackend::default());
         let id = backend
             .start_background(&BackgroundLaunchRequest {
+                name: None,
                 image: "img",
                 workdir: std::path::Path::new("/w"),
                 env: &HashMap::new(),
@@ -630,6 +637,7 @@ mod tests {
         let backend = Arc::new(RecordingBackend::default());
         let id = backend
             .start_background(&BackgroundLaunchRequest {
+                name: None,
                 image: "img",
                 workdir: std::path::Path::new("/w"),
                 env: &HashMap::new(),

@@ -480,6 +480,7 @@ impl ContainerBackend for DockerBackend {
     ) -> Result<String, EngineError> {
         background::default_start_background(
             ContainerCli::DOCKER,
+            request.name,
             request.image,
             request.workdir,
             request.env,

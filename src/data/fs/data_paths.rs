@@ -159,7 +159,7 @@ impl MigrationLock {
                             Err(remove_error)
                                 if remove_error.kind() == std::io::ErrorKind::NotFound =>
                             {
-                                continue
+                                continue;
                             }
                             Err(remove_error) => return Err(DataError::io(&path, remove_error)),
                         }

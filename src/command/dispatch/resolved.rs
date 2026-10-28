@@ -523,6 +523,10 @@ pub struct BuildContext<'a> {
     /// `GatewayNeed`, if any.
     pub gateway: Option<Arc<dyn TaskGateway>>,
     pub caller: CallerContext,
+    /// Fired by an external cancel request. Commands that can be cancelled
+    /// (`exec workflow`, `exec prompt`) observe it; a never-fired token unless
+    /// the caller used `Dispatch::with_cancellation` (only the API worker does).
+    pub cancel: tokio_util::sync::CancellationToken,
 }
 
 impl BuildContext<'_> {

@@ -231,6 +231,7 @@ pub(crate) async fn execute_prepared(
     task_workspace: Option<&Path>,
     workflow_state_root: Option<&Path>,
     managed_session: Option<&Arc<tokio::sync::RwLock<Session>>>,
+    cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<ExecWorkflowOutcome, CommandError> {
     let PreparedRun {
         mut workflow,
@@ -421,6 +422,10 @@ pub(crate) async fn execute_prepared(
             launch_modes: Arc::new(launch_modes),
             agent_flags: workflow_agent_flags,
         };
+        let cleanup_workflow = workflow.clone();
+        let cleanup_work_item = engine_work_item_context
+            .as_ref()
+            .map(|wi| (wi.number, wi.content.clone()));
         let mut engine = match WorkflowEngine::resume(
             &session,
             crate::engine::workflow::WorkflowSpec::new(workflow)
@@ -450,6 +455,7 @@ pub(crate) async fn execute_prepared(
             engine = engine.mirror_into_session(Arc::clone(session));
         }
         engine.set_yolo(yolo);
+        engine.set_cancellation(cancel.clone());
         engine.set_parallel_group_prompts(crate::command::prompts::parallel_group_prompts());
         engine.set_workflow_context_permission(active_workflow_context_permission);
         if let Err(e) = engine.declare_phase_steps(&setup_steps, &teardown_steps) {
@@ -497,6 +503,25 @@ pub(crate) async fn execute_prepared(
         // is driving it.
         let interactive_phase_steps =
             squad_identity.is_none() && shared.lock().unwrap().supports_interactive_recovery();
+
+        shared.lock().unwrap().record_cancel_cleanup(
+            &crate::data::workflow_cleanup::WorkflowCleanup {
+                workflow: cleanup_workflow,
+                work_item: cleanup_work_item,
+                workdir: session.working_dir().to_path_buf(),
+                mount_path: mount_path.clone(),
+                state_root: workflow_state_root.map(Path::to_path_buf),
+                image: resolve_phase_image(
+                    &session,
+                    &git_root_for_scope,
+                    engines.runtime.capabilities().image_acquisition,
+                ),
+                cli_overlays: cli_typed.clone(),
+                worktree_git_mount: worktree_git_mount
+                    .as_ref()
+                    .map(|m| (m.host_path.clone(), m.container_path.clone(), m.permission)),
+            },
+        )?;
 
         // === SETUP PHASE ===
         //
@@ -558,6 +583,7 @@ pub(crate) async fn execute_prepared(
                             .as_ref()
                             .map_err(|e| EngineError::Other(e.to_string()))?;
                         super::phase_container::PhaseContainerFactory {
+                            name_prefix: engines.runtime.container_name_prefix(),
                             runtime: &runtime,
                             frontend: &shared_for_factory,
                             agent_engine: &engines.agent_engine,
@@ -605,13 +631,28 @@ pub(crate) async fn execute_prepared(
         }
 
         // === MAIN PHASE ===
-        let result = if setup_failed {
+        //
+        // A cancel during setup stops the phase before its next step; the
+        // main phase then never starts and the run ends cancelled. The cancel
+        // takes precedence over a setup failure it caused or raced.
+        let result = if engine.cancel_requested() {
+            engine.cancel_run()
+        } else if setup_failed {
             Err(crate::engine::error::EngineError::Container(
                 "setup phase failed; main workflow not started".into(),
             ))
         } else {
             engine.run_to_completion().await
         };
+        // A runtime wait error may race the token too. Reconcile before
+        // deciding which teardown policy to apply, rather than after cleanup.
+        let result =
+            if engine.cancel_requested() && !matches!(result, Ok(WorkflowOutcome::Cancelled)) {
+                engine.cancel_run()
+            } else {
+                result
+            };
+        let cancelled = matches!(result, Ok(WorkflowOutcome::Cancelled));
 
         let workflow_succeeded = matches!(
             result,
@@ -628,9 +669,13 @@ pub(crate) async fn execute_prepared(
         //
         // If the setup or main phase triggered abort_on_failure,
         // teardown is skipped regardless of teardown_on_failure.
+        //
+        // A cancelled run always tears down, in cancelled mode: push, pull
+        // request and CI-poll steps are skipped, cleanup steps still run
+        // (without `on_failure` remediation).
         let mut teardown_outcome = crate::engine::workflow::PhaseOutcome::default();
         if !teardown_steps.is_empty() && !engine.abort_on_failure_triggered() {
-            let should_run = teardown_on_failure || workflow_succeeded;
+            let should_run = cancelled || teardown_on_failure || workflow_succeeded;
             if should_run {
                 let base_image = resolve_phase_image(
                     &session,
@@ -667,6 +712,7 @@ pub(crate) async fn execute_prepared(
                             .as_ref()
                             .map_err(|e| EngineError::Other(e.to_string()))?;
                         super::phase_container::PhaseContainerFactory {
+                            name_prefix: engines.runtime.container_name_prefix(),
                             runtime: &runtime,
                             frontend: &shared,
                             agent_engine: &engines.agent_engine,
@@ -677,31 +723,45 @@ pub(crate) async fn execute_prepared(
                         }
                         .build(step, env, overlays)
                     };
-                    engine
-                        .run_phase(
-                            PhaseKind::Teardown,
-                            &teardown_steps,
-                            &teardown_abort_flags,
-                            &teardown_on_failure_configs,
-                            factory,
-                        )
-                        .unwrap_or_default()
+                    if cancelled {
+                        engine
+                            .run_teardown_cancelled(&teardown_steps, &teardown_abort_flags, factory)
+                            .unwrap_or_default()
+                    } else {
+                        engine
+                            .run_phase(
+                                PhaseKind::Teardown,
+                                &teardown_steps,
+                                &teardown_abort_flags,
+                                &teardown_on_failure_configs,
+                                factory,
+                            )
+                            .unwrap_or_default()
+                    }
                 });
             }
         }
 
+        // A cancel that arrived during a normal teardown (its publishing steps
+        // were then skipped) cancels the run: the command had not finished.
+        // So does one that arrived after the main phase with no teardown to
+        // run; only a command that finished first keeps its result.
+        let cancelled_late = !cancelled
+            && (teardown_outcome.cancelled || engine.cancel_requested())
+            && !engine.abort_on_failure_triggered();
         // If any teardown step failed, promote the result to
         // CompletedTeardownFailed so post-workflow flows know.
-        let result =
-            if (teardown_outcome.aborted || teardown_outcome.any_failed) && workflow_succeeded {
-                shared.lock().unwrap().write_message(UserMessage {
-                    level: MessageLevel::Warning,
-                    text: "Workflow completed but one or more teardown steps failed".into(),
-                });
-                Ok(WorkflowOutcome::CompletedTeardownFailed)
-            } else {
-                result
-            };
+        let result = if cancelled_late {
+            engine.cancel_run()
+        } else if (teardown_outcome.aborted || teardown_outcome.any_failed) && workflow_succeeded {
+            shared.lock().unwrap().write_message(UserMessage {
+                level: MessageLevel::Warning,
+                text: "Workflow completed but one or more teardown steps failed".into(),
+            });
+            Ok(WorkflowOutcome::CompletedTeardownFailed)
+        } else {
+            result
+        };
 
         // If teardown didn't run (no teardown steps, or skipped on failure)
         // the engine's current_phase still reads Main — promote it to Done
@@ -742,6 +802,7 @@ pub(crate) async fn execute_prepared(
             Err(_)
                 | Ok(WorkflowOutcome::Failed { .. })
                 | Ok(WorkflowOutcome::Aborted)
+                | Ok(WorkflowOutcome::Cancelled)
                 | Ok(WorkflowOutcome::CompletedTeardownFailed)
         );
 
@@ -760,6 +821,8 @@ pub(crate) async fn execute_prepared(
         Ok(WorkflowOutcome::CompletedTeardownFailed) => Some(1),
         Ok(WorkflowOutcome::Failed { exit_code, .. }) => Some(*exit_code),
         Ok(WorkflowOutcome::Aborted) => Some(1),
+        // SIGINT convention, as `CommandError::Aborted` maps to.
+        Ok(WorkflowOutcome::Cancelled) => Some(crate::data::command_status::CANCELLED_EXIT_CODE),
         Ok(WorkflowOutcome::Paused) => None,
         Err(_) => Some(1),
     };
@@ -1338,5 +1401,115 @@ mod compat_tests {
             ),
             agent
         );
+    }
+}
+
+/// Recovery never dispatches setup, main, a leader, or remediation. It uses
+/// the inputs saved before the original run and the existing phase statuses.
+pub(crate) async fn finish_cancelled_cleanup(
+    engines: &Engines,
+    original_session: &Session,
+    cleanup: crate::data::workflow_cleanup::WorkflowCleanup,
+    frontend: SharedWorkflowFrontend,
+) -> Result<(), CommandError> {
+    let session = Session::open_worktree_for(
+        cleanup.workdir.clone(),
+        cleanup.workdir.clone(),
+        original_session,
+    )?;
+    let steps: Vec<_> = cleanup
+        .workflow
+        .teardown
+        .iter()
+        .map(|e| e.step.clone())
+        .collect();
+    let aborts: Vec<_> = cleanup
+        .workflow
+        .teardown
+        .iter()
+        .map(|e| e.abort_on_failure)
+        .collect();
+    let entries: Vec<_> = cleanup
+        .workflow
+        .teardown
+        .iter()
+        .map(|e| e.overlays.clone())
+        .collect();
+    let mut engine = WorkflowEngine::resume(
+        &session,
+        crate::engine::workflow::WorkflowSpec::new(cleanup.workflow)
+            .with_work_item_context(
+                cleanup
+                    .work_item
+                    .map(|(number, content)| WorkItemContext { number, content }),
+            )
+            .with_state_root(cleanup.state_root),
+        crate::engine::workflow::WorkflowEngineDeps {
+            frontend: frontend.clone().into_workflow_frontend(),
+            agent_factory: Box::new(CleanupOnlyFactory),
+        },
+    )
+    .await?;
+    engine.cancel_run()?;
+    if !engine.state().teardown_completed && !steps.is_empty() {
+        let mount = cleanup
+            .worktree_git_mount
+            .map(|(host_path, container_path, permission)| {
+                crate::engine::container::options::OverlaySpec {
+                    host_path,
+                    container_path,
+                    permission,
+                }
+            });
+        let resolved = resolve_phase_overlays(
+            engines,
+            &session,
+            &cleanup.cli_overlays,
+            &entries,
+            mount.as_ref(),
+            &cleanup.image,
+        );
+        let runtime = engines.require_container_runtime()?;
+        tokio::task::block_in_place(|| {
+            engine.resume_teardown_cancelled(&steps, &aborts, |step| {
+                let (overlays, env) = resolved[step.index]
+                    .as_ref()
+                    .map_err(|e| EngineError::Other(e.to_string()))?;
+                super::phase_container::PhaseContainerFactory {
+                    name_prefix: engines.runtime.container_name_prefix(),
+                    runtime,
+                    frontend: &frontend,
+                    agent_engine: &engines.agent_engine,
+                    session: &session,
+                    image: &cleanup.image,
+                    workdir: &cleanup.mount_path,
+                    interactive: false,
+                }
+                .build(step, env, overlays)
+            })
+        })?;
+    }
+    engine.mark_done()?;
+    Ok(())
+}
+
+struct CleanupOnlyFactory;
+impl crate::engine::workflow::factory::AgentExecutionFactory for CleanupOnlyFactory {
+    fn execution_for_step(
+        &self,
+        _: &WorkflowStep,
+        _: &Session,
+        _: &crate::engine::workflow::factory::WorkflowRuntimeContext,
+    ) -> Result<crate::engine::agent_runtime::execution::AgentExecution, EngineError> {
+        Err(EngineError::Other(
+            "cancel recovery cannot launch agents".into(),
+        ))
+    }
+    fn inject_prompt(
+        &self,
+        _: &crate::engine::agent_runtime::execution::AgentExecution,
+        _: &str,
+    ) -> Result<Option<()>, EngineError> {
+        Ok(None)
     }
 }

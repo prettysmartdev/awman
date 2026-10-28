@@ -218,6 +218,7 @@ impl StepViewStatus {
             PhaseStepStatus::Succeeded => Self::Done,
             PhaseStepStatus::Failed { .. } => Self::Error,
             PhaseStepStatus::Remediating { .. } => Self::Fixing,
+            PhaseStepStatus::Skipped => Self::Skipped,
         }
     }
 }

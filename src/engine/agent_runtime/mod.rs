@@ -101,6 +101,11 @@ pub struct ReadyAgentOptions {
 /// Layer 2 programs against; paradigm-specific decisions branch on
 /// `capabilities()` or `runtime_name()`, never on concrete types.
 pub trait AgentRuntimeEngine: Send + Sync {
+    /// Optional ownership prefix for auxiliary containers of this launch.
+    fn container_name_prefix(&self) -> Option<&str> {
+        None
+    }
+
     /// Stable machine name for this runtime (e.g. "docker", "apple-containers",
     /// "docker-sbx-experimental"). Used for log lines and config round-trips.
     fn runtime_name(&self) -> &'static str;

@@ -106,6 +106,121 @@ impl WorkflowEngine {
         steps: &[S],
         abort_flags: &[bool],
         on_failure_configs: &[Option<crate::data::workflow_definition::RemediationConfig>],
+        container_for_step: F,
+    ) -> Result<PhaseOutcome, EngineError>
+    where
+        S: PhaseStepSpec,
+        F: FnMut(&PhaseStepRef) -> Result<Box<dyn AgentExec>, EngineError>,
+    {
+        // Setup stops between steps on a cancel so the main phase never
+        // starts. A teardown entered normally (the main phase already
+        // finished) switches to cancelled cleanup on a cancel: its remaining
+        // publishing steps are skipped and no remediation is launched.
+        let options = PhaseRunOptions {
+            resume: false,
+            skip: Vec::new(),
+            allow_remediation: true,
+            observe_cancel: kind == PhaseKind::Setup,
+        };
+        self.run_phase_with(
+            kind,
+            steps,
+            abort_flags,
+            on_failure_configs,
+            options,
+            container_for_step,
+        )
+    }
+
+    /// Teardown after a cancel: `PushBranch`, `CreatePullRequest` and `PollCi`
+    /// entries are recorded `PhaseStepStatus::Skipped` and reported through
+    /// `WorkflowFrontend::on_phase_step_skipped`; the remaining entries
+    /// (`RunShell`, `RunScript`, `CommitChanges`) run in order with no
+    /// `on_failure` remediation and without observing the cancel token (the run
+    /// is already cancelled; cleanup must finish). `abort_flags` keep their
+    /// meaning. Returns the phase outcome with `cancelled = true`.
+    pub fn run_teardown_cancelled<F>(
+        &mut self,
+        steps: &[crate::data::workflow_definition::TeardownStep],
+        abort_flags: &[bool],
+        container_for_step: F,
+    ) -> Result<PhaseOutcome, EngineError>
+    where
+        F: FnMut(&PhaseStepRef) -> Result<Box<dyn AgentExec>, EngineError>,
+    {
+        let options = PhaseRunOptions {
+            resume: false,
+            skip: steps
+                .iter()
+                .map(|s| !Self::teardown_step_runs_when_cancelled(s))
+                .collect(),
+            allow_remediation: false,
+            observe_cancel: false,
+        };
+        let mut outcome = self.run_phase_with(
+            PhaseKind::Teardown,
+            steps,
+            abort_flags,
+            &[],
+            options,
+            container_for_step,
+        )?;
+        outcome.cancelled = true;
+        Ok(outcome)
+    }
+
+    /// Finish interrupted cancelled teardown without repeating terminal steps.
+    pub fn resume_teardown_cancelled<F>(
+        &mut self,
+        steps: &[crate::data::workflow_definition::TeardownStep],
+        abort_flags: &[bool],
+        container_for_step: F,
+    ) -> Result<PhaseOutcome, EngineError>
+    where
+        F: FnMut(&PhaseStepRef) -> Result<Box<dyn AgentExec>, EngineError>,
+    {
+        self.run_phase_with(
+            PhaseKind::Teardown,
+            steps,
+            abort_flags,
+            &[],
+            PhaseRunOptions {
+                resume: true,
+                skip: steps
+                    .iter()
+                    .map(|s| !Self::teardown_step_runs_when_cancelled(s))
+                    .collect(),
+                allow_remediation: false,
+                observe_cancel: false,
+            },
+            container_for_step,
+        )
+    }
+
+    /// Whether a teardown step still runs after a cancel. Nothing that
+    /// publishes the cancelled work (a push, a pull request, waiting on CI
+    /// for it) does; local cleanup does.
+    pub fn teardown_step_runs_when_cancelled(
+        step: &crate::data::workflow_definition::TeardownStep,
+    ) -> bool {
+        use crate::data::workflow_definition::TeardownStep;
+        !matches!(
+            step,
+            TeardownStep::PushBranch { .. }
+                | TeardownStep::CreatePullRequest { .. }
+                | TeardownStep::PollCi { .. }
+        )
+    }
+
+    /// The one phase runner behind [`Self::run_phase`] and
+    /// [`Self::run_teardown_cancelled`].
+    fn run_phase_with<S, F>(
+        &mut self,
+        kind: PhaseKind,
+        steps: &[S],
+        abort_flags: &[bool],
+        on_failure_configs: &[Option<crate::data::workflow_definition::RemediationConfig>],
+        options: PhaseRunOptions,
         mut container_for_step: F,
     ) -> Result<PhaseOutcome, EngineError>
     where
@@ -124,13 +239,51 @@ impl WorkflowEngine {
         let steps: Vec<S> = steps.iter().map(|s| s.substitute(wi_ctx)).collect();
 
         self.state.current_phase = kind.workflow_phase();
-        self.reset_or_rebuild_phase_states(kind, &steps);
+        if options.resume {
+            self.refresh_phase_states(kind, &steps);
+        } else {
+            self.reset_or_rebuild_phase_states(kind, &steps);
+        }
         self.persist()?;
 
         let mut outcome = PhaseOutcome::default();
         for (idx, step) in steps.iter().enumerate() {
+            if options.resume
+                && matches!(
+                    self.state.phase_step_states(kind)[idx].status,
+                    PhaseStepStatus::Succeeded
+                        | PhaseStepStatus::Skipped
+                        | PhaseStepStatus::Failed { .. }
+                )
+            {
+                continue;
+            }
+            // A shell step already executing finishes (its exec is a blocking
+            // call); the cancel is honoured before the next one starts.
+            if options.observe_cancel && self.cancel_requested() {
+                outcome.cancelled = true;
+                break;
+            }
+
             let desc = self.state.phase_step_states(kind)[idx].description.clone();
             let abort = abort_flags.get(idx).copied().unwrap_or(false);
+
+            // A cancel during teardown switches the rest of it to cancelled
+            // cleanup: nothing that publishes the cancelled work starts, local
+            // cleanup still runs (and launches no remediation, below).
+            let cancelled_teardown = kind == PhaseKind::Teardown && self.cancel_requested();
+            if cancelled_teardown {
+                outcome.cancelled = true;
+            }
+
+            if options.skip.get(idx).copied().unwrap_or(false)
+                || (cancelled_teardown && step.publishes())
+            {
+                self.state.phase_step_states_mut(kind)[idx].status = PhaseStepStatus::Skipped;
+                self.persist()?;
+                self.frontend.on_phase_step_skipped(kind, &desc);
+                continue;
+            }
 
             self.state.phase_step_states_mut(kind)[idx].status = PhaseStepStatus::Running;
             self.persist()?;
@@ -140,7 +293,8 @@ impl WorkflowEngine {
             let mut step_outcome =
                 self.run_single_phase_step(kind, step, idx, &mut container_for_step);
 
-            if step_outcome.failed {
+            // No `on_failure` agent is ever launched once a cancel arrived.
+            if step_outcome.failed && options.allow_remediation && !self.cancel_requested() {
                 let rem = on_failure_configs
                     .get(idx)
                     .and_then(|c| c.as_ref())
@@ -155,6 +309,14 @@ impl WorkflowEngine {
                         &mut container_for_step,
                     );
                 }
+            }
+
+            // A setup step (or its remediation) that failed after a cancel
+            // arrived is part of the cancelled run, not a failure: the abort
+            // policy must not fire, since that would suppress teardown.
+            if step_outcome.failed && options.observe_cancel && self.cancel_requested() {
+                outcome.cancelled = true;
+                break;
             }
 
             if !step_outcome.failed {
@@ -183,11 +345,18 @@ impl WorkflowEngine {
             }
         }
 
-        // An aborted setup did not finish: leaving `setup_completed` false is
-        // what makes a resumed run re-run it, and leaving `current_phase` at
-        // `Setup` keeps the run out of the main phase. Teardown is terminal,
-        // so an abort there still records completion and moves to `Done`.
-        if !outcome.aborted || kind == PhaseKind::Teardown {
+        // A cancel that arrived during the last teardown step still makes the
+        // run cancelled: the command has not finished yet.
+        if kind == PhaseKind::Teardown && self.cancel_requested() {
+            outcome.cancelled = true;
+        }
+
+        // An aborted or cancelled setup did not finish: leaving
+        // `setup_completed` false is what makes a resumed run re-run it, and
+        // leaving `current_phase` at `Setup` keeps the run out of the main
+        // phase. Teardown is terminal, so an abort there still records
+        // completion and moves to `Done`.
+        if !(outcome.aborted || outcome.cancelled) || kind == PhaseKind::Teardown {
             self.state.set_phase_completed(kind);
             self.state.current_phase = kind.next_workflow_phase();
         }
@@ -367,6 +536,9 @@ impl WorkflowEngine {
         let desc = self.state.phase_step_states(kind)[idx].description.clone();
         let mut last = failure;
         for attempt in 1..=config.max_attempts {
+            if self.cancel_requested() {
+                break;
+            }
             self.msg_info(format!(
                 "Step failed — launching on_failure agent (attempt {attempt}/{})...",
                 config.max_attempts,
@@ -389,6 +561,12 @@ impl WorkflowEngine {
                     stderr: &last.stderr,
                 }),
             );
+
+            // The agent was stopped by a cancel: do not retry the step.
+            if self.cancel_requested() {
+                self.set_phase_step_failed(kind, idx, "cancelled during on_failure remediation");
+                break;
+            }
 
             self.state.phase_step_states_mut(kind)[idx].status = PhaseStepStatus::Running;
             let _ = self.persist();
@@ -577,7 +755,9 @@ impl WorkflowEngine {
     /// `--dynamic` implies) a stuck agent gets the same yolo countdown a
     /// workflow step does: Esc or Ctrl-W cancels it (the agent keeps running),
     /// fresh output cancels it, and expiry kills the agent so the failed phase
-    /// step is retried.
+    /// step is retried. An external cancel stops the agent (its `CancelHandle`
+    /// and `stop_agent`) and returns `KILLED_EXIT_CODE`; the caller then sees
+    /// `cancel_requested()` and skips the retry.
     async fn wait_on_failure_agent(
         &mut self,
         mut exec: AgentExecution,
@@ -585,15 +765,19 @@ impl WorkflowEngine {
     ) -> Result<i32, EngineError> {
         use crate::engine::agent_runtime::execution::KILLED_EXIT_CODE;
 
-        if !self.yolo {
-            return exec.wait().await.map(|e| e.exit_code);
-        }
-
         let cancel_handle = exec.cancel_handle();
-        let mut stuck_rx = Some(exec.subscribe_stuck());
-        // Same tab-colouring hookup a main step's container gets.
-        self.frontend
-            .attach_engine(EngineHandles::stuck(exec.stuck_sender()));
+        let handle = exec.handle().clone();
+        let cancel = self.cancel.clone();
+        // Stuck detection only matters under yolo; without it the receiver
+        // stays `None` and that branch never fires.
+        let mut stuck_rx = if self.yolo {
+            // Same tab-colouring hookup a main step's container gets.
+            self.frontend
+                .attach_engine(EngineHandles::stuck(exec.stuck_sender()));
+            Some(exec.subscribe_stuck())
+        } else {
+            None
+        };
 
         let (wait_tx, mut wait_rx) =
             tokio::sync::oneshot::channel::<Result<AgentExitInfo, EngineError>>();
@@ -608,6 +792,17 @@ impl WorkflowEngine {
                     return result
                         .map_err(|_| EngineError::Other("on_failure wait task dropped unexpectedly".into()))?
                         .map(|e| e.exit_code);
+                }
+                _ = cancel.cancelled() => {
+                    self.msg_warning(format!("Cancel requested; stopping '{label}'"));
+                    if let Some(ch) = &cancel_handle {
+                        let _ = ch.cancel();
+                    }
+                    if let Err(e) = self.agent_factory.stop_agent(&handle) {
+                        tracing::warn!(error = %e, "cancel: stopping the on_failure agent failed");
+                    }
+                    self.frontend.report_container_exited(KILLED_EXIT_CODE);
+                    return Ok(KILLED_EXIT_CODE);
                 }
                 Some(event) = Self::recv_stuck(&mut stuck_rx) => {
                     if !matches!(event, StuckEvent::Stuck) {

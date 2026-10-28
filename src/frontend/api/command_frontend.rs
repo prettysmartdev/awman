@@ -886,6 +886,18 @@ impl WorkflowFrontend for ApiDispatchFrontend {
         });
     }
 
+    fn on_phase_step_skipped(&mut self, kind: PhaseKind, description: &str) {
+        self.event_bus.emit(EventPayload::StatusMessage {
+            phase: kind.label().to_string(),
+            message: format!("skipped (cancelled): {description}"),
+        });
+        self.event_bus.emit(EventPayload::WorkflowPhaseTransition {
+            phase: kind.label().to_string(),
+            step_desc: description.to_string(),
+            status: PhaseStatusKind::Cancelled,
+        });
+    }
+
     fn on_phase_step_failed(
         &mut self,
         kind: PhaseKind,
@@ -926,6 +938,13 @@ impl WorkflowFrontend for ApiDispatchFrontend {
                 None,
                 PhaseStatusKind::Failed,
                 "Workflow aborted".to_string(),
+            ),
+            WorkflowOutcome::Cancelled => (
+                CommandStatusKind::Cancelled,
+                Some(crate::data::command_status::CANCELLED_EXIT_CODE),
+                None,
+                PhaseStatusKind::Cancelled,
+                "Workflow cancelled".to_string(),
             ),
             WorkflowOutcome::CompletedTeardownFailed => (
                 CommandStatusKind::Done,
@@ -1264,6 +1283,15 @@ impl ExecPromptCommandFrontend for ApiDispatchFrontend {}
 
 #[async_trait]
 impl ExecWorkflowCommandFrontend for ApiDispatchFrontend {
+    fn record_cancel_cleanup(
+        &mut self,
+        cleanup: &crate::data::workflow_cleanup::WorkflowCleanup,
+    ) -> Result<(), CommandError> {
+        if let Some(writer) = &self.state_writer {
+            writer.write_cleanup(cleanup)?;
+        }
+        Ok(())
+    }
     fn report_workflow_summary(&mut self, summary: &WorkflowSummary) {
         self.event_bus.emit(EventPayload::StatusMessage {
             phase: "workflow".to_string(),

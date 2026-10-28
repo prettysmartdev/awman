@@ -99,6 +99,10 @@ impl WorkflowEngine {
         step_name: &str,
         exit_code: i32,
     ) -> Result<IterationOutcome, EngineError> {
+        // No recovery of any kind once a cancel has been requested.
+        if self.cancel_requested() {
+            return Ok(IterationOutcome::Ended(self.cancel_run()?));
+        }
         if self.frontend.supports_interactive_recovery() {
             self.handle_step_failure_interactive(step_name, exit_code)
         } else {
@@ -220,7 +224,12 @@ impl WorkflowEngine {
             "Step '{step_name}' failed (exit {exit_code}); retrying once in {}s",
             timing::YOLO_COUNTDOWN_DURATION.as_secs(),
         ));
-        match self.run_failure_retry_countdown(step_name).await? {
+        let countdown = self.run_failure_retry_countdown(step_name).await?;
+        // The countdown breaks early on a cancel: never start the retry.
+        if self.cancel_requested() {
+            return Ok(IterationOutcome::Ended(self.cancel_run()?));
+        }
+        match countdown {
             YoloTickOutcome::Cancel => {
                 self.msg_warning(format!(
                     "Retry countdown for step '{step_name}' cancelled; failing workflow",
@@ -269,6 +278,9 @@ impl WorkflowEngine {
         self.frontend
             .yolo_countdown_started(step_name, CountdownKind::FailureRetry);
         let outcome = loop {
+            if self.cancel_requested() {
+                break YoloTickOutcome::Cancel;
+            }
             let elapsed = start.elapsed();
             let remaining = total.saturating_sub(elapsed);
             match self

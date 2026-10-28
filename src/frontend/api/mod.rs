@@ -37,7 +37,11 @@ pub async fn serve(runtime: ApiServerRuntime) -> Result<(), CommandError> {
     runtime.spawn_workers(ApiFrontendFactory);
     let addr = runtime.bind_addr();
     let tls = runtime.tls_material();
+    let canceller = runtime.canceller();
     let state = Arc::new(routes::AppState {
+        lifecycle_store: runtime.lifecycle_store,
+        setup_cancels: runtime.setup_cancels,
+        canceller,
         store: runtime.store,
         paths: runtime.paths,
         workdirs: runtime.workdirs,

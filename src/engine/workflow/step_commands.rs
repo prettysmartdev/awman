@@ -341,6 +341,13 @@ pub trait PhaseStepSpec: Sized {
     /// `Some((interval_secs, max_retries))` when the step is a native CI poll
     /// the engine runs itself rather than a command in a container.
     fn poll_ci(&self) -> Option<(u32, u32)>;
+
+    /// Whether the step publishes the run's work (a push, a pull request,
+    /// waiting on CI for it). Such a step never starts once the run is
+    /// cancelled.
+    fn publishes(&self) -> bool {
+        false
+    }
 }
 
 impl PhaseStepSpec for SetupStep {
@@ -402,6 +409,10 @@ impl PhaseStepSpec for TeardownStep {
             )),
             _ => None,
         }
+    }
+
+    fn publishes(&self) -> bool {
+        !super::WorkflowEngine::teardown_step_runs_when_cancelled(self)
     }
 }
 

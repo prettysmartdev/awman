@@ -16,7 +16,9 @@ use crate::engine::auth::TlsMaterial;
 use crate::engine::daemon::{AcquireError, DaemonGuard, DaemonKind, DaemonSupervisor, Termination};
 use crate::engine::remote::{HttpClientOptions, HttpCore};
 
+pub mod cancel;
 pub mod event_bus;
+pub mod owned_runtime;
 pub mod push_back;
 pub mod queue_worker;
 pub mod runtime;
@@ -26,6 +28,7 @@ pub mod session_setup;
 /// `ApiServerRuntime` hands it to the router; Layer 2 holds no copy of it
 /// (WI 0114 F-14).
 pub use crate::engine::auth::AuthMode;
+pub use cancel::{CancelOutcome, CommandCanceller, TokenRegistry};
 pub use runtime::{ApiServerRuntime, ApiSessionLifecycle, CloseOutcome, SetupReadiness};
 
 /// Build the API daemon's process handle from its paths.

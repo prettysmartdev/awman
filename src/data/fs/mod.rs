@@ -8,6 +8,7 @@ pub mod agent_dirs;
 pub mod agent_trust;
 pub mod api_command_log;
 pub mod api_db;
+pub mod api_labels;
 pub mod api_paths;
 pub mod auth_paths;
 pub mod context_dirs;

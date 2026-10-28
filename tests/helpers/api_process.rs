@@ -71,6 +71,7 @@ case "$1" in
       exit 0
     fi
     [ "$mode" = "noop" ] && exit 0
+    [ "$mode" = "slow" ] && { echo "$$" > "$ctl/slow.pid"; sleep 30; }
     [ -n "$workspace" ] && echo "edited by the fake agent" > "$workspace/agent-edit.txt"
     if [ "$mode" = "poison" ]; then
       mkdir -p "$workspace/.git/hooks"
@@ -107,6 +108,8 @@ pub enum AgentMode {
     /// Write `agent-edit.txt` and exit 3.
     Fail,
     Poison,
+    /// Sleep 30 seconds (a long-running agent a test can cancel), then edit.
+    Slow,
     LeaderRewrite,
     LeaderCommit,
 }
@@ -142,6 +145,7 @@ impl ApiHome {
             AgentMode::NoOp => "noop",
             AgentMode::Fail => "fail",
             AgentMode::Poison => "poison",
+            AgentMode::Slow => "slow",
             AgentMode::LeaderRewrite => "leader-rewrite",
             AgentMode::LeaderCommit => "leader-commit",
         };

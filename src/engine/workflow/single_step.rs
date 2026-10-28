@@ -27,6 +27,12 @@ impl WorkflowEngine {
         };
 
         if let WorkflowStepStatus::Failed { exit_code } = outcome.status {
+            // A cancel that lands while the step was failing wins: no auth
+            // retry, no abort_on_failure, no unattended retry.
+            if self.cancel_requested() {
+                return Ok(IterationOutcome::Ended(self.cancel_run()?));
+            }
+
             let progress = self.workflow_progress_info();
             self.frontend.report_workflow_progress(&progress);
 
@@ -190,12 +196,14 @@ impl WorkflowEngine {
         self.persist()?;
 
         let container_name = execution.handle().name.clone();
+        let handle = execution.handle().clone();
         let output_tail = execution.output_tail();
         self.active_steps = vec![ActiveParallelStep {
             step_name: step.name.clone(),
             execution: Some(execution),
             cancel_handle: None,
             container_name,
+            handle,
             output_tail,
             awman_killed: false,
             stuck: false,
@@ -284,6 +292,9 @@ impl WorkflowEngine {
             let _ = wait_tx.send((exec, result));
         });
 
+        // Cloned so the select below borrows nothing of `self` for it.
+        let cancel = self.cancel.clone();
+
         loop {
             tokio::select! {
                 biased;
@@ -294,6 +305,12 @@ impl WorkflowEngine {
                     return Ok(InterruptibleStepResult::StepCompleted(
                         self.finalize_step(&step_name, exit_result?)?
                     ));
+                }
+                // After `wait_rx` (the loop is biased): a container that
+                // already exited is finalised first.
+                _ = cancel.cancelled() => {
+                    self.kill_current_container(&cancel_handle);
+                    return Ok(InterruptibleStepResult::WorkflowEnded(self.cancel_run()?));
                 }
                 Some(event) = Self::recv_stuck(&mut stuck_rx) => {
                     match event {
@@ -531,6 +548,13 @@ impl WorkflowEngine {
         let start = std::time::Instant::now();
 
         loop {
+            // An external cancel ends the countdown; the caller's own select
+            // then observes the token and stops the container.
+            if self.cancel_requested() {
+                self.frontend.yolo_countdown_finished(step_name);
+                return Ok(MidStepYoloResult::Cancelled);
+            }
+
             // Drain any pending stuck events first. Without this, an `Unstuck`
             // event that lands at almost the same instant as countdown expiry
             // can be passed over by the `remaining.is_zero()` check below —

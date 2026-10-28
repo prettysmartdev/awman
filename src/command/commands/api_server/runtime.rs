@@ -8,11 +8,15 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
+use super::cancel::{CommandCanceller, TokenRegistry};
 use super::event_bus::EventBus;
+use super::owned_runtime::stop_command_containers;
 use super::queue_worker::{ApiCommandFrontendFactory, QueueWorker, QueueWorkerDeps};
 use super::ApiServeConfig;
 use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
+use crate::data::api_lifecycle_store::CommandLifecycleStore;
+use crate::data::command_status::CommandStatus;
 use crate::data::fs::api_db::SqliteSessionStore;
 use crate::data::fs::api_paths::ApiPaths;
 use crate::data::session::{Session, SessionOpenOptions, SessionType, StaticGitRootResolver};
@@ -85,6 +89,14 @@ pub struct ApiServerRuntime {
     pub bind_ip: std::net::IpAddr,
     pub port: u16,
     pub tls_material: Option<crate::engine::auth::TlsMaterial>,
+    /// Cancel markers and `/v1/runs` linkage (WI 0135).
+    pub lifecycle_store: CommandLifecycleStore,
+    /// Tokens of running commands, keyed by command id; registered by the
+    /// worker that claimed each one.
+    pub command_cancels: Arc<TokenRegistry>,
+    /// Tokens of in-progress session setups, keyed by session id; registered
+    /// by the route that spawns the setup.
+    pub setup_cancels: Arc<TokenRegistry>,
 }
 
 impl ApiServerRuntime {
@@ -110,13 +122,22 @@ impl ApiServerRuntime {
 
         let db_path = paths.db_path();
         tracing::info!(db = %db_path.display(), "Opening session store");
-        let store = SqliteSessionStore::open_at(&db_path).map_err(CommandError::Data)?;
+        let store = Arc::new(SqliteSessionStore::open_at(&db_path).map_err(CommandError::Data)?);
+        // The WI 0135 lifecycle tables (cancel markers, `/v1/runs` linkage)
+        // must exist before any recovery below reads them.
+        let lifecycle_store =
+            CommandLifecycleStore::open(Arc::clone(&store)).map_err(CommandError::Data)?;
 
         // Startup cleanup: remove closed sessions older than 24 hours.
         if let Ok(deleted) = store.delete_closed_sessions_older_than(24) {
             for (sid, cmd_count) in &deleted {
                 tracing::info!(session_id = %sid, commands = cmd_count, "Purging stale closed session");
             }
+        }
+        match lifecycle_store.prune_orphans() {
+            Ok(0) => {}
+            Ok(pruned) => tracing::info!(pruned, "Pruned lifecycle rows of purged sessions"),
+            Err(error) => tracing::warn!(%error, "Failed to prune lifecycle rows"),
         }
 
         let auth_mode = engines
@@ -131,8 +152,11 @@ impl ApiServerRuntime {
         // server restarts.
         tracing::info!("Restoring active sessions from previous server lifetime");
         let sessions = Arc::new(SessionManager::in_memory(config.env.clone()));
-        if let Ok(records) = store.list_sessions_by_status(Some("active")) {
-            for rec in records {
+        if let Ok(records) = store.list_sessions_by_status(None) {
+            for rec in records
+                .into_iter()
+                .filter(|rec| rec.status == "active" || rec.status == "closing")
+            {
                 let workdir_path = std::path::PathBuf::from(&rec.workdir);
                 if rec.session_type == "remote" && !workdir_path.exists() {
                     tracing::warn!(session_id = %rec.id, workdir = %rec.workdir, "Remote session clone no longer exists; closing session");
@@ -194,22 +218,86 @@ impl ApiServerRuntime {
                     message: "Server restarted during session setup".to_string(),
                 });
                 let _ = paths.save_setup_state(&rec.id, &setup_state);
+                // A `/v1/runs` command queued behind this setup can never run.
+                if let Ok(Some(run)) = lifecycle_store.run_for_session(&rec.id) {
+                    let now = chrono::Utc::now().to_rfc3339();
+                    let result = run_setup_error_result(
+                        serde_json::to_value(setup_state.error.as_ref())
+                            .ok()
+                            .as_ref(),
+                    );
+                    let _ = lifecycle_store.fail_if_queued(&run.command_id, &now, &result);
+                    if run.close_on_finish {
+                        let _ = store.close_session_force(&rec.id, &now);
+                        forget_restored_session(&sessions, &rec.id);
+                    }
+                }
             }
         }
 
-        let store = Arc::new(store);
+        // A command that was asked to cancel before the restart is finalised
+        // as `cancelled` here, so the stale recovery below (which requeues
+        // every `running` row) never brings it back.
+        match lifecycle_store.finalize_interrupted_cancellations(&chrono::Utc::now().to_rfc3339()) {
+            Ok(cancelled) => {
+                if !cancelled.is_empty() {
+                    tracing::info!(
+                        count = cancelled.len(),
+                        "Finalised commands cancelled before the restart"
+                    );
+                }
+                ()
+            }
+            Err(error) => {
+                tracing::warn!(%error, "Failed to finalise interrupted cancellations");
+                return Err(CommandError::Data(error));
+            }
+        };
+
         // Stale command recovery: at startup, every command still in `running`
         // is unequivocally stale — the worker that owned it died with the
         // previous server process. Use a zero-second threshold so we recover all
         // of them immediately rather than leaving recently-started ones stuck.
-        match store.recover_stale_commands(0) {
-            Ok(recovered) if !recovered.is_empty() => tracing::info!(
-                count = recovered.len(),
-                "Recovered stale running commands back to queued"
-            ),
-            Err(error) => tracing::warn!(%error, "Failed to recover stale commands"),
-            _ => {}
+        let recovered = match store.recover_stale_commands(0) {
+            Ok(recovered) => {
+                if !recovered.is_empty() {
+                    tracing::info!(
+                        count = recovered.len(),
+                        "Recovered stale running commands back to queued"
+                    );
+                }
+                recovered
+            }
+            Err(error) => {
+                tracing::warn!(%error, "Failed to recover stale commands");
+                Vec::new()
+            }
+        };
+
+        // Containers survive the daemon. Complete each interrupted
+        // cancellation by stopping what its command launched (and stop a
+        // requeued command's old containers before it runs again); every
+        // container is named after its command, so no other agent is hit.
+        let cancelled = lifecycle_store
+            .cancelled_command_ids()
+            .map_err(CommandError::Data)?;
+        for command_id in cancelled.iter().chain(&recovered) {
+            match stop_command_containers(engines.runtime.as_ref(), command_id) {
+                Ok(0) => {}
+                Ok(count) => {
+                    tracing::info!(
+                        command_id,
+                        count,
+                        "Stopped containers left by the previous daemon"
+                    )
+                }
+                Err(error) => {
+                    return Err(CommandError::from(error));
+                }
+            }
         }
+
+        reconcile_runs(&store, &lifecycle_store, &paths, &engines, &sessions);
 
         Ok(Self {
             store,
@@ -226,7 +314,20 @@ impl ApiServerRuntime {
             bind_ip: config.bind_ip,
             port: config.port,
             tls_material: config.tls_material,
+            lifecycle_store,
+            command_cancels: Arc::new(TokenRegistry::new()),
+            setup_cancels: Arc::new(TokenRegistry::new()),
         })
+    }
+
+    /// The cancel decision owner, sharing this daemon's stores and registries.
+    pub fn canceller(&self) -> CommandCanceller {
+        CommandCanceller::new(
+            Arc::clone(&self.store),
+            self.lifecycle_store.clone(),
+            Arc::clone(&self.command_cancels),
+            Arc::clone(&self.setup_cancels),
+        )
     }
 
     pub fn engines(&self) -> &Engines {
@@ -260,6 +361,7 @@ impl ApiServerRuntime {
             tracing::warn!("workers config is 0 — no queue workers will run; commands will be enqueued but never processed");
         }
         let frontend_factory = Arc::new(frontend_factory);
+        let mut workers = Vec::new();
         for worker_index in 0..self.worker_count {
             let worker = QueueWorker::new(
                 format!("worker-{worker_index}-{}", uuid::Uuid::new_v4()),
@@ -271,12 +373,25 @@ impl ApiServerRuntime {
                     paths: self.paths.clone(),
                     frontend_factory: Arc::clone(&frontend_factory),
                     lifecycle: self.lifecycle(),
+                    lifecycle_store: self.lifecycle_store.clone(),
+                    cancels: Arc::clone(&self.command_cancels),
                 },
             );
-            tokio::spawn(worker.run());
+            workers.push(worker);
             tracing::debug!(worker_index, "Spawned queue worker");
         }
         tracing::info!(count = self.worker_count, "Queue workers started");
+        tokio::spawn(async move {
+            if let Some(worker) = workers.first() {
+                if let Err(error) = worker.recover_cancelled_cleanup().await {
+                    tracing::error!(%error, "Cancelled cleanup recovery failed; queue workers were not started");
+                    return;
+                }
+            }
+            for worker in workers {
+                tokio::spawn(worker.run());
+            }
+        });
     }
 }
 
@@ -304,6 +419,35 @@ impl ApiSessionLifecycle {
         }
     }
 
+    /// Reconcile a one-shot run after setup relinquishes ownership, including
+    /// cancellation racing setup's final ready publication.
+    pub async fn finish_run_setup(
+        &self,
+        lifecycle: &CommandLifecycleStore,
+        run: &crate::data::api_lifecycle_store::RunRecord,
+    ) -> Result<(), CommandError> {
+        let readiness = self.setup_readiness(&run.session_id).await;
+        if !readiness.is_ready() {
+            lifecycle.fail_if_queued(
+                &run.command_id,
+                &chrono::Utc::now().to_rfc3339(),
+                &run_setup_error_result(readiness.error()),
+            )?;
+        }
+        let command = self.store.get_command(&run.command_id)?;
+        let terminal = command.as_ref().is_some_and(|c| {
+            CommandStatus::parse(&c.status).is_some_and(CommandStatus::is_terminal)
+        });
+        // A setup cancel also closes the session with the default close flag.
+        let cancelled_during_setup = command.as_ref().is_some_and(|c| {
+            c.status == CommandStatus::Cancelled.as_str() && c.started_at.is_none()
+        });
+        if cancelled_during_setup || (run.close_on_finish && terminal) {
+            self.close(&run.session_id).await?;
+        }
+        Ok(())
+    }
+
     pub async fn close(&self, session_id: &str) -> Result<CloseOutcome, CommandError> {
         let session = match self.store.get_session(session_id)? {
             None => return Ok(CloseOutcome::NotFound),
@@ -313,6 +457,7 @@ impl ApiSessionLifecycle {
                     .store
                     .running_command_for_session(session_id)?
                     .is_some()
+                    || self.pending_cleanup_command(session_id)?.is_some()
                 {
                     return Ok(CloseOutcome::AlreadyClosing);
                 }
@@ -335,9 +480,38 @@ impl ApiSessionLifecycle {
                 cancelled,
             });
         }
+        // Recovery owns the clone until cancelled teardown has finished,
+        // even though its command remains terminal and is never requeued.
+        if let Some(command_id) = self.pending_cleanup_command(session_id)? {
+            return Ok(CloseOutcome::Draining {
+                running_command_id: command_id,
+                cancelled,
+            });
+        }
 
         self.finish_close(session_id, &session).await?;
         Ok(CloseOutcome::Closed)
+    }
+
+    fn pending_cleanup_command(&self, session_id: &str) -> Result<Option<String>, CommandError> {
+        let rows =
+            self.store
+                .list_commands_filtered(&crate::data::fs::api_db::CommandListFilter {
+                    session_id: Some(session_id),
+                    status: Some("cancelled"),
+                    labels: &[],
+                    limit: i64::MAX,
+                })?;
+        for command in rows {
+            if self
+                .paths
+                .read_command_cleanup(session_id, &command.id)?
+                .is_some()
+            {
+                return Ok(Some(command.id));
+            }
+        }
+        Ok(None)
     }
 
     async fn finish_close(
@@ -380,6 +554,111 @@ impl ApiSessionLifecycle {
                 status: session.setup_status,
             },
             Ok(None) | Err(_) => SetupReadiness::NotFound,
+        }
+    }
+}
+
+/// The `result` JSON of a `/v1/runs` command whose session setup failed:
+/// `error` is the literal `"setup_error"`; the setup's own `{stage, message}`
+/// (or `null`) rides in `setup_error`. Written with exit code 1.
+pub fn run_setup_error_result(setup_error: Option<&serde_json::Value>) -> String {
+    serde_json::json!({
+        "exit_code": 1,
+        "error": "setup_error",
+        "error_status": 409,
+        "stage": "setup",
+        "setup_error": setup_error.cloned().unwrap_or(serde_json::Value::Null),
+    })
+    .to_string()
+}
+
+/// Bootstrap: finish every `/v1/runs` lifecycle hook a crash interrupted,
+/// whatever state its setup reached. A run whose setup failed cannot start,
+/// so a still-queued command becomes `error` (a cancelled one stays
+/// cancelled); a run asking to `close_on_finish` whose command is terminal is
+/// closed the way `ApiSessionLifecycle::close` finishes a close (remote clone
+/// deleted). Repeatable: every step is conditional on the current rows.
+fn reconcile_runs(
+    store: &SqliteSessionStore,
+    lifecycle_store: &CommandLifecycleStore,
+    paths: &ApiPaths,
+    engines: &Engines,
+    sessions: &SessionManager,
+) {
+    let runs = match lifecycle_store.list_runs() {
+        Ok(runs) => runs,
+        Err(error) => {
+            tracing::warn!(%error, "Failed to list runs for restart reconciliation");
+            return;
+        }
+    };
+    for run in runs {
+        let Ok(Some(session)) = store.get_session(&run.session_id) else {
+            continue;
+        };
+        if session.status == "closed" {
+            continue;
+        }
+        let now = chrono::Utc::now().to_rfc3339();
+        if session.setup_status == "failed" {
+            let error = paths
+                .read_setup_state(&run.session_id)
+                .and_then(|state| state.error)
+                .and_then(|error| serde_json::to_value(error).ok());
+            let result = run_setup_error_result(error.as_ref());
+            if let Err(error) = lifecycle_store.fail_if_queued(&run.command_id, &now, &result) {
+                tracing::warn!(command_id = %run.command_id, %error, "Failed to fail a run whose setup failed");
+            }
+        }
+        let terminal = store
+            .get_command(&run.command_id)
+            .ok()
+            .flatten()
+            .and_then(|c| CommandStatus::parse(&c.status))
+            .is_some_and(CommandStatus::is_terminal);
+        // The worker finishes durable cancelled cleanup before closing a
+        // one-shot session and deleting the workspace it still needs.
+        if matches!(store.get_command(&run.command_id), Ok(Some(c)) if c.status == "cancelled")
+            && !matches!(
+                paths.read_command_cleanup(&run.session_id, &run.command_id),
+                Ok(None)
+            )
+        {
+            continue;
+        }
+        if !(run.close_on_finish && terminal) {
+            continue;
+        }
+        if session.session_type == "remote" {
+            if let Some(cloned) = session.cloned_path.as_deref() {
+                if let Err(error) = engines
+                    .git_engine
+                    .delete_directory(&std::path::PathBuf::from(cloned))
+                {
+                    tracing::warn!(session_id = %run.session_id, %error, "Failed to clean finished run clone; retaining session for recovery");
+                    continue;
+                }
+            }
+        }
+        match store.close_session_force(&run.session_id, &now) {
+            Ok(_) => {
+                forget_restored_session(sessions, &run.session_id);
+                tracing::info!(session_id = %run.session_id, "Closed finished run session after restart");
+            }
+            Err(error) => {
+                tracing::warn!(session_id = %run.session_id, %error, "Failed to close finished run session")
+            }
+        }
+    }
+}
+
+/// Drop a session restored earlier in bootstrap that bootstrap then closed.
+/// Nothing else holds its lock yet, so `try_read` cannot contend.
+fn forget_restored_session(sessions: &SessionManager, key: &str) {
+    if let Some(session) = sessions.get_by_key(key) {
+        let id = session.try_read().map(|s| s.id()).ok();
+        if let Some(id) = id {
+            let _ = sessions.remove_by_key(key, id);
         }
     }
 }
@@ -470,6 +749,70 @@ mod tests {
         assert_eq!(
             lifecycle.close("missing").await.unwrap(),
             CloseOutcome::NotFound
+        );
+    }
+
+    #[tokio::test]
+    async fn close_waits_for_cancelled_cleanup_before_retiring_the_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (lifecycle, store) = lifecycle(tmp.path());
+        insert_active(&store, "cleanup");
+        store
+            .enqueue_command("command", "cleanup", "exec workflow", "[]", "log")
+            .unwrap();
+        store
+            .complete_command("command", "cancelled", Some(130), None)
+            .unwrap();
+        lifecycle
+            .paths
+            .prepare_command_dir("cleanup", "command")
+            .unwrap();
+        let cleanup = crate::data::workflow_cleanup::WorkflowCleanup {
+            workflow: crate::data::workflow_definition::Workflow {
+                title: None,
+                steps: vec![],
+                agent: None,
+                model: None,
+                overlays: None,
+                setup: vec![],
+                teardown: vec![],
+                teardown_on_failure: false,
+            },
+            work_item: None,
+            workdir: tmp.path().to_path_buf(),
+            mount_path: tmp.path().to_path_buf(),
+            state_root: None,
+            image: "test".into(),
+            cli_overlays: vec![],
+            worktree_git_mount: None,
+        };
+        lifecycle
+            .paths
+            .write_command_cleanup("cleanup", "command", &cleanup)
+            .unwrap();
+        assert!(matches!(
+            lifecycle.close("cleanup").await.unwrap(),
+            CloseOutcome::Draining { .. }
+        ));
+        assert_eq!(
+            store.get_session("cleanup").unwrap().unwrap().status,
+            "closing"
+        );
+        assert_eq!(
+            lifecycle.close("cleanup").await.unwrap(),
+            CloseOutcome::AlreadyClosing
+        );
+        lifecycle
+            .paths
+            .remove_command_cleanup("cleanup", "command")
+            .unwrap();
+        assert_eq!(
+            lifecycle.close("cleanup").await.unwrap(),
+            CloseOutcome::Closed
+        );
+        assert_eq!(
+            store.get_session("cleanup").unwrap().unwrap().status,
+            "closed"
         );
     }
 }

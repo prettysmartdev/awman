@@ -78,6 +78,9 @@ pub struct ExecPromptCommand {
     flags: ExecPromptCommandFlags,
     engines: Engines,
     session: Session,
+    /// Fired by an external cancel (the API's `POST /v1/commands/{id}/cancel`).
+    /// Never fired for the CLI or the TUI, which never install one.
+    cancel: tokio_util::sync::CancellationToken,
 }
 
 impl ExecPromptCommand {
@@ -86,6 +89,7 @@ impl ExecPromptCommand {
             flags,
             engines,
             session,
+            cancel: tokio_util::sync::CancellationToken::new(),
         }
     }
 
@@ -123,7 +127,15 @@ impl ExecPromptCommand {
             },
             ctx.engines.clone(),
             ctx.session.clone(),
-        ))
+        )
+        .with_cancellation(ctx.cancel.clone()))
+    }
+
+    /// Observe `token`: once it fires the agent container is stopped and the
+    /// command ends with exit code 130.
+    pub fn with_cancellation(mut self, token: tokio_util::sync::CancellationToken) -> Self {
+        self.cancel = token;
+        self
     }
 
     pub fn flags(&self) -> &ExecPromptCommandFlags {
@@ -387,6 +399,7 @@ impl Command for ExecPromptCommand {
             level: MessageLevel::Info,
             text: format!("Launching agent ({})…", self.engines.runtime.display_name()),
         });
+        let mut cancelled = false;
         let exit = if launch_decision == LaunchModeDecision::Acp {
             let (runtime_frontend, transport) = crate::engine::acp::AcpTransport::channel();
             let execution = match instance.run_with_frontend(Box::new(runtime_frontend)) {
@@ -399,6 +412,7 @@ impl Command for ExecPromptCommand {
                     return Err(CommandError::from(e));
                 }
             };
+            let acp_handle = execution.handle().clone();
             let mut acp = crate::engine::acp::AcpSession::from_transport(
                 execution,
                 transport,
@@ -413,18 +427,48 @@ impl Command for ExecPromptCommand {
                     crate::engine::acp::PermissionPolicy::Ask
                 },
             );
-            if let Err(e) = acp.initialize("/workspace").await {
-                // Reap the launched container before returning on a failed
-                // handshake so it is not left running.
-                let _ = acp.shutdown().await;
-                return Err(CommandError::from(e));
+            // The handshake and every turn race an external cancel, as the
+            // stdio wait does.
+            let driven = tokio::select! {
+                biased;
+                _ = self.cancel.cancelled() => None,
+                driven = async {
+                    acp.initialize("/workspace").await?;
+                    // The seeded prompt is the first ACP turn, driven inside
+                    // the same loop as follow-ups so its `session/update`s are
+                    // rendered (the subscription is taken before the prompt is
+                    // sent) and any permission request during that turn is
+                    // serviced.
+                    Ok::<_, crate::engine::error::EngineError>(acp
+                        .drive_with_initial_prompt(frontend.as_mut(), Some(final_prompt))
+                        .await)
+                } => Some(driven),
+            };
+            match driven {
+                Some(Ok(exit)) => exit,
+                Some(Err(e)) => {
+                    // Reap the launched container before returning on a failed
+                    // handshake so it is not left running.
+                    let _ = acp.shutdown().await;
+                    return Err(CommandError::from(e));
+                }
+                None => {
+                    cancelled = true;
+                    frontend.write_message(UserMessage {
+                        level: MessageLevel::Warning,
+                        text: "exec prompt: cancelled; stopping the agent".to_string(),
+                    });
+                    // Stopped through the runtime like `agents kill`, then
+                    // reaped: the ACP client process alone is not the container.
+                    if let Err(e) = crate::command::commands::agents::kill::stop_and_remove_agent(
+                        self.engines.runtime.as_ref(),
+                        &acp_handle,
+                    ) {
+                        tracing::warn!(error = %e, "cancel: stopping the exec prompt agent failed");
+                    }
+                    acp.shutdown().await
+                }
             }
-            // The seeded prompt is the first ACP turn, driven inside the same
-            // loop as follow-ups so its `session/update`s are rendered (the
-            // subscription is taken before the prompt is sent) and any
-            // permission request during that turn is serviced.
-            acp.drive_with_initial_prompt(frontend.as_mut(), Some(final_prompt))
-                .await
         } else {
             frontend.set_pty_active(true);
             let container_frontend = frontend.container_frontend_for_pty();
@@ -441,7 +485,41 @@ impl Command for ExecPromptCommand {
                 }
             };
             frontend.set_stuck_sender(execution.stuck_sender());
-            let exit = execution.wait().await;
+            // Raced against an external cancel, the way a workflow step's
+            // wait is: the execution moves into a wait task, and a cancel
+            // kills it and stops it through the runtime like `agents kill`.
+            let handle = execution.handle().clone();
+            let cancel_handle = execution.cancel_handle();
+            let (wait_tx, mut wait_rx) = tokio::sync::oneshot::channel();
+            tokio::spawn(async move {
+                let _ = wait_tx.send(execution.wait().await);
+            });
+            let dropped = || {
+                Err(crate::engine::error::EngineError::Other(
+                    "exec prompt wait task dropped unexpectedly".into(),
+                ))
+            };
+            let exit = tokio::select! {
+                biased;
+                result = &mut wait_rx => result.unwrap_or_else(|_| dropped()),
+                _ = self.cancel.cancelled() => {
+                    cancelled = true;
+                    frontend.write_message(UserMessage {
+                        level: MessageLevel::Warning,
+                        text: "exec prompt: cancelled; stopping the agent".to_string(),
+                    });
+                    if let Some(ch) = &cancel_handle {
+                        let _ = ch.cancel();
+                    }
+                    if let Err(e) = crate::command::commands::agents::kill::stop_and_remove_agent(
+                        self.engines.runtime.as_ref(),
+                        &handle,
+                    ) {
+                        tracing::warn!(error = %e, "cancel: stopping the exec prompt agent failed");
+                    }
+                    (&mut wait_rx).await.unwrap_or_else(|_| dropped())
+                }
+            };
             frontend.set_pty_active(false);
             frontend.replay_queued();
             exit
@@ -453,7 +531,11 @@ impl Command for ExecPromptCommand {
             &exit,
         );
 
-        let exit_code = exit.map(|e| e.exit_code).ok();
+        let exit_code = if cancelled {
+            Some(crate::data::command_status::CANCELLED_EXIT_CODE)
+        } else {
+            exit.map(|e| e.exit_code).ok()
+        };
         Ok(ExecPromptOutcome {
             agent: Some(agent.as_str().to_string()),
             exit_code,

@@ -17,6 +17,7 @@ use crate::command::commands::Command;
 use crate::command::dispatch::BuildContext;
 use crate::command::error::CommandError;
 use crate::data::message::{MessageLevel, UserMessage};
+use crate::data::session::AgentHandle;
 use crate::engine::agent_runtime::AgentRuntimeEngine;
 use crate::engine::error::EngineError;
 
@@ -75,34 +76,58 @@ impl AgentsKillCommand {
         &self.flags
     }
 
-    /// Best-effort removal after a successful stop. Some backends may already
-    /// remove resources on stop; unsupported removal is also accepted.
+    /// Best-effort removal after a successful stop; see [`remove_stopped_agent`].
     fn remove(&self, frontend: &mut dyn AgentsCommandFrontend, snapshot: &AgentSnapshot) -> bool {
-        match self.runtime.remove_agent(&snapshot.id) {
-            Ok(()) | Err(EngineError::UnsupportedOnRuntime { .. }) => true,
+        match remove_stopped_agent(self.runtime.as_ref(), &snapshot.id) {
+            Ok(()) => true,
             Err(e) => {
-                let still_present = self
-                    .runtime
-                    .list_running_all()
-                    .and_then(|mut running| {
-                        running.extend(self.runtime.list_stopped()?);
-                        Ok(running)
-                    })
-                    .map(|agents| agents.iter().any(|h| h.id == snapshot.id))
-                    .unwrap_or(true);
-                if still_present {
-                    frontend.write_message(UserMessage {
-                        level: MessageLevel::Warning,
-                        text: format!(
-                            "agent {} stopped but could not be removed: {e}; `awman clean` can remove it",
-                            snapshot.name
-                        ),
-                    });
-                }
-                !still_present
+                frontend.write_message(UserMessage {
+                    level: MessageLevel::Warning,
+                    text: format!(
+                        "agent {} stopped but could not be removed: {e}; `awman clean` can remove it",
+                        snapshot.name
+                    ),
+                });
+                false
             }
         }
     }
+}
+
+/// Best-effort removal of an agent that was just stopped. Some backends
+/// already remove resources on stop, and unsupported removal is accepted, so
+/// this is `Ok` unless the removal failed *and* the agent is still listed;
+/// then the removal error comes back.
+fn remove_stopped_agent(runtime: &dyn AgentRuntimeEngine, id: &str) -> Result<(), EngineError> {
+    match runtime.remove_agent(id) {
+        Ok(()) | Err(EngineError::UnsupportedOnRuntime { .. }) => Ok(()),
+        Err(e) => {
+            let still_present = runtime
+                .list_running_all()
+                .and_then(|mut running| {
+                    running.extend(runtime.list_stopped()?);
+                    Ok(running)
+                })
+                .map(|agents| agents.iter().any(|h| h.id == id))
+                .unwrap_or(true);
+            if still_present {
+                Err(e)
+            } else {
+                Ok(())
+            }
+        }
+    }
+}
+
+/// `stop` then best-effort `remove_agent`; `Ok(removed)`. `UnsupportedOnRuntime`
+/// on removal counts as removed, exactly as `awman agents kill` does. Used by
+/// an API cancel, which stops a workflow's containers the same way.
+pub fn stop_and_remove_agent(
+    runtime: &dyn AgentRuntimeEngine,
+    handle: &AgentHandle,
+) -> Result<bool, EngineError> {
+    runtime.stop(handle)?;
+    Ok(remove_stopped_agent(runtime, &handle.id).is_ok())
 }
 
 #[async_trait]

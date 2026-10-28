@@ -4,7 +4,7 @@
 
 use std::path::PathBuf;
 
-use crate::data::session::{AgentName, Session, SessionId};
+use crate::data::session::{AgentHandle, AgentName, Session, SessionId};
 use crate::data::workflow_definition::WorkflowStep;
 use crate::engine::agent_runtime::execution::AgentExecution;
 use crate::engine::context_prompt::WorkflowStepInfo;
@@ -65,5 +65,14 @@ pub trait AgentExecutionFactory: Send + Sync {
         _output_tail: &str,
     ) -> Result<bool, EngineError> {
         Ok(false)
+    }
+
+    /// Stop and remove the agent behind `handle` through the runtime — the same
+    /// `AgentRuntimeEngine::stop` then `remove_agent` path `awman agents kill`
+    /// uses. A step's `CancelHandle` alone may only end the local client
+    /// process, so an external cancel calls this as well. Default: no-op, so
+    /// test factories and the squad path are unchanged.
+    fn stop_agent(&self, _handle: &AgentHandle) -> Result<(), EngineError> {
+        Ok(())
     }
 }

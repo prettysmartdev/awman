@@ -448,6 +448,7 @@ impl ContainerBackend for AppleBackend {
     ) -> Result<String, EngineError> {
         background::default_start_background(
             ContainerCli::APPLE,
+            request.name,
             request.image,
             request.workdir,
             request.env,

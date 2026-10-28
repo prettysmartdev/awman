@@ -62,6 +62,14 @@ impl CommandStateWriter {
         self.paths
             .write_command_workflow_state(&self.session_id, &self.command_id, state)
     }
+
+    pub fn write_cleanup(
+        &self,
+        cleanup: &crate::data::workflow_cleanup::WorkflowCleanup,
+    ) -> Result<(), DataError> {
+        self.paths
+            .write_command_cleanup(&self.session_id, &self.command_id, cleanup)
+    }
 }
 
 /// Owns the two open log files for one command run and appends to them as

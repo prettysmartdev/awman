@@ -463,4 +463,12 @@ impl AgentExecutionFactory for CommandLayerFactory {
         // the workflow engine owns the exactly-once guard.
         Ok(true)
     }
+
+    fn stop_agent(&self, handle: &crate::data::session::AgentHandle) -> Result<(), EngineError> {
+        crate::command::commands::agents::kill::stop_and_remove_agent(
+            self.engines.runtime.as_ref(),
+            handle,
+        )
+        .map(|_removed| ())
+    }
 }

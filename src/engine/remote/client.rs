@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
+use crate::data::fs::api_labels::Labels;
 use crate::data::session::Session;
 use crate::data::session_setup_event::SessionSetupState;
 use crate::engine::auth::ApiKey;
@@ -30,21 +31,24 @@ pub type RemoteResponse = HttpResponse;
 
 /// The terminal-aware status vocabulary used by remote workflow polling.
 /// Parsing the wire strings here keeps status semantics out of frontends.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum JobStatus {
+    #[serde(alias = "pending")]
     Queued,
     Running,
     Done,
     Error,
+    Cancelled,
 }
 
 impl JobStatus {
     pub fn is_terminal(self) -> bool {
-        matches!(self, Self::Done | Self::Error)
+        matches!(self, Self::Done | Self::Error | Self::Cancelled)
     }
 }
 /// Request body for `POST /v1/sessions`.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct StartSessionRequest {
     pub session_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -53,6 +57,60 @@ pub struct StartSessionRequest {
     pub repo_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub merge_refs: Vec<String>,
+    #[serde(default)]
+    pub push: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub labels: Option<Labels>,
+}
+
+/// Command accepted by `POST /v1/commands` or nested in `POST /v1/runs`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct StartCommandRequest {
+    pub subcommand: String,
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub labels: Labels,
+}
+
+/// One submission; setup readiness and optional session cleanup are server-owned.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct StartRunRequest {
+    pub session: StartSessionRequest,
+    pub command: StartCommandRequest,
+    #[serde(default)]
+    pub close_on_finish: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct StartRunResponse {
+    pub session_id: String,
+    pub command_id: String,
+}
+
+/// Both terminal (200) and stopping (202) cancel responses identify the command.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CancelCommandResponse {
+    #[serde(alias = "id")]
+    pub command_id: String,
+    pub session_id: String,
+    pub status: JobStatus,
+    #[serde(default)]
+    pub cancel_requested_at: Option<String>,
+    #[serde(default)]
+    pub labels: Labels,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CommandListQuery {
+    pub session_id: Option<String>,
+    pub status: Option<JobStatus>,
+    /// Repeatable ANDed selectors (`key=value` or `key`).
+    pub labels: Vec<String>,
+    pub limit: Option<i64>,
 }
 
 /// `StartSession` response body.
@@ -163,15 +221,20 @@ impl RemoteClient {
         &self,
         req: &StartSessionRequest,
     ) -> Result<StartSessionResponse, EngineError> {
+        self.start_session_with_idempotency(req, None).await
+    }
+
+    pub async fn start_session_with_idempotency(
+        &self,
+        req: &StartSessionRequest,
+        idempotency_key: Option<&str>,
+    ) -> Result<StartSessionResponse, EngineError> {
         let url = self.core.url(&["sessions"]);
-        let resp = self
-            .core
-            .http()
-            .post(&url)
-            .json(req)
-            .send()
-            .await
-            .map_err(Self::map_reqwest_error)?;
+        let mut request = self.core.http().post(&url).json(req);
+        if let Some(key) = idempotency_key {
+            request = request.header("Idempotency-Key", key);
+        }
+        let resp = request.send().await.map_err(Self::map_reqwest_error)?;
         let status = resp.status().as_u16();
         let body = resp
             .json::<serde_json::Value>()
@@ -210,31 +273,140 @@ impl RemoteClient {
         exec: ExecArg,
         extra_args: &[String],
     ) -> Result<ExecJobResponse, EngineError> {
+        self.exec_job_with_idempotency(session_id, exec, extra_args, None)
+            .await
+    }
+
+    pub async fn exec_job_with_idempotency(
+        &self,
+        session_id: &str,
+        exec: ExecArg,
+        extra_args: &[String],
+        idempotency_key: Option<&str>,
+    ) -> Result<ExecJobResponse, EngineError> {
         let (subcommand, mut args) = match exec {
             ExecArg::Workflow(path) => ("exec workflow", vec![path]),
             ExecArg::Prompt(text) => ("exec prompt", vec![text]),
         };
         args.extend(extra_args.iter().cloned());
 
+        self.submit_command(
+            session_id,
+            &StartCommandRequest {
+                subcommand: subcommand.into(),
+                args,
+                labels: Labels::empty(),
+            },
+            idempotency_key,
+        )
+        .await
+    }
+
+    /// Submit a command with optional labels and idempotency, to a ready session.
+    pub async fn submit_command(
+        &self,
+        session_id: &str,
+        request: &StartCommandRequest,
+        idempotency_key: Option<&str>,
+    ) -> Result<ExecJobResponse, EngineError> {
+        let mut headers = vec![("x-awman-session", session_id)];
+        if let Some(key) = idempotency_key {
+            headers.push(("Idempotency-Key", key));
+        }
+
         let resp = self
             .send_command_with_headers(
                 &["commands"],
                 &[
-                    ("subcommand", serde_json::json!(subcommand)),
-                    (
-                        "args",
-                        serde_json::json!(args
-                            .iter()
-                            .map(|s| serde_json::json!(s))
-                            .collect::<Vec<_>>()),
-                    ),
+                    ("subcommand", serde_json::json!(request.subcommand)),
+                    ("args", serde_json::json!(request.args)),
+                    ("labels", serde_json::json!(request.labels)),
                 ],
-                &[("x-awman-session", session_id)],
+                &headers,
             )
             .await?;
 
         serde_json::from_value::<ExecJobResponse>(resp.body)
             .map_err(|e| EngineError::Other(format!("invalid exec response: {e}")))
+    }
+
+    /// `POST /v1/runs` accepts the command immediately; no readiness polling.
+    pub async fn start_run(
+        &self,
+        request: &StartRunRequest,
+        idempotency_key: Option<&str>,
+    ) -> Result<StartRunResponse, EngineError> {
+        let headers = idempotency_key
+            .map(|key| vec![("Idempotency-Key", key)])
+            .unwrap_or_default();
+        let response = self
+            .send_command_with_headers(
+                &["runs"],
+                &[
+                    ("session", serde_json::json!(request.session)),
+                    ("command", serde_json::json!(request.command)),
+                    (
+                        "close_on_finish",
+                        serde_json::json!(request.close_on_finish),
+                    ),
+                ],
+                &headers,
+            )
+            .await?;
+        serde_json::from_value(response.body)
+            .map_err(|e| EngineError::Other(format!("invalid start-run response: {e}")))
+    }
+
+    pub async fn cancel_command(&self, id: &str) -> Result<CancelCommandResponse, EngineError> {
+        let response = self
+            .send_command_with_headers(&["commands", id, "cancel"], &[], &[])
+            .await?;
+        serde_json::from_value(response.body)
+            .map_err(|e| EngineError::Other(format!("invalid cancel response: {e}")))
+    }
+
+    pub async fn list_commands(
+        &self,
+        query: &CommandListQuery,
+    ) -> Result<RemoteResponse, EngineError> {
+        let mut pairs: Vec<(&str, String)> = query
+            .labels
+            .iter()
+            .map(|label| ("label", label.clone()))
+            .collect();
+        if let Some(id) = &query.session_id {
+            pairs.push(("session_id", id.clone()));
+        }
+        if let Some(status) = query.status {
+            let value =
+                serde_json::to_value(status).map_err(|e| EngineError::Other(e.to_string()))?;
+            pairs.push(("status", value.as_str().unwrap().to_owned()));
+        }
+        if let Some(limit) = query.limit {
+            pairs.push(("limit", limit.to_string()));
+        }
+        let mut url = reqwest::Url::parse(&self.core.url(&["commands"]))
+            .map_err(|e| EngineError::RemoteTransport(e.to_string()))?;
+        url.query_pairs_mut().extend_pairs(pairs);
+        let response = self
+            .core
+            .http()
+            .get(url)
+            .send()
+            .await
+            .map_err(Self::map_reqwest_error)?;
+        let status = response.status().as_u16();
+        let body = response
+            .json::<serde_json::Value>()
+            .await
+            .map_err(Self::map_reqwest_error)?;
+        if status >= 400 {
+            return Err(EngineError::RemoteHttpStatus {
+                status,
+                body: body.to_string(),
+            });
+        }
+        Ok(RemoteResponse { status, body })
     }
 
     /// `GET /v1/commands/{id}/status` — fetch a job's metadata.
@@ -254,6 +426,7 @@ impl RemoteClient {
             "running" => Ok(JobStatus::Running),
             "done" => Ok(JobStatus::Done),
             "error" => Ok(JobStatus::Error),
+            "cancelled" => Ok(JobStatus::Cancelled),
             other => Err(EngineError::RemoteTransport(format!(
                 "unknown remote job status: {other}"
             ))),

@@ -114,6 +114,7 @@ fn docker_background_container_start_exec_kill() {
     let container = runtime
         .start_background(
             &awman::engine::container::background::BackgroundLaunchRequest {
+                name: None,
                 image: "alpine:latest",
                 workdir: tmp.path(),
                 env: &env,
@@ -173,6 +174,7 @@ fn docker_background_container_exec_nonzero_exit() {
     let container = runtime
         .start_background(
             &awman::engine::container::background::BackgroundLaunchRequest {
+                name: None,
                 image: "alpine:latest",
                 workdir: tmp.path(),
                 env: &env,
@@ -211,6 +213,7 @@ fn docker_background_container_env_var_injected() {
     let container = runtime
         .start_background(
             &awman::engine::container::background::BackgroundLaunchRequest {
+                name: None,
                 image: "alpine:latest",
                 workdir: tmp.path(),
                 env: &env,
@@ -265,6 +268,7 @@ fn docker_background_container_overlay_mount_applied() {
     let container = runtime
         .start_background(
             &awman::engine::container::background::BackgroundLaunchRequest {
+                name: None,
                 image: "alpine:latest",
                 workdir: workdir.path(),
                 env: &env,
@@ -303,6 +307,7 @@ fn docker_background_container_image_not_found() {
 
     let result = runtime.start_background(
         &awman::engine::container::background::BackgroundLaunchRequest {
+            name: None,
             image: bad_image,
             workdir: tmp.path(),
             env: &env,
