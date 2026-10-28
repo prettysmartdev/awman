@@ -7,10 +7,10 @@
 use std::path::Path;
 
 use crate::command::commands::worktree_lifecycle::{
-    dirty_merge_target_body, dirty_target_commit_message, DirtyMergeTargetDecision,
-    ExistingWorktreeDecision, MergeFailure, PostWorkflowWorktreeAction, PostWorkflowWorktreePrompt,
-    PreWorktreeDecision, WorktreeLifecycleFrontend, WorktreeMergeMode, DIRTY_COMMIT_PROMPT,
-    DIRTY_COMMIT_TITLE, DIRTY_MERGE_TARGET_KEYS, DIRTY_MERGE_TARGET_TITLE,
+    dirty_merge_target_body, dirty_target_commit_message, existing_worktree_prompt_line,
+    DirtyMergeTargetDecision, ExistingWorktreeDecision, MergeFailure, PostWorkflowWorktreeAction,
+    PostWorkflowWorktreePrompt, PreWorktreeDecision, WorktreeLifecycleFrontend, WorktreeMergeMode,
+    DIRTY_COMMIT_PROMPT, DIRTY_COMMIT_TITLE, DIRTY_MERGE_TARGET_KEYS, DIRTY_MERGE_TARGET_TITLE,
     MERGE_FIX_PROMPT_OUTPUT_LINES,
 };
 use crate::command::error::CommandError;
@@ -74,16 +74,26 @@ impl WorktreeLifecycleFrontend for CliFrontend {
         if self.non_interactive {
             return Ok(self.headless.existing_worktree());
         }
-        eprintln!(
-            "awman: worktree {} already exists for branch {branch}. [r]esume / [R]ecreate?",
-            path.display()
-        );
+        eprintln!("{}", existing_worktree_prompt_line(path, branch));
         let ch = read_line_or_default('r');
         Ok(if ch == 'R' {
             ExistingWorktreeDecision::Recreate
         } else {
             ExistingWorktreeDecision::Resume
         })
+    }
+
+    fn existing_worktree_after_resume(
+        &mut self,
+        _path: &Path,
+        _branch: &str,
+    ) -> Result<ExistingWorktreeDecision, CommandError> {
+        // A confirmed resume is not asked twice; a piped run answers from
+        // its profile like every other headless host.
+        if self.non_interactive {
+            return Ok(self.headless.existing_worktree());
+        }
+        Ok(ExistingWorktreeDecision::Resume)
     }
 
     fn report_worktree_created(&mut self, path: &Path, branch: &str) {

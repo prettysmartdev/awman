@@ -17,9 +17,22 @@ use crate::data::worktree_paths::{
 use crate::engine::error::{EngineError, MergeFailedDetail};
 
 pub mod frontend;
+mod host_command;
 pub mod remote_push;
 
 pub use frontend::{GitCommand, GitFrontend};
+
+fn path_from_git_bytes(bytes: &[u8]) -> PathBuf {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        PathBuf::from(std::ffi::OsStr::from_bytes(bytes))
+    }
+    #[cfg(not(unix))]
+    {
+        PathBuf::from(String::from_utf8_lossy(bytes).as_ref())
+    }
+}
 
 /// Run a git command, reporting it to the frontend and streaming its output.
 fn run_git_logged(
@@ -43,7 +56,7 @@ fn run_git_logged_env(
     // writes the same `$ git …` line this function used to compose itself
     // (F-45), so nothing changes for a frontend that has not opted in.
     sink.command_started(&command);
-    let output = Command::new("git")
+    let output = host_command::command(cwd)
         .args(args)
         .envs(env.iter().copied())
         .current_dir(cwd)
@@ -306,15 +319,22 @@ impl GitEngine {
     /// Resolve the git root for the given working directory via `git rev-parse
     /// --show-toplevel`.
     pub fn resolve_root(&self, working_dir: &Path) -> Result<PathBuf, EngineError> {
-        let output = Command::new("git")
+        let output = host_command::discovery_command(working_dir)
             .args(["rev-parse", "--show-toplevel"])
             .current_dir(working_dir)
             .output()
             .map_err(|e| EngineError::Git(format!("invoke `git rev-parse`: {e}")))?;
         if !output.status.success() {
-            return Err(EngineError::Data(DataError::GitRootNotFound {
-                working_dir: working_dir.to_path_buf(),
-            }));
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if stderr.starts_with("fatal: not a git repository") {
+                return Err(EngineError::Data(DataError::GitRootNotFound {
+                    working_dir: working_dir.to_path_buf(),
+                }));
+            }
+            return Err(EngineError::Git(format!(
+                "git root discovery failed: {}",
+                stderr.trim()
+            )));
         }
         let s = String::from_utf8_lossy(&output.stdout);
         Ok(PathBuf::from(s.trim()))
@@ -377,7 +397,7 @@ impl GitEngine {
             }
             Ok(())
         }
-        let output = Command::new("git")
+        let output = host_command::command(root)
             .args([
                 "-c",
                 "core.fsmonitor=false",
@@ -415,7 +435,7 @@ impl GitEngine {
 
     /// `git status --porcelain` lines (one per uncommitted file).
     pub fn uncommitted_files(&self, path: &Path) -> Result<Vec<String>, EngineError> {
-        let output = Command::new("git")
+        let output = host_command::command(path)
             .args(["status", "--porcelain"])
             .current_dir(path)
             .output()
@@ -493,16 +513,223 @@ impl GitEngine {
         Ok(summary)
     }
 
-    /// `~/.awman/worktrees/<repo-name>/<NNNN>/` for a work-item.
+    /// `~/.awman/worktrees/<dirname>-<hash8>/<NNNN>/` for a work-item, or the
+    /// legacy unhashed path when it holds a worktree of this repository
+    /// (see [`Self::pick_worktree_path`]).
     pub fn worktree_path(&self, git_root: &Path, work_item: u32) -> Result<PathBuf, EngineError> {
         let p = WorktreePaths::from_home().map_err(EngineError::Data)?;
-        Ok(p.for_work_item(git_root, work_item))
+        let root = canonical_or_given(git_root);
+        Ok(self.pick_worktree_path(
+            &root,
+            p.for_work_item(&root, work_item),
+            p.legacy_for_work_item(&root, work_item),
+        ))
     }
 
-    /// `~/.awman/worktrees/<repo-name>/wf-<name>/` for a named workflow.
+    /// `~/.awman/worktrees/<dirname>-<hash8>/wf-<name>/` for a named workflow,
+    /// or the legacy unhashed path when it holds a worktree of this repository
+    /// (see [`Self::pick_worktree_path`]).
     pub fn worktree_path_named(&self, git_root: &Path, name: &str) -> Result<PathBuf, EngineError> {
         let p = WorktreePaths::from_home().map_err(EngineError::Data)?;
-        Ok(p.for_workflow(git_root, name))
+        let root = canonical_or_given(git_root);
+        Ok(self.pick_worktree_path(
+            &root,
+            p.for_workflow(&root, name),
+            p.legacy_for_workflow(&root, name),
+        ))
+    }
+
+    /// The hashed path, unless it does not exist while the legacy path does
+    /// and `git worktree list` in `git_root` names the legacy path — then the
+    /// legacy path, so a worktree made before the hashed key is still found.
+    /// A legacy directory owned by another checkout with the same dirname is
+    /// ignored. A `list_worktrees` failure counts as "not listed".
+    fn pick_worktree_path(&self, git_root: &Path, hashed: PathBuf, legacy: PathBuf) -> PathBuf {
+        if hashed.exists() || !legacy.exists() {
+            return hashed;
+        }
+        let legacy_canonical = canonical_or_given(&legacy);
+        let listed = self
+            .list_worktrees(git_root)
+            .map(|wts| {
+                wts.iter()
+                    .any(|wt| canonical_or_given(wt) == legacy_canonical)
+            })
+            .unwrap_or(false);
+        if listed && self.validate_worktree_owner(git_root, &legacy).is_ok() {
+            legacy
+        } else {
+            hashed
+        }
+    }
+
+    /// Paths of every worktree of `git_root` (including the main checkout),
+    /// parsed from the `worktree <path>` lines of
+    /// `git worktree list --porcelain`.
+    pub fn list_worktrees(&self, git_root: &Path) -> Result<Vec<PathBuf>, EngineError> {
+        let output = host_command::command(git_root)
+            .args(["worktree", "list", "--porcelain", "-z"])
+            .current_dir(git_root)
+            .output()
+            .map_err(|e| EngineError::Git(format!("invoke `git worktree list`: {e}")))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(EngineError::Git(format!(
+                "git worktree list failed: {}",
+                stderr.trim()
+            )));
+        }
+        let mut paths = Vec::new();
+        let mut path = None;
+        let mut prunable = false;
+        for field in output.stdout.split(|byte| *byte == 0) {
+            if field.is_empty() {
+                if !prunable {
+                    paths.extend(path.take());
+                }
+                path = None;
+                prunable = false;
+            } else if let Some(bytes) = field.strip_prefix(b"worktree ") {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::ffi::OsStrExt;
+                    path = Some(PathBuf::from(std::ffi::OsStr::from_bytes(bytes)));
+                }
+                #[cfg(not(unix))]
+                {
+                    path = Some(PathBuf::from(String::from_utf8_lossy(bytes).as_ref()));
+                }
+            } else if field.starts_with(b"prunable") {
+                prunable = true;
+            }
+        }
+        Ok(paths)
+    }
+
+    /// Validate both sides of a linked-worktree registration. A stale list
+    /// entry alone cannot prove ownership of a replaced directory.
+    pub fn validate_worktree_owner(
+        &self,
+        git_root: &Path,
+        worktree: &Path,
+    ) -> Result<PathBuf, EngineError> {
+        let invalid = || {
+            EngineError::Git(format!(
+                "worktree does not belong to this repository: {}",
+                worktree.display()
+            ))
+        };
+        let common_output = host_command::command(git_root)
+            .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+            .current_dir(git_root)
+            .output()
+            .map_err(|_| invalid())?;
+        if !common_output.status.success() {
+            return Err(invalid());
+        }
+        let common =
+            PathBuf::from(String::from_utf8_lossy(&common_output.stdout).trim_end_matches('\n'))
+                .canonicalize()
+                .map_err(|_| invalid())?;
+        if !std::fs::symlink_metadata(worktree).is_ok_and(|m| m.is_dir()) {
+            return Err(invalid());
+        }
+        let dot_git = worktree.join(".git");
+        if !std::fs::symlink_metadata(&dot_git).is_ok_and(|m| m.is_file()) {
+            return Err(invalid());
+        }
+        let pointer = std::fs::read_to_string(&dot_git).map_err(|_| invalid())?;
+        let pointer = pointer
+            .trim_end_matches('\n')
+            .strip_prefix("gitdir: ")
+            .ok_or_else(invalid)?;
+        let admin = worktree
+            .join(pointer)
+            .canonicalize()
+            .map_err(|_| invalid())?;
+        if git_root.join(".git").is_dir()
+            && git_root
+                .join(".git")
+                .canonicalize()
+                .map_err(|_| invalid())?
+                != common
+        {
+            return Err(invalid());
+        }
+        let registrations = common
+            .join("worktrees")
+            .canonicalize()
+            .map_err(|_| invalid())?;
+        if registrations != common.join("worktrees")
+            || admin.parent() != Some(registrations.as_path())
+        {
+            return Err(invalid());
+        }
+        let backlink = std::fs::read(admin.join("gitdir")).map_err(|_| invalid())?;
+        if path_from_git_bytes(backlink.strip_suffix(b"\n").unwrap_or(&backlink))
+            .canonicalize()
+            .map_err(|_| invalid())?
+            != dot_git.canonicalize().map_err(|_| invalid())?
+        {
+            return Err(invalid());
+        }
+        let commondir = std::fs::read_to_string(admin.join("commondir")).map_err(|_| invalid())?;
+        if admin
+            .join(commondir.trim())
+            .canonicalize()
+            .map_err(|_| invalid())?
+            != common
+        {
+            return Err(invalid());
+        }
+        Ok(common)
+    }
+
+    /// Delete the branch before removing its checkout. Detaching HEAD with
+    /// update-ref preserves the index and every working file (no checkout,
+    /// hooks or filters). Any deletion failure restores the symbolic HEAD.
+    pub fn delete_recreated_branch_logged(
+        &self,
+        git_root: &Path,
+        worktree: &Path,
+        branch: &str,
+        sink: &mut dyn GitFrontend,
+    ) -> Result<(), EngineError> {
+        let actual = self.current_branch(worktree);
+        if actual.as_deref() != Some(branch) {
+            return Err(EngineError::Git(format!(
+                "cannot recreate {}: branch '{}' is not checked out here (current branch: {}); check whether it is checked out elsewhere",
+                worktree.display(), branch, actual.as_deref().unwrap_or("detached HEAD"),
+            )));
+        }
+        {
+            let out = run_git_logged(
+                &["update-ref", "--no-deref", "HEAD", "HEAD"],
+                worktree,
+                sink,
+            )?;
+            if !out.status.success() {
+                return Err(EngineError::Git(
+                    String::from_utf8_lossy(&out.stderr).into_owned(),
+                ));
+            }
+        }
+        if self.branch_exists(git_root, branch) {
+            if let Err(error) = self.delete_branch_logged(git_root, branch, sink) {
+                {
+                    let restore = run_git_logged(
+                        &["symbolic-ref", "HEAD", &format!("refs/heads/{branch}")],
+                        worktree,
+                        sink,
+                    )?;
+                    if !restore.status.success() {
+                        return Err(EngineError::Git(format!("{error}; could not restore original branch; worktree files preserved at {}", worktree.display())));
+                    }
+                }
+                return Err(error);
+            }
+        }
+        Ok(())
     }
 
     /// Branch name for a work-item (`awman/work-item-NNNN`).
@@ -532,7 +759,7 @@ impl GitEngine {
         } else {
             vec!["worktree", "add", wt_str, "-b", branch]
         };
-        let output = Command::new("git")
+        let output = host_command::command(git_root)
             .args(&args)
             .current_dir(git_root)
             .output()
@@ -555,7 +782,7 @@ impl GitEngine {
         let wt_str = worktree_path
             .to_str()
             .ok_or_else(|| EngineError::Git("worktree path not UTF-8".into()))?;
-        let output = Command::new("git")
+        let output = host_command::command(git_root)
             .args(["worktree", "remove", "--force", wt_str])
             .current_dir(git_root)
             .output()
@@ -579,7 +806,7 @@ impl GitEngine {
         worktree_path: &Path,
     ) -> Result<(), EngineError> {
         let args = ["merge", "--squash", branch];
-        let output = Command::new("git")
+        let output = host_command::command(git_root)
             .args(args)
             .current_dir(git_root)
             .output()
@@ -595,7 +822,7 @@ impl GitEngine {
         }
         let message = squash_commit_message(branch);
         let args = ["commit", "-m", &message];
-        let output = Command::new("git")
+        let output = host_command::command(git_root)
             .args(args)
             .current_dir(git_root)
             .output()
@@ -613,7 +840,7 @@ impl GitEngine {
     }
 
     pub fn commit_all(&self, path: &Path, message: &str) -> Result<(), EngineError> {
-        let add = Command::new("git")
+        let add = host_command::command(path)
             .args(["add", "-A"])
             .current_dir(path)
             .output()
@@ -625,7 +852,7 @@ impl GitEngine {
                 stderr.trim()
             )));
         }
-        let commit = Command::new("git")
+        let commit = host_command::command(path)
             .args(["commit", "-m", message])
             .current_dir(path)
             .output()
@@ -641,7 +868,7 @@ impl GitEngine {
     }
 
     pub fn delete_branch(&self, git_root: &Path, branch: &str) -> Result<(), EngineError> {
-        let output = Command::new("git")
+        let output = host_command::command(git_root)
             .args(["branch", "-D", branch])
             .current_dir(git_root)
             .output()
@@ -721,7 +948,7 @@ impl GitEngine {
         subdir: &str,
     ) -> Result<SparseCloneOutcome, EngineError> {
         let outcome = self.clone_repo_sparse_inner(url, dest, subdir, &mut |args, cwd| {
-            Command::new("git")
+            host_command::command(cwd)
                 .args(args)
                 .current_dir(cwd)
                 .output()
@@ -836,7 +1063,7 @@ impl GitEngine {
     }
 
     fn pull_latest_with(&self, repo_dir: &Path, fetch_args: &[&str]) -> Result<(), EngineError> {
-        let fetch = Command::new("git")
+        let fetch = host_command::command(repo_dir)
             .args(fetch_args)
             .current_dir(repo_dir)
             .output()
@@ -849,7 +1076,7 @@ impl GitEngine {
                 stderr.trim()
             )));
         }
-        let reset = Command::new("git")
+        let reset = host_command::command(repo_dir)
             .args(["reset", "--hard", "origin/HEAD"])
             .current_dir(repo_dir)
             .output()
@@ -875,7 +1102,7 @@ impl GitEngine {
     /// named after the rewritten URL, and switching to the stored value would
     /// silently orphan it.
     pub fn remote_effective_url(&self, repo_dir: &Path, remote: &str) -> Option<String> {
-        let output = Command::new("git")
+        let output = host_command::command(repo_dir)
             .args(["remote", "get-url", remote])
             .current_dir(repo_dir)
             .stdout(std::process::Stdio::piped())
@@ -897,7 +1124,7 @@ impl GitEngine {
     /// rewrites, which would mask the stored value this is meant to inspect.
     pub fn remote_url(&self, repo_dir: &Path, remote: &str) -> Result<String, EngineError> {
         let key = format!("remote.{remote}.url");
-        let output = Command::new("git")
+        let output = host_command::command(repo_dir)
             .args(["config", "--get", &key])
             .current_dir(repo_dir)
             .output()
@@ -916,7 +1143,7 @@ impl GitEngine {
     /// remote's default branch. This intentionally discards local changes in
     /// a managed library clone.
     pub fn pull_latest(&self, repo_dir: &Path) -> Result<(), EngineError> {
-        let fetch = Command::new("git")
+        let fetch = host_command::command(repo_dir)
             .args(["fetch", "origin"])
             .current_dir(repo_dir)
             .output()
@@ -929,7 +1156,7 @@ impl GitEngine {
             )));
         }
 
-        let reset = Command::new("git")
+        let reset = host_command::command(repo_dir)
             .args(["reset", "--hard", "origin/HEAD"])
             .current_dir(repo_dir)
             .output()
@@ -957,7 +1184,7 @@ impl GitEngine {
         // exists or (b) exactly one remote has the branch (git auto-creates
         // a tracking branch). Try this first so we don't need a separate
         // remote-branch probe.
-        let output = Command::new("git")
+        let output = host_command::command(path)
             .args(["checkout", branch])
             .current_dir(path)
             .output()
@@ -968,7 +1195,7 @@ impl GitEngine {
 
         // Fall back: branch exists neither locally nor on any remote — create
         // it from the current HEAD.
-        let output = Command::new("git")
+        let output = host_command::command(path)
             .args(["checkout", "-b", branch])
             .current_dir(path)
             .output()
@@ -994,7 +1221,7 @@ impl GitEngine {
     }
 
     pub fn branch_exists(&self, git_root: &Path, branch: &str) -> bool {
-        Command::new("git")
+        host_command::command(git_root)
             .args(["rev-parse", "--verify", &format!("refs/heads/{branch}")])
             .current_dir(git_root)
             .stdout(std::process::Stdio::null())
@@ -1005,7 +1232,7 @@ impl GitEngine {
     }
 
     pub fn is_detached_head(&self, git_root: &Path) -> bool {
-        !Command::new("git")
+        !host_command::command(git_root)
             .args(["symbolic-ref", "--quiet", "HEAD"])
             .current_dir(git_root)
             .stdout(std::process::Stdio::null())
@@ -1018,7 +1245,7 @@ impl GitEngine {
     /// Return the current branch name at `git_root` (the branch HEAD points
     /// to). Returns `None` if HEAD is detached or git invocation fails.
     pub fn current_branch(&self, git_root: &Path) -> Option<String> {
-        let output = Command::new("git")
+        let output = host_command::command(git_root)
             .args(["rev-parse", "--abbrev-ref", "HEAD"])
             .current_dir(git_root)
             .stderr(std::process::Stdio::null())
@@ -1055,7 +1282,7 @@ impl GitEngine {
 
     /// One `git -C <path> config <key>`, `None` when unset or empty.
     fn config_value(&self, path: &Path, key: &str) -> Result<Option<String>, EngineError> {
-        let output = Command::new("git")
+        let output = host_command::command(path)
             .args(["config", key])
             .current_dir(path)
             .stderr(std::process::Stdio::null())
@@ -1070,7 +1297,7 @@ impl GitEngine {
     }
     /// The commit SHA HEAD points at in `git_root`.
     pub fn head_sha(&self, git_root: &Path) -> Result<String, EngineError> {
-        let output = Command::new("git")
+        let output = host_command::command(git_root)
             .args(["rev-parse", "HEAD"])
             .current_dir(git_root)
             .output()
@@ -1359,7 +1586,7 @@ impl GitEngine {
     /// conflicted squash merge leaves no `MERGE_HEAD`; check
     /// [`Self::unmerged_paths_logged`] too.
     pub fn merge_in_progress(&self, git_root: &Path) -> bool {
-        Command::new("git")
+        host_command::command(git_root)
             .args(["rev-parse", "-q", "--verify", "MERGE_HEAD"])
             .current_dir(git_root)
             .output()
@@ -1380,7 +1607,7 @@ impl GitEngine {
 
     /// Whether `commit` is an ancestor of (already merged into) `HEAD`.
     pub fn is_merged_into_head(&self, git_root: &Path, commit: &str) -> bool {
-        Command::new("git")
+        host_command::command(git_root)
             .args(["merge-base", "--is-ancestor", commit, "HEAD"])
             .current_dir(git_root)
             .output()
@@ -1614,7 +1841,7 @@ impl GitEngine {
 
     /// `git rev-parse --verify --quiet refs/remotes/<remote>/<branch>` → sha, or `None`.
     pub fn remote_ref_sha(&self, repo: &Path, remote: &str, branch: &str) -> Option<String> {
-        let output = Command::new("git")
+        let output = host_command::command(repo)
             .args(["rev-parse", "--verify", "--quiet"])
             .arg(format!("refs/remotes/{remote}/{branch}^{{commit}}"))
             .current_dir(repo)
@@ -1635,7 +1862,7 @@ impl GitEngine {
         names: &[String],
     ) -> Result<Option<String>, EngineError> {
         let scratch = tempfile::tempdir().map_err(|e| EngineError::Git(e.to_string()))?;
-        let mut command = Command::new("git");
+        let mut command = host_command::command(scratch.path());
         command
             .args(["ls-remote", "--heads", "--tags", url])
             .current_dir(scratch.path())
@@ -1944,7 +2171,7 @@ pub fn build_summary(
 
 /// Run a git command with explicit args in `root`.
 fn run_git_summary(args: &[&str], root: &Path) -> Result<String, EngineError> {
-    let output = Command::new("git")
+    let output = host_command::command(root)
         .args(args)
         .current_dir(root)
         .output()
@@ -1976,6 +2203,12 @@ fn repo_relative_file_path(root: &Path, rel: &str) -> Option<PathBuf> {
 }
 
 /// Count the lines in an untracked file. Missing/unreadable files count as 0.
+/// `path` canonicalized, or `path` as given when it cannot be (missing,
+/// unreadable). Used to key worktrees on the canonical git root.
+fn canonical_or_given(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
 fn count_file_lines(path: &Path) -> u32 {
     match std::fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_file() => {}
@@ -1998,43 +2231,6 @@ impl GitRootResolver for GitEngine {
             }),
         }
     }
-}
-
-/// Resolve the main `.git` directory backing a worktree checkout.
-///
-/// A worktree's `.git` entry is a *file* containing `gitdir: <path>` where
-/// `<path>` points to `.git/worktrees/<name>/` in the main repository.
-/// This function reads that pointer and returns the main `.git/` directory
-/// (two levels up from the worktree entry).
-///
-/// Returns `Ok(None)` when `worktree_path/.git` is a directory (regular
-/// repo) or does not exist.
-pub fn resolve_worktree_git_dir(worktree_path: &Path) -> Result<Option<PathBuf>, EngineError> {
-    let dot_git = worktree_path.join(".git");
-    if !dot_git.exists() || dot_git.is_dir() {
-        return Ok(None);
-    }
-    let content = std::fs::read_to_string(&dot_git).map_err(|e| EngineError::io(&dot_git, e))?;
-    let gitdir_line = content.trim().strip_prefix("gitdir: ").ok_or_else(|| {
-        EngineError::Git(format!(
-            "unexpected .git file format at {}: {}",
-            dot_git.display(),
-            content.trim(),
-        ))
-    })?;
-    let gitdir = if Path::new(gitdir_line).is_absolute() {
-        PathBuf::from(gitdir_line)
-    } else {
-        worktree_path.join(gitdir_line)
-    };
-    // gitdir → .git/worktrees/<name>  →  parent .git/worktrees/  →  parent .git/
-    let main_git_dir = gitdir.parent().and_then(|p| p.parent()).ok_or_else(|| {
-        EngineError::Git(format!(
-            "cannot derive main .git dir from worktree gitdir: {}",
-            gitdir.display(),
-        ))
-    })?;
-    Ok(Some(main_git_dir.to_path_buf()))
 }
 
 #[cfg(test)]
@@ -2176,42 +2372,6 @@ mod tests {
         g.remove_worktree(repo_tmp.path(), &wt_path)
             .expect("remove_worktree should succeed");
         assert!(!wt_path.exists(), "worktree directory must be gone");
-    }
-
-    #[test]
-    fn resolve_worktree_git_dir_returns_none_for_regular_repo() {
-        let tmp = tempfile::tempdir().unwrap();
-        init_repo(tmp.path());
-        let result = resolve_worktree_git_dir(tmp.path()).unwrap();
-        assert!(result.is_none(), "regular repo should return None");
-    }
-
-    #[test]
-    fn resolve_worktree_git_dir_returns_none_for_non_git_dir() {
-        let tmp = tempfile::tempdir().unwrap();
-        let result = resolve_worktree_git_dir(tmp.path()).unwrap();
-        assert!(result.is_none(), "non-git dir should return None");
-    }
-
-    #[test]
-    fn resolve_worktree_git_dir_finds_main_git_dir() {
-        let repo_tmp = tempfile::tempdir().unwrap();
-        let wt_tmp = tempfile::tempdir().unwrap();
-        init_repo(repo_tmp.path());
-        let g = GitEngine::new();
-        let wt_path = wt_tmp.path().join("my-worktree");
-        g.create_worktree(repo_tmp.path(), &wt_path, "awman/test-resolve")
-            .expect("create_worktree should succeed");
-
-        let result = resolve_worktree_git_dir(&wt_path)
-            .expect("should not error")
-            .expect("worktree should resolve to Some");
-
-        let expected = repo_tmp.path().join(".git").canonicalize().unwrap();
-        let actual = result.canonicalize().unwrap();
-        assert_eq!(actual, expected, "should resolve to main repo .git dir");
-
-        g.remove_worktree(repo_tmp.path(), &wt_path).unwrap();
     }
 
     // ─── pull_latest ──────────────────────────────────────────────────────────
@@ -3067,6 +3227,159 @@ mod tests {
             before,
             git_out(bare.path(), &["rev-parse", "refs/heads/job"]),
             "a non-fast-forward push must not overwrite the remote branch"
+        );
+    }
+    #[test]
+    fn legacy_lookup_rejects_stale_registration_replaced_by_foreign_checkout() {
+        for suffix in ["0134", "wf-build"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let a = tmp.path().join("a");
+            let b = tmp.path().join("b");
+            std::fs::create_dir_all(&a).unwrap();
+            std::fs::create_dir_all(&b).unwrap();
+            init_repo(&a);
+            init_repo(&b);
+            let legacy = tmp.path().join("legacy").join(suffix);
+            let hashed = tmp.path().join("hashed").join(suffix);
+            let git = GitEngine::new();
+            git.create_worktree(&a, &legacy, "old-a").unwrap();
+            std::fs::remove_dir_all(&legacy).unwrap();
+            assert!(
+                !git.list_worktrees(&a).unwrap().contains(&legacy),
+                "prunable records are excluded"
+            );
+            git.create_worktree(&b, &legacy, "new-b").unwrap();
+            // Some Git versions retain this registration without a prunable
+            // marker once another checkout occupies the path. Ownership must
+            // reject it independently of that marker.
+            assert!(git.validate_worktree_owner(&a, &legacy).is_err());
+            assert_eq!(
+                git.pick_worktree_path(&a, hashed.clone(), legacy.clone()),
+                hashed
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_lookup_rejects_replacement_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        let git = GitEngine::new();
+        let legacy = tmp.path().join("legacy");
+        let replacement = tmp.path().join("replacement");
+        git.create_worktree(&repo, &legacy, "old").unwrap();
+        git.create_worktree(&repo, &replacement, "other").unwrap();
+        std::fs::remove_dir_all(&legacy).unwrap();
+        std::os::unix::fs::symlink(&replacement, &legacy).unwrap();
+        let hashed = tmp.path().join("hashed");
+        assert_eq!(
+            git.pick_worktree_path(&repo, hashed.clone(), legacy),
+            hashed
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_lookup_preserves_tabs_newlines_and_native_path_bytes() {
+        use std::os::unix::ffi::OsStringExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        for (index, suffix) in ["0134", "wf-build"].iter().enumerate() {
+            let ancestor = std::ffi::OsString::from_vec(b"tab\tline\nnonutf8-\xff".to_vec());
+            let legacy = tmp.path().join(ancestor).join(suffix);
+            let hashed = tmp.path().join("hashed").join(suffix);
+            let git = GitEngine::new();
+            // GitEngine creation currently requires UTF-8 argv; Git itself
+            // accepts native bytes and the listing must preserve them.
+            std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+            assert!(Command::new("git")
+                .args(["worktree", "add", "-b", &format!("odd-{index}")])
+                .arg(&legacy)
+                .current_dir(&repo)
+                .output()
+                .unwrap()
+                .status
+                .success());
+            assert_eq!(
+                git.pick_worktree_path(&repo, hashed, legacy.clone()),
+                legacy
+            );
+        }
+    }
+
+    #[test]
+    fn worktree_owner_rejects_tampered_pointer_without_deriving_overlay_from_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        let wt = tmp.path().join("wt");
+        let git = GitEngine::new();
+        git.create_worktree(&repo, &wt, "test-pointer").unwrap();
+        assert_eq!(
+            git.validate_worktree_owner(&repo, &wt).unwrap(),
+            repo.join(".git")
+        );
+        std::fs::write(
+            wt.join(".git"),
+            format!("gitdir: {}/foreign/a/b\n", tmp.path().display()),
+        )
+        .unwrap();
+        assert!(git.validate_worktree_owner(&repo, &wt).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn host_git_disables_repository_hooks_filters_fsmonitor_and_merge_drivers() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        init_repo(tmp.path());
+        let sentinel = tmp.path().join("host-executed");
+        let script = tmp.path().join("evil.sh");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\ntouch '{}'\ncat\n", sentinel.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for key in [
+            "core.fsmonitor",
+            "filter.evil.clean",
+            "filter.evil.smudge",
+            "filter.evil.process",
+            "merge.evil.driver",
+            "diff.evil.textconv",
+        ] {
+            assert!(Command::new("git")
+                .args(["config", key])
+                .arg(&script)
+                .current_dir(tmp.path())
+                .status()
+                .unwrap()
+                .success());
+        }
+        let hook = tmp.path().join(".git/hooks/post-checkout");
+        std::fs::copy(&script, &hook).unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(
+            tmp.path().join(".gitattributes"),
+            "* filter=evil diff=evil merge=evil\n",
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join("tracked"), "data\n").unwrap();
+        let git = GitEngine::new();
+        git.commit_all(tmp.path(), "inert content drivers").unwrap();
+        git.uncommitted_files(tmp.path()).unwrap();
+        let wt = tmp.path().join("worktree");
+        git.create_worktree(tmp.path(), &wt, "safe").unwrap();
+        assert!(
+            !sentinel.exists(),
+            "repository commands must not execute on the host"
         );
     }
 }

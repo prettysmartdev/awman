@@ -44,6 +44,8 @@ pub(crate) struct FakeExecWorkflowFrontend {
     resume_response: WorkflowResumeDecision,
     /// Prompts the resume question was asked with.
     resume_prompts: Vec<WorkflowResumePrompt>,
+    resume_prompt_calls: Arc<std::sync::atomic::AtomicUsize>,
+    existing_default: ExistingWorktreeDecision,
     /// `on_phase_step_fixing` calls. Recorded through an `Arc` so a test
     /// can observe them after the fake has been boxed into the shared
     /// handle (F-36).
@@ -66,6 +68,8 @@ impl FakeExecWorkflowFrontend {
             next_action_response: NextAction::LaunchNext,
             resume_response: WorkflowResumeDecision::Fresh,
             resume_prompts: Vec::new(),
+            resume_prompt_calls: Default::default(),
+            existing_default: ExistingWorktreeDecision::Resume,
             phase_fixing: Arc::new(Mutex::new(Vec::new())),
             take_io_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
@@ -208,6 +212,13 @@ impl WorktreeLifecycleFrontend for FakeExecWorkflowFrontend {
     ) -> Result<ExistingWorktreeDecision, CommandError> {
         Ok(ExistingWorktreeDecision::Resume)
     }
+    fn existing_worktree_after_resume(
+        &mut self,
+        _path: &Path,
+        _branch: &str,
+    ) -> Result<ExistingWorktreeDecision, CommandError> {
+        Ok(self.existing_default)
+    }
     fn report_worktree_created(&mut self, _path: &Path, _branch: &str) {}
     fn ask_post_workflow_action(
         &mut self,
@@ -280,6 +291,8 @@ impl ExecWorkflowCommandFrontend for FakeExecWorkflowFrontend {
         &mut self,
         prompt: &WorkflowResumePrompt,
     ) -> Result<WorkflowResumeDecision, CommandError> {
+        self.resume_prompt_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.resume_prompts.push(prompt.clone());
         Ok(self.resume_response.clone())
     }
@@ -416,6 +429,7 @@ async fn set_pty_active_called_true_then_false_around_engine() {
         leader: None,
         on_dirty_merge_target: None,
         on_merge_failure: None,
+        on_existing_worktree: None,
     };
     let session = {
         let resolver = crate::data::session::StaticGitRootResolver::new(tmp.path());
@@ -653,6 +667,7 @@ async fn workflow_command_survives_runtime_holding_frontend_after_wait() {
             leader: None,
             on_dirty_merge_target: None,
             on_merge_failure: None,
+            on_existing_worktree: None,
         };
         let frontend = FakeExecWorkflowFrontend::new();
         let messages = frontend.shared_messages.clone();
@@ -932,6 +947,7 @@ fn exec_workflow_flags_worktree_defaults_to_false() {
         leader: None,
         on_dirty_merge_target: None,
         on_merge_failure: None,
+        on_existing_worktree: None,
     };
     assert!(!flags.worktree);
     assert!(!flags.yolo);
@@ -1036,6 +1052,7 @@ fn exec_workflow_flags_yolo_implies_worktree_in_dispatch() {
         leader: None,
         on_dirty_merge_target: None,
         on_merge_failure: None,
+        on_existing_worktree: None,
     };
     assert!(flags.yolo);
     assert!(flags.worktree, "yolo must imply worktree");
@@ -1555,6 +1572,7 @@ fn make_dynamic_flags(
         leader: leader.map(|s| s.to_string()),
         on_dirty_merge_target: None,
         on_merge_failure: None,
+        on_existing_worktree: None,
     }
 }
 
@@ -3635,6 +3653,7 @@ async fn run_recorded_workflow(
         leader: None,
         on_dirty_merge_target: None,
         on_merge_failure: None,
+        on_existing_worktree: None,
     };
     let session = Session::for_tests_isolated(&repo, &tmp.join("config-home"));
     let cmd = ExecWorkflowCommand::new(flags, engines, session);
@@ -3757,6 +3776,7 @@ async fn record_leader_launch(
         leader: Some("codex::gpt-5".into()),
         on_dirty_merge_target: None,
         on_merge_failure: None,
+        on_existing_worktree: None,
     };
     let cmd = ExecWorkflowCommand::new(flags, engines, invoking);
     let shared = SharedWorkflowFrontend::new(Box::new(FakeExecWorkflowFrontend::new()));
@@ -3944,6 +3964,7 @@ fn merge_policy_flags(
         leader: None,
         on_dirty_merge_target: dirty,
         on_merge_failure: failure,
+        on_existing_worktree: None,
     }
 }
 
@@ -4108,4 +4129,232 @@ fn merge_fix_prompt_unreadable_template_is_an_error_not_a_fallback() {
     )
     .unwrap_err();
     assert!(err.to_string().contains("promptTemplate"), "{err}");
+}
+
+fn policy_repo() -> tempfile::TempDir {
+    let tmp = tempfile::tempdir().unwrap();
+    for args in [
+        vec!["init", "-q"],
+        vec!["config", "user.name", "Test"],
+        vec!["config", "user.email", "test@example.com"],
+        vec!["commit", "--allow-empty", "-qm", "initial"],
+    ] {
+        assert!(std::process::Command::new("git")
+            .args(args)
+            .current_dir(tmp.path())
+            .status()
+            .unwrap()
+            .success());
+    }
+    tmp
+}
+
+#[tokio::test]
+async fn existing_policy_fail_precedes_all_saved_state_changes_and_prompts() {
+    for explicit in [false, true] {
+        for complete in [false, true] {
+            let repo = policy_repo();
+            let root = repo.path().canonicalize().unwrap();
+            let workflow_path = root.join("wf.toml");
+            std::fs::write(&workflow_path, "title = \"wf\"\nagent = \"claude\"\n[[step]]\nname = \"a\"\nprompt = \"a\"\n[[step]]\nname = \"b\"\nprompt = \"b\"\ndepends_on = [\"a\"]\n[[step]]\nname = \"c\"\nprompt = \"c\"\ndepends_on = [\"b\"]\n").unwrap();
+            let engines = Engines::for_tests(&root);
+            let lifecycle =
+                WorktreeLifecycle::for_workflow(engines.git_engine.clone(), root.clone(), "wf")
+                    .unwrap();
+            engines
+                .git_engine
+                .create_worktree(&root, lifecycle.worktree_path(), lifecycle.branch())
+                .unwrap();
+            let statuses = if complete {
+                vec![StepState::Succeeded; 3]
+            } else {
+                vec![StepState::Succeeded, failed(1), StepState::Cancelled]
+            };
+            let store = seed_state(lifecycle.worktree_path(), &statuses);
+            let state_path = store.state_path(None, "wf");
+            let before = std::fs::read(&state_path).unwrap();
+            let session = Session::for_tests_isolated(&root, &root);
+            let mut flags = merge_policy_flags(None, None);
+            flags.workflow = Some(workflow_path);
+            flags.on_existing_worktree = explicit.then_some(ExistingWorktreeDecision::Fail);
+            // Reproduce the API default, or an interactive user's explicit
+            // Fail while their resume answer would otherwise delete state.
+            let mut frontend =
+                FakeExecWorkflowFrontend::new().answering_resume(WorkflowResumeDecision::Fresh);
+            frontend.existing_default = if explicit {
+                ExistingWorktreeDecision::Resume
+            } else {
+                ExistingWorktreeDecision::Fail
+            };
+            let calls = frontend.resume_prompt_calls.clone();
+            let error = ExecWorkflowCommand::new(flags, engines.clone(), session)
+                .run_with_frontend(Box::new(frontend))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, CommandError::WorktreeExists { .. }),
+                "{error:?}"
+            );
+            assert_eq!(std::fs::read(&state_path).unwrap(), before);
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+            engines
+                .git_engine
+                .remove_worktree(&root, lifecycle.worktree_path())
+                .unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn dynamic_recreate_discards_saved_successes_and_enters_fresh_leader_path() {
+    let repo = policy_repo();
+    let root = repo.path().canonicalize().unwrap();
+    std::fs::create_dir_all(root.join("aspec/work-items")).unwrap();
+    std::fs::write(root.join("aspec/work-items/0134-feature.md"), "# Feature").unwrap();
+    let engines = Engines::for_tests(&root);
+    let lifecycle =
+        WorktreeLifecycle::for_work_item(engines.git_engine.clone(), root.clone(), 134).unwrap();
+    engines
+        .git_engine
+        .create_worktree(&root, lifecycle.worktree_path(), lifecycle.branch())
+        .unwrap();
+    let dynamic =
+        crate::data::fs::WorkflowDirs::dynamic_workflow_path(lifecycle.worktree_path(), 134);
+    std::fs::create_dir_all(dynamic.parent().unwrap()).unwrap();
+    std::fs::write(&dynamic, "title = \"wf\"\nagent = \"claude\"\n[[step]]\nname = \"a\"\nprompt = \"a\"\n[[step]]\nname = \"b\"\nprompt = \"b\"\ndepends_on = [\"a\"]\n").unwrap();
+    let (mut state, _) = resume_fixture(&["a", "b"], &[StepState::Succeeded, failed(1)]);
+    state.workflow_name = "wf".into();
+    state.work_item = Some(134);
+    let store = crate::data::WorkflowStateStore::at_git_root(lifecycle.worktree_path());
+    store.save(&state).unwrap();
+    let mut flags = make_dynamic_flags(
+        true,
+        None,
+        Some("0134"),
+        Some("missing-leader::model"),
+        false,
+        None,
+    );
+    flags.on_existing_worktree = Some(ExistingWorktreeDecision::Recreate);
+    let frontend = FakeExecWorkflowFrontend::new()
+        .answering_resume(WorkflowResumeDecision::ResumeFrom("b".into()));
+    let calls = frontend.resume_prompt_calls.clone();
+    let session = Session::for_tests_isolated(&root, &root);
+    let result = ExecWorkflowCommand::new(flags, engines.clone(), session)
+        .run_with_frontend(Box::new(frontend))
+        .await;
+    let error = result.unwrap_err().to_string();
+    assert!(
+        error.contains("missing-leader"),
+        "must reach fresh leader resolution: {error}"
+    );
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert!(!dynamic.exists(), "deleted workflow must not be resumed");
+    assert!(
+        store.load(Some(134), "wf").unwrap().is_none(),
+        "old successes must not be restored in a fresh checkout"
+    );
+    engines
+        .git_engine
+        .remove_worktree(&root, lifecycle.worktree_path())
+        .unwrap();
+}
+
+#[tokio::test]
+async fn workflow_uses_session_root_after_core_worktree_tampering() {
+    let repo = policy_repo();
+    let root = repo.path().canonicalize().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let workflow_path = write_minimal_workflow(&root, "tamper.toml");
+    let session = Session::for_tests_isolated(&root, &root);
+    let engines = Engines::for_tests(&root);
+    let lifecycle =
+        WorktreeLifecycle::for_workflow(engines.git_engine.clone(), root.clone(), "tamper")
+            .unwrap();
+    engines
+        .git_engine
+        .create_worktree(&root, lifecycle.worktree_path(), lifecycle.branch())
+        .unwrap();
+    assert!(std::process::Command::new("git")
+        .args(["config", "core.worktree"])
+        .arg(outside.path())
+        .current_dir(&root)
+        .status()
+        .unwrap()
+        .success());
+    let mut flags = merge_policy_flags(None, None);
+    flags.workflow = Some(workflow_path);
+    flags.on_existing_worktree = Some(ExistingWorktreeDecision::Fail);
+    let error = ExecWorkflowCommand::new(flags, engines.clone(), session)
+        .run_with_frontend(Box::new(FakeExecWorkflowFrontend::new()))
+        .await
+        .unwrap_err();
+    match error {
+        CommandError::WorktreeExists { path, .. } => assert_eq!(path, lifecycle.worktree_path()),
+        other => panic!("must use original root: {other:?}"),
+    }
+    engines
+        .git_engine
+        .remove_worktree(&root, lifecycle.worktree_path())
+        .unwrap();
+}
+
+#[tokio::test]
+async fn dynamic_fail_preserves_both_resume_artifacts_before_fresh_prompt() {
+    for explicit in [false, true] {
+        let repo = policy_repo();
+        let root = repo.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("aspec/work-items")).unwrap();
+        std::fs::write(root.join("aspec/work-items/0134-feature.md"), "# Feature").unwrap();
+        let engines = Engines::for_tests(&root);
+        let lifecycle =
+            WorktreeLifecycle::for_work_item(engines.git_engine.clone(), root.clone(), 134)
+                .unwrap();
+        engines
+            .git_engine
+            .create_worktree(&root, lifecycle.worktree_path(), lifecycle.branch())
+            .unwrap();
+        let dynamic =
+            crate::data::fs::WorkflowDirs::dynamic_workflow_path(lifecycle.worktree_path(), 134);
+        std::fs::create_dir_all(dynamic.parent().unwrap()).unwrap();
+        std::fs::write(&dynamic, "title = \"wf\"\nagent = \"claude\"\n[[step]]\nname = \"a\"\nprompt = \"a\"\n[[step]]\nname = \"b\"\nprompt = \"b\"\ndepends_on = [\"a\"]\n").unwrap();
+        let (mut state, _) = resume_fixture(&["a", "b"], &[StepState::Succeeded, failed(1)]);
+        state.workflow_name = "wf".into();
+        state.work_item = Some(134);
+        let store = crate::data::WorkflowStateStore::at_git_root(lifecycle.worktree_path());
+        store.save(&state).unwrap();
+        let state_path = store.state_path(Some(134), "wf");
+        let before = (
+            std::fs::read(&dynamic).unwrap(),
+            std::fs::read(&state_path).unwrap(),
+        );
+        let mut flags = make_dynamic_flags(true, None, Some("0134"), None, false, None);
+        flags.on_existing_worktree = explicit.then_some(ExistingWorktreeDecision::Fail);
+        let mut frontend =
+            FakeExecWorkflowFrontend::new().answering_resume(WorkflowResumeDecision::Fresh);
+        frontend.existing_default = if explicit {
+            ExistingWorktreeDecision::Resume
+        } else {
+            ExistingWorktreeDecision::Fail
+        };
+        let calls = frontend.resume_prompt_calls.clone();
+        let session = Session::for_tests_isolated(&root, &root);
+        let error = ExecWorkflowCommand::new(flags, engines.clone(), session)
+            .run_with_frontend(Box::new(frontend))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, CommandError::WorktreeExists { .. }));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(
+            (
+                std::fs::read(&dynamic).unwrap(),
+                std::fs::read(&state_path).unwrap()
+            ),
+            before
+        );
+        engines
+            .git_engine
+            .remove_worktree(&root, lifecycle.worktree_path())
+            .unwrap();
+    }
 }

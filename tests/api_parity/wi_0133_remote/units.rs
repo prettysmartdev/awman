@@ -6,6 +6,7 @@ use awman::command::error::CommandError;
 use awman::command::session_create::{
     is_valid_branch_name, SessionCreatePolicy, SessionCreateRequest,
 };
+use awman::data::session::StaticGitRootResolver;
 use awman::data::workflow_definition::TeardownStep;
 use awman::engine::workflow::step_commands::teardown_step_to_shell;
 
@@ -91,7 +92,9 @@ fn session_request_rejects_remote_only_fields_on_a_local_session() {
         ),
     ];
     for (request, expected) in cases {
-        let error = request.validate(&policy()).unwrap_err();
+        let error = request
+            .validate(&policy(), &StaticGitRootResolver::new("/unused"))
+            .unwrap_err();
         assert!(
             matches!(error, CommandError::SessionFieldRemoteOnly { field } if field == expected),
             "{expected}: {error:?}"
@@ -130,7 +133,9 @@ fn session_request_requires_a_branch_for_base_ref_merge_refs_and_push() {
         ),
     ];
     for (request, expected) in cases {
-        let error = request.validate(&policy()).unwrap_err();
+        let error = request
+            .validate(&policy(), &StaticGitRootResolver::new("/unused"))
+            .unwrap_err();
         assert!(
             matches!(error, CommandError::SessionFieldRequiresBranch { field } if field == expected),
             "{expected}: {error:?}"
@@ -159,7 +164,9 @@ fn session_request_merge_refs_must_be_branch_names() {
             merge_refs: vec!["ok".into(), bad.into()],
             ..remote(Some("work"))
         };
-        let error = request.validate(&policy()).unwrap_err();
+        let error = request
+            .validate(&policy(), &StaticGitRootResolver::new("/unused"))
+            .unwrap_err();
         assert!(
             matches!(
                 &error,
@@ -180,7 +187,9 @@ fn session_request_accepts_and_trims_remote_fields() {
         push: true,
         ..remote(Some(" work "))
     };
-    let plan = request.validate(&policy()).expect("valid remote request");
+    let plan = request
+        .validate(&policy(), &StaticGitRootResolver::new("/unused"))
+        .expect("valid remote request");
     assert_eq!(plan.branch.as_deref(), Some("work"));
     assert_eq!(plan.base_ref.as_deref(), Some("v1.0"));
     assert_eq!(plan.merge_refs, ["feature/a", "feature-b", "feature-b"]);
@@ -199,13 +208,20 @@ fn session_request_base_ref_may_be_a_sha_tag_or_remote_branch_but_not_an_option(
             base_ref: Some(good.into()),
             ..remote(Some("work"))
         };
-        assert!(request.validate(&policy()).is_ok(), "{good}");
+        assert!(
+            request
+                .validate(&policy(), &StaticGitRootResolver::new("/unused"))
+                .is_ok(),
+            "{good}"
+        );
     }
     let request = SessionCreateRequest {
         base_ref: Some("--upload-pack=evil".into()),
         ..remote(Some("work"))
     };
-    let error = request.validate(&policy()).unwrap_err();
+    let error = request
+        .validate(&policy(), &StaticGitRootResolver::new("/unused"))
+        .unwrap_err();
     assert!(
         matches!(
             error,
@@ -220,7 +236,9 @@ fn session_request_base_ref_may_be_a_sha_tag_or_remote_branch_but_not_an_option(
 
 #[test]
 fn session_request_invalid_branch_is_rejected() {
-    let error = remote(Some("-x")).validate(&policy()).unwrap_err();
+    let error = remote(Some("-x"))
+        .validate(&policy(), &StaticGitRootResolver::new("/unused"))
+        .unwrap_err();
     assert!(
         matches!(
             error,
@@ -243,13 +261,15 @@ fn session_request_file_scheme_only_with_a_test_policy() {
         ..remote(Some("work"))
     };
     assert!(matches!(
-        request.validate(&policy()).unwrap_err(),
+        request
+            .validate(&policy(), &StaticGitRootResolver::new("/unused"))
+            .unwrap_err(),
         CommandError::SessionRepoUrlInvalidScheme { .. }
     ));
     let mut permissive = policy();
     permissive.allowed_schemes.push("file://".into());
     let plan = request
-        .validate(&permissive)
+        .validate(&permissive, &StaticGitRootResolver::new("/unused"))
         .expect("file:// allowed by policy");
     assert!(plan.push);
     assert_eq!(

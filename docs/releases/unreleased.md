@@ -5,6 +5,39 @@ they mean for you, not by where they were made.
 
 ## Breaking and behaviour changes
 
+### An API run no longer silently resumes an existing worktree
+
+When the worktree for an `exec workflow --worktree` run already existed, the
+API reused it without telling you. It now fails the command (exit code 1,
+HTTP 409) with a message naming the worktree path and branch. Pass
+`--on-existing-worktree resume` to get the old behaviour, or `recreate` to
+start over. The TUI, interactive CLI, piped CLI and squad daemon behave as
+before when the flag is absent.
+
+**Who is affected:** API clients that re-run a workflow whose worktree was left
+behind by an earlier run.
+
+### `recreate` now discards the branch and its commits
+
+Choosing to recreate an existing worktree used to remove the directory and
+reuse the old branch, so the earlier commits came back. It now deletes the
+worktree, the branch (`git branch -D`) and every commit on it, then starts from
+`HEAD`. If Git cannot delete the branch, the run stops with Git's error.
+
+**Who is affected:** anyone who answered `R` to the existing-worktree prompt
+expecting to keep committed work. Merge or copy what you need first. The same
+choice is available up front as `--on-existing-worktree recreate`.
+
+### Worktree directories are now `<repo-name>-<hash>`
+
+Worktrees live under `~/.awman/worktrees/<repo-name>-<hash>/`, where `<hash>`
+is 8 hex characters derived from the repository's full path, so two checkouts
+with the same folder name no longer collide. A worktree created under the old
+`~/.awman/worktrees/<repo-name>/` folder is still found and reused while Git
+lists it for the same repository; new worktrees always use the new folder.
+
+**Who is affected:** scripts that build a worktree path by hand.
+
 ### `awman chat` now exits with the agent's exit code
 
 A `chat` session whose agent exited non-zero reported that code in the TUI but
@@ -110,6 +143,20 @@ Several prompts used to pick an answer for you when there was nobody to ask:
   the interview instead of silently filing a Task.
 
 ## Features
+
+### API workdir roots: `--workdir-root` and `api.workDirRoots`
+
+`awman api start --workdir-root <dir>` (repeatable) and the global
+`api.workDirRoots` setting allow any Git repository cloned directly beneath a
+root to be used as a local session workdir, without listing each one in
+`--workdirs`. The child must be its own Git root with a real `.git` directory.
+`GET /v1/workdirs` now also returns `roots`, and a refused `workdir` names the
+rule it failed. See [Working directory allowlist](../09-api-and-remote-mode.md#working-directory-allowlist).
+
+### `--on-existing-worktree` for `exec workflow`
+
+`ask`, `resume`, `recreate` or `fail` answers the existing-worktree question up
+front on the CLI, TUI and API. See [Worktrees](../05-workflows.md#worktrees).
 
 ### Extra agent flags: `agentFlags` and `--agent-flag`
 

@@ -6,7 +6,7 @@
 use std::path::Path;
 
 use awman::data::worktree_paths::{
-    worktree_branch_name, worktree_branch_name_for_workflow, WorktreePaths,
+    repo_key, worktree_branch_name, worktree_branch_name_for_workflow, WorktreePaths,
 };
 
 // ─── Worktree path computation (no git needed) ───────────────────────────────
@@ -14,9 +14,10 @@ use awman::data::worktree_paths::{
 #[test]
 fn worktree_path_for_work_item_42() {
     let wt = WorktreePaths::with_home("/home/user");
-    let path = wt.for_work_item(Path::new("/projects/myrepo"), 42);
+    let root = Path::new("/projects/myrepo");
+    let path = wt.for_work_item(root, 42);
     assert!(
-        path.ends_with("worktrees/myrepo/0042"),
+        path.ends_with(format!("worktrees/{}/0042", repo_key(root))),
         "unexpected path: {path:?}"
     );
 }
@@ -34,9 +35,10 @@ fn worktree_path_for_work_item_1() {
 #[test]
 fn worktree_path_for_workflow_uses_wf_prefix() {
     let wt = WorktreePaths::with_home("/home/user");
-    let path = wt.for_workflow(Path::new("/projects/myrepo"), "build-docs");
+    let root = Path::new("/projects/myrepo");
+    let path = wt.for_workflow(root, "build-docs");
     assert!(
-        path.ends_with("worktrees/myrepo/wf-build-docs"),
+        path.ends_with(format!("worktrees/{}/wf-build-docs", repo_key(root))),
         "got {path:?}"
     );
 }
@@ -98,6 +100,10 @@ fn init_repo(dir: &std::path::Path) {
     run(&["commit", "-m", "initial"]);
 }
 
+/// Serialises tests that mutate process-wide `HOME` (the identity tests) with
+/// the worktree-key tests, whose paths `GitEngine` resolves under `HOME`.
+static HOME_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Real-git: GitEngine resolves the root of a freshly initialised repo.
 #[test]
 fn real_git_engine_resolves_root_of_fresh_repo() {
@@ -122,6 +128,142 @@ fn real_git_engine_resolves_root_of_fresh_repo() {
         canonical_resolved, canonical_input,
         "resolved root mismatch"
     );
+}
+
+/// A pre-key worktree is reused only when this checkout's git worktree list
+/// identifies the legacy path as its own.
+#[test]
+fn real_git_legacy_unhashed_worktree_owned_by_repository_is_reused() {
+    use crate::helpers::git_available;
+    if !git_available() {
+        eprintln!("SKIP: git not available — run on a host with git");
+        return;
+    }
+    use awman::engine::git::GitEngine;
+
+    let _lock = HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let home = dirs::home_dir().expect("test home directory");
+    let temp = tempfile::tempdir().unwrap();
+    let repo = temp
+        .path()
+        .join(format!("legacy-owner-repo-{}", std::process::id()));
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
+    let paths = WorktreePaths::with_home(&home);
+    let legacy = paths.legacy_for_work_item(&repo, 8134);
+    let _ = std::fs::remove_dir_all(legacy.parent().unwrap());
+    let engine = GitEngine::new();
+    engine
+        .create_worktree(&repo, &legacy, "awman/test-legacy-owned")
+        .unwrap();
+
+    let selected = engine.worktree_path(&repo, 8134).unwrap();
+    assert_eq!(selected, legacy);
+
+    let legacy_workflow = paths.legacy_for_workflow(&repo, "old-flow");
+    engine
+        .create_worktree(&repo, &legacy_workflow, "awman/test-legacy-workflow")
+        .unwrap();
+    assert_eq!(
+        engine.worktree_path_named(&repo, "old-flow").unwrap(),
+        legacy_workflow
+    );
+
+    engine.remove_worktree(&repo, &legacy).unwrap();
+    engine.remove_worktree(&repo, &legacy_workflow).unwrap();
+    let _ = std::fs::remove_dir_all(legacy.parent().unwrap());
+}
+
+/// Two real checkouts with the same final directory component resolve to
+/// stable but distinct hashed directories for both naming schemes.
+#[test]
+fn real_git_same_named_checkouts_have_separate_worktree_keys() {
+    use crate::helpers::git_available;
+    if !git_available() {
+        eprintln!("SKIP: git not available — run on a host with git");
+        return;
+    }
+    use awman::engine::git::GitEngine;
+
+    let _lock = HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let temp = tempfile::tempdir().unwrap();
+    let first = temp.path().join("first-checkout").join("shared-name");
+    let second = temp.path().join("second-checkout").join("shared-name");
+    std::fs::create_dir_all(&first).unwrap();
+    std::fs::create_dir_all(&second).unwrap();
+    init_repo(&first);
+    init_repo(&second);
+    let first = std::fs::canonicalize(first).unwrap();
+    let second = std::fs::canonicalize(second).unwrap();
+    let engine = GitEngine::new();
+
+    for (path, root) in [
+        (engine.worktree_path(&first, 8136).unwrap(), &first),
+        (engine.worktree_path(&second, 8136).unwrap(), &second),
+    ] {
+        assert!(path.ends_with(format!("worktrees/{}/8136", repo_key(root))));
+    }
+    let first_item = engine.worktree_path(&first, 8136).unwrap();
+    let second_item = engine.worktree_path(&second, 8136).unwrap();
+    assert_eq!(first_item, engine.worktree_path(&first, 8136).unwrap());
+    assert_eq!(second_item, engine.worktree_path(&second, 8136).unwrap());
+    assert_ne!(first_item, second_item);
+
+    let first_workflow = engine.worktree_path_named(&first, "same-flow").unwrap();
+    let second_workflow = engine.worktree_path_named(&second, "same-flow").unwrap();
+    assert!(first_workflow.ends_with(format!("worktrees/{}/wf-same-flow", repo_key(&first))));
+    assert!(second_workflow.ends_with(format!("worktrees/{}/wf-same-flow", repo_key(&second))));
+    assert_ne!(first_workflow, second_workflow);
+}
+
+/// A stale legacy path that belongs to another same-named checkout must not
+/// be reused; the path resolver chooses and creates this checkout's hash key.
+#[test]
+fn real_git_legacy_unhashed_worktree_owned_by_other_repository_is_ignored() {
+    use crate::helpers::git_available;
+    if !git_available() {
+        eprintln!("SKIP: git not available — run on a host with git");
+        return;
+    }
+    use awman::engine::git::GitEngine;
+
+    let _lock = HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let home = dirs::home_dir().expect("test home directory");
+    let temp = tempfile::tempdir().unwrap();
+    let dirname = format!("same-name-{}", std::process::id());
+    let current = temp.path().join(&dirname);
+    let other = temp.path().join("other-parent").join(dirname);
+    std::fs::create_dir_all(&current).unwrap();
+    std::fs::create_dir_all(&other).unwrap();
+    init_repo(&current);
+    init_repo(&other);
+
+    let paths = WorktreePaths::with_home(&home);
+    let legacy = paths.legacy_for_work_item(&current, 8135);
+    let _ = std::fs::remove_dir_all(legacy.parent().unwrap());
+    let engine = GitEngine::new();
+    engine
+        .create_worktree(&other, &legacy, "awman/test-legacy-foreign")
+        .unwrap();
+
+    let hashed = engine.worktree_path(&current, 8135).unwrap();
+    assert_ne!(hashed, legacy);
+    assert!(hashed.ends_with(format!(
+        "worktrees/{}/8135",
+        repo_key(&std::fs::canonicalize(&current).unwrap())
+    )));
+    engine
+        .create_worktree(&current, &hashed, "awman/test-legacy-new")
+        .unwrap();
+    assert!(hashed.exists(), "new hashed worktree should be created");
+
+    engine.remove_worktree(&current, &hashed).unwrap();
+    engine.remove_worktree(&other, &legacy).unwrap();
+    let _ = std::fs::remove_dir_all(hashed.parent().unwrap());
+    let _ = std::fs::remove_dir_all(legacy.parent().unwrap());
 }
 
 /// Real-git: full prepare → run → finalize → cleanup cycle for a worktree.
@@ -280,9 +422,6 @@ fn restore_env(saved: Vec<(&'static str, String)>) {
     }
 }
 
-/// Serialises the identity tests: they mutate process-wide `HOME`.
-static IDENTITY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 #[test]
 fn real_git_identity_configured_reads_the_global_identity() {
     use crate::helpers::git_available;
@@ -292,7 +431,7 @@ fn real_git_identity_configured_reads_the_global_identity() {
     }
     use awman::engine::git::GitEngine;
 
-    let _lock = IDENTITY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (_tmp, repo, saved) = repo_with_isolated_global(Some(("Global User", "global@x.test")));
 
     let identity = GitEngine::new().identity_configured(&repo).unwrap();
@@ -313,7 +452,7 @@ fn real_git_identity_configured_prefers_the_repo_local_override() {
     }
     use awman::engine::git::GitEngine;
 
-    let _lock = IDENTITY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (_tmp, repo, saved) = repo_with_isolated_global(Some(("Global User", "global@x.test")));
 
     for args in [
@@ -346,7 +485,7 @@ fn real_git_identity_configured_reports_both_keys_missing() {
     }
     use awman::engine::git::GitEngine;
 
-    let _lock = IDENTITY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (_tmp, repo, saved) = repo_with_isolated_global(None);
 
     let identity = GitEngine::new().identity_configured(&repo).unwrap();

@@ -23,3 +23,4 @@ mod wi_0097;
 mod wi_0097_architecture;
 mod wi_0132;
 mod wi_0133_remote;
+mod wi_0134;

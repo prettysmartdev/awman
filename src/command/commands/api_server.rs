@@ -45,6 +45,7 @@ pub struct ApiServeConfig {
     pub port: u16,
     pub bind_ip: IpAddr,
     pub workdirs: Vec<PathBuf>,
+    pub workdir_roots: Vec<PathBuf>,
     pub dangerously_skip_auth: bool,
     /// `None` means TLS is disabled (plain HTTP); only set when the user
     /// explicitly passed `--dangerously-skip-tls`.
@@ -87,6 +88,7 @@ impl ApiKeyDisclosure {
 pub struct ApiServerStartFlags {
     pub port: u16,
     pub workdirs: Vec<String>,
+    pub workdir_roots: Vec<String>,
     pub background: bool,
     pub refresh_key: bool,
     pub dangerously_skip_auth: bool,
@@ -115,6 +117,7 @@ pub struct ApiServerStartOutcome {
     pub port: u16,
     pub background: bool,
     pub workdirs: Vec<String>,
+    pub workdir_roots: Vec<String>,
     pub refreshed_key: bool,
 }
 
@@ -199,6 +202,7 @@ impl ApiServerCommand {
             "start" => ApiServerSubcommand::Start(ApiServerStartFlags {
                 port: ctx.flags.require_u16("port")?,
                 workdirs: ctx.flags.strs("workdirs").to_vec(),
+                workdir_roots: ctx.flags.strs("workdir-root").to_vec(),
                 background: ctx.flags.bool("background"),
                 refresh_key: ctx.flags.bool("refresh-key"),
                 dangerously_skip_auth: ctx.flags.bool("dangerously-skip-auth"),
@@ -274,6 +278,12 @@ async fn run_start(
     // `GlobalConfig::load()`: the session already merged global, repo, env and
     // flags, and a second load here would answer from a different one (F-31).
     let workdirs = resolve_workdirs(&flags.workdirs, &session.effective_config().api_work_dirs())?;
+    let workdir_roots = resolve_workdir_roots(
+        &flags.workdir_roots,
+        &session.effective_config().api_work_dir_roots(),
+        engines.git_engine.as_ref(),
+        frontend,
+    )?;
 
     // --refresh-key: generate new key, disclose it, exit.
     if flags.refresh_key {
@@ -283,6 +293,10 @@ async fn run_start(
             port: flags.port,
             background: false,
             workdirs: workdirs.iter().map(|p| p.display().to_string()).collect(),
+            workdir_roots: workdir_roots
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect(),
             refreshed_key: true,
         }));
     }
@@ -312,7 +326,13 @@ async fn run_start(
         });
     }
 
+    validate_root_mount_overlap(&workdirs, &workdir_roots)?;
+
     let workdir_strings: Vec<String> = workdirs.iter().map(|p| p.display().to_string()).collect();
+    let root_strings: Vec<String> = workdir_roots
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect();
 
     // Background mode: spawn a child process and exit.
     if flags.background {
@@ -320,22 +340,7 @@ async fn run_start(
         guard.check().map_err(CommandError::from)?;
         let binary = std::env::current_exe()
             .map_err(|e| CommandError::Other(format!("cannot determine awman binary: {e}")))?;
-        let mut args = vec![
-            "api".to_string(),
-            "start".to_string(),
-            "--port".to_string(),
-            flags.port.to_string(),
-        ];
-        if flags.dangerously_skip_auth {
-            args.push("--dangerously-skip-auth".to_string());
-        }
-        if flags.dangerously_skip_tls {
-            args.push("--dangerously-skip-tls".to_string());
-        }
-        for w in &flags.workdirs {
-            args.push("--workdirs".to_string());
-            args.push(w.clone());
-        }
+        let args = background_args(&flags, &workdir_strings, &root_strings);
 
         let child_pid = daemon.spawn_detached(&binary, &args)?;
         if child_pid > 0 {
@@ -364,6 +369,7 @@ async fn run_start(
             port: flags.port,
             background: true,
             workdirs: workdir_strings,
+            workdir_roots: root_strings,
             refreshed_key: false,
         }));
     }
@@ -444,6 +450,7 @@ async fn run_start(
         port: flags.port,
         bind_ip,
         workdirs,
+        workdir_roots,
         dangerously_skip_auth: flags.dangerously_skip_auth,
         tls_material,
         env: session.env().clone(),
@@ -462,6 +469,7 @@ async fn run_start(
         port: flags.port,
         background: false,
         workdirs: workdir_strings,
+        workdir_roots: root_strings,
         refreshed_key: false,
     }))
 }
@@ -631,6 +639,99 @@ pub fn resolve_workdirs(
     Ok(out)
 }
 
+/// Forward the effective absolute allowlist to the detached process.
+fn background_args(
+    flags: &ApiServerStartFlags,
+    workdirs: &[String],
+    roots: &[String],
+) -> Vec<String> {
+    let mut args = vec![
+        "api".into(),
+        "start".into(),
+        "--port".into(),
+        flags.port.to_string(),
+    ];
+    if flags.dangerously_skip_auth {
+        args.push("--dangerously-skip-auth".into());
+    }
+    if flags.dangerously_skip_tls {
+        args.push("--dangerously-skip-tls".into());
+    }
+    for path in workdirs {
+        args.extend(["--workdirs".into(), path.clone()]);
+    }
+    for path in roots {
+        args.extend(["--workdir-root".into(), path.clone()]);
+    }
+    args
+}
+
+/// Roots must remain host-owned: an ancestor mount could replace another
+/// session's child directory with a symlink after validation.
+fn validate_root_mount_overlap(
+    workdirs: &[PathBuf],
+    roots: &[PathBuf],
+) -> Result<(), CommandError> {
+    for workdir in workdirs {
+        if roots.iter().any(|root| root.starts_with(workdir)) {
+            return Err(CommandError::Other(format!("API exact workdir '{}' contains a workdir root; roots and their ancestors must not be mounted by another session", workdir.display())));
+        }
+    }
+    Ok(())
+}
+
+/// Merge CLI and global-config roots, rejecting roots at or inside a git
+/// repository. Missing roots are kept for request-time canonicalization.
+pub fn resolve_workdir_roots(
+    cli: &[String],
+    config: &[String],
+    git: &crate::engine::git::GitEngine,
+    sink: &mut dyn UserMessageSink,
+) -> Result<Vec<PathBuf>, CommandError> {
+    use std::collections::BTreeSet;
+
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::new();
+    for raw in cli.iter().chain(config.iter()) {
+        let path = PathBuf::from(raw);
+        let root = path.canonicalize().unwrap_or_else(|_| path.clone());
+        if !seen.insert(root.clone()) {
+            continue;
+        }
+        if !root.exists() {
+            // Anchor relative entries now so they still refer to the same
+            // place when a later request runs, even if the CWD changes.
+            let root = if root.is_absolute() {
+                root
+            } else {
+                std::env::current_dir()
+                    .map_err(|e| {
+                        CommandError::Other(format!("cannot determine working directory: {e}"))
+                    })?
+                    .join(root)
+            };
+            sink.write_message(UserMessage {
+                level: MessageLevel::Warning,
+                text: format!(
+                    "API workdir root does not exist yet: {}; it is allowed once it is created",
+                    root.display(),
+                ),
+            });
+            out.push(root);
+        } else {
+            match git.resolve_root(&root) {
+                Ok(git_root) => return Err(CommandError::ApiWorkdirRootInvalid { root, git_root }),
+                Err(crate::engine::error::EngineError::Data(
+                    crate::data::error::DataError::GitRootNotFound { .. },
+                )) => {}
+                Err(error) => return Err(error.into()),
+            }
+            out.push(root);
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -701,6 +802,7 @@ mod tests {
         let flags = ApiServerStartFlags {
             port: 9876,
             workdirs: Vec::new(),
+            workdir_roots: Vec::new(),
             background: false,
             refresh_key: true,
             dangerously_skip_auth: false, // no auth configured, but refresh_key skips check
@@ -733,6 +835,7 @@ mod tests {
         let flags = ApiServerStartFlags {
             port: 9876,
             workdirs: Vec::new(),
+            workdir_roots: Vec::new(),
             background: false,
             refresh_key: false,
             dangerously_skip_auth: false,
@@ -801,6 +904,7 @@ mod tests {
         let flags = ApiServerStartFlags {
             port: 9876,
             workdirs: Vec::new(),
+            workdir_roots: Vec::new(),
             background: false,
             refresh_key: false,
             dangerously_skip_auth: true,
@@ -865,6 +969,7 @@ mod tests {
         let flags = ApiServerStartFlags {
             port: 9876,
             workdirs: Vec::new(),
+            workdir_roots: Vec::new(),
             background: false,
             refresh_key: false,
             dangerously_skip_auth: true,
@@ -1046,5 +1151,212 @@ mod tests {
         assert_eq!(frontend.messages.len(), 3, "must stream all lines");
         assert_eq!(frontend.messages[0], "line one");
         assert_eq!(frontend.messages[2], "line three");
+    }
+}
+
+#[cfg(test)]
+mod workdir_root_tests {
+    //! `resolve_workdir_roots` (WI 0134): merge precedence, startup refusal of
+    //! roots that are or sit inside a repository, and missing-root warnings.
+    use super::*;
+
+    #[derive(Default)]
+    struct WarnSink {
+        warnings: Vec<String>,
+    }
+    impl UserMessageSink for WarnSink {
+        fn write_message(&mut self, msg: UserMessage) {
+            if matches!(msg.level, MessageLevel::Warning) {
+                self.warnings.push(msg.text);
+            }
+        }
+        fn replay_queued(&mut self) {}
+    }
+
+    fn git_init(dir: &std::path::Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        let out = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+    }
+
+    fn s(p: &std::path::Path) -> String {
+        p.to_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn roots_merge_cli_first_then_config_and_dedupe() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let (ca, cb) = (
+            a.path().canonicalize().unwrap(),
+            b.path().canonicalize().unwrap(),
+        );
+        let git = crate::engine::git::GitEngine::new();
+        let mut sink = WarnSink::default();
+
+        let merged =
+            resolve_workdir_roots(&[s(a.path())], &[s(b.path()), s(a.path())], &git, &mut sink)
+                .unwrap();
+        assert_eq!(merged, vec![ca, cb], "CLI first, config second, deduped");
+        assert!(sink.warnings.is_empty());
+    }
+
+    #[test]
+    fn roots_config_only_and_cli_only_both_work() {
+        let a = tempfile::tempdir().unwrap();
+        let git = crate::engine::git::GitEngine::new();
+        let mut sink = WarnSink::default();
+        let ca = a.path().canonicalize().unwrap();
+        assert_eq!(
+            resolve_workdir_roots(&[s(a.path())], &[], &git, &mut sink).unwrap(),
+            vec![ca.clone()]
+        );
+        assert_eq!(
+            resolve_workdir_roots(&[], &[s(a.path())], &git, &mut sink).unwrap(),
+            vec![ca]
+        );
+        assert!(resolve_workdir_roots(&[], &[], &git, &mut sink)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn missing_root_warns_and_is_kept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().canonicalize().unwrap().join("not-yet");
+        let git = crate::engine::git::GitEngine::new();
+        let mut sink = WarnSink::default();
+
+        let roots = resolve_workdir_roots(&[s(&missing)], &[], &git, &mut sink).unwrap();
+        assert_eq!(roots, vec![missing.clone()]);
+        assert_eq!(sink.warnings.len(), 1);
+        assert!(
+            sink.warnings[0].contains("does not exist yet"),
+            "{:?}",
+            sink.warnings
+        );
+        assert!(sink.warnings[0].contains(&s(&missing)));
+    }
+
+    #[test]
+    fn root_that_is_a_git_repo_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().canonicalize().unwrap().join("repo");
+        git_init(&repo);
+        let git = crate::engine::git::GitEngine::new();
+        let err =
+            resolve_workdir_roots(&[s(&repo)], &[], &git, &mut WarnSink::default()).unwrap_err();
+        match err {
+            CommandError::ApiWorkdirRootInvalid { root, git_root } => {
+                assert_eq!(root, repo);
+                assert_eq!(git_root, repo);
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn root_inside_a_git_repo_is_refused_from_either_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().canonicalize().unwrap().join("repo");
+        git_init(&repo);
+        let inside = repo.join("sub");
+        std::fs::create_dir_all(&inside).unwrap();
+        let git = crate::engine::git::GitEngine::new();
+        for (cli, cfg) in [(vec![s(&inside)], vec![]), (vec![], vec![s(&inside)])] {
+            let err =
+                resolve_workdir_roots(&cli, &cfg, &git, &mut WarnSink::default()).unwrap_err();
+            assert!(
+                matches!(&err, CommandError::ApiWorkdirRootInvalid { git_root, .. } if *git_root == repo),
+                "got {err:?}"
+            );
+            assert_eq!(err.exit_code(), 2);
+        }
+    }
+
+    #[test]
+    fn repo_refused_as_root_is_still_usable_as_exact_workdir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().canonicalize().unwrap().join("repo");
+        git_init(&repo);
+        let git = crate::engine::git::GitEngine::new();
+        assert!(resolve_workdir_roots(&[s(&repo)], &[], &git, &mut WarnSink::default()).is_err());
+        assert_eq!(resolve_workdirs(&[s(&repo)], &[]).unwrap(), vec![repo]);
+    }
+
+    #[test]
+    fn exact_workdirs_cli_entries_precede_config_entries() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let merged = resolve_workdirs(&[s(a.path())], &[s(b.path())]).unwrap();
+        assert_eq!(
+            merged,
+            vec![
+                a.path().canonicalize().unwrap(),
+                b.path().canonicalize().unwrap()
+            ]
+        );
+    }
+    #[test]
+    fn background_arguments_use_effective_absolute_allowlist_paths() {
+        let flags = ApiServerStartFlags {
+            port: 9999,
+            workdirs: vec!["relative".into()],
+            workdir_roots: vec![".".into()],
+            background: true,
+            refresh_key: false,
+            dangerously_skip_auth: false,
+            dangerously_skip_tls: false,
+        };
+        let args = background_args(
+            &flags,
+            &["/absolute/checkout".into()],
+            &["/absolute/root".into(), "/absolute/missing".into()],
+        );
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--workdirs", "/absolute/checkout"]));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--workdir-root", "/absolute/root"]));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--workdir-root", "/absolute/missing"]));
+        assert!(!args.iter().any(|arg| arg == "." || arg == "relative"));
+    }
+
+    #[test]
+    fn exact_mount_cannot_contain_a_root_writable_by_another_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        assert!(
+            validate_root_mount_overlap(&[tmp.path().into()], std::slice::from_ref(&root)).is_err()
+        );
+        assert!(validate_root_mount_overlap(
+            std::slice::from_ref(&root),
+            std::slice::from_ref(&root)
+        )
+        .is_err());
+        assert!(validate_root_mount_overlap(&[root.join("child")], &[root]).is_ok());
+    }
+
+    #[test]
+    fn startup_git_errors_other_than_non_repository_are_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        std::fs::write(tmp.path().join(".git/config"), "[invalid config").unwrap();
+        let mut sink = crate::data::message::RecordingMessageSink::new();
+        let error = resolve_workdir_roots(
+            &[s(tmp.path())],
+            &[],
+            &crate::engine::git::GitEngine::new(),
+            &mut sink,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("git root discovery failed"));
     }
 }

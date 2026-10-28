@@ -1108,6 +1108,32 @@ pub(crate) fn parse_on_merge_failure(
     .transpose()
 }
 
+/// Typed `--on-existing-worktree`: `None` when not passed or `ask`, so the
+/// host asks (or answers from its headless profile).
+pub(crate) fn parse_on_existing_worktree(
+    raw: Option<String>,
+    command: &[&str],
+) -> Result<
+    Option<crate::command::commands::worktree_lifecycle::ExistingWorktreeDecision>,
+    CommandError,
+> {
+    use crate::command::commands::worktree_lifecycle::ExistingWorktreeDecision;
+    let Some(value) = raw else {
+        return Ok(None);
+    };
+    match value.trim().to_ascii_lowercase().as_str() {
+        "ask" => Ok(None),
+        "resume" => Ok(Some(ExistingWorktreeDecision::Resume)),
+        "recreate" => Ok(Some(ExistingWorktreeDecision::Recreate)),
+        "fail" => Ok(Some(ExistingWorktreeDecision::Fail)),
+        other => Err(CommandError::InvalidFlagValue {
+            command: command.iter().map(|part| (*part).to_string()).collect(),
+            flag: "on-existing-worktree".into(),
+            reason: format!("unknown value '{other}' (expected ask, resume, recreate or fail)"),
+        }),
+    }
+}
+
 /// Typed `--agent-flag` values: `None` when the flag was not passed (so config
 /// `agentFlags` applies), otherwise the list in order. Empty entries are
 /// rejected with the same rule config uses.
@@ -1134,6 +1160,29 @@ mod builtin_launch_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn on_existing_worktree_parses_all_choices_and_ask_as_unset() {
+        use crate::command::commands::worktree_lifecycle::ExistingWorktreeDecision as D;
+        let command = &["exec", "workflow"];
+        assert_eq!(parse_on_existing_worktree(None, command).unwrap(), None);
+        assert_eq!(
+            parse_on_existing_worktree(Some("ask".into()), command).unwrap(),
+            None
+        );
+        assert_eq!(
+            parse_on_existing_worktree(Some(" RESUME ".into()), command).unwrap(),
+            Some(D::Resume)
+        );
+        assert_eq!(
+            parse_on_existing_worktree(Some("Recreate".into()), command).unwrap(),
+            Some(D::Recreate)
+        );
+        assert_eq!(
+            parse_on_existing_worktree(Some("fail".into()), command).unwrap(),
+            Some(D::Fail)
+        );
+    }
 
     /// Recording frontend used by Dispatch unit tests.
     pub(super) struct FakeCommandFrontend {

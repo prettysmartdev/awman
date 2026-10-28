@@ -70,6 +70,10 @@ pub struct ExecWorkflowCommandFlags {
     pub on_dirty_merge_target: Option<crate::data::config::repo::OnDirtyMergeTarget>,
     /// `--on-merge-failure`; `None` lets config and the host default apply.
     pub on_merge_failure: Option<crate::data::config::repo::OnMergeFailure>,
+    /// `--on-existing-worktree`; `None` (absent or `ask`) lets the host ask or
+    /// answer from its headless profile.
+    pub on_existing_worktree:
+        Option<crate::command::commands::worktree_lifecycle::ExistingWorktreeDecision>,
 }
 
 pub use crate::data::config::leader_spec::LeaderSpec;
@@ -384,6 +388,10 @@ impl ExecWorkflowCommand {
             )?,
             on_merge_failure: crate::command::dispatch::parse_on_merge_failure(
                 ctx.flags.string("on-merge-failure"),
+                &ctx.path(),
+            )?,
+            on_existing_worktree: crate::command::dispatch::parse_on_existing_worktree(
+                ctx.flags.string("on-existing-worktree"),
                 &ctx.path(),
             )?,
         };

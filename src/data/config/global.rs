@@ -263,6 +263,7 @@ mod tests {
             api: Some(ApiConfig {
                 work_dirs: Some(vec!["/work".to_string()]),
                 always_non_interactive: Some(true),
+                ..Default::default()
             }),
             squad: Some(SquadConfig {
                 agents_to_models: Some(std::collections::HashMap::from([(

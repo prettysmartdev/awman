@@ -180,6 +180,16 @@ impl EffectiveConfig {
         Vec::new()
     }
 
+    /// Effective API workdir roots allowlist.
+    pub fn api_work_dir_roots(&self) -> Vec<String> {
+        if let Some(api_cfg) = self.global.api.as_ref() {
+            if let Some(roots) = api_cfg.work_dir_roots.as_ref() {
+                return roots.clone();
+            }
+        }
+        Vec::new()
+    }
+
     /// Effective `alwaysNonInteractive` setting.
     pub fn always_non_interactive(&self) -> bool {
         if let Some(value) = self.flags.non_interactive {
@@ -1051,6 +1061,41 @@ mod tests {
             GlobalConfig::default(),
         );
         assert!(ec.api_work_dirs().is_empty());
+    }
+
+    // ─── api_work_dir_roots ──────────────────────────────────────────────
+
+    #[test]
+    fn api_work_dir_roots_from_global() {
+        let global = GlobalConfig {
+            api: Some(ApiConfig {
+                work_dir_roots: Some(vec!["/srv/repos".to_string(), "/more".to_string()]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let ec = make_effective(
+            FlagConfig::default(),
+            EnvSnapshot::empty(),
+            RepoConfig::default(),
+            global,
+        );
+        assert_eq!(ec.api_work_dir_roots(), vec!["/srv/repos", "/more"]);
+        assert!(
+            ec.api_work_dirs().is_empty(),
+            "roots do not leak into workdirs"
+        );
+    }
+
+    #[test]
+    fn api_work_dir_roots_empty_when_not_set() {
+        let ec = make_effective(
+            FlagConfig::default(),
+            EnvSnapshot::empty(),
+            RepoConfig::default(),
+            GlobalConfig::default(),
+        );
+        assert!(ec.api_work_dir_roots().is_empty());
     }
 
     // ─── runtime ─────────────────────────────────────────────────────────────

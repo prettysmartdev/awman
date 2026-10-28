@@ -58,6 +58,17 @@ pub(super) const API_SERVER_START: CommandSpec = CommandSpec {
             optional: true,
         },
         FlagSpec {
+            long: "workdir-root",
+            short: None,
+            help: "Allowlisted root directories; any git repository cloned directly beneath one may be used as a session workdir (repeatable).",
+            kind: FlagKind::VecString,
+            default: FlagDefault::EmptyVec,
+            frontends: FrontendVisibility::CliOnly,
+            conflicts_with: &[],
+            implies: &[],
+            optional: true,
+        },
+        FlagSpec {
             long: "background",
             short: None,
             help: "Daemonize via the OS process manager.",

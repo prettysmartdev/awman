@@ -197,7 +197,7 @@ fn validate_and_coerce(field: &str, value: &str) -> Result<serde_json::Value, St
             crate::data::session::AgentName::new(value).map_err(|e| e.to_string())?;
             Ok(serde_json::Value::String(value.to_string()))
         }
-        "yoloDisallowedTools" | "overlays" | "api.workDirs" => {
+        "yoloDisallowedTools" | "overlays" | "api.workDirs" | "api.workDirRoots" => {
             // Parse comma-separated into array
             let items: Vec<&str> = value
                 .split(',')
@@ -983,6 +983,18 @@ fn write_config_field(
 mod tests {
     use super::*;
     use crate::data::config::config_json::{remove_config_field, set_config_field};
+
+    #[test]
+    fn api_work_dir_roots_parses_as_comma_list_like_work_dirs() {
+        for field in ["api.workDirs", "api.workDirRoots"] {
+            assert_eq!(
+                validate_and_coerce(field, " /a, /b ,,/c ").unwrap(),
+                serde_json::json!(["/a", "/b", "/c"]),
+                "{field}"
+            );
+        }
+        assert!(valid_field_names().contains(&"api.workDirRoots"));
+    }
 
     // ── config_field_value ───────────────────────────────────────────────────
 

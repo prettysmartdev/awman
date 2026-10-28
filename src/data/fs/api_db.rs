@@ -140,6 +140,9 @@ impl std::fmt::Display for WorkerId {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CommandResult {
     pub exit_code: Option<i32>,
+    /// Checkout retained after dispatch, for deliberate resume or cleanup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1321,6 +1324,7 @@ mod tests {
     #[test]
     fn command_result_serialises_pushed_as_absent_null_or_value() {
         let base = CommandResult {
+            worktree_path: None,
             exit_code: Some(0),
             error: None,
             error_status: None,

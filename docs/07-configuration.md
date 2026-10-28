@@ -99,6 +99,7 @@ Applies to every project on the machine unless a repo overrides it.
   "workers": 2,
   "api": {
     "workDirs": ["/home/user/my-project"],
+    "workDirRoots": ["/home/user/projects"],
     "alwaysNonInteractive": false
   },
   "squad": {
@@ -606,6 +607,7 @@ awman keeps global config and data (workflows, skills, worktrees, API state) und
 | `worktree.mergeFix.onFailure` | string | (unset → frontend default) | Default merge-failure action: `ask`, `agent`, or `keep` | yes |
 | `worktree.mergeFix.promptTemplate` | string | (unset → built-in prompt) | Default merge-fix prompt template path relative to the Git root | yes |
 | `api.workDirs` | string array | `[]` | Directories pre-approved for API session creation; merged with `--workdirs` at server start | yes |
+| `api.workDirRoots` | string array | `[]` | Root directories; any git repository cloned directly beneath a root may be used as a local session workdir. Merged with `--workdir-root` at server start. See [Working directory allowlist](09-api-and-remote-mode.md#working-directory-allowlist) | yes |
 | `api.alwaysNonInteractive` | bool | `false` | Force non-interactive mode for all dispatched commands (useful on API servers with no TTY) | no (edit file) |
 | `remote.defaultAddr` | string | (unset) | Default remote awman API server address | yes |
 | `remote.defaultAPIKey` | string | (unset) | API key for the default remote server; only sent when the target address matches `remote.defaultAddr` | yes |
@@ -649,6 +651,7 @@ awman keeps global config and data (workflows, skills, worktrees, API state) und
 | `work_items.dir` | repo only |
 | `work_items.template` | repo only |
 | `api.workDirs` | global only |
+| `api.workDirRoots` | global only |
 | `api.port` | global only (default 9876) |
 | `api.background` | global only |
 | `remote.defaultAddr` | global only in practice (see note) |
@@ -666,7 +669,7 @@ shown above directly.
 
 Value handling:
 
-- `yoloDisallowedTools`, `overlays`, `api.workDirs` — comma-separated values are stored as arrays; an empty string stores an empty array.
+- `yoloDisallowedTools`, `overlays`, `api.workDirs`, `api.workDirRoots` — comma-separated values are stored as arrays; an empty string stores an empty array.
 - `terminal_scrollback_lines`, `agentStuckTimeout`, `api.port`, `maxConcurrentAgents`, `dynamicWorkflows.maxConcurrentSteps` — must be positive integers; `0` is rejected.
 - `agent`, `default_agent` — validated against the built-in agents and the custom agents defined in the scope being written.
 - `dynamicWorkflows.defaultLeader` — must be in `agent::model` format (exactly two non-empty, non-whitespace components).

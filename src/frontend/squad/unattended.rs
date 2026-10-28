@@ -673,6 +673,14 @@ impl WorktreeLifecycleFrontend for UnattendedFrontend {
         Ok(self.headless.existing_worktree())
     }
 
+    fn existing_worktree_after_resume(
+        &mut self,
+        _path: &Path,
+        _branch: &str,
+    ) -> Result<ExistingWorktreeDecision, CommandError> {
+        Ok(self.headless.existing_worktree())
+    }
+
     fn report_worktree_created(&mut self, path: &Path, branch: &str) {
         tracing::info!(task = %self.task, run_id = %self.run_id, path = %path.display(), branch, "squad worktree created");
     }

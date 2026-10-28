@@ -358,6 +358,18 @@ impl WorktreeLifecycleFrontend for CliParallelFrontend {
         self.inner.report_worktree_created(path, branch);
     }
 
+    fn report_worktree_resumed(&mut self, path: &Path, branch: &str) {
+        self.inner.report_worktree_resumed(path, branch);
+    }
+
+    fn existing_worktree_after_resume(
+        &mut self,
+        path: &Path,
+        branch: &str,
+    ) -> Result<ExistingWorktreeDecision, CommandError> {
+        self.inner.existing_worktree_after_resume(path, branch)
+    }
+
     fn ask_post_workflow_action(
         &mut self,
         prompt: &PostWorkflowWorktreePrompt,

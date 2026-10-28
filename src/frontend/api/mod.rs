@@ -41,6 +41,7 @@ pub async fn serve(runtime: ApiServerRuntime) -> Result<(), CommandError> {
         store: runtime.store,
         paths: runtime.paths,
         workdirs: runtime.workdirs,
+        workdir_roots: runtime.workdir_roots,
         started_at: runtime.started_at,
         task_handles: runtime.task_handles,
         auth_mode: runtime.auth_mode,

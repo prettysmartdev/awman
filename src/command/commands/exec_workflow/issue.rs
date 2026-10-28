@@ -57,14 +57,14 @@ pub(crate) fn find_work_item_file(
 /// overlay mounts the main `.git` directory at its host-absolute path so the
 /// pointer resolves identically inside the container.
 ///
-/// Returns `Ok(None)` when `worktree_path` is a regular repo or has no `.git`.
+/// Both the pointer and its administrative backlink must belong to
+/// `git_root`; a tampered pointer never chooses a host mount source.
 pub(crate) fn worktree_git_overlay(
+    git: &crate::engine::git::GitEngine,
+    git_root: &std::path::Path,
     worktree_path: &std::path::Path,
 ) -> Result<Option<crate::engine::container::options::OverlaySpec>, EngineError> {
-    let main_git_dir = match crate::engine::git::resolve_worktree_git_dir(worktree_path)? {
-        Some(p) => p,
-        None => return Ok(None),
-    };
+    let main_git_dir = git.validate_worktree_owner(git_root, worktree_path)?;
     Ok(Some(crate::engine::container::options::OverlaySpec {
         host_path: main_git_dir.clone(),
         container_path: main_git_dir,

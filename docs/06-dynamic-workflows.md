@@ -279,7 +279,7 @@ awman exec workflow --dynamic --work-item 42
 │ A previous dynamic run left resumable state on disk.       │
 │                                                            │
 │ Work item: 0042                                            │
-│ Worktree: ~/.awman/worktrees/myproj/0042                   │
+│ Worktree: ~/.awman/worktrees/myproj-3fa91c2e/0042                   │
 │ Progress: 2/5 step(s) completed.                           │
 │                                                            │
 │ Resume it from one of these steps, or start over?          │
@@ -295,9 +295,9 @@ awman exec workflow --dynamic --work-item 42
 
 This is the same prompt a plain `exec workflow` shows when it finds saved state — see [Resuming](05-workflows.md#resuming). The three offered start points are named after the real steps in the saved workflow: the one that failed, its predecessor, and its successor. Picking one rewinds the saved state — everything from that step onwards runs again; earlier steps that never succeeded are marked skipped so they do not block their dependents. The only thing dynamic mode adds is that accepting the resume also skips the leader-design pass entirely, so a resume costs no leader tokens at all.
 
-Accepting a resume also answers the [existing-worktree question](05-workflows.md#worktrees): the run you are resuming lives in that worktree, so awman reuses it rather than asking whether to recreate it.
+For interactive hosts, accepting a resume also answers the [existing-worktree question](05-workflows.md#worktrees), so awman reuses that checkout without a second dialog. An explicit `--on-existing-worktree` policy takes precedence: `recreate` discards the saved workflow and state and runs a fresh leader pass; `fail` stops before any resume prompt or state change. The API defaults to `fail` even when saved dynamic state exists, so API clients must select `resume` explicitly. Squad and piped CLI continue to default to `resume`.
 
-Choosing **`f`** deletes the saved workflow *and* its state, then designs a new workflow as usual — a leader pass you have already paid for is gone for good, so it is the one answer you have to type. The worktree itself is left alone; you are asked separately whether to reuse or recreate it.
+Choosing **`f`** deletes the saved workflow *and* its state, then designs a new workflow as usual — a leader pass you have already paid for is gone for good, so it is the one answer you have to type. The worktree itself is left alone; you are asked separately whether to reuse or recreate it (or answer in advance with `--on-existing-worktree`).
 
 Pressing **Esc cancels the command**. Nothing is designed, nothing is deleted, no worktree is touched, and the same offer is waiting the next time you run it. The prompt is raised before the worktree is prepared and before any leader launches, so there is nothing to undo.
 

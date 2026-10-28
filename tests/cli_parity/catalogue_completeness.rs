@@ -136,3 +136,14 @@ fn config_get_has_field_argument() {
     let cmd = cat().lookup(&["config", "get"]).unwrap();
     assert!(!cmd.arguments.is_empty());
 }
+
+#[test]
+fn api_start_has_workdir_root_flag() {
+    let cmd = cat().lookup(&["api", "start"]).unwrap();
+    let flag = cmd.find_flag("workdir-root").expect("workdir-root flag");
+    assert!(
+        matches!(flag.kind, FlagKind::VecString),
+        "repeatable flag, like workdirs"
+    );
+    assert!(cmd.find_flag("workdirs").is_some(), "workdirs is unchanged");
+}

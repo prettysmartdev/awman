@@ -25,8 +25,53 @@ pub enum PreWorktreeDecision {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExistingWorktreeDecision {
+    /// Keep the worktree and its branch as they are and run in it.
     Resume,
+    /// Remove the worktree, force-delete its branch (and the branch's
+    /// commits), then create a fresh worktree from the current HEAD.
     Recreate,
+    /// Stop with [`CommandError::WorktreeExists`]; nothing is changed.
+    Fail,
+}
+
+/// How [`WorktreeLifecycle::prepare_with_existing`] settles the
+/// existing-worktree question.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExistingWorktreeChoice {
+    /// No flag, no accepted resume: `ask_existing_worktree` decides.
+    Ask,
+    /// `--on-existing-worktree resume|recreate|fail`: wins on every host.
+    Explicit(ExistingWorktreeDecision),
+    /// The caller already accepted a workflow/dynamic resume for this worktree.
+    /// `existing_worktree_after_resume` decides: interactive hosts answer
+    /// `Resume` (not asked twice); headless hosts answer their profile
+    /// (API `Fail`, squad and piped CLI `Resume`).
+    ResumeAccepted,
+}
+
+pub const EXISTING_WORKTREE_TITLE: &str = "Existing worktree";
+pub const EXISTING_WORKTREE_KEYS: &[(char, &str)] = &[
+    ('r', "Resume"),
+    ('n', "Recreate (discard branch and commits)"),
+];
+
+/// Body of the existing-worktree dialog. The frontend only renders it.
+pub fn existing_worktree_body(path: &Path, branch: &str) -> String {
+    format!(
+        "Worktree exists at {path} (branch: {branch}).\n\nResume keeps it as it is. \
+         Recreate deletes the worktree and the branch '{branch}' with all of its commits, \
+         then starts from the current HEAD.",
+        path = path.display(),
+    )
+}
+
+/// One-line existing-worktree prompt for line-oriented frontends.
+pub fn existing_worktree_prompt_line(path: &Path, branch: &str) -> String {
+    format!(
+        "awman: worktree {} already exists for branch {branch}. \
+         [r]esume / [R]ecreate (deletes the branch and its commits)?",
+        path.display(),
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -252,6 +297,22 @@ pub trait WorktreeLifecycleFrontend: GitFrontend + Send + Sync {
 
     fn report_worktree_created(&mut self, path: &Path, branch: &str);
 
+    /// An existing worktree is being reused as it is. Hosts that track the
+    /// active worktree record it here; the default does nothing.
+    fn report_worktree_resumed(&mut self, _path: &Path, _branch: &str) {}
+
+    /// The caller already accepted a workflow/dynamic resume, which implies
+    /// the worktree is reused. Interactive hosts keep that answer (the
+    /// default); headless hosts return their profile's answer, so the API
+    /// still fails closed unless the client passed `--on-existing-worktree`.
+    fn existing_worktree_after_resume(
+        &mut self,
+        _path: &Path,
+        _branch: &str,
+    ) -> Result<ExistingWorktreeDecision, CommandError> {
+        Ok(ExistingWorktreeDecision::Resume)
+    }
+
     fn ask_post_workflow_action(
         &mut self,
         prompt: &PostWorkflowWorktreePrompt,
@@ -296,6 +357,7 @@ pub struct WorktreeLifecycle {
     git_engine: Arc<GitEngine>,
     git_root: PathBuf,
     worktree_path: PathBuf,
+    creation_path: PathBuf,
     branch: String,
 }
 
@@ -349,11 +411,18 @@ impl WorktreeLifecycle {
         let worktree_path = git_engine
             .worktree_path_named(&git_root, workflow_name)
             .map_err(CommandError::from)?;
+        let creation_path = crate::data::worktree_paths::WorktreePaths::from_home()?.for_workflow(
+            &git_root
+                .canonicalize()
+                .map_err(|e| CommandError::Other(e.to_string()))?,
+            workflow_name,
+        );
         let branch = git_engine.branch_name_for_workflow(workflow_name);
         Ok(Self {
             git_engine,
             git_root,
             worktree_path,
+            creation_path,
             branch,
         })
     }
@@ -366,11 +435,18 @@ impl WorktreeLifecycle {
         let worktree_path = git_engine
             .worktree_path(&git_root, work_item)
             .map_err(CommandError::from)?;
+        let creation_path = crate::data::worktree_paths::WorktreePaths::from_home()?.for_work_item(
+            &git_root
+                .canonicalize()
+                .map_err(|e| CommandError::Other(e.to_string()))?,
+            work_item,
+        );
         let branch = git_engine.branch_name_for_work_item(work_item);
         Ok(Self {
             git_engine,
             git_root,
             worktree_path,
+            creation_path,
             branch,
         })
     }
@@ -415,25 +491,57 @@ impl WorktreeLifecycle {
         }
     }
 
-    pub async fn prepare(
+    /// Settle fail/fresh policy before reading or changing saved run state.
+    /// The accepted-resume hook supplies headless defaults without prompting
+    /// interactive users a second time.
+    pub fn should_offer_resume(
         &self,
         frontend: &mut dyn WorktreeLifecycleFrontend,
-    ) -> Result<PathBuf, CommandError> {
-        self.prepare_with_existing(frontend, None).await
+        explicit: Option<ExistingWorktreeDecision>,
+    ) -> Result<bool, CommandError> {
+        if self.worktree_path.exists() {
+            let decision = match explicit {
+                Some(d) => d,
+                None => {
+                    frontend.existing_worktree_after_resume(&self.worktree_path, &self.branch)?
+                }
+            };
+            if decision == ExistingWorktreeDecision::Fail {
+                return Err(CommandError::WorktreeExists {
+                    path: self.worktree_path.clone(),
+                    branch: self.branch.clone(),
+                });
+            }
+            self.git_engine
+                .validate_worktree_owner(&self.git_root, &self.worktree_path)?;
+            return Ok(decision != ExistingWorktreeDecision::Recreate);
+        }
+        Ok(explicit != Some(ExistingWorktreeDecision::Recreate))
     }
 
-    /// [`Self::prepare`], with the existing-worktree question already answered.
-    ///
-    /// A caller that has just asked the user a question which *implies* the
-    /// answer — the workflow resume prompt, which only makes sense against the
-    /// worktree that is already there (WI-0115 §2) — passes `Some(Resume)`
-    /// rather than asking a second, near-identical question. It is not only
-    /// redundant: `Recreate` deletes the worktree, and with it the state the
-    /// accepted resume just rewound. `None` asks as usual.
-    pub async fn prepare_with_existing(
-        &self,
+    pub async fn prepare(
+        &mut self,
         frontend: &mut dyn WorktreeLifecycleFrontend,
-        preselected: Option<ExistingWorktreeDecision>,
+    ) -> Result<PathBuf, CommandError> {
+        self.prepare_with_existing(frontend, ExistingWorktreeChoice::Ask)
+            .await
+    }
+
+    /// [`Self::prepare`], with the existing-worktree question possibly
+    /// already settled.
+    ///
+    /// `Explicit` (`--on-existing-worktree`) wins on every host. A caller that
+    /// has just asked a question which *implies* the answer — the workflow
+    /// resume prompt, which only makes sense against the worktree that is
+    /// already there (WI-0115 §2) — passes `ResumeAccepted` rather than asking
+    /// a second, near-identical question. It is not only redundant:
+    /// `Recreate` deletes the worktree, and with it the state the accepted
+    /// resume just rewound. Headless hosts still answer that case from their
+    /// profile (WI 0134), so the API fails closed. `Ask` asks as usual.
+    pub async fn prepare_with_existing(
+        &mut self,
+        frontend: &mut dyn WorktreeLifecycleFrontend,
+        choice: ExistingWorktreeChoice,
     ) -> Result<PathBuf, CommandError> {
         if self.git_engine.is_detached_head(&self.git_root) {
             frontend.write_message(UserMessage {
@@ -442,20 +550,43 @@ impl WorktreeLifecycle {
             });
         }
         if self.worktree_path.exists() {
-            let decision = match preselected {
-                Some(d) => d,
-                None => frontend.ask_existing_worktree(&self.worktree_path, &self.branch)?,
+            let decision = match choice {
+                ExistingWorktreeChoice::Explicit(d) => d,
+                ExistingWorktreeChoice::Ask => {
+                    frontend.ask_existing_worktree(&self.worktree_path, &self.branch)?
+                }
+                ExistingWorktreeChoice::ResumeAccepted => {
+                    frontend.existing_worktree_after_resume(&self.worktree_path, &self.branch)?
+                }
             };
             match decision {
                 ExistingWorktreeDecision::Resume => {
+                    self.git_engine
+                        .validate_worktree_owner(&self.git_root, &self.worktree_path)?;
+                    frontend.report_worktree_resumed(&self.worktree_path, &self.branch);
                     return Ok(self.worktree_path.clone());
                 }
                 ExistingWorktreeDecision::Recreate => {
+                    self.git_engine
+                        .validate_worktree_owner(&self.git_root, &self.worktree_path)?;
+                    self.git_engine.delete_recreated_branch_logged(
+                        &self.git_root,
+                        &self.worktree_path,
+                        &self.branch,
+                        frontend,
+                    )?;
                     self.git_engine.remove_worktree_logged(
                         &self.git_root,
                         &self.worktree_path,
                         frontend,
                     )?;
+                    self.worktree_path = self.creation_path.clone();
+                }
+                ExistingWorktreeDecision::Fail => {
+                    return Err(CommandError::WorktreeExists {
+                        path: self.worktree_path.clone(),
+                        branch: self.branch.clone(),
+                    });
                 }
             }
         }
@@ -932,6 +1063,7 @@ impl WorktreeLifecycle {
         Self {
             git_engine,
             git_root,
+            creation_path: worktree_path.clone(),
             worktree_path,
             branch,
         }
@@ -1148,7 +1280,7 @@ mod tests {
         let git_root = repo.path().to_path_buf();
         let wt_path = wt_dir.path().join("wt");
         let engine = Arc::new(GitEngine::new());
-        let lifecycle = WorktreeLifecycle::new_for_test(
+        let mut lifecycle = WorktreeLifecycle::new_for_test(
             engine,
             git_root,
             wt_path.clone(),
@@ -1173,7 +1305,7 @@ mod tests {
         let git_root = repo.path().to_path_buf();
         let wt_path = wt_dir.path().join("wt");
         let engine = Arc::new(GitEngine::new());
-        let lifecycle = WorktreeLifecycle::new_for_test(
+        let mut lifecycle = WorktreeLifecycle::new_for_test(
             engine,
             git_root.clone(),
             wt_path.clone(),
@@ -1201,7 +1333,7 @@ mod tests {
         let git_root = repo.path().to_path_buf();
         let wt_path = wt_dir.path().join("wt");
         let engine = Arc::new(GitEngine::new());
-        let lifecycle = WorktreeLifecycle::new_for_test(
+        let mut lifecycle = WorktreeLifecycle::new_for_test(
             engine,
             git_root.clone(),
             wt_path.clone(),
@@ -1227,7 +1359,7 @@ mod tests {
         let git_root = repo.path().to_path_buf();
         let wt_path = wt_dir.path().join("wt");
         let engine = Arc::new(GitEngine::new());
-        let lifecycle = WorktreeLifecycle::new_for_test(
+        let mut lifecycle = WorktreeLifecycle::new_for_test(
             engine,
             git_root,
             wt_path.clone(),
@@ -1257,7 +1389,7 @@ mod tests {
         // Write a sentinel that must survive Resume (no recreation).
         std::fs::write(wt_path.join("sentinel.txt"), "existing").unwrap();
 
-        let lifecycle =
+        let mut lifecycle =
             WorktreeLifecycle::new_for_test(engine, git_root, wt_path.clone(), branch.to_string());
         let mut fe = RecordingWorktreeLifecycleFrontend::new();
         fe.existing_worktree_response = ExistingWorktreeDecision::Resume;
@@ -1275,6 +1407,191 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prepare_existing_worktree_fail_names_path_and_explicit_flag_choices() {
+        let repo = tempfile::tempdir().unwrap();
+        let wt_dir = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let git_root = repo.path().to_path_buf();
+        let wt_path = wt_dir.path().join("existing");
+        let branch = "awman/test-fail-existing";
+        let engine = Arc::new(GitEngine::new());
+        engine.create_worktree(&git_root, &wt_path, branch).unwrap();
+        let mut lifecycle =
+            WorktreeLifecycle::new_for_test(engine, git_root, wt_path.clone(), branch.to_string());
+        let mut frontend = RecordingWorktreeLifecycleFrontend::new();
+
+        let error = lifecycle
+            .prepare_with_existing(
+                &mut frontend,
+                ExistingWorktreeChoice::Explicit(ExistingWorktreeDecision::Fail),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, CommandError::WorktreeExists { .. }));
+        let message = error.to_string();
+        assert!(
+            message.contains(&wt_path.display().to_string()),
+            "{message}"
+        );
+        assert!(
+            message.contains("--on-existing-worktree resume"),
+            "{message}"
+        );
+        assert!(
+            message.contains("--on-existing-worktree recreate"),
+            "{message}"
+        );
+        assert!(wt_path.exists(), "Fail must leave the worktree untouched");
+    }
+
+    #[tokio::test]
+    async fn prepare_existing_worktree_recreate_deletes_branch_commits() {
+        let repo = tempfile::tempdir().unwrap();
+        let wt_dir = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let git_root = repo.path().to_path_buf();
+        let wt_path = wt_dir.path().join("existing");
+        let branch = "awman/test-recreate-fresh";
+        let engine = Arc::new(GitEngine::new());
+        engine.create_worktree(&git_root, &wt_path, branch).unwrap();
+        std::fs::write(wt_path.join("old-commit.txt"), "old\n").unwrap();
+        for args in [
+            vec!["add", "old-commit.txt"],
+            vec!["commit", "-m", "old worktree commit"],
+        ] {
+            let output = SysCmd::new("git")
+                .args(&args)
+                .current_dir(&wt_path)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        let mut lifecycle = WorktreeLifecycle::new_for_test(
+            engine.clone(),
+            git_root.clone(),
+            wt_path.clone(),
+            branch.to_string(),
+        );
+        let mut frontend = RecordingWorktreeLifecycleFrontend::new();
+        let result = lifecycle
+            .prepare_with_existing(
+                &mut frontend,
+                ExistingWorktreeChoice::Explicit(ExistingWorktreeDecision::Recreate),
+            )
+            .await;
+
+        assert!(result.is_ok(), "Recreate must succeed: {result:?}");
+        assert_eq!(
+            git_log_count(&wt_path),
+            1,
+            "only the original HEAD commit remains"
+        );
+        assert!(!wt_path.join("old-commit.txt").exists());
+        let branch_exists = SysCmd::new("git")
+            .args([
+                "show-ref",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{branch}"),
+            ])
+            .current_dir(&git_root)
+            .status()
+            .unwrap()
+            .success();
+        assert!(branch_exists, "fresh worktree creation makes a new branch");
+    }
+
+    #[tokio::test]
+    async fn prepare_recreate_surfaces_git_error_when_branch_is_checked_out_elsewhere() {
+        let repo = tempfile::tempdir().unwrap();
+        let wt_dir = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let git_root = repo.path().to_path_buf();
+        let assigned_branch = "awman/test-checked-out-elsewhere";
+        let elsewhere = wt_dir.path().join("elsewhere");
+        let target = wt_dir.path().join("target");
+        let engine = Arc::new(GitEngine::new());
+        engine
+            .create_worktree(&git_root, &elsewhere, assigned_branch)
+            .unwrap();
+        // The existing target is a different branch; Recreate then attempts
+        // to delete `assigned_branch`, which git refuses while `elsewhere`
+        // still has it checked out.
+        engine
+            .create_worktree(&git_root, &target, "awman/test-target")
+            .unwrap();
+        let mut lifecycle = WorktreeLifecycle::new_for_test(
+            engine,
+            git_root,
+            target.clone(),
+            assigned_branch.to_string(),
+        );
+        let mut frontend = RecordingWorktreeLifecycleFrontend::new();
+
+        let error = lifecycle
+            .prepare_with_existing(
+                &mut frontend,
+                ExistingWorktreeChoice::Explicit(ExistingWorktreeDecision::Recreate),
+            )
+            .await
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("checked out"),
+            "expected git's branch-in-use error: {message}"
+        );
+        assert!(elsewhere.exists(), "the other checkout remains intact");
+        assert!(
+            target.exists(),
+            "branch deletion failure preserves the target"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_recreate_keeps_existing_worktree_when_branch_is_checked_out_elsewhere() {
+        let repo = tempfile::tempdir().unwrap();
+        let wt_dir = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let git_root = repo.path().to_path_buf();
+        let assigned_branch = "awman/test-checked-out-preserved";
+        let elsewhere = wt_dir.path().join("elsewhere");
+        let target = wt_dir.path().join("target");
+        let engine = Arc::new(GitEngine::new());
+        engine
+            .create_worktree(&git_root, &elsewhere, assigned_branch)
+            .unwrap();
+        engine
+            .create_worktree(&git_root, &target, "awman/test-target-preserved")
+            .unwrap();
+        let mut lifecycle = WorktreeLifecycle::new_for_test(
+            engine,
+            git_root,
+            target.clone(),
+            assigned_branch.to_string(),
+        );
+        let mut frontend = RecordingWorktreeLifecycleFrontend::new();
+
+        let error = lifecycle
+            .prepare_with_existing(
+                &mut frontend,
+                ExistingWorktreeChoice::Explicit(ExistingWorktreeDecision::Recreate),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("checked out"));
+        assert!(
+            target.exists(),
+            "failed recreate should preserve the existing worktree"
+        );
+        assert!(elsewhere.exists());
+    }
+
+    #[tokio::test]
     async fn prepare_existing_worktree_recreate_removes_then_recreates() {
         let repo = tempfile::tempdir().unwrap();
         let wt_dir = tempfile::tempdir().unwrap();
@@ -1286,7 +1603,7 @@ mod tests {
         engine.create_worktree(&git_root, &wt_path, branch).unwrap();
         std::fs::write(wt_path.join("sentinel.txt"), "original").unwrap();
 
-        let lifecycle =
+        let mut lifecycle =
             WorktreeLifecycle::new_for_test(engine, git_root, wt_path.clone(), branch.to_string());
         let mut fe = RecordingWorktreeLifecycleFrontend::new();
         fe.existing_worktree_response = ExistingWorktreeDecision::Recreate;
@@ -1317,7 +1634,7 @@ mod tests {
         // Make the main branch dirty AFTER the worktree already exists.
         std::fs::write(repo.path().join("dirty.txt"), "dirty").unwrap();
 
-        let lifecycle = WorktreeLifecycle::new_for_test(
+        let mut lifecycle = WorktreeLifecycle::new_for_test(
             engine,
             git_root.clone(),
             wt_path.clone(),
@@ -1356,7 +1673,7 @@ mod tests {
         engine.create_worktree(&git_root, &wt_path, branch).unwrap();
         std::fs::write(repo.path().join("dirty.txt"), "dirty").unwrap();
 
-        let lifecycle =
+        let mut lifecycle =
             WorktreeLifecycle::new_for_test(engine, git_root, wt_path.clone(), branch.to_string());
         let mut fe = RecordingWorktreeLifecycleFrontend::new();
         fe.existing_worktree_response = ExistingWorktreeDecision::Recreate;
@@ -1392,7 +1709,7 @@ mod tests {
         let git_root = repo.path().to_path_buf();
         let wt_path = wt_dir.path().join("wt");
         let engine = Arc::new(GitEngine::new());
-        let lifecycle = WorktreeLifecycle::new_for_test(
+        let mut lifecycle = WorktreeLifecycle::new_for_test(
             engine,
             git_root,
             wt_path,
@@ -2513,15 +2830,15 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn squash_failed_commit_then_discarded_index_is_not_success() {
-        use std::os::unix::fs::PermissionsExt;
         let (repo, _wt, lifecycle, wt_path) = dirty_target_fixture("awman/failed-commit");
         std::fs::remove_file(repo.path().join("scratch.txt")).unwrap();
-        let hook = repo.path().join(".git/hooks/pre-commit");
-        std::fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
-        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Hooks are disabled for host Git. Force a real commit I/O failure
+        // instead, after the squash has populated the index.
+        let message = repo.path().join(".git/COMMIT_EDITMSG");
+        std::fs::remove_file(&message).unwrap();
+        std::fs::create_dir(&message).unwrap();
         let mut fe = merging_frontend();
         let FinalizeOutcome::MergeFixRequested(failure) = lifecycle
             .finalize(
@@ -2594,6 +2911,129 @@ mod tests {
                 "agent policy never asks again"
             );
         }
+    }
+    #[tokio::test]
+    async fn recreate_owned_legacy_uses_hashed_creation_path_for_both_names() {
+        use crate::data::worktree_paths::WorktreePaths;
+        for named in [false, true] {
+            let repo = tempfile::tempdir().unwrap();
+            let home = tempfile::tempdir().unwrap();
+            init_repo(repo.path());
+            let root = repo.path().canonicalize().unwrap();
+            let paths = WorktreePaths::with_home(home.path());
+            let (legacy, hashed, branch) = if named {
+                (
+                    paths.legacy_for_workflow(&root, "build"),
+                    paths.for_workflow(&root, "build"),
+                    "awman/workflow-build",
+                )
+            } else {
+                (
+                    paths.legacy_for_work_item(&root, 134),
+                    paths.for_work_item(&root, 134),
+                    "awman/work-item-0134",
+                )
+            };
+            let git = Arc::new(GitEngine::new());
+            git.create_worktree(&root, &legacy, branch).unwrap();
+            let mut lifecycle =
+                WorktreeLifecycle::new_for_test(git.clone(), root, legacy.clone(), branch.into());
+            lifecycle.creation_path = hashed.clone();
+            let mut frontend = RecordingWorktreeLifecycleFrontend::new();
+            let result = lifecycle
+                .prepare_with_existing(
+                    &mut frontend,
+                    ExistingWorktreeChoice::Explicit(ExistingWorktreeDecision::Recreate),
+                )
+                .await
+                .unwrap();
+            assert_eq!(result, hashed);
+            assert_eq!(lifecycle.worktree_path(), hashed);
+            assert!(!legacy.exists());
+            assert_eq!(frontend.worktree_created_calls[0].0, hashed);
+            // Finalization follows the effective hashed path too.
+            assert!(git
+                .validate_worktree_owner(lifecycle.git_root(), lifecycle.worktree_path())
+                .is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn recreate_refuses_unexpected_target_branch_without_deleting_either_branch() {
+        let repo = tempfile::tempdir().unwrap();
+        let wt_dir = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let engine = Arc::new(GitEngine::new());
+        let target = wt_dir.path().join("wt");
+        engine
+            .create_worktree(repo.path(), &target, "actual")
+            .unwrap();
+        // The deterministic branch exists, but the user switched the target
+        // to a different branch after the previous run.
+        assert!(SysCmd::new("git")
+            .args(["branch", "assigned"])
+            .current_dir(repo.path())
+            .status()
+            .unwrap()
+            .success());
+        std::fs::write(target.join("untracked"), "preserve").unwrap();
+        let mut lifecycle = WorktreeLifecycle::new_for_test(
+            engine.clone(),
+            repo.path().into(),
+            target.clone(),
+            "assigned".into(),
+        );
+        let mut fe = RecordingWorktreeLifecycleFrontend::new();
+        assert!(lifecycle
+            .prepare_with_existing(
+                &mut fe,
+                ExistingWorktreeChoice::Explicit(ExistingWorktreeDecision::Recreate)
+            )
+            .await
+            .is_err());
+        assert!(engine.branch_exists(repo.path(), "actual"));
+        assert!(engine.branch_exists(repo.path(), "assigned"));
+        assert_eq!(engine.current_branch(&target).as_deref(), Some("actual"));
+        assert_eq!(
+            std::fs::read_to_string(target.join("untracked")).unwrap(),
+            "preserve"
+        );
+    }
+
+    #[tokio::test]
+    async fn recreate_branch_lock_error_restores_head_and_preserves_untracked_work() {
+        let repo = tempfile::tempdir().unwrap();
+        let target_dir = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let git = Arc::new(GitEngine::new());
+        let target = target_dir.path().join("wt");
+        let branch = "awman/locked";
+        git.create_worktree(repo.path(), &target, branch).unwrap();
+        std::fs::write(target.join("untracked"), "keep me").unwrap();
+        std::fs::write(
+            repo.path().join(".git/refs/heads/awman/locked.lock"),
+            "lock",
+        )
+        .unwrap();
+        let mut lifecycle = WorktreeLifecycle::new_for_test(
+            git.clone(),
+            repo.path().into(),
+            target.clone(),
+            branch.into(),
+        );
+        let mut fe = RecordingWorktreeLifecycleFrontend::new();
+        assert!(lifecycle
+            .prepare_with_existing(
+                &mut fe,
+                ExistingWorktreeChoice::Explicit(ExistingWorktreeDecision::Recreate)
+            )
+            .await
+            .is_err());
+        assert_eq!(
+            std::fs::read_to_string(target.join("untracked")).unwrap(),
+            "keep me"
+        );
+        assert_eq!(git.current_branch(&target).as_deref(), Some(branch));
     }
 }
 

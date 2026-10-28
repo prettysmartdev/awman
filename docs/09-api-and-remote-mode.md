@@ -385,7 +385,7 @@ awman api start --dangerously-skip-tls --port 9876 --workdirs /repo
 awman api start --dangerously-skip-auth --port 9876 --workdirs /repo
 ```
 
-`--workdirs` accepts one or more absolute paths (repeat the flag for multiple values). Only working directories on the allowlist can be used to create sessions — requests with any other path are rejected with HTTP 403. See [Working directory allowlist](#working-directory-allowlist).
+`--workdirs` accepts one or more absolute paths (repeat the flag for multiple values). `--workdir-root` (also repeatable) names a directory whose direct-child Git repositories are allowed. Only working directories on the allowlist can be used to create sessions — requests with any other path are rejected with HTTP 403. See [Working directory allowlist](#working-directory-allowlist).
 
 **Start flags related to authentication and transport:**
 
@@ -576,12 +576,29 @@ The key hash is stored at `~/.awman/api/api_key.hash` with mode `0o600` (owner r
 
 The server maintains a strict allowlist of working directories. Any session creation request that specifies a path not on the allowlist is rejected with HTTP 403.
 
-**At startup**, the allowlist is populated from two sources:
+There are two kinds of entry:
 
-1. `--workdirs` flags passed to `awman api start`
-2. `api.workDirs` in the global config (`~/.awman/config.json`)
+- **Workdirs** name one directory each. Sources: `--workdirs` flags passed to `awman api start` and `api.workDirs` in the global config (`~/.awman/config.json`).
+- **Roots** name a directory that *contains* repositories. Sources: `--workdir-root` flags (repeatable) and `api.workDirRoots` in the global config. A request is accepted when its `workdir` is a repository cloned **directly** beneath a root — so a client can clone `/srv/repos/app` and create a session on it without restarting the server.
 
-Both sources are merged. Every path is resolved to its canonical form (symlinks resolved, trailing slashes stripped) via `std::fs::canonicalize`. If a listed path does not exist at startup, a warning is logged but the server still starts — the path stays on the allowlist in case the directory is created later.
+All sources of each kind are merged. A request is allowed if it matches any workdir entry or any root.
+
+```sh
+awman api start --workdir-root /srv/repos
+awman config set --global api.workDirRoots "/srv/repos,/home/user/projects"
+```
+
+A directory under a root is accepted only when all of these hold:
+
+1. It is a direct child of the root — not a grandchild, and not the root itself.
+2. It is its own Git root (its top-level directory is the child itself, not a parent repository).
+3. Its `.git` is a real directory. A linked worktree (where `.git` is a file) or a symlinked `.git` is refused.
+
+A refused request returns HTTP 403 with a message naming the rule that failed and the path as submitted. Use `GET /v1/workdirs` for the effective allowlist.
+
+A root must not be a Git repository or lie inside one: starting the server with one exits with code 2 and suggests `--workdirs` for a single repository. This condition is checked again on requests, including for roots that appear after startup. Git discovery errors refuse the root. Exact workdir entries must not contain a root or its ancestors: such a mount would let one session replace another session's checkout directory. Roots must remain host-owned.
+
+Every path is resolved to its canonical form (symlinks resolved, trailing slashes stripped) via `std::fs::canonicalize`. Roots are re-resolved on every request, so a root created after startup works. If a root does not exist at startup, a warning is logged and it remains configured for later requests. Exact workdir entries must already exist. Background startup preserves absolute paths and the invoking working directory, including when relative entries are read again from global config.
 
 To see the current allowlist over HTTP:
 
@@ -594,9 +611,14 @@ curl http://localhost:9876/v1/workdirs
   "workdirs": [
     "/home/user/my-project",
     "/home/user/other-project"
+  ],
+  "roots": [
+    "/srv/repos"
   ]
 }
 ```
+
+`roots` is an empty array when none are configured.
 
 ---
 
@@ -656,7 +678,7 @@ Every `curl` example in the rest of this document elides `-k`/`--cacert` for bre
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/v1/workdirs` | List the server's allowlisted working directories |
+| `GET` | `/v1/workdirs` | List the server's allowlisted working directories (`workdirs`) and workdir roots (`roots`) |
 | `POST` | `/v1/sessions` | Create a new session |
 | `GET` | `/v1/sessions` | List sessions; accepts optional `?status=active` filter |
 | `GET` | `/v1/sessions/:id` | Get session detail |
@@ -752,7 +774,7 @@ If the push fails (for example the branch moved on `origin`, or the credentials 
 
 The push runs on the server as the user running `awman api`, using that user's git credentials (SSH keys, credential helpers), until per-session credentials are available. Make sure that account can push to `repo_url`. Host push-back uses isolated Git metadata with hooks and repository-configured helpers disabled; the destination comes from the session's saved URL. Each host push-back Git operation times out after two minutes.
 
-**Local sessions** bind to an existing directory on the server. The directory must be in the allowlist (configured via `api.workDirs` in global config or `--workdirs` at startup). Workflows run directly in that directory.
+**Local sessions** bind to an existing directory on the server. The directory must be in the allowlist (an `api.workDirs` / `--workdirs` entry, or a Git repository directly beneath an `api.workDirRoots` / `--workdir-root` root). Workflows run directly in that directory.
 
 **Remote sessions** clone a git repository into `<API root>/sessions/<session_id>/<repository-folder>` on the server. The API root is selected from `AWMAN_API_ROOT`, `AWMAN_CONFIG_HOME/api`, `XDG_DATA_HOME/awman/api`, then `~/.awman/api`, in that order. Workflows run inside the clone. Closing the session deletes the clone; command logs remain in API storage. This is useful for running ephemeral CI jobs without a local checkout.
 
@@ -895,7 +917,7 @@ Error responses:
 
 | Situation | HTTP status |
 |-----------|-------------|
-| `workdir` not in allowlist (local) | 403 — includes `allowed_workdirs` list |
+| `workdir` not in allowlist (local) | 403 — names the failed rule and includes the allowed workdirs and roots |
 | Invalid `type` field | 400 |
 | Missing required fields | 400 |
 | `base_ref`, `merge_refs` or `push` on a local session, or without `branch` | 400 |
@@ -1309,6 +1331,22 @@ for what each choice does. These policies apply at final merge-back. The API
 still automatically commits changes already present before creating a worktree;
 start from a clean checkout to avoid that existing preparation behavior.
 
+#### Existing worktrees
+
+When the worktree for a run already exists, an API `exec workflow` **fails by
+default**: the command ends with status `error`, exit code 1 and HTTP 409, and
+the message names the worktree path and branch. Nothing on disk is changed, and
+this applies even when a saved workflow state would otherwise be resumed. Pass
+`--on-existing-worktree` in the command's arguments to choose instead:
+
+- `resume` continues in the existing worktree and branch.
+- `recreate` deletes the worktree, its branch and every commit on that branch,
+  then starts fresh.
+- `fail` is the default.
+
+See [Worktrees](05-workflows.md#worktrees). Worktrees live under
+`~/.awman/worktrees/<repo-name>-<hash>/` on the server. A retained checkout is reported as `result.worktree_path` in the completed command. This includes failures after worktree preparation; a checkout removed after a successful squash merge is omitted. Resuming verifies that the checkout's Git pointer and registration still belong to this repository.
+
 #### Get workflow state
 
 ```sh
@@ -1581,6 +1619,16 @@ awman config set --global api.workDirs "/home/user/my-project,/home/user/other-p
 
 Paths from `api.workDirs` and paths from `--workdirs` flags are merged at startup — both sources can be used together. See [Configuration](07-configuration.md#global-config) for the full global config reference.
 
+### `api.workDirRoots`
+
+Pre-configure roots so a client can create sessions on any repository cloned directly beneath them:
+
+```sh
+awman config set --global api.workDirRoots "/srv/repos"
+```
+
+Merged with `--workdir-root` flags at startup. See [Working directory allowlist](#working-directory-allowlist) for what qualifies as a direct child.
+
 ### `api.alwaysNonInteractive`
 
 When set to `true`, awman automatically injects `--non-interactive` into every dispatched command that supports it — including `implement`, `chat`, `exec prompt`, `exec workflow`, `ready`, and `specs amend`.
@@ -1635,14 +1683,16 @@ On `SIGTERM` or `SIGINT`, the server finishes all in-flight HTTP responses and a
 
 | Situation | Behaviour |
 |-----------|-----------|
-| `workdir` not in allowlist on `POST /v1/sessions` | HTTP 403; response includes the list of allowed directories |
+| `workdir` not in allowlist on `POST /v1/sessions` | HTTP 403; response names the failed rule and lists the allowed directories and roots |
 | Session not found or already closed on `POST /v1/commands` | HTTP 404; response includes the session UUID |
 | Multiple `POST /v1/commands` in quick succession | All commands are enqueued; first returns immediately, subsequent requests also return immediately with different command IDs; all are processed in FIFO order (one per session at a time) |
 | Session is `closing` on `POST /v1/commands` | HTTP 409 `"session is closing"`; command is rejected to prevent new work during graceful shutdown |
 | Server already running when `api start` is invoked | Error printed; exits non-zero |
 | API server or squad daemon already running when the other is started | Error names the other process and its PID; the new process does not start |
 | Port already bound (EADDRINUSE) | Error includes the port number and PID holding it |
-| `--workdirs` path doesn't exist at startup | Warning logged; path remains on allowlist |
+| `--workdir-root` path does not exist at startup | Warning logged; root is checked again on each request |
+| `--workdirs` path does not exist at startup | Startup refused; create the directory first |
+| `--workdir-root` is itself a Git repository | Startup refused (exit 2); use `--workdirs` for a single repository |
 | `awman api kill` when server is not running | Informational message; exits 0 |
 | `awman api logs` with no log file | Clear error suggesting `--background` |
 | Unknown `subcommand` in `POST /v1/commands` | HTTP 400; response lists valid subcommands |
