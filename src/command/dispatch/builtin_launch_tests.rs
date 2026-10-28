@@ -157,6 +157,7 @@ fn launch_background(fake: &FakeBuiltin, engines: &Engines, session: &Session) -
     let container = fake
         .runtime
         .launch_background(&BackgroundLaunchRequest {
+            secret_env: &[],
             name: None,
             image,
             workdir: session.git_root(),
@@ -332,6 +333,7 @@ async fn a_repo_state_dir_must_match_the_process_one() {
     let env = std::collections::HashMap::new();
     assert!(matches!(
         fake.runtime.launch_background(&BackgroundLaunchRequest {
+            secret_env: &[],
             name: None,
             image: "awman-base:latest",
             workdir: foreign.git_root(),

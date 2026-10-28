@@ -75,6 +75,78 @@ impl ConfigFieldSpec {
 ///
 /// Order is display order in `awman config show`.
 pub const CONFIG_FIELDS: &[ConfigFieldSpec] = &[
+    f(
+        "workflows.prerequisites.preflight",
+        FieldScope::Both,
+        ConfigFieldKind::Enum,
+        Some("warn | off"),
+    ),
+    f(
+        "workflows.prerequisites.unresolved",
+        FieldScope::Both,
+        ConfigFieldKind::Enum,
+        Some("warn | fail"),
+    ),
+    f(
+        "workflows.prerequisites.gitIdentity.use",
+        FieldScope::Both,
+        ConfigFieldKind::Enum,
+        Some("ask | allow | deny"),
+    ),
+    f(
+        "workflows.prerequisites.gitIdentity.name",
+        FieldScope::Both,
+        ConfigFieldKind::String,
+        None,
+    ),
+    f(
+        "workflows.prerequisites.gitIdentity.email",
+        FieldScope::Both,
+        ConfigFieldKind::String,
+        None,
+    ),
+    f(
+        "workflows.prerequisites.ssh.use",
+        FieldScope::Both,
+        ConfigFieldKind::Enum,
+        Some("ask | allow | deny"),
+    ),
+    f(
+        "workflows.prerequisites.ssh.key",
+        FieldScope::Both,
+        ConfigFieldKind::String,
+        Some("Path under ~/.ssh"),
+    ),
+    f(
+        "workflows.prerequisites.githubToken.use",
+        FieldScope::Both,
+        ConfigFieldKind::Enum,
+        Some("ask | allow | deny"),
+    ),
+    f(
+        "workflows.prerequisites.githubToken.envVars",
+        FieldScope::Both,
+        ConfigFieldKind::String,
+        LIST_HINT,
+    ),
+    f(
+        "workflows.prerequisites.githubToken.verify",
+        FieldScope::Both,
+        ConfigFieldKind::Bool,
+        None,
+    ),
+    f(
+        "workflows.prerequisites.githubToken.acquire",
+        FieldScope::GlobalOnly,
+        ConfigFieldKind::String,
+        Some(r#"JSON object: {"argv":[...],"timeoutSecs":30,"refresh":"start"}"#),
+    ),
+    f(
+        "workflows.prerequisites.allowApiClientGrants",
+        FieldScope::GlobalOnly,
+        ConfigFieldKind::Bool,
+        None,
+    ),
     f("agent", FieldScope::Both, ConfigFieldKind::Enum, AGENT_HINT),
     ConfigFieldSpec {
         name: "auto_agent_auth_accepted",

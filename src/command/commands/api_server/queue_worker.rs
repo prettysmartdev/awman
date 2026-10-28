@@ -61,7 +61,14 @@ impl QueuedCommandResult {
             exit_code: Some(exit_code),
             error: result.as_ref().err().map(ToString::to_string),
             error_status: result.as_ref().err().map(|error| error.http_status()),
-            stage: None,
+            // `"workflow_prerequisites"` when an unresolved prerequisite stopped
+            // the run before any container started (WI 0149); the report itself
+            // reached the client as the `workflow_prerequisites` event.
+            stage: result
+                .as_ref()
+                .err()
+                .and_then(|error| error.stage())
+                .map(str::to_string),
             pushed: None,
         };
         match push_outcome {
@@ -822,7 +829,8 @@ fn spawn_tracing_subscriber(
                     EventPayload::Done => break,
                     EventPayload::StdoutLine(_)
                     | EventPayload::StderrLine(_)
-                    | EventPayload::StatusMessage { .. } => {}
+                    | EventPayload::StatusMessage { .. }
+                    | EventPayload::WorkflowPrerequisites { .. } => {}
                 },
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                     tracing::warn!(
@@ -848,6 +856,7 @@ mod completion_tests {
         for exit_code in [None, Some(0), Some(1), Some(130)] {
             let workflow = Ok(CommandOutcome::ExecWorkflow(
                 crate::command::commands::exec_workflow::ExecWorkflowOutcome {
+                    prerequisites: None,
                     workflow: "workflow.toml".into(),
                     exit_code,
                     worktree_used: false,

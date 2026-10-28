@@ -172,7 +172,7 @@ microsandbox-network = { path = "third_party/microsandbox-network-0.7.8" }
 microsandbox-types = { path = "third_party/microsandbox-types-0.7.8" }
 
 [target.'cfg(unix)'.dependencies]
-nix = { workspace = true, features = ["signal", "process", "fs", "dir", "poll", "user"] }
+nix = { workspace = true, features = ["signal", "process", "term", "fs", "dir", "poll", "user"] }
 libc = { workspace = true }
 
 [dev-dependencies]

@@ -78,6 +78,7 @@ use crate::engine::workflow::frontend::WorkflowFrontend;
 /// The API dispatch frontend. Emits typed events to an `EventBusSender`
 /// for distribution to logfile writers and SSE clients.
 pub struct ApiDispatchFrontend {
+    frontend_kind: FrontendKind,
     /// Typed flags/arguments parsed by Layer 2 (`CommandCatalogue::parse_raw_args`).
     /// Empty when parsing failed; the error is surfaced via `parse_error`.
     parsed: ParsedArgs,
@@ -162,17 +163,24 @@ impl ApiDispatchFrontend {
     /// 0097, Findings A + D). The `Api` frontend profile is what forces
     /// `non-interactive=true` and defaults `yolo=true`.
     pub fn new(subcommand: &str, args: &[String], event_bus: EventBusSender) -> Self {
+        Self::for_frontend(subcommand, args, event_bus, FrontendKind::Api)
+    }
+
+    pub fn for_frontend(
+        subcommand: &str,
+        args: &[String],
+        event_bus: EventBusSender,
+        frontend_kind: FrontendKind,
+    ) -> Self {
         let path: Vec<&str> = subcommand.split_whitespace().collect();
-        let (parsed, parse_error) = match CommandCatalogue::get().parse_raw_args_with_profile(
-            &path,
-            args,
-            FrontendKind::Api,
-        ) {
-            Ok(parsed) => (parsed, None),
-            Err(e) => (ParsedArgs::default(), Some(e)),
-        };
+        let (parsed, parse_error) =
+            match CommandCatalogue::get().parse_raw_args_with_profile(&path, args, frontend_kind) {
+                Ok(parsed) => (parsed, None),
+                Err(e) => (ParsedArgs::default(), Some(e)),
+            };
 
         Self {
+            frontend_kind,
             parsed,
             parse_error,
             event_bus,
@@ -320,7 +328,7 @@ impl ApiDispatchFrontend {
 
 impl CommandFrontend for ApiDispatchFrontend {
     fn kind(&self) -> crate::command::dispatch::catalogue::FrontendKind {
-        crate::command::dispatch::catalogue::FrontendKind::Api
+        self.frontend_kind
     }
     fn flag_bool(&self, _command_path: &[&str], flag: &str) -> Result<Option<bool>, CommandError> {
         self.check_parse()?;
@@ -1341,6 +1349,31 @@ impl NewCommandFrontend for ApiDispatchFrontend {}
 /// No person is behind an HTTP request, so a custom definition that needs
 /// approval is refused (`AgentDefinitionUntrusted`), never approved.
 impl crate::command::commands::agent_trust::AgentTrustFrontend for ApiDispatchFrontend {}
+
+impl crate::command::commands::workflow_prerequisites::WorkflowPrerequisiteFrontend
+    for ApiDispatchFrontend
+{
+    fn show_workflow_prerequisites(
+        &mut self,
+        report: &crate::data::workflow_prerequisites::WorkflowPrerequisiteReport,
+    ) -> Result<(), CommandError> {
+        self.event_bus.emit(EventPayload::WorkflowPrerequisites {
+            phase: report.phase,
+            report: report.clone(),
+        });
+        Ok(())
+    }
+
+    fn report_workflow_prerequisites_recheck(
+        &mut self,
+        report: &crate::data::workflow_prerequisites::WorkflowPrerequisiteReport,
+    ) {
+        self.event_bus.emit(EventPayload::WorkflowPrerequisites {
+            phase: report.phase,
+            report: report.clone(),
+        });
+    }
+}
 
 #[cfg(test)]
 mod tests {

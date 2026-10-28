@@ -92,6 +92,17 @@ pub const BUILTIN_RUNTIME_NAME: &str = "builtin";
 
 pub struct ContainerRuntime {
     backend: Arc<dyn ContainerBackend>,
+    phase_tools_cache: std::sync::Mutex<crate::data::fs::phase_tools_cache::PhaseToolsCache>,
+}
+
+fn new_phase_tools_cache() -> std::sync::Mutex<crate::data::fs::phase_tools_cache::PhaseToolsCache>
+{
+    let cache = crate::data::config::global::GlobalConfig::data_home_with(
+        &crate::data::config::env::Env::from_process(),
+    )
+    .map(|root| crate::data::fs::phase_tools_cache::PhaseToolsCache::load(&root))
+    .unwrap_or_else(|_| crate::data::fs::phase_tools_cache::PhaseToolsCache::in_memory());
+    std::sync::Mutex::new(cache)
 }
 
 impl ContainerRuntime {
@@ -99,6 +110,7 @@ impl ContainerRuntime {
     pub fn docker() -> Self {
         Self {
             backend: Arc::new(DockerBackend),
+            phase_tools_cache: new_phase_tools_cache(),
         }
     }
 
@@ -108,6 +120,7 @@ impl ContainerRuntime {
     pub fn apple() -> Self {
         Self {
             backend: Arc::new(AppleBackend),
+            phase_tools_cache: new_phase_tools_cache(),
         }
     }
 
@@ -130,14 +143,20 @@ impl ContainerRuntime {
             }
             Err(e) => return Err(e),
         };
-        Ok(Self { backend })
+        Ok(Self {
+            backend,
+            phase_tools_cache: new_phase_tools_cache(),
+        })
     }
 
     /// Wrap an already-constructed backend. Test-only: lets hermetic tests run
     /// a real backend over a fake driver.
     #[cfg(test)]
     pub(super) fn with_backend(backend: Arc<dyn ContainerBackend>) -> Self {
-        Self { backend }
+        Self {
+            backend,
+            phase_tools_cache: new_phase_tools_cache(),
+        }
     }
 
     /// Static name of the chosen backend (e.g. `"docker"`).
@@ -201,6 +220,33 @@ impl ContainerRuntime {
     /// unresponsive.
     pub fn image_exists(&self, tag: &str) -> bool {
         self.backend.image_exists(tag).unwrap_or(false)
+    }
+
+    /// Stable image content identity for metadata caches; falls back to the tag.
+    pub fn image_id(&self, tag: &str) -> Option<String> {
+        self.backend.image_id(tag).ok().flatten()
+    }
+
+    /// Run a bounded, mount-free tool probe in an existing container image.
+    /// This path never builds or imports an image.
+    pub fn probe_phase_tools(
+        &self,
+        image: &str,
+        tools: &[&str],
+    ) -> crate::engine::container::phase_tools::PhaseToolsStatus {
+        let Ok(mut cache) = self.phase_tools_cache.lock() else {
+            return crate::engine::container::phase_tools::PhaseToolsStatus::Unknown {
+                reason: "phase tools cache unavailable".into(),
+            };
+        };
+        crate::engine::container::phase_tools::probe(self, image, tools, &mut cache)
+    }
+
+    pub(super) fn run_probe(
+        &self,
+        request: &crate::engine::container::backend::ProbeRequest<'_>,
+    ) -> Result<String, EngineError> {
+        self.backend.run_probe(request)
     }
 
     /// List all running awman containers without requiring a session.

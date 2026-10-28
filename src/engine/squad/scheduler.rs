@@ -1040,6 +1040,7 @@ mod tests {
         let store = Arc::new(summary_store(tmp.path()));
         let now = Utc::now();
         let mut configured = Task {
+            prerequisites: None,
             id: "id-triage".into(),
             name: "issue-triage".into(),
             description: "d".into(),

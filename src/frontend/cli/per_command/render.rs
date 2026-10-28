@@ -44,6 +44,9 @@ pub fn render(outcome: &CommandOutcome, json: bool) -> Option<String> {
         CommandOutcome::Init(o) => render_init(o),
         CommandOutcome::Ready(o) => render_ready(o),
         CommandOutcome::ExecPrompt(o) => render_exec_prompt(o),
+        CommandOutcome::ExecWorkflow(o) if json => {
+            Some(serde_json::to_string(o).expect("workflow outcome serializes"))
+        }
         CommandOutcome::ExecWorkflow(o) => render_exec_workflow(o),
         CommandOutcome::Config(o) => render_config(o),
         CommandOutcome::ApiServer(o) => render_api_server(o),
@@ -87,6 +90,20 @@ fn render_exec_prompt(o: &ExecPromptOutcome) -> Option<String> {
 }
 
 fn render_exec_workflow(o: &ExecWorkflowOutcome) -> Option<String> {
+    // `--check-prerequisites` ran no workflow: the table already went to
+    // stderr when it was shown, so stdout carries the verdict.
+    if let Some(report) = &o.prerequisites {
+        let verdict = if o.exit_code == Some(0) {
+            "ok"
+        } else {
+            "needs attention"
+        };
+        return Some(format!(
+            "Workflow {} prerequisites: {verdict} — {}.",
+            o.workflow,
+            report.summary_line()
+        ));
+    }
     let exit = match o.exit_code {
         Some(c) if c != 0 => format!(" (exit {c})"),
         _ => String::new(),
@@ -123,7 +140,56 @@ fn render_config(o: &ConfigOutcome) -> Option<String> {
         ConfigOutcome::Show(s) => Some(render_config_show(s)),
         ConfigOutcome::Get(g) => Some(render_config_get(g)),
         ConfigOutcome::Set(s) => Some(render_config_set(s)),
+        ConfigOutcome::PrerequisiteGrants(g) => Some(render_prerequisite_grants(g)),
     }
+}
+
+/// `config prerequisite-grants list|revoke`: the remembered decisions as a
+/// table, numbered as `revoke` takes them.
+fn render_prerequisite_grants(
+    g: &crate::command::commands::workflow_prerequisites::PrerequisiteGrantsOutcome,
+) -> String {
+    use crate::data::fs::prerequisite_grants::RememberedKind;
+    let mut out = String::new();
+    if let Some(warning) = &g.warning {
+        out.push_str(&format!("Warning: {warning}\n"));
+    }
+    if let Some(n) = g.revoked {
+        out.push_str(&format!(
+            "Revoked {n} remembered prerequisite decision(s).\n"
+        ));
+    }
+    if g.rows.is_empty() {
+        out.push_str(&format!(
+            "No remembered prerequisite decisions ({}).",
+            g.path
+        ));
+        return out;
+    }
+    let rows: Vec<Vec<String>> = g
+        .rows
+        .iter()
+        .map(|row| {
+            let kind = match row.prerequisite {
+                RememberedKind::Ssh => "ssh",
+                RememberedKind::GithubToken => "github token",
+                RememberedKind::GitIdentity => "git identity",
+            };
+            vec![
+                row.index.to_string(),
+                row.git_root.clone(),
+                row.remote_url.clone(),
+                kind.to_string(),
+                row.decision.clone(),
+                row.recorded_at.clone(),
+            ]
+        })
+        .collect();
+    out.push_str(&format_table(
+        &["#", "Repository", "Remote", "Kind", "Decision", "Recorded"],
+        &rows,
+    ));
+    out
 }
 
 fn render_config_show(o: &ConfigShowOutcome) -> String {
@@ -838,6 +904,7 @@ mod tests {
     #[test]
     fn render_exec_workflow_shows_workflow_name() {
         let o = ExecWorkflowOutcome {
+            prerequisites: None,
             workflow: "deploy.toml".into(),
             exit_code: Some(0),
             worktree_used: false,
@@ -850,6 +917,7 @@ mod tests {
     #[test]
     fn render_exec_workflow_nonzero_exit_shows_exit_code() {
         let o = ExecWorkflowOutcome {
+            prerequisites: None,
             workflow: "build.yaml".into(),
             exit_code: Some(2),
             worktree_used: false,

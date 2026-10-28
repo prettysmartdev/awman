@@ -783,6 +783,70 @@ impl<F: CommandFrontend> Dispatch<F> {
         (spec.build)(&ctx)
     }
 
+    /// Validate credential flags before remote admission, using the same
+    /// parser and policy ceiling as command construction. Returns names only.
+    pub fn prerequisite_admission(
+        &self,
+        path: &[&str],
+    ) -> Result<Option<serde_json::Value>, CommandError> {
+        use crate::command::commands::workflow_prerequisites as prerequisites;
+        let canonical: Vec<&str> = self.catalogue.canonical_path(path).into_iter().collect();
+        let spec = self
+            .catalogue
+            .lookup(&canonical)
+            .ok_or_else(|| CommandError::unknown_command(path))?;
+        if !spec
+            .flags
+            .iter()
+            .any(|f| f.long == prerequisites::FLAG_TOKEN)
+        {
+            return Ok(None);
+        }
+        let flags = ResolvedFlags::resolve(&self.frontend, &canonical, spec)?;
+        let args = ResolvedArgs::resolve(&self.frontend, &canonical, spec.arguments)?;
+        let mut session = self
+            .session
+            .try_read()
+            .map_err(|_| CommandError::Other("session is write-locked".into()))?
+            .clone();
+        let with_check = spec
+            .flags
+            .iter()
+            .any(|f| f.long == prerequisites::FLAG_CHECK);
+        let mut context_flags = session.flags().clone();
+        context_flags.squad_prerequisites = !with_check;
+        session.set_flags(context_flags);
+        let ctx = BuildContext {
+            flags: &flags,
+            args: &args,
+            engines: &self.engines,
+            session,
+            managed_session: self.session.clone(),
+            gateway: self.squad_gateway.clone(),
+            caller: CallerContext::new(&canonical, self.frontend.kind()),
+            cancel: self.cancel.clone(),
+        };
+        let parsed = prerequisites::parse_prerequisite_flags(&ctx, with_check)?;
+        prerequisites::check_flag_widening(
+            self.frontend.kind(),
+            &parsed,
+            &prerequisites::policy_for(&ctx.session, &Default::default(), None),
+        )?;
+        let mut summary = prerequisites::flags_applied_policy(&ctx.session, &parsed);
+        if summary["unresolved"].is_null() {
+            let origin = if with_check && !ctx.flags.bool("dynamic") {
+                crate::data::workflow_prerequisites::PrerequisiteOrigin::Static
+            } else {
+                crate::data::workflow_prerequisites::PrerequisiteOrigin::AssumedAll
+            };
+            summary["unresolved"] = serde_json::to_value(
+                prerequisites::headless_for(self.frontend.kind()).prerequisite_unresolved(origin),
+            )
+            .expect("policy serializes");
+        }
+        Ok(Some(summary))
+    }
+
     /// What a frontend should display while this invocation runs.
     ///
     /// Both facts used to be recomputed in `App::spawn_command` from the raw
@@ -2366,6 +2430,7 @@ mod tests {
         assert_eq!(
             CommandOutcome::ExecWorkflow(
                 crate::command::commands::exec_workflow::ExecWorkflowOutcome {
+                    prerequisites: None,
                     workflow: "workflow.toml".into(),
                     exit_code: Some(17),
                     worktree_used: false,

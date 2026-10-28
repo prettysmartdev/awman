@@ -201,6 +201,17 @@ pub(crate) fn render_squad_detail(
             &format!("\u{26a0} {} unmet", c.unmet_env.join(", ")),
         ));
     }
+    match &c.prerequisites {
+        Some(policy) => {
+            for line in crate::command::commands::workflow_prerequisites::policy_lines(policy) {
+                fields.push(squad_field_line("Prerequisite", &line));
+            }
+        }
+        None => fields.push(squad_field_line(
+            "Prerequisites",
+            "not set; run `awman squad edit <task>` to configure",
+        )),
+    }
     let field_h = fields.len() as u16;
 
     let tooltip_lines = pack_hint_segments(&HINTS, content_width as usize);

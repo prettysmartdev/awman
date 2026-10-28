@@ -24,6 +24,7 @@ mod remote_frontend;
 mod specs;
 mod squad;
 mod workflow_frontend;
+mod workflow_prerequisites;
 mod worktree_lifecycle;
 
 pub use acp_frontend::{AcpPromptReceiver, AcpPromptSender, TuiAcpFrontend};

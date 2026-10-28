@@ -113,8 +113,9 @@ Provide a short manual test plan when done.
 """
 
 # ── Teardown steps ────────────────────────────────────────────────────────────
-# Run on the host after the last agent step (or on failure if teardown_on_failure
-# is true). Order is sequential. skill() and skills() are NOT valid here.
+# Each teardown step runs in its own container built from the project image, after
+# the last agent step (or on failure if teardown_on_failure is true). Order is
+# sequential. skill() and skills() are NOT valid here.
 
 [[teardown]]
 type = "run_shell"
@@ -137,14 +138,12 @@ add_all = true
 type = "push_branch"
 # remote = "origin"  # optional
 # branch = "HEAD"    # optional
-overlays = ["ssh()"]
 
 [[teardown]]
 type = "create_pull_request"
 title = "Implement {{work_item_number}}"
 body = "Automated PR created by awman dynamic workflow."
 # base = "main"  # optional; defaults to repo default branch
-overlays = ["env(GITHUB_TOKEN)"]
 
 # [[teardown]]
 # type = "poll_ci"

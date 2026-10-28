@@ -17,7 +17,10 @@ use crate::data::session::{AgentName, Session};
 use crate::engine::error::EngineError;
 
 pub mod credential;
+pub mod github_token;
+pub mod host_secret_command;
 pub mod keychain;
+pub mod redaction;
 
 use credential::{CredentialFingerprint, CredentialReadError, RefreshableCredentialSpec};
 
@@ -254,6 +257,32 @@ impl AuthEngine {
 
     pub fn api_paths(&self) -> &ApiPaths {
         &self.api_paths
+    }
+
+    // ── Workflow prerequisite credentials (WI 0149) ─────────────────────────
+
+    /// A resolver for the GitHub token sources a workflow prerequisite may use.
+    pub fn github_token_resolver(
+        &self,
+        opts: github_token::GitHubTokenResolverOptions,
+    ) -> github_token::GitHubTokenResolver {
+        github_token::GitHubTokenResolver::new(opts)
+    }
+
+    /// The sole constructor of a prerequisite host command; see
+    /// [`host_secret_command`] for the hardening it applies.
+    pub fn host_secret_command(
+        &self,
+        opts: host_secret_command::HostSecretCommandOptions,
+    ) -> Result<host_secret_command::HostSecretCommand, host_secret_command::HostSecretCommandError>
+    {
+        host_secret_command::HostSecretCommand::new(opts)
+    }
+
+    /// Whether the host `gh` is installed and logged in to `host` (shared by
+    /// `poll_ci` and the prerequisite preflight).
+    pub fn host_gh_authenticated(host: &str) -> bool {
+        github_token::GitHubTokenResolver::host_gh_authenticated(host)
     }
 
     // ── Agent credential discovery ──────────────────────────────────────────

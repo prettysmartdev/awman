@@ -283,6 +283,11 @@ impl crate::command::commands::agent_setup::AgentLaunchFrontend for FakeExecWork
     }
 }
 
+impl crate::command::commands::workflow_prerequisites::WorkflowPrerequisiteFrontend
+    for FakeExecWorkflowFrontend
+{
+}
+
 impl ExecWorkflowCommandFrontend for FakeExecWorkflowFrontend {
     fn report_workflow_summary(&mut self, summary: &WorkflowSummary) {
         self.summary_calls.push(summary.clone());
@@ -409,6 +414,8 @@ async fn set_pty_active_called_true_then_false_around_engine() {
         Arc::new(crate::data::WorkflowStateStore::at_git_root(tmp.path()));
 
     let flags = ExecWorkflowCommandFlags {
+        prerequisites: Default::default(),
+        squad_task_prerequisites: None,
         workflow: Some(wf_path),
         work_item: None,
         non_interactive: true,
@@ -648,6 +655,8 @@ async fn workflow_command_survives_runtime_holding_frontend_after_wait() {
             runtime,
         ));
         let flags = ExecWorkflowCommandFlags {
+            prerequisites: Default::default(),
+            squad_task_prerequisites: None,
             workflow: Some(workflow_path),
             work_item: None,
             non_interactive: true,
@@ -927,6 +936,8 @@ fn exec_workflow_flags_worktree_defaults_to_false() {
     // Verify ExecWorkflowCommandFlags is constructable and worktree defaults
     // correctly reflect what dispatch sets.
     let flags = ExecWorkflowCommandFlags {
+        prerequisites: Default::default(),
+        squad_task_prerequisites: None,
         workflow: Some(PathBuf::from("wf.toml")),
         work_item: None,
         non_interactive: false,
@@ -1032,6 +1043,8 @@ fn exec_workflow_flags_yolo_implies_worktree_in_dispatch() {
     // Dispatch sets worktree=true when yolo=true; verify the flag struct
     // allows that combination.
     let flags = ExecWorkflowCommandFlags {
+        prerequisites: Default::default(),
+        squad_task_prerequisites: None,
         workflow: Some(PathBuf::from("wf.toml")),
         work_item: None,
         non_interactive: false,
@@ -1553,6 +1566,8 @@ fn make_dynamic_flags(
     model: Option<&str>,
 ) -> ExecWorkflowCommandFlags {
     ExecWorkflowCommandFlags {
+        prerequisites: Default::default(),
+        squad_task_prerequisites: None,
         workflow: workflow.map(PathBuf::from),
         work_item: work_item.map(|s| s.to_string()),
         non_interactive: false,
@@ -3634,6 +3649,8 @@ async fn run_recorded_workflow(
     engines.workflow_state_store = Arc::new(crate::data::WorkflowStateStore::at_git_root(&repo));
 
     let flags = ExecWorkflowCommandFlags {
+        prerequisites: Default::default(),
+        squad_task_prerequisites: None,
         workflow: Some(wf),
         work_item: None,
         non_interactive: true,
@@ -3757,6 +3774,8 @@ async fn record_leader_launch(
         runtime.clone(),
     ));
     let flags = ExecWorkflowCommandFlags {
+        prerequisites: Default::default(),
+        squad_task_prerequisites: None,
         workflow: None,
         work_item: Some("1".into()),
         non_interactive: true,
@@ -3884,6 +3903,8 @@ async fn interactive_setup_and_teardown_factories_use_each_sessions_policy() {
         for kind in [PhaseKind::Setup, PhaseKind::Teardown] {
             let frontend = SharedWorkflowFrontend::new(Box::new(FakeExecWorkflowFrontend::new()));
             let factory = phase_container::PhaseContainerFactory {
+                secret_env: &[],
+                transport: None,
                 name_prefix: None,
                 runtime: &fake.runtime,
                 frontend: &frontend,
@@ -3946,6 +3967,8 @@ fn merge_policy_flags(
     failure: Option<crate::data::config::repo::OnMergeFailure>,
 ) -> ExecWorkflowCommandFlags {
     ExecWorkflowCommandFlags {
+        prerequisites: Default::default(),
+        squad_task_prerequisites: None,
         workflow: None,
         work_item: None,
         non_interactive: true,
@@ -4358,4 +4381,207 @@ async fn dynamic_fail_preserves_both_resume_artifacts_before_fresh_prompt() {
             .remove_worktree(&root, lifecycle.worktree_path())
             .unwrap();
     }
+}
+
+#[tokio::test]
+async fn wi0149_static_missing_token_fails_before_worktree_or_agent_build() {
+    use crate::data::workflow_prerequisites::{PrerequisiteStatus, WorkflowPrerequisite};
+    let repo = policy_repo();
+    let root = repo.path();
+    let path = root.join("prerequisites.toml");
+    std::fs::write(&path, "title='preflight'\n[[steps]]\nname='work'\nagent='claude'\nprompt='work'\n[[teardown]]\ntype='commit_changes'\nmessage='commit'\n[[teardown]]\ntype='push_branch'\n[[teardown]]\ntype='create_pull_request'\n").unwrap();
+    let mut flags = merge_policy_flags(None, None);
+    flags.workflow = Some(path);
+    let held = Arc::new(Mutex::new(Vec::new()));
+    let builds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = builds.clone();
+    let runtime = crate::engine::container::test_support::holding_runtime_with_hooks(
+        held.clone(),
+        "",
+        Arc::new(|_| panic!("phase exec before preflight")),
+        Arc::new(move |_| {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }),
+        None,
+    );
+    let mut engines = Engines::for_tests(root);
+    engines.runtime = runtime.clone();
+    engines.container_runtime = Some(runtime.clone());
+    engines.agent_engine = Arc::new(crate::engine::agent::AgentEngine::new(
+        engines.overlay_engine.clone(),
+        runtime,
+    ));
+    let error = ExecWorkflowCommand::new(flags, engines, Session::for_tests_isolated(root, root))
+        .run_with_frontend(Box::new(FakeExecWorkflowFrontend::new()))
+        .await
+        .unwrap_err();
+    let CommandError::WorkflowPrerequisitesUnresolved { report } = error else {
+        panic!("{error:?}");
+    };
+    assert!(
+        report.checks.iter().any(|c| matches!(
+            c.prerequisite,
+            WorkflowPrerequisite::GitHubToken { .. }
+        ) && c.status == PrerequisiteStatus::Missing),
+        "{report:?}"
+    );
+    assert_eq!(builds.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert!(held.lock().unwrap().is_empty());
+    assert!(!root.join(".awman/worktrees").exists());
+}
+
+#[tokio::test]
+async fn wi0149_dynamic_check_only_precedes_leader_and_worktree() {
+    let repo = policy_repo();
+    let root = repo.path();
+    std::fs::create_dir_all(root.join("aspec/work-items")).unwrap();
+    std::fs::write(root.join("aspec/work-items/0149-feature.md"), "# Feature").unwrap();
+    let mut flags = make_dynamic_flags(true, None, Some("0149"), None, false, None);
+    flags.prerequisites.check_only = true;
+    let held = Arc::new(Mutex::new(Vec::new()));
+    let runtime = crate::engine::container::test_support::holding_runtime(held.clone());
+    let mut engines = Engines::for_tests(root);
+    engines.runtime = runtime.clone();
+    engines.container_runtime = Some(runtime.clone());
+    engines.agent_engine = Arc::new(crate::engine::agent::AgentEngine::new(
+        engines.overlay_engine.clone(),
+        runtime,
+    ));
+    let result = ExecWorkflowCommand::new(flags, engines, Session::for_tests_isolated(root, root))
+        .run_with_frontend(Box::new(FakeExecWorkflowFrontend::new()))
+        .await
+        .unwrap();
+    assert_eq!(
+        result.prerequisites.unwrap().origin,
+        crate::data::workflow_prerequisites::PrerequisiteOrigin::AssumedAll
+    );
+    assert!(!result.worktree_used);
+    assert!(
+        held.lock().unwrap().is_empty(),
+        "leader must never launch for --check-prerequisites"
+    );
+    assert!(!root.join(".awman/worktrees").exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wi0149_dynamic_preflight_before_leader_and_narrowing_excludes_ssh_from_agents() {
+    use crate::data::config::flags::SshFlag;
+    let repo = policy_repo();
+    let root = repo.path();
+    assert!(std::process::Command::new("git")
+        .args(["remote", "add", "origin", "git@github.com:org/repo.git"])
+        .current_dir(root)
+        .output()
+        .unwrap()
+        .status
+        .success());
+    std::fs::create_dir_all(root.join("aspec/work-items")).unwrap();
+    std::fs::create_dir_all(root.join(".awman")).unwrap();
+    std::fs::write(root.join(".awman/Dockerfile.claude"), "FROM scratch\n").unwrap();
+    std::fs::write(root.join("aspec/work-items/0149-feature.md"), "# Feature").unwrap();
+    let home = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(home.path().join(".ssh")).unwrap();
+    std::fs::write(home.path().join(".ssh/id_ed25519"), "fixture private key").unwrap();
+    let session = Session::for_tests_with_env(
+        root,
+        crate::data::config::env::EnvSnapshot::with_overrides([
+            ("HOME", home.path().to_str().unwrap()),
+            ("AWMAN_CONFIG_HOME", home.path().to_str().unwrap()),
+        ]),
+    );
+    let messages = Arc::new(Mutex::new(Vec::<UserMessage>::new()));
+    let seen = messages.clone();
+    let builds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = builds.clone();
+    let held = Arc::new(Mutex::new(Vec::new()));
+    let runtime = crate::engine::container::test_support::holding_runtime_with_hooks(
+        held.clone(),
+        "[[steps]]\nname='generated'\nagent='claude'\nprompt='work'\n",
+        Arc::new(|_| {}),
+        Arc::new(move |opts| {
+            assert!(
+                seen.lock()
+                    .unwrap()
+                    .iter()
+                    .any(|m| m.text.to_lowercase().contains("workflow prerequisites")),
+                "preflight summary must precede the leader's build"
+            );
+            assert!(
+                !format!("{:?}", opts.overlays).contains(".ssh"),
+                "leader and main agents must not receive SSH grants"
+            );
+            assert!(!opts
+                .env_passthrough
+                .iter()
+                .any(|e| matches!(e.0.as_str(), "GH_TOKEN" | "AWMAN_GIT_TOKEN")));
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }),
+        None,
+    );
+    let mut engines = Engines::for_tests(root);
+    engines.runtime = runtime.clone();
+    engines.container_runtime = Some(runtime.clone());
+    engines.agent_engine = Arc::new(crate::engine::agent::AgentEngine::new(
+        engines.overlay_engine.clone(),
+        runtime,
+    ));
+    let mut flags = make_dynamic_flags(true, None, Some("0149"), None, false, None);
+    flags.prerequisites.ssh = Some(SshFlag::All);
+    flags.prerequisites.unresolved = Some(crate::data::config::workflows::UnresolvedMode::Warn);
+    let result = ExecWorkflowCommand::new(flags, engines, session)
+        .run_with_frontend(Box::new(FakeExecWorkflowFrontend::with_shared_messages(
+            messages.clone(),
+        )))
+        .await;
+    assert!(result.is_ok(), "{result:?}");
+    assert!(builds.load(std::sync::atomic::Ordering::SeqCst) >= 2);
+    assert!(messages
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|m| m.text.contains("granted but unused: SSH key")));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn credentialed_interactive_phase_uses_filtered_execution_instead_of_raw_attach() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = crate::engine::container::test_support::holding_runtime_with_hooks(
+        Arc::new(Mutex::new(vec![])),
+        "",
+        Arc::new(|_| {}),
+        Arc::new(|_| panic!("credentialed phase reached raw interactive attach")),
+        None,
+    );
+    let session = Session::for_tests_isolated(root.path(), root.path());
+    let engines = Engines::for_tests(root.path());
+    let frontend = SharedWorkflowFrontend::new(Box::new(FakeExecWorkflowFrontend::new()));
+    let secrets = [(
+        "GH_TOKEN".into(),
+        crate::engine::auth::credential::SecretString::new("selected_fixture_token"),
+    )];
+    let factory = phase_container::PhaseContainerFactory {
+        name_prefix: None,
+        runtime: &runtime,
+        frontend: &frontend,
+        agent_engine: &engines.agent_engine,
+        session: &session,
+        image: "fixture",
+        workdir: root.path(),
+        interactive: true,
+        secret_env: &secrets,
+        transport: None,
+    };
+    let step = crate::engine::workflow::PhaseStepRef {
+        kind: PhaseKind::Teardown,
+        index: 0,
+        description: "PR".into(),
+    };
+    let output = factory
+        .build(&step, &HashMap::new(), &[])
+        .unwrap()
+        .exec("true", None)
+        .unwrap();
+    assert_eq!(output.exit_code, 0);
 }

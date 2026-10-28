@@ -35,6 +35,10 @@ pub const GLOBAL_CONFIG_HOME_SUBDIR: &str = ".awman";
 /// Global configuration stored at `$HOME/.awman/config.json` (or `$AWMAN_CONFIG_HOME/config.json`).
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GlobalConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflows: Option<super::workflows::WorkflowsConfig>,
+    #[serde(skip)]
+    pub load_warnings: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_agent: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -160,7 +164,7 @@ impl GlobalConfig {
             return Ok(Self::default());
         }
         let content = std::fs::read_to_string(path).map_err(|e| DataError::io(path, e))?;
-        let cfg: Self =
+        let mut cfg: Self =
             serde_json::from_str(&content).map_err(|e| DataError::config_parse(path, e))?;
         if let Some(n) = cfg.max_concurrent_agents {
             if n < 1 {
@@ -170,13 +174,40 @@ impl GlobalConfig {
             }
         }
         if let Some(squad) = &cfg.squad {
-            squad.validate()?;
+            squad
+                .validate()
+                .map_err(|e| DataError::Other(format!("{}: {e}", path.display())))?;
         }
         if let Some(auth_refresh) = &cfg.auth_refresh {
             validate_auth_refresh(auth_refresh)?;
         }
         if let Some(agent_flags) = &cfg.agent_flags {
             validate_agent_flags(agent_flags)?;
+        }
+        if let Some(prerequisites) = cfg
+            .workflows
+            .as_ref()
+            .and_then(|w| w.prerequisites.as_ref())
+        {
+            cfg.load_warnings.extend(
+                prerequisites
+                    .validate(super::workflows::ConfigScope::Global)
+                    .map_err(|e| DataError::Other(format!("{}: {e}", path.display())))?,
+            );
+        }
+        if let Some(prerequisites) = cfg
+            .squad
+            .as_ref()
+            .and_then(|s| s.workflows.as_ref())
+            .and_then(|w| w.prerequisites.as_ref())
+        {
+            cfg.load_warnings.extend(
+                prerequisites
+                    .validate(super::workflows::ConfigScope::Global)
+                    .map_err(|e| DataError::Other(format!("{}: squad.{e}", path.display())))?
+                    .into_iter()
+                    .map(|w| format!("squad.{w}")),
+            );
         }
         Ok(cfg)
     }
@@ -223,7 +254,11 @@ pub fn task_squad_config(
     let path = paths.task_config_file(name)?;
     let document = GlobalConfig::load_path(&path)?;
     Ok(match document.squad {
-        Some(task) => task.layered_over(global),
+        Some(mut task) => {
+            // Task files are agent-writable and cannot supply trusted host policy.
+            task.workflows = None;
+            task.layered_over(global)
+        }
         None => global.clone(),
     })
 }
@@ -253,6 +288,8 @@ mod tests {
         let env = isolated_env(tmp.path());
 
         let original = GlobalConfig {
+            workflows: None,
+            load_warnings: Vec::new(),
             default_agent: Some("claude".to_string()),
             terminal_scrollback_lines: Some(8000),
             runtime: Some("docker".to_string()),
@@ -266,6 +303,7 @@ mod tests {
                 ..Default::default()
             }),
             squad: Some(SquadConfig {
+                workflows: None,
                 agents_to_models: Some(std::collections::HashMap::from([(
                     "claude".to_string(),
                     vec!["claude-opus-4-8".to_string()],
@@ -513,5 +551,24 @@ mod tests {
         .unwrap_err()
         .to_string()
         .contains("builtin.builder.enabled"));
+    }
+}
+
+#[cfg(test)]
+mod task_prerequisite_trust_review_tests {
+    use super::*;
+    #[test]
+    fn task_directory_cannot_replace_trusted_squad_workflow_policy() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = SquadPaths::from_root(root.path());
+        let path = paths.task_config_file("fixture").unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, r#"{"squad":{"workflows":{"prerequisites":{"githubToken":{"use":"allow","acquire":{"argv":["untrusted-tool"]}}}}}}"#).unwrap();
+        let global: SquadConfig = serde_json::from_value(
+            serde_json::json!({"workflows":{"prerequisites":{"githubToken":{"use":"deny"}}}}),
+        )
+        .unwrap();
+        let resolved = task_squad_config(&paths, "fixture", &global).unwrap();
+        assert_eq!(resolved.workflows, global.workflows);
     }
 }

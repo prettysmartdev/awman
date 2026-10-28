@@ -17,6 +17,7 @@ use crate::engine::agent::registry::AgentRegistry;
 use crate::engine::auth::credential::{CredentialFile, CredentialFingerprint};
 use crate::engine::container::options::{OverlayPermission, OverlaySpec};
 use crate::engine::error::EngineError;
+use crate::engine::overlay::prerequisite_grants::GrantTarget;
 
 /// Top-level entries in `~/.claude/` that the legacy code excludes when
 /// preparing a sanitized overlay copy. Single source of truth.
@@ -177,6 +178,222 @@ impl std::fmt::Debug for OverlayEngine {
 }
 
 impl OverlayEngine {
+    /// Turn narrowly scoped workflow grants into container mounts and env.
+    /// This is the only grant-to-container boundary.
+    pub fn prerequisite_grant_overlays(
+        &self,
+        target: &GrantTarget<'_>,
+        grants: &crate::engine::workflow::prerequisite_grants::PrerequisiteGrants,
+    ) -> Result<crate::engine::overlay::prerequisite_grants::GrantOverlays, EngineError> {
+        use crate::data::config::overlays::OverlayPermission;
+        use crate::data::fs::ssh_keys::SshKeyInventory;
+        use crate::data::workflow_prerequisites::{GitRemoteKind, PrerequisiteStepKind};
+        use crate::engine::overlay::prerequisite_grants::*;
+        use crate::engine::workflow::prerequisite_grants::SshGrant;
+        use crate::engine::workflow::step_commands::PushAuth;
+
+        let mut out = GrantOverlays::none();
+        let home = target.container_home.unwrap_or("/root");
+        match target.step_kind {
+            PrerequisiteStepKind::CommitChanges => {
+                if let Some(identity) = &grants.identity {
+                    out.env_literals.extend([
+                        ("GIT_AUTHOR_NAME".into(), identity.name.clone()),
+                        ("GIT_AUTHOR_EMAIL".into(), identity.email.clone()),
+                        ("GIT_COMMITTER_NAME".into(), identity.name.clone()),
+                        ("GIT_COMMITTER_EMAIL".into(), identity.email.clone()),
+                    ]);
+                }
+            }
+            PrerequisiteStepKind::PushBranch
+            | PrerequisiteStepKind::PullBranch
+            | PrerequisiteStepKind::CloneRepo => {
+                if let (
+                    Some(SshGrant::Key {
+                        key_path,
+                        known_hosts,
+                        ..
+                    }),
+                    Some(remote),
+                ) = (&grants.ssh, target.remote)
+                {
+                    if matches!(remote.kind, GitRemoteKind::Ssh { .. })
+                        && grants.allows_ssh(&remote.redacted)
+                    {
+                        let host_home = dirs::home_dir().ok_or_else(|| {
+                            EngineError::Other(
+                                "cannot resolve host home for SSH key validation".into(),
+                            )
+                        })?;
+                        let key = SshKeyInventory::validate_key_path(&host_home, key_path)
+                            .map_err(EngineError::Data)?;
+                        let key_target = PathBuf::from(home)
+                            .join(".ssh")
+                            .join(GRANT_SSH_KEY_CONTAINER_NAME);
+                        out.overlays.push(OverlaySpec {
+                            host_path: key.clone(),
+                            container_path: key_target.clone(),
+                            permission: OverlayPermission::ReadOnly,
+                        });
+                        let mut kh_target = None;
+                        if let Some(known) = known_hosts {
+                            let source = SshKeyInventory::validate_key_path(&host_home, known)
+                                .map_err(EngineError::Data)?;
+                            let scratch = tempfile::Builder::new()
+                                .prefix("awman-known-hosts-")
+                                .tempdir()
+                                .map_err(|e| {
+                                    EngineError::Other(format!("create known_hosts copy: {e}"))
+                                })?;
+                            let copy = scratch.path().join("known_hosts");
+                            std::fs::copy(source, &copy).map_err(|e| {
+                                EngineError::Other(format!("copy known_hosts: {e}"))
+                            })?;
+                            #[cfg(unix)]
+                            {
+                                use std::os::unix::fs::PermissionsExt;
+                                std::fs::set_permissions(
+                                    &copy,
+                                    std::fs::Permissions::from_mode(0o600),
+                                )
+                                .map_err(|e| {
+                                    EngineError::Other(format!("secure known_hosts copy: {e}"))
+                                })?;
+                            }
+                            kh_target = Some(PathBuf::from(home).join(".ssh/known_hosts"));
+                            out.overlays.push(OverlaySpec {
+                                host_path: copy,
+                                container_path: kh_target.clone().unwrap(),
+                                permission: OverlayPermission::ReadWrite,
+                            });
+                            out.scratch = Some(scratch);
+                        }
+                        out.display.push(format!(
+                            "ssh key {} → {} (ro)",
+                            key.display(),
+                            key_target.display()
+                        ));
+                        out.push_auth = PushAuth::Ssh {
+                            key_path: key_target.display().to_string(),
+                            known_hosts: kh_target.map(|p| p.display().to_string()),
+                        };
+                    }
+                }
+                if let (Some(token), Some(remote)) = (&grants.token, target.remote) {
+                    if matches!(&remote.kind, GitRemoteKind::Https { host } if host.eq_ignore_ascii_case(&token.host))
+                        && grants.allows_token(&remote.redacted)
+                    {
+                        out.secret_env
+                            .push((GRANT_TOKEN_ENV_GIT.into(), token.secret.clone()));
+                        out.env_literals
+                            .push(("GIT_TERMINAL_PROMPT".into(), "0".into()));
+                        out.display.push("AWMAN_GIT_TOKEN=***".into());
+                        out.push_auth = PushAuth::HttpsToken {
+                            env_var: GRANT_TOKEN_ENV_GIT.into(),
+                        };
+                    }
+                }
+                if let Some(SshGrant::WholeDir { ssh_dir }) = &grants.ssh {
+                    if target.remote.is_some_and(|r| {
+                        matches!(r.kind, GitRemoteKind::Ssh { .. })
+                            && grants.allows_ssh(&r.redacted)
+                    }) {
+                        out.overlays.push(OverlaySpec {
+                            host_path: ssh_dir.clone(),
+                            container_path: PathBuf::from(home).join(".ssh"),
+                            permission: OverlayPermission::ReadOnly,
+                        });
+                        out.display.push(format!(
+                            "ssh() {} → {}/.ssh (ro)",
+                            ssh_dir.display(),
+                            home
+                        ));
+                    }
+                }
+            }
+            PrerequisiteStepKind::CreatePullRequest => {
+                out.env_literals
+                    .push(("GH_PROMPT_DISABLED".into(), "1".into()));
+                if let Some(token) = grants.token.as_ref().filter(|token| {
+                    target.remote.is_some_and(|r| {
+                        grants.allows_token(&r.redacted)
+                            && match &r.kind {
+                                GitRemoteKind::Https { host } | GitRemoteKind::Ssh { host } => {
+                                    host.eq_ignore_ascii_case(&token.host)
+                                }
+                                _ => false,
+                            }
+                    })
+                }) {
+                    out.secret_env
+                        .push((GRANT_TOKEN_ENV_GH.into(), token.secret.clone()));
+                    if let Some(remote) = target.remote {
+                        let path = if let Some((_, rest)) = remote.redacted.split_once("://") {
+                            rest.split_once('/').map(|(_, path)| path)
+                        } else {
+                            remote.redacted.split_once(':').map(|(_, path)| path)
+                        };
+                        if let Some(path) = path {
+                            out.env_literals.push((
+                                "GH_REPO".into(),
+                                format!(
+                                    "{}/{}",
+                                    token.host,
+                                    path.trim_matches('/').trim_end_matches(".git")
+                                ),
+                            ));
+                        }
+                    }
+                    if !token.host.eq_ignore_ascii_case("github.com") {
+                        out.env_literals
+                            .push(("GH_HOST".into(), token.host.clone()));
+                    }
+                    out.display.push("GH_TOKEN=***".into());
+                }
+            }
+            _ => {}
+        }
+        if !out.secret_env.is_empty()
+            || !matches!(out.push_auth, PushAuth::None)
+            || !out.overlays.is_empty()
+        {
+            if let (Some(repo), Some(remote)) = (target.repo, target.remote) {
+                out.env_literals.extend([
+                    ("GIT_CONFIG_NOSYSTEM".into(), "1".into()),
+                    ("GIT_CONFIG_GLOBAL".into(), "/dev/null".into()),
+                    ("GIT_CONFIG_SYSTEM".into(), "/dev/null".into()),
+                    ("GIT_TERMINAL_PROMPT".into(), "0".into()),
+                ]);
+                if target.step_kind != PrerequisiteStepKind::CloneRepo {
+                    let isolated = crate::engine::git::GitEngine::new()
+                        .isolate_workflow_transport(
+                            target.git_source.ok_or_else(|| {
+                                EngineError::Git(
+                                    "trusted pre-agent Git metadata is unavailable".into(),
+                                )
+                            })?,
+                            grants
+                                .ssh_transports
+                                .get(&remote.redacted)
+                                .map_or(remote.redacted.as_str(), |u| u.expose()),
+                        )?;
+                    let path = isolated.metadata_dir().to_path_buf();
+                    out.overlays.push(OverlaySpec {
+                        host_path: path.clone(),
+                        container_path: path.clone(),
+                        permission: OverlayPermission::ReadWrite,
+                    });
+                    out.env_literals
+                        .push(("GIT_DIR".into(), path.display().to_string()));
+                    out.env_literals
+                        .push(("GIT_WORK_TREE".into(), repo.display().to_string()));
+                    out.transport = Some(std::sync::Arc::new(isolated));
+                }
+            }
+        }
+        Ok(out)
+    }
+
     pub fn new(_session: &Session) -> Result<Self, EngineError> {
         let auth_resolver = AuthPathResolver::from_process_env().map_err(EngineError::Data)?;
         let credential_provider = default_credential_provider(auth_resolver.clone());
@@ -566,6 +783,7 @@ fn insert_or_merge(map: &mut HashMap<String, OverlaySpec>, key: String, spec: Ov
 mod agent_settings;
 mod claude;
 mod credential_file;
+pub mod prerequisite_grants;
 mod skills;
 
 #[cfg(test)]

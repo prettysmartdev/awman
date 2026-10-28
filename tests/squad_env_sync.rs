@@ -376,6 +376,7 @@ async fn the_indicator_probe_makes_exactly_one_list_call_per_tick() {
 
     // One task, carrying an unmet name on the `list` response itself.
     let task = Task {
+        prerequisites: None,
         id: "deploy".into(),
         name: "deploy".into(),
         description: "d".into(),

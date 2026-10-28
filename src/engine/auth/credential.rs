@@ -36,6 +36,26 @@ pub const CLAUDE_KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
 pub struct SecretString(String);
 
 impl SecretString {
+    pub fn input_buffer() -> Self {
+        Self(String::with_capacity(8192))
+    }
+
+    pub fn push_char(&mut self, ch: char) {
+        if self.0.len() + ch.len_utf8() <= 8192 {
+            self.0.push(ch);
+        }
+    }
+
+    pub fn pop_char(&mut self) {
+        if let Some(ch) = self.0.chars().last() {
+            let len = self.0.len() - ch.len_utf8();
+            self.0.truncate(len);
+            self.0.extend(std::iter::repeat_n('\0', ch.len_utf8()));
+            std::hint::black_box(&mut self.0);
+            self.0.truncate(len);
+        }
+    }
+
     pub fn new(s: impl Into<String>) -> Self {
         Self(s.into())
     }
@@ -43,6 +63,21 @@ impl SecretString {
     /// The only accessor. Every call site is a place a reviewer must check.
     pub fn expose(&self) -> &str {
         &self.0
+    }
+}
+
+impl Drop for SecretString {
+    /// Best-effort overwrite of the buffer before it is freed (no `unsafe`, no
+    /// `zeroize` crate): truncate, then refill the retained capacity with NULs
+    /// in place. Pushing at most `capacity` bytes never reallocates, so the
+    /// writes land on the allocation that held the secret. `black_box` keeps
+    /// the optimiser from discarding writes to memory about to be freed.
+    fn drop(&mut self) {
+        let buffer = &mut self.0;
+        let capacity = buffer.capacity();
+        buffer.clear();
+        buffer.extend(std::iter::repeat_n('\0', capacity));
+        std::hint::black_box(buffer);
     }
 }
 
@@ -573,5 +608,68 @@ mod tests {
         assert!(claude_is_auth_failure("invalid OAuth access token"));
         assert!(claude_is_auth_failure("Failed to authenticate with server"));
         assert!(!claude_is_auth_failure("everything is fine"));
+    }
+}
+
+#[cfg(test)]
+mod secret_string_tests {
+    use super::*;
+
+    #[test]
+    fn debug_never_contains_the_value_or_its_length() {
+        for value in ["a", "ghp_0123456789abcdefghij", ""] {
+            let text = format!(
+                "{:?} {:#?}",
+                SecretString::new(value),
+                SecretString::new(value)
+            );
+            assert!(!text.contains("ghp_"));
+            assert!(text.contains("<redacted>"));
+            assert!(!text.contains(&value.len().to_string()) || value.is_empty());
+        }
+    }
+
+    #[test]
+    fn clone_and_equality_work_without_exposing() {
+        let a = SecretString::new("same-value");
+        let b = a.clone();
+        assert_eq!(a, b);
+        assert_ne!(a, SecretString::new("other"));
+        assert_eq!(b.expose(), "same-value");
+    }
+
+    #[test]
+    fn nested_in_a_debug_struct_stays_redacted() {
+        #[derive(Debug)]
+        #[allow(dead_code)]
+        struct Holder {
+            token: SecretString,
+            list: Vec<SecretString>,
+            opt: Option<SecretString>,
+        }
+        let holder = Holder {
+            token: SecretString::new("ghp_nested_value"),
+            list: vec![SecretString::new("ghp_nested_value2")],
+            opt: Some(SecretString::new("ghp_nested_value3")),
+        };
+        assert!(!format!("{holder:?}").contains("ghp_nested"));
+    }
+}
+
+#[cfg(test)]
+mod input_buffer_review_tests {
+    use super::*;
+    #[test]
+    fn input_is_bounded_from_the_first_keystroke_and_debug_is_redacted() {
+        let mut input = SecretString::input_buffer();
+        for _ in 0..10000 {
+            input.push_char('x');
+        }
+        assert_eq!(input.expose().len(), 8192);
+        input.pop_char();
+        assert_eq!(input.expose().len(), 8191);
+        input.push_char('é');
+        assert_eq!(input.expose().len(), 8191);
+        assert!(!format!("{input:?}").contains("xxx"));
     }
 }

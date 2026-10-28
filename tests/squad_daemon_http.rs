@@ -364,6 +364,7 @@ async fn the_workflow_route_serves_the_live_state_verbatim_while_a_run_is_in_fli
     let now = chrono::Utc::now();
     store
         .create(&awman::data::fs::Task {
+            prerequisites: None,
             id: uuid::Uuid::new_v4().to_string(),
             name: "issue-triage".into(),
             description: "watch new issues".into(),
@@ -513,6 +514,7 @@ fn seed_task_for_agent(root: &std::path::Path, name: &str, overlays: &[&str], ag
     let now = chrono::Utc::now();
     store
         .create(&awman::data::fs::Task {
+            prerequisites: None,
             id: uuid::Uuid::new_v4().to_string(),
             name: name.into(),
             description: "seeded for the env protocol tests".into(),
@@ -1400,6 +1402,7 @@ async fn a_slow_keychain_write_does_not_park_the_runtime_during_a_push() {
     let now = chrono::Utc::now();
     store
         .create(&awman::data::fs::Task {
+            prerequisites: None,
             id: uuid::Uuid::new_v4().to_string(),
             name: "nightly".into(),
             description: "declares the pushed name".into(),
@@ -1530,4 +1533,30 @@ async fn approved_custom_agent_auth_env_is_required_and_collected_with_its_task(
     assert!(!captured_log().contains(SECRET));
 
     handle.abort();
+}
+
+#[tokio::test]
+async fn prerequisite_widening_is_refused_by_the_real_squad_route_unless_operator_opts_in() {
+    let _env_guard = ENV_LOCK.lock().await;
+    for (use_policy, allow) in [("ask", false), ("deny", false), ("ask", true)] {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("config.json"), serde_json::json!({
+            "squad": {"envPersistence":"none"},
+            "workflows": {"prerequisites": {"allowApiClientGrants":allow, "ssh":{"use":use_policy}}}
+        }).to_string()).unwrap();
+        let (handle, base) = start_daemon(root.path(), Arc::new(ContainerRuntime::docker())).await;
+        for (name, flag, value, accepted) in [
+            ("ssh-task", "--prerequisite-ssh", "all", allow),
+            ("token-task", "--prerequisite-token", "env:GH_TOKEN", allow),
+            ("narrow-task", "--prerequisite-ssh", "deny", true),
+        ] {
+            let response = reqwest::Client::new().post(format!("{base}/v1/commands")).json(&serde_json::json!({
+                "subcommand":"squad add", "args":["--name",name,"--description","security fixture","--mount-scope","cwd","--workspace",root.path().to_str().unwrap(),"--interval","1h",flag,value,"--non-interactive"]
+            })).send().await.unwrap();
+            let status = response.status();
+            let text = response.text().await.unwrap();
+            assert_eq!(status.as_u16(), if accepted { 200 } else { 403 }, "{text}");
+        }
+        handle.abort();
+    }
 }

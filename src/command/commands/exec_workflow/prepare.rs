@@ -216,6 +216,10 @@ pub(crate) struct PreparedRun {
     /// resume path, which has already asked the user a strictly better version
     /// of the same question (WI-0115 §2).
     pub(crate) skip_state_resume_prompt: bool,
+    /// The run's workflow prerequisites (WI 0149): needs, report, grants and
+    /// the redaction set. Grants live here for the run and nowhere else.
+    pub(crate) prerequisites:
+        Box<crate::command::commands::workflow_prerequisites::PreparedPrerequisites>,
 }
 
 /// Execute a fully-prepared workflow: persisted-state resume check, engine
@@ -248,7 +252,11 @@ pub(crate) async fn execute_prepared(
         issue_temp_file: _issue_temp_file,
         launch_modes,
         skip_state_resume_prompt,
+        prerequisites,
     } = prepared;
+    let mut prerequisites = prerequisites;
+    // The pre-teardown re-check probes the checkout the steps really mount.
+    prerequisites.flow.set_worktree(worktree_path.clone());
 
     // Resolved from the invoking session: the worktree session's config is
     // whatever was committed on the branch, not what the user has now.
@@ -301,6 +309,7 @@ pub(crate) async fn execute_prepared(
                 })
             });
             return Ok(ExecWorkflowOutcome {
+                prerequisites: None,
                 workflow: workflow_name,
                 exit_code: None,
                 worktree_used: worktree_path.is_some(),
@@ -430,7 +439,14 @@ pub(crate) async fn execute_prepared(
             &session,
             crate::engine::workflow::WorkflowSpec::new(workflow)
                 .with_work_item_context(engine_work_item_context)
-                .with_state_root(workflow_state_root.map(Path::to_path_buf)),
+                .with_state_root(workflow_state_root.map(Path::to_path_buf))
+                // poll_ci runs on the host with the granted token, never the
+                // ambient GITHUB_TOKEN.
+                .with_ci_token(
+                    prerequisites
+                        .remote("origin")
+                        .and_then(|remote| prerequisites.grants.token_for_remote(&remote)),
+                ),
             crate::engine::workflow::WorkflowEngineDeps {
                 frontend: proxy.into_workflow_frontend(),
                 agent_factory: Box::new(factory),
@@ -455,6 +471,8 @@ pub(crate) async fn execute_prepared(
             engine = engine.mirror_into_session(Arc::clone(session));
         }
         engine.set_yolo(yolo);
+        engine.set_ci_destination(prerequisites.remote("origin").map(|r| r.redacted));
+        engine.set_ci_host_binaries(prerequisites.flow.options().custom_agent_binaries.clone());
         engine.set_cancellation(cancel.clone());
         engine.set_parallel_group_prompts(crate::command::prompts::parallel_group_prompts());
         engine.set_workflow_context_permission(active_workflow_context_permission);
@@ -466,33 +484,15 @@ pub(crate) async fn execute_prepared(
             return Err(CommandError::from(e));
         }
 
-        // Warn if the workflow will commit but git identity is not configured.
-        if teardown_steps.iter().any(|s| {
-            matches!(
-                s,
-                crate::data::workflow_definition::TeardownStep::CommitChanges { .. }
-            )
-        }) {
-            // Probed at the worktree (or session root) so a repo-local
-            // identity counts: the pre-F-39 probe ran `git config` with no
-            // working directory and only ever saw the global value.
-            let identity = engines
-                .git_engine
-                .identity_configured(worktree_path.as_deref().unwrap_or(&git_root_for_scope))
-                .unwrap_or_default();
-            if !identity.is_complete() {
-                let missing = identity.missing_keys();
-                shared.lock().unwrap().write_message(UserMessage {
-                    level: MessageLevel::Warning,
-                    text: format!(
-                        "workflow has a commit_changes teardown step but git {} not set; \
-                         set them locally (git config {0}) or use a dir() overlay to mount \
-                         your global ~/.gitconfig into the agent container",
-                        missing.join(" and "),
-                    ),
-                });
-            }
-        }
+        // The commit_changes identity is a workflow prerequisite (WI 0149): it
+        // was checked against what the container sees, and granted, before
+        // the run started. The run's one redaction set covers every granted
+        // token in step output and failure files.
+        engine.set_redaction(prerequisites.redaction.clone());
+        let mut step_command_options: Vec<(
+            (PhaseKind, usize),
+            crate::engine::workflow::step_commands::StepCommandOptions,
+        )> = Vec::new();
 
         // When a person is at the frontend (the CLI on a TTY, the TUI), each
         // setup/teardown shell step runs as a foreground, PTY-attached
@@ -501,8 +501,9 @@ pub(crate) async fn execute_prepared(
         // `--non-interactive` CLI — keeps the headless background container.
         // A squad-generated workflow is always headless, whichever frontend
         // is driving it.
-        let interactive_phase_steps =
-            squad_identity.is_none() && shared.lock().unwrap().supports_interactive_recovery();
+        let interactive_phase_steps = prerequisites.redaction.is_empty()
+            && squad_identity.is_none()
+            && shared.lock().unwrap().supports_interactive_recovery();
 
         shared.lock().unwrap().record_cancel_cleanup(
             &crate::data::workflow_cleanup::WorkflowCleanup {
@@ -538,7 +539,7 @@ pub(crate) async fn execute_prepared(
                 &git_root_for_scope,
                 engines.runtime.capabilities().image_acquisition,
             );
-            let resolved = resolve_phase_overlays(
+            let mut resolved = resolve_phase_overlays(
                 engines,
                 &session,
                 &cli_typed,
@@ -546,6 +547,20 @@ pub(crate) async fn execute_prepared(
                 worktree_git_mount.as_ref(),
                 &base_image,
             );
+            // Grant overlays go after the user's and the step's own, and only
+            // to the step kinds that receive grants (pull_branch, clone_repo).
+            // `_setup_grants` keeps their scratch files alive for the phase.
+            let (_setup_grants, setup_options) = apply_grant_overlays(
+                engines,
+                &prerequisites,
+                PhaseKind::Setup,
+                &setup_grant_kinds(&setup_steps),
+                &mut resolved,
+                &base_image,
+                &mut **shared.lock().unwrap(),
+            );
+            step_command_options.extend(setup_options);
+            engine.set_phase_step_command_options(step_command_options.clone());
 
             // A bad overlay on ANY entry aborts the whole phase before
             // any container starts — otherwise earlier steps would have
@@ -591,6 +606,14 @@ pub(crate) async fn execute_prepared(
                             image: &base,
                             workdir: &mount,
                             interactive: interactive_phase_steps,
+                            secret_env: _setup_grants
+                                .iter()
+                                .find(|(i, _)| *i == idx)
+                                .map_or(&[], |(_, g)| g.secret_env.as_slice()),
+                            transport: _setup_grants
+                                .iter()
+                                .find(|(i, _)| *i == idx)
+                                .and_then(|(_, g)| g.transport.as_ref()),
                         }
                         .build(step, env, overlays)
                     };
@@ -682,7 +705,44 @@ pub(crate) async fn execute_prepared(
                     &git_root_for_scope,
                     engines.runtime.capabilities().image_acquisition,
                 );
-                let resolved = resolve_phase_overlays(
+                // Re-check the prerequisites without prompting (WI 0149 §3):
+                // a granted env var may have gone, and a `refresh:
+                // "beforeTeardown"` token command runs again. Gaps become one
+                // warning here rather than N step failures. A cancelled
+                // teardown skips push, PR and poll_ci, so it skips this too.
+                if !cancelled {
+                    let crate::command::commands::workflow_prerequisites::PreparedPrerequisites {
+                        flow,
+                        needs,
+                        grants,
+                        redaction,
+                        remotes,
+                        ..
+                    } = &mut *prerequisites;
+                    let report = flow.recheck_before_teardown(
+                        needs,
+                        grants,
+                        redaction,
+                        &mut **shared.lock().unwrap(),
+                    );
+                    if let Some(session) = managed_session {
+                        session
+                            .write()
+                            .await
+                            .state_mut()
+                            .record_workflow_prerequisites(report);
+                    }
+                    engine.set_ci_token(
+                        remotes
+                            .get("origin")
+                            .and_then(|remote| grants.token_for_remote(remote)),
+                    );
+                }
+                if cancelled {
+                    prerequisites.grants = Default::default();
+                    engine.set_ci_token(None);
+                }
+                let mut resolved = resolve_phase_overlays(
                     engines,
                     &session,
                     &cli_typed,
@@ -690,6 +750,19 @@ pub(crate) async fn execute_prepared(
                     worktree_git_mount.as_ref(),
                     &base_image,
                 );
+                // `_teardown_grants` keeps the grant scratch files (the
+                // writable known_hosts copy) alive until the phase ends.
+                let (_teardown_grants, teardown_options) = apply_grant_overlays(
+                    engines,
+                    &prerequisites,
+                    PhaseKind::Teardown,
+                    &teardown_grant_kinds(&teardown_steps),
+                    &mut resolved,
+                    &base_image,
+                    &mut **shared.lock().unwrap(),
+                );
+                step_command_options.extend(teardown_options);
+                engine.set_phase_step_command_options(step_command_options.clone());
                 let runtime = Arc::clone(
                     engines
                         .require_container_runtime()
@@ -720,6 +793,14 @@ pub(crate) async fn execute_prepared(
                             image: &base_image,
                             workdir: &mount,
                             interactive: interactive_phase_steps,
+                            secret_env: _teardown_grants
+                                .iter()
+                                .find(|(i, _)| *i == idx)
+                                .map_or(&[], |(_, g)| g.secret_env.as_slice()),
+                            transport: _teardown_grants
+                                .iter()
+                                .find(|(i, _)| *i == idx)
+                                .and_then(|(_, g)| g.transport.as_ref()),
                         }
                         .build(step, env, overlays)
                     };
@@ -887,6 +968,7 @@ pub(crate) async fn execute_prepared(
     // error return above.
 
     Ok(ExecWorkflowOutcome {
+        prerequisites: None,
         workflow: workflow_path.display().to_string(),
         exit_code,
         worktree_used: worktree_path.is_some(),
@@ -1224,7 +1306,7 @@ pub(crate) fn resolve_base_image(session: &Session, git_root: &std::path::Path) 
     crate::data::image_tags::project_image_tag(git_root)
 }
 
-fn resolve_phase_image(
+pub(crate) fn resolve_phase_image(
     session: &Session,
     git_root: &std::path::Path,
     acquisition: crate::engine::agent_runtime::ImageAcquisition,
@@ -1454,6 +1536,8 @@ pub(crate) async fn finish_cancelled_cleanup(
                     image: &cleanup.image,
                     workdir: &cleanup.mount_path,
                     interactive: false,
+                    secret_env: &[],
+                    transport: None,
                 }
                 .build(step, env, overlays)
             })

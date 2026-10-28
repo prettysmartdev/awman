@@ -21,6 +21,7 @@ use chrono::{Duration, Utc};
 
 fn task(name: &str, now: chrono::DateTime<Utc>) -> Task {
     Task {
+        prerequisites: None,
         id: format!("id-{name}"),
         name: name.into(),
         description: format!("when {name} happens"),
@@ -90,6 +91,7 @@ fn squad_schema_and_workspace_overlay_fields_round_trip() {
     let now = Utc::now();
     let workspace = tmp.path().join("squad/tasks/durable/workspace");
     let stored = Task {
+        prerequisites: None,
         id: "durable-id".into(),
         name: "durable".into(),
         description: "preserve task state".into(),
@@ -172,6 +174,7 @@ async fn malformed_task_overlay_is_rejected_before_store_or_workspace_write() {
         model: None,
         overlays: vec!["not-an-overlay".into()],
         agents_to_models: Default::default(),
+        prerequisites: None,
     };
 
     let error = gateway.create(request).await.unwrap_err();
@@ -368,6 +371,7 @@ async fn task_store_crud_is_exercised_through_daemon_gateway() {
         model: None,
         overlays: Vec::new(),
         agents_to_models: Default::default(),
+        prerequisites: None,
     };
 
     let created = gateway.create(request()).await.unwrap();
@@ -509,6 +513,7 @@ async fn a_custom_workspace_below_a_repository_root_is_a_plain_directory_and_nev
             model: None,
             overlays: Vec::new(),
             agents_to_models: Default::default(),
+            prerequisites: None,
         })
         .await
         .unwrap();
@@ -531,6 +536,7 @@ async fn a_custom_workspace_below_a_repository_root_is_a_plain_directory_and_nev
             model: None,
             overlays: Vec::new(),
             agents_to_models: Default::default(),
+            prerequisites: None,
         })
         .await
         .unwrap();
@@ -641,6 +647,7 @@ fn editable_task(name: &str) -> CreateTask {
         model: Some("claude-opus-4-8".into()),
         overlays: vec!["env(GITHUB_TOKEN)".into()],
         agents_to_models: Default::default(),
+        prerequisites: None,
     }
 }
 
@@ -873,6 +880,7 @@ async fn a_task_config_layers_over_the_global_squad_block() {
     let tmp = tempfile::tempdir().unwrap();
     let (_store, gateway, paths) = edit_fixture(&tmp);
     let global = SquadConfig {
+        workflows: None,
         agents_to_models: Some(std::collections::HashMap::from([(
             "claude".to_string(),
             vec!["claude-opus-4-8".to_string()],

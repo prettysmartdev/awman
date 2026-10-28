@@ -15,15 +15,22 @@ use crate::command::commands::agent_trust::{AgentTrustReview, TrustDecision};
 use crate::command::commands::agents::{AgentSnapshot, AgentSource, KillChoice};
 use crate::command::commands::specs::WorkItemKind;
 use crate::command::commands::squad::commands::{SquadConfirmDecision, TaskWorkspaceChoice};
+use crate::command::commands::workflow_prerequisites::{
+    GapChoice, IdentityChoice, IdentityPersist, SshChoice, TokenConsent, TokenSourceChoice,
+    ToolChoice,
+};
 use crate::command::dispatch::catalogue::{CommandCatalogue, FlagDefault};
 use crate::command::dispatch::frontend_action::FrontendAction;
 use crate::data::fs::task_store::MountScope;
 use crate::data::prompt::{Choice, Prompt, TextPrompt};
+use crate::data::workflow_prerequisites::{PrerequisiteCheck, Remediation};
 use crate::data::workflow_state::StepState;
+use crate::engine::auth::host_secret_command::HostSecretCommandReview;
 use crate::engine::init::frontend::DockerfileSetupChoice;
 use crate::engine::workflow::actions::{
     GroupExit, GroupMember, ParallelGroupDecision, ParallelGroupPrompts,
 };
+use std::path::{Path, PathBuf};
 
 /// Which kind of work item `awman new spec` / `awman specs` is creating.
 ///
@@ -334,6 +341,444 @@ fn cancel_parallel_group(group: &[String], exit: &GroupExit) -> Prompt<ParallelG
     )
 }
 
+// ─── Workflow prerequisites (WI 0149) ───────────────────────────────────────
+//
+// Every question the workflow prerequisite flow asks. Each one that grants a
+// credential has `default_on_dismiss` = the refusal (`Continue` without it,
+// `Decline`), so Esc or Ctrl-C applies nothing for that prerequisite. The
+// tool and gap questions dismiss to `Abort`: walking away from "this step
+// will fail" should not start a long run.
+
+/// "push_branch", "push_branch, create_pull_request" or "any teardown step"
+/// (a dynamic run, whose steps do not exist yet).
+fn prerequisite_steps(check: &PrerequisiteCheck) -> String {
+    if check.needed_by.is_empty() {
+        return "any teardown step".to_string();
+    }
+    let mut kinds: Vec<&str> = Vec::new();
+    for step in &check.needed_by {
+        let label = step.kind.label();
+        if !kinds.contains(&label) {
+            kinds.push(label);
+        }
+    }
+    kinds.join(", ")
+}
+
+/// The git identity question for `commit_changes`, built from the check's
+/// remediations so only the answers that apply are offered. The persistent
+/// `.git/config` write is listed last.
+pub fn prerequisite_identity(check: &PrerequisiteCheck) -> Prompt<IdentityChoice> {
+    let mut choices = Vec::new();
+    let mut set_local = None;
+    for remediation in &check.remediations {
+        match remediation {
+            Remediation::UseHostIdentity { name, email } => choices.push(Choice::new(
+                'h',
+                format!("Use host identity \"{name} <{email}>\""),
+                IdentityChoice::UseHost {
+                    name: name.clone(),
+                    email: email.clone(),
+                },
+            )),
+            Remediation::EnterIdentity => choices.push(Choice::new(
+                'e',
+                "Enter a name and email",
+                IdentityChoice::Enter,
+            )),
+            Remediation::SetLocalIdentity { name, email, .. } => {
+                set_local = Some(Choice::new(
+                    'g',
+                    "Set it in this repo's .git/config",
+                    IdentityChoice::SetLocalFromHost {
+                        name: name.clone(),
+                        email: email.clone(),
+                    },
+                ))
+            }
+            _ => {}
+        }
+    }
+    if !choices
+        .iter()
+        .any(|c| matches!(c.value, IdentityChoice::Enter))
+    {
+        choices.push(Choice::new(
+            'e',
+            "Enter a name and email",
+            IdentityChoice::Enter,
+        ));
+    }
+    choices.extend(set_local);
+    choices.push(Choice::new(
+        'c',
+        "Continue without (commit_changes will fail)",
+        IdentityChoice::Continue,
+    ));
+    Prompt::new(
+        format!(
+            "{} needs a git identity inside its container",
+            prerequisite_steps(check)
+        ),
+        format!(
+            "{}\n\nA global ~/.gitconfig on this host is not visible inside the step container. \
+             A chosen identity is injected as GIT_AUTHOR_*/GIT_COMMITTER_* only into \
+             commit_changes containers.",
+            check.explanation
+        ),
+        choices,
+        Some(IdentityChoice::Continue),
+    )
+}
+
+/// The name asked after "Enter a name and email".
+pub fn prerequisite_identity_name() -> TextPrompt {
+    TextPrompt::new(
+        "Git author name",
+        "Used for commit_changes in this run only. Must not be empty or contain a newline.",
+        None,
+    )
+}
+
+/// The email asked after the name.
+pub fn prerequisite_identity_email() -> TextPrompt {
+    TextPrompt::new(
+        "Git author email",
+        "Used for commit_changes in this run only. Must contain '@' and no newline.",
+        None,
+    )
+}
+
+/// Confirmation before awman writes `user.name`/`user.email` into the repo's
+/// `.git/config` on the host. `command` is the exact command that will run.
+/// Dismiss means "don't write it", which still uses the identity for this run.
+pub fn prerequisite_identity_persist(command: &str) -> Prompt<IdentityPersist> {
+    Prompt::new(
+        "Write the identity into this repo's .git/config?",
+        format!(
+            "awman will run this ON YOUR HOST:\n\n  {command}\n\n\
+             The setting persists after this run. In a worktree it is written to the \
+             repository's shared config, so every worktree of this repository sees it."
+        ),
+        vec![
+            Choice::new(
+                'w',
+                "Run it and write .git/config",
+                IdentityPersist::WriteLocal,
+            ),
+            Choice::new(
+                'r',
+                "Don't write it; use the identity for this run only",
+                IdentityPersist::RunOnly,
+            ),
+        ],
+        Some(IdentityPersist::RunOnly),
+    )
+}
+
+/// The SSH key question for `push_branch` (and `pull_branch`/`clone_repo`
+/// over SSH). One "this run" choice per detected key, each followed by its
+/// "remember" variant, then the whole `~/.ssh` (offered last because it also
+/// exposes `config`, other keys and agent sockets named in config), then
+/// "Don't use SSH keys".
+///
+/// `remote` is the credential-stripped remote URL.
+pub fn prerequisite_ssh(check: &PrerequisiteCheck, remote: &str) -> Prompt<SshChoice> {
+    const RUN_KEYS: &[char] = &['1', '2', '3', '4', '5', '6', '7', '8'];
+    const REMEMBER_KEYS: &[char] = &['a', 'b', 'd', 'e', 'f', 'g', 'h', 'i'];
+    let steps = prerequisite_steps(check);
+    let keys: Vec<(&String, &Option<bool>, bool, bool)> = check
+        .remediations
+        .iter()
+        .filter_map(|r| match r {
+            Remediation::MountSshKey {
+                path,
+                passphrase_protected,
+                remembered,
+                suggested,
+                ..
+            } => Some((path, passphrase_protected, *remembered, *suggested)),
+            _ => None,
+        })
+        .take(RUN_KEYS.len())
+        .collect();
+    let mut choices = Vec::new();
+    for (i, (path, passphrase, remembered, suggested)) in keys.iter().enumerate() {
+        let display = tilde_path(path);
+        let mut note = String::new();
+        if **passphrase == Some(true) {
+            note.push_str(" (passphrase-protected: will fail unattended)");
+        }
+        if *suggested {
+            note.push_str(" (suggested by repo config)");
+        }
+        if *remembered {
+            note.push_str(" (remembered)");
+        }
+        choices.push(Choice::new(
+            RUN_KEYS[i],
+            format!("Mount {display} read-only for this run{note}"),
+            SshChoice::Key {
+                path: PathBuf::from(path.as_str()),
+                remember: false,
+            },
+        ));
+        choices.push(Choice::new(
+            REMEMBER_KEYS[i],
+            format!("Mount {display} read-only and remember for this repo"),
+            SshChoice::Key {
+                path: PathBuf::from(path.as_str()),
+                remember: true,
+            },
+        ));
+    }
+    if check
+        .remediations
+        .iter()
+        .any(|r| matches!(r, Remediation::MountSshDir))
+    {
+        choices.push(Choice::new(
+            'w',
+            "Mount the whole ~/.ssh read-only",
+            SshChoice::WholeDir,
+        ));
+    }
+    choices.push(Choice::new(
+        'n',
+        "Don't use SSH keys (push_branch will fail)",
+        SshChoice::Decline,
+    ));
+    let mut body = format!(
+        "The chosen key is mounted read-only, as a single file, at \
+         ~/.ssh/{GRANT_SSH_KEY} inside the {steps} container only, with a writable \
+         copy of known_hosts. No other step, agent or remediation agent sees it.\n\n{}",
+        check.explanation
+    );
+    let all_protected = !keys.is_empty() && keys.iter().all(|(_, p, _, _)| **p == Some(true));
+    if all_protected {
+        body.push_str(
+            "\n\nEvery detected key is passphrase-protected, and a step container cannot \
+             prompt for a passphrase. Consider a deploy key without a passphrase, or an \
+             HTTPS remote with a GitHub token.",
+        );
+    }
+    Prompt::new(
+        format!(
+            "{steps} pushes to {remote} over SSH. Allow awman to mount an SSH key into the \
+             {steps} container?"
+        ),
+        body,
+        choices,
+        Some(SshChoice::Decline),
+    )
+}
+
+const GRANT_SSH_KEY: &str =
+    crate::engine::overlay::prerequisite_grants::GRANT_SSH_KEY_CONTAINER_NAME;
+
+/// `$HOME/.ssh/id_x` → `~/.ssh/id_x` for display. Paths outside `$HOME` are
+/// shown as they are.
+fn tilde_path(path: &str) -> String {
+    match crate::data::config::env::host_var("HOME") {
+        Some(home) if !home.is_empty() => match Path::new(path).strip_prefix(&home) {
+            Ok(rest) => format!("~/{}", rest.display()),
+            Err(_) => path.to_string(),
+        },
+        _ => path.to_string(),
+    }
+}
+
+/// "Use the token found in `var`?", asked when a token is set in the
+/// environment. The token goes only to the containers that need it.
+pub fn prerequisite_token_consent(check: &PrerequisiteCheck, var: &str) -> Prompt<TokenConsent> {
+    let steps = prerequisite_steps(check);
+    Prompt::new(
+        format!("{steps} need a GitHub token. Use the token in {var} for teardown steps?"),
+        format!(
+            "The token is passed by name only to the containers that need it \
+             (create_pull_request as GH_TOKEN, an HTTPS push_branch as AWMAN_GIT_TOKEN) and \
+             to poll_ci on the host. It is redacted from step output and never written to \
+             disk. \"Remember\" stores only the variable name, {var}."
+        ),
+        vec![
+            Choice::new('y', "Yes, this run", TokenConsent::ThisRun),
+            Choice::new(
+                'r',
+                "Yes, and remember for this repo",
+                TokenConsent::Remember,
+            ),
+            Choice::new('n', "No", TokenConsent::Decline),
+        ],
+        Some(TokenConsent::Decline),
+    )
+}
+
+/// Where a GitHub token should come from, asked when none is set or consent
+/// to the one found was declined. Only the sources the check offers are
+/// listed, in the work item's order.
+pub fn prerequisite_token_source(check: &PrerequisiteCheck) -> Prompt<TokenSourceChoice> {
+    let steps = prerequisite_steps(check);
+    let mut choices = Vec::new();
+    let mut body = Vec::new();
+    for remediation in &check.remediations {
+        match remediation {
+            Remediation::PasteToken => {
+                choices.push(Choice::new('1', "Paste a token", TokenSourceChoice::Paste))
+            }
+            Remediation::RunGhAuthToken {
+                argv,
+                resolved_path,
+                ..
+            } => {
+                choices.push(Choice::new(
+                    '2',
+                    "Run \"gh auth token\" on this host",
+                    TokenSourceChoice::GhAuthToken,
+                ));
+                body.push(format!(
+                    "\"gh auth token\" runs ON YOUR HOST: {} (resolved to {resolved_path})",
+                    render_argv(argv)
+                ));
+            }
+            Remediation::RunGhAuthLogin {
+                argv,
+                resolved_path,
+            } => {
+                choices.push(Choice::new(
+                    '3',
+                    "Log in with \"gh auth login\" on this host, then use its token",
+                    TokenSourceChoice::GhAuthLogin,
+                ));
+                body.push(format!(
+                    "\"gh auth login\" runs ON YOUR HOST in the foreground: {} (resolved to \
+                     {resolved_path})",
+                    render_argv(argv)
+                ));
+            }
+            Remediation::RunAcquireCommand {
+                label, argv, scope, ..
+            } => {
+                choices.push(Choice::new(
+                    '4',
+                    format!("Run the configured token command ({})", render_argv(argv)),
+                    TokenSourceChoice::Acquire,
+                ));
+                let from = match scope {
+                    crate::data::workflow_prerequisites::AcquireScope::Global => {
+                        "your global config"
+                    }
+                    crate::data::workflow_prerequisites::AcquireScope::Repo => {
+                        "this repository's config; it needs your approval first"
+                    }
+                };
+                body.push(format!(
+                    "{label} from {from} runs ON YOUR HOST: {}",
+                    render_argv(argv)
+                ));
+            }
+            _ => {}
+        }
+    }
+    choices.push(Choice::new(
+        'c',
+        "Continue without a token",
+        TokenSourceChoice::Decline,
+    ));
+    body.push(
+        "Continuing without a token: create_pull_request will fail; poll_ci will fall back \
+         to unauthenticated, rate-limited requests."
+            .to_string(),
+    );
+    Prompt::new(
+        format!("{steps} need a GitHub token. Where should it come from?"),
+        body.join("\n"),
+        choices,
+        Some(TokenSourceChoice::Decline),
+    )
+}
+
+/// The masked prompt for a pasted token.
+pub fn prerequisite_token_paste() -> TextPrompt {
+    TextPrompt::masked(
+        "Paste a GitHub token",
+        "The token is held in memory for this run only and never written anywhere.",
+    )
+}
+
+/// A tool missing from the phase image. awman never edits a Dockerfile
+/// itself, so the body shows the exact line to add.
+pub fn prerequisite_missing_tool(check: &PrerequisiteCheck) -> Prompt<ToolChoice> {
+    let mut body = check.explanation.clone();
+    for remediation in &check.remediations {
+        if let Remediation::AddDockerfileLine { file, line } = remediation {
+            body.push_str(&format!(
+                "\n\nAdd this line to {file} (or your configured base image) and rebuild:\n  {line}"
+            ));
+        }
+    }
+    Prompt::new(
+        format!(
+            "{} is missing from the image {} runs in",
+            check.prerequisite.label(),
+            prerequisite_steps(check)
+        ),
+        body,
+        vec![
+            Choice::new('c', "Continue (the step will fail)", ToolChoice::Continue),
+            Choice::new('a', "Abort the run", ToolChoice::Abort),
+        ],
+        Some(ToolChoice::Abort),
+    )
+}
+
+/// A gap no grant can fix: a missing remote, a detached HEAD, a pull request
+/// with no push before it.
+pub fn prerequisite_gap(check: &PrerequisiteCheck) -> Prompt<GapChoice> {
+    Prompt::new(
+        format!(
+            "{}: {} will fail",
+            check.prerequisite.label(),
+            prerequisite_steps(check)
+        ),
+        check.explanation.clone(),
+        vec![
+            Choice::new('c', "Continue", GapChoice::Continue),
+            Choice::new('a', "Abort the run", GapChoice::Abort),
+        ],
+        Some(GapChoice::Abort),
+    )
+}
+
+/// Approval of a repository-defined token command
+/// (`workflows.prerequisites.githubToken.acquire` in `.awman/config.json`)
+/// for its exact content hash. `default_on_dismiss` is `Some(Decline)`:
+/// walking away from an approval is a refusal.
+pub fn prerequisite_acquire_approval(review: &HostSecretCommandReview) -> Prompt<TrustDecision> {
+    Prompt::new(
+        "Approve this repository's GitHub token command?",
+        format!(
+            "⚠ awman will run this command ON YOUR HOST (not in a container):\n\n  {}\n\n\
+             Resolved program: {}\nTimeout: {}s\nSHA-256: {}\n\n\
+             It comes from this repository's .awman/config.json. The approval is \
+             remembered for this exact command; any change asks again.",
+            review.rendered,
+            review.resolved_path.display(),
+            review.timeout_secs,
+            review.sha256
+        ),
+        vec![
+            Choice::new('y', "Approve this command", TrustDecision::Approve),
+            Choice::new('n', "Do not approve", TrustDecision::Decline),
+        ],
+        Some(TrustDecision::Decline),
+    )
+}
+
+/// argv joined for display, shell-quoted where needed.
+fn render_argv(argv: &[String]) -> String {
+    shell_words::join(argv)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -616,4 +1061,115 @@ mod parity_tests {
             );
         }
     }
+}
+
+#[cfg(test)]
+mod wi0149_tests {
+    use super::*;
+    fn check(remediations: Vec<Remediation>) -> PrerequisiteCheck {
+        PrerequisiteCheck {
+            prerequisite: crate::data::workflow_prerequisites::WorkflowPrerequisite::GitIdentity,
+            status: crate::data::workflow_prerequisites::PrerequisiteStatus::NeedsConsent,
+            explanation: "fixture".into(),
+            needed_by: vec![],
+            remediations,
+        }
+    }
+    #[test]
+    fn wi0149_all_prerequisite_prompts_have_safe_dismiss_defaults_and_unique_keys() {
+        fn unique<D>(p: &Prompt<D>) {
+            let keys = p.keys();
+            assert_eq!(
+                keys.iter().collect::<std::collections::BTreeSet<_>>().len(),
+                keys.len()
+            );
+        }
+        let c = check(vec![
+            Remediation::UseHostIdentity {
+                name: "Ada".into(),
+                email: "ada@x".into(),
+            },
+            Remediation::SetLocalIdentity {
+                name: "Ada".into(),
+                email: "ada@x".into(),
+                command: "git config --local".into(),
+            },
+        ]);
+        let identity = prerequisite_identity(&c);
+        unique(&identity);
+        assert_eq!(identity.keys(), vec!['h', 'e', 'g', 'c']);
+        assert_eq!(identity.default_on_dismiss, Some(IdentityChoice::Continue));
+        assert_eq!(identity.labels()[0], "Use host identity \"Ada <ada@x>\"");
+        let persist = prerequisite_identity_persist("git config --local user.name Ada");
+        unique(&persist);
+        assert_eq!(persist.default_on_dismiss, Some(IdentityPersist::RunOnly));
+        assert!(persist.body.contains("git config --local user.name Ada"));
+        let c = check(vec![
+            Remediation::MountSshKey {
+                path: "/home/test/.ssh/id_ed25519".into(),
+                passphrase_protected: Some(true),
+                mode_ok: true,
+                remembered: false,
+                suggested: false,
+            },
+            Remediation::MountSshDir,
+        ]);
+        let ssh = prerequisite_ssh(&c, "github.com:org/repo.git");
+        unique(&ssh);
+        assert_eq!(ssh.keys(), vec!['1', 'a', 'w', 'n']);
+        assert!(ssh.labels()[0].contains("passphrase-protected: will fail unattended"));
+        assert!(ssh.body.contains("read-only"));
+        assert!(ssh.body.contains("deploy key"));
+        assert_eq!(ssh.default_on_dismiss, Some(SshChoice::Decline));
+        let token = prerequisite_token_consent(&c, "GH_TOKEN");
+        unique(&token);
+        assert_eq!(
+            token.labels(),
+            vec!["Yes, this run", "Yes, and remember for this repo", "No"]
+        );
+        assert_eq!(token.default_on_dismiss, Some(TokenConsent::Decline));
+        let source = prerequisite_token_source(&c);
+        unique(&source);
+        assert_eq!(source.default_on_dismiss, Some(TokenSourceChoice::Decline));
+        assert_eq!(source.labels().last(), Some(&"Continue without a token"));
+        let tool = prerequisite_missing_tool(&c);
+        unique(&tool);
+        assert_eq!(tool.default_on_dismiss, Some(ToolChoice::Abort));
+        let gap = prerequisite_gap(&c);
+        unique(&gap);
+        assert_eq!(gap.default_on_dismiss, Some(GapChoice::Abort));
+        let review = HostSecretCommandReview {
+            label: "op".into(),
+            argv: vec!["op".into()],
+            rendered: "op read vault".into(),
+            resolved_path: "/usr/bin/op".into(),
+            timeout_secs: 30,
+            sha256: "exact-hash".into(),
+        };
+        let approval = prerequisite_acquire_approval(&review);
+        unique(&approval);
+        assert_eq!(approval.default_on_dismiss, Some(TrustDecision::Decline));
+        for detail in ["ON YOUR HOST", "/usr/bin/op", "op read vault", "exact-hash"] {
+            assert!(approval.body.contains(detail));
+        }
+        assert!(prerequisite_token_paste().masked);
+        assert!(!prerequisite_identity_name().masked);
+        assert!(!prerequisite_identity_email().masked);
+    }
+}
+
+/// The summary is a decision in every interactive frontend. Esc continues;
+/// Ctrl-C is an explicit abort, handled by the frontend's input transport.
+pub fn prerequisite_report(
+    report: &crate::data::workflow_prerequisites::WorkflowPrerequisiteReport,
+) -> Prompt<bool> {
+    Prompt::new(
+        report.summary_line(),
+        report.render_lines().join("\n"),
+        vec![
+            Choice::new('c', "Continue", true),
+            Choice::new('a', "Abort the run", false),
+        ],
+        Some(true),
+    )
 }

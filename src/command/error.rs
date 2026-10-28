@@ -236,6 +236,23 @@ pub enum CommandError {
     #[error("workflow file not found: {path}")]
     WorkflowFileNotFound { path: std::path::PathBuf },
 
+    // ── Workflow prerequisites (WI 0149) ──────────────────────────────────
+    /// A prerequisite is still unsatisfied after prompts and policy, and the
+    /// `unresolved` policy is `fail`. Raised before any container starts.
+    #[error("workflow prerequisites unresolved: {}", report.summary_line())]
+    WorkflowPrerequisitesUnresolved {
+        report: Box<crate::data::workflow_prerequisites::WorkflowPrerequisiteReport>,
+    },
+
+    /// An API or squad-daemon client passed a `--prerequisite-*` flag that
+    /// grants more than the server's global policy allows.
+    #[error("flag '{flag}' would grant beyond the server's global prerequisite policy; set workflows.prerequisites.allowApiClientGrants in the server's global config")]
+    PrerequisiteWideningRefused { flag: String },
+
+    /// A `--prerequisite-*` value this build cannot honour yet.
+    #[error("flag '{flag}' is unsupported until per-command secrets are available")]
+    PrerequisiteFlagUnsupported { flag: String },
+
     // ── Agents (`awman agents …`) ─────────────────────────────────────────
     #[error("no agent matches {reference:?}; run `awman agents ls` to see running agents")]
     AgentNotFound { reference: String },
@@ -380,6 +397,9 @@ impl CommandError {
         | CommandError::InvalidOverlaySpec { .. }
         | CommandError::UnknownConfigField { .. }
         | CommandError::InteractiveInputUnavailable { .. }
+        | CommandError::WorkflowPrerequisitesUnresolved { .. }
+        | CommandError::PrerequisiteWideningRefused { .. }
+        | CommandError::PrerequisiteFlagUnsupported { .. }
         // Session-creation validation failures are invalid-usage class.
         | CommandError::SessionInvalidType { .. }
         | CommandError::SessionWorkdirRequired
@@ -444,6 +464,8 @@ impl CommandError {
             CommandError::Engine(EngineError::AgentDefinitionUntrusted { .. }) => 403,
             CommandError::Engine(EngineError::UnknownAgent { .. }) => 404,
             CommandError::SessionWorkdirNotAllowed { .. } => 403,
+            CommandError::PrerequisiteWideningRefused { .. } => 403,
+            CommandError::WorkflowPrerequisitesUnresolved { .. } => 409,
             CommandError::MergeTargetDirty { .. }
             | CommandError::MergeConflict { .. }
             | CommandError::WorktreeExists { .. } => 409,
@@ -452,6 +474,17 @@ impl CommandError {
                 4 => 404,
                 _ => 500,
             },
+        }
+    }
+}
+
+impl CommandError {
+    /// The pipeline stage a failure belongs to, reported by the API as
+    /// `error.stage`. `None` for failures with no named stage.
+    pub fn stage(&self) -> Option<&'static str> {
+        match self {
+            CommandError::WorkflowPrerequisitesUnresolved { .. } => Some("workflow_prerequisites"),
+            _ => None,
         }
     }
 }

@@ -397,3 +397,86 @@ Specifically:
 - `docs/12-squad.md`: task prerequisite policy and daemon-side token resolution.
 - `docs/10-github-integration.md`: token sources for PRs and CI.
 - `docs/14-command-reference.md`: the new flags.
+
+## Security Review
+
+### Plan review
+
+Required model: **gpt-6-astra**. **Review not delivered; mandatory gate remains open.**
+The supplied `plan-security-resolutions.md` records BLOCKED because
+`plan-security-review.md` was absent. It contains no PSR-n identifiers or
+resolutions. This is not a “no findings” review, and no model provenance or
+accepted-PSR implementation trace is claimed. The intended PSR ledger is:
+
+| Finding | Resolution |
+|---|---|
+| No PSR-n findings delivered | Recover or rerun the mandated-class plan review, resolve each numbered finding and trace accepted requirements before sign-off. The pre-implementation timing requirement was missed and cannot be retroactively claimed. |
+
+### Implementation review
+
+Model: **gpt-6-astra**, with an additional adversarial review by
+**claude-fable-5-1** (the reviewers identified by this workflow). Dispositions
+below refer to the supplied ISR/AR artifacts and the review-fixes changes.
+The detailed regression ledger and validation logs are retained in
+`/awman/context/workflow/fixes-log.md`.
+
+| Finding | Resolution |
+|---|---|
+| ISR-1 | Fixed in `src/engine/auth/host_secret_command.rs`, `github_token.rs`, command flow and CI polling: canonical/content identity refusal, interpreter/launcher refusal, repository exclusion and custom-agent propagation. Exact installed-executable approval is a trust decision; arbitrary transitive program semantics cannot be classified from a basename or digest. That limitation is explicit in the security specification. |
+| ISR-2 | Fixed in `src/engine/auth/host_secret_command.rs` and command flow: approval binds argv, canonical path and executable content; execution uses a verified private snapshot. Symlink and file-replacement regressions added. |
+| ISR-3 | Fixed in `src/engine/auth/host_secret_command.rs`: retain process-group identity after reaping, kill remaining descendants, restore foreground terminal ownership and clean up on cancellation. Unsupported host-command platforms fail closed. |
+| ISR-4 | Fixed in `src/engine/container/{options,phase_step,background,docker,builtin/backend}.rs` and phase launch wiring: explicit secret-valued overrides survive every backend and take precedence over ambient values. Values stay out of argv. |
+| ISR-5 | Fixed in phase-container selection and engine redaction: credentialed execution uses filtered streams, including CLI/TUI, instead of a raw PTY/attach stream. Stdout, stderr, returned output and failure files remain redacted. |
+| ISR-6 | Fixed in grants, flow, probes, overlays and CI polling: exact destination and credential-kind scope, actual-remote remembered keys, generated-destination reauthorization, scoped CI token selection and per-poll destination checks. |
+| ISR-7 | Fixed in `src/engine/git/remote_push.rs`, `src/data/fs/git_metadata.rs`, overlays, squad evaluation and step commands: private inert metadata, descriptor-relative link refusal, pre-agent metadata-path capture, pinned destination, disabled checkout hooks/helpers/rewrites and controlled SSH transport. Config parsing uses a private no-follow snapshot. Rewritten `.git`/`commondir` cannot redirect staging or publication; squad rejects a changed layout after every leader/repair attempt. PR repository/head are explicit. |
+| ISR-8 | Fixed in squad command admission, route frontend identity, policy provenance and evaluation: the operator ceiling applies to remote requests and is rechecked for remotely stored task decisions. Real squad-route regression added. |
+| ISR-9 | Fixed in `src/data/fs/{prerequisite_grants,agent_trust,private_files}.rs`: lock/reload/per-key mutation/atomic publication; approval reads validate the opened descriptor. Stale writers cannot resurrect revoked decisions. |
+| ISR-10 | Fixed in host capture and shared redaction: bounded pipes, overflow termination, withheld unsafe error diagnostics and registration of every nonempty accepted secret. |
+| ISR-11 | Fixed in launch carriers and CLI/TUI secret input: SecretString-valued overrides until runtime environment construction, redacted launch Debug, bounded input from the first keystroke and wiping on deletion/error/drop. |
+| ISR-12 | Fixed in `src/data/config/workflows.rs`: repository unresolved warn cannot weaken the implicit or explicit headless fail policy. |
+| ISR-13 | Fixed in the Layer 0 resolver and task-policy editing: sparse explicit credential overrides retain unrelated global policy and acquisition commands; daemon defaults apply without a stored task policy. |
+| ISR-14 | Fixed in setup transport builders and controlled metadata: pull/clone use the selected key/helper and pinned destination; pull synchronizes only inert Git state. |
+| ISR-15 | Fixed in `src/engine/workflow/step_commands.rs`: valid printf credential records, correct shell quoting and exact protocol/host/path restrictions, tested with real `git credential fill`. |
+| ISR-16 | Fixed in TUI key routing, prompt handling and bounded yolo presentation: Ctrl-C discards secrets, summary Ctrl-C aborts, and safe defaults remain command-owned. Ignored regression enabled. |
+| ISR-17 | Fixed in host derivation, consent, overlays and polling: GitHub Enterprise uses host-specific gh/API endpoints. General github.com allow policy never sends tokens to a new repo-selected host before explicit or destination-remembered authorization. |
+| ISR-18 | Documentation fixed here; required plan review remains OPEN. No missing PSR trace or historical pre-code review is represented as completed. The real-diff review also remains necessary because this checkout's Git pointer references unavailable host metadata. |
+| AR-1 | Fixed: squad/generated runs use the assumed-needs unresolved default, while explicit fail policies remain effective. |
+| AR-2 | Fixed: repo/task layers retain the trusted global acquire command; regression covers sparse SSH and acquire task choices. |
+| AR-3 | Required review record added; missing plan-review gate explicitly remains open, as ISR-18. |
+| AR-4 | Fixed: command-dialog Ctrl-C is routed before global tab closing; secret input is discarded and summary input interrupts. |
+| AR-5 | Fixed: terminal release uses an unwind guard and tracing follows TUI_ACTIVE during release/restore. |
+| AR-6 | Fixed: yolo questions render and expire with the existing countdown, instead of the frontend immediately choosing an answer. |
+| AR-7 | Fixed with ISR-17's Enterprise authorization and host support. |
+| AR-8 | Fixed: explicit squad context applies daemon defaults, and task-directory workflow policy cannot become trusted global policy. |
+| AR-9 | Fixed: Dispatch validates credential flags before API enqueue and supplies the resolved, secret-free policy for flags_applied. Both ignored API tests enabled. |
+| AR-10 | Fixed: workflow JSON flag implies non-interactive mode and serializes the complete outcome/report. Command reference regenerated and ignored binary regression enabled. |
+| AR-11 | Fixed: check-only exits 0 only for all Satisfied; consent, missing and unknown checks exit 1. |
+| AR-12 | Fixed: rejected tokens require replacement or remain Missing, and cannot be silently regranted from the rejected source. |
+| AR-13 | Fixed: the shared command report prompt supplies labels/hotkeys/defaults to CLI and TUI; summary Ctrl-C/EOF aborts consistently. |
+| AR-14 | Fixed: every PR target disables gh prompts, including without a token grant; the unused command option was removed. |
+| AR-15 | Concrete regressions fixed: all ignored bug tests enabled, non-vacuous dynamic grant narrowing, real squad route gate, stream/SSE ordering and redaction, native Docker SSH push/clone and identity commit fixture. Rejected the broader inference that every invariant needs another binary-level duplicate: the typed §0 boundaries and focused integration tests remain authoritative. Native Docker execution is a separate opt-in gate, not claimed by test-fast. |
+| AR-16 | Docs/specs/examples corrected. Rejected inserting command-specific syntax into `aspec/uxui/cli.md`: developer decision Q9 and its projection test reserve that document for general UX standards; syntax belongs in the generated reference and user guides. |
+| AR-17 | Fixed: requested probe tools reach CLI argv, incomplete cache entries miss, and only the runtime cache remains. |
+| AR-18 | Fixed: missing configured keys and unusable remembered keys produce an explicit warning and grant nothing. |
+| AR-19 | Fixed by locked per-key grant-store updates, with interleaved revoke/remember regression. |
+| AR-20 | Fixed: planned worktree context satisfies attached-HEAD checks before creation. |
+| AR-21 | Shared report redaction and duplicate warning behavior fixed. Rejected the broad structural rewrite as a separate correctness requirement: §0 places this flow in Layer 2 and aspec sets no numeric file/function limit; further restructuring would enlarge this security fix unnecessarily. |
+| AR-22 | Fixed: bounded secret input is protected from the first keystroke; read errors decline instead of advertising an invalid flag. |
+| AR-23 | Rejected: WI §1/§3 require checks before the untrusted leader and recomputation after generated-workflow validation. Reusing the earlier report would miss destination changes; tool metadata alone is safely cached. |
+
+Recommended follow-up work items:
+
+- Threat review for SSH-agent forwarding and encrypted-key interaction; no agent socket forwarding is introduced here.
+- Consent for repo-sourced `ssh()` and secret `env()` overlays, which remain a separate broader authorization surface under the existing developer decision.
+- WI 0140 coordination: switch the HTTPS helper to its socket credential helper and reuse the same per-run RedactionSet.
+
+Review-fixes validation passed: `cargo build --workspace`,
+`cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --all --check`,
+`bash tools/architecture-lint.sh` and `make test-fast`. `make docs-reference`
+also passed after the catalogue change. Native Docker fixtures remain opt-in;
+their execution is not claimed by test-fast.
+
+The remaining sign-off gates are the missing mandated-class plan review,
+resolution of any recovered PSR findings, and a complete real-diff audit when
+the original Git metadata is accessible. The verify-fixes step must independently
+check the dispositions against the supplied reviews.

@@ -127,6 +127,11 @@ pub enum ContainerOption {
     Entrypoint(Entrypoint),
     Overlay(OverlaySpec),
     EnvPassthrough(EnvVar),
+    /// Per-launch value, kept out of argv and redacted in Debug.
+    EnvOverride {
+        key: String,
+        value: crate::engine::auth::credential::SecretString,
+    },
     EnvLiteral(EnvLiteral),
     SeededPrompt(String),
     /// Flag used to deliver the seeded prompt in *interactive* mode (e.g.
@@ -419,6 +424,7 @@ pub struct ResolvedContainerOptions {
     pub entrypoint: Option<Entrypoint>,
     pub overlays: Vec<OverlaySpec>,
     pub env_passthrough: Vec<EnvVar>,
+    pub env_overrides: Vec<(String, crate::engine::auth::credential::SecretString)>,
     pub env_literal: Vec<EnvLiteral>,
     pub seeded_prompt: Option<String>,
     /// Flag used to deliver `seeded_prompt` in interactive mode. When `None`,
@@ -519,6 +525,7 @@ impl ResolvedContainerOptions {
             ContainerOption::Entrypoint(v) => self.entrypoint = Some(v),
             ContainerOption::Overlay(v) => self.overlays.push(v),
             ContainerOption::EnvPassthrough(v) => self.env_passthrough.push(v),
+            ContainerOption::EnvOverride { key, value } => self.env_overrides.push((key, value)),
             ContainerOption::EnvLiteral(v) => self.env_literal.push(v),
             ContainerOption::SeededPrompt(v) => self.seeded_prompt = Some(v),
             ContainerOption::InteractiveSeedFlag(v) => self.interactive_seed_flag = Some(v),

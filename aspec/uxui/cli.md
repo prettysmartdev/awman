@@ -70,6 +70,18 @@ command or flag.
   correctness is declared as an implication (`implies`) rather than
   silently required.
 
+## Credential prerequisite decisions
+
+Credential grants require explicit decisions and are never implied by bulk
+approval or automatic progression. Interactive frontends share the same command
+prompts and safe dismissal defaults; unattended frontends use policy and explicit
+inputs. Remote clients cannot widen the operator's credential ceiling without a
+global opt-in. Check-only output exits 0 only when every check is satisfied,
+otherwise 1 (including unknown checks). Summary Esc continues; summary Ctrl-C
+aborts. Invalid credential inputs, refused widening and unresolved fail policies
+use exit 2; explicit abort uses 130. Per-command syntax belongs in the generated
+command reference.
+
 ## Exit codes
 
 Exit codes are classes of outcome, not per-command codes:
@@ -247,3 +259,4 @@ flags. The builtin runtime rejects ambient `MSB_PATH`,
 `MSB_CONFIG_PATH`, `MSB_PROFILE`, `MSB_CACHE_DIR`, `MSB_SANDBOXES_DIR`,
 `MSB_VOLUMES_DIR`, `MSB_SNAPSHOTS_DIR`, `MSB_LOGS_DIR`, or `MSB_SECRETS_DIR`
 overrides instead of loading an installed runtime.
+

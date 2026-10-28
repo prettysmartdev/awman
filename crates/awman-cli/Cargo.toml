@@ -225,3 +225,7 @@ path = "../../tests/squad_env_daemon.rs"
 [[test]]
 name = "dockerfile_build"
 path = "../../tests/dockerfile_build.rs"
+
+[[test]]
+name = "workflow_prerequisites"
+path = "tests/workflow_prerequisites.rs"

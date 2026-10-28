@@ -9,6 +9,7 @@
 //! drives no host CLI implements each operation natively.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use crate::data::message::UserMessageSink;
 use crate::data::oci_identity::ImageIdentity;
@@ -22,6 +23,14 @@ use crate::engine::container::background::BackgroundLaunchRequest;
 use crate::engine::container::options::ResolvedContainerOptions;
 use crate::engine::container::runtime::ContainerImageInfo;
 use crate::engine::error::EngineError;
+
+/// A bounded, mount-free command against an already available image.
+pub(super) struct ProbeRequest<'a> {
+    pub tools: &'a [&'a str],
+    pub image: &'a str,
+    pub script: &'a str,
+    pub timeout: Duration,
+}
 
 /// What every container backend must support. The concrete type is hidden
 /// behind `Arc<dyn ContainerBackend>` and never escapes this module.
@@ -38,6 +47,16 @@ pub(super) trait ContainerBackend: Send + Sync {
     /// What this backend can do. Docker and Apple share
     /// `runtime::CONTAINER_CAPABILITIES`; the builtin backend has its own.
     fn capabilities(&self) -> &'static Capabilities;
+
+    /// Execute a no-mount image probe; importing or building is never part of this call.
+    fn run_probe(&self, _request: &ProbeRequest<'_>) -> Result<String, EngineError> {
+        Err(EngineError::NotImplemented("no-mount probe"))
+    }
+
+    /// Stable image content identity when available.
+    fn image_id(&self, _tag: &str) -> Result<Option<String>, EngineError> {
+        Ok(None)
+    }
 
     /// Whether `attach` still reaches an agent after the launching process has
     /// exited. See `AgentRuntimeEngine::reattach_after_owner_exit`.

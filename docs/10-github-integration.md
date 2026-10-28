@@ -126,6 +126,14 @@ Set `GITHUB_TOKEN` to a personal access token (PAT) or app token. awman reads it
 
 To create a token, visit [github.com/settings/tokens](https://github.com/settings/tokens) and create a "Fine-grained personal access token" with read access to the `issues` scope.
 
+### Tokens for workflow pull requests and CI
+
+Workflow teardown steps have their own prerequisite checks. You do not need to add `env(GITHUB_TOKEN)` or `ssh()` overlays just to let `push_branch`, `create_pull_request`, or `poll_ci` authenticate. Before the workflow starts, awman checks the remote and offers a credential source when one is needed. Depending on your policy and available credentials, you can grant a configured host variable (`GH_TOKEN` or `GITHUB_TOKEN` by default), use `gh auth token`, paste a token, or run the configured `workflows.prerequisites.githubToken.acquire.argv` command. If you decline access, a static workflow stops by default; `--prerequisite-unresolved warn` allows it to continue with a warning.
+
+awman passes a granted token only to the relevant teardown step: HTTPS `push_branch` receives Git push authentication, and `create_pull_request` receives `GH_TOKEN` for `gh`. `poll_ci` uses authenticated host `gh` when available; otherwise it uses a token granted for the run. Tokens are redacted from workflow output and are not stored in the prerequisite decision file. The base image still needs the `gh` program for `create_pull_request`.
+
+This workflow behavior is separate from fetching issues: the `--issue` commands described above continue to use the host `gh` CLI or the issue-fetching API token sources.
+
 ---
 
 ## Command behavior
@@ -355,3 +363,5 @@ awman exec prompt --issue owner/private-repo#99
 
 [← API & Remote Mode](09-api-and-remote-mode.md) · [Next: Runtimes →](11-runtimes.md)
 
+
+GitHub Enterprise workflow tokens are consented for the remote's exact destination. Interactive acquisition uses `gh auth token --hostname HOST` and verification uses `https://HOST/api/v3/user`. Unattended Enterprise runs need an explicit `--prerequisite-token env:NAME` or a remembered decision for that destination; a general github.com token policy never sends a token to an arbitrary repository-supplied host.

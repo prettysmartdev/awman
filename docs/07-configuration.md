@@ -127,6 +127,42 @@ failing with `config parse error in <path>: <reason>` — naming the file and
 the offending key — instead of starting a daemon on settings you never set.
 Fix the file (or restore it from git, for the per-repo one) and try again.
 
+## Workflow prerequisites
+
+Workflow prerequisite policy lives under the `workflows.prerequisites` object in the global and repository config files. It controls checks for commit identity, SSH pushes, and GitHub tokens used by workflow teardown steps. Unknown keys are ignored with a warning, so use these exact names and casing:
+
+```json
+{
+  "workflows": {
+    "prerequisites": {
+      "preflight": "warn",
+      "unresolved": "fail",
+      "gitIdentity": { "use": "ask", "name": "Workflow Bot", "email": "bot@example.com" },
+      "ssh": { "use": "ask", "key": "~/.ssh/id_ed25519" },
+      "githubToken": {
+        "use": "ask",
+        "envVars": ["GH_TOKEN", "GITHUB_TOKEN"],
+        "acquire": {
+          "argv": ["op", "read", "op://Engineering/GitHub/token"],
+          "timeoutSecs": 30,
+          "refresh": "beforeTeardown"
+        },
+        "verify": true
+      },
+      "allowApiClientGrants": false
+    }
+  }
+}
+```
+
+All fields are optional. `preflight` is `warn` (the default) or `off`; `off` skips probes and does not grant credentials, and repository config cannot turn checks off. `unresolved` is `warn` or `fail`; repository config cannot relax a global `fail`. `fail` stops when a requirement remains missing or needs consent. Each credential's `use` is `ask`, `allow`, or `deny`. `gitIdentity.name` and `email` set a fixed identity; otherwise a granted host identity is used only for that workflow run. An SSH `key` is a suggested key path, not permission to mount it. SSH key use still requires an interactive choice, an explicit `--prerequisite-ssh` flag, or an allowed global policy.
+
+`githubToken.envVars` lists host environment variables awman may offer; the defaults are `GH_TOKEN` and `GITHUB_TOKEN`. A repo may only narrow that list to names already allowed globally. `verify` enables best-effort token checking and a repository cannot turn global verification off. `acquire.argv` is an argument array, not a shell command string. It runs on the host when selected by an interactive user or allowed by policy. A repo-supplied acquisition command requires approval for its exact argument list and resolved executable; changing the command requires approval again. `timeoutSecs` defaults to 30 (maximum 300). `refresh` is `start` (default) or `beforeTeardown`; the latter lets an already-granted acquisition command refresh a token before teardown.
+
+Repository config cannot grant access to host credentials. It can ask or deny, narrow globally allowed settings, provide a fixed Git identity, suggest an SSH key, and define an acquisition command that requires per-command approval. Put broad grants in `~/.awman/config.json` or choose them when prompted. `allowApiClientGrants` is global-only; when false, API callers cannot use prerequisite flags to grant credentials beyond the configured policy.
+
+Remembered SSH and token choices are stored as decisions in `~/.awman/prerequisite-grants.json`; the file does not contain credentials. A remembered choice applies only to its repository, remote, and credential type. Review or remove entries with `awman config prerequisite-grants list` and `awman config prerequisite-grants revoke <index|all>`.
+
 ### Squad daemon configuration
 
 The optional `squad` block is global, so it belongs in
@@ -705,3 +741,22 @@ When the API or squad daemon is started as a background service (`systemd --user
 ---
 
 [← Dynamic Workflows](06-dynamic-workflows.md) · [Next: Overlays →](08-overlays.md)
+
+### Workflow prerequisite field reference
+
+| Field (`workflows.prerequisites.` prefix) | Default | `config set` scope |
+|---|---|---|
+| `preflight` | `warn` | Global or repo; repo cannot set `off` |
+| `unresolved` | Headless static: `fail`; interactive, dynamic, squad: `warn` | Global or repo; repo may only set `fail` |
+| `gitIdentity.use`, `.name`, `.email` | `ask`, unset, unset | Global or repo; a fixed repo identity is non-secret |
+| `ssh.use`, `.key` | `ask`, unset | Global or repo; repo key is a suggestion and repo cannot grant `allow` |
+| `githubToken.use`, `.envVars`, `.verify` | `ask`, `["GH_TOKEN","GITHUB_TOKEN"]`, `true` | Global or repo; repo may only narrow |
+| `githubToken.acquire` | unset | GlobalOnly in `config set`; repo JSON commands require exact-executable approval and cannot replace a global command |
+| `allowApiClientGrants` | `false` | GlobalOnly |
+
+Global `squad.workflows.prerequisites` uses the same shape for daemon-wide
+defaults. Sparse task decisions override only the credentials explicitly chosen;
+`--prerequisite-token acquire` retains the trusted global acquisition command.
+Task-directory `config.json` cannot supply this trusted workflow policy.
+Remembered decisions use atomic per-key updates under a private cross-process
+lock. Revocation cannot be undone by a stale writer remembering another key.

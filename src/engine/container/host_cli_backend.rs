@@ -20,6 +20,7 @@ use std::time::Instant;
 
 use crate::engine::oci::CancelToken;
 
+use crate::engine::container::backend::ProbeRequest;
 use crate::engine::container::process::ContainerCli;
 use crate::engine::container::runtime::wait_with_timeout;
 use crate::engine::error::EngineError;
@@ -55,6 +56,45 @@ pub(super) fn cli_image_exists(cli: ContainerCli, tag: &str) -> Result<bool, Eng
             .unwrap_or(false),
         Err(_) => false,
     })
+}
+
+pub(super) fn cli_run_probe(
+    cli: ContainerCli,
+    request: &ProbeRequest<'_>,
+) -> Result<String, EngineError> {
+    let _ = request.timeout; // checked_output uses the same bounded ten-second probe budget.
+    let mut command = Command::new(crate::engine::host_cli::program(cli.bin));
+    command.args(["run", "--rm", "--network", "none"]);
+    command.args([
+        "--entrypoint",
+        "sh",
+        request.image,
+        "-c",
+        request.script,
+        "sh",
+    ]);
+    command.args(request.tools);
+    let output = crate::engine::host_cli::checked_output(&mut command, cli.bin)?;
+    if !output.status.success() {
+        return Err(EngineError::Container(format!(
+            "{} phase-tools probe exited with {}",
+            cli.bin, output.status
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+pub(super) fn cli_image_id(cli: ContainerCli, tag: &str) -> Result<Option<String>, EngineError> {
+    let output = crate::engine::host_cli::checked_output(
+        Command::new(crate::engine::host_cli::program(cli.bin))
+            .args(["image", "inspect", "--format", "{{.Id}}", tag]),
+        cli.bin,
+    )?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Ok((!id.is_empty()).then_some(id))
 }
 
 /// `<cli> build [--no-cache] -t <tag> -f <dockerfile> <context>`, streaming
@@ -467,5 +507,36 @@ mod tests {
         ));
         // Best-effort probe: a missing CLI is "no such image", not an error.
         assert!(!cli_image_exists(cli, "x").unwrap());
+    }
+}
+
+#[cfg(all(test, unix))]
+mod requested_tools_review_tests {
+    use super::*;
+    #[test]
+    fn actual_probe_argv_carries_extra_requested_tools() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fixture-cli");
+        std::fs::write(
+            &path,
+            "#!/bin/sh\nwhile [ \"$1\" != -c ]; do shift; done\nexec sh \"$@\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let bin: &'static str = Box::leak(path.to_str().unwrap().to_owned().into_boxed_str());
+        let cli = ContainerCli {
+            bin,
+            ..ContainerCli::DOCKER
+        };
+        let request = ProbeRequest {
+            image: "fixture",
+            script: crate::engine::container::phase_tools::PHASE_TOOLS_SCRIPT,
+            tools: &["git", "__awman_missing_extra_tool_0149"],
+            timeout: Duration::from_secs(1),
+        };
+        let output = cli_run_probe(cli, &request).unwrap();
+        assert!(output.contains("git=1"));
+        assert!(output.contains("__awman_missing_extra_tool_0149=0"));
     }
 }

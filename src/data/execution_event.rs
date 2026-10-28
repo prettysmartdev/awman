@@ -4,6 +4,8 @@
 //! the API frontend's `EventBus` (Layer 3) for SSE streaming and logfile
 //! persistence. The engine layer (Layer 1) has no knowledge of these types.
 
+use crate::data::workflow_prerequisites::{PrerequisitePhase, WorkflowPrerequisiteReport};
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -228,6 +230,10 @@ impl std::fmt::Display for PhaseStatusKind {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
 pub enum EventPayload {
+    WorkflowPrerequisites {
+        phase: PrerequisitePhase,
+        report: WorkflowPrerequisiteReport,
+    },
     StdoutLine(String),
     StderrLine(String),
     StatusMessage {
@@ -271,6 +277,7 @@ pub enum EventPayload {
 impl EventPayload {
     pub fn sse_event_type(&self) -> &'static str {
         match self {
+            EventPayload::WorkflowPrerequisites { .. } => "workflow_prerequisites",
             EventPayload::StdoutLine(_) => "stdout_line",
             EventPayload::StderrLine(_) => "stderr_line",
             EventPayload::StatusMessage { .. } => "status_message",
@@ -286,6 +293,9 @@ impl EventPayload {
 
     pub fn to_plain_text(&self) -> Option<String> {
         match self {
+            EventPayload::WorkflowPrerequisites { report, .. } => {
+                Some(format!("[prerequisites] {}", report.summary_line()))
+            }
             EventPayload::StdoutLine(line) => Some(line.clone()),
             EventPayload::StderrLine(line) => Some(line.clone()),
             EventPayload::StatusMessage { phase, message } => Some(format!("[{phase}] {message}")),
@@ -548,5 +558,59 @@ mod cursor_tests {
     fn resolve_with_an_empty_log_restarts_the_current_attempt() {
         let from = ReplayFrom::resolve(&[], 3, Some(EventCursor::new(1, 0)));
         assert_eq!(from, ReplayFrom::StartOfAttempt(3));
+    }
+}
+
+#[cfg(test)]
+mod prerequisite_event_tests {
+    use super::*;
+    use crate::data::workflow_prerequisites::*;
+
+    fn payload() -> EventPayload {
+        EventPayload::WorkflowPrerequisites {
+            phase: PrerequisitePhase::BeforeTeardown,
+            report: WorkflowPrerequisiteReport {
+                phase: PrerequisitePhase::BeforeTeardown,
+                origin: PrerequisiteOrigin::AssumedAll,
+                checks: vec![PrerequisiteCheck {
+                    prerequisite: WorkflowPrerequisite::GitHubToken {
+                        host: "github.com".into(),
+                    },
+                    status: PrerequisiteStatus::Missing,
+                    explanation: "no granted GitHub token is available".into(),
+                    needed_by: vec![],
+                    remediations: vec![Remediation::PasteToken, Remediation::Continue],
+                }],
+                advisories: vec![],
+                notes: vec![],
+            },
+        }
+    }
+
+    #[test]
+    fn workflow_prerequisites_sse_type_and_plain_text() {
+        let event = payload();
+        assert_eq!(event.sse_event_type(), "workflow_prerequisites");
+        assert_eq!(
+            event.to_plain_text().unwrap(),
+            "[prerequisites] 1 of 1 workflow prerequisites need your attention"
+        );
+    }
+
+    #[test]
+    fn payload_json_is_tagged_and_secret_free() {
+        let json = serde_json::to_value(payload()).unwrap();
+        assert_eq!(json["type"], "WorkflowPrerequisites");
+        assert_eq!(json["data"]["phase"], "before_teardown");
+        assert_eq!(json["data"]["report"]["checks"][0]["status"], "missing");
+        assert_eq!(
+            json["data"]["report"]["checks"][0]["remediations"][0]["type"],
+            "paste_token"
+        );
+        let text = json.to_string();
+        // Remediations name choices; no field exists that could carry a value.
+        assert!(!text.contains("ghp_"));
+        let back: EventPayload = serde_json::from_value(json).unwrap();
+        assert_eq!(back.sse_event_type(), "workflow_prerequisites");
     }
 }

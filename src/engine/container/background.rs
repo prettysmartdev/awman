@@ -27,8 +27,9 @@ pub struct BackgroundExecRequest<'a> {
 }
 
 /// An idle setup/teardown container with per-session builtin settings.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub struct BackgroundLaunchRequest<'a> {
+    pub secret_env: &'a [(String, crate::engine::auth::credential::SecretString)],
     /// Explicit ownership name, when the caller needs restart discovery.
     pub name: Option<&'a str>,
     /// The project's base image.
@@ -44,6 +45,17 @@ pub struct BackgroundLaunchRequest<'a> {
     /// them, and it refuses to start without them; every other backend
     /// ignores them.
     pub builtin_launch: Option<&'a BuiltinLaunchSettings>,
+}
+
+impl std::fmt::Debug for BackgroundLaunchRequest<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BackgroundLaunchRequest")
+            .field("image", &self.image)
+            .field("workdir", &self.workdir)
+            .field("env_names", &self.env.keys().collect::<Vec<_>>())
+            .field("secret_env", &self.secret_env)
+            .finish_non_exhaustive()
+    }
 }
 
 /// A running background container that accepts `exec` calls.
@@ -158,16 +170,24 @@ pub(super) fn default_start_background(
     workdir: &Path,
     env: &HashMap<String, String>,
     overlays: &[OverlaySpec],
+    secret_env: &[(String, crate::engine::auth::credential::SecretString)],
 ) -> Result<String, EngineError> {
     let name = name
         .map(str::to_owned)
         .unwrap_or_else(crate::engine::container::naming::generate_container_name);
-    let args = build_start_background_argv(&name, image, workdir, env, overlays);
+    let mut args = build_start_background_argv(&name, image, workdir, env, overlays);
+    // Insert names before the image; values exist only in the CLI child env.
+    for (key, _) in secret_env {
+        args.splice(args.len() - 3..args.len() - 3, ["-e".into(), key.clone()]);
+    }
 
     let mut command = Command::new(crate::engine::host_cli::program(cli.bin));
     command.args(&args);
     for (k, v) in env {
         command.env(k, v);
+    }
+    for (key, value) in secret_env {
+        command.env(key, value.expose());
     }
     let output = command
         .stdin(Stdio::null())
@@ -576,6 +596,7 @@ mod tests {
         let backend = Arc::new(RecordingBackend::default());
         let id = backend
             .start_background(&BackgroundLaunchRequest {
+                secret_env: &[],
                 name: None,
                 image: "img",
                 workdir: std::path::Path::new("/w"),
@@ -605,6 +626,7 @@ mod tests {
         let backend = Arc::new(RecordingBackend::default());
         let id = backend
             .start_background(&BackgroundLaunchRequest {
+                secret_env: &[],
                 name: None,
                 image: "img",
                 workdir: std::path::Path::new("/w"),
@@ -637,6 +659,7 @@ mod tests {
         let backend = Arc::new(RecordingBackend::default());
         let id = backend
             .start_background(&BackgroundLaunchRequest {
+                secret_env: &[],
                 name: None,
                 image: "img",
                 workdir: std::path::Path::new("/w"),

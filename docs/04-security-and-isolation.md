@@ -248,7 +248,7 @@ WARNING: overlay ssh(): mounting host ~/.ssh into container (read-only). Ensure 
 
 The directory is mounted as `-v /home/user/.ssh:/root/.ssh:ro`. The `:ro` flag prevents the agent from modifying your host SSH keys.
 
-`~/.ssh` is never mounted without an explicit `ssh()` overlay — there is no config option to enable it silently.
+An `ssh()` overlay deliberately mounts the whole directory when you configure it in an overlay source. Workflow prerequisite checks also support a narrower, read-only mount of a selected key after you choose it, or the whole directory after you explicitly choose that option. A repository's `workflows.prerequisites.ssh.key` is only a suggested key; repository config cannot grant SSH access by itself. See [Workflow prerequisites](05-workflows.md#workflow-prerequisite-checks).
 
 ### Security notes
 
@@ -264,7 +264,13 @@ awman chat --overlay "ssh()"                                             # freef
 awman exec workflow path/to/workflow.toml --worktree --overlay "ssh()"   # combine with worktree isolation
 ```
 
-When used with a workflow, the SSH directory is mounted into every workflow-step container.
+When used with a workflow, the SSH directory is mounted into every workflow-step container. The workflow prerequisite flow instead scopes its selected key mount to the steps that need SSH access.
+
+## Workflow credentials
+
+Workflow credential grants are scoped to the current run, repository, remote, credential type, and the setup or teardown steps that need them. A selected SSH key is mounted read-only only for the relevant step containers. A granted GitHub token is passed only to the relevant PR, HTTPS-push, or API-polling step. awman redacts granted tokens from workflow output. Remembered choices store decisions only in `~/.awman/prerequisite-grants.json`; they do not store keys or token values, and each decision is limited to its repository, remote, and credential type.
+
+If you configure `workflows.prerequisites.githubToken.acquire.argv`, awman may run that token command on the host. It uses an argv list without a shell, shows the resolved executable during review, applies a timeout, and refuses known agent binaries (including configured custom agent binaries). A repository-configured command is additionally approved by its argument-list hash before use. The command output token is held as a secret and is not written to config or logs. See [Workflow prerequisites](05-workflows.md#workflow-prerequisite-checks) and [Configuration](07-configuration.md#workflow-prerequisites).
 
 ---
 
@@ -286,3 +292,24 @@ With the Apple Containers runtime, the same commands are shown with `container` 
 ---
 
 [← Agent Sessions](03-agent-sessions.md) · [Next: Workflows →](05-workflows.md)
+
+Workflow prerequisite grants exclude `run_shell`, `run_script`, main agent steps,
+`on_failure` remediation agents and dynamic/squad leaders. A single SSH key is
+mounted read-only as `~/.ssh/awman_push_key`, with `IdentitiesOnly=yes` and a
+writable private copy of `known_hosts`. Credentialed Git transport uses private,
+controlled metadata, a pinned approved URL, no checkout hooks or URL rewrites,
+and no checkout-selected helpers or SSH commands. HTTPS helpers answer only for
+the approved host and path. New generated destinations require a fresh decision.
+
+Host token tools are trusted installed programs outside Git checkouts. Known
+agent identities (including canonical paths and content hashes of configured
+agents), shells, interpreters and launch wrappers are refused. Review binds argv,
+canonical executable and executable content; execution uses a verified private
+snapshot. Changing installed content requires a new approval. This boundary
+cannot infer arbitrary program semantics: approving an installed token tool also
+trusts its interpreter, libraries and transitive behavior. Do not authorize a tool
+that delegates to an agent. Output is bounded while running, errors withhold
+untrusted diagnostics, and the process group is cleaned up on every exit. Tokens
+stay in secret-typed launch overrides until the runtime child environment is
+constructed; runs holding token grants use filtered phase streams, including
+CLI/TUI, so raw terminal or attach output cannot precede redaction.

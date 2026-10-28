@@ -25,6 +25,7 @@ pub mod io_bridge;
 pub mod naming;
 pub mod options;
 pub mod phase_step;
+pub mod phase_tools;
 mod process;
 pub mod runtime;
 #[cfg(test)]

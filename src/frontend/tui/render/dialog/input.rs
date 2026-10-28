@@ -87,6 +87,59 @@ pub(crate) fn render_text_input(
     }
 }
 
+/// A masked single-line prompt: one `•` per typed character, nothing else of
+/// the value reaches the screen (WI 0149). Typing is append-only.
+pub(crate) fn render_secret_input(
+    title: &str,
+    prompt: &str,
+    buffer: &dialogs::SecretBuffer,
+    area: Rect,
+    frame: &mut Frame,
+) {
+    let prompt_lines = prompt.lines().count() as u16;
+    let dialog_h = prompt_lines + 10;
+    let dialog_w = (area.width.saturating_sub(8)).clamp(50, 80);
+    let dialog_area = dialogs::centered_fixed(dialog_w, dialog_h, area);
+    let inner = dialogs::render_dialog_frame(title, Color::Cyan, dialog_area, frame);
+    frame.render_widget(
+        Paragraph::new(prompt).style(Style::default().fg(Color::Gray)),
+        Rect {
+            height: prompt_lines,
+            ..inner
+        },
+    );
+    let input_area = Rect {
+        y: inner.y + prompt_lines + 1,
+        height: 3,
+        ..inner
+    };
+    let input_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    let input_inner = input_block.inner(input_area);
+    frame.render_widget(input_block, input_area);
+    let shown = buffer
+        .len()
+        .min(input_inner.width.saturating_sub(1) as usize);
+    frame.render_widget(
+        Paragraph::new("•".repeat(shown)).style(Style::default().fg(Color::White)),
+        input_inner,
+    );
+    let hint_y = input_area.y + input_area.height + 1;
+    if hint_y < inner.y + inner.height {
+        frame.render_widget(
+            Paragraph::new("  [Enter] submit   [Esc] cancel")
+                .style(Style::default().fg(Color::DarkGray)),
+            Rect {
+                y: hint_y,
+                height: 1,
+                ..inner
+            },
+        );
+    }
+    frame.set_cursor_position(Position::new(input_inner.x + shown as u16, input_inner.y));
+}
+
 pub(crate) fn render_multiline_input(
     title: &str,
     prompt: &str,

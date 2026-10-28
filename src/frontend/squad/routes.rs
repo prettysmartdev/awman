@@ -99,8 +99,12 @@ async fn handle_command(
     // ApiDispatchFrontend is the existing non-interactive Dispatch frontend.
     // Its event bus has no subscriber here: squad deliberately exposes neither
     // an SSE route nor a logs route.
-    let frontend =
-        ApiDispatchFrontend::new(&body.subcommand, &body.args, EventBus::new(1).sender());
+    let frontend = ApiDispatchFrontend::for_frontend(
+        &body.subcommand,
+        &body.args,
+        EventBus::new(1).sender(),
+        FrontendKind::SquadDaemon,
+    );
     let outcome = Dispatch::new(
         frontend,
         state.handles.session(),
@@ -121,7 +125,18 @@ async fn handle_command(
             error_json("squad command dispatched to an unexpected command family"),
         )
             .into_response(),
-        Err(error) => (StatusCode::BAD_REQUEST, error_json(error.to_string())).into_response(),
+        Err(error) => (
+            if matches!(
+                error,
+                crate::command::error::CommandError::PrerequisiteWideningRefused { .. }
+            ) {
+                StatusCode::FORBIDDEN
+            } else {
+                StatusCode::BAD_REQUEST
+            },
+            error_json(error.to_string()),
+        )
+            .into_response(),
     }
 }
 

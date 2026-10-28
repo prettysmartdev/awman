@@ -80,6 +80,7 @@ where
 fn task(name: &str, interval_secs: u64) -> Task {
     let now = Utc::now();
     Task {
+        prerequisites: None,
         id: uuid::Uuid::new_v4().to_string(),
         name: name.to_string(),
         description: "test task".into(),

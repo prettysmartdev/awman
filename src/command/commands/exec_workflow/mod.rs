@@ -76,6 +76,12 @@ pub struct ExecWorkflowCommandFlags {
     /// answer from its headless profile.
     pub on_existing_worktree:
         Option<crate::command::commands::worktree_lifecycle::ExistingWorktreeDecision>,
+    /// `--prerequisite-*` and `--check-prerequisites` (WI 0149). A value is an
+    /// explicit grant or denial; `--yes` never grants a credential.
+    pub prerequisites: Box<crate::data::config::flags::PrerequisiteFlags>,
+    /// A squad task's stored prerequisite policy, layered under the flags by
+    /// `EffectiveConfig::prerequisite_policy`. `None` outside squad.
+    pub squad_task_prerequisites: Option<Box<crate::data::config::workflows::PrerequisitePolicy>>,
 }
 
 pub use crate::data::config::leader_spec::LeaderSpec;
@@ -99,6 +105,9 @@ pub struct ExecWorkflowOutcome {
     pub workflow: String,
     pub exit_code: Option<i32>,
     pub worktree_used: bool,
+    /// The prerequisite report, set for `--check-prerequisites`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prerequisites: Option<crate::data::workflow_prerequisites::WorkflowPrerequisiteReport>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -116,6 +125,7 @@ pub trait ExecWorkflowCommandFrontend:
     + crate::command::commands::agent_setup::AgentLaunchFrontend
     + WorkflowFrontend
     + WorktreeLifecycleFrontend
+    + crate::command::commands::workflow_prerequisites::WorkflowPrerequisiteFrontend
     + Send
     + Sync
 {
@@ -339,6 +349,9 @@ pub struct ExecWorkflowCommand {
     /// Fired by an external cancel (the API's `POST /v1/commands/{id}/cancel`).
     /// Never fired for the CLI, the TUI or squad, which never install one.
     cancel: tokio_util::sync::CancellationToken,
+    /// Which frontend runs this command: picks the headless profile the
+    /// workflow prerequisite flow answers from when nobody can be asked.
+    frontend_kind: crate::command::dispatch::catalogue::FrontendKind,
 }
 
 impl ExecWorkflowCommand {
@@ -352,6 +365,7 @@ impl ExecWorkflowCommand {
             workflow_state_root: None,
             managed_session: None,
             cancel: tokio_util::sync::CancellationToken::new(),
+            frontend_kind: crate::command::dispatch::catalogue::FrontendKind::Cli,
         }
     }
 
@@ -370,7 +384,21 @@ impl ExecWorkflowCommand {
     /// non-dynamic run requires (the catalogue marks it optional so
     /// `--dynamic` may omit it).
     pub fn from_input(ctx: &BuildContext) -> Result<Self, CommandError> {
+        let prerequisites =
+            crate::command::commands::workflow_prerequisites::parse_prerequisite_flags(ctx, true)?;
+        // An API client may only narrow what the server grants (WI 0149 §6).
+        crate::command::commands::workflow_prerequisites::check_flag_widening(
+            ctx.caller.frontend(),
+            &prerequisites,
+            &crate::command::commands::workflow_prerequisites::policy_for(
+                &ctx.session,
+                &Default::default(),
+                None,
+            ),
+        )?;
         let flags = ExecWorkflowCommandFlags {
+            prerequisites: Box::new(prerequisites),
+            squad_task_prerequisites: None,
             workflow: ctx.args.get("workflow").map(PathBuf::from),
             work_item: ctx.flags.string("work-item"),
             non_interactive: ctx.flags.bool("non-interactive"),
@@ -417,6 +445,7 @@ impl ExecWorkflowCommand {
             ));
         }
         Ok(Self::new(flags, ctx.engines.clone(), ctx.session.clone())
+            .with_frontend_kind(ctx.caller.frontend())
             .mirroring_into(Arc::clone(&ctx.managed_session))
             .with_cancellation(ctx.cancel.clone()))
     }
@@ -462,6 +491,16 @@ impl ExecWorkflowCommand {
         self
     }
 
+    /// Record which frontend runs the command (the squad daemon sets
+    /// `SquadDaemon` for the workflows it runs).
+    pub fn with_frontend_kind(
+        mut self,
+        kind: crate::command::dispatch::catalogue::FrontendKind,
+    ) -> Self {
+        self.frontend_kind = kind;
+        self
+    }
+
     pub fn flags(&self) -> &ExecWorkflowCommandFlags {
         &self.flags
     }
@@ -479,6 +518,7 @@ mod factory;
 mod issue;
 mod phase_container;
 mod prepare;
+mod prerequisites;
 mod shared_frontend;
 pub(crate) use shared_frontend::SharedWorkflowFrontend;
 
@@ -491,6 +531,7 @@ pub(crate) mod tests;
 pub(super) use factory::*;
 pub(super) use issue::*;
 pub(super) use prepare::*;
+pub(super) use prerequisites::*;
 
 // Q13: the preflight helpers live in `commands::workflow_preflight` so the
 // squad evaluator can reach them without importing from this command. They are

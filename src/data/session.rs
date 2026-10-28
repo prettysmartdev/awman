@@ -171,6 +171,9 @@ impl SessionLogEntry {
 /// rather than keeping a parallel copy (WI 0114 F-30/F-22).
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionState {
+    #[serde(default)]
+    pub workflow_prerequisites:
+        Option<crate::data::workflow_prerequisites::WorkflowPrerequisiteReport>,
     pub current_command: Option<CommandInvocation>,
     /// The workflow running in this session right now, summarised.
     ///
@@ -186,6 +189,12 @@ pub struct SessionState {
 }
 
 impl SessionState {
+    pub fn record_workflow_prerequisites(
+        &mut self,
+        report: crate::data::workflow_prerequisites::WorkflowPrerequisiteReport,
+    ) {
+        self.workflow_prerequisites = Some(report);
+    }
     pub fn new() -> Self {
         Self::default()
     }
@@ -435,6 +444,13 @@ pub struct SessionOpenOptions {
 }
 
 impl Session {
+    pub fn prerequisite_policy(&self) -> crate::data::config::workflows::PrerequisitePolicy {
+        self.effective_config().prerequisite_policy(
+            crate::data::config::workflows::PrerequisiteResolveContext {
+                remote_session: self.session_type().is_remote(),
+            },
+        )
+    }
     /// Open a session at the supplied working directory, resolving the git
     /// root via `resolver` and loading repo + global config from disk.
     pub fn open(

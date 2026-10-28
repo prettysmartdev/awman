@@ -404,6 +404,17 @@ impl ContainerBackend for AppleBackend {
         host_cli_backend::cli_image_exists(ContainerCli::APPLE, tag)
     }
 
+    fn run_probe(
+        &self,
+        request: &crate::engine::container::backend::ProbeRequest<'_>,
+    ) -> Result<String, EngineError> {
+        host_cli_backend::cli_run_probe(ContainerCli::APPLE, request)
+    }
+
+    fn image_id(&self, tag: &str) -> Result<Option<String>, EngineError> {
+        host_cli_backend::cli_image_id(ContainerCli::APPLE, tag)
+    }
+
     fn build_image(
         &self,
         request: &crate::engine::container::BuildRequest,
@@ -453,6 +464,7 @@ impl ContainerBackend for AppleBackend {
             request.workdir,
             request.env,
             request.overlays,
+            request.secret_env,
         )
     }
 

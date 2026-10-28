@@ -28,6 +28,12 @@ awman exec workflow --dynamic --work-item 42 --leader claude::claude-opus-4-8
 
 `--work-item` is required with `--dynamic`. Without it, awman cannot provide the leader agent with the work item it is designing the workflow for.
 
+## Workflow prerequisites
+
+Dynamic workflows check prerequisites after reading the work item and before offering resume or starting the leader. Because the final workflow does not exist yet, this first report covers the possible workflow requirements. `--check-prerequisites` displays that report and exits without starting the leader.
+
+The leader receives a summary of the available workflow credentials and tools, so it can plan around them. After awman validates the generated workflow, it narrows the grants to the needs that workflow actually uses: unused grants are dropped, and any newly introduced requirement is checked and reported. When unresolved requirements use `--prerequisite-unresolved fail`, awman stops before executing the generated workflow. See [Workflow prerequisite checks](05-workflows.md#workflow-prerequisite-checks) for the available choices and credential behavior.
+
 ---
 
 ## How it works

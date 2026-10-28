@@ -533,6 +533,7 @@ mod tests {
     ) -> Task {
         let now = Utc::now();
         Task {
+            prerequisites: None,
             id: "t".into(),
             name: "t".into(),
             description: "d".into(),

@@ -36,6 +36,7 @@ fn squad_config_round_trips_through_global_config_using_squad_json_key() {
     )]);
     let config = GlobalConfig {
         squad: Some(SquadConfig {
+            workflows: None,
             agents_to_models: Some(HashMap::from([(
                 "codex".into(),
                 vec!["gpt-5".into(), "gpt-5-mini".into()],

@@ -6,7 +6,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::data::error::DataError;
 use crate::data::fs::private_files::{
-    create_private_dir, read_private_json_or_miss, write_private_json_atomic,
+    create_private_dir, read_private_approval_json as read_private_json_or_miss,
+    write_private_json_atomic,
 };
 
 pub const TRUST_STORE_FILENAME: &str = "trusted-agents.json";
@@ -124,7 +125,15 @@ impl TrustStore {
     /// write succeeds. Concurrent writers can lose approvals, never gain trust.
     pub fn approve(&mut self, key: TrustKey, name: &str, sha256: &str) -> Result<(), DataError> {
         let key = canonical_key(&key);
-        let mut file = self.file.clone();
+        let parent = self.path.parent().unwrap_or(Path::new("."));
+        if !parent.exists() {
+            create_private_dir(parent)?;
+        }
+        let _lock = crate::data::fs::private_files::lock_private_exclusive(
+            &self.path.with_extension("lock"),
+            || Ok(()),
+        )?;
+        let mut file = Self::load(parent).file;
         file.entries.retain(|entry| !entry_matches(entry, &key));
         let approved_at = chrono::Utc::now().to_rfc3339();
         let entry = match key {
@@ -302,5 +311,27 @@ mod tests {
             .load_warning
             .as_deref()
             .is_some_and(|warning| warning.contains("treating it as empty")));
+    }
+}
+
+#[cfg(test)]
+mod concurrent_review_tests {
+    use super::*;
+    #[test]
+    fn unrelated_stale_approval_does_not_restore_an_old_hash() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("state");
+        let key = |name: &str| TrustKey::Repo {
+            git_root: root.path().into(),
+            name: name.into(),
+        };
+        let mut first = TrustStore::load(&home);
+        first.approve(key("one"), "one", "old").unwrap();
+        let mut stale = TrustStore::load(&home);
+        first.approve(key("one"), "one", "new").unwrap();
+        stale.approve(key("two"), "two", "other").unwrap();
+        let result = TrustStore::load(&home);
+        assert!(result.is_trusted(&key("one"), "new"));
+        assert!(!result.is_trusted(&key("one"), "old"));
     }
 }

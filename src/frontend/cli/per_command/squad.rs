@@ -118,8 +118,16 @@ pub(crate) fn render_squad(outcome: &SquadOutcome, json: bool) -> Option<String>
                     task.unmet_env.join(", ")
                 )
             };
+            let prerequisites_line = match &task.prerequisites {
+                Some(policy) => format!(
+                    "Workflow prerequisites:\n  {}\n",
+                    crate::command::commands::workflow_prerequisites::policy_lines(policy)
+                        .join("\n  ")
+                ),
+                None => "Workflow prerequisites: workflow prerequisite policy not set; run `awman squad edit <task>` to configure\n".to_string(),
+            };
             Some(format!(
-                "Task: {}\nDescription: {}\nWorkspace: {}\nOverlays: {}\nInterval: {}s\nAgent: {}\nModel: {}\n{}\n{}",
+                "Task: {}\nDescription: {}\nWorkspace: {}\nOverlays: {}\nInterval: {}s\nAgent: {}\nModel: {}\n{}{}\n{}",
                 task.name,
                 task.description,
                 workspace,
@@ -127,6 +135,7 @@ pub(crate) fn render_squad(outcome: &SquadOutcome, json: bool) -> Option<String>
                 task.interval_secs,
                 task.agent.as_deref().unwrap_or("default"),
                 task.model.as_deref().unwrap_or("default"),
+                prerequisites_line,
                 env_line,
                 format_table(run_headers, &rows),
             ))
@@ -374,6 +383,7 @@ mod tests {
 
     fn task(name: &str, unmet: &[&str]) -> Task {
         Task {
+            prerequisites: None,
             id: name.into(),
             name: name.into(),
             description: "a task".into(),
@@ -967,5 +977,49 @@ mod key_setup_tests {
         for line in &lines[1..4] {
             assert_eq!(line.chars().count(), width, "misaligned box line: {line}");
         }
+    }
+}
+
+#[cfg(test)]
+mod wi0149_tests {
+    use super::*;
+    #[test]
+    fn wi0149_squad_show_renders_denied_policy_and_legacy_configuration_hint() {
+        let now = chrono::Utc::now();
+        let mut task = Task {
+            prerequisites: None,
+            id: "149".into(),
+            name: "regression".into(),
+            description: "test".into(),
+            repo_scope: "/repo".into(),
+            mount_scope: crate::data::fs::task_store::MountScope::GitRoot,
+            overlays: vec![],
+            interval_secs: 60,
+            status: crate::data::fs::task_store::TaskStatus::Active,
+            agent: None,
+            model: None,
+            backoff_until: None,
+            created_at: now,
+            updated_at: now,
+            last_run_at: None,
+            trigger_requested_at: None,
+            last_run_status: None,
+            unmet_env: vec![],
+        };
+        let detail = |task| {
+            SquadOutcome::Detail(crate::command::commands::squad::gateway::TaskDetail {
+                task,
+                runs: vec![],
+            })
+        };
+        let legacy = render_squad(&detail(task.clone()), false).unwrap();
+        assert!(legacy.contains("workflow prerequisite policy not set"));
+        assert!(legacy.contains("awman squad edit"));
+        let mut policy = crate::data::config::workflows::PrerequisitePolicy::default();
+        policy.ssh.use_ = crate::data::config::workflows::CredentialUse::Deny;
+        task.prerequisites = Some(policy);
+        let text = render_squad(&detail(task), false).unwrap();
+        assert!(text.to_lowercase().contains("ssh"));
+        assert!(text.contains("deny"));
     }
 }

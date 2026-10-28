@@ -16,6 +16,7 @@ pub mod daemon_env;
 pub mod daemon_paths;
 pub mod daemon_process;
 pub mod data_paths;
+pub mod git_metadata;
 pub mod hash;
 pub mod kit_paths;
 pub mod log_dirs;
@@ -58,3 +59,6 @@ pub use task_store::{
     MountScope, Run, RunDetail, RunId, RunStatus, Task, TaskStatus, TaskStore, TaskWorkspace,
 };
 pub use workflow_dirs::WorkflowDirs;
+pub mod phase_tools_cache;
+pub mod prerequisite_grants;
+pub mod ssh_keys;

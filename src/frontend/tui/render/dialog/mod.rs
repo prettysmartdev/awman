@@ -55,6 +55,11 @@ pub(super) fn render_dialog(dialog: &dialogs::Dialog, area: Rect, frame: &mut Fr
             prompt,
             editor,
         } => input::render_text_input(title, prompt, editor, area, frame),
+        dialogs::Dialog::SecretInput {
+            title,
+            prompt,
+            buffer,
+        } => input::render_secret_input(title, prompt, buffer, area, frame),
         dialogs::Dialog::MultilineInput {
             title,
             prompt,

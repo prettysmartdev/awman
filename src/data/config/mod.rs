@@ -46,3 +46,4 @@ pub const DEFAULT_SCROLLBACK_LINES: usize = 10_000;
 
 /// Built-in default seconds of inactivity before the agent is considered stuck.
 pub const DEFAULT_AGENT_STUCK_TIMEOUT_SECS: u64 = 30;
+pub mod workflows;

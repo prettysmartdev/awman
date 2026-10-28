@@ -64,10 +64,14 @@ awman squad add \
   --name issue-triage \
   --description "Whenever a new issue is opened, analyze it and post a plan as a comment." \
   --workspace default \
-  --overlay "env(GITHUB_TOKEN)" \
   --interval 10m \
   --mount-scope gitroot
 ```
+
+When adding a task interactively, awman also asks which workflow prerequisites
+the task may use. For unattended runs, configure the task's prerequisite policy
+with the `--prerequisite-*` flags or the interactive task setup; do not add
+`env(GITHUB_TOKEN)` or `ssh()` just for workflow pushes and pull requests.
 
 | Flag | Description |
 |------|-------------|
@@ -79,6 +83,10 @@ awman squad add \
 | `--agent <name>` / `--model <name>` | Override the agent/model used for this task's evaluations, taking priority over the global `squad` config (see [Configuring squad](#configuring-squad) below). |
 | `--agent-models <agent>=<model>[,<model>…]` | Give this task its own pool of agents and models, written to its `config.json`. Repeat the flag for more agents. See [Choosing a task's agents and models](#choosing-a-tasks-agents-and-models). |
 | `--mount-scope <cwd\|gitroot>` | Only meaningful for a custom workspace that is a Git repository root, where both values name that same root (default `gitroot`). Captured once and never changed later. Every other workspace — the default durable workspace, a plain directory, or a subdirectory of a repository — is mounted directly, as given. |
+| `--prerequisite-identity <value>` | Set the task's commit identity policy: `host`, `deny`, or `Name <email>`. |
+| `--prerequisite-ssh <value>` | Set the SSH policy: a key path, `all`, or `deny`. `all` allows the whole SSH directory to be mounted for steps that need SSH. |
+| `--prerequisite-token <value>` | Set the GitHub token policy: `env:NAME`, `acquire` or `deny`. The daemon resolves an allowed source when a workflow needs it. |
+| `--prerequisite-unresolved <warn\|fail>` | Decide whether an unattended run continues with unresolved workflow requirements or fails before workflow execution. |
 | `--interview` | Collect the task fields through the interactive interview, including the multiline description, workspace choice, and overlays. |
 | `-n, --non-interactive` | Never prompt: refuse anything that would need a confirmation instead of asking. Cannot be combined with `--interview`. |
 
@@ -126,6 +134,7 @@ awman squad edit issue-triage \
 | `--clear-overlays` | Remove every overlay from the task. |
 | `--agent-models <agent>=<model>[,<model>…]` | Replace the task's agent pool. Repeat the flag for more agents. |
 | `--clear-agent-models` | Remove the task's own agent pool, so it inherits the global `squad` settings again. |
+| `--prerequisite-identity <value>` / `--prerequisite-ssh <value>` / `--prerequisite-token <value>` / `--prerequisite-unresolved <warn\|fail>` | Change the task's workflow prerequisite policy. Each credential flag changes only that credential's task policy. |
 | `--interview` | Collect the fields interactively, each prefilled with the task's current value. |
 | `-n, --non-interactive` | Never prompt. Cannot be combined with `--interview`. |
 
@@ -300,13 +309,16 @@ Each run, before it designs anything, the leader agent is given the merged
 overlay set as an inventory in its prompt: which host directories are mounted
 and where, which skills it can call, which context directories the steps will
 get, and — split into *set* and *declared but not set* — which environment
-variables the task named. Names only, never values.
+variables the task named. It also receives a summary of the task's workflow
+prerequisite policy and available workflow needs. Names only, never values.
 
-This matters in both directions. A leader not told it has `ssh()` and
-`env(GITHUB_TOKEN)` won't design a workflow that pushes a branch and opens a
-pull request, though the task allows exactly that; one that assumes a key it
-lacks writes steps that fail at runtime. The inventory comes from the same
-resolution the containers launch with, so the two cannot disagree.
+This helps the leader plan workflow steps around the credentials the task is
+allowed to use. During an unattended run, the squad daemon resolves the task's
+policy and host credential sources before starting the workflow, then supplies
+granted credentials only to the teardown steps that need them. Secrets are not
+saved in the task policy or passed to the leader. A task with no configured
+prerequisite policy is warned in its run log; it cannot interactively approve
+credentials while unattended.
 
 ### From the TUI
 
@@ -1251,3 +1263,5 @@ tell what your squad is doing versus what you started yourself. See
 ---
 
 [← Runtimes](11-runtimes.md) · [Next: Cleaning Up →](13-cleaning-up.md)
+
+Squad credential defaults come from global `squad.workflows.prerequisites`, under explicit task decisions. Other global token sources remain inherited when a task changes only SSH policy. Requests through squad routes obey the same global `allowApiClientGrants` ceiling as API requests, and remote decisions are rechecked when the task runs. Task workspace config files cannot define trusted prerequisite host commands.

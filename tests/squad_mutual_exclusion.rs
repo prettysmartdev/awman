@@ -224,6 +224,11 @@ impl UserMessageSink for NeverServesFrontend {
     fn replay_queued(&mut self) {}
 }
 
+impl awman::command::commands::workflow_prerequisites::WorkflowPrerequisiteFrontend
+    for NeverServesFrontend
+{
+}
+
 #[async_trait::async_trait]
 impl SquadCommandFrontend for NeverServesFrontend {
     async fn serve_squad_daemon(

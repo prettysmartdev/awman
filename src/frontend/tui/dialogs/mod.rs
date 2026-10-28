@@ -33,6 +33,20 @@ pub enum DialogRequest {
         prompt: String,
         default_text: Option<String>,
     },
+    /// A masked prompt for a secret (WI 0149). Typed characters render as
+    /// `•`; the value is never echoed, logged or kept after the answer.
+    SecretInput {
+        title: String,
+        prompt: String,
+    },
+    /// Leave the alternate screen and raw mode so a host command can use the
+    /// terminal. Answered `Yes` once the terminal is released.
+    TerminalRelease {
+        title: String,
+    },
+    /// Re-enter the alternate screen after a `TerminalRelease`. Answered
+    /// `Dismissed` once the screen is back.
+    TerminalRestore,
     MultilineInput {
         title: String,
         prompt: String,
@@ -102,10 +116,14 @@ pub enum DialogRequest {
 /// A dialog response returned from the event loop to the command thread.
 #[derive(Debug, Clone)]
 pub enum DialogResponse {
+    Interrupted,
     Yes,
     No,
     Cancel,
     Text(String),
+    /// The answer to a `SecretInput`. Wrapped in a `SecretString` before it
+    /// leaves the dialog; its `Debug` is redacted.
+    Secret(crate::engine::auth::credential::SecretString),
     Index(usize),
     Char(char),
     Dismissed,
@@ -138,6 +156,13 @@ pub enum Dialog {
         title: String,
         prompt: String,
         editor: TextEdit,
+    },
+    /// Masked input (WI 0149). Not a `TextEdit`: the buffer is zeroized on
+    /// drop and has no cursor movement, so nothing about it is worth keeping.
+    SecretInput {
+        title: String,
+        prompt: String,
+        buffer: SecretBuffer,
     },
     ListPicker {
         title: String,
@@ -225,6 +250,54 @@ pub enum Dialog {
         /// belongs in the rc file, without the banner and notes around it.
         copy_zshrc_snippet: Option<String>,
     },
+}
+
+/// The typed characters of a [`Dialog::SecretInput`]. Append-only editing, a
+/// redacted `Debug`, and a best-effort overwrite of the buffer when dropped
+/// (cancel, submit, or the dialog being replaced).
+pub struct SecretBuffer {
+    text: crate::engine::auth::credential::SecretString,
+}
+
+impl Default for SecretBuffer {
+    fn default() -> Self {
+        Self {
+            text: crate::engine::auth::credential::SecretString::input_buffer(),
+        }
+    }
+}
+
+impl SecretBuffer {
+    pub fn insert_char(&mut self, ch: char) {
+        self.text.push_char(ch);
+    }
+
+    pub fn backspace(&mut self) {
+        self.text.pop_char();
+    }
+
+    /// Number of characters typed, for drawing one `•` each.
+    pub fn len(&self) -> usize {
+        self.text.expose().chars().count()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.text.expose().is_empty()
+    }
+
+    /// Move the typed value out as a `SecretString`, leaving the buffer empty.
+    pub fn take(&mut self) -> crate::engine::auth::credential::SecretString {
+        std::mem::replace(
+            &mut self.text,
+            crate::engine::auth::credential::SecretString::input_buffer(),
+        )
+    }
+}
+
+impl std::fmt::Debug for SecretBuffer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SecretBuffer(<redacted>)")
+    }
 }
 
 #[derive(Debug, Clone)]

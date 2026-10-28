@@ -23,3 +23,5 @@ mod sbx;
 mod stuck_event_wiring;
 mod workflow_end_to_end;
 mod workflow_on_failure;
+
+mod ssh_push_docker;

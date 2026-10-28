@@ -666,6 +666,9 @@ fn only_the_config_subtree_declares_requires_runtime_false() {
         vec![
             "config",
             "config get",
+            "config prerequisite-grants",
+            "config prerequisite-grants list",
+            "config prerequisite-grants revoke",
             "config set",
             "config show",
             // Writes a definition file and never builds.
@@ -994,6 +997,12 @@ fn exec_workflow_flags_keep_their_documented_order() {
             "on-dirty-merge-target",
             "on-merge-failure",
             "on-existing-worktree",
+            "prerequisite-identity",
+            "prerequisite-ssh",
+            "prerequisite-token",
+            "prerequisite-unresolved",
+            "check-prerequisites",
+            "json",
         ]
     );
 }

@@ -96,6 +96,11 @@ fn every_squad_subcommand_has_the_contract_shape() {
                 "overlay",
                 "repo",
                 "workspace",
+                // WI 0149: the task's workflow prerequisite policy.
+                "prerequisite-identity",
+                "prerequisite-ssh",
+                "prerequisite-token",
+                "prerequisite-unresolved",
             ],
         ),
         // WI 0110: `squad edit` carries every field a task may change after
@@ -117,6 +122,10 @@ fn every_squad_subcommand_has_the_contract_shape() {
                 "model",
                 "non-interactive",
                 "overlay",
+                "prerequisite-identity",
+                "prerequisite-ssh",
+                "prerequisite-token",
+                "prerequisite-unresolved",
             ],
         ),
         ("list", vec![], vec!["json"]),

@@ -16,6 +16,16 @@ type Result<T> = std::result::Result<T, EngineError>;
 pub struct RemotePushGit {
     private: tempfile::TempDir,
     repo: PathBuf,
+    original: Option<(PathBuf, PathBuf)>,
+}
+
+/// Repository metadata locations captured before any workflow agent runs.
+/// Later transport never rediscovers them through a writable `.git` pointer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowGitSource {
+    repo: PathBuf,
+    common: PathBuf,
+    admin: PathBuf,
 }
 
 fn io(error: std::io::Error) -> EngineError {
@@ -25,28 +35,59 @@ fn io(error: std::io::Error) -> EngineError {
 // Reject symlinks and special files, including directory symlinks. In particular,
 // never import objects/info/alternates, config, hooks, attributes or split indexes.
 fn copy_regular(source: &Path, dest: &Path) -> Result<()> {
-    let meta = fs::symlink_metadata(source).map_err(io)?;
-    if meta.is_file() {
-        if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent).map_err(io)?;
-        }
-        fs::copy(source, dest).map_err(io)?;
-    } else if meta.is_dir() {
-        fs::create_dir_all(dest).map_err(io)?;
-        for entry in fs::read_dir(source).map_err(io)? {
-            let entry = entry.map_err(io)?;
-            copy_regular(&entry.path(), &dest.join(entry.file_name()))?;
-        }
-    } else {
-        return Err(EngineError::Git(format!(
-            "unsafe Git metadata: {}",
-            source.display()
-        )));
-    }
-    Ok(())
+    crate::data::fs::git_metadata::GitMetadataCopy::copy(source, dest).map_err(io)
 }
 
 impl GitEngine {
+    pub fn ensure_workflow_git_source_unchanged(&self, source: &WorkflowGitSource) -> Result<()> {
+        if self.capture_workflow_git_source(&source.repo)? != *source {
+            return Err(EngineError::Git(
+                "workflow Git metadata layout changed after agent execution".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn capture_workflow_git_source(&self, repo: &Path) -> Result<WorkflowGitSource> {
+        let common = fs::canonicalize(self.git_common_dir(repo)?).map_err(io)?;
+        let output = super::host_command::command(repo)
+            .args(["rev-parse", "--absolute-git-dir"])
+            .current_dir(repo)
+            .output()
+            .map_err(io)?;
+        if !output.status.success() {
+            return Err(EngineError::Git("cannot locate worktree metadata".into()));
+        }
+        let admin = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+        Ok(WorkflowGitSource {
+            repo: fs::canonicalize(repo).map_err(io)?,
+            common,
+            admin: fs::canonicalize(admin).map_err(io)?,
+        })
+    }
+
+    /// Snapshot inert metadata using the layout pinned before agents ran.
+    pub fn isolate_workflow_transport(
+        &self,
+        source: &WorkflowGitSource,
+        url: &str,
+    ) -> Result<RemotePushGit> {
+        let mut isolated = self.isolate_transport(&source.repo, &source.common, url)?;
+        // A linked worktree has a distinct HEAD and index.
+        copy_regular(
+            &source.admin.join("HEAD"),
+            &isolated.private.path().join("HEAD"),
+        )?;
+        if source.admin.join("index").exists() {
+            copy_regular(
+                &source.admin.join("index"),
+                &isolated.private.path().join("index"),
+            )?;
+        }
+        isolated.original = Some((source.common.clone(), source.admin.clone()));
+        Ok(isolated)
+    }
+
     pub fn isolate_remote_push(&self, repo: &Path, url: &str) -> Result<RemotePushGit> {
         let metadata = repo.join(".git");
         if !fs::symlink_metadata(&metadata).map_err(io)?.is_dir() {
@@ -54,6 +95,10 @@ impl GitEngine {
                 "remote clone must have a real .git directory".into(),
             ));
         }
+        self.isolate_transport(repo, &metadata, url)
+    }
+
+    fn isolate_transport(&self, repo: &Path, metadata: &Path, url: &str) -> Result<RemotePushGit> {
         // A sibling of the clone is outside its bind mount even when the
         // server's TMPDIR was configured inside the repository.
         let parent = repo
@@ -66,6 +111,7 @@ impl GitEngine {
         let git = RemotePushGit {
             private,
             repo: repo.to_path_buf(),
+            original: None,
         };
         let dir = git.private.path();
         fs::create_dir_all(dir.join("objects")).map_err(io)?;
@@ -107,8 +153,11 @@ impl GitEngine {
             &mut sink,
         )?;
         // Preserve only identity and object-format values from local config, without includes.
-        let local = metadata.join("config");
-        if fs::symlink_metadata(&local).map_err(io)?.is_file() {
+        let local = dir.join("source-config");
+        // Git must parse a private snapshot, never reopen an agent-swappable
+        // pathname after a separate symlink check.
+        copy_regular(&metadata.join("config"), &local)?;
+        {
             for key in ["user.name", "user.email", "extensions.objectformat"] {
                 let output = Command::new("git")
                     .args(["config", "--no-includes", "--file"])
@@ -135,11 +184,68 @@ impl GitEngine {
                 }
             }
         }
+        fs::remove_file(&local).map_err(io)?;
         Ok(git)
     }
 }
 
 impl RemotePushGit {
+    pub fn metadata_dir(&self) -> &Path {
+        self.private.path()
+    }
+
+    pub fn refresh_workflow_metadata(&self) -> Result<()> {
+        let Some((common, admin)) = &self.original else {
+            return Ok(());
+        };
+        for name in ["objects", "refs", "packed-refs", "shallow"] {
+            let source = common.join(name);
+            if name == "objects" {
+                for entry in fs::read_dir(&source).map_err(io)? {
+                    let entry = entry.map_err(io)?;
+                    if entry.file_name() != "info" {
+                        copy_regular(
+                            &entry.path(),
+                            &self.private.path().join("objects").join(entry.file_name()),
+                        )?;
+                    }
+                }
+            } else if source.exists() {
+                copy_regular(&source, &self.private.path().join(name))?;
+            }
+        }
+        for name in ["HEAD", "index"] {
+            let source = admin.join(name);
+            if source.exists() {
+                copy_regular(&source, &self.private.path().join(name))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Publish only inert Git state after an isolated setup fetch/pull.
+    pub fn sync_workflow_metadata(&self) -> Result<()> {
+        let Some((common, admin)) = &self.original else {
+            return Ok(());
+        };
+        for name in ["objects", "refs", "packed-refs", "shallow"] {
+            let source = self.private.path().join(name);
+            if source.exists() {
+                if name == "objects" {
+                    copy_new_objects(&source, &common.join(name))?;
+                } else {
+                    copy_regular(&source, &common.join(name))?;
+                }
+            }
+        }
+        for name in ["HEAD", "index"] {
+            let source = self.private.path().join(name);
+            if source.exists() {
+                copy_regular(&source, &admin.join(name))?;
+            }
+        }
+        Ok(())
+    }
     fn run(&self, args: &[&str], transport: bool, sink: &mut dyn GitFrontend) -> Result<Output> {
         let display = GitCommand::new(args);
         sink.command_started(&display);
@@ -497,5 +603,132 @@ mod tests {
             super::bounded_output(&mut command, std::time::Duration::from_millis(30)).unwrap_err();
         assert!(error.to_string().contains("timed out"));
         assert!(start.elapsed() < std::time::Duration::from_secs(2));
+    }
+}
+
+#[cfg(test)]
+mod workflow_review_tests {
+    use super::*;
+    #[test]
+    fn isolated_workflow_transport_omits_agent_hooks_rewrites_and_pushurl() {
+        let repo = tempfile::tempdir().unwrap();
+        assert!(Command::new("git")
+            .args(["init", "-q"])
+            .arg(repo.path())
+            .status()
+            .unwrap()
+            .success());
+        let git = GitEngine::new();
+        let config = repo.path().join(".git/config");
+        fs::write(&config, "[core]\nrepositoryformatversion=0\n[remote \"origin\"]\nurl=https://approved.test/o/r\npushurl=https://evil.test/o/r\n[url \"https://evil.test/\"]\ninsteadOf=https://approved.test/\n[core]\nhooksPath=hooks\nsshCommand=evil\n").unwrap();
+        fs::write(repo.path().join(".git/hooks/pre-push"), "echo stolen").unwrap();
+        let isolated = git
+            .isolate_workflow_transport(
+                &git.capture_workflow_git_source(repo.path()).unwrap(),
+                "https://approved.test/o/r",
+            )
+            .unwrap();
+        let config = fs::read_to_string(isolated.metadata_dir().join("config")).unwrap();
+        assert!(config.contains("https://approved.test/o/r"));
+        for needle in [
+            "evil.test",
+            "insteadOf",
+            "hooksPath",
+            "sshCommand",
+            "pushurl",
+        ] {
+            assert!(!config.contains(needle));
+        }
+        assert!(!isolated.metadata_dir().join("hooks/pre-push").exists());
+        assert!(!isolated.metadata_dir().starts_with(repo.path()));
+    }
+
+    #[test]
+    fn pinned_workflow_metadata_ignores_rewritten_git_and_commondir_pointers() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        let worktree = root.path().join("worktree");
+        let foreign = root.path().join("foreign");
+        for path in [&repo, &foreign] {
+            assert!(Command::new("git")
+                .args(["init", "-q"])
+                .arg(path)
+                .status()
+                .unwrap()
+                .success());
+        }
+        assert!(Command::new("git")
+            .current_dir(&repo)
+            .args([
+                "-c",
+                "user.name=Trusted",
+                "-c",
+                "user.email=trusted@test",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "initial",
+            ])
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .current_dir(&repo)
+            .args(["worktree", "add", "--detach", "-q"])
+            .arg(&worktree)
+            .status()
+            .unwrap()
+            .success());
+        let git = GitEngine::new();
+        let source = git.capture_workflow_git_source(&worktree).unwrap();
+        let foreign_head = fs::read(foreign.join(".git/HEAD")).unwrap();
+        fs::write(
+            foreign.join(".git/config"),
+            "[core]\nrepositoryformatversion=0\n[user]\nname=FOREIGN_CANARY\n",
+        )
+        .unwrap();
+        fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", foreign.join(".git").display()),
+        )
+        .unwrap();
+        fs::write(
+            source.admin.join("commondir"),
+            format!("{}\n", foreign.join(".git").display()),
+        )
+        .unwrap();
+        let isolated = git
+            .isolate_workflow_transport(&source, "https://approved.test/o/r")
+            .unwrap();
+        assert!(!fs::read_to_string(isolated.metadata_dir().join("config"))
+            .unwrap()
+            .contains("FOREIGN_CANARY"));
+        assert_eq!(
+            fs::read(isolated.metadata_dir().join("HEAD")).unwrap(),
+            fs::read(source.admin.join("HEAD")).unwrap()
+        );
+        isolated.refresh_workflow_metadata().unwrap();
+        isolated.sync_workflow_metadata().unwrap();
+        assert_eq!(fs::read(foreign.join(".git/HEAD")).unwrap(), foreign_head);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn isolated_workflow_metadata_refuses_linked_config() {
+        let repo = tempfile::tempdir().unwrap();
+        assert!(Command::new("git")
+            .args(["init", "-q"])
+            .arg(repo.path())
+            .status()
+            .unwrap()
+            .success());
+        let git = GitEngine::new();
+        let source = git.capture_workflow_git_source(repo.path()).unwrap();
+        let foreign = tempfile::NamedTempFile::new().unwrap();
+        fs::remove_file(repo.path().join(".git/config")).unwrap();
+        std::os::unix::fs::symlink(foreign.path(), repo.path().join(".git/config")).unwrap();
+        assert!(git
+            .isolate_workflow_transport(&source, "https://approved.test/o/r")
+            .is_err());
     }
 }

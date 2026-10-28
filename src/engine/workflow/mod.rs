@@ -31,6 +31,7 @@ use crate::engine::agent_runtime::execution::{
     AgentExecution, AgentExitInfo, CancelHandle, StuckEvent, KILLED_EXIT_CODE,
 };
 use crate::engine::agent_runtime::output_tail::OutputTail;
+use crate::engine::auth::{credential::SecretString, redaction::RedactionSet};
 use crate::engine::container::options::OverlayPermission;
 use crate::engine::error::EngineError;
 use crate::engine::workflow::actions::{
@@ -41,11 +42,14 @@ use crate::engine::workflow::actions::{
 use crate::engine::workflow::factory::{AgentExecutionFactory, WorkflowRuntimeContext};
 use crate::engine::workflow::frontend::{EngineHandles, WorkflowFrontend};
 use crate::engine::workflow::step_commands::PhaseStepSpec;
+use crate::engine::workflow::step_commands::StepCommandOptions;
 
 pub mod actions;
 pub mod factory;
 pub mod frontend;
 pub mod poll_ci;
+pub mod prerequisite_grants;
+pub mod prerequisites;
 pub mod step_commands;
 pub mod timing;
 
@@ -236,6 +240,8 @@ struct ActiveParallelStep {
 /// six-parameter `new` / `resume` / `resume_with_state_root` constructors
 /// (F-34).
 pub struct WorkflowSpec {
+    /// Explicitly granted credential for host CI polling. Never persisted.
+    pub ci_token: Option<SecretString>,
     pub workflow: Workflow,
     pub work_item_context: Option<crate::data::workflow_prompt_template::WorkItemContext>,
     /// Root for the workflow-state file. `None` uses the session's git root,
@@ -255,6 +261,7 @@ impl WorkflowSpec {
             workflow,
             work_item_context: None,
             state_root: None,
+            ci_token: None,
         }
     }
 
@@ -270,6 +277,11 @@ impl WorkflowSpec {
         self.state_root = root;
         self
     }
+
+    pub fn with_ci_token(mut self, token: Option<SecretString>) -> Self {
+        self.ci_token = token;
+        self
+    }
 }
 
 /// The two Layer 2/3 collaborators a `WorkflowEngine` needs: somewhere to
@@ -281,6 +293,11 @@ pub struct WorkflowEngineDeps {
 }
 
 pub struct WorkflowEngine {
+    ci_token: Option<SecretString>,
+    ci_destination: Option<String>,
+    ci_refused_binaries: Vec<String>,
+    redaction: RedactionSet,
+    step_command_options: Vec<((PhaseKind, usize), StepCommandOptions)>,
     session: Session,
     workflow: Workflow,
     dag: WorkflowDag,
@@ -377,7 +394,7 @@ impl WorkflowEngine {
         tail: &OutputTail,
         exit_code: i32,
     ) {
-        let contents = tail.snapshot_text();
+        let contents = self.redaction.redact(&tail.snapshot_text());
         let paths = match crate::data::fs::WorkflowLogPaths::from_env(self.session.env()) {
             Ok(p) => p,
             Err(e) => {
@@ -447,6 +464,7 @@ impl WorkflowEngine {
             workflow,
             work_item_context,
             state_root,
+            ci_token,
         } = spec;
         let dag = WorkflowDag::build(&workflow.steps).map_err(EngineError::Data)?;
         let workflow_hash = compute_workflow_hash(&workflow);
@@ -465,7 +483,43 @@ impl WorkflowEngine {
             state_store_for(session, state_root),
             work_item_context,
             deps,
-        ))
+        )
+        .with_ci_token(ci_token))
+    }
+
+    fn with_ci_token(mut self, token: Option<SecretString>) -> Self {
+        self.set_ci_token(token);
+        self
+    }
+
+    /// Replace the CI grant after a pre-teardown refresh. Keep both old and new
+    /// credentials in the run's redaction set for buffered output.
+    pub fn set_ci_token(&mut self, token: Option<SecretString>) {
+        if let Some(secret) = &token {
+            self.redaction.add(secret.clone());
+        }
+        self.ci_token = token;
+    }
+    pub fn set_ci_destination(&mut self, destination: Option<String>) {
+        self.ci_destination = destination;
+    }
+    pub fn set_ci_host_binaries(&mut self, binaries: Vec<String>) {
+        self.ci_refused_binaries = binaries;
+    }
+
+    pub fn set_redaction(&mut self, redaction: RedactionSet) {
+        if let Some(token) = &self.ci_token {
+            redaction.add(token.clone());
+        }
+        self.redaction = redaction;
+    }
+
+    /// Accepts a map or a sequence; PhaseKind need not gain data-layer Hash semantics.
+    pub fn set_phase_step_command_options(
+        &mut self,
+        options: impl IntoIterator<Item = ((PhaseKind, usize), StepCommandOptions)>,
+    ) {
+        self.step_command_options = options.into_iter().collect();
     }
 
     pub fn abort_on_failure_triggered(&self) -> bool {
@@ -534,6 +588,7 @@ impl WorkflowEngine {
             workflow,
             work_item_context,
             state_root,
+            ci_token,
         } = spec;
         let WorkflowEngineDeps {
             mut frontend,
@@ -644,7 +699,8 @@ impl WorkflowEngine {
                 frontend,
                 agent_factory,
             },
-        ))
+        )
+        .with_ci_token(ci_token))
     }
 
     /// The struct literal `new` and `resume` share. Both had their own copy
@@ -674,6 +730,11 @@ impl WorkflowEngine {
         frontend.attach_engine(EngineHandles::requests(tx));
         Self {
             session: session.clone(),
+            ci_token: None,
+            ci_destination: None,
+            ci_refused_binaries: vec![],
+            redaction: RedactionSet::new(),
+            step_command_options: Vec::new(),
             workflow,
             dag,
             state,

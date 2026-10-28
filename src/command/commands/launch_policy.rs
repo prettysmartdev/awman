@@ -301,6 +301,19 @@ impl<'a> LaunchPolicy<'a> {
                 text: "'~/.awman/config.json' contains a deprecated 'envPassthrough' field. Move these vars to the 'overlays' array as env() expressions, e.g. \"env(VAR_NAME)\", then remove 'envPassthrough'.".into(),
             });
         }
+        // Load-time warnings (an unknown `workflows.prerequisites` key, a repo
+        // `allowApiClientGrants`, …): surfaced, never fatal (WI 0149 §5).
+        for (file, warnings) in [
+            ("'~/.awman/config.json'", &ec.global().load_warnings),
+            ("'.awman/config.json'", &ec.repo().load_warnings),
+        ] {
+            for warning in warnings {
+                sink.write_message(UserMessage {
+                    level: MessageLevel::Warning,
+                    text: format!("{file}: {warning}"),
+                });
+            }
+        }
         self.warn_redundant_agent_flags(&ec, sink);
     }
 

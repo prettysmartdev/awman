@@ -130,8 +130,18 @@ steps are:
 
   - `run_shell` running the project's test command, with `abort_on_failure = true`
   - `commit_changes` to commit the work
-  - `push_branch` to push, with `overlays = ["ssh()"]`
-  - `create_pull_request` to open a PR, with `overlays = ["env(GITHUB_TOKEN)"]`
+  - `push_branch` to push the branch
+  - `create_pull_request` to open a PR
+
+awman supplies credentials to teardown steps automatically: the git identity for
+`commit_changes`, the SSH key or token for `push_branch`, and the GitHub token for
+`create_pull_request` and `poll_ci`. Do not add `ssh()` or `env(...)` overlays to these
+steps for credentials.
+
+Workflow prerequisites for this run: {{workflow_prerequisites}}
+
+Do not add a teardown step whose prerequisite is marked ✗ above; mention it in your
+summary instead.
 
 Give a test teardown step an `on_failure` block so an agent gets a chance to fix
 failures before the run aborts.

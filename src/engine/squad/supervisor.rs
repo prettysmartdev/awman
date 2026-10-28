@@ -918,6 +918,7 @@ mod health_tests {
     fn task(name: &str, last_run_status: Option<RunStatus>) -> Task {
         let now = Utc::now();
         Task {
+            prerequisites: None,
             id: name.to_string(),
             name: name.to_string(),
             description: "test".into(),

@@ -15,11 +15,11 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::engine::container::options::{
-    ContainerOption, Entrypoint, EnvLiteral, EnvVar, ImageRef, OverlayPermission, OverlaySpec,
+    ContainerOption, Entrypoint, EnvLiteral, ImageRef, OverlayPermission, OverlaySpec,
 };
 
 /// Everything a foreground setup/teardown step container needs.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PhaseStepContainerSpec<'a> {
     /// Session-scoped settings, also required by interactive builtin steps.
     pub builtin_launch: Option<&'a crate::data::config::builtin_launch::BuiltinLaunchSettings>,
@@ -36,6 +36,16 @@ pub struct PhaseStepContainerSpec<'a> {
     pub command: &'a str,
     /// The step's own `env` entries from the workflow file.
     pub step_env: Option<&'a HashMap<String, String>>,
+}
+
+impl std::fmt::Debug for PhaseStepContainerSpec<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PhaseStepContainerSpec")
+            .field("image", &self.image)
+            .field("workdir", &self.workdir)
+            .field("env_names", &self.env.keys().collect::<Vec<_>>())
+            .finish_non_exhaustive()
+    }
 }
 
 impl PhaseStepContainerSpec<'_> {
@@ -73,11 +83,10 @@ impl PhaseStepContainerSpec<'_> {
 
         let mut names: Vec<&String> = self.env.keys().collect();
         names.sort();
-        options.extend(
-            names
-                .into_iter()
-                .map(|name| ContainerOption::EnvPassthrough(EnvVar(name.clone()))),
-        );
+        options.extend(names.into_iter().map(|name| ContainerOption::EnvOverride {
+            key: name.clone(),
+            value: crate::engine::auth::credential::SecretString::new(self.env[name].clone()),
+        }));
 
         if let Some(step_env) = self.step_env {
             let mut literals: Vec<(&String, &String)> = step_env.iter().collect();
@@ -182,7 +191,10 @@ mod tests {
     fn env_overlay_values_are_passed_through_by_name_never_as_literals() {
         let env = HashMap::from([("GITHUB_TOKEN".to_string(), "s3cret".to_string())]);
         let opts = resolve(&spec(Path::new("/w"), &[], &env, None));
-        assert_eq!(opts.env_passthrough, vec![EnvVar("GITHUB_TOKEN".into())]);
+        assert!(opts.env_passthrough.is_empty());
+        assert_eq!(opts.env_overrides[0].0, "GITHUB_TOKEN");
+        assert_eq!(opts.env_overrides[0].1.expose(), "s3cret");
+        assert!(!format!("{opts:?}").contains("s3cret"));
         assert!(
             opts.env_literal.iter().all(|l| !l.value.contains("s3cret")),
             "a host env() value must never become a KEY=VALUE literal"

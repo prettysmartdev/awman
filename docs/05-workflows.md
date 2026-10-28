@@ -256,7 +256,25 @@ Workflows can include optional `setup` and `teardown` sections to prepare the en
 - Pushing branches to a remote
 - Cleanup operations
 
-All setup and teardown steps execute inside the project's **base container image** — the same isolated Docker container used for agent steps. No shell commands are ever executed directly on the host. Each step gets its own fresh container, built with only that step's overlays, which is removed as soon as the step finishes. In the TUI and in an interactive CLI session, each step's container is shown to you just like an agent step's — see [Container execution model](#container-execution-model).
+All setup and teardown steps execute inside the project's **base container image** — the same isolated Docker container used for agent steps. Workflow commands run in fresh containers; host prerequisite operations include Git metadata probes, an explicitly requested local identity write, fixed `gh auth` commands, and token acquisition. Repository acquisition commands require exact-executable approval; globally configured acquisition commands use the operator's existing authorization and are listed in every report. Each step container is built with only that step's overlays and is removed as soon as the step finishes. In the TUI and an interactive CLI session, uncredentialed steps can use an attached terminal. Credentialed Git operations and runs holding token grants use filtered, streamed output — see [Container execution model](#container-execution-model).
+
+### Workflow prerequisite checks
+
+Before starting a workflow, awman checks the resources needed by its setup and teardown steps. The check happens before the first agent or step container starts. In an interactive run, awman shows a report and asks before using host credentials. In headless runs, it uses only credentials already available through the selected policy or explicit flags; `--yes` does not grant credentials. If requirements remain unresolved, a headless static workflow fails before launch by default; interactive, dynamic and squad runs warn by default. Set `--prerequisite-unresolved warn` to continue with a warning, or `fail` to stop when a requirement remains missing or needs consent. Dynamic workflows default to warning when a check remains unresolved.
+
+The requirements depend on the steps and the repository's remote:
+
+| Workflow need | When it is needed | What awman checks or supplies |
+|---|---|---|
+| Git identity | `commit_changes` | A complete `user.name` and `user.email` in the repository/worktree config is used directly. If missing, you can provide an identity for this run or explicitly allow use of your host Git identity. awman does not change your global Git configuration. |
+| SSH access | `push_branch` when the remote uses SSH | awman checks for a usable key and the `ssh` tool in the base image. With consent, it mounts a selected key read-only, or the whole `~/.ssh` directory if you choose that broader access. |
+| GitHub token | GitHub HTTPS `clone_repo` / `pull_branch`, `create_pull_request`, HTTPS `push_branch`, and token-authenticated `poll_ci` | awman can use a token from an approved host variable, `gh auth token`, a token you paste, or a configured `acquire` command. Credentials are supplied only to the steps that need them. For `poll_ci`, an already-authenticated host `gh` may be used without a token grant. |
+| GitHub CLI | `create_pull_request` and some GitHub operations | The base image must contain `gh` for `create_pull_request`; awman checks the image before execution. |
+| Push before pull request | `create_pull_request` | A preceding teardown `push_branch` step or an existing upstream branch is required. |
+
+Repo-local Git identity is preferred: it follows the repository/worktree and avoids exposing your global identity to a container. Host identity use requires an explicit choice. For SSH, a key mount is read-only; the private key itself is not copied into the workflow configuration.
+
+Use `--check-prerequisites` with `exec workflow` to run the checks and display their report without starting the workflow. Exit code `0` means every check is satisfied; `1` means a check is missing, awaiting consent, or unknown. Dynamic workflow checks happen before the leader as well. See [Dynamic Workflows](06-dynamic-workflows.md#workflow-prerequisites).
 
 ### Setup step types
 
@@ -338,10 +356,10 @@ setup:
 
 `poll_ci` uses two strategies in order of preference:
 
-1. **GitHub CLI (`gh`)** — if `gh` is installed and authenticated, awman runs `gh run list` to fetch the most recent run matching the current branch and HEAD commit.
-2. **GitHub REST API** — if `gh` is unavailable or not authenticated, awman calls the GitHub REST API directly using the `GITHUB_TOKEN` environment variable. If `GITHUB_TOKEN` is not set, the step fails immediately with a clear error message.
+1. **GitHub CLI (`gh`)** — if `gh` is installed on the host and authenticated, awman runs it to fetch the most recent run matching the current branch and HEAD commit.
+2. **GitHub REST API** — otherwise, awman uses a token granted for this workflow run. awman can supply a selected `GH_TOKEN` or `GITHUB_TOKEN`, or a token from the configured acquisition methods. If no token is granted and host `gh` is not authenticated, the prerequisite check reports the missing credential before the workflow starts.
 
-Both methods are secure: `GITHUB_TOKEN` is never logged or exposed in step output.
+The token is provided only to workflow steps that need it and is redacted from workflow output. See [Workflow prerequisite checks](#workflow-prerequisite-checks) and [Configuration](07-configuration.md#workflow-prerequisites).
 
 **Handling missing or multiple CI runs:**
 
@@ -583,7 +601,7 @@ Teardown steps are defined in a `[[teardown]]` (TOML) or `teardown:` (YAML) arra
 | `create_pull_request` | `title` (string, optional), `body` (string, optional), `base` (string, optional) | Create a pull request using the GitHub CLI. If `base` is provided, it sets the branch the PR will be opened against (via the `--base` flag). Requires `gh` to be available in the base container image. |
 | `poll_ci` | `interval_secs` (integer, optional), `max_retries` (integer, optional) | Poll GitHub for the CI run status of the current branch. Waits for the CI run to complete. `interval_secs` controls the polling interval in seconds (default: 30). `max_retries` limits the number of polling attempts (default: 10). See [Polling CI status](#polling-ci-status) for details. |
 
-If any teardown step is `commit_changes`, awman checks before running the workflow that `git user.name` and `git user.email` resolve at the commit's working directory (the worktree, if `--worktree` is used, otherwise the repo root) — so a repo-local identity set in that repo's own `.git/config` is honoured, not just your global `~/.gitconfig`. If either is unset there, awman prints a warning up front naming which one, rather than letting the `commit_changes` step fail partway through the workflow.
+If any teardown step is `commit_changes`, awman checks the identity available in the repository or worktree before starting. A complete repo-local identity is used as-is. If it is incomplete, awman offers choices in an interactive run, including entering an identity for this run or allowing the host-global identity for this run. No global Git config is changed. Headless runs need a complete repo-local identity or an explicit `--prerequisite-identity` choice.
 
 Example TOML teardown:
 
@@ -672,7 +690,7 @@ If a workflow is interrupted mid-setup or mid-teardown and then resumed, the ful
 
 ### Base image and `gh` CLI
 
-If your teardown includes a `create_pull_request` step, the base container image **must have the GitHub CLI (`gh`) installed**. By default, the base image is the project's `Dockerfile.dev`. If `gh` is not available, the step will fail with a clear error. Update your `Dockerfile.dev` to include `gh` if you intend to use `create_pull_request` steps.
+If your teardown includes a `create_pull_request` step, the base container image **must have the GitHub CLI (`gh`) installed**. awman checks this before the workflow starts and reports how to add the missing tool to your base image. By default, the base image is the project's `Dockerfile.dev`.
 
 ### Complete example: setup + steps + teardown
 
@@ -1591,12 +1609,13 @@ Each parallel step gets its own control board when it completes or gets stuck; y
 | Uppercase field name in TOML/YAML (e.g. `Name:`) | Parse error; field names must be lowercase |
 | Setup step with invalid type | Parse error; type must be one of the supported step types |
 | Teardown step with invalid type | Parse error; type must be one of the supported step types |
-| `create_pull_request` step but `gh` not in base image | Step fails at execution time with "command not found: gh" |
+| `create_pull_request` step but `gh` not in base image | Prerequisite check reports the missing tool before workflow execution |
 | `poll_ci` step | Polls GitHub for CI status; see [Polling CI status](#polling-ci-status) for authentication and error handling |
 | `poll_ci` with no CI run found yet | First 3 polling attempts treat "not found" as retriable; after 3 attempts, step fails with "No CI run found" |
 | `poll_ci` with multiple CI runs on the branch | Uses the run matching the current HEAD commit SHA; if no match, uses the most recent run with a warning |
-| `poll_ci` with `gh` CLI available but not authenticated | Falls back to GitHub REST API with `GITHUB_TOKEN` |
-| `poll_ci` with neither `gh` nor `GITHUB_TOKEN` | Step fails immediately with "Cannot authenticate with GitHub" error |
+| `poll_ci` with authenticated host `gh` | Uses host `gh` without passing a token into a container |
+| `poll_ci` without authenticated host `gh` | Uses a token explicitly granted for the workflow run |
+| `poll_ci` with neither authenticated host `gh` nor a granted token | Prerequisite check reports the missing credential before workflow execution |
 | `poll_ci` when CI fails (red status) | Step fails with CI failure details |
 | `poll_ci` after pushing new commits | Re-detects HEAD SHA; polls for the new CI run, not the old one |
 | Step with `on_failure` block | When step fails, launches a remediation agent; retries the step after agent completes; see [Step remediation](#step-remediation-with-on_failure) |

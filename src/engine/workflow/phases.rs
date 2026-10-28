@@ -384,11 +384,16 @@ impl WorkflowEngine {
         idx: usize,
     ) -> PhaseStepOutcome {
         let result = match container.exec_streaming(command, env, &mut |line| {
-            self.frontend.on_phase_step_output(kind, line);
+            self.frontend
+                .on_phase_step_output(kind, &self.redaction.redact(line));
         }) {
-            Ok(r) => r,
+            Ok(mut r) => {
+                r.stdout = self.redaction.redact(&r.stdout);
+                r.stderr = self.redaction.redact(&r.stderr);
+                r
+            }
             Err(e) => {
-                let error = e.to_string();
+                let error = self.redaction.redact(&e.to_string());
                 self.set_phase_step_failed(kind, idx, &error);
                 // The runtime never produced an ExecOutput, so stdout is empty
                 // and stderr carries the launch error for the failure file.
@@ -416,7 +421,7 @@ impl WorkflowEngine {
         use crate::data::workflow_state::PhaseStepStatus;
 
         self.state.phase_step_states_mut(kind)[idx].status = PhaseStepStatus::Failed {
-            error: error.to_string(),
+            error: self.redaction.redact(error),
         };
         let _ = self.persist();
     }
@@ -445,22 +450,24 @@ impl WorkflowEngine {
         idx: usize,
     ) -> bool {
         let git_root = self.session.git_root().to_path_buf();
-        // `GITHUB_TOKEN` is host-supplied, so it must come through the Layer 0
-        // daemon overlay when squad is the caller: the daemon does not inherit
-        // the shell that created the task (WI 0116).
         let poller = poll_ci::CiPoller::new(
             std::sync::Arc::new(crate::engine::git::GitEngine::new()),
-            crate::data::config::env::host_var(crate::data::config::env::GITHUB_TOKEN),
-        );
+            self.ci_token.clone(),
+        )
+        .with_destination(self.ci_destination.clone())
+        .with_host_policy(self.ci_refused_binaries.clone(), self.redaction.clone());
         // The poller reports facts; the frontend draws them. The default
         // `report_ci_poll` writes the same narration this closure used to
         // compose (F-45).
-        let result = poller.poll(&git_root, interval_secs, max_retries, |event| {
+        let result = poller.poll(&git_root, interval_secs, max_retries, |mut event| {
+            if let crate::data::ci_poll_event::CiPollEvent::Failed { detail } = &mut event {
+                *detail = self.redaction.redact(detail);
+            }
             self.frontend.report_ci_poll(&event);
         });
 
         if let Err(e) = result {
-            let error = e.to_string();
+            let error = self.redaction.redact(&e.to_string());
             self.set_phase_step_failed(kind, idx, &error);
             return true;
         }
@@ -493,7 +500,14 @@ impl WorkflowEngine {
             };
         }
 
-        let (command, env) = step.to_shell();
+        let default_options = StepCommandOptions::default();
+        let options = self
+            .step_command_options
+            .iter()
+            .find(|((phase, index), _)| *phase == kind && *index == idx)
+            .map(|(_, options)| options)
+            .unwrap_or(&default_options);
+        let (command, env) = step.to_shell_with(options);
         let step_ref = PhaseStepRef {
             kind,
             index: idx,
@@ -502,7 +516,7 @@ impl WorkflowEngine {
         match container_for_step(&step_ref) {
             Ok(c) => self.run_shell_phase_step(&*c, &command, env.as_ref(), kind, idx),
             Err(e) => {
-                let error = e.to_string();
+                let error = self.redaction.redact(&e.to_string());
                 self.set_phase_step_failed(kind, idx, &error);
                 PhaseStepOutcome::failed(String::new(), error)
             }
@@ -908,7 +922,11 @@ impl WorkflowEngine {
         let sanitized = sanitize_step_name_for_filename(failure.step_name);
         let filename = format!("{}-failure-{sanitized}.txt", failure.kind.label());
         let file_path = host_dir.join(&filename);
-        let contents = format_phase_failure_file(failure.step_name, failure.stdout, failure.stderr);
+        let contents = self.redaction.redact(&format_phase_failure_file(
+            failure.step_name,
+            failure.stdout,
+            failure.stderr,
+        ));
         if let Err(e) = std::fs::write(&file_path, contents) {
             self.msg_warning(format!(
                 "on_failure: could not write failure output to {}, launching agent without it: {e}",

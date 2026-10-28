@@ -1135,6 +1135,7 @@ fn fake_task(name: &str) -> crate::data::fs::task_store::Task {
     use crate::data::fs::task_store::{MountScope, TaskStatus};
     let now = chrono::Utc::now();
     crate::data::fs::task_store::Task {
+        prerequisites: None,
         id: name.to_string(),
         name: name.to_string(),
         description: "test task".into(),
