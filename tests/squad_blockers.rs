@@ -51,6 +51,7 @@ static ENV_LOCK: AsyncMutex<()> = AsyncMutex::const_new(());
 fn sample_task(name: &str) -> Task {
     let now = chrono::Utc::now();
     Task {
+        prerequisites: None,
         id: format!("id-{name}"),
         name: name.to_string(),
         description: "desc".into(),
@@ -176,6 +177,11 @@ impl UserMessageSink for ScriptedFrontend {
         self.messages.lock().unwrap().push(msg.text);
     }
     fn replay_queued(&mut self) {}
+}
+
+impl awman::command::commands::workflow_prerequisites::WorkflowPrerequisiteFrontend
+    for ScriptedFrontend
+{
 }
 
 impl SquadCommandFrontend for ScriptedFrontend {

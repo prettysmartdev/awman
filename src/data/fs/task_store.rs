@@ -50,6 +50,8 @@ use crate::data::error::DataError;
 /// for its whole lifetime.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Task {
+    #[serde(default)]
+    pub prerequisites: Option<crate::data::config::workflows::PrerequisitePolicy>,
     pub id: String,
     pub name: String,
     pub description: String,
@@ -192,6 +194,13 @@ pub enum TaskWorkspace {
 }
 
 impl Task {
+    pub fn with_prerequisites(
+        mut self,
+        prerequisites: Option<crate::data::config::workflows::PrerequisitePolicy>,
+    ) -> Self {
+        self.prerequisites = prerequisites;
+        self
+    }
     /// Whether this task's runs are worktree-isolated.
     ///
     /// Derived from the effective task root's kind as captured at creation —
@@ -290,6 +299,7 @@ pub struct RunDetail {
 /// and isolation (see [`Task`]'s type-level docs).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TaskUpdate {
+    pub prerequisites: Option<crate::data::config::workflows::PrerequisitePolicy>,
     pub description: Option<String>,
     pub interval_secs: Option<u64>,
     pub agent: Option<Option<String>>,
@@ -438,6 +448,7 @@ impl TaskStore {
         // contain. `NULL` (a row written before this column existed) decodes
         // to an empty list.
         Self::add_column_if_missing(conn, "squad_tasks", "overlays", "TEXT")?;
+        Self::add_column_if_missing(conn, "squad_tasks", "prerequisites", "TEXT")?;
         // Set by `squad trigger` and cleared the moment the run it asked for
         // opens (`start_run`). It is a *request*, not a schedule: it survives
         // a daemon restart, so a task triggered while the daemon was down is
@@ -488,8 +499,8 @@ impl TaskStore {
         let result = conn.execute(
             "INSERT INTO squad_tasks
              (id, name, description, repo_scope, mount_scope, overlays, interval_secs, status, agent, model,
-              backoff_until, created_at, updated_at, last_run_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+              backoff_until, created_at, updated_at, last_run_at, prerequisites)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 task.id,
                 task.name,
@@ -505,6 +516,7 @@ impl TaskStore {
                 timestamp(task.created_at),
                 timestamp(task.updated_at),
                 timestamp_opt(task.last_run_at),
+                encode_prerequisites(task.prerequisites.as_ref())?,
             ],
         );
         match result {
@@ -525,7 +537,7 @@ impl TaskStore {
                         backoff_until, created_at, updated_at, last_run_at, trigger_requested_at,
                         (SELECT r.status FROM squad_runs r
                           WHERE r.task_id = squad_tasks.id
-                          ORDER BY r.started_at DESC LIMIT 1)
+                          ORDER BY r.started_at DESC LIMIT 1), prerequisites
                  FROM squad_tasks WHERE name = ?1",
                 [name],
                 task_from_row,
@@ -544,7 +556,7 @@ impl TaskStore {
                     backoff_until, created_at, updated_at, last_run_at, trigger_requested_at,
                     (SELECT r.status FROM squad_runs r
                       WHERE r.task_id = squad_tasks.id
-                      ORDER BY r.started_at DESC LIMIT 1)
+                      ORDER BY r.started_at DESC LIMIT 1), prerequisites
              FROM squad_tasks ORDER BY created_at ASC",
         )?;
         let rows = stmt.query_map([], task_from_row)?;
@@ -591,7 +603,7 @@ impl TaskStore {
             conn.execute(
                 "UPDATE squad_tasks
                  SET description = ?1, interval_secs = ?2, agent = ?3, model = ?4,
-                     overlays = ?5, updated_at = ?6
+                     overlays = ?5, updated_at = ?6, prerequisites = ?8
                  WHERE name = ?7",
                 params![
                     description,
@@ -601,6 +613,11 @@ impl TaskStore {
                     encode_overlays(&overlays)?,
                     timestamp(Utc::now()),
                     name,
+                    encode_prerequisites(
+                        req.prerequisites
+                            .as_ref()
+                            .or(existing.prerequisites.as_ref())
+                    )?,
                 ],
             )?;
         }
@@ -678,7 +695,7 @@ impl TaskStore {
                     c.last_run_at, c.trigger_requested_at,
                     (SELECT r2.status FROM squad_runs r2
                       WHERE r2.task_id = c.id
-                      ORDER BY r2.started_at DESC LIMIT 1)
+                      ORDER BY r2.started_at DESC LIMIT 1), c.prerequisites
              FROM squad_tasks c
              WHERE c.status = 'active'
                AND (c.trigger_requested_at IS NOT NULL
@@ -849,6 +866,7 @@ impl TaskStore {
 
 #[derive(Debug)]
 struct RawTask {
+    prerequisites: Option<String>,
     id: String,
     name: String,
     description: String,
@@ -869,6 +887,7 @@ struct RawTask {
 
 fn task_from_row(row: &Row<'_>) -> rusqlite::Result<RawTask> {
     Ok(RawTask {
+        prerequisites: row.get(16)?,
         id: row.get(0)?,
         name: row.get(1)?,
         description: row.get(2)?,
@@ -890,6 +909,12 @@ fn task_from_row(row: &Row<'_>) -> rusqlite::Result<RawTask> {
 
 fn task_from_raw(raw: RawTask) -> Result<Task, DataError> {
     Ok(Task {
+        prerequisites: raw
+            .prerequisites
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .map_err(|source| DataError::ConfigSerialize { source })?,
         id: raw.id,
         name: raw.name,
         description: raw.description,
@@ -1034,12 +1059,22 @@ fn is_unique_name_violation(error: &rusqlite::Error) -> bool {
     matches!(error, rusqlite::Error::SqliteFailure(code, _) if code.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE)
 }
 
+fn encode_prerequisites(
+    policy: Option<&crate::data::config::workflows::PrerequisitePolicy>,
+) -> Result<Option<String>, DataError> {
+    policy
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|source| DataError::ConfigSerialize { source })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn task(name: &str, now: DateTime<Utc>) -> Task {
         Task {
+            prerequisites: None,
             id: uuid::Uuid::new_v4().to_string(),
             name: name.to_string(),
             description: "test".into(),
@@ -1143,5 +1178,151 @@ mod tests {
             runs[0].reason.as_deref(),
             Some("no new issues since the last run")
         );
+    }
+}
+
+#[cfg(test)]
+mod prerequisite_tests {
+    use super::*;
+    use crate::data::config::flags::{PrerequisiteFlags, SshFlag};
+    use crate::data::config::workflows::PrerequisitePolicy;
+
+    fn task(name: &str, now: DateTime<Utc>) -> Task {
+        serde_json::from_value(serde_json::json!({
+            "id": format!("id-{name}"), "name": name, "description": "example",
+            "repo_scope": "/repo", "mount_scope": "gitroot", "overlays": [],
+            "interval_secs": 60, "status": "active", "agent": null, "model": null,
+            "backoff_until": null, "created_at": now, "updated_at": now, "last_run_at": null
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn policy_round_trips_all_task_queries_and_updates_old_tasks() {
+        let root = tempfile::tempdir().unwrap();
+        let store = TaskStore::open(&root.path().join("tasks.db")).unwrap();
+        store.migrate().unwrap();
+        store.migrate().unwrap();
+        let now = Utc::now();
+        let mut task: Task = serde_json::from_value(serde_json::json!({
+            "id": "task-id", "name": "example", "description": "example",
+            "repo_scope": "/repo", "mount_scope": "gitroot", "overlays": [],
+            "interval_secs": 60, "status": "active", "agent": null, "model": null,
+            "backoff_until": null, "created_at": now, "updated_at": now, "last_run_at": null
+        }))
+        .unwrap();
+        assert!(task.prerequisites.is_none());
+        let policy = PrerequisitePolicy::from_flags(&PrerequisiteFlags {
+            ssh: Some(SshFlag::Deny),
+            ..Default::default()
+        });
+        task.prerequisites = Some(policy.clone());
+        store.create(&task).unwrap();
+        assert_eq!(
+            store.get("example").unwrap().unwrap().prerequisites,
+            Some(policy.clone())
+        );
+        assert_eq!(store.list().unwrap()[0].prerequisites, Some(policy.clone()));
+        assert_eq!(
+            store.due_for_evaluation(now).unwrap()[0].prerequisites,
+            Some(policy)
+        );
+        let replacement = PrerequisitePolicy::default();
+        let updated = store
+            .update(
+                "example",
+                &TaskUpdate {
+                    prerequisites: Some(replacement.clone()),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.prerequisites, Some(replacement));
+    }
+
+    #[test]
+    fn prerequisites_policy_round_trips_through_sqlite() {
+        use crate::data::config::workflows::{CredentialUse, PrerequisitePolicy};
+        let tmp = tempfile::tempdir().unwrap();
+        let store = TaskStore::open(&tmp.path().join("awman.db")).unwrap();
+        store.migrate().unwrap();
+        let mut policy = PrerequisitePolicy::default();
+        policy.ssh.use_ = CredentialUse::Allow;
+        policy.ssh.key = Some("~/.ssh/id_ed25519".into());
+        policy.github_token.use_ = CredentialUse::Allow;
+        policy.github_token.env_vars = vec!["GH_TOKEN".into()];
+        let now = Utc::now();
+        let created = task("with-policy", now).with_prerequisites(Some(policy.clone()));
+        store.create(&created).unwrap();
+        let loaded = store.get("with-policy").unwrap().unwrap();
+        assert_eq!(loaded.prerequisites, Some(policy.clone()));
+        assert_eq!(store.list().unwrap()[0].prerequisites, Some(policy.clone()));
+        // Stored as decisions only: key path and env var *names*.
+        let conn = store.lock();
+        let raw: String = conn
+            .query_row(
+                "SELECT prerequisites FROM squad_tasks WHERE name = 'with-policy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(conn);
+        assert!(raw.contains("GH_TOKEN"));
+        assert!(raw.contains("~/.ssh/id_ed25519"));
+        assert!(!raw.contains("ghp_"));
+
+        // Update replaces the policy; an update without one keeps the stored policy.
+        let mut denied = policy.clone();
+        denied.ssh.use_ = CredentialUse::Deny;
+        let updated = store
+            .update(
+                "with-policy",
+                &TaskUpdate {
+                    prerequisites: Some(denied.clone()),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.prerequisites, Some(denied.clone()));
+        let kept = store
+            .update(
+                "with-policy",
+                &TaskUpdate {
+                    description: Some("changed".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(kept.prerequisites, Some(denied));
+    }
+
+    #[test]
+    fn legacy_row_reads_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = TaskStore::open(&tmp.path().join("awman.db")).unwrap();
+        store.migrate().unwrap();
+        store.create(&task("legacy", Utc::now())).unwrap();
+        // A row written before the column existed has NULL there.
+        store
+            .lock()
+            .execute("UPDATE squad_tasks SET prerequisites = NULL", [])
+            .unwrap();
+        assert!(store
+            .get("legacy")
+            .unwrap()
+            .unwrap()
+            .prerequisites
+            .is_none());
+        // Migrating again is a no-op on an existing column.
+        store.migrate().unwrap();
+        assert!(store
+            .get("legacy")
+            .unwrap()
+            .unwrap()
+            .prerequisites
+            .is_none());
     }
 }

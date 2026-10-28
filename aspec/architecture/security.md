@@ -102,3 +102,32 @@ When a remote API session is created with `push: true`, awman pushes the session
 - **No force:** awman never force-pushes. A rejected push fails the command with a `push` stage error and leaves local commits in the clone.
 - **Untrusted metadata:** agents can write the clone's `.git`, so absence of hooks immediately after clone provides no protection. Push-back imports only inert objects and refs into a private Git directory outside the mount, rejects symlinks/special files in imported metadata, disables hooks and fsmonitor explicitly, and never imports the clone's config, index, alternates, attributes, or signing/transport helpers. Work-tree staging/committing uses no system/global config, preventing configured filters from executing on agent files. Only identity values and the inert object format are preserved; transport uses a newly authored `origin` pinned to the session's persisted `repo_url`, with trusted host credentials. No agent-authored configuration is evaluated as host commands. Commit objects and the resulting index/ref are copied back without executing Git in the writable clone.
 - **Scope:** only `refs/heads/<session branch>` on `origin` is pushed, and only when the session was explicitly created with `push: true`. Explicit workflow `push_branch` steps execute in the container, accept branch names rather than force options/refspecs, and delimit positional arguments with `--`.
+
+## Workflow prerequisite credentials
+
+`HostSecretCommand` is a narrowly scoped host-execution exception for obtaining a workflow GitHub token. It accepts an argv vector and never invokes a shell; resolves and canonicalizes the executable before execution; refuses known first-party agent binaries, custom-agent binaries supplied by the command layer, and wrappers that would launder those binaries; clears the inherited environment to an explicit allowlist; uses a private temporary working directory; defaults stdin to null; and enforces a bounded timeout and process-group termination. Token output is validated and returned only as a secret value. When user approval is required, review shows the exact argv, resolved executable path, and timeout. Repository-scope commands require approval keyed to the canonical repository root and a hash of the exact argv; changing argv requires new approval. No credential-acquisition path may execute an agent binary on the host.
+
+Workflow grants are ephemeral command state, never session or workflow-state data. Each grant is limited to the repository/run, the relevant remote and credential kind, and only the setup or teardown steps whose declared needs require it. A selected SSH key is mounted read-only to only the relevant phase-step container; token environment values are injected only into the relevant step, and token-authenticated CI receives the token through an explicit typed engine input. Before non-cancelled teardown, granted credentials are rechecked; only an existing host-command token grant configured for `beforeTeardown` may be refreshed. Cancellation cleanup receives no grants and skips publishing steps. Dynamic workflows narrow grants to the generated workflow's actual needs and discard unused grants.
+
+Remembered decisions are stored in `~/.awman/prerequisite-grants.json`, scoped by canonical repository root, normalized remote, and credential kind. The store contains decisions and key selection metadata only, never private key bytes or token values. Revocation is supported. Repository configuration can never grant host credential use: it may narrow policy, suggest a key, or define an acquisition command that needs its own exact-argv approval. Credential `allow` policy is limited to trusted global/task/explicit-flag sources; repository `allow` is ignored. Repository policy also cannot turn preflight off, relax global unresolved `fail`, expand the configured token environment-variable set, or disable globally enabled token verification. API clients cannot widen credential grants unless the global-only `workflows.prerequisites.allowApiClientGrants` setting enables that behavior.
+
+Workflow prerequisite grants exclude `run_shell`, `run_script`, main agent steps,
+`on_failure` remediation agents and dynamic/squad leaders. A single SSH key is
+mounted read-only as `~/.ssh/awman_push_key`, with `IdentitiesOnly=yes` and a
+writable private copy of `known_hosts`. Credentialed Git transport uses private,
+controlled metadata, a pinned approved URL, no checkout hooks or URL rewrites,
+and no checkout-selected helpers or SSH commands. HTTPS helpers answer only for
+the approved host and path. New generated destinations require a fresh decision.
+
+Host token tools are trusted installed programs outside Git checkouts. Known
+agent identities (including canonical paths and content hashes of configured
+agents), shells, interpreters and launch wrappers are refused. Review binds argv,
+canonical executable and executable content; execution uses a verified private
+snapshot. Changing installed content requires a new approval. This boundary
+cannot infer arbitrary program semantics: approving an installed token tool also
+trusts its interpreter, libraries and transitive behavior. Do not authorize a tool
+that delegates to an agent. Output is bounded while running, errors withhold
+untrusted diagnostics, and the process group is cleaned up on every exit. Tokens
+stay in secret-typed launch overrides until the runtime child environment is
+constructed; runs holding token grants use filtered phase streams, including
+CLI/TUI, so raw terminal or attach output cannot precede redaction.

@@ -12,7 +12,8 @@ use crossterm::terminal::{
 };
 use ratatui::prelude::*;
 
-use super::app::App;
+use super::app::{App, TerminalOp};
+use super::dialogs::DialogResponse;
 use super::tabs::{self, ContainerWindowState};
 use super::{git_sidebar, key_handler, mouse_handler, render, TUI_ACTIVE};
 
@@ -33,6 +34,30 @@ fn restore_terminal(keyboard_enhanced: bool) {
         crossterm::event::DisableMouseCapture,
         crossterm::cursor::Show,
     );
+}
+
+/// Take the terminal back after a host command had it: raw mode, the
+/// alternate screen and the keyboard protocol, then a full repaint.
+fn reenter_terminal(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    keyboard_enhanced: bool,
+) -> io::Result<()> {
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    if keyboard_enhanced {
+        execute!(
+            stdout,
+            crossterm::event::PushKeyboardEnhancementFlags(
+                crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+            )
+        )?;
+    }
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        crossterm::event::EnableMouseCapture
+    )?;
+    terminal.clear()
 }
 
 /// Where TUI panics are recorded. `None` when the home directory cannot be
@@ -112,7 +137,7 @@ pub(super) fn run_event_loop(app: &mut App) -> io::Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = main_loop(&mut terminal, app);
+    let result = main_loop(&mut terminal, app, keyboard_enhanced);
 
     TUI_ACTIVE.store(false, Ordering::Relaxed);
     restore_terminal(keyboard_enhanced);
@@ -125,10 +150,38 @@ pub(super) fn run_event_loop(app: &mut App) -> io::Result<()> {
 fn main_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
+    keyboard_enhanced: bool,
 ) -> io::Result<()> {
+    // True while a host command owns the terminal (WI 0149): nothing is drawn
+    // and no input is read until the matching restore.
+    let mut released = false;
     loop {
         if app.should_quit {
             break;
+        }
+
+        app.poll_dialog_requests();
+        if let Some(op) = app.terminal_op.take() {
+            match op {
+                TerminalOp::Release { title } => {
+                    restore_terminal(keyboard_enhanced);
+                    TUI_ACTIVE.store(false, Ordering::Relaxed);
+                    println!("awman: {title}");
+                    released = true;
+                    app.send_dialog_response(DialogResponse::Yes);
+                }
+                TerminalOp::Restore => {
+                    reenter_terminal(terminal, keyboard_enhanced)?;
+                    TUI_ACTIVE.store(true, Ordering::Relaxed);
+                    released = false;
+                    app.send_dialog_response(DialogResponse::Dismissed);
+                }
+            }
+            continue;
+        }
+        if released {
+            std::thread::sleep(Duration::from_millis(50));
+            continue;
         }
 
         terminal.draw(|frame| {
@@ -136,7 +189,6 @@ fn main_loop(
         })?;
 
         app.tick_all_tabs();
-        app.poll_dialog_requests();
         app.poll_runtime_notices();
 
         if event::poll(Duration::from_millis(50))? {

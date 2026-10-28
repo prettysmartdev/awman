@@ -683,6 +683,132 @@ impl WorkflowFrontend for CliParallelFrontend {
 /// agent, so this frontend never asks: it keeps the default refusal.
 impl crate::command::commands::agent_trust::AgentTrustFrontend for CliParallelFrontend {}
 
+/// Prerequisites are resolved before any step starts, so the parallel wrapper
+/// only forwards to the frontend it wraps.
+impl crate::command::commands::workflow_prerequisites::WorkflowPrerequisiteFrontend
+    for CliParallelFrontend
+{
+    fn show_workflow_prerequisites(
+        &mut self,
+        report: &crate::data::workflow_prerequisites::WorkflowPrerequisiteReport,
+    ) -> Result<(), CommandError> {
+        self.inner.show_workflow_prerequisites(report)
+    }
+
+    fn report_workflow_prerequisites_recheck(
+        &mut self,
+        report: &crate::data::workflow_prerequisites::WorkflowPrerequisiteReport,
+    ) {
+        self.inner.report_workflow_prerequisites_recheck(report);
+    }
+
+    fn can_ask_prerequisites(&self) -> bool {
+        self.inner.can_ask_prerequisites()
+    }
+
+    fn ask_prerequisite_identity(
+        &mut self,
+        prompt: &crate::data::prompt::Prompt<
+            crate::command::commands::workflow_prerequisites::IdentityChoice,
+        >,
+    ) -> Result<crate::command::commands::workflow_prerequisites::IdentityChoice, CommandError>
+    {
+        self.inner.ask_prerequisite_identity(prompt)
+    }
+
+    fn ask_prerequisite_identity_text(
+        &mut self,
+        prompt: &crate::data::prompt::TextPrompt,
+    ) -> Result<Option<String>, CommandError> {
+        self.inner.ask_prerequisite_identity_text(prompt)
+    }
+
+    fn ask_prerequisite_identity_persist(
+        &mut self,
+        prompt: &crate::data::prompt::Prompt<
+            crate::command::commands::workflow_prerequisites::IdentityPersist,
+        >,
+    ) -> Result<crate::command::commands::workflow_prerequisites::IdentityPersist, CommandError>
+    {
+        self.inner.ask_prerequisite_identity_persist(prompt)
+    }
+
+    fn ask_prerequisite_ssh(
+        &mut self,
+        prompt: &crate::data::prompt::Prompt<
+            crate::command::commands::workflow_prerequisites::SshChoice,
+        >,
+    ) -> Result<crate::command::commands::workflow_prerequisites::SshChoice, CommandError> {
+        self.inner.ask_prerequisite_ssh(prompt)
+    }
+
+    fn ask_prerequisite_token_consent(
+        &mut self,
+        prompt: &crate::data::prompt::Prompt<
+            crate::command::commands::workflow_prerequisites::TokenConsent,
+        >,
+    ) -> Result<crate::command::commands::workflow_prerequisites::TokenConsent, CommandError> {
+        self.inner.ask_prerequisite_token_consent(prompt)
+    }
+
+    fn ask_prerequisite_token_source(
+        &mut self,
+        prompt: &crate::data::prompt::Prompt<
+            crate::command::commands::workflow_prerequisites::TokenSourceChoice,
+        >,
+    ) -> Result<crate::command::commands::workflow_prerequisites::TokenSourceChoice, CommandError>
+    {
+        self.inner.ask_prerequisite_token_source(prompt)
+    }
+
+    fn ask_prerequisite_secret(
+        &mut self,
+        prompt: &crate::data::prompt::TextPrompt,
+    ) -> Result<Option<crate::engine::auth::credential::SecretString>, CommandError> {
+        self.inner.ask_prerequisite_secret(prompt)
+    }
+
+    fn ask_prerequisite_tool(
+        &mut self,
+        prompt: &crate::data::prompt::Prompt<
+            crate::command::commands::workflow_prerequisites::ToolChoice,
+        >,
+    ) -> Result<crate::command::commands::workflow_prerequisites::ToolChoice, CommandError> {
+        self.inner.ask_prerequisite_tool(prompt)
+    }
+
+    fn ask_prerequisite_gap(
+        &mut self,
+        prompt: &crate::data::prompt::Prompt<
+            crate::command::commands::workflow_prerequisites::GapChoice,
+        >,
+    ) -> Result<crate::command::commands::workflow_prerequisites::GapChoice, CommandError> {
+        self.inner.ask_prerequisite_gap(prompt)
+    }
+
+    fn confirm_prerequisite_host_command(
+        &mut self,
+        review: &crate::engine::auth::host_secret_command::HostSecretCommandReview,
+        prompt: &crate::data::prompt::Prompt<crate::command::commands::agent_trust::TrustDecision>,
+    ) -> Result<crate::command::commands::agent_trust::TrustDecision, CommandError> {
+        self.inner.confirm_prerequisite_host_command(review, prompt)
+    }
+
+    fn with_terminal_released(
+        &mut self,
+        title: &str,
+        f: &mut dyn FnMut() -> Result<
+            crate::engine::auth::host_secret_command::HostSecretOutput,
+            crate::engine::auth::host_secret_command::HostSecretCommandError,
+        >,
+    ) -> Result<
+        crate::engine::auth::host_secret_command::HostSecretOutput,
+        crate::engine::auth::host_secret_command::HostSecretCommandError,
+    > {
+        self.inner.with_terminal_released(title, f)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

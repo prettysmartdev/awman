@@ -2,8 +2,12 @@ FROM debian:bookworm-slim
 
 # System packages required for building, testing, and running this project.
 # Add language runtimes, compilers, and tool dependencies here.
+# git, gh and openssh-client let the commit_changes, push_branch and
+# create_pull_request teardown steps run in this image.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
+    gh \
+    openssh-client \
     ca-certificates \
     curl \
     make \

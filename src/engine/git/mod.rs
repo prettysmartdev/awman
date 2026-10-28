@@ -1295,6 +1295,219 @@ impl GitEngine {
         let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
         Ok(if value.is_empty() { None } else { Some(value) })
     }
+
+    // ─── Workflow prerequisites (WI 0149) ─────────────────────────────
+
+    /// The identity the **repository** configures: `git config --local` at
+    /// `repo`, falling back to the worktree's common-dir config file (a
+    /// linked worktree shares it). Never reads global or system config, and
+    /// `include.*` directives are not followed, so this is exactly what a
+    /// container that sees only the repository would resolve.
+    pub fn local_identity(&self, repo: &Path) -> Result<GitIdentity, EngineError> {
+        let common_config = self.git_common_dir(repo).ok().map(|d| d.join("config"));
+        let read = |key: &str| -> Result<Option<String>, EngineError> {
+            if let Some(value) = self.scoped_config_value(repo, &["--local"], key)? {
+                return Ok(Some(value));
+            }
+            match &common_config {
+                Some(file) if file.is_file() => {
+                    let file = file.to_string_lossy();
+                    self.scoped_config_value(repo, &["--file", &file], key)
+                }
+                _ => Ok(None),
+            }
+        };
+        Ok(GitIdentity {
+            name: read("user.name")?,
+            email: read("user.email")?,
+        })
+    }
+
+    /// The host's `git config --global` identity, run from a private scratch
+    /// directory so no repository config can contribute. Offered to the user
+    /// only; never assumed to reach a container.
+    pub fn host_identity(&self) -> Result<GitIdentity, EngineError> {
+        let scratch = tempfile::Builder::new()
+            .prefix("awman-git-identity-")
+            .tempdir()
+            .map_err(|e| EngineError::Git(format!("create scratch dir: {e}")))?;
+        let read = |key: &str| -> Result<Option<String>, EngineError> {
+            let output = host_command::discovery_command(scratch.path())
+                .args(["config", "--global", "--get", key])
+                .current_dir(scratch.path())
+                .stderr(std::process::Stdio::null())
+                .output()
+                .map_err(|e| {
+                    EngineError::Git(format!("invoke `git config --global {key}`: {e}"))
+                })?;
+            Ok(config_output_value(&output))
+        };
+        Ok(GitIdentity {
+            name: read("user.name")?,
+            email: read("user.email")?,
+        })
+    }
+
+    /// `git config --local user.name <name>` + `user.email <email>` through the
+    /// hardened command. Rejects empty values, newlines/control characters, a
+    /// leading `-` and an email without `@`. In a linked worktree `--local`
+    /// writes the repository's shared config.
+    pub fn set_local_identity(
+        &self,
+        repo: &Path,
+        name: &str,
+        email: &str,
+    ) -> Result<(), EngineError> {
+        validate_identity_value("user.name", name)?;
+        validate_identity_value("user.email", email)?;
+        if !email.contains('@') {
+            return Err(EngineError::Git("user.email must contain '@'".to_string()));
+        }
+        for (key, value) in [("user.name", name), ("user.email", email)] {
+            let output = host_command::command(repo)
+                .args(["config", "--local", key, value])
+                .current_dir(repo)
+                .output()
+                .map_err(|e| EngineError::Git(format!("invoke `git config --local {key}`: {e}")))?;
+            if !output.status.success() {
+                return Err(EngineError::Git(format!(
+                    "git config --local {key} failed: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Rendered `git -C <repo> config --local user.name '<name>' …` shown
+    /// before [`Self::set_local_identity`] runs. Display only; never executed.
+    pub fn set_local_identity_command_display(repo: &Path, name: &str, email: &str) -> String {
+        let repo = shell_words::quote(&repo.to_string_lossy()).into_owned();
+        let render = |key: &str, value: &str| {
+            let value: String = value
+                .chars()
+                .map(|c| {
+                    if c.is_control() {
+                        c.escape_default().to_string()
+                    } else {
+                        c.to_string()
+                    }
+                })
+                .collect();
+            format!(
+                "git -C {repo} config --local {key} {}",
+                shell_words::quote(&value)
+            )
+        };
+        format!(
+            "{} && {}",
+            render("user.name", name),
+            render("user.email", email)
+        )
+    }
+
+    /// `git rev-parse --path-format=absolute --git-common-dir`.
+    pub fn git_common_dir(&self, repo: &Path) -> Result<PathBuf, EngineError> {
+        let output = host_command::command(repo)
+            .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+            .current_dir(repo)
+            .output()
+            .map_err(|e| {
+                EngineError::Git(format!("invoke `git rev-parse --git-common-dir`: {e}"))
+            })?;
+        if !output.status.success() {
+            return Err(EngineError::Git(format!(
+                "git rev-parse --git-common-dir failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        Ok(PathBuf::from(
+            String::from_utf8_lossy(&output.stdout).trim_end_matches('\n'),
+        ))
+    }
+
+    /// `git rev-parse --abbrev-ref <branch>@{upstream}`; None when unset.
+    pub fn branch_upstream(&self, repo: &Path, branch: &str) -> Option<String> {
+        if branch.is_empty() || branch.starts_with('-') {
+            return None;
+        }
+        let output = host_command::command(repo)
+            .args(["rev-parse", "--abbrev-ref"])
+            .arg(format!("{branch}@{{upstream}}"))
+            .current_dir(repo)
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let upstream = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        (!upstream.is_empty()).then_some(upstream)
+    }
+
+    /// The stored URL of `remote` with any embedded credentials removed
+    /// ([`strip_url_credentials`]); `None` when the remote is not configured.
+    /// Use this, never [`Self::remote_url`], for anything a user may see.
+    pub fn remote_url_redacted(
+        &self,
+        repo: &Path,
+        remote: &str,
+    ) -> Result<Option<String>, EngineError> {
+        let key = format!("remote.{remote}.url");
+        let output = host_command::command(repo)
+            .args(["config", "--get", &key])
+            .current_dir(repo)
+            .stderr(std::process::Stdio::null())
+            .output()
+            .map_err(|e| EngineError::Git(format!("invoke `git config --get {key}`: {e}")))?;
+        Ok(config_output_value(&output).map(|url| strip_url_credentials(&url)))
+    }
+
+    /// SSH routing identity is pinned in ephemeral engine state, never in a
+    /// report or remembered decision. Password-bearing URLs are refused.
+    pub fn workflow_ssh_destination(
+        &self,
+        repo: &Path,
+        remote: &str,
+    ) -> Result<crate::engine::auth::credential::SecretString, EngineError> {
+        let url = if remote.contains(':') {
+            remote.to_string()
+        } else {
+            self.remote_url(repo, remote)?
+        };
+        if let Some((_, rest)) = url.split_once("://") {
+            if rest.split('/').next().is_some_and(|a| {
+                a.split_once('@')
+                    .is_some_and(|(user, _)| user.contains(':'))
+            }) {
+                return Err(EngineError::Git(
+                    "password-bearing SSH URLs are unsupported".into(),
+                ));
+            }
+        }
+        if url.chars().any(char::is_control) {
+            return Err(EngineError::Git("invalid SSH destination".into()));
+        }
+        Ok(crate::engine::auth::credential::SecretString::new(url))
+    }
+
+    /// One `git config <scope…> --get <key>` at `path`, `None` when unset or empty.
+    fn scoped_config_value(
+        &self,
+        path: &Path,
+        scope: &[&str],
+        key: &str,
+    ) -> Result<Option<String>, EngineError> {
+        let output = host_command::command(path)
+            .arg("config")
+            .args(scope)
+            .args(["--get", key])
+            .current_dir(path)
+            .stderr(std::process::Stdio::null())
+            .output()
+            .map_err(|e| EngineError::Git(format!("invoke `git config {key}`: {e}")))?;
+        Ok(config_output_value(&output))
+    }
     /// The commit SHA HEAD points at in `git_root`.
     pub fn head_sha(&self, git_root: &Path) -> Result<String, EngineError> {
         let output = host_command::command(git_root)
@@ -2230,6 +2443,96 @@ impl GitRootResolver for GitEngine {
                 message: e.to_string(),
             }),
         }
+    }
+}
+
+/// The value printed by a successful `git config --get`, `None` when the key
+/// is unset (exit 1) or empty.
+fn config_output_value(output: &std::process::Output) -> Option<String> {
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!value.is_empty()).then_some(value)
+}
+
+fn validate_identity_value(key: &str, value: &str) -> Result<(), EngineError> {
+    if value.trim().is_empty() {
+        return Err(EngineError::Git(format!("{key} must not be empty")));
+    }
+    if value.chars().any(char::is_control) {
+        return Err(EngineError::Git(format!(
+            "{key} must not contain newlines or control characters"
+        )));
+    }
+    if value.starts_with('-') {
+        return Err(EngineError::Git(format!("{key} must not start with '-'")));
+    }
+    Ok(())
+}
+
+/// Remove credentials embedded in a remote URL before it is displayed or
+/// stored: `https://user:token@host/x` → `https://host/x`; for other schemes
+/// only a password is removed (`ssh://git:pw@host` → `ssh://git@host`); query
+/// strings and fragments are dropped. scp-style `user@host:path` carries no
+/// password and is returned unchanged.
+pub fn strip_url_credentials(url: &str) -> String {
+    let url = url.trim();
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_string();
+    };
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(end);
+    let tail = tail.split(['?', '#']).next().unwrap_or_default();
+    let authority = match authority.rsplit_once('@') {
+        None => authority.to_string(),
+        Some((userinfo, host)) => {
+            if scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https") {
+                host.to_string()
+            } else {
+                let user = userinfo.split(':').next().unwrap_or_default();
+                if user.is_empty() {
+                    host.to_string()
+                } else {
+                    format!("{user}@{host}")
+                }
+            }
+        }
+    };
+    format!("{scheme}://{authority}{tail}")
+}
+
+/// The git queries the workflow-prerequisite preflight makes. `GitEngine` is
+/// the production implementation; tests inject a fake. The preflight's
+/// `sources.rs` re-exports this trait rather than declaring its own.
+pub trait GitProbeSource: Send + Sync {
+    fn local_identity(&self, repo: &Path) -> Result<GitIdentity, EngineError>;
+    fn host_identity(&self) -> Result<GitIdentity, EngineError>;
+    /// Credential-free URL ([`strip_url_credentials`]); `None` when unset.
+    fn remote_url(&self, repo: &Path, remote: &str) -> Result<Option<String>, EngineError>;
+    fn is_detached_head(&self, repo: &Path) -> bool;
+    fn current_branch(&self, repo: &Path) -> Option<String>;
+    fn branch_upstream(&self, repo: &Path, branch: &str) -> Option<String>;
+}
+
+impl GitProbeSource for GitEngine {
+    fn local_identity(&self, repo: &Path) -> Result<GitIdentity, EngineError> {
+        GitEngine::local_identity(self, repo)
+    }
+    fn host_identity(&self) -> Result<GitIdentity, EngineError> {
+        GitEngine::host_identity(self)
+    }
+    fn remote_url(&self, repo: &Path, remote: &str) -> Result<Option<String>, EngineError> {
+        self.remote_url_redacted(repo, remote)
+    }
+    fn is_detached_head(&self, repo: &Path) -> bool {
+        GitEngine::is_detached_head(self, repo)
+    }
+    fn current_branch(&self, repo: &Path) -> Option<String> {
+        GitEngine::current_branch(self, repo)
+    }
+    fn branch_upstream(&self, repo: &Path, branch: &str) -> Option<String> {
+        GitEngine::branch_upstream(self, repo, branch)
     }
 }
 
@@ -3381,5 +3684,242 @@ mod tests {
             !sentinel.exists(),
             "repository commands must not execute on the host"
         );
+    }
+
+    #[test]
+    fn strip_url_credentials_removes_userinfo_secrets_and_queries() {
+        for (input, expected) in [
+            (
+                "https://x-access-token:ghp_abc@github.com/o/r.git",
+                "https://github.com/o/r.git",
+            ),
+            ("https://ghp_abc@github.com/o/r", "https://github.com/o/r"),
+            (
+                "https://github.com/o/r?token=1#frag",
+                "https://github.com/o/r",
+            ),
+            (
+                "ssh://git:pw@host.example/o/r",
+                "ssh://git@host.example/o/r",
+            ),
+            (
+                "ssh://git@host.example:22/o/r",
+                "ssh://git@host.example:22/o/r",
+            ),
+            ("git@github.com:o/r.git", "git@github.com:o/r.git"),
+            ("/srv/repo.git", "/srv/repo.git"),
+        ] {
+            assert_eq!(strip_url_credentials(input), expected, "{input}");
+        }
+    }
+
+    #[test]
+    fn local_identity_reads_repo_config_and_linked_worktrees_share_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo);
+        let git = GitEngine::new();
+        let identity = git.local_identity(&repo).unwrap();
+        assert_eq!(identity.name.as_deref(), Some("awman-test"));
+        assert_eq!(identity.email.as_deref(), Some("test@awman.test"));
+
+        let linked = tmp.path().join("linked");
+        Command::new("git")
+            .args(["worktree", "add", "-q", "-b", "linked"])
+            .arg(&linked)
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        assert_eq!(git.local_identity(&linked).unwrap(), identity);
+        assert_eq!(
+            git.git_common_dir(&linked).unwrap().canonicalize().unwrap(),
+            repo.join(".git").canonicalize().unwrap()
+        );
+
+        git.set_local_identity(&linked, "New Name", "new@example.com")
+            .unwrap();
+        let updated = git.local_identity(&repo).unwrap();
+        assert_eq!(updated.name.as_deref(), Some("New Name"));
+        assert_eq!(updated.email.as_deref(), Some("new@example.com"));
+        assert!(git.branch_upstream(&repo, "linked").is_none());
+        assert!(git.remote_url_redacted(&repo, "origin").unwrap().is_none());
+    }
+
+    #[test]
+    fn set_local_identity_rejects_unsafe_values() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_repo(tmp.path());
+        let git = GitEngine::new();
+        for (name, email) in [
+            ("", "a@b"),
+            ("Name\nInjected", "a@b"),
+            ("-n", "a@b"),
+            ("Name", "no-at-sign"),
+            ("Name", "a@b\u{7}"),
+        ] {
+            assert!(
+                git.set_local_identity(tmp.path(), name, email).is_err(),
+                "{name:?} {email:?}"
+            );
+        }
+        assert_eq!(
+            git.local_identity(tmp.path()).unwrap().name.as_deref(),
+            Some("awman-test")
+        );
+        let display = GitEngine::set_local_identity_command_display(Path::new("/r"), "A B", "a@b");
+        assert_eq!(
+            display,
+            "git -C /r config --local user.name 'A B' && git -C /r config --local user.email a@b"
+        );
+    }
+}
+
+#[cfg(test)]
+mod prerequisite_probe_tests {
+    use super::*;
+    use std::process::Command;
+
+    fn git(repo: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?}");
+    }
+
+    fn bare_repo() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        git(tmp.path(), &["init", "-q", "-b", "main"]);
+        tmp
+    }
+
+    #[test]
+    fn local_identity_ignores_include_directives_and_global_config() {
+        let tmp = bare_repo();
+        let outside = tmp.path().join("outside.gitconfig");
+        std::fs::write(
+            &outside,
+            "[user]\n\tname = Included\n\temail = inc@x.test\n",
+        )
+        .unwrap();
+        let config = tmp.path().join(".git/config");
+        let mut text = std::fs::read_to_string(&config).unwrap();
+        text.push_str(&format!("[include]\n\tpath = {}\n", outside.display()));
+        std::fs::write(&config, text).unwrap();
+        let identity = GitEngine::new().local_identity(tmp.path()).unwrap();
+        assert_eq!(identity, GitIdentity::default(), "{identity:?}");
+        assert!(!identity.missing_keys().is_empty());
+        // Setting the local identity makes it visible.
+        GitEngine::new()
+            .set_local_identity(tmp.path(), "Local", "local@x.test")
+            .unwrap();
+        let identity = GitEngine::new().local_identity(tmp.path()).unwrap();
+        assert_eq!(identity.name.as_deref(), Some("Local"));
+        assert!(identity.missing_keys().is_empty());
+    }
+
+    #[test]
+    fn set_local_identity_writes_only_the_repo_config() {
+        let tmp = bare_repo();
+        GitEngine::new()
+            .set_local_identity(tmp.path(), "Name With Spaces", "a@b.test")
+            .unwrap();
+        let config = std::fs::read_to_string(tmp.path().join(".git/config")).unwrap();
+        assert!(config.contains("Name With Spaces"));
+        assert!(config.contains("a@b.test"));
+    }
+
+    #[test]
+    fn remote_url_redacted_strips_embedded_credentials() {
+        let tmp = bare_repo();
+        git(
+            tmp.path(),
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://x-access-token:ghp_SECRET@github.com/o/r.git",
+            ],
+        );
+        let git_engine = GitEngine::new();
+        let url = git_engine
+            .remote_url_redacted(tmp.path(), "origin")
+            .unwrap()
+            .unwrap();
+        assert_eq!(url, "https://github.com/o/r.git");
+        assert!(!url.contains("ghp_SECRET"));
+        assert!(git_engine
+            .remote_url_redacted(tmp.path(), "nope")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn branch_upstream_is_none_until_one_is_configured() {
+        let tmp = bare_repo();
+        git(
+            tmp.path(),
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@x",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "init",
+            ],
+        );
+        let upstream = tempfile::tempdir().unwrap();
+        git(upstream.path(), &["init", "-q", "--bare", "-b", "main"]);
+        git(
+            tmp.path(),
+            &[
+                "remote",
+                "add",
+                "origin",
+                &upstream.path().display().to_string(),
+            ],
+        );
+        let engine = GitEngine::new();
+        assert!(engine.branch_upstream(tmp.path(), "main").is_none());
+        git(tmp.path(), &["push", "-q", "-u", "origin", "main"]);
+        assert_eq!(
+            engine.branch_upstream(tmp.path(), "main").as_deref(),
+            Some("origin/main")
+        );
+        // Option-like branch names are never passed to git.
+        assert!(engine.branch_upstream(tmp.path(), "--all").is_none());
+        assert!(engine.branch_upstream(tmp.path(), "").is_none());
+    }
+
+    #[test]
+    fn detached_head_probe_reports_detached_and_attached() {
+        let tmp = bare_repo();
+        git(
+            tmp.path(),
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@x",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "init",
+            ],
+        );
+        let engine = GitEngine::new();
+        assert!(!engine.is_detached_head(tmp.path()));
+        assert_eq!(engine.current_branch(tmp.path()).as_deref(), Some("main"));
+        git(tmp.path(), &["checkout", "-q", "--detach"]);
+        assert!(engine.is_detached_head(tmp.path()));
+        assert!(engine.current_branch(tmp.path()).is_none());
     }
 }

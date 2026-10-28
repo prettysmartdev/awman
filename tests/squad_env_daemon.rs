@@ -97,6 +97,7 @@ fn required(pairs: &[(&str, &[&str])]) -> BTreeMap<String, Vec<String>> {
 fn task(name: &str, overlays: &[&str]) -> Task {
     let now = chrono::Utc::now();
     Task {
+        prerequisites: None,
         id: name.into(),
         name: name.into(),
         description: "d".into(),

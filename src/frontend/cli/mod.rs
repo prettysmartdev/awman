@@ -253,6 +253,14 @@ pub(crate) fn format_error(err: &CommandError) -> String {
         CommandError::WorkflowFileNotFound { path } => {
             format!("workflow file not found: {}", path.display())
         }
+        CommandError::WorkflowPrerequisitesUnresolved { report } => format!(
+            "workflow prerequisites unresolved\n{}\n\n\
+             Grant them with --prerequisite-identity / --prerequisite-ssh / --prerequisite-token, \
+             or pass --prerequisite-unresolved warn to continue anyway.",
+            report.render_lines().join("\n")
+        ),
+        CommandError::PrerequisiteWideningRefused { .. }
+        | CommandError::PrerequisiteFlagUnsupported { .. } => err.to_string(),
         // The engine owns its user-facing text, guidance included (WI 0126
         // F1), so the CLI, the TUI and the API print the same words. The
         // five remote-transport variants are mapped onto their Layer 2 twins

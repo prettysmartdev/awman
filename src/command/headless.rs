@@ -46,11 +46,20 @@
 //! | [`confirm_deletion`](HeadlessDefaults::confirm_deletion) | `false` | *(unused)* | *(not delegated — see below)* |
 //! | [`delete_task_dir`](HeadlessDefaults::delete_task_dir) | `false` | `false` | `false` |
 //! | [`spec_kind`](HeadlessDefaults::spec_kind) | `Task` | `Task` | `Task` |
+//! | [`prerequisite_credential_use`](HeadlessDefaults::prerequisite_credential_use) | `Deny` | `Deny` | `Deny` |
+//! | [`prerequisite_unresolved`](HeadlessDefaults::prerequisite_unresolved) | `static ? Fail : Warn` | `static ? Fail : Warn` | `static ? Fail : Warn` |
+//! | [`prerequisite_tool`](HeadlessDefaults::prerequisite_tool) | `Continue` | `Continue` | `Continue` |
+//! | [`prerequisite_gap`](HeadlessDefaults::prerequisite_gap) | `Continue` | `Continue` | `Continue` |
 //!
 //! Approving a custom agent definition (`agent_trust::ensure_agent_trusted`)
 //! deliberately has **no row**: no profile, and no `--yes`, ever answers it.
 //! A host with nobody to ask refuses with `AgentDefinitionUntrusted`, which
 //! tells the user to run `awman ready --agent <name>` interactively.
+//!
+//! Approving a repository-defined workflow prerequisite token command
+//! (`workflows.prerequisites.githubToken.acquire` in `.awman/config.json`)
+//! has no row for the same reason: a host with nobody to ask skips the
+//! command with a warning, and `--yes` never approves it.
 //!
 //! Every row reproduces what the three frontends answered before F-13. The
 //! table-driven test at the bottom of this file is the contract: it asserts
@@ -116,11 +125,14 @@ use crate::command::commands::agent_setup::AgentSetupDecision;
 use crate::command::commands::exec_workflow::{WorkflowResumeDecision, WorkflowResumePrompt};
 use crate::command::commands::mount_scope::MountScopeDecision;
 use crate::command::commands::specs::WorkItemKind;
+use crate::command::commands::workflow_prerequisites::{GapChoice, ToolChoice};
 use crate::command::commands::worktree_lifecycle::{
     DirtyMergeTargetDecision, ExistingWorktreeDecision, PostWorkflowWorktreeAction,
     PostWorkflowWorktreePrompt, PreWorktreeDecision, WorktreeMergeMode,
 };
 use crate::data::config::repo::WorkItemsConfig;
+use crate::data::config::workflows::{CredentialUse, UnresolvedMode};
+use crate::data::workflow_prerequisites::PrerequisiteOrigin;
 use crate::engine::acp::protocol::{PermissionDecision, PermissionOption};
 use crate::engine::init::frontend::DockerfileSetupDecision;
 use crate::engine::workflow::actions::{AvailableActions, NextAction, YoloTickOutcome};
@@ -407,6 +419,46 @@ impl HeadlessDefaults {
     pub fn spec_kind(&self) -> WorkItemKind {
         WorkItemKind::Task
     }
+
+    // ─── Workflow prerequisites (WI 0149) ───────────────────────────────────
+
+    /// Answer for every `ask`-policy credential question
+    /// (`WorkflowPrerequisiteFrontend::ask_prerequisite_identity`, `_ssh`,
+    /// `_token_consent`, `_token_source`).
+    ///
+    /// Uniform: a host with nobody to ask never hands over the user's
+    /// identity, SSH keys or token. Only an explicit `allow` policy or a
+    /// `--prerequisite-*` flag grants one; `--yes` never does.
+    pub fn prerequisite_credential_use(&self) -> CredentialUse {
+        CredentialUse::Deny
+    }
+
+    /// What an unsatisfied prerequisite means when neither a flag nor config
+    /// sets `unresolved`.
+    ///
+    /// Uniform: a **static** workflow that explicitly needs the prerequisite
+    /// fails before any container starts, because its teardown will
+    /// certainly fail; a dynamic or squad run, whose need is only assumed,
+    /// warns and carries on.
+    pub fn prerequisite_unresolved(&self, origin: PrerequisiteOrigin) -> UnresolvedMode {
+        match origin {
+            PrerequisiteOrigin::Static => UnresolvedMode::Fail,
+            PrerequisiteOrigin::AssumedAll => UnresolvedMode::Warn,
+        }
+    }
+
+    /// Answer for `ask_prerequisite_tool` (a tool missing from the phase
+    /// image). Uniform: continue, and let `unresolved` decide.
+    pub fn prerequisite_tool(&self) -> ToolChoice {
+        ToolChoice::Continue
+    }
+
+    /// Answer for `ask_prerequisite_gap` (missing remote, detached HEAD, a
+    /// pull request with no push before it). Uniform: continue, and let
+    /// `unresolved` decide.
+    pub fn prerequisite_gap(&self) -> GapChoice {
+        GapChoice::Continue
+    }
 }
 
 #[cfg(test)]
@@ -432,6 +484,36 @@ mod tests {
     /// headless policy, which is the point: it cannot happen as a side effect
     /// of editing a frontend.
     const TABLE: &[Row] = &[
+        Row {
+            question: "prerequisite_credential_use",
+            api: "Deny",
+            squad: "Deny",
+            cli: "Deny",
+        },
+        Row {
+            question: "prerequisite_unresolved(static)",
+            api: "Fail",
+            squad: "Fail",
+            cli: "Fail",
+        },
+        Row {
+            question: "prerequisite_unresolved(assumed_all)",
+            api: "Warn",
+            squad: "Warn",
+            cli: "Warn",
+        },
+        Row {
+            question: "prerequisite_tool",
+            api: "Continue",
+            squad: "Continue",
+            cli: "Continue",
+        },
+        Row {
+            question: "prerequisite_gap",
+            api: "Continue",
+            squad: "Continue",
+            cli: "Continue",
+        },
         Row {
             question: "mount_scope",
             api: "MountGitRoot",
@@ -613,6 +695,26 @@ mod tests {
     fn answers(d: &HeadlessDefaults) -> Vec<(&'static str, String)> {
         let opts = permission_options();
         vec![
+            (
+                "prerequisite_credential_use",
+                format!("{:?}", d.prerequisite_credential_use()),
+            ),
+            (
+                "prerequisite_unresolved(static)",
+                format!(
+                    "{:?}",
+                    d.prerequisite_unresolved(PrerequisiteOrigin::Static)
+                ),
+            ),
+            (
+                "prerequisite_unresolved(assumed_all)",
+                format!(
+                    "{:?}",
+                    d.prerequisite_unresolved(PrerequisiteOrigin::AssumedAll)
+                ),
+            ),
+            ("prerequisite_tool", format!("{:?}", d.prerequisite_tool())),
+            ("prerequisite_gap", format!("{:?}", d.prerequisite_gap())),
             ("mount_scope", format!("{:?}", d.mount_scope())),
             (
                 "agent_setup(default_available = true)",

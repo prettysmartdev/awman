@@ -56,26 +56,11 @@ impl Command for ExecWorkflowCommand {
             self.session.working_dir().join(&workflow_arg)
         };
 
-        // Track whether the gemini deprecation warning has already been emitted
-        // so we never fire it twice (early CLI check + post-load TOML scan).
-        let mut deprecation_warned = false;
-        if let Some(agent) = self.flags.agent.as_deref() {
-            deprecation_warned =
-                frontend.with(|frontend| emit_deprecation_warning(agent, frontend));
-        }
-
-        // Emit deprecation warnings for legacy config fields.
-        frontend.with(|frontend| LaunchPolicy::for_session(&self.session).warn_config(frontend));
-
-        if self.flags.yolo && self.flags.worktree {
-            frontend.write_message(UserMessage {
-                level: MessageLevel::Info,
-                text: "--yolo implies --worktree. Running in isolated worktree.".into(),
-            });
-        }
-
         // 1. Load the workflow file.
         if !workflow_path.exists() {
+            if let Some(agent) = self.flags.agent.as_deref() {
+                frontend.with(|frontend| emit_deprecation_warning(agent, frontend));
+            }
             let err = CommandError::WorkflowFileNotFound {
                 path: workflow_path.clone(),
             };
@@ -100,6 +85,53 @@ impl Command for ExecWorkflowCommand {
             }
         };
 
+        // Custom agent definitions are reviewed once per distinct agent
+        // before anything resolves them (the preflight below included).
+        if let Err(e) = frontend.with(|frontend| {
+            ensure_workflow_agents_approved(&workflow, &self.session, &self.flags, frontend)
+        }) {
+            frontend.write_message(UserMessage {
+                level: MessageLevel::Error,
+                text: format!("exec workflow: {e}"),
+            });
+            return Err(e);
+        }
+
+        // Workflow prerequisites (WI 0149): what the teardown steps need is
+        // checked, asked about and granted now, before the worktree, the
+        // image or any container exists. `--check-prerequisites` ends here.
+        let prerequisite_needs =
+            crate::data::workflow_prerequisites::WorkflowPrerequisites::from_workflow(&workflow);
+        let prerequisites = match self
+            .start_prerequisites(
+                &prerequisite_needs,
+                crate::engine::workflow::workflow_name_for(&workflow),
+                &frontend,
+            )
+            .await?
+        {
+            PrerequisiteStart::Run(prepared) => prepared,
+            PrerequisiteStart::CheckOnly(outcome) => return Ok(outcome),
+        };
+
+        // Track whether the gemini deprecation warning has already been emitted
+        // so we never fire it twice (early CLI check + post-load TOML scan).
+        let mut deprecation_warned = false;
+        if let Some(agent) = self.flags.agent.as_deref() {
+            deprecation_warned =
+                frontend.with(|frontend| emit_deprecation_warning(agent, frontend));
+        }
+
+        // Emit deprecation warnings for legacy config fields.
+        frontend.with(|frontend| LaunchPolicy::for_session(&self.session).warn_config(frontend));
+
+        if self.flags.yolo && self.flags.worktree {
+            frontend.write_message(UserMessage {
+                level: MessageLevel::Info,
+                text: "--yolo implies --worktree. Running in isolated worktree.".into(),
+            });
+        }
+
         // After load: scan the workflow's per-step and workflow-level agents,
         // plus the session default (used when neither step nor workflow set an
         // agent). Per-step resolution mirrors WorkflowEngine::resolve_agent so
@@ -119,18 +151,6 @@ impl Command for ExecWorkflowCommand {
         // be empty.
         frontend.with(|frontend| warn_context_workflow_in_phase(&workflow, frontend));
         let _ = deprecation_warned;
-
-        // Custom agent definitions are reviewed once per distinct agent
-        // before anything resolves them (the preflight below included).
-        if let Err(e) = frontend.with(|frontend| {
-            ensure_workflow_agents_approved(&workflow, &self.session, &self.flags, frontend)
-        }) {
-            frontend.write_message(UserMessage {
-                level: MessageLevel::Error,
-                text: format!("exec workflow: {e}"),
-            });
-            return Err(e);
-        }
 
         // ACP compatibility is a workflow-wide pre-flight check.  Do it
         // before mount scope, worktree preparation, image setup, overlays, or
@@ -340,6 +360,7 @@ impl Command for ExecWorkflowCommand {
                                 .to_string(),
                         });
                         return Ok(ExecWorkflowOutcome {
+                            prerequisites: None,
                             workflow: workflow_name,
                             exit_code: None,
                             worktree_used: false,
@@ -436,6 +457,7 @@ impl Command for ExecWorkflowCommand {
             issue_temp_file: _issue_temp_file,
             launch_modes,
             skip_state_resume_prompt: state_resume_settled,
+            prerequisites,
         };
         execute_prepared(
             &self.flags,

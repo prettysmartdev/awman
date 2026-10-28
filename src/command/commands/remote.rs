@@ -441,6 +441,12 @@ async fn run_remote_exec(
                         };
                         self.sink.write_message(UserMessage { level, text });
                     }
+                    EventPayload::WorkflowPrerequisites { report, .. } => {
+                        self.sink.write_message(UserMessage {
+                            level: MessageLevel::Info,
+                            text: format!("[prerequisites] {}", report.summary_line()),
+                        });
+                    }
                     EventPayload::Done => {}
                 }
                 false

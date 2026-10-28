@@ -60,6 +60,7 @@ pub struct BuiltinBackend {
 #[derive(Clone, Default)]
 pub struct BackgroundState {
     pub env: HashMap<String, String>,
+    pub secret_env: Vec<(String, crate::engine::auth::credential::SecretString)>,
     pub user: Option<String>,
 }
 fn unsupported(operation: &'static str) -> EngineError {
@@ -276,6 +277,10 @@ impl BuiltinBackend {
             if let Some(value) = crate::data::config::env::host_var(&key.0) {
                 env.push((key.0, value));
             }
+        }
+        for (key, value) in options.env_overrides {
+            env.retain(|(name, _)| name != &key);
+            env.push((key, value.expose().to_string()));
         }
         env.extend(options.env_literal.into_iter().map(|e| (e.key, e.value)));
         env.extend(options.agent_credentials);
@@ -635,6 +640,7 @@ impl ContainerBackend for BuiltinBackend {
         self.is_available()?;
         let launch = self.launch_settings(request.builtin_launch)?;
         let BackgroundLaunchRequest {
+            secret_env,
             image,
             workdir,
             env,
@@ -694,6 +700,7 @@ impl ContainerBackend for BuiltinBackend {
                 id.clone(),
                 BackgroundState {
                     env: env.clone(),
+                    secret_env: secret_env.to_vec(),
                     user: config.user,
                 },
             );
@@ -739,6 +746,9 @@ impl ContainerBackend for BuiltinBackend {
         if let Some(env) = env {
             vars.extend(env.clone());
         }
+        for (key, value) in state.secret_env {
+            vars.insert(key, value.expose().to_string());
+        }
         let session = self.driver.exec(
             id,
             ExecRequest {
@@ -780,7 +790,7 @@ impl ContainerBackend for BuiltinBackend {
                     _ => {
                         return Err(EngineError::Other(
                             "builtin background exec failed without an exit status".into(),
-                        ))
+                        ));
                     }
                 }
             };

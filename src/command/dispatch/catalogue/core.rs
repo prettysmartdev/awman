@@ -288,7 +288,12 @@ pub(super) const CONFIG: CommandSpec = CommandSpec {
     // on this host: `awman config set runtime …` must stay reachable.
     requires_runtime: false,
     opens_tui_when_bare: false,
-    subcommands: &[&CONFIG_SHOW, &CONFIG_GET, &CONFIG_SET],
+    subcommands: &[
+        &CONFIG_SHOW,
+        &CONFIG_GET,
+        &CONFIG_SET,
+        &CONFIG_PREREQUISITE_GRANTS,
+    ],
 };
 
 pub(super) const CONFIG_SHOW: CommandSpec = CommandSpec {
@@ -368,6 +373,65 @@ pub(super) const CONFIG_SET: CommandSpec = CommandSpec {
     requires_container_tier: false,
     // The recovery path when the configured runtime cannot be constructed
     // on this host: `awman config set runtime …` must stay reachable.
+    requires_runtime: false,
+    opens_tui_when_bare: false,
+    subcommands: &[],
+};
+
+/// `config prerequisite-grants` (WI 0149): the remembered workflow
+/// prerequisite decisions in `~/.awman/prerequisite-grants.json`.
+pub(super) const CONFIG_PREREQUISITE_GRANTS: CommandSpec = CommandSpec {
+    name: "prerequisite-grants",
+    aliases: &[],
+    help: "List or revoke remembered workflow prerequisite decisions (SSH key, token variable).",
+    long_help: None,
+    arguments: &[],
+    flags: &[],
+    api_allowed: false,
+    build: crate::command::dispatch::build::unsupported,
+    gateway_need: GatewayNeed::None,
+    requires_container_tier: false,
+    requires_runtime: false,
+    opens_tui_when_bare: false,
+    subcommands: &[
+        &CONFIG_PREREQUISITE_GRANTS_LIST,
+        &CONFIG_PREREQUISITE_GRANTS_REVOKE,
+    ],
+};
+
+pub(super) const CONFIG_PREREQUISITE_GRANTS_LIST: CommandSpec = CommandSpec {
+    name: "list",
+    aliases: &[],
+    help:
+        "List remembered workflow prerequisite decisions. They hold decisions only, never secrets.",
+    long_help: None,
+    arguments: &[],
+    flags: &[],
+    api_allowed: false,
+    build: crate::command::dispatch::build::config,
+    gateway_need: GatewayNeed::None,
+    requires_container_tier: false,
+    requires_runtime: false,
+    opens_tui_when_bare: false,
+    subcommands: &[],
+};
+
+pub(super) const CONFIG_PREREQUISITE_GRANTS_REVOKE: CommandSpec = CommandSpec {
+    name: "revoke",
+    aliases: &[],
+    help: "Revoke a remembered workflow prerequisite decision.",
+    long_help: None,
+    arguments: &[ArgumentSpec {
+        name: "selector",
+        help: "The record number shown by `config prerequisite-grants list`, or all.",
+        kind: ArgumentKind::String,
+        optional: false,
+    }],
+    flags: &[],
+    api_allowed: false,
+    build: crate::command::dispatch::build::config,
+    gateway_need: GatewayNeed::None,
+    requires_container_tier: false,
     requires_runtime: false,
     opens_tui_when_bare: false,
     subcommands: &[],

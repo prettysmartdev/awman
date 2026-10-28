@@ -37,6 +37,16 @@ pub(super) fn handle(app: &mut App, action: Action) {
         Action::PreviousTab => app.switch_to_prev_tab(),
         Action::NextTab => app.switch_to_next_tab(),
         Action::CloseTabOrQuit => {
+            if app.command_dialog_active {
+                if matches!(app.active_dialog, Some(Dialog::Review(_))) {
+                    app.send_dialog_response(DialogResponse::Interrupted);
+                    app.active_dialog = None;
+                    app.command_dialog_active = false;
+                } else {
+                    dialog_router::dismiss_dialog(app);
+                }
+                return;
+            }
             // Second Ctrl-C while QuitConfirm or CloseTabConfirm is open
             // confirms the quit action immediately.
             if matches!(app.active_dialog, Some(Dialog::QuitConfirm)) {

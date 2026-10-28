@@ -1466,13 +1466,34 @@ async fn create_command(
 
     // The profile's own account of itself, not a restatement of it (F-50).
     // Serialised with the underscore spelling the response has always used.
-    let flags_applied = serde_json::Value::Object(
+    let mut flags_applied = serde_json::Value::Object(
         CommandCatalogue::get()
             .frontend_profile(FrontendKind::Api, &path_parts)
             .into_iter()
             .map(|(flag, value)| (flag.replace('-', "_"), flag_default_json(&value)))
             .collect(),
     );
+    if let Some(session) = state.sessions.get_by_key(&session_id) {
+        let bus = EventBus::new(1);
+        let frontend = super::command_frontend::ApiDispatchFrontend::new(
+            &body.subcommand,
+            &body.args,
+            bus.sender(),
+        );
+        let dispatch =
+            crate::command::dispatch::Dispatch::new(frontend, session, state.engines.clone());
+        match dispatch.prerequisite_admission(&path_parts) {
+            Ok(Some(policy)) => flags_applied["prerequisites"] = policy,
+            Ok(None) => {}
+            Err(error) => {
+                return (
+                    StatusCode::from_u16(error.http_status()).unwrap_or(StatusCode::BAD_REQUEST),
+                    error_json(error.to_string()),
+                )
+                    .into_response()
+            }
+        }
+    }
     let response_body = match admission_body(
         journal,
         &CreateCommandResponse {

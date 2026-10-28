@@ -201,6 +201,34 @@ Runs without a working agent runtime — reachable even when the configured runt
 |---|---|---|---|---|---|---|
 | `--global` | bool | false | — | — | CLI, TUI, API | Write to global config instead of repo config. |
 
+### `awman config prerequisite-grants`
+
+List or revoke remembered workflow prerequisite decisions (SSH key, token variable).
+
+Available via: CLI, TUI
+
+Runs without a working agent runtime — reachable even when the configured runtime cannot be started on this host.
+
+#### `awman config prerequisite-grants list`
+
+List remembered workflow prerequisite decisions. They hold decisions only, never secrets.
+
+Available via: CLI, TUI
+
+Runs without a working agent runtime — reachable even when the configured runtime cannot be started on this host.
+
+#### `awman config prerequisite-grants revoke`
+
+Revoke a remembered workflow prerequisite decision.
+
+Available via: CLI, TUI
+
+Runs without a working agent runtime — reachable even when the configured runtime cannot be started on this host.
+
+| Argument | Kind | Required | Help |
+|---|---|---|---|
+| `selector` | string | yes | The record number shown by `config prerequisite-grants list`, or all. |
+
 ---
 
 ## `awman exec`
@@ -266,6 +294,12 @@ Available via: CLI, TUI, API
 | `--on-dirty-merge-target` | enum: ask, commit, stash, fail | — | — | — | CLI, TUI, API | What to do when the merge target has uncommitted changes before a worktree branch is merged back. |
 | `--on-merge-failure` | enum: ask, agent, keep | — | — | — | CLI, TUI, API | What to do when merging a worktree branch back fails: ask, launch a fix agent, or keep the worktree. |
 | `--on-existing-worktree` | enum: ask, resume, recreate, fail | — | — | — | CLI, TUI, API | What to do when the worktree for this run already exists: ask, resume it, recreate it (deletes the worktree, its branch and that branch's commits), or fail. |
+| `--prerequisite-identity` | string (optional) | — | — | — | CLI, TUI, API | Git identity for commit_changes: host (your global git identity), "Name <email>", or deny. Never granted by --yes. |
+| `--prerequisite-ssh` | string (optional) | — | — | — | CLI, TUI, API | SSH key for push_branch: a key path under ~/.ssh (mounted read-only), all (the whole ~/.ssh), or deny. Never granted by --yes. |
+| `--prerequisite-token` | string (optional) | — | — | — | CLI, TUI, API | GitHub token for create_pull_request, an HTTPS push_branch and poll_ci: env:NAME, acquire (the configured token command), or deny. Never granted by --yes. |
+| `--prerequisite-unresolved` | enum: warn, fail | — | — | — | CLI, TUI, API | What an unsatisfied workflow prerequisite does: warn and continue, or fail before any container starts. |
+| `--check-prerequisites` | bool | false | — | — | CLI, TUI, API | Run only the workflow prerequisite checks, print the report and exit 0 when all checks are satisfied or 1 when any check is missing, needs consent or is unknown. |
+| `--json` | bool | false | `--non-interactive` | — | CLI, TUI, API | Print the workflow outcome and prerequisite report as JSON. |
 
 ---
 
@@ -383,6 +417,10 @@ Available via: CLI, TUI, API
 | `--agent-models` | string (repeatable) | [] | — | — | CLI, TUI, API | Agents and models this task may use: <agent>=<model>[,<model>...]. Repeatable. |
 | `--interview` | bool | false | — | `--non-interactive` | CLI, TUI | Collect task fields interactively. |
 | `-n, --non-interactive` | bool | false | — | `--interview` | CLI, TUI | Never prompt: refuse anything needing a confirmation instead of asking. |
+| `--prerequisite-identity` | string (optional) | — | — | — | CLI, TUI, API | Git identity for commit_changes: host (your global git identity), "Name <email>", or deny. Never granted by --yes. |
+| `--prerequisite-ssh` | string (optional) | — | — | — | CLI, TUI, API | SSH key for push_branch: a key path under ~/.ssh (mounted read-only), all (the whole ~/.ssh), or deny. Never granted by --yes. |
+| `--prerequisite-token` | string (optional) | — | — | — | CLI, TUI, API | GitHub token for create_pull_request, an HTTPS push_branch and poll_ci: env:NAME, acquire (the configured token command), or deny. Never granted by --yes. |
+| `--prerequisite-unresolved` | enum: warn, fail | — | — | — | CLI, TUI, API | What an unsatisfied workflow prerequisite does: warn and continue, or fail before any container starts. |
 
 ### `awman squad edit`
 
@@ -410,6 +448,10 @@ Available via: CLI, TUI, API
 | `--clear-agent-models` | bool | false | — | `--agent-models` | CLI, TUI, API | Remove the task's own agent pool, inheriting the global squad settings. |
 | `--interview` | bool | false | — | `--non-interactive` | CLI, TUI | Collect the edited fields interactively, prefilled with the current values. |
 | `-n, --non-interactive` | bool | false | — | `--interview` | CLI, TUI | Never prompt: refuse anything needing a confirmation instead of asking. |
+| `--prerequisite-identity` | string (optional) | — | — | — | CLI, TUI, API | Git identity for commit_changes: host (your global git identity), "Name <email>", or deny. Never granted by --yes. |
+| `--prerequisite-ssh` | string (optional) | — | — | — | CLI, TUI, API | SSH key for push_branch: a key path under ~/.ssh (mounted read-only), all (the whole ~/.ssh), or deny. Never granted by --yes. |
+| `--prerequisite-token` | string (optional) | — | — | — | CLI, TUI, API | GitHub token for create_pull_request, an HTTPS push_branch and poll_ci: env:NAME, acquire (the configured token command), or deny. Never granted by --yes. |
+| `--prerequisite-unresolved` | enum: warn, fail | — | — | — | CLI, TUI, API | What an unsatisfied workflow prerequisite does: warn and continue, or fail before any container starts. |
 
 ### `awman squad list`
 
@@ -609,6 +651,12 @@ Available via: CLI, TUI
 | `--on-dirty-merge-target` | enum: ask, commit, stash, fail | — | — | — | CLI, TUI, API | What to do when the merge target has uncommitted changes before a worktree branch is merged back. |
 | `--on-merge-failure` | enum: ask, agent, keep | — | — | — | CLI, TUI, API | What to do when merging a worktree branch back fails: ask, launch a fix agent, or keep the worktree. |
 | `--on-existing-worktree` | enum: ask, resume, recreate, fail | — | — | — | CLI, TUI, API | What to do when the worktree for this run already exists: ask, resume it, recreate it (deletes the worktree, its branch and that branch's commits), or fail. |
+| `--prerequisite-identity` | string (optional) | — | — | — | CLI, TUI, API | Git identity for commit_changes: host (your global git identity), "Name <email>", or deny. Never granted by --yes. |
+| `--prerequisite-ssh` | string (optional) | — | — | — | CLI, TUI, API | SSH key for push_branch: a key path under ~/.ssh (mounted read-only), all (the whole ~/.ssh), or deny. Never granted by --yes. |
+| `--prerequisite-token` | string (optional) | — | — | — | CLI, TUI, API | GitHub token for create_pull_request, an HTTPS push_branch and poll_ci: env:NAME, acquire (the configured token command), or deny. Never granted by --yes. |
+| `--prerequisite-unresolved` | enum: warn, fail | — | — | — | CLI, TUI, API | What an unsatisfied workflow prerequisite does: warn and continue, or fail before any container starts. |
+| `--check-prerequisites` | bool | false | — | — | CLI, TUI, API | Run only the workflow prerequisite checks, print the report and exit 0 when all checks are satisfied or 1 when any check is missing, needs consent or is unknown. |
+| `--json` | bool | false | `--non-interactive` | — | CLI, TUI, API | Print the workflow outcome and prerequisite report as JSON. |
 
 #### `awman remote exec prompt`
 

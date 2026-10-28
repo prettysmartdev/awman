@@ -67,6 +67,11 @@ impl UserMessageSink for RecordingFrontend {
     fn replay_queued(&mut self) {}
 }
 
+impl awman::command::commands::workflow_prerequisites::WorkflowPrerequisiteFrontend
+    for RecordingFrontend
+{
+}
+
 #[async_trait::async_trait]
 impl SquadCommandFrontend for RecordingFrontend {
     // WI 0113 F-02: the daemon host supplies the unattended frontends its

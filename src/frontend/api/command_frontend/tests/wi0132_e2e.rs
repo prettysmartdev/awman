@@ -104,6 +104,8 @@ fn app_state(root: &Path) -> Arc<AppState> {
 
 fn flags(on_dirty_merge_target: Option<OnDirtyMergeTarget>) -> ExecWorkflowCommandFlags {
     ExecWorkflowCommandFlags {
+        prerequisites: Default::default(),
+        squad_task_prerequisites: None,
         workflow: None,
         work_item: Some("0042".into()),
         non_interactive: true,

@@ -172,3 +172,5 @@ fn subcommand_presence_routes_away_from_tui() {
         );
     }
 }
+
+mod prerequisites_tests;

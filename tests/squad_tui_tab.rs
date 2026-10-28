@@ -115,6 +115,7 @@ fn live_dir() -> tempfile::TempDir {
 fn fake_task(name: &str) -> Task {
     let now = chrono::Utc::now();
     Task {
+        prerequisites: None,
         id: name.to_string(),
         name: name.to_string(),
         description: "a test task".into(),

@@ -783,7 +783,7 @@ type = "create_pull_request"
         &[],
         json!({
             "session": remote(&origin.url),
-            "command": {"subcommand": "exec workflow", "args": ["workflow.toml"]},
+            "command": {"subcommand": "exec workflow", "args": ["workflow.toml", "--prerequisite-unresolved", "warn"]},
             "close_on_finish": true,
         }),
     )

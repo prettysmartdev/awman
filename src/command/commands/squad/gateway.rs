@@ -69,6 +69,11 @@ pub struct CreateTask {
     /// the task inherits the global `squad` block whole.
     #[serde(default)]
     pub agents_to_models: BTreeMap<String, Vec<String>>,
+    /// The task's workflow prerequisite policy (WI 0149): decisions only, never
+    /// a credential value. `None` means "not set", which headless resolves to
+    /// deny.
+    #[serde(default)]
+    pub prerequisites: Option<crate::data::config::workflows::PrerequisitePolicy>,
 }
 
 /// The fields `squad edit` may change on an existing task (WI 0110).
@@ -101,6 +106,9 @@ pub struct UpdateTask {
     /// removes the task config so the task inherits the global block again.
     #[serde(default)]
     pub agents_to_models: Option<BTreeMap<String, Vec<String>>>,
+    /// Replaces the task's workflow prerequisite policy when given (WI 0149).
+    #[serde(default)]
+    pub prerequisites: Option<crate::data::config::workflows::PrerequisitePolicy>,
 }
 
 impl UpdateTask {
@@ -114,6 +122,7 @@ impl UpdateTask {
             && self.model.is_none()
             && self.overlays.is_none()
             && self.agents_to_models.is_none()
+            && self.prerequisites.is_none()
     }
 
     /// The subset of this request the task *row* carries. `agents_to_models`
@@ -121,6 +130,7 @@ impl UpdateTask {
     /// the database, so the store never learns about it.
     fn to_store_update(&self) -> TaskUpdate {
         TaskUpdate {
+            prerequisites: self.prerequisites.clone(),
             description: self.description.clone(),
             interval_secs: self.interval_secs,
             agent: self.agent.clone(),
@@ -479,6 +489,12 @@ impl LocalTaskGateway {
             for name in self.custom_auth_env_names(task) {
                 required.entry(name).or_default().push(task.name.clone());
             }
+            // The token variable a task's prerequisite policy grants (WI 0149) is
+            // read from the same daemon env store, so it is required on the same
+            // terms and the "daemon has no value for" warning covers it.
+            for name in prerequisite_token_env_names(task) {
+                required.entry(name).or_default().push(task.name.clone());
+            }
         }
         for name in self.daemon_wide_env_names() {
             required.insert(name, task_names.clone());
@@ -784,6 +800,7 @@ impl TaskGateway for LocalTaskGateway {
         self.write_task_config(&req.name, &req.agents_to_models)?;
         let now = Utc::now();
         let task = Task {
+            prerequisites: req.prerequisites.clone(),
             id: uuid::Uuid::new_v4().to_string(),
             name: req.name,
             description: req.description,
@@ -1140,6 +1157,11 @@ impl TaskGateway for RemoteTaskGateway {
         for spec in format_agent_models_specs(&req.agents_to_models) {
             args.extend(["--agent-models".into(), spec]);
         }
+        if let Some(policy) = &req.prerequisites {
+            args.extend(
+                crate::command::commands::workflow_prerequisites::prerequisite_flag_args(policy),
+            );
+        }
         self.command("squad add", args).await
     }
     /// Re-serialise the edit as the `squad edit` argv the daemon parses.
@@ -1183,6 +1205,11 @@ impl TaskGateway for RemoteTaskGateway {
                 }
             }
             None => {}
+        }
+        if let Some(policy) = &req.prerequisites {
+            args.extend(
+                crate::command::commands::workflow_prerequisites::prerequisite_flag_args(policy),
+            );
         }
         self.command("squad edit", args).await
     }
@@ -1374,6 +1401,19 @@ fn validate_task_agents(
     Err(CommandError::Other(message))
 }
 
+/// The env var names a task's workflow prerequisite policy allows a GitHub
+/// token to come from (WI 0149). Empty unless the token use is `allow`.
+fn prerequisite_token_env_names(task: &Task) -> Vec<String> {
+    match &task.prerequisites {
+        Some(policy)
+            if policy.github_token.use_ == crate::data::config::workflows::CredentialUse::Allow =>
+        {
+            policy.github_token.env_vars.clone()
+        }
+        _ => Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1535,6 +1575,7 @@ mod tests {
             model: Some(None),
             overlays: Some(vec!["env(TOKEN)".into()]),
             agents_to_models: Some(pool),
+            prerequisites: None,
         };
         let stored = update.to_store_update();
         assert_eq!(stored.description.as_deref(), Some("d"));
@@ -1573,5 +1614,53 @@ mod tests {
         assert!(rendered.contains("<redacted>"), "{rendered}");
         assert!(rendered.contains("GITHUB_TOKEN"), "{rendered}");
         assert!(rendered.contains("0123456789abcdef"), "{rendered}");
+    }
+}
+
+#[cfg(test)]
+mod wi0149_tests {
+    use super::*;
+    #[test]
+    fn wi0149_only_allowed_task_token_env_names_enter_daemon_required_set() {
+        let now = Utc::now();
+        let mut task = Task {
+            prerequisites: None,
+            id: "0149".into(),
+            name: "regression".into(),
+            description: "test".into(),
+            repo_scope: PathBuf::from("/repo"),
+            mount_scope: MountScope::GitRoot,
+            overlays: vec![],
+            interval_secs: 60,
+            status: TaskStatus::Active,
+            agent: None,
+            model: None,
+            backoff_until: None,
+            created_at: now,
+            updated_at: now,
+            last_run_at: None,
+            trigger_requested_at: None,
+            last_run_status: None,
+            unmet_env: vec![],
+        };
+        assert!(prerequisite_token_env_names(&task).is_empty());
+        for use_ in [
+            crate::data::config::workflows::CredentialUse::Ask,
+            crate::data::config::workflows::CredentialUse::Deny,
+            crate::data::config::workflows::CredentialUse::Allow,
+        ] {
+            let mut policy = crate::data::config::workflows::PrerequisitePolicy::default();
+            policy.github_token.use_ = use_;
+            policy.github_token.env_vars = vec!["GH_TOKEN".into(), "WORK_TOKEN".into()];
+            task.prerequisites = Some(policy);
+            assert_eq!(
+                prerequisite_token_env_names(&task),
+                if use_ == crate::data::config::workflows::CredentialUse::Allow {
+                    vec!["GH_TOKEN", "WORK_TOKEN"]
+                } else {
+                    vec![]
+                }
+            );
+        }
     }
 }

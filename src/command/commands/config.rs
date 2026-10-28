@@ -338,6 +338,8 @@ pub enum ConfigSubcommand {
     Show(ConfigShowFlags),
     Get(ConfigGetFlags),
     Set(ConfigSetFlags),
+    /// `config prerequisite-grants list|revoke` (WI 0149).
+    PrerequisiteGrants(crate::command::commands::workflow_prerequisites::PrerequisiteGrantsAction),
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -734,6 +736,14 @@ impl ConfigCommand {
                 value: ctx.args.require("value")?,
                 global: ctx.flags.bool("global"),
             }),
+            "list" => ConfigSubcommand::PrerequisiteGrants(
+                crate::command::commands::workflow_prerequisites::PrerequisiteGrantsAction::List,
+            ),
+            "revoke" => ConfigSubcommand::PrerequisiteGrants(
+                crate::command::commands::workflow_prerequisites::PrerequisiteGrantsAction::Revoke(
+                    ctx.args.require("selector")?,
+                ),
+            ),
             _ => return Err(CommandError::unknown_command(&ctx.path())),
         };
         Ok(Self::new(sub, ctx.engines.clone(), ctx.session.clone()))
@@ -751,6 +761,7 @@ pub enum ConfigOutcome {
     Show(ConfigShowOutcome),
     Get(ConfigGetOutcome),
     Set(ConfigSetOutcome),
+    PrerequisiteGrants(crate::command::commands::workflow_prerequisites::PrerequisiteGrantsOutcome),
 }
 
 #[async_trait]
@@ -830,6 +841,11 @@ impl Command for ConfigCommand {
                     }
                 }
             }
+            ConfigSubcommand::PrerequisiteGrants(action) => ConfigOutcome::PrerequisiteGrants(
+                crate::command::commands::workflow_prerequisites::run_prerequisite_grants(
+                    &session, &action,
+                )?,
+            ),
             ConfigSubcommand::Get(f) => {
                 // Validate field name.
                 if let Some(msg) = removed_field_message(&f.field) {

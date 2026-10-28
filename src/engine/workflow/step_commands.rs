@@ -10,6 +10,81 @@ use crate::data::workflow_definition::{CloneConflictMode, SetupStep, TeardownSte
 use crate::data::workflow_prompt_template::{extract_section, substitute_prompt, WorkItemContext};
 use crate::data::workflow_state::PhaseKind;
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum PushAuth {
+    #[default]
+    None,
+    Ssh {
+        key_path: String,
+        known_hosts: Option<String>,
+    },
+    HttpsToken {
+        env_var: String,
+    },
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StepCommandOptions {
+    pub push_auth: PushAuth,
+    pub remote_url: Option<String>,
+}
+
+/// Transport runs with controlled metadata supplied by OverlayEngine. Never
+/// consult hooks, SSH config, helpers or URL rewrites from the checkout.
+fn transport_git(opts: &StepCommandOptions) -> String {
+    if opts.push_auth == PushAuth::None && opts.remote_url.is_none() {
+        return "git".into();
+    }
+    let mut git = "git -c core.hooksPath=/dev/null -c core.fsmonitor=false -c maintenance.auto=false -c gc.auto=0 -c push.gpgSign=false -c push.recurseSubmodules=no -c credential.helper=".to_string();
+    if let PushAuth::HttpsToken { env_var } = &opts.push_auth {
+        let destination = opts.remote_url.as_deref().unwrap_or("");
+        let (host, path) = destination
+            .strip_prefix("https://")
+            .unwrap_or("")
+            .split_once('/')
+            .unwrap_or(("", ""));
+        // Consume Git's credential protocol and answer only for the approved
+        // HTTPS destination. The token itself is expanded in the child env.
+        let helper = format!(
+            "credential.helper=!f() {{ protocol=; host=; path=; while IFS='=' read -r k v; do case \\\"$k\\\" in protocol) protocol=$v;; host) host=$v;; path) path=$v;; esac; done; if [ \\\"$1\\\" = get ] && [ \\\"$protocol\\\" = https ] && [ \\\"$host\\\" = {host} ] && [ \\\"$path\\\" = {path} ]; then printf '%s\\n' 'username=x-access-token' \\\"password=${env_var}\\\"; fi; }}; f",
+            host = sh_quote(host), path = sh_quote(path)
+        );
+        // Rust escapes quotes once; sh_quote then quotes the complete config
+        // argument once. Literal backslashes must not reach the helper body.
+        let helper = helper.replace("\\\"", "\"");
+        git.push_str(&format!(
+            " -c credential.useHttpPath=true -c {}",
+            sh_quote(&helper)
+        ));
+    }
+    git
+}
+
+fn transport_env(opts: &StepCommandOptions) -> Option<HashMap<String, String>> {
+    if opts.push_auth == PushAuth::None && opts.remote_url.is_none() {
+        return Some(HashMap::from([(
+            "GIT_SSH_COMMAND".into(),
+            "ssh -o StrictHostKeyChecking=accept-new".into(),
+        )]));
+    }
+    let mut env = HashMap::from([("GIT_TERMINAL_PROMPT".into(), "0".into())]);
+    let ssh = match &opts.push_auth {
+        PushAuth::Ssh {
+            key_path,
+            known_hosts,
+        } => {
+            let mut ssh = format!("ssh -F /dev/null -i {} -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=accept-new", sh_quote(key_path));
+            if let Some(path) = known_hosts {
+                ssh.push_str(&format!(" -o UserKnownHostsFile={}", sh_quote(path)));
+            }
+            ssh
+        }
+        _ => "ssh -F /dev/null -o BatchMode=yes -o StrictHostKeyChecking=accept-new".into(),
+    };
+    env.insert("GIT_SSH_COMMAND".into(), ssh);
+    Some(env)
+}
+
 /// Quote `s` as a single POSIX shell word so embedded whitespace, quotes, and
 /// metacharacters cannot break out of the argument. Workflow files are
 /// author-controlled but may still contain literal quotes, spaces, or other
@@ -46,6 +121,13 @@ fn clone_target_dir(url: &str, into: Option<&str>) -> String {
 
 /// Translate a setup step into a shell command string and optional env overrides.
 pub fn setup_step_to_shell(step: &SetupStep) -> (String, Option<HashMap<String, String>>) {
+    setup_step_to_shell_with(step, &StepCommandOptions::default())
+}
+
+pub fn setup_step_to_shell_with(
+    step: &SetupStep,
+    opts: &StepCommandOptions,
+) -> (String, Option<HashMap<String, String>>) {
     match step {
         SetupStep::CloneRepo {
             url,
@@ -53,11 +135,15 @@ pub fn setup_step_to_shell(step: &SetupStep) -> (String, Option<HashMap<String, 
             into,
             conflict_mode,
         } => {
-            let mut clone = "git clone".to_string();
+            let mut clone = format!("{} clone", transport_git(opts));
             if let Some(b) = branch {
                 clone.push_str(&format!(" -b {}", sh_quote(b)));
             }
-            clone.push_str(&format!(" {}", sh_quote(url)));
+            clone.push_str(&format!(
+                " {}{}",
+                if opts.remote_url.is_some() { "-- " } else { "" },
+                sh_quote(opts.remote_url.as_deref().unwrap_or(url))
+            ));
             if let Some(d) = into {
                 clone.push_str(&format!(" {}", sh_quote(d)));
             }
@@ -94,7 +180,14 @@ pub fn setup_step_to_shell(step: &SetupStep) -> (String, Option<HashMap<String, 
                     )),
                 ),
             };
-            (cmd, None)
+            (
+                cmd,
+                if opts == &StepCommandOptions::default() {
+                    None
+                } else {
+                    transport_env(opts)
+                },
+            )
         }
         SetupStep::CheckoutCreateBranch { branch, base } => {
             let b_q = sh_quote(branch);
@@ -110,11 +203,27 @@ pub fn setup_step_to_shell(step: &SetupStep) -> (String, Option<HashMap<String, 
             (cmd, None)
         }
         SetupStep::PullBranch { remote, branch } => {
-            let cmd = match (remote, branch) {
-                (Some(r), Some(b)) => format!("git pull {} {}", sh_quote(r), sh_quote(b)),
-                _ => "git pull".to_string(),
+            if opts == &StepCommandOptions::default() {
+                return (
+                    match (remote, branch) {
+                        (Some(r), Some(b)) => format!("git pull {} {}", sh_quote(r), sh_quote(b)),
+                        _ => "git pull".into(),
+                    },
+                    None,
+                );
+            }
+            let destination = opts.remote_url.as_deref().or(remote.as_deref());
+            let cmd = match (destination, branch) {
+                (Some(r), Some(b)) => format!(
+                    "{} pull -- {} {}",
+                    transport_git(opts),
+                    sh_quote(r),
+                    sh_quote(b)
+                ),
+                (Some(r), None) => format!("{} pull -- {}", transport_git(opts), sh_quote(r)),
+                _ => format!("{} pull", transport_git(opts)),
             };
-            (cmd, None)
+            (cmd, transport_env(opts))
         }
         SetupStep::RunShell { command, env } => (command.clone(), env.clone()),
         SetupStep::RunScript { path, env } => (format!("sh {}", sh_quote(path)), env.clone()),
@@ -126,6 +235,13 @@ pub fn setup_step_to_shell(step: &SetupStep) -> (String, Option<HashMap<String, 
 
 /// Translate a teardown step into a shell command string and optional env overrides.
 pub fn teardown_step_to_shell(step: &TeardownStep) -> (String, Option<HashMap<String, String>>) {
+    teardown_step_to_shell_with(step, &StepCommandOptions::default())
+}
+
+pub fn teardown_step_to_shell_with(
+    step: &TeardownStep,
+    opts: &StepCommandOptions,
+) -> (String, Option<HashMap<String, String>>) {
     match step {
         TeardownStep::RunShell { command, env } => (command.clone(), env.clone()),
         TeardownStep::RunScript { path } => (format!("sh {}", sh_quote(path)), None),
@@ -146,13 +262,20 @@ pub fn teardown_step_to_shell(step: &TeardownStep) -> (String, Option<HashMap<St
                 sh_quote(t),
                 sh_quote(b),
             );
+            if opts.remote_url.is_some() {
+                cmd.push_str(" --head \"$(git symbolic-ref --short HEAD)\"");
+            }
             if let Some(base) = base {
                 cmd.push_str(&format!(" --base {}", sh_quote(base)));
             }
             (cmd, None)
         }
         TeardownStep::PushBranch { remote, branch } => {
-            let remote = remote.as_deref().unwrap_or("origin");
+            let remote = opts
+                .remote_url
+                .as_deref()
+                .or(remote.as_deref())
+                .unwrap_or("origin");
             let branch = branch.as_deref().unwrap_or("HEAD");
             if branch.starts_with(['-', '+']) || branch.contains(':') {
                 return (
@@ -160,13 +283,13 @@ pub fn teardown_step_to_shell(step: &TeardownStep) -> (String, Option<HashMap<St
                     None,
                 );
             }
-            let cmd = format!("git push -u -- {} {}", sh_quote(remote), sh_quote(branch));
-            let mut env = HashMap::new();
-            env.insert(
-                "GIT_SSH_COMMAND".to_string(),
-                "ssh -o StrictHostKeyChecking=accept-new".to_string(),
+            let cmd = format!(
+                "{} push -u -- {} {}",
+                transport_git(opts),
+                sh_quote(remote),
+                sh_quote(branch)
             );
-            (cmd, Some(env))
+            (cmd, transport_env(opts))
         }
         TeardownStep::PollCi { .. } => {
             unreachable!("PollCi steps are handled natively by the engine, not translated to shell")
@@ -336,7 +459,12 @@ pub trait PhaseStepSpec: Sized {
 
     /// The shell command and per-step env overrides this step runs as.
     /// Never called for a step whose [`PhaseStepSpec::poll_ci`] is `Some`.
-    fn to_shell(&self) -> (String, Option<HashMap<String, String>>);
+    fn to_shell(&self) -> (String, Option<HashMap<String, String>>) {
+        self.to_shell_with(&StepCommandOptions::default())
+    }
+
+    fn to_shell_with(&self, opts: &StepCommandOptions)
+        -> (String, Option<HashMap<String, String>>);
 
     /// `Some((interval_secs, max_retries))` when the step is a native CI poll
     /// the engine runs itself rather than a command in a container.
@@ -363,8 +491,11 @@ impl PhaseStepSpec for SetupStep {
         setup_step_description(self)
     }
 
-    fn to_shell(&self) -> (String, Option<HashMap<String, String>>) {
-        setup_step_to_shell(self)
+    fn to_shell_with(
+        &self,
+        opts: &StepCommandOptions,
+    ) -> (String, Option<HashMap<String, String>>) {
+        setup_step_to_shell_with(self, opts)
     }
 
     fn poll_ci(&self) -> Option<(u32, u32)> {
@@ -394,8 +525,11 @@ impl PhaseStepSpec for TeardownStep {
         teardown_step_description(self)
     }
 
-    fn to_shell(&self) -> (String, Option<HashMap<String, String>>) {
-        teardown_step_to_shell(self)
+    fn to_shell_with(
+        &self,
+        opts: &StepCommandOptions,
+    ) -> (String, Option<HashMap<String, String>>) {
+        teardown_step_to_shell_with(self, opts)
     }
 
     fn poll_ci(&self) -> Option<(u32, u32)> {
@@ -972,5 +1106,216 @@ mod tests {
         };
         let result = substitute_teardown_step(&step, Some(&wi()));
         assert_eq!(result, step);
+    }
+}
+
+#[cfg(test)]
+mod push_auth_tests {
+    use super::*;
+
+    fn push(remote: Option<&str>, branch: Option<&str>) -> TeardownStep {
+        TeardownStep::PushBranch {
+            remote: remote.map(String::from),
+            branch: branch.map(String::from),
+        }
+    }
+
+    fn with(auth: PushAuth, step: &TeardownStep) -> (String, Option<HashMap<String, String>>) {
+        teardown_step_to_shell_with(
+            step,
+            &StepCommandOptions {
+                push_auth: auth,
+                remote_url: None,
+            },
+        )
+    }
+
+    #[test]
+    fn defaults_unchanged() {
+        let step = push(None, None);
+        assert_eq!(
+            teardown_step_to_shell(&step),
+            with(PushAuth::None, &step),
+            "PushAuth::None must equal the pre-grant behaviour"
+        );
+        let (cmd, env) = teardown_step_to_shell(&step);
+        assert!(cmd.ends_with("push -u -- 'origin' 'HEAD'"));
+        assert_eq!(
+            env.unwrap()["GIT_SSH_COMMAND"],
+            "ssh -o StrictHostKeyChecking=accept-new"
+        );
+        let commit = TeardownStep::CommitChanges {
+            message: "m".into(),
+            add_all: true,
+        };
+        assert_eq!(
+            teardown_step_to_shell(&commit),
+            with(
+                PushAuth::Ssh {
+                    key_path: "/k".into(),
+                    known_hosts: None
+                },
+                &commit
+            ),
+            "push auth never changes non-push steps"
+        );
+    }
+
+    #[test]
+    fn ssh_push_auth_sets_identities_only_and_known_hosts() {
+        let (cmd, env) = with(
+            PushAuth::Ssh {
+                key_path: "/root/.ssh/awman_push_key".into(),
+                known_hosts: Some("/root/.ssh/known_hosts".into()),
+            },
+            &push(None, None),
+        );
+        assert!(cmd.ends_with("push -u -- 'origin' 'HEAD'"));
+        assert_eq!(
+            env.unwrap()["GIT_SSH_COMMAND"],
+            "ssh -F /dev/null -i '/root/.ssh/awman_push_key' -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile='/root/.ssh/known_hosts'"
+        );
+        let (_, env) = with(
+            PushAuth::Ssh {
+                key_path: "/k".into(),
+                known_hosts: None,
+            },
+            &push(None, None),
+        );
+        let ssh = &env.unwrap()["GIT_SSH_COMMAND"];
+        assert!(ssh.contains("IdentitiesOnly=yes"));
+        assert!(!ssh.contains("UserKnownHostsFile"));
+    }
+
+    #[test]
+    fn ssh_key_path_is_shell_quoted() {
+        let (_, env) = with(
+            PushAuth::Ssh {
+                key_path: "/k'; touch /pwned; echo '".into(),
+                known_hosts: None,
+            },
+            &push(None, None),
+        );
+        let ssh = &env.unwrap()["GIT_SSH_COMMAND"];
+        assert!(ssh.contains(r"'/k'\''; touch /pwned; echo '\'''"), "{ssh}");
+    }
+
+    #[test]
+    fn https_push_auth_uses_env_var_name_only() {
+        let (cmd, env) = with(
+            PushAuth::HttpsToken {
+                env_var: "AWMAN_GIT_TOKEN".into(),
+            },
+            &push(None, Some("feature/x")),
+        );
+        assert!(cmd.contains("-c credential.helper="), "{cmd}");
+        assert!(cmd.contains("AWMAN_GIT_TOKEN"));
+        assert!(cmd.ends_with("push -u -- 'origin' 'feature/x'"), "{cmd}");
+        // The helper references the variable; the value can never be in argv.
+        assert!(cmd.contains("$AWMAN_GIT_TOKEN"));
+        assert_eq!(env.unwrap()["GIT_TERMINAL_PROMPT"], "0");
+    }
+
+    #[test]
+    fn push_refuses_option_like_branches_regardless_of_auth() {
+        for branch in ["-f", "+main", "a:b"] {
+            let (cmd, _) = with(PushAuth::None, &push(None, Some(branch)));
+            assert!(cmd.contains("exit 2"), "{branch}: {cmd}");
+            assert!(!cmd.contains("git push"));
+        }
+    }
+
+    #[test]
+    fn create_pull_request_command_is_independent_of_push_auth() {
+        let step = TeardownStep::CreatePullRequest {
+            title: Some("t".into()),
+            body: None,
+            base: Some("main".into()),
+        };
+        assert_eq!(
+            teardown_step_to_shell(&step),
+            with(
+                PushAuth::HttpsToken {
+                    env_var: "AWMAN_GIT_TOKEN".into()
+                },
+                &step
+            )
+        );
+    }
+}
+
+#[cfg(test)]
+mod review_transport_tests {
+    use super::*;
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    #[test]
+    fn https_helper_obeys_git_protocol_and_restricts_destination() {
+        let opts = StepCommandOptions {
+            push_auth: PushAuth::HttpsToken {
+                env_var: "AWMAN_GIT_TOKEN".into(),
+            },
+            remote_url: Some("https://github.com/o/r.git".into()),
+        };
+        let args = shell_words::split(&transport_git(&opts)).unwrap();
+        for (host, path, allowed) in [
+            ("github.com", "o/r.git", true),
+            ("evil.test", "o/r.git", false),
+            ("github.com", "other/repo", false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut child = Command::new("git")
+                .args(&args[1..])
+                .args(["credential", "fill"])
+                .current_dir(dir.path())
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .env("AWMAN_GIT_TOKEN", "fixture_secret")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            writeln!(
+                child.stdin.take().unwrap(),
+                "protocol=https\nhost={host}\npath={path}\n"
+            )
+            .unwrap();
+            let output = child.wait_with_output().unwrap();
+            assert_eq!(
+                output.status.success(),
+                allowed,
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout).contains("password=fixture_secret"),
+                allowed
+            );
+            assert!(!args.iter().any(|a| a.contains("fixture_secret")));
+        }
+    }
+    #[test]
+    fn setup_uses_selected_transport_and_pinned_destination() {
+        let opts = StepCommandOptions {
+            push_auth: PushAuth::Ssh {
+                key_path: "/root/.ssh/awman_push_key".into(),
+                known_hosts: Some("/root/.ssh/known_hosts".into()),
+            },
+            remote_url: Some("ssh://git@trusted.test/o/r".into()),
+        };
+        let step: SetupStep = serde_json::from_value(
+            serde_json::json!({"type":"pull_branch", "remote":"origin", "branch":"main"}),
+        )
+        .unwrap();
+        let (shell, env) = setup_step_to_shell_with(&step, &opts);
+        assert!(shell.contains("ssh://git@trusted.test/o/r"));
+        assert!(!shell.contains("'origin'"));
+        let env = env.unwrap();
+        let ssh = &env["GIT_SSH_COMMAND"];
+        assert!(ssh.contains("-F /dev/null"));
+        assert!(ssh.contains("awman_push_key"));
+        assert!(ssh.contains("IdentitiesOnly=yes"));
     }
 }

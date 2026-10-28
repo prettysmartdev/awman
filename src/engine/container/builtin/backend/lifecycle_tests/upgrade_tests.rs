@@ -87,11 +87,13 @@ fn assert_old_and_no_backup(rig: &Rig, original: &BTreeMap<PathBuf, Vec<u8>>) {
         OLD
     );
     assert_eq!(&tree(&paths.home.join("db")), original);
-    assert!(!std::fs::read_dir(&paths.home).unwrap().any(|entry| entry
-        .unwrap()
-        .file_name()
-        .to_string_lossy()
-        .contains("db.pre-")));
+    assert!(!std::fs::read_dir(&paths.home).unwrap().any(|entry| {
+        entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains("db.pre-")
+    }));
 }
 
 fn add_sandbox(rig: &Rig, name: &str, protocol: Option<&str>, awman: bool) -> String {

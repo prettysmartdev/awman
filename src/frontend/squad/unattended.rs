@@ -788,6 +788,41 @@ impl ExecWorkflowCommandFrontend for UnattendedFrontend {
 /// needs approval is refused, never approved.
 impl crate::command::commands::agent_trust::AgentTrustFrontend for UnattendedFrontend {}
 
+impl crate::command::commands::workflow_prerequisites::WorkflowPrerequisiteFrontend
+    for UnattendedFrontend
+{
+    fn show_workflow_prerequisites(
+        &mut self,
+        report: &crate::data::workflow_prerequisites::WorkflowPrerequisiteReport,
+    ) -> Result<(), CommandError> {
+        let summary = report.summary_line();
+        match self.logs.open_step_log("workflow", 0, "prerequisites") {
+            Ok(mut log) => {
+                log.write_line(&format!("# {summary}"));
+                for line in report.render_lines() {
+                    log.write_line(&line);
+                }
+                let path = log.finish();
+                tracing::info!(
+                    task = %self.task,
+                    run_id = %self.run_id,
+                    summary,
+                    log_path = %path.display(),
+                    "squad workflow prerequisites checked"
+                );
+            }
+            Err(error) => tracing::error!(
+                task = %self.task,
+                run_id = %self.run_id,
+                summary,
+                error = %error,
+                "squad failed to open workflow prerequisite log"
+            ),
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
@@ -1277,5 +1312,44 @@ mod tests {
                 "{label}: {contents:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod wi0149_tests {
+    use super::*;
+    use crate::command::commands::workflow_prerequisites::WorkflowPrerequisiteFrontend;
+    use crate::data::workflow_prerequisites::*;
+    #[test]
+    fn wi0149_squad_run_log_contains_prerequisite_summary_and_gap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut frontend = UnattendedFrontend::for_run(
+            "task",
+            &RunId("run-0149".into()),
+            tmp.path(),
+            "workflow",
+            MountScopeDecision::MountGitRoot,
+        )
+        .unwrap();
+        let report = WorkflowPrerequisiteReport {
+            phase: PrerequisitePhase::Start,
+            origin: PrerequisiteOrigin::AssumedAll,
+            checks: vec![PrerequisiteCheck {
+                prerequisite: WorkflowPrerequisite::GitHubToken {
+                    host: "github.com".into(),
+                },
+                status: PrerequisiteStatus::Missing,
+                explanation: "No token in GH_TOKEN".into(),
+                needed_by: vec![],
+                remediations: vec![],
+            }],
+            advisories: vec![],
+            notes: vec![],
+        };
+        assert!(!frontend.can_ask_prerequisites());
+        frontend.show_workflow_prerequisites(&report).unwrap();
+        let log = std::fs::read_to_string(tmp.path().join("workflow-0-prerequisites.log")).unwrap();
+        assert!(log.contains(&report.summary_line()), "{log}");
+        assert!(log.contains("No token in GH_TOKEN"));
     }
 }

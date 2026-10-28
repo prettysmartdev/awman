@@ -436,6 +436,17 @@ impl ContainerBackend for DockerBackend {
         host_cli_backend::cli_image_exists(ContainerCli::DOCKER, tag)
     }
 
+    fn run_probe(
+        &self,
+        request: &crate::engine::container::backend::ProbeRequest<'_>,
+    ) -> Result<String, EngineError> {
+        host_cli_backend::cli_run_probe(ContainerCli::DOCKER, request)
+    }
+
+    fn image_id(&self, tag: &str) -> Result<Option<String>, EngineError> {
+        host_cli_backend::cli_image_id(ContainerCli::DOCKER, tag)
+    }
+
     fn build_image(
         &self,
         request: &crate::engine::container::BuildRequest,
@@ -485,6 +496,7 @@ impl ContainerBackend for DockerBackend {
             request.workdir,
             request.env,
             request.overlays,
+            request.secret_env,
         )
     }
 
@@ -878,14 +890,21 @@ impl ExecutionBackend for AttachExecution {
 /// changing it would silently alter CLI/TUI behaviour for a variable that is
 /// deliberately set to the empty string.
 pub(super) fn resolve_env_passthrough(options: &ResolvedContainerOptions) -> Vec<(String, String)> {
-    options
+    let mut values: Vec<_> = options
         .env_passthrough
         .iter()
         .filter(|envvar| is_env_var_name(&envvar.0))
         .filter_map(|envvar| {
             crate::data::config::env::host_var(&envvar.0).map(|value| (envvar.0.clone(), value))
         })
-        .collect()
+        .collect();
+    for (key, value) in &options.env_overrides {
+        if crate::data::config::workflows::valid_env_name(key) {
+            values.retain(|(name, _)| name != key);
+            values.push((key.clone(), value.expose().to_string()));
+        }
+    }
+    values
 }
 
 /// Whether a passthrough name is a usable environment variable name.
@@ -2074,5 +2093,47 @@ mod tests {
                 "credential value {value} must never appear in argv; argv: {argv:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod explicit_phase_env_review_tests {
+    use super::*;
+    use crate::engine::auth::credential::SecretString;
+    use crate::engine::container::options::{ContainerOption, EnvVar};
+    #[test]
+    fn explicit_values_win_over_different_or_absent_ambient_values_without_entering_argv() {
+        use crate::data::config::env::{
+            set_daemon_overlay, DaemonEnvMap, DAEMON_OVERLAY_TEST_LOCK,
+        };
+        let _lock = DAEMON_OVERLAY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let key = "AWMAN_WI0149_EXPLICIT_OVERRIDE";
+        for ambient in [None, Some("ambient_token")] {
+            set_daemon_overlay(DaemonEnvMap::from_pairs(ambient.map(|v| (key, v))));
+            let options = ResolvedContainerOptions::resolve(vec![
+                ContainerOption::Image(ImageRef::new("fixture")),
+                ContainerOption::EnvPassthrough(EnvVar(key.into())),
+                ContainerOption::EnvOverride {
+                    key: key.into(),
+                    value: SecretString::new("selected_token"),
+                },
+            ])
+            .unwrap();
+            assert_eq!(
+                resolve_env_passthrough(&options),
+                [(key.into(), "selected_token".into())]
+            );
+            let argv = build_run_argv(
+                &ContainerName::new("fixture"),
+                &ImageRef::new("fixture"),
+                &options,
+            )
+            .unwrap();
+            assert!(argv.windows(2).any(|w| w == ["-e", key]));
+            assert!(!format!("{argv:?} {options:?}").contains("selected_token"));
+        }
+        set_daemon_overlay(DaemonEnvMap::new());
     }
 }

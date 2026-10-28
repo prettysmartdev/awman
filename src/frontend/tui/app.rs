@@ -62,6 +62,14 @@ pub struct SquadTabBuild {
     pub key_setup: Option<SquadKeySetup>,
 }
 
+/// Hand the terminal to a host command, or take it back (see
+/// `DialogRequest::TerminalRelease`).
+#[derive(Debug)]
+pub enum TerminalOp {
+    Release { title: String },
+    Restore,
+}
+
 /// Central TUI state. Contains NO business logic — only UI state.
 pub struct App {
     pub tabs: Vec<Tab>,
@@ -78,6 +86,10 @@ pub struct App {
     pub should_quit: bool,
     pub needs_redraw: bool,
     pub command_dialog_active: bool,
+    pub command_dialog_deadline: Option<std::time::Instant>,
+    /// A terminal hand-over the command thread is waiting on (WI 0149); the
+    /// event loop performs it and answers.
+    pub terminal_op: Option<TerminalOp>,
     pub runtime_handle: tokio::runtime::Handle,
     /// Gateway for the singleton squad tab, obtained from
     /// `SquadGatewayResolver::ensure_running()` when the tab is opened. Injected into
@@ -138,6 +150,8 @@ impl App {
             should_quit: false,
             needs_redraw: true,
             command_dialog_active: false,
+            command_dialog_deadline: None,
+            terminal_op: None,
             runtime_handle,
             squad_gateway: None,
             squad_startup_rx: None,
@@ -708,6 +722,14 @@ impl App {
     /// Tick all tabs: drain container output, poll for command completion,
     /// poll for stats results, and recompute the per-tab stuck flag.
     pub fn tick_all_tabs(&mut self) {
+        if self.command_dialog_active
+            && self
+                .command_dialog_deadline
+                .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+        {
+            super::dialog_router::dismiss_dialog(self);
+            self.command_dialog_deadline = None;
+        }
         self.refresh_tabs_from_sessions();
         self.refresh_agents_context();
         self.drain_stats_samples();
@@ -1010,6 +1032,9 @@ impl App {
             None
         };
         if let Some(state) = yolo_snapshot {
+            if state.remaining_secs == 0 && self.command_dialog_active {
+                super::dialog_router::dismiss_dialog(self);
+            }
             if !self.command_dialog_active {
                 self.active_dialog = Some(Dialog::WorkflowYoloCountdown(
                     crate::frontend::tui::dialogs::WorkflowYoloCountdownState {
@@ -1130,6 +1155,21 @@ impl App {
                         editor,
                     }
                 }
+                DialogRequest::SecretInput { title, prompt } => Dialog::SecretInput {
+                    title,
+                    prompt,
+                    buffer: crate::frontend::tui::dialogs::SecretBuffer::default(),
+                },
+                // The event loop owns the terminal: park the operation for it
+                // and let it answer once the screen has changed.
+                DialogRequest::TerminalRelease { title } => {
+                    self.terminal_op = Some(TerminalOp::Release { title });
+                    return;
+                }
+                DialogRequest::TerminalRestore => {
+                    self.terminal_op = Some(TerminalOp::Restore);
+                    return;
+                }
                 DialogRequest::MultilineInput {
                     title,
                     prompt,
@@ -1227,6 +1267,17 @@ impl App {
             };
             self.active_dialog = Some(dialog);
             self.command_dialog_active = true;
+            self.command_dialog_deadline = self
+                .active_tab()
+                .shared
+                .yolo_state
+                .lock()
+                .ok()
+                .and_then(|state| {
+                    state.as_ref().map(|s| {
+                        std::time::Instant::now() + std::time::Duration::from_secs(s.remaining_secs)
+                    })
+                });
         }
     }
 

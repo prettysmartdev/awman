@@ -476,6 +476,14 @@ impl LocalTaskEvaluator {
         let task = &request.task;
         let session = self.open_session(task)?;
         let git_root = session.git_root().to_path_buf();
+        let trusted_git_source = session
+            .is_git_repo()
+            .then(|| {
+                self.engines
+                    .git_engine
+                    .capture_workflow_git_source(&git_root)
+            })
+            .transpose()?;
 
         let mut sink = TracingSink::new(&task.name);
         // Raw container image build output goes to per-build files under
@@ -609,6 +617,9 @@ impl LocalTaskEvaluator {
             &format!("{RUN_DIR_CONTAINER_PATH}/{VERDICT_FILE_NAME}"),
             request.guidance.as_deref(),
         );
+        // Gaps in the task's workflow prerequisites reach the leader the same way
+        // missing `env()` names do, so it does not design a step that will fail.
+        let prompt = with_prerequisite_summary(prompt, &self.engines, &session, task);
 
         let launcher = SquadAgentLauncher::new(
             Arc::clone(&self.engines.agent_engine),
@@ -677,6 +688,14 @@ impl LocalTaskEvaluator {
                 )
                 .await
                 .map_err(CommandError::from)?;
+            // The leader precedes ExecWorkflowCommand's own preflight.
+            // Reject redirected metadata before repair or workflow launches
+            // can adopt it as their trusted baseline.
+            if let Some(source) = &trusted_git_source {
+                self.engines
+                    .git_engine
+                    .ensure_workflow_git_source_unchanged(source)?;
+            }
             // The leader's own output lives here (the unattended frontend
             // opened it when the container started); every line about this
             // attempt names it so a failure can be debugged from the log.
@@ -855,11 +874,26 @@ impl LocalTaskEvaluator {
             task.name.clone(),
             session.id().to_string(),
         );
+        if let Some(task_policy) = &task.prerequisites {
+            let options = crate::command::commands::workflow_prerequisites::WorkflowPrerequisiteFlowOptions::for_session(
+                &session, crate::command::dispatch::catalogue::FrontendKind::SquadDaemon, &Default::default(), None,
+                crate::data::workflow_prerequisites::PrerequisiteOrigin::AssumedAll, None);
+            crate::command::commands::workflow_prerequisites::check_task_widening(
+                task_policy,
+                &options.policy,
+            )?;
+        }
         let mut command = ExecWorkflowCommand::new(
-            squad_workflow_flags(&generated_path, uses_worktree, &task.overlays),
+            squad_workflow_flags(
+                &generated_path,
+                uses_worktree,
+                &task.overlays,
+                task.prerequisites.clone().map(Box::new),
+            ),
             self.engines.clone(),
             session,
         )
+        .with_frontend_kind(crate::command::dispatch::catalogue::FrontendKind::SquadDaemon)
         .with_squad_identity(squad_identity)
         // Every step container also gets the durable task workspace at the
         // stable `context(workflow)` path, so a task's persistent data is
@@ -874,14 +908,26 @@ impl LocalTaskEvaluator {
             // what the run row records for the daemon's workflow route.
             command = command.with_workflow_state_root(request.run_log_dir.clone());
         }
-        let outcome = command
-            .run_with_frontend(self.frontends.workflow_frontend(
-                &task.name,
-                &request.run_id,
-                &request.run_log_dir,
-                mount_scope_decision(task.mount_scope),
-            )?)
-            .await?;
+        let mut workflow_frontend = self.frontends.workflow_frontend(
+            &task.name,
+            &request.run_id,
+            &request.run_log_dir,
+            mount_scope_decision(task.mount_scope),
+        )?;
+        if task.prerequisites.is_none() {
+            // A task created before workflow prerequisites existed (WI 0149):
+            // "ask" resolves to deny here, and explicit step overlays still work.
+            let notice = format!(
+                "workflow prerequisite policy not set; run `awman squad edit {}` to configure",
+                task.name
+            );
+            tracing::warn!(task = %task.name, "{notice}");
+            workflow_frontend.write_message(UserMessage {
+                level: MessageLevel::Warning,
+                text: notice,
+            });
+        }
+        let outcome = command.run_with_frontend(workflow_frontend).await?;
 
         tracing::info!(
             task = %task.name,
@@ -1072,8 +1118,14 @@ fn squad_workflow_flags(
     workflow_path: &Path,
     uses_worktree: bool,
     overlays: &[String],
+    prerequisites: Option<Box<crate::data::config::workflows::PrerequisitePolicy>>,
 ) -> ExecWorkflowCommandFlags {
     ExecWorkflowCommandFlags {
+        prerequisites: Default::default(),
+        // The task's stored prerequisite decisions (WI 0149), layered under
+        // flags and over the global `squad.workflows.prerequisites` block by
+        // the one Layer 0 merge.
+        squad_task_prerequisites: prerequisites,
         workflow: Some(workflow_path.to_path_buf()),
         work_item: None,
         non_interactive: false,
@@ -1235,6 +1287,41 @@ impl UserMessageSink for TracingSink {
     fn replay_queued(&mut self) {}
 }
 
+/// Append the workflow prerequisite summary (WI 0149 §6) to a squad leader
+/// prompt. The preflight assumes every teardown kind, uses the task's stored
+/// policy and asks nothing; an empty summary leaves the prompt unchanged.
+fn with_prerequisite_summary(
+    prompt: String,
+    engines: &crate::command::dispatch::Engines,
+    session: &Session,
+    task: &Task,
+) -> String {
+    use crate::command::commands::workflow_prerequisites::{
+        WorkflowPrerequisiteFlow, WorkflowPrerequisiteFlowOptions,
+    };
+    use crate::data::workflow_prerequisites::{PrerequisiteOrigin, WorkflowPrerequisites};
+    let options = WorkflowPrerequisiteFlowOptions::for_session(
+        session,
+        crate::command::dispatch::catalogue::FrontendKind::SquadDaemon,
+        &Default::default(),
+        task.prerequisites.as_ref(),
+        PrerequisiteOrigin::AssumedAll,
+        None,
+    );
+    let flow = WorkflowPrerequisiteFlow::new(engines, session, options);
+    let summary = flow
+        .preflight(&WorkflowPrerequisites::assume_all(), false)
+        .leader_summary();
+    if summary.trim().is_empty() {
+        return prompt;
+    }
+    format!(
+        "{prompt}\n\n## Workflow prerequisites\n\nWorkflow prerequisites for this run: {summary}\n\n\
+         awman supplies credentials to teardown steps automatically. Do not add a teardown step \
+         whose prerequisite is marked ✗; mention it in your verdict instead.\n"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1274,6 +1361,16 @@ mod tests {
 
     #[tokio::test]
     async fn squad_evaluation_survives_retained_workflow_frontend() {
+        evaluate_retained_frontend(false).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn squad_leader_cannot_redirect_the_generated_workflows_git_metadata() {
+        evaluate_retained_frontend(true).await;
+    }
+
+    async fn evaluate_retained_frontend(redirect_git: bool) {
         let temp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(temp.path().join(".awman")).unwrap();
         std::fs::write(
@@ -1305,7 +1402,35 @@ mod tests {
         std::fs::create_dir_all(&task_dir).unwrap();
         std::fs::create_dir_all(&run_log_dir).unwrap();
         let held = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let runtime = crate::engine::container::test_support::holding_runtime(held.clone());
+        let foreign = tempfile::tempdir().unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["init", "-q"])
+            .arg(foreign.path())
+            .status()
+            .unwrap()
+            .success());
+        let builds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen_builds = builds.clone();
+        let repo = temp.path().to_path_buf();
+        let foreign_git = foreign.path().join(".git");
+        let runtime = crate::engine::container::test_support::holding_runtime_with_hooks(
+            held.clone(),
+            "[[steps]]\nname = 'generated'\nagent = 'claude'\nprompt = 'work'\n",
+            Arc::new(|_| {}),
+            Arc::new(move |_| {
+                if seen_builds.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0
+                    && redirect_git
+                {
+                    std::fs::rename(repo.join(".git"), repo.join(".git-original")).unwrap();
+                    #[cfg(unix)]
+                    std::os::unix::fs::symlink(&foreign_git, repo.join(".git")).unwrap();
+                    #[cfg(not(unix))]
+                    let _ = &foreign_git;
+                }
+                Ok(())
+            }),
+            None,
+        );
         let mut engines = Engines::for_tests(temp.path());
         engines.runtime = runtime.clone();
         engines.container_runtime = Some(runtime.clone());
@@ -1338,6 +1463,14 @@ mod tests {
                 progress: Arc::new(crate::engine::squad::NoRunProgress),
             })
             .await;
+        if redirect_git {
+            let EvaluationOutcome::Failed { error, .. } = outcome else {
+                panic!("redirected repository was accepted");
+            };
+            assert!(error.contains("Git metadata layout changed"), "{error}");
+            assert_eq!(builds.load(std::sync::atomic::Ordering::SeqCst), 1);
+            return;
+        }
         assert!(
             matches!(outcome, EvaluationOutcome::WorkflowExecuted { .. }),
             "{}",
@@ -1352,6 +1485,11 @@ mod tests {
             .unwrap()
             .iter()
             .any(|message| message.text == "held runtime message"));
+        assert!(messages.lock().unwrap().iter().any(|message| {
+            message
+                .text
+                .contains("workflow prerequisite policy not set")
+        }));
     }
 
     // ── WI 0112 Part 6: the leader's exit and verdict decide together ──────
@@ -1430,6 +1568,7 @@ mod tests {
     fn task(agent: Option<&str>, model: Option<&str>) -> Task {
         let now = Utc::now();
         Task {
+            prerequisites: None,
             id: "id".into(),
             name: "issue-triage".into(),
             description: "when an issue opens, plan it".into(),
@@ -1610,7 +1749,7 @@ mod tests {
     #[test]
     fn generated_workflows_carry_the_unattended_guardrails_and_the_tasks_overlays() {
         let overlays = vec!["ssh()".to_string(), "env(GITHUB_TOKEN)".to_string()];
-        let flags = squad_workflow_flags(Path::new("/c/workflow.toml"), true, &overlays);
+        let flags = squad_workflow_flags(Path::new("/c/workflow.toml"), true, &overlays, None);
         assert!(
             flags.yolo,
             "an unattended agent must never block on a prompt"
@@ -1635,13 +1774,13 @@ mod tests {
         // A repository-backed task is always worktree-isolated, so two runs
         // touching one repo cannot collide…
         assert!(
-            squad_workflow_flags(Path::new("/c/workflow.toml"), true, &[]).worktree,
+            squad_workflow_flags(Path::new("/c/workflow.toml"), true, &[], None).worktree,
             "a repository-backed task must always be worktree-isolated"
         );
         // …and a directory workspace never is: there is no repository to
         // branch a worktree from, so the workspace is mounted directly.
         assert!(
-            !squad_workflow_flags(Path::new("/c/workflow.toml"), false, &[]).worktree,
+            !squad_workflow_flags(Path::new("/c/workflow.toml"), false, &[], None).worktree,
             "a directory-workspace task must never request a worktree"
         );
     }

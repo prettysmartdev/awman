@@ -60,6 +60,15 @@ pub(super) fn handle_dialog_submit(app: &mut App) {
             key_handler::handle_new_tab_path(app, &path);
         }
 
+        Some(Dialog::SecretInput { .. }) if is_command => {
+            if let Some(Dialog::SecretInput { buffer, .. }) = &mut app.active_dialog {
+                let secret = buffer.take();
+                app.send_dialog_response(DialogResponse::Secret(secret));
+            }
+            app.active_dialog = None;
+            app.command_dialog_active = false;
+        }
+
         Some(Dialog::MultilineInput { editor, .. }) if is_command => {
             let text = editor.text.clone();
             app.send_dialog_response(DialogResponse::Text(text));
@@ -365,6 +374,7 @@ pub(super) fn handle_dialog_cursor(app: &mut App, dir: CursorDir) {
 
 pub(super) fn handle_dialog_backspace(app: &mut App) {
     match &mut app.active_dialog {
+        Some(Dialog::SecretInput { buffer, .. }) => buffer.backspace(),
         Some(Dialog::TextInput { editor, .. }) | Some(Dialog::MultilineInput { editor, .. }) => {
             editor.backspace();
         }
@@ -633,6 +643,11 @@ pub(super) fn handle_dialog_char(app: &mut App, c: char) {
         }
 
         // ── Text input in dialogs ────────────────────────────────────
+        Some(Dialog::SecretInput { .. }) => {
+            if let Some(Dialog::SecretInput { buffer, .. }) = &mut app.active_dialog {
+                buffer.insert_char(c);
+            }
+        }
         Some(Dialog::TextInput { .. }) | Some(Dialog::MultilineInput { .. }) => {
             if let Some(Dialog::TextInput { editor, .. })
             | Some(Dialog::MultilineInput { editor, .. }) = &mut app.active_dialog

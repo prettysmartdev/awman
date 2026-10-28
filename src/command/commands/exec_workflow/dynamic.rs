@@ -165,6 +165,9 @@ pub(crate) struct DynamicExecution {
     lifecycle: Option<WorktreeLifecycle>,
     worktree_git_mount: Option<crate::engine::container::options::OverlaySpec>,
     skip_state_resume_prompt: bool,
+    /// Granted before the leader started (assume-all); narrowed to the
+    /// generated workflow in `execute_generated_workflow`.
+    prerequisites: Box<crate::command::commands::workflow_prerequisites::PreparedPrerequisites>,
     frontend: SharedWorkflowFrontend,
 }
 
@@ -267,7 +270,6 @@ impl ExecWorkflowCommand {
         frontend: Box<dyn ExecWorkflowCommandFrontend>,
     ) -> Result<ExecWorkflowOutcome, CommandError> {
         let mut frontend = SharedWorkflowFrontend::new(frontend);
-        frontend.with(|frontend| LaunchPolicy::for_session(&self.session).warn_config(frontend));
 
         // ── Effective (implied) flags: --dynamic forces --yolo, --worktree,
         //    and context(workflow) (WI-0092 §4). Computed once so all
@@ -306,6 +308,23 @@ impl ExecWorkflowCommand {
             number: wi_number,
             content: wi_content,
         };
+
+        // ── Workflow prerequisites BEFORE the leader (WI 0149). The workflow
+        //    does not exist yet, so assume it may use every teardown kind; the
+        //    grants are narrowed once the generated workflow validates.
+        let mut prerequisites = match self
+            .start_prerequisites(
+                &crate::data::workflow_prerequisites::WorkflowPrerequisites::assume_all(),
+                format!("dynamic-{wi_number:04}"),
+                &frontend,
+            )
+            .await?
+        {
+            PrerequisiteStart::Run(prepared) => prepared,
+            PrerequisiteStart::CheckOnly(outcome) => return Ok(outcome),
+        };
+
+        frontend.with(|frontend| LaunchPolicy::for_session(&self.session).warn_config(frontend));
 
         // ── Worktree prepare BEFORE launching the leader (WI-0092 §5). ──────
         let remote_clone = base_session.session_type().is_remote();
@@ -357,6 +376,7 @@ impl ExecWorkflowCommand {
                         ),
                     });
                     return Ok(ExecWorkflowOutcome {
+                        prerequisites: None,
                         workflow: format!("dynamic-{wi_number:04}"),
                         exit_code: None,
                         worktree_used: false,
@@ -393,6 +413,8 @@ impl ExecWorkflowCommand {
                 (None, git_root_for_scope.clone(), None, None)
             }
         };
+        // Pin the linked-worktree metadata before the leader can edit `.git`.
+        prerequisites.flow.set_worktree(worktree_path.clone());
         let mount_path = run_root.clone();
         let state_git_root = self.workflow_state_root_for(&run_root);
 
@@ -453,6 +475,7 @@ impl ExecWorkflowCommand {
                     // The resume prompt already asked; execute_prepared must
                     // not ask the same question in different words.
                     skip_state_resume_prompt: true,
+                    prerequisites,
                     frontend,
                 })
                 .await?;
@@ -587,6 +610,10 @@ impl ExecWorkflowCommand {
             max_concurrent_steps,
             dynamic_cfg.as_ref().and_then(|d| d.guidance.as_deref()),
         );
+        let leader_prompt = crate::data::dynamic_workflow_assets::substitute_workflow_prerequisites(
+            &leader_prompt,
+            &prerequisites.report.leader_summary(),
+        );
 
         // Record the run checkout's baseline so we can detect a leader that
         // illicitly modifies source files (WI-0092 §7 mutation guard).
@@ -665,6 +692,7 @@ impl ExecWorkflowCommand {
                         ),
                     });
                     return Ok(ExecWorkflowOutcome {
+                        prerequisites: None,
                         workflow: format!("dynamic-{wi_number:04}"),
                         exit_code: None,
                         worktree_used: worktree_path.is_some(),
@@ -741,6 +769,7 @@ impl ExecWorkflowCommand {
                 lifecycle,
                 worktree_git_mount,
                 skip_state_resume_prompt: false,
+                prerequisites,
                 frontend: shared,
             })
             .await?;
@@ -887,6 +916,7 @@ impl ExecWorkflowCommand {
             lifecycle,
             worktree_git_mount,
             skip_state_resume_prompt,
+            prerequisites,
             frontend,
         } = exec;
 
@@ -894,6 +924,40 @@ impl ExecWorkflowCommand {
         frontend.with(|frontend| {
             ensure_workflow_agents_approved(&workflow, &base_session, &effective_flags, frontend)
         })?;
+
+        // ── Narrow the assumed-all grants to what the generated workflow
+        //    really uses (WI 0149 §1): no SSH mount if nothing pushes. A newly
+        //    needed prerequisite is asked about again when a person is there.
+        let mut prerequisites = prerequisites;
+        prerequisites.flow.set_worktree(worktree_path.clone());
+        {
+            let PreparedPrerequisites {
+                flow,
+                grants,
+                redaction,
+                ..
+            } = &mut *prerequisites;
+            let narrowed = frontend.with(|frontend| {
+                flow.narrow_after_generation(&workflow, grants, redaction, frontend)
+            });
+            match narrowed {
+                Ok((needs, report)) => {
+                    prerequisites.needs = needs;
+                    prerequisites.report = report;
+                }
+                Err(e) => {
+                    frontend.with(|frontend| {
+                        frontend.write_message(UserMessage {
+                            level: MessageLevel::Error,
+                            text: format!("exec workflow: {e}"),
+                        })
+                    });
+                    return Err(e);
+                }
+            }
+        }
+        prerequisites.remotes = prerequisites.flow.remotes_for(&prerequisites.needs);
+        self.record_prerequisite_report(&prerequisites.report).await;
 
         // ── Build any missing agent images before execution (WI-0092 §9b). ──
         let resolved_agents =
@@ -954,6 +1018,7 @@ impl ExecWorkflowCommand {
             issue_temp_file: None,
             launch_modes,
             skip_state_resume_prompt,
+            prerequisites,
         };
         execute_prepared(
             &effective_flags,
@@ -986,6 +1051,7 @@ impl ExecWorkflowCommand {
             g.report_workflow_completed(&WorkflowOutcome::Cancelled);
         }
         ExecWorkflowOutcome {
+            prerequisites: None,
             workflow: format!("dynamic-{wi_number:04}"),
             exit_code: Some(crate::data::command_status::CANCELLED_EXIT_CODE),
             worktree_used,

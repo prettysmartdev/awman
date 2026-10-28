@@ -507,6 +507,37 @@ impl EffectiveConfig {
     }
 }
 
+impl EffectiveConfig {
+    pub fn prerequisite_policy(
+        &self,
+        context: super::workflows::PrerequisiteResolveContext,
+    ) -> super::workflows::PrerequisitePolicy {
+        use super::workflows::{PrerequisitePolicy, PrerequisitePolicyLayers};
+        PrerequisitePolicy::resolve(PrerequisitePolicyLayers {
+            global: self
+                .global
+                .workflows
+                .as_ref()
+                .and_then(|w| w.prerequisites.as_ref()),
+            squad_global: self
+                .flags
+                .squad_prerequisites
+                .then_some(())
+                .and(self.global.squad.as_ref())
+                .and_then(|s| s.workflows.as_ref())
+                .and_then(|w| w.prerequisites.as_ref()),
+            repo: self
+                .repo
+                .workflows
+                .as_ref()
+                .and_then(|w| w.prerequisites.as_ref()),
+            task: self.flags.squad_task_prerequisites.as_ref(),
+            flags: &self.flags.prerequisites,
+            context,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2097,5 +2128,30 @@ mod tests {
             EffectiveConfig::default().runtime_selection(),
             Ok(RuntimeSelection::Docker)
         );
+    }
+}
+
+#[cfg(test)]
+mod squad_prerequisite_review_tests {
+    use super::*;
+    #[test]
+    fn squad_defaults_apply_without_a_stored_task_policy_and_only_to_squad_runs() {
+        let global: GlobalConfig = serde_json::from_value(serde_json::json!({"squad":{"workflows":{"prerequisites":{"ssh":{"use":"deny"},"unresolved":"warn"}}}})).unwrap();
+        for squad in [true, false] {
+            let config = EffectiveConfig::new(
+                FlagConfig {
+                    squad_prerequisites: squad,
+                    ..Default::default()
+                },
+                EnvSnapshot::default(),
+                RepoConfig::default(),
+                global.clone(),
+            );
+            let policy = config.prerequisite_policy(Default::default());
+            assert_eq!(
+                policy.ssh.use_ == crate::data::config::workflows::CredentialUse::Deny,
+                squad
+            );
+        }
     }
 }

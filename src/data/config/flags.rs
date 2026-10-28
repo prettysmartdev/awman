@@ -14,6 +14,9 @@ use crate::data::config::repo::LaunchMode;
 /// Every field is `None` when the user did not pass the corresponding flag.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct FlagConfig {
+    pub prerequisites: PrerequisiteFlags,
+    pub squad_prerequisites: bool,
+    pub squad_task_prerequisites: Option<super::workflows::PrerequisitePolicy>,
     /// Override the working directory.
     pub working_dir: Option<PathBuf>,
     /// Override the agent name (`--agent <name>`).
@@ -55,5 +58,63 @@ impl FlagConfig {
     /// Construct an empty flag set (all fields `None`).
     pub fn new() -> Self {
         Self::default()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IdentityFlag {
+    Host,
+    Fixed { name: String, email: String },
+    Deny,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SshFlag {
+    Key(PathBuf),
+    All,
+    Deny,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TokenFlag {
+    Env(String),
+    Acquire,
+    Secret(String),
+    Deny,
+}
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PrerequisiteFlags {
+    pub identity: Option<IdentityFlag>,
+    pub ssh: Option<SshFlag>,
+    pub token: Option<TokenFlag>,
+    pub unresolved: Option<super::workflows::UnresolvedMode>,
+    pub check_only: bool,
+}
+impl PrerequisiteFlags {
+    pub fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
+    pub fn widens(&self) -> Vec<&'static str> {
+        let mut flags = vec![];
+        if self
+            .identity
+            .as_ref()
+            .is_some_and(|f| !matches!(f, IdentityFlag::Deny))
+        {
+            flags.push("--prerequisite-identity");
+        }
+        if self
+            .ssh
+            .as_ref()
+            .is_some_and(|f| !matches!(f, SshFlag::Deny))
+        {
+            flags.push("--prerequisite-ssh");
+        }
+        if self
+            .token
+            .as_ref()
+            .is_some_and(|f| !matches!(f, TokenFlag::Deny))
+        {
+            flags.push("--prerequisite-token");
+        }
+        flags
     }
 }

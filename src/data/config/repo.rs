@@ -81,6 +81,8 @@ pub struct ApiConfig {
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct SquadConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflows: Option<super::workflows::WorkflowsConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agents_to_models: Option<HashMap<String, Vec<String>>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -99,6 +101,13 @@ pub struct SquadConfig {
 
 impl SquadConfig {
     pub fn validate(&self) -> Result<(), DataError> {
+        if let Some(p) = self
+            .workflows
+            .as_ref()
+            .and_then(|w| w.prerequisites.as_ref())
+        {
+            p.validate(super::workflows::ConfigScope::Global)?;
+        }
         if let Some(n) = self.max_concurrent_evaluations {
             if n < 1 {
                 return Err(DataError::Other(
@@ -148,6 +157,7 @@ impl SquadConfig {
     /// coherent meaning. It is always the base's.
     pub fn layered_over(&self, base: &SquadConfig) -> SquadConfig {
         SquadConfig {
+            workflows: self.workflows.clone().or_else(|| base.workflows.clone()),
             agents_to_models: self
                 .agents_to_models
                 .clone()
@@ -466,6 +476,10 @@ pub struct WorktreeConfig {
 /// Per-repository configuration stored at `<git_root>/.awman/config.json`.
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RepoConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflows: Option<super::workflows::WorkflowsConfig>,
+    #[serde(skip)]
+    pub load_warnings: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -537,7 +551,7 @@ impl RepoConfig {
             return Ok(Self::default());
         }
         let content = std::fs::read_to_string(&path).map_err(|e| DataError::io(&path, e))?;
-        let cfg: Self =
+        let mut cfg: Self =
             serde_json::from_str(&content).map_err(|e| DataError::config_parse(&path, e))?;
         // Layer 0 semantic validation of the dynamicWorkflows section (WI-0095):
         // schema shape that serde cannot express is enforced here so malformed
@@ -557,6 +571,17 @@ impl RepoConfig {
         }
         if let Some(agent_flags) = &cfg.agent_flags {
             validate_agent_flags(agent_flags)?;
+        }
+        if let Some(prerequisites) = cfg
+            .workflows
+            .as_ref()
+            .and_then(|w| w.prerequisites.as_ref())
+        {
+            cfg.load_warnings.extend(
+                prerequisites
+                    .validate(super::workflows::ConfigScope::Repo)
+                    .map_err(|e| DataError::Other(format!("{}: {e}", path.display())))?,
+            );
         }
         Ok(cfg)
     }
@@ -1331,6 +1356,7 @@ mod tests {
     #[test]
     fn squad_config_uses_camel_case_and_validates_shared_agent_rules() {
         let config = SquadConfig {
+            workflows: None,
             agents_to_models: Some(HashMap::from([(
                 "claude".to_string(),
                 vec!["claude-opus-4-8".to_string()],
@@ -1376,6 +1402,7 @@ mod tests {
     #[test]
     fn a_task_squad_block_overrides_the_global_one_field_by_field() {
         let global = SquadConfig {
+            workflows: None,
             agents_to_models: Some(HashMap::from([(
                 "claude".to_string(),
                 vec!["claude-opus-4-8".to_string()],
@@ -1436,6 +1463,7 @@ mod tests {
     #[test]
     fn an_empty_task_block_inherits_the_whole_global_block() {
         let global = SquadConfig {
+            workflows: None,
             agents_to_models: Some(HashMap::from([(
                 "claude".to_string(),
                 vec!["claude-opus-4-8".to_string()],

@@ -67,7 +67,11 @@ pub struct Prompt<D> {
     /// | `prompts::agent_trust_confirm` | `Decline` | Walking away from an approval is a refusal; a dismissal must never trust a definition. |
     /// | `prompts::dockerfile_setup` | `CreateNew` | The only choice that leaves `init` able to finish, it matches every headless profile, and it writes a file the user can replace or delete. |
     ///
-    /// Everything else is `None`: `work_item_kind`, `squad_task_workspace`
+    /// | `prompts::prerequisite_identity`, `_identity_persist` | `Continue`, `RunOnly` | Dismissal grants or persists nothing. |
+    /// | `prompts::prerequisite_ssh`, `_token_consent`, `_token_source`, `_acquire_approval` | Decline | Credentials and host commands require explicit consent. |
+    /// | `prompts::prerequisite_missing_tool`, `_gap`, `_report` | Continue | Esc leaves the run decision to the unresolved policy; summary Ctrl-C explicitly aborts. |
+    ///
+    /// Interview prompts are `None`: `work_item_kind`, `squad_task_workspace`
     /// and `squad_task_mount_scope` are interview steps whose answers are
     /// captured once and bind everything afterwards, so a dismissal must not
     /// answer them.
@@ -159,11 +163,23 @@ pub struct TextPrompt {
     /// What an empty submission means. `None` makes an empty submission an
     /// error rather than an answer.
     pub default: Option<String>,
+    /// The frontend conceals typed characters and does not retain input history.
+    pub masked: bool,
 }
 
 impl TextPrompt {
+    pub fn masked(title: impl Into<String>, body: impl Into<String>) -> Self {
+        Self {
+            title: title.into(),
+            body: body.into(),
+            default: None,
+            masked: true,
+        }
+    }
+
     pub fn new(title: impl Into<String>, body: impl Into<String>, default: Option<String>) -> Self {
         Self {
+            masked: false,
             title: title.into(),
             body: body.into(),
             default,
@@ -261,5 +277,23 @@ mod tests {
     #[should_panic(expected = "at least one answer")]
     fn a_prompt_with_no_answers_is_a_programming_error() {
         Prompt::<Answer>::new("Proceed?", "", Vec::new(), None);
+    }
+}
+
+#[cfg(test)]
+mod masked_tests {
+    use super::*;
+
+    #[test]
+    fn masked_text_prompt_constructor() {
+        let prompt = TextPrompt::masked("GitHub token", "Paste a token");
+        assert!(prompt.masked);
+        assert_eq!(prompt.default, None);
+        assert_eq!(prompt.title, "GitHub token");
+        // No default: an empty submission is an error, never an empty secret.
+        assert_eq!(prompt.resolve(""), None);
+        assert_eq!(prompt.resolve("  ghp_x  "), Some("ghp_x".into()));
+        assert!(!TextPrompt::new("t", "b", None).masked);
+        assert!(!TextPrompt::new("t", "b", Some("d".into())).masked);
     }
 }

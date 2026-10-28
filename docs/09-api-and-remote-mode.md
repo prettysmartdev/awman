@@ -1032,10 +1032,21 @@ curl -s -X POST http://localhost:9876/v1/commands \
   -H 'Authorization: Bearer <api-key>' \
   -H 'x-awman-session: <session-id>' \
   -H 'Content-Type: application/json' \
-  -d '{"subcommand":"exec workflow","args":["./aspec/workflows/implement-feature.toml","--work-item","0053"]}'
+  -d '{"subcommand":"exec workflow","args":["./aspec/workflows/implement-feature.toml","--work-item","0053","--prerequisite-unresolved","warn"]}'
 ```
 
+Workflow prerequisite options are passed in the same `args` array as CLI
+flags: `--prerequisite-identity`, `--prerequisite-ssh`,
+`--prerequisite-token`, and `--prerequisite-unresolved`. Use
+`--check-prerequisites` to return the prerequisite report without starting the
+workflow. API commands are non-interactive: flags can grant a specific choice,
+but the API caller cannot silently widen the configured credential policy.
+Set global `workflows.prerequisites.allowApiClientGrants` to `true` only if API
+clients should be allowed to grant credentials beyond the normal policy.
+
 **Workflow files:** For `exec workflow`, the workflow file path is specified as a positional argument relative to the session's working directory (same format as the CLI). The file must exist within the session's working directory and be a valid TOML or YAML workflow definition. Workflow files are never passed as inline JSON — always use file paths.
+
+Invalid prerequisite syntax and unsupported `secret:NAME` return HTTP 400 at admission. Credential-widening requests return HTTP 403 unless globally authorized. Accepted responses include the secret-free resolved policy in `flags_applied.prerequisites`.
 
 Returns immediately with a command UUID — the command is **enqueued** and execution is asynchronous:
 
@@ -1229,7 +1240,7 @@ curl -N -H 'Authorization: Bearer <api-key>' \
 `awman remote exec --follow` uses this endpoint internally. The cURL form above is equivalent and is useful in scripts where the awman binary is unavailable on the client.
 
 **Structured events:** each event frame carries a named `event:` type (`stdout_line`,
-`stderr_line`, `status_message`, `workflow_step_transition`,
+`stderr_line`, `status_message`, `workflow_prerequisites`, `workflow_step_transition`,
 `workflow_phase_transition`, `workflow_parallel_step_launched`,
 `workflow_parallel_step_exited`, `workflow_parallel_group_finished`,
 `command_status`, `done`) and a JSON `data:` payload, so a client that wants
@@ -1259,6 +1270,14 @@ setup or teardown phase step. Its `phase` is `setup`, `main`, or `teardown`,
 `step_desc` identifies the phase step, and `status` reports its transition.
 Setup and teardown transitions let clients track those phases independently of
 the main `workflow_step_transition` events.
+
+`workflow_prerequisites` carries a `WorkflowPrerequisites` report with its
+phase (`start` or `before_teardown`) and check results. The start report is
+emitted before workflow step events; a second report is emitted before
+non-cancelled teardown when awman rechecks granted credentials. If prerequisite
+policy requires a missing check to fail, the command ends with HTTP status 409
+and error stage `workflow_prerequisites`; the response includes the report so
+the client can show what needs attention.
 
 #### Get session queue status
 

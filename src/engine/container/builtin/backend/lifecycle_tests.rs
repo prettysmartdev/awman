@@ -81,6 +81,7 @@ pub(super) fn background<'a>(
     overlays: &'a [OverlaySpec],
 ) -> BackgroundLaunchRequest<'a> {
     BackgroundLaunchRequest {
+        secret_env: &[],
         name: None,
         image,
         workdir,

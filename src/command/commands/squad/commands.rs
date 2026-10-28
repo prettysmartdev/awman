@@ -65,7 +65,12 @@ pub struct SquadServeConfig {
 }
 
 #[async_trait]
-pub trait SquadCommandFrontend: UserMessageSink + Send + Sync {
+pub trait SquadCommandFrontend:
+    UserMessageSink
+    + crate::command::commands::workflow_prerequisites::WorkflowPrerequisiteFrontend
+    + Send
+    + Sync
+{
     /// The unattended frontends the daemon's evaluator drives leader agents
     /// and workflows with. Only the host that can actually serve the daemon
     /// supplies them; every other frontend answers `None` and is refused a
@@ -576,6 +581,7 @@ fn squad_add_request(ctx: &BuildContext) -> Result<SquadAddRequest, CommandError
                 &ctx.path(),
                 ctx.flags.strs("agent-models"),
             )?,
+            prerequisites: squad_prerequisite_policy(ctx)?,
         }),
     })
 }
@@ -631,7 +637,52 @@ fn squad_update(ctx: &BuildContext) -> Result<UpdateTask, CommandError> {
         model,
         overlays,
         agents_to_models,
+        prerequisites: squad_prerequisite_policy(ctx)?,
     })
+}
+
+/// The task policy the `--prerequisite-*` flags of `squad add` / `squad edit`
+/// describe (WI 0149), or `None` when none was given. Decisions only: no flag
+/// can carry a credential value or define a host command.
+///
+/// A request arriving through the API server may only narrow what that
+/// server's global policy grants (`allowApiClientGrants`). The squad daemon's
+/// own routes are authenticated with the user's squad key, and a stored
+/// policy grants nothing until the daemon runs the task, so they are not
+/// checked again there.
+fn squad_prerequisite_policy(
+    ctx: &BuildContext,
+) -> Result<Option<crate::data::config::workflows::PrerequisitePolicy>, CommandError> {
+    use crate::command::commands::workflow_prerequisites as prerequisites;
+    let flags = prerequisites::parse_prerequisite_flags(ctx, false)?;
+    if flags.is_empty() {
+        return Ok(None);
+    }
+    if !ctx.caller.frontend().is_local_user() {
+        let mut session = ctx.session.clone();
+        let mut config = session.flags().clone();
+        config.squad_prerequisites = true;
+        session.set_flags(config);
+        prerequisites::check_flag_widening(
+            ctx.caller.frontend(),
+            &flags,
+            &prerequisites::policy_for(&session, &Default::default(), None),
+        )?;
+    }
+    let mut policy = crate::data::config::workflows::PrerequisitePolicy::from_flags(&flags);
+    if !ctx.caller.frontend().is_local_user() {
+        use crate::data::config::workflows::PolicySource;
+        for source in [
+            &mut policy.git_identity.source,
+            &mut policy.ssh.source,
+            &mut policy.github_token.source,
+        ] {
+            if *source != PolicySource::Default {
+                *source = PolicySource::RemoteTask;
+            }
+        }
+    }
+    Ok(Some(policy))
 }
 
 #[async_trait]
@@ -727,6 +778,15 @@ impl Command for SquadCommand {
                                 &engines.global_config,
                             )?,
                         };
+                        let mut req = req;
+                        if req.prerequisites.is_none() && !request.non_interactive {
+                            req.prerequisites = ask_task_prerequisites(
+                                frontend.as_mut(),
+                                &engines,
+                                local_user,
+                                &req.workspace,
+                            )?;
+                        }
                         let task = gateway.create(req).await?;
                         warn_unmet_env(frontend.as_mut(), &task, TaskChange::Created);
                         Ok(SquadOutcome::Task(task))
@@ -751,6 +811,29 @@ impl Command for SquadCommand {
                         } else {
                             update
                         };
+                        let mut update = update;
+                        if interview {
+                            // The same prerequisite questions as `squad add`, against
+                            // the task's own workspace (WI 0149).
+                            let current = gateway.get(&name).await?;
+                            if let Some(policy) = ask_task_prerequisites(
+                                frontend.as_mut(),
+                                &engines,
+                                local_user,
+                                &TaskWorkspace::Custom(current.repo_scope.clone()),
+                            )? {
+                                update.prerequisites = Some(policy);
+                            }
+                        } else if let Some(edit) = update.prerequisites.take() {
+                            // A flag changes only the credential it names.
+                            let current = gateway.get(&name).await?;
+                            update.prerequisites = Some(match &current.prerequisites {
+                                Some(stored) => crate::command::commands::workflow_prerequisites::edit_task_policy(
+                                    stored, &edit,
+                                ),
+                                None => edit,
+                            });
+                        }
                         // Refusing an empty edit is the point: a request that
                         // changes nothing would otherwise report success while
                         // only moving `updated_at`.
@@ -840,6 +923,36 @@ impl Command for SquadCommand {
 /// including the workspace choice and the overlay loop — has been answered. An
 /// interview abandoned partway (Ctrl-C, a dismissed dialog) propagates its
 /// error out of this function, so a partial task can never be written.
+/// The workflow prerequisite questions for a squad task (WI 0149 §6), asked
+/// only when a person is at the frontend. Run against the task's workspace
+/// with every teardown kind assumed; the answers become the task's stored
+/// policy (decisions only). `None` leaves the policy unset.
+fn ask_task_prerequisites(
+    frontend: &mut dyn SquadCommandFrontend,
+    engines: &Engines,
+    local_user: bool,
+    workspace: &TaskWorkspace,
+) -> Result<Option<crate::data::config::workflows::PrerequisitePolicy>, CommandError> {
+    if !local_user || !frontend.can_ask_prerequisites() {
+        return Ok(None);
+    }
+    let dir = match workspace {
+        TaskWorkspace::Custom(path) if path.is_dir() => path.clone(),
+        // The default workspace does not exist yet; the questions are about
+        // the host's keys and tokens, so the current directory stands in.
+        _ => match std::env::current_dir() {
+            Ok(dir) => dir,
+            Err(_) => return Ok(None),
+        },
+    };
+    crate::command::commands::workflow_prerequisites::collect_task_prerequisites(
+        engines,
+        crate::command::dispatch::catalogue::FrontendKind::Cli,
+        &dir,
+        frontend,
+    )
+}
+
 fn collect_task_interview(
     frontend: &mut dyn SquadCommandFrontend,
     git_engine: &GitEngine,
@@ -876,6 +989,9 @@ fn collect_task_interview(
         model,
         overlays,
         agents_to_models,
+        // Asked after the interview by `ask_task_prerequisites`, which needs the
+        // resolved workspace.
+        prerequisites: None,
     })
 }
 
@@ -1194,6 +1310,10 @@ mod workspace_choice_tests {
         fn replay_queued(&mut self) {}
     }
 
+    impl crate::command::commands::workflow_prerequisites::WorkflowPrerequisiteFrontend
+        for WorkspaceFrontend
+    {
+    }
     #[async_trait]
     impl SquadCommandFrontend for WorkspaceFrontend {
         fn ask_task_workspace_choice(
@@ -1316,6 +1436,10 @@ mod scripted_workspace_scope_tests {
         fn replay_queued(&mut self) {}
     }
 
+    impl crate::command::commands::workflow_prerequisites::WorkflowPrerequisiteFrontend
+        for RefusingLocalFrontend
+    {
+    }
     #[async_trait]
     impl SquadCommandFrontend for RefusingLocalFrontend {
         fn confirm_parent_directory_workspace(
@@ -1337,6 +1461,10 @@ mod scripted_workspace_scope_tests {
         fn replay_queued(&mut self) {}
     }
 
+    impl crate::command::commands::workflow_prerequisites::WorkflowPrerequisiteFrontend
+        for DaemonFrontend
+    {
+    }
     #[async_trait]
     impl SquadCommandFrontend for DaemonFrontend {}
 
@@ -1604,12 +1732,17 @@ mod unmet_env_warning_tests {
         fn replay_queued(&mut self) {}
     }
 
+    impl crate::command::commands::workflow_prerequisites::WorkflowPrerequisiteFrontend
+        for RecordingFrontend
+    {
+    }
     #[async_trait]
     impl SquadCommandFrontend for RecordingFrontend {}
 
     fn task(name: &str, unmet: &[&str]) -> Task {
         let now = Utc::now();
         Task {
+            prerequisites: None,
             id: name.into(),
             name: name.into(),
             description: "a task".into(),
@@ -1713,5 +1846,90 @@ mod unmet_env_warning_tests {
     fn nothing_is_written_when_the_returned_task_has_no_unmet_name() {
         assert!(warn(&task("nightly-triage", &[]), TaskChange::Created).is_empty());
         assert!(warn(&task("nightly-triage", &[]), TaskChange::Updated).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod wi0149_tests {
+    use super::super::gateway::{LocalTaskGateway, SharedTaskGateway};
+    use super::*;
+    use crate::data::config::flags::{PrerequisiteFlags, SshFlag};
+    use crate::data::config::workflows::{CredentialUse, PrerequisitePolicy};
+    use crate::data::fs::{task_store::TaskStore, SquadPaths};
+    use crate::data::message::{UserMessage, UserMessageSink};
+    use crate::engine::squad::{env_state::DaemonEnvState, scheduler::SchedulerStatus};
+    use std::sync::{Arc, Mutex};
+    #[derive(Default)]
+    struct Frontend;
+    impl UserMessageSink for Frontend {
+        fn write_message(&mut self, _: UserMessage) {}
+        fn replay_queued(&mut self) {}
+    }
+    impl crate::command::commands::workflow_prerequisites::WorkflowPrerequisiteFrontend for Frontend {}
+    #[async_trait]
+    impl SquadCommandFrontend for Frontend {}
+    #[tokio::test]
+    async fn wi0149_squad_add_ssh_deny_round_trips_to_show_decisions_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engines = Engines::for_tests(tmp.path());
+        let store = Arc::new(TaskStore::open(&tmp.path().join("tasks.db")).unwrap());
+        store.migrate().unwrap();
+        let gateway: Arc<dyn TaskGateway> = Arc::new(LocalTaskGateway::new(
+            store,
+            engines.clone(),
+            Arc::new(Mutex::new(SchedulerStatus::default())),
+            SquadPaths::from_root(tmp.path().join("squad")),
+            Arc::new(DaemonEnvState::without_store()),
+        ));
+        let policy = PrerequisitePolicy::from_flags(&PrerequisiteFlags {
+            ssh: Some(SshFlag::Deny),
+            ..Default::default()
+        });
+        let request = CreateTask {
+            name: "prerequisite-test".into(),
+            description: "test".into(),
+            workspace: TaskWorkspace::Default,
+            mount_scope: crate::data::fs::task_store::MountScope::Directory,
+            interval_secs: 60,
+            agent: None,
+            model: None,
+            overlays: vec![],
+            agents_to_models: Default::default(),
+            prerequisites: Some(policy),
+        };
+        let result = SquadCommand::new(
+            SquadSubcommand::Add(SquadAddRequest {
+                interview: false,
+                non_interactive: true,
+                prefilled: Some(request),
+            }),
+            Some(Box::new(SharedTaskGateway(gateway.clone()))),
+            engines.clone(),
+        )
+        .run_with_frontend(Box::new(Frontend))
+        .await
+        .unwrap();
+        assert!(matches!(result, SquadOutcome::Task(_)));
+        let shown = SquadCommand::new(
+            SquadSubcommand::Show("prerequisite-test".into()),
+            Some(Box::new(SharedTaskGateway(gateway))),
+            engines,
+        )
+        .run_with_frontend(Box::new(Frontend))
+        .await
+        .unwrap();
+        let SquadOutcome::Detail(detail) = shown else {
+            panic!("{shown:?}");
+        };
+        let policy = detail.task.prerequisites.unwrap();
+        assert_eq!(policy.ssh.use_, CredentialUse::Deny);
+        assert!(
+            crate::command::commands::workflow_prerequisites::policy_lines(&policy)
+                .iter()
+                .any(|line| line.to_lowercase().contains("ssh") && line.contains("deny"))
+        );
+        assert!(!serde_json::to_string(&policy)
+            .unwrap()
+            .contains("ghp_fake_wi0149"));
     }
 }

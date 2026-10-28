@@ -380,3 +380,30 @@ mod tests {
         assert!(create_private_dir(&link).is_err());
     }
 }
+
+/// A bounded approval read validates ownership, links and permissions on the
+/// opened descriptor. Cache readers deliberately retain their separate policy.
+pub fn read_private_approval_json<T: DeserializeOwned>(
+    path: &Path,
+    max_bytes: u64,
+) -> Result<Option<T>, DataError> {
+    use std::io::Read;
+    let Some(file) = open_private(path, false, false)? else {
+        return Ok(None);
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if file.metadata().map_err(|e| io_err(path, e))?.mode() & 0o777 != 0o600 {
+            return Ok(None);
+        }
+    }
+    let mut bytes = Vec::new();
+    file.take(max_bytes + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| io_err(path, e))?;
+    if bytes.len() as u64 > max_bytes {
+        return Ok(None);
+    }
+    Ok(serde_json::from_slice(&bytes).ok())
+}

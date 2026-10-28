@@ -94,6 +94,7 @@ fn start_background_sizes_and_confines_each_launch_by_its_own_settings() {
         let id = rig
             .backend
             .start_background(&BackgroundLaunchRequest {
+                secret_env: &[],
                 builtin_launch: Some(&launch),
                 ..background("agent:latest", work.path(), &env, &[])
             })
@@ -134,6 +135,7 @@ fn a_launch_without_session_settings_fails_closed_on_every_path() {
     let error = rig
         .backend
         .start_background(&BackgroundLaunchRequest {
+            secret_env: &[],
             builtin_launch: None,
             ..background("agent:latest", work.path(), &env, &[])
         })
@@ -180,6 +182,7 @@ fn a_repo_state_dir_other_than_the_process_one_fails_that_launch_only() {
     let env = HashMap::new();
     assert!(matches!(
         rig.backend.start_background(&BackgroundLaunchRequest {
+            secret_env: &[],
             builtin_launch: Some(&foreign),
             ..background("agent:latest", work.path(), &env, &[])
         }),

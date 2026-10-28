@@ -95,6 +95,7 @@ impl RecordingGateway {
 fn task(name: &str) -> Task {
     let now = chrono::Utc::now();
     Task {
+        prerequisites: None,
         id: format!("task-{name}"),
         name: name.to_string(),
         description: "recorded task".into(),
@@ -427,7 +428,7 @@ async fn cli_and_tui_same_argv_build_squad_and_issue_the_same_gateway_sequence()
     let env = helpers::IsolatedEnv::new();
     let session = env.open_session();
     for raw in [
-        "squad add --name parity --description desc --repo /not/validated --interval 60",
+        "squad add --name parity --description desc --repo /not/validated --interval 60 --prerequisite-identity deny --prerequisite-ssh deny --prerequisite-token deny",
         "squad list",
         "squad show parity",
         "squad remove parity",

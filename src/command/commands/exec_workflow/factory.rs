@@ -104,6 +104,12 @@ impl UserMessageSink for AgentFrontendProxy {
 // Implements `AgentExecutionFactory` for the workflow engine. Builds a
 // container instance from per-step parameters + command flags, then binds a
 // `AgentFrontendProxy` to it via `run_with_frontend`.
+//
+// Workflow prerequisite grants (WI 0149) are deliberately not a field and
+// never passed in: this factory launches main agent steps, the dynamic leader
+// and `on_failure` remediation agents (`launch_on_failure_agent`), none of
+// which may receive the user's SSH key, token or identity. Grants reach only
+// setup/teardown containers, through `apply_grant_overlays` in `prepare.rs`.
 
 pub(crate) struct CommandLayerFactory {
     pub(crate) shared: SharedWorkflowFrontend,

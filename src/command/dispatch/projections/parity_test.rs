@@ -878,6 +878,7 @@ fn every_catalogue_command_leaf_is_buildable_by_dispatch() {
         &["agents"],
         &["specs"],
         &["config"],
+        &["config", "prerequisite-grants"],
         &["exec"],
         &["api"],
         &["remote"],
@@ -915,5 +916,62 @@ fn every_catalogue_command_leaf_is_buildable_by_dispatch() {
                 result.err().map(|e| e.to_string()).unwrap_or_default()
             );
         }
+    }
+}
+
+#[test]
+fn wi0149_prerequisite_flags_parse_identically_in_cli_tui_and_api() {
+    let cat = CommandCatalogue::get();
+    let args = [
+        "wf.toml",
+        "--prerequisite-identity",
+        "Ada <ada@example.com>",
+        "--prerequisite-ssh",
+        "deny",
+        "--prerequisite-token",
+        "env:GH_TOKEN",
+        "--prerequisite-unresolved",
+        "fail",
+        "--check-prerequisites",
+    ];
+    let spec = cat.lookup(&["exec", "workflow"]).unwrap();
+    let cli = clap_leaf(cat, &["exec", "workflow"], &args);
+    let api = cat
+        .parse_raw_args(&["exec", "workflow"], &to_vec(&args))
+        .unwrap();
+    let tui = crate::command::dispatch::parsed_input::parse(
+        &format!("exec workflow {}", shell_words::join(args)),
+        cat,
+    )
+    .unwrap();
+    let api_typed = api
+        .clone()
+        .into_command_box_input(spec, vec!["exec".into(), "workflow".into()]);
+    assert_eq!(tui, api_typed);
+    for name in [
+        "prerequisite-identity",
+        "prerequisite-ssh",
+        "prerequisite-token",
+        "prerequisite-unresolved",
+        "check-prerequisites",
+    ] {
+        let flag = spec.find_flag(name).unwrap();
+        assert!(matches!(flag.frontends, FrontendVisibility::All));
+        assert_eq!(clap_flag(&cli, flag), raw_flag(&api, flag), "{name}");
+    }
+    for path in [["squad", "add"], ["squad", "edit"]] {
+        let spec = cat.lookup(&path).unwrap();
+        for name in [
+            "prerequisite-identity",
+            "prerequisite-ssh",
+            "prerequisite-token",
+            "prerequisite-unresolved",
+        ] {
+            assert!(matches!(
+                spec.find_flag(name).unwrap().frontends,
+                FrontendVisibility::All
+            ));
+        }
+        assert!(spec.find_flag("check-prerequisites").is_none());
     }
 }

@@ -411,6 +411,79 @@ pub(super) const EXEC_WORKFLOW_TRAILING_FLAGS: [FlagSpec; 7] = [
     },
 ];
 
+/// The workflow prerequisite grant flags (WI 0149), shared by `exec workflow`
+/// and `squad add` / `squad edit`.
+///
+/// A value is an explicit grant or denial, so the matching question is not
+/// asked, on a TTY too. `--yes` never grants a credential. Visible to every
+/// frontend so the same flags parse identically from CLI args, the TUI
+/// command box and API `args`; an API or squad-daemon client is refused a
+/// value that grants beyond the server's global policy.
+pub(super) const PREREQUISITE_GRANT_FLAGS: [FlagSpec; 4] = [
+    FlagSpec {
+        long: "prerequisite-identity",
+        short: None,
+        help: "Git identity for commit_changes: host (your global git identity), \
+               \"Name <email>\", or deny. Never granted by --yes.",
+        kind: FlagKind::OptionalString,
+        default: FlagDefault::None,
+        frontends: FrontendVisibility::All,
+        conflicts_with: &[],
+        implies: &[],
+        optional: true,
+    },
+    FlagSpec {
+        long: "prerequisite-ssh",
+        short: None,
+        help: "SSH key for push_branch: a key path under ~/.ssh (mounted read-only), \
+               all (the whole ~/.ssh), or deny. Never granted by --yes.",
+        kind: FlagKind::OptionalString,
+        default: FlagDefault::None,
+        frontends: FrontendVisibility::All,
+        conflicts_with: &[],
+        implies: &[],
+        optional: true,
+    },
+    FlagSpec {
+        long: "prerequisite-token",
+        short: None,
+        help: "GitHub token for create_pull_request, an HTTPS push_branch and poll_ci: \
+               env:NAME, acquire (the configured token command), or deny. Never granted by --yes.",
+        kind: FlagKind::OptionalString,
+        default: FlagDefault::None,
+        frontends: FrontendVisibility::All,
+        conflicts_with: &[],
+        implies: &[],
+        optional: true,
+    },
+    FlagSpec {
+        long: "prerequisite-unresolved",
+        short: None,
+        help: "What an unsatisfied workflow prerequisite does: warn and continue, or fail \
+               before any container starts.",
+        kind: FlagKind::Enum(&["warn", "fail"]),
+        default: FlagDefault::None,
+        frontends: FrontendVisibility::All,
+        conflicts_with: &[],
+        implies: &[],
+        optional: true,
+    },
+];
+
+/// `exec workflow --check-prerequisites` (WI 0149).
+pub(super) const CHECK_PREREQUISITES_FLAG: [FlagSpec; 1] = [FlagSpec {
+    long: "check-prerequisites",
+    short: None,
+    help: "Run only the workflow prerequisite checks, print the report and exit 0 when \
+           all checks are satisfied or 1 when any check is missing, needs consent or is unknown.",
+    kind: FlagKind::Bool,
+    default: FlagDefault::Bool(false),
+    frontends: FrontendVisibility::All,
+    conflicts_with: &[],
+    implies: &[],
+    optional: true,
+}];
+
 /// Agent-run flags for `exec workflow`.
 ///
 /// Derived rather than copied (WI 0114 F-51). Unlike `exec prompt` this is not
@@ -418,12 +491,25 @@ pub(super) const EXEC_WORKFLOW_TRAILING_FLAGS: [FlagSpec; 7] = [
 /// base run, so the base set is spliced rather than concatenated. The order is
 /// exactly what the literal had, because it is the order `--help` and the
 /// generated command reference print.
-pub(super) const EXEC_WORKFLOW_FLAGS: [FlagSpec; 19] = concat_flags(&[
+pub(super) const EXEC_WORKFLOW_FLAGS: [FlagSpec; 25] = concat_flags(&[
     &EXEC_WORKFLOW_LEADING_FLAGS,
     AGENT_RUN_BEFORE_WORKTREE,
     &EXEC_WORKFLOW_WORKTREE_FLAG,
     AGENT_RUN_AFTER_WORKTREE,
     &EXEC_WORKFLOW_TRAILING_FLAGS,
+    &PREREQUISITE_GRANT_FLAGS,
+    &CHECK_PREREQUISITES_FLAG,
+    &[FlagSpec {
+        long: "json",
+        short: None,
+        help: "Print the workflow outcome and prerequisite report as JSON.",
+        kind: FlagKind::Bool,
+        default: FlagDefault::Bool(false),
+        frontends: FrontendVisibility::All,
+        conflicts_with: &[],
+        implies: &["non-interactive"],
+        optional: true,
+    }],
 ]);
 
 /// The three base flags `exec workflow` declares differently.
