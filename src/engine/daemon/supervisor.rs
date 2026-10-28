@@ -362,6 +362,9 @@ pub(crate) fn systemd_run_argv(
         format!("--property=StandardOutput=append:{log}"),
         format!("--property=StandardError=append:{log}"),
     ];
+    if let Ok(cwd) = std::env::current_dir() {
+        argv.push(format!("--working-directory={}", cwd.display()));
+    }
     argv.extend(
         env.iter()
             .map(|(name, value)| format!("--setenv={name}={value}")),
@@ -842,6 +845,10 @@ mod tests {
             Path::new("/tmp/awman.log"),
             &[],
         );
+        assert!(argv.contains(&format!(
+            "--working-directory={}",
+            std::env::current_dir().unwrap().display()
+        )));
         assert!(!argv.iter().any(|a| a.starts_with("--setenv=")), "{argv:?}");
         let dd = argv.iter().position(|a| a == "--").unwrap();
         assert_eq!(&argv[dd + 1..], &["/usr/local/bin/awman"]);

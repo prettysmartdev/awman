@@ -65,6 +65,8 @@ pub struct RemoteConfig {
 pub struct ApiConfig {
     #[serde(rename = "workDirs", skip_serializing_if = "Option::is_none")]
     pub work_dirs: Option<Vec<String>>,
+    #[serde(rename = "workDirRoots", skip_serializing_if = "Option::is_none")]
+    pub work_dir_roots: Option<Vec<String>>,
     #[serde(
         rename = "alwaysNonInteractive",
         skip_serializing_if = "Option::is_none"
@@ -647,6 +649,28 @@ mod tests {
 
     fn make_git_root() -> TempDir {
         tempfile::tempdir().unwrap()
+    }
+
+    #[test]
+    fn api_work_dir_roots_serializes_as_camel_case_next_to_work_dirs() {
+        let cfg = ApiConfig {
+            work_dirs: Some(vec!["/a".to_string()]),
+            work_dir_roots: Some(vec!["/roots".to_string()]),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&cfg).unwrap();
+        assert_eq!(json["workDirs"], serde_json::json!(["/a"]));
+        assert_eq!(json["workDirRoots"], serde_json::json!(["/roots"]));
+        let back: ApiConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(back, cfg);
+    }
+
+    #[test]
+    fn api_work_dir_roots_is_omitted_when_unset() {
+        let json = serde_json::to_value(ApiConfig::default()).unwrap();
+        assert!(json.get("workDirRoots").is_none(), "{json}");
+        let parsed: ApiConfig = serde_json::from_str(r#"{"workDirs":["/a"]}"#).unwrap();
+        assert!(parsed.work_dir_roots.is_none());
     }
 
     #[test]

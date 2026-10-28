@@ -84,7 +84,7 @@ awman exec workflow path/to/workflow.toml --worktree
 ### How it works
 
 1. awman creates a branch `awman/work-item-NNNN` from your current `HEAD`
-2. A worktree is checked out at `~/.awman/worktrees/<repo-name>/<NNNN>/`
+2. A worktree is checked out at `~/.awman/worktrees/<repo-name>-<hash>/<NNNN>/` (`<hash>` is 8 hex characters derived from the repository's full path, so two checkouts with the same folder name never share a worktree)
 3. The agent container mounts the worktree instead of your repo root
 4. After the agent exits, you choose what to do with the branch
 
@@ -123,10 +123,12 @@ If the workflow defines a `checkout_create_branch` setup step, it is **skipped w
 If a worktree already exists (previous run was interrupted), awman detects it:
 
 ```
-Worktree already exists at ~/.awman/worktrees/myrepo/0030.
+Worktree already exists at ~/.awman/worktrees/myrepo-3fa91c2e/0030.
 [r]esume — reuse existing worktree
-[R]ecreate — remove it and start fresh
+[R]ecreate — delete the worktree, its branch and the commits on that branch, and start fresh
 ```
+
+You can answer in advance with `--on-existing-worktree`; see [Worktrees](05-workflows.md#worktrees).
 
 ### Merge conflicts
 
@@ -134,7 +136,7 @@ If the merge fails, awman prints a recovery message and leaves the worktree in p
 
 ```
 Merge failed with conflicts — resolve manually in /path/to/repo,
-then run: git branch -d awman/work-item-0030 && git worktree remove ~/.awman/worktrees/myrepo/0030
+then run: git branch -d awman/work-item-0030 && git worktree remove ~/.awman/worktrees/myrepo-3fa91c2e/0030
 ```
 
 ### Commit signing (GPG, SSH, S/MIME)

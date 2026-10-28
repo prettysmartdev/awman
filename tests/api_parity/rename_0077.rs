@@ -210,6 +210,7 @@ async fn real_network_api_frontend_status_endpoint_reachable_after_rename() {
         store: Arc::new(store),
         paths,
         workdirs: vec![],
+        workdir_roots: Vec::new(),
         started_at: Instant::now(),
         task_handles: tokio::sync::Mutex::new(Vec::new()),
         auth_mode: AuthMode::Disabled,

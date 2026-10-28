@@ -17,10 +17,11 @@
 //! map them to transport-specific statuses (HTTP 400 vs 403) without inspecting
 //! error strings.
 
-use std::path::PathBuf;
+use std::fmt;
+use std::path::{Path, PathBuf};
 
 use crate::command::error::CommandError;
-use crate::data::session::SessionKind;
+use crate::data::session::{GitRootResolver, SessionKind};
 
 /// URL schemes accepted for `remote` session repository URLs. Bare paths and
 /// `file:` URLs are intentionally excluded — a remote session must reference a
@@ -60,6 +61,9 @@ pub struct SessionCreateRequest {
 pub struct SessionCreatePolicy {
     /// Canonicalized directories a `local` session is permitted to mount.
     pub workdirs: Vec<PathBuf>,
+    /// Roots whose direct children may be used when they are independent git
+    /// repositories. Resolved again per request; roots may not exist yet.
+    pub workdir_roots: Vec<PathBuf>,
     /// Permitted `repo_url` scheme prefixes (matched case-insensitively).
     pub allowed_schemes: Vec<String>,
     /// Directory under which a `remote` session's clone is planned.
@@ -71,11 +75,122 @@ impl SessionCreatePolicy {
     pub fn new(workdirs: Vec<PathBuf>, clone_base_dir: PathBuf) -> Self {
         Self {
             workdirs,
+            workdir_roots: Vec::new(),
             allowed_schemes: DEFAULT_REPO_URL_SCHEMES
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
             clone_base_dir,
+        }
+    }
+
+    /// Add roots without requiring them to exist until a request uses them.
+    pub fn with_workdir_roots(mut self, roots: Vec<PathBuf>) -> Self {
+        self.workdir_roots = roots;
+        self
+    }
+
+    fn validate_workdir(
+        &self,
+        requested: &Path,
+        git: &dyn GitRootResolver,
+    ) -> Result<(), CommandError> {
+        if self.workdirs.iter().any(|path| path == requested) {
+            return Ok(());
+        }
+
+        let roots: Vec<PathBuf> = self
+            .workdir_roots
+            .iter()
+            .filter_map(|root| root.canonicalize().ok())
+            .filter(|root| !self.workdirs.iter().any(|workdir| root.starts_with(workdir)))
+            .filter(|root| match git.resolve(root) {
+                Err(crate::data::error::DataError::GitRootNotFound { .. }) => true,
+                _ => { tracing::warn!(root = %root.display(), "API workdir root is no longer outside git repositories, or git discovery failed"); false }
+            })
+            .collect();
+        // A direct match takes precedence over any enclosing root, so the
+        // result does not depend on the order of overlapping entries.
+        let rule = if let Some(root) = roots
+            .iter()
+            .find(|root| requested.parent() == Some(root.as_path()))
+        {
+            let git_root = git
+                .resolve(requested)
+                .ok()
+                .and_then(|p| p.canonicalize().ok());
+            if git_root.as_deref() != Some(requested) {
+                WorkdirRefusal::NotOwnGitRoot {
+                    root: root.clone(),
+                    git_root,
+                }
+            } else if !std::fs::symlink_metadata(requested.join(".git"))
+                .is_ok_and(|metadata| metadata.is_dir())
+            {
+                // is_dir on symlink_metadata also rejects symlinked .git
+                // directories, which could pull a mount outside the child.
+                WorkdirRefusal::GitDirNotDirectory { root: root.clone() }
+            } else {
+                return Ok(());
+            }
+        } else if let Some(root) = roots
+            .iter()
+            .find(|root| requested != root.as_path() && requested.starts_with(root))
+        {
+            WorkdirRefusal::NotDirectChild { root: root.clone() }
+        } else {
+            WorkdirRefusal::NotListed
+        };
+
+        tracing::warn!(workdir = %requested.display(), rule = ?rule, "API workdir refused");
+        Err(CommandError::SessionWorkdirNotAllowed {
+            requested: requested.display().to_string(),
+            rule,
+            allowed: self
+                .workdirs
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect(),
+            roots: self
+                .workdir_roots
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect(),
+        })
+    }
+}
+
+/// The allowlist rule a local session's canonical workdir failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkdirRefusal {
+    /// Neither an exact entry nor under a canonical root.
+    NotListed,
+    /// Under the root, but deeper than one level.
+    NotDirectChild { root: PathBuf },
+    /// A direct child whose resolved git root is elsewhere or unavailable.
+    NotOwnGitRoot {
+        root: PathBuf,
+        git_root: Option<PathBuf>,
+    },
+    /// A direct child with a pointer file, symlink or missing `.git` directory.
+    GitDirNotDirectory { root: PathBuf },
+}
+
+impl fmt::Display for WorkdirRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotListed => f.write_str(
+                "not an allowlisted workdir and not a direct child of an allowlisted root",
+            ),
+            Self::NotDirectChild { root } => write!(
+                f,
+                "it is below allowlisted root '{}' but is not a direct child of it",
+                root.display(),
+            ),
+            Self::NotOwnGitRoot { .. } => f.write_str("it is a direct child of an allowlisted root but is not its own git root"),
+            Self::GitDirNotDirectory { .. } => f.write_str(
+                "its .git is not a real directory (linked worktrees and symlinked .git directories are not allowed)",
+            ),
         }
     }
 }
@@ -134,12 +249,13 @@ impl SessionCreateRequest {
     /// Validate this request against `policy`, returning a resolved plan or a
     /// typed [`CommandError`].
     ///
-    /// Mirrors the previous API-route validation exactly:
+    /// Applies the session-creation policy:
     /// - `session_type` defaults to `local`; anything other than
     ///   `local`/`remote` is [`CommandError::SessionInvalidType`].
     /// - `local` requires a `workdir` that **canonicalizes** (resolving
-    ///   symlinks) onto the policy allowlist. Canonicalization happens before
-    ///   the allowlist comparison so no frontend can bypass symlink resolution.
+    ///   symlinks) onto the exact allowlist or a direct child of a root that
+    ///   is its own git root and has a real `.git` directory. Roots are
+    ///   canonicalized at each request before comparison.
     /// - `remote` requires a non-empty `repo_url` whose scheme is on the
     ///   policy's accepted list.
     /// - `base_ref`, `merge_refs` and `push` are remote-only
@@ -150,6 +266,7 @@ impl SessionCreateRequest {
     pub fn validate(
         &self,
         policy: &SessionCreatePolicy,
+        git: &dyn GitRootResolver,
     ) -> Result<SessionCreatePlan, CommandError> {
         // One parse, in Layer 2, producing the typed kind every later reader
         // uses (F-48). The `as_str()` matches this replaced ran in three
@@ -185,16 +302,15 @@ impl SessionCreateRequest {
                         path: workdir_in.to_string(),
                     }
                 })?;
-                if !policy.workdirs.contains(&requested) {
-                    return Err(CommandError::SessionWorkdirNotAllowed {
-                        requested: requested.display().to_string(),
-                        allowed: policy
-                            .workdirs
-                            .iter()
-                            .map(|p| p.display().to_string())
-                            .collect(),
-                    });
-                }
+                policy
+                    .validate_workdir(&requested, git)
+                    .map_err(|mut error| {
+                        if let CommandError::SessionWorkdirNotAllowed { requested, .. } = &mut error
+                        {
+                            *requested = workdir_in.to_string();
+                        }
+                        error
+                    })?;
                 Ok(SessionCreatePlan {
                     kind,
                     resolved_workdir: requested,
@@ -466,6 +582,9 @@ mod validate_tests {
     //! frontend can map failures to transport statuses without string matching.
 
     use super::*;
+    use crate::data::session::StaticGitRootResolver;
+
+    type RequestEdit = Box<dyn Fn(&mut SessionCreateRequest)>;
 
     /// A policy whose allowlist is exactly `workdirs`; clone base is a throwaway
     /// temp dir (only exercised by remote cases).
@@ -502,7 +621,9 @@ mod validate_tests {
             session_type: Some("banana".to_string()),
             ..Default::default()
         };
-        let err = req.validate(&policy(vec![])).unwrap_err();
+        let err = req
+            .validate(&policy(vec![]), &StaticGitRootResolver::new("/unused"))
+            .unwrap_err();
         assert!(
             matches!(err, CommandError::SessionInvalidType { .. }),
             "got {err:?}"
@@ -514,7 +635,9 @@ mod validate_tests {
         // No session_type → treated as local → fails on the missing workdir,
         // proving the default path is `local` (not an invalid-type error).
         let req = SessionCreateRequest::default();
-        let err = req.validate(&policy(vec![])).unwrap_err();
+        let err = req
+            .validate(&policy(vec![]), &StaticGitRootResolver::new("/unused"))
+            .unwrap_err();
         assert!(
             matches!(err, CommandError::SessionWorkdirRequired),
             "got {err:?}"
@@ -525,7 +648,9 @@ mod validate_tests {
 
     #[test]
     fn local_missing_workdir_is_workdir_required() {
-        let err = local(None).validate(&policy(vec![])).unwrap_err();
+        let err = local(None)
+            .validate(&policy(vec![]), &StaticGitRootResolver::new("/unused"))
+            .unwrap_err();
         assert!(
             matches!(err, CommandError::SessionWorkdirRequired),
             "got {err:?}"
@@ -535,7 +660,9 @@ mod validate_tests {
     #[test]
     fn local_noncanonicalizable_workdir_is_unresolvable() {
         let req = local(Some("/this/path/definitely/does/not/exist/awman-0097"));
-        let err = req.validate(&policy(vec![])).unwrap_err();
+        let err = req
+            .validate(&policy(vec![]), &StaticGitRootResolver::new("/unused"))
+            .unwrap_err();
         assert!(
             matches!(err, CommandError::SessionWorkdirUnresolvable { .. }),
             "got {err:?}"
@@ -550,7 +677,10 @@ mod validate_tests {
         let requested_str = requested.path().to_str().unwrap().to_string();
 
         let err = local(Some(&requested_str))
-            .validate(&policy(vec![allowed_canon]))
+            .validate(
+                &policy(vec![allowed_canon]),
+                &StaticGitRootResolver::new("/unused"),
+            )
             .unwrap_err();
         assert!(
             matches!(err, CommandError::SessionWorkdirNotAllowed { .. }),
@@ -564,7 +694,10 @@ mod validate_tests {
         let canon = workdir.path().canonicalize().unwrap();
 
         let plan = local(Some(workdir.path().to_str().unwrap()))
-            .validate(&policy(vec![canon.clone()]))
+            .validate(
+                &policy(vec![canon.clone()]),
+                &StaticGitRootResolver::new("/unused"),
+            )
             .expect("allowlisted workdir must validate");
         assert_eq!(plan.kind, SessionKind::Local);
         assert_eq!(plan.resolved_workdir, canon);
@@ -586,7 +719,10 @@ mod validate_tests {
         std::os::unix::fs::symlink(&target_canon, &link).unwrap();
 
         let plan = local(Some(link.to_str().unwrap()))
-            .validate(&policy(vec![target_canon.clone()]))
+            .validate(
+                &policy(vec![target_canon.clone()]),
+                &StaticGitRootResolver::new("/unused"),
+            )
             .expect("symlink onto allowlist must validate");
         assert_eq!(plan.resolved_workdir, target_canon);
     }
@@ -607,7 +743,10 @@ mod validate_tests {
         std::os::unix::fs::symlink(&off_canon, &link).unwrap();
 
         let err = local(Some(link.to_str().unwrap()))
-            .validate(&policy(vec![allowed_canon]))
+            .validate(
+                &policy(vec![allowed_canon]),
+                &StaticGitRootResolver::new("/unused"),
+            )
             .unwrap_err();
         assert!(
             matches!(err, CommandError::SessionWorkdirNotAllowed { .. }),
@@ -619,7 +758,9 @@ mod validate_tests {
 
     #[test]
     fn remote_missing_repo_url_is_repo_url_required() {
-        let err = remote(None).validate(&policy(vec![])).unwrap_err();
+        let err = remote(None)
+            .validate(&policy(vec![]), &StaticGitRootResolver::new("/unused"))
+            .unwrap_err();
         assert!(
             matches!(err, CommandError::SessionRepoUrlRequired),
             "got {err:?}"
@@ -628,7 +769,9 @@ mod validate_tests {
 
     #[test]
     fn remote_blank_repo_url_is_repo_url_empty() {
-        let err = remote(Some("   ")).validate(&policy(vec![])).unwrap_err();
+        let err = remote(Some("   "))
+            .validate(&policy(vec![]), &StaticGitRootResolver::new("/unused"))
+            .unwrap_err();
         assert!(
             matches!(err, CommandError::SessionRepoUrlEmpty),
             "got {err:?}"
@@ -646,7 +789,7 @@ mod validate_tests {
         ];
         for url in accepted {
             let plan = remote(Some(url))
-                .validate(&policy(vec![]))
+                .validate(&policy(vec![]), &StaticGitRootResolver::new("/unused"))
                 .unwrap_or_else(|e| panic!("accepted scheme {url} must validate; got {e:?}"));
             assert_eq!(plan.kind, SessionKind::Remote);
             assert_eq!(plan.repo_url.as_deref(), Some(url));
@@ -661,7 +804,7 @@ mod validate_tests {
     #[test]
     fn remote_file_scheme_is_invalid_scheme() {
         let err = remote(Some("file:///etc/passwd"))
-            .validate(&policy(vec![]))
+            .validate(&policy(vec![]), &StaticGitRootResolver::new("/unused"))
             .unwrap_err();
         assert!(
             matches!(err, CommandError::SessionRepoUrlInvalidScheme { .. }),
@@ -672,7 +815,7 @@ mod validate_tests {
     #[test]
     fn remote_bare_path_is_invalid_scheme() {
         let err = remote(Some("/srv/git/local-repo"))
-            .validate(&policy(vec![]))
+            .validate(&policy(vec![]), &StaticGitRootResolver::new("/unused"))
             .unwrap_err();
         assert!(
             matches!(err, CommandError::SessionRepoUrlInvalidScheme { .. }),
@@ -693,7 +836,7 @@ mod validate_tests {
         let workdir = tempfile::tempdir().unwrap();
         let canon = workdir.path().canonicalize().unwrap();
         let path = workdir.path().to_str().unwrap();
-        let cases: [(&str, Box<dyn Fn(&mut SessionCreateRequest)>); 3] = [
+        let cases: [(&str, RequestEdit); 3] = [
             ("base_ref", Box::new(|r| r.base_ref = Some("main".into()))),
             (
                 "merge_refs",
@@ -704,7 +847,12 @@ mod validate_tests {
         for (name, edit) in cases {
             let mut req = local(Some(path));
             edit(&mut req);
-            let err = req.validate(&policy(vec![canon.clone()])).unwrap_err();
+            let err = req
+                .validate(
+                    &policy(vec![canon.clone()]),
+                    &StaticGitRootResolver::new("/unused"),
+                )
+                .unwrap_err();
             assert!(
                 matches!(err, CommandError::SessionFieldRemoteOnly { field } if field == name),
                 "{name}: got {err:?}"
@@ -715,7 +863,7 @@ mod validate_tests {
 
     #[test]
     fn remote_fields_require_branch() {
-        let cases: [(&str, Box<dyn Fn(&mut SessionCreateRequest)>); 3] = [
+        let cases: [(&str, RequestEdit); 3] = [
             ("base_ref", Box::new(|r| r.base_ref = Some("main".into()))),
             (
                 "merge_refs",
@@ -728,7 +876,9 @@ mod validate_tests {
                 r.branch = None;
                 edit(r);
             });
-            let err = req.validate(&policy(vec![])).unwrap_err();
+            let err = req
+                .validate(&policy(vec![]), &StaticGitRootResolver::new("/unused"))
+                .unwrap_err();
             assert!(
                 matches!(err, CommandError::SessionFieldRequiresBranch { field } if field == name),
                 "{name}: got {err:?}"
@@ -745,7 +895,7 @@ mod validate_tests {
             r.merge_refs = vec!["a".into(), " b ".into()];
             r.push = true;
         })
-        .validate(&policy(vec![]))
+        .validate(&policy(vec![]), &StaticGitRootResolver::new("/unused"))
         .unwrap();
         assert_eq!(plan.branch.as_deref(), Some("feature/x"));
         assert_eq!(plan.base_ref.as_deref(), Some("v1.2.0"));
@@ -766,7 +916,7 @@ mod validate_tests {
             "",
         ] {
             let err = remote_with(|r| r.merge_refs = vec![bad.into()])
-                .validate(&policy(vec![]))
+                .validate(&policy(vec![]), &StaticGitRootResolver::new("/unused"))
                 .unwrap_err();
             assert!(
                 matches!(&err, CommandError::SessionRefInvalid { field: "merge_refs", value, .. } if value == bad),
@@ -779,7 +929,7 @@ mod validate_tests {
     #[test]
     fn invalid_branch_and_base_ref_are_refused() {
         let err = remote_with(|r| r.branch = Some("--foo".into()))
-            .validate(&policy(vec![]))
+            .validate(&policy(vec![]), &StaticGitRootResolver::new("/unused"))
             .unwrap_err();
         assert!(
             matches!(
@@ -792,7 +942,7 @@ mod validate_tests {
             "got {err:?}"
         );
         let err = remote_with(|r| r.base_ref = Some("-b".into()))
-            .validate(&policy(vec![]))
+            .validate(&policy(vec![]), &StaticGitRootResolver::new("/unused"))
             .unwrap_err();
         assert!(
             matches!(
@@ -835,5 +985,378 @@ mod validate_tests {
         for bad in ["", "-x", "a b", "a\nb"] {
             assert!(!is_valid_ref_spelling(bad), "{bad:?} should be invalid");
         }
+    }
+}
+
+#[cfg(test)]
+mod workdir_root_tests {
+    //! The allowlist-root rule (WI 0134): a direct child of a root is allowed
+    //! only when it is its own git root with a real `.git` directory. These
+    //! use real `git init` and the real `GitEngine` probe, because the rule is
+    //! about what `git rev-parse --show-toplevel` reports.
+
+    use super::*;
+    use crate::engine::git::GitEngine;
+    use std::process::Command;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("run git");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn init_repo(dir: &Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        git(dir, &["init", "-q"]);
+    }
+
+    fn policy_with_roots(workdirs: Vec<PathBuf>, roots: Vec<PathBuf>) -> SessionCreatePolicy {
+        SessionCreatePolicy::new(workdirs, std::env::temp_dir().join("awman-0134-clone-base"))
+            .with_workdir_roots(roots)
+    }
+
+    fn request(path: &Path) -> SessionCreateRequest {
+        SessionCreateRequest {
+            session_type: Some("local".to_string()),
+            workdir: Some(path.to_str().unwrap().to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn validate(
+        path: &Path,
+        policy: &SessionCreatePolicy,
+    ) -> Result<SessionCreatePlan, CommandError> {
+        request(path).validate(policy, &GitEngine::new())
+    }
+
+    fn refusal(result: Result<SessionCreatePlan, CommandError>) -> (WorkdirRefusal, String) {
+        match result.expect_err("must be refused") {
+            err @ CommandError::SessionWorkdirNotAllowed { .. } => {
+                let text = err.to_string();
+                let CommandError::SessionWorkdirNotAllowed { rule, .. } = err else {
+                    unreachable!()
+                };
+                (rule, text)
+            }
+            other => panic!("expected SessionWorkdirNotAllowed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn direct_child_git_root_is_allowed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let child = root.join("repo");
+        init_repo(&child);
+
+        let plan = validate(&child, &policy_with_roots(vec![], vec![root])).unwrap();
+        assert_eq!(plan.resolved_workdir, child);
+        assert_eq!(plan.kind, SessionKind::Local);
+    }
+
+    #[test]
+    fn direct_child_that_is_not_a_git_root_is_refused() {
+        // The root lives inside a repository, so the plain child's toplevel is
+        // the enclosing repository, not the child.
+        let tmp = tempfile::tempdir().unwrap();
+        let outer = tmp.path().canonicalize().unwrap().join("outer");
+        init_repo(&outer);
+        let root = outer.join("roots");
+        let child = root.join("plain");
+        std::fs::create_dir_all(&child).unwrap();
+
+        let (rule, text) = refusal(validate(&child, &policy_with_roots(vec![], vec![root])));
+        assert_eq!(rule, WorkdirRefusal::NotListed);
+        assert!(text.contains("not an allowlisted workdir"));
+    }
+
+    #[test]
+    fn direct_child_outside_any_repo_is_refused_as_not_own_git_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let child = root.join("plain");
+        std::fs::create_dir_all(&child).unwrap();
+
+        let (rule, _) = refusal(validate(&child, &policy_with_roots(vec![], vec![root])));
+        assert!(
+            matches!(rule, WorkdirRefusal::NotOwnGitRoot { .. }),
+            "{rule:?}"
+        );
+    }
+
+    #[test]
+    fn direct_child_with_git_file_linked_worktree_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        let main = base.join("main-repo");
+        init_repo(&main);
+        git(&main, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        let root = base.join("roots");
+        std::fs::create_dir_all(&root).unwrap();
+        let linked = root.join("linked");
+        git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "linked",
+                linked.to_str().unwrap(),
+            ],
+        );
+        assert!(
+            linked.join(".git").is_file(),
+            "fixture: .git must be a file"
+        );
+
+        let (rule, text) = refusal(validate(&linked, &policy_with_roots(vec![], vec![root])));
+        assert!(
+            matches!(rule, WorkdirRefusal::GitDirNotDirectory { .. }),
+            "{rule:?}"
+        );
+        assert!(text.contains(".git is not a real directory"), "{text}");
+    }
+
+    #[test]
+    fn grandchild_of_root_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let child = root.join("repo");
+        init_repo(&child);
+        let grandchild = child.join("src");
+        std::fs::create_dir_all(&grandchild).unwrap();
+        // Also a grandchild that is itself a repository.
+        let nested = root.join("group").join("nested");
+        init_repo(&nested);
+
+        for path in [&grandchild, &nested] {
+            let (rule, text) = refusal(validate(
+                path,
+                &policy_with_roots(vec![], vec![root.clone()]),
+            ));
+            assert!(
+                matches!(rule, WorkdirRefusal::NotDirectChild { .. }),
+                "{rule:?}"
+            );
+            assert!(text.contains("not a direct child"), "{text}");
+        }
+    }
+
+    #[test]
+    fn root_itself_is_not_allowed_by_the_root_rule() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let (rule, _) = refusal(validate(
+            &root,
+            &policy_with_roots(vec![], vec![root.clone()]),
+        ));
+        assert_eq!(rule, WorkdirRefusal::NotListed);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_to_direct_child_of_root_is_allowed_after_resolution() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap().join("roots");
+        let child = root.join("repo");
+        init_repo(&child);
+        let links = tempfile::tempdir().unwrap();
+        let link = links.path().join("alias");
+        std::os::unix::fs::symlink(&child, &link).unwrap();
+
+        let plan = validate(&link, &policy_with_roots(vec![], vec![root])).unwrap();
+        assert_eq!(plan.resolved_workdir, child);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_inside_root_pointing_outside_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap().join("roots");
+        std::fs::create_dir_all(&root).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().canonicalize().unwrap().join("repo");
+        init_repo(&target);
+        let link = root.join("escape");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let (rule, _) = refusal(validate(&link, &policy_with_roots(vec![], vec![root])));
+        assert_eq!(rule, WorkdirRefusal::NotListed);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_to_grandchild_of_root_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap().join("roots");
+        let nested = root.join("group").join("repo");
+        init_repo(&nested);
+        let link = root.join("shortcut");
+        std::os::unix::fs::symlink(&nested, &link).unwrap();
+
+        let (rule, _) = refusal(validate(&link, &policy_with_roots(vec![], vec![root])));
+        assert!(
+            matches!(rule, WorkdirRefusal::NotDirectChild { .. }),
+            "{rule:?}"
+        );
+    }
+
+    #[test]
+    fn root_missing_at_validation_time_allows_nothing_then_works_once_created() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        let root = base.join("later");
+        let policy = policy_with_roots(vec![], vec![root.clone()]);
+
+        // A repository elsewhere is not allowed while the root is missing.
+        let other = base.join("other");
+        init_repo(&other);
+        let (rule, _) = refusal(validate(&other, &policy));
+        assert_eq!(rule, WorkdirRefusal::NotListed);
+
+        // Creating the root and a repository in it needs no policy rebuild.
+        let child = root.join("repo");
+        init_repo(&child);
+        let plan = validate(&child, &policy).expect("allowed once the root exists");
+        assert_eq!(plan.resolved_workdir, child);
+    }
+
+    #[test]
+    fn exact_workdir_entry_still_allows_non_repo_and_nested_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().canonicalize().unwrap();
+        let plan = validate(&dir, &policy_with_roots(vec![dir.clone()], vec![])).unwrap();
+        assert_eq!(plan.resolved_workdir, dir);
+
+        // An exact entry that is also under a root is not subject to root rules.
+        let child = dir.join("plain");
+        std::fs::create_dir_all(&child).unwrap();
+        let policy = policy_with_roots(vec![child.clone()], vec![dir]);
+        assert_eq!(validate(&child, &policy).unwrap().resolved_workdir, child);
+    }
+
+    #[test]
+    fn stranger_path_is_not_listed_and_body_names_rule() {
+        let root = tempfile::tempdir().unwrap();
+        let stranger = tempfile::tempdir().unwrap();
+        let policy = policy_with_roots(vec![], vec![root.path().canonicalize().unwrap()]);
+        let (rule, text) = refusal(validate(&stranger.path().canonicalize().unwrap(), &policy));
+        assert_eq!(rule, WorkdirRefusal::NotListed);
+        assert!(
+            text.contains("not a direct child of an allowlisted root"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn overlapping_roots_allow_if_any_root_matches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outer = tmp.path().canonicalize().unwrap();
+        let inner = outer.join("inner");
+        let child = inner.join("repo");
+        init_repo(&child);
+
+        for roots in [
+            vec![outer.clone(), inner.clone()],
+            vec![inner.clone(), outer.clone()],
+        ] {
+            let plan = validate(&child, &policy_with_roots(vec![], roots)).unwrap();
+            assert_eq!(plan.resolved_workdir, child);
+        }
+    }
+    #[test]
+    fn missing_root_later_created_inside_repository_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outer = tmp.path().join("outer");
+        init_repo(&outer);
+        let root = outer.join("missing");
+        let policy = policy_with_roots(vec![], vec![root.clone()]);
+        let child = root.join("child");
+        init_repo(&child);
+        assert_eq!(
+            refusal(validate(&child, &policy)).0,
+            WorkdirRefusal::NotListed
+        );
+    }
+
+    #[test]
+    fn existing_root_later_initialized_as_repository_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let child = root.join("child");
+        init_repo(&child);
+        let policy = policy_with_roots(vec![], vec![root.clone()]);
+        assert!(validate(&child, &policy).is_ok());
+        init_repo(&root);
+        assert_eq!(
+            refusal(validate(&child, &policy)).0,
+            WorkdirRefusal::NotListed
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_git_directory_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let child = root.join("child");
+        init_repo(&child);
+        let metadata = root.join("elsewhere.git");
+        std::fs::rename(child.join(".git"), &metadata).unwrap();
+        std::os::unix::fs::symlink(&metadata, child.join(".git")).unwrap();
+        assert!(matches!(
+            refusal(validate(&child, &policy_with_roots(vec![], vec![root]))).0,
+            WorkdirRefusal::GitDirNotDirectory { .. }
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refusal_echoes_client_spelling_without_disclosing_symlink_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        let target = tmp.path().join("private-target");
+        std::fs::create_dir_all(&root).unwrap();
+        init_repo(&target);
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let (_, text) = refusal(validate(&link, &policy_with_roots(vec![], vec![root])));
+        assert!(text.contains(&link.display().to_string()));
+        assert!(!text.contains(&target.display().to_string()));
+        assert!(!text.contains("Allowed workdirs"));
+    }
+    #[cfg(unix)]
+    #[test]
+    fn root_retargeted_inside_an_exact_mount_is_refused_at_request_time() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mount = tmp.path().canonicalize().unwrap().join("exact");
+        std::fs::create_dir(&mount).unwrap();
+        let child = mount.join("repo");
+        init_repo(&child);
+        let root = tmp.path().join("root");
+        // Models a missing configured root that later appears as a symlink.
+        let policy = policy_with_roots(vec![mount.clone()], vec![root.clone()]);
+        std::os::unix::fs::symlink(&mount, &root).unwrap();
+        assert_eq!(
+            refusal(validate(&child, &policy)).0,
+            WorkdirRefusal::NotListed
+        );
     }
 }

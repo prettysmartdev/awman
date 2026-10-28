@@ -979,11 +979,28 @@ impl WorktreeLifecycleFrontend for ApiDispatchFrontend {
         Ok(self.headless.existing_worktree())
     }
 
+    fn existing_worktree_after_resume(
+        &mut self,
+        _path: &Path,
+        _branch: &str,
+    ) -> Result<ExistingWorktreeDecision, CommandError> {
+        Ok(self.headless.existing_worktree())
+    }
+
     fn report_worktree_created(&mut self, path: &Path, branch: &str) {
+        if let Some(writer) = &self.state_writer {
+            writer.record_worktree(path);
+        }
         self.event_bus.emit(EventPayload::StatusMessage {
             phase: "worktree".to_string(),
             message: format!("Worktree created: {} (branch: {branch})", path.display()),
         });
+    }
+
+    fn report_worktree_resumed(&mut self, path: &Path, _branch: &str) {
+        if let Some(writer) = &self.state_writer {
+            writer.record_worktree(path);
+        }
     }
 
     fn ask_post_workflow_action(
@@ -1043,6 +1060,9 @@ impl WorktreeLifecycleFrontend for ApiDispatchFrontend {
     }
 
     fn report_worktree_discarded(&mut self, branch: &str) {
+        if let Some(writer) = &self.state_writer {
+            writer.clear_worktree();
+        }
         self.event_bus.emit(EventPayload::StatusMessage {
             phase: "worktree".to_string(),
             message: format!("Worktree discarded: {branch}"),
@@ -1050,6 +1070,9 @@ impl WorktreeLifecycleFrontend for ApiDispatchFrontend {
     }
 
     fn report_worktree_kept(&mut self, path: &Path, branch: &str) {
+        if let Some(writer) = &self.state_writer {
+            writer.record_worktree(path);
+        }
         self.event_bus.emit(EventPayload::StatusMessage {
             phase: "worktree".to_string(),
             message: format!("Worktree kept: {} (branch: {branch})", path.display()),
@@ -1785,5 +1808,28 @@ mod tests {
             count, 2,
             "expected 2 events: initial tick + tick after simulated 11-second gap"
         );
+    }
+    #[test]
+    fn worktree_preparation_and_resume_record_structured_result_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = crate::data::fs::api_paths::ApiPaths::at_root(tmp.path());
+        let writer = CommandStateWriter::new(paths, "s", "c");
+        let bus = crate::command::commands::api_server::event_bus::EventBus::new(16);
+        let mut frontend = ApiDispatchFrontend::new("exec workflow", &[], bus.sender())
+            .with_state_writer(writer.clone());
+        for resumed in [false, true] {
+            let wt = tmp.path().join(if resumed { "resumed" } else { "created" });
+            std::fs::create_dir(&wt).unwrap();
+            if resumed {
+                frontend.report_worktree_resumed(&wt, "branch");
+            } else {
+                frontend.report_worktree_created(&wt, "branch");
+            }
+            assert_eq!(writer.kept_worktree(), Some(wt));
+        }
+        // A later checkout may reuse the same directory before completion;
+        // explicit cleanup must clear this command's ownership of the path.
+        frontend.report_worktree_discarded("branch");
+        assert!(writer.kept_worktree().is_none());
     }
 }

@@ -325,7 +325,7 @@ pub(super) const EXEC_WORKFLOW_WORKTREE_FLAG: [FlagSpec; 1] = [FlagSpec {
 }];
 
 /// The flags `exec workflow` adds after the base set.
-pub(super) const EXEC_WORKFLOW_TRAILING_FLAGS: [FlagSpec; 6] = [
+pub(super) const EXEC_WORKFLOW_TRAILING_FLAGS: [FlagSpec; 7] = [
     FlagSpec {
         long: "issue",
         short: None,
@@ -398,6 +398,17 @@ pub(super) const EXEC_WORKFLOW_TRAILING_FLAGS: [FlagSpec; 6] = [
         implies: &[],
         optional: true,
     },
+    FlagSpec {
+        long: "on-existing-worktree",
+        short: None,
+        help: "What to do when the worktree for this run already exists: ask, resume it, recreate it (deletes the worktree, its branch and that branch's commits), or fail.",
+        kind: FlagKind::Enum(&["ask", "resume", "recreate", "fail"]),
+        default: FlagDefault::None,
+        frontends: FrontendVisibility::All,
+        conflicts_with: &[],
+        implies: &[],
+        optional: true,
+    },
 ];
 
 /// Agent-run flags for `exec workflow`.
@@ -407,7 +418,7 @@ pub(super) const EXEC_WORKFLOW_TRAILING_FLAGS: [FlagSpec; 6] = [
 /// base run, so the base set is spliced rather than concatenated. The order is
 /// exactly what the literal had, because it is the order `--help` and the
 /// generated command reference print.
-pub(super) const EXEC_WORKFLOW_FLAGS: [FlagSpec; 18] = concat_flags(&[
+pub(super) const EXEC_WORKFLOW_FLAGS: [FlagSpec; 19] = concat_flags(&[
     &EXEC_WORKFLOW_LEADING_FLAGS,
     AGENT_RUN_BEFORE_WORKTREE,
     &EXEC_WORKFLOW_WORKTREE_FLAG,

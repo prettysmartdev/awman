@@ -3,11 +3,11 @@
 use std::path::Path;
 
 use crate::command::commands::worktree_lifecycle::{
-    dirty_merge_target_body, dirty_target_commit_message, DirtyMergeTargetDecision,
-    ExistingWorktreeDecision, MergeFailure, PostWorkflowWorktreeAction, PostWorkflowWorktreePrompt,
-    PreWorktreeDecision, WorktreeLifecycleFrontend, WorktreeMergeMode, DIRTY_COMMIT_PROMPT,
-    DIRTY_COMMIT_TITLE, DIRTY_MERGE_TARGET_KEYS, DIRTY_MERGE_TARGET_TITLE,
-    MERGE_FIX_PROMPT_OUTPUT_LINES,
+    dirty_merge_target_body, dirty_target_commit_message, existing_worktree_body,
+    DirtyMergeTargetDecision, ExistingWorktreeDecision, MergeFailure, PostWorkflowWorktreeAction,
+    PostWorkflowWorktreePrompt, PreWorktreeDecision, WorktreeLifecycleFrontend, WorktreeMergeMode,
+    DIRTY_COMMIT_PROMPT, DIRTY_COMMIT_TITLE, DIRTY_MERGE_TARGET_KEYS, DIRTY_MERGE_TARGET_TITLE,
+    EXISTING_WORKTREE_KEYS, EXISTING_WORKTREE_TITLE, MERGE_FIX_PROMPT_OUTPUT_LINES,
 };
 use crate::command::error::CommandError;
 use crate::data::message::UserMessageSink;
@@ -67,27 +67,26 @@ impl WorktreeLifecycleFrontend for TuiCommandFrontend {
         branch: &str,
     ) -> Result<ExistingWorktreeDecision, CommandError> {
         let response = self.ask_dialog(DialogRequest::Custom {
-            title: "Existing worktree".into(),
-            body: format!(
-                "Worktree exists at {} (branch: {}).\n\nResume or recreate?",
-                path.display(),
-                branch
-            ),
-            keys: vec![('r', "Resume".into()), ('n', "Recreate".into())],
+            title: EXISTING_WORKTREE_TITLE.into(),
+            body: existing_worktree_body(path, branch),
+            keys: EXISTING_WORKTREE_KEYS
+                .iter()
+                .map(|(key, label)| (*key, (*label).into()))
+                .collect(),
         })?;
-        let decision = match response {
+        Ok(match response {
             DialogResponse::Char('n') => ExistingWorktreeDecision::Recreate,
             _ => ExistingWorktreeDecision::Resume,
-        };
-        if matches!(decision, ExistingWorktreeDecision::Resume) {
-            // The lifecycle returns early on Resume without calling
-            // report_worktree_created, so publish the path here so the
-            // bottom-bar context line shows "Worktree" immediately.
-            if let Ok(mut guard) = self.active_worktree_path.lock() {
-                *guard = Some(path.to_path_buf());
-            }
+        })
+    }
+
+    fn report_worktree_resumed(&mut self, path: &Path, _branch: &str) {
+        // The lifecycle returns early on Resume without calling
+        // report_worktree_created, so publish the path here so the
+        // bottom-bar context line shows "Worktree" immediately.
+        if let Ok(mut guard) = self.active_worktree_path.lock() {
+            *guard = Some(path.to_path_buf());
         }
-        Ok(decision)
     }
 
     fn report_worktree_created(&mut self, path: &Path, branch: &str) {

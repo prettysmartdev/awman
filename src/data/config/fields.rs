@@ -222,6 +222,12 @@ pub const CONFIG_FIELDS: &[ConfigFieldSpec] = &[
         LIST_HINT,
     ),
     f(
+        "api.workDirRoots",
+        FieldScope::GlobalOnly,
+        ConfigFieldKind::String,
+        LIST_HINT,
+    ),
+    f(
         "api.port",
         FieldScope::GlobalOnly,
         ConfigFieldKind::Number,
@@ -350,6 +356,17 @@ mod tests {
         names.sort_unstable();
         names.dedup();
         assert_eq!(names.len(), total, "duplicate field name in CONFIG_FIELDS");
+    }
+
+    #[test]
+    fn api_work_dir_roots_is_a_global_only_list_like_work_dirs() {
+        let find = |name: &str| CONFIG_FIELDS.iter().find(|f| f.name == name).unwrap();
+        let roots = find("api.workDirRoots");
+        let dirs = find("api.workDirs");
+        assert!(matches!(roots.scope, FieldScope::GlobalOnly));
+        assert_eq!(roots.writability(), (true, false));
+        assert_eq!(roots.writability(), dirs.writability());
+        assert_eq!(roots.hint, dirs.hint);
     }
 
     #[test]

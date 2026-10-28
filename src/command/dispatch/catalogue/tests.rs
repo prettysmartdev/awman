@@ -993,8 +993,24 @@ fn exec_workflow_flags_keep_their_documented_order() {
             "max-concurrent",
             "on-dirty-merge-target",
             "on-merge-failure",
+            "on-existing-worktree",
         ]
     );
+}
+
+#[test]
+fn existing_worktree_policy_flag_is_api_allowed_and_has_all_choices() {
+    let cat = CommandCatalogue::get();
+    let workflow = cat.lookup(&["exec", "workflow"]).unwrap();
+    let flag = workflow
+        .flags
+        .iter()
+        .find(|flag| flag.long == "on-existing-worktree")
+        .expect("exec workflow exposes on-existing-worktree");
+    assert!(
+        matches!(flag.kind, FlagKind::Enum(values) if values == ["ask", "resume", "recreate", "fail"])
+    );
+    assert!(cat.is_allowed_for_frontend(FrontendKind::Api, &["exec", "workflow"]));
 }
 
 #[test]

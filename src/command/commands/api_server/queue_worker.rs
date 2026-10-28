@@ -34,6 +34,14 @@ impl QueuedCommandResult {
             CommandOutcome::exit_code,
         );
         let mut json = CommandResult {
+            worktree_path: match result {
+                Err(crate::command::error::CommandError::WorktreeExists { path, .. })
+                    if path.is_dir() =>
+                {
+                    Some(path.display().to_string())
+                }
+                _ => None,
+            },
             exit_code: Some(exit_code),
             error: result.as_ref().err().map(ToString::to_string),
             error_status: result.as_ref().err().map(|error| error.http_status()),
@@ -63,6 +71,16 @@ impl QueuedCommandResult {
             status,
             result_json: serde_json::to_string(&json).expect("command result is serializable"),
         }
+    }
+
+    fn with_worktree(mut self, path: Option<std::path::PathBuf>) -> Self {
+        let mut result: CommandResult =
+            serde_json::from_str(&self.result_json).expect("serialized command result");
+        result.worktree_path = path
+            .map(|path| path.display().to_string())
+            .or(result.worktree_path);
+        self.result_json = serde_json::to_string(&result).expect("command result is serializable");
+        self
     }
 
     fn persist(
@@ -272,9 +290,9 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
         // The API frontend supplies the presentation adapter through its
         // factory; Layer 2 owns everything around command execution.
         let state_writer = CommandStateWriter::new(self.paths.clone(), &session_id, &command_id);
-        let frontend = self
-            .frontend_factory
-            .frontend_for(&cmd, event_bus.sender(), state_writer);
+        let frontend =
+            self.frontend_factory
+                .frontend_for(&cmd, event_bus.sender(), state_writer.clone());
 
         // Look up the Session.
         let session = match self.sessions.get_by_key(&session_id) {
@@ -406,7 +424,8 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
             });
         }
 
-        let completion = QueuedCommandResult::new(&result, &push_outcome);
+        let completion = QueuedCommandResult::new(&result, &push_outcome)
+            .with_worktree(state_writer.kept_worktree());
         let exit_code = completion.exit_code;
         let status = completion.status;
         let success = status == "done";
@@ -769,6 +788,41 @@ mod completion_tests {
             let json: serde_json::Value =
                 serde_json::from_str(saved.result.as_ref().unwrap()).unwrap();
             assert_eq!(json["exit_code"], expected);
+        }
+    }
+    #[test]
+    fn api_worktree_result_tracks_preparation_resume_early_failure_and_cleanup() {
+        for resumed in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let paths = ApiPaths::at_root(tmp.path());
+            let writer = CommandStateWriter::new(paths, "session", "command");
+            let wt = tmp.path().join("worktree");
+            std::fs::create_dir(&wt).unwrap();
+            let prepared_writer = writer.clone();
+            prepared_writer.record_worktree(&wt);
+            if resumed {
+                prepared_writer.record_worktree(&wt);
+            }
+            // No finalization/kept callback is required. A setup error right
+            // after preparation still exposes the checkout through result.
+            let result = Err(crate::command::error::CommandError::Other(
+                "setup failed".into(),
+            ));
+            let completion = QueuedCommandResult::new(&result, &Ok(PushBackOutcome::NotConfigured))
+                .with_worktree(writer.kept_worktree());
+            let json: CommandResult = serde_json::from_str(&completion.result_json).unwrap();
+            assert_eq!(json.worktree_path, Some(wt.display().to_string()));
+            assert_eq!(completion.status, "error");
+            // Successful squash cleanup is reflected by the existence check,
+            // even when no explicit discard callback follows merge-back.
+            std::fs::remove_dir(&wt).unwrap();
+            let completion = QueuedCommandResult::new(
+                &Ok(CommandOutcome::Empty),
+                &Ok(PushBackOutcome::NotConfigured),
+            )
+            .with_worktree(writer.kept_worktree());
+            let json: serde_json::Value = serde_json::from_str(&completion.result_json).unwrap();
+            assert!(json.get("worktree_path").is_none());
         }
     }
 }

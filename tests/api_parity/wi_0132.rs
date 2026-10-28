@@ -69,6 +69,7 @@ fn app_state(root: &std::path::Path) -> Arc<AppState> {
         store: Arc::new(store),
         paths,
         workdirs: vec![],
+        workdir_roots: Vec::new(),
         started_at: Instant::now(),
         task_handles: tokio::sync::Mutex::new(Vec::new()),
         auth_mode: AuthMode::Disabled,

@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use super::ExecWorkflowCommandFrontend;
 use crate::command::commands::worktree_lifecycle::{
-    ExistingWorktreeDecision, FinalizeOutcome, FinalizePolicy, MergeFailure, WorktreeLifecycle,
+    ExistingWorktreeChoice, FinalizeOutcome, FinalizePolicy, MergeFailure, WorktreeLifecycle,
 };
 use crate::command::error::CommandError;
 use crate::data::message::{UserMessage, UserMessageSink};
@@ -49,14 +49,14 @@ impl SharedWorkflowFrontend {
 
     pub(crate) async fn prepare_worktree(
         &self,
-        lifecycle: WorktreeLifecycle,
-        preselected: Option<ExistingWorktreeDecision>,
+        mut lifecycle: WorktreeLifecycle,
+        choice: ExistingWorktreeChoice,
     ) -> Result<(WorktreeLifecycle, PathBuf), CommandError> {
         let frontend = self.clone();
         tokio::task::spawn_blocking(move || {
             let path = frontend.with(|frontend| {
                 tokio::runtime::Handle::current()
-                    .block_on(lifecycle.prepare_with_existing(frontend, preselected))
+                    .block_on(lifecycle.prepare_with_existing(frontend, choice))
             })?;
             Ok((lifecycle, path))
         })

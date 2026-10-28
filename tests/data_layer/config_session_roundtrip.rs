@@ -359,19 +359,23 @@ fn worktree_branch_name_for_workflow_prefixed() {
 
 #[test]
 fn worktree_paths_for_work_item_correct_structure() {
-    use awman::data::worktree_paths::WorktreePaths;
+    use awman::data::worktree_paths::{repo_key, WorktreePaths};
     let paths = WorktreePaths::with_home("/fake-home");
-    let wt = paths.for_work_item(std::path::Path::new("/r/myrepo"), 42);
-    // Should be ~/.awman/worktrees/myrepo/0042
-    assert!(wt.ends_with("worktrees/myrepo/0042"), "got {wt:?}");
+    let root = std::path::Path::new("/r/myrepo");
+    let wt = paths.for_work_item(root, 42);
+    // Should be ~/.awman/worktrees/myrepo-<hash8>/0042
+    let expected = format!("worktrees/{}/0042", repo_key(root));
+    assert!(wt.ends_with(&expected), "got {wt:?}");
 }
 
 #[test]
 fn worktree_paths_for_workflow_uses_wf_prefix() {
-    use awman::data::worktree_paths::WorktreePaths;
+    use awman::data::worktree_paths::{repo_key, WorktreePaths};
     let paths = WorktreePaths::with_home("/fake-home");
-    let wt = paths.for_workflow(std::path::Path::new("/r/myrepo"), "my-flow");
-    assert!(wt.ends_with("worktrees/myrepo/wf-my-flow"), "got {wt:?}");
+    let root = std::path::Path::new("/r/myrepo");
+    let wt = paths.for_workflow(root, "my-flow");
+    let expected = format!("worktrees/{}/wf-my-flow", repo_key(root));
+    assert!(wt.ends_with(&expected), "got {wt:?}");
 }
 
 // ─── Image tags ──────────────────────────────────────────────────────────────

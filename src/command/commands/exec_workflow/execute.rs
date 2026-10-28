@@ -281,17 +281,7 @@ impl Command for ExecWorkflowCommand {
         let mut state_resume_settled = false;
         let worktree_lifecycle = if self.flags.worktree && !self.session.session_type().is_remote()
         {
-            let git_root = match self.engines.git_engine.resolve_root(&cwd) {
-                Ok(r) => r,
-                Err(e) => {
-                    let err = CommandError::from(e);
-                    frontend.write_message(UserMessage {
-                        level: MessageLevel::Error,
-                        text: format!("exec workflow: failed to resolve git root: {err}"),
-                    });
-                    return Err(err);
-                }
-            };
+            let git_root = self.session.git_root().to_path_buf();
             // `--issue` names the worktree after the issue slug, `--work-item`
             // after the number, otherwise the workflow filename. The choice is
             // `WorktreeLifecycle::name_for`'s; this opens it once (F-51).
@@ -327,29 +317,36 @@ impl Command for ExecWorkflowCommand {
             let store =
                 crate::data::workflow_state_store::WorkflowStateStore::at_git_root(state_root);
             let workflow_name = crate::engine::workflow::workflow_name_for(&workflow);
-            let resumed = match frontend.with(|frontend| {
-                offer_state_resume(
-                    &store,
-                    &workflow,
-                    &workflow_name,
-                    work_item_context.as_ref().map(|c| c.number),
-                    Some(lifecycle.worktree_path()),
-                    frontend,
-                )
-            })? {
-                StateResumeOutcome::Cancelled => {
-                    frontend.write_message(UserMessage {
-                        level: MessageLevel::Info,
-                        text: "exec workflow: cancelled; nothing was created or changed."
-                            .to_string(),
-                    });
-                    return Ok(ExecWorkflowOutcome {
-                        workflow: workflow_name,
-                        exit_code: None,
-                        worktree_used: false,
-                    });
+            let offer_resume = frontend.with(|frontend| {
+                lifecycle.should_offer_resume(frontend, self.flags.on_existing_worktree)
+            })?;
+            let resumed = if !offer_resume {
+                false
+            } else {
+                match frontend.with(|frontend| {
+                    offer_state_resume(
+                        &store,
+                        &workflow,
+                        &workflow_name,
+                        work_item_context.as_ref().map(|c| c.number),
+                        Some(lifecycle.worktree_path()),
+                        frontend,
+                    )
+                })? {
+                    StateResumeOutcome::Cancelled => {
+                        frontend.write_message(UserMessage {
+                            level: MessageLevel::Info,
+                            text: "exec workflow: cancelled; nothing was created or changed."
+                                .to_string(),
+                        });
+                        return Ok(ExecWorkflowOutcome {
+                            workflow: workflow_name,
+                            exit_code: None,
+                            worktree_used: false,
+                        });
+                    }
+                    StateResumeOutcome::Proceed { resumed } => resumed,
                 }
-                StateResumeOutcome::Proceed { resumed } => resumed,
             };
             state_resume_settled = true;
 
@@ -359,10 +356,9 @@ impl Command for ExecWorkflowCommand {
                     // An accepted resume is an answer to the existing-worktree
                     // question: the saved run lives in that worktree, and
                     // recreating it would throw away both the commits and the
-                    // state we just rewound.
-                    resumed.then_some(
-                        crate::command::commands::worktree_lifecycle::ExistingWorktreeDecision::Resume,
-                    ),
+                    // state we just rewound. An explicit
+                    // `--on-existing-worktree` still wins.
+                    existing_worktree_choice(self.flags.on_existing_worktree, resumed),
                 )
                 .await;
             let (lifecycle, wt_path) = match prepared_worktree {
@@ -395,7 +391,7 @@ impl Command for ExecWorkflowCommand {
         // path that doesn't exist inside the container, breaking all git ops.
         let worktree_git_mount: Option<crate::engine::container::options::OverlaySpec> =
             if worktree_path.is_some() {
-                worktree_git_overlay(&mount_path)?
+                worktree_git_overlay(&self.engines.git_engine, &git_root_for_scope, &mount_path)?
             } else {
                 None
             };
@@ -452,5 +448,55 @@ impl Command for ExecWorkflowCommand {
             self.managed_session.as_ref(),
         )
         .await
+    }
+}
+
+/// Settle the existing-worktree question for a run: an explicit
+/// `--on-existing-worktree` value wins; otherwise an accepted workflow/dynamic
+/// resume is passed on as `ResumeAccepted` (the host decides whether that
+/// implies `Resume`); otherwise the host asks.
+pub(crate) fn existing_worktree_choice(
+    flag: Option<crate::command::commands::worktree_lifecycle::ExistingWorktreeDecision>,
+    resume_accepted: bool,
+) -> crate::command::commands::worktree_lifecycle::ExistingWorktreeChoice {
+    use crate::command::commands::worktree_lifecycle::ExistingWorktreeChoice;
+    match (flag, resume_accepted) {
+        (Some(d), _) => ExistingWorktreeChoice::Explicit(d),
+        (None, true) => ExistingWorktreeChoice::ResumeAccepted,
+        (None, false) => ExistingWorktreeChoice::Ask,
+    }
+}
+
+#[cfg(test)]
+mod existing_worktree_choice_tests {
+    use super::existing_worktree_choice;
+    use crate::command::commands::worktree_lifecycle::{
+        ExistingWorktreeChoice as C, ExistingWorktreeDecision as D,
+    };
+
+    #[test]
+    fn explicit_choice_overrides_accepted_dynamic_resume() {
+        use crate::command::headless::HeadlessDefaults;
+
+        for decision in [D::Resume, D::Recreate, D::Fail] {
+            assert_eq!(
+                existing_worktree_choice(Some(decision), true),
+                C::Explicit(decision)
+            );
+        }
+        assert_eq!(existing_worktree_choice(None, true), C::ResumeAccepted);
+        assert_eq!(existing_worktree_choice(None, false), C::Ask);
+
+        // ResumeAccepted is resolved by the host: API fails even for saved
+        // dynamic state, while unattended squad and piped CLI keep resuming.
+        assert_eq!(HeadlessDefaults::api().existing_worktree(), D::Fail);
+        assert_eq!(
+            HeadlessDefaults::squad(
+                crate::command::commands::mount_scope::MountScopeDecision::MountGitRoot
+            )
+            .existing_worktree(),
+            D::Resume
+        );
+        assert_eq!(HeadlessDefaults::cli().existing_worktree(), D::Resume);
     }
 }

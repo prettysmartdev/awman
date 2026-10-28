@@ -51,7 +51,7 @@ fn git(dir: &Path, args: &[&str]) -> String {
 /// The "server checkout": a committed repo with a work item and an agent
 /// Dockerfile, so nothing is dirty before the run.
 fn server_checkout(root: &Path) -> PathBuf {
-    // Named after the temp dir, so each run gets its own `~/.awman/worktrees/<name>`.
+    // Named after the temp dir, so each run gets its own `~/.awman/worktrees/<name>-<hash8>`.
     let repo = root.join(format!(
         "checkout-{}",
         root.file_name().unwrap().to_string_lossy()
@@ -77,6 +77,7 @@ fn app_state(root: &Path) -> Arc<AppState> {
         store: Arc::new(store),
         paths: paths.clone(),
         workdirs: vec![],
+        workdir_roots: Vec::new(),
         started_at: std::time::Instant::now(),
         task_handles: tokio::sync::Mutex::new(Vec::new()),
         auth_mode: AuthMode::Disabled,
@@ -110,6 +111,7 @@ fn flags(on_dirty_merge_target: Option<OnDirtyMergeTarget>) -> ExecWorkflowComma
         leader: None,
         on_dirty_merge_target,
         on_merge_failure: None,
+        on_existing_worktree: None,
     }
 }
 
@@ -420,7 +422,11 @@ command = "make-conflict"
 "#;
     let tmp = tempfile::tempdir().unwrap();
     let repo = server_checkout(tmp.path());
-    std::fs::write(repo.join("conflict.txt"), "base\n").unwrap();
+    std::fs::write(
+        repo.join("conflict-{{work_item_content}}-```.txt"),
+        "base\n",
+    )
+    .unwrap();
     if matches!(case, RepairCase::RejectedTemplate) {
         std::fs::write(tmp.path().join("secret.md"), "OUTSIDE_SENTINEL").unwrap();
         std::fs::write(
@@ -466,10 +472,18 @@ command = "make-conflict"
         held.clone(),
         PARALLEL,
         Arc::new(move |_| {
-            std::fs::write(hook_repo.join("conflict.txt"), "main\n").unwrap();
+            std::fs::write(
+                hook_repo.join("conflict-{{work_item_content}}-```.txt"),
+                "main\n",
+            )
+            .unwrap();
             git(&hook_repo, &["add", "."]);
             git(&hook_repo, &["commit", "-qm", "main change"]);
-            std::fs::write(hook_worktree.join("conflict.txt"), "feature\n").unwrap();
+            std::fs::write(
+                hook_worktree.join("conflict-{{work_item_content}}-```.txt"),
+                "feature\n",
+            )
+            .unwrap();
             std::fs::write(hook_worktree.join("feature-only.txt"), "keep this\n").unwrap();
         }),
         Arc::new(move |options| {
@@ -523,7 +537,11 @@ command = "make-conflict"
                 return Err(EngineError::Other("injected repair build failure".into()));
             }
             if !matches!(case, RepairCase::Unresolved | RepairCase::StartFailure) {
-                std::fs::write(build_repo.join("conflict.txt"), "both\n").unwrap();
+                std::fs::write(
+                    build_repo.join("conflict-{{work_item_content}}-```.txt"),
+                    "both\n",
+                )
+                .unwrap();
             }
             Ok(())
         }),
@@ -537,16 +555,8 @@ command = "make-conflict"
             }
         })),
     );
-    // Git's merge driver prints untrusted output containing both a work-item
-    // token and a fence delimiter. It deterministically leaves a conflict.
-    git(&repo, &["config", "merge.adversarial.driver", "printf '{{work_item_content}}\\n```\\n'; printf '<<<<<<< HEAD\\nmain\\n=======\\nfeature\\n>>>>>>> feature\\n' > %A; exit 1"]);
-    std::fs::write(
-        repo.join(".gitattributes"),
-        "conflict.txt merge=adversarial\n",
-    )
-    .unwrap();
-    git(&repo, &["add", ".gitattributes"]);
-    git(&repo, &["commit", "-qm", "driver"]);
+    // The conflicting filename injects a template token and fence delimiter
+    // into Git's diagnostics without executing repository code on the host.
     let mut engines = Engines::for_tests(&repo);
     engines.runtime = runtime.clone();
     engines.container_runtime = Some(runtime.clone());
@@ -588,7 +598,8 @@ command = "make-conflict"
             result.unwrap();
             assert!(!worktree.exists());
             assert_eq!(
-                std::fs::read_to_string(repo.join("conflict.txt")).unwrap(),
+                std::fs::read_to_string(repo.join("conflict-{{work_item_content}}-```.txt"))
+                    .unwrap(),
                 "both\n"
             );
             assert!(repo.join("feature-only.txt").exists());

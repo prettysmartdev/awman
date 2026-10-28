@@ -79,6 +79,7 @@ fn make_app_state_with_workdirs(
         store: Arc::new(store),
         paths,
         workdirs,
+        workdir_roots: Vec::new(),
         started_at: Instant::now(),
         task_handles: tokio::sync::Mutex::new(Vec::new()),
         auth_mode: auth,

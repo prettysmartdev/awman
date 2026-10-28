@@ -47,6 +47,7 @@ pub struct AppState {
     pub store: Arc<SqliteSessionStore>,
     pub paths: ApiPaths,
     pub workdirs: Vec<PathBuf>,
+    pub workdir_roots: Vec<PathBuf>,
     pub started_at: Instant,
     pub task_handles: tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
     pub auth_mode: AuthMode,
@@ -306,7 +307,12 @@ async fn handle_workdirs(State(state): State<Arc<AppState>>) -> impl IntoRespons
         .iter()
         .map(|p| p.display().to_string())
         .collect();
-    Json(serde_json::json!({ "workdirs": dirs }))
+    let roots: Vec<String> = state
+        .workdir_roots
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect();
+    Json(serde_json::json!({ "workdirs": dirs, "roots": roots }))
 }
 
 async fn handle_create_session(
@@ -328,8 +334,9 @@ async fn handle_create_session(
         merge_refs: body.merge_refs,
         push: body.push,
     };
-    let policy = SessionCreatePolicy::new(state.workdirs.clone(), session_dir.clone());
-    let plan = match request.validate(&policy) {
+    let policy = SessionCreatePolicy::new(state.workdirs.clone(), session_dir.clone())
+        .with_workdir_roots(state.workdir_roots.clone());
+    let plan = match request.validate(&policy, state.engines.git_engine.as_ref()) {
         Ok(plan) => plan,
         Err(e) => {
             return (session_create_error_status(&e), error_json(e.to_string())).into_response();
@@ -1428,6 +1435,7 @@ mod tests {
             store,
             paths,
             workdirs: Vec::new(),
+            workdir_roots: Vec::new(),
             started_at: Instant::now(),
             task_handles: tokio::sync::Mutex::new(Vec::new()),
             auth_mode: AuthMode::Disabled,

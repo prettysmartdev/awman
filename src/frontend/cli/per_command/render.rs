@@ -899,6 +899,7 @@ mod tests {
             port: 9876,
             background: true,
             workdirs: vec!["/repo".into()],
+            workdir_roots: vec![],
             refreshed_key: false,
         };
         let s = render_api_server_start(&o);
@@ -912,6 +913,7 @@ mod tests {
             port: 8080,
             background: false,
             workdirs: vec![],
+            workdir_roots: vec![],
             refreshed_key: true,
         };
         let s = render_api_server_start(&o);

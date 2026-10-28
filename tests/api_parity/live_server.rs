@@ -51,6 +51,7 @@ fn make_app_state(root: &std::path::Path, auth: AuthMode) -> Arc<AppState> {
         store: Arc::new(store),
         paths,
         workdirs: vec![],
+        workdir_roots: Vec::new(),
         started_at: Instant::now(),
         task_handles: tokio::sync::Mutex::new(Vec::new()),
         auth_mode: auth,
@@ -136,6 +137,9 @@ async fn real_network_api_workdirs_endpoint_returns_200() {
     let url = format!("http://{addr}/v1/workdirs");
     let resp = reqwest::get(&url).await.expect("workdirs response");
     assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.expect("workdirs body");
+    assert!(body["workdirs"].is_array());
+    assert!(body["roots"].is_array());
 
     server.abort();
 }

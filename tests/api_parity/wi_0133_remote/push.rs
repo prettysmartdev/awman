@@ -356,8 +356,7 @@ async fn real_git_non_fast_forward_push_errors_at_stage_push_and_is_never_forced
     let last_status = events
         .lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .filter(|event| event["payload"]["type"] == "CommandStatus")
-        .last()
+        .rfind(|event| event["payload"]["type"] == "CommandStatus")
         .unwrap();
     assert_eq!(
         last_status["payload"]["data"]["status"], "error",

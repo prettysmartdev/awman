@@ -315,11 +315,7 @@ impl ExecWorkflowCommand {
             });
             None
         } else {
-            let git_root = self
-                .engines
-                .git_engine
-                .resolve_root(&cwd)
-                .map_err(CommandError::from)?;
+            let git_root = base_session.git_root().to_path_buf();
             Some(WorktreeLifecycle::for_work_item(
                 Arc::clone(&self.engines.git_engine),
                 git_root,
@@ -336,36 +332,52 @@ impl ExecWorkflowCommand {
             .as_ref()
             .map(|lifecycle| lifecycle.worktree_path())
             .unwrap_or(&git_root_for_scope);
-        let resume_plan = match frontend
-            .with(|frontend| self.offer_dynamic_resume(resume_root, wi_number, frontend))?
-        {
-            DynamicResumeOutcome::Resume(plan) => Some(plan),
-            DynamicResumeOutcome::Fresh => None,
-            DynamicResumeOutcome::Cancelled => {
-                frontend.write_message(UserMessage {
-                    level: MessageLevel::Info,
-                    text: format!(
-                        "exec workflow: cancelled; the previous dynamic run for work item \
+        let offer_resume = match lifecycle.as_ref() {
+            Some(lifecycle) => frontend.with(|frontend| {
+                lifecycle.should_offer_resume(frontend, self.flags.on_existing_worktree)
+            })?,
+            None => true,
+        };
+        let resume_plan = if !offer_resume {
+            None
+        } else {
+            match frontend
+                .with(|frontend| self.offer_dynamic_resume(resume_root, wi_number, frontend))?
+            {
+                DynamicResumeOutcome::Resume(plan) => Some(plan),
+                DynamicResumeOutcome::Fresh => None,
+                DynamicResumeOutcome::Cancelled => {
+                    frontend.write_message(UserMessage {
+                        level: MessageLevel::Info,
+                        text: format!(
+                            "exec workflow: cancelled; the previous dynamic run for work item \
                          {wi_number:04} is unchanged."
-                    ),
-                });
-                return Ok(ExecWorkflowOutcome {
-                    workflow: format!("dynamic-{wi_number:04}"),
-                    exit_code: None,
-                    worktree_used: false,
-                });
+                        ),
+                    });
+                    return Ok(ExecWorkflowOutcome {
+                        workflow: format!("dynamic-{wi_number:04}"),
+                        exit_code: None,
+                        worktree_used: false,
+                    });
+                }
             }
         };
 
         let (lifecycle, run_root, worktree_path, worktree_git_mount) = match lifecycle {
             Some(lifecycle) => {
-                // A confirmed resume answers the existing-worktree question.
-                let decision = resume_plan.is_some().then_some(
-                    crate::command::commands::worktree_lifecycle::ExistingWorktreeDecision::Resume,
+                // A confirmed resume answers the existing-worktree question
+                // unless `--on-existing-worktree` says otherwise.
+                let choice = super::execute::existing_worktree_choice(
+                    self.flags.on_existing_worktree,
+                    resume_plan.is_some(),
                 );
                 let (lifecycle, worktree_path) =
-                    frontend.prepare_worktree(lifecycle, decision).await?;
-                let worktree_git_mount = worktree_git_overlay(&worktree_path)?;
+                    frontend.prepare_worktree(lifecycle, choice).await?;
+                let worktree_git_mount = worktree_git_overlay(
+                    &self.engines.git_engine,
+                    lifecycle.git_root(),
+                    &worktree_path,
+                )?;
                 (
                     Some(lifecycle),
                     worktree_path.clone(),
@@ -387,11 +399,7 @@ impl ExecWorkflowCommand {
         } else {
             // Re-root at the worktree, carrying over the invoking session's
             // builtin block, default agent, env and global config.
-            let leader_git_root = self
-                .engines
-                .git_engine
-                .resolve_root(&run_root)
-                .map_err(CommandError::from)?;
+            let leader_git_root = run_root.clone();
             Session::open_worktree_for(run_root.clone(), leader_git_root, &self.session)
                 .map_err(|e| CommandError::Other(format!("opening worktree session: {e}")))?
         };
@@ -837,9 +845,7 @@ impl ExecWorkflowCommand {
         if let Some(root) = &self.workflow_state_root {
             return root.clone();
         }
-        Arc::clone(&self.engines.git_engine)
-            .resolve_root(session_root)
-            .unwrap_or_else(|_| session_root.to_path_buf())
+        session_root.to_path_buf()
     }
 
     /// Shared tail of both dynamic paths: build any missing agent images, run

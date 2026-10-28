@@ -265,6 +265,7 @@ Available via: CLI, TUI, API
 | `--max-concurrent` | usize (>= 1) | — | — | — | CLI, TUI, API | Cap on concurrently-running workflow steps (must be >= 1). |
 | `--on-dirty-merge-target` | enum: ask, commit, stash, fail | — | — | — | CLI, TUI, API | What to do when the merge target has uncommitted changes before a worktree branch is merged back. |
 | `--on-merge-failure` | enum: ask, agent, keep | — | — | — | CLI, TUI, API | What to do when merging a worktree branch back fails: ask, launch a fix agent, or keep the worktree. |
+| `--on-existing-worktree` | enum: ask, resume, recreate, fail | — | — | — | CLI, TUI, API | What to do when the worktree for this run already exists: ask, resume it, recreate it (deletes the worktree, its branch and that branch's commits), or fail. |
 
 ---
 
@@ -284,6 +285,7 @@ Available via: CLI, TUI
 |---|---|---|---|---|---|---|
 | `--port` | u16 | 9876 | — | — | CLI | Port to listen on. |
 | `--workdirs` | string (repeatable) | [] | — | — | CLI | Allowlisted working directories (repeatable). |
+| `--workdir-root` | string (repeatable) | [] | — | — | CLI | Allowlisted root directories; any git repository cloned directly beneath one may be used as a session workdir (repeatable). |
 | `--background` | bool | false | — | — | CLI | Daemonize via the OS process manager. |
 | `--refresh-key` | bool | false | — | — | CLI | Regenerate the API key. |
 | `--dangerously-skip-auth` | bool | false | — | — | CLI | Disable authentication for this execution even if a key hash exists on disk. |
@@ -606,6 +608,7 @@ Available via: CLI, TUI
 | `--max-concurrent` | usize (>= 1) | — | — | — | CLI, TUI, API | Cap on concurrently-running workflow steps (must be >= 1). |
 | `--on-dirty-merge-target` | enum: ask, commit, stash, fail | — | — | — | CLI, TUI, API | What to do when the merge target has uncommitted changes before a worktree branch is merged back. |
 | `--on-merge-failure` | enum: ask, agent, keep | — | — | — | CLI, TUI, API | What to do when merging a worktree branch back fails: ask, launch a fix agent, or keep the worktree. |
+| `--on-existing-worktree` | enum: ask, resume, recreate, fail | — | — | — | CLI, TUI, API | What to do when the worktree for this run already exists: ask, resume it, recreate it (deletes the worktree, its branch and that branch's commits), or fail. |
 
 #### `awman remote exec prompt`
 

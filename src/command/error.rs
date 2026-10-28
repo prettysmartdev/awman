@@ -99,6 +99,9 @@ pub enum CommandError {
         worktree_path: PathBuf,
     },
 
+    #[error("worktree already exists at {path} (branch {branch}); pass --on-existing-worktree resume to continue in it, or --on-existing-worktree recreate to delete it and its branch and start over")]
+    WorktreeExists { path: PathBuf, branch: String },
+
     // ── Remote command ────────────────────────────────────────────────────
     #[error("remote target address is missing or invalid")]
     MissingRemoteAddress,
@@ -124,6 +127,9 @@ pub enum CommandError {
     // ── API ───────────────────────────────────────────────────────────────
     #[error("API workdir not found: {path}")]
     ApiWorkdirNotFound { path: PathBuf },
+
+    #[error("API workdir root '{root}' is inside a git repository ({git_root}); list it with --workdirs instead, or choose a directory that only contains repositories")]
+    ApiWorkdirRootInvalid { root: PathBuf, git_root: PathBuf },
 
     #[error("API server already running on PID {pid}")]
     ApiServerAlreadyRunning { pid: u32 },
@@ -159,7 +165,7 @@ pub enum CommandError {
     // ── Session creation (multi-session frontends: API, future desktop, …) ──
     // Typed so that a frontend can map each to the right transport status
     // (e.g. HTTP 400 vs 403) without inspecting the message string. Display
-    // text is kept byte-identical to the previous inline API responses.
+    // text names the failed rule for allowlist refusals.
     #[error("session_type must be 'local' or 'remote'; got '{got}'")]
     SessionInvalidType { got: String },
 
@@ -169,10 +175,12 @@ pub enum CommandError {
     #[error("Cannot resolve path: {path}")]
     SessionWorkdirUnresolvable { path: String },
 
-    #[error("Workdir '{requested}' is not in the allowlist. Allowed: {allowed:?}")]
+    #[error("Workdir '{requested}' is not allowed: {rule}")]
     SessionWorkdirNotAllowed {
         requested: String,
+        rule: crate::command::session_create::WorkdirRefusal,
         allowed: Vec<String>,
+        roots: Vec<String>,
     },
 
     #[error("repo_url is required when session_type is 'remote'")]
@@ -377,6 +385,7 @@ impl CommandError {
         | CommandError::SessionWorkdirRequired
         | CommandError::SessionWorkdirUnresolvable { .. }
         | CommandError::SessionWorkdirNotAllowed { .. }
+        | CommandError::ApiWorkdirRootInvalid { .. }
         | CommandError::SessionRepoUrlRequired
         | CommandError::SessionRepoUrlEmpty
         | CommandError::SessionRepoUrlInvalidScheme { .. }
@@ -401,7 +410,7 @@ impl CommandError {
         CommandError::Engine(e) => e.exit_code(),
         CommandError::Data(_) => 1,
         CommandError::MergeConflict { .. } => 1,
-        CommandError::MergeTargetDirty { .. } => 1,
+        CommandError::MergeTargetDirty { .. } | CommandError::WorktreeExists { .. } => 1,
         CommandError::MissingRemoteAddress
         | CommandError::MissingApiKey
         | CommandError::RemoteTimeout
@@ -435,7 +444,9 @@ impl CommandError {
             CommandError::Engine(EngineError::AgentDefinitionUntrusted { .. }) => 403,
             CommandError::Engine(EngineError::UnknownAgent { .. }) => 404,
             CommandError::SessionWorkdirNotAllowed { .. } => 403,
-            CommandError::MergeTargetDirty { .. } | CommandError::MergeConflict { .. } => 409,
+            CommandError::MergeTargetDirty { .. }
+            | CommandError::MergeConflict { .. }
+            | CommandError::WorktreeExists { .. } => 409,
             _ => match self.exit_code() {
                 2 => 400,
                 4 => 404,

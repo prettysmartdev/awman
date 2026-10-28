@@ -1074,7 +1074,7 @@ impl GitEngine {
     pub fn is_clean(&self, path: &Path) -> Result<bool, EngineError>;
     pub fn uncommitted_files(&self, path: &Path) -> Result<Vec<String>, EngineError>;
 
-    // Worktree paths (convention: ~/.awman/worktrees/<repo>/<NNNN>/ or wf-<name>/)
+    // Worktree paths (convention: ~/.awman/worktrees/<dirname>-<hash8>/<NNNN>/ or wf-<name>/)
     pub fn worktree_path(&self, git_root: &Path, work_item: u32) -> Result<PathBuf, EngineError>;
     pub fn worktree_path_named(&self, git_root: &Path, name: &str) -> Result<PathBuf, EngineError>;
     pub fn branch_name_for_work_item(&self, work_item: u32) -> String;  // awman/work-item-NNNN
@@ -1095,8 +1095,8 @@ impl GitEngine {
 ```
 
 Naming conventions enforced by `GitEngine`:
-- Worktree path (work-item): `$HOME/.awman/worktrees/<repo-name>/<NNNN>/`
-- Worktree path (workflow): `$HOME/.awman/worktrees/<repo-name>/wf-<workflow-name>/`
+- Worktree path (work-item): `$HOME/.awman/worktrees/<repo-name>-<hash8>/<NNNN>/`
+- Worktree path (workflow): `$HOME/.awman/worktrees/<repo-name>-<hash8>/wf-<workflow-name>/`
 - Branch (work-item): `awman/work-item-<NNNN>` (zero-padded 4 digits)
 - Branch (workflow): `awman/workflow-<workflow-name>`
 - Merge commit: `"Implement <branch>"` (verbatim format preserved)
@@ -1895,7 +1895,7 @@ pub enum PreWorktreeDecision {
     Abort,
 }
 
-pub enum ExistingWorktreeDecision { Resume, Recreate }
+pub enum ExistingWorktreeDecision { Resume, Recreate, Fail }
 
 pub enum PostWorkflowWorktreeAction { Merge, Discard, Keep }
 
@@ -1904,13 +1904,15 @@ pub enum WorktreeMergeMode { Merge /* no squash */, Squash, LeaveBranch }
 
 #### `WorktreeLifecycleFrontend` trait
 
-Defined by Layer 2, implemented by Layer 3:
+Defined by Layer 2, implemented by Layer 3. It also exposes `existing_worktree_after_resume(path, branch) -> Result<ExistingWorktreeDecision, CommandError>` (interactive default Resume; headless profile default), and `report_worktree_resumed(path, branch)` for tracking the active path:
 
 ```rust
 pub trait WorktreeLifecycleFrontend: UserMessageSink + Send + Sync {
     fn ask_pre_worktree_uncommitted_files(&mut self, files: &[String]) -> Result<PreWorktreeDecision, CommandError>;
     fn ask_existing_worktree(&mut self, path: &Path, branch: &str) -> Result<ExistingWorktreeDecision, CommandError>;
     fn report_worktree_created(&mut self, path: &Path, branch: &str);
+    fn report_worktree_resumed(&mut self, path: &Path, branch: &str);
+    fn existing_worktree_after_resume(&mut self, path: &Path, branch: &str) -> Result<ExistingWorktreeDecision, CommandError>;
     fn ask_post_workflow_action(&mut self, branch: &str, had_error: bool) -> Result<PostWorkflowWorktreeAction, CommandError>;
     fn ask_worktree_commit_before_merge(&mut self, branch: &str, files: &[String]) -> Result<Option<String>, CommandError>;
     fn ask_merge_mode(&mut self, branch: &str) -> Result<WorktreeMergeMode, CommandError>;
@@ -1928,25 +1930,28 @@ pub struct WorktreeLifecycle {
     git_engine: Arc<GitEngine>,
     git_root: PathBuf,
     worktree_path: PathBuf,
+    creation_path: PathBuf,
     branch: String,
 }
 
 impl WorktreeLifecycle {
-    /// Branch name: `awman/workflow-<name>`; path: `~/.awman/worktrees/<repo>/wf-<name>/`
+    /// Branch name: `awman/workflow-<name>`; path: `~/.awman/worktrees/<dirname>-<hash8>/wf-<name>/`
     pub fn for_workflow(git_engine: Arc<GitEngine>, git_root: PathBuf, workflow_name: &str) -> Self;
 
     pub fn worktree_path(&self) -> &Path;
     pub fn branch(&self) -> &str;
 
     /// Pre-creation checks and worktree setup. Returns the worktree path (= mount root).
-    pub async fn prepare(&self, frontend: &mut dyn WorktreeLifecycleFrontend) -> Result<PathBuf, CommandError>;
+    pub async fn prepare(&mut self, frontend: &mut dyn WorktreeLifecycleFrontend) -> Result<PathBuf, CommandError>;
 
     /// Post-completion merge / discard / keep flow.
     pub async fn finalize(&self, frontend: &mut dyn WorktreeLifecycleFrontend, had_error: bool) -> Result<(), CommandError>;
 }
 ```
 
-`prepare` steps: check for existing worktree → if exists call `ask_existing_worktree` (Resume or Recreate); check for uncommitted files → if present call `ask_pre_worktree_uncommitted_files`; create worktree; report.
+Before reading or changing saved workflow state, `should_offer_resume` enforces explicit/default Fail and skips saved resume for Recreate. The API defaults to Fail, including when saved state exists; squad and piped CLI default to Resume. Interactive hosts keep the resume prompt.
+
+`prepare_with_existing` honors an explicit decision first. With `ResumeAccepted`, it calls `existing_worktree_after_resume`: interactive hosts return Resume without a second dialog, while headless hosts apply their profile default. With `Ask`, it calls `ask_existing_worktree`. Fail returns `WorktreeExists` with the path and branch. Resume verifies repository ownership before reporting the reused checkout. Recreate deletes the old branch and checkout, discarding its commits, and creates from current HEAD at the hashed path. A failed branch deletion preserves the original checkout and HEAD. Before creation it checks uncommitted files via `ask_pre_worktree_uncommitted_files`, then creates and reports the effective path, which finalization also uses.
 
 `finalize` steps: call `ask_post_workflow_action`; on Merge → `ask_merge_mode` (plain merge / squash / leave branch alone) → optional commit of uncommitted files (runs for every mode, including LeaveBranch) → merge per mode → optional cleanup; on Discard → remove worktree + branch; on Keep → report.
 

@@ -992,6 +992,40 @@ Press [r] to retry, or any other key to abort:
 | `--on-dirty-merge-target=<POLICY>` | Action for uncommitted changes in the merge target: `ask`, `commit`, `stash`, or `fail` |
 | `--on-merge-failure=<POLICY>` | Action after a failed merge: `ask`, `agent`, or `keep` |
 
+### Worktrees
+
+`--worktree` runs the workflow on its own branch in a worktree under
+`~/.awman/worktrees/<repo-name>-<hash>/`, where `<hash>` is 8 hex characters
+derived from the repository's full path. A work item uses `<NNNN>/` inside that
+folder and a named workflow uses `wf-<name>/`. The hash keeps two checkouts that
+share a folder name (for example two clones both called `app`) apart. A worktree
+created by an earlier awman under the plain `<repo-name>/` folder is still found
+and reused only when Git lists it for the same repository and its checkout pointer and administrative registration agree. Recreating a legacy worktree moves the fresh checkout to the hashed path.
+
+If the worktree for a run already exists (for example after an interrupted run),
+choose what happens with `--on-existing-worktree`:
+
+| Value | Behaviour |
+|-------|-----------|
+| `ask` | Ask where the host can prompt. This is the default in the TUI and an interactive CLI. |
+| `resume` | Continue in the existing worktree and branch. |
+| `recreate` | Delete the worktree, delete its branch **and every commit on that branch**, then start fresh from `HEAD`. |
+| `fail` | Stop with an error naming the worktree path and branch. Nothing is changed. |
+
+When the flag is absent, the TUI and an interactive CLI ask, unless you have
+accepted a workflow or dynamic-workflow resume, in which case the existing
+worktree is reused without a second question. A piped or `--non-interactive` CLI
+run, and the squad daemon, resume. The API fails (see
+[Existing worktrees](09-api-and-remote-mode.md#existing-worktrees)). An explicit
+value always wins.
+
+`recreate` is destructive: unlike resuming, it discards the branch and any work
+committed on it. If Git cannot delete the branch (for example, it is checked out
+in another worktree), the run stops with Git's error and the branch is left
+intact, together with the original checkout and its uncommitted files. Recreate also refuses a target that has been switched to a different branch.
+
+Host-side Git operations disable repository hooks, fsmonitor, signing, automatic maintenance and configured external content drivers (filters, diff and merge drivers). Git commands run by agents inside their containers retain their usual repository configuration.
+
 ### Worktree merge-back
 
 When `--worktree` is active (including the worktree implied by `--yolo` or

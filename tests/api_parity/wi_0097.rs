@@ -80,6 +80,7 @@ fn make_app_state_with_workdirs(
         store: Arc::new(store),
         paths,
         workdirs,
+        workdir_roots: Vec::new(),
         started_at: Instant::now(),
         task_handles: tokio::sync::Mutex::new(Vec::new()),
         auth_mode: AuthMode::Disabled,
@@ -279,7 +280,7 @@ async fn real_network_create_session_local_offallowlist_workdir_returns_403() {
         body["error"]
             .as_str()
             .unwrap_or("")
-            .contains("not in the allowlist"),
+            .contains("not an allowlisted workdir and not a direct child of an allowlisted root"),
         "got {body}"
     );
 

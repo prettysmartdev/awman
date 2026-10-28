@@ -277,10 +277,7 @@ pub(crate) async fn execute_prepared(
         let session_root_for_state = worktree_path.as_deref().unwrap_or(&cwd).to_path_buf();
         let git_root_for_state = match workflow_state_root {
             Some(root) => root.to_path_buf(),
-            None => match Arc::clone(&engines.git_engine).resolve_root(&session_root_for_state) {
-                Ok(r) => r,
-                Err(_) => session_root_for_state,
-            },
+            None => session_root_for_state,
         };
         let store =
             crate::data::workflow_state_store::WorkflowStateStore::at_git_root(git_root_for_state);
@@ -338,19 +335,7 @@ pub(crate) async fn execute_prepared(
     // When a worktree is active, re-root the session at the worktree so
     // that `build_options` mounts the worktree checkout, not the main repo.
     let mut session = if let Some(ref wt) = worktree_path {
-        let git_root_for_session = match Arc::clone(&engines.git_engine).resolve_root(wt) {
-            Ok(r) => r,
-            Err(e) => {
-                let err = CommandError::from(e);
-                shared.lock().unwrap().write_message(UserMessage {
-                    level: MessageLevel::Error,
-                    text: format!(
-                        "exec workflow: failed to resolve git root for worktree session: {err}"
-                    ),
-                });
-                return Err(err);
-            }
-        };
+        let git_root_for_session = wt.clone();
         // The invoker's builtin block, default agent, env and global config
         // carry over: the worktree checkout lacks uncommitted edits.
         match Session::open_worktree_for(wt.clone(), git_root_for_session, &original_session) {

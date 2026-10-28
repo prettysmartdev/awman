@@ -28,7 +28,7 @@
 //! | [`workflow_next_action`](HeadlessDefaults::workflow_next_action) | `can_launch_next ? LaunchNext : can_finish_workflow ? FinishWorkflow : Abort` | `LaunchNext` | `LaunchNext` |
 //! | [`yolo_tick`](HeadlessDefaults::yolo_tick) | `Continue` | `Continue` | `Continue` |
 //! | [`pre_worktree_uncommitted_files`](HeadlessDefaults::pre_worktree_uncommitted_files) | `Commit { message: m }` | `UseLastCommit` | `UseLastCommit` |
-//! | [`existing_worktree`](HeadlessDefaults::existing_worktree) | `Resume` | `Resume` | `Resume` |
+//! | [`existing_worktree`](HeadlessDefaults::existing_worktree) | `Fail` | `Resume` | `Resume` |
 //! | [`post_workflow_action`](HeadlessDefaults::post_workflow_action) | `e ? Keep : Merge` | `Keep` | `Keep` |
 //! | [`worktree_commit_before_merge`](HeadlessDefaults::worktree_commit_before_merge) | `Some(m)` | `None` | `None` |
 //! | [`merge_mode`](HeadlessDefaults::merge_mode) | `Squash` | `LeaveBranch` | `LeaveBranch` |
@@ -59,7 +59,7 @@
 //!
 //! ## Where the profiles genuinely differ
 //!
-//! Nine rows are not uniform, and each is a per-host policy worth stating:
+//! Ten rows are not uniform, and each is a per-host policy worth stating:
 //!
 //! - **`agent_setup`.** Only the API refuses to proceed when the default agent
 //!   is unavailable. An HTTP caller named an agent and gets an error rather
@@ -78,6 +78,11 @@
 //!   result is fetched over HTTP, so leaving branches around strands the work.
 //!   Squad and the CLI never touch a user's working tree or branches
 //!   unattended.
+//! - **`existing_worktree`.** The API fails closed on a leftover worktree
+//!   (`CommandError::WorktreeExists`): it may hold another client's work or a
+//!   stale saved run, and resuming it is the client's explicit choice
+//!   (`--on-existing-worktree resume`). Squad and the piped CLI resume it, as
+//!   they always have.
 //! - **`mount_scope`.** Squad answers with the scope captured when the task was
 //!   created rather than a constant; that is why [`HeadlessDefaults::squad`]
 //!   takes it as an argument.
@@ -258,8 +263,15 @@ impl HeadlessDefaults {
     }
 
     /// Answer for `WorktreeLifecycleFrontend::ask_existing_worktree`.
+    ///
+    /// The API fails closed: resuming a leftover worktree is the client's
+    /// explicit choice (`--on-existing-worktree resume`). Squad and the piped
+    /// CLI resume it.
     pub fn existing_worktree(&self) -> ExistingWorktreeDecision {
-        ExistingWorktreeDecision::Resume
+        match self.profile {
+            Profile::Api => ExistingWorktreeDecision::Fail,
+            Profile::Squad | Profile::Cli => ExistingWorktreeDecision::Resume,
+        }
     }
 
     /// Answer for `WorktreeLifecycleFrontend::ask_post_workflow_action`.
@@ -475,6 +487,12 @@ mod tests {
             cli: "UseLastCommit",
         },
         Row {
+            question: "existing_worktree",
+            api: "Fail",
+            squad: "Resume",
+            cli: "Resume",
+        },
+        Row {
             question: "post_workflow_action(had_error = false)",
             api: "Merge",
             squad: "Keep",
@@ -628,6 +646,7 @@ mod tests {
                     other => format!("{other:?}"),
                 },
             ),
+            ("existing_worktree", format!("{:?}", d.existing_worktree())),
             (
                 "post_workflow_action(had_error = false)",
                 format!("{:?}", d.post_workflow_action(&post_workflow_prompt(false))),
@@ -727,10 +746,6 @@ mod tests {
             HeadlessDefaults::squad(SQUAD_TASK_SCOPE),
             HeadlessDefaults::cli(),
         ] {
-            assert_eq!(
-                defaults.existing_worktree(),
-                ExistingWorktreeDecision::Resume
-            );
             assert!(matches!(defaults.yolo_tick(), YoloTickOutcome::Continue));
             assert!(!defaults.replace_aspec());
             assert!(!defaults.run_audit());

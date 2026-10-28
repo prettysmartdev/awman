@@ -1095,6 +1095,7 @@ fn squad_workflow_flags(
         dynamic: false,
         on_dirty_merge_target: None,
         on_merge_failure: None,
+        on_existing_worktree: None,
         leader: None,
     }
 }

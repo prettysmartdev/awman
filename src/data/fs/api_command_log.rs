@@ -18,7 +18,9 @@ use crate::data::workflow_state::WorkflowState;
 /// Owns the filesystem side of a command's live workflow state so the API
 /// frontend never touches the filesystem itself. Synchronous because the
 /// engine reports state from its synchronous persistence path.
+#[derive(Clone)]
 pub struct CommandStateWriter {
+    worktree: std::sync::Arc<std::sync::Mutex<Option<std::path::PathBuf>>>,
     paths: ApiPaths,
     session_id: String,
     command_id: String,
@@ -31,10 +33,29 @@ impl CommandStateWriter {
         command_id: impl Into<String>,
     ) -> Self {
         Self {
+            worktree: Default::default(),
             paths,
             session_id: session_id.into(),
             command_id: command_id.into(),
         }
+    }
+
+    /// Shared with the queue worker so early errors after preparation still
+    /// return the checkout path. Snapshot only surviving directories.
+    pub fn record_worktree(&self, path: &std::path::Path) {
+        *self.worktree.lock().expect("worktree result poisoned") = Some(path.to_path_buf());
+    }
+
+    pub fn clear_worktree(&self) {
+        *self.worktree.lock().expect("worktree result poisoned") = None;
+    }
+
+    pub fn kept_worktree(&self) -> Option<std::path::PathBuf> {
+        self.worktree
+            .lock()
+            .expect("worktree result poisoned")
+            .clone()
+            .filter(|path| path.is_dir())
     }
 
     pub fn write(&self, state: &WorkflowState) -> Result<(), DataError> {
