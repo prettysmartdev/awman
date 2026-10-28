@@ -101,6 +101,8 @@ pub struct ApiDispatchFrontend {
     done_emitted: std::sync::atomic::AtomicBool,
     /// The queue worker owns completion when post-command stages are enabled.
     emit_done_on_drop: bool,
+    /// The queue worker emits workflow completion after stdout/stderr drains.
+    defer_command_status: bool,
     /// Throttle: last time a yolo countdown status message was emitted.
     last_sink_message_time: Option<std::time::Instant>,
     /// What the countdown currently being ticked will do when it expires
@@ -181,6 +183,7 @@ impl ApiDispatchFrontend {
             phase_emitted: std::sync::Mutex::new(false),
             done_emitted: std::sync::atomic::AtomicBool::new(false),
             emit_done_on_drop: true,
+            defer_command_status: false,
             last_sink_message_time: None,
             countdown_kind: CountdownKind::StuckStep,
             // The *catalogue's* spelling of the path, not the request's. This
@@ -204,6 +207,7 @@ impl ApiDispatchFrontend {
     /// Let the queue worker emit `Done` after post-command stages finish.
     pub fn deferring_done(mut self) -> Self {
         self.emit_done_on_drop = false;
+        self.defer_command_status = true;
         self
     }
 
@@ -469,7 +473,7 @@ impl AgentFrontend for ApiDispatchFrontend {
         // so the container sees EOF promptly.
 
         // Drain stdout → event bus (line-buffered).
-        tokio::spawn(async move {
+        event_bus_stdout.clone().spawn_drain(async move {
             let mut buf = String::new();
             while let Some(bytes) = stdout_rx.recv().await {
                 let text = String::from_utf8_lossy(&bytes);
@@ -486,7 +490,7 @@ impl AgentFrontend for ApiDispatchFrontend {
         });
 
         // Drain stderr → event bus (line-buffered).
-        tokio::spawn(async move {
+        event_bus_stderr.clone().spawn_drain(async move {
             let mut buf = String::new();
             while let Some(bytes) = stderr_rx.recv().await {
                 let text = String::from_utf8_lossy(&bytes);
@@ -627,7 +631,7 @@ impl AgentFrontend for ApiContainerSink {
         let (stderr_tx, mut stderr_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
         let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
 
-        tokio::spawn(async move {
+        event_bus_stdout.clone().spawn_drain(async move {
             let mut buf = String::new();
             while let Some(bytes) = stdout_rx.recv().await {
                 let text = String::from_utf8_lossy(&bytes);
@@ -643,7 +647,7 @@ impl AgentFrontend for ApiContainerSink {
             }
         });
 
-        tokio::spawn(async move {
+        event_bus_stderr.clone().spawn_drain(async move {
             let mut buf = String::new();
             while let Some(bytes) = stderr_rx.recv().await {
                 let text = String::from_utf8_lossy(&bytes);
@@ -964,16 +968,22 @@ impl WorkflowFrontend for ApiDispatchFrontend {
                 format!("Step '{last_step}' failed"),
             ),
         };
-        self.event_bus.emit(EventPayload::WorkflowPhaseTransition {
+        let phase = EventPayload::WorkflowPhaseTransition {
             phase: "main".to_string(),
             step_desc,
             status: phase_status,
-        });
-        self.event_bus.emit(EventPayload::CommandStatus {
+        };
+        let payload = EventPayload::CommandStatus {
             status,
             exit_code,
             error,
-        });
+        };
+        if self.defer_command_status {
+            self.event_bus.defer_workflow_completion(phase, payload);
+        } else {
+            self.event_bus.emit(phase);
+            self.event_bus.emit(payload);
+        }
     }
 }
 
@@ -1346,6 +1356,137 @@ mod tests {
         let sender = bus.sender();
         let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
         ApiDispatchFrontend::new(subcommand, &args, sender)
+    }
+
+    // ─── WI 0136: output drains finish before Done ─────────────────────────
+    //
+    // The queue worker waits for the bus's drain barrier and only then emits
+    // `Done`. Writing right up to exit, the last stdout line (even without a
+    // trailing newline) must precede `Done` for every consumer.
+
+    /// One simulated run: output is produced right up to "exit" by a
+    /// concurrent producer, then the worker's barrier and `Done`.
+    async fn run_once(run: usize, lines: usize, unterminated_tail: bool) {
+        use crate::command::commands::api_server::event_bus::EventBus;
+        use crate::data::execution_event::ExecutionEvent;
+
+        let bus = EventBus::new(4096);
+        let mut live = bus.subscribe();
+        let mut log = bus.subscribe_log();
+        let mut fe = ApiDispatchFrontend::new("exec prompt", &[], bus.sender()).deferring_done();
+        let io = AgentFrontend::take_io(&mut fe);
+
+        let stdout = io.stdout.clone();
+        let stderr = io.stderr.clone();
+        drop(io);
+        let last = format!("last-{run}");
+        let producer = tokio::spawn({
+            let last = last.clone();
+            async move {
+                for i in 0..lines {
+                    stdout.send(format!("line {i}\n").into_bytes()).unwrap();
+                    if i % 7 == 0 {
+                        stderr.send(format!("err {i}\n").into_bytes()).unwrap();
+                        tokio::task::yield_now().await;
+                    }
+                }
+                let tail = if unterminated_tail {
+                    last
+                } else {
+                    format!("{last}\n")
+                };
+                // Split the tail across chunks so a partial line is buffered.
+                let (head, rest) = tail.split_at(2);
+                stdout.send(head.as_bytes().to_vec()).unwrap();
+                stdout.send(rest.as_bytes().to_vec()).unwrap();
+                // Senders drop here: the container's pipes closed on exit.
+            }
+        });
+        producer.await.unwrap();
+        fe.report_workflow_completed(&WorkflowOutcome::Completed);
+        drop(fe);
+
+        assert!(
+            bus.wait_output_drained(Duration::from_secs(5)).await,
+            "run {run}: drains must finish once the pipes close"
+        );
+        bus.emit_deferred_command_status();
+        bus.sender().emit(EventPayload::Done);
+
+        let mut from_live: Vec<ExecutionEvent> = Vec::new();
+        while let Ok(event) = live.try_recv() {
+            from_live.push(event);
+        }
+        let mut from_log: Vec<ExecutionEvent> = Vec::new();
+        while let Ok(event) = log.try_recv() {
+            from_log.push(event);
+        }
+        for (name, events) in [("stream", from_live), ("events.log", from_log)] {
+            let done = events
+                .iter()
+                .position(|e| matches!(e.payload, EventPayload::Done))
+                .unwrap_or_else(|| panic!("run {run}: {name} has no Done"));
+            assert_eq!(done, events.len() - 1, "run {run}: {name} Done is last");
+            let last_stdout = events
+                .iter()
+                .rposition(|e| matches!(e.payload, EventPayload::StdoutLine(_)))
+                .unwrap();
+            assert!(
+                matches!(&events[last_stdout].payload, EventPayload::StdoutLine(s) if *s == last),
+                "run {run}: {name} last stdout line was {:?}",
+                events[last_stdout].payload
+            );
+            assert!(last_stdout < done, "run {run}: {name} stdout before Done");
+            let status = events
+                .iter()
+                .position(|e| matches!(e.payload, EventPayload::CommandStatus { .. }))
+                .unwrap();
+            let last_output = events
+                .iter()
+                .rposition(|e| {
+                    matches!(
+                        e.payload,
+                        EventPayload::StdoutLine(_) | EventPayload::StderrLine(_)
+                    )
+                })
+                .unwrap();
+            assert!(
+                last_output < status && status < done,
+                "run {run}: {name} completion order"
+            );
+            let sequences: Vec<u64> = events.iter().map(|e| e.sequence).collect();
+            let expected: Vec<u64> = (0..events.len() as u64).collect();
+            assert_eq!(sequences, expected, "run {run}: {name} dense sequences");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stress_last_stdout_line_always_precedes_done_in_stream_and_log() {
+        // Many short runs: the race window is the gap between the producer's
+        // last write and the worker emitting Done.
+        let mut runs = Vec::new();
+        for run in 0..200 {
+            runs.push(tokio::spawn(run_once(
+                run,
+                5 + run % 40,
+                run.is_multiple_of(2),
+            )));
+        }
+        for run in runs {
+            run.await.unwrap();
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drain_barrier_times_out_when_a_pipe_never_closes() {
+        use crate::command::commands::api_server::event_bus::EventBus;
+
+        let bus = EventBus::new(16);
+        let mut fe = ApiDispatchFrontend::new("exec prompt", &[], bus.sender());
+        let io = AgentFrontend::take_io(&mut fe);
+        // `io` keeps the senders alive, as a backend that leaks a pipe would.
+        assert!(!bus.wait_output_drained(Duration::from_millis(50)).await);
+        drop(io);
     }
 
     // ─── ReadyFrontend::{report_phase, report_summary} ─────────────────────

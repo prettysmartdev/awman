@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use super::cancel::TokenRegistry;
 use super::event_bus::EventBus;
@@ -13,12 +14,24 @@ use crate::command::dispatch::{CommandOutcome, Dispatch, Engines};
 use crate::data::api_lifecycle_store::CommandLifecycleStore;
 use crate::data::command_status::{CommandStatus, CANCELLED_EXIT_CODE};
 use crate::data::execution_event::{
-    CommandStatusKind, EventPayload, PhaseStatusKind, StepStatusKind,
+    CommandStatusKind, EventPayload, PhaseStatusKind, StepStatusKind, FIRST_ATTEMPT,
 };
 use crate::data::fs::api_command_log::{CommandLogWriter, CommandStateWriter};
 use crate::data::fs::api_db::{CommandRecord, CommandResult, SqliteSessionStore};
 use crate::data::fs::api_paths::ApiPaths;
 use crate::data::session_manager::SessionManager;
+
+const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+async fn wait_for_output_drains(event_bus: &EventBus, command_id: &str) {
+    if !event_bus.wait_output_drained(OUTPUT_DRAIN_TIMEOUT).await {
+        tracing::warn!(
+            command_id = %command_id,
+            timeout_seconds = OUTPUT_DRAIN_TIMEOUT.as_secs(),
+            "output drain did not finish; trailing agent output may be missing"
+        );
+    }
+}
 
 /// The completion projection persisted by the queue worker, shared by the
 /// command row, its result JSON and final metadata.
@@ -185,7 +198,7 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
                 ))
             })?;
             let session = session.read().await.clone();
-            let bus = EventBus::new(4096);
+            let bus = EventBus::for_attempt(4096, cmd.attempt);
             let writer = CommandStateWriter::new(self.paths.clone(), &cmd.session_id, &id);
             let frontend = self
                 .frontend_factory
@@ -204,6 +217,9 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
                 )),
             )
             .await?;
+            // Recovery only finishes teardown for an already-cancelled row.
+            // Its private bus is intentionally neither published nor logged;
+            // restarting sequence zero must not append duplicate event ids.
             self.paths.remove_command_cleanup(&cmd.session_id, &id)?;
             self.post_execution_check(&cmd.session_id, &id).await;
         }
@@ -314,6 +330,7 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
                 "session_id": session_id,
                 "subcommand": subcommand,
                 "args": args,
+                "attempt": cmd.attempt,
                 "started_at": cmd.started_at,
                 "worker_id": self.worker_id,
             });
@@ -323,17 +340,17 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
         }
 
         // Create EventBus for this command execution.
-        let event_bus = Arc::new(EventBus::new(4096));
+        let event_bus = Arc::new(EventBus::for_attempt(4096, cmd.attempt));
 
         // Spawn logfile writer task. The two log files are owned by a Layer 0
         // writer so this frontend performs no filesystem calls of its own.
         let log_writer = {
-            let mut log_rx = event_bus.subscribe();
+            let mut log_rx = event_bus.subscribe_log();
             let paths = self.paths.clone();
             let session_id_for_log = session_id.clone();
             let command_id_for_log = command_id.clone();
             tokio::spawn(async move {
-                let mut writer = match CommandLogWriter::create(
+                let mut writer = match CommandLogWriter::open_append(
                     &paths,
                     &session_id_for_log,
                     &command_id_for_log,
@@ -346,19 +363,11 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
                         return;
                     }
                 };
-                loop {
-                    match log_rx.recv().await {
-                        Ok(event) => {
-                            writer.write_event(&event).await;
-                            if matches!(event.payload, EventPayload::Done) {
-                                writer.flush().await;
-                                break;
-                            }
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                            tracing::warn!(lagged = n, "Logfile writer lagged");
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                while let Some(event) = log_rx.recv().await {
+                    writer.write_event(&event).await;
+                    if matches!(event.payload, EventPayload::Done) {
+                        writer.flush().await;
+                        break;
                     }
                 }
             })
@@ -382,6 +391,16 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
             .await
             .insert(command_id.clone(), Arc::clone(&event_bus));
 
+        // A re-queued command says so as the first event of its new attempt,
+        // so a client reading the appended log or attached live sees why the
+        // output restarts (WI 0136).
+        if cmd.attempt > FIRST_ATTEMPT {
+            event_bus.sender().emit(EventPayload::StatusMessage {
+                phase: "queue".into(),
+                message: format!("re-queued after restart (attempt {})", cmd.attempt),
+            });
+        }
+
         // The API frontend supplies the presentation adapter through its
         // factory; Layer 2 owns everything around command execution.
         let state_writer = CommandStateWriter::new(self.paths.clone(), &session_id, &command_id);
@@ -399,6 +418,7 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
                     "Session not found in memory"
                 );
                 drop(frontend);
+                wait_for_output_drains(&event_bus, &command_id).await;
                 let result_json = serde_json::to_string(&serde_json::json!({
                     "error": "Session not found in memory",
                 }))
@@ -481,6 +501,13 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
                 )))
             }
         };
+
+        // Workflow completion is synchronous inside the frontend, so it is
+        // deferred until the tracked output tasks have emitted their final
+        // buffered lines. The timeout keeps cancellation from waiting forever
+        // if a backend leaves an output sender open.
+        wait_for_output_drains(&event_bus, &command_id).await;
+        event_bus.emit_deferred_command_status();
 
         // A cancel accepted before push-back begins wins over a clean exit:
         // the cancelled work is not published and the command is `cancelled`.
@@ -594,6 +621,7 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
                 "exit_code": exit_code,
                 "status": status,
                 "worker_id": self.worker_id,
+                "attempt": cmd.attempt,
             });
             let _ = self
                 .paths
@@ -607,7 +635,9 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
         if let Err(error) = self.paths.remove_command_cleanup(&session_id, &command_id) {
             tracing::warn!(%error, "Failed to retire command cleanup recipe");
         }
-        let _ = completion.persist(&self.store, &command_id);
+        if let Err(error) = completion.persist(&self.store, &command_id) {
+            tracing::error!(%error, %command_id, "Failed to persist command completion");
+        }
         self.cleanup_event_bus(&command_id).await;
         self.post_execution_check(&session_id, &command_id).await;
     }

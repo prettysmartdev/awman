@@ -40,3 +40,21 @@ treat `event: done` as the end of the command
 
 ## Documentation
 - `docs/09-api-and-remote-mode.md`: the event stream section.
+
+## Implementation decisions
+
+- Worker waiting has no deadline; comments are sent every 15 seconds and no
+  `timeout` event is emitted. Server shutdown/disconnect closes without `Done`.
+- Persisted event frames and terminal notifications have numeric cursor IDs.
+  The compatibility waiting status message remains id-less (`attempt: 0`,
+  `sequence: 0`), as do keepalive comments; neither advances Last-Event-ID.
+- `after` overrides `Last-Event-ID`. Ordinary events resume strictly after the
+  cursor, but a terminal connection always receives one `Done`, including a
+  reconnect at or beyond that marker's ID. Historical `Done` records are withheld
+  from SSE and retained in the full-history JSON snapshot.
+- Completion order is output drains, deferred main workflow phase/status
+  notifications, optional push-failure status, then `Done`. The drain wait is
+  bounded to five seconds for leaked pipes, with a warning of possible output
+  loss; publication after `Done` is refused.
+- Broadcast gaps are repaired from the reliable persisted log before advancing
+  the client cursor. Failed recovery closes without `Done`, allowing resume.

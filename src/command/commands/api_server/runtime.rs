@@ -246,7 +246,6 @@ impl ApiServerRuntime {
                         "Finalised commands cancelled before the restart"
                     );
                 }
-                ()
             }
             Err(error) => {
                 tracing::warn!(%error, "Failed to finalise interrupted cancellations");

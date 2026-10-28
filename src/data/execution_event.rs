@@ -7,11 +7,123 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+/// The first execution of a command. Re-queues after a daemon restart count
+/// up from here.
+pub const FIRST_ATTEMPT: u32 = 1;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionEvent {
     pub timestamp: DateTime<Utc>,
+    /// Which execution of the command produced this event (1-based). Lines
+    /// written before WI 0136 have no field and read back as attempt 1.
+    #[serde(default = "first_attempt")]
+    pub attempt: u32,
+    /// Position within the attempt; restarts at 0 for every attempt.
     pub sequence: u64,
     pub payload: EventPayload,
+}
+
+fn first_attempt() -> u32 {
+    FIRST_ATTEMPT
+}
+
+impl ExecutionEvent {
+    /// This event's position in the command's stream.
+    pub fn cursor(&self) -> EventCursor {
+        EventCursor::new(self.attempt, self.sequence)
+    }
+}
+
+/// A position in a command's event stream: `<attempt>:<sequence>`. This is the
+/// SSE `id:` of every persisted frame and the value of `Last-Event-ID` /
+/// `?after=`. Ordering is lexicographic (attempt first), which is the order
+/// events are appended to `events.log`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct EventCursor {
+    pub attempt: u32,
+    pub sequence: u64,
+}
+
+impl EventCursor {
+    pub const fn new(attempt: u32, sequence: u64) -> Self {
+        Self { attempt, sequence }
+    }
+
+    /// Parse exactly `<digits>:<digits>`. Returns `None` for anything else
+    /// (empty, whitespace, signs, missing colon, overflow). Attempt 0 parses;
+    /// it is never kept, so [`ReplayFrom::resolve`] treats it as unknown.
+    pub fn parse(s: &str) -> Option<Self> {
+        let (attempt, sequence) = s.split_once(':')?;
+        let all_digits = |part: &str| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit());
+        if !all_digits(attempt) || !all_digits(sequence) {
+            return None;
+        }
+        Some(Self::new(attempt.parse().ok()?, sequence.parse().ok()?))
+    }
+}
+
+impl std::fmt::Display for EventCursor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.attempt, self.sequence)
+    }
+}
+
+/// Parse `events.log` NDJSON text into events, in file order. Blank and
+/// malformed lines (a torn write from a crash) are skipped.
+pub fn parse_event_log(raw: &str) -> Vec<ExecutionEvent> {
+    raw.lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(|line| serde_json::from_str::<ExecutionEvent>(line).ok())
+        .collect()
+}
+
+/// The attempts that still have at least one event in `events`, ascending.
+pub fn kept_attempts(events: &[ExecutionEvent]) -> std::collections::BTreeSet<u32> {
+    events.iter().map(|e| e.attempt).collect()
+}
+
+/// Where a replay of `events.log` starts, given a client's resume cursor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplayFrom {
+    /// No cursor was given: replay everything.
+    Beginning,
+    /// The cursor's attempt is kept: replay only events strictly after it.
+    After(EventCursor),
+    /// The cursor names an attempt that is not kept (attempt 0, purged,
+    /// unknown, or newer than the command's current attempt): replay the
+    /// current attempt from its start.
+    StartOfAttempt(u32),
+}
+
+impl ReplayFrom {
+    /// Decide the replay start for a command whose current attempt is
+    /// `current_attempt`. A cursor beyond the head of a kept attempt is still
+    /// `After` (nothing replays; the client is ahead), not a fallback.
+    pub fn resolve(
+        events: &[ExecutionEvent],
+        current_attempt: u32,
+        requested: Option<EventCursor>,
+    ) -> Self {
+        match requested {
+            None => ReplayFrom::Beginning,
+            Some(cursor)
+                if cursor.attempt <= current_attempt
+                    && events.iter().any(|e| e.attempt == cursor.attempt) =>
+            {
+                ReplayFrom::After(cursor)
+            }
+            Some(_) => ReplayFrom::StartOfAttempt(current_attempt),
+        }
+    }
+
+    /// Whether `event` is part of the replay.
+    pub fn includes(&self, event: &ExecutionEvent) -> bool {
+        match self {
+            ReplayFrom::Beginning => true,
+            ReplayFrom::After(cursor) => event.cursor() > *cursor,
+            ReplayFrom::StartOfAttempt(attempt) => event.attempt == *attempt,
+        }
+    }
 }
 
 /// How far a workflow step has got, on the wire.
@@ -243,5 +355,198 @@ mod phase_log_tests {
             .to_plain_text(),
             Some("[setup] started: prepare".into())
         );
+    }
+}
+
+#[cfg(test)]
+mod cursor_tests {
+    use super::*;
+
+    fn event(attempt: u32, sequence: u64, payload: EventPayload) -> ExecutionEvent {
+        ExecutionEvent {
+            timestamp: Utc::now(),
+            attempt,
+            sequence,
+            payload,
+        }
+    }
+
+    fn line(n: &str) -> EventPayload {
+        EventPayload::StdoutLine(n.into())
+    }
+
+    #[test]
+    fn cursor_parses_attempt_and_sequence() {
+        assert_eq!(EventCursor::parse("1:0"), Some(EventCursor::new(1, 0)));
+        assert_eq!(
+            EventCursor::parse("12:345"),
+            Some(EventCursor::new(12, 345))
+        );
+        assert_eq!(EventCursor::parse("007:0009"), Some(EventCursor::new(7, 9)));
+        // Attempt 0 is syntactically valid; `ReplayFrom` treats it as unknown.
+        assert_eq!(EventCursor::parse("0:5"), Some(EventCursor::new(0, 5)));
+        assert_eq!(
+            EventCursor::parse("4294967295:18446744073709551615"),
+            Some(EventCursor::new(u32::MAX, u64::MAX))
+        );
+    }
+
+    #[test]
+    fn cursor_rejects_malformed_input() {
+        for bad in [
+            "",
+            ":",
+            "1",
+            "1:",
+            ":1",
+            "1:2:3",
+            "a:b",
+            "1:b",
+            "a:1",
+            "-1:2",
+            "1:-2",
+            "+1:2",
+            "1:+2",
+            " 1:2",
+            "1:2 ",
+            "1: 2",
+            "1 :2",
+            "1;2",
+            "1.0:2",
+            "0x1:2",
+            "١:٢",
+            "1:2\n",
+            "4294967296:0",
+            "1:18446744073709551616",
+        ] {
+            assert_eq!(EventCursor::parse(bad), None, "{bad:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn cursor_display_round_trips_through_parse() {
+        for cursor in [
+            EventCursor::new(1, 0),
+            EventCursor::new(3, 41),
+            EventCursor::new(u32::MAX, u64::MAX),
+        ] {
+            assert_eq!(EventCursor::parse(&cursor.to_string()), Some(cursor));
+        }
+        assert_eq!(EventCursor::new(2, 7).to_string(), "2:7");
+    }
+
+    #[test]
+    fn cursor_orders_by_attempt_then_sequence() {
+        assert!(EventCursor::new(1, 999) < EventCursor::new(2, 0));
+        assert!(EventCursor::new(2, 3) < EventCursor::new(2, 4));
+        // Numeric, not lexicographic: 10 > 9.
+        assert!(EventCursor::new(1, 9) < EventCursor::new(1, 10));
+        assert!(EventCursor::new(9, 0) < EventCursor::new(10, 0));
+    }
+
+    #[test]
+    fn event_cursor_reflects_attempt_and_sequence() {
+        assert_eq!(event(3, 8, EventPayload::Done).cursor().to_string(), "3:8");
+    }
+
+    #[test]
+    fn serialized_event_includes_attempt() {
+        let json = serde_json::to_value(event(2, 5, line("x"))).unwrap();
+        assert_eq!(json["attempt"], 2);
+        assert_eq!(json["sequence"], 5);
+    }
+
+    #[test]
+    fn legacy_line_without_attempt_deserializes_as_first_attempt() {
+        let legacy = r#"{"timestamp":"2026-01-01T00:00:00Z","sequence":4,"payload":{"type":"StdoutLine","data":"hi"}}"#;
+        let parsed: ExecutionEvent = serde_json::from_str(legacy).unwrap();
+        assert_eq!(parsed.attempt, FIRST_ATTEMPT);
+        assert_eq!(parsed.attempt, 1);
+        assert_eq!(parsed.cursor(), EventCursor::new(1, 4));
+    }
+
+    #[test]
+    fn parse_event_log_reads_mixed_legacy_and_new_lines_and_skips_damage() {
+        let legacy = r#"{"timestamp":"2026-01-01T00:00:00Z","sequence":0,"payload":{"type":"StdoutLine","data":"old"}}"#;
+        let new = serde_json::to_string(&event(2, 0, line("new"))).unwrap();
+        let raw = format!("{legacy}\n\n{{\"torn\":\n{new}\nnot json\n");
+        let events = parse_event_log(&raw);
+        let cursors: Vec<_> = events.iter().map(|e| e.cursor().to_string()).collect();
+        assert_eq!(cursors, ["1:0", "2:0"]);
+    }
+
+    #[test]
+    fn kept_attempts_lists_each_attempt_once() {
+        let events = vec![
+            event(1, 0, line("a")),
+            event(1, 1, line("b")),
+            event(3, 0, line("c")),
+        ];
+        assert_eq!(
+            kept_attempts(&events).into_iter().collect::<Vec<_>>(),
+            [1, 3]
+        );
+        assert!(kept_attempts(&[]).is_empty());
+    }
+
+    fn two_attempts() -> Vec<ExecutionEvent> {
+        vec![
+            event(1, 0, line("a1")),
+            event(1, 1, line("a2")),
+            event(2, 0, line("b1")),
+            event(2, 1, line("b2")),
+        ]
+    }
+
+    #[test]
+    fn resolve_without_a_cursor_replays_everything() {
+        let events = two_attempts();
+        let from = ReplayFrom::resolve(&events, 2, None);
+        assert_eq!(from, ReplayFrom::Beginning);
+        assert!(events.iter().all(|e| from.includes(e)));
+    }
+
+    #[test]
+    fn resolve_with_a_kept_attempt_resumes_strictly_after_the_cursor() {
+        let events = two_attempts();
+        for (cursor, expected) in [
+            (EventCursor::new(1, 0), vec!["1:1", "2:0", "2:1"]),
+            (EventCursor::new(1, 1), vec!["2:0", "2:1"]),
+            (EventCursor::new(2, 0), vec!["2:1"]),
+            (EventCursor::new(2, 1), vec![]),
+            // Ahead of the head of a kept attempt: nothing replays, no fallback.
+            (EventCursor::new(2, 99), vec![]),
+        ] {
+            let from = ReplayFrom::resolve(&events, 2, Some(cursor));
+            assert_eq!(from, ReplayFrom::After(cursor));
+            let got: Vec<_> = events
+                .iter()
+                .filter(|e| from.includes(e))
+                .map(|e| e.cursor().to_string())
+                .collect();
+            assert_eq!(got, expected, "after {cursor}");
+        }
+    }
+
+    #[test]
+    fn resolve_with_an_attempt_that_is_not_kept_restarts_the_current_attempt() {
+        let events = vec![event(2, 0, line("b1")), event(2, 1, line("b2"))];
+        for cursor in [
+            EventCursor::new(1, 5),  // purged / not in the log
+            EventCursor::new(0, 0),  // attempt 0 never exists
+            EventCursor::new(3, 0),  // newer than the row's attempt
+            EventCursor::new(40, 1), // far newer
+        ] {
+            let from = ReplayFrom::resolve(&events, 2, Some(cursor));
+            assert_eq!(from, ReplayFrom::StartOfAttempt(2), "{cursor}");
+            assert!(events.iter().all(|e| from.includes(e)));
+            assert!(!from.includes(&event(1, 0, line("older"))));
+        }
+    }
+
+    #[test]
+    fn resolve_with_an_empty_log_restarts_the_current_attempt() {
+        let from = ReplayFrom::resolve(&[], 3, Some(EventCursor::new(1, 0)));
+        assert_eq!(from, ReplayFrom::StartOfAttempt(3));
     }
 }
