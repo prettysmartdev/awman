@@ -632,6 +632,10 @@ teardown_on_failure = true
 
 If any teardown step fails, the error is logged and execution continues to the next teardown step (best-effort cleanup). Teardown failure does not retroactively change the workflow's success/failure status.
 
+### Teardown on cancel
+
+When an API client [cancels a running command](09-api-and-remote-mode.md#cancel-a-command), the workflow stops, and teardown still runs so cleanup steps are kept. The publishing steps `push_branch`, `create_pull_request` and `poll_ci` are skipped, and no `on_failure` retry or remediation is started. The command ends `cancelled` with exit code 130.
+
 ### Container execution model
 
 Every setup and teardown step that runs a command (every step type except `poll_ci`, which awman runs itself) gets its own container from the base image, with the session workdir mounted and only that step's overlays applied. How that container runs depends on where you started the workflow:

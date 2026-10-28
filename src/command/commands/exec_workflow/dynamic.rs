@@ -235,6 +235,8 @@ pub(crate) enum LeaderDriveOutcome {
     /// agent from scratch. The caller relaunches a fresh leader with the
     /// original prompt.
     Restart,
+    /// An external cancel request stopped the leader container.
+    Cancelled,
 }
 
 /// Outcome of the Workflow Control Board while it is driven from the dynamic
@@ -614,6 +616,13 @@ impl ExecWorkflowCommand {
         // to this interactive caller.
         let mut repair = WorkflowRepairLoop::new(generated_path.clone(), leader_prompt.clone());
         let validated_workflow = loop {
+            if self.cancel.is_cancelled() {
+                return Ok(self.cancelled_during_leader(
+                    &shared,
+                    wi_number,
+                    worktree_path.is_some(),
+                ));
+            }
             let label = repair.label();
             let current_prompt = repair.prompt().to_string();
             let drive = self
@@ -632,6 +641,13 @@ impl ExecWorkflowCommand {
                 .await?;
             match drive {
                 LeaderDriveOutcome::Advanced => {}
+                LeaderDriveOutcome::Cancelled => {
+                    return Ok(self.cancelled_during_leader(
+                        &shared,
+                        wi_number,
+                        worktree_path.is_some(),
+                    ));
+                }
                 LeaderDriveOutcome::Aborted => {
                     return Err(CommandError::Other(
                         "dynamic workflow aborted during the leader step".into(),
@@ -948,8 +964,32 @@ impl ExecWorkflowCommand {
             self.task_workspace.as_deref(),
             self.workflow_state_root.as_deref(),
             self.managed_session.as_ref(),
+            &self.cancel,
         )
         .await
+    }
+
+    /// The dynamic run was cancelled before its generated workflow started:
+    /// report it the way the engine reports a cancelled run, exit code 130.
+    fn cancelled_during_leader(
+        &self,
+        shared: &SharedWorkflowFrontend,
+        wi_number: u32,
+        worktree_used: bool,
+    ) -> ExecWorkflowOutcome {
+        {
+            let mut g = shared.lock().unwrap();
+            g.write_message(UserMessage {
+                level: MessageLevel::Warning,
+                text: "Dynamic workflow cancelled during the leader step".into(),
+            });
+            g.report_workflow_completed(&WorkflowOutcome::Cancelled);
+        }
+        ExecWorkflowOutcome {
+            workflow: format!("dynamic-{wi_number:04}"),
+            exit_code: Some(crate::data::command_status::CANCELLED_EXIT_CODE),
+            worktree_used,
+        }
     }
 
     /// Launch a single leader/repair agent container and drive it through the
@@ -1050,6 +1090,7 @@ impl ExecWorkflowCommand {
 
         let cancel = execution.cancel_handle();
         let mut stuck_rx = execution.subscribe_stuck();
+        let handle = execution.handle().clone();
         let (wait_tx, mut wait_rx) = tokio::sync::oneshot::channel::<i32>();
         tokio::spawn(async move {
             let code = execution
@@ -1065,6 +1106,26 @@ impl ExecWorkflowCommand {
         // reports the exit to the frontend before leaving the loop. The
         // container window must NOT close on mere stuck states or while the
         // yolo countdown is still running — those paths `continue` instead.
+        // Stopped the way `agents kill` does.
+        let stop_leader = || {
+            if let Some(c) = &cancel {
+                let _ = c.cancel();
+            }
+            if let Err(e) = crate::command::commands::agents::kill::stop_and_remove_agent(
+                self.engines.runtime.as_ref(),
+                &handle,
+            ) {
+                tracing::warn!(error = %e, "cancel: stopping the leader container failed");
+            }
+            shared
+                .lock()
+                .unwrap()
+                .report_container_exited(KILLED_EXIT_CODE);
+        };
+        let stop_for_cancel = || {
+            stop_leader();
+            LeaderDriveOutcome::Cancelled
+        };
         let outcome = loop {
             tokio::select! {
                 biased;
@@ -1075,26 +1136,30 @@ impl ExecWorkflowCommand {
                         .report_container_exited(code.unwrap_or(-1));
                     break LeaderDriveOutcome::Advanced;
                 }
+                // After `wait_rx` (the loop is biased): a leader that already
+                // exited is reported first.
+                _ = self.cancel.cancelled() => break stop_for_cancel(),
                 ev = stuck_rx.recv() => {
                     match ev {
                         Ok(StuckEvent::Stuck) => {
-                            match run_leader_yolo_countdown(
+                            let countdown = run_leader_yolo_countdown(
                                 &shared,
                                 &mut wait_rx,
                                 &mut stuck_rx,
                                 engine_rx,
+                                &self.cancel,
                                 label,
                             )
-                            .await
-                            {
+                            .await;
+                            // A cancel during the countdown (or one racing its
+                            // end) stops the leader through the runtime; it is
+                            // never treated as an ordinary leader exit.
+                            if self.cancel.is_cancelled() {
+                                break stop_for_cancel();
+                            }
+                            match countdown {
                                 LeaderCountdownOutcome::Advance => {
-                                    if let Some(c) = &cancel {
-                                        let _ = c.cancel();
-                                    }
-                                    shared
-                                        .lock()
-                                        .unwrap()
-                                        .report_container_exited(KILLED_EXIT_CODE);
+                                    stop_leader();
                                     break LeaderDriveOutcome::Advanced;
                                 }
                                 LeaderCountdownOutcome::Completed(code) => {
@@ -1102,14 +1167,9 @@ impl ExecWorkflowCommand {
                                     break LeaderDriveOutcome::Advanced;
                                 }
                                 LeaderCountdownOutcome::Recovered => continue,
+                                LeaderCountdownOutcome::Cancelled => break stop_for_cancel(),
                                 LeaderCountdownOutcome::Abort => {
-                                    if let Some(c) = &cancel {
-                                        let _ = c.cancel();
-                                    }
-                                    shared
-                                        .lock()
-                                        .unwrap()
-                                        .report_container_exited(KILLED_EXIT_CODE);
+                                    stop_leader();
                                     break LeaderDriveOutcome::Aborted;
                                 }
                                 // Ctrl-W during the countdown: cancel the
@@ -1243,6 +1303,8 @@ pub(crate) enum LeaderCountdownOutcome {
     Abort,
     /// The user pressed Ctrl-W — cancel the countdown and open the WCB.
     ShowControlBoard,
+    /// The command was cancelled during the countdown.
+    Cancelled,
 }
 
 /// Drive the 60-second yolo countdown for the leader step, reusing the same
@@ -1256,6 +1318,7 @@ pub(crate) async fn run_leader_yolo_countdown(
         crate::engine::agent_runtime::execution::StuckEvent,
     >,
     engine_rx: &mut tokio::sync::mpsc::UnboundedReceiver<EngineRequest>,
+    cancel: &tokio_util::sync::CancellationToken,
     step_name: &str,
 ) -> LeaderCountdownOutcome {
     use crate::engine::agent_runtime::execution::StuckEvent;
@@ -1290,6 +1353,7 @@ pub(crate) async fn run_leader_yolo_countdown(
             code = &mut *wait_rx => {
                 break LeaderCountdownOutcome::Completed(code.unwrap_or(-1));
             }
+            _ = cancel.cancelled() => break LeaderCountdownOutcome::Cancelled,
             ev = stuck_rx.recv() => {
                 match ev {
                     Ok(StuckEvent::Unstuck) => break LeaderCountdownOutcome::Recovered,

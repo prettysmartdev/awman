@@ -17,13 +17,14 @@
 
 use crate::data::config::EffectiveConfig;
 use crate::data::error::DataError;
+use serde::{Deserialize, Serialize};
 
 /// Read-only or read-write, as a mount is granted to an agent.
 ///
 /// Moved here from `engine::container::options` by WI 0114 F-27: it is the
 /// permission half of every parsed overlay spec, so the Layer 0 grammar has
 /// to be able to name it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OverlayPermission {
     ReadOnly,
     ReadWrite,
@@ -43,7 +44,7 @@ impl OverlayPermission {
 ///
 /// Moved here from `engine::overlay` by WI 0114 F-27. Resolution — canonical
 /// host paths, existence checks — stays in the engine on `DirectoryOverlay`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DirectorySpec {
     pub host: String,
     pub container: String,
@@ -52,7 +53,7 @@ pub struct DirectorySpec {
 
 /// Scope for a context overlay. Moved here from `engine::overlay` by WI 0114
 /// F-27 so the Layer 0 grammar can construct it; the engine re-exports it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ContextScope {
     Global,
     Repo,
@@ -60,21 +61,21 @@ pub enum ContextScope {
 }
 
 /// Specification for a skill overlay: all skills or a named one.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SkillSpec {
     All,
     Named(String),
 }
 
 /// A parsed context overlay specification (scope + permission).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextOverlaySpec {
     pub scope: ContextScope,
     pub permission: OverlayPermission,
 }
 
 /// A parsed overlay expression: directory mount, skill, env passthrough, or context.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum TypedOverlay {
     Directory(DirectorySpec),
     Skill(SkillSpec),

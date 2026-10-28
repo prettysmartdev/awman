@@ -13,7 +13,9 @@ use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use futures_util::FutureExt;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tower_http::trace::TraceLayer;
 
@@ -22,16 +24,26 @@ use crate::command::commands::api_server::session_setup::{
     log_session_setup, SessionSetupBus, SessionSetupBusSender, SetupReadyFrontend, TracingSetupSink,
 };
 pub use crate::command::commands::api_server::AuthMode;
-use crate::command::commands::api_server::{ApiSessionLifecycle, CloseOutcome, SetupReadiness};
+use crate::command::commands::api_server::{
+    ApiSessionLifecycle, CancelOutcome, CloseOutcome, CommandCanceller, SetupReadiness,
+    TokenRegistry,
+};
 use crate::command::dispatch::catalogue::{CommandCatalogue, FrontendKind};
 use crate::command::error::CommandError;
 use crate::command::session_create::{
     SessionCreatePlan, SessionCreatePolicy, SessionCreateRequest,
 };
 use crate::command::session_setup::{SessionSetup, SessionSetupPresenter};
+use crate::data::api_lifecycle_store::{CommandLifecycleStore, RunRecord};
+use crate::data::command_status::CommandStatus;
 use crate::data::execution_event::{EventPayload, ExecutionEvent};
+use crate::data::fs::api_db::{
+    CommandListFilter, CommandRecord, IdempotencyBegin, IdempotencyOwner, IdempotencyResource,
+    IdempotencyScope, LabelOwner,
+};
 use crate::data::fs::api_db::{NewSessionRow, RemoteSessionFields, SessionRecord};
 use crate::data::fs::api_db::{SessionCommandAdmission, SqliteSessionStore};
+use crate::data::fs::api_labels::{LabelSelector, Labels};
 use crate::data::fs::api_paths::ApiPaths;
 use crate::data::session::SessionKind;
 use crate::data::session_manager::SessionManager;
@@ -45,6 +57,9 @@ use crate::engine::ready::frontend::ReadyFrontend;
 // ─── Shared state ────────────────────────────────────────────────────────────
 pub struct AppState {
     pub store: Arc<SqliteSessionStore>,
+    pub lifecycle_store: CommandLifecycleStore,
+    pub canceller: CommandCanceller,
+    pub setup_cancels: Arc<TokenRegistry>,
     pub paths: ApiPaths,
     pub workdirs: Vec<PathBuf>,
     pub workdir_roots: Vec<PathBuf>,
@@ -112,6 +127,8 @@ struct CreateSessionRequest {
     /// Remote only: push the session branch after a successful command.
     #[serde(default)]
     push: bool,
+    #[serde(default)]
+    labels: Labels,
 }
 
 #[derive(Serialize)]
@@ -137,6 +154,8 @@ struct SessionResponse {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     merge_refs: Vec<String>,
     push: bool,
+    #[serde(default)]
+    labels: Labels,
 }
 
 impl From<SessionRecord> for SessionResponse {
@@ -153,6 +172,7 @@ impl From<SessionRecord> for SessionResponse {
             base_ref: s.base_ref,
             merge_refs: s.merge_refs,
             push: s.push,
+            labels: Labels::empty(),
         }
     }
 }
@@ -161,6 +181,8 @@ impl From<SessionRecord> for SessionResponse {
 struct CreateCommandRequest {
     subcommand: String,
     args: Vec<String>,
+    #[serde(default)]
+    labels: Labels,
 }
 
 #[derive(Serialize)]
@@ -195,10 +217,19 @@ struct CommandResponse {
     worker_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     result: Option<serde_json::Value>,
+    labels: Labels,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cancel_requested_at: Option<String>,
 }
 
 /// Capabilities a client can detect without parsing the version. Append only.
-pub const API_FEATURES: &[&str] = &["workflow_state"];
+pub const API_FEATURES: &[&str] = &[
+    "workflow_state",
+    "command_cancel",
+    "labels",
+    "idempotency",
+    "runs",
+];
 
 #[derive(Serialize)]
 struct StatusResponse {
@@ -210,13 +241,445 @@ struct StatusResponse {
     features: Vec<String>,
 }
 
-#[derive(Deserialize, Default)]
-struct ListSessionsQuery {
+#[derive(Deserialize)]
+struct CreateRunRequest {
+    session: CreateSessionRequest,
+    command: CreateCommandRequest,
     #[serde(default)]
-    status: Option<String>,
+    close_on_finish: bool,
+}
+
+#[derive(Serialize)]
+struct CreateRunResponse {
+    session_id: String,
+    command_id: String,
 }
 
 use crate::frontend::api::serve::error_json;
+
+fn bad_request(message: impl Into<String>) -> Response {
+    (StatusCode::BAD_REQUEST, error_json(message)).into_response()
+}
+
+fn internal_error(message: &str) -> Response {
+    (StatusCode::INTERNAL_SERVER_ERROR, error_json(message)).into_response()
+}
+
+fn command_is_terminal(status: &str) -> bool {
+    CommandStatus::parse(status).is_some_and(CommandStatus::is_terminal)
+}
+
+fn session_response(state: &AppState, row: SessionRecord) -> Response {
+    match state.store.labels_for(LabelOwner::Session, &row.id) {
+        Ok(labels) => Json(SessionResponse {
+            labels,
+            ..SessionResponse::from(row)
+        })
+        .into_response(),
+        Err(_) => internal_error("Failed to read session labels"),
+    }
+}
+
+fn command_response(
+    state: &AppState,
+    c: CommandRecord,
+    labels: Option<Labels>,
+) -> Result<CommandResponse, Response> {
+    let labels = match labels {
+        Some(labels) => labels,
+        None => state
+            .store
+            .labels_for(LabelOwner::Command, &c.id)
+            .map_err(|_| internal_error("Failed to read command labels"))?,
+    };
+    let cancel_requested_at = state
+        .lifecycle_store
+        .cancel_requested_at(&c.id)
+        .map_err(|_| internal_error("Failed to read cancel request"))?;
+    let queue_position = if CommandStatus::parse(&c.status).is_some_and(CommandStatus::is_claimable)
+    {
+        state
+            .store
+            .queue_position_for_command(&c.id, &c.session_id)
+            .map_err(|_| internal_error("Failed to read queue position"))?
+    } else {
+        None
+    };
+    Ok(CommandResponse {
+        args: serde_json::from_str(&c.args).unwrap_or_else(|_| serde_json::json!([])),
+        result: c
+            .result
+            .as_deref()
+            .and_then(|r| serde_json::from_str(r).ok()),
+        id: c.id,
+        session_id: c.session_id,
+        subcommand: c.subcommand,
+        status: c.status,
+        exit_code: c.exit_code,
+        started_at: c.started_at,
+        finished_at: c.finished_at,
+        log_path: c.log_path,
+        queued_at: c.queued_at,
+        queue_position,
+        worker_id: c.worker_id,
+        labels,
+        cancel_requested_at,
+    })
+}
+
+#[derive(Default)]
+struct ListQuery {
+    status: Option<String>,
+    session_id: Option<String>,
+    labels: Vec<LabelSelector>,
+    limit: i64,
+}
+
+impl ListQuery {
+    fn parse(pairs: Vec<(String, String)>, commands: bool) -> Result<Self, Response> {
+        let mut query = Self {
+            limit: 100,
+            ..Self::default()
+        };
+        for (key, value) in pairs {
+            match key.as_str() {
+                "label" => query
+                    .labels
+                    .push(LabelSelector::parse(&value).map_err(|e| bad_request(e.to_string()))?),
+                "status" => {
+                    if commands && CommandStatus::parse(&value).is_none() {
+                        let valid: Vec<_> = CommandStatus::ALL.iter().map(|s| s.as_str()).collect();
+                        return Err(bad_request(format!(
+                            "unknown command status: {value}; expected {}",
+                            valid.join("|")
+                        )));
+                    }
+                    if !commands && !matches!(value.as_str(), "active" | "closing" | "closed") {
+                        return Err(bad_request(format!(
+                            "unknown session status: {value}; expected active|closing|closed"
+                        )));
+                    }
+                    query.status = Some(value);
+                }
+                "session_id" if commands => query.session_id = Some(value),
+                "limit" if commands => {
+                    query.limit = value
+                        .parse::<i64>()
+                        .map_err(|_| bad_request("limit must be an integer"))?
+                        .clamp(1, 1000)
+                }
+                _ => {}
+            }
+        }
+        Ok(query)
+    }
+}
+
+async fn handle_list_commands(
+    State(state): State<Arc<AppState>>,
+    Query(pairs): Query<Vec<(String, String)>>,
+) -> Response {
+    let query = match ListQuery::parse(pairs, true) {
+        Ok(query) => query,
+        Err(response) => return response,
+    };
+    let rows = match state.store.list_commands_filtered(&CommandListFilter {
+        status: query.status.as_deref(),
+        session_id: query.session_id.as_deref(),
+        labels: &query.labels,
+        limit: query.limit,
+    }) {
+        Ok(rows) => rows,
+        Err(_) => return internal_error("Failed to list commands"),
+    };
+    let ids: Vec<_> = rows.iter().map(|c| c.id.clone()).collect();
+    let mut labels = match state.store.labels_for_many(LabelOwner::Command, &ids) {
+        Ok(labels) => labels,
+        Err(_) => return internal_error("Failed to read command labels"),
+    };
+    let mut commands = Vec::with_capacity(rows.len());
+    for row in rows {
+        let row_labels = labels.remove(&row.id).unwrap_or_default();
+        match command_response(&state, row, Some(row_labels)) {
+            Ok(command) => commands.push(command),
+            Err(response) => return response,
+        }
+    }
+    Json(serde_json::json!({ "commands": commands })).into_response()
+}
+
+async fn handle_cancel_command(
+    State(state): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    match state.canceller.cancel(&id) {
+        Ok(CancelOutcome::NotFound) => (
+            StatusCode::NOT_FOUND,
+            error_json(format!("Command '{id}' not found")),
+        )
+            .into_response(),
+        Ok(CancelOutcome::AlreadyTerminal(row) | CancelOutcome::Cancelled(row)) => {
+            // During setup its owner must finish clone cleanup before closing.
+            // After setup, a cancelled queued row has no worker to close it.
+            if !state.setup_cancels.is_registered(&row.session_id) {
+                match state.lifecycle_store.run_for_command(&id) {
+                    Ok(Some(run)) if run.close_on_finish => {
+                        if let Err(error) = state.lifecycle().close(&run.session_id).await {
+                            tracing::error!(%error, "Failed to close cancelled run session");
+                            return internal_error("Failed to close cancelled run session");
+                        }
+                    }
+                    Err(_) => return internal_error("Failed to read run"),
+                    _ => {}
+                }
+            }
+            match command_response(&state, row, None) {
+                Ok(response) => Json(response).into_response(),
+                Err(response) => response,
+            }
+        }
+        Ok(CancelOutcome::Stopping {
+            command_id,
+            session_id,
+            requested_at,
+        }) => (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({
+                "command_id": command_id, "session_id": session_id, "status": "running",
+                "cancel_requested_at": requested_at,
+                "message": "Stopping. Poll GET /v1/commands/{id}/status until status is cancelled.",
+            })),
+        )
+            .into_response(),
+        Err(error) => {
+            tracing::error!(%error, "Failed to cancel command");
+            internal_error("Failed to cancel command")
+        }
+    }
+}
+
+/// One id per daemon process. An unfinished idempotency reservation held by
+/// another id belongs to a daemon that has exited (see `idempotency_begin`).
+fn daemon_instance() -> &'static str {
+    static INSTANCE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    INSTANCE.get_or_init(|| uuid::Uuid::new_v4().to_string())
+}
+
+/// A request's hold on its idempotency reservation. Handlers call
+/// [`AdmissionJournal::record`] before their first durable write; the
+/// wrapper stores or releases the reservation afterwards.
+pub(crate) struct AdmissionJournal {
+    store: Arc<SqliteSessionStore>,
+    route: &'static str,
+    principal: String,
+    key: String,
+    request: String,
+}
+
+impl AdmissionJournal {
+    fn scope(&self) -> IdempotencyScope<'_> {
+        IdempotencyScope {
+            route: self.route,
+            principal: &self.principal,
+        }
+    }
+
+    fn owner(&self) -> IdempotencyOwner<'_> {
+        IdempotencyOwner {
+            instance: daemon_instance(),
+            request: &self.request,
+        }
+    }
+
+    /// Record the 202 `body` this request returns once `resource` exists.
+    fn record(&self, body: &str, resource: IdempotencyResource<'_>) -> Result<(), Response> {
+        match self.store.idempotency_record_intent(
+            self.scope(),
+            &self.key,
+            self.owner(),
+            StatusCode::ACCEPTED.as_u16(),
+            body,
+            resource,
+        ) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(internal_error("Idempotency reservation lost")),
+            Err(error) => {
+                tracing::error!(%error, "Failed to record idempotent admission");
+                Err(internal_error("Failed to record idempotent admission"))
+            }
+        }
+    }
+}
+
+/// Record the admission intent (when keyed) and serialise the 202 body, so
+/// the response a restart recovers is byte-identical to the one returned.
+fn admission_body(
+    journal: Option<&AdmissionJournal>,
+    body: &impl Serialize,
+    resource: IdempotencyResource<'_>,
+) -> Result<String, Response> {
+    let body =
+        serde_json::to_string(body).map_err(|_| internal_error("Failed to encode response"))?;
+    if let Some(journal) = journal {
+        journal.record(&body, resource)?;
+    }
+    Ok(body)
+}
+
+fn accepted_json(body: String) -> Response {
+    (
+        StatusCode::ACCEPTED,
+        [("content-type", "application/json")],
+        body,
+    )
+        .into_response()
+}
+
+// A panic, a dropped request future or a failed response store ends the
+// request without a stored response: keep the reservation if the work was
+// admitted (its recorded resource exists), else release it.
+struct IdempotencyReservation(Option<Arc<AdmissionJournal>>);
+
+impl Drop for IdempotencyReservation {
+    fn drop(&mut self) {
+        if let Some(journal) = self.0.take() {
+            if let Err(error) = journal.store.idempotency_release_unless_admitted(
+                journal.scope(),
+                &journal.key,
+                journal.owner(),
+            ) {
+                tracing::error!(%error, "Failed to release idempotency reservation");
+            }
+        }
+    }
+}
+
+async fn with_idempotency<F, Fut>(
+    state: &AppState,
+    headers: &HeaderMap,
+    route: &'static str,
+    canonical: &str,
+    handler: F,
+) -> Response
+where
+    F: FnOnce(Option<Arc<AdmissionJournal>>) -> Fut,
+    Fut: std::future::Future<Output = Response>,
+{
+    let Some(header) = headers.get("idempotency-key") else {
+        return handler(None).await;
+    };
+    let key = match header.to_str() {
+        Ok(key)
+            if !key.is_empty()
+                && key.len() <= crate::data::fs::api_db::IDEMPOTENCY_KEY_MAX_BYTES
+                && key.bytes().all(|b| (0x21..=0x7e).contains(&b)) =>
+        {
+            key
+        }
+        _ => return bad_request("invalid Idempotency-Key header"),
+    };
+    let principal = match &state.auth_mode {
+        AuthMode::Enabled { key_hash } => key_hash.as_str(),
+        AuthMode::Disabled => "anonymous",
+    };
+    let journal = Arc::new(AdmissionJournal {
+        store: Arc::clone(&state.store),
+        route,
+        principal: principal.to_string(),
+        key: key.to_string(),
+        request: uuid::Uuid::new_v4().to_string(),
+    });
+    let hash: String = Sha256::digest(canonical.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    match state.store.idempotency_begin(
+        journal.scope(),
+        key,
+        &hash,
+        &chrono::Utc::now().to_rfc3339(),
+        journal.owner(),
+    ) {
+        Ok(IdempotencyBegin::Fresh) => {}
+        Ok(IdempotencyBegin::Replay { status, body }) => {
+            return (
+                StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                [
+                    ("content-type", "application/json"),
+                    ("idempotent-replayed", "true"),
+                ],
+                body,
+            )
+                .into_response()
+        }
+        Ok(IdempotencyBegin::InFlight) => {
+            return (
+                StatusCode::CONFLICT,
+                [("retry-after", "1")],
+                error_json("a request with this Idempotency-Key is still in progress"),
+            )
+                .into_response()
+        }
+        Ok(IdempotencyBegin::Mismatch) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                error_json("Idempotency-Key reused with a different request body"),
+            )
+                .into_response()
+        }
+        Err(error) => {
+            tracing::error!(%error, "Failed to reserve idempotency key");
+            return internal_error("Failed to reserve idempotency key");
+        }
+    }
+    let mut reservation = IdempotencyReservation(Some(Arc::clone(&journal)));
+    let response = match std::panic::AssertUnwindSafe(handler(Some(Arc::clone(&journal))))
+        .catch_unwind()
+        .await
+    {
+        Ok(response) => response,
+        Err(_) => return internal_error("Request handler failed"),
+    };
+    if response.status().is_server_error() {
+        // Handlers roll back what they admitted before returning a 5xx.
+        reservation.0 = None;
+        if let Err(error) = state
+            .store
+            .idempotency_release(journal.scope(), key, journal.owner())
+        {
+            tracing::error!(%error, "Failed to release idempotency reservation");
+        }
+        return response;
+    }
+    let (parts, body) = response.into_parts();
+    let bytes = match axum::body::to_bytes(body, usize::MAX).await {
+        Ok(bytes) => bytes,
+        Err(_) => return internal_error("Failed to buffer response"),
+    };
+    let body = match std::str::from_utf8(&bytes) {
+        Ok(body) => body,
+        Err(_) => return internal_error("Invalid JSON response encoding"),
+    };
+    match state.store.idempotency_complete(
+        journal.scope(),
+        key,
+        journal.owner(),
+        parts.status.as_u16(),
+        body,
+    ) {
+        Ok(true) => reservation.0 = None,
+        Ok(false) => {
+            tracing::warn!("Idempotency reservation was no longer held when completing");
+            reservation.0 = None;
+        }
+        Err(error) => {
+            // The reservation guard keeps an admitted request's recorded
+            // response; the work itself has already been accepted.
+            tracing::error!(%error, "Failed to save idempotent response");
+        }
+    }
+    Response::from_parts(parts, axum::body::Body::from(bytes))
+}
 
 /// Map a session-creation validation error to its HTTP status. This is the
 /// ONLY session-creation logic that remains in the frontend — the transport
@@ -250,7 +713,12 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         )
         .route("/v1/sessions/{id}/status", get(handle_get_session_status))
         .route("/v1/sessions/{id}/queue", get(handle_get_session_queue))
-        .route("/v1/commands", post(handle_create_command))
+        .route(
+            "/v1/commands",
+            get(handle_list_commands).post(handle_create_command),
+        )
+        .route("/v1/commands/{id}/cancel", post(handle_cancel_command))
+        .route("/v1/runs", post(handle_create_run))
         .route("/v1/commands/{id}/status", get(handle_get_command))
         .route("/v1/commands/{id}/logs", get(handle_stream_command_logs))
         .route("/v1/workflows/{command_id}", get(handle_get_workflow))
@@ -317,7 +785,62 @@ async fn handle_workdirs(State(state): State<Arc<AppState>>) -> impl IntoRespons
 
 async fn handle_create_session(
     State(state): State<Arc<AppState>>,
-    Json(body): Json<CreateSessionRequest>,
+    headers: HeaderMap,
+    Json(value): Json<serde_json::Value>,
+) -> Response {
+    let st = &state;
+    with_idempotency(
+        &state,
+        &headers,
+        "/v1/sessions",
+        &value.to_string(),
+        |journal| async move {
+            let body = match serde_json::from_value(value) {
+                Ok(body) => body,
+                Err(error) => return bad_request(error.to_string()),
+            };
+            create_submission(st, body, None, false, journal.as_deref()).await
+        },
+    )
+    .await
+}
+
+async fn handle_create_run(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(value): Json<serde_json::Value>,
+) -> Response {
+    let st = &state;
+    let canonical = value.to_string();
+    with_idempotency(
+        &state,
+        &headers,
+        "/v1/runs",
+        &canonical,
+        |journal| async move {
+            let body: CreateRunRequest = match serde_json::from_value(value) {
+                Ok(body) => body,
+                Err(error) => return bad_request(error.to_string()),
+            };
+            create_submission(
+                st,
+                body.session,
+                Some(body.command),
+                body.close_on_finish,
+                journal.as_deref(),
+            )
+            .await
+        },
+    )
+    .await
+}
+
+async fn create_submission(
+    state: &Arc<AppState>,
+    body: CreateSessionRequest,
+    command: Option<CreateCommandRequest>,
+    close_on_finish: bool,
+    journal: Option<&AdmissionJournal>,
 ) -> Response {
     let session_id = uuid::Uuid::new_v4().to_string();
     let created_at = chrono::Utc::now().to_rfc3339();
@@ -349,6 +872,12 @@ async fn handle_create_session(
         return (session_create_error_status(&e), error_json(e.to_string())).into_response();
     }
 
+    if let Some(command) = &command {
+        if let Err(response) = validate_command(command) {
+            return response;
+        }
+    }
+
     // Create session storage directories (Layer 0).
     if let Err(e) = state.paths.prepare_session_dirs(&session_id) {
         tracing::error!(error = %e, "Failed to create session directory");
@@ -358,6 +887,32 @@ async fn handle_create_session(
         )
             .into_response();
     }
+
+    // The response is fixed before anything durable is written, so a keyed
+    // request recovers it from the admitted resource after a crash: the
+    // session row for a session, the command row (written last) for a run.
+    let command_id = command.as_ref().map(|_| uuid::Uuid::new_v4().to_string());
+    let response_body = match &command_id {
+        Some(command_id) => admission_body(
+            journal,
+            &CreateRunResponse {
+                session_id: session_id.clone(),
+                command_id: command_id.clone(),
+            },
+            IdempotencyResource::Command(command_id),
+        ),
+        None => admission_body(
+            journal,
+            &CreateSessionResponse {
+                session_id: session_id.clone(),
+            },
+            IdempotencyResource::Session(&session_id),
+        ),
+    };
+    let response_body = match response_body {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
 
     // Persist the session row with setup_status='initializing' BEFORE spawning
     // the setup task. If the server restarts mid-setup we want the cleanup
@@ -405,6 +960,37 @@ async fn handle_create_session(
         }
     }
 
+    if let Err(error) = state
+        .store
+        .set_labels(LabelOwner::Session, &session_id, &body.labels)
+    {
+        tracing::error!(%error, "Failed to store session labels");
+        let _ = state.lifecycle().close(&session_id).await;
+        return internal_error("Failed to store session labels");
+    }
+    let run = if let (Some(command), Some(command_id)) = (command, command_id) {
+        // The run link precedes the command row: the row is the admission
+        // point, and setup/bootstrap always find the link for it.
+        let run = RunRecord {
+            session_id: session_id.clone(),
+            command_id,
+            close_on_finish,
+            created_at,
+        };
+        if let Err(error) = state.lifecycle_store.record_run(&run) {
+            tracing::error!(%error, "Failed to record run");
+            let _ = state.lifecycle().close(&session_id).await;
+            return internal_error("Failed to record run");
+        }
+        if let Err(response) = enqueue_command(state, &run.command_id, &session_id, &command) {
+            let _ = state.lifecycle().close(&session_id).await;
+            return response;
+        }
+        Some(run)
+    } else {
+        None
+    };
+
     let setup_bus = Arc::new(SessionSetupBus::new(256));
     state
         .setup_buses
@@ -419,17 +1005,15 @@ async fn handle_create_session(
         "Session created (setup starting)"
     );
 
-    let state_clone = Arc::clone(&state);
+    // Register before spawning/responding so cancellation can never miss setup.
+    let token = state.setup_cancels.register(&session_id);
+    let state_clone = Arc::clone(state);
     let sid = session_id.clone();
+    let run_for_setup = run.clone();
     tokio::spawn(async move {
-        run_session_setup(state_clone, sid, plan, setup_bus).await;
+        run_session_setup(state_clone, sid, plan, setup_bus, token, run_for_setup).await;
     });
-
-    (
-        StatusCode::ACCEPTED,
-        Json(CreateSessionResponse { session_id }),
-    )
-        .into_response()
+    accepted_json(response_body)
 }
 
 /// Drive the Layer 2 [`SessionSetup`] orchestrator with an
@@ -444,6 +1028,8 @@ async fn run_session_setup(
     session_id: String,
     plan: SessionCreatePlan,
     setup_bus: Arc<SessionSetupBus>,
+    token: tokio_util::sync::CancellationToken,
+    run: Option<RunRecord>,
 ) {
     let setup = SessionSetup::new(
         session_id.clone(),
@@ -453,15 +1039,42 @@ async fn run_session_setup(
         Arc::clone(&setup_bus.current_state),
         Arc::clone(&state.store),
         state.paths.clone(),
-    );
+    )
+    .with_cancellation(token.clone());
     let mut presenter = ApiSessionSetupPresenter {
         bus_sender: setup_bus.sender(),
         setup_bus,
-        state,
-        session_id,
+        state: Arc::clone(&state),
+        session_id: session_id.clone(),
         verbose_setup: crate::data::config::env::Env::from_process().api_verbose_setup(),
     };
+    // Lists can expose the queued row before this task is spawned (or even
+    // before run linkage/token registration). Carry that early cancel into
+    // Track A's setup-abort path as well.
+    if let Some(run) = &run {
+        if state
+            .store
+            .get_command(&run.command_id)
+            .ok()
+            .flatten()
+            .is_some_and(|c| c.status == CommandStatus::Cancelled.as_str())
+        {
+            token.cancel();
+        }
+    }
     setup.run(&mut presenter).await;
+    // Once cleanup is complete, cancellation may close a terminal run itself.
+    // Unregister before checking its row so neither path can miss the close.
+    state.setup_cancels.unregister(&session_id);
+    if let Some(run) = run {
+        if let Err(error) = state
+            .lifecycle()
+            .finish_run_setup(&state.lifecycle_store, &run)
+            .await
+        {
+            tracing::error!(%error, "Failed to reconcile run after setup");
+        }
+    }
 }
 
 /// API-frontend implementation of the Layer 2 [`SessionSetupPresenter`]: the
@@ -506,7 +1119,10 @@ impl SessionSetupPresenter for ApiSessionSetupPresenter {
     }
 
     async fn finished(&mut self) {
-        cleanup_setup_bus(Arc::clone(&self.state), self.session_id.clone()).await;
+        tokio::spawn(cleanup_setup_bus(
+            Arc::clone(&self.state),
+            self.session_id.clone(),
+        ));
     }
 }
 
@@ -520,12 +1136,32 @@ async fn cleanup_setup_bus(state: Arc<AppState>, session_id: String) {
 
 async fn handle_list_sessions(
     State(state): State<Arc<AppState>>,
-    Query(query): Query<ListSessionsQuery>,
+    Query(pairs): Query<Vec<(String, String)>>,
 ) -> Response {
-    match state.store.list_sessions_by_status(query.status.as_deref()) {
+    let query = match ListQuery::parse(pairs, false) {
+        Ok(query) => query,
+        Err(response) => return response,
+    };
+    match state
+        .store
+        .list_sessions_filtered(query.status.as_deref(), &query.labels)
+    {
         Ok(sessions) => {
-            let list: Vec<SessionResponse> =
-                sessions.into_iter().map(SessionResponse::from).collect();
+            let ids: Vec<_> = sessions.iter().map(|s| s.id.clone()).collect();
+            let mut labels = match state.store.labels_for_many(LabelOwner::Session, &ids) {
+                Ok(labels) => labels,
+                Err(_) => return internal_error("Failed to read session labels"),
+            };
+            let list: Vec<SessionResponse> = sessions
+                .into_iter()
+                .map(|s| {
+                    let labels = labels.remove(&s.id).unwrap_or_default();
+                    SessionResponse {
+                        labels,
+                        ..SessionResponse::from(s)
+                    }
+                })
+                .collect();
             Json(serde_json::json!({ "sessions": list })).into_response()
         }
         Err(e) => {
@@ -544,7 +1180,7 @@ async fn handle_get_session(
     AxumPath(id): AxumPath<String>,
 ) -> Response {
     match state.store.get_session(&id) {
-        Ok(Some(s)) => Json(SessionResponse::from(s)).into_response(),
+        Ok(Some(s)) => session_response(&state, s),
         Ok(None) => (
             StatusCode::NOT_FOUND,
             error_json(format!("Session '{}' not found", id)),
@@ -585,7 +1221,7 @@ async fn handle_close_session(
             message: "Session is already closing. Poll GET /v1/sessions/{id}/status to monitor.".to_string(),
         }).into_response(),
         Ok(CloseOutcome::Closed) => match state.store.get_session(&id) {
-            Ok(Some(session)) => Json(SessionResponse::from(session)).into_response(),
+            Ok(Some(session)) => session_response(&state, session),
             _ => StatusCode::NO_CONTENT.into_response(),
         },
         Err(error) => {
@@ -619,11 +1255,17 @@ async fn handle_get_session_status(
         Ok(Some(_)) => {}
     }
 
+    let labels = match state.store.labels_for(LabelOwner::Session, &id) {
+        Ok(labels) => labels,
+        Err(_) => return internal_error("Failed to read session labels"),
+    };
+
     // Try to read from in-memory setup bus first.
     if let Some(bus) = state.setup_buses.lock().await.get(&id).cloned() {
         let setup_state = bus.snapshot();
         return Json(serde_json::json!({
             "session_id": id,
+            "labels": labels,
             "status": setup_state.status,
             "current_stage": setup_state.current_stage,
             "current_ready_phase": setup_state.current_ready_phase,
@@ -638,6 +1280,7 @@ async fn handle_get_session_status(
     match state.paths.read_setup_state(&id) {
         Some(setup_state) => Json(serde_json::json!({
             "session_id": id,
+            "labels": labels,
             "status": setup_state.status,
             "current_stage": setup_state.current_stage,
             "current_ready_phase": setup_state.current_ready_phase,
@@ -669,8 +1312,13 @@ async fn fallback_status_from_db(state: &AppState, id: &str) -> Response {
         .flatten()
         .map(|s| s.setup_status)
         .unwrap_or_else(|| "ready".to_string());
+    let labels = match state.store.labels_for(LabelOwner::Session, id) {
+        Ok(labels) => labels,
+        Err(_) => return internal_error("Failed to read session labels"),
+    };
     Json(serde_json::json!({
         "session_id": id,
+        "labels": labels,
         "status": setup_status,
     }))
     .into_response()
@@ -679,7 +1327,38 @@ async fn fallback_status_from_db(state: &AppState, id: &str) -> Response {
 async fn handle_create_command(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(body): Json<CreateCommandRequest>,
+    Json(value): Json<serde_json::Value>,
+) -> Response {
+    let canonical = format!(
+        "{}\n{}",
+        value,
+        headers
+            .get("x-awman-session")
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or_default()
+    );
+    let (st, hd) = (&state, &headers);
+    with_idempotency(
+        &state,
+        &headers,
+        "/v1/commands",
+        &canonical,
+        |journal| async move {
+            let body = match serde_json::from_value(value) {
+                Ok(body) => body,
+                Err(error) => return bad_request(error.to_string()),
+            };
+            create_command(st, hd, body, journal.as_deref()).await
+        },
+    )
+    .await
+}
+
+async fn create_command(
+    state: &AppState,
+    headers: &HeaderMap,
+    body: CreateCommandRequest,
+    journal: Option<&AdmissionJournal>,
 ) -> Response {
     let session_id = match headers.get("x-awman-session") {
         Some(val) => match val.to_str() {
@@ -701,45 +1380,10 @@ async fn handle_create_command(
         }
     };
 
-    // Validate the command shape against the catalogue BEFORE touching session
-    // state. Both checks below are request-shape (400-class) errors derived
-    // entirely from the command catalogue — no per-command logic in the route.
-    let path_parts: Vec<&str> = body.subcommand.split_whitespace().collect();
-    {
-        let catalogue = CommandCatalogue::get();
-
-        // (1) The command must be reachable via the API frontend.
-        if let Err(CommandError::NotAvailableForFrontend { command, .. }) =
-            catalogue.validate_for_frontend(FrontendKind::Api, &path_parts)
-        {
-            // The advertised alternatives are the catalogue's api-allowed
-            // commands, not a hand-maintained list that could drift.
-            let available: Vec<String> = catalogue
-                .api_allowed_commands()
-                .into_iter()
-                .map(|(parent, sub)| format!("{parent} {sub}"))
-                .collect();
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": "command not available via API",
-                    "blocked_command": command,
-                    "available": available,
-                })),
-            )
-                .into_response();
-        }
-
-        // (2) The args must parse cleanly against the catalogue: an unknown
-        // flag, a bad flag value, or an unknown command produces a structured
-        // 400 here, rather than being enqueued and failing asynchronously in
-        // the worker when the dispatch accessors are later called.
-        if let Err(e) =
-            catalogue.parse_raw_args_with_profile(&path_parts, &body.args, FrontendKind::Api)
-        {
-            return (StatusCode::BAD_REQUEST, error_json(e.to_string())).into_response();
-        }
+    if let Err(response) = validate_command(&body) {
+        return response;
     }
+    let path_parts: Vec<&str> = body.subcommand.split_whitespace().collect();
 
     // Validate session exists and is in a state that accepts commands. The
     // lifecycle classification lives in Layer 0 (on the store that owns the
@@ -811,40 +1455,6 @@ async fn handle_create_command(
     }
 
     let command_id = uuid::Uuid::new_v4().to_string();
-    let args_json = serde_json::to_string(&body.args).unwrap_or_else(|_| "[]".to_string());
-
-    if let Err(e) = state.paths.prepare_command_dir(&session_id, &command_id) {
-        tracing::error!(error = %e, "Failed to create command directory");
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            error_json("Failed to create command directory"),
-        )
-            .into_response();
-    }
-
-    let log_path = state.paths.command_log_path(&session_id, &command_id);
-
-    if let Err(e) = state.store.enqueue_command(
-        &command_id,
-        &session_id,
-        &body.subcommand,
-        &args_json,
-        &log_path.to_string_lossy(),
-    ) {
-        tracing::error!(error = %e, "Failed to enqueue command");
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            error_json("Failed to enqueue command"),
-        )
-            .into_response();
-    }
-
-    tracing::info!(
-        command_id = %command_id,
-        session_id = %session_id,
-        subcommand = %body.subcommand,
-        "Command enqueued"
-    );
 
     // The profile's own account of itself, not a restatement of it (F-50).
     // Serialised with the underscore spelling the response has always used.
@@ -855,15 +1465,111 @@ async fn handle_create_command(
             .map(|(flag, value)| (flag.replace('-', "_"), flag_default_json(&value)))
             .collect(),
     );
-
-    (
-        StatusCode::ACCEPTED,
-        Json(CreateCommandResponse {
-            command_id,
+    let response_body = match admission_body(
+        journal,
+        &CreateCommandResponse {
+            command_id: command_id.clone(),
             flags_applied,
-        }),
-    )
-        .into_response()
+        },
+        IdempotencyResource::Command(&command_id),
+    ) {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+
+    if let Err(response) = enqueue_command(state, &command_id, &session_id, &body) {
+        return response;
+    }
+    accepted_json(response_body)
+}
+
+fn validate_command(body: &CreateCommandRequest) -> Result<(), Response> {
+    // Validate the command shape against the catalogue BEFORE touching session
+    // state. Both checks below are request-shape (400-class) errors derived
+    // entirely from the command catalogue — no per-command logic in the route.
+    let path_parts: Vec<&str> = body.subcommand.split_whitespace().collect();
+    {
+        let catalogue = CommandCatalogue::get();
+
+        // (1) The command must be reachable via the API frontend.
+        if let Err(CommandError::NotAvailableForFrontend { command, .. }) =
+            catalogue.validate_for_frontend(FrontendKind::Api, &path_parts)
+        {
+            // The advertised alternatives are the catalogue's api-allowed
+            // commands, not a hand-maintained list that could drift.
+            let available: Vec<String> = catalogue
+                .api_allowed_commands()
+                .into_iter()
+                .map(|(parent, sub)| format!("{parent} {sub}"))
+                .collect();
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "command not available via API",
+                    "blocked_command": command,
+                    "available": available,
+                })),
+            )
+                .into_response());
+        }
+
+        // (2) The args must parse cleanly against the catalogue: an unknown
+        // flag, a bad flag value, or an unknown command produces a structured
+        // 400 here, rather than being enqueued and failing asynchronously in
+        // the worker when the dispatch accessors are later called.
+        if let Err(e) =
+            catalogue.parse_raw_args_with_profile(&path_parts, &body.args, FrontendKind::Api)
+        {
+            return Err(bad_request(e.to_string()));
+        }
+    }
+
+    Ok(())
+}
+
+fn enqueue_command(
+    state: &AppState,
+    command_id: &str,
+    session_id: &str,
+    body: &CreateCommandRequest,
+) -> Result<(), Response> {
+    let args_json = serde_json::to_string(&body.args).unwrap_or_else(|_| "[]".to_string());
+
+    if let Err(e) = state.paths.prepare_command_dir(&session_id, &command_id) {
+        tracing::error!(error = %e, "Failed to create command directory");
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error_json("Failed to create command directory"),
+        )
+            .into_response());
+    }
+
+    let log_path = state.paths.command_log_path(&session_id, &command_id);
+
+    if let Err(e) = state.store.enqueue_command_with_labels(
+        command_id,
+        session_id,
+        &body.subcommand,
+        &args_json,
+        &log_path.to_string_lossy(),
+        &body.labels,
+    ) {
+        tracing::error!(error = %e, "Failed to enqueue command");
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error_json("Failed to enqueue command"),
+        )
+            .into_response());
+    }
+
+    tracing::info!(
+        command_id = %command_id,
+        session_id = %session_id,
+        subcommand = %body.subcommand,
+        "Command enqueued"
+    );
+
+    Ok(())
 }
 
 async fn handle_get_command(
@@ -871,42 +1577,10 @@ async fn handle_get_command(
     AxumPath(id): AxumPath<String>,
 ) -> Response {
     match state.store.get_command(&id) {
-        Ok(Some(c)) => {
-            let args: serde_json::Value =
-                serde_json::from_str(&c.args).unwrap_or(serde_json::Value::Array(vec![]));
-
-            let queue_position = if c.status == "queued" {
-                state
-                    .store
-                    .queue_position_for_command(&c.id, &c.session_id)
-                    .ok()
-                    .flatten()
-            } else {
-                None
-            };
-
-            let result: Option<serde_json::Value> = c
-                .result
-                .as_deref()
-                .and_then(|r| serde_json::from_str(r).ok());
-
-            Json(CommandResponse {
-                id: c.id,
-                session_id: c.session_id,
-                subcommand: c.subcommand,
-                args,
-                status: c.status,
-                exit_code: c.exit_code,
-                started_at: c.started_at,
-                finished_at: c.finished_at,
-                log_path: c.log_path,
-                queued_at: c.queued_at,
-                queue_position,
-                worker_id: c.worker_id,
-                result,
-            })
-            .into_response()
-        }
+        Ok(Some(c)) => match command_response(&state, c, None) {
+            Ok(response) => Json(response).into_response(),
+            Err(response) => response,
+        },
         Ok(None) => (
             StatusCode::NOT_FOUND,
             error_json(format!("Command '{}' not found", id)),
@@ -953,7 +1627,7 @@ async fn handle_stream_command_logs(
 ) -> Response {
     let (session_id, is_already_done) = match state.store.get_command(&command_id) {
         Ok(Some(c)) => {
-            let done = matches!(c.status.as_str(), "done" | "error" | "cancelled");
+            let done = command_is_terminal(&c.status);
             (c.session_id, done)
         }
         Ok(None) => {
@@ -1072,7 +1746,7 @@ async fn handle_stream_command_logs(
                 // we were waiting, replay any newly-flushed events.log lines
                 // and exit the wait loop so the Done event is emitted below.
                 let cmd_terminal = match state_for_task.store.get_command(&command_id_for_task) {
-                    Ok(Some(c)) => matches!(c.status.as_str(), "done" | "error" | "cancelled"),
+                    Ok(Some(c)) => command_is_terminal(&c.status),
                     _ => false,
                 };
                 if cmd_terminal {
@@ -1223,8 +1897,28 @@ async fn handle_get_session_queue(
 
     let queue_depth = state.store.count_queued_for_session(&id).unwrap_or(0);
 
-    let running = match state.store.running_command_for_session(&id) {
-        Ok(Some(c)) => {
+    let running_record = state.store.running_command_for_session(&id).ok().flatten();
+    let session_cmds = state
+        .store
+        .list_commands_for_session(&id, 100)
+        .unwrap_or_default();
+    // Every command projection carries its labels; one batch read covers them.
+    let ids: Vec<String> = session_cmds
+        .iter()
+        .chain(running_record.iter())
+        .map(|c| c.id.clone())
+        .collect();
+    let labels = match state.store.labels_for_many(LabelOwner::Command, &ids) {
+        Ok(labels) => labels,
+        Err(error) => {
+            tracing::error!(%error, "Failed to read command labels");
+            return internal_error("Failed to read command labels");
+        }
+    };
+    let labels_of = |id: &str| labels.get(id).cloned().unwrap_or_else(Labels::empty);
+
+    let running = match running_record {
+        Some(c) => {
             let args: serde_json::Value =
                 serde_json::from_str(&c.args).unwrap_or(serde_json::Value::Array(vec![]));
             Some(serde_json::json!({
@@ -1233,15 +1927,11 @@ async fn handle_get_session_queue(
                 "args": args,
                 "started_at": c.started_at,
                 "worker_id": c.worker_id,
+                "labels": labels_of(&c.id),
             }))
         }
-        _ => None,
+        None => None,
     };
-
-    let session_cmds = state
-        .store
-        .list_commands_for_session(&id, 100)
-        .unwrap_or_default();
 
     // Queued items: spec requires oldest first (position 0 = next to run).
     // `list_commands_for_session` returns newest first, so collect queued
@@ -1263,6 +1953,7 @@ async fn handle_get_session_queue(
                 "args": args,
                 "queued_at": c.queued_at,
                 "position": pos as i64,
+                "labels": labels_of(&c.id),
             })
         })
         .collect();
@@ -1270,7 +1961,7 @@ async fn handle_get_session_queue(
     // Recent completed: spec requires `finished_at DESC`, capped at 10.
     let mut completed_records: Vec<_> = session_cmds
         .iter()
-        .filter(|c| matches!(c.status.as_str(), "done" | "error"))
+        .filter(|c| command_is_terminal(&c.status))
         .collect();
     completed_records.sort_by(|a, b| b.finished_at.cmp(&a.finished_at));
     let recent_completed: Vec<serde_json::Value> = completed_records
@@ -1283,6 +1974,7 @@ async fn handle_get_session_queue(
                 "status": c.status,
                 "exit_code": c.exit_code,
                 "finished_at": c.finished_at,
+                "labels": labels_of(&c.id),
             })
         })
         .collect();
@@ -1390,6 +2082,9 @@ mod tests {
         ("GET", "/v1/sessions/{id}/status"),
         ("GET", "/v1/sessions/{id}/queue"),
         ("POST", "/v1/commands"),
+        ("GET", "/v1/commands"),
+        ("POST", "/v1/commands/{id}/cancel"),
+        ("POST", "/v1/runs"),
         ("GET", "/v1/commands/{id}/status"),
         ("GET", "/v1/commands/{id}/logs"),
         ("GET", "/v1/workflows/{command_id}"),
@@ -1431,7 +2126,18 @@ mod tests {
             credential_monitor: None,
             global_config: std::sync::Arc::new(Default::default()),
         };
+        let lifecycle_store = crate::data::CommandLifecycleStore::open(Arc::clone(&store)).unwrap();
+        let setup_cancels = Arc::new(crate::command::commands::api_server::TokenRegistry::new());
+        let canceller = crate::command::commands::api_server::CommandCanceller::new(
+            Arc::clone(&store),
+            lifecycle_store.clone(),
+            Arc::new(crate::command::commands::api_server::TokenRegistry::new()),
+            Arc::clone(&setup_cancels),
+        );
         Arc::new(AppState {
+            lifecycle_store,
+            setup_cancels,
+            canceller,
             store,
             paths,
             workdirs: Vec::new(),
@@ -1453,7 +2159,7 @@ mod tests {
         // Guard: if someone adds a route without updating this table, the count drifts.
         assert_eq!(
             EXPECTED_ROUTES.len(),
-            12,
+            15,
             "route count mismatch — update EXPECTED_ROUTES"
         );
     }
@@ -1489,6 +2195,7 @@ mod tests {
             ("GET", "/v1/status"),
             ("GET", "/v1/workdirs"),
             ("GET", "/v1/sessions"),
+            ("GET", "/v1/commands"),
         ];
 
         for (method, path) in unconditional_routes {
@@ -1532,6 +2239,7 @@ mod tests {
             ("GET", "/v1/sessions/test-id/queue", 404), // session not found
             ("GET", "/v1/commands/test-id/status", 404), // command not found
             ("GET", "/v1/commands/test-id/logs", 404), // command not found
+            ("POST", "/v1/commands/test-id/cancel", 404), // command not found
             ("GET", "/v1/workflows/test-cmd", 404), // command not found
         ];
 
@@ -1540,6 +2248,7 @@ mod tests {
             let req = match *method {
                 "GET" => client.get(&url),
                 "DELETE" => client.delete(&url),
+                "POST" => client.post(&url),
                 _ => panic!("unhandled method {method}"),
             };
             let resp = req
@@ -1579,6 +2288,16 @@ mod tests {
             resp.status().as_u16(),
             404,
             "POST /v1/commands returned 404 — route may not be registered"
+        );
+        let resp = client
+            .post(format!("http://{addr}/v1/runs"))
+            .send()
+            .await
+            .unwrap();
+        assert_ne!(
+            resp.status().as_u16(),
+            404,
+            "POST /v1/runs must be registered"
         );
     }
 

@@ -3884,6 +3884,7 @@ async fn interactive_setup_and_teardown_factories_use_each_sessions_policy() {
         for kind in [PhaseKind::Setup, PhaseKind::Teardown] {
             let frontend = SharedWorkflowFrontend::new(Box::new(FakeExecWorkflowFrontend::new()));
             let factory = phase_container::PhaseContainerFactory {
+                name_prefix: None,
                 runtime: &fake.runtime,
                 frontend: &frontend,
                 agent_engine: &engines.agent_engine,

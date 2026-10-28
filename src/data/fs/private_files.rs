@@ -108,7 +108,7 @@ fn open_private(path: &Path, create: bool, write: bool) -> Result<Option<File>, 
             return Err(refused(
                 path,
                 &format!("cannot be opened safely (symlinks are refused): {e}"),
-            ))
+            ));
         }
     };
     let meta = file.metadata().map_err(|e| io_err(path, e))?;

@@ -58,8 +58,10 @@ fn read_beneath(root: &Path, components: &[Component<'_>]) -> io::Result<String>
 #[cfg(not(unix))]
 fn read_beneath(_: &Path, _: &[Component<'_>]) -> io::Result<String> {
     // Fail closed on platforms without the descriptor-relative implementation.
-    Err(io::Error::new(io::ErrorKind::Unsupported,
-        "custom merge-fix templates require secure descriptor-relative file access on this platform"))
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "custom merge-fix templates require secure descriptor-relative file access on this platform",
+    ))
 }
 
 #[cfg(test)]

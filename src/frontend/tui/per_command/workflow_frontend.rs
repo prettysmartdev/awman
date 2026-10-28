@@ -142,6 +142,7 @@ impl WorkflowFrontend for TuiCommandFrontend {
             }
             WorkflowOutcome::Paused => self.messages.info("Workflow paused"),
             WorkflowOutcome::Aborted => self.messages.warning("Workflow aborted"),
+            WorkflowOutcome::Cancelled => self.messages.warning("Workflow cancelled"),
             WorkflowOutcome::Failed {
                 last_step,
                 exit_code,

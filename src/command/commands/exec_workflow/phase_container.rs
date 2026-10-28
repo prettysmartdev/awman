@@ -44,6 +44,7 @@ pub(crate) struct PhaseContainerWorkspace {
 /// The setup and teardown factories share this launch boundary. Resolve the
 /// session policy before choosing whether the step owns a foreground PTY.
 pub(crate) struct PhaseContainerFactory<'a> {
+    pub name_prefix: Option<&'a str>,
     pub runtime: &'a Arc<ContainerRuntime>,
     pub frontend: &'a SharedWorkflowFrontend,
     pub agent_engine: &'a crate::engine::agent::AgentEngine,
@@ -74,8 +75,12 @@ impl PhaseContainerFactory<'_> {
                 },
             )));
         }
+        let name = self
+            .name_prefix
+            .map(|prefix| format!("{prefix}phase-{}", uuid::Uuid::new_v4().simple()));
         Ok(Box::new(self.runtime.start_background(
             &crate::engine::container::background::BackgroundLaunchRequest {
+                name: name.as_deref(),
                 image: self.image,
                 workdir: self.workdir,
                 env,

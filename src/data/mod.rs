@@ -5,10 +5,14 @@
 //! operations, no workflow execution, no command logic, and no frontend code
 //! is permitted at this layer. See `aspec/architecture/2026-grand-architecture.md`.
 
+pub mod api_lifecycle_store;
 pub mod builtin_runtime;
 #[cfg(unix)]
 pub mod builtin_state;
 pub mod ci_poll_event;
+// `command_status::CommandStatus` (API command rows) is not re-exported here:
+// `data::CommandStatus` already names the in-memory session command status.
+pub mod command_status;
 pub mod config;
 pub mod dynamic_workflow_assets;
 pub mod error;
@@ -37,6 +41,7 @@ pub mod setup_step;
 pub mod step_status;
 pub mod templates;
 pub mod text;
+pub mod workflow_cleanup;
 pub mod workflow_dag;
 pub mod workflow_definition;
 pub mod workflow_prompt_template;
@@ -44,6 +49,7 @@ pub mod workflow_state;
 pub mod workflow_state_store;
 pub mod worktree_paths;
 
+pub use api_lifecycle_store::{CommandLifecycleStore, RunRecord};
 pub use error::DataError;
 pub use fs::api_db::{CommandResult, WorkerId};
 pub use image_tags::{agent_image_tag, project_image_tag, repo_hash};

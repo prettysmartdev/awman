@@ -260,6 +260,7 @@ impl WorkflowFrontend for CliFrontend {
             WorkflowOutcome::CompletedTeardownFailed => "workflow completed but teardown failed.",
             WorkflowOutcome::Paused => "workflow paused.",
             WorkflowOutcome::Aborted => "workflow aborted.",
+            WorkflowOutcome::Cancelled => "workflow cancelled.",
             WorkflowOutcome::Failed {
                 last_step,
                 exit_code,

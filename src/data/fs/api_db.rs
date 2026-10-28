@@ -4,12 +4,14 @@
 //! existing on-disk databases written by prior awman releases can be opened
 //! by the new store without losing state.
 
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::Mutex;
 
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, OptionalExtension, params, params_from_iter, types::Value};
 
 use crate::data::error::DataError;
+use crate::data::fs::api_labels::{LabelSelector, Labels};
 use crate::data::fs::api_paths::ApiPaths;
 use crate::data::session::SessionKind;
 use crate::data::session_setup_event::SessionSetupStatus;
@@ -107,6 +109,81 @@ pub struct CommandRecord {
     pub worker_id: Option<String>,
     pub queued_at: Option<String>,
     pub result: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LabelOwner {
+    Session,
+    Command,
+}
+impl LabelOwner {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Session => "session",
+            Self::Command => "command",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CommandListFilter<'a> {
+    pub session_id: Option<&'a str>,
+    pub status: Option<&'a str>,
+    pub labels: &'a [LabelSelector],
+    pub limit: i64,
+}
+
+pub const IDEMPOTENCY_TTL_HOURS: u64 = 24;
+pub const IDEMPOTENCY_KEY_MAX_BYTES: usize = 255;
+
+#[derive(Debug, Clone, Copy)]
+pub struct IdempotencyScope<'a> {
+    pub route: &'a str,
+    pub principal: &'a str,
+}
+impl IdempotencyScope<'_> {
+    fn key(&self) -> String {
+        format!("{}|{}", self.route, self.principal)
+    }
+}
+
+/// Who holds an unfinished reservation: the daemon process (`instance`, one
+/// id per process lifetime) and the request within it. A reservation whose
+/// instance is not the caller's belongs to a daemon that has exited.
+#[derive(Debug, Clone, Copy)]
+pub struct IdempotencyOwner<'a> {
+    pub instance: &'a str,
+    pub request: &'a str,
+}
+
+/// The durable resource whose existence proves a request was admitted.
+#[derive(Debug, Clone, Copy)]
+pub enum IdempotencyResource<'a> {
+    Session(&'a str),
+    Command(&'a str),
+}
+
+impl IdempotencyResource<'_> {
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Session(_) => "session",
+            Self::Command(_) => "command",
+        }
+    }
+
+    fn id(&self) -> &str {
+        match self {
+            Self::Session(id) | Self::Command(id) => id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IdempotencyBegin {
+    Fresh,
+    Replay { status: u16, body: String },
+    InFlight,
+    Mismatch,
 }
 
 /// Identifies a running worker task.
@@ -269,6 +346,37 @@ impl SqliteSessionStore {
         Self::add_column_if_missing(conn, "commands", "worker_id", "TEXT")?;
         Self::add_column_if_missing(conn, "commands", "queued_at", "TEXT")?;
         Self::add_column_if_missing(conn, "commands", "result", "TEXT")?;
+        // WI 0135: labels and idempotency are side tables so old databases
+        // migrate additively without changing the stable session/command rows.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS labels (
+                owner_kind TEXT NOT NULL CHECK (owner_kind IN ('session','command')),
+                owner_id   TEXT NOT NULL,
+                key        TEXT NOT NULL,
+                value      TEXT NOT NULL,
+                PRIMARY KEY (owner_kind, owner_id, key)
+            );
+            CREATE INDEX IF NOT EXISTS labels_lookup ON labels (owner_kind, key, value);
+            CREATE TABLE IF NOT EXISTS idempotency_keys (
+                scope        TEXT NOT NULL,
+                key          TEXT NOT NULL,
+                request_hash TEXT NOT NULL,
+                status       INTEGER,
+                body         TEXT,
+                created_at   TEXT NOT NULL,
+                PRIMARY KEY (scope, key)
+            );
+            CREATE INDEX IF NOT EXISTS idempotency_created ON idempotency_keys (created_at);",
+        )?;
+        // Reservation ownership (daemon instance + request) and the admission
+        // intent: the response the owner will return once the named resource
+        // exists. A NULL owner (older rows) reads as a dead owner.
+        Self::add_column_if_missing(conn, "idempotency_keys", "owner_instance", "TEXT")?;
+        Self::add_column_if_missing(conn, "idempotency_keys", "owner_request", "TEXT")?;
+        Self::add_column_if_missing(conn, "idempotency_keys", "intent_status", "INTEGER")?;
+        Self::add_column_if_missing(conn, "idempotency_keys", "intent_body", "TEXT")?;
+        Self::add_column_if_missing(conn, "idempotency_keys", "resource_kind", "TEXT")?;
+        Self::add_column_if_missing(conn, "idempotency_keys", "resource_id", "TEXT")?;
         Ok(())
     }
 
@@ -452,6 +560,127 @@ impl SqliteSessionStore {
         Ok(result)
     }
 
+    pub fn set_labels(
+        &self,
+        owner: LabelOwner,
+        owner_id: &str,
+        labels: &Labels,
+    ) -> Result<(), DataError> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM labels WHERE owner_kind=?1 AND owner_id=?2",
+            params![owner.as_str(), owner_id],
+        )?;
+        for (key, value) in labels.iter() {
+            tx.execute(
+                "INSERT INTO labels(owner_kind,owner_id,key,value) VALUES(?1,?2,?3,?4)",
+                params![owner.as_str(), owner_id, key, value],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn labels_for(&self, owner: LabelOwner, owner_id: &str) -> Result<Labels, DataError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT key,value FROM labels WHERE owner_kind=?1 AND owner_id=?2 ORDER BY key",
+        )?;
+        let rows = stmt.query_map(params![owner.as_str(), owner_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        let map = rows.collect::<rusqlite::Result<BTreeMap<_, _>>>()?;
+        labels_from_map(map)
+    }
+
+    pub fn labels_for_many(
+        &self,
+        owner: LabelOwner,
+        ids: &[String],
+    ) -> Result<HashMap<String, Labels>, DataError> {
+        let mut result = ids
+            .iter()
+            .cloned()
+            .map(|id| (id, Labels::empty()))
+            .collect::<HashMap<_, _>>();
+        if ids.is_empty() {
+            return Ok(result);
+        }
+        let placeholders = vec!["?"; ids.len()].join(",");
+        let sql = format!(
+            "SELECT owner_id,key,value FROM labels WHERE owner_kind=? AND owner_id IN ({placeholders}) ORDER BY owner_id,key"
+        );
+        let mut values = vec![Value::from(owner.as_str().to_owned())];
+        values.extend(ids.iter().cloned().map(Value::from));
+        let conn = self.lock();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(values.iter()), |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut maps: HashMap<String, BTreeMap<String, String>> = HashMap::new();
+        for row in rows {
+            let (id, key, value) = row?;
+            maps.entry(id).or_default().insert(key, value);
+        }
+        for (id, map) in maps {
+            result.insert(id, labels_from_map(map)?);
+        }
+        Ok(result)
+    }
+
+    pub fn list_sessions_filtered(
+        &self,
+        status: Option<&str>,
+        labels: &[LabelSelector],
+    ) -> Result<Vec<SessionRecord>, DataError> {
+        let mut sql = String::from(
+            "SELECT id,workdir,created_at,status,closed_at,setup_status,session_type,cloned_path,repo_url,branch,base_ref,merge_refs,push FROM sessions s WHERE 1=1",
+        );
+        let mut args: Vec<Value> = Vec::new();
+        if let Some(status) = status {
+            sql.push_str(" AND s.status=?");
+            args.push(Value::from(status.to_owned()));
+        }
+        append_label_predicates(&mut sql, &mut args, "session", "s.id", labels);
+        sql.push_str(" ORDER BY s.created_at");
+        let conn = self.lock();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(args.iter()), session_record_from_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(DataError::from)
+    }
+
+    pub fn list_commands_filtered(
+        &self,
+        filter: &CommandListFilter<'_>,
+    ) -> Result<Vec<CommandRecord>, DataError> {
+        let mut sql = String::from(
+            "SELECT c.id,c.session_id,c.subcommand,c.args,c.status,c.exit_code,c.started_at,c.finished_at,c.log_path,c.worker_id,c.queued_at,c.result FROM commands c WHERE 1=1",
+        );
+        let mut args: Vec<Value> = Vec::new();
+        if let Some(session) = filter.session_id {
+            sql.push_str(" AND c.session_id=?");
+            args.push(Value::from(session.to_owned()));
+        }
+        if let Some(status) = filter.status {
+            sql.push_str(" AND c.status=?");
+            args.push(Value::from(status.to_owned()));
+        }
+        append_label_predicates(&mut sql, &mut args, "command", "c.id", filter.labels);
+        sql.push_str(" ORDER BY c.queued_at DESC, c.rowid DESC LIMIT ?");
+        args.push(Value::from(filter.limit));
+        let conn = self.lock();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(args.iter()), command_record_from_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(DataError::from)
+    }
+
     /// Return every session whose `setup_status` is one of the non-terminal
     /// values — `initializing`, `cloning_repository`, `setting_up_branch`, `merging_refs`,
     /// `running_ready`. Used at startup to mark them as `failed` (the setup
@@ -522,6 +751,11 @@ impl SqliteSessionStore {
                 params![sid],
                 |r| r.get::<_, i64>(0),
             )? as usize;
+            conn.execute(
+                "DELETE FROM labels WHERE owner_kind='session' AND owner_id=?1",
+                params![sid],
+            )?;
+            conn.execute("DELETE FROM labels WHERE owner_kind='command' AND owner_id IN (SELECT id FROM commands WHERE session_id=?1)", params![sid])?;
             conn.execute("DELETE FROM commands WHERE session_id = ?1", params![sid])?;
             conn.execute("DELETE FROM sessions WHERE id = ?1", params![sid])?;
             deleted.push((sid.clone(), cmd_count));
@@ -631,6 +865,193 @@ impl SqliteSessionStore {
         f(&conn)
     }
 
+    /// Reserve `key` for `owner`, or report what an earlier request with the
+    /// same key did. An unfinished reservation is never taken over while its
+    /// daemon instance is alive; one left by an exited daemon is replayed when
+    /// its recorded resource exists (the work was admitted) and otherwise
+    /// handed to the new request, since nothing was created.
+    pub fn idempotency_begin(
+        &self,
+        scope: IdempotencyScope<'_>,
+        key: &str,
+        request_hash: &str,
+        now: &str,
+        owner: IdempotencyOwner<'_>,
+    ) -> Result<IdempotencyBegin, DataError> {
+        validate_idempotency_key(key)?;
+        let now_dt = parse_timestamp(now)?;
+        let ttl_cutoff =
+            (now_dt - chrono::Duration::hours(IDEMPOTENCY_TTL_HOURS as i64)).to_rfc3339();
+        let scope = scope.key();
+        let mut conn = self.lock();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        tx.execute(
+            "DELETE FROM idempotency_keys WHERE created_at < ?1",
+            params![ttl_cutoff],
+        )?;
+        // An admitted request's recorded response wins over any liveness rule.
+        admitted_intent_to_response(&tx, &scope, key)?;
+        let existing: Option<(String, Option<u16>, Option<String>, Option<String>)> = tx
+            .query_row(
+                "SELECT request_hash,status,body,owner_instance FROM idempotency_keys WHERE scope=?1 AND key=?2",
+                params![scope, key],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?;
+        let outcome = match existing {
+            None => {
+                tx.execute(
+                    "INSERT INTO idempotency_keys(scope,key,request_hash,status,body,created_at,owner_instance,owner_request)
+                     VALUES(?1,?2,?3,NULL,NULL,?4,?5,?6)",
+                    params![scope, key, request_hash, now, owner.instance, owner.request],
+                )?;
+                IdempotencyBegin::Fresh
+            }
+            Some((old_hash, Some(status), Some(body), _)) => {
+                if old_hash == request_hash {
+                    IdempotencyBegin::Replay { status, body }
+                } else {
+                    IdempotencyBegin::Mismatch
+                }
+            }
+            Some((old_hash, _, _, instance)) if instance.as_deref() == Some(owner.instance) => {
+                if old_hash == request_hash {
+                    IdempotencyBegin::InFlight
+                } else {
+                    IdempotencyBegin::Mismatch
+                }
+            }
+            Some(_) => {
+                tx.execute(
+                    "UPDATE idempotency_keys SET request_hash=?3,status=NULL,body=NULL,created_at=?4,
+                        owner_instance=?5,owner_request=?6,intent_status=NULL,intent_body=NULL,
+                        resource_kind=NULL,resource_id=NULL
+                     WHERE scope=?1 AND key=?2",
+                    params![scope, key, request_hash, now, owner.instance, owner.request],
+                )?;
+                IdempotencyBegin::Fresh
+            }
+        };
+        tx.commit()?;
+        Ok(outcome)
+    }
+
+    /// Record, before the owner's first durable write, the response it will
+    /// return and the resource whose existence means it was admitted. A
+    /// restart or a dropped request then recovers the response from that
+    /// resource instead of admitting the work twice. `Ok(false)` when `owner`
+    /// no longer holds the reservation.
+    pub fn idempotency_record_intent(
+        &self,
+        scope: IdempotencyScope<'_>,
+        key: &str,
+        owner: IdempotencyOwner<'_>,
+        status: u16,
+        body: &str,
+        resource: IdempotencyResource<'_>,
+    ) -> Result<bool, DataError> {
+        validate_idempotency_key(key)?;
+        let conn = self.lock();
+        let changed = conn.execute(
+            "UPDATE idempotency_keys SET intent_status=?5,intent_body=?6,resource_kind=?7,resource_id=?8
+             WHERE scope=?1 AND key=?2 AND owner_instance=?3 AND owner_request=?4 AND status IS NULL",
+            params![
+                scope.key(),
+                key,
+                owner.instance,
+                owner.request,
+                status,
+                body,
+                resource.kind(),
+                resource.id()
+            ],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Store the final response. Only the reservation's owner can complete
+    /// it; `Ok(false)` when `owner` no longer holds an unfinished reservation.
+    pub fn idempotency_complete(
+        &self,
+        scope: IdempotencyScope<'_>,
+        key: &str,
+        owner: IdempotencyOwner<'_>,
+        status: u16,
+        body: &str,
+    ) -> Result<bool, DataError> {
+        validate_idempotency_key(key)?;
+        let conn = self.lock();
+        let changed = conn.execute(
+            "UPDATE idempotency_keys SET status=?5,body=?6
+             WHERE scope=?1 AND key=?2 AND owner_instance=?3 AND owner_request=?4 AND status IS NULL",
+            params![scope.key(), key, owner.instance, owner.request, status, body],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Drop `owner`'s unfinished reservation after a request that admitted
+    /// nothing (or rolled back what it admitted). Another owner's reservation
+    /// is never touched.
+    pub fn idempotency_release(
+        &self,
+        scope: IdempotencyScope<'_>,
+        key: &str,
+        owner: IdempotencyOwner<'_>,
+    ) -> Result<(), DataError> {
+        validate_idempotency_key(key)?;
+        let conn = self.lock();
+        conn.execute(
+            "DELETE FROM idempotency_keys
+             WHERE scope=?1 AND key=?2 AND owner_instance=?3 AND owner_request=?4 AND status IS NULL",
+            params![scope.key(), key, owner.instance, owner.request],
+        )?;
+        Ok(())
+    }
+
+    /// Like [`Self::idempotency_release`], for a request that ended without
+    /// storing its response (a panic, a dropped future, a failed store):
+    /// when its recorded resource exists the work was admitted, so the
+    /// recorded response is stored instead of releasing the key.
+    pub fn idempotency_release_unless_admitted(
+        &self,
+        scope: IdempotencyScope<'_>,
+        key: &str,
+        owner: IdempotencyOwner<'_>,
+    ) -> Result<(), DataError> {
+        validate_idempotency_key(key)?;
+        let scope = scope.key();
+        let mut conn = self.lock();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let owned = tx
+            .query_row(
+                "SELECT 1 FROM idempotency_keys
+                 WHERE scope=?1 AND key=?2 AND owner_instance=?3 AND owner_request=?4 AND status IS NULL",
+                params![scope, key, owner.instance, owner.request],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if owned && !admitted_intent_to_response(&tx, &scope, key)? {
+            tx.execute(
+                "DELETE FROM idempotency_keys WHERE scope=?1 AND key=?2 AND status IS NULL",
+                params![scope, key],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn prune_idempotency_keys(&self, ttl_hours: u64, now: &str) -> Result<usize, DataError> {
+        let cutoff = (parse_timestamp(now)?
+            - chrono::Duration::hours(ttl_hours.min(i64::MAX as u64) as i64))
+        .to_rfc3339();
+        let conn = self.lock();
+        Ok(conn.execute(
+            "DELETE FROM idempotency_keys WHERE created_at < ?1",
+            params![cutoff],
+        )?)
+    }
+
     // ─── Queue operations ─────────────────────────────────────────────────
 
     pub fn enqueue_command(
@@ -651,6 +1072,40 @@ impl SqliteSessionStore {
         Ok(())
     }
 
+    /// [`Self::enqueue_command`] and its labels in one transaction, so a
+    /// claimable row never exists without its labels (and the row's
+    /// existence alone proves the submission was admitted).
+    pub fn enqueue_command_with_labels(
+        &self,
+        id: &str,
+        session_id: &str,
+        subcommand: &str,
+        args: &str,
+        log_path: &str,
+        labels: &Labels,
+    ) -> Result<(), DataError> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM labels WHERE owner_kind=?1 AND owner_id=?2",
+            params![LabelOwner::Command.as_str(), id],
+        )?;
+        for (key, value) in labels.iter() {
+            tx.execute(
+                "INSERT INTO labels(owner_kind,owner_id,key,value) VALUES(?1,?2,?3,?4)",
+                params![LabelOwner::Command.as_str(), id, key, value],
+            )?;
+        }
+        tx.execute(
+            "INSERT INTO commands (id, session_id, subcommand, args, status, log_path, queued_at)
+             VALUES (?1, ?2, ?3, ?4, 'queued', ?5, ?6)",
+            params![id, session_id, subcommand, args, log_path, now],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn claim_next_command(&self, worker_id: &str) -> Result<Option<CommandRecord>, DataError> {
         let now = chrono::Utc::now().to_rfc3339();
         let conn = self.lock();
@@ -662,6 +1117,7 @@ impl SqliteSessionStore {
              WHERE id = (
                  SELECT c.id FROM commands c
                  WHERE c.status IN ('queued', 'pending')
+                   AND EXISTS (SELECT 1 FROM sessions s WHERE s.id=c.session_id AND s.setup_status='ready')
                    AND NOT EXISTS (
                        SELECT 1 FROM commands r
                        WHERE r.session_id = c.session_id
@@ -908,6 +1364,104 @@ fn session_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionR
     })
 }
 
+fn command_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CommandRecord> {
+    Ok(CommandRecord {
+        id: row.get(0)?,
+        session_id: row.get(1)?,
+        subcommand: row.get(2)?,
+        args: row.get(3)?,
+        status: row.get(4)?,
+        exit_code: row.get(5)?,
+        started_at: row.get(6)?,
+        finished_at: row.get(7)?,
+        log_path: row.get(8)?,
+        worker_id: row.get(9)?,
+        queued_at: row.get(10)?,
+        result: row.get(11)?,
+    })
+}
+
+fn labels_from_map(map: BTreeMap<String, String>) -> Result<Labels, DataError> {
+    Labels::new(map).map_err(|e| DataError::Other(format!("invalid labels in API database: {e}")))
+}
+
+fn append_label_predicates(
+    sql: &mut String,
+    args: &mut Vec<Value>,
+    owner: &str,
+    owner_expr: &str,
+    selectors: &[LabelSelector],
+) {
+    for selector in selectors {
+        sql.push_str(" AND EXISTS (SELECT 1 FROM labels l WHERE l.owner_kind=? AND l.owner_id=");
+        sql.push_str(owner_expr);
+        sql.push_str(" AND l.key=?");
+        args.push(Value::from(owner.to_owned()));
+        match selector {
+            LabelSelector::Equals { key, value } => {
+                sql.push_str(" AND l.value=?");
+                args.push(Value::from(key.clone()));
+                args.push(Value::from(value.clone()));
+            }
+            LabelSelector::Exists { key } => args.push(Value::from(key.clone())),
+        }
+        sql.push(')');
+    }
+}
+
+/// If the unfinished reservation `(scope, key)` recorded an intent whose
+/// resource exists, store that intent as its response. Returns whether it did.
+fn admitted_intent_to_response(
+    conn: &Connection,
+    scope: &str,
+    key: &str,
+) -> Result<bool, DataError> {
+    let intent: Option<(String, String)> = conn
+        .query_row(
+            "SELECT resource_kind,resource_id FROM idempotency_keys
+             WHERE scope=?1 AND key=?2 AND status IS NULL AND intent_status IS NOT NULL",
+            params![scope, key],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let Some((kind, id)) = intent else {
+        return Ok(false);
+    };
+    let sql = match kind.as_str() {
+        "session" => "SELECT 1 FROM sessions WHERE id=?1",
+        "command" => "SELECT 1 FROM commands WHERE id=?1",
+        _ => return Ok(false),
+    };
+    let exists = conn
+        .query_row(sql, params![id], |_| Ok(()))
+        .optional()?
+        .is_some();
+    if exists {
+        conn.execute(
+            "UPDATE idempotency_keys SET status=intent_status,body=intent_body
+             WHERE scope=?1 AND key=?2 AND status IS NULL",
+            params![scope, key],
+        )?;
+    }
+    Ok(exists)
+}
+
+fn validate_idempotency_key(key: &str) -> Result<(), DataError> {
+    if key.is_empty() || key.len() > IDEMPOTENCY_KEY_MAX_BYTES || key.chars().any(char::is_control)
+    {
+        return Err(DataError::Other(format!(
+            "invalid Idempotency-Key (must be 1..={IDEMPOTENCY_KEY_MAX_BYTES} bytes without control characters)"
+        )));
+    }
+    Ok(())
+}
+
+fn parse_timestamp(value: &str) -> Result<chrono::DateTime<chrono::Utc>, DataError> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .map(|v| v.with_timezone(&chrono::Utc))
+        .map_err(|e| DataError::Other(format!("invalid RFC3339 timestamp '{value}': {e}")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -924,6 +1478,283 @@ mod tests {
     fn open_fresh_db_succeeds() {
         let (_tmp, _store) = make_store();
         // If we reach here without panic/error, the open + migration succeeded.
+    }
+
+    #[test]
+    fn labels_round_trip_and_filter_sessions_and_commands() {
+        let (_tmp, store) = make_store();
+        store
+            .insert_session("s-label", "/work", "2026-01-01T00:00:00Z")
+            .unwrap();
+        store
+            .insert_command("c-label", "s-label", "chat", "[]", "/tmp/log")
+            .unwrap();
+        store
+            .insert_session("s-partial", "/work-2", "2026-01-02T00:00:00Z")
+            .unwrap();
+        store
+            .insert_command("c-partial", "s-partial", "chat", "[]", "/tmp/log-2")
+            .unwrap();
+        let labels = Labels::new(BTreeMap::from([
+            ("env".to_owned(), "prod".to_owned()),
+            ("tier".to_owned(), "api".to_owned()),
+        ]))
+        .unwrap();
+        store
+            .set_labels(LabelOwner::Session, "s-label", &labels)
+            .unwrap();
+        store
+            .set_labels(LabelOwner::Command, "c-label", &labels)
+            .unwrap();
+        let partial = Labels::new(BTreeMap::from([("env".to_owned(), "prod".to_owned())])).unwrap();
+        store
+            .set_labels(LabelOwner::Session, "s-partial", &partial)
+            .unwrap();
+        store
+            .set_labels(LabelOwner::Command, "c-partial", &partial)
+            .unwrap();
+        assert_eq!(
+            store.labels_for(LabelOwner::Session, "s-label").unwrap(),
+            labels
+        );
+        assert_eq!(
+            store
+                .labels_for_many(LabelOwner::Command, &["c-label".into(), "missing".into()])
+                .unwrap()["c-label"],
+            labels
+        );
+        let selectors = [
+            LabelSelector::parse("env=prod").unwrap(),
+            LabelSelector::parse("tier").unwrap(),
+        ];
+        assert_eq!(
+            store
+                .list_sessions_filtered(Some("active"), &selectors)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .list_sessions_filtered(Some("active"), &[selectors[0].clone()])
+                .unwrap()
+                .len(),
+            2,
+            "one selector matches both rows"
+        );
+        assert_eq!(
+            store
+                .list_commands_filtered(&CommandListFilter {
+                    session_id: Some("s-label"),
+                    status: Some("pending"),
+                    labels: &selectors,
+                    limit: 10
+                })
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .list_commands_filtered(&CommandListFilter {
+                    session_id: None,
+                    status: Some("pending"),
+                    labels: &[selectors[0].clone()],
+                    limit: 10
+                })
+                .unwrap()
+                .len(),
+            2,
+            "one selector matches both commands"
+        );
+    }
+
+    #[test]
+    fn idempotency_replays_until_24_hour_expiry_and_is_scope_isolated() {
+        let (_tmp, store) = make_store();
+        let commands = IdempotencyScope {
+            route: "/v1/commands",
+            principal: "key-a",
+        };
+        let other_principal = IdempotencyScope {
+            route: "/v1/commands",
+            principal: "key-b",
+        };
+        let other_route = IdempotencyScope {
+            route: "/v1/runs",
+            principal: "key-a",
+        };
+        let owner = IdempotencyOwner {
+            instance: "daemon",
+            request: "request-1",
+        };
+        let retry = IdempotencyOwner {
+            instance: "daemon",
+            request: "request-2",
+        };
+        let t0 = "2026-01-01T00:00:00Z";
+
+        assert_eq!(
+            store
+                .idempotency_begin(commands, "key", "body", t0, owner)
+                .unwrap(),
+            IdempotencyBegin::Fresh
+        );
+        assert!(
+            store
+                .idempotency_complete(commands, "key", owner, 202, r#"{"command_id":"c1"}"#)
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .idempotency_begin(commands, "key", "body", "2026-01-01T23:59:59Z", retry)
+                .unwrap(),
+            IdempotencyBegin::Replay {
+                status: 202,
+                body: r#"{"command_id":"c1"}"#.into()
+            }
+        );
+
+        // The deterministic timestamp is the injected clock: just beyond
+        // +24h the completed reservation is pruned and the key can be admitted.
+        assert_eq!(
+            store
+                .idempotency_begin(commands, "key", "body", "2026-01-02T00:00:01Z", retry)
+                .unwrap(),
+            IdempotencyBegin::Fresh
+        );
+        assert_eq!(
+            store
+                .idempotency_begin(other_principal, "key", "body", t0, owner)
+                .unwrap(),
+            IdempotencyBegin::Fresh
+        );
+        assert_eq!(
+            store
+                .idempotency_begin(other_route, "key", "body", t0, owner)
+                .unwrap(),
+            IdempotencyBegin::Fresh
+        );
+    }
+
+    #[test]
+    fn idempotency_replays_mismatches_expires_and_releases() {
+        let (_tmp, store) = make_store();
+        let scope = IdempotencyScope {
+            route: "/v1/commands",
+            principal: "local",
+        };
+        let a = IdempotencyOwner {
+            instance: "daemon-1",
+            request: "a",
+        };
+        let b = IdempotencyOwner {
+            instance: "daemon-1",
+            request: "b",
+        };
+        let t0 = "2026-01-01T00:00:00Z";
+        assert_eq!(
+            store
+                .idempotency_begin(scope, "key", "hash", t0, a)
+                .unwrap(),
+            IdempotencyBegin::Fresh
+        );
+        assert_eq!(
+            store
+                .idempotency_begin(scope, "key", "hash", t0, b)
+                .unwrap(),
+            IdempotencyBegin::InFlight
+        );
+        assert_eq!(
+            store
+                .idempotency_begin(scope, "key", "other", t0, b)
+                .unwrap(),
+            IdempotencyBegin::Mismatch
+        );
+        // A live owner is never displaced, however long it takes.
+        assert_eq!(
+            store
+                .idempotency_begin(scope, "key", "hash", "2026-01-01T00:05:00Z", b)
+                .unwrap(),
+            IdempotencyBegin::InFlight
+        );
+        assert!(
+            !store
+                .idempotency_complete(scope, "key", b, 202, "{}")
+                .unwrap()
+        );
+        assert!(
+            store
+                .idempotency_complete(scope, "key", a, 202, r#"{"ok":true}"#)
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .idempotency_begin(scope, "key", "hash", t0, b)
+                .unwrap(),
+            IdempotencyBegin::Replay {
+                status: 202,
+                body: r#"{"ok":true}"#.into()
+            }
+        );
+        // A completed key stays bound to its body for the whole TTL.
+        assert_eq!(
+            store
+                .idempotency_begin(scope, "key", "new", "2026-01-01T00:01:01Z", b)
+                .unwrap(),
+            IdempotencyBegin::Mismatch
+        );
+        // Release is owner-fenced and leaves completed responses alone.
+        store.idempotency_release(scope, "key", a).unwrap();
+        assert!(matches!(
+            store
+                .idempotency_begin(scope, "key", "hash", t0, b)
+                .unwrap(),
+            IdempotencyBegin::Replay { .. }
+        ));
+        assert_eq!(
+            store
+                .idempotency_begin(scope, "other", "x", "2026-01-01T00:02:00Z", a)
+                .unwrap(),
+            IdempotencyBegin::Fresh
+        );
+        store.idempotency_release(scope, "other", b).unwrap();
+        assert_eq!(
+            store
+                .idempotency_begin(scope, "other", "x", "2026-01-01T00:02:00Z", b)
+                .unwrap(),
+            IdempotencyBegin::InFlight
+        );
+        store.idempotency_release(scope, "other", a).unwrap();
+        assert_eq!(
+            store
+                .idempotency_begin(scope, "other", "y", "2026-01-01T00:02:00Z", b)
+                .unwrap(),
+            IdempotencyBegin::Fresh
+        );
+        // A reservation left by an exited daemon that admitted nothing is
+        // handed over; its old owner can then no longer complete it.
+        let restarted = IdempotencyOwner {
+            instance: "daemon-2",
+            request: "c",
+        };
+        assert_eq!(
+            store
+                .idempotency_begin(scope, "other", "z", "2026-01-01T00:02:30Z", restarted)
+                .unwrap(),
+            IdempotencyBegin::Fresh
+        );
+        assert!(
+            !store
+                .idempotency_complete(scope, "other", b, 202, "{}")
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .prune_idempotency_keys(24, "2026-01-03T00:02:00Z")
+                .unwrap(),
+            2
+        );
     }
 
     #[test]
@@ -1215,6 +2046,18 @@ mod tests {
         // Step 2: open with SqliteSessionStore (triggers idempotent migration).
         let store = SqliteSessionStore::open(tmp.path()).unwrap();
 
+        // WI 0135 lifecycle tables are additive too and can be opened on the
+        // same database created by the prior schema.
+        let lifecycle = crate::data::api_lifecycle_store::CommandLifecycleStore::open(
+            std::sync::Arc::new(SqliteSessionStore::open(tmp.path()).unwrap()),
+        )
+        .unwrap();
+        assert!(
+            lifecycle
+                .cancel_if_queued("cmd-1", "2026-10-28T00:00:00Z")
+                .unwrap()
+        );
+
         // Step 3: verify the legacy rows are readable.
         let sessions = store.list_sessions().unwrap();
         assert_eq!(sessions.len(), 1);
@@ -1231,7 +2074,11 @@ mod tests {
         let cmd = store.get_command("cmd-1").unwrap().unwrap();
         assert_eq!(cmd.session_id, "legacy-id-1");
         assert_eq!(cmd.subcommand, "chat");
-        assert_eq!(cmd.status, "pending");
+        assert_eq!(cmd.status, "cancelled");
+        assert_eq!(
+            cmd.exit_code,
+            Some(crate::data::command_status::CANCELLED_EXIT_CODE)
+        );
     }
 
     // ─── WI 0133: remote session fields ───────────────────────────────────────
@@ -1254,18 +2101,20 @@ mod tests {
         let (_tmp, store) = make_store();
         insert_remote(&store, "r1");
         let merge_refs = vec!["feat-a".to_string(), "feat-b".to_string()];
-        assert!(store
-            .set_remote_fields(
-                "r1",
-                RemoteSessionFields {
-                    repo_url: Some("https://host.invalid/o/r.git"),
-                    branch: Some("job-1"),
-                    base_ref: Some("v1.0"),
-                    merge_refs: &merge_refs,
-                    push: true,
-                },
-            )
-            .unwrap());
+        assert!(
+            store
+                .set_remote_fields(
+                    "r1",
+                    RemoteSessionFields {
+                        repo_url: Some("https://host.invalid/o/r.git"),
+                        branch: Some("job-1"),
+                        base_ref: Some("v1.0"),
+                        merge_refs: &merge_refs,
+                        push: true,
+                    },
+                )
+                .unwrap()
+        );
         let rec = store.get_session("r1").unwrap().unwrap();
         assert_eq!(
             rec.repo_url.as_deref(),

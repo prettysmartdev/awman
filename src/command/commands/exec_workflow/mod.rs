@@ -8,6 +8,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde::Serialize;
 
+pub(crate) use prepare::finish_cancelled_cleanup;
+
 use crate::command::commands::launch_policy::LaunchPolicy;
 use crate::command::commands::mount_scope::MountScope;
 use crate::command::commands::worktree_lifecycle::{
@@ -120,6 +122,14 @@ pub trait ExecWorkflowCommandFrontend:
     fn report_workflow_summary(&mut self, summary: &WorkflowSummary);
 
     fn report_workflow_context_path(&mut self, _host_path: &std::path::Path) {}
+
+    /// Persist teardown inputs before starting work on a durable API command.
+    fn record_cancel_cleanup(
+        &mut self,
+        _cleanup: &crate::data::workflow_cleanup::WorkflowCleanup,
+    ) -> Result<(), CommandError> {
+        Ok(())
+    }
 
     /// An interactive setup/teardown container is about to launch for the
     /// step `description` (the string `on_phase_step_started` carried).
@@ -326,6 +336,9 @@ pub struct ExecWorkflowCommand {
     /// daemon's and has no viewer, and for tests built with
     /// [`ExecWorkflowCommand::new`].
     managed_session: Option<Arc<tokio::sync::RwLock<Session>>>,
+    /// Fired by an external cancel (the API's `POST /v1/commands/{id}/cancel`).
+    /// Never fired for the CLI, the TUI or squad, which never install one.
+    cancel: tokio_util::sync::CancellationToken,
 }
 
 impl ExecWorkflowCommand {
@@ -338,6 +351,7 @@ impl ExecWorkflowCommand {
             task_workspace: None,
             workflow_state_root: None,
             managed_session: None,
+            cancel: tokio_util::sync::CancellationToken::new(),
         }
     }
 
@@ -403,7 +417,8 @@ impl ExecWorkflowCommand {
             ));
         }
         Ok(Self::new(flags, ctx.engines.clone(), ctx.session.clone())
-            .mirroring_into(Arc::clone(&ctx.managed_session)))
+            .mirroring_into(Arc::clone(&ctx.managed_session))
+            .with_cancellation(ctx.cancel.clone()))
     }
 
     /// Carry a squad container identity so every generated-workflow step
@@ -440,6 +455,13 @@ impl ExecWorkflowCommand {
         self
     }
 
+    /// Observe `token`: once it fires the workflow stops its containers, runs
+    /// teardown in cancelled mode and ends with exit code 130.
+    pub fn with_cancellation(mut self, token: tokio_util::sync::CancellationToken) -> Self {
+        self.cancel = token;
+        self
+    }
+
     pub fn flags(&self) -> &ExecWorkflowCommandFlags {
         &self.flags
     }
@@ -458,7 +480,7 @@ mod issue;
 mod phase_container;
 mod prepare;
 mod shared_frontend;
-use shared_frontend::SharedWorkflowFrontend;
+pub(crate) use shared_frontend::SharedWorkflowFrontend;
 
 #[cfg(test)]
 pub(crate) mod tests;

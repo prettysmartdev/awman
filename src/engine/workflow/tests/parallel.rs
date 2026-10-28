@@ -525,6 +525,7 @@ async fn compute_available_actions_scopes_wcb_with_parallel_peers() {
         execution: None,
         cancel_handle: None,
         container_name: format!("container-{name}"),
+        handle: fake_handle(&format!("container-{name}")),
         output_tail: None,
         awman_killed: false,
         stuck: false,
@@ -1159,4 +1160,80 @@ fn ask_parallel_group_defaults_to_keep_running() {
         frontend.ask_parallel_group(&prompt).unwrap(),
         ParallelGroupDecision::KeepRunning
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn simultaneous_parallel_failure_and_cancel_stops_all_slots_without_retry_or_abort() {
+    struct CancellingFactory {
+        inner: BlockingFactory,
+        token: tokio_util::sync::CancellationToken,
+    }
+    impl AgentExecutionFactory for CancellingFactory {
+        fn execution_for_step(
+            &self,
+            step: &WorkflowStep,
+            session: &Session,
+            ctx: &WorkflowRuntimeContext,
+        ) -> Result<AgentExecution, EngineError> {
+            let execution = self.inner.execution_for_step(step, session, ctx)?;
+            if self.inner.execution_count.load(Ordering::Relaxed) == 2 {
+                self.token.cancel();
+            }
+            Ok(execution)
+        }
+        fn inject_prompt(&self, _: &AgentExecution, _: &str) -> Result<Option<()>, EngineError> {
+            Ok(None)
+        }
+        fn stop_agent(&self, handle: &AgentHandle) -> Result<(), EngineError> {
+            self.inner.stop_agent(handle)
+        }
+        fn recover_auth_failure(&self, _: &AgentName, _: &str) -> Result<bool, EngineError> {
+            panic!("cancel must precede auth recovery")
+        }
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let session = make_session(&tmp);
+    let mut failing = make_step("failure", &[], None);
+    failing.abort_on_failure = true;
+    let sibling = make_step("live", &[], None);
+    let workflow = make_workflow(
+        Some("parallel-cancel-race"),
+        Some("claude"),
+        vec![failing.clone(), sibling.clone()],
+    );
+    let (failed_flag, failed_completion) = make_blocking_entry();
+    signal_completion(&failed_completion, 1);
+    let (live_flag, live_completion) = make_blocking_entry();
+    let inner = BlockingFactory::new([
+        (failed_flag, failed_completion),
+        (live_flag.clone(), live_completion),
+    ]);
+    let stopped = inner.stopped.clone();
+    let launches = inner.execution_count.clone();
+    let token = tokio_util::sync::CancellationToken::new();
+    let mut engine = WorkflowEngine::new(
+        &session,
+        WorkflowSpec::new(workflow),
+        WorkflowEngineDeps {
+            frontend: Box::new(FakeWorkflowFrontend::new([])),
+            agent_factory: Box::new(CancellingFactory {
+                inner,
+                token: token.clone(),
+            }),
+        },
+    )
+    .unwrap();
+    engine.set_cancellation(token);
+    let result = engine
+        .run_parallel_group(vec![failing, sibling])
+        .await
+        .unwrap();
+    assert!(matches!(
+        result,
+        GroupOutcome::Ended(WorkflowOutcome::Cancelled)
+    ));
+    assert_eq!(stopped.lock().unwrap().len(), 2);
+    assert_eq!(launches.load(Ordering::Relaxed), 2);
+    assert!(live_flag.load(Ordering::Relaxed));
+    assert!(!engine.abort_on_failure_triggered());
 }

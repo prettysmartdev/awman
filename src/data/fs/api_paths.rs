@@ -312,10 +312,56 @@ impl ApiPaths {
         std::fs::rename(&tmp_path, &path).map_err(|e| DataError::io(&path, e))
     }
 
-    /// Read a command's persisted workflow state as raw JSON text. Returns
-    /// `Ok(None)` when no workflow state exists (the file is absent) and
-    /// `Err` for any other IO failure, so callers can distinguish "no
-    /// workflow" from "read failed".
+    /// Save the original cleanup inputs outside the agent's workspace.
+    pub fn write_command_cleanup(
+        &self,
+        session_id: &str,
+        command_id: &str,
+        cleanup: &crate::data::workflow_cleanup::WorkflowCleanup,
+    ) -> Result<(), DataError> {
+        let path = self
+            .command_workflow_state_path(session_id, command_id)
+            .with_file_name("cleanup.json");
+        let tmp = path.with_extension("json.tmp");
+        let json =
+            serde_json::to_vec(cleanup).map_err(|source| DataError::ConfigSerialize { source })?;
+        std::fs::write(&tmp, json).map_err(|e| DataError::io(&tmp, e))?;
+        std::fs::rename(&tmp, &path).map_err(|e| DataError::io(&path, e))
+    }
+
+    pub fn read_command_cleanup(
+        &self,
+        session_id: &str,
+        command_id: &str,
+    ) -> Result<Option<crate::data::workflow_cleanup::WorkflowCleanup>, DataError> {
+        let path = self
+            .command_workflow_state_path(session_id, command_id)
+            .with_file_name("cleanup.json");
+        match std::fs::read(&path) {
+            Ok(json) => serde_json::from_slice(&json)
+                .map(Some)
+                .map_err(|source| DataError::ConfigParse { path, source }),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(DataError::io(&path, e)),
+        }
+    }
+
+    pub fn remove_command_cleanup(
+        &self,
+        session_id: &str,
+        command_id: &str,
+    ) -> Result<(), DataError> {
+        let path = self
+            .command_workflow_state_path(session_id, command_id)
+            .with_file_name("cleanup.json");
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(DataError::io(&path, e)),
+        }
+    }
+
+    /// Read a command's workflow state, distinguishing absence from IO failure.
     pub fn read_command_workflow_state_raw(
         &self,
         session_id: &str,

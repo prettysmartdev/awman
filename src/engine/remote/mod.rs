@@ -12,8 +12,9 @@ pub mod events;
 pub mod http_core;
 
 pub use client::{
-    ExecArg, ExecJobResponse, JobStatus, RemoteClient, RemoteResponse, SessionSetupStatusResponse,
-    StartSessionRequest, StartSessionResponse,
+    CancelCommandResponse, CommandListQuery, ExecArg, ExecJobResponse, JobStatus, RemoteClient,
+    RemoteResponse, SessionSetupStatusResponse, StartCommandRequest, StartRunRequest,
+    StartRunResponse, StartSessionRequest, StartSessionResponse,
 };
 pub use events::ExecutionEventSink;
 pub use http_core::{HttpClientOptions, HttpCore, HttpResponse};

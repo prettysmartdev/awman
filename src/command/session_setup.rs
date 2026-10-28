@@ -44,6 +44,9 @@ use crate::engine::git::{GitFrontend, MergeRefOutcome};
 use crate::engine::ready::frontend::ReadyFrontend;
 use crate::engine::ready::{ReadyEngine, ReadyEngineOptions};
 
+/// `error.stage` of a setup abandoned through [`SessionSetup::with_cancellation`].
+pub const SETUP_CANCELLED_STAGE: &str = "cancelled";
+
 /// Presentation-only side effects the [`SessionSetup`] orchestrator delegates
 /// to the calling frontend.
 ///
@@ -95,6 +98,9 @@ pub struct SessionSetup {
     store: Arc<SqliteSessionStore>,
     /// Where the terminal `setup_state.json` snapshot is written.
     paths: ApiPaths,
+    /// Fired to abandon the setup (a cancelled `/v1/runs` command). Never fires
+    /// unless the caller installs one with [`SessionSetup::with_cancellation`].
+    cancel: tokio_util::sync::CancellationToken,
 }
 
 impl SessionSetup {
@@ -115,7 +121,18 @@ impl SessionSetup {
             setup_state,
             store,
             paths,
+            cancel: tokio_util::sync::CancellationToken::new(),
         }
+    }
+
+    /// Observe `token`: between stages, and around the ready checks. A fired
+    /// token records `failed` with `error.stage = "cancelled"`,
+    /// `message = "session setup cancelled"`, deletes a remote clone, persists
+    /// `"failed"` and finishes. A blocking git operation already running is
+    /// not interrupted; the token is honoured at the next check.
+    pub fn with_cancellation(mut self, token: tokio_util::sync::CancellationToken) -> Self {
+        self.cancel = token;
+        self
     }
 
     /// Apply one transition to the shared setup state. Every write this
@@ -207,6 +224,28 @@ impl SessionSetup {
         self.finish(presenter).await;
     }
 
+    /// Record a cancelled setup and retire the run: broadcast it, delete a
+    /// remote session's clone, persist `"failed"`, then finish.
+    async fn fail_cancelled(&self, presenter: &mut dyn SessionSetupPresenter) {
+        tracing::info!(session_id = %self.session_id, "Session setup cancelled");
+        self.mark_failed(presenter, SETUP_CANCELLED_STAGE, "session setup cancelled");
+        if self.plan.kind == SessionKind::Remote {
+            self.delete_clone().await;
+        }
+        self.persist_status("failed");
+        self.finish(presenter).await;
+    }
+
+    /// One cancellation check point: `true` once the token has fired, after
+    /// the cancel has been recorded and the run retired; the caller stops.
+    async fn cancelled_here(&self, presenter: &mut dyn SessionSetupPresenter) -> bool {
+        if !self.cancel.is_cancelled() {
+            return false;
+        }
+        self.fail_cancelled(presenter).await;
+        true
+    }
+
     /// Run one blocking git operation off the async runtime, turning a panic
     /// in the task into an [`EngineError::Git`] naming `what`.
     async fn blocking_git<T: Send + 'static>(
@@ -278,6 +317,9 @@ impl SessionSetup {
             stage: "cloning_repository_done".to_string(),
             message: "Repository cloned".to_string(),
         });
+        if self.cancelled_here(presenter).await {
+            return Err(());
+        }
 
         // ── Stage 2: set up branch ───────────────────────────────────────────
         let Some(branch) = self.plan.branch.clone() else {
@@ -310,6 +352,9 @@ impl SessionSetup {
                 self.fail_remote(presenter, "branch", &e).await;
                 return Err(());
             }
+        }
+        if self.cancelled_here(presenter).await {
+            return Err(());
         }
 
         // ── Stage 2b: merge refs ─────────────────────────────────────────────
@@ -433,6 +478,9 @@ impl SessionSetup {
         // 202) can be flushed before any setup work runs. Critical when the
         // tokio runtime is single-threaded (e.g. `#[tokio::test]`).
         tokio::time::sleep(Duration::from_millis(50)).await;
+        if self.cancelled_here(presenter).await {
+            return;
+        }
 
         tracing::info!(
             session_id = %session_id,
@@ -452,6 +500,11 @@ impl SessionSetup {
 
         // ── [remote only] Stages 1-2b: clone, branch, merges ─────────────────
         if self.plan.kind == SessionKind::Remote && self.prepare_clone(presenter).await.is_err() {
+            return;
+        }
+        // After the merges (or straight after the clone/branch when there are
+        // none), and before the session is opened.
+        if self.cancelled_here(presenter).await {
             return;
         }
 
@@ -600,8 +653,23 @@ impl SessionSetup {
         // base-image build, completes well within this. If the wall-clock exceeds
         // the cap (e.g. Docker daemon is unresponsive), mark the setup as failed
         // so the session row reaches a terminal state and the bus is cleaned up.
+        //
+        // A cancel drops the ready future, which cancels an in-flight import.
         let ready_fut = ready_engine.run_to_completion(&mut *setup_frontend);
-        let ready_outcome = tokio::time::timeout(Duration::from_secs(600), ready_fut).await;
+        let cancel = self.cancel.clone();
+        let ready_outcome = tokio::select! {
+            // A cancel and a finished ready run that are both ready: the
+            // cancel wins (and is rechecked below before `ready` is published).
+            biased;
+            _ = cancel.cancelled() => {
+                self.fail_cancelled(presenter).await;
+                return;
+            }
+            outcome = tokio::time::timeout(Duration::from_secs(600), ready_fut) => outcome,
+        };
+        if self.cancelled_here(presenter).await {
+            return;
+        }
 
         match ready_outcome {
             // The engine records a failed build or import as a summary row,
@@ -863,6 +931,75 @@ mod tests {
             !presenter.ready_frontend_called,
             "setup must not reach the ready stage"
         );
+    }
+
+    #[tokio::test]
+    async fn cancelled_remote_setup_deletes_clone_and_records_cancelled_stage() {
+        let root = tempfile::tempdir().unwrap();
+        let cloned_path = root.path().join("cancelled-clone");
+        std::fs::create_dir_all(&cloned_path).unwrap();
+        std::fs::write(cloned_path.join("marker"), b"partial clone").unwrap();
+
+        let api_root = tempfile::tempdir().unwrap();
+        let paths = ApiPaths::from_root(api_root.path());
+        let store = Arc::new(SqliteSessionStore::open_from_paths(&paths).unwrap());
+        store
+            .insert_session_full(crate::data::fs::api_db::NewSessionRow {
+                id: "sess-cancelled-setup",
+                workdir: &cloned_path.display().to_string(),
+                created_at: "2026-10-28T00:00:00Z",
+                setup_status: SessionSetupStatus::Initializing,
+                kind: SessionKind::Remote,
+                cloned_path: Some(&cloned_path.display().to_string()),
+            })
+            .unwrap();
+        let setup_state = Arc::new(std::sync::RwLock::new(SessionSetupState::new()));
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+        let plan = SessionCreatePlan {
+            kind: SessionKind::Remote,
+            resolved_workdir: cloned_path.clone(),
+            cloned_path: Some(cloned_path.clone()),
+            repo_url: Some("unused://because-cancelled-before-clone".into()),
+            branch: None,
+            base_ref: None,
+            merge_refs: Vec::new(),
+            push: false,
+        };
+        let setup = SessionSetup::new(
+            "sess-cancelled-setup".into(),
+            plan,
+            test_engines(),
+            Arc::new(SessionManager::in_memory(
+                crate::data::config::env::EnvSnapshot::empty(),
+            )),
+            Arc::clone(&setup_state),
+            Arc::clone(&store),
+            paths,
+        )
+        .with_cancellation(cancel);
+        let mut presenter = RecordingPresenter::default();
+
+        setup.run(&mut presenter).await;
+
+        assert!(
+            !cloned_path.exists(),
+            "cancelled setup must delete its remote clone"
+        );
+        assert_eq!(
+            store
+                .get_session("sess-cancelled-setup")
+                .unwrap()
+                .unwrap()
+                .setup_status,
+            "failed"
+        );
+        assert_eq!(
+            setup_state.read().unwrap().status,
+            SessionSetupStatus::Failed
+        );
+        assert_eq!(presenter.failures()[0].0, SETUP_CANCELLED_STAGE);
+        assert!(presenter.finished_called);
     }
 
     // ── WI 0125 B-1: a not-ready `ReadySummary` must fail setup ─────────────

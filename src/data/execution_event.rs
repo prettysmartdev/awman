@@ -64,6 +64,8 @@ pub enum CommandStatusKind {
     Aborted,
     /// Ended with an error; `error` carries the reason.
     Error,
+    /// Stopped by an external cancel request (`POST /v1/commands/{id}/cancel`).
+    Cancelled,
 }
 
 impl std::fmt::Display for CommandStatusKind {
@@ -73,6 +75,7 @@ impl std::fmt::Display for CommandStatusKind {
             CommandStatusKind::Paused => "paused",
             CommandStatusKind::Aborted => "aborted",
             CommandStatusKind::Error => "error",
+            CommandStatusKind::Cancelled => "cancelled",
         };
         f.write_str(s)
     }
@@ -92,6 +95,8 @@ pub enum PhaseStatusKind {
     Paused,
     /// The main phase finished but teardown did not.
     TeardownFailed,
+    /// Stopped by an external cancel request, or a step skipped because of one.
+    Cancelled,
 }
 
 impl std::fmt::Display for PhaseStatusKind {
@@ -102,6 +107,7 @@ impl std::fmt::Display for PhaseStatusKind {
             PhaseStatusKind::Failed => "failed",
             PhaseStatusKind::Paused => "paused",
             PhaseStatusKind::TeardownFailed => "teardown_failed",
+            PhaseStatusKind::Cancelled => "cancelled",
         };
         f.write_str(s)
     }

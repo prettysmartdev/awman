@@ -645,6 +645,7 @@ async fn run_session_start(
                     workdir: Some(workdir),
                     repo_url: None,
                     branch: None,
+                    ..Default::default()
                 }
             }
             "remote" => {
@@ -659,6 +660,7 @@ async fn run_session_start(
                     workdir: None,
                     repo_url: Some(repo_url),
                     branch: flags.branch.clone(),
+                    ..Default::default()
                 }
             }
             other => {

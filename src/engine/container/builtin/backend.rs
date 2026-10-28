@@ -641,7 +641,10 @@ impl ContainerBackend for BuiltinBackend {
             overlays,
             ..
         } = *request;
-        let name = crate::engine::container::naming::generate_container_name();
+        let name = request
+            .name
+            .map(str::to_owned)
+            .unwrap_or_else(crate::engine::container::naming::generate_container_name);
         let id = naming::sandbox_name_for(&name);
         let mut mounted = mounts(overlays)?;
         let guest = workdir

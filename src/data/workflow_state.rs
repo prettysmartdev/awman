@@ -57,8 +57,18 @@ pub enum PhaseStepStatus {
     Pending,
     Running,
     Succeeded,
-    Failed { error: String },
-    Remediating { attempt: u32, of: u32 },
+    Failed {
+        error: String,
+    },
+    Remediating {
+        attempt: u32,
+        of: u32,
+    },
+    /// Not run because the workflow was cancelled (a teardown `push_branch`,
+    /// `create_pull_request` or `poll_ci` after a cancel). Additive: an older
+    /// binary cannot resume a state that carries it, which is acceptable for
+    /// a run that was cancelled.
+    Skipped,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -140,6 +150,10 @@ pub struct WorkflowState {
     pub setup_step_states: Vec<PhaseStepState>,
     #[serde(default)]
     pub teardown_step_states: Vec<PhaseStepState>,
+    /// When an external cancel request stopped this run. Additive; absent on
+    /// every run that was not cancelled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancelled_at: Option<DateTime<Utc>>,
 }
 
 fn default_schema_version() -> u32 {
@@ -189,6 +203,7 @@ impl WorkflowState {
             teardown_completed: false,
             setup_step_states: Vec::new(),
             teardown_step_states: Vec::new(),
+            cancelled_at: None,
         }
     }
 

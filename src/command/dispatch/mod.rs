@@ -644,6 +644,8 @@ pub struct Dispatch<F: CommandFrontend> {
     session: Arc<RwLock<Session>>,
     engines: Engines,
     squad_gateway: Option<Arc<dyn TaskGateway>>,
+    /// Handed to the built command through `BuildContext::cancel`.
+    cancel: tokio_util::sync::CancellationToken,
 }
 
 impl<F: CommandFrontend> Dispatch<F> {
@@ -658,7 +660,16 @@ impl<F: CommandFrontend> Dispatch<F> {
             session,
             engines,
             squad_gateway: None,
+            cancel: tokio_util::sync::CancellationToken::new(),
         }
+    }
+
+    /// Let an external cancel stop the dispatched command: `token` reaches
+    /// the command as `BuildContext::cancel`. The CLI, TUI and squad never
+    /// call this, so their commands see a token that never fires.
+    pub fn with_cancellation(mut self, token: tokio_util::sync::CancellationToken) -> Self {
+        self.cancel = token;
+        self
     }
 
     pub fn catalogue(&self) -> &'static CommandCatalogue {
@@ -767,6 +778,7 @@ impl<F: CommandFrontend> Dispatch<F> {
                 _ => self.squad_gateway.clone(),
             },
             caller: CallerContext::new(&canonical, self.frontend.kind()),
+            cancel: self.cancel.clone(),
         };
         (spec.build)(&ctx)
     }

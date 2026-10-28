@@ -198,6 +198,9 @@ pub trait WorkflowFrontend: UserMessageSink + Send {
         _of: u32,
     ) {
     }
+    /// A phase step was not run because the workflow was cancelled (a
+    /// teardown `push_branch`, `create_pull_request` or `poll_ci`).
+    fn on_phase_step_skipped(&mut self, _kind: PhaseKind, _description: &str) {}
 
     // === Parallel-group commands (WI-0096) ===
     //
@@ -450,6 +453,12 @@ impl<F: WorkflowFrontend + ?Sized> WorkflowFrontend for std::sync::Arc<std::sync
         self.lock()
             .unwrap()
             .on_phase_step_fixing(kind, description, attempt, of);
+    }
+
+    fn on_phase_step_skipped(&mut self, kind: PhaseKind, description: &str) {
+        self.lock()
+            .unwrap()
+            .on_phase_step_skipped(kind, description);
     }
 
     fn report_parallel_group_started(&mut self, step_names: &[String]) {

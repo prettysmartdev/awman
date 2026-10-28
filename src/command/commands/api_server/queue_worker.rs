@@ -3,12 +3,15 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use super::cancel::TokenRegistry;
 use super::event_bus::EventBus;
 use super::push_back::{
     push_after_success, push_baseline, PushBackError, PushBackOutcome, PushEventSink,
 };
 use super::runtime::ApiSessionLifecycle;
 use crate::command::dispatch::{CommandOutcome, Dispatch, Engines};
+use crate::data::api_lifecycle_store::CommandLifecycleStore;
+use crate::data::command_status::{CommandStatus, CANCELLED_EXIT_CODE};
 use crate::data::execution_event::{
     CommandStatusKind, EventPayload, PhaseStatusKind, StepStatusKind,
 };
@@ -83,6 +86,26 @@ impl QueuedCommandResult {
         self
     }
 
+    /// Turn this completion into a `cancelled` one: exit 130, `error`
+    /// `"cancelled"` and `cancelled_at`. Re-serialised through
+    /// `serde_json::Value` so `CommandResult` keeps its shape; the worktree
+    /// and push fields survive.
+    fn cancelled(mut self, requested_at: &str) -> Self {
+        let mut result: serde_json::Value =
+            serde_json::from_str(&self.result_json).expect("serialized command result");
+        if let Some(fields) = result.as_object_mut() {
+            fields.insert("exit_code".into(), CANCELLED_EXIT_CODE.into());
+            fields.insert("error".into(), "cancelled".into());
+            fields.insert("cancelled_at".into(), requested_at.into());
+            fields.remove("error_status");
+            fields.remove("stage");
+        }
+        self.exit_code = CANCELLED_EXIT_CODE;
+        self.status = CommandStatus::Cancelled.as_str();
+        self.result_json = result.to_string();
+        self
+    }
+
     fn persist(
         &self,
         store: &SqliteSessionStore,
@@ -121,6 +144,8 @@ pub struct QueueWorker<F: ApiCommandFrontendFactory> {
     paths: ApiPaths,
     frontend_factory: Arc<F>,
     lifecycle: ApiSessionLifecycle,
+    lifecycle_store: CommandLifecycleStore,
+    cancels: Arc<TokenRegistry>,
 }
 
 /// Dependencies collected by API runtime bootstrap before a queue worker is
@@ -134,9 +159,57 @@ pub struct QueueWorkerDeps<F: ApiCommandFrontendFactory> {
     pub paths: ApiPaths,
     pub frontend_factory: Arc<F>,
     pub lifecycle: ApiSessionLifecycle,
+    /// Cancel markers and `/v1/runs` linkage (WI 0135).
+    pub lifecycle_store: CommandLifecycleStore,
+    /// The daemon's command-cancel tokens; this worker registers each
+    /// command it claims.
+    pub cancels: Arc<TokenRegistry>,
 }
 
 impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
+    /// Finish cancelled teardown before starting the normal worker pool.
+    pub async fn recover_cancelled_cleanup(
+        &self,
+    ) -> Result<(), crate::command::error::CommandError> {
+        for id in self.lifecycle_store.cancelled_command_ids()? {
+            let Some(cmd) = self.store.get_command(&id)? else {
+                continue;
+            };
+            let Some(cleanup) = self.paths.read_command_cleanup(&cmd.session_id, &id)? else {
+                continue;
+            };
+            let session = self.sessions.get_by_key(&cmd.session_id).ok_or_else(|| {
+                crate::command::error::CommandError::Other(format!(
+                    "Cannot recover cleanup for session {}",
+                    cmd.session_id
+                ))
+            })?;
+            let session = session.read().await.clone();
+            let bus = EventBus::new(4096);
+            let writer = CommandStateWriter::new(self.paths.clone(), &cmd.session_id, &id);
+            let frontend = self
+                .frontend_factory
+                .frontend_for(&cmd, bus.sender(), writer);
+            let mut engines = self.engines.clone();
+            engines.runtime = Arc::new(super::owned_runtime::CommandOwnedRuntime::new(
+                Arc::clone(&engines.runtime),
+                &id,
+            ));
+            crate::command::commands::exec_workflow::finish_cancelled_cleanup(
+                &engines,
+                &session,
+                cleanup,
+                crate::command::commands::exec_workflow::SharedWorkflowFrontend::new(Box::new(
+                    frontend,
+                )),
+            )
+            .await?;
+            self.paths.remove_command_cleanup(&cmd.session_id, &id)?;
+            self.post_execution_check(&cmd.session_id, &id).await;
+        }
+        Ok(())
+    }
+
     pub fn new(worker_id: String, deps: QueueWorkerDeps<F>) -> Self {
         Self {
             worker_id,
@@ -147,14 +220,21 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
             paths: deps.paths,
             frontend_factory: deps.frontend_factory,
             lifecycle: deps.lifecycle,
+            lifecycle_store: deps.lifecycle_store,
+            cancels: deps.cancels,
         }
     }
 
     pub async fn run(self) {
         loop {
-            let claimed = self.store.claim_next_command(&self.worker_id);
+            // Claim and register the cancel token in one step, so a cancel
+            // request never finds this command running without an owner.
+            let claimed = self.cancels.claim(
+                || self.store.claim_next_command(&self.worker_id),
+                |cmd| cmd.id.clone(),
+            );
             match claimed {
-                Ok(Some(cmd)) => {
+                Ok(Some((cmd, cancel))) => {
                     tracing::info!(
                         worker_id = %self.worker_id,
                         command_id = %cmd.id,
@@ -162,7 +242,9 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
                         subcommand = %cmd.subcommand,
                         "Worker claimed command"
                     );
-                    self.execute_command(cmd).await;
+                    let command_id = cmd.id.clone();
+                    self.execute_command(cmd, cancel).await;
+                    self.cancels.unregister(&command_id);
                 }
                 Ok(None) => {
                     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
@@ -179,11 +261,24 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
         }
     }
 
-    async fn execute_command(&self, cmd: crate::data::fs::api_db::CommandRecord) {
+    async fn execute_command(
+        &self,
+        cmd: crate::data::fs::api_db::CommandRecord,
+        cancel: tokio_util::sync::CancellationToken,
+    ) {
         let command_id = cmd.id.clone();
         let session_id = cmd.session_id.clone();
         let subcommand = cmd.subcommand.clone();
         let args: Vec<String> = serde_json::from_str(&cmd.args).unwrap_or_default();
+
+        // A cancel recorded before this worker owned the command (it lost the
+        // race with the claim) still applies.
+        if matches!(
+            self.lifecycle_store.cancel_requested_at(&command_id),
+            Ok(Some(_))
+        ) {
+            cancel.cancel();
+        }
 
         tracing::info!(
             worker_id = %self.worker_id,
@@ -208,7 +303,7 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
             let _ = self
                 .store
                 .complete_command(&command_id, "error", None, result_json.as_deref());
-            self.post_execution_check(&session_id).await;
+            self.post_execution_check(&session_id, &command_id).await;
             return;
         }
 
@@ -314,7 +409,7 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
                     self.store
                         .complete_command(&command_id, "error", None, result_json.as_deref());
                 self.cleanup_event_bus(&command_id).await;
-                self.post_execution_check(&session_id).await;
+                self.post_execution_check(&session_id, &command_id).await;
                 return;
             }
         };
@@ -341,7 +436,14 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
 
         // Dispatch through Layer 2.
         let path_parts: Vec<&str> = subcommand.split_whitespace().collect();
-        let dispatch = Dispatch::new(frontend, session, self.engines.clone());
+        // Every container the command launches is named after it, so a
+        // restart can find and stop what a cancelled command left running.
+        let mut engines = self.engines.clone();
+        engines.runtime = Arc::new(super::owned_runtime::CommandOwnedRuntime::new(
+            Arc::clone(&engines.runtime),
+            &command_id,
+        ));
+        let dispatch = Dispatch::new(frontend, session, engines).with_cancellation(cancel);
         tracing::info!(
             worker_id = %self.worker_id,
             command_id = %command_id,
@@ -380,7 +482,20 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
             }
         };
 
-        let push_outcome = if command_succeeded_for_push(&result) {
+        // A cancel accepted before push-back begins wins over a clean exit:
+        // the cancelled work is not published and the command is `cancelled`.
+        // Push already in flight cannot be undone; a cancel received while
+        // it runs still determines the final command status below.
+        let cancelled_before_push = if command_succeeded_for_push(&result) {
+            self.lifecycle_store
+                .cancel_requested_at(&command_id)
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
+        let push_outcome = if command_succeeded_for_push(&result) && cancelled_before_push.is_none()
+        {
             match self.store.get_session(&session_id) {
                 Ok(Some(record)) => {
                     let git = Arc::clone(&self.engines.git_engine);
@@ -424,8 +539,16 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
             });
         }
 
-        let completion = QueuedCommandResult::new(&result, &push_outcome)
+        let mut completion = QueuedCommandResult::new(&result, &push_outcome)
             .with_worktree(state_writer.kept_worktree());
+        // An accepted cancellation wins until the terminal row is published,
+        // including a request received during automatic push-back.
+        if let Some(requested_at) = &cancelled_before_push {
+            completion = completion.cancelled(requested_at);
+        } else if let Ok(Some(requested_at)) = self.lifecycle_store.cancel_requested_at(&command_id)
+        {
+            completion = completion.cancelled(&requested_at);
+        }
         let exit_code = completion.exit_code;
         let status = completion.status;
         let success = status == "done";
@@ -479,9 +602,14 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
 
         event_bus.sender().emit(EventPayload::Done);
         let _ = log_writer.await;
+        // Cleanup has finished. Retire its recovery recipe before publishing
+        // the terminal row; a crash after this point needs no repeated cleanup.
+        if let Err(error) = self.paths.remove_command_cleanup(&session_id, &command_id) {
+            tracing::warn!(%error, "Failed to retire command cleanup recipe");
+        }
         let _ = completion.persist(&self.store, &command_id);
         self.cleanup_event_bus(&command_id).await;
-        self.post_execution_check(&session_id).await;
+        self.post_execution_check(&session_id, &command_id).await;
     }
 
     async fn cleanup_event_bus(&self, command_id: &str) {
@@ -493,9 +621,18 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
         });
     }
 
-    async fn post_execution_check(&self, session_id: &str) {
-        if matches!(self.store.get_session(session_id), Ok(Some(ref session)) if session.status == "closing")
-        {
+    /// Finish closing a draining session, and close a `/v1/runs` session
+    /// asked to `close_on_finish` once its run command (`command_id`) is
+    /// terminal — `done`, `error` and `cancelled` alike. Both go through the
+    /// one `ApiSessionLifecycle::close`, so a remote clone is deleted exactly
+    /// as `DELETE /v1/sessions/{id}` would.
+    async fn post_execution_check(&self, session_id: &str, command_id: &str) {
+        let closing = matches!(self.store.get_session(session_id), Ok(Some(ref session)) if session.status == "closing");
+        let run_finished = matches!(
+            self.lifecycle_store.run_for_session(session_id),
+            Ok(Some(ref run)) if run.close_on_finish && run.command_id == command_id
+        );
+        if closing || run_finished {
             if let Err(error) = self.lifecycle.close(session_id).await {
                 tracing::error!(worker_id = %self.worker_id, %error, session_id, "Failed to finish closing session");
             }

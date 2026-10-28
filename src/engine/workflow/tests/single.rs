@@ -3,7 +3,7 @@
 
 use super::super::*;
 use super::parallel::make_session_with_max_concurrent;
-use super::phases::{make_engine_capturing, MessageCapturingFrontend};
+use super::phases::{MessageCapturingFrontend, make_engine_capturing};
 use super::*;
 
 // ── WorkflowEngine tests ─────────────────────────────────────────────────
@@ -18,7 +18,15 @@ async fn step_once_advances_one_step_and_persists() {
         vec![make_step("a", &[], None), make_step("b", &["a"], None)],
     );
     let factory = FakeAgentExecutionFactory::always_success();
-    let mut engine = make_engine(&session, workflow, factory, []);
+    let mut engine = WorkflowEngine::new(
+        &session,
+        WorkflowSpec::new(workflow).with_work_item_context(None),
+        WorkflowEngineDeps {
+            frontend: Box::new(FakeWorkflowFrontend::new([])),
+            agent_factory: Box::new(factory),
+        },
+    )
+    .unwrap();
 
     let outcome = engine.step_once().await.unwrap();
     assert_eq!(outcome.step_name, "a");
@@ -49,19 +57,63 @@ async fn run_to_completion_runs_all_steps() {
         vec![make_step("a", &[], None), make_step("b", &["a"], None)],
     );
     let factory = FakeAgentExecutionFactory::always_success();
-    let frontend = FakeWorkflowFrontend::new([NextAction::LaunchNext]);
+    let mut engine = make_engine(&session, workflow, factory, [NextAction::LaunchNext]);
+
+    let result = engine.run_to_completion().await.unwrap();
+    assert_eq!(result, WorkflowOutcome::Completed);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn api_cancel_stops_running_fake_container_and_marks_workflow_cancelled() {
+    let tmp = tempfile::tempdir().unwrap();
+    let session = make_session(&tmp);
+    let workflow = make_workflow(
+        Some("wf-api-cancel"),
+        Some("claude"),
+        vec![make_step("blocked", &[], None)],
+    );
+    let (backend_cancelled, _completion) = make_blocking_entry();
+    let factory = BlockingFactory::new([(backend_cancelled.clone(), _completion)]);
+    let stopped = Arc::clone(&factory.stopped);
+    let launches = Arc::clone(&factory.execution_count);
     let mut engine = WorkflowEngine::new(
         &session,
         WorkflowSpec::new(workflow).with_work_item_context(None),
         WorkflowEngineDeps {
-            frontend: Box::new(frontend),
+            frontend: Box::new(FakeWorkflowFrontend::new([])),
             agent_factory: Box::new(factory),
         },
     )
     .unwrap();
+    let token = tokio_util::sync::CancellationToken::new();
+    engine.set_cancellation(token.clone());
 
-    let result = engine.run_to_completion().await.unwrap();
-    assert_eq!(result, WorkflowOutcome::Completed);
+    let engine_task = tokio::spawn(async move {
+        let outcome = engine.run_to_completion().await.unwrap();
+        let state = engine.state().clone();
+        let aborted = engine.abort_on_failure_triggered();
+        (outcome, state, aborted)
+    });
+    wait_for_execution_count(&launches, 1).await;
+    token.cancel();
+
+    let (outcome, state, aborted) = tokio::time::timeout(Duration::from_secs(5), engine_task)
+        .await
+        .expect("cancel must release the blocking fake execution")
+        .unwrap();
+    assert_eq!(outcome, WorkflowOutcome::Cancelled);
+    assert!(state.cancelled_at.is_some());
+    assert!(matches!(
+        state.status_of("blocked"),
+        Some(StepState::Cancelled)
+    ));
+    assert!(!aborted, "user cancellation must not set abort_on_failure");
+    assert!(backend_cancelled.load(Ordering::Relaxed));
+    assert_eq!(
+        stopped.lock().unwrap().len(),
+        1,
+        "runtime stop path is called"
+    );
 }
 
 #[tokio::test]
@@ -235,6 +287,7 @@ async fn awman_killed_container_writes_no_failure_log() {
         execution: None,
         cancel_handle: None,
         container_name: "awman-build-killed".to_string(),
+        handle: fake_handle("awman-build-killed"),
         output_tail: Some(Arc::new(tail)),
         awman_killed: true,
         stuck: false,
@@ -401,10 +454,12 @@ fn failure_actions_offer_recovery_and_never_finish() {
     assert_eq!(failure.exit_code, 42);
     assert_eq!(failure.previous_step.as_deref(), Some("a"));
     assert_eq!(failure.next_step.as_deref(), Some("c"));
-    assert!(failure
-        .detail_lines
-        .iter()
-        .any(|l| l.contains("Exit code: 42")));
+    assert!(
+        failure
+            .detail_lines
+            .iter()
+            .any(|l| l.contains("Exit code: 42"))
+    );
 }
 
 // ─── simple_advance (WI 0114 F-18) ──────────────────────────────────────
@@ -457,11 +512,13 @@ fn two_pending_steps_are_not_a_simple_advance() {
     let mut engine = make_engine(&session, workflow, factory, []);
     engine.state.set_status("a", StepState::Succeeded);
 
-    assert!(engine
-        .compute_available_actions()
-        .unwrap()
-        .simple_advance
-        .is_none());
+    assert!(
+        engine
+            .compute_available_actions()
+            .unwrap()
+            .simple_advance
+            .is_none()
+    );
 }
 
 /// A failed step anywhere in the run means recovery actions, not a
@@ -490,11 +547,13 @@ fn a_failed_step_anywhere_rules_out_a_simple_advance() {
         },
     );
 
-    assert!(engine
-        .compute_available_actions()
-        .unwrap()
-        .simple_advance
-        .is_none());
+    assert!(
+        engine
+            .compute_available_actions()
+            .unwrap()
+            .simple_advance
+            .is_none()
+    );
 }
 
 /// A running step is dismissable, and a board you can dismiss back to a

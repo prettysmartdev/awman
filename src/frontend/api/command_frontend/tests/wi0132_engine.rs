@@ -49,8 +49,20 @@ fn app_state(root: &std::path::Path) -> Arc<AppState> {
         credential_monitor: None,
         global_config: Arc::new(Default::default()),
     };
+    let store = Arc::new(store);
+    let lifecycle_store = crate::data::CommandLifecycleStore::open(Arc::clone(&store)).unwrap();
+    let setup_cancels = Arc::new(crate::command::commands::api_server::TokenRegistry::new());
+    let canceller = crate::command::commands::api_server::CommandCanceller::new(
+        Arc::clone(&store),
+        lifecycle_store.clone(),
+        Arc::new(crate::command::commands::api_server::TokenRegistry::new()),
+        Arc::clone(&setup_cancels),
+    );
     Arc::new(AppState {
-        store: Arc::new(store),
+        lifecycle_store,
+        setup_cancels,
+        canceller,
+        store,
         paths,
         workdirs: vec![],
         workdir_roots: Vec::new(),

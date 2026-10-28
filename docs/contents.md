@@ -17,7 +17,7 @@ A guide to using awman, the containerized multi-agent terminal multiplexer.
 | 06 | [Dynamic Workflows](06-dynamic-workflows.md) | `--dynamic` — leader agent designs the workflow, repair loop, `--leader` |
 | 07 | [Configuration](07-configuration.md) | Config files, precedence, runtime selection, builtin runtime settings, every field |
 | 08 | [Overlays](08-overlays.md) | `dir()`, `env()`, `skill()`, `ssh()`, `context()` — sources, merge semantics |
-| 09 | [API & Remote Mode](09-api-and-remote-mode.md) | HTTP server, headless operation, CI/automation, and the `awman remote` client |
+| 09 | [API & Remote Mode](09-api-and-remote-mode.md) | HTTP server, command cancel, labels, idempotency, one-shot runs, headless operation, CI/automation, and the `awman remote` client |
 | 10 | [GitHub Integration](10-github-integration.md) | `--issue` flag, fetching issues, authentication |
 | 11 | [Runtimes](11-runtimes.md) | Docker, Apple Containers, the builtin microVM, and Docker Sandboxes — platform support, setup, image sources, lifecycle |
 | 12 | [squad](12-squad.md) | Your squad of agents: tasks, durable workspaces, the squad tab, attach, guardrails |

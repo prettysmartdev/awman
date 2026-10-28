@@ -142,7 +142,7 @@ fn api_headless_next_action(available: &AvailableActions) -> NextAction {
 
 struct FakeAgentExecutionFactory {
     exit_codes: Mutex<VecDeque<i32>>,
-    pub execution_call_count: AtomicUsize,
+    pub execution_call_count: Arc<AtomicUsize>,
     pub inject_call_count: AtomicUsize,
     pub recorded_contexts: Mutex<Vec<WorkflowRuntimeContext>>,
     inject_result: Option<()>,
@@ -151,18 +151,23 @@ struct FakeAgentExecutionFactory {
     tail_lines: Option<Vec<String>>,
     /// Container name stamped on each produced execution's handle.
     container_name: String,
+    /// Every handle `stop_agent` was asked to stop, in order. An `Arc` so a
+    /// test can keep a clone after the factory is boxed into the engine.
+    #[allow(dead_code)] // read by the cancel tests
+    pub stopped: Arc<Mutex<Vec<AgentHandle>>>,
 }
 
 impl FakeAgentExecutionFactory {
     fn new(exit_codes: impl IntoIterator<Item = i32>) -> Self {
         Self {
             exit_codes: Mutex::new(exit_codes.into_iter().collect()),
-            execution_call_count: AtomicUsize::new(0),
+            execution_call_count: Arc::new(AtomicUsize::new(0)),
             inject_call_count: AtomicUsize::new(0),
             recorded_contexts: Mutex::new(Vec::new()),
             inject_result: None,
             tail_lines: None,
             container_name: "fake-container".to_string(),
+            stopped: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -233,9 +238,24 @@ impl AgentExecutionFactory for FakeAgentExecutionFactory {
         self.inject_call_count.fetch_add(1, Ordering::Relaxed);
         Ok(self.inject_result)
     }
+
+    fn stop_agent(&self, handle: &AgentHandle) -> Result<(), EngineError> {
+        self.stopped.lock().unwrap().push(handle.clone());
+        Ok(())
+    }
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────
+
+/// A runtime handle for a hand-built `ActiveParallelStep` slot.
+fn fake_handle(container_name: &str) -> AgentHandle {
+    AgentHandle {
+        id: format!("fake-{container_name}"),
+        image_tag: "fake-image:latest".into(),
+        name: container_name.to_string(),
+        started_at: Utc::now(),
+    }
+}
 
 fn make_session(tmp: &tempfile::TempDir) -> Session {
     Session::for_tests(tmp.path())
@@ -398,6 +418,7 @@ struct BlockingFactory {
     inject_count: Arc<AtomicUsize>,
     inject_result: Option<()>,
     blocking_slots: Mutex<VecDeque<(Arc<AtomicBool>, CompletionArc)>>,
+    stopped: Arc<Mutex<Vec<AgentHandle>>>,
 }
 
 impl BlockingFactory {
@@ -407,6 +428,7 @@ impl BlockingFactory {
             inject_count: Arc::new(AtomicUsize::new(0)),
             inject_result: None,
             blocking_slots: Mutex::new(slots.into_iter().collect()),
+            stopped: Arc::new(Mutex::new(Vec::new())),
         }
     }
 }
@@ -464,6 +486,11 @@ impl AgentExecutionFactory for BlockingFactory {
     ) -> Result<Option<()>, EngineError> {
         self.inject_count.fetch_add(1, Ordering::Relaxed);
         Ok(self.inject_result)
+    }
+
+    fn stop_agent(&self, handle: &AgentHandle) -> Result<(), EngineError> {
+        self.stopped.lock().unwrap().push(handle.clone());
+        Ok(())
     }
 }
 

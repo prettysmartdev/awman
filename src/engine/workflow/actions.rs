@@ -243,6 +243,9 @@ pub enum WorkflowOutcome {
     Completed,
     Paused,
     Aborted,
+    /// Stopped by an external cancel request: every unfinished step is
+    /// `Cancelled` and no retry or `on_failure` remediation ran.
+    Cancelled,
     Failed {
         last_step: String,
         exit_code: i32,
