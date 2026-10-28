@@ -80,8 +80,8 @@ curl -Nsk "$SERVER/v1/commands/$CMD/logs" \
   -H "Authorization: Bearer $KEY" \
   | while IFS= read -r line; do
       case "$line" in
-        "data: [awman:done]") break ;;
-        data:\ *)              printf '%s\n' "${line#data: }" ;;
+        "event: done") break ;;
+        data:\ *)      printf '%s\n' "${line#data: }" ;;
       esac
     done
 
@@ -1132,22 +1132,34 @@ processed and reported in the command log.
 
 Execution failures after admission are recorded in the command's `result`; poll `GET /v1/commands/{id}/status` or follow its log stream.
 
-#### Get command logs
+#### Get a command log snapshot
 
 ```sh
-curl -s http://localhost:9876/v1/commands/<command-id>/logs \
+curl -s 'http://localhost:9876/v1/commands/<command-id>/logs?format=json' \
   -H 'Authorization: Bearer <api-key>'
 ```
 
-Returns the captured output for a command. Stdout and stderr are combined into a single stream in the order they were written. For a running command, returns whatever has been written so far. For a completed command, returns the full output.
+Returns a snapshot of the captured event log, including the command's current
+attempt. For a running command it contains events persisted so far; for a
+completed command it contains the retained events from every attempt.
 
 ```json
 {
-  "output": "Implementing work item 0057...\n✓ Tests pass\n"
+  "session_id": "…",
+  "command_id": "…",
+  "attempt": 1,
+  "events": [
+    {
+      "timestamp": "…",
+      "attempt": 1,
+      "sequence": 0,
+      "payload": { "type": "StdoutLine", "data": "…" }
+    }
+  ]
 }
 ```
 
-Output is written incrementally as the subprocess produces it — not buffered in memory.
+The default form of this endpoint is the live SSE stream described below.
 
 #### Stream command logs (live)
 
@@ -1156,20 +1168,26 @@ curl -s http://localhost:9876/v1/commands/<command-id>/logs \
   -H 'Authorization: Bearer <api-key>'
 ```
 
-Opens a persistent HTTP response using [Server-Sent Events (SSE)](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events). The server replays any output already written, then tails the log file and sends new lines as they arrive. When the command completes, the server sends a `[awman:done]` sentinel event and closes the response.
+Opens a persistent HTTP response using [Server-Sent Events (SSE)](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events). The server replays persisted events, then sends new events as they arrive. A terminal `event: done` frame means the command really ended: the command status is `done`, `error`, or `cancelled`. The server sends it only after the terminal status is recorded, then closes the response. It does not send `event: timeout`; a worker wait or a quiet command does not mean the command ended.
 
 **SSE event format:**
 
 ```
-data: <line of log output>
+id: 1:0
+event: stdout_line
+data: {"timestamp":"…","attempt":1,"sequence":0,"payload":{"type":"StdoutLine","data":"<line of output>"}}
 
-data: <another line>
+id: 1:1
+event: stderr_line
+data: {"timestamp":"…","attempt":1,"sequence":1,"payload":{"type":"StderrLine","data":"<line of output>"}}
 
-data: [awman:done]
+id: 1:2
+event: done
+data: {"timestamp":"…","attempt":1,"sequence":2,"payload":{"type":"Done"}}
 
 ```
 
-Each event is terminated by a blank line (standard SSE format). The sentinel `[awman:done]` signals that the command has finished — no more output will follow.
+Each SSE frame is terminated by a blank line. Persisted events carry `id: <attempt>:<sequence>`; sequence numbers start at 0 and increase within each attempt. The JSON payload is typed, and the `event:` name identifies its type. Treat `event: done` as the completion signal. Clients that ignore `id:` and continue reading `event:` and `data:` work as before.
 
 **Shell example — stream and print until done:**
 
@@ -1178,7 +1196,7 @@ curl -s http://localhost:9876/v1/commands/<command-id>/logs \
   -H 'Authorization: Bearer <api-key>' \
 | while IFS= read -r line; do
     case "$line" in
-      "data: [awman:done]") echo "--- done ---"; break ;;
+      "event: done") echo "--- done ---"; break ;;
       data:\ *)              echo "${line#data: }" ;;
     esac
   done
@@ -1186,23 +1204,41 @@ curl -s http://localhost:9876/v1/commands/<command-id>/logs \
 
 **Behaviour notes:**
 
-- If the command has already completed when you connect, the server replays the full historical log and sends `[awman:done]` immediately — no output is missed.
+- The informational waiting event uses `attempt: 0` and `sequence: 0`; it is not a persisted event or a resume position.
+- Normal completion drains buffered stdout/stderr before the final workflow completion notifications and `done`. If a backend leaves an output pipe open, the server waits up to five seconds, logs a warning, and completes; trailing output may be missing in that exceptional case.
+- If the command has already completed when you connect, the server replays its persisted events and sends `event: done` before closing.
 - If the client disconnects mid-stream, the command continues executing unaffected.
-- If the log file does not yet exist (the command is `pending`), the server waits up to 10 s for it to appear before returning HTTP 404.
+- An unknown command ID returns HTTP 404. A queued command with no log yet stays connected while it waits for a worker.
 - The `Content-Type` response header is `text/event-stream`.
-- **Read timeout:** `awman remote exec --follow` uses a 10-minute read timeout per SSE event. Any output from the server resets the timer, so long-running commands that produce incremental output can stream for hours. If the server is completely silent for 10 minutes, the client disconnects with a timeout message; the command continues running on the server. When using cURL directly with `--no-buffer`, consider adding `--max-time 0` to disable cURL's own timeout for very long-running commands.
+- While a command waits for a worker, the server sends an id-less `status_message` event saying it is waiting, then an SSE comment (`: waiting for command progress`) every 15 seconds. A quiet live stream also gets an id-less `: keepalive` comment every 15 seconds. Comments do not advance the resume cursor. There is no server-side worker-wait deadline and no `event: timeout`; HTTP client timeouts are separate from command completion. With cURL, use `-N` to display frames as they arrive and `--max-time 0` to disable cURL's overall timeout for long-running commands.
+- `attempt` is the 1-based execution number for the command. If a daemon restart causes a running command to be re-queued, its next execution has a higher `attempt` number and sequence numbering starts again at 0. Its first persisted event is a `status_message` with phase `queue` and message `re-queued after restart (attempt N)`. `events.log` appends every attempt, preserving earlier events.
+
+**Resume a stream:** pass the last persisted event ID as `Last-Event-ID` or as the `after` query parameter. The server replays persisted events strictly after that cursor; for a terminal command it also sends the terminal `done` frame so the client can observe completion. This terminal `done` is sent even when the supplied cursor equals or exceeds its ID, so clients should accept a repeated completion notification. If both resume inputs are provided, `?after=` takes precedence. Since earlier attempts remain in `events.log`, a cursor from an earlier attempt is valid and replay continues after it into later attempts. If the cursor's attempt is not present in the log, is 0, or is newer than the command's current attempt, replay restarts at the beginning of the current attempt with a comment such as `: resuming from the start of attempt 2`. A malformed effective cursor returns HTTP 400. A valid query cursor overrides even a malformed `Last-Event-ID` header.
+
+```sh
+# Resume after the last frame previously received, e.g. id: 2:17
+curl -N -H 'Authorization: Bearer <api-key>' \
+  -H 'Last-Event-ID: 2:17' \
+  'http://localhost:9876/v1/commands/<command-id>/logs'
+
+# Equivalent query form (takes precedence if the header is also present)
+curl -N -H 'Authorization: Bearer <api-key>' \
+  'http://localhost:9876/v1/commands/<command-id>/logs?after=2:17'
+```
 
 `awman remote exec --follow` uses this endpoint internally. The cURL form above is equivalent and is useful in scripts where the awman binary is unavailable on the client.
 
-**Structured events:** the plain-text view above is a simplification. Each
-SSE frame actually carries a named `event:` type (`stdout_line`,
+**Structured events:** each event frame carries a named `event:` type (`stdout_line`,
 `stderr_line`, `status_message`, `workflow_step_transition`,
 `workflow_phase_transition`, `workflow_parallel_step_launched`,
 `workflow_parallel_step_exited`, `workflow_parallel_group_finished`,
 `command_status`, `done`) and a JSON `data:` payload, so a client that wants
 structured data instead of log lines can read the `event:` field and parse
-accordingly. Add `?format=json` to the same URL to fetch the full captured
-event log as one JSON array instead of streaming it:
+accordingly. Add `?format=json` to the same URL to fetch the event-log snapshot
+described above. It includes all retained attempts and their historical `Done`
+records, including a marker written immediately before a crash and re-queue.
+Interpret those records by `attempt`; only the SSE `done` notification certifies
+that the current command is terminal. Resume inputs do not filter this snapshot:
 
 ```sh
 curl -s "http://localhost:9876/v1/commands/<command-id>/logs?format=json" \
@@ -1215,8 +1251,8 @@ strings, so a client can match on a fixed set of values:
 | Field | Values |
 |-------|--------|
 | `workflow_step_transition.from_status` / `.to_status` | `pending`, `running`, `succeeded`, `failed`, `cancelled`, `skipped` |
-| `workflow_phase_transition.status` | `running`, `succeeded`, `failed`, `paused`, `teardown_failed` |
-| `command_status.status` | `done`, `paused`, `aborted`, `error` |
+| `workflow_phase_transition.status` | `running`, `succeeded`, `failed`, `paused`, `teardown_failed`, `cancelled` |
+| `command_status.status` | `done`, `paused`, `aborted`, `error`, `cancelled` |
 
 `workflow_phase_transition` is emitted for the main workflow and for each
 setup or teardown phase step. Its `phase` is `setup`, `main`, or `teardown`,
@@ -1686,9 +1722,10 @@ while true; do
   sleep 10
 done
 
-# 4. Retrieve output
-curl -s "$SERVER/v1/commands/$CMD/logs" \
-  -H "Authorization: Bearer $KEY" | jq -r .output
+# 4. Retrieve output from the JSON event snapshot
+curl -s "$SERVER/v1/commands/$CMD/logs?format=json" \
+  -H "Authorization: Bearer $KEY" \
+  | jq -r '.events[] | select(.payload.type == "stdout_line" or .payload.type == "stderr_line") | .payload.data'
 
 # 5. Close the session
 curl -s -X DELETE "$SERVER/v1/sessions/$SESSION" \
@@ -1942,7 +1979,7 @@ Local machine                                    Remote host
 ──────────────                                   ──────────────────────────
 awman remote exec workflow my.toml -f ──────────► POST /v1/commands
                                                  ◄── SSE stream: log output
-                                                 ◄── [awman:done] sentinel
+                                                 ◄── `event: done` when command status is terminal
 ```
 
 Four subcommands cover the full lifecycle:
@@ -2509,7 +2546,7 @@ curl -s "$SERVER/v1/commands/$CMD/logs" \
   -H "Authorization: Bearer $KEY" \
 | while IFS= read -r line; do
   case "$line" in
-    "data: [awman:done]") echo "--- done ---"; break ;;
+    "event: done") echo "--- done ---"; break ;;
     data:\ *)             echo "${line#data: }" ;;
   esac
 done
@@ -2521,8 +2558,9 @@ while true; do
   [ "$STATUS" = "done" ] || [ "$STATUS" = "error" ] && break
   sleep 5
 done
-curl -s "$SERVER/v1/commands/$CMD/logs" \
-  -H "Authorization: Bearer $KEY" | jq -r .output
+curl -s "$SERVER/v1/commands/$CMD/logs?format=json" \
+  -H "Authorization: Bearer $KEY" \
+  | jq -r '.events[] | select(.payload.type == "stdout_line" or .payload.type == "stderr_line") | .payload.data'
 ```
 
 See [API mode](#api-mode) for the full HTTP API reference, including session management endpoints.

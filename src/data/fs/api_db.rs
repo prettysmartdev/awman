@@ -8,9 +8,10 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::Mutex;
 
-use rusqlite::{Connection, OptionalExtension, params, params_from_iter, types::Value};
+use rusqlite::{params, params_from_iter, types::Value, Connection, OptionalExtension};
 
 use crate::data::error::DataError;
+use crate::data::execution_event::FIRST_ATTEMPT;
 use crate::data::fs::api_labels::{LabelSelector, Labels};
 use crate::data::fs::api_paths::ApiPaths;
 use crate::data::session::SessionKind;
@@ -109,6 +110,9 @@ pub struct CommandRecord {
     pub worker_id: Option<String>,
     pub queued_at: Option<String>,
     pub result: Option<String>,
+    /// Which execution of the command this is (1-based). A re-queue after a
+    /// daemon restart increments it.
+    pub attempt: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -346,6 +350,10 @@ impl SqliteSessionStore {
         Self::add_column_if_missing(conn, "commands", "worker_id", "TEXT")?;
         Self::add_column_if_missing(conn, "commands", "queued_at", "TEXT")?;
         Self::add_column_if_missing(conn, "commands", "result", "TEXT")?;
+        // WI 0136: SQLite applies the DEFAULT to every existing row on ADD
+        // COLUMN, so pre-0136 commands read back as attempt 1. That is the
+        // backfill; no separate UPDATE is needed.
+        Self::add_column_if_missing(conn, "commands", "attempt", "INTEGER NOT NULL DEFAULT 1")?;
         // WI 0135: labels and idempotency are side tables so old databases
         // migrate additively without changing the stable session/command rows.
         conn.execute_batch(
@@ -660,7 +668,7 @@ impl SqliteSessionStore {
         filter: &CommandListFilter<'_>,
     ) -> Result<Vec<CommandRecord>, DataError> {
         let mut sql = String::from(
-            "SELECT c.id,c.session_id,c.subcommand,c.args,c.status,c.exit_code,c.started_at,c.finished_at,c.log_path,c.worker_id,c.queued_at,c.result FROM commands c WHERE 1=1",
+            "SELECT c.id,c.session_id,c.subcommand,c.args,c.status,c.exit_code,c.started_at,c.finished_at,c.log_path,c.worker_id,c.queued_at,c.result,c.attempt FROM commands c WHERE 1=1",
         );
         let mut args: Vec<Value> = Vec::new();
         if let Some(session) = filter.session_id {
@@ -786,25 +794,10 @@ impl SqliteSessionStore {
         let conn = self.lock();
         let mut stmt = conn.prepare(
             "SELECT id, session_id, subcommand, args, status, exit_code, \
-                    started_at, finished_at, log_path, worker_id, queued_at, result
+                    started_at, finished_at, log_path, worker_id, queued_at, result, attempt
              FROM commands WHERE id = ?1",
         )?;
-        let mut rows = stmt.query_map(params![id], |row| {
-            Ok(CommandRecord {
-                id: row.get(0)?,
-                session_id: row.get(1)?,
-                subcommand: row.get(2)?,
-                args: row.get(3)?,
-                status: row.get(4)?,
-                exit_code: row.get(5)?,
-                started_at: row.get(6)?,
-                finished_at: row.get(7)?,
-                log_path: row.get(8)?,
-                worker_id: row.get(9)?,
-                queued_at: row.get(10)?,
-                result: row.get(11)?,
-            })
-        })?;
+        let mut rows = stmt.query_map(params![id], command_record_from_row)?;
         match rows.next() {
             Some(row) => Ok(Some(row?)),
             None => Ok(None),
@@ -891,7 +884,8 @@ impl SqliteSessionStore {
         )?;
         // An admitted request's recorded response wins over any liveness rule.
         admitted_intent_to_response(&tx, &scope, key)?;
-        let existing: Option<(String, Option<u16>, Option<String>, Option<String>)> = tx
+        type ExistingAdmission = (String, Option<u16>, Option<String>, Option<String>);
+        let existing: Option<ExistingAdmission> = tx
             .query_row(
                 "SELECT request_hash,status,body,owner_instance FROM idempotency_keys WHERE scope=?1 AND key=?2",
                 params![scope, key],
@@ -1127,24 +1121,9 @@ impl SqliteSessionStore {
                  LIMIT 1
              )
              RETURNING id, session_id, subcommand, args, status, exit_code,
-                       started_at, finished_at, log_path, worker_id, queued_at, result",
+                       started_at, finished_at, log_path, worker_id, queued_at, result, attempt",
         )?;
-        let mut rows = stmt.query_map(params![worker_id, now], |row| {
-            Ok(CommandRecord {
-                id: row.get(0)?,
-                session_id: row.get(1)?,
-                subcommand: row.get(2)?,
-                args: row.get(3)?,
-                status: row.get(4)?,
-                exit_code: row.get(5)?,
-                started_at: row.get(6)?,
-                finished_at: row.get(7)?,
-                log_path: row.get(8)?,
-                worker_id: row.get(9)?,
-                queued_at: row.get(10)?,
-                result: row.get(11)?,
-            })
-        })?;
+        let mut rows = stmt.query_map(params![worker_id, now], command_record_from_row)?;
         match rows.next() {
             Some(row) => Ok(Some(row?)),
             None => Ok(None),
@@ -1176,28 +1155,13 @@ impl SqliteSessionStore {
         let conn = self.lock();
         let mut stmt = conn.prepare(
             "SELECT id, session_id, subcommand, args, status, exit_code,
-                    started_at, finished_at, log_path, worker_id, queued_at, result
+                    started_at, finished_at, log_path, worker_id, queued_at, result, attempt
              FROM commands
              WHERE session_id = ?1
              ORDER BY queued_at DESC, rowid DESC
              LIMIT ?2",
         )?;
-        let rows = stmt.query_map(params![session_id, limit], |row| {
-            Ok(CommandRecord {
-                id: row.get(0)?,
-                session_id: row.get(1)?,
-                subcommand: row.get(2)?,
-                args: row.get(3)?,
-                status: row.get(4)?,
-                exit_code: row.get(5)?,
-                started_at: row.get(6)?,
-                finished_at: row.get(7)?,
-                log_path: row.get(8)?,
-                worker_id: row.get(9)?,
-                queued_at: row.get(10)?,
-                result: row.get(11)?,
-            })
-        })?;
+        let rows = stmt.query_map(params![session_id, limit], command_record_from_row)?;
         let mut result = Vec::new();
         for row in rows {
             result.push(row?);
@@ -1222,27 +1186,12 @@ impl SqliteSessionStore {
         let conn = self.lock();
         let mut stmt = conn.prepare(
             "SELECT id, session_id, subcommand, args, status, exit_code,
-                    started_at, finished_at, log_path, worker_id, queued_at, result
+                    started_at, finished_at, log_path, worker_id, queued_at, result, attempt
              FROM commands
              WHERE session_id = ?1 AND status = 'running'
              LIMIT 1",
         )?;
-        let mut rows = stmt.query_map(params![session_id], |row| {
-            Ok(CommandRecord {
-                id: row.get(0)?,
-                session_id: row.get(1)?,
-                subcommand: row.get(2)?,
-                args: row.get(3)?,
-                status: row.get(4)?,
-                exit_code: row.get(5)?,
-                started_at: row.get(6)?,
-                finished_at: row.get(7)?,
-                log_path: row.get(8)?,
-                worker_id: row.get(9)?,
-                queued_at: row.get(10)?,
-                result: row.get(11)?,
-            })
-        })?;
+        let mut rows = stmt.query_map(params![session_id], command_record_from_row)?;
         match rows.next() {
             Some(row) => Ok(Some(row?)),
             None => Ok(None),
@@ -1285,7 +1234,8 @@ impl SqliteSessionStore {
             rows
         };
         conn.execute(
-            "UPDATE commands SET status = 'queued', worker_id = NULL, started_at = NULL
+            "UPDATE commands SET status = 'queued', worker_id = NULL, started_at = NULL,
+                 attempt = attempt + 1
              WHERE status = 'running' AND started_at IS NOT NULL AND started_at < ?1",
             params![cutoff_str],
         )?;
@@ -1378,6 +1328,7 @@ fn command_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CommandR
         worker_id: row.get(9)?,
         queued_at: row.get(10)?,
         result: row.get(11)?,
+        attempt: u32::try_from(row.get::<_, i64>(12)?).unwrap_or(FIRST_ATTEMPT),
     })
 }
 
@@ -1600,11 +1551,9 @@ mod tests {
                 .unwrap(),
             IdempotencyBegin::Fresh
         );
-        assert!(
-            store
-                .idempotency_complete(commands, "key", owner, 202, r#"{"command_id":"c1"}"#)
-                .unwrap()
-        );
+        assert!(store
+            .idempotency_complete(commands, "key", owner, 202, r#"{"command_id":"c1"}"#)
+            .unwrap());
         assert_eq!(
             store
                 .idempotency_begin(commands, "key", "body", "2026-01-01T23:59:59Z", retry)
@@ -1678,16 +1627,12 @@ mod tests {
                 .unwrap(),
             IdempotencyBegin::InFlight
         );
-        assert!(
-            !store
-                .idempotency_complete(scope, "key", b, 202, "{}")
-                .unwrap()
-        );
-        assert!(
-            store
-                .idempotency_complete(scope, "key", a, 202, r#"{"ok":true}"#)
-                .unwrap()
-        );
+        assert!(!store
+            .idempotency_complete(scope, "key", b, 202, "{}")
+            .unwrap());
+        assert!(store
+            .idempotency_complete(scope, "key", a, 202, r#"{"ok":true}"#)
+            .unwrap());
         assert_eq!(
             store
                 .idempotency_begin(scope, "key", "hash", t0, b)
@@ -1744,11 +1689,9 @@ mod tests {
                 .unwrap(),
             IdempotencyBegin::Fresh
         );
-        assert!(
-            !store
-                .idempotency_complete(scope, "other", b, 202, "{}")
-                .unwrap()
-        );
+        assert!(!store
+            .idempotency_complete(scope, "other", b, 202, "{}")
+            .unwrap());
         assert_eq!(
             store
                 .prune_idempotency_keys(24, "2026-01-03T00:02:00Z")
@@ -1990,6 +1933,120 @@ mod tests {
         assert!(!store.has_running_command_for_session("s1").unwrap());
     }
 
+    // ─── WI 0136: attempt column ──────────────────────────────────────────────
+
+    fn insert_running(store: &SqliteSessionStore, id: &str) {
+        store
+            .with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO commands (id, session_id, subcommand, args, status, log_path,
+                             started_at, worker_id, queued_at)
+                     VALUES (?1, 's1', 'exec prompt', '[]', 'running', '/logs/x',
+                             '2020-01-01T00:00:00Z', 'dead-worker', '2020-01-01T00:00:00Z')",
+                    params![id],
+                )
+                .map_err(DataError::from)
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn new_commands_start_at_attempt_one() {
+        let (_tmp, store) = make_store();
+        store
+            .insert_session("s1", "/w", "2026-01-01T00:00:00Z")
+            .unwrap();
+        store
+            .enqueue_command("c1", "s1", "chat", "[]", "/l")
+            .unwrap();
+        assert_eq!(store.get_command("c1").unwrap().unwrap().attempt, 1);
+        let claimed = store.claim_next_command("w").unwrap().unwrap();
+        assert_eq!(claimed.attempt, 1);
+    }
+
+    #[test]
+    fn recover_stale_commands_increments_attempt_each_time() {
+        let (_tmp, store) = make_store();
+        store
+            .insert_session("s1", "/w", "2026-01-01T00:00:00Z")
+            .unwrap();
+        insert_running(&store, "crash");
+        assert_eq!(store.recover_stale_commands(1).unwrap(), ["crash"]);
+        let row = store.get_command("crash").unwrap().unwrap();
+        assert_eq!((row.status.as_str(), row.attempt), ("queued", 2));
+
+        // The re-queued claim reports the incremented attempt.
+        let claimed = store.claim_next_command("w2").unwrap().unwrap();
+        assert_eq!((claimed.id.as_str(), claimed.attempt), ("crash", 2));
+
+        // A second crash while running attempt 2 moves it to attempt 3.
+        store
+            .with_conn(|conn| {
+                conn.execute(
+                    "UPDATE commands SET started_at = '2020-01-01T00:00:00Z' WHERE id = 'crash'",
+                    [],
+                )
+                .map_err(DataError::from)
+            })
+            .unwrap();
+        assert_eq!(store.recover_stale_commands(1).unwrap(), ["crash"]);
+        assert_eq!(store.get_command("crash").unwrap().unwrap().attempt, 3);
+    }
+
+    #[test]
+    fn recover_stale_commands_leaves_other_rows_at_their_attempt() {
+        let (_tmp, store) = make_store();
+        store
+            .insert_session("s1", "/w", "2026-01-01T00:00:00Z")
+            .unwrap();
+        store
+            .enqueue_command("queued", "s1", "chat", "[]", "/l")
+            .unwrap();
+        assert!(store.recover_stale_commands(0).unwrap().is_empty());
+        assert_eq!(store.get_command("queued").unwrap().unwrap().attempt, 1);
+    }
+
+    #[test]
+    fn migration_backfills_attempt_one_on_pre_existing_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("awman.db");
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE sessions (
+                    id TEXT PRIMARY KEY, workdir TEXT NOT NULL, created_at TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'active', closed_at TEXT
+                );
+                CREATE TABLE commands (
+                    id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id),
+                    subcommand TEXT NOT NULL, args TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending', exit_code INTEGER,
+                    started_at TEXT, finished_at TEXT, log_path TEXT NOT NULL
+                );
+                INSERT INTO sessions (id, workdir, created_at) VALUES ('s', '/w', '2023-01-01');
+                INSERT INTO commands (id, session_id, subcommand, args, status, log_path)
+                    VALUES ('old-1', 's', 'chat', '[]', 'running', '/l1'),
+                           ('old-2', 's', 'chat', '[]', 'done', '/l2');",
+            )
+            .unwrap();
+        }
+        let store = SqliteSessionStore::open(tmp.path()).unwrap();
+        for id in ["old-1", "old-2"] {
+            assert_eq!(store.get_command(id).unwrap().unwrap().attempt, 1, "{id}");
+        }
+        // Opening again is idempotent and keeps later increments.
+        store
+            .with_conn(|conn| {
+                conn.execute("UPDATE commands SET attempt = 4 WHERE id = 'old-1'", [])
+                    .map_err(DataError::from)
+            })
+            .unwrap();
+        drop(store);
+        let store = SqliteSessionStore::open(tmp.path()).unwrap();
+        assert_eq!(store.get_command("old-1").unwrap().unwrap().attempt, 4);
+        assert_eq!(store.get_command("old-2").unwrap().unwrap().attempt, 1);
+    }
+
     // ─── Schema compatibility with legacy DB ──────────────────────────────────
     //
     // Creates a DB using the exact SQL from oldsrc/commands/headless/db.rs,
@@ -2052,11 +2109,9 @@ mod tests {
             std::sync::Arc::new(SqliteSessionStore::open(tmp.path()).unwrap()),
         )
         .unwrap();
-        assert!(
-            lifecycle
-                .cancel_if_queued("cmd-1", "2026-10-28T00:00:00Z")
-                .unwrap()
-        );
+        assert!(lifecycle
+            .cancel_if_queued("cmd-1", "2026-10-28T00:00:00Z")
+            .unwrap());
 
         // Step 3: verify the legacy rows are readable.
         let sessions = store.list_sessions().unwrap();
@@ -2101,20 +2156,18 @@ mod tests {
         let (_tmp, store) = make_store();
         insert_remote(&store, "r1");
         let merge_refs = vec!["feat-a".to_string(), "feat-b".to_string()];
-        assert!(
-            store
-                .set_remote_fields(
-                    "r1",
-                    RemoteSessionFields {
-                        repo_url: Some("https://host.invalid/o/r.git"),
-                        branch: Some("job-1"),
-                        base_ref: Some("v1.0"),
-                        merge_refs: &merge_refs,
-                        push: true,
-                    },
-                )
-                .unwrap()
-        );
+        assert!(store
+            .set_remote_fields(
+                "r1",
+                RemoteSessionFields {
+                    repo_url: Some("https://host.invalid/o/r.git"),
+                    branch: Some("job-1"),
+                    base_ref: Some("v1.0"),
+                    merge_refs: &merge_refs,
+                    push: true,
+                },
+            )
+            .unwrap());
         let rec = store.get_session("r1").unwrap().unwrap();
         assert_eq!(
             rec.repo_url.as_deref(),

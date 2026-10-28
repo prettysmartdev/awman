@@ -17,10 +17,7 @@
 
 #![cfg(unix)]
 
-#[path = "../../helpers/api_process.rs"]
-mod api_process;
-#[path = "../../helpers/git_daemon.rs"]
-mod git_daemon;
+use crate::{api_process, git_daemon};
 
 mod push;
 mod setup;

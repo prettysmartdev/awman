@@ -36,6 +36,14 @@ echo "docker $*" >> "$ctl/docker.log"
 case "$1" in
   info) echo "27.0.0"; exit 0 ;;
   image|images|inspect) echo '[{"Id":"sha256:fake"}]'; exit 0 ;;
+  stop)
+    # The chatty cancellation fixture models docker stop closing the running
+    # container's pipes. Other fixture modes retain their existing behavior.
+    if [ "$(cat "$ctl/mode" 2>/dev/null)" = "chatty-slow" ] && [ -f "$ctl/slow.pid" ]; then
+      kill "$(cat "$ctl/slow.pid")" 2>/dev/null || true
+    fi
+    exit 0
+    ;;
   exec)
     shift
     workdir=""
@@ -71,6 +79,19 @@ case "$1" in
       exit 0
     fi
     [ "$mode" = "noop" ] && exit 0
+    if [ "$mode" = "chatty" ] || [ "$mode" = "chatty-slow" ]; then
+      [ "$mode" = "chatty-slow" ] && echo "$$" > "$ctl/slow.pid"
+      i=0
+      while [ "$i" -lt 2000 ]; do
+        printf 'burst-%s\n' "$i"
+        printf 'error-%s\n' "$i" >&2
+        i=$((i + 1))
+      done
+      printf 'LAST-STDOUT'
+      printf 'LAST-STDERR' >&2
+      [ "$mode" = "chatty-slow" ] && exec sleep 30
+      exit 0
+    fi
     [ "$mode" = "slow" ] && { echo "$$" > "$ctl/slow.pid"; sleep 30; }
     [ -n "$workspace" ] && echo "edited by the fake agent" > "$workspace/agent-edit.txt"
     if [ "$mode" = "poison" ]; then
@@ -110,6 +131,10 @@ pub enum AgentMode {
     Poison,
     /// Sleep 30 seconds (a long-running agent a test can cancel), then edit.
     Slow,
+    /// Burst on both pipes, with unterminated tails, then exit immediately.
+    Chatty,
+    /// Emit the same burst, then wait for cancellation.
+    ChattySlow,
     LeaderRewrite,
     LeaderCommit,
 }
@@ -146,6 +171,8 @@ impl ApiHome {
             AgentMode::Fail => "fail",
             AgentMode::Poison => "poison",
             AgentMode::Slow => "slow",
+            AgentMode::Chatty => "chatty",
+            AgentMode::ChattySlow => "chatty-slow",
             AgentMode::LeaderRewrite => "leader-rewrite",
             AgentMode::LeaderCommit => "leader-commit",
         };

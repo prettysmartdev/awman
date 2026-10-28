@@ -16,7 +16,7 @@ use axum::{Json, Router};
 use futures_util::FutureExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio_stream::wrappers::UnboundedReceiverStream;
+use tokio_stream::wrappers::ReceiverStream;
 use tower_http::trace::TraceLayer;
 
 use crate::command::commands::api_server::event_bus::EventBus;
@@ -36,7 +36,7 @@ use crate::command::session_create::{
 use crate::command::session_setup::{SessionSetup, SessionSetupPresenter};
 use crate::data::api_lifecycle_store::{CommandLifecycleStore, RunRecord};
 use crate::data::command_status::CommandStatus;
-use crate::data::execution_event::{EventPayload, ExecutionEvent};
+use crate::data::execution_event::{EventCursor, EventPayload, ExecutionEvent, ReplayFrom};
 use crate::data::fs::api_db::{
     CommandListFilter, CommandRecord, IdempotencyBegin, IdempotencyOwner, IdempotencyResource,
     IdempotencyScope, LabelOwner,
@@ -198,6 +198,7 @@ struct CreateCommandResponse {
 #[derive(Serialize)]
 struct CommandResponse {
     id: String,
+    attempt: u32,
     session_id: String,
     subcommand: String,
     args: serde_json::Value,
@@ -280,11 +281,15 @@ fn session_response(state: &AppState, row: SessionRecord) -> Response {
     }
 }
 
+// Keep fallible route helpers small on the success path; HTTP responses carry
+// a body and extensions even when they are only used to report an error.
+type RouteResult<T> = Result<T, Box<Response>>;
+
 fn command_response(
     state: &AppState,
     c: CommandRecord,
     labels: Option<Labels>,
-) -> Result<CommandResponse, Response> {
+) -> RouteResult<CommandResponse> {
     let labels = match labels {
         Some(labels) => labels,
         None => state
@@ -312,6 +317,7 @@ fn command_response(
             .as_deref()
             .and_then(|r| serde_json::from_str(r).ok()),
         id: c.id,
+        attempt: c.attempt,
         session_id: c.session_id,
         subcommand: c.subcommand,
         status: c.status,
@@ -336,7 +342,7 @@ struct ListQuery {
 }
 
 impl ListQuery {
-    fn parse(pairs: Vec<(String, String)>, commands: bool) -> Result<Self, Response> {
+    fn parse(pairs: Vec<(String, String)>, commands: bool) -> RouteResult<Self> {
         let mut query = Self {
             limit: 100,
             ..Self::default()
@@ -349,15 +355,15 @@ impl ListQuery {
                 "status" => {
                     if commands && CommandStatus::parse(&value).is_none() {
                         let valid: Vec<_> = CommandStatus::ALL.iter().map(|s| s.as_str()).collect();
-                        return Err(bad_request(format!(
+                        return Err(Box::new(bad_request(format!(
                             "unknown command status: {value}; expected {}",
                             valid.join("|")
-                        )));
+                        ))));
                     }
                     if !commands && !matches!(value.as_str(), "active" | "closing" | "closed") {
-                        return Err(bad_request(format!(
+                        return Err(Box::new(bad_request(format!(
                             "unknown session status: {value}; expected active|closing|closed"
-                        )));
+                        ))));
                     }
                     query.status = Some(value);
                 }
@@ -381,7 +387,7 @@ async fn handle_list_commands(
 ) -> Response {
     let query = match ListQuery::parse(pairs, true) {
         Ok(query) => query,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let rows = match state.store.list_commands_filtered(&CommandListFilter {
         status: query.status.as_deref(),
@@ -402,7 +408,7 @@ async fn handle_list_commands(
         let row_labels = labels.remove(&row.id).unwrap_or_default();
         match command_response(&state, row, Some(row_labels)) {
             Ok(command) => commands.push(command),
-            Err(response) => return response,
+            Err(response) => return *response,
         }
     }
     Json(serde_json::json!({ "commands": commands })).into_response()
@@ -435,7 +441,7 @@ async fn handle_cancel_command(
             }
             match command_response(&state, row, None) {
                 Ok(response) => Json(response).into_response(),
-                Err(response) => response,
+                Err(response) => *response,
             }
         }
         Ok(CancelOutcome::Stopping {
@@ -492,7 +498,7 @@ impl AdmissionJournal {
     }
 
     /// Record the 202 `body` this request returns once `resource` exists.
-    fn record(&self, body: &str, resource: IdempotencyResource<'_>) -> Result<(), Response> {
+    fn record(&self, body: &str, resource: IdempotencyResource<'_>) -> RouteResult<()> {
         match self.store.idempotency_record_intent(
             self.scope(),
             &self.key,
@@ -502,10 +508,12 @@ impl AdmissionJournal {
             resource,
         ) {
             Ok(true) => Ok(()),
-            Ok(false) => Err(internal_error("Idempotency reservation lost")),
+            Ok(false) => Err(Box::new(internal_error("Idempotency reservation lost"))),
             Err(error) => {
                 tracing::error!(%error, "Failed to record idempotent admission");
-                Err(internal_error("Failed to record idempotent admission"))
+                Err(Box::new(internal_error(
+                    "Failed to record idempotent admission",
+                )))
             }
         }
     }
@@ -517,7 +525,7 @@ fn admission_body(
     journal: Option<&AdmissionJournal>,
     body: &impl Serialize,
     resource: IdempotencyResource<'_>,
-) -> Result<String, Response> {
+) -> RouteResult<String> {
     let body =
         serde_json::to_string(body).map_err(|_| internal_error("Failed to encode response"))?;
     if let Some(journal) = journal {
@@ -874,7 +882,7 @@ async fn create_submission(
 
     if let Some(command) = &command {
         if let Err(response) = validate_command(command) {
-            return response;
+            return *response;
         }
     }
 
@@ -911,7 +919,7 @@ async fn create_submission(
     };
     let response_body = match response_body {
         Ok(body) => body,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
 
     // Persist the session row with setup_status='initializing' BEFORE spawning
@@ -984,7 +992,7 @@ async fn create_submission(
         }
         if let Err(response) = enqueue_command(state, &run.command_id, &session_id, &command) {
             let _ = state.lifecycle().close(&session_id).await;
-            return response;
+            return *response;
         }
         Some(run)
     } else {
@@ -1140,7 +1148,7 @@ async fn handle_list_sessions(
 ) -> Response {
     let query = match ListQuery::parse(pairs, false) {
         Ok(query) => query,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     match state
         .store
@@ -1381,7 +1389,7 @@ async fn create_command(
     };
 
     if let Err(response) = validate_command(&body) {
-        return response;
+        return *response;
     }
     let path_parts: Vec<&str> = body.subcommand.split_whitespace().collect();
 
@@ -1427,7 +1435,7 @@ async fn create_command(
 
     // Job submission guard: reject if session setup is not ready.
     {
-        let readiness = resolve_setup_status(&state, &session_id).await;
+        let readiness = resolve_setup_status(state, &session_id).await;
         if !readiness.is_ready() {
             if matches!(readiness, SetupReadiness::NotFound) {
                 return (
@@ -1474,16 +1482,16 @@ async fn create_command(
         IdempotencyResource::Command(&command_id),
     ) {
         Ok(body) => body,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
 
     if let Err(response) = enqueue_command(state, &command_id, &session_id, &body) {
-        return response;
+        return *response;
     }
     accepted_json(response_body)
 }
 
-fn validate_command(body: &CreateCommandRequest) -> Result<(), Response> {
+fn validate_command(body: &CreateCommandRequest) -> RouteResult<()> {
     // Validate the command shape against the catalogue BEFORE touching session
     // state. Both checks below are request-shape (400-class) errors derived
     // entirely from the command catalogue — no per-command logic in the route.
@@ -1502,15 +1510,17 @@ fn validate_command(body: &CreateCommandRequest) -> Result<(), Response> {
                 .into_iter()
                 .map(|(parent, sub)| format!("{parent} {sub}"))
                 .collect();
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": "command not available via API",
-                    "blocked_command": command,
-                    "available": available,
-                })),
-            )
-                .into_response());
+            return Err(Box::new(
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "command not available via API",
+                        "blocked_command": command,
+                        "available": available,
+                    })),
+                )
+                    .into_response(),
+            ));
         }
 
         // (2) The args must parse cleanly against the catalogue: an unknown
@@ -1520,7 +1530,7 @@ fn validate_command(body: &CreateCommandRequest) -> Result<(), Response> {
         if let Err(e) =
             catalogue.parse_raw_args_with_profile(&path_parts, &body.args, FrontendKind::Api)
         {
-            return Err(bad_request(e.to_string()));
+            return Err(Box::new(bad_request(e.to_string())));
         }
     }
 
@@ -1532,19 +1542,21 @@ fn enqueue_command(
     command_id: &str,
     session_id: &str,
     body: &CreateCommandRequest,
-) -> Result<(), Response> {
+) -> RouteResult<()> {
     let args_json = serde_json::to_string(&body.args).unwrap_or_else(|_| "[]".to_string());
 
-    if let Err(e) = state.paths.prepare_command_dir(&session_id, &command_id) {
+    if let Err(e) = state.paths.prepare_command_dir(session_id, command_id) {
         tracing::error!(error = %e, "Failed to create command directory");
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            error_json("Failed to create command directory"),
-        )
-            .into_response());
+        return Err(Box::new(
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_json("Failed to create command directory"),
+            )
+                .into_response(),
+        ));
     }
 
-    let log_path = state.paths.command_log_path(&session_id, &command_id);
+    let log_path = state.paths.command_log_path(session_id, command_id);
 
     if let Err(e) = state.store.enqueue_command_with_labels(
         command_id,
@@ -1555,11 +1567,13 @@ fn enqueue_command(
         &body.labels,
     ) {
         tracing::error!(error = %e, "Failed to enqueue command");
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            error_json("Failed to enqueue command"),
-        )
-            .into_response());
+        return Err(Box::new(
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_json("Failed to enqueue command"),
+            )
+                .into_response(),
+        ));
     }
 
     tracing::info!(
@@ -1579,7 +1593,7 @@ async fn handle_get_command(
     match state.store.get_command(&id) {
         Ok(Some(c)) => match command_response(&state, c, None) {
             Ok(response) => Json(response).into_response(),
-            Err(response) => response,
+            Err(response) => *response,
         },
         Ok(None) => (
             StatusCode::NOT_FOUND,
@@ -1600,36 +1614,244 @@ async fn handle_get_command(
 /// Query parameters for the per-command SSE / log endpoint.
 #[derive(Deserialize, Default)]
 struct CommandLogsQuery {
-    /// When set to `"json"`, return the events.log content as a JSON array
-    /// of ExecutionEvent values instead of streaming SSE.
+    /// Return the full events.log as JSON instead of streaming SSE.
     #[serde(default)]
     format: Option<String>,
+    /// Resume strictly after this cursor; overrides Last-Event-ID.
+    #[serde(default)]
+    after: Option<String>,
+}
+
+const WORKER_WAIT_KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(15);
+const COMMAND_STATUS_POLL: std::time::Duration = std::time::Duration::from_secs(1);
+
+type CommandLogSender = tokio::sync::mpsc::Sender<Result<Event, std::convert::Infallible>>;
+type CommandLogReceiver = tokio::sync::broadcast::Receiver<ExecutionEvent>;
+
+/// Per-connection replay boundary and the last event actually sent. Done is
+/// held back until the row is terminal, including when it arrives on a live bus.
+struct CommandLogCursor {
+    replay_from: ReplayFrom,
+    last_sent: Option<EventCursor>,
+    attempt: u32,
+    next_sequence: u64,
+    done: Option<ExecutionEvent>,
+}
+
+impl CommandLogCursor {
+    fn new(replay_from: ReplayFrom, attempt: u32) -> Self {
+        Self {
+            replay_from,
+            last_sent: match replay_from {
+                ReplayFrom::After(cursor) => Some(cursor),
+                _ => None,
+            },
+            attempt,
+            next_sequence: 0,
+            done: None,
+        }
+    }
+
+    fn update_attempt(&mut self, attempt: u32) {
+        if attempt > self.attempt {
+            self.attempt = attempt;
+            self.next_sequence = 0;
+            self.done = None;
+            if matches!(self.replay_from, ReplayFrom::StartOfAttempt(_)) {
+                self.replay_from = ReplayFrom::StartOfAttempt(attempt);
+            }
+        }
+    }
+
+    async fn send_frame(&mut self, event: &ExecutionEvent, tx: &CommandLogSender) -> bool {
+        if !self.replay_from.includes(event)
+            || self.last_sent.is_some_and(|last| event.cursor() <= last)
+        {
+            return true;
+        }
+        if tx.send(Ok(execution_event_to_sse(event))).await.is_err() {
+            return false;
+        }
+        self.last_sent = Some(event.cursor());
+        true
+    }
+
+    async fn forward(&mut self, event: &ExecutionEvent, tx: &CommandLogSender) -> bool {
+        if event.attempt == self.attempt {
+            self.next_sequence = self.next_sequence.max(event.sequence.saturating_add(1));
+            if matches!(event.payload, EventPayload::Done) {
+                self.done = Some(event.clone());
+            }
+        }
+        // An earlier attempt may have written Done just before a daemon crash.
+        // Neither that marker nor the current marker can end a nonterminal row.
+        if matches!(event.payload, EventPayload::Done) {
+            return true;
+        }
+        self.send_frame(event, tx).await
+    }
+
+    async fn replay(&mut self, events: &[ExecutionEvent], tx: &CommandLogSender) -> bool {
+        // Legacy logs can contain inversions from concurrent producers. Sort
+        // before applying the high-water mark so full replay loses no records.
+        let mut events: Vec<_> = events.iter().collect();
+        events.sort_by_key(|event| event.cursor());
+        for event in events {
+            if !self.forward(event, tx).await {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn missing_before(&self, event: &ExecutionEvent) -> bool {
+        match self.last_sent {
+            Some(last) if last.attempt == event.attempt => {
+                event.sequence > last.sequence.saturating_add(1)
+            }
+            Some(last) if last.attempt > event.attempt => false,
+            _ => event.sequence > 0,
+        }
+    }
+
+    async fn finish(&mut self, tx: &CommandLogSender) {
+        // Early failures and queued cancellations can have no events.log.
+        let done = self.done.take().unwrap_or_else(|| ExecutionEvent {
+            timestamp: chrono::Utc::now(),
+            attempt: self.attempt,
+            sequence: self.next_sequence,
+            payload: EventPayload::Done,
+        });
+        // Completion is a terminal-state notification as well as a log event.
+        // Even an ahead-of-head resume must learn that the command ended.
+        let _ = tx.send(Ok(execution_event_to_sse(&done))).await;
+    }
+}
+
+enum WorkerWaitOutcome {
+    Terminal(u32),
+    Bus(CommandLogReceiver),
+    ClientGone,
+    Unavailable,
+}
+
+/// SQLite can wait on a busy lock; never run these polls on a Tokio worker.
+async fn command_log_row(state: &AppState, command_id: &str) -> Option<CommandRecord> {
+    let store = Arc::clone(&state.store);
+    let id = command_id.to_owned();
+    match tokio::task::spawn_blocking(move || store.get_command(&id)).await {
+        Ok(Ok(row)) => row,
+        Ok(Err(error)) => {
+            tracing::error!(%error, %command_id, "Failed to poll command status");
+            None
+        }
+        Err(error) => {
+            tracing::error!(%error, %command_id, "Command status poll failed");
+            None
+        }
+    }
+}
+
+async fn command_log_events(
+    state: &AppState,
+    session_id: &str,
+    command_id: &str,
+) -> Vec<ExecutionEvent> {
+    let paths = state.paths.clone();
+    let session = session_id.to_owned();
+    let command = command_id.to_owned();
+    tokio::task::spawn_blocking(move || paths.read_command_events(&session, &command))
+        .await
+        .unwrap_or_default()
+}
+
+/// A subscription can start ahead of the independent logfile writer. Hold
+/// the live event until the log catches up, replaying the missing prefix before
+/// advancing the client's id. The same path repairs broadcast lag. On failure,
+/// close without Done so the client resumes from its actual delivered cursor.
+async fn recover_command_log_gap(
+    state: &AppState,
+    session_id: &str,
+    command_id: &str,
+    through: EventCursor,
+    cursor: &mut CommandLogCursor,
+    tx: &CommandLogSender,
+) -> bool {
+    let recovery = async {
+        loop {
+            let events = command_log_events(state, session_id, command_id).await;
+            if events.iter().any(|event| event.cursor() == through) {
+                return cursor.replay(&events, tx).await;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    };
+    tokio::select! {
+        _ = tx.closed() => false,
+        result = tokio::time::timeout(std::time::Duration::from_secs(5), recovery) => {
+            match result {
+                Ok(sent) => sent,
+                Err(_) => {
+                    tracing::warn!(%command_id, %through, "Command log gap could not be recovered");
+                    false
+                }
+            }
+        }
+    }
+}
+
+/// Wait indefinitely, polling independently of the comment keepalive cadence.
+/// Subscribe before returning; live gap recovery also waits for the independent
+/// logfile writer to catch up before advancing the response cursor.
+async fn wait_for_worker(
+    state: &AppState,
+    command_id: &str,
+    tx: &CommandLogSender,
+    keepalive: std::time::Duration,
+    poll: std::time::Duration,
+) -> WorkerWaitOutcome {
+    let mut status_poll = tokio::time::interval(poll);
+    let mut keepalive =
+        tokio::time::interval_at(tokio::time::Instant::now() + keepalive, keepalive);
+    loop {
+        tokio::select! {
+            _ = tx.closed() => return WorkerWaitOutcome::ClientGone,
+            _ = status_poll.tick() => {
+                let Some(row) = command_log_row(state, command_id).await else {
+                    return WorkerWaitOutcome::Unavailable;
+                };
+                if command_is_terminal(&row.status) {
+                    return WorkerWaitOutcome::Terminal(row.attempt);
+                }
+                if let Some(bus) = state.event_buses.lock().await.get(command_id) {
+                    return WorkerWaitOutcome::Bus(bus.subscribe());
+                }
+            }
+            _ = keepalive.tick() => {
+                if tx.send(Ok(Event::default().comment("waiting for command progress"))).await.is_err() {
+                    return WorkerWaitOutcome::ClientGone;
+                }
+            }
+        }
+    }
 }
 
 /// `GET /v1/commands/{id}/logs` — structured event stream.
 ///
-/// Behavior:
-/// - Validates the command exists; 404 otherwise.
-/// - When `?format=json`, returns `events.log` as a JSON array of
-///   `ExecutionEvent` (non-streaming).
-/// - Otherwise streams SSE in `event: <type>\ndata: <json>\n\n` format.
-/// - If the command is running, first replays `events.log` from disk (capturing
-///   the highest sequence number), then subscribes to the live EventBus
-///   and filters out events with `sequence <= last_replayed_seq` to avoid
-///   duplicates from the replay/live switchover race.
-/// - When the broadcast channel reports `Lagged(n)`, sends an SSE comment
-///   line `: lagged: <n> events skipped` and resumes streaming.
-/// - Emits a final `event: done\ndata: ...\n\n` when the stream completes.
+/// Persisted frames carry `<attempt>:<sequence>` ids. `?after=` overrides
+/// Last-Event-ID; malformed cursors return the usual JSON 400 response.
+/// Unknown attempts restart replay at the current attempt. JSON format always
+/// returns the full log. Waiting has no deadline and only terminal rows end in
+/// Done. Informational waiting frames and comment keepalives have no id.
 async fn handle_stream_command_logs(
     State(state): State<Arc<AppState>>,
     AxumPath(command_id): AxumPath<String>,
     Query(query): Query<CommandLogsQuery>,
+    headers: HeaderMap,
+    shutdown: Option<axum::Extension<tokio_util::sync::CancellationToken>>,
 ) -> Response {
-    let (session_id, is_already_done) = match state.store.get_command(&command_id) {
-        Ok(Some(c)) => {
-            let done = command_is_terminal(&c.status);
-            (c.session_id, done)
-        }
+    let command = match state.store.get_command(&command_id) {
+        Ok(Some(c)) => c,
         Ok(None) => {
             return (
                 StatusCode::NOT_FOUND,
@@ -1639,238 +1861,203 @@ async fn handle_stream_command_logs(
         }
         Err(e) => {
             tracing::error!(error = %e, "Failed to look up command");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                error_json("Failed to look up command"),
-            )
-                .into_response();
+            return internal_error("Failed to look up command");
         }
     };
+    let session_id = command.session_id;
 
-    // ?format=json — return the full events.log as a JSON array.
+    // JSON is a full-log snapshot; SSE resume inputs do not filter it.
     if query.format.as_deref() == Some("json") {
-        let content = state
-            .paths
-            .read_command_events_raw(&session_id, &command_id)
-            .unwrap_or_default();
-        let mut events = Vec::new();
-        for line in content.lines() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            match serde_json::from_str::<ExecutionEvent>(line) {
-                Ok(ev) => events.push(serde_json::to_value(ev).unwrap_or(serde_json::Value::Null)),
-                Err(e) => {
-                    tracing::warn!(error = %e, "skipping malformed events.log line");
-                }
-            }
-        }
         return Json(serde_json::json!({
             "session_id": session_id,
             "command_id": command_id,
-            "events": events,
+            "attempt": command.attempt,
+            "events": state.paths.read_command_events(&session_id, &command_id),
         }))
         .into_response();
     }
 
-    // SSE streaming path.
-    let (tx, rx) =
-        tokio::sync::mpsc::unbounded_channel::<Result<Event, std::convert::Infallible>>();
-    let stream = UnboundedReceiverStream::new(rx);
-
-    let maybe_bus = if is_already_done {
-        None
+    let invalid_id = || bad_request("invalid event id; expected <attempt>:<sequence>");
+    let requested = if let Some(after) = query.after.as_deref() {
+        match EventCursor::parse(after) {
+            Some(cursor) => Some(cursor),
+            None => return invalid_id(),
+        }
+    } else if let Some(header) = headers.get("last-event-id") {
+        match header.to_str().ok().and_then(EventCursor::parse) {
+            Some(cursor) => Some(cursor),
+            None => return invalid_id(),
+        }
     } else {
-        state.event_buses.lock().await.get(&command_id).cloned()
+        None
     };
 
-    let state_for_task = Arc::clone(&state);
-    let command_id_for_task = command_id.clone();
-    let session_id_for_task = session_id.clone();
-
-    tokio::spawn(async move {
-        // 1. Replay events.log from disk, recording the highest sequence.
-        let mut last_replayed_seq: Option<u64> = None;
-        if let Some(content) = state_for_task
-            .paths
-            .read_command_events_raw(&session_id_for_task, &command_id_for_task)
-        {
-            for line in content.lines() {
-                let line = line.trim();
-                if line.is_empty() {
-                    continue;
-                }
-                let event: ExecutionEvent = match serde_json::from_str(line) {
-                    Ok(e) => e,
-                    Err(_) => continue,
-                };
-                last_replayed_seq = Some(
-                    last_replayed_seq
-                        .map(|s| s.max(event.sequence))
-                        .unwrap_or(event.sequence),
-                );
-                if tx.send(Ok(execution_event_to_sse(&event))).is_err() {
-                    return;
-                }
-            }
-        }
-
-        // 2. If no live bus was found AND the command is not yet terminal, the
-        //    worker hasn't claimed it yet (status='queued') or it's between
-        //    claim and bus registration. Poll for the bus to appear, with a
-        //    short keepalive comment every iteration so the SSE connection
-        //    doesn't look dead to the client. Bail out if the command
-        //    transitions to a terminal state while we're waiting.
-        let mut live_bus = maybe_bus;
-        if live_bus.is_none() && !is_already_done {
-            const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
-            const POLL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
-            // Emit a visible status event so `--follow` clients see *something*
-            // while they wait for a worker to claim the command. Without this
-            // the client looks frozen for up to POLL_TIMEOUT.
-            let waiting_event = ExecutionEvent {
-                timestamp: chrono::Utc::now(),
-                sequence: last_replayed_seq.map(|s| s + 1).unwrap_or(0),
-                payload: EventPayload::StatusMessage {
-                    phase: "queue".into(),
-                    message: "Waiting for a worker to claim this command...".into(),
-                },
-            };
-            if tx.send(Ok(execution_event_to_sse(&waiting_event))).is_err() {
+    let (tx, rx) = tokio::sync::mpsc::channel(256);
+    let shutdown = shutdown.map(|extension| extension.0).unwrap_or_default();
+    let stream = async move {
+        // Subscribe before reading disk and deduplicate the overlap. If the
+        // writer is behind this subscription, repair the gap before forwarding.
+        let mut live_rx = state
+            .event_buses
+            .lock()
+            .await
+            .get(&command_id)
+            .map(|bus| bus.subscribe());
+        let events = command_log_events(&state, &session_id, &command_id).await;
+        let replay_from = ReplayFrom::resolve(&events, command.attempt, requested);
+        let mut cursor = CommandLogCursor::new(replay_from, command.attempt);
+        if let ReplayFrom::StartOfAttempt(attempt) = replay_from {
+            if tx
+                .send(Ok(Event::default().comment(format!(
+                    "resuming from the start of attempt {attempt}"
+                ))))
+                .await
+                .is_err()
+            {
                 return;
             }
-            let started = std::time::Instant::now();
-            loop {
-                // Check command status — if it reached a terminal state while
-                // we were waiting, replay any newly-flushed events.log lines
-                // and exit the wait loop so the Done event is emitted below.
-                let cmd_terminal = match state_for_task.store.get_command(&command_id_for_task) {
-                    Ok(Some(c)) => command_is_terminal(&c.status),
-                    _ => false,
+        }
+        if !cursor.replay(&events, &tx).await {
+            return;
+        }
+        if command_is_terminal(&command.status) {
+            cursor.finish(&tx).await;
+            return;
+        }
+
+        let mut saw_worker = live_rx.is_some();
+        loop {
+            if live_rx.is_none() {
+                // This informational event is outside the persisted cursor
+                // namespace. An id-less frame leaves Last-Event-ID untouched.
+                let waiting = ExecutionEvent {
+                    timestamp: chrono::Utc::now(),
+                    attempt: 0,
+                    sequence: 0,
+                    payload: EventPayload::StatusMessage {
+                        phase: "queue".into(),
+                        message: if saw_worker {
+                            "Waiting for command status to be recorded..."
+                        } else {
+                            "Waiting for a worker to claim this command..."
+                        }
+                        .into(),
+                    },
                 };
-                if cmd_terminal {
-                    if let Some(content) = state_for_task
-                        .paths
-                        .read_command_events_raw(&session_id_for_task, &command_id_for_task)
-                    {
-                        for line in content.lines() {
-                            let line = line.trim();
-                            if line.is_empty() {
-                                continue;
+                let waiting = Event::default()
+                    .event(waiting.payload.sse_event_type())
+                    .data(serde_json::to_string(&waiting).unwrap_or_else(|_| "{}".into()));
+                if tx.send(Ok(waiting)).await.is_err() {
+                    return;
+                }
+                match wait_for_worker(
+                    &state,
+                    &command_id,
+                    &tx,
+                    WORKER_WAIT_KEEPALIVE,
+                    COMMAND_STATUS_POLL,
+                )
+                .await
+                {
+                    WorkerWaitOutcome::ClientGone | WorkerWaitOutcome::Unavailable => return,
+                    WorkerWaitOutcome::Terminal(attempt) => {
+                        cursor.update_attempt(attempt);
+                        let events = command_log_events(&state, &session_id, &command_id).await;
+                        if cursor.replay(&events, &tx).await {
+                            cursor.finish(&tx).await;
+                        }
+                        return;
+                    }
+                    WorkerWaitOutcome::Bus(receiver) => {
+                        saw_worker = true;
+                        live_rx = Some(receiver);
+                        let events = command_log_events(&state, &session_id, &command_id).await;
+                        if !cursor.replay(&events, &tx).await {
+                            return;
+                        }
+                    }
+                }
+            }
+
+            let Some(receiver) = live_rx.as_mut() else {
+                continue;
+            };
+            let mut status_poll = tokio::time::interval(COMMAND_STATUS_POLL);
+            let mut keepalive = tokio::time::interval_at(
+                tokio::time::Instant::now() + WORKER_WAIT_KEEPALIVE,
+                WORKER_WAIT_KEEPALIVE,
+            );
+            loop {
+                tokio::select! {
+                    _ = tx.closed() => return,
+                    _ = keepalive.tick() => {
+                        if tx.send(Ok(Event::default().comment("keepalive"))).await.is_err() {
+                            return;
+                        }
+                    }
+                    _ = status_poll.tick() => {
+                        let Some(row) = command_log_row(&state, &command_id).await else {
+                            return;
+                        };
+                        cursor.update_attempt(row.attempt);
+                        if command_is_terminal(&row.status) {
+                            let events = command_log_events(&state, &session_id, &command_id).await;
+                            if cursor.replay(&events, &tx).await {
+                                cursor.finish(&tx).await;
                             }
-                            let event: ExecutionEvent = match serde_json::from_str(line) {
-                                Ok(e) => e,
-                                Err(_) => continue,
-                            };
-                            if let Some(last) = last_replayed_seq {
-                                if event.sequence <= last {
-                                    continue;
-                                }
+                            return;
+                        }
+                    }
+                    result = receiver.recv() => match result {
+                        Ok(event) => {
+                            cursor.update_attempt(event.attempt);
+                            if cursor.missing_before(&event)
+                                && !recover_command_log_gap(
+                                    &state, &session_id, &command_id, event.cursor(), &mut cursor, &tx,
+                                ).await
+                            {
+                                return;
                             }
-                            last_replayed_seq = Some(
-                                last_replayed_seq
-                                    .map(|s| s.max(event.sequence))
-                                    .unwrap_or(event.sequence),
-                            );
-                            if tx.send(Ok(execution_event_to_sse(&event))).is_err() {
+                            if !cursor.forward(&event, &tx).await {
                                 return;
                             }
                         }
-                    }
-                    break;
-                }
-                // Has the worker registered the bus yet?
-                if let Some(bus) = state_for_task
-                    .event_buses
-                    .lock()
-                    .await
-                    .get(&command_id_for_task)
-                    .cloned()
-                {
-                    live_bus = Some(bus);
-                    break;
-                }
-                if started.elapsed() >= POLL_TIMEOUT {
-                    tracing::warn!(
-                        command_id = %command_id_for_task,
-                        "SSE wait for worker timed out — emitting Done"
-                    );
-                    break;
-                }
-                // Keepalive comment so the SSE connection stays alive on
-                // intermediaries and the client knows we're still here.
-                if tx
-                    .send(Ok(
-                        Event::default().comment("waiting for worker to claim job")
-                    ))
-                    .is_err()
-                {
-                    return;
-                }
-                tokio::time::sleep(POLL_INTERVAL).await;
-            }
-        }
-
-        // 3. If a live EventBus exists, subscribe and forward post-replay events.
-        if let Some(bus) = live_bus {
-            let mut rx = bus.subscribe();
-            loop {
-                match rx.recv().await {
-                    Ok(event) => {
-                        if let Some(last) = last_replayed_seq {
-                            if event.sequence <= last {
-                                continue;
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            tracing::warn!(lagged = n, "SSE subscriber lagged");
+                            let comment = Event::default().comment(format!("lagged: recovering {n} events from log"));
+                            if tx.send(Ok(comment)).await.is_err() {
+                                return;
                             }
                         }
-                        let is_done = matches!(event.payload, EventPayload::Done);
-                        if tx.send(Ok(execution_event_to_sse(&event))).is_err() {
-                            return;
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            // A vanished bus does not prove completion. Re-enter
+                            // worker waiting and check the row before sending Done.
+                            live_rx = None;
+                            break;
                         }
-                        if is_done {
-                            return;
-                        }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        tracing::warn!(lagged = n, "SSE subscriber lagged");
-                        let comment =
-                            Event::default().comment(format!("lagged: {n} events skipped"));
-                        if tx.send(Ok(comment)).is_err() {
-                            return;
-                        }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        let done = ExecutionEvent {
-                            timestamp: chrono::Utc::now(),
-                            sequence: last_replayed_seq.map(|s| s + 1).unwrap_or(0),
-                            payload: EventPayload::Done,
-                        };
-                        let _ = tx.send(Ok(execution_event_to_sse(&done)));
-                        return;
                     }
                 }
             }
         }
-        let done = ExecutionEvent {
-            timestamp: chrono::Utc::now(),
-            sequence: last_replayed_seq.map(|s| s + 1).unwrap_or(0),
-            payload: EventPayload::Done,
-        };
-        let _ = tx.send(Ok(execution_event_to_sse(&done)));
+    };
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = shutdown.cancelled() => {},
+            _ = stream => {},
+        }
     });
 
-    Sse::new(stream).into_response()
+    Sse::new(ReceiverStream::new(rx)).into_response()
 }
 
-/// Encode an ExecutionEvent as a structured SSE message:
-/// `event: <type>\ndata: <json>\n\n`.
+/// Encode an ExecutionEvent with a cursor safe for axum's SSE id validation.
 fn execution_event_to_sse(event: &ExecutionEvent) -> Event {
     let data = serde_json::to_string(event).unwrap_or_else(|_| "{}".into());
     Event::default()
+        .id(event.cursor().to_string())
         .event(event.payload.sse_event_type())
         .data(data)
 }
-
 async fn handle_get_session_queue(
     State(state): State<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,

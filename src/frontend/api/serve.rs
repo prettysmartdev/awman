@@ -121,6 +121,8 @@ where
     // graceful shutdown handle when it fires.
     let server_handle = axum_server::Handle::new();
     let shutdown_handle = server_handle.clone();
+    let stream_shutdown = tokio_util::sync::CancellationToken::new();
+    let router = router.layer(axum::Extension(stream_shutdown.clone()));
     tokio::spawn(async move {
         let ctrl_c = tokio::signal::ctrl_c();
         #[cfg(unix)]
@@ -143,6 +145,7 @@ where
             let _ = ctrl_c.await;
             tracing::info!("Received SIGINT, shutting down");
         }
+        stream_shutdown.cancel();
         shutdown_handle.graceful_shutdown(Some(shutdown_grace));
     });
 

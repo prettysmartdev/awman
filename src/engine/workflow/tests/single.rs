@@ -3,7 +3,7 @@
 
 use super::super::*;
 use super::parallel::make_session_with_max_concurrent;
-use super::phases::{MessageCapturingFrontend, make_engine_capturing};
+use super::phases::{make_engine_capturing, MessageCapturingFrontend};
 use super::*;
 
 // ── WorkflowEngine tests ─────────────────────────────────────────────────
@@ -454,12 +454,10 @@ fn failure_actions_offer_recovery_and_never_finish() {
     assert_eq!(failure.exit_code, 42);
     assert_eq!(failure.previous_step.as_deref(), Some("a"));
     assert_eq!(failure.next_step.as_deref(), Some("c"));
-    assert!(
-        failure
-            .detail_lines
-            .iter()
-            .any(|l| l.contains("Exit code: 42"))
-    );
+    assert!(failure
+        .detail_lines
+        .iter()
+        .any(|l| l.contains("Exit code: 42")));
 }
 
 // ─── simple_advance (WI 0114 F-18) ──────────────────────────────────────
@@ -512,13 +510,11 @@ fn two_pending_steps_are_not_a_simple_advance() {
     let mut engine = make_engine(&session, workflow, factory, []);
     engine.state.set_status("a", StepState::Succeeded);
 
-    assert!(
-        engine
-            .compute_available_actions()
-            .unwrap()
-            .simple_advance
-            .is_none()
-    );
+    assert!(engine
+        .compute_available_actions()
+        .unwrap()
+        .simple_advance
+        .is_none());
 }
 
 /// A failed step anywhere in the run means recovery actions, not a
@@ -547,13 +543,11 @@ fn a_failed_step_anywhere_rules_out_a_simple_advance() {
         },
     );
 
-    assert!(
-        engine
-            .compute_available_actions()
-            .unwrap()
-            .simple_advance
-            .is_none()
-    );
+    assert!(engine
+        .compute_available_actions()
+        .unwrap()
+        .simple_advance
+        .is_none());
 }
 
 /// A running step is dismissable, and a board you can dismiss back to a

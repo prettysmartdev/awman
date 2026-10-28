@@ -697,6 +697,7 @@ fn sse_wire_format_assembles_correctly() {
         timestamp: chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
             .unwrap()
             .with_timezone(&chrono::Utc),
+        attempt: 1,
         sequence: 42,
         payload: EventPayload::StdoutLine("hello world".into()),
     };
@@ -1043,6 +1044,7 @@ fn execution_event_json_roundtrip_all_payload_variants() {
     for (i, payload) in payloads.into_iter().enumerate() {
         let event = ExecutionEvent {
             timestamp: chrono::Utc::now(),
+            attempt: 1,
             sequence: i as u64,
             payload,
         };

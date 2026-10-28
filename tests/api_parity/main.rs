@@ -12,6 +12,13 @@
 #[path = "../helpers/mod.rs"]
 mod helpers;
 
+#[cfg(unix)]
+#[path = "../helpers/api_process.rs"]
+mod api_process;
+#[cfg(unix)]
+#[path = "../helpers/git_daemon.rs"]
+mod git_daemon;
+
 mod auth_modes;
 mod http_core;
 mod live_server;
@@ -25,3 +32,4 @@ mod wi_0132;
 mod wi_0133_remote;
 mod wi_0134;
 mod wi_0135;
+mod wi_0136;

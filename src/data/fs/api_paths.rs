@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 
 use crate::data::config::env::{Env, EnvSnapshot};
 use crate::data::error::DataError;
+use crate::data::execution_event::ExecutionEvent;
 use crate::data::fs::daemon_paths::DaemonPaths;
 use crate::data::fs::data_paths::DataPaths;
 use crate::data::session_setup_event::SessionSetupState;
@@ -280,6 +281,26 @@ impl ApiPaths {
     pub fn read_command_events_raw(&self, session_id: &str, command_id: &str) -> Option<String> {
         let path = self.command_events_log_path(session_id, command_id);
         std::fs::read_to_string(&path).ok()
+    }
+
+    /// Read and parse a command's `events.log`, every attempt in file order.
+    /// Deserialize each byte record independently so torn UTF-8 cannot hide
+    /// intact history or subsequent attempts. Malformed lines are skipped;
+    /// an absent log is empty and other I/O failures are logged.
+    pub fn read_command_events(&self, session_id: &str, command_id: &str) -> Vec<ExecutionEvent> {
+        let path = self.command_events_log_path(session_id, command_id);
+        match std::fs::read(&path) {
+            Ok(raw) => raw
+                .split(|byte| *byte == b'\n')
+                .filter_map(|line| serde_json::from_slice(line).ok())
+                .collect(),
+            Err(error) => {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(%error, path = %path.display(), "Failed to read command events");
+                }
+                Vec::new()
+            }
+        }
     }
 
     /// Write a command's `metadata.json` (pretty-printed).

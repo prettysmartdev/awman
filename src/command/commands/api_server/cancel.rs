@@ -290,12 +290,10 @@ mod tests {
             store.get_command("running").unwrap().unwrap().status,
             "cancelled"
         );
-        assert!(
-            store
-                .claim_next_command("worker-after-restart")
-                .unwrap()
-                .is_none()
-        );
+        assert!(store
+            .claim_next_command("worker-after-restart")
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -322,15 +320,13 @@ mod tests {
         lifecycle
             .cancel_if_queued("cancelled-run", "2026-10-28T00:00:01Z")
             .unwrap();
-        assert!(
-            !lifecycle
-                .fail_if_queued(
-                    "cancelled-run",
-                    "2026-10-28T00:00:02Z",
-                    r#"{"error":"setup"}"#
-                )
-                .unwrap()
-        );
+        assert!(!lifecycle
+            .fail_if_queued(
+                "cancelled-run",
+                "2026-10-28T00:00:02Z",
+                r#"{"error":"setup"}"#
+            )
+            .unwrap());
         assert_eq!(
             store.get_command("cancelled-run").unwrap().unwrap().status,
             "cancelled"
