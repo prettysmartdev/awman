@@ -49,11 +49,12 @@ The findings below were verified against awman's source. Where noted, they were 
 | Proposal | What it fixes | Status |
 |---|---|---|
 | [0132](0132-api-finishes-yolo-workflows.md) | **Bug**: API-mode yolo workflows (every `--dynamic` run) abort after their last step and skip teardown; also a dirty-target check and an agent-assisted fix for worktree merge-back, and a working `GET /v1/workflows/{id}` (nothing wrote its file) with setup/teardown steps listed from the start | ready to implement |
-| [0143](0143-step-attributed-live-output.md) | Output events carry no step or container, and non-interactive agents emit only a final message | needed for exact per-agent output in infact's workflow view (0002) |
+| [0137](0137-structured-command-results.md) | Output events carry no step or container, and non-interactive agents emit only a final message (formerly 0143, now folded into 0137) | needed for exact per-agent output in infact's workflow view (0002) |
 | [0145](0145-one-daemon-with-modes.md) | Squad and the API server are separate daemons that cannot run together | design: one daemon, any mix of squad, API and worker modes |
 | [0146](0146-interaction-modes-and-live-terminals.md) | Squad is interactive-only, the API is non-interactive-only, and PTYs can only be attached locally | design: interaction per mode, a terminal hub with network viewers; needed for infact 0024 |
 | [0147](0147-worker-mode-and-work-servers.md) | Nothing lets awman pull work; every client must reach awman's loopback port | design: worker mode, Work Server Protocol v1, label affinity, TUI queue picker; infact 0023 and 0025 build on it |
 | [0148](0148-github-issues-work-server.md) | No work server exists to try 0147 with | design: reference server serving GitHub issues |
+| [0151](0151-api-consistency-pass.md) | API audit: errors have no machine-readable code, per-command routes split across two roots, session records hide `setup_status`, docs contradict admission, dead OpenAPI projection | small consistency fixes; pairs with 0137 |
 | [0144](0144-init-over-the-api.md) | `init` is not API-allowed, and dynamic workflows refuse agents without `.awman/Dockerfile.<agent>`, so a repository awman has never seen cannot run a node | worked around: infact runs `awman init` with the CLI in the workspace before a project's first node run |
 
 ## Worker mode (0145–0148): the pull model

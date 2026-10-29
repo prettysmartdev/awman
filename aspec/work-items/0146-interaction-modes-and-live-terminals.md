@@ -56,7 +56,7 @@ watch it, or step in when it is stuck, with the same keys as `squad attach`
   - Stuck agents get the existing 60 s countdown, then auto-advance.
   - A person attached with input rights can cancel a countdown exactly as in the TUI.
 - **Terminal hub** (`src/engine/terminal_hub/`). One per daemon, built by the 0145 core.
-  - Every PTY-bridged container registers a terminal with `{terminal_id, command_id, step_name, step_index, container, agent, model, attempt, cols, rows, state}`.
+  - Every PTY-bridged container registers a terminal with `{terminal_id, command_id, source, agent, model, attempt, cols, rows, state}`. `source` is 0137's event-envelope object (phase, step name and index, container, `step_attempt`), and `attempt` is the command's execution number (0136).
   - The hub tees PTY output into a `vt100::Parser`, the same crate the TUI's `container_view.rs` uses, plus a bounded ring buffer, then fans it out to subscribers.
   - Slow subscribers get `Lagged` and a fresh snapshot rather than unbounded buffering.
   - Today's attach socket and exec bridge become hub subscribers, so local attach works for every mode.
@@ -72,7 +72,7 @@ watch it, or step in when it is stuck, with the same keys as `squad attach`
   - Client-to-server frames: `input{bytes}` and `resize{cols,rows}`. Both are accepted only from a client holding the input grant, below.
   - The frame set mirrors `attach_protocol.rs` so one codec serves local and network viewers.
 - **Input over the network is off by default.** Two things must both allow it: `daemon.terminal.remoteInput` and a per-command `allow_remote_input`. When allowed, the first client that sends `take_control` holds the input grant, and others stay read-only. Every grant and release is written to the command's event log (`TerminalControl{terminal_id, holder}`), with the holder named by the client's `x-awman-actor` header. Keystrokes are not logged.
-- **Events.** Add `TerminalOpened{terminal_id,…}` and `TerminalClosed{terminal_id, exit_code}` to `ExecutionEvent`, so SSE followers know when to open a socket. Plain-text `StepOutput` (0143) continues for clients that only want text.
+- **Events.** Add `TerminalOpened{terminal_id, agent, model, cols, rows}` and `TerminalClosed{terminal_id, exit_code}` to `ExecutionEvent`, so SSE followers know when to open a socket. Step, phase, container and retry come from the event envelope's `source` (0137), not from fields repeated in these payloads. Attributed output lines (0137) continue for clients that only want text.
 - **CLI and TUI.** `awman attach <command-id> [--step NAME]` opens any hub terminal on this machine. `squad attach` becomes a shortcut for it.
 
 ## Edge Case Considerations:

@@ -35,7 +35,7 @@ give each project its own token for `gh pr create` without restarting awman
 - Session `git_auth` (token or basic) is kept in the runtime's in-memory session map and never persisted. If awman restarts, the session's next git operation fails with `credentials_lost`, and the client opens a new session.
 - Clone and push use a one-shot credential helper (`git -c credential.helper=` plus an awman helper that reads from a unix socket or fd), so the secret never lands in argv, the environment or `.git/config`. The clone's `origin` is the clean URL.
 - Teardown steps that run git (`push_branch`, `pull_branch`, `create_pull_request`) inside containers get the same helper through a mounted socket that answers only for the session's host.
-- `secrets` on `POST /v1/commands`: kept in memory, injected as container env for names the command's overlays request with `env(NAME)`, and they take precedence over host env. Values are redacted from `StdoutLine`/`StderrLine` (exact-match replacement with `***`).
+- `secrets` on `POST /v1/commands`: kept in memory, injected as container env for names the command's overlays request with `env(NAME)`, and they take precedence over host env. Values are redacted (exact-match replacement with `***`) from every event payload that carries agent text: `StdoutLine`, `StderrLine`, `StatusMessage`, `StepActivity.summary`, and `result.final_message`/`failure.message` (0137). Redaction lives in one place, the event bus sender, so a new event type cannot bypass it. Files the agent writes to `/awman/output` and terminal bytes (0146) are not redacted; document that.
 - Validation: max 32 secrets of 8 KiB each; names must match `^[A-Z_][A-Z0-9_]*$`.
 
 ## Edge Case Considerations:

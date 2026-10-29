@@ -93,7 +93,7 @@ take work without the TUI
 - The **server** evaluates affinity and only ever lists or hands out eligible items. awman re-checks `required` against its own reported labels and refuses (`release` with reason `ineligible`) anything that does not match. For example, it refuses an item needing `awman.dev/agent.codex=true` on a machine without codex.
 
 ### Work Server Protocol v1
-All calls are from the worker to the server, under the server's base URL, with `Authorization: Bearer <access token>`. Access tokens come from `POST /v1/token {refresh_token}` and are short-lived. Every request carries `x-wsp-version: 1`. Errors are `{error: {code, message}}`.
+All calls are from the worker to the server, under the server's base URL, with `Authorization: Bearer <access token>`. Access tokens come from `POST /v1/token {refresh_token}` and are short-lived. Every request carries `x-wsp-version: 1`. Errors are `{error, code}`: a message string and a snake_case code, the same shape as awman's own API errors (0151).
 
 | Call | Purpose |
 |---|---|
@@ -102,7 +102,7 @@ All calls are from the worker to the server, under the server's base URL, with `
 | `GET /v1/queue?limit=50` | Items **eligible for this worker**, in the server's order (priority, then age, then preferred weight). Returns summaries: `{id, title, summary, kind, labels, priority, enqueued_at, assigned_to_me}`. Used by the picker. |
 | `POST /v1/claims` | `{item_id?}`: with `item_id`, claim that item (manual pick); without it, the next eligible item. Supports `?wait=30` long-poll. Returns `201 {lease}`, `204` if nothing is eligible, or `409 taken`. |
 | `POST /v1/leases/{id}/heartbeat` | `{state: "preparing"\|"running"\|"awaiting_input"\|"pushing", step?, progress?}` → `{expires_at, cancel: bool, cancel_reason?}`. `awaiting_input` means a step dialog or stuck agent is waiting for a person. Missing heartbeats past `expires_at` make the server re-queue the item. |
-| `POST /v1/leases/{id}/events` | `{events: [ExecutionEvent…]}` with awman's own event JSON (including 0143's step attribution and 0146's terminal events), each with its `sequence` and `attempt`. Idempotent by `(attempt, sequence)`. |
+| `POST /v1/leases/{id}/events` | `{events: [ExecutionEvent…]}` with awman's own event JSON (including 0137's `source` attribution and `step_activity`, and 0146's terminal events), each with its `sequence` and `attempt`. Idempotent by `(attempt, sequence)`. |
 | `GET /v1/leases/{id}/terminal` (WebSocket, `awman.terminal.v1`) | The worker opens this only if the lease has `terminal: true`. It multiplexes 0146's terminal frames for every terminal of the run, each tagged with `terminal_id`. The server fans them out to its own viewers. `input` frames flow back only when the lease grants `remote_input` **and** the worker's config allows it. |
 | `POST /v1/leases/{id}/result` | The final result (below). Ends the lease. |
 | `POST /v1/leases/{id}/release` | `{reason: "user_declined"\|"ineligible"\|"shutdown"\|"error", message?}` hands the item back unrun, or abandons it mid-run with the partial result attached. |
@@ -135,7 +135,7 @@ All calls are from the worker to the server, under the server's base URL, with `
     "affinity": { "required": [], "preferred": [] }
   }
   ```
-- **Result** = `{status: "succeeded"|"failed"|"cancelled", exit_code, error?: {stage, message}, pushed?: {branch, sha}, outputs?: {path: base64}, workflow?: {steps…}, failed_steps: […], duration_secs}`. This is 0137's structured result, so API clients and work servers read the same shape.
+- **Result** = `{result: CommandResult, outputs?: {path: base64}, duration_secs}`. `result` is 0137's `CommandResult`, embedded unchanged (`outcome`, `failure{stage, code, message}`, `failed_steps`, `git`, `pushed`, `pull_request`, `final_message`), so API clients and work servers decode one shape. `outputs` inlines the 0137 outputs directory up to `outputs.max_bytes`. WSP does not define a second status vocabulary (`succeeded|failed`).
 
 ### Running a lease
 - The worker runs each lease in a fresh clone at `<workRoot>/leases/<lease_id>/`, using 0133's remote-session machinery:
