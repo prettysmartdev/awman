@@ -6,6 +6,7 @@
 
 use std::path::PathBuf;
 
+pub use crate::data::agent_output_format::AgentOutputFormat;
 pub use crate::data::fs::agent_dirs::DefinitionScope;
 
 use crate::data::config::repo::LaunchMode;
@@ -181,6 +182,14 @@ pub struct AgentDefinition {
     pub interactive_entrypoint: Vec<String>,
     /// Print/non-interactive entrypoint suffix (e.g. `--print` for Claude).
     pub non_interactive_flag: Option<String>,
+    /// The structured output mode a non-interactive run can print in
+    /// (WI 0137 §4). A capability of the table, not a name match: under the
+    /// API an agent with a structured format runs in that mode (claude
+    /// `--output-format stream-json --verbose`, codex `exec --json`) and the
+    /// matching `engine::agent_output` translator turns the stream into
+    /// `step_activity` events, output lines and the final message. `Text`
+    /// for every other agent and for a custom definition that declares none.
+    pub output_format: AgentOutputFormat,
     /// Flags appended to the entrypoint only for an interactive (non-`-n`)
     /// launch — for options the agent's non-interactive mode rejects (codex
     /// `--no-daemon`, which `codex exec` refuses). Not used for ACP launches.

@@ -222,11 +222,12 @@ pub(crate) struct PreparedRun {
         Box<crate::command::commands::workflow_prerequisites::PreparedPrerequisites>,
 }
 
-/// Execute a fully-prepared workflow: persisted-state resume check, engine
-/// setup/main/teardown phases, summary reporting, and worktree finalize.
-/// Shared by the non-dynamic and dynamic execution paths.
+/// Execute the prepared workflow, mounting `output_dir` read-write at `/awman/output`
+/// into every step container (WI 0137 §3). The directory is created when
+/// missing and never cleared: a resumed workflow keeps the files of the steps
+/// it keeps, and a rerun step overwrites its own.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn execute_prepared(
+pub(crate) async fn execute_prepared_with_outputs(
     flags: &ExecWorkflowCommandFlags,
     engines: &Engines,
     prepared: PreparedRun,
@@ -236,7 +237,16 @@ pub(crate) async fn execute_prepared(
     workflow_state_root: Option<&Path>,
     managed_session: Option<&Arc<tokio::sync::RwLock<Session>>>,
     cancel: &tokio_util::sync::CancellationToken,
+    output_dir: Option<&Path>,
 ) -> Result<ExecWorkflowOutcome, CommandError> {
+    if let Some(dir) = output_dir {
+        crate::data::fs::command_outputs::prepare_output_dir(dir, false).map_err(|e| {
+            CommandError::Other(format!(
+                "exec workflow: failed to prepare the outputs directory {}: {e}",
+                dir.display()
+            ))
+        })?;
+    }
     let PreparedRun {
         mut workflow,
         workflow_path,
@@ -430,6 +440,7 @@ pub(crate) async fn execute_prepared(
             task_workspace: task_workspace.map(Path::to_path_buf),
             launch_modes: Arc::new(launch_modes),
             agent_flags: workflow_agent_flags,
+            output_dir: output_dir.map(Path::to_path_buf),
         };
         let cleanup_workflow = workflow.clone();
         let cleanup_work_item = engine_work_item_context

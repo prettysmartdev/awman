@@ -10,6 +10,7 @@
 
 pub mod acp;
 pub mod agent;
+pub mod agent_output;
 pub mod agent_runtime;
 pub mod aspec;
 pub mod auth;

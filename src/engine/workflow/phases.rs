@@ -409,7 +409,11 @@ impl WorkflowEngine {
             return PhaseStepOutcome::exited(result.exit_code, result.stdout, result.stderr);
         }
 
-        PhaseStepOutcome::succeeded()
+        PhaseStepOutcome {
+            stdout: result.stdout,
+            stderr: result.stderr,
+            ..PhaseStepOutcome::succeeded()
+        }
     }
 
     /// Record a phase step as failed in the persisted state. Does NOT notify
@@ -514,7 +518,15 @@ impl WorkflowEngine {
             description: self.state.phase_step_states(kind)[idx].description.clone(),
         };
         match container_for_step(&step_ref) {
-            Ok(c) => self.run_shell_phase_step(&*c, &command, env.as_ref(), kind, idx),
+            Ok(c) => {
+                let result = self.run_shell_phase_step(&*c, &command, env.as_ref(), kind, idx);
+                if !result.failed && kind == PhaseKind::Teardown && step.creates_pull_request() {
+                    if let Some(url) = parse_gh_pr_create_output(&result.stdout) {
+                        self.frontend.report_pull_request_created(&url);
+                    }
+                }
+                result
+            }
             Err(e) => {
                 let error = self.redaction.redact(&e.to_string());
                 self.set_phase_step_failed(kind, idx, &error);
@@ -726,6 +738,14 @@ impl WorkflowEngine {
             session_id: session.id(),
             workflow_invocation_id: self.state.invocation_id,
             workflow_step_info: None,
+            // An `on_failure` remediation runs while its phase is current; the
+            // merge-fix agent runs after the workflow is done, at merge-back.
+            source: EventSource::phase(match self.state.current_phase {
+                crate::data::workflow_state::WorkflowPhase::Setup => EventSourcePhase::Setup,
+                crate::data::workflow_state::WorkflowPhase::Main => EventSourcePhase::Main,
+                crate::data::workflow_state::WorkflowPhase::Teardown => EventSourcePhase::Teardown,
+                crate::data::workflow_state::WorkflowPhase::Done => EventSourcePhase::Merge,
+            }),
         };
 
         // Same pre-launch notification main steps get (mod.rs `launch_step`).
@@ -959,5 +979,51 @@ impl WorkflowEngine {
             step_name: failure.step_name.to_string(),
             extra_overlay,
         })
+    }
+}
+
+/// gh prints the created PR URL on stdout. This parser is used only by the
+/// create_pull_request teardown step, never by general output handling.
+fn parse_gh_pr_create_output(output: &str) -> Option<String> {
+    output.lines().rev().map(str::trim).find_map(|line| {
+        let url = reqwest::Url::parse(line).ok()?;
+        if url.scheme() != "https"
+            || url.host_str().is_none()
+            || url.query().is_some()
+            || url.fragment().is_some()
+            || !url.username().is_empty()
+            || url.password().is_some()
+        {
+            return None;
+        }
+        let parts: Vec<_> = url.path_segments()?.collect();
+        (parts.len() == 4
+            && !parts[0].is_empty()
+            && !parts[1].is_empty()
+            && parts[2] == "pull"
+            && parts[3].parse::<u64>().is_ok_and(|n| n > 0))
+        .then(|| line.to_string())
+    })
+}
+
+#[cfg(test)]
+mod pull_request_output_tests {
+    use super::parse_gh_pr_create_output;
+    #[test]
+    fn only_standalone_success_urls_are_captured_including_enterprise_hosts() {
+        for output in [
+            "https://github.com/o/r/pull/7",
+            "created\nhttps://git.example.test/o/r/pull/9\nextra diagnostics",
+        ] {
+            assert!(parse_gh_pr_create_output(output).is_some());
+        }
+        for output in [
+            "already exists: https://github.com/o/r/pull/7",
+            "https://github.com/o/r/pull/7/",
+            "https://github.com/o/r/pull/0",
+            "https://github.com/o/r/pull/1?x=1",
+        ] {
+            assert!(parse_gh_pr_create_output(output).is_none());
+        }
     }
 }

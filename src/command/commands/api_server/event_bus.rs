@@ -12,14 +12,14 @@ use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::task::TaskTracker;
 
-use crate::data::execution_event::{EventPayload, ExecutionEvent, FIRST_ATTEMPT};
+use crate::data::execution_event::{EventPayload, EventSource, ExecutionEvent, FIRST_ATTEMPT};
 
 pub struct EventBus {
     tx: broadcast::Sender<ExecutionEvent>,
     publication: Arc<Mutex<Publication>>,
     attempt: u32,
     drains: TaskTracker,
-    deferred_command_status: Arc<Mutex<Vec<EventPayload>>>,
+    drain_shutdown: tokio_util::sync::CancellationToken,
 }
 
 #[derive(Default)]
@@ -44,7 +44,7 @@ impl EventBus {
             publication: Arc::new(Mutex::new(Publication::default())),
             attempt,
             drains: TaskTracker::new(),
-            deferred_command_status: Arc::new(Mutex::new(Vec::new())),
+            drain_shutdown: Default::default(),
         }
     }
 
@@ -58,7 +58,8 @@ impl EventBus {
             publication: Arc::clone(&self.publication),
             attempt: self.attempt,
             drains: self.drains.clone(),
-            deferred_command_status: Arc::clone(&self.deferred_command_status),
+            drain_shutdown: self.drain_shutdown.clone(),
+            source: None,
         }
     }
 
@@ -71,18 +72,8 @@ impl EventBus {
             .is_ok()
     }
 
-    /// Emit workflow completion phases and statuses after output has drained.
-    /// Buses with no deferred completion notifications do nothing.
-    pub fn emit_deferred_command_status(&self) {
-        let payloads = std::mem::take(
-            &mut *self
-                .deferred_command_status
-                .lock()
-                .expect("deferred command status lock poisoned"),
-        );
-        for payload in payloads {
-            self.sender().emit(payload);
-        }
+    pub fn close_output_drains(&self) {
+        self.drain_shutdown.cancel();
     }
 
     /// Register the sole persistence consumer before emitting any events.
@@ -106,12 +97,64 @@ pub struct EventBusSender {
     publication: Arc<Mutex<Publication>>,
     attempt: u32,
     drains: TaskTracker,
-    deferred_command_status: Arc<Mutex<Vec<EventPayload>>>,
+    drain_shutdown: tokio_util::sync::CancellationToken,
+    /// Stamped on every event this sender emits (WI 0137 §5). `None` on the
+    /// bus's root sender; set by [`EventBusSender::with_source`] or
+    /// [`EventBusSender::with_shared_source`].
+    source: Option<SourceStamp>,
+}
+
+/// What a sender stamps: a fixed source, or one shared with whoever can
+/// still learn more about it (a container that has not reported its name).
+#[derive(Clone)]
+enum SourceStamp {
+    Fixed(EventSource),
+    Shared(Arc<Mutex<EventSource>>),
+}
+
+impl SourceStamp {
+    fn current(&self) -> EventSource {
+        match self {
+            Self::Fixed(source) => source.clone(),
+            Self::Shared(cell) => cell.lock().expect("event source lock poisoned").clone(),
+        }
+    }
 }
 
 impl EventBusSender {
+    pub fn output_shutdown(&self) -> tokio_util::sync::CancellationToken {
+        self.drain_shutdown.clone()
+    }
+
     pub fn attempt(&self) -> u32 {
         self.attempt
+    }
+
+    /// A sender that attributes everything it emits to `source` (WI 0137
+    /// §5). Sequence numbers and the log stay shared with the bus; only the
+    /// envelope's `source` differs. A per-container sink or a per-step
+    /// frontend call site takes one of these instead of the root sender.
+    pub fn with_source(&self, source: EventSource) -> Self {
+        Self {
+            source: Some(SourceStamp::Fixed(source)),
+            ..self.clone()
+        }
+    }
+
+    /// A sender that stamps whatever `cell` holds at the moment of each
+    /// emit. A container's output drains are created with one so that the
+    /// container name, reported after the drains exist on some runtimes,
+    /// still reaches every line.
+    pub fn with_shared_source(&self, cell: Arc<Mutex<EventSource>>) -> Self {
+        Self {
+            source: Some(SourceStamp::Shared(cell)),
+            ..self.clone()
+        }
+    }
+
+    /// The source this sender stamps right now, if any.
+    pub fn source(&self) -> Option<EventSource> {
+        self.source.as_ref().map(SourceStamp::current)
     }
 
     /// Spawn an output drain tracked by the bus's completion barrier.
@@ -122,19 +165,23 @@ impl EventBusSender {
         self.drains.spawn(future)
     }
 
-    /// Save completion notifications in order, including nested workflows.
-    /// The worker publishes them after all output drains finish.
-    pub fn defer_workflow_completion(&self, phase: EventPayload, status: EventPayload) {
-        self.deferred_command_status
-            .lock()
-            .expect("deferred command status lock poisoned")
-            .extend([phase, status]);
-    }
-
     pub fn emit(&self, payload: EventPayload) {
         // Allocation and both publications are one operation across all
         // producer clones. No cursor can overtake an earlier event.
         let mut publication = self.publication.lock().expect("publication lock poisoned");
+        self.publish(&mut publication, payload);
+    }
+
+    /// Publish the final status and Done under one lock so even a timed-out
+    /// output drain cannot interleave output between the terminal pair.
+    pub fn finish(&self, status: EventPayload) {
+        debug_assert!(matches!(status, EventPayload::CommandStatus { .. }));
+        let mut publication = self.publication.lock().expect("publication lock poisoned");
+        self.publish(&mut publication, status);
+        self.publish(&mut publication, EventPayload::Done);
+    }
+
+    fn publish(&self, publication: &mut Publication, payload: EventPayload) {
         if publication.finished {
             return;
         }
@@ -143,6 +190,7 @@ impl EventBusSender {
             timestamp: chrono::Utc::now(),
             attempt: self.attempt,
             sequence: publication.next_sequence,
+            source: self.source(),
             payload,
         };
         publication.next_sequence += 1;
@@ -197,6 +245,34 @@ mod tests {
         }
         assert!(live.try_recv().is_err());
         assert!(log.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn sender_with_source_stamps_its_events_and_shares_the_sequence() {
+        use crate::data::execution_event::EventSourcePhase;
+
+        let bus = EventBus::new(16);
+        let mut rx = bus.subscribe();
+        let root = bus.sender();
+        let step = root.with_source(EventSource::step(EventSourcePhase::Main, "tests", 1));
+
+        root.emit(EventPayload::StdoutLine("root".into()));
+        step.emit(EventPayload::StdoutLine("step".into()));
+        root.emit(EventPayload::Done);
+
+        let first = rx.recv().await.unwrap();
+        assert_eq!(first.sequence, 0);
+        assert!(first.source.is_none());
+        let second = rx.recv().await.unwrap();
+        assert_eq!(second.sequence, 1);
+        assert_eq!(
+            second.source.as_ref().and_then(|s| s.step_name.as_deref()),
+            Some("tests")
+        );
+        assert_eq!(step.source().map(|s| s.step_index), Some(Some(1)));
+        let done = rx.recv().await.unwrap();
+        assert_eq!(done.sequence, 2);
+        assert!(done.source.is_none());
     }
 
     #[tokio::test]

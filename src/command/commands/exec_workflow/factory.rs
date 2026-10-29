@@ -31,6 +31,11 @@ pub(crate) struct AgentFrontendProxy {
     /// A second take would make the TUI build fresh channels and move the
     /// keyboard onto them while the agent still reads the first set.
     io_taken: bool,
+    output_format: crate::data::agent_output_format::AgentOutputFormat,
+    /// This container's event attribution (WI 0137 §5), lent to the shared
+    /// frontend for the duration of every forwarded call. The container
+    /// name is filled in here when the runtime reports `Running`.
+    source: Option<crate::engine::workflow::frontend::ContainerSource>,
 }
 
 impl AgentFrontendProxy {
@@ -40,8 +45,40 @@ impl AgentFrontendProxy {
             acp,
             io: None,
             io_taken: false,
+            output_format: Default::default(),
+            source: None,
         }
     }
+
+    /// Attribute this container's events to `source`.
+    pub(crate) fn with_source(mut self, source: crate::data::execution_event::EventSource) -> Self {
+        self.source = Some(std::sync::Arc::new(std::sync::Mutex::new(source)));
+        self
+    }
+
+    /// Run `operation` on the shared frontend with this container's source
+    /// set, under one lock so no other container's call sees it.
+    fn with_attributed<T>(
+        &self,
+        operation: impl FnOnce(&mut dyn ExecWorkflowCommandFrontend) -> T,
+    ) -> T {
+        let mut frontend = self.frontend.lock().unwrap();
+        attributed(&self.source, frontend.as_mut(), operation)
+    }
+}
+
+fn attributed<T>(
+    source: &Option<crate::engine::workflow::frontend::ContainerSource>,
+    frontend: &mut dyn ExecWorkflowCommandFrontend,
+    operation: impl FnOnce(&mut dyn ExecWorkflowCommandFrontend) -> T,
+) -> T {
+    if source.is_none() {
+        return operation(frontend);
+    }
+    frontend.set_container_source(source.clone());
+    let result = operation(&mut *frontend);
+    frontend.set_container_source(None);
+    result
 }
 
 #[async_trait]
@@ -51,26 +88,41 @@ impl AgentFrontend for AgentFrontendProxy {
             &status,
             crate::engine::agent_runtime::frontend::AgentStatus::Running { .. }
         );
+        if let (
+            Some(source),
+            crate::engine::agent_runtime::frontend::AgentStatus::Running { container_name },
+        ) = (&self.source, &status)
+        {
+            source.lock().unwrap().container = Some(container_name.clone());
+        }
         // One lock for both calls: a parallel step must not slip in between
         // the `Running` report and the matching `take_io`.
         let mut frontend = self.frontend.lock().unwrap();
-        frontend.report_status(status);
-        if is_running && !self.io_taken {
-            self.io = Some(frontend.take_io());
+        let take_io = is_running && !self.io_taken;
+        let io = attributed(&self.source, frontend.as_mut(), |frontend| {
+            frontend.report_status(status);
+            take_io.then(|| {
+                frontend.set_agent_output_format(self.output_format);
+                frontend.take_io()
+            })
+        });
+        if take_io {
+            self.io = io;
             self.io_taken = true;
         }
     }
 
     fn report_progress(&mut self, progress: crate::engine::agent_runtime::frontend::AgentProgress) {
-        self.frontend
-            .with(|frontend| frontend.report_progress(progress));
+        self.with_attributed(|frontend| frontend.report_progress(progress));
     }
 
     fn take_io(&mut self) -> crate::engine::agent_runtime::frontend::AgentIo {
-        let mut io = self
-            .io
-            .take()
-            .unwrap_or_else(|| self.frontend.with(|frontend| frontend.take_io()));
+        let mut io = self.io.take().unwrap_or_else(|| {
+            self.with_attributed(|frontend| {
+                frontend.set_agent_output_format(self.output_format);
+                frontend.take_io()
+            })
+        });
         self.io_taken = true;
         if self.acp {
             // ACP framing is line-delimited JSON, never a PTY stream.
@@ -78,6 +130,14 @@ impl AgentFrontend for AgentFrontendProxy {
             io.resize = None;
         }
         io
+    }
+
+    fn set_agent_output_format(
+        &mut self,
+        format: crate::data::agent_output_format::AgentOutputFormat,
+    ) {
+        // Lend the protocol atomically with take_io, just like attribution.
+        self.output_format = format;
     }
 
     fn grace_timeout(&self) -> std::time::Duration {
@@ -91,7 +151,7 @@ impl AgentFrontend for AgentFrontendProxy {
 
 impl UserMessageSink for AgentFrontendProxy {
     fn write_message(&mut self, msg: UserMessage) {
-        self.frontend.with(|frontend| frontend.write_message(msg));
+        self.with_attributed(|frontend| frontend.write_message(msg));
     }
 
     fn replay_queued(&mut self) {
@@ -132,6 +192,9 @@ pub(crate) struct CommandLayerFactory {
     pub(crate) launch_modes: Arc<HashMap<String, crate::data::config::repo::LaunchMode>>,
     /// Resolves each step's `agentFlags`; see [`workflow_agent_flags`].
     pub(crate) agent_flags: EffectiveConfig,
+    /// Mounted read-write at `/awman/output` into every step container
+    /// (WI 0137 §3). `None` outside the API.
+    pub(crate) output_dir: Option<PathBuf>,
 }
 
 /// The `agentFlags` resolver for every agent a workflow run launches.
@@ -274,6 +337,22 @@ impl CommandLayerFactory {
             &self.image_git_root,
             runtime.step_agent.as_str(),
         );
+        // Every step shares the command's one outputs directory (WI 0137 §3).
+        let mut directory_overlays = collected.directories;
+        let system_prompt = match self
+            .output_dir
+            .as_ref()
+            .filter(|_| self.engines.runtime.capabilities().arbitrary_host_mounts)
+        {
+            Some(dir) => {
+                directory_overlays.push(crate::data::fs::command_outputs::output_dir_overlay(dir));
+                Some(crate::engine::context_prompt::with_outputs_section(
+                    system_prompt,
+                    crate::engine::context_prompt::OutputsPromptRole::Step(&step.name),
+                ))
+            }
+            None => system_prompt,
+        };
         let run_opts = AgentRunOptions {
             yolo: self.flags.yolo.then_some(YoloMode::Enabled),
             auto: self.flags.auto.then_some(AutoMode::Enabled),
@@ -295,6 +374,7 @@ impl CommandLayerFactory {
             initial_prompt: Some(substitution.rendered),
             allow_docker: self.flags.allow_docker,
             non_interactive: self.flags.non_interactive,
+            structured_output: self.output_dir.is_some(),
             model: runtime.step_model.clone(),
             // Always `Some`: resolved here from the invoking session so the
             // engine never falls back to the worktree session's config.
@@ -304,7 +384,7 @@ impl CommandLayerFactory {
             } else {
                 Some(collected.env_passthrough)
             },
-            directory_overlays: collected.directories,
+            directory_overlays,
             include_all_skills: collected.include_all_skills,
             named_skills: collected.named_skills,
             image_tag_override: Some(correct_tag),
@@ -386,7 +466,8 @@ impl CommandLayerFactory {
         let proxy = AgentFrontendProxy::new(
             self.shared.clone(),
             run_opts.launch_mode == crate::data::config::repo::LaunchMode::Acp,
-        );
+        )
+        .with_source(runtime.source.clone());
         instance.run_with_frontend(Box::new(proxy))
     }
 }

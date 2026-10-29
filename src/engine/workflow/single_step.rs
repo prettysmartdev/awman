@@ -9,6 +9,19 @@
 use super::*;
 
 impl WorkflowEngine {
+    /// The attribution of a main step's container (WI 0137 §5): its index
+    /// in `WorkflowState.steps`, stable across attempts, and the 1-based
+    /// attempt this launch is.
+    pub(super) fn main_step_source(&self, step_name: &str, step_attempt: u32) -> EventSource {
+        EventSource {
+            phase: EventSourcePhase::Main,
+            step_name: Some(step_name.to_string()),
+            step_index: self.state.step_index(step_name),
+            container: None,
+            step_attempt: Some(step_attempt),
+        }
+    }
+
     /// One iteration of the sequential (single-step) path: launch the first
     /// ready step, drive its interactive lifecycle (mid-step WCB, yolo, stuck),
     /// handle failure, then present the inter-step Workflow Control Board.
@@ -161,6 +174,7 @@ impl WorkflowEngine {
             "workflow_engine resolved step parameters"
         );
 
+        let step_attempt = self.state.record_step_launch(&step.name);
         let workflow_step_info = self.build_workflow_step_info(&step.name);
         let runtime = WorkflowRuntimeContext {
             step_agent: resolved_agent.clone(),
@@ -169,6 +183,7 @@ impl WorkflowEngine {
             session_id: self.session.id(),
             workflow_invocation_id: self.state.invocation_id,
             workflow_step_info,
+            source: self.main_step_source(&step.name, step_attempt),
         };
 
         self.frontend.report_step_interactive_launch(
@@ -179,6 +194,8 @@ impl WorkflowEngine {
 
         self.state
             .set_status(&step.name, StepState::Running { container_id: None });
+        self.frontend
+            .report_step_launching(&step.name, step_attempt);
         self.frontend
             .report_step_status(&step, WorkflowStepStatus::Running);
         self.persist()?;

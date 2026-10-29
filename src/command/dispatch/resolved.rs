@@ -527,6 +527,11 @@ pub struct BuildContext<'a> {
     /// (`exec workflow`, `exec prompt`) observe it; a never-fired token unless
     /// the caller used `Dispatch::with_cancellation` (only the API worker does).
     pub cancel: tokio_util::sync::CancellationToken,
+    /// The host directory to mount read-write at `/awman/output` into every
+    /// agent container the command launches (WI 0137 §3). Set only by the
+    /// API queue worker (`Dispatch::with_output_dir`); `None` means no
+    /// outputs directory, which is what the CLI and TUI get.
+    pub output_dir: Option<std::path::PathBuf>,
 }
 
 impl BuildContext<'_> {

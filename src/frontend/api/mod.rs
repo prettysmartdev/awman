@@ -1,8 +1,10 @@
 //! API HTTP frontend — router, listener, signal handling, and serving only.
 
 pub mod command_frontend;
+pub mod outputs;
 pub mod routes;
 pub mod serve;
+pub mod workflow_view;
 
 use std::sync::Arc;
 

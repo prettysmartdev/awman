@@ -478,14 +478,285 @@ impl CommandError {
     }
 }
 
+/// The post-admission stages a queued command can fail in, as the API
+/// reports them in `result.failure.stage` (WI 0137 §1). Engine outcomes and
+/// post-command stages the queue worker names itself (`step`, `teardown`,
+/// `push`, `setup`) use the same spellings.
+pub mod failure_stages {
+    /// `/v1/runs` session setup, before the command ran.
+    pub const SETUP: &str = "setup";
+    /// After admission, before any container started: argument resolution,
+    /// agent lookup, an existing worktree, a missing resource.
+    pub const PREFLIGHT: &str = "preflight";
+    /// An unresolved workflow prerequisite (WI 0149).
+    pub const WORKFLOW_PREREQUISITES: &str = "workflow_prerequisites";
+    /// While the command's own work ran: the `exec prompt` agent, or a
+    /// main-phase workflow step.
+    pub const STEP: &str = "step";
+    /// A workflow teardown step.
+    pub const TEARDOWN: &str = "teardown";
+    /// Worktree merge-back.
+    pub const MERGE: &str = "merge";
+    /// Remote-session push-back.
+    pub const PUSH: &str = "push";
+}
+
 impl CommandError {
     /// The pipeline stage a failure belongs to, reported by the API as
-    /// `error.stage`. `None` for failures with no named stage.
-    pub fn stage(&self) -> Option<&'static str> {
+    /// `result.failure.stage` and the legacy `result.stage` (WI 0137 §1).
+    ///
+    /// Every variant names a stage: usage, lookup and configuration failures
+    /// happen before any container starts (`preflight`); merge-back failures
+    /// are `merge`; an unresolved prerequisite is `workflow_prerequisites`;
+    /// anything raised while the command's work was running — engine and
+    /// data failures, an abort, the catch-alls — is `step`. The match is
+    /// exhaustive on purpose: a new variant must pick its stage here.
+    pub fn stage(&self) -> &'static str {
+        use failure_stages::*;
         match self {
-            CommandError::WorkflowPrerequisitesUnresolved { .. } => Some("workflow_prerequisites"),
-            _ => None,
+            CommandError::WorkflowPrerequisitesUnresolved { .. } => WORKFLOW_PREREQUISITES,
+
+            CommandError::MergeConflict { .. } | CommandError::MergeTargetDirty { .. } => MERGE,
+
+            CommandError::Engine(EngineError::UnknownAgent { .. })
+            | CommandError::Engine(EngineError::AgentDefinitionUntrusted { .. })
+            | CommandError::WorktreeExists { .. }
+            | CommandError::UnknownCommand { .. }
+            | CommandError::NotAvailableForFrontend { .. }
+            | CommandError::UnknownFlag { .. }
+            | CommandError::MissingRequiredFlag { .. }
+            | CommandError::MissingRequiredArgument { .. }
+            | CommandError::UnexpectedArgument { .. }
+            | CommandError::MutuallyExclusive { .. }
+            | CommandError::InvalidFlagValue { .. }
+            | CommandError::InvalidArgumentValue { .. }
+            | CommandError::CommandBoxParse(_)
+            | CommandError::MissingRemoteAddress
+            | CommandError::MissingApiKey
+            | CommandError::ApiWorkdirNotFound { .. }
+            | CommandError::ApiWorkdirRootInvalid { .. }
+            | CommandError::ApiServerAlreadyRunning { .. }
+            | CommandError::ApiServerNotRunning
+            | CommandError::ApiServerAuthMissing
+            | CommandError::SquadKeyMissing
+            | CommandError::SessionInvalidType { .. }
+            | CommandError::SessionWorkdirRequired
+            | CommandError::SessionWorkdirUnresolvable { .. }
+            | CommandError::SessionWorkdirNotAllowed { .. }
+            | CommandError::SessionRepoUrlRequired
+            | CommandError::SessionRepoUrlEmpty
+            | CommandError::SessionRepoUrlInvalidScheme { .. }
+            | CommandError::SessionFieldRemoteOnly { .. }
+            | CommandError::SessionFieldRequiresBranch { .. }
+            | CommandError::SessionRefInvalid { .. }
+            | CommandError::RemoteSessionMissing
+            | CommandError::WorkItemNotFound { .. }
+            | CommandError::SpecTemplateMissing { .. }
+            | CommandError::InvalidOverlaySpec { .. }
+            | CommandError::UnknownConfigField { .. }
+            | CommandError::InteractiveInputUnavailable { .. }
+            | CommandError::WorkflowFileNotFound { .. }
+            | CommandError::PrerequisiteWideningRefused { .. }
+            | CommandError::PrerequisiteFlagUnsupported { .. }
+            | CommandError::AgentNotFound { .. }
+            | CommandError::AgentNoLongerRunning { .. }
+            | CommandError::AgentNotRunning { .. }
+            | CommandError::AgentReplaced { .. }
+            | CommandError::AgentAmbiguous { .. }
+            | CommandError::AgentReferenceEmpty
+            | CommandError::NotImplemented(_) => PREFLIGHT,
+
+            CommandError::Engine(_)
+            | CommandError::Data(_)
+            | CommandError::Aborted
+            | CommandError::RemoteTimeout
+            | CommandError::RemoteConnectionRefused(_)
+            | CommandError::RemoteHttpStatus { .. }
+            | CommandError::MalformedSseEvent(_)
+            | CommandError::RemoteTransport(_)
+            | CommandError::RemoteSessionKillFailed { .. }
+            | CommandError::AgentOwnerGone { .. }
+            | CommandError::Other(_) => STEP,
         }
+    }
+
+    /// A stable snake_case code for this failure, reported by the API as
+    /// `result.failure.code` (WI 0137 §1) so clients stop matching message
+    /// text. Variants a client can act on get their own code; the rest share
+    /// a class code (`invalid_usage`, `not_found`, `internal`). Codes for
+    /// outcomes that are not `CommandError`s (`step_failed`,
+    /// `teardown_failed`, `push_failed`, `setup_failed`, `cancelled`) live in
+    /// `crate::data::fs::api_db::failure_codes`. Exhaustive on purpose.
+    pub fn code(&self) -> &'static str {
+        match self {
+            CommandError::WorktreeExists { .. } => "worktree_exists",
+            CommandError::MergeConflict { .. } => "merge_conflict",
+            CommandError::MergeTargetDirty { .. } => "merge_target_dirty",
+            CommandError::WorkflowPrerequisitesUnresolved { .. } => {
+                "workflow_prerequisites_unresolved"
+            }
+            CommandError::Engine(EngineError::UnknownAgent { .. }) => "unknown_agent",
+            CommandError::Engine(EngineError::AgentDefinitionUntrusted { .. }) => "agent_untrusted",
+            CommandError::Aborted => "aborted",
+
+            CommandError::UnknownCommand { .. }
+            | CommandError::NotAvailableForFrontend { .. }
+            | CommandError::UnknownFlag { .. }
+            | CommandError::MissingRequiredFlag { .. }
+            | CommandError::MissingRequiredArgument { .. }
+            | CommandError::UnexpectedArgument { .. }
+            | CommandError::MutuallyExclusive { .. }
+            | CommandError::InvalidFlagValue { .. }
+            | CommandError::InvalidArgumentValue { .. }
+            | CommandError::CommandBoxParse(_)
+            | CommandError::InvalidOverlaySpec { .. }
+            | CommandError::UnknownConfigField { .. }
+            | CommandError::InteractiveInputUnavailable { .. }
+            | CommandError::PrerequisiteWideningRefused { .. }
+            | CommandError::PrerequisiteFlagUnsupported { .. }
+            | CommandError::SessionInvalidType { .. }
+            | CommandError::SessionWorkdirRequired
+            | CommandError::SessionWorkdirUnresolvable { .. }
+            | CommandError::SessionWorkdirNotAllowed { .. }
+            | CommandError::ApiWorkdirRootInvalid { .. }
+            | CommandError::SessionRepoUrlRequired
+            | CommandError::SessionRepoUrlEmpty
+            | CommandError::SessionRepoUrlInvalidScheme { .. }
+            | CommandError::SessionFieldRemoteOnly { .. }
+            | CommandError::SessionFieldRequiresBranch { .. }
+            | CommandError::SessionRefInvalid { .. }
+            | CommandError::AgentAmbiguous { .. }
+            | CommandError::AgentReferenceEmpty => "invalid_usage",
+
+            CommandError::WorkItemNotFound { .. }
+            | CommandError::SpecTemplateMissing { .. }
+            | CommandError::WorkflowFileNotFound { .. }
+            | CommandError::ApiWorkdirNotFound { .. }
+            | CommandError::AgentNotFound { .. }
+            | CommandError::AgentNoLongerRunning { .. }
+            | CommandError::AgentNotRunning { .. }
+            | CommandError::AgentReplaced { .. } => "not_found",
+
+            CommandError::Engine(_)
+            | CommandError::Data(_)
+            | CommandError::MissingRemoteAddress
+            | CommandError::MissingApiKey
+            | CommandError::RemoteTimeout
+            | CommandError::RemoteConnectionRefused(_)
+            | CommandError::RemoteHttpStatus { .. }
+            | CommandError::MalformedSseEvent(_)
+            | CommandError::RemoteTransport(_)
+            | CommandError::ApiServerAlreadyRunning { .. }
+            | CommandError::ApiServerNotRunning
+            | CommandError::ApiServerAuthMissing
+            | CommandError::SquadKeyMissing
+            | CommandError::RemoteSessionMissing
+            | CommandError::RemoteSessionKillFailed { .. }
+            | CommandError::AgentOwnerGone { .. }
+            | CommandError::NotImplemented(_)
+            | CommandError::Other(_) => "internal",
+        }
+    }
+}
+
+#[cfg(test)]
+mod failure_classification_tests {
+    use super::*;
+
+    #[test]
+    fn every_failure_has_a_stage_and_a_snake_case_code() {
+        let cases: Vec<(CommandError, &str, &str)> = vec![
+            (
+                CommandError::WorktreeExists {
+                    path: "/w".into(),
+                    branch: "b".into(),
+                },
+                "preflight",
+                "worktree_exists",
+            ),
+            (
+                CommandError::MergeConflict {
+                    branch: "b".into(),
+                    worktree_path: "/w".into(),
+                    git_root: "/r".into(),
+                },
+                "merge",
+                "merge_conflict",
+            ),
+            (
+                CommandError::MergeTargetDirty {
+                    target_branch: "main".into(),
+                    branch: "b".into(),
+                    worktree_path: "/w".into(),
+                },
+                "merge",
+                "merge_target_dirty",
+            ),
+            (
+                CommandError::Engine(EngineError::UnknownAgent {
+                    name: "pi".into(),
+                    first_party: vec![],
+                    custom: vec![],
+                    notes: vec![],
+                }),
+                "preflight",
+                "unknown_agent",
+            ),
+            (
+                CommandError::Engine(EngineError::AgentDefinitionUntrusted {
+                    name: "pi".into(),
+                    path: "/x".into(),
+                    sha256: "ab".into(),
+                }),
+                "preflight",
+                "agent_untrusted",
+            ),
+            (CommandError::Aborted, "step", "aborted"),
+            (CommandError::Other("boom".into()), "step", "internal"),
+            (
+                CommandError::Engine(EngineError::Other("boom".into())),
+                "step",
+                "internal",
+            ),
+            (
+                CommandError::MissingRequiredArgument {
+                    command: vec!["prompt".into()],
+                    argument: "prompt".into(),
+                },
+                "preflight",
+                "invalid_usage",
+            ),
+            (
+                CommandError::WorkflowFileNotFound { path: "/w".into() },
+                "preflight",
+                "not_found",
+            ),
+        ];
+        for (error, stage, code) in cases {
+            assert_eq!(error.stage(), stage, "{error}");
+            assert_eq!(error.code(), code, "{error}");
+            assert!(
+                code.bytes().all(|b| b.is_ascii_lowercase() || b == b'_'),
+                "{code} is not snake_case"
+            );
+        }
+    }
+
+    #[test]
+    fn unresolved_prerequisites_keep_their_stage() {
+        let error = CommandError::WorkflowPrerequisitesUnresolved {
+            report: Box::new(
+                crate::data::workflow_prerequisites::WorkflowPrerequisiteReport {
+                    phase: crate::data::workflow_prerequisites::PrerequisitePhase::BeforeTeardown,
+                    origin: crate::data::workflow_prerequisites::PrerequisiteOrigin::AssumedAll,
+                    checks: vec![],
+                    advisories: vec![],
+                    notes: vec![],
+                },
+            ),
+        };
+        assert_eq!(error.stage(), "workflow_prerequisites");
+        assert_eq!(error.code(), "workflow_prerequisites_unresolved");
     }
 }
 

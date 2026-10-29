@@ -16,6 +16,7 @@ use crate::data::worktree_paths::{
 };
 use crate::engine::error::{EngineError, MergeFailedDetail};
 
+mod command_result;
 pub mod frontend;
 mod host_command;
 pub mod remote_push;

@@ -50,7 +50,16 @@ When you run `exec workflow --dynamic`, awman follows these steps:
 8. **Build missing images** — for any agent referenced in the generated workflow that has a `Dockerfile.<agent>` but no built image, awman builds the image automatically before starting the workflow
 9. **Execute the workflow** — runs the generated workflow exactly as if you had written it yourself and passed it to `exec workflow --yolo --work-item 42`
 
-The leader may write only in the context directory. The checkout is mounted read-only when the runtime supports it. A guard compares HEAD and source-file contents before and after the leader runs, including already dirty and untracked files; a change aborts the dynamic run before the generated workflow executes.
+The leader may write in the context directory and, for API runs on runtimes with host directory mounts, `/awman/output`. The checkout is mounted read-only when the runtime supports it. A guard compares HEAD and source-file contents before and after the leader runs, including already dirty and untracked files; a change aborts the dynamic run before the generated workflow executes.
+
+When a dynamic workflow runs through the API server, the leader and generated
+agent steps can write machine-readable results and generated files under
+`/awman/output`. All steps share the command's output directory. Parallel
+steps should use a subdirectory named for the step (for example,
+`/awman/output/tests/`) so their files do not collide. The API server exposes
+these files through the [command outputs endpoints](09-api-and-remote-mode.md#list-and-retrieve-command-outputs).
+The output directory has no hard quota and has the same disk exposure as the
+workspace; its files are not redacted.
 
 ### Dynamic workflows in remote sessions
 

@@ -1594,3 +1594,43 @@ async fn step_unstuck_outside_countdown_is_ignored() {
     let result = engine_task.await.unwrap().unwrap();
     assert_eq!(result, WorkflowOutcome::Completed);
 }
+
+#[tokio::test]
+async fn resumed_definition_additions_and_reordering_use_authoritative_step_indices() {
+    let tmp = tempfile::tempdir().unwrap();
+    let session = make_session(&tmp);
+    let before = make_workflow(
+        Some("index-drift"),
+        Some("claude"),
+        vec![make_step("beta", &[], None)],
+    );
+    let mut engine = make_engine_with_frontend(
+        &session,
+        before,
+        FakeAgentExecutionFactory::always_success(),
+        FakeWorkflowFrontend::new([]),
+    );
+    engine.step_once().await.unwrap();
+    let after = make_workflow(
+        Some("index-drift"),
+        Some("claude"),
+        vec![make_step("alpha", &[], None), make_step("beta", &[], None)],
+    );
+    let engine = WorkflowEngine::resume(
+        &session,
+        WorkflowSpec::new(after),
+        WorkflowEngineDeps {
+            frontend: Box::new(FakeWorkflowFrontend::new([])),
+            agent_factory: Box::new(FakeAgentExecutionFactory::always_success()),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(engine.state().step_index("alpha"), Some(0));
+    assert_eq!(engine.state().step_index("beta"), Some(1));
+    assert_eq!(engine.state().status_of("alpha"), Some(&StepState::Pending));
+    assert_eq!(
+        engine.state().status_of("beta"),
+        Some(&StepState::Succeeded)
+    );
+}

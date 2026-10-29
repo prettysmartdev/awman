@@ -1927,9 +1927,9 @@ fn build_leader_prompt_includes_developer_guidance_section_when_present() {
         Some(&guidance),
     );
     assert!(
-            prompt.contains("## Developer Guidance"),
-            "prompt must include the Developer Guidance heading when guidance is present, got: {prompt}"
-        );
+        prompt.contains("## Developer Guidance"),
+        "prompt must include the Developer Guidance heading when guidance is present, got: {prompt}"
+    );
     assert!(
         prompt.contains("- never spawn more than two agents in parallel"),
         "prompt must render the first guidance entry as a bullet, got: {prompt}"
@@ -2958,9 +2958,9 @@ fn repair_prompt_substitution_contains_verbatim_validation_error() {
     let error_msg = "workflow.toml references agents with no Dockerfile: \"gemini\"";
     let repair_prompt = crate::data::dynamic_workflow_assets::build_repair_prompt(error_msg);
     assert!(
-            repair_prompt.contains(error_msg),
-            "repair prompt must contain the verbatim validation error from Workflow::load(), got: {repair_prompt}"
-        );
+        repair_prompt.contains(error_msg),
+        "repair prompt must contain the verbatim validation error from Workflow::load(), got: {repair_prompt}"
+    );
 }
 
 // ── Integration: dynamicWorkflows config → leader prompt (WI-0095) ────────
@@ -3633,6 +3633,9 @@ fn remote_dynamic_resume_finds_the_saved_run_under_the_clone() {
 struct RecordingRuntime {
     caps: crate::engine::agent_runtime::Capabilities,
     launches: Mutex<Vec<Vec<String>>>,
+    resolved: Mutex<Vec<crate::engine::container::options::ResolvedContainerOptions>>,
+    prompts: Mutex<Vec<String>>,
+    sandbox_launches: Mutex<Vec<crate::engine::sandbox::ResolvedSandboxOptions>>,
 }
 
 impl RecordingRuntime {
@@ -3642,6 +3645,9 @@ impl RecordingRuntime {
                 .capabilities()
                 .clone(),
             launches: Mutex::new(Vec::new()),
+            resolved: Mutex::new(Vec::new()),
+            prompts: Mutex::new(Vec::new()),
+            sandbox_launches: Mutex::new(Vec::new()),
         }
     }
 }
@@ -3663,9 +3669,46 @@ impl crate::engine::agent_runtime::AgentRuntimeEngine for RecordingRuntime {
         &self,
         options: crate::engine::agent_runtime::ResolvedAgentOptions,
     ) -> Result<Box<dyn crate::engine::agent_runtime::AgentInstance>, EngineError> {
-        let crate::engine::agent_runtime::ResolvedAgentOptions::Container(o) = options else {
-            panic!("expected container options");
+        let o = match options {
+            crate::engine::agent_runtime::ResolvedAgentOptions::Container(o) => o,
+            crate::engine::agent_runtime::ResolvedAgentOptions::Sandbox(o) => {
+                let prompt = o
+                    .system_prompt_file
+                    .as_ref()
+                    .map(|(p, _, _)| std::fs::read_to_string(p).unwrap())
+                    .or_else(|| {
+                        o.system_prompt_inline
+                            .as_ref()
+                            .map(|(_, text)| text.clone())
+                    })
+                    .or_else(|| {
+                        o.system_prompt_env_file
+                            .as_ref()
+                            .map(|(_, p, _)| std::fs::read_to_string(p).unwrap())
+                    })
+                    .unwrap_or_default();
+                self.prompts.lock().unwrap().push(prompt);
+                self.sandbox_launches.lock().unwrap().push(o);
+                return Err(EngineError::Other("recorded sandbox".into()));
+            }
         };
+        let prompt = o
+            .system_prompt_file
+            .as_ref()
+            .map(|(p, _, _)| std::fs::read_to_string(p).unwrap())
+            .or_else(|| {
+                o.system_prompt_inline
+                    .as_ref()
+                    .map(|(_, text)| text.clone())
+            })
+            .or_else(|| {
+                o.system_prompt_env_file
+                    .as_ref()
+                    .map(|(_, p, _)| std::fs::read_to_string(p).unwrap())
+            })
+            .unwrap_or_default();
+        self.prompts.lock().unwrap().push(prompt);
+        self.resolved.lock().unwrap().push(o.clone());
         let mut argv = o.entrypoint.map(|e| e.0).unwrap_or_default();
         argv.extend(o.agent_flags);
         self.launches.lock().unwrap().push(argv);
@@ -4731,4 +4774,103 @@ async fn credentialed_interactive_phase_uses_filtered_execution_instead_of_raw_a
         .exec("true", None)
         .unwrap();
     assert_eq!(output.exit_code, 0);
+}
+
+#[tokio::test]
+async fn static_workflow_launch_mounts_the_command_outputs_and_keeps_saved_files() {
+    run_outputs_workflow(true).await;
+}
+
+#[tokio::test]
+async fn sandbox_workflows_warn_and_do_not_advertise_an_unmounted_output_path() {
+    run_outputs_workflow(false).await;
+}
+
+async fn run_outputs_workflow(mounts: bool) {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, wf) = agent_flags_workflow_repo(tmp.path(), CLAUDE_STEP);
+    let mut runtime = RecordingRuntime::new();
+    if !mounts {
+        runtime.caps.arbitrary_host_mounts = false;
+        runtime.caps.kit_declarative = true;
+        runtime.caps.has_image_store = false;
+        runtime.caps.image_acquisition = crate::engine::agent_runtime::ImageAcquisition::Kit;
+    }
+    let runtime = Arc::new(runtime);
+    let mut engines = Engines::for_tests(&tmp.path().join("home"));
+    engines.runtime = runtime.clone();
+    engines.agent_engine = Arc::new(crate::engine::agent::AgentEngine::new(
+        engines.overlay_engine.clone(),
+        runtime.clone(),
+    ));
+    engines.workflow_state_store = Arc::new(crate::data::WorkflowStateStore::at_git_root(&repo));
+    let session = Session::for_tests_isolated(&repo, &tmp.path().join("config-home"));
+    let output = tmp.path().join("api/sessions/s/commands/c/output");
+    std::fs::create_dir_all(&output).unwrap();
+    std::fs::write(output.join("saved.json"), "{}").unwrap();
+    let flags = ExecWorkflowCommandFlags {
+        prerequisites: Default::default(),
+        squad_task_prerequisites: None,
+        workflow: Some(wf),
+        work_item: None,
+        non_interactive: true,
+        plan: false,
+        allow_docker: false,
+        worktree: false,
+        yolo: false,
+        auto: false,
+        agent: None,
+        model: None,
+        launch_mode: None,
+        overlay: vec![],
+        agent_flags: None,
+        max_concurrent: None,
+        issue_source: crate::engine::issue::IssueSourceFlags { issue: None },
+        dynamic: false,
+        leader: None,
+        on_dirty_merge_target: None,
+        on_merge_failure: None,
+        on_existing_worktree: None,
+    };
+    let cmd =
+        ExecWorkflowCommand::new(flags, engines, session).with_output_dir(Some(output.clone()));
+    let messages = Arc::new(Mutex::new(Vec::new()));
+    let _ = cmd
+        .run_with_frontend(Box::new(FakeExecWorkflowFrontend::with_shared_messages(
+            messages.clone(),
+        )))
+        .await;
+    assert!(output.join("saved.json").exists());
+    if !mounts {
+        let launches = runtime.sandbox_launches.lock().unwrap();
+        assert!(!launches.is_empty(), "the sandbox step reached build");
+        assert!(launches.iter().all(|launch| launch
+            .extra_overlays
+            .iter()
+            .all(|overlay| overlay.container_path != Path::new("/awman/output"))));
+        assert!(runtime
+            .prompts
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|prompt| !prompt.contains("/awman/output")));
+        assert!(messages.lock().unwrap().iter().any(|message| message
+            .text
+            .contains("Persistent command outputs are unavailable")));
+        return;
+    }
+    let launches = runtime.resolved.lock().unwrap();
+    let launch = launches.first().expect("a static step was launched");
+    let mount = launch
+        .overlays
+        .iter()
+        .find(|m| m.container_path == Path::new("/awman/output"))
+        .expect("step outputs mount");
+    assert_eq!(mount.host_path, output);
+    assert_eq!(
+        mount.permission,
+        crate::data::config::overlays::OverlayPermission::ReadWrite
+    );
+    let prompt = runtime.prompts.lock().unwrap()[0].clone();
+    assert!(prompt.contains("/awman/output"), "{prompt}");
 }

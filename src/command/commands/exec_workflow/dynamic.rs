@@ -1009,7 +1009,7 @@ impl ExecWorkflowCommand {
             skip_state_resume_prompt,
             prerequisites,
         };
-        execute_prepared(
+        execute_prepared_with_outputs(
             &effective_flags,
             &self.engines,
             prepared,
@@ -1019,6 +1019,7 @@ impl ExecWorkflowCommand {
             self.workflow_state_root.as_deref(),
             self.managed_session.as_ref(),
             &self.cancel,
+            self.output_dir.as_deref(),
         )
         .await
     }
@@ -1066,16 +1067,42 @@ impl ExecWorkflowCommand {
     ) -> Result<LeaderDriveOutcome, CommandError> {
         use crate::engine::agent_runtime::execution::{StuckEvent, KILLED_EXIT_CODE};
 
+        // The leader shares the command's outputs directory with the steps it
+        // designs (WI 0137 §3); it is created here, never cleared.
+        let mut directory_overlays = Vec::new();
+        let system_prompt = match self
+            .output_dir
+            .as_ref()
+            .filter(|_| self.engines.runtime.capabilities().arbitrary_host_mounts)
+        {
+            Some(dir) => {
+                crate::data::fs::command_outputs::prepare_output_dir(dir, false).map_err(|e| {
+                    CommandError::Other(format!(
+                        "exec workflow: failed to prepare the outputs directory {}: {e}",
+                        dir.display()
+                    ))
+                })?;
+                directory_overlays.push(crate::data::fs::command_outputs::output_dir_overlay(dir));
+                Some(crate::engine::context_prompt::with_outputs_section(
+                    system_prompt,
+                    crate::engine::context_prompt::OutputsPromptRole::Leader,
+                ))
+            }
+            None => system_prompt,
+        };
+
         let run_opts = AgentRunOptions {
             yolo: Some(YoloMode::Enabled),
             initial_prompt: Some(prompt.to_string()),
             model: model.map(|m| m.to_string()),
             allow_docker: self.flags.allow_docker,
             non_interactive: self.flags.non_interactive,
+            structured_output: self.output_dir.is_some(),
             image_tag_override: Some(crate::data::image_tags::agent_image_tag(
                 image_git_root,
                 agent.as_str(),
             )),
+            directory_overlays,
             system_prompt,
             context_overlays,
             // From the invoking session, not the worktree `session` (see
@@ -1132,7 +1159,11 @@ impl ExecWorkflowCommand {
         });
         shared.lock().unwrap().set_pty_active(true);
 
-        let proxy = AgentFrontendProxy::new(shared.clone(), false);
+        let proxy = AgentFrontendProxy::new(shared.clone(), false).with_source(
+            crate::data::execution_event::EventSource::phase(
+                crate::data::execution_event::EventSourcePhase::Leader,
+            ),
+        );
         let mut execution = match instance.run_with_frontend(Box::new(proxy)) {
             Ok(e) => e,
             Err(e) => {

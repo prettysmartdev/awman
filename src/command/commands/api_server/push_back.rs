@@ -53,6 +53,12 @@ pub(crate) struct PushBackError {
     pub message: String,
 }
 
+impl PushBackError {
+    pub fn code(&self) -> &'static str {
+        crate::data::fs::api_db::failure_codes::PUSH_FAILED
+    }
+}
+
 impl From<EngineError> for PushBackError {
     fn from(error: EngineError) -> Self {
         Self {
@@ -137,10 +143,15 @@ pub(crate) struct PushEventSink(pub EventBusSender);
 
 impl UserMessageSink for PushEventSink {
     fn write_message(&mut self, message: UserMessage) {
-        self.0.emit(EventPayload::StatusMessage {
-            phase: "push".into(),
-            message: message.text,
-        });
+        // Push output is attributed to the push phase (WI 0137 §5).
+        self.0
+            .with_source(crate::data::execution_event::EventSource::phase(
+                crate::data::execution_event::EventSourcePhase::Push,
+            ))
+            .emit(EventPayload::StatusMessage {
+                phase: "push".into(),
+                message: message.text,
+            });
     }
 
     fn replay_queued(&mut self) {}

@@ -447,6 +447,11 @@ pub fn substitute_teardown_step(
 /// engine carried two near-identical copies of every phase function. This
 /// trait is what lets one `run_phase` drive both.
 pub trait PhaseStepSpec: Sized {
+    /// Only create_pull_request interprets successful stdout as a PR URL.
+    fn creates_pull_request(&self) -> bool {
+        false
+    }
+
     /// Which phase steps of this type belong to. `run_phase` asserts (in
     /// debug builds) that its `kind` argument agrees.
     fn kind() -> PhaseKind;
@@ -513,6 +518,10 @@ impl PhaseStepSpec for SetupStep {
 }
 
 impl PhaseStepSpec for TeardownStep {
+    fn creates_pull_request(&self) -> bool {
+        matches!(self, TeardownStep::CreatePullRequest { .. })
+    }
+
     fn kind() -> PhaseKind {
         PhaseKind::Teardown
     }

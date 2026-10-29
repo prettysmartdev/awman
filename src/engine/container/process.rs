@@ -231,6 +231,9 @@ impl AgentInstance for ContainerInstance {
         let seeded = self.options.seeded_prompt.clone();
         let handle = handle_now(&self.id, &self.name, &self.image);
 
+        if self.options.agent_output_format.is_structured() {
+            frontend.set_agent_output_format(self.options.agent_output_format);
+        }
         frontend.report_status(
             crate::engine::agent_runtime::frontend::AgentStatus::Running {
                 container_name: self.name.0.clone(),

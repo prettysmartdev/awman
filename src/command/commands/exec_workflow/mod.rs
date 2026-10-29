@@ -351,6 +351,9 @@ pub struct ExecWorkflowCommand {
     cancel: tokio_util::sync::CancellationToken,
     /// Which frontend runs this command: picks the headless profile the
     /// workflow prerequisite flow answers from when nobody can be asked.
+    /// Mounted read-write at `/awman/output` into the leader and every step
+    /// container (WI 0137 §3). Set only under the API.
+    output_dir: Option<PathBuf>,
     frontend_kind: crate::command::dispatch::catalogue::FrontendKind,
 }
 
@@ -366,7 +369,15 @@ impl ExecWorkflowCommand {
             managed_session: None,
             cancel: tokio_util::sync::CancellationToken::new(),
             frontend_kind: crate::command::dispatch::catalogue::FrontendKind::Cli,
+            output_dir: None,
         }
+    }
+
+    /// Mount `dir` at `/awman/output` into every agent container of the run
+    /// (WI 0137 §3).
+    pub fn with_output_dir(mut self, dir: Option<PathBuf>) -> Self {
+        self.output_dir = dir;
+        self
     }
 
     /// Mirror this run's summary into the shared session it belongs to.
@@ -447,7 +458,8 @@ impl ExecWorkflowCommand {
         Ok(Self::new(flags, ctx.engines.clone(), ctx.session.clone())
             .with_frontend_kind(ctx.caller.frontend())
             .mirroring_into(Arc::clone(&ctx.managed_session))
-            .with_cancellation(ctx.cancel.clone()))
+            .with_cancellation(ctx.cancel.clone())
+            .with_output_dir(ctx.output_dir.clone()))
     }
 
     /// Carry a squad container identity so every generated-workflow step
@@ -515,6 +527,8 @@ impl ExecWorkflowCommand {
 mod dynamic;
 mod execute;
 mod factory;
+#[cfg(test)]
+pub(crate) use factory::AgentFrontendProxy;
 mod issue;
 mod phase_container;
 mod prepare;

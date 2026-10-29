@@ -962,6 +962,19 @@ The `--model` flag acts as the **default** for all steps without a `model` field
 
 Per-step `model` values are persisted in the workflow state file. On resume, the persisted model is used, not any `--model` flag passed on the resumed invocation. This matches the existing behaviour for `agent` fields and ensures the resumed run is identical to the original.
 
+### Output files in API workflows
+
+When a workflow is run through the API server, each agent step can write
+machine-readable results and generated files under `/awman/output`. The
+directory is shared by every step in that command. If steps run in parallel,
+write into a step-specific subdirectory to avoid collisions; for example, a
+step named `tests` should use `/awman/output/tests/`. The API server lists and
+serves these files through the [command outputs endpoints](09-api-and-remote-mode.md#list-and-retrieve-command-outputs).
+
+This mount is provided to API-backed agent steps on runtimes with host directory
+mounts (Docker, Apple Containers and builtin). Sandbox runtimes emit a warning
+and omit the output path. CLI and TUI workflow runs do not mount `/awman/output`.
+
 ---
 
 ## Running a workflow

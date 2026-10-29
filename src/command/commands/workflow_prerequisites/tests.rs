@@ -326,7 +326,7 @@ fn wi0149_headless_ask_fails_static_but_warns_for_assumed_all() {
         if origin == PrerequisiteOrigin::Static {
             let err = result.err().expect("static missing credential must fail");
             assert_eq!(err.exit_code(), 2);
-            assert_eq!(err.stage(), Some("workflow_prerequisites"));
+            assert_eq!(err.stage(), "workflow_prerequisites");
         } else {
             assert!(result.unwrap().grants.is_empty());
         }

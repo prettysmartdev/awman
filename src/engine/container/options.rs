@@ -6,6 +6,7 @@
 
 use std::path::PathBuf;
 
+use crate::data::agent_output_format::AgentOutputFormat;
 use crate::data::config::builtin_launch::BuiltinLaunchSettings;
 use crate::engine::auth::RefreshableCredentialDelivery;
 
@@ -141,6 +142,8 @@ pub enum ContainerOption {
     /// `interactive_seed_delivery` is `Flag`.
     InteractiveSeedFlag(String),
     Interactive(bool),
+    /// Structured stdout protocol for a non-interactive stdio launch.
+    AgentOutputFormat(AgentOutputFormat),
     /// Launch the agent over ACP (Agent Client Protocol) instead of raw
     /// container stdio. Selects the persistent-piped spawn path (`-i`, no PTY)
     /// so a newline-delimited JSON-RPC 2.0 channel can ride the container's
@@ -433,6 +436,9 @@ pub struct ResolvedContainerOptions {
     /// since opencode treats a bare positional as a project directory).
     pub interactive_seed_flag: Option<String>,
     pub interactive: bool,
+    /// The protocol actually selected by the launch builder (never inferred
+    /// from the agent name or by parsing stdout).
+    pub agent_output_format: AgentOutputFormat,
     /// When `true`, the runtime uses the persistent-piped spawn path (`-i`,
     /// never a PTY) so an ACP JSON-RPC channel can span the whole session.
     /// Default `false` keeps today's PTY/one-shot-piped behaviour unchanged.
@@ -516,6 +522,21 @@ impl ResolvedContainerOptions {
             &crate::data::config::env::host_var,
         )?;
         r.validate()?;
+        // Render through the existing shared argv tail on every container
+        // backend. ACP and interactive launches never receive structured flags.
+        if !r.interactive && !r.acp {
+            r.agent_mode_flags.extend(match r.agent_output_format {
+                AgentOutputFormat::Text => Vec::new(),
+                AgentOutputFormat::ClaudeStreamJson => vec![
+                    "--output-format".into(),
+                    "stream-json".into(),
+                    "--verbose".into(),
+                ],
+                AgentOutputFormat::CodexJson => vec!["--json".into()],
+            });
+        } else {
+            r.agent_output_format = AgentOutputFormat::Text;
+        }
         Ok(r)
     }
 
@@ -530,6 +551,7 @@ impl ResolvedContainerOptions {
             ContainerOption::SeededPrompt(v) => self.seeded_prompt = Some(v),
             ContainerOption::InteractiveSeedFlag(v) => self.interactive_seed_flag = Some(v),
             ContainerOption::Interactive(v) => self.interactive = v,
+            ContainerOption::AgentOutputFormat(v) => self.agent_output_format = v,
             ContainerOption::Acp(v) => self.acp = v,
             ContainerOption::AllowDocker(v) => self.allow_docker = v,
             ContainerOption::Yolo(v) => self.yolo = v,

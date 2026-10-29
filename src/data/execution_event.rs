@@ -4,6 +4,7 @@
 //! the API frontend's `EventBus` (Layer 3) for SSE streaming and logfile
 //! persistence. The engine layer (Layer 1) has no knowledge of these types.
 
+use crate::data::fs::api_db::CommandResult;
 use crate::data::workflow_prerequisites::{PrerequisitePhase, WorkflowPrerequisiteReport};
 
 use chrono::{DateTime, Utc};
@@ -22,6 +23,11 @@ pub struct ExecutionEvent {
     pub attempt: u32,
     /// Position within the attempt; restarts at 0 for every attempt.
     pub sequence: u64,
+    /// Where this event came from: the phase, step, container and retry
+    /// (WI 0137 §5). Absent on events that no step produced (queue notices,
+    /// the final `command_status`, `done`) and on lines written before 0137.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<EventSource>,
     pub payload: EventPayload,
 }
 
@@ -34,7 +40,144 @@ impl ExecutionEvent {
     pub fn cursor(&self) -> EventCursor {
         EventCursor::new(self.attempt, self.sequence)
     }
+
+    /// Whether this event belongs to a `?step=<name>` filtered stream
+    /// (WI 0137 §5): events attributed to that step pass, and so do the
+    /// command-level terminal events (`command_status`, `done`) that carry no
+    /// source, so a filtered client can still finish from the stream alone.
+    pub fn matches_step_filter(&self, step: &str) -> bool {
+        match &self.payload {
+            EventPayload::CommandStatus { .. } | EventPayload::Done => true,
+            _ => self
+                .source
+                .as_ref()
+                .and_then(|source| source.step_name.as_deref())
+                .is_some_and(|name| name == step),
+        }
+    }
 }
+
+/// The pipeline phase an event's producer belongs to (WI 0137 §5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EventSourcePhase {
+    /// The dynamic workflow's leader agent.
+    Leader,
+    /// A workflow `setup:` step.
+    Setup,
+    /// A main-phase agent step, or the `exec prompt` agent.
+    Main,
+    /// A workflow `teardown:` step.
+    Teardown,
+    /// Worktree merge-back.
+    Merge,
+    /// Remote-session push-back.
+    Push,
+}
+
+impl std::fmt::Display for EventSourcePhase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            EventSourcePhase::Leader => "leader",
+            EventSourcePhase::Setup => "setup",
+            EventSourcePhase::Main => "main",
+            EventSourcePhase::Teardown => "teardown",
+            EventSourcePhase::Merge => "merge",
+            EventSourcePhase::Push => "push",
+        };
+        f.write_str(s)
+    }
+}
+
+/// Attribution of one event to the step, container and retry that produced
+/// it (WI 0137 §5). Lives on the envelope so every payload — output lines,
+/// status messages, `step_activity`, terminal events — is attributed the
+/// same way without each variant defining its own copy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventSource {
+    pub phase: EventSourcePhase,
+    /// Absent for the leader and for shell setup/teardown output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_name: Option<String>,
+    /// The step's position in the workflow definition (`WorkflowState.steps`),
+    /// never a first-seen counter, so it is stable across attempts and
+    /// matches `GET /v1/workflows/{id}`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_index: Option<usize>,
+    /// Runtime container name, when one exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container: Option<String>,
+    /// 1-based; incremented by `on_failure` retries. Distinct from the
+    /// envelope's `attempt`, which counts executions after a daemon restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_attempt: Option<u32>,
+}
+
+impl EventSource {
+    /// A source with only its phase set.
+    pub fn phase(phase: EventSourcePhase) -> Self {
+        Self {
+            phase,
+            step_name: None,
+            step_index: None,
+            container: None,
+            step_attempt: None,
+        }
+    }
+
+    /// A main-phase step source. `container` and `step_attempt` are added
+    /// with the builder methods once known.
+    pub fn step(phase: EventSourcePhase, step_name: impl Into<String>, step_index: usize) -> Self {
+        Self {
+            phase,
+            step_name: Some(step_name.into()),
+            step_index: Some(step_index),
+            container: None,
+            step_attempt: None,
+        }
+    }
+
+    pub fn with_container(mut self, container: impl Into<String>) -> Self {
+        self.container = Some(container.into());
+        self
+    }
+
+    pub fn with_step_attempt(mut self, step_attempt: u32) -> Self {
+        self.step_attempt = Some(step_attempt);
+        self
+    }
+}
+
+/// What a structured-output agent is doing right now (WI 0137 §4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StepActivityKind {
+    /// The assistant produced (part of) a message.
+    Message,
+    /// The assistant invoked a tool.
+    ToolUse,
+    /// A tool returned.
+    ToolResult,
+    /// The assistant is thinking.
+    Thinking,
+}
+
+impl std::fmt::Display for StepActivityKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            StepActivityKind::Message => "message",
+            StepActivityKind::ToolUse => "tool_use",
+            StepActivityKind::ToolResult => "tool_result",
+            StepActivityKind::Thinking => "thinking",
+        };
+        f.write_str(s)
+    }
+}
+
+/// Longest `step_activity.summary` the translators emit, in characters. A
+/// summary is one bounded line, never a tool payload, so event volume stays
+/// bounded for a chatty agent.
+pub const STEP_ACTIVITY_SUMMARY_MAX_CHARS: usize = 200;
 
 /// A position in a command's event stream: `<attempt>:<sequence>`. This is the
 /// SSE `id:` of every persisted frame and the value of `Last-Event-ID` /
@@ -266,10 +409,24 @@ pub enum EventPayload {
     },
     /// A parallel group (WI-0096) has fully drained; all its steps completed.
     WorkflowParallelGroupFinished,
+    /// A structured-output agent did something (WI 0137 §4). `summary` is one
+    /// line of at most [`STEP_ACTIVITY_SUMMARY_MAX_CHARS`] characters. The
+    /// step it belongs to is the envelope's `source`.
+    StepActivity {
+        kind: StepActivityKind,
+        summary: String,
+    },
+    /// How the command ended. Emitted exactly once per command by the queue
+    /// worker, after the terminal row is written and before `Done`
+    /// (WI 0137 §2). `result` is the same object `GET
+    /// /v1/commands/{id}/status` returns; `status`, `exit_code` and `error`
+    /// are kept for clients that predate it.
     CommandStatus {
         status: CommandStatusKind,
         exit_code: Option<i32>,
         error: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        result: Option<Box<CommandResult>>,
     },
     Done,
 }
@@ -286,6 +443,7 @@ impl EventPayload {
             EventPayload::WorkflowParallelStepLaunched { .. } => "workflow_parallel_step_launched",
             EventPayload::WorkflowParallelStepExited { .. } => "workflow_parallel_step_exited",
             EventPayload::WorkflowParallelGroupFinished => "workflow_parallel_group_finished",
+            EventPayload::StepActivity { .. } => "step_activity",
             EventPayload::CommandStatus { .. } => "command_status",
             EventPayload::Done => "done",
         }
@@ -331,6 +489,9 @@ impl EventPayload {
             EventPayload::WorkflowParallelGroupFinished => {
                 Some("[parallel] group finished".to_string())
             }
+            // The activity feed is additive: `output.log` stays the agent's
+            // output lines only, exactly as before WI 0137.
+            EventPayload::StepActivity { .. } => None,
             EventPayload::CommandStatus {
                 status, exit_code, ..
             } => {
@@ -377,12 +538,105 @@ mod cursor_tests {
             timestamp: Utc::now(),
             attempt,
             sequence,
+            source: None,
             payload,
         }
     }
 
     fn line(n: &str) -> EventPayload {
         EventPayload::StdoutLine(n.into())
+    }
+
+    #[test]
+    fn source_is_omitted_when_absent_and_round_trips_when_present() {
+        let bare = serde_json::to_value(event(1, 0, line("x"))).unwrap();
+        assert!(bare.get("source").is_none());
+
+        let mut attributed = event(1, 1, line("y"));
+        attributed.source = Some(
+            EventSource::step(EventSourcePhase::Main, "tests", 2)
+                .with_container("awman-1")
+                .with_step_attempt(1),
+        );
+        let json = serde_json::to_value(&attributed).unwrap();
+        assert_eq!(json["source"]["phase"], "main");
+        assert_eq!(json["source"]["step_name"], "tests");
+        assert_eq!(json["source"]["step_index"], 2);
+        assert_eq!(json["source"]["container"], "awman-1");
+        assert_eq!(json["source"]["step_attempt"], 1);
+        let back: ExecutionEvent = serde_json::from_value(json).unwrap();
+        assert_eq!(back.source, attributed.source);
+
+        let leader = serde_json::to_value(EventSource::phase(EventSourcePhase::Leader)).unwrap();
+        assert_eq!(leader, serde_json::json!({"phase": "leader"}));
+    }
+
+    #[test]
+    fn step_filter_keeps_matching_steps_and_terminal_events() {
+        let mut tests = event(1, 0, line("a"));
+        tests.source = Some(EventSource::step(EventSourcePhase::Main, "tests", 0));
+        let mut docs = event(1, 1, line("b"));
+        docs.source = Some(EventSource::step(EventSourcePhase::Main, "docs", 1));
+        let unattributed = event(1, 2, line("c"));
+        let status = event(
+            1,
+            3,
+            EventPayload::CommandStatus {
+                status: CommandStatusKind::Done,
+                exit_code: Some(0),
+                error: None,
+                result: None,
+            },
+        );
+        let done = event(1, 4, EventPayload::Done);
+        assert!(tests.matches_step_filter("tests"));
+        assert!(!docs.matches_step_filter("tests"));
+        assert!(!unattributed.matches_step_filter("tests"));
+        assert!(status.matches_step_filter("tests"));
+        assert!(done.matches_step_filter("tests"));
+    }
+
+    #[test]
+    fn step_activity_is_typed_and_absent_from_plain_text() {
+        let payload = EventPayload::StepActivity {
+            kind: StepActivityKind::ToolUse,
+            summary: "Read src/main.rs".into(),
+        };
+        assert_eq!(payload.sse_event_type(), "step_activity");
+        assert_eq!(payload.to_plain_text(), None);
+        let json = serde_json::to_value(&payload).unwrap();
+        assert_eq!(json["type"], "StepActivity");
+        assert_eq!(json["data"]["kind"], "tool_use");
+    }
+
+    #[test]
+    fn command_status_result_is_omitted_when_absent_and_legacy_lines_parse() {
+        let without = serde_json::to_value(EventPayload::CommandStatus {
+            status: CommandStatusKind::Error,
+            exit_code: Some(1),
+            error: Some("boom".into()),
+            result: None,
+        })
+        .unwrap();
+        assert!(without["data"].get("result").is_none());
+        let legacy =
+            r#"{"type":"CommandStatus","data":{"status":"done","exit_code":0,"error":null}}"#;
+        let parsed: EventPayload = serde_json::from_str(legacy).unwrap();
+        assert!(matches!(
+            parsed,
+            EventPayload::CommandStatus { result: None, .. }
+        ));
+        let with = EventPayload::CommandStatus {
+            status: CommandStatusKind::Done,
+            exit_code: Some(0),
+            error: None,
+            result: Some(Box::new(CommandResult {
+                exit_code: Some(0),
+                ..CommandResult::default()
+            })),
+        };
+        let json = serde_json::to_value(&with).unwrap();
+        assert_eq!(json["data"]["result"]["exit_code"], 0);
     }
 
     #[test]

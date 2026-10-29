@@ -653,6 +653,8 @@ pub struct Dispatch<F: CommandFrontend> {
     squad_gateway: Option<Arc<dyn TaskGateway>>,
     /// Handed to the built command through `BuildContext::cancel`.
     cancel: tokio_util::sync::CancellationToken,
+    /// Handed to the built command through `BuildContext::output_dir`.
+    output_dir: Option<std::path::PathBuf>,
 }
 
 impl<F: CommandFrontend> Dispatch<F> {
@@ -668,6 +670,7 @@ impl<F: CommandFrontend> Dispatch<F> {
             engines,
             squad_gateway: None,
             cancel: tokio_util::sync::CancellationToken::new(),
+            output_dir: None,
         }
     }
 
@@ -676,6 +679,14 @@ impl<F: CommandFrontend> Dispatch<F> {
     /// call this, so their commands see a token that never fires.
     pub fn with_cancellation(mut self, token: tokio_util::sync::CancellationToken) -> Self {
         self.cancel = token;
+        self
+    }
+
+    /// The command's `/awman/output` host directory (WI 0137 §3). Only the
+    /// API queue worker sets it; the directory is created by the command
+    /// that mounts it.
+    pub fn with_output_dir(mut self, dir: std::path::PathBuf) -> Self {
+        self.output_dir = Some(dir);
         self
     }
 
@@ -786,6 +797,7 @@ impl<F: CommandFrontend> Dispatch<F> {
             },
             caller: CallerContext::new(&canonical, self.frontend.kind()),
             cancel: self.cancel.clone(),
+            output_dir: self.output_dir.clone(),
         };
         (spec.build)(&ctx)
     }
@@ -832,6 +844,7 @@ impl<F: CommandFrontend> Dispatch<F> {
             gateway: self.squad_gateway.clone(),
             caller: CallerContext::new(&canonical, self.frontend.kind()),
             cancel: self.cancel.clone(),
+            output_dir: self.output_dir.clone(),
         };
         let parsed = prerequisites::parse_prerequisite_flags(&ctx, with_check)?;
         prerequisites::check_flag_widening(

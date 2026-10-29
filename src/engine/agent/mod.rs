@@ -188,6 +188,8 @@ pub struct AgentRunOptions {
     pub initial_prompt: Option<String>,
     pub allow_docker: bool,
     pub non_interactive: bool,
+    /// Opt in to translated structured stdout for API launches.
+    pub structured_output: bool,
     /// Optional explicit model name; if `None`, the engine emits no model flag.
     pub model: Option<String>,
     /// Optional explicit env-passthrough list (name only). If `None`, falls
@@ -599,6 +601,10 @@ impl AgentEngine {
         if acp {
             options.push(ContainerOption::Acp(true));
         }
+        if run.structured_output && run.non_interactive && !acp && def.output_format.is_structured()
+        {
+            options.push(ContainerOption::AgentOutputFormat(def.output_format));
+        }
 
         // Mode flags.
         if let Some(y) = run.yolo {
@@ -933,6 +939,13 @@ impl AgentEngine {
                     )));
                 }
             }
+        }
+
+        if run.structured_output && run.non_interactive && def.output_format.is_structured() {
+            options.push(SandboxOption::UnsupportedNote(format!(
+                "structured output ({}) cannot be delivered under the sandbox runtime; continuing with text output",
+                def.output_format,
+            )));
         }
 
         // Non-interactive shape (`--print` / `exec` / `run` / `task`): the
@@ -1506,6 +1519,83 @@ mod tests {
             matches!(result, Err(EngineError::ConflictingOptions(_))),
             "plan + yolo must be rejected as conflicting, got {result:?}"
         );
+    }
+
+    #[test]
+    fn structured_output_options_are_non_interactive_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, session) = make_agent_engine(tmp.path());
+        for (name, format, flags) in [
+            (
+                "claude",
+                AgentOutputFormat::ClaudeStreamJson,
+                vec!["--output-format", "stream-json", "--verbose"],
+            ),
+            ("codex", AgentOutputFormat::CodexJson, vec!["--json"]),
+        ] {
+            let agent = AgentName::new(name).unwrap();
+            for (non_interactive, structured_output) in
+                [(false, false), (true, false), (false, true), (true, true)]
+            {
+                let run = AgentRunOptions {
+                    non_interactive,
+                    structured_output,
+                    ..Default::default()
+                };
+                let options = engine.build_options(&session, &agent, &run).unwrap();
+                let resolved =
+                    crate::engine::container::options::ResolvedContainerOptions::resolve(options)
+                        .unwrap();
+                assert_eq!(
+                    resolved.agent_output_format,
+                    if non_interactive && structured_output {
+                        format
+                    } else {
+                        AgentOutputFormat::Text
+                    }
+                );
+                for flag in &flags {
+                    assert_eq!(
+                        resolved.agent_mode_flags.iter().any(|value| value == flag),
+                        non_interactive && structured_output
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn structured_output_opt_in_still_excludes_acp_and_cli_sandbox_warnings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, session) = make_agent_engine(tmp.path());
+        let agent = AgentName::new("claude").unwrap();
+        let acp_agent = AgentName::new("cline").unwrap();
+        let run = AgentRunOptions {
+            structured_output: true,
+            non_interactive: true,
+            launch_mode: LaunchMode::Acp,
+            ..Default::default()
+        };
+        let resolved = crate::engine::container::options::ResolvedContainerOptions::resolve(
+            engine.build_options(&session, &acp_agent, &run).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(resolved.agent_output_format, AgentOutputFormat::Text);
+        assert!(!resolved
+            .agent_mode_flags
+            .iter()
+            .any(|flag| flag == "--output-format"));
+        for structured_output in [false, true] {
+            let run = AgentRunOptions {
+                structured_output,
+                non_interactive: true,
+                ..Default::default()
+            };
+            let options = engine
+                .build_sandbox_options(&session, &agent, &run)
+                .unwrap();
+            assert_eq!(options.iter().any(|option| matches!(option, SandboxOption::UnsupportedNote(note) if note.contains("structured output"))), structured_output);
+        }
     }
 
     #[test]

@@ -40,6 +40,7 @@ pub fn convert(
         image,
         interactive_entrypoint: file.run.command.clone(),
         non_interactive_flag: file.run.non_interactive.clone(),
+        output_format: file.run.output_format,
         interactive_only_flags: file.run.interactive_only_flags.clone(),
         plan_flags: file.modes.plan.clone(),
         yolo_flags: file.modes.yolo.clone(),

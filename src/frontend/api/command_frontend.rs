@@ -20,9 +20,11 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::command::commands::api_server::event_bus::EventBusSender;
+use crate::data::agent_output_format::AgentOutputFormat;
 use crate::data::execution_event::{
-    CommandStatusKind, EventPayload, PhaseStatusKind, StepStatusKind,
+    CommandStatusKind, EventPayload, EventSource, EventSourcePhase, PhaseStatusKind, StepStatusKind,
 };
+use crate::engine::agent_output::{FinalMessageSink, OutputStream, Translated};
 
 use async_trait::async_trait;
 
@@ -55,6 +57,7 @@ use crate::command::error::CommandError;
 use crate::command::headless::HeadlessDefaults;
 use crate::data::config::repo::WorkItemsConfig;
 use crate::data::fs::api_command_log::CommandStateWriter;
+use crate::data::fs::api_db::{FailedStep, FailedStepPhase};
 use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
 use crate::data::ready_phase::ReadyPhase;
 use crate::data::ready_summary::ReadySummary;
@@ -73,7 +76,7 @@ use crate::engine::workflow::actions::{
     AvailableActions, CountdownKind, NextAction, ResumeMismatch, StepOutput, WorkflowOutcome,
     WorkflowStepStatus, YoloTickOutcome,
 };
-use crate::engine::workflow::frontend::WorkflowFrontend;
+use crate::engine::workflow::frontend::{ContainerSource, WorkflowFrontend};
 
 /// The API dispatch frontend. Emits typed events to an `EventBusSender`
 /// for distribution to logfile writers and SSE clients.
@@ -90,10 +93,16 @@ pub struct ApiDispatchFrontend {
     state_writer: Option<CommandStateWriter>,
     line_buffer_stdout: String,
     line_buffer_stderr: String,
-    /// Map of step name → 0-based index, populated lazily on the first
-    /// `report_step_status` call for each unique step. Used to emit
-    /// `WorkflowStepTransition.step_index` accurately.
-    step_indices: std::sync::Mutex<HashMap<String, usize>>,
+    /// Main step names in definition order (`WorkflowState.steps`), from the
+    /// engine's progress reports and state snapshots. A step's position here
+    /// is its `step_index` in every event (WI 0137 §5).
+    step_order: Vec<String>,
+    /// The attribution of the container whose call is being forwarded right
+    /// now, lent by its per-container proxy (`set_container_source`).
+    container_source: Option<ContainerSource>,
+    /// The last container name each main step ran in, for the attribution
+    /// of the step's own workflow events.
+    step_containers: HashMap<String, String>,
     /// Set after the first main-phase `WorkflowPhaseTransition` event.
     /// Prevents duplicate main-phase start events for the same workflow run.
     phase_emitted: std::sync::Mutex<bool>,
@@ -102,8 +111,13 @@ pub struct ApiDispatchFrontend {
     done_emitted: std::sync::atomic::AtomicBool,
     /// The queue worker owns completion when post-command stages are enabled.
     emit_done_on_drop: bool,
-    /// The queue worker emits workflow completion after stdout/stderr drains.
-    defer_command_status: bool,
+    step_attempts: HashMap<String, u32>,
+    phase_attempts: HashMap<(String, usize), u32>,
+    workflow_state: Option<WorkflowState>,
+    /// The structured output format of the agent about to run, announced by
+    /// the engine through `set_agent_output_format` and consumed by the next
+    /// `take_io` (WI 0137 §4). `Text` when nothing was announced.
+    output_format: AgentOutputFormat,
     /// Throttle: last time a yolo countdown status message was emitted.
     last_sink_message_time: Option<std::time::Instant>,
     /// What the countdown currently being ticked will do when it expires
@@ -187,11 +201,16 @@ impl ApiDispatchFrontend {
             state_writer: None,
             line_buffer_stdout: String::new(),
             line_buffer_stderr: String::new(),
-            step_indices: std::sync::Mutex::new(HashMap::new()),
+            step_order: Vec::new(),
+            container_source: None,
+            step_containers: HashMap::new(),
             phase_emitted: std::sync::Mutex::new(false),
             done_emitted: std::sync::atomic::AtomicBool::new(false),
             emit_done_on_drop: true,
-            defer_command_status: false,
+            step_attempts: HashMap::new(),
+            phase_attempts: HashMap::new(),
+            workflow_state: None,
+            output_format: AgentOutputFormat::Text,
             last_sink_message_time: None,
             countdown_kind: CountdownKind::StuckStep,
             // The *catalogue's* spelling of the path, not the request's. This
@@ -215,24 +234,45 @@ impl ApiDispatchFrontend {
     /// Let the queue worker emit `Done` after post-command stages finish.
     pub fn deferring_done(mut self) -> Self {
         self.emit_done_on_drop = false;
-        self.defer_command_status = true;
         self
     }
 
-    /// Look up (or assign on first sight) the 0-based step index for a step
-    /// name. The first time a given step name is reported, it gets the next
-    /// available index; subsequent reports return the same index.
-    fn step_index_for(&self, name: &str) -> usize {
-        let mut map = self
-            .step_indices
-            .lock()
-            .expect("step_indices lock poisoned");
-        if let Some(idx) = map.get(name) {
-            return *idx;
+    /// The step's index in `WorkflowState.steps` (WI 0137 §5), stable across
+    /// attempts. The engine reports the definition before any step launches,
+    /// so an unknown step has no index until an authoritative snapshot arrives.
+    fn step_index_for(&self, name: &str) -> Option<usize> {
+        self.step_order.iter().position(|n| n == name)
+    }
+
+    /// The authoritative definition order from the engine's latest report.
+    fn set_step_order(&mut self, names: impl Iterator<Item = String>) {
+        self.step_order = names.collect();
+    }
+
+    /// A sender attributing a main step's workflow events to that step.
+    fn step_sender(&mut self, name: &str) -> EventBusSender {
+        let index = self.step_index_for(name);
+        self.event_bus.with_source(EventSource {
+            phase: EventSourcePhase::Main,
+            step_name: Some(name.to_string()),
+            step_index: index,
+            container: self.step_containers.get(name).cloned(),
+            step_attempt: self.step_attempts.get(name).copied(),
+        })
+    }
+
+    /// A sender attributing events to a phase with no step name.
+    fn phase_sender(&self, phase: EventSourcePhase) -> EventBusSender {
+        self.event_bus.with_source(EventSource::phase(phase))
+    }
+
+    /// The sender for a container call: attributed to the container whose
+    /// proxy lent its source, otherwise the unattributed root sender.
+    fn container_sender(&self) -> EventBusSender {
+        match &self.container_source {
+            Some(cell) => self.event_bus.with_shared_source(cell.clone()),
+            None => self.event_bus.clone(),
         }
-        let idx = map.len();
-        map.insert(name.to_string(), idx);
-        idx
     }
 
     /// Flush any remaining partial lines in the stdout/stderr buffers.
@@ -303,7 +343,7 @@ impl UserMessageSink for ApiDispatchFrontend {
             crate::data::message::MessageLevel::Error => "error",
             crate::data::message::MessageLevel::Success => "ok",
         };
-        self.event_bus.emit(EventPayload::StatusMessage {
+        self.container_sender().emit(EventPayload::StatusMessage {
             phase: phase.to_string(),
             message: msg.text,
         });
@@ -445,6 +485,11 @@ fn clone_parse_error(e: &CommandError) -> CommandError {
 #[async_trait]
 impl AgentFrontend for ApiDispatchFrontend {
     fn report_status(&mut self, status: AgentStatus) {
+        if matches!(status, AgentStatus::Running { .. }) {
+            if let Some(writer) = &self.state_writer {
+                writer.record_container_started();
+            }
+        }
         let message = match &status {
             AgentStatus::Building => "Building container image...".to_string(),
             AgentStatus::Pulling => "Pulling container image...".to_string(),
@@ -456,72 +501,48 @@ impl AgentFrontend for ApiDispatchFrontend {
             AgentStatus::Exited(code) => format!("Container exited with code {code}"),
             AgentStatus::Failed(reason) => format!("Container failed: {reason}"),
         };
-        self.event_bus.emit(EventPayload::StatusMessage {
+        // The proxy has already written the container name into its source;
+        // remember it so the step's own workflow events carry it too.
+        if let (AgentStatus::Running { container_name }, Some(cell)) =
+            (&status, &self.container_source)
+        {
+            let step_name = cell
+                .lock()
+                .expect("event source lock poisoned")
+                .step_name
+                .clone();
+            if let Some(step_name) = step_name {
+                self.step_containers
+                    .insert(step_name, container_name.clone());
+            }
+        }
+        self.container_sender().emit(EventPayload::StatusMessage {
             phase: "container".to_string(),
             message,
         });
     }
 
     fn report_progress(&mut self, progress: AgentProgress) {
-        self.event_bus.emit(EventPayload::StatusMessage {
+        self.container_sender().emit(EventPayload::StatusMessage {
             phase: progress.stage,
             message: progress.message,
         });
     }
 
     fn take_io(&mut self) -> crate::engine::agent_runtime::frontend::AgentIo {
-        let event_bus_stdout = self.event_bus.clone();
-        let event_bus_stderr = self.event_bus.clone();
-
-        let (stdout_tx, mut stdout_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-        let (stderr_tx, mut stderr_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-        let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
         // API never has interactive stdin: the engine owns the only sender
         // and drops it after seeding the prompt (see `spawn_piped_docker`)
-        // so the container sees EOF promptly.
+        // so the container sees EOF promptly. The drains keep the lent
+        // source, so every line of this container stays attributed to it.
+        spawn_output_drains(
+            &self.container_sender(),
+            std::mem::take(&mut self.output_format),
+            self.final_message_sink(),
+        )
+    }
 
-        // Drain stdout → event bus (line-buffered).
-        event_bus_stdout.clone().spawn_drain(async move {
-            let mut buf = String::new();
-            while let Some(bytes) = stdout_rx.recv().await {
-                let text = String::from_utf8_lossy(&bytes);
-                buf.push_str(&text);
-                while let Some(pos) = buf.find('\n') {
-                    let line = buf[..pos].to_string();
-                    buf = buf[pos + 1..].to_string();
-                    event_bus_stdout.emit(EventPayload::StdoutLine(line));
-                }
-            }
-            if !buf.is_empty() {
-                event_bus_stdout.emit(EventPayload::StdoutLine(buf));
-            }
-        });
-
-        // Drain stderr → event bus (line-buffered).
-        event_bus_stderr.clone().spawn_drain(async move {
-            let mut buf = String::new();
-            while let Some(bytes) = stderr_rx.recv().await {
-                let text = String::from_utf8_lossy(&bytes);
-                buf.push_str(&text);
-                while let Some(pos) = buf.find('\n') {
-                    let line = buf[..pos].to_string();
-                    buf = buf[pos + 1..].to_string();
-                    event_bus_stderr.emit(EventPayload::StderrLine(line));
-                }
-            }
-            if !buf.is_empty() {
-                event_bus_stderr.emit(EventPayload::StderrLine(buf));
-            }
-        });
-
-        crate::engine::agent_runtime::frontend::AgentIo {
-            stdout: stdout_tx,
-            stderr: stderr_tx,
-            stdin_tx,
-            stdin_rx,
-            resize: None,
-            initial_size: None,
-        }
+    fn set_agent_output_format(&mut self, format: AgentOutputFormat) {
+        self.output_format = format;
     }
 
     /// API runs unattended workloads — an agent may need minutes to pull
@@ -533,13 +554,139 @@ impl AgentFrontend for ApiDispatchFrontend {
     }
 }
 
+/// Wire a container's stdout/stderr byte channels to the event bus
+/// (WI 0137 §4): both streams are line-buffered, stdout runs through the
+/// translator for `format`, and every [`Translated`] item becomes an event or
+/// — for the final message — a call to `final_message`. Shared by the
+/// top-level frontend and every per-container sink, so the API has one
+/// drain implementation.
+///
+/// Attribution (WI 0137 §5) rides on `event_bus`: a sender made with
+/// `EventBusSender::with_source` stamps every event emitted here.
+fn spawn_output_drains(
+    event_bus: &EventBusSender,
+    format: AgentOutputFormat,
+    final_message: Option<FinalMessageSink>,
+) -> crate::engine::agent_runtime::frontend::AgentIo {
+    let event_bus_stdout = event_bus.clone();
+    let event_bus_stderr = event_bus.clone();
+
+    let (stdout_tx, mut stdout_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    let (stderr_tx, mut stderr_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+
+    // Drain stdout → translator → event bus (line-buffered).
+    event_bus_stdout.clone().spawn_drain(async move {
+        let shutdown = event_bus_stdout.output_shutdown();
+        let mut translator = crate::engine::agent_output::translator_for(format);
+        let emit = |items: Vec<Translated>| {
+            for item in items {
+                emit_translated(&event_bus_stdout, final_message.as_ref(), item);
+            }
+        };
+        let mut buf = Vec::new();
+        loop {
+            let bytes = tokio::select! {
+                _ = shutdown.cancelled(), if !stdout_rx.is_closed() => { stdout_rx.close(); continue; }
+                bytes = stdout_rx.recv() => bytes,
+            };
+            let Some(bytes) = bytes else { break; };
+            buf.extend_from_slice(&bytes);
+            while let Some(pos) = buf.iter().position(|byte| *byte == b'\n') {
+                let line = String::from_utf8_lossy(&buf[..pos]).into_owned();
+                buf.drain(..=pos);
+                emit(translator.feed_line(OutputStream::Stdout, &line));
+            }
+        }
+        if !buf.is_empty() {
+            emit(translator.feed_line(OutputStream::Stdout, &String::from_utf8_lossy(&buf)));
+        }
+        emit(translator.finish());
+    });
+
+    // Drain stderr → event bus (line-buffered). Structured formats print
+    // on stdout only, so stderr never goes through the translator.
+    event_bus_stderr.clone().spawn_drain(async move {
+        let shutdown = event_bus_stderr.output_shutdown();
+        let mut buf = Vec::new();
+        loop {
+            let bytes = tokio::select! {
+                _ = shutdown.cancelled(), if !stderr_rx.is_closed() => { stderr_rx.close(); continue; }
+                bytes = stderr_rx.recv() => bytes,
+            };
+            let Some(bytes) = bytes else { break; };
+            buf.extend_from_slice(&bytes);
+            while let Some(pos) = buf.iter().position(|byte| *byte == b'\n') {
+                let line = String::from_utf8_lossy(&buf[..pos]).into_owned();
+                buf.drain(..=pos);
+                event_bus_stderr.emit(EventPayload::StderrLine(line));
+            }
+        }
+        if !buf.is_empty() {
+            event_bus_stderr.emit(EventPayload::StderrLine(String::from_utf8_lossy(&buf).into_owned()));
+        }
+    });
+
+    crate::engine::agent_runtime::frontend::AgentIo {
+        stdout: stdout_tx,
+        stderr: stderr_tx,
+        stdin_tx,
+        stdin_rx,
+        resize: None,
+        initial_size: None,
+    }
+}
+
+/// One translated item onto the bus (or into the final-message sink).
+fn emit_translated(
+    event_bus: &EventBusSender,
+    final_message: Option<&FinalMessageSink>,
+    item: Translated,
+) {
+    match item {
+        Translated::Line {
+            stream: OutputStream::Stdout,
+            text,
+        } => event_bus.emit(EventPayload::StdoutLine(text)),
+        Translated::Line {
+            stream: OutputStream::Stderr,
+            text,
+        } => event_bus.emit(EventPayload::StderrLine(text)),
+        Translated::Activity { kind, summary } => {
+            event_bus.emit(EventPayload::StepActivity { kind, summary })
+        }
+        Translated::FinalMessage(message) => {
+            if let Some(sink) = final_message {
+                sink(message);
+            }
+        }
+    }
+}
+
+impl ApiDispatchFrontend {
+    /// Where a translated final message goes: the shared state writer, so
+    /// the queue worker finds it in `ResultContributions::final_message`.
+    /// `None` without a state writer (unit tests, nested frontends).
+    fn final_message_sink(&self) -> Option<FinalMessageSink> {
+        if self.command_path != "exec prompt" {
+            return None;
+        }
+        let writer = self.state_writer.clone()?;
+        Some(std::sync::Arc::new(move |message: String| {
+            writer.record_final_message(message)
+        }))
+    }
+}
+
 // ─── HasAgentFrontend ───────────────────────────────────────────────────
 
 impl HasAgentFrontend for ApiDispatchFrontend {
     fn container_frontend(&mut self) -> Box<dyn AgentFrontend> {
-        Box::new(ApiContainerSink {
-            event_bus: self.event_bus.clone(),
-        })
+        Box::new(ApiContainerSink::new(
+            &self.event_bus,
+            self.final_message_sink(),
+            self.state_writer.clone(),
+        ))
     }
 }
 
@@ -568,9 +715,19 @@ impl crate::engine::agent::AgentImageFrontend for ApiDispatchFrontend {
     }
 
     fn container_frontend(&mut self) -> Box<dyn AgentFrontend> {
-        Box::new(ApiContainerSink {
-            event_bus: self.event_bus.clone(),
-        })
+        Box::new(ApiContainerSink::new(
+            &self.event_bus,
+            self.final_message_sink(),
+            self.state_writer.clone(),
+        ))
+    }
+}
+
+/// The event-source phase of a setup or teardown phase step.
+fn phase_source(kind: PhaseKind) -> EventSourcePhase {
+    match kind {
+        PhaseKind::Setup => EventSourcePhase::Setup,
+        PhaseKind::Teardown => EventSourcePhase::Teardown,
     }
 }
 
@@ -585,8 +742,43 @@ fn title_case(s: &str) -> String {
 }
 
 /// Standalone container frontend that emits events to the EventBus.
+///
+/// One is created per container (`exec prompt` and the other single-agent
+/// commands). Every event it emits is attributed (WI 0137 §5) to the main
+/// phase, `step_attempt` 1, and the container name once `Running` reports
+/// it. Workflow steps do not use it: their per-container proxy lends its
+/// own source to the shared frontend.
 struct ApiContainerSink {
+    state_writer: Option<CommandStateWriter>,
+    /// Stamps `source` as it is when each event is emitted.
     event_bus: EventBusSender,
+    /// This container's attribution: the main phase, attempt 1, and the
+    /// container name once it runs.
+    source: ContainerSource,
+    /// Set by the engine through `set_agent_output_format` before `take_io`;
+    /// `Text` until then, and taken (reset) by `take_io`.
+    output_format: AgentOutputFormat,
+    /// Where a translated final message goes (`exec prompt`).
+    final_message: Option<FinalMessageSink>,
+}
+
+impl ApiContainerSink {
+    fn new(
+        event_bus: &EventBusSender,
+        final_message: Option<FinalMessageSink>,
+        state_writer: Option<CommandStateWriter>,
+    ) -> Self {
+        let source: ContainerSource = std::sync::Arc::new(std::sync::Mutex::new(
+            EventSource::phase(EventSourcePhase::Main).with_step_attempt(1),
+        ));
+        Self {
+            state_writer,
+            event_bus: event_bus.with_shared_source(source.clone()),
+            source,
+            output_format: AgentOutputFormat::Text,
+            final_message,
+        }
+    }
 }
 
 impl UserMessageSink for ApiContainerSink {
@@ -608,6 +800,15 @@ impl UserMessageSink for ApiContainerSink {
 #[async_trait]
 impl AgentFrontend for ApiContainerSink {
     fn report_status(&mut self, status: AgentStatus) {
+        if let AgentStatus::Running { container_name } = &status {
+            if let Some(writer) = &self.state_writer {
+                writer.record_container_started();
+            }
+            self.source
+                .lock()
+                .expect("event source lock poisoned")
+                .container = Some(container_name.clone());
+        }
         let message = match &status {
             AgentStatus::Building => "Building container image...".to_string(),
             AgentStatus::Pulling => "Pulling container image...".to_string(),
@@ -632,55 +833,17 @@ impl AgentFrontend for ApiContainerSink {
     }
 
     fn take_io(&mut self) -> crate::engine::agent_runtime::frontend::AgentIo {
-        let event_bus_stdout = self.event_bus.clone();
-        let event_bus_stderr = self.event_bus.clone();
-
-        let (stdout_tx, mut stdout_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-        let (stderr_tx, mut stderr_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-        let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-
-        event_bus_stdout.clone().spawn_drain(async move {
-            let mut buf = String::new();
-            while let Some(bytes) = stdout_rx.recv().await {
-                let text = String::from_utf8_lossy(&bytes);
-                buf.push_str(&text);
-                while let Some(pos) = buf.find('\n') {
-                    let line = buf[..pos].to_string();
-                    buf = buf[pos + 1..].to_string();
-                    event_bus_stdout.emit(EventPayload::StdoutLine(line));
-                }
-            }
-            if !buf.is_empty() {
-                event_bus_stdout.emit(EventPayload::StdoutLine(buf));
-            }
-        });
-
-        event_bus_stderr.clone().spawn_drain(async move {
-            let mut buf = String::new();
-            while let Some(bytes) = stderr_rx.recv().await {
-                let text = String::from_utf8_lossy(&bytes);
-                buf.push_str(&text);
-                while let Some(pos) = buf.find('\n') {
-                    let line = buf[..pos].to_string();
-                    buf = buf[pos + 1..].to_string();
-                    event_bus_stderr.emit(EventPayload::StderrLine(line));
-                }
-            }
-            if !buf.is_empty() {
-                event_bus_stderr.emit(EventPayload::StderrLine(buf));
-            }
-        });
-
         // Engine owns the single stdin_tx and drops it after seeding so EOF
         // arrives at the container's stdin pipe (see `spawn_piped_docker`).
-        crate::engine::agent_runtime::frontend::AgentIo {
-            stdout: stdout_tx,
-            stderr: stderr_tx,
-            stdin_tx,
-            stdin_rx,
-            resize: None,
-            initial_size: None,
-        }
+        spawn_output_drains(
+            &self.event_bus,
+            std::mem::take(&mut self.output_format),
+            self.final_message.clone(),
+        )
+    }
+
+    fn set_agent_output_format(&mut self, format: AgentOutputFormat) {
+        self.output_format = format;
     }
 
     fn grace_timeout(&self) -> Duration {
@@ -732,7 +895,79 @@ impl AgentAuthFrontend for ApiDispatchFrontend {
 
 impl WorkflowFrontend for ApiDispatchFrontend {
     fn report_workflow_state(&mut self, state: &WorkflowState) {
+        self.workflow_state = Some(state.clone());
+        self.set_step_order(state.steps.iter().map(|step| step.name.clone()));
+        // The engine's launch counts are authoritative and survive a restart.
+        for (name, attempt) in &state.step_attempts {
+            self.step_attempts.insert(name.clone(), *attempt);
+        }
+        for kind in [PhaseKind::Setup, PhaseKind::Teardown] {
+            for (index, step) in state.phase_step_states(kind).iter().enumerate() {
+                let key = (kind.label().to_string(), index);
+                if let crate::data::workflow_state::PhaseStepStatus::Remediating {
+                    attempt, ..
+                } = step.status
+                {
+                    self.phase_attempts.insert(key.clone(), attempt + 1);
+                }
+                if let crate::data::workflow_state::PhaseStepStatus::Failed { ref error } =
+                    step.status
+                {
+                    if let Some(writer) = &self.state_writer {
+                        writer.record_failed_step(FailedStep {
+                            name: step.description.clone(),
+                            index,
+                            phase: if kind == PhaseKind::Setup {
+                                FailedStepPhase::Setup
+                            } else {
+                                FailedStepPhase::Teardown
+                            },
+                            exit_code: None,
+                            step_attempt: *self.phase_attempts.get(&key).unwrap_or(&1),
+                            error: Some(error.clone()),
+                        });
+                    }
+                }
+                if matches!(
+                    step.status,
+                    crate::data::workflow_state::PhaseStepStatus::Succeeded
+                ) {
+                    if let Some(writer) = &self.state_writer {
+                        writer.record_step_succeeded(
+                            if kind == PhaseKind::Setup {
+                                FailedStepPhase::Setup
+                            } else {
+                                FailedStepPhase::Teardown
+                            },
+                            index,
+                        );
+                    }
+                }
+            }
+        }
         if let Some(writer) = &self.state_writer {
+            for (index, step) in state.steps.iter().enumerate() {
+                if matches!(
+                    state.step_states.get(&step.name),
+                    Some(crate::data::workflow_state::StepState::Succeeded)
+                ) {
+                    writer.record_step_succeeded(FailedStepPhase::Main, index);
+                }
+                if let Some(crate::data::workflow_state::StepState::Failed {
+                    exit_code,
+                    error_message,
+                }) = state.step_states.get(&step.name)
+                {
+                    writer.record_failed_step(FailedStep {
+                        name: step.name.clone(),
+                        index,
+                        phase: FailedStepPhase::Main,
+                        exit_code: Some(*exit_code),
+                        step_attempt: *self.step_attempts.get(&step.name).unwrap_or(&1),
+                        error: error_message.clone(),
+                    });
+                }
+            }
             if let Err(error) = writer.write(state) {
                 tracing::warn!(%error, "failed to write command workflow state");
             }
@@ -764,7 +999,14 @@ impl WorkflowFrontend for ApiDispatchFrontend {
                 CountdownKind::StuckStep => "auto-advancing",
                 CountdownKind::FailureRetry => "retrying after failure",
             };
-            self.event_bus.emit(EventPayload::StatusMessage {
+            // `step_name` is a countdown label, which for an `on_failure` agent
+            // is not a step: attribute it only when it names one.
+            let sender = if self.step_order.iter().any(|n| n == step_name) {
+                self.step_sender(step_name)
+            } else {
+                self.event_bus.clone()
+            };
+            sender.emit(EventPayload::StatusMessage {
                 phase: "yolo_countdown".to_string(),
                 message: format!("Step '{}': {what} in {}s", step_name, remaining.as_secs()),
             });
@@ -782,7 +1024,42 @@ impl WorkflowFrontend for ApiDispatchFrontend {
         self.countdown_kind = CountdownKind::default();
     }
 
+    fn report_step_launching(&mut self, step_name: &str, step_attempt: u32) {
+        self.step_attempts
+            .insert(step_name.to_string(), step_attempt);
+        // A new launch runs in a new container; its name arrives with `Running`.
+        self.step_containers.remove(step_name);
+    }
+
+    fn set_container_source(&mut self, source: Option<ContainerSource>) {
+        self.container_source = source;
+    }
+
     fn report_step_status(&mut self, step: &WorkflowStep, status: WorkflowStepStatus) {
+        let Some(index) = self.step_index_for(&step.name) else {
+            tracing::warn!(
+                step = step.name,
+                "Skipping step transition without a definition index"
+            );
+            return;
+        };
+        if matches!(status, WorkflowStepStatus::Succeeded) {
+            if let Some(writer) = &self.state_writer {
+                writer.record_step_succeeded(FailedStepPhase::Main, index);
+            }
+        }
+        if let WorkflowStepStatus::Failed { exit_code } = &status {
+            if let Some(writer) = &self.state_writer {
+                writer.record_failed_step(FailedStep {
+                    name: step.name.clone(),
+                    index,
+                    phase: FailedStepPhase::Main,
+                    exit_code: Some(*exit_code),
+                    step_attempt: *self.step_attempts.get(&step.name).unwrap_or(&1),
+                    error: None,
+                });
+            }
+        }
         // The `from` status is what the step must have been in for this
         // transition to be reachable; the engine reports only the new one.
         let (from, to) = match &status {
@@ -793,20 +1070,23 @@ impl WorkflowFrontend for ApiDispatchFrontend {
             WorkflowStepStatus::Cancelled => (StepStatusKind::Pending, StepStatusKind::Cancelled),
             WorkflowStepStatus::Skipped => (StepStatusKind::Pending, StepStatusKind::Skipped),
         };
-        let idx = self.step_index_for(&step.name);
-        self.event_bus.emit(EventPayload::WorkflowStepTransition {
-            step_name: step.name.clone(),
-            step_index: idx,
-            from_status: from,
-            to_status: to,
-        });
+        let idx = index;
+        self.step_sender(&step.name)
+            .emit(EventPayload::WorkflowStepTransition {
+                step_name: step.name.clone(),
+                step_index: idx,
+                from_status: from,
+                to_status: to,
+            });
     }
 
     fn report_step_output(&mut self, _step: &WorkflowStep, _output: StepOutput) {}
 
     fn report_parallel_step_launched(&mut self, step_name: &str, agent: &str, model: Option<&str>) {
-        let idx = self.step_index_for(step_name);
-        self.event_bus
+        let Some(idx) = self.step_index_for(step_name) else {
+            return;
+        };
+        self.step_sender(step_name)
             .emit(EventPayload::WorkflowParallelStepLaunched {
                 step_name: step_name.to_string(),
                 step_index: idx,
@@ -816,13 +1096,20 @@ impl WorkflowFrontend for ApiDispatchFrontend {
     }
 
     fn report_parallel_step_exited(&mut self, step_name: &str, exit_code: i32) {
-        let idx = self.step_index_for(step_name);
-        self.event_bus
+        let Some(idx) = self.step_index_for(step_name) else {
+            return;
+        };
+        self.step_sender(step_name)
             .emit(EventPayload::WorkflowParallelStepExited {
                 step_name: step_name.to_string(),
                 step_index: idx,
                 exit_code,
             });
+    }
+
+    fn report_parallel_step_container(&mut self, step_name: &str, container_name: &str) {
+        self.step_containers
+            .insert(step_name.to_string(), container_name.to_string());
     }
 
     fn report_parallel_group_finished(&mut self) {
@@ -834,6 +1121,14 @@ impl WorkflowFrontend for ApiDispatchFrontend {
         &mut self,
         steps: &[crate::engine::workflow::actions::WorkflowStepProgressInfo],
     ) {
+        if let Some(writer) = &self.state_writer {
+            writer.record_workflow_main_started();
+        }
+        // `WorkflowState.steps` is the reference order; the definition walk
+        // stands in for it only until the first state snapshot arrives.
+        if self.workflow_state.is_none() {
+            self.set_step_order(steps.iter().map(|step| step.name.clone()));
+        }
         // Emit one WorkflowPhaseTransition event the first time the engine
         // reports progress (the workflow has entered the main phase) and one
         // more on completion (handled in report_workflow_completed).
@@ -845,14 +1140,15 @@ impl WorkflowFrontend for ApiDispatchFrontend {
             *phase_emitted = true;
             drop(phase_emitted);
             let total = steps.len();
-            self.event_bus.emit(EventPayload::WorkflowPhaseTransition {
-                phase: "main".to_string(),
-                step_desc: format!(
-                    "Running workflow ({total} step{})",
-                    if total == 1 { "" } else { "s" }
-                ),
-                status: PhaseStatusKind::Running,
-            });
+            self.phase_sender(EventSourcePhase::Main)
+                .emit(EventPayload::WorkflowPhaseTransition {
+                    phase: "main".to_string(),
+                    step_desc: format!(
+                        "Running workflow ({total} step{})",
+                        if total == 1 { "" } else { "s" }
+                    ),
+                    status: PhaseStatusKind::Running,
+                });
         }
     }
 
@@ -868,46 +1164,53 @@ impl WorkflowFrontend for ApiDispatchFrontend {
     // `"teardown"` exactly as before.
 
     fn on_phase_step_started(&mut self, kind: PhaseKind, description: &str) {
-        self.event_bus.emit(EventPayload::StatusMessage {
-            phase: kind.label().to_string(),
-            message: format!("started: {description}"),
-        });
-        self.event_bus.emit(EventPayload::WorkflowPhaseTransition {
-            phase: kind.label().to_string(),
-            step_desc: description.to_string(),
-            status: PhaseStatusKind::Running,
-        });
+        self.phase_sender(phase_source(kind))
+            .emit(EventPayload::StatusMessage {
+                phase: kind.label().to_string(),
+                message: format!("started: {description}"),
+            });
+        self.phase_sender(phase_source(kind))
+            .emit(EventPayload::WorkflowPhaseTransition {
+                phase: kind.label().to_string(),
+                step_desc: description.to_string(),
+                status: PhaseStatusKind::Running,
+            });
     }
 
     fn on_phase_step_output(&mut self, kind: PhaseKind, line: &str) {
-        self.event_bus.emit(EventPayload::StatusMessage {
-            phase: kind.label().to_string(),
-            message: line.to_string(),
-        });
+        self.phase_sender(phase_source(kind))
+            .emit(EventPayload::StatusMessage {
+                phase: kind.label().to_string(),
+                message: line.to_string(),
+            });
     }
 
     fn on_phase_step_completed(&mut self, kind: PhaseKind, description: &str) {
-        self.event_bus.emit(EventPayload::StatusMessage {
-            phase: kind.label().to_string(),
-            message: format!("completed: {description}"),
-        });
-        self.event_bus.emit(EventPayload::WorkflowPhaseTransition {
-            phase: kind.label().to_string(),
-            step_desc: description.to_string(),
-            status: PhaseStatusKind::Succeeded,
-        });
+        self.phase_sender(phase_source(kind))
+            .emit(EventPayload::StatusMessage {
+                phase: kind.label().to_string(),
+                message: format!("completed: {description}"),
+            });
+        self.phase_sender(phase_source(kind))
+            .emit(EventPayload::WorkflowPhaseTransition {
+                phase: kind.label().to_string(),
+                step_desc: description.to_string(),
+                status: PhaseStatusKind::Succeeded,
+            });
     }
 
     fn on_phase_step_skipped(&mut self, kind: PhaseKind, description: &str) {
-        self.event_bus.emit(EventPayload::StatusMessage {
-            phase: kind.label().to_string(),
-            message: format!("skipped (cancelled): {description}"),
-        });
-        self.event_bus.emit(EventPayload::WorkflowPhaseTransition {
-            phase: kind.label().to_string(),
-            step_desc: description.to_string(),
-            status: PhaseStatusKind::Cancelled,
-        });
+        self.phase_sender(phase_source(kind))
+            .emit(EventPayload::StatusMessage {
+                phase: kind.label().to_string(),
+                message: format!("skipped (cancelled): {description}"),
+            });
+        self.phase_sender(phase_source(kind))
+            .emit(EventPayload::WorkflowPhaseTransition {
+                phase: kind.label().to_string(),
+                step_desc: description.to_string(),
+                status: PhaseStatusKind::Cancelled,
+            });
     }
 
     fn on_phase_step_failed(
@@ -917,81 +1220,145 @@ impl WorkflowFrontend for ApiDispatchFrontend {
         exit_code: i32,
         stderr: &str,
     ) {
-        self.event_bus.emit(EventPayload::StatusMessage {
-            phase: kind.label().to_string(),
-            message: format!("failed: {description} (exit {exit_code}): {stderr}"),
-        });
-        self.event_bus.emit(EventPayload::WorkflowPhaseTransition {
-            phase: kind.label().to_string(),
-            step_desc: description.to_string(),
-            status: PhaseStatusKind::Failed,
-        });
+        if let Some(writer) = &self.state_writer {
+            let index = self
+                .workflow_state
+                .as_ref()
+                .and_then(|state| {
+                    state.phase_step_states(kind).iter().rposition(|step| {
+                        step.description == description
+                            && matches!(
+                                step.status,
+                                crate::data::workflow_state::PhaseStepStatus::Failed { .. }
+                            )
+                    })
+                })
+                .unwrap_or(0);
+            writer.record_failed_step(FailedStep {
+                name: description.into(),
+                index,
+                phase: if kind == PhaseKind::Setup {
+                    FailedStepPhase::Setup
+                } else {
+                    FailedStepPhase::Teardown
+                },
+                exit_code: Some(exit_code),
+                step_attempt: *self
+                    .phase_attempts
+                    .get(&(kind.label().into(), index))
+                    .unwrap_or(&1),
+                error: Some(stderr.to_string()),
+            });
+            if kind == PhaseKind::Teardown
+                && writer.result_contributions().workflow_outcome == Some(CommandStatusKind::Done)
+            {
+                writer.record_workflow_outcome(CommandStatusKind::Error);
+                writer.record_workflow_failure(Some(crate::data::fs::api_db::CommandFailure {
+                    stage: "teardown".into(),
+                    code: crate::data::fs::api_db::failure_codes::TEARDOWN_FAILED.into(),
+                    message: "Teardown failed".into(),
+                    step: Some(description.into()),
+                }));
+                self.phase_sender(EventSourcePhase::Main).emit(
+                    EventPayload::WorkflowPhaseTransition {
+                        phase: "main".into(),
+                        step_desc: "Workflow completed but teardown failed".into(),
+                        status: PhaseStatusKind::TeardownFailed,
+                    },
+                );
+            }
+        }
+        self.phase_sender(phase_source(kind))
+            .emit(EventPayload::StatusMessage {
+                phase: kind.label().to_string(),
+                message: format!("failed: {description} (exit {exit_code}): {stderr}"),
+            });
+        self.phase_sender(phase_source(kind))
+            .emit(EventPayload::WorkflowPhaseTransition {
+                phase: kind.label().to_string(),
+                step_desc: description.to_string(),
+                status: PhaseStatusKind::Failed,
+            });
+    }
+
+    fn report_pull_request_created(&mut self, url: &str) {
+        if let Some(writer) = &self.state_writer {
+            writer.record_pull_request(url);
+        }
     }
 
     fn report_workflow_completed(&mut self, outcome: &WorkflowOutcome) {
-        let (status, exit_code, error, phase_status, step_desc) = match outcome {
+        let (status, phase_status, step_desc) = match outcome {
             WorkflowOutcome::Completed => (
                 CommandStatusKind::Done,
-                Some(0),
-                None,
                 PhaseStatusKind::Succeeded,
-                "Workflow completed".to_string(),
+                "Workflow completed".into(),
             ),
             WorkflowOutcome::Paused => (
                 CommandStatusKind::Paused,
-                None,
-                None,
                 PhaseStatusKind::Paused,
-                "Workflow paused".to_string(),
+                "Workflow paused".into(),
             ),
             WorkflowOutcome::Aborted => (
                 CommandStatusKind::Aborted,
-                Some(1),
-                None,
                 PhaseStatusKind::Failed,
-                "Workflow aborted".to_string(),
+                "Workflow aborted".into(),
             ),
             WorkflowOutcome::Cancelled => (
                 CommandStatusKind::Cancelled,
-                Some(crate::data::command_status::CANCELLED_EXIT_CODE),
-                None,
                 PhaseStatusKind::Cancelled,
-                "Workflow cancelled".to_string(),
+                "Workflow cancelled".into(),
             ),
             WorkflowOutcome::CompletedTeardownFailed => (
-                CommandStatusKind::Done,
-                Some(1),
-                Some("Teardown failed".to_string()),
-                PhaseStatusKind::TeardownFailed,
-                "Workflow completed but teardown failed".to_string(),
-            ),
-            WorkflowOutcome::Failed {
-                last_step,
-                exit_code,
-            } => (
                 CommandStatusKind::Error,
-                Some(*exit_code),
-                Some(format!("Step '{last_step}' failed")),
+                PhaseStatusKind::TeardownFailed,
+                "Workflow completed but teardown failed".into(),
+            ),
+            WorkflowOutcome::Failed { last_step, .. } => (
+                CommandStatusKind::Error,
                 PhaseStatusKind::Failed,
                 format!("Step '{last_step}' failed"),
             ),
         };
-        let phase = EventPayload::WorkflowPhaseTransition {
-            phase: "main".to_string(),
-            step_desc,
-            status: phase_status,
-        };
-        let payload = EventPayload::CommandStatus {
-            status,
-            exit_code,
-            error,
-        };
-        if self.defer_command_status {
-            self.event_bus.defer_workflow_completion(phase, payload);
-        } else {
-            self.event_bus.emit(phase);
-            self.event_bus.emit(payload);
+        if let Some(writer) = &self.state_writer {
+            writer.record_workflow_outcome(status);
+            writer.record_workflow_failure(match outcome {
+                WorkflowOutcome::Failed { last_step, .. } => {
+                    Some(crate::data::fs::api_db::CommandFailure {
+                        stage: "step".into(),
+                        code: crate::data::fs::api_db::failure_codes::STEP_FAILED.into(),
+                        message: format!("Step '{last_step}' failed"),
+                        step: Some(last_step.clone()),
+                    })
+                }
+                WorkflowOutcome::CompletedTeardownFailed => {
+                    Some(crate::data::fs::api_db::CommandFailure {
+                        stage: "teardown".into(),
+                        code: crate::data::fs::api_db::failure_codes::TEARDOWN_FAILED.into(),
+                        message: "Teardown failed".into(),
+                        step: None,
+                    })
+                }
+                WorkflowOutcome::Cancelled => Some(crate::data::fs::api_db::CommandFailure {
+                    stage: match self.workflow_state.as_ref().map(|s| s.current_phase) {
+                        Some(crate::data::workflow_state::WorkflowPhase::Setup) => "setup",
+                        Some(crate::data::workflow_state::WorkflowPhase::Teardown) => "teardown",
+                        _ => "step",
+                    }
+                    .into(),
+                    code: crate::data::fs::api_db::failure_codes::CANCELLED.into(),
+                    message: "cancelled".into(),
+                    step: None,
+                }),
+                _ => None,
+            });
         }
+        self.phase_sender(EventSourcePhase::Main)
+            .emit(EventPayload::WorkflowPhaseTransition {
+                phase: "main".into(),
+                step_desc,
+                status: phase_status,
+            });
     }
 }
 
@@ -1087,33 +1454,36 @@ impl WorktreeLifecycleFrontend for ApiDispatchFrontend {
     }
 
     fn report_merge_conflict(&mut self, branch: &str, worktree_path: &Path, _git_root: &Path) {
-        self.event_bus.emit(EventPayload::StatusMessage {
-            phase: "worktree".to_string(),
-            message: format!(
-                "Merge conflict on branch '{branch}' at {}",
-                worktree_path.display()
-            ),
-        });
+        self.phase_sender(EventSourcePhase::Merge)
+            .emit(EventPayload::StatusMessage {
+                phase: "worktree".to_string(),
+                message: format!(
+                    "Merge conflict on branch '{branch}' at {}",
+                    worktree_path.display()
+                ),
+            });
     }
 
     fn report_worktree_discarded(&mut self, branch: &str) {
         if let Some(writer) = &self.state_writer {
             writer.clear_worktree();
         }
-        self.event_bus.emit(EventPayload::StatusMessage {
-            phase: "worktree".to_string(),
-            message: format!("Worktree discarded: {branch}"),
-        });
+        self.phase_sender(EventSourcePhase::Merge)
+            .emit(EventPayload::StatusMessage {
+                phase: "worktree".to_string(),
+                message: format!("Worktree discarded: {branch}"),
+            });
     }
 
     fn report_worktree_kept(&mut self, path: &Path, branch: &str) {
         if let Some(writer) = &self.state_writer {
             writer.record_worktree(path);
         }
-        self.event_bus.emit(EventPayload::StatusMessage {
-            phase: "worktree".to_string(),
-            message: format!("Worktree kept: {} (branch: {branch})", path.display()),
-        });
+        self.phase_sender(EventSourcePhase::Merge)
+            .emit(EventPayload::StatusMessage {
+                phase: "worktree".to_string(),
+                message: format!("Worktree kept: {} (branch: {branch})", path.display()),
+            });
     }
 }
 
@@ -1219,6 +1589,12 @@ impl AgentsCommandFrontend for ApiDispatchFrontend {
 impl ApiDispatchFrontend {
     /// One stdout event contains the same JSON payload as the CLI.
     fn emit_agents_json(&self, value: &impl serde::Serialize) {
+        if let Some(writer) = &self.state_writer {
+            writer.record_data(
+                serde_json::to_value(value).expect("agent outcomes are JSON serializable"),
+            );
+        }
+        // Retain JSON stdout for one release for existing log consumers.
         self.event_bus.emit(EventPayload::StdoutLine(
             serde_json::to_string(value).expect("agent outcomes are JSON serializable"),
         ));
@@ -1384,6 +1760,8 @@ mod tests {
     mod wi0132_e2e;
     #[path = "wi0132_engine.rs"]
     mod wi0132_engine;
+    #[path = "wi0137_agent_output.rs"]
+    mod wi0137_agent_output;
 
     fn make_frontend(subcommand: &str, args: &[&str]) -> ApiDispatchFrontend {
         let bus = crate::command::commands::api_server::event_bus::EventBus::new(16);
@@ -1444,7 +1822,13 @@ mod tests {
             bus.wait_output_drained(Duration::from_secs(5)).await,
             "run {run}: drains must finish once the pipes close"
         );
-        bus.emit_deferred_command_status();
+        // Simulate the queue worker's single final status, after the drain.
+        bus.sender().finish(EventPayload::CommandStatus {
+            status: CommandStatusKind::Done,
+            exit_code: Some(0),
+            error: None,
+            result: None,
+        });
         bus.sender().emit(EventPayload::Done);
 
         let mut from_live: Vec<ExecutionEvent> = Vec::new();

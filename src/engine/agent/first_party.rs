@@ -3,8 +3,8 @@
 //! here; any other agent is a custom definition (`.awman/agents/<name>.toml`).
 
 use super::definition::{
-    AgentDefinition, AgentImageSource, AgentOrigin, CredentialSource, InteractiveSeedDelivery,
-    ModelFlagDelivery, SbxKitKind, SettingsMount, SystemPromptMode,
+    AgentDefinition, AgentImageSource, AgentOrigin, AgentOutputFormat, CredentialSource,
+    InteractiveSeedDelivery, ModelFlagDelivery, SbxKitKind, SettingsMount, SystemPromptMode,
 };
 
 /// The seven built-in agents. Same slice as the Layer 0 constant so Layer 0
@@ -32,6 +32,7 @@ fn base(name: &str, display_name: &str) -> AgentDefinition {
         image: AgentImageSource::Download,
         interactive_entrypoint: vec![name.to_string()],
         non_interactive_flag: None,
+        output_format: AgentOutputFormat::Text,
         interactive_only_flags: Vec::new(),
         plan_flags: Vec::new(),
         yolo_flags: Vec::new(),
@@ -66,6 +67,7 @@ pub fn first_party(name: &str) -> Option<AgentDefinition> {
     Some(match name {
         "claude" => AgentDefinition {
             non_interactive_flag: Some("--print".into()),
+            output_format: AgentOutputFormat::ClaudeStreamJson,
             plan_flags: strings(&["--permission-mode", "plan"]),
             yolo_flags: strings(&["--dangerously-skip-permissions"]),
             auto_flags: strings(&["--permission-mode", "auto"]),
@@ -87,6 +89,7 @@ pub fn first_party(name: &str) -> Option<AgentDefinition> {
         },
         "codex" => AgentDefinition {
             non_interactive_flag: Some("exec".into()),
+            output_format: AgentOutputFormat::CodexJson,
             // Recent Codex runs its interactive TUI on a shared background
             // "app-server daemon" installed under `$CODEX_HOME/packages`. A
             // throwaway container has no use for one, the image has none, and

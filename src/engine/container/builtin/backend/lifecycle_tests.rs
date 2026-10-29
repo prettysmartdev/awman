@@ -1472,3 +1472,23 @@ async fn stopping_a_reused_name_is_the_typed_generation_mismatch() {
     }
     assert_eq!(rig.driver.is_stopped(&b_id), Some(false));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn structured_launch_announces_its_protocol_before_taking_io() {
+    use crate::data::agent_output_format::AgentOutputFormat;
+    let rig = Rig::new("structured");
+    let mut options = options("structured-agent");
+    options.agent_output_format = AgentOutputFormat::CodexJson;
+    options.agent_mode_flags.push("--json".into());
+    let instance = rig.backend.build(options).unwrap();
+    let id = instance.handle_preview().id;
+    let (frontend, peer) = frontend(None);
+    let mut execution = instance.run_with_frontend(frontend).unwrap();
+    rig.driver.wait_for_exec(&id).await;
+    assert_eq!(
+        *peer.io_formats.lock().unwrap(),
+        [AgentOutputFormat::CodexJson]
+    );
+    rig.driver.emit(&id, ExecEvent::Exited(0));
+    execution.wait().await.unwrap();
+}

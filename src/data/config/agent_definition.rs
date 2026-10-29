@@ -92,6 +92,12 @@ pub struct RunTable {
     pub seed_prompt: SeedPromptSpec, // default Positional
     #[serde(default)]
     pub model: ModelFlagSpec, // default Space
+    /// The structured output mode a non-interactive run can print in
+    /// (WI 0137 §4): `"text"` (default), `"claude_stream_json"` or
+    /// `"codex_json"`. A structured format lets an API run produce
+    /// `step_activity` events and a `final_message`.
+    #[serde(default)]
+    pub output_format: crate::data::agent_output_format::AgentOutputFormat,
     #[serde(default)]
     pub env: std::collections::BTreeMap<String, String>,
 }

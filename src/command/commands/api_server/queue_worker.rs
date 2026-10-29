@@ -12,12 +12,15 @@ use super::push_back::{
 use super::runtime::ApiSessionLifecycle;
 use crate::command::dispatch::{CommandOutcome, Dispatch, Engines};
 use crate::data::api_lifecycle_store::CommandLifecycleStore;
-use crate::data::command_status::{CommandStatus, CANCELLED_EXIT_CODE};
+use crate::data::command_status::CANCELLED_EXIT_CODE;
 use crate::data::execution_event::{
     CommandStatusKind, EventPayload, PhaseStatusKind, StepStatusKind, FIRST_ATTEMPT,
 };
-use crate::data::fs::api_command_log::{CommandLogWriter, CommandStateWriter};
-use crate::data::fs::api_db::{CommandRecord, CommandResult, SqliteSessionStore};
+use crate::data::fs::api_command_log::{CommandLogWriter, CommandStateWriter, ResultContributions};
+use crate::data::fs::api_db::{
+    failure_codes, CommandFailure, CommandRecord, CommandResult, FailedStepPhase,
+    SqliteSessionStore,
+};
 use crate::data::fs::api_paths::ApiPaths;
 use crate::data::session_manager::SessionManager;
 
@@ -30,100 +33,285 @@ async fn wait_for_output_drains(event_bus: &EventBus, command_id: &str) {
             timeout_seconds = OUTPUT_DRAIN_TIMEOUT.as_secs(),
             "output drain did not finish; trailing agent output may be missing"
         );
+        event_bus.close_output_drains();
+        // Closing the receivers drains already queued bytes and finalizes the
+        // translator even if a broken backend retained a sender after exit.
+        event_bus.wait_output_drained(OUTPUT_DRAIN_TIMEOUT).await;
     }
 }
 
-/// The completion projection persisted by the queue worker, shared by the
-/// command row, its result JSON and final metadata.
+/// The single projection persisted by the worker and then read back for SSE.
 struct QueuedCommandResult {
     exit_code: i32,
     status: &'static str,
     result_json: String,
 }
+
+fn failure(
+    stage: &str,
+    code: &str,
+    message: impl Into<String>,
+    step: Option<String>,
+) -> CommandFailure {
+    CommandFailure {
+        stage: stage.into(),
+        code: code.into(),
+        message: message.into(),
+        step,
+    }
+}
+
+/// Preserve the legacy explicit setup_error:null through the foundation
+/// type's Option<Value> deserialization (which otherwise treats null as absent).
+fn read_command_result(json: &str) -> Option<CommandResult> {
+    let mut result: CommandResult = serde_json::from_str(json).ok()?;
+    if result.setup_error.is_none() {
+        result.setup_error = serde_json::from_str::<serde_json::Value>(json)
+            .ok()?
+            .get("setup_error")
+            .cloned();
+    }
+    Some(result)
+}
+
 impl QueuedCommandResult {
     fn new(
         result: &Result<CommandOutcome, crate::command::error::CommandError>,
-        push_outcome: &Result<PushBackOutcome, PushBackError>,
+        push: &Result<PushBackOutcome, PushBackError>,
     ) -> Self {
-        let mut exit_code = result.as_ref().map_or_else(
+        Self::build(result, push, Default::default())
+    }
+
+    fn build(
+        result: &Result<CommandOutcome, crate::command::error::CommandError>,
+        push: &Result<PushBackOutcome, PushBackError>,
+        contributions: ResultContributions,
+    ) -> Self {
+        use crate::command::error::CommandError;
+        let exit_code = result.as_ref().map_or_else(
             |error| i32::from(error.exit_code()),
             CommandOutcome::exit_code,
         );
+        let mut outcome = match result {
+            Err(CommandError::Aborted) => CommandStatusKind::Aborted,
+            Err(_) => CommandStatusKind::Error,
+            Ok(CommandOutcome::ExecWorkflow(o)) if o.exit_code.is_none() => {
+                CommandStatusKind::Paused
+            }
+            Ok(_) => contributions.workflow_outcome.unwrap_or(if exit_code == 0 {
+                CommandStatusKind::Done
+            } else {
+                CommandStatusKind::Error
+            }),
+        };
+        if outcome == CommandStatusKind::Done && exit_code != 0 {
+            outcome = CommandStatusKind::Error;
+        }
         let mut json = CommandResult {
+            exit_code: Some(exit_code),
+            outcome: Some(outcome),
+            error: result.as_ref().err().map(ToString::to_string),
+            error_status: result.as_ref().err().map(|error| error.http_status()),
+            stage: result.as_ref().err().map(|error| error.stage().to_string()),
+            failure: result
+                .as_ref()
+                .err()
+                .map(|error| failure(error.stage(), error.code(), error.to_string(), None)),
             worktree_path: match result {
-                Err(crate::command::error::CommandError::WorktreeExists { path, .. })
-                    if path.is_dir() =>
-                {
+                Err(CommandError::WorktreeExists { path, .. }) if path.is_dir() => {
                     Some(path.display().to_string())
                 }
                 _ => None,
             },
-            exit_code: Some(exit_code),
-            error: result.as_ref().err().map(ToString::to_string),
-            error_status: result.as_ref().err().map(|error| error.http_status()),
-            // `"workflow_prerequisites"` when an unresolved prerequisite stopped
-            // the run before any container started (WI 0149); the report itself
-            // reached the client as the `workflow_prerequisites` event.
-            stage: result
-                .as_ref()
-                .err()
-                .and_then(|error| error.stage())
-                .map(str::to_string),
-            pushed: None,
+            pull_request: contributions.pull_request,
+            final_message: contributions.final_message,
+            data: contributions.data,
+            ..CommandResult::default()
         };
-        match push_outcome {
+        let failed = &contributions.failed_steps;
+        if exit_code != 0 {
+            if let Ok(CommandOutcome::ExecWorkflow(workflow)) = result {
+                if let Some(report) = &workflow.prerequisites {
+                    let error = CommandError::WorkflowPrerequisitesUnresolved {
+                        report: Box::new(report.clone()),
+                    };
+                    json.failure = Some(failure(
+                        error.stage(),
+                        error.code(),
+                        error.to_string(),
+                        None,
+                    ));
+                    json.error = Some(error.to_string());
+                }
+            }
+        }
+        // Setup aborts return an Engine error; the phase's own failure is the
+        // useful stage and step, while the legacy error still describes it.
+        if result.is_err()
+            && !contributions.workflow_main_started
+            && json.failure.as_ref().is_some_and(|f| f.stage == "step")
+        {
+            if let Some(step) = failed
+                .iter()
+                .rev()
+                .find(|s| s.phase == FailedStepPhase::Setup)
+            {
+                json.failure = Some(failure(
+                    "setup",
+                    failure_codes::SETUP_FAILED,
+                    json.error.clone().unwrap_or_else(|| "Setup failed".into()),
+                    Some(step.name.clone()),
+                ));
+            }
+        }
+        if !contributions.container_started {
+            if let Some(reason) = json
+                .failure
+                .as_mut()
+                .filter(|f| f.stage == "step" && f.code == failure_codes::INTERNAL)
+            {
+                reason.stage = "preflight".into();
+                json.stage = Some(reason.stage.clone());
+            }
+        }
+        if outcome != CommandStatusKind::Done && json.failure.is_none() {
+            let reason = contributions
+                .workflow_failure
+                .unwrap_or_else(|| match outcome {
+                    CommandStatusKind::Paused => {
+                        failure("step", failure_codes::PAUSED, "Workflow paused", None)
+                    }
+                    CommandStatusKind::Aborted => {
+                        failure("step", failure_codes::ABORTED, "Workflow aborted", None)
+                    }
+                    CommandStatusKind::Cancelled => {
+                        failure("step", failure_codes::CANCELLED, "cancelled", None)
+                    }
+                    _ => {
+                        let step =
+                            if contributions.workflow_outcome == Some(CommandStatusKind::Done) {
+                                failed
+                                    .iter()
+                                    .rev()
+                                    .find(|s| s.phase == FailedStepPhase::Teardown)
+                            } else {
+                                failed
+                                    .iter()
+                                    .rev()
+                                    .find(|s| s.phase == FailedStepPhase::Main)
+                                    .or_else(|| failed.last())
+                            };
+                        match step {
+                            Some(step) => {
+                                let (stage, code) = match step.phase {
+                                    FailedStepPhase::Setup => {
+                                        ("setup", failure_codes::SETUP_FAILED)
+                                    }
+                                    FailedStepPhase::Main => ("step", failure_codes::STEP_FAILED),
+                                    FailedStepPhase::Teardown => {
+                                        ("teardown", failure_codes::TEARDOWN_FAILED)
+                                    }
+                                };
+                                failure(
+                                    stage,
+                                    code,
+                                    format!("Step '{}' failed", step.name),
+                                    Some(step.name.clone()),
+                                )
+                            }
+                            None => failure(
+                                "step",
+                                if matches!(
+                                    result,
+                                    Ok(CommandOutcome::ExecPrompt(_)
+                                        | CommandOutcome::ExecWorkflow(_))
+                                ) {
+                                    failure_codes::STEP_FAILED
+                                } else {
+                                    failure_codes::COMMAND_FAILED
+                                },
+                                format!("Command exited with code {exit_code}"),
+                                None,
+                            ),
+                        }
+                    }
+                });
+            json.error = Some(reason.message.clone());
+            json.stage = Some(reason.stage.clone());
+            json.failure = Some(reason);
+        }
+        if !failed.is_empty() {
+            json.failed_steps = Some(contributions.failed_steps);
+        }
+        match push {
             Ok(PushBackOutcome::NotConfigured) => {}
             Ok(PushBackOutcome::NothingToPush) => json.pushed = Some(None),
             Ok(PushBackOutcome::Pushed(pushed)) => json.pushed = Some(Some(pushed.clone())),
             Err(error) => {
-                exit_code = 1;
-                json.exit_code = Some(exit_code);
+                outcome = CommandStatusKind::Error;
+                json.outcome = Some(outcome);
+                json.exit_code = Some(1);
                 json.error = Some(error.message.clone());
                 json.error_status = Some(500);
                 json.stage = Some(error.stage.into());
+                json.failure = Some(failure(
+                    error.stage,
+                    error.code(),
+                    error.message.clone(),
+                    None,
+                ));
                 json.pushed = Some(None);
             }
         }
-        let status = if result.is_ok() && exit_code == 0 {
-            "done"
-        } else {
-            "error"
+        if let Some(reason) = &json.failure {
+            json.stage = Some(reason.stage.clone());
+        }
+        Self::from_result(json)
+    }
+
+    fn from_result(result: CommandResult) -> Self {
+        let status = match result.outcome.unwrap_or(CommandStatusKind::Error) {
+            CommandStatusKind::Done => "done",
+            CommandStatusKind::Cancelled => "cancelled",
+            _ => "error",
         };
         Self {
-            exit_code,
+            exit_code: result.exit_code.unwrap_or(0),
             status,
-            result_json: serde_json::to_string(&json).expect("command result is serializable"),
+            result_json: serde_json::to_string(&result).expect("command result is serializable"),
         }
     }
 
-    fn with_worktree(mut self, path: Option<std::path::PathBuf>) -> Self {
-        let mut result: CommandResult =
-            serde_json::from_str(&self.result_json).expect("serialized command result");
-        result.worktree_path = path
-            .map(|path| path.display().to_string())
-            .or(result.worktree_path);
-        self.result_json = serde_json::to_string(&result).expect("command result is serializable");
-        self
+    fn map_result(self, update: impl FnOnce(&mut CommandResult)) -> Self {
+        let mut result = read_command_result(&self.result_json).expect("serialized command result");
+        update(&mut result);
+        Self::from_result(result)
     }
 
-    /// Turn this completion into a `cancelled` one: exit 130, `error`
-    /// `"cancelled"` and `cancelled_at`. Re-serialised through
-    /// `serde_json::Value` so `CommandResult` keeps its shape; the worktree
-    /// and push fields survive.
-    fn cancelled(mut self, requested_at: &str) -> Self {
-        let mut result: serde_json::Value =
-            serde_json::from_str(&self.result_json).expect("serialized command result");
-        if let Some(fields) = result.as_object_mut() {
-            fields.insert("exit_code".into(), CANCELLED_EXIT_CODE.into());
-            fields.insert("error".into(), "cancelled".into());
-            fields.insert("cancelled_at".into(), requested_at.into());
-            fields.remove("error_status");
-            fields.remove("stage");
-        }
-        self.exit_code = CANCELLED_EXIT_CODE;
-        self.status = CommandStatus::Cancelled.as_str();
-        self.result_json = result.to_string();
-        self
+    fn with_worktree(self, path: Option<std::path::PathBuf>) -> Self {
+        self.map_result(|result| {
+            result.worktree_path = path
+                .map(|p| p.display().to_string())
+                .or(result.worktree_path.take());
+        })
+    }
+
+    fn cancelled(self, requested_at: &str) -> Self {
+        self.map_result(|result| {
+            let stage = result
+                .failure
+                .as_ref()
+                .map(|f| f.stage.clone())
+                .unwrap_or_else(|| "step".into());
+            result.outcome = Some(CommandStatusKind::Cancelled);
+            result.failure = Some(failure(&stage, failure_codes::CANCELLED, "cancelled", None));
+            result.exit_code = Some(CANCELLED_EXIT_CODE);
+            result.error = Some("cancelled".into());
+            result.cancelled_at = Some(requested_at.into());
+            // Preserve WI 0135's legacy cancellation fields.
+            result.error_status = None;
+            result.stage = None;
+        })
     }
 
     fn persist(
@@ -138,6 +326,152 @@ impl QueuedCommandResult {
             Some(&self.result_json),
         )
     }
+
+    fn publish(
+        &self,
+        store: &SqliteSessionStore,
+        command: &CommandRecord,
+        sender: &super::event_bus::EventBusSender,
+    ) {
+        let row = self
+            .persist(store, &command.id)
+            .and_then(|()| store.get_command(&command.id));
+        let row = match row {
+            Ok(Some(row)) => row,
+            error => {
+                tracing::error!(?error, command_id = %command.id, "Failed to store/read command completion; publishing in-memory result");
+                let mut row = command.clone();
+                row.status = self.status.into();
+                row.exit_code = Some(self.exit_code);
+                row.result = Some(self.result_json.clone());
+                row
+            }
+        };
+        sender.finish(terminal_payload(&row));
+    }
+}
+
+/// Read the terminal event from the same row the status route serves. The row
+/// must have been persisted before this function is called.
+pub(crate) fn terminal_payload(command: &CommandRecord) -> EventPayload {
+    let result: Option<CommandResult> = command.result.as_deref().and_then(read_command_result);
+    EventPayload::CommandStatus {
+        status: result
+            .as_ref()
+            .and_then(|r| r.outcome)
+            .unwrap_or(match command.status.as_str() {
+                "done" => CommandStatusKind::Done,
+                "cancelled" => CommandStatusKind::Cancelled,
+                _ => CommandStatusKind::Error,
+            }),
+        exit_code: result
+            .as_ref()
+            .and_then(|r| r.exit_code)
+            .or(command.exit_code),
+        error: result.as_ref().and_then(|r| {
+            r.error.as_ref().map(|error| {
+                // Preserve the legacy event's push prefix; the embedded result
+                // retains the row's unchanged message and structured stage.
+                if r.failure
+                    .as_ref()
+                    .is_some_and(|f| f.code == failure_codes::PUSH_FAILED)
+                {
+                    format!("push: {error}")
+                } else {
+                    error.clone()
+                }
+            })
+        }),
+        result: result.map(Box::new),
+    }
+}
+
+/// Finish a command which never had a worker (setup failed, queued cancel),
+/// or repair its final pair at startup. No active bus exists for such a row.
+pub(super) fn finalize_unowned_command(
+    store: &SqliteSessionStore,
+    paths: &ApiPaths,
+    id: &str,
+) -> Result<(), crate::data::error::DataError> {
+    // Setup completion and a queued cancellation can race. Both write through
+    // here, so only one can inspect/append a command's final pair at a time.
+    static FINALIZATION: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = FINALIZATION
+        .lock()
+        .expect("terminal finalization lock poisoned");
+    let Some(command) = store.get_command(id)? else {
+        return Ok(());
+    };
+    if !matches!(command.status.as_str(), "done" | "error" | "cancelled") {
+        return Ok(());
+    }
+    // Completed history (including pre-0137 rows) is immutable. A restart
+    // must not describe today's checkout or change the original finish time.
+    if paths
+        .read_command_events(&command.session_id, id)
+        .iter()
+        .any(|event| {
+            event.attempt == command.attempt && matches!(event.payload, EventPayload::Done)
+        })
+    {
+        return Ok(());
+    }
+    let mut result: CommandResult = command
+        .result
+        .as_deref()
+        .and_then(read_command_result)
+        .unwrap_or_default();
+    if result.outcome.is_some() && result.outputs.is_some() {
+        // An already structured terminal row is immutable. Only repair a
+        // missing terminal pair after a crash; never recompute checkout facts
+        // from a checkout that may have changed since this command ended.
+        return CommandLogWriter::append_terminal(paths, &command, terminal_payload(&command));
+    }
+    result.exit_code = result.exit_code.or(command.exit_code);
+    if result.outcome.is_none() {
+        result.outcome = Some(if command.status == "cancelled" {
+            CommandStatusKind::Cancelled
+        } else if command.status == "done" {
+            CommandStatusKind::Done
+        } else {
+            CommandStatusKind::Error
+        });
+    }
+    if result.failure.is_none() && result.outcome != Some(CommandStatusKind::Done) {
+        let cancelled = result.outcome == Some(CommandStatusKind::Cancelled);
+        let setup = result.setup_error.is_some();
+        result.failure = Some(failure(
+            if setup { "setup" } else { "preflight" },
+            if cancelled {
+                failure_codes::CANCELLED
+            } else if setup {
+                failure_codes::SETUP_FAILED
+            } else {
+                failure_codes::INTERNAL
+            },
+            result.error.clone().unwrap_or_else(|| {
+                if cancelled {
+                    "cancelled".into()
+                } else {
+                    "Command failed".into()
+                }
+            }),
+            None,
+        ));
+    }
+    if result.outputs.is_none() {
+        result.outputs = Some(crate::data::fs::command_outputs::summarize_output_dir(
+            &paths.command_output_dir(&command.session_id, id),
+        ));
+    }
+    // There is no captured base for an unowned command. Never attribute the
+    // user's existing files to a command that did not start.
+    let completion = QueuedCommandResult::from_result(result);
+    completion.persist(store, id)?;
+    if let Some(command) = store.get_command(id)? {
+        CommandLogWriter::append_terminal(paths, &command, terminal_payload(&command))?;
+    }
+    Ok(())
 }
 
 /// Factory implemented by the HTTP frontend. Queue lifecycle code only knows
@@ -187,6 +521,11 @@ pub struct QueueWorkerDeps<F: ApiCommandFrontendFactory> {
 }
 
 impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
+    /// Exercise worker early exits from Layer 3's frontend integration tests.
+    #[cfg(test)]
+    pub(crate) async fn execute_for_test(&self, command: CommandRecord) {
+        self.execute_command(command, Default::default()).await;
+    }
     /// Finish cancelled teardown before starting the normal worker pool.
     pub async fn recover_cancelled_cleanup(
         &self,
@@ -319,13 +658,25 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
                 error = %e,
                 "Failed to create command directory"
             );
-            let result_json = serde_json::to_string(&serde_json::json!({
-                "error": format!("Failed to create command directory: {e}"),
-            }))
-            .ok();
-            let _ = self
-                .store
-                .complete_command(&command_id, "error", None, result_json.as_deref());
+            let bus = Arc::new(EventBus::for_attempt(16, cmd.attempt));
+            self.event_buses
+                .lock()
+                .await
+                .insert(command_id.clone(), Arc::clone(&bus));
+            let completion = QueuedCommandResult::new(
+                &Err(crate::command::error::CommandError::Other(format!(
+                    "Failed to create command directory: {e}"
+                ))),
+                &Ok(PushBackOutcome::NotConfigured),
+            )
+            .map_result(|r| {
+                r.outputs = Some(Default::default());
+                if let Some(failure) = &mut r.failure {
+                    failure.stage = "preflight".into();
+                }
+            });
+            completion.publish(&self.store, &cmd, &bus.sender());
+            self.cleanup_event_bus(&command_id).await;
             self.post_execution_check(&session_id, &command_id).await;
             return;
         }
@@ -426,20 +777,35 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
                 );
                 drop(frontend);
                 wait_for_output_drains(&event_bus, &command_id).await;
-                let result_json = serde_json::to_string(&serde_json::json!({
-                    "error": "Session not found in memory",
-                }))
-                .ok();
-                event_bus.sender().emit(EventPayload::Done);
+                let completion = QueuedCommandResult::new(
+                    &Err(crate::command::error::CommandError::Other(
+                        "Session not found in memory".into(),
+                    )),
+                    &Ok(PushBackOutcome::NotConfigured),
+                )
+                .map_result(|r| {
+                    r.outputs = Some(crate::data::fs::command_outputs::summarize_output_dir(
+                        &state_writer.output_dir(),
+                    ));
+                    if let Some(failure) = &mut r.failure {
+                        failure.stage = "preflight".into();
+                    }
+                });
+                completion.publish(&self.store, &cmd, &event_bus.sender());
                 let _ = log_writer.await;
-                let _ =
-                    self.store
-                        .complete_command(&command_id, "error", None, result_json.as_deref());
                 self.cleanup_event_bus(&command_id).await;
                 self.post_execution_check(&session_id, &command_id).await;
                 return;
             }
         };
+
+        let checkout_root = session.read().await.git_root().to_path_buf();
+        let git = Arc::clone(&self.engines.git_engine);
+        let root = checkout_root.clone();
+        let base_sha = tokio::task::spawn_blocking(move || git.command_base_sha(&root))
+            .await
+            .ok()
+            .flatten();
 
         // Capture before dispatch: explicit workflow teardown may publish itself.
         let baseline = match self.store.get_session(&session_id) {
@@ -470,7 +836,11 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
             Arc::clone(&engines.runtime),
             &command_id,
         ));
-        let dispatch = Dispatch::new(frontend, session, engines).with_cancellation(cancel);
+        // The command's `/awman/output` directory (WI 0137 §3): the command
+        // that mounts it creates (or, for `exec prompt`, clears) it.
+        let dispatch = Dispatch::new(frontend, session, engines)
+            .with_cancellation(cancel)
+            .with_output_dir(self.paths.command_output_dir(&session_id, &command_id));
         tracing::info!(
             worker_id = %self.worker_id,
             command_id = %command_id,
@@ -514,7 +884,6 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
         // buffered lines. The timeout keeps cancellation from waiting forever
         // if a backend leaves an output sender open.
         wait_for_output_drains(&event_bus, &command_id).await;
-        event_bus.emit_deferred_command_status();
 
         // A cancel accepted before push-back begins wins over a clean exit:
         // the cancelled work is not published and the command is `cancelled`.
@@ -566,21 +935,69 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
         };
         if let Err(error) = &push_outcome {
             tracing::error!(command_id = %command_id, error = %error.message, "Push-back failed");
-            event_bus.sender().emit(EventPayload::CommandStatus {
-                status: CommandStatusKind::Error,
-                exit_code: Some(1),
-                error: Some(format!("{}: {}", error.stage, error.message)),
-            });
         }
 
-        let mut completion = QueuedCommandResult::new(&result, &push_outcome)
-            .with_worktree(state_writer.kept_worktree());
+        let mut completion =
+            QueuedCommandResult::build(&result, &push_outcome, state_writer.result_contributions())
+                .with_worktree(state_writer.kept_worktree());
         // An accepted cancellation wins until the terminal row is published,
         // including a request received during automatic push-back.
         if let Some(requested_at) = &cancelled_before_push {
             completion = completion.cancelled(requested_at);
         } else if let Ok(Some(requested_at)) = self.lifecycle_store.cancel_requested_at(&command_id)
         {
+            completion = completion.cancelled(&requested_at);
+        }
+        // This runs before post_execution_check can remove a remote clone.
+        let canonical_path = crate::command::dispatch::catalogue::CommandCatalogue::get()
+            .canonical_path(&path_parts);
+        let collect_git = matches!(
+            canonical_path.as_slice(),
+            ["exec", "prompt" | "workflow"] | ["chat"]
+        ) && !matches!(
+            result,
+            Err(crate::command::error::CommandError::WorktreeExists { .. })
+        );
+        let root = state_writer.kept_worktree().unwrap_or(checkout_root);
+        let git = Arc::clone(&self.engines.git_engine);
+        let git_result = tokio::task::spawn_blocking(move || {
+            if collect_git {
+                git.command_result(&root, base_sha.as_deref())
+            } else {
+                Ok(None)
+            }
+        })
+        .await;
+        let git_result = match git_result {
+            Ok(Ok(value)) => value,
+            error => {
+                tracing::warn!(?error, %command_id, "Could not collect command git result");
+                None
+            }
+        };
+        completion = completion.map_result(|value| {
+            value.git = git_result;
+            value.outputs = Some(crate::data::fs::command_outputs::summarize_output_dir(
+                &state_writer.output_dir(),
+            ));
+            // Workflow agents' messages are step output; only exec prompt has
+            // a command-level final message.
+            if crate::command::dispatch::catalogue::CommandCatalogue::get()
+                .canonical_path(&path_parts)
+                .join(" ")
+                != "exec prompt"
+            {
+                value.final_message = None;
+            }
+            if value.data.is_none() {
+                if let Ok(outcome) = &result {
+                    value.data = catalogue_json(outcome);
+                }
+            }
+        });
+        // Git collection and output summarization can take time; observe a
+        // cancellation accepted during either before publishing the row.
+        if let Ok(Some(requested_at)) = self.lifecycle_store.cancel_requested_at(&command_id) {
             completion = completion.cancelled(&requested_at);
         }
         let exit_code = completion.exit_code;
@@ -635,16 +1052,13 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
                 .write_command_metadata(&session_id, &command_id, &metadata);
         }
 
-        event_bus.sender().emit(EventPayload::Done);
-        let _ = log_writer.await;
         // Cleanup has finished. Retire its recovery recipe before publishing
         // the terminal row; a crash after this point needs no repeated cleanup.
         if let Err(error) = self.paths.remove_command_cleanup(&session_id, &command_id) {
             tracing::warn!(%error, "Failed to retire command cleanup recipe");
         }
-        if let Err(error) = completion.persist(&self.store, &command_id) {
-            tracing::error!(%error, %command_id, "Failed to persist command completion");
-        }
+        completion.publish(&self.store, &cmd, &event_bus.sender());
+        let _ = log_writer.await;
         self.cleanup_event_bus(&command_id).await;
         self.post_execution_check(&session_id, &command_id).await;
     }
@@ -686,6 +1100,16 @@ fn command_succeeded_for_push(
         Ok(CommandOutcome::ExecWorkflow(outcome)) => outcome.exit_code == Some(0),
         Ok(CommandOutcome::ExecPrompt(outcome)) => outcome.exit_code == Some(0),
         _ => false,
+    }
+}
+
+/// JSON values used by the catalogue's CLI presenters. Agents record their
+/// exact status/list/detail/kill value in the frontend instead.
+fn catalogue_json(outcome: &CommandOutcome) -> Option<serde_json::Value> {
+    match outcome {
+        CommandOutcome::Ready(outcome) if outcome.json_requested => Some(outcome.to_legacy_json()),
+        CommandOutcome::Squad(outcome) => serde_json::to_value(outcome).ok(),
+        _ => None,
     }
 }
 
@@ -774,6 +1198,7 @@ fn spawn_tracing_subscriber(
                         status,
                         exit_code,
                         error,
+                        ..
                     } => match status {
                         CommandStatusKind::Done => tracing::info!(
                             command_id = %command_id,
@@ -830,6 +1255,7 @@ fn spawn_tracing_subscriber(
                     EventPayload::StdoutLine(_)
                     | EventPayload::StderrLine(_)
                     | EventPayload::StatusMessage { .. }
+                    | EventPayload::StepActivity { .. }
                     | EventPayload::WorkflowPrerequisites { .. } => {}
                 },
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
@@ -881,7 +1307,10 @@ mod completion_tests {
 
         let result = Ok(CommandOutcome::Empty);
         let unconfigured = QueuedCommandResult::new(&result, &Ok(PushBackOutcome::NotConfigured));
-        assert_eq!(unconfigured.result_json, r#"{"exit_code":0}"#);
+        assert_eq!(
+            unconfigured.result_json,
+            r#"{"exit_code":0,"outcome":"done"}"#
+        );
 
         let nothing = QueuedCommandResult::new(&result, &Ok(PushBackOutcome::NothingToPush));
         let json: serde_json::Value = serde_json::from_str(&nothing.result_json).unwrap();
@@ -1000,5 +1429,126 @@ mod completion_tests {
             let json: serde_json::Value = serde_json::from_str(&completion.result_json).unwrap();
             assert!(json.get("worktree_path").is_none());
         }
+    }
+}
+
+#[cfg(test)]
+mod adversarial_tests {
+    use super::*;
+    use crate::command::error::CommandError;
+    use crate::data::execution_event::ExecutionEvent;
+
+    #[test]
+    fn reconciliation_preserves_completed_legacy_history_and_finish_time() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = ApiPaths::from_root(tmp.path());
+        let store = SqliteSessionStore::open(tmp.path()).unwrap();
+        store.insert_session("s", "/work", "then").unwrap();
+        store
+            .enqueue_command("c", "s", "exec prompt", "[]", "log")
+            .unwrap();
+        store
+            .complete_command("c", "done", Some(0), Some(r#"{"exit_code":0}"#))
+            .unwrap();
+        paths.prepare_command_dir("s", "c").unwrap();
+        let done = ExecutionEvent {
+            timestamp: chrono::Utc::now(),
+            attempt: 1,
+            sequence: 1,
+            source: None,
+            payload: EventPayload::Done,
+        };
+        let text = format!("{}\n", serde_json::to_string(&done).unwrap());
+        std::fs::write(paths.command_events_log_path("s", "c"), &text).unwrap();
+        let before = store.get_command("c").unwrap().unwrap();
+        finalize_unowned_command(&store, &paths, "c").unwrap();
+        assert_eq!(store.get_command("c").unwrap().unwrap(), before);
+        assert_eq!(paths.read_command_events_raw("s", "c").unwrap(), text);
+    }
+
+    #[test]
+    fn prelaunch_internal_errors_are_preflight_but_launched_errors_are_step_failures() {
+        use crate::engine::error::EngineError;
+        let error = Err(CommandError::Engine(
+            EngineError::ContainerRuntimeUnavailable {
+                binary: "docker".into(),
+            },
+        ));
+        for started in [false, true] {
+            let completion = QueuedCommandResult::build(
+                &error,
+                &Ok(PushBackOutcome::NotConfigured),
+                ResultContributions {
+                    container_started: started,
+                    ..Default::default()
+                },
+            );
+            let result = read_command_result(&completion.result_json).unwrap();
+            assert_eq!(
+                result.failure.as_ref().unwrap().stage,
+                if started { "step" } else { "preflight" }
+            );
+            assert_eq!(
+                result.stage.as_deref(),
+                Some(result.failure.as_ref().unwrap().stage.as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn workflow_outcomes_do_not_add_catalogue_json_and_nonexec_failures_use_their_own_code() {
+        let workflow = CommandOutcome::ExecWorkflow(
+            crate::command::commands::exec_workflow::ExecWorkflowOutcome {
+                workflow: "w".into(),
+                exit_code: Some(0),
+                worktree_used: false,
+                prerequisites: None,
+            },
+        );
+        assert!(catalogue_json(&workflow).is_none());
+        let ready = crate::command::commands::ready::ReadyOutcome::from(
+            crate::data::ready_summary::ReadySummary::new("docker"),
+        );
+        assert!(catalogue_json(&CommandOutcome::Ready(ready.clone())).is_none());
+        let ready = CommandOutcome::Ready(ready);
+        let completion = QueuedCommandResult::new(&Ok(ready), &Ok(PushBackOutcome::NotConfigured));
+        let result = read_command_result(&completion.result_json).unwrap();
+        assert_eq!(result.failure.as_ref().unwrap().code, "command_failed");
+        assert_eq!(
+            result.error.as_deref(),
+            Some(result.failure.as_ref().unwrap().message.as_str())
+        );
+        assert_eq!(
+            result.stage.as_deref(),
+            Some(result.failure.as_ref().unwrap().stage.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn persistence_failure_still_publishes_the_in_memory_terminal_pair() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = SqliteSessionStore::open(tmp.path()).unwrap();
+        store.insert_session("s", "/work", "then").unwrap();
+        store
+            .enqueue_command("c", "s", "exec prompt", "[]", "log")
+            .unwrap();
+        let command = store.get_command("c").unwrap().unwrap();
+        let connection = rusqlite::Connection::open(tmp.path().join("awman.db")).unwrap();
+        connection.execute_batch("CREATE TRIGGER refuse_completion BEFORE UPDATE ON commands BEGIN SELECT RAISE(FAIL, 'injected'); END;").unwrap();
+        let completion = QueuedCommandResult::new(
+            &Ok(CommandOutcome::Empty),
+            &Ok(PushBackOutcome::NotConfigured),
+        );
+        let bus = EventBus::new(8);
+        let mut events = bus.subscribe();
+        completion.publish(&store, &command, &bus.sender());
+        assert!(
+            matches!(events.recv().await.unwrap().payload, EventPayload::CommandStatus { result: Some(result), .. } if result.outcome == Some(CommandStatusKind::Done))
+        );
+        assert!(matches!(
+            events.recv().await.unwrap().payload,
+            EventPayload::Done
+        ));
+        assert!(events.try_recv().is_err());
     }
 }

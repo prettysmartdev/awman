@@ -17,21 +17,71 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 use crate::data::error::DataError;
 use crate::data::execution_event::ExecutionEvent;
+use crate::data::fs::api_db::{FailedStep, PullRequestRef};
 use crate::data::fs::api_paths::ApiPaths;
 use crate::data::workflow_state::WorkflowState;
 
 /// Owns the filesystem side of a command's live workflow state so the API
 /// frontend never touches the filesystem itself. Synchronous because the
 /// engine reports state from its synchronous persistence path.
+///
+/// It is also the one handle the API frontend and the queue worker share
+/// while a command runs, so facts the frontend learns on the way — the kept
+/// worktree, and since WI 0137 the [`ResultContributions`] — reach the
+/// worker's `CommandResult` through it.
 #[derive(Clone)]
 pub struct CommandStateWriter {
     worktree: std::sync::Arc<std::sync::Mutex<Option<std::path::PathBuf>>>,
+    contributions: std::sync::Arc<std::sync::Mutex<ResultContributions>>,
     paths: ApiPaths,
     session_id: String,
     command_id: String,
 }
 
+/// Pieces of a `CommandResult` (WI 0137 §1) that are learned while the
+/// command runs, by whoever learns them, and merged into the result by the
+/// queue worker when the command ends. Every field is optional; a field that
+/// nobody recorded stays absent from the result.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ResultContributions {
+    /// Engine completion, handed to the queue worker which owns the final event.
+    pub workflow_outcome: Option<crate::data::execution_event::CommandStatusKind>,
+    pub workflow_failure: Option<crate::data::fs::api_db::CommandFailure>,
+    pub workflow_main_started: bool,
+    pub container_started: bool,
+    /// `exec prompt`: the agent's final message, from the output translator.
+    pub final_message: Option<String>,
+    /// The URL a `create_pull_request` teardown step printed.
+    pub pull_request: Option<PullRequestRef>,
+    /// The JSON value of a command with a `--json` form.
+    pub data: Option<serde_json::Value>,
+    /// Failed main, setup and teardown steps, each listed once (the last
+    /// record for a phase/index wins, so a retried step keeps its last attempt).
+    pub failed_steps: Vec<FailedStep>,
+}
+
 impl CommandStateWriter {
+    pub fn record_container_started(&self) {
+        self.contributions().container_started = true;
+    }
+    pub fn record_workflow_main_started(&self) {
+        self.contributions().workflow_main_started = true;
+    }
+
+    pub fn record_workflow_failure(
+        &self,
+        failure: Option<crate::data::fs::api_db::CommandFailure>,
+    ) {
+        self.contributions().workflow_failure = failure;
+    }
+
+    pub fn record_workflow_outcome(
+        &self,
+        outcome: crate::data::execution_event::CommandStatusKind,
+    ) {
+        self.contributions().workflow_outcome = Some(outcome);
+    }
+
     pub fn new(
         paths: ApiPaths,
         session_id: impl Into<String>,
@@ -39,10 +89,72 @@ impl CommandStateWriter {
     ) -> Self {
         Self {
             worktree: Default::default(),
+            contributions: Default::default(),
             paths,
             session_id: session_id.into(),
             command_id: command_id.into(),
         }
+    }
+
+    /// The command's `/awman/output` host directory (WI 0137 §3).
+    pub fn output_dir(&self) -> std::path::PathBuf {
+        self.paths
+            .command_output_dir(&self.session_id, &self.command_id)
+    }
+
+    /// Record the agent's final message (WI 0137 §4). A later call replaces
+    /// an earlier one: an `exec prompt` restart reruns from scratch.
+    pub fn record_final_message(&self, message: impl Into<String>) {
+        self.contributions().final_message = Some(message.into());
+    }
+
+    /// Record the pull request a teardown step opened (WI 0137 §1).
+    pub fn record_pull_request(&self, url: impl Into<String>) {
+        self.contributions().pull_request = Some(PullRequestRef { url: url.into() });
+    }
+
+    /// Record the JSON value of a `--json` command (WI 0137 §1).
+    pub fn record_data(&self, value: serde_json::Value) {
+        self.contributions().data = Some(value);
+    }
+
+    /// Record a failed step, replacing an earlier record of the same index and
+    /// phase so a retried step is listed once with its last attempt.
+    pub fn record_failed_step(&self, mut step: FailedStep) {
+        let mut contributions = self.contributions();
+        if let Some(previous) = contributions.failed_steps.iter().find(|existing| {
+            existing.index == step.index
+                && existing.phase == step.phase
+                && existing.step_attempt == step.step_attempt
+        }) {
+            step.exit_code = step.exit_code.or(previous.exit_code);
+            step.error = step.error.or_else(|| previous.error.clone());
+        }
+        contributions
+            .failed_steps
+            .retain(|existing| !(existing.index == step.index && existing.phase == step.phase));
+        contributions.failed_steps.push(step);
+    }
+
+    pub fn record_step_succeeded(
+        &self,
+        phase: crate::data::fs::api_db::FailedStepPhase,
+        index: usize,
+    ) {
+        self.contributions()
+            .failed_steps
+            .retain(|step| step.phase != phase || step.index != index);
+    }
+
+    /// A snapshot of everything recorded so far.
+    pub fn result_contributions(&self) -> ResultContributions {
+        self.contributions().clone()
+    }
+
+    fn contributions(&self) -> std::sync::MutexGuard<'_, ResultContributions> {
+        self.contributions
+            .lock()
+            .expect("result contributions poisoned")
     }
 
     /// Shared with the queue worker so early errors after preparation still
@@ -85,6 +197,76 @@ pub struct CommandLogWriter {
 }
 
 impl CommandLogWriter {
+    /// Terminal pair for commands that never had an owning worker. Reconciliation
+    /// may call this again after a restart; completed attempts are left alone.
+    /// The caller must ensure no worker is concurrently writing these logs.
+    pub fn append_terminal(
+        paths: &ApiPaths,
+        command: &crate::data::fs::api_db::CommandRecord,
+        payload: crate::data::execution_event::EventPayload,
+    ) -> Result<(), DataError> {
+        use crate::data::execution_event::{EventPayload, ExecutionEvent};
+        use std::io::{BufRead, Read, Seek, Write};
+        paths.prepare_command_dir(&command.session_id, &command.id)?;
+        let path = paths.command_events_log_path(&command.session_id, &command.id);
+        let append = || -> std::io::Result<()> {
+            let mut sequence = 0;
+            let mut has_status = false;
+            if let Ok(file) = std::fs::File::open(&path) {
+                for line in std::io::BufReader::new(file).split(b'\n') {
+                    if let Ok(event) = serde_json::from_slice::<ExecutionEvent>(&line?) {
+                        if event.attempt == command.attempt {
+                            sequence = sequence.max(event.sequence + 1);
+                            if matches!(event.payload, EventPayload::Done) {
+                                return Ok(());
+                            }
+                            has_status |=
+                                matches!(event.payload, EventPayload::CommandStatus { .. });
+                        }
+                    }
+                }
+            }
+            let mut events = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)?;
+            if events.metadata()?.len() > 0 {
+                let mut tail = std::fs::File::open(&path)?;
+                tail.seek(SeekFrom::End(-1))?;
+                let mut byte = [0];
+                tail.read_exact(&mut byte)?;
+                if byte[0] != b'\n' {
+                    events.write_all(b"\n")?;
+                }
+            }
+            let mut output = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(paths.command_log_path(&command.session_id, &command.id))?;
+            for payload in [(!has_status).then_some(payload), Some(EventPayload::Done)]
+                .into_iter()
+                .flatten()
+            {
+                let event = ExecutionEvent {
+                    timestamp: chrono::Utc::now(),
+                    attempt: command.attempt,
+                    sequence,
+                    source: None,
+                    payload,
+                };
+                serde_json::to_writer(&mut events, &event)?;
+                events.write_all(b"\n")?;
+                if let Some(line) = event.payload.to_plain_text() {
+                    writeln!(output, "{line}")?;
+                }
+                sequence += 1;
+            }
+            events.flush()?;
+            output.flush()
+        };
+        append().map_err(|source| DataError::Io { path, source })
+    }
+
     /// Open both log files for `command_id` under `session_id` for appending,
     /// creating them if absent. A re-queued command (attempt > 1) continues
     /// the same files, so the previous attempt's lines stay. If a file is
@@ -170,6 +352,7 @@ mod append_tests {
 
     fn event(attempt: u32, sequence: u64, text: &str) -> ExecutionEvent {
         ExecutionEvent {
+            source: None,
             timestamp: chrono::Utc::now(),
             attempt,
             sequence,
