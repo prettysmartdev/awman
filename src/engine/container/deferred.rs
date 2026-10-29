@@ -108,6 +108,12 @@ impl ContainerBackend for DeferredBackend {
     fn remove_agent(&self, id: &str) -> Result<(), EngineError> {
         self.get()?.remove_agent(id)
     }
+    fn run_probe(&self, request: &super::backend::ProbeRequest<'_>) -> Result<String, EngineError> {
+        self.get()?.run_probe(request)
+    }
+    fn image_id(&self, tag: &str) -> Result<Option<String>, EngineError> {
+        self.get()?.image_id(tag)
+    }
     fn image_exists(&self, tag: &str) -> Result<bool, EngineError> {
         self.get()?.image_exists(tag)
     }

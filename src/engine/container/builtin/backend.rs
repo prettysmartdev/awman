@@ -9,7 +9,11 @@ use super::{
 };
 use crate::{
     data::{
-        config::{builtin_launch::BuiltinLaunchSettings, env::Env},
+        config::{
+            builtin_launch::BuiltinLaunchSettings,
+            builtin_network::{BuiltinNetworkSettings, NetworkMode},
+            env::Env,
+        },
         message::UserMessageSink,
         oci_identity::{ImageIdentity, InstalledImageIdentity},
         session::{AgentHandle, Session},
@@ -22,7 +26,7 @@ use crate::{
         },
         container::{
             agent_argv::AgentArgv,
-            backend::ContainerBackend,
+            backend::{ContainerBackend, ProbeRequest},
             background::BackgroundLaunchRequest,
             options::{OverlayPermission, OverlaySpec, ResolvedContainerOptions},
             runtime::{BuiltinRuntimeSettings, ContainerImageInfo},
@@ -174,6 +178,66 @@ impl BuiltinBackend {
             }
         }
         Ok(launch)
+    }
+    /// Run the probe script in sandbox `id` and return its stdout, bounded by
+    /// the request's timeout. The caller removes the sandbox.
+    fn collect_probe(
+        &self,
+        id: &str,
+        config: &SandboxImageConfig,
+        request: &ProbeRequest<'_>,
+    ) -> Result<String, EngineError> {
+        let mut argv: Vec<String> = ["/bin/sh", "-c", request.script, "sh"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        argv.extend(request.tools.iter().map(|t| t.to_string()));
+        let session = self.driver.exec(
+            id,
+            ExecRequest {
+                argv,
+                cwd: Some("/".into()),
+                user: config.user.clone(),
+                ..Default::default()
+            },
+        )?;
+        // Blocking receiver is isolated from the caller's Tokio context.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut events = session.events;
+            while let Ok(event) = events.blocking_recv() {
+                let terminal = matches!(event, ExecEvent::Exited(_) | ExecEvent::Failed);
+                if tx.send(event).is_err() || terminal {
+                    break;
+                }
+            }
+        });
+        let deadline = std::time::Instant::now() + request.timeout;
+        let mut stdout = Vec::new();
+        loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            match rx.recv_timeout(left) {
+                Ok(ExecEvent::Stdout(bytes)) => stdout.extend_from_slice(&bytes),
+                Ok(ExecEvent::Stderr(_)) => {}
+                Ok(ExecEvent::Exited(0)) => break,
+                Ok(ExecEvent::Exited(code)) => {
+                    return Err(EngineError::Container(format!(
+                        "builtin phase-tools probe exited with {code}"
+                    )));
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    return Err(EngineError::Container(
+                        "builtin phase-tools probe timed out".into(),
+                    ));
+                }
+                _ => {
+                    return Err(EngineError::Container(
+                        "builtin phase-tools probe failed without an exit status".into(),
+                    ));
+                }
+            }
+        }
+        Ok(String::from_utf8_lossy(&stdout).into_owned())
     }
     fn owned(&self, id: &str) -> Result<SandboxSummary, EngineError> {
         let summary = self.driver.get(id)?;
@@ -505,6 +569,52 @@ impl ContainerBackend for BuiltinBackend {
             let _ = std::fs::remove_file(self.paths.attach(id, owner));
         }
         Ok(())
+    }
+    /// Boot a throwaway VM with no mounts and no network device, run the
+    /// probe as the image USER, and remove the VM whatever the outcome.
+    fn run_probe(&self, request: &ProbeRequest<'_>) -> Result<String, EngineError> {
+        self.is_available()?;
+        let _image_lease = self.paths.image_lease(request.image, false)?;
+        let config = self.driver.image_config(request.image)?.ok_or_else(|| {
+            EngineError::BuiltinImageNotImported {
+                image: request.image.to_string(),
+            }
+        })?;
+        let launch = BuiltinLaunchSettings::default();
+        let offline = BuiltinNetworkSettings {
+            mode: NetworkMode::None,
+            ..Default::default()
+        };
+        let name = format!(
+            "{}-probe",
+            crate::engine::container::naming::generate_container_name()
+        );
+        let id = naming::sandbox_name_for(&name);
+        let owner = format!("{}/{}", self.owner, uuid::Uuid::new_v4());
+        self.driver.create(SandboxSpec {
+            name: id.clone(),
+            image: request.image.into(),
+            labels: naming::labels(
+                &name,
+                &owner,
+                naming::LaunchLabels {
+                    vcpus: 1,
+                    memory_mib: launch.memory_mib,
+                    network_mode: offline.mode.as_str(),
+                },
+                &[],
+            )?,
+            mounts: Vec::new(),
+            mount_owner: None,
+            vcpus: 1,
+            memory_mib: launch.memory_mib,
+            root_disk_mib: launch.root_disk_mib,
+            mount_quota_mib: launch.mount_quota_mib,
+            network: network::compile(&offline),
+        })?;
+        let output = self.collect_probe(&id, &config, request);
+        let _ = self.driver.stop_owned(&id, &owner, Duration::from_secs(2));
+        output
     }
     fn image_exists(&self, tag: &str) -> Result<bool, EngineError> {
         Ok(self.driver.image_config(tag)?.is_some())

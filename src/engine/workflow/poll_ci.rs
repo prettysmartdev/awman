@@ -286,10 +286,13 @@ impl CiPoller {
             .git
             .remote_url_redacted(git_root, "origin")?
             .ok_or_else(|| EngineError::Other("poll_ci: origin remote is missing".into()))?;
+        // The approved destination is a `GitRemoteUrl` redaction (no userinfo,
+        // `host:path` for scp-style remotes); compare in that same form.
+        let current = crate::data::workflow_prerequisites::GitRemoteUrl::parse(&remote_url);
         if self
             .destination
             .as_ref()
-            .is_some_and(|approved| approved != &remote_url)
+            .is_some_and(|approved| approved != &current.redacted)
         {
             return Err(EngineError::Other(
                 "poll_ci: destination changed since prerequisite approval".into(),
@@ -1013,5 +1016,30 @@ mod destination_review_tests {
         let error = poller.fetch_status(root.path()).unwrap_err().to_string();
         assert!(error.contains("destination changed"));
         assert!(!error.contains("fixture_secret"));
+    }
+
+    #[test]
+    fn an_unchanged_ssh_destination_matches_its_approved_redaction() {
+        for url in ["git@example.test:o/r.git", "ssh://git@example.test/o/r.git"] {
+            let root = tempfile::tempdir().unwrap();
+            for args in [&["init", "-q"][..], &["remote", "add", "origin", url][..]] {
+                assert!(std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(root.path())
+                    .output()
+                    .unwrap()
+                    .status
+                    .success());
+            }
+            // The prerequisite flow approves `GitRemoteUrl::parse(..).redacted`.
+            let approved = crate::data::workflow_prerequisites::GitRemoteUrl::parse(url).redacted;
+            let poller =
+                CiPoller::new(Arc::new(GitEngine::new()), None).with_destination(Some(approved));
+            // Past the destination check, a non-github.com host without a token
+            // stops before any network use.
+            let error = poller.fetch_status(root.path()).unwrap_err().to_string();
+            assert!(!error.contains("destination changed"), "{url}: {error}");
+            assert!(error.contains("explicit token grant"), "{url}: {error}");
+        }
     }
 }

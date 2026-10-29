@@ -1492,3 +1492,62 @@ async fn structured_launch_announces_its_protocol_before_taking_io() {
     rig.driver.emit(&id, ExecEvent::Exited(0));
     execution.wait().await.unwrap();
 }
+
+#[test]
+fn phase_tools_probe_runs_offline_without_mounts_and_removes_its_vm() {
+    let rig = Rig::new("session-a");
+    let driver = rig.driver.clone();
+    let emitter = std::thread::spawn(move || {
+        for _ in 0..400 {
+            let id = driver.names().into_iter().next();
+            if let Some(id) = id.filter(|id| !driver.execs(id).is_empty()) {
+                let spec = driver.spec(&id);
+                assert!(spec.mounts.is_empty(), "a probe never mounts anything");
+                assert!(!spec.network.enabled, "a probe has no network device");
+                assert_eq!(spec.labels[naming::LABEL_NETWORK_MODE], "none");
+                driver.emit(&id, ExecEvent::Stdout(b"git=1\ngh=0\nuid=1000\n".to_vec()));
+                driver.emit(&id, ExecEvent::Exited(0));
+                return driver.execs(&id).remove(0);
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("probe never started");
+    });
+    let output = rig
+        .backend
+        .run_probe(&ProbeRequest {
+            tools: &["git", "gh"],
+            image: "agent:latest",
+            script: "probe-script",
+            timeout: Duration::from_secs(5),
+        })
+        .unwrap();
+    let request = emitter.join().unwrap();
+    assert_eq!(output, "git=1\ngh=0\nuid=1000\n");
+    assert_eq!(
+        request.argv,
+        ["/bin/sh", "-c", "probe-script", "sh", "git", "gh"]
+    );
+    assert_eq!(request.user.as_deref(), Some("probe"));
+    assert!(
+        request.env.is_empty(),
+        "no session env or secrets reach a probe"
+    );
+    assert!(rig.driver.names().is_empty(), "the probe VM is removed");
+}
+
+#[test]
+fn phase_tools_probe_for_a_missing_image_creates_nothing() {
+    let rig = Rig::new("session-a");
+    let error = rig
+        .backend
+        .run_probe(&ProbeRequest {
+            tools: &["git"],
+            image: "absent:latest",
+            script: "true",
+            timeout: Duration::from_secs(1),
+        })
+        .unwrap_err();
+    assert!(matches!(error, EngineError::BuiltinImageNotImported { .. }));
+    assert_eq!(rig.driver.creates(), 0);
+}
