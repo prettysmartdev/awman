@@ -256,7 +256,7 @@ Workflows can include optional `setup` and `teardown` sections to prepare the en
 - Pushing branches to a remote
 - Cleanup operations
 
-All setup and teardown steps execute inside the project's **base container image** — the same isolated Docker container used for agent steps. Workflow commands run in fresh containers; host prerequisite operations include Git metadata probes, an explicitly requested local identity write, fixed `gh auth` commands, and token acquisition. Repository acquisition commands require exact-executable approval; globally configured acquisition commands use the operator's existing authorization and are listed in every report. Each step container is built with only that step's overlays and is removed as soon as the step finishes. In the TUI and an interactive CLI session, uncredentialed steps can use an attached terminal. Credentialed Git operations and runs holding token grants use filtered, streamed output — see [Container execution model](#container-execution-model).
+All setup and teardown steps execute inside the project's **base container image** — the same isolated Docker container used for agent steps. Workflow commands run in fresh containers; host prerequisite operations include Git metadata probes, an explicitly requested local identity write, fixed `gh auth` commands, and token acquisition. Repository acquisition commands require exact-executable approval; globally configured acquisition commands use the operator's existing authorization and are listed in every report. Each step container is built with only that step's overlays and is removed as soon as the step finishes. In the TUI and an interactive CLI session, steps use an attached terminal, including Git operations that use a granted SSH key. Runs holding token grants use filtered, streamed output instead — see [Container execution model](#container-execution-model).
 
 ### Workflow prerequisite checks
 
@@ -675,9 +675,9 @@ Every setup and teardown step that runs a command (every step type except `poll_
 3. When the command exits, the container exits and is removed. In the TUI the container window closes, leaving the summary bar
 4. All of the command's output is also recorded, so a failing step's [`on_failure` agent](#step-remediation-with-on_failure) still gets it in its failure file. A terminal merges a command's stdout and stderr into one stream, so the whole transcript appears under `STDOUT` and `STDERR` reads `(empty)`; color codes are stripped
 
-**Headless (`--non-interactive` CLI, the API server, and squad):**
+**Headless (`--non-interactive` CLI, the API server, and squad), and any run holding a token grant:**
 1. awman starts a background container, runs the step's command in it with no terminal attached, then removes the container
-2. Each line of output is streamed into the status log (or the API/squad event stream) as it's printed
+2. Each line of output is redacted, then streamed as it's printed: in the TUI into the step's container window (which closes when the step ends), in the CLI to your terminal, and in the API/squad event stream
 3. stdout and stderr are captured separately for the `on_failure` failure file
 
 In both modes:

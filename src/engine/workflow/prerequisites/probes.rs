@@ -299,7 +299,7 @@ impl PrerequisitePreflight {
                 ]),
                 None => Self::check(need, PrerequisiteStatus::Unknown, "phase probe did not report this tool; check the image", vec![]),
             },
-            PhaseToolsStatus::Unknown { .. } => Self::check(need, PrerequisiteStatus::Unknown, "phase image could not be probed (unavailable image, runtime or test isolation); build/check the image separately", vec![]),
+            PhaseToolsStatus::Unknown { reason } => Self::check(need, PrerequisiteStatus::Unknown, format!("phase image could not be probed: {reason}"), vec![]),
         }
     }
 

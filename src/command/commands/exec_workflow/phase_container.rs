@@ -9,8 +9,10 @@
 //! agent step. The container's shape, and the transcript it keeps, are the
 //! runtime's ([`ContainerRuntime::build_phase_step`]); this module only wires
 //! the command's frontend to it and reports the result to the workflow engine.
-//! Credentialed operations always use the filtered background stream, so raw
-//! terminal output cannot expose a grant before the engine redacts it.
+//! A step holding a secret env grant (a token) always uses the filtered
+//! background stream, so raw terminal output cannot expose it before the
+//! engine redacts it. A transport-only grant (an SSH key, the isolated git
+//! metadata) has nothing to redact and keeps the foreground PTY.
 //!
 //! The headless path's contract is kept: the full transcript comes back as
 //! the step's [`ExecOutput`], so a failing step's `on_failure` agent still gets
@@ -65,8 +67,8 @@ impl PhaseContainerFactory<'_> {
         overlays: &[OverlaySpec],
     ) -> Result<Box<dyn AgentExec>, EngineError> {
         let launch = self.agent_engine.builtin_launch_settings(self.session)?;
-        if self.interactive && self.transport.is_none() && self.secret_env.is_empty() {
-            return Ok(Box::new(InteractivePhaseContainer::new(
+        let container: Box<dyn AgentExec> = if self.interactive && self.secret_env.is_empty() {
+            Box::new(InteractivePhaseContainer::new(
                 self.runtime.clone(),
                 self.frontend.clone(),
                 step,
@@ -77,22 +79,23 @@ impl PhaseContainerFactory<'_> {
                     overlays: overlays.to_vec(),
                     builtin_launch: launch,
                 },
-            )));
-        }
-        let name = self
-            .name_prefix
-            .map(|prefix| format!("{prefix}phase-{}", uuid::Uuid::new_v4().simple()));
-        let container: Box<dyn AgentExec> = Box::new(self.runtime.start_background(
-            &crate::engine::container::background::BackgroundLaunchRequest {
-                secret_env: self.secret_env,
-                name: name.as_deref(),
-                image: self.image,
-                workdir: self.workdir,
-                env,
-                overlays,
-                builtin_launch: launch.as_ref(),
-            },
-        )?);
+            ))
+        } else {
+            let name = self
+                .name_prefix
+                .map(|prefix| format!("{prefix}phase-{}", uuid::Uuid::new_v4().simple()));
+            Box::new(self.runtime.start_background(
+                &crate::engine::container::background::BackgroundLaunchRequest {
+                    secret_env: self.secret_env,
+                    name: name.as_deref(),
+                    image: self.image,
+                    workdir: self.workdir,
+                    env,
+                    overlays,
+                    builtin_launch: launch.as_ref(),
+                },
+            )?)
+        };
         if let Some(transport) = self.transport {
             Ok(Box::new(TransportPhaseContainer {
                 inner: container,

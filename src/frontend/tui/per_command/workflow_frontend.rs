@@ -216,6 +216,9 @@ impl WorkflowFrontend for TuiCommandFrontend {
         if let Ok(mut guard) = self.yolo_state.lock() {
             *guard = None;
         }
+        // An `on_failure` agent takes the window over from a streamed phase
+        // step; a retry of that step readies it again.
+        self.phase_stream_open = false;
 
         if self.parallel_group_active {
             // Parallel steps get their own fresh slot (with a fresh parser)
@@ -276,6 +279,8 @@ impl WorkflowFrontend for TuiCommandFrontend {
     fn on_phase_step_started(&mut self, kind: PhaseKind, description: &str) {
         self.messages
             .info(format!("{}: {description}", kind.label()));
+        self.phase_stream_title = Some(format!("[{}] {description}", kind.label()));
+        self.phase_stream_open = false;
         upsert_phase_step(
             &self.workflow_view,
             step_kind(kind),
@@ -284,11 +289,28 @@ impl WorkflowFrontend for TuiCommandFrontend {
         );
     }
 
+    /// Only steps on the filtered background stream (those holding a token
+    /// grant) report output line by line; a PTY step's output is already in
+    /// the container window. The lines arrive redacted and are written into
+    /// the container window the same way a PTY step's bytes are, so phase
+    /// step output never lands in the outer status log.
     fn on_phase_step_output(&mut self, _kind: PhaseKind, line: &str) {
-        self.messages.info(format!("  {line}"));
+        if !self.phase_stream_open {
+            self.phase_stream_open = true;
+            self.pty_reset_flag
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            if let Ok(mut name) = self.container_name_shared.lock() {
+                *name = None;
+            }
+            if let Ok(mut title) = self.container_title_shared.lock() {
+                *title = self.phase_stream_title.clone();
+            }
+        }
+        let _ = self.stdout_tx.send(format!("{line}\r\n").into_bytes());
     }
 
     fn on_phase_step_completed(&mut self, kind: PhaseKind, description: &str) {
+        self.close_phase_stream(0);
         self.messages
             .success(format!("{}: {description}", kind.label()));
         upsert_phase_step(
@@ -306,6 +328,7 @@ impl WorkflowFrontend for TuiCommandFrontend {
         exit_code: i32,
         stderr: &str,
     ) {
+        self.close_phase_stream(exit_code);
         let label = kind.label();
         let msg = if stderr.is_empty() {
             format!("{label} failed: {description} (exit {exit_code})")
@@ -448,6 +471,18 @@ impl WorkflowFrontend for TuiCommandFrontend {
 /// Map a WCB dialog response to a `NextAction`.
 /// Project an engine [`AvailableActions`] onto the TUI dialog state. One place
 /// so the escalated-from-step-confirm board and the direct board never drift.
+impl TuiCommandFrontend {
+    /// Close the container window a streamed phase step readied, the same
+    /// way a container exit closes a PTY step's window.
+    fn close_phase_stream(&mut self, exit_code: i32) {
+        if std::mem::take(&mut self.phase_stream_open) {
+            if let Ok(mut guard) = self.container_exit_shared.lock() {
+                *guard = Some(exit_code);
+            }
+        }
+    }
+}
+
 fn control_board_state(step_name: &str, available: &AvailableActions) -> WorkflowControlBoardState {
     WorkflowControlBoardState {
         step_name: step_name.to_string(),
@@ -1127,6 +1162,59 @@ mod tests {
             .pty_reset_flag
             .load(std::sync::atomic::Ordering::Relaxed));
         assert!(frontend.container_name_shared.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn streamed_phase_step_output_goes_to_the_container_window_not_the_status_log() {
+        let (mut frontend, _req_rx, _resp_tx) = make_frontend();
+        let (stdout_tx, mut stdout_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        frontend.stdout_tx = stdout_tx;
+        *frontend.container_name_shared.lock().unwrap() = Some("old".into());
+
+        frontend.on_phase_step_started(PhaseKind::Teardown, "push branch");
+        frontend.on_phase_step_output(PhaseKind::Teardown, "To github.com:o/r.git");
+        frontend.on_phase_step_output(PhaseKind::Teardown, "done");
+
+        assert_eq!(
+            stdout_rx.try_recv().unwrap(),
+            b"To github.com:o/r.git\r\n".to_vec()
+        );
+        assert_eq!(stdout_rx.try_recv().unwrap(), b"done\r\n".to_vec());
+        assert!(frontend
+            .pty_reset_flag
+            .load(std::sync::atomic::Ordering::Relaxed));
+        assert!(frontend.container_name_shared.lock().unwrap().is_none());
+        assert_eq!(
+            frontend.container_title_shared.lock().unwrap().as_deref(),
+            Some("[teardown] push branch")
+        );
+        assert!(!frontend
+            .status_log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| e.text.contains("To github.com")));
+        assert!(frontend.container_exit_shared.lock().unwrap().is_none());
+
+        frontend.on_phase_step_completed(PhaseKind::Teardown, "push branch");
+        assert_eq!(*frontend.container_exit_shared.lock().unwrap(), Some(0));
+    }
+
+    #[test]
+    fn a_failed_streamed_phase_step_closes_its_window_with_the_exit_code() {
+        let (mut frontend, _req_rx, _resp_tx) = make_frontend();
+        frontend.on_phase_step_started(PhaseKind::Teardown, "open PR");
+        frontend.on_phase_step_output(PhaseKind::Teardown, "error");
+        frontend.on_phase_step_failed(PhaseKind::Teardown, "open PR", 3, "");
+        assert_eq!(*frontend.container_exit_shared.lock().unwrap(), Some(3));
+    }
+
+    #[test]
+    fn a_phase_step_without_streamed_output_leaves_the_window_alone() {
+        let (mut frontend, _req_rx, _resp_tx) = make_frontend();
+        frontend.on_phase_step_started(PhaseKind::Setup, "fetch");
+        frontend.on_phase_step_completed(PhaseKind::Setup, "fetch");
+        assert!(frontend.container_exit_shared.lock().unwrap().is_none());
     }
 
     #[test]

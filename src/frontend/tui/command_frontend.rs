@@ -108,6 +108,15 @@ pub struct TuiCommandFrontend {
     /// table reopens with that row selected (the `config show` edit loop
     /// presents the dialog again after every save).
     pub(crate) last_config_edit_field: Option<String>,
+    /// The window title for the setup/teardown step now running, set when it
+    /// starts. A step on the filtered background stream (one holding a token
+    /// grant) has no PTY, so its redacted output lines are written into the
+    /// container window under this title instead of the status log.
+    pub(crate) phase_stream_title: Option<String>,
+    /// Whether the current phase step's filtered output has readied the
+    /// container window; cleared when the step ends or a PTY launch takes the
+    /// window over.
+    pub(crate) phase_stream_open: bool,
 }
 
 // `SquadCommandFrontend` for `TuiCommandFrontend` (interview dialogs) lives in
@@ -207,6 +216,8 @@ impl TuiCommandFrontend {
             pending_step_slot_io: HashMap::new(),
             pending_parallel_yolo_cancel: HashMap::new(),
             last_config_edit_field: None,
+            phase_stream_title: None,
+            phase_stream_open: false,
         }
     }
 
