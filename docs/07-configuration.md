@@ -297,8 +297,10 @@ awman config migrate                       # move legacy dynamic-workflow settin
 - Setting the removed `envPassthrough` field errors with guidance to use `env(VAR)` overlay entries instead.
 
 `awman config migrate` moves a repo's old dynamic-workflow block to
-`workflows.dynamic`. Use `--dry-run` to preview the changes, or `--yes` to
-apply without confirmation. It keeps the order of every other key in the file,
+`workflows.dynamic`. It shows the before/after JSON and asks before writing
+(in the TUI the preview scrolls with **↑ / ↓ / PgUp / PgDn**; press **y** to move
+it, **n** or **Esc** to cancel). Use `--dry-run` to preview the changes, or
+`--yes` to apply without confirmation. It keeps the order of every other key in the file,
 and refuses a `.awman/` directory or `config.json` that is a symlink. Saving a
 repo config (`config set`, the TUI config dialog, `awman init`) also moves the
 old repo block automatically and says so. `--global` changes nothing: the

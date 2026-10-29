@@ -96,13 +96,22 @@ pub(crate) fn render_secret_input(
     area: Rect,
     frame: &mut Frame,
 ) {
-    let prompt_lines = prompt.lines().count() as u16;
-    let dialog_h = prompt_lines + 10;
-    let dialog_w = (area.width.saturating_sub(8)).clamp(50, 80);
+    let dialog_w = area
+        .width
+        .saturating_sub(8)
+        .clamp(50, 80)
+        .min(area.width.saturating_sub(2));
+    // Wrapped to the dialog, so a long prompt grows the dialog instead of
+    // running under the input box.
+    let prompt_rows = super::review::prose_rows(prompt, dialog_w.saturating_sub(4) as usize);
+    let prompt_lines = prompt_rows.len() as u16;
+    // Frame (4), blank, input box (3), blank, hint.
+    let dialog_h = (prompt_lines + 10).min(area.height);
     let dialog_area = dialogs::centered_fixed(dialog_w, dialog_h, area);
     let inner = dialogs::render_dialog_frame(title, Color::Cyan, dialog_area, frame);
+    let prompt_lines = prompt_lines.min(inner.height.saturating_sub(4));
     frame.render_widget(
-        Paragraph::new(prompt).style(Style::default().fg(Color::Gray)),
+        Paragraph::new(prompt_rows.join("\n")).style(Style::default().fg(Color::Gray)),
         Rect {
             height: prompt_lines,
             ..inner

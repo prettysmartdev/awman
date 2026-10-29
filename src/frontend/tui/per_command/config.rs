@@ -1,20 +1,29 @@
 //! `ConfigCommandFrontend` impl for the TUI.
 
 use crate::command::commands::config::{
-    ConfigCommandFrontend, ConfigEditRejection, ConfigEditRequest, ConfigFieldRow,
+    ConfigCommandFrontend, ConfigEditRejection, ConfigEditRequest, ConfigFieldRow, MigrateChoice,
 };
 use crate::command::error::CommandError;
 use crate::frontend::tui::command_frontend::TuiCommandFrontend;
 use crate::frontend::tui::dialogs::{
-    ConfigShowRejectedEdit, ConfigShowRow, DialogRequest, DialogResponse,
+    ConfigShowRejectedEdit, ConfigShowRow, DialogRequest, DialogResponse, ReviewBody, ReviewState,
 };
 
 impl ConfigCommandFrontend for TuiCommandFrontend {
+    /// The before/after preview can be far taller than the terminal, so it
+    /// scrolls under a footer that keeps the choices on screen.
     fn confirm_config_migration(
         &mut self,
-        prompt: &crate::data::prompt::Prompt<crate::command::commands::config::MigrateChoice>,
-    ) -> Result<crate::command::commands::config::MigrateChoice, CommandError> {
-        self.pick_from_keyed_prompt(prompt)
+        prompt: &crate::data::prompt::Prompt<MigrateChoice>,
+    ) -> Result<MigrateChoice, CommandError> {
+        let state = ReviewState::question(prompt, ReviewBody::Prose(prompt.body.clone()));
+        let answer = match self.ask_dialog(DialogRequest::Review(state))? {
+            DialogResponse::Char(key) => prompt.answer_for_key(key),
+            _ => None,
+        };
+        answer
+            .or(prompt.default_on_dismiss)
+            .ok_or(CommandError::Aborted)
     }
 
     fn present_config_table(

@@ -1,18 +1,21 @@
 //! `WorkflowPrerequisiteFrontend` impl for the TUI.
 //!
-//! The report is a scrollable modal; every question is the command layer's
-//! `Prompt` drawn as a keyed dialog (title, body, one line per choice); a
-//! pasted token goes through `DialogRequest::SecretInput`, which renders `•`
-//! and is wrapped in a `SecretString` the moment it is answered. Nothing here
-//! decides what is asked, what the choices mean or what runs.
+//! The report and every question are scrollable review dialogs: the body
+//! (the report's checks, or a question's explanation) scrolls under a footer
+//! that always shows the choices, so nothing is pushed off screen however
+//! long the text or small the terminal. The report pins the command layer's
+//! "what happens next" above its choices. A pasted token goes through
+//! `DialogRequest::SecretInput`, which renders `•` and is wrapped in a
+//! `SecretString` the moment it is answered. Nothing here decides what is
+//! asked, what the choices mean or what runs.
 //!
 //! Questions stay visible during yolo countdowns; the event loop dismisses
 //! them when the command countdown expires.
 
 use crate::command::commands::agent_trust::TrustDecision;
 use crate::command::commands::workflow_prerequisites::{
-    GapChoice, IdentityChoice, IdentityPersist, SshChoice, TokenConsent, TokenSourceChoice,
-    ToolChoice, WorkflowPrerequisiteFrontend,
+    GapChoice, IdentityChoice, IdentityPersist, PrerequisiteReportNext, SshChoice, TokenConsent,
+    TokenSourceChoice, ToolChoice, WorkflowPrerequisiteFrontend,
 };
 use crate::command::error::CommandError;
 use crate::data::prompt::{Prompt, TextPrompt};
@@ -22,32 +25,38 @@ use crate::engine::auth::host_secret_command::{
     HostSecretCommandError, HostSecretCommandReview, HostSecretOutput,
 };
 use crate::frontend::tui::command_frontend::TuiCommandFrontend;
-use crate::frontend::tui::dialogs::{DialogRequest, DialogResponse};
+use crate::frontend::tui::dialogs::{DialogRequest, DialogResponse, ReviewBody, ReviewState};
 
 impl TuiCommandFrontend {
-    /// Render the command's choices and return its input transport response.
-    fn ask_prerequisite_prompt<D: Clone>(&self, prompt: &Prompt<D>) -> Result<D, CommandError> {
-        self.pick_from_keyed_prompt(prompt)
+    /// Ask one of the command's questions; Esc and Ctrl-C answer its
+    /// `default_on_dismiss`.
+    fn ask_prerequisite_prompt<D: Clone + PartialEq>(
+        &self,
+        prompt: &Prompt<D>,
+    ) -> Result<D, CommandError> {
+        let state = ReviewState::question(prompt, ReviewBody::Prose(prompt.body.clone()));
+        let answer = match self.ask_dialog(DialogRequest::Review(state))? {
+            DialogResponse::Char(key) => prompt.answer_for_key(key),
+            _ => None,
+        };
+        answer
+            .or_else(|| prompt.default_on_dismiss.clone())
+            .ok_or(CommandError::Aborted)
     }
 }
 
 impl WorkflowPrerequisiteFrontend for TuiCommandFrontend {
+    /// One entry per check, with what continuing leads to pinned above the
+    /// choices. A check-only report offers only Close.
     fn show_workflow_prerequisites(
         &mut self,
         report: &WorkflowPrerequisiteReport,
+        next: PrerequisiteReportNext,
     ) -> Result<(), CommandError> {
-        let prompt = crate::command::prompts::prerequisite_report(report);
-        let response = self.ask_dialog(DialogRequest::Review {
-            title: prompt.title.clone(),
-            body: prompt.body.clone(),
-            keys: prompt
-                .choices
-                .iter()
-                .map(|c| (c.key, c.label.clone()))
-                .collect(),
-            gated_keys: Vec::new(),
-        })?;
-        match response {
+        let prompt = crate::command::prompts::prerequisite_report(report, next);
+        let state = ReviewState::question(&prompt, ReviewBody::Prerequisites(report.clone()))
+            .with_note(prompt.body.clone());
+        match self.ask_dialog(DialogRequest::Review(state))? {
             DialogResponse::Interrupted => Err(CommandError::Aborted),
             DialogResponse::Char(key) if prompt.answer_for_key(key) == Some(false) => {
                 Err(CommandError::Aborted)
@@ -151,16 +160,16 @@ impl WorkflowPrerequisiteFrontend for TuiCommandFrontend {
             .filter(|choice| choice.value == TrustDecision::Approve)
             .map(|choice| choice.key)
             .collect();
-        let response = self.ask_dialog(DialogRequest::Review {
-            title: prompt.title.clone(),
-            body: prompt.body.clone(),
-            keys: prompt
+        let response = self.ask_dialog(DialogRequest::Review(ReviewState::new(
+            prompt.title.clone(),
+            prompt.body.clone(),
+            prompt
                 .choices
                 .iter()
                 .map(|choice| (choice.key, choice.label.clone()))
                 .collect(),
             gated_keys,
-        })?;
+        )))?;
         let answer = match response {
             DialogResponse::Char(key) => prompt.answer_for_key(key),
             _ => None,

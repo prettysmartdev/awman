@@ -26,8 +26,8 @@ pub use flow::{
     ACQUIRE_TRUST_NAME,
 };
 pub use frontend::{
-    GapChoice, IdentityChoice, IdentityPersist, SshChoice, TokenConsent, TokenSourceChoice,
-    ToolChoice, WorkflowPrerequisiteFrontend,
+    GapChoice, IdentityChoice, IdentityPersist, PrerequisiteReportNext, SshChoice, TokenConsent,
+    TokenSourceChoice, ToolChoice, WorkflowPrerequisiteFrontend,
 };
 pub use grants_subcommand::{
     parse_selector, run_prerequisite_grants, PrerequisiteGrantRow, PrerequisiteGrantsAction,

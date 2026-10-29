@@ -691,8 +691,9 @@ impl crate::command::commands::workflow_prerequisites::WorkflowPrerequisiteFront
     fn show_workflow_prerequisites(
         &mut self,
         report: &crate::data::workflow_prerequisites::WorkflowPrerequisiteReport,
+        next: crate::command::commands::workflow_prerequisites::PrerequisiteReportNext,
     ) -> Result<(), CommandError> {
-        self.inner.show_workflow_prerequisites(report)
+        self.inner.show_workflow_prerequisites(report, next)
     }
 
     fn report_workflow_prerequisites_recheck(

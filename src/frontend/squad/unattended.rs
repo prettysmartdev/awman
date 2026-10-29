@@ -794,6 +794,7 @@ impl crate::command::commands::workflow_prerequisites::WorkflowPrerequisiteFront
     fn show_workflow_prerequisites(
         &mut self,
         report: &crate::data::workflow_prerequisites::WorkflowPrerequisiteReport,
+        _next: crate::command::commands::workflow_prerequisites::PrerequisiteReportNext,
     ) -> Result<(), CommandError> {
         let summary = report.summary_line();
         match self.logs.open_step_log("workflow", 0, "prerequisites") {
@@ -1347,7 +1348,12 @@ mod wi0149_tests {
             notes: vec![],
         };
         assert!(!frontend.can_ask_prerequisites());
-        frontend.show_workflow_prerequisites(&report).unwrap();
+        frontend
+            .show_workflow_prerequisites(
+                &report,
+                crate::command::commands::workflow_prerequisites::PrerequisiteReportNext::Decided,
+            )
+            .unwrap();
         let log = std::fs::read_to_string(tmp.path().join("workflow-0-prerequisites.log")).unwrap();
         assert!(log.contains(&report.summary_line()), "{log}");
         assert!(log.contains("No token in GH_TOKEN"));

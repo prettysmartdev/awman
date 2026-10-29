@@ -17,8 +17,8 @@ use crate::command::commands::config::MigrateChoice;
 use crate::command::commands::specs::WorkItemKind;
 use crate::command::commands::squad::commands::{SquadConfirmDecision, TaskWorkspaceChoice};
 use crate::command::commands::workflow_prerequisites::{
-    GapChoice, IdentityChoice, IdentityPersist, SshChoice, TokenConsent, TokenSourceChoice,
-    ToolChoice,
+    GapChoice, IdentityChoice, IdentityPersist, PrerequisiteReportNext, SshChoice, TokenConsent,
+    TokenSourceChoice, ToolChoice,
 };
 use crate::command::dispatch::catalogue::{CommandCatalogue, FlagDefault};
 use crate::command::dispatch::frontend_action::FrontendAction;
@@ -255,17 +255,18 @@ pub fn agents_kill_confirm(agent: &AgentSnapshot) -> Prompt<KillChoice> {
 
 /// `awman config migrate`: move renamed settings to their current keys.
 ///
-/// The body is the migration preview (file path, then the before/after JSON
-/// of every affected key) and a warning about teammates on older awman
-/// versions, who stop seeing moved settings. `default_on_dismiss` is
+/// The body is a warning about teammates on older awman versions, who stop
+/// seeing moved settings, then the migration preview (file path, then the
+/// before/after JSON of every affected key). The warning comes first so a
+/// long preview cannot push it out of sight. `default_on_dismiss` is
 /// `Some(Cancel)`: walking away from a confirmation is a refusal; Esc must
 /// not rewrite a file.
 pub fn config_migrate_confirm(preview: &str) -> Prompt<MigrateChoice> {
     Prompt::new(
         "Move `dynamicWorkflows` to `workflows.dynamic`?",
         format!(
-            "{preview}\n\nteammates on awman versions before v{} will stop seeing these \
-             settings once this change is committed.",
+            "Teammates on awman versions before v{} will stop seeing these settings once \
+             this change is committed.\n\n{preview}",
             env!("CARGO_PKG_VERSION")
         ),
         vec![
@@ -376,17 +377,7 @@ fn cancel_parallel_group(group: &[String], exit: &GroupExit) -> Prompt<ParallelG
 /// "push_branch", "push_branch, create_pull_request" or "any teardown step"
 /// (a dynamic run, whose steps do not exist yet).
 fn prerequisite_steps(check: &PrerequisiteCheck) -> String {
-    if check.needed_by.is_empty() {
-        return "any teardown step".to_string();
-    }
-    let mut kinds: Vec<&str> = Vec::new();
-    for step in &check.needed_by {
-        let label = step.kind.label();
-        if !kinds.contains(&label) {
-            kinds.push(label);
-        }
-    }
-    kinds.join(", ")
+    check.needed_by_label()
 }
 
 /// The git identity question for `commit_changes`, built from the check's
@@ -1182,18 +1173,209 @@ mod wi0149_tests {
     }
 }
 
-/// The summary is a decision in every interactive frontend. Esc continues;
-/// Ctrl-C is an explicit abort, handled by the frontend's input transport.
+/// The prerequisite summary's choices, and what each leads to.
+///
+/// The body is not the table (each frontend draws the report its own way)
+/// but what happens next, so "Continue" is never a leap in the dark: who is
+/// asked what, and what an item left unresolved does to the run. Esc
+/// continues; Ctrl-C is an explicit abort, handled by the frontend's input
+/// transport.
 pub fn prerequisite_report(
     report: &crate::data::workflow_prerequisites::WorkflowPrerequisiteReport,
+    next: PrerequisiteReportNext,
 ) -> Prompt<bool> {
+    use crate::data::config::workflows::UnresolvedMode;
+    use crate::data::workflow_prerequisites::{PrerequisiteOrigin, PrerequisiteStatus};
+
+    let attention = report.needs_attention();
+    let dynamic = report.origin == PrerequisiteOrigin::AssumedAll;
+    let mut body: Vec<String> = Vec::new();
+    if dynamic && next != PrerequisiteReportNext::CheckOnly {
+        body.push(
+            "This is a dynamic workflow: its teardown steps are not known until the leader \
+             writes them, so every kind of teardown step is checked."
+                .into(),
+        );
+    }
+    let choices = match next {
+        PrerequisiteReportNext::CheckOnly => {
+            body.push(
+                "Check only (--check-prerequisites): nothing was granted and no workflow ran."
+                    .into(),
+            );
+            vec![Choice::new('c', "Close", true)]
+        }
+        PrerequisiteReportNext::Decided => vec![Choice::new('c', "Continue", true)],
+        PrerequisiteReportNext::Questions { .. } if attention.is_empty() => {
+            body.push("Everything this workflow needs is available.".into());
+            vec![
+                Choice::new('c', "Start the workflow", true),
+                Choice::new('a', "Abort the run", false),
+            ]
+        }
+        PrerequisiteReportNext::Questions { unresolved } => {
+            let count = attention.len();
+            body.push(format!(
+                "Next: awman asks about {} one at a time and offers a fix where it can. \
+                 Nothing is mounted, passed to a container or written until you choose it.",
+                if count == 1 {
+                    "the item that needs attention".to_string()
+                } else {
+                    format!("each of the {count} items that need attention")
+                }
+            ));
+            let mut steps: Vec<&str> = Vec::new();
+            let mut any_step = false;
+            for check in &attention {
+                any_step |= check.needed_by.is_empty();
+                for step in &check.needed_by {
+                    if !steps.contains(&step.kind.label()) {
+                        steps.push(step.kind.label());
+                    }
+                }
+            }
+            let steps = if any_step || steps.is_empty() {
+                "the steps that need them".to_string()
+            } else {
+                steps.join(", ")
+            };
+            body.push(match unresolved {
+                UnresolvedMode::Warn if dynamic => format!(
+                    "Anything you leave unresolved does not stop the run: the workflow starts, \
+                     you get a warning for each item, the leader is told what is unavailable, \
+                     and {steps} will fail if they run."
+                ),
+                UnresolvedMode::Warn => format!(
+                    "Anything you leave unresolved does not stop the run: the workflow starts, \
+                     you get a warning for each item, and {steps} will fail when they run."
+                ),
+                UnresolvedMode::Fail => "Anything you leave unresolved stops the run before any \
+                     agent starts (workflows.prerequisites.unresolved is \"fail\")."
+                    .to_string(),
+            });
+            vec![
+                Choice::new('c', "Continue to the questions", true),
+                Choice::new('a', "Abort the run", false),
+            ]
+        }
+    };
+    let unknown = report
+        .checks
+        .iter()
+        .filter(|c| c.status == PrerequisiteStatus::Unknown)
+        .count();
+    if unknown > 0 {
+        body.push(format!(
+            "{unknown} {} could not be checked; awman does not ask about {}, and the steps \
+             that need {} may still fail.",
+            if unknown == 1 { "item" } else { "items" },
+            if unknown == 1 { "it" } else { "them" },
+            if unknown == 1 { "it" } else { "them" },
+        ));
+    }
     Prompt::new(
         report.summary_line(),
-        report.render_lines().join("\n"),
-        vec![
-            Choice::new('c', "Continue", true),
-            Choice::new('a', "Abort the run", false),
-        ],
+        body.join("\n\n"),
+        choices,
         Some(true),
     )
+}
+
+#[cfg(test)]
+mod prerequisite_report_tests {
+    use super::*;
+    use crate::data::config::workflows::UnresolvedMode;
+    use crate::data::workflow_prerequisites::*;
+
+    fn report(
+        status: PrerequisiteStatus,
+        origin: PrerequisiteOrigin,
+    ) -> WorkflowPrerequisiteReport {
+        WorkflowPrerequisiteReport {
+            phase: PrerequisitePhase::Start,
+            origin,
+            checks: vec![PrerequisiteCheck {
+                prerequisite: WorkflowPrerequisite::GitHubToken {
+                    host: "github.com".into(),
+                },
+                status,
+                explanation: "No token".into(),
+                needed_by: vec![StepRef {
+                    phase: crate::data::workflow_state::PhaseKind::Teardown,
+                    kind: PrerequisiteStepKind::CreatePullRequest,
+                    index: 0,
+                    description: "open PR".into(),
+                }],
+                remediations: vec![],
+            }],
+            advisories: vec![],
+            notes: vec![],
+        }
+    }
+
+    #[test]
+    fn continuing_with_gaps_says_what_is_asked_and_what_fails() {
+        let r = report(PrerequisiteStatus::Missing, PrerequisiteOrigin::Static);
+        let warn = prerequisite_report(
+            &r,
+            PrerequisiteReportNext::Questions {
+                unresolved: UnresolvedMode::Warn,
+            },
+        );
+        assert_eq!(
+            warn.labels(),
+            vec!["Continue to the questions", "Abort the run"]
+        );
+        assert!(warn.body.contains("one at a time"), "{}", warn.body);
+        assert!(warn.body.contains("does not stop the run"), "{}", warn.body);
+        assert!(
+            warn.body.contains("create_pull_request will fail"),
+            "{}",
+            warn.body
+        );
+        assert_eq!(warn.default_on_dismiss, Some(true));
+        let fail = prerequisite_report(
+            &r,
+            PrerequisiteReportNext::Questions {
+                unresolved: UnresolvedMode::Fail,
+            },
+        );
+        assert!(fail.body.contains("stops the run"), "{}", fail.body);
+    }
+
+    #[test]
+    fn nothing_to_resolve_and_check_only_offer_no_questions() {
+        let ok = report(PrerequisiteStatus::Satisfied, PrerequisiteOrigin::Static);
+        let start = prerequisite_report(
+            &ok,
+            PrerequisiteReportNext::Questions {
+                unresolved: UnresolvedMode::Warn,
+            },
+        );
+        assert_eq!(start.labels(), vec!["Start the workflow", "Abort the run"]);
+        let check = prerequisite_report(
+            &report(PrerequisiteStatus::Missing, PrerequisiteOrigin::AssumedAll),
+            PrerequisiteReportNext::CheckOnly,
+        );
+        assert_eq!(check.labels(), vec!["Close"]);
+        assert!(check.body.contains("no workflow ran"));
+        assert!(!check.body.contains("dynamic"));
+    }
+
+    #[test]
+    fn dynamic_runs_and_unknown_items_are_explained() {
+        let unknown = report(PrerequisiteStatus::Unknown, PrerequisiteOrigin::AssumedAll);
+        let prompt = prerequisite_report(
+            &unknown,
+            PrerequisiteReportNext::Questions {
+                unresolved: UnresolvedMode::Warn,
+            },
+        );
+        assert!(prompt.body.contains("dynamic workflow"), "{}", prompt.body);
+        assert!(
+            prompt.body.contains("1 item could not be checked"),
+            "{}",
+            prompt.body
+        );
+    }
 }

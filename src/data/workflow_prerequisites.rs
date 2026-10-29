@@ -108,6 +108,18 @@ pub enum PrerequisiteStatus {
     Unknown,
 }
 
+impl PrerequisiteStatus {
+    /// The words every frontend shows for this status.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Satisfied => "satisfied",
+            Self::NeedsConsent => "needs consent",
+            Self::Missing => "missing",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AcquireScope {
@@ -530,6 +542,23 @@ impl WorkflowPrerequisites {
     }
 }
 
+impl PrerequisiteCheck {
+    /// The step kinds that need this check, each named once, in order
+    /// ("any teardown step" when the workflow is not known yet).
+    pub fn needed_by_label(&self) -> String {
+        if self.needed_by.is_empty() {
+            return "any teardown step".to_string();
+        }
+        let mut kinds: Vec<&str> = Vec::new();
+        for step in &self.needed_by {
+            if !kinds.contains(&step.kind.label()) {
+                kinds.push(step.kind.label());
+            }
+        }
+        kinds.join(", ")
+    }
+}
+
 impl WorkflowPrerequisiteReport {
     pub fn all_satisfied(&self) -> bool {
         self.needs_attention().is_empty()
@@ -576,16 +605,10 @@ impl WorkflowPrerequisiteReport {
             "Workflow prerequisite", "Status", "Details"
         )];
         for check in &self.checks {
-            let status = match check.status {
-                PrerequisiteStatus::Satisfied => "satisfied",
-                PrerequisiteStatus::NeedsConsent => "needs consent",
-                PrerequisiteStatus::Missing => "missing",
-                PrerequisiteStatus::Unknown => "unknown",
-            };
             lines.push(format!(
                 "{:<32} {:<14} {}",
                 check.prerequisite.label(),
-                status,
+                check.status.label(),
                 check.explanation
             ));
         }

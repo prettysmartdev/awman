@@ -9,7 +9,7 @@
 use super::*;
 pub(crate) use crate::command::commands::workflow_prerequisites::PreparedPrerequisites;
 use crate::command::commands::workflow_prerequisites::{
-    WorkflowPrerequisiteFlow, WorkflowPrerequisiteFlowOptions,
+    PrerequisiteReportNext, WorkflowPrerequisiteFlow, WorkflowPrerequisiteFlowOptions,
 };
 use crate::data::workflow_definition::{SetupStep, TeardownStep};
 use crate::data::workflow_prerequisites::{
@@ -58,7 +58,9 @@ impl ExecWorkflowCommand {
         let flow = self.prerequisite_flow(needs.origin);
         if self.flags.prerequisites.check_only {
             let report = flow.preflight(needs, false);
-            frontend.with(|f| f.show_workflow_prerequisites(&report))?;
+            frontend.with(|f| {
+                f.show_workflow_prerequisites(&report, PrerequisiteReportNext::CheckOnly)
+            })?;
             self.record_prerequisite_report(&report).await;
             return Ok(PrerequisiteStart::CheckOnly(ExecWorkflowOutcome {
                 prerequisites: Some(report.clone()),

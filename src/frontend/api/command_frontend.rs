@@ -1356,6 +1356,7 @@ impl crate::command::commands::workflow_prerequisites::WorkflowPrerequisiteFront
     fn show_workflow_prerequisites(
         &mut self,
         report: &crate::data::workflow_prerequisites::WorkflowPrerequisiteReport,
+        _next: crate::command::commands::workflow_prerequisites::PrerequisiteReportNext,
     ) -> Result<(), CommandError> {
         self.event_bus.emit(EventPayload::WorkflowPrerequisites {
             phase: report.phase,

@@ -10,8 +10,8 @@ use std::io::IsTerminal as _;
 
 use crate::command::commands::agent_trust::TrustDecision;
 use crate::command::commands::workflow_prerequisites::{
-    GapChoice, IdentityChoice, IdentityPersist, SshChoice, TokenConsent, TokenSourceChoice,
-    ToolChoice, WorkflowPrerequisiteFrontend,
+    GapChoice, IdentityChoice, IdentityPersist, PrerequisiteReportNext, SshChoice, TokenConsent,
+    TokenSourceChoice, ToolChoice, WorkflowPrerequisiteFrontend,
 };
 use crate::command::error::CommandError;
 use crate::data::prompt::{Prompt, TextPrompt};
@@ -29,15 +29,22 @@ pub(crate) fn print_report(report: &WorkflowPrerequisiteReport) {
 }
 
 impl WorkflowPrerequisiteFrontend for CliFrontend {
-    /// `--json` prints nothing here: the outcome carries the report.
+    /// `--json` prints nothing here: the outcome carries the report. Only a
+    /// report that questions follow asks Continue/Abort, after saying what
+    /// continuing leads to; a check-only or headless report is just printed.
     fn show_workflow_prerequisites(
         &mut self,
         report: &WorkflowPrerequisiteReport,
+        next: PrerequisiteReportNext,
     ) -> Result<(), CommandError> {
         if !self.is_json_mode() {
             print_report(report);
-            if self.can_ask_prerequisites() {
-                let prompt = crate::command::prompts::prerequisite_report(report);
+            if matches!(next, PrerequisiteReportNext::Questions { .. })
+                && self.can_ask_prerequisites()
+            {
+                let prompt = crate::command::prompts::prerequisite_report(report, next);
+                eprintln!();
+                eprintln!("{}", prompt.body);
                 if !helpers::read_prerequisite_report(&prompt)? {
                     return Err(CommandError::Aborted);
                 }

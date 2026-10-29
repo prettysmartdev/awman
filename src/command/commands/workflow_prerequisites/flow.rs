@@ -57,8 +57,8 @@ use crate::engine::workflow::prerequisites::{
 };
 
 use super::frontend::{
-    GapChoice, IdentityChoice, IdentityPersist, SshChoice, TokenConsent, TokenSourceChoice,
-    ToolChoice, WorkflowPrerequisiteFrontend,
+    GapChoice, IdentityChoice, IdentityPersist, PrerequisiteReportNext, SshChoice, TokenConsent,
+    TokenSourceChoice, ToolChoice, WorkflowPrerequisiteFrontend,
 };
 
 /// The trust-store name a repository's `acquire` command is approved under,
@@ -656,7 +656,11 @@ impl WorkflowPrerequisiteFlow {
     ) -> Result<PrerequisiteOutcome, CommandError> {
         let can_ask = frontend.can_ask_prerequisites();
         if show && can_ask {
-            frontend.show_workflow_prerequisites(&report)?;
+            let unresolved = self.options.policy.unresolved_or(UnresolvedMode::Warn);
+            frontend.show_workflow_prerequisites(
+                &report,
+                PrerequisiteReportNext::Questions { unresolved },
+            )?;
         }
         // One token serves both `GitHubToken` and `PushAuthHttps`: once it is
         // declined, the second check is not asked about again.
@@ -764,7 +768,7 @@ impl WorkflowPrerequisiteFlow {
         }
         let report = PrerequisitePreflight::redact_report(report, redaction);
         if show && !can_ask {
-            frontend.show_workflow_prerequisites(&report)?;
+            frontend.show_workflow_prerequisites(&report, PrerequisiteReportNext::Decided)?;
         }
         let unresolved = report
             .needs_attention()

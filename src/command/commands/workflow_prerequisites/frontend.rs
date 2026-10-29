@@ -13,6 +13,7 @@ use std::path::PathBuf;
 
 use crate::command::commands::agent_trust::TrustDecision;
 use crate::command::error::CommandError;
+use crate::data::config::workflows::UnresolvedMode;
 use crate::data::message::UserMessageSink;
 use crate::data::prompt::{Prompt, TextPrompt};
 use crate::data::workflow_prerequisites::WorkflowPrerequisiteReport;
@@ -87,6 +88,20 @@ pub enum GapChoice {
     Abort,
 }
 
+/// What follows the prerequisite report, so a frontend can say so beside it
+/// and offer a Continue/Abort choice only when one is really being asked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrerequisiteReportNext {
+    /// `--check-prerequisites`: the report is the whole result; nothing runs.
+    CheckOnly,
+    /// A person is there: each item that needs attention is asked about
+    /// next, one at a time, then `unresolved` decides what an item left
+    /// unresolved does to the run.
+    Questions { unresolved: UnresolvedMode },
+    /// Nobody to ask: the headless answers have already been applied.
+    Decided,
+}
+
 fn unavailable(prompt: &str) -> CommandError {
     CommandError::InteractiveInputUnavailable {
         prompt: prompt.to_string(),
@@ -108,11 +123,15 @@ pub trait WorkflowPrerequisiteFrontend: UserMessageSink {
     /// means "stop" (Ctrl-C on the TUI summary) returns
     /// `Err(CommandError::Aborted)`.
     ///
+    /// `next` says what happens after it (see
+    /// [`prompts::prerequisite_report`](crate::command::prompts::prerequisite_report)).
+    ///
     /// The default writes the report's one text rendering
     /// ([`WorkflowPrerequisiteReport::render_lines`]) as info messages.
     fn show_workflow_prerequisites(
         &mut self,
         report: &WorkflowPrerequisiteReport,
+        _next: PrerequisiteReportNext,
     ) -> Result<(), CommandError> {
         for line in report.render_lines() {
             self.write_message(crate::data::message::UserMessage {

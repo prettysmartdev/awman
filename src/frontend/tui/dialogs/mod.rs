@@ -93,15 +93,12 @@ pub enum DialogRequest {
         body: String,
         keys: Vec<(char, String)>,
     },
-    /// A keyed confirmation whose body must be read in full before a
-    /// `gated_keys` choice is accepted (the custom-agent trust review). The
-    /// body scrolls; the keys stay visible.
-    Review {
-        title: String,
-        body: String,
-        keys: Vec<(char, String)>,
-        gated_keys: Vec<char>,
-    },
+    /// A keyed question whose body scrolls under a footer that is always on
+    /// screen (the note, the keys and the Esc hint). Used for the trust
+    /// reviews, where a `gated_keys` choice is accepted only once the body
+    /// has been read in full, and for every question whose body can outgrow
+    /// the terminal (workflow prerequisites, `config migrate`).
+    Review(ReviewState),
     /// The one-shot squad key disclosure, raised as a [`Dialog::Notice`].
     /// Sent, never awaited: a notice has no answer to give back, and the
     /// command thread must not block on the user dismissing it.
@@ -761,11 +758,29 @@ mod tests {
 #[derive(Debug)]
 pub struct ReviewState {
     pub title: String,
-    pub body: String,
+    pub body: ReviewBody,
+    /// Text pinned above the keys, so it is read at the moment of choosing
+    /// (for the prerequisite report: what continuing leads to). Empty for none.
+    pub note: String,
     pub keys: Vec<(char, String)>,
     pub gated_keys: Vec<char>,
+    /// What Esc answers, shown as `[Esc] <label>`; `None` shows "cancel".
+    pub dismiss_label: Option<String>,
     pub scroll: usize,
     pub max_scroll: std::cell::Cell<usize>,
+}
+
+/// What a [`ReviewState`] scrolls, and how it is wrapped to the dialog.
+#[derive(Debug)]
+pub enum ReviewBody {
+    /// Every character kept, hard-wrapped at the edge: a reviewed argv must
+    /// read exactly as it will run.
+    Exact(String),
+    /// Word-wrapped text; each line keeps its own indentation, so indented
+    /// JSON in a preview still lines up.
+    Prose(String),
+    /// The workflow prerequisite report, one entry per check.
+    Prerequisites(crate::data::workflow_prerequisites::WorkflowPrerequisiteReport),
 }
 
 impl ReviewState {
@@ -777,12 +792,50 @@ impl ReviewState {
     ) -> Self {
         Self {
             title,
-            body,
+            body: ReviewBody::Exact(body),
+            note: String::new(),
             keys,
             gated_keys,
+            dismiss_label: None,
             scroll: 0,
             max_scroll: std::cell::Cell::new(usize::MAX),
         }
+    }
+
+    /// A question with no gated key: `body` scrolls, Esc answers
+    /// `default_on_dismiss` and is labelled with that choice.
+    pub fn question<D: PartialEq>(prompt: &Prompt<D>, body: ReviewBody) -> Self {
+        let dismiss_label = prompt.default_on_dismiss.as_ref().and_then(|default| {
+            prompt
+                .choices
+                .iter()
+                .find(|choice| &choice.value == default)
+                .map(|choice| choice.label.clone())
+        });
+        Self {
+            dismiss_label,
+            ..Self::new(
+                prompt.title.clone(),
+                String::new(),
+                prompt
+                    .choices
+                    .iter()
+                    .map(|choice| (choice.key, choice.label.clone()))
+                    .collect(),
+                Vec::new(),
+            )
+        }
+        .with_body(body)
+    }
+
+    pub fn with_body(mut self, body: ReviewBody) -> Self {
+        self.body = body;
+        self
+    }
+
+    pub fn with_note(mut self, note: String) -> Self {
+        self.note = note;
+        self
     }
 
     /// Whether the end of the body has been on screen.

@@ -6,7 +6,7 @@ use crate::command::commands::agent_trust::{AgentTrustFrontend, AgentTrustReview
 use crate::command::error::CommandError;
 use crate::data::prompt::Prompt;
 use crate::frontend::tui::command_frontend::TuiCommandFrontend;
-use crate::frontend::tui::dialogs::{DialogRequest, DialogResponse};
+use crate::frontend::tui::dialogs::{DialogRequest, DialogResponse, ReviewState};
 
 impl AgentTrustFrontend for TuiCommandFrontend {
     fn confirm_agent_definition(
@@ -20,16 +20,16 @@ impl AgentTrustFrontend for TuiCommandFrontend {
             .filter(|choice| choice.value == TrustDecision::Approve)
             .map(|choice| choice.key)
             .collect();
-        let response = self.ask_dialog(DialogRequest::Review {
-            title: prompt.title.clone(),
-            body: prompt.body.clone(),
-            keys: prompt
+        let response = self.ask_dialog(DialogRequest::Review(ReviewState::new(
+            prompt.title.clone(),
+            prompt.body.clone(),
+            prompt
                 .choices
                 .iter()
                 .map(|choice| (choice.key, choice.label.clone()))
                 .collect(),
             gated_keys,
-        })?;
+        )))?;
         let answer = match response {
             DialogResponse::Char(key) => prompt.answer_for_key(key),
             _ => None,

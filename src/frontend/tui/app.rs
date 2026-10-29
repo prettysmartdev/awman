@@ -1259,14 +1259,7 @@ impl App {
                 }
                 DialogRequest::Loading { title } => Dialog::Loading { title },
                 DialogRequest::Custom { title, body, keys } => Dialog::Custom { title, body, keys },
-                DialogRequest::Review {
-                    title,
-                    body,
-                    keys,
-                    gated_keys,
-                } => Dialog::Review(crate::frontend::tui::dialogs::ReviewState::new(
-                    title, body, keys, gated_keys,
-                )),
+                DialogRequest::Review(state) => Dialog::Review(state),
                 DialogRequest::KeySetupNotice {
                     title,
                     body,
