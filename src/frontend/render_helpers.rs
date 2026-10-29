@@ -8,6 +8,31 @@
 
 use crate::data::step_status::StepStatus;
 
+/// Config migrations carry their own descriptions and preview from lower
+/// layers, so neither frontend needs to name the settings being migrated.
+pub(crate) fn render_config_migrate(
+    outcome: &crate::command::commands::config::ConfigMigrateOutcome,
+) -> String {
+    if outcome.changes.is_empty() {
+        match &outcome.note {
+            Some(note) => format!("nothing to migrate\n{note}"),
+            None => "nothing to migrate".to_string(),
+        }
+    } else if outcome.dry_run {
+        format!("{}\ndry run: nothing written", outcome.preview)
+    } else if outcome.applied {
+        let summaries = outcome
+            .changes
+            .iter()
+            .map(|change| change.summary)
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("Applied config migration in {}:\n{summaries}", outcome.path)
+    } else {
+        outcome.preview.clone()
+    }
+}
+
 /// The one-character status marker a summary row is drawn with.
 pub fn step_glyph(status: &StepStatus) -> &'static str {
     match status {

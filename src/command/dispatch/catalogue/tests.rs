@@ -425,6 +425,30 @@ const FLAG_TABLE: &[FlagCheck] = &[
         is_optional: true,
     },
     FlagCheck {
+        path: &["config", "migrate"],
+        flag: "yes",
+        is_bool: true,
+        is_optional: true,
+    },
+    FlagCheck {
+        path: &["config", "migrate"],
+        flag: "dry-run",
+        is_bool: true,
+        is_optional: true,
+    },
+    FlagCheck {
+        path: &["config", "migrate"],
+        flag: "global",
+        is_bool: true,
+        is_optional: true,
+    },
+    FlagCheck {
+        path: &["config", "migrate"],
+        flag: "non-interactive",
+        is_bool: true,
+        is_optional: true,
+    },
+    FlagCheck {
         path: &["api", "start"],
         flag: "port",
         is_bool: false,
@@ -573,6 +597,7 @@ fn all_expected_subcommands_are_present() {
         (&["config"], "show"),
         (&["config"], "get"),
         (&["config"], "set"),
+        (&["config"], "migrate"),
         (&["exec"], "prompt"),
         (&["exec"], "workflow"),
         (&["api"], "start"),
@@ -611,6 +636,7 @@ fn config_commands_do_not_require_runtime() {
         &["config", "show"],
         &["config", "get"],
         &["config", "set"],
+        &["config", "migrate"],
     ] {
         assert!(
             !cat.requires_runtime(path),
@@ -666,6 +692,7 @@ fn only_the_config_subtree_declares_requires_runtime_false() {
         vec![
             "config",
             "config get",
+            "config migrate",
             "config prerequisite-grants",
             "config prerequisite-grants list",
             "config prerequisite-grants revoke",

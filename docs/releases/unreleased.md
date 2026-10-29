@@ -144,6 +144,37 @@ Several prompts used to pick an answer for you when there was nobody to ask:
 
 ## Features
 
+### Dynamic workflow settings use `workflows.dynamic`
+
+Dynamic workflow settings now live in the `workflows.dynamic` block in both
+repo and global config. Run `awman config migrate` to move a repo's existing
+`dynamicWorkflows` block; saving repo config also migrates it automatically.
+The old global `dynamicWorkflows` block was never read, so copy any settings
+you want to keep into the global `workflows.dynamic` block. Global settings now
+provide defaults for all repos, with repo settings taking precedence. Older
+awman versions do not read `workflows.dynamic`, so teammates on older versions
+will stop seeing these settings after the updated config is committed.
+
+Related changes to how awman writes config files:
+
+- Every config save (`config set`, the TUI config dialog, `awman init`,
+  `config migrate`) now writes a temporary file and renames it into place.
+  A save refuses a read-only `config.json`. A repo save also refuses a
+  `.awman/` directory or `config.json` that is a symlink; previously
+  `config set` wrote through it. A symlinked `~/.awman/config.json` (for
+  example one managed in a dotfiles repo) is still followed: its target is
+  replaced and the link is kept. A new config file gets the same permissions
+  as before (your umask default); an existing file keeps its mode.
+- `config set work_items.dir` and `work_items.template` now save the value,
+  and `config get`/`config show` display it. Previously the edit reported
+  success but was dropped.
+- A save refuses a value that would make the file fail to load (for example a
+  51st `guidance` entry), so `config set` can no longer leave a file that every
+  later command rejects.
+- A repeated `guidance` entry is now dropped even within one file, so a repo
+  that listed the same instruction twice gets one bullet in the leader prompt.
+
+
 ### API workdir roots: `--workdir-root` and `api.workDirRoots`
 
 `awman api start --workdir-root <dir>` (repeatable) and the global

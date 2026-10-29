@@ -10,6 +10,7 @@ mod builtin_network;
 mod config_session_roundtrip;
 mod daemon_primitives;
 mod db_migration;
+mod dynamic_workflows_0150;
 mod rename_0077;
 mod sqlite_upgrade_compat;
 mod squad_config;

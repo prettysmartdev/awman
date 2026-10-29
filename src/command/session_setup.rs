@@ -818,6 +818,7 @@ mod tests {
             overlay_engine: overlay,
             auth_engine,
             agent_engine,
+            config_notices: Default::default(),
             workflow_state_store,
             credential_monitor: None,
             global_config: std::sync::Arc::new(Default::default()),

@@ -285,9 +285,15 @@ impl<'a> LaunchPolicy<'a> {
         Ok((overlays, prompt))
     }
 
-    /// Emit launch-time configuration warnings: deprecated `envPassthrough`
-    /// fields and `agentFlags` entries awman already manages.
-    pub fn warn_config(&self, sink: &mut dyn UserMessageSink) {
+    /// Emit launch-time configuration warnings: the once-per-repo
+    /// `dynamicWorkflows` deprecation notice (gated by `notices`), deprecated
+    /// `envPassthrough` fields and `agentFlags` entries awman already manages.
+    pub fn warn_config(
+        &self,
+        notices: &crate::command::config_notices::ConfigNotices,
+        sink: &mut dyn UserMessageSink,
+    ) {
+        notices.warn_legacy_dynamic_workflows(self.session, sink);
         let ec = self.session.effective_config();
         if ec.repo().legacy_env_passthrough.is_some() {
             sink.write_message(UserMessage {
@@ -522,7 +528,7 @@ mod warn_config_tests {
         let session = open_session(git_tmp.path(), env);
 
         let mut sink = RecordingMessageSink::new();
-        LaunchPolicy::for_session(&session).warn_config(&mut sink);
+        LaunchPolicy::for_session(&session).warn_config(&Default::default(), &mut sink);
 
         let warnings: Vec<_> = sink
             .queued()
@@ -558,7 +564,7 @@ mod warn_config_tests {
         let session = open_session(git_tmp.path(), env);
 
         let mut sink = RecordingMessageSink::new();
-        LaunchPolicy::for_session(&session).warn_config(&mut sink);
+        LaunchPolicy::for_session(&session).warn_config(&Default::default(), &mut sink);
         let warnings: Vec<_> = sink
             .queued()
             .iter()
@@ -590,7 +596,7 @@ mod warn_config_tests {
         let session = open_session(git_tmp.path(), env);
 
         let mut sink = RecordingMessageSink::new();
-        LaunchPolicy::for_session(&session).warn_config(&mut sink);
+        LaunchPolicy::for_session(&session).warn_config(&Default::default(), &mut sink);
 
         let warnings: Vec<_> = sink
             .queued()
@@ -615,7 +621,7 @@ mod warn_config_tests {
         let session = open_session(tmp.path(), env);
 
         let mut sink = RecordingMessageSink::new();
-        LaunchPolicy::for_session(&session).warn_config(&mut sink);
+        LaunchPolicy::for_session(&session).warn_config(&Default::default(), &mut sink);
 
         assert!(
             sink.queued().is_empty(),

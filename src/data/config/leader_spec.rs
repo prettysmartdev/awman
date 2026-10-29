@@ -1,7 +1,7 @@
 //! `LeaderSpec` — an `agent::model` pair.
 //!
 //! The shape is a data contract: it arrives on `--leader` (a flag), in
-//! `dynamicWorkflows.defaultLeader` (a config field), and in a squad task's
+//! `workflows.dynamic.defaultLeader` (a config field), and in a squad task's
 //! leader setting. Before WI 0114 F-51 the parse lived in Layer 2
 //! (`commands/exec_workflow.rs`) and the config validator in Layer 0 restated
 //! the same two-non-empty-components rule beside a comment saying it did so

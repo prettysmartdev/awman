@@ -97,30 +97,29 @@ pub(super) fn handle(app: &mut App, action: Action) {
             dialog_router::dismiss_dialog(app);
         }
         Action::NewMapEntry => {
-            // Ctrl+N in the config dialog: start an add-entry flow. On a
-            // guidance section row it starts the single-phase guidance entry
-            // flow; on an agentsToModels row it starts the two-phase
-            // key→value flow. No-op elsewhere.
+            // Maps collect a key then a value; lists collect one value.
+            // Keep the selected scope and ignore scalar rows.
+            use crate::command::commands::config::ConfigRowShape;
             if let Some(Dialog::ConfigShow(state)) = &mut app.active_dialog {
-                if state.new_entry.is_none() {
-                    let on_guidance_row = state
+                if !state.editing && state.new_entry.is_none() {
+                    let phase = state
                         .rows
                         .get(state.selected)
-                        .map(|r| {
-                            r.field == "dynamicWorkflows.guidance"
-                                || r.field.starts_with("dynamicWorkflows.guidance.")
-                        })
-                        .unwrap_or(false);
-                    state.new_entry = Some(if on_guidance_row {
-                        dialogs::NewMapEntryPhase::GuidanceEntry
-                    } else {
-                        dialogs::NewMapEntryPhase::Key
-                    });
-                    state.editing = true;
-                    state.error = None;
-                    // Both agentsToModels and guidance entries are repo-scoped.
-                    state.edit_column = 1;
-                    state.editor = crate::frontend::tui::text_edit::TextEdit::new(false);
+                        .and_then(|row| match row.shape {
+                            ConfigRowShape::MapHeader { .. } | ConfigRowShape::MapEntry => {
+                                Some(dialogs::NewMapEntryPhase::Key)
+                            }
+                            ConfigRowShape::ListHeader { .. } | ConfigRowShape::ListEntry => {
+                                Some(dialogs::NewMapEntryPhase::ListEntry)
+                            }
+                            ConfigRowShape::Scalar => None,
+                        });
+                    if let Some(phase) = phase {
+                        state.new_entry = Some(phase);
+                        state.editing = true;
+                        state.error = None;
+                        state.editor = crate::frontend::tui::text_edit::TextEdit::new(false);
+                    }
                 }
             }
         }

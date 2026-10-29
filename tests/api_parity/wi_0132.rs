@@ -61,6 +61,7 @@ fn app_state(root: &std::path::Path) -> Arc<AppState> {
         overlay_engine,
         auth_engine,
         agent_engine,
+        config_notices: Default::default(),
         workflow_state_store: Arc::new(WorkflowStateStore::at_git_root(paths.root())),
         credential_monitor: None,
         global_config: Arc::new(Default::default()),

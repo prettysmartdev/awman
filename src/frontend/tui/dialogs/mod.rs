@@ -428,12 +428,25 @@ pub struct ConfigShowState {
     pub editing: bool,
     pub edit_column: usize,
     pub editor: TextEdit,
-    /// In-progress Ctrl+N "add model mapping" flow, if any. While `Some`,
+    /// In-progress Ctrl+N add-entry flow, if any. While `Some`,
     /// `editing` is also true so text input routes to `editor`.
     pub new_entry: Option<NewMapEntryPhase>,
     /// Why the last save attempt was rejected. Rendered in the dialog until
     /// the user cancels the edit or starts a new one.
     pub error: Option<String>,
+}
+
+impl ConfigShowState {
+    /// Members follow their header in the command's row projection. Use the
+    /// nearest header so separate maps or lists keep their own editors.
+    pub(crate) fn selected_header(&self) -> Option<(usize, &ConfigShowRow)> {
+        self.rows
+            .get(..=self.selected)?
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, row)| row.shape.is_header())
+    }
 }
 
 /// A rejected config edit carried in `DialogRequest::ConfigShow`: the value
@@ -450,14 +463,14 @@ pub struct ConfigShowRejectedEdit {
 /// Phase of a Ctrl+N add-entry flow in the config dialog.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NewMapEntryPhase {
-    /// Typing the agent name (the new `agentsToModels` map key).
+    /// Typing the new map key.
     Key,
     /// Typing the comma-separated model list for the confirmed key.
     Value { key: String },
-    /// Typing a new `dynamicWorkflows.guidance` entry (WI-0099). Single-phase:
-    /// only the instruction text is needed; its array index is assigned
+    /// Typing a new list entry. Single-phase:
+    /// only the entry text is needed; its index is assigned
     /// automatically by appending.
-    GuidanceEntry,
+    ListEntry,
 }
 
 #[derive(Debug)]
@@ -474,10 +487,10 @@ pub struct ConfigShowRow {
     /// Short format hint shown while editing (e.g. "true or false").
     pub value_hint: Option<String>,
     /// The row's shape, carried through from `ConfigFieldRow` so the dialog
-    /// can find the map and array headers — and build a new member's field
+    /// can find the map and list headers — and build a new member's field
     /// name from the header's own prefix — without spelling a config path
     /// (WI 0114 F-20).
-    pub shape: crate::command::commands::config::ConfigFieldShape,
+    pub shape: crate::command::commands::config::ConfigRowShape,
 }
 
 /// Compute a centered rect for a dialog.

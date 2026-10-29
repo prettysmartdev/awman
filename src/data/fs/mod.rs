@@ -11,6 +11,7 @@ pub mod api_db;
 pub mod api_labels;
 pub mod api_paths;
 pub mod auth_paths;
+pub mod config_file;
 pub mod context_dirs;
 pub mod daemon_env;
 pub mod daemon_paths;

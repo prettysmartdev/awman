@@ -56,6 +56,7 @@ fn test_engines(root: &std::path::Path) -> Engines {
         overlay_engine: overlay,
         auth_engine: Arc::new(AuthEngine::with_paths(auth_paths, api_paths)),
         agent_engine: agent,
+        config_notices: Default::default(),
         workflow_state_store: Arc::new(WorkflowStateStore::at_git_root(root)),
         credential_monitor: None,
         global_config: std::sync::Arc::new(Default::default()),

@@ -685,6 +685,18 @@ impl CommandFrontend for CliFrontend {
 // modules under `src/frontend/cli/per_command/`.
 
 impl ConfigCommandFrontend for CliFrontend {
+    fn confirm_config_migration(
+        &mut self,
+        prompt: &Prompt<crate::command::commands::config::MigrateChoice>,
+    ) -> Result<crate::command::commands::config::MigrateChoice, CommandError> {
+        if self.non_interactive {
+            return Err(CommandError::InteractiveInputUnavailable {
+                prompt: "yes".into(),
+            });
+        }
+        self.pick_from_prompt(prompt)
+    }
+
     fn present_config_table(
         &mut self,
         _rows: &[crate::command::commands::config::ConfigFieldRow],

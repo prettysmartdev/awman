@@ -218,7 +218,7 @@ pub struct WorkItemsConfig {
     pub template: Option<String>,
 }
 
-/// Dynamic-workflow configuration nested within `RepoConfig` (WI-0095).
+/// Dynamic-workflow settings at `workflows.dynamic` in repo and global config.
 ///
 /// Lets teams pin which agents/models a dynamic workflow's leader may schedule,
 /// cap concurrent steps, and set a default leader — all via version-controlled
@@ -244,11 +244,11 @@ pub struct DynamicWorkflowsConfig {
     pub guidance: Option<Vec<String>>,
 }
 
-/// Maximum number of `dynamicWorkflows.guidance` entries. Caps prompt bloat
+/// Maximum number of `workflows.dynamic.guidance` entries. Caps prompt bloat
 /// (WI-0099).
 pub const GUIDANCE_MAX_ENTRIES: usize = 50;
 
-/// Maximum length of a single `dynamicWorkflows.guidance` entry, in chars.
+/// Maximum length of a single `workflows.dynamic.guidance` entry, in chars.
 /// Prevents one instruction from dominating the leader prompt (WI-0099).
 pub const GUIDANCE_MAX_ENTRY_LEN: usize = 1000;
 
@@ -259,28 +259,103 @@ impl DynamicWorkflowsConfig {
     /// first violation. Dockerfile-availability checks are intentionally *not*
     /// here — they depend on filesystem discovery and belong to the command
     /// layer.
-    pub fn validate(&self) -> Result<(), DataError> {
+    pub fn validate(&self, field_path: &str) -> Result<(), DataError> {
         if let Some(n) = self.max_concurrent_steps {
             if n < 1 {
-                return Err(DataError::Other(
-                    "dynamicWorkflows.maxConcurrentSteps must be >= 1".to_string(),
-                ));
+                return Err(DataError::Other(format!(
+                    "{field_path}.maxConcurrentSteps must be >= 1"
+                )));
             }
         }
         if let Some(leader) = &self.default_leader {
-            validate_leader_spec("dynamicWorkflows", leader)?;
+            validate_leader_spec(field_path, leader)?;
         }
         if let Some(map) = &self.agents_to_models {
-            validate_agents_to_models("dynamicWorkflows", map)?;
+            validate_agents_to_models(field_path, map)?;
+            let mut folded_keys = BTreeMap::new();
+            let mut keys: Vec<_> = map.keys().collect();
+            keys.sort();
+            for key in keys {
+                if let Some(previous) = folded_keys.insert(key.to_ascii_lowercase(), key) {
+                    return Err(DataError::Other(format!(
+                        "{field_path}.agentsToModels contains keys {previous:?} and {key:?} \
+                         that collide after case folding; remove one so model lists are not \
+                         ambiguously merged."
+                    )));
+                }
+            }
         }
         if let Some(entries) = &self.guidance {
-            validate_guidance("dynamicWorkflows", entries)?;
+            validate_guidance(field_path, entries)?;
         }
         Ok(())
     }
+
+    /// Whether every field is unset or an empty collection.
+    pub fn is_empty(&self) -> bool {
+        self.default_leader.is_none()
+            && self.max_concurrent_steps.is_none()
+            && self.agents_to_models.as_ref().is_none_or(HashMap::is_empty)
+            && self.guidance.as_ref().is_none_or(Vec::is_empty)
+    }
 }
 
-/// Validate a `dynamicWorkflows.agentsToModels` key against the same lexical
+/// Which key a repo's dynamic-workflow block was read from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DynamicWorkflowsKey {
+    New,
+    Legacy,
+}
+
+impl DynamicWorkflowsKey {
+    pub fn path(self) -> &'static str {
+        match self {
+            Self::New => "workflows.dynamic",
+            Self::Legacy => "dynamicWorkflows",
+        }
+    }
+}
+
+/// A serde type error inside a dynamic-workflow block says only which struct
+/// it expected. Name the key the user wrote instead (`dynamicWorkflows` or
+/// `workflows.dynamic`), so the message matches their file. Every other parse
+/// error is returned unchanged.
+fn name_dynamic_workflows_parse_error(
+    path: &Path,
+    content: &str,
+    error: serde_json::Error,
+) -> DataError {
+    let Ok(document) = serde_json::from_str::<serde_json::Value>(content) else {
+        return DataError::config_parse(path, error);
+    };
+    for key in [DynamicWorkflowsKey::Legacy, DynamicWorkflowsKey::New] {
+        let block = key
+            .path()
+            .split('.')
+            .try_fold(&document, |value, part| value.get(part));
+        if let Some(block) = block.filter(|b| !b.is_null()) {
+            if let Err(inner) = serde_json::from_value::<DynamicWorkflowsConfig>(block.clone()) {
+                return DataError::Other(format!(
+                    "config parse error in {}: {}: {inner}",
+                    path.display(),
+                    key.path()
+                ));
+            }
+        }
+    }
+    DataError::config_parse(path, error)
+}
+
+/// Appended after a repo write that also moved the legacy block (WI 0150
+/// §3.7). Every writer of an existing repo config reports it: `config set`,
+/// the TUI config dialog and `init`.
+pub const MOVED_LEGACY_DYNAMIC_WORKFLOWS_NOTICE: &str =
+    "also moved `dynamicWorkflows` → `workflows.dynamic`";
+
+pub(super) const BOTH_DYNAMIC_WORKFLOWS_KEYS: &str =
+    "both `dynamicWorkflows` and `workflows.dynamic` are set; remove one, or run `awman config migrate` after deleting the copy you don't want";
+
+/// Validate a `workflows.dynamic.agentsToModels` key against the same lexical
 /// rules as [`crate::data::session::AgentName`] (ASCII alphanumerics, `-`, `_`,
 /// length 1..=64). Returns [`DataError::Other`] so the failure surfaces as a
 /// config-load error rather than a synthesized parse error.
@@ -324,7 +399,7 @@ pub fn validate_agent_flag_values(source: &str, values: &[String]) -> Result<(),
     Ok(())
 }
 
-/// Layer 0 validator for `dynamicWorkflows.defaultLeader`. Enforces the same
+/// Layer 0 validator for `workflows.dynamic.defaultLeader`. Enforces the same
 /// `agent::model` syntax as `LeaderSpec::parse` (two non-empty components) plus
 /// no leading/trailing whitespace in either component and an `AgentName`-valid
 /// agent component. Kept in the data layer so the config fails fast at load
@@ -503,12 +578,9 @@ pub struct RepoConfig {
     pub base_image: Option<String>,
     #[serde(rename = "dockerfile", skip_serializing_if = "Option::is_none")]
     pub dockerfile: Option<String>,
-    #[serde(
-        rename = "dynamicWorkflows",
-        default,
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub dynamic_workflows: Option<DynamicWorkflowsConfig>,
+    /// Deprecated read-only alias; callers use `dynamic_workflows_block()`.
+    #[serde(rename = "dynamicWorkflows", default, skip_serializing)]
+    pub legacy_dynamic_workflows: Option<DynamicWorkflowsConfig>,
     #[serde(
         rename = "maxConcurrentAgents",
         skip_serializing_if = "Option::is_none"
@@ -551,50 +623,93 @@ impl RepoConfig {
             return Ok(Self::default());
         }
         let content = std::fs::read_to_string(&path).map_err(|e| DataError::io(&path, e))?;
-        let mut cfg: Self =
-            serde_json::from_str(&content).map_err(|e| DataError::config_parse(&path, e))?;
-        // Layer 0 semantic validation of the dynamicWorkflows section (WI-0095):
-        // schema shape that serde cannot express is enforced here so malformed
-        // config fails at load, before any UI or workflow starts.
-        if let Some(dw) = &cfg.dynamic_workflows {
-            dw.validate()?;
+        let mut cfg: Self = serde_json::from_str(&content)
+            .map_err(|e| name_dynamic_workflows_parse_error(&path, &content, e))?;
+        cfg.validate_loaded(&path)?;
+        Ok(cfg)
+    }
+
+    /// Shared load validation, also used to prove migration results load.
+    pub(super) fn validate_loaded(&mut self, path: &Path) -> Result<(), DataError> {
+        if let Some((block, key)) = self
+            .dynamic_workflows_block()
+            .map_err(|e| DataError::Other(format!("{}: {e}", path.display())))?
+        {
+            block.validate(key.path())?;
         }
-        if let Some(n) = cfg.max_concurrent_agents {
+        if let Some(n) = self.max_concurrent_agents {
             if n < 1 {
                 return Err(DataError::Other(
                     "maxConcurrentAgents must be >= 1".to_string(),
                 ));
             }
         }
-        if let Some(auth_refresh) = &cfg.auth_refresh {
+        if let Some(auth_refresh) = &self.auth_refresh {
             validate_auth_refresh(auth_refresh)?;
         }
-        if let Some(agent_flags) = &cfg.agent_flags {
+        if let Some(agent_flags) = &self.agent_flags {
             validate_agent_flags(agent_flags)?;
         }
-        if let Some(prerequisites) = cfg
+        if let Some(prerequisites) = self
             .workflows
             .as_ref()
             .and_then(|w| w.prerequisites.as_ref())
         {
-            cfg.load_warnings.extend(
+            self.load_warnings.extend(
                 prerequisites
                     .validate(super::workflows::ConfigScope::Repo)
                     .map_err(|e| DataError::Other(format!("{}: {e}", path.display())))?,
             );
         }
-        Ok(cfg)
+        Ok(())
     }
 
-    /// Persist this config to disk, creating parent directories if needed.
+    /// The single repo accessor; rejects conflicting non-null locations.
+    pub fn dynamic_workflows_block(
+        &self,
+    ) -> Result<Option<(&DynamicWorkflowsConfig, DynamicWorkflowsKey)>, DataError> {
+        let current = self.workflows.as_ref().and_then(|w| w.dynamic.as_ref());
+        match (current, self.legacy_dynamic_workflows.as_ref()) {
+            (Some(_), Some(_)) => Err(DataError::Other(BOTH_DYNAMIC_WORKFLOWS_KEYS.into())),
+            (Some(block), None) => Ok(Some((block, DynamicWorkflowsKey::New))),
+            (None, Some(block)) => Ok(Some((block, DynamicWorkflowsKey::Legacy))),
+            (None, None) => Ok(None),
+        }
+    }
+
+    pub fn uses_legacy_dynamic_workflows(&self) -> bool {
+        self.legacy_dynamic_workflows.is_some()
+    }
+
+    /// Adopt the legacy value before serialization. Conflicts stay untouched
+    /// so the fallible accessor and every save continue to reject them.
+    pub fn adopt_legacy_dynamic_workflows(&mut self) -> bool {
+        if self.workflows.as_ref().is_some_and(|w| w.dynamic.is_some()) {
+            return false;
+        }
+        let Some(block) = self.legacy_dynamic_workflows.take() else {
+            return false;
+        };
+        self.workflows.get_or_insert_with(Default::default).dynamic = Some(block);
+        true
+    }
+
+    /// Persist config atomically, adopting the deprecated block on a clone.
+    ///
+    /// The result is validated as [`RepoConfig::load`] would validate it
+    /// first, so a save never writes a file that every later command would
+    /// refuse to load. No component of the path below `git_root` may be a
+    /// symlink.
     pub fn save(&self, git_root: &Path) -> Result<(), DataError> {
         let path = Self::path(git_root);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| DataError::io(parent, e))?;
-        }
-        let content = serde_json::to_string_pretty(self)
+        self.dynamic_workflows_block()
+            .map_err(|e| DataError::Other(format!("{}: {e}", path.display())))?;
+        let mut cfg = self.clone();
+        cfg.adopt_legacy_dynamic_workflows();
+        cfg.validate_loaded(&path)?;
+        let content = serde_json::to_string_pretty(&cfg)
             .map_err(|e| DataError::ConfigSerialize { source: e })?;
-        std::fs::write(&path, content).map_err(|e| DataError::io(&path, e))
+        crate::data::fs::config_file::write_config_file_within(git_root, &path, &content)
     }
 
     /// Resolve the configured work items directory relative to `git_root`.
@@ -878,6 +993,149 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_workflows_new_and_legacy_resolution_and_conflicts() {
+        let new_only: RepoConfig =
+            serde_json::from_str(r#"{"workflows":{"dynamic":{"maxConcurrentSteps":2}}}"#).unwrap();
+        assert_eq!(
+            new_only.dynamic_workflows_block().unwrap().unwrap().1,
+            DynamicWorkflowsKey::New
+        );
+        let legacy_only: RepoConfig =
+            serde_json::from_str(r#"{"dynamicWorkflows":{"maxConcurrentSteps":3}}"#).unwrap();
+        assert_eq!(
+            legacy_only.dynamic_workflows_block().unwrap().unwrap().1,
+            DynamicWorkflowsKey::Legacy
+        );
+        let both: RepoConfig =
+            serde_json::from_str(r#"{"dynamicWorkflows":{},"workflows":{"dynamic":{}}}"#).unwrap();
+        let err = both.dynamic_workflows_block().unwrap_err().to_string();
+        assert!(
+            err.contains("dynamicWorkflows") && err.contains("workflows.dynamic"),
+            "{err}"
+        );
+        for raw in [
+            r#"{"dynamicWorkflows":null,"workflows":{"dynamic":null}}"#,
+            r#"{}"#,
+        ] {
+            let cfg: RepoConfig = serde_json::from_str(raw).unwrap();
+            assert!(cfg.dynamic_workflows_block().unwrap().is_none(), "{raw}");
+        }
+        let tmp = make_git_root();
+        let path = RepoConfig::path(tmp.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, r#"{"dynamicWorkflows":false}"#).unwrap();
+        let err = RepoConfig::load(tmp.path()).unwrap_err().to_string();
+        assert!(
+            err.contains("dynamicWorkflows"),
+            "legacy parse error must identify the legacy field: {err}"
+        );
+    }
+
+    #[test]
+    fn saving_legacy_dynamic_workflows_moves_only_that_key_and_preserves_other_bytes() {
+        let tmp = make_git_root();
+        let path = RepoConfig::path(tmp.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let before = b"{\n  \"agent\" : \"claude\",\n  \"workItems\": { \"dir\" : \"work-items\" },\n  \"dynamicWorkflows\": {\"maxConcurrentSteps\": 4}\n}\n";
+        std::fs::write(&path, before).unwrap();
+        let cfg = RepoConfig::load(tmp.path()).unwrap();
+        cfg.save(tmp.path()).unwrap();
+        let after = std::fs::read_to_string(&path).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&after).unwrap();
+        assert!(value.get("dynamicWorkflows").is_none(), "{after}");
+        assert_eq!(value["workflows"]["dynamic"]["maxConcurrentSteps"], 4);
+        assert_eq!(value["agent"], "claude");
+        assert_eq!(value["workItems"]["dir"], "work-items");
+        let before_value: serde_json::Value = serde_json::from_slice(before).unwrap();
+        let before_other = before_value
+            .as_object()
+            .unwrap()
+            .iter()
+            .filter(|(k, _)| k.as_str() != "dynamicWorkflows")
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect::<serde_json::Map<_, _>>();
+        let after_other = value
+            .as_object()
+            .unwrap()
+            .iter()
+            .filter(|(k, _)| k.as_str() != "workflows")
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect::<serde_json::Map<_, _>>();
+        assert_eq!(
+            before_other, after_other,
+            "unrelated JSON values must survive"
+        );
+        // A typed save re-serializes the whole file, so hand-written
+        // formatting (`"agent" : "claude"`) is normalized. Unrelated parts are
+        // semantically identical, not byte-identical: whether `save` should
+        // instead edit the raw document is an open developer decision (WI
+        // 0150 resolution, B2). A file awman wrote itself is reproduced
+        // exactly outside the moved block.
+        let current_format = after.clone();
+        RepoConfig::load(tmp.path())
+            .unwrap()
+            .save(tmp.path())
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), current_format);
+    }
+
+    #[test]
+    fn save_refuses_a_config_that_load_would_reject() {
+        let tmp = make_git_root();
+        let path = RepoConfig::path(tmp.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, r#"{"agent":"claude"}"#).unwrap();
+        let mut cfg = RepoConfig::load(tmp.path()).unwrap();
+        cfg.workflows.get_or_insert_with(Default::default).dynamic = Some(DynamicWorkflowsConfig {
+            guidance: Some((0..51).map(|i| format!("entry {i}")).collect()),
+            ..Default::default()
+        });
+        let err = cfg.save(tmp.path()).unwrap_err().to_string();
+        assert!(err.contains("workflows.dynamic.guidance"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            r#"{"agent":"claude"}"#
+        );
+    }
+
+    #[test]
+    fn invalid_dynamic_block_types_name_the_key_the_user_wrote() {
+        let tmp = make_git_root();
+        let path = RepoConfig::path(tmp.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        for (raw, key) in [
+            (r#"{"dynamicWorkflows":false}"#, "dynamicWorkflows"),
+            (
+                r#"{"workflows":{"dynamic":{"guidance":"one"}}}"#,
+                "workflows.dynamic",
+            ),
+        ] {
+            std::fs::write(&path, raw).unwrap();
+            let err = RepoConfig::load(tmp.path()).unwrap_err().to_string();
+            assert!(err.contains(&format!("{key}: ")), "{raw}: {err}");
+            assert!(err.contains("config.json"), "{raw}: {err}");
+        }
+        // Errors elsewhere are untouched.
+        std::fs::write(&path, r#"{"agent":7}"#).unwrap();
+        let err = RepoConfig::load(tmp.path()).unwrap_err().to_string();
+        assert!(!err.contains("dynamic"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_refuses_a_symlinked_awman_directory() {
+        let tmp = make_git_root();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), tmp.path().join(".awman")).unwrap();
+        let err = RepoConfig::default()
+            .save(tmp.path())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("is a symlink"), "{err}");
+        assert!(!outside.path().join("config.json").exists());
+    }
+
+    #[test]
     fn overlays_round_trip_with_dir_and_env_expressions() {
         let tmp = make_git_root();
         let original = RepoConfig {
@@ -1054,7 +1312,7 @@ mod tests {
             guidance: Some(vec!["a".repeat(GUIDANCE_MAX_ENTRY_LEN + 1)]),
             ..Default::default()
         };
-        let err = cfg.validate().unwrap_err();
+        let err = cfg.validate("dynamicWorkflows").unwrap_err();
         assert!(
             err.to_string()
                 .contains(&GUIDANCE_MAX_ENTRY_LEN.to_string()),
@@ -1068,7 +1326,7 @@ mod tests {
             guidance: Some(vec!["   \t  ".to_string()]),
             ..Default::default()
         };
-        let err = cfg.validate().unwrap_err();
+        let err = cfg.validate("dynamicWorkflows").unwrap_err();
         assert!(
             err.to_string().contains("empty or whitespace-only"),
             "whitespace-only entries must be rejected, got: {err}"
@@ -1085,7 +1343,7 @@ mod tests {
             ),
             ..Default::default()
         };
-        let err = cfg.validate().unwrap_err();
+        let err = cfg.validate("dynamicWorkflows").unwrap_err();
         assert!(
             err.to_string().contains(&GUIDANCE_MAX_ENTRIES.to_string()),
             "error must name the count cap, got: {err}"
@@ -1101,7 +1359,7 @@ mod tests {
             ]),
             ..Default::default()
         };
-        assert!(cfg.validate().is_ok());
+        assert!(cfg.validate("dynamicWorkflows").is_ok());
     }
 
     #[test]
@@ -1110,7 +1368,7 @@ mod tests {
             guidance: Some(Vec::new()),
             ..Default::default()
         };
-        assert!(cfg.validate().is_ok());
+        assert!(cfg.validate("dynamicWorkflows").is_ok());
     }
 
     #[test]
@@ -1144,7 +1402,9 @@ mod tests {
 
         let cfg = RepoConfig::load(tmp.path()).unwrap();
         assert_eq!(
-            cfg.dynamic_workflows.and_then(|dw| dw.guidance),
+            cfg.dynamic_workflows_block()
+                .unwrap()
+                .and_then(|(dw, _)| dw.guidance.clone()),
             Some(vec!["entry one".to_string(), "entry two".to_string()])
         );
     }
@@ -1302,9 +1562,9 @@ mod tests {
 
         let cfg = RepoConfig::load(tmp.path()).unwrap();
         assert_eq!(
-            cfg.dynamic_workflows
-                .as_ref()
-                .and_then(|dw| dw.default_leader.as_deref()),
+            cfg.dynamic_workflows_block()
+                .unwrap()
+                .and_then(|(dw, _)| dw.default_leader.as_deref()),
             Some("claude::claude-opus-4-8")
         );
     }

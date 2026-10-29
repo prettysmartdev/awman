@@ -51,6 +51,7 @@ fn make_state(root: &std::path::Path) -> Arc<AppState> {
         overlay_engine: overlay.clone(),
         auth_engine: Arc::new(AuthEngine::with_paths(auth_paths, paths.clone())),
         agent_engine: Arc::new(AgentEngine::new(overlay, runtime)),
+        config_notices: Default::default(),
         workflow_state_store: Arc::new(WorkflowStateStore::at_git_root(paths.root())),
         credential_monitor: None,
         global_config: Arc::new(Default::default()),

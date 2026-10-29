@@ -168,6 +168,7 @@ pub fn engines_at(
         overlay_engine: overlay_engine.clone(),
         auth_engine: Arc::new(AuthEngine::with_paths(auth_paths, api_paths)),
         agent_engine: Arc::new(AgentEngine::new(overlay_engine, runtime)),
+        config_notices: Default::default(),
         workflow_state_store: Arc::new(WorkflowStateStore::at_git_root(git_root)),
         credential_monitor: None,
         global_config: Arc::new(Default::default()),

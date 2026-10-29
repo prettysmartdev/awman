@@ -129,37 +129,10 @@ fn open_squad_run_detail(app: &mut App) {
     }
 }
 
-/// The shape of the row heading the config table's map section, if it has one.
-///
-/// Found by shape rather than by field-name prefix (WI 0114 F-20), so renaming
-/// a config path moves nothing in this file.
-fn map_header_shape(
-    state: &dialogs::ConfigShowState,
-) -> Option<&crate::command::commands::config::ConfigFieldShape> {
-    use crate::command::commands::config::ConfigFieldShape;
-    state
-        .rows
-        .iter()
-        .map(|row| &row.shape)
-        .find(|shape| matches!(shape, ConfigFieldShape::MapHeader { .. }))
-}
-
-/// The same for the table's array section.
-fn array_header_shape(
-    state: &dialogs::ConfigShowState,
-) -> Option<&crate::command::commands::config::ConfigFieldShape> {
-    use crate::command::commands::config::ConfigFieldShape;
-    state
-        .rows
-        .iter()
-        .map(|row| &row.shape)
-        .find(|shape| matches!(shape, ConfigFieldShape::ArrayHeader { .. }))
-}
-
 /// Handle Enter in the ConfigShow dialog: advance the add-mapping flow, save
 /// the active inline edit, or begin editing the selected row.
 fn config_show_submit(app: &mut App) {
-    use crate::command::commands::config::{ConfigEditRequest, ConfigFieldShape};
+    use crate::command::commands::config::{ConfigEditRequest, ConfigRowShape};
     use dialogs::NewMapEntryPhase;
 
     let mut toast: Option<String> = None;
@@ -179,20 +152,30 @@ fn config_show_submit(app: &mut App) {
                 } else if let Err(error) = crate::data::session::AgentName::new(key.clone()) {
                     toast = Some(error.to_string());
                 } else {
-                    let field = map_header_shape(state)
+                    let field = state
+                        .selected_header()
+                        .map(|(_, row)| &row.shape)
                         .and_then(|header| {
-                            ConfigEditRequest::new_member(header, &key, String::new())
+                            ConfigEditRequest::new_member(
+                                header,
+                                &key,
+                                String::new(),
+                                state.edit_column == 0,
+                            )
                         })
                         .map(|request| request.field)
                         .unwrap_or_default();
                     if let Some(idx) = state.rows.iter().position(|r| r.field == field) {
                         // Already mapped: jump to the existing row and edit it
                         // instead of silently overwriting.
-                        let current = state.rows[idx].repo.clone();
+                        let current = if state.edit_column == 0 {
+                            state.rows[idx].global.clone()
+                        } else {
+                            state.rows[idx].repo.clone()
+                        };
                         state.selected = idx;
                         state.new_entry = None;
                         state.editing = true;
-                        state.edit_column = 1;
                         state.editor = crate::frontend::tui::text_edit::TextEdit::new(false);
                         state.editor.set_text(&current);
                         toast = Some(format!("'{key}' is already mapped — editing its models"));
@@ -206,32 +189,48 @@ fn config_show_submit(app: &mut App) {
             Some(NewMapEntryPhase::Value { key }) => {
                 let value = state.editor.text.trim().to_string();
                 if value.is_empty() {
-                    toast =
-                        Some("Enter at least one model name, or press Esc to cancel".to_string());
+                    toast = Some("Enter a value, or press Esc to cancel".to_string());
                 } else {
-                    response = map_header_shape(state).and_then(|header| {
-                        ConfigEditRequest::new_member(header, &key, value.clone())
+                    response = state.selected_header().and_then(|(_, row)| {
+                        ConfigEditRequest::new_member(
+                            &row.shape,
+                            &key,
+                            value.clone(),
+                            state.edit_column == 0,
+                        )
                     });
                 }
             }
-            // Ctrl+N (single-phase): append a new guidance entry. The index is
-            // the current entry count, so the config layer appends it (WI-0099).
-            Some(NewMapEntryPhase::GuidanceEntry) => {
+            // Append at this list's entry count in the selected scope,
+            // independent of the other scope's length.
+            Some(NewMapEntryPhase::ListEntry) => {
                 let value = state.editor.text.trim().to_string();
                 if value.is_empty() {
-                    toast =
-                        Some("Enter a guidance instruction, or press Esc to cancel".to_string());
+                    toast = Some("Enter a value, or press Esc to cancel".to_string());
                 } else {
                     let next_index = state
-                        .rows
-                        .iter()
-                        .filter(|r| matches!(r.shape, ConfigFieldShape::ArrayEntry))
-                        .count();
-                    response = array_header_shape(state).and_then(|header| {
+                        .selected_header()
+                        .map(|(index, _)| {
+                            state.rows[index + 1..]
+                                .iter()
+                                .take_while(|row| matches!(row.shape, ConfigRowShape::ListEntry))
+                                .filter(|row| {
+                                    let value = if state.edit_column == 0 {
+                                        &row.global
+                                    } else {
+                                        &row.repo
+                                    };
+                                    !value.is_empty()
+                                })
+                                .count()
+                        })
+                        .unwrap_or(0);
+                    response = state.selected_header().and_then(|(_, row)| {
                         ConfigEditRequest::new_member(
-                            header,
+                            &row.shape,
                             &next_index.to_string(),
                             value.clone(),
+                            state.edit_column == 0,
                         )
                     });
                 }
@@ -287,10 +286,10 @@ fn config_show_begin_edit(app: &mut App) {
         );
 
         if read_only {
-            toast = Some(if field == "dynamicWorkflows.agentsToModels" {
-                "Press Ctrl+N to add a mapping, or edit a per-agent row below".to_string()
-            } else if field == "dynamicWorkflows.guidance" {
-                "Press Ctrl+N to add a guidance entry, or edit a per-entry row below".to_string()
+            toast = Some(if row.shape.is_header() {
+                row.value_hint
+                    .clone()
+                    .unwrap_or_else(|| "This field is read-only".to_string())
             } else {
                 "This field is read-only".to_string()
             });

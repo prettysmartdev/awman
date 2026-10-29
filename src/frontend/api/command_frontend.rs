@@ -2035,3 +2035,28 @@ mod tests {
         assert!(writer.kept_worktree().is_none());
     }
 }
+
+#[cfg(test)]
+mod config_migrate_tests {
+    use super::*;
+
+    /// `config migrate` is not API-allowed, but if its frontend trait is ever
+    /// reached the API must refuse to confirm rather than guess: the answer
+    /// is the same as the CLI's `--non-interactive` without `--yes`.
+    #[test]
+    fn api_frontend_never_confirms_a_config_migration() {
+        let bus = crate::command::commands::api_server::event_bus::EventBus::new(16);
+        let mut fe = ApiDispatchFrontend::new("config migrate", &[], bus.sender());
+        let prompt = crate::command::prompts::config_migrate_confirm("PREVIEW");
+        let err = fe
+            .confirm_config_migration(&prompt)
+            .expect_err("the API cannot answer a confirmation");
+        assert!(
+            matches!(
+                err,
+                CommandError::InteractiveInputUnavailable { ref prompt } if prompt == "yes"
+            ),
+            "{err:?}"
+        );
+    }
+}

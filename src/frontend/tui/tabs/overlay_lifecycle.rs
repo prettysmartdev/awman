@@ -133,6 +133,17 @@ impl Tab {
                     // successfully" in the status log (F-22).
                     let exit_code = outcome.exit_code();
                     if let Ok(mut log) = self.shared.status_log.lock() {
+                        if let crate::command::CommandOutcome::Config(
+                            crate::command::commands::config::ConfigOutcome::Migrate(migration),
+                        ) = &outcome
+                        {
+                            log.push(crate::frontend::tui::user_message::StatusLogEntry {
+                                level: crate::data::message::MessageLevel::Info,
+                                text: crate::frontend::render_helpers::render_config_migrate(
+                                    migration,
+                                ),
+                            });
+                        }
                         if exit_code == 0 {
                             log.push(crate::frontend::tui::user_message::StatusLogEntry {
                                 level: crate::data::message::MessageLevel::Success,

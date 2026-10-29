@@ -552,13 +552,13 @@ Press **Ctrl+,** from anywhere in the TUI to open the config dialog instantly �
 │  runtime                            docker                       docker        │
 │  terminal_scrollback_lines          10000         5000           5000          │
 │  ...                                                                           │
-│  dynamicWorkflows.agentsToModels                  2 agents ma…   2 agents ma…  │
-│▶ dynamicWorkflows.agentsToModels.…                claude-opus…   claude-opus…  │
+│  workflows.dynamic.agentsToModels                 2 agents ma…   2 agents ma…  │
+│▶ workflows.dynamic.agentsToModels.…               claude-opus…   claude-opus…  │
 │                                                                                 │
-│  dynamicWorkflows.agentsToModels.claude = claude-opus-4-8, claude-sonnet-4-6   │
+│  workflows.dynamic.agentsToModels.claude = claude-opus-4-8, claude-sonnet…    │
 │                                                                                 │
 │  comma-separated model names; save an empty value to remove                    │
-│  ↑↓=row  PgUp/PgDn=page  ←→=col  Enter/e=edit  Ctrl+N=add model mapping  Esc   │
+│  ↑↓=row  PgUp/PgDn=page  ←→=col  Enter/e=edit  Ctrl+N=add global mapping  Esc  │
 ╰─────────────────────────────────────────────────────────────────────────────────╯
 ```
 
@@ -581,33 +581,33 @@ A detail pane below the table always shows the full, untruncated value of the se
 
 Each edit is validated and written immediately when you press **Enter** (surrounding whitespace is trimmed first). If the value is invalid (an unknown agent name, a non-numeric value for a numeric field, a malformed `agent::model` leader) or the config file cannot be written, nothing is saved: the dialog stays in edit mode with your input intact and shows the reason in red where the format hint normally appears, so you can correct the value instead of retyping it. Press **Esc** to abandon the rejected edit. After a successful save the table refreshes with the selected row preserved, so consecutive edits don't send you back to the top.
 
-Editing targets the column the selection is on: the **Global** column writes `$HOME/.awman/config.json`, the **Repo** column writes `GITROOT/.awman/config.json`. Scope-restricted fields snap automatically — starting an edit on the Global column of a repo-only field (like `dynamicWorkflows.*`) moves the edit to the Repo column with a status-bar note, and vice versa for global-only fields (like `runtime`), so a value can never be written into a scope where it isn't read.
+Editing targets the column the selection is on: the **Global** column writes `$HOME/.awman/config.json`, the **Repo** column writes `GITROOT/.awman/config.json`. Scope-restricted fields snap automatically — starting an edit on the Global column of a repo-only field moves the edit to the Repo column with a status-bar note, and vice versa for global-only fields (like `runtime`). Dynamic workflow settings can be edited in either column.
 
 Fields marked read-only — such as `auto_agent_auth_accepted` — are shown dimmed; pressing **Enter** on one shows `This field is read-only` in the status bar.
 
 There are more fields than fit at once — the table scrolls automatically to keep the selected row visible as you move past the bottom or top of the visible window.
 
-### Agent→model mappings (`dynamicWorkflows.agentsToModels`)
+### Agent→model mappings (`workflows.dynamic.agentsToModels`)
 
 The agent→model map for [dynamic workflows](06-dynamic-workflows.md) is fully manageable from the dialog:
 
-- A summary row (`dynamicWorkflows.agentsToModels`) always appears, showing how many agents are mapped (or `(none)`), so the mapping is discoverable even before it's configured.
-- Each configured agent gets its own row (`dynamicWorkflows.agentsToModels.<agentName>`) whose comma-separated model list is edited inline like any other field.
+- A summary row (`workflows.dynamic.agentsToModels`) always appears, showing how many agents are mapped (or `(none)`) in each scope.
+- Each configured agent gets its own row (`workflows.dynamic.agentsToModels.<agentName>`) whose comma-separated model list is edited inline like any other field. Select the **Global** or **Repo** column to edit that scope; **Ctrl+N** adds a mapping to the selected scope. The dialog opens on the **Global** column, so press **→** first to add to this repo; the prompt and the hint bar both name the scope (`(global)` or `(repo)`).
 - **Ctrl+N** adds a new mapping in two steps: type the agent name and press **Enter**, then type its comma-separated model list and press **Enter** again. **Esc** cancels at either step. Entering the name of an already-mapped agent jumps to that agent's existing row for editing instead of overwriting it.
 - Saving an **empty** value on a per-agent row removes that agent's mapping (an agent cannot be mapped to zero models).
 
-The same per-agent entries work on the command line: `awman config set dynamicWorkflows.agentsToModels.claude "claude-opus-4-8, claude-sonnet-4-6"`.
+The same per-agent entries work on the command line: `awman config set workflows.dynamic.agentsToModels.claude "claude-opus-4-8, claude-sonnet-4-6"` or pass `--global` to edit global config.
 
-### Developer guidance list (`dynamicWorkflows.guidance`)
+### Developer guidance list (`workflows.dynamic.guidance`)
 
 The [leader guidance list](06-dynamic-workflows.md#guidance) — project-specific instructions the leader agent must follow whenever it designs a dynamic workflow — is also fully manageable from the dialog:
 
-- A summary row (`dynamicWorkflows.guidance`) always appears, showing how many entries are configured (or `(none)`).
-- Each entry gets its own row (`dynamicWorkflows.guidance.<index>`) whose text is edited inline like any other field.
-- **Ctrl+N** appends a new entry in a single step: type the instruction text and press **Enter**. **Esc** cancels. Unlike `agentsToModels`, there's no key to type first — the index is assigned automatically as the next position in the list.
+- A summary row (`workflows.dynamic.guidance`) always appears, showing how many entries are configured in each scope (or `(none)`).
+- Each entry gets its own row (`workflows.dynamic.guidance.<index>`) whose text is edited inline like any other field. Select the **Global** or **Repo** column to edit that scope.
+- **Ctrl+N** appends a new entry to the selected scope in a single step: type the instruction text and press **Enter**. **Esc** cancels. Unlike `agentsToModels`, there's no key to type first — the index is assigned automatically as the next position in the selected list.
 - Saving an **empty** value on an entry row removes it; the remaining entries shift down and re-index, and the row list refreshes to reflect the new indices.
 
-The same per-entry edits work on the command line: `awman config set dynamicWorkflows.guidance.0 "Never spawn more than two agents in parallel."`.
+The same per-entry edits work on the command line: `awman config set workflows.dynamic.guidance.0 "Never spawn more than two agents in parallel."` or pass `--global` to edit global config.
 
 ---
 

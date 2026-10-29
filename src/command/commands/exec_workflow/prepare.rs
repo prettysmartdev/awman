@@ -1165,6 +1165,7 @@ pub(crate) fn workflow_flag_config(
             .as_deref()
             .and_then(|raw| raw.parse::<u32>().ok()),
         max_concurrent_agents: flags.max_concurrent,
+        leader: flags.leader.clone(),
         ..Default::default()
     }
 }

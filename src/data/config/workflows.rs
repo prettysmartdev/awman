@@ -11,11 +11,14 @@ pub const ACQUIRE_TIMEOUT_DEFAULT_SECS: u64 = 30;
 pub const ACQUIRE_TIMEOUT_MAX_SECS: u64 = 300;
 pub const PREREQUISITE_POLICY_VERSION: u32 = 1;
 
-/// Top-level `workflows` block. Unknown keys (including `dynamic`, reserved for WI 0150) are ignored.
+/// Top-level `workflows` block. Unknown keys are ignored.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkflowsConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prerequisites: Option<PrerequisitesConfig>,
+    /// Dynamic-workflow settings, read from both global and repo config.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dynamic: Option<super::repo::DynamicWorkflowsConfig>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -1109,7 +1112,7 @@ mod policy_merge_tests {
     }
 
     #[test]
-    fn unknown_key_under_workflows_is_ignored_including_dynamic() {
+    fn unknown_keys_under_workflows_and_dynamic_are_ignored() {
         let w: WorkflowsConfig = serde_json::from_value(serde_json::json!({
             "dynamic": {"anything": 1}, "future": [1, 2],
             "prerequisites": {"unresolved": "fail"}
@@ -1121,9 +1124,12 @@ mod policy_merge_tests {
         );
         let w: WorkflowsConfig =
             serde_json::from_value(serde_json::json!({"dynamic": {}})).unwrap();
-        assert_eq!(w, WorkflowsConfig::default());
-        // Round trip drops the ignored keys without erroring.
-        assert_eq!(serde_json::to_string(&w).unwrap(), "{}");
+        assert_eq!(
+            w.dynamic,
+            Some(super::super::repo::DynamicWorkflowsConfig::default())
+        );
+        // Round trip retains the supported dynamic block.
+        assert_eq!(serde_json::to_string(&w).unwrap(), r#"{"dynamic":{}}"#);
     }
 
     #[test]

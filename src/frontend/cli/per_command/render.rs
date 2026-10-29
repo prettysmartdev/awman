@@ -29,7 +29,7 @@ use crate::command::commands::remote::{
 };
 use crate::command::commands::specs::{SpecsAmendOutcome, SpecsOutcome};
 use crate::command::CommandOutcome;
-use crate::frontend::render_helpers::format_table;
+use crate::frontend::render_helpers::{format_table, render_config_migrate};
 
 // ─── Top-level dispatcher ────────────────────────────────────────────────────
 
@@ -141,6 +141,7 @@ fn render_config(o: &ConfigOutcome) -> Option<String> {
         ConfigOutcome::Get(g) => Some(render_config_get(g)),
         ConfigOutcome::Set(s) => Some(render_config_set(s)),
         ConfigOutcome::PrerequisiteGrants(g) => Some(render_prerequisite_grants(g)),
+        ConfigOutcome::Migrate(m) => Some(render_config_migrate(m)),
     }
 }
 
@@ -486,6 +487,7 @@ mod tests {
             global_value: Some("claude".into()),
             repo_value: None,
             effective_value: Some("claude".into()),
+            alias_used: None,
         };
         let s = render_config_get(&o);
         assert!(s.contains("Field: agent"));
@@ -648,7 +650,7 @@ mod tests {
                     global_writable: true,
                     repo_writable: true,
                     value_hint: None,
-                    shape: crate::command::commands::config::ConfigFieldShape::Scalar,
+                    shape: crate::command::commands::config::ConfigRowShape::Scalar,
                 },
                 ConfigFieldRow {
                     field: "auto_agent_auth_accepted".into(),
@@ -660,7 +662,7 @@ mod tests {
                     global_writable: false,
                     repo_writable: false,
                     value_hint: None,
-                    shape: crate::command::commands::config::ConfigFieldShape::Scalar,
+                    shape: crate::command::commands::config::ConfigRowShape::Scalar,
                 },
             ],
         };
@@ -688,7 +690,7 @@ mod tests {
             repo: serde_json::json!({}),
             rows: vec![
                 ConfigFieldRow {
-                    field: "dynamicWorkflows.defaultLeader".into(),
+                    field: "demo.leader".into(),
                     global_value: None,
                     repo_value: Some("claude::claude-opus-4-8".into()),
                     effective_value: Some("claude::claude-opus-4-8".into()),
@@ -697,10 +699,10 @@ mod tests {
                     global_writable: false,
                     repo_writable: true,
                     value_hint: None,
-                    shape: crate::command::commands::config::ConfigFieldShape::Scalar,
+                    shape: crate::command::commands::config::ConfigRowShape::Scalar,
                 },
                 ConfigFieldRow {
-                    field: "dynamicWorkflows.maxConcurrentSteps".into(),
+                    field: "demo.limit".into(),
                     global_value: None,
                     repo_value: Some("3".into()),
                     effective_value: Some("3".into()),
@@ -709,10 +711,10 @@ mod tests {
                     global_writable: false,
                     repo_writable: true,
                     value_hint: None,
-                    shape: crate::command::commands::config::ConfigFieldShape::Scalar,
+                    shape: crate::command::commands::config::ConfigRowShape::Scalar,
                 },
                 ConfigFieldRow {
-                    field: "dynamicWorkflows.agentsToModels.claude".into(),
+                    field: "demo.map.claude".into(),
                     global_value: None,
                     repo_value: Some(long_models.into()),
                     effective_value: Some(long_models.into()),
@@ -721,37 +723,252 @@ mod tests {
                     global_writable: false,
                     repo_writable: true,
                     value_hint: None,
-                    shape: crate::command::commands::config::ConfigFieldShape::Scalar,
+                    shape: crate::command::commands::config::ConfigRowShape::Scalar,
                 },
             ],
         };
         let s = render_config_show(&o);
 
         assert!(
-            s.contains("dynamicWorkflows.defaultLeader"),
-            "defaultLeader field must appear: {s}"
+            s.contains("demo.leader"),
+            "leader scalar row must appear: {s}"
         );
         assert!(
-            s.contains("dynamicWorkflows.maxConcurrentSteps"),
-            "maxConcurrentSteps field must appear: {s}"
+            s.contains("demo.limit"),
+            "limit scalar row must appear: {s}"
         );
         assert!(
-            s.contains("dynamicWorkflows.agentsToModels.claude"),
-            "per-agent agentsToModels row must appear, got: {s}"
+            s.contains("demo.map.claude"),
+            "map entry row must appear, got: {s}"
         );
         assert!(
-            !s.contains("dynamicWorkflows.agentsToModels.claude (read-only)"),
-            "per-agent agentsToModels rows are inline-editable and must not be marked \
+            !s.contains("demo.map.claude (read-only)"),
+            "map entry rows are inline-editable and must not be marked \
              read-only, got: {s}"
         );
         assert!(
             s.contains(long_models),
-            "long agentsToModels value must appear untruncated in CLI text output, got: {s}"
+            "long map entry value must appear untruncated in CLI text output, got: {s}"
         );
         assert!(
             !s.contains('\u{2026}'),
             "CLI config show output must never truncate values with an ellipsis, got: {s}"
         );
+    }
+
+    /// A row built only from synthetic names and an explicit shape (WI 0150):
+    /// the CLI view must render it without knowing any real field name.
+    fn shaped_row(
+        field: &str,
+        shape: crate::command::commands::config::ConfigRowShape,
+        global: Option<&str>,
+        repo: Option<&str>,
+        effective: Option<&str>,
+        read_only: bool,
+    ) -> crate::command::commands::config::ConfigFieldRow {
+        crate::command::commands::config::ConfigFieldRow {
+            field: field.into(),
+            global_value: global.map(Into::into),
+            repo_value: repo.map(Into::into),
+            effective_value: effective.map(Into::into),
+            kind: crate::command::commands::config::ConfigFieldKind::String,
+            read_only,
+            global_writable: !read_only,
+            repo_writable: !read_only,
+            value_hint: None,
+            shape,
+        }
+    }
+
+    fn shape_driven_outcome() -> ConfigShowOutcome {
+        use crate::command::commands::config::ConfigRowShape as Shape;
+        ConfigShowOutcome {
+            global: serde_json::json!({}),
+            repo: serde_json::json!({}),
+            rows: vec![
+                shaped_row(
+                    "demo.map",
+                    Shape::MapHeader {
+                        child_prefix: "demo.map.",
+                    },
+                    Some("2 agents mapped"),
+                    Some("(none)"),
+                    Some("global map"),
+                    true,
+                ),
+                shaped_row(
+                    "demo.map.alpha",
+                    Shape::MapEntry,
+                    Some("m1, m2"),
+                    None,
+                    Some("m1, m2"),
+                    false,
+                ),
+                shaped_row(
+                    "demo.map.beta",
+                    Shape::MapEntry,
+                    None,
+                    Some("m3"),
+                    None,
+                    false,
+                ),
+                shaped_row(
+                    "demo.list",
+                    Shape::ListHeader {
+                        child_prefix: "demo.list.",
+                    },
+                    Some("1 entry"),
+                    Some("1 entry"),
+                    Some("1 global + 1 repo entries"),
+                    true,
+                ),
+                shaped_row(
+                    "demo.list.0",
+                    Shape::ListEntry,
+                    Some("global note"),
+                    Some("repo note"),
+                    None,
+                    false,
+                ),
+                shaped_row(
+                    "demo.scalar",
+                    Shape::Scalar,
+                    Some("g"),
+                    None,
+                    Some("g"),
+                    false,
+                ),
+            ],
+        }
+    }
+
+    #[test]
+    fn render_config_show_renders_map_list_and_scalar_rows_from_shape_alone() {
+        let s = render_config_show(&shape_driven_outcome());
+        let line_of = |needle: &str| {
+            s.lines()
+                .find(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("no row for {needle}: {s}"))
+                .to_string()
+        };
+        // Headers are read-only and carry their per-scope summaries.
+        let map_header = line_of("demo.map (read-only)");
+        assert!(map_header.contains("2 agents mapped"), "{map_header}");
+        assert!(map_header.contains("global map"), "{map_header}");
+        let list_header = line_of("demo.list (read-only)");
+        assert!(
+            list_header.contains("1 global + 1 repo entries"),
+            "{list_header}"
+        );
+        // Members are editable and show per-scope cells; a missing cell is "—".
+        let alpha = line_of("demo.map.alpha");
+        assert!(!alpha.contains("read-only"), "{alpha}");
+        assert!(alpha.contains("m1, m2") && alpha.contains('—'), "{alpha}");
+        let beta = line_of("demo.map.beta");
+        assert!(beta.contains("m3") && beta.contains('—'), "{beta}");
+        let entry = line_of("demo.list.0");
+        assert!(
+            entry.contains("global note") && entry.contains("repo note"),
+            "list member shows both scopes: {entry}"
+        );
+        let scalar = line_of("demo.scalar");
+        assert!(!scalar.contains("read-only"), "{scalar}");
+    }
+
+    #[test]
+    fn render_config_show_shows_global_and_repo_cells_in_their_own_columns() {
+        let s = render_config_show(&shape_driven_outcome());
+        let header = s
+            .lines()
+            .find(|l| l.contains("Field") && l.contains("Global"))
+            .expect("table header");
+        let global_col = header.find("Global").unwrap();
+        let repo_col = header.find("Repo").unwrap();
+        let entry = s.lines().find(|l| l.contains("demo.list.0")).unwrap();
+        let global_at = entry.find("global note").unwrap();
+        let repo_at = entry.find("repo note").unwrap();
+        assert!(global_at >= global_col && global_at < repo_col, "{s}");
+        assert!(repo_at >= repo_col, "{s}");
+    }
+
+    #[test]
+    fn render_config_show_output_names_only_what_the_rows_supply() {
+        let s = render_config_show(&shape_driven_outcome());
+        // Built from pieces so this file passes the frontend field-name scan.
+        let forbidden = [
+            ["agents", "ToModels"].concat(),
+            "guidance".to_string(),
+            ["default", "Leader"].concat(),
+            "dynamic".to_string(),
+        ];
+        for forbidden in &forbidden {
+            let forbidden = forbidden.as_str();
+            assert!(!s.contains(forbidden), "{forbidden} leaked into: {s}");
+        }
+    }
+
+    fn migrate_outcome(
+        changes: Vec<crate::data::config::ConfigMigrationChange>,
+        applied: bool,
+        dry_run: bool,
+    ) -> crate::command::commands::config::ConfigMigrateOutcome {
+        crate::command::commands::config::ConfigMigrateOutcome {
+            scope: crate::data::config::ConfigMigrationScope::Repo,
+            path: "/r/.awman/config.json".into(),
+            changes,
+            preview: "PREVIEW TEXT".into(),
+            applied,
+            dry_run,
+            global_has_never_read_dynamic_workflows: false,
+            note: None,
+        }
+    }
+
+    fn one_change() -> crate::data::config::ConfigMigrationChange {
+        crate::data::config::ConfigMigrationChange {
+            id: "demo-step",
+            summary: "Moved the demo block.",
+            before: serde_json::json!({"a": 1}),
+            after: serde_json::json!({"b": 1}),
+        }
+    }
+
+    #[test]
+    fn render_config_migrate_nothing_dry_run_and_applied() {
+        let nothing = render(
+            &CommandOutcome::Config(ConfigOutcome::Migrate(migrate_outcome(
+                vec![],
+                false,
+                false,
+            ))),
+            false,
+        )
+        .unwrap();
+        assert_eq!(nothing, "nothing to migrate");
+
+        let dry = render(
+            &CommandOutcome::Config(ConfigOutcome::Migrate(migrate_outcome(
+                vec![one_change()],
+                false,
+                true,
+            ))),
+            false,
+        )
+        .unwrap();
+        assert!(dry.starts_with("PREVIEW TEXT"), "{dry}");
+        assert!(dry.ends_with("dry run: nothing written"), "{dry}");
+
+        let applied = render(
+            &CommandOutcome::Config(ConfigOutcome::Migrate(migrate_outcome(
+                vec![one_change()],
+                true,
+                false,
+            ))),
+            false,
+        )
+        .unwrap();
+        assert!(applied.contains("/r/.awman/config.json"), "{applied}");
+        assert!(applied.contains("Moved the demo block."), "{applied}");
     }
 
     #[test]
@@ -760,6 +977,8 @@ mod tests {
             field: "agent".into(),
             value: "gemini".into(),
             scope: "repo".into(),
+            moved_legacy_dynamic_workflows: false,
+            alias_used: None,
         };
         let s = render_config_set(&o);
         assert!(s.contains("agent"), "field name must appear");

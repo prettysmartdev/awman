@@ -22,6 +22,7 @@ mod clean_command;
 mod cli_subprocess;
 mod context_overlay_0087;
 mod custom_agents;
+mod dynamic_config_0150;
 mod hardening_0098;
 mod headless_no_tty;
 mod overlay_0082;

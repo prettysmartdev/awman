@@ -1,7 +1,7 @@
 //! Reading and writing a dot-notation path inside a config JSON document.
 //!
 //! `awman config get|set` addresses fields by dotted name — `work_items.dir`,
-//! `dynamicWorkflows.guidance.2` — and these four navigate, create and remove
+//! `workflows.dynamic.guidance.2` — and these four navigate, create and remove
 //! the corresponding JSON. Layer 0 (WI 0114 F-51): they know nothing about
 //! which fields exist or what their values mean, only how a path maps onto a
 //! `serde_json::Value`.
@@ -12,7 +12,7 @@ pub fn config_field_value(json: &serde_json::Value, field: &str) -> Option<Strin
     let mut current = json;
     for part in &parts {
         // A numeric segment indexes into an array (e.g. the
-        // dynamicWorkflows.guidance.<n> entries); everything else is an
+        // workflows.dynamic.guidance.<n> entries); everything else is an
         // object key.
         current = match current {
             serde_json::Value::Array(arr) => arr.get(part.parse::<usize>().ok()?)?,
@@ -47,7 +47,7 @@ pub fn apply_config_field(json: &mut serde_json::Value, field: &str, value: serd
 
 /// Remove a JSON field, supporting dot-notation for nested objects and a
 /// trailing numeric segment that indexes into an array-of-strings field
-/// (e.g. `dynamicWorkflows.guidance.1`). Removing an array element via
+/// (e.g. `workflows.dynamic.guidance.1`). Removing an array element via
 /// `Vec::remove` compacts the remaining elements, so subsequent entries are
 /// automatically re-indexed (WI-0099). Missing intermediate objects make this
 /// a no-op.
@@ -89,11 +89,11 @@ pub fn remove_config_field(json: &mut serde_json::Value, field: &str) {
 pub fn set_config_field(json: &mut serde_json::Value, field: &str, value: serde_json::Value) {
     let parts: Vec<&str> = field.split('.').collect();
     // Trailing numeric segment: set (or append) an element in the parent
-    // array-of-strings field (e.g. `dynamicWorkflows.guidance.<n>`). An index
+    // array-of-strings field (e.g. `workflows.dynamic.guidance.<n>`). An index
     // at or past the current length appends, which is how the TUI Ctrl+N flow
     // adds a new entry (WI-0099). Intermediate objects and the array itself
     // are created on demand so guidance can be added to a config that has no
-    // `dynamicWorkflows` block yet.
+    // `workflows.dynamic` block yet.
     if let Some(index) = parts.last().and_then(|p| p.parse::<usize>().ok()) {
         if parts.len() >= 2 {
             set_array_element(json, &parts[..parts.len() - 1], index, value);
@@ -132,9 +132,9 @@ pub fn set_config_field(json: &mut serde_json::Value, field: &str, value: serde_
 
 /// Set or append an element in an array-of-strings field addressed by
 /// `array_path` (the dot-path segments up to and including the array field,
-/// e.g. `["dynamicWorkflows", "guidance"]`). Intermediate objects and the
+/// e.g. `["workflows", "dynamic", "guidance"]`). Intermediate objects and the
 /// array are created on demand. `index >= len` appends; `index < len`
-/// overwrites in place. Used for the `dynamicWorkflows.guidance` array
+/// overwrites in place. Used for the `workflows.dynamic.guidance` array
 /// (WI-0099).
 pub fn set_array_element(
     json: &mut serde_json::Value,

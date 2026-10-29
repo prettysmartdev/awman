@@ -37,6 +37,7 @@ fn state(root: &Path, workdirs: Vec<PathBuf>, roots: Vec<PathBuf>) -> Arc<AppSta
         overlay_engine,
         auth_engine: Arc::new(AuthEngine::with_paths(auth_paths, paths.clone())),
         agent_engine,
+        config_notices: Default::default(),
         workflow_state_store: Arc::new(WorkflowStateStore::at_git_root(paths.root())),
         credential_monitor: None,
         global_config: Arc::new(Default::default()),

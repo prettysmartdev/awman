@@ -123,7 +123,10 @@ impl Command for ExecWorkflowCommand {
         }
 
         // Emit deprecation warnings for legacy config fields.
-        frontend.with(|frontend| LaunchPolicy::for_session(&self.session).warn_config(frontend));
+        frontend.with(|frontend| {
+            LaunchPolicy::for_session(&self.session)
+                .warn_config(&self.engines.config_notices, frontend)
+        });
 
         if self.flags.yolo && self.flags.worktree {
             frontend.write_message(UserMessage {

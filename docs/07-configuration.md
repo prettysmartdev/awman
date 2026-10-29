@@ -29,13 +29,15 @@ Created by `awman init`; commit it so the whole team shares the same setup.
     "dir": "docs/work-items",
     "template": "docs/work-items/0000-template.md"
   },
-  "dynamicWorkflows": {
-    "agentsToModels": {
-      "claude": ["claude-opus-4-8", "claude-sonnet-4-6"]
-    },
-    "maxConcurrentSteps": 3,
-    "defaultLeader": "claude::claude-opus-4-8",
-    "guidance": ["Never spawn more than two agents in parallel."]
+  "workflows": {
+    "dynamic": {
+      "agentsToModels": {
+        "claude": ["claude-opus-4-8", "claude-sonnet-4-6"]
+      },
+      "maxConcurrentSteps": 3,
+      "defaultLeader": "claude::claude-opus-4-8",
+      "guidance": ["Never spawn more than two agents in parallel."]
+    }
   },
   "worktree": {
     "onDirtyMergeTarget": "ask",
@@ -109,6 +111,12 @@ Applies to every project on the machine unless a repo overrides it.
     "maxConcurrentEvaluations": 2,
     "defaultLeader": "claude::claude-opus-4-8",
     "guidance": ["Keep automated changes focused."]
+  },
+  "workflows": {
+    "dynamic": {
+      "defaultLeader": "claude::claude-opus-4-8",
+      "guidance": ["Keep workflows focused and include a review step."]
+    }
   },
   "remote": {
     "defaultAddr": "http://build-server.example.com:9876",
@@ -279,6 +287,7 @@ awman config show                          # full table: global, repo, and effec
 awman config get <field>                   # one field, all scopes
 awman config set <field> <value>           # write to repo config
 awman config set --global <field> <value>  # write to global config
+awman config migrate                       # move legacy dynamic-workflow settings
 ```
 
 - `config show` and `config get` never fail on missing files; absent files are treated as all-unset. `config set` creates the file and its parent directory as needed.
@@ -286,6 +295,26 @@ awman config set --global <field> <value>  # write to global config
 - Unknown field names get a did-you-mean suggestion list.
 - `remote.defaultAPIKey` is masked in `config show`/`config get` output.
 - Setting the removed `envPassthrough` field errors with guidance to use `env(VAR)` overlay entries instead.
+
+`awman config migrate` moves a repo's old dynamic-workflow block to
+`workflows.dynamic`. Use `--dry-run` to preview the changes, or `--yes` to
+apply without confirmation. It keeps the order of every other key in the file,
+and refuses a `.awman/` directory or `config.json` that is a symlink. Saving a
+repo config (`config set`, the TUI config dialog, `awman init`) also moves the
+old repo block automatically and says so. `--global` changes nothing: the
+former global `dynamicWorkflows` key was never read, so `awman config migrate
+--global` only reports whether it is present. Copy any settings you want from
+it into the global `workflows.dynamic` block yourself; awman keeps the old
+block in the file until you delete it. Older awman versions do not read
+`workflows.dynamic`; teammates on older versions will stop seeing migrated
+settings once the config change is committed.
+
+An invalid `workflows.dynamic` block in global config (for example
+`maxConcurrentSteps: 0`) is a load error naming `~/.awman/config.json` and the
+field. Like any other invalid global setting, it stops every command, including
+`awman config show` and `awman config set --global`, so fix it by editing the
+file by hand. `config set` refuses an edit that would make either file invalid,
+so this only happens after a hand edit.
 
 The full list of accepted field names and their scopes is in the [Reference](#reference).
 
@@ -394,13 +423,22 @@ Leaving `maxConcurrentAgents` unset (the default) means unlimited — every step
 ### Configure dynamic workflow agents, models, and leader
 
 ```sh
-awman config set dynamicWorkflows.defaultLeader claude::claude-opus-4-8
-awman config set dynamicWorkflows.maxConcurrentSteps 3
+awman config set workflows.dynamic.defaultLeader claude::claude-opus-4-8
+awman config set workflows.dynamic.maxConcurrentSteps 3
 ```
 
-`dynamicWorkflows.agentsToModels` is set one agent at a time — `awman config set dynamicWorkflows.agentsToModels.<agentName> "model-a, model-b"` (an empty value removes the mapping), or inline in the TUI config dialog where **Ctrl+N** adds a new mapping.
+`workflows.dynamic.agentsToModels` is set one agent at a time —
+`awman config set workflows.dynamic.agentsToModels.<agentName> "model-a, model-b"`
+(an empty value removes the mapping). Add `--global` to write to global config,
+or use the TUI config dialog's Global or Repo column; **Ctrl+N** adds a mapping
+to the selected scope.
 
-`dynamicWorkflows.guidance` is a list of instructions the leader agent must follow whenever it designs a workflow. It's set one entry at a time, addressed by index — `awman config set dynamicWorkflows.guidance.0 "Never spawn more than two agents in parallel."` (an empty value removes that entry and re-indexes the rest) — or inline in the TUI config dialog, where **Ctrl+N** appends a new entry.
+`workflows.dynamic.guidance` is a list of instructions the leader agent must
+follow whenever it designs a workflow. It's set one entry at a time, addressed
+by index — `awman config set workflows.dynamic.guidance.0 "Never spawn more than
+two agents in parallel."` (an empty value removes that entry and re-indexes the
+rest). Use `--global` or select the Global column in the TUI to edit global
+guidance; **Ctrl+N** appends to the selected scope.
 
 See [Dynamic Workflows](06-dynamic-workflows.md#configuring-dynamic-workflows) for the full reference.
 
@@ -616,10 +654,10 @@ awman keeps global config and data (workflows, skills, worktrees, API state) und
 | `worktree.mergeFix.onFailure` | string | (unset → frontend default) | `ask`, `agent`, or `keep` after a worktree merge fails — see [Worktree merge-back](05-workflows.md#worktree-merge-back) | yes |
 | `worktree.mergeFix.promptTemplate` | string | (unset → built-in prompt) | Merge-fix agent prompt template path relative to the Git root | yes |
 | `dockerfile` | string | `Dockerfile.dev` | Path to the project base Dockerfile, relative to repo root or absolute | no (edit file) |
-| `dynamicWorkflows.agentsToModels` | object (agent → string array) | (unset → Dockerfile discovery) | Restricts a dynamic workflow's leader to this agent/model set — see [Dynamic Workflows](06-dynamic-workflows.md#configuring-dynamic-workflows) | yes, per agent as `dynamicWorkflows.agentsToModels.<agentName>` (comma-separated; empty value removes) |
-| `dynamicWorkflows.maxConcurrentSteps` | integer | (unset → unlimited) | Advisory cap on concurrent workflow steps passed to the leader prompt | yes, as `dynamicWorkflows.maxConcurrentSteps` |
-| `dynamicWorkflows.defaultLeader` | string (`agent::model`) | (unset) | Default leader agent/model for `exec workflow --dynamic`; overridden by `--leader` | yes, as `dynamicWorkflows.defaultLeader` |
-| `dynamicWorkflows.guidance` | string array | (unset → no guidance block) | Project-specific instructions injected into the leader prompt as a bullet list — see [Dynamic Workflows](06-dynamic-workflows.md#configuring-dynamic-workflows) | yes, per entry as `dynamicWorkflows.guidance.<index>` (empty value removes) |
+| `workflows.dynamic.agentsToModels` | object (agent → string array) | (unset → Dockerfile discovery) | Repo map replaces global map; global agents without a Dockerfile in this repo are skipped — see [Dynamic Workflows](06-dynamic-workflows.md#global-and-repo-settings) | yes, per agent as `workflows.dynamic.agentsToModels.<agentName>` (comma-separated; empty value removes) |
+| `workflows.dynamic.maxConcurrentSteps` | integer | (unset → unlimited) | Advisory cap on concurrent workflow steps passed to the leader prompt | yes, as `workflows.dynamic.maxConcurrentSteps` |
+| `workflows.dynamic.defaultLeader` | string (`agent::model`) | (unset) | Default leader agent/model for `exec workflow --dynamic`; overridden by `--leader` | yes, as `workflows.dynamic.defaultLeader` |
+| `workflows.dynamic.guidance` | string array | (unset → no guidance block) | Global and repo instructions are combined in order, with duplicates dropped — see [Dynamic Workflows](06-dynamic-workflows.md#global-and-repo-settings) | yes, per entry as `workflows.dynamic.guidance.<index>` (empty value removes) |
 | `builtin` | object | (unset) | Repo overrides for the builtin runtime block, merged over the global one per field — see [Builtin runtime settings](#builtin-runtime-settings) | scalars only (`builtin.stateDir`, `builtin.vcpus`, `builtin.memoryMib`, `builtin.rootDiskMib`, `builtin.mountQuotaMib`) |
 | `auth` | `"keychain"` \| `"passthrough"` \| `"none"` | `"keychain"` | Credential injection mode — see [Control credential injection](#control-credential-injection-auth-mode) | no (edit file) |
 | `authRefresh` | object | (unset) | Live credential-refresh settings for Claude — see [Control credential refresh](#control-credential-refresh-authrefresh) | no (edit file) |
@@ -652,6 +690,10 @@ awman keeps global config and data (workflows, skills, worktrees, API state) und
 | `launchModeFallback` | `"stdio"` \| `"error"` | `"error"` | What to do when a requested ACP launch uses an agent without ACP support | no (edit file) |
 | `authRefresh` | object | (unset) | Machine-wide default live credential-refresh settings for Claude (unless a repo overrides a field) — see [Control credential refresh](#control-credential-refresh-authrefresh) | no (edit file) |
 | `agentFlags` | object (agent → string array) | (unset) | Machine-wide extra arguments appended to that agent's command (unless a repo sets an entry for the same agent) — see [Pass extra flags to an agent](#pass-extra-flags-to-an-agent) | no (edit file) |
+| `workflows.dynamic.agentsToModels` | object (agent → string array) | (unset → Dockerfile discovery) | Machine-wide agent/model map; entries without a Dockerfile in a repo are skipped — see [Dynamic Workflows](06-dynamic-workflows.md#global-and-repo-settings) | yes, per agent as `workflows.dynamic.agentsToModels.<agentName>` |
+| `workflows.dynamic.maxConcurrentSteps` | integer | (unset → unlimited) | Advisory cap passed to the dynamic workflow leader | yes, as `workflows.dynamic.maxConcurrentSteps` |
+| `workflows.dynamic.defaultLeader` | string (`agent::model`) | (unset) | Default leader agent/model, unless a repo or `--leader` overrides it | yes, as `workflows.dynamic.defaultLeader` |
+| `workflows.dynamic.guidance` | string array | (unset → no guidance block) | Machine-wide leader instructions, combined with repo guidance — see [Dynamic Workflows](06-dynamic-workflows.md#global-and-repo-settings) | yes, per entry as `workflows.dynamic.guidance.<index>` |
 
 ### `awman config` subcommands
 
@@ -661,6 +703,7 @@ awman keeps global config and data (workflows, skills, worktrees, API state) und
 | `awman config get <field>` | Global, repo, and effective value of one field |
 | `awman config set <field> <value>` | Write a field to repo config |
 | `awman config set --global <field> <value>` | Write a field to global config |
+| `awman config migrate [--global] [--dry-run] [--yes]` | Move legacy repo dynamic-workflow settings to `workflows.dynamic`; `--global` only reports the never-read global key |
 
 ### Field names accepted by `config set` / `config get`
 
@@ -692,10 +735,10 @@ awman keeps global config and data (workflows, skills, worktrees, API state) und
 | `api.background` | global only |
 | `remote.defaultAddr` | global only in practice (see note) |
 | `remote.defaultAPIKey` | global only in practice (see note) |
-| `dynamicWorkflows.defaultLeader` | repo only |
-| `dynamicWorkflows.maxConcurrentSteps` | repo only |
-| `dynamicWorkflows.agentsToModels` (and `.<agentName>`) | repo only |
-| `dynamicWorkflows.guidance` (and `.<index>`) | repo only |
+| `workflows.dynamic.defaultLeader` | repo or global |
+| `workflows.dynamic.maxConcurrentSteps` | repo or global |
+| `workflows.dynamic.agentsToModels` (and `.<agentName>`) | repo or global |
+| `workflows.dynamic.guidance` (and `.<index>`) | repo or global |
 
 > **Note on `remote.*` scope.** `config set` accepts these at repo scope, but only the **global** file is ever read back — always pass `--global` when setting them.
 
@@ -706,10 +749,10 @@ shown above directly.
 Value handling:
 
 - `yoloDisallowedTools`, `overlays`, `api.workDirs`, `api.workDirRoots` — comma-separated values are stored as arrays; an empty string stores an empty array.
-- `terminal_scrollback_lines`, `agentStuckTimeout`, `api.port`, `maxConcurrentAgents`, `dynamicWorkflows.maxConcurrentSteps` — must be positive integers; `0` is rejected.
+- `terminal_scrollback_lines`, `agentStuckTimeout`, `api.port`, `maxConcurrentAgents`, `workflows.dynamic.maxConcurrentSteps` — must be positive integers; `0` is rejected.
 - `agent`, `default_agent` — validated against the built-in agents and the custom agents defined in the scope being written.
-- `dynamicWorkflows.defaultLeader` — must be in `agent::model` format (exactly two non-empty, non-whitespace components).
-- `dynamicWorkflows.guidance.<index>` — a single free-form instruction string, capped at 1,000 characters and 50 entries total; empty or whitespace-only values are rejected on load and coerced to a removal when set via `config set`.
+- `workflows.dynamic.defaultLeader` — must be in `agent::model` format (exactly two non-empty, non-whitespace components).
+- `workflows.dynamic.guidance.<index>` — a single free-form instruction string, capped at 1,000 characters; the combined global and repo list is limited to 50 entries. Empty or whitespace-only values are rejected on load and coerced to a removal when set via `config set`.
 - `envPassthrough` — removed; the error message points you to `env(VAR)` overlay entries.
 
 ### Environment variables

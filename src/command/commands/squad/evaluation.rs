@@ -29,7 +29,7 @@ use crate::command::commands::squad::runtime_guard::require_container_tier;
 use crate::command::commands::workflow_preflight::{
     build_effective_agents_to_models, ensure_agent_image_with_build_output,
     format_agents_with_models, format_available_agents, validate_generated_workflow,
-    BuildOutputTarget,
+    BuildOutputTarget, MissingDockerfilePolicy,
 };
 use crate::command::commands::{parse_overlay_list, CollectedOverlays, Command};
 use crate::command::dispatch::Engines;
@@ -486,6 +486,13 @@ impl LocalTaskEvaluator {
             .transpose()?;
 
         let mut sink = TracingSink::new(&task.name);
+        // The once-per-repo deprecation notice belongs to the first
+        // evaluation, not to the first one that triggers: a leader that never
+        // triggers would otherwise never show it. The generated workflow
+        // shares this gate through `engines`, so it does not repeat it.
+        self.engines
+            .config_notices
+            .warn_legacy_dynamic_workflows(&session, &mut sink);
         // Raw container image build output goes to per-build files under
         // `<squad root>/builds/<task>/`, never into the daemon log; the daemon
         // log gets one lifecycle line per build naming the file instead.
@@ -536,8 +543,13 @@ impl LocalTaskEvaluator {
         {
             Some(map) => {
                 let mut warnings = Vec::new();
-                let effective =
-                    build_effective_agents_to_models(map, &available_agents, &mut warnings)?;
+                let effective = build_effective_agents_to_models(
+                    map,
+                    &available_agents,
+                    MissingDockerfilePolicy::Fail,
+                    "squad.agentsToModels",
+                    &mut warnings,
+                )?;
                 for warning in warnings {
                     sink.write_message(UserMessage {
                         level: MessageLevel::Warning,

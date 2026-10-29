@@ -105,7 +105,7 @@ pub fn build_leader_prompt(
         .replace("{{developer_guidance}}", &developer_guidance)
 }
 
-/// Render the repo config's `dynamicWorkflows.guidance` entries as the bullet
+/// Render resolved `workflows.dynamic.guidance` entries as the bullet
 /// list both leader prompts substitute into their Developer Guidance section
 /// (WI-0099).
 ///
