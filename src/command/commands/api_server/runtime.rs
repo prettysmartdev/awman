@@ -202,13 +202,6 @@ impl ApiServerRuntime {
             for rec in &records {
                 tracing::warn!(session_id = %rec.id, previous_status = %rec.setup_status, "Marking session as failed (server restarted during setup)");
                 let _ = store.update_setup_status(&rec.id, "failed");
-                if rec.session_type == "remote" {
-                    if let Some(cloned) = rec.cloned_path.as_deref() {
-                        let _ = engines
-                            .git_engine
-                            .delete_directory(&std::path::PathBuf::from(cloned));
-                    }
-                }
                 let mut setup_state = paths.read_setup_state(&rec.id).unwrap_or_default();
                 setup_state.status = SessionSetupStatus::Failed;
                 setup_state.current_stage =
@@ -227,9 +220,21 @@ impl ApiServerRuntime {
                             .as_ref(),
                     );
                     let _ = lifecycle_store.fail_if_queued(&run.command_id, &now, &result);
+                    let _ = super::queue_worker::finalize_unowned_command(
+                        &store,
+                        &paths,
+                        &run.command_id,
+                    );
                     if run.close_on_finish {
                         let _ = store.close_session_force(&rec.id, &now);
                         forget_restored_session(&sessions, &rec.id);
+                    }
+                }
+                if rec.session_type == "remote" {
+                    if let Some(cloned) = rec.cloned_path.as_deref() {
+                        let _ = engines
+                            .git_engine
+                            .delete_directory(&std::path::PathBuf::from(cloned));
                     }
                 }
             }
@@ -240,6 +245,13 @@ impl ApiServerRuntime {
         // every `running` row) never brings it back.
         match lifecycle_store.finalize_interrupted_cancellations(&chrono::Utc::now().to_rfc3339()) {
             Ok(cancelled) => {
+                for id in &cancelled {
+                    if let Err(error) =
+                        super::queue_worker::finalize_unowned_command(&store, &paths, id)
+                    {
+                        tracing::warn!(%error, %id, "Failed to publish recovered cancellation");
+                    }
+                }
                 if !cancelled.is_empty() {
                     tracing::info!(
                         count = cancelled.len(),
@@ -327,6 +339,7 @@ impl ApiServerRuntime {
             Arc::clone(&self.command_cancels),
             Arc::clone(&self.setup_cancels),
         )
+        .with_completion_paths(self.paths.clone())
     }
 
     pub fn engines(&self) -> &Engines {
@@ -434,6 +447,15 @@ impl ApiSessionLifecycle {
             )?;
         }
         let command = self.store.get_command(&run.command_id)?;
+        if command.as_ref().is_some_and(|c| {
+            c.started_at.is_none() && matches!(c.status.as_str(), "error" | "cancelled")
+        }) {
+            super::queue_worker::finalize_unowned_command(
+                &self.store,
+                &self.paths,
+                &run.command_id,
+            )?;
+        }
         let terminal = command.as_ref().is_some_and(|c| {
             CommandStatus::parse(&c.status).is_some_and(CommandStatus::is_terminal)
         });
@@ -561,14 +583,27 @@ impl ApiSessionLifecycle {
 /// `error` is the literal `"setup_error"`; the setup's own `{stage, message}`
 /// (or `null`) rides in `setup_error`. Written with exit code 1.
 pub fn run_setup_error_result(setup_error: Option<&serde_json::Value>) -> String {
-    serde_json::json!({
-        "exit_code": 1,
-        "error": "setup_error",
-        "error_status": 409,
-        "stage": "setup",
-        "setup_error": setup_error.cloned().unwrap_or(serde_json::Value::Null),
+    use crate::data::fs::api_db::{failure_codes, CommandFailure, CommandResult};
+    let message = setup_error
+        .and_then(|e| e.get("message"))
+        .and_then(|m| m.as_str())
+        .unwrap_or("Session setup failed");
+    serde_json::to_string(&CommandResult {
+        exit_code: Some(1),
+        outcome: Some(crate::data::execution_event::CommandStatusKind::Error),
+        failure: Some(CommandFailure {
+            stage: "setup".into(),
+            code: failure_codes::SETUP_FAILED.into(),
+            message: message.into(),
+            step: None,
+        }),
+        error: Some("setup_error".into()),
+        error_status: Some(409),
+        stage: Some("setup".into()),
+        setup_error: Some(setup_error.cloned().unwrap_or(serde_json::Value::Null)),
+        ..CommandResult::default()
     })
-    .to_string()
+    .expect("command result is serializable")
 }
 
 /// Bootstrap: finish every `/v1/runs` lifecycle hook a crash interrupted,
@@ -608,6 +643,11 @@ fn reconcile_runs(
             if let Err(error) = lifecycle_store.fail_if_queued(&run.command_id, &now, &result) {
                 tracing::warn!(command_id = %run.command_id, %error, "Failed to fail a run whose setup failed");
             }
+        }
+        if let Err(error) =
+            super::queue_worker::finalize_unowned_command(store, paths, &run.command_id)
+        {
+            tracing::warn!(%error, command_id = %run.command_id, "Failed to publish terminal run result");
         }
         let terminal = store
             .get_command(&run.command_id)

@@ -674,6 +674,7 @@ fn sse_event_type_names_are_correct_snake_case() {
                 status: CommandStatusKind::Done,
                 exit_code: Some(0),
                 error: None,
+                result: None,
             },
             "command_status",
         ),
@@ -700,6 +701,7 @@ fn sse_wire_format_assembles_correctly() {
             .with_timezone(&chrono::Utc),
         attempt: 1,
         sequence: 42,
+        source: None,
         payload: EventPayload::StdoutLine("hello world".into()),
     };
 
@@ -757,6 +759,7 @@ async fn ndjson_1000_events_all_parseable() {
                 status: CommandStatusKind::Done,
                 exit_code: None,
                 error: None,
+                result: None,
             },
         };
         sender.emit(payload);
@@ -1038,6 +1041,7 @@ fn execution_event_json_roundtrip_all_payload_variants() {
             status: CommandStatusKind::Done,
             exit_code: Some(0),
             error: None,
+            result: None,
         },
         EventPayload::Done,
     ];
@@ -1047,6 +1051,7 @@ fn execution_event_json_roundtrip_all_payload_variants() {
             timestamp: chrono::Utc::now(),
             attempt: 1,
             sequence: i as u64,
+            source: None,
             payload,
         };
         let json = serde_json::to_string(&event)
@@ -1537,7 +1542,9 @@ async fn api_frontend_write_message_emits_status_message_event() {
 }
 
 /// Reporting a workflow step transition through the frontend must emit a
-/// `WorkflowStepTransition` event with a sensible (per-step) `step_index`.
+/// `WorkflowStepTransition` event whose `step_index` is the step's position in
+/// `WorkflowState.steps` (WI 0137 §5), whatever order the steps launch in,
+/// and whose envelope `source` names the step.
 #[tokio::test]
 async fn api_frontend_workflow_step_transition_index_is_per_step() {
     use awman::data::workflow_definition::WorkflowStep;
@@ -1568,9 +1575,16 @@ async fn api_frontend_workflow_step_transition_index_is_per_step() {
         abort_on_failure: false,
     };
 
-    fe.report_step_status(&step_a, WorkflowStepStatus::Running);
+    let state = awman::data::workflow_state::WorkflowState::new(
+        "w".into(),
+        &[step_a.clone(), step_b.clone()],
+        "hash".into(),
+        None,
+    );
+    fe.report_workflow_state(&state);
     fe.report_step_status(&step_b, WorkflowStepStatus::Running);
-    fe.report_step_status(&step_a, WorkflowStepStatus::Succeeded);
+    fe.report_step_status(&step_a, WorkflowStepStatus::Running);
+    fe.report_step_status(&step_b, WorkflowStepStatus::Succeeded);
 
     let e1 = rx.recv().await.unwrap();
     let e2 = rx.recv().await.unwrap();
@@ -1579,9 +1593,12 @@ async fn api_frontend_workflow_step_transition_index_is_per_step() {
         EventPayload::WorkflowStepTransition { step_index, .. } => *step_index,
         _ => panic!("expected WorkflowStepTransition"),
     };
-    assert_eq!(idx(&e1), 0, "first reported step gets index 0");
-    assert_eq!(idx(&e2), 1, "second new step gets index 1");
-    assert_eq!(idx(&e3), 0, "repeat of first step keeps index 0");
+    assert_eq!(idx(&e1), 1, "beta is second in the definition");
+    assert_eq!(idx(&e2), 0, "alpha is first in the definition");
+    assert_eq!(idx(&e3), 1, "beta keeps its definition index");
+    let source = e1.source.as_ref().expect("step events carry a source");
+    assert_eq!(source.step_name.as_deref(), Some("beta"));
+    assert_eq!(source.step_index, Some(1));
 }
 
 // ─── SSE lagged-subscriber behavior ───────────────────────────────────────────

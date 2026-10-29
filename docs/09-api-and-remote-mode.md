@@ -1129,9 +1129,52 @@ processed and reported in the command log.
 ```json
 {
   "exit_code": 0,
-  "error": null
+  "outcome": "done",
+  "git": {
+    "dirty": false,
+    "changed_files": [],
+    "changed_files_truncated": false
+  },
+  "outputs": { "files": 0, "bytes": 0 }
 }
 ```
+
+`result` is the structured description of how the command ended. Optional
+fields are omitted when they do not apply:
+
+| Field | Meaning |
+|-------|---------|
+| `exit_code` | Process or command exit code, when known |
+| `outcome` | `done`, `error`, `aborted`, `paused` or `cancelled`; refines the command row's status |
+| `failure` | Why a command did not finish successfully: `{ "stage", "code", "message", "step?" }` |
+| `failed_steps` | Failed workflow steps, each with its name, phase, index, last `step_attempt`, and known exit code or error |
+| `git` | Checkout summary: branch and base/head SHAs when known, dirty flag, and changed-file details |
+| `worktree_path` | Retained worktree path, when applicable |
+| `pull_request` | `{ "url": "…" }` for a PR opened by a successful `create_pull_request` teardown step |
+| `final_message` | The final agent message for `exec prompt` when the selected agent provides structured output |
+| `outputs` | `{ "files", "bytes" }` summary of files under `/awman/output` |
+| `data` | JSON data for commands with a JSON result |
+| `error` | Legacy error text; ordinary failures use `failure.message`, while setup and cancellation retain their legacy markers |
+| `cancelled_at` | Time an accepted cancellation was recorded |
+| `pushed` | Push result for sessions configured with `push: true`; may be `null` when no push occurred |
+
+Git details apply to commands that execute in a checkout. They are omitted for
+queued cancellations and an existing-worktree preflight refusal. Changed files
+include uncommitted and untracked edits, are capped at 500 entries, and set
+`changed_files_truncated` when entries are omitted. Binary files have null line
+counts. If diff collection fails, `changed_files_error` explains why the list
+is unavailable while known branch, head and dirty facts remain available.
+A step that succeeds on retry is removed from `failed_steps`.
+
+`error_status`, `stage` and `setup_error` are deprecated compatibility fields.
+Use `failure.code` and `failure.stage` instead of `error_status` and `stage`;
+use `failure` for session setup errors instead of `setup_error`. The legacy
+`error_status` was a numeric HTTP-style error status, `stage` was a coarse
+failure label, and `setup_error` held the `/v1/runs` setup details. The legacy
+`error` field remains available as the human-readable message. A command row
+status is only `queued` (or legacy `pending`), `running`, `done`, `error` or
+`cancelled`; `aborted` and `paused` are values of `result.outcome`, not row
+statuses.
 
 **Malformed `args`:** `POST /v1/commands` and the nested command in `POST /v1/runs` validate flags and positional arguments against the command catalogue before enqueueing. Unknown flags or invalid typed values return HTTP 400 without creating a command, for example:
 
@@ -1200,6 +1243,16 @@ data: {"timestamp":"…","attempt":1,"sequence":2,"payload":{"type":"Done"}}
 
 Each SSE frame is terminated by a blank line. Persisted events carry `id: <attempt>:<sequence>`; sequence numbers start at 0 and increase within each attempt. The JSON payload is typed, and the `event:` name identifies its type. Treat `event: done` as the completion signal. Clients that ignore `id:` and continue reading `event:` and `data:` work as before.
 
+Every event JSON object may also include a `source` envelope field describing
+where it came from. For attributed work it contains `phase` (`leader`,
+`setup`, `main`, `teardown`, `merge` or `push`), and may contain `step_name`,
+`step_index`, `container` and 1-based `step_attempt`. The step index is its
+position in the workflow definition; `step_attempt` counts retries of that
+step. The envelope's `attempt` separately counts command executions after a
+daemon restart. Queue notices and terminal `command_status`/`done` events have
+no source. Shell setup and teardown output and leader output may have a phase
+without a step name.
+
 **Shell example — stream and print until done:**
 
 ```sh
@@ -1239,17 +1292,50 @@ curl -N -H 'Authorization: Bearer <api-key>' \
 
 `awman remote exec --follow` uses this endpoint internally. The cURL form above is equivalent and is useful in scripts where the awman binary is unavailable on the client.
 
+Add `?step=<step-name>` to the live logs URL or JSON snapshot URL to receive only events attributed
+to that workflow step. Command-level completion events (`command_status` and
+`done`) are still sent so the filtered stream can finish on its own. For
+example:
+
+```sh
+curl -N 'http://localhost:9876/v1/commands/<command-id>/logs?step=implement' \
+  -H 'Authorization: Bearer <api-key>'
+```
+
 **Structured events:** each event frame carries a named `event:` type (`stdout_line`,
 `stderr_line`, `status_message`, `workflow_prerequisites`, `workflow_step_transition`,
 `workflow_phase_transition`, `workflow_parallel_step_launched`,
 `workflow_parallel_step_exited`, `workflow_parallel_group_finished`,
-`command_status`, `done`) and a JSON `data:` payload, so a client that wants
+`command_status`, `step_activity`, `done`) and a JSON `data:` payload, so a client that wants
 structured data instead of log lines can read the `event:` field and parse
 accordingly. Add `?format=json` to the same URL to fetch the event-log snapshot
 described above. It includes all retained attempts and their historical `Done`
 records, including a marker written immediately before a crash and re-queue.
 Interpret those records by `attempt`; only the SSE `done` notification certifies
 that the current command is terminal. Resume inputs do not filter this snapshot:
+
+The worker emits exactly one final `command_status` event after recording the
+terminal command row, followed by `done`. Its `result` is the same structured
+object returned by the command status endpoint. The event's status can be
+`paused` or `aborted` even though the persisted row status is `error`; inspect
+`result.outcome` for that distinction. The older `status`, `exit_code` and
+`error` event fields remain for compatibility.
+
+The stream waits for delayed final log writes. If the log cannot be recovered,
+it sends completion from the terminal row without event IDs, preserving the
+persisted cursor space for a later reconnect.
+
+Structured-output agents can also produce `step_activity` events. Their
+payload is `{ "type": "StepActivity", "kind": "message" | "tool_use" |
+"tool_result" | "thinking", "summary": "…" }`. The summary is a bounded
+one-line hint (at most 200 characters), and the event's `source` attributes it
+to its step. Activity events supplement ordinary stdout/stderr output.
+
+Final messages and activity summaries currently have the same redaction limits
+as log text; do not assume they conceal secrets. Any future log redaction must
+also cover those fields. Valid structured frames with unknown content produce
+bounded activity hints rather than raw tool payloads; malformed JSON lines pass
+through as ordinary output.
 
 ```sh
 curl -s "http://localhost:9876/v1/commands/<command-id>/logs?format=json" \
@@ -1390,6 +1476,52 @@ After a daemon restart, a recorded cancellation stays cancelled. The daemon stop
 
 `exec prompt` (including ACP agents), `exec workflow` and dynamic workflows are all cancellable. Closing a session with `DELETE /v1/sessions/:id` still lets a running command finish; use the cancel endpoint first if you want it stopped.
 
+#### List and retrieve command outputs
+
+API-backed agent runs can write files under `/awman/output`. List the files
+for a command with `GET /v1/commands/{id}/outputs`; fetch one with
+`GET /v1/commands/{id}/outputs/{path}`:
+
+Persistent outputs require a runtime that supports host directory mounts
+(Docker, Apple Containers or builtin). Sandbox runtimes do not mount or
+advertise `/awman/output`; the command emits a warning about this limitation.
+Output retrieval is supported on Unix hosts. Other hosts refuse output reads
+until a safe descriptor-based implementation is available.
+
+```sh
+curl -s http://localhost:9876/v1/commands/<command-id>/outputs \
+  -H 'Authorization: Bearer <api-key>'
+
+curl -s http://localhost:9876/v1/commands/<command-id>/outputs/report.json \
+  -H 'Authorization: Bearer <api-key>'
+```
+
+The listing returns `files` with relative `path`, `size`, `sha256` and
+`modified_at` fields, plus a `total` `{ "files", "bytes" }` summary. The same
+totals appear in `result.outputs`. A missing output directory is an empty
+listing, and listing is available while a command is running. File retrieval
+returns the file body with a content type inferred from its extension (or
+`application/octet-stream`); files larger than 16 MiB return HTTP 413. Invalid
+paths return 400, and unknown commands or missing files return 404.
+
+Responses are downloads, including HTML and SVG, with a scriptless sandbox
+policy. A listing that is busy, exceeds its work budget (100,000 directory
+entries, 256 MiB of hashing, or two seconds), or observes a file changing returns
+503; retry later. At most two listings run concurrently, and disconnected
+requests stop their work. Totals count all regular files, including names that
+cannot be addressed through a URL. If summary traversal cannot finish,
+`result.outputs.incomplete: true` marks its totals as a lower bound.
+
+Files are stored under the command's API directory and are removed with that
+command's logs. The output directory has no hard quota: it has the same disk
+exposure as the workspace. Files are not redacted, so agents should not write
+secrets or credentials there.
+
+`exec prompt` clears its outputs at the start of each execution attempt,
+including a restart. Resumed workflows retain existing outputs; rerun steps
+overwrite their own files. Parallel steps share the directory, so collisions
+are last-writer-wins; use a subdirectory named after the step.
+
 #### List commands
 
 ```sh
@@ -1511,19 +1643,23 @@ Track the run with `GET /v1/commands/<command_id>/status` and `GET /v1/commands/
 
 **`close_on_finish`** (default `false`). When `true`, the session is closed as soon as the command reaches a terminal state — `done`, `error` or `cancelled` — and a remote session's clone is deleted. This also applies when setup fails or the run is cancelled before the command starts. Logs and command records are kept. With `false`, the session stays open for further commands.
 
-**Setup failure.** If session setup fails (a clone error, a merge conflict, a failing ready step), the queued command never runs. It becomes `error` with exit code 1 and the setup details:
+**Setup failure.** If session setup fails (a clone error, a merge conflict, a failing ready step), the queued command never runs. It becomes `error` with exit code 1 and a structured failure:
 
 ```json
 {
   "exit_code": 1,
-  "error": "setup_error",
-  "error_status": 409,
-  "stage": "setup",
-  "setup_error": { "stage": "clone", "message": "..." }
+  "outcome": "error",
+  "failure": {
+    "stage": "setup",
+    "code": "setup_failed",
+    "message": "..."
+  },
+  "error": "..."
 }
 ```
 
-`setup_error` carries an object with `stage` and `message`, or `null` if none was recorded.
+For compatibility, current responses can also include deprecated
+`error_status`, `stage` and `setup_error` fields. Use `failure` in new clients.
 
 **Cancelling during setup.** `POST /v1/commands/<command_id>/cancel` works while setup is still running: setup is aborted, the command ends `cancelled`, and the session is closed and any remote clone deleted — whatever `close_on_finish` is set to.
 
@@ -1602,8 +1738,10 @@ curl -s http://localhost:9876/v1/workflows/<command-id> \
   -H 'Authorization: Bearer <api-key>'
 ```
 
-Returns the current `WorkflowState` for the given command. It uses the same
-serialized state structure as the local workflow state file.
+Returns the current workflow view for the given command. The alias
+`GET /v1/commands/{id}/workflow` returns the same body. The response retains
+the persisted `WorkflowState` fields and adds client-ready fields at read time;
+it does not change the local workflow state file.
 
 ```json
 {
@@ -1613,9 +1751,10 @@ serialized state structure as the local workflow state file.
   "workflow_hash": "a41f…",
   "work_item": 132,
   "steps": [
-    { "name": "plan", "depends_on": [], "agent": "codex", "model": "gpt-6" },
-    { "name": "docs", "depends_on": ["plan"] }
+    { "name": "plan", "depends_on": [], "agent": "codex", "model": "gpt-6", "index": 0, "stage": 0, "status": "succeeded", "step_attempt": 1 },
+    { "name": "docs", "depends_on": ["plan"], "index": 1, "stage": 1, "status": "running", "step_attempt": 1 }
   ],
+  "stages": [["plan"], ["docs"]],
   "step_states": {
     "plan": "Succeeded",
     "docs": { "Running": { "container_id": null } }
@@ -1624,33 +1763,44 @@ serialized state structure as the local workflow state file.
   "current_step_index": 1,
   "started_at": "2026-10-27T12:00:00Z",
   "updated_at": "2026-10-27T12:05:00Z",
+  "phase": "main",
   "current_phase": "Main",
   "setup_completed": true,
   "teardown_completed": false,
   "setup_step_states": [
-    { "description": "run_shell: prepare", "status": "Succeeded" }
+    { "description": "run_shell: prepare", "status": "Succeeded", "state": "succeeded" }
   ],
   "teardown_step_states": [
-    { "description": "run_shell: verify", "status": "Pending" }
+    { "description": "run_shell: verify", "status": "Pending", "state": "pending" }
   ]
 }
 ```
 
-`WorkflowState` has no top-level `status` property. `step_states` maps each step
-name to a `StepState`; `steps` contains step metadata (`name`, `depends_on`,
-and optional `agent` and `model`). Setup and teardown progress is in the
-`setup_step_states` and `teardown_step_states` arrays. Workflow phase values
-use their Rust variant names (`"Setup"`, `"Main"`, `"Teardown"`, `"Done"`).
-The enum values use Serde's externally tagged representation: unit variants
-are strings such as `"Succeeded"`, and data variants are one-key objects, as
-in `{"Running":{"container_id":null}}` or
-`{"Failed":{"exit_code":1,"error_message":"step failed"}}`.
-Poll `step_states` and `current_phase` to track progress; there is no derived
-workflow-level status field. Phase entries have `description` and `status`.
-Phase statuses are `"Pending"`, `"Running"` (without a container ID),
-`"Succeeded"`, `{"Failed":{"error":"reason"}}`, or
-`{"Remediating":{"attempt":1,"of":2}}`. Agent steps additionally use
-`"Cancelled"` and `"Skipped"`.
+The response retains `step_states` and adds `stages`, an array grouping step
+names by dependency stage. Each `steps` entry adds its definition-order
+`index`, dependency `stage`, snake_case `status` (`pending`, `running`,
+`succeeded`, `failed`, `cancelled` or `skipped`), and `step_attempt` after the
+step has launched. Failed steps may also include `exit_code` and `error`; a
+running step may include its `container`. Setup and teardown progress remains
+in `setup_step_states` and `teardown_step_states`, whose entries gain a
+snake_case `state` (`pending`, `running`, `succeeded`, `failed`, `remediating`
+or `skipped`). The added top-level `phase` is snake_case (`setup`, `main`,
+`teardown` or `done`).
+
+The legacy `current_phase`, `step_states`, and phase-entry `status` fields
+remain in their persisted representation for compatibility. `WorkflowState`
+has no top-level workflow status property; monitor command status or the final
+`command_status` event for command completion.
+The legacy enum values use Serde's externally tagged representation: unit
+variants are strings such as `"Succeeded"`, and data variants are one-key
+objects, as in `{"Running":{"container_id":null}}` or
+`{"Failed":{"exit_code":1,"error_message":"step failed"}}`. Legacy
+phase-entry `status` values are `"Pending"`, `"Running"` (without a
+container ID), `"Succeeded"`, `{"Failed":{"error":"reason"}}`, or
+`{"Remediating":{"attempt":1,"of":2}}`; agent steps additionally use
+`"Cancelled"` and `"Skipped"`. There is no derived workflow-level status;
+monitor command status or the final `command_status` event for command
+completion.
 
 Always also watch `GET /v1/commands/{command_id}` or `command_status` events.
 A command can end before its workflow starts, or fail while the most recent
@@ -1664,7 +1814,7 @@ across retries or resumes.
 
 | HTTP status | Meaning |
 |-------------|---------|
-| 200 | Workflow state found; body contains the full `WorkflowState` JSON |
+| 200 | Workflow state found; body contains the persisted state plus computed workflow-view fields |
 | 404 `{"error": "command not found"}` | No command with that ID exists |
 | 404 `{"error": "no workflow for this command"}` | The command exists but did not run a workflow (e.g. `exec prompt` or `chat`) |
 | 404 `{"error": "workflow not started"}` | An `exec workflow` command is pending or running, but no workflow snapshot exists yet |
@@ -1683,13 +1833,16 @@ KEY=<your-api-key>
 while true; do
   RESP=$(curl -s "$SERVER/v1/workflows/$CMD" \
     -H "Authorization: Bearer $KEY")
-  PHASE=$(echo "$RESP" | jq -r '.current_phase')
+  PHASE=$(echo "$RESP" | jq -r '.phase // .current_phase')
   echo "Workflow phase: $PHASE"
   COMMAND=$(curl -fsS "$SERVER/v1/commands/$CMD/status" \
     -H "Authorization: Bearer $KEY") || break
   STATUS=$(echo "$COMMAND" | jq -r '.status')
   case "$STATUS" in
-    done|error|aborted|cancelled|paused) break ;;
+    done|error|cancelled)
+      OUTCOME=$(echo "$COMMAND" | jq -r '.result.outcome // .status')
+      echo "Command outcome: $OUTCOME"
+      break ;;
   esac
   sleep 5
 done

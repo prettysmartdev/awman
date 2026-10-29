@@ -59,6 +59,7 @@ case "$1" in
     ;;
   run)
     mode="$(cat "$ctl/mode" 2>/dev/null)"
+    if [ "$mode" = "structured" ]; then cat "$ctl/agent.ndjson"; exit 0; fi
     workspace=""; leader=""; background=""
     for arg in "$@"; do
       case "$arg" in

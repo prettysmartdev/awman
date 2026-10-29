@@ -200,6 +200,7 @@ impl WorkflowEngine {
             "workflow_engine launching parallel step"
         );
 
+        let step_attempt = self.state.record_step_launch(&step.name);
         let workflow_step_info = self.build_workflow_step_info(&step.name);
         let runtime = WorkflowRuntimeContext {
             step_agent: resolved_agent.clone(),
@@ -208,6 +209,7 @@ impl WorkflowEngine {
             session_id: self.session.id(),
             workflow_invocation_id: self.state.invocation_id,
             workflow_step_info,
+            source: self.main_step_source(&step.name, step_attempt),
         };
 
         self.frontend.report_step_interactive_launch(
@@ -217,6 +219,8 @@ impl WorkflowEngine {
         );
         self.state
             .set_status(&step.name, StepState::Running { container_id: None });
+        self.frontend
+            .report_step_launching(&step.name, step_attempt);
         self.frontend
             .report_step_status(&step, WorkflowStepStatus::Running);
         self.persist()?;

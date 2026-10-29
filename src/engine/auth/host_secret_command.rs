@@ -394,7 +394,23 @@ impl HostSecretCommand {
             use std::os::unix::process::CommandExt;
             command.process_group(0);
         }
-        let mut child = command.spawn().map_err(|e| {
+        // A concurrent fork elsewhere in this process can inherit the write
+        // descriptor used to stage the snapshot, so `execve` reports it busy
+        // (`ETXTBSY`) until that fork execs. A refused exec never ran the
+        // program, so retrying briefly is safe.
+        let mut busy_retries = 0;
+        let spawned = loop {
+            match command.spawn() {
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::ExecutableFileBusy && busy_retries < 50 =>
+                {
+                    busy_retries += 1;
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                result => break result,
+            }
+        };
+        let mut child = spawned.map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 HostSecretCommandError::NotFound {
                     program: program.clone(),

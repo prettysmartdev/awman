@@ -230,6 +230,15 @@ pub const API_FEATURES: &[&str] = &[
     "labels",
     "idempotency",
     "runs",
+    // WI 0137: `result.{outcome,failure,failed_steps,git,pull_request,
+    // final_message,outputs,data}` and the one final `command_status`.
+    "structured_results",
+    // WI 0137: `GET /v1/commands/{id}/outputs[/{path}]`.
+    "outputs",
+    // WI 0137: `source` on the event envelope and `?step=` on the logs.
+    "event_source",
+    // WI 0137: `step_activity` events from structured-output agents.
+    "step_activity",
 ];
 
 #[derive(Serialize)]
@@ -730,6 +739,17 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/v1/commands/{id}/status", get(handle_get_command))
         .route("/v1/commands/{id}/logs", get(handle_stream_command_logs))
         .route("/v1/workflows/{command_id}", get(handle_get_workflow))
+        // WI 0137 §6: every per-command resource under /v1/commands/{id}/.
+        .route("/v1/commands/{id}/workflow", get(handle_get_workflow))
+        // WI 0137 §3: the agent-written outputs directory.
+        .route(
+            "/v1/commands/{id}/outputs",
+            get(crate::frontend::api::outputs::handle_list_outputs),
+        )
+        .route(
+            "/v1/commands/{id}/outputs/{*path}",
+            get(crate::frontend::api::outputs::handle_get_output),
+        )
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -1641,6 +1661,11 @@ struct CommandLogsQuery {
     /// Resume strictly after this cursor; overrides Last-Event-ID.
     #[serde(default)]
     after: Option<String>,
+    /// Only events whose `source.step_name` is this step, plus the
+    /// command-level terminal events (WI 0137 §5). Cursors stay global, so a
+    /// filtered stream resumes with the same `Last-Event-ID`.
+    #[serde(default)]
+    step: Option<String>,
 }
 
 const WORKER_WAIT_KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(15);
@@ -1657,6 +1682,11 @@ struct CommandLogCursor {
     attempt: u32,
     next_sequence: u64,
     done: Option<ExecutionEvent>,
+    terminal_status_seen: bool,
+    /// `?step=<name>`: events of other steps are skipped, not sent. The
+    /// high-water mark still advances past them, so the client's cursor
+    /// stays global (WI 0137 §5).
+    step_filter: Option<String>,
 }
 
 impl CommandLogCursor {
@@ -1670,7 +1700,14 @@ impl CommandLogCursor {
             attempt,
             next_sequence: 0,
             done: None,
+            terminal_status_seen: false,
+            step_filter: None,
         }
+    }
+
+    fn with_step_filter(mut self, step: Option<String>) -> Self {
+        self.step_filter = step.filter(|step| !step.is_empty());
+        self
     }
 
     fn update_attempt(&mut self, attempt: u32) {
@@ -1678,6 +1715,7 @@ impl CommandLogCursor {
             self.attempt = attempt;
             self.next_sequence = 0;
             self.done = None;
+            self.terminal_status_seen = false;
             if matches!(self.replay_from, ReplayFrom::StartOfAttempt(_)) {
                 self.replay_from = ReplayFrom::StartOfAttempt(attempt);
             }
@@ -1690,6 +1728,13 @@ impl CommandLogCursor {
         {
             return true;
         }
+        if let Some(step) = &self.step_filter {
+            if !event.matches_step_filter(step) {
+                // Skipped, but counted: the cursor stays global.
+                self.last_sent = Some(event.cursor());
+                return true;
+            }
+        }
         if tx.send(Ok(execution_event_to_sse(event))).await.is_err() {
             return false;
         }
@@ -1699,6 +1744,9 @@ impl CommandLogCursor {
 
     async fn forward(&mut self, event: &ExecutionEvent, tx: &CommandLogSender) -> bool {
         if event.attempt == self.attempt {
+            if matches!(event.payload, EventPayload::CommandStatus { .. }) {
+                self.terminal_status_seen = true;
+            }
             self.next_sequence = self.next_sequence.max(event.sequence.saturating_add(1));
             if matches!(event.payload, EventPayload::Done) {
                 self.done = Some(event.clone());
@@ -1741,6 +1789,7 @@ impl CommandLogCursor {
             timestamp: chrono::Utc::now(),
             attempt: self.attempt,
             sequence: self.next_sequence,
+            source: None,
             payload: EventPayload::Done,
         });
         // Completion is a terminal-state notification as well as a log event.
@@ -1784,6 +1833,73 @@ async fn command_log_events(
     tokio::task::spawn_blocking(move || paths.read_command_events(&session, &command))
         .await
         .unwrap_or_default()
+}
+
+/// A terminal row precedes its final events. Wait for the actual marker so
+/// a disk-writer delay cannot mint a cursor that hides the final result.
+async fn finish_terminal_log(
+    state: &AppState,
+    session_id: &str,
+    command_id: &str,
+    cursor: &mut CommandLogCursor,
+    live_rx: &mut Option<CommandLogReceiver>,
+    tx: &CommandLogSender,
+) {
+    let terminal_row = command_log_row(state, command_id).await;
+    let structured = terminal_row
+        .as_ref()
+        .and_then(|row| row.result.as_deref())
+        .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+        .is_some_and(|result| result.get("outcome").is_some());
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let events = command_log_events(state, session_id, command_id).await;
+        if !cursor.replay(&events, tx).await {
+            return;
+        }
+        if cursor.done.is_some() || !structured {
+            cursor.finish(tx).await;
+            return;
+        }
+        tokio::select! {
+            _ = tx.closed() => return,
+            _ = tokio::time::sleep_until(deadline) => {
+                tracing::warn!(command_id, "Terminal command log has not caught up");
+                // An unwritable command directory can leave only the row.
+                // These recovery notifications have no id: they must never
+                // consume the eventual persisted pair's cursor namespace.
+                if let Some(row) = &terminal_row {
+                    let payloads = if cursor.terminal_status_seen {
+                        vec![EventPayload::Done]
+                    } else {
+                        vec![crate::command::commands::api_server::queue_worker::terminal_payload(row), EventPayload::Done]
+                    };
+                    for payload in payloads {
+                        let event = ExecutionEvent { timestamp: chrono::Utc::now(), attempt: row.attempt, sequence: 0, source: None, payload };
+                        let frame = Event::default().event(event.payload.sse_event_type()).data(serde_json::to_string(&event).unwrap());
+                        if tx.send(Ok(frame)).await.is_err() { return; }
+                    }
+                }
+                return;
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(20)) => {},
+            event = async {
+                match live_rx.as_mut() {
+                    Some(receiver) => receiver.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => match event {
+                Ok(event) => {
+                    if cursor.missing_before(&event) && !recover_command_log_gap(
+                        state, session_id, command_id, event.cursor(), cursor, tx,
+                    ).await { return; }
+                    if !cursor.forward(&event, tx).await { return; }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => *live_rx = None,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {},
+            }
+        }
+    }
 }
 
 /// A subscription can start ahead of the independent logfile writer. Hold
@@ -1887,13 +2003,25 @@ async fn handle_stream_command_logs(
     };
     let session_id = command.session_id;
 
-    // JSON is a full-log snapshot; SSE resume inputs do not filter it.
+    // Resume inputs apply only to SSE; the step selector applies to both.
     if query.format.as_deref() == Some("json") {
+        let events: Vec<_> = state
+            .paths
+            .read_command_events(&session_id, &command_id)
+            .into_iter()
+            .filter(|event| {
+                query
+                    .step
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .is_none_or(|step| event.matches_step_filter(step))
+            })
+            .collect();
         return Json(serde_json::json!({
             "session_id": session_id,
             "command_id": command_id,
             "attempt": command.attempt,
-            "events": state.paths.read_command_events(&session_id, &command_id),
+            "events": events,
         }))
         .into_response();
     }
@@ -1926,7 +2054,8 @@ async fn handle_stream_command_logs(
             .map(|bus| bus.subscribe());
         let events = command_log_events(&state, &session_id, &command_id).await;
         let replay_from = ReplayFrom::resolve(&events, command.attempt, requested);
-        let mut cursor = CommandLogCursor::new(replay_from, command.attempt);
+        let mut cursor = CommandLogCursor::new(replay_from, command.attempt)
+            .with_step_filter(query.step.clone());
         if let ReplayFrom::StartOfAttempt(attempt) = replay_from {
             if tx
                 .send(Ok(Event::default().comment(format!(
@@ -1942,7 +2071,15 @@ async fn handle_stream_command_logs(
             return;
         }
         if command_is_terminal(&command.status) {
-            cursor.finish(&tx).await;
+            finish_terminal_log(
+                &state,
+                &session_id,
+                &command_id,
+                &mut cursor,
+                &mut live_rx,
+                &tx,
+            )
+            .await;
             return;
         }
 
@@ -1955,6 +2092,7 @@ async fn handle_stream_command_logs(
                     timestamp: chrono::Utc::now(),
                     attempt: 0,
                     sequence: 0,
+                    source: None,
                     payload: EventPayload::StatusMessage {
                         phase: "queue".into(),
                         message: if saw_worker {
@@ -1983,10 +2121,15 @@ async fn handle_stream_command_logs(
                     WorkerWaitOutcome::ClientGone | WorkerWaitOutcome::Unavailable => return,
                     WorkerWaitOutcome::Terminal(attempt) => {
                         cursor.update_attempt(attempt);
-                        let events = command_log_events(&state, &session_id, &command_id).await;
-                        if cursor.replay(&events, &tx).await {
-                            cursor.finish(&tx).await;
-                        }
+                        finish_terminal_log(
+                            &state,
+                            &session_id,
+                            &command_id,
+                            &mut cursor,
+                            &mut live_rx,
+                            &tx,
+                        )
+                        .await;
                         return;
                     }
                     WorkerWaitOutcome::Bus(receiver) => {
@@ -2022,10 +2165,7 @@ async fn handle_stream_command_logs(
                         };
                         cursor.update_attempt(row.attempt);
                         if command_is_terminal(&row.status) {
-                            let events = command_log_events(&state, &session_id, &command_id).await;
-                            if cursor.replay(&events, &tx).await {
-                                cursor.finish(&tx).await;
-                            }
+                            finish_terminal_log(&state, &session_id, &command_id, &mut cursor, &mut live_rx, &tx).await;
                             return;
                         }
                     }
@@ -2053,7 +2193,17 @@ async fn handle_stream_command_logs(
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                             // A vanished bus does not prove completion. Re-enter
                             // worker waiting and check the row before sending Done.
+                            // A row already terminal finishes here, so no waiting
+                            // frame lands between the output and the final Done.
+                            let Some(row) = command_log_row(&state, &command_id).await else {
+                                return;
+                            };
+                            cursor.update_attempt(row.attempt);
                             live_rx = None;
+                            if command_is_terminal(&row.status) {
+                                finish_terminal_log(&state, &session_id, &command_id, &mut cursor, &mut live_rx, &tx).await;
+                                return;
+                            }
                             break;
                         }
                     }
@@ -2221,7 +2371,9 @@ async fn handle_get_workflow(
         .read_command_workflow_state_raw(&cmd.session_id, &command_id)
     {
         Ok(Some(content)) => match serde_json::from_str::<serde_json::Value>(&content) {
-            Ok(val) => Json(val).into_response(),
+            // WI 0137 §6: computed, client-ready fields are added at read
+            // time; the persisted state file stays an engine format.
+            Ok(val) => Json(crate::frontend::api::workflow_view::client_view(val)).into_response(),
             Err(e) => {
                 tracing::error!(error = %e, "Failed to parse workflow state");
                 (
@@ -2296,6 +2448,9 @@ mod tests {
         ("GET", "/v1/commands/{id}/status"),
         ("GET", "/v1/commands/{id}/logs"),
         ("GET", "/v1/workflows/{command_id}"),
+        ("GET", "/v1/commands/{id}/workflow"),
+        ("GET", "/v1/commands/{id}/outputs"),
+        ("GET", "/v1/commands/{id}/outputs/{*path}"),
     ];
 
     fn make_test_state(tmp: &std::path::Path) -> Arc<AppState> {
@@ -2368,7 +2523,7 @@ mod tests {
         // Guard: if someone adds a route without updating this table, the count drifts.
         assert_eq!(
             EXPECTED_ROUTES.len(),
-            15,
+            18,
             "route count mismatch — update EXPECTED_ROUTES"
         );
     }

@@ -154,6 +154,58 @@ pub struct WorkflowState {
     /// every run that was not cancelled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cancelled_at: Option<DateTime<Utc>>,
+    /// How many times each main step has been launched (WI 0137 §5): the
+    /// 1-based `step_attempt` of its latest launch. Additive; persisted so a
+    /// run resumed after a daemon restart keeps counting from here.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub step_attempts: HashMap<String, u32>,
+}
+
+/// Group steps into stages by topological depth.
+///
+/// `steps` is `(name, depends_on)` in definition order. A step's depth is one
+/// more than its deepest dependency; every step at the same depth shares a
+/// stage. Returns, per non-empty stage in depth order, the indices into
+/// `steps` in definition order. Dependencies naming no step are ignored.
+///
+/// This is the one grouping the TUI's Workflow Overview and
+/// `GET /v1/workflows/{id}` both use.
+pub fn group_stages(steps: &[(&str, &[String])]) -> Vec<Vec<usize>> {
+    let index_of: HashMap<&str, usize> = steps
+        .iter()
+        .enumerate()
+        .map(|(i, (name, _))| (*name, i))
+        .collect();
+
+    let mut depths = vec![0usize; steps.len()];
+    // A DAG settles within `len` passes; the bound keeps a cyclic definition
+    // from spinning forever.
+    for _ in 0..=steps.len() {
+        let mut changed = false;
+        for (i, (_, deps)) in steps.iter().enumerate() {
+            for dep in deps.iter() {
+                if let Some(&d) = index_of.get(dep.as_str()) {
+                    if depths[d] + 1 > depths[i] {
+                        depths[i] = depths[d] + 1;
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    let max_depth = depths.iter().copied().max().unwrap_or(0);
+    (0..=max_depth)
+        .map(|d| {
+            (0..steps.len())
+                .filter(|&i| depths[i] == d)
+                .collect::<Vec<_>>()
+        })
+        .filter(|stage| !stage.is_empty())
+        .collect()
 }
 
 fn default_schema_version() -> u32 {
@@ -204,7 +256,45 @@ impl WorkflowState {
             setup_step_states: Vec::new(),
             teardown_step_states: Vec::new(),
             cancelled_at: None,
+            step_attempts: HashMap::new(),
         }
+    }
+
+    /// The step's position in [`Self::steps`], the index every event and
+    /// `GET /v1/workflows/{id}` use for it.
+    pub fn step_index(&self, step_name: &str) -> Option<usize> {
+        self.steps.iter().position(|s| s.name == step_name)
+    }
+
+    /// The `step_attempt` of the step's latest launch, if it was launched.
+    pub fn step_attempt(&self, step_name: &str) -> Option<u32> {
+        self.step_attempts.get(step_name).copied()
+    }
+
+    /// Count a new launch of `step_name` and return its 1-based attempt.
+    pub fn record_step_launch(&mut self, step_name: &str) -> u32 {
+        let attempt = self.step_attempts.entry(step_name.to_string()).or_insert(0);
+        *attempt += 1;
+        *attempt
+    }
+
+    /// The main steps grouped into stages by dependency depth, as step names.
+    /// Setup and teardown steps are not part of it. See [`group_stages`].
+    pub fn stages(&self) -> Vec<Vec<String>> {
+        let deps: Vec<(&str, &[String])> = self
+            .steps
+            .iter()
+            .map(|s| (s.name.as_str(), s.depends_on.as_slice()))
+            .collect();
+        group_stages(&deps)
+            .into_iter()
+            .map(|stage| {
+                stage
+                    .into_iter()
+                    .map(|i| self.steps[i].name.clone())
+                    .collect()
+            })
+            .collect()
     }
 
     /// The step states for one phase. The two vectors keep their own
@@ -343,6 +433,7 @@ impl WorkflowState {
         for name in &dropped {
             self.step_states.remove(name);
             self.completed_steps.remove(name);
+            self.step_attempts.remove(name);
         }
         self.steps.retain(|s| !dropped.contains(&s.name));
         if !dropped.is_empty() {

@@ -86,6 +86,7 @@ A definition is a TOML file with `schema = 1`. Unknown keys are rejected, so a t
 |-----|------|---------|
 | `command` | string array | **Required.** The interactive entrypoint, as argv. `command[0]` is a bare binary name or an absolute container path. No shell is involved |
 | `non_interactive` | string | Token appended for `-n` / `exec` / workflow steps (for example `"-p"` or `"run"`). Omit it if the agent has no non-interactive mode |
+| `output_format` | string | Structured output protocol for non-interactive API runs: `text` (default), `claude_stream_json` or `codex_json` |
 | `interactive_only_flags` | string array | Flags appended only to interactive launches |
 | `seed_prompt` | string or table | How the initial prompt is passed: `"positional"` (default) or `{ flag = "--prompt" }` |
 | `model` | string | `"space"` (default, `--model NAME`), `"equals"` (`--model=NAME`) or `"unsupported"` |
@@ -173,6 +174,7 @@ awman reports every problem it finds in one pass. The file is capped at 64 KiB a
 | `image.dockerfile` | A relative path inside the TOML's own directory (no `..`, no symlink escaping it); exclusive with `install`, `apt` and `needs_node` |
 | `[image]` | Needs either `install` or `dockerfile` |
 | `[sandbox]` | Rejected: `custom agents do not support Docker Sandboxes yet; remove [sandbox] and use docker, apple or builtin-experimental` |
+| `[run].output_format` | One of `text`, `claude_stream_json` or `codex_json` (default `text`) |
 
 ---
 
@@ -189,6 +191,7 @@ display_name = "Pi"
 [run]
 command = ["pi"]
 non_interactive = "-p"
+output_format = "text"
 
 [modes]
 yolo = ["--yolo"]
@@ -197,6 +200,15 @@ yolo = ["--yolo"]
 needs_node = true
 install = ["npm install -g --prefix=/usr/local @example/pi-coding-agent"]
 ```
+
+`output_format` tells awman how to parse the agent's non-interactive output.
+Use `claude_stream_json` for Claude Code's stream-JSON output or `codex_json`
+for Codex JSONL output; these modes add the corresponding CLI flags and let
+API clients receive `step_activity` events and, for `exec prompt`, the
+agent's `final_message` in the command result. Choose `text` (or omit the
+field) for ordinary text output. This is a protocol declaration: awman does
+not infer the format from the agent name, so the selected CLI must support the
+declared format. Interactive and ACP launches use text output.
 
 ### Escape-hatch Dockerfile
 

@@ -133,6 +133,37 @@ pub trait AgentInstance: Send + Sync {
     ) -> Result<AgentExecution, EngineError>;
 }
 
+/// Carry a launch's structured stdout protocol through a runtime-neutral
+/// instance. Announce it before the backend can report Running or take I/O.
+pub fn with_output_format(
+    instance: Box<dyn AgentInstance>,
+    format: crate::data::agent_output_format::AgentOutputFormat,
+) -> Box<dyn AgentInstance> {
+    if !format.is_structured() {
+        return instance;
+    }
+    Box::new(OutputFormatInstance { instance, format })
+}
+
+struct OutputFormatInstance {
+    instance: Box<dyn AgentInstance>,
+    format: crate::data::agent_output_format::AgentOutputFormat,
+}
+
+impl AgentInstance for OutputFormatInstance {
+    fn handle_preview(&self) -> AgentHandlePreview {
+        self.instance.handle_preview()
+    }
+
+    fn run_with_frontend(
+        self: Box<Self>,
+        mut frontend: Box<dyn AgentFrontend>,
+    ) -> Result<AgentExecution, EngineError> {
+        frontend.set_agent_output_format(self.format);
+        self.instance.run_with_frontend(frontend)
+    }
+}
+
 /// "Fully prepared, ready-to-run agent handle" — the type passed by
 /// Layer 2 to `WorkflowEngine` without leaking backend or frontend details.
 pub struct AgentExecution {

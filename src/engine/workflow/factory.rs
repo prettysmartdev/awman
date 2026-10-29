@@ -4,6 +4,7 @@
 
 use std::path::PathBuf;
 
+use crate::data::execution_event::EventSource;
 use crate::data::session::{AgentHandle, AgentName, Session, SessionId};
 use crate::data::workflow_definition::WorkflowStep;
 use crate::engine::agent_runtime::execution::AgentExecution;
@@ -22,6 +23,10 @@ pub struct WorkflowRuntimeContext {
     pub workflow_invocation_id: uuid::Uuid,
     /// Step progression info for building the workflow context prompt.
     pub workflow_step_info: Option<WorkflowStepInfo>,
+    /// Who the step container's events are attributed to (WI 0137 §5): the
+    /// phase, and for a main step its name, definition index and
+    /// `step_attempt`. The frontend adds the container name once it runs.
+    pub source: EventSource,
 }
 
 /// Trait implemented by Layer 2: produce a fresh `AgentExecution` for a

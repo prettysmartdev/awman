@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use tokio::sync::broadcast;
 
+use crate::data::execution_event::EventSource;
 use crate::data::message::UserMessageSink;
 use crate::data::prompt::Prompt;
 use crate::data::workflow_definition::WorkflowStep;
@@ -21,6 +22,10 @@ use crate::engine::workflow::actions::{
     WorkflowOutcome, WorkflowStepProgressInfo, WorkflowStepStatus, YoloTickOutcome,
 };
 use crate::engine::workflow::EngineRequest;
+
+/// A container's event attribution, shared between the per-container proxy
+/// that owns it and the frontend that stamps it (WI 0137 §5).
+pub type ContainerSource = Arc<std::sync::Mutex<EventSource>>;
 
 /// Per-workflow frontend the engine uses for every Q&A and status report.
 ///
@@ -69,6 +74,22 @@ pub trait WorkflowFrontend: UserMessageSink + Send {
     /// and remediation. The API frontend mirrors it into the command's
     /// `workflow.state.json`; other frontends may keep this no-op default.
     fn report_workflow_state(&mut self, _state: &WorkflowState) {}
+
+    /// Called by the engine as it launches a main step, right before
+    /// `report_step_status(step, Running)` (WI 0137 §5). `step_attempt` is
+    /// 1-based, counts every launch of the step (an `on_failure` or board
+    /// retry, a restart) and is persisted in `WorkflowState.step_attempts`,
+    /// so a resumed run keeps counting.
+    fn report_step_launching(&mut self, _step_name: &str, _step_attempt: u32) {}
+
+    /// Attribute the container calls that follow to `source` (WI 0137 §5);
+    /// `None` ends the attribution. The per-container proxy brackets every
+    /// call it forwards to a shared frontend with this, under the same lock,
+    /// so parallel steps never borrow each other's attribution. The proxy
+    /// owns the cell and fills in the container name when it runs, which
+    /// also reaches output drains created before that (the builtin runtime
+    /// takes its I/O first).
+    fn set_container_source(&mut self, _source: Option<ContainerSource>) {}
 
     fn report_step_status(&mut self, step: &WorkflowStep, status: WorkflowStepStatus);
 
@@ -228,6 +249,12 @@ pub trait WorkflowFrontend: UserMessageSink + Send {
     /// stats polling and status-bar display.
     fn report_parallel_step_container(&mut self, _step_name: &str, _container_name: &str) {}
 
+    /// A `create_pull_request` teardown step opened `url` (WI 0137 §1). The
+    /// engine parses `gh pr create` output once and reports it here; a
+    /// frontend that records results (the API) keeps it for
+    /// `CommandResult::pull_request`. Default: ignore.
+    fn report_pull_request_created(&mut self, _url: &str) {}
+
     /// One container in a parallel group has exited.
     /// `evict` — the frontend should remove the status bar for this step
     /// entirely (not replace it with a grey summary bar).
@@ -367,6 +394,16 @@ impl<F: WorkflowFrontend + ?Sized> WorkflowFrontend for std::sync::Arc<std::sync
         self.lock().unwrap().report_step_status(step, status);
     }
 
+    fn report_step_launching(&mut self, step_name: &str, step_attempt: u32) {
+        self.lock()
+            .unwrap()
+            .report_step_launching(step_name, step_attempt);
+    }
+
+    fn set_container_source(&mut self, source: Option<ContainerSource>) {
+        self.lock().unwrap().set_container_source(source);
+    }
+
     fn report_workflow_state(&mut self, state: &WorkflowState) {
         self.lock().unwrap().report_workflow_state(state);
     }
@@ -477,6 +514,10 @@ impl<F: WorkflowFrontend + ?Sized> WorkflowFrontend for std::sync::Arc<std::sync
         self.lock()
             .unwrap()
             .report_parallel_step_container(step_name, container_name);
+    }
+
+    fn report_pull_request_created(&mut self, url: &str) {
+        self.lock().unwrap().report_pull_request_created(url);
     }
 
     fn report_parallel_step_exited(&mut self, step_name: &str, exit_code: i32) {

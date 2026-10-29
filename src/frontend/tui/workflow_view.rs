@@ -28,7 +28,7 @@
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 
-use crate::data::workflow_state::WorkflowState;
+use crate::data::workflow_state::{group_stages, WorkflowState};
 use crate::frontend::tui::tabs::{
     StepViewStatus, WorkflowOverviewState, WorkflowStepKind, WorkflowStepView, WorkflowViewState,
 };
@@ -653,39 +653,9 @@ pub fn workflow_state_to_view_state(state: &WorkflowState) -> WorkflowViewState 
 /// depend on members of the previous parallel group all land in the next
 /// column regardless of which specific member they depend on.
 pub(crate) fn build_workflow_columns(state: &WorkflowViewState) -> Vec<Vec<&WorkflowStepView>> {
-    use std::collections::HashMap;
-
     // Only agent steps participate in the `depends_on` DAG — a setup or
     // teardown pseudo-step's name is a free-text description, never a
     // dependency target.
-    let step_names: HashMap<&str, usize> = state
-        .steps
-        .iter()
-        .enumerate()
-        .filter(|(_, s)| s.kind == WorkflowStepKind::Agent)
-        .map(|(i, s)| (s.name.as_str(), i))
-        .collect();
-
-    let mut depths: Vec<usize> = vec![0; state.steps.len()];
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for (i, step) in state.steps.iter().enumerate() {
-            if step.kind != WorkflowStepKind::Agent {
-                continue;
-            }
-            for dep in &step.depends_on {
-                if let Some(&dep_idx) = step_names.get(dep.as_str()) {
-                    let new_depth = depths[dep_idx] + 1;
-                    if new_depth > depths[i] {
-                        depths[i] = new_depth;
-                        changed = true;
-                    }
-                }
-            }
-        }
-    }
-
     let agent_indices: Vec<usize> = state
         .steps
         .iter()
@@ -693,9 +663,17 @@ pub(crate) fn build_workflow_columns(state: &WorkflowViewState) -> Vec<Vec<&Work
         .filter(|(_, s)| s.kind == WorkflowStepKind::Agent)
         .map(|(i, _)| i)
         .collect();
-    let max_depth = agent_indices.iter().map(|&i| depths[i]).max().unwrap_or(0);
+    let deps: Vec<(&str, &[String])> = agent_indices
+        .iter()
+        .map(|&i| {
+            (
+                state.steps[i].name.as_str(),
+                state.steps[i].depends_on.as_slice(),
+            )
+        })
+        .collect();
 
-    let mut columns: Vec<Vec<&WorkflowStepView>> = Vec::with_capacity(max_depth + 3);
+    let mut columns: Vec<Vec<&WorkflowStepView>> = Vec::new();
 
     let setup: Vec<&WorkflowStepView> = state
         .steps
@@ -706,15 +684,13 @@ pub(crate) fn build_workflow_columns(state: &WorkflowViewState) -> Vec<Vec<&Work
         columns.push(setup);
     }
 
-    for d in 0..=max_depth {
-        let col: Vec<&WorkflowStepView> = agent_indices
-            .iter()
-            .filter(|&&i| depths[i] == d)
-            .map(|&i| &state.steps[i])
-            .collect();
-        if !col.is_empty() {
-            columns.push(col);
-        }
+    for stage in group_stages(&deps) {
+        columns.push(
+            stage
+                .into_iter()
+                .map(|k| &state.steps[agent_indices[k]])
+                .collect(),
+        );
     }
 
     let teardown: Vec<&WorkflowStepView> = state

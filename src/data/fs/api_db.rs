@@ -218,20 +218,64 @@ impl std::fmt::Display for WorkerId {
 
 /// Result of a completed command execution, serialized as JSON into the
 /// `result` column.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+///
+/// The single description of how a command ended (WI 0137 §1): the status
+/// route returns it, the one final `command_status` event carries it, and a
+/// WSP `result` embeds it unchanged. Every field added by 0137 is optional and
+/// filled only where it is known; the pre-0137 fields keep their meaning.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CommandResult {
     pub exit_code: Option<i32>,
+    /// How the command ended, refining the row's coarse `done | error |
+    /// cancelled` status (an `error` row has outcome `error`, `aborted` or
+    /// `paused`). Same enum as `command_status.status`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<crate::data::execution_event::CommandStatusKind>,
+    /// Why the command did not end `done`. Absent when `outcome` is `done`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<CommandFailure>,
+    /// Every failed main, setup or teardown step, each listed once with its
+    /// last attempt. Absent when no step failed or the command ran no steps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed_steps: Option<Vec<FailedStep>>,
+    /// What the command did to the git checkout it ran in. Absent for
+    /// commands without a checkout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git: Option<GitResult>,
     /// Checkout retained after dispatch, for deliberate resume or cleanup.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree_path: Option<String>,
+    /// The pull request a `create_pull_request` teardown step opened.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pull_request: Option<PullRequestRef>,
+    /// `exec prompt` only: the agent's final message, from its structured
+    /// output stream. Absent for text-only agents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_message: Option<String>,
+    /// Summary of the command's `/awman/output` directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outputs: Option<OutputsSummary>,
+    /// Commands with a `--json` form (`agents status|list|detail|kill`, …)
+    /// put their JSON value here as well as in a `StdoutLine`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<serde_json::Value>,
+    /// Kept: equals `failure.message` when `failure` is present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Kept, deprecated: use `failure.code`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_status: Option<u16>,
-    /// The stage that failed when the failure was not the command itself
-    /// (`"push"`).
+    /// Kept, deprecated: equals `failure.stage`. Before 0137 it was set for
+    /// `"push"` and `"workflow_prerequisites"` only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stage: Option<String>,
+    /// Kept, deprecated: a `/v1/runs` setup failure's own `{stage, message}`
+    /// (WI 0135). Setup failures also carry `failure.stage = "setup"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup_error: Option<serde_json::Value>,
+    /// Kept: when the cancel request was accepted (WI 0135).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancelled_at: Option<String>,
     /// Present (possibly `null`) on every result of a session with
     /// `push: true`; absent when the session does not push.
     #[serde(
@@ -240,6 +284,155 @@ pub struct CommandResult {
         deserialize_with = "deserialize_present"
     )]
     pub pushed: Option<Option<PushedRef>>,
+}
+
+/// Why a command did not end `done` (WI 0137 §1). Replaces the mix of an
+/// `error` string that is sometimes a code and sometimes a message, an HTTP
+/// status stored in an asynchronous result, and a `stage` set for only two
+/// failures.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CommandFailure {
+    /// Post-admission stage: `setup | preflight | workflow_prerequisites |
+    /// step | teardown | merge | push`. From `CommandError::stage()` for a
+    /// typed error; the queue worker names the stage for engine outcomes,
+    /// push failures and cancellation.
+    pub stage: String,
+    /// snake_case code: `CommandError::code()` for a typed error, or one of
+    /// the [`failure_codes`] the queue worker assigns.
+    pub code: String,
+    /// Human-readable reason; equals the legacy `error` field.
+    pub message: String,
+    /// The step to blame, when a single one is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step: Option<String>,
+}
+
+/// `CommandFailure::code` values that no `CommandError` variant produces:
+/// they describe engine outcomes and post-command stages, and the queue
+/// worker assigns them.
+pub mod failure_codes {
+    /// A main-phase step failed (`WorkflowOutcome::Failed`).
+    pub const STEP_FAILED: &str = "step_failed";
+    /// A non-execution command returned a nonzero exit status.
+    pub const COMMAND_FAILED: &str = "command_failed";
+    /// The main phase finished but teardown did not.
+    pub const TEARDOWN_FAILED: &str = "teardown_failed";
+    /// Remote-session push-back failed.
+    pub const PUSH_FAILED: &str = "push_failed";
+    /// `/v1/runs` session setup failed before the command ran.
+    pub const SETUP_FAILED: &str = "setup_failed";
+    /// Stopped by `POST /v1/commands/{id}/cancel`.
+    pub const CANCELLED: &str = "cancelled";
+    /// The workflow was aborted (`WorkflowOutcome::Aborted`).
+    pub const ABORTED: &str = "aborted";
+    /// The workflow paused and can be resumed.
+    pub const PAUSED: &str = "paused";
+    /// Anything the worker could not classify (a panic, a missing session).
+    pub const INTERNAL: &str = "internal";
+}
+
+/// Which phase a failed step ran in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailedStepPhase {
+    Setup,
+    Main,
+    Teardown,
+}
+
+/// One failed step of a workflow (WI 0137 §1). An object, not a name, so it
+/// carries the phase, the retry and the error without another lookup.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FailedStep {
+    pub name: String,
+    /// The step's position in the workflow definition (main steps) or in its
+    /// phase's step list (setup/teardown steps).
+    pub index: usize,
+    pub phase: FailedStepPhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    /// 1-based; the last attempt when `on_failure` retried the step.
+    pub step_attempt: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// What a command did to the checkout it ran in (WI 0137 §1).
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GitResult {
+    /// Branch holding the result: the merge target after merge-back, else
+    /// the kept worktree's branch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    /// `HEAD` when the command started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_sha: Option<String>,
+    /// `HEAD` of `branch` at the end, after merge-back and push.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_sha: Option<String>,
+    /// Uncommitted changes remain in the checkout.
+    pub dirty: bool,
+    /// `base_sha` compared with the final working tree (`git diff --numstat
+    /// -M <base>` plus untracked files), so uncommitted edits count. Capped
+    /// at [`CHANGED_FILES_CAP`] entries.
+    #[serde(default)]
+    pub changed_files: Vec<ChangedFile>,
+    /// `true` when the cap was hit and `changed_files` is incomplete.
+    #[serde(default)]
+    pub changed_files_truncated: bool,
+    /// Diff collection failed; branch/head/dirty remain available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub changed_files_error: Option<String>,
+}
+
+/// Most entries `GitResult::changed_files` lists before it is truncated.
+pub const CHANGED_FILES_CAP: usize = 500;
+
+/// How one path changed relative to the base commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChangedFileStatus {
+    /// New, including untracked files.
+    Added,
+    Modified,
+    Deleted,
+    Renamed,
+    Copied,
+    TypeChanged,
+    Unmerged,
+}
+
+/// One changed path. Binary files report `added`/`deleted` as `null`, and so
+/// do untracked files.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ChangedFile {
+    pub path: String,
+    pub status: ChangedFileStatus,
+    /// The previous path of a renamed or copied file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_path: Option<String>,
+    #[serde(default)]
+    pub added: Option<u64>,
+    #[serde(default)]
+    pub deleted: Option<u64>,
+}
+
+/// The pull request a `create_pull_request` teardown step opened. An object
+/// so `number` and `state` can be added later without another field.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PullRequestRef {
+    pub url: String,
+}
+
+/// Size of a command's `/awman/output` directory: regular files only,
+/// symlinks never followed (WI 0137 §3).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct OutputsSummary {
+    pub files: u64,
+    pub bytes: u64,
+    /// Traversal hit a resource limit or an I/O error; totals are a lower bound.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub incomplete: bool,
 }
 
 /// What the push stage pushed after a successful command (WI 0133). `None`
@@ -1140,7 +1333,7 @@ impl SqliteSessionStore {
         let now = chrono::Utc::now().to_rfc3339();
         let conn = self.lock();
         conn.execute(
-            "UPDATE commands SET status = ?1, exit_code = ?2, finished_at = ?3, result = ?4
+            "UPDATE commands SET status = ?1, exit_code = ?2, finished_at = COALESCE(finished_at, ?3), result = ?4
              WHERE id = ?5",
             params![status, exit_code, now, result_json, id],
         )?;
@@ -2226,12 +2419,8 @@ mod tests {
     #[test]
     fn command_result_serialises_pushed_as_absent_null_or_value() {
         let base = CommandResult {
-            worktree_path: None,
             exit_code: Some(0),
-            error: None,
-            error_status: None,
-            stage: None,
-            pushed: None,
+            ..CommandResult::default()
         };
         assert_eq!(serde_json::to_string(&base).unwrap(), r#"{"exit_code":0}"#);
         let null = CommandResult {
@@ -2258,5 +2447,75 @@ mod tests {
             serde_json::from_str::<CommandResult>(r#"{"exit_code":0}"#).unwrap(),
             base
         );
+    }
+
+    #[test]
+    fn command_result_new_fields_are_optional_and_round_trip() {
+        use crate::data::execution_event::CommandStatusKind;
+        // A pre-0137 row (legacy fields only, including the ad-hoc
+        // `cancelled_at` / `setup_error` keys) still parses.
+        let legacy = r#"{"exit_code":130,"error":"cancelled","cancelled_at":"2026-01-01T00:00:00Z","setup_error":{"stage":"ready","message":"x"}}"#;
+        let parsed: CommandResult = serde_json::from_str(legacy).unwrap();
+        assert_eq!(parsed.cancelled_at.as_deref(), Some("2026-01-01T00:00:00Z"));
+        assert_eq!(parsed.setup_error.unwrap()["stage"], "ready");
+        assert!(parsed.outcome.is_none() && parsed.failure.is_none());
+
+        let full = CommandResult {
+            exit_code: Some(1),
+            outcome: Some(CommandStatusKind::Error),
+            failure: Some(CommandFailure {
+                stage: "teardown".into(),
+                code: failure_codes::STEP_FAILED.into(),
+                message: "Step 'tests' failed".into(),
+                step: Some("tests".into()),
+            }),
+            failed_steps: Some(vec![FailedStep {
+                name: "tests".into(),
+                index: 2,
+                phase: FailedStepPhase::Main,
+                exit_code: Some(1),
+                step_attempt: 2,
+                error: Some("boom".into()),
+            }]),
+            git: Some(GitResult {
+                branch: Some("main".into()),
+                base_sha: Some("a".into()),
+                head_sha: Some("b".into()),
+                dirty: false,
+                changed_files: vec![ChangedFile {
+                    path: "src/x.rs".into(),
+                    status: ChangedFileStatus::Modified,
+                    old_path: None,
+                    added: Some(10),
+                    deleted: Some(2),
+                }],
+                changed_files_truncated: false,
+                changed_files_error: None,
+            }),
+            pull_request: Some(PullRequestRef {
+                url: "https://github.com/o/r/pull/7".into(),
+            }),
+            final_message: Some("done".into()),
+            outputs: Some(OutputsSummary {
+                files: 2,
+                bytes: 5120,
+                incomplete: false,
+            }),
+            data: Some(serde_json::json!({"agents": []})),
+            error: Some("Step 'tests' failed".into()),
+            stage: Some("teardown".into()),
+            ..CommandResult::default()
+        };
+        let json = serde_json::to_value(&full).unwrap();
+        assert_eq!(json["outcome"], "error");
+        assert_eq!(json["failure"]["code"], "step_failed");
+        assert_eq!(json["failed_steps"][0]["phase"], "main");
+        assert_eq!(json["git"]["changed_files"][0]["status"], "modified");
+        assert!(json["git"]["changed_files"][0].get("old_path").is_none());
+        assert_eq!(json["pull_request"]["url"], "https://github.com/o/r/pull/7");
+        assert_eq!(json["outputs"]["bytes"], 5120);
+        assert!(json.get("pushed").is_none() && json.get("setup_error").is_none());
+        let back: CommandResult = serde_json::from_value(json).unwrap();
+        assert_eq!(back, full);
     }
 }

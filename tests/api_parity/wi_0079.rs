@@ -2416,6 +2416,7 @@ async fn command_status_kinds_serialise_to_their_documented_wire_values() {
             status: kind,
             exit_code: None,
             error: None,
+            result: None,
         });
         assert_eq!(json["status"], wire, "{kind:?} must serialise as {wire}");
         assert_eq!(kind.to_string(), wire);

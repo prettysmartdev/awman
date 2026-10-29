@@ -132,6 +132,41 @@ impl ContextPromptBuilder {
     }
 }
 
+/// Who an outputs-directory prompt line is for (WI 0137 §3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputsPromptRole<'a> {
+    /// The `exec prompt` agent.
+    Prompt,
+    /// The dynamic-workflow leader (and its repair runs).
+    Leader,
+    /// A workflow step, by name: parallel steps share the one directory.
+    Step(&'a str),
+}
+
+/// The one line naming `/awman/output` as the place for machine-readable
+/// results. Only added when the command really mounts the directory.
+pub fn outputs_prompt_line(role: OutputsPromptRole<'_>) -> String {
+    const BASE: &str = "Write machine-readable results (JSON, reports, generated files) for \
+                        the caller under /awman/output; awman lists and serves every file there.";
+    match role {
+        OutputsPromptRole::Prompt | OutputsPromptRole::Leader => BASE.to_string(),
+        OutputsPromptRole::Step(name) => format!(
+            "{BASE} Other steps of this workflow share the directory: when steps run in \
+             parallel, write under /awman/output/{name}/ so files do not collide."
+        ),
+    }
+}
+
+/// Append the outputs section to a rendered system prompt (or start one),
+/// after every context section.
+pub fn with_outputs_section(system_prompt: Option<String>, role: OutputsPromptRole<'_>) -> String {
+    let section = format!("## Outputs\n\n{}", outputs_prompt_line(role));
+    match system_prompt {
+        Some(prompt) if !prompt.is_empty() => format!("{prompt}\n---\n{section}"),
+        _ => section,
+    }
+}
+
 fn render_workflow_prompt(info: &WorkflowStepInfo) -> String {
     let mut out = String::new();
     out.push_str(&format!(
@@ -188,6 +223,35 @@ fn render_workflow_prompt(info: &WorkflowStepInfo) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn outputs_line_names_the_mount_for_every_role() {
+        for role in [
+            OutputsPromptRole::Prompt,
+            OutputsPromptRole::Leader,
+            OutputsPromptRole::Step("tests"),
+        ] {
+            assert!(outputs_prompt_line(role).contains("/awman/output"));
+            assert!(!outputs_prompt_line(role).contains('\n'));
+        }
+        assert!(
+            outputs_prompt_line(OutputsPromptRole::Step("tests")).contains("/awman/output/tests/")
+        );
+        assert!(!outputs_prompt_line(OutputsPromptRole::Prompt).contains("parallel"));
+    }
+
+    #[test]
+    fn outputs_section_is_appended_last_or_stands_alone() {
+        let alone = with_outputs_section(None, OutputsPromptRole::Prompt);
+        assert!(alone.starts_with("## Outputs"));
+        let combined = with_outputs_section(
+            ContextPromptBuilder::new().with_repo().build(),
+            OutputsPromptRole::Leader,
+        );
+        assert!(combined.starts_with("## Repository-Specific Context"));
+        assert!(combined.ends_with(&outputs_prompt_line(OutputsPromptRole::Leader)));
+        assert!(combined.contains("\n---\n## Outputs"));
+    }
 
     #[test]
     fn empty_builder_returns_none() {

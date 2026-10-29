@@ -17,6 +17,9 @@ impl Command for ExecWorkflowCommand {
         self,
         mut frontend: Self::Frontend,
     ) -> Result<Self::Outcome, CommandError> {
+        if self.output_dir.is_some() && !self.engines.runtime.capabilities().arbitrary_host_mounts {
+            frontend.write_message(UserMessage { level: MessageLevel::Warning, text: "Persistent command outputs are unavailable on this runtime; /awman/output is not mounted.".into() });
+        }
         // Early flag validation (Layer 2) — runs before any IO for both the
         // dynamic and non-dynamic paths. Surfaces an error message and aborts.
         if let Err(e) = validate_dynamic_flags(&self.flags) {
@@ -462,7 +465,7 @@ impl Command for ExecWorkflowCommand {
             skip_state_resume_prompt: state_resume_settled,
             prerequisites,
         };
-        execute_prepared(
+        execute_prepared_with_outputs(
             &self.flags,
             &self.engines,
             prepared,
@@ -472,6 +475,7 @@ impl Command for ExecWorkflowCommand {
             self.workflow_state_root.as_deref(),
             self.managed_session.as_ref(),
             &self.cancel,
+            self.output_dir.as_deref(),
         )
         .await
     }

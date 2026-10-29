@@ -211,7 +211,9 @@ async fn real_git_failed_command_does_not_push() {
     assert_ne!(record["exit_code"], 0, "{record}");
     let result = record["result"].as_object().expect("result object");
     assert!(!result.contains_key("pushed"), "{record}");
-    assert!(!result.contains_key("stage"), "{record}");
+    assert_eq!(result["stage"], "step", "{record}");
+    assert_eq!(result["failure"]["stage"], "step", "{record}");
+    assert_eq!(result["failure"]["code"], "step_failed", "{record}");
     // Nothing committed, nothing pushed: the edit is still loose in the clone.
     assert_eq!(origin.ls_remote(), refs_before);
     assert_eq!(git(&clone, &["rev-parse", "HEAD"]), head_before);

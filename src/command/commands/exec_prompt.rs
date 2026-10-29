@@ -81,6 +81,10 @@ pub struct ExecPromptCommand {
     /// Fired by an external cancel (the API's `POST /v1/commands/{id}/cancel`).
     /// Never fired for the CLI or the TUI, which never install one.
     cancel: tokio_util::sync::CancellationToken,
+    /// The host directory mounted read-write at `/awman/output` (WI 0137
+    /// §3). Set only under the API; cleared at the start of every run, since
+    /// a restarted `exec prompt` reruns from scratch.
+    output_dir: Option<std::path::PathBuf>,
 }
 
 impl ExecPromptCommand {
@@ -90,6 +94,7 @@ impl ExecPromptCommand {
             engines,
             session,
             cancel: tokio_util::sync::CancellationToken::new(),
+            output_dir: None,
         }
     }
 
@@ -128,13 +133,20 @@ impl ExecPromptCommand {
             ctx.engines.clone(),
             ctx.session.clone(),
         )
-        .with_cancellation(ctx.cancel.clone()))
+        .with_cancellation(ctx.cancel.clone())
+        .with_output_dir(ctx.output_dir.clone()))
     }
 
     /// Observe `token`: once it fires the agent container is stopped and the
     /// command ends with exit code 130.
     pub fn with_cancellation(mut self, token: tokio_util::sync::CancellationToken) -> Self {
         self.cancel = token;
+        self
+    }
+
+    /// Mount `dir` at `/awman/output` into the agent container (WI 0137 §3).
+    pub fn with_output_dir(mut self, dir: Option<std::path::PathBuf>) -> Self {
+        self.output_dir = dir;
         self
     }
 
@@ -153,6 +165,20 @@ impl Command for ExecPromptCommand {
         mut frontend: Self::Frontend,
     ) -> Result<Self::Outcome, CommandError> {
         let session = self.session;
+        if self.output_dir.is_some() && !self.engines.runtime.capabilities().arbitrary_host_mounts {
+            frontend.write_message(UserMessage { level: MessageLevel::Warning, text: "Persistent command outputs are unavailable on this runtime; /awman/output is not mounted.".into() });
+        }
+
+        // Each run of `exec prompt` is an attempt from scratch (a daemon
+        // restart reruns it), so its outputs start empty (WI 0137 §3).
+        if let Some(dir) = &self.output_dir {
+            if let Err(e) = crate::data::fs::command_outputs::prepare_output_dir(dir, true) {
+                return Err(CommandError::Other(format!(
+                    "exec prompt: failed to prepare the outputs directory {}: {e}",
+                    dir.display()
+                )));
+            }
+        }
 
         // Validate that at least one of prompt and --issue is provided.
         if self.flags.prompt.is_none() && self.flags.issue_source.issue.is_none() {
@@ -340,6 +366,21 @@ impl Command for ExecPromptCommand {
                 None,
                 frontend.as_mut(),
             )?;
+        let mut directory_overlays = collected.directories;
+        let system_prompt = match self
+            .output_dir
+            .as_ref()
+            .filter(|_| self.engines.runtime.capabilities().arbitrary_host_mounts)
+        {
+            Some(dir) => {
+                directory_overlays.push(crate::data::fs::command_outputs::output_dir_overlay(dir));
+                Some(crate::engine::context_prompt::with_outputs_section(
+                    system_prompt,
+                    crate::engine::context_prompt::OutputsPromptRole::Prompt,
+                ))
+            }
+            None => system_prompt,
+        };
 
         let run_opts = AgentRunOptions {
             yolo: self.flags.yolo.then_some(YoloMode::Enabled),
@@ -347,6 +388,7 @@ impl Command for ExecPromptCommand {
             plan: self.flags.plan.then_some(PlanMode::Enabled),
             allow_docker: self.flags.allow_docker,
             non_interactive: self.flags.non_interactive,
+            structured_output: self.output_dir.is_some(),
             model: self.flags.model.clone(),
             agent_flags: self.flags.agent_flags.clone(),
             // ACP sends its initial turn after the initialize/session-new
@@ -358,7 +400,7 @@ impl Command for ExecPromptCommand {
             } else {
                 Some(collected.env_passthrough)
             },
-            directory_overlays: collected.directories,
+            directory_overlays,
             include_all_skills: collected.include_all_skills,
             named_skills: collected.named_skills,
             system_prompt,

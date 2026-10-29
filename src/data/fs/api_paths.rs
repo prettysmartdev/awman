@@ -130,6 +130,14 @@ impl ApiPaths {
         self.command_dir(session_id, command_id).join("events.log")
     }
 
+    /// The directory mounted read-write at `/awman/output` into the command's
+    /// agent containers (WI 0137 §3). Under the API root, never inside the
+    /// clone, so it survives a remote session's clone being deleted; its
+    /// retention follows the command's logs.
+    pub fn command_output_dir(&self, session_id: &str, command_id: &str) -> PathBuf {
+        self.command_dir(session_id, command_id).join("output")
+    }
+
     /// TLS material directory.
     pub fn tls_dir(&self) -> PathBuf {
         self.root.join(TLS_SUBDIR)

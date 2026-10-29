@@ -450,6 +450,7 @@ impl CatalogUpgrade for FakeDriver {
 
 /// Everything a test needs to drive one frontend-bound execution.
 pub struct Peer {
+    pub io_formats: Arc<Mutex<Vec<crate::data::agent_output_format::AgentOutputFormat>>>,
     pub stdout: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
     pub stderr: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
     pub stdin: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
@@ -458,6 +459,8 @@ pub struct Peer {
 }
 
 pub struct TestFrontend {
+    output_format: crate::data::agent_output_format::AgentOutputFormat,
+    io_formats: Arc<Mutex<Vec<crate::data::agent_output_format::AgentOutputFormat>>>,
     io: Option<AgentIo>,
     statuses: Arc<Mutex<Vec<AgentStatus>>>,
 }
@@ -469,6 +472,7 @@ pub fn frontend(pty: Option<(u16, u16)>) -> (Box<TestFrontend>, Peer) {
     let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel();
     let (resize_tx, resize_rx) = tokio::sync::mpsc::unbounded_channel();
     let statuses = Arc::new(Mutex::new(Vec::new()));
+    let io_formats = Arc::new(Mutex::new(Vec::new()));
     let io = AgentIo {
         stdout: stdout_tx,
         stderr: stderr_tx,
@@ -479,10 +483,13 @@ pub fn frontend(pty: Option<(u16, u16)>) -> (Box<TestFrontend>, Peer) {
     };
     (
         Box::new(TestFrontend {
+            output_format: Default::default(),
+            io_formats: io_formats.clone(),
             io: Some(io),
             statuses: statuses.clone(),
         }),
         Peer {
+            io_formats,
             stdout,
             stderr,
             stdin: stdin_tx,
@@ -499,11 +506,18 @@ impl UserMessageSink for TestFrontend {
 
 #[async_trait::async_trait]
 impl AgentFrontend for TestFrontend {
+    fn set_agent_output_format(
+        &mut self,
+        format: crate::data::agent_output_format::AgentOutputFormat,
+    ) {
+        self.output_format = format;
+    }
     fn report_status(&mut self, status: AgentStatus) {
         self.statuses.lock().unwrap().push(status);
     }
     fn report_progress(&mut self, _progress: AgentProgress) {}
     fn take_io(&mut self) -> AgentIo {
+        self.io_formats.lock().unwrap().push(self.output_format);
         self.io.take().expect("I/O is taken once")
     }
     fn grace_timeout(&self) -> Duration {

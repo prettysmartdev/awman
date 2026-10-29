@@ -307,6 +307,20 @@ struct RemoteExecParams<'a> {
     api_key_flag: Option<&'a str>,
 }
 
+fn follow_error(
+    error: Option<String>,
+    result: Option<&crate::data::fs::api_db::CommandResult>,
+) -> Option<String> {
+    error.or_else(|| {
+        result.and_then(|result| {
+            result
+                .failure
+                .as_ref()
+                .map(|failure| failure.message.clone())
+        })
+    })
+}
+
 async fn run_remote_exec(
     session: &crate::data::session::Session,
     engines: &Engines,
@@ -332,6 +346,7 @@ async fn run_remote_exec(
     });
 
     let mut follow_exit_code: Option<i32> = None;
+    let mut follow_result: Option<crate::data::fs::api_db::CommandResult> = None;
 
     if params.follow {
         frontend.write_message(UserMessage {
@@ -344,19 +359,43 @@ async fn run_remote_exec(
         struct FollowSink<'a> {
             sink: &'a mut dyn UserMessageSink,
             exit_code: &'a mut Option<i32>,
+            result: &'a mut Option<crate::data::fs::api_db::CommandResult>,
             interrupted: std::sync::Arc<std::sync::atomic::AtomicBool>,
+            /// Step names seen in `source` (WI 0137 §5). Once a second step
+            /// appears (a parallel group, or later steps), output lines are
+            /// prefixed with the step that wrote them.
+            steps_seen: std::collections::HashSet<String>,
+        }
+        impl FollowSink<'_> {
+            fn step_prefix(
+                &mut self,
+                event: &crate::data::execution_event::ExecutionEvent,
+            ) -> String {
+                let Some(step) = event.source.as_ref().and_then(|s| s.step_name.as_deref()) else {
+                    return String::new();
+                };
+                if !self.steps_seen.contains(step) {
+                    self.steps_seen.insert(step.to_string());
+                }
+                if self.steps_seen.len() > 1 {
+                    format!("[{step}] ")
+                } else {
+                    String::new()
+                }
+            }
         }
         impl ExecutionEventSink for FollowSink<'_> {
             fn on_event(&mut self, event: crate::data::execution_event::ExecutionEvent) -> bool {
                 if self.interrupted.load(std::sync::atomic::Ordering::Relaxed) {
                     return true;
                 }
+                let prefix = self.step_prefix(&event);
                 match event.payload {
                     EventPayload::StdoutLine(line) => {
-                        println!("{line}");
+                        println!("{prefix}{line}");
                     }
                     EventPayload::StderrLine(line) => {
-                        eprintln!("{line}");
+                        eprintln!("{prefix}{line}");
                     }
                     EventPayload::StatusMessage { phase, message } => {
                         self.sink.write_message(UserMessage {
@@ -419,11 +458,24 @@ async fn run_remote_exec(
                             text: "[parallel] group finished".to_string(),
                         });
                     }
+                    EventPayload::StepActivity { kind, summary } => {
+                        self.sink.write_message(UserMessage {
+                            level: MessageLevel::Info,
+                            text: format!("{prefix}[activity] {kind}: {summary}"),
+                        });
+                    }
                     EventPayload::CommandStatus {
                         status,
                         exit_code,
                         error,
+                        result,
                     } => {
+                        let status = result.as_ref().and_then(|r| r.outcome).unwrap_or(status);
+                        let exit_code = result.as_ref().and_then(|r| r.exit_code).or(exit_code);
+                        let error = follow_error(error, result.as_deref());
+                        if let Some(value) = result {
+                            *self.result = Some(*value);
+                        }
                         if let Some(code) = exit_code {
                             *self.exit_code = Some(code);
                         }
@@ -464,7 +516,9 @@ async fn run_remote_exec(
         let mut sink = FollowSink {
             sink: frontend,
             exit_code: &mut follow_exit_code,
+            result: &mut follow_result,
             interrupted: interrupted.clone(),
+            steps_seen: std::collections::HashSet::new(),
         };
 
         // Try once; on disconnect, retry once after 2s.
@@ -515,15 +569,26 @@ async fn run_remote_exec(
         }
     }
 
-    let status_resp = client.get_job(&command_id).await;
-    let (status, exit_code) = match status_resp {
-        Ok(r) => (
-            r.body["status"].as_str().map(|s| s.to_string()),
-            r.body["exit_code"]
-                .as_i64()
-                .or_else(|| follow_exit_code.map(|c| c as i64)),
-        ),
-        Err(_) => (None, follow_exit_code.map(|c| c as i64)),
+    let (status, exit_code) = if let Some(result) = follow_result {
+        let status = result.outcome.map(|outcome| {
+            match outcome {
+                CommandStatusKind::Done => "done",
+                CommandStatusKind::Cancelled => "cancelled",
+                _ => "error",
+            }
+            .to_string()
+        });
+        (status, result.exit_code.or(follow_exit_code).map(i64::from))
+    } else {
+        match client.get_job(&command_id).await {
+            Ok(r) => (
+                r.body["status"].as_str().map(|s| s.to_string()),
+                r.body["exit_code"]
+                    .as_i64()
+                    .or_else(|| follow_exit_code.map(|c| c as i64)),
+            ),
+            Err(_) => (None, follow_exit_code.map(|c| c as i64)),
+        }
     };
 
     Ok(RemoteExecOutcome {
@@ -865,6 +930,27 @@ async fn run_session_kill(
 mod tests {
     use super::*;
     use crate::data::session::Session;
+
+    #[test]
+    fn follow_preserves_the_legacy_push_prefix_and_falls_back_to_result_errors() {
+        let result = crate::data::fs::api_db::CommandResult {
+            failure: Some(crate::data::fs::api_db::CommandFailure {
+                stage: "push".into(),
+                code: "push_failed".into(),
+                message: "rejected".into(),
+                step: None,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            follow_error(Some("push: rejected".into()), Some(&result)).as_deref(),
+            Some("push: rejected")
+        );
+        assert_eq!(
+            follow_error(None, Some(&result)).as_deref(),
+            Some("rejected")
+        );
+    }
 
     #[test]
     fn remote_exec_warns_that_agent_flags_are_not_forwarded() {

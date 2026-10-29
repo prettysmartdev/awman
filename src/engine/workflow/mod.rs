@@ -18,6 +18,7 @@ use futures_util::StreamExt;
 use tokio_util::sync::CancellationToken;
 
 use crate::data::config::effective::EffectiveConfig;
+use crate::data::execution_event::{EventSource, EventSourcePhase};
 use crate::data::prompt::Prompt;
 use crate::data::session::{AgentHandle, AgentName, Session};
 use crate::data::workflow_dag::WorkflowDag;
@@ -641,6 +642,24 @@ impl WorkflowEngine {
         // end on "no ready steps remaining" instead. Pruning is safe because
         // the DAG is the only thing that decides what actually runs.
         let orphans = state.retain_steps_in(&dag);
+        // Accepted definition drift may add or reorder steps. The ordered
+        // definition, including newly pending entries, is the index authority.
+        state.steps = workflow
+            .steps
+            .iter()
+            .map(|step| crate::data::workflow_state::WorkflowStepInfo {
+                name: step.name.clone(),
+                depends_on: step.depends_on.clone(),
+                agent: step.agent.clone(),
+                model: step.model.clone(),
+            })
+            .collect();
+        for step in &state.steps {
+            state
+                .step_states
+                .entry(step.name.clone())
+                .or_insert(StepState::Pending);
+        }
         if !orphans.is_empty() {
             frontend.write_message(crate::data::message::UserMessage {
                 level: crate::data::message::MessageLevel::Warning,

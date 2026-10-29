@@ -117,6 +117,18 @@ pub trait AgentFrontend: UserMessageSink + Send {
     /// and spawns reader/writer tasks. Every frontend must implement this.
     fn take_io(&mut self) -> AgentIo;
 
+    /// Which structured output format the agent about to run will print on
+    /// stdout (WI 0137 §4). The engine calls this once per launch, before
+    /// `report_status(Running)` and therefore before `take_io`, when it has
+    /// enabled a structured mode (`Text` means plain output). A frontend
+    /// that translates agent output (the API) picks its translator from it;
+    /// every other frontend keeps the default and ignores it.
+    fn set_agent_output_format(
+        &mut self,
+        _format: crate::data::agent_output_format::AgentOutputFormat,
+    ) {
+    }
+
     /// Startup-grace timeout: how long the agent has to emit its first
     /// byte of output before it is considered failed-to-start and killed.
     /// The regular stuck timer does not begin until the first byte is seen
@@ -161,6 +173,13 @@ impl<F: AgentFrontend + ?Sized> AgentFrontend for std::sync::Arc<std::sync::Mute
 
     fn take_io(&mut self) -> AgentIo {
         self.lock().unwrap().take_io()
+    }
+
+    fn set_agent_output_format(
+        &mut self,
+        format: crate::data::agent_output_format::AgentOutputFormat,
+    ) {
+        self.lock().unwrap().set_agent_output_format(format);
     }
 
     fn grace_timeout(&self) -> Duration {

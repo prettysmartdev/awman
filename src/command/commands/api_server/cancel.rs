@@ -123,6 +123,7 @@ pub struct CommandCanceller {
     lifecycle: CommandLifecycleStore,
     commands: Arc<TokenRegistry>,
     setups: Arc<TokenRegistry>,
+    completion_paths: Option<crate::data::fs::api_paths::ApiPaths>,
 }
 
 impl CommandCanceller {
@@ -137,7 +138,20 @@ impl CommandCanceller {
             lifecycle,
             commands,
             setups,
+            completion_paths: None,
         }
+    }
+
+    pub fn with_completion_paths(mut self, paths: crate::data::fs::api_paths::ApiPaths) -> Self {
+        self.completion_paths = Some(paths);
+        self
+    }
+
+    fn finalize_unowned(&self, command_id: &str) -> Result<(), CommandError> {
+        if let Some(paths) = &self.completion_paths {
+            super::queue_worker::finalize_unowned_command(&self.store, paths, command_id)?;
+        }
+        Ok(())
     }
 
     pub fn cancel(&self, command_id: &str) -> Result<CancelOutcome, CommandError> {
@@ -158,6 +172,7 @@ impl CommandCanceller {
             if let Some(run) = self.lifecycle.run_for_command(command_id)? {
                 self.setups.cancel(&run.session_id);
             }
+            self.finalize_unowned(command_id)?;
             return Ok(CancelOutcome::Cancelled(self.reread(record)?));
         }
 
@@ -175,7 +190,10 @@ impl CommandCanceller {
         if !owned {
             let current = self.reread(record.clone())?;
             match CommandStatus::parse(&current.status) {
-                Some(CommandStatus::Cancelled) => return Ok(CancelOutcome::Cancelled(current)),
+                Some(CommandStatus::Cancelled) => {
+                    self.finalize_unowned(command_id)?;
+                    return Ok(CancelOutcome::Cancelled(self.reread(current)?));
+                }
                 Some(s) if s.is_terminal() => return Ok(CancelOutcome::AlreadyTerminal(current)),
                 // Not finalised (the row left `running` some other way):
                 // the marker is recorded, so restart recovery cancels it.

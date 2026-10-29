@@ -382,6 +382,7 @@ impl ContainerBackend for BuiltinBackend {
         options: ResolvedContainerOptions,
     ) -> Result<Box<dyn AgentInstance>, EngineError> {
         self.is_available()?;
+        let format = options.agent_output_format;
         let plan = self.plan(options)?;
         let owner = plan
             .spec
@@ -389,12 +390,15 @@ impl ContainerBackend for BuiltinBackend {
             .get(naming::LABEL_OWNER)
             .ok_or_else(|| EngineError::Other("builtin launch plan has no owner label".into()))?
             .clone();
-        Ok(Box::new(Instance {
-            driver: self.driver.clone(),
-            paths: self.paths.clone(),
-            owner,
-            plan,
-        }))
+        Ok(crate::engine::agent_runtime::execution::with_output_format(
+            Box::new(Instance {
+                driver: self.driver.clone(),
+                paths: self.paths.clone(),
+                owner,
+                plan,
+            }),
+            format,
+        ))
     }
     fn attach(&self, handle: &AgentHandle) -> Result<Box<dyn AgentInstance>, EngineError> {
         let summary = self.driver.get(&handle.id)?;
