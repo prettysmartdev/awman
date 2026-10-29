@@ -149,6 +149,10 @@ pub struct Engines {
     /// that already merged this in, under the repo config, the environment
     /// and the flags. This field is for the code that has no session.
     pub global_config: Arc<GlobalConfig>,
+
+    /// Once-per-repo config notices for this bundle's lifetime (WI 0150 §3):
+    /// one CLI/TUI process or one daemon.
+    pub config_notices: Arc<crate::command::config_notices::ConfigNotices>,
 }
 
 impl Engines {
@@ -233,6 +237,7 @@ impl Engines {
             overlay_engine,
             auth_engine: Arc::new(AuthEngine::with_paths(auth_paths, api_paths)),
             agent_engine,
+            config_notices: Default::default(),
             workflow_state_store: Arc::new(crate::data::WorkflowStateStore::at_git_root(
                 workflow_root,
             )),
@@ -274,6 +279,7 @@ impl Engines {
             overlay_engine,
             auth_engine,
             agent_engine,
+            config_notices: Default::default(),
             workflow_state_store: Arc::new(crate::data::WorkflowStateStore::at_git_root(
                 session.git_root().to_path_buf(),
             )),
@@ -299,6 +305,7 @@ impl Engines {
             overlay_engine,
             auth_engine: Arc::new(AuthEngine::with_paths(auth_paths, ApiPaths::at_root(root))),
             agent_engine,
+            config_notices: Default::default(),
             workflow_state_store: Arc::new(crate::data::WorkflowStateStore::at_git_root(root)),
             credential_monitor: None,
             global_config: Arc::new(GlobalConfig::default()),

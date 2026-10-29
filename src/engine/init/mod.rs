@@ -100,6 +100,31 @@ impl InitEngine {
         &self.summary
     }
 
+    /// Save the run's repo config. A save also moves a legacy
+    /// `dynamicWorkflows` block (WI 0150 §4), so say so as soon as that write
+    /// lands: a later phase may still fail, and the move is already on disk.
+    fn save_existing_repo_config(
+        &mut self,
+        git_root: &std::path::Path,
+        frontend: &mut dyn InitFrontend,
+    ) -> Result<(), EngineError> {
+        let mut adopted = self.repo_config.clone();
+        let moved = adopted.adopt_legacy_dynamic_workflows();
+        adopted.save(git_root)?;
+        self.repo_config = adopted;
+        if moved {
+            frontend.write_message(crate::data::message::UserMessage {
+                level: crate::data::message::MessageLevel::Info,
+                text: format!(
+                    "{}: {}",
+                    RepoConfig::path(git_root).display(),
+                    crate::data::config::repo::MOVED_LEGACY_DYNAMIC_WORKFLOWS_NOTICE
+                ),
+            });
+        }
+        Ok(())
+    }
+
     pub async fn step(
         &mut self,
         frontend: &mut dyn InitFrontend,
@@ -245,7 +270,7 @@ impl InitEngine {
             }
             InitPhase::SavingDockerfileConfig => {
                 self.repo_config.dockerfile = self.pending_dockerfile_path.take();
-                self.repo_config.save(&git_root)?;
+                self.save_existing_repo_config(&git_root, frontend)?;
                 self.summary.dockerfile = StepStatus::Done;
                 InitPhase::SettingUpAgentDockerfile
             }
@@ -597,7 +622,7 @@ impl InitEngine {
                     let cfg = frontend.ask_work_items_setup()?;
                     if let Some(work_items) = cfg {
                         self.repo_config.set_work_items_config(Some(work_items));
-                        self.repo_config.save(&git_root)?;
+                        self.save_existing_repo_config(&git_root, frontend)?;
                         InitPhase::WritingWorkItemsConfig
                     } else {
                         self.summary.work_items_setup = StepStatus::Skipped;
@@ -671,6 +696,7 @@ mod tests {
         work_items_config: Option<WorkItemsConfig>,
         dockerfile_decision: crate::engine::init::frontend::DockerfileSetupDecision,
         phases: Vec<InitPhase>,
+        messages: Vec<String>,
     }
 
     impl FakeInitFrontend {
@@ -682,6 +708,7 @@ mod tests {
                 dockerfile_decision:
                     crate::engine::init::frontend::DockerfileSetupDecision::CreateNew,
                 phases: Vec::new(),
+                messages: Vec::new(),
             }
         }
     }
@@ -711,7 +738,9 @@ mod tests {
     }
 
     impl UserMessageSink for FakeInitFrontend {
-        fn write_message(&mut self, _: UserMessage) {}
+        fn write_message(&mut self, message: UserMessage) {
+            self.messages.push(message.text);
+        }
         fn replay_queued(&mut self) {}
     }
 
@@ -880,6 +909,7 @@ mod tests {
             work_items_config: None,
             dockerfile_decision: crate::engine::init::frontend::DockerfileSetupDecision::CreateNew,
             phases: Vec::new(),
+            messages: Vec::new(),
         };
         let summary = engine.run_to_completion(&mut frontend).await.unwrap();
         assert!(matches!(summary.config, StepStatus::Done));
@@ -901,6 +931,7 @@ mod tests {
             work_items_config: None,
             dockerfile_decision: crate::engine::init::frontend::DockerfileSetupDecision::CreateNew,
             phases: Vec::new(),
+            messages: Vec::new(),
         };
         // First run.
         let mut engine = make_engine(tmp.path());
@@ -928,6 +959,7 @@ mod tests {
             work_items_config: Some(wi_cfg),
             dockerfile_decision: crate::engine::init::frontend::DockerfileSetupDecision::CreateNew,
             phases: Vec::new(),
+            messages: Vec::new(),
         };
         let summary = engine.run_to_completion(&mut frontend).await.unwrap();
         assert!(matches!(summary.work_items_setup, StepStatus::Done));
@@ -960,6 +992,7 @@ mod tests {
             work_items_config: Some(crate::data::config::repo::WorkItemsConfig::default()),
             dockerfile_decision: crate::engine::init::frontend::DockerfileSetupDecision::CreateNew,
             phases: Vec::new(),
+            messages: Vec::new(),
         };
         let summary = engine.run_to_completion(&mut frontend).await.unwrap();
         assert!(
@@ -1001,6 +1034,7 @@ mod tests {
             work_items_config: Some(crate::data::config::repo::WorkItemsConfig::default()),
             dockerfile_decision: crate::engine::init::frontend::DockerfileSetupDecision::CreateNew,
             phases: Vec::new(),
+            messages: Vec::new(),
         };
         let summary = engine.run_to_completion(&mut frontend).await.unwrap();
         assert!(
@@ -1028,6 +1062,7 @@ mod tests {
             // when it should not, the test can detect the mismatch via phases.
             dockerfile_decision: crate::engine::init::frontend::DockerfileSetupDecision::Skip,
             phases: Vec::new(),
+            messages: Vec::new(),
         };
         engine.run_to_completion(&mut frontend).await.unwrap();
 
@@ -1054,6 +1089,7 @@ mod tests {
             work_items_config: None,
             dockerfile_decision: crate::engine::init::frontend::DockerfileSetupDecision::CreateNew,
             phases: Vec::new(),
+            messages: Vec::new(),
         };
         let summary = engine.run_to_completion(&mut frontend).await.unwrap();
 
@@ -1080,6 +1116,7 @@ mod tests {
                     "docker/Dockerfile.custom".to_string(),
                 ),
             phases: Vec::new(),
+            messages: Vec::new(),
         };
         let summary = engine.run_to_completion(&mut frontend).await.unwrap();
 
@@ -1099,6 +1136,7 @@ mod tests {
             work_items_config: None,
             dockerfile_decision: crate::engine::init::frontend::DockerfileSetupDecision::Skip,
             phases: Vec::new(),
+            messages: Vec::new(),
         };
         let summary = engine.run_to_completion(&mut frontend).await.unwrap();
 
@@ -1110,6 +1148,59 @@ mod tests {
             !tmp.path().join("Dockerfile.dev").exists(),
             "Dockerfile.dev must not be created when decision is Skip"
         );
+    }
+
+    /// Both saves of an existing config move a legacy `dynamicWorkflows`
+    /// block, and each run reports the move once, when the write lands.
+    #[tokio::test]
+    async fn saving_an_existing_legacy_config_reports_the_dynamic_workflows_move() {
+        let moved = |messages: &[String]| {
+            messages
+                .iter()
+                .filter(|m| m.contains("also moved `dynamicWorkflows`"))
+                .count()
+        };
+        // Dockerfile phase (`UseExisting`) and work-items phase (no aspec/).
+        let decisions = [
+            (
+                crate::engine::init::frontend::DockerfileSetupDecision::UseExisting(
+                    "docker/Dockerfile.custom".to_string(),
+                ),
+                None,
+            ),
+            (
+                crate::engine::init::frontend::DockerfileSetupDecision::Skip,
+                Some(WorkItemsConfig {
+                    dir: Some("items".to_string()),
+                    template: None,
+                }),
+            ),
+        ];
+        for (dockerfile_decision, work_items_config) in decisions {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = crate::data::config::repo::RepoConfig::path(tmp.path());
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(
+                &path,
+                r#"{"agent":"claude","dynamicWorkflows":{"maxConcurrentSteps":2}}"#,
+            )
+            .unwrap();
+            let mut engine = make_engine(tmp.path());
+            let mut frontend = FakeInitFrontend {
+                replace_aspec: false,
+                run_audit: false,
+                work_items_config,
+                dockerfile_decision,
+                phases: Vec::new(),
+                messages: Vec::new(),
+            };
+            engine.run_to_completion(&mut frontend).await.unwrap();
+            assert_eq!(moved(&frontend.messages), 1, "{:?}", frontend.messages);
+            let saved: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            assert!(saved.get("dynamicWorkflows").is_none(), "{saved}");
+            assert_eq!(saved["workflows"]["dynamic"]["maxConcurrentSteps"], 2);
+        }
     }
 
     #[tokio::test]
@@ -1125,6 +1216,7 @@ mod tests {
                     "docker/Dockerfile.custom".to_string(),
                 ),
             phases: Vec::new(),
+            messages: Vec::new(),
         };
         engine.run_to_completion(&mut frontend).await.unwrap();
 
@@ -1154,6 +1246,7 @@ mod tests {
             work_items_config: None,
             dockerfile_decision: crate::engine::init::frontend::DockerfileSetupDecision::CreateNew,
             phases: Vec::new(),
+            messages: Vec::new(),
         };
         engine.run_to_completion(&mut frontend).await.unwrap();
         assert!(tmp.path().join("Dockerfile.dev").exists());
@@ -1166,6 +1259,7 @@ mod tests {
             work_items_config: None,
             dockerfile_decision: crate::engine::init::frontend::DockerfileSetupDecision::Skip,
             phases: Vec::new(),
+            messages: Vec::new(),
         };
         engine2.run_to_completion(&mut frontend2).await.unwrap();
         assert!(
@@ -1226,6 +1320,7 @@ mod tests {
             work_items_config: None,
             dockerfile_decision: crate::engine::init::frontend::DockerfileSetupDecision::CreateNew,
             phases: Vec::new(),
+            messages: Vec::new(),
         };
         // Run only the Preflight step.
         engine.step(&mut frontend).await.unwrap();

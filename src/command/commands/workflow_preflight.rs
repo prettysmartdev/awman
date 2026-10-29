@@ -20,6 +20,7 @@ use crate::command::commands::exec_workflow::{
 use crate::command::commands::launch_policy::LaunchPolicy;
 use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
+use crate::data::config::{DynamicWorkflowsSource, ResolvedDynamicWorkflows};
 use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
 use crate::data::session::Session;
 use crate::data::workflow_definition::Workflow;
@@ -184,45 +185,82 @@ pub(crate) fn apply_dynamic_implied_flags(flags: &mut ExecWorkflowCommandFlags) 
     }
 }
 
-/// Resolve the leader agent name and optional model override from `flags`,
-/// `session`, and the repo config (WI-0092 §7, WI-0095 §5 precedence).
+/// The one way a dynamic run reads its settings (WI 0150 §2): an
+/// `EffectiveConfig` built from the INVOKING session's env/repo/global config
+/// and the workflow flags (so `--leader` is the `Flag` source), as
+/// `factory.rs::workflow_agent_flags` does. `session` is the invoking checkout,
+/// never a workflow worktree.
+pub(crate) fn resolve_dynamic_workflows(
+    session: &Session,
+    flags: &ExecWorkflowCommandFlags,
+) -> Result<ResolvedDynamicWorkflows, CommandError> {
+    crate::data::config::EffectiveConfig::new(
+        workflow_flag_config(flags),
+        session.env().clone(),
+        session.repo_config().clone(),
+        session.global_config().clone(),
+    )
+    .dynamic_workflows()
+    .map_err(CommandError::from)
+}
+
+/// Resolve the leader agent name and optional model override (WI-0092 §7,
+/// WI-0095 §5, WI 0150 §2).
 ///
 /// Precedence:
 /// 1. `--leader agent::model` provided → `leader_agent = spec.agent`, `leader_model = spec.model`;
 ///    `--model` is ignored for the leader.
-/// 2. `dynamicWorkflows.defaultLeader` set in repo config (and no `--leader`) →
-///    it governs both the leader agent and leader model; `--model` does not
-///    override the configured leader model.
+/// 2. `workflows.dynamic.defaultLeader` (repo, legacy repo key, then global)
+///    and no `--leader` → it governs both the leader agent and leader model;
+///    `--model` does not override the configured leader model.
 /// 3. `--model` provided, no `--leader`/`defaultLeader` → default agent, `leader_model = flags.model`.
 /// 4. None of the above → default agent, `leader_model = None`.
 pub(crate) fn resolve_leader_model(
     flags: &ExecWorkflowCommandFlags,
     session: &Session,
+    resolved: &ResolvedDynamicWorkflows,
 ) -> Result<(crate::data::session::AgentName, Option<String>), CommandError> {
-    // 1. `--leader` flag wins.
+    // 1. `--leader` flag wins. (Also reflected as the `Flag` source in
+    //    `resolved`; parsed here so a malformed flag names the flag.)
     if let Some(raw) = &flags.leader {
         let spec = parse_leader_flag(raw)?;
         let agent =
             crate::data::session::AgentName::new(&spec.agent).map_err(CommandError::from)?;
         return Ok((agent, Some(spec.model)));
     }
-    // 2. `dynamicWorkflows.defaultLeader` from repo config. Already validated in
-    //    RepoConfig::load; re-parse here with the command-layer LeaderSpec to
-    //    construct the leader selection.
-    if let Some(default_leader) = session
-        .repo_config()
-        .dynamic_workflows
-        .as_ref()
-        .and_then(|dw| dw.default_leader.as_deref())
-    {
-        let spec = parse_leader_flag(default_leader)?;
-        let agent =
-            crate::data::session::AgentName::new(&spec.agent).map_err(CommandError::from)?;
+    // 2. The configured default leader. Already validated at config load;
+    //    re-parsed here to construct the leader selection. Errors name the key
+    //    and file the user wrote.
+    if let Some(leader) = &resolved.default_leader {
+        let label = leader.source.describe("defaultLeader");
+        let spec = parse_leader_flag(&leader.value)
+            .map_err(|e| CommandError::Other(format!("{label}: {e}")))?;
+        let agent = crate::data::session::AgentName::new(&spec.agent)
+            .map_err(|e| CommandError::Other(format!("{label}: {e}")))?;
         return Ok((agent, Some(spec.model)));
     }
     // 3 & 4. `--model` + default-agent fallback (WI-0092 behavior).
     let agent = LaunchPolicy::for_session(session).resolve_agent(&flags.agent)?;
     Ok((agent, flags.model.clone()))
+}
+
+/// Name the configured leader's key and file on a leader-availability error
+/// (an unknown agent, a missing Dockerfile, a failed image build), so a user
+/// whose global `defaultLeader` names an agent this repo lacks sees where it
+/// came from. A `--leader` (or no configured leader) leaves the error as is.
+pub(crate) fn attribute_leader_error(
+    resolved: &ResolvedDynamicWorkflows,
+    error: CommandError,
+) -> CommandError {
+    match &resolved.default_leader {
+        Some(leader) if leader.source != DynamicWorkflowsSource::Flag && error.exit_code() == 1 => {
+            CommandError::Other(format!(
+                "{error}\nThe leader is set by {}; pass --leader agent::model to override it.",
+                leader.source.describe("defaultLeader")
+            ))
+        }
+        _ => error,
+    }
 }
 
 /// Validate the `workflow.toml` produced by the leader agent: checks file
@@ -284,19 +322,35 @@ pub(crate) fn format_agents_with_models(
         .join("\n")
 }
 
+/// What to do with a configured agent that has no `.awman/Dockerfile.<agent>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MissingDockerfilePolicy {
+    /// Repo-vetted list: a missing Dockerfile is a hard error.
+    Fail,
+    /// Global list spans repos: skip the entry with a warning.
+    SkipWithWarning,
+}
+
 /// Build the effective (normalized) agent→models map for a dynamic workflow
-/// from the configured `agentsToModels`, validating each configured agent
-/// against the set of discovered Dockerfile agents (WI-0095 §2).
+/// from a configured `agentsToModels`, validating each configured agent
+/// against the set of discovered Dockerfile agents (WI-0095 §2, WI 0150 §2).
 ///
 /// Matching is case-insensitive as a compatibility aid, but the returned map is
 /// always keyed by the lowercase agent name; the config file is never silently
-/// rewritten. Fails with a single descriptive error when any configured agent
-/// has no Dockerfile, or when two configured keys collapse to the same
-/// discovered agent after case folding. Case-folded (non-exact) matches are
-/// appended to `warnings` for the caller to surface.
+/// rewritten. Fails with a single descriptive error when two configured keys
+/// collapse to the same discovered agent after case folding, and — under
+/// [`MissingDockerfilePolicy::Fail`] — when any configured agent has no
+/// Dockerfile. Under [`MissingDockerfilePolicy::SkipWithWarning`] such agents
+/// are dropped with one warning each, and the returned map may be EMPTY,
+/// which the caller treats as "fall back to discovery". `key_label` is what
+/// messages call the map (`workflows.dynamic.agentsToModels`,
+/// `dynamicWorkflows.agentsToModels`, `squad.agentsToModels`). Case-folded
+/// matches and skips are appended to `warnings` for the caller to surface.
 pub(crate) fn build_effective_agents_to_models(
     configured: &std::collections::HashMap<String, Vec<String>>,
     available_agents: &[(String, std::path::PathBuf)],
+    policy: MissingDockerfilePolicy,
+    key_label: &str,
     warnings: &mut Vec<String>,
 ) -> Result<std::collections::HashMap<String, Vec<String>>, CommandError> {
     use std::collections::HashMap;
@@ -323,16 +377,16 @@ pub(crate) fn build_effective_agents_to_models(
             Some(found) => {
                 if let Some(prev) = claimed.get(&folded) {
                     return Err(CommandError::Other(format!(
-                        "dynamicWorkflows.agentsToModels contains keys {prev:?} and {key:?} that \
-                         both refer to the discovered agent {found:?} after case folding; remove \
-                         one so model lists are not ambiguously merged."
+                        "{key_label} contains keys {prev:?} and {key:?} that both refer to the \
+                         discovered agent {found:?} after case folding; remove one so model \
+                         lists are not ambiguously merged."
                     )));
                 }
                 claimed.insert(folded.clone(), key.clone());
                 if key.as_str() != *found {
                     warnings.push(format!(
-                        "dynamicWorkflows.agentsToModels key {key:?} matched discovered agent \
-                         {found:?} only after case folding; the workflow will use {folded:?}."
+                        "{key_label} key {key:?} matched discovered agent {found:?} only after \
+                         case folding; the workflow will use {folded:?}."
                     ));
                 }
                 effective.insert(folded, models.clone());
@@ -341,20 +395,67 @@ pub(crate) fn build_effective_agents_to_models(
         }
     }
 
-    if !missing.is_empty() {
-        let mut available_names: Vec<String> =
-            available_agents.iter().map(|(n, _)| n.clone()).collect();
-        available_names.sort();
-        return Err(CommandError::Other(format!(
-            "dynamicWorkflows.agentsToModels references agents that have no Dockerfile in this \
-             repo: [{}].\nAvailable agents: [{}].\nAdd a .awman/Dockerfile.<agent> for each \
-             missing agent, or remove it from agentsToModels.",
-            missing.join(", "),
-            available_names.join(", ")
-        )));
+    if missing.is_empty() {
+        return Ok(effective);
     }
+    match policy {
+        MissingDockerfilePolicy::SkipWithWarning => {
+            for agent in &missing {
+                warnings.push(format!(
+                    "global {key_label}: skipping '{agent}' — no Dockerfile in this repo"
+                ));
+            }
+            Ok(effective)
+        }
+        MissingDockerfilePolicy::Fail => {
+            let mut available_names: Vec<String> =
+                available_agents.iter().map(|(n, _)| n.clone()).collect();
+            available_names.sort();
+            Err(CommandError::Other(format!(
+                "{key_label} references agents that have no Dockerfile in this repo: [{}].\n\
+                 Available agents: [{}].\nAdd a .awman/Dockerfile.<agent> for each missing \
+                 agent, or remove it from agentsToModels.",
+                missing.join(", "),
+                available_names.join(", ")
+            )))
+        }
+    }
+}
 
-    Ok(effective)
+/// The `{{available_agents}}` section of the dynamic leader prompt, from the
+/// resolved `agentsToModels` (WI 0150 §2): a repo map (either key) keeps the
+/// hard missing-Dockerfile error; a global map skips agents this repo has no
+/// Dockerfile for, and falls back to Dockerfile discovery when it skips them
+/// all. With no map at all, discovery as before. Returns the section and the
+/// warnings to emit.
+pub(crate) fn agents_section_for_leader(
+    resolved: &ResolvedDynamicWorkflows,
+    available_agents: &[(String, std::path::PathBuf)],
+) -> Result<(String, Vec<String>), CommandError> {
+    let mut warnings = Vec::new();
+    let Some(map) = &resolved.agents_to_models else {
+        return Ok((format_available_agents(available_agents), warnings));
+    };
+    let key_label = format!("{}.agentsToModels", map.source.key_prefix());
+    let policy = match map.source {
+        DynamicWorkflowsSource::Global => MissingDockerfilePolicy::SkipWithWarning,
+        _ => MissingDockerfilePolicy::Fail,
+    };
+    let effective = build_effective_agents_to_models(
+        &map.value,
+        available_agents,
+        policy,
+        &key_label,
+        &mut warnings,
+    )?;
+    if effective.is_empty() {
+        warnings.push(format!(
+            "global {key_label}: no listed agent has a Dockerfile in this repo; falling back to \
+             Dockerfile discovery"
+        ));
+        return Ok((format_available_agents(available_agents), warnings));
+    }
+    Ok((format_agents_with_models(&effective), warnings))
 }
 
 /// Resolve the unique set of agent names a workflow will launch, using the same

@@ -39,21 +39,23 @@ The multi-model aspect of `awman` dynamic workflows helps take this even further
 
 ## Keeping the leader on the rails
 
-An agent designing your pipeline is only useful if you can constrain it. A `dynamicWorkflows` block in `.awman/config.json` does that, and it lives in version control so your whole team shares it:
+An agent designing your pipeline is only useful if you can constrain it. A `workflows.dynamic` block in `.awman/config.json` does that, and it lives in version control so your whole team shares it:
 
 ```json
 {
-  "dynamicWorkflows": {
-    "agentsToModels": {
-      "claude": ["claude-opus-4-8", "claude-sonnet-5"],
-      "codex": ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"]
-    },
-    "defaultLeader": "claude::claude-fable-5",
-    "maxConcurrentSteps": 3,
-    "guidance": [
-      "Always add a validation step after each implementation step.",
-      "Emulate the BMAD 'adverserial review' technique when finalizing the work item"
-    ]
+  "workflows": {
+    "dynamic": {
+      "agentsToModels": {
+        "claude": ["claude-opus-4-8", "claude-sonnet-5"],
+        "codex": ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"]
+      },
+      "defaultLeader": "claude::claude-fable-5",
+      "maxConcurrentSteps": 3,
+      "guidance": [
+        "Always add a validation step after each implementation step.",
+        "Emulate the BMAD 'adverserial review' technique when finalizing the work item"
+      ]
+    }
   }
 }
 ```

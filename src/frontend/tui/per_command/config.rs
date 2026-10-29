@@ -10,6 +10,13 @@ use crate::frontend::tui::dialogs::{
 };
 
 impl ConfigCommandFrontend for TuiCommandFrontend {
+    fn confirm_config_migration(
+        &mut self,
+        prompt: &crate::data::prompt::Prompt<crate::command::commands::config::MigrateChoice>,
+    ) -> Result<crate::command::commands::config::MigrateChoice, CommandError> {
+        self.pick_from_keyed_prompt(prompt)
+    }
+
     fn present_config_table(
         &mut self,
         rows: &[ConfigFieldRow],
@@ -26,7 +33,7 @@ impl ConfigCommandFrontend for TuiCommandFrontend {
                 global_writable: r.global_writable,
                 repo_writable: r.repo_writable,
                 value_hint: r.value_hint.clone(),
-                shape: r.shape.clone(),
+                shape: r.shape,
             })
             .collect();
 

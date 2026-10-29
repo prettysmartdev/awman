@@ -2333,6 +2333,7 @@ mod tests {
             workflow_state_store,
             credential_monitor: None,
             global_config: std::sync::Arc::new(Default::default()),
+            config_notices: Default::default(),
         };
         let lifecycle_store = crate::data::CommandLifecycleStore::open(Arc::clone(&store)).unwrap();
         let setup_cancels = Arc::new(crate::command::commands::api_server::TokenRegistry::new());

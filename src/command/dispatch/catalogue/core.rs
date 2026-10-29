@@ -292,6 +292,7 @@ pub(super) const CONFIG: CommandSpec = CommandSpec {
         &CONFIG_SHOW,
         &CONFIG_GET,
         &CONFIG_SET,
+        &CONFIG_MIGRATE,
         &CONFIG_PREREQUISITE_GRANTS,
     ],
 };
@@ -373,6 +374,77 @@ pub(super) const CONFIG_SET: CommandSpec = CommandSpec {
     requires_container_tier: false,
     // The recovery path when the configured runtime cannot be constructed
     // on this host: `awman config set runtime …` must stay reachable.
+    requires_runtime: false,
+    opens_tui_when_bare: false,
+    subcommands: &[],
+};
+
+pub(super) const CONFIG_MIGRATE: CommandSpec = CommandSpec {
+    name: "migrate",
+    aliases: &[],
+    help: "Move settings awman has renamed to their current keys in the repo config, after \
+           confirmation.",
+    long_help: Some(
+        "Runs every known config migration for the chosen scope. Today that is one: \
+         `dynamicWorkflows` moves to `workflows.dynamic`. Shows the before/after JSON and asks \
+         first; teammates on awman versions before this release stop seeing migrated settings \
+         once the change is committed.",
+    ),
+    arguments: &[],
+    flags: &[
+        FlagSpec {
+            long: "yes",
+            short: Some('y'),
+            help: "Skip the confirmation prompt (for scripting).",
+            kind: FlagKind::Bool,
+            default: FlagDefault::Bool(false),
+            frontends: FrontendVisibility::All,
+            conflicts_with: &[],
+            implies: &[],
+            optional: true,
+        },
+        FlagSpec {
+            long: "dry-run",
+            short: None,
+            help: "Show what would change without writing anything.",
+            kind: FlagKind::Bool,
+            default: FlagDefault::Bool(false),
+            frontends: FrontendVisibility::All,
+            conflicts_with: &[],
+            implies: &[],
+            optional: true,
+        },
+        FlagSpec {
+            long: "global",
+            short: None,
+            help: "Migrate the global config instead of the repo config.",
+            kind: FlagKind::Bool,
+            default: FlagDefault::Bool(false),
+            frontends: FrontendVisibility::All,
+            conflicts_with: &[],
+            implies: &[],
+            optional: true,
+        },
+        FlagSpec {
+            long: "non-interactive",
+            short: Some('n'),
+            help: "Never prompt: refuse instead of asking for confirmation (pass --yes to \
+                   proceed).",
+            kind: FlagKind::Bool,
+            default: FlagDefault::Bool(false),
+            frontends: FrontendVisibility::All,
+            conflicts_with: &[],
+            implies: &[],
+            optional: true,
+        },
+    ],
+    // Same visibility as `config set`.
+    api_allowed: false,
+    build: crate::command::dispatch::build::config,
+    gateway_need: GatewayNeed::None,
+    requires_container_tier: false,
+    // A config repair path, like the other config leaves: it must stay
+    // reachable when the configured runtime cannot be constructed.
     requires_runtime: false,
     opens_tui_when_bare: false,
     subcommands: &[],

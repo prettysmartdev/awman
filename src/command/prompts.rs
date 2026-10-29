@@ -13,6 +13,7 @@
 
 use crate::command::commands::agent_trust::{AgentTrustReview, TrustDecision};
 use crate::command::commands::agents::{AgentSnapshot, AgentSource, KillChoice};
+use crate::command::commands::config::MigrateChoice;
 use crate::command::commands::specs::WorkItemKind;
 use crate::command::commands::squad::commands::{SquadConfirmDecision, TaskWorkspaceChoice};
 use crate::command::commands::workflow_prerequisites::{
@@ -249,6 +250,29 @@ pub fn agents_kill_confirm(agent: &AgentSnapshot) -> Prompt<KillChoice> {
             Choice::new('n', "keep running", KillChoice::Keep),
         ],
         Some(KillChoice::Keep),
+    )
+}
+
+/// `awman config migrate`: move renamed settings to their current keys.
+///
+/// The body is the migration preview (file path, then the before/after JSON
+/// of every affected key) and a warning about teammates on older awman
+/// versions, who stop seeing moved settings. `default_on_dismiss` is
+/// `Some(Cancel)`: walking away from a confirmation is a refusal; Esc must
+/// not rewrite a file.
+pub fn config_migrate_confirm(preview: &str) -> Prompt<MigrateChoice> {
+    Prompt::new(
+        "Move `dynamicWorkflows` to `workflows.dynamic`?",
+        format!(
+            "{preview}\n\nteammates on awman versions before v{} will stop seeing these \
+             settings once this change is committed.",
+            env!("CARGO_PKG_VERSION")
+        ),
+        vec![
+            Choice::new('y', "Move it", MigrateChoice::Move),
+            Choice::new('n', "Cancel", MigrateChoice::Cancel),
+        ],
+        Some(MigrateChoice::Cancel),
     )
 }
 

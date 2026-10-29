@@ -52,6 +52,15 @@ pub struct GlobalConfig {
     pub yolo_disallowed_tools: Option<Vec<String>>,
     #[serde(rename = "envPassthrough", default, skip_serializing)]
     pub legacy_env_passthrough: Option<Vec<String>>,
+    /// Never read in global config; warn without activating these stale settings.
+    /// Written back unchanged on save, so a global `config set` made while
+    /// following the warning does not delete what the user has yet to move.
+    #[serde(
+        rename = "dynamicWorkflows",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub legacy_dynamic_workflows: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api: Option<ApiConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -155,10 +164,8 @@ impl GlobalConfig {
     /// Load and validate a config document from an explicit path, returning
     /// defaults when the file is absent.
     ///
-    /// The global file is only the best-known instance of this shape: a squad
-    /// task may carry its own `config.json` beside its workspace (WI 0110), and
-    /// it goes through this same parse and the same validation, so a task file
-    /// can never accept a value the global file would reject.
+    /// Dynamic settings are validated here for global scope. Task evaluation
+    /// uses [`task_squad_config`] to read only the task's `squad` block.
     pub fn load_path(path: &std::path::Path) -> Result<Self, DataError> {
         if !path.exists() {
             return Ok(Self::default());
@@ -166,6 +173,14 @@ impl GlobalConfig {
         let content = std::fs::read_to_string(path).map_err(|e| DataError::io(path, e))?;
         let mut cfg: Self =
             serde_json::from_str(&content).map_err(|e| DataError::config_parse(path, e))?;
+        cfg.validate_loaded(path)?;
+        Ok(cfg)
+    }
+
+    /// Shared load validation. Also run before every save, so a global edit
+    /// never persists a file that every later command would refuse to load.
+    fn validate_loaded(&mut self, path: &std::path::Path) -> Result<(), DataError> {
+        let cfg = self;
         if let Some(n) = cfg.max_concurrent_agents {
             if n < 1 {
                 return Err(DataError::Other(
@@ -195,6 +210,16 @@ impl GlobalConfig {
                     .map_err(|e| DataError::Other(format!("{}: {e}", path.display())))?,
             );
         }
+        if let Some(dynamic) = cfg.workflows.as_ref().and_then(|w| w.dynamic.as_ref()) {
+            dynamic
+                .validate("workflows.dynamic")
+                .map_err(|e| DataError::Other(format!("{}: {e}", path.display())))?;
+        }
+        if cfg.legacy_dynamic_workflows.is_some() {
+            cfg.load_warnings.push(
+                "`dynamicWorkflows` in ~/.awman/config.json was never read; move what you want to `workflows.dynamic`".into(),
+            );
+        }
         if let Some(prerequisites) = cfg
             .squad
             .as_ref()
@@ -209,7 +234,7 @@ impl GlobalConfig {
                     .map(|w| format!("squad.{w}")),
             );
         }
-        Ok(cfg)
+        Ok(())
     }
 
     /// Persist this config to disk, creating parent directories if needed.
@@ -218,14 +243,15 @@ impl GlobalConfig {
     }
 
     /// Same as [`save`] but reads paths via the supplied env snapshot.
+    ///
+    /// The config is validated as [`GlobalConfig::load_path`] would validate
+    /// it, and nothing is written when that fails.
     pub fn save_with(&self, env: &EnvSnapshot) -> Result<(), DataError> {
         let path = Self::path_with(env)?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| DataError::io(parent, e))?;
-        }
+        self.clone().validate_loaded(&path)?;
         let content = serde_json::to_string_pretty(self)
             .map_err(|e| DataError::ConfigSerialize { source: e })?;
-        std::fs::write(&path, content).map_err(|e| DataError::io(&path, e))
+        crate::data::fs::config_file::write_user_config_file(&path, &content)
     }
 }
 
@@ -241,8 +267,8 @@ impl GlobalConfig {
 /// should say what is wrong with it.
 ///
 /// This lives in the data layer, not beside the gateway, because every input it
-/// touches does: the path comes from [`SquadPaths`], the parse and validation
-/// from [`GlobalConfig::load_path`], and the merge from
+/// touches does: the path comes from [`SquadPaths`], the validation from
+/// [`SquadConfig::validate`], and the merge from
 /// [`SquadConfig::layered_over`]. Only its error type was ever Layer 2, and
 /// that was enough to make the scheduler — Layer 1 — import Layer 2 to reach
 /// it.
@@ -251,9 +277,7 @@ pub fn task_squad_config(
     name: &str,
     global: &SquadConfig,
 ) -> Result<SquadConfig, DataError> {
-    let path = paths.task_config_file(name)?;
-    let document = GlobalConfig::load_path(&path)?;
-    Ok(match document.squad {
+    Ok(match task_own_squad_config(paths, name)? {
         Some(mut task) => {
             // Task files are agent-writable and cannot supply trusted host policy.
             task.workflows = None;
@@ -261,6 +285,35 @@ pub fn task_squad_config(
         }
         None => global.clone(),
     })
+}
+
+/// The task's own validated `squad` block, not layered over anything:
+/// `None` when the file or the block is absent (the task inherits the global
+/// block). Every other block in the task file is ignored, never validated.
+pub fn task_own_squad_config(
+    paths: &SquadPaths,
+    name: &str,
+) -> Result<Option<SquadConfig>, DataError> {
+    let path = paths.task_config_file(name)?;
+    // Task files have their own scope: global dynamic-workflow settings in
+    // other blocks must not affect squad evaluation, including validation.
+    #[derive(Default, Deserialize)]
+    struct TaskConfig {
+        squad: Option<SquadConfig>,
+    }
+    let document: TaskConfig = match std::fs::read_to_string(&path) {
+        Ok(content) => {
+            serde_json::from_str(&content).map_err(|e| DataError::config_parse(&path, e))?
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => TaskConfig::default(),
+        Err(e) => return Err(DataError::io(&path, e)),
+    };
+    if let Some(squad) = &document.squad {
+        squad
+            .validate()
+            .map_err(|e| DataError::Other(format!("{}: {e}", path.display())))?;
+    }
+    Ok(document.squad)
 }
 
 #[cfg(test)]
@@ -283,6 +336,48 @@ mod tests {
     }
 
     #[test]
+    fn global_legacy_dynamic_key_warns_and_is_not_honoured() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = isolated_env(tmp.path());
+        let path = GlobalConfig::path_with(&env).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"dynamicWorkflows":{"defaultLeader":"old::model","maxConcurrentSteps":9}}"#,
+        )
+        .unwrap();
+        let config = GlobalConfig::load_with(&env).unwrap();
+        assert_eq!(config.load_warnings.len(), 1);
+        assert!(
+            config.load_warnings[0].contains("dynamicWorkflows")
+                && config.load_warnings[0].contains("never read"),
+            "{:?}",
+            config.load_warnings
+        );
+        assert!(config.workflows.is_none());
+        assert!(config.legacy_dynamic_workflows.is_some());
+    }
+
+    #[test]
+    fn invalid_global_dynamic_block_load_error_names_config_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = isolated_env(tmp.path());
+        let path = GlobalConfig::path_with(&env).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"workflows":{"dynamic":{"maxConcurrentSteps":0}}}"#,
+        )
+        .unwrap();
+        let err = GlobalConfig::load_with(&env).unwrap_err().to_string();
+        assert!(err.contains(&path.display().to_string()), "{err}");
+        assert!(
+            err.contains("workflows.dynamic.maxConcurrentSteps"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn load_save_load_round_trip_is_byte_stable() {
         let tmp = tempfile::tempdir().unwrap();
         let env = isolated_env(tmp.path());
@@ -295,6 +390,7 @@ mod tests {
             runtime: Some("docker".to_string()),
             yolo_disallowed_tools: Some(vec!["rm".to_string()]),
             legacy_env_passthrough: None,
+            legacy_dynamic_workflows: None,
             builtin: None,
             worktree: None,
             api: Some(ApiConfig {
@@ -570,5 +666,54 @@ mod task_prerequisite_trust_review_tests {
         .unwrap();
         let resolved = task_squad_config(&paths, "fixture", &global).unwrap();
         assert_eq!(resolved.workflows, global.workflows);
+    }
+}
+
+#[cfg(test)]
+mod task_own_squad_config_tests {
+    use super::*;
+
+    #[test]
+    fn other_blocks_in_a_task_file_are_ignored_not_validated() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = SquadPaths::from_root(root.path());
+        let path = paths.task_config_file("fixture").unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        assert!(task_own_squad_config(&paths, "fixture").unwrap().is_none());
+        std::fs::write(
+            &path,
+            r#"{"squad":{"agentsToModels":{"claude":["m"]}},"workflows":{"dynamic":{"maxConcurrentSteps":0}},"maxConcurrentAgents":0}"#,
+        )
+        .unwrap();
+        let squad = task_own_squad_config(&paths, "fixture").unwrap().unwrap();
+        assert_eq!(
+            squad.agents_to_models.unwrap().get("claude"),
+            Some(&vec!["m".to_string()])
+        );
+        std::fs::write(&path, r#"{"workflows":{}}"#).unwrap();
+        assert!(task_own_squad_config(&paths, "fixture").unwrap().is_none());
+    }
+}
+
+#[cfg(test)]
+mod legacy_dynamic_round_trip_tests {
+    use super::*;
+    use crate::data::config::env::AWMAN_CONFIG_HOME;
+
+    #[test]
+    fn a_global_save_keeps_the_never_read_dynamic_workflows_block() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, tmp.path().to_str().unwrap())]);
+        let path = GlobalConfig::path_with(&env).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, r#"{"dynamicWorkflows":{"guidance":["move me"]}}"#).unwrap();
+        let mut cfg = GlobalConfig::load_with(&env).unwrap();
+        cfg.default_agent = Some("claude".into());
+        cfg.save_with(&env).unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved["dynamicWorkflows"]["guidance"][0], "move me");
+        let reloaded = GlobalConfig::load_with(&env).unwrap();
+        assert!(reloaded.workflows.is_none(), "still never honoured");
     }
 }

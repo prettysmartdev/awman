@@ -14,6 +14,8 @@ use crate::data::config::repo::LaunchMode;
 /// Every field is `None` when the user did not pass the corresponding flag.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct FlagConfig {
+    /// `--leader agent::model`, resolved as the dynamic-workflow Flag source.
+    pub leader: Option<String>,
     pub prerequisites: PrerequisiteFlags,
     pub squad_prerequisites: bool,
     pub squad_task_prerequisites: Option<super::workflows::PrerequisitePolicy>,

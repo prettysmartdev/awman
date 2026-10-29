@@ -1221,24 +1221,38 @@ impl App {
                     // value preserved and the reason displayed, so the user
                     // corrects it instead of retyping from scratch.
                     if let Some(rej) = rejected {
-                        let has_row = state.rows.iter().any(|r| r.field == rej.field);
-                        let new_mapping_key = if has_row {
-                            None
-                        } else {
-                            rej.field
-                                .strip_prefix("dynamicWorkflows.agentsToModels.")
-                                .map(str::to_string)
-                        };
-                        if has_row || new_mapping_key.is_some() {
+                        use crate::command::commands::config::ConfigRowShape;
+                        let existing = state.rows.iter().position(|r| r.field == rej.field);
+                        let new_member = state.rows.iter().enumerate().find_map(|(index, row)| {
+                            let member = rej.field.strip_prefix(row.shape.child_prefix()?)?;
+                            if member.is_empty() {
+                                return None;
+                            }
+                            let phase = match row.shape {
+                                ConfigRowShape::MapHeader { .. } => {
+                                    crate::frontend::tui::dialogs::NewMapEntryPhase::Value {
+                                        key: member.to_string(),
+                                    }
+                                }
+                                ConfigRowShape::ListHeader { .. } => {
+                                    crate::frontend::tui::dialogs::NewMapEntryPhase::ListEntry
+                                }
+                                _ => return None,
+                            };
+                            Some((index, phase))
+                        });
+                        if let Some(index) =
+                            existing.or_else(|| new_member.as_ref().map(|(i, _)| *i))
+                        {
+                            state.selected = index;
                             state.error = Some(rej.reason);
                             state.editing = true;
                             state.edit_column = if rej.global { 0 } else { 1 };
                             state.editor.set_text(&rej.value);
-                            // A rejected Ctrl+N mapping has no row yet —
-                            // resume the add flow in its value phase.
-                            state.new_entry = new_mapping_key.map(|key| {
-                                crate::frontend::tui::dialogs::NewMapEntryPhase::Value { key }
-                            });
+                            // A rejected Ctrl+N member has no row yet.
+                            if existing.is_none() {
+                                state.new_entry = new_member.map(|(_, phase)| phase);
+                            }
                         }
                     }
                     Dialog::ConfigShow(state)
@@ -1923,7 +1937,7 @@ mod tests {
             global_writable: false,
             repo_writable: true,
             value_hint: None,
-            shape: crate::command::commands::config::ConfigFieldShape::Scalar,
+            shape: crate::command::commands::config::ConfigRowShape::Scalar,
         }
     }
 
@@ -1960,9 +1974,9 @@ mod tests {
         let mut app = make_app();
         deliver_config_show(
             &mut app,
-            vec![config_show_row("dynamicWorkflows.defaultLeader")],
+            vec![config_show_row("demo.leader")],
             Some(crate::frontend::tui::dialogs::ConfigShowRejectedEdit {
-                field: "dynamicWorkflows.defaultLeader".into(),
+                field: "demo.leader".into(),
                 value: "claude".into(),
                 global: false,
                 reason: "expected agent::model".into(),
@@ -1991,9 +2005,15 @@ mod tests {
         let mut app = make_app();
         deliver_config_show(
             &mut app,
-            vec![config_show_row("agent")],
+            vec![crate::frontend::tui::dialogs::ConfigShowRow {
+                shape: crate::command::commands::config::ConfigRowShape::MapHeader {
+                    child_prefix: "demo.map.",
+                },
+                read_only: true,
+                ..config_show_row("demo.map")
+            }],
             Some(crate::frontend::tui::dialogs::ConfigShowRejectedEdit {
-                field: "dynamicWorkflows.agentsToModels.maki".into(),
+                field: "demo.map.maki".into(),
                 value: "model-a, model-b".into(),
                 global: false,
                 reason: "could not write config".into(),

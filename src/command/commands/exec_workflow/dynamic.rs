@@ -324,7 +324,10 @@ impl ExecWorkflowCommand {
             PrerequisiteStart::CheckOnly(outcome) => return Ok(outcome),
         };
 
-        frontend.with(|frontend| LaunchPolicy::for_session(&self.session).warn_config(frontend));
+        frontend.with(|frontend| {
+            LaunchPolicy::for_session(&self.session)
+                .warn_config(&self.engines.config_notices, frontend)
+        });
 
         // ── Worktree prepare BEFORE launching the leader (WI-0092 §5). ──────
         let remote_clone = base_session.session_type().is_remote();
@@ -489,15 +492,22 @@ impl ExecWorkflowCommand {
         // ── Resolve the leader agent + model (WI-0092 §7). Deliberately after
         //    the resume branch: a resumed run never launches a leader, and must
         //    not be blocked by leader config that has drifted since.
-        let (leader_agent, leader_model) = resolve_leader_model(&self.flags, &self.session)?;
+        //    The dynamic settings (WI 0150) layer the invoking checkout's repo
+        //    config over global config, with `--leader` on top; a worktree's
+        //    copy of the repo config is never consulted.
+        let dynamic = resolve_dynamic_workflows(&base_session, &self.flags)?;
+        let (leader_agent, leader_model) =
+            resolve_leader_model(&self.flags, &self.session, &dynamic)?;
         // A custom leader definition is reviewed before the leader resolves.
-        frontend.with(|frontend| {
-            crate::command::commands::agent_trust::ensure_agent_trusted(
-                &base_session,
-                &leader_agent,
-                frontend,
-            )
-        })?;
+        frontend
+            .with(|frontend| {
+                crate::command::commands::agent_trust::ensure_agent_trusted(
+                    &base_session,
+                    &leader_agent,
+                    frontend,
+                )
+            })
+            .map_err(|e| attribute_leader_error(&dynamic, e))?;
 
         // The work item path the leader sees is inside the mounted checkout.
         let wi_relative = wi_file
@@ -556,41 +566,18 @@ impl ExecWorkflowCommand {
             });
         }
 
-        // ── Resolve the dynamicWorkflows config (WI-0095): the configured
-        //    agent/model listing (validated against discovered Dockerfiles) and
-        //    the concurrency advisory both feed the leader prompt. Validated
-        //    before ensure_agent_image so a misconfigured agentsToModels fails
-        //    before any image build or container work.
-        let dynamic_cfg = base_session.repo_config().dynamic_workflows.clone();
-        let max_concurrent_steps = dynamic_cfg.as_ref().and_then(|d| d.max_concurrent_steps);
-        let configured_agents = dynamic_cfg
-            .as_ref()
-            .and_then(|d| d.agents_to_models.as_ref())
-            .filter(|m| !m.is_empty());
-        let agents_section = if let Some(map) = configured_agents {
-            let mut warnings: Vec<String> = Vec::new();
-            let effective =
-                build_effective_agents_to_models(map, &available_agents, &mut warnings)?;
-            for w in warnings {
-                frontend.write_message(UserMessage {
-                    level: MessageLevel::Warning,
-                    text: w,
-                });
-            }
-            format_agents_with_models(&effective)
-        } else {
-            if dynamic_cfg
-                .as_ref()
-                .and_then(|d| d.agents_to_models.as_ref())
-                .is_some_and(|m| m.is_empty())
-            {
-                tracing::debug!(
-                    "dynamicWorkflows.agentsToModels is an empty map; falling back to \
-                     Dockerfile discovery"
-                );
-            }
-            format_available_agents(&available_agents)
-        };
+        // ── The agent/model listing for the leader prompt (WI-0095, WI 0150
+        //    §2): a repo `agentsToModels` is validated against the discovered
+        //    Dockerfiles (a missing one is an error); a global one skips the
+        //    agents this repo lacks. Done before ensure_agent_image so a
+        //    misconfigured map fails before any image build or container work.
+        let (agents_section, warnings) = agents_section_for_leader(&dynamic, &available_agents)?;
+        for w in warnings {
+            frontend.write_message(UserMessage {
+                level: MessageLevel::Warning,
+                text: w,
+            });
+        }
 
         // ── Ensure the leader image is built. ───────────────────────────────
         ensure_agent_image(
@@ -601,14 +588,16 @@ impl ExecWorkflowCommand {
             &self.session,
             &mut frontend.clone(),
         )
-        .await?;
+        .await
+        .map_err(|e| attribute_leader_error(&dynamic, e))?;
 
+        let guidance = dynamic.guidance_texts();
         let leader_prompt = crate::data::dynamic_workflow_assets::build_leader_prompt(
             &format!("{wi_number:04}"),
             &leader_work_item_path.display().to_string(),
             &agents_section,
-            max_concurrent_steps,
-            dynamic_cfg.as_ref().and_then(|d| d.guidance.as_deref()),
+            dynamic.max_concurrent_steps.as_ref().map(|s| s.value),
+            guidance.as_deref(),
         );
         let leader_prompt = crate::data::dynamic_workflow_assets::substitute_workflow_prerequisites(
             &leader_prompt,

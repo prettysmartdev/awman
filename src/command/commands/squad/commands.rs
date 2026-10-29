@@ -1075,13 +1075,15 @@ fn collect_models_for_agent(
 /// Empty when the task has none (it inherits the global block) — the same
 /// answer the interview's "use the global settings" branch produces.
 fn read_task_agent_pool(name: &str) -> Result<BTreeMap<String, Vec<String>>, CommandError> {
+    // Only the task's own `squad` block: other blocks in a task file are
+    // outside its schema and must not change what the interview accepts.
     let paths = SquadPaths::from_process_env()?;
-    let document = GlobalConfig::load_path(&paths.task_config_file(name)?)?;
-    Ok(document
-        .squad
-        .and_then(|squad| squad.agents_to_models)
-        .map(|map| map.into_iter().collect())
-        .unwrap_or_default())
+    Ok(
+        crate::data::config::global::task_own_squad_config(&paths, name)?
+            .and_then(|squad| squad.agents_to_models)
+            .map(|map| map.into_iter().collect())
+            .unwrap_or_default(),
+    )
 }
 
 /// Collect an edit interactively, prefilled from the task as it stands.

@@ -245,7 +245,7 @@ fn truncate_path_at_exact_width_unchanged() {
 
 #[test]
 fn config_show_truncates_long_cell_and_shows_full_value_in_detail_line() {
-    let field = "dynamicWorkflows.agentsToModels.claude".to_string();
+    let field = "demo.map.claude".to_string();
     let value = "claude-opus-4-8, claude-sonnet-4-6, gemini-2.5-pro".to_string();
     let state = dialogs::ConfigShowState {
         rows: vec![dialogs::ConfigShowRow {
@@ -257,7 +257,7 @@ fn config_show_truncates_long_cell_and_shows_full_value_in_detail_line() {
             global_writable: false,
             repo_writable: true,
             value_hint: None,
-            shape: crate::command::commands::config::ConfigFieldShape::Scalar,
+            shape: crate::command::commands::config::ConfigRowShape::Scalar,
         }],
         selected: 0,
         editing: false,
@@ -296,7 +296,7 @@ fn config_show_truncates_long_cell_and_shows_full_value_in_detail_line() {
 
 #[test]
 fn config_show_scrolls_to_reveal_rows_past_the_visible_window() {
-    // Reproduces the bug where dynamicWorkflows.agentsToModels rows (WI-0095),
+    // Reproduces the bug where demo.map rows (WI-0095),
     // appended after ~20 other config rows, fell past the visible table
     // height and were never rendered — the Table widget always started
     // from row 0 with no scroll offset tied to `selected`.
@@ -311,7 +311,7 @@ fn config_show_scrolls_to_reveal_rows_past_the_visible_window() {
                 global_writable: true,
                 repo_writable: true,
                 value_hint: None,
-                shape: crate::command::commands::config::ConfigFieldShape::Scalar,
+                shape: crate::command::commands::config::ConfigRowShape::Scalar,
             })
             .collect();
         rows.push(dialogs::ConfigShowRow {
@@ -323,11 +323,11 @@ fn config_show_scrolls_to_reveal_rows_past_the_visible_window() {
             global_writable: false,
             repo_writable: true,
             value_hint: None,
-            shape: crate::command::commands::config::ConfigFieldShape::Scalar,
+            shape: crate::command::commands::config::ConfigRowShape::Scalar,
         });
         rows
     }
-    let target_field = "dynamicWorkflows.agentsToModels.claude".to_string();
+    let target_field = "demo.map.claude".to_string();
     let last_index = build_rows(&target_field).len() - 1;
 
     // Short terminal: fewer visible table rows than total rows, so the
@@ -417,7 +417,7 @@ fn config_show_editing_long_value_keeps_cursor_visible_in_cell() {
             global_writable: true,
             repo_writable: true,
             value_hint: None,
-            shape: crate::command::commands::config::ConfigFieldShape::Scalar,
+            shape: crate::command::commands::config::ConfigRowShape::Scalar,
         }],
         selected: 0,
         editing: true,
@@ -453,14 +453,26 @@ fn config_show_add_mapping_prompts_render_per_phase() {
         render_config_show(&key_phase, area, frame);
     }));
     assert!(
-        text.contains("agent name: maki|"),
+        text.contains("(repo) \u{2014} agent name: maki|"),
         "key phase must prompt for the agent name with a cursor:\n{text}"
     );
 
     let mut editor = crate::frontend::tui::text_edit::TextEdit::new(false);
     editor.set_text("model-a");
     let value_phase = dialogs::ConfigShowState {
-        rows: vec![],
+        rows: vec![dialogs::ConfigShowRow {
+            field: "demo.map".into(),
+            global: String::new(),
+            repo: String::new(),
+            effective: String::new(),
+            read_only: true,
+            global_writable: false,
+            repo_writable: false,
+            value_hint: None,
+            shape: crate::command::commands::config::ConfigRowShape::MapHeader {
+                child_prefix: "demo.map.",
+            },
+        }],
         selected: 0,
         editing: true,
         edit_column: 1,
@@ -472,14 +484,15 @@ fn config_show_add_mapping_prompts_render_per_phase() {
         render_config_show(&value_phase, area, frame);
     }));
     assert!(
-        text.contains("dynamicWorkflows.agentsToModels.maki = model-a|"),
+        text.contains("demo.map.maki (repo) = model-a|"),
         "value phase must show the pending field and model list:\n{text}"
     );
 }
 
 #[test]
-fn config_show_ctrl_n_hint_only_on_agents_to_models_rows() {
-    fn browse_state(field: &str) -> dialogs::ConfigShowState {
+fn config_show_ctrl_n_hint_only_on_map_and_list_rows() {
+    use crate::command::commands::config::ConfigRowShape;
+    fn browse_state(field: &str, shape: ConfigRowShape) -> dialogs::ConfigShowState {
         dialogs::ConfigShowState {
             rows: vec![dialogs::ConfigShowRow {
                 field: field.to_string(),
@@ -490,7 +503,7 @@ fn config_show_ctrl_n_hint_only_on_agents_to_models_rows() {
                 global_writable: false,
                 repo_writable: true,
                 value_hint: None,
-                shape: crate::command::commands::config::ConfigFieldShape::Scalar,
+                shape,
             }],
             selected: 0,
             editing: false,
@@ -502,20 +515,24 @@ fn config_show_ctrl_n_hint_only_on_agents_to_models_rows() {
     }
 
     let unrelated = buffer_text(&render_to_buffer(140, 30, |area, frame| {
-        render_config_show(&browse_state("agent"), area, frame);
+        render_config_show(&browse_state("agent", ConfigRowShape::Scalar), area, frame);
     }));
     assert!(
         !unrelated.contains("Ctrl+N"),
-        "the add-mapping hint must not show on rows unrelated to \
-         agentsToModels:\n{unrelated}"
+        "the add-entry hint must not show on scalar rows:\n{unrelated}"
     );
 
-    for field in [
-        "dynamicWorkflows.agentsToModels",
-        "dynamicWorkflows.agentsToModels.claude",
+    for (field, shape) in [
+        (
+            "demo.map",
+            ConfigRowShape::MapHeader {
+                child_prefix: "demo.map.",
+            },
+        ),
+        ("demo.map.claude", ConfigRowShape::MapEntry),
     ] {
         let mapping = buffer_text(&render_to_buffer(140, 30, |area, frame| {
-            render_config_show(&browse_state(field), area, frame);
+            render_config_show(&browse_state(field, shape), area, frame);
         }));
         assert!(
             mapping.contains("Ctrl+N"),
@@ -530,7 +547,7 @@ fn config_show_renders_rejection_reason_over_format_hint() {
     editor.set_text("claude");
     let state = dialogs::ConfigShowState {
         rows: vec![dialogs::ConfigShowRow {
-            field: "dynamicWorkflows.defaultLeader".to_string(),
+            field: "demo.leader".to_string(),
             global: String::new(),
             repo: String::new(),
             effective: String::new(),
@@ -538,7 +555,7 @@ fn config_show_renders_rejection_reason_over_format_hint() {
             global_writable: false,
             repo_writable: true,
             value_hint: Some("agent::model".to_string()),
-            shape: crate::command::commands::config::ConfigFieldShape::Scalar,
+            shape: crate::command::commands::config::ConfigRowShape::Scalar,
         }],
         selected: 0,
         editing: true,
@@ -726,4 +743,144 @@ fn command_box_scroll_offset_zero_width_does_not_underflow() {
     assert_eq!(command_box_scroll_offset(0, 0), 1);
     assert_eq!(command_box_scroll_offset(5, 0), 6);
     assert_eq!(5usize.saturating_sub(command_box_scroll_offset(5, 0)), 0);
+}
+
+// ─── Shape-driven rows in both scope views (WI 0150) ────────────────────────
+
+fn shaped_state(edit_column: usize, selected: usize) -> dialogs::ConfigShowState {
+    use crate::command::commands::config::ConfigRowShape as Shape;
+    let row =
+        |field: &str, shape: Shape, global: &str, repo: &str, effective: &str, header: bool| {
+            dialogs::ConfigShowRow {
+                field: field.into(),
+                global: global.into(),
+                repo: repo.into(),
+                effective: effective.into(),
+                read_only: header,
+                global_writable: !header,
+                repo_writable: !header,
+                value_hint: header.then(|| "press Ctrl+N to add".to_string()),
+                shape,
+            }
+        };
+    dialogs::ConfigShowState {
+        rows: vec![
+            row(
+                "demo.map",
+                Shape::MapHeader {
+                    child_prefix: "demo.map.",
+                },
+                "1 agent mapped",
+                "(none)",
+                "global map",
+                true,
+            ),
+            row(
+                "demo.map.alpha",
+                Shape::MapEntry,
+                "m1, m2",
+                "",
+                "m1, m2",
+                false,
+            ),
+            row(
+                "demo.list",
+                Shape::ListHeader {
+                    child_prefix: "demo.list.",
+                },
+                "1 entry",
+                "1 entry",
+                "1 global + 1 repo entries",
+                true,
+            ),
+            row(
+                "demo.list.0",
+                Shape::ListEntry,
+                "global note",
+                "repo note",
+                "",
+                false,
+            ),
+            row("demo.scalar", Shape::Scalar, "g", "r", "r", false),
+        ],
+        selected,
+        editing: false,
+        edit_column,
+        editor: crate::frontend::tui::text_edit::TextEdit::new(false),
+        error: None,
+        new_entry: None,
+    }
+}
+
+#[test]
+fn config_show_renders_map_list_and_scalar_rows_for_both_scopes() {
+    for column in [0, 1] {
+        let text = buffer_text(&render_to_buffer(140, 30, |area, frame| {
+            render_config_show(&shaped_state(column, 0), area, frame);
+        }));
+        for needle in [
+            "demo.map",
+            "demo.map.alpha",
+            "demo.list",
+            "demo.list.0",
+            "demo.scalar",
+            "global note",
+            "repo note",
+            "1 global + 1 repo entries",
+        ] {
+            assert!(
+                text.contains(needle),
+                "column {column} lacks {needle}:\n{text}"
+            );
+        }
+    }
+}
+
+#[test]
+fn config_show_detail_line_follows_the_selected_scope_column() {
+    // List member row (index 3): the detail pane shows the focused column.
+    let global_view = buffer_text(&render_to_buffer(140, 30, |area, frame| {
+        render_config_show(&shaped_state(0, 3), area, frame);
+    }));
+    assert!(
+        global_view.contains("demo.list.0 = global note"),
+        "global view detail:\n{global_view}"
+    );
+    let repo_view = buffer_text(&render_to_buffer(140, 30, |area, frame| {
+        render_config_show(&shaped_state(1, 3), area, frame);
+    }));
+    assert!(
+        repo_view.contains("demo.list.0 = repo note"),
+        "repo view detail:\n{repo_view}"
+    );
+}
+
+#[test]
+fn config_show_ctrl_n_hint_follows_the_row_shape_in_the_global_view() {
+    // Header and member rows of a map or list offer Ctrl+N; a scalar does not,
+    // whichever scope column is focused.
+    for column in [0, 1] {
+        for (selected, expect) in [(0, true), (1, true), (2, true), (3, true), (4, false)] {
+            let text = buffer_text(&render_to_buffer(140, 30, |area, frame| {
+                render_config_show(&shaped_state(column, selected), area, frame);
+            }));
+            assert_eq!(
+                text.contains("Ctrl+N"),
+                expect,
+                "column {column}, row {selected}:\n{text}"
+            );
+        }
+    }
+}
+
+#[test]
+fn config_show_add_value_prompt_uses_the_header_prefix_in_the_global_view() {
+    let mut state = shaped_state(0, 0);
+    state.editing = true;
+    state.editor.set_text("model-a");
+    state.new_entry = Some(dialogs::NewMapEntryPhase::Value { key: "maki".into() });
+    let text = buffer_text(&render_to_buffer(140, 30, |area, frame| {
+        render_config_show(&state, area, frame);
+    }));
+    assert!(text.contains("demo.map.maki (global) = model-a|"), "{text}");
 }

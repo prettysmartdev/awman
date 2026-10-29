@@ -13,6 +13,8 @@
 
 pub mod api;
 pub mod cli;
+#[cfg(test)]
+mod field_name_literals_tests;
 pub mod render_helpers;
 pub mod squad;
 pub mod tui;

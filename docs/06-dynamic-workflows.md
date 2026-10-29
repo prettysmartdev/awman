@@ -60,7 +60,7 @@ Dynamic workflows also run in [remote API sessions](09-api-and-remote-mode.md#cr
 
 ## Choosing the leader agent
 
-By default, the leader uses whatever agent is configured as the project default (from `.awman/config.json` or `~/.awman/config.json`), unless `dynamicWorkflows.defaultLeader` is set (see [Configuring dynamic workflows](#configuring-dynamic-workflows) below). You can override this per invocation in two ways:
+By default, the leader uses whatever agent is configured as the project default (from `.awman/config.json` or `~/.awman/config.json`), unless `workflows.dynamic.defaultLeader` is set (see [Configuring dynamic workflows](#configuring-dynamic-workflows) below). You can override this per invocation in two ways:
 
 **`--leader agent::model`** — specify both the agent container and model for the leader:
 
@@ -91,9 +91,10 @@ claude::opus::extra           # invalid — too many components
 When more than one source could determine the leader, awman applies this precedence:
 
 1. `--leader agent::model` on the command line
-2. `dynamicWorkflows.defaultLeader` in `.awman/config.json`
-3. `--model`, applied to the project's default agent
-4. No override — the project's default agent and model
+2. `workflows.dynamic.defaultLeader` in repo config
+3. `workflows.dynamic.defaultLeader` in global config
+4. `--model`, applied to the project's default agent
+5. No override — the project's default agent and model
 
 `defaultLeader` governs both the leader's agent and model. A separate `--model` flag continues to set the session-level default model for the *generated workflow's* steps, but it does not override the model half of `defaultLeader`.
 
@@ -101,21 +102,23 @@ When more than one source could determine the leader, awman applies this precede
 
 ## Configuring dynamic workflows
 
-Add a `dynamicWorkflows` section to `.awman/config.json` to pin which agents and models the leader may schedule, cap how many steps run concurrently, and set a repo-wide default leader — all shared with your team via version control instead of passed as flags on every run.
+Add a `workflows.dynamic` block to either `.awman/config.json` or `~/.awman/config.json` to configure which agents and models the leader may schedule, cap how many steps run concurrently, set a default leader, and provide guidance.
 
 ```json
 {
-  "dynamicWorkflows": {
-    "agentsToModels": {
-      "claude": ["claude-opus-4-8", "claude-sonnet-4-6"],
-      "codex": ["codex-mini-latest"]
-    },
-    "maxConcurrentSteps": 3,
-    "defaultLeader": "claude::claude-opus-4-8",
-    "guidance": [
-      "Never spawn more than two agents in parallel.",
-      "Always include a validation step after each implementation step."
-    ]
+  "workflows": {
+    "dynamic": {
+      "agentsToModels": {
+        "claude": ["claude-opus-4-8", "claude-sonnet-4-6"],
+        "codex": ["codex-mini-latest"]
+      },
+      "maxConcurrentSteps": 3,
+      "defaultLeader": "claude::claude-opus-4-8",
+      "guidance": [
+        "Never spawn more than two agents in parallel.",
+        "Always include a validation step after each implementation step."
+      ]
+    }
   }
 }
 ```
@@ -124,18 +127,26 @@ All four fields are optional and independent.
 
 ### `agentsToModels`
 
-Restricts the leader to a known, approved set of agents and models instead of everything discovered from `.awman/Dockerfile.<agent>` files. When set and non-empty, this list — not Dockerfile discovery — is what the leader prompt's "Available Agents and Models" section shows, so the leader only schedules steps against agents and models your team has vetted.
+Restricts the leader to a known, approved set of agents and models instead of everything discovered from `.awman/Dockerfile.<agent>` files. When set and non-empty, this list — not Dockerfile discovery — is what the leader prompt's "Available Agents and Models" section shows, so the leader only schedules steps against agents and models your team has vetted. A non-empty repo map replaces the global map.
 
-- Every key must name an agent that has a `.awman/Dockerfile.<agent>` in the project. If any configured agent has no matching Dockerfile, the workflow fails immediately, before any container is spawned:
+- Every repo-map key must name an agent that has a `.awman/Dockerfile.<agent>` in the project. If any configured repo agent has no matching Dockerfile, the workflow fails immediately, before any container is spawned:
 
   ```
-  Error: dynamicWorkflows.agentsToModels references agents that have no Dockerfile in this repo: [foo, bar].
+  Error: workflows.dynamic.agentsToModels references agents that have no Dockerfile in this repo: [foo, bar].
   Available agents: [claude, codex, gemini].
   Add a .awman/Dockerfile.<agent> for each missing agent, or remove it from agentsToModels.
   ```
 
+- Global maps apply across projects, so a global entry without a matching Dockerfile in the current repo is skipped with a warning instead, and the workflow continues with the remaining entries:
+
+  ```
+  global workflows.dynamic.agentsToModels: skipping 'foo' — no Dockerfile in this repo
+  ```
+
+  If no global entry has a Dockerfile, awman falls back to Dockerfile discovery.
+
 - Agent name matching is case-insensitive as a compatibility aid (`"Claude"` matches a `claude` Dockerfile), but the workflow always uses the lowercase agent name, and a warning is shown when a match only succeeds after case folding. Two configured keys that fold to the same agent (e.g. `"Claude"` and `"claude"`) is a configuration error, since awman won't guess which model list should win.
-- An empty map (`{}`) is treated the same as omitting the field — the leader falls back to Dockerfile discovery.
+- An empty repo map (`{}`) is treated the same as omitting it and falls through to the global map. A repo that wants to use only its own agents instead of inheriting a global map must set a non-empty repo map listing the agents and models it allows.
 - Each agent's model list must be non-empty, and no model name may be empty or whitespace-only; both are rejected when the config is loaded.
 
 ### `maxConcurrentSteps`
@@ -143,7 +154,8 @@ Restricts the leader to a known, approved set of agents and models instead of ev
 An advisory cap the leader is told to plan around:
 
 ```
-Note: the repository configuration advises a maximum of 3 concurrent steps. Plan your workflow accordingly.
+Maximum concurrent steps advised: 3. Plan parallelism
+accordingly.
 ```
 
 This is advisory only — awman does not enforce it in the workflow scheduler. It is a hint the leader agent uses when deciding how much of the workflow to run in parallel via `depends_on`. Must be `>= 1` if set; `0` is rejected when the config is loaded, since it would deadlock any workflow.
@@ -152,7 +164,7 @@ Don't confuse this with [`maxConcurrentAgents`](07-configuration.md#reference), 
 
 ### `defaultLeader`
 
-Sets the repo-wide default leader agent and model, in the same `agent::model` format as `--leader` (see [Leader resolution order](#leader-resolution-order) above). Rejected at config-load time if the format is invalid, if either component is empty or has surrounding whitespace, or if the agent component isn't a valid agent name.
+Sets the default leader agent and model, in the same `agent::model` format as `--leader` (see [Leader resolution order](#leader-resolution-order) above). A repo value takes precedence over a global value. Rejected at config-load time if the format is invalid, if either component is empty or has surrounding whitespace, or if the agent component isn't a valid agent name.
 
 ### `guidance`
 
@@ -166,43 +178,56 @@ You MUST follow these project-specific instructions when building the workflow:
 ```
 
 - Omitting the field, or leaving it an empty array (`[]`), skips the block entirely — the leader prompt is unchanged.
-- Each entry is capped at 1,000 characters and the array at 50 entries, since every entry is injected verbatim into the leader's prompt. Both caps are enforced when the config is loaded.
+- Each entry is capped at 1,000 characters, and each config file may list at most 50 entries; both are checked when the config is loaded. The combined global and repo list is also limited to 50 entries after duplicate entries are dropped. That limit is checked when the leader prompt is built (before the leader starts) and shown in `awman config show`; the error names both counts, so you can trim either file.
+- An entry identical, after trimming whitespace, to an earlier one is dropped, including a repeat within the same file.
 - Whitespace-only entries are rejected when the config is loaded.
 - Each entry is rendered as exactly one bullet — any newlines inside an entry are flattened to spaces so a multi-line entry can't break the bullet list.
 
 ### Managing this config
 
-`dynamicWorkflows.defaultLeader` and `dynamicWorkflows.maxConcurrentSteps` are editable with `awman config set` / the TUI config dialog like any other repo field:
+`workflows.dynamic.defaultLeader` and `workflows.dynamic.maxConcurrentSteps` are editable with `awman config set` / the TUI config dialog:
 
 ```sh
-awman config set dynamicWorkflows.defaultLeader claude::claude-opus-4-8
-awman config set dynamicWorkflows.maxConcurrentSteps 3
+awman config set workflows.dynamic.defaultLeader claude::claude-opus-4-8
+awman config set workflows.dynamic.maxConcurrentSteps 3
 ```
 
 `agentsToModels` is managed one agent at a time. On the command line, set an agent's comma-separated model list (or clear it with an empty value):
 
 ```sh
-awman config set dynamicWorkflows.agentsToModels.claude "claude-opus-4-8, claude-sonnet-4-6"
-awman config set dynamicWorkflows.agentsToModels.claude ""   # remove the mapping
+awman config set workflows.dynamic.agentsToModels.claude "claude-opus-4-8, claude-sonnet-4-6"
+awman config set workflows.dynamic.agentsToModels.claude ""   # remove the mapping
 ```
 
-In `awman config show` and the TUI config dialog, the map appears as a summary row plus one editable row per agent (`dynamicWorkflows.agentsToModels.<agentName>`); in the TUI, **Ctrl+N** adds a new mapping and per-agent rows are edited inline — see [Using the TUI](02-using-the-tui.md#agentmodel-mappings-dynamicworkflowsagentstomodels). See [Configuration](07-configuration.md#reference) for the full field reference.
+In `awman config show` and the TUI config dialog, the map appears as a summary row plus one editable row per agent (`workflows.dynamic.agentsToModels.<agentName>`); in the TUI, **Ctrl+N** adds a new mapping and per-agent rows are edited inline — see [Using the TUI](02-using-the-tui.md#agentmodel-mappings-workflowsdynamicagentstomodels). See [Configuration](07-configuration.md#reference) for the full field reference.
 
 `guidance` is managed one entry at a time, addressed by index on the command line:
 
 ```sh
-awman config set dynamicWorkflows.guidance.0 "Never spawn more than two agents in parallel."
-awman config set dynamicWorkflows.guidance.1 "Always include a validation step after each implementation step."
-awman config set dynamicWorkflows.guidance.0 ""   # remove entry 0; remaining entries shift down and re-index
+awman config set workflows.dynamic.guidance.0 "Never spawn more than two agents in parallel."
+awman config set workflows.dynamic.guidance.1 "Always include a validation step after each implementation step."
+awman config set workflows.dynamic.guidance.0 ""   # remove entry 0; remaining entries shift down and re-index
 ```
 
-In `awman config show` and the TUI config dialog, the list appears as a summary row (`dynamicWorkflows.guidance`, showing the entry count or `(none)`) plus one editable row per entry (`dynamicWorkflows.guidance.<index>`). In the TUI:
+In `awman config show` and the TUI config dialog, the list appears as a summary row (`workflows.dynamic.guidance`, showing the entry count or `(none)`) plus one editable row per entry (`workflows.dynamic.guidance.<index>`). In the TUI:
 
 - **Ctrl+N** while a guidance row is selected appends a new entry — you only type the instruction text, since the index is assigned automatically.
 - Existing entries are edited inline like any other field.
 - Saving an **empty** value on an entry row removes it; remaining entries re-index automatically.
 
-See [Using the TUI](02-using-the-tui.md#developer-guidance-list-dynamicworkflowsguidance) for the walkthrough and [Configuration](07-configuration.md#reference) for the full field reference.
+See [Using the TUI](02-using-the-tui.md#developer-guidance-list-workflowsdynamicguidance) for the walkthrough and [Configuration](07-configuration.md#reference) for the full field reference.
+
+### Global and repo settings
+
+Both the global config and repo config can set `workflows.dynamic`. For `agentsToModels`, a repo map replaces the global map. If the repo map is `{}`, it falls through to the global map; a repo that wants Dockerfile discovery must set an explicit non-empty map of its own agents. A global map can list agents for many projects: entries whose agent has no Dockerfile in the current repo are skipped with a warning. If every global entry is skipped, awman falls back to Dockerfile discovery.
+
+Guidance from the global and repo lists is combined in that order, with duplicate entries dropped. The combined list can contain at most 50 entries. The repo can add project-specific instructions while inheriting the global guidance.
+
+The scalar fields `defaultLeader` and `maxConcurrentSteps` use the repo value when set, then the global value. A repo `defaultLeader` takes precedence over a global one, which is why leader resolution checks the global setting after repo config.
+
+### Upgrading from `dynamicWorkflows`
+
+The older repo key `dynamicWorkflows` is still accepted as an alias. Run `awman config migrate` to move it to `workflows.dynamic`; saving repo config (for example with `config set` or the TUI dialog) also moves it automatically. Older awman versions do not read `workflows.dynamic`, so teammates using an older version will stop seeing these settings after the migrated config is committed. The old global key was never read; move any desired settings into the global `workflows.dynamic` block yourself.
 
 ---
 
@@ -385,18 +410,18 @@ Dynamic mode always enforces `--yolo`, `--worktree`, and `--overlay context(work
 | Leader becomes unstuck during yolo countdown | Countdown cancelled; leader continues running normally |
 | `--leader` and `--model` both set | `--leader` controls the leader's agent and model; `--model` applies to the generated workflow's steps |
 | Context directory already contains a `workflow.toml` from a previous run | Deleted before the leader launches; stale files are never executed |
-| `dynamicWorkflows.agentsToModels` references an agent with no matching Dockerfile | Hard error before any container is spawned; lists the missing agents and the available ones |
-| `dynamicWorkflows.agentsToModels` is `{}` (empty map) | Treated as if unset; falls back to Dockerfile discovery |
-| `dynamicWorkflows.agentsToModels` key matches a Dockerfile only after case folding | Workflow proceeds using the lowercase agent name; a warning is shown |
-| Two `dynamicWorkflows.agentsToModels` keys fold to the same agent (e.g. `"Claude"` and `"claude"`) | Error at workflow start, before any container is spawned; ambiguous model lists are never merged |
-| `dynamicWorkflows.maxConcurrentSteps` is `0` | Rejected when the config is loaded — awman never starts with this value |
-| `dynamicWorkflows.defaultLeader` is malformed | Rejected when the config is loaded, before any UI or workflow starts |
-| `--leader` and `dynamicWorkflows.defaultLeader` both set | `--leader` wins |
-| `--model` and `dynamicWorkflows.defaultLeader` both set, no `--leader` | `defaultLeader` controls the leader's model; `--model` still applies to the generated workflow's steps |
-| `dynamicWorkflows.guidance` is `[]` (empty array) | Treated as if unset; no guidance block is injected into the leader prompt |
-| A `dynamicWorkflows.guidance` entry exceeds 1,000 characters | Rejected when the config is loaded |
-| `dynamicWorkflows.guidance` has more than 50 entries | Rejected when the config is loaded |
-| A `dynamicWorkflows.guidance` entry is empty or whitespace-only | Rejected when the config is loaded |
+| `workflows.dynamic.agentsToModels` references a repo agent with no matching Dockerfile | Hard error before any container is spawned; global agents without a Dockerfile in this repo are skipped with a warning |
+| Repo `workflows.dynamic.agentsToModels` is `{}` (empty map) | Falls through to the global map; set an explicit repo map to use only this repo's Dockerfile discovery |
+| `workflows.dynamic.agentsToModels` key matches a Dockerfile only after case folding | Workflow proceeds using the lowercase agent name; a warning is shown |
+| Two `workflows.dynamic.agentsToModels` keys fold to the same agent (e.g. `"Claude"` and `"claude"`) | Error at workflow start, before any container is spawned; ambiguous model lists are never merged |
+| `workflows.dynamic.maxConcurrentSteps` is `0` | Rejected when the config is loaded — awman never starts with this value |
+| `workflows.dynamic.defaultLeader` is malformed | Rejected when the config is loaded, before any UI or workflow starts |
+| `--leader` and `workflows.dynamic.defaultLeader` both set | `--leader` wins |
+| `--model` and `workflows.dynamic.defaultLeader` both set, no `--leader` | `defaultLeader` controls the leader's model; `--model` still applies to the generated workflow's steps |
+| Global and repo `workflows.dynamic.guidance` both set | Lists concatenate global first, repo second, with duplicates dropped; the combined list is limited to 50 entries |
+| Both `workflows.dynamic.guidance` lists are empty | No guidance block is injected into the leader prompt |
+| A `workflows.dynamic.guidance` entry exceeds 1,000 characters | Rejected when the config is loaded |
+| A `workflows.dynamic.guidance` entry is empty or whitespace-only | Rejected when the config is loaded |
 
 ---
 

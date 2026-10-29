@@ -35,6 +35,7 @@ fn make_app_state(root: &std::path::Path, auth: AuthMode) -> Arc<AppState> {
     let workflow_state_store = Arc::new(WorkflowStateStore::at_git_root(paths.root()));
 
     let engines = Engines {
+        config_notices: Default::default(),
         runtime: runtime.clone(),
         container_runtime: Some(runtime),
         sandbox_runtime: None,

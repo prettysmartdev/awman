@@ -201,6 +201,23 @@ Runs without a working agent runtime — reachable even when the configured runt
 |---|---|---|---|---|---|---|
 | `--global` | bool | false | — | — | CLI, TUI, API | Write to global config instead of repo config. |
 
+### `awman config migrate`
+
+Move settings awman has renamed to their current keys in the repo config, after confirmation.
+
+Runs every known config migration for the chosen scope. Today that is one: `dynamicWorkflows` moves to `workflows.dynamic`. Shows the before/after JSON and asks first; teammates on awman versions before this release stop seeing migrated settings once the change is committed.
+
+Available via: CLI, TUI
+
+Runs without a working agent runtime — reachable even when the configured runtime cannot be started on this host.
+
+| Flag | Kind | Default | Implies | Conflicts | Frontends | Help |
+|---|---|---|---|---|---|---|
+| `-y, --yes` | bool | false | — | — | CLI, TUI, API | Skip the confirmation prompt (for scripting). |
+| `--dry-run` | bool | false | — | — | CLI, TUI, API | Show what would change without writing anything. |
+| `--global` | bool | false | — | — | CLI, TUI, API | Migrate the global config instead of the repo config. |
+| `-n, --non-interactive` | bool | false | — | — | CLI, TUI, API | Never prompt: refuse instead of asking for confirmation (pass --yes to proceed). |
+
 ### `awman config prerequisite-grants`
 
 List or revoke remembered workflow prerequisite decisions (SSH key, token variable).

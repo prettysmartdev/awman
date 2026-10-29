@@ -2103,7 +2103,12 @@ fn resolve_leader_model_with_leader_flag_uses_spec_agent_and_model() {
         None,
     );
     flags.agent = None;
-    let (agent, model) = resolve_leader_model(&flags, &session).unwrap();
+    let (agent, model) = resolve_leader_model(
+        &flags,
+        &session,
+        &resolve_dynamic_workflows(&session, &flags).unwrap(),
+    )
+    .unwrap();
     assert_eq!(agent.as_str(), "claude");
     assert_eq!(model.as_deref(), Some("claude-opus-4-8"));
 }
@@ -2122,7 +2127,12 @@ fn resolve_leader_model_with_leader_flag_ignores_flags_model() {
         Some("some-other-model"),
     );
     flags.agent = None;
-    let (_agent, model) = resolve_leader_model(&flags, &session).unwrap();
+    let (_agent, model) = resolve_leader_model(
+        &flags,
+        &session,
+        &resolve_dynamic_workflows(&session, &flags).unwrap(),
+    )
+    .unwrap();
     assert_eq!(
         model.as_deref(),
         Some("claude-opus-4-8"),
@@ -2136,7 +2146,12 @@ fn resolve_leader_model_with_model_flag_no_leader_passes_model() {
     let tmp = tempfile::tempdir().unwrap();
     let session = make_session_with_agent(&tmp, "cline");
     let flags = make_dynamic_flags(true, None, Some("0042"), None, false, Some("custom-model"));
-    let (_agent, model) = resolve_leader_model(&flags, &session).unwrap();
+    let (_agent, model) = resolve_leader_model(
+        &flags,
+        &session,
+        &resolve_dynamic_workflows(&session, &flags).unwrap(),
+    )
+    .unwrap();
     assert_eq!(
         model.as_deref(),
         Some("custom-model"),
@@ -2150,7 +2165,12 @@ fn resolve_leader_model_with_neither_flag_model_is_none() {
     let tmp = tempfile::tempdir().unwrap();
     let session = make_session_simple(&tmp);
     let flags = make_dynamic_flags(true, None, Some("0042"), None, false, None);
-    let (_agent, model) = resolve_leader_model(&flags, &session).unwrap();
+    let (_agent, model) = resolve_leader_model(
+        &flags,
+        &session,
+        &resolve_dynamic_workflows(&session, &flags).unwrap(),
+    )
+    .unwrap();
     assert!(
         model.is_none(),
         "model must be None when neither --leader nor --model is set"
@@ -2170,7 +2190,12 @@ fn resolve_leader_model_both_flags_leader_model_wins() {
         false,
         Some("should-be-ignored-for-leader"),
     );
-    let (_agent, model) = resolve_leader_model(&flags, &session).unwrap();
+    let (_agent, model) = resolve_leader_model(
+        &flags,
+        &session,
+        &resolve_dynamic_workflows(&session, &flags).unwrap(),
+    )
+    .unwrap();
     assert_eq!(
         model.as_deref(),
         Some("claude-opus-4-8"),
@@ -2186,7 +2211,12 @@ fn resolve_leader_model_uses_default_leader_from_config_when_flag_absent() {
     let session = make_session_with_default_leader(&tmp, "codex::codex-mini-latest");
     let flags = make_dynamic_flags(true, None, Some("0042"), None, false, None);
 
-    let (agent, model) = resolve_leader_model(&flags, &session).unwrap();
+    let (agent, model) = resolve_leader_model(
+        &flags,
+        &session,
+        &resolve_dynamic_workflows(&session, &flags).unwrap(),
+    )
+    .unwrap();
     assert_eq!(agent.as_str(), "codex");
     assert_eq!(model.as_deref(), Some("codex-mini-latest"));
 }
@@ -2204,7 +2234,12 @@ fn resolve_leader_model_leader_flag_wins_over_default_leader_config() {
         None,
     );
 
-    let (agent, model) = resolve_leader_model(&flags, &session).unwrap();
+    let (agent, model) = resolve_leader_model(
+        &flags,
+        &session,
+        &resolve_dynamic_workflows(&session, &flags).unwrap(),
+    )
+    .unwrap();
     assert_eq!(
         agent.as_str(),
         "claude",
@@ -2226,7 +2261,12 @@ fn resolve_leader_model_default_leader_config_not_overridden_by_model_flag() {
         Some("should-be-ignored"),
     );
 
-    let (agent, model) = resolve_leader_model(&flags, &session).unwrap();
+    let (agent, model) = resolve_leader_model(
+        &flags,
+        &session,
+        &resolve_dynamic_workflows(&session, &flags).unwrap(),
+    )
+    .unwrap();
     assert_eq!(agent.as_str(), "codex");
     assert_eq!(
         model.as_deref(),
@@ -2244,7 +2284,12 @@ fn resolve_leader_model_no_flag_no_config_falls_back_to_default_agent() {
     let session = make_session_simple(&tmp);
     let flags = make_dynamic_flags(true, None, Some("0042"), None, false, None);
 
-    let (_agent, model) = resolve_leader_model(&flags, &session).unwrap();
+    let (_agent, model) = resolve_leader_model(
+        &flags,
+        &session,
+        &resolve_dynamic_workflows(&session, &flags).unwrap(),
+    )
+    .unwrap();
     assert!(
         model.is_none(),
         "with no --leader, no defaultLeader, and no --model, model must be None"
@@ -2446,8 +2491,14 @@ fn build_effective_agents_to_models_all_match_succeeds() {
     let available = agent_dockerfiles(&["claude", "codex"]);
     let mut warnings = Vec::new();
 
-    let effective =
-        build_effective_agents_to_models(&configured, &available, &mut warnings).unwrap();
+    let effective = build_effective_agents_to_models(
+        &configured,
+        &available,
+        MissingDockerfilePolicy::Fail,
+        "workflows.dynamic.agentsToModels",
+        &mut warnings,
+    )
+    .unwrap();
 
     assert_eq!(effective.len(), 2);
     assert_eq!(
@@ -2465,7 +2516,14 @@ fn build_effective_agents_to_models_partial_mismatch_error_lists_only_missing() 
     let available = agent_dockerfiles(&["claude", "codex"]);
     let mut warnings = Vec::new();
 
-    let err = build_effective_agents_to_models(&configured, &available, &mut warnings).unwrap_err();
+    let err = build_effective_agents_to_models(
+        &configured,
+        &available,
+        MissingDockerfilePolicy::Fail,
+        "workflows.dynamic.agentsToModels",
+        &mut warnings,
+    )
+    .unwrap_err();
     let msg = err.to_string();
 
     assert!(
@@ -2486,7 +2544,14 @@ fn build_effective_agents_to_models_complete_mismatch_fails() {
     let available = agent_dockerfiles(&["claude"]);
     let mut warnings = Vec::new();
 
-    let err = build_effective_agents_to_models(&configured, &available, &mut warnings).unwrap_err();
+    let err = build_effective_agents_to_models(
+        &configured,
+        &available,
+        MissingDockerfilePolicy::Fail,
+        "workflows.dynamic.agentsToModels",
+        &mut warnings,
+    )
+    .unwrap_err();
     let msg = err.to_string();
     assert!(msg.contains("foo"), "got: {msg}");
     assert!(msg.contains("bar"), "got: {msg}");
@@ -2499,8 +2564,14 @@ fn build_effective_agents_to_models_case_folded_match_emits_lowercase_and_warnin
     let available = agent_dockerfiles(&["claude"]);
     let mut warnings = Vec::new();
 
-    let effective =
-        build_effective_agents_to_models(&configured, &available, &mut warnings).unwrap();
+    let effective = build_effective_agents_to_models(
+        &configured,
+        &available,
+        MissingDockerfilePolicy::Fail,
+        "workflows.dynamic.agentsToModels",
+        &mut warnings,
+    )
+    .unwrap();
 
     assert_eq!(
         effective.get("claude"),
@@ -2527,7 +2598,14 @@ fn build_effective_agents_to_models_duplicate_keys_after_case_folding_fail() {
     let available = agent_dockerfiles(&["claude"]);
     let mut warnings = Vec::new();
 
-    let err = build_effective_agents_to_models(&configured, &available, &mut warnings).unwrap_err();
+    let err = build_effective_agents_to_models(
+        &configured,
+        &available,
+        MissingDockerfilePolicy::Fail,
+        "workflows.dynamic.agentsToModels",
+        &mut warnings,
+    )
+    .unwrap_err();
     let msg = err.to_string();
     assert!(
         msg.contains("Claude") && msg.contains("claude") && msg.contains("case folding"),
@@ -2541,10 +2619,88 @@ fn build_effective_agents_to_models_empty_map_is_not_an_error() {
     let available = agent_dockerfiles(&["claude"]);
     let mut warnings = Vec::new();
 
-    let effective =
-        build_effective_agents_to_models(&configured, &available, &mut warnings).unwrap();
+    let effective = build_effective_agents_to_models(
+        &configured,
+        &available,
+        MissingDockerfilePolicy::Fail,
+        "workflows.dynamic.agentsToModels",
+        &mut warnings,
+    )
+    .unwrap();
     assert!(effective.is_empty());
     assert!(warnings.is_empty());
+}
+
+#[test]
+fn global_agent_map_skips_missing_dockerfiles_warns_and_falls_back_when_all_skipped() {
+    let config = std::collections::HashMap::from([
+        ("missing".to_string(), vec!["m".to_string()]),
+        ("claude".to_string(), vec!["opus".to_string()]),
+    ]);
+    let available = agent_dockerfiles(&["claude", "codex"]);
+    let mut warnings = Vec::new();
+    let effective = build_effective_agents_to_models(
+        &config,
+        &available,
+        MissingDockerfilePolicy::SkipWithWarning,
+        "workflows.dynamic.agentsToModels",
+        &mut warnings,
+    )
+    .unwrap();
+    assert_eq!(
+        effective.keys().cloned().collect::<Vec<_>>(),
+        vec!["claude"]
+    );
+    assert_eq!(warnings.len(), 1);
+    assert!(
+        warnings[0].contains("missing") && warnings[0].contains("Dockerfile"),
+        "{}",
+        warnings[0]
+    );
+
+    let only_missing =
+        std::collections::HashMap::from([("missing".to_string(), vec!["m".to_string()])]);
+    let resolved = crate::data::config::ResolvedDynamicWorkflows {
+        default_leader: None,
+        max_concurrent_steps: None,
+        agents_to_models: Some(crate::data::config::Sourced {
+            value: only_missing,
+            source: crate::data::config::DynamicWorkflowsSource::Global,
+        }),
+        guidance: Vec::new(),
+        guidance_counts: Default::default(),
+        repo_uses_legacy_key: false,
+    };
+    let (section, warnings) = agents_section_for_leader(&resolved, &available).unwrap();
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("missing") && w.contains("Dockerfile")),
+        "{warnings:?}"
+    );
+    assert!(
+        section.contains("claude") && section.contains("codex"),
+        "empty global result should render discovered agents: {section}"
+    );
+}
+
+#[test]
+fn repo_agent_map_without_dockerfile_remains_a_hard_error() {
+    let config = std::collections::HashMap::from([("missing".to_string(), vec!["m".to_string()])]);
+    let available = agent_dockerfiles(&["claude"]);
+    let err = build_effective_agents_to_models(
+        &config,
+        &available,
+        MissingDockerfilePolicy::Fail,
+        "workflows.dynamic.agentsToModels",
+        &mut Vec::new(),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        err.contains("missing") && err.contains("no Dockerfile"),
+        "{err}"
+    );
 }
 
 // ── resolve_and_validate_workflow_agents ──────────────────────────────────
@@ -2808,6 +2964,21 @@ fn repair_prompt_substitution_contains_verbatim_validation_error() {
 }
 
 // ── Integration: dynamicWorkflows config → leader prompt (WI-0095) ────────
+
+/// The repo config at `root` layered over an empty global config, resolved
+/// the way `run_dynamic` resolves it.
+fn resolved_dynamic_workflows(
+    root: &std::path::Path,
+) -> crate::data::config::ResolvedDynamicWorkflows {
+    crate::data::config::EffectiveConfig::new(
+        crate::data::config::FlagConfig::default(),
+        Default::default(),
+        crate::data::config::repo::RepoConfig::load(root).unwrap(),
+        crate::data::config::global::GlobalConfig::default(),
+    )
+    .dynamic_workflows()
+    .unwrap()
+}
 //
 // These exercise the same sequence `run_dynamic` performs — RepoConfig
 // load, Dockerfile discovery, `build_effective_agents_to_models`,
@@ -2837,30 +3008,20 @@ fn integration_dynamic_config_valid_agents_produces_leader_prompt_with_models_an
     )
     .unwrap();
 
-    let repo_config = crate::data::config::repo::RepoConfig::load(tmp.path()).unwrap();
-    let dw = repo_config
-        .dynamic_workflows
-        .clone()
-        .expect("dynamicWorkflows section must be present");
+    let dw = resolved_dynamic_workflows(tmp.path());
 
     let paths = crate::data::RepoDockerfilePaths::new(tmp.path());
     let available_agents = paths.discover_agent_dockerfiles();
 
-    let mut warnings = Vec::new();
-    let effective = build_effective_agents_to_models(
-        dw.agents_to_models.as_ref().unwrap(),
-        &available_agents,
-        &mut warnings,
-    )
-    .expect("all configured agents have Dockerfiles; validation must succeed");
-    let agents_section = format_agents_with_models(&effective);
+    let (agents_section, _warnings) = agents_section_for_leader(&dw, &available_agents)
+        .expect("all configured agents have Dockerfiles; validation must succeed");
 
     let leader_prompt = crate::data::dynamic_workflow_assets::build_leader_prompt(
         "0042",
         "/workspace/aspec/work-items/0042-item.md",
         &agents_section,
-        dw.max_concurrent_steps,
-        dw.guidance.as_deref(),
+        dw.max_concurrent_steps.as_ref().map(|s| s.value),
+        dw.guidance_texts().as_deref(),
     );
 
     assert!(
@@ -2898,18 +3059,14 @@ fn integration_dynamic_config_guidance_entries_appear_in_leader_prompt() {
     )
     .unwrap();
 
-    let repo_config = crate::data::config::repo::RepoConfig::load(tmp.path()).unwrap();
-    let dw = repo_config
-        .dynamic_workflows
-        .clone()
-        .expect("dynamicWorkflows section must be present");
+    let dw = resolved_dynamic_workflows(tmp.path());
 
     let leader_prompt = crate::data::dynamic_workflow_assets::build_leader_prompt(
         "0099",
         "/workspace/aspec/work-items/0099-item.md",
         "  - claude",
-        dw.max_concurrent_steps,
-        dw.guidance.as_deref(),
+        dw.max_concurrent_steps.as_ref().map(|s| s.value),
+        dw.guidance_texts().as_deref(),
     );
 
     assert!(
@@ -2945,11 +3102,7 @@ fn integration_dynamic_config_mismatched_agents_fails_before_container_spawn() {
     )
     .unwrap();
 
-    let repo_config = crate::data::config::repo::RepoConfig::load(tmp.path()).unwrap();
-    let dw = repo_config
-        .dynamic_workflows
-        .clone()
-        .expect("dynamicWorkflows section must be present");
+    let dw = resolved_dynamic_workflows(tmp.path());
 
     let paths = crate::data::RepoDockerfilePaths::new(tmp.path());
     let available_agents = paths.discover_agent_dockerfiles();
@@ -2957,13 +3110,7 @@ fn integration_dynamic_config_mismatched_agents_fails_before_container_spawn() {
     // This is the exact check `run_dynamic` performs immediately after
     // Dockerfile discovery and before `ensure_agent_image` /
     // `drive_leader_agent` — i.e. before any image build or container spawn.
-    let mut warnings = Vec::new();
-    let err = build_effective_agents_to_models(
-        dw.agents_to_models.as_ref().unwrap(),
-        &available_agents,
-        &mut warnings,
-    )
-    .unwrap_err();
+    let err = agents_section_for_leader(&dw, &available_agents).unwrap_err();
 
     let msg = err.to_string();
     assert!(

@@ -12,7 +12,9 @@ pub mod fields;
 pub mod flags;
 pub mod global;
 pub mod image_source;
+mod json_order;
 pub mod leader_spec;
+pub mod migrations;
 pub mod overlays;
 pub mod repo;
 pub mod resolved_builtin;
@@ -22,21 +24,29 @@ pub use builtin_network::{
     BuiltinNetworkConfig, BuiltinNetworkSettings, NetworkAllowEntry, NetworkMode,
 };
 pub use builtin_runtime::BuiltinRuntimeConfig;
-pub use effective::EffectiveConfig;
+pub use effective::{
+    DynamicWorkflowsSource, EffectiveConfig, GuidanceCounts, GuidanceEntry,
+    ResolvedDynamicWorkflows, Sourced,
+};
 pub use env::{Env, EnvSnapshot};
+pub use fields::{resolve_field_name, ConfigRowShape, FieldAlias, ResolvedFieldName};
 pub use flags::FlagConfig;
 pub use global::{GlobalConfig, LaunchModeFallback};
 pub use image_source::{
     DockerTlsConfig, ImageSourceKind, ImageSourceSpec, RegistryAuthSource, RegistryHostConfig,
+};
+pub use migrations::{
+    ConfigMigration, ConfigMigrationChange, ConfigMigrationScope, GlobalConfigMigration,
+    RepoConfigMigration, CONFIG_MIGRATIONS,
 };
 pub use overlays::{
     parse_overlay_list, parse_overlay_spec, CollectedOverlays, ContextOverlaySpec, ContextScope,
     DirectorySpec, OverlayPermission, SkillSpec, TypedOverlay,
 };
 pub use repo::{
-    AgentAuthMode, ApiConfig, AuthRefreshConfig, DynamicWorkflowsConfig, LaunchMode,
-    MergeFixConfig, OnDirtyMergeTarget, OnMergeFailure, RemoteConfig, RepoConfig, SquadConfig,
-    WorkItemsConfig, WorktreeConfig, REPO_CONFIG_FILENAME, REPO_CONFIG_SUBDIR,
+    AgentAuthMode, ApiConfig, AuthRefreshConfig, DynamicWorkflowsConfig, DynamicWorkflowsKey,
+    LaunchMode, MergeFixConfig, OnDirtyMergeTarget, OnMergeFailure, RemoteConfig, RepoConfig,
+    SquadConfig, WorkItemsConfig, WorktreeConfig, REPO_CONFIG_FILENAME, REPO_CONFIG_SUBDIR,
 };
 pub use resolved_builtin::{BuiltinProcessConfig, ResolvedBuiltinConfig};
 pub use runtime_selection::{RuntimeSelection, UnknownRuntimeValue};

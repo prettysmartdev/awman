@@ -432,34 +432,46 @@ pub(crate) fn render_config_show(state: &dialogs::ConfigShowState, area: Rect, f
         let cursor = state.editor.cursor.min(text.len());
         format!("{}|{}", &text[..cursor], &text[cursor..])
     };
+    // The add-entry lines name the header the entry goes under and the scope
+    // it will be written to, as the inline editor does: Ctrl+N writes to
+    // whichever column is selected.
+    let scope = if state.edit_column == 0 {
+        "global"
+    } else {
+        "repo"
+    };
+    let header_field = state
+        .selected_header()
+        .map(|(_, row)| row.field.as_str())
+        .unwrap_or_default();
     let (detail_text, format_hint): (String, Option<String>) = match &state.new_entry {
         Some(dialogs::NewMapEntryPhase::Key) => (
-            format!("  New model mapping \u{2014} agent name: {}", edit_buffer()),
+            format!(
+                "  New {header_field} entry ({scope}) \u{2014} agent name: {}",
+                edit_buffer()
+            ),
             Some("ASCII letters, digits, '-' and '_'".to_string()),
         ),
         Some(dialogs::NewMapEntryPhase::Value { key }) => (
             format!(
-                "  dynamicWorkflows.agentsToModels.{key} = {}",
+                "  {}{key} ({scope}) = {}",
+                state
+                    .selected_header()
+                    .and_then(|(_, row)| row.shape.child_prefix())
+                    .unwrap_or_default(),
                 edit_buffer()
             ),
             Some("comma-separated model names".to_string()),
         ),
-        Some(dialogs::NewMapEntryPhase::GuidanceEntry) => (
-            format!("  New guidance entry: {}", edit_buffer()),
+        Some(dialogs::NewMapEntryPhase::ListEntry) => (
+            format!("  New {header_field} entry ({scope}): {}", edit_buffer()),
             Some("a single instruction the leader must follow".to_string()),
         ),
         None => match state.rows.get(state.selected) {
-            Some(row) if editing_value => {
-                let scope = if state.edit_column == 0 {
-                    "global"
-                } else {
-                    "repo"
-                };
-                (
-                    format!("  {} ({scope}) = {}", row.field, edit_buffer()),
-                    row.value_hint.clone(),
-                )
-            }
+            Some(row) if editing_value => (
+                format!("  {} ({scope}) = {}", row.field, edit_buffer()),
+                row.value_hint.clone(),
+            ),
             Some(row) => {
                 let full = if state.edit_column == 0 {
                     &row.global
@@ -511,7 +523,7 @@ pub(crate) fn render_config_show(state: &dialogs::ConfigShowState, area: Rect, f
     // minus the 3 single-cell gaps ratatui inserts between the 4 columns.
     // Cell values are truncated to these widths so long values don't
     // overflow; the Field column gets the largest share because dotted
-    // names (dynamicWorkflows.agentsToModels.<agent>) are the longest.
+    // names of expanded map/list members are the longest.
     let usable = table_area.width.saturating_sub(3) as u32;
     let field_w = (usable * 34 / 100) as usize;
     let col_w = (usable * 22 / 100) as usize;
@@ -528,7 +540,7 @@ pub(crate) fn render_config_show(state: &dialogs::ConfigShowState, area: Rect, f
     .height(1);
 
     // Window rows so the selection stays visible when the table has more
-    // rows than fit (e.g. dynamicWorkflows.agentsToModels.* expansions),
+    // rows than fit (e.g. expanded map members),
     // mirroring the ListPicker windowing pattern above.
     let visible = (table_area.height.saturating_sub(1)) as usize;
     let start = state
@@ -649,8 +661,8 @@ pub(crate) fn render_config_show(state: &dialogs::ConfigShowState, area: Rect, f
             key("Esc"),
             Span::raw("=cancel"),
         ]),
-        Some(dialogs::NewMapEntryPhase::GuidanceEntry) => Line::from(vec![
-            Span::styled("  New guidance entry", Style::default().fg(Color::Green)),
+        Some(dialogs::NewMapEntryPhase::ListEntry) => Line::from(vec![
+            Span::styled("  New entry", Style::default().fg(Color::Green)),
             Span::raw("  |  "),
             key("Enter"),
             Span::raw("=save entry  "),
@@ -670,21 +682,9 @@ pub(crate) fn render_config_show(state: &dialogs::ConfigShowState, area: Rect, f
             Span::raw("=jump"),
         ]),
         None => {
-            // The Ctrl+N add-entry hint only makes sense on the agentsToModels
-            // or guidance rows; elsewhere it is noise. The label differs so
-            // users know what will be added.
-            let selected_field = state.rows.get(state.selected).map(|r| r.field.as_str());
-            let on_mapping_row = selected_field
-                .map(|f| {
-                    f == "dynamicWorkflows.agentsToModels"
-                        || f.starts_with("dynamicWorkflows.agentsToModels.")
-                })
-                .unwrap_or(false);
-            let on_guidance_row = selected_field
-                .map(|f| {
-                    f == "dynamicWorkflows.guidance" || f.starts_with("dynamicWorkflows.guidance.")
-                })
-                .unwrap_or(false);
+            // The row shape decides whether Ctrl+N adds a map or list entry.
+            use crate::command::commands::config::ConfigRowShape;
+            let selected_shape = state.rows.get(state.selected).map(|row| row.shape);
             let mut spans = vec![
                 key("  \u{2191}\u{2193}"),
                 Span::raw("=row  "),
@@ -695,12 +695,16 @@ pub(crate) fn render_config_show(state: &dialogs::ConfigShowState, area: Rect, f
                 key("Enter/e"),
                 Span::raw("=edit  "),
             ];
-            if on_mapping_row {
-                spans.push(key("Ctrl+N"));
-                spans.push(Span::raw("=add model mapping  "));
-            } else if on_guidance_row {
-                spans.push(key("Ctrl+N"));
-                spans.push(Span::raw("=add entry  "));
+            match selected_shape {
+                Some(ConfigRowShape::MapHeader { .. } | ConfigRowShape::MapEntry) => {
+                    spans.push(key("Ctrl+N"));
+                    spans.push(Span::raw(format!("=add {scope} mapping  ")));
+                }
+                Some(ConfigRowShape::ListHeader { .. } | ConfigRowShape::ListEntry) => {
+                    spans.push(key("Ctrl+N"));
+                    spans.push(Span::raw(format!("=add {scope} entry  ")));
+                }
+                _ => {}
             }
             spans.push(key("Esc"));
             spans.push(Span::raw("=close"));

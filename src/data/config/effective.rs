@@ -4,6 +4,7 @@
 //! method on `EffectiveConfig`. The merge precedence is encoded once, in this
 //! module, and is the single source of truth.
 
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -14,7 +15,8 @@ use crate::data::config::env::EnvSnapshot;
 use crate::data::config::flags::FlagConfig;
 use crate::data::config::global::{GlobalConfig, LaunchModeFallback};
 use crate::data::config::repo::{
-    AgentAuthMode, LaunchMode, OnDirtyMergeTarget, OnMergeFailure, RepoConfig, WorktreeConfig,
+    AgentAuthMode, DynamicWorkflowsKey, LaunchMode, OnDirtyMergeTarget, OnMergeFailure, RepoConfig,
+    WorktreeConfig, GUIDANCE_MAX_ENTRIES,
 };
 use crate::data::config::resolved_builtin::ResolvedBuiltinConfig;
 use crate::data::config::runtime_selection::{RuntimeSelection, UnknownRuntimeValue};
@@ -31,6 +33,84 @@ pub struct EffectiveConfig {
     env: EnvSnapshot,
     repo: RepoConfig,
     global: GlobalConfig,
+}
+
+/// Where a resolved dynamic-workflow value came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DynamicWorkflowsSource {
+    Global,
+    Repo,
+    LegacyRepo,
+    Flag,
+}
+
+impl DynamicWorkflowsSource {
+    pub fn key_prefix(self) -> &'static str {
+        match self {
+            Self::Global | Self::Repo => "workflows.dynamic",
+            Self::LegacyRepo => "dynamicWorkflows",
+            Self::Flag => "--leader",
+        }
+    }
+
+    pub fn file(self) -> Option<&'static str> {
+        match self {
+            Self::Global => Some("~/.awman/config.json"),
+            Self::Repo | Self::LegacyRepo => Some(".awman/config.json"),
+            Self::Flag => None,
+        }
+    }
+
+    /// Label the key and file the user actually wrote.
+    pub fn describe(self, field: &str) -> String {
+        match self.file() {
+            Some(file) => format!("{}.{field} in {file}", self.key_prefix()),
+            None => self.key_prefix().to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Sourced<T> {
+    pub value: T,
+    pub source: DynamicWorkflowsSource,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuidanceEntry {
+    pub text: String,
+    pub source: DynamicWorkflowsSource,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GuidanceCounts {
+    pub global: usize,
+    pub repo: usize,
+}
+
+/// Per-field layering, with attribution retained for views and diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedDynamicWorkflows {
+    pub default_leader: Option<Sourced<String>>,
+    pub max_concurrent_steps: Option<Sourced<usize>>,
+    /// Always non-empty when set. A repo map replaces the entire global map.
+    pub agents_to_models: Option<Sourced<HashMap<String, Vec<String>>>>,
+    pub guidance: Vec<GuidanceEntry>,
+    /// Counts after trimmed de-duplication, per scope.
+    pub guidance_counts: GuidanceCounts,
+    pub repo_uses_legacy_key: bool,
+}
+
+impl ResolvedDynamicWorkflows {
+    pub fn guidance_texts(&self) -> Option<Vec<String>> {
+        (!self.guidance.is_empty()).then(|| {
+            self.guidance
+                .iter()
+                .map(|entry| entry.text.clone())
+                .collect()
+        })
+    }
 }
 
 /// Resolved live credential-refresh settings. Repository fields override the
@@ -54,6 +134,102 @@ impl Default for EffectiveConfig {
 }
 
 impl EffectiveConfig {
+    /// Resolve dynamic settings: flags > repo > global, with a replacing map
+    /// and global-then-repo guidance (trimmed duplicates dropped, never truncated).
+    pub fn dynamic_workflows(&self) -> Result<ResolvedDynamicWorkflows, DataError> {
+        let repo = self.repo.dynamic_workflows_block()?;
+        let repo_source = match repo.map(|(_, key)| key) {
+            Some(DynamicWorkflowsKey::Legacy) => DynamicWorkflowsSource::LegacyRepo,
+            _ => DynamicWorkflowsSource::Repo,
+        };
+        let repo = repo.map(|(block, _)| block);
+        let global = self
+            .global
+            .workflows
+            .as_ref()
+            .and_then(|w| w.dynamic.as_ref());
+        let blocks = [
+            (repo, repo_source),
+            (global, DynamicWorkflowsSource::Global),
+        ];
+        let default_leader = self
+            .flags
+            .leader
+            .as_ref()
+            .map(|leader| Sourced {
+                value: leader.clone(),
+                source: DynamicWorkflowsSource::Flag,
+            })
+            .or_else(|| {
+                blocks.iter().find_map(|(block, source)| {
+                    block
+                        .and_then(|b| b.default_leader.as_ref())
+                        .map(|value| Sourced {
+                            value: value.clone(),
+                            source: *source,
+                        })
+                })
+            });
+        let max_concurrent_steps = blocks.iter().find_map(|(block, source)| {
+            block
+                .and_then(|b| b.max_concurrent_steps)
+                .map(|value| Sourced {
+                    value,
+                    source: *source,
+                })
+        });
+        let agents_to_models = blocks.iter().find_map(|(block, source)| {
+            block
+                .and_then(|b| b.agents_to_models.as_ref())
+                .filter(|map| !map.is_empty())
+                .map(|value| Sourced {
+                    value: value.clone(),
+                    source: *source,
+                })
+        });
+        let mut seen = HashSet::new();
+        let mut guidance = Vec::new();
+        let mut guidance_counts = GuidanceCounts::default();
+        for (block, source) in [
+            (global, DynamicWorkflowsSource::Global),
+            (repo, repo_source),
+        ] {
+            for text in block
+                .and_then(|b| b.guidance.as_ref())
+                .into_iter()
+                .flatten()
+            {
+                if seen.insert(text.trim()) {
+                    guidance.push(GuidanceEntry {
+                        text: text.clone(),
+                        source,
+                    });
+                    if source == DynamicWorkflowsSource::Global {
+                        guidance_counts.global += 1;
+                    } else {
+                        guidance_counts.repo += 1;
+                    }
+                }
+            }
+        }
+        if guidance.len() > GUIDANCE_MAX_ENTRIES {
+            return Err(DataError::Other(format!(
+                "workflows.dynamic.guidance: {} global + {} repo entries exceeds the limit of \
+                 {GUIDANCE_MAX_ENTRIES}; remove entries from either ~/.awman/config.json or \
+                 .awman/config.json",
+                guidance_counts.global, guidance_counts.repo,
+            )));
+        }
+        Ok(ResolvedDynamicWorkflows {
+            default_leader,
+            max_concurrent_steps,
+            agents_to_models,
+            guidance,
+            guidance_counts,
+            repo_uses_legacy_key: self.repo.uses_legacy_dynamic_workflows(),
+        })
+    }
+
     /// Construct a merged view from the four source layers.
     ///
     /// Precedence (highest → lowest): `flags` > `env` > `repo` > `global` > built-in.
@@ -2134,6 +2310,17 @@ mod tests {
 #[cfg(test)]
 mod squad_prerequisite_review_tests {
     use super::*;
+    use crate::data::config::repo::DynamicWorkflowsConfig;
+    use std::collections::HashMap;
+
+    fn make_effective(
+        flags: FlagConfig,
+        env: EnvSnapshot,
+        repo: RepoConfig,
+        global: GlobalConfig,
+    ) -> EffectiveConfig {
+        EffectiveConfig::new(flags, env, repo, global)
+    }
     #[test]
     fn squad_defaults_apply_without_a_stored_task_policy_and_only_to_squad_runs() {
         let global: GlobalConfig = serde_json::from_value(serde_json::json!({"squad":{"workflows":{"prerequisites":{"ssh":{"use":"deny"},"unresolved":"warn"}}}})).unwrap();
@@ -2153,5 +2340,280 @@ mod squad_prerequisite_review_tests {
                 squad
             );
         }
+    }
+
+    fn dynamic(
+        leader: Option<&str>,
+        max: Option<usize>,
+        agents: Option<HashMap<String, Vec<String>>>,
+        guidance: Option<Vec<&str>>,
+    ) -> DynamicWorkflowsConfig {
+        DynamicWorkflowsConfig {
+            default_leader: leader.map(str::to_owned),
+            max_concurrent_steps: max,
+            agents_to_models: agents,
+            guidance: guidance.map(|v| v.into_iter().map(str::to_owned).collect()),
+        }
+    }
+
+    fn dynamic_effective(
+        flags: FlagConfig,
+        repo: Option<DynamicWorkflowsConfig>,
+        global: Option<DynamicWorkflowsConfig>,
+    ) -> EffectiveConfig {
+        make_effective(
+            flags,
+            EnvSnapshot::empty(),
+            RepoConfig {
+                workflows: repo.map(|dynamic| crate::data::config::workflows::WorkflowsConfig {
+                    dynamic: Some(dynamic),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            GlobalConfig {
+                workflows: global.map(|dynamic| crate::data::config::workflows::WorkflowsConfig {
+                    dynamic: Some(dynamic),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+    }
+
+    #[test]
+    fn dynamic_default_leader_precedence_is_flag_repo_global() {
+        let global = dynamic(Some("g::m"), None, None, None);
+        let repo = dynamic(Some("r::m"), None, None, None);
+        let result = dynamic_effective(
+            FlagConfig {
+                leader: Some("f::m".into()),
+                ..Default::default()
+            },
+            Some(repo.clone()),
+            Some(global.clone()),
+        )
+        .dynamic_workflows()
+        .unwrap();
+        assert_eq!(
+            result.default_leader.unwrap().source,
+            DynamicWorkflowsSource::Flag
+        );
+        let result = dynamic_effective(FlagConfig::default(), Some(repo), Some(global))
+            .dynamic_workflows()
+            .unwrap();
+        assert_eq!(
+            result.default_leader.unwrap().source,
+            DynamicWorkflowsSource::Repo
+        );
+        let result = dynamic_effective(
+            FlagConfig::default(),
+            None,
+            Some(dynamic(Some("g::m"), None, None, None)),
+        )
+        .dynamic_workflows()
+        .unwrap();
+        assert_eq!(
+            result.default_leader.unwrap().source,
+            DynamicWorkflowsSource::Global
+        );
+    }
+
+    #[test]
+    fn dynamic_max_concurrent_steps_falls_through_to_global() {
+        let result = dynamic_effective(
+            FlagConfig::default(),
+            Some(dynamic(None, None, None, None)),
+            Some(dynamic(None, Some(7), None, None)),
+        )
+        .dynamic_workflows()
+        .unwrap();
+        assert_eq!(result.max_concurrent_steps.unwrap().value, 7);
+        let result = dynamic_effective(
+            FlagConfig::default(),
+            Some(dynamic(None, Some(3), None, None)),
+            Some(dynamic(None, Some(7), None, None)),
+        )
+        .dynamic_workflows()
+        .unwrap();
+        assert_eq!(result.max_concurrent_steps.unwrap().value, 3);
+    }
+
+    #[test]
+    fn dynamic_repo_agent_map_replaces_global_but_empty_repo_map_falls_through() {
+        let global = HashMap::from([
+            ("global-only".into(), vec!["m".into()]),
+            ("shared".into(), vec!["g".into()]),
+        ]);
+        let repo = HashMap::from([("shared".into(), vec!["r".into()])]);
+        let result = dynamic_effective(
+            FlagConfig::default(),
+            Some(dynamic(None, None, Some(repo), None)),
+            Some(dynamic(None, None, Some(global.clone()), None)),
+        )
+        .dynamic_workflows()
+        .unwrap();
+        let map = &result.agents_to_models.unwrap().value;
+        assert!(!map.contains_key("global-only"));
+        assert_eq!(map["shared"], vec!["r"]);
+        let result = dynamic_effective(
+            FlagConfig::default(),
+            Some(dynamic(None, None, Some(HashMap::new()), None)),
+            Some(dynamic(None, None, Some(global), None)),
+        )
+        .dynamic_workflows()
+        .unwrap();
+        assert_eq!(
+            result.agents_to_models.unwrap().source,
+            DynamicWorkflowsSource::Global
+        );
+    }
+
+    #[test]
+    fn dynamic_guidance_concatenates_deduplicates_attributes_and_enforces_combined_cap() {
+        let result = dynamic_effective(
+            FlagConfig::default(),
+            Some(dynamic(None, None, None, Some(vec![" repo ", "same"]))),
+            Some(dynamic(None, None, None, Some(vec!["global", "same"]))),
+        )
+        .dynamic_workflows()
+        .unwrap();
+        assert_eq!(
+            result
+                .guidance
+                .iter()
+                .map(|e| e.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["global", "same", " repo "]
+        );
+        assert_eq!(result.guidance[0].source, DynamicWorkflowsSource::Global);
+        assert_eq!(result.guidance[2].source, DynamicWorkflowsSource::Repo);
+        let result = dynamic_effective(
+            FlagConfig::default(),
+            Some(DynamicWorkflowsConfig {
+                guidance: Some((0..26).map(|i| format!("repo-{i}")).collect()),
+                ..Default::default()
+            }),
+            Some(DynamicWorkflowsConfig {
+                guidance: Some((0..25).map(|i| format!("global-{i}")).collect()),
+                ..Default::default()
+            }),
+        )
+        .dynamic_workflows()
+        .unwrap_err()
+        .to_string();
+        assert!(result.contains("25 global + 26 repo entries"), "{result}");
+        assert!(
+            result.contains("limit of 50")
+                && result.contains("~/.awman/config.json")
+                && result.contains(" .awman/config.json"),
+            "the error must suggest trimming either scope: {result}"
+        );
+    }
+
+    #[test]
+    fn dynamic_sources_attribute_every_field_including_legacy_repo() {
+        let mut repo: RepoConfig = serde_json::from_value(serde_json::json!({"dynamicWorkflows":{"defaultLeader":"r::m","maxConcurrentSteps":2,"agentsToModels":{"r":["m"]},"guidance":["r"]}})).unwrap();
+        let global: GlobalConfig = serde_json::from_value(serde_json::json!({"workflows":{"dynamic":{"defaultLeader":"g::m","maxConcurrentSteps":3,"agentsToModels":{"g":["m"]},"guidance":["g"]}}})).unwrap();
+        let result = make_effective(
+            FlagConfig::default(),
+            EnvSnapshot::empty(),
+            repo.clone(),
+            global,
+        )
+        .dynamic_workflows()
+        .unwrap();
+        assert_eq!(
+            result.default_leader.unwrap().source,
+            DynamicWorkflowsSource::LegacyRepo
+        );
+        assert_eq!(
+            result.max_concurrent_steps.unwrap().source,
+            DynamicWorkflowsSource::LegacyRepo
+        );
+        assert_eq!(
+            result.agents_to_models.unwrap().source,
+            DynamicWorkflowsSource::LegacyRepo
+        );
+        assert_eq!(
+            result.guidance.iter().map(|e| e.source).collect::<Vec<_>>(),
+            vec![
+                DynamicWorkflowsSource::Global,
+                DynamicWorkflowsSource::LegacyRepo
+            ]
+        );
+        repo.adopt_legacy_dynamic_workflows();
+        let result = make_effective(
+            FlagConfig::default(),
+            EnvSnapshot::empty(),
+            repo,
+            GlobalConfig::default(),
+        )
+        .dynamic_workflows()
+        .unwrap();
+        assert_eq!(
+            result.default_leader.unwrap().source,
+            DynamicWorkflowsSource::Repo
+        );
+        let result = dynamic_effective(
+            FlagConfig {
+                leader: Some("f::m".into()),
+                ..Default::default()
+            },
+            None,
+            None,
+        )
+        .dynamic_workflows()
+        .unwrap();
+        assert_eq!(
+            result.default_leader.unwrap().source,
+            DynamicWorkflowsSource::Flag
+        );
+
+        let global = dynamic(
+            Some("g::m"),
+            Some(8),
+            Some(HashMap::from([("global".into(), vec!["model".into()])])),
+            Some(vec!["global guidance"]),
+        );
+        let result = dynamic_effective(FlagConfig::default(), None, Some(global))
+            .dynamic_workflows()
+            .unwrap();
+        assert_eq!(
+            result.default_leader.unwrap().source,
+            DynamicWorkflowsSource::Global
+        );
+        assert_eq!(
+            result.max_concurrent_steps.unwrap().source,
+            DynamicWorkflowsSource::Global
+        );
+        assert_eq!(
+            result.agents_to_models.unwrap().source,
+            DynamicWorkflowsSource::Global
+        );
+        assert_eq!(result.guidance[0].source, DynamicWorkflowsSource::Global);
+
+        let repo = dynamic(
+            Some("r::m"),
+            Some(4),
+            Some(HashMap::from([("repo".into(), vec!["model".into()])])),
+            Some(vec!["repo guidance"]),
+        );
+        let result = dynamic_effective(FlagConfig::default(), Some(repo), None)
+            .dynamic_workflows()
+            .unwrap();
+        assert_eq!(
+            result.default_leader.unwrap().source,
+            DynamicWorkflowsSource::Repo
+        );
+        assert_eq!(
+            result.max_concurrent_steps.unwrap().source,
+            DynamicWorkflowsSource::Repo
+        );
+        assert_eq!(
+            result.agents_to_models.unwrap().source,
+            DynamicWorkflowsSource::Repo
+        );
+        assert_eq!(result.guidance[0].source, DynamicWorkflowsSource::Repo);
     }
 }

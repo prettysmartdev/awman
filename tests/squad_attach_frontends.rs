@@ -279,6 +279,7 @@ fn squad_app() -> App {
             ApiPaths::at_root("/tmp"),
         )),
         agent_engine: Arc::new(AgentEngine::new(overlay, runtime)),
+        config_notices: Default::default(),
         workflow_state_store: Arc::new(WorkflowStateStore::at_git_root(
             tempfile::tempdir().unwrap().path(),
         )),
