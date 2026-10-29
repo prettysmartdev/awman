@@ -5,7 +5,7 @@ Issue: issuelink
 
 ## Summary:
 - `exec prompt` runs in the session directory with no worktree. With the API's default `--yolo`, the agent can modify that directory. Clients that use a long-lived checkout for a planning or review agent must reset it (`git reset --hard`) before every call and hope nothing important was written.
-- Add `--read-only-workspace`: the workspace is mounted `:ro`. Durable writes go to the context (0139) or outputs (0137) directories.
+- Add `--read-only-workspace`: the workspace is mounted `:ro`. Durable writes go to the context (0140) or outputs (0137) directories.
 
 ## User Stories
 

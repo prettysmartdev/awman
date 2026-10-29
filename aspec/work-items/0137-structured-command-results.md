@@ -22,7 +22,7 @@ An API client today has to rebuild most of what a command did by scraping the ev
 
 This item gives each command one structured `result`, which is also the payload of exactly one final `command_status` event. It adds an outputs directory that awman collects and serves. It attaches a `source` to every event, giving the step, phase, container and retry it came from, and gives streaming-capable agents a live activity feed. Together these let a client build the equivalent of the TUI's Workflow Overview and container panes without parsing log text.
 
-(This item absorbs the former 0143, "Step-attributed, live output for API clients".)
+(This item absorbs the former proposal "Step-attributed, live output for API clients".)
 
 ## User Stories
 
@@ -153,7 +153,7 @@ show each agent's output live, and switch between the parallel agents of a group
   - The agent's final message, emitted as ordinary output lines exactly as today, so text-only clients see the same output.
   - The same final message as `result.final_message` for `exec prompt`.
 
-  This one translator is the source of both 0137's final message and 0143's activity feed, so there is no second parser.
+  This one translator is the source of both the final message and the activity feed, so there is no second parser.
 - Agents with `output_format = "text"` emit only output lines and no `final_message`.
 - Translators are tested against recorded fixtures. An unparseable line is passed through as an output line, never dropped.
 
@@ -194,7 +194,7 @@ The route returns the engine's serialized `WorkflowState`. Its statuses are Rust
 - `current_phase` is accompanied by `phase`, the same value in snake_case.
 - `setup_step_states` and `teardown_step_states` entries gain a snake_case `state` alongside the legacy `status`.
 - `step_states` and the PascalCase values remain for existing clients. The docs mark them legacy.
-- Also serve the route as `GET /v1/commands/{id}/workflow`, so every per-command resource sits under `/v1/commands/{id}/` (`status`, `logs`, `outputs`, 0139's `context-changes`, 0146's `terminals`). The old path stays.
+- Also serve the route as `GET /v1/commands/{id}/workflow`, so every per-command resource sits under `/v1/commands/{id}/` (`status`, `logs`, `outputs`, 0140's `context-changes`, 0146's `terminals`). The old path stays.
 
 ### 7. Feature flags
 Append `structured_results`, `outputs`, `event_source` and `step_activity` to `API_FEATURES` (`routes.rs`).
@@ -208,7 +208,7 @@ Append `structured_results`, `outputs`, `event_source` and `step_activity` to `A
 - **An `on_failure` retry**: same `step_name` and `step_index`, with `step_attempt` incremented. `failed_steps` lists the step once, with its last attempt.
 - **Agents without PTY or streaming support**, or ACP agents: no `step_activity` and no `final_message`. Output lines carry `source` as usual.
 - **Very chatty agents**: `step_activity.summary` is one bounded line. Tool payloads never enter the event log.
-- **Secrets**: `final_message` and `step_activity.summary` pass through the same redaction as output lines once 0140 lands. Files in `/awman/output` are written by the agent and are not redacted. Document that.
+- **Secrets**: `final_message` and `step_activity.summary` pass through the same redaction as output lines once 0141 lands. Files in `/awman/output` are written by the agent and are not redacted. Document that.
 - **Large diffs**: the 500-entry cap and the truncation flag. Binary files report `added`/`deleted` as `null`.
 
 ## Test Considerations:

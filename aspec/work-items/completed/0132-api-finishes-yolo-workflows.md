@@ -192,7 +192,7 @@ show the verdict next to what actually happened
 6. **The route says what it means.**
    - For an `exec workflow` command with no state yet (queued, or still in the dynamic leader phase), answer `404 {"error": "workflow not started"}`.
    - Keep `no workflow for this command` for commands that never run a workflow (`exec prompt`, `chat`), and `command not found` for unknown ids.
-   - Add a `features: Vec<String>` field to `StatusResponse` (`GET /v1/status`, which has no such field today), with `workflow_state` as its first entry. Clients then detect a working endpoint from the capability rather than the version. Later items (e.g. 0143's step output) append to the same list.
+   - Add a `features: Vec<String>` field to `StatusResponse` (`GET /v1/status`, which has no such field today), with `workflow_state` as its first entry. Clients then detect a working endpoint from the capability rather than the version. Later items (e.g. 0137's step output) append to the same list.
 
 ## Edge Case Considerations:
 - A parallel group with peers still running: `compute_available_actions` forces `can_finish_workflow = false` and `can_launch_next` stays true, so the answer is unchanged (`LaunchNext`).

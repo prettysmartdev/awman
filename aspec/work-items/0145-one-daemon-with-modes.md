@@ -54,7 +54,7 @@ see one picture of everything awman is doing on this machine
     "maxConcurrent": { "squad": 1, "api": 2, "worker": 2 }
   }
   ```
-  `interaction` is specified in 0146 and worker settings in 0147. `bind` is the API listener address that 0141 makes configurable. The existing `workers` key stays the host-wide cap, and `maxConcurrent` gives each mode a share of it.
+  `interaction` is specified in 0146 and worker settings in 0147. `bind` is the API listener address that 0142 makes configurable. The existing `workers` key stays the host-wide cap, and `maxConcurrent` gives each mode a share of it.
 - **One process, one guard.** `DaemonGuard` changes from "my pidfile, refuse if the other's is live" to a single daemon identity: one pidfile and one startup lock under `<data>/daemon/`. On start it detects a live legacy squad or API pidfile and refuses with a message naming that process. It never takes a legacy process over silently.
 - **Shared core.** The daemon builds what both daemons build today exactly once: the SQLite store (`TaskStore` and `SqliteSessionStore` on the same pool), container runtime handles, the credential refresh loop, the event bus and the attach hub (0146). Each mode is a `DaemonMode` with `start(&Core)`, `drain()` and `status()`. Squad wraps `SquadDaemonEngine` and `SquadScheduler`. API wraps today's router and `spawn_workers`. Worker is 0147.
 - **One executor.** Commands from every mode go through one executor with the host-wide `workers` cap. It claims round-robin across modes, so a flood of API commands cannot starve squad runs. Within a mode, ordering is unchanged: FIFO per API session, the scheduler's order for squad, and claim order for worker.

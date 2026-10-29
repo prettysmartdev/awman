@@ -93,7 +93,7 @@ take work without the TUI
 - The **server** evaluates affinity and only ever lists or hands out eligible items. awman re-checks `required` against its own reported labels and refuses (`release` with reason `ineligible`) anything that does not match. For example, it refuses an item needing `awman.dev/agent.codex=true` on a machine without codex.
 
 ### Work Server Protocol v1
-All calls are from the worker to the server, under the server's base URL, with `Authorization: Bearer <access token>`. Access tokens come from `POST /v1/token {refresh_token}` and are short-lived. Every request carries `x-wsp-version: 1`. Errors are `{error, code}`: a message string and a snake_case code, the same shape as awman's own API errors (0151).
+All calls are from the worker to the server, under the server's base URL, with `Authorization: Bearer <access token>`. Access tokens come from `POST /v1/token {refresh_token}` and are short-lived. Every request carries `x-wsp-version: 1`. Errors are `{error, code}`: a message string and a snake_case code, the same shape as awman's own API errors (0138).
 
 | Call | Purpose |
 |---|---|
@@ -124,7 +124,7 @@ All calls are from the worker to the server, under the server's base URL, with `
       "dynamic": true, "leader": "claude::claude-opus-5-5",   // workflow kind
       "workflow_toml": null,                                   // or an inline workflow (file mode)
       "agent": "claude", "model": null,                        // prompt kind
-      "read_only": false,                                      // 0142
+      "read_only": false,                                      // 0143
       "overlays": [], "interaction": "interactive" | "non-interactive" | null,
       "yolo": true,                                            // false: step dialogs wait for a person (manual picks)
       "timeout_secs": 7200
@@ -139,9 +139,9 @@ All calls are from the worker to the server, under the server's base URL, with `
 
 ### Running a lease
 - The worker runs each lease in a fresh clone at `<workRoot>/leases/<lease_id>/`, using 0133's remote-session machinery:
-  1. clone `repo.url` with the lease's credentials, through a one-shot credential helper, never in the URL or argv (0140);
+  1. clone `repo.url` with the lease's credentials, through a one-shot credential helper, never in the URL or argv (0141);
   2. check out `branch` from `base_ref` and merge `merge_refs`;
-  3. run `exec workflow --dynamic`, with the work item passed in as `body` (the 0138 inline source, so no file is committed), or `exec prompt`;
+  3. run `exec workflow --dynamic`, with the work item passed in as `body` (the 0139 inline source, so no file is committed), or `exec prompt`;
   4. push `push.branch` on success;
   5. post the result;
   6. delete the clone.

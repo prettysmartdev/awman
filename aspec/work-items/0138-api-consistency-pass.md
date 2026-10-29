@@ -10,8 +10,8 @@ An audit of the whole HTTP API covered the routes as built (through 0136 and 014
    - `/v1/commands/{id}/status` answers 404 with `"Command '<id>' not found"`, while `/v1/workflows/{id}` answers `"command not found"`;
    - the workflow route's four 404 meanings (`command not found`, `no workflow for this command`, `workflow not started`, `workflow never started`) are documented as exact strings to compare.
 
-   Proposals add their own spellings: 0145 `mode_disabled`, 0139 412 on `If-Match`, 0140 `credentials_lost`.
-2. **Per-command resources are split across two roots.** `/v1/workflows/{command_id}` is the only per-command resource outside `/v1/commands/{id}/`, where `status`, `logs`, `cancel`, and the proposed `outputs` (0137), `context-changes` (0139) and `terminals` (0146) sit. Meanwhile `GET /v1/commands/{id}` (the record itself) does not exist: the record is at `/status`, which 0141 notes the docs already get wrong. Sessions have both `/sessions/{id}` (the record) and `/sessions/{id}/status` (setup progress), so `/status` means different things on the two resources.
+   Proposals add their own spellings: 0145 `mode_disabled`, 0140 412 on `If-Match`, 0141 `credentials_lost`.
+2. **Per-command resources are split across two roots.** `/v1/workflows/{command_id}` is the only per-command resource outside `/v1/commands/{id}/`, where `status`, `logs`, `cancel`, and the proposed `outputs` (0137), `context-changes` (0140) and `terminals` (0146) sit. Meanwhile `GET /v1/commands/{id}` (the record itself) does not exist: the record is at `/status`, which 0142 notes the docs already get wrong. Sessions have both `/sessions/{id}` (the record) and `/sessions/{id}/status` (setup progress), so `/status` means different things on the two resources.
 3. **A session's record hides whether it can be used.** `GET /v1/sessions` and `GET /v1/sessions/{id}` return `status: active|closing|closed` but not `setup_status`, although the row stores it (`SessionResponse` in `routes.rs`). `?status=active` therefore includes sessions whose clone or merge failed. The only way to tell is one extra `GET /sessions/{id}/status` per session.
 4. **The docs contradict the server on admission.** The "API edge cases" table says an unknown flag in `args` is enqueued (202) and fails later at the worker. The "Malformed `args`" section, and the code, return 400 at admission. The "Submit a command" section says `exec`'s `args` "starts with the exec action", but every example puts the action in `subcommand` (`"exec prompt"`).
 5. **A dead, misleading schema projection.** `CommandCatalogue::rest_route_table()` and `openapi_schema()` (`src/command/dispatch/projections/api_schema.rs`) are used only by their own tests. They describe `POST /v1/<command path>` routes (e.g. `/v1/exec/workflow`) that the server has never served.
@@ -45,7 +45,7 @@ navigate the API by one rule and skip a round trip per session
   - Every error body becomes `{"error": "<message>", "code": "<snake_case>"}`. `error` keeps its current text (additive).
   - Add one `ApiError { status, code, message }` type in `src/frontend/api/` with constructors per condition, and have `error_json` callers use it. Codes are stable and documented in one table.
   - The asynchronous `result.failure.code` (0137) uses the same vocabulary where conditions overlap (`worktree_exists`, `merge_conflict`, …).
-  - 0139, 0140, 0141 and 0145 use this shape for their new errors. 0147's WSP errors use the same flat shape so one decoder serves both.
+  - 0140, 0141, 0142 and 0145 use this shape for their new errors. 0147's WSP errors use the same flat shape so one decoder serves both.
   - Initial codes:
     - `unauthorized`, `forbidden_workdir`, `invalid_request`, `unknown_subcommand`, `unknown_flag`;
     - `session_not_found`, `session_closing`, `session_not_ready`;
@@ -92,7 +92,7 @@ navigate the API by one rule and skip a round trip per session
 ## Codebase Integration:
 - follow established conventions, best practices, testing, and architecture patterns from the project's aspec.
 - `src/frontend/api/routes.rs` (errors, session responses, new routes), `src/data/fs/api_db.rs` (`pending` normalisation), `src/command/dispatch/projections/api_schema.rs` (delete), `tests/api_parity/routes.rs`.
-- Coordinate with 0137 (shared failure codes, the `/workflow` alias) and 0141 (its docs fixes overlap finding 2).
+- Coordinate with 0137 (shared failure codes, the `/workflow` alias) and 0142 (its docs fixes overlap finding 2).
 
 ## Documentation
 - `docs/09-api-and-remote-mode.md`:
