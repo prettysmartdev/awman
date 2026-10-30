@@ -796,7 +796,8 @@ mod adversarial_tests {
         assert_eq!(summary.bytes, 2);
         assert!(!summary.incomplete);
         assert!(open_output_file(tmp.path(), &relative).unwrap().is_some());
-        #[cfg(unix)]
+        // APFS refuses file names that are not valid UTF-8.
+        #[cfg(all(unix, not(target_os = "macos")))]
         {
             use std::os::unix::ffi::OsStringExt;
             std::fs::write(
