@@ -996,7 +996,7 @@ mod tests {
             "probe",
             "[ -z \"$(ls -A .)\" ] || exit 1\n\
              [ \"$(stat -c %a . 2>/dev/null || stat -f %Lp .)\" = 700 ] || exit 2\n\
-             [ -z \"$TERM\" ] || exit 4\n\
+             env | grep -q '^TERM=' && exit 4\n\
              read -r line && exit 5\n\
              echo ok_token",
         );
@@ -1183,7 +1183,7 @@ mod tests {
         let review = cmd.review();
         assert!(review.rendered.contains("\\n"));
         assert!(!review.rendered.contains('\n'));
-        assert_eq!(review.resolved_path, s);
+        assert_eq!(review.resolved_path, s.canonicalize().unwrap());
         assert_eq!(review.sha256, cmd.sha256());
         assert_eq!(review.timeout_secs, 10);
     }

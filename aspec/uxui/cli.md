@@ -150,6 +150,21 @@ belongs to rather than inventing a new code.
   that assert against the catalogue and the shared prompt/dialog data, not
   against a second copy of the literals.
 
+## HTTP API
+
+- Every newly generated error body is `{"error": "<message>", "code": "<snake_case>"}`. The
+  `code` is stable and documented once, in the error-code table in
+  `docs/09-api-and-remote-mode.md`; existing `error` text is preserved for compatibility. Codes
+  are defined by the `ApiError` type in `src/frontend/api/`, and the
+  asynchronous `result.failure.code` reuses the same vocabulary where the
+  conditions overlap. Idempotent replays preserve stored bytes; errors cached
+  before error codes were introduced may lack a code until the 24-hour expiry.
+- Every new user-visible route, request field or event type adds an entry to
+  the `features` list reported by `GET /v1/status` in the same change. The
+  list must not contain duplicates; a test asserts this.
+- A route is never removed within `v1`. When a resource gets a better path,
+  the old path keeps being served and the docs point to the new one.
+
 ## Output and configuration
 
 - Human-readable output goes to stdout, diagnostics to stderr. A

@@ -151,6 +151,24 @@ pub enum SessionSetupStatus {
 }
 
 impl SessionSetupStatus {
+    pub const ALL: &'static [SessionSetupStatus] = &[
+        Self::Initializing,
+        Self::CloningRepository,
+        Self::SettingUpBranch,
+        Self::MergingRefs,
+        Self::RunningReady,
+        Self::Ready,
+        Self::Failed,
+    ];
+
+    /// Exact, lower-case match on the wire spelling.
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|status| status.as_str() == s)
+    }
+
     pub fn is_terminal(&self) -> bool {
         matches!(self, Self::Ready | Self::Failed)
     }

@@ -3585,7 +3585,8 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    // APFS refuses file names that are not valid UTF-8.
+    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn legacy_lookup_preserves_tabs_newlines_and_native_path_bytes() {
         use std::os::unix::ffi::OsStringExt;
@@ -3627,7 +3628,7 @@ mod tests {
         git.create_worktree(&repo, &wt, "test-pointer").unwrap();
         assert_eq!(
             git.validate_worktree_owner(&repo, &wt).unwrap(),
-            repo.join(".git")
+            repo.join(".git").canonicalize().unwrap()
         );
         std::fs::write(
             wt.join(".git"),

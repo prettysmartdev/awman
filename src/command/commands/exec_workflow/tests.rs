@@ -4866,7 +4866,7 @@ async fn run_outputs_workflow(mounts: bool) {
         .iter()
         .find(|m| m.container_path == Path::new("/awman/output"))
         .expect("step outputs mount");
-    assert_eq!(mount.host_path, output);
+    assert_eq!(mount.host_path, output.canonicalize().unwrap());
     assert_eq!(
         mount.permission,
         crate::data::config::overlays::OverlayPermission::ReadWrite

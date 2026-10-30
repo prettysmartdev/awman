@@ -8,7 +8,6 @@ use std::sync::Arc;
 
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -22,7 +21,8 @@ use crate::command::commands::squad::gateway::EnvPush;
 use crate::command::dispatch::catalogue::{CommandCatalogue, FrontendKind};
 use crate::command::dispatch::{CommandOutcome, Dispatch};
 use crate::frontend::api::command_frontend::ApiDispatchFrontend;
-use crate::frontend::api::serve::{check_bearer_auth, error_json};
+use crate::frontend::api::error::ApiError;
+use crate::frontend::api::serve::check_bearer_auth;
 
 use super::state::SquadAppState;
 
@@ -54,6 +54,9 @@ pub fn build_router(state: Arc<SquadAppState>) -> Router {
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
+        ))
+        .layer(axum::middleware::from_fn(
+            crate::frontend::api::error::normalize_rejections,
         ))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
@@ -88,12 +91,12 @@ async fn handle_command(
     // literal `"squad"` itself (WI 0114 F-50).
     let catalogue = CommandCatalogue::get();
     if let Err(error) = catalogue.validate_for_frontend(FrontendKind::SquadDaemon, &path_parts) {
-        return (StatusCode::BAD_REQUEST, error_json(error.to_string())).into_response();
+        return ApiError::command_validation(&error).into_response();
     }
     if let Err(error) =
         catalogue.parse_raw_args_with_profile(&path_parts, &body.args, FrontendKind::SquadDaemon)
     {
-        return (StatusCode::BAD_REQUEST, error_json(error.to_string())).into_response();
+        return ApiError::command_validation(&error).into_response();
     }
 
     // ApiDispatchFrontend is the existing non-interactive Dispatch frontend.
@@ -120,23 +123,18 @@ async fn handle_command(
         Ok(CommandOutcome::Squad(outcome)) => squad_outcome_response(outcome),
         // The catalogue/front-door restriction above make this unreachable;
         // retain a safe error if a future Dispatch change violates the seam.
-        Ok(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            error_json("squad command dispatched to an unexpected command family"),
-        )
+        Ok(_) => ApiError::internal("squad command dispatched to an unexpected command family")
             .into_response(),
-        Err(error) => (
+        Err(error) => {
             if matches!(
                 error,
                 crate::command::error::CommandError::PrerequisiteWideningRefused { .. }
             ) {
-                StatusCode::FORBIDDEN
+                ApiError::request_forbidden(error.to_string()).into_response()
             } else {
-                StatusCode::BAD_REQUEST
-            },
-            error_json(error.to_string()),
-        )
-            .into_response(),
+                ApiError::command_validation(&error).into_response()
+            }
+        }
     }
 }
 
@@ -173,11 +171,9 @@ fn squad_outcome_response(outcome: SquadOutcome) -> Response {
         // admits it and this arm exists only to keep the match exhaustive.
         // Answering with the report anyway would quietly make the leaf
         // API-reachable, which is exactly what its catalogue flag refuses.
-        SquadOutcome::Env(_) => (
-            StatusCode::NOT_FOUND,
-            error_json("squad env is not available over the API"),
-        )
-            .into_response(),
+        SquadOutcome::Env(_) => {
+            ApiError::request_not_found("squad env is not available over the API").into_response()
+        }
     }
 }
 
@@ -186,11 +182,7 @@ async fn handle_status(State(state): State<Arc<SquadAppState>>) -> Response {
         Ok(status) => Json(status).into_response(),
         Err(error) => {
             tracing::error!(error = %error, "squad: failed to read daemon status");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                error_json("Failed to read daemon status"),
-            )
-                .into_response()
+            ApiError::internal("Failed to read daemon status").into_response()
         }
     }
 }
@@ -203,11 +195,7 @@ async fn handle_env_coverage(State(state): State<Arc<SquadAppState>>) -> Respons
         Ok(coverage) => Json(coverage).into_response(),
         Err(error) => {
             tracing::error!(error = %error, "squad: failed to read env coverage");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                error_json("Failed to read daemon env coverage"),
-            )
-                .into_response()
+            ApiError::internal("Failed to read daemon env coverage").into_response()
         }
     }
 }
@@ -225,21 +213,13 @@ async fn handle_env_push(
     let Ok(Json(push)) = body else {
         // No body echo, no serde message, no value — not even in the log.
         tracing::warn!("squad: rejected a malformed daemon env push");
-        return (
-            StatusCode::BAD_REQUEST,
-            error_json("malformed daemon env request"),
-        )
-            .into_response();
+        return ApiError::invalid_request("malformed daemon env request").into_response();
     };
     match state.handles.gateway().push_env(push).await {
         Ok(response) => Json(response).into_response(),
         Err(error) => {
             tracing::error!(error = %error, "squad: failed to apply env push");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                error_json("Failed to apply daemon env push"),
-            )
-                .into_response()
+            ApiError::internal("Failed to apply daemon env push").into_response()
         }
     }
 }
@@ -253,11 +233,7 @@ async fn handle_env_clear(State(state): State<Arc<SquadAppState>>) -> Response {
         Ok(cleared) => Json(serde_json::json!({ "cleared": cleared })).into_response(),
         Err(error) => {
             tracing::error!(error = %error, "squad: failed to clear stored env");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                error_json("Failed to clear the stored daemon env"),
-            )
-                .into_response()
+            ApiError::internal("Failed to clear the stored daemon env").into_response()
         }
     }
 }
@@ -269,20 +245,14 @@ async fn handle_workflow(
     match state.handles.workflow_state(&name).await {
         Ok(SquadWorkflowLookup::Found(workflow)) => Json(*workflow).into_response(),
         Ok(SquadWorkflowLookup::TaskNotFound) => {
-            (StatusCode::NOT_FOUND, error_json("task not found")).into_response()
+            ApiError::request_not_found("task not found").into_response()
         }
-        Ok(SquadWorkflowLookup::NoWorkflow) => (
-            StatusCode::NOT_FOUND,
-            error_json("no workflow for this task"),
-        )
-            .into_response(),
+        Ok(SquadWorkflowLookup::NoWorkflow) => {
+            ApiError::no_workflow("no workflow for this task").into_response()
+        }
         Err(error) => {
             tracing::error!(error = %error, "squad: failed to read workflow state");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                error_json("Failed to read workflow state"),
-            )
-                .into_response()
+            ApiError::internal("Failed to read workflow state").into_response()
         }
     }
 }

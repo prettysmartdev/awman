@@ -137,6 +137,15 @@ pub struct CommandListFilter<'a> {
     pub limit: i64,
 }
 
+/// Keep the retired status spelling usable as a list-filter alias.
+fn normalize_command_status_filter(status: &str) -> &str {
+    if status == "pending" {
+        "queued"
+    } else {
+        status
+    }
+}
+
 pub const IDEMPOTENCY_TTL_HOURS: u64 = 24;
 pub const IDEMPOTENCY_KEY_MAX_BYTES: usize = 255;
 
@@ -509,7 +518,7 @@ impl SqliteSessionStore {
                 session_id  TEXT NOT NULL REFERENCES sessions(id),
                 subcommand  TEXT NOT NULL,
                 args        TEXT NOT NULL,
-                status      TEXT NOT NULL DEFAULT 'pending',
+                status      TEXT NOT NULL DEFAULT 'queued',
                 exit_code   INTEGER,
                 started_at  TEXT,
                 finished_at TEXT,
@@ -547,6 +556,12 @@ impl SqliteSessionStore {
         // COLUMN, so pre-0136 commands read back as attempt 1. That is the
         // backfill; no separate UPDATE is needed.
         Self::add_column_if_missing(conn, "commands", "attempt", "INTEGER NOT NULL DEFAULT 1")?;
+        // WI 0138: old databases may contain the retired status. Convert rows
+        // in place without touching queued_at or rowid, which define claim order.
+        conn.execute(
+            "UPDATE commands SET status = 'queued' WHERE status = 'pending'",
+            [],
+        )?;
         // WI 0135: labels and idempotency are side tables so old databases
         // migrate additively without changing the stable session/command rows.
         conn.execute_batch(
@@ -837,6 +852,7 @@ impl SqliteSessionStore {
     pub fn list_sessions_filtered(
         &self,
         status: Option<&str>,
+        setup_status: Option<&str>,
         labels: &[LabelSelector],
     ) -> Result<Vec<SessionRecord>, DataError> {
         let mut sql = String::from(
@@ -846,6 +862,10 @@ impl SqliteSessionStore {
         if let Some(status) = status {
             sql.push_str(" AND s.status=?");
             args.push(Value::from(status.to_owned()));
+        }
+        if let Some(setup_status) = setup_status {
+            sql.push_str(" AND s.setup_status=?");
+            args.push(Value::from(setup_status.to_owned()));
         }
         append_label_predicates(&mut sql, &mut args, "session", "s.id", labels);
         sql.push_str(" ORDER BY s.created_at");
@@ -869,8 +889,12 @@ impl SqliteSessionStore {
             args.push(Value::from(session.to_owned()));
         }
         if let Some(status) = filter.status {
-            sql.push_str(" AND c.status=?");
-            args.push(Value::from(status.to_owned()));
+            if normalize_command_status_filter(status) == "queued" {
+                sql.push_str(" AND c.status IN ('queued','pending')");
+            } else {
+                sql.push_str(" AND c.status=?");
+                args.push(Value::from(status.to_owned()));
+            }
         }
         append_label_predicates(&mut sql, &mut args, "command", "c.id", filter.labels);
         sql.push_str(" ORDER BY c.queued_at DESC, c.rowid DESC LIMIT ?");
@@ -977,7 +1001,7 @@ impl SqliteSessionStore {
         let conn = self.lock();
         conn.execute(
             "INSERT INTO commands (id, session_id, subcommand, args, status, log_path)
-             VALUES (?1, ?2, ?3, ?4, 'pending', ?5)",
+             VALUES (?1, ?2, ?3, ?4, 'queued', ?5)",
             params![id, session_id, subcommand, args, log_path],
         )?;
         Ok(())
@@ -1035,7 +1059,7 @@ impl SqliteSessionStore {
         let conn = self.lock();
         let count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM commands \
-             WHERE session_id = ?1 AND status IN ('pending', 'running')",
+             WHERE session_id = ?1 AND status IN ('queued', 'running')",
             params![session_id],
             |r| r.get(0),
         )?;
@@ -1296,14 +1320,14 @@ impl SqliteSessionStore {
     pub fn claim_next_command(&self, worker_id: &str) -> Result<Option<CommandRecord>, DataError> {
         let now = chrono::Utc::now().to_rfc3339();
         let conn = self.lock();
-        // Atomically claim the next eligible command: must be queued (or legacy pending)
-        // and no other command in the same session can be running.
+        // Atomically claim the next eligible queued command and ensure no
+        // other command in the same session is already running.
         let mut stmt = conn.prepare(
             "UPDATE commands
              SET status = 'running', worker_id = ?1, started_at = ?2
              WHERE id = (
                  SELECT c.id FROM commands c
-                 WHERE c.status IN ('queued', 'pending')
+                 WHERE c.status IN ('queued','pending')
                    AND EXISTS (SELECT 1 FROM sessions s WHERE s.id=c.session_id AND s.setup_status='ready')
                    AND NOT EXISTS (
                        SELECT 1 FROM commands r
@@ -1365,7 +1389,7 @@ impl SqliteSessionStore {
     pub fn count_queued_for_session(&self, session_id: &str) -> Result<i64, DataError> {
         let conn = self.lock();
         let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM commands WHERE session_id = ?1 AND status = 'queued'",
+            "SELECT COUNT(*) FROM commands WHERE session_id = ?1 AND status IN ('queued','pending')",
             params![session_id],
             |r| r.get(0),
         )?;
@@ -1396,8 +1420,9 @@ impl SqliteSessionStore {
         let conn = self.lock();
         // First get the IDs
         let ids: Vec<String> = {
-            let mut stmt = conn
-                .prepare("SELECT id FROM commands WHERE session_id = ?1 AND status = 'queued'")?;
+            let mut stmt = conn.prepare(
+                "SELECT id FROM commands WHERE session_id = ?1 AND status IN ('queued','pending')",
+            )?;
             let rows = stmt
                 .query_map(params![session_id], |row| row.get(0))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1441,25 +1466,19 @@ impl SqliteSessionStore {
         session_id: &str,
     ) -> Result<Option<i64>, DataError> {
         let conn = self.lock();
-        // Get the queued_at for this command
-        let queued_at: Option<String> = conn
+        let position: Option<i64> = conn
             .query_row(
-                "SELECT queued_at FROM commands WHERE id = ?1 AND status = 'queued'",
-                params![command_id],
+                "SELECT (SELECT COUNT(*) FROM commands c
+                WHERE c.session_id = ?2 AND c.status IN ('queued','pending')
+                  AND ((c.queued_at IS NULL AND target.queued_at IS NOT NULL)
+                    OR c.queued_at < target.queued_at
+                    OR (c.queued_at IS target.queued_at AND c.rowid < target.rowid)))
+             FROM commands target WHERE target.id = ?1 AND target.status IN ('queued','pending')",
+                params![command_id, session_id],
                 |r| r.get(0),
             )
-            .ok();
-        let Some(queued_at) = queued_at else {
-            return Ok(None);
-        };
-        let position: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM commands
-             WHERE session_id = ?1 AND status = 'queued'
-               AND (queued_at < ?2 OR (queued_at = ?2 AND rowid < (SELECT rowid FROM commands WHERE id = ?3)))",
-            params![session_id, queued_at, command_id],
-            |r| r.get(0),
-        )?;
-        Ok(Some(position))
+            .optional()?;
+        Ok(position)
     }
 
     /// Update a session's status to an arbitrary value (e.g. 'closing').
@@ -1513,7 +1532,14 @@ fn command_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CommandR
         session_id: row.get(1)?,
         subcommand: row.get(2)?,
         args: row.get(3)?,
-        status: row.get(4)?,
+        status: {
+            let status: String = row.get(4)?;
+            if status == "pending" {
+                "queued".to_string()
+            } else {
+                status
+            }
+        },
         exit_code: row.get(5)?,
         started_at: row.get(6)?,
         finished_at: row.get(7)?,
@@ -1673,14 +1699,14 @@ mod tests {
         ];
         assert_eq!(
             store
-                .list_sessions_filtered(Some("active"), &selectors)
+                .list_sessions_filtered(Some("active"), None, &selectors)
                 .unwrap()
                 .len(),
             1
         );
         assert_eq!(
             store
-                .list_sessions_filtered(Some("active"), &[selectors[0].clone()])
+                .list_sessions_filtered(Some("active"), None, &[selectors[0].clone()])
                 .unwrap()
                 .len(),
             2,
@@ -2035,7 +2061,7 @@ mod tests {
         assert_eq!(cmd.id, "c1");
         assert_eq!(cmd.session_id, "s1");
         assert_eq!(cmd.subcommand, "chat");
-        assert_eq!(cmd.status, "pending");
+        assert_eq!(cmd.status, "queued");
         assert_eq!(cmd.log_path, "/logs/c1.log");
         assert!(cmd.exit_code.is_none());
     }
@@ -2238,6 +2264,111 @@ mod tests {
         let store = SqliteSessionStore::open(tmp.path()).unwrap();
         assert_eq!(store.get_command("old-1").unwrap().unwrap().attempt, 4);
         assert_eq!(store.get_command("old-2").unwrap().unwrap().attempt, 1);
+    }
+
+    #[test]
+    fn migration_normalizes_legacy_pending_and_preserves_claim_order_and_filter_alias() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("awman.db");
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE sessions (
+                    id TEXT PRIMARY KEY, workdir TEXT NOT NULL, created_at TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'active', closed_at TEXT
+                );
+                CREATE TABLE commands (
+                    id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id),
+                    subcommand TEXT NOT NULL, args TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending', exit_code INTEGER,
+                    started_at TEXT, finished_at TEXT, log_path TEXT NOT NULL,
+                    queued_at TEXT
+                );
+                INSERT INTO sessions (id, workdir, created_at)
+                    VALUES ('s-later', '/w', '2026-01-01'),
+                           ('s-first', '/w', '2026-01-01'),
+                           ('s-same-next', '/w', '2026-01-01');
+                INSERT INTO commands (id, session_id, subcommand, args, status, log_path, queued_at)
+                    VALUES ('later', 's-later', 'chat', '[]', 'pending', '/later', '2026-01-02T00:00:00Z'),
+                           ('first', 's-first', 'chat', '[]', 'pending', '/first', '2026-01-01T00:00:00Z'),
+                           ('same-time-next', 's-same-next', 'chat', '[]', 'pending', '/next', '2026-01-01T00:00:00Z');",
+            )
+            .unwrap();
+        }
+
+        let store = SqliteSessionStore::open(tmp.path()).unwrap();
+        let filter = CommandListFilter {
+            status: Some("pending"),
+            limit: 10,
+            ..CommandListFilter::default()
+        };
+        let filtered = store.list_commands_filtered(&filter).unwrap();
+        assert_eq!(filtered.len(), 3);
+        assert!(filtered.iter().all(|command| command.status == "queued"));
+
+        // Migration leaves both ordering columns alone: queued_at first,
+        // then the original rowid for ties.
+        for expected_id in ["first", "same-time-next", "later"] {
+            let claimed = store.claim_next_command("worker").unwrap().unwrap();
+            assert_eq!(claimed.id, expected_id);
+        }
+        assert!(store.claim_next_command("worker").unwrap().is_none());
+    }
+
+    #[test]
+    fn mixed_legacy_queue_keeps_null_first_order_across_reopens_and_old_writers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = SqliteSessionStore::open(tmp.path()).unwrap();
+        store.insert_session("s", "/work", "2026-01-01").unwrap();
+        store
+            .with_conn(|conn| {
+                conn.execute_batch(
+                    "INSERT INTO commands(id,session_id,subcommand,args,status,log_path,queued_at)
+                VALUES ('null','s','chat','[]','pending','/l',NULL),
+                       ('queued','s','chat','[]','queued','/l','2026-01-01'),
+                       ('pending','s','chat','[]','pending','/l','2026-01-01');",
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        drop(store);
+        for _ in 0..2 {
+            let store = SqliteSessionStore::open(tmp.path()).unwrap();
+            assert_eq!(store.count_queued_for_session("s").unwrap(), 3);
+            for (position, id) in ["null", "queued", "pending"].iter().enumerate() {
+                assert_eq!(store.get_command(id).unwrap().unwrap().status, "queued");
+                assert_eq!(
+                    store.queue_position_for_command(id, "s").unwrap(),
+                    Some(position as i64)
+                );
+            }
+        }
+        let store = SqliteSessionStore::open(tmp.path()).unwrap();
+        // An old daemon can still insert pending after our migration has run.
+        store
+            .with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO commands(id,session_id,subcommand,args,status,log_path,queued_at)
+                VALUES ('late','s','chat','[]','pending','/l','2026-01-02')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(store.get_command("late").unwrap().unwrap().status, "queued");
+        assert_eq!(store.count_queued_for_session("s").unwrap(), 4);
+        assert_eq!(
+            store.queue_position_for_command("late", "s").unwrap(),
+            Some(3)
+        );
+        for expected in ["null", "queued", "pending", "late"] {
+            let command = store.claim_next_command("worker").unwrap().unwrap();
+            assert_eq!(command.id, expected);
+            store
+                .complete_command(expected, "done", Some(0), None)
+                .unwrap();
+        }
+        assert!(store.claim_next_command("worker").unwrap().is_none());
     }
 
     // ─── Schema compatibility with legacy DB ──────────────────────────────────

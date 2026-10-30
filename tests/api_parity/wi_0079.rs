@@ -457,13 +457,23 @@ fn backward_compat_legacy_pending_commands_are_claimable() {
         })
         .unwrap();
 
-    // Insert legacy command via old insert_command (status='pending').
+    // The old insert_command entry point now writes `queued` (WI 0138);
+    // pre-existing `pending` rows are migrated (see api_db.rs).
     store
         .insert_command("legacy-c1", "s1", "exec workflow", "[]", "/logs/legacy")
         .unwrap();
 
+    store
+        .with_conn(|conn| {
+            conn.execute(
+                "UPDATE commands SET status='pending' WHERE id='legacy-c1'",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
     let cmd = store.get_command("legacy-c1").unwrap().unwrap();
-    assert_eq!(cmd.status, "pending");
+    assert_eq!(cmd.status, "queued");
 
     // Workers must be able to claim pending commands.
     let claimed = store

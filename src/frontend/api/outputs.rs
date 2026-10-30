@@ -28,8 +28,8 @@ use crate::data::fs::command_outputs::{
     content_type_for, list_output_dir, open_output_file, validate_output_path,
     MAX_SERVED_OUTPUT_BYTES,
 };
+use crate::frontend::api::error::ApiError;
 use crate::frontend::api::routes::AppState;
-use crate::frontend::api::serve::error_json;
 
 /// `GET /v1/commands/{id}/outputs`.
 pub async fn handle_list_outputs(
@@ -39,10 +39,7 @@ pub async fn handle_list_outputs(
     // Bound concurrent CPU/I/O work and cancel it when the request is dropped.
     static LISTINGS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
     let Ok(permit) = LISTINGS.try_acquire() else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            error_json("output listing busy; retry later"),
-        )
+        return ApiError::output_listing_unavailable("output listing busy; retry later")
             .into_response();
     };
     let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -66,11 +63,10 @@ pub async fn handle_list_outputs(
     .await;
     match listed {
         Ok(Some(Ok(listing))) => Json(listing).into_response(),
-        Ok(Some(Err(_))) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            error_json("output listing could not complete; retry later"),
-        )
-            .into_response(),
+        Ok(Some(Err(_))) => {
+            ApiError::output_listing_unavailable("output listing could not complete; retry later")
+                .into_response()
+        }
         Ok(None) => command_not_found(&command_id),
         Err(error) => internal_error(error),
     }
@@ -92,7 +88,7 @@ pub async fn handle_get_output(
 ) -> Response {
     // Reject a hostile path before looking anything up.
     if let Err(error) = validate_output_path(&path) {
-        return (StatusCode::BAD_REQUEST, error_json(error.to_string())).into_response();
+        return ApiError::invalid_request(error.to_string()).into_response();
     }
     let state = Arc::clone(&state);
     let id = command_id.clone();
@@ -133,24 +129,16 @@ pub async fn handle_get_output(
     .await;
     match fetched {
         Ok(Fetched::UnknownCommand) => command_not_found(&command_id),
-        Ok(Fetched::BadPath(message)) => {
-            (StatusCode::BAD_REQUEST, error_json(message)).into_response()
-        }
-        Ok(Fetched::Missing) => (
-            StatusCode::NOT_FOUND,
-            error_json(format!(
-                "Output '{path}' not found for command '{command_id}'"
-            )),
-        )
-            .into_response(),
-        Ok(Fetched::TooLarge(size)) => (
-            StatusCode::PAYLOAD_TOO_LARGE,
-            error_json(format!(
-                "Output '{path}' is {size} bytes; the largest output served is \
+        Ok(Fetched::BadPath(message)) => ApiError::invalid_request(message).into_response(),
+        Ok(Fetched::Missing) => ApiError::output_not_found(format!(
+            "Output '{path}' not found for command '{command_id}'"
+        ))
+        .into_response(),
+        Ok(Fetched::TooLarge(size)) => ApiError::output_too_large(format!(
+            "Output '{path}' is {size} bytes; the largest output served is \
                  {MAX_SERVED_OUTPUT_BYTES} bytes"
-            )),
-        )
-            .into_response(),
+        ))
+        .into_response(),
         Ok(Fetched::File(bytes)) => (
             StatusCode::OK,
             [
@@ -185,18 +173,10 @@ fn lookup_command(
 }
 
 fn command_not_found(command_id: &str) -> Response {
-    (
-        StatusCode::NOT_FOUND,
-        error_json(format!("Command '{command_id}' not found")),
-    )
-        .into_response()
+    ApiError::command_not_found(format!("Command '{command_id}' not found")).into_response()
 }
 
 fn internal_error(error: tokio::task::JoinError) -> Response {
     tracing::error!(%error, "Command outputs task failed");
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        error_json("failed to read command outputs"),
-    )
-        .into_response()
+    ApiError::internal("failed to read command outputs").into_response()
 }

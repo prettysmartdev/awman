@@ -70,9 +70,8 @@ SESSION=$(curl -sk -X POST "$SERVER/v1/sessions" \
 # 2. Dispatch a one-shot prompt; the response carries the command_id
 CMD=$(curl -sk -X POST "$SERVER/v1/commands" \
   -H "Authorization: Bearer $KEY" \
-  -H "x-awman-session: $SESSION" \
   -H 'Content-Type: application/json' \
-  -d '{"subcommand":"exec prompt","args":["Summarise recent changes","--non-interactive"]}' \
+  -d '{"session_id":"'"$SESSION"'","subcommand":"exec prompt","args":["Summarise recent changes","--non-interactive"]}' \
   | jq -r .command_id)
 
 # 3. Stream the output until the command finishes
@@ -129,9 +128,8 @@ SESSION=$(curl -sk -X POST "$SERVER/v1/sessions" \
 # 2. Run a workflow against the clone
 CMD=$(curl -sk -X POST "$SERVER/v1/commands" \
   -H "Authorization: Bearer $KEY" \
-  -H "x-awman-session: $SESSION" \
   -H 'Content-Type: application/json' \
-  -d '{"subcommand":"exec workflow","args":["aspec/workflows/implement-feature.toml","--work-item","0053"]}' \
+  -d '{"session_id":"'"$SESSION"'","subcommand":"exec workflow","args":["aspec/workflows/implement-feature.toml","--work-item","0053"]}' \
   | jq -r .command_id)
 
 # 3. Poll status until terminal
@@ -561,8 +559,8 @@ When using `awman remote` subcommands, the key is resolved and injected automati
 
 | Situation | HTTP status | Response body |
 |-----------|-------------|---------------|
-| No `Authorization` header | 401 | `{"error": "API key required. Pass the key via the Authorization header (e.g. Authorization: Bearer <key>)."}` |
-| Wrong key | 401 | `{"error": "Invalid API key."}` |
+| No `Authorization` header | 401 | `{"error": "API key required. Pass the key via the Authorization header (e.g. Authorization: Bearer <key>).", "code": "unauthorized"}` |
+| Wrong key | 401 | `{"error": "Invalid API key.", "code": "unauthorized"}` |
 
 Hash comparisons use constant-time comparison (`ring::constant_time::verify_slices_are_equal`) to prevent timing attacks.
 
@@ -680,7 +678,7 @@ Every `curl` example in the rest of this document elides `-k`/`--cacert` for bre
 |--------|------|-------------|
 | `GET` | `/v1/workdirs` | List the server's allowlisted working directories (`workdirs`) and workdir roots (`roots`) |
 | `POST` | `/v1/sessions` | Create a new session |
-| `GET` | `/v1/sessions` | List sessions; accepts optional `status` and repeatable `label` filters |
+| `GET` | `/v1/sessions` | List sessions; accepts optional `status`, `setup_status` and repeatable `label` filters |
 | `GET` | `/v1/sessions/:id` | Get session detail |
 | `GET` | `/v1/sessions/:id/status` | Session setup progress (`status` becomes `ready` when commands can be submitted) |
 | `GET` | `/v1/sessions/:id/queue` | Get queue status for a session (queued, running, recent completed) |
@@ -689,9 +687,9 @@ Every `curl` example in the rest of this document elides `-k`/`--cacert` for bre
 | `GET` | `/v1/commands` | List commands; filter by `session_id`, `status`, `label` |
 | `POST` | `/v1/commands/:id/cancel` | Cancel a queued or running command |
 | `POST` | `/v1/runs` | Create a session and run a command in one request |
-| `GET` | `/v1/commands/:id/status` | Get command status and metadata |
+| `GET` | `/v1/commands/:id` | Get command status and metadata (`/v1/commands/:id/status` returns the same body) |
 | `GET` | `/v1/commands/:id/logs` | Stream structured command events via Server-Sent Events; `?format=json` returns the captured events instead |
-| `GET` | `/v1/workflows/:id` | Get the workflow state for a command |
+| `GET` | `/v1/commands/:id/workflow` | Get the workflow state for a command (`/v1/workflows/:id` returns the same body) |
 | `GET` | `/v1/status` | Server health (uptime, active sessions, running commands, and supported `features`) |
 
 ### Agent commands
@@ -863,9 +861,9 @@ base = "main"
 ```sh
 curl -s -X POST http://localhost:9876/v1/commands \
   -H 'Authorization: Bearer <api-key>' \
-  -H 'x-awman-session: a1b2c3d4-e5f6-7890-abcd-ef1234567890' \
   -H 'Content-Type: application/json' \
   -d '{
+    "session_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
     "subcommand": "exec workflow",
     "args": ["aspec/workflows/implement-feature.toml", "--work-item", "0053"]
   }'
@@ -939,7 +937,11 @@ curl -s "http://localhost:9876/v1/sessions?status=active" \
   -H 'Authorization: Bearer <api-key>'
 ```
 
-The optional `status` query parameter filters by session status. Accepted values: `active`, `closing`, `closed`. The repeatable `label` parameter filters by [label](#labels) (`label=k=v` or `label=k`; all must match). An invalid value returns HTTP 400. Without parameters, all sessions are returned.
+The optional `status` query parameter filters by session status. Accepted values: `active`, `closing`, `closed`. The repeatable `label` parameter filters by [label](#labels) (`label=k=v` or `label=k`; all must match). The optional `setup_status` parameter filters by setup stage (`initializing`, `cloning_repository`, `setting_up_branch`, `merging_refs`, `running_ready`, `ready` or `failed`) and combines with `status` and `label`; for example `setup_status=failed` finds remote sessions whose clone or merge failed. An invalid value returns HTTP 400 `invalid_request`. Without parameters, all sessions are returned.
+
+Every session record carries `setup_status`. When it is `failed`, the record also carries `setup_error: {"stage": "...", "message": "..."}` (omitted if no error was recorded).
+
+The same readiness fields appear on `GET /v1/sessions/:id` and all JSON responses of `DELETE /v1/sessions/:id`. DELETE returns the session record when closed; while draining it returns a closing acknowledgement (202 initially, 200 if already closing) with `session_id`, `status`, readiness, `running_command_id`, `cancelled_count` and `message`.
 
 ```json
 {
@@ -950,7 +952,8 @@ The optional `status` query parameter filters by session status. Accepted values
       "status": "active",
       "created_at": "2026-04-20T12:00:00Z",
       "closed_at": null,
-      "labels": { "ci-run": "4812" }
+      "labels": { "ci-run": "4812" },
+      "setup_status": "ready"
     },
     {
       "id": "b2c3d4e5-...",
@@ -958,7 +961,8 @@ The optional `status` query parameter filters by session status. Accepted values
       "status": "closed",
       "created_at": "2026-04-19T09:00:00Z",
       "closed_at": "2026-04-19T09:47:13Z",
-      "labels": {}
+      "labels": {},
+      "setup_status": "ready"
     }
   ]
 }
@@ -971,7 +975,7 @@ curl -s http://localhost:9876/v1/sessions/<session-id> \
   -H 'Authorization: Bearer <api-key>'
 ```
 
-Returns the session record, including its `labels`. For remote sessions this includes `repo_url`, `branch`, `base_ref`, `merge_refs` (omitted when empty) and `push`. Returns HTTP 404 if the ID does not exist.
+Returns the session record, including its `labels`. It also includes `setup_status` (and `setup_error` when setup failed), so a client can tell whether the session is ready for commands without polling `/status`. For remote sessions this includes `repo_url`, `branch`, `base_ref`, `merge_refs` (omitted when empty) and `push`. Returns HTTP 404 if the ID does not exist.
 
 #### Close a session
 
@@ -1010,29 +1014,26 @@ Commands are submitted to a session and execute asynchronously. Submit a command
 ```sh
 curl -s -X POST http://localhost:9876/v1/commands \
   -H 'Authorization: Bearer <api-key>' \
-  -H 'x-awman-session: <session-id>' \
   -H 'Content-Type: application/json' \
-  -d '{"subcommand":"chat"}'
+  -d '{"session_id":"<session-id>","subcommand":"exec prompt","args":["hello"]}'
 ```
 
-Dispatches a subcommand to the session identified by the `x-awman-session` header. The API accepts commands enabled for API use, including squad task and daemon-management commands. `squad attach` is intentionally excluded: attaching owns an interactive PTY and must be run from the CLI or TUI.
+Dispatches a subcommand to the session named by the `session_id` field in the JSON body. The `x-awman-session` header is still supported as an alternative; if both are sent they must name the same session, otherwise the request is rejected with HTTP 400 `invalid_request`. Idempotency comparison covers whichever form was sent. The API accepts commands enabled for API use, including squad task and daemon-management commands. `squad attach` is intentionally excluded: attaching owns an interactive PTY and must be run from the CLI or TUI.
 
-For `exec`, the `args` array starts with the exec action (`prompt` or `workflow`/`wf`), followed by any further arguments:
+For `exec`, put the action in `subcommand` (`exec prompt` or `exec workflow`) and the action's arguments in `args`. A bare `"subcommand": "exec"` with the action as the first `args` entry is rejected at admission with HTTP 400 `invalid_request`:
 
 ```sh
 # exec prompt via API
 curl -s -X POST http://localhost:9876/v1/commands \
   -H 'Authorization: Bearer <api-key>' \
-  -H 'x-awman-session: <session-id>' \
   -H 'Content-Type: application/json' \
-  -d '{"subcommand":"exec prompt","args":["Fix the failing tests","--non-interactive"]}'
+  -d '{"session_id":"<session-id>","subcommand":"exec prompt","args":["Fix the failing tests","--non-interactive"]}'
 
 # exec workflow via API
 curl -s -X POST http://localhost:9876/v1/commands \
   -H 'Authorization: Bearer <api-key>' \
-  -H 'x-awman-session: <session-id>' \
   -H 'Content-Type: application/json' \
-  -d '{"subcommand":"exec workflow","args":["./aspec/workflows/implement-feature.toml","--work-item","0053","--prerequisite-unresolved","warn"]}'
+  -d '{"session_id":"<session-id>","subcommand":"exec workflow","args":["./aspec/workflows/implement-feature.toml","--work-item","0053","--prerequisite-unresolved","warn"]}'
 ```
 
 Workflow prerequisite options are passed in the same `args` array as CLI
@@ -1070,21 +1071,25 @@ This has always been awman's behavior for commands dispatched through the API; `
 
 Error responses:
 
-| Situation | HTTP status | `error` field |
-|-----------|-------------|---------------|
-| Session not found or closed | 404 | `"session not found"` (includes session UUID) |
-| Session is closing (graceful shutdown) | 409 | `"session is closing"` |
-| Unknown subcommand | 400 | `"unknown subcommand"` (includes list of valid subcommands) |
-| `x-awman-session` header missing | 400 | `"missing x-awman-session header"` |
+| Situation | HTTP status | `code` |
+|-----------|-------------|--------|
+| Session not found or closed | 404 | `session_not_found` |
+| Session is closing (graceful shutdown) | 409 | `session_closing` |
+| Session setup still running or failed | 409 | `session_not_ready` |
+| Unknown subcommand | 400 | `unknown_subcommand` |
+| Unknown flag | 400 | `unknown_flag` |
+| No session named in the body or the `x-awman-session` header, or the two disagree | 400 | `invalid_request` |
+
+See [Error responses](#error-responses) for the full list of codes.
 
 #### Get command status
 
 ```sh
-curl -s http://localhost:9876/v1/commands/<command-id>/status \
+curl -s http://localhost:9876/v1/commands/<command-id> \
   -H 'Authorization: Bearer <api-key>'
 ```
 
-Returns the current status and metadata for a command:
+Returns the current status and metadata for a command. `GET /v1/commands/{id}/status` is still served and returns the identical body.
 
 ```json
 {
@@ -1095,15 +1100,13 @@ Returns the current status and metadata for a command:
   "status": "queued",
   "queued_at": "2026-04-20T12:00:30Z",
   "queue_position": 2,
-  "labels": {},
-  "log_path": "~/.awman/api/sessions/a1b2c3d4-.../commands/e5f6a7b8-.../output.log"
+  "labels": {}
 }
 ```
 
 | `status` value | Meaning |
 |----------------|---------|
 | `queued` | Enqueued; waiting for a worker to claim it |
-| `pending` | Legacy spelling of `queued`; also claimable once setup is ready |
 | `running` | Claimed by a worker; container is executing |
 | `done` | Completed with exit code 0 |
 | `error` | Completed with a non-zero exit code |
@@ -1113,6 +1116,8 @@ For `new skill --pull-all`, awman attempts every reachable library even when
 one pull fails. If any library fails, the command is reported with
 `status: "error"` and `exit_code: 1`; successful library pulls are still
 processed and reported in the command log.
+
+**`log_path` (deprecated).** Responses to requests from a loopback address (`127.0.0.0/8` or `::1`) also carry `log_path`, the path of the command's output log on the server. It is omitted when the TCP peer is not loopback, and is deprecated: read output through `/v1/commands/{id}/logs` and `/v1/commands/{id}/outputs`. The address checked is the immediate TCP peer; forwarding headers are ignored. SSH tunnels and proxies running on the API host connect from loopback, so their clients can also receive this field. This check does not establish that the original client is local.
 
 **Other response fields:** `labels` is always present (empty object when none). `cancel_requested_at` appears once running cancellation has been requested and is retained on terminal reads. Optional fields are omitted when unavailable.
 
@@ -1172,7 +1177,7 @@ use `failure` for session setup errors instead of `setup_error`. The legacy
 `error_status` was a numeric HTTP-style error status, `stage` was a coarse
 failure label, and `setup_error` held the `/v1/runs` setup details. The legacy
 `error` field remains available as the human-readable message. A command row
-status is only `queued` (or legacy `pending`), `running`, `done`, `error` or
+status is only `queued`, `running`, `done`, `error` or
 `cancelled`; `aborted` and `paused` are values of `result.outcome`, not row
 statuses.
 
@@ -1439,7 +1444,7 @@ Stops a command that has not finished. No request body or `x-awman-session` head
 
 | Command is… | Response | Effect |
 |-------------|----------|--------|
-| Queued (or pending) | `200` with the command's status object | Cancelled immediately; it never starts. |
+| Queued | `200` with the command's status object | Cancelled immediately; it never starts. |
 | Running | `202` | The command is told to stop. Its containers are stopped and removed, then the command finishes as `cancelled`. |
 | Already finished (`done`, `error`, `cancelled`) | `200` with the command's status object | Nothing changes; the response shows the final state. |
 | Unknown ID | `404` `{"error":"Command '<id>' not found"}` | — |
@@ -1532,11 +1537,60 @@ curl -s "http://localhost:9876/v1/commands?label=job=nightly&status=running" \
 | Query parameter | Meaning |
 |-----------------|---------|
 | `session_id` | Only commands in this session |
-| `status` | One of `queued`, `pending`, `running`, `done`, `error`, `cancelled` |
+| `status` | One of `queued`, `running`, `done`, `error`, `cancelled`. The old value `pending` is still accepted as an alias for `queued` |
 | `label` | A [label](#labels) selector, `k=v` or `k`. Repeat the parameter to require several; all must match |
 | `limit` | Maximum results; default 100, clamped to 1–1000. A non-integer returns HTTP 400 |
 
-Returns `{"commands":[...]}`, newest first. Each entry has the same shape as `GET /v1/commands/:id/status`. An unknown `status` or malformed selector returns HTTP 400.
+Returns `{"commands":[...]}`, newest first. Each entry has the same shape as `GET /v1/commands/:id`. An unknown `status` or malformed selector returns HTTP 400.
+
+---
+
+### Error responses
+
+Idempotent replays preserve the originally stored response bytes. Errors cached by a server version before the `error_codes` feature may lack `code` until the key expires (24 hours).
+
+New error responses are JSON with a human-readable `error` message and a stable, machine-readable `code`:
+
+```json
+{ "error": "Session 'a1b2c3d4-...' not found", "code": "session_not_found" }
+```
+
+Match on `code`, not on the `error` text. Existing messages are preserved for compatibility. Some errors carry extra fields (for example `hint`, `session_id`, `setup_status` or `blocked_command`). Errors from the HTTP framework itself — malformed JSON, an unsupported content type, an oversized body, an unknown route or a wrong method — use the same shape and retain their original HTTP status, with the codes below.
+
+| `code` | HTTP status | Meaning |
+|--------|-------------|---------|
+| `unauthorized` | 401 | The `Authorization` header is missing or the key is wrong |
+| `forbidden_workdir` | 403 | The session `workdir` is not allowed by the [working directory allowlist](#working-directory-allowlist) |
+| `invalid_request` | 400 | The request is malformed or fails validation: bad JSON, an invalid query value, an invalid label selector or `Idempotency-Key`, no session named, or a body `session_id` that disagrees with the `x-awman-session` header |
+| `forbidden` | 403 | The requested operation is forbidden, including credential widening |
+| `not_found` | 404 | An unknown route or missing admission resource |
+| `method_not_allowed` | 405 | The route does not accept this HTTP method; see the `Allow` header |
+| `request_too_large` | 413 | The request body exceeds the limit |
+| `output_not_found` | 404 | The output file is unavailable |
+| `output_too_large` | 413 | The output exceeds the download limit |
+| `unsupported_media_type` | 415 | The request content type is unsupported |
+| `unprocessable_request` | 422 | The JSON cannot be decoded into the required request type |
+| `unknown_subcommand` | 400 | The `subcommand` is not a known command (a known command that is not available over the API is `invalid_request`) |
+| `unknown_flag` | 400 | `args` contains a flag the command does not accept |
+| `session_not_found` | 404 | The session does not exist, or is closed |
+| `session_closing` | 409 | The session is closing and rejects new commands |
+| `session_not_ready` | 409 | The session's setup has not finished or has failed |
+| `command_not_found` | 404 | No command with that ID exists |
+| `no_workflow` | 404 | The command did not run a workflow |
+| `workflow_not_started` | 404 | The workflow command has not produced a snapshot yet; retry |
+| `workflow_never_started` | 404 | The workflow command ended without producing a snapshot; stop polling |
+| `idempotency_conflict` | 422 | The `Idempotency-Key` was already used for a different request |
+| `idempotency_in_flight` | 409 | The original request with this `Idempotency-Key` is still being handled; sent with `Retry-After: 1` |
+| `internal` | 500 | The server failed to complete the request |
+| `unavailable` | 503 | Output listing is temporarily unavailable; retry after `Retry-After: 1` |
+| `worktree_exists` | 409 | A workflow worktree for this work item already exists |
+| `merge_conflict` | 409 | Merging the workflow branch conflicted |
+| `merge_target_dirty` | 409 | The merge target has uncommitted changes |
+| `workflow_prerequisites_unresolved` | 409 | Workflow credential prerequisites could not be resolved |
+| `unknown_agent` | 404 | The requested agent is not defined |
+| `agent_untrusted` | 403 | The agent definition has not been trusted |
+
+Validation codes (`invalid_request`, `unknown_subcommand`, `unknown_flag`, `forbidden_workdir`) and the last six codes are the same values reported asynchronously in a command's `result.failure.code`, so one decoder serves both. Several of them can also be returned synchronously when a request is rejected at admission. A run whose setup actually fails uses `setup_failed`; submitting a new command to an unready session uses `session_not_ready`, because that command has not been admitted.
 
 ---
 
@@ -1592,13 +1646,13 @@ curl -s -X POST http://localhost:9876/v1/runs \
   -d @run.json
 ```
 
-The key is 1–255 visible ASCII characters; anything else returns HTTP 400. Keys are remembered for 24 hours, per route and per API key (or shared when authentication is disabled). Two requests are the same when their JSON bodies are equivalent; for `POST /v1/commands` the `x-awman-session` header is part of the comparison.
+The key is 1–255 visible ASCII characters; anything else returns HTTP 400. Keys are remembered for 24 hours, per route and per API key (or shared when authentication is disabled). Two requests are the same when their JSON bodies are equivalent; for `POST /v1/commands` the selected session is part of the comparison, whether it was sent as the body `session_id` or the `x-awman-session` header (the same command and session replays either way).
 
 | Retry with the same key… | Result |
 |--------------------------|--------|
 | After the original completed, same body | The original status and body are replayed, with the header `Idempotent-Replayed: true`. No second session or command is created |
-| Same key, different body | HTTP 422 |
-| While the original is still being handled | HTTP 409 with `Retry-After: 1` (HTTP 422 if the body also differs) |
+| Same key, different body | HTTP 422 `idempotency_conflict` |
+| While the original is still being handled | HTTP 409 `idempotency_in_flight` with `Retry-After: 1` (HTTP 422 `idempotency_conflict` if the body also differs) |
 | After the original returned a 5xx | Treated as a new request; nothing was stored |
 
 Responses below 500 are replayed, including 4xx errors. If the daemon restarts before the client received the response, a retry still gets the original `202` when the resource had already been created; otherwise it is processed as new. Use a fresh key for each distinct piece of work.
@@ -1637,9 +1691,9 @@ Response (HTTP 202):
 { "session_id": "a1b2c3d4-...", "command_id": "e5f6a7b8-..." }
 ```
 
-`session` takes the same fields as [Create a session](#create-a-session) and `command` the same fields as [Submit a command](#submit-a-command), and both are validated before anything is created (HTTP 400, 403 or 404 as for those routes). The command is queued immediately and starts on its own once session setup reaches `ready`, so there is no readiness check and no HTTP 409 for an unready session. `Idempotency-Key` is supported.
+`session` takes the same fields as [Create a session](#create-a-session) and `command` the same fields as [Submit a command](#submit-a-command) except `session_id` (400 `invalid_request` if supplied: the run creates and selects its own session), and both are validated before anything is created (HTTP 400, 403 or 404 as for those routes). The command is queued immediately and starts on its own once session setup reaches `ready`, so there is no readiness check and no HTTP 409 for an unready session. `Idempotency-Key` is supported.
 
-Track the run with `GET /v1/commands/<command_id>/status` and `GET /v1/commands/<command_id>/logs`.
+Track the run with `GET /v1/commands/<command_id>` and `GET /v1/commands/<command_id>/logs`.
 
 **`close_on_finish`** (default `false`). When `true`, the session is closed as soon as the command reaches a terminal state — `done`, `error` or `cancelled` — and a remote session's clone is deleted. This also applies when setup fails or the run is cancelled before the command starts. Logs and command records are kept. With `false`, the session stays open for further commands.
 
@@ -1679,14 +1733,17 @@ curl -s http://localhost:9876/v1/status \
   "uptime_seconds": 11640,
   "active_sessions": 2,
   "running_commands": 1,
-  "features": ["workflow_state", "command_cancel", "labels", "idempotency", "runs"]
+  "features": ["error_codes", "workflow_state", "command_cancel", "labels", "idempotency", "runs", "structured_results", "outputs", "event_source", "step_activity", "command_record", "session_setup_status", "command_session_body"]
 }
 ```
 
 The `features` array lists capabilities clients can detect without relying on
 the server version. `workflow_state` means the server exposes live workflow
-snapshots through `GET /v1/workflows/:command_id`.
+snapshots through `GET /v1/commands/:id/workflow`.
 `command_cancel`, `labels`, `idempotency` and `runs` mean the server supports [command cancellation](#cancel-a-command), [labels](#labels), [idempotency keys](#idempotency-keys) and [`POST /v1/runs`](#one-shot-runs).
+`error_codes` means every error body carries a `code` ([Error responses](#error-responses)). `command_record` means `GET /v1/commands/:id` is served. `session_setup_status` means sessions carry `setup_status` and `setup_error` and `GET /v1/sessions` accepts `setup_status`. `command_session_body` means `POST /v1/commands` accepts `session_id` in the body.
+
+**Adding to the API.** Every new user-visible route, request field or event type adds an entry to `features` in the same change, so clients can detect it without parsing version numbers. The list never contains duplicates.
 
 ---
 
@@ -1734,12 +1791,12 @@ See [Worktrees](05-workflows.md#worktrees). Worktrees live under
 #### Get workflow state
 
 ```sh
-curl -s http://localhost:9876/v1/workflows/<command-id> \
+curl -s http://localhost:9876/v1/commands/<command-id>/workflow \
   -H 'Authorization: Bearer <api-key>'
 ```
 
-Returns the current workflow view for the given command. The alias
-`GET /v1/commands/{id}/workflow` returns the same body. The response retains
+Returns the current workflow view for the given command. The older path
+`GET /v1/workflows/{command_id}` is still served and returns the same body. The response retains
 the persisted `WorkflowState` fields and adds client-ready fields at read time;
 it does not change the local workflow state file.
 
@@ -1815,10 +1872,10 @@ across retries or resumes.
 | HTTP status | Meaning |
 |-------------|---------|
 | 200 | Workflow state found; body contains the persisted state plus computed workflow-view fields |
-| 404 `{"error": "command not found"}` | No command with that ID exists |
-| 404 `{"error": "no workflow for this command"}` | The command exists but did not run a workflow (e.g. `exec prompt` or `chat`) |
-| 404 `{"error": "workflow not started"}` | An `exec workflow` command is pending or running, but no workflow snapshot exists yet |
-| 404 `{"error": "workflow never started"}` | The workflow command ended before producing any snapshot; stop polling |
+| 404 `command_not_found` | No command with that ID exists |
+| 404 `no_workflow` | The command exists but did not run a workflow (e.g. `exec prompt` or `chat`) |
+| 404 `workflow_not_started` | An `exec workflow` command is queued or running, but no workflow snapshot exists yet |
+| 404 `workflow_never_started` | The workflow command ended before producing any snapshot; stop polling |
 | 401 | Missing or invalid API key (same auth middleware as all other endpoints) |
 
 **Polling for live workflow progress:**
@@ -1831,7 +1888,7 @@ KEY=<your-api-key>
 
 # Poll workflow progress until this command execution stops
 while true; do
-  RESP=$(curl -s "$SERVER/v1/workflows/$CMD" \
+  RESP=$(curl -s "$SERVER/v1/commands/$CMD/workflow" \
     -H "Authorization: Bearer $KEY")
   PHASE=$(echo "$RESP" | jq -r '.phase // .current_phase')
   echo "Workflow phase: $PHASE"
@@ -1848,11 +1905,10 @@ while true; do
 done
 ```
 
-If the endpoint returns HTTP 404 `{"error":"workflow not started"}`, the
-workflow state has not been created yet; retry while the command remains pending
-or running. `{"error":"workflow never started"}` means that execution has ended
-without a workflow snapshot. The exact
-`{"error":"no workflow for this command"}` response means the command did not
+If the endpoint returns HTTP 404 with `code` `workflow_not_started`, the
+workflow state has not been created yet; retry while the command remains queued
+or running. `workflow_never_started` means that execution has ended
+without a workflow snapshot. A `no_workflow` response means the command did not
 run a workflow. If a workflow state was previously returned and later becomes
 404, the state was removed; stop polling.
 
@@ -1876,9 +1932,8 @@ echo "Session: $SESSION"
 # 2. Submit a command
 CMD=$(curl -s -X POST "$SERVER/v1/commands" \
   -H "Authorization: Bearer $KEY" \
-  -H "x-awman-session: $SESSION" \
   -H 'Content-Type: application/json' \
-  -d '{"subcommand":"exec workflow","args":["./aspec/workflows/implement-feature.toml"]}' | jq -r .command_id)
+  -d '{"session_id":"'"$SESSION"'","subcommand":"exec workflow","args":["./aspec/workflows/implement-feature.toml"]}' | jq -r .command_id)
 echo "Command: $CMD"
 
 # 3. Poll until done
@@ -1929,9 +1984,8 @@ SESSION=$(curl -s -X POST "$SERVER/v1/sessions" \
 
 CMD=$(curl -s -X POST "$SERVER/v1/commands" \
   -H "Authorization: Bearer $KEY" \
-  -H "x-awman-session: $SESSION" \
   -H 'Content-Type: application/json' \
-  -d '{"subcommand":"exec prompt","args":["Fix the failing tests","--non-interactive"]}' | jq -r .command_id)
+  -d '{"session_id":"'"$SESSION"'","subcommand":"exec prompt","args":["Fix the failing tests","--non-interactive"]}' | jq -r .command_id)
 
 # Poll as usual...
 ```
@@ -2086,10 +2140,10 @@ On `SIGTERM` or `SIGINT`, the server finishes all in-flight HTTP responses and a
 
 | Situation | Behaviour |
 |-----------|-----------|
-| `workdir` not in allowlist on `POST /v1/sessions` | HTTP 403; response names the failed rule and lists the allowed directories and roots |
-| Session not found or already closed on `POST /v1/commands` | HTTP 404; response includes the session UUID |
+| `workdir` not in allowlist on `POST /v1/sessions` | HTTP 403 `forbidden_workdir`; response names the failed rule and lists the allowed directories and roots |
+| Session not found or already closed on `POST /v1/commands` | HTTP 404 `session_not_found`; response includes the session UUID |
 | Multiple `POST /v1/commands` in quick succession | All commands are enqueued; first returns immediately, subsequent requests also return immediately with different command IDs; all are processed in FIFO order (one per session at a time) |
-| Session is `closing` on `POST /v1/commands` | HTTP 409 `"session is closing"`; command is rejected to prevent new work during graceful shutdown |
+| Session is `closing` on `POST /v1/commands` | HTTP 409 `session_closing`; command is rejected to prevent new work during graceful shutdown |
 | Server already running when `api start` is invoked | Error printed; exits non-zero |
 | API server or squad daemon already running when the other is started | Error names the other process and its PID; the new process does not start |
 | Port already bound (EADDRINUSE) | Error includes the port number and PID holding it |
@@ -2098,16 +2152,17 @@ On `SIGTERM` or `SIGINT`, the server finishes all in-flight HTTP responses and a
 | `--workdir-root` is itself a Git repository | Startup refused (exit 2); use `--workdirs` for a single repository |
 | `awman api kill` when server is not running | Informational message; exits 0 |
 | `awman api logs` with no log file | Clear error suggesting `--background` |
-| Unknown `subcommand` in `POST /v1/commands` | HTTP 400; response lists valid subcommands |
-| `x-awman-session` header missing | HTTP 400 |
+| Unknown `subcommand` in `POST /v1/commands` | HTTP 400 `unknown_subcommand`; response lists valid subcommands |
+| No session in the body `session_id` or the `x-awman-session` header | HTTP 400 `invalid_request` |
+| Body `session_id` and `x-awman-session` header name different sessions | HTTP 400 `invalid_request` |
 | `exec prompt` with empty string | CLI validation error: `"prompt cannot be empty"` before any container launches |
 | `exec workflow` with `{{work_item_content}}` and no `--work-item` | Warning printed; placeholder left unexpanded; workflow continues |
 | `exec workflow --work-item <N>` where file not found | Error pointing to the expected path pattern; same message as `implement` |
 | `api.alwaysNonInteractive` true + duplicate `--non-interactive` flag in args | Flag is deduplicated; no error |
-| `exec` dispatched via HTTP API with unknown action (not `prompt`/`workflow`/`wf`) | HTTP 400; response lists valid exec actions |
+| `exec` dispatched via HTTP API as a bare `exec` (action in `args`) or with an unknown action | HTTP 400; use `exec prompt` or `exec workflow` as the `subcommand` |
 | `remote` subcommand dispatched via HTTP API without required args (e.g. no `--session`) | Subprocess exits with a clear error; output appears in the command log |
-| No `Authorization` header on any request | HTTP 401 with JSON body explaining which header to use |
-| Wrong API key on any request | HTTP 401 with JSON `{"error": "Invalid API key."}` |
+| No `Authorization` header on any request | HTTP 401 `unauthorized` with a JSON body explaining which header to use |
+| Wrong API key on any request | HTTP 401 with JSON `{"error": "Invalid API key.", "code": "unauthorized"}` |
 | `--refresh-key` used: existing clients present the old key | HTTP 401; clients must be updated with the new key |
 | `--dangerously-skip-auth` with a hash file on disk | Auth disabled for this run only; the hash file is not modified; next normal start re-enables auth |
 | `api_key.hash` file is missing or unreadable at startup | Server treats it as a first start and generates a new key |
@@ -2115,11 +2170,11 @@ On `SIGTERM` or `SIGINT`, the server finishes all in-flight HTTP responses and a
 | Session transitions to closed between list fetch and command dispatch | Server enforces rejection at `POST /v1/commands` regardless of filter; client receives HTTP 404 |
 | Startup cleanup: sessions closed exactly 24h ago | Not deleted until the next second boundary passes (exclusive `<` comparison) |
 | Startup cleanup: on-disk log files for cleaned sessions | Not deleted; they remain in `~/.awman/api/sessions/<uuid>/` for audit purposes |
-| `GET /v1/workflows/:command_id` — unknown command ID | HTTP 404 `{"error": "command not found"}` |
-| `GET /v1/workflows/:command_id` — command is not a workflow command | HTTP 404 `{"error": "no workflow for this command"}`; `workflow.state.json` is never created |
-| `GET /v1/workflows/:command_id` — command is `pending` (not yet started) | HTTP 404 `{"error": "workflow not started"}`; state is created when workflow execution starts |
-| `GET /v1/workflows/:command_id` — workflow is paused | HTTP 200; inspect the tagged step states and `current_phase`; polling may continue since the workflow can resume |
-| `GET /v1/workflows/:command_id` — workflow is complete | HTTP 200; inspect the tagged step states and `current_phase`; stop polling when the command status is terminal, including any merge-back outcome |
+| `GET /v1/commands/:id/workflow` — unknown command ID | HTTP 404 `command_not_found` |
+| `GET /v1/commands/:id/workflow` — command is not a workflow command | HTTP 404 `no_workflow`; `workflow.state.json` is never created |
+| `GET /v1/commands/:id/workflow` — command is `queued` (not yet started) | HTTP 404 `workflow_not_started`; state is created when workflow execution starts |
+| `GET /v1/commands/:id/workflow` — workflow is paused | HTTP 200; inspect the tagged step states and `current_phase`; polling may continue since the workflow can resume |
+| `GET /v1/commands/:id/workflow` — workflow is complete | HTTP 200; inspect the tagged step states and `current_phase`; stop polling when the command status is terminal, including any merge-back outcome |
 | Concurrent reads of `workflow.state.json` during a write | File is written atomically via rename; clients never observe a partial JSON document |
 | `DELETE /v1/sessions/:id` — no queued commands, no running command | HTTP 200; session immediately transitions to `closed` status |
 | `DELETE /v1/sessions/:id` — queued commands present, no running command | HTTP 200; all queued commands are cancelled; session immediately transitions to `closed` status |
@@ -2127,12 +2182,12 @@ On `SIGTERM` or `SIGINT`, the server finishes all in-flight HTTP responses and a
 | `DELETE /v1/sessions/:id` — called again while `closing` | HTTP 200; returns the current session state (still `closing` if command hasn't finished, or `closed` if it has) |
 | `POST /v1/commands/:id/cancel` — queued or already finished command | HTTP 200 with the command's status object |
 | `POST /v1/commands/:id/cancel` — running command | HTTP 202; poll the status endpoint until `cancelled` (exit code 130) |
-| `POST /v1/commands/:id/cancel` — unknown ID | HTTP 404 |
-| Create request repeated with the same `Idempotency-Key` | Original response replayed with `Idempotent-Replayed: true`; different body → 422; original still in flight → 409 |
+| `POST /v1/commands/:id/cancel` — unknown ID | HTTP 404 `command_not_found` |
+| Create request repeated with the same `Idempotency-Key` | Original response replayed with `Idempotent-Replayed: true`; different body → 422 `idempotency_conflict`; original still in flight → 409 `idempotency_in_flight` |
 | `GET /v1/sessions/:id/queue` — session has no commands | HTTP 200; returns `queue_depth: 0`, `running: null`, empty arrays for `queued` and `recent_completed` |
-| `GET /v1/sessions/:id/queue` — command is `pending` (queued but not yet claimed) | Appears in the `queued` array with a `position` indicating its place in the queue (0-indexed) |
+| `GET /v1/sessions/:id/queue` — command is `queued` (not yet claimed) | Appears in the `queued` array with a `position` indicating its place in the queue (0-indexed) |
 | `POST /v1/commands` with workflow file that doesn't exist | Command is enqueued; when the worker executes it, it fails with an error in the `result` field and status becomes `error` |
-| `POST /v1/commands` with an unknown flag or invalid flag value in `args` | Command is enqueued (202); the flags aren't checked against the command's catalogue until a worker claims it, at which point it fails with `status: "error"`, `exit_code: 1`, and a descriptive `result.error` |
+| `POST /v1/commands` with an unknown flag or invalid flag value in `args` | HTTP 400 at admission (`unknown_flag` for an unknown flag, `invalid_request` for an invalid value); no command is created |
 
 ---
 
@@ -2709,9 +2764,8 @@ SESSION=a1b2c3d4-...
 # Submit a command
 CMD=$(curl -s -X POST "$SERVER/v1/commands" \
   -H "Authorization: Bearer $KEY" \
-  -H "x-awman-session: $SESSION" \
   -H 'Content-Type: application/json' \
-  -d '{"subcommand":"exec workflow","args":["path/to/workflow.toml"]}' | jq -r .command_id)
+  -d '{"session_id":"'"$SESSION"'","subcommand":"exec workflow","args":["path/to/workflow.toml"]}' | jq -r .command_id)
 
 # Stream live output via SSE (prints each log line as it arrives)
 curl -s "$SERVER/v1/commands/$CMD/logs" \

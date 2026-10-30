@@ -336,7 +336,7 @@ fn command_error_codes_distinguish_the_variants_clients_act_on() {
         "agent_untrusted"
     );
     // Class codes for everything else.
-    assert_eq!(code(CommandError::SessionRepoUrlEmpty), "invalid_usage");
+    assert_eq!(code(CommandError::SessionRepoUrlEmpty), "invalid_request");
     assert_eq!(
         code(CommandError::WorkItemNotFound { number: 1 }),
         "not_found"
