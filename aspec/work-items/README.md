@@ -21,7 +21,7 @@ The findings below were verified against awman's source. Where noted, they were 
 
 | infact workaround | awman proposal | infact work items it simplifies |
 |---|---|---|
-| Commit the node spec onto `infact/wi-NNNN` so awman can read it | 0139 (HTTP issue source, `--issue` in dynamic mode, inline body) | 0004, 0009, 0012 |
+| Commit the node spec onto `infact/wi-NNNN` so awman can read it | 0139 (HTTP work item source, `--work-item` from any source in dynamic mode, inline body) | 0004, 0009, 0012 |
 | Downstream runs need upstream work: infact merges finished nodes into the default branch | 0133 (`base_ref`, `merge_refs`) as an alternative strategy | 0020 |
 | Generated workflows must not push; infact publishes and opens PRs | 0133 (`push: true`, `push_branch -u` fix) | 0004 |
 | Files changed and pushed commit computed by infact with git; failed steps from events | 0137 (structured `result`) | 0009, 0012 |
