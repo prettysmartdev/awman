@@ -89,6 +89,14 @@ impl EventBus {
     pub fn subscribe(&self) -> broadcast::Receiver<ExecutionEvent> {
         self.tx.subscribe()
     }
+
+    /// The sequence the next event of this attempt will carry.
+    pub fn next_sequence(&self) -> u64 {
+        self.publication
+            .lock()
+            .expect("publication lock poisoned")
+            .next_sequence
+    }
 }
 
 #[derive(Clone)]

@@ -1968,6 +1968,22 @@ async fn finish_terminal_log(
 /// the live event until the log catches up, replaying the missing prefix before
 /// advancing the client's id. The same path repairs broadcast lag. On failure,
 /// close without Done so the client resumes from its actual delivered cursor.
+/// Whether the running attempt's bus has published past what `cursor` has seen.
+async fn command_log_is_behind(
+    state: &AppState,
+    command_id: &str,
+    cursor: &CommandLogCursor,
+) -> bool {
+    state
+        .event_buses
+        .lock()
+        .await
+        .get(command_id)
+        .is_some_and(|bus| {
+            bus.attempt() == cursor.attempt && bus.next_sequence() > cursor.next_sequence
+        })
+}
+
 async fn recover_command_log_gap(
     state: &AppState,
     session_id: &str,
@@ -2226,6 +2242,16 @@ async fn handle_stream_command_logs(
                         if command_is_terminal(&row.status) {
                             finish_terminal_log(&state, &session_id, &command_id, &mut cursor, &mut live_rx, &tx).await;
                             return;
+                        }
+                        // Events published before this subscription, or lost
+                        // to lag, reach the client only through the log. Do
+                        // not leave them waiting on a later event that a quiet
+                        // command may never emit.
+                        if command_log_is_behind(&state, &command_id, &cursor).await {
+                            let events = command_log_events(&state, &session_id, &command_id).await;
+                            if !cursor.replay(&events, &tx).await {
+                                return;
+                            }
                         }
                     }
                     result = receiver.recv() => match result {

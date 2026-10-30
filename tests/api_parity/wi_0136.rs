@@ -521,6 +521,48 @@ async fn resuming_a_live_stream_across_a_disconnect_loses_nothing() {
     assert_eq!(count_done(&resumed), 1);
 }
 
+/// Events a client connected too late to receive live, and that the log did
+/// not hold yet when it was replayed, arrive with no further output.
+#[tokio::test]
+async fn events_the_log_writer_had_not_flushed_at_connect_still_arrive() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = make_state(tmp.path());
+    let base = serve(Arc::clone(&state)).await;
+    enqueue(&state, "behind");
+    let record = state.store.claim_next_command("w").unwrap().unwrap();
+    let bus = Arc::new(EventBus::for_attempt(4096, record.attempt));
+    let mut log_rx = bus.subscribe_log();
+    state
+        .event_buses
+        .lock()
+        .await
+        .insert("behind".to_string(), Arc::clone(&bus));
+    for i in 0..3 {
+        bus.sender().emit(EventPayload::StdoutLine(format!("l{i}")));
+    }
+
+    // The client replays an empty log, and only then does the writer catch up.
+    let mut client = Sse::open(&base, "behind", "", None).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let mut writer = CommandLogWriter::open_append(&state.paths, SESSION, "behind")
+        .await
+        .unwrap();
+    for _ in 0..3 {
+        writer.write_event(&log_rx.recv().await.unwrap()).await;
+    }
+    writer.flush().await;
+
+    let mut seen = Vec::new();
+    while seen.len() < 3 {
+        let frame = tokio::time::timeout(Duration::from_secs(10), client.next())
+            .await
+            .expect("flushed events reach a quiet stream")
+            .unwrap();
+        seen.extend(frame.id);
+    }
+    assert_eq!(seen, ["1:0", "1:1", "1:2"]);
+}
+
 #[tokio::test]
 async fn a_stale_attempt_id_replays_from_the_start_of_the_current_attempt() {
     let tmp = tempfile::tempdir().unwrap();

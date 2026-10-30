@@ -331,6 +331,24 @@ impl BuiltinState {
     }
 }
 
+/// Retry a zero-wait lock that a test just released. A process forked by a
+/// concurrent test holds a copy of the descriptor, and so the lock, until it
+/// execs.
+#[cfg(test)]
+fn after_forked_copies_close<T>(
+    mut lock: impl FnMut() -> Result<T, DataError>,
+) -> Result<T, DataError> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match lock() {
+            Err(DataError::BuiltinStateBusy { .. }) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            result => return result,
+        }
+    }
+}
+
 #[cfg(test)]
 mod upgrade_tests;
 
@@ -555,7 +573,7 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         drop(lease);
-        assert!(state.image_lease("agent:1", true).is_ok());
+        assert!(after_forked_copies_close(|| state.image_lease("agent:1", true)).is_ok());
     }
 
     #[test]

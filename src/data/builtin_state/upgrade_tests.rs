@@ -725,12 +725,12 @@ fn existing_image_leases_are_taken_exclusively_or_reported_busy() {
         Err(DataError::BuiltinStateBusy { .. })
     ));
     drop(launch);
-    let held = state.lock_image_leases().unwrap();
+    let held = after_forked_copies_close(|| state.lock_image_leases()).unwrap();
     assert_eq!(held.len(), 1);
     assert!(matches!(
         state.image_lease("image:tag", false),
         Err(DataError::BuiltinStateBusy { .. })
     ));
     drop(held);
-    assert!(state.image_lease("image:tag", false).is_ok());
+    assert!(after_forked_copies_close(|| state.image_lease("image:tag", false)).is_ok());
 }
