@@ -2,7 +2,7 @@
 
 Title: Codebase simplicity, modularity, idiomatic Rust, duplication, and architecture conformance remediation
 Issue: Not linked
-Status: Proposed — findings revalidated 2026-10-30 against `6128a50f`; architecture audit added; implementation not started. One maintainer decision (D1, under A05) is open; it blocks A05 only.
+Status: Proposed — findings revalidated 2026-10-30 against `6128a50f`, with code touched by WI 0138 rechecked at `55d7fbbd`; architecture audit added; maintainer decisions recorded (D1, F01, F04); implementation not started.
 
 ## Summary:
 
@@ -45,7 +45,7 @@ The 2026-10-30 revalidation re-read the cited code for every finding, using file
 Validation performed on 2026-10-30:
 
 - `bash tools/architecture-lint.sh`: passed (see F15 and A05 for what that does and does not prove).
-- `cargo clippy --workspace --all-targets --locked -- -D warnings`: passed with default features.
+- `cargo clippy --workspace --all-targets --locked -- -D warnings`: passed with default features, at `6128a50f` and again at `55d7fbbd`.
 - Not run: the test suite, the `builtin-runtime` feature, Docker/native runtime paths, macOS. Findings describing behavior are source-derived; none was reproduced with a failing test.
 
 Line numbers are review-time locators. Use the named functions and types when edits shift them.
@@ -94,11 +94,11 @@ All findings are in scope, but land them in coherent batches. Do not combine all
 
 **Already done:** `QueuedCommandResult::publish` (`src/command/commands/api_server/queue_worker.rs:330`) is now the shared completion path, including the early directory-failure branch at 655–679.
 
-**Evidence:** when `persist` fails, `publish` logs the error and sends subscribers an in-memory terminal event, leaving the row `running`. At the next startup, `recover_stale_commands(0)` (`runtime.rs:272`, `src/data/fs/api_db.rs:1415`) returns every `running` row to `queued` and increments its attempt. Separately, `execute_command` decodes stored args with `unwrap_or_default` at line 634, ignores metadata writes at 695 and 1050, and `ApiServerRuntime` bootstrap discards lifecycle writes at `runtime.rs:163, 204, 213, 222–235`, including `finalize_unowned_command`.
+**Evidence:** when `persist` fails, `publish` logs the error and sends subscribers an in-memory terminal event, leaving the row `running`. At the next startup, `recover_stale_commands(0)` (`runtime.rs:272`, `src/data/fs/api_db.rs:1440`) returns every `running` row to `queued` and increments its attempt. Separately, `execute_command` decodes stored args with `unwrap_or_default` at line 634, ignores metadata writes at 695 and 1050, and `ApiServerRuntime` bootstrap discards lifecycle writes at `runtime.rs:163, 204, 213, 222–235`, including `finalize_unowned_command`.
 
 **Impact:** clients are told a command finished while the database disagrees. A restart can then run the agent's side effects a second time. Corrupt stored args become an empty metadata vector instead of a queue-record error.
 
-**Remediation:** retry the row write a small fixed number of times. Before the first attempt, have Layer 0 write a terminal sidecar in the command directory holding the completion's status, exit code, and result JSON. During startup recovery, a `running` row with a sidecar is finalized from it instead of requeued; the sidecar is removed once the row is terminal. A `running` row with no sidecar keeps today's requeue behavior, because that process really did die mid-run. Decode stored args once at the queue boundary and fail the command with a named queue-record error when they are invalid. Check the bootstrap writes at `runtime.rs:163–235`: failures of authoritative row writes are logged with session and command identity, and metadata remains best effort but logged.
+**Remediation (sidecar approach confirmed by the maintainer, 2026-10-30):** retry the row write a small fixed number of times. Before the first attempt, have Layer 0 write a terminal sidecar in the command directory holding the completion's status, exit code, and result JSON. During startup recovery, a `running` row with a sidecar is finalized from it instead of requeued; the sidecar is removed once the row is terminal. A `running` row with no sidecar keeps today's requeue behavior, because that process really did die mid-run. Decode stored args once at the queue boundary and fail the command with a named queue-record error when they are invalid. Check the bootstrap writes at `runtime.rs:163–235`: failures of authoritative row writes are logged with session and command identity, and metadata remains best effort but logged.
 
 **Acceptance:** with an injected completion-write failure after a side-effecting fake command, a restart finalizes the row and does not redispatch. A crash before completion still requeues. Cover directory/setup errors, malformed stored args, closing-session handling, and sidecar removal. Preserve exit-code and partial-failure behavior.
 
@@ -130,7 +130,7 @@ All findings are in scope, but land them in coherent batches. Do not combine all
 
 **Impact:** malformed or unreadable global config discards the configured concurrency limit, guidance, and leader/model policy while the scheduler continues admitting work.
 
-**Remediation:** on a failed reload, admit no new work for that tick, report the named config error once per distinct error rather than every tick, and continue observing existing runs. Resume admission automatically on the next valid reload. Do not keep a last-known-good policy. A genuinely absent file keeps its documented default behavior.
+**Remediation (confirmed by the maintainer, 2026-10-30):** on a failed reload, admit no new work for that tick, report the named config error once per distinct error rather than every tick, and continue observing existing runs. Resume admission automatically on the next valid reload. Do not keep a last-known-good policy. A genuinely absent file keeps its documented default behavior.
 
 **Acceptance:** valid → malformed/unreadable → valid transitions do not launch with default policy, do not lose in-flight accounting, and recover without restart. Retain live reload for valid edits.
 
@@ -194,7 +194,7 @@ All findings are in scope, but land them in coherent batches. Do not combine all
 
 **Already done:** `src/data/command_status.rs` names command status spellings, and its doc comment records that the column stays a free `String`.
 
-**Evidence:** `SessionRecord` and `CommandRecord` (`src/data/fs/api_db.rs:26, 32, 105`), plus `update_setup_status` (685), `complete_command` (1329), and `update_session_status` (1466), still take strings. `QueuedCommandResult.status` is `&'static str` (`queue_worker.rs:46`). Session status has no enum, so literals are compared in `runtime.rs:158, 475–476, 493, 569–570, 633–637`, `queue_worker.rs:432–434, 1005, 1081`, and `routes.rs:372, 1238, 1246, 2299`. There are now three command-status types: `data::command_status::CommandStatus`, `data::session::CommandStatus` (`session.rs:120`), and `data::execution_event::CommandStatusKind`.
+**Evidence:** `SessionRecord` and `CommandRecord` (`src/data/fs/api_db.rs`), plus `update_setup_status` (700), `complete_command` (1350), and `update_session_status` (1485), still take strings. `QueuedCommandResult.status` is `&'static str` (`queue_worker.rs:46`). Session status has no enum, so literals are compared in `runtime.rs:158, 475–476, 493, 569–570, 633–637`, `queue_worker.rs:432–434, 1005, 1081`, and `routes.rs:451, 1316, 1332, 2377, 2459`. There are now three command-status types: `data::command_status::CommandStatus`, `data::session::CommandStatus` (`session.rs:120`), and `data::execution_event::CommandStatusKind`.
 
 **Impact:** invalid states and spelling drift compile. Two public types with one name and different variants invite the wrong import.
 
@@ -300,7 +300,7 @@ These were checked and need no work. Do not reopen them under this item:
 
 **Rule:** T2; L3 “no specific persistence logic,” “only job is to translate.” **Kind:** violation.
 
-**Evidence:** in `src/frontend/api/routes.rs`, `create_submission` (866) inserts the session row (954), records remote fields (972) and labels, records the run (1008), enqueues the command, compensates by closing the session on failure, and creates the setup bus. `enqueue_command` (1581) performs the command insert. `AdmissionJournal` and `with_idempotency` (494–700) implement the idempotency reservation state machine, including its `Drop` release (560).
+**Evidence:** in `src/frontend/api/routes.rs`, `create_submission` (950) inserts the session row (1034), records remote fields (1048) and labels (1065), records the run (1080), enqueues the command, compensates by closing the session on failure, and creates the setup bus. `enqueue_command` (1656) performs the command insert. `AdmissionJournal` and `with_idempotency` (584–790) implement the idempotency reservation state machine, including its `Drop` release (650). WI 0138 added `command_idempotency_canonical` here as well.
 
 **Impact:** the ordering of these writes is crash-consistency logic, as the file's own comments say. Any other HTTP host, including the daemon proposed by WI 0145, would have to reproduce it. It is also not testable without HTTP.
 
@@ -312,7 +312,7 @@ These were checked and need no work. Do not reopen them under this item:
 
 **Rule:** T2. **Kind:** violation.
 
-**Evidence:** `CommandLogCursor` (`routes.rs:1679`), `ReplayFrom` use, `command_log_events` (1825), `finish_terminal_log` (1840), `recover_command_log_gap` (1909), and `wait_for_worker` (1943) implement resume, deduplication, gap repair, and terminal-event rules. `handle_stream_command_logs` (1983) runs them inline in the SSE stream.
+**Evidence:** `CommandLogCursor` (`routes.rs:1741`), `ReplayFrom` use, `command_log_events` (1887), `finish_terminal_log` (1902), `recover_command_log_gap` (1987), and `wait_for_worker` (2021) implement resume, deduplication, gap repair, and terminal-event rules. `handle_stream_command_logs` (2061) runs them inline in the SSE stream.
 
 **Impact:** event delivery guarantees are business rules in a transport adapter. WI 0146's live terminals and any non-SSE consumer would need the same rules.
 
@@ -324,11 +324,11 @@ These were checked and need no work. Do not reopen them under this item:
 
 **Rule:** T2; L3 “no validation of requests.” **Kind:** violation.
 
-**Evidence:** `command_is_terminal` (`routes.rs:278`); session status validation with literals in `ListQuery` (372); queue assembly and positions in `handle_get_session_queue` (2232–2310), including filtering on `"queued"` and decoding stored args with an empty-array fallback; `fallback_status_from_db` (1335).
+**Evidence:** `command_is_terminal` (`routes.rs:325`); session status validation with literals in `ListQuery` (451); queue assembly and positions in `handle_get_session_queue` (2317–2395), including filtering on `"queued"` and decoding stored args with an empty-array fallback; the workflow route choosing its error from status literals (2459); `fallback_status_from_db` (1423).
 
-**Remediation:** after F10, move these to Layer 2/Layer 0 read-model methods returning typed views: `SessionStatus::parse`, `CommandStatus::is_terminal`, a queue-view method, and the status fallback. Share F01's stored-args decoding. Field-level request shape validation remains acceptable where serde does it. WI 0138 owns the error-code and resource-layout work; do not duplicate it.
+**Remediation:** after F10, move these to Layer 2/Layer 0 read-model methods returning typed views: `SessionStatus::parse`, `CommandStatus::is_terminal`, a queue-view method, and the status fallback. Share F01's stored-args decoding. Field-level request shape validation remains acceptable where serde does it. WI 0138 has landed; its error codes in `src/frontend/api/error.rs` are the contract, and mapping typed outcomes to them stays in Layer 3.
 
-**Acceptance:** status codes and bodies are unchanged except where WI 0138 deliberately changes them. No lifecycle literal comparisons remain in `routes.rs`.
+**Acceptance:** status codes, error codes, and bodies are unchanged, with `tests/api_parity/wi_0138.rs` passing. No lifecycle literal comparisons remain in `routes.rs`.
 
 ### A04 — P2: The CLI routes `exec workflow` itself
 
@@ -342,15 +342,15 @@ These were checked and need no work. Do not reopen them under this item:
 
 **Acceptance:** `exec workflow`, alias `wf`, JSON output, and exit codes behave as before in `cli_parity` and binary smoke tests. `cli::run` contains no command-specific branch.
 
-### A05 — P2: Tenet 1 and the lint disagree on layer skipping (needs a maintainer decision)
+### A05 — P2: Tenet 1 and the lint disagree on layer skipping
 
 **Rule:** T1. **Kind:** spec ambiguity.
 
-**Evidence:** Tenet 1 says each layer exposes its API “ONLY to the layer ABOVE,” while the lint header explicitly allows Layer 3 to import `data` and `engine`, and Layer 2 to import `data`. Non-test frontend code has 124 `use crate::engine::` and 150 `use crate::data::` lines. Most are types and engine-defined frontend traits (`engine::workflow`, `data::message`). Some are behavior: `Tab::new_with_git_engine` and `start_git_diff_poll_task` (`tui/git_sidebar.rs:63`) poll `GitEngine` from the TUI; `routes.rs:890, 897` pass `engines.git_engine` into request validation; `tui/app.rs:1123` drains notices from the concrete `ContainerRuntime`. The same document also tells the TUI and API to use `SessionManager` directly.
+**Evidence:** Tenet 1 says each layer exposes its API “ONLY to the layer ABOVE,” while the lint header explicitly allows Layer 3 to import `data` and `engine`, and Layer 2 to import `data`. Non-test frontend code has 124 `use crate::engine::` and 150 `use crate::data::` lines. Most are types and engine-defined frontend traits (`engine::workflow`, `data::message`). Some are behavior: `Tab::new_with_git_engine` and `start_git_diff_poll_task` (`tui/git_sidebar.rs:63`) poll `GitEngine` from the TUI; `routes.rs:974, 981` pass `engines.git_engine` into request validation; `tui/app.rs:1123` drains notices from the concrete `ContainerRuntime`. The same document also tells the TUI and API to use `SessionManager` directly.
 
-**D1 — Decision needed:** what may Layer 3 import from Layers 0 and 1? The recommendation, which implementers should assume only after the maintainer confirms it: Layer 3 may import data types and engine-defined frontend traits/types, but may not call engine behavior except through Layer 2. Tenet 1 and the lint header are then amended to say so. The alternative, reexporting everything through Layer 2, is about 270 import lines of churn for little protection.
+**D1 — Decided by the maintainer, 2026-10-30:** Layer 3 may import data types and engine-defined frontend traits/types, but may not call engine behavior except through Layer 2. Tenet 1 and the lint header are amended to say so. Reexporting everything through Layer 2 and keeping the current lint rule were both rejected.
 
-**Remediation once decided (under the recommendation):** route the three behavior cases above through Layer 2 (a small Layer 2 git-summary source for the TUI, session-create validation inside A01's admission type, runtime notices via a Layer 2 method). Add a lint rule rejecting `engines.<engine field>.` in `src/frontend`, with the fixtures from F15. Do not start this finding before D1 is answered.
+**Remediation:** route the three behavior cases above through Layer 2 (a small Layer 2 git-summary source for the TUI, session-create validation inside A01's admission type, runtime notices via a Layer 2 method). Add a lint rule rejecting `engines.<engine field>.` in `src/frontend`, with the fixtures from F15.
 
 **Acceptance:** the document and lint agree; the lint rule has allow and deny fixtures; the TUI sidebar behaves the same.
 
@@ -399,10 +399,10 @@ Use a coordinating integrator and bounded implementers. These are future assignm
 
 | Owner | Findings / owned area | Dependencies and handoff |
 | --- | --- | --- |
-| Integrator | Baseline, shared interface decisions, final review, F12, A05 (after D1), A06, A08 | Reserve `dispatch/mod.rs`, manifests, module exports, and common error variants; approve small interface changes before consumers branch |
+| Integrator | Baseline, shared interface decisions, final review, F12, A05, A06, A08 | Reserve `dispatch/mod.rs`, manifests, module exports, and common error variants; approve small interface changes before consumers branch |
 | Persistence/config implementer | F01, F03, F04, F07, F10 | Land F03/F04 first; coordinate typed statuses with queue completion and with the API implementer |
 | Runtime implementer | F02, F08, F09, F11, A07 | Agree launch-resource ownership first; hand typed launch inputs to command changes |
-| API implementer | A01, A02, A03, F05 | A03 follows F10. Agree the admission type with the integrator. Coordinate with WI 0138 and WI 0145 owners |
+| API implementer | A01, A02, A03, F05 | A03 follows F10. Agree the admission type with the integrator. Coordinate with the WI 0145 owner |
 | Frontend implementer | F06, F13, A04 | Agree the typed input boundary with the integrator. A04 follows F06 |
 | Verification/cleanup implementer | F14–F17 | Run after or alongside independent fixes; the integrator owns final manifest edits; never change other agents' source to make a check pass silently |
 
@@ -410,10 +410,10 @@ Run only as many assignments concurrently as the available team supports. Test c
 
 Landing sequence:
 
-1. Establish the baseline and focused failing regressions; agree DB status, input, resource, and admission contracts. Get the D1 decision.
+1. Establish the baseline and focused failing regressions; agree DB status, input, resource, and admission contracts.
 2. Land F01–F04 correctness fixes with their tests. Review F03/F04 together for reload behavior.
 3. Land F05–F11 in independently reviewable behavior/duplication batches.
-4. Land A01–A03 before WI 0138 and WI 0145 start, because those items change the same routes and daemon code. If either has started, the integrator re-sequences with its owner.
+4. Land A01–A03 before WI 0145 starts, because it changes the same API and daemon code. WI 0138 has already landed, so A01–A03 build on its routes. If WI 0145 has started, the integrator re-sequences with its owner.
 5. Land F12, F13, A04, and A05 after the affected contracts settle, preserving behavior.
 6. Finish F14–F17 and A06–A08, then run the integrated validation matrix.
 
@@ -430,7 +430,7 @@ For each finding, record: commit/change location, behavior before/after, focused
 - Moving idempotency logic (A01) must keep a retried request from creating a second session or command across a crash, and must keep the reservation released when a handler future is dropped.
 - Avoid widening mounts, network policy, credentials, or host execution while consolidating code. Keep native and sandbox capability refusals explicit.
 - Keep private-file versus repo-file permissions intentional; atomic publication must not silently change established symlink or concurrent-writer behavior.
-- Coordinate upstream runtime work with WI 0120, Linux/native gates with WI 0124, API surface with WI 0138, daemon structure with WI 0145, and live terminals with WI 0146. Do not duplicate their feature scope here.
+- Coordinate upstream runtime work with WI 0120, Linux/native gates with WI 0124, daemon structure with WI 0145, and live terminals with WI 0146. Do not duplicate their feature scope here.
 
 ## Test Considerations:
 
@@ -452,7 +452,7 @@ On provisioned supported hosts, also compile/lint the builtin feature, exercise 
 Completion criteria:
 
 - [ ] F01–F17 and A01–A08 each have implementation/test evidence or a justified current-tree withdrawal.
-- [ ] D1 is answered and recorded here, and Tenet 1 and the lint agree.
+- [ ] Tenet 1 and the lint both state the D1 rule.
 - [ ] Shared policy has one owning implementation; retained differences are explicit.
 - [ ] `src/frontend/api/routes.rs` contains HTTP translation only, as A01–A03 define it.
 - [ ] No new general framework, global service locator, blanket lint suppression, or fallback-to-success was introduced to satisfy a cleanup metric.
