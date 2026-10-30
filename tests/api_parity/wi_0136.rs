@@ -298,6 +298,24 @@ fn count_done(frames: &[Frame]) -> usize {
     frames.iter().filter(|f| f.is_event("done")).count()
 }
 
+/// Fail `body` if it outlasts `REAL_TIME_GUARD` on the wall clock. Paused-clock
+/// tests use this rather than `tokio::time::timeout`: virtual time auto-advances
+/// while a read waits on a real socket, so a virtual deadline can expire on a
+/// healthy stream.
+const REAL_TIME_GUARD: Duration = Duration::from_secs(120);
+
+async fn within_real_time<F: std::future::Future>(body: F) -> F::Output {
+    let (expired, on_expiry) = tokio::sync::oneshot::channel::<()>();
+    std::thread::spawn(move || {
+        std::thread::sleep(REAL_TIME_GUARD);
+        let _ = expired.send(());
+    });
+    tokio::select! {
+        output = body => output,
+        _ = on_expiry => panic!("test body still running after {REAL_TIME_GUARD:?}"),
+    }
+}
+
 // ─── Item 3: queued past 300 s ───────────────────────────────────────────────
 
 #[tokio::test(start_paused = true)]
@@ -307,7 +325,7 @@ async fn queued_command_waiting_past_300s_keeps_the_stream_open_with_15s_keepali
     let base = serve(Arc::clone(&state)).await;
     enqueue(&state, "queued");
 
-    tokio::time::timeout(Duration::from_secs(1800), async {
+    within_real_time(async {
         let started = tokio::time::Instant::now();
         let mut sse = Sse::open(&base, "queued", "", None).await.unwrap();
 
@@ -360,8 +378,7 @@ async fn queued_command_waiting_past_300s_keeps_the_stream_open_with_15s_keepali
         assert!(rest[1].is_event("done"));
         assert_eq!(rest[1].id.as_deref(), Some("1:1"));
     })
-    .await
-    .expect("test body finished within virtual time");
+    .await;
 }
 
 #[tokio::test(start_paused = true)]
@@ -371,7 +388,7 @@ async fn a_queued_stream_resumes_by_id_after_the_client_reconnects_past_300s() {
     let base = serve(Arc::clone(&state)).await;
     enqueue(&state, "waiter");
 
-    tokio::time::timeout(Duration::from_secs(1800), async {
+    within_real_time(async {
         // First connection waits 20 s of keepalives, then drops.
         let mut first = Sse::open(&base, "waiter", "", None).await.unwrap();
         let started = tokio::time::Instant::now();
@@ -393,8 +410,7 @@ async fn a_queued_stream_resumes_by_id_after_the_client_reconnects_past_300s() {
         let tail = stream(&base, "waiter", "", Some("1:0")).await;
         assert_eq!(ids(&tail), ["1:1", "1:2"]);
     })
-    .await
-    .unwrap();
+    .await;
 }
 
 // ─── Item 4: resume by id ────────────────────────────────────────────────────
@@ -1008,7 +1024,7 @@ async fn delayed_persistence_repairs_attach_and_broadcast_lag_before_completion(
                 }
             }
         });
-        tokio::time::timeout(Duration::from_secs(30), async {
+        within_real_time(async {
             for n in 1..=100 {
                 let frame = loop {
                     let frame = client.next().await.unwrap();
@@ -1020,8 +1036,7 @@ async fn delayed_persistence_repairs_attach_and_broadcast_lag_before_completion(
                 assert_eq!(frame.text(), n.to_string());
             }
         })
-        .await
-        .unwrap();
+        .await;
         // Recovery must happen while running, not merely in final replay.
         assert_eq!(
             state.store.get_command("gap").unwrap().unwrap().status,
@@ -1058,9 +1073,7 @@ async fn unrecoverable_live_gap_closes_without_advancing_cursor_or_done() {
     for n in 0..100 {
         bus.sender().emit(EventPayload::StdoutLine(n.to_string()));
     }
-    let frames = tokio::time::timeout(Duration::from_secs(30), client.all())
-        .await
-        .unwrap();
+    let frames = within_real_time(client.all()).await;
     assert!(ids(&frames).is_empty());
     assert_eq!(count_done(&frames), 0);
     assert_eq!(
@@ -1105,9 +1118,7 @@ async fn shutdown_closes_queued_stream_without_done() {
     let mut client = Sse::open(&base, "shutdown", "", None).await.unwrap();
     assert!(client.next().await.unwrap().is_event("status_message"));
     shutdown.cancel();
-    let frames = tokio::time::timeout(Duration::from_secs(2), client.all())
-        .await
-        .unwrap();
+    let frames = within_real_time(client.all()).await;
     assert_eq!(count_done(&frames), 0);
 }
 
