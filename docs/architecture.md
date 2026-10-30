@@ -155,7 +155,6 @@ src/
         mod.rs            Re-exports
         clap.rs           CommandCatalogue::build_clap_command()
         tui_hints.rs      CommandCatalogue::tui_hint_for(), tui_completions()
-        api_schema.rs CommandCatalogue::openapi_schema(), rest_route_table()
     commands/
       mod.rs              Re-exports all *Command types
       command_trait.rs    Command trait (run_with_frontend)
@@ -1721,20 +1720,9 @@ impl CommandCatalogue {
 
 Generates the hint string shown above the TUI command box for the currently typed command path, and the autocomplete entries shown as the user types. The TUI frontend never maintains its own hint or completion lists.
 
-#### `api_schema.rs`
-
-```rust
-impl CommandCatalogue {
-    pub fn openapi_schema(&self) -> serde_json::Value;
-    pub fn rest_route_table(&self) -> Vec<RestRoute>;
-}
-```
-
-Generates the OpenAPI JSON schema and the REST route table used by the API server. The API frontend derives its API surface entirely from these projections.
-
 #### Projection consistency guarantee
 
-A suite of catalogue unit tests (`catalogue_clap_consistency`, `catalogue_tui_consistency`, `catalogue_api_consistency`) walks every `Arg` in the clap output, every hint entry, and every route in the REST table and asserts each is present in the catalogue with a matching kind, default, and help string. If a flag exists in a projection but not the catalogue (or vice versa), the test fails.
+A suite of catalogue unit tests (`catalogue_clap_consistency`, `catalogue_tui_consistency`) walks every `Arg` in the clap output and every hint entry and asserts each is present in the catalogue with a matching kind, default, and help string. If a flag exists in a projection but not the catalogue (or vice versa), the test fails.
 
 ---
 

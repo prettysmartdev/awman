@@ -478,6 +478,20 @@ impl CommandError {
     }
 }
 
+/// Failure codes shared by command results and HTTP admission errors.
+pub mod failure_codes {
+    pub const INVALID_REQUEST: &str = "invalid_request";
+    pub const UNKNOWN_FLAG: &str = "unknown_flag";
+    pub const UNKNOWN_SUBCOMMAND: &str = "unknown_subcommand";
+    pub const FORBIDDEN_WORKDIR: &str = "forbidden_workdir";
+    pub const WORKTREE_EXISTS: &str = "worktree_exists";
+    pub const MERGE_CONFLICT: &str = "merge_conflict";
+    pub const MERGE_TARGET_DIRTY: &str = "merge_target_dirty";
+    pub const WORKFLOW_PREREQUISITES_UNRESOLVED: &str = "workflow_prerequisites_unresolved";
+    pub const UNKNOWN_AGENT: &str = "unknown_agent";
+    pub const AGENT_UNTRUSTED: &str = "agent_untrusted";
+}
+
 /// The post-admission stages a queued command can fail in, as the API
 /// reports them in `result.failure.stage` (WI 0137 §1). Engine outcomes and
 /// post-command stages the queue worker names itself (`step`, `teardown`,
@@ -583,25 +597,28 @@ impl CommandError {
     /// A stable snake_case code for this failure, reported by the API as
     /// `result.failure.code` (WI 0137 §1) so clients stop matching message
     /// text. Variants a client can act on get their own code; the rest share
-    /// a class code (`invalid_usage`, `not_found`, `internal`). Codes for
+    /// a class code (`invalid_request`, `not_found`, `internal`). Codes for
     /// outcomes that are not `CommandError`s (`step_failed`,
     /// `teardown_failed`, `push_failed`, `setup_failed`, `cancelled`) live in
     /// `crate::data::fs::api_db::failure_codes`. Exhaustive on purpose.
     pub fn code(&self) -> &'static str {
         match self {
-            CommandError::WorktreeExists { .. } => "worktree_exists",
-            CommandError::MergeConflict { .. } => "merge_conflict",
-            CommandError::MergeTargetDirty { .. } => "merge_target_dirty",
+            CommandError::WorktreeExists { .. } => failure_codes::WORKTREE_EXISTS,
+            CommandError::MergeConflict { .. } => failure_codes::MERGE_CONFLICT,
+            CommandError::MergeTargetDirty { .. } => failure_codes::MERGE_TARGET_DIRTY,
             CommandError::WorkflowPrerequisitesUnresolved { .. } => {
-                "workflow_prerequisites_unresolved"
+                failure_codes::WORKFLOW_PREREQUISITES_UNRESOLVED
             }
-            CommandError::Engine(EngineError::UnknownAgent { .. }) => "unknown_agent",
-            CommandError::Engine(EngineError::AgentDefinitionUntrusted { .. }) => "agent_untrusted",
+            CommandError::Engine(EngineError::UnknownAgent { .. }) => failure_codes::UNKNOWN_AGENT,
+            CommandError::Engine(EngineError::AgentDefinitionUntrusted { .. }) => {
+                failure_codes::AGENT_UNTRUSTED
+            }
             CommandError::Aborted => "aborted",
 
-            CommandError::UnknownCommand { .. }
-            | CommandError::NotAvailableForFrontend { .. }
-            | CommandError::UnknownFlag { .. }
+            CommandError::UnknownCommand { .. } => failure_codes::UNKNOWN_SUBCOMMAND,
+            CommandError::UnknownFlag { .. } => failure_codes::UNKNOWN_FLAG,
+            CommandError::SessionWorkdirNotAllowed { .. } => failure_codes::FORBIDDEN_WORKDIR,
+            CommandError::NotAvailableForFrontend { .. }
             | CommandError::MissingRequiredFlag { .. }
             | CommandError::MissingRequiredArgument { .. }
             | CommandError::UnexpectedArgument { .. }
@@ -617,7 +634,6 @@ impl CommandError {
             | CommandError::SessionInvalidType { .. }
             | CommandError::SessionWorkdirRequired
             | CommandError::SessionWorkdirUnresolvable { .. }
-            | CommandError::SessionWorkdirNotAllowed { .. }
             | CommandError::ApiWorkdirRootInvalid { .. }
             | CommandError::SessionRepoUrlRequired
             | CommandError::SessionRepoUrlEmpty
@@ -626,7 +642,7 @@ impl CommandError {
             | CommandError::SessionFieldRequiresBranch { .. }
             | CommandError::SessionRefInvalid { .. }
             | CommandError::AgentAmbiguous { .. }
-            | CommandError::AgentReferenceEmpty => "invalid_usage",
+            | CommandError::AgentReferenceEmpty => failure_codes::INVALID_REQUEST,
 
             CommandError::WorkItemNotFound { .. }
             | CommandError::SpecTemplateMissing { .. }
@@ -724,7 +740,7 @@ mod failure_classification_tests {
                     argument: "prompt".into(),
                 },
                 "preflight",
-                "invalid_usage",
+                "invalid_request",
             ),
             (
                 CommandError::WorkflowFileNotFound { path: "/w".into() },

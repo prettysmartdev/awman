@@ -172,7 +172,8 @@ fn insert_and_get_command_roundtrip() {
     assert_eq!(rec.id, "cmd-1");
     assert_eq!(rec.session_id, "sess-1");
     assert_eq!(rec.subcommand, "exec");
-    assert_eq!(rec.status, "pending");
+    // New writes are queued; pending is accepted only for legacy rows.
+    assert_eq!(rec.status, "queued");
     assert!(rec.exit_code.is_none());
 }
 

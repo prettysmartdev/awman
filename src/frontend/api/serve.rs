@@ -10,26 +10,13 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
-use axum::{Json, Router};
+use axum::Router;
 
 use crate::command::error::CommandError;
 use crate::engine::auth::{AuthEngine, AuthMode, AuthOutcome, TlsMaterial};
-
-/// The single JSON error envelope every awman HTTP daemon emits.
-#[derive(serde::Serialize)]
-pub struct ErrorResponse {
-    pub error: String,
-}
-
-/// Build the shared `{"error": "..."}` body. Both routers use this, so the
-/// wire shape has exactly one definition.
-pub fn error_json(message: impl Into<String>) -> Json<ErrorResponse> {
-    Json(ErrorResponse {
-        error: message.into(),
-    })
-}
+use crate::frontend::api::error::ApiError;
 
 /// Extract the bearer token from `headers` and turn Layer 1's verdict into
 /// the 401 envelope, or `None` when the request may proceed.
@@ -53,17 +40,14 @@ pub fn check_bearer_auth(
     match auth.verify_bearer(mode, header) {
         AuthOutcome::Authorized | AuthOutcome::Disabled => None,
         AuthOutcome::Unauthorized if header.is_none() => Some(
-            (
-                StatusCode::UNAUTHORIZED,
-                error_json(
-                    "API key required. Pass the key via the Authorization header \
+            ApiError::unauthorized(
+                "API key required. Pass the key via the Authorization header \
                      (e.g. Authorization: Bearer <key>).",
-                ),
             )
-                .into_response(),
+            .into_response(),
         ),
         AuthOutcome::Unauthorized => {
-            Some((StatusCode::UNAUTHORIZED, error_json("Invalid API key.")).into_response())
+            Some(ApiError::unauthorized("Invalid API key.").into_response())
         }
     }
 }
@@ -149,18 +133,20 @@ where
         shutdown_handle.graceful_shutdown(Some(shutdown_grace));
     });
 
+    // ConnectInfo gives handlers the TCP peer (the API sends `log_path` to
+    // loopback peers only).
     let serve_result = if let Some(tls) = tls {
         let rustls_config = tls_config(tls)?;
         axum_server::from_tcp_rustls(listener, rustls_config)
             .map_err(|e| CommandError::Other(format!("Server setup: {e}")))?
             .handle(server_handle.clone())
-            .serve(router.into_make_service())
+            .serve(router.into_make_service_with_connect_info::<std::net::SocketAddr>())
             .await
     } else {
         axum_server::from_tcp(listener)
             .map_err(|e| CommandError::Other(format!("Server setup: {e}")))?
             .handle(server_handle.clone())
-            .serve(router.into_make_service())
+            .serve(router.into_make_service_with_connect_info::<std::net::SocketAddr>())
             .await
     };
 

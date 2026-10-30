@@ -94,6 +94,9 @@ struct QueueStatusResponse {
 
 #[derive(Serialize)]
 struct SessionClosingResponse {
+    setup_status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    setup_error: Option<serde_json::Value>,
     session_id: String,
     status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -156,6 +159,33 @@ struct SessionResponse {
     push: bool,
     #[serde(default)]
     labels: Labels,
+    /// The setup stage stored on the row (`SessionSetupStatus` spelling). A
+    /// closed session keeps its last stage.
+    setup_status: String,
+    /// `{stage, message}`, only when `setup_status` is `failed`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    setup_error: Option<serde_json::Value>,
+}
+
+impl SessionResponse {
+    /// The row projection plus its labels and, for a failed setup, the
+    /// `{stage, message}` recorded in the session's setup_state.json.
+    fn new(state: &AppState, row: SessionRecord, labels: Labels) -> Self {
+        let setup_error = if row.setup_status == SessionSetupStatus::Failed.as_str() {
+            state
+                .paths
+                .read_setup_state(&row.id)
+                .and_then(|setup| setup.error)
+                .and_then(|error| serde_json::to_value(error).ok())
+        } else {
+            None
+        };
+        Self {
+            labels,
+            setup_error,
+            ..Self::from(row)
+        }
+    }
 }
 
 impl From<SessionRecord> for SessionResponse {
@@ -165,6 +195,8 @@ impl From<SessionRecord> for SessionResponse {
             workdir: s.workdir,
             created_at: s.created_at,
             status: s.status,
+            setup_status: s.setup_status,
+            setup_error: None,
             closed_at: s.closed_at,
             session_type: s.session_type,
             repo_url: s.repo_url,
@@ -183,6 +215,10 @@ struct CreateCommandRequest {
     args: Vec<String>,
     #[serde(default)]
     labels: Labels,
+    /// `POST /v1/commands` only: the session, as an alternative to the
+    /// `x-awman-session` header. A run's command must not name one.
+    #[serde(default)]
+    session_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -209,7 +245,10 @@ struct CommandResponse {
     started_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     finished_at: Option<String>,
-    log_path: String,
+    /// Deprecated: a server-side path a remote client cannot open, so it is
+    /// sent only to loopback peers. Clients read `GET /v1/commands/{id}/logs`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    log_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     queued_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -225,6 +264,7 @@ struct CommandResponse {
 
 /// Capabilities a client can detect without parsing the version. Append only.
 pub const API_FEATURES: &[&str] = &[
+    "error_codes",
     "workflow_state",
     "command_cancel",
     "labels",
@@ -239,6 +279,13 @@ pub const API_FEATURES: &[&str] = &[
     "event_source",
     // WI 0137: `step_activity` events from structured-output agents.
     "step_activity",
+    // WI 0138: `GET /v1/commands/{id}`, the command record.
+    "command_record",
+    // WI 0138: `setup_status`/`setup_error` on session records and the
+    // `?setup_status=` filter on `GET /v1/sessions`.
+    "session_setup_status",
+    // WI 0138: `session_id` in the `POST /v1/commands` body.
+    "command_session_body",
 ];
 
 #[derive(Serialize)]
@@ -265,14 +312,14 @@ struct CreateRunResponse {
     command_id: String,
 }
 
-use crate::frontend::api::serve::error_json;
+use crate::frontend::api::error::ApiError;
 
 fn bad_request(message: impl Into<String>) -> Response {
-    (StatusCode::BAD_REQUEST, error_json(message)).into_response()
+    ApiError::invalid_request(message).into_response()
 }
 
 fn internal_error(message: &str) -> Response {
-    (StatusCode::INTERNAL_SERVER_ERROR, error_json(message)).into_response()
+    ApiError::internal(message).into_response()
 }
 
 fn command_is_terminal(status: &str) -> bool {
@@ -281,11 +328,7 @@ fn command_is_terminal(status: &str) -> bool {
 
 fn session_response(state: &AppState, row: SessionRecord) -> Response {
     match state.store.labels_for(LabelOwner::Session, &row.id) {
-        Ok(labels) => Json(SessionResponse {
-            labels,
-            ..SessionResponse::from(row)
-        })
-        .into_response(),
+        Ok(labels) => Json(SessionResponse::new(state, row, labels)).into_response(),
         Err(_) => internal_error("Failed to read session labels"),
     }
 }
@@ -294,8 +337,38 @@ fn session_response(state: &AppState, row: SessionRecord) -> Response {
 // a body and extensions even when they are only used to report an error.
 type RouteResult<T> = Result<T, Box<Response>>;
 
+/// The TCP peer of a request, from the `ConnectInfo` the server installs.
+/// Only the socket address counts; `Forwarded`/`X-Forwarded-For` are never
+/// read. No `ConnectInfo` (a router served without it) reads as not loopback.
+#[derive(Clone, Copy)]
+pub(crate) struct Peer(Option<std::net::SocketAddr>);
+
+impl Peer {
+    fn is_loopback(self) -> bool {
+        self.0
+            .is_some_and(|addr| addr.ip().to_canonical().is_loopback())
+    }
+}
+
+impl<S: Send + Sync> axum::extract::FromRequestParts<S> for Peer {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        Ok(Self(
+            parts
+                .extensions
+                .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+                .map(|info| info.0),
+        ))
+    }
+}
+
 fn command_response(
     state: &AppState,
+    peer: Peer,
     c: CommandRecord,
     labels: Option<Labels>,
 ) -> RouteResult<CommandResponse> {
@@ -329,11 +402,16 @@ fn command_response(
         attempt: c.attempt,
         session_id: c.session_id,
         subcommand: c.subcommand,
-        status: c.status,
+        // Rows migrate `pending` → `queued`; never show the legacy name.
+        status: if c.status == CommandStatus::Pending.as_str() {
+            CommandStatus::Queued.as_str().to_string()
+        } else {
+            c.status
+        },
         exit_code: c.exit_code,
         started_at: c.started_at,
         finished_at: c.finished_at,
-        log_path: c.log_path,
+        log_path: peer.is_loopback().then_some(c.log_path),
         queued_at: c.queued_at,
         queue_position,
         worker_id: c.worker_id,
@@ -345,6 +423,7 @@ fn command_response(
 #[derive(Default)]
 struct ListQuery {
     status: Option<String>,
+    setup_status: Option<String>,
     session_id: Option<String>,
     labels: Vec<LabelSelector>,
     limit: i64,
@@ -376,6 +455,17 @@ impl ListQuery {
                     }
                     query.status = Some(value);
                 }
+                "setup_status" if !commands => {
+                    if SessionSetupStatus::parse(&value).is_none() {
+                        let valid: Vec<_> =
+                            SessionSetupStatus::ALL.iter().map(|s| s.as_str()).collect();
+                        return Err(Box::new(bad_request(format!(
+                            "unknown session setup_status: {value}; expected {}",
+                            valid.join("|")
+                        ))));
+                    }
+                    query.setup_status = Some(value);
+                }
                 "session_id" if commands => query.session_id = Some(value),
                 "limit" if commands => {
                     query.limit = value
@@ -392,6 +482,7 @@ impl ListQuery {
 
 async fn handle_list_commands(
     State(state): State<Arc<AppState>>,
+    peer: Peer,
     Query(pairs): Query<Vec<(String, String)>>,
 ) -> Response {
     let query = match ListQuery::parse(pairs, true) {
@@ -415,7 +506,7 @@ async fn handle_list_commands(
     let mut commands = Vec::with_capacity(rows.len());
     for row in rows {
         let row_labels = labels.remove(&row.id).unwrap_or_default();
-        match command_response(&state, row, Some(row_labels)) {
+        match command_response(&state, peer, row, Some(row_labels)) {
             Ok(command) => commands.push(command),
             Err(response) => return *response,
         }
@@ -425,14 +516,13 @@ async fn handle_list_commands(
 
 async fn handle_cancel_command(
     State(state): State<Arc<AppState>>,
+    peer: Peer,
     AxumPath(id): AxumPath<String>,
 ) -> Response {
     match state.canceller.cancel(&id) {
-        Ok(CancelOutcome::NotFound) => (
-            StatusCode::NOT_FOUND,
-            error_json(format!("Command '{id}' not found")),
-        )
-            .into_response(),
+        Ok(CancelOutcome::NotFound) => {
+            ApiError::command_not_found(format!("Command '{id}' not found")).into_response()
+        }
         Ok(CancelOutcome::AlreadyTerminal(row) | CancelOutcome::Cancelled(row)) => {
             // During setup its owner must finish clone cleanup before closing.
             // After setup, a cancelled queued row has no worker to close it.
@@ -448,7 +538,7 @@ async fn handle_cancel_command(
                     _ => {}
                 }
             }
-            match command_response(&state, row, None) {
+            match command_response(&state, peer, row, None) {
                 Ok(response) => Json(response).into_response(),
                 Err(response) => *response,
             }
@@ -631,18 +721,18 @@ where
         }
         Ok(IdempotencyBegin::InFlight) => {
             return (
-                StatusCode::CONFLICT,
                 [("retry-after", "1")],
-                error_json("a request with this Idempotency-Key is still in progress"),
+                ApiError::idempotency_in_flight(
+                    "a request with this Idempotency-Key is still in progress",
+                ),
             )
                 .into_response()
         }
         Ok(IdempotencyBegin::Mismatch) => {
-            return (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                error_json("Idempotency-Key reused with a different request body"),
+            return ApiError::idempotency_conflict(
+                "Idempotency-Key reused with a different request body",
             )
-                .into_response()
+            .into_response()
         }
         Err(error) => {
             tracing::error!(%error, "Failed to reserve idempotency key");
@@ -698,22 +788,6 @@ where
     Response::from_parts(parts, axum::body::Body::from(bytes))
 }
 
-/// Map a session-creation validation error to its HTTP status. This is the
-/// ONLY session-creation logic that remains in the frontend — the transport
-/// mapping. An off-allowlist workdir is a 403 (the path exists but the caller
-/// is not permitted to use it), as is an unapproved custom agent definition;
-/// an unknown agent is a 404; every other validation failure is a 400.
-fn session_create_error_status(err: &CommandError) -> StatusCode {
-    match err {
-        CommandError::SessionWorkdirNotAllowed { .. } => StatusCode::FORBIDDEN,
-        CommandError::Engine(
-            crate::engine::error::EngineError::AgentDefinitionUntrusted { .. }
-            | crate::engine::error::EngineError::UnknownAgent { .. },
-        ) => StatusCode::from_u16(err.http_status()).unwrap_or(StatusCode::BAD_REQUEST),
-        _ => StatusCode::BAD_REQUEST,
-    }
-}
-
 // ─── Router ──────────────────────────────────────────────────────────────────
 
 pub fn build_router(state: Arc<AppState>) -> Router {
@@ -736,6 +810,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         )
         .route("/v1/commands/{id}/cancel", post(handle_cancel_command))
         .route("/v1/runs", post(handle_create_run))
+        // WI 0138: the command record itself; `/status` stays as an alias.
+        .route("/v1/commands/{id}", get(handle_get_command))
         .route("/v1/commands/{id}/status", get(handle_get_command))
         .route("/v1/commands/{id}/logs", get(handle_stream_command_logs))
         .route("/v1/workflows/{command_id}", get(handle_get_workflow))
@@ -753,6 +829,9 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
+        ))
+        .layer(axum::middleware::from_fn(
+            super::error::normalize_rejections,
         ))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
@@ -850,6 +929,11 @@ async fn handle_create_run(
                 Ok(body) => body,
                 Err(error) => return bad_request(error.to_string()),
             };
+            if body.command.session_id.is_some() {
+                return bad_request(
+                    "command.session_id is not accepted: a run creates its session",
+                );
+            }
             create_submission(
                 st,
                 body.session,
@@ -890,14 +974,14 @@ async fn create_submission(
     let plan = match request.validate(&policy, state.engines.git_engine.as_ref()) {
         Ok(plan) => plan,
         Err(e) => {
-            return (session_create_error_status(&e), error_json(e.to_string())).into_response();
+            return ApiError::session_creation(&e).into_response();
         }
     };
     if let Err(e) = plan
         .validate_merge_ref_kinds(Arc::clone(&state.engines.git_engine))
         .await
     {
-        return (session_create_error_status(&e), error_json(e.to_string())).into_response();
+        return ApiError::session_creation(&e).into_response();
     }
 
     if let Some(command) = &command {
@@ -909,11 +993,7 @@ async fn create_submission(
     // Create session storage directories (Layer 0).
     if let Err(e) = state.paths.prepare_session_dirs(&session_id) {
         tracing::error!(error = %e, "Failed to create session directory");
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            error_json("Failed to create session directory"),
-        )
-            .into_response();
+        return ApiError::internal("Failed to create session directory").into_response();
     }
 
     // The response is fixed before anything durable is written, so a keyed
@@ -960,11 +1040,7 @@ async fn create_submission(
         cloned_path: cloned_path.as_deref(),
     }) {
         tracing::error!(error = %e, "Failed to insert session");
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            error_json("Failed to create session"),
-        )
-            .into_response();
+        return ApiError::internal("Failed to create session").into_response();
     }
     // Record the remote inputs before setup starts, so a restored session
     // keeps them (and the push stage can read `push` from the row).
@@ -980,11 +1056,7 @@ async fn create_submission(
             },
         ) {
             tracing::error!(error = %e, "Failed to record remote session fields");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                error_json("Failed to create session"),
-            )
-                .into_response();
+            return ApiError::internal("Failed to create session").into_response();
         }
     }
 
@@ -1170,10 +1242,11 @@ async fn handle_list_sessions(
         Ok(query) => query,
         Err(response) => return *response,
     };
-    match state
-        .store
-        .list_sessions_filtered(query.status.as_deref(), &query.labels)
-    {
+    match state.store.list_sessions_filtered(
+        query.status.as_deref(),
+        query.setup_status.as_deref(),
+        &query.labels,
+    ) {
         Ok(sessions) => {
             let ids: Vec<_> = sessions.iter().map(|s| s.id.clone()).collect();
             let mut labels = match state.store.labels_for_many(LabelOwner::Session, &ids) {
@@ -1184,21 +1257,14 @@ async fn handle_list_sessions(
                 .into_iter()
                 .map(|s| {
                     let labels = labels.remove(&s.id).unwrap_or_default();
-                    SessionResponse {
-                        labels,
-                        ..SessionResponse::from(s)
-                    }
+                    SessionResponse::new(&state, s, labels)
                 })
                 .collect();
             Json(serde_json::json!({ "sessions": list })).into_response()
         }
         Err(e) => {
             tracing::error!(error = %e, "Failed to list sessions");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                error_json("Failed to list sessions"),
-            )
-                .into_response()
+            ApiError::internal("Failed to list sessions").into_response()
         }
     }
 }
@@ -1209,18 +1275,12 @@ async fn handle_get_session(
 ) -> Response {
     match state.store.get_session(&id) {
         Ok(Some(s)) => session_response(&state, s),
-        Ok(None) => (
-            StatusCode::NOT_FOUND,
-            error_json(format!("Session '{}' not found", id)),
-        )
-            .into_response(),
+        Ok(None) => {
+            ApiError::session_not_found(format!("Session '{}' not found", id)).into_response()
+        }
         Err(e) => {
             tracing::error!(error = %e, "Failed to get session");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                error_json("Failed to get session"),
-            )
-                .into_response()
+            ApiError::internal("Failed to get session").into_response()
         }
     }
 }
@@ -1229,32 +1289,67 @@ async fn handle_close_session(
     State(state): State<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Response {
+    let closing_readiness = || -> RouteResult<SessionResponse> {
+        match state.store.get_session(&id) {
+            Ok(Some(row)) => Ok(SessionResponse::new(&state, row, Labels::empty())),
+            _ => Err(Box::new(internal_error("Failed to get session"))),
+        }
+    };
     match state.lifecycle().close(&id).await {
-        Ok(CloseOutcome::NotFound) => (StatusCode::NOT_FOUND, error_json(format!("Session '{id}' not found"))).into_response(),
-        Ok(CloseOutcome::Draining { running_command_id, cancelled }) => (
+        Ok(CloseOutcome::NotFound) => {
+            ApiError::session_not_found(format!("Session '{id}' not found")).into_response()
+        }
+        Ok(CloseOutcome::Draining {
+            running_command_id,
+            cancelled,
+        }) => {
+            let readiness = match closing_readiness() {
+                Ok(row) => row,
+                Err(response) => return *response,
+            };
+            (
             StatusCode::ACCEPTED,
             Json(SessionClosingResponse {
+                setup_status: readiness.setup_status,
+                setup_error: readiness.setup_error,
                 session_id: id,
                 status: "closing".to_string(),
                 running_command_id: Some(running_command_id),
                 cancelled_count: cancelled.len(),
                 message: "Session is closing. Waiting for running command to complete. Poll GET /v1/sessions/{id}/status to monitor.".to_string(),
             }),
-        ).into_response(),
-        Ok(CloseOutcome::AlreadyClosing) => Json(SessionClosingResponse {
-            session_id: id.clone(),
-            status: "closing".to_string(),
-            running_command_id: state.store.running_command_for_session(&id).ok().flatten().map(|command| command.id),
-            cancelled_count: 0,
-            message: "Session is already closing. Poll GET /v1/sessions/{id}/status to monitor.".to_string(),
-        }).into_response(),
+        ).into_response()
+        }
+        Ok(CloseOutcome::AlreadyClosing) => {
+            let readiness = match closing_readiness() {
+                Ok(row) => row,
+                Err(response) => return *response,
+            };
+            Json(SessionClosingResponse {
+                setup_status: readiness.setup_status,
+                setup_error: readiness.setup_error,
+                session_id: id.clone(),
+                status: "closing".to_string(),
+                running_command_id: state
+                    .store
+                    .running_command_for_session(&id)
+                    .ok()
+                    .flatten()
+                    .map(|command| command.id),
+                cancelled_count: 0,
+                message:
+                    "Session is already closing. Poll GET /v1/sessions/{id}/status to monitor."
+                        .to_string(),
+            })
+            .into_response()
+        }
         Ok(CloseOutcome::Closed) => match state.store.get_session(&id) {
             Ok(Some(session)) => session_response(&state, session),
             _ => StatusCode::NO_CONTENT.into_response(),
         },
         Err(error) => {
             tracing::error!(%error, session_id = %id, "Failed to close session");
-            (StatusCode::INTERNAL_SERVER_ERROR, error_json("Failed to clean up remote session directory")).into_response()
+            ApiError::internal("Failed to clean up remote session directory").into_response()
         }
     }
 }
@@ -1266,19 +1361,12 @@ async fn handle_get_session_status(
     // Check if session exists at all.
     match state.store.get_session(&id) {
         Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
-                error_json(format!("Session '{}' not found", id)),
-            )
+            return ApiError::session_not_found(format!("Session '{}' not found", id))
                 .into_response();
         }
         Err(e) => {
             tracing::error!(error = %e, "Failed to get session");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                error_json("Failed to get session"),
-            )
-                .into_response();
+            return ApiError::internal("Failed to get session").into_response();
         }
         Ok(Some(_)) => {}
     }
@@ -1357,27 +1445,22 @@ async fn handle_create_command(
     headers: HeaderMap,
     Json(value): Json<serde_json::Value>,
 ) -> Response {
-    let canonical = format!(
-        "{}\n{}",
-        value,
-        headers
-            .get("x-awman-session")
-            .and_then(|h| h.to_str().ok())
-            .unwrap_or_default()
-    );
+    let body: CreateCommandRequest = match serde_json::from_value(value.clone()) {
+        Ok(body) => body,
+        Err(error) => return bad_request(error.to_string()),
+    };
+    let session_id = match command_session_id(&headers, body.session_id.as_deref()) {
+        Ok(session_id) => session_id,
+        Err(response) => return *response,
+    };
+    let canonical = command_idempotency_canonical(&value, &session_id);
     let (st, hd) = (&state, &headers);
     with_idempotency(
         &state,
         &headers,
         "/v1/commands",
         &canonical,
-        |journal| async move {
-            let body = match serde_json::from_value(value) {
-                Ok(body) => body,
-                Err(error) => return bad_request(error.to_string()),
-            };
-            create_command(st, hd, body, journal.as_deref()).await
-        },
+        |journal| async move { create_command(st, hd, body, journal.as_deref()).await },
     )
     .await
 }
@@ -1388,24 +1471,9 @@ async fn create_command(
     body: CreateCommandRequest,
     journal: Option<&AdmissionJournal>,
 ) -> Response {
-    let session_id = match headers.get("x-awman-session") {
-        Some(val) => match val.to_str() {
-            Ok(s) => s.to_string(),
-            Err(_) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    error_json("Invalid x-awman-session header value"),
-                )
-                    .into_response();
-            }
-        },
-        None => {
-            return (
-                StatusCode::BAD_REQUEST,
-                error_json("Missing required header: x-awman-session"),
-            )
-                .into_response();
-        }
+    let session_id = match command_session_id(headers, body.session_id.as_deref()) {
+        Ok(session_id) => session_id,
+        Err(response) => return *response,
     };
 
     if let Err(response) = validate_command(&body) {
@@ -1419,37 +1487,24 @@ async fn create_command(
     match state.store.command_admission(&session_id) {
         Ok(SessionCommandAdmission::Accepted) => {}
         Ok(SessionCommandAdmission::Closing) => {
-            return (
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({
-                    "error": "session is closing",
+            return ApiError::session_closing("session is closing").with_details(
+                serde_json::json!({
                     "session_id": session_id,
                     "hint": "Session is shutting down and no longer accepts commands."
-                })),
-            )
-                .into_response();
+                }),
+            );
         }
         Ok(SessionCommandAdmission::Closed) => {
-            return (
-                StatusCode::NOT_FOUND,
-                error_json(format!("Session '{}' is closed", session_id)),
-            )
+            return ApiError::session_not_found(format!("Session '{}' is closed", session_id))
                 .into_response();
         }
         Ok(SessionCommandAdmission::NotFound) => {
-            return (
-                StatusCode::NOT_FOUND,
-                error_json(format!("Session '{}' not found", session_id)),
-            )
+            return ApiError::session_not_found(format!("Session '{}' not found", session_id))
                 .into_response();
         }
         Err(e) => {
             tracing::error!(error = %e, "Failed to get session");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                error_json("Failed to validate session"),
-            )
-                .into_response();
+            return ApiError::internal("Failed to validate session").into_response();
         }
     };
 
@@ -1458,27 +1513,19 @@ async fn create_command(
         let readiness = resolve_setup_status(state, &session_id).await;
         if !readiness.is_ready() {
             if matches!(readiness, SetupReadiness::NotFound) {
-                return (
-                    StatusCode::NOT_FOUND,
-                    error_json(format!("Session '{session_id}' not found")),
-                )
+                return ApiError::session_not_found(format!("Session '{session_id}' not found"))
                     .into_response();
             }
             let mut body = serde_json::json!({
-                "error": "session is not ready",
                 "setup_status": readiness.status(),
                 "hint": "Poll GET /v1/sessions/{id}/status to check setup progress"
             });
+            let mut message = "session is not ready";
             if let Some(err) = readiness.error().cloned() {
                 body["setup_error"] = err;
-                if let Some(obj) = body.as_object_mut() {
-                    obj.insert(
-                        "error".into(),
-                        serde_json::Value::String("session setup failed".into()),
-                    );
-                }
+                message = "session setup failed";
             }
-            return (StatusCode::CONFLICT, Json(body)).into_response();
+            return ApiError::session_not_ready(message).with_details(body);
         }
     }
 
@@ -1505,13 +1552,7 @@ async fn create_command(
         match dispatch.prerequisite_admission(&path_parts) {
             Ok(Some(policy)) => flags_applied["prerequisites"] = policy,
             Ok(None) => {}
-            Err(error) => {
-                return (
-                    StatusCode::from_u16(error.http_status()).unwrap_or(StatusCode::BAD_REQUEST),
-                    error_json(error.to_string()),
-                )
-                    .into_response()
-            }
+            Err(error) => return ApiError::command_admission(&error).into_response(),
         }
     }
     let response_body = match admission_body(
@@ -1530,6 +1571,43 @@ async fn create_command(
         return *response;
     }
     accepted_json(response_body)
+}
+
+/// The session a `POST /v1/commands` targets: the body's `session_id`, the
+/// `x-awman-session` header, or both when they agree. Two different values
+/// are refused; awman never picks one.
+fn command_session_id(headers: &HeaderMap, body: Option<&str>) -> RouteResult<String> {
+    let header = match headers.get("x-awman-session").map(|h| h.to_str()) {
+        Some(Ok(header)) => Some(header),
+        Some(Err(_)) => {
+            return Err(Box::new(
+                ApiError::invalid_request("Invalid x-awman-session header value").into_response(),
+            ))
+        }
+        None => None,
+    };
+    match (body, header) {
+        (Some(body), Some(header)) if body != header => Err(Box::new(
+            ApiError::invalid_request(
+                "session_id in the body and the x-awman-session header name different sessions",
+            )
+            .into_response(),
+        )),
+        (Some(session), _) | (None, Some(session)) => Ok(session.to_string()),
+        (None, None) => Err(Box::new(
+            ApiError::invalid_request("Missing required header: x-awman-session").into_response(),
+        )),
+    }
+}
+
+/// Canonical body plus the validated session selection. Header-only requests
+/// retain the legacy fingerprint, and valid cross-form requests replay.
+fn command_idempotency_canonical(value: &serde_json::Value, session: &str) -> String {
+    let mut value = value.clone();
+    if let Some(body) = value.as_object_mut() {
+        body.remove("session_id");
+    }
+    format!("{value}\n{session}")
 }
 
 fn validate_command(body: &CreateCommandRequest) -> RouteResult<()> {
@@ -1552,15 +1630,12 @@ fn validate_command(body: &CreateCommandRequest) -> RouteResult<()> {
                 .map(|(parent, sub)| format!("{parent} {sub}"))
                 .collect();
             return Err(Box::new(
-                (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({
-                        "error": "command not available via API",
+                ApiError::invalid_request("command not available via API").with_details(
+                    serde_json::json!({
                         "blocked_command": command,
                         "available": available,
-                    })),
-                )
-                    .into_response(),
+                    }),
+                ),
             ));
         }
 
@@ -1571,7 +1646,7 @@ fn validate_command(body: &CreateCommandRequest) -> RouteResult<()> {
         if let Err(e) =
             catalogue.parse_raw_args_with_profile(&path_parts, &body.args, FrontendKind::Api)
         {
-            return Err(Box::new(bad_request(e.to_string())));
+            return Err(Box::new(ApiError::command_validation(&e).into_response()));
         }
     }
 
@@ -1589,11 +1664,7 @@ fn enqueue_command(
     if let Err(e) = state.paths.prepare_command_dir(session_id, command_id) {
         tracing::error!(error = %e, "Failed to create command directory");
         return Err(Box::new(
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                error_json("Failed to create command directory"),
-            )
-                .into_response(),
+            ApiError::internal("Failed to create command directory").into_response(),
         ));
     }
 
@@ -1609,11 +1680,7 @@ fn enqueue_command(
     ) {
         tracing::error!(error = %e, "Failed to enqueue command");
         return Err(Box::new(
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                error_json("Failed to enqueue command"),
-            )
-                .into_response(),
+            ApiError::internal("Failed to enqueue command").into_response(),
         ));
     }
 
@@ -1629,25 +1696,20 @@ fn enqueue_command(
 
 async fn handle_get_command(
     State(state): State<Arc<AppState>>,
+    peer: Peer,
     AxumPath(id): AxumPath<String>,
 ) -> Response {
     match state.store.get_command(&id) {
-        Ok(Some(c)) => match command_response(&state, c, None) {
+        Ok(Some(c)) => match command_response(&state, peer, c, None) {
             Ok(response) => Json(response).into_response(),
             Err(response) => *response,
         },
-        Ok(None) => (
-            StatusCode::NOT_FOUND,
-            error_json(format!("Command '{}' not found", id)),
-        )
-            .into_response(),
+        Ok(None) => {
+            ApiError::command_not_found(format!("Command '{}' not found", id)).into_response()
+        }
         Err(e) => {
             tracing::error!(error = %e, "Failed to get command");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                error_json("Failed to get command"),
-            )
-                .into_response()
+            ApiError::internal("Failed to get command").into_response()
         }
     }
 }
@@ -1990,10 +2052,7 @@ async fn handle_stream_command_logs(
     let command = match state.store.get_command(&command_id) {
         Ok(Some(c)) => c,
         Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
-                error_json(format!("Command '{command_id}' not found")),
-            )
+            return ApiError::command_not_found(format!("Command '{command_id}' not found"))
                 .into_response();
         }
         Err(e) => {
@@ -2236,19 +2295,12 @@ async fn handle_get_session_queue(
     // Validate session exists.
     match state.store.get_session(&id) {
         Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
-                error_json(format!("Session '{}' not found", id)),
-            )
+            return ApiError::session_not_found(format!("Session '{}' not found", id))
                 .into_response();
         }
         Err(e) => {
             tracing::error!(error = %e, "Failed to get session");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                error_json("Failed to get session"),
-            )
-                .into_response();
+            return ApiError::internal("Failed to get session").into_response();
         }
         Ok(Some(_)) => {}
     }
@@ -2354,15 +2406,11 @@ async fn handle_get_workflow(
     let cmd = match state.store.get_command(&command_id) {
         Ok(Some(c)) => c,
         Ok(None) => {
-            return (StatusCode::NOT_FOUND, error_json("command not found")).into_response();
+            return ApiError::command_not_found("command not found").into_response();
         }
         Err(e) => {
             tracing::error!(error = %e, "Failed to get command for workflow");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                error_json("Failed to get command"),
-            )
-                .into_response();
+            return ApiError::internal("Failed to get command").into_response();
         }
     };
 
@@ -2376,33 +2424,25 @@ async fn handle_get_workflow(
             Ok(val) => Json(crate::frontend::api::workflow_view::client_view(val)).into_response(),
             Err(e) => {
                 tracing::error!(error = %e, "Failed to parse workflow state");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    error_json("Failed to parse workflow state"),
-                )
-                    .into_response()
+                ApiError::internal("Failed to parse workflow state").into_response()
             }
         },
         Ok(None) => {
             let path: Vec<&str> = cmd.subcommand.split_whitespace().collect();
             let error = if CommandCatalogue::get().canonical_path(&path) == ["exec", "workflow"] {
                 if matches!(cmd.status.as_str(), "queued" | "pending" | "running") {
-                    "workflow not started"
+                    ApiError::workflow_not_started("workflow not started")
                 } else {
-                    "workflow never started"
+                    ApiError::workflow_never_started("workflow never started")
                 }
             } else {
-                "no workflow for this command"
+                ApiError::no_workflow("no workflow for this command")
             };
-            (StatusCode::NOT_FOUND, error_json(error)).into_response()
+            error.into_response()
         }
         Err(e) => {
             tracing::error!(error = %e, "Failed to read workflow state");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                error_json("Failed to read workflow state"),
-            )
-                .into_response()
+            ApiError::internal("Failed to read workflow state").into_response()
         }
     }
 }
@@ -2445,6 +2485,7 @@ mod tests {
         ("GET", "/v1/commands"),
         ("POST", "/v1/commands/{id}/cancel"),
         ("POST", "/v1/runs"),
+        ("GET", "/v1/commands/{id}"),
         ("GET", "/v1/commands/{id}/status"),
         ("GET", "/v1/commands/{id}/logs"),
         ("GET", "/v1/workflows/{command_id}"),
@@ -2523,7 +2564,7 @@ mod tests {
         // Guard: if someone adds a route without updating this table, the count drifts.
         assert_eq!(
             EXPECTED_ROUTES.len(),
-            18,
+            19,
             "route count mismatch — update EXPECTED_ROUTES"
         );
     }
@@ -2601,6 +2642,7 @@ mod tests {
             ("DELETE", "/v1/sessions/test-id", 404), // session not found
             ("GET", "/v1/sessions/test-id/status", 404), // session not found
             ("GET", "/v1/sessions/test-id/queue", 404), // session not found
+            ("GET", "/v1/commands/test-id", 404), // command not found
             ("GET", "/v1/commands/test-id/status", 404), // command not found
             ("GET", "/v1/commands/test-id/logs", 404), // command not found
             ("POST", "/v1/commands/test-id/cancel", 404), // command not found

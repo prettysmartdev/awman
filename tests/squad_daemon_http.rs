@@ -1561,3 +1561,27 @@ async fn prerequisite_widening_is_refused_by_the_real_squad_route_unless_operato
         handle.abort();
     }
 }
+
+#[tokio::test]
+async fn malformed_command_json_uses_the_shared_error_envelope() {
+    let _env_guard = ENV_LOCK.lock().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let (handle, base) = start_daemon(tmp.path(), Arc::new(ContainerRuntime::docker())).await;
+    for (input, status, code) in [
+        ("{bad", 400, "invalid_request"),
+        ("{}", 422, "unprocessable_request"),
+    ] {
+        let response = reqwest::Client::new()
+            .post(format!("{base}/v1/commands"))
+            .header("content-type", "application/json")
+            .body(input)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), status);
+        assert_eq!(response.headers()["content-type"], "application/json");
+        let json: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(json["code"], code);
+    }
+    handle.abort();
+}

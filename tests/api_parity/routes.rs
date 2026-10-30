@@ -57,7 +57,7 @@ fn api_paths_tls_dir_under_root() {
 /// The expected route paths from `build_router`. WI 0079 moved SSE log
 /// streaming from `/v1/sessions/{id}/jobs/{job_id}/logs` to
 /// `/v1/commands/{id}/logs`, and added `GET /v1/sessions/:id/queue` and
-/// `GET /v1/commands/:id/status`.
+/// `GET /v1/commands/:id/status`. WI 0138 added `GET /v1/commands/:id`.
 const EXPECTED_ROUTES: &[(&str, &str)] = &[
     ("GET", "/v1/status"),
     ("GET", "/v1/workdirs"),
@@ -71,6 +71,7 @@ const EXPECTED_ROUTES: &[(&str, &str)] = &[
     ("GET", "/v1/commands"),
     ("POST", "/v1/commands/:id/cancel"),
     ("POST", "/v1/runs"),
+    ("GET", "/v1/commands/:id"),
     ("GET", "/v1/commands/:id/status"),
     ("GET", "/v1/commands/:id/logs"),
     ("GET", "/v1/workflows/:command_id"),
@@ -78,7 +79,7 @@ const EXPECTED_ROUTES: &[(&str, &str)] = &[
 
 #[test]
 fn expected_routes_table_is_non_empty() {
-    assert_eq!(EXPECTED_ROUTES.len(), 15);
+    assert_eq!(EXPECTED_ROUTES.len(), 16);
 }
 
 #[test]
