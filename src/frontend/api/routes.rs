@@ -2496,6 +2496,40 @@ mod tests {
     use std::sync::Arc;
     use std::time::Instant;
 
+    #[tokio::test(start_paused = true)]
+    async fn waiting_for_a_worker_sends_keepalives_on_cadence_past_300s() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = make_test_state(tmp.path());
+        state
+            .store
+            .insert_session_full(crate::data::fs::api_db::NewSessionRow {
+                id: "s",
+                workdir: "/work",
+                created_at: &chrono::Utc::now().to_rfc3339(),
+                setup_status: crate::data::session_setup_event::SessionSetupStatus::Ready,
+                kind: crate::data::session::SessionKind::Local,
+                cloned_path: None,
+            })
+            .unwrap();
+        state
+            .store
+            .enqueue_command("c", "s", "exec prompt", "[]", "/unused")
+            .unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let waiter = {
+            let state = Arc::clone(&state);
+            tokio::spawn(async move {
+                wait_for_worker(&state, "c", &tx, WORKER_WAIT_KEEPALIVE, COMMAND_STATUS_POLL).await;
+            })
+        };
+        let started = tokio::time::Instant::now();
+        for n in 1..=22 {
+            let _ = rx.recv().await.unwrap().unwrap();
+            assert_eq!(started.elapsed(), WORKER_WAIT_KEEPALIVE * n);
+        }
+        waiter.abort();
+    }
+
     // Route table — assertion guard. Every entry here must be registered in
     // build_router; any divergence is a regression.
     const EXPECTED_ROUTES: &[(&str, &str)] = &[

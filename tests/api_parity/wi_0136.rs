@@ -321,9 +321,11 @@ async fn queued_command_waiting_past_300s_keeps_the_stream_open_with_15s_keepali
             .unwrap()
             .contains("Waiting for a worker"));
 
-        // Well past the old 300 s deadline: only keepalive comments.
-        let mut keepalives = Vec::new();
-        while started.elapsed() < Duration::from_secs(330) {
+        // Well past the old 300 s deadline: only keepalive comments. Count
+        // frames rather than read the clock per frame: virtual time can run
+        // ahead of delivery over a real socket. The cadence is tested on
+        // `wait_for_worker` itself in routes.rs.
+        for _ in 0..22 {
             let frame = sse
                 .next()
                 .await
@@ -334,21 +336,8 @@ async fn queued_command_waiting_past_300s_keeps_the_stream_open_with_15s_keepali
                 started.elapsed()
             );
             assert!(frame.comment.is_some(), "{frame:?}");
-            keepalives.push(started.elapsed());
         }
-        assert!(
-            (21..=23).contains(&keepalives.len()),
-            "~330s / 15s keepalives, got {}: {keepalives:?}",
-            keepalives.len()
-        );
-        for pair in keepalives.windows(2) {
-            let gap = pair[1] - pair[0];
-            assert!(
-                (Duration::from_secs(14)..=Duration::from_secs(16)).contains(&gap),
-                "keepalive cadence {gap:?}"
-            );
-        }
-        assert!(keepalives[0] >= Duration::from_secs(14), "{keepalives:?}");
+        assert!(started.elapsed() >= Duration::from_secs(330));
 
         // The row is still queued: no Done was fabricated.
         let row = state.store.get_command("queued").unwrap().unwrap();
