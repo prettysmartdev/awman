@@ -15,10 +15,13 @@ use crate::engine::auth::redaction::RedactionSet;
 use crate::engine::container::ContainerRuntime;
 use crate::engine::workflow::prerequisite_grants::{PrerequisiteGrants, TokenGrantSource};
 
+mod policy;
 mod probes;
 pub mod sources;
 pub use sources::PreflightSources;
 
+#[cfg(test)]
+mod policy_tests;
 #[cfg(test)]
 mod tests;
 

@@ -416,18 +416,32 @@ fn free_port() -> u16 {
 }
 
 /// The persisted event stream of a finished command (`events.log`, beside the
-/// record's `log_path`). A terminal row guarantees the tail is already flushed.
+/// record's `log_path`). WI 0137 §2 writes the terminal row before publishing
+/// the final status and Done, so wait for the log writer to finish that tail.
 pub async fn events_log(command: &Value) -> String {
     let output_log = Path::new(command["log_path"].as_str().expect("command log_path"));
     let path = output_log.with_file_name("events.log");
-    let log = std::fs::read_to_string(&path).unwrap();
-    assert_eq!(
-        log.matches(r#""type":"Done""#).count(),
-        1,
-        "{}: {log}",
-        path.display()
-    );
-    log
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let log = match std::fs::read_to_string(&path) {
+            Ok(log) => log,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(error) => panic!("{}: {error}", path.display()),
+        };
+        let done = log.matches(r#""type":"Done""#).count();
+        // A reader can observe a partially written JSON record. The final
+        // newline, as well as Done, must be present before returning the log.
+        if done > 0 && log.ends_with('\n') {
+            assert_eq!(done, 1, "{}: {log}", path.display());
+            return log;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no complete Done event in {}: {log}",
+            path.display()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 /// The clone a remote session works in, as `GET /v1/sessions/{id}` reports it.

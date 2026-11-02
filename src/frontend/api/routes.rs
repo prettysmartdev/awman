@@ -1,6 +1,6 @@
 //! HTTP route registration and handlers for the API server.
 //!
-//! Wire-identical to `oldsrc/commands/headless/server.rs::build_router`.
+//! Routes preserve the API's established request and response contract.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -15,10 +15,15 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::FutureExt;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use tokio_stream::wrappers::ReceiverStream;
 use tower_http::trace::TraceLayer;
 
+use crate::command::commands::api_server::admission::{
+    AdmissionError, ApiAdmission, CommandSubmission, IdempotentAdmission, SessionSubmission,
+};
+use crate::command::commands::api_server::command_log_stream::{
+    CommandLogStream, CommandLogUpdate,
+};
 use crate::command::commands::api_server::event_bus::EventBus;
 use crate::command::commands::api_server::session_setup::{
     log_session_setup, SessionSetupBus, SessionSetupBusSender, SetupReadyFrontend, TracingSetupSink,
@@ -28,27 +33,20 @@ use crate::command::commands::api_server::{
     ApiSessionLifecycle, CancelOutcome, CloseOutcome, CommandCanceller, SetupReadiness,
     TokenRegistry,
 };
-use crate::command::dispatch::catalogue::{CommandCatalogue, FrontendKind};
-use crate::command::error::CommandError;
-use crate::command::session_create::{
-    SessionCreatePlan, SessionCreatePolicy, SessionCreateRequest,
-};
+use crate::command::session_create::{SessionCreatePlan, SessionCreateRequest};
 use crate::command::session_setup::{SessionSetup, SessionSetupPresenter};
 use crate::data::api_lifecycle_store::{CommandLifecycleStore, RunRecord};
 use crate::data::command_status::CommandStatus;
-use crate::data::execution_event::{EventCursor, EventPayload, ExecutionEvent, ReplayFrom};
-use crate::data::fs::api_db::{
-    CommandListFilter, CommandRecord, IdempotencyBegin, IdempotencyOwner, IdempotencyResource,
-    IdempotencyScope, LabelOwner,
-};
-use crate::data::fs::api_db::{NewSessionRow, RemoteSessionFields, SessionRecord};
+use crate::data::execution_event::{EventCursor, ExecutionEvent};
+use crate::data::fs::api_db::SessionRecord;
+use crate::data::fs::api_db::{CommandListFilter, CommandRecord, IdempotencyBegin, LabelOwner};
 use crate::data::fs::api_db::{SessionCommandAdmission, SqliteSessionStore};
 use crate::data::fs::api_labels::{LabelSelector, Labels};
 use crate::data::fs::api_paths::ApiPaths;
-use crate::data::session::SessionKind;
 use crate::data::session_manager::SessionManager;
 use crate::data::session_setup_event::SessionSetupStatus;
 use crate::data::session_setup_event::SetupEventPayload;
+use crate::data::session_status::SessionStatus;
 use crate::engine::git::GitFrontend;
 use crate::engine::ready::frontend::ReadyFrontend;
 
@@ -73,6 +71,18 @@ pub struct AppState {
 }
 
 impl AppState {
+    fn admission(&self) -> ApiAdmission {
+        ApiAdmission::new(
+            Arc::clone(&self.store),
+            self.lifecycle_store.clone(),
+            self.paths.clone(),
+            self.engines.clone(),
+            Arc::clone(&self.sessions),
+            self.workdirs.clone(),
+            self.workdir_roots.clone(),
+        )
+    }
+
     fn lifecycle(&self) -> ApiSessionLifecycle {
         ApiSessionLifecycle::new(
             Arc::clone(&self.store),
@@ -81,15 +91,6 @@ impl AppState {
             self.paths.clone(),
         )
     }
-}
-
-#[derive(Serialize)]
-struct QueueStatusResponse {
-    session_id: String,
-    queue_depth: i64,
-    running: Option<serde_json::Value>,
-    queued: Vec<serde_json::Value>,
-    recent_completed: Vec<serde_json::Value>,
 }
 
 #[derive(Serialize)]
@@ -105,7 +106,7 @@ struct SessionClosingResponse {
     message: String,
 }
 
-// ─── Request / Response types (wire-compatible with oldsrc) ──────────────────
+// ─── Request / Response types (API compatibility contract) ───────────────────
 
 #[derive(Deserialize, Debug)]
 struct CreateSessionRequest {
@@ -132,11 +133,6 @@ struct CreateSessionRequest {
     push: bool,
     #[serde(default)]
     labels: Labels,
-}
-
-#[derive(Serialize)]
-struct CreateSessionResponse {
-    session_id: String,
 }
 
 #[derive(Serialize)]
@@ -171,15 +167,10 @@ impl SessionResponse {
     /// The row projection plus its labels and, for a failed setup, the
     /// `{stage, message}` recorded in the session's setup_state.json.
     fn new(state: &AppState, row: SessionRecord, labels: Labels) -> Self {
-        let setup_error = if row.setup_status == SessionSetupStatus::Failed.as_str() {
-            state
-                .paths
-                .read_setup_state(&row.id)
-                .and_then(|setup| setup.error)
-                .and_then(|error| serde_json::to_value(error).ok())
-        } else {
-            None
-        };
+        let setup_error = state
+            .lifecycle()
+            .setup_error(&row)
+            .and_then(|error| serde_json::to_value(error).ok());
         Self {
             labels,
             setup_error,
@@ -194,8 +185,8 @@ impl From<SessionRecord> for SessionResponse {
             id: s.id,
             workdir: s.workdir,
             created_at: s.created_at,
-            status: s.status,
-            setup_status: s.setup_status,
+            status: s.status.as_str().to_string(),
+            setup_status: s.setup_status.as_str().to_string(),
             setup_error: None,
             closed_at: s.closed_at,
             session_type: s.session_type,
@@ -219,16 +210,6 @@ struct CreateCommandRequest {
     /// `x-awman-session` header. A run's command must not name one.
     #[serde(default)]
     session_id: Option<String>,
-}
-
-#[derive(Serialize)]
-struct CreateCommandResponse {
-    command_id: String,
-    /// Server-enforced flags whose values the API frontend always overrides.
-    /// Documents to clients that `yolo` and `non_interactive` are forced to
-    /// `true` regardless of any value sent in the request body. Empty object
-    /// for non-exec routes.
-    flags_applied: serde_json::Value,
 }
 
 #[derive(Serialize)]
@@ -306,13 +287,64 @@ struct CreateRunRequest {
     close_on_finish: bool,
 }
 
-#[derive(Serialize)]
-struct CreateRunResponse {
-    session_id: String,
-    command_id: String,
+use crate::frontend::api::error::ApiError;
+
+impl From<CreateCommandRequest> for CommandSubmission {
+    fn from(body: CreateCommandRequest) -> Self {
+        Self {
+            subcommand: body.subcommand,
+            args: body.args,
+            labels: body.labels,
+        }
+    }
 }
 
-use crate::frontend::api::error::ApiError;
+fn admission_error(error: AdmissionError, session_id: &str) -> Response {
+    match error {
+        AdmissionError::SessionCreation(e) => ApiError::session_creation(&e).into_response(),
+        AdmissionError::CommandValidation(e) => ApiError::command_validation(&e).into_response(),
+        AdmissionError::CommandAdmission(e) => ApiError::command_admission(&e).into_response(),
+        AdmissionError::Unavailable { command, available } => ApiError::invalid_request(
+            "command not available via API",
+        )
+        .with_details(serde_json::json!({ "blocked_command": command, "available": available })),
+        AdmissionError::Session(SessionCommandAdmission::Closing) => {
+            ApiError::session_closing("session is closing").with_details(serde_json::json!({
+                "session_id": session_id,
+                "hint": "Session is shutting down and no longer accepts commands."
+            }))
+        }
+        AdmissionError::Session(SessionCommandAdmission::Closed) => {
+            ApiError::session_not_found(format!("Session '{}' is closed", session_id))
+                .into_response()
+        }
+        AdmissionError::Session(SessionCommandAdmission::NotFound)
+        | AdmissionError::Setup(SetupReadiness::NotFound) => {
+            ApiError::session_not_found(format!("Session '{}' not found", session_id))
+                .into_response()
+        }
+        AdmissionError::Setup(readiness) => {
+            let mut body = serde_json::json!({
+                "setup_status": readiness.status(),
+                "hint": "Poll GET /v1/sessions/{id}/status to check setup progress"
+            });
+            let mut message = "session is not ready";
+            if let Some(err) = readiness.error().cloned() {
+                body["setup_error"] = err;
+                message = "session setup failed";
+            }
+            ApiError::session_not_ready(message).with_details(body)
+        }
+        AdmissionError::Storage { what, source } => {
+            tracing::error!(error = %source, "{what}");
+            internal_error(what)
+        }
+        AdmissionError::ReservationLost => internal_error("Idempotency reservation lost"),
+        AdmissionError::Session(SessionCommandAdmission::Accepted) => {
+            internal_error("Unexpected session admission outcome")
+        }
+    }
+}
 
 fn bad_request(message: impl Into<String>) -> Response {
     ApiError::invalid_request(message).into_response()
@@ -320,10 +352,6 @@ fn bad_request(message: impl Into<String>) -> Response {
 
 fn internal_error(message: &str) -> Response {
     ApiError::internal(message).into_response()
-}
-
-fn command_is_terminal(status: &str) -> bool {
-    CommandStatus::parse(status).is_some_and(CommandStatus::is_terminal)
 }
 
 fn session_response(state: &AppState, row: SessionRecord) -> Response {
@@ -383,17 +411,12 @@ fn command_response(
         .lifecycle_store
         .cancel_requested_at(&c.id)
         .map_err(|_| internal_error("Failed to read cancel request"))?;
-    let queue_position = if CommandStatus::parse(&c.status).is_some_and(CommandStatus::is_claimable)
-    {
-        state
-            .store
-            .queue_position_for_command(&c.id, &c.session_id)
-            .map_err(|_| internal_error("Failed to read queue position"))?
-    } else {
-        None
-    };
+    let queue_position = state
+        .lifecycle()
+        .queue_position(&c)
+        .map_err(|_| internal_error("Failed to read queue position"))?;
     Ok(CommandResponse {
-        args: serde_json::from_str(&c.args).unwrap_or_else(|_| serde_json::json!([])),
+        args: crate::command::commands::api_server::runtime::stored_args_view(&c),
         result: c
             .result
             .as_deref()
@@ -403,11 +426,7 @@ fn command_response(
         session_id: c.session_id,
         subcommand: c.subcommand,
         // Rows migrate `pending` → `queued`; never show the legacy name.
-        status: if c.status == CommandStatus::Pending.as_str() {
-            CommandStatus::Queued.as_str().to_string()
-        } else {
-            c.status
-        },
+        status: c.status.canonical().as_str().to_string(),
         exit_code: c.exit_code,
         started_at: c.started_at,
         finished_at: c.finished_at,
@@ -422,8 +441,9 @@ fn command_response(
 
 #[derive(Default)]
 struct ListQuery {
-    status: Option<String>,
-    setup_status: Option<String>,
+    command_status: Option<CommandStatus>,
+    session_status: Option<SessionStatus>,
+    setup_status: Option<SessionSetupStatus>,
     session_id: Option<String>,
     labels: Vec<LabelSelector>,
     limit: i64,
@@ -440,31 +460,34 @@ impl ListQuery {
                 "label" => query
                     .labels
                     .push(LabelSelector::parse(&value).map_err(|e| bad_request(e.to_string()))?),
-                "status" => {
-                    if commands && CommandStatus::parse(&value).is_none() {
+                "status" if commands => {
+                    query.command_status = Some(CommandStatus::parse(&value).ok_or_else(|| {
                         let valid: Vec<_> = CommandStatus::ALL.iter().map(|s| s.as_str()).collect();
-                        return Err(Box::new(bad_request(format!(
+                        bad_request(format!(
                             "unknown command status: {value}; expected {}",
                             valid.join("|")
-                        ))));
-                    }
-                    if !commands && !matches!(value.as_str(), "active" | "closing" | "closed") {
-                        return Err(Box::new(bad_request(format!(
-                            "unknown session status: {value}; expected active|closing|closed"
-                        ))));
-                    }
-                    query.status = Some(value);
+                        ))
+                    })?);
+                }
+                "status" => {
+                    query.session_status = Some(SessionStatus::parse(&value).ok_or_else(|| {
+                        let valid: Vec<_> = SessionStatus::ALL.iter().map(|s| s.as_str()).collect();
+                        bad_request(format!(
+                            "unknown session status: {value}; expected {}",
+                            valid.join("|")
+                        ))
+                    })?);
                 }
                 "setup_status" if !commands => {
-                    if SessionSetupStatus::parse(&value).is_none() {
-                        let valid: Vec<_> =
-                            SessionSetupStatus::ALL.iter().map(|s| s.as_str()).collect();
-                        return Err(Box::new(bad_request(format!(
-                            "unknown session setup_status: {value}; expected {}",
-                            valid.join("|")
-                        ))));
-                    }
-                    query.setup_status = Some(value);
+                    query.setup_status =
+                        Some(SessionSetupStatus::parse(&value).ok_or_else(|| {
+                            let valid: Vec<_> =
+                                SessionSetupStatus::ALL.iter().map(|s| s.as_str()).collect();
+                            bad_request(format!(
+                                "unknown session setup_status: {value}; expected {}",
+                                valid.join("|")
+                            ))
+                        })?);
                 }
                 "session_id" if commands => query.session_id = Some(value),
                 "limit" if commands => {
@@ -490,7 +513,7 @@ async fn handle_list_commands(
         Err(response) => return *response,
     };
     let rows = match state.store.list_commands_filtered(&CommandListFilter {
-        status: query.status.as_deref(),
+        status: query.command_status,
         session_id: query.session_id.as_deref(),
         labels: &query.labels,
         limit: query.limit,
@@ -519,25 +542,11 @@ async fn handle_cancel_command(
     peer: Peer,
     AxumPath(id): AxumPath<String>,
 ) -> Response {
-    match state.canceller.cancel(&id) {
+    match state.lifecycle().cancel_command(&id, &state.canceller, &state.setup_cancels, &state.lifecycle_store).await {
         Ok(CancelOutcome::NotFound) => {
             ApiError::command_not_found(format!("Command '{id}' not found")).into_response()
         }
         Ok(CancelOutcome::AlreadyTerminal(row) | CancelOutcome::Cancelled(row)) => {
-            // During setup its owner must finish clone cleanup before closing.
-            // After setup, a cancelled queued row has no worker to close it.
-            if !state.setup_cancels.is_registered(&row.session_id) {
-                match state.lifecycle_store.run_for_command(&id) {
-                    Ok(Some(run)) if run.close_on_finish => {
-                        if let Err(error) = state.lifecycle().close(&run.session_id).await {
-                            tracing::error!(%error, "Failed to close cancelled run session");
-                            return internal_error("Failed to close cancelled run session");
-                        }
-                    }
-                    Err(_) => return internal_error("Failed to read run"),
-                    _ => {}
-                }
-            }
             match command_response(&state, peer, row, None) {
                 Ok(response) => Json(response).into_response(),
                 Err(response) => *response,
@@ -550,87 +559,17 @@ async fn handle_cancel_command(
         }) => (
             StatusCode::ACCEPTED,
             Json(serde_json::json!({
-                "command_id": command_id, "session_id": session_id, "status": "running",
+                "command_id": command_id, "session_id": session_id, "status": CommandStatus::Running.as_str(),
                 "cancel_requested_at": requested_at,
                 "message": "Stopping. Poll GET /v1/commands/{id}/status until status is cancelled.",
             })),
         )
             .into_response(),
         Err(error) => {
-            tracing::error!(%error, "Failed to cancel command");
-            internal_error("Failed to cancel command")
+            tracing::error!(?error, command_id = %id, "Command cancellation failed");
+            internal_error(&error.to_string())
         }
     }
-}
-
-/// One id per daemon process. An unfinished idempotency reservation held by
-/// another id belongs to a daemon that has exited (see `idempotency_begin`).
-fn daemon_instance() -> &'static str {
-    static INSTANCE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    INSTANCE.get_or_init(|| uuid::Uuid::new_v4().to_string())
-}
-
-/// A request's hold on its idempotency reservation. Handlers call
-/// [`AdmissionJournal::record`] before their first durable write; the
-/// wrapper stores or releases the reservation afterwards.
-pub(crate) struct AdmissionJournal {
-    store: Arc<SqliteSessionStore>,
-    route: &'static str,
-    principal: String,
-    key: String,
-    request: String,
-}
-
-impl AdmissionJournal {
-    fn scope(&self) -> IdempotencyScope<'_> {
-        IdempotencyScope {
-            route: self.route,
-            principal: &self.principal,
-        }
-    }
-
-    fn owner(&self) -> IdempotencyOwner<'_> {
-        IdempotencyOwner {
-            instance: daemon_instance(),
-            request: &self.request,
-        }
-    }
-
-    /// Record the 202 `body` this request returns once `resource` exists.
-    fn record(&self, body: &str, resource: IdempotencyResource<'_>) -> RouteResult<()> {
-        match self.store.idempotency_record_intent(
-            self.scope(),
-            &self.key,
-            self.owner(),
-            StatusCode::ACCEPTED.as_u16(),
-            body,
-            resource,
-        ) {
-            Ok(true) => Ok(()),
-            Ok(false) => Err(Box::new(internal_error("Idempotency reservation lost"))),
-            Err(error) => {
-                tracing::error!(%error, "Failed to record idempotent admission");
-                Err(Box::new(internal_error(
-                    "Failed to record idempotent admission",
-                )))
-            }
-        }
-    }
-}
-
-/// Record the admission intent (when keyed) and serialise the 202 body, so
-/// the response a restart recovers is byte-identical to the one returned.
-fn admission_body(
-    journal: Option<&AdmissionJournal>,
-    body: &impl Serialize,
-    resource: IdempotencyResource<'_>,
-) -> RouteResult<String> {
-    let body =
-        serde_json::to_string(body).map_err(|_| internal_error("Failed to encode response"))?;
-    if let Some(journal) = journal {
-        journal.record(&body, resource)?;
-    }
-    Ok(body)
 }
 
 fn accepted_json(body: String) -> Response {
@@ -642,25 +581,6 @@ fn accepted_json(body: String) -> Response {
         .into_response()
 }
 
-// A panic, a dropped request future or a failed response store ends the
-// request without a stored response: keep the reservation if the work was
-// admitted (its recorded resource exists), else release it.
-struct IdempotencyReservation(Option<Arc<AdmissionJournal>>);
-
-impl Drop for IdempotencyReservation {
-    fn drop(&mut self) {
-        if let Some(journal) = self.0.take() {
-            if let Err(error) = journal.store.idempotency_release_unless_admitted(
-                journal.scope(),
-                &journal.key,
-                journal.owner(),
-            ) {
-                tracing::error!(%error, "Failed to release idempotency reservation");
-            }
-        }
-    }
-}
-
 async fn with_idempotency<F, Fut>(
     state: &AppState,
     headers: &HeaderMap,
@@ -669,7 +589,7 @@ async fn with_idempotency<F, Fut>(
     handler: F,
 ) -> Response
 where
-    F: FnOnce(Option<Arc<AdmissionJournal>>) -> Fut,
+    F: FnOnce(Option<Arc<IdempotentAdmission>>) -> Fut,
     Fut: std::future::Future<Output = Response>,
 {
     let Some(header) = headers.get("idempotency-key") else {
@@ -689,24 +609,13 @@ where
         AuthMode::Enabled { key_hash } => key_hash.as_str(),
         AuthMode::Disabled => "anonymous",
     };
-    let journal = Arc::new(AdmissionJournal {
-        store: Arc::clone(&state.store),
+    let journal = Arc::new(IdempotentAdmission::new(
+        Arc::clone(&state.store),
         route,
-        principal: principal.to_string(),
-        key: key.to_string(),
-        request: uuid::Uuid::new_v4().to_string(),
-    });
-    let hash: String = Sha256::digest(canonical.as_bytes())
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
-    match state.store.idempotency_begin(
-        journal.scope(),
+        principal,
         key,
-        &hash,
-        &chrono::Utc::now().to_rfc3339(),
-        journal.owner(),
-    ) {
+    ));
+    match journal.begin(canonical) {
         Ok(IdempotencyBegin::Fresh) => {}
         Ok(IdempotencyBegin::Replay { status, body }) => {
             return (
@@ -739,7 +648,6 @@ where
             return internal_error("Failed to reserve idempotency key");
         }
     }
-    let mut reservation = IdempotencyReservation(Some(Arc::clone(&journal)));
     let response = match std::panic::AssertUnwindSafe(handler(Some(Arc::clone(&journal))))
         .catch_unwind()
         .await
@@ -748,12 +656,8 @@ where
         Err(_) => return internal_error("Request handler failed"),
     };
     if response.status().is_server_error() {
-        // Handlers roll back what they admitted before returning a 5xx.
-        reservation.0 = None;
-        if let Err(error) = state
-            .store
-            .idempotency_release(journal.scope(), key, journal.owner())
-        {
+        // Layer 2 retains a barrier if admission compensation is unfinished.
+        if let Err(error) = journal.release() {
             tracing::error!(%error, "Failed to release idempotency reservation");
         }
         return response;
@@ -767,17 +671,10 @@ where
         Ok(body) => body,
         Err(_) => return internal_error("Invalid JSON response encoding"),
     };
-    match state.store.idempotency_complete(
-        journal.scope(),
-        key,
-        journal.owner(),
-        parts.status.as_u16(),
-        body,
-    ) {
-        Ok(true) => reservation.0 = None,
+    match journal.complete(parts.status.as_u16(), body) {
+        Ok(true) => {}
         Ok(false) => {
             tracing::warn!("Idempotency reservation was no longer held when completing");
-            reservation.0 = None;
         }
         Err(error) => {
             // The reservation guard keeps an admitted request's recorded
@@ -847,7 +744,7 @@ async fn auth_middleware(
     // State extraction only: the decision itself lives in one shared place so
     // the API and squad daemons can never diverge on how a key is accepted.
     if let Some(rejection) = crate::frontend::api::serve::check_bearer_auth(
-        &state.engines.auth_engine,
+        &state.engines,
         &state.auth_mode,
         req.headers(),
     ) {
@@ -952,151 +849,41 @@ async fn create_submission(
     body: CreateSessionRequest,
     command: Option<CreateCommandRequest>,
     close_on_finish: bool,
-    journal: Option<&AdmissionJournal>,
+    journal: Option<&IdempotentAdmission>,
 ) -> Response {
-    let session_id = uuid::Uuid::new_v4().to_string();
-    let created_at = chrono::Utc::now().to_rfc3339();
-    let session_dir = state.paths.session_dir(&session_id);
-
-    // Validate and plan the session in Layer 2. The route only maps the typed
-    // result/error to an HTTP status + JSON envelope — no business logic here.
-    let request = SessionCreateRequest {
-        session_type: body.session_type,
-        workdir: body.workdir,
-        repo_url: body.repo_url,
-        branch: body.branch,
-        base_ref: body.base_ref,
-        merge_refs: body.merge_refs,
-        push: body.push,
+    let submission = SessionSubmission {
+        request: SessionCreateRequest {
+            session_type: body.session_type,
+            workdir: body.workdir,
+            repo_url: body.repo_url,
+            branch: body.branch,
+            base_ref: body.base_ref,
+            merge_refs: body.merge_refs,
+            push: body.push,
+        },
+        labels: body.labels,
     };
-    let policy = SessionCreatePolicy::new(state.workdirs.clone(), session_dir.clone())
-        .with_workdir_roots(state.workdir_roots.clone());
-    let plan = match request.validate(&policy, state.engines.git_engine.as_ref()) {
-        Ok(plan) => plan,
-        Err(e) => {
-            return ApiError::session_creation(&e).into_response();
-        }
-    };
-    if let Err(e) = plan
-        .validate_merge_ref_kinds(Arc::clone(&state.engines.git_engine))
+    let admitted = match state
+        .admission()
+        .admit_session(
+            submission,
+            command.map(CommandSubmission::from),
+            close_on_finish,
+            journal,
+        )
         .await
     {
-        return ApiError::session_creation(&e).into_response();
-    }
-
-    if let Some(command) = &command {
-        if let Err(response) = validate_command(command) {
-            return *response;
-        }
-    }
-
-    // Create session storage directories (Layer 0).
-    if let Err(e) = state.paths.prepare_session_dirs(&session_id) {
-        tracing::error!(error = %e, "Failed to create session directory");
-        return ApiError::internal("Failed to create session directory").into_response();
-    }
-
-    // The response is fixed before anything durable is written, so a keyed
-    // request recovers it from the admitted resource after a crash: the
-    // session row for a session, the command row (written last) for a run.
-    let command_id = command.as_ref().map(|_| uuid::Uuid::new_v4().to_string());
-    let response_body = match &command_id {
-        Some(command_id) => admission_body(
-            journal,
-            &CreateRunResponse {
-                session_id: session_id.clone(),
-                command_id: command_id.clone(),
-            },
-            IdempotencyResource::Command(command_id),
-        ),
-        None => admission_body(
-            journal,
-            &CreateSessionResponse {
-                session_id: session_id.clone(),
-            },
-            IdempotencyResource::Session(&session_id),
-        ),
+        Ok(admitted) => admitted,
+        Err(error) => return admission_error(error, ""),
     };
-    let response_body = match response_body {
-        Ok(body) => body,
-        Err(response) => return *response,
-    };
-
-    // Persist the session row with setup_status='initializing' BEFORE spawning
-    // the setup task. If the server restarts mid-setup we want the cleanup
-    // pass to find this session as non-terminal even if no setup_state.json
-    // was written yet.
-    let workdir = plan.resolved_workdir.to_string_lossy().into_owned();
-    let cloned_path = plan
-        .cloned_path
-        .as_ref()
-        .map(|p| p.to_string_lossy().into_owned());
-    if let Err(e) = state.store.insert_session_full(NewSessionRow {
-        id: &session_id,
-        workdir: &workdir,
-        created_at: &created_at,
-        setup_status: SessionSetupStatus::Initializing,
-        kind: plan.kind,
-        cloned_path: cloned_path.as_deref(),
-    }) {
-        tracing::error!(error = %e, "Failed to insert session");
-        return ApiError::internal("Failed to create session").into_response();
-    }
-    // Record the remote inputs before setup starts, so a restored session
-    // keeps them (and the push stage can read `push` from the row).
-    if plan.kind == SessionKind::Remote {
-        if let Err(e) = state.store.set_remote_fields(
-            &session_id,
-            RemoteSessionFields {
-                repo_url: plan.repo_url.as_deref(),
-                branch: plan.branch.as_deref(),
-                base_ref: plan.base_ref.as_deref(),
-                merge_refs: &plan.merge_refs,
-                push: plan.push,
-            },
-        ) {
-            tracing::error!(error = %e, "Failed to record remote session fields");
-            return ApiError::internal("Failed to create session").into_response();
-        }
-    }
-
-    if let Err(error) = state
-        .store
-        .set_labels(LabelOwner::Session, &session_id, &body.labels)
-    {
-        tracing::error!(%error, "Failed to store session labels");
-        let _ = state.lifecycle().close(&session_id).await;
-        return internal_error("Failed to store session labels");
-    }
-    let run = if let (Some(command), Some(command_id)) = (command, command_id) {
-        // The run link precedes the command row: the row is the admission
-        // point, and setup/bootstrap always find the link for it.
-        let run = RunRecord {
-            session_id: session_id.clone(),
-            command_id,
-            close_on_finish,
-            created_at,
-        };
-        if let Err(error) = state.lifecycle_store.record_run(&run) {
-            tracing::error!(%error, "Failed to record run");
-            let _ = state.lifecycle().close(&session_id).await;
-            return internal_error("Failed to record run");
-        }
-        if let Err(response) = enqueue_command(state, &run.command_id, &session_id, &command) {
-            let _ = state.lifecycle().close(&session_id).await;
-            return *response;
-        }
-        Some(run)
-    } else {
-        None
-    };
+    let crate::command::commands::api_server::admission::AdmittedSession {
+        session_id,
+        plan,
+        run,
+        response_body,
+    } = admitted;
 
     let setup_bus = Arc::new(SessionSetupBus::new(256));
-    state
-        .setup_buses
-        .lock()
-        .await
-        .insert(session_id.clone(), Arc::clone(&setup_bus));
 
     tracing::info!(
         session_id = %session_id,
@@ -1110,7 +897,15 @@ async fn create_submission(
     let state_clone = Arc::clone(state);
     let sid = session_id.clone();
     let run_for_setup = run.clone();
+    // There is no await between durable admission and spawning its owner.
+    // Bus contention belongs to that task, so dropping the HTTP future cannot
+    // strand admitted work or serialize validation behind a presentation lock.
     tokio::spawn(async move {
+        state_clone
+            .setup_buses
+            .lock()
+            .await
+            .insert(sid.clone(), Arc::clone(&setup_bus));
         run_session_setup(state_clone, sid, plan, setup_bus, token, run_for_setup).await;
     });
     accepted_json(response_body)
@@ -1152,14 +947,8 @@ async fn run_session_setup(
     // before run linkage/token registration). Carry that early cancel into
     // Track A's setup-abort path as well.
     if let Some(run) = &run {
-        if state
-            .store
-            .get_command(&run.command_id)
-            .ok()
-            .flatten()
-            .is_some_and(|c| c.status == CommandStatus::Cancelled.as_str())
-        {
-            token.cancel();
+        if let Err(error) = state.lifecycle().reconcile_setup_cancel(run, &token) {
+            tracing::error!(%error, session_id, command_id = %run.command_id, "Failed to read early setup cancellation");
         }
     }
     setup.run(&mut presenter).await;
@@ -1243,8 +1032,8 @@ async fn handle_list_sessions(
         Err(response) => return *response,
     };
     match state.store.list_sessions_filtered(
-        query.status.as_deref(),
-        query.setup_status.as_deref(),
+        query.session_status,
+        query.setup_status,
         &query.labels,
     ) {
         Ok(sessions) => {
@@ -1313,7 +1102,7 @@ async fn handle_close_session(
                 setup_status: readiness.setup_status,
                 setup_error: readiness.setup_error,
                 session_id: id,
-                status: "closing".to_string(),
+                status: SessionStatus::Closing.as_str().to_string(),
                 running_command_id: Some(running_command_id),
                 cancelled_count: cancelled.len(),
                 message: "Session is closing. Waiting for running command to complete. Poll GET /v1/sessions/{id}/status to monitor.".to_string(),
@@ -1329,7 +1118,7 @@ async fn handle_close_session(
                 setup_status: readiness.setup_status,
                 setup_error: readiness.setup_error,
                 session_id: id.clone(),
-                status: "closing".to_string(),
+                status: SessionStatus::Closing.as_str().to_string(),
                 running_command_id: state
                     .store
                     .running_command_for_session(&id)
@@ -1371,30 +1160,19 @@ async fn handle_get_session_status(
         Ok(Some(_)) => {}
     }
 
-    let labels = match state.store.labels_for(LabelOwner::Session, &id) {
-        Ok(labels) => labels,
-        Err(_) => return internal_error("Failed to read session labels"),
-    };
-
-    // Try to read from in-memory setup bus first.
-    if let Some(bus) = state.setup_buses.lock().await.get(&id).cloned() {
-        let setup_state = bus.snapshot();
-        return Json(serde_json::json!({
-            "session_id": id,
-            "labels": labels,
-            "status": setup_state.status,
-            "current_stage": setup_state.current_stage,
-            "current_ready_phase": setup_state.current_ready_phase,
-            "ready_step_statuses": setup_state.ready_step_statuses,
-            "ready_summary": setup_state.ready_summary,
-            "error": setup_state.error,
-        }))
-        .into_response();
-    }
-
-    // Fall back to on-disk setup_state.json (Layer 0).
-    match state.paths.read_setup_state(&id) {
-        Some(setup_state) => Json(serde_json::json!({
+    // Capturing the frontend's bus is wiring; Layer 2 owns source precedence.
+    let snapshot = state
+        .setup_buses
+        .lock()
+        .await
+        .get(&id)
+        .map(|bus| bus.snapshot());
+    use crate::command::commands::api_server::runtime::SessionStatusView;
+    match state.lifecycle().session_status_view(&id, snapshot) {
+        Ok(SessionStatusView::Snapshot {
+            labels,
+            state: setup_state,
+        }) => Json(serde_json::json!({
             "session_id": id,
             "labels": labels,
             "status": setup_state.status,
@@ -1405,37 +1183,35 @@ async fn handle_get_session_status(
             "error": setup_state.error,
         }))
         .into_response(),
-        None => fallback_status_from_db(&state, &id).await,
+        Ok(SessionStatusView::Fallback(fallback)) => status_fallback_response(&id, fallback),
+        Err(error) => status_fallback_error(&id, error),
     }
 }
 
-/// Resolve a session's setup status to (is_ready, status_string, optional error JSON).
-/// Reads the in-memory bus first, then setup_state.json on disk, then the sqlite
-/// session row. Used by the job-submission guard and other places that need to
-/// reason about session readiness.
-async fn resolve_setup_status(state: &AppState, session_id: &str) -> SetupReadiness {
-    state.lifecycle().setup_readiness(session_id).await
+fn status_fallback_error(
+    id: &str,
+    error: crate::command::commands::api_server::runtime::StatusFallbackError,
+) -> Response {
+    match error {
+        crate::command::commands::api_server::runtime::StatusFallbackError::Session(error) => {
+            tracing::error!(session_id = id, %error, "Failed to read session setup status");
+            internal_error("Failed to read session")
+        }
+        crate::command::commands::api_server::runtime::StatusFallbackError::Labels(error) => {
+            tracing::error!(session_id = id, %error, "Failed to read session labels");
+            internal_error("Failed to read session labels")
+        }
+    }
 }
 
-/// Last-resort fallback when neither the in-memory bus nor the on-disk
-/// setup_state.json is usable: read the session's setup_status from sqlite
-/// and return a minimal response. Used for very old sessions (pre-WI-0078).
-async fn fallback_status_from_db(state: &AppState, id: &str) -> Response {
-    let setup_status = state
-        .store
-        .get_session(id)
-        .ok()
-        .flatten()
-        .map(|s| s.setup_status)
-        .unwrap_or_else(|| "ready".to_string());
-    let labels = match state.store.labels_for(LabelOwner::Session, id) {
-        Ok(labels) => labels,
-        Err(_) => return internal_error("Failed to read session labels"),
-    };
+fn status_fallback_response(
+    id: &str,
+    fallback: crate::command::commands::api_server::runtime::SessionStatusFallback,
+) -> Response {
     Json(serde_json::json!({
         "session_id": id,
-        "labels": labels,
-        "status": setup_status,
+        "labels": fallback.labels,
+        "status": fallback.setup_status.as_str(),
     }))
     .into_response()
 }
@@ -1453,7 +1229,7 @@ async fn handle_create_command(
         Ok(session_id) => session_id,
         Err(response) => return *response,
     };
-    let canonical = command_idempotency_canonical(&value, &session_id);
+    let canonical = CommandSubmission::idempotency_canonical(&value, &session_id);
     let (st, hd) = (&state, &headers);
     with_idempotency(
         &state,
@@ -1469,108 +1245,21 @@ async fn create_command(
     state: &AppState,
     headers: &HeaderMap,
     body: CreateCommandRequest,
-    journal: Option<&AdmissionJournal>,
+    journal: Option<&IdempotentAdmission>,
 ) -> Response {
     let session_id = match command_session_id(headers, body.session_id.as_deref()) {
         Ok(session_id) => session_id,
         Err(response) => return *response,
     };
 
-    if let Err(response) = validate_command(&body) {
-        return *response;
-    }
-    let path_parts: Vec<&str> = body.subcommand.split_whitespace().collect();
-
-    // Validate session exists and is in a state that accepts commands. The
-    // lifecycle classification lives in Layer 0 (on the store that owns the
-    // `status` column); the route only maps each outcome to an HTTP status.
-    match state.store.command_admission(&session_id) {
-        Ok(SessionCommandAdmission::Accepted) => {}
-        Ok(SessionCommandAdmission::Closing) => {
-            return ApiError::session_closing("session is closing").with_details(
-                serde_json::json!({
-                    "session_id": session_id,
-                    "hint": "Session is shutting down and no longer accepts commands."
-                }),
-            );
-        }
-        Ok(SessionCommandAdmission::Closed) => {
-            return ApiError::session_not_found(format!("Session '{}' is closed", session_id))
-                .into_response();
-        }
-        Ok(SessionCommandAdmission::NotFound) => {
-            return ApiError::session_not_found(format!("Session '{}' not found", session_id))
-                .into_response();
-        }
-        Err(e) => {
-            tracing::error!(error = %e, "Failed to get session");
-            return ApiError::internal("Failed to validate session").into_response();
-        }
-    };
-
-    // Job submission guard: reject if session setup is not ready.
+    match state
+        .admission()
+        .admit_command(&session_id, body.into(), journal)
+        .await
     {
-        let readiness = resolve_setup_status(state, &session_id).await;
-        if !readiness.is_ready() {
-            if matches!(readiness, SetupReadiness::NotFound) {
-                return ApiError::session_not_found(format!("Session '{session_id}' not found"))
-                    .into_response();
-            }
-            let mut body = serde_json::json!({
-                "setup_status": readiness.status(),
-                "hint": "Poll GET /v1/sessions/{id}/status to check setup progress"
-            });
-            let mut message = "session is not ready";
-            if let Some(err) = readiness.error().cloned() {
-                body["setup_error"] = err;
-                message = "session setup failed";
-            }
-            return ApiError::session_not_ready(message).with_details(body);
-        }
+        Ok(admitted) => accepted_json(admitted.response_body),
+        Err(error) => admission_error(error, &session_id),
     }
-
-    let command_id = uuid::Uuid::new_v4().to_string();
-
-    // The profile's own account of itself, not a restatement of it (F-50).
-    // Serialised with the underscore spelling the response has always used.
-    let mut flags_applied = serde_json::Value::Object(
-        CommandCatalogue::get()
-            .frontend_profile(FrontendKind::Api, &path_parts)
-            .into_iter()
-            .map(|(flag, value)| (flag.replace('-', "_"), flag_default_json(&value)))
-            .collect(),
-    );
-    if let Some(session) = state.sessions.get_by_key(&session_id) {
-        let bus = EventBus::new(1);
-        let frontend = super::command_frontend::ApiDispatchFrontend::new(
-            &body.subcommand,
-            &body.args,
-            bus.sender(),
-        );
-        let dispatch =
-            crate::command::dispatch::Dispatch::new(frontend, session, state.engines.clone());
-        match dispatch.prerequisite_admission(&path_parts) {
-            Ok(Some(policy)) => flags_applied["prerequisites"] = policy,
-            Ok(None) => {}
-            Err(error) => return ApiError::command_admission(&error).into_response(),
-        }
-    }
-    let response_body = match admission_body(
-        journal,
-        &CreateCommandResponse {
-            command_id: command_id.clone(),
-            flags_applied,
-        },
-        IdempotencyResource::Command(&command_id),
-    ) {
-        Ok(body) => body,
-        Err(response) => return *response,
-    };
-
-    if let Err(response) = enqueue_command(state, &command_id, &session_id, &body) {
-        return *response;
-    }
-    accepted_json(response_body)
 }
 
 /// The session a `POST /v1/commands` targets: the body's `session_id`, the
@@ -1598,100 +1287,6 @@ fn command_session_id(headers: &HeaderMap, body: Option<&str>) -> RouteResult<St
             ApiError::invalid_request("Missing required header: x-awman-session").into_response(),
         )),
     }
-}
-
-/// Canonical body plus the validated session selection. Header-only requests
-/// retain the legacy fingerprint, and valid cross-form requests replay.
-fn command_idempotency_canonical(value: &serde_json::Value, session: &str) -> String {
-    let mut value = value.clone();
-    if let Some(body) = value.as_object_mut() {
-        body.remove("session_id");
-    }
-    format!("{value}\n{session}")
-}
-
-fn validate_command(body: &CreateCommandRequest) -> RouteResult<()> {
-    // Validate the command shape against the catalogue BEFORE touching session
-    // state. Both checks below are request-shape (400-class) errors derived
-    // entirely from the command catalogue — no per-command logic in the route.
-    let path_parts: Vec<&str> = body.subcommand.split_whitespace().collect();
-    {
-        let catalogue = CommandCatalogue::get();
-
-        // (1) The command must be reachable via the API frontend.
-        if let Err(CommandError::NotAvailableForFrontend { command, .. }) =
-            catalogue.validate_for_frontend(FrontendKind::Api, &path_parts)
-        {
-            // The advertised alternatives are the catalogue's api-allowed
-            // commands, not a hand-maintained list that could drift.
-            let available: Vec<String> = catalogue
-                .api_allowed_commands()
-                .into_iter()
-                .map(|(parent, sub)| format!("{parent} {sub}"))
-                .collect();
-            return Err(Box::new(
-                ApiError::invalid_request("command not available via API").with_details(
-                    serde_json::json!({
-                        "blocked_command": command,
-                        "available": available,
-                    }),
-                ),
-            ));
-        }
-
-        // (2) The args must parse cleanly against the catalogue: an unknown
-        // flag, a bad flag value, or an unknown command produces a structured
-        // 400 here, rather than being enqueued and failing asynchronously in
-        // the worker when the dispatch accessors are later called.
-        if let Err(e) =
-            catalogue.parse_raw_args_with_profile(&path_parts, &body.args, FrontendKind::Api)
-        {
-            return Err(Box::new(ApiError::command_validation(&e).into_response()));
-        }
-    }
-
-    Ok(())
-}
-
-fn enqueue_command(
-    state: &AppState,
-    command_id: &str,
-    session_id: &str,
-    body: &CreateCommandRequest,
-) -> RouteResult<()> {
-    let args_json = serde_json::to_string(&body.args).unwrap_or_else(|_| "[]".to_string());
-
-    if let Err(e) = state.paths.prepare_command_dir(session_id, command_id) {
-        tracing::error!(error = %e, "Failed to create command directory");
-        return Err(Box::new(
-            ApiError::internal("Failed to create command directory").into_response(),
-        ));
-    }
-
-    let log_path = state.paths.command_log_path(session_id, command_id);
-
-    if let Err(e) = state.store.enqueue_command_with_labels(
-        command_id,
-        session_id,
-        &body.subcommand,
-        &args_json,
-        &log_path.to_string_lossy(),
-        &body.labels,
-    ) {
-        tracing::error!(error = %e, "Failed to enqueue command");
-        return Err(Box::new(
-            ApiError::internal("Failed to enqueue command").into_response(),
-        ));
-    }
-
-    tracing::info!(
-        command_id = %command_id,
-        session_id = %session_id,
-        subcommand = %body.subcommand,
-        "Command enqueued"
-    );
-
-    Ok(())
 }
 
 async fn handle_get_command(
@@ -1733,324 +1328,6 @@ struct CommandLogsQuery {
 const WORKER_WAIT_KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(15);
 const COMMAND_STATUS_POLL: std::time::Duration = std::time::Duration::from_secs(1);
 
-type CommandLogSender = tokio::sync::mpsc::Sender<Result<Event, std::convert::Infallible>>;
-type CommandLogReceiver = tokio::sync::broadcast::Receiver<ExecutionEvent>;
-
-/// Per-connection replay boundary and the last event actually sent. Done is
-/// held back until the row is terminal, including when it arrives on a live bus.
-struct CommandLogCursor {
-    replay_from: ReplayFrom,
-    last_sent: Option<EventCursor>,
-    attempt: u32,
-    next_sequence: u64,
-    done: Option<ExecutionEvent>,
-    terminal_status_seen: bool,
-    /// `?step=<name>`: events of other steps are skipped, not sent. The
-    /// high-water mark still advances past them, so the client's cursor
-    /// stays global (WI 0137 §5).
-    step_filter: Option<String>,
-}
-
-impl CommandLogCursor {
-    fn new(replay_from: ReplayFrom, attempt: u32) -> Self {
-        Self {
-            replay_from,
-            last_sent: match replay_from {
-                ReplayFrom::After(cursor) => Some(cursor),
-                _ => None,
-            },
-            attempt,
-            next_sequence: 0,
-            done: None,
-            terminal_status_seen: false,
-            step_filter: None,
-        }
-    }
-
-    fn with_step_filter(mut self, step: Option<String>) -> Self {
-        self.step_filter = step.filter(|step| !step.is_empty());
-        self
-    }
-
-    fn update_attempt(&mut self, attempt: u32) {
-        if attempt > self.attempt {
-            self.attempt = attempt;
-            self.next_sequence = 0;
-            self.done = None;
-            self.terminal_status_seen = false;
-            if matches!(self.replay_from, ReplayFrom::StartOfAttempt(_)) {
-                self.replay_from = ReplayFrom::StartOfAttempt(attempt);
-            }
-        }
-    }
-
-    async fn send_frame(&mut self, event: &ExecutionEvent, tx: &CommandLogSender) -> bool {
-        if !self.replay_from.includes(event)
-            || self.last_sent.is_some_and(|last| event.cursor() <= last)
-        {
-            return true;
-        }
-        if let Some(step) = &self.step_filter {
-            if !event.matches_step_filter(step) {
-                // Skipped, but counted: the cursor stays global.
-                self.last_sent = Some(event.cursor());
-                return true;
-            }
-        }
-        if tx.send(Ok(execution_event_to_sse(event))).await.is_err() {
-            return false;
-        }
-        self.last_sent = Some(event.cursor());
-        true
-    }
-
-    async fn forward(&mut self, event: &ExecutionEvent, tx: &CommandLogSender) -> bool {
-        if event.attempt == self.attempt {
-            if matches!(event.payload, EventPayload::CommandStatus { .. }) {
-                self.terminal_status_seen = true;
-            }
-            self.next_sequence = self.next_sequence.max(event.sequence.saturating_add(1));
-            if matches!(event.payload, EventPayload::Done) {
-                self.done = Some(event.clone());
-            }
-        }
-        // An earlier attempt may have written Done just before a daemon crash.
-        // Neither that marker nor the current marker can end a nonterminal row.
-        if matches!(event.payload, EventPayload::Done) {
-            return true;
-        }
-        self.send_frame(event, tx).await
-    }
-
-    async fn replay(&mut self, events: &[ExecutionEvent], tx: &CommandLogSender) -> bool {
-        // Legacy logs can contain inversions from concurrent producers. Sort
-        // before applying the high-water mark so full replay loses no records.
-        let mut events: Vec<_> = events.iter().collect();
-        events.sort_by_key(|event| event.cursor());
-        for event in events {
-            if !self.forward(event, tx).await {
-                return false;
-            }
-        }
-        true
-    }
-
-    fn missing_before(&self, event: &ExecutionEvent) -> bool {
-        match self.last_sent {
-            Some(last) if last.attempt == event.attempt => {
-                event.sequence > last.sequence.saturating_add(1)
-            }
-            Some(last) if last.attempt > event.attempt => false,
-            _ => event.sequence > 0,
-        }
-    }
-
-    async fn finish(&mut self, tx: &CommandLogSender) {
-        // Early failures and queued cancellations can have no events.log.
-        let done = self.done.take().unwrap_or_else(|| ExecutionEvent {
-            timestamp: chrono::Utc::now(),
-            attempt: self.attempt,
-            sequence: self.next_sequence,
-            source: None,
-            payload: EventPayload::Done,
-        });
-        // Completion is a terminal-state notification as well as a log event.
-        // Even an ahead-of-head resume must learn that the command ended.
-        let _ = tx.send(Ok(execution_event_to_sse(&done))).await;
-    }
-}
-
-enum WorkerWaitOutcome {
-    Terminal(u32),
-    Bus(CommandLogReceiver),
-    ClientGone,
-    Unavailable,
-}
-
-/// SQLite can wait on a busy lock; never run these polls on a Tokio worker.
-async fn command_log_row(state: &AppState, command_id: &str) -> Option<CommandRecord> {
-    let store = Arc::clone(&state.store);
-    let id = command_id.to_owned();
-    match tokio::task::spawn_blocking(move || store.get_command(&id)).await {
-        Ok(Ok(row)) => row,
-        Ok(Err(error)) => {
-            tracing::error!(%error, %command_id, "Failed to poll command status");
-            None
-        }
-        Err(error) => {
-            tracing::error!(%error, %command_id, "Command status poll failed");
-            None
-        }
-    }
-}
-
-async fn command_log_events(
-    state: &AppState,
-    session_id: &str,
-    command_id: &str,
-) -> Vec<ExecutionEvent> {
-    let paths = state.paths.clone();
-    let session = session_id.to_owned();
-    let command = command_id.to_owned();
-    tokio::task::spawn_blocking(move || paths.read_command_events(&session, &command))
-        .await
-        .unwrap_or_default()
-}
-
-/// A terminal row precedes its final events. Wait for the actual marker so
-/// a disk-writer delay cannot mint a cursor that hides the final result.
-async fn finish_terminal_log(
-    state: &AppState,
-    session_id: &str,
-    command_id: &str,
-    cursor: &mut CommandLogCursor,
-    live_rx: &mut Option<CommandLogReceiver>,
-    tx: &CommandLogSender,
-) {
-    let terminal_row = command_log_row(state, command_id).await;
-    let structured = terminal_row
-        .as_ref()
-        .and_then(|row| row.result.as_deref())
-        .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
-        .is_some_and(|result| result.get("outcome").is_some());
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
-        let events = command_log_events(state, session_id, command_id).await;
-        if !cursor.replay(&events, tx).await {
-            return;
-        }
-        if cursor.done.is_some() || !structured {
-            cursor.finish(tx).await;
-            return;
-        }
-        tokio::select! {
-            _ = tx.closed() => return,
-            _ = tokio::time::sleep_until(deadline) => {
-                tracing::warn!(command_id, "Terminal command log has not caught up");
-                // An unwritable command directory can leave only the row.
-                // These recovery notifications have no id: they must never
-                // consume the eventual persisted pair's cursor namespace.
-                if let Some(row) = &terminal_row {
-                    let payloads = if cursor.terminal_status_seen {
-                        vec![EventPayload::Done]
-                    } else {
-                        vec![crate::command::commands::api_server::queue_worker::terminal_payload(row), EventPayload::Done]
-                    };
-                    for payload in payloads {
-                        let event = ExecutionEvent { timestamp: chrono::Utc::now(), attempt: row.attempt, sequence: 0, source: None, payload };
-                        let frame = Event::default().event(event.payload.sse_event_type()).data(serde_json::to_string(&event).unwrap());
-                        if tx.send(Ok(frame)).await.is_err() { return; }
-                    }
-                }
-                return;
-            }
-            _ = tokio::time::sleep(std::time::Duration::from_millis(20)) => {},
-            event = async {
-                match live_rx.as_mut() {
-                    Some(receiver) => receiver.recv().await,
-                    None => std::future::pending().await,
-                }
-            } => match event {
-                Ok(event) => {
-                    if cursor.missing_before(&event) && !recover_command_log_gap(
-                        state, session_id, command_id, event.cursor(), cursor, tx,
-                    ).await { return; }
-                    if !cursor.forward(&event, tx).await { return; }
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => *live_rx = None,
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {},
-            }
-        }
-    }
-}
-
-/// A subscription can start ahead of the independent logfile writer. Hold
-/// the live event until the log catches up, replaying the missing prefix before
-/// advancing the client's id. The same path repairs broadcast lag. On failure,
-/// close without Done so the client resumes from its actual delivered cursor.
-/// Whether the running attempt's bus has published past what `cursor` has seen.
-async fn command_log_is_behind(
-    state: &AppState,
-    command_id: &str,
-    cursor: &CommandLogCursor,
-) -> bool {
-    state
-        .event_buses
-        .lock()
-        .await
-        .get(command_id)
-        .is_some_and(|bus| {
-            bus.attempt() == cursor.attempt && bus.next_sequence() > cursor.next_sequence
-        })
-}
-
-async fn recover_command_log_gap(
-    state: &AppState,
-    session_id: &str,
-    command_id: &str,
-    through: EventCursor,
-    cursor: &mut CommandLogCursor,
-    tx: &CommandLogSender,
-) -> bool {
-    let recovery = async {
-        loop {
-            let events = command_log_events(state, session_id, command_id).await;
-            if events.iter().any(|event| event.cursor() == through) {
-                return cursor.replay(&events, tx).await;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-    };
-    tokio::select! {
-        _ = tx.closed() => false,
-        result = tokio::time::timeout(std::time::Duration::from_secs(5), recovery) => {
-            match result {
-                Ok(sent) => sent,
-                Err(_) => {
-                    tracing::warn!(%command_id, %through, "Command log gap could not be recovered");
-                    false
-                }
-            }
-        }
-    }
-}
-
-/// Wait indefinitely, polling independently of the comment keepalive cadence.
-/// Subscribe before returning; live gap recovery also waits for the independent
-/// logfile writer to catch up before advancing the response cursor.
-async fn wait_for_worker(
-    state: &AppState,
-    command_id: &str,
-    tx: &CommandLogSender,
-    keepalive: std::time::Duration,
-    poll: std::time::Duration,
-) -> WorkerWaitOutcome {
-    let mut status_poll = tokio::time::interval(poll);
-    let mut keepalive =
-        tokio::time::interval_at(tokio::time::Instant::now() + keepalive, keepalive);
-    loop {
-        tokio::select! {
-            _ = tx.closed() => return WorkerWaitOutcome::ClientGone,
-            _ = status_poll.tick() => {
-                let Some(row) = command_log_row(state, command_id).await else {
-                    return WorkerWaitOutcome::Unavailable;
-                };
-                if command_is_terminal(&row.status) {
-                    return WorkerWaitOutcome::Terminal(row.attempt);
-                }
-                if let Some(bus) = state.event_buses.lock().await.get(command_id) {
-                    return WorkerWaitOutcome::Bus(bus.subscribe());
-                }
-            }
-            _ = keepalive.tick() => {
-                if tx.send(Ok(Event::default().comment("waiting for command progress"))).await.is_err() {
-                    return WorkerWaitOutcome::ClientGone;
-                }
-            }
-        }
-    }
-}
-
 /// `GET /v1/commands/{id}/logs` — structured event stream.
 ///
 /// Persisted frames carry `<attempt>:<sequence>` ids. `?after=` overrides
@@ -2076,13 +1353,13 @@ async fn handle_stream_command_logs(
             return internal_error("Failed to look up command");
         }
     };
-    let session_id = command.session_id;
+    let session_id = &command.session_id;
 
     // Resume inputs apply only to SSE; the step selector applies to both.
     if query.format.as_deref() == Some("json") {
         let events: Vec<_> = state
             .paths
-            .read_command_events(&session_id, &command_id)
+            .read_command_events(session_id, &command_id)
             .into_iter()
             .filter(|event| {
                 query
@@ -2116,183 +1393,50 @@ async fn handle_stream_command_logs(
         None
     };
 
-    let (tx, rx) = tokio::sync::mpsc::channel(256);
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, std::convert::Infallible>>(256);
     let shutdown = shutdown.map(|extension| extension.0).unwrap_or_default();
     let stream = async move {
-        // Subscribe before reading disk and deduplicate the overlap. If the
-        // writer is behind this subscription, repair the gap before forwarding.
-        let mut live_rx = state
-            .event_buses
-            .lock()
-            .await
-            .get(&command_id)
-            .map(|bus| bus.subscribe());
-        let events = command_log_events(&state, &session_id, &command_id).await;
-        let replay_from = ReplayFrom::resolve(&events, command.attempt, requested);
-        let mut cursor = CommandLogCursor::new(replay_from, command.attempt)
-            .with_step_filter(query.step.clone());
-        if let ReplayFrom::StartOfAttempt(attempt) = replay_from {
-            if tx
-                .send(Ok(Event::default().comment(format!(
-                    "resuming from the start of attempt {attempt}"
-                ))))
-                .await
-                .is_err()
-            {
-                return;
-            }
-        }
-        if !cursor.replay(&events, &tx).await {
-            return;
-        }
-        if command_is_terminal(&command.status) {
-            finish_terminal_log(
-                &state,
-                &session_id,
-                &command_id,
-                &mut cursor,
-                &mut live_rx,
-                &tx,
-            )
-            .await;
-            return;
-        }
-
-        let mut saw_worker = live_rx.is_some();
+        let mut events = CommandLogStream::open(
+            Arc::clone(&state.store),
+            state.paths.clone(),
+            Arc::clone(&state.event_buses),
+            command,
+            requested,
+            query.step,
+            COMMAND_STATUS_POLL,
+        )
+        .await;
+        let mut waiting = false;
+        let mut keepalive = tokio::time::interval_at(
+            tokio::time::Instant::now() + WORKER_WAIT_KEEPALIVE,
+            WORKER_WAIT_KEEPALIVE,
+        );
         loop {
-            if live_rx.is_none() {
-                // This informational event is outside the persisted cursor
-                // namespace. An id-less frame leaves Last-Event-ID untouched.
-                let waiting = ExecutionEvent {
-                    timestamp: chrono::Utc::now(),
-                    attempt: 0,
-                    sequence: 0,
-                    source: None,
-                    payload: EventPayload::StatusMessage {
-                        phase: "queue".into(),
-                        message: if saw_worker {
-                            "Waiting for command status to be recorded..."
-                        } else {
-                            "Waiting for a worker to claim this command..."
-                        }
-                        .into(),
-                    },
-                };
-                let waiting = Event::default()
-                    .event(waiting.payload.sse_event_type())
-                    .data(serde_json::to_string(&waiting).unwrap_or_else(|_| "{}".into()));
-                if tx.send(Ok(waiting)).await.is_err() {
-                    return;
-                }
-                match wait_for_worker(
-                    &state,
-                    &command_id,
-                    &tx,
-                    WORKER_WAIT_KEEPALIVE,
-                    COMMAND_STATUS_POLL,
-                )
-                .await
-                {
-                    WorkerWaitOutcome::ClientGone | WorkerWaitOutcome::Unavailable => return,
-                    WorkerWaitOutcome::Terminal(attempt) => {
-                        cursor.update_attempt(attempt);
-                        finish_terminal_log(
-                            &state,
-                            &session_id,
-                            &command_id,
-                            &mut cursor,
-                            &mut live_rx,
-                            &tx,
-                        )
-                        .await;
-                        return;
+            let frame = tokio::select! {
+                _ = tx.closed() => return,
+                _ = keepalive.tick() => Event::default().comment(if waiting {
+                    "waiting for command progress"
+                } else {
+                    "keepalive"
+                }),
+                update = events.next_update() => match update {
+                    None => return,
+                    Some(CommandLogUpdate::Waiting(value)) => {
+                        waiting = value;
+                        keepalive.reset();
+                        continue;
                     }
-                    WorkerWaitOutcome::Bus(receiver) => {
-                        saw_worker = true;
-                        live_rx = Some(receiver);
-                        let events = command_log_events(&state, &session_id, &command_id).await;
-                        if !cursor.replay(&events, &tx).await {
-                            return;
-                        }
-                    }
+                    Some(CommandLogUpdate::Restart(attempt)) => Event::default().comment(
+                        format!("resuming from the start of attempt {attempt}")
+                    ),
+                    Some(CommandLogUpdate::Lagged(n)) => Event::default().comment(
+                        format!("lagged: recovering {n} events from log")
+                    ),
+                    Some(CommandLogUpdate::Event { event, cursor }) => execution_event_to_sse(&event, cursor),
                 }
-            }
-
-            let Some(receiver) = live_rx.as_mut() else {
-                continue;
             };
-            let mut status_poll = tokio::time::interval(COMMAND_STATUS_POLL);
-            let mut keepalive = tokio::time::interval_at(
-                tokio::time::Instant::now() + WORKER_WAIT_KEEPALIVE,
-                WORKER_WAIT_KEEPALIVE,
-            );
-            loop {
-                tokio::select! {
-                    _ = tx.closed() => return,
-                    _ = keepalive.tick() => {
-                        if tx.send(Ok(Event::default().comment("keepalive"))).await.is_err() {
-                            return;
-                        }
-                    }
-                    _ = status_poll.tick() => {
-                        let Some(row) = command_log_row(&state, &command_id).await else {
-                            return;
-                        };
-                        cursor.update_attempt(row.attempt);
-                        if command_is_terminal(&row.status) {
-                            finish_terminal_log(&state, &session_id, &command_id, &mut cursor, &mut live_rx, &tx).await;
-                            return;
-                        }
-                        // Events published before this subscription, or lost
-                        // to lag, reach the client only through the log. Do
-                        // not leave them waiting on a later event that a quiet
-                        // command may never emit.
-                        if command_log_is_behind(&state, &command_id, &cursor).await {
-                            let events = command_log_events(&state, &session_id, &command_id).await;
-                            if !cursor.replay(&events, &tx).await {
-                                return;
-                            }
-                        }
-                    }
-                    result = receiver.recv() => match result {
-                        Ok(event) => {
-                            cursor.update_attempt(event.attempt);
-                            if cursor.missing_before(&event)
-                                && !recover_command_log_gap(
-                                    &state, &session_id, &command_id, event.cursor(), &mut cursor, &tx,
-                                ).await
-                            {
-                                return;
-                            }
-                            if !cursor.forward(&event, &tx).await {
-                                return;
-                            }
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                            tracing::warn!(lagged = n, "SSE subscriber lagged");
-                            let comment = Event::default().comment(format!("lagged: recovering {n} events from log"));
-                            if tx.send(Ok(comment)).await.is_err() {
-                                return;
-                            }
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                            // A vanished bus does not prove completion. Re-enter
-                            // worker waiting and check the row before sending Done.
-                            // A row already terminal finishes here, so no waiting
-                            // frame lands between the output and the final Done.
-                            let Some(row) = command_log_row(&state, &command_id).await else {
-                                return;
-                            };
-                            cursor.update_attempt(row.attempt);
-                            live_rx = None;
-                            if command_is_terminal(&row.status) {
-                                finish_terminal_log(&state, &session_id, &command_id, &mut cursor, &mut live_rx, &tx).await;
-                                return;
-                            }
-                            break;
-                        }
-                    }
-                }
+            if tx.send(Ok(frame)).await.is_err() {
+                return;
             }
         }
     };
@@ -2307,122 +1451,64 @@ async fn handle_stream_command_logs(
 }
 
 /// Encode an ExecutionEvent with a cursor safe for axum's SSE id validation.
-fn execution_event_to_sse(event: &ExecutionEvent) -> Event {
+fn execution_event_to_sse(event: &ExecutionEvent, cursor: Option<EventCursor>) -> Event {
     let data = serde_json::to_string(event).unwrap_or_else(|_| "{}".into());
-    Event::default()
-        .id(event.cursor().to_string())
-        .event(event.payload.sse_event_type())
-        .data(data)
+    let frame = match cursor {
+        Some(cursor) => Event::default().id(cursor.to_string()),
+        None => Event::default(),
+    };
+    frame.event(event.payload.sse_event_type()).data(data)
 }
 async fn handle_get_session_queue(
     State(state): State<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Response {
-    // Validate session exists.
-    match state.store.get_session(&id) {
+    match state.lifecycle().queue_view(&id) {
         Ok(None) => {
-            return ApiError::session_not_found(format!("Session '{}' not found", id))
-                .into_response();
+            ApiError::session_not_found(format!("Session '{}' not found", id)).into_response()
         }
-        Err(e) => {
-            tracing::error!(error = %e, "Failed to get session");
-            return ApiError::internal("Failed to get session").into_response();
+        Err(crate::command::commands::api_server::runtime::QueueViewError::Session(error)) => {
+            tracing::error!(error = %error, "Failed to get session");
+            ApiError::internal("Failed to get session").into_response()
         }
-        Ok(Some(_)) => {}
-    }
-
-    let queue_depth = state.store.count_queued_for_session(&id).unwrap_or(0);
-
-    let running_record = state.store.running_command_for_session(&id).ok().flatten();
-    let session_cmds = state
-        .store
-        .list_commands_for_session(&id, 100)
-        .unwrap_or_default();
-    // Every command projection carries its labels; one batch read covers them.
-    let ids: Vec<String> = session_cmds
-        .iter()
-        .chain(running_record.iter())
-        .map(|c| c.id.clone())
-        .collect();
-    let labels = match state.store.labels_for_many(LabelOwner::Command, &ids) {
-        Ok(labels) => labels,
-        Err(error) => {
+        Err(crate::command::commands::api_server::runtime::QueueViewError::Queue(error)) => {
+            tracing::error!(session_id = %id, %error, "Failed to read session queue");
+            internal_error("Failed to read session queue")
+        }
+        Err(crate::command::commands::api_server::runtime::QueueViewError::Labels(error)) => {
             tracing::error!(%error, "Failed to read command labels");
-            return internal_error("Failed to read command labels");
+            internal_error("Failed to read command labels")
         }
-    };
-    let labels_of = |id: &str| labels.get(id).cloned().unwrap_or_else(Labels::empty);
-
-    let running = match running_record {
-        Some(c) => {
-            let args: serde_json::Value =
-                serde_json::from_str(&c.args).unwrap_or(serde_json::Value::Array(vec![]));
-            Some(serde_json::json!({
-                "command_id": c.id,
-                "subcommand": c.subcommand,
-                "args": args,
-                "started_at": c.started_at,
-                "worker_id": c.worker_id,
-                "labels": labels_of(&c.id),
-            }))
-        }
-        None => None,
-    };
-
-    // Queued items: spec requires oldest first (position 0 = next to run).
-    // `list_commands_for_session` returns newest first, so collect queued
-    // candidates and reverse before assigning positions.
-    let mut queued_records: Vec<_> = session_cmds
-        .iter()
-        .filter(|c| c.status == "queued")
-        .collect();
-    queued_records.reverse();
-    let queued: Vec<serde_json::Value> = queued_records
-        .iter()
-        .enumerate()
-        .map(|(pos, c)| {
-            let args: serde_json::Value =
-                serde_json::from_str(&c.args).unwrap_or(serde_json::Value::Array(vec![]));
-            serde_json::json!({
-                "command_id": c.id,
-                "subcommand": c.subcommand,
-                "args": args,
-                "queued_at": c.queued_at,
-                "position": pos as i64,
-                "labels": labels_of(&c.id),
-            })
-        })
-        .collect();
-
-    // Recent completed: spec requires `finished_at DESC`, capped at 10.
-    let mut completed_records: Vec<_> = session_cmds
-        .iter()
-        .filter(|c| command_is_terminal(&c.status))
-        .collect();
-    completed_records.sort_by(|a, b| b.finished_at.cmp(&a.finished_at));
-    let recent_completed: Vec<serde_json::Value> = completed_records
-        .into_iter()
-        .take(10)
-        .map(|c| {
-            serde_json::json!({
-                "command_id": c.id,
-                "subcommand": c.subcommand,
-                "status": c.status,
-                "exit_code": c.exit_code,
-                "finished_at": c.finished_at,
-                "labels": labels_of(&c.id),
-            })
-        })
-        .collect();
-
-    Json(QueueStatusResponse {
-        session_id: id,
-        queue_depth,
-        running,
-        queued,
-        recent_completed,
-    })
-    .into_response()
+        Ok(Some(view)) => Json(serde_json::json!({
+            "session_id": id,
+            "queue_depth": view.queue_depth,
+            "running": view.running.map(|item| serde_json::json!({
+                "command_id": item.command_id,
+                "subcommand": item.subcommand,
+                "args": item.args,
+                "started_at": item.started_at,
+                "worker_id": item.worker_id,
+                "labels": item.labels,
+            })),
+            "queued": view.queued.into_iter().map(|item| serde_json::json!({
+                "command_id": item.command_id,
+                "subcommand": item.subcommand,
+                "args": item.args,
+                "queued_at": item.timestamp,
+                "position": item.position,
+                "labels": item.labels,
+            })).collect::<Vec<_>>(),
+            "recent_completed": view.recent_completed.into_iter().map(|item| serde_json::json!({
+                "command_id": item.command_id,
+                "subcommand": item.subcommand,
+                "status": item.status.as_str(),
+                "exit_code": item.exit_code,
+                "finished_at": item.finished_at,
+                "labels": item.labels,
+            })).collect::<Vec<_>>(),
+        }))
+        .into_response(),
+    }
 }
 
 async fn handle_get_workflow(
@@ -2454,15 +1540,16 @@ async fn handle_get_workflow(
             }
         },
         Ok(None) => {
-            let path: Vec<&str> = cmd.subcommand.split_whitespace().collect();
-            let error = if CommandCatalogue::get().canonical_path(&path) == ["exec", "workflow"] {
-                if matches!(cmd.status.as_str(), "queued" | "pending" | "running") {
+            let error = match state.lifecycle().workflow_state_availability(&cmd) {
+                crate::command::commands::api_server::runtime::WorkflowStateAvailability::NotStarted => {
                     ApiError::workflow_not_started("workflow not started")
-                } else {
+                }
+                crate::command::commands::api_server::runtime::WorkflowStateAvailability::NeverStarted => {
                     ApiError::workflow_never_started("workflow never started")
                 }
-            } else {
-                ApiError::no_workflow("no workflow for this command")
+                crate::command::commands::api_server::runtime::WorkflowStateAvailability::NotWorkflow => {
+                    ApiError::no_workflow("no workflow for this command")
+                }
             };
             error.into_response()
         }
@@ -2473,31 +1560,169 @@ async fn handle_get_workflow(
     }
 }
 
-/// One `FlagDefault` as the JSON a client sees in `flags_applied`.
-///
-/// Rendering only — the values themselves come from the catalogue's frontend
-/// profile (WI 0114 F-50).
-fn flag_default_json(
-    value: &crate::command::dispatch::catalogue::FlagDefault,
-) -> serde_json::Value {
-    use crate::command::dispatch::catalogue::FlagDefault;
-    match value {
-        FlagDefault::Bool(b) => serde_json::Value::Bool(*b),
-        FlagDefault::Str(s) => serde_json::Value::String((*s).to_string()),
-        FlagDefault::U16(n) => serde_json::Value::from(*n),
-        FlagDefault::EmptyVec => serde_json::Value::Array(Vec::new()),
-        FlagDefault::None => serde_json::Value::Null,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Arc;
     use std::time::Instant;
 
+    #[tokio::test]
+    async fn setup_owner_refuses_work_when_early_cancel_row_cannot_be_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = make_test_state(tmp.path());
+        Arc::get_mut(&mut state).unwrap().workdirs = vec![tmp.path().canonicalize().unwrap()];
+        let admitted = state
+            .admission()
+            .admit_session(
+                SessionSubmission {
+                    request: SessionCreateRequest {
+                        workdir: Some(tmp.path().to_string_lossy().into_owned()),
+                        ..Default::default()
+                    },
+                    labels: Labels::empty(),
+                },
+                Some(CommandSubmission {
+                    subcommand: "exec prompt".into(),
+                    args: vec!["hello".into()],
+                    labels: Labels::empty(),
+                }),
+                true,
+                None,
+            )
+            .await
+            .unwrap();
+        state
+            .store
+            .with_conn(|conn| {
+                conn.execute_batch("ALTER TABLE commands RENAME TO unavailable_commands")?;
+                Ok(())
+            })
+            .unwrap();
+        let token = state.setup_cancels.register(&admitted.session_id);
+        run_session_setup(
+            Arc::clone(&state),
+            admitted.session_id.clone(),
+            admitted.plan,
+            Arc::new(SessionSetupBus::new(256)),
+            token.clone(),
+            admitted.run,
+        )
+        .await;
+        assert!(token.is_cancelled());
+        let snapshot = state.paths.read_setup_state(&admitted.session_id).unwrap();
+        assert_eq!(snapshot.status, SessionSetupStatus::Failed);
+        assert_eq!(snapshot.error.unwrap().stage, "cancelled");
+        assert!(!state.setup_cancels.is_registered(&admitted.session_id));
+    }
+
+    #[tokio::test]
+    async fn setup_bus_contention_cannot_leave_admitted_work_without_a_setup_task() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = make_test_state(tmp.path());
+        Arc::get_mut(&mut state).unwrap().workdirs = vec![tmp.path().canonicalize().unwrap()];
+        let bus_guard = state.setup_buses.lock().await;
+        let request = serde_json::from_value(serde_json::json!({"workdir": tmp.path()})).unwrap();
+        let mut submission = Box::pin(create_submission(&state, request, None, false, None));
+        // Even with the bus lock held, admission and spawn finish in one poll.
+        let response = match futures_util::poll!(&mut submission) {
+            std::task::Poll::Ready(response) => response,
+            std::task::Poll::Pending => panic!("setup scheduling yielded after admission"),
+        };
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        drop(submission);
+        let session = state.store.list_sessions().unwrap().pop().unwrap();
+        assert!(state.setup_cancels.is_registered(&session.id));
+        assert_eq!(session.setup_status, SessionSetupStatus::Initializing);
+        // The setup task survives its request and waits on the lock itself.
+        tokio::task::yield_now().await;
+        assert!(!bus_guard.contains_key(&session.id));
+        state.setup_cancels.cancel(&session.id);
+        drop(bus_guard);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if state.setup_buses.lock().await.contains_key(&session.id) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("setup owner was never spawned");
+    }
+
+    #[tokio::test]
+    async fn queue_and_command_reads_preserve_each_legacy_args_value_without_hiding_other_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = make_test_state(tmp.path());
+        state.store.insert_session("s", "/tmp", "now").unwrap();
+        state
+            .store
+            .enqueue_command("valid", "s", "exec prompt", "[\"hello\"]", "log")
+            .unwrap();
+        for (id, raw, expected) in [
+            ("object", "{}", serde_json::json!({})),
+            ("number", "[1]", serde_json::json!([1])),
+            ("truncated", "{", serde_json::json!([])),
+        ] {
+            state
+                .store
+                .enqueue_command(id, "s", "exec prompt", raw, "log")
+                .unwrap();
+            let response =
+                handle_get_session_queue(State(Arc::clone(&state)), AxumPath("s".into())).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            let queued = body["queued"].as_array().unwrap();
+            assert_eq!(
+                queued.iter().find(|row| row["command_id"] == id).unwrap()["args"],
+                expected
+            );
+            assert_eq!(queued[0]["command_id"], "valid");
+            let command = command_response(
+                &state,
+                Peer(None),
+                state.store.get_command(id).unwrap().unwrap(),
+                None,
+            )
+            .unwrap_or_else(|_| panic!("command read failed"));
+            assert_eq!(command.args, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn command_log_encoding_preserves_exact_persisted_and_transient_bytes() {
+        use crate::data::execution_event::EventPayload;
+
+        let event = ExecutionEvent {
+            timestamp: "2026-10-30T12:00:00Z".parse().unwrap(),
+            attempt: 2,
+            sequence: 7,
+            source: None,
+            payload: EventPayload::StdoutLine("hello\nworld".into()),
+        };
+        for (cursor, id) in [(Some(event.cursor()), "id: 2:7\n"), (None, "")] {
+            let frame = execution_event_to_sse(&event, cursor);
+            let response = Sse::new(tokio_stream::iter([Ok::<_, std::convert::Infallible>(
+                frame,
+            )]))
+            .into_response();
+            let bytes = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            let expected = format!(
+                "{id}event: stdout_line\ndata: {{\"timestamp\":\"2026-10-30T12:00:00Z\",\"attempt\":2,\"sequence\":7,\"payload\":{{\"type\":\"StdoutLine\",\"data\":\"hello\\nworld\"}}}}\n\n"
+            );
+            assert_eq!(bytes.as_ref(), expected.as_bytes());
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn waiting_for_a_worker_sends_keepalives_on_cadence_past_300s() {
+        use futures_util::StreamExt;
+
         let tmp = tempfile::tempdir().unwrap();
         let state = make_test_state(tmp.path());
         state
@@ -2506,7 +1731,7 @@ mod tests {
                 id: "s",
                 workdir: "/work",
                 created_at: &chrono::Utc::now().to_rfc3339(),
-                setup_status: crate::data::session_setup_event::SessionSetupStatus::Ready,
+                setup_status: SessionSetupStatus::Ready,
                 kind: crate::data::session::SessionKind::Local,
                 cloned_path: None,
             })
@@ -2515,19 +1740,25 @@ mod tests {
             .store
             .enqueue_command("c", "s", "exec prompt", "[]", "/unused")
             .unwrap();
-        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-        let waiter = {
-            let state = Arc::clone(&state);
-            tokio::spawn(async move {
-                wait_for_worker(&state, "c", &tx, WORKER_WAIT_KEEPALIVE, COMMAND_STATUS_POLL).await;
-            })
-        };
+        let response = handle_stream_command_logs(
+            State(state),
+            AxumPath("c".into()),
+            Query(CommandLogsQuery::default()),
+            HeaderMap::new(),
+            None,
+        )
+        .await;
+        let mut body = response.into_body().into_data_stream();
+        let waiting = body.next().await.unwrap().unwrap();
+        assert!(std::str::from_utf8(&waiting)
+            .unwrap()
+            .contains("Waiting for a worker"));
         let started = tokio::time::Instant::now();
         for n in 1..=22 {
-            let _ = rx.recv().await.unwrap().unwrap();
+            let frame = body.next().await.unwrap().unwrap();
+            assert_eq!(frame.as_ref(), b": waiting for command progress\n\n");
             assert_eq!(started.elapsed(), WORKER_WAIT_KEEPALIVE * n);
         }
-        waiter.abort();
     }
 
     // Route table — assertion guard. Every entry here must be registered in

@@ -51,8 +51,8 @@ pub use output_tail::{OutputTail, DEFAULT_OUTPUT_TAIL_LINES};
 /// (branching on `AgentRuntimeEngine::capabilities()`).
 #[derive(Debug, Clone)]
 pub enum ResolvedAgentOptions {
-    Container(ResolvedContainerOptions),
-    Sandbox(ResolvedSandboxOptions),
+    Container(Box<ResolvedContainerOptions>),
+    Sandbox(Box<ResolvedSandboxOptions>),
 }
 
 impl ResolvedAgentOptions {
@@ -71,16 +71,16 @@ impl ResolvedAgentOptions {
         options: impl IntoIterator<Item = crate::engine::container::options::ContainerOption>,
     ) -> Result<Self, EngineError> {
         let resolved = ResolvedContainerOptions::resolve(options)?;
-        Ok(ResolvedAgentOptions::Container(resolved))
+        Ok(ResolvedAgentOptions::Container(Box::new(resolved)))
     }
 
     /// Resolve a sandbox option list into the `Sandbox` variant. The sandbox
     /// option bag never conflicts (last-writer-wins on `ingest`), so this is
-    /// infallible — the `Result` signature mirrors `container()` for symmetry.
+    /// infallible.
     pub fn sandbox(
         options: impl IntoIterator<Item = crate::engine::sandbox::options::SandboxOption>,
     ) -> Self {
-        ResolvedAgentOptions::Sandbox(ResolvedSandboxOptions::resolve(options))
+        ResolvedAgentOptions::Sandbox(Box::new(ResolvedSandboxOptions::resolve(options)))
     }
 }
 
@@ -802,10 +802,9 @@ mod tests {
 
     #[test]
     fn container_engine_rejects_sandbox_options() {
-        use crate::engine::sandbox::options::ResolvedSandboxOptions;
         let rt = detect(&docker_cfg()).unwrap();
         let engine = rt.engine();
-        let opts = ResolvedAgentOptions::Sandbox(ResolvedSandboxOptions::default());
+        let opts = ResolvedAgentOptions::Sandbox(Box::default());
         match engine.build(opts) {
             Err(EngineError::OptionVariantMismatch { runtime, got }) => {
                 assert_eq!(runtime, "docker");

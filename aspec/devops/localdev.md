@@ -32,7 +32,7 @@ Local testing:
 - Further opt-ins for real services and inputs: `AWMAN_TEST_APPLE_FIXTURE_REF` (the promoted fixture loaded into Apple Containers) for the Apple-store guest test; `AWMAN_TEST_REGISTRY_PUBLIC=1` for normal-case pulls from Docker Hub and GHCR; `AWMAN_TEST_APPLE_KILL_HELPER=1` for the helper-crash test (disrupts the running Apple service). `AWMAN_CORPUS_BUILDER=apple tests/oci_import/corpus/build-corpus.sh <dir>` builds a Docker-free real-image corpus of every shipped template with Apple Containers.
 - The builtin builder scenarios (`tests/builtin_runtime/builder_native.rs`, `builtin_hw_builder_*`) build disposable project and agent images through the local store, import them, boot them in the builtin runtime, rebuild with a changed marker and then run with the builder unavailable. Docker needs `AWMAN_TEST_BUILTIN=1`, `AWMAN_TEST_DOCKER=1` and `AWMAN_TEST_BUILDER_DOCKER_HOST=unix:///…` naming the Engine the test may build in (never an assumed daemon); Apple needs `AWMAN_TEST_BUILTIN=1` and `AWMAN_TEST_APPLE_CONTAINER=1` on Apple Silicon macOS. `AWMAN_TEST_DOCKER_CLI` and `AWMAN_TEST_APPLE_CLI` name the CLIs, and `AWMAN_TEST_BUILDER_BASE_IMAGE` the base image (default `alpine:3.20`, pulled on first run). A missing prerequisite is reported as a skip or block, never as a pass.
 - Builtin integration tests must distinguish capability preflight from guest execution. A missing `/dev/kvm`, denied KVM access, missing Apple hypervisor entitlement, unverified target payload, or unsupported host is SKIP/BLOCKED with the concrete prerequisite recorded; it is never a passing boot test. Hermetic backend, archive, registry-wire, and transport tests remain in the ordinary isolated suite.
-- Guest network and memory-pressure scenarios add two opt-ins beyond `AWMAN_TEST_BUILTIN=1`: `AWMAN_TEST_BUILTIN_NETWORK=1` for the egress/DNS/host-port/isolation guest tests (they start their own loopback fixtures — no outbound network is required by the tests themselves, but the host proxy variables `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`/`NO_PROXY` must be scrubbed for the run so a passing proxy dependency can't hide as a pass) and `AWMAN_TEST_BUILTIN_PRESSURE=1` for the bounded guest-OOM scenario (a small, fixed-size VM), both needing the same hardware prerequisites as `AWMAN_TEST_BUILTIN`. **As of this work item these test bodies (`tests/builtin_runtime/{network_resources,lifecycle,acquisition}.rs`) exist but are not yet registered in `tests/builtin_runtime/main.rs`** — `cargo test --test builtin_runtime -- --list` does not discover them, so `autotests=false` makes them zero coverage regardless of these opt-ins until that registration lands.
+- Guest network and memory-pressure scenarios add two opt-ins beyond `AWMAN_TEST_BUILTIN=1`: `AWMAN_TEST_BUILTIN_NETWORK=1` for the egress/DNS/host-port/isolation guest tests (they start their own loopback fixtures — no outbound network is required by the tests themselves, but the host proxy variables `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`/`NO_PROXY` must be scrubbed for the run so a passing proxy dependency can't hide as a pass) and `AWMAN_TEST_BUILTIN_PRESSURE=1` for the bounded guest-OOM scenario (a small, fixed-size VM), both needing the same hardware prerequisites as `AWMAN_TEST_BUILTIN`. The builtin test target is explicitly registered in `crates/awman-cli/Cargo.toml`; its `main.rs` includes the acquisition, lifecycle, and network-resource suites alongside the other builtin tests. List tests with `cargo test -p awman-cli --test builtin_runtime -- --list`.
 - When changing SQLite resolution or native dependencies, rerun the recorded SQLite resolution checks (`bash tools/oci-runtime-spike/sqlite-resolution/checks.sh auto`): confirm exactly one bundled `libsqlite3-sys`, combined awman/msb linking, store tests, msb migrations, cross-driver transactions, and old/new catalog round trips on supported native targets. Missing spike fixtures or hardware are reported as BLOCKED, not inferred from a successful compile.
 - Inspect final feature artifacts for dynamic dependencies and extracted-helper candidates (`bash tools/release-artifact-check.sh`, `bash tools/measure-release-artifact.sh`). The runtime must work offline with a minimal executable search path after build; no production runtime path may depend on `tools/` scripts, Cargo caches, or temporary spike artifacts.
 - `bash tools/reproducible-build-audit.sh [output-dir]` checks, on a native checkout with usable Git metadata, that build inputs (`.cargo/config.toml`, Cargo manifests/lock, patches, CI inputs) are Git-tracked and free of stray temp/cache paths. `make native-builtin-ci TARGET=<triple>` builds `awman` and its synthetic guest driver from a clean isolated `CARGO_HOME`/target dir and asserts the typed provider's info/version entrypoints on real hardware; it does not yet boot the actual `awman` entrypoint against a real guest (see the open request in `aspec/work-items/0121-complete-builtin-runtime-and-native-verification.md` for that remaining gap). Both fail closed (BLOCKED) rather than infer a pass when Git metadata, hardware, or verified payloads are unavailable.
@@ -44,34 +44,15 @@ Version control:
 Documentation:
 - After every work item is implemented, documentation should be written within the docs/ folder. Do not create one document per work item, but instead author a comprehensive set of documentation that explains to the user how to use the aspec tool in its entirety. Each work item should trigger an inspection of the entire docs/ folder to update and/or add relevant usage information.
 
-## Profiling and Benchmarking
-
-### Criterion benchmarks
-
-The `benches/performance.rs` file contains micro-benchmarks using `criterion`:
-
-| Benchmark group | What it measures |
-|---|---|
-| `render_frame_time` | Frame draw time at 1, 5, 10, 20 tabs |
-| `pty_parse_throughput` | `process_pty_data()` throughput for plain text, ANSI, and CR-overwrite streams |
-| `subprocess_spawn` | Subprocess spawn latency (lower bound for Docker API call cost) |
-| `dag_topological_order` | `topological_order()` latency at 10, 50, 100, 200 workflow steps |
-
-Run all benchmarks:
-
-```sh
-cargo bench
-```
-
-Criterion writes HTML reports to `target/criterion/` (requires the `html_reports` feature, which is enabled in `Cargo.toml`).
+## Profiling
 
 ### tokio-console (task lifetime visualisation)
 
-> **Planned — work item 0040.** The `tokio-console` feature flag and `console-subscriber` dependency have not yet been added to `Cargo.toml`. The steps below describe the intended usage once work item 0040 is implemented.
+> **Unavailable.** The `tokio-console` feature and `console-subscriber` dependency are not present in the current manifests. Work item 0040 describes a proposal, not an implemented feature.
 
 `tokio-console-subscriber` will be gated behind a `tokio-console` Cargo feature flag so it is never compiled into release builds.
 
-Once implemented, enable it with:
+If the feature is added in a future change, enable it with:
 
 ```sh
 cargo run --features tokio-console
@@ -99,14 +80,10 @@ Install `cargo-flamegraph`:
 cargo install flamegraph
 ```
 
-Produce a CPU flamegraph for a specific benchmark or binary:
+Produce a CPU flamegraph for the binary (requires sudo on Linux for perf):
 
 ```sh
-# Profile a benchmark
-cargo flamegraph --bench render -- --bench
-
-# Profile the binary directly (requires sudo on Linux for perf)
-sudo cargo flamegraph -- implement 0001 --non-interactive
+sudo cargo flamegraph --bin awman -- exec workflow path/to/workflow.yaml --non-interactive
 ```
 
 The output is `flamegraph.svg` in the current directory.
@@ -123,5 +100,3 @@ sudo apt install heaptrack
 heaptrack ./target/release/awman implement 0001 --non-interactive
 heaptrack_gui heaptrack.awman.*.zst
 ```
-
-On macOS, use `dhat` (compile-time heap profiler) by enabling the `dhat-heap` dev-dependency (see `Cargo.toml`).

@@ -804,7 +804,10 @@ run with a PTY even when nobody is attached, so attach reconnects to the
 actual agent process rather than opening a shell beside it. If the task has
 no run in progress right now,
 the command fails immediately rather than pretending an old run is still
-live. If more than one container is running (a generated workflow with
+live. If the configured runtime is unavailable or its listing request fails,
+attach reports that runtime error instead of claiming there are no task
+containers; restore runtime availability and retry. If more than one container
+is running (a generated workflow with
 parallel steps), the command lists each one's short ID and label and asks
 you to disambiguate:
 
@@ -950,7 +953,14 @@ the standing instructions every task evaluation must follow:
 
 This is all global rather than per-repo, because one squad daemon watches
 tasks across every repo you point it at. Editing this block takes
-effect on the daemon's next scheduling tick — no restart needed. See
+effect on the daemon's next scheduling tick — no restart needed. If a live
+reload finds malformed or unreadable global config, the scheduler reports the
+config error once per distinct error and does not admit new evaluations on
+that tick. `awman squad status` also shows the current reload error until a
+valid reload clears it. It continues to observe existing runs and resumes scheduling after
+a valid config reload; if the error later recurs, it is reported again. The
+scheduler does not silently substitute defaults or keep a last-known-good
+config. See
 [Configuration: Squad daemon configuration](07-configuration.md#squad-daemon-configuration)
 for the full field reference, validation rules, and how to edit it with
 `awman config set`.

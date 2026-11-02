@@ -412,9 +412,22 @@ fn apply_workflow_state(
                 agent,
                 model,
             } => {
-                let Some(handle) = handle_for_container_id(runtime, &container_id) else {
-                    driver.retry(&step_name);
-                    continue;
+                let handle = match handle_for_container_id(runtime, &container_id) {
+                    Ok(Some(handle)) => handle,
+                    Ok(None) => {
+                        driver.retry(&step_name);
+                        continue;
+                    }
+                    Err(error) => {
+                        driver.retry(&step_name);
+                        frontend.write_message(UserMessage {
+                            level: MessageLevel::Error,
+                            text: format!(
+                                "failed to find the running container for workflow step {step_name:?}: {error}"
+                            ),
+                        });
+                        continue;
+                    }
                 };
                 match runtime.attach(&handle) {
                     Ok(instance) => {
@@ -465,6 +478,7 @@ pub fn list_task_containers(
     runtime: &dyn AgentRuntimeEngine,
     task: &str,
 ) -> Result<Vec<SquadContainer>, CommandError> {
+    runtime.availability()?;
     Ok(runtime
         .list_running_with_name_prefix(&squad_name_prefix(task))?
         .into_iter()
@@ -559,15 +573,14 @@ pub fn format_candidates(candidates: &[SquadContainer]) -> Vec<String> {
 pub fn handle_for_container_id(
     runtime: &dyn AgentRuntimeEngine,
     container_id: &str,
-) -> Option<AgentHandle> {
+) -> Result<Option<AgentHandle>, CommandError> {
     if container_id.is_empty() {
-        return None;
+        return Ok(None);
     }
-    runtime
-        .list_running_all()
-        .ok()?
+    Ok(runtime
+        .list_running_all()?
         .into_iter()
-        .find(|handle| container_id_matches_handle(handle, container_id))
+        .find(|handle| container_id_matches_handle(handle, container_id)))
 }
 
 fn container_id_matches_handle(handle: &AgentHandle, container_id: &str) -> bool {
@@ -579,7 +592,17 @@ fn container_id_matches_handle(handle: &AgentHandle, container_id: &str) -> bool
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::command::commands::agents::test_support::FakeRuntime;
     use crate::data::workflow_definition::WorkflowStep;
+
+    #[test]
+    fn task_discovery_propagates_unavailable_runtime() {
+        let runtime = FakeRuntime::new();
+        *runtime.available.lock().unwrap() = Err("daemon down".into());
+        let error = list_task_containers(&runtime, "task").unwrap_err();
+        assert!(matches!(error, CommandError::Engine(_)));
+        assert_eq!(runtime.availability_checks.load(Ordering::SeqCst), 1);
+    }
 
     fn candidate(id: &str, name: &str) -> SquadContainer {
         SquadContainer {
@@ -758,5 +781,61 @@ mod tests {
             .to_string(),
             "container \"aaaa1111bbbb9999\" is not a running container for task \"issue-triage\"; legal containers: aaaa1111bbbb"
         );
+    }
+}
+
+#[cfg(test)]
+mod listing_failure_review_tests {
+    use super::*;
+    use crate::command::commands::agents::resolve::listing_failure_tests::ListingFailureRuntime;
+
+    struct Recording(Arc<Mutex<Vec<String>>>);
+    impl UserMessageSink for Recording {
+        fn write_message(&mut self, message: UserMessage) {
+            self.0.lock().unwrap().push(message.text);
+        }
+        fn replay_queued(&mut self) {}
+    }
+    #[async_trait]
+    impl SquadAttachFrontend for Recording {
+        fn ask_pick_candidate(
+            &mut self,
+            _: &[SquadContainer],
+        ) -> Result<Option<usize>, CommandError> {
+            unreachable!()
+        }
+        fn on_slot_attached(
+            &mut self,
+            _: &str,
+            _: Box<dyn AgentInstance>,
+        ) -> Result<(), CommandError> {
+            panic!("failed listing cannot attach")
+        }
+        fn on_slot_exited(&mut self, _: &str) {}
+    }
+    #[test]
+    fn reconcile_reports_listing_failure_and_retries_the_slot_on_the_next_snapshot() {
+        let runtime = ListingFailureRuntime::new(true);
+        let messages = Arc::new(Mutex::new(Vec::new()));
+        let frontend: Arc<Mutex<Box<dyn SquadAttachFrontend>>> =
+            Arc::new(Mutex::new(Box::new(Recording(messages.clone()))));
+        let driver = Arc::new(Mutex::new(SquadSlotDriver::new()));
+        let mut state = WorkflowState::new("listing-failure".into(), &[], "hash".into(), None);
+        state.set_status(
+            "build",
+            StepState::Running {
+                container_id: Some("id".into()),
+            },
+        );
+        let evaluation = Arc::new(AtomicBool::new(false));
+        for _ in 0..2 {
+            apply_workflow_state(&state, &runtime, &driver, &frontend, &evaluation);
+        }
+        let messages = messages.lock().unwrap();
+        assert_eq!(messages.len(), 2);
+        assert!(messages
+            .iter()
+            .all(|text| text.contains("running listing failed") && text.contains("build")));
+        assert!(driver.lock().unwrap().slotted.is_empty());
     }
 }

@@ -1,10 +1,13 @@
 //! `ConfigCommand` — view and edit global / repo configuration.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use serde::Serialize;
 
 use crate::command::commands::Command;
-use crate::command::dispatch::{BuildContext, Engines};
+use crate::command::config_notices::ConfigNotices;
+use crate::command::dispatch::BuildContext;
 use crate::command::error::CommandError;
 use crate::data::config::config_json::{apply_config_field, config_field_value};
 pub use crate::data::config::fields::ConfigRowShape;
@@ -132,8 +135,37 @@ fn check_agent_known(
 /// by name; a legacy alias coerces exactly like its canonical name.
 fn validate_and_coerce(field: &str, value: &str) -> Result<serde_json::Value, String> {
     let Some(resolved) = resolve_config_field(field) else {
-        return validate_and_coerce_scalar(field, value);
+        return validate_and_coerce_scalar(field, ConfigFieldKind::String, value);
     };
+    if resolved.shape == ConfigRowShape::Scalar && resolved.spec.read_only {
+        return Err(format!(
+            "{field} is read-only; {}",
+            resolved.spec.hint.unwrap_or("edit config JSON")
+        ));
+    }
+    if resolved.spec.comma_list {
+        let items: Vec<String> = value
+            .split(',')
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .map(str::to_string)
+            .collect();
+        if resolved.canonical == "workflows.prerequisites.githubToken.envVars" {
+            use crate::data::config::workflows::{
+                ConfigScope, GithubTokenConfig, PrerequisitesConfig,
+            };
+            PrerequisitesConfig {
+                github_token: Some(GithubTokenConfig {
+                    env_vars: Some(items.clone()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }
+            .validate(ConfigScope::Global)
+            .map_err(|error| error.to_string())?;
+        }
+        return Ok(serde_json::json!(items));
+    }
     match resolved.shape {
         ConfigRowShape::MapEntry => {
             validate_map_entry_key(resolved.member.as_deref().unwrap_or_default())?;
@@ -186,135 +218,114 @@ fn validate_and_coerce(field: &str, value: &str) -> Result<serde_json::Value, St
              {child_prefix}0 \"never spawn more than two agents in parallel\"`",
             resolved.spec.name
         )),
-        ConfigRowShape::Scalar => validate_and_coerce_scalar(&resolved.canonical, value),
+        ConfigRowShape::Scalar => {
+            validate_and_coerce_scalar(&resolved.canonical, resolved.spec.kind, value)
+        }
     }
 }
 
 /// [`validate_and_coerce`] for a single-valued field, by canonical name.
-fn validate_and_coerce_scalar(field: &str, value: &str) -> Result<serde_json::Value, String> {
-    if field == "runtime" {
-        use crate::data::config::RuntimeSelection;
-        return match RuntimeSelection::parse(Some(value)) {
-            Ok(_) => Ok(serde_json::Value::String(value.trim().to_string())),
-            Err(unknown) => Err(format!(
-                "'{}' is not a runtime; valid values: {}{}",
-                unknown.0,
-                RuntimeSelection::valid_values(),
-                RuntimeSelection::hint_for(&unknown.0)
-                    .map(|hint| format!(" ({hint})"))
-                    .unwrap_or_default()
-            )),
-        };
-    }
-    if field == crate::data::config::builtin_runtime::BUILDER_ENABLED_FIELD {
-        // The generic bool fallback below also accepts exactly "true"/"false"
-        // and would coerce the same way, but routes through here for the
-        // field-naming error message `parse_enabled` gives on anything else.
-        return crate::data::config::builtin_runtime::BuiltinBuilderConfig::parse_enabled(value)
-            .map(serde_json::Value::Bool);
-    }
-    match field {
-        "worktree.onDirtyMergeTarget" => value
-            .parse::<crate::data::config::OnDirtyMergeTarget>()
-            .map(|v| serde_json::to_value(v).unwrap_or(serde_json::Value::Null)),
-        "worktree.mergeFix.onFailure" => value
-            .parse::<crate::data::config::OnMergeFailure>()
-            .map(|v| serde_json::to_value(v).unwrap_or(serde_json::Value::Null)),
-        "agent" | "default_agent" => {
-            // Shape only here; whether the name is defined depends on the
-            // scope being written (`check_agent_known`).
-            crate::data::session::AgentName::new(value).map_err(|e| e.to_string())?;
-            Ok(serde_json::Value::String(value.to_string()))
-        }
-        "yoloDisallowedTools" | "overlays" | "api.workDirs" | "api.workDirRoots" => {
-            // Parse comma-separated into array
-            let items: Vec<&str> = value
-                .split(',')
-                .map(|s| s.trim())
-                .filter(|s| !s.is_empty())
-                .collect();
-            Ok(serde_json::Value::Array(
-                items
-                    .iter()
-                    .map(|s| serde_json::Value::String(s.to_string()))
-                    .collect(),
-            ))
-        }
-        "terminal_scrollback_lines" | "agentStuckTimeout" | "api.port" => {
-            // Must be a positive integer
-            value
-                .parse::<u64>()
-                .map(|n| serde_json::Value::Number(n.into()))
-                .map_err(|_| format!("'{}' is not a valid number", value))
-        }
-        "workflows.dynamic.maxConcurrentSteps" => {
-            // Positive integer; zero would deadlock any workflow (WI-0095).
-            let n = value
-                .parse::<u64>()
-                .map_err(|_| format!("'{}' is not a valid number", value))?;
-            if n < 1 {
-                return Err("workflows.dynamic.maxConcurrentSteps must be >= 1".to_string());
-            }
-            Ok(serde_json::Value::Number(n.into()))
-        }
-        "maxConcurrentAgents" => {
-            let n = value
-                .parse::<u64>()
-                .map_err(|_| format!("'{}' is not a valid number", value))?;
-            if n < 1 {
-                return Err("maxConcurrentAgents must be >= 1".to_string());
-            }
-            Ok(serde_json::Value::Number(n.into()))
-        }
-        "workflows.dynamic.defaultLeader" => {
-            validate_default_leader_value(value)?;
-            Ok(serde_json::Value::String(value.to_string()))
-        }
-        _ => {
-            // Default: try bool, then number, then string
-            if value == "true" {
-                Ok(serde_json::Value::Bool(true))
-            } else if value == "false" {
-                Ok(serde_json::Value::Bool(false))
-            } else if let Ok(n) = value.parse::<u64>() {
-                Ok(serde_json::Value::Number(n.into()))
+fn validate_and_coerce_scalar(
+    field: &str,
+    kind: ConfigFieldKind,
+    value: &str,
+) -> Result<serde_json::Value, String> {
+    use crate::data::config::fields::ConfigFieldKind::{Bool, Enum, Number, String as StringKind};
+
+    match kind {
+        Bool => {
+            if field == crate::data::config::builtin_runtime::BUILDER_ENABLED_FIELD {
+                crate::data::config::builtin_runtime::BuiltinBuilderConfig::parse_enabled(value)
+                    .map(serde_json::Value::Bool)
             } else {
+                match value.trim() {
+                    "true" => Ok(serde_json::Value::Bool(true)),
+                    "false" => Ok(serde_json::Value::Bool(false)),
+                    _ => Err(format!("{field} must be true or false, not '{value}'")),
+                }
+            }
+        }
+        Number => {
+            let n = value
+                .parse::<u64>()
+                .map_err(|_| format!("'{value}' is not a valid number"))?;
+            match field {
+                "workflows.dynamic.maxConcurrentSteps" => {
+                    let n = usize::try_from(n)
+                        .map_err(|_| format!("'{value}' is not a valid number"))?;
+                    crate::data::config::repo::validate_dynamic_max_concurrent_steps(
+                        "workflows.dynamic",
+                        n,
+                    )
+                    .map_err(|error| error.to_string())?;
+                }
+                "maxConcurrentAgents" if n == 0 => {
+                    return Err("maxConcurrentAgents must be >= 1".to_string());
+                }
+                "builtin.vcpus" if !(1..=u8::MAX as u64).contains(&n) => {
+                    return Err("builtin.vcpus must be between 1 and 255".to_string());
+                }
+                "builtin.memoryMib"
+                    if n < crate::data::config::builtin_runtime::MIN_MEMORY_MIB as u64 =>
+                {
+                    return Err(format!(
+                        "builtin.memoryMib must be at least {}",
+                        crate::data::config::builtin_runtime::MIN_MEMORY_MIB
+                    ));
+                }
+                "builtin.rootDiskMib"
+                    if n < crate::data::config::builtin_runtime::MIN_ROOT_DISK_MIB as u64 =>
+                {
+                    return Err(format!(
+                        "builtin.rootDiskMib must be at least {}",
+                        crate::data::config::builtin_runtime::MIN_ROOT_DISK_MIB
+                    ));
+                }
+                "builtin.mountQuotaMib" if n == 0 => {
+                    return Err("builtin.mountQuotaMib must be at least 1".to_string());
+                }
+                _ => {}
+            }
+            Ok(serde_json::Value::Number(n.into()))
+        }
+        Enum => match field {
+            "runtime" => {
+                use crate::data::config::RuntimeSelection;
+                match RuntimeSelection::parse(Some(value)) {
+                    Ok(_) => Ok(serde_json::Value::String(value.trim().to_string())),
+                    Err(unknown) => Err(format!(
+                        "'{}' is not a runtime; valid values: {}{}",
+                        unknown.0,
+                        RuntimeSelection::valid_values(),
+                        RuntimeSelection::hint_for(&unknown.0)
+                            .map(|hint| format!(" ({hint})"))
+                            .unwrap_or_default()
+                    )),
+                }
+            }
+            "worktree.onDirtyMergeTarget" => value
+                .parse::<crate::data::config::OnDirtyMergeTarget>()
+                .map(|v| serde_json::to_value(v).unwrap_or(serde_json::Value::Null))
+                .map_err(|e| e.to_string()),
+            "worktree.mergeFix.onFailure" => value
+                .parse::<crate::data::config::OnMergeFailure>()
+                .map(|v| serde_json::to_value(v).unwrap_or(serde_json::Value::Null))
+                .map_err(|e| e.to_string()),
+            "agent" | "default_agent" => {
+                crate::data::session::AgentName::new(value).map_err(|e| e.to_string())?;
                 Ok(serde_json::Value::String(value.to_string()))
             }
-        }
+            _ => Ok(serde_json::Value::String(value.to_string())),
+        },
+        StringKind => match field {
+            "workflows.dynamic.defaultLeader" => {
+                crate::data::config::repo::validate_leader_spec("workflows.dynamic", value)
+                    .map_err(|error| error.to_string())?;
+                Ok(serde_json::Value::String(value.to_string()))
+            }
+            _ => Ok(serde_json::Value::String(value.to_string())),
+        },
     }
-}
-
-/// Validate a `workflows.dynamic.defaultLeader` value for `awman config set`
-/// (WI-0095). Enforces the same `agent::model` shape as the Layer 0 config-load
-/// validator: exactly two non-empty components, no surrounding whitespace, and
-/// an `AgentName`-valid agent component.
-fn validate_default_leader_value(value: &str) -> Result<(), String> {
-    let parts: Vec<&str> = value.split("::").collect();
-    if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
-        return Err(format!(
-            "'{value}' is not a valid leader; expected agent::model \
-             (e.g. claude::claude-opus-4-8)"
-        ));
-    }
-    let (agent, model) = (parts[0], parts[1]);
-    if agent != agent.trim() || model != model.trim() {
-        return Err(
-            "leader agent and model components must not have leading or trailing whitespace"
-                .to_string(),
-        );
-    }
-    if agent.len() > 64
-        || !agent
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-    {
-        return Err(format!(
-            "'{agent}' is not a valid agent name: only ASCII alphanumerics, '-', and '_' are \
-             allowed, length 1..=64"
-        ));
-    }
-    Ok(())
 }
 
 /// Config-field names within three edits of `input`, nearest first.
@@ -468,17 +479,25 @@ fn mask_sensitive(field: &str, value: Option<String>) -> Option<String> {
         return value;
     }
     value.map(|v| {
-        if v.len() > 12 {
-            format!("{}…{}", &v[..4], &v[v.len() - 4..])
+        let chars: Vec<char> = v.chars().collect();
+        if chars.len() > 12 {
+            format!(
+                "{}…{}",
+                chars[..4].iter().collect::<String>(),
+                chars[chars.len() - 4..].iter().collect::<String>()
+            )
         } else {
             "(set)".to_string()
         }
     })
 }
 
-/// The JSON value at a dotted path, if every segment is an object key.
+/// The JSON value at a dotted path, including numeric array members.
 fn json_at<'a>(root: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
-    path.split('.').try_fold(root, |value, key| value.get(key))
+    path.split('.').try_fold(root, |value, key| match value {
+        serde_json::Value::Array(items) => items.get(key.parse::<usize>().ok()?),
+        _ => value.get(key),
+    })
 }
 
 /// The JSON views `config show|get` read: the global config, and the repo
@@ -869,19 +888,19 @@ pub trait ConfigCommandFrontend: UserMessageSink + Send + Sync {
 
 pub struct ConfigCommand {
     sub: ConfigSubcommand,
-    engines: Engines,
+    notices: Arc<ConfigNotices>,
     session: crate::data::session::Session,
 }
 
 impl ConfigCommand {
     pub fn new(
         sub: ConfigSubcommand,
-        engines: Engines,
+        notices: Arc<ConfigNotices>,
         session: crate::data::session::Session,
     ) -> Self {
         Self {
             sub,
-            engines,
+            notices,
             session,
         }
     }
@@ -916,11 +935,20 @@ impl ConfigCommand {
             ),
             _ => return Err(CommandError::unknown_command(&ctx.path())),
         };
-        Ok(Self::new(sub, ctx.engines.clone(), ctx.session.clone()))
+        Ok(Self::new(
+            sub,
+            ctx.engines.config_notices.clone(),
+            ctx.session.clone(),
+        ))
     }
 
     pub fn subcommand(&self) -> &ConfigSubcommand {
         &self.sub
+    }
+
+    #[cfg(test)]
+    pub(crate) fn notices(&self) -> &Arc<ConfigNotices> {
+        &self.notices
     }
 }
 
@@ -952,7 +980,7 @@ impl Command for ConfigCommand {
         mut frontend: Self::Frontend,
     ) -> Result<Self::Outcome, CommandError> {
         let session = self.session;
-        let notices = &self.engines.config_notices;
+        let notices = &self.notices;
         let outcome = match self.sub {
             ConfigSubcommand::Show(_) => {
                 notices.warn_legacy_dynamic_workflows(&session, frontend.as_mut());
@@ -1057,10 +1085,10 @@ impl Command for ConfigCommand {
                         .unwrap_or_default(),
                 };
                 ConfigOutcome::Get(ConfigGetOutcome {
+                    global_value: mask_sensitive(&field, global_value),
+                    repo_value: mask_sensitive(&field, repo_value),
+                    effective_value: mask_sensitive(&field, effective_value),
                     field,
-                    global_value,
-                    repo_value,
-                    effective_value,
                     alias_used,
                 })
             }
@@ -1122,8 +1150,8 @@ impl Command for ConfigCommand {
                     frontend.write_message(info(MOVED_LEGACY_DYNAMIC_WORKFLOWS_NOTICE));
                 }
                 ConfigOutcome::Set(ConfigSetOutcome {
+                    value: mask_sensitive(&field, Some(f.value)).unwrap_or_default(),
                     field,
-                    value: f.value,
                     scope: if f.global {
                         "global".into()
                     } else {
@@ -1282,8 +1310,23 @@ fn updated_config<T: Serialize + serde::de::DeserializeOwned>(
 ) -> Result<T, String> {
     let mut json =
         serde_json::to_value(cfg).map_err(|e| format!("could not serialize config: {e}"))?;
-    apply_config_field(&mut json, &json_path(field), coerced);
-    serde_json::from_value(json).map_err(|e| format!("'{field}' does not accept this value ({e})"))
+    let path = json_path(field);
+    apply_config_field(&mut json, &path, coerced);
+    let updated: T = serde_json::from_value(json.clone())
+        .map_err(|e| format!("'{field}' does not accept this value ({e})"))?;
+    let persisted = serde_json::to_value(&updated).map_err(|e| e.to_string())?;
+    // A numeric member may append or remove/compact the array. Verify its
+    // parent so append-at-end also checks the actual serialized element.
+    let verification_path = path
+        .rsplit_once('.')
+        .filter(|(_, member)| member.parse::<usize>().is_ok())
+        .map_or(path.as_ref(), |(parent, _)| parent);
+    if json_at(&json, verification_path).filter(|v| !v.is_null())
+        != json_at(&persisted, verification_path).filter(|v| !v.is_null())
+    {
+        return Err(format!("'{field}' cannot be stored in this config scope"));
+    }
+    Ok(updated)
 }
 
 /// Validate, apply, and persist one field edit to the chosen config scope.
@@ -1302,6 +1345,11 @@ fn write_config_field(
     coerced: serde_json::Value,
     global: bool,
 ) -> Result<bool, String> {
+    let resolved = resolve_config_field(field).ok_or_else(|| format!("unknown field '{field}'"))?;
+    let (global_writable, repo_writable) = writability(&resolved);
+    if (global && !global_writable) || (!global && !repo_writable) {
+        return Err(format!("'{field}' is not writable in this config scope"));
+    }
     if global {
         let cfg = updated_config(session.global_config(), field, coerced)?;
         // The session's environment, never the process's: they differ in
@@ -1658,18 +1706,57 @@ mod tests {
     }
 
     #[test]
-    fn validate_and_coerce_default_bool() {
+    fn string_values_are_never_inferred_as_booleans_or_numbers() {
+        for value in ["123", "true", "false"] {
+            assert_eq!(
+                validate_and_coerce("work_items.dir", value).unwrap(),
+                serde_json::Value::String(value.to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn string_values_are_preserved_for_unregistered_internal_calls() {
         assert_eq!(
             validate_and_coerce("some_field", "true").unwrap(),
-            serde_json::Value::Bool(true)
+            serde_json::Value::String("true".into())
         );
     }
 
     #[test]
-    fn validate_and_coerce_default_string() {
+    fn invalid_boolean_and_numeric_values_are_rejected() {
+        assert!(
+            validate_and_coerce("workflows.prerequisites.githubToken.verify", "yes")
+                .unwrap_err()
+                .contains("true or false")
+        );
+        assert!(validate_and_coerce("maxConcurrentAgents", "many")
+            .unwrap_err()
+            .contains("not a valid number"));
+        assert!(validate_and_coerce("builtin.vcpus", "256")
+            .unwrap_err()
+            .contains("between 1 and 255"));
+    }
+
+    #[test]
+    fn dynamic_config_validators_match_config_loading() {
+        let error =
+            validate_and_coerce("workflows.dynamic.defaultLeader", "claude:: ").unwrap_err();
         assert_eq!(
-            validate_and_coerce("some_field", "hello").unwrap(),
-            serde_json::Value::String("hello".into())
+            error,
+            crate::data::config::repo::validate_leader_spec("workflows.dynamic", "claude:: ")
+                .unwrap_err()
+                .to_string()
+        );
+        let error = validate_and_coerce("workflows.dynamic.maxConcurrentSteps", "0").unwrap_err();
+        assert_eq!(
+            error,
+            crate::data::config::repo::validate_dynamic_max_concurrent_steps(
+                "workflows.dynamic",
+                0
+            )
+            .unwrap_err()
+            .to_string()
         );
     }
 
@@ -2152,7 +2239,11 @@ mod tests {
 
     #[test]
     fn field_scope_both() {
-        assert_eq!(resolve_scope("agent"), Some(FieldScope::Both));
+        assert_eq!(
+            resolve_scope("terminal_scrollback_lines"),
+            Some(FieldScope::Both)
+        );
+        assert_eq!(resolve_scope("agent"), Some(FieldScope::RepoOnly));
     }
 
     // ── field_suggestions ─────────────────────────────────────────────────────
@@ -2227,6 +2318,74 @@ mod edit_loop_tests {
     }
 
     #[tokio::test]
+    async fn sensitive_get_set_and_show_outcomes_are_masked_without_changing_the_saved_key() {
+        for key in ["sk-secret-value-abcdefgh", "1é€€€€€€€"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let home = tmp.path().join("home");
+            let session = crate::data::session::Session::for_tests_isolated(tmp.path(), &home);
+            let frontend = || {
+                Box::new(ScriptedConfigFrontend {
+                    responses: vec![None],
+                    seen_rejections: Default::default(),
+                })
+            };
+            let notices = Arc::<ConfigNotices>::default();
+            let outcome = ConfigCommand::new(
+                ConfigSubcommand::Set(ConfigSetFlags {
+                    field: "remote.defaultAPIKey".into(),
+                    value: key.into(),
+                    global: true,
+                }),
+                notices.clone(),
+                session.clone(),
+            )
+            .run_with_frontend(frontend())
+            .await
+            .unwrap();
+            let ConfigOutcome::Set(set) = outcome else {
+                panic!("expected set")
+            };
+            assert_ne!(set.value, key);
+            let saved =
+                crate::data::config::global::GlobalConfig::load_with(session.env()).unwrap();
+            assert_eq!(
+                saved.remote.as_ref().unwrap().default_api_key.as_deref(),
+                Some(key)
+            );
+            let session = crate::data::session::Session::for_tests_isolated(tmp.path(), &home);
+            let outcome = ConfigCommand::new(
+                ConfigSubcommand::Get(ConfigGetFlags {
+                    field: "remote.defaultAPIKey".into(),
+                }),
+                notices.clone(),
+                session.clone(),
+            )
+            .run_with_frontend(frontend())
+            .await
+            .unwrap();
+            let ConfigOutcome::Get(get) = outcome else {
+                panic!("expected get")
+            };
+            assert_eq!(get.global_value.as_deref(), Some(set.value.as_str()));
+            assert_eq!(get.effective_value, get.global_value);
+            let outcome =
+                ConfigCommand::new(ConfigSubcommand::Show(ConfigShowFlags {}), notices, session)
+                    .run_with_frontend(frontend())
+                    .await
+                    .unwrap();
+            let ConfigOutcome::Show(show) = outcome else {
+                panic!("expected show")
+            };
+            let row = show
+                .rows
+                .iter()
+                .find(|row| row.field == "remote.defaultAPIKey")
+                .unwrap();
+            assert_eq!(row.global_value, get.global_value);
+        }
+    }
+
+    #[tokio::test]
     async fn show_edit_loop_preserves_rejected_input_and_persists_valid_edit() {
         let tmp = tempfile::tempdir().unwrap();
         let seen = Arc::new(Mutex::new(Vec::new()));
@@ -2253,7 +2412,7 @@ mod edit_loop_tests {
 
         let cmd = ConfigCommand::new(
             ConfigSubcommand::Show(ConfigShowFlags {}),
-            crate::command::dispatch::Engines::for_tests(std::path::Path::new("/tmp")),
+            Default::default(),
             open_session(tmp.path()),
         );
         cmd.run_with_frontend(Box::new(frontend))
@@ -2293,6 +2452,38 @@ mod edit_loop_tests {
     }
 
     #[tokio::test]
+    async fn tui_edit_loop_round_trips_boolean_and_numeric_looking_strings() {
+        for value in ["123", "true", "false"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let frontend = ScriptedConfigFrontend {
+                responses: vec![
+                    Some(ConfigEditRequest {
+                        field: "work_items.dir".into(),
+                        value: value.into(),
+                        global: false,
+                    }),
+                    None,
+                ],
+                seen_rejections: Arc::new(Mutex::new(Vec::new())),
+            };
+            ConfigCommand::new(
+                ConfigSubcommand::Show(ConfigShowFlags {}),
+                Default::default(),
+                open_session(tmp.path()),
+            )
+            .run_with_frontend(Box::new(frontend))
+            .await
+            .expect("the TUI edit should persist a valid string");
+
+            let config: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(crate::data::config::repo::RepoConfig::path(tmp.path())).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(config["workItems"]["dir"], value);
+        }
+    }
+
+    #[tokio::test]
     async fn set_reports_schema_mismatch_instead_of_silent_success() {
         let tmp = tempfile::tempdir().unwrap();
         let frontend = ScriptedConfigFrontend {
@@ -2306,7 +2497,7 @@ mod edit_loop_tests {
                 value: "not-an-object".into(),
                 global: false,
             }),
-            crate::command::dispatch::Engines::for_tests(std::path::Path::new("/tmp")),
+            Default::default(),
             open_session(tmp.path()),
         );
         let err = cmd
@@ -2462,6 +2653,36 @@ mod wi0150_command_tests {
             global,
             non_interactive,
         }
+    }
+
+    /// The notices handle is the command's only tie to its host: the
+    /// once-per-repo warning follows the handle it was given, so commands
+    /// sharing one warn once and a fresh handle warns again.
+    #[tokio::test]
+    async fn config_commands_warn_once_per_notices_handle() {
+        let root = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        legacy_repo(root.path());
+        let frontend = RecordingFrontend::default();
+        let shared = Arc::<ConfigNotices>::default();
+        for notices in [shared.clone(), shared, Default::default()] {
+            ConfigCommand::new(
+                ConfigSubcommand::Show(ConfigShowFlags {}),
+                notices,
+                session(root.path(), home.path()),
+            )
+            .run_with_frontend(Box::new(frontend.clone()))
+            .await
+            .unwrap();
+        }
+        let warnings = frontend
+            .messages
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|message| message.level == MessageLevel::Warning)
+            .count();
+        assert_eq!(warnings, 2);
     }
 
     #[test]
@@ -2641,7 +2862,7 @@ mod wi0150_command_tests {
                 value: "global note".into(),
                 global: true,
             }),
-            crate::command::dispatch::Engines::for_tests(root.path()),
+            Default::default(),
             session,
         )
         .run_with_frontend(Box::new(MigrationFrontend(MigrateChoice::Move)))
@@ -2682,7 +2903,7 @@ mod wi0150_command_tests {
                     value: "extra".into(),
                     global,
                 }),
-                crate::command::dispatch::Engines::for_tests(root.path()),
+                Default::default(),
                 session,
             )
             .run_with_frontend(Box::new(MigrationFrontend(MigrateChoice::Move)))
@@ -2695,6 +2916,68 @@ mod wi0150_command_tests {
         }
         assert_eq!(std::fs::read_to_string(&global_path).unwrap(), raw);
         assert_eq!(std::fs::read_to_string(&repo_path).unwrap(), raw);
+    }
+
+    #[tokio::test]
+    async fn config_set_preserves_string_contents_and_rejects_invalid_typed_values_before_write() {
+        let root = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let repo_path = crate::data::config::repo::RepoConfig::path(root.path());
+        let global_path = crate::data::config::global::GlobalConfig::path_with(
+            session(root.path(), home.path()).env(),
+        )
+        .unwrap();
+
+        for value in ["123", "true", "false"] {
+            ConfigCommand::new(
+                ConfigSubcommand::Set(ConfigSetFlags {
+                    field: "work_items.dir".into(),
+                    value: value.into(),
+                    global: false,
+                }),
+                Default::default(),
+                session(root.path(), home.path()),
+            )
+            .run_with_frontend(Box::new(MigrationFrontend(MigrateChoice::Move)))
+            .await
+            .unwrap();
+
+            let config: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&repo_path).unwrap()).unwrap();
+            assert_eq!(config["workItems"]["dir"], value);
+        }
+
+        let before = std::fs::read(&repo_path).unwrap();
+        for (field, value, global) in [
+            ("workflows.prerequisites.githubToken.verify", "yes", true),
+            ("builtin.vcpus", "256", false),
+            (
+                "workflows.prerequisites.githubToken.envVars",
+                "lower-case",
+                false,
+            ),
+        ] {
+            let result = ConfigCommand::new(
+                ConfigSubcommand::Set(ConfigSetFlags {
+                    field: field.into(),
+                    value: value.into(),
+                    global,
+                }),
+                Default::default(),
+                session(root.path(), home.path()),
+            )
+            .run_with_frontend(Box::new(MigrationFrontend(MigrateChoice::Move)))
+            .await;
+            assert!(
+                matches!(result, Err(CommandError::InvalidFlagValue { .. })),
+                "{field}={value} must be rejected as invalid input before writing"
+            );
+            assert_eq!(std::fs::read(&repo_path).unwrap(), before);
+            assert!(
+                !global_path.exists(),
+                "{field}={value} must not create global config"
+            );
+        }
     }
 
     #[tokio::test]
@@ -2727,7 +3010,7 @@ mod wi0150_command_tests {
                 value: "x".into(),
                 global: true,
             }),
-            crate::command::dispatch::Engines::for_tests(root.path()),
+            Default::default(),
             session,
         )
         .run_with_frontend(Box::new(MigrationFrontend(MigrateChoice::Move)))
@@ -2751,7 +3034,7 @@ mod wi0150_command_tests {
                 value: "new note".into(),
                 global: false,
             }),
-            crate::command::dispatch::Engines::for_tests(root.path()),
+            Default::default(),
             session,
         )
         .run_with_frontend(Box::new(frontend))
@@ -2808,5 +3091,81 @@ mod wi0150_command_tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("read-only"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod behavior_review_tests {
+    use super::*;
+    use crate::data::config::{global::GlobalConfig, repo::RepoConfig};
+
+    #[test]
+    fn typed_round_trip_rejects_unknown_fields_instead_of_dropping_them() {
+        for (field, value) in [
+            ("api.port", serde_json::json!(7777)),
+            ("api.background", serde_json::json!(true)),
+            ("agent", serde_json::json!("claude")),
+        ] {
+            assert!(
+                updated_config(&GlobalConfig::default(), field, value).is_err(),
+                "{field}"
+            );
+        }
+        for field in ["remote", "remote.defaultAddr", "remote.defaultAPIKey"] {
+            assert!(
+                updated_config(&RepoConfig::default(), field, serde_json::json!("secret")).is_err(),
+                "{field}"
+            );
+        }
+    }
+
+    #[test]
+    fn scope_and_object_edits_are_rejected_before_writing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session =
+            crate::data::session::Session::for_tests_isolated(tmp.path(), &tmp.path().join("home"));
+        for (field, global) in [
+            ("agent", true),
+            ("remote.defaultAddr", false),
+            ("remote.defaultAPIKey", false),
+            ("api.port", true),
+            ("api.background", true),
+        ] {
+            assert!(
+                write_config_field(&session, field, serde_json::json!("value"), global).is_err(),
+                "{field}"
+            );
+        }
+        for field in [
+            "api",
+            "remote",
+            "workItems",
+            "workflows.prerequisites.githubToken.acquire",
+        ] {
+            assert!(validate_and_coerce(field, "{}")
+                .unwrap_err()
+                .contains("read-only"));
+        }
+        assert!(!RepoConfig::path(tmp.path()).exists());
+    }
+
+    #[test]
+    fn sensitive_values_are_unicode_safe_and_list_validation_uses_the_schema() {
+        let field = "remote.defaultAPIKey";
+        for key in ["1é€€€€€€€", "1é€€€€€€€€€€€€€€€", "sk-secret-value-abcdefgh"]
+        {
+            let masked = mask_sensitive(field, Some(key.into())).unwrap();
+            assert_ne!(masked, key);
+            assert!(!masked.contains("secret-value"));
+        }
+        assert!(
+            validate_and_coerce("workflows.prerequisites.githubToken.envVars", "lower-case")
+                .unwrap_err()
+                .contains("names must match")
+        );
+        assert_eq!(
+            validate_and_coerce("overlays", "one, two").unwrap(),
+            serde_json::json!(["one", "two"])
+        );
     }
 }

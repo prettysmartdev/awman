@@ -8,6 +8,7 @@
 //! | `queued`/`pending`           | row → `cancelled`; a `/v1/runs` setup is told to stop | `Cancelled` |
 //! | `running`                    | marker recorded, the owning worker's token fired | `Stopping`       |
 //! | `running`, no owner          | (only between a crash and the next bootstrap) row → `cancelled` | `Cancelled` |
+//! | `running`, no owner, sidecar | row → the recorded completion; an unreadable sidecar is an error | `AlreadyTerminal` |
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -154,19 +155,35 @@ impl CommandCanceller {
         Ok(())
     }
 
+    /// A worker that could not store its completion has already published it;
+    /// that outcome stands, whatever a later cancel asks for.
+    fn finalize_from_sidecar(&self, command_id: &str) -> Result<bool, CommandError> {
+        let Some(paths) = &self.completion_paths else {
+            return Ok(false);
+        };
+        let Some(record) = self.store.get_command(command_id)? else {
+            return Ok(false);
+        };
+        if record.status != CommandStatus::Running {
+            return Ok(false);
+        }
+        Ok(super::queue_worker::finalize_running_from_sidecar(
+            &self.store,
+            paths,
+            &record,
+        )?)
+    }
+
     pub fn cancel(&self, command_id: &str) -> Result<CancelOutcome, CommandError> {
         let Some(record) = self.store.get_command(command_id)? else {
             return Ok(CancelOutcome::NotFound);
         };
-        let status = CommandStatus::parse(&record.status);
-        if status.is_some_and(CommandStatus::is_terminal) {
+        if record.status.is_terminal() {
             return Ok(CancelOutcome::AlreadyTerminal(record));
         }
 
         let now = chrono::Utc::now().to_rfc3339();
-        if status.is_some_and(CommandStatus::is_claimable)
-            && self.lifecycle.cancel_if_queued(command_id, &now)?
-        {
+        if record.status.is_claimable() && self.lifecycle.cancel_if_queued(command_id, &now)? {
             // A `/v1/runs` command waits in the queue while its session is
             // set up: abandon that setup too.
             if let Some(run) = self.lifecycle.run_for_command(command_id)? {
@@ -183,18 +200,20 @@ impl CommandCanceller {
             .cancel_requested_at(command_id)?
             .unwrap_or(now.clone());
         let owned = self.commands.cancel_or(command_id, || {
-            self.lifecycle
-                .cancel_if_running(command_id, &now, &requested_at)
-                .map(|_| ())
+            if !self.finalize_from_sidecar(command_id)? {
+                self.lifecycle
+                    .cancel_if_running(command_id, &now, &requested_at)?;
+            }
+            Ok::<(), CommandError>(())
         })?;
         if !owned {
             let current = self.reread(record.clone())?;
-            match CommandStatus::parse(&current.status) {
-                Some(CommandStatus::Cancelled) => {
+            match current.status {
+                CommandStatus::Cancelled => {
                     self.finalize_unowned(command_id)?;
                     return Ok(CancelOutcome::Cancelled(self.reread(current)?));
                 }
-                Some(s) if s.is_terminal() => return Ok(CancelOutcome::AlreadyTerminal(current)),
+                s if s.is_terminal() => return Ok(CancelOutcome::AlreadyTerminal(current)),
                 // Not finalised (the row left `running` some other way):
                 // the marker is recorded, so restart recovery cancels it.
                 _ => {}
@@ -254,7 +273,7 @@ mod tests {
         let CancelOutcome::Cancelled(row) = cancel.cancel("queued").unwrap() else {
             panic!("queued command should cancel immediately");
         };
-        assert_eq!(row.status, "cancelled");
+        assert_eq!(row.status.as_str(), "cancelled");
         assert_eq!(
             row.exit_code,
             Some(crate::data::command_status::CANCELLED_EXIT_CODE)
@@ -265,7 +284,12 @@ mod tests {
             .enqueue_command("done", "session", "chat", "[]", "log")
             .unwrap();
         store
-            .complete_command("done", "done", Some(0), Some(r#"{"exit_code":0}"#))
+            .complete_command(
+                "done",
+                CommandStatus::Done,
+                Some(0),
+                Some(r#"{"exit_code":0}"#),
+            )
             .unwrap();
         let before = store.get_command("done").unwrap().unwrap();
         assert!(matches!(
@@ -284,7 +308,7 @@ mod tests {
         let owner = Arc::new(TokenRegistry::new());
         let token = owner.register("running");
         let claimed = store.claim_next_command("worker").unwrap().unwrap();
-        assert_eq!(claimed.status, "running");
+        assert_eq!(claimed.status.as_str(), "running");
         let cancel = canceller(Arc::clone(&store), lifecycle.clone(), Arc::clone(&owner));
 
         assert!(matches!(
@@ -293,7 +317,12 @@ mod tests {
         ));
         assert!(token.is_cancelled());
         assert_eq!(
-            store.get_command("running").unwrap().unwrap().status,
+            store
+                .get_command("running")
+                .unwrap()
+                .unwrap()
+                .status
+                .as_str(),
             "running"
         );
 
@@ -305,7 +334,12 @@ mod tests {
         assert_eq!(finalized, ["running"]);
         assert!(store.recover_stale_commands(0).unwrap().is_empty());
         assert_eq!(
-            store.get_command("running").unwrap().unwrap().status,
+            store
+                .get_command("running")
+                .unwrap()
+                .unwrap()
+                .status
+                .as_str(),
             "cancelled"
         );
         assert!(store
@@ -346,7 +380,12 @@ mod tests {
             )
             .unwrap());
         assert_eq!(
-            store.get_command("cancelled-run").unwrap().unwrap().status,
+            store
+                .get_command("cancelled-run")
+                .unwrap()
+                .unwrap()
+                .status
+                .as_str(),
             "cancelled"
         );
     }

@@ -9,6 +9,7 @@ pub mod commands;
 pub mod config_notices;
 pub mod dispatch;
 pub mod error;
+pub mod git_summary;
 pub mod headless;
 pub mod prompts;
 pub mod session_create;

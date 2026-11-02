@@ -6,7 +6,7 @@ use serde::Serialize;
 use crate::command::commands::launch_policy::{
     ensure_agent_trusted, LaunchModeDecision, LaunchPolicy,
 };
-use crate::command::commands::{parse_overlay_list, Command};
+use crate::command::commands::Command;
 use crate::command::dispatch::{BuildContext, Engines};
 use crate::command::error::CommandError;
 use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
@@ -240,18 +240,12 @@ impl Command for ExecPromptCommand {
         }
         // Resolve ACP policy before overlays or container setup. A direct ACP
         // request is deliberately never eligible for fallback.
-        let config = command_effective_config(&session, &self.flags);
-        let explicit_acp = self.flags.launch_mode
-            == Some(crate::data::config::repo::LaunchMode::Acp)
-            || (self.flags.agent.is_none()
-                && session.repo_config().agent.is_some()
-                && session.repo_config().launch_mode
-                    == Some(crate::data::config::repo::LaunchMode::Acp));
-        let launch_decision =
-            match LaunchPolicy::resolve_launch_mode(&session, &config, &agent, explicit_acp) {
-                Ok(decision) => decision,
-                Err(e) => return Err(CommandError::from(e)),
-            };
+        let launch_decision = LaunchPolicy::for_session(&session).single_agent_launch_mode(
+            &agent,
+            &self.flags.agent,
+            &self.flags.model,
+            self.flags.launch_mode,
+        )?;
         if launch_decision == LaunchModeDecision::StdioWithFallbackWarning {
             frontend.write_message(UserMessage {
                 level: MessageLevel::Warning,
@@ -267,25 +261,15 @@ impl Command for ExecPromptCommand {
             text: format!("exec prompt: using agent '{}'", agent.as_str()),
         });
 
-        let cli_typed = {
-            let mut all = Vec::new();
-            for s in &self.flags.overlay {
-                match parse_overlay_list(s) {
-                    Ok(parsed) => all.extend(parsed),
-                    Err(reason) => {
-                        let e = CommandError::InvalidOverlaySpec {
-                            spec: s.clone(),
-                            reason,
-                        };
-                        frontend.write_message(UserMessage {
-                            level: MessageLevel::Error,
-                            text: format!("exec prompt: invalid overlay spec: {e}"),
-                        });
-                        return Err(e);
-                    }
-                }
+        let cli_typed = match LaunchPolicy::parse_overlay_flags(&self.flags.overlay) {
+            Ok(overlays) => overlays,
+            Err(e) => {
+                frontend.write_message(UserMessage {
+                    level: MessageLevel::Error,
+                    text: format!("exec prompt: invalid overlay spec: {e}"),
+                });
+                return Err(e);
             }
-            all
         };
         let collected = session
             .effective_config()
@@ -584,23 +568,6 @@ impl Command for ExecPromptCommand {
             exit_code,
         })
     }
-}
-
-fn command_effective_config(
-    session: &Session,
-    command_flags: &ExecPromptCommandFlags,
-) -> crate::data::config::effective::EffectiveConfig {
-    let current = session.effective_config();
-    let mut flags = current.flags().clone();
-    flags.agent = command_flags.agent.clone();
-    flags.model = command_flags.model.clone();
-    flags.launch_mode = command_flags.launch_mode;
-    crate::data::config::effective::EffectiveConfig::new(
-        flags,
-        current.env().clone(),
-        current.repo().clone(),
-        current.global().clone(),
-    )
 }
 
 #[cfg(test)]

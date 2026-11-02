@@ -21,14 +21,14 @@ awman initially grew into three execution modes (CLI, TUI, API) that share the s
 ### Tenets
 
 1. **No upward calls.** Lower layers never call functions or use types from higher layers. If a lower layer needs to delegate upward, it defines a trait that a higher layer implements.
-2. **Frontends are dumb.** No frontend (CLI, TUI, API) may implement business logic. All logic lives in Layer 2 (`command`) or below.
+2. **Frontends are presentation layers.** No frontend (CLI, TUI, API, or squad) may implement business logic. All logic lives in Layer 2 (`command`) or below.
 3. **Typed objects over free functions.** Every significant abstraction is a struct with methods. Free `pub fn` is acceptable only for stateless helpers, constructors, and one-off utilities.
 
 ### Layers
 
 ```
 Layer 4: binary    main.rs — selects a frontend after Startup completes
-Layer 3: frontend  CLI, TUI, API — input/output only
+Layer 3: frontend  CLI, TUI, API, squad — input/output only
 Layer 2: command   Dispatch, per-command business logic
 Layer 1: engine    ContainerRuntime, WorkflowEngine, GitEngine, OverlayEngine, AuthEngine
 Layer 0: data      Session, config, filesystem, database, typed data
@@ -36,11 +36,11 @@ Layer 0: data      Session, config, filesystem, database, typed data
 
 **Layer 0 (data)** owns every data definition, config concern, filesystem access, and database interaction. No business logic, no container calls, no git operations, no workflow execution. See [Layer 0 reference](#layer-0-data-srcdata) below.
 
-**Layer 1 (engine)** owns core runtime primitives: container lifecycle, workflow execution, git operations, overlay construction, authentication, agent management, and the multi-phase `ready`/`init` engines. See [Layer 1 reference](#layer-1-engine-srcengine) below.
+**Layer 1 (engine)** owns core runtime primitives: container lifecycle, workflow execution, git operations, overlay construction, authentication, agent management, and the multi-phase `ready`/`init` engines. Its current modules also cover ACP, structured agent output, template retrieval, credential refresh, daemon supervision, context prompts, image preparation, issue providers, OCI acquisition, remote HTTP clients, and squad scheduling. See [Layer 1 reference](#layer-1-engine-srcengine) below.
 
 **Layer 2 (command)** owns higher-level business logic: the `Dispatch` type that routes input to typed command objects, and command-specific types (`ChatCommand`, `InitCommand`, etc.). Implemented in work item 0068.
 
-**Layer 3 (frontend)** contains the CLI, TUI, and API server. Each is a presentation layer only: it translates user input into `Dispatch` calls and renders command output. All three frontends are fully functional. See [Layer 3 reference](#layer-3-frontend-srcfrontend) below.
+**Layer 3 (frontend)** contains the CLI, TUI, API server, and squad HTTP frontend. Each is a presentation layer only: it translates input to lower-layer operations and renders command output. See [Layer 3 reference](#layer-3-frontend-srcfrontend) below.
 
 **Layer 4 (binary)** is `src/main.rs` — the real entrypoint that builds clap from `CommandCatalogue`, calls Layer 2 `Startup`, and routes the resulting context to the CLI or TUI frontend. Session-backed engine construction is centralized in `Engines::build`; the API and squad daemons enter through `ApiServerRuntime` and `SquadDaemonHandles`. See [Layer 4 reference](#layer-4-binary-srcmainrs) below.
 
@@ -150,6 +150,7 @@ src/
     dispatch/
       mod.rs              Dispatch<F>, Engines::build, CommandFrontend, CommandOutcome, BuiltCommand
       catalogue.rs        CommandCatalogue, CommandSpec, FlagSpec, ArgumentSpec, FlagKind, FlagDefault, ArgumentKind, FrontendVisibility
+      build.rs            catalogue leaf-to-command constructor table
       parsed_input.rs     ParsedCommandBoxInput (TUI command-box tokenized result)
       projections/
         mod.rs            Re-exports
@@ -180,7 +181,7 @@ src/
       api_server/runtime.rs ApiServerRuntime — API daemon bootstrap
       squad/daemon_runtime.rs SquadDaemonHandles — squad daemon bootstrap
   frontend/
-    mod.rs                Declares cli, tui, API sub-modules
+    mod.rs                Declares api, cli, squad, tui, and shared render helpers
     cli/
       mod.rs              RuntimeContext; run() entry point; render_outcome/render_error; error_exit_code
       command_frontend.rs CliFrontend (implements CommandFrontend + all *CommandFrontend marker traits); command_path_from_matches
@@ -236,8 +237,11 @@ src/
       text_edit.rs        TextEdit — single-line/multiline text editing with cursor and word movement
       user_message.rs     TuiUserMessageSink, SharedStatusLog, StatusLogEntry
       workflow_view.rs    render_workflow_overview() — per-step Workflow Overview
-    API/
+    api/
       mod.rs              ApiServerRuntime handoff; router, listener, and serving
+    squad/
+      mod.rs              Serves the bootstrapped SquadDaemonHandles over HTTP
+    render_helpers.rs     Shared presentation utilities
   main.rs                 Layer 4 binary entrypoint
 ```
 
@@ -755,6 +759,25 @@ Three rules govern every engine in this layer:
 1. **No direct I/O.** No `println!`, `eprintln!`, `tracing::info!` to user-facing output. All user-visible output flows through `UserMessageSink::write_message` or the appropriate frontend trait.
 2. **No PTY, no `clap`, no `crossterm`, no `ratatui`.** Those are Layer 3 concerns.
 3. **Typed objects over free functions.** Every significant abstraction is a struct with methods.
+
+Current top-level module responsibilities: `acp` owns ACP transport and
+session driving; `agent` owns agent definitions, registry and option
+preparation; `agent_output` translates structured output streams;
+`agent_runtime` defines the cross-runtime contract and execution types;
+`aspec` fetches the canonical template; `auth` handles credentials and API
+authentication; `container` and `sandbox` implement their runtime tiers;
+`context_prompt.rs` composes context prompts; `credential_refresh` tracks live
+credential leases; `daemon` supervises daemon processes; `error.rs` defines
+engine errors; `git` owns repository and worktree operations;
+`host_cli.rs` resolves container/sandbox CLI programs under test isolation;
+`image_prep` owns source-matched image preparation; `init` and `ready` are
+multi-phase engines; `issue` routes issue providers; `message.rs` defines
+engine messages and their sink; `oci` acquires and verifies images; `overlay`
+builds resolved overlay specs; `remote` provides shared HTTP transport and
+typed daemon clients; `squad` owns its daemon engine, scheduler and supervisor;
+`step_status.rs` shares ready/init step status; and `workflow` owns workflow
+execution. These modules own reusable Layer 1 mechanics; command policy stays
+in Layer 2 and presentation stays in Layer 3.
 
 ---
 
@@ -1550,6 +1573,16 @@ Four rules govern this layer:
 3. **Typed objects over `pub fn`.** Each command is a `*Command` struct that implements `Command` and exposes `run_with_frontend(frontend) -> Result<Outcome, CommandError>`.
 4. **The full list of available commands and flags lives only in `CommandCatalogue`.** Frontends never hard-code command names, flag names, or defaults; they ask the catalogue (or its projections) for what's available. This is the single most important guarantee against mode drift across CLI, TUI, and API.
 
+`Startup` (`src/command/startup.rs`) owns ordered process and session startup.
+`Engines::build` and `Engines::for_daemon`
+(`src/command/dispatch/engines.rs`) assemble engine bundles for the main host
+and daemon hosts. `HeadlessDefaults` (`src/command/headless.rs`) provides
+named API, squad, and CLI answer profiles when no interactive operator is
+attached. The `CommandCatalogue` stores command and flag metadata;
+`dispatch/build.rs` maps runnable catalogue leaves to command-owned
+constructors through a function-pointer table. The table selects constructors
+and contains no command behavior.
+
 ---
 
 ### `Command` trait (`src/command/commands/command_trait.rs`)
@@ -2154,7 +2187,10 @@ The `--workdirs` flag is merged with `GlobalConfig::API.work_dirs`, canonicalize
 
 ## Layer 3: Frontend (`src/frontend/`)
 
-Layer 3 is the presentation layer. It has three sub-modules — `cli`, `tui`, and `api` — each of which translates user input into `Dispatch` calls and renders the typed outcomes back to the user. Frontends contain **no business logic**: any behavioral decision lives in Layer 2 (`command`) or below.
+Layer 3 is the presentation layer. Its `cli`, `tui`, `api`, and `squad`
+sub-modules translate input to lower-layer operations and render results.
+Frontends contain **no business logic**: behavioral decisions live in Layer 2
+(`command`) or below.
 
 Layer 3 is the only layer that may:
 
@@ -2169,7 +2205,9 @@ Layer 3 may call into Layer 0 (`data`), Layer 1 (`engine`), and Layer 2 (`comman
 
 ### `src/frontend/mod.rs`
 
-Declares the three sub-modules: `pub mod cli; pub mod API; pub mod tui;`. All public symbols used by `main.rs` are re-exported from here.
+Declares `api`, `cli`, `squad`, and `tui`, plus shared `render_helpers`.
+These are the complete frontend directory set. `render_helpers` contains
+shared presentation utilities, not command policy.
 
 ---
 
@@ -2553,7 +2591,7 @@ Running 'awman ready' to check your environment...
 
 ---
 
-### API Frontend (`src/frontend/API/`)
+### API Frontend (`src/frontend/api/`)
 
 The API frontend is a full HTTP server (Axum + axum-server with optional rustls TLS) that dispatches commands through `Dispatch::run_command` rather than spawning child `awman` processes. `ApiServerRuntime::bootstrap` prepares the daemon state before the frontend builds its router and listener. It was completed in WI 0072 and is exercised end-to-end by `tests/api_parity/`.
 
@@ -2579,6 +2617,18 @@ impl ApiServerRuntime {
 
 pub async fn serve(runtime: ApiServerRuntime) -> Result<(), CommandError>
 ```
+
+### Squad Frontend (`src/frontend/squad/`)
+
+The squad frontend owns the squad HTTP router, listener, and request/response
+mapping. It receives already-bootstrapped `SquadDaemonHandles`; daemon
+bootstrap, store setup, scheduling, and lifecycle remain in the Layer 1 squad
+engine and Layer 2 command wiring. The `unattended` adapter delegates answers
+to `HeadlessDefaults::squad`, while `routes`, `state`, and `unattended` cover
+the frontend's route, request state, and no-operator presentation concerns.
+
+`src/frontend/render_helpers.rs` contains shared presentation helpers. The
+complete set of frontend directories is `api`, `cli`, `squad`, and `tui`.
 
 ---
 

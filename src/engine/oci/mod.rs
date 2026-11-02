@@ -51,6 +51,8 @@ pub mod format;
 pub mod registry;
 pub mod resolve;
 pub mod retry;
+#[cfg(test)]
+mod retry_fixtures;
 pub mod sources;
 mod transport;
 pub mod verify;
@@ -473,7 +475,8 @@ impl ImageAcquirer for CachingAcquirer {
             &self.cancel,
             self.sleep.as_ref(),
             attempt,
-        )?;
+        )
+        .map_err(retry::finish)?;
         if let Some(expected) = &fetched.expected_manifest {
             if *expected != validated.manifest_digest {
                 return Err(EngineError::ImageDigestMismatch {

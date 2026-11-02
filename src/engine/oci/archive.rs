@@ -1555,7 +1555,10 @@ pub(super) fn stage_local_archive(
         _ => Box::new(chained),
     };
     sink.copy_from(&mut reader).map_err(|e| match e {
-        EngineError::Network(msg) => EngineError::ImageArchiveRejected {
+        EngineError::Network(msg)
+        | EngineError::ImageSourceFailure {
+            diagnostic: msg, ..
+        } => EngineError::ImageArchiveRejected {
             path: source.to_path_buf(),
             reason: msg,
         },

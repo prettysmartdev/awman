@@ -44,7 +44,7 @@ impl Tab {
     /// slot itself is left in place — mid-workflow closes reuse its info for
     /// the next step's stats polling and title; `poll_command_completion`
     /// clears the slots when the whole command is over.
-    fn close_container_overlay(&mut self, exit_code: i32) {
+    pub(super) fn close_container_overlay(&mut self, exit_code: i32) {
         self.surface_unseen_container_output();
         if self.container_window_state != ContainerWindowState::Hidden {
             if let Some(info) = self.focused_slot().and_then(|s| s.container_info.as_ref()) {
@@ -78,43 +78,10 @@ impl Tab {
             slot.agent_alternate_scroll = false;
         }
         self.stuck = false;
-        self.stuck_rx = None;
-    }
-
-    /// Close the container window as soon as the engine reports that a
-    /// mid-workflow container has actually terminated (killed by awman —
-    /// e.g. after a yolo countdown — or the user quit the agent process).
-    ///
-    /// The engine only publishes the exit code on real container death,
-    /// never for a stuck-but-alive container or while a yolo countdown is
-    /// still running, so taking the slot is the whole gate. The summary bar
-    /// is left behind (captured by `close_container_overlay`), and the slot
-    /// (with its `ContainerInfo`) is kept alive because later workflow steps
-    /// reuse it for stats polling and the overlay title.
-    pub fn poll_container_exit(&mut self) {
-        let exit_code = self
-            .shared
-            .container_exit_shared
-            .lock()
-            .ok()
-            .and_then(|mut guard| guard.take());
-        let Some(exit_code) = exit_code else {
-            return;
-        };
-        // Pull any final bytes into the parser first so the captured
-        // scrollback (and `surface_unseen_container_output`) is complete.
-        // Bytes only: the next step may already have set `pty_reset_flag`
-        // (yolo expiry launches it within milliseconds), and consuming it
-        // here would leave auto-open suppressed for the new container. With
-        // a reset pending the channel may already carry the new step's
-        // output, so leave it for the reset that follows this tick.
-        if !self.shared.pty_reset_flag.load(Ordering::Relaxed) {
-            self.drain_slot_bytes();
+        for slot in &mut self.container_slots {
+            slot.stuck_rx = None;
+            slot.stuck = false;
         }
-        self.close_container_overlay(exit_code);
-        // Late bytes still in flight from the dead container must not
-        // re-open the window; cleared when the next container launches.
-        self.suppress_container_auto_open = true;
     }
 
     /// Check if the command task has completed; update execution phase.

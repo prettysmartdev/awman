@@ -31,6 +31,94 @@ use crate::engine::container::process::{ContainerCli, ContainerInstance};
 use crate::engine::credential_refresh::register_container_leases;
 use crate::engine::error::EngineError;
 
+const AGENT_LIST_FORMAT: &str = "{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.CreatedAt}}";
+
+// The fixture overrides only listing calls on its own thread.
+fn listing_command() -> Command {
+    #[cfg(all(test, unix))]
+    if let Some(path) = docker_listing_tests::CLI.with(|cli| cli.borrow().clone()) {
+        return Command::new(path);
+    }
+    Command::new(crate::engine::host_cli::program("docker"))
+}
+
+/// Query Docker once for each ownership route, then merge by id. The name
+/// query keeps compatibility with legacy awman containers created before
+/// the ownership label was added.
+fn list_owned_containers(stopped: bool) -> Result<Vec<AgentHandle>, EngineError> {
+    let mut handles = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for ownership_filter in ["label=awman=true", "name=awman-"] {
+        let mut args = vec!["ps", "--no-trunc"];
+        if stopped {
+            args.push("-a");
+        }
+        args.extend(["--filter", ownership_filter]);
+        if stopped {
+            args.extend(["--filter", "status=exited", "--filter", "status=dead"]);
+        }
+        args.extend(["--format", AGENT_LIST_FORMAT]);
+        let output = crate::engine::host_cli::checked_output(
+            listing_command()
+                .args(args)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null()),
+            "docker",
+        )?;
+        handles.extend(parse_agent_listing(&output.stdout, &mut seen));
+    }
+    Ok(handles)
+}
+
+/// Parse Docker's tab-separated rows for every agent listing. Incomplete
+/// rows and rows without an id or name are malformed and ignored.
+fn parse_agent_listing(
+    output: &[u8],
+    seen: &mut std::collections::HashSet<String>,
+) -> Vec<AgentHandle> {
+    let stdout = String::from_utf8_lossy(output);
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.splitn(4, '\t');
+            let id = parts.next()?;
+            let name = parts.next()?;
+            let image_tag = parts.next()?;
+            let created = parts.next()?;
+            if id.is_empty() || name.is_empty() || !seen.insert(id.to_string()) {
+                return None;
+            }
+            let started_at = chrono::DateTime::parse_from_str(created, "%Y-%m-%d %H:%M:%S %z %Z")
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+                .unwrap_or_else(|error| {
+                    tracing::warn!(container_id = id, created_at = created, %error,
+                        "invalid Docker creation timestamp; using observation time");
+                    chrono::Utc::now()
+                });
+            Some(AgentHandle {
+                id: id.to_string(),
+                image_tag: image_tag.to_string(),
+                name: name.to_string(),
+                started_at,
+            })
+        })
+        .collect()
+}
+
+fn query_agent_listing(args: &[&str]) -> Result<Vec<AgentHandle>, EngineError> {
+    let output = crate::engine::host_cli::checked_output(
+        listing_command()
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null()),
+        "docker",
+    )?;
+    Ok(parse_agent_listing(
+        &output.stdout,
+        &mut std::collections::HashSet::new(),
+    ))
+}
+
 /// Docker label applied to every amux-spawned container so `list_running`
 /// can filter to ours. Lives on `ContainerCli` so the shared process module
 /// and this backend cannot drift apart.
@@ -72,212 +160,16 @@ impl ContainerBackend for DockerBackend {
     }
 
     fn list_running(&self, _session: &Session) -> Result<Vec<AgentHandle>, EngineError> {
-        // Query by label AND by name prefix so old-amux containers (which may
-        // lack the label) are included. Results from all queries are merged and
-        // deduplicated by container ID.
-        let format = "{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.CreatedAt}}";
-        let queries: &[&[&str]] = &[
-            &[
-                "ps",
-                "--no-trunc",
-                "--filter",
-                "label=awman=true",
-                "--format",
-                format,
-            ],
-            &[
-                "ps",
-                "--no-trunc",
-                "--filter",
-                "name=awman-",
-                "--format",
-                format,
-            ],
-        ];
-
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut handles: Vec<AgentHandle> = Vec::new();
-
-        for args in queries {
-            let output = crate::engine::host_cli::checked_output(
-                Command::new(crate::engine::host_cli::program("docker"))
-                    .args(*args)
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::null()),
-                "docker",
-            )?;
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            for line in stdout.lines() {
-                let parts: Vec<&str> = line.splitn(4, '\t').collect();
-                if parts.len() < 4 {
-                    continue;
-                }
-                let id = parts[0].to_string();
-                if !seen.insert(id.clone()) {
-                    continue; // already added from a previous query
-                }
-                let name = parts[1].to_string();
-                let image_tag = parts[2].to_string();
-                let created = parts[3];
-                // Docker's "CreatedAt" format is locale-formatted; fall back to
-                // now() when parsing fails — better to surface the row than drop it.
-                let started_at =
-                    chrono::DateTime::parse_from_str(created, "%Y-%m-%d %H:%M:%S %z %Z")
-                        .map(|dt| dt.with_timezone(&chrono::Utc))
-                        .unwrap_or_else(|_| chrono::Utc::now());
-                handles.push(AgentHandle {
-                    id,
-                    image_tag,
-                    name,
-                    started_at,
-                });
-            }
-        }
-
-        Ok(handles)
+        list_owned_containers(false)
     }
 
     fn list_running_all(&self) -> Result<Vec<AgentHandle>, EngineError> {
-        let format = "{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.CreatedAt}}";
-        let queries: &[&[&str]] = &[
-            &[
-                "ps",
-                "--no-trunc",
-                "--filter",
-                "label=awman=true",
-                "--format",
-                format,
-            ],
-            &[
-                "ps",
-                "--no-trunc",
-                "--filter",
-                "name=awman-",
-                "--format",
-                format,
-            ],
-        ];
-
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut handles: Vec<AgentHandle> = Vec::new();
-
-        for args in queries {
-            let output = crate::engine::host_cli::checked_output(
-                Command::new(crate::engine::host_cli::program("docker"))
-                    .args(*args)
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::null()),
-                "docker",
-            )?;
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            for line in stdout.lines() {
-                let parts: Vec<&str> = line.splitn(4, '\t').collect();
-                if parts.len() < 4 {
-                    continue;
-                }
-                let id = parts[0].to_string();
-                if !seen.insert(id.clone()) {
-                    continue;
-                }
-                let name = parts[1].to_string();
-                if id.is_empty() && name.is_empty() {
-                    continue;
-                }
-                let image_tag = parts[2].to_string();
-                let created = parts[3];
-                let started_at =
-                    chrono::DateTime::parse_from_str(created, "%Y-%m-%d %H:%M:%S %z %Z")
-                        .map(|dt| dt.with_timezone(&chrono::Utc))
-                        .unwrap_or_else(|_| chrono::Utc::now());
-                handles.push(AgentHandle {
-                    id,
-                    image_tag,
-                    name,
-                    started_at,
-                });
-            }
-        }
-
-        Ok(handles)
+        list_owned_containers(false)
     }
 
     fn list_stopped(&self) -> Result<Vec<AgentHandle>, EngineError> {
-        // Two-query deduplicated approach mirroring `list_running_all`: query
-        // by the awman label and by the legacy `awman-` name prefix. Each query
-        // adds `status=exited` and `status=dead` filters (OR'd within the same
-        // filter type) so only stopped containers are returned — running or
-        // paused containers are never included.
-        let format = "{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.CreatedAt}}";
-        let queries: &[&[&str]] = &[
-            &[
-                "ps",
-                "--no-trunc",
-                "-a",
-                "--filter",
-                "label=awman=true",
-                "--filter",
-                "status=exited",
-                "--filter",
-                "status=dead",
-                "--format",
-                format,
-            ],
-            &[
-                "ps",
-                "--no-trunc",
-                "-a",
-                "--filter",
-                "name=awman-",
-                "--filter",
-                "status=exited",
-                "--filter",
-                "status=dead",
-                "--format",
-                format,
-            ],
-        ];
-
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut handles: Vec<AgentHandle> = Vec::new();
-
-        for args in queries {
-            let output = crate::engine::host_cli::checked_output(
-                Command::new(crate::engine::host_cli::program("docker"))
-                    .args(*args)
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::null()),
-                "docker",
-            )?;
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            for line in stdout.lines() {
-                let parts: Vec<&str> = line.splitn(4, '\t').collect();
-                if parts.len() < 4 {
-                    continue;
-                }
-                let id = parts[0].to_string();
-                if id.is_empty() {
-                    continue;
-                }
-                if !seen.insert(id.clone()) {
-                    continue;
-                }
-                let name = parts[1].to_string();
-                let image_tag = parts[2].to_string();
-                let created = parts[3];
-                let started_at =
-                    chrono::DateTime::parse_from_str(created, "%Y-%m-%d %H:%M:%S %z %Z")
-                        .map(|dt| dt.with_timezone(&chrono::Utc))
-                        .unwrap_or_else(|_| chrono::Utc::now());
-                handles.push(AgentHandle {
-                    id,
-                    image_tag,
-                    name,
-                    started_at,
-                });
-            }
-        }
-
-        Ok(handles)
+        // Keep the ownership label and the legacy name-prefix route in sync.
+        list_owned_containers(true)
     }
 
     fn list_dangling_images(
@@ -359,46 +251,14 @@ impl ContainerBackend for DockerBackend {
     }
 
     fn list_running_with_name_prefix(&self, prefix: &str) -> Result<Vec<AgentHandle>, EngineError> {
-        let format = "{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.CreatedAt}}";
-        let output = crate::engine::host_cli::checked_output(
-            Command::new(crate::engine::host_cli::program("docker"))
-                .args([
-                    "ps",
-                    "--no-trunc",
-                    "--filter",
-                    &format!("name={prefix}"),
-                    "--format",
-                    format,
-                ])
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null()),
-            "docker",
-        )?;
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let mut handles: Vec<AgentHandle> = Vec::new();
-        for line in stdout.lines() {
-            let parts: Vec<&str> = line.splitn(4, '\t').collect();
-            if parts.len() < 4 {
-                continue;
-            }
-            let id = parts[0].to_string();
-            let name = parts[1].to_string();
-            if id.is_empty() && name.is_empty() {
-                continue;
-            }
-            let image_tag = parts[2].to_string();
-            let created = parts[3];
-            let started_at = chrono::DateTime::parse_from_str(created, "%Y-%m-%d %H:%M:%S %z %Z")
-                .map(|dt| dt.with_timezone(&chrono::Utc))
-                .unwrap_or_else(|_| chrono::Utc::now());
-            handles.push(AgentHandle {
-                id,
-                image_tag,
-                name,
-                started_at,
-            });
-        }
-        Ok(handles)
+        query_agent_listing(&[
+            "ps",
+            "--no-trunc",
+            "--filter",
+            &format!("name={prefix}"),
+            "--format",
+            AGENT_LIST_FORMAT,
+        ])
     }
 
     fn name(&self) -> &'static str {
@@ -2096,6 +1956,164 @@ mod tests {
     }
 }
 
+#[cfg(all(test, unix))]
+mod docker_listing_tests {
+    use super::*;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    thread_local! {
+        pub(super) static CLI: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+    }
+
+    struct FakeDocker {
+        dir: tempfile::TempDir,
+    }
+
+    impl FakeDocker {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let cli = dir.path().join("docker");
+            fs::write(
+                &cli,
+                r##"#!/bin/sh
+printf '%s\n' "$@" >> "$(dirname "$0")/argv"
+mode=$(cat "$(dirname "$0")/mode")
+case "$mode" in
+  unavailable) echo "cannot connect to the docker daemon" >&2; exit 1 ;;
+  nonzero) echo "query rejected" >&2; exit 17 ;;
+  second-fails)
+    case " $* " in *" name=awman- "*) echo "legacy query failed" >&2; exit 9 ;; esac
+    printf 'first-id\tawman-current\timage:v1\tbad-time\n'
+    exit 0
+    ;;
+  empty) exit 0 ;;
+  rows)
+    case " $* " in
+      *" label=awman=true "*)
+        printf 'row-one\tawman-current\timage:v1\tbad-time\n'
+        printf 'row-one\tawman-current\timage:v1\tbad-time\n'
+        printf 'short-row\tmissing-fields\n'
+        printf '\tawman-empty-id\timage:v1\tbad-time\n'
+        printf 'row-empty-name\t\timage:v1\tbad-time\n'
+        ;;
+      *)
+        printf 'row-one\tawman-current\timage:v1\tbad-time\n'
+        printf 'legacy-id\tawman-legacy\timage:v0\tbad-time\n'
+        ;;
+    esac
+    ;;
+esac
+"##,
+            )
+            .unwrap();
+            fs::set_permissions(&cli, fs::Permissions::from_mode(0o755)).unwrap();
+            fs::write(dir.path().join("mode"), "empty").unwrap();
+            CLI.with(|slot| assert!(slot.replace(Some(cli)).is_none()));
+            Self { dir }
+        }
+
+        fn mode(&self, mode: &str) {
+            fs::write(self.dir.path().join("mode"), mode).unwrap();
+        }
+    }
+
+    impl Drop for FakeDocker {
+        fn drop(&mut self) {
+            CLI.with(|slot| slot.replace(None));
+        }
+    }
+
+    #[test]
+    fn listing_override_is_local_to_its_thread() {
+        let fake = FakeDocker::new();
+        assert_eq!(
+            listing_command().get_program(),
+            fake.dir.path().join("docker")
+        );
+        let other = std::thread::spawn(|| listing_command().get_program().to_os_string())
+            .join()
+            .unwrap();
+        assert_ne!(other, fake.dir.path().join("docker"));
+    }
+
+    #[test]
+    fn ownership_listing_handles_empty_errors_partial_failure_malformed_rows_and_dedup() {
+        let fake = FakeDocker::new();
+        let backend = DockerBackend;
+
+        fake.mode("empty");
+        assert!(backend.list_running_all().unwrap().is_empty());
+
+        fake.mode("unavailable");
+        assert!(matches!(
+            backend.list_running_all(),
+            Err(EngineError::Container(message)) if message.contains("cannot connect")
+        ));
+
+        fake.mode("nonzero");
+        assert!(matches!(
+            backend.list_running_all(),
+            Err(EngineError::Container(message)) if message.contains("query rejected")
+        ));
+
+        fake.mode("second-fails");
+        assert!(matches!(
+            backend.list_running_all(),
+            Err(EngineError::Container(message)) if message.contains("legacy query failed")
+        ));
+
+        fake.mode("rows");
+        let listed = backend.list_running_all().unwrap();
+        assert_eq!(
+            listed
+                .iter()
+                .map(|agent| agent.id.as_str())
+                .collect::<Vec<_>>(),
+            ["row-one", "legacy-id"]
+        );
+        assert_eq!(listed[1].name, "awman-legacy");
+    }
+
+    #[test]
+    fn all_listing_routes_preserve_query_filters_and_failures() {
+        let fake = FakeDocker::new();
+        let backend = DockerBackend;
+        for route in 0..3 {
+            let list = || match route {
+                0 => backend.list_running_all(),
+                1 => backend.list_stopped(),
+                _ => backend.list_running_with_name_prefix("awman-squad-task-"),
+            };
+            for mode in ["empty", "unavailable", "nonzero", "rows", "second-fails"] {
+                fake.mode(mode);
+                fs::write(fake.dir.path().join("argv"), "").unwrap();
+                let result = list();
+                match mode {
+                    "empty" => assert!(result.unwrap().is_empty()),
+                    "unavailable" | "nonzero" => assert!(result.is_err()),
+                    "second-fails" if route < 2 => assert!(result.is_err()),
+                    _ => assert!(!result.unwrap().is_empty()),
+                }
+                let argv = fs::read_to_string(fake.dir.path().join("argv")).unwrap();
+                let args: Vec<&str> = argv.lines().collect();
+                assert_eq!(args[0], "ps");
+                assert!(args.contains(&"--no-trunc"));
+                assert_eq!(args.contains(&"-a"), route == 1);
+                assert_eq!(args.contains(&"status=exited"), route == 1);
+                assert_eq!(args.contains(&"status=dead"), route == 1);
+                if route == 2 {
+                    assert!(args.contains(&"name=awman-squad-task-"));
+                } else {
+                    assert!(args.contains(&"label=awman=true"));
+                    if !matches!(mode, "unavailable" | "nonzero") {
+                        assert!(args.contains(&"name=awman-"));
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod explicit_phase_env_review_tests {
     use super::*;
@@ -2135,5 +2153,22 @@ mod explicit_phase_env_review_tests {
             assert!(!format!("{argv:?} {options:?}").contains("selected_token"));
         }
         set_daemon_overlay(DaemonEnvMap::new());
+    }
+}
+
+#[cfg(test)]
+mod timestamp_review_tests {
+    use super::*;
+
+    #[test]
+    fn malformed_creation_time_keeps_the_legacy_observation_time_fallback() {
+        let before = chrono::Utc::now();
+        let handles = parse_agent_listing(
+            b"id\tawman-agent\timage:v1\tbad-time\n",
+            &mut Default::default(),
+        );
+        let after = chrono::Utc::now();
+        assert_eq!(handles.len(), 1);
+        assert!((before..=after).contains(&handles[0].started_at));
     }
 }

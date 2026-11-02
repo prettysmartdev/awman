@@ -2,8 +2,7 @@
 //!
 //! Consolidates overlay construction and management. Layer 0 *resolves* host
 //! paths; this layer *builds* the resolved overlay specs that
-//! `ContainerOption::Overlay` accepts. Replaces `oldsrc/overlays/` and the
-//! agent-settings-passthrough bits of `oldsrc/passthrough.rs`.
+//! `ContainerOption::Overlay` accepts.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

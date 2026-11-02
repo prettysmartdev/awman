@@ -9,7 +9,9 @@
 //!   [`RetryPolicy::deadline`], with exponential backoff between them;
 //! * only *transient transport* failures are retried ([`is_retryable`]):
 //!   connection refused/reset, a disconnect or truncation mid-transfer, a
-//!   5xx from the daemon or registry. Authentication, certificate,
+//!   5xx from the daemon or registry. HTTP 408 and 429 remain final: this
+//!   fixed backoff policy does not implement server Retry-After scheduling.
+//!   Authentication, certificate,
 //!   platform, digest, format, disk-space and configuration failures are
 //!   final on the first occurrence — retrying them cannot succeed and would
 //!   only hammer a credential or hide a real mismatch;
@@ -25,7 +27,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::engine::error::EngineError;
+use crate::engine::error::{EngineError, ImageRetryClass};
 
 /// How many times, how long, and how spaced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,45 +124,115 @@ pub fn is_cancelled(err: &EngineError) -> bool {
 /// qualify; everything that reflects the request, the credentials, the
 /// content or the host is final.
 pub fn is_retryable(err: &EngineError) -> bool {
-    match err {
-        EngineError::Network(message) => !is_final_network_failure(message),
-        EngineError::Auth(_)
-        | EngineError::Config(_)
-        | EngineError::Container(_)
-        | EngineError::UnsupportedImageSource { .. }
-        | EngineError::ImageSourceBlocked { .. }
-        | EngineError::ImageSourceUnconfigured { .. }
-        | EngineError::ImageDigestMismatch { .. }
-        | EngineError::ImagePlatformMismatch { .. }
-        | EngineError::ImageArchiveRejected { .. }
-        | EngineError::InsufficientDiskSpace { .. } => false,
-        _ => false,
+    matches!(
+        err,
+        EngineError::ImageSourceFailure {
+            retry: ImageRetryClass::Transient,
+            ..
+        }
+    )
+}
+
+fn transient_io_kind(kind: std::io::ErrorKind) -> bool {
+    use std::io::ErrorKind::*;
+    matches!(
+        kind,
+        ConnectionRefused
+            | ConnectionReset
+            | ConnectionAborted
+            | NotConnected
+            | BrokenPipe
+            | TimedOut
+            | UnexpectedEof
+            | NetworkUnreachable
+            | HostUnreachable
+            | NetworkDown
+    )
+}
+
+impl ImageRetryClass {
+    pub(crate) fn failure(self, diagnostic: String) -> EngineError {
+        EngineError::ImageSourceFailure {
+            retry: self,
+            diagnostic,
+        }
+    }
+
+    pub(crate) fn status(status: reqwest::StatusCode) -> Self {
+        if status.is_server_error() {
+            Self::Transient
+        } else {
+            Self::Permanent
+        }
+    }
+
+    /// Reqwest retains rustls errors in its cause chain, sometimes inside
+    /// `io::Error`. Check those types before its broad connect/request flags:
+    /// certificate and TLS protocol refusals are also connect errors.
+    pub(crate) fn http(err: &reqwest::Error) -> Self {
+        let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(err);
+        let mut transport_io = false;
+        while let Some(error) = cause {
+            if error.is::<rustls::Error>() {
+                return Self::Permanent;
+            }
+            if let Some(io) = error.downcast_ref::<std::io::Error>() {
+                transport_io |= transient_io_kind(io.kind());
+                if let Some(inner) = io.get_ref() {
+                    cause = Some(inner);
+                    continue;
+                }
+            }
+            cause = error.source();
+        }
+        if err.is_builder() || err.is_redirect() {
+            Self::Permanent
+        } else if transport_io
+            || err.is_timeout()
+            || err.is_dns()
+            // These clients read raw bytes. Reqwest also calls a truncated
+            // HTTP body a decode error; JSON/schema decoding happens later
+            // at the source boundary and is always permanent.
+            || (!err.is_connect() && (err.is_request() || err.is_body() || err.is_decode()))
+        {
+            Self::Transient
+        } else {
+            // Unknown connection/setup refusals (including proxy auth) are
+            // final. Never infer their category from a library's wording.
+            Self::Permanent
+        }
     }
 }
 
-/// Network errors that describe a certificate or TLS identity problem are
-/// final: the peer will present the same certificate again.
-///
-/// Paths, URLs and quoted references are skipped: a random staging name
-/// such as `acq-P6TlSt` must not read as a TLS failure.
-fn is_final_network_failure(message: &str) -> bool {
-    let lower = message
-        .split_whitespace()
-        .filter(|token| !token.contains(['/', '\\']) && !token.starts_with('\''))
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_ascii_lowercase();
-    [
-        "certificate",
-        "tls",
-        "handshake",
-        "unknownissuer",
-        "invalid peer",
-        "hostname",
-        "client setup failed",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle))
+/// Preserve classified HTTP body errors and authoritative control errors
+/// through the synchronous `Read` adapter. HTTP classifies its disconnects
+/// before this boundary; an unclassified reader error is final.
+pub(crate) fn read_error(err: std::io::Error) -> EngineError {
+    let diagnostic = err.to_string();
+    if let Some(inner) = err.into_inner() {
+        if let Ok(error) = inner.downcast::<EngineError>() {
+            return *error;
+        }
+    }
+    ImageRetryClass::Permanent.failure(diagnostic)
+}
+
+/// Add source context/redaction without losing the classification or
+/// converting cancellation/deadline errors into transport failures.
+pub(crate) fn map_diagnostic(err: EngineError, map: impl FnOnce(String) -> String) -> EngineError {
+    match err {
+        EngineError::ImageSourceFailure { retry, diagnostic } => retry.failure(map(diagnostic)),
+        other => other,
+    }
+}
+
+/// Keep the acquisition API's existing error hierarchy after retry decisions
+/// are complete. Unclassified `Network` errors are never retry inputs.
+pub(crate) fn finish(err: EngineError) -> EngineError {
+    match err {
+        EngineError::ImageSourceFailure { diagnostic, .. } => EngineError::Network(diagnostic),
+        other => other,
+    }
 }
 
 /// Deadline bookkeeping for one acquisition.
@@ -319,8 +391,8 @@ fn annotate(err: EngineError, attempts: u32, max: u32) -> EngineError {
         return err;
     }
     match err {
-        EngineError::Network(message) => EngineError::Network(format!(
-            "{message} (after {attempts} of {max} attempts against the same source)"
+        EngineError::ImageSourceFailure { retry, diagnostic } => retry.failure(format!(
+            "{diagnostic} (after {attempts} of {max} attempts against the same source)"
         )),
         other => other,
     }
@@ -328,8 +400,8 @@ fn annotate(err: EngineError, attempts: u32, max: u32) -> EngineError {
 
 /// The full cause chain of a transport error (`error sending request:
 /// client error (Connect): invalid peer certificate: UnknownIssuer`), so
-/// the user sees why and [`is_retryable`] can tell a certificate failure
-/// from a dropped connection. Request URLs are never part of the chain.
+/// the user sees why. This text never participates in retry classification.
+/// Callers remove request URLs before formatting the chain.
 pub fn error_chain(err: &dyn std::error::Error) -> String {
     let mut parts = vec![err.to_string()];
     let mut source = err.source();
@@ -431,25 +503,20 @@ mod tests {
 
     #[test]
     fn only_transport_failures_are_retryable() {
-        assert!(is_retryable(&EngineError::Network(
-            "Docker Engine at unix:///x is not reachable: connection refused".into()
-        )));
-        assert!(is_retryable(&EngineError::Network(
-            "export of 'a' was truncated: 10 of 20 bytes".into()
-        )));
-        assert!(!is_retryable(&EngineError::Network(
-            "registry r: invalid peer certificate: UnknownIssuer".into()
-        )));
-        assert!(!is_retryable(&EngineError::Network(
-            "HTTP client setup failed: bad".into()
-        )));
-        // A needle inside a path or reference is not a TLS failure.
-        assert!(is_retryable(&EngineError::Network(
-            "Docker Engine at unix:///tmp/tls/docker.sock disconnected while exporting \
-             'tls-proxy:latest': transfer into /tmp/acq-P6TlSt/archive.tar failed after \
-             700 bytes: end of file before message length reached"
-                .into()
-        )));
+        for diagnostic in [
+            "connection reset",
+            "certificate tls handshake unknownissuer invalid peer hostname client setup failed",
+            "tls-proxy:latest /tmp/acq-P6TlSt/archive.tar",
+            "entirely different diagnostic",
+        ] {
+            assert!(is_retryable(
+                &ImageRetryClass::Transient.failure(diagnostic.into())
+            ));
+            assert!(!is_retryable(
+                &ImageRetryClass::Permanent.failure(diagnostic.into())
+            ));
+            assert!(!is_retryable(&EngineError::Network(diagnostic.into())));
+        }
         assert!(!is_retryable(&EngineError::Auth("denied".into())));
         assert!(!is_retryable(&EngineError::Config("bad".into())));
         assert!(!is_retryable(&EngineError::Container("not found".into())));
@@ -476,6 +543,83 @@ mod tests {
     }
 
     #[test]
+    fn diagnostic_changes_and_redaction_do_not_change_attempt_counts() {
+        for class in [ImageRetryClass::Transient, ImageRetryClass::Permanent] {
+            for diagnostic in [
+                "disconnected",
+                "tls certificate handshake",
+                "tls-agent:latest",
+            ] {
+                let mut attempts = 0;
+                let err = run_bounded(
+                    RetryPolicy {
+                        initial_backoff: Duration::ZERO,
+                        ..RetryPolicy::DEFAULT
+                    },
+                    Deadline::start(Duration::from_secs(60)),
+                    &CancelToken::new(),
+                    &|_| {},
+                    |_| {
+                        attempts += 1;
+                        Err::<(), _>(map_diagnostic(class.failure(diagnostic.into()), |text| {
+                            redact(&text, &["tls-agent"])
+                        }))
+                    },
+                )
+                .unwrap_err();
+                assert_eq!(
+                    attempts,
+                    if class == ImageRetryClass::Transient {
+                        3
+                    } else {
+                        1
+                    }
+                );
+                assert_eq!(is_retryable(&err), class == ImageRetryClass::Transient);
+                assert!(!err.to_string().contains("tls-agent"));
+            }
+        }
+    }
+
+    #[test]
+    fn cancellation_and_deadlines_outrank_both_source_classes() {
+        for class in [ImageRetryClass::Transient, ImageRetryClass::Permanent] {
+            let cancel = CancelToken::new();
+            let mut calls = 0;
+            let err = run_bounded(
+                RetryPolicy::DEFAULT,
+                Deadline::start(Duration::from_secs(60)),
+                &cancel,
+                &|_| {},
+                |_| {
+                    calls += 1;
+                    cancel.cancel();
+                    Err::<(), _>(class.failure("source failure".into()))
+                },
+            )
+            .unwrap_err();
+            assert_eq!(calls, 1);
+            assert!(is_cancelled(&err));
+
+            let mut calls = 0;
+            let err = run_bounded(
+                RetryPolicy::DEFAULT,
+                Deadline::start(Duration::from_millis(1)),
+                &CancelToken::new(),
+                &|_| {},
+                |_| {
+                    calls += 1;
+                    std::thread::sleep(Duration::from_millis(10));
+                    Err::<(), _>(class.failure("source failure".into()))
+                },
+            )
+            .unwrap_err();
+            assert!(calls <= 1);
+            assert!(matches!(err, EngineError::Network(ref text) if text.contains("deadline")));
+        }
+    }
+
+    #[test]
     fn run_bounded_retries_transport_failures_up_to_the_cap() {
         let calls = Mutex::new(Vec::new());
         let sleeps = Mutex::new(Vec::new());
@@ -491,7 +635,7 @@ mod tests {
             &sleep,
             |n| {
                 calls.lock().unwrap().push(n);
-                Err::<(), _>(EngineError::Network("connection reset".into()))
+                Err::<(), _>(ImageRetryClass::Transient.failure("connection reset".into()))
             },
         )
         .unwrap_err();
@@ -533,7 +677,7 @@ mod tests {
             |n| {
                 *calls.lock().unwrap() += 1;
                 if n < 2 {
-                    Err(EngineError::Network("disconnected".into()))
+                    Err(ImageRetryClass::Transient.failure("disconnected".into()))
                 } else {
                     Ok(n)
                 }
@@ -566,7 +710,7 @@ mod tests {
             &|_| token.cancel(),
             |_| {
                 *calls.lock().unwrap() += 1;
-                Err::<(), _>(EngineError::Network("reset".into()))
+                Err::<(), _>(ImageRetryClass::Transient.failure("reset".into()))
             },
         )
         .unwrap_err();
@@ -591,7 +735,7 @@ mod tests {
             Deadline::start(Duration::from_secs(10)),
             &token,
             &std::thread::sleep,
-            |_| Err::<(), _>(EngineError::Network("disconnected".into())),
+            |_| Err::<(), _>(ImageRetryClass::Transient.failure("disconnected".into())),
         )
         .unwrap_err();
         assert!(is_cancelled(&error));
@@ -613,12 +757,12 @@ mod tests {
             &*no_sleep(),
             |_| {
                 *calls.lock().unwrap() += 1;
-                Err::<(), _>(EngineError::Network("reset".into()))
+                Err::<(), _>(ImageRetryClass::Transient.failure("reset".into()))
             },
         )
         .unwrap_err();
         assert_eq!(*calls.lock().unwrap(), 1, "a 10s backoff does not fit 5s");
-        assert!(matches!(err, EngineError::Network(_)));
+        assert!(matches!(err, EngineError::ImageSourceFailure { .. }));
         let expired = Deadline::start(Duration::ZERO);
         assert!(expired.expired());
         assert_eq!(expired.request_timeout(None), Duration::from_millis(1));
@@ -633,5 +777,46 @@ mod tests {
             "proxy http://user:[redacted]@proxy:3128 refused; token [redacted]"
         );
         assert_eq!(redact("nothing", &[]), "nothing");
+    }
+}
+
+#[cfg(test)]
+mod behavior_review_tests {
+    use super::*;
+
+    #[test]
+    fn unreachable_network_kinds_retry_to_the_attempt_cap() {
+        for kind in [
+            std::io::ErrorKind::NetworkUnreachable,
+            std::io::ErrorKind::HostUnreachable,
+            std::io::ErrorKind::NetworkDown,
+        ] {
+            assert!(transient_io_kind(kind));
+            let mut calls = 0;
+            let err = run_bounded(
+                RetryPolicy::DEFAULT,
+                Deadline::start(Duration::from_secs(60)),
+                &CancelToken::new(),
+                &|_| {},
+                |_| {
+                    calls += 1;
+                    Err::<(), _>(ImageRetryClass::Transient.failure(format!("{kind:?}")))
+                },
+            )
+            .unwrap_err();
+            assert_eq!(calls, 3);
+            assert!(is_retryable(&err));
+        }
+        assert!(!transient_io_kind(std::io::ErrorKind::PermissionDenied));
+    }
+
+    #[test]
+    fn request_timeout_and_rate_limit_statuses_remain_final() {
+        for status in [
+            reqwest::StatusCode::REQUEST_TIMEOUT,
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+        ] {
+            assert_eq!(ImageRetryClass::status(status), ImageRetryClass::Permanent);
+        }
     }
 }

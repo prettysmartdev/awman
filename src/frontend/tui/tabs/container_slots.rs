@@ -52,7 +52,7 @@ impl Tab {
     /// the old slot before adding the new one — keeping the net slot count
     /// correct.
     pub fn drain_container_slot_events(&mut self) {
-        let events: Vec<ContainerSlotEvent> = match self.shared.container_slot_events.lock() {
+        let events: Vec<ContainerSlotEvent> = match self.shared.container.events.lock() {
             Ok(mut q) => q.drain(..).collect(),
             Err(_) => return,
         };
@@ -63,6 +63,101 @@ impl Tab {
 
     fn apply_container_slot_event(&mut self, event: ContainerSlotEvent) {
         match event {
+            ContainerSlotEvent::SequentialLaunched {
+                launch_id,
+                title,
+                io,
+            } => {
+                let scrollback = self.session.effective_config().scrollback_lines();
+                // The backbone can be dormant while a parallel group is visible.
+                let target = if self.dormant_slots.is_empty() {
+                    self.container_slots.first_mut()
+                } else {
+                    self.dormant_slots.first_mut()
+                };
+                if let Some(slot) = target {
+                    let (rows, cols) = slot.vt100_parser.screen().size();
+                    let agent = slot
+                        .container_info
+                        .as_ref()
+                        .map(|info| info.agent_display_name.clone())
+                        .unwrap_or_default();
+                    let sandboxed = slot
+                        .container_info
+                        .as_ref()
+                        .is_some_and(|info| info.sandboxed);
+                    *slot = ContainerSlot::new(String::new(), agent, scrollback);
+                    slot.launch_id = launch_id;
+                    slot.vt100_parser.screen_mut().set_size(rows, cols);
+                    let _ = io.resize_tx.send((cols, rows));
+                    slot.bind_io(io);
+                    if let Some(info) = slot.container_info.as_mut() {
+                        info.phase_step_title = title;
+                        info.sandboxed = sandboxed;
+                    }
+                }
+                if self.dormant_slots.is_empty() {
+                    self.focused_slot_idx = 0;
+                    self.container_scroll_offset = 0;
+                    self.container_rendered = false;
+                    self.mouse_selection = None;
+                    self.last_container_summary = None;
+                    self.suppress_container_auto_open = false;
+                    self.stuck = false;
+                }
+            }
+            ContainerSlotEvent::SequentialRunning {
+                launch_id,
+                container_name,
+            } => {
+                if let Some(slot) = self.backbone_mut(launch_id) {
+                    slot.set_runtime_name(container_name);
+                }
+            }
+            ContainerSlotEvent::SequentialExited {
+                launch_id,
+                exit_code,
+            } => {
+                if self.dormant_slots.is_empty()
+                    && self
+                        .container_slots
+                        .first()
+                        .is_some_and(|slot| slot.launch_id == launch_id)
+                {
+                    self.drain_slot_bytes();
+                    self.close_container_overlay(exit_code);
+                    self.suppress_container_auto_open = true;
+                }
+            }
+            ContainerSlotEvent::EngineAttached {
+                launch_id,
+                requests,
+                stuck,
+            } => {
+                let current = self.backbone_mut(launch_id).is_some();
+                if current {
+                    if let Some(requests) = requests {
+                        self.engine_tx = Some(requests);
+                    }
+                }
+                if let Some(slot) = self.backbone_mut(launch_id) {
+                    if stuck.is_some() {
+                        slot.stuck_rx = stuck;
+                    }
+                }
+            }
+            ContainerSlotEvent::AttachedExited {
+                container_name,
+                step_name,
+            } => {
+                if self
+                    .slot_mut(&step_name)
+                    .and_then(|slot| slot.container_info.as_ref())
+                    .is_some_and(|info| info.container_name == container_name)
+                {
+                    self.evict_slot(&step_name);
+                }
+            }
             ContainerSlotEvent::GroupStarted => {
                 // Stash the sequential backbone slot(s) for the duration of
                 // the group. Their stdout receivers must stay alive: later
@@ -92,9 +187,7 @@ impl Tab {
                 let scrollback = self.session.effective_config().scrollback_lines();
                 let mut slot = ContainerSlot::new(step_name, agent, scrollback);
                 if let Some(io) = io {
-                    slot.container_stdout_rx = Some(io.stdout_rx);
-                    slot.container_stdin_tx = Some(io.stdin_tx);
-                    slot.container_resize_tx = Some(io.resize_tx);
+                    slot.bind_io(io);
                 }
                 // Size the fresh 80x24 parser to the real overlay dimensions
                 // immediately and push the size to the container's PTY, so
@@ -127,16 +220,10 @@ impl Tab {
                 step_name,
                 container_name,
             } => {
-                if let Some(info) = self
-                    .slot_mut(&step_name)
-                    .and_then(|s| s.container_info.as_mut())
-                {
-                    info.container_name = container_name;
-                    info.latest_stats = None;
+                if let Some(slot) = self.slot_mut(&step_name) {
+                    slot.set_runtime_name(container_name);
+                    self.suppress_container_auto_open = false;
                 }
-                // A fresh container is running — same as the sequential
-                // name pickup in `App::refresh_tabs_from_sessions`.
-                self.suppress_container_auto_open = false;
             }
             ContainerSlotEvent::Exited { step_name } => self.evict_slot(&step_name),
             ContainerSlotEvent::Stuck { step_name } => {
@@ -196,27 +283,9 @@ impl Tab {
     /// arrive so the user sees the PTY output immediately without having to
     /// manually cycle with Ctrl+M.
     ///
-    /// Between sequential workflow steps the engine sets `pty_reset_flag`,
-    /// which reinitializes the focused slot's parser (clearing the previous
-    /// step's terminal content) before the new step's output is processed.
+    /// Lifecycle events install fresh sequential parsers and I/O before this
+    /// drain, so one launch cannot feed bytes into another launch's parser.
     pub fn drain_container_output(&mut self) {
-        if self.shared.pty_reset_flag.swap(false, Ordering::Relaxed) {
-            let scrollback = self.session.effective_config().scrollback_lines();
-            let focused_idx = self.focused_slot_idx;
-            if let Some(slot) = self.container_slots.get_mut(focused_idx) {
-                let (rows, cols) = slot.vt100_parser.screen().size();
-                slot.vt100_parser = vt100::Parser::new(rows, cols, scrollback);
-                slot.agent_alt_screen = false;
-                slot.agent_alternate_scroll = false;
-                slot.region_scroll.reset();
-            }
-            self.container_scroll_offset = 0;
-            self.container_rendered = false;
-            self.mouse_selection = None;
-            // A new step's container is launching — allow auto-open again.
-            self.suppress_container_auto_open = false;
-        }
-
         let received_any = self.drain_slot_bytes();
         if received_any
             && !self.suppress_container_auto_open
@@ -227,8 +296,8 @@ impl Tab {
     }
 
     /// Feed every slot's pending PTY bytes into its parser. Touches neither
-    /// `pty_reset_flag` nor the window state, so the exit path can flush a
-    /// dead container's tail without consuming the next step's reset.
+    /// lifecycle events nor window state, so the exit path can flush a dead
+    /// container's tail before the next launch replaces its channels.
     pub(super) fn drain_slot_bytes(&mut self) -> bool {
         let mut received_any = false;
         for slot in &mut self.container_slots {
@@ -255,6 +324,15 @@ impl Tab {
         self.container_slots
             .iter_mut()
             .find(|s| s.step_name == step_name)
+    }
+
+    fn backbone_mut(&mut self, launch_id: uuid::Uuid) -> Option<&mut ContainerSlot> {
+        let slots = if self.dormant_slots.is_empty() {
+            &mut self.container_slots
+        } else {
+            &mut self.dormant_slots
+        };
+        slots.first_mut().filter(|slot| slot.launch_id == launch_id)
     }
 
     /// Remove the slot for `step_name` with NO grey summary bar (WI-0096 §12)
@@ -327,9 +405,8 @@ impl Tab {
         let scrollback = self.session.effective_config().scrollback_lines();
         let mut slot = ContainerSlot::new(String::new(), agent_display_name, scrollback);
         slot.vt100_parser.screen_mut().set_size(rows, cols);
-        if let Some(info) = slot.container_info.as_mut() {
-            info.container_name = container_name;
-        }
+        slot.launch_id = self.shared.container.launch_id();
+        slot.set_runtime_name(container_name);
         self.container_slots.clear();
         self.dormant_slots.clear();
         self.focused_slot_idx = 0;
@@ -344,6 +421,8 @@ impl Tab {
         self.dormant_slots.clear();
         self.focused_slot_idx = 0;
         self.command_result_rx = None;
+        self.shared.container = ContainerLifecycle::default();
+        self.engine_tx = None;
     }
 
     /// Tear down an attach session's view of a tab (WI 0110), leaving every
@@ -363,15 +442,8 @@ impl Tab {
         self.container_window_state = ContainerWindowState::Hidden;
         self.suppress_container_auto_open = true;
         self.execution_phase = ExecutionPhase::Idle;
-        if let Ok(mut events) = self.shared.container_slot_events.lock() {
-            events.clear();
-        }
-        if let Ok(mut view) = self.shared.workflow_state.lock() {
-            *view = None;
-        }
-        if let Ok(mut invocation_id) = self.shared.workflow_invocation_id.lock() {
-            *invocation_id = None;
-        }
+        self.shared.detach();
+        self.engine_tx = None;
         self.last_workflow_invocation_id = None;
     }
 }

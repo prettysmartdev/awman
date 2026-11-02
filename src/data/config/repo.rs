@@ -1,8 +1,7 @@
 //! Per-repository configuration: `<git_root>/.awman/config.json`.
 //!
-//! Schema parity with the legacy `RepoConfig` (`oldsrc/config/mod.rs`) is
-//! preserved for forward and backward compatibility — users upgrading from a
-//! prior release must continue to read their existing files.
+//! The stored schema remains compatible with files written by prior releases
+//! so users can continue to read their existing configuration.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -261,11 +260,7 @@ impl DynamicWorkflowsConfig {
     /// layer.
     pub fn validate(&self, field_path: &str) -> Result<(), DataError> {
         if let Some(n) = self.max_concurrent_steps {
-            if n < 1 {
-                return Err(DataError::Other(format!(
-                    "{field_path}.maxConcurrentSteps must be >= 1"
-                )));
-            }
+            validate_dynamic_max_concurrent_steps(field_path, n)?;
         }
         if let Some(leader) = &self.default_leader {
             validate_leader_spec(field_path, leader)?;
@@ -298,6 +293,19 @@ impl DynamicWorkflowsConfig {
             && self.agents_to_models.as_ref().is_none_or(HashMap::is_empty)
             && self.guidance.as_ref().is_none_or(Vec::is_empty)
     }
+}
+
+/// Shared domain constraint for the dynamic-workflow concurrency limit.
+pub(crate) fn validate_dynamic_max_concurrent_steps(
+    field_path: &str,
+    value: usize,
+) -> Result<(), DataError> {
+    if value < 1 {
+        return Err(DataError::Other(format!(
+            "{field_path}.maxConcurrentSteps must be >= 1"
+        )));
+    }
+    Ok(())
 }
 
 /// Which key a repo's dynamic-workflow block was read from.

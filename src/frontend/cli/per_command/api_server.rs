@@ -35,7 +35,7 @@ impl ApiServerCommandFrontend for CliFrontend {
 /// function is the CLI's way of saying it. Byte-identical to what the command
 /// layer used to emit.
 fn render_api_key_banner(key: &str) -> String {
-    // Inner width chosen to fit the title verbatim; matches oldsrc.
+    // Inner width chosen to fit the current banner title verbatim.
     let inner_width: usize = 67;
     let key_line = format!("  {key}  ");
     let key_padded = format!("{:<width$}", key_line, width = inner_width);

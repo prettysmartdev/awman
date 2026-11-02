@@ -16,7 +16,7 @@ use crate::command::commands::squad::supervisor::SquadKeySetup;
 use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
 use crate::data::config::env::Env;
-use crate::data::fs::{DataPaths, SquadPaths};
+use crate::data::fs::SquadPaths;
 use crate::data::message::{MessageLevel, UserMessage};
 use crate::engine::daemon::{AcquireError, DaemonGuard, DaemonKind, DaemonSupervisor, Termination};
 
@@ -205,8 +205,7 @@ async fn run_start(
                 command: "squad start".into(),
                 frontend: "this".into(),
             })?;
-    let data_paths = DataPaths::from_env(&Env::from_process())?;
-    let daemon_engines = Engines::for_daemon(DaemonKind::Squad, &data_paths)?;
+    let daemon_engines = Engines::for_daemon(DaemonKind::Squad)?;
     let bootstrap = SquadDaemonHandles::bootstrap_with_frontends(
         SquadServeConfig {
             port: flags.port,
@@ -376,6 +375,7 @@ async fn run_status(process: &DaemonSupervisor) -> Result<SquadOutcome, CommandE
         active_count: 0,
         last_tick: None,
         in_flight: 0,
+        config_error: None,
         // Read from the process sidecar, not from a daemon: there is nobody to
         // ask about persistence or coverage here, and reporting a guess would
         // be worse than reporting nothing.

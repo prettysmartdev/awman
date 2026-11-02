@@ -4,7 +4,7 @@
 //! daemon (the squad daemon, WI 0101 Part 4) can bind, serve, and shut down over
 //! the exact same code path instead of duplicating it. Nothing here is
 //! API-specific: `serve_router` takes a fully-formed [`Router`] and
-//! `check_bearer_auth` takes the [`AuthMode`] its caller's engine resolved, so
+//! `check_bearer_auth` takes the [`AuthMode`] its caller resolved, so
 //! both daemons drive them with their own state.
 
 use std::net::SocketAddr;
@@ -14,8 +14,9 @@ use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use axum::Router;
 
+use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
-use crate::engine::auth::{AuthEngine, AuthMode, AuthOutcome, TlsMaterial};
+use crate::engine::auth::{AuthMode, AuthOutcome, TlsMaterial};
 use crate::frontend::api::error::ApiError;
 
 /// Extract the bearer token from `headers` and turn Layer 1's verdict into
@@ -29,7 +30,7 @@ use crate::frontend::api::error::ApiError;
 /// request with no header is still hashed and compared, so the reply's shape
 /// tells an attacker nothing its timing does not (WI 0114 F-14).
 pub fn check_bearer_auth(
-    auth: &AuthEngine,
+    engines: &Engines,
     mode: &AuthMode,
     headers: &HeaderMap,
 ) -> Option<Response> {
@@ -37,7 +38,7 @@ pub fn check_bearer_auth(
         .get("authorization")
         .and_then(|value| value.to_str().ok())
         .filter(|value| !value.is_empty());
-    match auth.verify_bearer(mode, header) {
+    match engines.verify_bearer(mode, header) {
         AuthOutcome::Authorized | AuthOutcome::Disabled => None,
         AuthOutcome::Unauthorized if header.is_none() => Some(
             ApiError::unauthorized(
@@ -257,5 +258,57 @@ mod tls_tests {
         assert!(untrusted.get(&url).send().await.unwrap_err().is_connect());
         task.abort();
         let _ = task.await;
+    }
+}
+
+#[cfg(test)]
+mod auth_tests {
+    use super::*;
+    use crate::engine::auth::ApiKey;
+    use axum::http::{HeaderValue, StatusCode};
+
+    async fn rejection_message(rejection: Option<Response>) -> String {
+        let response = rejection.expect("request must be refused");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8(body.to_vec()).unwrap()
+    }
+
+    fn with_header(value: &'static str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", HeaderValue::from_static(value));
+        headers
+    }
+
+    /// Both daemons pass through this one check: its verdicts and its two 401
+    /// bodies are their wire behavior.
+    #[tokio::test]
+    async fn bearer_check_keeps_its_verdicts_through_the_engines_bundle() {
+        let root = tempfile::tempdir().unwrap();
+        let engines = Engines::for_tests(root.path());
+        let mode = AuthMode::Enabled {
+            key_hash: engines
+                .auth_engine
+                .hash_api_key(&ApiKey::from_string("s3cret"))
+                .as_str()
+                .to_string(),
+        };
+
+        assert!(check_bearer_auth(&engines, &mode, &with_header("Bearer s3cret")).is_none());
+        assert!(check_bearer_auth(&engines, &AuthMode::Disabled, &HeaderMap::new()).is_none());
+
+        let missing = rejection_message(check_bearer_auth(&engines, &mode, &HeaderMap::new()));
+        assert!(missing.await.contains("API key required"));
+        // An empty header counts as no header.
+        let empty = rejection_message(check_bearer_auth(&engines, &mode, &with_header("")));
+        assert!(empty.await.contains("API key required"));
+        let wrong = rejection_message(check_bearer_auth(
+            &engines,
+            &mode,
+            &with_header("Bearer wrong"),
+        ));
+        assert!(wrong.await.contains("Invalid API key."));
     }
 }

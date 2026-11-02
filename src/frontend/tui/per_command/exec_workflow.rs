@@ -11,9 +11,8 @@ use crate::frontend::tui::dialogs::{DialogRequest, DialogResponse};
 
 impl ExecWorkflowCommandFrontend for TuiCommandFrontend {
     fn report_workflow_context_path(&mut self, host_path: &std::path::Path) {
-        if let Ok(mut path) = self.workflow_context_path.lock() {
-            *path = Some(host_path.to_path_buf());
-        }
+        self.workflow
+            .set_context_path(Some(host_path.to_path_buf()));
     }
 
     /// Same slot preparation a sequential agent step gets in
@@ -21,15 +20,7 @@ impl ExecWorkflowCommandFrontend for TuiCommandFrontend {
     /// the previous container's screen is cleared, and no stale container name.
     /// The window is titled with the step, not the agent.
     fn report_phase_step_interactive_launch(&mut self, kind: PhaseKind, description: &str) {
-        self.pty_reset_flag
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        self.recreate_container_io();
-        if let Ok(mut name) = self.container_name_shared.lock() {
-            *name = None;
-        }
-        if let Ok(mut title) = self.container_title_shared.lock() {
-            *title = Some(format!("[{}] {description}", kind.label()));
-        }
+        self.launch_sequential_container(Some(format!("[{}] {description}", kind.label())));
         self.messages.info(format!(
             "Launching {} step in new container...",
             kind.label()
@@ -37,9 +28,7 @@ impl ExecWorkflowCommandFrontend for TuiCommandFrontend {
     }
 
     fn report_workflow_summary(&mut self, summary: &WorkflowSummary) {
-        if let Ok(mut path) = self.workflow_context_path.lock() {
-            *path = None;
-        }
+        self.workflow.set_context_path(None);
         self.messages.info(format!(
             "Workflow: {} completed, {} failed",
             summary.steps_completed, summary.steps_failed

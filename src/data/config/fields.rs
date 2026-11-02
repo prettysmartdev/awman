@@ -46,6 +46,8 @@ pub struct ConfigFieldSpec {
     pub name: &'static str,
     pub scope: FieldScope,
     pub kind: ConfigFieldKind,
+    /// Scalar editor input is a comma-separated string array.
+    pub comma_list: bool,
     /// Computed by awman itself and not settable by the user. Surfaced with
     /// `(read-only)` in the table.
     pub read_only: bool,
@@ -178,11 +180,9 @@ pub const CONFIG_FIELDS: &[ConfigFieldSpec] = &[
         ConfigFieldKind::Enum,
         Some("ask | allow | deny"),
     ),
-    f(
+    list(
         "workflows.prerequisites.githubToken.envVars",
         FieldScope::Both,
-        ConfigFieldKind::String,
-        LIST_HINT,
     ),
     f(
         "workflows.prerequisites.githubToken.verify",
@@ -190,11 +190,9 @@ pub const CONFIG_FIELDS: &[ConfigFieldSpec] = &[
         ConfigFieldKind::Bool,
         None,
     ),
-    f(
+    object(
         "workflows.prerequisites.githubToken.acquire",
         FieldScope::GlobalOnly,
-        ConfigFieldKind::String,
-        Some(r#"JSON object: {"argv":[...],"timeoutSecs":30,"refresh":"start"}"#),
     ),
     f(
         "workflows.prerequisites.allowApiClientGrants",
@@ -202,11 +200,17 @@ pub const CONFIG_FIELDS: &[ConfigFieldSpec] = &[
         ConfigFieldKind::Bool,
         None,
     ),
-    f("agent", FieldScope::Both, ConfigFieldKind::Enum, AGENT_HINT),
+    f(
+        "agent",
+        FieldScope::RepoOnly,
+        ConfigFieldKind::Enum,
+        AGENT_HINT,
+    ),
     ConfigFieldSpec {
         name: "auto_agent_auth_accepted",
         scope: FieldScope::GlobalOnly,
         kind: ConfigFieldKind::Bool,
+        comma_list: false,
         read_only: true,
         sensitive: false,
         aliases: &[],
@@ -217,31 +221,16 @@ pub const CONFIG_FIELDS: &[ConfigFieldSpec] = &[
         "terminal_scrollback_lines",
         FieldScope::Both,
         ConfigFieldKind::Number,
-        Some("positive integer"),
+        Some("non-negative integer"),
     ),
-    f(
-        "yoloDisallowedTools",
-        FieldScope::Both,
-        ConfigFieldKind::String,
-        LIST_HINT,
-    ),
-    f(
-        "workItems",
-        FieldScope::RepoOnly,
-        ConfigFieldKind::String,
-        None,
-    ),
-    f(
-        "overlays",
-        FieldScope::Both,
-        ConfigFieldKind::String,
-        LIST_HINT,
-    ),
+    list("yoloDisallowedTools", FieldScope::Both),
+    object("workItems", FieldScope::RepoOnly),
+    list("overlays", FieldScope::Both),
     f(
         "agentStuckTimeout",
         FieldScope::Both,
         ConfigFieldKind::Number,
-        Some("positive integer"),
+        Some("non-negative integer (seconds)"),
     ),
     f(
         "maxConcurrentAgents",
@@ -252,8 +241,8 @@ pub const CONFIG_FIELDS: &[ConfigFieldSpec] = &[
     f(
         "runtime",
         FieldScope::GlobalOnly,
-        ConfigFieldKind::String,
-        None,
+        ConfigFieldKind::Enum,
+        Some("docker | apple-container | builtin-experimental"),
     ),
     f(
         "builtin.stateDir",
@@ -295,6 +284,7 @@ pub const CONFIG_FIELDS: &[ConfigFieldSpec] = &[
         name: "builtin.imageSource",
         scope: FieldScope::Both,
         kind: ConfigFieldKind::String,
+        comma_list: false,
         read_only: true,
         sensitive: false,
         aliases: &[],
@@ -305,6 +295,7 @@ pub const CONFIG_FIELDS: &[ConfigFieldSpec] = &[
         name: "builtin.images",
         scope: FieldScope::Both,
         kind: ConfigFieldKind::String,
+        comma_list: false,
         read_only: true,
         sensitive: false,
         aliases: &[],
@@ -315,6 +306,7 @@ pub const CONFIG_FIELDS: &[ConfigFieldSpec] = &[
         name: "builtin.registries",
         scope: FieldScope::Both,
         kind: ConfigFieldKind::String,
+        comma_list: false,
         read_only: true,
         sensitive: false,
         aliases: &[],
@@ -325,6 +317,7 @@ pub const CONFIG_FIELDS: &[ConfigFieldSpec] = &[
         name: "builtin.network",
         scope: FieldScope::Both,
         kind: ConfigFieldKind::String,
+        comma_list: false,
         read_only: true,
         sensitive: false,
         aliases: &[],
@@ -337,8 +330,8 @@ pub const CONFIG_FIELDS: &[ConfigFieldSpec] = &[
         ConfigFieldKind::Enum,
         AGENT_HINT,
     ),
-    f("api", FieldScope::GlobalOnly, ConfigFieldKind::String, None),
-    f("remote", FieldScope::Both, ConfigFieldKind::String, None),
+    object("api", FieldScope::GlobalOnly),
+    object("remote", FieldScope::GlobalOnly),
     // Dot-notation nested fields
     f(
         "work_items.dir",
@@ -352,40 +345,19 @@ pub const CONFIG_FIELDS: &[ConfigFieldSpec] = &[
         ConfigFieldKind::String,
         None,
     ),
-    f(
-        "api.workDirs",
-        FieldScope::GlobalOnly,
-        ConfigFieldKind::String,
-        LIST_HINT,
-    ),
-    f(
-        "api.workDirRoots",
-        FieldScope::GlobalOnly,
-        ConfigFieldKind::String,
-        LIST_HINT,
-    ),
-    f(
-        "api.port",
-        FieldScope::GlobalOnly,
-        ConfigFieldKind::Number,
-        Some("positive integer"),
-    ),
-    f(
-        "api.background",
-        FieldScope::GlobalOnly,
-        ConfigFieldKind::Bool,
-        Some("true or false"),
-    ),
+    list("api.workDirs", FieldScope::GlobalOnly),
+    list("api.workDirRoots", FieldScope::GlobalOnly),
     f(
         "remote.defaultAddr",
-        FieldScope::Both,
+        FieldScope::GlobalOnly,
         ConfigFieldKind::String,
         None,
     ),
     ConfigFieldSpec {
         name: "remote.defaultAPIKey",
-        scope: FieldScope::Both,
+        scope: FieldScope::GlobalOnly,
         kind: ConfigFieldKind::String,
+        comma_list: false,
         read_only: false,
         sensitive: true,
         aliases: &[],
@@ -439,6 +411,7 @@ pub const CONFIG_FIELDS: &[ConfigFieldSpec] = &[
         name: "workflows.dynamic.agentsToModels",
         scope: FieldScope::Both,
         kind: ConfigFieldKind::String,
+        comma_list: false,
         // The map's own row is a header; the per-agent rows beneath it are
         // editable.
         read_only: true,
@@ -456,6 +429,7 @@ pub const CONFIG_FIELDS: &[ConfigFieldSpec] = &[
         name: "workflows.dynamic.guidance",
         scope: FieldScope::Both,
         kind: ConfigFieldKind::String,
+        comma_list: false,
         read_only: true,
         sensitive: false,
         aliases: &[FieldAlias {
@@ -488,12 +462,30 @@ const fn f(
         name,
         scope,
         kind,
+        comma_list: false,
         read_only: false,
         sensitive: false,
         aliases: &[],
         shape: ConfigRowShape::Scalar,
         hint,
     }
+}
+
+const fn list(name: &'static str, scope: FieldScope) -> ConfigFieldSpec {
+    let mut spec = f(name, scope, ConfigFieldKind::String, LIST_HINT);
+    spec.comma_list = true;
+    spec
+}
+
+const fn object(name: &'static str, scope: FieldScope) -> ConfigFieldSpec {
+    let mut spec = f(
+        name,
+        scope,
+        ConfigFieldKind::String,
+        Some("edit this object in config JSON"),
+    );
+    spec.read_only = true;
+    spec
 }
 
 /// The spec for `name`, if it is a known field.

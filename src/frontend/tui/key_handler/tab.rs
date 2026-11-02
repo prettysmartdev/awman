@@ -73,13 +73,7 @@ pub(super) fn handle(app: &mut App, action: Action) {
             // workflow-cancel confirmation over the close-tab one — old amux
             // semantics. The user can still escape and Ctrl+C again to close
             // the tab if they really mean it.
-            let workflow_active = app
-                .active_tab()
-                .shared
-                .workflow_state
-                .lock()
-                .map(|g| g.is_some())
-                .unwrap_or(false);
+            let workflow_active = app.active_tab().shared.workflow.snapshot().view.is_some();
             if workflow_active
                 && matches!(
                     app.active_tab().execution_phase,

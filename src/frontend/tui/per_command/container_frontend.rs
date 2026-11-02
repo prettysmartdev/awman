@@ -19,8 +19,8 @@ use crate::frontend::tui::user_message::{SharedStatusLog, StatusLogEntry};
 impl AgentFrontend for TuiCommandFrontend {
     fn report_status(&mut self, status: AgentStatus) {
         if let AgentStatus::Running { ref container_name } = status {
-            if let Ok(mut name) = self.container_name_shared.lock() {
-                *name = Some(container_name.clone());
+            if !self.parallel_group_active {
+                self.container.running(container_name.clone());
             }
         }
         self.messages.info(format!("Container: {status:?}"));
@@ -60,7 +60,7 @@ impl AgentFrontend for TuiCommandFrontend {
 pub struct TuiContainerProxy {
     log: SharedStatusLog,
     container_io: Option<crate::engine::agent_runtime::frontend::AgentIo>,
-    container_name_shared: Option<crate::frontend::tui::tabs::SharedContainerName>,
+    container: Option<crate::frontend::tui::tabs::ContainerLifecycle>,
 }
 
 impl TuiContainerProxy {
@@ -122,7 +122,7 @@ impl TuiContainerProxy {
         Self {
             log,
             container_io: Some(io),
-            container_name_shared: None,
+            container: None,
         }
     }
 
@@ -132,12 +132,12 @@ impl TuiContainerProxy {
     pub fn with_io(
         log: SharedStatusLog,
         io: crate::engine::agent_runtime::frontend::AgentIo,
-        container_name_shared: crate::frontend::tui::tabs::SharedContainerName,
+        container: Option<crate::frontend::tui::tabs::ContainerLifecycle>,
     ) -> Self {
         Self {
             log,
             container_io: Some(io),
-            container_name_shared: Some(container_name_shared),
+            container,
         }
     }
 }
@@ -159,10 +159,8 @@ impl UserMessageSink for TuiContainerProxy {
 impl AgentFrontend for TuiContainerProxy {
     fn report_status(&mut self, status: AgentStatus) {
         if let AgentStatus::Running { ref container_name } = status {
-            if let Some(ref shared) = self.container_name_shared {
-                if let Ok(mut name) = shared.lock() {
-                    *name = Some(container_name.clone());
-                }
+            if let Some(ref shared) = self.container {
+                shared.running(container_name.clone());
             }
         }
     }

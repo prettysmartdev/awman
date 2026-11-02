@@ -118,7 +118,7 @@ impl AgentRuntimeEngine for SandboxRuntime {
         match options {
             ResolvedAgentOptions::Sandbox(opts) => {
                 opts.validate_tool_restrictions()?;
-                Ok(Box::new(SandboxAgentInstance { options: opts }))
+                Ok(Box::new(SandboxAgentInstance { options: *opts }))
             }
             other => Err(EngineError::OptionVariantMismatch {
                 runtime: self.runtime_name().to_string(),
@@ -594,7 +594,9 @@ mod tests {
             Ok(rt) => rt,
             Err(_) => return, // unsupported platform — platform guard test covers this
         };
-        let opts = ResolvedAgentOptions::Container(ResolvedContainerOptions::resolve([]).unwrap());
+        let opts = ResolvedAgentOptions::Container(Box::new(
+            ResolvedContainerOptions::resolve([]).unwrap(),
+        ));
         match <SandboxRuntime as AgentRuntimeEngine>::build(&rt, opts) {
             Err(EngineError::OptionVariantMismatch { runtime, got }) => {
                 assert_eq!(runtime, "docker-sbx-experimental");

@@ -380,6 +380,7 @@ impl BuiltinBackend {
                 options.seeded_prompt
             },
             leases,
+            prompt_files: options.prompt_files,
         })
     }
     fn identities_path(&self) -> std::path::PathBuf {

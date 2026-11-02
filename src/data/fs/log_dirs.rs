@@ -64,6 +64,10 @@ impl WorkflowLogPaths {
     /// Write `contents` to the per-container log file, creating the logs
     /// directory if necessary. Returns the path written so callers can point
     /// the user at it.
+    ///
+    /// Left as a direct write: the file name carries a fresh workflow id and
+    /// the content is written once and never re-read by awman, so there is no
+    /// earlier record to protect and no reader that needs it complete.
     pub fn write_container_log(
         &self,
         workflow_id: uuid::Uuid,

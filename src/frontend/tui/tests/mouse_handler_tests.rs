@@ -23,23 +23,25 @@ fn install_overflowing_overview(app: &mut App) {
         StepViewStatus, WorkflowStepKind, WorkflowStepView, WorkflowViewState,
     };
     use crate::frontend::tui::workflow_view::horizontal_layout;
-    *app.active_tab().shared.workflow_state.lock().unwrap() = Some(WorkflowViewState {
-        steps: (0..14)
-            .map(|i| WorkflowStepView {
-                name: format!("stage-{i}"),
-                status: StepViewStatus::Pending,
-                agent: None,
-                model: None,
-                depends_on: if i == 0 {
-                    vec![]
-                } else {
-                    vec![format!("stage-{}", i - 1)]
-                },
-                kind: WorkflowStepKind::Agent,
-            })
-            .collect(),
-        current_step: None,
-        max_concurrent: None,
+    app.active_tab().shared.workflow.update_view(|view| {
+        *view = Some(WorkflowViewState {
+            steps: (0..14)
+                .map(|i| WorkflowStepView {
+                    name: format!("stage-{i}"),
+                    status: StepViewStatus::Pending,
+                    agent: None,
+                    model: None,
+                    depends_on: if i == 0 {
+                        vec![]
+                    } else {
+                        vec![format!("stage-{}", i - 1)]
+                    },
+                    kind: WorkflowStepKind::Agent,
+                })
+                .collect(),
+            current_step: None,
+            max_concurrent: None,
+        })
     });
     let tab = app.active_tab_mut();
     tab.last_overview_rect = Some(Rect::new(0, 10, 100, 9));

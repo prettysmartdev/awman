@@ -17,11 +17,13 @@ use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
 use crate::data::api_lifecycle_store::CommandLifecycleStore;
 use crate::data::command_status::CommandStatus;
-use crate::data::fs::api_db::SqliteSessionStore;
+use crate::data::fs::api_db::{CommandRecord, LabelOwner, SqliteSessionStore};
+use crate::data::fs::api_labels::Labels;
 use crate::data::fs::api_paths::ApiPaths;
 use crate::data::session::{Session, SessionOpenOptions, SessionType, StaticGitRootResolver};
 use crate::data::session_manager::SessionManager;
 use crate::data::session_setup_event::{SessionSetupError, SessionSetupStatus};
+use crate::data::session_status::SessionStatus;
 use crate::engine::auth::AuthMode;
 
 /// Outcome of the one API session drain-and-close state machine.
@@ -34,6 +36,86 @@ pub enum CloseOutcome {
     },
     AlreadyClosing,
     NotFound,
+}
+
+/// Command-layer projection consumed by the API queue endpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionQueueView {
+    pub queue_depth: i64,
+    pub running: Option<QueueCommandView>,
+    pub queued: Vec<QueueCommandView>,
+    pub recent_completed: Vec<CompletedCommandView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueueCommandView {
+    pub command_id: String,
+    pub subcommand: String,
+    pub args: serde_json::Value,
+    pub timestamp: Option<String>,
+    pub position: Option<i64>,
+    pub started_at: Option<String>,
+    pub worker_id: Option<String>,
+    pub labels: Labels,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompletedCommandView {
+    pub command_id: String,
+    pub subcommand: String,
+    pub status: CommandStatus,
+    pub exit_code: Option<i32>,
+    pub finished_at: Option<String>,
+    pub labels: Labels,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionStatusFallback {
+    pub setup_status: SessionSetupStatus,
+    pub labels: Labels,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkflowStateAvailability {
+    NotStarted,
+    NeverStarted,
+    NotWorkflow,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum QueueViewError {
+    #[error("failed to read session: {0}")]
+    Session(#[source] crate::data::error::DataError),
+    #[error("failed to read queue: {0}")]
+    Queue(#[source] crate::data::error::DataError),
+    #[error("failed to read command labels: {0}")]
+    Labels(#[source] crate::data::error::DataError),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum StatusFallbackError {
+    #[error("failed to read session: {0}")]
+    Session(#[source] crate::data::error::DataError),
+    #[error("failed to read session labels: {0}")]
+    Labels(#[source] crate::data::error::DataError),
+}
+
+pub enum SessionStatusView {
+    Snapshot {
+        labels: Labels,
+        state: Box<crate::data::session_setup_event::SessionSetupState>,
+    },
+    Fallback(SessionStatusFallback),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum CancelSessionError {
+    #[error("Failed to cancel command")]
+    Cancel(#[source] CommandError),
+    #[error("Failed to read run")]
+    Run(#[source] crate::data::error::DataError),
+    #[error("Failed to close cancelled run session")]
+    Close(#[source] CommandError),
 }
 
 /// Command-layer classification used by HTTP handlers to map setup admission
@@ -152,15 +234,22 @@ impl ApiServerRuntime {
         // server restarts.
         tracing::info!("Restoring active sessions from previous server lifetime");
         let sessions = Arc::new(SessionManager::in_memory(config.env.clone()));
-        if let Ok(records) = store.list_sessions_by_status(None) {
+        if let Ok(records) = store
+            .list_sessions_by_status(None)
+            .inspect_err(|error| tracing::error!(%error, "Failed to list sessions to restore"))
+        {
             for rec in records
                 .into_iter()
-                .filter(|rec| rec.status == "active" || rec.status == "closing")
+                .filter(|rec| rec.status != SessionStatus::Closed)
             {
                 let workdir_path = std::path::PathBuf::from(&rec.workdir);
                 if rec.session_type == "remote" && !workdir_path.exists() {
                     tracing::warn!(session_id = %rec.id, workdir = %rec.workdir, "Remote session clone no longer exists; closing session");
-                    let _ = store.close_session_force(&rec.id, &chrono::Utc::now().to_rfc3339());
+                    if let Err(error) =
+                        store.close_session_force(&rec.id, &chrono::Utc::now().to_rfc3339())
+                    {
+                        tracing::error!(session_id = %rec.id, %error, "Failed to close session whose clone is gone");
+                    }
                     continue;
                 }
                 let resolver = StaticGitRootResolver::new(&workdir_path);
@@ -198,10 +287,14 @@ impl ApiServerRuntime {
         // Authoritative source is the DB's setup_status column; we also persist
         // a setup_state.json for the /status endpoint's disk fallback path so
         // that the failure reason is visible to clients.
-        if let Ok(records) = store.list_sessions_with_in_progress_setup() {
+        if let Ok(records) = store.list_sessions_with_in_progress_setup().inspect_err(
+            |error| tracing::error!(%error, "Failed to list sessions with in-progress setup"),
+        ) {
             for rec in &records {
-                tracing::warn!(session_id = %rec.id, previous_status = %rec.setup_status, "Marking session as failed (server restarted during setup)");
-                let _ = store.update_setup_status(&rec.id, "failed");
+                tracing::warn!(session_id = %rec.id, previous_status = rec.setup_status.as_str(), "Marking session as failed (server restarted during setup)");
+                if let Err(error) = store.update_setup_status(&rec.id, SessionSetupStatus::Failed) {
+                    tracing::error!(session_id = %rec.id, %error, "Failed to mark interrupted setup as failed");
+                }
                 let mut setup_state = paths.read_setup_state(&rec.id).unwrap_or_default();
                 setup_state.status = SessionSetupStatus::Failed;
                 setup_state.current_stage =
@@ -210,35 +303,58 @@ impl ApiServerRuntime {
                     stage: "server_restart".to_string(),
                     message: "Server restarted during session setup".to_string(),
                 });
-                let _ = paths.save_setup_state(&rec.id, &setup_state);
+                if let Err(error) = paths.save_setup_state(&rec.id, &setup_state) {
+                    tracing::warn!(session_id = %rec.id, %error, "Failed to save interrupted setup state");
+                }
                 // A `/v1/runs` command queued behind this setup can never run.
-                if let Ok(Some(run)) = lifecycle_store.run_for_session(&rec.id) {
+                if let Ok(Some(run)) =
+                    lifecycle_store.run_for_session(&rec.id).inspect_err(|error| {
+                        tracing::error!(session_id = %rec.id, %error, "Failed to read run of interrupted setup")
+                    })
+                {
                     let now = chrono::Utc::now().to_rfc3339();
                     let result = run_setup_error_result(
                         serde_json::to_value(setup_state.error.as_ref())
                             .ok()
                             .as_ref(),
                     );
-                    let _ = lifecycle_store.fail_if_queued(&run.command_id, &now, &result);
-                    let _ = super::queue_worker::finalize_unowned_command(
+                    if let Err(error) =
+                        lifecycle_store.fail_if_queued(&run.command_id, &now, &result)
+                    {
+                        tracing::error!(session_id = %rec.id, command_id = %run.command_id, %error, "Failed to fail run command of interrupted setup");
+                    }
+                    if let Err(error) = super::queue_worker::finalize_unowned_command(
                         &store,
                         &paths,
                         &run.command_id,
-                    );
+                    ) {
+                        tracing::error!(session_id = %rec.id, command_id = %run.command_id, %error, "Failed to finalize run command of interrupted setup");
+                    }
                     if run.close_on_finish {
-                        let _ = store.close_session_force(&rec.id, &now);
+                        if let Err(error) = store.close_session_force(&rec.id, &now) {
+                            tracing::error!(session_id = %rec.id, command_id = %run.command_id, %error, "Failed to close session of interrupted setup");
+                        }
                         forget_restored_session(&sessions, &rec.id);
                     }
                 }
                 if rec.session_type == "remote" {
                     if let Some(cloned) = rec.cloned_path.as_deref() {
-                        let _ = engines
+                        if let Err(error) = engines
                             .git_engine
-                            .delete_directory(&std::path::PathBuf::from(cloned));
+                            .delete_directory(&std::path::PathBuf::from(cloned))
+                        {
+                            tracing::warn!(session_id = %rec.id, %error, "Failed to delete clone of interrupted setup");
+                        }
                     }
                 }
             }
         }
+
+        // A completion recorded before the restart is what happened, so it goes
+        // first: a cancel accepted after it cannot change the published outcome,
+        // and the stale recovery below must not run the command a second time.
+        super::queue_worker::finalize_completed_from_sidecars(&store, &paths)
+            .map_err(CommandError::Data)?;
 
         // A command that was asked to cancel before the restart is finalised
         // as `cancelled` here, so the stale recovery below (which requeues
@@ -309,6 +425,7 @@ impl ApiServerRuntime {
         }
 
         reconcile_runs(&store, &lifecycle_store, &paths, &engines, &sessions);
+        finish_drained_closes(&store, &paths, &engines, &sessions);
 
         Ok(Self {
             store,
@@ -360,6 +477,19 @@ impl ApiServerRuntime {
             self.engines.clone(),
             Arc::clone(&self.sessions),
             self.paths.clone(),
+        )
+    }
+
+    /// Admission shares this daemon's stores, session policy and engines.
+    pub fn admission(&self) -> super::admission::ApiAdmission {
+        super::admission::ApiAdmission::new(
+            Arc::clone(&self.store),
+            self.lifecycle_store.clone(),
+            self.paths.clone(),
+            self.engines.clone(),
+            Arc::clone(&self.sessions),
+            self.workdirs.clone(),
+            self.workdir_roots.clone(),
         )
     }
 
@@ -431,6 +561,214 @@ impl ApiSessionLifecycle {
         }
     }
 
+    pub fn queue_position(
+        &self,
+        command: &CommandRecord,
+    ) -> Result<Option<i64>, crate::data::error::DataError> {
+        if command.status.is_claimable() {
+            self.store
+                .queue_position_for_command(&command.id, &command.session_id)
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn setup_error(
+        &self,
+        session: &crate::data::fs::api_db::SessionRecord,
+    ) -> Option<SessionSetupError> {
+        (session.setup_status == SessionSetupStatus::Failed)
+            .then(|| {
+                self.paths
+                    .read_setup_state(&session.id)
+                    .and_then(|state| state.error)
+            })
+            .flatten()
+    }
+
+    /// An in-memory snapshot wins over disk, which wins over the legacy row.
+    pub fn session_status_view(
+        &self,
+        session_id: &str,
+        snapshot: Option<crate::data::session_setup_event::SessionSetupState>,
+    ) -> Result<SessionStatusView, StatusFallbackError> {
+        let labels = self
+            .store
+            .labels_for(LabelOwner::Session, session_id)
+            .map_err(StatusFallbackError::Labels)?;
+        match snapshot.or_else(|| self.paths.read_setup_state(session_id)) {
+            Some(state) => Ok(SessionStatusView::Snapshot {
+                labels,
+                state: Box::new(state),
+            }),
+            None => self
+                .status_fallback(session_id)
+                .map(SessionStatusView::Fallback),
+        }
+    }
+
+    /// Setup owns cleanup while its token is registered. Otherwise a terminal
+    /// one-shot command has no worker left to perform close-on-finish.
+    pub async fn cancel_command(
+        &self,
+        command_id: &str,
+        canceller: &CommandCanceller,
+        setup_cancels: &TokenRegistry,
+        lifecycle: &CommandLifecycleStore,
+    ) -> Result<super::CancelOutcome, CancelSessionError> {
+        let outcome = canceller
+            .cancel(command_id)
+            .map_err(CancelSessionError::Cancel)?;
+        if let super::CancelOutcome::AlreadyTerminal(row) | super::CancelOutcome::Cancelled(row) =
+            &outcome
+        {
+            if !setup_cancels.is_registered(&row.session_id) {
+                if let Some(run) = lifecycle
+                    .run_for_command(command_id)
+                    .map_err(CancelSessionError::Run)?
+                {
+                    if run.close_on_finish {
+                        self.close(&run.session_id)
+                            .await
+                            .map_err(CancelSessionError::Close)?;
+                    }
+                }
+            }
+        }
+        Ok(outcome)
+    }
+
+    /// A cancelled row can predate setup token registration. On a read error,
+    /// cancel setup rather than starting work whose cancellation is unknown.
+    pub fn reconcile_setup_cancel(
+        &self,
+        run: &crate::data::api_lifecycle_store::RunRecord,
+        token: &tokio_util::sync::CancellationToken,
+    ) -> Result<(), crate::data::error::DataError> {
+        match self.store.get_command(&run.command_id) {
+            Ok(command) => {
+                if command.is_some_and(|c| c.status == CommandStatus::Cancelled) {
+                    token.cancel();
+                }
+                Ok(())
+            }
+            Err(error) => {
+                token.cancel();
+                Err(error)
+            }
+        }
+    }
+
+    /// Build the typed queue projection shared by API consumers. Stored args
+    /// pass through the same decoder used by command execution.
+    pub fn queue_view(&self, session_id: &str) -> Result<Option<SessionQueueView>, QueueViewError> {
+        if self
+            .store
+            .get_session(session_id)
+            .map_err(QueueViewError::Session)?
+            .is_none()
+        {
+            return Ok(None);
+        }
+        let records = self
+            .store
+            .session_queue_records(session_id)
+            .map_err(QueueViewError::Queue)?;
+        let ids: Vec<String> = records
+            .recent
+            .iter()
+            .chain(records.running.iter())
+            .map(|record| record.id.clone())
+            .collect();
+        let labels = self
+            .store
+            .labels_for_many(LabelOwner::Command, &ids)
+            .map_err(QueueViewError::Labels)?;
+        let labels_for = |id: &str| labels.get(id).cloned().unwrap_or_else(Labels::empty);
+
+        let running = records
+            .running
+            .map(|record| decode_queue_command(record, None, labels_for));
+        let mut queued_records: Vec<_> = records
+            .recent
+            .iter()
+            .filter(|record| record.status.is_claimable())
+            .collect();
+        queued_records.reverse();
+        let queued = queued_records
+            .into_iter()
+            .enumerate()
+            .map(|(position, record)| {
+                decode_queue_command(record.clone(), Some(position as i64), labels_for)
+            })
+            .collect();
+
+        let mut completed: Vec<_> = records
+            .recent
+            .into_iter()
+            .filter(|record| record.status.is_terminal())
+            .collect();
+        completed.sort_by(|a, b| b.finished_at.cmp(&a.finished_at));
+        let recent_completed = completed
+            .into_iter()
+            .take(10)
+            .map(|record| CompletedCommandView {
+                command_id: record.id.clone(),
+                subcommand: record.subcommand,
+                status: record.status,
+                exit_code: record.exit_code,
+                finished_at: record.finished_at,
+                labels: labels_for(&record.id),
+            })
+            .collect();
+
+        Ok(Some(SessionQueueView {
+            queue_depth: records.queue_depth,
+            running,
+            queued,
+            recent_completed,
+        }))
+    }
+
+    /// Last-resort setup-status read for sessions without setup state files.
+    /// Older sessions with no row retain the historical `ready` fallback.
+    pub fn status_fallback(
+        &self,
+        session_id: &str,
+    ) -> Result<SessionStatusFallback, StatusFallbackError> {
+        let setup_status = self
+            .store
+            .get_session(session_id)
+            .map_err(StatusFallbackError::Session)?
+            .map_or(SessionSetupStatus::Ready, |session| session.setup_status);
+        let labels = self
+            .store
+            .labels_for(crate::data::fs::api_db::LabelOwner::Session, session_id)
+            .map_err(StatusFallbackError::Labels)?;
+        Ok(SessionStatusFallback {
+            setup_status,
+            labels,
+        })
+    }
+
+    /// Classify the absent-workflow response without inspecting persisted
+    /// lifecycle spellings in the transport adapter.
+    pub fn workflow_state_availability(
+        &self,
+        command: &CommandRecord,
+    ) -> WorkflowStateAvailability {
+        let path: Vec<&str> = command.subcommand.split_whitespace().collect();
+        if crate::command::dispatch::catalogue::CommandCatalogue::get().canonical_path(&path)
+            != ["exec", "workflow"]
+        {
+            WorkflowStateAvailability::NotWorkflow
+        } else if command.status.is_terminal() {
+            WorkflowStateAvailability::NeverStarted
+        } else {
+            WorkflowStateAvailability::NotStarted
+        }
+    }
+
     /// Reconcile a one-shot run after setup relinquishes ownership, including
     /// cancellation racing setup's final ready publication.
     pub async fn finish_run_setup(
@@ -448,7 +786,8 @@ impl ApiSessionLifecycle {
         }
         let command = self.store.get_command(&run.command_id)?;
         if command.as_ref().is_some_and(|c| {
-            c.started_at.is_none() && matches!(c.status.as_str(), "error" | "cancelled")
+            c.started_at.is_none()
+                && matches!(c.status, CommandStatus::Error | CommandStatus::Cancelled)
         }) {
             super::queue_worker::finalize_unowned_command(
                 &self.store,
@@ -456,13 +795,11 @@ impl ApiSessionLifecycle {
                 &run.command_id,
             )?;
         }
-        let terminal = command.as_ref().is_some_and(|c| {
-            CommandStatus::parse(&c.status).is_some_and(CommandStatus::is_terminal)
-        });
+        let terminal = command.as_ref().is_some_and(|c| c.status.is_terminal());
         // A setup cancel also closes the session with the default close flag.
-        let cancelled_during_setup = command.as_ref().is_some_and(|c| {
-            c.status == CommandStatus::Cancelled.as_str() && c.started_at.is_none()
-        });
+        let cancelled_during_setup = command
+            .as_ref()
+            .is_some_and(|c| c.status == CommandStatus::Cancelled && c.started_at.is_none());
         if cancelled_during_setup || (run.close_on_finish && terminal) {
             self.close(&run.session_id).await?;
         }
@@ -472,8 +809,10 @@ impl ApiSessionLifecycle {
     pub async fn close(&self, session_id: &str) -> Result<CloseOutcome, CommandError> {
         let session = match self.store.get_session(session_id)? {
             None => return Ok(CloseOutcome::NotFound),
-            Some(session) if session.status == "closed" => return Ok(CloseOutcome::Closed),
-            Some(session) if session.status == "closing" => {
+            Some(session) if session.status == SessionStatus::Closed => {
+                return Ok(CloseOutcome::Closed)
+            }
+            Some(session) if session.status == SessionStatus::Closing => {
                 if self
                     .store
                     .running_command_for_session(session_id)?
@@ -490,7 +829,8 @@ impl ApiSessionLifecycle {
 
         // Step 1: mark closing before cancelling queued work, closing the
         // command-admission gate before a racing POST can enqueue another job.
-        self.store.update_session_status(session_id, "closing")?;
+        self.store
+            .update_session_status(session_id, SessionStatus::Closing)?;
         // Step 2: cancel any queued jobs that entered before the gate closed.
         let cancelled = self.store.cancel_queued_for_session(session_id)?;
         // Step 3: a running command owns the drain; worker post-check reenters
@@ -519,7 +859,7 @@ impl ApiSessionLifecycle {
             self.store
                 .list_commands_filtered(&crate::data::fs::api_db::CommandListFilter {
                     session_id: Some(session_id),
-                    status: Some("cancelled"),
+                    status: Some(CommandStatus::Cancelled),
                     labels: &[],
                     limit: i64::MAX,
                 })?;
@@ -566,15 +906,43 @@ impl ApiSessionLifecycle {
             return readiness_from_state(state.status, state.error);
         }
         match self.store.get_session(session_id) {
-            Ok(Some(session)) if session.setup_status == "ready" => SetupReadiness::Ready,
-            Ok(Some(session)) if session.setup_status == "failed" => SetupReadiness::Failed {
-                status: session.setup_status,
-                error: None,
-            },
-            Ok(Some(session)) => SetupReadiness::Pending {
-                status: session.setup_status,
-            },
-            Ok(None) | Err(_) => SetupReadiness::NotFound,
+            Ok(Some(session)) => readiness_from_state(session.setup_status, None),
+            Ok(None) => SetupReadiness::NotFound,
+            Err(error) => {
+                tracing::error!(session_id, %error, "Failed to read session setup status");
+                SetupReadiness::NotFound
+            }
+        }
+    }
+}
+
+fn decode_queue_command(
+    record: CommandRecord,
+    position: Option<i64>,
+    labels: impl FnOnce(&str) -> Labels,
+) -> QueueCommandView {
+    let args = stored_args_view(&record);
+    QueueCommandView {
+        command_id: record.id.clone(),
+        subcommand: record.subcommand,
+        args,
+        timestamp: record.queued_at,
+        position,
+        started_at: record.started_at,
+        worker_id: record.worker_id,
+        labels: labels(&record.id),
+    }
+}
+
+/// Read projections retain legacy JSON values (and `[]` for invalid JSON).
+/// Execution still rejects invalid argv through `decode_args`; one bad row
+/// must not hide the rest of a session's queue from an operator.
+pub fn stored_args_view(record: &CommandRecord) -> serde_json::Value {
+    match record.decode_args() {
+        Ok(args) => serde_json::json!(args),
+        Err(error) => {
+            tracing::warn!(command_id = %record.id, %error, "Invalid stored command args in read projection");
+            serde_json::from_str(&record.args).unwrap_or_else(|_| serde_json::json!([]))
         }
     }
 }
@@ -627,14 +995,19 @@ fn reconcile_runs(
         }
     };
     for run in runs {
-        let Ok(Some(session)) = store.get_session(&run.session_id) else {
-            continue;
+        let session = match store.get_session(&run.session_id) {
+            Ok(Some(session)) => session,
+            Ok(None) => continue,
+            Err(error) => {
+                tracing::error!(session_id = %run.session_id, command_id = %run.command_id, %error, "Failed to read session for restart reconciliation");
+                continue;
+            }
         };
-        if session.status == "closed" {
+        if session.status == SessionStatus::Closed {
             continue;
         }
         let now = chrono::Utc::now().to_rfc3339();
-        if session.setup_status == "failed" {
+        if session.setup_status == SessionSetupStatus::Failed {
             let error = paths
                 .read_setup_state(&run.session_id)
                 .and_then(|state| state.error)
@@ -653,11 +1026,10 @@ fn reconcile_runs(
             .get_command(&run.command_id)
             .ok()
             .flatten()
-            .and_then(|c| CommandStatus::parse(&c.status))
-            .is_some_and(CommandStatus::is_terminal);
+            .is_some_and(|c| c.status.is_terminal());
         // The worker finishes durable cancelled cleanup before closing a
         // one-shot session and deleting the workspace it still needs.
-        if matches!(store.get_command(&run.command_id), Ok(Some(c)) if c.status == "cancelled")
+        if matches!(store.get_command(&run.command_id), Ok(Some(c)) if c.status == CommandStatus::Cancelled)
             && !matches!(
                 paths.read_command_cleanup(&run.session_id, &run.command_id),
                 Ok(None)
@@ -668,25 +1040,95 @@ fn reconcile_runs(
         if !(run.close_on_finish && terminal) {
             continue;
         }
-        if session.session_type == "remote" {
-            if let Some(cloned) = session.cloned_path.as_deref() {
-                if let Err(error) = engines
-                    .git_engine
-                    .delete_directory(&std::path::PathBuf::from(cloned))
-                {
-                    tracing::warn!(session_id = %run.session_id, %error, "Failed to clean finished run clone; retaining session for recovery");
-                    continue;
-                }
+        close_finished_session(&session, store, engines, sessions);
+    }
+}
+
+/// Bootstrap: a session left `closing` waits on a worker's post-check, which
+/// never runs if the daemon died after the row was finished or the row finalized
+/// from its sidecar. Runs after stale recovery, so a requeued command counts as
+/// the work that will still drain it.
+fn finish_drained_closes(
+    store: &Arc<SqliteSessionStore>,
+    paths: &ApiPaths,
+    engines: &Engines,
+    sessions: &Arc<SessionManager>,
+) {
+    let closing = match store.list_sessions_by_status(Some(SessionStatus::Closing)) {
+        Ok(closing) => closing,
+        Err(error) => {
+            tracing::error!(%error, "Failed to list closing sessions");
+            return;
+        }
+    };
+    let lifecycle = ApiSessionLifecycle::new(
+        Arc::clone(store),
+        engines.clone(),
+        Arc::clone(sessions),
+        paths.clone(),
+    );
+    for session in closing {
+        let session_id = session.id.as_str();
+        match has_unfinished_command(store, session_id).and_then(|busy| {
+            if busy {
+                return Ok(true);
+            }
+            Ok(lifecycle.pending_cleanup_command(session_id)?.is_some())
+        }) {
+            Ok(true) => {}
+            Ok(false) => close_finished_session(&session, store, engines, sessions),
+            Err(error) => {
+                tracing::error!(session_id, %error, "Failed to check work of draining session");
             }
         }
-        match store.close_session_force(&run.session_id, &now) {
-            Ok(_) => {
-                forget_restored_session(sessions, &run.session_id);
-                tracing::info!(session_id = %run.session_id, "Closed finished run session after restart");
+    }
+}
+
+fn has_unfinished_command(
+    store: &SqliteSessionStore,
+    session_id: &str,
+) -> Result<bool, CommandError> {
+    // The `Queued` filter also selects rows with the legacy `pending` spelling.
+    for status in [CommandStatus::Running, CommandStatus::Queued] {
+        let rows = store.list_commands_filtered(&crate::data::fs::api_db::CommandListFilter {
+            session_id: Some(session_id),
+            status: Some(status),
+            labels: &[],
+            limit: 1,
+        })?;
+        if !rows.is_empty() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Close a session at bootstrap the way `ApiSessionLifecycle::close` finishes
+/// one (remote clone deleted first; a failed delete retains the session).
+fn close_finished_session(
+    session: &crate::data::fs::api_db::SessionRecord,
+    store: &SqliteSessionStore,
+    engines: &Engines,
+    sessions: &SessionManager,
+) {
+    if session.session_type == "remote" {
+        if let Some(cloned) = session.cloned_path.as_deref() {
+            if let Err(error) = engines
+                .git_engine
+                .delete_directory(&std::path::PathBuf::from(cloned))
+            {
+                tracing::warn!(session_id = %session.id, %error, "Failed to clean finished session clone; retaining session for recovery");
+                return;
             }
-            Err(error) => {
-                tracing::warn!(session_id = %run.session_id, %error, "Failed to close finished run session")
-            }
+        }
+    }
+    match store.close_session_force(&session.id, &chrono::Utc::now().to_rfc3339()) {
+        Ok(_) => {
+            forget_restored_session(sessions, &session.id);
+            tracing::info!(session_id = %session.id, "Closed finished session after restart");
+        }
+        Err(error) => {
+            tracing::warn!(session_id = %session.id, %error, "Failed to close finished session")
         }
     }
 }
@@ -744,6 +1186,194 @@ mod tests {
             .unwrap();
     }
 
+    #[test]
+    fn queue_view_assigns_oldest_first_positions_and_preserves_legacy_args_projection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (lifecycle, store) = lifecycle(tmp.path());
+        insert_active(&store, "queue");
+        store
+            .enqueue_command("first", "queue", "agents status", "[\"a\"]", "log")
+            .unwrap();
+        store
+            .enqueue_command("second", "queue", "agents status", "[]", "log")
+            .unwrap();
+
+        let view = lifecycle.queue_view("queue").unwrap().unwrap();
+        assert_eq!(view.queue_depth, 2);
+        assert_eq!(
+            view.queued
+                .iter()
+                .map(|command| (command.command_id.as_str(), command.position))
+                .collect::<Vec<_>>(),
+            vec![("first", Some(0)), ("second", Some(1))]
+        );
+        assert_eq!(view.queued[0].args, serde_json::json!(["a"]));
+
+        for (id, args, expected) in [
+            ("bad", "{", serde_json::json!([])),
+            ("object", "{}", serde_json::json!({})),
+            ("numbers", "[1]", serde_json::json!([1])),
+        ] {
+            store
+                .enqueue_command(id, "queue", "agents status", args, "log")
+                .unwrap();
+            let view = lifecycle.queue_view("queue").unwrap().unwrap();
+            assert_eq!(
+                view.queued
+                    .iter()
+                    .find(|c| c.command_id == id)
+                    .unwrap()
+                    .args,
+                expected
+            );
+            assert_eq!(view.queued[0].command_id, "first");
+            assert_eq!(view.queued[1].command_id, "second");
+            assert!(store
+                .get_command(id)
+                .unwrap()
+                .unwrap()
+                .decode_args()
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn status_fallback_keeps_ready_for_legacy_missing_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (lifecycle, _) = lifecycle(tmp.path());
+        let fallback = lifecycle.status_fallback("legacy").unwrap();
+        assert_eq!(fallback.setup_status, SessionSetupStatus::Ready);
+        assert!(fallback.labels.is_empty());
+    }
+
+    #[test]
+    fn session_status_view_prefers_memory_then_disk_then_row() {
+        use crate::data::session_setup_event::SessionSetupState;
+        let tmp = tempfile::tempdir().unwrap();
+        let (lifecycle, store) = lifecycle(tmp.path());
+        insert_active(&store, "s");
+        store
+            .update_setup_status("s", SessionSetupStatus::Ready)
+            .unwrap();
+        let mut disk = SessionSetupState::new();
+        disk.mark_failed("clone", "disk failure");
+        lifecycle.paths.save_setup_state("s", &disk).unwrap();
+        let mut memory = SessionSetupState::new();
+        memory.current_stage = Some("from memory".into());
+        match lifecycle.session_status_view("s", Some(memory)).unwrap() {
+            SessionStatusView::Snapshot { state, .. } => {
+                assert_eq!(state.current_stage.as_deref(), Some("from memory"))
+            }
+            _ => panic!("memory snapshot lost"),
+        }
+        match lifecycle.session_status_view("s", None).unwrap() {
+            SessionStatusView::Snapshot { state, .. } => {
+                assert_eq!(state.status, SessionSetupStatus::Failed)
+            }
+            _ => panic!("disk snapshot lost"),
+        }
+        std::fs::write(
+            lifecycle.paths.session_dir("s").join("setup_state.json"),
+            "{",
+        )
+        .unwrap();
+        match lifecycle.session_status_view("s", None).unwrap() {
+            SessionStatusView::Fallback(fallback) => {
+                assert_eq!(fallback.setup_status, SessionSetupStatus::Ready)
+            }
+            _ => panic!("malformed disk state hid row fallback"),
+        }
+    }
+
+    #[test]
+    fn early_setup_cancel_carries_cancelled_row_and_fails_closed_on_read_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (lifecycle, store) = lifecycle(tmp.path());
+        insert_active(&store, "s");
+        store
+            .enqueue_command("c", "s", "exec prompt", "[]", "log")
+            .unwrap();
+        let run = crate::data::api_lifecycle_store::RunRecord {
+            session_id: "s".into(),
+            command_id: "c".into(),
+            close_on_finish: true,
+            created_at: "now".into(),
+        };
+        let token = tokio_util::sync::CancellationToken::new();
+        lifecycle.reconcile_setup_cancel(&run, &token).unwrap();
+        assert!(!token.is_cancelled());
+        store.cancel_queued_for_session("s").unwrap();
+        lifecycle.reconcile_setup_cancel(&run, &token).unwrap();
+        assert!(token.is_cancelled());
+        store
+            .with_conn(|conn| {
+                conn.execute_batch("ALTER TABLE commands RENAME TO unavailable_commands")?;
+                Ok(())
+            })
+            .unwrap();
+        let token = tokio_util::sync::CancellationToken::new();
+        assert!(lifecycle.reconcile_setup_cancel(&run, &token).is_err());
+        assert!(token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn cancel_run_defers_close_to_setup_owner_and_reports_close_failure() {
+        for setup_owns in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (lifecycle, store) = lifecycle(tmp.path());
+            insert_active(&store, "s");
+            let runs = CommandLifecycleStore::open(Arc::clone(&store)).unwrap();
+            runs.record_run(&crate::data::api_lifecycle_store::RunRecord {
+                session_id: "s".into(),
+                command_id: "c".into(),
+                close_on_finish: true,
+                created_at: "now".into(),
+            })
+            .unwrap();
+            store
+                .enqueue_command("c", "s", "exec prompt", "[]", "log")
+                .unwrap();
+            let setups = Arc::new(TokenRegistry::new());
+            let token = setup_owns.then(|| setups.register("s"));
+            let canceller = CommandCanceller::new(
+                Arc::clone(&store),
+                runs.clone(),
+                Arc::new(TokenRegistry::new()),
+                Arc::clone(&setups),
+            );
+            if !setup_owns {
+                store.with_conn(|conn| { conn.execute_batch("CREATE TRIGGER fail_close BEFORE UPDATE OF status ON sessions BEGIN SELECT RAISE(ABORT, 'close failed'); END;")?; Ok(()) }).unwrap();
+                assert!(matches!(
+                    lifecycle
+                        .cancel_command("c", &canceller, &setups, &runs)
+                        .await,
+                    Err(CancelSessionError::Close(_))
+                ));
+                store
+                    .with_conn(|conn| {
+                        conn.execute_batch("DROP TRIGGER fail_close;")?;
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+            lifecycle
+                .cancel_command("c", &canceller, &setups, &runs)
+                .await
+                .unwrap();
+            assert_eq!(
+                store.get_session("s").unwrap().unwrap().status,
+                if setup_owns {
+                    SessionStatus::Active
+                } else {
+                    SessionStatus::Closed
+                }
+            );
+            if let Some(token) = token {
+                assert!(token.is_cancelled());
+            }
+        }
+    }
+
     #[tokio::test]
     async fn close_outcome_closes_session_without_a_queue() {
         let tmp = tempfile::tempdir().unwrap();
@@ -754,7 +1384,7 @@ mod tests {
             CloseOutcome::Closed
         );
         assert_eq!(
-            store.get_session("empty").unwrap().unwrap().status,
+            store.get_session("empty").unwrap().unwrap().status.as_str(),
             "closed"
         );
     }
@@ -800,7 +1430,7 @@ mod tests {
             .enqueue_command("command", "cleanup", "exec workflow", "[]", "log")
             .unwrap();
         store
-            .complete_command("command", "cancelled", Some(130), None)
+            .complete_command("command", CommandStatus::Cancelled, Some(130), None)
             .unwrap();
         lifecycle
             .paths
@@ -834,7 +1464,12 @@ mod tests {
             CloseOutcome::Draining { .. }
         ));
         assert_eq!(
-            store.get_session("cleanup").unwrap().unwrap().status,
+            store
+                .get_session("cleanup")
+                .unwrap()
+                .unwrap()
+                .status
+                .as_str(),
             "closing"
         );
         assert_eq!(
@@ -850,7 +1485,12 @@ mod tests {
             CloseOutcome::Closed
         );
         assert_eq!(
-            store.get_session("cleanup").unwrap().unwrap().status,
+            store
+                .get_session("cleanup")
+                .unwrap()
+                .unwrap()
+                .status
+                .as_str(),
             "closed"
         );
     }

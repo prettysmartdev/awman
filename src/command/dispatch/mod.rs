@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use tokio::sync::RwLock;
 
-use crate::command::commands::agents::{AgentsCommand, AgentsCommandFrontend, AgentsOutcome};
+use crate::command::commands::agents::{AgentsCommand, AgentsCommandFrontend};
 use crate::command::commands::api_server::{ApiServerCommand, ApiServerCommandFrontend};
 use crate::command::commands::chat::{ChatCommand, ChatCommandFrontend};
 use crate::command::commands::clean::{CleanCommand, CleanCommandFrontend};
@@ -23,9 +23,7 @@ use crate::command::commands::new::{NewCommand, NewCommandFrontend};
 use crate::command::commands::ready::{ReadyCommand, ReadyCommandFrontend};
 use crate::command::commands::remote::{RemoteCommand, RemoteCommandFrontend};
 use crate::command::commands::specs::{SpecsCommand, SpecsCommandFrontend};
-use crate::command::commands::squad::attach::{
-    SquadAttachCommand, SquadAttachFrontend, SquadAttachOutcome,
-};
+use crate::command::commands::squad::attach::{SquadAttachCommand, SquadAttachFrontend};
 use crate::command::commands::squad::commands::{SquadCommand, SquadCommandFrontend};
 use crate::command::commands::squad::gateway::TaskGateway;
 use crate::command::commands::squad::runtime_guard::require_container_tier;
@@ -33,409 +31,25 @@ use crate::command::commands::squad::supervisor::SquadGatewayResolver;
 use crate::command::commands::Command;
 use crate::command::dispatch::catalogue::{CommandCatalogue, FrontendKind, GatewayNeed};
 use crate::command::error::CommandError;
-use crate::command::startup::RuntimeStartupFailure;
-use crate::data::config::global::GlobalConfig;
-use crate::data::config::EffectiveConfig;
-use crate::data::fs::{ApiPaths, AuthPathResolver, DataPaths, SquadPaths};
 use crate::data::message::UserMessageSink;
 use crate::data::session::Session;
-use crate::engine::agent::AgentEngine;
-use crate::engine::agent_runtime::{self, AgentRuntimeEngine, DetectedRuntime};
-use crate::engine::auth::AuthEngine;
-use crate::engine::container::ContainerRuntime;
-use crate::engine::daemon::DaemonKind;
-use crate::engine::error::EngineError;
-use crate::engine::git::GitEngine;
-use crate::engine::overlay::OverlayEngine;
-use crate::engine::sandbox::SandboxRuntime;
 
 pub mod build;
 pub mod catalogue;
+pub mod engines;
 pub mod frontend_action;
+pub mod outcomes;
 pub mod parsed_input;
 pub mod projections;
 pub mod resolved;
 pub mod runtime_context;
 
+pub use engines::{credential_refresh_monitor, Engines};
 pub use frontend_action::FrontendAction;
+pub use outcomes::CommandOutcome;
 pub use parsed_input::ParsedCommandBoxInput;
 pub use resolved::{BuildContext, CallerContext, ResolvedArgs, ResolvedFlags};
 pub use runtime_context::RuntimeContext;
-
-/// Build the live credential monitor this engine bundle's launches register
-/// leases with, or `None` when `authRefresh.enabled` is false.
-///
-/// Before WI 0114 F-38 this installed a process-global `OnceLock` that the
-/// container backends reached behind everybody's back, and "no monitor
-/// installed" was how the kill switch was implemented. The monitor is now
-/// carried explicitly — attached to `AgentEngine` here, emitted onto
-/// `ResolvedContainerOptions` at build-options time, and read by the backends
-/// from the options they were handed. `None` means leases are disabled,
-/// exactly as an uninstalled global did.
-pub fn credential_refresh_monitor(
-    config: &EffectiveConfig,
-) -> Option<Arc<crate::engine::credential_refresh::CredentialRefreshMonitor>> {
-    let settings = config.auth_refresh();
-    if !settings.enabled {
-        return None;
-    }
-    Some(
-        crate::engine::credential_refresh::CredentialRefreshMonitor::new(
-            crate::engine::credential_refresh::MonitorConfig {
-                refresh_threshold: settings.threshold,
-                tick_interval: settings.tick,
-            },
-        ),
-    )
-}
-
-/// The lease-factory handle for a monitor, or `None` when there is none.
-fn lease_factory_for(
-    monitor: Option<&Arc<crate::engine::credential_refresh::CredentialRefreshMonitor>>,
-) -> Option<crate::engine::credential_refresh::LeaseFactoryHandle> {
-    monitor.map(|m| {
-        crate::engine::credential_refresh::LeaseFactoryHandle::new(Arc::new(Arc::clone(m)))
-    })
-}
-
-// ─── Pre-wired engines bundle ───────────────────────────────────────────────
-
-/// All Layer 1 engine handles a `Dispatch` needs to construct a `*Command`.
-/// `ReadyEngine` and `InitEngine` are NOT pre-constructed here — those
-/// engines accept per-invocation flag values.
-#[derive(Clone)]
-pub struct Engines {
-    /// Cross-paradigm trait-object handle. Used for build(), list_running(),
-    /// stats(), stop(), attach(), is_available(), capabilities() and
-    /// other operations that exist on both paradigms.
-    pub runtime: Arc<dyn AgentRuntimeEngine>,
-
-    /// Container-paradigm-specific handle, set when `runtime` is a
-    /// ContainerRuntime. None when the active runtime is a SandboxRuntime.
-    /// Used for image-paradigm operations (build_image, image_exists,
-    /// image_home_dir, start_background) that only exist on the container
-    /// side. Points at the same underlying object as `runtime`.
-    pub container_runtime: Option<Arc<ContainerRuntime>>,
-
-    /// Sandbox-paradigm-specific handle, mirror of `container_runtime` for
-    /// sandbox-only operations. None when running under a ContainerRuntime.
-    pub sandbox_runtime: Option<Arc<SandboxRuntime>>,
-
-    pub git_engine: Arc<GitEngine>,
-    pub overlay_engine: Arc<OverlayEngine>,
-    pub auth_engine: Arc<AuthEngine>,
-    pub agent_engine: Arc<AgentEngine>,
-    pub workflow_state_store: Arc<crate::data::WorkflowStateStore>,
-
-    /// The live credential-refresh monitor, or `None` when
-    /// `authRefresh.enabled` is false. Built once per engine bundle (F-38
-    /// replaced the process-global `OnceLock`). `agent_engine` already holds
-    /// it as a lease factory; this handle is for the callers that need the
-    /// monitor itself — the workflow pre-step guard and auth-failure
-    /// recovery, `security.md` triggers (c) and (d).
-    pub credential_monitor:
-        Option<Arc<crate::engine::credential_refresh::CredentialRefreshMonitor>>,
-
-    /// The global config this bundle was assembled from.
-    ///
-    /// A **daemon's** single config source. Daemons have no `Session`, so
-    /// before WI 0114 F-31 the daemon-side code that needed a global setting
-    /// simply called `GlobalConfig::load()` wherever it stood — four separate
-    /// reads, each with its own `unwrap_or_default()` swallowing a malformed
-    /// file, and each able to see a different file than the one the daemon
-    /// started with.
-    ///
-    /// A **session-backed** host reads `session.effective_config()` instead:
-    /// that already merged this in, under the repo config, the environment
-    /// and the flags. This field is for the code that has no session.
-    pub global_config: Arc<GlobalConfig>,
-
-    /// Once-per-repo config notices for this bundle's lifetime (WI 0150 §3):
-    /// one CLI/TUI process or one daemon.
-    pub config_notices: Arc<crate::command::config_notices::ConfigNotices>,
-}
-
-impl Engines {
-    /// Assemble the engines for a session-backed command invocation.
-    ///
-    /// This is the single owner of the Layer 1 graph formerly assembled by
-    /// the binary entrypoint. Runtime selection is deliberately here rather
-    /// than in a frontend so every session-backed host gets the same tier.
-    pub fn build(global: &GlobalConfig, session: &Session) -> Result<Self, EngineError> {
-        let effective = EffectiveConfig::new(
-            session.flags().clone(),
-            session.env().clone(),
-            session.repo_config().clone(),
-            global.clone(),
-        );
-        let detected = agent_runtime::detect_effective(&effective)?;
-        // Hosts without a startup frontend still record an in-place builtin
-        // state upgrade rather than dropping its notice.
-        for notice in detected.take_notices() {
-            tracing::info!("{notice}");
-        }
-        Self::from_detected(detected, session)
-    }
-
-    /// Assemble the engines used by either standalone daemon.
-    ///
-    /// Daemons do not have a `Session`: overlays resolve credentials from the
-    /// process auth paths, auth uses the API key store, and workflow state is
-    /// rooted under that daemon's own root. `paths` is the shared daemon data
-    /// context retained by this common factory boundary.
-    pub fn for_daemon(kind: DaemonKind, paths: &DataPaths) -> Result<Self, EngineError> {
-        let auth_paths = AuthPathResolver::from_process_env()?;
-        let api_paths = ApiPaths::from_process_env()?;
-        // The daemon's one config read (F-31). A malformed file fails the
-        // start with a message naming the file and the offending key, rather
-        // than being defaulted away and leaving the daemon quietly running on
-        // settings the user did not write.
-        let global = GlobalConfig::load()?;
-        // Only the runtime's process-wide parts (for builtin: the state
-        // directory and the ambient-override check) come from the global
-        // config. Every launch resolves its own builtin settings (network,
-        // vCPUs, memory) from the task's session through
-        // `AgentEngine::builtin_launch_settings`, so a task inherits its
-        // repo's narrowing.
-        let detected = agent_runtime::detect(&global)?;
-        for notice in detected.take_notices() {
-            tracing::info!("{notice}");
-        }
-        let runtime = detected.engine();
-        let container_runtime = detected.container_runtime();
-        let sandbox_runtime = detected.sandbox_runtime();
-        let overlay_engine = Arc::new(OverlayEngine::with_auth_resolver(auth_paths.clone()));
-        // A daemon has no `Session`, so its credential-refresh settings come
-        // from the global config it just loaded plus the process env.
-        let daemon_config = EffectiveConfig::new(
-            Default::default(),
-            crate::data::config::env::Env::from_process(),
-            Default::default(),
-            global.clone(),
-        );
-        let credential_monitor = credential_refresh_monitor(&daemon_config);
-        // The *detected* runtime, not a fresh Docker handle: `AgentEngine`
-        // branches on `runtime.capabilities()` to decide which paradigm's
-        // options to resolve (F-40b), so handing it a Docker handle under a
-        // sandbox-class runtime resolves container options that the sandbox
-        // runtime then refuses to build.
-        let agent_engine = Arc::new(
-            AgentEngine::new(overlay_engine.clone(), runtime.clone())
-                .with_lease_factory(lease_factory_for(credential_monitor.as_ref())),
-        );
-
-        let workflow_root = match kind {
-            DaemonKind::Api => api_paths.root().to_path_buf(),
-            DaemonKind::Squad => SquadPaths::from_process_env()?.root().to_path_buf(),
-        };
-        let _shared_data_root = paths.root();
-        Ok(Self {
-            runtime,
-            container_runtime,
-            sandbox_runtime,
-            git_engine: Arc::new(GitEngine::new()),
-            overlay_engine,
-            auth_engine: Arc::new(AuthEngine::with_paths(auth_paths, api_paths)),
-            agent_engine,
-            config_notices: Default::default(),
-            workflow_state_store: Arc::new(crate::data::WorkflowStateStore::at_git_root(
-                workflow_root,
-            )),
-            credential_monitor,
-            global_config: Arc::new(global),
-        })
-    }
-
-    pub(crate) fn from_detected(
-        detected: DetectedRuntime,
-        session: &Session,
-    ) -> Result<Self, EngineError> {
-        let runtime = detected.engine();
-        let container_runtime = detected.container_runtime();
-        let sandbox_runtime = detected.sandbox_runtime();
-        let overlay_engine = Arc::new(OverlayEngine::new(session)?);
-        let auth_engine = Arc::new(AuthEngine::new(session)?);
-        // `AgentEngine` is given the *detected* runtime, whatever its
-        // paradigm. It is no longer container-specific: `resolve_agent_options`
-        // branches on `self.runtime.capabilities().kit_declarative` (F-40b), so
-        // the handle it holds decides which paradigm's options come out.
-        // Container-paradigm flows that genuinely need the concrete type still
-        // go through `Engines::require_container_runtime()`.
-        //
-        // A disabled `authRefresh` leaves the monitor unbuilt, making lease
-        // registration a no-op and preserving legacy env-var delivery — the
-        // same kill switch the uninstalled process-global used to be.
-        let credential_monitor = credential_refresh_monitor(&session.effective_config());
-        let agent_engine = Arc::new(
-            AgentEngine::new(overlay_engine.clone(), runtime.clone())
-                .with_lease_factory(lease_factory_for(credential_monitor.as_ref())),
-        );
-
-        Ok(Self {
-            runtime,
-            container_runtime,
-            sandbox_runtime,
-            git_engine: Arc::new(GitEngine::new()),
-            overlay_engine,
-            auth_engine,
-            agent_engine,
-            config_notices: Default::default(),
-            workflow_state_store: Arc::new(crate::data::WorkflowStateStore::at_git_root(
-                session.git_root().to_path_buf(),
-            )),
-            credential_monitor,
-            // The session already merged the global config; taking it from
-            // there rather than re-loading is the whole point of F-31.
-            global_config: Arc::new(session.effective_config().global().clone()),
-        })
-    }
-
-    #[cfg(test)]
-    /// Assemble a hermetic container-tier engine bundle rooted at `root`.
-    pub fn for_tests(root: &std::path::Path) -> Self {
-        let runtime = Arc::new(ContainerRuntime::docker());
-        let auth_paths = AuthPathResolver::at_home(root);
-        let overlay_engine = Arc::new(OverlayEngine::with_auth_resolver(auth_paths.clone()));
-        let agent_engine = Arc::new(AgentEngine::new(overlay_engine.clone(), runtime.clone()));
-        Self {
-            runtime: runtime.clone(),
-            container_runtime: Some(runtime),
-            sandbox_runtime: None,
-            git_engine: Arc::new(GitEngine::new()),
-            overlay_engine,
-            auth_engine: Arc::new(AuthEngine::with_paths(auth_paths, ApiPaths::at_root(root))),
-            agent_engine,
-            config_notices: Default::default(),
-            workflow_state_store: Arc::new(crate::data::WorkflowStateStore::at_git_root(root)),
-            credential_monitor: None,
-            global_config: Arc::new(GlobalConfig::default()),
-        }
-    }
-
-    /// The container-paradigm runtime handle, or — when the active runtime is
-    /// sandbox-class — a `NotImplemented` error. Container-paradigm flows
-    /// (agent setup, image builds, background containers) call this instead
-    /// of unwrapping `container_runtime` so a sandbox-configured user gets an
-    pub fn require_container_runtime(&self) -> Result<&Arc<ContainerRuntime>, EngineError> {
-        self.container_runtime
-            .as_ref()
-            .ok_or(EngineError::NotImplemented(
-                "this command does not yet route to the sandbox runtime \
-                 (docker-sbx-experimental); set runtime to \"docker\" or \
-                 \"apple-containers\" to use it here",
-            ))
-    }
-
-    /// The typed sandbox-tier handle, for the paradigm-specific operations
-    /// the cross-paradigm trait deliberately does not carry. Errors when the
-    /// active runtime is not sandbox-class.
-    pub fn require_sandbox_runtime(&self) -> Result<&Arc<SandboxRuntime>, EngineError> {
-        self.sandbox_runtime
-            .as_ref()
-            .ok_or(EngineError::NotImplemented(
-                "this operation is specific to the sandbox runtime \
-                 (docker-sbx-experimental)",
-            ))
-    }
-
-    /// Agent-runtime detection with the documented CLI/TUI fallback policy,
-    /// lifted out of `main.rs` (WI-0098 Finding B) so Layer 4 stays pure
-    /// wiring. Picks the runtime named by `config`, applying three rules:
-    ///
-    /// * **Valid runtime** → `Ok((runtime, None))`.
-    /// * **Unknown `runtime:` string** — a fatal configuration error, never a
-    ///   silent Docker fallback, for every command that `requires_runtime`.
-    ///   For such a CLI invocation the [`EngineError::UnknownRuntime`] is
-    ///   returned so the caller can print it and exit. Commands that need no
-    ///   runtime (`awman config …`) get a warning and inert default engines,
-    ///   so the setting can be repaired. For the bare-TUI invocation
-    ///   (`command_path` empty) inert default (Docker) engines are still
-    ///   constructed — the TUI boots only far enough to show a fatal modal —
-    ///   and the error text is returned as the second tuple field for that
-    ///   modal.
-    /// * **Runtime unavailable on this host** (e.g. `apple-containers` on
-    ///   Linux) → fatal only when the command `requires_runtime`; otherwise a
-    ///   warning is printed to stderr and detection falls back to the default
-    ///   Docker runtime, keeping `awman config` reachable to fix the setting.
-    ///
-    /// Returns the detected runtime handles paired with the optional TUI
-    /// fatal-modal message (`Some` only on the unknown-runtime TUI path).
-    /// `main` combines the returned [`DetectedRuntime`] with the
-    /// session-derived engines to assemble the full [`Engines`] bundle.
-    pub fn detect(
-        catalogue: &CommandCatalogue,
-        config: &GlobalConfig,
-        command_path: &[&str],
-    ) -> Result<(DetectedRuntime, Option<RuntimeStartupFailure>), EngineError> {
-        Self::detect_result(catalogue, agent_runtime::detect(config), command_path)
-    }
-
-    /// Session-backed runtime selection includes repo overrides for builtin settings.
-    pub fn detect_effective(
-        catalogue: &CommandCatalogue,
-        config: &EffectiveConfig,
-        command_path: &[&str],
-    ) -> Result<(DetectedRuntime, Option<RuntimeStartupFailure>), EngineError> {
-        Self::detect_result(
-            catalogue,
-            agent_runtime::detect_effective(config),
-            command_path,
-        )
-    }
-
-    fn detect_result(
-        catalogue: &CommandCatalogue,
-        result: Result<DetectedRuntime, EngineError>,
-        command_path: &[&str],
-    ) -> Result<(DetectedRuntime, Option<RuntimeStartupFailure>), EngineError> {
-        match result {
-            Ok(detected) => Ok((detected, None)),
-            Err(e @ EngineError::UnknownRuntime { .. }) => {
-                // Invalid `runtime:` is fatal for anything that would run an
-                // agent. CLI invocations bubble the error up to be printed and
-                // exited on; the bare-TUI invocation constructs inert default
-                // engines (never exercised — the modal's only action is quit)
-                // and returns the message for the startup modal. Commands that
-                // need no runtime (`awman config …`) warn and continue, so the
-                // setting stays fixable from the CLI.
-                if !command_path.is_empty() {
-                    if catalogue.requires_runtime(command_path) {
-                        return Err(e);
-                    }
-                    eprintln!(
-                        "warning: {e}; continuing without it so `awman config` can update the \
-                         setting"
-                    );
-                    let fallback = agent_runtime::detect(&GlobalConfig::default())?;
-                    return Ok((fallback, None));
-                }
-                let fallback = agent_runtime::detect(&GlobalConfig::default())?;
-                Ok((fallback, Some(RuntimeStartupFailure::new(e))))
-            }
-            Err(e) => {
-                if command_path.is_empty() {
-                    let inert = agent_runtime::detect(&GlobalConfig::default())?;
-                    return Ok((inert, Some(RuntimeStartupFailure::new(e))));
-                }
-                // A configured runtime this host can't construct must not lock
-                // the user out of `awman config` — the documented way to switch
-                // the runtime back. The catalogue decides which commands need a
-                // runtime; for the rest, warn and continue on the default
-                // Docker runtime, which config commands never touch.
-                if catalogue.requires_runtime(command_path) {
-                    return Err(e);
-                }
-                eprintln!(
-                    "warning: configured runtime is unavailable on this host ({e}); \
-                     continuing with the default Docker runtime so `awman config` \
-                     can update the setting"
-                );
-                let fallback = agent_runtime::detect(&GlobalConfig::default())?;
-                Ok((fallback, None))
-            }
-        }
-    }
-}
 
 // ─── CommandFrontend trait ──────────────────────────────────────────────────
 
@@ -536,64 +150,6 @@ impl<T> DispatchFrontend for T where
         + CleanCommandFrontend
         + 'static
 {
-}
-
-// ─── Outcome / error wrappers ───────────────────────────────────────────────
-
-/// Catch-all outcome enum returned by `Dispatch::run_command`. Layer 3
-/// inspects the variant to choose an appropriate rendering.
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(tag = "kind", content = "payload")]
-pub enum CommandOutcome {
-    Init(crate::command::commands::init::InitOutcome),
-    Ready(crate::command::commands::ready::ReadyOutcome),
-    Chat(crate::command::commands::chat::ChatOutcome),
-    Agents(AgentsOutcome),
-    Config(crate::command::commands::config::ConfigOutcome),
-    ExecPrompt(crate::command::commands::exec_prompt::ExecPromptOutcome),
-    ExecWorkflow(crate::command::commands::exec_workflow::ExecWorkflowOutcome),
-    ApiServer(crate::command::commands::api_server::ApiServerOutcome),
-    Squad(crate::command::commands::squad::commands::SquadOutcome),
-    SquadAttach(SquadAttachOutcome),
-    Remote(crate::command::commands::remote::RemoteOutcome),
-    New(crate::command::commands::new::NewOutcome),
-    Specs(crate::command::commands::specs::SpecsOutcome),
-    Clean(crate::command::commands::clean::CleanOutcome),
-    /// Trivial wrapper used by no-op leaf commands during the refactor.
-    Empty,
-}
-
-impl CommandOutcome {
-    /// The command's process/API exit code. Successful aggregate outcomes can
-    /// still carry a failure: `new skill --pull-all` continues collecting
-    /// libraries after one source fails, and must be visible to both CLI and
-    /// API clients as a non-zero result.
-    ///
-    /// Every agent-session command reports the agent's own exit code. `Chat`
-    /// was missing from this list until WI 0114 F-22: the TUI read
-    /// `ChatOutcome::exit_code` itself while the CLI and API came through here
-    /// and saw 0, so the same failing `awman chat` exited 0 from a script and
-    /// showed red in the TUI.
-    pub fn exit_code(&self) -> i32 {
-        match self {
-            Self::Chat(outcome) => outcome.exit_code.unwrap_or(0),
-            Self::ExecWorkflow(outcome) => outcome.exit_code.unwrap_or(0),
-            Self::ExecPrompt(outcome) => outcome.exit_code.unwrap_or(0),
-            Self::SquadAttach(outcome) => outcome.exit_code,
-            Self::Agents(outcome) => outcome.exit_code(),
-            // `ReadyOutcome::ready` is `ReadySummary::is_ready()` (WI 0125):
-            // a failed required build/import stage must never exit 0, for
-            // the CLI's process exit code and the API's command status alike.
-            Self::Ready(outcome) if !outcome.ready => 1,
-            _ if self.is_partial_failure() => 1,
-            _ => 0,
-        }
-    }
-
-    pub fn is_partial_failure(&self) -> bool {
-        matches!(self, Self::New(crate::command::commands::new::NewOutcome::Skill(skill))
-            if skill.libraries.iter().any(|library| library.error.is_some()))
-    }
 }
 
 /// One per `*Command` struct in `src/command/commands/`. Constructed by
@@ -1064,10 +620,16 @@ impl Drop for UnfinishedCommandGuard {
 /// Move `$frontend` into the `Box<dyn *CommandFrontend>` each command's
 /// [`Command`] impl takes, run it, and wrap the typed outcome in the matching
 /// [`CommandOutcome`] variant. One line per command: the mapping is the only
-/// thing that differs between arms.
+/// thing that differs between arms. `ExecWorkflow` is the one exception: its
+/// frontend may wrap itself first, through
+/// [`ExecWorkflowCommandFrontend::into_exec_workflow_frontend`].
 macro_rules! run_built_command {
     ($built:expr, $frontend:expr, { $($variant:ident => $frontend_trait:path),* $(,)? }) => {
         match $built {
+            BuiltCommand::ExecWorkflow(command) => command
+                .run_with_frontend($frontend.into_exec_workflow_frontend())
+                .await
+                .map(CommandOutcome::ExecWorkflow),
             $(
                 BuiltCommand::$variant(command) => {
                     let boxed: Box<dyn $frontend_trait> = Box::new($frontend);
@@ -1086,9 +648,8 @@ impl BuiltCommand {
     ///
     /// The enum survives WI 0113 F-10 because [`Command`] carries associated
     /// `Frontend` and `Outcome` types and so cannot be made into a trait
-    /// object, and because `cli::run` still needs to reach inside for the
-    /// `exec workflow` carve-out. What it no longer carries is any per-command
-    /// logic — only the variant-to-frontend-trait mapping below.
+    /// object. What it no longer carries is any per-command logic — only the
+    /// variant-to-frontend-trait mapping below.
     pub async fn run_with_frontend<F: DispatchFrontend>(
         self,
         frontend: F,
@@ -1101,7 +662,6 @@ impl BuiltCommand {
             Agents => AgentsCommandFrontend,
             Config => ConfigCommandFrontend,
             ExecPrompt => ExecPromptCommandFrontend,
-            ExecWorkflow => ExecWorkflowCommandFrontend,
             ApiServer => ApiServerCommandFrontend,
             Squad => SquadCommandFrontend,
             SquadAttach => SquadAttachFrontend,
@@ -1367,34 +927,6 @@ mod tests {
         Arc::new(RwLock::new(Session::for_tests(tmp.path())))
     }
 
-    /// A malformed global config fails the daemon's start with a message
-    /// naming the file, instead of being `unwrap_or_default()`ed away (F-31).
-    #[test]
-    fn a_malformed_global_config_fails_the_daemon_bootstrap() {
-        use crate::data::fs::DataPaths;
-
-        let _lock = crate::data::config::env::DAEMON_OVERLAY_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let tmp = tempfile::tempdir().unwrap();
-        let _env = crate::data::config::env::ConfigHomeGuard::set(tmp.path());
-        // `AWMAN_CONFIG_HOME` *is* the config home, so the file sits directly
-        // under it.
-        std::fs::write(tmp.path().join("config.json"), "{ \"runtime\": ").unwrap();
-
-        let paths = DataPaths::at_root(tmp.path());
-        let result = Engines::for_daemon(DaemonKind::Squad, &paths);
-
-        let error = result
-            .err()
-            .expect("a malformed config must fail the start");
-        let text = error.to_string();
-        assert!(
-            text.contains("config.json"),
-            "the error must name the file: {text}"
-        );
-    }
-
     /// Who the caller is comes from the frontend's declared kind, once, at
     /// construction — not from a per-frontend `is_local_user_session`
     /// override (F-49).
@@ -1423,7 +955,7 @@ mod tests {
     /// the failure, which is exactly what the unwind does to it.
     #[test]
     fn an_unfinished_command_is_recorded_as_failed_on_the_session() {
-        use crate::data::session::CommandStatus;
+        use crate::data::session::InvocationStatus;
 
         let session = make_session();
         {
@@ -1442,7 +974,7 @@ mod tests {
             .as_ref()
             .expect("the command is still recorded");
         match &command.status {
-            CommandStatus::Error(message) => assert!(
+            InvocationStatus::Error(message) => assert!(
                 message.contains("ended unexpectedly"),
                 "unexpected message: {message}"
             ),
@@ -1454,7 +986,7 @@ mod tests {
     /// never overwrites it.
     #[test]
     fn a_disarmed_guard_leaves_the_recorded_outcome_alone() {
-        use crate::data::session::CommandStatus;
+        use crate::data::session::InvocationStatus;
 
         let session = make_session();
         {
@@ -1470,49 +1002,8 @@ mod tests {
 
         let guard = session.try_read().unwrap();
         let command = guard.state().current_command.as_ref().unwrap();
-        assert!(matches!(command.status, CommandStatus::Done));
+        assert!(matches!(command.status, InvocationStatus::Done));
         assert_eq!(command.exit_code, Some(0));
-    }
-
-    /// `Engines::from_detected` must hand `AgentEngine` the runtime it
-    /// actually detected, not a fresh Docker handle.
-    ///
-    /// `AgentEngine::resolve_agent_options` branches on
-    /// `self.runtime.capabilities().kit_declarative` (F-40b). When the two
-    /// disagree, a sandbox user gets `ResolvedAgentOptions::Container` out of
-    /// the agent engine and `SandboxRuntime::build` then refuses it with
-    /// `OptionVariantMismatch` — every `chat`, `exec prompt` and `exec
-    /// workflow` fails. The other sandbox tests build an `AgentEngine`
-    /// directly, so only a test that goes through `Engines` catches it.
-    #[test]
-    fn a_sandbox_detected_runtime_gives_the_agent_engine_a_sandbox_runtime() {
-        use crate::engine::agent_runtime::{DetectedRuntime, ResolvedAgentOptions};
-        use crate::engine::sandbox::SandboxRuntime;
-
-        let tmp = tempfile::tempdir().unwrap();
-        let session = Session::for_tests(tmp.path());
-
-        let detected = DetectedRuntime::Sandbox(Arc::new(SandboxRuntime::for_tests()));
-        let engines = Engines::from_detected(detected, &session).unwrap();
-
-        assert!(
-            engines
-                .agent_engine
-                .runtime()
-                .capabilities()
-                .kit_declarative,
-            "the agent engine must hold the detected sandbox runtime"
-        );
-
-        let agent = crate::data::session::AgentName::new("claude").unwrap();
-        let resolved = engines
-            .agent_engine
-            .resolve_agent_options(&session, &agent, &Default::default(), &Default::default())
-            .expect("resolving options under a sandbox runtime");
-        assert!(
-            matches!(resolved, ResolvedAgentOptions::Sandbox(_)),
-            "a sandbox-class runtime must resolve sandbox options; got {resolved:?}"
-        );
     }
 
     #[test]
@@ -1673,6 +1164,20 @@ mod tests {
         );
         let built = dispatch.build_command(&["config", "show"]).unwrap();
         assert!(matches!(built, BuiltCommand::Config(_)));
+    }
+
+    /// A built config command keeps the once-per-repo state of the host's
+    /// bundle, so a notice is not repeated for each command the host runs.
+    #[test]
+    fn build_config_shares_the_bundles_notices_handle() {
+        let engines = Engines::for_tests(std::path::Path::new("/tmp"));
+        let notices = engines.config_notices.clone();
+        let dispatch = Dispatch::new(FakeCommandFrontend::new(), make_session(), engines);
+        let BuiltCommand::Config(command) = dispatch.build_command(&["config", "show"]).unwrap()
+        else {
+            panic!("expected Config");
+        };
+        assert!(Arc::ptr_eq(command.notices(), &notices));
     }
 
     #[test]
@@ -1853,16 +1358,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(parsed.path, vec!["exec", "workflow"]);
-        assert!(matches!(
-            parsed.flags.get("yolo"),
-            Some(parsed_input::FlagValue::Bool(true))
-        ));
-        match parsed.arguments.get("workflow") {
-            Some(parsed_input::ArgValue::Single(s)) => {
-                assert_eq!(s, "my-workflow.toml");
-            }
-            other => panic!("expected Single workflow argument, got: {other:?}"),
-        }
+        assert_eq!(parsed.args.flag_bool("yolo"), Some(true));
+        assert_eq!(
+            parsed.args.argument("workflow").as_deref(),
+            Some("my-workflow.toml")
+        );
     }
 
     #[test]
@@ -1891,26 +1391,18 @@ mod tests {
         )
         .unwrap();
         assert_eq!(parsed.path, vec!["remote", "exec", "workflow"]);
-        match parsed.arguments.get("workflow") {
-            Some(parsed_input::ArgValue::Single(s)) => {
-                assert_eq!(s, "my-workflow.toml");
-            }
-            other => panic!("expected Single workflow argument, got: {other:?}"),
-        }
-        assert!(matches!(
-            parsed.flags.get("follow"),
-            Some(parsed_input::FlagValue::Bool(true))
-        ));
+        assert_eq!(
+            parsed.args.argument("workflow").as_deref(),
+            Some("my-workflow.toml")
+        );
+        assert_eq!(parsed.args.flag_bool("follow"), Some(true));
     }
 
     #[test]
     fn parse_command_box_input_short_flag_non_interactive() {
         let parsed = Dispatch::<FakeCommandFrontend>::parse_command_box_input("ready -n").unwrap();
         assert_eq!(parsed.path, vec!["ready"]);
-        assert!(matches!(
-            parsed.flags.get("non-interactive"),
-            Some(parsed_input::FlagValue::Bool(true))
-        ));
+        assert_eq!(parsed.args.flag_bool("non-interactive"), Some(true));
     }
 
     #[test]
@@ -2239,292 +1731,6 @@ mod tests {
         assert!(
             matches!(result, Err(CommandError::MissingRequiredArgument { .. })),
             "static exec workflow without path must return MissingRequiredArgument"
-        );
-    }
-
-    // ── WI-0098 Finding B: Engines::detect runtime-detection policy ───────────
-    //
-    // The three documented paths lifted out of `main.rs`: valid runtime, an
-    // unknown `runtime:` string (fatal for CLI, modal for TUI), and a runtime
-    // unavailable on this host (fatal only when the command requires a runtime).
-
-    fn config_with_runtime(runtime: Option<&str>) -> GlobalConfig {
-        GlobalConfig {
-            runtime: runtime.map(String::from),
-            ..Default::default()
-        }
-    }
-
-    fn session_at(root: &std::path::Path) -> Session {
-        Session::open_at_git_root(
-            root.to_path_buf(),
-            root.to_path_buf(),
-            crate::data::session::SessionOpenOptions::default(),
-        )
-        .expect("open test session")
-    }
-
-    fn with_daemon_global_config<T>(config: GlobalConfig, test: impl FnOnce() -> T) -> T {
-        let home = tempfile::tempdir().expect("create global config home");
-        // `ConfigHomeGuard`, not `CWD_LOCK`: the variable this serialises is
-        // `AWMAN_CONFIG_HOME`, and the `clean` and `overlay` tests that also
-        // repoint it never touched `CWD_LOCK`. Holding the wrong lock let
-        // them move the config home mid-test, so `Engines::for_daemon` read a
-        // config it was never given and built the wrong runtime tier.
-        let _guard = crate::data::config::env::ConfigHomeGuard::set(home.path());
-        config.save().expect("save global config");
-        test()
-    }
-
-    #[test]
-    fn engines_build_and_for_daemon_produce_container_tier_under_default_config() {
-        let root = tempfile::tempdir().expect("create test root");
-        let session = session_at(root.path());
-        let built = Engines::build(&GlobalConfig::default(), &session)
-            .expect("default session engines build");
-        assert!(built.container_runtime.is_some());
-        assert!(built.sandbox_runtime.is_none());
-
-        with_daemon_global_config(GlobalConfig::default(), || {
-            let daemon = Engines::for_daemon(DaemonKind::Api, &DataPaths::at_root(root.path()))
-                .expect("default daemon engines build");
-            assert!(daemon.container_runtime.is_some());
-            assert!(daemon.sandbox_runtime.is_none());
-        });
-    }
-
-    /// `docker-sbx-experimental` is platform-gated in `SandboxRuntime::dsbx`
-    /// (linux refuses with `BackendUnsupportedOnPlatform`
-    /// — see `engine::sandbox::runtime`'s own `dsbx_errors_on_*` tests, which
-    /// use the same branch-on-`cfg!` pattern). `Engines::build`/`for_daemon`
-    /// only assemble a sandbox-tier bundle on the platforms where the backend
-    /// actually constructs.
-    #[test]
-    fn engines_build_and_for_daemon_produce_sandbox_tier_for_experimental_runtime() {
-        let root = tempfile::tempdir().expect("create test root");
-        let session = session_at(root.path());
-        let config = config_with_runtime(Some("docker-sbx-experimental"));
-
-        if cfg!(target_os = "linux") {
-            match Engines::build(&config, &session) {
-                Err(EngineError::BackendUnsupportedOnPlatform { backend, .. }) => {
-                    assert_eq!(backend, "docker-sbx-experimental")
-                }
-                Err(e) => panic!("expected BackendUnsupportedOnPlatform, got {e:?}"),
-                Ok(_) => panic!("dsbx build must fail on this platform"),
-            }
-
-            with_daemon_global_config(config, || {
-                match Engines::for_daemon(DaemonKind::Squad, &DataPaths::at_root(root.path())) {
-                    Err(EngineError::BackendUnsupportedOnPlatform { backend, .. }) => {
-                        assert_eq!(backend, "docker-sbx-experimental")
-                    }
-                    Err(e) => panic!("expected BackendUnsupportedOnPlatform, got {e:?}"),
-                    Ok(_) => panic!("dsbx for_daemon must fail on this platform"),
-                }
-            });
-            return;
-        }
-
-        let built = Engines::build(&config, &session).expect("sandbox session engines build");
-        assert!(built.container_runtime.is_none());
-        assert!(built.sandbox_runtime.is_some());
-
-        with_daemon_global_config(config, || {
-            let daemon = Engines::for_daemon(DaemonKind::Squad, &DataPaths::at_root(root.path()))
-                .expect("sandbox daemon engines build");
-            assert!(daemon.container_runtime.is_none());
-            assert!(daemon.sandbox_runtime.is_some());
-        });
-    }
-
-    #[test]
-    fn detect_valid_runtime_returns_runtime_and_no_modal_message() {
-        let cat = CommandCatalogue::get();
-        let cfg = config_with_runtime(Some("docker"));
-        let (detected, modal) = Engines::detect(cat, &cfg, &["agents", "status"])
-            .expect("a valid runtime must detect successfully");
-        assert_eq!(detected.engine().runtime_name(), "docker");
-        assert!(
-            modal.is_none(),
-            "no fatal-modal message on the valid-runtime path"
-        );
-    }
-
-    #[test]
-    fn detect_unknown_runtime_cli_returns_unknown_runtime_error() {
-        // A CLI invocation (non-empty command path) with a misspelled runtime is
-        // a fatal configuration error the caller prints and exits on.
-        let cat = CommandCatalogue::get();
-        let cfg = config_with_runtime(Some("totally-bogus-runtime"));
-        // `DetectedRuntime` is not `Debug`, so match rather than `expect_err`.
-        match Engines::detect(cat, &cfg, &["agents", "status"]) {
-            Err(EngineError::UnknownRuntime { .. }) => {}
-            Err(other) => panic!("expected UnknownRuntime, got {other:?}"),
-            Ok(_) => panic!("an unknown runtime must be an error for CLI invocations"),
-        }
-    }
-
-    #[test]
-    fn detect_unknown_runtime_keeps_config_reachable() {
-        // A stored typo must not lock the user out of the command that fixes
-        // it; `config` never runs an agent, so inert default engines are safe.
-        let cat = CommandCatalogue::get();
-        assert!(!cat.requires_runtime(&["config", "set"]));
-        let cfg = config_with_runtime(Some("builtin"));
-        match Engines::detect(cat, &cfg, &["config", "set"]) {
-            Ok((detected, modal)) => {
-                assert_eq!(detected.engine().runtime_name(), "docker");
-                assert!(modal.is_none());
-            }
-            Err(e) => panic!("config must stay reachable, got {e:?}"),
-        }
-    }
-
-    #[test]
-    fn detect_unknown_runtime_tui_builds_default_engines_and_returns_modal_message() {
-        // The bare-TUI invocation (empty command path) must still construct inert
-        // default (Docker) engines so the fatal modal can render, and return the
-        // error text for that modal.
-        let cat = CommandCatalogue::get();
-        let cfg = config_with_runtime(Some("totally-bogus-runtime"));
-        let (detected, modal) =
-            Engines::detect(cat, &cfg, &[]).expect("the TUI path must still yield default engines");
-        assert_eq!(
-            detected.engine().runtime_name(),
-            "docker",
-            "the TUI fallback must be the default Docker runtime"
-        );
-        let msg = modal
-            .expect("the TUI path must return a fatal-modal message")
-            .error
-            .to_string();
-        assert!(
-            msg.contains("totally-bogus-runtime"),
-            "modal message must name the bad runtime; got: {msg}"
-        );
-    }
-
-    // The unavailable-on-host path needs a runtime that this host cannot
-    // construct. `apple-containers` is unavailable on every non-macOS host, so
-    // these two tests exercise the fatal-vs-warn branch there.
-    #[cfg(not(target_os = "macos"))]
-    #[test]
-    fn detect_unavailable_runtime_is_fatal_when_command_requires_runtime() {
-        let cat = CommandCatalogue::get();
-        let cfg = config_with_runtime(Some("apple-containers"));
-        // `agents status` requires a runtime → the unavailable runtime is fatal.
-        assert!(cat.requires_runtime(&["agents", "status"]));
-        match Engines::detect(cat, &cfg, &["agents", "status"]) {
-            Err(EngineError::UnknownRuntime { .. }) => {
-                panic!("an unavailable (not unknown) runtime must not surface as UnknownRuntime")
-            }
-            Err(_) => {}
-            Ok(_) => panic!("an unavailable runtime must be fatal for a runtime-requiring command"),
-        }
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    #[test]
-    fn detect_unavailable_runtime_warns_and_falls_back_when_command_allows() {
-        let cat = CommandCatalogue::get();
-        let cfg = config_with_runtime(Some("apple-containers"));
-        // `config` does not require a runtime → warn on stderr and fall back to
-        // the default Docker runtime so `awman config` stays reachable.
-        assert!(!cat.requires_runtime(&["config", "show"]));
-        let (detected, modal) = Engines::detect(cat, &cfg, &["config", "show"])
-            .expect("config commands must fall back rather than fail");
-        assert_eq!(
-            detected.engine().runtime_name(),
-            "docker",
-            "the fallback must be the default Docker runtime"
-        );
-        assert!(
-            modal.is_none(),
-            "the unavailable-but-tolerated path yields no TUI modal message"
-        );
-    }
-
-    #[test]
-    fn command_outcome_exit_code_covers_execution_and_partial_skill_failure() {
-        assert_eq!(
-            CommandOutcome::ExecWorkflow(
-                crate::command::commands::exec_workflow::ExecWorkflowOutcome {
-                    prerequisites: None,
-                    workflow: "workflow.toml".into(),
-                    exit_code: Some(17),
-                    worktree_used: false,
-                }
-            )
-            .exit_code(),
-            17
-        );
-        assert_eq!(
-            CommandOutcome::ExecPrompt(crate::command::commands::exec_prompt::ExecPromptOutcome {
-                agent: None,
-                exit_code: Some(3)
-            })
-            .exit_code(),
-            3
-        );
-        let partial = CommandOutcome::New(crate::command::commands::new::NewOutcome::Skill(
-            crate::command::commands::new::NewSkillOutcome {
-                interview: false,
-                global: false,
-                path: None,
-                pull: true,
-                libraries: vec![crate::command::commands::new::PullLibraryOutcome {
-                    slug: "broken".into(),
-                    dir: "broken".into(),
-                    updated: false,
-                    skills_found: Vec::new(),
-                    error: Some("unreachable".into()),
-                }],
-            },
-        ));
-        assert!(partial.is_partial_failure());
-        assert_eq!(partial.exit_code(), 1);
-        assert_eq!(CommandOutcome::Empty.exit_code(), 0);
-    }
-
-    /// WI 0125 (M-7): a `Ready` outcome's exit code is driven by
-    /// `ReadyOutcome::ready` (set from `ReadySummary::is_ready()` in
-    /// `From<ReadySummary>`), not by whether the engine returned `Ok` —
-    /// `run_to_completion` can return `Ok(summary)` for a summary that
-    /// recorded a failed build/import as a row rather than an `Err`. Before
-    /// this change every `Ready` outcome exited 0 regardless of
-    /// `StepStatus::Failed` anywhere in it.
-    #[test]
-    fn command_outcome_exit_code_reflects_ready_image_failures() {
-        fn ready_outcome(ready: bool) -> CommandOutcome {
-            use crate::command::commands::ready::ReadyOutcome;
-            use crate::data::step_status::StepStatus;
-            CommandOutcome::Ready(ReadyOutcome {
-                runtime: "docker".into(),
-                dockerfile: StepStatus::Done,
-                base_image: StepStatus::Done,
-                agent_image: StepStatus::Done,
-                image_source: None,
-                agent_definition: None,
-                local_agent: StepStatus::Done,
-                audit: StepStatus::Skipped,
-                image_rebuild: StepStatus::Skipped,
-                agent_credentials: Vec::new(),
-                non_default_agent_images: Vec::new(),
-                image_results: Vec::new(),
-                base_image_results: Vec::new(),
-                ready,
-                json_requested: false,
-                refresh_requested: false,
-            })
-        }
-
-        assert_eq!(ready_outcome(true).exit_code(), 0);
-        assert_eq!(
-            ready_outcome(false).exit_code(),
-            1,
-            "a failed required image stage must exit non-zero on every runtime, \
-             not only builtin"
         );
     }
 

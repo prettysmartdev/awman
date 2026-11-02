@@ -8,23 +8,15 @@ use awman::data::session::AgentName;
 use awman::engine::container::options::OverlayPermission;
 use awman::engine::overlay::{DirectorySpec, OverlayEngine, OverlayRequest, CLAUDE_DENYLIST};
 
-/// Serialises tests that write to `AWMAN_CONFIG_HOME` (a process-global env var).
-static AMUX_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// Set `AWMAN_CONFIG_HOME` to `home`, run `f`, then restore the previous value.
+/// Set `AWMAN_CONFIG_HOME` to `home`, run `f`, then restore the previous value
+/// (even if `f` panics) under the engine binary's shared environment guard.
 fn with_amux_config_home<F, R>(home: &std::path::Path, f: F) -> R
 where
     F: FnOnce() -> R,
 {
-    let _g = AMUX_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let prev = std::env::var("AWMAN_CONFIG_HOME").ok();
-    std::env::set_var("AWMAN_CONFIG_HOME", home.to_str().unwrap());
-    let result = f();
-    match prev {
-        Some(v) => std::env::set_var("AWMAN_CONFIG_HOME", v),
-        None => std::env::remove_var("AWMAN_CONFIG_HOME"),
-    }
-    result
+    let mut env = crate::process_env::ProcessEnvGuard::lock();
+    env.set("AWMAN_CONFIG_HOME", home);
+    f()
 }
 
 fn make_engine(home: &std::path::Path) -> OverlayEngine {

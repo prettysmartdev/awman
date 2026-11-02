@@ -39,16 +39,13 @@ const MIN_EXEC_HEIGHT: u16 = 5;
 /// Render the full TUI frame.
 pub fn render_frame(app: &mut App, frame: &mut Frame) {
     let area = frame.area();
+    let workflow_snapshot = app.active_tab().shared.workflow.snapshot();
 
     // Read shape decisions from the active tab (immutable borrow).
     let (wf_state, overview_state, container_state, has_summary, git_sidebar_state, slot_count) = {
         let tab = app.active_tab();
         (
-            tab.shared
-                .workflow_state
-                .lock()
-                .ok()
-                .and_then(|g| g.clone()),
+            workflow_snapshot.view.clone(),
             tab.workflow_overview_state,
             tab.container_window_state,
             tab.last_container_summary.is_some(),
@@ -175,13 +172,7 @@ pub fn render_frame(app: &mut App, frame: &mut Frame) {
 
     // A squad attach may observe another invocation without spawning a new
     // command on this tab. Give that run a fresh horizontal viewport.
-    let invocation_id = app
-        .active_tab()
-        .shared
-        .workflow_invocation_id
-        .lock()
-        .ok()
-        .and_then(|id| *id);
+    let invocation_id = workflow_snapshot.invocation_id;
     if let Some(id) = invocation_id {
         let tab = app.active_tab_mut();
         if tab.last_workflow_invocation_id != Some(id) {

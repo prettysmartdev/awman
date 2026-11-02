@@ -1382,11 +1382,13 @@ fn update_setup_status_round_trips() {
         .unwrap();
 
     let s = store.get_session("sid").unwrap().unwrap();
-    assert_eq!(s.setup_status, "initializing");
+    assert_eq!(s.setup_status.as_str(), "initializing");
 
-    assert!(store.update_setup_status("sid", "ready").unwrap());
+    assert!(store
+        .update_setup_status("sid", SessionSetupStatus::Ready)
+        .unwrap());
     let s2 = store.get_session("sid").unwrap().unwrap();
-    assert_eq!(s2.setup_status, "ready");
+    assert_eq!(s2.setup_status.as_str(), "ready");
 }
 
 // ─── Per-job SSE endpoint ─────────────────────────────────────────────────────

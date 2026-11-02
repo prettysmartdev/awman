@@ -263,12 +263,23 @@ pub(crate) fn install_crush_fixture(
     root: &std::path::Path,
     env: &crate::data::config::env::EnvSnapshot,
 ) -> AgentDefinition {
+    install_crush_fixture_with_prompt(root, env, "delivery = \"none\"")
+}
+
+/// The Crush example with its `[system_prompt]` table body replaced.
+#[cfg(test)]
+pub(crate) fn install_crush_fixture_with_prompt(
+    root: &std::path::Path,
+    env: &crate::data::config::env::EnvSnapshot,
+    prompt_table: &str,
+) -> AgentDefinition {
     let dir = root.join(".awman/agents");
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("crush.toml");
     std::fs::write(
         &path,
-        include_str!("../../../skills/create-custom-agent/examples/crush.toml"),
+        include_str!("../../../skills/create-custom-agent/examples/crush.toml")
+            .replace("delivery = \"none\"", prompt_table),
     )
     .unwrap();
     let loaded = load_agent_definition_with_scope(&path, DefinitionScope::Repo).unwrap();

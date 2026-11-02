@@ -22,7 +22,6 @@ use std::path::PathBuf;
 use crate::command::dispatch::catalogue::{
     ArgumentKind, CommandCatalogue, CommandSpec, FlagDefault, FlagKind, FlagSpec, FrontendKind,
 };
-use crate::command::dispatch::parsed_input::{ArgValue, FlagValue, ParsedCommandBoxInput};
 use crate::command::error::CommandError;
 
 /// A single parsed flag value, typed per the catalogue's declared [`FlagKind`].
@@ -38,8 +37,9 @@ pub enum ParsedFlag {
 
 /// Typed result of [`CommandCatalogue::parse_raw_args`]. Frontends read values
 /// out of it through the accessor methods, which map 1:1 onto the
-/// `CommandFrontend` trait surface.
-#[derive(Debug, Clone, Default)]
+/// `CommandFrontend` trait surface. This is the one parsed representation the
+/// API and TUI dispatch from; nothing downstream re-validates its values.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ParsedArgs {
     flags: BTreeMap<String, ParsedFlag>,
     /// Positional arguments, keyed by their catalogue name. Stored as a vector
@@ -53,6 +53,27 @@ pub struct ParsedArgs {
 }
 
 impl ParsedArgs {
+    /// A parsed invocation a frontend raises itself: `bool_flags` set true and
+    /// at most one positional. Callers check both against the command's spec.
+    pub(crate) fn for_action(bool_flags: &[&str], argument: Option<(&str, &str)>) -> Self {
+        Self {
+            flags: bool_flags
+                .iter()
+                .map(|name| ((*name).to_string(), ParsedFlag::Bool(true)))
+                .collect(),
+            arguments: argument
+                .map(|(name, value)| (name.to_string(), vec![value.to_string()]))
+                .into_iter()
+                .collect(),
+            path_arguments: BTreeSet::new(),
+        }
+    }
+
+    /// Whether the invocation set `flag`, whatever its type.
+    pub fn has_flag(&self, flag: &str) -> bool {
+        self.flags.contains_key(flag)
+    }
+
     pub fn flag_bool(&self, flag: &str) -> Option<bool> {
         match self.flags.get(flag) {
             Some(ParsedFlag::Bool(b)) => Some(*b),
@@ -181,6 +202,15 @@ fn flag_default_to_parsed(value: &FlagDefault) -> Option<ParsedFlag> {
     }
 }
 
+/// Whether the caller asked for `name`, by the rule of
+/// [`ResolvedFlags::supplied`](crate::command::dispatch::resolved::ResolvedFlags::supplied):
+/// an explicit `--flag=false` asks for nothing, so it conflicts with nothing.
+fn flag_is_active(flags: &BTreeMap<String, ParsedFlag>, name: &str) -> bool {
+    flags
+        .get(name)
+        .is_some_and(|value| !matches!(value, ParsedFlag::Bool(false)))
+}
+
 /// Apply the frontend profile's flag defaults to an already-parsed argv. Only
 /// flags the command actually declares are touched, so commands without the
 /// flag are left untouched.
@@ -207,7 +237,7 @@ fn apply_frontend_defaults(parsed: &mut ParsedArgs, spec: &CommandSpec, frontend
         let conflict_present = flag_spec
             .conflicts_with
             .iter()
-            .any(|other| parsed.flags.contains_key(*other));
+            .any(|other| flag_is_active(&parsed.flags, other));
         if conflict_present {
             continue;
         }
@@ -275,61 +305,6 @@ impl CommandCatalogue {
             .filter(|entry| spec.find_flag(entry.flag).is_some())
             .map(|entry| (entry.flag, entry.value))
             .collect()
-    }
-}
-
-impl ParsedArgs {
-    /// Reshape into the TUI command box's [`ParsedCommandBoxInput`].
-    ///
-    /// The command box's frontend reads flags as strings, so the typed values
-    /// this parser produced are rendered back — which is what the box's own
-    /// parser produced before WI 0114 F-26 folded the two together. The
-    /// difference is that a bad enum value or a non-numeric number has already
-    /// been rejected by the time this runs, rather than surviving as a string
-    /// to fail later (or not at all).
-    pub fn into_command_box_input(
-        self,
-        spec: &CommandSpec,
-        path: Vec<String>,
-    ) -> ParsedCommandBoxInput {
-        let flags = self
-            .flags
-            .into_iter()
-            .map(|(name, value)| {
-                let value = match value {
-                    ParsedFlag::Bool(b) => FlagValue::Bool(b),
-                    ParsedFlag::Str(s) => FlagValue::String(s),
-                    ParsedFlag::Strings(v) => FlagValue::Strings(v),
-                    ParsedFlag::Path(p) => FlagValue::String(p.display().to_string()),
-                    ParsedFlag::U16(n) => FlagValue::String(n.to_string()),
-                    ParsedFlag::Usize(n) => FlagValue::String(n.to_string()),
-                };
-                (name, value)
-            })
-            .collect();
-
-        let arguments = self
-            .arguments
-            .into_iter()
-            .map(|(name, values)| {
-                let trailing = spec
-                    .arguments
-                    .iter()
-                    .any(|a| a.name == name && matches!(a.kind, ArgumentKind::TrailingVarArgs));
-                let value = if trailing {
-                    ArgValue::Multi(values)
-                } else {
-                    ArgValue::Single(values.into_iter().next().unwrap_or_default())
-                };
-                (name, value)
-            })
-            .collect();
-
-        ParsedCommandBoxInput {
-            path,
-            flags,
-            arguments,
-        }
     }
 }
 
@@ -410,13 +385,13 @@ fn parse_against_spec(
     // Raw/API parsing has no clap layer, so enforce the same declarative rule
     // before dispatch can observe a contradictory flag set.
     for flag in spec.flags {
-        if !flags.contains_key(flag.long) {
+        if !flag_is_active(&flags, flag.long) {
             continue;
         }
         if let Some(conflicting) = flag
             .conflicts_with
             .iter()
-            .find(|conflicting| flags.contains_key::<str>(*conflicting))
+            .find(|conflicting| flag_is_active(&flags, conflicting))
         {
             return Err(CommandError::InvalidFlagValue {
                 command: path.iter().map(|segment| (*segment).to_string()).collect(),
@@ -809,6 +784,14 @@ mod tests {
     }
 
     #[test]
+    fn only_parse_stage_errors_can_be_replayed() {
+        let error = cat().parse_raw_args(&["nope"], &argv(&[])).unwrap_err();
+        let replay = error.clone_parse_stage().expect("a parse error replays");
+        assert_eq!(replay.to_string(), error.to_string());
+        assert!(CommandError::Aborted.clone_parse_stage().is_none());
+    }
+
+    #[test]
     fn explicit_yolo_value_is_kept_under_api_profile() {
         // yolo is an overridable default, so if the request already set it the
         // profile must not clobber it.
@@ -816,5 +799,276 @@ mod tests {
             .parse_raw_args_with_profile(&["exec", "prompt"], &argv(&["--yolo"]), FrontendKind::Api)
             .unwrap();
         assert_eq!(p.flag_bool("yolo"), Some(true));
+    }
+}
+
+/// Parsing cases every frontend that dispatches from [`ParsedArgs`] must read
+/// back identically. The API and TUI frontends' own tests run this table, so
+/// the only allowed differences are the profile rows declared here.
+#[cfg(test)]
+pub(crate) mod shared_cases {
+    use super::*;
+    use crate::command::dispatch::CommandFrontend;
+
+    pub(crate) enum Read {
+        /// Compared the way `resolved::read_flag` reads it: absent is false.
+        Bool(&'static str, bool),
+        Str(&'static str, &'static str),
+        Strs(&'static str, &'static [&'static str]),
+        Path(&'static str, &'static str),
+        U16(&'static str, u16),
+        Usize(&'static str, usize),
+        Arg(&'static str, &'static str),
+        Args(&'static str, &'static [&'static str]),
+    }
+
+    pub(crate) struct Case {
+        pub name: &'static str,
+        /// The command as typed, possibly through an alias.
+        pub path: &'static [&'static str],
+        pub canonical: &'static [&'static str],
+        pub args: &'static [&'static str],
+        pub reads: &'static [Read],
+        /// Reads that differ by caller profile.
+        pub tui_reads: &'static [Read],
+        pub api_reads: &'static [Read],
+    }
+
+    const PROMPT: &[&str] = &["exec", "prompt"];
+    const WORKFLOW: &[&str] = &["exec", "workflow"];
+
+    pub(crate) const CASES: &[Case] = &[
+        Case {
+            name: "omitted flags: false for the TUI, API profile defaults and forces",
+            path: PROMPT,
+            canonical: PROMPT,
+            args: &["hi"],
+            reads: &[Read::Bool("plan", false)],
+            tui_reads: &[
+                Read::Bool("yolo", false),
+                Read::Bool("non-interactive", false),
+            ],
+            api_reads: &[
+                Read::Bool("yolo", true),
+                Read::Bool("non-interactive", true),
+            ],
+        },
+        Case {
+            name: "explicit false beats a default but not a forced flag",
+            path: PROMPT,
+            canonical: PROMPT,
+            args: &["--yolo=false", "--non-interactive=false", "hi"],
+            reads: &[Read::Bool("yolo", false)],
+            tui_reads: &[Read::Bool("non-interactive", false)],
+            api_reads: &[Read::Bool("non-interactive", true)],
+        },
+        Case {
+            name: "a conflicting flag suppresses the API's yolo default",
+            path: PROMPT,
+            canonical: PROMPT,
+            args: &["--plan", "hi"],
+            reads: &[Read::Bool("plan", true), Read::Bool("yolo", false)],
+            tui_reads: &[],
+            api_reads: &[],
+        },
+        Case {
+            name: "an explicitly false flag does not suppress another flag's default",
+            path: PROMPT,
+            canonical: PROMPT,
+            args: &["--plan=false", "hi"],
+            reads: &[Read::Bool("plan", false)],
+            tui_reads: &[Read::Bool("yolo", false)],
+            api_reads: &[Read::Bool("yolo", true)],
+        },
+        Case {
+            name: "an explicitly false flag keeps its own value beside a false conflict",
+            path: PROMPT,
+            canonical: PROMPT,
+            args: &["--plan=false", "--yolo=false", "hi"],
+            reads: &[Read::Bool("plan", false), Read::Bool("yolo", false)],
+            tui_reads: &[],
+            api_reads: &[],
+        },
+        Case {
+            name: "a false --plan does not conflict with --yolo",
+            path: PROMPT,
+            canonical: PROMPT,
+            args: &["--plan=false", "--yolo", "hi"],
+            reads: &[Read::Bool("plan", false), Read::Bool("yolo", true)],
+            tui_reads: &[],
+            api_reads: &[],
+        },
+        Case {
+            name: "a false --yolo does not conflict with --plan",
+            path: PROMPT,
+            canonical: PROMPT,
+            args: &["--yolo=false", "--plan", "hi"],
+            reads: &[Read::Bool("plan", true), Read::Bool("yolo", false)],
+            tui_reads: &[],
+            api_reads: &[],
+        },
+        Case {
+            name: "a command alias and a short flag resolve to canonical names",
+            path: &["exec", "wf"],
+            canonical: WORKFLOW,
+            args: &["a.toml", "-n"],
+            reads: &[
+                Read::Bool("non-interactive", true),
+                Read::Arg("workflow", "a.toml"),
+            ],
+            tui_reads: &[],
+            api_reads: &[],
+        },
+        Case {
+            name: "numeric flags at their bounds arrive typed",
+            path: WORKFLOW,
+            canonical: WORKFLOW,
+            args: &["a.toml", "--max-concurrent", "1"],
+            reads: &[Read::Usize("max-concurrent", 1)],
+            tui_reads: &[],
+            api_reads: &[],
+        },
+        Case {
+            name: "the largest port arrives typed",
+            path: &["api", "start"],
+            canonical: &["api", "start"],
+            args: &["--port=65535"],
+            reads: &[Read::U16("port", 65535)],
+            tui_reads: &[],
+            api_reads: &[],
+        },
+        Case {
+            name: "a path positional reads as both a path and an argument",
+            path: WORKFLOW,
+            canonical: WORKFLOW,
+            args: &["dir with space/a.toml"],
+            reads: &[
+                Read::Path("workflow", "dir with space/a.toml"),
+                Read::Arg("workflow", "dir with space/a.toml"),
+            ],
+            tui_reads: &[],
+            api_reads: &[],
+        },
+        Case {
+            name: "trailing arguments keep hyphen-leading tokens",
+            path: PROMPT,
+            canonical: PROMPT,
+            args: &["hello", "--not-a-flag", "-x"],
+            reads: &[
+                Read::Arg("prompt", "hello --not-a-flag -x"),
+                Read::Args("prompt", &["hello", "--not-a-flag", "-x"]),
+            ],
+            tui_reads: &[],
+            api_reads: &[],
+        },
+        Case {
+            name: "a double dash makes the rest positional",
+            path: PROMPT,
+            canonical: PROMPT,
+            args: &["--", "--plan"],
+            reads: &[Read::Bool("plan", false), Read::Arg("prompt", "--plan")],
+            tui_reads: &[],
+            api_reads: &[],
+        },
+        Case {
+            name: "repeated flags accumulate in order",
+            path: PROMPT,
+            canonical: PROMPT,
+            args: &["--overlay", "/b", "--overlay=/a"],
+            reads: &[Read::Strs("overlay", &["/b", "/a"])],
+            tui_reads: &[],
+            api_reads: &[],
+        },
+        Case {
+            name: "hyphen-leading agent args pass through their inline form",
+            path: &["chat"],
+            canonical: &["chat"],
+            args: &[
+                "--agent",
+                "claude",
+                "--agent-flag=--no-daemon",
+                "--agent-flag=-v",
+            ],
+            reads: &[
+                Read::Str("agent", "claude"),
+                Read::Strs("agent-flag", &["--no-daemon", "-v"]),
+            ],
+            tui_reads: &[],
+            api_reads: &[],
+        },
+    ];
+
+    /// Rejected input and the classification it must keep in every frontend.
+    pub(crate) const ERROR_CASES: &[(&[&str], &[&str], &str)] = &[
+        (PROMPT, &["--bogus"], "UnknownFlag"),
+        (PROMPT, &["-ab"], "UnknownFlag"),
+        (&["nope"], &[], "UnknownCommand"),
+        (WORKFLOW, &["a.toml", "stray"], "UnexpectedArgument"),
+        (&["api", "start"], &["--port=65536"], "InvalidFlagValue"),
+        (&["api", "start"], &["--port=abc"], "InvalidFlagValue"),
+        (WORKFLOW, &["--max-concurrent=0"], "InvalidFlagValue"),
+        (&["chat"], &["--launch-mode=banana"], "InvalidFlagValue"),
+        (&["chat"], &["--agent-flag", "-v"], "InvalidFlagValue"),
+        (PROMPT, &["--plan", "--yolo"], "InvalidFlagValue"),
+    ];
+
+    pub(crate) fn classification(error: &CommandError) -> &'static str {
+        match error {
+            CommandError::UnknownCommand { .. } => "UnknownCommand",
+            CommandError::UnknownFlag { .. } => "UnknownFlag",
+            CommandError::InvalidFlagValue { .. } => "InvalidFlagValue",
+            CommandError::UnexpectedArgument { .. } => "UnexpectedArgument",
+            other => panic!("not a parse-stage classification: {other:?}"),
+        }
+    }
+
+    /// Assert `reads` against any frontend, through the dispatch accessors.
+    pub(crate) fn assert_reads<F: CommandFrontend>(frontend: &F, case: &Case, reads: &[Read]) {
+        let path = case.canonical;
+        let name = case.name;
+        for read in reads {
+            match *read {
+                Read::Bool(flag, want) => assert_eq!(
+                    frontend.flag_bool(path, flag).unwrap().unwrap_or(false),
+                    want,
+                    "{name}: --{flag}"
+                ),
+                Read::Str(flag, want) => assert_eq!(
+                    frontend.flag_string(path, flag).unwrap().as_deref(),
+                    Some(want),
+                    "{name}: --{flag}"
+                ),
+                Read::Strs(flag, want) => assert_eq!(
+                    frontend.flag_strings(path, flag).unwrap(),
+                    want,
+                    "{name}: --{flag}"
+                ),
+                Read::Path(flag, want) => assert_eq!(
+                    frontend.flag_path(path, flag).unwrap(),
+                    Some(PathBuf::from(want)),
+                    "{name}: --{flag}"
+                ),
+                Read::U16(flag, want) => assert_eq!(
+                    frontend.flag_u16(path, flag).unwrap(),
+                    Some(want),
+                    "{name}: --{flag}"
+                ),
+                Read::Usize(flag, want) => assert_eq!(
+                    frontend.flag_usize(path, flag).unwrap(),
+                    Some(want),
+                    "{name}: --{flag}"
+                ),
+                Read::Arg(arg, want) => assert_eq!(
+                    frontend.argument(path, arg).unwrap().as_deref(),
+                    Some(want),
+                    "{name}: {arg}"
+                ),
+                Read::Args(arg, want) => assert_eq!(
+                    frontend.arguments(path, arg).unwrap(),
+                    want,
+                    "{name}: {arg}"
+                ),
+            }
+        }
     }
 }

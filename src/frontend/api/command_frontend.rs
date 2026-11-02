@@ -17,6 +17,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::command::commands::api_server::event_bus::EventBusSender;
@@ -82,13 +83,11 @@ use crate::engine::workflow::frontend::{ContainerSource, WorkflowFrontend};
 /// for distribution to logfile writers and SSE clients.
 pub struct ApiDispatchFrontend {
     frontend_kind: FrontendKind,
-    /// Typed flags/arguments parsed by Layer 2 (`CommandCatalogue::parse_raw_args`).
-    /// Empty when parsing failed; the error is surfaced via `parse_error`.
-    parsed: ParsedArgs,
-    /// A structured parse error captured at construction time, if any. Every
-    /// `CommandFrontend` accessor returns it so Dispatch aborts the command
-    /// rather than running with silently-dropped flags. `None` on success.
-    parse_error: Option<CommandError>,
+    /// The outcome of Layer 2 parsing (`CommandCatalogue::parse_raw_args`),
+    /// captured at construction. Every `CommandFrontend` accessor reports a
+    /// failure so Dispatch aborts the command rather than running with
+    /// silently-dropped flags.
+    parsed: Arc<Result<ParsedArgs, CommandError>>,
     event_bus: EventBusSender,
     state_writer: Option<CommandStateWriter>,
     line_buffer_stdout: String,
@@ -187,16 +186,12 @@ impl ApiDispatchFrontend {
         frontend_kind: FrontendKind,
     ) -> Self {
         let path: Vec<&str> = subcommand.split_whitespace().collect();
-        let (parsed, parse_error) =
-            match CommandCatalogue::get().parse_raw_args_with_profile(&path, args, frontend_kind) {
-                Ok(parsed) => (parsed, None),
-                Err(e) => (ParsedArgs::default(), Some(e)),
-            };
+        let parsed =
+            CommandCatalogue::get().parse_raw_args_with_profile(&path, args, frontend_kind);
 
         Self {
             frontend_kind,
-            parsed,
-            parse_error,
+            parsed: Arc::new(parsed),
             event_bus,
             state_writer: None,
             line_buffer_stdout: String::new(),
@@ -355,14 +350,14 @@ impl UserMessageSink for ApiDispatchFrontend {
 // ─── CommandFrontend (flag/argument access) ─────────────────────────────────
 
 impl ApiDispatchFrontend {
-    /// Re-materialize the construction-time parse error, if any. The first
-    /// accessor Dispatch calls returns this so a malformed request aborts the
-    /// command instead of running with silently-dropped flags.
-    fn check_parse(&self) -> Result<(), CommandError> {
-        match &self.parse_error {
-            None => Ok(()),
-            Some(e) => Err(clone_parse_error(e)),
-        }
+    /// The parsed arguments, or the construction-time parse error with its
+    /// structured classification. The first accessor Dispatch calls returns
+    /// the error so a malformed request aborts the command.
+    fn parsed(&self) -> Result<&ParsedArgs, CommandError> {
+        self.parsed.as_ref().as_ref().map_err(|e| {
+            e.clone_parse_stage()
+                .unwrap_or_else(|| CommandError::Other(e.to_string()))
+        })
     }
 }
 
@@ -371,8 +366,7 @@ impl CommandFrontend for ApiDispatchFrontend {
         self.frontend_kind
     }
     fn flag_bool(&self, _command_path: &[&str], flag: &str) -> Result<Option<bool>, CommandError> {
-        self.check_parse()?;
-        Ok(self.parsed.flag_bool(flag))
+        Ok(self.parsed()?.flag_bool(flag))
     }
 
     fn flag_string(
@@ -380,8 +374,7 @@ impl CommandFrontend for ApiDispatchFrontend {
         _command_path: &[&str],
         flag: &str,
     ) -> Result<Option<String>, CommandError> {
-        self.check_parse()?;
-        Ok(self.parsed.flag_string(flag))
+        Ok(self.parsed()?.flag_string(flag))
     }
 
     fn flag_strings(
@@ -389,8 +382,7 @@ impl CommandFrontend for ApiDispatchFrontend {
         _command_path: &[&str],
         flag: &str,
     ) -> Result<Vec<String>, CommandError> {
-        self.check_parse()?;
-        Ok(self.parsed.flag_strings(flag))
+        Ok(self.parsed()?.flag_strings(flag))
     }
 
     fn flag_path(
@@ -398,8 +390,7 @@ impl CommandFrontend for ApiDispatchFrontend {
         _command_path: &[&str],
         flag: &str,
     ) -> Result<Option<PathBuf>, CommandError> {
-        self.check_parse()?;
-        Ok(self.parsed.flag_path(flag))
+        Ok(self.parsed()?.flag_path(flag))
     }
 
     fn flag_enum(
@@ -407,13 +398,11 @@ impl CommandFrontend for ApiDispatchFrontend {
         _command_path: &[&str],
         flag: &str,
     ) -> Result<Option<String>, CommandError> {
-        self.check_parse()?;
-        Ok(self.parsed.flag_enum(flag))
+        Ok(self.parsed()?.flag_enum(flag))
     }
 
     fn flag_u16(&self, _command_path: &[&str], flag: &str) -> Result<Option<u16>, CommandError> {
-        self.check_parse()?;
-        Ok(self.parsed.flag_u16(flag))
+        Ok(self.parsed()?.flag_u16(flag))
     }
 
     fn flag_usize(
@@ -421,62 +410,15 @@ impl CommandFrontend for ApiDispatchFrontend {
         _command_path: &[&str],
         flag: &str,
     ) -> Result<Option<usize>, CommandError> {
-        self.check_parse()?;
-        Ok(self.parsed.flag_usize(flag))
+        Ok(self.parsed()?.flag_usize(flag))
     }
 
     fn argument(&self, _command_path: &[&str], name: &str) -> Result<Option<String>, CommandError> {
-        self.check_parse()?;
-        Ok(self.parsed.argument(name))
+        Ok(self.parsed()?.argument(name))
     }
 
     fn arguments(&self, _command_path: &[&str], name: &str) -> Result<Vec<String>, CommandError> {
-        self.check_parse()?;
-        Ok(self.parsed.arguments(name))
-    }
-}
-
-/// Reconstruct a parse-stage [`CommandError`] so accessors can return it more
-/// than once from `&self` (the type is not `Clone` because it wraps engine/data
-/// errors, but the parse-stage variants carry only owned string data).
-fn clone_parse_error(e: &CommandError) -> CommandError {
-    match e {
-        CommandError::UnknownCommand { path, suggestions } => CommandError::UnknownCommand {
-            path: path.clone(),
-            suggestions: suggestions.clone(),
-        },
-        CommandError::UnknownFlag { command, flag } => CommandError::UnknownFlag {
-            command: command.clone(),
-            flag: flag.clone(),
-        },
-        CommandError::InvalidFlagValue {
-            command,
-            flag,
-            reason,
-        } => CommandError::InvalidFlagValue {
-            command: command.clone(),
-            flag: flag.clone(),
-            reason: reason.clone(),
-        },
-        CommandError::MissingRequiredFlag { command, flag } => CommandError::MissingRequiredFlag {
-            command: command.clone(),
-            flag: flag.clone(),
-        },
-        CommandError::MissingRequiredArgument { command, argument } => {
-            CommandError::MissingRequiredArgument {
-                command: command.clone(),
-                argument: argument.clone(),
-            }
-        }
-        CommandError::UnexpectedArgument { command, argument } => {
-            CommandError::UnexpectedArgument {
-                command: command.clone(),
-                argument: argument.clone(),
-            }
-        }
-        // parse_raw_args only produces the variants above; anything else is
-        // rendered to a stable string so the command still aborts cleanly.
-        other => CommandError::Other(other.to_string()),
+        Ok(self.parsed()?.arguments(name))
     }
 }
 
@@ -490,17 +432,7 @@ impl AgentFrontend for ApiDispatchFrontend {
                 writer.record_container_started();
             }
         }
-        let message = match &status {
-            AgentStatus::Building => "Building container image...".to_string(),
-            AgentStatus::Pulling => "Pulling container image...".to_string(),
-            AgentStatus::Starting => "Starting container...".to_string(),
-            AgentStatus::Running { container_name } => {
-                format!("Container running: {container_name}")
-            }
-            AgentStatus::Stopping => "Stopping container...".to_string(),
-            AgentStatus::Exited(code) => format!("Container exited with code {code}"),
-            AgentStatus::Failed(reason) => format!("Container failed: {reason}"),
-        };
+        let message = container_status_message(&status);
         // The proxy has already written the container name into its source;
         // remember it so the step's own workflow events carry it too.
         if let (AgentStatus::Running { container_name }, Some(cell)) =
@@ -554,6 +486,10 @@ impl AgentFrontend for ApiDispatchFrontend {
     }
 }
 
+// Structured frames contain whole messages and tool results. Keep a larger
+// explicit bound than plain text, while bounding malformed protocol output.
+const MAX_STRUCTURED_FRAME_BYTES: usize = 8 * 1024 * 1024;
+
 /// Wire a container's stdout/stderr byte channels to the event bus
 /// (WI 0137 §4): both streams are line-buffered, stdout runs through the
 /// translator for `format`, and every [`Translated`] item becomes an event or
@@ -584,22 +520,46 @@ fn spawn_output_drains(
                 emit_translated(&event_bus_stdout, final_message.as_ref(), item);
             }
         };
-        let mut buf = Vec::new();
-        loop {
-            let bytes = tokio::select! {
-                _ = shutdown.cancelled(), if !stdout_rx.is_closed() => { stdout_rx.close(); continue; }
-                bytes = stdout_rx.recv() => bytes,
+        let mut framer = crate::engine::agent_output::line_framer::LineFramer::new(
+            if format.is_structured() {
+                MAX_STRUCTURED_FRAME_BYTES
+            } else {
+                crate::engine::agent_output::line_framer::MAX_LINE_BYTES
+            },
+        );
+        {
+            let mut process_line = |line: crate::engine::agent_output::line_framer::FramedLine| {
+                let items = if line.truncated && format.is_structured() {
+                    // A partial protocol frame is neither text nor a final
+                    // answer. Forget any earlier candidate before EOF fallback.
+                    translator = crate::engine::agent_output::translator_for(format);
+                    vec![Translated::Activity {
+                        kind: crate::data::execution_event::StepActivityKind::Message,
+                        summary: "Agent frame too large; final message may be unavailable".into(),
+                    }]
+                } else if line.truncated {
+                    vec![Translated::Line {
+                        stream: OutputStream::Stdout,
+                        text: line.marked_lossy_text(),
+                    }]
+                } else {
+                    translator.feed_line(OutputStream::Stdout, &line.lossy_text())
+                };
+                emit(items);
             };
-            let Some(bytes) = bytes else { break; };
-            buf.extend_from_slice(&bytes);
-            while let Some(pos) = buf.iter().position(|byte| *byte == b'\n') {
-                let line = String::from_utf8_lossy(&buf[..pos]).into_owned();
-                buf.drain(..=pos);
-                emit(translator.feed_line(OutputStream::Stdout, &line));
+            loop {
+                let bytes = tokio::select! {
+                    _ = shutdown.cancelled(), if !stdout_rx.is_closed() => { stdout_rx.close(); continue; }
+                    bytes = stdout_rx.recv() => bytes,
+                };
+                let Some(bytes) = bytes else { break; };
+                for line in framer.push(&bytes) {
+                    process_line(line);
+                }
             }
-        }
-        if !buf.is_empty() {
-            emit(translator.feed_line(OutputStream::Stdout, &String::from_utf8_lossy(&buf)));
+            if let Some(line) = framer.finish() {
+                process_line(line);
+            }
         }
         emit(translator.finish());
     });
@@ -608,22 +568,19 @@ fn spawn_output_drains(
     // on stdout only, so stderr never goes through the translator.
     event_bus_stderr.clone().spawn_drain(async move {
         let shutdown = event_bus_stderr.output_shutdown();
-        let mut buf = Vec::new();
+        let mut framer = crate::engine::agent_output::line_framer::LineFramer::default();
         loop {
             let bytes = tokio::select! {
                 _ = shutdown.cancelled(), if !stderr_rx.is_closed() => { stderr_rx.close(); continue; }
                 bytes = stderr_rx.recv() => bytes,
             };
             let Some(bytes) = bytes else { break; };
-            buf.extend_from_slice(&bytes);
-            while let Some(pos) = buf.iter().position(|byte| *byte == b'\n') {
-                let line = String::from_utf8_lossy(&buf[..pos]).into_owned();
-                buf.drain(..=pos);
-                event_bus_stderr.emit(EventPayload::StderrLine(line));
+            for line in framer.push(&bytes) {
+                event_bus_stderr.emit(EventPayload::StderrLine(line.marked_lossy_text()));
             }
         }
-        if !buf.is_empty() {
-            event_bus_stderr.emit(EventPayload::StderrLine(String::from_utf8_lossy(&buf).into_owned()));
+        if let Some(line) = framer.finish() {
+            event_bus_stderr.emit(EventPayload::StderrLine(line.marked_lossy_text()));
         }
     });
 
@@ -662,6 +619,8 @@ fn emit_translated(
         }
     }
 }
+
+use crate::engine::agent_output::container_status_message;
 
 impl ApiDispatchFrontend {
     /// Where a translated final message goes: the shared state writer, so
@@ -809,17 +768,7 @@ impl AgentFrontend for ApiContainerSink {
                 .expect("event source lock poisoned")
                 .container = Some(container_name.clone());
         }
-        let message = match &status {
-            AgentStatus::Building => "Building container image...".to_string(),
-            AgentStatus::Pulling => "Pulling container image...".to_string(),
-            AgentStatus::Starting => "Starting container...".to_string(),
-            AgentStatus::Running { container_name } => {
-                format!("Container running: {container_name}")
-            }
-            AgentStatus::Stopping => "Stopping container...".to_string(),
-            AgentStatus::Exited(code) => format!("Container exited with code {code}"),
-            AgentStatus::Failed(reason) => format!("Container failed: {reason}"),
-        };
+        let message = container_status_message(&status);
         self.event_bus.emit(EventPayload::StatusMessage {
             phase: "container".to_string(),
             message,
@@ -1763,6 +1712,10 @@ mod tests {
     #[path = "wi0137_agent_output.rs"]
     mod wi0137_agent_output;
 
+    use crate::command::dispatch::projections::raw_args::shared_cases::{
+        assert_reads, classification, CASES, ERROR_CASES,
+    };
+
     fn make_frontend(subcommand: &str, args: &[&str]) -> ApiDispatchFrontend {
         let bus = crate::command::commands::api_server::event_bus::EventBus::new(16);
         let sender = bus.sender();
@@ -2013,6 +1966,49 @@ mod tests {
         let f = make_frontend("exec prompt", &["--not-a-real-flag"]);
         let err = f.flag_bool(&["exec", "prompt"], "yolo").unwrap_err();
         assert!(matches!(err, CommandError::UnknownFlag { .. }));
+    }
+
+    // ─── Shared parsing cases (raw_args::shared_cases) ────────────────────────
+
+    #[test]
+    fn shared_cases_read_the_same_through_the_api_profile() {
+        for case in CASES {
+            let f = make_frontend(&case.path.join(" "), case.args);
+            assert_eq!(f.command_path, case.canonical.join(" "), "{}", case.name);
+            assert_reads(&f, case, case.reads);
+            assert_reads(&f, case, case.api_reads);
+        }
+    }
+
+    #[test]
+    fn parse_errors_keep_their_classification_from_every_accessor() {
+        for (path, args, want) in ERROR_CASES {
+            let f = make_frontend(&path.join(" "), args);
+            let direct = CommandCatalogue::get()
+                .parse_raw_args_with_profile(
+                    path,
+                    &args.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                    FrontendKind::Api,
+                )
+                .expect_err("the case must be rejected");
+            let reads = [
+                f.flag_bool(path, "yolo").map(|_| ()).unwrap_err(),
+                f.flag_string(path, "agent").map(|_| ()).unwrap_err(),
+                f.flag_strings(path, "overlay").map(|_| ()).unwrap_err(),
+                f.flag_path(path, "workflow").map(|_| ()).unwrap_err(),
+                f.flag_enum(path, "launch-mode").map(|_| ()).unwrap_err(),
+                f.flag_u16(path, "port").map(|_| ()).unwrap_err(),
+                f.flag_usize(path, "max-concurrent")
+                    .map(|_| ())
+                    .unwrap_err(),
+                f.argument(path, "prompt").map(|_| ()).unwrap_err(),
+                f.arguments(path, "prompt").map(|_| ()).unwrap_err(),
+            ];
+            for error in reads {
+                assert_eq!(classification(&error), *want, "{path:?} {args:?}");
+                assert_eq!(error.to_string(), direct.to_string());
+            }
+        }
     }
 
     // ─── flag_string ──────────────────────────────────────────────────────────

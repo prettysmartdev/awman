@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::retry::OperationControl;
-use crate::engine::error::EngineError;
+use crate::engine::error::{EngineError, ImageRetryClass};
 
 pub(super) enum Error {
     Control(EngineError),
@@ -46,7 +46,9 @@ impl Transport {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .map_err(|e| EngineError::Network(format!("HTTP executor setup failed: {e}")))?;
+            .map_err(|e| {
+                ImageRetryClass::Permanent.failure(format!("HTTP executor setup failed: {e}"))
+            })?;
         Ok(Self {
             executor: Arc::new(Executor(Some(runtime))),
             control,
@@ -118,9 +120,10 @@ impl Read for Response {
                 Ok(None) => return Ok(0),
                 Err(Error::Control(e)) => return Err(io::Error::other(e)),
                 Err(Error::Http(e)) => {
-                    return Err(io::Error::other(super::retry::error_chain(
-                        &e.without_url(),
-                    )))
+                    let retry = ImageRetryClass::http(&e);
+                    return Err(io::Error::other(
+                        retry.failure(super::retry::error_chain(&e.without_url())),
+                    ));
                 }
             }
         }

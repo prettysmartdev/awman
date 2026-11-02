@@ -1,8 +1,7 @@
 //! Merged configuration view: flags > env > repo > global > built-in default.
 //!
-//! Every legacy `effective_*` free function in `oldsrc/config/mod.rs` becomes a
-//! method on `EffectiveConfig`. The merge precedence is encoded once, in this
-//! module, and is the single source of truth.
+//! The merge precedence is encoded once, in this module, and is the single
+//! source of truth.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;

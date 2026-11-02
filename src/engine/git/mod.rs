@@ -1,7 +1,7 @@
 //! `engine::git` — `GitEngine`. Consolidates every git operation awman performs.
 //!
-//! Replaces the free `pub fn`s in `oldsrc/git.rs` with a typed object whose
-//! methods are the only public surface. Implements Layer 0's
+//! Provides one typed object for git operations. Its methods are the public
+//! surface. It implements Layer 0's
 //! `GitRootResolver` trait so `Session::open` can use it.
 
 use std::collections::HashMap;

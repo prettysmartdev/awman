@@ -1,6 +1,6 @@
 //! Per-tab state.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -8,12 +8,13 @@ use ratatui::layout::Rect;
 
 use crate::command::dispatch::CommandOutcome;
 use crate::command::error::CommandError;
-use crate::data::session::{CommandStatus, Session, SessionId, SessionState};
+use crate::command::git_summary::GitSummaryPoller;
+use crate::data::session::{InvocationStatus, Session, SessionId, SessionState};
 use crate::engine::acp::{PermissionRequest, SessionUpdate};
 use crate::engine::agent_runtime::execution::{AgentStats, StuckEvent};
-use crate::engine::git::{GitDiffSummary, GitEngine};
+use crate::engine::git::GitDiffSummary;
 use crate::frontend::tui::dialogs::{DialogRequest, DialogResponse};
-use crate::frontend::tui::git_sidebar::{start_git_diff_poll_task, GitSidebarState};
+use crate::frontend::tui::git_sidebar::GitSidebarState;
 use crate::frontend::tui::user_message::SharedStatusLog;
 
 mod container_slots;
@@ -22,7 +23,7 @@ mod labels;
 mod overlay_lifecycle;
 pub mod squad_state;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 use squad_state::SquadTabState;
 
@@ -65,14 +66,14 @@ impl ExecutionPhase {
             return Self::Idle;
         };
         match &cmd.status {
-            CommandStatus::Pending | CommandStatus::Running => Self::Running {
+            InvocationStatus::Pending | InvocationStatus::Running => Self::Running {
                 command: cmd.subcommand.clone(),
             },
-            CommandStatus::Done => Self::Done {
+            InvocationStatus::Done => Self::Done {
                 command: cmd.subcommand.clone(),
                 exit_code: cmd.exit_code.unwrap_or(0),
             },
-            CommandStatus::Error(message) => Self::Error {
+            InvocationStatus::Error(message) => Self::Error {
                 command: cmd.subcommand.clone(),
                 message: message.clone(),
             },
@@ -234,11 +235,54 @@ pub enum WorkflowStepKind {
     Teardown,
 }
 
-/// Cross-thread shared workflow view state.
-///
-/// `WorkflowFrontend` (engine-driven, in a tokio task) writes to it; the TUI
-/// renderer reads from it. Mirrors the pattern used by `SharedStatusLog`.
-pub type SharedWorkflowViewState = Arc<Mutex<Option<WorkflowViewState>>>;
+/// Workflow identity and its presentation metadata are published together.
+/// A command owns one handle; reset replaces it instead of clearing a live
+/// producer's fields. Scroll offsets and dialog input remain on the UI thread.
+#[derive(Clone, Default)]
+pub struct SharedWorkflowPresentation(Arc<Mutex<WorkflowPresentation>>);
+
+#[derive(Clone, Default)]
+pub struct WorkflowPresentation {
+    pub view: Option<WorkflowViewState>,
+    pub invocation_id: Option<uuid::Uuid>,
+    pub context_path: Option<std::path::PathBuf>,
+    pub worktree_path: Option<std::path::PathBuf>,
+}
+
+impl SharedWorkflowPresentation {
+    pub fn snapshot(&self) -> WorkflowPresentation {
+        self.0.lock().map(|state| state.clone()).unwrap_or_default()
+    }
+
+    pub fn update_view(&self, update: impl FnOnce(&mut Option<WorkflowViewState>)) {
+        if let Ok(mut state) = self.0.lock() {
+            update(&mut state.view);
+        }
+    }
+
+    pub fn publish_remote(&self, invocation_id: uuid::Uuid, view: WorkflowViewState) {
+        if let Ok(mut state) = self.0.lock() {
+            if state.invocation_id != Some(invocation_id) {
+                state.context_path = None;
+                state.worktree_path = None;
+            }
+            state.invocation_id = Some(invocation_id);
+            state.view = Some(view);
+        }
+    }
+
+    pub fn set_context_path(&self, path: Option<std::path::PathBuf>) {
+        if let Ok(mut state) = self.0.lock() {
+            state.context_path = path;
+        }
+    }
+
+    pub fn set_worktree_path(&self, path: Option<std::path::PathBuf>) {
+        if let Ok(mut state) = self.0.lock() {
+            state.worktree_path = path;
+        }
+    }
+}
 
 /// The latest `agents status` frame, rendered as a `Table` widget.
 #[derive(Debug, Clone)]
@@ -262,55 +306,6 @@ pub type SharedYoloState = Arc<Mutex<Option<YoloState>>>;
 /// Esc during a yolo countdown. `yolo_countdown_tick` checks it and
 /// returns `Cancel` when set, then resets the flag.
 pub type SharedYoloCancelFlag = Arc<AtomicBool>;
-
-/// Shared flag set by the workflow frontend to signal the TUI event loop
-/// to reset the vt100 parser before the next step's PTY output arrives.
-pub type SharedPtyResetFlag = Arc<AtomicBool>;
-
-/// Shared container name. Set by the container frontend when the engine
-/// reports `AgentStatus::Running { container_name }`. The TUI event
-/// loop reads this to populate `ContainerInfo.container_name` for stats
-/// polling.
-pub type SharedContainerName = Arc<Mutex<Option<String>>>;
-
-/// Title for the next container the workflow launches, when it is a
-/// setup/teardown step rather than an agent (e.g. `[setup] install deps`).
-/// Set by the workflow frontend before that container starts and cleared
-/// before an agent container starts; the TUI event loop copies it into the
-/// focused slot's `ContainerInfo` when that container's name arrives.
-pub type SharedContainerTitle = Arc<Mutex<Option<String>>>;
-
-/// Shared container exit code. Set by the workflow frontend when the engine
-/// reports `report_container_exited` — the step's container has actually
-/// terminated (killed by awman or the agent process exited). The TUI event
-/// loop takes it and closes the container window, leaving the summary bar.
-pub type SharedContainerExitCode = Arc<Mutex<Option<i32>>>;
-
-/// Shared active-worktree path. Set by the worktree-lifecycle frontend on
-/// `report_worktree_created` and cleared on the post-workflow report
-/// (kept/discarded). The renderer reads this so the bottom-bar context
-/// line can show "Worktree: <path>" while a workflow runs in a
-/// worktree even though the tab's session is rooted at the main repo.
-pub type SharedActiveWorktreePath = Arc<Mutex<Option<std::path::PathBuf>>>;
-
-/// Shared stdin sender slot. When a workflow step transition creates fresh
-/// stdin channels, the new sender is published here so the TUI event loop
-/// can swap `tab.container_stdin_tx` to the new one.
-pub type SharedStdinTx = Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>>>;
-
-/// Shared resize sender slot, same pattern as `SharedStdinTx`.
-pub type SharedResizeTx = Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<(u16, u16)>>>>;
-
-/// Shared engine sender. The engine creates the channel and publishes
-/// the sender via `set_engine_sender`; the TUI event loop reads it
-/// to send Ctrl-W requests.
-pub type SharedEngineTx =
-    Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<crate::engine::workflow::EngineRequest>>>>;
-
-/// Shared stuck sender. The engine publishes the container's stuck
-/// broadcast sender via `set_stuck_sender`; the TUI event loop subscribes
-/// from it for tab-coloring (stuck indicator).
-pub type SharedStuckSender = Arc<Mutex<Option<Arc<tokio::sync::broadcast::Sender<StuckEvent>>>>>;
 
 /// Shared TUI context for `agents status`. The event loop refreshes this on
 /// every tick so the watch loop always sees live tab data.
@@ -462,6 +457,8 @@ pub enum AgentWindowKind {
 /// selects whether it is driven by that stdio/PTY machinery or by a structured
 /// ACP update stream (in which case the vt100 fields stay inert).
 pub struct ContainerSlot {
+    /// Identity of this launch, independent of its reusable workflow step name.
+    pub launch_id: uuid::Uuid,
     /// Whether this slot is a stdio (PTY/vt100) window or an ACP window.
     /// Stdio is the default; ACP slots carry their shared render state here.
     pub kind: AgentWindowKind,
@@ -496,11 +493,29 @@ pub struct ContainerSlotIo {
 }
 
 impl ContainerSlot {
+    /// Install one launch's channels as a unit; input and resize must target
+    /// the same execution that supplies this slot's output.
+    pub fn bind_io(&mut self, io: ContainerSlotIo) {
+        self.container_stdout_rx = Some(io.stdout_rx);
+        self.container_stdin_tx = Some(io.stdin_tx);
+        self.container_resize_tx = Some(io.resize_tx);
+    }
+
+    /// Only lifecycle transitions assign runtime identity. Stats are observations
+    /// and never supply a container name for input or later polling.
+    pub fn set_runtime_name(&mut self, container_name: String) {
+        if let Some(info) = self.container_info.as_mut() {
+            info.container_name = container_name;
+            info.latest_stats = None;
+        }
+    }
+
     /// Create a fresh slot for a newly-launched container. The PTY parser
     /// starts at 80x24 and is sized to the real overlay dimensions as soon
     /// as they are known; live I/O channels are attached by the caller.
     pub fn new(step_name: String, agent_display_name: String, scrollback: usize) -> Self {
         Self {
+            launch_id: uuid::Uuid::new_v4(),
             kind: AgentWindowKind::Stdio,
             step_name,
             vt100_parser: vt100::Parser::new(24, 80, scrollback),
@@ -573,6 +588,31 @@ impl ContainerSlot {
 /// because the frontend runs on the engine's tokio task while `Tab` lives on
 /// the TUI thread.
 pub enum ContainerSlotEvent {
+    /// Replace the sequential backbone's identity and all of its I/O at once.
+    SequentialLaunched {
+        launch_id: uuid::Uuid,
+        title: Option<String>,
+        io: ContainerSlotIo,
+    },
+    SequentialRunning {
+        launch_id: uuid::Uuid,
+        container_name: String,
+    },
+    SequentialExited {
+        launch_id: uuid::Uuid,
+        exit_code: i32,
+    },
+    EngineAttached {
+        launch_id: uuid::Uuid,
+        requests:
+            Option<tokio::sync::mpsc::UnboundedSender<crate::engine::workflow::EngineRequest>>,
+        stuck: Option<tokio::sync::broadcast::Receiver<StuckEvent>>,
+    },
+    /// An asynchronous attach waiter may finish after the same step was reattached.
+    AttachedExited {
+        container_name: String,
+        step_name: String,
+    },
     /// A parallel group is starting: the sequential "backbone" slot (the
     /// command-level container plumbing that sequential steps reuse) goes
     /// dormant while the group's per-step slots take over the display.
@@ -622,81 +662,92 @@ pub enum ContainerSlotEvent {
 /// slots: the workflow frontend pushes, the event loop drains.
 pub type SharedContainerSlotEvents = Arc<Mutex<std::collections::VecDeque<ContainerSlotEvent>>>;
 
-/// The cross-thread slots a [`Tab`] shares with the command thread running
-/// against it.
-///
-/// Every field is an `Arc` handle: the tab keeps one end, the
-/// `TuiCommandFrontend` built for a command keeps the other, and both observe
-/// the same value. They travel together — a frontend that received some of
-/// them and not others would render against a tab it is only half wired to —
-/// so they are one clonable bundle rather than sixteen constructor
-/// parameters.
+/// Ordered container transitions for one command. A proxy keeps the launch id
+/// it was given, so late Running/Exited callbacks cannot relabel a newer slot.
+#[derive(Clone)]
+pub struct ContainerLifecycle {
+    pub events: SharedContainerSlotEvents,
+    launch_id: uuid::Uuid,
+}
+
+impl Default for ContainerLifecycle {
+    fn default() -> Self {
+        Self {
+            events: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+            launch_id: uuid::Uuid::new_v4(),
+        }
+    }
+}
+
+impl ContainerLifecycle {
+    pub fn launch_id(&self) -> uuid::Uuid {
+        self.launch_id
+    }
+
+    pub fn push(&self, event: ContainerSlotEvent) {
+        if let Ok(mut queue) = self.events.lock() {
+            queue.push_back(event);
+        }
+    }
+
+    pub fn launch(&mut self, title: Option<String>, io: ContainerSlotIo) {
+        self.launch_id = uuid::Uuid::new_v4();
+        self.push(ContainerSlotEvent::SequentialLaunched {
+            launch_id: self.launch_id,
+            title,
+            io,
+        });
+    }
+
+    pub fn running(&self, container_name: String) {
+        self.push(ContainerSlotEvent::SequentialRunning {
+            launch_id: self.launch_id,
+            container_name,
+        });
+    }
+
+    pub fn exited(&self, exit_code: i32) {
+        self.push(ContainerSlotEvent::SequentialExited {
+            launch_id: self.launch_id,
+            exit_code,
+        });
+    }
+
+    pub fn attach_engine(&self, handles: crate::engine::workflow::frontend::EngineHandles) {
+        if handles.step.is_none() {
+            self.push(ContainerSlotEvent::EngineAttached {
+                launch_id: self.launch_id,
+                requests: handles.requests,
+                // Subscribe now so events before the next UI tick are retained.
+                stuck: handles.stuck.map(|sender| sender.subscribe()),
+            });
+        }
+    }
+}
+
+/// Command-owned workflow and container lifecycles, plus independent UI feeds.
+/// Reset replaces producer handles, isolating the next command from late writes.
 #[derive(Clone)]
 pub struct TabSharedState {
-    /// Workflow view state written by the engine's `WorkflowFrontend` impl and
-    /// read by the Workflow Overview renderer.
-    pub workflow_state: SharedWorkflowViewState,
-    /// Invocation id of the latest remote workflow snapshot, when available.
-    pub workflow_invocation_id: Arc<Mutex<Option<uuid::Uuid>>>,
-    pub workflow_context_path: Arc<Mutex<Option<std::path::PathBuf>>>,
-    /// Yolo countdown state, rendered as a non-modal overlay.
+    pub workflow: SharedWorkflowPresentation,
+    pub container: ContainerLifecycle,
     pub yolo_state: SharedYoloState,
-    /// Cancel flag for the yolo countdown; set on Esc, read and cleared by
-    /// `yolo_countdown_tick`.
     pub yolo_cancel_flag: SharedYoloCancelFlag,
-    /// The tab's status log, appended to by `TuiUserMessageSink`.
     pub status_log: SharedStatusLog,
-    /// The `agents status` dashboard, rendered as a `Table` widget.
     pub agents_dashboard: SharedAgentsDashboard,
-    /// Queue of container-slot lifecycle events, drained each tick.
-    pub container_slot_events: SharedContainerSlotEvents,
-    /// Signals the event loop to reset the vt100 parser between steps.
-    pub pty_reset_flag: SharedPtyResetFlag,
-    /// Name of the running container, published by the container frontend.
-    pub container_name_shared: SharedContainerName,
-    /// Title for a setup/teardown step's container; see [`SharedContainerTitle`].
-    pub container_title_shared: SharedContainerTitle,
-    /// Exit code of a mid-workflow container that actually terminated.
-    pub container_exit_shared: SharedContainerExitCode,
-    /// Stdin sender slot, republished on each workflow step transition.
-    pub stdin_tx_shared: SharedStdinTx,
-    /// Resize sender slot, same pattern as `stdin_tx_shared`.
-    pub resize_tx_shared: SharedResizeTx,
-    /// Engine request sender, published by the engine for Ctrl-W.
-    pub engine_tx_shared: SharedEngineTx,
-    /// Stuck-event broadcast sender, published by the container engine.
-    pub stuck_sender_shared: SharedStuckSender,
-    /// Active worktree path, driving the bottom-bar context line.
-    pub active_worktree_path: SharedActiveWorktreePath,
-    /// Live TUI context refreshed each tick for `agents status --watch`.
     pub tui_context_shared: SharedTuiContext,
-    /// Cancels the command running in this tab where the command supports
-    /// it (`agents status --watch`, `agents attach`). Cancelled when the tab
-    /// starts another command or closes, or when the user stops a watch.
     pub command_cancel: tokio_util::sync::CancellationToken,
 }
 
 impl TabSharedState {
-    /// A fresh, empty set of slots. Every tab starts with its own.
     pub fn new() -> Self {
         Self {
-            workflow_state: Arc::new(Mutex::new(None)),
-            workflow_invocation_id: Arc::new(Mutex::new(None)),
-            workflow_context_path: Arc::new(Mutex::new(None)),
+            workflow: SharedWorkflowPresentation::default(),
+            container: ContainerLifecycle::default(),
             yolo_state: Arc::new(Mutex::new(None)),
             yolo_cancel_flag: Arc::new(AtomicBool::new(false)),
             status_log: Arc::new(Mutex::new(Vec::new())),
             agents_dashboard: Arc::new(Mutex::new(None)),
-            container_slot_events: Arc::new(Mutex::new(std::collections::VecDeque::new())),
-            pty_reset_flag: Arc::new(AtomicBool::new(false)),
-            container_name_shared: Arc::new(Mutex::new(None)),
-            container_title_shared: Arc::new(Mutex::new(None)),
-            container_exit_shared: Arc::new(Mutex::new(None)),
-            stdin_tx_shared: Arc::new(Mutex::new(None)),
-            resize_tx_shared: Arc::new(Mutex::new(None)),
-            engine_tx_shared: Arc::new(Mutex::new(None)),
-            stuck_sender_shared: Arc::new(Mutex::new(None)),
-            active_worktree_path: Arc::new(Mutex::new(None)),
             tui_context_shared: Arc::new(Mutex::new(
                 crate::command::commands::agents::AgentsTuiContext::default(),
             )),
@@ -704,30 +755,27 @@ impl TabSharedState {
         }
     }
 
-    /// Fresh slots for a test that builds a `TuiCommandFrontend` without a
-    /// `Tab`. Identical to [`TabSharedState::new`]; named so the call sites
-    /// read as fixtures rather than as production wiring.
     #[cfg(test)]
     pub fn for_tests() -> Self {
         Self::new()
     }
 
-    /// Replace the per-command slots before a new command is spawned into the
-    /// tab, so a stale container name, exit code or I/O sender from the
-    /// previous command cannot be observed by the new one. The log, workflow
-    /// view and dashboard slots persist for the life of the tab.
     pub fn reset_for_new_command(&mut self) {
-        // Stop whatever the previous command left cancellable (a dashboard
-        // watch, an attach) before handing out a fresh token.
+        self.command_cancel.cancel();
+        let context = self.tui_context_shared.clone();
+        *self = Self::new();
+        self.tui_context_shared = context;
+    }
+
+    /// Detaching drops command-owned presentation feeds while retaining the
+    /// tab's log and dashboard. Old publishers keep disconnected handles.
+    pub fn detach(&mut self) {
         self.command_cancel.cancel();
         self.command_cancel = tokio_util::sync::CancellationToken::new();
-        self.workflow_context_path = Arc::new(Mutex::new(None));
-        self.container_name_shared = Arc::new(Mutex::new(None));
-        self.container_title_shared = Arc::new(Mutex::new(None));
-        self.container_exit_shared = Arc::new(Mutex::new(None));
-        self.stdin_tx_shared = Arc::new(Mutex::new(None));
-        self.resize_tx_shared = Arc::new(Mutex::new(None));
-        self.engine_tx_shared = Arc::new(Mutex::new(None));
+        self.workflow = SharedWorkflowPresentation::default();
+        self.container = ContainerLifecycle::default();
+        self.yolo_state = Arc::new(Mutex::new(None));
+        self.yolo_cancel_flag = Arc::new(AtomicBool::new(false));
     }
 }
 
@@ -744,7 +792,7 @@ pub struct Tab {
     /// state out of Tab without changing ownership again.
     pub session_id: SessionId,
     pub session: Session,
-    pub(crate) git_engine: Arc<GitEngine>,
+    pub(crate) git_summary: GitSummaryPoller,
     /// Derived from `SessionState::current_command` by
     /// [`Tab::refresh_from_session`] each tick. Never assigned directly:
     /// whatever starts or ends a command records that on the session, and this
@@ -820,7 +868,8 @@ pub struct Tab {
     pub yolo_mode: bool,
     /// Broadcast receiver for stuck/unstuck events from the container engine.
     /// Drained non-blockingly in `tick_all_tabs` for tab coloring.
-    pub stuck_rx: Option<tokio::sync::broadcast::Receiver<StuckEvent>>,
+    pub engine_tx:
+        Option<tokio::sync::mpsc::UnboundedSender<crate::engine::workflow::EngineRequest>>,
 
     // ── Container slots ──────────────────────────────────────────────────
     /// The tab's running containers. A plain containerized command is one
@@ -870,6 +919,7 @@ pub struct Tab {
 
 impl Drop for Tab {
     fn drop(&mut self) {
+        self.shared.command_cancel.cancel();
         // Stop the background git poll task so it doesn't outlive the tab.
         if let Some(cancel) = self.git_poll_cancel.take() {
             cancel.cancel();
@@ -885,7 +935,7 @@ impl Tab {
         if !matches!(self.execution_phase, ExecutionPhase::Running { .. }) {
             return None;
         }
-        self.shared.workflow_context_path.lock().ok()?.clone()
+        self.shared.workflow.snapshot().context_path
     }
 
     /// Apply a manual one-column scroll while the overview overflows, and
@@ -908,12 +958,12 @@ impl Tab {
     }
 
     pub fn new(session: Session) -> Self {
-        Self::new_with_git_engine(session, Arc::new(GitEngine::new()))
+        Self::new_with_git_summary(session, GitSummaryPoller::default())
     }
 
-    pub fn new_with_git_engine(session: Session, git_engine: Arc<GitEngine>) -> Self {
+    pub fn new_with_git_summary(session: Session, git_summary: GitSummaryPoller) -> Self {
         let git_root = session.git_root().to_path_buf();
-        let mut tab = Self::new_inner(session, git_engine);
+        let mut tab = Self::new_inner(session, git_summary);
         // Start polling against the session git root. Once a worktree is
         // created, `refresh_git_poll` (called each tick) restarts the task
         // pointed at the worktree path.
@@ -926,7 +976,7 @@ impl Tab {
     /// which has no meaningful diff. The caller must not auto-spawn a startup
     /// command into this tab.
     pub fn new_squad(session: Session) -> Self {
-        let mut tab = Self::new_inner(session, Arc::new(GitEngine::new()));
+        let mut tab = Self::new_inner(session, GitSummaryPoller::default());
         tab.is_squad = true;
         tab.squad = Some(SquadTabState::new());
         tab
@@ -969,11 +1019,11 @@ impl Tab {
     /// Shared field initialisation for [`Tab::new`] and [`Tab::new_squad`].
     /// Starts **no** poll and spawns nothing; the caller decides whether a git
     /// poll runs (normal tab) or not (squad tab).
-    fn new_inner(session: Session, git_engine: Arc<GitEngine>) -> Self {
+    fn new_inner(session: Session, git_summary: GitSummaryPoller) -> Self {
         Self {
             session_id: session.id(),
             session,
-            git_engine,
+            git_summary,
             execution_phase: ExecutionPhase::Idle,
             current_workflow: None,
             current_container: None,
@@ -1000,7 +1050,7 @@ impl Tab {
             output_lines: Vec::new(),
             stuck: false,
             yolo_mode: false,
-            stuck_rx: None,
+            engine_tx: None,
             container_slots: Vec::new(),
             focused_slot_idx: 0,
             dormant_slots: Vec::new(),

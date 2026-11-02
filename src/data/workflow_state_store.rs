@@ -7,6 +7,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::data::error::DataError;
+use crate::data::fs::config_file::write_config_file_atomically;
 use crate::data::fs::hash::{sanitize_name_for_filename, sha256_hex};
 use crate::data::session::Session;
 use crate::data::workflow_state::WorkflowState;
@@ -78,14 +79,15 @@ impl WorkflowStateStore {
             .map_err(|e| DataError::config_parse(path, e))
     }
 
-    /// Persist a workflow's state.
+    /// Persist a workflow's state through a sibling temp file and rename, so a
+    /// failed or interrupted save leaves the previous checkpoint readable.
     pub fn save(&self, state: &WorkflowState) -> Result<PathBuf, DataError> {
         let dir = self.dir();
         std::fs::create_dir_all(&dir).map_err(|e| DataError::io(&dir, e))?;
         let path = self.state_path(state.work_item, &state.workflow_name);
         let json = serde_json::to_string_pretty(state)
             .map_err(|e| DataError::ConfigSerialize { source: e })?;
-        std::fs::write(&path, json).map_err(|e| DataError::io(&path, e))?;
+        write_config_file_atomically(&path, &json)?;
         Ok(path)
     }
 
@@ -227,5 +229,73 @@ mod tests {
             loaded.workflow_name, name,
             "the raw name is preserved in state"
         );
+    }
+
+    fn entries(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn save_replaces_the_record_and_leaves_no_temp_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = WorkflowStateStore::at_git_root(tmp.path());
+        let mut s = fresh_state("wf");
+        let path = store.save(&s).unwrap();
+        s.workflow_hash = "new-hash".into();
+        assert_eq!(store.save(&s).unwrap(), path);
+        assert_eq!(
+            store.load(None, "wf").unwrap().unwrap().workflow_hash,
+            "new-hash"
+        );
+        assert_eq!(
+            entries(&store.dir()).len(),
+            1,
+            "{:?}",
+            entries(&store.dir())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_save_leaves_the_previous_checkpoint_readable() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let store = WorkflowStateStore::at_git_root(tmp.path());
+        let mut s = fresh_state("wf");
+        let path = store.save(&s).unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let dir = store.dir();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        s.workflow_hash = "other".into();
+        let result = store.save(&s);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        assert!(
+            store.load(None, "wf").unwrap().is_some(),
+            "resume still works"
+        );
+        assert_eq!(entries(&dir).len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_keeps_the_mode_of_an_existing_record() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let store = WorkflowStateStore::at_git_root(tmp.path());
+        let s = fresh_state("wf");
+        let path = store.save(&s).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        store.save(&s).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o640);
     }
 }

@@ -7,6 +7,7 @@ use std::time::Instant;
 use awman::command::commands::api_server::{CommandCanceller, TokenRegistry};
 use awman::command::dispatch::Engines;
 use awman::data::agent_output_format::AgentOutputFormat;
+use awman::data::command_status::CommandStatus;
 use awman::data::execution_event::{EventPayload, EventSource, EventSourcePhase, ExecutionEvent};
 use awman::data::fs::api_db::{NewSessionRow, SqliteSessionStore};
 use awman::data::fs::api_paths::ApiPaths;
@@ -284,7 +285,7 @@ async fn step_filter_applies_to_replay_and_resumes_from_its_global_cursor() {
     writer.write_event(&done).await;
     writer.flush().await;
     app.store
-        .complete_command("step-filter", "done", Some(0), None)
+        .complete_command("step-filter", CommandStatus::Done, Some(0), None)
         .unwrap();
     let base = server(app).await;
     let client = reqwest::Client::new();
@@ -348,7 +349,7 @@ async fn step_filter_applies_to_live_bus_events_and_keeps_terminal_events() {
     alpha.emit(EventPayload::StdoutLine("live alpha".into()));
     beta.emit(EventPayload::StdoutLine("live beta hidden".into()));
     app.store
-        .complete_command("live-step-filter", "done", Some(0), None)
+        .complete_command("live-step-filter", CommandStatus::Done, Some(0), None)
         .unwrap();
     bus.sender().emit(EventPayload::Done);
     let body = tokio::time::timeout(std::time::Duration::from_secs(3), response.text())
@@ -782,7 +783,7 @@ async fn terminal_row_waits_for_the_actual_final_pair_and_preserves_resume() {
         app.store
             .complete_command(
                 "race",
-                "done",
+                CommandStatus::Done,
                 Some(0),
                 Some(&serde_json::to_string(&result).unwrap()),
             )
@@ -900,7 +901,7 @@ async fn a_terminal_row_without_a_writable_log_recovers_without_minting_cursor_i
     app.store
         .complete_command(
             "no-log",
-            "error",
+            CommandStatus::Error,
             Some(1),
             Some(&serde_json::to_string(&result).unwrap()),
         )

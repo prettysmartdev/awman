@@ -23,7 +23,7 @@ use super::transport::{Response, Transport};
 use crate::data::config::env::EnvSnapshot;
 use crate::data::config::image_source::{DockerTlsConfig, ImageSourceKind};
 use crate::data::oci_identity::OciPlatform;
-use crate::engine::error::EngineError;
+use crate::engine::error::{EngineError, ImageRetryClass};
 use crate::engine::oci::sources::{FetchContext, Fetched, Report};
 use crate::engine::oci::verify::{ensure_space, StagingSink};
 
@@ -270,9 +270,9 @@ impl Client {
                 }
             }
         };
-        let http = builder
-            .build()
-            .map_err(|e| EngineError::Network(format!("HTTP client setup failed: {e}")))?;
+        let http = builder.build().map_err(|e| {
+            ImageRetryClass::Permanent.failure(format!("HTTP client setup failed: {e}"))
+        })?;
         Ok(Self {
             http,
             transport: Transport::new(control)?,
@@ -288,7 +288,7 @@ impl Client {
             .timeout(timeout);
         self.transport.send(req).map_err(|e| {
             e.map_http(|e| {
-                EngineError::Network(format!(
+                ImageRetryClass::http(&e).failure(format!(
                     "Docker Engine at {} is not reachable: {}",
                     self.endpoint,
                     crate::engine::oci::retry::error_chain(&e.without_url())
@@ -301,20 +301,24 @@ impl Client {
         &self,
         path: &str,
         timeout: Duration,
-    ) -> Result<(u16, Option<T>), EngineError> {
+    ) -> Result<(reqwest::StatusCode, Option<T>), EngineError> {
         let resp = self.get(path, timeout)?;
-        let status = resp.status().as_u16();
+        let status = resp.status();
         if !resp.status().is_success() {
             return Ok((status, None));
         }
         let mut bytes = Vec::new();
         std::io::Read::read_to_end(&mut std::io::Read::take(resp, 1024 * 1024 + 1), &mut bytes)
-            .map_err(|e| EngineError::Network(format!("Docker metadata transfer failed: {e}")))?;
+            .map_err(|e| {
+                super::retry::map_diagnostic(super::retry::read_error(e), |diagnostic| {
+                    format!("Docker metadata transfer failed: {diagnostic}")
+                })
+            })?;
         if bytes.len() > 1024 * 1024 {
-            return Err(EngineError::Network("Docker metadata exceeds 1 MiB".into()));
+            return Err(ImageRetryClass::Permanent.failure("Docker metadata exceeds 1 MiB".into()));
         }
         let parsed = serde_json::from_slice::<T>(&bytes).map_err(|e| {
-            EngineError::Network(format!(
+            ImageRetryClass::Permanent.failure(format!(
                 "Docker Engine at {} returned an unreadable response for {path}: {}",
                 self.endpoint, e
             ))
@@ -404,18 +408,24 @@ pub(super) fn export(
 
     let ping = client.get("/_ping", metadata())?;
     if !ping.status().is_success() {
-        return Err(EngineError::Network(format!(
+        return Err(ImageRetryClass::status(ping.status()).failure(format!(
             "Docker Engine at {} answered {} to /_ping",
             client.endpoint,
             ping.status()
         )));
     }
-    let (_, version) = client.get_json::<VersionInfo>("/version", metadata())?;
+    let (status, version) = client.get_json::<VersionInfo>("/version", metadata())?;
+    if !status.is_success() {
+        return Err(ImageRetryClass::status(status).failure(format!(
+            "Docker Engine at {} answered {status} to /version",
+            client.endpoint
+        )));
+    }
     let api = version
         .as_ref()
         .and_then(|v| parse_api(&v.api_version))
         .ok_or_else(|| {
-            EngineError::Network(format!(
+            ImageRetryClass::Permanent.failure(format!(
                 "Docker Engine at {} did not report its API version",
                 client.endpoint
             ))
@@ -437,13 +447,13 @@ pub(super) fn export(
     let (status, inspect) =
         client.get_json::<Inspect>(&format!("{prefix}/images/{selector}/json"), metadata())?;
     let Some(inspect) = inspect else {
-        return Err(if status == 404 {
+        return Err(if status == reqwest::StatusCode::NOT_FOUND {
             EngineError::SourceImageNotFound {
                 reference: reference.to_string(),
                 location: format!("the Docker Engine at {}", client.endpoint),
             }
         } else {
-            EngineError::Network(format!(
+            ImageRetryClass::status(status).failure(format!(
                 "Docker Engine at {} answered {status} when inspecting '{reference}'",
                 client.endpoint
             ))
@@ -496,7 +506,7 @@ pub(super) fn export(
         .max(Duration::from_millis(1));
     let resp = client.get(&path, export_timeout)?;
     if !resp.status().is_success() {
-        return Err(EngineError::Network(format!(
+        return Err(ImageRetryClass::status(resp.status()).failure(format!(
             "Docker Engine at {} answered {} when exporting '{reference}'",
             client.endpoint,
             resp.status()
@@ -513,16 +523,17 @@ pub(super) fn export(
     .cancellable(ctx.cancel)
     .with_deadline(ctx.deadline);
     let mut body = resp;
-    sink.copy_from(&mut body).map_err(|e| match e {
-        EngineError::Network(message) => EngineError::Network(format!(
-            "Docker Engine at {} disconnected while exporting '{reference}': {message}",
-            client.endpoint
-        )),
-        other => other,
+    sink.copy_from(&mut body).map_err(|e| {
+        super::retry::map_diagnostic(e, |diagnostic| {
+            format!(
+                "Docker Engine at {} disconnected while exporting '{reference}': {diagnostic}",
+                client.endpoint
+            )
+        })
     })?;
     if let Some(n) = declared {
         if n != sink.written() {
-            return Err(EngineError::Network(format!(
+            return Err(ImageRetryClass::Transient.failure(format!(
                 "export of '{reference}' from {} was truncated: {} of {n} bytes",
                 client.endpoint,
                 sink.written()

@@ -50,14 +50,14 @@ pub fn resolve_agent(
                     state: AgentState::Running,
                 });
             }
-            // Only consulted to give a better error; a listing failure here
-            // must not hide the "not found" answer.
-            if let Ok(stopped) = runtime.list_stopped() {
-                if !matches!(match_reference(&stopped, reference), Ok(None)) {
-                    return Err(CommandError::AgentNotRunning {
-                        reference: reference.to_string(),
-                    });
-                }
+            // A failed stopped listing is still a runtime failure. Treating
+            // it as an empty list would turn an unavailable daemon into a
+            // misleading "not found" response.
+            let stopped = runtime.list_stopped()?;
+            if !matches!(match_reference(&stopped, reference), Ok(None)) {
+                return Err(CommandError::AgentNotRunning {
+                    reference: reference.to_string(),
+                });
             }
         }
         ResolveScope::IncludeStopped => {
@@ -276,5 +276,129 @@ mod tests {
         let rt = FakeRuntime::new().with_running(vec![h.clone()]);
         let err = map_action_error(&rt, &h, CommandError::Aborted);
         assert!(matches!(err, CommandError::Aborted));
+    }
+}
+
+// Kept beside the listing consumer so these failure tests do not change the
+// shared agents fake used by unrelated workflow steps.
+#[cfg(test)]
+pub(crate) mod listing_failure_tests {
+    use super::*;
+    use crate::command::commands::agents::test_support::{FakeFrontend, FakeRuntime};
+    use crate::data::session::Session;
+    use crate::engine::agent_runtime::*;
+    use crate::engine::error::EngineError;
+
+    pub(crate) struct ListingFailureRuntime {
+        pub inner: FakeRuntime,
+        pub fail_running: bool,
+    }
+    impl ListingFailureRuntime {
+        pub fn new(fail_running: bool) -> Self {
+            Self {
+                inner: FakeRuntime::new(),
+                fail_running,
+            }
+        }
+    }
+    impl AgentRuntimeEngine for ListingFailureRuntime {
+        fn runtime_name(&self) -> &'static str {
+            "listing-fixture"
+        }
+        fn display_name(&self) -> &'static str {
+            "listing fixture"
+        }
+        fn capabilities(&self) -> &Capabilities {
+            self.inner.capabilities()
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn build(&self, _: ResolvedAgentOptions) -> Result<Box<dyn AgentInstance>, EngineError> {
+            unreachable!()
+        }
+        fn list_running(&self, _: &Session) -> Result<Vec<AgentHandle>, EngineError> {
+            self.list_running_all()
+        }
+        fn list_running_all(&self) -> Result<Vec<AgentHandle>, EngineError> {
+            if self.fail_running {
+                Err(EngineError::Container("running listing failed".into()))
+            } else {
+                self.inner.list_running_all()
+            }
+        }
+        fn list_stopped(&self) -> Result<Vec<AgentHandle>, EngineError> {
+            Err(EngineError::Container("stopped listing failed".into()))
+        }
+        fn list_running_with_name_prefix(&self, _: &str) -> Result<Vec<AgentHandle>, EngineError> {
+            self.list_running_all()
+        }
+        fn stats(&self, h: &AgentHandle) -> Result<AgentStats, EngineError> {
+            self.inner.stats(h)
+        }
+        fn stop(&self, h: &AgentHandle) -> Result<(), EngineError> {
+            self.inner.stop(h)
+        }
+        fn attach(&self, h: &AgentHandle) -> Result<Box<dyn AgentInstance>, EngineError> {
+            self.inner.attach(h)
+        }
+        fn ready_agent(
+            &self,
+            _: &str,
+            _: ReadyAgentOptions,
+            _: &mut dyn crate::data::message::UserMessageSink,
+        ) -> Result<(), EngineError> {
+            unreachable!()
+        }
+        fn image_exists(&self, _: &str) -> Result<bool, EngineError> {
+            unreachable!()
+        }
+        fn image_home_dir(&self, _: &str) -> Result<Option<String>, EngineError> {
+            unreachable!()
+        }
+        fn build_image(
+            &self,
+            _: &crate::engine::container::BuildRequest,
+            _: &mut dyn FnMut(&str),
+        ) -> Result<(), EngineError> {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn stopped_listing_failure_is_preserved_for_both_resolution_scopes() {
+        for scope in [ResolveScope::RunningOnly, ResolveScope::IncludeStopped] {
+            let runtime = ListingFailureRuntime::new(false);
+            let err = resolve_agent(&runtime, "missing", scope).unwrap_err();
+            assert!(err.to_string().contains("stopped listing failed"));
+            assert!(runtime.inner.called("list_running_all"));
+        }
+    }
+
+    #[tokio::test]
+    async fn listing_errors_reach_status_and_kill_without_mutating_agents() {
+        use crate::command::commands::agents::{
+            AgentsKillCommand, AgentsKillFlags, AgentsStatusCommand, AgentsStatusFlags,
+        };
+        use crate::command::commands::Command;
+        let runtime = std::sync::Arc::new(ListingFailureRuntime::new(false));
+        let (frontend, _) = FakeFrontend::new();
+        let err = AgentsKillCommand::new(
+            "missing".into(),
+            AgentsKillFlags { yes: true },
+            runtime.clone(),
+        )
+        .run_with_frontend(frontend.boxed())
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("stopped listing failed"));
+        assert!(!runtime.inner.called("stop "));
+        let (frontend, _) = FakeFrontend::new();
+        let runtime = std::sync::Arc::new(ListingFailureRuntime::new(true));
+        let err = AgentsStatusCommand::new(AgentsStatusFlags::default(), runtime)
+            .run_with_frontend(frontend.boxed())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("running listing failed"));
     }
 }

@@ -123,6 +123,7 @@ impl TaskGateway for RecordingGateway {
             active_count: 0,
             last_tick: None,
             in_flight: 0,
+            config_error: None,
             env_persistence: Some(awman::data::fs::daemon_env::EnvPersistence::None),
             unmet_env: Vec::new(),
         })
@@ -533,7 +534,7 @@ async fn cli_squad_entry_points_fail_fast_under_a_sandbox_runtime() {
         // key and block ~10s polling for a daemon child that refuses to start.
         let _exit: ExitCode = tokio::time::timeout(
             Duration::from_secs(5),
-            awman::frontend::cli::run(matches, ctx),
+            awman::frontend::cli::run(matches, ctx, Vec::new(), Vec::new()),
         )
         .await
         .unwrap_or_else(|_| panic!("squad {raw:?} hung under a sandbox runtime"));

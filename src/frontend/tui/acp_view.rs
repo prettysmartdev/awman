@@ -87,10 +87,10 @@ pub fn render_acp_maximized(
         .filter(|s| !s.is_empty())
         .or_else(|| {
             tab.shared
-                .workflow_state
-                .lock()
-                .ok()
-                .and_then(|g| g.as_ref().and_then(|v| v.current_step.clone()))
+                .workflow
+                .snapshot()
+                .view
+                .and_then(|view| view.current_step)
         });
     let left_title = match step_name {
         Some(step) => format!(" \u{1F512} {} (acp) \u{2014} {} ", agent_name, step),

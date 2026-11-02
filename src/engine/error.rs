@@ -26,6 +26,13 @@ pub struct MergeFailedDetail {
     pub output: String,
 }
 
+/// Retry classification assigned by an image source before diagnostics are formatted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageRetryClass {
+    Transient,
+    Permanent,
+}
+
 #[derive(Debug, Error)]
 pub enum EngineError {
     #[error(transparent)]
@@ -119,6 +126,15 @@ pub enum EngineError {
 
     #[error("network error: {0}")]
     Network(String),
+
+    /// Internal acquisition failure. The retry loop uses `retry`, never the
+    /// redacted diagnostic. Acquisition exposes the existing `Network` error
+    /// once its retry policy is finished.
+    #[error("network error: {diagnostic}")]
+    ImageSourceFailure {
+        retry: ImageRetryClass,
+        diagnostic: String,
+    },
 
     #[error("auth error: {0}")]
     Auth(String),

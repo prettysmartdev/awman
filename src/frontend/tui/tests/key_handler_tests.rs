@@ -633,11 +633,14 @@ fn ctrl_w_during_running_step_sends_engine_request() {
         current_step: Some("build".into()),
         max_concurrent: None,
     };
-    *app.active_tab_mut().shared.workflow_state.lock().unwrap() = Some(view);
+    app.active_tab_mut()
+        .shared
+        .workflow
+        .update_view(|slot| *slot = Some(view));
 
     // Wire up an engine channel so we can observe what's sent.
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<EngineRequest>();
-    *app.active_tab_mut().shared.engine_tx_shared.lock().unwrap() = Some(tx);
+    app.active_tab_mut().engine_tx = Some(tx);
 
     press_key(&mut app, KeyCode::Char('w'), KeyModifiers::CONTROL);
 
@@ -656,7 +659,7 @@ fn ctrl_w_in_step_confirm_escalates_to_wcb() {
 
     // Wire up an engine channel so Ctrl-W handler fires.
     let (engine_tx, _engine_rx) = tokio::sync::mpsc::unbounded_channel::<EngineRequest>();
-    *app.active_tab_mut().shared.engine_tx_shared.lock().unwrap() = Some(engine_tx);
+    app.active_tab_mut().engine_tx = Some(engine_tx);
 
     // Open a StepConfirm dialog with a response channel.
     let (tx, rx) = std::sync::mpsc::channel();
@@ -786,7 +789,10 @@ fn scroll_down_reveals_hidden_parallel_steps() {
         current_step: None,
         max_concurrent: None,
     };
-    *app.active_tab_mut().shared.workflow_state.lock().unwrap() = Some(view);
+    app.active_tab_mut()
+        .shared
+        .workflow
+        .update_view(|slot| *slot = Some(view));
 
     // Simulate the renderer having recorded an overview rect.
     let overview_rect = Rect::new(0, 30, 80, 9);
@@ -832,7 +838,10 @@ fn scroll_clamped_at_bounds() {
         current_step: None,
         max_concurrent: None,
     };
-    *app.active_tab_mut().shared.workflow_state.lock().unwrap() = Some(view);
+    app.active_tab_mut()
+        .shared
+        .workflow
+        .update_view(|slot| *slot = Some(view));
 
     let overview_rect = Rect::new(0, 30, 80, 3);
     app.active_tab_mut().last_overview_rect = Some(overview_rect);
@@ -859,27 +868,29 @@ fn install_horizontal_overview(app: &mut App, n: usize, current: Option<&str>) {
         ExecutionPhase, StepViewStatus, WorkflowStepKind, WorkflowStepView, WorkflowViewState,
     };
     let tab = app.active_tab();
-    *tab.shared.workflow_state.lock().unwrap() = Some(WorkflowViewState {
-        steps: (0..n)
-            .map(|i| WorkflowStepView {
-                name: format!("stage-{i}"),
-                status: if current == Some(format!("stage-{i}").as_str()) {
-                    StepViewStatus::Running
-                } else {
-                    StepViewStatus::Pending
-                },
-                agent: Some("agent".into()),
-                model: None,
-                depends_on: if i == 0 {
-                    vec![]
-                } else {
-                    vec![format!("stage-{}", i - 1)]
-                },
-                kind: WorkflowStepKind::Agent,
-            })
-            .collect(),
-        current_step: current.map(str::to_string),
-        max_concurrent: None,
+    tab.shared.workflow.update_view(|view| {
+        *view = Some(WorkflowViewState {
+            steps: (0..n)
+                .map(|i| WorkflowStepView {
+                    name: format!("stage-{i}"),
+                    status: if current == Some(format!("stage-{i}").as_str()) {
+                        StepViewStatus::Running
+                    } else {
+                        StepViewStatus::Pending
+                    },
+                    agent: Some("agent".into()),
+                    model: None,
+                    depends_on: if i == 0 {
+                        vec![]
+                    } else {
+                        vec![format!("stage-{}", i - 1)]
+                    },
+                    kind: WorkflowStepKind::Agent,
+                })
+                .collect(),
+            current_step: current.map(str::to_string),
+            max_concurrent: None,
+        })
     });
     app.active_tab_mut().execution_phase = ExecutionPhase::Running {
         command: "exec workflow".into(),
@@ -966,8 +977,8 @@ fn horizontal_offset_is_clamped_after_width_and_column_count_shrink() {
         .draw(|f| crate::frontend::tui::render::render_frame(&mut app, f))
         .unwrap();
     assert_eq!(app.active_tab().workflow_overview_hscroll_offset, 8);
-    *app.active_tab().shared.workflow_state.lock().unwrap() =
-        Some(crate::frontend::tui::tabs::WorkflowViewState {
+    app.active_tab().shared.workflow.update_view(|view| {
+        *view = Some(crate::frontend::tui::tabs::WorkflowViewState {
             steps: (0..3)
                 .map(|i| crate::frontend::tui::tabs::WorkflowStepView {
                     name: format!("stage-{i}"),
@@ -984,7 +995,8 @@ fn horizontal_offset_is_clamped_after_width_and_column_count_shrink() {
                 .collect(),
             current_step: None,
             max_concurrent: None,
-        });
+        })
+    });
     terminal
         .draw(|f| crate::frontend::tui::render::render_frame(&mut app, f))
         .unwrap();

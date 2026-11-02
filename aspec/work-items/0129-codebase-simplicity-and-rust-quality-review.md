@@ -2,7 +2,7 @@
 
 Title: Codebase simplicity, modularity, idiomatic Rust, duplication, and architecture conformance remediation
 Issue: Not linked
-Status: Proposed — findings revalidated 2026-10-30 against `6128a50f`, with code touched by WI 0138 rechecked at `55d7fbbd`; architecture audit added; maintainer decisions recorded (D1, F01, F04); implementation not started.
+Status: In progress — remediation integrated and required Linux checks pass (2026-10-31); native/platform acceptance evidence and independent review of the final integration delta remain open.
 
 ## Summary:
 
@@ -451,14 +451,19 @@ On provisioned supported hosts, also compile/lint the builtin feature, exercise 
 
 Completion criteria:
 
-- [ ] F01–F17 and A01–A08 each have implementation/test evidence or a justified current-tree withdrawal.
-- [ ] Tenet 1 and the lint both state the D1 rule.
-- [ ] Shared policy has one owning implementation; retained differences are explicit.
-- [ ] `src/frontend/api/routes.rs` contains HTTP translation only, as A01–A03 define it.
-- [ ] No new general framework, global service locator, blanket lint suppression, or fallback-to-success was introduced to satisfy a cleanup metric.
+- [x] F01–F17 and A01–A08 each have implementation/test evidence or a justified current-tree withdrawal.
+- [x] Tenet 1 and the lint both state the D1 rule.
+- [x] Shared policy has one owning implementation; retained differences are explicit.
+- [x] `src/frontend/api/routes.rs` contains HTTP translation only, as A01–A03 define it.
+- [x] No new general framework, global service locator, blanket lint suppression, or fallback-to-success was introduced to satisfy a cleanup metric.
 - [ ] Targeted behavior and compatibility tests pass; required platform checks have results.
 - [ ] Conflicts were resolved by the integrator, and final changes were reviewed across team boundaries.
-- [ ] Current docs describe the resulting behavior and verification limits accurately.
+- [x] Current docs describe the resulting behavior and verification limits accurately.
+
+The two unchecked criteria remain open: required platform results are missing
+(see P1–P7 below), and the cross-team reports reviewed the pre-integration tree.
+Their findings are resolved and the integrator reviewed the corrections, but the
+final integration delta has not received a separate independent cross-team review.
 
 ## Codebase Integration:
 
@@ -469,3 +474,422 @@ Prefer a small concrete struct, enum, or local helper when it removes an actual 
 ## Documentation
 
 After implementation, update existing user-facing docs only for changed observable behavior (config errors, daemon recovery, output handling, runtime availability). Regenerate the command reference if catalogue changes require it. Put implementation rationale and evidence in this item or review notes, not in a new user-facing “WI 0129 guide.” Correct the development/spec guidance identified by F17 and the architecture documents per A05 and A08, while preserving historical evidence archives.
+
+## Remediation record
+
+All batches land in **one pull request**. Reviewers can follow the batches through
+this record; file/symbol locations substitute for per-batch commits. This is the
+integration record, not a user-facing guide. It reconciles the per-finding ledgers
+under `/awman/context/workflow/0129/ledger/` with the current code, including their
+later corrections. Earlier counts and “complete” statements in those ledgers are
+historical when superseded below.
+
+The final cross-team reports are `reviews/final-codex-work.md` and
+`reviews/final-claude-work.md` in that context directory. Their disposition is in
+`reviews/integrator-dispositions.md`; the current integrated check results are in
+`validation.md`. CX-01/FCW-06, CX-02/FCW-03, and the two validation failures are
+duplicate reports of the same issues, not separate unaddressed findings. All
+confirmed final-review defects received fixes and regression coverage (existing
+scope tests support the documentation correction). CX-06's additional framer-home
+and setup-task requirements were withdrawn with the evidence under F05 below.
+No F01–F17 or A01–A08 finding is withdrawn merely because it moved or lint passes.
+
+### Batch 1 — persistence, resource lifetime and reloads
+
+**F01 — queue completion.** Locations: `src/command/commands/api_server/queue_worker.rs`
+(`QueuedCommandResult::publish`, sidecar recovery), `cancel.rs`, `runtime.rs`,
+`command_log_stream.rs`, `src/data/command_status.rs`, and
+`src/data/fs/{api_db,api_paths}.rs`. Before, failed terminal writes allowed
+restart redispatch, malformed argv could become an empty invocation, and an
+already published completion could be overwritten by unowned cancellation.
+After, atomic attempt-bound sidecars precede bounded row retries, strict argv
+validation fails the invocation, restart/cancel reconcile the same result once,
+and terminal rows only lose stale sidecars. Unreadable evidence refuses startup
+instead of requeueing; idle closing sessions reconcile without losing cleanup
+recipes. FCW-01 additionally lets the stream finish from a matching terminal
+sidecar while row writes still fail. Evidence: `sidecar_tests`, early-worker
+tests, and `sidecar_projection_requires_running_matching_terminal_evidence`;
+the SQL-failure test now checks live/reconnect delivery, complete result equality,
+exactly one Done and no redispatch after restart. Intentional differences:
+best-effort log/sidecar removal stays distinct from command completion. No
+F01-specific platform check is blocked.
+
+**F02 — prompt files.** Locations: `src/engine/container/{options,process}.rs`,
+`builtin/{backend,instance,exec_bridge}.rs`, `agent/mod.rs`, and
+`agent_runtime/{execution,conformance}.rs`. Before, a shared engine accumulated
+files/descriptors, and a poisoned registry could return a deleted path. After,
+guards travel with each launch through options, instance and execution; CLI
+waiters/builtin event owners retain files while a guest may read them. FCW-02
+removes irreversible `mem::forget`: after stream/stop failure, the observing task
+retains ownership until exit or a confirmed later owned stop; failed grace stops
+permit another cancellation. Evidence: sequential/per-path descriptor counts,
+concurrent launches, unlaunched/spawn failure, custom file/env agents, conformance,
+and `bridge_tests::prompt_files_follow_confirmed_exit_or_stop_including_a_later_retry`
+plus `failed_grace_stop_allows_another_cancel` and a runtime-abort/last-clone
+regression. Losing the final observer preserves the path but closes its descriptor;
+that path then needs external cleanup after the unknown guest ends. The five earlier P1-R04 tests
+claimed in the ledger were absent; that claim is retracted, replaced by these
+actual regressions. Retained differences: CLI child reaping, builtin grace and
+attached execution ownership; two-line resource transfers remain per backend.
+Deliberate correction: dropped launches retain their own files while liveness is
+unknown; no other launch or attached agent is stopped. **OPEN/BLOCKED P1:** real
+Docker Desktop and Apple unwaited-PTY prompt readability, and non-Unix execution.
+An unconfirmed guest still retains its resources; no bounded cleanup claim is made
+without termination evidence.
+
+**F03 — atomic saves.** Locations: `src/data/workflow_state_store.rs`,
+`fs/{task_store,api_paths,daemon_process,skill_library,config_file}.rs`.
+Before, truncate-in-place could destroy the last checkpoint/config or expose
+partial JSON. After, these mutable records use the existing same-directory
+write/sync/rename helper. Evidence: workflow/task/config-file tests for failed
+publication, readable prior state/resume, first create, mode preservation and temp
+cleanup. The earlier p1-correctness review separately records rename-EIO and
+312,875 complete-JSON concurrent-read probes against its cached library; those
+are historical probe evidence, not newly executed integration tests. Deliberate correction: final-component symlinks,
+nonregular/read-only records are refused; concurrent writers remain last rename
+wins and directory sync is best effort. Intentional differences: unique
+write-once container logs and unconsumed best-effort command metadata remain
+direct writes; pre-existing API-specific atomic writers remain separate.
+**OPEN/BLOCKED P2:** macOS and Windows replacement/permission validation.
+
+**F04 — scheduler reload.** Locations: `src/engine/squad/scheduler.rs`,
+`src/command/commands/squad/gateway.rs`, CLI squad rendering, and
+`docs/12-squad.md`. Before, unreadable/malformed config silently selected defaults.
+After, that tick admits nothing, preserves observation/in-flight counts, logs a
+distinct error once, and resumes on valid reload. FCW-07 exposes the same
+`SchedulerStatus.config_error` through optional daemon status and CLI output,
+clearing it on recovery. Evidence: malformed/inaccessible/absent/changed-error
+scheduler tests, gateway projection/legacy JSON and CLI recovery tests. No
+duplicate error slot remains. These pauses and error visibility are deliberate
+corrections; healthy output and absent-file defaults remain. No specific platform
+blocker; the unrelated general loader fallback is not claimed repaired here.
+
+### Batches 2–3 — shared behavior and typed boundaries
+
+**F05 — output framing.** Locations:
+`src/engine/agent_output/{line_framer,mod}.rs`,
+`src/frontend/api/command_frontend.rs`, and API `session_setup.rs`.
+Before, copied drain/search loops moved bytes repeatedly and grew without bound.
+After, one incremental byte framer bounds text/stderr at 64 KiB, marks truncation,
+flushes EOF and preserves split Unicode; structured stdout permits complete frames
+up to 8 MiB and suppresses over-limit raw protocol content/stale final candidates.
+Evidence: all split-point/empty/invalid/EOF/overlong framer tests,
+`structured_large_frames_preserve_results_and_never_echo_tool_payloads`,
+stdin EOF and short-execution completion-order tests. Retain consumer-specific
+translation/log formatting and ACP's distinct framing. CX-06: Layer 1 is already
+below both consumers and is the accepted owner; moving to Layer 0 adds no behavior.
+Command drains retain the EventBus completion barrier. Setup tracing is best
+effort and can finish after setup status, as before; the extra tracking requirement
+in shared contracts §9 is explicitly withdrawn. No platform-specific blocker.
+
+**F06 — typed inputs.** Locations:
+`src/command/dispatch/{parsed_input,projections/raw_args}.rs`,
+`src/command/error.rs`, TUI/API command frontends. Before, TUI stringified and
+reparsed typed values; API reconstructed parse errors in Layer 3. After, TUI owns
+`ParsedArgs`; API uses the agreed `Arc<Result<ParsedArgs, CommandError>>`
+fallback and Layer 2 `clone_parse_stage`. Evidence: shared cases for omitted/false,
+forced/default flags, aliases, numeric/path/trailing/repeated inputs and structured
+errors, plus CLI parity. Deliberate correction: explicit false no longer creates
+a conflict or suppresses another flag's default (API `--plan=false` keeps yolo);
+explicit `--yolo=false` still overrides its own default. Retain clap's refusal of
+`--flag=false`, frontend-specific defaults, and the limited parse-error variant
+list because broader errors are not cloneable. No specific platform blocker.
+
+**F07 — config coercion.** Locations: `src/command/commands/config.rs`,
+`src/data/config/{fields,repo}.rs`, `docs/07-configuration.md`.
+Before, boolean/numeric-looking strings changed type and unsupported fields could
+report success without persisting. After, registry kind/scope/list metadata and
+typed round-trip validation drive edits; shared loader validators reject bad
+values before write and Unicode-safe masking protects sensitive presentation.
+Evidence: CLI/TUI string round trips, scope/object/no-op rejection, map deletion,
+guidance commas, leader/env-list validation and sensitive-value tests. Retain
+field-specific enum sets/numeric bounds and separate list/map handling. Named
+corrections include usage errors for discarded edits, masked get/set and exit 2
+for invalid envVars; zero values retain each loader's established policy. CX-03
+fixes prose to say `agent` repo-only and `default_agent` global-only. No
+specific platform blocker.
+
+**F08 — launch policy.** Locations:
+`src/command/commands/{launch_policy,chat,exec_prompt}.rs` and
+`src/engine/workflow/{single_step,parallel}.rs`. Before, ACP/overlay policy and
+workflow spawn checkpoints were duplicated; factory failure left Running and
+could abandon live sibling waits. After, LaunchPolicy owns common decisions and
+`prepare_step_launch`/`spawn_prepared_step` own launch recording. A failed
+factory records Failed/-1, preserves the original cause even if saving fails,
+and the parallel group explicitly stops its owned siblings and resets them for
+resume. Evidence: cross-entrypoint cases, single/parallel retry,
+`failed_checkpoint_write_preserves_the_original_spawn_error`, and
+`parallel_spawn_failure_stops_owned_live_siblings_through_the_group`. Retain
+single/parallel scheduling, frontend callbacks, plan/yolo and prompt/ACP flows;
+no flag-driven universal runner. These failure-state changes are deliberate.
+**BLOCKED P3:** native macOS focused reruns and lint.
+
+**F09 — Docker listings.** Locations: `src/engine/container/docker.rs`,
+`src/command/commands/agents/resolve.rs`, `squad/attach.rs`,
+`src/command/stats_sampler.rs`. Before, multiple parsers and swallowed query
+failures could report “not found.” After, one parser and ownership-query helper
+deduplicate IDs, skip malformed rows, preserve legacy names and surface query
+failure to resolution/status/kill/attach; sampler failure remains best effort.
+Evidence: fake CLI empty/unavailable/nonzero/second-query/malformed/dedup/filter
+tests and caller-level failure/retry tests. CX-01/FCW-06 removes fixture PATH
+mutation through a thread-local listing executable seam, with cross-thread
+isolation coverage. Retain the two Docker ownership queries, stopped filters and
+separate Apple backend. Timestamp fallback still keeps the row but logs its cause.
+Deliberate corrections: runtime failure and malformed IDs/names are no longer
+hidden. Fake executable tests are Unix-only; **BLOCKED P6** for real Docker.
+
+**F10 — lifecycle types.** Locations: `src/data/{command_status,session_status,session}.rs`,
+`fs/api_db.rs`, API worker/runtime/cancel and route projections. Before,
+unrestricted row strings overlapped invocation status and silently missed states.
+After, typed session/command/setup values govern reads/mutations; InvocationStatus
+is distinct and terminal wire conversion explicit. Evidence:
+`every_stored_status_round_trips_and_unknown_values_are_named_errors`,
+mixed-writer pending cancellation, WI 0138 spelling/unknown-row tests and SQLite
+upgrade fixtures. Unknown values now fail reads rather than fabricate readiness
+or an empty queue; legacy pending still maps to queued and is cancelled atomically.
+Retain wire-event types, per-enum parse/as_str implementations and compatibility
+JSON args views (strict execution decoding remains F01's). No specific platform
+blocker. Historical `aborted` row provenance cannot be certified with unavailable
+Git history; no current writer or documented row contract establishes it as valid.
+
+**F11 — OCI retry classification.** Locations:
+`src/engine/oci/{retry,registry,docker_engine,transport,verify,archive,apple_store,retry_fixtures}.rs`
+and `engine/error.rs`. Before, diagnostic wording controlled retries and permanent
+metadata failures retried. After, typed transient/permanent source failures
+survive readers and redaction, then map back to the existing public error shape.
+Evidence: local HTTP/TLS/token/proxy fixtures count attempts for malformed content,
+digest/platform errors, TLS/auth refusals, 5xx, truncation and unreachable-network
+kinds; cancellation/deadline/private-staging tests remain. Deliberate corrections:
+permanent inputs stop after one attempt, token 5xx and typed network unreachability
+retry. HTTP 408/429 remain final by explicit policy. Retain source-specific limits,
+schemas, authentication and provenance; no general error framework.
+**BLOCKED P4/P6:** macOS/Windows reruns and native source/runtime checks.
+
+### Batches 4–5 — ownership and architecture
+
+**F12 — dependency boundaries.** Locations:
+`src/command/dispatch/{mod,engines,outcomes}.rs`,
+`commands/config.rs`, `commands/squad/daemon.rs`. Before, dispatch mixed
+assembly/outcomes/routing, ConfigCommand carried all engines and for_daemon
+advertised an unused paths input. After, assembly/outcomes have focused owners
+with compatible reexports; config needs only notices plus session; daemon paths
+come from the existing environment owner. Evidence: shared-notice/once-only
+tests, dispatch/catalogue/startup/fallback/exit-code and registered command tests.
+Retain BuildContext's engine bundle and dispatch's routing helpers; no new
+duplicate owner or broad mocks. No deliberate user-visible change or specific
+platform blocker.
+
+**F13 — TUI lifecycle.** Locations: `src/frontend/tui/tabs.rs`,
+`tabs/{container_slots,overlay_lifecycle,git_poll,labels}.rs`,
+`command_frontend.rs`, `app.rs`, per-command/render/attach consumers and
+`tests/squad_attach_frontends.rs`. Before, independently locked identity/I/O/view
+fields could mix launches and same-tick events. After, SharedWorkflowPresentation
+publishes coherent identity/view/path snapshots; ContainerLifecycle queues
+launch-bound transitions; one consumer writes active identity and `bind_io`
+writes bindings. Reset/detach replace command feeds and UUID slot keys reject
+stale stats. Evidence: same-tick exit/start, stale callbacks, sequential/parallel
+retry, stuck subscriptions, cancellation isolation, shifted-tab stats, dialog
+preservation and registered attach/tab tests. Retain sequential backbone versus
+parallel slot presentation and independent terminal/countdown state. Deliberate
+corrections clear prior-launch state and cancel only a dropped tab's own token.
+AT-01's fixture migration is present; no unresolved source/platform blocker.
+
+**F14 — test environment.** Locations: `tests/engine/process_env.rs` and its
+engine-test consumers; `src/frontend/tui/tests/render_tests.rs`. Before, unrelated
+mutexes raced over HOME/PATH and restoration conflated absent/empty values.
+After, one per-executable poison-tolerant RAII guard restores Option<OsString>;
+the squad render test checks its execution-window title rather than “awman” in
+CWD (FCW-05). F09's lib fixture no longer changes PATH at all. Evidence: panic/
+empty/absent restoration, normal/high-concurrency engine tests and required-root
+render/full suite. Retain separate guards in distinct test processes; no global
+single-threading or product behavior change. **OPEN/BLOCKED P5:** macOS HOME
+collision execution.
+
+**F15 — architecture scanners.** Locations: `tools/architecture-lint.sh`,
+`tools/test-architecture-lint.sh`, fixture trees and `Makefile`. Before, scanner
+failure/missing inputs could pass, nonportable patterns hid violations, and an
+inline cfg(test) item exempted the next production item. After, scan/allocation/
+input/symlink failures exit 2 with diagnostics, violations exit 1, and only
+positively test-gated items are exempt. Evidence: allowed/direct/grouped/shim,
+fault-injection, top-level security, cfg and inline-item fixtures. The existing
+CI `make architecture-lint` now runs the fixtures as well. Retain per-rule
+reporting and documented line-scanner alias limitations; no blanket suppression.
+These fail-closed diagnostics are deliberate. **OPEN/BLOCKED P5:** BSD-tool run.
+
+**A01 — admission.** Locations: `src/command/commands/api_server/admission.rs`,
+`admission/tests.rs`, runtime constructor, `src/data/fs/api_db.rs` and
+`src/frontend/api/routes.rs`. Before, routes owned persistence order,
+compensation and reservation lifecycle. After, typed Layer 2 admission owns
+validation/writes/Drop; routes decode and map outcomes. CX-02/FCW-03 strengthens
+crash safety with an atomic provisional-row/barrier transaction, accepted intent
+only after complete admission, and close despite a failed barrier refresh.
+Evidence: direct ordering/trigger/drop/panic/foreign-owner/restart tests,
+`failed_barrier_never_leaves_an_unprotected_session`,
+`failed_barrier_refresh_still_closes_and_preserves_pending_rollback`, and
+unchanged successful API/idempotency fixtures. Deliberate corrections prevent
+orphan duplicate sessions and incomplete-admission success replay. Retain tiny
+typed access adapters, byte-order-preserving response structs and raw JSON
+fingerprints; setup presentation remains frontend-owned under the contract.
+No new platform gate; WI 0145 orchestration scope is not duplicated.
+
+**A02 — log stream.** Location:
+`src/command/commands/api_server/command_log_stream.rs`; routes consume it and
+encode SSE. Before, transport owned resume, dedupe, gap repair and terminal rules.
+After, an independently cancellable Layer 2 subscription yields events plus
+cursor/progress metadata. FCW-01 makes a matching durable sidecar authoritative
+while the row is still running. Evidence: direct cursor/filter/gap/drop tests,
+worker-failure live/reconnect tests and WI 0136 resume/step-filter fixtures.
+Retain JSON snapshot transport handling, separate setup streams and id-less
+recovery notifications; historical Done alone cannot finish a running attempt.
+The sidecar completion correction is deliberate; wire names/IDs are preserved.
+No platform-specific blocker or WI 0146 terminal feature added.
+
+**A03 — read models.** Locations: API runtime's `ApiSessionLifecycle`,
+`src/data/fs/api_db.rs` queue records and routes. Before, routes chose lifecycle,
+queue positions and fallback status. After, typed Layer 2 views own those choices;
+routes spell HTTP fields/errors. Evidence: queue order/positions/legacy args,
+memory/disk/row precedence, early-cancel failure, setup-owner and WI 0138 tests.
+Retain full snapshot versus minimal legacy projection and existing malformed
+read-args `[]` compatibility; F01 execution decoding stays strict. Deliberate
+correction: unreadable lifecycle/early-cancel state fails explicitly rather than
+reporting readiness or starting uncertain setup. No specific platform blocker.
+
+**A04 — CLI routing and run_command comparison.** Locations:
+`src/frontend/cli/mod.rs`, `cli/per_command/exec_workflow.rs`,
+`src/command/dispatch/mod.rs` and workflow frontend trait. The old special
+`exec workflow` branch built/executed directly, skipped `Dispatch::admit`
+(runtime-tier guard and catalogue gateway resolution; workflow needs no gateway),
+`begin_command`/`finish_command`/`fail_command`, workflow-state clearing and
+`UnfinishedCommandGuard`, and reconstructed a fresh CLI frontend. It also used
+plain error rendering even with JSON. Now every path calls `Dispatch::run_command`;
+`into_exec_workflow_frontend` supplies CliParallelFrontend. Deliberate correction:
+workflow errors get the standard JSON stdout envelope and common lifecycle/
+admission, with established exit codes and success output retained. Evidence:
+canonical/wf lifecycle and parallel frontend tests,
+`exec_workflow_failure_renders_for_the_output_mode`, cli_parity/binary_smoke.
+Retain CLI parallel chrome as a presentation adapter; no duplicate router.
+**BLOCKED P7:** live TTY chrome check.
+
+**A05 — D1.** Locations: Tenet 1 in the grand architecture, lint header/rule,
+`src/command/git_summary.rs`, `dispatch/engines.rs`, admission and frontend
+consumers. Before, spec/lint disagreed and frontends polled Git, validated admission,
+verified bearer auth and drained runtime notices directly. After, data and
+engine-defined frontend types are allowed while Layer 2 owns behavior. Evidence:
+GitSummaryPoller publish/cancel tests, bearer verdict parity, notice tests and
+allow/deny/inline-cfg lint fixtures. Poll cadence, sidebar output, auth verdicts
+and notice semantics remain; no reexport framework or duplicate policy.
+**BLOCKED P5/P7:** BSD lint and live TUI inspection.
+
+**A06 — binary notices.** Locations: `src/main.rs`,
+`src/frontend/{cli,tui}/mod.rs`. Before, the binary chose notice presentation and
+drained the concrete runtime. After, it passes startup messages/notices to the
+selected frontend; CLI prints messages then notices then command/deferred notices
+to stderr, TUI prints startup messages before terminal setup and uses its status
+area for notices. Evidence: launch-mode/notice/CLI/squad blocker tests and current
+absence of container_runtime from main. Retain binary clap/tracing/native
+transport/launch-mode wiring; no new duplication or deliberate behavior change.
+No A06-specific platform blocker.
+
+### Batch 6 — policy location, manifests and documentation
+
+**F16 — manifests/builds.** Locations: `crates/awman-cli/{Cargo.toml,build.rs}`,
+host-shim manifest/build script, root `build.rs`, `Cargo.lock`, and registered
+`tests/binary_smoke/build_cfg.rs`. Before, CLI duplicated library dependencies
+and payload responsibilities; cfg could diverge from the implementation.
+After, binary imports are normal dependencies, integration imports dev-only,
+builtin forwarding goes through library/shim owners, both receive cfg after
+validation and only the shim emits kernel bytes. CX-05 makes CLI cfg use the
+same exact three triples, excluding musl. Evidence: default workspace/all-target
+build/lint, worker-path/default builtin tests, feature dependency tree and real
+CLI build-script execution with supported/musl/Windows targets and feature off/on.
+Retain shared library/shim payload validation and the short explicit CLI target
+allowlist; no dependency version/patch upgrades. **OPEN/BLOCKED P6:** verified
+payload, builtin feature/examples and supported native/hardware gates.
+
+**F17 — current prose.** Locations: CLI manifest comments,
+`aspec/devops/localdev.md`, and ledger-listed source comments. Before, guidance
+named removed oldsrc paths, unregistered suites that are now registered, nonexistent
+Criterion/dhat targets and an obsolete workflow profiling command. After, current
+registrations, commands and verification limits are described. Evidence: manifest
+target listing, builtin-runtime default suite, catalogue command and dependency
+inspection. Retain historical schema/provenance rationale and safety/cancellation/
+FFI comments; no deletion quota or behavior change. Builtin example execution
+shares **BLOCKED P6**; other prose requires no platform test.
+
+**A07 — each reviewed Layer 0 item.** Locations:
+`src/data/workflow_prerequisites.rs`,
+`src/engine/workflow/prerequisites/{policy,policy_tests}.rs`,
+`src/data/merge_fix_prompt.rs`, and
+`src/command/commands/exec_workflow/merge_fix_prompt.rs`.
+Prerequisite derivation, step-kind and report decisions moved to the existing
+Layer 1 owner with their tests. Serializable types, pure Git remote parsing/
+redaction and summary formatting remain in Layer 0 because Layer 0 persistence/
+events consume them; cleanup review corrected their initial over-move.
+Merge-fix rendering moved to its clear Layer 2 preparation owner; pure conflict
+marker detection remains data-owned. `UserMessageSink`, `GitRootResolver`,
+`SessionStore`, and `DaemonEnvStore` are all retained in Layer 0 because that
+layer consumes their message/environment/storage seams; the architecture wording
+now explicitly permits them. Evidence: prerequisite policy/shape/redaction,
+persisted-secret exclusion and merge-template/substitution/error tests plus
+registered prerequisite/data-layer targets. Retain those four distinct seam
+traits and policy-versus-shape test separation. No deliberate prerequisite
+behavior correction: decisions, ordering, serialized spellings and renderer
+semantics remain unchanged. No specific platform blocker.
+
+**A08 — architecture inventory.** Locations:
+`aspec/architecture/{2026-grand-architecture,design,four-layer-summary}.md` and
+`docs/architecture.md`. Before, references omitted squad and several engines/
+assembly owners. After, all frontend directories and the current engine surface
+are described or covered by the reusable-mechanics rule, with Startup, Engines,
+HeadlessDefaults and catalogue construction named. CX-04 completes design.md.
+Evidence: current module declarations and constructor paths checked against the
+document maps. Retain short repeated inventories for independently readable
+references and the grand document's historical framing; daemon wording stays
+minimal for WI 0145. No runtime behavior change or platform blocker.
+
+### Final integrated validation (2026-10-31)
+
+All four required checks pass on Linux aarch64 / Rust 1.94.0, with no runtime or
+service opt-in:
+
+| Check | Result |
+| --- | --- |
+| `bash tools/architecture-lint.sh` | PASS, exit 0 |
+| `cargo fmt --all --check` | PASS, exit 0 |
+| `cargo clippy --workspace --all-targets --locked -- -D warnings` | PASS, exit 0 |
+| `make test-fast AWMAN_TEST_TMPROOT=/tmp/awman-0129-tests` | PASS, exit 0; 4,601 library tests passed, 1 ignored, 2 filtered; all registered fast integration targets and doctests passed |
+
+Additional evidence: 91 architecture scanner checks pass; ten mixed
+`docker_listing_tests engine::agent:: --test-threads=16` runs pass (148 tests
+each), and the registered engine target passes at 64 threads (129 tests plus
+child fixtures). The final matrix includes the new build-script, sidecar-stream,
+admission-barrier, observer-shutdown and reload-status regressions.
+
+Authoritative logs: `/awman/context/workflow/0129/logs/integrator-final-*.log`
+and `integrator-final-exit-codes.txt`; supplemental logs use `integrator-race-*`,
+`integrator-engine-64.log` and `integrator-lint-fixtures.log`.
+An intermediate run lost its rlib during overlapping Clippy/rustdoc execution;
+it is not counted as a pass. The final sequential matrix above supersedes it
+and the original two test-fast failures. No source workaround or suppression
+was added for the artifact race.
+
+### Outstanding platform evidence
+
+These are missing results, not waived checks. No real runtime/service was opted
+into in this container; Linux fake-driver success cannot close them.
+
+| ID | Exact remaining check and prerequisite |
+| --- | --- |
+| P1 | On Docker Desktop and Apple Containers, drop an unwaited PTY launch whose guest ignores SIGHUP and verify it can still read its own prompt file until actual exit; run the F02 conformance/lifetime cases on supported non-Unix paths. Requires those native runtimes. |
+| P2 | On macOS and Windows, run `bash tools/isolated-test.sh -p awman --lib --locked -- workflow_state_store task_store config_file` for replacement, first-create, mode and failed-save/resume; confirm complete old/new JSON and temp cleanup. |
+| P3 | Native macOS: isolated `-p awman --lib --locked -- launch_policy engine::workflow:: worktree --skip real_git --skip real_network --skip builtin_hw`, `-p awman-cli --test engine_tests --locked -- workflow --skip real_git --skip real_network --skip builtin_hw`, plus workspace all-target Clippy. |
+| P4 | macOS/Windows: isolated `-p awman --lib --locked -- engine::oci`, `-p awman-cli --test oci_import --locked`, plus workspace all-target Clippy. |
+| P5 | macOS: isolated `-p awman-cli --test engine_tests --locked -- --test-threads=64` (including HOME collision), `make architecture-lint` and `bash tools/test-architecture-lint.sh` with BSD tools. |
+| P6 | Verified native payload: `cargo check --workspace --all-targets --locked --features builtin-runtime`, `cargo clippy --workspace --all-targets --locked --features builtin-runtime -- -D warnings`, isolated `-p awman-cli --test builtin_runtime --locked --features builtin-runtime`, `cargo check -p awman-cli --examples --locked --features builtin-runtime` (`builtin_hw_driver`, `builtin_net_driver`), `make payloads-verify`, `tools/native-builtin-ci.sh`, `tools/test-msb-catalog-compat.sh`; KVM/HVF required for real guests. Docker/Apple runtime checks require their installed services. `tools/release-artifact-check.sh` and `make sign-macos` require target release artifacts; `tools/reproducible-build-audit.sh` additionally requires usable Git metadata. Coordinate with WI 0120/0124, without taking their feature scope. |
+| P7 | Live TTY `exec workflow`/`wf` parallel chrome and TUI sidebar/notice presentation through dispatch; terminal access unavailable here. |
+
+Git status/diff/history cannot be certified because this checkout's .git points to
+an absent host worktree. No Git mutation was attempted. All integration scratch
+scripts/logs are outside the repository in the shared workflow context or isolated
+temporary roots; retained repository additions are source, regression tests and
+the requested record.

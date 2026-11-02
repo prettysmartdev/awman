@@ -59,6 +59,7 @@ fn docker_selected_key_pushes_and_setup_clone_uses_same_key_while_identity_commi
         .unwrap()
         .success());
     std::fs::write(repo.join("file"), "fixture").unwrap();
+    let _env = crate::process_env::ProcessEnvGuard::lock();
     let home = dirs::home_dir().unwrap();
     let ssh = home.join(".ssh");
     std::fs::create_dir_all(&ssh).unwrap();

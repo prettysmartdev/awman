@@ -3,6 +3,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use awman::data::command_status::CommandStatus;
 use awman::data::fs::api_db::{NewSessionRow, SqliteSessionStore};
 use awman::data::fs::api_paths::ApiPaths;
 use awman::data::fs::auth_paths::AuthPathResolver;
@@ -243,17 +244,21 @@ async fn status_advertises_workflow_state_feature_and_queued_exec_says_not_start
     app.store
         .enqueue_command("alias", "session", "exec wf", "[]", "/l")
         .unwrap();
-    for status in ["done", "error", "aborted", "cancelled"] {
+    for status in [
+        CommandStatus::Done,
+        CommandStatus::Error,
+        CommandStatus::Cancelled,
+    ] {
         app.store
-            .enqueue_command(status, "session", "exec workflow", "[]", "/l")
+            .enqueue_command(status.as_str(), "session", "exec workflow", "[]", "/l")
             .unwrap();
         app.store
-            .update_command_finished(status, status, Some(1), "now")
+            .update_command_finished(status.as_str(), status, Some(1), "now")
             .unwrap();
     }
     let (addr, server) = serve_router(app).await;
     let client = reqwest::Client::new();
-    for id in ["alias", "done", "error", "aborted", "cancelled"] {
+    for id in ["alias", "done", "error", "cancelled"] {
         let response = client
             .get(format!("http://{addr}/v1/workflows/{id}"))
             .send()

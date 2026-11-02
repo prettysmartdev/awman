@@ -188,8 +188,13 @@ pub(crate) fn render_squad(outcome: &SquadOutcome, json: bool) -> Option<String>
                 None | Some(EnvPersistence::Keychain) | Some(EnvPersistence::None) => String::new(),
                 Some(other) => format!("; env persistence {other}"),
             };
+            let config = status
+                .config_error
+                .as_ref()
+                .map(|error| format!("; config reload failed: {error}"))
+                .unwrap_or_default();
             Some(format!(
-                "squad daemon running (PID {pid}) at {address}; {} tasks ({} active); last tick {last_tick}{unmet}{persistence}",
+                "squad daemon running (PID {pid}) at {address}; {} tasks ({} active); last tick {last_tick}{unmet}{persistence}{config}",
                 status.task_count, status.active_count
             ))
         }
@@ -429,6 +434,7 @@ mod tests {
             active_count: 2,
             last_tick: Some(at(0)),
             in_flight: 0,
+            config_error: None,
             env_persistence: Some(EnvPersistence::Keychain),
             unmet_env: unmet.iter().map(|s| s.to_string()).collect(),
         }
@@ -500,6 +506,16 @@ mod tests {
     /// their `env()` values had stopped being persisted. The healthy states —
     /// `keychain` and the explicit `none` opt-out — stay silent, so the common
     /// line is unchanged.
+    #[test]
+    fn squad_status_names_a_reload_failure_and_clears_after_recovery() {
+        let mut current = status(&[]);
+        current.config_error = Some("invalid config.json".into());
+        assert!(text(&SquadOutcome::Status(current.clone()))
+            .ends_with("; config reload failed: invalid config.json"));
+        current.config_error = None;
+        assert!(!text(&SquadOutcome::Status(current)).contains("config reload failed"));
+    }
+
     #[test]
     fn squad_status_names_a_degraded_env_persistence_and_stays_silent_otherwise() {
         for healthy in [

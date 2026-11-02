@@ -22,12 +22,7 @@ pub(super) fn render_status_bar(app: &App, area: Rect, frame: &mut Frame, sideba
     }
 
     let tab = app.active_tab();
-    let workflow_active = tab
-        .shared
-        .workflow_state
-        .lock()
-        .map(|g| g.is_some())
-        .unwrap_or(false);
+    let workflow_active = tab.shared.workflow.snapshot().view.is_some();
 
     // A squad tab renders the card grid in place of the execution window, so
     // the execution-window hints below ("Exit code", "press ↑ to focus the

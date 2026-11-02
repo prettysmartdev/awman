@@ -90,6 +90,8 @@ pub struct SchedulerStatus {
     pub tick_count: u64,
     /// How many evaluations are executing right now.
     pub in_flight: usize,
+    /// Current reload failure; cleared by the next successful reload.
+    pub config_error: Option<String>,
     /// One cancellation handle per in-flight evaluation, keyed by task id.
     /// `squad cancel` fires it; the evaluation removes its own entry when it
     /// ends, however it ends.
@@ -219,15 +221,48 @@ impl SquadScheduler {
         while tasks.join_next().await.is_some() {}
     }
 
+    /// Re-read the global config's squad policy. A genuinely absent file yields
+    /// the documented defaults; an unreadable or invalid one yields `None`
+    /// (admit nothing) and its named error is logged once per distinct error.
+    fn reload_squad_config(&self) -> Option<crate::data::config::SquadConfig> {
+        let loaded = self.load_global_config();
+        let mut status = self.status.lock().expect("scheduler status mutex poisoned");
+        let reported = &mut status.config_error;
+        match loaded {
+            Ok(cfg) => {
+                *reported = None;
+                Some(cfg.squad.unwrap_or_default())
+            }
+            Err(error) => {
+                let text = error.to_string();
+                if reported.as_deref() != Some(text.as_str()) {
+                    tracing::error!(
+                        "squad: global config reload failed; admitting no new work until it loads: {text}"
+                    );
+                    *reported = Some(text);
+                }
+                None
+            }
+        }
+    }
+
+    /// `GlobalConfig` treats a path that `exists()` denies as absent, which here
+    /// would admit work under default policy. Only a real `NotFound` is absence.
+    fn load_global_config(&self) -> Result<GlobalConfig, crate::data::error::DataError> {
+        let path = GlobalConfig::path_with(&self.env)?;
+        path.try_exists()
+            .map_err(|error| crate::data::error::DataError::io(&path, error))?;
+        GlobalConfig::load_path(&path)
+    }
+
     /// One tick: re-read config, select due tasks, dispatch each.
     fn tick(&self, tasks: &mut JoinSet<()>) {
         // Re-read config every tick — never cached at startup — so guidance /
         // agentsToModels / defaultLeader / maxConcurrentEvaluations edits take
-        // effect on the next tick with no restart. A malformed config that
-        // fails to load falls back to defaults rather than stalling the loop.
-        let cfg = GlobalConfig::load_with(&self.env).unwrap_or_default();
-        let squad = cfg.squad.unwrap_or_default();
-        let max_concurrent = squad.max_concurrent_evaluations_or_default().max(1);
+        // effect on the next tick with no restart. A config that fails to load
+        // admits nothing this tick (there is no last-known-good policy), but
+        // the tick is still counted and running agents are still observed.
+        let squad = self.reload_squad_config();
 
         self.log_running_agents();
 
@@ -243,6 +278,11 @@ impl SquadScheduler {
             status.last_tick = Some(now);
             status.tick_count += 1;
         }
+
+        let Some(squad) = squad else {
+            return;
+        };
+        let max_concurrent = squad.max_concurrent_evaluations_or_default().max(1);
 
         // The whole admission predicate — active, off-backoff, interval
         // elapsed, and not already running — is enforced in SQL. Never
@@ -971,6 +1011,170 @@ mod tests {
         assert_eq!(status, RunStatus::WorkflowExecuted);
         assert!(!failed);
         assert!(detail.error.is_none());
+    }
+
+    // ── Global config reload (WI 0129 F04) ────────────────────────────────
+
+    fn config_scheduler(tmp: &std::path::Path) -> (SquadScheduler, std::path::PathBuf) {
+        let store = Arc::new(summary_store(tmp));
+        let past = Utc::now() - chrono::Duration::hours(1);
+        store
+            .create(&Task {
+                prerequisites: None,
+                id: "id-alpha".into(),
+                name: "alpha".into(),
+                description: "d".into(),
+                repo_scope: tmp.to_path_buf(),
+                mount_scope: crate::data::fs::MountScope::Directory,
+                overlays: Vec::new(),
+                interval_secs: 60,
+                status: crate::data::fs::TaskStatus::Active,
+                agent: None,
+                model: None,
+                backoff_until: None,
+                created_at: past,
+                updated_at: past,
+                last_run_at: None,
+                trigger_requested_at: None,
+                last_run_status: None,
+                unmet_env: Vec::new(),
+            })
+            .unwrap();
+        let home = tmp.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let env = EnvSnapshot::with_overrides([(
+            crate::data::config::env::AWMAN_CONFIG_HOME,
+            home.to_str().unwrap(),
+        )]);
+        let scheduler = SquadScheduler::new(
+            store,
+            SquadPaths::from_root(tmp.join("squad")),
+            Arc::new(NoopEvaluator),
+            env,
+        );
+        (scheduler, home.join("config.json"))
+    }
+
+    /// A started run takes the task out of the due set.
+    fn task_admitted(scheduler: &SquadScheduler) -> bool {
+        scheduler
+            .store
+            .due_for_evaluation(Utc::now())
+            .unwrap()
+            .is_empty()
+    }
+
+    #[tokio::test]
+    async fn a_malformed_global_config_admits_nothing_and_recovers_on_the_next_valid_reload() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (scheduler, config) = config_scheduler(tmp.path());
+        let mut tasks = JoinSet::new();
+
+        // Malformed with an unrelated run in flight: nothing is admitted, the
+        // in-flight count is untouched, and the tick is still counted.
+        adjust_in_flight(&scheduler.status, 1);
+        std::fs::write(&config, "{ not json").unwrap();
+        scheduler.tick(&mut tasks);
+        assert!(!task_admitted(&scheduler), "default policy must not admit");
+        {
+            let status = scheduler.status.lock().unwrap();
+            assert_eq!(status.in_flight, 1);
+            assert_eq!(status.tick_count, 1);
+        }
+        let first = scheduler.status.lock().unwrap().config_error.clone();
+        assert!(first.is_some(), "the named error is recorded");
+
+        // The same error on a later tick is not a new report.
+        scheduler.tick(&mut tasks);
+        assert_eq!(scheduler.status.lock().unwrap().config_error, first);
+        assert!(!task_admitted(&scheduler));
+
+        // A valid reload resumes admission with no restart, and the in-flight
+        // run still counts against the cap.
+        std::fs::write(&config, r#"{"squad":{"maxConcurrentEvaluations":1}}"#).unwrap();
+        scheduler.tick(&mut tasks);
+        assert!(scheduler
+            .status_handle()
+            .lock()
+            .unwrap()
+            .config_error
+            .is_none());
+        assert!(!task_admitted(&scheduler), "cap of 1 is still full");
+        adjust_in_flight(&scheduler.status, -1);
+        scheduler.tick(&mut tasks);
+        assert!(task_admitted(&scheduler));
+        while tasks.join_next().await.is_some() {}
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_inaccessible_global_config_admits_nothing_and_recovers_when_restored() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let (scheduler, config) = config_scheduler(tmp.path());
+        std::fs::write(&config, r#"{"squad":{"maxConcurrentEvaluations":1}}"#).unwrap();
+        let parent = config.parent().unwrap();
+        let mut tasks = JoinSet::new();
+        adjust_in_flight(&scheduler.status, 1);
+
+        for denied in [&config, &parent.to_path_buf()] {
+            let original = std::fs::metadata(denied).unwrap().permissions();
+            std::fs::set_permissions(denied, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let enforced = std::fs::read_to_string(&config).is_err();
+            if enforced {
+                // Running as root the mode cannot deny access.
+                scheduler.tick(&mut tasks);
+            }
+            std::fs::set_permissions(denied, original).unwrap();
+            if !enforced {
+                return;
+            }
+            assert!(!task_admitted(&scheduler), "default policy must not admit");
+            assert_eq!(scheduler.status.lock().unwrap().in_flight, 1);
+            assert!(scheduler
+                .status_handle()
+                .lock()
+                .unwrap()
+                .config_error
+                .is_some());
+
+            // Restored: a valid reload clears the error with no restart.
+            scheduler.tick(&mut tasks);
+            assert!(scheduler
+                .status_handle()
+                .lock()
+                .unwrap()
+                .config_error
+                .is_none());
+            assert!(!task_admitted(&scheduler), "cap of 1 is still full");
+        }
+        adjust_in_flight(&scheduler.status, -1);
+        scheduler.tick(&mut tasks);
+        assert!(task_admitted(&scheduler));
+        while tasks.join_next().await.is_some() {}
+    }
+
+    #[tokio::test]
+    async fn an_absent_global_config_keeps_the_default_policy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (scheduler, config) = config_scheduler(tmp.path());
+        assert!(!config.exists());
+        let mut tasks = JoinSet::new();
+        scheduler.tick(&mut tasks);
+        assert!(task_admitted(&scheduler));
+        while tasks.join_next().await.is_some() {}
+    }
+
+    #[test]
+    fn a_changed_config_error_is_reported_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (scheduler, config) = config_scheduler(tmp.path());
+        std::fs::write(&config, "{ not json").unwrap();
+        assert!(scheduler.reload_squad_config().is_none());
+        let first = scheduler.status.lock().unwrap().config_error.clone();
+        std::fs::write(&config, r#"{"maxConcurrentAgents":0}"#).unwrap();
+        assert!(scheduler.reload_squad_config().is_none());
+        assert_ne!(scheduler.status.lock().unwrap().config_error, first);
     }
 
     // ── The periodic running-agents summary (WI 0106 §3b) ─────────────────

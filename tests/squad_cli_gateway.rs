@@ -199,6 +199,7 @@ impl TaskGateway for RecordingGateway {
             active_count: 1,
             last_tick: None,
             in_flight: 0,
+            config_error: None,
             env_persistence: Some(awman::data::fs::daemon_env::EnvPersistence::None),
             unmet_env: Vec::new(),
         })

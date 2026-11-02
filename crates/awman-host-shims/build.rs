@@ -1,2 +1,2 @@
-// Reuse the root's checked payload configuration; paths resolve from the workspace.
+// Shared payload validation; this package alone emits the kernel table.
 include!("../../build.rs");

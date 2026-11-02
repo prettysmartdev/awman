@@ -317,3 +317,34 @@ fn awman_api_start_help_mentions_port_flag() {
         "`awman api start --help` should mention --port;\ngot:\n{text}"
     );
 }
+
+/// `exec workflow` and its alias report a failure through the same renderer as
+/// every other command: a JSON error on stdout under `--json`, and the same exit
+/// code as the plain form, which keeps its text on stderr.
+#[test]
+fn exec_workflow_failure_renders_for_the_output_mode() {
+    let repo = make_git_repo();
+    let config = tempfile::TempDir::new().unwrap();
+    let run = |args: &[&str]| {
+        std::process::Command::new(awman_bin())
+            .args(args)
+            .current_dir(repo.path())
+            .env("AWMAN_CONFIG_HOME", config.path())
+            .env("AWMAN_API_ROOT", config.path().join("api"))
+            .output()
+            .unwrap()
+    };
+
+    let plain = run(&["exec", "workflow", "missing.toml", "--non-interactive"]);
+    assert!(!plain.status.success());
+    assert!(plain.stdout.is_empty(), "{plain:?}");
+    assert!(!plain.stderr.is_empty(), "{plain:?}");
+
+    for spelling in ["workflow", "wf"] {
+        let json = run(&["exec", spelling, "missing.toml", "--json"]);
+        assert_eq!(json.status.code(), plain.status.code(), "{json:?}");
+        let body: serde_json::Value =
+            serde_json::from_slice(&json.stdout).expect("stdout is one JSON document");
+        assert!(body["error"].as_str().is_some_and(|text| !text.is_empty()));
+    }
+}

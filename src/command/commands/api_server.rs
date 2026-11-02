@@ -16,7 +16,9 @@ use crate::engine::auth::TlsMaterial;
 use crate::engine::daemon::{AcquireError, DaemonGuard, DaemonKind, DaemonSupervisor, Termination};
 use crate::engine::remote::{HttpClientOptions, HttpCore};
 
+pub mod admission;
 pub mod cancel;
+pub mod command_log_stream;
 pub mod event_bus;
 pub mod owned_runtime;
 pub mod push_back;

@@ -33,8 +33,8 @@ use serde::Deserialize;
 use crate::data::config::image_source::{RegistryAuthSource, RegistryHostConfig};
 use crate::data::oci_identity::{Digest, OciPlatform};
 use crate::engine::auth::credential::SecretString;
-use crate::engine::error::EngineError;
-use crate::engine::oci::retry::{redact, CancelToken, Deadline};
+use crate::engine::error::{EngineError, ImageRetryClass};
+use crate::engine::oci::retry::{map_diagnostic, read_error, redact, CancelToken, Deadline};
 use crate::engine::oci::sources::{FetchContext, Fetched, Report};
 use crate::engine::oci::verify::{
     digest_hex, ensure_space, is_limit_exceeded, sha256_digest, HashingReader, StagingSink,
@@ -566,9 +566,12 @@ impl<'a> Session<'a> {
                 builder = builder.add_root_certificate(cert);
             }
         }
-        let client = builder
-            .build()
-            .map_err(|e| EngineError::Network(format!("HTTP client setup failed: {e}")))?;
+        let client = builder.build().map_err(|e| {
+            ImageRetryClass::Permanent.failure(redact(
+                &format!("HTTP client setup failed: {e}"),
+                &secrets.iter().map(String::as_str).collect::<Vec<_>>(),
+            ))
+        })?;
         let scheme = if insecure { "http" } else { "https" };
         Ok(Self {
             client,
@@ -654,15 +657,26 @@ impl<'a> Session<'a> {
         // `reqwest::Error` renders the URL, never request headers; the text
         // is still redacted against every secret this session holds (a proxy
         // URL with credentials can surface in a connect error).
-        let secrets: Vec<&str> = self.secrets.iter().map(String::as_str).collect();
-        EngineError::Network(redact(
-            &format!(
+        self.failure(
+            ImageRetryClass::http(&e),
+            format!(
                 "registry {}: {}",
                 self.reference.registry,
                 crate::engine::oci::retry::error_chain(&e.without_url())
             ),
-            &secrets,
-        ))
+        )
+    }
+
+    fn failure(&self, retry: ImageRetryClass, diagnostic: String) -> EngineError {
+        let secrets: Vec<&str> = self.secrets.iter().map(String::as_str).collect();
+        retry.failure(redact(&diagnostic, &secrets))
+    }
+
+    fn response_error(&self, error: EngineError, context: &str) -> EngineError {
+        map_diagnostic(error, |diagnostic| {
+            let secrets: Vec<&str> = self.secrets.iter().map(String::as_str).collect();
+            redact(&format!("{context}: {diagnostic}"), &secrets)
+        })
     }
 
     fn authorize(&mut self, challenge: &str) -> Result<(), EngineError> {
@@ -724,14 +738,24 @@ impl<'a> Session<'a> {
                     .transport
                     .send(req)
                     .map_err(|e| e.map_http(|e| self.network_error(e)))?;
+                if resp.status().is_server_error() {
+                    return Err(self.failure(
+                        ImageRetryClass::Transient,
+                        format!(
+                            "registry {} token service answered {}",
+                            self.reference.registry,
+                            resp.status()
+                        ),
+                    ));
+                }
                 if !resp.status().is_success() {
                     return Err(self.rejected());
                 }
                 let body = read_capped(resp, MAX_TOKEN_BYTES).map_err(|e| {
-                    EngineError::Network(format!(
-                        "registry {} token response: {e}",
-                        self.reference.registry
-                    ))
+                    self.response_error(
+                        e,
+                        &format!("registry {} token response", self.reference.registry),
+                    )
                 })?;
                 let parsed: TokenResponse = serde_json::from_slice(&body).map_err(|_| {
                     EngineError::Auth(format!(
@@ -769,11 +793,14 @@ impl<'a> Session<'a> {
             });
         }
         if !resp.status().is_success() {
-            return Err(EngineError::Network(format!(
-                "registry {} answered {} for the manifest of {shown}",
-                self.reference.registry,
-                resp.status()
-            )));
+            return Err(self.failure(
+                ImageRetryClass::status(resp.status()),
+                format!(
+                    "registry {} answered {} for the manifest of {shown}",
+                    self.reference.registry,
+                    resp.status()
+                ),
+            ));
         }
         let media_type = resp
             .headers()
@@ -787,7 +814,7 @@ impl<'a> Session<'a> {
             .and_then(|v| v.to_str().ok())
             .map(str::to_string);
         let body = read_capped(resp, MAX_MANIFEST_BYTES)
-            .map_err(|e| EngineError::Network(format!("manifest of {shown}: {e}")))?;
+            .map_err(|e| self.response_error(e, &format!("manifest of {shown}")))?;
         let digest = sha256_digest(&body);
         if let Ok(expected) = Digest::parse(reference) {
             if expected != digest {
@@ -821,7 +848,10 @@ impl<'a> Session<'a> {
                 manifests: Option<serde_json::Value>,
             }
             let probe: Probe = serde_json::from_slice(&body).map_err(|e| {
-                EngineError::Network(format!("manifest of {shown} is not JSON: {e}"))
+                self.failure(
+                    ImageRetryClass::Permanent,
+                    format!("manifest of {shown} is not JSON: {e}"),
+                )
             })?;
             match (probe.media_type, probe.manifests) {
                 (Some(mt), _) => mt,
@@ -850,11 +880,14 @@ impl<'a> Session<'a> {
         let url = format!("{}/blobs/{digest}", self.base);
         let resp = self.get(&url, None, None)?;
         if !resp.status().is_success() {
-            return Err(EngineError::Network(format!(
-                "registry {} answered {} for blob {digest}",
-                self.reference.registry,
-                resp.status()
-            )));
+            return Err(self.failure(
+                ImageRetryClass::status(resp.status()),
+                format!(
+                    "registry {} answered {} for blob {digest}",
+                    self.reference.registry,
+                    resp.status()
+                ),
+            ));
         }
         let mut file = crate::engine::oci::verify::create_private_file(path)?;
         // Allow one extra byte so an over-long body is detected, not cut.
@@ -879,16 +912,15 @@ impl<'a> Session<'a> {
                     })
                 }
                 Err(e) => {
-                    let secrets: Vec<&str> = self.secrets.iter().map(String::as_str).collect();
-                    return Err(EngineError::Network(redact(
+                    return Err(self.response_error(
+                        read_error(e),
                         &format!(
                             "registry {}: blob {digest} transfer failed after {} of {size} \
-                             bytes: {e}",
+                             bytes",
                             self.reference.registry,
                             reader.count()
                         ),
-                        &secrets,
-                    )));
+                    ));
                 }
             };
             std::io::Write::write_all(&mut file, &buf[..n])
@@ -906,9 +938,10 @@ impl<'a> Session<'a> {
         let count = reader.count();
         let (hex, _) = reader.finish().map_err(|e| EngineError::io(path, e))?;
         if count != size {
-            return Err(EngineError::Network(format!(
-                "blob {digest} was truncated: {count} of {size} bytes"
-            )));
+            return Err(self.failure(
+                ImageRetryClass::Transient,
+                format!("blob {digest} was truncated: {count} of {size} bytes"),
+            ));
         }
         if hex != digest_hex(digest) {
             return Err(EngineError::ImageDigestMismatch {
@@ -926,13 +959,13 @@ impl<'a> Session<'a> {
     }
 }
 
-fn read_capped(resp: Response, cap: u64) -> Result<Vec<u8>, String> {
+fn read_capped(resp: Response, cap: u64) -> Result<Vec<u8>, EngineError> {
     let mut body = Vec::new();
     resp.take(cap + 1)
         .read_to_end(&mut body)
-        .map_err(|e| e.to_string())?;
+        .map_err(read_error)?;
     if body.len() as u64 > cap {
-        return Err(format!("response exceeds {cap} bytes"));
+        return Err(ImageRetryClass::Permanent.failure(format!("response exceeds {cap} bytes")));
     }
     Ok(body)
 }
@@ -1041,7 +1074,10 @@ pub(super) fn pull(
     let (mut bytes, mut media_type, mut digest) = session.manifest(&reference.manifest_ref())?;
     if media_type == OCI_INDEX || media_type == DOCKER_LIST {
         let index: Index = serde_json::from_slice(&bytes).map_err(|e| {
-            EngineError::Network(format!("image index of {shown} is malformed: {e}"))
+            session.failure(
+                ImageRetryClass::Permanent,
+                format!("image index of {shown} is malformed: {e}"),
+            )
         })?;
         let mut found = Vec::new();
         let chosen = index.manifests.iter().find(|d| {
@@ -1065,8 +1101,12 @@ pub(super) fn pull(
                 found: found.join(", "),
             });
         };
-        let wanted = Digest::parse(&chosen.digest)
-            .map_err(|e| EngineError::Network(format!("image index of {shown}: {e}")))?;
+        let wanted = Digest::parse(&chosen.digest).map_err(|e| {
+            session.failure(
+                ImageRetryClass::Permanent,
+                format!("image index of {shown}: {e}"),
+            )
+        })?;
         (bytes, media_type, digest) = session.manifest(wanted.as_str())?;
         if digest != wanted {
             return Err(EngineError::ImageDigestMismatch {
@@ -1082,8 +1122,12 @@ pub(super) fn pull(
             reason: format!("{shown} has unsupported manifest type `{media_type}`"),
         });
     }
-    let manifest: Manifest = serde_json::from_slice(&bytes)
-        .map_err(|e| EngineError::Network(format!("manifest of {shown} is malformed: {e}")))?;
+    let manifest: Manifest = serde_json::from_slice(&bytes).map_err(|e| {
+        session.failure(
+            ImageRetryClass::Permanent,
+            format!("manifest of {shown} is malformed: {e}"),
+        )
+    })?;
     if manifest.layers.len() > ctx.limits.max_layers {
         return Err(EngineError::ImageArchiveRejected {
             path: PathBuf::from(&shown),
@@ -1099,8 +1143,12 @@ pub(super) fn pull(
     crate::data::fs::private_files::create_private_dir(&blobs_dir)?;
 
     // Config first: it decides the platform before any layer is fetched.
-    let config_digest = Digest::parse(&manifest.config.digest)
-        .map_err(|e| EngineError::Network(format!("manifest of {shown}: {e}")))?;
+    let config_digest = Digest::parse(&manifest.config.digest).map_err(|e| {
+        session.failure(
+            ImageRetryClass::Permanent,
+            format!("manifest of {shown}: {e}"),
+        )
+    })?;
     let config_path = blobs_dir.join(digest_hex(&config_digest));
     session.blob_to_file(
         &config_digest,
@@ -1112,7 +1160,12 @@ pub(super) fn pull(
     let config: ConfigPlatform = serde_json::from_slice(
         &std::fs::read(&config_path).map_err(|e| EngineError::io(&config_path, e))?,
     )
-    .map_err(|e| EngineError::Network(format!("image config of {shown} is malformed: {e}")))?;
+    .map_err(|e| {
+        session.failure(
+            ImageRetryClass::Permanent,
+            format!("image config of {shown} is malformed: {e}"),
+        )
+    })?;
     let config_platform = OciPlatform {
         os: config.os,
         architecture: config.architecture,
@@ -1160,8 +1213,12 @@ pub(super) fn pull(
     let mut layer_digests = Vec::new();
     for layer in &manifest.layers {
         ctx.cancel.check()?;
-        let d = Digest::parse(&layer.digest)
-            .map_err(|e| EngineError::Network(format!("manifest of {shown}: {e}")))?;
+        let d = Digest::parse(&layer.digest).map_err(|e| {
+            session.failure(
+                ImageRetryClass::Permanent,
+                format!("manifest of {shown}: {e}"),
+            )
+        })?;
         let path = blobs_dir.join(digest_hex(&d));
         if !path.exists() {
             session.blob_to_file(&d, layer.size, &path, ctx.limits.max_layer_bytes, report)?;
@@ -1703,6 +1760,54 @@ mod tests {
             assert!(matches!(err, EngineError::Auth(_)), "{err:?}");
             assert!(!text.contains("wrong-secret"), "{text}");
             assert!(text.contains("keychain service"), "{text}");
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn token_service_5xx_retries_but_auth_refusal_is_final() {
+            for (status, attempts) in [(503, 3), (403, 1)] {
+                let server = MockServer::start().await;
+                Mock::given(path("/v2/team/agent/manifests/1"))
+                    .respond_with(ResponseTemplate::new(401).insert_header(
+                        "www-authenticate",
+                        format!(r#"Bearer realm="{}/token""#, server.uri()),
+                    ))
+                    .mount(&server)
+                    .await;
+                Mock::given(path("/token"))
+                    .respond_with(ResponseTemplate::new(status))
+                    .mount(&server)
+                    .await;
+                let state = tempfile::tempdir().unwrap();
+                let req = request(&server, "awman-oci-test-token-status");
+                let st = state.path().to_path_buf();
+                let err = tokio::task::spawn_blocking(move || {
+                    acquirer(&st)
+                        .with_retry(crate::engine::oci::RetryPolicy {
+                            initial_backoff: std::time::Duration::ZERO,
+                            ..crate::engine::oci::RetryPolicy::DEFAULT
+                        })
+                        .acquire(&req, &mut |_| {})
+                })
+                .await
+                .unwrap()
+                .unwrap_err();
+                let seen = server.received_requests().await.unwrap();
+                assert_eq!(
+                    seen.iter().filter(|r| r.url.path() == "/token").count(),
+                    attempts,
+                    "{err}"
+                );
+                assert_eq!(
+                    seen.iter()
+                        .filter(|r| r.url.path().ends_with("/manifests/1"))
+                        .count(),
+                    attempts,
+                    "{err}"
+                );
+                if status == 403 {
+                    assert!(matches!(err, EngineError::Auth(_)));
+                }
+            }
         }
 
         /// Regression (review finding: credential leak via token realm): a

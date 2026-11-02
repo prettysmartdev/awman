@@ -3688,7 +3688,7 @@ impl crate::engine::agent_runtime::AgentRuntimeEngine for RecordingRuntime {
                     })
                     .unwrap_or_default();
                 self.prompts.lock().unwrap().push(prompt);
-                self.sandbox_launches.lock().unwrap().push(o);
+                self.sandbox_launches.lock().unwrap().push(*o);
                 return Err(EngineError::Other("recorded sandbox".into()));
             }
         };
@@ -3708,7 +3708,7 @@ impl crate::engine::agent_runtime::AgentRuntimeEngine for RecordingRuntime {
             })
             .unwrap_or_default();
         self.prompts.lock().unwrap().push(prompt);
-        self.resolved.lock().unwrap().push(o.clone());
+        self.resolved.lock().unwrap().push((*o).clone());
         let mut argv = o.entrypoint.map(|e| e.0).unwrap_or_default();
         argv.extend(o.agent_flags);
         self.launches.lock().unwrap().push(argv);

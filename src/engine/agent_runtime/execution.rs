@@ -403,6 +403,9 @@ impl AgentExecution {
 
     /// Hand ownership of the running agent back to the caller without
     /// joining. Useful for API background mode.
+    ///
+    /// The runtime keeps any mounted prompt files until the agent ends, because
+    /// the backend owns them rather than this handle.
     pub fn detach(mut self) -> AgentHandle {
         self.inner = ExecutionState::Detached;
         self.handle.clone()

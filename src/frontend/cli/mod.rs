@@ -14,9 +14,8 @@ use std::process::ExitCode;
 
 use clap::ArgMatches;
 
-use crate::command::commands::Command;
 use crate::command::dispatch::catalogue::CommandCatalogue;
-use crate::command::dispatch::{BuiltCommand, Dispatch, RuntimeContext};
+use crate::command::dispatch::{Dispatch, RuntimeContext};
 use crate::command::error::CommandError;
 use crate::command::CommandOutcome;
 
@@ -33,7 +32,29 @@ pub use parallel::CliParallelFrontend;
 ///
 /// Returns a process [`ExitCode`] reflecting the outcome of the dispatched
 /// command.
-pub async fn run(matches: ArgMatches, ctx: RuntimeContext) -> ExitCode {
+///
+/// `startup_messages` and `notices` come from Layer 2's startup and are
+/// printed to stderr, one per line and in that order, before the command
+/// runs. A builtin backend whose first open was deferred opens during the
+/// command, so the notices it raises are printed after the command returns.
+pub async fn run(
+    matches: ArgMatches,
+    ctx: RuntimeContext,
+    startup_messages: Vec<String>,
+    notices: Vec<String>,
+) -> ExitCode {
+    for line in startup_messages.iter().chain(&notices) {
+        eprintln!("{line}");
+    }
+    let engines = ctx.engines.clone();
+    let code = run_command(matches, ctx).await;
+    for notice in engines.take_runtime_notices() {
+        eprintln!("{notice}");
+    }
+    code
+}
+
+async fn run_command(matches: ArgMatches, ctx: RuntimeContext) -> ExitCode {
     let path = command_path_from_matches(&matches);
     if path.is_empty() {
         // `main.rs` should already have routed bare invocations to the TUI.
@@ -41,22 +62,6 @@ pub async fn run(matches: ArgMatches, ctx: RuntimeContext) -> ExitCode {
         return ExitCode::from(2);
     }
     let path_strs: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
-    if path_strs == ["exec", "workflow"] {
-        let build_frontend = CliFrontend::new(matches.clone());
-        let json = build_frontend.is_json_mode();
-        let dispatch = Dispatch::new(build_frontend, ctx.session.clone(), ctx.engines.clone());
-        return match dispatch.build_command(&path_strs) {
-            Ok(BuiltCommand::ExecWorkflow(cmd)) => {
-                let frontend = CliParallelFrontend::new(CliFrontend::new(matches));
-                match cmd.run_with_frontend(Box::new(frontend)).await {
-                    Ok(outcome) => render_outcome(&CommandOutcome::ExecWorkflow(outcome), json),
-                    Err(err) => render_error(&err),
-                }
-            }
-            Ok(_) => render_error(&CommandError::unknown_command(&path_strs)),
-            Err(err) => render_error(&err),
-        };
-    }
 
     // The runtime-tier guard and the squad gateway are catalogue-driven and
     // resolved by `Dispatch::run_command` (WI 0113 F-04). The CLI names no
@@ -343,6 +348,71 @@ mod tests {
     use super::*;
     use crate::command::dispatch::catalogue::CommandCatalogue;
     use crate::command::error::CommandError;
+
+    fn matches_for(argv: &[&str]) -> ArgMatches {
+        CommandCatalogue::get()
+            .build_clap_command()
+            .try_get_matches_from(argv)
+            .unwrap()
+    }
+
+    /// `exec workflow` runs under the parallel-step chrome. The boxed trait hides
+    /// the concrete type, but not its size, and the wrapper is larger than what
+    /// it wraps.
+    #[test]
+    fn the_cli_runs_exec_workflow_through_its_parallel_frontend() {
+        use crate::command::commands::exec_workflow::ExecWorkflowCommandFrontend;
+
+        let frontend = CliFrontend::new(matches_for(&["awman", "exec", "workflow", "w.toml"]));
+        let boxed = frontend.into_exec_workflow_frontend();
+        assert_eq!(
+            std::mem::size_of_val(&*boxed),
+            std::mem::size_of::<CliParallelFrontend>()
+        );
+        assert_ne!(
+            std::mem::size_of::<CliParallelFrontend>(),
+            std::mem::size_of::<CliFrontend>()
+        );
+    }
+
+    /// `exec workflow` and its `wf` alias go through dispatch like every other
+    /// command, so a failure is on the session and not only on the terminal.
+    #[tokio::test]
+    async fn a_failed_exec_workflow_is_recorded_on_the_session() {
+        use crate::data::session::{InvocationStatus, Session, SessionOpenOptions};
+
+        for spelling in ["workflow", "wf"] {
+            let root = tempfile::tempdir().unwrap();
+            let session = Session::open_at_git_root(
+                root.path().to_path_buf(),
+                root.path().to_path_buf(),
+                SessionOpenOptions::default(),
+            )
+            .unwrap();
+            let engines = crate::command::dispatch::Engines::for_tests(root.path());
+            let ctx = RuntimeContext::new(session, engines);
+            let session = ctx.session.clone();
+            let missing = root.path().join("missing.toml");
+            let matches = matches_for(&[
+                "awman",
+                "exec",
+                spelling,
+                missing.to_str().unwrap(),
+                "--non-interactive",
+            ]);
+
+            let code = run_command(matches, ctx).await;
+
+            assert_ne!(code, ExitCode::SUCCESS, "{spelling}");
+            let guard = session.read().await;
+            let command = guard.state().current_command.as_ref().expect(spelling);
+            assert!(
+                matches!(command.status, InvocationStatus::Error(_)),
+                "{spelling}: {:?}",
+                command.status
+            );
+        }
+    }
 
     /// Keep the user-facing text aligned at the actual CLI, TUI, and API
     /// message sinks. The engine owns the wording; this harness catches a

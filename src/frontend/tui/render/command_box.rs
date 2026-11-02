@@ -173,12 +173,7 @@ pub(super) fn render_suggestion_row(app: &App, area: Rect, frame: &mut Frame) {
     let show_suggestions = app.focus == Focus::CommandBox && !app.suggestion_row.is_empty();
     let tab = app.active_tab();
     let working_dir = tab.session.working_dir();
-    let active_worktree = tab
-        .shared
-        .active_worktree_path
-        .lock()
-        .ok()
-        .and_then(|path| path.clone());
+    let active_worktree = tab.shared.workflow.snapshot().worktree_path;
     let (directory_label, directory_path, directory_color) =
         if let Some(worktree) = active_worktree.as_deref() {
             ("  Worktree: ", worktree, Color::Blue)

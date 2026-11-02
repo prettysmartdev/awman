@@ -4,32 +4,17 @@
 //! catalogue and returns a typed [`ParsedCommandBoxInput`] the TUI feeds back
 //! through a `TuiCommandFrontend`.
 
-use std::collections::BTreeMap;
-
 use crate::command::dispatch::catalogue::{CommandCatalogue, CommandSpec};
+use crate::command::dispatch::projections::raw_args::ParsedArgs;
 use crate::command::error::CommandError;
 
 /// Result of `parse_command_box_input`. `path` is the resolved canonical
-/// command path; `flags` and `arguments` are typed string maps the TUI hands
-/// back to Dispatch via a `CommandFrontend`.
+/// command path the box needs for its own labels and admission; `args` is the
+/// typed parse the TUI hands back to Dispatch via a `CommandFrontend`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedCommandBoxInput {
     pub path: Vec<String>,
-    pub flags: BTreeMap<String, FlagValue>,
-    pub arguments: BTreeMap<String, ArgValue>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum FlagValue {
-    Bool(bool),
-    String(String),
-    Strings(Vec<String>),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ArgValue {
-    Single(String),
-    Multi(Vec<String>),
+    pub args: ParsedArgs,
 }
 
 /// Tokenize `raw` against the catalogue.
@@ -74,8 +59,8 @@ pub fn parse(
     }
 
     let path_refs: Vec<&str> = path.iter().map(String::as_str).collect();
-    let parsed = catalogue.parse_raw_args(&path_refs, &tokens[idx..])?;
-    Ok(parsed.into_command_box_input(current, path))
+    let args = catalogue.parse_raw_args(&path_refs, &tokens[idx..])?;
+    Ok(ParsedCommandBoxInput { path, args })
 }
 
 #[cfg(test)]
@@ -87,14 +72,11 @@ mod tests {
         let cat = CommandCatalogue::get();
         let parsed = parse("exec workflow my-workflow.toml --yolo", cat).unwrap();
         assert_eq!(parsed.path, vec!["exec", "workflow"]);
-        assert!(matches!(
-            parsed.flags.get("yolo"),
-            Some(FlagValue::Bool(true))
-        ));
-        assert!(matches!(
-            parsed.arguments.get("workflow"),
-            Some(ArgValue::Single(s)) if s == "my-workflow.toml"
-        ));
+        assert_eq!(parsed.args.flag_bool("yolo"), Some(true));
+        assert_eq!(
+            parsed.args.argument("workflow").as_deref(),
+            Some("my-workflow.toml")
+        );
     }
 
     #[test]
@@ -102,10 +84,10 @@ mod tests {
         let cat = CommandCatalogue::get();
         let parsed = parse("remote exec workflow my-workflow.toml", cat).unwrap();
         assert_eq!(parsed.path, vec!["remote", "exec", "workflow"]);
-        assert!(matches!(
-            parsed.arguments.get("workflow"),
-            Some(ArgValue::Single(s)) if s == "my-workflow.toml"
-        ));
+        assert_eq!(
+            parsed.args.argument("workflow").as_deref(),
+            Some("my-workflow.toml")
+        );
     }
 
     #[test]
@@ -114,11 +96,8 @@ mod tests {
         let parsed = parse(r#"remote exec prompt "hello world""#, cat).unwrap();
         assert_eq!(parsed.path, vec!["remote", "exec", "prompt"]);
         // `prompt` is a greedy trailing positional (TrailingVarArgs), so a
-        // single quoted token collects into a one-element Multi.
-        assert!(matches!(
-            parsed.arguments.get("prompt"),
-            Some(ArgValue::Multi(v)) if v == &["hello world".to_string()]
-        ));
+        // single quoted token stays one element.
+        assert_eq!(parsed.args.arguments("prompt"), vec!["hello world"]);
     }
 
     #[test]
@@ -168,13 +147,11 @@ mod tests {
         let parsed = parse(r#"exec prompt "do something complex""#, cat).unwrap();
         assert_eq!(parsed.path, vec!["exec", "prompt"]);
         // `prompt` is a greedy trailing positional: a single quoted token
-        // collects into a one-element Multi (the TUI frontend joins it back).
-        match parsed.arguments.get("prompt") {
-            Some(ArgValue::Multi(v)) => {
-                assert_eq!(v, &["do something complex".to_string()]);
-            }
-            other => panic!("expected Multi prompt argument, got: {other:?}"),
-        }
+        // stays one element.
+        assert_eq!(
+            parsed.args.arguments("prompt"),
+            vec!["do something complex"]
+        );
     }
 
     #[test]
@@ -182,11 +159,9 @@ mod tests {
         let cat = CommandCatalogue::get();
         let parsed = parse("ready -n", cat).unwrap();
         assert_eq!(parsed.path, vec!["ready"]);
-        assert!(
-            matches!(
-                parsed.flags.get("non-interactive"),
-                Some(FlagValue::Bool(true))
-            ),
+        assert_eq!(
+            parsed.args.flag_bool("non-interactive"),
+            Some(true),
             "-n must map to non-interactive flag"
         );
     }
@@ -256,16 +231,11 @@ mod shared_parser_tests {
         assert_eq!(from_box.to_string(), from_api.to_string());
     }
 
-    /// A well-formed numeric value still reaches the frontend as the string
-    /// the command box's own parser produced.
+    /// A well-formed numeric value reaches the frontend already typed.
     #[test]
-    fn a_valid_number_still_arrives_as_a_string() {
+    fn a_valid_number_arrives_typed() {
         let parsed = parse("squad start --port 9000", CommandCatalogue::get()).unwrap();
-        assert!(
-            matches!(parsed.flags.get("port"), Some(FlagValue::String(s)) if s == "9000"),
-            "got {:?}",
-            parsed.flags.get("port")
-        );
+        assert_eq!(parsed.args.flag_u16("port"), Some(9000));
     }
 
     /// A short-flag cluster is an unknown flag now, as it is on the CLI and in

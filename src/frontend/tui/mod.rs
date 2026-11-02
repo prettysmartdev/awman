@@ -15,6 +15,7 @@ pub fn is_tui_active() -> bool {
 
 use crate::command::dispatch::catalogue::CommandCatalogue;
 use crate::command::dispatch::RuntimeContext;
+use crate::command::git_summary::GitSummaryPoller;
 use crate::data::session_manager::SessionManager;
 
 pub mod acp_view;
@@ -68,6 +69,8 @@ pub enum InitialTab {
 /// behaviour, including the `ready` / `agents status --watch` startup auto-spawn;
 /// `Squad` opens the singleton squad tab (§2.2) with no auto-spawn.
 ///
+/// `startup_messages` are printed to stderr before the TUI takes the terminal.
+///
 /// `notices` are startup runtime notices (an in-place builtin state upgrade);
 /// they are shown in the status area rather than printed, since the TUI owns
 /// the terminal.
@@ -76,8 +79,12 @@ pub async fn run(
     ctx: RuntimeContext,
     fatal_runtime_error: Option<crate::command::startup::RuntimeStartupFailure>,
     initial_tab: InitialTab,
+    startup_messages: Vec<String>,
     notices: Vec<String>,
 ) -> ExitCode {
+    for message in &startup_messages {
+        eprintln!("{message}");
+    }
     let catalogue = CommandCatalogue::get();
     let session_manager = Arc::new(SessionManager::in_memory(
         ctx.session.read().await.env().clone(),
@@ -97,7 +104,10 @@ pub async fn run(
             session_manager
                 .create(session.clone())
                 .expect("startup session id must be unique");
-            let tab = Tab::new_with_git_engine(session, ctx.engines.git_engine.clone());
+            let tab = Tab::new_with_git_summary(
+                session,
+                GitSummaryPoller::new(ctx.engines.git_engine.clone()),
+            );
             let app = App::new(catalogue, ctx.engines, session_manager, tab, runtime_handle);
             (app, true)
         }
@@ -127,7 +137,10 @@ pub async fn run(
             // accepting it builds the squad tab through the ordinary path.
             Ok(SquadTabStart::KeyMissing) => {
                 let session = ctx.session.read().await.clone();
-                let tab = Tab::new_with_git_engine(session, ctx.engines.git_engine.clone());
+                let tab = Tab::new_with_git_summary(
+                    session,
+                    GitSummaryPoller::new(ctx.engines.git_engine.clone()),
+                );
                 let mut app =
                     App::new(catalogue, ctx.engines, session_manager, tab, runtime_handle);
                 app.active_dialog = Some(Dialog::SquadKeyMissing);
@@ -138,7 +151,10 @@ pub async fn run(
                 // should not happen; degrade to a normal tab on the cwd session
                 // and surface the specific error rather than failing to open.
                 let session = ctx.session.read().await.clone();
-                let tab = Tab::new_with_git_engine(session, ctx.engines.git_engine.clone());
+                let tab = Tab::new_with_git_summary(
+                    session,
+                    GitSummaryPoller::new(ctx.engines.git_engine.clone()),
+                );
                 let mut app =
                     App::new(catalogue, ctx.engines, session_manager, tab, runtime_handle);
                 app.status_bar.text = error.to_string();

@@ -9,7 +9,7 @@
 ```
 ┌──────────────────────────────────────────┐
 │ Layer 3: Frontend                        │  src/frontend/
-│ CLI (clap), TUI (Ratatui), API HTTP │
+│ CLI, TUI, API HTTP, squad HTTP           │
 │ RULE: Presentation-only, no business logic
 ├──────────────────────────────────────────┤
 │ Layer 2: Command                         │  src/command/
@@ -98,6 +98,18 @@
 - `HostAgentPinger` (`src/engine/ready/host_agent.rs`) — the only type
   permitted to spawn an agent binary on the host (see
   `aspec/architecture/security.md`).
+- Other current Layer 1 modules: `acp` owns ACP transport and session driving;
+  `agent_output` translates structured agent streams; `aspec` fetches the
+  canonical template; `credential_refresh` tracks live credential leases;
+  `daemon` supervises daemon processes; `host_cli.rs` resolves container and
+  sandbox CLI programs under test isolation; `image_prep` owns source-matched
+  builds/imports; `issue` routes issue providers; `oci` acquires and verifies
+  OCI images; `remote` owns shared HTTP transport and typed daemon clients;
+  `context_prompt.rs` builds context-overlay prompts; `message.rs` defines
+  engine messages and their sink; `step_status.rs` shares ready/init status;
+  and `error.rs` defines Layer 1 errors. The general rule for every Layer 1
+  module is to own reusable execution mechanics, with command policy in Layer
+  2 and presentation in Layer 3.
 - **Real systems (Docker, git, filesystem), no frontends.**
 
 ### Layer 2: Command (`src/command/`)
@@ -118,6 +130,9 @@
 - `HeadlessDefaults` (`src/command/headless.rs`) — the named answer profiles
   (`::api()`, `::squad()`, `::cli()`) a command delegates to when no operator
   is attached, instead of each frontend answering its own `ask_*` inline.
+- `CommandCatalogue` (`src/command/dispatch/catalogue.rs`) owns command and
+  flag metadata. `dispatch/build.rs` is its constructor table: each runnable
+  catalogue leaf points to a command-owned constructor, not command logic.
 - `LaunchPolicy` (`src/command/commands/launch_policy.rs`) — the decisions a
   command makes before putting an agent in front of a user: which agent,
   stdio vs. ACP, which context directories, how the session's end is
@@ -133,14 +148,16 @@
   never reclaims it. Multi-phase commands (`ExecWorkflowCommand`) hold it
   behind a shared handle (`SharedWorkflowFrontend`) and pass clones of the
   handle to phases and runtimes; no `Arc::try_unwrap`.
-- **All logic shared by CLI, TUI, API.**
+- **All logic shared by the frontend modes.**
 
 ### Layer 3: Frontend (`src/frontend/`)
-- CLI: clap-based CLI wrapper
-- TUI: Ratatui-based interactive terminal UI
-- API: HTTP router/bind/TLS only — bootstrap lives in `ApiServerRuntime` (L2)
-- Squad daemon: Axum router/bind only — bootstrap lives in
+- CLI (`src/frontend/cli/`): clap-driven command-line presentation
+- TUI (`src/frontend/tui/`): Ratatui-based interactive terminal presentation
+- API (`src/frontend/api/`): HTTP router/bind/TLS only — bootstrap lives in `ApiServerRuntime` (L2)
+- Squad (`src/frontend/squad/`): HTTP router/listener over bootstrapped handles;
+  bootstrap lives in
   `SquadDaemonEngine` (L1) via L2's `SquadDaemonHandles`
+- `render_helpers.rs`: shared frontend presentation helpers
 - **No business logic. Implement frontend traits. Call Dispatch.**
 
 ---

@@ -291,6 +291,38 @@ pub enum CommandError {
 }
 
 impl CommandError {
+    /// A copy of an error `parse_raw_args` can produce, so a parse result held
+    /// behind a shared handle can report it from every accessor. `None` for
+    /// any other variant, most of which wrap uncloneable engine or data errors.
+    pub fn clone_parse_stage(&self) -> Option<CommandError> {
+        Some(match self {
+            CommandError::UnknownCommand { path, suggestions } => CommandError::UnknownCommand {
+                path: path.clone(),
+                suggestions: suggestions.clone(),
+            },
+            CommandError::UnknownFlag { command, flag } => CommandError::UnknownFlag {
+                command: command.clone(),
+                flag: flag.clone(),
+            },
+            CommandError::InvalidFlagValue {
+                command,
+                flag,
+                reason,
+            } => CommandError::InvalidFlagValue {
+                command: command.clone(),
+                flag: flag.clone(),
+                reason: reason.clone(),
+            },
+            CommandError::UnexpectedArgument { command, argument } => {
+                CommandError::UnexpectedArgument {
+                    command: command.clone(),
+                    argument: argument.clone(),
+                }
+            }
+            _ => return None,
+        })
+    }
+
     /// An unknown command, with the catalogue's near misses attached.
     pub fn unknown_command(path: &[&str]) -> Self {
         CommandError::UnknownCommand {
