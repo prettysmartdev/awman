@@ -15,6 +15,16 @@ fn session_log_lines(log: &str, session_id: &str) -> Vec<String> {
         .collect()
 }
 
+/// Wait for a failed setup's partial clone to go away. `/status` reports
+/// `failed` when the failure is recorded, just before the clone is deleted.
+async fn wait_for_removal(clone: &std::path::Path) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while clone.exists() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(!clone.exists(), "clone left behind at {}", clone.display());
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn real_git_merge_conflict_fails_setup_at_merging_refs_naming_the_path() {
     crate::real_git_skip!();
@@ -59,7 +69,7 @@ async fn real_git_merge_conflict_fails_setup_at_merging_refs_naming_the_path() {
     assert!(!lines.contains("state → RunningReady"), "{lines}");
     // The partial clone is deleted, and nothing reached the origin.
     let clone = clone_path(&server.session(&id).await);
-    assert!(!clone.exists(), "clone left behind at {}", clone.display());
+    wait_for_removal(&clone).await;
     assert_eq!(origin.ls_remote(), refs_before);
 }
 
@@ -99,7 +109,7 @@ async fn real_git_existing_branch_with_base_ref_fails_at_setting_up_branch() {
     );
     assert!(!lines.contains("state → MergingRefs"), "{lines}");
     assert!(!lines.contains("state → RunningReady"), "{lines}");
-    assert!(!clone_path(&server.session(&id).await).exists());
+    wait_for_removal(&clone_path(&server.session(&id).await)).await;
     assert_eq!(origin.branch_sha("feature"), Some(feature));
 }
 
