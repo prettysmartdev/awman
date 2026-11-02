@@ -855,6 +855,7 @@ async fn parallel_group_restart_single_running_step() {
     tokio::time::sleep(Duration::from_millis(150)).await;
 
     open_board(&tx, "b").await;
+    wait_for_launched(&record, &["a", "b", "a"]).await;
     assert!(cancel_a.load(Ordering::Relaxed), "a's container is killed");
     assert!(!cancel_b.load(Ordering::Relaxed), "b keeps running");
     {
@@ -928,7 +929,7 @@ async fn parallel_group_restart_single_completed_step() {
     signal_completion(&completion_a, 0);
     tokio::time::sleep(Duration::from_millis(150)).await;
     open_board(&tx, "b").await;
-    assert_eq!(record.lock().unwrap().launched, vec!["a", "b", "a"]);
+    wait_for_launched(&record, &["a", "b", "a"]).await;
 
     signal_completion(&completion_a2, 0);
     signal_completion(&completion_b, 0);
