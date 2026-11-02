@@ -191,9 +191,10 @@ cat > "$shim/mktemp" <<SH
 #!/usr/bin/env bash
 case "\$*" in
   *err.XXXXXX*)
-    # Pipeline stages allocate concurrently; mkdir makes each number unique.
+    # Pipeline stages allocate concurrently; noclobber's O_EXCL open makes each
+    # number unique. uutils mkdir can report success to the loser of a race.
     n=1
-    until mkdir "\$MKTEMP_STATE/\$n" 2>/dev/null; do n=\$((n + 1)); done
+    until (set -C; : > "\$MKTEMP_STATE/\$n") 2>/dev/null; do n=\$((n + 1)); done
     if [ "\$n" = "\$MKTEMP_FAIL_AT" ]; then
       case "\${MKTEMP_LOCK:-}" in
         ?*) chmod 000 "\$(dirname "\${!#}")/\$MKTEMP_LOCK" ;;
