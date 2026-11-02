@@ -84,6 +84,8 @@ impl Server {
                     Err(e) => panic!("fixture accept: {e}"),
                 };
                 count.fetch_add(1, Ordering::SeqCst);
+                // BSD-derived systems pass the listener's O_NONBLOCK to accepted sockets.
+                stream.set_nonblocking(false).unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(2)))
                     .unwrap();
