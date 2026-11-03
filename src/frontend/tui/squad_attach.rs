@@ -88,10 +88,8 @@ impl SquadAttachFrontend for TuiCommandFrontend {
                 "squad attach is only available from the squad tab".to_string(),
             ));
         };
-        if let Ok(mut view) = self.workflow_view.lock() {
-            *view = None;
-        }
-        if let Ok(mut events) = self.container_slot_events.lock() {
+        self.workflow.update_view(|view| *view = None);
+        if let Ok(mut events) = self.container.events.lock() {
             events.clear();
             events.push_back(ContainerSlotEvent::Exited {
                 step_name: String::new(),
@@ -148,14 +146,13 @@ impl SquadAttachFrontend for TuiCommandFrontend {
             resize: Some(resize_rx),
             initial_size: Some(initial_size),
         };
-        let container_name = Arc::new(Mutex::new(None));
-        let proxy = TuiContainerProxy::with_io(self.status_log.clone(), io, container_name);
+        let proxy = TuiContainerProxy::with_io(self.status_log.clone(), io, None);
         let mut execution = instance
             .run_with_frontend(Box::new(proxy))
             .map_err(CommandError::from)?;
 
         push_slot_event(
-            &self.container_slot_events,
+            &self.container.events,
             ContainerSlotEvent::Launched {
                 step_name: step.to_string(),
                 agent,
@@ -168,10 +165,10 @@ impl SquadAttachFrontend for TuiCommandFrontend {
             },
         );
         push_slot_event(
-            &self.container_slot_events,
+            &self.container.events,
             ContainerSlotEvent::ContainerName {
                 step_name: step.to_string(),
-                container_name: preview.name,
+                container_name: preview.name.clone(),
             },
         );
 
@@ -181,7 +178,7 @@ impl SquadAttachFrontend for TuiCommandFrontend {
             .and_then(|session| session.cancel_token())
             .unwrap_or_default();
         let cancel_handle = execution.cancel_handle();
-        let events = self.container_slot_events.clone();
+        let events = self.container.events.clone();
         let status_log = self.status_log.clone();
         let output_tail = execution.output_tail();
         let step_name = step.to_string();
@@ -219,7 +216,7 @@ impl SquadAttachFrontend for TuiCommandFrontend {
                         }
                     }
                     if single_attach {
-                        push_slot_event(&events, ContainerSlotEvent::Exited { step_name });
+                        push_slot_event(&events, ContainerSlotEvent::AttachedExited { step_name, container_name: preview.name });
                         cancel.cancel();
                     }
                 }
@@ -230,7 +227,7 @@ impl SquadAttachFrontend for TuiCommandFrontend {
 
     fn on_slot_exited(&mut self, step: &str) {
         push_slot_event(
-            &self.container_slot_events,
+            &self.container.events,
             ContainerSlotEvent::Exited {
                 step_name: step.to_string(),
             },
@@ -238,12 +235,8 @@ impl SquadAttachFrontend for TuiCommandFrontend {
     }
 
     fn on_workflow_state(&mut self, state: &WorkflowState) {
-        if let Ok(mut view) = self.workflow_view.lock() {
-            *view = Some(workflow_state_to_view_state(state));
-        }
-        if let Ok(mut invocation_id) = self.workflow_invocation_id.lock() {
-            *invocation_id = Some(state.invocation_id);
-        }
+        self.workflow
+            .publish_remote(state.invocation_id, workflow_state_to_view_state(state));
     }
 
     fn reachable_flag(&self) -> Option<Arc<AtomicBool>> {

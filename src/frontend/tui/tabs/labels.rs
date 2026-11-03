@@ -88,10 +88,7 @@ impl Tab {
     /// Build a workflow step suffix like "implement (2/5)" for the tab label.
     /// Returns empty string when no workflow is active or has no steps.
     fn workflow_step_suffix(&self) -> String {
-        let guard = match self.shared.workflow_state.lock() {
-            Ok(g) => g,
-            Err(_) => return String::new(),
-        };
+        let guard = self.shared.workflow.snapshot().view;
         let view = match guard.as_ref() {
             Some(v) if !v.steps.is_empty() => v,
             _ => return String::new(),

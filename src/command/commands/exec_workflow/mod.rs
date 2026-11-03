@@ -129,6 +129,16 @@ pub trait ExecWorkflowCommandFrontend:
     + Send
     + Sync
 {
+    /// The frontend this command runs against, once dispatch has resolved its
+    /// flags and arguments on `self`. A frontend with chrome of its own for
+    /// workflows wraps itself here; the others run as they are.
+    fn into_exec_workflow_frontend(self) -> Box<dyn ExecWorkflowCommandFrontend>
+    where
+        Self: Sized + 'static,
+    {
+        Box::new(self)
+    }
+
     fn report_workflow_summary(&mut self, summary: &WorkflowSummary);
 
     fn report_workflow_context_path(&mut self, _host_path: &std::path::Path) {}
@@ -530,6 +540,7 @@ mod factory;
 #[cfg(test)]
 pub(crate) use factory::AgentFrontendProxy;
 mod issue;
+mod merge_fix_prompt;
 mod phase_container;
 mod prepare;
 mod prerequisites;

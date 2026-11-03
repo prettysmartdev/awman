@@ -112,6 +112,7 @@ test-full:
 
 architecture-lint:
 	@bash tools/architecture-lint.sh
+	@bash tools/test-architecture-lint.sh
 
 # Rewrite docs/14-command-reference.md from CommandCatalogue. The doc is
 # generated, never hand-edited; `markdown_reference_matches_committed_docs`

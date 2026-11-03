@@ -201,6 +201,9 @@ pub struct DaemonStatus {
     pub active_count: usize,
     pub last_tick: Option<DateTime<Utc>>,
     pub in_flight: usize,
+    /// A live scheduler reload failure; absent for healthy or older daemons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_error: Option<String>,
     /// Where the daemon persists its payload environment (WI 0116 §5a):
     /// `"keychain"`, `"none"`, or `"unavailable(<reason>)"`.
     ///
@@ -1023,6 +1026,7 @@ impl TaskGateway for LocalTaskGateway {
                 .count(),
             last_tick: status.last_tick,
             in_flight: status.in_flight,
+            config_error: status.config_error.clone(),
             env_persistence,
             unmet_env,
         })
@@ -1417,6 +1421,35 @@ fn prerequisite_token_env_names(task: &Task) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn status_projects_reload_error_and_clears_on_recovery() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(TaskStore::open(&tmp.path().join("squad.db")).unwrap());
+        store.migrate().unwrap();
+        let status = Arc::new(Mutex::new(SchedulerStatus::default()));
+        let gateway = LocalTaskGateway::new(
+            store,
+            Engines::for_tests(tmp.path()),
+            status.clone(),
+            SquadPaths::from_root(tmp.path().join("squad")),
+            Arc::new(DaemonEnvState::without_store()),
+        );
+        status.lock().unwrap().config_error = Some("invalid config.json".into());
+        let failed = gateway.status().await.unwrap();
+        assert_eq!(failed.config_error.as_deref(), Some("invalid config.json"));
+        assert_eq!(
+            serde_json::to_value(&failed).unwrap()["config_error"],
+            "invalid config.json"
+        );
+        status.lock().unwrap().config_error = None;
+        let recovered = serde_json::to_value(gateway.status().await.unwrap()).unwrap();
+        assert!(recovered.get("config_error").is_none());
+        assert!(serde_json::from_value::<DaemonStatus>(recovered)
+            .unwrap()
+            .config_error
+            .is_none());
+    }
 
     /// Create/update validation resolves each agent like the scheduler will:
     /// first-party and approved custom agents pass; an unapproved definition,

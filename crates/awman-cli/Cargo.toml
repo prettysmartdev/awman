@@ -7,11 +7,13 @@ publish = false
 autobins = false
 autoexamples = false
 description = "A containerized code agent manager"
-# Top-level tests/ targets reference the old (oldsrc) library API; they are
-# rebuilt from scratch in work item 0072 alongside the deletion of oldsrc/.
-# Suppress auto-discovery so `cargo test` only runs Layer 0–3 unit tests
-# until then.
+# Integration tests are registered explicitly below so Cargo only builds the
+# maintained suites for this package.
 autotests = false
+build = "build.rs"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(awman_builtin)'] }
 
 [[bin]]
 name = "awman"
@@ -19,81 +21,55 @@ path = "../../src/main.rs"
 
 [features]
 default = []
-builtin-runtime = ["awman/builtin-runtime", "awman-host-shims/builtin-runtime", "dep:microsandbox", "dep:microsandbox-cli", "dep:microsandbox-image", "dep:microsandbox-network", "dep:sqlx", "dep:msb_krun", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:hyper-rustls"]
+builtin-runtime = ["awman/builtin-runtime", "awman-host-shims/builtin-runtime", "dep:microsandbox", "dep:sqlx"]
 
 [dependencies]
 awman = { workspace = true }
 awman-host-shims = { workspace = true }
 anyhow = { workspace = true }
-tracing = { workspace = true }
 clap = { workspace = true }
-crossterm = { workspace = true }
-dirs = { workspace = true }
-portable-pty = { workspace = true }
-ratatui = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-base64 = { workspace = true }
-strip-ansi-escapes = { workspace = true }
-strsim = { workspace = true }
-tempfile = { workspace = true }
-vt100 = { workspace = true }
 tokio = { workspace = true }
-tokio-util = { workspace = true }
-reqwest = { workspace = true, features = ["stream", "blocking"] }
-tokio-stream = { workspace = true }
-unicode-width = { workspace = true }
-flate2 = { workspace = true }
-tar = { workspace = true }
-sha2 = { workspace = true }
-arboard = { workspace = true }
-shell-words = { workspace = true }
-toml = { workspace = true }
-serde_yaml = { workspace = true }
-axum = { workspace = true }
-axum-server = { workspace = true }
-rusqlite = { workspace = true }
-uuid = { workspace = true }
 tracing-subscriber = { workspace = true }
-tower-http = { workspace = true }
 chrono = { workspace = true }
-rcgen = { workspace = true }
-ring = { workspace = true }
-rustls = { workspace = true }
-subtle = { workspace = true }
-thiserror = { workspace = true }
-async-trait = { workspace = true }
-futures-util = { workspace = true }
-which = { workspace = true }
-hyper = { workspace = true, optional = true }
-hyper-util = { workspace = true, optional = true }
-http-body-util = { workspace = true, optional = true }
-hyper-rustls = { workspace = true, optional = true }
 
-[build-dependencies]
-sha2 = { workspace = true }
-toml = { workspace = true }
-
+# Used only by the builtin_runtime integration tests. These are regular
+# dependencies because Cargo does not allow optional dev-dependencies.
 [target.'cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(target_os = "linux", target_env = "gnu", any(target_arch = "aarch64", target_arch = "x86_64"))))'.dependencies]
 microsandbox = { workspace = true, optional = true }
-microsandbox-cli = { workspace = true, optional = true }
-microsandbox-image = { workspace = true, optional = true }
-microsandbox-network = { workspace = true, optional = true }
 sqlx = { workspace = true, optional = true }
-msb_krun = { workspace = true, optional = true }
-
-[target.'cfg(unix)'.dependencies]
-nix = { workspace = true, features = ["signal", "process", "fs", "poll", "user"] }
-libc = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 reqwest = { workspace = true }
 wiremock = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+tracing = { workspace = true }
+dirs = { workspace = true }
+portable-pty = { workspace = true }
+ratatui = { workspace = true }
+serde = { workspace = true }
+base64 = { workspace = true }
+tokio-util = { workspace = true }
+flate2 = { workspace = true }
+tar = { workspace = true }
+sha2 = { workspace = true }
+shell-words = { workspace = true }
+toml = { workspace = true }
+axum = { workspace = true }
+axum-server = { workspace = true }
+rusqlite = { workspace = true }
+uuid = { workspace = true }
+rcgen = { workspace = true }
+ring = { workspace = true }
+rustls = { workspace = true }
+async-trait = { workspace = true }
+futures-util = { workspace = true }
+nix = { workspace = true, features = ["signal", "process", "fs", "poll", "user"] }
+libc = { workspace = true }
 
-# ── New architecture integration tests (WI 0073) ─────────────────────────────
-# autotests = false suppresses the legacy tests/; these explicit entries
-# target the new src/ API only.
+# ── Registered integration tests ─────────────────────────────────────────────
+# Automatic discovery is disabled above; maintain the target list explicitly.
 
 [[test]]
 name = "data_layer"
@@ -218,10 +194,8 @@ path = "../../tests/squad_env_cli.rs"
 name = "squad_env_daemon"
 path = "../../tests/squad_env_daemon.rs"
 
-# WI 0114 tests-audit: this one still builds against the current API; the
-# other thirteen unregistered `tests/*.rs` files reference the pre-WI-0072
-# `oldsrc` surface (`awman::commands`, `awman::workflow`, `awman::tui`, …)
-# and are recorded as dead in `40-tests-audit.md`.
+# This top-level test is maintained against the current API and is registered
+# explicitly because automatic test discovery is disabled for this package.
 [[test]]
 name = "dockerfile_build"
 path = "../../tests/dockerfile_build.rs"

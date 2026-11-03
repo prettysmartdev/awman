@@ -11,7 +11,7 @@ The new layered architecture will ensure that core business logic, data structur
 ## Tenets
 There are several tenets of this new architecture that MUST be upheld.
 
-1) Every layer must expose its public API ONLY to the layer ABOVE itself. If ever a lower layer needs to interact with a higher layer, it MUST accept an object that implements a trait which the higher layer provides to delegate operations to a higher layer. Lower layers must NEVER directly call functions or access structs from higher layers. 
+1) Every layer must expose its public API ONLY to the layer ABOVE itself. If ever a lower layer needs to interact with a higher layer, it MUST accept an object that implements a trait which the higher layer provides to delegate operations to a higher layer. Lower layers must NEVER directly call functions or access structs from higher layers. Layer 3 exception (D1, WI 0129): a frontend may import Layer 0 data types and the frontend-facing traits and types that Layer 1 defines (for example `engine::workflow::frontend`, `engine::agent_runtime::frontend`, `data::message`), because Layer 2 hands those to frontends by design. A frontend may not call engine behavior: no method call on an `Engines` engine field or on any other Layer 1 engine object from `src/frontend`. Such calls go through a Layer 2 type. Passing an engine handle (a `.clone()`) into a Layer 2 constructor is wiring, not a call.
 
 2) NONE of the frontend packages (TUI, CLI, or API) may EVER implement any business logic. ALL business logic MUST be consumed via the layer below, the `Command` layer. The frontend layer's sole responsibility is displaying outputs and recieving inputs. It should NEVER attempt to control the flow of business logic EXCEPT where the command layer requires a frontend trait to manage inputs and outputs. 
 
@@ -43,7 +43,7 @@ Some key data structs and functions that must live at this layer:
 - Any and all other interactions between awman and the filesystem or databases it uses
 
 Things that DO NOT belong in this layer:
-- Layer-specific types such as traits or business logic concerns
+- Layer-specific business logic concerns; storage-seam traits that Layer 0 itself consumes are allowed
 - Container management OTHER THAN resolution of filepaths and directories for anything mounted to a container
 
 ### Layer 1: engine
@@ -86,12 +86,38 @@ Kay components of layer 1:
   - Handling authentication logic for the API server
   - Any and all other authentication concerns across awman
 
+Current Layer 1 modules also include `acp` (Agent Client Protocol transport and
+session driver), `agent_output` (structured agent-output translation),
+`aspec` (canonical template download), `credential_refresh` (live credential
+leases and refresh monitoring), `daemon` (daemon process supervision and
+mutual exclusion), `host_cli` (test-isolated resolution of container and
+sandbox CLI executables), `image_prep` (source-matched image build/import),
+`issue` (issue-source providers and routing), `oci` (verified OCI image
+acquisition), `remote` (shared HTTP transport and typed daemon clients), and
+`squad` (daemon engine, scheduler, and supervisor). `context_prompt.rs` builds
+the combined context prompt. The modules listed above and the runtime, agent,
+workflow, git, overlay, auth, ready, and init components form the current
+engine surface; engine modules own reusable mechanics and do not own command
+selection or frontend presentation.
+
 ### Layer 2: command
 Layer 2 is responsible for the higher-level business logic of operating awman's various commands.
 
 Each command that awman provides, such as `chat`, `exec prompt`, `init`, etc. should all be implemented, in their entirety, within this package. No command or flag definitions, busines logic, flows, error handling, etc. should leak into higher layers.
 
 Key components:
+
+- Current construction path: `Startup` (`src/command/startup.rs`) performs
+  ordered process/session startup; `Engines::build` and `Engines::for_daemon`
+  (`src/command/dispatch/engines.rs`) assemble session and daemon engine
+  bundles. `HeadlessDefaults` (`src/command/headless.rs`) supplies named
+  answer profiles for unattended API, squad, and CLI command paths.
+- `CommandCatalogue` (`src/command/dispatch/catalogue.rs`) is the source for
+  command and flag metadata and frontend projections. Its catalogue-driven
+  build table (`src/command/dispatch/build.rs`) maps runnable leaves to
+  per-command constructors; it does not contain command behavior.
+- Squad command behavior is in Layer 2; the `SquadDaemonEngine` itself is a
+  Layer 1 component (`src/engine/squad/`).
 
 - A new `Dispatch` package which is used to route inputs (such as command strings from the TUI, or command execution requests received from the API API) to appropriate command types and methods.
   - `Dispatch` is responsible for ensuring that any higher-level caller is able to provide all of the reqired parameters, flags, etc. for each and every command. For example, `Dispatch::new(some_frontend_trait)` must accept a trait-implemented object which, for each of the possible commands, includes functions to read the appropriate flgs for said command. As an example, the CLI frontend may run `Dispatch::new(cli_command_frontend)` and then `dispatch::run_command("exec", "prompt")` and the `cli_command_frontend` object passed to `new` would have `get_model`, `get_agent`, `get_yolo`, `get_auto`, etc methods allowing the dispatcher to retrieve relevant flag options from the frontend. This guarantees that every frontend will implement methods for all required flags and cannot drift in which flags are supported.
@@ -134,6 +160,16 @@ Components of this layer:
   - The server/API frontend's only job is to translate the lower-level package's functionality into an HTTP-powered API.
   - Server endpoint handler should be nearly identical to their CLI and TUI counterparts, using `Dispatch` to parse inputs and then execute the resolved `Command` and providing `frontend_...` trait implementations. 
   - Interactive/PTY commands such as `squad attach` are the sanctioned P2 exception and remain excluded from the API (`api_allowed: false`).
+
+- Squad frontend (`src/frontend/squad/`): builds the squad HTTP router, binds
+  and serves it over the already-bootstrapped `SquadDaemonHandles`, maps HTTP
+  requests to the squad runtime, and requests shutdown when serving ends. The
+  engine, scheduler, store setup, and daemon lifecycle remain below Layer 3.
+
+The frontend directories are `cli`, `tui`, `api`, and `squad`. The same rule
+applies to each: translate input and render results through Layer 2 and the
+frontend traits; do not own business or persistence policy. Shared rendering
+helpers in `src/frontend/render_helpers.rs` are presentation utilities.
 
 ### Layer 4: binary
 The binary layer is responsible for the main method, whose sole responsibility is to set up the available frontends and make them available to the user. 

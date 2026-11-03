@@ -745,7 +745,7 @@ mod tests {
         let finishing = running.clone();
         crate::engine::agent_runtime::conformance::Launcher {
             name: "dsbx",
-            launch: Box::new(move |frontend, long| {
+            launch: Box::new(move |frontend, long, _prompt_files| {
                 let child = std::process::Command::new("sleep")
                     .arg(if long { "30" } else { "0.01" })
                     .spawn()

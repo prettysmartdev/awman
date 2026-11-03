@@ -2,26 +2,23 @@
 //! per-command frontend trait for the TUI execution mode.
 //!
 //! Constructed from a `ParsedCommandBoxInput` (produced by
-//! `Dispatch::parse_command_box_input`). Flag/argument extraction reads from
-//! the parsed input's typed maps. Interactive Q&A methods open modal dialogs
+//! `Dispatch::parse_command_box_input`). Flag/argument extraction delegates to
+//! the input's typed `ParsedArgs`; Layer 2 has already validated every value. Interactive Q&A methods open modal dialogs
 //! via the dialog channel and block until the user responds.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-use crate::command::dispatch::catalogue::{CommandCatalogue, FlagKind};
-use crate::command::dispatch::parsed_input::{ArgValue, FlagValue, ParsedCommandBoxInput};
+use crate::command::dispatch::parsed_input::ParsedCommandBoxInput;
 use crate::command::dispatch::CommandFrontend;
 use crate::command::error::CommandError;
 use crate::data::message::{UserMessage, UserMessageSink};
 use crate::engine::agent_runtime::frontend::AgentIo;
 use crate::frontend::tui::dialogs::{DialogRequest, DialogResponse};
 use crate::frontend::tui::tabs::{
-    SharedActiveWorktreePath, SharedAgentsDashboard, SharedContainerExitCode, SharedContainerName,
-    SharedEngineTx, SharedPtyResetFlag, SharedResizeTx, SharedStdinTx, SharedStuckSender,
-    SharedTuiContext, SharedWorkflowViewState, SharedYoloCancelFlag, SharedYoloState,
-    TabSharedState,
+    ContainerLifecycle, SharedAgentsDashboard, SharedTuiContext, SharedWorkflowPresentation,
+    SharedYoloCancelFlag, SharedYoloState, TabSharedState,
 };
 use crate::frontend::tui::user_message::{SharedStatusLog, TuiUserMessageSink};
 
@@ -44,40 +41,12 @@ pub struct TuiCommandFrontend {
     pub(crate) dialog_rx: Mutex<std::sync::mpsc::Receiver<DialogResponse>>,
     pub(crate) container_io: Option<AgentIo>,
     pub(crate) status_log: SharedStatusLog,
-    pub(crate) workflow_view: SharedWorkflowViewState,
-    pub(crate) workflow_invocation_id: std::sync::Arc<Mutex<Option<uuid::Uuid>>>,
-    pub(crate) workflow_context_path: std::sync::Arc<Mutex<Option<PathBuf>>>,
+    pub(crate) workflow: SharedWorkflowPresentation,
+    pub(crate) container: ContainerLifecycle,
     pub(crate) yolo_state: SharedYoloState,
     pub(crate) yolo_cancel_flag: SharedYoloCancelFlag,
-    pub(crate) pty_reset_flag: SharedPtyResetFlag,
-    pub(crate) container_name_shared: SharedContainerName,
-    /// Title for a setup/teardown step's container; see
-    /// [`crate::frontend::tui::tabs::SharedContainerTitle`].
-    pub(crate) container_title_shared: crate::frontend::tui::tabs::SharedContainerTitle,
-    /// Shared exit-code slot: written when the engine reports a workflow
-    /// container actually terminated; the TUI event loop takes it and closes
-    /// the container window.
-    pub(crate) container_exit_shared: SharedContainerExitCode,
-    /// Persistent stdout sender — kept alive across workflow steps so each
-    /// new `AgentIo` can send output to the same TUI event loop receiver.
+    /// Output sender for the current sequential launch only.
     pub(crate) stdout_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
-    /// Shared slot for the stdin sender. When a new workflow step creates
-    /// fresh stdin channels, the new sender is placed here so the TUI event
-    /// loop can pick it up and forward keystrokes to the new container.
-    pub(crate) stdin_tx_shared: SharedStdinTx,
-    /// Shared slot for the resize sender, same pattern as stdin_tx_shared.
-    pub(crate) resize_tx_shared: SharedResizeTx,
-    /// Shared slot for the engine sender. The engine publishes the
-    /// sender here via `set_engine_sender`; the TUI event loop reads
-    /// it to send Ctrl-W requests.
-    pub(crate) engine_tx_shared: SharedEngineTx,
-    /// Shared stuck sender. The engine publishes the container's stuck
-    /// broadcast sender here; the TUI subscribes for tab coloring.
-    pub(crate) stuck_sender_shared: SharedStuckSender,
-    /// Shared active-worktree path. The worktree-lifecycle frontend sets
-    /// this when a worktree is created/resumed and clears it on cleanup;
-    /// the renderer reads it for the bottom-bar context line.
-    pub(crate) active_worktree_path: SharedActiveWorktreePath,
     /// The `agents status` dashboard slot. The command writes each frame
     /// here; the TUI renderer reads it to display a `Table` widget.
     pub(crate) agents_dashboard: SharedAgentsDashboard,
@@ -87,10 +56,6 @@ pub struct TuiCommandFrontend {
     /// The tab's command-cancel token: ends an `agents status --watch` loop
     /// or an `agents attach` session (new command, tab closed, Esc).
     pub(crate) command_cancel: tokio_util::sync::CancellationToken,
-    /// Shared queue of parallel-slot lifecycle events (WI-0096). The parallel
-    /// workflow callbacks push here; the TUI event loop drains it to maintain
-    /// `Tab::container_slots`.
-    pub(crate) container_slot_events: crate::frontend::tui::tabs::SharedContainerSlotEvents,
     pub(crate) squad_attach_session:
         Option<std::sync::Arc<crate::frontend::tui::squad_attach::SquadAttachSession>>,
     pub(crate) squad_attach_reachable: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
@@ -141,15 +106,12 @@ impl DialogChannels {
 
 impl TuiCommandFrontend {
     pub(crate) fn squad_attach_has_explicit_target(&self) -> bool {
-        self.parsed.flags.contains_key("container")
+        self.parsed.args.has_flag("container")
     }
 
     /// Build the frontend for one command run in one tab.
     ///
-    /// `shared` is the tab's [`TabSharedState`] — the sixteen cross-thread
-    /// slots this frontend and the tab both observe. It is destructured here
-    /// so each slot keeps its own field and doc comment; the tab hands the
-    /// whole bundle over so that no slot can be forgotten at a call site.
+    /// `shared` carries lifecycle owners intact into the command frontend.
     pub fn new(
         parsed: ParsedCommandBoxInput,
         dialogs: DialogChannels,
@@ -157,23 +119,12 @@ impl TuiCommandFrontend {
         shared: TabSharedState,
     ) -> Self {
         let TabSharedState {
-            workflow_state: workflow_view,
-            workflow_invocation_id,
-            workflow_context_path,
+            workflow,
+            container,
             yolo_state,
             yolo_cancel_flag,
             status_log,
             agents_dashboard,
-            container_slot_events,
-            pty_reset_flag,
-            container_name_shared,
-            container_title_shared,
-            container_exit_shared,
-            stdin_tx_shared,
-            resize_tx_shared,
-            engine_tx_shared,
-            stuck_sender_shared,
-            active_worktree_path,
             tui_context_shared,
             command_cancel,
         } = shared;
@@ -190,25 +141,14 @@ impl TuiCommandFrontend {
             dialog_rx: Mutex::new(dialog_rx),
             container_io: Some(container_io),
             status_log,
-            workflow_view,
-            workflow_invocation_id,
-            workflow_context_path,
+            workflow,
+            container,
             yolo_state,
             yolo_cancel_flag,
-            pty_reset_flag,
-            container_name_shared,
-            container_title_shared,
-            container_exit_shared,
             stdout_tx,
-            stdin_tx_shared,
-            resize_tx_shared,
-            engine_tx_shared,
-            stuck_sender_shared,
-            active_worktree_path,
             agents_dashboard,
             tui_context_shared,
             command_cancel,
-            container_slot_events,
             squad_attach_session: None,
             squad_attach_reachable: None,
             squad_attach_metadata: HashMap::new(),
@@ -221,38 +161,38 @@ impl TuiCommandFrontend {
         }
     }
 
-    /// Recreate `AgentIo` channels for a new workflow step. The stdout
-    /// sender is reused (same TUI event loop receiver), but stdin and resize
-    /// get fresh channels. The new senders are published via shared slots so
-    /// the TUI event loop can swap to them.
+    /// Each sequential launch owns a complete set of channels. Publishing them
+    /// in the lifecycle queue orders the old exit before the new parser/I/O.
     pub(crate) fn recreate_container_io(&mut self) {
-        let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-        let stdin_tx_for_engine = stdin_tx.clone();
-        let (resize_tx, resize_rx) = tokio::sync::mpsc::unbounded_channel::<(u16, u16)>();
+        self.launch_sequential_container(None);
+    }
 
-        let initial_size = match crossterm::terminal::size() {
-            Ok((cols, rows)) => {
+    pub(crate) fn launch_sequential_container(&mut self, title: Option<String>) {
+        let (stdout_tx, stdout_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (resize_tx, resize_rx) = tokio::sync::mpsc::unbounded_channel();
+        let initial_size = crossterm::terminal::size()
+            .map(|(cols, rows)| {
                 crate::frontend::tui::event_loop::compute_container_inner_size(cols, rows)
-            }
-            Err(_) => (80u16, 24u16),
-        };
-
-        // Publish new senders so the TUI event loop picks them up.
-        if let Ok(mut guard) = self.stdin_tx_shared.lock() {
-            *guard = Some(stdin_tx);
-        }
-        if let Ok(mut guard) = self.resize_tx_shared.lock() {
-            *guard = Some(resize_tx);
-        }
-
+            })
+            .unwrap_or((80, 24));
         self.container_io = Some(AgentIo {
-            stdout: self.stdout_tx.clone(),
-            stderr: self.stdout_tx.clone(),
-            stdin_tx: stdin_tx_for_engine,
+            stdout: stdout_tx.clone(),
+            stderr: stdout_tx.clone(),
+            stdin_tx: stdin_tx.clone(),
             stdin_rx,
             resize: Some(resize_rx),
             initial_size: Some(initial_size),
         });
+        self.stdout_tx = stdout_tx;
+        self.container.launch(
+            title,
+            crate::frontend::tui::tabs::ContainerSlotIo {
+                stdout_rx,
+                stdin_tx,
+                resize_tx,
+            },
+        );
     }
 
     pub(crate) fn recreate_parallel_container_io(&mut self, step_name: &str) {
@@ -292,9 +232,7 @@ impl TuiCommandFrontend {
         &self,
         event: crate::frontend::tui::tabs::ContainerSlotEvent,
     ) {
-        if let Ok(mut q) = self.container_slot_events.lock() {
-            q.push_back(event);
-        }
+        self.container.push(event);
     }
 
     /// Send a dialog request and block waiting for the response.
@@ -370,15 +308,6 @@ impl TuiCommandFrontend {
             None => Err(CommandError::Aborted),
         }
     }
-
-    /// Check if a flag-path flag is a known Bool flag in the catalogue.
-    fn is_known_bool_flag(&self, command_path: &[&str], flag: &str) -> bool {
-        let cat = CommandCatalogue::get();
-        cat.lookup(command_path)
-            .and_then(|spec| spec.find_flag(flag))
-            .map(|f| matches!(f.kind, FlagKind::Bool))
-            .unwrap_or(false)
-    }
 }
 
 // ─── UserMessageSink ──────────────────────────────────────────────────────
@@ -404,25 +333,7 @@ impl CommandFrontend for TuiCommandFrontend {
         crate::command::dispatch::catalogue::FrontendKind::Tui
     }
     fn flag_bool(&self, _command_path: &[&str], flag: &str) -> Result<Option<bool>, CommandError> {
-        match self.parsed.flags.get(flag) {
-            Some(FlagValue::Bool(v)) => Ok(Some(*v)),
-            Some(_) => Ok(Some(true)),
-            None => {
-                if self.is_known_bool_flag(
-                    &self
-                        .parsed
-                        .path
-                        .iter()
-                        .map(|s| s.as_str())
-                        .collect::<Vec<_>>(),
-                    flag,
-                ) {
-                    Ok(Some(false))
-                } else {
-                    Ok(None)
-                }
-            }
-        }
+        Ok(self.parsed.args.flag_bool(flag))
     }
 
     fn flag_string(
@@ -430,10 +341,7 @@ impl CommandFrontend for TuiCommandFrontend {
         _command_path: &[&str],
         flag: &str,
     ) -> Result<Option<String>, CommandError> {
-        match self.parsed.flags.get(flag) {
-            Some(FlagValue::String(v)) => Ok(Some(v.clone())),
-            _ => Ok(None),
-        }
+        Ok(self.parsed.args.flag_string(flag))
     }
 
     fn flag_strings(
@@ -441,11 +349,7 @@ impl CommandFrontend for TuiCommandFrontend {
         _command_path: &[&str],
         flag: &str,
     ) -> Result<Vec<String>, CommandError> {
-        match self.parsed.flags.get(flag) {
-            Some(FlagValue::Strings(v)) => Ok(v.clone()),
-            Some(FlagValue::String(v)) => Ok(vec![v.clone()]),
-            _ => Ok(Vec::new()),
-        }
+        Ok(self.parsed.args.flag_strings(flag))
     }
 
     fn flag_path(
@@ -453,29 +357,19 @@ impl CommandFrontend for TuiCommandFrontend {
         _command_path: &[&str],
         flag: &str,
     ) -> Result<Option<PathBuf>, CommandError> {
-        match self.parsed.flags.get(flag) {
-            Some(FlagValue::String(v)) => Ok(Some(PathBuf::from(v))),
-            _ => Ok(None),
-        }
+        Ok(self.parsed.args.flag_path(flag))
     }
 
-    fn flag_enum(&self, command_path: &[&str], flag: &str) -> Result<Option<String>, CommandError> {
-        self.flag_string(command_path, flag)
+    fn flag_enum(
+        &self,
+        _command_path: &[&str],
+        flag: &str,
+    ) -> Result<Option<String>, CommandError> {
+        Ok(self.parsed.args.flag_enum(flag))
     }
 
     fn flag_u16(&self, _command_path: &[&str], flag: &str) -> Result<Option<u16>, CommandError> {
-        match self.parsed.flags.get(flag) {
-            Some(FlagValue::String(v)) => {
-                v.parse::<u16>()
-                    .map(Some)
-                    .map_err(|_| CommandError::InvalidFlagValue {
-                        command: self.parsed.path.clone(),
-                        flag: flag.to_string(),
-                        reason: format!("'{v}' is not a valid u16"),
-                    })
-            }
-            _ => Ok(None),
-        }
+        Ok(self.parsed.args.flag_u16(flag))
     }
 
     fn flag_usize(
@@ -483,39 +377,61 @@ impl CommandFrontend for TuiCommandFrontend {
         _command_path: &[&str],
         flag: &str,
     ) -> Result<Option<usize>, CommandError> {
-        match self.parsed.flags.get(flag) {
-            Some(FlagValue::String(v)) => {
-                let n: usize = v.parse().map_err(|_| CommandError::InvalidFlagValue {
-                    command: self.parsed.path.clone(),
-                    flag: flag.to_string(),
-                    reason: format!("'{v}' is not a valid number"),
-                })?;
-                if n < 1 {
-                    return Err(CommandError::InvalidFlagValue {
-                        command: self.parsed.path.clone(),
-                        flag: flag.to_string(),
-                        reason: format!("'{v}' must be >= 1"),
-                    });
-                }
-                Ok(Some(n))
-            }
-            _ => Ok(None),
-        }
+        Ok(self.parsed.args.flag_usize(flag))
     }
 
     fn argument(&self, _command_path: &[&str], name: &str) -> Result<Option<String>, CommandError> {
-        match self.parsed.arguments.get(name) {
-            Some(ArgValue::Single(v)) => Ok(Some(v.clone())),
-            Some(ArgValue::Multi(v)) => Ok(Some(v.join(" "))),
-            None => Ok(None),
-        }
+        Ok(self.parsed.args.argument(name))
     }
 
     fn arguments(&self, _command_path: &[&str], name: &str) -> Result<Vec<String>, CommandError> {
-        match self.parsed.arguments.get(name) {
-            Some(ArgValue::Multi(v)) => Ok(v.clone()),
-            Some(ArgValue::Single(v)) => Ok(vec![v.clone()]),
-            None => Ok(Vec::new()),
+        Ok(self.parsed.args.arguments(name))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::command::dispatch::catalogue::CommandCatalogue;
+    use crate::command::dispatch::parsed_input::parse;
+    use crate::command::dispatch::projections::raw_args::shared_cases::{
+        assert_reads, classification, CASES, ERROR_CASES,
+    };
+    use crate::frontend::tui::tests::test_command_frontend;
+
+    fn command_line(path: &[&str], args: &[&str]) -> String {
+        shell_words::join(path.iter().chain(args))
+    }
+
+    #[test]
+    fn typed_input_reaches_every_accessor_unchanged() {
+        for case in CASES {
+            let raw = command_line(case.path, case.args);
+            let parsed = parse(&raw, CommandCatalogue::get())
+                .unwrap_or_else(|e| panic!("{}: {e}", case.name));
+            assert_eq!(parsed.path, case.canonical, "{}", case.name);
+            let (frontend, _requests, _responses) =
+                test_command_frontend(case.canonical, parsed.args);
+            assert_reads(&frontend, case, case.reads);
+            assert_reads(&frontend, case, case.tui_reads);
         }
+    }
+
+    #[test]
+    fn the_box_rejects_shared_error_cases_with_their_classification() {
+        for (path, args, want) in ERROR_CASES {
+            let raw = command_line(path, args);
+            let error = parse(&raw, CommandCatalogue::get()).expect_err(&raw);
+            assert_eq!(classification(&error), *want, "{raw}");
+        }
+    }
+
+    #[test]
+    fn squad_attach_target_is_explicit_only_when_container_was_passed() {
+        let attach = |raw: &str| {
+            let parsed = parse(raw, CommandCatalogue::get()).unwrap();
+            test_command_frontend(&["squad", "attach"], parsed.args).0
+        };
+        assert!(!attach("squad attach nightly").squad_attach_has_explicit_target());
+        assert!(attach("squad attach nightly --container c1").squad_attach_has_explicit_target());
     }
 }

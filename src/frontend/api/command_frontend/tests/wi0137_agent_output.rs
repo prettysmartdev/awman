@@ -1,6 +1,52 @@
 use super::*;
 use crate::command::commands::api_server::event_bus::EventBus;
 use crate::data::fs::api_paths::ApiPaths;
+use crate::data::session_status::SessionStatus;
+
+#[tokio::test]
+async fn api_output_io_closes_noninteractive_stdin_when_the_engine_drops_its_sender() {
+    let bus = EventBus::new(8);
+    let io = spawn_output_drains(&bus.sender(), AgentOutputFormat::Text, None);
+    let crate::engine::agent_runtime::frontend::AgentIo {
+        stdout,
+        stderr,
+        stdin_tx,
+        mut stdin_rx,
+        ..
+    } = io;
+
+    drop(stdin_tx);
+    assert!(stdin_rx.recv().await.is_none());
+    drop((stdout, stderr));
+    assert!(bus.wait_output_drained(Duration::from_secs(2)).await);
+}
+
+#[tokio::test]
+async fn api_output_emits_only_a_marked_bounded_prefix_for_an_overlong_line() {
+    let bus = EventBus::new(8);
+    let mut events = bus.subscribe();
+    let io = spawn_output_drains(&bus.sender(), AgentOutputFormat::Text, None);
+    let mut oversized = vec![b'x'; crate::engine::agent_output::line_framer::MAX_LINE_BYTES + 7];
+    oversized.push(b'\n');
+    io.stdout.send(oversized).unwrap();
+    drop(io);
+
+    assert!(bus.wait_output_drained(Duration::from_secs(2)).await);
+    let mut stdout = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        if let EventPayload::StdoutLine(line) = event.payload {
+            stdout.push(line);
+        }
+    }
+    assert_eq!(stdout.len(), 1);
+    assert_eq!(
+        stdout[0],
+        format!(
+            "{} [line truncated]",
+            "x".repeat(crate::engine::agent_output::line_framer::MAX_LINE_BYTES)
+        )
+    );
+}
 
 #[tokio::test]
 async fn drain_preserves_split_unicode_and_collects_only_prompt_final_messages() {
@@ -117,6 +163,82 @@ mod early_worker_path_tests {
     use std::sync::Arc;
 
     #[tokio::test]
+    async fn malformed_stored_args_fail_with_a_named_queue_record_error() {
+        for (session_status, cancelled) in [
+            (SessionStatus::Active, false),
+            (SessionStatus::Closing, false),
+            (SessionStatus::Active, true),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let paths = ApiPaths::from_root(tmp.path());
+            let store = Arc::new(SqliteSessionStore::open(tmp.path()).unwrap());
+            store.insert_session("s", "/missing", "then").unwrap();
+            store
+                .enqueue_command("c", "s", "exec prompt", "not json", "log")
+                .unwrap();
+            let command = store.claim_next_command("worker").unwrap().unwrap();
+            store.update_session_status("s", session_status).unwrap();
+            let engines = Engines::for_tests(&tmp.path().join("home"));
+            let sessions = Arc::new(SessionManager::in_memory(
+                crate::data::config::env::EnvSnapshot::empty(),
+            ));
+            let lifecycle = ApiSessionLifecycle::new(
+                store.clone(),
+                engines.clone(),
+                sessions.clone(),
+                paths.clone(),
+            );
+            let lifecycle_store = CommandLifecycleStore::open(store.clone()).unwrap();
+            if cancelled {
+                lifecycle_store.request_cancel("c", "at").unwrap();
+            }
+            let worker = QueueWorker::new(
+                "worker".into(),
+                QueueWorkerDeps {
+                    store: store.clone(),
+                    engines,
+                    sessions,
+                    event_buses: Default::default(),
+                    paths: paths.clone(),
+                    frontend_factory: Arc::new(crate::frontend::api::ApiFrontendFactory),
+                    lifecycle,
+                    lifecycle_store,
+                    cancels: Arc::new(TokenRegistry::new()),
+                },
+            );
+            worker.execute_for_test(command).await;
+            let row = store.get_command("c").unwrap().unwrap();
+            let result =
+                serde_json::from_str::<CommandResult>(row.result.as_deref().unwrap()).unwrap();
+            if cancelled {
+                assert_eq!(
+                    (row.status.as_str(), row.exit_code),
+                    ("cancelled", Some(130))
+                );
+            } else {
+                assert_eq!((row.status.as_str(), row.exit_code), ("error", Some(1)));
+                let failure = result.failure.unwrap();
+                assert_eq!(failure.code, "invalid_queue_record");
+                assert_eq!(failure.stage, "preflight");
+                assert!(
+                    failure.message.contains("stored args"),
+                    "{}",
+                    failure.message
+                );
+            }
+            assert!(!paths.command_completion_path("s", "c").exists());
+            assert_eq!(
+                store.get_session("s").unwrap().unwrap().status.as_str(),
+                if session_status == SessionStatus::Closing {
+                    "closed"
+                } else {
+                    "active"
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn command_directory_and_missing_memory_session_failures_have_structured_completion() {
         for unwritable_directory in [false, true] {
             let tmp = tempfile::tempdir().unwrap();
@@ -163,7 +285,7 @@ mod early_worker_path_tests {
             let row = store.get_command("c").unwrap().unwrap();
             let result =
                 serde_json::from_str::<CommandResult>(row.result.as_deref().unwrap()).unwrap();
-            assert_eq!(row.status, "error");
+            assert_eq!(row.status.as_str(), "error");
             assert_eq!(result.outcome, Some(CommandStatusKind::Error));
             assert_eq!(result.failure.unwrap().stage, "preflight");
             if !unwritable_directory {
@@ -312,5 +434,66 @@ async fn parallel_structured_formats_are_kept_on_each_container_proxy() {
             ]
         );
         assert_eq!(tools, 1);
+    }
+}
+
+#[tokio::test]
+async fn structured_large_frames_preserve_results_and_never_echo_tool_payloads() {
+    for size in [70 * 1024, MAX_STRUCTURED_FRAME_BYTES + 1] {
+        for kind in ["result", "error", "tool"] {
+            for interim in [false, true] {
+                let tmp = tempfile::tempdir().unwrap();
+                let writer = CommandStateWriter::new(ApiPaths::from_root(tmp.path()), "s", "c");
+                let bus = EventBus::new(32);
+                let mut events = bus.subscribe();
+                let mut frontend = ApiDispatchFrontend::new("exec prompt", &[], bus.sender())
+                    .with_state_writer(writer.clone());
+                frontend.set_agent_output_format(AgentOutputFormat::ClaudeStreamJson);
+                let io = frontend.take_io();
+                if interim {
+                    io.stdout.send(b"{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"interim\"}]}}\n".to_vec()).unwrap();
+                }
+                let payload = format!("TOOL_PAYLOAD_MARKER{}", "x".repeat(size));
+                let frame = if kind == "tool" {
+                    serde_json::json!({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"read","content":payload}]}})
+                } else {
+                    serde_json::json!({"type":"result","is_error":kind == "error","result":payload})
+                };
+                let mut bytes = serde_json::to_vec(&frame).unwrap();
+                bytes.push(b'\n');
+                io.stdout.send(bytes).unwrap();
+                drop(io);
+                assert!(bus.wait_output_drained(Duration::from_secs(5)).await);
+                let final_message = writer.result_contributions().final_message;
+                let too_large = size > MAX_STRUCTURED_FRAME_BYTES;
+                if kind == "result" && !too_large {
+                    assert_eq!(final_message.as_deref(), Some(payload.as_str()));
+                } else if kind == "tool" && interim && !too_large {
+                    assert_eq!(final_message.as_deref(), Some("interim"));
+                } else {
+                    assert_eq!(final_message, None, "{kind}, {size}, {interim}");
+                }
+                let mut truncation_reported = false;
+                while let Ok(event) = events.try_recv() {
+                    match event.payload {
+                        EventPayload::StdoutLine(text) => {
+                            assert!(!text.starts_with('{'));
+                            if kind != "result" || too_large {
+                                assert!(!text.contains("TOOL_PAYLOAD_MARKER"));
+                            }
+                            if too_large {
+                                panic!("truncated frames must not promote stale stdout: {text}");
+                            }
+                        }
+                        EventPayload::StepActivity { summary, .. } => {
+                            assert!(!summary.contains("TOOL_PAYLOAD_MARKER"));
+                            truncation_reported |= summary.contains("frame too large");
+                        }
+                        _ => {}
+                    }
+                }
+                assert_eq!(truncation_reported, too_large);
+            }
+        }
     }
 }

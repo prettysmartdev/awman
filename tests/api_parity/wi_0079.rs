@@ -13,12 +13,14 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use awman::command::dispatch::Engines;
+use awman::data::command_status::CommandStatus;
 use awman::data::fs::api_db::NewSessionRow;
 use awman::data::fs::api_db::SqliteSessionStore;
 use awman::data::fs::api_paths::ApiPaths;
 use awman::data::fs::auth_paths::AuthPathResolver;
 use awman::data::session::SessionKind;
 use awman::data::session_setup_event::SessionSetupStatus;
+use awman::data::session_status::SessionStatus;
 use awman::data::WorkflowStateStore;
 use awman::engine::agent::AgentEngine;
 use awman::engine::auth::AuthEngine;
@@ -162,7 +164,7 @@ fn enqueue_and_claim_fifo_order() {
         .unwrap()
         .expect("c1 must be claimed");
     assert_eq!(claimed1.id, "c1", "first claim must be c1 (FIFO)");
-    assert_eq!(claimed1.status, "running");
+    assert_eq!(claimed1.status.as_str(), "running");
     assert_eq!(claimed1.worker_id.as_deref(), Some(w));
 
     // With c1 running, session s1 is busy — no more claims for s1 yet.
@@ -173,21 +175,27 @@ fn enqueue_and_claim_fifo_order() {
     );
 
     // Complete c1, then the next queued command becomes claimable.
-    store.complete_command("c1", "done", Some(0), None).unwrap();
+    store
+        .complete_command("c1", CommandStatus::Done, Some(0), None)
+        .unwrap();
 
     let claimed2 = store
         .claim_next_command(w)
         .unwrap()
         .expect("c2 must be claimed");
     assert_eq!(claimed2.id, "c2", "second claim must be c2 (FIFO)");
-    store.complete_command("c2", "done", Some(0), None).unwrap();
+    store
+        .complete_command("c2", CommandStatus::Done, Some(0), None)
+        .unwrap();
 
     let claimed3 = store
         .claim_next_command(w)
         .unwrap()
         .expect("c3 must be claimed");
     assert_eq!(claimed3.id, "c3");
-    store.complete_command("c3", "done", Some(0), None).unwrap();
+    store
+        .complete_command("c3", CommandStatus::Done, Some(0), None)
+        .unwrap();
 
     // Queue is empty.
     let nothing = store.claim_next_command(w).unwrap();
@@ -304,7 +312,7 @@ fn session_exclusive_execution_one_running_at_a_time() {
         claimed.id, "c1",
         "only the first-queued command is claimable"
     );
-    assert_eq!(claimed.status, "running");
+    assert_eq!(claimed.status.as_str(), "running");
 }
 
 /// One command per distinct session — both should be claimable concurrently.
@@ -381,7 +389,7 @@ fn stale_command_recovery_resets_old_running_commands() {
 
     // Verify it's running before recovery.
     let cmd = store.get_command("stale-cmd").unwrap().unwrap();
-    assert_eq!(cmd.status, "running");
+    assert_eq!(cmd.status.as_str(), "running");
 
     // Recover with a 1-second timeout — this command is years old.
     let recovered = store.recover_stale_commands(1).unwrap();
@@ -394,7 +402,8 @@ fn stale_command_recovery_resets_old_running_commands() {
     // Now it should be 'queued' with worker_id and started_at cleared.
     let cmd_after = store.get_command("stale-cmd").unwrap().unwrap();
     assert_eq!(
-        cmd_after.status, "queued",
+        cmd_after.status.as_str(),
+        "queued",
         "recovered command must have status='queued'"
     );
     assert!(
@@ -437,7 +446,7 @@ fn stale_command_recovery_does_not_touch_fresh_running_commands() {
     );
 
     let cmd = store.get_command("c1").unwrap().unwrap();
-    assert_eq!(cmd.status, "running");
+    assert_eq!(cmd.status.as_str(), "running");
 }
 
 /// Legacy commands with status='pending' are treated as queued by
@@ -473,7 +482,7 @@ fn backward_compat_legacy_pending_commands_are_claimable() {
         })
         .unwrap();
     let cmd = store.get_command("legacy-c1").unwrap().unwrap();
-    assert_eq!(cmd.status, "queued");
+    assert_eq!(cmd.status.as_str(), "queued");
 
     // Workers must be able to claim pending commands.
     let claimed = store
@@ -482,7 +491,7 @@ fn backward_compat_legacy_pending_commands_are_claimable() {
         .expect("legacy pending command must be claimable");
 
     assert_eq!(claimed.id, "legacy-c1");
-    assert_eq!(claimed.status, "running");
+    assert_eq!(claimed.status.as_str(), "running");
 }
 
 /// count_queued_for_session returns accurate counts.
@@ -552,7 +561,7 @@ fn cancel_queued_for_session_cancels_all_queued() {
 
     for id in &["c1", "c2", "c3"] {
         let cmd = store.get_command(id).unwrap().unwrap();
-        assert_eq!(cmd.status, "cancelled", "{id} must be 'cancelled'");
+        assert_eq!(cmd.status.as_str(), "cancelled", "{id} must be 'cancelled'");
         assert!(
             cmd.finished_at.is_some(),
             "{id} must have finished_at set after cancellation"
@@ -662,7 +671,7 @@ fn queue_depth_under_load_no_duplicates() {
             if let Some(cmd) = store.claim_next_command(&format!("loader-{wid}")).unwrap() {
                 batch_claimed.push(cmd.id.clone());
                 store
-                    .complete_command(&cmd.id, "done", Some(0), None)
+                    .complete_command(&cmd.id, CommandStatus::Done, Some(0), None)
                     .unwrap();
             }
         }
@@ -732,7 +741,7 @@ fn server_restart_recovery_resets_stale_running_commands() {
     );
 
     let cmd = store.get_command("crash-cmd").unwrap().unwrap();
-    assert_eq!(cmd.status, "queued");
+    assert_eq!(cmd.status.as_str(), "queued");
 }
 
 // ─── Worker count config test ─────────────────────────────────────────────────
@@ -804,7 +813,8 @@ async fn real_network_post_commands_enqueues_with_status_queued() {
 
     let cmd_record = state.store.get_command(command_id).unwrap().unwrap();
     assert_eq!(
-        cmd_record.status, "queued",
+        cmd_record.status.as_str(),
+        "queued",
         "command inserted by POST must have status='queued', not '{}' or 'pending'",
         cmd_record.status
     );
@@ -868,7 +878,11 @@ async fn real_network_post_commands_no_longer_blocks_session() {
         .unwrap();
     assert_eq!(cmds.len(), 2, "both commands must be in the DB");
     for c in &cmds {
-        assert_eq!(c.status, "queued", "both commands must be 'queued'");
+        assert_eq!(
+            c.status.as_str(),
+            "queued",
+            "both commands must be 'queued'"
+        );
     }
 
     server.abort();
@@ -1178,7 +1192,7 @@ async fn real_network_delete_session_with_empty_queue_closes_immediately() {
     );
 
     let rec = state.store.get_session("del-empty").unwrap().unwrap();
-    assert_eq!(rec.status, "closed");
+    assert_eq!(rec.status.as_str(), "closed");
 
     server.abort();
 }
@@ -1232,7 +1246,8 @@ async fn real_network_delete_session_with_queued_commands_cancels_all() {
             .unwrap()
             .unwrap();
         assert_eq!(
-            cmd.status, "cancelled",
+            cmd.status.as_str(),
+            "cancelled",
             "qcmd-{i} must be 'cancelled'; got '{}'",
             cmd.status
         );
@@ -1241,7 +1256,8 @@ async fn real_network_delete_session_with_queued_commands_cancels_all() {
     // Session must be closed.
     let rec = state.store.get_session("del-queued").unwrap().unwrap();
     assert_eq!(
-        rec.status, "closed",
+        rec.status.as_str(),
+        "closed",
         "session must be 'closed' after delete; got '{}'",
         rec.status
     );
@@ -1313,13 +1329,14 @@ async fn real_network_delete_session_with_running_command_returns_202() {
     // The queued command must be cancelled.
     let queued = state.store.get_command("queued-cmd").unwrap().unwrap();
     assert_eq!(
-        queued.status, "cancelled",
+        queued.status.as_str(),
+        "cancelled",
         "queued-cmd must be cancelled when session is being deleted"
     );
 
     // Session must be 'closing'.
     let rec = state.store.get_session("del-running").unwrap().unwrap();
-    assert_eq!(rec.status, "closing");
+    assert_eq!(rec.status.as_str(), "closing");
 
     server.abort();
 }
@@ -1349,7 +1366,7 @@ async fn real_network_post_commands_rejected_on_closing_session() {
         .unwrap();
     state
         .store
-        .update_session_status("closing-sess", "closing")
+        .update_session_status("closing-sess", SessionStatus::Closing)
         .unwrap();
 
     let client = reqwest::Client::new();
@@ -1407,7 +1424,7 @@ async fn real_network_double_delete_returns_200_with_current_state() {
         .unwrap();
     state
         .store
-        .update_session_status("double-del-sess", "closing")
+        .update_session_status("double-del-sess", SessionStatus::Closing)
         .unwrap();
 
     let client = reqwest::Client::new();
@@ -1940,11 +1957,11 @@ fn complete_command_sets_status_and_result() {
 
     let result_json = r#"{"exit_code":0}"#;
     store
-        .complete_command("c1", "done", Some(0), Some(result_json))
+        .complete_command("c1", CommandStatus::Done, Some(0), Some(result_json))
         .unwrap();
 
     let cmd = store.get_command("c1").unwrap().unwrap();
-    assert_eq!(cmd.status, "done");
+    assert_eq!(cmd.status.as_str(), "done");
     assert_eq!(cmd.exit_code, Some(0));
     assert!(cmd.finished_at.is_some());
     assert_eq!(cmd.result.as_deref(), Some(result_json));
@@ -1971,11 +1988,11 @@ fn complete_command_error_path() {
 
     let result_json = r#"{"exit_code":1,"error":"workflow file not found"}"#;
     store
-        .complete_command("c1", "error", Some(1), Some(result_json))
+        .complete_command("c1", CommandStatus::Error, Some(1), Some(result_json))
         .unwrap();
 
     let cmd = store.get_command("c1").unwrap().unwrap();
-    assert_eq!(cmd.status, "error");
+    assert_eq!(cmd.status.as_str(), "error");
     assert_eq!(cmd.exit_code, Some(1));
     assert!(cmd.result.as_deref().unwrap().contains("not found"));
 }
@@ -1988,10 +2005,12 @@ fn update_session_status_sets_arbitrary_status() {
     store
         .insert_session("s1", "/wd", &chrono::Utc::now().to_rfc3339())
         .unwrap();
-    let ok = store.update_session_status("s1", "closing").unwrap();
+    let ok = store
+        .update_session_status("s1", SessionStatus::Closing)
+        .unwrap();
     assert!(ok);
     let rec = store.get_session("s1").unwrap().unwrap();
-    assert_eq!(rec.status, "closing");
+    assert_eq!(rec.status.as_str(), "closing");
 }
 
 #[test]
@@ -1999,14 +2018,16 @@ fn close_session_force_closes_from_closing_state() {
     let (_tmp, store) = make_store();
     let ts = chrono::Utc::now().to_rfc3339();
     store.insert_session("s1", "/wd", &ts).unwrap();
-    store.update_session_status("s1", "closing").unwrap();
+    store
+        .update_session_status("s1", SessionStatus::Closing)
+        .unwrap();
 
     let closed_at = chrono::Utc::now().to_rfc3339();
     let ok = store.close_session_force("s1", &closed_at).unwrap();
     assert!(ok);
 
     let rec = store.get_session("s1").unwrap().unwrap();
-    assert_eq!(rec.status, "closed");
+    assert_eq!(rec.status.as_str(), "closed");
     assert!(rec.closed_at.is_some());
 }
 
@@ -2244,13 +2265,13 @@ fn recover_stale_commands_zero_threshold_recovers_all_running() {
         "300s threshold must not recover a freshly-started command"
     );
     let cmd = store.get_command("c-fresh").unwrap().unwrap();
-    assert_eq!(cmd.status, "running");
+    assert_eq!(cmd.status.as_str(), "running");
 
     // With a 0s threshold (startup recovery), the command IS recovered.
     let recovered = store.recover_stale_commands(0).unwrap();
     assert_eq!(recovered, vec!["c-fresh".to_string()]);
     let cmd = store.get_command("c-fresh").unwrap().unwrap();
-    assert_eq!(cmd.status, "queued");
+    assert_eq!(cmd.status.as_str(), "queued");
     assert!(
         cmd.worker_id.is_none(),
         "worker_id must be cleared on recover"

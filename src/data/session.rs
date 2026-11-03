@@ -115,9 +115,10 @@ pub struct AgentHandle {
     pub started_at: chrono::DateTime<chrono::Utc>,
 }
 
-/// Lifecycle state of a single command.
+/// Lifecycle state of one in-memory [`CommandInvocation`]. API command rows use
+/// [`crate::data::command_status::CommandStatus`] instead.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum CommandStatus {
+pub enum InvocationStatus {
     Pending,
     Running,
     Done,
@@ -130,7 +131,7 @@ pub struct CommandInvocation {
     pub id: Uuid,
     pub subcommand: String,
     pub args: Vec<String>,
-    pub status: CommandStatus,
+    pub status: InvocationStatus,
     pub exit_code: Option<i32>,
     pub started_at: chrono::DateTime<chrono::Utc>,
     pub finished_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -226,7 +227,7 @@ impl SessionState {
     pub fn begin_command(&mut self, subcommand: impl Into<String>, args: Vec<String>) {
         let subcommand = subcommand.into();
         if let Some(existing) = self.current_command.as_mut() {
-            if existing.status == CommandStatus::Running
+            if existing.status == InvocationStatus::Running
                 && existing.subcommand == subcommand
                 && existing.args == args
             {
@@ -237,7 +238,7 @@ impl SessionState {
             id: Uuid::new_v4(),
             subcommand,
             args,
-            status: CommandStatus::Running,
+            status: InvocationStatus::Running,
             exit_code: None,
             started_at: chrono::Utc::now(),
             finished_at: None,
@@ -251,7 +252,7 @@ impl SessionState {
     /// when no command is recorded.
     pub fn finish_command(&mut self, exit_code: i32) {
         if let Some(cmd) = self.current_command.as_mut() {
-            cmd.status = CommandStatus::Done;
+            cmd.status = InvocationStatus::Done;
             cmd.exit_code = Some(exit_code);
             cmd.finished_at = Some(chrono::Utc::now());
         }
@@ -262,7 +263,7 @@ impl SessionState {
     pub fn fail_command(&mut self, message: impl Into<String>) {
         let message = message.into();
         if let Some(cmd) = self.current_command.as_mut() {
-            cmd.status = CommandStatus::Error(message);
+            cmd.status = InvocationStatus::Error(message);
             cmd.finished_at = Some(chrono::Utc::now());
         }
         self.current_container = None;

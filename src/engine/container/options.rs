@@ -1,10 +1,10 @@
 //! Typed `ContainerOption` enum and surrounding option types.
 //!
-//! Every flag the legacy `oldsrc/runtime/{docker,apple,mod}.rs` exposes
-//! becomes one variant here. Adding a new option is one variant + one branch
-//! in `ResolvedContainerOptions::ingest`.
+//! Each supported container launch setting has a typed variant. Adding an
+//! option requires one variant and one branch in `ResolvedContainerOptions::ingest`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::data::agent_output_format::AgentOutputFormat;
 use crate::data::config::builtin_launch::BuiltinLaunchSettings;
@@ -120,6 +120,54 @@ pub struct AgentSettings {
     pub overlays: Vec<OverlaySpec>,
 }
 
+/// Owns one launch's system-prompt temp file. Clones share the file and the
+/// last one normally deletes it. The file follows this launch's options,
+/// instance and execution; an observer lost before confirmed termination can
+/// preserve the path while still releasing the descriptor.
+#[derive(Debug, Clone)]
+pub struct PromptFileGuard(Arc<PromptFile>);
+
+#[derive(Debug)]
+struct PromptFile {
+    file: tempfile::NamedTempFile,
+    preserve: std::sync::atomic::AtomicBool,
+}
+
+impl Drop for PromptFile {
+    fn drop(&mut self) {
+        // If the last observer disappears before guest termination is known,
+        // leave the path readable but close the descriptor normally.
+        if self.preserve.load(std::sync::atomic::Ordering::Acquire) {
+            self.file.disable_cleanup(true);
+        }
+    }
+}
+
+impl PromptFileGuard {
+    pub fn new(file: tempfile::NamedTempFile) -> Self {
+        Self(Arc::new(PromptFile {
+            file,
+            preserve: std::sync::atomic::AtomicBool::new(false),
+        }))
+    }
+
+    pub fn host_path(&self) -> &Path {
+        self.0.file.path()
+    }
+
+    pub(super) fn preserve_for_unconfirmed_guest(&self) {
+        self.0
+            .preserve
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+impl PartialEq for PromptFileGuard {
+    fn eq(&self, other: &Self) -> bool {
+        self.host_path() == other.host_path()
+    }
+}
+
 /// Every knob a `AgentInstance` accepts. Adding a new option is a single
 /// variant and a single branch in `ResolvedContainerOptions::ingest`.
 #[derive(Debug, Clone, PartialEq)]
@@ -206,6 +254,7 @@ pub enum ContainerOption {
         host_path: PathBuf,
         container_path: PathBuf,
         flag: String,
+        guard: PromptFileGuard,
     },
     /// System prompt delivered via an env var pointing to a mounted file
     /// (e.g. `GEMINI_SYSTEM_MD=<container_path>`).
@@ -213,6 +262,7 @@ pub enum ContainerOption {
         env_var: String,
         host_path: PathBuf,
         container_path: PathBuf,
+        guard: PromptFileGuard,
     },
     /// System prompt delivered as inline text via a CLI flag (e.g.
     /// `--system <text>` for cline).
@@ -481,6 +531,9 @@ pub struct ResolvedContainerOptions {
     pub system_prompt_file: Option<(PathBuf, PathBuf, String)>,
     pub system_prompt_env_file: Option<(String, PathBuf, PathBuf)>,
     pub system_prompt_inline: Option<(String, String)>,
+    /// Keeps the files behind `system_prompt_file` / `system_prompt_env_file`
+    /// on disk. Each backend moves these into its execution at spawn.
+    pub prompt_files: Vec<PromptFileGuard>,
     pub agent_add_dirs: Vec<(String, PathBuf)>,
     /// From `ContainerOption::StartupGrace`; `None` uses the frontend's.
     pub startup_grace: Option<std::time::Duration>,
@@ -588,14 +641,18 @@ impl ResolvedContainerOptions {
                 host_path,
                 container_path,
                 flag,
+                guard,
             } => {
+                self.prompt_files.push(guard);
                 self.system_prompt_file = Some((host_path, container_path, flag));
             }
             ContainerOption::SystemPromptEnvFile {
                 env_var,
                 host_path,
                 container_path,
+                guard,
             } => {
+                self.prompt_files.push(guard);
                 self.system_prompt_env_file = Some((env_var, host_path, container_path));
             }
             ContainerOption::SystemPromptInline { flag, text } => {
@@ -745,6 +802,56 @@ mod tests {
         .expect("resolve");
 
         assert_eq!(resolved.lease_factory, Some(factory));
+    }
+
+    fn prompt_guard() -> (PromptFileGuard, PathBuf) {
+        let guard = PromptFileGuard::new(tempfile::NamedTempFile::new().unwrap());
+        let path = guard.host_path().to_path_buf();
+        (guard, path)
+    }
+
+    #[test]
+    fn resolved_options_own_prompt_files_and_the_last_clone_removes_them() {
+        let (file_guard, file_path) = prompt_guard();
+        let (env_guard, env_path) = prompt_guard();
+        let resolved = ResolvedContainerOptions::resolve([
+            ContainerOption::SystemPromptFile {
+                host_path: file_path.clone(),
+                container_path: "/tmp/a.md".into(),
+                flag: "--sp".into(),
+                guard: file_guard,
+            },
+            ContainerOption::SystemPromptEnvFile {
+                env_var: "SP".into(),
+                host_path: env_path.clone(),
+                container_path: "/tmp/b.md".into(),
+                guard: env_guard,
+            },
+        ])
+        .expect("resolve");
+        assert_eq!(resolved.prompt_files.len(), 2);
+        let clone = resolved.clone();
+        drop(resolved);
+        assert!(file_path.exists() && env_path.exists());
+        drop(clone);
+        assert!(!file_path.exists() && !env_path.exists());
+    }
+
+    #[test]
+    fn failed_resolution_releases_prompt_files() {
+        let (guard, path) = prompt_guard();
+        let result = ResolvedContainerOptions::resolve([
+            ContainerOption::SystemPromptFile {
+                host_path: path.clone(),
+                container_path: "/tmp/a.md".into(),
+                flag: "--sp".into(),
+                guard,
+            },
+            ContainerOption::Yolo(YoloMode::Enabled),
+            ContainerOption::Plan(PlanMode::Enabled),
+        ]);
+        assert!(result.is_err());
+        assert!(!path.exists());
     }
 
     #[test]

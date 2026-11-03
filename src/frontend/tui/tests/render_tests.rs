@@ -339,7 +339,7 @@ fn render_frame_squad_tab_no_slots_draws_squad_body_not_execution_window() {
         "the squad key-hint line must render: {text}"
     );
     assert!(
-        !text.contains("awman"),
+        !text.contains("╭ awman "),
         "the ordinary execution window's idle title must not render for the squad tab: {text}"
     );
 }
@@ -634,19 +634,21 @@ fn set_parallel_workflow(app: &App, n: usize) {
     use crate::frontend::tui::tabs::{
         StepViewStatus, WorkflowStepKind, WorkflowStepView, WorkflowViewState,
     };
-    *app.active_tab().shared.workflow_state.lock().unwrap() = Some(WorkflowViewState {
-        steps: (0..n)
-            .map(|i| WorkflowStepView {
-                name: format!("step-{i}"),
-                status: StepViewStatus::Running,
-                agent: None,
-                model: None,
-                depends_on: vec![],
-                kind: WorkflowStepKind::Agent,
-            })
-            .collect(),
-        current_step: None,
-        max_concurrent: None,
+    app.active_tab().shared.workflow.update_view(|view| {
+        *view = Some(WorkflowViewState {
+            steps: (0..n)
+                .map(|i| WorkflowStepView {
+                    name: format!("step-{i}"),
+                    status: StepViewStatus::Running,
+                    agent: None,
+                    model: None,
+                    depends_on: vec![],
+                    kind: WorkflowStepKind::Agent,
+                })
+                .collect(),
+            current_step: None,
+            max_concurrent: None,
+        })
     });
 }
 
@@ -679,27 +681,29 @@ fn set_sequential_workflow(app: &App, n: usize, failed: Option<usize>) {
     use crate::frontend::tui::tabs::{
         StepViewStatus, WorkflowStepKind, WorkflowStepView, WorkflowViewState,
     };
-    *app.active_tab().shared.workflow_state.lock().unwrap() = Some(WorkflowViewState {
-        steps: (0..n)
-            .map(|i| WorkflowStepView {
-                name: format!("stage-{i}"),
-                status: if failed == Some(i) {
-                    StepViewStatus::Error
-                } else {
-                    StepViewStatus::Pending
-                },
-                agent: Some("agent".into()),
-                model: None,
-                depends_on: if i == 0 {
-                    vec![]
-                } else {
-                    vec![format!("stage-{}", i - 1)]
-                },
-                kind: WorkflowStepKind::Agent,
-            })
-            .collect(),
-        current_step: None,
-        max_concurrent: None,
+    app.active_tab().shared.workflow.update_view(|view| {
+        *view = Some(WorkflowViewState {
+            steps: (0..n)
+                .map(|i| WorkflowStepView {
+                    name: format!("stage-{i}"),
+                    status: if failed == Some(i) {
+                        StepViewStatus::Error
+                    } else {
+                        StepViewStatus::Pending
+                    },
+                    agent: Some("agent".into()),
+                    model: None,
+                    depends_on: if i == 0 {
+                        vec![]
+                    } else {
+                        vec![format!("stage-{}", i - 1)]
+                    },
+                    kind: WorkflowStepKind::Agent,
+                })
+                .collect(),
+            current_step: None,
+            max_concurrent: None,
+        })
     });
 }
 
@@ -810,11 +814,10 @@ fn a_new_remote_workflow_invocation_resets_manual_horizontal_scroll() {
     let mut app = make_app();
     set_running_workflow(&mut app, 14);
     let first_id = uuid::Uuid::new_v4();
-    *app.active_tab()
-        .shared
-        .workflow_invocation_id
-        .lock()
-        .unwrap() = Some(first_id);
+    app.active_tab().shared.workflow.publish_remote(
+        first_id,
+        app.active_tab().shared.workflow.snapshot().view.unwrap(),
+    );
     render_app(&mut app, 100, 40);
 
     app.active_tab_mut().workflow_overview_hscroll_offset = 8;
@@ -822,11 +825,10 @@ fn a_new_remote_workflow_invocation_resets_manual_horizontal_scroll() {
     render_app(&mut app, 100, 40);
     assert_eq!(app.active_tab().workflow_overview_hscroll_offset, 8);
 
-    *app.active_tab()
-        .shared
-        .workflow_invocation_id
-        .lock()
-        .unwrap() = Some(uuid::Uuid::new_v4());
+    app.active_tab().shared.workflow.publish_remote(
+        uuid::Uuid::new_v4(),
+        app.active_tab().shared.workflow.snapshot().view.unwrap(),
+    );
     render_app(&mut app, 100, 40);
     assert_eq!(app.active_tab().workflow_overview_hscroll_offset, 0);
     assert!(app.active_tab().workflow_overview_hscroll_follow);
@@ -1730,7 +1732,10 @@ fn workflow_context_footer_shows_host_path_with_cwd_or_worktree_and_squad() {
     let path = "/home/user/.awman/context/workflow/invocation";
     activate_workflow_context(&mut app, path);
     for worktree in [None, Some(std::path::PathBuf::from("/worktrees/current"))] {
-        *app.active_tab().shared.active_worktree_path.lock().unwrap() = worktree.clone();
+        app.active_tab()
+            .shared
+            .workflow
+            .set_worktree_path(worktree.clone());
         let row = bottom_row(&render_app(&mut app, 200, 24));
         assert!(row.contains(path), "{row}");
         assert!(row.contains("Context:"), "{row}");
@@ -1747,7 +1752,10 @@ fn workflow_context_footer_shows_host_path_with_cwd_or_worktree_and_squad() {
 #[test]
 fn workflow_context_footer_preserves_hint_and_squad_on_narrow_screens() {
     let mut app = make_app();
-    *app.active_tab().shared.active_worktree_path.lock().unwrap() = Some("/work".into());
+    app.active_tab()
+        .shared
+        .workflow
+        .set_worktree_path(Some("/work".into()));
     activate_workflow_context(
         &mut app,
         "/home/user/very-long-host-directory/上下文/.awman/context/workflow/invocation",
@@ -1775,7 +1783,10 @@ fn workflow_context_footer_yields_to_the_full_directory_and_squad_indicator() {
         )),
         Some(std::path::PathBuf::from("/worktrees/上下文/feature-branch")),
     ] {
-        *app.active_tab().shared.active_worktree_path.lock().unwrap() = worktree.clone();
+        app.active_tab()
+            .shared
+            .workflow
+            .set_worktree_path(worktree.clone());
         let directory = worktree
             .as_deref()
             .unwrap_or(app.active_tab().session.working_dir());
@@ -1797,11 +1808,7 @@ fn workflow_context_footer_yields_to_the_full_directory_and_squad_indicator() {
             .collect();
 
         for width in [6, 30, 60, 80, 120, 200] {
-            *app.active_tab()
-                .shared
-                .workflow_context_path
-                .lock()
-                .unwrap() = None;
+            app.active_tab().shared.workflow.set_context_path(None);
             let without_context = render_app(&mut app, width, 24);
             activate_workflow_context(
                 &mut app,

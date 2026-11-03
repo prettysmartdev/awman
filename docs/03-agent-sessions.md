@@ -655,6 +655,13 @@ its name; use `--json` for structured output.
 `agents kill <id>` (alias: `rm`) stops and removes an agent after confirmation.
 Pass `-y` / `--yes` to skip the prompt, as in the scripting example above.
 Use `--json --yes` to emit the kill result as JSON without a prompt.
+
+Status and kill operations report errors from the configured runtime instead
+of treating a failed listing as an empty result. For example, if Docker is
+unavailable, `agents status` and `agents kill` surface the runtime failure
+rather than reporting that no agent exists. Restore runtime availability and
+retry.
+
 `agents attach <id>` connects to the running agent's terminal. Press **Ctrl-C**
 to detach in the CLI or TUI; this closes only your connection and leaves the
 agent running. Apple agents launched by older versions without launcher metadata

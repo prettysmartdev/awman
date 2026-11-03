@@ -670,6 +670,60 @@ mod server {
     use crate::api_process::{clone_path, AgentMode, ApiHome, ApiServer};
     use crate::git_daemon::{git, Origin};
 
+    #[tokio::test(start_paused = true)]
+    async fn events_log_waits_for_the_complete_tail_after_the_terminal_row() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let record = json!({"status": "error", "log_path": dir.path().join("output.log")});
+        let path = dir.path().join("events.log");
+        let read = crate::api_process::events_log(&record);
+        tokio::pin!(read);
+        // A terminal row can be visible before the writer even opens its files.
+        assert!(tokio::time::timeout(Duration::from_millis(10), &mut read)
+            .await
+            .is_err());
+
+        let status = json!({"timestamp": "2026-11-02T00:00:00Z", "attempt": 1,
+        "sequence": 0, "payload": {"type": "CommandStatus", "data": {
+            "status": "error", "exit_code": 2, "error": "prerequisites unresolved"
+        }}})
+        .to_string();
+        let done = json!({"timestamp": "2026-11-02T00:00:00Z", "attempt": 1,
+            "sequence": 1, "payload": {"type": "Done"}})
+        .to_string();
+        std::fs::write(&path, format!("{status}\n")).unwrap();
+        assert!(tokio::time::timeout(Duration::from_millis(60), &mut read)
+            .await
+            .is_err());
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        write!(file, "{done}").unwrap();
+        assert!(tokio::time::timeout(Duration::from_millis(60), &mut read)
+            .await
+            .is_err());
+        writeln!(file).unwrap();
+        let log = tokio::time::timeout(Duration::from_secs(1), &mut read)
+            .await
+            .expect("a complete Done record ends the wait");
+        assert_eq!(log, format!("{status}\n{done}\n"));
+        let events = awman::data::execution_event::parse_event_log(&log);
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            events[0].payload,
+            awman::data::execution_event::EventPayload::CommandStatus {
+                exit_code: Some(2),
+                ..
+            }
+        ));
+        assert!(matches!(
+            events[1].payload,
+            awman::data::execution_event::EventPayload::Done
+        ));
+    }
+
     // ── helpers ──────────────────────────────────────────────────────────────
 
     /// A committed repo the server may open as a local session: the agent
@@ -1635,6 +1689,10 @@ exit 0
         assert!(result.get("failed_steps").is_none(), "{result}");
 
         let events = events_of(&record).await;
+        // An unowned failure writes its row twice: `error`, then again with the
+        // output summary just before the final pair. Compare with the settled row.
+        let id = created["command_id"].as_str().unwrap();
+        let record = server.get(&format!("/v1/commands/{id}/status")).await;
         let final_status = assert_one_final_status(&events, &record);
         assert_eq!(final_status["status"], "error");
         assert_eq!(final_status["exit_code"], 1);

@@ -44,7 +44,7 @@ pub enum SpecsOutcome {
     Amend(SpecsAmendOutcome),
 }
 
-/// Work-item kinds — `oldsrc/commands/new.rs::WorkItemKind` ported verbatim.
+/// Work-item kinds accepted by the spec commands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum WorkItemKind {
     Feature,
@@ -556,8 +556,7 @@ fn next_work_item_number(dir: &std::path::Path) -> u32 {
     max + 1
 }
 
-/// Apply all work-item substitutions to a template string. Ported from
-/// `oldsrc/commands/new.rs::apply_template` and extended with number/summary.
+/// Apply all work-item substitutions to a template string.
 ///
 /// Rules (applied in order):
 /// - Lines beginning with `# Work Item:` → `# Work Item: {kind}`

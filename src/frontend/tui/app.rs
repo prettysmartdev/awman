@@ -10,6 +10,7 @@ use crate::command::dispatch::catalogue::CommandCatalogue;
 use crate::command::dispatch::parsed_input::ParsedCommandBoxInput;
 use crate::command::dispatch::{CommandOutcome, Dispatch, Engines};
 use crate::command::error::CommandError;
+use crate::command::git_summary::GitSummaryPoller;
 use crate::command::stats_sampler::{ContainerStatsSampler, StatsRequest, StatsTarget};
 use crate::data::config::env::Env;
 use crate::data::session::Session;
@@ -527,7 +528,7 @@ impl App {
         // Capture the runtime class before borrowing the tab mutably: a
         // sandbox-class runtime (e.g. docker-sbx-experimental) labels the
         // overlay "(sandboxed)" rather than "(containerized)".
-        let sandboxed = self.engines.sandbox_runtime.is_some();
+        let sandboxed = self.engines.is_sandboxed();
         self.clear_active_tab_for_new_command();
         let tab = self.active_tab_mut();
 
@@ -562,7 +563,6 @@ impl App {
         // Build the TUI frontend. Workflow + yolo overlays share the same
         // `Arc<Mutex<...>>` between the engine-side frontend impl and the
         // renderer.
-        tab.shared.reset_for_new_command();
         let attach_context = tab
             .squad
             .as_ref()
@@ -635,9 +635,11 @@ impl App {
             initial_size.1,
         );
         if let Some(slot) = tab.focused_slot_mut() {
-            slot.container_stdout_rx = Some(stdout_rx);
-            slot.container_stdin_tx = Some(stdin_tx);
-            slot.container_resize_tx = Some(resize_tx);
+            slot.bind_io(crate::frontend::tui::tabs::ContainerSlotIo {
+                stdout_rx,
+                stdin_tx,
+                resize_tx,
+            });
             if let Some(info) = slot.container_info.as_mut() {
                 info.sandboxed = sandboxed;
             }
@@ -669,35 +671,16 @@ impl App {
     fn clear_active_tab_for_new_command(&mut self) {
         let tab = self.active_tab_mut();
 
-        // Stop a dashboard watch or attach the previous command left running.
-        tab.shared.command_cancel.cancel();
-
-        // Clear previous output so the new command starts with a fresh log.
-        if let Ok(mut log) = tab.shared.status_log.lock() {
-            log.clear();
-        }
-        if let Ok(mut dash) = tab.shared.agents_dashboard.lock() {
-            *dash = None;
-        }
+        tab.shared.reset_for_new_command();
         tab.scroll_offset = 0;
 
-        // Clear previous workflow state so the overview resets for the new command.
-        // Also clear the overview hit-test rect so stale rects from a previous
-        // workflow don't intercept mouse-scroll events meant for the container.
-        if let Ok(mut guard) = tab.shared.workflow_state.lock() {
-            *guard = None;
-        }
-        if let Ok(mut guard) = tab.shared.workflow_invocation_id.lock() {
-            *guard = None;
-        }
+        // Lifecycle handles are replaced before the next command is built.
         tab.last_overview_rect = None;
         tab.last_overview_hlayout = None;
         tab.last_workflow_invocation_id = None;
         tab.workflow_overview_hscroll_offset = 0;
         tab.workflow_overview_hscroll_follow = true;
-        if let Ok(mut guard) = tab.shared.yolo_state.lock() {
-            *guard = None;
-        }
+        tab.engine_tx = None;
     }
 
     /// Open and register a directory session, then create its tab view.
@@ -714,7 +697,10 @@ impl App {
             .try_read()
             .expect("newly-created session must not be locked")
             .clone();
-        let tab = Tab::new_with_git_engine(session, self.engines.git_engine.clone());
+        let tab = Tab::new_with_git_summary(
+            session,
+            GitSummaryPoller::new(self.engines.git_engine.clone()),
+        );
         self.tabs.push(tab);
         Ok(self.tabs.len() - 1)
     }
@@ -776,15 +762,7 @@ impl App {
                 }
             }
 
-            // The old container's exit goes first: the engine reports it
-            // before launching the next step, and after a yolo expiry both
-            // can land in one tick. Handling it after the next step's
-            // GroupStarted / pty reset would re-suppress auto-open and leave
-            // the new container's window hidden until Ctrl-M.
-            tab.poll_container_exit();
-            // Maintain container_slots before draining output (a Launched
-            // event may carry the channels the drain reads) and before
-            // aggregating stuck/yolo (drain_stuck_events reads slot flags).
+            // Lifecycle events carry identity and I/O together, in engine order.
             tab.drain_container_slot_events();
             tab.drain_container_output();
             tab.poll_command_completion();
@@ -813,82 +791,6 @@ impl App {
                                 let _ = tx.send((inner.width, inner.height));
                             }
                         }
-                    }
-                }
-            }
-
-            // Pick up the container name from the engine (set via
-            // `report_status(Running { container_name })`) into the focused
-            // slot. Also handles sequential workflow step transitions: the
-            // engine clears the shared name then sets a new one when the
-            // next container reports Running. During a parallel group the
-            // backbone slot is dormant and per-slot names arrive via
-            // `ContainerSlotEvent::ContainerName` instead, so the shared
-            // name is left alone to avoid mislabeling a group slot.
-            if tab.dormant_slots.is_empty() {
-                let name = tab
-                    .shared
-                    .container_name_shared
-                    .lock()
-                    .ok()
-                    .and_then(|mut g| g.take());
-                if let Some(name) = name {
-                    // The frontend sets (or clears) the title before the
-                    // container it belongs to starts, so reading it as the
-                    // name arrives binds it to this container.
-                    let phase_step_title = tab
-                        .shared
-                        .container_title_shared
-                        .lock()
-                        .ok()
-                        .and_then(|g| g.clone());
-                    if let Some(info) = tab
-                        .focused_slot_mut()
-                        .and_then(|s| s.container_info.as_mut())
-                    {
-                        info.container_name = name;
-                        info.latest_stats = None;
-                        info.phase_step_title = phase_step_title;
-                    }
-                    // A fresh container is running — let its output
-                    // auto-open the window again after a mid-workflow
-                    // container exit closed it.
-                    tab.suppress_container_auto_open = false;
-                }
-            }
-
-            // Pick up new stdin/resize senders from sequential workflow step
-            // transitions. When `recreate_container_io()` runs on the engine
-            // thread, it publishes new senders via the shared slots; swap
-            // them into the focused (backbone) slot so keystrokes and resize
-            // events reach the new container.
-            let new_stdin = tab
-                .shared
-                .stdin_tx_shared
-                .lock()
-                .ok()
-                .and_then(|mut g| g.take());
-            let new_resize = tab
-                .shared
-                .resize_tx_shared
-                .lock()
-                .ok()
-                .and_then(|mut g| g.take());
-            if new_stdin.is_some() || new_resize.is_some() {
-                // These only come from the sequential path; if a parallel
-                // group is active the backbone is dormant — apply them there
-                // so they aren't lost (or misrouted to a group slot).
-                let target = if tab.dormant_slots.is_empty() {
-                    tab.focused_slot_mut()
-                } else {
-                    tab.dormant_slots.first_mut()
-                };
-                if let Some(slot) = target {
-                    if let Some(new_tx) = new_stdin {
-                        slot.container_stdin_tx = Some(new_tx);
-                    }
-                    if let Some(new_tx) = new_resize {
-                        slot.container_resize_tx = Some(new_tx);
                     }
                 }
             }
@@ -937,11 +839,10 @@ impl App {
 
     /// Route each arrived stats sample to the slot it was polled for.
     ///
-    /// Matched by step name; a stale sample whose slot has since exited is
-    /// dropped.
+    /// Matched by launch identity, including across retries and tab-index shifts.
     fn drain_stats_samples(&mut self) {
-        // Route each arrived sample to the slot it was polled for (matched by
-        // step name; a stale sample whose slot has since exited is dropped).
+        // The sampler echoes our opaque launch identity in `step_name`. A
+        // tab index alone can be reused after a close, and step names repeat.
         for sample in self.stats_sampler.drain() {
             if sample.key >= self.tabs.len() {
                 continue;
@@ -950,15 +851,14 @@ impl App {
             let info = tab
                 .container_slots
                 .iter_mut()
-                .find(|s| s.step_name == sample.step_name)
+                .find(|s| s.launch_id.to_string() == sample.step_name)
                 .and_then(|s| s.container_info.as_mut());
-            if let Some(info) = info {
+            if let Some(info) = info.filter(|info| {
+                info.container_name.is_empty() || info.container_name == sample.stats.name
+            }) {
                 let stats = sample.stats;
                 info.stats_history
                     .push((stats.cpu_percent, stats.memory_mb));
-                if info.container_name.is_empty() {
-                    info.container_name = stats.name.clone();
-                }
                 info.latest_stats = Some(stats);
             }
         }
@@ -1120,10 +1020,8 @@ impl App {
     /// Pick up notices from a runtime that opened after startup (a deferred
     /// builtin backend whose first open was retried by a later command).
     pub fn poll_runtime_notices(&mut self) {
-        if let Some(runtime) = &self.engines.container_runtime {
-            let notices = runtime.take_notices();
-            self.show_runtime_notices(notices);
-        }
+        let notices = self.engines.take_runtime_notices();
+        self.show_runtime_notices(notices);
     }
 
     /// Check the active tab's dialog_request_rx and open the corresponding
@@ -1308,8 +1206,7 @@ impl App {
 }
 
 /// Which of a tab's container slots to poll for stats this tick, keyed by the
-/// slot's step name (empty for the single/backbone slot of a plain command)
-/// so the drain can route each sample back to the slot it was polled for.
+/// slot's launch identity, so a sample cannot cross a retry or tab close.
 ///
 /// Every slot whose container name is known is polled — during a parallel
 /// group that means all N containers, not just the focused one.
@@ -1317,9 +1214,8 @@ impl App {
 /// The "first running container" fallback covers the brief window before a
 /// plain `chat`/`exec` container reports its name. It is deliberately limited
 /// to a lone slot outside a parallel group: with several containers live,
-/// "the first running container" is an arbitrary sibling, and because the
-/// drain adopts a sample's name for a still-unnamed slot, one guess would pin
-/// that slot to a sibling's stats for the rest of the run. A group slot with
+/// "the first running container" is an arbitrary sibling. Samples update only
+/// stats; lifecycle events own the container identity. A group slot with
 /// no name yet simply waits for its `ContainerSlotEvent::ContainerName`.
 pub(crate) fn stats_poll_targets(tab: &Tab) -> Vec<(String, StatsTarget)> {
     let in_parallel_group = !tab.dormant_slots.is_empty();
@@ -1331,11 +1227,11 @@ pub(crate) fn stats_poll_targets(tab: &Tab) -> Vec<(String, StatsTarget)> {
         };
         if !info.container_name.is_empty() {
             targets.push((
-                slot.step_name.clone(),
+                slot.launch_id.to_string(),
                 StatsTarget::Named(info.container_name.clone()),
             ));
         } else if sole_slot {
-            targets.push((slot.step_name.clone(), StatsTarget::FirstRunning));
+            targets.push((slot.launch_id.to_string(), StatsTarget::FirstRunning));
         }
     }
     targets
@@ -1510,8 +1406,8 @@ mod tests {
             .latest_stats
             .is_none());
 
-        // Simulate a stats result arriving on the channel (empty step name =
-        // the single/backbone slot).
+        // The sampler returns the opaque launch identity supplied by the TUI.
+        let sample_slot = tab.focused_slot().unwrap().launch_id.to_string();
         let stats = crate::engine::agent_runtime::execution::AgentStats {
             name: "awman-test-1234".into(),
             cpu_percent: 42.5,
@@ -1521,7 +1417,7 @@ mod tests {
             .sender()
             .send(crate::command::stats_sampler::StatsSample {
                 key: 0,
-                step_name: String::new(),
+                step_name: sample_slot,
                 stats,
             })
             .unwrap();
@@ -1559,6 +1455,7 @@ mod tests {
         tab.container_slots
             .push(ContainerSlot::new("test".into(), "codex".into(), 1000));
 
+        let sample_slot = tab.container_slots[1].launch_id.to_string();
         let stats = crate::engine::agent_runtime::execution::AgentStats {
             name: "awman-test-1".into(),
             cpu_percent: 12.5,
@@ -1568,7 +1465,7 @@ mod tests {
             .sender()
             .send(crate::command::stats_sampler::StatsSample {
                 key: 0,
-                step_name: "test".into(),
+                step_name: sample_slot,
                 stats,
             })
             .unwrap();
@@ -1617,9 +1514,18 @@ mod tests {
         assert_eq!(
             stats_poll_targets(&tab),
             vec![
-                ("build".into(), StatsTarget::Named("awman-b-1".into())),
-                ("test".into(), StatsTarget::Named("awman-t-2".into())),
-                ("docs".into(), StatsTarget::Named("awman-d-3".into())),
+                (
+                    tab.container_slots[0].launch_id.to_string(),
+                    StatsTarget::Named("awman-b-1".into())
+                ),
+                (
+                    tab.container_slots[1].launch_id.to_string(),
+                    StatsTarget::Named("awman-t-2".into())
+                ),
+                (
+                    tab.container_slots[2].launch_id.to_string(),
+                    StatsTarget::Named("awman-d-3".into())
+                ),
             ],
             "every container in a parallel group must be polled, not just the focused one"
         );
@@ -1656,7 +1562,10 @@ mod tests {
 
         assert_eq!(
             stats_poll_targets(&tab),
-            vec![(String::new(), StatsTarget::FirstRunning)],
+            vec![(
+                tab.container_slots[0].launch_id.to_string(),
+                StatsTarget::FirstRunning
+            )],
             "a plain command's slot still gets stats before its name arrives"
         );
     }
@@ -1708,10 +1617,10 @@ mod tests {
         tab.container_window_state = ContainerWindowState::Maximized;
         tab.container_rendered = true;
 
-        *tab.shared.container_exit_shared.lock().unwrap() = Some(137);
+        tab.shared.container.exited(137);
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
         {
-            let mut q = tab.shared.container_slot_events.lock().unwrap();
+            let mut q = tab.shared.container.events.lock().unwrap();
             q.push_back(ContainerSlotEvent::GroupStarted);
             q.push_back(ContainerSlotEvent::Launched {
                 step_name: "build".into(),
@@ -1741,18 +1650,17 @@ mod tests {
     #[test]
     fn exit_and_pty_reset_in_one_tick_still_open_the_window() {
         use crate::frontend::tui::tabs::ContainerWindowState;
-        use std::sync::atomic::Ordering;
-
         let mut app = make_app();
         let tab = app.active_tab_mut();
         tab.start_container("claude".into(), "awman-step1".into(), 80, 24);
         tab.container_window_state = ContainerWindowState::Maximized;
         tab.container_rendered = true;
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let (_old_tx, rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
         tab.focused_slot_mut().unwrap().container_stdout_rx = Some(rx);
 
-        *tab.shared.container_exit_shared.lock().unwrap() = Some(137);
-        tab.shared.pty_reset_flag.store(true, Ordering::Relaxed);
+        tab.shared.container.exited(137);
+        let (tx, io) = crate::frontend::tui::tabs::tests::test_slot_io();
+        tab.shared.container.launch(None, io);
         tx.send(b"step 2 output".to_vec()).unwrap();
 
         app.tick_all_tabs();
@@ -1834,9 +1742,7 @@ mod tests {
         tab.start_container("Claude".into(), String::new(), 80, 24);
 
         // Simulate the engine reporting the container name.
-        if let Ok(mut guard) = tab.shared.container_name_shared.lock() {
-            *guard = Some("awman-new-container".into());
-        }
+        tab.shared.container.running("awman-new-container".into());
 
         app.tick_all_tabs();
 
@@ -1868,10 +1774,10 @@ mod tests {
             info.stats_history = vec![(10.0, 100.0)];
         }
 
-        // Simulate a workflow step transition reporting a new container name.
-        if let Ok(mut guard) = tab.shared.container_name_shared.lock() {
-            *guard = Some("awman-step2-container".into());
-        }
+        // A new launch resets all stats before its name arrives.
+        let (_tx, io) = crate::frontend::tui::tabs::tests::test_slot_io();
+        tab.shared.container.launch(None, io);
+        tab.shared.container.running("awman-step2-container".into());
 
         app.tick_all_tabs();
 
@@ -2024,5 +1930,113 @@ mod tests {
         assert!(state.editing);
         assert_eq!(state.editor.text, "model-a, model-b");
         assert_eq!(state.error.as_deref(), Some("could not write config"));
+    }
+    #[test]
+    fn stale_stats_cannot_cross_retry_or_tab_close_even_when_names_repeat() {
+        use crate::command::stats_sampler::StatsSample;
+        use crate::engine::agent_runtime::execution::AgentStats;
+        let mut app = make_app();
+        app.active_tab_mut()
+            .start_container("claude".into(), "same-name".into(), 80, 24);
+        let old_id = app
+            .active_tab()
+            .focused_slot()
+            .unwrap()
+            .launch_id
+            .to_string();
+        let (_stdout, io) = crate::frontend::tui::tabs::tests::test_slot_io();
+        app.active_tab_mut().shared.container.launch(None, io);
+        app.active_tab_mut()
+            .shared
+            .container
+            .running("same-name".into());
+        app.active_tab_mut().drain_container_slot_events();
+        let fresh_id = app
+            .active_tab()
+            .focused_slot()
+            .unwrap()
+            .launch_id
+            .to_string();
+        let sample = |identity, cpu_percent| StatsSample {
+            key: 0,
+            step_name: identity,
+            stats: AgentStats {
+                name: "same-name".into(),
+                cpu_percent,
+                memory_mb: 64.0,
+            },
+        };
+        app.stats_sampler
+            .sender()
+            .send(sample(old_id, 90.0))
+            .unwrap();
+        app.stats_sampler
+            .sender()
+            .send(sample(fresh_id.clone(), 10.0))
+            .unwrap();
+        app.drain_stats_samples();
+        let info = app
+            .active_tab()
+            .focused_slot()
+            .unwrap()
+            .container_info
+            .as_ref()
+            .unwrap();
+        assert_eq!(info.stats_history, vec![(10.0, 64.0)]);
+
+        let closing = app.active_tab().shared.command_cancel.clone();
+        let mut replacement = Tab::new(make_test_session());
+        replacement.start_container("claude".into(), "same-name".into(), 80, 24);
+        let other = replacement.shared.command_cancel.clone();
+        app.tabs.push(replacement);
+        app.close_active_tab();
+        assert!(closing.is_cancelled());
+        assert!(!other.is_cancelled());
+        app.stats_sampler
+            .sender()
+            .send(sample(fresh_id, 80.0))
+            .unwrap();
+        app.drain_stats_samples();
+        assert!(app
+            .active_tab()
+            .focused_slot()
+            .unwrap()
+            .container_info
+            .as_ref()
+            .unwrap()
+            .stats_history
+            .is_empty());
+    }
+
+    #[test]
+    fn container_transitions_preserve_a_config_dialogs_unsaved_input() {
+        let mut app = make_app();
+        deliver_config_show(
+            &mut app,
+            vec![config_show_row("demo.leader")],
+            Some(crate::frontend::tui::dialogs::ConfigShowRejectedEdit {
+                field: "demo.leader".into(),
+                value: "claude::draft".into(),
+                global: false,
+                reason: "could not save".into(),
+            }),
+        );
+        let Some(Dialog::ConfigShow(state)) = app.active_dialog.as_mut() else {
+            panic!("config dialog");
+        };
+        state.editor.text.push_str("-unsaved");
+        let tab = app.active_tab_mut();
+        tab.start_container("claude".into(), "old".into(), 80, 24);
+        tab.shared.container.exited(0);
+        let (stdout, io) = crate::frontend::tui::tabs::tests::test_slot_io();
+        tab.shared.container.launch(None, io);
+        stdout.send(b"new launch output".to_vec()).unwrap();
+        app.tick_all_tabs();
+        let Some(Dialog::ConfigShow(state)) = app.active_dialog.as_ref() else {
+            panic!("dialog must survive");
+        };
+        assert!(state.editing);
+        assert_eq!(state.editor.text, "claude::draft-unsaved");
+        assert_eq!(state.error.as_deref(), Some("could not save"));
     }
 }

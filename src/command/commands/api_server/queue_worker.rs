@@ -12,7 +12,7 @@ use super::push_back::{
 use super::runtime::ApiSessionLifecycle;
 use crate::command::dispatch::{CommandOutcome, Dispatch, Engines};
 use crate::data::api_lifecycle_store::CommandLifecycleStore;
-use crate::data::command_status::CANCELLED_EXIT_CODE;
+use crate::data::command_status::{CommandCompletion, CommandStatus, CANCELLED_EXIT_CODE};
 use crate::data::execution_event::{
     CommandStatusKind, EventPayload, PhaseStatusKind, StepStatusKind, FIRST_ATTEMPT,
 };
@@ -23,8 +23,12 @@ use crate::data::fs::api_db::{
 };
 use crate::data::fs::api_paths::ApiPaths;
 use crate::data::session_manager::SessionManager;
+use crate::data::session_status::SessionStatus;
 
 const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+/// Bounded row-write attempts for one completion; the sidecar covers the rest.
+const COMPLETION_WRITE_ATTEMPTS: usize = 3;
+const COMPLETION_WRITE_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 async fn wait_for_output_drains(event_bus: &EventBus, command_id: &str) {
     if !event_bus.wait_output_drained(OUTPUT_DRAIN_TIMEOUT).await {
@@ -43,7 +47,7 @@ async fn wait_for_output_drains(event_bus: &EventBus, command_id: &str) {
 /// The single projection persisted by the worker and then read back for SSE.
 struct QueuedCommandResult {
     exit_code: i32,
-    status: &'static str,
+    status: CommandStatus,
     result_json: String,
 }
 
@@ -271,9 +275,9 @@ impl QueuedCommandResult {
 
     fn from_result(result: CommandResult) -> Self {
         let status = match result.outcome.unwrap_or(CommandStatusKind::Error) {
-            CommandStatusKind::Done => "done",
-            CommandStatusKind::Cancelled => "cancelled",
-            _ => "error",
+            CommandStatusKind::Done => CommandStatus::Done,
+            CommandStatusKind::Cancelled => CommandStatus::Cancelled,
+            _ => CommandStatus::Error,
         };
         Self {
             exit_code: result.exit_code.unwrap_or(0),
@@ -327,27 +331,76 @@ impl QueuedCommandResult {
         )
     }
 
-    fn publish(
+    fn sidecar(&self, attempt: u32) -> CommandCompletion {
+        CommandCompletion {
+            attempt,
+            status: self.status,
+            exit_code: self.exit_code,
+            result_json: self.result_json.clone(),
+            finished_at: chrono::Utc::now().to_rfc3339(),
+        }
+    }
+
+    /// Write the row with a bounded retry. On failure the last error is
+    /// returned and the sidecar remains for the next startup.
+    async fn persist_with_retry(
         &self,
         store: &SqliteSessionStore,
         command: &CommandRecord,
+    ) -> Result<(), crate::data::error::DataError> {
+        let mut attempts_left = COMPLETION_WRITE_ATTEMPTS;
+        loop {
+            attempts_left -= 1;
+            match self.persist(store, &command.id) {
+                Ok(()) => return Ok(()),
+                Err(error) if attempts_left == 0 => return Err(error),
+                Err(error) => {
+                    tracing::warn!(%error, session_id = %command.session_id, command_id = %command.id, "Retrying command completion write");
+                    tokio::time::sleep(COMPLETION_WRITE_RETRY_DELAY).await;
+                }
+            }
+        }
+    }
+
+    async fn publish(
+        &self,
+        store: &SqliteSessionStore,
+        paths: &ApiPaths,
+        command: &CommandRecord,
         sender: &super::event_bus::EventBusSender,
     ) {
-        let row = self
-            .persist(store, &command.id)
-            .and_then(|()| store.get_command(&command.id));
-        let row = match row {
-            Ok(Some(row)) => row,
-            error => {
-                tracing::error!(?error, command_id = %command.id, "Failed to store/read command completion; publishing in-memory result");
-                let mut row = command.clone();
-                row.status = self.status.into();
-                row.exit_code = Some(self.exit_code);
-                row.result = Some(self.result_json.clone());
-                row
-            }
-        };
+        // Durable before the row: from here on a restart finalizes this
+        // attempt rather than running its side effects again.
+        if let Err(error) = paths.write_command_completion(
+            &command.session_id,
+            &command.id,
+            &self.sidecar(command.attempt),
+        ) {
+            tracing::error!(%error, session_id = %command.session_id, command_id = %command.id, "Failed to write completion sidecar; a failed row write would requeue this command");
+        }
+        let persisted = self.persist_with_retry(store, command).await;
+        if let Err(error) = &persisted {
+            tracing::error!(%error, session_id = %command.session_id, command_id = %command.id, attempt = command.attempt, "Failed to store command completion; startup recovery will finalize the row from its sidecar");
+        }
+        let stored = persisted.is_ok().then(|| {
+            store.get_command(&command.id).unwrap_or_else(|error| {
+                tracing::error!(%error, session_id = %command.session_id, command_id = %command.id, "Failed to read back command completion");
+                None
+            })
+        });
+        let row = stored.flatten().unwrap_or_else(|| {
+            let mut row = command.clone();
+            row.status = self.status;
+            row.exit_code = Some(self.exit_code);
+            row.result = Some(self.result_json.clone());
+            row
+        });
         sender.finish(terminal_payload(&row));
+        if persisted.is_ok() {
+            if let Err(error) = paths.remove_command_completion(&command.session_id, &command.id) {
+                tracing::warn!(%error, session_id = %command.session_id, command_id = %command.id, "Failed to remove completion sidecar");
+            }
+        }
     }
 }
 
@@ -356,14 +409,12 @@ impl QueuedCommandResult {
 pub(crate) fn terminal_payload(command: &CommandRecord) -> EventPayload {
     let result: Option<CommandResult> = command.result.as_deref().and_then(read_command_result);
     EventPayload::CommandStatus {
-        status: result
-            .as_ref()
-            .and_then(|r| r.outcome)
-            .unwrap_or(match command.status.as_str() {
-                "done" => CommandStatusKind::Done,
-                "cancelled" => CommandStatusKind::Cancelled,
-                _ => CommandStatusKind::Error,
-            }),
+        status: result.as_ref().and_then(|r| r.outcome).unwrap_or(
+            command
+                .status
+                .terminal_wire_kind()
+                .unwrap_or(CommandStatusKind::Error),
+        ),
         exit_code: result
             .as_ref()
             .and_then(|r| r.exit_code)
@@ -402,7 +453,7 @@ pub(super) fn finalize_unowned_command(
     let Some(command) = store.get_command(id)? else {
         return Ok(());
     };
-    if !matches!(command.status.as_str(), "done" | "error" | "cancelled") {
+    if !command.status.is_terminal() {
         return Ok(());
     }
     // Completed history (including pre-0137 rows) is immutable. A restart
@@ -429,13 +480,7 @@ pub(super) fn finalize_unowned_command(
     }
     result.exit_code = result.exit_code.or(command.exit_code);
     if result.outcome.is_none() {
-        result.outcome = Some(if command.status == "cancelled" {
-            CommandStatusKind::Cancelled
-        } else if command.status == "done" {
-            CommandStatusKind::Done
-        } else {
-            CommandStatusKind::Error
-        });
+        result.outcome = command.status.terminal_wire_kind();
     }
     if result.failure.is_none() && result.outcome != Some(CommandStatusKind::Done) {
         let cancelled = result.outcome == Some(CommandStatusKind::Cancelled);
@@ -472,6 +517,109 @@ pub(super) fn finalize_unowned_command(
         CommandLogWriter::append_terminal(paths, &command, terminal_payload(&command))?;
     }
     Ok(())
+}
+
+/// Startup: apply terminal sidecars left by the previous daemon. A `running`
+/// row finalizes from its sidecar instead of being requeued, and a sidecar whose
+/// row is already terminal is removed without changing the row. Returns how many
+/// rows were finalized. Every other row is still processed, but any error is
+/// returned afterwards and refuses startup: the requeue that follows would run a
+/// command that may already have finished a second time.
+pub(super) fn finalize_completed_from_sidecars(
+    store: &SqliteSessionStore,
+    paths: &ApiPaths,
+) -> Result<usize, crate::data::error::DataError> {
+    let commands = store.list_commands_filtered(&crate::data::fs::api_db::CommandListFilter {
+        session_id: None,
+        status: None,
+        labels: &[],
+        limit: i64::MAX,
+    })?;
+    let mut finalized = 0;
+    let mut failures = Vec::new();
+    for command in commands {
+        let (session_id, id) = (&command.session_id, &command.id);
+        match command.status {
+            status if status.is_terminal() => {
+                if matches!(paths.read_command_completion(session_id, id), Ok(None)) {
+                    continue;
+                }
+                // The previous daemon stopped between the row and the sidecar's
+                // removal, possibly before logging the terminal pair (a no-op
+                // when the pair is already there).
+                if let Err(error) =
+                    CommandLogWriter::append_terminal(paths, &command, terminal_payload(&command))
+                {
+                    tracing::error!(%error, session_id, command_id = id, "Failed to append terminal events");
+                }
+                remove_applied_sidecar(paths, session_id, id);
+            }
+            CommandStatus::Running => match finalize_running_from_sidecar(store, paths, &command) {
+                Ok(true) => finalized += 1,
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::error!(%error, session_id, command_id = id, "Failed to apply completion sidecar");
+                    failures.push(error.to_string());
+                }
+            },
+            _ => {}
+        }
+    }
+    if failures.is_empty() {
+        Ok(finalized)
+    } else {
+        Err(crate::data::error::DataError::Other(failures.join("; ")))
+    }
+}
+
+/// Finalize a `running` row nobody owns from its sidecar, returning whether the
+/// row is terminal now. A sidecar that exists but cannot be read is an error, not
+/// absence: it may record a finished command, so the caller must neither requeue
+/// nor cancel the row.
+pub(super) fn finalize_running_from_sidecar(
+    store: &SqliteSessionStore,
+    paths: &ApiPaths,
+    command: &CommandRecord,
+) -> Result<bool, crate::data::error::DataError> {
+    let (session_id, id) = (&command.session_id, &command.id);
+    let completion = match paths.read_command_completion(session_id, id) {
+        Ok(Some(completion)) => completion,
+        Ok(None) => return Ok(false),
+        Err(error) => {
+            return Err(crate::data::error::DataError::Other(format!(
+                "command {id}: completion sidecar {} is unreadable, so whether it finished is unknown; restore the file, or remove it to let the command run again: {error}",
+                paths.command_completion_path(session_id, id).display()
+            )));
+        }
+    };
+    if completion.attempt != command.attempt {
+        tracing::warn!(
+            session_id,
+            command_id = id,
+            sidecar_attempt = completion.attempt,
+            row_attempt = command.attempt,
+            "Removing completion sidecar from another attempt"
+        );
+        remove_applied_sidecar(paths, session_id, id);
+        return Ok(false);
+    }
+    if !store.finalize_running_command(id, &completion)? {
+        return Ok(false);
+    }
+    // Skips the pair if the previous owner already logged the in-memory
+    // terminal event carrying these same values.
+    if let Err(error) = finalize_unowned_command(store, paths, id) {
+        tracing::error!(%error, session_id, command_id = id, "Failed to append terminal events");
+    }
+    remove_applied_sidecar(paths, session_id, id);
+    tracing::info!(session_id, command_id = id, attempt = completion.attempt, status = %completion.status, "Finalized command from completion sidecar");
+    Ok(true)
+}
+
+fn remove_applied_sidecar(paths: &ApiPaths, session_id: &str, command_id: &str) {
+    if let Err(error) = paths.remove_command_completion(session_id, command_id) {
+        tracing::warn!(%error, session_id, command_id, "Failed to remove completion sidecar");
+    }
 }
 
 /// Factory implemented by the HTTP frontend. Queue lifecycle code only knows
@@ -631,16 +779,42 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
         let command_id = cmd.id.clone();
         let session_id = cmd.session_id.clone();
         let subcommand = cmd.subcommand.clone();
-        let args: Vec<String> = serde_json::from_str(&cmd.args).unwrap_or_default();
 
         // A cancel recorded before this worker owned the command (it lost the
         // race with the claim) still applies.
-        if matches!(
-            self.lifecycle_store.cancel_requested_at(&command_id),
-            Ok(Some(_))
-        ) {
+        let cancel_requested_at = self
+            .lifecycle_store
+            .cancel_requested_at(&command_id)
+            .ok()
+            .flatten();
+        if cancel_requested_at.is_some() {
             cancel.cancel();
         }
+
+        let args = match cmd.decode_args() {
+            Ok(args) => args,
+            Err(error) => {
+                tracing::error!(session_id = %session_id, command_id = %command_id, %error, "Invalid queue record");
+                let mut completion = QueuedCommandResult::new(
+                    &Err(crate::command::error::CommandError::Other(
+                        error.to_string(),
+                    )),
+                    &Ok(PushBackOutcome::NotConfigured),
+                )
+                .map_result(|r| {
+                    r.outputs = Some(Default::default());
+                    if let Some(failure) = &mut r.failure {
+                        failure.stage = "preflight".into();
+                        failure.code = failure_codes::INVALID_QUEUE_RECORD.into();
+                    }
+                });
+                if let Some(requested_at) = &cancel_requested_at {
+                    completion = completion.cancelled(requested_at);
+                }
+                self.finish_without_log(&cmd, completion).await;
+                return;
+            }
+        };
 
         tracing::info!(
             worker_id = %self.worker_id,
@@ -658,11 +832,6 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
                 error = %e,
                 "Failed to create command directory"
             );
-            let bus = Arc::new(EventBus::for_attempt(16, cmd.attempt));
-            self.event_buses
-                .lock()
-                .await
-                .insert(command_id.clone(), Arc::clone(&bus));
             let completion = QueuedCommandResult::new(
                 &Err(crate::command::error::CommandError::Other(format!(
                     "Failed to create command directory: {e}"
@@ -675,9 +844,7 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
                     failure.stage = "preflight".into();
                 }
             });
-            completion.publish(&self.store, &cmd, &bus.sender());
-            self.cleanup_event_bus(&command_id).await;
-            self.post_execution_check(&session_id, &command_id).await;
+            self.finish_without_log(&cmd, completion).await;
             return;
         }
 
@@ -692,9 +859,7 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
                 "started_at": cmd.started_at,
                 "worker_id": self.worker_id,
             });
-            let _ = self
-                .paths
-                .write_command_metadata(&session_id, &command_id, &metadata);
+            self.write_metadata(&session_id, &command_id, &metadata);
         }
 
         // Create EventBus for this command execution.
@@ -791,7 +956,9 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
                         failure.stage = "preflight".into();
                     }
                 });
-                completion.publish(&self.store, &cmd, &event_bus.sender());
+                completion
+                    .publish(&self.store, &self.paths, &cmd, &event_bus.sender())
+                    .await;
                 let _ = log_writer.await;
                 self.cleanup_event_bus(&command_id).await;
                 self.post_execution_check(&session_id, &command_id).await;
@@ -1002,14 +1169,14 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
         }
         let exit_code = completion.exit_code;
         let status = completion.status;
-        let success = status == "done";
+        let success = status == CommandStatus::Done;
 
         if success {
             tracing::info!(
                 worker_id = %self.worker_id,
                 command_id = %command_id,
                 subcommand = %subcommand,
-                status = status,
+                status = status.as_str(),
                 exit_code = ?exit_code,
                 success = true,
                 "Command execution finished"
@@ -1019,7 +1186,7 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
                 worker_id = %self.worker_id,
                 command_id = %command_id,
                 subcommand = %subcommand,
-                status = status,
+                status = status.as_str(),
                 exit_code = ?exit_code,
                 success = false,
                 error = push_outcome.as_ref().err().map(|e| e.message.clone())
@@ -1047,9 +1214,7 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
                 "worker_id": self.worker_id,
                 "attempt": cmd.attempt,
             });
-            let _ = self
-                .paths
-                .write_command_metadata(&session_id, &command_id, &metadata);
+            self.write_metadata(&session_id, &command_id, &metadata);
         }
 
         // Cleanup has finished. Retire its recovery recipe before publishing
@@ -1057,10 +1222,36 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
         if let Err(error) = self.paths.remove_command_cleanup(&session_id, &command_id) {
             tracing::warn!(%error, "Failed to retire command cleanup recipe");
         }
-        completion.publish(&self.store, &cmd, &event_bus.sender());
+        completion
+            .publish(&self.store, &self.paths, &cmd, &event_bus.sender())
+            .await;
         let _ = log_writer.await;
         self.cleanup_event_bus(&command_id).await;
         self.post_execution_check(&session_id, &command_id).await;
+    }
+
+    /// Complete a command that failed before its log writer started.
+    async fn finish_without_log(&self, cmd: &CommandRecord, completion: QueuedCommandResult) {
+        let bus = Arc::new(EventBus::for_attempt(16, cmd.attempt));
+        self.event_buses
+            .lock()
+            .await
+            .insert(cmd.id.clone(), Arc::clone(&bus));
+        completion
+            .publish(&self.store, &self.paths, cmd, &bus.sender())
+            .await;
+        self.cleanup_event_bus(&cmd.id).await;
+        self.post_execution_check(&cmd.session_id, &cmd.id).await;
+    }
+
+    /// `metadata.json` has no reader in the tree, so a failed write only warns.
+    fn write_metadata(&self, session_id: &str, command_id: &str, metadata: &serde_json::Value) {
+        if let Err(error) = self
+            .paths
+            .write_command_metadata(session_id, command_id, metadata)
+        {
+            tracing::warn!(%error, session_id, command_id, "Failed to write command metadata");
+        }
     }
 
     async fn cleanup_event_bus(&self, command_id: &str) {
@@ -1078,7 +1269,13 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
     /// one `ApiSessionLifecycle::close`, so a remote clone is deleted exactly
     /// as `DELETE /v1/sessions/{id}` would.
     async fn post_execution_check(&self, session_id: &str, command_id: &str) {
-        let closing = matches!(self.store.get_session(session_id), Ok(Some(ref session)) if session.status == "closing");
+        let closing = match self.store.get_session(session_id) {
+            Ok(session) => session.is_some_and(|s| s.status == SessionStatus::Closing),
+            Err(error) => {
+                tracing::error!(session_id, command_id, %error, "Failed to read session after command");
+                false
+            }
+        };
         let run_finished = matches!(
             self.lifecycle_store.run_for_session(session_id),
             Ok(Some(ref run)) if run.close_on_finish && run.command_id == command_id
@@ -1325,7 +1522,7 @@ mod completion_tests {
         let completion =
             QueuedCommandResult::new(&result, &Ok(PushBackOutcome::Pushed(pushed.clone())));
         let json: CommandResult = serde_json::from_str(&completion.result_json).unwrap();
-        assert_eq!(completion.status, "done");
+        assert_eq!(completion.status.as_str(), "done");
         assert_eq!(json.pushed, Some(Some(pushed)));
     }
 
@@ -1336,7 +1533,7 @@ mod completion_tests {
         ));
         let completion = QueuedCommandResult::new(&Ok(CommandOutcome::Empty), &Err(failure));
         let json: CommandResult = serde_json::from_str(&completion.result_json).unwrap();
-        assert_eq!(completion.status, "error");
+        assert_eq!(completion.status.as_str(), "error");
         assert_eq!(completion.exit_code, 1);
         assert_eq!(json.exit_code, Some(1));
         assert_eq!(json.stage.as_deref(), Some("push"));
@@ -1388,7 +1585,7 @@ mod completion_tests {
                 QueuedCommandResult::new(&Err(error), &Ok(PushBackOutcome::NotConfigured));
             completion.persist(&store, &id).unwrap();
             let saved = store.get_command(&id).unwrap().unwrap();
-            assert_eq!(saved.status, "error");
+            assert_eq!(saved.status.as_str(), "error");
             assert_eq!(saved.exit_code, Some(expected));
             let json: serde_json::Value =
                 serde_json::from_str(saved.result.as_ref().unwrap()).unwrap();
@@ -1417,7 +1614,7 @@ mod completion_tests {
                 .with_worktree(writer.kept_worktree());
             let json: CommandResult = serde_json::from_str(&completion.result_json).unwrap();
             assert_eq!(json.worktree_path, Some(wt.display().to_string()));
-            assert_eq!(completion.status, "error");
+            assert_eq!(completion.status.as_str(), "error");
             // Successful squash cleanup is reflected by the existence check,
             // even when no explicit discard callback follows merge-back.
             std::fs::remove_dir(&wt).unwrap();
@@ -1448,7 +1645,12 @@ mod adversarial_tests {
             .enqueue_command("c", "s", "exec prompt", "[]", "log")
             .unwrap();
         store
-            .complete_command("c", "done", Some(0), Some(r#"{"exit_code":0}"#))
+            .complete_command(
+                "c",
+                CommandStatus::Done,
+                Some(0),
+                Some(r#"{"exit_code":0}"#),
+            )
             .unwrap();
         paths.prepare_command_dir("s", "c").unwrap();
         let done = ExecutionEvent {
@@ -1541,7 +1743,14 @@ mod adversarial_tests {
         );
         let bus = EventBus::new(8);
         let mut events = bus.subscribe();
-        completion.publish(&store, &command, &bus.sender());
+        completion
+            .publish(
+                &store,
+                &ApiPaths::from_root(tmp.path()),
+                &command,
+                &bus.sender(),
+            )
+            .await;
         assert!(
             matches!(events.recv().await.unwrap().payload, EventPayload::CommandStatus { result: Some(result), .. } if result.outcome == Some(CommandStatusKind::Done))
         );
@@ -1550,5 +1759,641 @@ mod adversarial_tests {
             EventPayload::Done
         ));
         assert!(events.try_recv().is_err());
+    }
+}
+
+#[cfg(test)]
+mod sidecar_tests {
+    use super::*;
+    use crate::command::commands::api_server::cancel::{
+        CancelOutcome, CommandCanceller, TokenRegistry,
+    };
+    use crate::command::commands::api_server::runtime::ApiServerRuntime;
+    use crate::command::commands::api_server::ApiServeConfig;
+    use crate::command::error::CommandError;
+    use crate::data::config::env::{EnvSnapshot, AWMAN_CONFIG_HOME};
+    use crate::data::execution_event::ExecutionEvent;
+
+    const REFUSE: &str = "CREATE TRIGGER refuse_completion BEFORE UPDATE ON commands BEGIN SELECT RAISE(FAIL, 'injected'); END;";
+
+    struct Fixture {
+        tmp: tempfile::TempDir,
+        store: Arc<SqliteSessionStore>,
+        paths: ApiPaths,
+        side_effects: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let tmp = tempfile::tempdir().unwrap();
+            // Separate API and data roots, as `serve` resolves them: bootstrap
+            // treats a database under the API root as a legacy one to migrate.
+            let paths = ApiPaths::from_env(&EnvSnapshot::with_overrides([(
+                AWMAN_CONFIG_HOME,
+                tmp.path().to_str().unwrap(),
+            )]))
+            .unwrap();
+            paths.data_paths().ensure_root().unwrap();
+            let store = Arc::new(SqliteSessionStore::open_from_paths(&paths).unwrap());
+            store.insert_session("s", "/missing", "then").unwrap();
+            store
+                .enqueue_command("c", "s", "exec prompt", "[]", "log")
+                .unwrap();
+            Self {
+                tmp,
+                store,
+                paths,
+                side_effects: Default::default(),
+            }
+        }
+
+        fn sql(&self, sql: &str) {
+            rusqlite::Connection::open(self.paths.db_path())
+                .unwrap()
+                .execute_batch(sql)
+                .unwrap();
+        }
+
+        fn claim(&self) -> CommandRecord {
+            self.store.claim_next_command("worker").unwrap().unwrap()
+        }
+
+        /// One worker cycle of a command with an observable side effect, with
+        /// the worker's log writer attached.
+        async fn run_fake_command(&self, completion: &QueuedCommandResult, refuse_row: bool) {
+            let command = self.claim();
+            if refuse_row {
+                self.sql(REFUSE);
+            }
+            self.side_effects
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let bus = Arc::new(EventBus::for_attempt(16, command.attempt));
+            let buses = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::from([
+                ("c".into(), bus.clone()),
+            ])));
+            let mut stream = super::super::command_log_stream::CommandLogStream::open(
+                self.store.clone(),
+                self.paths.clone(),
+                buses.clone(),
+                command.clone(),
+                None,
+                None,
+                Duration::from_millis(5),
+            )
+            .await;
+            let mut log_rx = bus.subscribe_log();
+            self.paths.prepare_command_dir("s", "c").unwrap();
+            let mut writer = CommandLogWriter::open_append(&self.paths, "s", "c")
+                .await
+                .unwrap();
+            completion
+                .publish(&self.store, &self.paths, &command, &bus.sender())
+                .await;
+            while let Some(event) = log_rx.recv().await {
+                writer.write_event(&event).await;
+                if matches!(event.payload, EventPayload::Done) {
+                    writer.flush().await;
+                    break;
+                }
+            }
+            // Exercise the actual consumer, with the worker's SQL failure still
+            // installed. It must end without waiting for restart reconciliation.
+            let terminal_cursor = tokio::time::timeout(Duration::from_secs(2), async {
+                let mut terminal = None;
+                let mut dones = 0;
+                while let Some(event) = stream.next().await {
+                    match event.payload {
+                        EventPayload::CommandStatus { .. } => {
+                            let mut expected = command.clone();
+                            expected.status = completion.status;
+                            expected.exit_code = Some(completion.exit_code);
+                            expected.result = Some(completion.result_json.clone());
+                            assert_eq!(
+                                serde_json::to_value(&event.payload).unwrap(),
+                                serde_json::to_value(terminal_payload(&expected)).unwrap()
+                            );
+                            terminal = Some(event.cursor());
+                        }
+                        EventPayload::Done => dones += 1,
+                        _ => {}
+                    }
+                }
+                assert_eq!(dones, 1);
+                terminal.expect("terminal result delivered")
+            })
+            .await
+            .expect("live completion stream ends");
+            buses.lock().await.clear();
+            let mut resumed = super::super::command_log_stream::CommandLogStream::open(
+                self.store.clone(),
+                self.paths.clone(),
+                buses,
+                self.row(),
+                Some(terminal_cursor),
+                None,
+                Duration::from_millis(5),
+            )
+            .await;
+            tokio::time::timeout(Duration::from_secs(2), async {
+                let mut dones = 0;
+                while let Some(event) = resumed.next().await {
+                    assert!(
+                        !matches!(event.payload, EventPayload::CommandStatus { .. }),
+                        "resume must not duplicate the result"
+                    );
+                    if matches!(event.payload, EventPayload::Done) {
+                        dones += 1;
+                    }
+                }
+                assert_eq!(dones, 1);
+            })
+            .await
+            .expect("reconnect ends from durable completion");
+        }
+
+        /// A real daemon restart, through the same bootstrap `serve` runs.
+        fn restart(&self) -> Result<ApiServerRuntime, CommandError> {
+            let mut engines = Engines::for_tests(self.tmp.path());
+            engines.auth_engine = Arc::new(crate::engine::auth::AuthEngine::with_paths(
+                crate::data::fs::auth_paths::AuthPathResolver::at_home(self.tmp.path()),
+                self.paths.clone(),
+            ));
+            ApiServerRuntime::bootstrap(
+                ApiServeConfig {
+                    port: 0,
+                    bind_ip: std::net::IpAddr::from([127, 0, 0, 1]),
+                    workdirs: vec![],
+                    workdir_roots: vec![],
+                    dangerously_skip_auth: true,
+                    tls_material: None,
+                    env: crate::data::config::env::EnvSnapshot::empty(),
+                },
+                engines,
+            )
+        }
+
+        fn row(&self) -> CommandRecord {
+            self.store.get_command("c").unwrap().unwrap()
+        }
+
+        fn sidecar_exists(&self) -> bool {
+            self.paths.command_completion_path("s", "c").exists()
+        }
+
+        fn terminal_events(&self) -> Vec<ExecutionEvent> {
+            self.paths
+                .read_command_events("s", "c")
+                .into_iter()
+                .filter(|event| {
+                    matches!(
+                        event.payload,
+                        EventPayload::CommandStatus { .. } | EventPayload::Done
+                    )
+                })
+                .collect()
+        }
+
+        fn write_sidecar(&self, attempt: u32, completion: &QueuedCommandResult) {
+            self.paths
+                .write_command_completion("s", "c", &completion.sidecar(attempt))
+                .unwrap();
+        }
+    }
+
+    fn completed() -> QueuedCommandResult {
+        QueuedCommandResult::new(
+            &Ok(CommandOutcome::Empty),
+            &Ok(PushBackOutcome::NotConfigured),
+        )
+        .map_result(|r| r.outputs = Some(Default::default()))
+    }
+
+    fn assert_one_terminal_pair(fixture: &Fixture, completion: &QueuedCommandResult) {
+        let events = fixture.terminal_events();
+        assert_eq!(events.len(), 2, "{events:?}");
+        let EventPayload::CommandStatus { exit_code, .. } = &events[0].payload else {
+            panic!("{events:?}");
+        };
+        assert_eq!(*exit_code, Some(completion.exit_code));
+        assert!(matches!(events[1].payload, EventPayload::Done));
+    }
+
+    #[tokio::test]
+    async fn failed_completion_write_finalizes_on_restart_without_redispatch() {
+        // Success, a real failure exit code, and a partial failure (push) all
+        // come back exactly as the worker computed them.
+        for completion in [
+            completed(),
+            QueuedCommandResult::new(
+                &Err(CommandError::MissingRequiredArgument {
+                    command: vec!["prompt".into()],
+                    argument: "prompt".into(),
+                }),
+                &Ok(PushBackOutcome::NotConfigured),
+            )
+            .map_result(|r| r.outputs = Some(Default::default())),
+            QueuedCommandResult::new(
+                &Ok(CommandOutcome::Empty),
+                &Err(PushBackError {
+                    stage: "push",
+                    message: "rejected".into(),
+                }),
+            )
+            .map_result(|r| r.outputs = Some(Default::default())),
+        ] {
+            let fixture = Fixture::new();
+            fixture.run_fake_command(&completion, true).await;
+            assert_eq!(fixture.row().status.as_str(), "running");
+            let recorded = fixture
+                .paths
+                .read_command_completion("s", "c")
+                .unwrap()
+                .expect("sidecar survives a failed row write");
+            let live_events = fixture.paths.read_command_events_raw("s", "c");
+            assert_one_terminal_pair(&fixture, &completion);
+
+            fixture.sql("DROP TRIGGER refuse_completion;");
+            let runtime = fixture.restart().unwrap();
+            let row = fixture.row();
+            assert_eq!(row.status, completion.status);
+            assert_eq!(row.exit_code, Some(completion.exit_code));
+            assert_eq!(row.result.as_deref(), Some(completion.result_json.as_str()));
+            assert_eq!(row.finished_at, Some(recorded.finished_at));
+            assert_eq!(row.attempt, 1);
+            assert!(!fixture.sidecar_exists());
+            assert!(runtime.store.claim_next_command("next").unwrap().is_none());
+            assert_eq!(
+                fixture
+                    .side_effects
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                1
+            );
+            // The terminal event clients already saw is the only one logged.
+            assert_eq!(fixture.paths.read_command_events_raw("s", "c"), live_events);
+        }
+    }
+
+    #[tokio::test]
+    async fn crash_between_sidecar_and_row_finalizes_exactly_once() {
+        let fixture = Fixture::new();
+        let command = fixture.claim();
+        let completion = completed();
+        fixture.write_sidecar(command.attempt, &completion);
+
+        fixture.restart().unwrap();
+        let row = fixture.row();
+        assert_eq!(row.status.as_str(), "done");
+        assert!(!fixture.sidecar_exists());
+        assert_one_terminal_pair(&fixture, &completion);
+        let events = fixture.paths.read_command_events_raw("s", "c");
+
+        // A second restart has nothing left to do.
+        fixture.restart().unwrap();
+        assert_eq!(fixture.row(), row);
+        assert_eq!(fixture.paths.read_command_events_raw("s", "c"), events);
+    }
+
+    #[test]
+    fn crash_before_completion_still_requeues() {
+        let fixture = Fixture::new();
+        fixture.claim();
+        std::thread::sleep(Duration::from_millis(2));
+        assert_eq!(
+            finalize_completed_from_sidecars(&fixture.store, &fixture.paths).unwrap(),
+            0
+        );
+        assert_eq!(fixture.store.recover_stale_commands(0).unwrap(), ["c"]);
+        let row = fixture.row();
+        assert_eq!((row.status.as_str(), row.attempt), ("queued", 2));
+    }
+
+    #[test]
+    fn sidecar_from_another_attempt_is_removed_and_the_row_requeues() {
+        let fixture = Fixture::new();
+        fixture.claim();
+        fixture.write_sidecar(7, &completed());
+        std::thread::sleep(Duration::from_millis(2));
+        assert_eq!(
+            finalize_completed_from_sidecars(&fixture.store, &fixture.paths).unwrap(),
+            0
+        );
+        assert!(!fixture.sidecar_exists());
+        assert_eq!(fixture.store.recover_stale_commands(0).unwrap(), ["c"]);
+    }
+
+    #[test]
+    fn malformed_sidecar_refuses_startup_and_never_requeues() {
+        let fixture = Fixture::new();
+        fixture.claim();
+        fixture.paths.prepare_command_dir("s", "c").unwrap();
+        std::fs::write(fixture.paths.command_completion_path("s", "c"), "{").unwrap();
+        let error = fixture.restart().err().expect("startup must refuse");
+        assert!(
+            error.to_string().contains("completion.json"),
+            "names the file: {error}"
+        );
+        assert_eq!(fixture.row().status.as_str(), "running");
+        assert_eq!(fixture.row().attempt, 1);
+        assert!(fixture.sidecar_exists());
+        assert!(fixture.store.claim_next_command("next").unwrap().is_none());
+
+        // The named repair: remove the evidence to allow the command to rerun.
+        fixture.paths.remove_command_completion("s", "c").unwrap();
+        assert_eq!(
+            finalize_completed_from_sidecars(&fixture.store, &fixture.paths).unwrap(),
+            0
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inaccessible_sidecar_refuses_startup_until_its_access_is_restored() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = Fixture::new();
+        let command = fixture.claim();
+        fixture.write_sidecar(command.attempt, &completed());
+        let path = fixture.paths.command_completion_path("s", "c");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&path).is_ok() {
+            return; // Running as root: the mode cannot deny access.
+        }
+        assert!(fixture.restart().is_err());
+        assert_eq!(fixture.row().status.as_str(), "running");
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let runtime = fixture.restart().unwrap();
+        assert_eq!(fixture.row().status.as_str(), "done");
+        assert!(runtime.store.claim_next_command("next").unwrap().is_none());
+    }
+
+    #[test]
+    fn one_unreadable_sidecar_does_not_stop_the_others_from_finalizing() {
+        let fixture = Fixture::new();
+        fixture.claim();
+        fixture.paths.prepare_command_dir("s", "c").unwrap();
+        std::fs::write(fixture.paths.command_completion_path("s", "c"), "{").unwrap();
+        fixture
+            .store
+            .insert_session("s2", "/missing", "then")
+            .unwrap();
+        fixture
+            .store
+            .enqueue_command("good", "s2", "exec prompt", "[]", "log")
+            .unwrap();
+        let good = fixture.store.claim_next_command("worker").unwrap().unwrap();
+        fixture.paths.prepare_command_dir("s2", "good").unwrap();
+        fixture
+            .paths
+            .write_command_completion("s2", "good", &completed().sidecar(good.attempt))
+            .unwrap();
+        assert!(finalize_completed_from_sidecars(&fixture.store, &fixture.paths).is_err());
+        let good = fixture.store.get_command("good").unwrap().unwrap();
+        assert_eq!(good.status.as_str(), "done");
+        assert_eq!(fixture.row().status.as_str(), "running");
+    }
+
+    fn unowned_canceller(fixture: &Fixture) -> CommandCanceller {
+        CommandCanceller::new(
+            fixture.store.clone(),
+            CommandLifecycleStore::open(fixture.store.clone()).unwrap(),
+            Arc::new(TokenRegistry::new()),
+            Arc::new(TokenRegistry::new()),
+        )
+        .with_completion_paths(fixture.paths.clone())
+    }
+
+    #[tokio::test]
+    async fn cancel_does_not_change_an_already_published_completion() {
+        let fixture = Fixture::new();
+        let completion = completed();
+        fixture.run_fake_command(&completion, true).await;
+        fixture.sql("DROP TRIGGER refuse_completion;");
+        let events = fixture.paths.read_command_events_raw("s", "c");
+        let recorded = fixture
+            .paths
+            .read_command_completion("s", "c")
+            .unwrap()
+            .unwrap();
+
+        // The worker returned and unregistered; its row write never landed.
+        let outcome = unowned_canceller(&fixture).cancel("c").unwrap();
+        let CancelOutcome::AlreadyTerminal(row) = outcome else {
+            panic!("a published completion cannot be cancelled: {outcome:?}");
+        };
+        assert_eq!((row.status.as_str(), row.exit_code), ("done", Some(0)));
+        assert_eq!(row.finished_at, Some(recorded.finished_at));
+        assert!(!fixture.sidecar_exists());
+
+        // A repeat cancel and a restart both leave what clients were told.
+        let row = fixture.row();
+        assert!(matches!(
+            unowned_canceller(&fixture).cancel("c").unwrap(),
+            CancelOutcome::AlreadyTerminal(_)
+        ));
+        let runtime = fixture.restart().unwrap();
+        assert_eq!(fixture.row(), row);
+        assert_eq!(fixture.paths.read_command_events_raw("s", "c"), events);
+        assert!(runtime.store.claim_next_command("next").unwrap().is_none());
+    }
+
+    #[test]
+    fn cancel_refuses_to_overwrite_an_unreadable_completion() {
+        let fixture = Fixture::new();
+        fixture.claim();
+        fixture.paths.prepare_command_dir("s", "c").unwrap();
+        std::fs::write(fixture.paths.command_completion_path("s", "c"), "{").unwrap();
+        assert!(unowned_canceller(&fixture).cancel("c").is_err());
+        assert_eq!(fixture.row().status.as_str(), "running");
+        assert!(fixture.sidecar_exists());
+    }
+
+    #[test]
+    fn cancel_of_a_row_with_another_attempts_sidecar_still_cancels() {
+        let fixture = Fixture::new();
+        fixture.claim();
+        fixture.write_sidecar(7, &completed());
+        assert!(matches!(
+            unowned_canceller(&fixture).cancel("c").unwrap(),
+            CancelOutcome::Cancelled(_)
+        ));
+        assert_eq!(fixture.row().status.as_str(), "cancelled");
+        assert!(!fixture.sidecar_exists());
+    }
+
+    #[test]
+    fn sidecar_of_a_terminal_row_is_removed_without_changing_the_row() {
+        let fixture = Fixture::new();
+        let command = fixture.claim();
+        fixture.write_sidecar(command.attempt, &completed());
+        fixture
+            .store
+            .complete_command("c", CommandStatus::Cancelled, Some(130), Some("{}"))
+            .unwrap();
+        let before = fixture.row();
+        fixture.restart().unwrap();
+        assert_eq!(fixture.row(), before);
+        assert!(!fixture.sidecar_exists());
+    }
+
+    #[test]
+    fn failed_recovery_write_refuses_startup_rather_than_requeueing() {
+        let fixture = Fixture::new();
+        let command = fixture.claim();
+        fixture.write_sidecar(command.attempt, &completed());
+        fixture.sql(REFUSE);
+        assert!(fixture.restart().is_err());
+        assert_eq!(fixture.row().status.as_str(), "running");
+        assert!(fixture.sidecar_exists());
+
+        fixture.sql("DROP TRIGGER refuse_completion;");
+        fixture.restart().unwrap();
+        assert_eq!(fixture.row().status.as_str(), "done");
+        assert!(!fixture.sidecar_exists());
+    }
+
+    #[test]
+    fn recorded_completion_outranks_a_cancel_accepted_after_it() {
+        let fixture = Fixture::new();
+        let command = fixture.claim();
+        fixture.write_sidecar(command.attempt, &completed());
+        let lifecycle = CommandLifecycleStore::open(fixture.store.clone()).unwrap();
+        lifecycle.request_cancel("c", "later").unwrap();
+        fixture.restart().unwrap();
+        let row = fixture.row();
+        assert_eq!((row.status.as_str(), row.exit_code), ("done", Some(0)));
+        assert_one_terminal_pair(&fixture, &completed());
+    }
+
+    #[test]
+    fn restart_finishes_closing_a_session_drained_by_its_sidecar() {
+        let fixture = Fixture::new();
+        let command = fixture.claim();
+        fixture.write_sidecar(command.attempt, &completed());
+        fixture
+            .store
+            .update_session_status("s", SessionStatus::Closing)
+            .unwrap();
+        fixture.restart().unwrap();
+        assert_eq!(fixture.row().status.as_str(), "done");
+        assert_eq!(
+            fixture
+                .store
+                .get_session("s")
+                .unwrap()
+                .unwrap()
+                .status
+                .as_str(),
+            "closed"
+        );
+    }
+
+    fn session_status(fixture: &Fixture) -> String {
+        fixture
+            .store
+            .get_session("s")
+            .unwrap()
+            .unwrap()
+            .status
+            .as_str()
+            .to_string()
+    }
+
+    #[test]
+    fn restart_closes_a_session_whose_row_was_saved_before_the_crash() {
+        // Crash after the row, before the worker's post-check; the sidecar is
+        // either still there or already removed.
+        for keep_sidecar in [true, false] {
+            let fixture = Fixture::new();
+            let command = fixture.claim();
+            fixture
+                .store
+                .update_session_status("s", SessionStatus::Closing)
+                .unwrap();
+            if keep_sidecar {
+                fixture.write_sidecar(command.attempt, &completed());
+            }
+            fixture
+                .store
+                .complete_command("c", CommandStatus::Done, Some(0), Some("{}"))
+                .unwrap();
+            fixture.restart().unwrap();
+            assert_eq!(session_status(&fixture), "closed", "{keep_sidecar}");
+            assert!(!fixture.sidecar_exists());
+        }
+    }
+
+    #[test]
+    fn restart_keeps_a_session_closing_while_it_still_has_work() {
+        // A queued command drains through a worker, whose post-check closes.
+        let fixture = Fixture::new();
+        fixture
+            .store
+            .update_session_status("s", SessionStatus::Closing)
+            .unwrap();
+        fixture.restart().unwrap();
+        assert_eq!(fixture.row().status.as_str(), "queued");
+        assert_eq!(session_status(&fixture), "closing");
+    }
+
+    #[test]
+    fn restart_keeps_a_session_closing_until_cancelled_cleanup_finishes() {
+        let fixture = Fixture::new();
+        fixture.claim();
+        fixture
+            .store
+            .update_session_status("s", SessionStatus::Closing)
+            .unwrap();
+        fixture.paths.prepare_command_dir("s", "c").unwrap();
+        let cleanup = crate::data::workflow_cleanup::WorkflowCleanup {
+            workflow: crate::data::workflow_definition::Workflow {
+                title: None,
+                steps: vec![],
+                agent: None,
+                model: None,
+                overlays: None,
+                setup: vec![],
+                teardown: vec![],
+                teardown_on_failure: false,
+            },
+            work_item: None,
+            workdir: fixture.tmp.path().to_path_buf(),
+            mount_path: fixture.tmp.path().to_path_buf(),
+            state_root: None,
+            image: "test".into(),
+            cli_overlays: vec![],
+            worktree_git_mount: None,
+        };
+        fixture
+            .paths
+            .write_command_cleanup("s", "c", &cleanup)
+            .unwrap();
+        fixture
+            .store
+            .complete_command("c", CommandStatus::Cancelled, Some(130), Some("{}"))
+            .unwrap();
+        fixture.restart().unwrap();
+        assert_eq!(session_status(&fixture), "closing");
+    }
+
+    #[tokio::test]
+    async fn successful_publish_removes_the_sidecar() {
+        let fixture = Fixture::new();
+        fixture.run_fake_command(&completed(), false).await;
+        assert_eq!(fixture.row().status.as_str(), "done");
+        assert!(!fixture.sidecar_exists());
+    }
+
+    #[tokio::test]
+    async fn unwritable_sidecar_does_not_stop_the_row_write() {
+        let fixture = Fixture::new();
+        let command = fixture.claim();
+        let directory = fixture.paths.session_commands_dir("s");
+        std::fs::create_dir_all(directory.parent().unwrap()).unwrap();
+        std::fs::write(&directory, "not a directory").unwrap();
+        let bus = EventBus::new(8);
+        completed()
+            .publish(&fixture.store, &fixture.paths, &command, &bus.sender())
+            .await;
+        assert_eq!(fixture.row().status.as_str(), "done");
     }
 }

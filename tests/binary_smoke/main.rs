@@ -18,6 +18,7 @@ mod agents_docker;
 #[cfg(unix)]
 mod agents_review;
 mod antigravity_0083;
+mod build_cfg;
 mod clean_command;
 mod cli_subprocess;
 mod context_overlay_0087;

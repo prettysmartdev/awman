@@ -6,12 +6,10 @@
 //! Split out of `commands/exec_workflow.rs` by WI 0114 F-51. A child module
 //! of `exec_workflow`, so it reaches that module's private items unchanged.
 
+use super::merge_fix_prompt::{render_merge_fix_prompt, MergeFixPromptVars, MERGE_FIX_PROMPT_MD};
 use super::*;
 use crate::command::commands::worktree_lifecycle::{FinalizeOutcome, MergeFailure};
 use crate::data::config::effective::EffectiveConfig;
-use crate::data::merge_fix_prompt::{
-    render_merge_fix_prompt, MergeFixPromptVars, MERGE_FIX_PROMPT_MD,
-};
 use crate::data::session::AgentName;
 use crate::engine::workflow::{PhaseStepRef, RemediationAgentSpec};
 

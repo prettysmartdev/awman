@@ -7,11 +7,13 @@ use std::time::Instant;
 
 use awman::command::commands::api_server::{CommandCanceller, TokenRegistry};
 use awman::command::dispatch::Engines;
+use awman::data::command_status::CommandStatus;
 use awman::data::fs::api_db::{NewSessionRow, SqliteSessionStore};
 use awman::data::fs::api_paths::ApiPaths;
 use awman::data::fs::auth_paths::AuthPathResolver;
 use awman::data::session::SessionKind;
 use awman::data::session_setup_event::SessionSetupStatus;
+use awman::data::session_status::SessionStatus;
 use awman::data::WorkflowStateStore;
 use awman::engine::agent::AgentEngine;
 use awman::engine::auth::AuthEngine;
@@ -239,7 +241,7 @@ async fn legacy_error_messages_and_command_resource_aliases_are_stable() {
         )
         .unwrap();
     app.store
-        .complete_command("finished-workflow", "done", Some(0), None)
+        .complete_command("finished-workflow", CommandStatus::Done, Some(0), None)
         .unwrap();
     let base = server(app.clone()).await;
     let client = reqwest::Client::new();
@@ -314,7 +316,9 @@ async fn session_setup_status_filters_errors_and_closed_stage_are_returned() {
     app.store
         .insert_session("ready-session", "/ready", "2026-01-01")
         .unwrap();
-    app.store.update_setup_status(SESSION, "failed").unwrap();
+    app.store
+        .update_setup_status(SESSION, SessionSetupStatus::Failed)
+        .unwrap();
     let setup_dir = app.paths.session_dir(SESSION);
     std::fs::create_dir_all(&setup_dir).unwrap();
     std::fs::write(setup_dir.join("setup_state.json"), r#"{"status":"failed","current_stage":"Failed: git clone failed","current_ready_phase":null,"ready_step_statuses":[],"ready_summary":null,"error":{"stage":"clone","message":"git clone failed"}}"#).unwrap();
@@ -768,13 +772,15 @@ async fn framework_and_admission_errors_have_codes_over_http() {
         assert_eq!(json["code"], code, "{json}");
         assert!(!json["error"].as_str().unwrap().is_empty());
     }
-    for setup in ["initializing", "failed"] {
+    for setup in [SessionSetupStatus::Initializing, SessionSetupStatus::Failed] {
         app.store.update_setup_status(SESSION, setup).unwrap();
         let (status, json) = body(submit().send().await.unwrap()).await;
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(json["code"], "session_not_ready");
     }
-    app.store.update_session_status(SESSION, "closing").unwrap();
+    app.store
+        .update_session_status(SESSION, SessionStatus::Closing)
+        .unwrap();
     let (status, json) = body(submit().send().await.unwrap()).await;
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(json["code"], "session_closing");
@@ -794,4 +800,120 @@ async fn framework_and_admission_errors_have_codes_over_http() {
     let (status, json) = body(response).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert_eq!(json["code"], "unauthorized");
+}
+
+/// WI 0129 F10: the wire keeps the stored spellings, and a stored value no
+/// enum names is a server error, never a guessed state.
+#[tokio::test]
+async fn stored_statuses_keep_their_wire_spelling_and_unknown_values_fail_explicitly() {
+    let tmp = tempfile::tempdir().unwrap();
+    let app = state(tmp.path());
+    app.store
+        .enqueue_command("legacy", SESSION, "agents status", "[]", "/l")
+        .unwrap();
+    let raw = |sql: &str| {
+        app.store
+            .with_conn(|conn| {
+                conn.execute(sql, [])
+                    .map_err(awman::data::error::DataError::from)
+            })
+            .unwrap();
+    };
+    raw("UPDATE commands SET status='pending' WHERE id='legacy'");
+    let base = server(app.clone()).await;
+    let client = reqwest::Client::new();
+    let get = |path: String| {
+        let client = client.clone();
+        let url = format!("{base}{path}");
+        async move { body(client.get(url).send().await.unwrap()).await }
+    };
+
+    // Legacy `pending` is `queued` on the wire, and still a filter alias.
+    for filter in ["pending", "queued"] {
+        let (status, json) = get(format!("/v1/commands?status={filter}")).await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["commands"][0]["status"], "queued", "{json}");
+    }
+    let (_, json) = get(format!("/v1/sessions/{SESSION}")).await;
+    assert_eq!(json["status"], "active", "{json}");
+    assert_eq!(json["setup_status"], "ready", "{json}");
+    for query in ["status=wat", "setup_status=wat"] {
+        let (status, _) = get(format!("/v1/sessions?{query}")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{query}");
+    }
+
+    raw("UPDATE commands SET status='wat' WHERE id='legacy'");
+    let (status, _) = get("/v1/commands/legacy".to_string()).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    let (status, _) = get("/v1/commands".to_string()).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+
+    raw("UPDATE commands SET status='done' WHERE id='legacy'");
+    raw("UPDATE sessions SET setup_status='wat'");
+    let (status, _) = get(format!("/v1/sessions/{SESSION}")).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    // No setup_state.json exists, so this reaches the row: it must not report
+    // the default `ready` for a stage it could not read.
+    let (status, json) = get(format!("/v1/sessions/{SESSION}/status")).await;
+    assert_ne!(json["status"], "ready", "{status} {json}");
+}
+
+#[tokio::test]
+async fn closing_a_session_cancels_pending_written_after_open() {
+    let tmp = tempfile::tempdir().unwrap();
+    let app = state(tmp.path());
+    enqueue(&app, "legacy");
+    app.store
+        .with_conn(|conn| {
+            conn.execute("UPDATE commands SET status='pending' WHERE id='legacy'", [])
+                .map_err(awman::data::error::DataError::from)
+        })
+        .unwrap();
+    let base = server(app.clone()).await;
+
+    let (status, json) = body(
+        reqwest::Client::new()
+            .delete(format!("{base}/v1/sessions/{SESSION}"))
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["status"], "closed", "{json}");
+    assert_eq!(
+        app.store.get_command("legacy").unwrap().unwrap().status,
+        CommandStatus::Cancelled
+    );
+    assert!(app.store.claim_next_command("worker").unwrap().is_none());
+}
+
+#[tokio::test]
+async fn session_queue_reports_an_unreadable_row_instead_of_an_empty_queue() {
+    let tmp = tempfile::tempdir().unwrap();
+    let app = state(tmp.path());
+    enqueue(&app, "good");
+    enqueue(&app, "corrupt");
+    let set_status = |status: &str| {
+        app.store
+            .with_conn(|conn| {
+                conn.execute("UPDATE commands SET status=?1 WHERE id='corrupt'", [status])
+                    .map_err(awman::data::error::DataError::from)
+            })
+            .unwrap();
+    };
+    set_status("wat");
+    let base = server(app.clone()).await;
+    let url = format!("{base}/v1/sessions/{SESSION}/queue");
+    let client = reqwest::Client::new();
+
+    let (status, json) = body(client.get(&url).send().await.unwrap()).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{json}");
+    assert_eq!(json["code"], "internal", "{json}");
+
+    set_status("done");
+    let (status, json) = body(client.get(&url).send().await.unwrap()).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["queued"][0]["command_id"], "good", "{json}");
 }

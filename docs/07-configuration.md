@@ -331,7 +331,7 @@ awman config set --global default_agent gemini   # for all projects
 awman config set agent codex                     # for this repo only
 ```
 
-Valid agents: `claude`, `codex`, `gemini`, `opencode`, `cline`, `copilot`, `antigravity`, or the name of a [custom agent](15-custom-agents.md). A repo-scope write accepts custom agents defined in the repo or globally; a `--global` write accepts only globally defined ones. Anything else is rejected at write time with the list of valid agents.
+Valid agents: `claude`, `codex`, `gemini`, `opencode`, `cline`, `copilot`, `antigravity`, or the name of a [custom agent](15-custom-agents.md). A repo-scope write accepts custom agents defined in the repo or globally; a `--global default_agent` write accepts only globally defined ones. `agent` is repo-only and rejects `--global`. Anything else is rejected at write time with the list of valid agents.
 
 ### Custom agent definitions and approvals
 
@@ -641,7 +641,7 @@ awman keeps global config and data (workflows, skills, worktrees, API state) und
 
 | JSON key | Type | Default | Meaning | Settable via `config set` |
 |----------|------|---------|---------|---------------------------|
-| `agent` | string | (unset → global `default_agent`) | Agent for this repo | yes (repo or global scope) |
+| `agent` | string | (unset → global `default_agent`) | Agent for this repo | yes (repo only) |
 | `launchMode` | `"stdio"` \| `"acp"` | `"stdio"` | Default agent launch mode for this repo | no (edit file) |
 | `auto_agent_auth_accepted` | bool | (unset) | Records that you accepted the agent auth consent prompt; managed by awman, shown read-only | no (managed) |
 | `terminal_scrollback_lines` | integer | 10000 | Scrollback lines in the container terminal | yes |
@@ -711,7 +711,7 @@ awman keeps global config and data (workflows, skills, worktrees, API state) und
 
 | Field name | Scope |
 |------------|-------|
-| `agent` | repo or global |
+| `agent` | repo only |
 | `auto_agent_auth_accepted` | global only (read-only; managed by the auth flow) |
 | `terminal_scrollback_lines` | repo or global |
 | `yoloDisallowedTools` | repo or global |
@@ -727,22 +727,15 @@ awman keeps global config and data (workflows, skills, worktrees, API state) und
 | `builtin.mountQuotaMib` | repo or global |
 | `builtin.imageSource`, `builtin.images`, `builtin.registries`, `builtin.network` | repo or global; shown read-only, edit the JSON |
 | `default_agent` | global only |
-| `api` | global only |
-| `remote` | global only in practice (see note) |
+| `remote.defaultAddr`, `remote.defaultAPIKey` | global only |
 | `work_items.dir` | repo only |
 | `work_items.template` | repo only |
 | `api.workDirs` | global only |
 | `api.workDirRoots` | global only |
-| `api.port` | global only (default 9876) |
-| `api.background` | global only |
-| `remote.defaultAddr` | global only in practice (see note) |
-| `remote.defaultAPIKey` | global only in practice (see note) |
 | `workflows.dynamic.defaultLeader` | repo or global |
 | `workflows.dynamic.maxConcurrentSteps` | repo or global |
 | `workflows.dynamic.agentsToModels` (and `.<agentName>`) | repo or global |
 | `workflows.dynamic.guidance` (and `.<index>`) | repo or global |
-
-> **Note on `remote.*` scope.** `config set` accepts these at repo scope, but only the **global** file is ever read back — always pass `--global` when setting them.
 
 `launchMode` and `launchModeFallback` are currently config-file-only fields;
 they are not accepted by `config set` or `config get`. Edit the JSON files
@@ -751,11 +744,14 @@ shown above directly.
 Value handling:
 
 - `yoloDisallowedTools`, `overlays`, `api.workDirs`, `api.workDirRoots` — comma-separated values are stored as arrays; an empty string stores an empty array.
-- `terminal_scrollback_lines`, `agentStuckTimeout`, `api.port`, `maxConcurrentAgents`, `workflows.dynamic.maxConcurrentSteps` — must be positive integers; `0` is rejected.
+- `terminal_scrollback_lines` and `agentStuckTimeout` accept non-negative integers, including `0`. `maxConcurrentAgents` and `workflows.dynamic.maxConcurrentSteps` must be positive integers when set.
+- The API port is selected when starting the server; `api.port` is not an accepted `config set` / `config get` field.
 - `agent`, `default_agent` — validated against the built-in agents and the custom agents defined in the scope being written.
 - `workflows.dynamic.defaultLeader` — must be in `agent::model` format (exactly two non-empty, non-whitespace components).
 - `workflows.dynamic.guidance.<index>` — a single free-form instruction string, capped at 1,000 characters; the combined global and repo list is limited to 50 entries. Empty or whitespace-only values are rejected on load and coerced to a removal when set via `config set`.
 - `envPassthrough` — removed; the error message points you to `env(VAR)` overlay entries.
+- String fields keep string values even when the text looks like a boolean or number (for example, `work_items.dir true` stores the string `"true"`). Invalid booleans and numbers are rejected before the config file is written. Config edits that would be dropped by typed config loading are rejected instead of reporting success.
+- `config show`, `config get`, and `config set` mask sensitive values, including `remote.defaultAPIKey`; the stored key is unchanged.
 
 ### Environment variables
 

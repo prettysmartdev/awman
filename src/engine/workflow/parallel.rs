@@ -191,53 +191,56 @@ impl WorkflowEngine {
         stuck_tx: &StuckFanIn,
         dequeued: bool,
     ) -> Result<(), EngineError> {
-        let resolved_agent = self.resolve_agent(&step)?;
-        let resolved_model = self.resolve_model(&step);
-        tracing::info!(
-            step = %step.name,
-            agent = %resolved_agent.as_str(),
-            model = ?resolved_model,
-            "workflow_engine launching parallel step"
-        );
-
-        let step_attempt = self.state.record_step_launch(&step.name);
-        let workflow_step_info = self.build_workflow_step_info(&step.name);
-        let runtime = WorkflowRuntimeContext {
-            step_agent: resolved_agent.clone(),
-            step_model: resolved_model.clone(),
-            git_root: self.session.git_root().to_path_buf(),
-            session_id: self.session.id(),
-            workflow_invocation_id: self.state.invocation_id,
-            workflow_step_info,
-            source: self.main_step_source(&step.name, step_attempt),
-        };
-
+        let prepared = self.prepare_step_launch(&step)?;
         self.frontend.report_step_interactive_launch(
             &step,
-            resolved_agent.as_str(),
-            resolved_model.as_deref(),
+            prepared.runtime.step_agent.as_str(),
+            prepared.runtime.step_model.as_deref(),
         );
-        self.state
-            .set_status(&step.name, StepState::Running { container_id: None });
         self.frontend
-            .report_step_launching(&step.name, step_attempt);
+            .report_step_launching(&step.name, prepared.attempt);
         self.frontend
             .report_step_status(&step, WorkflowStepStatus::Running);
-        self.persist()?;
+        let launch = match self.spawn_prepared_step(&step, prepared) {
+            Ok(launch) => launch,
+            Err(error) => {
+                if matches!(
+                    self.state.status_of(&step.name),
+                    Some(StepState::Failed { .. })
+                ) {
+                    self.frontend
+                        .report_step_status(&step, WorkflowStepStatus::Failed { exit_code: -1 });
+                }
+                // A launch error exits the group. Stop its owned siblings
+                // before their wait futures are dropped, including runtimes
+                // whose execution Drop deliberately leaves containers alive.
+                let live: Vec<String> = self
+                    .active_steps
+                    .iter()
+                    .map(|slot| slot.step_name.clone())
+                    .collect();
+                self.stop_active_agents();
+                for name in live {
+                    self.state.set_status(&name, StepState::Pending);
+                    let sibling = self.find_step(&name)?;
+                    self.frontend
+                        .report_step_status(&sibling, WorkflowStepStatus::Pending);
+                    self.frontend
+                        .report_parallel_step_exited(&name, KILLED_EXIT_CODE);
+                }
+                if let Err(save_error) = self.persist() {
+                    tracing::error!(step = %step.name, error = %save_error,
+                        "could not persist parallel launch failure cleanup");
+                }
+                return Err(error);
+            }
+        };
+        let single_step::StepLaunch {
+            execution,
+            agent: resolved_agent,
+            model: resolved_model,
+        } = launch;
 
-        let execution = self
-            .agent_factory
-            .execution_for_step(&step, &self.session, &runtime)?;
-
-        self.state.set_status(
-            &step.name,
-            StepState::Running {
-                container_id: Some(execution.handle().id.clone()),
-            },
-        );
-        self.persist()?;
-
-        self.last_launched_identity = Some((resolved_agent.clone(), resolved_model.clone()));
         let stuck_sender = execution.stuck_sender();
         let cancel_handle = execution.cancel_handle();
         let container_name = execution.handle().name.clone();

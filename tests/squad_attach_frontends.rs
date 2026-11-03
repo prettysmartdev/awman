@@ -28,14 +28,15 @@ use awman::engine::git::GitEngine;
 use awman::engine::overlay::OverlayEngine;
 use awman::frontend::tui::app::App;
 use awman::frontend::tui::tabs::{
-    ContainerSlotEvent, SharedWorkflowViewState, StepViewStatus, Tab, WorkflowOverviewState,
-    WorkflowViewState,
+    ContainerSlotEvent, StepViewStatus, Tab, WorkflowOverviewState, WorkflowViewState,
 };
 use awman::frontend::tui::workflow_view::{render_workflow_overview, workflow_state_to_view_state};
 use ratatui::backend::TestBackend;
 use ratatui::layout::Rect;
 use ratatui::Terminal;
 use tokio_util::sync::CancellationToken;
+
+type SharedWorkflowViewState = Arc<Mutex<Option<WorkflowViewState>>>;
 
 /// One step of a scripted workflow: name, dependencies, state, agent, model.
 type StepSpec<'a> = (
@@ -298,7 +299,7 @@ fn squad_app() -> App {
 }
 
 fn push_launch(tab: &Tab, step_name: &str, agent: &str, container_name: &str) {
-    let mut events = tab.shared.container_slot_events.lock().unwrap();
+    let mut events = tab.shared.container.events.lock().unwrap();
     events.push_back(ContainerSlotEvent::Launched {
         step_name: step_name.into(),
         agent: agent.into(),
@@ -354,7 +355,10 @@ fn workflow_phase_attach_matches_the_in_process_workflow_slot_and_overview_state
     push_launch(&in_process, "lint", "claude", "awman-lint-id");
     push_launch(&in_process, "test", "codex", "awman-test-id");
     in_process.drain_container_slot_events();
-    *in_process.shared.workflow_state.lock().unwrap() = Some(workflow_state_to_view_state(&state));
+    in_process
+        .shared
+        .workflow
+        .update_view(|view| *view = Some(workflow_state_to_view_state(&state)));
 
     // The attach driver produces actions from the remote snapshot; its normal
     // downstream representation is the exact same event queue.
@@ -378,24 +382,15 @@ fn workflow_phase_attach_matches_the_in_process_workflow_slot_and_overview_state
         );
     }
     attached.drain_container_slot_events();
-    *attached.shared.workflow_state.lock().unwrap() = Some(workflow_state_to_view_state(&state));
+    attached
+        .shared
+        .workflow
+        .update_view(|view| *view = Some(workflow_state_to_view_state(&state)));
 
     assert_eq!(slot_fingerprint(&attached), slot_fingerprint(&in_process));
     assert_eq!(attached.focused_slot_idx, in_process.focused_slot_idx);
-    let attached_view = attached
-        .shared
-        .workflow_state
-        .lock()
-        .unwrap()
-        .clone()
-        .unwrap();
-    let in_process_view = in_process
-        .shared
-        .workflow_state
-        .lock()
-        .unwrap()
-        .clone()
-        .unwrap();
+    let attached_view = attached.shared.workflow.snapshot().view.unwrap();
+    let in_process_view = in_process.shared.workflow.snapshot().view.unwrap();
     assert_eq!(
         view_fingerprint(&attached_view),
         view_fingerprint(&in_process_view)
@@ -513,7 +508,8 @@ async fn daemon_failure_freezes_poller_overview_and_preserves_live_slots() {
         None,
     )]);
     let mut app = squad_app();
-    let view = app.active_tab().shared.workflow_state.clone();
+    let workflow = app.active_tab().shared.workflow.clone();
+    let view = Arc::new(Mutex::new(None));
     let reachable = app
         .active_tab()
         .squad
@@ -532,6 +528,7 @@ async fn daemon_failure_freezes_poller_overview_and_preserves_live_slots() {
         Box::new({
             let view = view.clone();
             move |state| {
+                workflow.publish_remote(state.invocation_id, workflow_state_to_view_state(state));
                 *view.lock().unwrap() = Some(workflow_state_to_view_state(state));
                 callback_seen.store(true, Ordering::Relaxed);
             }

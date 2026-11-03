@@ -24,6 +24,7 @@
 
 mod claude_stream_json;
 mod codex_json;
+pub mod line_framer;
 
 use std::sync::Arc;
 
@@ -282,5 +283,21 @@ mod adversarial_tests {
             vec![activity(StepActivityKind::Thinking, "thinking")]
         );
         assert!(translator.feed_line(OutputStream::Stdout, r#"{"type":"item.updated","item":{"type":"reasoning","text":"private reasoning update"}}"#).is_empty());
+    }
+}
+
+/// Shared container lifecycle presentation used by API commands and setup.
+pub fn container_status_message(status: &crate::engine::agent_runtime::AgentStatus) -> String {
+    use crate::engine::agent_runtime::AgentStatus;
+    match status {
+        AgentStatus::Building => "Building container image...".to_string(),
+        AgentStatus::Pulling => "Pulling container image...".to_string(),
+        AgentStatus::Starting => "Starting container...".to_string(),
+        AgentStatus::Running { container_name } => {
+            format!("Container running: {container_name}")
+        }
+        AgentStatus::Stopping => "Stopping container...".to_string(),
+        AgentStatus::Exited(code) => format!("Container exited with code {code}"),
+        AgentStatus::Failed(reason) => format!("Container failed: {reason}"),
     }
 }

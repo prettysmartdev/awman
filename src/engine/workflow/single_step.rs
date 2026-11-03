@@ -8,7 +8,96 @@
 
 use super::*;
 
+/// Resolved inputs for one launch. Scheduling and frontend notifications stay
+/// with the single-step or parallel caller.
+pub(super) struct PreparedStepLaunch {
+    pub(super) runtime: WorkflowRuntimeContext,
+    pub(super) attempt: u32,
+}
+
+/// A spawned execution whose container identity has been persisted.
+pub(super) struct StepLaunch {
+    pub(super) execution: AgentExecution,
+    pub(super) agent: AgentName,
+    pub(super) model: Option<String>,
+}
+
 impl WorkflowEngine {
+    pub(super) fn prepare_step_launch(
+        &mut self,
+        step: &WorkflowStep,
+    ) -> Result<PreparedStepLaunch, EngineError> {
+        let agent = self.resolve_agent(step)?;
+        let model = self.resolve_model(step);
+        tracing::info!(
+            step = %step.name,
+            agent = %agent.as_str(),
+            model = ?model,
+            "workflow_engine resolved step parameters"
+        );
+        let attempt = self.state.record_step_launch(&step.name);
+        let runtime = WorkflowRuntimeContext {
+            step_agent: agent,
+            step_model: model,
+            git_root: self.session.git_root().to_path_buf(),
+            session_id: self.session.id(),
+            workflow_invocation_id: self.state.invocation_id,
+            workflow_step_info: self.build_workflow_step_info(&step.name),
+            source: self.main_step_source(&step.name, attempt),
+        };
+        Ok(PreparedStepLaunch { runtime, attempt })
+    }
+
+    /// Persist both sides of the factory call. A failed spawn has no live
+    /// container; record Failed and attempt to save it before returning the
+    /// factory error. A failed save is logged and resume handles the prior
+    /// interrupted Running checkpoint.
+    pub(super) fn spawn_prepared_step(
+        &mut self,
+        step: &WorkflowStep,
+        prepared: PreparedStepLaunch,
+    ) -> Result<StepLaunch, EngineError> {
+        self.state
+            .set_status(&step.name, StepState::Running { container_id: None });
+        self.persist()?;
+        let execution =
+            match self
+                .agent_factory
+                .execution_for_step(step, &self.session, &prepared.runtime)
+            {
+                Ok(execution) => execution,
+                Err(error) => {
+                    self.state.set_status(
+                        &step.name,
+                        StepState::Failed {
+                            exit_code: -1,
+                            error_message: Some(error.to_string()),
+                        },
+                    );
+                    if let Err(save_error) = self.persist() {
+                        tracing::error!(step = %step.name, error = %save_error,
+                            spawn_error = %error, "could not persist failed workflow launch");
+                    }
+                    return Err(error);
+                }
+            };
+        self.state.set_status(
+            &step.name,
+            StepState::Running {
+                container_id: Some(execution.handle().id.clone()),
+            },
+        );
+        self.persist()?;
+        let agent = prepared.runtime.step_agent;
+        let model = prepared.runtime.step_model;
+        self.last_launched_identity = Some((agent.clone(), model.clone()));
+        Ok(StepLaunch {
+            execution,
+            agent,
+            model,
+        })
+    }
+
     /// The attribution of a main step's container (WI 0137 §5): its index
     /// in `WorkflowState.steps`, stable across attempts, and the 1-based
     /// attempt this launch is.
@@ -165,52 +254,34 @@ impl WorkflowEngine {
             .ok_or_else(|| EngineError::InvalidAdvanceAction("no ready steps remaining".into()))?;
         let step = self.find_step(&step_name)?;
 
-        let resolved_agent = self.resolve_agent(&step)?;
-        let resolved_model = self.resolve_model(&step);
-        tracing::info!(
-            step = %step.name,
-            agent = %resolved_agent.as_str(),
-            model = ?resolved_model,
-            "workflow_engine resolved step parameters"
-        );
-
-        let step_attempt = self.state.record_step_launch(&step.name);
-        let workflow_step_info = self.build_workflow_step_info(&step.name);
-        let runtime = WorkflowRuntimeContext {
-            step_agent: resolved_agent.clone(),
-            step_model: resolved_model.clone(),
-            git_root: self.session.git_root().to_path_buf(),
-            session_id: self.session.id(),
-            workflow_invocation_id: self.state.invocation_id,
-            workflow_step_info,
-            source: self.main_step_source(&step.name, step_attempt),
-        };
-
+        let prepared = self.prepare_step_launch(&step)?;
         self.frontend.report_step_interactive_launch(
             &step,
-            resolved_agent.as_str(),
-            resolved_model.as_deref(),
+            prepared.runtime.step_agent.as_str(),
+            prepared.runtime.step_model.as_deref(),
         );
-
-        self.state
-            .set_status(&step.name, StepState::Running { container_id: None });
         self.frontend
-            .report_step_launching(&step.name, step_attempt);
+            .report_step_launching(&step.name, prepared.attempt);
         self.frontend
             .report_step_status(&step, WorkflowStepStatus::Running);
-        self.persist()?;
-
-        let execution = self
-            .agent_factory
-            .execution_for_step(&step, &self.session, &runtime)?;
-
-        self.state.set_status(
-            &step.name,
-            StepState::Running {
-                container_id: Some(execution.handle().id.clone()),
-            },
-        );
-        self.persist()?;
+        let launch = match self.spawn_prepared_step(&step, prepared) {
+            Ok(launch) => launch,
+            Err(error) => {
+                if matches!(
+                    self.state.status_of(&step.name),
+                    Some(StepState::Failed { .. })
+                ) {
+                    self.frontend
+                        .report_step_status(&step, WorkflowStepStatus::Failed { exit_code: -1 });
+                }
+                return Err(error);
+            }
+        };
+        let single_step::StepLaunch {
+            execution,
+            agent: resolved_agent,
+            model: resolved_model,
+        } = launch;
 
         let container_name = execution.handle().name.clone();
         let handle = execution.handle().clone();
@@ -230,7 +301,6 @@ impl WorkflowEngine {
             launch_id: 0,
         }];
         self.current_step_name = Some(step.name.clone());
-        self.last_launched_identity = Some((resolved_agent.clone(), resolved_model.clone()));
         self.current_step_agent = Some(resolved_agent);
         self.current_step_model = resolved_model;
         Ok(step.name)
@@ -694,5 +764,369 @@ impl WorkflowEngine {
                 _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod launch_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    /// Fails one launch after verifying that Running was published before the
+    /// factory was invoked. Subsequent calls model an explicit user retry.
+    struct FailOnceFactory {
+        calls: AtomicUsize,
+        store: WorkflowStateStore,
+        workflow_name: String,
+    }
+
+    impl AgentExecutionFactory for FailOnceFactory {
+        fn execution_for_step(
+            &self,
+            step: &WorkflowStep,
+            session: &Session,
+            runtime: &WorkflowRuntimeContext,
+        ) -> Result<AgentExecution, EngineError> {
+            let saved = self.store.load(None, &self.workflow_name).unwrap().unwrap();
+            assert_eq!(
+                saved.status_of(&step.name),
+                Some(&StepState::Running { container_id: None })
+            );
+            assert_eq!(saved.step_attempt(&step.name), runtime.source.step_attempt);
+            assert_eq!(runtime.git_root, session.git_root());
+            assert_eq!(runtime.session_id, session.id());
+            assert_eq!(runtime.workflow_invocation_id, saved.invocation_id);
+            assert_eq!(runtime.source.step_index, saved.step_index(&step.name));
+            if step.name == "a" && self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(EngineError::Other("injected spawn failure".into()));
+            }
+            let now = chrono::Utc::now();
+            Ok(AgentExecution::finished(
+                AgentHandle {
+                    id: "retry-id".into(),
+                    name: "retry-container".into(),
+                    image_tag: "fake:latest".into(),
+                    started_at: now,
+                },
+                AgentExitInfo {
+                    exit_code: 0,
+                    signal: None,
+                    started_at: now,
+                    ended_at: now,
+                },
+            ))
+        }
+
+        fn inject_prompt(
+            &self,
+            _execution: &AgentExecution,
+            _prompt: &str,
+        ) -> Result<Option<()>, EngineError> {
+            Ok(None)
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingFrontend {
+        states: Arc<Mutex<Vec<WorkflowState>>>,
+        statuses: Arc<Mutex<Vec<WorkflowStepStatus>>>,
+    }
+
+    impl crate::data::message::UserMessageSink for RecordingFrontend {
+        fn write_message(&mut self, _message: crate::data::message::UserMessage) {}
+        fn replay_queued(&mut self) {}
+    }
+
+    impl WorkflowFrontend for RecordingFrontend {
+        fn yolo_countdown_tick(
+            &mut self,
+            _step_name: &str,
+            _remaining: Duration,
+            _total: Duration,
+        ) -> Result<YoloTickOutcome, EngineError> {
+            Ok(YoloTickOutcome::Cancel)
+        }
+        fn report_workflow_completed(&mut self, _outcome: &WorkflowOutcome) {}
+        fn show_workflow_control_board(
+            &mut self,
+            _state: &WorkflowState,
+            _available: &AvailableActions,
+        ) -> Result<NextAction, EngineError> {
+            panic!("spawn failures must return to the caller")
+        }
+        fn confirm_resume(&mut self, _mismatch: &ResumeMismatch) -> Result<bool, EngineError> {
+            Ok(true)
+        }
+        fn report_workflow_state(&mut self, state: &WorkflowState) {
+            self.states.lock().unwrap().push(state.clone());
+        }
+        fn report_step_status(&mut self, _step: &WorkflowStep, status: WorkflowStepStatus) {
+            self.statuses.lock().unwrap().push(status);
+        }
+    }
+
+    fn step(name: &str) -> WorkflowStep {
+        WorkflowStep {
+            name: name.into(),
+            depends_on: vec![],
+            prompt_template: "test prompt".into(),
+            agent: Some("codex".into()),
+            model: Some("test-model".into()),
+            overlays: None,
+            abort_on_failure: false,
+        }
+    }
+
+    fn engine(session: &Session, frontend: RecordingFrontend) -> WorkflowEngine {
+        let workflow = Workflow {
+            title: Some("spawn-failure".into()),
+            steps: vec![step("a"), step("b")],
+            agent: None,
+            model: None,
+            setup: vec![],
+            teardown: vec![],
+            teardown_on_failure: false,
+            overlays: None,
+        };
+        WorkflowEngine::new(
+            session,
+            WorkflowSpec::new(workflow),
+            WorkflowEngineDeps {
+                frontend: Box::new(frontend),
+                agent_factory: Box::new(FailOnceFactory {
+                    calls: AtomicUsize::new(0),
+                    store: WorkflowStateStore::new(session),
+                    workflow_name: "spawn-failure".into(),
+                }),
+            },
+        )
+        .unwrap()
+    }
+
+    fn assert_failed_checkpoint(engine: &WorkflowEngine, frontend_states: &[WorkflowState]) {
+        // EngineError's Display may add context; check that the diagnostic
+        // survives without tying persistence to its presentation prefix.
+        let assert_failed = |state: &WorkflowState| {
+            match state.status_of("a").unwrap() {
+                StepState::Failed {
+                    exit_code,
+                    error_message,
+                } => {
+                    assert_eq!(*exit_code, -1);
+                    assert!(error_message
+                        .as_ref()
+                        .unwrap()
+                        .contains("injected spawn failure"));
+                }
+                other => panic!("expected failed spawn, got {other:?}"),
+            }
+            assert_eq!(state.step_attempt("a"), Some(1));
+            assert_eq!(state.status_of("b"), Some(&StepState::Pending));
+            assert!(!state.completed_steps.contains("a"));
+        };
+        assert_failed(engine.state());
+        let saved = engine
+            .state_store
+            .load(None, "spawn-failure")
+            .unwrap()
+            .unwrap();
+        assert_failed(&saved);
+        assert_failed(frontend_states.last().unwrap());
+        assert!(engine.active_steps.is_empty());
+        assert!(engine.last_launched_identity.is_none());
+    }
+
+    #[tokio::test]
+    async fn single_spawn_failure_is_persisted_and_explicit_retry_can_succeed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = Session::for_tests_isolated(tmp.path(), &tmp.path().join("home"));
+        let frontend = RecordingFrontend::default();
+        let states = frontend.states.clone();
+        let statuses = frontend.statuses.clone();
+        let mut engine = engine(&session, frontend);
+        let error = engine.step_once().await.unwrap_err();
+        assert!(error.to_string().contains("injected spawn failure"));
+        assert_failed_checkpoint(&engine, &states.lock().unwrap());
+        assert_eq!(
+            *statuses.lock().unwrap(),
+            vec![
+                WorkflowStepStatus::Running,
+                WorkflowStepStatus::Failed { exit_code: -1 },
+            ]
+        );
+
+        engine.state.set_status("a", StepState::Pending);
+        let outcome = engine.step_once().await.unwrap();
+        assert_eq!(outcome.status, WorkflowStepStatus::Succeeded);
+        assert_eq!(engine.state.step_attempt("a"), Some(2));
+        assert_eq!(
+            engine.current_step_agent.as_ref().unwrap().as_str(),
+            "codex"
+        );
+        assert_eq!(engine.current_step_model.as_deref(), Some("test-model"));
+    }
+
+    #[tokio::test]
+    async fn parallel_spawn_failure_is_persisted_without_a_wait_slot_and_can_retry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = Session::for_tests_isolated(tmp.path(), &tmp.path().join("home"));
+        let frontend = RecordingFrontend::default();
+        let states = frontend.states.clone();
+        let mut engine = engine(&session, frontend);
+        let error = engine
+            .run_parallel_group(vec![step("a"), step("b")])
+            .await
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("injected spawn failure"));
+        assert_failed_checkpoint(&engine, &states.lock().unwrap());
+
+        engine.state.set_status("a", StepState::Pending);
+        let outcome = engine
+            .run_parallel_group(vec![step("a"), step("b")])
+            .await
+            .unwrap();
+        assert!(matches!(outcome, GroupOutcome::Drained { failed } if failed.is_empty()));
+        assert_eq!(engine.state.step_attempt("a"), Some(2));
+        assert_eq!(engine.state.step_attempt("b"), Some(1));
+        assert_eq!(engine.state.status_of("a"), Some(&StepState::Succeeded));
+        assert_eq!(engine.state.status_of("b"), Some(&StepState::Succeeded));
+    }
+
+    struct PendingExecution;
+    impl crate::engine::agent_runtime::execution::ExecutionBackend for PendingExecution {
+        fn wait_blocking(self: Box<Self>) -> Result<AgentExitInfo, EngineError> {
+            panic!("sibling wait must not be abandoned into a blocking task")
+        }
+        fn cancel(&self) -> Result<(), EngineError> {
+            Ok(())
+        }
+        fn cancel_handle(&self) -> crate::engine::agent_runtime::CancelHandle {
+            crate::engine::agent_runtime::CancelHandle::new(|| Ok(()))
+        }
+        fn cancel_on_execution_drop(&self) -> bool {
+            false
+        }
+    }
+
+    struct FailureFactory {
+        inner: FailOnceFactory,
+        pending: Option<String>,
+        fail_checkpoint: bool,
+        stopped: Arc<Mutex<Vec<String>>>,
+    }
+    impl AgentExecutionFactory for FailureFactory {
+        fn execution_for_step(
+            &self,
+            step: &WorkflowStep,
+            session: &Session,
+            runtime: &WorkflowRuntimeContext,
+        ) -> Result<AgentExecution, EngineError> {
+            let result = self.inner.execution_for_step(step, session, runtime);
+            if result.is_err() && self.fail_checkpoint {
+                let path = self.inner.store.state_path(None, &self.inner.workflow_name);
+                let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+                permissions.set_readonly(true);
+                std::fs::set_permissions(path, permissions).unwrap();
+            }
+            if self.pending.as_deref() == Some(&step.name) {
+                let handle = result?.handle().clone();
+                let (tx, _) = tokio::sync::broadcast::channel(4);
+                Ok(AgentExecution::new(
+                    handle,
+                    Box::new(PendingExecution),
+                    Arc::new(tx),
+                    None,
+                ))
+            } else {
+                result
+            }
+        }
+        fn inject_prompt(&self, _: &AgentExecution, _: &str) -> Result<Option<()>, EngineError> {
+            Ok(None)
+        }
+        fn stop_agent(&self, handle: &AgentHandle) -> Result<(), EngineError> {
+            self.stopped.lock().unwrap().push(handle.id.clone());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn parallel_spawn_failure_stops_owned_live_siblings_through_the_group() {
+        for dequeued in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let session = Session::for_tests_isolated(tmp.path(), &tmp.path().join("home"));
+            let mut engine = engine(&session, RecordingFrontend::default());
+            let stopped = Arc::new(Mutex::new(Vec::new()));
+            engine.workflow.steps.push(step("c"));
+            engine.state.set_status("c", StepState::Pending);
+            engine.max_concurrent = Some(2);
+            engine.agent_factory = Box::new(FailureFactory {
+                inner: FailOnceFactory {
+                    calls: AtomicUsize::new(0),
+                    store: engine.state_store.clone(),
+                    workflow_name: "spawn-failure".into(),
+                },
+                pending: Some("c".into()),
+                fail_checkpoint: false,
+                stopped: stopped.clone(),
+            });
+            let steps = if dequeued {
+                vec![step("b"), step("c"), step("a")]
+            } else {
+                vec![step("c"), step("a")]
+            };
+            let error = engine.run_parallel_group(steps).await.err().unwrap();
+            assert!(error.to_string().contains("injected spawn failure"));
+            assert_eq!(*stopped.lock().unwrap(), ["retry-id"]);
+            assert!(engine.active_steps.is_empty());
+            let saved = engine
+                .state_store
+                .load(None, "spawn-failure")
+                .unwrap()
+                .unwrap();
+            assert_eq!(saved.status_of("c"), Some(&StepState::Pending));
+            assert!(matches!(
+                saved.status_of("a"),
+                Some(StepState::Failed { exit_code: -1, .. })
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_checkpoint_write_preserves_the_original_spawn_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = Session::for_tests_isolated(tmp.path(), &tmp.path().join("home"));
+        let mut engine = engine(&session, RecordingFrontend::default());
+        engine.agent_factory = Box::new(FailureFactory {
+            inner: FailOnceFactory {
+                calls: AtomicUsize::new(0),
+                store: engine.state_store.clone(),
+                workflow_name: "spawn-failure".into(),
+            },
+            pending: None,
+            fail_checkpoint: true,
+            stopped: Default::default(),
+        });
+        let error = engine.step_once().await.unwrap_err();
+        assert!(error.to_string().contains("injected spawn failure"));
+        assert!(matches!(
+            engine.state.status_of("a"),
+            Some(StepState::Failed { .. })
+        ));
+        let saved = engine
+            .state_store
+            .load(None, "spawn-failure")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            saved.status_of("a"),
+            Some(&StepState::Running { container_id: None })
+        );
+        assert!(
+            saved.interrupted_running_steps().contains(&"a".to_string()),
+            "resume resets a never-started Running checkpoint"
+        );
     }
 }

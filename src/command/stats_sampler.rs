@@ -127,6 +127,8 @@ impl ContainerStatsSampler {
                 let stats = match &request.target {
                     // One runtime call, not the list-then-find-then-stats
                     // three the fallback costs.
+                    // Sampling is best effort: a missing runtime or transient
+                    // listing failure simply yields no sample for this round.
                     StatsTarget::Named(name) => runtime.stats_by_name(name).ok(),
                     StatsTarget::FirstRunning => runtime
                         .list_running_all()

@@ -535,11 +535,10 @@ fn real_git_cli_api_and_tui_dispatch_keep_pull_subdir_and_pull_all_in_parity() {
     )
     .expect("TUI shared dispatcher must retain pull flags");
     assert_eq!(tui.path, vec!["new", "skill"]);
-    assert!(
-        matches!(tui.flags.get("pull"), Some(awman::command::dispatch::parsed_input::FlagValue::String(value)) if value == "owner/alpha")
-    );
-    assert!(
-        matches!(tui.flags.get("subdir"), Some(awman::command::dispatch::parsed_input::FlagValue::String(value)) if value == "custom-skills")
+    assert_eq!(tui.args.flag_string("pull").as_deref(), Some("owner/alpha"));
+    assert_eq!(
+        tui.args.flag_string("subdir").as_deref(),
+        Some("custom-skills")
     );
 }
 

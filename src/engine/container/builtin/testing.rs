@@ -56,6 +56,8 @@ pub struct FakeState {
     pub finished: Vec<(String, String, bool)>,
     pub removed_images: Vec<String>,
     pub fail_exec: bool,
+    pub fail_finish: bool,
+    pub finish_attempts: usize,
     pub hypervisor_error: Option<String>,
     /// Scripted behaviour and observations for the in-place catalog upgrade.
     pub upgrade: FakeUpgrade,
@@ -325,6 +327,10 @@ impl SandboxDriver for FakeDriver {
         remove: bool,
     ) -> Result<(), EngineError> {
         let mut state = self.state.lock().unwrap();
+        state.finish_attempts += 1;
+        if state.fail_finish {
+            return Err(EngineError::Other("injected stop failure".into()));
+        }
         let position = state
             .sandboxes
             .iter()

@@ -246,17 +246,7 @@ impl UserMessageSink for SetupContainerSink {
 #[async_trait]
 impl AgentFrontend for SetupContainerSink {
     fn report_status(&mut self, status: AgentStatus) {
-        let message = match &status {
-            AgentStatus::Building => "Building container image...".to_string(),
-            AgentStatus::Pulling => "Pulling container image...".to_string(),
-            AgentStatus::Starting => "Starting container...".to_string(),
-            AgentStatus::Running { container_name } => {
-                format!("Container running: {container_name}")
-            }
-            AgentStatus::Stopping => "Stopping container...".to_string(),
-            AgentStatus::Exited(code) => format!("Container exited with code {code}"),
-            AgentStatus::Failed(reason) => format!("Container failed: {reason}"),
-        };
+        let message = crate::engine::agent_output::container_status_message(&status);
         self.log.line(&format!("container: {message}"));
         self.event_bus.emit(EventPayload::StatusMessage {
             phase: "container".to_string(),
@@ -309,26 +299,30 @@ fn forward_container_stream_to_tracing(
     mut rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
 ) {
     tokio::spawn(async move {
-        let mut buf: Vec<u8> = Vec::with_capacity(256);
+        let mut framer = crate::engine::agent_output::line_framer::LineFramer::default();
         while let Some(chunk) = rx.recv().await {
-            buf.extend_from_slice(&chunk);
-            while let Some(nl) = buf.iter().position(|b| *b == b'\n') {
-                let line: Vec<u8> = buf.drain(..=nl).collect();
-                let s = String::from_utf8_lossy(&line[..line.len() - 1]);
-                let trimmed = s.trim_end_matches('\r');
-                if !trimmed.is_empty() {
-                    log.line(&format!("container.{stream_name}: {trimmed}"));
-                }
+            for line in framer.push(&chunk) {
+                log_setup_output_line(&log, &stream_name, line);
             }
         }
-        if !buf.is_empty() {
-            let s = String::from_utf8_lossy(&buf);
-            let trimmed = s.trim_end_matches(['\r', '\n']);
-            if !trimmed.is_empty() {
-                log.line(&format!("container.{stream_name}: {trimmed}"));
-            }
+        if let Some(line) = framer.finish() {
+            log_setup_output_line(&log, &stream_name, line);
         }
     });
+}
+
+fn log_setup_output_line(
+    log: &SetupLog,
+    stream_name: &str,
+    line: crate::engine::agent_output::line_framer::FramedLine,
+) {
+    let mut text = line.lossy_text().trim_end_matches('\r').to_owned();
+    if line.truncated {
+        text.push_str(" [line truncated]");
+    }
+    if !text.is_empty() {
+        log.line(&format!("container.{stream_name}: {text}"));
+    }
 }
 
 // ─── Logging helpers ───────────────────────────────────────────────────────

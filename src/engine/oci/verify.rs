@@ -289,11 +289,13 @@ impl<'a> StagingSink<'a> {
                             reason: format!("decompressed archive {e}"),
                         }
                     } else {
-                        EngineError::Network(format!(
-                            "transfer into {} failed after {} bytes: {e}",
-                            self.path.display(),
-                            self.written - start
-                        ))
+                        super::retry::map_diagnostic(super::retry::read_error(e), |diagnostic| {
+                            format!(
+                                "transfer into {} failed after {} bytes: {diagnostic}",
+                                self.path.display(),
+                                self.written - start
+                            )
+                        })
                     });
                 }
             };

@@ -229,10 +229,6 @@ fn resolve_agent_flags(session: &Session, agent: &AgentName, run: &AgentRunOptio
 pub struct AgentEngine {
     overlay_engine: Arc<OverlayEngine>,
     runtime: Arc<dyn AgentRuntimeEngine>,
-    /// Temp files backing file/env-file system-prompt delivery. Retained as
-    /// RAII guards so the files live as long as this engine instance and are
-    /// removed on drop — no `/tmp` leakage.
-    prompt_tempfiles: Arc<std::sync::Mutex<Vec<tempfile::NamedTempFile>>>,
     /// Who registers credential-refresh leases for the containers this engine
     /// builds options for (F-38). `None` — the default — disables leases, the
     /// same behaviour the absent process-global monitor used to produce.
@@ -248,7 +244,6 @@ impl AgentEngine {
         Self {
             overlay_engine,
             runtime,
-            prompt_tempfiles: Arc::new(std::sync::Mutex::new(Vec::new())),
             lease_factory: None,
             #[cfg(test)]
             local_builder: None,
@@ -1046,11 +1041,12 @@ impl AgentEngine {
                     .system_prompt_flag
                     .as_deref()
                     .unwrap_or("--append-system-prompt-file");
-                let (host_path, container_path) = self.write_prompt_temp_file(prompt_text)?;
+                let (guard, container_path) = write_prompt_temp_file(prompt_text)?;
                 options.push(ContainerOption::SystemPromptFile {
-                    host_path,
+                    host_path: guard.host_path().to_path_buf(),
                     container_path,
                     flag: flag.to_string(),
+                    guard,
                 });
             }
             SystemPromptMode::AppendInline { key } => {
@@ -1078,11 +1074,12 @@ impl AgentEngine {
                 }
             }
             SystemPromptMode::EnvFile { var } => {
-                let (host_path, container_path) = self.write_prompt_temp_file(prompt_text)?;
+                let (guard, container_path) = write_prompt_temp_file(prompt_text)?;
                 options.push(ContainerOption::SystemPromptEnvFile {
                     env_var: var.to_string(),
-                    host_path,
+                    host_path: guard.host_path().to_path_buf(),
                     container_path,
+                    guard,
                 });
             }
             SystemPromptMode::AddDir { flag } => {
@@ -1102,30 +1099,34 @@ impl AgentEngine {
         }
         Ok(())
     }
+}
 
-    /// Write the system prompt text to a temp file and return (host_path, container_path).
-    /// The temp file is retained on the engine's RAII guard so it lives as
-    /// long as the engine and is cleaned up on drop.
-    fn write_prompt_temp_file(
-        &self,
-        text: &str,
-    ) -> Result<(std::path::PathBuf, std::path::PathBuf), EngineError> {
-        use std::io::Write as _;
-        let mut tmp = tempfile::Builder::new()
-            .prefix("awman-ctx-prompt-")
-            .suffix(".md")
-            .tempfile()
-            .map_err(|e| EngineError::io(std::path::PathBuf::from("/tmp"), e))?;
-        tmp.write_all(text.as_bytes())
-            .map_err(|e| EngineError::io(tmp.path(), e))?;
-        let host_path = tmp.path().to_path_buf();
-        let container_path =
-            std::path::PathBuf::from("/tmp").join(host_path.file_name().unwrap_or_default());
-        if let Ok(mut guard) = self.prompt_tempfiles.lock() {
-            guard.push(tmp);
-        }
-        Ok((host_path, container_path))
-    }
+/// Write the system prompt text to a temp file and return its guard and the
+/// path it is mounted at. The guard travels with the launch's options, so the
+/// file lives as long as that launch and no longer.
+fn write_prompt_temp_file(
+    text: &str,
+) -> Result<
+    (
+        crate::engine::container::options::PromptFileGuard,
+        std::path::PathBuf,
+    ),
+    EngineError,
+> {
+    use std::io::Write as _;
+    let mut tmp = tempfile::Builder::new()
+        .prefix("awman-ctx-prompt-")
+        .suffix(".md")
+        .tempfile()
+        .map_err(|e| EngineError::io(std::path::PathBuf::from("/tmp"), e))?;
+    tmp.write_all(text.as_bytes())
+        .map_err(|e| EngineError::io(tmp.path(), e))?;
+    let container_path =
+        std::path::PathBuf::from("/tmp").join(tmp.path().file_name().unwrap_or_default());
+    Ok((
+        crate::engine::container::options::PromptFileGuard::new(tmp),
+        container_path,
+    ))
 }
 
 /// Emit the `SandboxOption` for system-prompt delivery. Unlike the container
@@ -2356,6 +2357,89 @@ mod tests {
             "no SystemPromptFile option must be emitted when system_prompt is None; \
              got {opts:?}"
         );
+    }
+
+    fn prompt_file_path(options: &[ContainerOption]) -> std::path::PathBuf {
+        options
+            .iter()
+            .find_map(|option| match option {
+                ContainerOption::SystemPromptFile {
+                    guard, host_path, ..
+                }
+                | ContainerOption::SystemPromptEnvFile {
+                    guard, host_path, ..
+                } => {
+                    assert_eq!(guard.host_path(), host_path);
+                    Some(host_path.clone())
+                }
+                _ => None,
+            })
+            .expect("a file-delivered system prompt")
+    }
+
+    #[test]
+    fn prompt_files_belong_to_the_launch_and_not_the_shared_engine() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, session) = make_agent_engine(tmp.path());
+        let agent = crate::data::session::AgentName::new("claude").unwrap();
+        let run = AgentRunOptions {
+            system_prompt: Some("Test prompt.".to_string()),
+            ..Default::default()
+        };
+
+        // Engine clones are what `Engines` shares between daemon commands.
+        let shared = engine.clone();
+        let first = engine.build_options(&session, &agent, &run).unwrap();
+        let second = shared.build_options(&session, &agent, &run).unwrap();
+        let (first_path, second_path) = (prompt_file_path(&first), prompt_file_path(&second));
+        assert_ne!(first_path, second_path);
+        assert_eq!(
+            std::fs::read_to_string(&first_path).unwrap(),
+            "Test prompt."
+        );
+
+        drop(first);
+        assert!(!first_path.exists(), "an unlaunched plan retained its file");
+        assert!(
+            second_path.exists(),
+            "dropping one plan removed another's file"
+        );
+        drop(second);
+        assert!(!second_path.exists());
+
+        for _ in 0..64 {
+            let options = engine.build_options(&session, &agent, &run).unwrap();
+            let path = prompt_file_path(&options);
+            assert!(path.exists());
+            drop(options);
+            assert!(!path.exists(), "the engine retained a prompt file");
+        }
+    }
+
+    #[test]
+    fn custom_agent_prompt_files_follow_the_same_launch_lifetime() {
+        for table in [
+            "delivery = \"append-file\"\nflag = \"--system\"",
+            "delivery = \"env-file\"\nenv = \"CRUSH_SYSTEM\"",
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (engine, _) = make_agent_engine(tmp.path());
+            let session = Session::for_tests_isolated(tmp.path(), &tmp.path().join("global"));
+            custom::install_crush_fixture_with_prompt(session.git_root(), session.env(), table);
+            let agent = crate::data::session::AgentName::new("crush").unwrap();
+            let run = AgentRunOptions {
+                system_prompt: Some("Test prompt.".to_string()),
+                ..Default::default()
+            };
+            let options = engine.build_options(&session, &agent, &run).unwrap();
+            let path = prompt_file_path(&options);
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "Test prompt.");
+            drop(options);
+            assert!(
+                !path.exists(),
+                "{table}: custom agent file outlived its plan"
+            );
+        }
     }
 
     #[test]

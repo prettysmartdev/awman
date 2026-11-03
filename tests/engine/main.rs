@@ -19,6 +19,7 @@ mod git_engine;
 mod issue_e2e;
 mod issue_integration;
 mod overlay_engine;
+mod process_env;
 mod sbx;
 mod stuck_event_wiring;
 mod workflow_end_to_end;

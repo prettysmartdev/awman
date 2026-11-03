@@ -642,6 +642,12 @@ async fn builder_unavailable_keeps_its_build_leases_through_the_import() {
         held[0] >= 1,
         "the build leases must be held during the import"
     );
+    // flock is shared with any process a parallel test forks while the lease is
+    // open, until that child's exec closes its copy. A leaked lease never clears.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while held_lock_files(locks.root()) > 0 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
     assert_eq!(held_lock_files(locks.root()), 0, "and released afterwards");
 }
 

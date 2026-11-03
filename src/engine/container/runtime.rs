@@ -379,7 +379,7 @@ impl AgentRuntimeEngine for ContainerRuntime {
 
     fn build(&self, options: ResolvedAgentOptions) -> Result<Box<dyn AgentInstance>, EngineError> {
         match options {
-            ResolvedAgentOptions::Container(opts) => ContainerRuntime::build(self, opts),
+            ResolvedAgentOptions::Container(opts) => ContainerRuntime::build(self, *opts),
             other => Err(EngineError::OptionVariantMismatch {
                 runtime: self.runtime_name().to_string(),
                 got: other.paradigm(),
@@ -516,7 +516,6 @@ mod tests {
     use super::*;
     use crate::data::config::effective::EffectiveConfig;
     use crate::engine::agent_runtime::ResolvedAgentOptions;
-    use crate::engine::sandbox::options::ResolvedSandboxOptions;
 
     #[test]
     fn build_requires_image_option() {
@@ -539,7 +538,7 @@ mod tests {
         use crate::engine::agent_runtime::AgentRuntimeEngine;
 
         let rt = ContainerRuntime::docker();
-        let opts = ResolvedAgentOptions::Sandbox(ResolvedSandboxOptions::default());
+        let opts = ResolvedAgentOptions::Sandbox(Box::default());
         match <ContainerRuntime as AgentRuntimeEngine>::build(&rt, opts) {
             Err(EngineError::OptionVariantMismatch { runtime, got }) => {
                 assert_eq!(runtime, "docker");
@@ -555,7 +554,7 @@ mod tests {
         use crate::engine::agent_runtime::AgentRuntimeEngine;
 
         let rt = ContainerRuntime::apple();
-        let opts = ResolvedAgentOptions::Sandbox(ResolvedSandboxOptions::default());
+        let opts = ResolvedAgentOptions::Sandbox(Box::default());
         match <ContainerRuntime as AgentRuntimeEngine>::build(&rt, opts) {
             Err(EngineError::OptionVariantMismatch { runtime, got }) => {
                 assert_eq!(runtime, "apple-containers");

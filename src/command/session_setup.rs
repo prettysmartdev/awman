@@ -148,9 +148,8 @@ impl SessionSetup {
 
     /// Enter a lifecycle status and persist it to the session row.
     fn enter_status(&self, status: SessionSetupStatus) {
-        let persisted = status.as_str();
         self.state(|s| s.enter_status(status));
-        let _ = self.store.update_setup_status(&self.session_id, persisted);
+        let _ = self.store.update_setup_status(&self.session_id, status);
     }
 
     /// Record a terminal failure in the state and broadcast it. The caller
@@ -174,9 +173,8 @@ impl SessionSetup {
         });
     }
 
-    /// Persist the terminal status string (`"ready"` / `"failed"`) to the
-    /// session row.
-    fn persist_status(&self, status: &str) {
+    /// Persist a terminal status to the session row.
+    fn persist_status(&self, status: SessionSetupStatus) {
         let _ = self.store.update_setup_status(&self.session_id, status);
     }
 
@@ -220,7 +218,7 @@ impl SessionSetup {
     ) {
         self.mark_failed(presenter, stage, error);
         self.delete_clone().await;
-        self.persist_status("failed");
+        self.persist_status(SessionSetupStatus::Failed);
         self.finish(presenter).await;
     }
 
@@ -232,7 +230,7 @@ impl SessionSetup {
         if self.plan.kind == SessionKind::Remote {
             self.delete_clone().await;
         }
-        self.persist_status("failed");
+        self.persist_status(SessionSetupStatus::Failed);
         self.finish(presenter).await;
     }
 
@@ -542,7 +540,7 @@ impl SessionSetup {
                 if self.plan.kind == SessionKind::Remote {
                     self.delete_clone().await;
                 }
-                self.persist_status("failed");
+                self.persist_status(SessionSetupStatus::Failed);
                 self.finish(presenter).await;
                 return;
             }
@@ -587,7 +585,7 @@ impl SessionSetup {
                 drop(session_guard);
                 tracing::error!(session_id = %session_id, error = %e, "Failed to resolve agent");
                 self.mark_failed(presenter, "resolve_agent", &e.to_string());
-                self.persist_status("failed");
+                self.persist_status(SessionSetupStatus::Failed);
                 self.finish(presenter).await;
                 return;
             }
@@ -601,7 +599,7 @@ impl SessionSetup {
                 drop(session_guard);
                 tracing::error!(session_id = %session_id, error = %e, "Runtime unsupported for session setup");
                 self.mark_failed(presenter, "ready", &e.to_string());
-                self.persist_status("failed");
+                self.persist_status(SessionSetupStatus::Failed);
                 self.finish(presenter).await;
                 return;
             }
@@ -630,7 +628,7 @@ impl SessionSetup {
                 drop(session_guard);
                 tracing::error!(session_id = %session_id, error = %e, "Invalid builtin configuration");
                 self.mark_failed(presenter, "ready", &e.to_string());
-                self.persist_status("failed");
+                self.persist_status(SessionSetupStatus::Failed);
                 self.finish(presenter).await;
                 return;
             }
@@ -690,14 +688,14 @@ impl SessionSetup {
                 if self.plan.kind == SessionKind::Remote {
                     self.delete_clone().await;
                 }
-                self.persist_status("failed");
+                self.persist_status(SessionSetupStatus::Failed);
             }
             Ok(Ok(summary)) => {
                 self.state(|s| s.set_ready(summary.clone()));
                 presenter.emit(SetupEventPayload::SetupComplete {
                     ready_summary: Box::new(summary),
                 });
-                self.persist_status("ready");
+                self.persist_status(SessionSetupStatus::Ready);
                 tracing::info!(session_id = %session_id, "Session setup complete");
             }
             Ok(Err(e)) => {
@@ -710,7 +708,7 @@ impl SessionSetup {
                 if self.plan.kind == SessionKind::Remote {
                     self.delete_clone().await;
                 }
-                self.persist_status("failed");
+                self.persist_status(SessionSetupStatus::Failed);
             }
             Err(_elapsed) => {
                 let msg = "ReadyEngine exceeded the 600s setup deadline".to_string();
@@ -719,7 +717,7 @@ impl SessionSetup {
                 if self.plan.kind == SessionKind::Remote {
                     self.delete_clone().await;
                 }
-                self.persist_status("failed");
+                self.persist_status(SessionSetupStatus::Failed);
             }
         }
 
@@ -916,7 +914,7 @@ mod tests {
         // The orchestrator persisted the terminal status to the session row
         // and the snapshot to disk — neither went through the frontend.
         let row = store.get_session("sess-clone-fail").unwrap().unwrap();
-        assert_eq!(row.setup_status, "failed");
+        assert_eq!(row.setup_status.as_str(), "failed");
         let snapshot_path = paths.session_setup_state_path("sess-clone-fail");
         assert!(
             snapshot_path.exists(),
@@ -992,7 +990,8 @@ mod tests {
                 .get_session("sess-cancelled-setup")
                 .unwrap()
                 .unwrap()
-                .setup_status,
+                .setup_status
+                .as_str(),
             "failed"
         );
         assert_eq!(
@@ -1175,7 +1174,8 @@ mod tests {
 
         let row = store.get_session("sess-local-not-ready").unwrap().unwrap();
         assert_eq!(
-            row.setup_status, "failed",
+            row.setup_status.as_str(),
+            "failed",
             "a summary with a failed required image stage must never persist as ready \
              (this is the exact regression B-1 fixed)"
         );

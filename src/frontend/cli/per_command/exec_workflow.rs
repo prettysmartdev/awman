@@ -14,8 +14,14 @@ use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
 use crate::data::workflow_state::PhaseKind;
 
 use crate::frontend::cli::command_frontend::CliFrontend;
+use crate::frontend::cli::CliParallelFrontend;
 
 impl ExecWorkflowCommandFrontend for CliFrontend {
+    /// `exec workflow` runs under the status chrome for parallel steps.
+    fn into_exec_workflow_frontend(self) -> Box<dyn ExecWorkflowCommandFrontend> {
+        Box::new(CliParallelFrontend::new(self))
+    }
+
     /// Take the terminal back from the exited container: stop the raw stdin
     /// reader and restore cooked mode before the step's result is printed.
     /// Agent steps get the same release from their terminal

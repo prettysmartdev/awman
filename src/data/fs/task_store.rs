@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::data::config::global::GlobalConfig;
 use crate::data::error::DataError;
+use crate::data::fs::config_file::write_config_file_atomically;
 
 /// A persisted scheduled squad task.
 ///
@@ -383,10 +384,8 @@ impl TaskStore {
     pub fn write_config(path: &Path, config: &GlobalConfig) -> Result<(), DataError> {
         let body = serde_json::to_string_pretty(config)
             .map_err(|source| DataError::ConfigSerialize { source })?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|error| DataError::io(parent, error))?;
-        }
-        std::fs::write(path, body).map_err(|error| DataError::io(path, error))
+        // Published by rename: the scheduler re-reads this file every tick.
+        write_config_file_atomically(path, &body)
     }
 
     /// Remove a task's own `config.json`. A file that is already absent is a
@@ -1195,6 +1194,35 @@ mod prerequisite_tests {
             "backoff_until": null, "created_at": now, "updated_at": now, "last_run_at": null
         }))
         .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_config_publishes_atomically_and_keeps_old_config_on_failure() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("task").join("config.json");
+        TaskStore::write_config(&path, &GlobalConfig::default()).unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let dir = path.parent().unwrap();
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let changed = GlobalConfig {
+            default_agent: Some("claude".into()),
+            ..GlobalConfig::default()
+        };
+        let result = TaskStore::write_config(&path, &changed);
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        TaskStore::write_config(&path, &changed).unwrap();
+        assert_ne!(std::fs::read_to_string(&path).unwrap(), before);
+        assert_eq!(
+            std::fs::read_dir(dir).unwrap().count(),
+            1,
+            "no temp file left"
+        );
     }
 
     #[test]

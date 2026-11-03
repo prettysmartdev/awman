@@ -90,10 +90,10 @@ pub fn render_container_maximized(
             .filter(|s| !s.is_empty())
             .or_else(|| {
                 tab.shared
-                    .workflow_state
-                    .lock()
-                    .ok()
-                    .and_then(|g| g.as_ref().and_then(|v| v.current_step.clone()))
+                    .workflow
+                    .snapshot()
+                    .view
+                    .and_then(|view| view.current_step)
             })
     };
     let left_title = match step_name {
@@ -586,7 +586,8 @@ mod tests {
 
         // The background step exits → its slot is evicted and the bar is gone.
         tab.shared
-            .container_slot_events
+            .container
+            .events
             .lock()
             .unwrap()
             .push_back(ContainerSlotEvent::Exited {

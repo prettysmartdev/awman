@@ -944,10 +944,7 @@ fn wi0149_prerequisite_flags_parse_identically_in_cli_tui_and_api() {
         cat,
     )
     .unwrap();
-    let api_typed = api
-        .clone()
-        .into_command_box_input(spec, vec!["exec".into(), "workflow".into()]);
-    assert_eq!(tui, api_typed);
+    assert_eq!(tui.args, api);
     for name in [
         "prerequisite-identity",
         "prerequisite-ssh",

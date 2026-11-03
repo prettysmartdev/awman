@@ -84,15 +84,11 @@ impl WorktreeLifecycleFrontend for TuiCommandFrontend {
         // The lifecycle returns early on Resume without calling
         // report_worktree_created, so publish the path here so the
         // bottom-bar context line shows "Worktree" immediately.
-        if let Ok(mut guard) = self.active_worktree_path.lock() {
-            *guard = Some(path.to_path_buf());
-        }
+        self.workflow.set_worktree_path(Some(path.to_path_buf()));
     }
 
     fn report_worktree_created(&mut self, path: &Path, branch: &str) {
-        if let Ok(mut guard) = self.active_worktree_path.lock() {
-            *guard = Some(path.to_path_buf());
-        }
+        self.workflow.set_worktree_path(Some(path.to_path_buf()));
         self.messages.info(format!(
             "Created worktree at {} on branch {}",
             path.display(),
@@ -235,17 +231,13 @@ impl WorktreeLifecycleFrontend for TuiCommandFrontend {
     }
 
     fn report_worktree_discarded(&mut self, branch: &str) {
-        if let Ok(mut guard) = self.active_worktree_path.lock() {
-            *guard = None;
-        }
+        self.workflow.set_worktree_path(None);
         self.messages
             .info(format!("Worktree for branch '{branch}' discarded"));
     }
 
     fn report_worktree_kept(&mut self, path: &Path, branch: &str) {
-        if let Ok(mut guard) = self.active_worktree_path.lock() {
-            *guard = None;
-        }
+        self.workflow.set_worktree_path(None);
         self.messages.info(format!(
             "Worktree kept at {} (branch: {branch})",
             path.display()

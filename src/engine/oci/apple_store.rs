@@ -321,9 +321,9 @@ fn transport_error(service: &str, route: &str, failure: XpcFailure) -> EngineErr
             "the Apple Containers service is not running ({service} is not registered). Start it \
              with `container system start` and run `awman ready` again."
         )),
-        XpcFailure::Interrupted => EngineError::Network(format!(
-            "the Apple Containers service {service} went away during `{route}`"
-        )),
+        XpcFailure::Interrupted => crate::engine::error::ImageRetryClass::Transient.failure(
+            format!("the Apple Containers service {service} went away during `{route}`"),
+        ),
         XpcFailure::Stopped => crate::engine::oci::retry::cancelled(),
         XpcFailure::TimedOut => {
             EngineError::Network("image acquisition exceeded its deadline".into())
@@ -388,7 +388,7 @@ fn call(
             "notFound" => {
                 EngineError::Config(format!("Apple Containers `{route}` failed: {message}"))
             }
-            "interrupted" => EngineError::Network(format!(
+            "interrupted" => crate::engine::error::ImageRetryClass::Transient.failure(format!(
                 "Apple Containers `{route}` was interrupted: {message}"
             )),
             _ => EngineError::AppleImageStoreFailed {

@@ -1,13 +1,6 @@
 //! Presentation helpers for the TUI git sidebar.
 
-use std::path::Path;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
-
-use tokio::task::JoinHandle;
-use tokio_util::sync::CancellationToken;
-
-use crate::engine::git::{GitDiffSummary, GitEngine};
+use crate::engine::git::GitDiffSummary;
 
 /// Sidebar open/close state, stored on the `Tab`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,38 +45,6 @@ pub fn sidebar_title(summary: &Option<GitDiffSummary>) -> String {
         0 => format!("{branch}: clean"),
         n => format!("{branch}: {n} changed"),
     }
-}
-
-/// Spawn the background diff-polling task.
-///
-/// Every ~2 seconds the task asks [`GitEngine::diff_summary`] for a snapshot
-/// and replaces the shared value. On failure (not a repo, git missing) it
-/// stores `None`. The engine owns all git process and file I/O; this function
-/// only schedules the refresh and publishes the result for rendering.
-pub fn start_git_diff_poll_task(
-    root: std::path::PathBuf,
-    git_engine: Arc<GitEngine>,
-    summary: Arc<Mutex<Option<GitDiffSummary>>>,
-    cancel: CancellationToken,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        loop {
-            if cancel.is_cancelled() {
-                break;
-            }
-
-            let next = git_engine.diff_summary(Path::new(&root)).ok();
-            if let Ok(mut guard) = summary.lock() {
-                *guard = next;
-            }
-
-            // Sleep ~2s, but wake immediately on cancellation.
-            tokio::select! {
-                _ = cancel.cancelled() => break,
-                _ = tokio::time::sleep(Duration::from_secs(2)) => {}
-            }
-        }
-    })
 }
 
 #[cfg(test)]

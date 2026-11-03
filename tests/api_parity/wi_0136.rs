@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 
 use awman::command::commands::api_server::event_bus::EventBus;
 use awman::command::dispatch::Engines;
+use awman::data::command_status::CommandStatus;
 use awman::data::execution_event::{EventPayload, ExecutionEvent};
 use awman::data::fs::api_command_log::CommandLogWriter;
 use awman::data::fs::api_db::{NewSessionRow, SqliteSessionStore};
@@ -161,7 +162,7 @@ impl Attempt {
         self.writer.await.unwrap();
         state
             .store
-            .complete_command(id, "done", Some(0), None)
+            .complete_command(id, CommandStatus::Done, Some(0), None)
             .unwrap();
         state.event_buses.lock().await.remove(id);
     }
@@ -359,7 +360,7 @@ async fn queued_command_waiting_past_300s_keeps_the_stream_open_with_15s_keepali
 
         // The row is still queued: no Done was fabricated.
         let row = state.store.get_command("queued").unwrap().unwrap();
-        assert_eq!(row.status, "queued");
+        assert_eq!(row.status.as_str(), "queued");
 
         // A worker finally claims it; the same connection sees real output
         // and exactly one terminal Done.
@@ -736,7 +737,7 @@ async fn a_pre_attempt_events_log_streams_as_attempt_one() {
     state.store.claim_next_command("w").unwrap().unwrap();
     state
         .store
-        .complete_command("legacy", "done", Some(0), None)
+        .complete_command("legacy", CommandStatus::Done, Some(0), None)
         .unwrap();
     // Lines as an older awman wrote them: no `attempt` field.
     let legacy = [
@@ -1039,14 +1040,20 @@ async fn delayed_persistence_repairs_attach_and_broadcast_lag_before_completion(
         .await;
         // Recovery must happen while running, not merely in final replay.
         assert_eq!(
-            state.store.get_command("gap").unwrap().unwrap().status,
+            state
+                .store
+                .get_command("gap")
+                .unwrap()
+                .unwrap()
+                .status
+                .as_str(),
             "running"
         );
         bus.sender().emit(EventPayload::Done);
         writer.await.unwrap();
         state
             .store
-            .complete_command("gap", "done", Some(0), None)
+            .complete_command("gap", CommandStatus::Done, Some(0), None)
             .unwrap();
         let tail = client.all().await;
         assert_eq!(ids(&tail), ["1:101"]);
@@ -1077,7 +1084,13 @@ async fn unrecoverable_live_gap_closes_without_advancing_cursor_or_done() {
     assert!(ids(&frames).is_empty());
     assert_eq!(count_done(&frames), 0);
     assert_eq!(
-        state.store.get_command("missing").unwrap().unwrap().status,
+        state
+            .store
+            .get_command("missing")
+            .unwrap()
+            .unwrap()
+            .status
+            .as_str(),
         "running"
     );
 }

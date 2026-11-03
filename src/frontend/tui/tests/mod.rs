@@ -27,7 +27,7 @@ mod render_tests;
 /// invent a command path" guard has one allowlisted call site instead of six.
 pub(crate) fn test_command_frontend(
     path: &[&str],
-    flags: std::collections::BTreeMap<String, crate::command::dispatch::parsed_input::FlagValue>,
+    args: crate::command::dispatch::projections::raw_args::ParsedArgs,
 ) -> (
     crate::frontend::tui::command_frontend::TuiCommandFrontend,
     std::sync::mpsc::Receiver<crate::frontend::tui::dialogs::DialogRequest>,
@@ -56,8 +56,7 @@ pub(crate) fn test_command_frontend(
     let frontend = TuiCommandFrontend::new(
         ParsedCommandBoxInput {
             path: path.iter().map(|s| s.to_string()).collect(),
-            flags,
-            arguments: Default::default(),
+            args,
         },
         DialogChannels::new(req_tx, resp_rx),
         container_io,
@@ -123,11 +122,10 @@ fn activate_workflow_context(app: &mut App, path: &str) {
     app.active_tab_mut().execution_phase = crate::frontend::tui::tabs::ExecutionPhase::Running {
         command: "exec workflow".into(),
     };
-    *app.active_tab()
+    app.active_tab()
         .shared
-        .workflow_context_path
-        .lock()
-        .unwrap() = Some(path.into());
+        .workflow
+        .set_context_path(Some(path.into()));
 }
 
 fn press_char(app: &mut App, c: char) {

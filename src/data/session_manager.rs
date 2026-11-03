@@ -609,7 +609,7 @@ mod tests {
         }
         // All sessions should have 'active' status.
         for record in &records {
-            assert_eq!(record.status, "active");
+            assert_eq!(record.status.as_str(), "active");
         }
     }
 }

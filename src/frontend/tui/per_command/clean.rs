@@ -24,10 +24,7 @@ impl CleanCommandFrontend for TuiCommandFrontend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
-
     use crate::command::commands::clean::{CleanContainer, CleanSummary};
-    use crate::command::dispatch::parsed_input::FlagValue;
     use crate::frontend::tui::dialogs::{DialogRequest, DialogResponse};
 
     fn make_tui_frontend() -> (
@@ -35,17 +32,7 @@ mod tests {
         std::sync::mpsc::Receiver<DialogRequest>,
         std::sync::mpsc::Sender<DialogResponse>,
     ) {
-        make_tui_frontend_with_flags(BTreeMap::new())
-    }
-
-    fn make_tui_frontend_with_flags(
-        flags: BTreeMap<String, FlagValue>,
-    ) -> (
-        TuiCommandFrontend,
-        std::sync::mpsc::Receiver<DialogRequest>,
-        std::sync::mpsc::Sender<DialogResponse>,
-    ) {
-        crate::frontend::tui::tests::test_command_frontend(&["clean"], flags)
+        crate::frontend::tui::tests::test_command_frontend(&["clean"], Default::default())
     }
 
     fn sample_summary() -> CleanSummary {

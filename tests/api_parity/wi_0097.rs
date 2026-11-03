@@ -35,6 +35,7 @@ use awman::data::fs::api_paths::ApiPaths;
 use awman::data::fs::auth_paths::AuthPathResolver;
 use awman::data::session::SessionKind;
 use awman::data::session_setup_event::SessionSetupStatus;
+use awman::data::session_status::SessionStatus;
 use awman::data::WorkflowStateStore;
 use awman::engine::agent::AgentEngine;
 use awman::engine::auth::AuthEngine;
@@ -685,7 +686,7 @@ async fn real_network_create_command_closing_session_returns_409() {
         .unwrap();
     state
         .store
-        .update_session_status("closing-sess", "closing")
+        .update_session_status("closing-sess", SessionStatus::Closing)
         .unwrap();
 
     let resp = reqwest::Client::new()

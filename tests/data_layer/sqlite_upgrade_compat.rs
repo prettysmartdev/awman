@@ -4,7 +4,9 @@
 //! records correctly, and satisfies the on-disk compatibility requirement
 //! from WI 0073 §1 (opens databases written by prior awman releases).
 
+use awman::data::command_status::CommandStatus;
 use awman::data::fs::api_db::SqliteSessionStore;
+use awman::data::session_status::SessionStatus;
 
 use crate::helpers::IsolatedEnv;
 
@@ -49,7 +51,7 @@ fn insert_and_get_session_roundtrip() {
     assert_eq!(rec.id, "sess-1");
     assert_eq!(rec.workdir, "/work/dir");
     assert_eq!(rec.created_at, "2026-01-01T00:00:00Z");
-    assert_eq!(rec.status, "active");
+    assert_eq!(rec.status.as_str(), "active");
     assert!(rec.closed_at.is_none());
 }
 
@@ -91,7 +93,7 @@ fn close_session_updates_status() {
     assert!(changed);
 
     let rec = store.get_session("sess-1").unwrap().expect("exists");
-    assert_eq!(rec.status, "closed");
+    assert_eq!(rec.status.as_str(), "closed");
     assert_eq!(rec.closed_at.as_deref(), Some("2026-01-02T00:00:00Z"));
 }
 
@@ -140,11 +142,15 @@ fn list_sessions_by_status_filters_correctly() {
         .unwrap();
     store.close_session("b", "2026-01-02T00:00:00Z").unwrap();
 
-    let active = store.list_sessions_by_status(Some("active")).unwrap();
+    let active = store
+        .list_sessions_by_status(Some(SessionStatus::Active))
+        .unwrap();
     assert_eq!(active.len(), 1);
     assert_eq!(active[0].id, "a");
 
-    let closed = store.list_sessions_by_status(Some("closed")).unwrap();
+    let closed = store
+        .list_sessions_by_status(Some(SessionStatus::Closed))
+        .unwrap();
     assert_eq!(closed.len(), 1);
     assert_eq!(closed[0].id, "b");
 }
@@ -173,7 +179,7 @@ fn insert_and_get_command_roundtrip() {
     assert_eq!(rec.session_id, "sess-1");
     assert_eq!(rec.subcommand, "exec");
     // New writes are queued; pending is accepted only for legacy rows.
-    assert_eq!(rec.status, "queued");
+    assert_eq!(rec.status.as_str(), "queued");
     assert!(rec.exit_code.is_none());
 }
 
@@ -191,13 +197,18 @@ fn update_command_started_and_finished_reflects_change() {
         .update_command_started("cmd-1", "2026-01-01T00:01:00Z")
         .unwrap();
     let rec = store.get_command("cmd-1").unwrap().expect("exists");
-    assert_eq!(rec.status, "running");
+    assert_eq!(rec.status.as_str(), "running");
 
     store
-        .update_command_finished("cmd-1", "done", Some(0), "2026-01-01T00:02:00Z")
+        .update_command_finished(
+            "cmd-1",
+            CommandStatus::Done,
+            Some(0),
+            "2026-01-01T00:02:00Z",
+        )
         .unwrap();
     let rec = store.get_command("cmd-1").unwrap().expect("exists");
-    assert_eq!(rec.status, "done");
+    assert_eq!(rec.status.as_str(), "done");
     assert_eq!(rec.exit_code, Some(0));
     assert!(rec.finished_at.is_some());
 }
@@ -217,7 +228,12 @@ fn has_running_command_reflects_state() {
 
     // Finish the command.
     store
-        .update_command_finished("cmd-a", "done", Some(0), "2026-01-01T00:02:00Z")
+        .update_command_finished(
+            "cmd-a",
+            CommandStatus::Done,
+            Some(0),
+            "2026-01-01T00:02:00Z",
+        )
         .unwrap();
     assert!(!store.has_running_command_for_session("sess-1").unwrap());
 }

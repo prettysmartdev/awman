@@ -56,7 +56,7 @@ impl HasAgentFrontend for TuiCommandFrontend {
             Some(io) => Box::new(super::TuiContainerProxy::with_io(
                 self.status_log.clone(),
                 io,
-                self.container_name_shared.clone(),
+                (!self.parallel_group_active).then(|| self.container.clone()),
             )),
             None => Box::new(super::TuiContainerProxy::new(self.status_log.clone())),
         }
@@ -94,8 +94,9 @@ impl crate::command::commands::agent_setup::AgentLaunchFrontend for TuiCommandFr
             tokio::sync::broadcast::Sender<crate::engine::agent_runtime::StuckEvent>,
         >,
     ) {
-        if let Ok(mut guard) = self.stuck_sender_shared.lock() {
-            *guard = Some(sender);
-        }
+        self.container
+            .attach_engine(crate::engine::workflow::frontend::EngineHandles::stuck(
+                sender,
+            ));
     }
 }

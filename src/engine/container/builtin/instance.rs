@@ -17,6 +17,7 @@ pub struct LaunchPlan {
     pub persistent_stdin: bool,
     pub seeded_prompt: Option<String>,
     pub leases: Vec<crate::engine::credential_refresh::CredentialLease>,
+    pub prompt_files: Vec<crate::engine::container::options::PromptFileGuard>,
     pub image_lease: std::fs::File,
 }
 pub struct Instance {
@@ -81,6 +82,7 @@ impl Instance {
                 persistent_stdin: persistent,
                 seeded_prompt: self.plan.seeded_prompt,
                 leases: self.plan.leases,
+                prompt_files: self.plan.prompt_files,
                 io,
             })
             .run(frontend)?;

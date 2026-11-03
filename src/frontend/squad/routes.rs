@@ -70,7 +70,7 @@ async fn auth_middleware(
     next: axum::middleware::Next,
 ) -> Response {
     if let Some(rejection) = check_bearer_auth(
-        &state.handles.engines().auth_engine,
+        state.handles.engines(),
         &state.handles.auth_mode(),
         req.headers(),
     ) {

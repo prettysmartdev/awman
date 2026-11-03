@@ -2,7 +2,7 @@
 
 ## Overview
 
-awman follows a **four-layer architecture** that separates data, business logic, command dispatch, and presentation. This design ensures functional parity across three frontend modalities (CLI, TUI, API) while maintaining code health and enabling future frontend implementations.
+awman follows a **four-layer architecture** that separates data, business logic, command dispatch, and presentation. This design ensures functional parity across four frontend adapters (CLI, TUI, API, squad) while maintaining code health and enabling future frontend implementations.
 
 Pattern: single statically-linked binary
 
@@ -26,7 +26,7 @@ Strict unidirectional dependencies between layers prevent cross-cutting concerns
 │  Layer 4: Binary                    │ src/main.rs
 │  (Entry point only)                 │
 ├─────────────────────────────────────┤
-│  Layer 3: Frontends                 │ src/frontend/{cli,tui,api}
+│  Layer 3: Frontends                 │ src/frontend/{cli,tui,api,squad}
 │  (Presentation + Input, no logic)   │
 ├─────────────────────────────────────┤
 │  Layer 2: Command                   │ src/command/
@@ -55,11 +55,13 @@ Strict unidirectional dependencies between layers prevent cross-cutting concerns
 - Git operations (init, worktree, merge)
 - Overlay management (mounts, env vars, auth)
 - Authentication and TLS
+- Squad scheduling, OCI acquisition, ACP transport, and credential refresh; the complete current module list is in the grand architecture’s Layer 1 section.
 
 **Constraint**: Imports from Layer 0 + `crate::engine::*` only
 
 ### Layer 2: Command (`src/command/`)
-- Command dispatch and routing
+- Command dispatch and routing through the catalogue-driven build table
+- `Startup` orders initialization, `Engines` assembles engine handles, and `HeadlessDefaults` supplies unattended answer profiles.
 - Business logic for each command (`init`, `ready`, `exec`, `chat`, etc.)
 - Workflow step execution coordination
 - Error handling and user messaging
@@ -70,6 +72,7 @@ Strict unidirectional dependencies between layers prevent cross-cutting concerns
 - CLI (clap-based command-line interface)
 - TUI (Ratatui-based terminal UI)
 - API (HTTP API server)
+- Squad (HTTP adapter over the squad daemon runtime)
 
 **Constraint**: Frontends are presentation-only. All business logic lives in Layer 2. Frontends communicate with lower layers via traits that delegate user input and receive outcomes for display.
 
@@ -80,7 +83,7 @@ Strict unidirectional dependencies between layers prevent cross-cutting concerns
 
 ### Layer 4: Binary (`src/main.rs`)
 - Single entry point
-- Sets up chosen frontend (CLI, TUI, or API)
+- Sets up chosen frontend (CLI, TUI, API, or squad)
 - Delegates to frontend for all functionality
 
 ## High-level Data Flow

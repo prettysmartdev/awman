@@ -1,21 +1,26 @@
 //! Sqlite-backed persistence for API-mode session and command metadata.
 //!
-//! Schema parity with `oldsrc/commands/headless/db.rs` is preserved so that
-//! existing on-disk databases written by prior awman releases can be opened
-//! by the new store without losing state.
+//! The established schema is preserved so that existing on-disk databases
+//! written by prior awman releases can be opened without losing state.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::Mutex;
 
-use rusqlite::{params, params_from_iter, types::Value, Connection, OptionalExtension};
+use rusqlite::{
+    params, params_from_iter,
+    types::{Type, Value},
+    Connection, OptionalExtension,
+};
 
+use crate::data::command_status::{CommandCompletion, CommandStatus};
 use crate::data::error::DataError;
 use crate::data::execution_event::FIRST_ATTEMPT;
 use crate::data::fs::api_labels::{LabelSelector, Labels};
 use crate::data::fs::api_paths::ApiPaths;
 use crate::data::session::SessionKind;
 use crate::data::session_setup_event::SessionSetupStatus;
+use crate::data::session_status::SessionStatus;
 
 /// Persistable session metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,13 +28,11 @@ pub struct SessionRecord {
     pub id: String,
     pub workdir: String,
     pub created_at: String,
-    pub status: String,
+    pub status: SessionStatus,
     pub closed_at: Option<String>,
-    /// Async setup status, one of `initializing`, `cloning_repository`,
-    /// `setting_up_branch`, `merging_refs`, `running_ready`, `ready`, `failed`. Set on
-    /// session creation; updated by the setup task; consulted by the
-    /// job-submission guard and the server-restart cleanup.
-    pub setup_status: String,
+    /// Async setup status. Set on session creation; updated by the setup task;
+    /// consulted by the job-submission guard and the server-restart cleanup.
+    pub setup_status: SessionSetupStatus,
     /// Session type — `local` (workdir mount) or `remote` (cloned repo).
     pub session_type: String,
     /// For `remote` sessions, the resolved clone destination on disk so that
@@ -102,7 +105,9 @@ pub struct CommandRecord {
     pub session_id: String,
     pub subcommand: String,
     pub args: String,
-    pub status: String,
+    /// Never [`CommandStatus::Pending`]: the store reads that legacy spelling
+    /// as `Queued`.
+    pub status: CommandStatus,
     pub exit_code: Option<i32>,
     pub started_at: Option<String>,
     pub finished_at: Option<String>,
@@ -113,6 +118,27 @@ pub struct CommandRecord {
     /// Which execution of the command this is (1-based). A re-queue after a
     /// daemon restart increments it.
     pub attempt: u32,
+}
+
+/// Rows used to build the session queue read model. Query order is the store's
+/// established newest-first order; Layer 2 assigns the public positions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionQueueRecords {
+    pub queue_depth: i64,
+    pub running: Option<CommandRecord>,
+    pub recent: Vec<CommandRecord>,
+}
+
+impl CommandRecord {
+    /// Decode the stored `args` column, the queue boundary's one decoder.
+    pub fn decode_args(&self) -> Result<Vec<String>, DataError> {
+        serde_json::from_str(&self.args).map_err(|e| {
+            DataError::Other(format!(
+                "command {}: stored args are not a JSON string array: {e}",
+                self.id
+            ))
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -132,18 +158,10 @@ impl LabelOwner {
 #[derive(Debug, Clone, Default)]
 pub struct CommandListFilter<'a> {
     pub session_id: Option<&'a str>,
-    pub status: Option<&'a str>,
+    /// `Pending` and `Queued` select the same rows.
+    pub status: Option<CommandStatus>,
     pub labels: &'a [LabelSelector],
     pub limit: i64,
-}
-
-/// Keep the retired status spelling usable as a list-filter alias.
-fn normalize_command_status_filter(status: &str) -> &str {
-    if status == "pending" {
-        "queued"
-    } else {
-        status
-    }
 }
 
 pub const IDEMPOTENCY_TTL_HOURS: u64 = 24;
@@ -336,6 +354,8 @@ pub mod failure_codes {
     pub const ABORTED: &str = "aborted";
     /// The workflow paused and can be resumed.
     pub const PAUSED: &str = "paused";
+    /// The stored queue row could not be decoded, so the command never ran.
+    pub const INVALID_QUEUE_RECORD: &str = "invalid_queue_record";
     /// Anything the worker could not classify (a panic, a missing session).
     pub const INTERNAL: &str = "internal";
 }
@@ -646,19 +666,34 @@ impl SqliteSessionStore {
     /// any setup_state.json is written.
     pub fn insert_session_full(&self, row: NewSessionRow<'_>) -> Result<(), DataError> {
         let conn = self.lock();
-        conn.execute(
-            "INSERT INTO sessions \
-                 (id, workdir, created_at, status, setup_status, session_type, cloned_path) \
-                 VALUES (?1, ?2, ?3, 'active', ?4, ?5, ?6)",
-            params![
-                row.id,
-                row.workdir,
-                row.created_at,
-                row.setup_status.as_str(),
-                row.kind.as_str(),
-                row.cloned_path
-            ],
+        insert_session_row(&conn, row)
+    }
+
+    /// Publish the provisional session and its rollback barrier atomically.
+    /// Until admission finishes, a crash or failed metadata write cannot turn
+    /// this row into an accepted response or release its reservation.
+    pub fn insert_session_for_admission(
+        &self,
+        row: NewSessionRow<'_>,
+        scope: IdempotencyScope<'_>,
+        key: &str,
+        owner: IdempotencyOwner<'_>,
+    ) -> Result<(), DataError> {
+        let mut conn = self.lock();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let changed = tx.execute(
+            "UPDATE idempotency_keys SET intent_status=NULL,intent_body=NULL,
+                resource_kind='compensating_session',resource_id=?5
+             WHERE scope=?1 AND key=?2 AND owner_instance=?3 AND owner_request=?4 AND status IS NULL",
+            params![scope.key(), key, owner.instance, owner.request, row.id],
         )?;
+        if changed != 1 {
+            return Err(DataError::Other(
+                "Idempotency reservation lost before session insertion".into(),
+            ));
+        }
+        insert_session_row(&tx, row)?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -697,11 +732,15 @@ impl SqliteSessionStore {
 
     /// Update the setup_status for a session. Returns true if the row was
     /// updated (i.e. the session exists).
-    pub fn update_setup_status(&self, id: &str, setup_status: &str) -> Result<bool, DataError> {
+    pub fn update_setup_status(
+        &self,
+        id: &str,
+        setup_status: SessionSetupStatus,
+    ) -> Result<bool, DataError> {
         let conn = self.lock();
         let affected = conn.execute(
             "UPDATE sessions SET setup_status = ?1 WHERE id = ?2",
-            params![setup_status, id],
+            params![setup_status.as_str(), id],
         )?;
         Ok(affected > 0)
     }
@@ -731,8 +770,8 @@ impl SqliteSessionStore {
         session_id: &str,
     ) -> Result<SessionCommandAdmission, DataError> {
         Ok(match self.get_session(session_id)? {
-            Some(s) if s.status == "active" => SessionCommandAdmission::Accepted,
-            Some(s) if s.status == "closing" => SessionCommandAdmission::Closing,
+            Some(s) if s.status == SessionStatus::Active => SessionCommandAdmission::Accepted,
+            Some(s) if s.status == SessionStatus::Closing => SessionCommandAdmission::Closing,
             Some(_) => SessionCommandAdmission::Closed,
             None => SessionCommandAdmission::NotFound,
         })
@@ -756,7 +795,7 @@ impl SqliteSessionStore {
 
     pub fn list_sessions_by_status(
         &self,
-        status: Option<&str>,
+        status: Option<SessionStatus>,
     ) -> Result<Vec<SessionRecord>, DataError> {
         let Some(status) = status else {
             return self.list_sessions();
@@ -768,7 +807,7 @@ impl SqliteSessionStore {
                     repo_url, branch, base_ref, merge_refs, push \
              FROM sessions WHERE status = ?1 ORDER BY created_at",
         )?;
-        let rows = stmt.query_map(params![status], session_record_from_row)?;
+        let rows = stmt.query_map(params![status.as_str()], session_record_from_row)?;
         let mut result = Vec::new();
         for row in rows {
             result.push(row?);
@@ -851,8 +890,8 @@ impl SqliteSessionStore {
 
     pub fn list_sessions_filtered(
         &self,
-        status: Option<&str>,
-        setup_status: Option<&str>,
+        status: Option<SessionStatus>,
+        setup_status: Option<SessionSetupStatus>,
         labels: &[LabelSelector],
     ) -> Result<Vec<SessionRecord>, DataError> {
         let mut sql = String::from(
@@ -861,11 +900,11 @@ impl SqliteSessionStore {
         let mut args: Vec<Value> = Vec::new();
         if let Some(status) = status {
             sql.push_str(" AND s.status=?");
-            args.push(Value::from(status.to_owned()));
+            args.push(Value::from(status.as_str().to_owned()));
         }
         if let Some(setup_status) = setup_status {
             sql.push_str(" AND s.setup_status=?");
-            args.push(Value::from(setup_status.to_owned()));
+            args.push(Value::from(setup_status.as_str().to_owned()));
         }
         append_label_predicates(&mut sql, &mut args, "session", "s.id", labels);
         sql.push_str(" ORDER BY s.created_at");
@@ -889,11 +928,11 @@ impl SqliteSessionStore {
             args.push(Value::from(session.to_owned()));
         }
         if let Some(status) = filter.status {
-            if normalize_command_status_filter(status) == "queued" {
+            if status.canonical() == CommandStatus::Queued {
                 sql.push_str(" AND c.status IN ('queued','pending')");
             } else {
                 sql.push_str(" AND c.status=?");
-                args.push(Value::from(status.to_owned()));
+                args.push(Value::from(status.as_str().to_owned()));
             }
         }
         append_label_predicates(&mut sql, &mut args, "command", "c.id", filter.labels);
@@ -1033,14 +1072,14 @@ impl SqliteSessionStore {
     pub fn update_command_finished(
         &self,
         id: &str,
-        status: &str,
+        status: CommandStatus,
         exit_code: Option<i32>,
         finished_at: &str,
     ) -> Result<(), DataError> {
         let conn = self.lock();
         conn.execute(
             "UPDATE commands SET status = ?1, exit_code = ?2, finished_at = ?3 WHERE id = ?4",
-            params![status, exit_code, finished_at, id],
+            params![status.as_str(), exit_code, finished_at, id],
         )?;
         Ok(())
     }
@@ -1099,6 +1138,32 @@ impl SqliteSessionStore {
             "DELETE FROM idempotency_keys WHERE created_at < ?1",
             params![ttl_cutoff],
         )?;
+        // A failed admission must finish compensation before this key can
+        // create another session, including after a daemon restart.
+        let compensating: Option<(String, bool)> = tx
+            .query_row(
+                "SELECT request_hash, EXISTS(SELECT 1 FROM sessions
+                WHERE id=resource_id AND status!='closed')
+             FROM idempotency_keys WHERE scope=?1 AND key=?2
+                AND resource_kind='compensating_session'",
+                params![scope, key],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        if let Some((old_hash, pending)) = compensating {
+            if pending {
+                tx.commit()?;
+                return Ok(if old_hash == request_hash {
+                    IdempotencyBegin::InFlight
+                } else {
+                    IdempotencyBegin::Mismatch
+                });
+            }
+            tx.execute(
+                "DELETE FROM idempotency_keys WHERE scope=?1 AND key=?2",
+                params![scope, key],
+            )?;
+        }
         // An admitted request's recorded response wins over any liveness rule.
         admitted_intent_to_response(&tx, &scope, key)?;
         type ExistingAdmission = (String, Option<u16>, Option<String>, Option<String>);
@@ -1194,8 +1259,16 @@ impl SqliteSessionStore {
         let conn = self.lock();
         let changed = conn.execute(
             "UPDATE idempotency_keys SET status=?5,body=?6
-             WHERE scope=?1 AND key=?2 AND owner_instance=?3 AND owner_request=?4 AND status IS NULL",
-            params![scope.key(), key, owner.instance, owner.request, status, body],
+             WHERE scope=?1 AND key=?2 AND owner_instance=?3 AND owner_request=?4 AND status IS NULL
+                AND resource_kind IS NOT 'compensating_session'",
+            params![
+                scope.key(),
+                key,
+                owner.instance,
+                owner.request,
+                status,
+                body
+            ],
         )?;
         Ok(changed > 0)
     }
@@ -1213,10 +1286,32 @@ impl SqliteSessionStore {
         let conn = self.lock();
         conn.execute(
             "DELETE FROM idempotency_keys
-             WHERE scope=?1 AND key=?2 AND owner_instance=?3 AND owner_request=?4 AND status IS NULL",
+             WHERE scope=?1 AND key=?2 AND owner_instance=?3 AND owner_request=?4 AND status IS NULL
+                AND (resource_kind IS NOT 'compensating_session' OR NOT EXISTS
+                    (SELECT 1 FROM sessions WHERE id=resource_id AND status!='closed'))",
             params![scope.key(), key, owner.instance, owner.request],
         )?;
         Ok(())
+    }
+
+    /// Void the accepted intent before asynchronous rollback. Keep a durable
+    /// barrier until this session is closed; an interrupted rollback is never
+    /// mistaken for a successful admission or a request that created nothing.
+    pub fn idempotency_compensating_session(
+        &self,
+        scope: IdempotencyScope<'_>,
+        key: &str,
+        owner: IdempotencyOwner<'_>,
+        session_id: &str,
+    ) -> Result<bool, DataError> {
+        let conn = self.lock();
+        let changed = conn.execute(
+            "UPDATE idempotency_keys SET intent_status=NULL,intent_body=NULL,
+                resource_kind='compensating_session',resource_id=?5
+             WHERE scope=?1 AND key=?2 AND owner_instance=?3 AND owner_request=?4 AND status IS NULL",
+            params![scope.key(), key, owner.instance, owner.request, session_id],
+        )?;
+        Ok(changed > 0)
     }
 
     /// Like [`Self::idempotency_release`], for a request that ended without
@@ -1244,7 +1339,9 @@ impl SqliteSessionStore {
             .is_some();
         if owned && !admitted_intent_to_response(&tx, &scope, key)? {
             tx.execute(
-                "DELETE FROM idempotency_keys WHERE scope=?1 AND key=?2 AND status IS NULL",
+                "DELETE FROM idempotency_keys WHERE scope=?1 AND key=?2 AND status IS NULL
+                    AND (resource_kind IS NOT 'compensating_session' OR NOT EXISTS
+                        (SELECT 1 FROM sessions WHERE id=resource_id AND status!='closed'))",
                 params![scope, key],
             )?;
         }
@@ -1350,7 +1447,7 @@ impl SqliteSessionStore {
     pub fn complete_command(
         &self,
         id: &str,
-        status: &str,
+        status: CommandStatus,
         exit_code: Option<i32>,
         result_json: Option<&str>,
     ) -> Result<(), DataError> {
@@ -1359,9 +1456,33 @@ impl SqliteSessionStore {
         conn.execute(
             "UPDATE commands SET status = ?1, exit_code = ?2, finished_at = COALESCE(finished_at, ?3), result = ?4
              WHERE id = ?5",
-            params![status, exit_code, now, result_json, id],
+            params![status.as_str(), exit_code, now, result_json, id],
         )?;
         Ok(())
+    }
+
+    /// Finalize a row left `running` from its terminal sidecar, keeping the
+    /// recorded finish time. Only the attempt that wrote the sidecar qualifies;
+    /// returns whether the row changed.
+    pub fn finalize_running_command(
+        &self,
+        id: &str,
+        completion: &CommandCompletion,
+    ) -> Result<bool, DataError> {
+        let conn = self.lock();
+        let changed = conn.execute(
+            "UPDATE commands SET status = ?1, exit_code = ?2, finished_at = ?3, result = ?4
+             WHERE id = ?5 AND status = 'running' AND attempt = ?6",
+            params![
+                completion.status.as_str(),
+                completion.exit_code,
+                completion.finished_at,
+                completion.result_json,
+                id,
+                completion.attempt
+            ],
+        )?;
+        Ok(changed > 0)
     }
 
     pub fn list_commands_for_session(
@@ -1384,6 +1505,18 @@ impl SqliteSessionStore {
             result.push(row?);
         }
         Ok(result)
+    }
+
+    /// Load the persisted rows needed by the session queue read model.
+    pub fn session_queue_records(
+        &self,
+        session_id: &str,
+    ) -> Result<SessionQueueRecords, DataError> {
+        Ok(SessionQueueRecords {
+            queue_depth: self.count_queued_for_session(session_id)?,
+            running: self.running_command_for_session(session_id)?,
+            recent: self.list_commands_for_session(session_id, 100)?,
+        })
     }
 
     pub fn count_queued_for_session(&self, session_id: &str) -> Result<i64, DataError> {
@@ -1418,22 +1551,16 @@ impl SqliteSessionStore {
     pub fn cancel_queued_for_session(&self, session_id: &str) -> Result<Vec<String>, DataError> {
         let now = chrono::Utc::now().to_rfc3339();
         let conn = self.lock();
-        // First get the IDs
-        let ids: Vec<String> = {
-            let mut stmt = conn.prepare(
-                "SELECT id FROM commands WHERE session_id = ?1 AND status IN ('queued','pending')",
-            )?;
-            let rows = stmt
-                .query_map(params![session_id], |row| row.get(0))?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            rows
-        };
-        // Then update
-        conn.execute(
+        // One statement, so the returned IDs are exactly the rows cancelled. An
+        // older writer can insert `pending` after this store's startup migration.
+        let mut stmt = conn.prepare(
             "UPDATE commands SET status = 'cancelled', finished_at = ?1
-             WHERE session_id = ?2 AND status = 'queued'",
-            params![now, session_id],
+             WHERE session_id = ?2 AND status IN ('queued','pending')
+             RETURNING id",
         )?;
+        let ids = stmt
+            .query_map(params![now, session_id], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?;
         Ok(ids)
     }
 
@@ -1481,12 +1608,16 @@ impl SqliteSessionStore {
         Ok(position)
     }
 
-    /// Update a session's status to an arbitrary value (e.g. 'closing').
-    pub fn update_session_status(&self, id: &str, status: &str) -> Result<bool, DataError> {
+    /// Update a session's status.
+    pub fn update_session_status(
+        &self,
+        id: &str,
+        status: SessionStatus,
+    ) -> Result<bool, DataError> {
         let conn = self.lock();
         let affected = conn.execute(
             "UPDATE sessions SET status = ?1 WHERE id = ?2",
-            params![status, id],
+            params![status.as_str(), id],
         )?;
         Ok(affected > 0)
     }
@@ -1505,14 +1636,33 @@ impl SqliteSessionStore {
     }
 }
 
+/// Read a status column through its enum's `parse`. An unknown stored value is
+/// an error naming the column and value, never a default: the row's real state
+/// is unknown, and guessing could rerun or abandon its work.
+fn status_column<T>(
+    row: &rusqlite::Row<'_>,
+    index: usize,
+    column: &str,
+    parse: impl FnOnce(&str) -> Option<T>,
+) -> rusqlite::Result<T> {
+    let value: String = row.get(index)?;
+    parse(&value).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            index,
+            Type::Text,
+            format!("unknown {column} value {value:?}").into(),
+        )
+    })
+}
+
 fn session_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
     Ok(SessionRecord {
         id: row.get(0)?,
         workdir: row.get(1)?,
         created_at: row.get(2)?,
-        status: row.get(3)?,
+        status: status_column(row, 3, "sessions.status", SessionStatus::parse)?,
         closed_at: row.get(4)?,
-        setup_status: row.get(5)?,
+        setup_status: status_column(row, 5, "sessions.setup_status", SessionSetupStatus::parse)?,
         session_type: row.get(6)?,
         cloned_path: row.get(7)?,
         repo_url: row.get(8)?,
@@ -1532,14 +1682,7 @@ fn command_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CommandR
         session_id: row.get(1)?,
         subcommand: row.get(2)?,
         args: row.get(3)?,
-        status: {
-            let status: String = row.get(4)?;
-            if status == "pending" {
-                "queued".to_string()
-            } else {
-                status
-            }
-        },
+        status: status_column(row, 4, "commands.status", CommandStatus::parse)?.canonical(),
         exit_code: row.get(5)?,
         started_at: row.get(6)?,
         finished_at: row.get(7)?,
@@ -1577,6 +1720,23 @@ fn append_label_predicates(
         }
         sql.push(')');
     }
+}
+
+fn insert_session_row(conn: &Connection, row: NewSessionRow<'_>) -> Result<(), DataError> {
+    conn.execute(
+        "INSERT INTO sessions \
+                 (id, workdir, created_at, status, setup_status, session_type, cloned_path) \
+                 VALUES (?1, ?2, ?3, 'active', ?4, ?5, ?6)",
+        params![
+            row.id,
+            row.workdir,
+            row.created_at,
+            row.setup_status.as_str(),
+            row.kind.as_str(),
+            row.cloned_path
+        ],
+    )?;
+    Ok(())
 }
 
 /// If the unfinished reservation `(scope, key)` recorded an intent whose
@@ -1635,6 +1795,64 @@ fn parse_timestamp(value: &str) -> Result<chrono::DateTime<chrono::Utc>, DataErr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::command_status::CommandStatus;
+
+    #[test]
+    fn decode_args_names_the_command_for_invalid_stored_args() {
+        let (_tmp, store) = make_store();
+        store.insert_session("s", "/work", "then").unwrap();
+        store
+            .enqueue_command("ok", "s", "exec prompt", r#"["a","b"]"#, "log")
+            .unwrap();
+        let ok = store.get_command("ok").unwrap().unwrap();
+        assert_eq!(ok.decode_args().unwrap(), ["a", "b"]);
+        for (id, args) in [("bad", "not json"), ("object", "{}"), ("mixed", "[1]")] {
+            store
+                .enqueue_command(id, "s", "exec prompt", args, "log")
+                .unwrap();
+            let error = store
+                .get_command(id)
+                .unwrap()
+                .unwrap()
+                .decode_args()
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains(&format!("command {id}: stored args")),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn finalize_running_command_requires_running_and_the_same_attempt() {
+        let (_tmp, store) = make_store();
+        store.insert_session("s", "/work", "then").unwrap();
+        store
+            .enqueue_command("c", "s", "exec prompt", "[]", "log")
+            .unwrap();
+        let completion = CommandCompletion {
+            attempt: 1,
+            status: CommandStatus::Done,
+            exit_code: 0,
+            result_json: "{}".into(),
+            finished_at: "finished".into(),
+        };
+        // Queued: nothing to finalize.
+        assert!(!store.finalize_running_command("c", &completion).unwrap());
+        store.claim_next_command("w").unwrap().unwrap();
+        let stale = CommandCompletion {
+            attempt: 9,
+            ..completion.clone()
+        };
+        assert!(!store.finalize_running_command("c", &stale).unwrap());
+        assert!(store.finalize_running_command("c", &completion).unwrap());
+        let row = store.get_command("c").unwrap().unwrap();
+        assert_eq!(row.status.as_str(), "done");
+        assert_eq!(row.finished_at.as_deref(), Some("finished"));
+        // Exactly once: a terminal row is never rewritten.
+        assert!(!store.finalize_running_command("c", &completion).unwrap());
+    }
 
     fn make_store() -> (tempfile::TempDir, SqliteSessionStore) {
         let tmp = tempfile::tempdir().unwrap();
@@ -1699,14 +1917,14 @@ mod tests {
         ];
         assert_eq!(
             store
-                .list_sessions_filtered(Some("active"), None, &selectors)
+                .list_sessions_filtered(Some(SessionStatus::Active), None, &selectors)
                 .unwrap()
                 .len(),
             1
         );
         assert_eq!(
             store
-                .list_sessions_filtered(Some("active"), None, &[selectors[0].clone()])
+                .list_sessions_filtered(Some(SessionStatus::Active), None, &[selectors[0].clone()])
                 .unwrap()
                 .len(),
             2,
@@ -1716,7 +1934,7 @@ mod tests {
             store
                 .list_commands_filtered(&CommandListFilter {
                     session_id: Some("s-label"),
-                    status: Some("pending"),
+                    status: Some(CommandStatus::Pending),
                     labels: &selectors,
                     limit: 10
                 })
@@ -1728,7 +1946,7 @@ mod tests {
             store
                 .list_commands_filtered(&CommandListFilter {
                     session_id: None,
-                    status: Some("pending"),
+                    status: Some(CommandStatus::Pending),
                     labels: &[selectors[0].clone()],
                     limit: 10
                 })
@@ -1948,7 +2166,7 @@ mod tests {
         assert_eq!(record.id, "s1");
         assert_eq!(record.workdir, "/work");
         assert_eq!(record.created_at, "2024-01-01T00:00:00Z");
-        assert_eq!(record.status, "active");
+        assert_eq!(record.status.as_str(), "active");
         assert!(record.closed_at.is_none());
     }
 
@@ -1991,7 +2209,7 @@ mod tests {
         assert!(closed);
 
         let record = store.get_session("s1").unwrap().unwrap();
-        assert_eq!(record.status, "closed");
+        assert_eq!(record.status.as_str(), "closed");
         assert_eq!(record.closed_at.as_deref(), Some("2024-01-02T00:00:00Z"));
     }
 
@@ -2036,11 +2254,15 @@ mod tests {
             .unwrap();
         store.close_session("s1", "2024-01-03T00:00:00Z").unwrap();
 
-        let active = store.list_sessions_by_status(Some("active")).unwrap();
+        let active = store
+            .list_sessions_by_status(Some(SessionStatus::Active))
+            .unwrap();
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].id, "s2");
 
-        let closed = store.list_sessions_by_status(Some("closed")).unwrap();
+        let closed = store
+            .list_sessions_by_status(Some(SessionStatus::Closed))
+            .unwrap();
         assert_eq!(closed.len(), 1);
         assert_eq!(closed[0].id, "s1");
     }
@@ -2061,7 +2283,7 @@ mod tests {
         assert_eq!(cmd.id, "c1");
         assert_eq!(cmd.session_id, "s1");
         assert_eq!(cmd.subcommand, "chat");
-        assert_eq!(cmd.status, "queued");
+        assert_eq!(cmd.status.as_str(), "queued");
         assert_eq!(cmd.log_path, "/logs/c1.log");
         assert!(cmd.exit_code.is_none());
     }
@@ -2081,7 +2303,7 @@ mod tests {
             .unwrap();
 
         let cmd = store.get_command("c1").unwrap().unwrap();
-        assert_eq!(cmd.status, "running");
+        assert_eq!(cmd.status.as_str(), "running");
         assert_eq!(cmd.started_at.as_deref(), Some("2024-01-01T01:00:00Z"));
     }
 
@@ -2099,11 +2321,11 @@ mod tests {
             .unwrap();
 
         store
-            .update_command_finished("c1", "done", Some(0), "2024-01-01T02:00:00Z")
+            .update_command_finished("c1", CommandStatus::Done, Some(0), "2024-01-01T02:00:00Z")
             .unwrap();
 
         let cmd = store.get_command("c1").unwrap().unwrap();
-        assert_eq!(cmd.status, "done");
+        assert_eq!(cmd.status.as_str(), "done");
         assert_eq!(cmd.exit_code, Some(0));
         assert_eq!(cmd.finished_at.as_deref(), Some("2024-01-01T02:00:00Z"));
     }
@@ -2125,7 +2347,7 @@ mod tests {
         assert_eq!(store.count_running_commands().unwrap(), 1);
 
         store
-            .update_command_finished("c1", "done", Some(0), "2024-01-01T02:00:00Z")
+            .update_command_finished("c1", CommandStatus::Done, Some(0), "2024-01-01T02:00:00Z")
             .unwrap();
         assert_eq!(store.count_running_commands().unwrap(), 0);
     }
@@ -2147,7 +2369,7 @@ mod tests {
             .update_command_started("c1", "2024-01-01T01:00:00Z")
             .unwrap();
         store
-            .update_command_finished("c1", "done", Some(0), "2024-01-01T02:00:00Z")
+            .update_command_finished("c1", CommandStatus::Done, Some(0), "2024-01-01T02:00:00Z")
             .unwrap();
         assert!(!store.has_running_command_for_session("s1").unwrap());
     }
@@ -2298,13 +2520,15 @@ mod tests {
 
         let store = SqliteSessionStore::open(tmp.path()).unwrap();
         let filter = CommandListFilter {
-            status: Some("pending"),
+            status: Some(CommandStatus::Pending),
             limit: 10,
             ..CommandListFilter::default()
         };
         let filtered = store.list_commands_filtered(&filter).unwrap();
         assert_eq!(filtered.len(), 3);
-        assert!(filtered.iter().all(|command| command.status == "queued"));
+        assert!(filtered
+            .iter()
+            .all(|command| command.status == CommandStatus::Queued));
 
         // Migration leaves both ordering columns alone: queued_at first,
         // then the original rowid for ties.
@@ -2336,7 +2560,10 @@ mod tests {
             let store = SqliteSessionStore::open(tmp.path()).unwrap();
             assert_eq!(store.count_queued_for_session("s").unwrap(), 3);
             for (position, id) in ["null", "queued", "pending"].iter().enumerate() {
-                assert_eq!(store.get_command(id).unwrap().unwrap().status, "queued");
+                assert_eq!(
+                    store.get_command(id).unwrap().unwrap().status.as_str(),
+                    "queued"
+                );
                 assert_eq!(
                     store.queue_position_for_command(id, "s").unwrap(),
                     Some(position as i64)
@@ -2355,7 +2582,10 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        assert_eq!(store.get_command("late").unwrap().unwrap().status, "queued");
+        assert_eq!(
+            store.get_command("late").unwrap().unwrap().status.as_str(),
+            "queued"
+        );
         assert_eq!(store.count_queued_for_session("s").unwrap(), 4);
         assert_eq!(
             store.queue_position_for_command("late", "s").unwrap(),
@@ -2365,17 +2595,101 @@ mod tests {
             let command = store.claim_next_command("worker").unwrap().unwrap();
             assert_eq!(command.id, expected);
             store
-                .complete_command(expected, "done", Some(0), None)
+                .complete_command(expected, CommandStatus::Done, Some(0), None)
                 .unwrap();
         }
         assert!(store.claim_next_command("worker").unwrap().is_none());
     }
 
-    // ─── Schema compatibility with legacy DB ──────────────────────────────────
+    // ─── Existing database schema compatibility ───────────────────────────────
     //
-    // Creates a DB using the exact SQL from oldsrc/commands/headless/db.rs,
-    // inserts data, then opens it with SqliteSessionStore to verify that the
-    // new store can read existing on-disk databases (user-upgrade path).
+    // Creates a database with the established schema, inserts data, then opens
+    // it with SqliteSessionStore to verify existing on-disk records remain readable.
+
+    #[test]
+    fn cancelling_a_session_queue_covers_pending_written_after_open() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = SqliteSessionStore::open(tmp.path()).unwrap();
+        store.insert_session("s", "/work", "2026-01-01").unwrap();
+        store
+            .enqueue_command("new", "s", "chat", "[]", "/l")
+            .unwrap();
+        store
+            .enqueue_command("old", "s", "chat", "[]", "/l")
+            .unwrap();
+        store
+            .with_conn(|conn| {
+                conn.execute("UPDATE commands SET status='pending' WHERE id='old'", [])?;
+                Ok(())
+            })
+            .unwrap();
+
+        let mut cancelled = store.cancel_queued_for_session("s").unwrap();
+        cancelled.sort();
+        assert_eq!(cancelled, ["new", "old"]);
+        for id in ["new", "old"] {
+            let row = store.get_command(id).unwrap().unwrap();
+            assert_eq!(row.status, CommandStatus::Cancelled, "{id}");
+            assert!(row.finished_at.is_some(), "{id}");
+        }
+        assert!(store.claim_next_command("w").unwrap().is_none());
+        // Already terminal rows are not reported as cancelled again.
+        assert!(store.cancel_queued_for_session("s").unwrap().is_empty());
+    }
+
+    #[test]
+    fn every_stored_status_round_trips_and_unknown_values_are_named_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = SqliteSessionStore::open(tmp.path()).unwrap();
+        store.insert_session("s", "/work", "2026-01-01").unwrap();
+        store.enqueue_command("c", "s", "chat", "[]", "/l").unwrap();
+        let set = |table: &str, column: &str, value: &str| {
+            store
+                .with_conn(|conn| {
+                    conn.execute(&format!("UPDATE {table} SET {column}=?1"), [value])?;
+                    Ok(())
+                })
+                .unwrap();
+        };
+
+        for status in SessionStatus::ALL {
+            set("sessions", "status", status.as_str());
+            let row = store.get_session("s").unwrap().unwrap();
+            assert_eq!(row.status, *status);
+        }
+        set("sessions", "status", "active");
+        for status in SessionSetupStatus::ALL {
+            set("sessions", "setup_status", status.as_str());
+            let row = store.get_session("s").unwrap().unwrap();
+            assert_eq!(row.setup_status, *status);
+        }
+        set("sessions", "setup_status", "ready");
+        for status in CommandStatus::ALL {
+            set("commands", "status", status.as_str());
+            let row = store.get_command("c").unwrap().unwrap();
+            assert_eq!(row.status, status.canonical());
+        }
+
+        set("commands", "status", "wat");
+        let error = store.get_command("c").unwrap_err().to_string();
+        assert!(
+            error.contains("commands.status") && error.contains("wat"),
+            "{error}"
+        );
+        set("sessions", "status", "wat");
+        let error = store.get_session("s").unwrap_err().to_string();
+        assert!(
+            error.contains("sessions.status") && error.contains("wat"),
+            "{error}"
+        );
+        set("sessions", "status", "active");
+        set("sessions", "setup_status", "wat");
+        let error = store.get_session("s").unwrap_err().to_string();
+        assert!(
+            error.contains("sessions.setup_status") && error.contains("wat"),
+            "{error}"
+        );
+    }
 
     #[test]
     fn legacy_schema_db_is_readable_by_new_store() {
@@ -2442,7 +2756,7 @@ mod tests {
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id, "legacy-id-1");
         assert_eq!(sessions[0].workdir, "/old/repo");
-        assert_eq!(sessions[0].status, "active");
+        assert_eq!(sessions[0].status.as_str(), "active");
         // WI 0133: a pre-existing row restores with no remote fields.
         assert_eq!(sessions[0].repo_url, None);
         assert_eq!(sessions[0].branch, None);
@@ -2453,7 +2767,7 @@ mod tests {
         let cmd = store.get_command("cmd-1").unwrap().unwrap();
         assert_eq!(cmd.session_id, "legacy-id-1");
         assert_eq!(cmd.subcommand, "chat");
-        assert_eq!(cmd.status, "cancelled");
+        assert_eq!(cmd.status.as_str(), "cancelled");
         assert_eq!(
             cmd.exit_code,
             Some(crate::data::command_status::CANCELLED_EXIT_CODE)
@@ -2504,7 +2818,9 @@ mod tests {
         // Every SELECT reads the same columns.
         assert_eq!(store.list_sessions().unwrap()[0], rec);
         assert_eq!(
-            store.list_sessions_by_status(Some("active")).unwrap()[0],
+            store
+                .list_sessions_by_status(Some(SessionStatus::Active))
+                .unwrap()[0],
             rec
         );
         assert_eq!(
@@ -2536,7 +2852,7 @@ mod tests {
         let (_tmp, store) = make_store();
         insert_remote(&store, "r3");
         store
-            .update_setup_status("r3", SessionSetupStatus::MergingRefs.as_str())
+            .update_setup_status("r3", SessionSetupStatus::MergingRefs)
             .unwrap();
         let ids: Vec<_> = store
             .list_sessions_with_in_progress_setup()

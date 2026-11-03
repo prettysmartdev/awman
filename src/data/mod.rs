@@ -11,8 +11,8 @@ pub mod builtin_runtime;
 #[cfg(unix)]
 pub mod builtin_state;
 pub mod ci_poll_event;
-// `command_status::CommandStatus` (API command rows) is not re-exported here:
-// `data::CommandStatus` already names the in-memory session command status.
+// `command_status::CommandStatus` (API command rows) is not re-exported here;
+// `data::InvocationStatus` names the in-memory session command status.
 pub mod command_status;
 pub mod config;
 pub mod dynamic_workflow_assets;
@@ -38,6 +38,7 @@ pub mod repo_dockerfile_paths;
 pub mod session;
 pub mod session_manager;
 pub mod session_setup_event;
+pub mod session_status;
 pub mod setup_step;
 pub mod step_status;
 pub mod templates;
@@ -56,8 +57,8 @@ pub use fs::api_db::{CommandResult, WorkerId};
 pub use image_tags::{agent_image_tag, project_image_tag, repo_hash};
 pub use repo_dockerfile_paths::RepoDockerfilePaths;
 pub use session::{
-    AgentHandle, AgentName, CommandInvocation, CommandStatus, GitRootResolver, Session, SessionId,
-    SessionLogEntry, SessionLogKind, SessionState, SessionType,
+    AgentHandle, AgentName, CommandInvocation, GitRootResolver, InvocationStatus, Session,
+    SessionId, SessionLogEntry, SessionLogKind, SessionState, SessionType,
 };
 pub use session_manager::{InMemorySessionStore, SessionManager, SessionStore};
 pub use workflow_dag::{detect_cycle, validate_references, WorkflowDag};

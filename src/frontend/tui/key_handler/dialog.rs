@@ -9,13 +9,7 @@ use super::*;
 pub(super) fn handle(app: &mut App, action: Action) {
     match action {
         Action::WorkflowControl => {
-            let engine_tx = app
-                .active_tab()
-                .shared
-                .engine_tx_shared
-                .lock()
-                .ok()
-                .and_then(|g| g.clone());
+            let engine_tx = app.active_tab().engine_tx.clone();
             if let Some(tx) = engine_tx {
                 if matches!(app.active_dialog, Some(Dialog::WorkflowStepConfirm(_))) {
                     app.send_dialog_response(DialogResponse::Char('W'));

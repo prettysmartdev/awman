@@ -16,6 +16,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::data::error::DataError;
+use crate::data::fs::config_file::write_config_file_atomically;
 use crate::data::fs::daemon_paths::DaemonPaths;
 
 /// systemd unit name / launchd plist label for the API daemon.
@@ -220,7 +221,8 @@ pub(crate) fn write_server_meta(meta_path: &Path, meta: &ServerMeta) -> Result<(
     }
     let json = serde_json::to_string(meta)
         .map_err(|e| DataError::Other(format!("serialize ServerMeta: {e}")))?;
-    std::fs::write(meta_path, json).map_err(|e| DataError::io(meta_path, e))
+    // Atomic: `read_server_meta` treats a partial file as a parse error.
+    write_config_file_atomically(meta_path, &json)
 }
 
 pub(crate) fn read_server_meta(meta_path: &Path) -> Result<Option<ServerMeta>, DataError> {

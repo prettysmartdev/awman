@@ -1,9 +1,7 @@
-//! Prompt templates for `SpecsCommand` and `NewCommand`. Literal
-//! strings are preserved from `oldsrc/commands/specs.rs` so
-//! user-visible prompts remain stable across the refactor.
+//! Prompt templates for `SpecsCommand` and `NewCommand`. Keep these literal
+//! strings stable because they are shown to users and passed to agents.
 
-/// Interview prompt for `new spec --interview`. Ports `oldsrc/commands/
-/// specs.rs::INTERVIEW_PROMPT_TEMPLATE` verbatim.
+/// Interview prompt for `new spec --interview`.
 pub const INTERVIEW_PROMPT: &str = "Work item {number} template has been created for \
 {kind}: {title}. Help complete the work item based on the following summary, making sure to \
 include 1-3 concise user stories, detailed implementation plan, edge case considerations, \
@@ -20,8 +18,7 @@ pub fn render_interview_prompt(number: u32, kind: &str, title: &str, summary: &s
         .replace("{summary}", summary)
 }
 
-/// Amend prompt for `specs amend`. Ports `oldsrc/commands/specs.rs::
-/// AMEND_PROMPT_TEMPLATE` verbatim.
+/// Amend prompt for `specs amend`.
 pub const AMEND_PROMPT: &str = "Work item {number} is complete. Review the work that has \
 been done in the codebase and compare it against the work item markdown file. If needed, amend \
 the work item to ensure it matches the final implementation, ensuring completeness and \
@@ -35,8 +32,7 @@ pub fn render_amend_prompt(number: u32) -> String {
     AMEND_PROMPT.replace("{number}", &format!("{number:04}"))
 }
 
-/// Interview prompt for `new workflow --interview`. Ported from
-/// `oldsrc/commands/new_workflow.rs::WORKFLOW_INTERVIEW_PROMPT_TEMPLATE`.
+/// Interview prompt for `new workflow --interview`.
 pub const WORKFLOW_INTERVIEW_PROMPT: &str = "Workflow file {filename} has been created at \
 {path}. Help complete the workflow based on the following summary. The workflow should include all \
 necessary steps with clear step names, explicit depends_on relationships, appropriate agent and \
@@ -53,8 +49,7 @@ pub fn render_workflow_interview_prompt(filename: &str, path: &str, summary: &st
         .replace("{summary}", summary)
 }
 
-/// Interview prompt for `new skill --interview`. Ported from
-/// `oldsrc/commands/new_skill.rs::SKILL_INTERVIEW_PROMPT_TEMPLATE`.
+/// Interview prompt for `new skill --interview`.
 pub const SKILL_INTERVIEW_PROMPT: &str = "A skill file has been created at {path}. \
 Help complete the skill based on the following summary. The skill should include clear \
 instructions that a code agent can follow step-by-step, with any relevant commands, code \

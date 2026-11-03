@@ -10,9 +10,6 @@ use std::path::Path;
 use std::process::{Child, Command};
 use std::time::Duration;
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-use std::sync::Mutex;
-
 use awman::data::config::env::{EnvSnapshot, AWMAN_API_ROOT, AWMAN_SQUAD_ROOT};
 use awman::data::fs::daemon_process::{
     DaemonProcess, API_PLIST_LABEL, API_UNIT_NAME, SQUAD_PLIST_LABEL, SQUAD_UNIT_NAME,
@@ -20,11 +17,8 @@ use awman::data::fs::daemon_process::{
 use awman::data::fs::DaemonPaths;
 use awman::engine::daemon::{DaemonGuard, DaemonKind, DaemonSupervisor};
 
-/// A few daemon-spawn tests temporarily replace `PATH` to inject a platform
-/// launcher.  Keep that process-global state serialized across the whole test
-/// module so one injection cannot change another test's meaning.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-static PATH_LOCK: Mutex<()> = Mutex::new(());
+use crate::process_env::ProcessEnvGuard;
 
 fn paths_env(api_root: &Path, squad_root: &Path) -> EnvSnapshot {
     EnvSnapshot::with_overrides([
@@ -66,7 +60,7 @@ fn spawn_detached_identity_is_distinct_for_api_and_squad() {
 
     #[cfg(target_os = "linux")]
     {
-        let _lock = PATH_LOCK.lock().unwrap();
+        let mut env = ProcessEnvGuard::lock();
         let bin_dir = api_root.path().join("bin");
         std::fs::create_dir_all(&bin_dir).unwrap();
         let log = api_root.path().join("systemd-run-args");
@@ -78,24 +72,14 @@ fn spawn_detached_identity_is_distinct_for_api_and_squad() {
         .unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&fake_systemd, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let old_path = std::env::var_os("PATH");
-        let new_path = match old_path.as_ref() {
-            Some(path) => format!("{}:{}", bin_dir.display(), path.to_string_lossy()),
-            None => bin_dir.display().to_string(),
-        };
-        std::env::set_var("PATH", new_path);
-        std::env::set_var("AWMAN_TEST_SYSTEMD_LOG", &log);
+        env.prepend_path(&bin_dir);
+        env.set("AWMAN_TEST_SYSTEMD_LOG", &log);
         assert_eq!(api.spawn_detached(Path::new("/bin/true"), &[]).unwrap(), 0);
         assert_eq!(
             squad.spawn_detached(Path::new("/bin/true"), &[]).unwrap(),
             0
         );
-        if let Some(path) = old_path {
-            std::env::set_var("PATH", path);
-        } else {
-            std::env::remove_var("PATH");
-        }
-        std::env::remove_var("AWMAN_TEST_SYSTEMD_LOG");
+        drop(env);
         let args = std::fs::read_to_string(log).unwrap();
         assert!(
             args.contains("--unit=awman-api"),
@@ -119,7 +103,7 @@ fn spawn_detached_identity_is_distinct_for_api_and_squad() {
         // installs one that reports failure. Two locks over one process-global
         // `PATH` serialize nothing, and whichever stub happened to be
         // installed would decide the other test's result.
-        let _lock = PATH_LOCK.lock().unwrap();
+        let mut env = ProcessEnvGuard::lock();
         let home = tempfile::tempdir().unwrap();
         let bin_dir = home.path().join("bin");
         std::fs::create_dir_all(&bin_dir).unwrap();
@@ -128,30 +112,14 @@ fn spawn_detached_identity_is_distinct_for_api_and_squad() {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&fake_launchctl, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        let old_path = std::env::var_os("PATH");
-        let old_home = std::env::var_os("HOME");
-        std::env::set_var(
-            "PATH",
-            match old_path.as_ref() {
-                Some(path) => format!("{}:{}", bin_dir.display(), path.to_string_lossy()),
-                None => bin_dir.display().to_string(),
-            },
-        );
-        std::env::set_var("HOME", home.path());
-
+        env.prepend_path(&bin_dir);
+        env.set("HOME", home.path());
         api.spawn_detached(Path::new("/usr/bin/true"), &[]).unwrap();
         squad
             .spawn_detached(Path::new("/usr/bin/true"), &[])
             .unwrap();
 
-        match old_path {
-            Some(path) => std::env::set_var("PATH", path),
-            None => std::env::remove_var("PATH"),
-        }
-        match old_home {
-            Some(value) => std::env::set_var("HOME", value),
-            None => std::env::remove_var("HOME"),
-        }
+        drop(env);
 
         let agents = home.path().join("Library/LaunchAgents");
         let api_plist = std::fs::read_to_string(agents.join(format!("{API_PLIST_LABEL}.plist")))
@@ -181,7 +149,7 @@ fn squad_spawn_failure_is_wrapped_with_an_attributable_daemon_message() {
     // unavailable is what makes the missing binary observable here.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     let _path_guard = {
-        let _lock = PATH_LOCK.lock().unwrap();
+        let mut env = ProcessEnvGuard::lock();
         let bin_dir = tmp.path().join("bin");
         std::fs::create_dir(&bin_dir).unwrap();
         let launcher = bin_dir.join(if cfg!(target_os = "macos") {
@@ -195,15 +163,8 @@ fn squad_spawn_failure_is_wrapped_with_an_attributable_daemon_message() {
         // Prepend rather than replace: the stub only needs to shadow the real
         // launcher. Other tests in this binary spawn `git` concurrently and
         // must keep finding it on the process-global `PATH`.
-        let old_path = std::env::var_os("PATH");
-        std::env::set_var(
-            "PATH",
-            match old_path.as_ref() {
-                Some(path) => format!("{}:{}", bin_dir.display(), path.to_string_lossy()),
-                None => bin_dir.display().to_string(),
-            },
-        );
-        PathGuard { _lock, old_path }
+        env.prepend_path(&bin_dir);
+        env
     };
 
     let error = process
@@ -218,22 +179,6 @@ fn squad_spawn_failure_is_wrapped_with_an_attributable_daemon_message() {
         !text.starts_with("Load failed:"),
         "the raw launchd diagnostic must never be surfaced verbatim: {text}"
     );
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-struct PathGuard {
-    _lock: std::sync::MutexGuard<'static, ()>,
-    old_path: Option<std::ffi::OsString>,
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-impl Drop for PathGuard {
-    fn drop(&mut self) {
-        match self.old_path.take() {
-            Some(path) => std::env::set_var("PATH", path),
-            None => std::env::remove_var("PATH"),
-        }
-    }
 }
 
 #[test]

@@ -38,7 +38,8 @@ fn checked_bytes(path: &PathBuf, expected: &str, limit: u64, hint: &str) -> Vec<
 }
 
 fn main() {
-    // All workspace packages verify the same repository-owned payload inputs.
+    // The awman library validates the embedded payload inputs; the host shim
+    // emits the aligned kernel table used by the embedding worker.
     let manifest_dir =
         PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("manifest directory"));
     let root = manifest_dir
@@ -124,8 +125,16 @@ fn main() {
         agent.starts_with(b"\x7fELF") && machine == wanted,
         "agent architecture mismatch for {target}"
     );
+    // Every package that consumes the verified builtin feature needs this
+    // cfg. The library uses it to compile the runtime, and the CLI uses it to
+    // include builtin-only integration-test paths.
+    println!("cargo:rustc-cfg=awman_builtin");
+    // The host shim embeds the aligned kernel table; the awman library only
+    // needs payload verification and the `awman_builtin` cfg above.
+    if env::var("CARGO_PKG_NAME").as_deref() != Ok("awman-host-shims") {
+        return;
+    }
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
     let source = format!("#[repr(align(65536))] pub struct AlignedKernel(pub [u8; {size}]);\n#[used] pub static KERNEL: AlignedKernel = AlignedKernel(*include_bytes!({:?}));\npub const GUEST_ADDRESS: u64 = {};\npub const ENTRY_ADDRESS: u64 = {};\npub const KERNEL_SHA256: &str = {:?};\n", fs::canonicalize(&kernel_path).expect("kernel path").to_string_lossy(), integer(record, "guest_address"), integer(record, "entry_address"), field(record, "kernel_sha256"));
     fs::write(out.join("msb_kernel.rs"), source).expect("write kernel table");
-    println!("cargo:rustc-cfg=awman_builtin");
 }

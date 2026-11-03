@@ -20,6 +20,174 @@ fn sandbox(driver: &Arc<FakeDriver>, name: &str, token: &str) -> String {
     id
 }
 
+#[test]
+fn aborting_an_unconfirmed_observer_preserves_path_but_closes_descriptor() {
+    use crate::engine::container::options::PromptFileGuard;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tempfile::NamedTempFile::new_in(tmp.path()).unwrap();
+    let path = file.path().to_owned();
+    let guard = PromptFileGuard::new(file);
+    let sibling = guard.clone();
+    runtime.block_on(async {
+        let (started, ready) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let _files = ObservedPromptFiles(vec![guard]);
+            started.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        ready.await.unwrap();
+    });
+    drop(runtime);
+    assert!(
+        path.exists(),
+        "observer shutdown does not establish guest exit"
+    );
+    drop(sibling);
+    assert!(
+        path.exists(),
+        "the last clone preserves the unknown guest's path"
+    );
+    assert_eq!(
+        open_prompt_descriptors(&path),
+        0,
+        "no forgotten allocation or fd"
+    );
+}
+
+fn open_prompt_descriptors(path: &Path) -> usize {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter_map(|entry| std::fs::read_link(entry.path()).ok())
+            .filter(|target| {
+                target == path
+                    || target.to_string_lossy() == format!("{} (deleted)", path.display())
+            })
+            .count()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = path;
+        0
+    }
+}
+
+#[tokio::test]
+async fn prompt_files_follow_confirmed_exit_or_stop_including_a_later_retry() {
+    use crate::engine::container::options::PromptFileGuard;
+    for (exited, failed_stop, owned) in [
+        (false, false, true),
+        (true, true, true),
+        (false, true, true),
+        (false, false, false),
+    ] {
+        let driver = FakeDriver::new();
+        let id = sandbox(&driver, "awman-prompt", "owner");
+        driver.state.lock().unwrap().fail_finish = failed_stop;
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let path = file.path().to_owned();
+        let (mut frontend, _peer) = frontend(None);
+        let io = frontend.take_io();
+        let (control, controls) = recorder();
+        let (broadcast, events) = tokio::sync::broadcast::channel(16);
+        let mut execution = ExecBridge::new(ExecBridgeOptions {
+            handle: AgentHandle {
+                id,
+                name: "awman-prompt".into(),
+                image_tag: "fixture".into(),
+                started_at: chrono::Utc::now(),
+            },
+            session: ExecSession {
+                events,
+                broadcast: broadcast.clone(),
+                control,
+            },
+            cleanup: owned.then(|| CleanupTarget {
+                driver: driver.clone(),
+                owner: "owner".into(),
+                remove_on_exit: true,
+            }),
+            attach_path: None,
+            persistent_stdin: false,
+            seeded_prompt: None,
+            leases: vec![],
+            prompt_files: vec![PromptFileGuard::new(file)],
+            io,
+        })
+        .run(frontend)
+        .unwrap();
+        let cancel = execution.cancel_handle().unwrap();
+        assert!(broadcast
+            .send(if exited {
+                ExecEvent::Exited(0)
+            } else {
+                ExecEvent::Failed
+            })
+            .is_ok());
+        assert_eq!(execution.wait().await.is_ok(), exited);
+        if !owned {
+            assert!(
+                path.exists(),
+                "an attached guest is still live after stream failure"
+            );
+            cancel.cancel().unwrap();
+            assert!(driver.finished().is_empty());
+            assert!(!controls.lock().unwrap().contains(&Sent::Kill));
+            assert!(broadcast.send(ExecEvent::Exited(0)).is_ok());
+            settle("attached guest exit releases prompt", || !path.exists()).await;
+        } else if !exited && failed_stop {
+            assert!(path.exists(), "unknown liveness retains the prompt");
+            #[cfg(target_os = "linux")]
+            assert_eq!(open_prompt_descriptors(&path), 1);
+            assert_eq!(driver.state.lock().unwrap().finish_attempts, 1);
+            driver.state.lock().unwrap().fail_finish = false;
+            cancel.cancel().unwrap();
+            tokio::time::timeout(Duration::from_secs(12), async {
+                while path.exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("later owned stop releases retained prompt");
+        } else {
+            assert!(
+                !path.exists(),
+                "confirmed termination releases prompt before wait resolves"
+            );
+        }
+        assert_eq!(
+            open_prompt_descriptors(&path),
+            0,
+            "the descriptor is released too"
+        );
+    }
+}
+
+#[tokio::test]
+async fn failed_grace_stop_allows_another_cancel() {
+    let driver = FakeDriver::new();
+    let id = sandbox(&driver, "awman-retry-stop", "owner");
+    driver.state.lock().unwrap().fail_finish = true;
+    let (control, _) = recorder();
+    let (owner, _) = target(&driver, &id, "owner", true);
+    let cancel = ExecCancelHandle::new(control, Some(owner), Duration::from_millis(10));
+    cancel.cancel().unwrap();
+    settle("failed stop releases cancellation request", || {
+        driver.state.lock().unwrap().finish_attempts == 1
+            && !cancel.requested.load(Ordering::Acquire)
+    })
+    .await;
+    driver.state.lock().unwrap().fail_finish = false;
+    cancel.cancel().unwrap();
+    settle("retry stopped guest", || driver.finished().len() == 1).await;
+}
+
 fn target(
     driver: &Arc<FakeDriver>,
     id: &str,
@@ -34,6 +202,7 @@ fn target(
             token: token.into(),
             remove,
             cleanup_claimed: finished.clone(),
+            stop_result: Arc::new(tokio::sync::watch::channel(None).0),
         },
         finished,
     )

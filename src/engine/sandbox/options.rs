@@ -228,8 +228,8 @@ mod restriction_tests {
                         SandboxOption::DisallowedTools(vec!["Bash".into()])
                     },
                 ]);
-                let result =
-                    SandboxRuntime::for_tests().build(ResolvedAgentOptions::Sandbox(options));
+                let result = SandboxRuntime::for_tests()
+                    .build(ResolvedAgentOptions::Sandbox(Box::new(options)));
                 if *agent == "claude" {
                     assert!(result.is_ok());
                 } else {

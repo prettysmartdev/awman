@@ -1,13 +1,14 @@
 //! Typed accessors for API-mode storage paths.
 //!
-//! Replaces ad-hoc `dirs::data_dir().join("awman/api/...")` calls scattered
-//! through `oldsrc/commands/headless/`.
+//! Resolves API-mode paths in one place instead of assembling them at call sites.
 
 use std::path::{Path, PathBuf};
 
+use crate::data::command_status::CommandCompletion;
 use crate::data::config::env::{Env, EnvSnapshot};
 use crate::data::error::DataError;
 use crate::data::execution_event::ExecutionEvent;
+use crate::data::fs::config_file::write_config_file_atomically;
 use crate::data::fs::daemon_paths::DaemonPaths;
 use crate::data::fs::data_paths::DataPaths;
 use crate::data::session_setup_event::SessionSetupState;
@@ -201,6 +202,12 @@ impl ApiPaths {
             .join("metadata.json")
     }
 
+    /// Terminal sidecar for a single command run.
+    pub fn command_completion_path(&self, session_id: &str, command_id: &str) -> PathBuf {
+        self.command_dir(session_id, command_id)
+            .join("completion.json")
+    }
+
     /// Per-session worktree directory.
     pub fn session_worktree_dir(&self, session_id: &str) -> PathBuf {
         self.session_dir(session_id).join("worktree")
@@ -273,7 +280,9 @@ impl ApiPaths {
         let path = self.session_setup_state_path(session_id);
         let json = serde_json::to_string_pretty(state)
             .map_err(|source| DataError::Other(format!("serializing workflow state: {source}")))?;
-        std::fs::write(&path, json).map_err(|e| DataError::io(&path, e))
+        // Atomic: the status route polls this file while setup rewrites it, and
+        // an unparseable read silently falls back to the (staler) DB row.
+        write_config_file_atomically(&path, &json)
     }
 
     /// Read and parse a session's `setup_state.json`. Returns `None` when the
@@ -312,6 +321,9 @@ impl ApiPaths {
     }
 
     /// Write a command's `metadata.json` (pretty-printed).
+    ///
+    /// Left as a direct write: nothing in the tree reads this file back, and
+    /// the queue worker treats the write as best effort.
     pub fn write_command_metadata(
         &self,
         session_id: &str,
@@ -390,6 +402,52 @@ impl ApiPaths {
         }
     }
 
+    /// Atomically record a command's terminal outcome before its row is written,
+    /// creating the command directory if needed.
+    pub fn write_command_completion(
+        &self,
+        session_id: &str,
+        command_id: &str,
+        completion: &CommandCompletion,
+    ) -> Result<(), DataError> {
+        self.prepare_command_dir(session_id, command_id)?;
+        let path = self.command_completion_path(session_id, command_id);
+        let json = serde_json::to_string(completion)
+            .map_err(|source| DataError::ConfigSerialize { source })?;
+        write_config_file_atomically(&path, &json)
+    }
+
+    /// Read a command's terminal sidecar. Absent is `None`; an unreadable or
+    /// malformed file is an error.
+    pub fn read_command_completion(
+        &self,
+        session_id: &str,
+        command_id: &str,
+    ) -> Result<Option<CommandCompletion>, DataError> {
+        let path = self.command_completion_path(session_id, command_id);
+        match std::fs::read(&path) {
+            Ok(json) => serde_json::from_slice(&json)
+                .map(Some)
+                .map_err(|source| DataError::ConfigParse { path, source }),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(DataError::io(&path, e)),
+        }
+    }
+
+    /// Remove a command's terminal sidecar; absent is success.
+    pub fn remove_command_completion(
+        &self,
+        session_id: &str,
+        command_id: &str,
+    ) -> Result<(), DataError> {
+        let path = self.command_completion_path(session_id, command_id);
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(DataError::io(&path, e)),
+        }
+    }
+
     /// Read a command's workflow state, distinguishing absence from IO failure.
     pub fn read_command_workflow_state_raw(
         &self,
@@ -408,7 +466,44 @@ impl ApiPaths {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::command_status::CommandStatus;
     use crate::data::config::env::{EnvSnapshot, AWMAN_API_ROOT, AWMAN_CONFIG_HOME, XDG_DATA_HOME};
+
+    #[test]
+    fn command_completion_round_trips_and_removal_is_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = ApiPaths::from_root(tmp.path());
+        assert_eq!(paths.read_command_completion("s", "c").unwrap(), None);
+        let completion = CommandCompletion {
+            attempt: 2,
+            status: CommandStatus::Error,
+            exit_code: 7,
+            result_json: r#"{"exit_code":7}"#.into(),
+            finished_at: "2026-10-30T00:00:00+00:00".into(),
+        };
+        // The command directory need not exist yet.
+        paths
+            .write_command_completion("s", "c", &completion)
+            .unwrap();
+        assert_eq!(
+            paths.read_command_completion("s", "c").unwrap(),
+            Some(completion)
+        );
+        let raw = std::fs::read_to_string(paths.command_completion_path("s", "c")).unwrap();
+        assert!(raw.contains(r#""status":"error""#), "{raw}");
+        paths.remove_command_completion("s", "c").unwrap();
+        paths.remove_command_completion("s", "c").unwrap();
+        assert_eq!(paths.read_command_completion("s", "c").unwrap(), None);
+    }
+
+    #[test]
+    fn malformed_command_completion_is_an_error_not_absence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = ApiPaths::from_root(tmp.path());
+        paths.prepare_command_dir("s", "c").unwrap();
+        std::fs::write(paths.command_completion_path("s", "c"), "{").unwrap();
+        assert!(paths.read_command_completion("s", "c").is_err());
+    }
 
     #[test]
     fn from_env_returns_xdg_data_home_awman_api_when_xdg_set() {

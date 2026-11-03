@@ -65,9 +65,29 @@ pub struct ExecBridgeOptions {
     pub persistent_stdin: bool,
     pub seeded_prompt: Option<String>,
     pub leases: Vec<crate::engine::credential_refresh::CredentialLease>,
+    /// Held by the event task, not the execution: a dropped execution leaves
+    /// the guest running through its cancel grace, and it can read these until
+    /// it exits.
+    pub prompt_files: Vec<crate::engine::container::options::PromptFileGuard>,
     pub io: AgentIo,
 }
 pub struct ExecBridge(ExecBridgeOptions);
+
+/// An aborted observer cannot prove guest exit. Preserve the paths on that
+/// exceptional drop, but release their descriptors with the last launch guard.
+struct ObservedPromptFiles(Vec<crate::engine::container::options::PromptFileGuard>);
+impl ObservedPromptFiles {
+    fn guest_ended(&mut self) {
+        self.0.clear();
+    }
+}
+impl Drop for ObservedPromptFiles {
+    fn drop(&mut self) {
+        for file in &self.0 {
+            file.preserve_for_unconfirmed_guest();
+        }
+    }
+}
 impl ExecutionBackend for Execution {
     fn frontend_for_wait(&mut self) -> Option<FrontendWaitGuard> {
         let frontend = self.frontend.take()?;
@@ -125,6 +145,8 @@ struct CancelTarget {
     /// (agent ignored the interrupt) reaches cleanup first; the other skips
     /// it, so `finish_owned` never runs twice concurrently.
     cleanup_claimed: Arc<AtomicBool>,
+    /// What the grace timer's stop did, for an event task that lost the claim.
+    stop_result: Arc<tokio::sync::watch::Sender<Option<bool>>>,
 }
 
 /// One grace timer shared by user cancellation, dropped waits and the stuck detector.
@@ -155,13 +177,14 @@ impl ExecCancelHandle {
         if let Some(target) = self.owner.clone() {
             let control = self.control.clone();
             let grace = self.grace;
+            let requested = self.requested.clone();
             self.runtime.spawn(async move {
                 tokio::time::sleep(grace).await;
                 if target.cleanup_claimed.swap(true, Ordering::AcqRel) {
                     return;
                 }
                 let _ = control.send(Control::Kill);
-                let _ = tokio::task::spawn_blocking(move || {
+                let stop = tokio::task::spawn_blocking(move || {
                     target.driver.finish_owned(
                         &target.id,
                         &target.token,
@@ -170,10 +193,31 @@ impl ExecCancelHandle {
                     )
                 })
                 .await;
+                let stopped = stop_confirmed(stop, &target.cleanup_claimed);
+                target.stop_result.send_replace(Some(stopped));
+                if !stopped {
+                    requested.store(false, Ordering::Release);
+                }
             });
         }
         result
     }
+}
+
+/// Whether an owner-scoped stop finished. A failed one gives up the claim, so
+/// whoever reaches cleanup next tries again.
+fn stop_confirmed(
+    stop: Result<Result<(), EngineError>, tokio::task::JoinError>,
+    cleanup_claimed: &AtomicBool,
+) -> bool {
+    let error = match stop {
+        Ok(Ok(())) => return true,
+        Ok(Err(error)) => error.to_string(),
+        Err(error) => error.to_string(),
+    };
+    tracing::error!(%error, "Failed to stop builtin agent; keeping its prompt files");
+    cleanup_claimed.store(false, Ordering::Release);
+    false
 }
 
 impl ExecBridge {
@@ -189,6 +233,7 @@ impl ExecBridge {
             persistent_stdin,
             seeded_prompt,
             leases,
+            prompt_files,
             mut io,
         } = self.0;
         if let Some(prompt) = seeded_prompt {
@@ -227,12 +272,15 @@ impl ExecBridge {
         let tail = Arc::new(OutputTail::with_default_capacity());
         let output_activity = OutputActivity::new();
         let cleanup_claimed = Arc::new(AtomicBool::new(false));
+        let (stop_result, mut grace_stop) = tokio::sync::watch::channel(None);
+        let stop_result = Arc::new(stop_result);
         let owner = cleanup.as_ref().map(|target| CancelTarget {
             driver: target.driver.clone(),
             id: handle.id.clone(),
             token: target.owner.clone(),
             remove: target.remove_on_exit,
             cleanup_claimed: cleanup_claimed.clone(),
+            stop_result,
         });
         let cancel = ExecCancelHandle::new(control.clone(), owner.clone(), CANCEL_GRACE);
         let stuck_cancel = cancel.clone();
@@ -262,6 +310,7 @@ impl ExecBridge {
         let io_release = Arc::new(tokio::sync::Notify::new());
         let released = io_release.clone();
         let mut sinks = Some((io.stdout, io.stderr));
+        let mut prompt_files = ObservedPromptFiles(prompt_files);
         let event_task = tokio::spawn(async move {
             let mut events = session.events;
             let outcome = loop {
@@ -335,19 +384,63 @@ impl ExecBridge {
             if let Some(server) = server {
                 server.finish();
             }
-            if let Some(target) = cleanup.filter(|_| !cleanup_claimed.swap(true, Ordering::AcqRel))
-            {
-                let _ = tokio::task::spawn_blocking(move || {
-                    target.driver.finish_owned(
-                        &id,
-                        &target.owner,
-                        Duration::from_secs(2),
-                        target.remove_on_exit,
-                    )
-                })
-                .await;
+            // The guest can read its prompt files until its exit is observed or
+            // its stop confirmed. A failed stream establishes neither.
+            let mut guest_ended = outcome.is_ok();
+            if let Some(target) = cleanup {
+                if cleanup_claimed.swap(true, Ordering::AcqRel) {
+                    if !guest_ended {
+                        guest_ended = grace_stop
+                            .wait_for(Option::is_some)
+                            .await
+                            .is_ok_and(|stopped| *stopped == Some(true));
+                    }
+                } else {
+                    let stop = tokio::task::spawn_blocking(move || {
+                        target.driver.finish_owned(
+                            &id,
+                            &target.owner,
+                            Duration::from_secs(2),
+                            target.remove_on_exit,
+                        )
+                    })
+                    .await;
+                    guest_ended |= stop_confirmed(stop, &cleanup_claimed);
+                }
             }
-            let _ = done_tx.send(outcome);
+            if guest_ended {
+                prompt_files.guest_ended();
+                let _ = done_tx.send(outcome);
+            } else {
+                // Report the stream failure promptly, but retain this launch's
+                // files in a reachable owner. A later cancellation or exit can
+                // still establish that the guest no longer needs them.
+                let _ = done_tx.send(outcome);
+                if prompt_files.0.is_empty() {
+                    return;
+                }
+                let mut stream_open = true;
+                let mut stop_open = true;
+                loop {
+                    if *grace_stop.borrow() == Some(true) {
+                        break;
+                    }
+                    tokio::select! {
+                        event = events.recv(), if stream_open => match event {
+                            Ok(ExecEvent::Exited(_)) => break,
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => stream_open = false,
+                            _ => {}
+                        },
+                        changed = grace_stop.changed(), if stop_open => {
+                            if changed.is_err() { stop_open = false; }
+                        },
+                        // With no evidence source left, keep the files for the
+                        // unknown guest rather than deleting them or busy-looping.
+                        _ = std::future::pending::<()>() => {}
+                    }
+                }
+                prompt_files.guest_ended();
+            }
         });
         // Dropping the JoinHandle detaches the event task. It must outlive a
         // dropped wait so it can observe exit and run the server/owner teardown.
@@ -499,6 +592,7 @@ impl AgentInstance for AttachInstance {
                 persistent_stdin: true,
                 seeded_prompt: None,
                 leases: Vec::new(),
+                prompt_files: Vec::new(),
                 io,
             })
             .run(frontend)
@@ -564,7 +658,7 @@ mod tests {
         let finishing = running.clone();
         crate::engine::agent_runtime::conformance::Launcher {
             name: "builtin",
-            launch: Box::new(move |mut frontend, long| {
+            launch: Box::new(move |mut frontend, long, prompt_files| {
                 let (broadcast, events) = tokio::sync::broadcast::channel(16);
                 let (commands, received) = tokio::sync::mpsc::unbounded_channel();
                 if long {
@@ -590,6 +684,7 @@ mod tests {
                     persistent_stdin: false,
                     seeded_prompt: None,
                     leases: Vec::new(),
+                    prompt_files,
                     io,
                 })
                 .run(frontend)
@@ -628,6 +723,7 @@ mod tests {
             persistent_stdin: false,
             seeded_prompt: Some("a seeded prompt".into()),
             leases: Vec::new(),
+            prompt_files: Vec::new(),
             io,
         })
         .run(frontend)
@@ -790,6 +886,7 @@ mod tests {
                 persistent_stdin: false,
                 seeded_prompt: None,
                 leases: Vec::new(),
+                prompt_files: Vec::new(),
                 io,
             })
             .run(frontend)
@@ -867,6 +964,7 @@ mod tests {
                 persistent_stdin: false,
                 seeded_prompt: None,
                 leases: Vec::new(),
+                prompt_files: Vec::new(),
                 io,
             })
             .run(frontend)
@@ -904,6 +1002,7 @@ mod tests {
                 persistent_stdin: false,
                 seeded_prompt: None,
                 leases: Vec::new(),
+                prompt_files: Vec::new(),
                 io,
             })
             .run(frontend)
@@ -954,6 +1053,7 @@ mod tests {
                 persistent_stdin: false,
                 seeded_prompt: None,
                 leases: Vec::new(),
+                prompt_files: Vec::new(),
                 io,
             })
             .run(frontend)

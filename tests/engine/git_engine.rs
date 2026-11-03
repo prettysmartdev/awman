@@ -100,10 +100,6 @@ fn init_repo(dir: &std::path::Path) {
     run(&["commit", "-m", "initial"]);
 }
 
-/// Serialises tests that mutate process-wide `HOME` (the identity tests) with
-/// the worktree-key tests, whose paths `GitEngine` resolves under `HOME`.
-static HOME_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 /// Real-git: GitEngine resolves the root of a freshly initialised repo.
 #[test]
 fn real_git_engine_resolves_root_of_fresh_repo() {
@@ -141,7 +137,7 @@ fn real_git_legacy_unhashed_worktree_owned_by_repository_is_reused() {
     }
     use awman::engine::git::GitEngine;
 
-    let _lock = HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _env = crate::process_env::ProcessEnvGuard::lock();
 
     let home = dirs::home_dir().expect("test home directory");
     let temp = tempfile::tempdir().unwrap();
@@ -186,7 +182,7 @@ fn real_git_same_named_checkouts_have_separate_worktree_keys() {
     }
     use awman::engine::git::GitEngine;
 
-    let _lock = HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _env = crate::process_env::ProcessEnvGuard::lock();
 
     let temp = tempfile::tempdir().unwrap();
     let first = temp.path().join("first-checkout").join("shared-name");
@@ -229,7 +225,7 @@ fn real_git_legacy_unhashed_worktree_owned_by_other_repository_is_ignored() {
     }
     use awman::engine::git::GitEngine;
 
-    let _lock = HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _env = crate::process_env::ProcessEnvGuard::lock();
 
     let home = dirs::home_dir().expect("test home directory");
     let temp = tempfile::tempdir().unwrap();
@@ -356,7 +352,11 @@ fn real_git_worktree_create_merge_remove_cycle() {
 /// global git config is whatever `global` says (`None` = no global config).
 fn repo_with_isolated_global(
     global: Option<(&str, &str)>,
-) -> (tempfile::TempDir, PathBuf, Vec<(&'static str, String)>) {
+) -> (
+    tempfile::TempDir,
+    PathBuf,
+    crate::process_env::ProcessEnvGuard,
+) {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");
     let repo = tmp.path().join("repo");
@@ -384,44 +384,19 @@ fn repo_with_isolated_global(
 
     // `GitEngine` shells out without overriding the environment, so the
     // scratch HOME has to be installed in this process for the probe to see
-    // it. Returned so the caller can restore.
-    let saved = vec![
-        ("HOME", std::env::var("HOME").unwrap_or_default()),
-        (
-            "XDG_CONFIG_HOME",
-            std::env::var("XDG_CONFIG_HOME").unwrap_or_default(),
-        ),
-        (
-            "GIT_CONFIG_GLOBAL",
-            std::env::var("GIT_CONFIG_GLOBAL").unwrap_or_default(),
-        ),
-        (
-            "GIT_CONFIG_SYSTEM",
-            std::env::var("GIT_CONFIG_SYSTEM").unwrap_or_default(),
-        ),
-    ];
-    std::env::set_var("HOME", &home);
-    std::env::set_var("XDG_CONFIG_HOME", home.join(".config"));
+    // it. The guard holds the binary-wide lock and restores on drop.
+    let mut env = crate::process_env::ProcessEnvGuard::lock();
+    env.set("HOME", &home);
+    env.set("XDG_CONFIG_HOME", home.join(".config"));
     match global {
-        Some(_) => std::env::set_var("GIT_CONFIG_GLOBAL", home.join(".gitconfig")),
+        Some(_) => env.set("GIT_CONFIG_GLOBAL", home.join(".gitconfig")),
         // `/dev/null` is git's documented way to say "no global config".
-        None => std::env::set_var("GIT_CONFIG_GLOBAL", "/dev/null"),
+        None => env.set("GIT_CONFIG_GLOBAL", "/dev/null"),
     }
-    std::env::set_var("GIT_CONFIG_SYSTEM", "/dev/null");
+    env.set("GIT_CONFIG_SYSTEM", "/dev/null");
 
-    (tmp, repo, saved)
+    (tmp, repo, env)
 }
-
-fn restore_env(saved: Vec<(&'static str, String)>) {
-    for (key, value) in saved {
-        if value.is_empty() {
-            std::env::remove_var(key);
-        } else {
-            std::env::set_var(key, value);
-        }
-    }
-}
-
 #[test]
 fn real_git_identity_configured_reads_the_global_identity() {
     use crate::helpers::git_available;
@@ -431,11 +406,9 @@ fn real_git_identity_configured_reads_the_global_identity() {
     }
     use awman::engine::git::GitEngine;
 
-    let _lock = HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let (_tmp, repo, saved) = repo_with_isolated_global(Some(("Global User", "global@x.test")));
+    let (_tmp, repo, _env) = repo_with_isolated_global(Some(("Global User", "global@x.test")));
 
     let identity = GitEngine::new().identity_configured(&repo).unwrap();
-    restore_env(saved);
 
     assert_eq!(identity.name.as_deref(), Some("Global User"));
     assert_eq!(identity.email.as_deref(), Some("global@x.test"));
@@ -452,8 +425,7 @@ fn real_git_identity_configured_prefers_the_repo_local_override() {
     }
     use awman::engine::git::GitEngine;
 
-    let _lock = HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let (_tmp, repo, saved) = repo_with_isolated_global(Some(("Global User", "global@x.test")));
+    let (_tmp, repo, _env) = repo_with_isolated_global(Some(("Global User", "global@x.test")));
 
     for args in [
         ["config", "user.name", "Repo User"],
@@ -468,7 +440,6 @@ fn real_git_identity_configured_prefers_the_repo_local_override() {
     }
 
     let identity = GitEngine::new().identity_configured(&repo).unwrap();
-    restore_env(saved);
 
     // This is the behaviour change: the old probe ran without a working
     // directory and would have reported the global values here.
@@ -485,11 +456,9 @@ fn real_git_identity_configured_reports_both_keys_missing() {
     }
     use awman::engine::git::GitEngine;
 
-    let _lock = HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let (_tmp, repo, saved) = repo_with_isolated_global(None);
+    let (_tmp, repo, _env) = repo_with_isolated_global(None);
 
     let identity = GitEngine::new().identity_configured(&repo).unwrap();
-    restore_env(saved);
 
     assert_eq!(identity.name, None);
     assert_eq!(identity.email, None);

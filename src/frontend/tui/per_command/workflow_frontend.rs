@@ -106,7 +106,7 @@ impl WorkflowFrontend for TuiCommandFrontend {
     fn report_step_status(&mut self, step: &WorkflowStep, status: WorkflowStepStatus) {
         self.messages
             .info(format!("workflow step '{}': {:?}", step.name, status));
-        if let Ok(mut guard) = self.workflow_view.lock() {
+        self.workflow.update_view(|guard| {
             if let Some(view) = guard.as_mut() {
                 let view_status = workflow_step_view_status(&status);
                 if let Some(s) = view.steps.iter_mut().find(|s| s.name == step.name) {
@@ -125,7 +125,7 @@ impl WorkflowFrontend for TuiCommandFrontend {
                     view.current_step.clone()
                 };
             }
-        }
+        });
     }
 
     fn report_step_output(&mut self, _step: &WorkflowStep, _output: StepOutput) {}
@@ -156,7 +156,7 @@ impl WorkflowFrontend for TuiCommandFrontend {
     }
 
     fn report_workflow_progress(&mut self, steps: &[WorkflowStepProgressInfo]) {
-        if let Ok(mut guard) = self.workflow_view.lock() {
+        self.workflow.update_view(|guard| {
             let view =
                 guard.get_or_insert_with(crate::frontend::tui::tabs::WorkflowViewState::default);
             let main_steps = steps.iter().map(|s| {
@@ -204,7 +204,7 @@ impl WorkflowFrontend for TuiCommandFrontend {
                 .find(|s| matches!(s.status, WorkflowStepStatus::Running))
                 .map(|s| s.name.clone());
             view.max_concurrent = steps.first().and_then(|s| s.max_concurrent);
-        }
+        });
     }
 
     fn report_step_interactive_launch(
@@ -226,20 +226,7 @@ impl WorkflowFrontend for TuiCommandFrontend {
             // currently-focused group slot's live content.
             self.recreate_parallel_container_io(&step.name);
         } else {
-            // Sequential steps reuse the backbone slot; flag its parser for
-            // a reset so the previous step's terminal content is cleared.
-            self.pty_reset_flag
-                .store(true, std::sync::atomic::Ordering::Relaxed);
             self.recreate_container_io();
-        }
-
-        if let Ok(mut name) = self.container_name_shared.lock() {
-            *name = None;
-        }
-        // An agent container (including a setup/teardown step's `on_failure`
-        // agent) is titled with the agent, never a phase step.
-        if let Ok(mut title) = self.container_title_shared.lock() {
-            *title = None;
         }
 
         self.messages
@@ -247,12 +234,7 @@ impl WorkflowFrontend for TuiCommandFrontend {
     }
 
     fn report_container_exited(&mut self, exit_code: i32) {
-        // Publish the exit so the TUI event loop closes the container window
-        // (leaving the summary bar). The engine only calls this on real
-        // container death — never for stuck states or during a yolo countdown.
-        if let Ok(mut guard) = self.container_exit_shared.lock() {
-            *guard = Some(exit_code);
-        }
+        self.container.exited(exit_code);
     }
 
     fn confirm_resume(&mut self, mismatch: &ResumeMismatch) -> Result<bool, EngineError> {
@@ -282,7 +264,7 @@ impl WorkflowFrontend for TuiCommandFrontend {
         self.phase_stream_title = Some(format!("[{}] {description}", kind.label()));
         self.phase_stream_open = false;
         upsert_phase_step(
-            &self.workflow_view,
+            &self.workflow,
             step_kind(kind),
             description,
             StepViewStatus::Running,
@@ -297,14 +279,7 @@ impl WorkflowFrontend for TuiCommandFrontend {
     fn on_phase_step_output(&mut self, _kind: PhaseKind, line: &str) {
         if !self.phase_stream_open {
             self.phase_stream_open = true;
-            self.pty_reset_flag
-                .store(true, std::sync::atomic::Ordering::Relaxed);
-            if let Ok(mut name) = self.container_name_shared.lock() {
-                *name = None;
-            }
-            if let Ok(mut title) = self.container_title_shared.lock() {
-                *title = self.phase_stream_title.clone();
-            }
+            self.launch_sequential_container(self.phase_stream_title.clone());
         }
         let _ = self.stdout_tx.send(format!("{line}\r\n").into_bytes());
     }
@@ -314,7 +289,7 @@ impl WorkflowFrontend for TuiCommandFrontend {
         self.messages
             .success(format!("{}: {description}", kind.label()));
         upsert_phase_step(
-            &self.workflow_view,
+            &self.workflow,
             step_kind(kind),
             description,
             StepViewStatus::Done,
@@ -337,7 +312,7 @@ impl WorkflowFrontend for TuiCommandFrontend {
         };
         self.messages.error_msg(msg);
         upsert_phase_step(
-            &self.workflow_view,
+            &self.workflow,
             step_kind(kind),
             description,
             StepViewStatus::Error,
@@ -350,19 +325,7 @@ impl WorkflowFrontend for TuiCommandFrontend {
     /// old `set_parallel_step_*` no-op defaults ignored them: the parallel
     /// view has its own wiring.
     fn attach_engine(&mut self, handles: crate::engine::workflow::frontend::EngineHandles) {
-        if handles.step.is_some() {
-            return;
-        }
-        if let Some(tx) = handles.requests {
-            if let Ok(mut guard) = self.engine_tx_shared.lock() {
-                *guard = Some(tx);
-            }
-        }
-        if let Some(sender) = handles.stuck {
-            if let Ok(mut guard) = self.stuck_sender_shared.lock() {
-                *guard = Some(sender);
-            }
-        }
+        self.container.attach_engine(handles);
     }
 
     // ── Parallel group callbacks (WI-0096) ───────────────────────────────
@@ -476,9 +439,7 @@ impl TuiCommandFrontend {
     /// way a container exit closes a PTY step's window.
     fn close_phase_stream(&mut self, exit_code: i32) {
         if std::mem::take(&mut self.phase_stream_open) {
-            if let Ok(mut guard) = self.container_exit_shared.lock() {
-                *guard = Some(exit_code);
-            }
+            self.container.exited(exit_code);
         }
     }
 }
@@ -574,45 +535,44 @@ fn step_kind(kind: PhaseKind) -> WorkflowStepKind {
 /// the main/teardown steps already tracked; a new teardown entry is appended,
 /// since teardown can only start once every main step is done.
 fn upsert_phase_step(
-    workflow_view: &crate::frontend::tui::tabs::SharedWorkflowViewState,
+    workflow_view: &crate::frontend::tui::tabs::SharedWorkflowPresentation,
     kind: WorkflowStepKind,
     description: &str,
     status: StepViewStatus,
 ) {
     use crate::frontend::tui::tabs::{WorkflowStepView, WorkflowViewState};
 
-    let Ok(mut guard) = workflow_view.lock() else {
-        return;
-    };
-    let view = guard.get_or_insert_with(WorkflowViewState::default);
-    if let Some(existing) = view
-        .steps
-        .iter_mut()
-        .rev()
-        .find(|s| s.kind == kind && s.name == description)
-    {
-        existing.status = status;
-        return;
-    }
-    let step = WorkflowStepView {
-        name: description.to_string(),
-        status,
-        agent: None,
-        model: None,
-        depends_on: Vec::new(),
-        kind,
-    };
-    match kind {
-        WorkflowStepKind::Setup => {
-            let pos = view
-                .steps
-                .iter()
-                .position(|s| s.kind != WorkflowStepKind::Setup)
-                .unwrap_or(view.steps.len());
-            view.steps.insert(pos, step);
+    workflow_view.update_view(|guard| {
+        let view = guard.get_or_insert_with(WorkflowViewState::default);
+        if let Some(existing) = view
+            .steps
+            .iter_mut()
+            .rev()
+            .find(|s| s.kind == kind && s.name == description)
+        {
+            existing.status = status;
+            return;
         }
-        WorkflowStepKind::Teardown | WorkflowStepKind::Agent => view.steps.push(step),
-    }
+        let step = WorkflowStepView {
+            name: description.to_string(),
+            status,
+            agent: None,
+            model: None,
+            depends_on: Vec::new(),
+            kind,
+        };
+        match kind {
+            WorkflowStepKind::Setup => {
+                let pos = view
+                    .steps
+                    .iter()
+                    .position(|s| s.kind != WorkflowStepKind::Setup)
+                    .unwrap_or(view.steps.len());
+                view.steps.insert(pos, step);
+            }
+            WorkflowStepKind::Teardown | WorkflowStepKind::Agent => view.steps.push(step),
+        }
+    });
 }
 
 #[cfg(test)]
@@ -625,6 +585,56 @@ mod tests {
     use crate::frontend::tui::command_frontend::TuiCommandFrontend;
     use crate::frontend::tui::dialogs::{DialogRequest, DialogResponse};
     use crate::frontend::tui::tabs::StepViewStatus;
+
+    fn has_launch(frontend: &TuiCommandFrontend) -> bool {
+        frontend
+            .container
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| {
+                matches!(
+                    event,
+                    crate::frontend::tui::tabs::ContainerSlotEvent::SequentialLaunched { .. }
+                )
+            })
+    }
+
+    fn launch_title(frontend: &TuiCommandFrontend) -> Option<String> {
+        frontend
+            .container
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find_map(|event| match event {
+                crate::frontend::tui::tabs::ContainerSlotEvent::SequentialLaunched {
+                    title,
+                    ..
+                } => Some(title.clone()),
+                _ => None,
+            })
+            .flatten()
+    }
+
+    fn exit_code(frontend: &TuiCommandFrontend) -> Option<i32> {
+        frontend
+            .container
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find_map(|event| match event {
+                crate::frontend::tui::tabs::ContainerSlotEvent::SequentialExited {
+                    exit_code,
+                    ..
+                } => Some(*exit_code),
+                _ => None,
+            })
+    }
 
     fn make_frontend() -> (
         TuiCommandFrontend,
@@ -656,19 +666,19 @@ mod tests {
             frontend.report_workflow_context_path(path);
             frontend.report_workflow_progress(&[]);
             assert_eq!(
-                frontend.workflow_context_path.lock().unwrap().as_deref(),
+                frontend.workflow.snapshot().context_path.as_deref(),
                 Some(path)
             );
             frontend.report_workflow_completed(&outcome);
             assert_eq!(
-                frontend.workflow_context_path.lock().unwrap().as_deref(),
+                frontend.workflow.snapshot().context_path.as_deref(),
                 Some(path)
             );
             frontend.report_workflow_summary(&WorkflowSummary {
                 steps_completed: 1,
                 steps_failed: 0,
             });
-            assert!(frontend.workflow_context_path.lock().unwrap().is_none());
+            assert!(frontend.workflow.snapshot().context_path.is_none());
         }
     }
 
@@ -872,7 +882,7 @@ mod tests {
         let (mut frontend, _req_rx, _resp_tx) = make_frontend();
         frontend.report_parallel_step_container("build", "awman-build-99");
 
-        let mut q = frontend.container_slot_events.lock().unwrap();
+        let mut q = frontend.container.events.lock().unwrap();
         let event = q.pop_front().expect("an event must be queued");
         match event {
             ContainerSlotEvent::ContainerName {
@@ -995,7 +1005,7 @@ mod tests {
             "a cancel flag must be stashed for later ticks"
         );
 
-        let mut q = frontend.container_slot_events.lock().unwrap();
+        let mut q = frontend.container.events.lock().unwrap();
         let event = q.pop_front().expect("an event must be queued");
         match event {
             ContainerSlotEvent::YoloStarted {
@@ -1024,7 +1034,7 @@ mod tests {
         frontend.parallel_step_yolo_countdown_started("build");
         // Drain the YoloStarted event pushed above so this test only
         // inspects the tick's own event.
-        frontend.container_slot_events.lock().unwrap().clear();
+        frontend.container.events.lock().unwrap().clear();
 
         let result = frontend
             .parallel_step_yolo_countdown_tick(
@@ -1035,7 +1045,7 @@ mod tests {
             .unwrap();
         assert_eq!(result, YoloTickOutcome::Continue);
 
-        let mut q = frontend.container_slot_events.lock().unwrap();
+        let mut q = frontend.container.events.lock().unwrap();
         let event = q.pop_front().expect("an event must be queued");
         match event {
             ContainerSlotEvent::YoloTick {
@@ -1102,12 +1112,12 @@ mod tests {
 
         let (mut frontend, _req_rx, _resp_tx) = make_frontend();
         frontend.parallel_step_yolo_countdown_started("build");
-        frontend.container_slot_events.lock().unwrap().clear();
+        frontend.container.events.lock().unwrap().clear();
 
         frontend.parallel_step_yolo_countdown_finished("build");
         assert!(!frontend.pending_parallel_yolo_cancel.contains_key("build"));
 
-        let mut q = frontend.container_slot_events.lock().unwrap();
+        let mut q = frontend.container.events.lock().unwrap();
         let event = q.pop_front().expect("an event must be queued");
         match event {
             ContainerSlotEvent::YoloFinished { step_name } => {
@@ -1126,7 +1136,7 @@ mod tests {
         let (mut frontend, _req_rx, _resp_tx) = make_frontend();
         frontend.report_phase_step_interactive_launch(PhaseKind::Setup, "run_shell: make deps");
         assert_eq!(
-            frontend.container_title_shared.lock().unwrap().as_deref(),
+            launch_title(&frontend).as_deref(),
             Some("[setup] run_shell: make deps")
         );
 
@@ -1140,7 +1150,7 @@ mod tests {
             abort_on_failure: false,
         };
         frontend.report_step_interactive_launch(&on_failure, "claude", None);
-        assert!(frontend.container_title_shared.lock().unwrap().is_none());
+        assert!(launch_title(&frontend).is_none());
     }
 
     #[test]
@@ -1150,7 +1160,7 @@ mod tests {
         let (mut frontend, _req_rx, _resp_tx) = make_frontend();
         assert!(frontend.supports_interactive_recovery());
         let _ = frontend.container_io.take();
-        *frontend.container_name_shared.lock().unwrap() = Some("old".into());
+        frontend.container.running("old".into());
 
         frontend.report_phase_step_interactive_launch(PhaseKind::Teardown, "clean up");
 
@@ -1158,34 +1168,38 @@ mod tests {
             frontend.container_io.is_some(),
             "fresh PTY channels must be ready"
         );
-        assert!(frontend
-            .pty_reset_flag
-            .load(std::sync::atomic::Ordering::Relaxed));
-        assert!(frontend.container_name_shared.lock().unwrap().is_none());
+        assert!(has_launch(&frontend));
     }
 
     #[test]
     fn streamed_phase_step_output_goes_to_the_container_window_not_the_status_log() {
         let (mut frontend, _req_rx, _resp_tx) = make_frontend();
-        let (stdout_tx, mut stdout_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-        frontend.stdout_tx = stdout_tx;
-        *frontend.container_name_shared.lock().unwrap() = Some("old".into());
+        frontend.container.running("old".into());
 
         frontend.on_phase_step_started(PhaseKind::Teardown, "push branch");
         frontend.on_phase_step_output(PhaseKind::Teardown, "To github.com:o/r.git");
         frontend.on_phase_step_output(PhaseKind::Teardown, "done");
 
+        let mut queue = frontend.container.events.lock().unwrap();
+        let io = queue
+            .iter_mut()
+            .find_map(|e| match e {
+                crate::frontend::tui::tabs::ContainerSlotEvent::SequentialLaunched {
+                    io, ..
+                } => Some(io),
+                _ => None,
+            })
+            .unwrap();
+        let stdout_rx = &mut io.stdout_rx;
         assert_eq!(
             stdout_rx.try_recv().unwrap(),
             b"To github.com:o/r.git\r\n".to_vec()
         );
         assert_eq!(stdout_rx.try_recv().unwrap(), b"done\r\n".to_vec());
-        assert!(frontend
-            .pty_reset_flag
-            .load(std::sync::atomic::Ordering::Relaxed));
-        assert!(frontend.container_name_shared.lock().unwrap().is_none());
+        drop(queue);
+        assert!(has_launch(&frontend));
         assert_eq!(
-            frontend.container_title_shared.lock().unwrap().as_deref(),
+            launch_title(&frontend).as_deref(),
             Some("[teardown] push branch")
         );
         assert!(!frontend
@@ -1194,10 +1208,10 @@ mod tests {
             .unwrap()
             .iter()
             .any(|e| e.text.contains("To github.com")));
-        assert!(frontend.container_exit_shared.lock().unwrap().is_none());
+        assert!(exit_code(&frontend).is_none());
 
         frontend.on_phase_step_completed(PhaseKind::Teardown, "push branch");
-        assert_eq!(*frontend.container_exit_shared.lock().unwrap(), Some(0));
+        assert_eq!(exit_code(&frontend), Some(0));
     }
 
     #[test]
@@ -1206,7 +1220,7 @@ mod tests {
         frontend.on_phase_step_started(PhaseKind::Teardown, "open PR");
         frontend.on_phase_step_output(PhaseKind::Teardown, "error");
         frontend.on_phase_step_failed(PhaseKind::Teardown, "open PR", 3, "");
-        assert_eq!(*frontend.container_exit_shared.lock().unwrap(), Some(3));
+        assert_eq!(exit_code(&frontend), Some(3));
     }
 
     #[test]
@@ -1214,7 +1228,7 @@ mod tests {
         let (mut frontend, _req_rx, _resp_tx) = make_frontend();
         frontend.on_phase_step_started(PhaseKind::Setup, "fetch");
         frontend.on_phase_step_completed(PhaseKind::Setup, "fetch");
-        assert!(frontend.container_exit_shared.lock().unwrap().is_none());
+        assert!(exit_code(&frontend).is_none());
     }
 
     #[test]
@@ -1223,7 +1237,7 @@ mod tests {
 
         let (mut frontend, _req_rx, _resp_tx) = make_frontend();
         frontend.report_phase_step_container_exited(PhaseKind::Setup, 2);
-        assert_eq!(*frontend.container_exit_shared.lock().unwrap(), Some(2));
+        assert_eq!(exit_code(&frontend), Some(2));
     }
 
     #[test]
@@ -1231,10 +1245,10 @@ mod tests {
         use crate::engine::workflow::frontend::WorkflowFrontend;
 
         let (mut frontend, _req_rx, _resp_tx) = make_frontend();
-        assert!(frontend.container_exit_shared.lock().unwrap().is_none());
+        assert!(exit_code(&frontend).is_none());
 
         frontend.report_container_exited(137);
-        assert_eq!(*frontend.container_exit_shared.lock().unwrap(), Some(137));
+        assert_eq!(exit_code(&frontend), Some(137));
     }
 
     #[test]
@@ -1243,11 +1257,23 @@ mod tests {
         use crate::engine::workflow::EngineRequest;
 
         let (mut frontend, _req_rx, _resp_tx) = make_frontend();
-        assert!(frontend.engine_tx_shared.lock().unwrap().is_none());
+        assert!(frontend.container.events.lock().unwrap().is_empty());
 
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<EngineRequest>();
         frontend.attach_engine(EngineHandles::requests(tx));
-        assert!(frontend.engine_tx_shared.lock().unwrap().is_some());
+        assert!(frontend
+            .container
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| matches!(
+                e,
+                crate::frontend::tui::tabs::ContainerSlotEvent::EngineAttached {
+                    requests: Some(_),
+                    ..
+                }
+            )));
     }
 
     /// A per-parallel-step handover must not overwrite the workflow-level
@@ -1262,7 +1288,7 @@ mod tests {
         let (sender, _rx) = tokio::sync::broadcast::channel::<StuckEvent>(4);
         frontend.attach_engine(EngineHandles::step_stuck("a", std::sync::Arc::new(sender)));
         assert!(
-            frontend.stuck_sender_shared.lock().unwrap().is_none(),
+            frontend.container.events.lock().unwrap().is_empty(),
             "a parallel step's stuck channel must not land in the tab-level slot"
         );
     }
@@ -1286,8 +1312,7 @@ mod tests {
 
         // The rebuilt channels publish fresh stdin/resize senders for the
         // TUI event loop to swap to.
-        assert!(frontend.stdin_tx_shared.lock().unwrap().is_some());
-        assert!(frontend.resize_tx_shared.lock().unwrap().is_some());
+        assert!(has_launch(&frontend));
     }
 
     // ── setup/teardown steps in the Workflow Overview (local execution) ──────
@@ -1314,7 +1339,7 @@ mod tests {
 
         frontend.on_phase_step_started(PhaseKind::Teardown, "clean up");
 
-        let guard = frontend.workflow_view.lock().unwrap();
+        let guard = frontend.workflow.snapshot().view;
         let view = guard.as_ref().expect("workflow view must be seeded");
         let steps: Vec<(WorkflowStepKind, &str, StepViewStatus)> = view
             .steps
@@ -1346,7 +1371,7 @@ mod tests {
         frontend.on_phase_step_started(PhaseKind::Setup, "install deps");
         frontend.on_phase_step_failed(PhaseKind::Setup, "install deps", 1, "boom");
 
-        let guard = frontend.workflow_view.lock().unwrap();
+        let guard = frontend.workflow.snapshot().view;
         let view = guard.as_ref().expect("workflow view must be seeded");
         assert_eq!(
             view.steps.len(),

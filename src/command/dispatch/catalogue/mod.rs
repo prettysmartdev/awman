@@ -3,7 +3,7 @@
 //!
 //! Frontends never hard-code command names or flag names; they ask the
 //! catalogue (or its projections) for what's available. The catalogue MUST
-//! enumerate every command currently defined in `oldsrc/cli.rs` exactly.
+//! enumerate every command currently exposed by the command layer.
 
 use std::sync::OnceLock;
 

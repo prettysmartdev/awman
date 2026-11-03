@@ -1,4 +1,18 @@
 use super::*;
+
+pub(crate) fn test_slot_io() -> (tokio::sync::mpsc::UnboundedSender<Vec<u8>>, ContainerSlotIo) {
+    let (stdout_tx, stdout_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (stdin_tx, _) = tokio::sync::mpsc::unbounded_channel();
+    let (resize_tx, _) = tokio::sync::mpsc::unbounded_channel();
+    (
+        stdout_tx,
+        ContainerSlotIo {
+            stdout_rx,
+            stdin_tx,
+            resize_tx,
+        },
+    )
+}
 use crate::data::session::Session;
 
 fn make_test_session() -> Session {
@@ -93,6 +107,34 @@ fn new_tab_git_diff_summary_is_none() {
     );
 }
 
+#[tokio::test]
+async fn a_new_tab_polls_its_git_root_into_the_sidebar_summary() {
+    let tmp = tempfile::tempdir().unwrap();
+    let status = std::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(tmp.path())
+        .status()
+        .unwrap();
+    assert!(status.success());
+    std::fs::write(tmp.path().join("new.txt"), "hello\n").unwrap();
+
+    let tab = Tab::new(Session::for_tests(tmp.path()));
+    assert_eq!(tab.git_poll_root.as_deref(), Some(tmp.path()));
+    for _ in 0..500 {
+        let found = tab
+            .git_diff_summary
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|summary| summary.files.iter().any(|file| file.path == "new.txt"));
+        if found {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("the tab's poll never published the repo's summary");
+}
+
 // ── mid-workflow container exit (poll_container_exit) ─────────────────
 
 #[test]
@@ -101,9 +143,9 @@ fn container_exit_report_closes_window_and_leaves_summary() {
     tab.start_container("claude".into(), "awman-abc".into(), 80, 24);
     tab.container_window_state = ContainerWindowState::Maximized;
     tab.container_rendered = true; // pretend a frame made it to screen
-    *tab.shared.container_exit_shared.lock().unwrap() = Some(137);
+    tab.shared.container.exited(137);
 
-    tab.poll_container_exit();
+    tab.drain_container_slot_events();
 
     assert_eq!(tab.container_window_state, ContainerWindowState::Hidden);
     let summary = tab
@@ -119,7 +161,7 @@ fn container_exit_report_closes_window_and_leaves_summary() {
         "the slot's container_info must survive so later workflow steps keep stats polling"
     );
     assert!(
-        tab.shared.container_exit_shared.lock().unwrap().is_none(),
+        tab.shared.container.events.lock().unwrap().is_empty(),
         "the exit slot is consumed"
     );
 }
@@ -130,7 +172,7 @@ fn poll_container_exit_is_noop_without_a_reported_exit() {
     tab.start_container("claude".into(), "awman-abc".into(), 80, 24);
     tab.container_window_state = ContainerWindowState::Maximized;
 
-    tab.poll_container_exit();
+    tab.drain_container_slot_events();
 
     // No exit was reported (stuck container / yolo countdown running /
     // container alive) — the window must stay open.
@@ -147,8 +189,8 @@ fn late_bytes_after_container_exit_do_not_reopen_window() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
     tab.focused_slot_mut().unwrap().container_stdout_rx = Some(rx);
 
-    *tab.shared.container_exit_shared.lock().unwrap() = Some(0);
-    tab.poll_container_exit();
+    tab.shared.container.exited(0);
+    tab.drain_container_slot_events();
     assert_eq!(tab.container_window_state, ContainerWindowState::Hidden);
 
     // Bytes still in flight from the dead container arrive afterwards.
@@ -162,7 +204,9 @@ fn late_bytes_after_container_exit_do_not_reopen_window() {
 
     // The next step launches: the engine sets pty_reset_flag, after which
     // fresh output auto-opens the window again.
-    tab.shared.pty_reset_flag.store(true, Ordering::Relaxed);
+    let (tx, io) = test_slot_io();
+    tab.shared.container.launch(None, io);
+    tab.drain_container_slot_events();
     tx.send(b"next step output".to_vec()).unwrap();
     tab.drain_container_output();
     assert_eq!(tab.container_window_state, ContainerWindowState::Maximized);
@@ -986,7 +1030,8 @@ fn evicting_focused_slot_advances_focus_to_next_live_slot() {
     tab.focused_slot_idx = 1; // focus "b"
 
     tab.shared
-        .container_slot_events
+        .container
+        .events
         .lock()
         .unwrap()
         .push_back(ContainerSlotEvent::Exited {
@@ -1016,7 +1061,8 @@ fn evicting_slot_before_focused_shifts_index_down() {
     tab.focused_slot_idx = 2; // focus "c"
 
     tab.shared
-        .container_slot_events
+        .container
+        .events
         .lock()
         .unwrap()
         .push_back(ContainerSlotEvent::Exited {
@@ -1040,7 +1086,8 @@ fn evicting_last_slot_hides_the_container_window() {
     tab.container_window_state = ContainerWindowState::Maximized;
 
     tab.shared
-        .container_slot_events
+        .container
+        .events
         .lock()
         .unwrap()
         .push_back(ContainerSlotEvent::Exited {
@@ -1133,7 +1180,8 @@ fn launched_slot_parser_is_sized_to_the_overlay_not_80x24() {
     let (_stdout_tx, stdout_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
     let (stdin_tx, _stdin_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
     tab.shared
-        .container_slot_events
+        .container
+        .events
         .lock()
         .unwrap()
         .push_back(ContainerSlotEvent::Launched {
@@ -1168,7 +1216,8 @@ fn container_name_event_updates_the_matching_slot() {
     tab.container_slots.push(slot("test"));
 
     tab.shared
-        .container_slot_events
+        .container
+        .events
         .lock()
         .unwrap()
         .push_back(ContainerSlotEvent::ContainerName {
@@ -1261,7 +1310,7 @@ fn group_started_stashes_backbone_and_group_finished_restores_it() {
 
     // Parallel group starts: the backbone goes dormant, group slots join.
     {
-        let mut q = tab.shared.container_slot_events.lock().unwrap();
+        let mut q = tab.shared.container.events.lock().unwrap();
         q.push_back(ContainerSlotEvent::GroupStarted);
         q.push_back(ContainerSlotEvent::Launched {
             step_name: "a".into(),
@@ -1282,7 +1331,7 @@ fn group_started_stashes_backbone_and_group_finished_restores_it() {
 
     // Group drains and finishes: the backbone is restored.
     {
-        let mut q = tab.shared.container_slot_events.lock().unwrap();
+        let mut q = tab.shared.container.events.lock().unwrap();
         q.push_back(ContainerSlotEvent::Exited {
             step_name: "a".into(),
         });
@@ -1313,15 +1362,16 @@ fn group_started_evicts_summary_bar_and_unblocks_auto_open() {
     tab.container_rendered = true;
 
     // Leader is killed — leaves a red summary bar and suppresses auto-open.
-    *tab.shared.container_exit_shared.lock().unwrap() = Some(137);
-    tab.poll_container_exit();
+    tab.shared.container.exited(137);
+    tab.drain_container_slot_events();
     assert_eq!(tab.container_window_state, ContainerWindowState::Hidden);
     assert!(tab.last_container_summary.is_some());
     assert!(tab.suppress_container_auto_open);
 
     // Engine fires GroupStarted for the first parallel group.
     tab.shared
-        .container_slot_events
+        .container
+        .events
         .lock()
         .unwrap()
         .push_back(ContainerSlotEvent::GroupStarted);
@@ -1338,7 +1388,8 @@ fn group_started_evicts_summary_bar_and_unblocks_auto_open() {
     // First container in the new group launches and produces output.
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
     tab.shared
-        .container_slot_events
+        .container
+        .events
         .lock()
         .unwrap()
         .push_back(ContainerSlotEvent::Launched {
@@ -1369,7 +1420,7 @@ fn yolo_started_shares_cancel_flag_and_tick_updates_slot_state() {
 
     let cancel_flag: SharedYoloCancelFlag = Arc::new(AtomicBool::new(false));
     {
-        let mut q = tab.shared.container_slot_events.lock().unwrap();
+        let mut q = tab.shared.container.events.lock().unwrap();
         q.push_back(ContainerSlotEvent::YoloStarted {
             step_name: "b".into(),
             cancel_flag: cancel_flag.clone(),
@@ -1410,7 +1461,7 @@ fn yolo_started_shares_cancel_flag_and_tick_updates_slot_state() {
 
     // Finishing clears both the flag and the displayed countdown.
     {
-        let mut q = tab.shared.container_slot_events.lock().unwrap();
+        let mut q = tab.shared.container.events.lock().unwrap();
         q.push_back(ContainerSlotEvent::YoloFinished {
             step_name: "b".into(),
         });
@@ -1608,13 +1659,13 @@ fn refresh_from_session_adopts_the_phase_workflow_and_container() {
 #[test]
 fn new_command_drops_workflow_context_and_ignores_late_reports() {
     let mut shared = super::TabSharedState::new();
-    let old_frontend_path = shared.workflow_context_path.clone();
-    *old_frontend_path.lock().unwrap() = Some("/host/context/previous".into());
+    let old_frontend_path = shared.workflow.clone();
+    old_frontend_path.set_context_path(Some("/host/context/previous".into()));
 
     shared.reset_for_new_command();
-    assert!(shared.workflow_context_path.lock().unwrap().is_none());
-    *old_frontend_path.lock().unwrap() = Some("/host/context/late-report".into());
-    assert!(shared.workflow_context_path.lock().unwrap().is_none());
+    assert!(shared.workflow.snapshot().context_path.is_none());
+    old_frontend_path.set_context_path(Some("/host/context/late-report".into()));
+    assert!(shared.workflow.snapshot().context_path.is_none());
 }
 
 #[test]
@@ -1664,4 +1715,331 @@ fn one_shot_agents_status_command_reaches_done() {
     assert!(
         matches!(tab.execution_phase, ExecutionPhase::Done { ref command, exit_code: 0 } if command == "agents status")
     );
+}
+
+#[test]
+fn sequential_launch_replaces_io_title_stats_and_parser_together() {
+    let mut tab = make_tab();
+    tab.start_container("claude".into(), "old-container".into(), 92, 31);
+    let (old_stdout, old_io) = test_slot_io();
+    tab.focused_slot_mut().unwrap().container_stdout_rx = Some(old_io.stdout_rx);
+    tab.focused_slot_mut()
+        .unwrap()
+        .vt100_parser
+        .process(b"old screen");
+    let info = tab
+        .focused_slot_mut()
+        .unwrap()
+        .container_info
+        .as_mut()
+        .unwrap();
+    info.stats_history.push((99.0, 123.0));
+    info.phase_step_title = Some("old title".into());
+    tab.container_window_state = ContainerWindowState::Maximized;
+    tab.container_rendered = true;
+    tab.shared.container.exited(137);
+
+    let (stdout, stdout_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (resize_tx, mut resize_rx) = tokio::sync::mpsc::unbounded_channel();
+    tab.shared.container.launch(
+        Some("[setup] install".into()),
+        ContainerSlotIo {
+            stdout_rx,
+            stdin_tx,
+            resize_tx,
+        },
+    );
+    tab.shared.container.running("new-container".into());
+    stdout.send(b"new screen".to_vec()).unwrap();
+    tab.drain_container_slot_events();
+    tab.drain_container_output();
+
+    let slot = tab.focused_slot().unwrap();
+    let info = slot.container_info.as_ref().unwrap();
+    assert_eq!(info.container_name, "new-container");
+    assert_eq!(info.phase_step_title.as_deref(), Some("[setup] install"));
+    assert!(info.stats_history.is_empty());
+    assert_eq!(slot.vt100_parser.screen().size(), (31, 92));
+    assert!(slot.vt100_parser.screen().contents().contains("new screen"));
+    assert!(!slot.vt100_parser.screen().contents().contains("old screen"));
+    assert!(old_stdout.send(b"late old bytes".to_vec()).is_err());
+    slot.container_stdin_tx
+        .as_ref()
+        .unwrap()
+        .send(b"input".to_vec())
+        .unwrap();
+    assert_eq!(stdin_rx.try_recv().unwrap(), b"input");
+    assert_eq!(resize_rx.try_recv().unwrap(), (92, 31));
+    assert_eq!(tab.container_window_state, ContainerWindowState::Maximized);
+    assert!(!tab.suppress_container_auto_open);
+}
+
+#[test]
+fn old_launch_callbacks_cannot_relabel_close_or_rewire_a_new_launch() {
+    let mut tab = make_tab();
+    tab.start_container("claude".into(), "old".into(), 80, 24);
+    let old = tab.shared.container.clone();
+    let (_stdout, io) = test_slot_io();
+    tab.shared.container.launch(None, io);
+    tab.shared.container.running("current".into());
+    let (current_tx, _current_rx) = tokio::sync::mpsc::unbounded_channel();
+    tab.shared
+        .container
+        .attach_engine(crate::engine::workflow::frontend::EngineHandles::requests(
+            current_tx.clone(),
+        ));
+    let (stale_tx, _stale_rx) = tokio::sync::mpsc::unbounded_channel();
+    old.running("stale".into());
+    old.exited(137);
+    old.attach_engine(crate::engine::workflow::frontend::EngineHandles::requests(
+        stale_tx,
+    ));
+    tab.container_window_state = ContainerWindowState::Maximized;
+    tab.drain_container_slot_events();
+    assert_eq!(
+        tab.focused_slot()
+            .unwrap()
+            .container_info
+            .as_ref()
+            .unwrap()
+            .container_name,
+        "current"
+    );
+    assert_eq!(tab.container_window_state, ContainerWindowState::Maximized);
+    assert!(tab.engine_tx.as_ref().unwrap().same_channel(&current_tx));
+    assert!(!tab.suppress_container_auto_open);
+}
+
+#[test]
+fn sequential_io_during_a_parallel_group_updates_only_the_dormant_backbone() {
+    let mut tab = make_tab();
+    tab.start_container("claude".into(), "backbone".into(), 80, 24);
+    tab.shared.container.push(ContainerSlotEvent::GroupStarted);
+    tab.shared.container.push(ContainerSlotEvent::Launched {
+        step_name: "build".into(),
+        agent: "codex".into(),
+        model: None,
+        io: None,
+    });
+    let (stdout, io) = test_slot_io();
+    tab.shared
+        .container
+        .launch(Some("[teardown] cleanup".into()), io);
+    tab.shared.container.running("cleanup".into());
+    tab.drain_container_slot_events();
+    assert_eq!(tab.focused_slot().unwrap().step_name, "build");
+    assert_eq!(tab.focused_slot().unwrap().agent_name(), "codex");
+    assert!(tab.focused_slot().unwrap().container_stdin_tx.is_none());
+    assert_eq!(
+        tab.dormant_slots[0]
+            .container_info
+            .as_ref()
+            .unwrap()
+            .container_name,
+        "cleanup"
+    );
+    tab.shared.container.push(ContainerSlotEvent::GroupFinished);
+    tab.drain_container_slot_events();
+    stdout.send(b"cleanup output".to_vec()).unwrap();
+    tab.drain_container_output();
+    assert!(tab
+        .focused_slot()
+        .unwrap()
+        .vt100_parser
+        .screen()
+        .contents()
+        .contains("cleanup output"));
+}
+
+#[test]
+fn reset_isolates_every_command_owned_feed_from_late_producers() {
+    let mut shared = TabSharedState::new();
+    let old = shared.clone();
+    let id = uuid::Uuid::new_v4();
+    old.workflow
+        .publish_remote(id, WorkflowViewState::default());
+    old.workflow.set_context_path(Some("/old/context".into()));
+    old.workflow.set_worktree_path(Some("/old/worktree".into()));
+    *old.yolo_state.lock().unwrap() = Some(YoloState {
+        step_name: "old".into(),
+        remaining_secs: 3,
+    });
+    old.container.push(ContainerSlotEvent::GroupStarted);
+    shared.reset_for_new_command();
+    old.container.running("late".into());
+    old.container.push(ContainerSlotEvent::Launched {
+        step_name: "late".into(),
+        agent: "claude".into(),
+        model: None,
+        io: None,
+    });
+    old.workflow
+        .publish_remote(id, WorkflowViewState::default());
+    old.yolo_cancel_flag
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let snapshot = shared.workflow.snapshot();
+    assert!(snapshot.view.is_none());
+    assert!(snapshot.invocation_id.is_none());
+    assert!(snapshot.context_path.is_none());
+    assert!(snapshot.worktree_path.is_none());
+    assert!(shared.container.events.lock().unwrap().is_empty());
+    assert!(shared.yolo_state.lock().unwrap().is_none());
+    assert!(!shared
+        .yolo_cancel_flag
+        .load(std::sync::atomic::Ordering::Relaxed));
+    assert!(old.command_cancel.is_cancelled());
+    assert!(!shared.command_cancel.is_cancelled());
+}
+
+#[test]
+fn workflow_snapshot_keeps_remote_identity_and_view_together() {
+    let workflow = SharedWorkflowPresentation::default();
+    let writer = workflow.clone();
+    let task = std::thread::spawn(move || {
+        for _ in 0..500 {
+            let id = uuid::Uuid::new_v4();
+            writer.publish_remote(
+                id,
+                WorkflowViewState {
+                    current_step: Some(id.to_string()),
+                    ..Default::default()
+                },
+            );
+        }
+    });
+    for _ in 0..500 {
+        let snapshot = workflow.snapshot();
+        if let Some(id) = snapshot.invocation_id {
+            assert_eq!(snapshot.view.unwrap().current_step, Some(id.to_string()));
+        }
+    }
+    task.join().unwrap();
+    workflow.set_context_path(Some("/old/context".into()));
+    workflow.set_worktree_path(Some("/old/worktree".into()));
+    workflow.publish_remote(uuid::Uuid::new_v4(), WorkflowViewState::default());
+    let snapshot = workflow.snapshot();
+    assert!(snapshot.context_path.is_none());
+    assert!(snapshot.worktree_path.is_none());
+}
+
+#[test]
+fn dropping_a_tab_cancels_its_command_without_cancelling_another_tab() {
+    let tab = make_tab();
+    let other = make_tab();
+    let token = tab.shared.command_cancel.clone();
+    drop(tab);
+    assert!(token.is_cancelled());
+    assert!(!other.shared.command_cancel.is_cancelled());
+}
+
+#[test]
+fn delayed_attach_exit_does_not_evict_a_reattached_step() {
+    let mut tab = make_tab();
+    let mut slot = ContainerSlot::new("build".into(), "claude".into(), 1000);
+    slot.container_info.as_mut().unwrap().container_name = "new-runtime-name".into();
+    tab.container_slots.push(slot);
+    tab.shared
+        .container
+        .push(ContainerSlotEvent::AttachedExited {
+            step_name: "build".into(),
+            container_name: "previous-runtime-name".into(),
+        });
+    tab.drain_container_slot_events();
+    assert_eq!(tab.container_slots.len(), 1);
+    tab.shared
+        .container
+        .push(ContainerSlotEvent::AttachedExited {
+            step_name: "build".into(),
+            container_name: "new-runtime-name".into(),
+        });
+    tab.drain_container_slot_events();
+    assert!(tab.container_slots.is_empty());
+}
+
+#[test]
+fn stuck_subscription_is_bound_to_its_launch_and_retains_events_before_tick() {
+    use crate::engine::workflow::frontend::EngineHandles;
+    let mut tab = make_tab();
+    tab.start_container("claude".into(), "old".into(), 80, 24);
+    let old = tab.shared.container.clone();
+    let (old_sender, _) = tokio::sync::broadcast::channel(8);
+    let old_sender = Arc::new(old_sender);
+    old.attach_engine(EngineHandles::stuck(old_sender.clone()));
+    old_sender.send(StuckEvent::Stuck).unwrap();
+    tab.drain_container_slot_events();
+    tab.drain_stuck_events();
+    assert!(tab.stuck);
+    let (_stdout, io) = test_slot_io();
+    tab.shared.container.launch(None, io);
+    let (sender, _) = tokio::sync::broadcast::channel(8);
+    let sender = Arc::new(sender);
+    tab.shared
+        .container
+        .attach_engine(EngineHandles::stuck(sender.clone()));
+    // A late old subscription and event cannot replace the new subscription.
+    old.attach_engine(EngineHandles::stuck(old_sender.clone()));
+    old_sender.send(StuckEvent::Stuck).unwrap();
+    sender.send(StuckEvent::Unstuck).unwrap();
+    tab.drain_container_slot_events();
+    tab.drain_stuck_events();
+    assert!(!tab.stuck);
+    sender.send(StuckEvent::Stuck).unwrap();
+    tab.drain_stuck_events();
+    assert!(tab.stuck);
+}
+
+#[test]
+fn completion_and_detach_disconnect_late_slot_events() {
+    let mut tab = make_tab();
+    tab.start_container("claude".into(), "attached".into(), 80, 24);
+    let old = tab.shared.container.clone();
+    tab.clear_container_slots();
+    old.push(ContainerSlotEvent::Launched {
+        step_name: "late".into(),
+        agent: "claude".into(),
+        model: None,
+        io: None,
+    });
+    tab.drain_container_slot_events();
+    assert!(tab.container_slots.is_empty());
+
+    let shared = tab.shared.clone();
+    let old_workflow = shared.workflow.clone();
+    tab.end_attach_session();
+    shared.container.push(ContainerSlotEvent::Launched {
+        step_name: "late attach".into(),
+        agent: "claude".into(),
+        model: None,
+        io: None,
+    });
+    old_workflow.publish_remote(uuid::Uuid::new_v4(), WorkflowViewState::default());
+    tab.drain_container_slot_events();
+    assert!(tab.container_slots.is_empty());
+    assert!(tab.shared.workflow.snapshot().view.is_none());
+    assert!(shared.command_cancel.is_cancelled());
+    assert!(Arc::ptr_eq(&tab.shared.status_log, &shared.status_log));
+}
+
+#[test]
+fn stale_events_for_an_absent_parallel_slot_do_not_reenable_auto_open() {
+    let mut tab = make_tab();
+    tab.suppress_container_auto_open = true;
+    tab.shared
+        .container
+        .push(ContainerSlotEvent::ContainerName {
+            step_name: "exited".into(),
+            container_name: "old-name".into(),
+        });
+    tab.shared.container.push(ContainerSlotEvent::Stuck {
+        step_name: "exited".into(),
+    });
+    tab.shared.container.push(ContainerSlotEvent::YoloTick {
+        step_name: "exited".into(),
+        remaining_secs: 8,
+    });
+    tab.drain_container_slot_events();
+    assert!(tab.container_slots.is_empty());
+    assert!(tab.suppress_container_auto_open);
+    assert!(!tab.stuck);
 }

@@ -12,6 +12,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::data::error::DataError;
+use crate::data::fs::config_file::write_config_file_atomically;
 use crate::data::session::AgentName;
 
 /// Filename of the persisted metadata file inside a pulled library directory.
@@ -53,7 +54,8 @@ pub fn write_library_meta(library_dir: &Path, meta: &SkillLibraryMeta) -> Result
     let path = library_dir.join(LIBRARY_META_FILENAME);
     let content =
         serde_json::to_string_pretty(meta).map_err(|e| DataError::ConfigSerialize { source: e })?;
-    std::fs::write(&path, content).map_err(|e| DataError::io(&path, e))
+    // Atomic: overlay resolution reads this file and fails on a partial one.
+    write_config_file_atomically(&path, &content)
 }
 
 /// A parsed `<owner>/<repo>` GitHub slug, sanitized for use as a directory

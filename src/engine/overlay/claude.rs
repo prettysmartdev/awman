@@ -19,8 +19,7 @@ pub(crate) fn sanitize_claude_config(
         obj.remove("oauthAccount");
 
         // Mark `/workspace` as a trusted project so Claude does not prompt for
-        // trust inside the container. Mirrors legacy
-        // `oldsrc/runtime/mod.rs::sanitize_claude_config`.
+        // trust inside the container.
         let projects = obj
             .entry("projects".to_string())
             .or_insert_with(|| serde_json::Value::Object(Default::default()));

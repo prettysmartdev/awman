@@ -44,7 +44,9 @@ use crate::engine::agent_runtime::frontend::AgentIo;
 use crate::engine::container::attach_socket::AttachSocketGuard;
 use crate::engine::container::instance::{handle_now, ContainerId};
 use crate::engine::container::io_bridge::{BridgeConfig, CancelFn};
-use crate::engine::container::options::{ContainerName, ImageRef, ResolvedContainerOptions};
+use crate::engine::container::options::{
+    ContainerName, ImageRef, PromptFileGuard, ResolvedContainerOptions,
+};
 use crate::engine::credential_refresh::CredentialLease;
 use crate::engine::error::EngineError;
 
@@ -384,6 +386,7 @@ pub(super) fn spawn_pty_bridged(
     // returns) and into the execution backend, so each lease brackets the child
     // process it credentials.
     let leases = std::mem::take(&mut instance.leases);
+    let prompt_files = std::mem::take(&mut instance.options.prompt_files);
 
     let (cols, rows) = io.initial_size.expect("PTY path requires initial_size");
     let pty_system = native_pty_system();
@@ -458,6 +461,7 @@ pub(super) fn spawn_pty_bridged(
         started_at,
         attach_socket,
         leases,
+        prompt_files,
     };
     Ok(AgentExecution::new(
         handle,
@@ -486,6 +490,7 @@ pub(super) fn spawn_piped(
 
     // Move leases into the backend; assert one exists before spawn (INV-6).
     let leases = std::mem::take(&mut instance.leases);
+    let prompt_files = std::mem::take(&mut instance.options.prompt_files);
     assert_leases_before_spawn(&instance.options, &leases);
 
     let mut child = spawn_child(cli, &mut cmd)?;
@@ -517,6 +522,7 @@ pub(super) fn spawn_piped(
         started_at,
         attach_socket: None,
         leases,
+        prompt_files,
     };
     Ok(AgentExecution::new(
         handle,
@@ -565,6 +571,7 @@ pub(super) fn spawn_piped_interactive(
 
     // Move leases into the backend; assert one exists before spawn (INV-6).
     let leases = std::mem::take(&mut instance.leases);
+    let prompt_files = std::mem::take(&mut instance.options.prompt_files);
     assert_leases_before_spawn(&instance.options, &leases);
 
     let mut child = spawn_child(cli, &mut cmd)?;
@@ -585,6 +592,7 @@ pub(super) fn spawn_piped_interactive(
         started_at,
         attach_socket: None,
         leases,
+        prompt_files,
     };
     Ok(AgentExecution::new(
         handle,
@@ -647,6 +655,34 @@ pub(super) struct ContainerExecution {
     /// drop. Not read directly — held purely for its `Drop`.
     #[allow(dead_code)]
     leases: Vec<CredentialLease>,
+    /// This launch's mounted system-prompt files. Released when the child
+    /// exits: `wait_blocking` consumes this backend then, and an unwaited drop
+    /// hands them to a thread that outlasts the child.
+    prompt_files: Vec<PromptFileGuard>,
+}
+
+impl Drop for ContainerExecution {
+    /// An execution dropped unwaited leaves its container running for a later
+    /// reattach, and the guest can still read its mounted prompt files. Keep
+    /// them until the CLI child exits. When awman exits first the thread dies
+    /// with it and the files stay on disk for that guest.
+    fn drop(&mut self) {
+        let prompt_files = std::mem::take(&mut self.prompt_files);
+        let child = self.child.take();
+        let pty_child = self.pty_child.take();
+        if prompt_files.is_empty() || (child.is_none() && pty_child.is_none()) {
+            return;
+        }
+        std::thread::spawn(move || {
+            if let Some(mut child) = child {
+                let _ = child.wait();
+            }
+            if let Some(mut child) = pty_child {
+                let _ = child.wait();
+            }
+            drop(prompt_files);
+        });
+    }
 }
 
 impl ExecutionBackend for ContainerExecution {
@@ -1055,7 +1091,7 @@ mod tests {
             let temp = Arc::new(tempfile::tempdir().unwrap());
             Launcher {
                 name,
-                launch: Box::new(move |frontend, long| {
+                launch: Box::new(move |frontend, long, prompt_files| {
                     let dir = temp.path().join(if long { "long" } else { "short" });
                     std::fs::create_dir_all(&dir).unwrap();
                     let script = if long {
@@ -1067,18 +1103,290 @@ mod tests {
                         bin: fake_cli(&write_fake_cli(&dir, script)).bin,
                         ..original
                     };
-                    test_instance(
-                        cli,
-                        vec![ContainerOption::Image(ImageRef::new("img:latest"))],
-                    )
-                    .run_with_frontend(frontend)
-                    .unwrap()
+                    let mut options = vec![ContainerOption::Image(ImageRef::new("img:latest"))];
+                    options.extend(prompt_files.into_iter().map(prompt_option));
+                    test_instance(cli, options)
+                        .run_with_frontend(frontend)
+                        .unwrap()
                 }),
                 // The fake `run` ends by itself.
                 finish: Box::new(|| {}),
             }
         })
         .collect()
+    }
+
+    #[cfg(unix)]
+    fn prompt_option(guard: PromptFileGuard) -> ContainerOption {
+        ContainerOption::SystemPromptFile {
+            host_path: guard.host_path().to_path_buf(),
+            container_path: "/tmp/awman-ctx-prompt-test.md".into(),
+            flag: "--sp".into(),
+            guard,
+        }
+    }
+
+    #[cfg(unix)]
+    fn written_prompt(text: &str) -> (ContainerOption, std::path::PathBuf) {
+        use std::io::Write as _;
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(text.as_bytes()).unwrap();
+        let path = file.path().to_path_buf();
+        (prompt_option(PromptFileGuard::new(file)), path)
+    }
+
+    /// A stand-in guest: `run` blocks until `gate` exists (`stop` creates it),
+    /// lingers so an early release would be seen, then reads its mounted prompt
+    /// into `read`. It ignores the hangup a dropped PTY master delivers, as a
+    /// CLI whose container outlives the drop does.
+    #[cfg(unix)]
+    fn gated_cli(dir: &std::path::Path) -> ContainerCli {
+        let dir_text = dir.display();
+        let script = format!(
+            "#!/bin/sh\ntrap '' HUP\n\
+             if [ \"$1\" = stop ]; then : > {dir_text}/gate; fi\n\
+             if [ \"$1\" = run ]; then\n\
+             for a in \"$@\"; do case \"$a\" in *:/tmp/awman-ctx-prompt-*:ro) src=\"${{a%%:*}}\";; esac; done\n\
+             until [ -e {dir_text}/gate ]; do sleep 0.01; done\n\
+             sleep 0.1\n\
+             cat \"$src\" > {dir_text}/read\n\
+             fi\n"
+        );
+        fake_cli(&write_fake_cli(dir, &script))
+    }
+
+    #[cfg(unix)]
+    fn frontend_with(initial_size: Option<(u16, u16)>) -> Box<IoProbeFrontend> {
+        Box::new(IoProbeFrontend {
+            receivers: Arc::new(Mutex::new(None)),
+            initial_size,
+        })
+    }
+
+    /// The guest read the whole prompt, and only afterwards was it released.
+    #[cfg(unix)]
+    async fn assert_guest_read_then_released(
+        dir: &std::path::Path,
+        path: &std::path::Path,
+        text: &str,
+        context: &str,
+    ) {
+        let read = dir.join("read");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while path.exists() || !read.exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{context}: guest never read, or file never released"));
+        assert_eq!(std::fs::read_to_string(&read).unwrap(), text, "{context}");
+    }
+
+    #[cfg(unix)]
+    #[derive(Clone, Copy, Debug)]
+    enum ExitPath {
+        Completion,
+        Cancel,
+        DroppedWait,
+        DroppedExecution,
+    }
+
+    /// Every way a run ends, on both spawn paths: the guest can still read its
+    /// prompt at its very end, and the file is gone afterwards.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn prompt_file_outlives_the_guest_and_no_longer_on_every_exit_path() {
+        for initial_size in [None, Some((80, 24))] {
+            for exit in [
+                ExitPath::Completion,
+                ExitPath::Cancel,
+                ExitPath::DroppedWait,
+                ExitPath::DroppedExecution,
+            ] {
+                let context = format!("{exit:?}, pty={}", initial_size.is_some());
+                let temp = tempfile::tempdir().unwrap();
+                let gate = temp.path().join("gate");
+                let (option, path) = written_prompt("the prompt");
+                let mut execution = test_instance(
+                    gated_cli(temp.path()),
+                    vec![ContainerOption::Image(ImageRef::new("img")), option],
+                )
+                .run_with_frontend(frontend_with(initial_size))
+                .unwrap();
+                assert!(path.exists(), "{context}");
+                match exit {
+                    ExitPath::Completion => {
+                        std::fs::write(&gate, "").unwrap();
+                        execution.wait().await.unwrap();
+                        assert!(!path.exists(), "{context}: retained after wait");
+                    }
+                    ExitPath::Cancel => {
+                        execution.cancel_handle().unwrap().cancel().unwrap();
+                        execution.wait().await.unwrap();
+                        assert!(!path.exists(), "{context}: retained after wait");
+                    }
+                    ExitPath::DroppedWait => {
+                        assert!(
+                            tokio::time::timeout(Duration::from_millis(20), execution.wait())
+                                .await
+                                .is_err(),
+                            "{context}"
+                        );
+                    }
+                    ExitPath::DroppedExecution => {
+                        drop(execution);
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        assert!(path.exists(), "{context}: released under a live guest");
+                        std::fs::write(&gate, "").unwrap();
+                        assert_guest_read_then_released(temp.path(), &path, "the prompt", &context)
+                            .await;
+                        continue;
+                    }
+                }
+                assert_guest_read_then_released(temp.path(), &path, "the prompt", &context).await;
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn prompt_file_is_released_when_the_launch_never_runs() {
+        // An unlaunched instance.
+        let temp = tempfile::tempdir().unwrap();
+        let (option, path) = written_prompt("p");
+        let instance = test_instance(
+            gated_cli(temp.path()),
+            vec![ContainerOption::Image(ImageRef::new("img")), option],
+        );
+        assert!(path.exists());
+        drop(instance);
+        assert!(!path.exists(), "retained by a dropped instance");
+
+        // A spawn failure, on both spawn paths.
+        for initial_size in [None, Some((80, 24))] {
+            let (option, path) = written_prompt("p");
+            let result = test_instance(
+                fake_cli(&temp.path().join("missing-cli")),
+                vec![ContainerOption::Image(ImageRef::new("img")), option],
+            )
+            .run_with_frontend(frontend_with(initial_size));
+            assert!(result.is_err());
+            assert!(!path.exists(), "retained after a spawn failure");
+        }
+    }
+
+    #[cfg(unix)]
+    fn prompt_engine(
+        tmp: &std::path::Path,
+    ) -> (
+        crate::engine::agent::AgentEngine,
+        crate::data::session::Session,
+    ) {
+        let overlay = crate::engine::overlay::OverlayEngine::with_auth_resolver(
+            crate::data::fs::auth_paths::AuthPathResolver::at_home(tmp),
+        );
+        (
+            crate::engine::agent::AgentEngine::new(
+                Arc::new(overlay),
+                Arc::new(crate::engine::container::ContainerRuntime::docker()),
+            ),
+            crate::data::session::Session::for_tests_isolated(tmp, &tmp.join("global")),
+        )
+    }
+
+    #[cfg(unix)]
+    fn engine_launch(
+        engine: &crate::engine::agent::AgentEngine,
+        session: &crate::data::session::Session,
+        text: &str,
+    ) -> (Vec<ContainerOption>, std::path::PathBuf) {
+        let options = engine
+            .build_options(
+                session,
+                &crate::data::session::AgentName::new("claude").unwrap(),
+                &crate::engine::agent::AgentRunOptions {
+                    system_prompt: Some(text.to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let path = options
+            .iter()
+            .find_map(|option| match option {
+                ContainerOption::SystemPromptFile { guard, .. } => {
+                    Some(guard.host_path().to_path_buf())
+                }
+                _ => None,
+            })
+            .expect("claude delivers its prompt by file");
+        (options, path)
+    }
+
+    /// Descriptors this process holds on `path`, deleted or not.
+    #[cfg(target_os = "linux")]
+    fn open_handles(path: &std::path::Path) -> usize {
+        std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
+            .filter(|target| {
+                target
+                    .to_string_lossy()
+                    .starts_with(&*path.to_string_lossy())
+            })
+            .count()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sequential_runs_through_one_engine_return_to_baseline() {
+        let temp = tempfile::tempdir().unwrap();
+        let (engine, session) = prompt_engine(temp.path());
+        let cli = fake_cli(&write_fake_cli(temp.path(), "#!/bin/sh\nexit 0\n"));
+        for _ in 0..16 {
+            let (options, path) = engine_launch(&engine, &session, "the prompt");
+            assert!(path.exists());
+            let mut execution = test_instance(cli, options)
+                .run_with_frontend(frontend_with(None))
+                .unwrap();
+            execution.wait().await.unwrap();
+            assert!(!path.exists(), "a completed run retained its prompt file");
+            #[cfg(target_os = "linux")]
+            assert_eq!(
+                open_handles(&path),
+                0,
+                "a completed run retained its handle"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_runs_through_one_engine_keep_only_their_own_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let (engine, session) = prompt_engine(temp.path());
+        let dirs = [temp.path().join("first"), temp.path().join("second")];
+        let (first_options, first_path) = engine_launch(&engine, &session, "first prompt");
+        let (second_options, second_path) = engine_launch(&engine, &session, "second prompt");
+        assert_ne!(first_path, second_path);
+        let mut runs = Vec::new();
+        for (dir, options) in dirs.iter().zip([first_options, second_options]) {
+            std::fs::create_dir_all(dir).unwrap();
+            runs.push(
+                test_instance(gated_cli(dir), options)
+                    .run_with_frontend(frontend_with(None))
+                    .unwrap(),
+            );
+        }
+        std::fs::write(dirs[0].join("gate"), "").unwrap();
+        runs[0].wait().await.unwrap();
+        assert_guest_read_then_released(&dirs[0], &first_path, "first prompt", "first").await;
+        assert!(
+            second_path.exists(),
+            "finishing one run removed the other run's file"
+        );
+        std::fs::write(dirs[1].join("gate"), "").unwrap();
+        runs[1].wait().await.unwrap();
+        assert_guest_read_then_released(&dirs[1], &second_path, "second prompt", "second").await;
     }
 
     /// The ACP path must retain its stdin injector for the whole session; the

@@ -232,6 +232,21 @@ async fn run_to_completion_full_parallel_group_max_concurrent_2() {
 /// `report_parallel_step_launched` runs after the factory bumps its
 /// execution counter, so on a loaded CI runner the record can lag the
 /// counter past a fixed sleep (observed: count 2, launched `["a"]`).
+async fn wait_until(
+    record: &Arc<Mutex<ParallelRecord>>,
+    what: &str,
+    done: impl Fn(&ParallelRecord) -> bool,
+) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !done(&record.lock().unwrap()) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for {what}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 async fn wait_for_launched(record: &Arc<Mutex<ParallelRecord>>, expected: &[&str]) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while record.lock().unwrap().launched.len() < expected.len()
@@ -488,6 +503,7 @@ async fn parallel_step_stuck_routes_to_named_slot_only() {
         step_name: "b".to_string(),
     })
     .unwrap();
+    wait_until(&record, "b to be reported stuck", |r| !r.stuck.is_empty()).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     {
@@ -596,20 +612,18 @@ async fn parallel_group_wcb_retries_failed_peer_mid_group() {
     tokio::time::sleep(Duration::from_millis(150)).await;
 
     // Before anything fails the board offers no retry.
-    tx.send(EngineRequest::OpenControlBoard {
-        step_name: "b".into(),
-    })
-    .unwrap();
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    open_board(&tx, &record, "b").await;
 
     // "a" fails while "b" keeps running; the next board offers to retry it.
     signal_completion(&completion_a, 1);
-    tokio::time::sleep(Duration::from_millis(150)).await;
-    tx.send(EngineRequest::OpenControlBoard {
-        step_name: "b".into(),
+    wait_until(&record, "a's failure", |r| {
+        r.exited
+            .iter()
+            .any(|(name, code)| name == "a" && *code == 1)
     })
-    .unwrap();
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    .await;
+    open_board(&tx, &record, "b").await;
+    wait_for_launched(&record, &["a", "b", "a"]).await;
 
     {
         let r = record.lock().unwrap();
@@ -672,11 +686,17 @@ fn build_group_engine(
 
 /// Open the WCB on `step` mid-group through the engine channel, then give the
 /// engine time to act on the frontend's queued answer.
-async fn open_board(tx: &tokio::sync::mpsc::UnboundedSender<EngineRequest>, step: &str) {
+async fn open_board(
+    tx: &tokio::sync::mpsc::UnboundedSender<EngineRequest>,
+    record: &Arc<Mutex<ParallelRecord>>,
+    step: &str,
+) {
+    let boards = record.lock().unwrap().available.len();
     tx.send(EngineRequest::OpenControlBoard {
         step_name: step.into(),
     })
     .unwrap();
+    wait_until(record, "the board to open", |r| r.available.len() > boards).await;
     tokio::time::sleep(Duration::from_millis(250)).await;
 }
 
@@ -715,7 +735,7 @@ async fn parallel_group_board_offers_group_restart_back_and_next() {
     let engine_task = tokio::spawn(async move { engine.run_to_completion().await });
     tokio::time::sleep(Duration::from_millis(250)).await;
 
-    open_board(&tx, "a").await;
+    open_board(&tx, &record, "a").await;
     {
         let r = record.lock().unwrap();
         let board = r.available.last().unwrap();
@@ -754,7 +774,7 @@ async fn parallel_group_board_offers_group_restart_back_and_next() {
     let tx = engine_tx.lock().unwrap().clone().unwrap();
     let engine_task = tokio::spawn(async move { engine.run_to_completion().await });
     tokio::time::sleep(Duration::from_millis(150)).await;
-    open_board(&tx, "a").await;
+    open_board(&tx, &record, "a").await;
     {
         let r = record.lock().unwrap();
         let board = r.available.last().unwrap();
@@ -796,7 +816,7 @@ async fn parallel_group_board_without_prompts_offers_no_group_actions() {
     let tx = engine_tx.lock().unwrap().clone().unwrap();
     let engine_task = tokio::spawn(async move { engine.run_to_completion().await });
     tokio::time::sleep(Duration::from_millis(150)).await;
-    open_board(&tx, "a").await;
+    open_board(&tx, &record, "a").await;
     {
         let r = record.lock().unwrap();
         let board = r.available.last().unwrap();
@@ -854,7 +874,8 @@ async fn parallel_group_restart_single_running_step() {
     let engine_task = tokio::spawn(async move { engine.run_to_completion().await });
     tokio::time::sleep(Duration::from_millis(150)).await;
 
-    open_board(&tx, "b").await;
+    open_board(&tx, &record, "b").await;
+    wait_for_launched(&record, &["a", "b", "a"]).await;
     assert!(cancel_a.load(Ordering::Relaxed), "a's container is killed");
     assert!(!cancel_b.load(Ordering::Relaxed), "b keeps running");
     {
@@ -927,8 +948,8 @@ async fn parallel_group_restart_single_completed_step() {
 
     signal_completion(&completion_a, 0);
     tokio::time::sleep(Duration::from_millis(150)).await;
-    open_board(&tx, "b").await;
-    assert_eq!(record.lock().unwrap().launched, vec!["a", "b", "a"]);
+    open_board(&tx, &record, "b").await;
+    wait_for_launched(&record, &["a", "b", "a"]).await;
 
     signal_completion(&completion_a2, 0);
     signal_completion(&completion_b, 0);
@@ -973,7 +994,7 @@ async fn parallel_group_restart_whole_group() {
 
     signal_completion(&completion_a, 0);
     tokio::time::sleep(Duration::from_millis(150)).await;
-    open_board(&tx, "b").await;
+    open_board(&tx, &record, "b").await;
 
     // The rerun uses instant-success containers (no blocking slots left).
     assert_eq!(
@@ -1034,7 +1055,7 @@ async fn parallel_group_cancel_back_returns_to_previous_step() {
     // "a" has already finished; going back must rerun it too.
     signal_completion(&completion_a, 0);
     tokio::time::sleep(Duration::from_millis(150)).await;
-    open_board(&tx, "b").await;
+    open_board(&tx, &record, "b").await;
 
     assert_eq!(
         engine_task.await.unwrap().unwrap(),
@@ -1090,7 +1111,7 @@ async fn parallel_group_cancel_next_skips_to_following_step() {
 
     signal_completion(&completion_a, 0);
     tokio::time::sleep(Duration::from_millis(150)).await;
-    open_board(&tx, "b").await;
+    open_board(&tx, &record, "b").await;
 
     let _ = engine_task.await.unwrap().unwrap();
     assert!(cancel_b.load(Ordering::Relaxed), "running b was killed");
@@ -1136,8 +1157,8 @@ async fn parallel_group_declined_confirmation_keeps_group_running() {
     let engine_task = tokio::spawn(async move { engine.run_to_completion().await });
     tokio::time::sleep(Duration::from_millis(150)).await;
 
-    open_board(&tx, "a").await; // next → declined
-    open_board(&tx, "a").await; // restart → scope question dismissed
+    open_board(&tx, &record, "a").await; // next → declined
+    open_board(&tx, &record, "a").await; // restart → scope question dismissed
     assert!(!cancel_a.load(Ordering::Relaxed));
     assert!(!cancel_b.load(Ordering::Relaxed));
     assert_eq!(record.lock().unwrap().launched, vec!["a", "b"]);

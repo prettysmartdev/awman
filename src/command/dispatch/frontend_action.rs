@@ -13,10 +13,9 @@
 //! turns it into an invocation, reading the path, the flag names and the
 //! positional argument's name out of the catalogue.
 
-use std::collections::BTreeMap;
-
 use crate::command::dispatch::catalogue::CommandCatalogue;
-use crate::command::dispatch::parsed_input::{ArgValue, FlagValue, ParsedCommandBoxInput};
+use crate::command::dispatch::parsed_input::ParsedCommandBoxInput;
+use crate::command::dispatch::projections::raw_args::ParsedArgs;
 use crate::data::session::Session;
 
 /// One entry of the action table: the catalogue path an action dispatches to,
@@ -153,29 +152,25 @@ impl CommandCatalogue {
             panic!("frontend action {action:?} names an unknown command {path:?}")
         });
 
-        let mut flags: BTreeMap<String, FlagValue> = BTreeMap::new();
         for name in bool_flags {
             assert!(
                 spec.find_flag(name).is_some(),
                 "frontend action {action:?} sets --{name}, which {path:?} does not declare"
             );
-            flags.insert((*name).to_string(), FlagValue::Bool(true));
         }
 
-        let mut arguments: BTreeMap<String, ArgValue> = BTreeMap::new();
-        if let Some(value) = argument {
+        let argument = argument.map(|value| {
             let arg = spec.arguments.first().unwrap_or_else(|| {
                 panic!(
                     "frontend action {action:?} supplies an argument, but {path:?} declares none"
                 )
             });
-            arguments.insert(arg.name.to_string(), ArgValue::Single(value.to_string()));
-        }
+            (arg.name, value)
+        });
 
         ParsedCommandBoxInput {
             path: path.iter().map(|part| (*part).to_string()).collect(),
-            flags,
-            arguments,
+            args: ParsedArgs::for_action(bool_flags, argument),
         }
     }
 
@@ -239,11 +234,8 @@ mod tests {
             .arguments
             .first()
             .expect("squad edit takes an argument");
-        assert_eq!(
-            input.arguments.get(name.name),
-            Some(&ArgValue::Single("nightly".to_string()))
-        );
-        assert_eq!(input.flags.get("interview"), Some(&FlagValue::Bool(true)));
+        assert_eq!(input.args.argument(name.name).as_deref(), Some("nightly"),);
+        assert_eq!(input.args.flag_bool("interview"), Some(true));
     }
 
     #[test]
@@ -269,7 +261,7 @@ mod tests {
         assert!(!plain.is_git_repo());
         let input = catalogue.startup_command(&plain);
         assert_eq!(input.path, vec!["agents".to_string(), "status".to_string()]);
-        assert_eq!(input.flags.get("watch"), Some(&FlagValue::Bool(true)));
+        assert_eq!(input.args.flag_bool("watch"), Some(true));
     }
 
     struct FailingResolver;
@@ -322,8 +314,8 @@ mod tests {
                 .first()
                 .unwrap_or_else(|| panic!("`squad {dispatched}` takes a task name"));
             assert_eq!(
-                input.arguments.get(arg.name),
-                Some(&ArgValue::Single("nightly".to_string())),
+                input.args.argument(arg.name).as_deref(),
+                Some("nightly"),
                 "{action:?} must key its argument by the catalogue's name"
             );
 
@@ -353,7 +345,8 @@ mod tests {
                 "{action:?} dispatches a different path than typing the command"
             );
             assert_eq!(
-                input.arguments, typed.arguments,
+                input.args.arguments(arg.name),
+                typed.args.arguments(arg.name),
                 "{action:?} keys its arguments differently than typing the command"
             );
         }
@@ -363,6 +356,6 @@ mod tests {
     fn removing_a_task_assumes_yes_because_the_dialog_already_asked() {
         let catalogue = CommandCatalogue::get();
         let input = catalogue.action_input(FrontendAction::RemoveSquadTask, Some("nightly"));
-        assert_eq!(input.flags.get("yes"), Some(&FlagValue::Bool(true)));
+        assert_eq!(input.args.flag_bool("yes"), Some(true));
     }
 }
