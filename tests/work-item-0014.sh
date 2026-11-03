@@ -29,7 +29,7 @@ check_file_exists ".github/workflows/test.yml"
 check_file_contains ".github/workflows/test.yml" "name: Tests"
 check_file_contains ".github/workflows/test.yml" 'push:'
 check_file_contains ".github/workflows/test.yml" 'pull_request:'
-check_file_contains ".github/workflows/test.yml" 'branches:.*\*\*'
+check_file_contains ".github/workflows/test.yml" 'branches: \[main\]'
 check_file_contains ".github/workflows/test.yml" 'make test'
 check_file_contains ".github/workflows/test.yml" 'rust-toolchain'
 check_file_contains ".github/workflows/test.yml" 'actions/checkout'

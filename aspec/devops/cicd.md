@@ -6,7 +6,13 @@ Platform: GitHub Actions
 
 ### `Tests` (`.github/workflows/test.yml`)
 
-The first three jobs run on every push and pull request; the rest are opt-in
+The workflow runs on every pull request and on pushes to `main` only. A
+branch push is tested through its pull request, which checks the merge with
+`main`; a branch without a PR gets CI by opening one (a draft is fine) or by
+`gh workflow run test.yml --ref <branch>`. Pushing to every branch would run
+the suite twice per PR update.
+
+The first three jobs run on every such event; the rest are opt-in
 (`workflow_dispatch`/`schedule`, or — for the two unsupported-target jobs —
 also `pull_request`) because they need native hardware this repo's hosted
 runners don't have:
@@ -16,7 +22,7 @@ runners don't have:
 | `fast` | `ubuntu-latest` | `make architecture-lint`, `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `make test-fast`. Hermetic — no Docker, no real git, no real network. Should finish in under two minutes warm. |
 | `full-linux-docker` | `ubuntu-latest` | `make test-full` against the runner's Docker daemon (`test-full` sets `AWMAN_TEST_DOCKER=1`; without it the Docker tests see Docker as not installed). Includes the `docker_*`, `real_git_*`, and `real_network_*` integration tests. Depends on `fast`. |
 | `build-macos` | `macos-latest` | `cargo build --release` and `make test-fast`. Smoke-tests cross-platform compilation; does not run Docker tests (macOS hosted runners lack Docker). Depends on `fast`. |
-| `builtin-build` | Linux ARM64 (`ubuntu-24.04-arm`, hosted) | Fetches and verifies the payload, builds the `builtin-runtime` feature, inspects dynamic dependencies, and runs `make test-builtin` — on a hosted runner with no KVM, so `builtin_hw_*` tests SKIP. A build/hermetic gate, not proof of guest execution. Runs on every push/PR (the only builtin job that does). |
+| `builtin-build` | Linux ARM64 (`ubuntu-24.04-arm`, hosted) | Fetches and verifies the payload, builds the `builtin-runtime` feature, inspects dynamic dependencies, and runs `make test-builtin` — on a hosted runner with no KVM, so `builtin_hw_*` tests SKIP. A build/hermetic gate, not proof of guest execution. Runs on every PR and push to `main` (the only builtin job that does). |
 | `builtin-hardware` | self-hosted `macOS/ARM64/hypervisor` (the released platform; WI 0124 re-adds `linux/arm64/kvm` and `linux/x64/kvm`) | Opt-in real-guest matrix (`AWMAN_TEST_BUILTIN=1 AWMAN_TEST_BUILTIN_REQUIRE_HW=1`): checks hardware prerequisites first and **fails** (never skips) if they're missing, builds a disposable fixture image, then runs `make test-builtin` for real — same-executable worker boot, image import, execution. `make test-builtin` builds the guest drivers explicitly and ad-hoc signs awman and the drivers with the hypervisor entitlement (`tools/macos-sign-test-artifacts.sh`) between building and running. It also builds the previous-protocol awman from git history for the old-to-new upgrade test (`tools/build-previous-builtin-awman.sh`), so the job checks out full history (`fetch-depth: 0`). Only on `workflow_dispatch` or the nightly `schedule`. |
 | `native-typed-provider` | same self-hosted macOS runner | Clean-checkout gate: `tools/native-builtin-ci.sh <triple>` builds and boots the typed provider from a fresh isolated `CARGO_HOME`/target dir (with the previous-protocol awman for the upgrade test, so this job also uses `fetch-depth: 0`), then `tools/oci-runtime-spike/sqlite-resolution/checks.sh auto` reruns the SQLite resolution checks on that target. Uploads SQLite and native-payload evidence as artifacts. Only on `workflow_dispatch` or `schedule`. |
 | `existing-backend-unsupported-targets` | Windows x86_64 (hosted) | Builds the default backends with the `builtin-runtime` feature **disabled** and asserts the precise refusal a `builtin-experimental` selection reports there (the runtime is released for Apple Silicon only). Runs on `pull_request` too (no native prerequisite beyond the target toolchain). |

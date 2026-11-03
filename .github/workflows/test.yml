@@ -1,10 +1,11 @@
 name: Tests
 
 on:
+  # Branch pushes are covered by `pull_request`, which tests the merge result
+  # (and also runs the Windows job); a `push` run there would duplicate it.
   push:
-    branches: ["**"]
+    branches: [main]
   pull_request:
-    branches: ["**"]
   workflow_dispatch:
   schedule:
     - cron: "17 4 * * *"
