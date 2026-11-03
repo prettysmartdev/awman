@@ -349,12 +349,9 @@ fn docker_hello_world_run_does_not_appear_in_amux_listing() {
         return;
     }
 
-    let before = ContainerRuntime::docker()
-        .list_running_all()
-        .expect("list_running_all before");
-
+    let name = format!("hello-probe-{}", std::process::id());
     let status = Command::new(awman::engine::host_cli::program("docker"))
-        .args(["run", "--rm", "hello-world:latest"])
+        .args(["run", "--rm", "--name", &name, "hello-world:latest"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
@@ -365,11 +362,12 @@ fn docker_hello_world_run_does_not_appear_in_amux_listing() {
         .list_running_all()
         .expect("list_running_all after");
 
-    // hello-world isn't amux-labeled and exits immediately; the amux listing
-    // should be unchanged in size.
-    assert_eq!(
-        before.len(),
-        after.len(),
-        "non-amux container must not appear in amux's labeled listing"
+    // Compare by identity, not count: parallel tests start and stop
+    // awman-labeled containers between any two listings.
+    assert!(
+        !after
+            .iter()
+            .any(|h| h.name == name || h.image_tag.starts_with("hello-world")),
+        "non-amux container must not appear in amux's labeled listing: {after:?}"
     );
 }
