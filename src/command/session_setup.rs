@@ -299,12 +299,17 @@ impl SessionSetup {
         let mut clone_sink = presenter.git_log_sink();
         // Clone the repository's default branch regardless of `plan.branch`.
         // A full clone, so every remote branch is available as
-        // `origin/<name>` to the branch and merge stages below.
+        // `origin/<name>` to the branch and merge stages below. A cancel kills
+        // the clone, which may otherwise wait on an unresponsive origin forever.
+        let cancel = self.cancel.clone();
         let clone_result = self
             .blocking_git("clone", move |git| {
-                git.clone_repo_logged(&url, None, &dest_for_clone, &mut *clone_sink)
+                git.clone_repo_logged(&url, None, &dest_for_clone, &mut *clone_sink, &cancel)
             })
             .await;
+        if self.cancelled_here(presenter).await {
+            return Err(());
+        }
         if let Err(e) = clone_result {
             tracing::error!(session_id = %session_id, error = %e, "Clone failed");
             self.fail_remote(presenter, "clone", &e.to_string()).await;
@@ -315,9 +320,6 @@ impl SessionSetup {
             stage: "cloning_repository_done".to_string(),
             message: "Repository cloned".to_string(),
         });
-        if self.cancelled_here(presenter).await {
-            return Err(());
-        }
 
         // ── Stage 2: set up branch ───────────────────────────────────────────
         let Some(branch) = self.plan.branch.clone() else {
