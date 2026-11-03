@@ -9,6 +9,9 @@ on:
   schedule:
     - cron: "17 4 * * *"
 
+permissions:
+  contents: read
+
 jobs:
   fast:
     name: Fast checks (lint, fmt, clippy, hermetic tests)
@@ -96,6 +99,12 @@ jobs:
           key: ${{ runner.os }}-cargo-mac-v2-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-mac-v2-
+
+      # Same lint and scanner fixtures as the Linux `fast` job, but with the
+      # BSD grep/sed/find the hosted macOS image ships, so a scanner that
+      # only works with GNU tools fails here instead of passing silently.
+      - name: Architecture lint (BSD tools)
+        run: make architecture-lint
 
       - name: Build release
         run: cargo build --workspace --release

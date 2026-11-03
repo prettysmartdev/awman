@@ -15,26 +15,7 @@
 //! bare-TUI branch — see `command::dispatch` tests); it needs a live terminal
 //! and so is not reachable from a headless subprocess test.
 
-use std::process::Command;
-use tempfile::TempDir;
-
-fn awman_bin() -> std::path::PathBuf {
-    crate::awman_bin()
-}
-
-fn awman() -> Command {
-    Command::new(awman_bin())
-}
-
-fn make_git_repo() -> TempDir {
-    let repo = TempDir::new().expect("TempDir::new");
-    std::process::Command::new("git")
-        .args(["init", "--quiet"])
-        .current_dir(repo.path())
-        .status()
-        .expect("git init");
-    repo
-}
+use crate::{awman, make_git_repo};
 
 // ─── Finding B: removed-flag migration hint exits 2 ───────────────────────────
 

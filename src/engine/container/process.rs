@@ -1135,10 +1135,12 @@ mod tests {
         (prompt_option(PromptFileGuard::new(file)), path)
     }
 
-    /// A stand-in guest: `run` blocks until `gate` exists (`stop` creates it),
-    /// lingers so an early release would be seen, then reads its mounted prompt
-    /// into `read`. It ignores the hangup a dropped PTY master delivers, as a
-    /// CLI whose container outlives the drop does.
+    /// A stand-in guest: `run` records the host prompt path it was given in
+    /// `started` (so a test can see it is running), blocks until `gate`
+    /// exists (`stop` creates it), lingers so an early release would be seen,
+    /// then reads its mounted prompt into `read`. It ignores the hangup a
+    /// dropped PTY master delivers, as a CLI whose container outlives the
+    /// drop does.
     #[cfg(unix)]
     fn gated_cli(dir: &std::path::Path) -> ContainerCli {
         let dir_text = dir.display();
@@ -1147,6 +1149,7 @@ mod tests {
              if [ \"$1\" = stop ]; then : > {dir_text}/gate; fi\n\
              if [ \"$1\" = run ]; then\n\
              for a in \"$@\"; do case \"$a\" in *:/tmp/awman-ctx-prompt-*:ro) src=\"${{a%%:*}}\";; esac; done\n\
+             printf '%s' \"$src\" > {dir_text}/started.tmp && mv {dir_text}/started.tmp {dir_text}/started\n\
              until [ -e {dir_text}/gate ]; do sleep 0.01; done\n\
              sleep 0.1\n\
              cat \"$src\" > {dir_text}/read\n\
@@ -1377,16 +1380,45 @@ mod tests {
                     .unwrap(),
             );
         }
+        // Both guests are running at once, each mounted with its own file.
+        for (dir, path) in dirs.iter().zip([&first_path, &second_path]) {
+            assert_eq!(
+                wait_for_started(dir).await,
+                path.display().to_string(),
+                "a running guest was handed another run's prompt file"
+            );
+        }
+        assert!(first_path.exists() && second_path.exists());
         std::fs::write(dirs[0].join("gate"), "").unwrap();
         runs[0].wait().await.unwrap();
         assert_guest_read_then_released(&dirs[0], &first_path, "first prompt", "first").await;
         assert!(
             second_path.exists(),
-            "finishing one run removed the other run's file"
+            "finishing one run removed the other running run's file"
+        );
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            open_handles(&first_path),
+            0,
+            "the finished run kept its handle"
         );
         std::fs::write(dirs[1].join("gate"), "").unwrap();
         runs[1].wait().await.unwrap();
         assert_guest_read_then_released(&dirs[1], &second_path, "second prompt", "second").await;
+    }
+
+    /// Wait for a `gated_cli` guest to start; returns the prompt path it got.
+    #[cfg(unix)]
+    async fn wait_for_started(dir: &std::path::Path) -> String {
+        let started = dir.join("started");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !started.exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the guest never started");
+        std::fs::read_to_string(started).unwrap()
     }
 
     /// The ACP path must retain its stdin injector for the whole session; the

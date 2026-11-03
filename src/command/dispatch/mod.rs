@@ -1269,6 +1269,146 @@ mod tests {
         assert!(matches!(built, BuiltCommand::Remote(_)));
     }
 
+    fn build_remote(
+        path: &[&str],
+        frontend: FakeCommandFrontend,
+    ) -> Result<crate::command::commands::remote::RemoteSubcommand, CommandError> {
+        let dispatch = Dispatch::new(
+            frontend,
+            make_session(),
+            Engines::for_tests(std::path::Path::new("/tmp")),
+        );
+        match dispatch.build_command(path)? {
+            BuiltCommand::Remote(cmd) => Ok(cmd.subcommand().clone()),
+            _ => panic!("expected a remote command"),
+        }
+    }
+
+    /// Every `exec workflow` flag the user gives `remote exec workflow`
+    /// reaches the server, in a request body the server's own parser reads
+    /// back to the same values; transport flags stay on the client.
+    #[test]
+    fn remote_exec_workflow_forwards_every_exec_flag_to_the_server() {
+        use crate::command::commands::remote::RemoteSubcommand;
+        use crate::command::commands::remote_client::ExecArg;
+        let mut frontend = FakeCommandFrontend::new();
+        frontend.args.insert("workflow".into(), "wf.toml".into());
+        frontend.bools.insert("auto".into(), true);
+        frontend.bools.insert("follow".into(), true);
+        frontend.strings.insert("session".into(), "abc".into());
+        frontend.strings.insert("model".into(), "opus".into());
+        frontend.strings.insert("issue".into(), "42".into());
+        frontend.strings.insert("agent".into(), "codex".into());
+        frontend
+            .strings_vec
+            .insert("agent-flag".into(), vec!["--search".into()]);
+        frontend
+            .enums
+            .insert("on-existing-worktree".into(), "resume".into());
+        let RemoteSubcommand::ExecWorkflow(flags) =
+            build_remote(&["remote", "exec", "workflow"], frontend).unwrap()
+        else {
+            panic!("expected exec workflow");
+        };
+        assert!(flags.follow);
+        assert_eq!(flags.session.as_deref(), Some("abc"));
+        assert!(
+            !flags
+                .forwarded
+                .iter()
+                .any(|a| a.contains("session") || a.contains("follow")),
+            "transport flags are not forwarded: {:?}",
+            flags.forwarded
+        );
+
+        let request = ExecArg::Workflow(Some("wf.toml".into())).into_request(&flags.forwarded);
+        assert_eq!(request.subcommand, "exec workflow");
+        let parsed = crate::command::dispatch::catalogue::CommandCatalogue::get()
+            .parse_raw_args(&["exec", "workflow"], &request.args)
+            .expect("the server parses what the client sends");
+        assert_eq!(parsed.argument("workflow").as_deref(), Some("wf.toml"));
+        assert_eq!(parsed.flag_bool("auto"), Some(true));
+        assert_eq!(parsed.flag_string("model").as_deref(), Some("opus"));
+        assert_eq!(parsed.flag_string("issue").as_deref(), Some("42"));
+        assert_eq!(parsed.flag_string("agent").as_deref(), Some("codex"));
+        assert_eq!(parsed.flag_strings("agent-flag"), vec!["--search"]);
+        assert_eq!(
+            parsed.flag_string("on-existing-worktree").as_deref(),
+            Some("resume")
+        );
+    }
+
+    /// The prompt is a greedy trailing argument on the server, so flags must
+    /// precede it; they used to follow it and became part of the prompt.
+    #[test]
+    fn remote_exec_prompt_flags_reach_the_server_as_flags_not_prompt_text() {
+        use crate::command::commands::remote::RemoteSubcommand;
+        use crate::command::commands::remote_client::ExecArg;
+        let mut frontend = FakeCommandFrontend::new();
+        frontend.args.insert("prompt".into(), "fix it".into());
+        frontend.bools.insert("yolo".into(), true);
+        frontend.strings.insert("agent".into(), "codex".into());
+        let RemoteSubcommand::ExecPrompt(flags) =
+            build_remote(&["remote", "exec", "prompt"], frontend).unwrap()
+        else {
+            panic!("expected exec prompt");
+        };
+        let request = ExecArg::Prompt(flags.prompt.clone()).into_request(&flags.forwarded);
+        let parsed = crate::command::dispatch::catalogue::CommandCatalogue::get()
+            .parse_raw_args(&["exec", "prompt"], &request.args)
+            .unwrap();
+        assert_eq!(parsed.arguments("prompt"), vec![flags.prompt.clone()]);
+        assert!(!flags.prompt.contains("--"), "{}", flags.prompt);
+        assert_eq!(parsed.flag_bool("yolo"), Some(true));
+        assert_eq!(parsed.flag_string("agent").as_deref(), Some("codex"));
+    }
+
+    #[test]
+    fn remote_exec_workflow_allows_dynamic_without_a_path_and_requires_one_otherwise() {
+        use crate::command::commands::remote::RemoteSubcommand;
+        use crate::command::commands::remote_client::ExecArg;
+        let err =
+            build_remote(&["remote", "exec", "workflow"], FakeCommandFrontend::new()).unwrap_err();
+        assert!(
+            matches!(err, CommandError::MissingRequiredArgument { ref argument, .. } if argument == "workflow"),
+            "{err:?}"
+        );
+
+        let mut frontend = FakeCommandFrontend::new();
+        frontend.bools.insert("dynamic".into(), true);
+        let RemoteSubcommand::ExecWorkflow(flags) =
+            build_remote(&["remote", "exec", "workflow"], frontend).unwrap()
+        else {
+            panic!("expected exec workflow");
+        };
+        assert!(flags.workflow.is_none());
+        let request = ExecArg::Workflow(None).into_request(&flags.forwarded);
+        let parsed = crate::command::dispatch::catalogue::CommandCatalogue::get()
+            .parse_raw_args(&["exec", "workflow"], &request.args)
+            .unwrap();
+        assert_eq!(parsed.flag_bool("dynamic"), Some(true));
+        assert_eq!(parsed.argument("workflow"), None);
+    }
+
+    /// A flag the server cannot honour is not declared on `remote exec`, so
+    /// it is refused as an unknown flag instead of being accepted and dropped.
+    #[test]
+    fn remote_exec_refuses_json_instead_of_dropping_it() {
+        let catalogue = crate::command::dispatch::catalogue::CommandCatalogue::get();
+        let spec = catalogue.lookup(&["remote", "exec", "workflow"]).unwrap();
+        assert!(spec.find_flag("json").is_none());
+        let err = catalogue
+            .parse_raw_args(
+                &["remote", "exec", "workflow"],
+                &["--json".to_string(), "wf.toml".to_string()],
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, CommandError::UnknownFlag { ref flag, .. } if flag == "json"),
+            "{err:?}"
+        );
+    }
+
     #[test]
     fn build_remote_exec_prompt_with_prompt_argument() {
         let mut frontend = FakeCommandFrontend::new();

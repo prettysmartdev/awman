@@ -237,7 +237,7 @@ mod tests {
         assert!(log.lock().unwrap().renders.is_empty());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn watch_with_precancelled_token_returns_aborted_without_collecting() {
         let (frontend, log) = FakeFrontend::new();
         frontend.watch_token.cancel();
@@ -255,7 +255,7 @@ mod tests {
         assert_eq!((log.begin_watch, log.end_watch), (1, 1));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn watch_renders_once_per_tick_until_cancelled() {
         let (mut frontend, log) = FakeFrontend::new();
         frontend.cancel_after_renders = Some(4);
@@ -277,7 +277,7 @@ mod tests {
         assert_eq!((log.begin_watch, log.end_watch), (1, 1));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn watch_shows_the_same_tip_on_every_tick() {
         let (mut frontend, log) = FakeFrontend::new();
         frontend.cancel_after_renders = Some(5);
@@ -291,7 +291,7 @@ mod tests {
         assert!(log.renders.iter().all(|(_, _, tip)| tip == first));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn watch_survives_an_unavailable_runtime_and_recovers() {
         let runtime = runtime_with_two();
         *runtime.available.lock().unwrap() = Err("daemon down".into());

@@ -252,7 +252,6 @@ async fn real_network_api_frontend_status_endpoint_reachable_after_rename() {
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     let url = format!("http://{addr}/v1/status");
     let resp = match reqwest::get(&url).await {

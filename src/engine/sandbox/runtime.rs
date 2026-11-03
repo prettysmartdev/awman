@@ -655,9 +655,33 @@ mod inspect_default_tests {
         cancel.cancel();
         let start = std::time::Instant::now();
         let available =
-            crate::engine::host_cli::with_collection_cancel(cancel, || rt.is_available());
+            crate::engine::host_cli::with_collection_cancel(cancel.clone(), || rt.is_available());
         assert!(!available);
-        assert!(start.elapsed() < std::time::Duration::from_millis(100));
+        // Generous: far below the CLI call's own 10 s deadline, which a probe
+        // that ignored the cancellation could wait out.
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
+
+        // Causality, not timing: under a cancelled collection the probe's
+        // runner refuses before spawning, so a command that would leave a
+        // trace never runs.
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("spawned");
+        let result = crate::engine::host_cli::with_collection_cancel(cancel, || {
+            crate::engine::host_cli::checked_output(
+                std::process::Command::new("sh")
+                    .arg("-c")
+                    .arg("touch \"$1\"")
+                    .arg("sh")
+                    .arg(&marker),
+                "sh",
+            )
+        });
+        let error = result.expect_err("a cancelled collection must not run the CLI");
+        assert!(
+            error.to_string().contains("collection cancelled"),
+            "{error}"
+        );
+        assert!(!marker.exists(), "nothing may be spawned once cancelled");
     }
 
     #[test]

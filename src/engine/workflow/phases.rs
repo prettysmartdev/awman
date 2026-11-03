@@ -486,11 +486,7 @@ impl WorkflowEngine {
         if let Err(e) = result {
             let error = self.redaction.redact(&e.to_string());
             self.set_phase_step_failed(kind, idx, &error);
-            let failure = poller.take_failure().unwrap_or_default();
-            return PhaseStepOutcome {
-                ci_failed_jobs: failure.failed_jobs,
-                ..PhaseStepOutcome::failed(self.redaction.redact(&failure.report), error)
-            };
+            return poll_ci_failure_outcome(error, poller.take_failure(), &self.redaction);
         }
 
         PhaseStepOutcome::succeeded()
@@ -1143,5 +1139,73 @@ mod pull_request_output_tests {
         ] {
             assert!(parse_gh_pr_create_output(output).is_none());
         }
+    }
+}
+
+/// What poll_ci hands its on_failure agent when CI did not end green.
+///
+/// `failure` is the CI report the poller recorded, which exists only when a
+/// CI run actually concluded with a failure. Every other poll error (no run
+/// found, attempts exhausted, a GitHub/remote error) has no CI report, and
+/// stdout says so explicitly instead of passing an empty report that reads
+/// as "CI failed with no output". The poll error itself is always stderr.
+pub(super) fn poll_ci_failure_outcome(
+    error: String,
+    failure: Option<poll_ci::CiFailure>,
+    redaction: &RedactionSet,
+) -> PhaseStepOutcome {
+    match failure {
+        Some(failure) => PhaseStepOutcome {
+            ci_failed_jobs: failure.failed_jobs,
+            ..PhaseStepOutcome::failed(redaction.redact(&failure.report), error)
+        },
+        None => PhaseStepOutcome::failed(NO_CI_FAILURE_REPORT.to_string(), error),
+    }
+}
+
+/// poll_ci's stdout when the poll failed without a failed CI run to report.
+const NO_CI_FAILURE_REPORT: &str =
+    "poll_ci recorded no failed CI run for this commit, so there are no failed jobs or log \
+     tails to show; the error below is why the poll stopped.";
+
+#[cfg(test)]
+mod poll_ci_outcome_tests {
+    use super::*;
+
+    #[test]
+    fn a_failed_ci_run_hands_over_its_redacted_report_and_jobs() {
+        let redaction = RedactionSet::new();
+        redaction.add(SecretString::new("hunter2"));
+        let outcome = poll_ci_failure_outcome(
+            "poll_ci: CI failed: CI".into(),
+            Some(poll_ci::CiFailure {
+                report: "job lint: token hunter2 rejected".into(),
+                failed_jobs: vec!["lint".into()],
+            }),
+            &redaction,
+        );
+        assert!(outcome.failed);
+        assert_eq!(
+            outcome.stdout,
+            format!("job lint: token {} rejected", RedactionSet::MARK)
+        );
+        assert_eq!(outcome.stderr, "poll_ci: CI failed: CI");
+        assert_eq!(outcome.ci_failed_jobs, vec!["lint".to_string()]);
+    }
+
+    #[test]
+    fn a_poll_error_without_a_ci_report_says_so_instead_of_an_empty_report() {
+        let outcome = poll_ci_failure_outcome(
+            "poll_ci: CI did not complete within max_retries attempts".into(),
+            None,
+            &RedactionSet::new(),
+        );
+        assert!(outcome.failed);
+        assert_eq!(outcome.stdout, NO_CI_FAILURE_REPORT);
+        assert_eq!(
+            outcome.stderr,
+            "poll_ci: CI did not complete within max_retries attempts"
+        );
+        assert!(outcome.ci_failed_jobs.is_empty());
     }
 }

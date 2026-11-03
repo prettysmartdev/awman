@@ -249,43 +249,7 @@ fn validate_and_coerce_scalar(
             let n = value
                 .parse::<u64>()
                 .map_err(|_| format!("'{value}' is not a valid number"))?;
-            match field {
-                "workflows.dynamic.maxConcurrentSteps" => {
-                    let n = usize::try_from(n)
-                        .map_err(|_| format!("'{value}' is not a valid number"))?;
-                    crate::data::config::repo::validate_dynamic_max_concurrent_steps(
-                        "workflows.dynamic",
-                        n,
-                    )
-                    .map_err(|error| error.to_string())?;
-                }
-                "maxConcurrentAgents" if n == 0 => {
-                    return Err("maxConcurrentAgents must be >= 1".to_string());
-                }
-                "builtin.vcpus" if !(1..=u8::MAX as u64).contains(&n) => {
-                    return Err("builtin.vcpus must be between 1 and 255".to_string());
-                }
-                "builtin.memoryMib"
-                    if n < crate::data::config::builtin_runtime::MIN_MEMORY_MIB as u64 =>
-                {
-                    return Err(format!(
-                        "builtin.memoryMib must be at least {}",
-                        crate::data::config::builtin_runtime::MIN_MEMORY_MIB
-                    ));
-                }
-                "builtin.rootDiskMib"
-                    if n < crate::data::config::builtin_runtime::MIN_ROOT_DISK_MIB as u64 =>
-                {
-                    return Err(format!(
-                        "builtin.rootDiskMib must be at least {}",
-                        crate::data::config::builtin_runtime::MIN_ROOT_DISK_MIB
-                    ));
-                }
-                "builtin.mountQuotaMib" if n == 0 => {
-                    return Err("builtin.mountQuotaMib must be at least 1".to_string());
-                }
-                _ => {}
-            }
+            validate_number_with_loader(field, n)?;
             Ok(serde_json::Value::Number(n.into()))
         }
         Enum => match field {
@@ -324,6 +288,36 @@ fn validate_and_coerce_scalar(
                 Ok(serde_json::Value::String(value.to_string()))
             }
             _ => Ok(serde_json::Value::String(value.to_string())),
+        },
+    }
+}
+
+/// Range-check a numeric field with the same Layer 0 validator that loading
+/// (or, for `builtin.*`, every launch) applies, so the editor rejects exactly
+/// what the loader rejects, with the loader's wording. Fields whose loader has
+/// no range rule beyond the JSON type need no check here; the typed round trip
+/// in [`updated_config`] still rejects values the field's type cannot hold.
+fn validate_number_with_loader(field: &str, n: u64) -> Result<(), String> {
+    use crate::data::config::{repo, BuiltinRuntimeConfig};
+    let as_usize = || usize::try_from(n).map_err(|_| format!("'{n}' is not a valid number"));
+    match field {
+        "workflows.dynamic.maxConcurrentSteps" => {
+            repo::validate_dynamic_max_concurrent_steps("workflows.dynamic", as_usize()?)
+                .map_err(|error| error.to_string())
+        }
+        "maxConcurrentAgents" => repo::validate_max_concurrent_agents(Some(as_usize()?))
+            .map_err(|error| error.to_string()),
+        _ => match field.strip_prefix("builtin.") {
+            // Decode the one member into the typed block exactly as a config
+            // file would be decoded (so an out-of-range `vcpus` gets serde's
+            // `u8` error), then apply the launch-time resource checks.
+            Some(member) => {
+                let fragment: BuiltinRuntimeConfig =
+                    serde_json::from_value(serde_json::json!({ member: n }))
+                        .map_err(|error| format!("{field}: {error}"))?;
+                fragment.validate_resources()
+            }
+            None => Ok(()),
         },
     }
 }
@@ -1735,7 +1729,82 @@ mod tests {
             .contains("not a valid number"));
         assert!(validate_and_coerce("builtin.vcpus", "256")
             .unwrap_err()
-            .contains("between 1 and 255"));
+            .contains("expected u8"));
+    }
+
+    /// The editor's numeric range errors are the loader's errors, word for
+    /// word: each case loads a real config file through the global and repo
+    /// loaders (or, for `builtin.*`, the launch-time resource check the
+    /// loaded block is subject to) and compares it with `config set`'s
+    /// rejection of the same value.
+    #[test]
+    fn numeric_range_errors_match_the_config_loader() {
+        use crate::data::config::{BuiltinRuntimeConfig, GlobalConfig, RepoConfig};
+
+        let dir = tempfile::tempdir().unwrap();
+        let global_path = dir.path().join("global.json");
+        std::fs::write(&global_path, r#"{"maxConcurrentAgents":0}"#).unwrap();
+        let global_error = GlobalConfig::load_path(&global_path)
+            .unwrap_err()
+            .to_string();
+        std::fs::create_dir_all(dir.path().join(".awman")).unwrap();
+        std::fs::write(RepoConfig::path(dir.path()), r#"{"maxConcurrentAgents":0}"#).unwrap();
+        let repo_error = RepoConfig::load(dir.path()).unwrap_err().to_string();
+        let editor_error = validate_and_coerce("maxConcurrentAgents", "0").unwrap_err();
+        assert_eq!(editor_error, global_error);
+        assert_eq!(editor_error, repo_error);
+
+        for (field, member, value) in [
+            ("builtin.vcpus", "vcpus", 0u64),
+            (
+                "builtin.memoryMib",
+                "memoryMib",
+                crate::data::config::builtin_runtime::MIN_MEMORY_MIB as u64 - 1,
+            ),
+            (
+                "builtin.rootDiskMib",
+                "rootDiskMib",
+                crate::data::config::builtin_runtime::MIN_ROOT_DISK_MIB as u64 - 1,
+            ),
+            ("builtin.mountQuotaMib", "mountQuotaMib", 0),
+        ] {
+            let loaded: GlobalConfig =
+                serde_json::from_value(serde_json::json!({ "builtin": { member: value } }))
+                    .unwrap();
+            let loader_error = loaded
+                .builtin
+                .as_ref()
+                .map(BuiltinRuntimeConfig::validate_resources)
+                .unwrap()
+                .unwrap_err();
+            assert_eq!(
+                validate_and_coerce(field, &value.to_string()).unwrap_err(),
+                loader_error,
+                "{field}={value}"
+            );
+        }
+
+        // Out of the field type's range: the loader refuses the file while
+        // decoding it, and the editor reports that same decode error.
+        let decode_error = serde_json::from_value::<GlobalConfig>(
+            serde_json::json!({ "builtin": { "vcpus": 256 } }),
+        )
+        .unwrap_err()
+        .to_string();
+        let editor_error = validate_and_coerce("builtin.vcpus", "256").unwrap_err();
+        assert_eq!(editor_error, format!("builtin.vcpus: {decode_error}"));
+
+        // In-range values are accepted and stay numbers.
+        for (field, value) in [
+            ("builtin.vcpus", "255"),
+            ("builtin.mountQuotaMib", "1"),
+            ("maxConcurrentAgents", "1"),
+        ] {
+            assert_eq!(
+                validate_and_coerce(field, value).unwrap(),
+                serde_json::json!(value.parse::<u64>().unwrap())
+            );
+        }
     }
 
     #[test]
@@ -2848,6 +2917,9 @@ mod wi0150_command_tests {
     /// an `AWMAN_CONFIG_HOME` override, the process does not).
     #[tokio::test]
     async fn config_set_global_writes_the_session_global_file_only() {
+        // Hold the config-home lock: `process_path` is derived from the process
+        // environment, which concurrent `ConfigHomeGuard` tests repoint.
+        let _env = crate::data::config::env::ProcessEnvGuard::acquire(&[]);
         let root = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
         let session = session(root.path(), home.path());

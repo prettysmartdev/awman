@@ -14,14 +14,17 @@ use super::*;
 //
 // Per the work item: `remote exec workflow` accepts the same flags as the
 // local `exec workflow`, minus flags that make no sense remotely (`--workdir`
-// is implicit and `--worktree` is a server-side concern). Plus remote-transport
-// flags (`--remote-addr`, `--session`, `--api-key`, `--follow`).
+// is implicit, `--worktree` is a server-side concern, and `--json` shapes the
+// local outcome, which the server reports itself). Plus remote-transport
+// flags (`--remote-addr`, `--session`, `--api-key`, `--follow`). Every kept
+// flag is forwarded to the server; an excluded one is an unknown flag, so it
+// is refused rather than silently dropped.
 //
 // The flag list is built at compile time by const fn so that any future
 // addition to AGENT_RUN_FLAGS_NO_WORKTREE / EXEC_WORKFLOW_FLAGS is picked up
 // automatically — no manual list maintenance.
 
-pub(super) const REMOTE_EXEC_EXCLUDED_FLAG_NAMES: &[&str] = &["workdir", "worktree"];
+pub(super) const REMOTE_EXEC_EXCLUDED_FLAG_NAMES: &[&str] = &["workdir", "worktree", "json"];
 
 pub(super) const REMOTE_TRANSPORT_FLAGS: [FlagSpec; 4] = [
     FlagSpec {

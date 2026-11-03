@@ -28,30 +28,40 @@ fn build_remote_client(
     RemoteClient::new_with_pinned_cert(addr, api_key, pinned.as_deref()).map_err(CommandError::from)
 }
 
+/// Flags of `remote exec` that configure the connection to the server.
+/// Every other flag it declares is an `exec` flag the server honours (the
+/// catalogue leaves out the ones it cannot, so they are refused as unknown
+/// flags rather than dropped), and is forwarded.
+const REMOTE_TRANSPORT_FLAG_NAMES: &[&str] = &["remote-addr", "session", "api-key", "follow"];
+
+/// The `exec` flags a `remote exec` invocation forwards to the server, as
+/// argv tokens.
+fn forwarded_exec_flags(ctx: &BuildContext) -> Vec<String> {
+    ctx.flags.supplied_argv(REMOTE_TRANSPORT_FLAG_NAMES)
+}
+
 #[derive(Debug, Clone)]
 pub struct RemoteExecWorkflowFlags {
-    pub workflow: std::path::PathBuf,
-    pub work_item: Option<String>,
-    pub agent: Option<String>,
+    /// The workflow path, resolved on the server. `None` only with `--dynamic`.
+    pub workflow: Option<std::path::PathBuf>,
     pub remote_addr: Option<String>,
     pub session: Option<String>,
     pub follow: bool,
     pub api_key: Option<String>,
-    /// `--agent-flag` values. Not forwarded: the remote host applies its own
-    /// `agentFlags`, so these only produce a warning.
-    pub agent_flags: Vec<String>,
+    /// Every other `exec workflow` flag the user supplied, as argv for the
+    /// server (`--yolo`, `--model=…`, `--agent-flag=…`, …).
+    pub forwarded: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
 pub struct RemoteExecPromptFlags {
     pub prompt: String,
-    pub agent: Option<String>,
     pub remote_addr: Option<String>,
     pub session: Option<String>,
     pub follow: bool,
     pub api_key: Option<String>,
-    /// `--agent-flag` values; see [`RemoteExecWorkflowFlags::agent_flags`].
-    pub agent_flags: Vec<String>,
+    /// See [`RemoteExecWorkflowFlags::forwarded`].
+    pub forwarded: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -87,6 +97,38 @@ pub struct RemoteExecOutcome {
     pub remote_addr: String,
     pub status: Option<String>,
     pub exit_code: Option<i64>,
+    /// Whether the client followed the command (`--follow`). Only a followed
+    /// command's result decides the client's exit code.
+    pub followed: bool,
+}
+
+impl RemoteExecOutcome {
+    /// The client's exit code. Without `--follow` the command was only
+    /// submitted, which succeeded: 0. With `--follow` it is the remote
+    /// command's own non-zero exit code, else 0 only for a command that
+    /// finished `done`; a failed or cancelled command, or one still running
+    /// because following stopped early, exits 1.
+    pub fn client_exit_code(&self) -> i32 {
+        if !self.followed {
+            return 0;
+        }
+        match (self.exit_code, self.status.as_deref()) {
+            (Some(code), _) if code != 0 => i32::try_from(code).unwrap_or(1),
+            (_, Some("done")) => 0,
+            _ => 1,
+        }
+    }
+}
+
+impl RemoteOutcome {
+    /// See [`RemoteExecOutcome::client_exit_code`]; session commands that
+    /// returned an outcome succeeded.
+    pub fn exit_code(&self) -> i32 {
+        match self {
+            RemoteOutcome::ExecWorkflow(o) | RemoteOutcome::ExecPrompt(o) => o.client_exit_code(),
+            RemoteOutcome::SessionStart(_) | RemoteOutcome::SessionKill(_) => 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -195,25 +237,31 @@ impl RemoteCommand {
         let path = ctx.caller.path();
         let sub = match path.as_slice() {
             ["remote", "exec", "workflow"] => {
+                // As on `exec workflow`, the path may be omitted only with
+                // `--dynamic`, where the server's leader designs the workflow.
+                let workflow = ctx.args.get("workflow").map(std::path::PathBuf::from);
+                if workflow.is_none() && !ctx.flags.bool("dynamic") {
+                    return Err(CommandError::missing_required_argument(
+                        &["remote", "exec", "workflow"],
+                        "workflow",
+                    ));
+                }
                 RemoteSubcommand::ExecWorkflow(RemoteExecWorkflowFlags {
-                    workflow: std::path::PathBuf::from(ctx.args.require("workflow")?),
-                    work_item: ctx.flags.string("work-item"),
-                    agent: ctx.flags.string("agent"),
+                    workflow,
                     remote_addr: ctx.flags.string("remote-addr"),
                     session: ctx.flags.string("session"),
                     follow: ctx.flags.bool("follow"),
                     api_key: ctx.flags.string("api-key"),
-                    agent_flags: ctx.flags.strs("agent-flag").to_vec(),
+                    forwarded: forwarded_exec_flags(ctx),
                 })
             }
             ["remote", "exec", "prompt"] => RemoteSubcommand::ExecPrompt(RemoteExecPromptFlags {
                 prompt: ctx.args.require("prompt")?,
-                agent: ctx.flags.string("agent"),
                 remote_addr: ctx.flags.string("remote-addr"),
                 session: ctx.flags.string("session"),
                 follow: ctx.flags.bool("follow"),
                 api_key: ctx.flags.string("api-key"),
-                agent_flags: ctx.flags.strs("agent-flag").to_vec(),
+                forwarded: forwarded_exec_flags(ctx),
             }),
             ["remote", "session", "start"] => {
                 RemoteSubcommand::SessionStart(RemoteSessionStartFlags {
@@ -242,6 +290,39 @@ impl RemoteCommand {
     }
 }
 
+impl RemoteSubcommand {
+    /// The `--remote-addr` value this invocation passed, if any.
+    fn remote_addr_flag(&self) -> Option<&str> {
+        match self {
+            RemoteSubcommand::ExecWorkflow(f) => f.remote_addr.as_deref(),
+            RemoteSubcommand::ExecPrompt(f) => f.remote_addr.as_deref(),
+            RemoteSubcommand::SessionStart(f) => f.remote_addr.as_deref(),
+            RemoteSubcommand::SessionKill(f) => f.remote_addr.as_deref(),
+        }
+    }
+}
+
+/// Add what to do next to a refused connection. The awman API server listens
+/// on loopback only, so a refused connection to another machine almost always
+/// means nothing is forwarding that port.
+fn explain_unreachable(addr: Option<&str>, error: CommandError) -> CommandError {
+    let (Some(addr), CommandError::RemoteConnectionRefused(reason)) = (addr, &error) else {
+        return error;
+    };
+    let hint = if RemoteClient::is_loopback_addr(addr) {
+        format!(
+            "is the API server running on this machine at {addr}? Start it with `awman api start`"
+        )
+    } else {
+        format!(
+            "the awman API server listens on 127.0.0.1 only, so {addr} must be an SSH tunnel \
+             (`ssh -N -L 9876:127.0.0.1:9876 <server-host>`, then use https://127.0.0.1:9876) \
+             or a reverse proxy running on the server host"
+        )
+    };
+    CommandError::RemoteConnectionRefused(format!("{reason}; {hint}"))
+}
+
 #[async_trait]
 impl Command for RemoteCommand {
     type Frontend = Box<dyn RemoteCommandFrontend>;
@@ -252,20 +333,22 @@ impl Command for RemoteCommand {
         mut frontend: Self::Frontend,
     ) -> Result<Self::Outcome, CommandError> {
         let session = self.session;
-        let outcome = match self.sub {
+        let addr = resolve_addr(&session, self.sub.remote_addr_flag()).ok();
+        let result = match self.sub {
             RemoteSubcommand::ExecWorkflow(f) => {
-                run_remote_exec_workflow(&session, &self.engines, f, &mut *frontend).await?
+                run_remote_exec_workflow(&session, &self.engines, f, &mut *frontend).await
             }
             RemoteSubcommand::ExecPrompt(f) => {
-                run_remote_exec_prompt(&session, &self.engines, f, &mut *frontend).await?
+                run_remote_exec_prompt(&session, &self.engines, f, &mut *frontend).await
             }
             RemoteSubcommand::SessionStart(f) => {
-                run_session_start(&session, &self.engines, f, &mut *frontend).await?
+                run_session_start(&session, &self.engines, f, &mut *frontend).await
             }
             RemoteSubcommand::SessionKill(f) => {
-                run_session_kill(&session, &self.engines, f, &mut *frontend).await?
+                run_session_kill(&session, &self.engines, f, &mut *frontend).await
             }
         };
+        let outcome = result.map_err(|e| explain_unreachable(addr.as_deref(), e))?;
         frontend.replay_queued();
         Ok(outcome)
     }
@@ -598,23 +681,8 @@ async fn run_remote_exec(
         remote_addr: addr,
         status,
         exit_code,
+        followed: params.follow,
     })
-}
-
-/// `--agent-flag` is accepted on `remote exec` (the flag set is derived from the
-/// local one) but never forwarded. Say so instead of dropping it silently.
-fn warn_agent_flags_not_forwarded(agent_flags: &[String], frontend: &mut dyn UserMessageSink) {
-    if agent_flags.is_empty() {
-        return;
-    }
-    frontend.write_message(crate::data::message::UserMessage {
-        level: crate::data::message::MessageLevel::Warning,
-        text: format!(
-            "--agent-flag ({}) is not forwarded to the remote host; set agentFlags in the \
-             remote repository's config instead",
-            agent_flags.join(" ")
-        ),
-    });
 }
 
 async fn run_remote_exec_workflow(
@@ -623,25 +691,18 @@ async fn run_remote_exec_workflow(
     flags: RemoteExecWorkflowFlags,
     frontend: &mut dyn UserMessageSink,
 ) -> Result<RemoteOutcome, CommandError> {
-    warn_agent_flags_not_forwarded(&flags.agent_flags, frontend);
     use crate::command::commands::remote_client::ExecArg;
-    let mut extra: Vec<String> = Vec::new();
-    if let Some(ref wi) = flags.work_item {
-        extra.push("--work-item".into());
-        extra.push(wi.clone());
-    }
-    if let Some(ref agent) = flags.agent {
-        extra.push("--agent".into());
-        extra.push(agent.clone());
-    }
-
+    let workflow = flags
+        .workflow
+        .as_ref()
+        .map(|path| path.to_string_lossy().into_owned());
     let outcome = run_remote_exec(
         session,
         engines,
         RemoteExecParams {
-            exec: ExecArg::Workflow(flags.workflow.to_string_lossy().into_owned()),
+            exec: ExecArg::Workflow(workflow),
             subcommand_name: "workflow",
-            extra_args: extra,
+            extra_args: flags.forwarded,
             remote_addr: flags.remote_addr.as_deref(),
             session_flag: flags.session.as_deref(),
             follow: flags.follow,
@@ -660,21 +721,14 @@ async fn run_remote_exec_prompt(
     flags: RemoteExecPromptFlags,
     frontend: &mut dyn UserMessageSink,
 ) -> Result<RemoteOutcome, CommandError> {
-    warn_agent_flags_not_forwarded(&flags.agent_flags, frontend);
     use crate::command::commands::remote_client::ExecArg;
-    let mut extra: Vec<String> = Vec::new();
-    if let Some(ref agent) = flags.agent {
-        extra.push("--agent".into());
-        extra.push(agent.clone());
-    }
-
     let outcome = run_remote_exec(
         session,
         engines,
         RemoteExecParams {
-            exec: ExecArg::Prompt(flags.prompt.clone()),
+            exec: ExecArg::Prompt(flags.prompt),
             subcommand_name: "prompt",
-            extra_args: extra,
+            extra_args: flags.forwarded,
             remote_addr: flags.remote_addr.as_deref(),
             session_flag: flags.session.as_deref(),
             follow: flags.follow,
@@ -932,7 +986,7 @@ mod tests {
     use crate::data::session::Session;
 
     #[test]
-    fn follow_preserves_the_legacy_push_prefix_and_falls_back_to_result_errors() {
+    fn follow_prefers_the_event_error_and_falls_back_to_result_errors() {
         let result = crate::data::fs::api_db::CommandResult {
             failure: Some(crate::data::fs::api_db::CommandFailure {
                 stage: "push".into(),
@@ -943,8 +997,8 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            follow_error(Some("push: rejected".into()), Some(&result)).as_deref(),
-            Some("push: rejected")
+            follow_error(Some("event error".into()), Some(&result)).as_deref(),
+            Some("event error")
         );
         assert_eq!(
             follow_error(None, Some(&result)).as_deref(),
@@ -952,16 +1006,61 @@ mod tests {
         );
     }
 
+    fn exec_outcome(followed: bool, status: Option<&str>, exit: Option<i64>) -> RemoteOutcome {
+        RemoteOutcome::ExecWorkflow(RemoteExecOutcome {
+            command_id: "c".into(),
+            subcommand: "workflow".into(),
+            session: "s".into(),
+            remote_addr: "https://127.0.0.1:9876".into(),
+            status: status.map(str::to_string),
+            exit_code: exit,
+            followed,
+        })
+    }
+
     #[test]
-    fn remote_exec_warns_that_agent_flags_are_not_forwarded() {
-        let mut sink = crate::data::message::RecordingMessageSink::new();
-        warn_agent_flags_not_forwarded(&[], &mut sink);
-        assert!(sink.queued().is_empty());
-        warn_agent_flags_not_forwarded(&["--search".to_string()], &mut sink);
-        let queued = sink.queued();
-        assert_eq!(queued.len(), 1);
-        assert_eq!(queued[0].level, crate::data::message::MessageLevel::Warning);
-        assert!(queued[0].text.contains("--search"), "{}", queued[0].text);
+    fn followed_remote_exec_exits_with_the_remote_result() {
+        // Submitting without --follow succeeded, whatever the command does.
+        assert_eq!(exec_outcome(false, Some("error"), Some(3)).exit_code(), 0);
+        assert_eq!(exec_outcome(true, Some("done"), Some(0)).exit_code(), 0);
+        assert_eq!(exec_outcome(true, Some("done"), None).exit_code(), 0);
+        assert_eq!(exec_outcome(true, Some("error"), Some(7)).exit_code(), 7);
+        assert_eq!(exec_outcome(true, Some("error"), None).exit_code(), 1);
+        assert_eq!(exec_outcome(true, Some("cancelled"), None).exit_code(), 1);
+        // Following stopped before the command finished.
+        assert_eq!(exec_outcome(true, Some("running"), None).exit_code(), 1);
+        assert_eq!(exec_outcome(true, None, None).exit_code(), 1);
+        // The process exit code is a byte; out-of-range codes still fail.
+        assert_eq!(
+            exec_outcome(true, Some("error"), Some(i64::MAX)).exit_code(),
+            1
+        );
+        let outcome = crate::command::dispatch::CommandOutcome::Remote(exec_outcome(
+            true,
+            Some("error"),
+            Some(2),
+        ));
+        assert_eq!(outcome.exit_code(), 2);
+    }
+
+    #[test]
+    fn refused_connection_explains_the_loopback_only_server() {
+        let refused = || CommandError::RemoteConnectionRefused("tcp connect error".into());
+        let remote = explain_unreachable(Some("https://build-host:9876"), refused()).to_string();
+        assert!(remote.contains("tcp connect error"), "{remote}");
+        assert!(remote.contains("listens on 127.0.0.1 only"), "{remote}");
+        assert!(remote.contains("ssh -N -L"), "{remote}");
+        let local = explain_unreachable(Some("https://127.0.0.1:9876"), refused()).to_string();
+        assert!(local.contains("awman api start"), "{local}");
+        // Other errors, and calls with no address, are left alone.
+        assert!(matches!(
+            explain_unreachable(Some("https://build-host:9876"), CommandError::RemoteTimeout),
+            CommandError::RemoteTimeout
+        ));
+        assert_eq!(
+            explain_unreachable(None, refused()).to_string(),
+            refused().to_string()
+        );
     }
 
     /// `AWMAN_CONFIG_HOME` is pinned at the (empty) fixture dir so the session

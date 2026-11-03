@@ -28,7 +28,7 @@ use crate::engine::auth::AgentCredentials;
 use crate::engine::container::naming::{generate_squad_container_name, validate_task_slug};
 use crate::engine::container::options::ContainerName;
 use crate::engine::error::EngineError;
-use crate::engine::workflow::timing::YOLO_COUNTDOWN_DURATION;
+use crate::engine::workflow::timing::yolo_countdown_duration;
 
 /// The label key carrying the squad evaluation session id — the same key an
 /// interactive session uses, so `docker ps` inspection is uniform.
@@ -195,7 +195,7 @@ impl SquadAgentLauncher {
 
     /// Drive a launched unattended agent to completion with the same stuck →
     /// yolo countdown → auto-advance machinery a dynamic workflow uses (identical
-    /// [`StuckEvent`] semantics and the same [`YOLO_COUNTDOWN_DURATION`]), minus
+    /// [`StuckEvent`] semantics and the same [`yolo_countdown_duration`]), minus
     /// the interactive control board — squad has no operator to consult.
     ///
     /// The agent's stuck detector (in the container I/O bridge) publishes `Stuck`
@@ -239,7 +239,7 @@ impl SquadAgentLauncher {
                             agent = label,
                             "squad yolo countdown started for task {task:?} ({label}): no output — \
                              advancing automatically in {}s",
-                            YOLO_COUNTDOWN_DURATION.as_secs(),
+                            yolo_countdown_duration().as_secs(),
                         );
                         match run_unattended_countdown(task, label, &mut wait_rx, &mut stuck_rx).await {
                             CountdownOutcome::Exited(result) => {
@@ -425,7 +425,7 @@ enum CountdownOutcome {
     Exited(Result<AgentExitInfo, EngineError>),
 }
 
-/// One countdown window of [`YOLO_COUNTDOWN_DURATION`]. A completed agent
+/// One countdown window of [`yolo_countdown_duration`]. A completed agent
 /// always wins over a same-instant expiry (`biased` puts the wait branch
 /// first), matching the dynamic leader countdown's ordering.
 async fn run_unattended_countdown(
@@ -434,7 +434,7 @@ async fn run_unattended_countdown(
     wait_rx: &mut tokio::sync::oneshot::Receiver<Result<AgentExitInfo, EngineError>>,
     stuck_rx: &mut tokio::sync::broadcast::Receiver<StuckEvent>,
 ) -> CountdownOutcome {
-    let deadline = tokio::time::Instant::now() + YOLO_COUNTDOWN_DURATION;
+    let deadline = tokio::time::Instant::now() + yolo_countdown_duration();
     loop {
         tokio::select! {
             biased;

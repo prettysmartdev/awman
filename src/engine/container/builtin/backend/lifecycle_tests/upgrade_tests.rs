@@ -677,7 +677,7 @@ fn an_older_awman_cannot_launch_or_import_while_the_upgrade_runs() {
     assert!(paths.upgrade_catalog(&*rig.driver).unwrap().is_some());
     assert_eq!(*observed.lock().unwrap(), vec![(true, true)]);
     // The fence is gone after the upgrade.
-    assert!(paths.image_lease("img:old", false).is_ok());
+    assert!(super::lease_after_forks(paths, "img:old", false).is_ok());
 }
 
 #[test]

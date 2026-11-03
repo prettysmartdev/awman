@@ -25,16 +25,17 @@ The installer detects your platform and installs `awman` to `/usr/local/bin`. Ot
 From your project's Git root:
 
 ```sh
-awman init
+awman init                 # sets up Claude Code
+awman init --agent codex   # or pick another agent
 ```
 
-Init is interactive. It asks you to:
+The agent you pass (`claude` by default) becomes the repo default; change it later with `awman config set agent <name>`. Init then asks you to:
 
-1. **Pick an agent** — this becomes the repo default (change later with `awman config set agent <name>`).
+1. **Choose a project Dockerfile** — only if the repo has none: create `Dockerfile.dev` from the template (recommended), use an existing Dockerfile, or skip.
 2. **Run the agent audit** — say yes. An agent inspects your codebase and fills `Dockerfile.dev` with the exact toolchain your project needs.
 3. **Set up work items** — optional; configures where structured task specs live (or downloads the `aspec/` template).
 
-Init then creates the two Dockerfiles, builds the container images, and prints a summary. Commit `Dockerfile.dev` and `.awman/` so teammates get the same environment.
+Init creates the agent Dockerfile, builds the container images, and prints a summary. Commit `Dockerfile.dev` and `.awman/` so teammates get the same environment.
 
 ## 3. Verify
 

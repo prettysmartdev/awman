@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::spawn_router;
 use awman::command::dispatch::Engines;
 use awman::data::fs::api_db::SqliteSessionStore;
 use awman::data::fs::api_paths::ApiPaths;
@@ -19,7 +20,7 @@ use awman::engine::auth::AuthEngine;
 use awman::engine::container::ContainerRuntime;
 use awman::engine::git::GitEngine;
 use awman::engine::overlay::OverlayEngine;
-use awman::frontend::api::routes::{build_router, AppState, AuthMode};
+use awman::frontend::api::routes::{AppState, AuthMode};
 
 fn make_app_state(root: &std::path::Path, auth: AuthMode) -> Arc<AppState> {
     let paths = ApiPaths::from_root(root);
@@ -80,22 +81,6 @@ fn make_app_state(root: &std::path::Path, auth: AuthMode) -> Arc<AppState> {
         event_buses: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         setup_buses: tokio::sync::Mutex::new(HashMap::new()),
     })
-}
-
-/// Spawn the router on an ephemeral loopback port. Returns `(addr, server_handle)`.
-/// Returns `None` if the host refuses to bind 127.0.0.1 (CI sandbox edge case).
-async fn spawn_router(
-    state: Arc<AppState>,
-) -> Option<(std::net::SocketAddr, tokio::task::JoinHandle<()>)> {
-    let app = build_router(state);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.ok()?;
-    let addr = listener.local_addr().ok()?;
-    let handle = tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
-    });
-    // Brief settle so the listener is ready before the first request.
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    Some((addr, handle))
 }
 
 #[tokio::test]

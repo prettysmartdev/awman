@@ -1,5 +1,6 @@
 //! Binary smoke tests — invokes the compiled `awman` binary as a subprocess.
 
+use crate::make_git_repo;
 use std::process::Command;
 
 /// Path to the compiled `awman` binary. Cargo sets this for integration tests.
@@ -185,16 +186,6 @@ fn awman_remote_session_help_lists_start_and_kill() {
 }
 
 // ─── skill() overlay flag behaviour (WI 0075) ────────────────────────────────
-
-fn make_git_repo() -> tempfile::TempDir {
-    let repo = tempfile::tempdir().expect("TempDir::new");
-    std::process::Command::new("git")
-        .args(["init", "--quiet"])
-        .current_dir(repo.path())
-        .status()
-        .expect("git init");
-    repo
-}
 
 /// `skill()` (empty parens, no args) as --overlay value must exit non-zero with
 /// a descriptive error; the flag itself must be recognised (not "unknown flag").

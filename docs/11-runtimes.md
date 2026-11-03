@@ -26,7 +26,7 @@ You can switch runtimes at any time — each keeps its own separate state and do
 
 [Custom agents](15-custom-agents.md) (including `crush` and `maki`) run on `docker`, `apple-containers` and `builtin-experimental`, but not on `docker-sbx-experimental` yet.
 
-**Invalid values are a fatal error.** If the `runtime` field holds anything other than the four strings above, awman refuses to start — it does not fall back to Docker, because launching agents under a different isolation model than the one you configured would be unsafe. CLI commands print the invalid value and the valid options, then exit immediately; the interactive TUI opens a modal dialog on startup with the same message (press Enter to quit). Fix the `runtime` value in `$HOME/.awman/config.json` and relaunch.
+**Invalid values are a fatal error.** If the `runtime` field holds anything other than the four strings above, awman does not fall back to Docker, because launching agents under a different isolation model than the one you configured would be unsafe. Commands that would run an agent print the invalid value and the valid options, then exit; the interactive TUI opens a modal dialog on startup with the same message (press Enter to quit). `awman config …` keeps working so you can fix it (`awman config set --global runtime docker`), or edit `$HOME/.awman/config.json` directly.
 
 ---
 
@@ -40,7 +40,7 @@ Docker is the default runtime on all platforms.
 
 **Lifecycle:** containers are ephemeral. The agent container is removed when the session ends. Persistent state lives in your Git repository.
 
-**`awman ready` for Docker** builds per-agent Docker images from the `Dockerfile.<agent>` files in `.awman/`. Images are rebuilt when you run `awman ready --build` or when another normal ready rule schedules a build; `--no-cache` disables build cache for builds that run.
+**`awman ready` for Docker** builds the project image from `Dockerfile.dev` and the per-agent images from the `.awman/Dockerfile.<agent>` files. Images are rebuilt when you run `awman ready --build` or when another normal ready rule schedules a build; `--no-cache` disables build cache for builds that run.
 
 See [Security & Isolation](04-security-and-isolation.md) for overlay mounts, the Docker socket flag, and worktree isolation.
 
@@ -65,7 +65,7 @@ Apple Containers is a macOS-native runtime that runs each agent in a lightweight
 
 ## Builtin microVM (experimental)
 
-`builtin-experimental` runs each agent session in a Linux microVM whose VM code, kernel, and guest agent are **embedded in the awman executable**. Each VM starts another process of that same executable. There is no separate runtime to install, and no Docker, `container` or `sbx` is needed to *run* agents.
+`builtin-experimental` runs each agent session in a Linux microVM whose VM code, kernel, and guest agent are **embedded in the awman executable** (it is powered by Microsandbox). Each VM starts another process of that same executable. There is no separate runtime to install, and no Docker, `container` or `sbx` is needed to *run* agents.
 
 **Isolation model:** a hardware-virtualized VM with its own kernel per session. The hypervisor, device emulation, and shared-filesystem implementations form part of the security boundary. The configured project, settings, and overlay mounts grant access to host files. There is no host Docker socket bridge.
 
@@ -128,18 +128,9 @@ make sign-macos BIN=/usr/local/bin/awman
 
 An unsigned build fails to start agents with `embedded worker startup failed; verify KVM access or the macOS com.apple.security.hypervisor entitlement …`.
 
-### Setup
-
-```sh
-awman config set --global runtime builtin-experimental
-awman ready
-```
-
-By default, `awman ready` **imports** a finished image from a source you choose. To opt into source-matched local builds, see [Building from a local image source](#building-from-a-local-image-source).
-
 ### Getting an agent image
 
-Docker and Apple Containers build `awman-<project>:latest` and `awman-<project>-<agent>:latest` from `Dockerfile.dev` and `.awman/Dockerfile.<agent>`. By default the builtin runtime imports finished images, but you can opt into source-matched builds with `builtin.builder.enabled`; see [Building from a local image source](#building-from-a-local-image-source). Without that setting, build the images yourself and tell awman where to import them from.
+Docker and Apple Containers build `awman-<project>:latest` and `awman-<project>-<agent>:latest` from `Dockerfile.dev` and `.awman/Dockerfile.<agent>`. By default the builtin runtime **imports** finished images from a source you choose; you can opt into source-matched local builds with `builtin.builder.enabled` (see [Building from a local image source](#building-from-a-local-image-source)). Without that setting, build the images yourself and tell awman where to import them from.
 
 **On a Mac, the simplest route is Apple Containers.** If you already use the `apple-containers` runtime, the images are already in its store: set `"imageSource": {"type": "apple-local"}` and run `awman ready` (see [Apple Containers store](#apple-containers-store)). Otherwise build them with `container build` (same arguments as `docker build` below) and use the same source. Docker, a registry, or an archive file work too:
 
@@ -275,6 +266,7 @@ The `runtime` key is global; the `builtin` block can be set in the global config
 | `builtin.memoryMib` | `4096` | Guest memory in MiB, 128 or more. |
 | `builtin.rootDiskMib` | `30720` (30 GiB) | Writable root disk per session VM in MiB, 256 or more: the space the agent has for everything outside its mounts (`/`, its home directory, installed packages). The disk file is sparse, so it only uses host space as the agent writes. |
 | `builtin.mountQuotaMib` | `30720` (30 GiB) | How many MiB the agent may add to each host mount, the workspace included, beyond what it already held; 1 or more. Writes past it fail with "no space left on device" in the guest. This keeps an agent from filling your disk through a mount. |
+| `builtin.builder.enabled` | `false` | Let `ready`, and a launch whose agent image is missing, build in a `docker-local` or `apple-local` source store before importing. See [Building from a local image source](#building-from-a-local-image-source). |
 | `builtin.imageSource` | unset | Default image source (see above). |
 | `builtin.images` | `{}` | Per-image-tag sources. |
 | `builtin.registries` | `{}` | Per-registry settings. |
@@ -372,14 +364,13 @@ For a newer catalog, use the newer awman. Otherwise quit any awman still using t
 
 | | Docker / Apple Containers | Builtin |
 |---|---|---|
-| Image creation | `ready` builds from Dockerfiles | `ready` imports; you build externally |
+| Image creation | `ready` builds from Dockerfiles | `ready` imports from a configured source; with `builtin.builder.enabled` it can first build in a local Docker or Apple Containers store |
 | Fractional CPU | Supported | Rejected (`cannot honour …`): whole vCPUs only |
 | Resource limit enforcement | Container-level limits | VM allocation: the guest sees exactly the configured vCPUs and memory, and memory exhaustion is handled by the guest's own OOM killer without affecting the host or other VMs |
 | `--allow-docker` | Mounts the host Docker socket (Docker only) | **Rejected.** No socket is ever mounted and there is no host daemon bridge |
 | Reattach after the launching awman exits | Docker: yes. Apple: no | No |
 | Host `localhost` / MCP services | Per the container network | Inside the VM, `127.0.0.1` is the VM itself; a host loopback service is reachable only if its port is listed in `builtin.network.hostPorts` (see [Network](#network)) |
 | Egress control | None built in (Docker); per-container network (Apple) | `builtin.network.mode`: `public` (default), `allowlist`, or `none`. HTTPS checks visible SNI plus its exact DNS/IP binding; encrypted HTTP authority and ECH inner names are not inspected. Hostname rules deny UDP/QUIC |
-| Tool allow/deny lists for an agent with no matching flag | See [Agent Sessions](03-agent-sessions.md) | Rejected with an error instead of being silently discarded |
 | Named image `USER` (like `awman` in the templates) | Handled by the container engine | Resolved to a numeric id from the imported image's `/etc/passwd` and `/etc/group`; an unresolvable user is refused. Agents never run as root |
 | Image `HOME` | From the image | From the image's `HOME`, or else the image user's home directory in `/etc/passwd` (as Docker does); an image with neither is refused |
 | Exit status of an agent killed by a signal | `128 + signal` (for example `137` after the OOM killer) | `-1`: the embedded guest agent reports that the process was killed by a signal but not which one; awman's own exit status is then `1` |
@@ -426,7 +417,7 @@ See [Cleaning Up](13-cleaning-up.md#builtin-runtime-state) for reclaiming disk s
 
 `docker-sbx-experimental` runs each agent session in a dedicated microVM, providing hypervisor-grade isolation. It uses Docker's `sbx` CLI and is distinct from Docker Desktop — `sbx` is a standalone binary and does not require Docker Desktop to be installed.
 
-This runtime is **experimental**. The `-experimental` suffix in the config string is intentional and durable: `sbx` itself has open known bugs as of June 2026 and its per-VM API is partly undocumented. The suffix will be removed in a future work item once both `sbx` and awman's integration have stabilized.
+This runtime is **experimental**, as the `-experimental` suffix says: `sbx` itself has open known bugs as of June 2026 and its per-VM API is partly undocumented.
 
 **Current status:** `awman ready`, `awman chat`, `awman exec`, and `awman exec workflow` all work end-to-end under `docker-sbx-experimental`. Run `awman ready` once to prepare the runtime, then use `awman chat` and `awman exec` exactly as you would with any other runtime.
 
@@ -613,7 +604,7 @@ No prompt is delivered twice: mixin kits use stdin; `kind: agent` kits use posit
 
 ### Supported agents
 
-All nine awman agents are supported under `docker-sbx-experimental`:
+All seven built-in agents are supported under `docker-sbx-experimental`:
 
 | Agent | Kit kind | Notes |
 |---|---|---|
@@ -660,31 +651,29 @@ All nine awman agents are supported under `docker-sbx-experimental`:
 
 **`sbx` not found:**
 ```
-awman: 'sbx' not found on PATH. Install with: brew install docker/tap/sbx
+`sbx` binary not found on PATH. Install Docker Sandboxes with `brew install docker/tap/sbx`, then re-run `awman ready`.
 ```
-Install `sbx` and re-run `awman ready`.
 
-**Not logged in:**
+**Not logged in** (a warning; `ready` continues):
 ```
-awman: sbx ls failed — run 'sbx login' to authenticate Docker Sandboxes
+sbx: `sbx ls` failed — you may not be logged in. Run `sbx login` to authenticate Docker Sandboxes, then re-run `awman ready`.
 ```
-Run `sbx login` and re-run `awman ready`.
 
 **Linux:**
 ```
-awman: docker-sbx-experimental is not supported on this platform
+backend docker-sbx-experimental is not supported on platform linux — blocked until the Docker Sandboxes virtiofs file-creation bug (sbx-releases Issue #51) is fixed upstream
 ```
-Use `runtime: "docker"` or `runtime: "apple-containers"` instead.
+Use `runtime: "docker"` instead.
 
-**Stale kit version:**
+**Stale kit version** (printed inside the sandbox):
 ```
-awman: session.json schema_version mismatch — re-run 'awman ready'
+awman: session.json has unsupported schema_version '<n>' (expected 1).
 ```
-The kit on disk was emitted by an older version of awman. Run `awman ready` to regenerate.
+The kit on disk was emitted by a different awman version. Run `awman ready` to regenerate it.
 
 **Kit validation failure:**
 ```
-awman: sbx kit validate failed for ~/.awman/kits/claude: <error from sbx>
+kit validation failed for ~/.awman/kits/claude: <error from sbx>
 ```
 The error text from `sbx kit validate` is printed verbatim. Common causes are a stale `sbx` binary (upgrade it) or a network issue during template pull. Run `awman ready --no-cache` to force a clean re-emit.
 
@@ -703,7 +692,6 @@ You can switch between runtimes at any time by changing the `runtime` setting. E
 
 - **Docker / Apple Containers:** per-repo `.awman/Dockerfile.<agent>` files and the local Docker / containerd image store. These are unchanged when you switch to sbx.
 - **Docker Sandboxes:** `~/.awman/kits/<agent>/` (host-global kit files) and `<workspace>/.awman/session.json` (per-launch dynamic config written just before each launch). These are not touched when you switch to Docker or Apple Containers.
-
 - **Builtin:** the private state directory (`~/.awman/builtin` by default) holding imported images and session VMs. Its images are separate from the Docker and Apple image stores.
 
 Switching runtimes does not delete state for the other runtimes. You can keep all four ready simultaneously.
@@ -719,7 +707,7 @@ awman ready
 
 # Try the sbx runtime
 awman config set --global runtime docker-sbx-experimental
-awman ready                         # emits kits, registers credentials
+awman ready                         # emits and validates kits
 awman chat --agent claude                   # runs in sbx sandbox
 
 # Switch back to Docker — Docker images are still there
@@ -732,5 +720,3 @@ awman chat --agent claude                   # runs in Docker container, unchange
 ---
 
 [← GitHub Integration](10-github-integration.md) · [Next: squad →](12-squad.md)
-
-The builtin runtime is powered by Microsandbox, embedded in awman; no separate installation is required.

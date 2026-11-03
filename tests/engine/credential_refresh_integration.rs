@@ -125,7 +125,7 @@ fn run_fixture_child(test_name: &str, refresh_mode: &str) {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
-    let old_path = std::env::var("PATH").unwrap_or_default();
+    let child_path = crate::process_env::ProcessEnvGuard::child_path_with_first(&bin);
     if test_name.contains("spawn_choke") || test_name.contains("workflow_auth") {
         for runtime in ["docker", "container"] {
             let runtime_script = bin.join(runtime);
@@ -163,7 +163,7 @@ fn run_fixture_child(test_name: &str, refresh_mode: &str) {
             },
         )
         .env("HOME", home.path())
-        .env("PATH", format!("{}:{old_path}", bin.display()))
+        .env("PATH", &child_path)
         .status()
         .expect("spawn isolated monitor test process");
     assert!(

@@ -37,11 +37,15 @@ case "$1" in
   info) echo "27.0.0"; exit 0 ;;
   image|images|inspect) echo '[{"Id":"sha256:fake"}]'; exit 0 ;;
   stop)
-    # The chatty cancellation fixture models docker stop closing the running
-    # container's pipes. Other fixture modes retain their existing behavior.
-    if [ "$(cat "$ctl/mode" 2>/dev/null)" = "chatty-slow" ] && [ -f "$ctl/slow.pid" ]; then
-      kill "$(cat "$ctl/slow.pid")" 2>/dev/null || true
-    fi
+    # The slow fixtures model docker stop ending the running container and
+    # closing its pipes, so a cancelled agent ends at once rather than when
+    # its 30s sleep runs out.
+    case "$(cat "$ctl/mode" 2>/dev/null)" in
+      slow|chatty-slow)
+        [ -f "$ctl/slow.child" ] && kill "$(cat "$ctl/slow.child")" 2>/dev/null
+        [ -f "$ctl/slow.pid" ] && kill "$(cat "$ctl/slow.pid")" 2>/dev/null
+        ;;
+    esac
     exit 0
     ;;
   exec)
@@ -60,13 +64,14 @@ case "$1" in
   run)
     mode="$(cat "$ctl/mode" 2>/dev/null)"
     if [ "$mode" = "structured" ]; then cat "$ctl/agent.ndjson"; exit 0; fi
-    workspace=""; leader=""; background=""
+    workspace=""; leader=""; background=""; output=""
     for arg in "$@"; do
       case "$arg" in
         -d) background=yes ;;
         /*:/*)
           host="${arg%%:/*}"; target="${arg#"$host":}"
           case "$target" in /workspace|/workspace:*) workspace="$host" ;; esac
+          case "$target" in /awman/output|/awman/output:*) output="$host" ;; esac
           [ -f "$host/workflow-usage.md" ] && leader="$host"
           ;;
       esac
@@ -80,6 +85,16 @@ case "$1" in
       exit 0
     fi
     [ "$mode" = "noop" ] && exit 0
+    if [ "$mode" = "outputs-resume" ]; then
+      # The first agent run writes an output and succeeds; every later run
+      # is a slow agent, so a test can restart the daemon mid-workflow.
+      if [ ! -f "$ctl/outputs-first.done" ]; then
+        mkdir -p "$output/first" && echo '{"step":"first"}' > "$output/first/result.json"
+        touch "$ctl/outputs-first.done"
+        exit 0
+      fi
+      mode=slow
+    fi
     if [ "$mode" = "chatty" ] || [ "$mode" = "chatty-slow" ]; then
       [ "$mode" = "chatty-slow" ] && echo "$$" > "$ctl/slow.pid"
       i=0
@@ -93,7 +108,13 @@ case "$1" in
       [ "$mode" = "chatty-slow" ] && exec sleep 30
       exit 0
     fi
-    [ "$mode" = "slow" ] && { echo "$$" > "$ctl/slow.pid"; sleep 30; }
+    if [ "$mode" = "slow" ]; then
+      # slow.pid is the readiness signal, so write it once both pids exist.
+      sleep 30 &
+      echo "$!" > "$ctl/slow.child"
+      echo "$$" > "$ctl/slow.pid"
+      wait "$!"
+    fi
     [ -n "$workspace" ] && echo "edited by the fake agent" > "$workspace/agent-edit.txt"
     if [ "$mode" = "poison" ]; then
       mkdir -p "$workspace/.git/hooks"
@@ -138,6 +159,9 @@ pub enum AgentMode {
     ChattySlow,
     LeaderRewrite,
     LeaderCommit,
+    /// The first run writes `first/result.json` into `/awman/output` and exits
+    /// 0; every later run behaves like [`AgentMode::Slow`].
+    OutputsResume,
 }
 
 /// A throwaway awman home plus the fake container CLI. Outlives any number
@@ -176,6 +200,7 @@ impl ApiHome {
             AgentMode::ChattySlow => "chatty-slow",
             AgentMode::LeaderRewrite => "leader-rewrite",
             AgentMode::LeaderCommit => "leader-commit",
+            AgentMode::OutputsResume => "outputs-resume",
         };
         std::fs::write(self.dir.path().join("control/mode"), mode).unwrap();
     }
@@ -206,13 +231,19 @@ exit 0
     /// Start `awman api start` on a free loopback port and wait until it
     /// answers `/v1/status`.
     pub async fn start(&self) -> ApiServer {
+        self.start_with_env(&[]).await
+    }
+
+    /// [`Self::start`] with extra environment variables for the server, such
+    /// as a test-isolation-only timing override.
+    pub async fn start_with_env(&self, env: &[(&str, &str)]) -> ApiServer {
         let mut last_log = String::new();
         for attempt in 0..3 {
             let port = free_port();
             let log_path = self.dir.path().join(format!("server-{port}-{attempt}.log"));
             let log = std::fs::File::create(&log_path).unwrap();
             let child = self
-                .server_command(port)
+                .server_command(port, env)
                 .stdout(Stdio::from(log.try_clone().unwrap()))
                 .stderr(Stdio::from(log))
                 .spawn()
@@ -232,7 +263,7 @@ exit 0
         panic!("awman api start never came up; last log:\n{last_log}");
     }
 
-    fn server_command(&self, port: u16) -> Command {
+    fn server_command(&self, port: u16, env: &[(&str, &str)]) -> Command {
         let home = self.home();
         let path = format!(
             "{}:{}",
@@ -262,6 +293,7 @@ exit 0
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("AWMAN_TEST_ISOLATION", "1")
             .env("FAKE_DOCKER_CONTROL", self.dir.path().join("control"))
+            .envs(env.iter().copied())
             .stdin(Stdio::null());
         command
     }

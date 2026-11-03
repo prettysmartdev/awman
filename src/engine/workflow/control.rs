@@ -222,7 +222,7 @@ impl WorkflowEngine {
 
         self.msg_warning(format!(
             "Step '{step_name}' failed (exit {exit_code}); retrying once in {}s",
-            timing::YOLO_COUNTDOWN_DURATION.as_secs(),
+            timing::yolo_countdown_duration().as_secs(),
         ));
         let countdown = self.run_failure_retry_countdown(step_name).await?;
         // The countdown breaks early on a cancel: never start the retry.
@@ -273,7 +273,7 @@ impl WorkflowEngine {
         &mut self,
         step_name: &str,
     ) -> Result<YoloTickOutcome, EngineError> {
-        let total = timing::YOLO_COUNTDOWN_DURATION;
+        let total = timing::yolo_countdown_duration();
         let start = Instant::now();
         self.frontend
             .yolo_countdown_started(step_name, CountdownKind::FailureRetry);

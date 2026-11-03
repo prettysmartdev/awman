@@ -167,6 +167,36 @@ impl ResolvedFlags {
         self.supplied.contains(name)
     }
 
+    /// The flags the frontend supplied, except `exclude`, as the argv tokens
+    /// [`CommandCatalogue::parse_raw_args`] reads back: `--name` for a true
+    /// boolean and `--name=value` for every value (one per repeated value).
+    /// The inline form keeps a value that starts with `-` (an
+    /// `--agent-flag`) from being read as a flag. Order is by flag name.
+    ///
+    /// [`CommandCatalogue::parse_raw_args`]: crate::command::dispatch::catalogue::CommandCatalogue::parse_raw_args
+    pub fn supplied_argv(&self, exclude: &[&str]) -> Vec<String> {
+        let mut argv = Vec::new();
+        for name in self.supplied.iter().filter(|name| !exclude.contains(name)) {
+            let values: Vec<String> = match self.get(name) {
+                ResolvedValue::Bool(true) => {
+                    argv.push(format!("--{name}"));
+                    continue;
+                }
+                ResolvedValue::Bool(false) => continue,
+                ResolvedValue::Str(value) => value.iter().cloned().collect(),
+                ResolvedValue::Strs(values) => values.clone(),
+                ResolvedValue::Path(value) => value
+                    .iter()
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .collect(),
+                ResolvedValue::U16(value) => value.iter().map(u16::to_string).collect(),
+                ResolvedValue::Usize(value) => value.iter().map(usize::to_string).collect(),
+            };
+            argv.extend(values.into_iter().map(|value| format!("--{name}={value}")));
+        }
+        argv
+    }
+
     /// Whether the command declares `name` at all.
     ///
     /// The value getters panic on an undeclared flag on purpose — a
@@ -559,6 +589,30 @@ mod tests {
     fn resolve(path: &[&str], frontend: &FakeCommandFrontend) -> ResolvedFlags {
         let spec = CommandCatalogue::get().lookup(path).expect("spec");
         ResolvedFlags::resolve(frontend, path, spec).expect("resolve")
+    }
+
+    #[test]
+    fn supplied_argv_renders_only_supplied_flags_in_the_raw_args_form() {
+        let mut frontend = FakeCommandFrontend::new();
+        frontend.bools.insert("yolo".into(), true);
+        frontend.strings.insert("model".into(), "opus".into());
+        frontend
+            .strings_vec
+            .insert("agent-flag".into(), vec!["--search".into(), "-v".into()]);
+        frontend.usizes.insert("max-concurrent".into(), 3);
+        frontend.strings.insert("session".into(), "abc".into());
+        let flags = resolve(&["remote", "exec", "workflow"], &frontend);
+        assert_eq!(
+            flags.supplied_argv(&["session"]),
+            vec![
+                "--agent-flag=--search",
+                "--agent-flag=-v",
+                "--max-concurrent=3",
+                "--model=opus",
+                "--yolo",
+            ],
+            "defaults (non-interactive, on-* enums) and excluded flags are not rendered"
+        );
     }
 
     #[test]

@@ -19,6 +19,21 @@ mod api_process;
 #[path = "../helpers/git_daemon.rs"]
 mod git_daemon;
 
+/// Serve the real router on an ephemeral loopback port. The listener is
+/// bound before this returns, so requests queue until `axum::serve` accepts
+/// them; no settle delay is needed. `None` when loopback cannot be bound.
+pub(crate) async fn spawn_router(
+    state: std::sync::Arc<awman::frontend::api::routes::AppState>,
+) -> Option<(std::net::SocketAddr, tokio::task::JoinHandle<()>)> {
+    let app = awman::frontend::api::routes::build_router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.ok()?;
+    let addr = listener.local_addr().ok()?;
+    let handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    Some((addr, handle))
+}
+
 mod auth_modes;
 mod http_core;
 mod live_server;

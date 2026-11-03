@@ -164,6 +164,26 @@ belongs to rather than inventing a new code.
   list must not contain duplicates; a test asserts this.
 - A route is never removed within `v1`. When a resource gets a better path,
   the old path keeps being served and the docs point to the new one.
+- The API server binds `127.0.0.1` only, with no option to listen elsewhere;
+  a client on another machine reaches it through an SSH tunnel or a reverse
+  proxy on the server host. A configurable bind address — with TLS required
+  for any non-loopback address — is specified by WI 0142 and is not part of
+  the current surface. A remote client whose connection to a non-loopback
+  address is refused says this in its error instead of reporting only the
+  transport failure.
+
+## Remote execution
+
+- A client command that runs another command on an awman server
+  forwards every flag it declares, apart from its own
+  transport flags, as the argv the server's API parser reads. A flag the
+  server cannot honour for a remote caller is left out of the client
+  command's catalogue entry, so it is refused as an unknown flag; it is never
+  accepted and dropped.
+- A client that follows a remote command to completion exits with that
+  command's result (non-zero when it failed, was cancelled, or following
+  stopped before it finished). A client that only submits exits 0 once the
+  server accepted the command.
 
 ## Output and configuration
 
@@ -261,7 +281,20 @@ source or change the selected execution runtime.
 
 An agent that lacks an allowed/disallowed-tools flag is rejected with a
 configuration error on every runtime (Docker, Apple Containers, builtin and Docker Sandboxes),
-rather than launching with the tool restriction silently dropped.
+rather than launching with the tool restriction silently dropped. The effective
+`yoloDisallowedTools` list is such a restriction on every yolo-mode launch (any
+frontend, any workflow step): it is added to the launch's disallowed tools, and
+an agent that cannot deliver it is refused with an error naming the setting.
+
+Before a static workflow starts its first setup or agent container on a
+reachable runtime that builds images, every agent its steps resolve to must
+have its image. For each missing one, Layer 2 asks the frontend once
+(`AgentSetupFrontend`): set it up (provision its Dockerfile from the definition
+and build, which needs the project image), fall back to the default agent for
+those steps (offered only when the default agent's image exists), or abort
+before any container starts. Hosts with nobody to ask answer from their
+headless profile. Importing and sandbox runtimes keep their own image
+preparation.
 Sandbox tool lists also require a supported native settings delivery path;
 currently only Claude's sandbox startup script applies them.
 

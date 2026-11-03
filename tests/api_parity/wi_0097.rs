@@ -27,6 +27,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::spawn_router;
 use awman::command::commands::api_server::event_bus::EventBus;
 use awman::command::dispatch::{CommandFrontend, Engines};
 use awman::data::fs::api_db::NewSessionRow;
@@ -43,7 +44,7 @@ use awman::engine::container::ContainerRuntime;
 use awman::engine::git::GitEngine;
 use awman::engine::overlay::OverlayEngine;
 use awman::frontend::api::command_frontend::ApiDispatchFrontend;
-use awman::frontend::api::routes::{build_router, AppState, AuthMode};
+use awman::frontend::api::routes::{AppState, AuthMode};
 
 // ─── Test helpers ─────────────────────────────────────────────────────────────
 
@@ -114,19 +115,6 @@ fn make_app_state_with_workdirs(
 
 fn make_app_state(root: &std::path::Path) -> Arc<AppState> {
     make_app_state_with_workdirs(root, vec![])
-}
-
-async fn spawn_router(
-    state: Arc<AppState>,
-) -> Option<(std::net::SocketAddr, tokio::task::JoinHandle<()>)> {
-    let app = build_router(state);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.ok()?;
-    let addr = listener.local_addr().ok()?;
-    let handle = tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
-    });
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    Some((addr, handle))
 }
 
 /// Insert an active + setup-ready local session directly into the store.

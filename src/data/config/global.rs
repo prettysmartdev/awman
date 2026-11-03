@@ -9,8 +9,8 @@ use serde::{Deserialize, Serialize};
 use crate::data::config::builtin_runtime::BuiltinRuntimeConfig;
 use crate::data::config::env::{Env, EnvSnapshot};
 use crate::data::config::repo::{
-    validate_agent_flags, validate_auth_refresh, AgentFlagsConfig, ApiConfig, AuthRefreshConfig,
-    RemoteConfig, SquadConfig, WorktreeConfig,
+    validate_agent_flags, validate_auth_refresh, validate_max_concurrent_agents, AgentFlagsConfig,
+    ApiConfig, AuthRefreshConfig, RemoteConfig, SquadConfig, WorktreeConfig,
 };
 use crate::data::config::runtime_selection::{RuntimeSelection, UnknownRuntimeValue};
 use crate::data::error::DataError;
@@ -181,13 +181,7 @@ impl GlobalConfig {
     /// never persists a file that every later command would refuse to load.
     fn validate_loaded(&mut self, path: &std::path::Path) -> Result<(), DataError> {
         let cfg = self;
-        if let Some(n) = cfg.max_concurrent_agents {
-            if n < 1 {
-                return Err(DataError::Other(
-                    "maxConcurrentAgents must be >= 1".to_string(),
-                ));
-            }
-        }
+        validate_max_concurrent_agents(cfg.max_concurrent_agents)?;
         if let Some(squad) = &cfg.squad {
             squad
                 .validate()

@@ -107,6 +107,13 @@ pub const AWMAN_TEST_SBX: &str = "AWMAN_TEST_SBX";
 /// runtime's state directory.
 pub const AWMAN_TEST_BUILTIN: &str = "AWMAN_TEST_BUILTIN";
 
+/// `AWMAN_TEST_YOLO_COUNTDOWN_MS` — under [`AWMAN_TEST_ISOLATION`], a shorter
+/// yolo / failure-retry countdown in milliseconds, so an integration test that
+/// drives a real `awman` process through the countdown need not wait out the
+/// 60 s default. Ignored outside test isolation; see
+/// `engine::workflow::timing::yolo_countdown_duration`.
+pub const AWMAN_TEST_YOLO_COUNTDOWN_MS: &str = "AWMAN_TEST_YOLO_COUNTDOWN_MS";
+
 /// `AWMAN_BUILTIN_STATE_DIR` — overrides the builtin runtime's private state
 /// directory (default `<data home>/builtin`). Keep it short: control sockets
 /// live beneath it.
@@ -406,6 +413,20 @@ impl EnvSnapshot {
         self.truthy(AWMAN_TEST_BUILTIN)
     }
 
+    /// The yolo countdown `AWMAN_TEST_YOLO_COUNTDOWN_MS` asks for, when it
+    /// holds a whole number of milliseconds and `AWMAN_TEST_ISOLATION` is on.
+    /// `None` in every normal run, whatever the variable holds.
+    pub fn test_yolo_countdown(&self) -> Option<std::time::Duration> {
+        if !self.test_isolation() {
+            return None;
+        }
+        self.get(AWMAN_TEST_YOLO_COUNTDOWN_MS)?
+            .trim()
+            .parse()
+            .ok()
+            .map(std::time::Duration::from_millis)
+    }
+
     /// `AWMAN_BUILTIN_STATE_DIR`, when set and non-empty.
     pub fn builtin_state_dir(&self) -> Option<PathBuf> {
         self.get(AWMAN_BUILTIN_STATE_DIR)
@@ -520,6 +541,7 @@ impl Env {
             AWMAN_TEST_APPLE_CONTAINER,
             AWMAN_TEST_SBX,
             AWMAN_TEST_BUILTIN,
+            AWMAN_TEST_YOLO_COUNTDOWN_MS,
             AWMAN_BUILTIN_STATE_DIR,
             DOCKER_HOST,
             DOCKER_CERT_PATH,
@@ -751,6 +773,45 @@ impl ConfigHomeGuard {
         let previous = std::env::var_os(AWMAN_CONFIG_HOME);
         std::env::set_var(AWMAN_CONFIG_HOME, home.as_ref());
         Self { _lock, previous }
+    }
+}
+
+/// Exclusive ownership of the config-home lock plus a snapshot of other
+/// process variables that resolve configuration (`XDG_*`, forwarded
+/// `AWMAN_*` names), restored on drop. Tests that mutate those variables, or
+/// that compare against paths derived from the process environment, take
+/// this so a concurrent [`ConfigHomeGuard`] test cannot interleave.
+#[cfg(test)]
+pub(crate) struct ProcessEnvGuard {
+    /// Held for the guard's lifetime to keep the lock; never read.
+    _lock: std::sync::MutexGuard<'static, ()>,
+    saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+}
+
+#[cfg(test)]
+impl ProcessEnvGuard {
+    /// Take the config-home lock and snapshot `names` for restoring on drop.
+    pub(crate) fn acquire(names: &[&'static str]) -> Self {
+        let _lock = CONFIG_HOME_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let saved = names
+            .iter()
+            .map(|name| (*name, std::env::var_os(name)))
+            .collect();
+        Self { _lock, saved }
+    }
+}
+
+#[cfg(test)]
+impl Drop for ProcessEnvGuard {
+    fn drop(&mut self) {
+        for (name, value) in self.saved.drain(..) {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
     }
 }
 
@@ -993,13 +1054,12 @@ mod tests {
 
     #[test]
     fn env_from_process_captures_xdg_config_and_data_home() {
+        let _env = ProcessEnvGuard::acquire(&[XDG_CONFIG_HOME, XDG_DATA_HOME]);
         let cfg_val = "/tmp/awman-test-xdg-cfg-0086";
         let data_val = "/tmp/awman-test-xdg-data-0086";
         std::env::set_var(XDG_CONFIG_HOME, cfg_val);
         std::env::set_var(XDG_DATA_HOME, data_val);
         let snap = Env::from_process();
-        std::env::remove_var(XDG_CONFIG_HOME);
-        std::env::remove_var(XDG_DATA_HOME);
         assert_eq!(
             snap.xdg_config_home(),
             Some(PathBuf::from(cfg_val)),
@@ -1257,6 +1317,27 @@ mod tests {
         assert!(!EnvSnapshot::empty().test_isolation());
     }
 
+    /// The countdown override is a test-isolation knob only: without
+    /// `AWMAN_TEST_ISOLATION` it is ignored, whatever it holds.
+    #[test]
+    fn test_yolo_countdown_is_honoured_only_under_test_isolation() {
+        use std::time::Duration;
+        let isolated = |value: &str| {
+            EnvSnapshot::with_overrides([
+                (AWMAN_TEST_ISOLATION, "1"),
+                (AWMAN_TEST_YOLO_COUNTDOWN_MS, value),
+            ])
+            .test_yolo_countdown()
+        };
+        assert_eq!(isolated("250"), Some(Duration::from_millis(250)));
+        assert_eq!(isolated(" 0 "), Some(Duration::ZERO));
+        assert_eq!(isolated("soon"), None);
+        assert_eq!(isolated("-5"), None);
+        let normal = EnvSnapshot::with_overrides([(AWMAN_TEST_YOLO_COUNTDOWN_MS, "250")]);
+        assert_eq!(normal.test_yolo_countdown(), None);
+        assert_eq!(EnvSnapshot::empty().test_yolo_countdown(), None);
+    }
+
     /// Unit tests are isolated whatever the environment says: they cannot be
     /// run in a way that reaches the developer's keychain or service manager.
     #[test]
@@ -1269,9 +1350,11 @@ mod tests {
     /// whichever happen to be set, and not alphabetical.
     #[test]
     fn forwarded_env_returns_only_set_names_in_list_order() {
-        let prev_overlays = std::env::var(AWMAN_OVERLAYS).ok();
-        let prev_agents = std::env::var(AWMAN_MAX_CONCURRENT_AGENTS).ok();
-        let prev_launch = std::env::var(AWMAN_LAUNCH_MODE).ok();
+        let _env = ProcessEnvGuard::acquire(&[
+            AWMAN_OVERLAYS,
+            AWMAN_MAX_CONCURRENT_AGENTS,
+            AWMAN_LAUNCH_MODE,
+        ]);
 
         std::env::remove_var(AWMAN_OVERLAYS);
         std::env::set_var(AWMAN_MAX_CONCURRENT_AGENTS, "7");
@@ -1304,19 +1387,6 @@ mod tests {
             names, expected_order,
             "ForwardedEnv::from_process() must preserve ForwardedEnv::NAMES's own order"
         );
-
-        match prev_overlays {
-            Some(v) => std::env::set_var(AWMAN_OVERLAYS, v),
-            None => std::env::remove_var(AWMAN_OVERLAYS),
-        }
-        match prev_agents {
-            Some(v) => std::env::set_var(AWMAN_MAX_CONCURRENT_AGENTS, v),
-            None => std::env::remove_var(AWMAN_MAX_CONCURRENT_AGENTS),
-        }
-        match prev_launch {
-            Some(v) => std::env::set_var(AWMAN_LAUNCH_MODE, v),
-            None => std::env::remove_var(AWMAN_LAUNCH_MODE),
-        }
     }
 }
 

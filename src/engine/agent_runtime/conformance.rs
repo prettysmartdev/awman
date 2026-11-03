@@ -173,9 +173,12 @@ async fn assert_eventually_removed(name: &str, path: &std::path::Path, after: &s
 pub(crate) async fn assert_releases_prompt_files(launcher: &mut Launcher) {
     let name = launcher.name;
 
+    // A prompt agent may already have exited (the builtin fake starts with
+    // its exit queued), so the runtime is free to release the file before
+    // this task looks; presence-while-running is checked on the long-running
+    // launches below.
     let (guard, path) = prompt_file();
     let mut execution = (launcher.launch)(probe().0, false, vec![guard]);
-    assert!(path.exists(), "{name}: prompt file missing after launch");
     tokio::time::timeout(Duration::from_secs(10), execution.wait())
         .await
         .unwrap_or_else(|_| panic!("{name}: a prompt agent never exited"))

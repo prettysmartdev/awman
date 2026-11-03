@@ -87,6 +87,8 @@ impl WorkflowEngine {
                 container_id: Some(execution.handle().id.clone()),
             },
         );
+        self.state
+            .record_step_container(&step.name, &execution.handle().name);
         self.persist()?;
         let agent = prepared.runtime.step_agent;
         let model = prepared.runtime.step_model;
@@ -627,11 +629,11 @@ impl WorkflowEngine {
         self.msg_info(format!(
             "Starting yolo countdown for step '{}' ({}s)",
             step_name,
-            timing::YOLO_COUNTDOWN_DURATION.as_secs(),
+            timing::yolo_countdown_duration().as_secs(),
         ));
         self.frontend
             .yolo_countdown_started(step_name, CountdownKind::StuckStep);
-        let total = timing::YOLO_COUNTDOWN_DURATION;
+        let total = timing::yolo_countdown_duration();
         let start = std::time::Instant::now();
 
         loop {

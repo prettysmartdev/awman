@@ -1,6 +1,6 @@
 # Cleaning Up
 
-awman creates and manages various resources — Docker containers (or builtin microVM sessions), workflow data files, database migration backups, and images — as you use the tool. Over time, completed workflows leave behind data that can accumulate. The `awman clean` command safely removes these resources.
+As you use awman it leaves behind stopped containers (or builtin microVM sessions), workflow data files, database migration backups and images. `awman clean` removes them safely. It does not remove worktrees: those are handled when a worktree run ends (see [Worktree isolation](04-security-and-isolation.md#worktree-isolation)).
 
 ---
 
@@ -8,7 +8,7 @@ awman creates and manages various resources — Docker containers (or builtin mi
 
 `awman clean` targets six categories of resources:
 
-1. **Stopped containers** — Docker containers from previous awman runs that have exited or died. These typically remain on disk even after they complete, and can accumulate quickly if you run many workflows.
+1. **Stopped containers** — awman containers from previous runs that have exited or died, on the configured runtime.
 
 2. **Completed repo workflow files** — Workflow state files in `<git_root>/.awman/workflows/` that have finished (all steps succeeded, failed, skipped, or were cancelled). In-progress workflows are left untouched.
 
@@ -16,9 +16,9 @@ awman creates and manages various resources — Docker containers (or builtin mi
 
 4. **Dangling images** — Awman-labeled Docker images that Docker reports as dangling, usually because a newer build replaced the same tag. If Docker refuses to remove an image because a container still references it, awman reports that item as a deletion error and continues.
 
-5. **Pre-migration database backup** — The retained `awman.db.pre-migration` backup from an automatic database migration (and any matching SQLite sidecar backups). The live database at `~/.awman/data/awman.db` is never removed or modified by `awman clean`.
+5. **Pre-migration database backups** — The `awman.db.pre-migration` backup (and its `-wal`/`-shm` sidecars) left in `~/.awman/api/` when the database moved to its current location. awman never reads it. The live database at `~/.awman/data/awman.db` is never touched.
 
-6. **Squad daemon environment** — The OS keychain item (`awman-squad` / `daemon-env`) in which the squad daemon persists the values it holds for tasks' `env()` names, so a daemon the OS restarts comes back already armed. Offered whenever the item exists, listed as "squad daemon environment (awman-squad/daemon-env, OS keychain)". Not a file: it is removed through `security` (macOS) or `secret-tool` (Linux). This is the only category that is not on disk, and the only one that may hold a secret — see [Squad: Persisting values across a restart](12-squad.md#persisting-values-across-a-restart). Removing it does **not** disturb a running daemon, which keeps the values it already holds in memory; it removes only what a future restart would have read back. On a platform with no keychain, or with `secret-tool` not installed, there is nothing to find and the category is simply absent.
+6. **Squad daemon environment** — The OS keychain item (`awman-squad` / `daemon-env`) where the squad daemon persists the values it holds for tasks' `env()` names, so a daemon the OS restarts comes back armed. It is removed through `security` (macOS) or `secret-tool` (Linux), and is the only category that may hold a secret — see [Squad: Persisting values across a restart](12-squad.md#persisting-values-across-a-restart). Removing it does **not** affect a running daemon, which keeps the values it holds in memory; it only removes what a future restart would read back. With no keychain, or no `secret-tool`, the category never appears.
 
 ### Builtin runtime state
 
@@ -28,8 +28,7 @@ With `runtime` set to `builtin-experimental`, `awman clean` applies to the built
 - **Dangling images** is always empty: the builtin runtime only tracks images it imported by name, and `awman clean` never runs a global image prune against the store.
 - **Downloaded archive cache.** Importing an image keeps a validated copy of its archive in `<builtin state dir>/oci-cache/` (`~/.awman/builtin/oci-cache/` by default). It is read only while an image is being acquired: during `awman ready`, or when a launch with `builtin.builder.enabled` prepares a missing agent image. `awman clean` does not remove it. To reclaim the space, delete that directory while no `awman ready` or launch is preparing an image; the next import simply re-acquires the image from its source.
 - **Everything else.** To remove all builtin state (imported images, session disks, the cache), stop or finish every builtin session, then delete the state directory (`builtin.stateDir`, or `AWMAN_BUILTIN_STATE_DIR`). The next `awman ready` re-imports your images. Do not delete it while sessions are running.
-
-Sessions started by an awman with a different internal protocol version are refused rather than adopted or cleaned up (`builtin runtime worker protocol mismatch`); stop them with the awman version that started them first. An older state directory is upgraded in place automatically (see [Runtimes](11-runtimes.md)). Only a directory that cannot be upgraded (no recorded protocol, or created by a newer awman) is refused as a whole: quit any awman still using it, then move or delete the directory, or set `builtin.stateDir` to a new one, and run `awman ready` to re-import your images.
+- **Sessions from another awman version.** Sessions started by an awman with a different internal protocol version are neither adopted nor cleaned up (`builtin runtime worker protocol mismatch`); stop them with the awman that started them. An older state directory is upgraded in place automatically (see [Upgrading an older state directory](11-runtimes.md#session-lifecycle)); one that cannot be upgraded must be moved or deleted, after which `awman ready` re-imports your images.
 - **Catalog upgrade backups.** When a new awman upgrades an older builtin state directory in place, it keeps the previous catalog as `<builtin state dir>/db.pre-<protocol>/` (for example `~/.awman/builtin/db.pre-0.7.2_18_awman-1/`). `awman clean` does not remove it, because it is the only way to roll back to the older awman. Once you are happy with the upgrade, delete that directory yourself while no awman is using the state directory. Hidden leftovers named `.db.pre-*.partial-*`, `.db.restore-*` or `.db.discard-*` can only come from a crash. Once the upgrade has completed (no `awman-catalog-restore` file is left in the state directory), they are also safe to delete then. A `.sandboxes.retired` directory is removed by awman itself the next time it opens the upgraded directory.
 
 ---
@@ -42,7 +41,7 @@ The simplest form lists what would be removed and prompts for confirmation:
 awman clean
 ```
 
-This displays an itemized list of all removable items grouped by category, then waits for your confirmation. The prompt respects your TTY status: if stdin is not a terminal (e.g., in a script or pipe), the command will abort unless you pass `--yes`.
+This displays an itemized list of all removable items grouped by category, then waits for your confirmation. If stdin is not a terminal (a script or pipe), the command aborts unless you pass `--yes`.
 
 ---
 
@@ -56,7 +55,7 @@ Skip the confirmation prompt and delete immediately. Use in scripts and automati
 awman clean --yes
 ```
 
-Without this flag, `awman clean` always prompts for confirmation when stdin is a TTY. In non-TTY contexts (CI/CD, shell scripts without interactive input), the command aborts unless `--yes` is passed, preventing silent deletion in automated contexts.
+The itemized list is still printed.
 
 ### `--dry-run`
 
@@ -85,7 +84,7 @@ Completed repo workflow files (1):
   - repohash8-workflow-name.json
 
 Dangling images (1):
-  - sha256:abc123de (awman:latest) 25MB
+  - sha256:abc123 <none>:<none> (25MB)
 
 Delete the above? [y/N]: 
 ```
@@ -102,7 +101,7 @@ Without `--yes`, the command aborts:
 
 ```bash
 awman clean </dev/null
-# error: interactive input unavailable (prompt: yes)
+# error: stdin is not a TTY; provide --yes on the command line
 # exit code: 2
 ```
 
@@ -135,9 +134,9 @@ awman clean
 
 No confirmation prompt is shown; the command exits immediately.
 
-### Docker unavailable
+### Container runtime unavailable
 
-If the Docker daemon is unreachable or not configured, container and image categories are skipped with a warning, but filesystem cleanup (completed workflow files and context directories) still runs:
+If the container runtime is unreachable or not configured, container and image categories are skipped with a warning, but filesystem cleanup (completed workflow files and context directories) still runs:
 
 ```bash
 awman clean
@@ -197,7 +196,7 @@ Select `[Yes]` to proceed or `[No]` to abort. The `--yes` flag also skips this d
 - **In-progress workflows are protected.** Only workflows that have reached a terminal state (completed, failed, or cancelled) are marked for deletion.
 - **Per-item failures don't stop the process.** If one container fails to delete, the command continues and reports all failures at the end.
 - **Context directories are verified.** A global context directory is only deleted if it matches a terminal workflow in the current repo or carries an explicit `completed` marker.
-- **Docker-unavailable is not an error.** If the container runtime is unreachable, filesystem cleanup still runs, and the exit code is 0 if those deletions succeed.
+- **An unavailable runtime is not an error.** If the container runtime is unreachable, filesystem cleanup still runs, and the exit code is 0 if those deletions succeed.
 - **A keychain that can't be reached is not an error either.** The probe for the squad daemon's stored environment is capped, so it can never hang the command; a platform with no keychain, a missing `secret-tool`, or a locked collection all resolve to "nothing to offer".
 
 ---
@@ -206,11 +205,11 @@ Select `[Yes]` to proceed or `[No]` to abort. The `--yes` flag also skips this d
 
 ### Clean up after a batch of workflows
 
-Run a few workflows, then clean up before committing:
+Run a few workflows, then clean up:
 
 ```bash
-awman exec workflow some-workflow.toml --yes
-awman exec workflow another-workflow.toml --yes
+awman exec workflow some-workflow.toml
+awman exec workflow another-workflow.toml
 awman clean --yes
 ```
 

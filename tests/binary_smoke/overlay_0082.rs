@@ -4,26 +4,7 @@
 //! CLI behaviour introduced in WI-0082: removal of `--mount-ssh`, removal of
 //! the `skills()` plural form, and fatal handling of malformed `AWMAN_OVERLAYS`.
 
-use std::process::Command;
-use tempfile::TempDir;
-
-fn awman_bin() -> std::path::PathBuf {
-    crate::awman_bin()
-}
-
-fn awman() -> Command {
-    Command::new(awman_bin())
-}
-
-fn make_git_repo() -> TempDir {
-    let repo = TempDir::new().expect("TempDir::new");
-    std::process::Command::new("git")
-        .args(["init", "--quiet"])
-        .current_dir(repo.path())
-        .status()
-        .expect("git init");
-    repo
-}
+use crate::{awman, make_git_repo};
 
 // ─── --mount-ssh removed ──────────────────────────────────────────────────────
 

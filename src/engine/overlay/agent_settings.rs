@@ -81,18 +81,19 @@ impl OverlayEngine {
                     .unwrap_or(false);
                 if has_config {
                     let cfg = paths.config_file.as_ref().unwrap();
-                    let host_path = match sanitize_claude_config(cfg) {
-                        Ok((dir, path)) => {
-                            let _retained = self.retain_tempdir(dir);
-                            path
-                        }
-                        Err(_) => cfg.clone(),
-                    };
-                    out.push(OverlaySpec {
-                        host_path,
-                        container_path: PathBuf::from(format!("{container_home}/.claude.json")),
-                        permission: OverlayPermission::ReadWrite,
-                    });
+                    // Fail closed: never mount the host file itself. If it
+                    // cannot be sanitized, fall back to the synthesised minimal
+                    // config, and skip the overlay if even that fails.
+                    let staged =
+                        sanitize_claude_config(cfg).or_else(|_| synthesize_minimal_claude_config());
+                    if let Ok((dir, host_path)) = staged {
+                        let _retained = self.retain_tempdir(dir);
+                        out.push(OverlaySpec {
+                            host_path,
+                            container_path: PathBuf::from(format!("{container_home}/.claude.json")),
+                            permission: OverlayPermission::ReadWrite,
+                        });
+                    }
                 } else {
                     // First-time user: no ~/.claude.json on host. Synthesize a
                     // minimal config with the /workspace trust dialog accepted

@@ -638,6 +638,137 @@ impl Drop for IdempotentAdmission {
     }
 }
 
+/// The first step of every idempotent API write: whether the request runs,
+/// and with which reservation, or what the host answers instead.
+///
+/// A host (HTTP today) reads the raw key and canonical request, calls
+/// [`IdempotencyGate::open`], and maps the result to its own status codes.
+/// The reservation state machine — key policy, principal scoping, replay,
+/// in-flight and mismatch decisions, release on failure or drop, and storing
+/// the final response — stays here, so a second host cannot sequence it
+/// differently.
+pub enum IdempotencyGate {
+    /// No key was sent: run the handler without a journal.
+    Unkeyed,
+    /// This request now holds the key: run the handler with
+    /// [`IdempotentRun::admission`], then report its result through
+    /// [`IdempotentRun::finish`]. Dropping the run (cancelled or panicking
+    /// handler) releases the key unless admission already became durable.
+    Fresh(IdempotentRun),
+    /// An earlier request with this key and body finished: answer with its
+    /// stored status and body verbatim.
+    Replay { status: u16, body: String },
+    /// Another request with this key still holds the reservation.
+    InFlight,
+    /// The key was already used with a different request body.
+    Mismatch,
+}
+
+/// Why [`IdempotencyGate::open`] could not decide.
+#[derive(Debug)]
+pub enum IdempotencyGateError {
+    /// The key is empty, too long, or not visible ASCII.
+    InvalidKey,
+    /// The reservation could not be read or written.
+    Reserve(DataError),
+}
+
+impl IdempotencyGate {
+    /// Validate `key` and reserve it for `route` under the caller's
+    /// principal (the API key hash, or one shared anonymous principal when
+    /// auth is disabled), comparing `canonical` with any earlier request.
+    pub fn open(
+        store: &Arc<SqliteSessionStore>,
+        route: &'static str,
+        auth: &crate::engine::auth::AuthMode,
+        key: Option<&str>,
+        canonical: &str,
+    ) -> Result<Self, IdempotencyGateError> {
+        let Some(key) = key else {
+            return Ok(Self::Unkeyed);
+        };
+        if !is_valid_idempotency_key(key) {
+            return Err(IdempotencyGateError::InvalidKey);
+        }
+        let principal = match auth {
+            crate::engine::auth::AuthMode::Enabled { key_hash } => key_hash.as_str(),
+            crate::engine::auth::AuthMode::Disabled => "anonymous",
+        };
+        let journal = Arc::new(IdempotentAdmission::new(
+            Arc::clone(store),
+            route,
+            principal,
+            key,
+        ));
+        Ok(
+            match journal
+                .begin(canonical)
+                .map_err(IdempotencyGateError::Reserve)?
+            {
+                IdempotencyBegin::Fresh => Self::Fresh(IdempotentRun { journal }),
+                IdempotencyBegin::Replay { status, body } => Self::Replay { status, body },
+                IdempotencyBegin::InFlight => Self::InFlight,
+                IdempotencyBegin::Mismatch => Self::Mismatch,
+            },
+        )
+    }
+}
+
+/// An `Idempotency-Key` is 1 to [`IDEMPOTENCY_KEY_MAX_BYTES`] bytes of
+/// visible ASCII (no spaces or control characters).
+///
+/// [`IDEMPOTENCY_KEY_MAX_BYTES`]: crate::data::fs::api_db::IDEMPOTENCY_KEY_MAX_BYTES
+fn is_valid_idempotency_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= crate::data::fs::api_db::IDEMPOTENCY_KEY_MAX_BYTES
+        && key.bytes().all(|b| (0x21..=0x7e).contains(&b))
+}
+
+/// A request that holds its key's reservation (see [`IdempotencyGate::Fresh`]).
+pub struct IdempotentRun {
+    journal: Arc<IdempotentAdmission>,
+}
+
+/// How a reserved request ended, as [`IdempotentRun::finish`] records it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdempotentResult<'a> {
+    /// A server-side failure: release the key so a retry runs again.
+    /// Unfinished admission compensation keeps its own barrier.
+    ServerError,
+    /// Any other final answer, stored so a retry replays it.
+    Final { status: u16, body: &'a str },
+}
+
+impl IdempotentRun {
+    /// The journal admission writes record their intent through.
+    pub fn admission(&self) -> Arc<IdempotentAdmission> {
+        Arc::clone(&self.journal)
+    }
+
+    /// Record how the request ended. A storage failure here is logged, not
+    /// returned: the work and its answer already happened, and a failed
+    /// completion keeps the drop guard armed so admitted work stays
+    /// replayable.
+    pub fn finish(self, result: IdempotentResult<'_>) {
+        match result {
+            IdempotentResult::ServerError => {
+                if let Err(error) = self.journal.release() {
+                    tracing::error!(%error, "Failed to release idempotency reservation");
+                }
+            }
+            IdempotentResult::Final { status, body } => match self.journal.complete(status, body) {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::warn!("Idempotency reservation was no longer held when completing");
+                }
+                Err(error) => {
+                    tracing::error!(%error, "Failed to save idempotent response");
+                }
+            },
+        }
+    }
+}
+
 fn admission_body(
     journal: Option<&IdempotentAdmission>,
     body: &impl Serialize,

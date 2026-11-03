@@ -20,7 +20,11 @@
 //!   Linux pins a non-I/O O_PATH handle and validates it before reopening
 //!   the regular inode. Other Unix platforms pin a hard link in a private
 //!   unmounted sibling directory before validating and opening that name.
-//!   Platforms without descriptor-relative traversal refuse access.
+//!   Other platforms (Windows) use the canonical-prefix fallback the spec
+//!   names for "elsewhere": every component is checked with
+//!   `symlink_metadata` before and after the open, the opened name must
+//!   canonicalise beneath the canonical root, and Windows device names are
+//!   refused (see `portable`).
 //! - only regular files are listed or served. Symlinks, devices, FIFOs and
 //!   sockets are omitted, and every listed fact (size, hash, mtime) comes
 //!   from the safely opened descriptor, never from a path lookup.
@@ -569,20 +573,172 @@ mod platform {
     }
 }
 
-// Refuse output access on platforms without a descriptor-relative no-follow
-// implementation. A pathname canonicalization is not proof about an open handle.
+// Platforms without descriptor-relative no-follow traversal (Windows) use the
+// canonical-prefix check WI 0137 §3 specifies for "elsewhere".
 #[cfg(not(unix))]
 mod platform {
-    use std::{io, path::Path};
-    pub(super) fn open_beneath(_: &Path, _: &[&str]) -> io::Result<std::fs::File> {
-        Err(io::ErrorKind::Unsupported.into())
+    pub(super) use super::portable::{open_beneath, walk};
+}
+
+/// The canonical-prefix fallback (WI 0137 §3) for platforms without
+/// `openat(O_NOFOLLOW)`. Pathname-based, so it is checked on both sides of
+/// the open:
+///
+/// - the root is canonicalised once; every component beneath it is looked
+///   up with `symlink_metadata` and must be a plain directory (or, last, a
+///   plain regular file) — a symlink or junction anywhere is refused;
+/// - Windows device names (`NUL`, `COM1`, …) and names Windows would alias
+///   by stripping a trailing dot or space are refused before any lookup;
+/// - after opening, the name is canonicalised again and must still lie
+///   beneath the canonical root, every component is re-checked, and the
+///   handle's own metadata must be a regular file agreeing with the name's.
+///
+/// Compiled on every platform under test so the Unix suite exercises it.
+#[cfg(any(not(unix), test))]
+mod portable {
+    use std::ffi::OsStr;
+    use std::fs;
+    use std::io;
+    use std::path::{Path, PathBuf};
+
+    /// `candidate` is strictly beneath `root` (both canonical), compared by
+    /// path component so `/out-evil` is not beneath `/out`.
+    pub(super) fn is_beneath(root: &Path, candidate: &Path) -> bool {
+        candidate != root && candidate.starts_with(root)
     }
+
+    /// A name Windows would open as a device, or alias to another name.
+    pub(super) fn is_windows_unsafe_name(name: &OsStr) -> bool {
+        let name = name.to_string_lossy();
+        if name.ends_with('.') || name.ends_with(' ') {
+            return true;
+        }
+        let stem = name.split('.').next().unwrap_or("").trim_end();
+        let upper = stem.to_ascii_uppercase();
+        let numbered = |prefix: &str| {
+            upper.strip_prefix(prefix).is_some_and(|rest| {
+                let mut chars = rest.chars();
+                matches!(
+                    (chars.next(), chars.next()),
+                    (Some('0'..='9' | '¹' | '²' | '³'), None)
+                )
+            })
+        };
+        matches!(
+            upper.as_str(),
+            "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+        ) || numbered("COM")
+            || numbered("LPT")
+    }
+
+    fn not_found() -> io::Error {
+        io::ErrorKind::NotFound.into()
+    }
+
+    /// Join `segments` to `root`, refusing any component that is a link, a
+    /// non-directory parent, or a final entry that is not a regular file.
+    fn checked_path(root: &Path, segments: &[&OsStr]) -> io::Result<PathBuf> {
+        let (_, parents) = segments.split_last().ok_or_else(not_found)?;
+        let mut path = root.to_path_buf();
+        for (i, segment) in segments.iter().enumerate() {
+            if is_windows_unsafe_name(segment) {
+                return Err(not_found());
+            }
+            path.push(segment);
+            let kind = fs::symlink_metadata(&path)?.file_type();
+            let ok = if i < parents.len() {
+                kind.is_dir()
+            } else {
+                kind.is_file()
+            };
+            if kind.is_symlink() || !ok {
+                return Err(not_found());
+            }
+        }
+        Ok(path)
+    }
+
+    fn open_checked(root: &Path, segments: &[&OsStr]) -> io::Result<fs::File> {
+        let path = checked_path(root, segments)?;
+        let file = fs::File::open(&path)?;
+        let resolved = fs::canonicalize(&path)?;
+        if !is_beneath(root, &resolved) || checked_path(root, segments)? != path {
+            return Err(not_found());
+        }
+        let handle = file.metadata()?;
+        let named = fs::symlink_metadata(&path)?;
+        if !handle.is_file()
+            || handle.len() != named.len()
+            || handle.modified().ok() != named.modified().ok()
+        {
+            return Err(not_found());
+        }
+        Ok(file)
+    }
+
+    /// The root itself must be a real directory, not a link to one.
+    fn canonical_root(root: &Path) -> io::Result<Option<PathBuf>> {
+        match fs::symlink_metadata(root) {
+            Ok(meta) if meta.is_dir() => fs::canonicalize(root).map(Some),
+            Ok(_) => Ok(None),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(super) fn open_beneath(root: &Path, segments: &[&str]) -> io::Result<fs::File> {
+        let root = canonical_root(root)?.ok_or_else(not_found)?;
+        let segments: Vec<&OsStr> = segments.iter().map(OsStr::new).collect();
+        open_checked(&root, &segments)
+    }
+
     pub(super) fn walk(
-        _: &Path,
-        _: &mut super::WalkBudget<'_>,
-        _: &mut impl FnMut(&Path, std::fs::File) -> io::Result<()>,
+        root: &Path,
+        budget: &mut super::WalkBudget<'_>,
+        visitor: &mut impl FnMut(&Path, fs::File) -> io::Result<()>,
     ) -> io::Result<()> {
-        Err(io::ErrorKind::Unsupported.into())
+        let Some(root) = canonical_root(root)? else {
+            return Ok(());
+        };
+        let mut stack: Vec<Vec<std::ffi::OsString>> = vec![Vec::new()];
+        while let Some(prefix) = stack.pop() {
+            let mut dir = root.clone();
+            dir.extend(&prefix);
+            let resolved = fs::canonicalize(&dir)?;
+            if resolved != root && !is_beneath(&root, &resolved) {
+                continue;
+            }
+            for entry in fs::read_dir(&dir)? {
+                let entry = entry?;
+                budget.entry()?;
+                let kind = match fs::symlink_metadata(entry.path()) {
+                    Ok(meta) => meta.file_type(),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(error),
+                };
+                let mut segments = prefix.clone();
+                segments.push(entry.file_name());
+                if kind.is_symlink() || is_windows_unsafe_name(&entry.file_name()) {
+                    continue;
+                }
+                if kind.is_dir() {
+                    stack.push(segments);
+                } else if kind.is_file() {
+                    let names: Vec<&OsStr> = segments.iter().map(|s| s.as_os_str()).collect();
+                    match open_checked(&root, &names) {
+                        Ok(file) => {
+                            // `/`-separated on every platform, as the listing
+                            // and `validate_output_path` expect.
+                            let relative = PathBuf::from(segments.join(OsStr::new("/")));
+                            visitor(&relative, file)?;
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -847,13 +1003,115 @@ mod adversarial_tests {
             .unwrap()
             .is_none());
     }
+}
 
-    #[cfg(not(unix))]
+/// The non-Unix canonical-prefix fallback, run on every platform.
+#[cfg(test)]
+mod portable_tests {
+    use super::portable::*;
+    use super::WalkBudget;
+    use std::ffi::OsStr;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::AtomicBool;
+
+    fn names(root: &Path) -> Vec<String> {
+        let cancelled = AtomicBool::new(false);
+        let mut found = Vec::new();
+        walk(root, &mut WalkBudget::new(&cancelled), &mut |path, _| {
+            found.push(path.to_str().unwrap().to_owned());
+            Ok(())
+        })
+        .unwrap();
+        found.sort();
+        found
+    }
+
     #[test]
-    fn platforms_without_a_safe_walk_refuse_output_access() {
+    fn prefix_check_is_by_component_and_excludes_the_root() {
+        let root = Path::new("/srv/out");
+        assert!(is_beneath(root, Path::new("/srv/out/a.json")));
+        assert!(is_beneath(root, Path::new("/srv/out/d/a.json")));
+        assert!(!is_beneath(root, Path::new("/srv/out")));
+        assert!(!is_beneath(root, Path::new("/srv/out-evil/a.json")));
+        assert!(!is_beneath(root, Path::new("/etc/passwd")));
+        let windows = Path::new(r"\\?\C:\awman\out");
+        assert!(!is_beneath(windows, Path::new(r"\\?\C:\Windows\win.ini")));
+    }
+
+    #[test]
+    fn windows_device_and_alias_names_are_unsafe() {
+        for bad in [
+            "NUL", "nul", "con.txt", "Aux.json", "COM1", "lpt9.log", "COM¹", "CONIN$", "a.", "a ",
+            "NUL .txt",
+        ] {
+            assert!(is_windows_unsafe_name(OsStr::new(bad)), "{bad}");
+        }
+        for ok in [
+            "answer.json",
+            "console.log",
+            "com10",
+            "nullable",
+            "lpt",
+            ".hidden",
+        ] {
+            assert!(!is_windows_unsafe_name(OsStr::new(ok)), "{ok}");
+        }
+    }
+
+    #[test]
+    fn serves_regular_files_beneath_the_root() {
         let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(tmp.path().join("file"), "data").unwrap();
-        assert!(open_output_file(tmp.path(), "file").unwrap().is_none());
-        assert!(list_output_dir(tmp.path(), &AtomicBool::new(false)).is_err());
+        std::fs::create_dir(tmp.path().join("tests")).unwrap();
+        std::fs::write(tmp.path().join("tests/report.json"), "{}").unwrap();
+        std::fs::write(tmp.path().join("a.txt"), "abc").unwrap();
+        let mut file = open_beneath(tmp.path(), &["tests", "report.json"]).unwrap();
+        let mut body = String::new();
+        std::io::Read::read_to_string(&mut file, &mut body).unwrap();
+        assert_eq!(body, "{}");
+        assert_eq!(names(tmp.path()), ["a.txt", "tests/report.json"]);
+        // A directory is not a servable file.
+        assert!(open_beneath(tmp.path(), &["tests"]).is_err());
+        assert!(open_beneath(tmp.path(), &["missing"]).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn links_anywhere_on_the_path_are_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("out");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("secret"), "secret").unwrap();
+        std::fs::write(root.join("ok"), "ok").unwrap();
+        std::os::unix::fs::symlink("/etc/passwd", root.join("passwd")).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("dir-link")).unwrap();
+        std::os::unix::fs::symlink(root.join("ok"), root.join("inner-link")).unwrap();
+        for path in [&["passwd"][..], &["dir-link", "secret"], &["inner-link"]] {
+            assert!(open_beneath(&root, path).is_err(), "{path:?}");
+        }
+        assert_eq!(names(&root), ["ok"]);
+        // A root that is itself a link is not followed.
+        let root_link = tmp.path().join("root-link");
+        std::os::unix::fs::symlink(&outside, &root_link).unwrap();
+        assert!(open_beneath(&root_link, &["secret"]).is_err());
+        assert!(names(&root_link).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fifos_are_neither_listed_nor_opened() {
+        let tmp = tempfile::tempdir().unwrap();
+        nix::unistd::mkfifo(&tmp.path().join("fifo"), nix::sys::stat::Mode::S_IRWXU).unwrap();
+        assert!(open_beneath(tmp.path(), &["fifo"]).is_err());
+        assert!(names(tmp.path()).is_empty());
+    }
+
+    #[test]
+    fn a_missing_root_is_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing: PathBuf = tmp.path().join("nope");
+        assert!(names(&missing).is_empty());
+        assert!(open_beneath(&missing, &["a"]).is_err());
     }
 }

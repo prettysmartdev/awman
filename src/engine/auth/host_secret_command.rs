@@ -827,6 +827,52 @@ fn escape_control(text: &str) -> String {
         .collect()
 }
 
+/// Detects a background descendant that outlives the process-group kill.
+///
+/// The descendant waits for a "go" file rather than a fixed delay, and the
+/// test creates that file only after `run()` has returned (by which point the
+/// group has been killed). A surviving descendant then touches the marker
+/// within one poll; a killed one never can. This is independent of how long
+/// the kill takes under load, unlike racing a `sleep N` against it.
+#[cfg(all(test, unix))]
+pub(crate) mod survivor_probe {
+    use std::path::{Path, PathBuf};
+    use std::time::Duration;
+
+    pub(crate) struct SurvivorProbe {
+        go: PathBuf,
+        marker: PathBuf,
+    }
+
+    impl SurvivorProbe {
+        pub(crate) fn new(dir: &Path) -> Self {
+            Self {
+                go: dir.join("go"),
+                marker: dir.join("survived"),
+            }
+        }
+
+        /// A shell line that starts the background descendant.
+        pub(crate) fn background_line(&self) -> String {
+            format!(
+                "(while [ ! -e '{}' ]; do sleep 0.02; done; touch '{}') &",
+                self.go.display(),
+                self.marker.display()
+            )
+        }
+
+        /// Call after `run()` returned: release any survivor, then check.
+        pub(crate) fn assert_none_survived(&self, what: &str) {
+            std::fs::write(&self.go, "").unwrap();
+            std::thread::sleep(Duration::from_millis(300));
+            assert!(
+                !self.marker.exists(),
+                "background descendant survived {what}"
+            );
+        }
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -925,11 +971,11 @@ mod tests {
     #[test]
     fn timeout_kills_the_process_group() {
         let dir = tempfile::tempdir().unwrap();
-        let marker = dir.path().join("survived");
+        let probe = super::survivor_probe::SurvivorProbe::new(dir.path());
         let s = script(
             dir.path(),
             "slow",
-            &format!("(sleep 2; touch '{}') & sleep 30", marker.display()),
+            &format!("{} sleep 30", probe.background_line()),
         );
         let mut opts = options(vec![s.to_string_lossy().into_owned()]);
         opts.timeout = Duration::from_millis(1);
@@ -940,8 +986,7 @@ mod tests {
             Err(HostSecretCommandError::TimedOut { .. })
         ));
         assert!(started.elapsed() < Duration::from_secs(5));
-        std::thread::sleep(Duration::from_millis(2500));
-        assert!(!marker.exists(), "background child outlived the group kill");
+        probe.assert_none_survived("the timeout kill");
     }
 
     #[test]
@@ -1269,17 +1314,16 @@ mod review_regression_tests {
             ("sleep 5", HostStdin::Tty),
         ] {
             let dir = tempfile::tempdir().unwrap();
-            let marker = dir.path().join("survived");
+            let probe = super::survivor_probe::SurvivorProbe::new(dir.path());
             let path = script(
                 dir.path(),
                 "op",
-                &format!("(sleep 2; touch '{}') &\n{body}", marker.display()),
+                &format!("{}\n{body}", probe.background_line()),
             );
             let mut opts = options(&path);
             opts.stdin = stdin;
             let _ = HostSecretCommand::new(opts).unwrap().run();
-            std::thread::sleep(Duration::from_millis(2200));
-            assert!(!marker.exists(), "descendant survived {stdin:?}");
+            probe.assert_none_survived(&format!("{stdin:?}"));
         }
     }
     #[test]
@@ -1313,13 +1357,13 @@ mod cancellation_review_tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let script = dir.path().join("fixture-tool");
-        let marker = dir.path().join("survived");
+        let probe = super::survivor_probe::SurvivorProbe::new(dir.path());
         let started = dir.path().join("started");
         std::fs::write(
             &script,
             format!(
-                "#!/bin/sh\n(sleep 1; touch '{}') &\necho ready > '{}'\nsleep 5\n",
-                marker.display(),
+                "#!/bin/sh\n{}\necho ready > '{}'\nsleep 5\n",
+                probe.background_line(),
                 started.display()
             ),
         )
@@ -1347,7 +1391,6 @@ mod cancellation_review_tests {
         });
         assert!(crate::engine::host_cli::with_collection_cancel(cancel, || command.run()).is_err());
         worker.join().unwrap();
-        std::thread::sleep(Duration::from_millis(1100));
-        assert!(!marker.exists());
+        probe.assert_none_survived("cancellation");
     }
 }

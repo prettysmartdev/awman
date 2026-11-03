@@ -421,6 +421,21 @@ mod custom_tests {
         def.auth_env = vec!["CUSTOM_AGENT_AUTH_TEST".into()];
         // A value is available where container auth forwarding would read it
         // (the daemon env overlay); the host ping must still not receive it.
+        // The overlay is process-wide: hold its test lock and remove the
+        // sentinel on drop, so no other test can capture or keep it.
+        struct Sentinel(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+        impl Drop for Sentinel {
+            fn drop(&mut self) {
+                crate::data::config::env::update_daemon_overlay(|overlay| {
+                    overlay.remove("CUSTOM_AGENT_AUTH_TEST");
+                });
+            }
+        }
+        let _sentinel = Sentinel(
+            crate::data::config::env::DAEMON_OVERLAY_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        );
         crate::data::config::env::update_daemon_overlay(|overlay| {
             overlay.insert(
                 "CUSTOM_AGENT_AUTH_TEST".into(),
@@ -433,9 +448,6 @@ mod custom_tests {
         else {
             panic!("probe failed")
         };
-        crate::data::config::env::update_daemon_overlay(|overlay| {
-            overlay.remove("CUSTOM_AGENT_AUTH_TEST");
-        });
         assert!(GREETINGS.contains(&greeting.as_str()));
         assert_eq!(response, greeting);
     }

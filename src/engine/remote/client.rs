@@ -120,10 +120,35 @@ pub struct StartSessionResponse {
 }
 
 /// Exec routing argument — either a workflow path or a one-shot prompt.
+/// A workflow path may be omitted only for `exec workflow --dynamic`.
 #[derive(Debug, Clone)]
 pub enum ExecArg {
-    Workflow(String),
+    Workflow(Option<String>),
     Prompt(String),
+}
+
+impl ExecArg {
+    /// The `POST /v1/commands` body for this exec with `flags` (argv tokens).
+    /// Flags come first and the positional follows a `--`: `exec prompt`'s
+    /// prompt is a greedy trailing argument that would otherwise swallow
+    /// every flag after it, and a prompt or path starting with `-` must never
+    /// be read as a flag.
+    pub fn into_request(self, flags: &[String]) -> StartCommandRequest {
+        let (subcommand, positional) = match self {
+            ExecArg::Workflow(path) => ("exec workflow", path),
+            ExecArg::Prompt(text) => ("exec prompt", Some(text)),
+        };
+        let mut args = flags.to_vec();
+        if let Some(positional) = positional {
+            args.push("--".into());
+            args.push(positional);
+        }
+        StartCommandRequest {
+            subcommand: subcommand.into(),
+            args,
+            labels: Labels::empty(),
+        }
+    }
 }
 
 /// Response for `POST /v1/commands`.
@@ -284,22 +309,8 @@ impl RemoteClient {
         extra_args: &[String],
         idempotency_key: Option<&str>,
     ) -> Result<ExecJobResponse, EngineError> {
-        let (subcommand, mut args) = match exec {
-            ExecArg::Workflow(path) => ("exec workflow", vec![path]),
-            ExecArg::Prompt(text) => ("exec prompt", vec![text]),
-        };
-        args.extend(extra_args.iter().cloned());
-
-        self.submit_command(
-            session_id,
-            &StartCommandRequest {
-                subcommand: subcommand.into(),
-                args,
-                labels: Labels::empty(),
-            },
-            idempotency_key,
-        )
-        .await
+        self.submit_command(session_id, &exec.into_request(extra_args), idempotency_key)
+            .await
     }
 
     /// Submit a command with optional labels and idempotency, to a ready session.

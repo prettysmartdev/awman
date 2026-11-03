@@ -549,7 +549,8 @@ pub mod failure_stages {
 
 impl CommandError {
     /// The pipeline stage a failure belongs to, reported by the API as
-    /// `result.failure.stage` and the legacy `result.stage` (WI 0137 §1).
+    /// `result.failure.stage` (WI 0137 §1). The legacy `result.stage` keeps
+    /// its pre-0137 meaning and is only filled for an unresolved prerequisite.
     ///
     /// Every variant names a stage: usage, lookup and configuration failures
     /// happen before any container starts (`preflight`); merge-back failures
@@ -628,81 +629,99 @@ impl CommandError {
 
     /// A stable snake_case code for this failure, reported by the API as
     /// `result.failure.code` (WI 0137 §1) so clients stop matching message
-    /// text. Variants a client can act on get their own code; the rest share
-    /// a class code (`invalid_request`, `not_found`, `internal`). Codes for
-    /// outcomes that are not `CommandError`s (`step_failed`,
-    /// `teardown_failed`, `push_failed`, `setup_failed`, `cancelled`) live in
-    /// `crate::data::fs::api_db::failure_codes`. Exhaustive on purpose.
+    /// text.
+    ///
+    /// One code per variant, spelled after the variant. Where WI 0138's HTTP
+    /// error vocabulary already names the condition, its spelling wins
+    /// (`unknown_subcommand`, `unknown_flag`, `forbidden_workdir`), so a
+    /// client decodes both with one table. The wrappers `Engine` and `Data`
+    /// carry lower-layer failures that are not the client's to act on and
+    /// report `internal`, except the two agent-definition failures that are;
+    /// `Other` is the untyped catch-all and is `internal` too. `Aborted`
+    /// reports `aborted`, the same word as its `outcome` (a cancel request
+    /// is `cancelled`, assigned by the queue worker). Codes for outcomes that
+    /// are not `CommandError`s (`step_failed`, `teardown_failed`,
+    /// `push_failed`, `setup_failed`, `cancelled`) live in
+    /// `crate::data::fs::api_db::failure_codes`. Exhaustive on purpose: a
+    /// new variant must pick its code here.
     pub fn code(&self) -> &'static str {
+        use crate::data::fs::api_db::failure_codes as outcome_codes;
         match self {
-            CommandError::WorktreeExists { .. } => failure_codes::WORKTREE_EXISTS,
-            CommandError::MergeConflict { .. } => failure_codes::MERGE_CONFLICT,
-            CommandError::MergeTargetDirty { .. } => failure_codes::MERGE_TARGET_DIRTY,
-            CommandError::WorkflowPrerequisitesUnresolved { .. } => {
-                failure_codes::WORKFLOW_PREREQUISITES_UNRESOLVED
-            }
             CommandError::Engine(EngineError::UnknownAgent { .. }) => failure_codes::UNKNOWN_AGENT,
             CommandError::Engine(EngineError::AgentDefinitionUntrusted { .. }) => {
                 failure_codes::AGENT_UNTRUSTED
             }
-            CommandError::Aborted => "aborted",
+            CommandError::Engine(_) | CommandError::Data(_) | CommandError::Other(_) => {
+                outcome_codes::INTERNAL
+            }
 
             CommandError::UnknownCommand { .. } => failure_codes::UNKNOWN_SUBCOMMAND,
+            CommandError::NotAvailableForFrontend { .. } => "not_available_for_frontend",
             CommandError::UnknownFlag { .. } => failure_codes::UNKNOWN_FLAG,
+            CommandError::MissingRequiredFlag { .. } => "missing_required_flag",
+            CommandError::MissingRequiredArgument { .. } => "missing_required_argument",
+            CommandError::UnexpectedArgument { .. } => "unexpected_argument",
+            CommandError::MutuallyExclusive { .. } => "mutually_exclusive_flags",
+            CommandError::InvalidFlagValue { .. } => "invalid_flag_value",
+            CommandError::InvalidArgumentValue { .. } => "invalid_argument_value",
+            CommandError::CommandBoxParse(_) => "command_box_parse_failed",
+
+            CommandError::Aborted => outcome_codes::ABORTED,
+            CommandError::MergeConflict { .. } => failure_codes::MERGE_CONFLICT,
+            CommandError::MergeTargetDirty { .. } => failure_codes::MERGE_TARGET_DIRTY,
+            CommandError::WorktreeExists { .. } => failure_codes::WORKTREE_EXISTS,
+
+            CommandError::MissingRemoteAddress => "missing_remote_address",
+            CommandError::MissingApiKey => "missing_api_key",
+            CommandError::RemoteTimeout => "remote_timeout",
+            CommandError::RemoteConnectionRefused(_) => "remote_connection_refused",
+            CommandError::RemoteHttpStatus { .. } => "remote_http_status",
+            CommandError::MalformedSseEvent(_) => "malformed_sse_event",
+            CommandError::RemoteTransport(_) => "remote_transport_failed",
+
+            CommandError::ApiWorkdirNotFound { .. } => "api_workdir_not_found",
+            CommandError::ApiWorkdirRootInvalid { .. } => "api_workdir_root_invalid",
+            CommandError::ApiServerAlreadyRunning { .. } => "api_server_already_running",
+            CommandError::ApiServerNotRunning => "api_server_not_running",
+            CommandError::ApiServerAuthMissing => "api_server_auth_missing",
+            CommandError::SquadKeyMissing => "squad_key_missing",
+
+            CommandError::SessionInvalidType { .. } => "session_invalid_type",
+            CommandError::SessionWorkdirRequired => "session_workdir_required",
+            CommandError::SessionWorkdirUnresolvable { .. } => "session_workdir_unresolvable",
             CommandError::SessionWorkdirNotAllowed { .. } => failure_codes::FORBIDDEN_WORKDIR,
-            CommandError::NotAvailableForFrontend { .. }
-            | CommandError::MissingRequiredFlag { .. }
-            | CommandError::MissingRequiredArgument { .. }
-            | CommandError::UnexpectedArgument { .. }
-            | CommandError::MutuallyExclusive { .. }
-            | CommandError::InvalidFlagValue { .. }
-            | CommandError::InvalidArgumentValue { .. }
-            | CommandError::CommandBoxParse(_)
-            | CommandError::InvalidOverlaySpec { .. }
-            | CommandError::UnknownConfigField { .. }
-            | CommandError::InteractiveInputUnavailable { .. }
-            | CommandError::PrerequisiteWideningRefused { .. }
-            | CommandError::PrerequisiteFlagUnsupported { .. }
-            | CommandError::SessionInvalidType { .. }
-            | CommandError::SessionWorkdirRequired
-            | CommandError::SessionWorkdirUnresolvable { .. }
-            | CommandError::ApiWorkdirRootInvalid { .. }
-            | CommandError::SessionRepoUrlRequired
-            | CommandError::SessionRepoUrlEmpty
-            | CommandError::SessionRepoUrlInvalidScheme { .. }
-            | CommandError::SessionFieldRemoteOnly { .. }
-            | CommandError::SessionFieldRequiresBranch { .. }
-            | CommandError::SessionRefInvalid { .. }
-            | CommandError::AgentAmbiguous { .. }
-            | CommandError::AgentReferenceEmpty => failure_codes::INVALID_REQUEST,
+            CommandError::SessionRepoUrlRequired => "session_repo_url_required",
+            CommandError::SessionRepoUrlEmpty => "session_repo_url_empty",
+            CommandError::SessionRepoUrlInvalidScheme { .. } => "session_repo_url_invalid_scheme",
+            CommandError::SessionFieldRemoteOnly { .. } => "session_field_remote_only",
+            CommandError::SessionFieldRequiresBranch { .. } => "session_field_requires_branch",
+            CommandError::SessionRefInvalid { .. } => "session_ref_invalid",
 
-            CommandError::WorkItemNotFound { .. }
-            | CommandError::SpecTemplateMissing { .. }
-            | CommandError::WorkflowFileNotFound { .. }
-            | CommandError::ApiWorkdirNotFound { .. }
-            | CommandError::AgentNotFound { .. }
-            | CommandError::AgentNoLongerRunning { .. }
-            | CommandError::AgentNotRunning { .. }
-            | CommandError::AgentReplaced { .. } => "not_found",
+            CommandError::RemoteSessionMissing => "remote_session_missing",
+            CommandError::RemoteSessionKillFailed { .. } => "remote_session_kill_failed",
 
-            CommandError::Engine(_)
-            | CommandError::Data(_)
-            | CommandError::MissingRemoteAddress
-            | CommandError::MissingApiKey
-            | CommandError::RemoteTimeout
-            | CommandError::RemoteConnectionRefused(_)
-            | CommandError::RemoteHttpStatus { .. }
-            | CommandError::MalformedSseEvent(_)
-            | CommandError::RemoteTransport(_)
-            | CommandError::ApiServerAlreadyRunning { .. }
-            | CommandError::ApiServerNotRunning
-            | CommandError::ApiServerAuthMissing
-            | CommandError::SquadKeyMissing
-            | CommandError::RemoteSessionMissing
-            | CommandError::RemoteSessionKillFailed { .. }
-            | CommandError::AgentOwnerGone { .. }
-            | CommandError::NotImplemented(_)
-            | CommandError::Other(_) => "internal",
+            CommandError::WorkItemNotFound { .. } => "work_item_not_found",
+            CommandError::SpecTemplateMissing { .. } => "spec_template_missing",
+            CommandError::InvalidOverlaySpec { .. } => "invalid_overlay_spec",
+            CommandError::UnknownConfigField { .. } => "unknown_config_field",
+            CommandError::InteractiveInputUnavailable { .. } => "interactive_input_unavailable",
+            CommandError::WorkflowFileNotFound { .. } => "workflow_file_not_found",
+
+            CommandError::WorkflowPrerequisitesUnresolved { .. } => {
+                failure_codes::WORKFLOW_PREREQUISITES_UNRESOLVED
+            }
+            CommandError::PrerequisiteWideningRefused { .. } => "prerequisite_widening_refused",
+            CommandError::PrerequisiteFlagUnsupported { .. } => "prerequisite_flag_unsupported",
+
+            CommandError::AgentNotFound { .. } => "agent_not_found",
+            CommandError::AgentNoLongerRunning { .. } => "agent_no_longer_running",
+            CommandError::AgentNotRunning { .. } => "agent_not_running",
+            CommandError::AgentReplaced { .. } => "agent_replaced",
+            CommandError::AgentAmbiguous { .. } => "agent_ambiguous",
+            CommandError::AgentReferenceEmpty => "agent_reference_empty",
+            CommandError::AgentOwnerGone { .. } => "agent_owner_gone",
+
+            CommandError::NotImplemented(_) => "not_implemented",
         }
     }
 }
@@ -772,12 +791,12 @@ mod failure_classification_tests {
                     argument: "prompt".into(),
                 },
                 "preflight",
-                "invalid_request",
+                "missing_required_argument",
             ),
             (
                 CommandError::WorkflowFileNotFound { path: "/w".into() },
                 "preflight",
-                "not_found",
+                "workflow_file_not_found",
             ),
         ];
         for (error, stage, code) in cases {

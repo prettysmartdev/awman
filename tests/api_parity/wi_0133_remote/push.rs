@@ -211,7 +211,7 @@ async fn real_git_failed_command_does_not_push() {
     assert_ne!(record["exit_code"], 0, "{record}");
     let result = record["result"].as_object().expect("result object");
     assert!(!result.contains_key("pushed"), "{record}");
-    assert_eq!(result["stage"], "step", "{record}");
+    assert!(!result.contains_key("stage"), "{record}");
     assert_eq!(result["failure"]["stage"], "step", "{record}");
     assert_eq!(result["failure"]["code"], "step_failed", "{record}");
     // Nothing committed, nothing pushed: the edit is still loose in the clone.
@@ -364,10 +364,16 @@ async fn real_git_non_fast_forward_push_errors_at_stage_push_and_is_never_forced
         last_status["payload"]["data"]["status"], "error",
         "{events}"
     );
-    assert!(last_status["payload"]["data"]["error"]
-        .as_str()
-        .unwrap()
-        .contains("push:"));
+    // WI 0137: one final status whose `error` is the row's `result.error`;
+    // the push stage is in `result.failure.stage`, not an error prefix.
+    assert_eq!(
+        last_status["payload"]["data"]["error"], record["result"]["error"],
+        "{events}"
+    );
+    assert_eq!(
+        last_status["payload"]["data"]["result"]["failure"]["stage"], "push",
+        "{events}"
+    );
 }
 
 /// The command `push_branch` (no remote, no branch) translates to, run for

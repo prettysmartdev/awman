@@ -1,6 +1,6 @@
 # Overlays
 
-Overlays give agent containers access to host resources — directories, environment variables, and personal skills libraries. Each step in a workflow can define its own overlays, ensuring isolated resource access across the task.
+Overlays give agent containers access to host resources — directories, environment variables, skills, and persistent context directories. Each workflow step can add its own, so every step gets only what it needs.
 
 ---
 
@@ -8,7 +8,7 @@ Overlays give agent containers access to host resources — directories, environ
 
 An overlay "opens a door" from the container into the host, mounting a directory, injecting an environment variable, or making a skill available. Unlike most container configurations, overlays from all sources are **additive** — your global config, per-repo config, `AWMAN_OVERLAYS` environment variable, `--overlay` flags, and per-step overlays all combine into a single final resource list.
 
-Overlays are expressed using a unified syntax that works anywhere: `dir()`, `ssh()`, `env()`, and `skill()` expressions. No matter where you configure them — config file, environment variable, CLI flag, or workflow TOML — the syntax is consistent.
+Overlays are expressed using a unified syntax that works anywhere: `dir()`, `ssh()`, `env()`, `skill()`, and `context()` expressions. No matter where you configure them — config file, environment variable, CLI flag, or workflow TOML — the syntax is consistent.
 
 ---
 
@@ -23,14 +23,14 @@ Mounts a host directory into the container at a specified path.
 dir(HOST_PATH:CONTAINER_PATH[:ro|rw])
 ```
 
-- `HOST_PATH` — absolute path or `~/`-prefixed (expanded to your home directory).
+- `HOST_PATH` — absolute, `~/`-prefixed (expanded to your home directory), or relative to the session's working directory.
 - `CONTAINER_PATH` — absolute path inside the container (or `~/` for the container user's home).
-- `permission` — optional; `ro` (read-only, default) or `rw` (read-write).
+- `permission` — optional; `ro` (read-only) or `rw` (read-write, the default).
 
 **Examples:**
 ```
 dir(/var/data:/mnt/data:ro)
-dir(~/personal-prompts:/mnt/prompts)
+dir(~/personal-prompts:/mnt/prompts)        # read-write: no permission given
 dir(/shared/fixtures:/workspace/fixtures:rw)
 ```
 
@@ -158,8 +158,8 @@ context(SCOPE[:ro|rw])
 
 - `SCOPE` — one of `global`, `repo`, or `workflow`:
   - `global` — persistent cross-project developer preferences (`~/.awman/context/global/`)
-  - `repo` — project-specific context (`~/.awman/context/repo/{owner}/{repo}/`)
-  - `workflow` — per-workflow shared workspace for multi-agent coordination (`~/.awman/context/workflow/`)
+  - `repo` — project-specific context (`~/.awman/context/repo/{owner}/{repo}/`, derived from the `origin` remote and lowercased; `_local/{dirname}` when there is no remote)
+  - `workflow` — per-workflow shared workspace for multi-agent coordination (`~/.awman/context/workflows/<run-id>/`)
 - `permission` — optional; `ro` (read-only) or `rw` (read-write, default).
 
 **Examples:**
@@ -190,29 +190,30 @@ Most agents natively support system prompt injection. If your agent does not (a 
 
 ## Configuration sources
 
-Overlays can be configured in five places. All sources are merged; the order below shows precedence for conflict resolution (lower priority first):
+Overlays can be configured in these places, and awman reads them in this order:
 
-| Priority | Source | Example |
-|----------|--------|---------|
-| 1 (lowest) | Global config `~/.awman/config.json` | `"overlays": ["dir(~/shared:/mnt/shared:ro)"]` |
+| Order | Source | Example |
+|-------|--------|---------|
+| 1 | Global config `~/.awman/config.json` | `"overlays": ["dir(~/shared:/mnt/shared:ro)"]` |
 | 2 | Per-repo config `.awman/config.json` | `"overlays": ["skill(lint)"]` |
 | 3 | `AWMAN_OVERLAYS` environment variable | `export AWMAN_OVERLAYS="dir(/data:/mnt:ro),env(TOKEN)"` |
 | 4 | `--overlay` CLI flags | `--overlay "ssh()" --overlay "env(GITHUB_TOKEN)"` |
-| 5 (highest) | Per-step overlays in workflows | `overlays = ["ssh()"]` in TOML |
+| 5 | Workflow-level `overlays` | `overlays = ["context(repo)"]` at the top of a workflow file |
+| 6 | Per-step overlays in workflows | `overlays = ["ssh()"]` in TOML |
 
 ---
 
 ## Merge semantics
 
-All sources are **additive** — they are combined into a single final list. Special rules apply to avoid conflicts:
+All sources are **additive** — they are combined into a single final list. No source can remove or loosen what an earlier one added. Where two entries collide:
 
 ### Directory overlays
 
-When different sources specify the **same host path**:
-- The **higher-priority source** wins for the container path.
-- The **more restrictive permission always wins** — `:ro` beats `:rw` regardless of priority. If a lower-priority source declares `:ro`, a higher-priority flag cannot escalate it to `:rw`.
+When different sources mount the **same host path**:
+- The mount keeps the container path from the **first** source that named it (in the order above), so a later source cannot move it.
+- The **more restrictive permission always wins** — `:ro` beats `:rw` in either direction. A flag or step cannot escalate a `:ro` mount to `:rw`.
 
-When different sources specify **different host paths** mapping to the **same container path**, both mounts are applied and a warning is logged (Docker will shadow one with the other).
+Different host paths mapped to the **same container path** are both passed to the runtime; one shadows the other, so avoid it.
 
 ### Skills overlays
 
@@ -229,7 +230,7 @@ Environment variable names are deduplicated by name. If multiple sources list th
 
 ### Context overlays
 
-Context overlays use **union** semantics — all specified scopes are mounted and all prompts are combined. If the same scope appears in multiple sources (e.g. `context(global)` in both global config and a step's overlays), it appears exactly once in the final mount list. The combined system prompt always presents scopes in the order: global, repo, workflow (workflow last).
+Context overlays use **union** semantics — all specified scopes are mounted and all prompts are combined. If the same scope appears in multiple sources (e.g. `context(global)` in both global config and a step's overlays), it is mounted once, with the permission from the first source that named it. The combined system prompt always presents scopes in the order: global, repo, workflow.
 
 ---
 
@@ -247,7 +248,7 @@ Context overlays use **union** semantics — all specified scopes are mounted an
 }
 ```
 
-This configuration applies overlays to all agent sessions on your machine unless overridden by a per-repo config.
+This configuration applies overlays to every agent session on your machine, in addition to any per-repo overlays.
 
 ### Table reference
 
@@ -289,7 +290,7 @@ Set `AWMAN_OVERLAYS` in your shell profile to inject overlays without modifying 
 export AWMAN_OVERLAYS="ssh(),dir(~/team-data:/mnt/data:ro),env(GITHUB_TOKEN),skill(fetch)"
 ```
 
-Expressions are comma-separated. This source has higher priority than config files but lower priority than `--overlay` flags.
+Expressions are comma-separated. They are added to the config-file overlays and any `--overlay` flags.
 
 ---
 
@@ -307,7 +308,7 @@ Or comma-separate multiple expressions in a single flag:
 awman chat --overlay "ssh(),env(GITHUB_TOKEN),skill(lint)"
 ```
 
-This source has the highest priority among global/repo/env/flag sources, but per-step overlays in workflows override it.
+Flag overlays are added to the config and `AWMAN_OVERLAYS` overlays, and to any workflow and step overlays.
 
 `awman squad add` also accepts repeatable `--overlay` flags, and the squad
 interview offers the same overlay step. These task overlays are saved with
@@ -352,7 +353,7 @@ steps:
       - "skill(*)"
 ```
 
-Per-step overlays merge additively with all other sources (global, repo, `AWMAN_OVERLAYS`, flags), and take highest priority for conflict resolution.
+Per-step overlays merge additively with all other sources (global, repo, `AWMAN_OVERLAYS`, flags, workflow-level). A step cannot remove or loosen an overlay another source added.
 
 ### Workflow-level overlays
 
@@ -396,7 +397,7 @@ steps:
     prompt: "Test the implementation..."
 ```
 
-Workflow-level overlays apply to all steps unless overridden by step-level overlays (which take highest priority). This is useful for context overlays that you want all steps to share (e.g. `context(repo)` so every agent in the workflow has access to the project's accumulated knowledge).
+Workflow-level overlays apply to every step, alongside each step's own overlays. This is useful for context overlays that you want all steps to share (e.g. `context(repo)` so every agent in the workflow has access to the project's accumulated knowledge).
 
 ### Setup and teardown steps
 
@@ -418,7 +419,7 @@ type = "create_pull_request"
 overlays = ["env(GITHUB_TOKEN)"]
 ```
 
-Setup and teardown steps support `dir()`, `ssh()`, and `env()` overlays. They do **not** support `skill()` or `skill(*)` (skills are only meaningful for agent containers; setup and teardown are host operations or custom containers).
+Setup and teardown steps use `dir()`, `ssh()`, and `env()` overlays — their own plus those from config, `AWMAN_OVERLAYS` and `--overlay`. `skill()` and `context()` entries are ignored there: they only mean something to an agent.
 
 ---
 
@@ -553,7 +554,7 @@ The three scopes:
 |-------|----------|---------|----------------|
 | **global** | `~/.awman/context/global/` | Personal coding preferences, style rules, recurring mistakes to avoid | All projects and workflows |
 | **repo** | `~/.awman/context/repo/{owner}/{repo}/` | Project-specific architecture notes, gotchas, accumulated team knowledge | All agents working on this repo |
-| **workflow** | `~/.awman/context/workflow/` (per workflow invocation) | Shared state and coordination between steps in a multi-agent workflow | All steps in the same workflow run |
+| **workflow** | `~/.awman/context/workflows/<run-id>/` (one per workflow run) | Shared state and coordination between steps in a multi-agent workflow | All steps in the same workflow run |
 
 The squad daemon keeps each task's durable context in
 `~/.awman/squad/tasks/{name}/workspace/`. It is a task-scoped location in
@@ -717,7 +718,7 @@ Container paths starting with `~/` are expanded at container launch time using t
 dir(/host/data:~/data:ro)
 ```
 
-For root-based containers (the default), `~/` becomes `/root/`. For non-root containers, `~/` becomes `/home/{username}/` where the username comes from the agent's `Dockerfile`. This ensures `ssh()` and other `~/`-based paths land in the correct location for both root and non-root containers.
+`~/` becomes the agent image's home directory, read from the image (or its `Dockerfile`), falling back to `/root/` when none can be found. This keeps `ssh()` and other `~/`-based paths in the right place whether the image runs as root or as a named user.
 
 ---
 
@@ -725,27 +726,25 @@ For root-based containers (the default), `~/` becomes `/root/`. For non-root con
 
 ### Malformed expressions
 
-Malformed overlay expressions cause the command to exit immediately with a descriptive error:
+A malformed overlay expression stops the command before any container launches. The error names the offending entry and the reason, for example:
 
 ```
-error: malformed overlay expression (missing colon): "notvalid"
-error: 'skill()' requires an argument; use skill(*) to mount all skills or skill(name) for a specific named skill
-error: 'env(A, B)' has multiple arguments; use separate env() calls for each variable
-error: 'context()' requires a scope; use context(global), context(repo), or context(workflow)
-error: 'context(global:rx)' has invalid permission; use 'ro' or 'rw'
+invalid overlay spec 'notvalid': expected 'host:container' or 'host:container:perm', got 'notvalid'
+invalid overlay spec 'skill()': skill() requires an argument; use skill(*) to mount all skills or skill(name) for a specific named skill
+invalid overlay spec 'env(A, B)': env() takes one argument; use separate env() calls for multiple vars
+invalid overlay spec 'context()': context() requires a scope argument: context(global), context(repo), or context(workflow)
+invalid overlay spec 'context(global:rx)': unknown permission 'rx' in 'context(global:rx)'; expected 'ro' or 'rw'
 ```
-
-The command does not proceed — you must fix the syntax before launching.
 
 ### Missing host paths
 
 If a configured host path does not exist when you launch the session:
 
 ```
-error: overlay host path '/nonexistent/data' does not exist
+overlay host path '/nonexistent/data' does not exist (resolved to '/nonexistent/data')
 ```
 
-The launch fails rather than asking Docker to create an empty bind-mount source.
+The launch fails rather than asking the runtime to create an empty bind-mount source.
 If a directory is optional across environments (for example, CI versus a local
 machine), add the overlay only in the environments where that path exists.
 
@@ -754,40 +753,30 @@ machine), add the overlay only in the environments where that path exists.
 If a named skill is neither a hand-authored skill nor a pulled library:
 
 ```
-error: named skill 'nonexistent' not found in ~/.awman/skills or ~/.awman/skills/.library
+named skill 'nonexistent' not found in ~/.awman/skills or ~/.awman/skills/.library
 ```
 
 For a library skill, the error identifies both the library and the missing skill, for example:
 
 ```
-error: skill 'brainstorming' not found in library 'superpowers' (looked for a SKILL.md in ~/.awman/skills/.library/superpowers/skills/brainstorming)
+skill 'brainstorming' not found in library 'superpowers' (looked for a SKILL.md in ~/.awman/skills/.library/superpowers/skills/brainstorming)
 ```
 
-A skill is a directory containing a `SKILL.md`. A directory inside a library
-that has no `SKILL.md` is reported the same way — it is not mountable as a
-skill.
-
-The command exits immediately. This catches typos before the container launches, preventing silent failures.
+A skill is a directory containing a `SKILL.md`; a directory inside a library
+without one is reported the same way. The command exits before the container
+launches.
 
 ### `AWMAN_OVERLAYS` errors
 
-If `AWMAN_OVERLAYS` contains a malformed expression, the command exits with an error that includes the variable name:
+If `AWMAN_OVERLAYS` contains a malformed expression, the error quotes the variable so you know to fix your shell profile:
 
 ```
-error: malformed AWMAN_OVERLAYS: 'skill()' requires an argument (use 'skill(*)' or 'skill(name)')
+invalid overlay spec 'AWMAN_OVERLAYS: skill()': skill() requires an argument; use skill(*) to mount all skills or skill(name) for a specific named skill
 ```
-
-This makes the source immediately obvious so you can fix your shell profile.
 
 ### Removed forms
 
-The old config schema used `{ "overlays": { "skills": true, "directories": [...] } }`. This format is no longer supported:
-
-```
-error: config overlay format is out of date
-```
-
-Update your config to use the new `"overlays": ["skill(*)", "dir(...)"]` format. The old `envPassthrough` field is also deprecated; use `env()` overlay expressions instead.
+The old object form, `{ "overlays": { "skills": true, "directories": [...] } }`, is a config parse error. Use the array form, `"overlays": ["skill(*)", "dir(...)"]`. The `skills()` expression is also gone (use `skill(*)`), and the old `envPassthrough` field is ignored with a warning; use `env()` overlay expressions instead.
 
 ---
 
@@ -857,15 +846,15 @@ The [builtin microVM runtime](11-runtimes.md#builtin-microvm-experimental) resol
 - Agent settings (the sanitized Claude, Antigravity, and other staged directories) and system-prompt files or directories are delivered the same way, through these mounts; their guest location comes from the imported image's `HOME`. A missing or non-absolute `HOME` in the image is refused.
 - A Unix socket, FIFO, or device node can never be an overlay source — only regular files and directories can be mounted — and `--allow-docker` is rejected.
 
-Mounts appear in the VM owned by the image's `USER`. If the image declares a named user (as the awman templates do), awman resolves it to a numeric id from the image's own `/etc/passwd` and `/etc/group`, and refuses to launch if it can't. The mounts, ownership, and live credential refresh in a real guest have not yet been verified on real hardware; see [Parity limits](11-runtimes.md#parity-limits-versus-docker-and-apple-containers).
+Mounts appear in the VM owned by the image's `USER`. If the image declares a named user (as the awman templates do), awman resolves it to a numeric id from the image's own `/etc/passwd` and `/etc/group`, and refuses to launch if it can't. See [Parity limits](11-runtimes.md#parity-limits-versus-docker-and-apple-containers) for what differs from Docker.
 
 ---
 
 ## Troubleshooting
 
-### "Path does not exist" warning
+### "overlay host path ... does not exist" error
 
-If you see this warning for a path that should exist, check:
+If you see this error for a path that should exist, check:
 - Is the path spelled correctly?
 - Is it an absolute path or properly `~`-expanded?
 - Does the host path actually exist? Try `ls -la /path/to/check`.

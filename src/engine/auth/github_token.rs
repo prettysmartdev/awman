@@ -593,3 +593,7 @@ mod custom_gh_review_tests {
             .is_err());
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "github_token_tests.rs"]
+mod coverage_tests;

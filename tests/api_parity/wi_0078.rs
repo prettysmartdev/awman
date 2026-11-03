@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::spawn_router;
 use awman::command::commands::api_server::event_bus::EventBus;
 use awman::command::commands::api_server::session_setup::SessionSetupBus;
 use awman::command::dispatch::catalogue::{CommandCatalogue, FrontendKind};
@@ -37,7 +38,7 @@ use awman::engine::auth::AuthEngine;
 use awman::engine::container::ContainerRuntime;
 use awman::engine::git::GitEngine;
 use awman::engine::overlay::OverlayEngine;
-use awman::frontend::api::routes::{build_router, AppState, AuthMode};
+use awman::frontend::api::routes::{AppState, AuthMode};
 
 // ─── Test helpers ─────────────────────────────────────────────────────────────
 
@@ -108,19 +109,6 @@ fn make_app_state_with_workdirs(
         event_buses: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         setup_buses: tokio::sync::Mutex::new(HashMap::new()),
     })
-}
-
-async fn spawn_router(
-    state: Arc<AppState>,
-) -> Option<(std::net::SocketAddr, tokio::task::JoinHandle<()>)> {
-    let app = build_router(state);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.ok()?;
-    let addr = listener.local_addr().ok()?;
-    let handle = tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
-    });
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    Some((addr, handle))
 }
 
 // ─── Dispatch catalogue unit tests ────────────────────────────────────────────
@@ -1451,7 +1439,8 @@ fn remote_exec_workflow_flags_parity_with_local() {
     let cat = CommandCatalogue::get();
     let local = cat.lookup(&["exec", "workflow"]).unwrap();
     let remote = cat.lookup(&["remote", "exec", "workflow"]).unwrap();
-    let excluded: &[&str] = &["workdir", "worktree"];
+    // `--json` shapes local output; the server reports the result itself.
+    let excluded: &[&str] = &["workdir", "worktree", "json"];
     for flag in local.flags {
         if excluded.contains(&flag.long) {
             continue;

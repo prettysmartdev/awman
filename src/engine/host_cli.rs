@@ -185,6 +185,9 @@ mod tests {
     /// with a path that does not exist.
     #[test]
     fn real_container_clis_are_off_under_isolation() {
+        // `program` and `resolves_to_test_fake` both read PATH; a sibling
+        // test adding its fake `sbx` between the reads must not interleave.
+        let _path = crate::engine::test_path::PathGuard::acquire();
         for (name, opted_in) in [
             ("docker", Env::from_process().test_docker()),
             ("container", Env::from_process().test_apple_container()),

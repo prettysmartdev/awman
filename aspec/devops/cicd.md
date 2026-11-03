@@ -78,6 +78,58 @@ Triggered on tag pushes matching `v[0-9]+.[0-9]+.[0-9]+`.
   succeeding** — a release cannot publish while the signed Apple Silicon
   artifact fails its native boot gate.
 
+### Release runner (`make release`)
+
+No hosted macOS runner can boot a guest (every hosted Mac is itself a VM, and
+macOS guests cannot nest Hypervisor.framework), so `release-macos-builtin`
+needs a bare-metal Apple Silicon Mac. `make release VERSION=vX.Y.Z` provides
+one on demand through `tools/release-runner.sh`:
+
+- **When.** `RELEASE_RUNNER=auto` (default) uses an online runner with the
+  `hypervisor` label if one exists, and otherwise registers the Mac running the
+  script, provided it is Apple Silicon with `kern.hv_support=1`.
+  `RELEASE_RUNNER=local` requires this Mac; `RELEASE_RUNNER=none` never
+  registers one.
+- **Provisioning, on every release.** `release-runner.sh provision` installs
+  or refreshes what the job expects in `/opt/awman` (creating it with `sudo`
+  the first time and handing it to the invoking user, so later runs need no
+  sudo): a copy of `tools/release-offline-session.sh`, the guest fixture
+  (`fixture-oci.tar`, built and cached in `~/.awman/release-runner/fixtures`
+  by `tools/builtin-hw-fixtures.sh`; the first build needs Docker or Apple
+  Containers running), and the two wrappers the job calls,
+  `release-offline-session.sh` and `release-workload.sh`. The job runs them with
+  a cleared environment, so each wrapper is a fixed command line with the
+  fixture path baked in. Only changed files are rewritten. A file there that
+  provisioning did not write is kept as `<name>.bak`. The workload wrapper
+  runs the same offline session, which records guest RSS, rather than a
+  heavier git/build workload.
+- **Short work directory.** Jobs run under `/tmp/awr` rather than the runner's
+  install directory, because the job's builtin state directories hold Unix
+  sockets and macOS caps socket paths at 103 bytes.
+- **Before the tag is pushed.** The script downloads the latest
+  `actions/runner` osx-arm64 archive into `~/.awman/release-runner/cache`,
+  refuses it unless its SHA-256 matches the checksum in that runner release's
+  notes, registers it with a repository registration token (labels
+  `self-hosted, macOS, ARM64, hypervisor`, name `awman-release-<tag>-<host>`),
+  starts it under `caffeinate`, and waits for it to come online. Queued
+  `Tests` runs that would take the runner first are offered for cancellation.
+  A runner that cannot register stops the release before anything is pushed.
+- **During.** The script waits for the tag's `Release` run, re-running its
+  failed jobs if the run already finished unsuccessfully, and follows it with
+  `gh run watch` until every job has finished.
+- **After.** An `EXIT` trap stops the runner's process group (SIGINT, then
+  SIGKILL) and deregisters it, whether the run succeeded, failed or the script
+  was interrupted. Re-running the script picks up where it stopped.
+
+The runner executes jobs as the invoking user on that Mac, and accepts any
+job whose labels it matches while it is online. The committed self-hosted
+jobs in `test.yml` run only on `workflow_dispatch` and `schedule`, but a pull
+request runs the workflow file from its own branch, so a fork PR could target
+these labels. For a public repository, set **Settings → Actions → General → fork
+pull request workflows** to require approval for every outside contributor
+(the strictest option), and don't approve fork workflow runs during a release. Registration and removal need repository
+admin rights for the `gh` login.
+
 ## Versioning
 
 - Semantic versioning. Major version bumps reserved for incompatible CLI or on-disk format changes.

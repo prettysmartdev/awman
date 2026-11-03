@@ -46,11 +46,18 @@ impl ProcessEnvGuard {
 
     /// Prepend `dir` to `PATH`, keeping the rest so `git` stays findable.
     pub fn prepend_path(&mut self, dir: &std::path::Path) {
-        let mut paths = vec![dir.to_path_buf()];
-        if let Some(old) = std::env::var_os("PATH") {
-            paths.extend(std::env::split_paths(&old));
-        }
-        self.set("PATH", std::env::join_paths(paths).unwrap());
+        self.set("PATH", path_with_first(dir));
+    }
+
+    /// `dir` followed by this process's `PATH`, read under the guard, for a
+    /// child's `Command::env("PATH", ..)`. Without the lock the read could
+    /// observe another test's temporary `prepend_path` and hand the child
+    /// that test's fake binaries. Must not be called while this thread
+    /// already holds a guard (the lock is not reentrant); use
+    /// [`path_with_first`] there instead.
+    pub fn child_path_with_first(dir: &std::path::Path) -> OsString {
+        let _guard = Self::lock();
+        path_with_first(dir)
     }
 
     fn remember(&mut self, key: &OsStr) {
@@ -58,6 +65,15 @@ impl ProcessEnvGuard {
             self.saved.push((key.to_owned(), std::env::var_os(key)));
         }
     }
+}
+
+/// `dir` followed by the current `PATH`. The caller must hold the guard.
+fn path_with_first(dir: &std::path::Path) -> OsString {
+    let mut paths = vec![dir.to_path_buf()];
+    if let Some(old) = std::env::var_os("PATH") {
+        paths.extend(std::env::split_paths(&old));
+    }
+    std::env::join_paths(paths).unwrap()
 }
 
 impl Drop for ProcessEnvGuard {
@@ -102,6 +118,36 @@ fn guard_restores_set_and_absent_variables_after_a_panic() {
     assert_eq!(std::env::var_os(SET), None);
     assert_eq!(std::env::var_os(ABSENT), None);
     assert_eq!(std::env::var_os(EMPTY), None);
+}
+
+/// A child's PATH read through the guard waits for another test's temporary
+/// override to be restored, so it never inherits that test's fake binaries.
+#[test]
+fn a_guarded_child_path_never_sees_another_tests_override() {
+    let fake = std::path::Path::new("/nonexistent/awman-fake-bin");
+    let own = std::path::Path::new("/nonexistent/awman-own-bin");
+    let (overridden_tx, overridden_rx) = std::sync::mpsc::channel::<()>();
+    let (restore_tx, restore_rx) = std::sync::mpsc::channel::<()>();
+    let holder = std::thread::spawn(move || {
+        let mut guard = ProcessEnvGuard::lock();
+        guard.prepend_path(fake);
+        overridden_tx.send(()).unwrap();
+        restore_rx.recv().unwrap();
+        drop(guard);
+    });
+    overridden_rx.recv().unwrap();
+    let reader = std::thread::spawn(move || ProcessEnvGuard::child_path_with_first(own));
+    // Give the reader time to block on the lock, then restore PATH.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    restore_tx.send(()).unwrap();
+    holder.join().unwrap();
+    let path = reader.join().unwrap();
+    let entries: Vec<_> = std::env::split_paths(&path).collect();
+    assert_eq!(entries.first().map(|p| p.as_path()), Some(own));
+    assert!(
+        !entries.iter().any(|p| p == fake),
+        "the child PATH included another test's temporary entry"
+    );
 }
 
 #[test]

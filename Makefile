@@ -8,6 +8,12 @@ TARGET_DIR := $(if $(CARGO_TARGET_DIR),$(CARGO_TARGET_DIR),target)
 # Do not use the workspace/target directory here: local Git remotes in the
 # smoke tests need the native filesystem's atomic object writes.
 AWMAN_TEST_TMPROOT ?= /var/tmp/test-fixtures
+# libtest threads per test binary. Most tests wait on subprocesses, sockets
+# and timers rather than the CPU, so twice the CPU count finishes sooner than
+# libtest's one-per-CPU default without overloading the runner. Override with
+# `make test TEST_THREADS=N` (or set RUST_TEST_THREADS yourself).
+TEST_THREADS ?= $(shell n=$$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2); echo $$((n * 2)))
+export RUST_TEST_THREADS ?= $(TEST_THREADS)
 
 .PHONY: all build sign-macos install test test-fast test-full test-builtin test-builtin-hw payloads payloads-verify clean release architecture-lint pre-push docs-reference reproducible-build-audit native-builtin-ci
 
@@ -137,9 +143,15 @@ pre-push: architecture-lint
 clean:
 	cargo clean
 
+# Release VERSION. On an Apple Silicon Mac with Hypervisor.framework, the
+# release job's /opt/awman scripts are installed or refreshed and the Mac is
+# registered as a temporary GitHub Actions runner for the Apple Silicon
+# release job, then removed when the Release workflow finishes.
+# RELEASE_RUNNER=auto|local|none (see scripts/release.sh).
+RELEASE_RUNNER ?= auto
 release:
 	@if [ -z "$(VERSION)" ]; then \
-		echo "Usage: make release VERSION=vx.y.z"; \
+		echo "Usage: make release VERSION=vx.y.z [RELEASE_RUNNER=auto|local|none]"; \
 		exit 1; \
 	fi
-	@bash scripts/release.sh "$(VERSION)"
+	@RELEASE_RUNNER="$(RELEASE_RUNNER)" bash scripts/release.sh "$(VERSION)"

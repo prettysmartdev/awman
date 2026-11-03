@@ -25,6 +25,7 @@ pub struct Instance {
     pub paths: BuiltinPaths,
     pub owner: String,
     pub plan: LaunchPlan,
+    pub cancel_grace: std::time::Duration,
 }
 impl AgentInstance for Instance {
     fn handle_preview(&self) -> AgentHandlePreview {
@@ -84,6 +85,7 @@ impl Instance {
                 leases: self.plan.leases,
                 prompt_files: self.plan.prompt_files,
                 io,
+                cancel_grace: self.cancel_grace,
             })
             .run(frontend)?;
         launch_cleanup.armed = false;

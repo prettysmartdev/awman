@@ -19,7 +19,8 @@ use tokio_stream::wrappers::ReceiverStream;
 use tower_http::trace::TraceLayer;
 
 use crate::command::commands::api_server::admission::{
-    AdmissionError, ApiAdmission, CommandSubmission, IdempotentAdmission, SessionSubmission,
+    AdmissionError, ApiAdmission, CommandSubmission, IdempotencyGate, IdempotencyGateError,
+    IdempotentAdmission, IdempotentResult, SessionSubmission,
 };
 use crate::command::commands::api_server::command_log_stream::{
     CommandLogStream, CommandLogUpdate,
@@ -39,7 +40,7 @@ use crate::data::api_lifecycle_store::{CommandLifecycleStore, RunRecord};
 use crate::data::command_status::CommandStatus;
 use crate::data::execution_event::{EventCursor, ExecutionEvent};
 use crate::data::fs::api_db::SessionRecord;
-use crate::data::fs::api_db::{CommandListFilter, CommandRecord, IdempotencyBegin, LabelOwner};
+use crate::data::fs::api_db::{CommandListFilter, CommandRecord, LabelOwner};
 use crate::data::fs::api_db::{SessionCommandAdmission, SqliteSessionStore};
 use crate::data::fs::api_labels::{LabelSelector, Labels};
 use crate::data::fs::api_paths::ApiPaths;
@@ -581,6 +582,10 @@ fn accepted_json(body: String) -> Response {
         .into_response()
 }
 
+/// HTTP adapter over Layer 2's [`IdempotencyGate`]: reads the
+/// `Idempotency-Key` header, maps each gate decision to its status and
+/// headers, and hands the handler's final status/body back to the gate.
+/// Which requests run, replay, wait or conflict is the gate's decision.
 async fn with_idempotency<F, Fut>(
     state: &AppState,
     headers: &HeaderMap,
@@ -592,32 +597,15 @@ where
     F: FnOnce(Option<Arc<IdempotentAdmission>>) -> Fut,
     Fut: std::future::Future<Output = Response>,
 {
-    let Some(header) = headers.get("idempotency-key") else {
-        return handler(None).await;
+    let key = match headers.get("idempotency-key").map(|h| h.to_str()) {
+        None => None,
+        Some(Ok(key)) => Some(key),
+        Some(Err(_)) => return bad_request("invalid Idempotency-Key header"),
     };
-    let key = match header.to_str() {
-        Ok(key)
-            if !key.is_empty()
-                && key.len() <= crate::data::fs::api_db::IDEMPOTENCY_KEY_MAX_BYTES
-                && key.bytes().all(|b| (0x21..=0x7e).contains(&b)) =>
-        {
-            key
-        }
-        _ => return bad_request("invalid Idempotency-Key header"),
-    };
-    let principal = match &state.auth_mode {
-        AuthMode::Enabled { key_hash } => key_hash.as_str(),
-        AuthMode::Disabled => "anonymous",
-    };
-    let journal = Arc::new(IdempotentAdmission::new(
-        Arc::clone(&state.store),
-        route,
-        principal,
-        key,
-    ));
-    match journal.begin(canonical) {
-        Ok(IdempotencyBegin::Fresh) => {}
-        Ok(IdempotencyBegin::Replay { status, body }) => {
+    let run = match IdempotencyGate::open(&state.store, route, &state.auth_mode, key, canonical) {
+        Ok(IdempotencyGate::Unkeyed) => return handler(None).await,
+        Ok(IdempotencyGate::Fresh(run)) => run,
+        Ok(IdempotencyGate::Replay { status, body }) => {
             return (
                 StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
                 [
@@ -628,7 +616,7 @@ where
             )
                 .into_response()
         }
-        Ok(IdempotencyBegin::InFlight) => {
+        Ok(IdempotencyGate::InFlight) => {
             return (
                 [("retry-after", "1")],
                 ApiError::idempotency_in_flight(
@@ -637,18 +625,23 @@ where
             )
                 .into_response()
         }
-        Ok(IdempotencyBegin::Mismatch) => {
+        Ok(IdempotencyGate::Mismatch) => {
             return ApiError::idempotency_conflict(
                 "Idempotency-Key reused with a different request body",
             )
             .into_response()
         }
-        Err(error) => {
+        Err(IdempotencyGateError::InvalidKey) => {
+            return bad_request("invalid Idempotency-Key header")
+        }
+        Err(IdempotencyGateError::Reserve(error)) => {
             tracing::error!(%error, "Failed to reserve idempotency key");
             return internal_error("Failed to reserve idempotency key");
         }
-    }
-    let response = match std::panic::AssertUnwindSafe(handler(Some(Arc::clone(&journal))))
+    };
+    // A panicking handler, or a response that cannot be buffered, drops
+    // `run`; its guard releases the key unless admission became durable.
+    let response = match std::panic::AssertUnwindSafe(handler(Some(run.admission())))
         .catch_unwind()
         .await
     {
@@ -656,10 +649,7 @@ where
         Err(_) => return internal_error("Request handler failed"),
     };
     if response.status().is_server_error() {
-        // Layer 2 retains a barrier if admission compensation is unfinished.
-        if let Err(error) = journal.release() {
-            tracing::error!(%error, "Failed to release idempotency reservation");
-        }
+        run.finish(IdempotentResult::ServerError);
         return response;
     }
     let (parts, body) = response.into_parts();
@@ -671,17 +661,10 @@ where
         Ok(body) => body,
         Err(_) => return internal_error("Invalid JSON response encoding"),
     };
-    match journal.complete(parts.status.as_u16(), body) {
-        Ok(true) => {}
-        Ok(false) => {
-            tracing::warn!("Idempotency reservation was no longer held when completing");
-        }
-        Err(error) => {
-            // The reservation guard keeps an admitted request's recorded
-            // response; the work itself has already been accepted.
-            tracing::error!(%error, "Failed to save idempotent response");
-        }
-    }
+    run.finish(IdempotentResult::Final {
+        status: parts.status.as_u16(),
+        body,
+    });
     Response::from_parts(parts, axum::body::Body::from(bytes))
 }
 

@@ -1112,7 +1112,8 @@ async fn open_control_board_mid_step_does_not_cancel_container() {
         Arc::new(Mutex::new(None));
 
     let factory = BlockingFactory::new([(cancel_flag.clone(), completion1.clone())]);
-    let (mut engine, container_exits) = make_capturing_engine(
+    let execution_count = factory.execution_count.clone();
+    let (mut engine, container_exits, boards) = make_capturing_engine(
         &session,
         workflow,
         factory,
@@ -1128,12 +1129,15 @@ async fn open_control_board_mid_step_does_not_cancel_container() {
 
     let engine_task = tokio::spawn(async move { engine.run_to_completion().await });
 
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    wait_for_execution_count(&execution_count, 1).await;
     tx.send(EngineRequest::OpenControlBoard {
         step_name: String::new(),
     })
     .unwrap();
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    wait_for_boards(&boards, 1).await;
+    // Deliberate "nothing happens" window: a (wrong) cancel would follow
+    // the Dismiss at once.
+    tokio::time::sleep(Duration::from_millis(100)).await;
 
     assert!(
         !cancel_flag.load(Ordering::Relaxed),
@@ -1167,7 +1171,8 @@ async fn mid_step_dismiss_resumes_waiting_on_step() {
     let (cancel_flag, completion) = make_blocking_entry();
     let engine_tx: Arc<Mutex<Option<_>>> = Arc::new(Mutex::new(None));
     let factory = BlockingFactory::new([(cancel_flag.clone(), completion.clone())]);
-    let (mut engine, _container_exits) = make_capturing_engine(
+    let execution_count = factory.execution_count.clone();
+    let (mut engine, _container_exits, boards) = make_capturing_engine(
         &session,
         workflow,
         factory,
@@ -1178,12 +1183,15 @@ async fn mid_step_dismiss_resumes_waiting_on_step() {
 
     let engine_task = tokio::spawn(async move { engine.run_to_completion().await });
 
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    wait_for_execution_count(&execution_count, 1).await;
     tx.send(EngineRequest::OpenControlBoard {
         step_name: String::new(),
     })
     .unwrap();
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    wait_for_boards(&boards, 1).await;
+    // Deliberate "nothing happens" window: a (wrong) cancel would follow
+    // the Dismiss at once.
+    tokio::time::sleep(Duration::from_millis(100)).await;
 
     assert!(!cancel_flag.load(Ordering::Relaxed));
 
@@ -1206,7 +1214,7 @@ async fn mid_step_restart_cancels_then_re_runs() {
     let engine_tx: Arc<Mutex<Option<_>>> = Arc::new(Mutex::new(None));
     let factory = BlockingFactory::new([(cancel_flag.clone(), completion1)]);
     let execution_count = factory.execution_count.clone();
-    let (mut engine, _container_exits) = make_capturing_engine(
+    let (mut engine, _container_exits, _boards) = make_capturing_engine(
         &session,
         workflow,
         factory,
@@ -1217,12 +1225,12 @@ async fn mid_step_restart_cancels_then_re_runs() {
 
     let engine_task = tokio::spawn(async move { engine.run_to_completion().await });
 
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    wait_for_execution_count(&execution_count, 1).await;
     tx.send(EngineRequest::OpenControlBoard {
         step_name: String::new(),
     })
     .unwrap();
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    wait_for_flag(&cancel_flag, "the restart to cancel the running step").await;
 
     assert!(cancel_flag.load(Ordering::Relaxed));
 
@@ -1245,7 +1253,7 @@ async fn mid_step_advance_cancels_then_marks_force_succeeded() {
     let engine_tx: Arc<Mutex<Option<_>>> = Arc::new(Mutex::new(None));
     let factory = BlockingFactory::new([(cancel_flag.clone(), completion1)]);
     let execution_count = factory.execution_count.clone();
-    let (mut engine, container_exits) = make_capturing_engine(
+    let (mut engine, container_exits, _boards) = make_capturing_engine(
         &session,
         workflow,
         factory,
@@ -1256,12 +1264,13 @@ async fn mid_step_advance_cancels_then_marks_force_succeeded() {
 
     let engine_task = tokio::spawn(async move { engine.run_to_completion().await });
 
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    wait_for_execution_count(&execution_count, 1).await;
     tx.send(EngineRequest::OpenControlBoard {
         step_name: String::new(),
     })
     .unwrap();
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // "b" launches only once "a" was killed and reported as such.
+    wait_for_execution_count(&execution_count, 2).await;
 
     assert!(cancel_flag.load(Ordering::Relaxed));
     assert_eq!(
@@ -1298,8 +1307,8 @@ async fn step_stuck_in_yolo_mode_starts_countdown() {
     struct YoloTrackingFrontend {
         actions: Mutex<VecDeque<NextAction>>,
         engine_tx: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<EngineRequest>>>>,
-        yolo_started: AtomicBool,
-        yolo_finished: AtomicBool,
+        yolo_started: Arc<AtomicBool>,
+        yolo_finished: Arc<AtomicBool>,
     }
     impl crate::data::message::UserMessageSink for YoloTrackingFrontend {
         fn write_message(&mut self, _: crate::data::message::UserMessage) {}
@@ -1345,18 +1354,20 @@ async fn step_stuck_in_yolo_mode_starts_countdown() {
         }
     }
 
+    let yolo_finished = Arc::new(AtomicBool::new(false));
     let frontend = YoloTrackingFrontend {
         // WCB is shown after last step completes in yolo mode.
         actions: Mutex::new(VecDeque::from([NextAction::FinishWorkflow])),
         engine_tx: engine_tx.clone(),
-        yolo_started: AtomicBool::new(false),
-        yolo_finished: AtomicBool::new(false),
+        yolo_started: Arc::new(AtomicBool::new(false)),
+        yolo_finished: yolo_finished.clone(),
     };
 
     let factory = BlockingFactory::new([
         (cancel_flag_a.clone(), completion_a.clone()),
         (_cancel_flag_b.clone(), completion_b.clone()),
     ]);
+    let execution_count = factory.execution_count.clone();
     let mut engine = WorkflowEngine::new(
         &session,
         WorkflowSpec::new(workflow).with_work_item_context(None),
@@ -1372,19 +1383,19 @@ async fn step_stuck_in_yolo_mode_starts_countdown() {
 
     let engine_task = tokio::spawn(async move { engine.run_to_completion().await });
 
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    wait_for_execution_count(&execution_count, 1).await;
     tx.send(EngineRequest::StepStuck {
         step_name: String::new(),
     })
     .unwrap();
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    wait_for_flag(&yolo_finished, "the cancelled countdown to finish").await;
 
     // Countdown was cancelled by the frontend (YoloTickOutcome::Cancel),
     // so step "a" keeps running. Complete it normally.
     signal_completion(&completion_a, 0);
 
     // Yolo auto-advances to step "b". Complete it.
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    wait_for_execution_count(&execution_count, 2).await;
     signal_completion(&completion_b, 0);
 
     let result = engine_task.await.unwrap().unwrap();
@@ -1404,8 +1415,9 @@ async fn step_stuck_in_non_yolo_mode_shows_wcb() {
     let (cancel_flag, completion) = make_blocking_entry();
     let engine_tx: Arc<Mutex<Option<_>>> = Arc::new(Mutex::new(None));
     let factory = BlockingFactory::new([(cancel_flag.clone(), completion.clone())]);
+    let execution_count = factory.execution_count.clone();
     // When WCB opens due to stuck: Dismiss, then later LaunchNext between steps.
-    let (mut engine, _container_exits) = make_capturing_engine(
+    let (mut engine, _container_exits, boards) = make_capturing_engine(
         &session,
         workflow,
         factory,
@@ -1418,12 +1430,15 @@ async fn step_stuck_in_non_yolo_mode_shows_wcb() {
 
     let engine_task = tokio::spawn(async move { engine.run_to_completion().await });
 
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    wait_for_execution_count(&execution_count, 1).await;
     tx.send(EngineRequest::StepStuck {
         step_name: String::new(),
     })
     .unwrap();
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    wait_for_boards(&boards, 1).await;
+    // Deliberate "nothing happens" window: a (wrong) cancel would follow
+    // the Dismiss at once.
+    tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Step still running (Dismiss was chosen).
     assert!(!cancel_flag.load(Ordering::Relaxed));
@@ -1458,6 +1473,7 @@ async fn step_unstuck_during_yolo_countdown_keeps_step_running() {
         actions: Mutex<VecDeque<NextAction>>,
         engine_tx: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<EngineRequest>>>>,
         step_statuses: Mutex<Vec<(String, WorkflowStepStatus)>>,
+        ticks: Arc<AtomicUsize>,
     }
     impl crate::data::message::UserMessageSink for UnstuckTestFrontend {
         fn write_message(&mut self, _: crate::data::message::UserMessage) {}
@@ -1482,6 +1498,7 @@ async fn step_unstuck_during_yolo_countdown_keeps_step_running() {
             _: Duration,
             _: Duration,
         ) -> Result<YoloTickOutcome, EngineError> {
+            self.ticks.fetch_add(1, Ordering::Relaxed);
             Ok(YoloTickOutcome::Continue)
         }
         fn confirm_resume(&mut self, _: &ResumeMismatch) -> Result<bool, EngineError> {
@@ -1500,16 +1517,19 @@ async fn step_unstuck_during_yolo_countdown_keeps_step_running() {
             }
         }
     }
+    let ticks = Arc::new(AtomicUsize::new(0));
     let frontend = UnstuckTestFrontend {
         actions: Mutex::new(VecDeque::from([NextAction::FinishWorkflow])),
         engine_tx: engine_tx.clone(),
         step_statuses: Mutex::new(Vec::new()),
+        ticks: ticks.clone(),
     };
 
     let factory = BlockingFactory::new([
         (cancel_flag_a.clone(), completion_a.clone()),
         (_cancel_flag_b.clone(), completion_b.clone()),
     ]);
+    let execution_count = factory.execution_count.clone();
     let mut engine = WorkflowEngine::new(
         &session,
         WorkflowSpec::new(workflow).with_work_item_context(None),
@@ -1526,22 +1546,29 @@ async fn step_unstuck_during_yolo_countdown_keeps_step_running() {
     let engine_task = tokio::spawn(async move { engine.run_to_completion().await });
 
     // Let the step launch.
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    wait_for_execution_count(&execution_count, 1).await;
     // Kick off the yolo countdown.
     tx.send(EngineRequest::StepStuck {
         step_name: String::new(),
     })
     .unwrap();
     // Let the countdown run a tick or two without expiring.
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while ticks.load(Ordering::Relaxed) < 2 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the countdown never ticked"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     // Container produced output again — recovery signal.
     tx.send(EngineRequest::StepUnstuck {
         step_name: String::new(),
     })
     .unwrap();
-    // Wait long enough that, if the engine were mistakenly advancing the
-    // step on Unstuck, step "b" would have launched. Cancel-flag-a must
-    // still be false (step "a" still running, NOT cancelled by Advanced).
+    // Deliberate "nothing happens" window: if the engine were mistakenly
+    // advancing the step on Unstuck, step "b" would launch in it. Cancel-flag-a
+    // must still be false (step "a" still running, NOT cancelled by Advanced).
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(
         !cancel_flag_a.load(Ordering::Relaxed),
@@ -1550,7 +1577,7 @@ async fn step_unstuck_during_yolo_countdown_keeps_step_running() {
 
     // Now complete step "a" normally; workflow proceeds.
     signal_completion(&completion_a, 0);
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    wait_for_execution_count(&execution_count, 2).await;
     signal_completion(&completion_b, 0);
 
     let result = engine_task.await.unwrap().unwrap();
@@ -1570,7 +1597,8 @@ async fn step_unstuck_outside_countdown_is_ignored() {
     let (_, completion) = make_blocking_entry();
     let engine_tx: Arc<Mutex<Option<_>>> = Arc::new(Mutex::new(None));
     let factory = BlockingFactory::new([(Arc::new(AtomicBool::new(false)), completion.clone())]);
-    let (mut engine, _container_exits) = make_capturing_engine(
+    let execution_count = factory.execution_count.clone();
+    let (mut engine, _container_exits, _boards) = make_capturing_engine(
         &session,
         workflow,
         factory,
@@ -1582,12 +1610,14 @@ async fn step_unstuck_outside_countdown_is_ignored() {
 
     let engine_task = tokio::spawn(async move { engine.run_to_completion().await });
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    wait_for_execution_count(&execution_count, 1).await;
     // Send StepUnstuck when there's no countdown — should be harmlessly ignored.
     tx.send(EngineRequest::StepUnstuck {
         step_name: String::new(),
     })
     .unwrap();
+    // Deliberate "nothing happens" window: let the engine see the stray
+    // StepUnstuck while "a" is still running.
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     signal_completion(&completion, 0);

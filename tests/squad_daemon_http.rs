@@ -29,6 +29,10 @@ use awman::engine::overlay::OverlayEngine;
 use awman::engine::squad::{EvaluationOutcome, EvaluationRequest, TaskEvaluator};
 use tokio::sync::Mutex;
 
+#[path = "helpers/in_process_daemon.rs"]
+mod in_process_daemon;
+use in_process_daemon::{EnvOverride, InProcessDaemon};
+
 static ENV_LOCK: Mutex<()> = Mutex::const_new(());
 
 struct NeverTriggeredEvaluator;
@@ -59,14 +63,14 @@ fn engines_with(container_runtime: Arc<ContainerRuntime>, root: &std::path::Path
 }
 
 /// Sets `AWMAN_CONFIG_HOME` to `root`, starts the daemon in a background
-/// task, and polls for its published metadata. Returns the task handle and
-/// the resolved `http://127.0.0.1:<port>` base URL. Restores the previous
-/// env var value once metadata has been read (the daemon itself already
-/// captured its own `EnvSnapshot` by then).
+/// task, and polls for its published metadata. Returns the daemon and the
+/// resolved `http://127.0.0.1:<port>` base URL. The previous env var value is
+/// restored only once the daemon is aborted (or dropped by a panicking test):
+/// the daemon resolves paths from it while it serves.
 async fn start_daemon(
     root: &std::path::Path,
     container_runtime: Arc<ContainerRuntime>,
-) -> (tokio::task::JoinHandle<()>, String) {
+) -> (InProcessDaemon, String) {
     start_daemon_with(root, container_runtime, Arc::new(NeverTriggeredEvaluator)).await
 }
 
@@ -76,7 +80,7 @@ async fn start_daemon_with(
     root: &std::path::Path,
     container_runtime: Arc<ContainerRuntime>,
     evaluator: Arc<dyn TaskEvaluator>,
-) -> (tokio::task::JoinHandle<()>, String) {
+) -> (InProcessDaemon, String) {
     // A test daemon must never reach the developer's real OS keychain. The
     // stored item is a single fixed `awman-squad`/`daemon-env` pair — it is not
     // keyed by storage root — so an isolated `AWMAN_CONFIG_HOME` does *not*
@@ -95,8 +99,7 @@ async fn start_daemon_with(
         dangerously_skip_auth: true,
     };
 
-    let previous = std::env::var("AWMAN_CONFIG_HOME").ok();
-    std::env::set_var("AWMAN_CONFIG_HOME", root);
+    let env = EnvOverride::set(&[("AWMAN_CONFIG_HOME", root.as_os_str())]);
 
     // WI 0113 F-02: Layer 2 bootstraps the daemon, Layer 3 serves it. This is
     // the same seam `serve_with` was, split across the layer boundary.
@@ -124,13 +127,8 @@ async fn start_daemon_with(
         waited += Duration::from_millis(50);
     };
 
-    match previous {
-        Some(v) => std::env::set_var("AWMAN_CONFIG_HOME", v),
-        None => std::env::remove_var("AWMAN_CONFIG_HOME"),
-    }
-
     (
-        handle,
+        InProcessDaemon::new(handle, env),
         format!("{}://{}:{}", meta.scheme, meta.bind_ip, meta.port),
     )
 }
@@ -540,9 +538,7 @@ fn seed_task_for_agent(root: &std::path::Path, name: &str, overlays: &[&str], ag
 /// Start the daemon with bearer auth **on**, returning the plaintext key.
 /// `AuthMode::resolve_for_daemon` demands a hash already on disk, so one is
 /// written before the bootstrap — exactly what `squad start` does for itself.
-async fn start_daemon_with_auth(
-    root: &std::path::Path,
-) -> (tokio::task::JoinHandle<()>, String, String) {
+async fn start_daemon_with_auth(root: &std::path::Path) -> (InProcessDaemon, String, String) {
     let key = awman::engine::auth::ApiKey::from_string(
         "d0d0cafe00000000000000000000000000000000000000000000000000000000",
     );
@@ -563,8 +559,7 @@ async fn start_daemon_with_auth(
         port: 0,
         dangerously_skip_auth: false,
     };
-    let previous = std::env::var("AWMAN_CONFIG_HOME").ok();
-    std::env::set_var("AWMAN_CONFIG_HOME", root);
+    let env = EnvOverride::set(&[("AWMAN_CONFIG_HOME", root.as_os_str())]);
     let handle = tokio::spawn(async move {
         let handles =
             SquadDaemonHandles::bootstrap(config, engines, Arc::new(NeverTriggeredEvaluator))
@@ -573,11 +568,11 @@ async fn start_daemon_with_auth(
         let _ = awman::frontend::squad::serve(handles).await;
     });
     let base = wait_for_endpoint(root).await;
-    match previous {
-        Some(v) => std::env::set_var("AWMAN_CONFIG_HOME", v),
-        None => std::env::remove_var("AWMAN_CONFIG_HOME"),
-    }
-    (handle, base, key.as_str().to_string())
+    (
+        InProcessDaemon::new(handle, env),
+        base,
+        key.as_str().to_string(),
+    )
 }
 
 /// Poll the daemon's endpoint sidecar until it publishes one.

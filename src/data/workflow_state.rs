@@ -157,8 +157,20 @@ pub struct WorkflowState {
     /// How many times each main step has been launched (WI 0137 §5): the
     /// 1-based `step_attempt` of its latest launch. Additive; persisted so a
     /// run resumed after a daemon restart keeps counting from here.
+    ///
+    /// This is a recorded engine fact, not a computed view field: WI 0137
+    /// requires `step_attempt` to restart "from the saved state's count"
+    /// after a restart, which only the persisted state can supply. State
+    /// files without it load with an empty map, and older binaries ignore
+    /// it (no `deny_unknown_fields`), so the schema version is unchanged.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub step_attempts: HashMap<String, u32>,
+    /// The runtime container **name** of each main step's latest launch:
+    /// the same value events carry in `source.container` (WI 0137 §5/§6).
+    /// Kept after the step finishes so a client can correlate a finished
+    /// step with its events. Additive, like `step_attempts`.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub step_containers: HashMap<String, String>,
 }
 
 /// Group steps into stages by topological depth.
@@ -257,6 +269,7 @@ impl WorkflowState {
             teardown_step_states: Vec::new(),
             cancelled_at: None,
             step_attempts: HashMap::new(),
+            step_containers: HashMap::new(),
         }
     }
 
@@ -276,6 +289,17 @@ impl WorkflowState {
         let attempt = self.step_attempts.entry(step_name.to_string()).or_insert(0);
         *attempt += 1;
         *attempt
+    }
+
+    /// The runtime container name of the step's latest launch, if any.
+    pub fn step_container(&self, step_name: &str) -> Option<&str> {
+        self.step_containers.get(step_name).map(String::as_str)
+    }
+
+    /// Record the runtime container name of the step's current launch.
+    pub fn record_step_container(&mut self, step_name: &str, container_name: &str) {
+        self.step_containers
+            .insert(step_name.to_string(), container_name.to_string());
     }
 
     /// The main steps grouped into stages by dependency depth, as step names.
@@ -434,6 +458,7 @@ impl WorkflowState {
             self.step_states.remove(name);
             self.completed_steps.remove(name);
             self.step_attempts.remove(name);
+            self.step_containers.remove(name);
         }
         self.steps.retain(|s| !dropped.contains(&s.name));
         if !dropped.is_empty() {
@@ -619,6 +644,44 @@ mod tests {
         let j = serde_json::to_string(&s).unwrap();
         let back: WorkflowState = serde_json::from_str(&j).unwrap();
         assert_eq!(s, back);
+    }
+
+    /// WI 0137: a state file written before `step_attempts` /
+    /// `step_containers` existed still loads, with empty maps.
+    #[test]
+    fn pre_0137_state_file_loads_without_launch_records() {
+        let steps = vec![step("a", &[])];
+        let s = WorkflowState::new("wf".into(), &steps, "h".into(), None);
+        let mut v = serde_json::to_value(&s).unwrap();
+        let obj = v.as_object_mut().unwrap();
+        obj.remove("step_attempts");
+        obj.remove("step_containers");
+        let back: WorkflowState = serde_json::from_value(v).unwrap();
+        assert!(back.step_attempts.is_empty());
+        assert!(back.step_containers.is_empty());
+        assert_eq!(back.step_attempt("a"), None);
+    }
+
+    /// WI 0137: the launch records round-trip, are omitted when empty (so an
+    /// unlaunched state file is byte-for-byte the pre-0137 shape), and a file
+    /// carrying fields this binary does not know still loads.
+    #[test]
+    fn launch_records_round_trip_and_unknown_fields_are_tolerated() {
+        let steps = vec![step("a", &[])];
+        let mut s = WorkflowState::new("wf".into(), &steps, "h".into(), None);
+        let empty = serde_json::to_value(&s).unwrap();
+        assert!(empty.get("step_attempts").is_none());
+        assert!(empty.get("step_containers").is_none());
+
+        assert_eq!(s.record_step_launch("a"), 1);
+        assert_eq!(s.record_step_launch("a"), 2);
+        s.record_step_container("a", "awman-a-2");
+        let mut v = serde_json::to_value(&s).unwrap();
+        v["a_future_field"] = serde_json::json!({"x": 1});
+        let back: WorkflowState = serde_json::from_value(v).unwrap();
+        assert_eq!(back.step_attempt("a"), Some(2));
+        assert_eq!(back.step_container("a"), Some("awman-a-2"));
+        assert_eq!(back.schema_version, WORKFLOW_STATE_SCHEMA_VERSION);
     }
 
     #[test]

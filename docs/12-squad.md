@@ -68,10 +68,17 @@ awman squad add \
   --mount-scope gitroot
 ```
 
-When adding a task interactively, awman also asks which workflow prerequisites
-the task may use. For unattended runs, configure the task's prerequisite policy
-with the `--prerequisite-*` flags or the interactive task setup; do not add
-`env(GITHUB_TOKEN)` or `ssh()` just for workflow pushes and pull requests.
+The interactive interview also asks which workflow prerequisites (commit
+identity, SSH key, GitHub token) the task may use; on the command line, set them
+with the `--prerequisite-*` flags. Do not add `env(GITHUB_TOKEN)` or `ssh()`
+overlays just so workflows can push and open pull requests.
+
+Task policies are layered over the global `squad.workflows.prerequisites`
+defaults: a task that changes only its SSH policy still inherits the global
+token sources. Requests that arrive through the squad daemon's HTTP routes obey
+the same global `workflows.prerequisites.allowApiClientGrants` ceiling as API
+requests, and those decisions are rechecked when the task runs. A task
+workspace's `config.json` cannot define trusted prerequisite host commands.
 
 | Flag | Description |
 |------|-------------|
@@ -87,7 +94,7 @@ with the `--prerequisite-*` flags or the interactive task setup; do not add
 | `--prerequisite-ssh <value>` | Set the SSH policy: a key path, `all`, or `deny`. `all` allows the whole SSH directory to be mounted for steps that need SSH. |
 | `--prerequisite-token <value>` | Set the GitHub token policy: `env:NAME`, `acquire` or `deny`. The daemon resolves an allowed source when a workflow needs it. |
 | `--prerequisite-unresolved <warn\|fail>` | Decide whether an unattended run continues with unresolved workflow requirements or fails before workflow execution. |
-| `--interview` | Collect the task fields through the interactive interview, including the multiline description, workspace choice, and overlays. |
+| `--interview` | Collect the task fields through the interactive interview, including the multiline description, workspace choice, and overlays. Needs a terminal: through a pipe, each question fails with "interactive input unavailable" rather than choosing an answer for you. |
 | `-n, --non-interactive` | Never prompt: refuse anything that would need a confirmation instead of asking. Cannot be combined with `--interview`. |
 
 Task names are lowercase slugs: letters `a`–`z`, digits `0`–`9`, and
@@ -375,14 +382,10 @@ Instead, any `awman squad` command that needs a working daemon — `add`,
 daemon already holds against what your current shell can see, and pushes
 anything new or different before doing its own work. Nothing is ever re-sent
 once the daemon already has it: both sides compare a digest, never the value
-itself, so this happens on every command at effectively no cost once your
-shell is caught up. The digest is a salted hash the daemon publishes per name
-it holds, over the daemon's authenticated local socket; it is what lets a
-client tell "the daemon already has this exact value" from "it has a different
-one" without either side putting a secret on the wire. This is why exporting a
-variable and then running *any*
-squad command — not just `awman squad env --push` — is enough for the daemon
-to pick it up on the very next command that reaches it.
+itself (a salted per-name hash served over the daemon's authenticated local
+socket), so once your shell is caught up this costs nothing and no secret
+crosses the wire. Exporting a variable and then running *any* squad command —
+not just `awman squad env --push` — is enough for the daemon to pick it up.
 
 The one exception is `awman squad status`: it's a lightweight liveness probe
 and deliberately pushes nothing, so checking status never has the side effect
@@ -764,18 +767,11 @@ seconds:
 | Blue | Reachable, and a task is executing right now |
 | Green | Reachable, nothing failed, nothing running, nothing unmet |
 
-Red wins over blue when both apply: a failure needs attention and persists,
-while a running task is transient. An unmet variable ranks below a failure
-but above a running task, for the same reason: it needs attention and
-persists across ticks. Yellow is deliberately shared between "can't reach
-the daemon" and "some task has an unmet variable" — both mean "worth a
-look, not broken" — and the two can never actually coincide, since an
-unreachable daemon has no way to report what's unmet in the first place. A
-persisted-storage fallback (see [Persisting values across a
-restart](#persisting-values-across-a-restart)) never turns this indicator
-yellow by itself — only an actual unmet name does — because that fallback is
-the ordinary steady state on headless Linux and on Windows, and a
-permanently yellow indicator would just teach you to ignore it. The
+The first matching row wins from the top: a failure outranks an
+unmet variable, which outranks a running task. Yellow means "worth a look, not
+broken" in both of its cases, which can never coincide. A keychain fallback
+(see [Persisting values across a restart](#persisting-values-across-a-restart))
+never turns the indicator yellow by itself; only an unmet name does. The
 indicator is only a summary — open the squad tab (or run `awman squad list`
 / `awman squad env`) to see which task or name.
 
@@ -853,15 +849,14 @@ moment earlier), the session ends and the client's exit code and final output
 are written to the tab's status log, so a failed attach explains itself
 rather than silently returning to the task grid.
 
-Attach works on both runtimes, through different plumbing with the same
-semantics. On **docker**, attach is a native `docker attach` to the agent's
-TTY. Apple's `container` CLI has no attach verb, so on **apple-containers**
-the awman process that launched the agent (the squad daemon, for squad tasks)
+Attach has the same semantics on every supported runtime. On **docker**, it is a
+native `docker attach` to the agent's TTY. On **apple-containers** and
+**builtin-experimental**, which have no attach verb, the awman process that launched the agent (the squad daemon, for squad tasks)
 serves the agent's live terminal on a local, user-private socket, and attach
 connects to that. Either way you reach the real agent TUI, several clients
 can attach at once, and detaching never stops the container.
 
-The one Apple-specific caveat: the launching process is the only holder of
+The caveat on those two runtimes: the launching process is the only holder of
 the agent's terminal there, so if it has exited (say, the daemon was
 restarted mid-run), attach reports that there is no live attach endpoint —
 the agent's per-run log file still has everything it printed.
@@ -920,7 +915,7 @@ guardrails to every run rather than leaving them optional:
   Every squad command — including daemon lifecycle commands such as `start`,
   `stop`, and `logs`, task commands, and the TUI — fails with a clear error
   naming the configured runtime rather than degrading silently.
-  Set `runtime` to `docker` or `apple-containers` to use squad.
+  Use `docker`, `apple-containers` or `builtin-experimental` (below) instead.
 - **The experimental builtin runtime (`builtin-experimental`, Apple Silicon) works with squad, with limits.** Squad discovers and attaches to its agents by name and label as on the other runtimes, and its tasks need imported images. Squad image checks are import-only like workflow preflight: they may re-acquire an image installed from a different source than the one now configured, but never build; use `awman ready` to perform an opted-in source-matched build before starting tasks. Like Apple Containers, a builtin session can be reattached only while the awman process that launched it (the squad daemon, for squad tasks) is still running; if the daemon exits, the agent VMs it launched stop with it. On macOS the squad daemon runs in the background under launchd, so macOS may ask for folder access again after every awman upgrade if a task's workspace is under `~/Desktop`, `~/Documents` or another protected folder; see [The macOS binary, Gatekeeper and permissions](11-runtimes.md#the-macos-binary-gatekeeper-and-permissions). See [Runtimes: Builtin microVM](11-runtimes.md#builtin-microvm-experimental).
 
 ---
@@ -1004,7 +999,7 @@ for the same guarantee from the API server's side.
 ```sh
 awman squad start              # explicit start (usually unnecessary — see above)
 awman squad status             # liveness and PID
-awman squad logs               # the daemon's log output
+awman squad logs               # the daemon's log output (-f to follow)
 awman squad stop               # alias: awman squad kill
 ```
 
@@ -1069,7 +1064,7 @@ used when a container launches:
 ERROR squad setup step failed task=nightly run_id=… step=clone_repo exit_code=128 log_path=/home/you/.awman/squad/tasks/nightly/runs/…/setup-1-clone-repo.log
 ```
 
-A failed evaluation's error text (as shown by `awman squad runs <name>` and
+A failed evaluation's error text (as shown by `awman squad show <name>` and
 by the task detail modal in the TUI) ends with the leader's log path for the
 same reason, and a failed run's closing `squad task run finished` line names
 the run directory even when the failure happened before any step ran.
@@ -1273,5 +1268,3 @@ tell what your squad is doing versus what you started yourself. See
 ---
 
 [← Runtimes](11-runtimes.md) · [Next: Cleaning Up →](13-cleaning-up.md)
-
-Squad credential defaults come from global `squad.workflows.prerequisites`, under explicit task decisions. Other global token sources remain inherited when a task changes only SSH policy. Requests through squad routes obey the same global `allowApiClientGrants` ceiling as API requests, and remote decisions are rechecked when the task runs. Task workspace config files cannot define trusted prerequisite host commands.

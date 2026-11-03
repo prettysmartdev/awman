@@ -295,6 +295,18 @@ impl DynamicWorkflowsConfig {
     }
 }
 
+/// Shared domain constraint for `maxConcurrentAgents` in either scope. The
+/// global and repo loaders and `config set` all call this one check, so the
+/// editor can never accept or word a value differently from loading.
+pub(crate) fn validate_max_concurrent_agents(value: Option<usize>) -> Result<(), DataError> {
+    if value == Some(0) {
+        return Err(DataError::Other(
+            "maxConcurrentAgents must be >= 1".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Shared domain constraint for the dynamic-workflow concurrency limit.
 pub(crate) fn validate_dynamic_max_concurrent_steps(
     field_path: &str,
@@ -645,13 +657,7 @@ impl RepoConfig {
         {
             block.validate(key.path())?;
         }
-        if let Some(n) = self.max_concurrent_agents {
-            if n < 1 {
-                return Err(DataError::Other(
-                    "maxConcurrentAgents must be >= 1".to_string(),
-                ));
-            }
-        }
+        validate_max_concurrent_agents(self.max_concurrent_agents)?;
         if let Some(auth_refresh) = &self.auth_refresh {
             validate_auth_refresh(auth_refresh)?;
         }

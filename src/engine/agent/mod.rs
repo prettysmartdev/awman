@@ -225,6 +225,42 @@ fn resolve_agent_flags(session: &Session, agent: &AgentName, run: &AgentRunOptio
     }
 }
 
+/// `run` with the session's effective `yoloDisallowedTools` added to its
+/// disallowed-tools list when the run is a `--yolo` launch. Any other run, or
+/// an empty configured list, is returned unchanged (borrowed).
+///
+/// An agent that cannot deliver a disallowed-tools list on `paradigm` is
+/// refused with [`EngineError::YoloDisallowedToolsUnsupported`] — the same
+/// fail-closed rule as an explicit list, but naming the config key the list
+/// came from.
+fn with_yolo_disallowed_tools<'a>(
+    session: &Session,
+    def: &AgentDefinition,
+    run: &'a AgentRunOptions,
+    paradigm: RunParadigm,
+) -> Result<std::borrow::Cow<'a, AgentRunOptions>, EngineError> {
+    use std::borrow::Cow;
+    if !matches!(run.yolo, Some(YoloMode::Enabled)) {
+        return Ok(Cow::Borrowed(run));
+    }
+    let configured = session.effective_config().yolo_disallowed_tools();
+    if configured.is_empty() {
+        return Ok(Cow::Borrowed(run));
+    }
+    def.validate_tool_restrictions(&[], &configured, paradigm)
+        .map_err(|_| EngineError::YoloDisallowedToolsUnsupported {
+            agent: def.name.clone(),
+            tools: configured.clone(),
+        })?;
+    let mut merged = run.clone();
+    for tool in configured {
+        if !merged.disallowed_tools.contains(&tool) {
+            merged.disallowed_tools.push(tool);
+        }
+    }
+    Ok(Cow::Owned(merged))
+}
+
 #[derive(Clone)]
 pub struct AgentEngine {
     overlay_engine: Arc<OverlayEngine>,
@@ -550,6 +586,9 @@ impl AgentEngine {
         credentials: &AgentCredentials,
     ) -> Result<Vec<ContainerOption>, EngineError> {
         let def = self.resolve_definition(session, agent)?;
+        // A `--yolo` launch carries the configured `yoloDisallowedTools`.
+        let yolo_run = with_yolo_disallowed_tools(session, &def, run, RunParadigm::Container)?;
+        let run: &AgentRunOptions = &yolo_run;
         // Plan-mode support, ACP support and the plan/yolo conflict are all
         // definition facts, checked identically on both paradigms.
         def.validate_run(run, RunParadigm::Container)?;
@@ -851,6 +890,8 @@ impl AgentEngine {
         // check is still refused as `NotImplemented` (WI 0089) rather than
         // silently launching in the wrong (stdio) mode — lives in
         // `validate_run` behind the `RunParadigm` it is given.
+        let yolo_run = with_yolo_disallowed_tools(session, &def, run, RunParadigm::Sandbox)?;
+        let run: &AgentRunOptions = &yolo_run;
         def.validate_run(run, RunParadigm::Sandbox)?;
 
         let mut options = vec![
@@ -2231,8 +2272,13 @@ mod tests {
         );
     }
 
-    // Scenario 4: project image present, agent Dockerfile absent → download
-    // attempted (fails without network) and a failed status is reported.
+    // Scenario 4: project image present, agent Dockerfile absent → the
+    // download is refused (unit tests are always under test isolation), the
+    // bundled template is provisioned instead, and the build of the missing
+    // agent image then fails — docker is unavailable under isolation, and with
+    // AWMAN_TEST_DOCKER the image's FROM (a project tag never built) cannot
+    // resolve — so a failed "Building image" status is reported and the call
+    // errors.
     #[tokio::test]
     async fn ensure_available_reports_failed_status_when_dockerfile_missing() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2249,15 +2295,33 @@ mod tests {
             })
             .await;
 
-        // In a test environment the download will fail (no network or the URL
-        // returns an error); we just need to verify the engine handled it
-        // gracefully (no panic) and reported something.
-        // The result may be Ok (download failed but is non-fatal in some paths)
-        // or Err; both are acceptable as long as the engine doesn't panic.
-        let _ = result;
-        // At minimum there should be some status activity.
-        // (We assert the engine completed without panicking — that's the
-        // key invariant for this scenario.)
+        assert!(
+            result.is_err(),
+            "a failed agent image build must surface as an error"
+        );
+        let dockerfile =
+            crate::data::repo_dockerfile_paths::RepoDockerfilePaths::new(session.git_root())
+                .agent_dockerfile("claude");
+        let provisioned = std::fs::read_to_string(&dockerfile)
+            .expect("the missing Dockerfile is provisioned from the bundled template");
+        assert!(
+            provisioned.contains(&project_tag),
+            "the template's base image is the project image: {provisioned}"
+        );
+        let building: Vec<_> = frontend
+            .statuses
+            .iter()
+            .filter(|(step, _)| step == "Building image")
+            .map(|(_, status)| status)
+            .collect();
+        assert!(
+            matches!(building.first(), Some(StepStatus::Running)),
+            "{building:?}"
+        );
+        assert!(
+            matches!(building.last(), Some(StepStatus::Failed(_))),
+            "the build failure is reported as a failed status: {building:?}"
+        );
     }
 
     // ─── WI-0087: build_options single emitter ────────────────────────────────
@@ -3578,6 +3642,136 @@ mod tests {
             AgentEngine::new(Arc::new(overlay), Arc::new(runtime)),
             session,
         )
+    }
+
+    // ─── yoloDisallowedTools ─────────────────────────────────────────────────
+
+    fn yolo_run() -> AgentRunOptions {
+        AgentRunOptions {
+            yolo: Some(YoloMode::Enabled),
+            ..Default::default()
+        }
+    }
+
+    fn container_disallowed(opts: &[ContainerOption]) -> Vec<String> {
+        opts.iter()
+            .filter_map(|o| match o {
+                ContainerOption::DisallowedTools(v) => Some(v.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
+
+    #[test]
+    fn yolo_launch_carries_configured_disallowed_tools_and_flag() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, session) = engine_with_repo_config(
+            tmp.path(),
+            r#"{"yoloDisallowedTools": ["Bash", "computer"]}"#,
+        );
+        let claude = AgentName::new("claude").unwrap();
+        let opts = engine
+            .build_options(&session, &claude, &yolo_run())
+            .unwrap();
+        assert_eq!(container_disallowed(&opts), vec!["Bash", "computer"]);
+        assert!(
+            opts.iter().any(|o| matches!(
+                o,
+                ContainerOption::DisallowedToolsFlag(flag) if flag == "--disallowedTools"
+            )),
+            "claude's --disallowedTools flag must be emitted; got {opts:?}"
+        );
+    }
+
+    #[test]
+    fn non_yolo_launch_ignores_yolo_disallowed_tools() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, session) =
+            engine_with_repo_config(tmp.path(), r#"{"yoloDisallowedTools": ["Bash"]}"#);
+        let claude = AgentName::new("claude").unwrap();
+        let opts = engine
+            .build_options(&session, &claude, &AgentRunOptions::default())
+            .unwrap();
+        assert!(container_disallowed(&opts).is_empty());
+        // Codex has no disallowed-tools flag, but outside yolo the list does
+        // not apply, so the launch is not refused.
+        let codex = AgentName::new("codex").unwrap();
+        engine
+            .build_options(&session, &codex, &AgentRunOptions::default())
+            .unwrap();
+    }
+
+    #[test]
+    fn yolo_disallowed_tools_merge_with_explicit_list_without_duplicates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, session) =
+            engine_with_repo_config(tmp.path(), r#"{"yoloDisallowedTools": ["Bash", "Write"]}"#);
+        let claude = AgentName::new("claude").unwrap();
+        let run = AgentRunOptions {
+            disallowed_tools: vec!["Bash".into()],
+            ..yolo_run()
+        };
+        let opts = engine.build_options(&session, &claude, &run).unwrap();
+        assert_eq!(container_disallowed(&opts), vec!["Bash", "Write"]);
+    }
+
+    #[test]
+    fn yolo_with_disallowed_tools_is_refused_for_an_agent_without_the_flag() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, session) =
+            engine_with_repo_config(tmp.path(), r#"{"yoloDisallowedTools": ["Bash"]}"#);
+        let codex = AgentName::new("codex").unwrap();
+        let err = engine
+            .build_options(&session, &codex, &yolo_run())
+            .unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                EngineError::YoloDisallowedToolsUnsupported { agent, tools }
+                    if agent == "codex" && tools == &vec!["Bash".to_string()]
+            ),
+            "got {err:?}"
+        );
+        let message = err.to_string();
+        assert!(message.contains("yoloDisallowedTools (Bash)"), "{message}");
+        assert!(message.contains("--yolo"), "{message}");
+        // The sandbox paradigm refuses it identically.
+        let err = engine
+            .build_sandbox_options(&session, &codex, &yolo_run())
+            .unwrap_err();
+        assert!(
+            matches!(err, EngineError::YoloDisallowedToolsUnsupported { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn empty_repo_yolo_disallowed_tools_lets_any_agent_run_yolo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, session) =
+            engine_with_repo_config(tmp.path(), r#"{"yoloDisallowedTools": []}"#);
+        let codex = AgentName::new("codex").unwrap();
+        let opts = engine.build_options(&session, &codex, &yolo_run()).unwrap();
+        assert!(container_disallowed(&opts).is_empty());
+    }
+
+    #[test]
+    fn sandbox_yolo_launch_carries_configured_disallowed_tools() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, session) =
+            engine_with_repo_config(tmp.path(), r#"{"yoloDisallowedTools": ["Bash"]}"#);
+        let claude = AgentName::new("claude").unwrap();
+        let opts = engine
+            .build_sandbox_options(&session, &claude, &yolo_run())
+            .unwrap();
+        assert!(
+            opts.iter().any(|o| matches!(
+                o,
+                SandboxOption::DisallowedTools(tools) if tools == &vec!["Bash".to_string()]
+            )),
+            "got {opts:?}"
+        );
     }
 
     fn container_agent_flags(opts: &[ContainerOption]) -> Vec<String> {

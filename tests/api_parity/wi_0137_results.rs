@@ -289,6 +289,42 @@ fn every_command_error_variant_has_a_snake_case_code_and_a_known_stage() {
     }
 }
 
+/// WI 0137 §1: one code per variant. Only the lower-layer wrappers
+/// (`Engine`, `Data`) and the untyped `Other` share `internal`; the two
+/// agent-definition engine errors keep their own codes; every other variant
+/// has a code no other variant uses.
+#[test]
+fn every_command_error_variant_has_its_own_code() {
+    let mut owners: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+    for error in &every_variant() {
+        let name = variant_witness(error);
+        let code = error.code();
+        let shared_catch_all = matches!(name, "Engine" | "Data" | "Other") && code == "internal";
+        if shared_catch_all {
+            continue;
+        }
+        assert_ne!(code, "internal", "{name} must have its own code");
+        if let Some(other) = owners.insert(code, name) {
+            assert_eq!(other, name, "code {code} is shared by {other} and {name}");
+        }
+    }
+    // WI 0138's HTTP vocabulary is reused where the conditions overlap.
+    for code in [
+        "unknown_subcommand",
+        "unknown_flag",
+        "forbidden_workdir",
+        "worktree_exists",
+        "merge_conflict",
+        "merge_target_dirty",
+        "workflow_prerequisites_unresolved",
+        "unknown_agent",
+        "agent_untrusted",
+        "aborted",
+    ] {
+        assert!(owners.contains_key(code), "missing {code}: {owners:?}");
+    }
+}
+
 #[test]
 fn command_error_codes_distinguish_the_variants_clients_act_on() {
     let code = |e: CommandError| e.code();
@@ -335,11 +371,14 @@ fn command_error_codes_distinguish_the_variants_clients_act_on() {
         )),
         "agent_untrusted"
     );
-    // Class codes for everything else.
-    assert_eq!(code(CommandError::SessionRepoUrlEmpty), "invalid_request");
+    // One code per variant; only the untyped catch-all is `internal`.
+    assert_eq!(
+        code(CommandError::SessionRepoUrlEmpty),
+        "session_repo_url_empty"
+    );
     assert_eq!(
         code(CommandError::WorkItemNotFound { number: 1 }),
-        "not_found"
+        "work_item_not_found"
     );
     assert_eq!(code(CommandError::Other("x".into())), "internal");
 }
@@ -1106,10 +1145,11 @@ abort_on_failure = true
         assert!(result["failure"].get("step").is_none(), "{result}");
         let message = result["failure"]["message"].as_str().unwrap();
         assert!(message.contains("nosuch"), "{message}");
-        // Legacy fields are filled exactly as before, and agree with `failure`.
+        // Legacy fields are filled exactly as before; `error` equals the message.
         assert_eq!(result["error"], result["failure"]["message"]);
         assert_eq!(result["error_status"], 404);
-        assert_eq!(result["stage"], "preflight");
+        // `stage` keeps its pre-0137 meaning: absent outside prerequisites/push.
+        assert!(result.get("stage").is_none(), "{result}");
         assert_eq!(result["exit_code"], 4);
         assert_eq!(record["exit_code"], 4);
         // The checkout is still reported; nothing ran, so nothing changed.
@@ -1143,7 +1183,7 @@ abort_on_failure = true
         assert_eq!(failure["stage"], "preflight", "{record}");
         assert_eq!(failure["code"], "worktree_exists");
         assert!(record["result"].get("git").is_none());
-        assert_eq!(record["result"]["stage"], "preflight");
+        assert!(record["result"].get("stage").is_none(), "{record}");
         let status = assert_one_final_status(&events_of(&record).await, &record);
         assert_eq!(status["result"]["failure"]["code"], "worktree_exists");
     }
@@ -1249,14 +1289,19 @@ abort_on_failure = true
         assert_eq!(status["status"], "aborted");
     }
 
-    /// Exercise the real 60 s countdown and automatic retry in the normal suite.
+    /// Exercise the real countdown and automatic retry in the normal suite.
+    /// The server runs under test isolation, so the test-only
+    /// `AWMAN_TEST_YOLO_COUNTDOWN_MS` shortens the 60 s countdown; the retry
+    /// path it drives is otherwise the production one.
     #[tokio::test(flavor = "multi_thread")]
     async fn real_git_a_retried_main_step_is_listed_once_with_its_last_attempt() {
         crate::real_git_skip!();
         let home = ApiHome::new();
         home.set_agent(AgentMode::Fail);
         let repo = LocalRepo::new(&home, &[("wf.toml", ONE_STEP)]);
-        let server = home.start().await;
+        let server = home
+            .start_with_env(&[("AWMAN_TEST_YOLO_COUNTDOWN_MS", "500")])
+            .await;
         let id = repo.session(&server).await;
 
         let record = server.run_command(&id, "exec workflow", &["wf.toml"]).await;
@@ -1646,10 +1691,8 @@ exit 0
         let events = events_of(&record).await;
         let status = assert_one_final_status(&events, &record);
         assert_eq!(status["status"], "error");
-        assert!(
-            status["error"].as_str().unwrap().contains("push:"),
-            "{status}"
-        ); // the event keeps its legacy prefix
+        // The event's `error` is exactly the row's `result.error`.
+        assert_eq!(status["error"], result["error"], "{status}");
         assert_eq!(status["result"]["failure"]["stage"], "push");
     }
 
@@ -1782,6 +1825,111 @@ exit 0
             Some(Value::Null),
         )
         .await;
+    }
+
+    // ── restart and resume ───────────────────────────────────────────────────
+
+    const TWO_STEPS: &str = r#"
+[[steps]]
+name = "first"
+agent = "claude"
+prompt = "write the first output"
+
+[[steps]]
+name = "second"
+agent = "claude"
+depends_on = ["first"]
+prompt = "work slowly"
+"#;
+
+    /// WI 0137 §3 and §5 through a real daemon restart: the re-queued workflow
+    /// resumes from its saved state, keeps the outputs of the step it keeps,
+    /// and attributes the rerun step by its definition index (1, though it
+    /// is the first step this attempt launches) with the saved launch count
+    /// continued. The workflow view's `container` is the name events carry.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn real_git_resumed_workflow_keeps_outputs_and_definition_step_indices() {
+        crate::real_git_skip!();
+        let Some(origin) = Origin::start() else {
+            return;
+        };
+        origin.commit_on("main", None, &[("wf.toml", TWO_STEPS)], "workflow");
+        let home = ApiHome::new();
+        home.set_agent(AgentMode::OutputsResume);
+        let mut server = home.start().await;
+        let session = server.ready_session(remote(&origin.url)).await;
+        let id = submit(&server, &session, "exec workflow", &["wf.toml"]).await;
+        wait_slow_agent(&home).await;
+
+        // Crash the daemon while `second` runs; `first` already succeeded and
+        // left an output. The restart re-queues and resumes the workflow.
+        server.kill();
+        for pid in ["slow.child", "slow.pid"] {
+            if let Ok(pid) = std::fs::read_to_string(home.control().join(pid)) {
+                let _ = std::process::Command::new("kill").arg(pid.trim()).status();
+            }
+        }
+        home.set_agent(AgentMode::Edit);
+        let server = home.start().await;
+        let record = wait_status(&server, &id, &["done", "error"]).await;
+        assert_eq!(record["status"], "done", "{record}\n{}", server.log());
+        assert_eq!(record["attempt"], 2, "{record}");
+
+        // The kept step's output survived the restart and the resume.
+        let listing = server.get(&format!("/v1/commands/{id}/outputs")).await;
+        let paths: Vec<&str> = listing["files"]
+            .as_array()
+            .expect("files")
+            .iter()
+            .filter_map(|f| f["path"].as_str())
+            .collect();
+        assert_eq!(paths, ["first/result.json"], "{listing}");
+        let body = reqwest::get(format!(
+            "{}/v1/commands/{id}/outputs/first/result.json",
+            server.url
+        ))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+        assert_eq!(body.trim(), r#"{"step":"first"}"#);
+        assert_eq!(record["result"]["outputs"]["files"], 1, "{record}");
+
+        // Attempt 2 launched only `second`, attributed by its definition index.
+        let events = events_of(&record).await;
+        let resumed: Vec<&Value> = events
+            .iter()
+            .filter(|e| e["attempt"] == 2 && e["source"]["step_name"].is_string())
+            .collect();
+        assert!(!resumed.is_empty(), "{events:#?}");
+        let mut container = None;
+        for event in &resumed {
+            let source = &event["source"];
+            assert_eq!(source["step_name"], "second", "{event}");
+            assert_eq!(source["step_index"], 1, "{event}");
+            assert_eq!(source["step_attempt"], 2, "{event}");
+            if let Some(name) = source["container"].as_str() {
+                container = Some(name.to_string());
+            }
+        }
+        let container = container.expect("a resumed event names its container");
+        let first_attempt_index = events
+            .iter()
+            .filter(|e| e["attempt"] == 1 && e["source"]["step_name"] == "second")
+            .map(|e| &e["source"]["step_index"])
+            .next();
+        assert_eq!(first_attempt_index, Some(&json!(1)));
+
+        // The workflow view agrees with the events, after the step finished.
+        let view = server.get(&format!("/v1/commands/{id}/workflow")).await;
+        let steps = view["steps"].as_array().expect("steps");
+        assert_eq!(steps[0]["status"], "succeeded", "{view}");
+        assert!(steps[0]["container"].is_string(), "{view}");
+        assert_eq!(steps[1]["index"], 1);
+        assert_eq!(steps[1]["status"], "succeeded", "{view}");
+        assert_eq!(steps[1]["step_attempt"], 2, "{view}");
+        assert_eq!(steps[1]["container"], container.as_str(), "{view}");
     }
 }
 

@@ -1409,9 +1409,9 @@ pub(crate) async fn run_leader_yolo_countdown(
 ) -> LeaderCountdownOutcome {
     use crate::engine::agent_runtime::execution::StuckEvent;
     use crate::engine::workflow::actions::YoloTickOutcome;
-    use crate::engine::workflow::timing::YOLO_COUNTDOWN_DURATION;
+    use crate::engine::workflow::timing::yolo_countdown_duration;
 
-    let total = YOLO_COUNTDOWN_DURATION;
+    let total = yolo_countdown_duration();
     let tick = Duration::from_millis(200);
     let mut remaining = total;
     shared

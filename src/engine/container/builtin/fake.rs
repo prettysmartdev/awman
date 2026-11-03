@@ -62,6 +62,7 @@ impl FakeBuiltin {
             owner: "fake-process".into(),
             background_env: Default::default(),
             notices: Default::default(),
+            cancel_grace: super::exec_bridge::DEFAULT_CANCEL_GRACE,
         };
         Self {
             _temp: temp,

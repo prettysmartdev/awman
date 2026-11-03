@@ -4,7 +4,7 @@ A workflow breaks a large implementation task into discrete phases — for examp
 
 Workflows are files you write and commit to your repo — in TOML or YAML format. awman parses them into an execution plan and runs them inside Docker containers, pausing between steps for your input. Optional `setup` and `teardown` sections allow you to prepare the environment before the first step (e.g., installing dependencies, checking out branches) and perform post-workflow actions (e.g., running tests, creating pull requests).
 
-**Migration from Markdown:** Markdown workflow files (`.md`) are no longer supported as of this release. If you have existing Markdown workflows, convert them to TOML or YAML using the format examples below. The conversion is straightforward — all step definitions map directly to TOML/YAML syntax.
+Markdown workflow files (`.md`) are not supported. Convert any you have to TOML or YAML using the examples below; every step definition maps directly.
 
 ---
 
@@ -145,6 +145,18 @@ Any other extension is rejected with:
 unsupported workflow format: expected .toml, .yml, or .yaml
 ```
 
+### Top-level fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `title` | string | Optional label shown at the top of the run. `name` is accepted as an alias |
+| `agent` | string | Default agent for steps that don't set `agent`. Takes precedence over `--agent` and config |
+| `model` | string | Default model for steps that don't set `model`. Takes precedence over `--model` |
+| `overlays` | array of strings | Overlays applied to every agent step — see [Overlays](08-overlays.md) |
+| `teardown_on_failure` | bool | Run teardown even when the workflow fails. Defaults to `false` — see [Teardown on failure](#teardown-on-failure) |
+| `step` (TOML) / `steps` (YAML) | array | The agent steps. TOML also accepts `[[steps]]` |
+| `setup` / `teardown` | array | Optional shell phases — see [Setup and teardown phases](#setup-and-teardown-phases) |
+
 ### Step fields
 
 All steps support the same fields:
@@ -260,7 +272,7 @@ All setup and teardown steps execute inside the project's **base container image
 
 ### Workflow prerequisite checks
 
-Before starting a workflow, awman checks the resources needed by its setup and teardown steps. The check happens before the first agent or step container starts. In an interactive run, awman shows a report and asks before using host credentials. In headless runs, it uses only credentials already available through the selected policy or explicit flags; `--yes` does not grant credentials. If requirements remain unresolved, a headless static workflow fails before launch by default; interactive, dynamic and squad runs warn by default. Set `--prerequisite-unresolved warn` to continue with a warning, or `fail` to stop when a requirement remains missing or needs consent. Dynamic workflows default to warning when a check remains unresolved.
+Before starting a workflow, awman checks the resources needed by its setup and teardown steps. The check happens before the first agent or step container starts. In an interactive run, awman shows a report and asks before using host credentials. In headless runs, it uses only credentials already available through the selected policy or explicit flags; `--yes` does not grant credentials. If requirements remain unresolved, a headless static workflow fails before launch by default; interactive, dynamic and squad runs warn by default. Set `--prerequisite-unresolved warn` to continue with a warning, or `fail` to stop when a requirement remains missing or needs consent.
 
 The requirements depend on the steps and the repository's remote:
 
@@ -298,7 +310,7 @@ Setup steps are defined in a `[[setup]]` (TOML) or `setup:` (YAML) array. Each s
 | `pull_branch` | `remote` (string, optional), `branch` (string, optional) | Pull the latest changes from a remote branch. Equivalent to `git pull <remote> <branch>`. Omit both to use `git pull` with defaults. |
 | `run_shell` | `command` (string, required), `env` (object, optional) | Execute a shell command. `env` is an optional object of environment variables to inject (`{"KEY": "value"}`). |
 | `run_script` | `path` (string, required), `env` (object, optional) | Execute a shell script file (relative to the workdir). `env` is an optional object of environment variables. |
-| `poll_ci` | `interval_secs` (integer, optional), `max_retries` (integer, optional) | Poll GitHub for the CI run status of the current branch. Waits for the CI run to complete. `interval_secs` controls the polling interval in seconds (default: 30). `max_retries` limits the number of polling attempts (default: 10). See [Polling CI status](#polling-ci-status) for details. |
+| `poll_ci` | `interval_secs` (integer, optional, default 30), `max_retries` (integer, optional, default 10) | Wait for GitHub Actions CI on the current HEAD commit to pass. See [Polling CI status](#polling-ci-status). |
 
 Example TOML setup:
 
@@ -336,11 +348,10 @@ Both setup and teardown phases can include a `poll_ci` step to wait for GitHub A
 
 **How it works:**
 
-1. `poll_ci` detects the current Git branch and HEAD commit SHA
-2. Polls GitHub for the CI run associated that commit on that branch
-3. Waits for the run to complete (success or failure) or times out after `max_retries` attempts
-4. Fails the step if CI fails, succeeds if CI succeeds, or times out if no completion within the retry limit
-5. All polling events are logged to the message sink so you can see progress
+1. `poll_ci` reads the current branch and HEAD commit
+2. Every `interval_secs`, it fetches the GitHub Actions runs for that commit on that branch
+3. The step succeeds when CI passes and fails when CI fails, or when no result arrives within `max_retries` attempts
+4. Each attempt is reported (`attempt N/M`) so you can follow progress
 
 **Configuration:**
 
@@ -365,16 +376,16 @@ setup:
 
 **Authentication:**
 
-`poll_ci` uses two strategies in order of preference:
+`poll_ci` runs on the host (not in a container) and queries the GitHub Actions REST API for the `origin` remote. It authenticates with, in order:
 
-1. **GitHub CLI (`gh`)** — if `gh` is installed on the host and authenticated, awman runs it to fetch the most recent run matching the current branch and HEAD commit.
-2. **GitHub REST API** — otherwise, awman uses a token granted for this workflow run. awman can supply a selected `GH_TOKEN` or `GITHUB_TOKEN`, or a token from the configured acquisition methods. If no token is granted and host `gh` is not authenticated, the prerequisite check reports the missing credential before the workflow starts.
+1. **A token granted for this run** — a selected `GH_TOKEN` or `GITHUB_TOKEN`, a pasted token, or one from the configured `acquire` command.
+2. **Your host `gh` login** — when no token was granted and `origin` is on `github.com`, awman borrows the token of an authenticated host `gh`. GitHub Enterprise hosts always need an explicit token grant.
 
-The token is provided only to workflow steps that need it and is redacted from workflow output. See [Workflow prerequisite checks](#workflow-prerequisite-checks) and [Configuration](07-configuration.md#workflow-prerequisites).
+If neither is available, the prerequisite check reports the missing credential before the workflow starts. Tokens are redacted from workflow output. See [Workflow prerequisite checks](#workflow-prerequisite-checks) and [Configuration](07-configuration.md#workflow-prerequisites).
 
 **Handling missing or multiple CI runs:**
 
-Only runs for the current HEAD commit count. Runs for earlier commits on the branch are ignored, so a previous commit's failure is never reported as this commit's result. If the branch was just pushed and GitHub hasn't created a run for HEAD yet, the poll reports "not found" and keeps waiting for the first 3 attempts, then fails if no run has appeared.
+Only runs for the current HEAD commit count. Runs for earlier commits on the branch are ignored, so a previous commit's failure is never reported as this commit's result. If the branch was just pushed and GitHub hasn't created a run for HEAD yet, the poll keeps waiting for the first 3 attempts, then fails with "no CI run found for this branch/commit".
 
 When a commit has several runs:
 
@@ -386,7 +397,7 @@ When a commit has several runs:
 
 When `poll_ci` fails because CI failed, awman fetches the failed jobs, their failed steps and the last 150 log lines of each (up to 3 jobs), and puts them in the failure file the `on_failure` agent reads (see [Step remediation](#step-remediation-with-on_failure)).
 
-After each agent attempt, awman runs the teardown's earlier `commit_changes` and `push_branch` steps again, each with the same credentials it had the first time, and only then polls CI again. The fix commit names the jobs it fixes: a `commit_changes` message of `Implement 0014` becomes `Implement 0014: fix CI jobs lint, test` (or `Implement 0014: fix CI` when the failed jobs could not be fetched). Put both steps before `poll_ci`; if no `push_branch` step precedes it, awman warns that a fix cannot reach CI.
+For a teardown `poll_ci`, after each agent attempt awman re-runs the teardown's earlier `commit_changes` and `push_branch` steps, with the same credentials they had the first time, and only then polls CI again. The fix commit names the jobs it fixes: a `commit_changes` message of `Implement 0014` becomes `Implement 0014: fix CI jobs lint, test` (or `Implement 0014: fix CI` when the failed jobs could not be fetched). Put both steps before `poll_ci`; if no `push_branch` step precedes it, awman warns that a fix cannot reach CI.
 
 ```toml
 [[teardown]]
@@ -403,28 +414,6 @@ max_retries = 20
 [teardown.on_failure]
 prompt = "CI failed. Read the failure file, fix the root cause, and run the failing check locally. Do not push; awman commits and pushes your fix."
 max_attempts = 2
-```
-
-**Example use case:**
-
-A teardown workflow that pushes code, then waits for CI to pass before reporting success:
-
-```toml
-[[teardown]]
-type = "push_branch"
-
-[[teardown]]
-type = "poll_ci"
-interval_secs = 60
-max_retries = 20
-```
-
-```yaml
-teardown:
-  - type: push_branch
-  - type: poll_ci
-    interval_secs: 60
-    max_retries: 20
 ```
 
 ### Step remediation with `on_failure`
@@ -445,7 +434,9 @@ Any setup or teardown step can include an optional `on_failure` block that autom
 3. The agent runs the remediation prompt and has full access to the same workdir as the failed step
 4. After the agent completes (regardless of success), the original step is retried
    - Under `--yolo` (and `--dynamic`, which implies it), a remediation agent that goes quiet gets the same 60-second yolo countdown as any other agent in the workflow. When the countdown expires, the agent is stopped and the step is retried. Esc, Ctrl-W, or fresh output from the agent cancels the countdown and leaves the agent running.
-5. If the retry succeeds, the workflow continues; if the retry still fails and `max_attempts` is exhausted, the step is marked failed and the workflow continues (or stops, depending on the step's `abort_on_failure` setting)
+5. If the retry succeeds, the workflow continues; if the retry still fails and `max_attempts` is exhausted, the step is marked failed and the phase continues (or stops, if the step sets `abort_on_failure`)
+
+No remediation agent starts once the run has been cancelled.
 
 **Configuration:**
 
@@ -589,7 +580,6 @@ max_attempts = 2
 [[teardown]]
 type = "commit_changes"
 message = "Implement feature"
-add_all = true
 
 [[teardown]]
 type = "push_branch"
@@ -615,7 +605,6 @@ teardown:
       max_attempts: 2
   - type: commit_changes
     message: Implement feature
-    add_all: true
   - type: push_branch
   - type: poll_ci
     interval_secs: 60
@@ -635,11 +624,11 @@ Teardown steps are defined in a `[[teardown]]` (TOML) or `teardown:` (YAML) arra
 | Type | Fields | Description |
 |------|--------|-------------|
 | `run_shell` | `command` (string, required), `env` (object, optional) | Execute a shell command. |
-| `run_script` | `path` (string, required), `env` (object, optional) | Execute a shell script file. |
+| `run_script` | `path` (string, required) | Execute a shell script file (relative to the workdir). Unlike the setup form, a teardown `run_script` has no `env` field; use `run_shell` if the script needs variables. |
 | `commit_changes` | `message` (string, required), `add_all` (boolean, optional, default `true`) | Commit the agent's work. By default every change in the working tree is staged first (`git add -A`), except awman's own run state under `.awman/workflows/`. Set `add_all = false` to commit only what is already staged. If there is nothing to commit (for example, the agent already committed its own work), the step succeeds and says so, so the following push and pull request steps still run. |
 | `push_branch` | `remote` (string, optional), `branch` (string, optional) | Push the current branch to a remote and set it as the upstream (`git push -u`). `remote` defaults to `origin` and `branch` to the current branch (`HEAD`), so omitting both runs `git push -u -- origin HEAD`. The branch field accepts a branch name, not options or force refspecs. |
-| `create_pull_request` | `title` (string, optional), `body` (string, optional), `base` (string, optional) | Create a pull request using the GitHub CLI. If `base` is provided, it sets the branch the PR will be opened against (via the `--base` flag). Requires `gh` to be available in the base container image. GitHub indexes a push a moment after it arrives; if `gh` reports "No commits between" the base and the branch, awman waits and retries up to four times (about 30 seconds in total) before failing the step. |
-| `poll_ci` | `interval_secs` (integer, optional), `max_retries` (integer, optional) | Poll GitHub for the CI run status of the current branch. Waits for the CI run to complete. `interval_secs` controls the polling interval in seconds (default: 30). `max_retries` limits the number of polling attempts (default: 10). See [Polling CI status](#polling-ci-status) for details. |
+| `create_pull_request` | `title` (string, optional), `body` (string, optional), `base` (string, optional) | Create a pull request with `gh pr create` in the base container image (which must contain `gh`). `base` sets the branch the PR targets. Without a `title`, a run with a work item uses `Implement awman/work-item-NNNN` (otherwise `Automated PR`); without a `body`, it uses the work item's `Summary` section. GitHub indexes a push a moment after it arrives; if `gh` reports "No commits between" the base and the branch, awman retries up to four times (about 30 seconds) before failing the step. |
+| `poll_ci` | `interval_secs` (integer, optional, default 30), `max_retries` (integer, optional, default 10) | Wait for GitHub Actions CI on the current HEAD commit to pass. See [Polling CI status](#polling-ci-status). |
 
 If any teardown step is `commit_changes`, awman checks the identity available in the repository or worktree before starting. A complete repo-local identity is used as-is. If it is incomplete, awman offers choices in an interactive run, including entering an identity for this run or allowing the host-global identity for this run. No global Git config is changed. Headless runs need a complete repo-local identity or an explicit `--prerequisite-identity` choice.
 
@@ -653,7 +642,6 @@ command = "npm test"
 [[teardown]]
 type = "commit_changes"
 message = "automated changes"
-add_all = true
 
 [[teardown]]
 type = "create_pull_request"
@@ -670,7 +658,6 @@ teardown:
     command: npm test
   - type: commit_changes
     message: "automated changes"
-    add_all: true
   - type: create_pull_request
     title: "feat: automated implementation"
     body: "This PR was created automatically by an awman workflow."
@@ -679,16 +666,18 @@ teardown:
 
 ### Teardown on failure
 
-By default, teardown steps are skipped if the workflow fails. To run teardown even on failure (e.g., to clean up partial artifacts), set `teardown_on_failure = true` at the top level:
+By default, teardown is skipped if the workflow fails. To run it anyway (for example, to clean up partial artifacts), set `teardown_on_failure = true` at the top level. A step that fails with `abort_on_failure` in setup or the main steps skips teardown even then.
 
 ```toml
-name = "implement-feature"
+title = "implement-feature"
 teardown_on_failure = true
 
 # steps, setup, teardown defined below...
 ```
 
-If any teardown step fails, the error is logged and execution continues to the next teardown step (best-effort cleanup). Teardown failure does not retroactively change the workflow's success/failure status.
+If a teardown step fails, the error is logged and the next teardown step runs (best-effort cleanup), unless the failed step sets `abort_on_failure`, which stops the rest of teardown. When the main steps succeeded but a teardown step failed, the run ends with "workflow completed but teardown failed": the CLI exits `1` and the API reports the command as an error with phase status `teardown_failed`.
+
+Before teardown starts, awman re-checks the [workflow prerequisites](#workflow-prerequisite-checks) without prompting: a granted environment variable may have gone, and a token `acquire` command configured with `refresh: "beforeTeardown"` runs again. Anything now missing becomes one warning rather than a failure in each step that needs it.
 
 ### Teardown on cancel
 
@@ -710,7 +699,7 @@ Every setup and teardown step that runs a command (every step type except `poll_
 3. stdout and stderr are captured separately for the `on_failure` failure file
 
 In both modes:
-- If a setup step fails with `abort_on_failure`, the main workflow steps do not run
+- If a setup step fails with `abort_on_failure`, neither the main steps nor teardown run. A setup step that fails without it is recorded, and the run continues
 - Teardown runs after all main steps complete; if `teardown_on_failure = false` and the workflow failed, teardown is skipped entirely
 
 All environment variables configured for the project (via overlays, config, or per-step `env` fields) are inherited by both setup and teardown containers, just as they are for main workflow steps.
@@ -770,7 +759,6 @@ command = "make test"
 [[teardown]]
 type = "commit_changes"
 message = "Implement {{work_item_number}}"
-add_all = true
 
 [[teardown]]
 type = "push_branch"
@@ -810,7 +798,6 @@ teardown:
     command: make test
   - type: commit_changes
     message: "Implement {{work_item_number}}"
-    add_all: true
   - type: push_branch
   - type: create_pull_request
     title: "Implement {{work_item_number}}"
@@ -820,7 +807,7 @@ teardown:
 
 ### Template variables
 
-Template variables are available in **all workflow fields** — step `prompt` values, setup step fields, and teardown step fields. The only field that does not support substitution is `type` (which selects the step kind).
+Template variables are substituted in step `prompt` values and in the string fields of setup and teardown steps (commands, paths, branches, messages, titles and so on). `type`, `env` values and numeric fields are used as written.
 
 | Variable | Replaced with |
 |----------|--------------|
@@ -829,9 +816,9 @@ Template variables are available in **all workflow fields** — step `prompt` va
 | `{{work_item_content}}` | Full text of the work item Markdown file |
 | `{{work_item_section:[Name]}}` | Content of the named `## Name` section from the work item file (case-insensitive heading match, trailing colons stripped) |
 
-All variables require `--work-item` to be passed when running the workflow. If `--work-item` is omitted, `{{work_item_*}}` placeholders are replaced with empty strings and a warning is emitted.
+All variables need a work item: pass `--work-item` or `--issue`. Without one, `{{work_item*}}` placeholders are replaced with empty strings and a warning is emitted.
 
-Unknown variables or missing sections are left in place with a warning.
+A section that the work item does not have is replaced with an empty string. Any other `{{...}}` text is left as written.
 
 **Examples across workflow phases:**
 
@@ -850,7 +837,6 @@ prompt = "Implement {{work_item_number}}: {{work_item_section:[Summary]}}"
 [[teardown]]
 type = "commit_changes"
 message = "Implement {{work_item_number}}"
-add_all = true
 
 [[teardown]]
 type = "create_pull_request"
@@ -896,38 +882,34 @@ steps:
     prompt: Review the implementation for correctness and style.
 ```
 
-Steps without an `agent` field use the workflow default agent — the value from repo config (or global config), overridden by the `--agent` flag if one was passed at the command line. The `--agent` flag sets the **default** for steps that do not name an agent; it does **not** override steps that explicitly specify one.
+A step without an `agent` field uses, in order: the workflow's top-level `agent`, the `--agent` flag, the repo config's `agent`, then the global default agent. `--agent` never overrides a step (or workflow) that names its own agent.
 
-### Agent pre-flight check
+### Agent images
 
-Before the first step runs, awman collects every distinct agent name required across all steps and checks that the corresponding image exists. If an image is missing, awman prompts:
-
-```
-Agent 'codex' has no Dockerfile. Download and build it? [y/N]:
-```
-
-**Accept** — awman downloads the agent Dockerfile template, builds the project base image (if needed), then builds the agent image. If your repo has multiple agents to set up, each is prompted in turn before the workflow begins.
-
-**Decline** — awman asks whether to substitute the default agent for that step instead:
+Every agent a workflow uses needs its image. Before a static workflow runs its first setup step or agent container (after any worktree is prepared), awman collects the agent each step will run and checks that its image exists. For each agent whose image is missing it asks once:
 
 ```
-Use the default agent (claude) for steps that specify 'codex'? [y/N]:
+awman: Set up agent codex? [y]es / [n]o / [f]allback to claude
 ```
 
-- Accept the fallback: those steps run with the default agent. The workflow starts normally.
-- Decline the fallback: the workflow does not start.
+- **Yes** — awman writes `.awman/Dockerfile.codex` from the agent's definition if the repo doesn't have one, then builds the image. When the Dockerfile already exists the question is `Build image for codex?`. The agent image is built on top of the project image, so if that is missing too the run stops and tells you to run `awman ready --build` first.
+- **Fallback** — the steps that would have run `codex` run with the default agent instead (the `--agent` flag, else the configured `agent`, else `claude`). It is offered only when the default agent's image exists.
+- **No** (or Esc in the TUI) — the run stops before any container starts and tells you to prepare the agent with `awman ready --agent codex`.
 
-If all required images are already available, the pre-flight check completes silently and the first step launches immediately.
+The TUI asks the same question in a dialog. A run with no terminal to ask (piped CLI, `--non-interactive`, squad) sets the agent up; the HTTP API sets it up when the default agent's image exists and otherwise refuses the command. You can always prepare images ahead of time:
 
-**Builtin runtime.** Workflow preflight is import-only: it never starts a host build, even when `builtin.builder.enabled` is true, but it does re-acquire an image that is installed from a different source than the one now configured (an installed image with no configured source is kept). A step that runs an agent other than the repo's default one stops when `builtin.imageSource` names a single image (an archive, or a fixed `reference`): give that agent its own `builtin.images` entry. In a worktree, the repo's `builtin` settings and default `agent` come from the checkout you launched from, not the worktree's commit. If a required agent image is not imported, the workflow stops before the first step and tells you to prepare it with `awman ready` (or to configure an image source). Setup and teardown steps run in the imported agent image of the repo's configured agent (or in the `baseImage` you set, which must also be imported). See [Runtimes: Builtin microVM](11-runtimes.md#builtin-microvm-experimental).
+```sh
+awman ready --agent codex
+```
+
+This check applies to the Docker and Apple Containers runtimes, which build images; when the runtime itself is unreachable, the run reports that instead. A [dynamic workflow](06-dynamic-workflows.md) checks the generated workflow's agents after the leader finishes and builds any missing image from `.awman/Dockerfile.<agent>` before the first step; a failed build stops the run.
+
+**Builtin runtime.** Image preparation for workflows (and squad) is import-only: it never starts a host build, even when `builtin.builder.enabled` is true, but it re-acquires an image that was installed from a different source than the one now configured (an installed image with no configured source is kept). A step that runs an agent other than the repo's default one stops when `builtin.imageSource` names a single image (an archive, or a fixed `reference`): give that agent its own `builtin.images` entry. In a worktree, the repo's `builtin` settings and default `agent` come from the checkout you launched from, not the worktree's commit. If a required agent image is not imported, the run stops and tells you to prepare it with `awman ready` (or to configure an image source). Setup and teardown steps run in the imported agent image of the repo's configured agent (or in the `baseImage` you set, which must also be imported). See [Runtimes: Builtin microVM](11-runtimes.md#builtin-microvm-experimental).
 
 ### Unknown agents
 
 An unknown agent name in an `agent` field is caught at parse time, before any container runs, and exits with a list of valid options.
 
-### Resuming workflows with per-step agents
-
-When resuming a saved workflow, the per-step agent assignments from the original run are preserved in the state file. If you pass a different `--agent` flag on resume, awman warns you; the persisted assignments still take precedence.
 
 ---
 
@@ -980,16 +962,13 @@ For each step, awman resolves the effective model using this priority:
 | Priority | Source | Applies when |
 |----------|--------|-------------|
 | 1 (highest) | Step's `model` field | The step explicitly declares a model |
-| 2 | `--model` flag on the command line | The step has no `model` field |
-| 3 (lowest) | Agent built-in default | Neither a step field nor a flag was provided |
+| 2 | Workflow's top-level `model` field | The step has no `model` field |
+| 3 | `--model` flag on the command line | Neither the step nor the workflow sets a model |
+| 4 (lowest) | Agent built-in default | None of the above |
 
-The `--model` flag acts as the **default** for all steps without a `model` field; it does **not** override steps that declare their own model.
+`--model` is only a default: it never overrides a step or workflow that sets its own model.
 
 `agent` and `model` are independent overrides. A step can specify one, both, or neither. When both are present, awman resolves the agent first, then resolves the model.
-
-### Workflow resume and model persistence
-
-Per-step `model` values are persisted in the workflow state file. On resume, the persisted model is used, not any `--model` flag passed on the resumed invocation. This matches the existing behaviour for `agent` fields and ensures the resumed run is identical to the original.
 
 ### Output files in API workflows
 
@@ -1022,7 +1001,7 @@ The **Workflow Overview** appears, showing each step as a coloured box:
 | Blue / bold | Running |
 | Green | Done |
 | Red / bold | Error |
-| Yellow / bold | Stuck (idle for >10 s) |
+| Yellow / bold | Stuck (no output for 30 s) |
 
 When a step completes, a confirmation dialog appears. Press **Enter** or **y** to advance, **q** or **Esc** to pause.
 
@@ -1032,40 +1011,44 @@ When a step completes, a confirmation dialog appears. Press **Enter** or **y** t
 awman exec workflow aspec/workflows/implement-hard.toml --work-item 0027
 ```
 
-Between steps, awman prints the step summary and prompts:
+Between steps, awman prints the control board as a menu on stderr and reads your choice. Only the actions that apply are listed:
 
 ```
-Step 'plan' completed.
-Next step(s): implement
-Press [Enter] to advance, or [q] to abort:
+awman: workflow paused — choose next action:
+  [n] Launch next step (new container)
+  [c] Continue in current container
+  [r] Restart current step
+  [b] Back to previous step
+  [p] Pause workflow
+  [a] Abort workflow
 ```
 
-On agent failure:
-
-```
-Step 'implement' failed: Container exited with code 1
-Press [r] to retry, or any other key to abort:
-```
+A failed step prints `awman: step '<name>' failed.` with its exit code and run time, then the same menu headed `choose how to recover:` (see [When a step fails](#when-a-step-fails)). Anything awman can't read as a choice pauses the workflow.
 
 ### Flags
 
-`exec workflow` accepts the following flags:
+The main `exec workflow` flags (see the [Command Reference](14-command-reference.md#awman-exec-workflow) for the full list):
 
 | Flag | Description |
 |------|-------------|
-| `--agent=<name>` | Default agent for steps that do not specify an `agent` field. Does not override steps with an explicit `agent` value |
-| `--model=<NAME>` | Default model for steps that do not specify a `model` field. Does not override steps with an explicit `model` value |
-| `--non-interactive` | Run each step's agent in print/batch mode |
-| `--plan` | Run each step in read-only mode |
-| `--allow-docker` | Mount Docker socket into each step's container |
-| `--worktree` | Run all steps in an isolated Git worktree |
-| `--overlay=<SPEC>` | Apply overlay(s) to every step; see [Overlays](08-overlays.md) |
-| `--yolo` | Fully autonomous mode; implies `--worktree`; auto-advances stuck steps |
-| `--dynamic` | Let a leader agent design the workflow file from your work item; see [Dynamic Workflows](06-dynamic-workflows.md) |
-| `--leader=<agent::model>` | Override the agent and model used as the leader when `--dynamic` is set; format: `agent::model` |
-| `--max-concurrent=<N>` | Cap on concurrently-running steps for this invocation (must be ≥ 1); overrides `maxConcurrentAgents` in config — see [Parallel workflows](05-workflows.md#parallel-workflows) |
-| `--on-dirty-merge-target=<POLICY>` | Action for uncommitted changes in the merge target: `ask`, `commit`, `stash`, or `fail` |
-| `--on-merge-failure=<POLICY>` | Action after a failed merge: `ask`, `agent`, or `keep` |
+| `--work-item <N>` / `--issue <REF>` | Supply a work item (a local spec, or a GitHub issue number, URL or `owner/repo#N`) for [template variables](#template-variables) |
+| `--agent <NAME>` | Default agent for steps that don't name one (a workflow-level `agent` takes precedence) |
+| `--model <NAME>` | Default model for steps that don't set one (a workflow-level `model` takes precedence) |
+| `--agent-flag=<ARG>` | Extra argument for the default agent's command, replacing its `agentFlags` entry. Repeatable |
+| `-n, --non-interactive` | Run each step's agent in print mode, and answer every prompt with its headless default |
+| `--plan` / `--auto` / `--yolo` | [Permission mode](03-agent-sessions.md#permission-modes) for every step. `--auto` and `--yolo` imply `--worktree`; `--yolo` also auto-advances stuck steps |
+| `--launch-mode <stdio\|acp>` | How awman talks to each step's agent |
+| `--allow-docker` | Mount the Docker socket into each step's container |
+| `--overlay <SPEC>` | Apply overlay(s) to every step; see [Overlays](08-overlays.md). Repeatable |
+| `--worktree` | Run all steps in an isolated Git worktree — see [Worktrees](#worktrees) |
+| `--on-existing-worktree <POLICY>` | `ask`, `resume`, `recreate` or `fail` when the run's worktree already exists |
+| `--on-dirty-merge-target <POLICY>` | `ask`, `commit`, `stash` or `fail` for uncommitted changes in the merge target |
+| `--on-merge-failure <POLICY>` | `ask`, `agent` or `keep` after a failed merge-back |
+| `--max-concurrent <N>` | Cap on concurrently running steps (≥ 1); overrides `maxConcurrentAgents` — see [Parallel workflows](#parallel-workflows) |
+| `--dynamic` / `--leader <agent::model>` | Let a leader agent design the workflow; see [Dynamic Workflows](06-dynamic-workflows.md) |
+| `--check-prerequisites` | Print the [prerequisite report](#workflow-prerequisite-checks) and exit without running |
+| `--prerequisite-identity`, `--prerequisite-ssh`, `--prerequisite-token`, `--prerequisite-unresolved` | Answer prerequisite questions up front, for headless runs |
+| `--json` | Print the workflow outcome and prerequisite report as JSON (implies `--non-interactive`) |
 
 ### Worktrees
 
@@ -1291,7 +1274,7 @@ Running: plan     ┃  ● implement    ✓ review    ⚠️ docs
 |--------|---------|
 | **●** (Blue, bold) | Step is currently running |
 | **✓** (Green) | Step completed successfully |
-| **⚠️** (Yellow, bold) | Step is stuck (no output for >30 seconds) |
+| **⚠️** (Yellow, bold) | Step is stuck (no output for 30 seconds) |
 | **●** (Gray, dim) | Step is pending |
 | **✗** (Red, bold) | Step encountered an error |
 | **🔧** (Magenta, bold) | Step failed and remediation is in progress (on_failure agent running) |
@@ -1492,16 +1475,9 @@ Runs with nobody at the keyboard (`--non-interactive`, the API server) resume at
 
 ### Workflow file changed
 
-If the workflow file has been modified since the state was saved, awman warns you:
+If the workflow file has changed since the state was saved, awman asks before resuming: `awman: workflow file changed since last run; resume anyway? [y/n]` in the CLI, or a **Resume workflow?** dialog in the TUI. Answering no stops the command and leaves the saved state alone. A `--non-interactive` CLI run answers no, and the API answers yes.
 
-```
-WARNING: The workflow file has changed since the last run.
-  1) Restart from the beginning
-  2) Continue anyway (could be dangerous)
-  [1/2]:
-```
-
-If you choose `2`, awman verifies that step names and `Depends-on` values are identical. If they differ, it forces a restart.
+If you resume, steps the saved run has but the file no longer defines are dropped (see [Unfinished steps](#unfinished-steps)).
 
 ### Unfinished steps
 
@@ -1624,9 +1600,9 @@ Each parallel step gets its own control board when it completes or gets stuck; y
 
 | File | Description |
 |------|-------------|
-| `implement-hard.toml` | Four-step workflow: implement → tests + docs (parallel) → review. Uses Opus for implementation, Haiku for docs, and a final interactive review step |
-| `implement-pr.toml` | Same four steps as `implement-hard.toml`, plus teardown steps that run tests, commit changes, push the branch, and create a pull request |
-| `dependency-upgrade-pr.toml` | Two-step workflow: security audit → version audit. Upgrades vulnerable dependencies first, then reviews available version updates, then opens a PR |
+| `implement-hard.toml` | Five steps: a Codex review of the work item's plan → implement → tests + docs (parallel) → an interactive review. Pins a model per step and mounts `context(workflow)` for every step |
+| `implement-pr.toml` | Four steps (implement → tests + docs (parallel) → review), plus teardown steps that run tests, commit, push the branch over `ssh()`, and open a pull request |
+| `dependency-upgrade-pr.toml` | Two steps (security audit → version audit) that upgrade vulnerable dependencies first, then take available updates; teardown runs tests, commits, pushes and opens a PR |
 
 ---
 
@@ -1636,19 +1612,16 @@ Each parallel step gets its own control board when it completes or gets stuck; y
 |-----------|-----------|
 | Cycle in `depends_on` graph | Error before any agent runs |
 | Unknown `depends_on` step name | Error at parse time |
-| Unknown agent name in `agent` field | Error at parse time, before any containers run |
-| Missing agent image at workflow start | Pre-flight prompt: build it, fall back to default, or abort |
-| Agent Dockerfile download fails during pre-flight | Error surfaced; workflow does not start |
-| Agent image build fails during pre-flight | Error surfaced; partial Dockerfile removed; workflow does not start |
+| Unknown agent name in `agent` field | Error before any containers run |
+| Missing agent image (static workflow) | Prepare it with `awman ready --agent <name>` before the run |
+| Missing agent image (dynamic workflow) | Built from `.awman/Dockerfile.<agent>` before the first step; a failed build stops the run (not a repair-loop error) |
 | `--agent` flag + step with explicit `agent` field | Step's `agent` value wins; `--agent` is only the default for unspecified steps |
 | `--model` flag + step with explicit `model` field | Step's `model` value wins; `--model` is only the default for steps without a `model` field |
 | `model` combined with `agent` in the same step | Independent overrides; agent resolved first, then model |
 | `model` field with no value | Treated as absent; agent launches with its built-in default or `--model` flag value |
 | Invalid model name in `model` field | Passed verbatim to the agent; the agent surfaces its own error |
-| Resume with a different `--model` flag | Persisted per-step model values take precedence; `--model` applies only to steps with no persisted model |
-| All steps specify non-default agents | Pre-flight still runs for each; default fallback offered only if setup is declined |
+| Resume with a different `--agent` or `--model` flag | Steps that name their own `agent`/`model` (or inherit the workflow's top-level one) are unchanged; the flags apply to the remaining steps, as on a fresh run |
 | Parallel steps with different agents | Each step runs in its own container — no cross-step sharing |
-| Resume with a different `--agent` flag | Warning printed; persisted per-step agent assignments take precedence |
 | Current step and next step use the same agent | "Same container" (**↓**) option available as usual |
 | Current step and next step use different agents | "Same container" option greyed out (TUI) or skipped (CLI) with explanation |
 | Empty workflow file | Rejected with a helpful message |
@@ -1663,21 +1636,18 @@ Each parallel step gets its own control board when it completes or gets stuck; y
 | Setup step with invalid type | Parse error; type must be one of the supported step types |
 | Teardown step with invalid type | Parse error; type must be one of the supported step types |
 | `create_pull_request` step but `gh` not in base image | Prerequisite check reports the missing tool before workflow execution |
-| `poll_ci` step | Polls GitHub for CI status; see [Polling CI status](#polling-ci-status) for authentication and error handling |
-| `poll_ci` with no CI run found yet | First 3 polling attempts treat "not found" as retriable; after 3 attempts, step fails with "No CI run found" |
-| `poll_ci` with multiple CI runs on the branch | Uses the run matching the current HEAD commit SHA; if no match, uses the most recent run with a warning |
-| `poll_ci` with authenticated host `gh` | Uses host `gh` without passing a token into a container |
-| `poll_ci` without authenticated host `gh` | Uses a token explicitly granted for the workflow run |
-| `poll_ci` with neither authenticated host `gh` nor a granted token | Prerequisite check reports the missing credential before workflow execution |
-| `poll_ci` when CI fails (red status) | Step fails with CI failure details |
-| `poll_ci` after pushing new commits | Re-detects HEAD SHA; polls for the new CI run, not the old one |
+| `poll_ci` with no CI run for HEAD yet | Keeps waiting for the first 3 attempts, then fails with "no CI run found for this branch/commit" |
+| `poll_ci` and runs for older commits | Ignored; only runs for the current HEAD commit count |
+| `poll_ci` without a granted token | Uses an authenticated host `gh` login for `github.com` remotes; otherwise the prerequisite check reports the missing credential before the run starts |
+| `poll_ci` when CI fails | Step fails with the failed runs; an `on_failure` agent gets the failed jobs, steps and log tails |
 | Step with `on_failure` block | When step fails, launches a remediation agent; retries the step after agent completes; see [Step remediation](#step-remediation-with-on_failure) |
 | Step with `on_failure` and `max_attempts = 0` | Parse error; `max_attempts` must be ≥ 1 |
 | `on_failure` agent exits with error | Agent exit code is ignored; the original step is retried regardless |
-| `on_failure` exhausts `max_attempts` | Step is marked failed; workflow continues (or stops if `abort_on_failure = true`) |
+| `on_failure` exhausts `max_attempts` | Step is marked failed; the phase continues (or stops if `abort_on_failure = true`) |
 | `abort_on_failure = true` + `on_failure` block | Remediation loop runs first; only if all attempts fail does abort trigger |
-| Setup failure | Main workflow steps do not run; go directly to teardown (if `teardown_on_failure = true`) or exit |
-| Teardown step failure (non-zero exit) | Error is logged; execution continues to next teardown step (best-effort); same for `on_failure` remediation |
+| Setup step fails without `abort_on_failure` | Failure is recorded; the remaining setup steps and the main steps still run |
+| Setup step fails with `abort_on_failure` | Main steps and teardown are skipped, even with `teardown_on_failure = true` |
+| Teardown step fails | Error is logged and the next teardown step runs, unless the failed step sets `abort_on_failure`; the run ends "completed but teardown failed" (exit 1) |
 | Setup or teardown step with `on_failure` fails | Failed command's stdout/stderr is automatically captured to a `setup-failure-<step>.txt` / `teardown-failure-<step>.txt` file and referenced in the remediation agent's prompt — see [Automatic failure output capture](#step-remediation-with-on_failure) |
 | Retried setup or teardown step fails again during remediation | The captured output file is overwritten with the latest attempt's stdout/stderr |
 | `checkout_create_branch` with no remote configured | Falls back to local branch creation from HEAD or specified `base` |
@@ -1685,23 +1655,19 @@ Each parallel step gets its own control board when it completes or gets stuck; y
 | Setup interrupted and resumed | Full setup phase re-runs from the beginning; steps should be idempotent |
 | Work item file not found | Error before loading the workflow |
 | Workflow file not found / unreadable | Clear error with the file path |
-| Agent failure mid-workflow | Step marked Error; user prompted to retry or abort |
+| Agent step fails mid-workflow | The [step-failure control board](#when-a-step-fails) opens (unattended runs retry the step once) |
 | Very long step names | Truncated to 12 characters with `…` in the TUI Workflow Overview |
-| Large number of parallel steps | Capped at 3 visible rows; extra shown as `+ N more…` |
+| Large parallel group | Minimized: one `N steps…` box. Maximized: overflow shown as `+ N more…`; scroll with the mouse wheel |
 | Large number of sequential steps | Workflow Overview scrolls horizontally; scroll with **Shift+←/→** or the mouse wheel |
 | **d** pressed; auto-popup suppressed | Auto-open skipped until workflow advances; Ctrl+W still works |
 | Container window maximized (auto-open) | Dialog opens over the maximized terminal; input routes to dialog |
-| Another dialog already open | Both Ctrl+W and auto-open suppressed until open dialog is dismissed |
+| Another dialog already open | Auto-open waits until it is dismissed; **Ctrl+W** dismisses it and opens the board |
 | Step silent on a background tab (non-yolo) | Auto-open deferred; control board appears when you switch to that tab |
 | Step silent on a background tab (yolo) | Live countdown shown in tab bar; dialog opens when you switch to the tab; workflow auto-advances when countdown expires |
-| Esc dismissed; container still silent | Timer resets; dialog re-opens after another 10 s |
-| Output resumes before 10 s threshold | Stuck state clears; auto-open does not trigger |
+| Esc dismissed; container still silent | Timer resets; the board re-opens after another 30 s of silence |
+| Output resumes before the 30 s threshold | Stuck state clears; auto-open does not trigger |
 | User actively scrolling on active tab | Stuck timer suppressed; control board does not open while user is engaged |
-| User becomes idle after scrolling | Timer starts from idle moment; control board opens after another 10 s of silence |
-
-### Known limitations
-
-- **TUI resume dialogs**: hash-mismatch and resume prompts use auto-restart behaviour rather than a full dialog.
+| User becomes idle after scrolling | Timer starts from the idle moment; control board opens after 30 s of silence |
 
 ---
 

@@ -45,8 +45,12 @@ use awman::frontend::tui::tabs::TabSharedState;
 mod fake_awman;
 #[path = "helpers/mod.rs"]
 mod helpers;
+#[path = "helpers/in_process_daemon.rs"]
+mod in_process_daemon;
 #[cfg(unix)]
 use fake_awman::FakeAwmanProcess;
+#[cfg(unix)]
+use in_process_daemon::{EnvOverride, InProcessDaemon};
 
 static ENV_LOCK: AsyncMutex<()> = AsyncMutex::const_new(());
 
@@ -314,6 +318,9 @@ async fn run_tui(
 
 #[tokio::test]
 async fn cli_crud_uses_exactly_one_gateway_call_and_no_frontend_validation() {
+    // `squad remove` resolves squad paths from the process env, which the
+    // locked tests below repoint at temporary homes.
+    let _env_guard = ENV_LOCK.lock().await;
     let env = helpers::IsolatedEnv::new();
     let session = env.open_session();
     let cases = [
@@ -427,6 +434,9 @@ async fn squad_add_without_a_workspace_flag_asks_for_the_durable_task_workspace(
 
 #[tokio::test]
 async fn cli_and_tui_same_argv_build_squad_and_issue_the_same_gateway_sequence() {
+    // `squad remove` resolves squad paths from the process env, which the
+    // locked tests below repoint at temporary homes.
+    let _env_guard = ENV_LOCK.lock().await;
     let env = helpers::IsolatedEnv::new();
     let session = env.open_session();
     for raw in [
@@ -657,12 +667,16 @@ fn init_repo(path: &Path) {
 }
 
 #[cfg(unix)]
-async fn start_daemon(root: &Path) -> (tokio::task::JoinHandle<()>, String, FakeAwmanProcess) {
+/// Start the daemon in-process. The returned [`InProcessDaemon`] keeps
+/// `AWMAN_CONFIG_HOME` / `AWMAN_SQUAD_ROOT` pointed at `root` until it is
+/// aborted (or dropped by a panicking test), then restores them.
+async fn start_daemon(root: &Path) -> (InProcessDaemon, String, FakeAwmanProcess) {
     let engines = engines_at(root);
-    let previous_config = std::env::var("AWMAN_CONFIG_HOME").ok();
-    let previous_squad = std::env::var("AWMAN_SQUAD_ROOT").ok();
-    std::env::set_var("AWMAN_CONFIG_HOME", root);
-    std::env::set_var("AWMAN_SQUAD_ROOT", root.join("squad"));
+    let squad_root = root.join("squad");
+    let env = EnvOverride::set(&[
+        ("AWMAN_CONFIG_HOME", root.as_os_str()),
+        ("AWMAN_SQUAD_ROOT", squad_root.as_os_str()),
+    ]);
     let daemon_guard = DaemonGuard::for_daemon(DaemonKind::Squad, &Env::from_process())
         .expect("test daemon guard");
     let holder = FakeAwmanProcess::spawn("squad");
@@ -704,17 +718,8 @@ async fn start_daemon(root: &Path) -> (tokio::task::JoinHandle<()>, String, Fake
         waited += Duration::from_millis(50);
     };
 
-    match previous_config {
-        Some(value) => std::env::set_var("AWMAN_CONFIG_HOME", value),
-        None => std::env::remove_var("AWMAN_CONFIG_HOME"),
-    }
-    match previous_squad {
-        Some(value) => std::env::set_var("AWMAN_SQUAD_ROOT", value),
-        None => std::env::remove_var("AWMAN_SQUAD_ROOT"),
-    }
-
     (
-        handle,
+        InProcessDaemon::new(handle, env),
         format!("{}://{}:{}", meta.scheme, meta.bind_ip, meta.port),
         holder,
     )

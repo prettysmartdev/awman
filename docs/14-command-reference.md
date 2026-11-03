@@ -1,6 +1,6 @@
 # Command Reference
 
-Generated from `CommandCatalogue` (`src/command/dispatch/catalogue.rs`) — do not hand-edit. Every command, flag, and argument awman accepts is listed here exactly as the catalogue defines it.
+Generated from `CommandCatalogue` (`src/command/dispatch/catalogue/`) — do not hand-edit. Every command, flag, and argument awman accepts is listed here exactly as the catalogue defines it.
 
 ---
 
@@ -642,7 +642,7 @@ Available via: CLI, TUI
 
 | Argument | Kind | Required | Help |
 |---|---|---|---|
-| `workflow` | path | yes | Path to the workflow file. |
+| `workflow` | path | no | Path to the workflow file on the remote host (omit with --dynamic). |
 
 | Flag | Kind | Default | Implies | Conflicts | Frontends | Help |
 |---|---|---|---|---|---|---|
@@ -673,7 +673,6 @@ Available via: CLI, TUI
 | `--prerequisite-token` | string (optional) | — | — | — | CLI, TUI, API | GitHub token for create_pull_request, an HTTPS push_branch and poll_ci: env:NAME, acquire (the configured token command), or deny. Never granted by --yes. |
 | `--prerequisite-unresolved` | enum: warn, fail | — | — | — | CLI, TUI, API | What an unsatisfied workflow prerequisite does: warn and continue, or fail before any container starts. |
 | `--check-prerequisites` | bool | false | — | — | CLI, TUI, API | Run only the workflow prerequisite checks, print the report and exit 0 when all checks are satisfied or 1 when any check is missing, needs consent or is unknown. |
-| `--json` | bool | false | `--non-interactive` | — | CLI, TUI, API | Print the workflow outcome and prerequisite report as JSON. |
 
 #### `awman remote exec prompt`
 

@@ -2,7 +2,7 @@
 
 Title: Codebase simplicity, modularity, idiomatic Rust, duplication, and architecture conformance remediation
 Issue: Not linked
-Status: In progress — remediation integrated and required Linux checks pass (2026-10-31); native/platform acceptance evidence and independent review of the final integration delta remain open.
+Status: In progress — remediation integrated (2026-10-31) and the post-review gaps closed (2026-11-03, see "Post-review remediation"); all required Linux checks pass. Only the P1–P7 real-platform checks (macOS, Windows, Docker Desktop/Apple Containers, live terminals) remain, pending manual verification.
 
 ## Summary:
 
@@ -460,10 +460,11 @@ Completion criteria:
 - [ ] Conflicts were resolved by the integrator, and final changes were reviewed across team boundaries.
 - [x] Current docs describe the resulting behavior and verification limits accurately.
 
-The two unchecked criteria remain open: required platform results are missing
-(see P1–P7 below), and the cross-team reports reviewed the pre-integration tree.
-Their findings are resolved and the integrator reviewed the corrections, but the
-final integration delta has not received a separate independent cross-team review.
+The two unchecked criteria remain open. Required platform results are missing
+(P1–P7 below, pending manual verification). The integrated tree was reviewed
+on 2026-11-03 and every gap that review found is closed under "Post-review
+remediation" below. That follow-up delta is small and passes the Linux checks,
+but it has not had its own independent review yet.
 
 ## Codebase Integration:
 
@@ -649,8 +650,12 @@ upgrade fixtures. Unknown values now fail reads rather than fabricate readiness
 or an empty queue; legacy pending still maps to queued and is cancelled atomically.
 Retain wire-event types, per-enum parse/as_str implementations and compatibility
 JSON args views (strict execution decoding remains F01's). No specific platform
-blocker. Historical `aborted` row provenance cannot be certified with unavailable
-Git history; no current writer or documented row contract establishes it as valid.
+blocker. Historical `aborted` provenance, checked against Git history on
+2026-11-03: the spelling was only ever an emitted `CommandStatus` *event* status
+for an aborted workflow (`report_workflow_completed`, from `f7e234d9`, later the
+wire `CommandStatusKind::Aborted` in `5d3d77ca`) and a failure code (`e8ebba6e`).
+No commit wrote it to the persisted command or session status column, so reads
+keep rejecting it as an unknown stored value.
 
 **F11 — OCI retry classification.** Locations:
 `src/engine/oci/{retry,registry,docker_engine,transport,verify,archive,apple_store,retry_fixtures}.rs`
@@ -884,12 +889,115 @@ into in this container; Linux fake-driver success cannot close them.
 | P2 | On macOS and Windows, run `bash tools/isolated-test.sh -p awman --lib --locked -- workflow_state_store task_store config_file` for replacement, first-create, mode and failed-save/resume; confirm complete old/new JSON and temp cleanup. |
 | P3 | Native macOS: isolated `-p awman --lib --locked -- launch_policy engine::workflow:: worktree --skip real_git --skip real_network --skip builtin_hw`, `-p awman-cli --test engine_tests --locked -- workflow --skip real_git --skip real_network --skip builtin_hw`, plus workspace all-target Clippy. |
 | P4 | macOS/Windows: isolated `-p awman --lib --locked -- engine::oci`, `-p awman-cli --test oci_import --locked`, plus workspace all-target Clippy. |
-| P5 | macOS: isolated `-p awman-cli --test engine_tests --locked -- --test-threads=64` (including HOME collision), `make architecture-lint` and `bash tools/test-architecture-lint.sh` with BSD tools. |
+| P5 | macOS: isolated `-p awman-cli --test engine_tests --locked -- --test-threads=64` (including HOME collision). The BSD-tools half (`make architecture-lint`, which also runs `tools/test-architecture-lint.sh`) is now a step of the hosted `build-macos` CI job; it stays pending until that job has run green. |
 | P6 | Verified native payload: `cargo check --workspace --all-targets --locked --features builtin-runtime`, `cargo clippy --workspace --all-targets --locked --features builtin-runtime -- -D warnings`, isolated `-p awman-cli --test builtin_runtime --locked --features builtin-runtime`, `cargo check -p awman-cli --examples --locked --features builtin-runtime` (`builtin_hw_driver`, `builtin_net_driver`), `make payloads-verify`, `tools/native-builtin-ci.sh`, `tools/test-msb-catalog-compat.sh`; KVM/HVF required for real guests. Docker/Apple runtime checks require their installed services. `tools/release-artifact-check.sh` and `make sign-macos` require target release artifacts; `tools/reproducible-build-audit.sh` additionally requires usable Git metadata. Coordinate with WI 0120/0124, without taking their feature scope. |
 | P7 | Live TTY `exec workflow`/`wf` parallel chrome and TUI sidebar/notice presentation through dispatch; terminal access unavailable here. |
 
-Git status/diff/history cannot be certified because this checkout's .git points to
-an absent host worktree. No Git mutation was attempted. All integration scratch
-scripts/logs are outside the repository in the shared workflow context or isolated
-temporary roots; retained repository additions are source, regression tests and
-the requested record.
+The 2026-10-31 integration ran in a checkout without usable Git metadata. The
+2026-11-03 follow-up below ran in a normal Git worktree, so its changes are an
+ordinary diff over the integrated tree, and the history questions this record
+had left open (F10's `aborted` provenance) were answered from `git log`. All
+scratch scripts and logs stay outside the repository; retained repository
+additions are source, regression tests, CI configuration and this record.
+
+### Post-review remediation (2026-11-03)
+
+A review of the integrated tree found gaps against this item's acceptance
+criteria, plus one silent fallback reintroduced afterwards by `789b8eae`. Each
+is closed below; nothing in the record above is withdrawn.
+
+- **F17 — stale paths.** No `oldsrc/` reference remains in `docs/` or in the
+  current specs (`aspec/architecture/`, `aspec/devops/`, `aspec/uxui/`); the
+  remaining mentions are in historical work items and review notes, which this
+  item does not edit. `aspec/architecture/four-layer-summary.md` named the
+  deleted `src/engine/agent/agent_matrix.rs` and the former
+  `src/command/dispatch/catalogue.rs`; it now names `AgentRegistry`/
+  `AgentDefinition`/the first-party table, the module-private
+  `ContainerBackend`, the `catalogue/` directory, and states the D1 import
+  rule. The grand architecture's catalogue path is corrected the same way. The
+  command-reference header came from `CommandCatalogue::markdown_reference`
+  (`src/command/dispatch/projections/markdown.rs`); the generator now prints
+  `src/command/dispatch/catalogue/` and `docs/14-command-reference.md` was
+  regenerated with `make docs-reference`; `markdown_reference_matches_committed_docs`
+  guards it.
+- **F15 — macOS lint.** `.github/workflows/test.yml`'s hosted `build-macos`
+  job (`macos-latest`, not the self-hosted runner) now runs
+  `make architecture-lint`, i.e. the lint and its fixture suite with BSD
+  grep/sed/find. Its first green run closes the lint half of P5.
+- **F07 — loader as the single source of truth.** The editor's numeric range
+  table had drifted (`builtin.vcpus must be between 1 and 255` versus the
+  loader's `must be at least 1`). `validate_number_with_loader`
+  (`src/command/commands/config.rs`) now calls the loader's own checks:
+  `repo::validate_max_concurrent_agents` (new, now also used by both the global
+  and repo loaders instead of two copies), `validate_dynamic_max_concurrent_steps`,
+  and `BuiltinRuntimeConfig::validate_resources` on the member decoded exactly as
+  a config file would be (so an out-of-range `vcpus` reports serde's `u8` decode
+  error, as loading does). `numeric_range_errors_match_the_config_loader`
+  compares the editor's message with the loaders' for every ranged field.
+  Deliberate wording change: `config set builtin.vcpus 0` now says
+  `builtin.vcpus must be at least 1`, and 256 reports the decode error.
+- **F05 — one `report_status` projection.** The two API agent frontends now share
+  `emit_container_status`, `emit_progress` and `emit_user_message`
+  (`src/frontend/api/command_frontend.rs`). Each keeps only its own attribution
+  step (step-container map versus the sink's own source), which runs before
+  the status line is emitted, as before. No event changes.
+- **F03 — readers see complete JSON.**
+  `a_concurrent_reader_always_sees_a_complete_old_or_new_record`
+  (`workflow_state_store.rs`) and
+  `the_scheduler_loader_always_reads_a_complete_task_config` (`task_store.rs`)
+  replace a record 100 times between a small and a 256 KiB version while
+  another thread parses it through the production loaders; every read must be
+  the complete old or new record. These are now registered library tests, not
+  historical probes.
+- **F02 — two concurrently running runs.** The `gated_cli` guest records the
+  prompt path it was mounted with once it is running.
+  `concurrent_runs_through_one_engine_keep_only_their_own_files` now waits
+  until both guests are running at once, checks that each got only its own file,
+  finishes the first, and checks that the second running guest's file is intact
+  (and, on Linux, that the finished run holds no descriptor) before the second
+  reads it and releases.
+- **F14 — PATH reads behind the guard.** `tests/engine/acp_support.rs` and
+  `credential_refresh_integration.rs` built child `PATH`s from an unguarded read
+  of the process `PATH`, which could pick up another test's temporary
+  `prepend_path`. Both now use `ProcessEnvGuard::child_path_with_first`, and
+  `a_guarded_child_path_never_sees_another_tests_override` shows the read waits
+  for an override to be restored.
+- **A01 — idempotency sequencing.** `with_idempotency` still made the
+  reservation decisions (key policy, principal choice, begin outcome handling,
+  release-on-server-error, completion logging). They now live in Layer 2 as
+  `IdempotencyGate::open` and `IdempotentRun::finish(IdempotentResult)`
+  (`src/command/commands/api_server/admission.rs`). The route only reads the
+  header, runs the handler (`catch_unwind`), buffers the body and maps each
+  gate outcome to status codes and headers. New HTTP-free tests cover unkeyed
+  and invalid keys, in-flight, replay (including a final 4xx), mismatch, release
+  after a server error or dropped run, a journal clone keeping the reservation,
+  and principal scoping. API responses are unchanged.
+- **Silent fallback after `789b8eae`.** `run_poll_ci_phase_step` filled a missing
+  CI report with `poller.take_failure().unwrap_or_default()`, so a poll that
+  stopped without a failed CI run (timeout, no run found, API error) handed the
+  on_failure agent an empty report that read as "CI failed with no output".
+  `poll_ci_failure_outcome` (`src/engine/workflow/phases.rs`) now handles both
+  cases explicitly: a recorded failure passes on its redacted report and failed
+  jobs, and no failure gives an explicit "no failed CI run" stdout with no jobs.
+  `poll_ci_outcome_tests` cover both. The other defaults that commit added are
+  JSON field defaults inside GitHub response parsing and per-step options that
+  are legitimately absent; they are not result fallbacks and were left alone.
+
+Re-verification of the completion criteria at this point: every F01–F17 and
+A01–A08 entry has implementation and test evidence. `routes.rs` makes no
+idempotency or admission decisions. Platform results P1–P7 are still missing
+and are left pending manual verification. Required checks for this follow-up
+(Linux aarch64, Rust 1.94.0, no runtime/service opt-in):
+
+| Check | Result |
+| --- | --- |
+| `bash tools/architecture-lint.sh` + fixtures (`make architecture-lint`) | PASS |
+| `cargo fmt --all --check` | PASS |
+| `cargo clippy --workspace --all-targets --locked -- -D warnings` | PASS |
+| `make test` | PASS; 4,620 library tests passed, 1 ignored; all registered integration targets and doctests passed |
+| `make docs-reference` | no diff against the committed reference |
+
+One focused run under heavy host load failed
+`docker_and_apple_close_io_and_cancel_dropped_wait_on_piped_and_pty_paths`
+(its 20 ms "still running" window); this follow-up does not touch that test or
+its fixture. It passed on three immediate reruns and in the full `make test` run.

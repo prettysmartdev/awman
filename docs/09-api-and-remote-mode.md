@@ -3,7 +3,7 @@
 awman can be driven over HTTP instead of from an interactive terminal. This guide covers both halves of that:
 
 - **[API mode](#api-mode)** — the *server*. `awman api start` exposes awman's sessions and subcommands over HTTP so scripts, CI pipelines, and any HTTP client can drive them. This half also covers [non-interactive (headless) operation](#non-interactive-headless-operation), which applies to plain CLI use too.
-- **[Remote mode](#remote-mode)** — the *client*. `awman remote …` is a thin client for an awman API server on another machine, with live log streaming and TUI pickers, so you can dispatch work to a build host as if it were local.
+- **[Remote mode](#remote-mode)** — the *client*. `awman remote …` is a thin command-line client for an awman API server, with live log streaming, so you can dispatch work to a build host as if it were local.
 
 You do not need remote mode to use the API (curl works fine), and you do not need to understand the HTTP surface to use `awman remote`. Read whichever half you need.
 
@@ -13,7 +13,7 @@ You do not need remote mode to use the API (curl works fine), and you do not nee
 
 API mode exposes awman's session and subcommand execution over HTTP. Start a persistent server with `awman api start`, then drive sessions and subcommands from scripts, CI pipelines, or any HTTP client — no interactive terminal or TUI required.
 
-A **session** in API mode is conceptually identical to a TUI tab: a named, isolated workspace bound to a working directory. Subcommands dispatched to a session (`exec workflow`, `chat`, etc.) execute exactly as they would in a TUI tab — inside a Docker container, with all the same security and isolation guarantees.
+A **session** in API mode is conceptually identical to a TUI tab: an isolated workspace bound to a working directory. Commands dispatched to a session (`exec prompt`, `exec workflow`, and the others listed under [Submit a command](#submit-a-command)) execute exactly as they would in a TUI tab — inside a container on the configured runtime, with the same security and isolation guarantees.
 
 API metadata, credentials, and output logs are recorded durably under
 `~/.awman/api/` for auditability. The shared SQLite database is stored at
@@ -32,9 +32,8 @@ API mode is useful for:
 
 - CI pipelines that trigger `exec workflow` or `exec prompt` runs and poll for results
 - Scripts or tooling that execute workflows and retrieve output programmatically
-- Remote integrations where the awman server runs on one machine and clients run elsewhere
+- Remote integrations where the awman server runs on a build host and clients reach it through a tunnel or proxy
 - Audit-heavy environments where a complete durable record of every agent action is required
-- One-shot agent invocations from scripts using `awman exec prompt` or `awman exec workflow`
 
 For single interactive sessions, use `awman chat` instead.
 
@@ -42,11 +41,11 @@ For single interactive sessions, use `awman chat` instead.
 
 ## Quickstart — copy-pastable examples
 
-These examples assume a server running on `127.0.0.1:9876`. The server speaks HTTPS by default with a self-signed cert, so curl needs `-k` (or `--cacert ~/.awman/api/tls/cert.pem`) to skip verification. Pass `--dangerously-skip-tls` at server start if you'd rather use plain HTTP.
+These examples assume a server on `127.0.0.1:9876` (the server always listens on loopback; see [Reaching the server from another machine](#reaching-the-server-from-another-machine)). It speaks HTTPS with a self-signed cert by default, so curl needs `-k` (or `--cacert ~/.awman/api/tls/cert.pem`). Pass `--dangerously-skip-tls` at server start if you'd rather use plain HTTP.
 
 ```sh
-# 0. Start the server (one-time; stores its api_key.hash under ~/.awman/api).
-#    The plaintext key is shown ONCE in the startup banner; copy it now.
+# 0. Start the server. The first start generates an API key and prints it
+#    ONCE in a banner; copy it now.
 awman api start --port 9876 --workdirs "$HOME/my-project" --background
 
 # Stash the key the banner just printed:
@@ -67,14 +66,18 @@ SESSION=$(curl -sk -X POST "$SERVER/v1/sessions" \
   -H 'Content-Type: application/json' \
   -d "{\"session_type\":\"local\",\"workdir\":\"$HOME/my-project\"}" | jq -r .session_id)
 
-# 2. Dispatch a one-shot prompt; the response carries the command_id
+# 2. Wait for session setup (it runs `ready`) to finish
+until [ "$(curl -sk "$SERVER/v1/sessions/$SESSION/status" \
+  -H "Authorization: Bearer $KEY" | jq -r .status)" = ready ]; do sleep 2; done
+
+# 3. Dispatch a one-shot prompt; the response carries the command_id
 CMD=$(curl -sk -X POST "$SERVER/v1/commands" \
   -H "Authorization: Bearer $KEY" \
   -H 'Content-Type: application/json' \
   -d '{"session_id":"'"$SESSION"'","subcommand":"exec prompt","args":["Summarise recent changes","--non-interactive"]}' \
   | jq -r .command_id)
 
-# 3. Stream the output until the command finishes
+# 4. Stream the output until the command finishes
 curl -Nsk "$SERVER/v1/commands/$CMD/logs" \
   -H "Authorization: Bearer $KEY" \
   | while IFS= read -r line; do
@@ -84,24 +87,26 @@ curl -Nsk "$SERVER/v1/commands/$CMD/logs" \
       esac
     done
 
-# 4. Close the session
+# 5. Close the session
 curl -sk -X DELETE "$SERVER/v1/sessions/$SESSION" \
   -H "Authorization: Bearer $KEY"
 ```
 
-**Using `awman` itself** (no manual session handling — `awman remote` handles it):
+[`POST /v1/runs`](#one-shot-runs) combines steps 1–3 (and optionally 5) into one request.
+
+**Using `awman` itself** (`awman remote` waits for readiness for you):
 
 ```sh
 # One-time setup so subsequent commands don't need flags
 awman config set --global remote.defaultAddr "$SERVER"
 awman config set --global remote.defaultAPIKey "$KEY"
 
-# Start a session bound to the local directory and capture its ID
-SESSION=$(awman remote session start "$HOME/my-project" \
-  | awk '/Session started:/ {print $NF}')
+# Start a session (returns once setup is ready) and capture its ID
+SESSION=$(awman remote session start --workdir "$HOME/my-project" \
+  | awk '/ created via / {print $2}')
 
 # Dispatch the same prompt and stream its output live
-awman remote exec prompt "Summarise recent changes" --non-interactive \
+awman remote exec prompt "Summarise recent changes" \
   --session "$SESSION" --follow
 
 # Close the session
@@ -125,35 +130,45 @@ SESSION=$(curl -sk -X POST "$SERVER/v1/sessions" \
     "branch": "main"
   }' | jq -r .session_id)
 
-# 2. Run a workflow against the clone
+# 2. Wait for the clone and setup to finish ("failed" means setup failed)
+until [ "$(curl -sk "$SERVER/v1/sessions/$SESSION/status" \
+  -H "Authorization: Bearer $KEY" | jq -r .status)" = ready ]; do sleep 5; done
+
+# 3. Run a workflow against the clone
 CMD=$(curl -sk -X POST "$SERVER/v1/commands" \
   -H "Authorization: Bearer $KEY" \
   -H 'Content-Type: application/json' \
   -d '{"session_id":"'"$SESSION"'","subcommand":"exec workflow","args":["aspec/workflows/implement-feature.toml","--work-item","0053"]}' \
   | jq -r .command_id)
 
-# 3. Poll status until terminal
+# 4. Poll status until terminal
 while true; do
-  STATUS=$(curl -sk "$SERVER/v1/commands/$CMD/status" \
+  STATUS=$(curl -sk "$SERVER/v1/commands/$CMD" \
     -H "Authorization: Bearer $KEY" | jq -r .status)
   echo "status=$STATUS"
   case "$STATUS" in done|error|cancelled) break ;; esac
   sleep 5
 done
 
-# 4. Closing deletes the on-server clone
+# 5. Closing deletes the on-server clone
 curl -sk -X DELETE "$SERVER/v1/sessions/$SESSION" \
   -H "Authorization: Bearer $KEY"
 ```
 
-**Using `awman` itself:** the `awman remote session start` command currently expects a path that already exists on the server, so for remote (clone-on-server) sessions create the session via curl as shown above, then drive it with `awman remote exec --session <id>`:
+**Using `awman` itself:**
 
 ```sh
-# Drive the just-created remote-clone session with awman
+SESSION=$(awman remote session start --type remote \
+  --repo-url https://github.com/org/my-project --branch main \
+  | awk '/ created via / {print $2}')
+
 awman remote exec workflow aspec/workflows/implement-feature.toml \
-  --work-item 0053 \
-  --session "$SESSION" --follow
+  --work-item 0053 --session "$SESSION" --follow
+
+awman remote session kill "$SESSION"
 ```
+
+`awman remote session start` does not set `base_ref`, `merge_refs` or `push`; use the HTTP API for those.
 
 ---
 
@@ -185,23 +200,9 @@ awman exec prompt "Security review for: " --issue 84
 awman exec prompt "Implement caching for the API layer" --yolo --non-interactive
 ```
 
-When neither a positional prompt nor `--issue` are provided, the command exits with an error. When `--issue` is used alone, the positional prompt is optional. When both a positional prompt and `--issue` are provided, your text appears first, followed by the issue content.
+A prompt, `--issue`, or both is required. With both, your text comes first, followed by the issue content ([GitHub Integration](10-github-integration.md)).
 
-**Flags accepted by `exec prompt`:**
-
-| Flag | Description |
-|------|-------------|
-| `--issue <ref>` | GitHub issue number, URL, or `owner/repo#N`; see [GitHub Integration](10-github-integration.md) |
-| `--non-interactive` / `-n` | Run in print/batch mode — agent executes and exits |
-| `--plan` | Read-only analysis mode — agent cannot modify files |
-| `--allow-docker` | Mount host Docker socket into the container |
-| `--overlay=<SPEC>` | Apply overlay(s) for this run; see [Overlays](08-overlays.md) |
-| `--auto` | Auto-approve file edits; prompt before shell commands |
-| `--yolo` | Fully autonomous mode — skip all permission prompts |
-| `--agent=<name>` | Override the agent for this run |
-| `--model=<NAME>` | Override the model for this run |
-
-All flags behave identically to their `chat` counterparts. See [Agent Sessions](03-agent-sessions.md#flags-common-to-chat-and-other-agent-launching-commands).
+`exec prompt` accepts the same agent flags as `chat` (`--non-interactive`/`-n`, `--plan`, `--auto`, `--yolo`, `--agent`, `--model`, `--overlay`, `--agent-flag`, `--launch-mode`, `--allow-docker`); see [Agent Sessions](03-agent-sessions.md#flags-common-to-chat-and-other-agent-launching-commands) and the [Command Reference](14-command-reference.md#awman-exec-prompt).
 
 ---
 
@@ -234,37 +235,11 @@ awman exec workflow ./aspec/workflows/review.toml --non-interactive
 warning: workflow uses {{work_item_content}} but no --work-item was provided; placeholder left unexpanded
 ```
 
-When `--work-item <N>` is provided, awman resolves the work item file from the configured work items directory and substitutes all template variables. When `--issue <ref>` is provided, awman fetches the GitHub issue and substitutes the same template variables.
+With `--work-item <N>`, awman resolves the work item file from the configured work items directory and substitutes all template variables; `--issue <ref>` fetches the GitHub issue and substitutes the same variables.
 
-**Workflow state files:** When no work item or issue is given, the state file is keyed by the workflow file's name and content hash:
+Workflow state is saved under `$GITROOT/.awman/workflows/` as `<repo-hash8>-<work-item>-<workflow-name>.json`, or `<repo-hash8>-<workflow-name>.json` without a work item.
 
-```
-~/.awman/api/<workflow-name>-<content-hash8>.state.json
-```
-
-When a work item or issue is given, the state file is saved to:
-
-```
-$GITROOT/.awman/workflows/<repo-hash8>-<work-item>-<workflow-name>.json
-```
-
-**Flags accepted by `exec workflow`:**
-
-| Flag | Description |
-|------|-------------|
-| `--work-item <N>` / `-w <N>` | Work item number; enables template variable substitution |
-| `--issue <ref>` | GitHub issue number, URL, or `owner/repo#N`; mutually exclusive with `--work-item` |
-| `--non-interactive` / `-n` | Run each step's agent in print/batch mode |
-| `--plan` | Read-only mode for all steps |
-| `--allow-docker` | Mount host Docker socket into each step's container |
-| `--worktree` | Run all steps in an isolated Git worktree |
-| `--overlay=<SPEC>` | Apply overlay(s) to every step; see [Overlays](08-overlays.md) |
-| `--auto` | Auto-approve file edits; prompt before shell commands |
-| `--yolo` | Fully autonomous mode; implies `--worktree`; auto-advances stuck steps |
-| `--agent=<name>` | Default agent for steps that do not specify an `Agent:` field |
-| `--model=<NAME>` | Default model for steps that do not specify a `Model:` field |
-
-All workflow flags are described in [Workflows](05-workflows.md#flags).
+All workflow flags (`--worktree`, `--yolo`, `--dynamic`, `--on-existing-worktree`, the prerequisite flags, `--json`, …) are described in [Workflows](05-workflows.md#flags) and listed in the [Command Reference](14-command-reference.md#awman-exec-workflow).
 
 ---
 
@@ -312,12 +287,7 @@ Force non-interactive mode even when a TTY is available. Useful for:
 
 ### Yolo mode in headless contexts
 
-`--yolo` works seamlessly without a terminal, and its stuck-detection keeps unattended runs from stalling:
-
-1. **Stuck detection** runs continuously — the engine tracks output on stdout and stderr.
-2. **Auto-advance after 30 seconds of silence** — a 60-second countdown begins when no output is seen.
-3. **Countdown via stderr/logs** — progress is printed to stderr (one message every 10 seconds to avoid noise).
-4. **Auto-advance when the countdown expires** — the step advances with no user input.
+`--yolo` works without a terminal, and its stuck detection keeps unattended runs from stalling: when a step produces no output for the stuck timeout (`agentStuckTimeout`, default 30 seconds), a 60-second countdown starts, reported on stderr every 10 seconds, and the step advances when it expires.
 
 ```sh
 # CI: no explicit --non-interactive needed; awman detects the headless context
@@ -348,7 +318,7 @@ An agent that needs full-screen terminal control (e.g. an interactive editor) re
 
 Headless, CI, and API-server runs work the same way under `runtime: "builtin-experimental"` (macOS on Apple Silicon only), with these differences:
 
-- The host must be an Apple Silicon Mac running the signed `awman-macos-arm64` binary (a macOS CI runner or VM must itself expose Hypervisor.framework). There is no Docker daemon requirement to run agents, but every agent image must already be imported: run `awman ready` (with a configured `builtin.imageSource`) as a setup step before `exec` commands. A missing image fails fast with build-and-import instructions rather than building.
+- The host must be an Apple Silicon Mac running the signed `awman-macos-arm64` binary (a macOS CI runner or VM must itself expose Hypervisor.framework). No Docker daemon is needed to run agents, but images must be available: run `awman ready` (with a configured `builtin.imageSource`) as a setup step. Unless `builtin.builder.enabled` is set with a local source, a launch whose image is missing fails with build-and-import instructions; workflow preflight and squad never build.
 - Each session's microVM lives and dies with the awman process that launched it. Under `awman api start`, that is the API server; stopping the server stops the VMs it launched.
 - `awman ready --json` includes an `image_source` entry when images were imported.
 
@@ -364,7 +334,7 @@ See [Runtimes: Builtin microVM](11-runtimes.md#builtin-microvm-experimental).
 awman api start --port 9876 --workdirs /path/to/repo
 ```
 
-The server starts on the specified port (default `9876`) and accepts requests for the life of the process. The first start auto-generates an API key and prints it in a banner — copy it then; it isn't shown again. Subsequent starts reuse the same hash silently. By default the server speaks HTTPS on a self-signed cert; pass `--dangerously-skip-tls` to fall back to plain HTTP for trusted-local use. Logs are emitted to stderr (color-coded when stderr is a TTY); press `Ctrl+C` to stop.
+The server listens on `127.0.0.1` at the given port (default `9876`) and accepts requests for the life of the process. The first start generates an API key and prints it in a banner — copy it then; it isn't shown again. Subsequent starts reuse the stored hash silently. By default the server speaks HTTPS with a self-signed cert; pass `--dangerously-skip-tls` for plain HTTP in trusted-local use. Logs go to stderr; press `Ctrl+C` to stop.
 
 ```sh
 # Multiple working directories
@@ -389,9 +359,21 @@ awman api start --dangerously-skip-auth --port 9876 --workdirs /repo
 
 | Flag | Description |
 |------|-------------|
-| `--refresh-key` | Generate a new API key, write its hash to disk, and print the plaintext key. The old key is invalidated immediately. The command exits after printing — it does not start the server. |
+| `--refresh-key` | Generate a new API key, write its hash to disk, and print the plaintext key, then exit without starting the server. Stop a running server first (`awman api kill`); the old key stops working when the server next starts. |
 | `--dangerously-skip-auth` | Disable authentication for this process lifetime only. The `api_key.hash` file is left untouched; the next normal start re-enables auth using the stored hash. |
-| `--dangerously-skip-tls` | Serve plain HTTP on the loopback interface instead of HTTPS. Intended for tests and trusted-local environments only; the server logs a loud warning at startup. Clients must connect with `http://` (not `https://`). |
+| `--dangerously-skip-tls` | Serve plain HTTP instead of HTTPS. Intended for tests and trusted-local environments only; the server logs a warning at startup. Clients must connect with `http://`. |
+
+### Reaching the server from another machine
+
+The server binds to `127.0.0.1` only; there is no flag to listen on another interface. To use it from another machine, forward the port over SSH (for example `ssh -N -L 9876:127.0.0.1:9876 build-host`) or put a reverse proxy on the server host in front of it.
+
+If `awman remote` cannot connect to a non-loopback address, its error says so and suggests the tunnel:
+
+```
+awman: remote connection refused: …; the awman API server listens on 127.0.0.1 only, so https://build-host:9876 must be an SSH tunnel (`ssh -N -L 9876:127.0.0.1:9876 <server-host>`, then use https://127.0.0.1:9876) or a reverse proxy running on the server host
+```
+
+When `awman remote` targets a loopback address, it trusts the certificate at `~/.awman/api/tls/cert.pem` on the *client* machine, so through an SSH tunnel copy the server's `cert.pem` there. For a non-loopback address (a proxy), the proxy must present a certificate the client trusts.
 
 ### Background
 
@@ -403,19 +385,13 @@ awman api start --background --port 9876 --workdirs /path/to/repo
 
 | Platform | Mechanism |
 |----------|-----------|
-| Linux (systemd available) | `systemd-run --user` writes a transient unit |
-| macOS (launchd) | Writes `~/Library/LaunchAgents/io.awman.api.plist` and calls `launchctl load` |
-| Fallback (no systemd/launchd) | Double-fork; PID written directly |
+| Linux (systemd available) | `systemd-run --user` transient unit |
+| macOS (launchd) | `~/Library/LaunchAgents/io.awman.api.plist`, loaded with `launchctl` |
+| Fallback | Detached child process |
 
 The PID is stored at `~/.awman/api/awman.pid`. Logs go to `~/.awman/api/awman.log`.
 
-If a server is already running (detected via `awman.pid` and a live process check), `start` prints an error and exits with a non-zero code rather than silently competing for the port.
-
-If `bind()` fails because the port is already in use, the error message includes the port number and the PID holding it (when discoverable):
-
-```
-error: port 9876 is already in use (PID 41290)
-```
+If a server is already running, `start` fails with `API server already running on PID <pid>`. If the port is taken by something else, it fails with `Port 9876 is already in use. Use --port to choose a different port.`
 
 ### API server and squad daemon
 
@@ -441,21 +417,13 @@ from the squad user's perspective.
 awman api status
 ```
 
-Prints whether the server is running, its PID, port, active session count, and uptime:
+Prints whether the server is running, its PID and address, and whether it answers an HTTP probe:
 
 ```
-Status:          running
-PID:             81234
-Port:            9876
-Active sessions: 2
-Uptime:          3h 14m
+API server is running (PID 81234) at https://127.0.0.1:9876.
 ```
 
-If the server is not running:
-
-```
-Status:  not running
-```
+When it is not running: `API server is not running.` For session and command counts, call [`GET /v1/status`](#server-health).
 
 ### Logs
 
@@ -463,14 +431,7 @@ Status:  not running
 awman api logs
 ```
 
-Streams `~/.awman/api/awman.log` to stdout in real time (equivalent to `tail -f`). Only available when the server was started with `--background`. Press `Ctrl+C` to stop streaming.
-
-If no log file exists:
-
-```
-error: no log file found at ~/.awman/api/awman.log
-       start the server with --background to enable file logging
-```
+Prints the contents of `~/.awman/api/awman.log`, which is written only when the server was started with `--background` (use `tail -f` on that file to follow it). If the file does not exist, awman says `Log file not found: <path>`.
 
 #### Session-setup verbosity
 
@@ -490,13 +451,7 @@ To silence this verbose stream, set `AWMAN_API_VERBOSE_SETUP=0` before starting 
 awman api kill
 ```
 
-Sends `SIGTERM` to the background server process, allows in-flight requests to drain (up to the graceful shutdown period), and removes the PID file. On macOS, also unloads the launchd plist.
-
-If the server is not running:
-
-```
-info: server is not running (no PID file found)
-```
+Stops the background server (see [Graceful shutdown](#graceful-shutdown)) and removes its PID file, printing `API server (PID <pid>) stopped.` When no server is running it prints `No API server is running (no PID file found).` (or notes a stale PID file it removed) and exits 1.
 
 ---
 
@@ -506,7 +461,7 @@ The API server uses cryptographic API key authentication. Every HTTP request mus
 
 ### First start — key generation
 
-On the first start (when no `api_key.hash` file exists in `~/.awman/api/`), awman automatically generates a cryptographically random 32-byte key, stores only its SHA-256 hash on disk (never the plaintext), and prints the key to stdout once:
+On the first start (when no `api_key.hash` file exists in `~/.awman/api/`), awman generates a random 32-byte key (64 hex characters), stores only its SHA-256 hash on disk, and prints the key once:
 
 ```
 ╔═══════════════════════════════════════════════════════════════════╗
@@ -515,7 +470,7 @@ On the first start (when no `api_key.hash` file exists in `~/.awman/api/`), awma
 ╚═══════════════════════════════════════════════════════════════════╝
 ```
 
-**This is the only time the plaintext key appears.** Store it immediately. Key generation happens before the log file is opened, so the key cannot appear in `awman.log` under any circumstances.
+**This is the only time the plaintext key appears.** Store it immediately. With `--background`, the key is printed by the starting command, before the daemon and its log file exist, so it never appears in `awman.log`. In the TUI and over the API the key is stated as plain text instead of a box.
 
 ### Subsequent starts
 
@@ -529,7 +484,7 @@ To invalidate the current key and generate a new one:
 awman api start --refresh-key --port 9876 --workdirs /repo
 ```
 
-A new key is generated and its hash replaces the file on disk. The new plaintext key is printed to stdout using the same banner format. All clients using the old key will immediately receive HTTP 401 and must be updated.
+A new key is generated, its hash replaces the file on disk, and the key is printed in the same banner. The command then exits without starting the server; it refuses to run while a server is running. Clients using the old key receive HTTP 401 from the next server start and must be updated.
 
 ### Disabling authentication — `--dangerously-skip-auth`
 
@@ -562,7 +517,7 @@ When using `awman remote` subcommands, the key is resolved and injected automati
 | No `Authorization` header | 401 | `{"error": "API key required. Pass the key via the Authorization header (e.g. Authorization: Bearer <key>).", "code": "unauthorized"}` |
 | Wrong key | 401 | `{"error": "Invalid API key.", "code": "unauthorized"}` |
 
-Hash comparisons use constant-time comparison (`ring::constant_time::verify_slices_are_equal`) to prevent timing attacks.
+The `Bearer` prefix is matched case-insensitively. Hashes are compared in constant time, and a request with no header costs the same as one with a wrong key.
 
 ### Key storage
 
@@ -624,25 +579,11 @@ curl http://localhost:9876/v1/workdirs
 
 The API server uses a per-session FIFO queue to serialize command execution. When you submit a command via `POST /v1/commands`, it is enqueued immediately and returns with a `command_id`. A pool of worker tasks processes the queue: each worker claims one queued command at a time and executes it, then claims the next one.
 
-**Key properties:**
+- **One command per session at a time**, in submission order, so commands in a session don't interfere with each other.
+- **Concurrency across sessions**: with N workers, up to N sessions run a command at once. Set N with the global `workers` setting (default 2; see [Server configuration](#server-configuration)).
+- **Submission does not wait for execution**: a valid command for a ready session is enqueued with HTTP 202. `POST /v1/commands` returns 409 if the session is closing or its setup is not ready; `POST /v1/runs` can queue its command during setup.
 
-- **One command per session at a time**: Within a single session, only one command runs at any moment. Commands are processed in strict FIFO order (ordered by submission time). This ensures workflows don't interfere with each other.
-
-- **Concurrent execution across sessions**: With N worker tasks and M sessions with queued commands, up to min(N, M) commands can run *concurrently* — one per session. For example, with 2 workers and 3 sessions, 2 sessions can execute in parallel while the 3rd waits.
-
-- **Submission does not wait for execution**: A valid command for a ready session is enqueued with HTTP 202. `POST /v1/commands` returns 409 if the session is closing or setup is not ready; `POST /v1/runs` can queue its command during setup. Poll `GET /v1/commands/{id}/status` or `GET /v1/sessions/{id}/queue` to check progress.
-
-**Monitoring queue status:**
-
-Use `GET /v1/sessions/{id}/queue` to inspect the queue depth, which command is currently running, and recently completed commands. This is useful for:
-
-- Checking how long commands will take to run (based on queue depth)
-- Diagnosing stalls or stuck commands
-- Capacity planning (how many workers to run)
-
-**Configuration:**
-
-The number of worker tasks is configurable via the `workers` global config option. The default is 2 workers. See [Server configuration](#server-configuration) below.
+Track progress with `GET /v1/commands/{id}`, or inspect a session's queue depth, running command and recent completions with [`GET /v1/sessions/{id}/queue`](#get-session-queue-status).
 
 ---
 
@@ -690,6 +631,8 @@ Every `curl` example in the rest of this document elides `-k`/`--cacert` for bre
 | `GET` | `/v1/commands/:id` | Get command status and metadata (`/v1/commands/:id/status` returns the same body) |
 | `GET` | `/v1/commands/:id/logs` | Stream structured command events via Server-Sent Events; `?format=json` returns the captured events instead |
 | `GET` | `/v1/commands/:id/workflow` | Get the workflow state for a command (`/v1/workflows/:id` returns the same body) |
+| `GET` | `/v1/commands/:id/outputs` | List files the agent wrote under `/awman/output` |
+| `GET` | `/v1/commands/:id/outputs/*path` | Download one output file |
 | `GET` | `/v1/status` | Server health (uptime, active sessions, running commands, and supported `features`) |
 
 ### Agent commands
@@ -708,8 +651,9 @@ session's working directory:
 
 For example, set `subcommand` to `agents status` or `agents kill` and pass
 arguments such as the agent ID and `--yes` in the request's `args` array. The
-result is emitted as one `StdoutLine` event containing the same JSON payload as
-the CLI's `--json` output. The same commands are documented in [Monitoring running agents](03-agent-sessions.md#monitoring-running-agents).
+result is the same JSON payload as the CLI's `--json` output, emitted as
+one `StdoutLine` event and stored in the command's `result.data`. The same
+commands are documented in [Monitoring running agents](03-agent-sessions.md#monitoring-running-agents).
 
 ---
 
@@ -737,11 +681,13 @@ curl -s -X POST http://localhost:9876/v1/sessions \
   -d '{"session_type":"remote","repo_url":"https://github.com/org/repo","branch":"main"}'
 ```
 
-Both types return immediately with a session UUID:
+`session_type` defaults to `local`. Both types return HTTP 202 immediately with a session UUID:
 
 ```json
 { "session_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890" }
 ```
+
+Setup (cloning, for a remote session, then the same checks and image preparation as `awman ready`) continues in the background. Commands can be submitted once `GET /v1/sessions/:id/status` reports `ready`; until then `POST /v1/commands` returns HTTP 409 `session_not_ready`. [`POST /v1/runs`](#one-shot-runs) queues a command without waiting.
 
 **Remote session options** — a remote session body can also carry these optional fields, all of which require `branch`:
 
@@ -773,54 +719,38 @@ Commands share the clone's working state. Edits left by a failed command remain 
 
 If the push fails (for example the branch moved on `origin`, or the credentials are rejected), the command ends with status `error`, exit code 1 and `stage: "push"`, with git's error text included. Local commits stay in the clone; nothing is retried or forced.
 
-The push runs on the server as the user running `awman api`, using that user's git credentials (SSH keys, credential helpers), until per-session credentials are available. Make sure that account can push to `repo_url`. Host push-back uses isolated Git metadata with hooks and repository-configured helpers disabled; the destination comes from the session's saved URL. Each host push-back Git operation times out after two minutes.
+The push runs on the server as the user running `awman api`, using that user's git credentials (SSH keys, credential helpers). Make sure that account can push to `repo_url`. Host push-back uses isolated Git metadata with hooks and repository-configured helpers disabled; the destination comes from the session's saved URL. Each host push-back Git operation times out after two minutes.
 
-**Local sessions** bind to an existing directory on the server. The directory must be in the allowlist (an `api.workDirs` / `--workdirs` entry, or a Git repository directly beneath an `api.workDirRoots` / `--workdir-root` root). Workflows run directly in that directory.
+**Local sessions** bind to an existing directory on the server. The directory must be in the allowlist (an `api.workDirs` / `--workdirs` entry, or a Git repository directly beneath an `api.workDirRoots` / `--workdir-root` root). Commands run against that directory; an `exec workflow` with `--worktree` (implied by the API's default `--yolo`) runs in a worktree of it under `~/.awman/worktrees/`.
 
-**Remote sessions** clone a git repository into `<API root>/sessions/<session_id>/<repository-folder>` on the server. The API root is selected from `AWMAN_API_ROOT`, `AWMAN_CONFIG_HOME/api`, `XDG_DATA_HOME/awman/api`, then `~/.awman/api`, in that order. Workflows run inside the clone. Closing the session deletes the clone; command logs remain in API storage. This is useful for running ephemeral CI jobs without a local checkout.
+**Remote sessions** clone a git repository into `<API root>/sessions/<session_id>/<repository-folder>` on the server. The API root is selected from `AWMAN_API_ROOT`, `AWMAN_CONFIG_HOME/api`, `XDG_DATA_HOME/awman/api`, then `~/.awman/api`, in that order. Commands run inside the clone. Closing the session deletes the clone; command logs remain in API storage. This is useful for running ephemeral CI jobs without a local checkout.
 
-#### End-to-end example: Remote session workflow with setup and teardown
+#### End-to-end example: remote session with setup and teardown
 
-This example demonstrates using a remote session to run an automated feature implementation workflow with setup and teardown steps. The repo is cloned by awman at session creation; setup installs dependencies; the main workflow steps implement the feature; teardown runs tests and creates a pull request.
+The server clones the repository when the session is created; the workflow's setup installs dependencies, its steps implement the feature, and teardown tests, commits, pushes and opens a pull request.
 
-**1. Create a remote session:**
+**1. Create a remote session and wait for `ready`:**
 
 ```sh
-curl -s -X POST http://localhost:9876/v1/sessions \
+SESSION=$(curl -s -X POST http://localhost:9876/v1/sessions \
   -H 'Authorization: Bearer <api-key>' \
   -H 'Content-Type: application/json' \
-  -d '{
-    "session_type": "remote",
-    "repo_url": "https://github.com/org/my-project",
-    "branch": "main"
-  }'
+  -d '{"session_type":"remote","repo_url":"https://github.com/org/my-project","branch":"main"}' \
+  | jq -r .session_id)
+
+until [ "$(curl -s http://localhost:9876/v1/sessions/$SESSION/status \
+  -H 'Authorization: Bearer <api-key>' | jq -r .status)" = ready ]; do sleep 5; done
 ```
 
-Response:
-```json
-{ "session_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890" }
-```
-
-At this point, the repository has been cloned on the server and the main branch has been checked out. The session's working directory contains a fresh clone.
-
-**2. Create a workflow file with setup and teardown (saved to your repo as `aspec/workflows/implement-feature.toml`):**
+**2. The workflow file, committed in the repository as `aspec/workflows/implement-feature.toml`:**
 
 ```toml
 name = "implement-feature"
 teardown_on_failure = true
 
 [[setup]]
-type = "checkout_create_branch"
-branch = "feature/auto-implementation"
-base = "main"
-
-[[setup]]
 type = "run_shell"
 command = "npm install"
-
-[[setup]]
-type = "run_shell"
-command = "npm run build"
 
 [[steps]]
 name = "implement"
@@ -842,79 +772,39 @@ command = "npm test"
 [[teardown]]
 type = "commit_changes"
 message = "feat: implementation from automated workflow"
-add_all = true
 
 [[teardown]]
 type = "push_branch"
-remote = "origin"
-branch = "feature/auto-implementation"
 
 [[teardown]]
 type = "create_pull_request"
 title = "feat: auto-implemented feature"
-body = "This PR was automatically generated by an awman workflow."
 base = "main"
 ```
 
-**3. Submit the workflow to the remote session:**
+API commands default to `--yolo`, which implies `--worktree`, so the run already happens on its own branch; `push_branch` with no fields pushes that branch.
+
+**3. Submit and follow it:**
 
 ```sh
-curl -s -X POST http://localhost:9876/v1/commands \
+CMD=$(curl -s -X POST http://localhost:9876/v1/commands \
   -H 'Authorization: Bearer <api-key>' \
   -H 'Content-Type: application/json' \
-  -d '{
-    "session_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
-    "subcommand": "exec workflow",
-    "args": ["aspec/workflows/implement-feature.toml", "--work-item", "0053"]
-  }'
+  -d '{"session_id":"'"$SESSION"'","subcommand":"exec workflow","args":["aspec/workflows/implement-feature.toml","--work-item","0053"]}' \
+  | jq -r .command_id)
+
+curl -N http://localhost:9876/v1/commands/$CMD/logs -H 'Authorization: Bearer <api-key>'
 ```
 
-Response:
-```json
-{ "command_id": "e5f6a7b8-c9d0-e1f2-3456-7890abcdef01" }
-```
+Notes:
 
-**4. What happens next:**
+- Setup and teardown steps run in containers with the session's checkout mounted, like agent steps. Because `teardown_on_failure = true`, teardown runs even if a step fails.
+- If the workflow is resumed, the whole setup phase runs again, so setup steps should be idempotent.
+- `commit_changes`, `push_branch` and `create_pull_request` need a git identity, push credentials and a GitHub token, and `gh` in the base image. A headless run with an unresolved prerequisite fails before launch by default, so grant them in `args` (for example `"--prerequisite-token","env:GITHUB_TOKEN"`); see [Workflow prerequisite checks](05-workflows.md#workflow-prerequisite-checks).
+- When the command finishes, `result.pull_request.url` names the pull request it opened.
+- Closing the session deletes the clone; command records and logs are kept.
 
-The workflow executes in three phases:
-
-1. **Setup phase:** Inside a background container with the cloned repo mounted:
-   - Check out a new feature branch from main
-   - Run `npm install` to install dependencies
-   - Run `npm run build` to build the project
-
-2. **Main phase:** Run the implement and review steps (agent sessions as usual)
-
-3. **Teardown phase:** After main steps complete, inside a new background container:
-   - Run the test suite (`npm test`)
-   - Commit all changes with a descriptive message
-   - Push the feature branch to the remote (`origin`)
-   - Create a pull request via the GitHub CLI
-
-If any step fails (including setup), all subsequent steps are skipped. Because `teardown_on_failure = true`, the teardown phase still runs even if the main workflow fails — useful for cleanup or test reports.
-
-**5. Monitor progress:**
-
-```sh
-# Check command status
-curl -s http://localhost:9876/v1/commands/e5f6a7b8-c9d0-e1f2-3456-7890abcdef01/status \
-  -H 'Authorization: Bearer <api-key>'
-
-# Stream output live
-curl -s http://localhost:9876/v1/commands/e5f6a7b8-c9d0-e1f2-3456-7890abcdef01/logs \
-  -H 'Authorization: Bearer <api-key>'
-```
-
-**Key observations:**
-
-- The repository provisioning (`clone`, `branch checkout`) is handled automatically by awman's `GitEngine` when the session is created — the setup phase does not need to clone the primary repo.
-- Setup and teardown steps run inside isolated containers, ensuring no side effects on the host.
-- All environment variables configured for the project (overlays, env vars) are available in setup and teardown containers.
-- If the workflow is interrupted and resumed, the entire setup phase re-runs (steps should be idempotent — e.g., use `npm install` which is safe to re-run).
-- The `create_pull_request` step requires the `gh` (GitHub CLI) tool to be available in the base container image. Ensure your `Dockerfile.dev` includes it.
-- When the session is closed, the cloned directory and all generated artifacts are deleted from the server.
-
-Error responses:
+Session-creation error responses:
 
 | Situation | HTTP status |
 |-----------|-------------|
@@ -1018,7 +908,9 @@ curl -s -X POST http://localhost:9876/v1/commands \
   -d '{"session_id":"<session-id>","subcommand":"exec prompt","args":["hello"]}'
 ```
 
-Dispatches a subcommand to the session named by the `session_id` field in the JSON body. The `x-awman-session` header is still supported as an alternative; if both are sent they must name the same session, otherwise the request is rejected with HTTP 400 `invalid_request`. Idempotency comparison covers whichever form was sent. The API accepts commands enabled for API use, including squad task and daemon-management commands. `squad attach` is intentionally excluded: attaching owns an interactive PTY and must be run from the CLI or TUI.
+Dispatches a subcommand to the session named by the `session_id` field in the JSON body. The `x-awman-session` header is still supported as an alternative; if both are sent they must name the same session, otherwise the request is rejected with HTTP 400 `invalid_request`. Idempotency comparison covers whichever form was sent.
+
+The API accepts these commands: `exec prompt`, `exec workflow`, `agents status|list|detail|kill` (see [Agent commands](#agent-commands)), and the `squad` task and daemon commands except `squad attach` (which needs an interactive PTY) and `squad env`. Anything else — `chat`, `ready`, `init`, `config`, `new`, `clean`, `remote` — is refused with HTTP 400 `invalid_request` ("command not available via API"), and the response lists the available commands. The [Command Reference](14-command-reference.md) marks each command's frontends.
 
 For `exec`, put the action in `subcommand` (`exec prompt` or `exec workflow`) and the action's arguments in `args`. A bare `"subcommand": "exec"` with the action as the first `args` entry is rejected at admission with HTTP 400 `invalid_request`:
 
@@ -1060,14 +952,14 @@ Returns immediately with a command UUID — the command is **enqueued** and exec
 
 The command begins executing as soon as a worker claims it from the queue. **At most one command per session runs at any given time** — commands within a session are processed sequentially in FIFO order. If a command is already running, subsequent commands are queued and wait their turn (they do not block the API request).
 
-**`flags_applied`:** Every `POST /v1/commands` response reports the same two API-profile flag defaults, so the behavior isn't a hidden surprise. They only take effect for commands that actually accept the corresponding flag (`chat`, `exec prompt`, `exec workflow`); for other subcommands the field is informational and doesn't change anything.
+**`flags_applied`** reports the API's flag defaults for the submitted command. It lists only flags the command accepts, so it is `{}` for commands such as `agents list`:
 
 | Flag | Behavior |
 |------|----------|
-| `non_interactive` | `true`. HTTP workers have no attached terminal, so a command that accepts `--non-interactive` always runs in print/batch mode — this cannot be turned off. |
-| `yolo` | `true` by default for a command that accepts `--yolo`. It's a default, not a forced override: if your request's `args` already specifies a value for the flag, yours is kept instead. See [Permission modes](03-agent-sessions.md#permission-modes) for what running with `--yolo` means — auto-approved actions, stuck-step auto-advance, and so on. |
+| `non_interactive` | Always `true`. API workers have no terminal, so `exec prompt` and `exec workflow` always run in print/batch mode. You never need to pass `--non-interactive`. |
+| `yolo` | `true` by default. It is a default, not an override: a `--yolo` value in `args` is kept, and `--plan` or `--auto` in `args` suppresses it. See [Permission modes](03-agent-sessions.md#permission-modes). |
 
-This has always been awman's behavior for commands dispatched through the API; `flags_applied` documents it explicitly rather than leaving it as an undocumented side effect of dispatch.
+For `exec workflow`, `flags_applied.prerequisites` also carries the resolved credential policy (see above).
 
 Error responses:
 
@@ -1111,11 +1003,6 @@ Returns the current status and metadata for a command. `GET /v1/commands/{id}/st
 | `done` | Completed with exit code 0 |
 | `error` | Completed with a non-zero exit code |
 | `cancelled` | Cancelled by [`POST /v1/commands/:id/cancel`](#cancel-a-command), or before execution by a session kill. Exit code 130 when it had started |
-
-For `new skill --pull-all`, awman attempts every reachable library even when
-one pull fails. If any library fails, the command is reported with
-`status: "error"` and `exit_code: 1`; successful library pulls are still
-processed and reported in the command log.
 
 **`log_path` (deprecated).** Responses to requests from a loopback address (`127.0.0.0/8` or `::1`) also carry `log_path`, the path of the command's output log on the server. It is omitted when the TCP peer is not loopback, and is deprecated: read output through `/v1/commands/{id}/logs` and `/v1/commands/{id}/outputs`. The address checked is the immediate TCP peer; forwarding headers are ignored. SSH tunnels and proxies running on the API host connect from loopback, so their clients can also receive this field. This check does not establish that the original client is local.
 
@@ -1171,25 +1058,60 @@ counts. If diff collection fails, `changed_files_error` explains why the list
 is unavailable while known branch, head and dirty facts remain available.
 A step that succeeds on retry is removed from `failed_steps`.
 
-`error_status`, `stage` and `setup_error` are deprecated compatibility fields.
-Use `failure.code` and `failure.stage` instead of `error_status` and `stage`;
-use `failure` for session setup errors instead of `setup_error`. The legacy
-`error_status` was a numeric HTTP-style error status, `stage` was a coarse
-failure label, and `setup_error` held the `/v1/runs` setup details. The legacy
+`error_status`, `stage` and `setup_error` are deprecated compatibility fields,
+filled exactly as before `failure` existed. Use `failure.code` and
+`failure.stage` instead of `error_status` and `stage`; use `failure` for
+session setup errors instead of `setup_error`. The legacy `error_status` is a
+numeric HTTP-style error status; `stage` is set only for an unresolved workflow
+prerequisite (`workflow_prerequisites`), a push failure (`push`) and a
+`/v1/runs` setup failure (`setup`), and is absent for every other failure and
+for cancellations, whereas `failure.stage` is always present; `setup_error`
+holds the `/v1/runs` setup details. The legacy
 `error` field remains available as the human-readable message. A command row
 status is only `queued`, `running`, `done`, `error` or
 `cancelled`; `aborted` and `paused` are values of `result.outcome`, not row
 statuses.
 
+**Failure codes.** `failure.stage` is one of `setup`, `preflight` (after
+admission, before any container started), `workflow_prerequisites`, `step`,
+`teardown`, `merge` or `push`. `failure.code` is a stable snake_case code; match
+on it rather than on `failure.message`. Codes describing how a run ended:
+
+| `failure.code` | Meaning |
+|----------------|---------|
+| `step_failed` | A workflow main step or the `exec prompt` agent failed (`failure.step` names the step when one is to blame) |
+| `teardown_failed` | The main phase finished but a teardown step failed |
+| `command_failed` | A non-execution command (for example `agents status`) exited non-zero |
+| `push_failed` | The automatic push of a `push: true` session failed |
+| `setup_failed` | `/v1/runs` session setup, or an aborting workflow setup step, failed |
+| `cancelled` | The command was cancelled (`outcome: "cancelled"`) |
+| `aborted` | The workflow was aborted, for example by a step with `abort_on_failure` (`outcome: "aborted"`) |
+| `paused` | The workflow paused and can be resumed (`outcome: "paused"`) |
+| `invalid_queue_record` | The stored command could not be decoded, so it never ran |
+| `internal` | An unclassified failure inside awman, its runtime or its storage |
+
+Any other failure has one code per error condition. Where the [error-code
+table](#error-responses) already names a condition, the same code is used
+(`unknown_subcommand`, `unknown_flag`, `forbidden_workdir`, `worktree_exists`,
+`merge_conflict`, `merge_target_dirty`, `workflow_prerequisites_unresolved`,
+`unknown_agent`, `agent_untrusted`). The rest are named after the condition, for
+example `work_item_not_found`, `workflow_file_not_found`,
+`spec_template_missing`, `invalid_overlay_spec`, `missing_required_argument`,
+`invalid_flag_value`, `agent_not_found`, `agent_ambiguous` or
+`not_implemented`. An HTTP error returned at admission keeps its own class
+code from the error-code table (`invalid_request`, `not_found`, …) for
+conditions that table does not name.
+
 **Malformed `args`:** `POST /v1/commands` and the nested command in `POST /v1/runs` validate flags and positional arguments against the command catalogue before enqueueing. Unknown flags or invalid typed values return HTTP 400 without creating a command, for example:
 
 ```json
 {
-  "error": "unknown flag 'not-a-real-flag' for command [\"exec\", \"prompt\"]"
+  "error": "unknown flag 'not-a-real-flag' for command [\"exec\", \"prompt\"]",
+  "code": "unknown_flag"
 }
 ```
 
-Execution failures after admission are recorded in the command's `result`; poll `GET /v1/commands/{id}/status` or follow its log stream.
+Execution failures after admission are recorded in the command's `result`; poll `GET /v1/commands/{id}` or follow its log stream.
 
 #### Get a command log snapshot
 
@@ -1318,14 +1240,16 @@ accordingly. Add `?format=json` to the same URL to fetch the event-log snapshot
 described above. It includes all retained attempts and their historical `Done`
 records, including a marker written immediately before a crash and re-queue.
 Interpret those records by `attempt`; only the SSE `done` notification certifies
-that the current command is terminal. Resume inputs do not filter this snapshot:
+that the current command is terminal. Resume inputs do not filter this snapshot.
 
 The worker emits exactly one final `command_status` event after recording the
 terminal command row, followed by `done`. Its `result` is the same structured
 object returned by the command status endpoint. The event's status can be
 `paused` or `aborted` even though the persisted row status is `error`; inspect
 `result.outcome` for that distinction. The older `status`, `exit_code` and
-`error` event fields remain for compatibility.
+`error` event fields remain for compatibility; the event's `error` is exactly
+`result.error`, so a push failure no longer has a `push: ` prefix there (its
+`result.failure.stage` is `push`).
 
 The stream waits for delayed final log writes. If the log cannot be recovered,
 it sends completion from the terminal row without event IDs, preserving the
@@ -1342,11 +1266,6 @@ as log text; do not assume they conceal secrets. Any future log redaction must
 also cover those fields. Valid structured frames with unknown content produce
 bounded activity hints rather than raw tool payloads; malformed JSON lines pass
 through as ordinary output.
-
-```sh
-curl -s "http://localhost:9876/v1/commands/<command-id>/logs?format=json" \
-  -H 'Authorization: Bearer <api-key>'
-```
 
 The status-carrying events use small typed enums rather than free-form
 strings, so a client can match on a fixed set of values:
@@ -1462,15 +1381,9 @@ The `202` response means "stopping", not "stopped":
 }
 ```
 
-Poll `GET /v1/commands/<command-id>/status` until `status` is `cancelled`. Repeating the cancel while the command is still stopping returns `202` again and keeps the original `cancel_requested_at`. A command that finishes cleanly before the stop takes effect stays `done`; the cancel does not rewrite a completed result.
+Poll `GET /v1/commands/<command-id>` until `status` is `cancelled`. Repeating the cancel while the command is still stopping returns `202` again and keeps the original `cancel_requested_at`. A command that finishes cleanly before the stop takes effect stays `done`; the cancel does not rewrite a completed result.
 
-A cancelled command has `status: "cancelled"`, `exit_code: 130` and:
-
-```json
-{ "exit_code": 130, "error": "cancelled" }
-```
-
-A command cancelled while running also carries `cancelled_at`.
+A cancelled command has `status: "cancelled"` and `exit_code: 130`. Its `result` has `outcome: "cancelled"`, `failure.code: "cancelled"` (with the stage it was cancelled in) and the legacy `error: "cancelled"`. A command cancelled while running also carries `cancelled_at`.
 
 **Cancellation is not a failure.** A workflow's `on_failure` retry and remediation handling is not triggered, and `abort_on_failure` is not applied. For a workflow command that is cancelled partway through:
 
@@ -1491,8 +1404,12 @@ for a command with `GET /v1/commands/{id}/outputs`; fetch one with
 Persistent outputs require a runtime that supports host directory mounts
 (Docker, Apple Containers or builtin). Sandbox runtimes do not mount or
 advertise `/awman/output`; the command emits a warning about this limitation.
-Output retrieval is supported on Unix hosts. Other hosts refuse output reads
-until a safe descriptor-based implementation is available.
+On Unix hosts each file is opened one path component at a time without
+following symbolic links. On Windows hosts awman checks paths instead: every
+component must be a plain directory or regular file (symbolic links and
+junctions are refused), the resolved path must stay inside the outputs
+directory, and Windows device names (`NUL`, `CON`, `COM1`, …) and names ending
+in a dot or a space are neither listed nor served.
 
 ```sh
 curl -s http://localhost:9876/v1/commands/<command-id>/outputs \
@@ -1591,7 +1508,7 @@ Match on `code`, not on the `error` text. Existing messages are preserved for co
 | `unknown_agent` | 404 | The requested agent is not defined |
 | `agent_untrusted` | 403 | The agent definition has not been trusted |
 
-Validation codes (`invalid_request`, `unknown_subcommand`, `unknown_flag`, `forbidden_workdir`) and the last six codes are the same values reported asynchronously in a command's `result.failure.code`, so one decoder serves both. Several of them can also be returned synchronously when a request is rejected at admission. A run whose setup actually fails uses `setup_failed`; submitting a new command to an unready session uses `session_not_ready`, because that command has not been admitted.
+`unknown_subcommand`, `unknown_flag`, `forbidden_workdir` and the last six codes are the same values reported asynchronously in a command's `result.failure.code`, so one decoder serves both. Several of them can also be returned synchronously when a request is rejected at admission. `invalid_request`, `forbidden` and `not_found` are HTTP class codes only: a command that fails after admission reports the specific condition instead (see [Failure codes](#get-command-status)). A run whose setup actually fails uses `setup_failed`; submitting a new command to an unready session uses `session_not_ready`, because that command has not been admitted.
 
 ---
 
@@ -1742,17 +1659,17 @@ The `features` array lists capabilities clients can detect without relying on
 the server version. `workflow_state` means the server exposes live workflow
 snapshots through `GET /v1/commands/:id/workflow`.
 `command_cancel`, `labels`, `idempotency` and `runs` mean the server supports [command cancellation](#cancel-a-command), [labels](#labels), [idempotency keys](#idempotency-keys) and [`POST /v1/runs`](#one-shot-runs).
-`error_codes` means every error body carries a `code` ([Error responses](#error-responses)). `command_record` means `GET /v1/commands/:id` is served. `session_setup_status` means sessions carry `setup_status` and `setup_error` and `GET /v1/sessions` accepts `setup_status`. `command_session_body` means `POST /v1/commands` accepts `session_id` in the body.
+`error_codes` means every error body carries a `code` ([Error responses](#error-responses)). `structured_results` means command records carry the structured [`result`](#get-command-status); `outputs` means the [outputs endpoints](#list-and-retrieve-command-outputs) exist; `event_source` means events carry `source` and the logs accept `?step=`; `step_activity` means `step_activity` events can appear. `command_record` means `GET /v1/commands/:id` is served. `session_setup_status` means sessions carry `setup_status` and `setup_error` and `GET /v1/sessions` accepts `setup_status`. `command_session_body` means `POST /v1/commands` accepts `session_id` in the body.
 
-**Adding to the API.** Every new user-visible route, request field or event type adds an entry to `features` in the same change, so clients can detect it without parsing version numbers. The list never contains duplicates.
+New capabilities are added to `features`, never removed, so check for a feature rather than comparing versions.
 
 ---
 
 ### Workflow state
 
-API-mode `exec workflow` commands launch available steps automatically, finish
-when the last step completes. A failed step is retried once, then fails the
-command (`error`); a step with `abort_on_failure` aborts it. No interactive
+API-mode `exec workflow` commands launch available steps automatically and
+finish when the last step completes. A failed step is retried once, then fails
+the command (`error`); a step with `abort_on_failure` aborts it. No interactive
 confirmation is required.
 
 When a workflow starts, the API server snapshots its `WorkflowState` to
@@ -1838,8 +1755,13 @@ The response retains `step_states` and adds `stages`, an array grouping step
 names by dependency stage. Each `steps` entry adds its definition-order
 `index`, dependency `stage`, snake_case `status` (`pending`, `running`,
 `succeeded`, `failed`, `cancelled` or `skipped`), and `step_attempt` after the
-step has launched. Failed steps may also include `exit_code` and `error`; a
-running step may include its `container`. Setup and teardown progress remains
+step has launched. Failed steps may also include `exit_code` and `error`. Once
+a step has launched, `container` is the runtime container name of its latest
+launch: the same value events carry in `source.container`, kept after the step
+finishes. A running step also includes `container_id`, the runtime's
+container ID. Other top-level fields such as `step_attempts` and
+`step_containers` are the engine's own bookkeeping; read the per-step fields
+instead. Setup and teardown progress remains
 in `setup_step_states` and `teardown_step_states`, whose entries gain a
 snake_case `state` (`pending`, `running`, `succeeded`, `failed`, `remediating`
 or `skipped`). The added top-level `phase` is snake_case (`setup`, `main`,
@@ -1893,7 +1815,7 @@ while true; do
     -H "Authorization: Bearer $KEY")
   PHASE=$(echo "$RESP" | jq -r '.phase // .current_phase')
   echo "Workflow phase: $PHASE"
-  COMMAND=$(curl -fsS "$SERVER/v1/commands/$CMD/status" \
+  COMMAND=$(curl -fsS "$SERVER/v1/commands/$CMD" \
     -H "Authorization: Bearer $KEY") || break
   STATUS=$(echo "$COMMAND" | jq -r '.status')
   case "$STATUS" in
@@ -1913,103 +1835,72 @@ without a workflow snapshot. A `no_workflow` response means the command did not
 run a workflow. If a workflow state was previously returned and later becomes
 404, the state was removed; stop polling.
 
-The [Remote-bound TUI tabs](#remote-bound-tui-tabs) feature uses this endpoint internally to render the Workflow Overview for commands running on a remote API server.
-
 ---
 
 ## Full example: session lifecycle
 
 ```sh
-SERVER=http://localhost:9876
-KEY=<your-api-key>   # obtained from the startup banner or --refresh-key
+SERVER=https://127.0.0.1:9876
+KEY=<your-api-key>   # from the startup banner or --refresh-key
+AUTH="Authorization: Bearer $KEY"
 
-# 1. Create a session
-SESSION=$(curl -s -X POST "$SERVER/v1/sessions" \
-  -H "Authorization: Bearer $KEY" \
+# 1. Create a session and wait until its setup is ready
+SESSION=$(curl -sk -X POST "$SERVER/v1/sessions" -H "$AUTH" \
   -H 'Content-Type: application/json' \
   -d '{"workdir":"/home/user/my-project"}' | jq -r .session_id)
-echo "Session: $SESSION"
+until [ "$(curl -sk "$SERVER/v1/sessions/$SESSION/status" -H "$AUTH" | jq -r .status)" = ready ]; do
+  sleep 2
+done
 
 # 2. Submit a command
-CMD=$(curl -s -X POST "$SERVER/v1/commands" \
-  -H "Authorization: Bearer $KEY" \
+CMD=$(curl -sk -X POST "$SERVER/v1/commands" -H "$AUTH" \
   -H 'Content-Type: application/json' \
-  -d '{"session_id":"'"$SESSION"'","subcommand":"exec workflow","args":["./aspec/workflows/implement-feature.toml"]}' | jq -r .command_id)
-echo "Command: $CMD"
+  -d '{"session_id":"'"$SESSION"'","subcommand":"exec workflow","args":["./aspec/workflows/implement-feature.toml"]}' \
+  | jq -r .command_id)
 
-# 3. Poll until done
-# Note: The command will first be in 'queued' status while waiting for a worker.
-# When a worker claims it, status transitions to 'running', then finally 'done' or 'error'.
+# 3. Poll until terminal (queued -> running -> done | error | cancelled)
 while true; do
-  RESP=$(curl -s "$SERVER/v1/commands/$CMD/status" \
-    -H "Authorization: Bearer $KEY")
-  STATUS=$(echo "$RESP" | jq -r .status)
-  POSITION=$(echo "$RESP" | jq -r '.queue_position // "N/A"')
-  echo "Status: $STATUS (queue position: $POSITION)"
-  [ "$STATUS" = "done" ] || [ "$STATUS" = "error" ] && break
+  STATUS=$(curl -sk "$SERVER/v1/commands/$CMD" -H "$AUTH" | jq -r .status)
+  echo "Status: $STATUS"
+  case "$STATUS" in done|error|cancelled) break ;; esac
   sleep 10
 done
 
-# 4. Retrieve output from the JSON event snapshot
-curl -s "$SERVER/v1/commands/$CMD/logs?format=json" \
-  -H "Authorization: Bearer $KEY" \
-  | jq -r '.events[] | select(.payload.type == "stdout_line" or .payload.type == "stderr_line") | .payload.data'
+# 4. Print the captured output from the JSON event snapshot
+curl -sk "$SERVER/v1/commands/$CMD/logs?format=json" -H "$AUTH" \
+  | jq -r '.events[] | select(.payload.type == "StdoutLine" or .payload.type == "StderrLine") | .payload.data'
 
 # 5. Close the session
-curl -s -X DELETE "$SERVER/v1/sessions/$SESSION" \
-  -H "Authorization: Bearer $KEY"
+curl -sk -X DELETE "$SERVER/v1/sessions/$SESSION" -H "$AUTH"
 ```
 
-### Example: one-shot exec prompt
-
-For tasks that don't need a persistent session, `exec prompt` can be run directly from the CLI without starting the HTTP server:
-
-```sh
-# Run a single one-shot task; output goes to stdout; exit code reflects agent result
-awman exec prompt "Fix the failing tests in src/api" --non-interactive
-
-# Combine with shell tools
-awman exec prompt "List all TODO comments in the codebase" --non-interactive | tee todos.txt
-```
-
-To drive the same task via the API server (so the result is logged and auditable):
-
-```sh
-SERVER=http://localhost:9876
-KEY=<your-api-key>
-
-SESSION=$(curl -s -X POST "$SERVER/v1/sessions" \
-  -H "Authorization: Bearer $KEY" \
-  -H 'Content-Type: application/json' \
-  -d '{"workdir":"/home/user/my-project"}' | jq -r .session_id)
-
-CMD=$(curl -s -X POST "$SERVER/v1/commands" \
-  -H "Authorization: Bearer $KEY" \
-  -H 'Content-Type: application/json' \
-  -d '{"session_id":"'"$SESSION"'","subcommand":"exec prompt","args":["Fix the failing tests","--non-interactive"]}' | jq -r .command_id)
-
-# Poll as usual...
-```
+For a single task without a server, `awman exec prompt "…" --non-interactive` runs locally and exits with the agent's exit code. Going through the API instead records the run durably and makes it visible to other clients.
 
 ---
 
 ## Storage layout
 
-API runtime files live under `~/.awman/api/`:
+API runtime files live under `~/.awman/api/` (or `AWMAN_API_ROOT`; see [Create a session](#create-a-session) for the full precedence):
 
 ```
 ~/.awman/api/
   awman.log                        # server log (background mode only)
-  awman.pid                        # PID file for the background process
+  awman.pid                        # PID file for the running server
+  server.json                      # port and scheme of the running server
   api_key.hash                     # SHA-256 hex digest of the API key (mode 0600)
+  tls/cert.pem, tls/key.pem        # self-signed TLS certificate and key
   sessions/
     <session-uuid>/
+      setup_state.json             # session setup progress
+      <repository-folder>/         # remote sessions only: the clone, deleted on close
       commands/
         <command-uuid>/
           output.log               # combined stdout+stderr (written incrementally)
-          metadata.json            # request payload, timestamps, exit code
-          workflow.state.json      # workflow state — only present for workflow commands
-          cleanup.json             # pending workflow cleanup recovery inputs; removed after completion
+          events.log               # structured events served by /logs
+          output/                  # files the agent wrote to /awman/output
+          workflow.state.json      # workflow commands only
+          completion.json          # recorded completion, used for restart recovery
+          cleanup.json             # pending workflow cleanup; removed after completion
 ```
 
 The shared SQLite database is stored separately at
@@ -2018,54 +1909,30 @@ the database from its former API storage location automatically. It retains an
 `awman.db.pre-migration` backup of the old database; `awman clean` removes that
 backup, but never removes the live database.
 
-`workflow.state.json` is written and updated atomically (write to a temp file,
-then rename) as workflow state changes. For an ordinary workflow its first
-snapshot is written before setup runs; with `--dynamic`, the first snapshot is
-written after the leader's design validates and before setup runs. The file
-uses the same JSON structure as the local workflow state in
-`$GITROOT/.awman/workflows/`. It is never present for `exec prompt`, `chat`, or
-other non-workflow commands.
+`workflow.state.json` is the snapshot served by [Get workflow state](#get-workflow-state). It is written atomically and uses the same JSON structure as the local workflow state in `$GITROOT/.awman/workflows/`.
 
-`awman.db` contains the API session and command records (and the squad task
-and run records when squad is in use):
-
-**`sessions`** — one row per session: `id` (UUID), `workdir`, `status` (`active`/`closing`/`closed`), `created_at`, `closed_at`, and the setup/remote-session metadata.
-
-**`commands`** — one row per command: `id` (UUID), `session_id`, `subcommand`, `args` (JSON array), `status` (`queued`/`running`/`done`/`error`/`cancelled`), `exit_code`, `started_at`, `finished_at`, `log_path`, `queued_at` (when enqueued), `worker_id` (UUID of the worker that claimed it), and `result` (JSON object with exit code and error message). Labels are stored in a related table and included in API metadata responses.
-
-The database is the authoritative record of all activity. The per-command log files hold raw output. Neither is deleted when a session is closed.
-
-`metadata.json` for each command contains the original request payload and precise timestamps:
-
-```json
-{
-  "id": "e5f6a7b8-...",
-  "session_id": "a1b2c3d4-...",
-  "subcommand": "implement",
-  "args": ["0057"],
-  "started_at": "2026-04-20T12:01:00Z",
-  "finished_at": "2026-04-20T12:43:17Z",
-  "exit_code": 0
-}
-```
+`awman.db` holds the API session and command records (and squad task and run records): the session and command fields described in this guide, plus labels. It is the authoritative record of activity; the per-command files hold raw output. Neither is deleted when a session is closed (see [Session cleanup](#session-cleanup)).
 
 ---
 
 ## Server configuration
 
-API mode settings live under an `api` key in the global config (`~/.awman/config.json`). All fields are optional.
+API server settings live in the global config (`~/.awman/config.json`). All fields are optional.
 
 ```json
 {
+  "workers": 2,
   "api": {
     "workDirs": [
       "/home/user/my-project",
       "/home/user/other-project"
     ],
-    "alwaysNonInteractive": true
+    "workDirRoots": ["/srv/repos"]
   }
 }
 ```
+
+`workers` (default 2) is the number of queue workers — the maximum number of sessions running a command at once. Edit it in the file; `config set` does not accept it.
 
 ### `api.workDirs`
 
@@ -2087,31 +1954,19 @@ awman config set --global api.workDirRoots "/srv/repos"
 
 Merged with `--workdir-root` flags at startup. See [Working directory allowlist](#working-directory-allowlist) for what qualifies as a direct child.
 
-### `api.alwaysNonInteractive`
-
-When set to `true`, awman automatically injects `--non-interactive` into every dispatched command that supports it — including `implement`, `chat`, `exec prompt`, `exec workflow`, `ready`, and `specs amend`.
-
-```sh
-awman config set --global api.alwaysNonInteractive true
-```
-
-This is the recommended setting for API server deployments where no TTY is available. It guarantees that no command blocks waiting for interactive input.
-
-When `alwaysNonInteractive` is `true` and a command is dispatched via the HTTP API, the flag is automatically injected into the args vector — you do not need to include `--non-interactive` in your API requests explicitly.
-
-The setting defaults to `false` so that awman's interactive defaults remain unchanged for users who have not configured an API server.
+No setting is needed to make API commands non-interactive: the API always runs them that way (see [`flags_applied`](#submit-a-command)). An `api.alwaysNonInteractive` key left in an older config is ignored.
 
 ---
 
 ## Security
 
-API mode preserves all of awman's container isolation guarantees: every subcommand runs inside a Docker container, never directly on the host.
+API mode preserves all of awman's container isolation guarantees: every agent runs inside a container on the configured runtime, never directly on the host.
 
 The HTTP server enforces cryptographic API key authentication on every request by default. The plaintext key is shown once at server start and never logged or persisted; only its SHA-256 hash is stored on disk. See [Authentication](#authentication) for the full key lifecycle.
 
 The working directory allowlist is the secondary access control on the server: even a client that presents a valid API key can only create sessions in pre-approved directories.
 
-For additional defense in depth, bind the server to `localhost` (the default) and restrict external access via firewall rules or SSH tunnels. Even with authentication enabled, reducing the attack surface is always worthwhile.
+The server listens on loopback only. If you expose it through a tunnel or proxy, keep authentication and TLS on and restrict who can reach the forwarded port.
 
 ---
 
@@ -2119,15 +1974,7 @@ For additional defense in depth, bind the server to `localhost` (the default) an
 
 At server startup, awman automatically purges sessions that were closed more than 24 hours ago. Their rows are removed from `~/.awman/data/awman.db` along with all associated command records. The on-disk output logs and workflow snapshots in `~/.awman/api/sessions/<uuid>/` are **not** deleted — they remain for audit purposes, but the API no longer serves a snapshot after its command row is purged. Remove these directories separately when disk retention is no longer needed.
 
-The cleanup runs once, before the server begins accepting connections. Each purged session is logged at `INFO` level:
-
-```
-INFO running stale closed session cleanup
-INFO deleted stale session a1b2c3d4-... and 3 linked command records
-INFO deleted stale session b2c3d4e5-... and 1 linked command records
-```
-
-Sessions closed within the last 24 hours are not touched. The 24-hour boundary (`< datetime('now', '-24 hours')`) is exclusive, so a session closed exactly 24 hours ago is not deleted until the next second boundary passes.
+The cleanup runs once, before the server accepts connections, and logs each purged session at `INFO` level. Sessions closed within the last 24 hours are not touched.
 
 ---
 
@@ -2139,658 +1986,230 @@ On `SIGTERM` or `SIGINT`, the server finishes all in-flight HTTP responses and a
 
 ## API edge cases
 
+Cases not covered in the sections above:
+
 | Situation | Behaviour |
 |-----------|-----------|
-| `workdir` not in allowlist on `POST /v1/sessions` | HTTP 403 `forbidden_workdir`; response names the failed rule and lists the allowed directories and roots |
-| Session not found or already closed on `POST /v1/commands` | HTTP 404 `session_not_found`; response includes the session UUID |
-| Multiple `POST /v1/commands` in quick succession | All commands are enqueued; first returns immediately, subsequent requests also return immediately with different command IDs; all are processed in FIFO order (one per session at a time) |
-| Session is `closing` on `POST /v1/commands` | HTTP 409 `session_closing`; command is rejected to prevent new work during graceful shutdown |
-| Server already running when `api start` is invoked | Error printed; exits non-zero |
-| API server or squad daemon already running when the other is started | Error names the other process and its PID; the new process does not start |
-| Port already bound (EADDRINUSE) | Error includes the port number and PID holding it |
-| `--workdir-root` path does not exist at startup | Warning logged; root is checked again on each request |
 | `--workdirs` path does not exist at startup | Startup refused; create the directory first |
-| `--workdir-root` is itself a Git repository | Startup refused (exit 2); use `--workdirs` for a single repository |
-| `awman api kill` when server is not running | Informational message; exits 0 |
-| `awman api logs` with no log file | Clear error suggesting `--background` |
-| Unknown `subcommand` in `POST /v1/commands` | HTTP 400 `unknown_subcommand`; response lists valid subcommands |
-| No session in the body `session_id` or the `x-awman-session` header | HTTP 400 `invalid_request` |
-| Body `session_id` and `x-awman-session` header name different sessions | HTTP 400 `invalid_request` |
-| `exec prompt` with empty string | CLI validation error: `"prompt cannot be empty"` before any container launches |
-| `exec workflow` with `{{work_item_content}}` and no `--work-item` | Warning printed; placeholder left unexpanded; workflow continues |
-| `exec workflow --work-item <N>` where file not found | Error pointing to the expected path pattern; same message as `implement` |
-| `api.alwaysNonInteractive` true + duplicate `--non-interactive` flag in args | Flag is deduplicated; no error |
-| `exec` dispatched via HTTP API as a bare `exec` (action in `args`) or with an unknown action | HTTP 400; use `exec prompt` or `exec workflow` as the `subcommand` |
-| `remote` subcommand dispatched via HTTP API without required args (e.g. no `--session`) | Subprocess exits with a clear error; output appears in the command log |
-| No `Authorization` header on any request | HTTP 401 `unauthorized` with a JSON body explaining which header to use |
-| Wrong API key on any request | HTTP 401 with JSON `{"error": "Invalid API key.", "code": "unauthorized"}` |
-| `--refresh-key` used: existing clients present the old key | HTTP 401; clients must be updated with the new key |
-| `--dangerously-skip-auth` with a hash file on disk | Auth disabled for this run only; the hash file is not modified; next normal start re-enables auth |
-| `api_key.hash` file is missing or unreadable at startup | Server treats it as a first start and generates a new key |
-| `GET /v1/sessions?status=active` with no active sessions | Returns `{"sessions":[]}` (empty list); HTTP 200 |
-| Session transitions to closed between list fetch and command dispatch | Server enforces rejection at `POST /v1/commands` regardless of filter; client receives HTTP 404 |
-| Startup cleanup: sessions closed exactly 24h ago | Not deleted until the next second boundary passes (exclusive `<` comparison) |
-| Startup cleanup: on-disk log files for cleaned sessions | Not deleted; they remain in `~/.awman/api/sessions/<uuid>/` for audit purposes |
-| `GET /v1/commands/:id/workflow` — unknown command ID | HTTP 404 `command_not_found` |
-| `GET /v1/commands/:id/workflow` — command is not a workflow command | HTTP 404 `no_workflow`; `workflow.state.json` is never created |
-| `GET /v1/commands/:id/workflow` — command is `queued` (not yet started) | HTTP 404 `workflow_not_started`; state is created when workflow execution starts |
-| `GET /v1/commands/:id/workflow` — workflow is paused | HTTP 200; inspect the tagged step states and `current_phase`; polling may continue since the workflow can resume |
-| `GET /v1/commands/:id/workflow` — workflow is complete | HTTP 200; inspect the tagged step states and `current_phase`; stop polling when the command status is terminal, including any merge-back outcome |
-| Concurrent reads of `workflow.state.json` during a write | File is written atomically via rename; clients never observe a partial JSON document |
-| `DELETE /v1/sessions/:id` — no queued commands, no running command | HTTP 200; session immediately transitions to `closed` status |
-| `DELETE /v1/sessions/:id` — queued commands present, no running command | HTTP 200; all queued commands are cancelled; session immediately transitions to `closed` status |
-| `DELETE /v1/sessions/:id` — running command present | HTTP 202; session transitions to `closing` status; running command is allowed to finish; client must poll `GET /v1/sessions/:id/status` to observe the transition to `closed` |
-| `DELETE /v1/sessions/:id` — called again while `closing` | HTTP 200; returns the current session state (still `closing` if command hasn't finished, or `closed` if it has) |
-| `POST /v1/commands/:id/cancel` — queued or already finished command | HTTP 200 with the command's status object |
-| `POST /v1/commands/:id/cancel` — running command | HTTP 202; poll the status endpoint until `cancelled` (exit code 130) |
-| `POST /v1/commands/:id/cancel` — unknown ID | HTTP 404 `command_not_found` |
-| Create request repeated with the same `Idempotency-Key` | Original response replayed with `Idempotent-Replayed: true`; different body → 422 `idempotency_conflict`; original still in flight → 409 `idempotency_in_flight` |
-| `GET /v1/sessions/:id/queue` — session has no commands | HTTP 200; returns `queue_depth: 0`, `running: null`, empty arrays for `queued` and `recent_completed` |
-| `GET /v1/sessions/:id/queue` — command is `queued` (not yet claimed) | Appears in the `queued` array with a `position` indicating its place in the queue (0-indexed) |
-| `POST /v1/commands` with workflow file that doesn't exist | Command is enqueued; when the worker executes it, it fails with an error in the `result` field and status becomes `error` |
-| `POST /v1/commands` with an unknown flag or invalid flag value in `args` | HTTP 400 at admission (`unknown_flag` for an unknown flag, `invalid_request` for an invalid value); no command is created |
+| `--workdir-root` path does not exist at startup | Warning logged; the root is checked again on each request |
+| `--workdir-root` is itself inside a Git repository | Startup refused (exit 2); use `--workdirs` for a single repository |
+| `api_key.hash` missing at startup | Treated as a first start: a new key is generated and printed |
+| `--dangerously-skip-auth` with a hash file on disk | Auth disabled for this run only; the hash file is untouched |
+| `exec workflow` with `{{work_item_content}}` and no `--work-item` | Warning; placeholder left unexpanded; the workflow continues |
+| Bare `"subcommand": "exec"` (action in `args`) | HTTP 400 `invalid_request`; use `exec prompt` or `exec workflow` as the `subcommand` |
+| Session closed between listing it and submitting a command | HTTP 404 `session_not_found` |
+| `GET /v1/sessions?status=active` with no active sessions | HTTP 200 `{"sessions":[]}` |
+| `GET /v1/commands/:id/workflow` for a paused workflow | HTTP 200; keep polling, since the workflow can resume |
 
 ---
 
 # Remote mode
 
-Remote mode lets you connect to an API awman server running on another machine and run commands there — from your terminal, from a CI pipeline, or from inside the TUI. Live log streaming lets you watch agent output in real time, exactly as if the session were local.
+`awman remote` is a command-line client for an awman API server. It creates and closes sessions, submits `exec prompt` and `exec workflow` commands, and streams their output to your terminal. It runs from the CLI or the TUI command box, and takes the same flags in both.
 
 ---
 
 ## Overview
 
-A typical setup has one machine running `awman api start` (the _remote host_), and one or more developers or pipelines using `awman remote` (the _client_) to dispatch work to it. The remote host manages all sessions and containers. The client only needs the server's address.
+One machine runs `awman api start` (the _remote host_); developers or pipelines run `awman remote` (the _client_). The remote host manages all sessions and containers.
 
 ```
-Local machine                                    Remote host
-──────────────                                   ──────────────────────────
+Client                                           Remote host
+──────                                           ───────────
 awman remote exec workflow my.toml -f ──────────► POST /v1/commands
                                                  ◄── SSE stream: log output
-                                                 ◄── `event: done` when command status is terminal
+                                                 ◄── `event: done` when the command ends
 ```
-
-Four subcommands cover the full lifecycle:
 
 | Command | What it does |
 |---------|-------------|
-| `awman remote exec workflow <file>` | Submit a workflow to a session on the remote host |
-| `awman remote exec prompt <prompt>` | Send a one-shot prompt to a session on the remote host |
-| `awman remote session start [dir]` | Create a new session on the remote host |
-| `awman remote session kill [session-id]` | Close a session on the remote host |
+| `awman remote session start` | Create a session on the remote host and wait until it is ready |
+| `awman remote exec workflow <file>` | Submit a workflow to a session |
+| `awman remote exec prompt <prompt>` | Send a one-shot prompt to a session |
+| `awman remote session kill <session-id>` | Close a session |
 
-All subcommands work from the terminal (CLI mode) and from inside the TUI (where interactive pickers are also available).
+The API server listens on loopback only, so a client on another machine reaches it through an SSH tunnel or a proxy; see [Reaching the server from another machine](#reaching-the-server-from-another-machine).
 
 ---
 
 ## Connecting to a remote host
 
-Every `remote` subcommand needs to know the address of the remote API server. The address is resolved in this order:
+Every `remote` subcommand resolves the server address in this order:
 
 | Priority | Source |
 |----------|--------|
-| 1 | `--remote-addr <URL>` flag on the command |
+| 1 | `--remote-addr <URL>` flag |
 | 2 | `AWMAN_REMOTE_ADDR` environment variable |
 | 3 | `remote.defaultAddr` in `~/.awman/config.json` |
 
-If none of the three sources provides an address, the command fails immediately with:
-
-```
-error: No remote address configured. Pass --remote-addr, set AWMAN_REMOTE_ADDR,
-       or set remote.defaultAddr in ~/.awman/config.json.
-```
-
-The most convenient setup for day-to-day use is to set a default address once:
+With none set, the command fails with `remote target address is missing or invalid; pass --remote-addr or set defaultAddr in config`. Set a default once:
 
 ```sh
-awman config set --global remote.defaultAddr http://build-server.example.com:9876
+awman config set --global remote.defaultAddr https://127.0.0.1:9876
 ```
-
-After that, every `awman remote` command targets that host by default, with no flag required.
 
 ---
 
 ## API key authentication
 
-When the remote API server has authentication enabled (the default), every request must include the API key. The key is resolved automatically from one of these sources, in priority order:
+The API key is resolved in this order:
 
 | Priority | Source |
 |----------|--------|
-| 1 | `--api-key <KEY>` flag on the command |
+| 1 | `--api-key <KEY>` flag |
 | 2 | `AWMAN_API_KEY` environment variable |
-| 3 | `remote.defaultAPIKey` in `~/.awman/config.json` — **only when the target address exactly matches `remote.defaultAddr`** |
+| 3 | `remote.defaultAPIKey` in `~/.awman/config.json` — **only when the target address matches `remote.defaultAddr`** |
 
-The host-match guard on `remote.defaultAPIKey` prevents a stored key from being silently forwarded to a different server. If you change `--remote-addr` or `AWMAN_REMOTE_ADDR` to point at a different host, the config key is ignored and the request proceeds without auth — resulting in an HTTP 401 if that server requires a key.
-
-### Storing the key
-
-The recommended approach for day-to-day use is to store the key in global config:
+The address match (trailing slashes ignored) keeps a stored key from being sent to a different server: when `--remote-addr` or `AWMAN_REMOTE_ADDR` points elsewhere, the config key is ignored and a server that requires auth answers HTTP 401.
 
 ```sh
 awman config set --global remote.defaultAPIKey <your-api-key>
 ```
 
-With both `remote.defaultAddr` and `remote.defaultAPIKey` configured, every `awman remote` command to the default host is fully authenticated with no extra flags.
-
-For CI pipelines, use the environment variable:
+For CI, use environment variables:
 
 ```sh
-export AWMAN_REMOTE_ADDR=http://build-server.internal:9876
+export AWMAN_REMOTE_ADDR=https://127.0.0.1:9876
 export AWMAN_API_KEY=<your-api-key>
-
-awman remote exec workflow aspec/workflows/implement-feature.toml --follow
 ```
 
-### Security note
-
-`AWMAN_API_KEY` is visible in `/proc/<pid>/environ` on Linux. In security-sensitive contexts, prefer passing the key via `--api-key` piped from a secrets manager, or store it in `~/.awman/config.json` with restricted file permissions (`chmod 600 ~/.awman/config.json`).
-
----
-
-## `awman remote exec workflow`
-
-Submits a workflow file to a session on the remote host.
-
-```sh
-awman remote exec workflow <file> [--session <ID>] [--follow] [--remote-addr <URL>] [exec workflow flags]
-```
-
-Accepts the same flags as `awman exec workflow` (except `--worktree`, which is a server-side concern), plus the remote transport flags below.
-
-### Basic usage
-
-```sh
-# Submit a workflow; return a command ID immediately
-awman remote exec workflow path/to/workflow.toml --session abc123
-
-# Stream output to your terminal until complete
-awman remote exec workflow path/to/workflow.toml --session abc123 --follow
-
-# Short form for --follow
-awman remote exec workflow path/to/workflow.toml --session abc123 -f
-
-# Pass exec workflow flags through unchanged
-awman remote exec workflow path/to/workflow.toml --yolo --work-item 0042 --session abc123 -f
-```
-
-### Flags
-
-| Flag | Short | Description |
-|------|-------|-------------|
-| `--session <ID>` | | Session ID on the remote host. Required in CLI mode; interactive in TUI mode. Overrides `AWMAN_REMOTE_SESSION` |
-| `--follow` | `-f` | Stream log output until the command completes, then print a summary table |
-| `--remote-addr <URL>` | | Remote host address. Overrides `AWMAN_REMOTE_ADDR` and `remote.defaultAddr` |
-| `--api-key <KEY>` | | API key for the remote server. Overrides `AWMAN_API_KEY` and `remote.defaultAPIKey` |
-
-Plus all `exec workflow` flags (except `--worktree`): `--work-item`, `--yolo`, `--auto`, `--plan`, `--agent`, `--model`, `--overlay`, `--issue`, `-n/--non-interactive`. `--agent-flag` is accepted but not forwarded: awman warns, and the remote host uses its own `agentFlags`.
-
-### Session resolution
-
-The session is resolved in this order:
-
-| Priority | Source |
-|----------|--------|
-| 1 | `--session <ID>` flag |
-| 2 | `AWMAN_REMOTE_SESSION` environment variable |
-| 3 | TUI only — last session used in this tab (not available in CLI) |
-| 4 | TUI only — interactive session picker |
-
-In CLI mode, if neither `--session` nor `AWMAN_REMOTE_SESSION` is set, the command fails with:
-
-```
-error: No session specified. Pass --session <ID> or set AWMAN_REMOTE_SESSION.
-       Use `awman remote session start` to create a session, or list sessions
-       with `curl <remote-addr>/v1/sessions`.
-```
-
-### Live log streaming (`--follow`)
-
-Without `--follow`, the command submits the workflow and returns immediately with the command ID:
-
-```
-Command dispatched: e5f6a7b8-...
-```
-
-With `--follow`, awman connects to the SSE log-streaming endpoint and relays output to your terminal in real time:
-
-```
-Connecting to log stream for e5f6a7b8-... on http://build-server.example.com:9876...
-Implementing work item 0059...
-✓ Tests pass
-✓ Cargo build successful
-...
-```
-
-Once the command completes, awman prints a summary table and exits:
-
-```
-┌──────────────┬────────────────────────────────────────┐
-│ Field        │ Value                                  │
-├──────────────┼────────────────────────────────────────┤
-│ Command ID   │ e5f6a7b8-…                             │
-│ Session ID   │ abc123                                 │
-│ Status       │ done                                   │
-│ Exit Code    │ 0                                      │
-│ Started      │ 2026-04-22T10:00:00Z                   │
-│ Finished     │ 2026-04-22T10:02:31Z                   │
-└──────────────┴────────────────────────────────────────┘
-```
-
-If the command had already completed before you connected, `--follow` replays the full historical log and then prints the summary immediately — there is no gap or missed output.
-
-When output is piped to a non-terminal, log lines are written without ANSI decoration.
-
----
-
-## `awman remote exec prompt`
-
-Sends a one-shot prompt to a session on the remote host.
-
-```sh
-awman remote exec prompt <prompt> [--session <ID>] [--follow] [--remote-addr <URL>] [exec prompt flags]
-```
-
-Accepts the same flags as `awman exec prompt` plus the remote transport flags.
-
-```sh
-# Submit a prompt; return a command ID immediately
-awman remote exec prompt "Fix the failing tests" --session abc123
-
-# Stream output to your terminal until complete
-awman remote exec prompt "Fix the failing tests" --session abc123 --follow
-
-# Pass exec prompt flags through
-awman remote exec prompt "Fix the tests" --yolo --agent claude --session abc123 -f
-```
-
-Session resolution and `--follow` behavior are identical to `remote exec workflow`.
+`AWMAN_API_KEY` is visible to other processes of the same user (for example `/proc/<pid>/environ` on Linux). In sensitive contexts prefer the config file with restricted permissions (`chmod 600 ~/.awman/config.json`).
 
 ---
 
 ## `awman remote session start`
 
-Creates a new session on the remote host.
+Creates a session on the remote host, prints setup progress, and returns once the session is `ready` (or fails if setup fails).
 
 ```sh
-awman remote session start [dir] [--remote-addr <URL>] [--api-key <KEY>]
+# Local session: a directory on the remote host that is on its allowlist
+awman remote session start --workdir /home/user/my-project
+
+# Remote session: the server clones the repository
+awman remote session start --type remote \
+  --repo-url https://github.com/org/my-project --branch main
 ```
 
-`dir` is the absolute path (on the remote host) of the working directory for the session. It must be in the remote host's `--workdirs` allowlist.
+| Flag | Description |
+|------|-------------|
+| `--type local\|remote` | Session type (default `local`) |
+| `--workdir <path>` | Required for `local`: an absolute path on the remote host, allowed by its [working directory allowlist](#working-directory-allowlist) |
+| `--repo-url <url>` | Required for `remote` |
+| `--branch <name>` | Optional for `remote` |
+| `--remote-addr`, `--api-key` | See above |
+
+On success awman prints `Session created: <id>`, the setup stages, the same ready summary box `awman ready` draws, and finally on stdout:
+
+```
+Session a1b2c3d4-e5f6-7890-abcd-ef1234567890 created via https://127.0.0.1:9876 [ready].
+```
+
+To capture the ID in a script: `SESSION=$(awman remote session start --workdir … | awk '/ created via / {print $2}')`. For `base_ref`, `merge_refs` or `push`, create the session through the [HTTP API](#create-a-session).
+
+---
+
+## `awman remote exec workflow`
+
+Submits a workflow file to a ready session. The path is resolved on the remote host, relative to the session's working directory.
 
 ```sh
-# Start a session bound to /home/user/my-project
-awman remote session start /home/user/my-project
+# Submit; print the command ID and return
+awman remote exec workflow aspec/workflows/implement-feature.toml --session abc123
 
-# Specify a non-default remote host and key
-awman remote session start /home/user/my-project \
-  --remote-addr http://alt-host:9876 \
-  --api-key <key>
+# Stream output until the command finishes
+awman remote exec workflow aspec/workflows/implement-feature.toml --work-item 0042 --session abc123 -f
 ```
 
-On success, awman prints the new session ID, followed by a readiness summary
-box for the remote host's environment — the same "Ready Summary" box `awman
-ready` prints locally (same rows, same glyphs), not a separately-composed
-report:
+| Flag | Short | Description |
+|------|-------|-------------|
+| `--session <ID>` | | Session ID on the remote host. Falls back to `AWMAN_REMOTE_SESSION` |
+| `--follow` | `-f` | Stream output until the command completes |
+| `--remote-addr <URL>` | | Remote host address |
+| `--api-key <KEY>` | | API key |
+Every other flag is an [`exec workflow`](#awman-exec-workflow-path--awman-exec-wf-path) flag, and every one you pass is sent to the server, which runs `exec workflow` with it: `--work-item`, `--issue`, `--agent`, `--model`, `--yolo`, `--auto`, `--plan`, `--overlay`, `--agent-flag`, `--dynamic` and `--leader`, `--max-concurrent`, the `--on-…` choices, the `--prerequisite-…` grants and `--check-prerequisites`. Paths in them (`--overlay`, the workflow file) are paths on the remote host, and `--agent-flag` replaces the remote host's `agentFlags` entry for the run. The server then applies its API defaults (non-interactive, and `--yolo` unless you passed `--plan` or `--auto`); see [Submit a command](#submit-a-command).
+
+Two `exec workflow` flags are not available, because they describe the local run: `--worktree` (the server decides; its API default `--yolo` implies one) and `--json` (the server reports the result; read it with `GET /v1/commands/<id>/status`). Passing either is an unknown-flag error.
+
+With `--dynamic`, omit the workflow path; the server's leader agent designs the workflow for `--work-item` or `--issue`:
+
+```sh
+awman remote exec workflow --dynamic --work-item 0042 --session abc123 -f
+```
+
+Without `--session` or `AWMAN_REMOTE_SESSION`, the command fails with ``no remote session id; pass --session <id> or run `awman remote session start` first``.
+
+### Live log streaming (`--follow`)
+
+Without `--follow`, awman prints `Command submitted: <id>` and returns. With `--follow`, it streams the command's events: stdout and stderr lines go to the matching stream (prefixed with `[step]` once more than one workflow step has produced output), and status, step and phase transitions are printed as `[...]` lines. When the command ends it prints a final line on stdout:
 
 ```
-Session started: a1b2c3d4-e5f6-7890-abcd-ef1234567890
-Workdir: /home/user/my-project
-
-┌─ Ready Summary (docker) ──────────────┐
-│ Dockerfile          ✓                 │
-│ Base image          ✓                 │
-│ Agent image         ✓                 │
-│ ...                                    │
-└────────────────────────────────────────┘
+Command e5f6a7b8-…: workflow (session abc123) via https://127.0.0.1:9876 [done].
 ```
 
-In CLI mode, `dir` is required. In TUI mode, `dir` is optional — if omitted and saved directories are configured, awman shows an interactive picker (see [TUI interactive flows](#tui-interactive-flows)).
+- A command that already finished is replayed in full, then the final line is printed.
+- If the connection drops, awman reconnects once after 2 seconds.
+- **Ctrl-C** stops following; the command keeps running on the server.
+- With `--follow`, awman exits with the remote command's result: `0` when it finished `done`, the command's own exit code when that is non-zero, and `1` when it failed or was cancelled without one, or when following stopped before it finished (Ctrl-C, a lost connection). Without `--follow`, a successful submit exits `0`.
+
+---
+
+## `awman remote exec prompt`
+
+Sends a one-shot prompt to a ready session. Session resolution, `--follow` and its exit code work as for `remote exec workflow`. Every [`exec prompt`](#awman-exec-prompt-prompt) flag you pass (`--agent`, `--model`, `--issue`, `--yolo`, `--plan`, `--overlay`, `--agent-flag` and the rest) is sent to the server. Put flags before the prompt: everything after the prompt's first word is part of the prompt.
+
+```sh
+awman remote exec prompt "Fix the failing tests" --session abc123 --follow
+```
 
 ---
 
 ## `awman remote session kill`
 
-Closes a session on the remote host.
+Closes a session on the remote host. A running command is allowed to finish; see [Close a session](#close-a-session).
 
 ```sh
-awman remote session kill [session-id] [--remote-addr <URL>] [--api-key <KEY>]
-```
-
-```sh
-# Kill a specific session
 awman remote session kill a1b2c3d4-e5f6-7890-abcd-ef1234567890
-
-# Specify a non-default remote host and key
-awman remote session kill abc123 \
-  --remote-addr http://alt-host:9876 \
-  --api-key <key>
 ```
 
-On success:
-
-```
-Session closed: a1b2c3d4-e5f6-7890-abcd-ef1234567890
-```
-
-In CLI mode, `session-id` is required. In TUI mode, if omitted, awman fetches the active session list from the remote host and shows an interactive picker.
-
----
-
-## TUI interactive flows
-
-When used inside the awman TUI, `remote` subcommands gain interactive capabilities that are not available in CLI mode.
-
-### Session picker (`remote exec` without `--session`)
-
-If you run `remote exec workflow` or `remote exec prompt` in the TUI without specifying a session, and no session is stored from previous activity in the current tab, awman fetches the **active** session list from the remote host (using `GET /v1/sessions?status=active`) and displays an interactive picker. Closed sessions are never shown in the picker.
-
-The picker dialog has a dynamic width that adjusts to fit long session IDs and working directory paths. Session IDs are truncated with `…` if necessary to preserve the full workdir path — the part most useful for identification.
-
-```
-╭─── Select Session ───────────────────────────────────────────────╮
-│                                                                    │
-│   ▶  a1b2c3d4  /home/user/my-project                              │
-│      b2c3d4e5  /home/user/other-project                           │
-│                                                                    │
-│  ↑↓ navigate  Enter confirm  Esc cancel                            │
-╰────────────────────────────────────────────────────────────────────╯
-```
-
-Use `↑` / `↓` to highlight a session and `Enter` to confirm. The TUI remembers your choice for the rest of the tab's lifetime — subsequent `remote exec` commands in the same tab skip the picker and use the remembered session automatically.
-
-If the remote host has no active sessions, the picker displays:
-
-```
-No active sessions on http://build-server.example.com:9876. Run `remote session start` first.
-```
-
-### Saved-dir picker (`remote session start` without a directory)
-
-If you run `remote session start` in the TUI without a directory argument, and `remote.savedDirs` is configured, awman shows a directory picker:
-
-```
-╭─── Select Directory ───────────────────────────────────────────────────────╮
-│                                                                              │
-│   ▶  /home/user/my-project                                                   │
-│      /home/user/other-project                                                │
-│      /opt/builds/service-a                                                   │
-│                                                                              │
-│  ↑↓ navigate  Enter confirm  Esc cancel                                      │
-╰──────────────────────────────────────────────────────────────────────────────╯
-```
-
-If no saved directories are configured and no directory argument is given:
-
-```
-error: No directory specified and no savedDirs configured.
-       Pass a directory argument or add paths via: config set remote.savedDirs --global
-```
-
-### Save-dir prompt (`remote session start` with a new directory)
-
-When you start a session with a directory that is not in `remote.savedDirs`, the TUI offers to save it:
-
-```
-╭────────────────────────────────────────────────────────────────╮
-│  Save '/home/user/new-project' to remote.savedDirs? (y/n)      │
-╰────────────────────────────────────────────────────────────────╯
-```
-
-- `y` — saves the path to `remote.savedDirs` in your global config, then starts the session
-- `n` or `Enter` — starts the session without saving
-- `Esc` — cancels the session start entirely
-
-### Session kill picker (`remote session kill` without a session ID)
-
-If you run `remote session kill` in the TUI without a session ID, awman fetches the active session list (`?status=active`) and shows a picker titled "Kill Session". Closed sessions are not listed. Navigation is identical to the session picker above.
-
----
-
-## Remote-bound TUI tabs
-
-When `remote.defaultAddr` is configured in `~/.awman/config.json`, the TUI's **new-tab dialog** (opened with **Ctrl+T**) can permanently bind a new tab to a remote API session. Every command typed in a remote-bound tab is forwarded to the remote host via the API — no `remote exec` prefix or `--session` flag required.
-
-### Creating a remote-bound tab
-
-Press **Ctrl+T**. When `remote.defaultAddr` is configured, awman asynchronously fetches the list of active sessions from the remote host and displays them below the working directory field:
-
-```
-┌──── New Tab ─────────────────────────────────────────────┐
-│  Working directory:                                       │
-│  [ /workspace/myproject                               ]   │
-│                                                           │
-│  ─── Remote sessions (1.2.3.4:9876) ───────────────────  │
-│    abc123  /workspace/proj-a                              │
-│  > def456  /workspace/proj-b          ← selected         │
-│    + Create new remote session                            │
-│                                                           │
-│  [Enter] confirm  [Esc] cancel  [↓] move to remote list  │
-└───────────────────────────────────────────────────────────┘
-```
-
-While the fetch is in-flight, the list area shows `"  Loading remote sessions…"`. The dialog does not block — you can open a local tab immediately by pressing **Enter** in the workdir field if the remote host is slow to respond.
-
-Only **active** sessions are shown; closed sessions are excluded.
-
-| Key | Action |
-|-----|--------|
-| **↓** (workdir field focused) | Move focus to the remote session list |
-| **↑ / ↓** (list focused) | Navigate the session list |
-| **↑** (top of list, list focused) | Return focus to the workdir field |
-| **Enter** (workdir field focused) | Open a local tab with that working directory — unchanged behavior |
-| **Enter** (session selected) | Create a new tab permanently bound to that remote session |
-| **Enter** (`+ Create new remote session` selected) | Open the create-session sub-modal |
-| **Esc** | Cancel the entire modal |
-
-**Fetch failure messages** (non-fatal — a local tab can still be opened):
-
-| Situation | Message shown |
-|-----------|---------------|
-| Remote host unreachable | `"  ⚠ Could not reach <host>: <error>"` |
-| Auth required but no key configured | `"  ⚠ Auth required for <host>. Set remote.defaultAPIKey or pass --api-key."` |
-
-### Creating a new remote session from the dialog
-
-Selecting **"+ Create new remote session"** transitions the dialog to a session-creation sub-modal:
-
-```
-┌──── New Remote Session ──────────────────────────────────┐
-│  Remote working directory:                                │
-│  [ /workspace/                                        ]   │
-│                                                           │
-│  Saved directories:                                       │
-│    /workspace/proj-a                                      │
-│  > /workspace/proj-b          ← selected                 │
-│                                                           │
-│  [Enter] confirm  [Esc] back  [↑↓] navigate saved dirs   │
-└───────────────────────────────────────────────────────────┘
-```
-
-Entries from `remote.savedDirs` appear in the list. Selecting one populates the text field at the top. Press **Enter** to create the session on the remote host and open a tab bound to it. Press **Esc** to return to the new-tab dialog.
-
-If session creation fails (e.g. the directory is not in the server's allowlist), the modal shows the error text. Press **Esc** to close and press **Ctrl+T** to start over.
-
-### Remote-bound tab appearance
-
-Remote-bound tabs are **purple** in the tab bar. The tab label shows the `host:port` of the remote host (the `display_host`, extracted from `remote.defaultAddr` at binding time) instead of the local working directory short name.
-
-```
-┌─ Tab 1: myproject ──────────┬─ 1.2.3.4:9876 ─────────────┐
-│  exec workflow plan.md       │  exec workflow build.md     │
-└──────────────────────────────┴─────────────────────────────┘
-```
-
-The `display_host` label is fixed for the lifetime of the tab — it does not change if `remote.defaultAddr` is later modified in config. The inner subtitle (below the hostname) shows the command currently running on the remote session, or `(ready)` when idle.
-
-### Command execution in a remote-bound tab
-
-Every command typed in a remote-bound tab is sent to the remote session via `POST /v1/commands`, then output is streamed back in real time via the SSE log-streaming endpoint — identical to `remote exec workflow <file> --follow` but with no flags required. The tab transitions through the same execution phase states as a local tab (running → done / error).
-
-When first created, the tab automatically dispatches a `ready` command to the remote session (matching local tab behavior). The `ready` output appears in the execution window.
-
-If the remote host returns an error (auth failure, session not found, network error), the error appears in the execution window. The tab remains bound to the remote session and accepts subsequent commands normally — the binding is permanent for the lifetime of the tab.
-
-Flags that refer to remote addressing (`--session`, `--remote-addr`, `--api-key`) are stripped from forwarded commands, since the binding already supplies the target.
-
-### Closing a remote-bound tab
-
-Closing a remote-bound tab (with **Ctrl+C** when multiple tabs are open) cancels any in-flight command stream and any active workflow polling task. The remote session itself is **not** closed — it continues running on the remote host and can be accessed again later via a new remote-bound tab or the `remote` CLI subcommands.
-
-### Workflow Overview for remote-bound tabs
-
-When a workflow command is dispatched from a remote-bound tab (`exec workflow`), the Workflow Overview appears automatically — exactly as it does for local workflow runs.
-
-Starting 5 seconds after the command is dispatched, awman polls `GET /v1/workflows/:command_id` on the remote API server every 5 seconds. As soon as a workflow state is found, the overview renders and continues updating until the workflow reaches a terminal state (`complete` or `error`).
-
-The remote Workflow Overview is visually identical to the local one: parallel steps, paused states, running steps, and completion markers all render the same way, and **Ctrl-O** minimizes / maximizes it just as it does locally. No extra configuration is required.
-
-**Polling behavior:**
-
-| Situation | Behavior |
-|-----------|----------|
-| No workflow found (HTTP 404) on first poll | Polling stops silently — the command is not a workflow command |
-| No workflow found (HTTP 404) after a previous 200 | Polling stops — workflow state was removed |
-| Transient network error during polling | Retried on the next 5-second interval; no error shown to the user |
-| Workflow reaches `complete` or `error` | Polling stops; the overview reflects the final state |
-| Tab closed while polling | Poll task cancelled immediately |
-| New command dispatched from the same tab | Previous poll task cancelled; new poll task starts for the new command |
+On success awman prints `Session <id> killed.` A session the server does not know is treated as already closed.
 
 ---
 
 ## Remote client configuration
 
-Remote mode settings live under a `remote` key in the global config (`~/.awman/config.json`). All fields are optional.
+Remote settings live under `remote` in the global config (`~/.awman/config.json`):
 
 ```json
 {
   "remote": {
-    "defaultAddr": "http://build-server.example.com:9876",
-    "defaultAPIKey": "a3f8b2c1...64-char-hex...",
-    "savedDirs": [
-      "/home/user/my-project",
-      "/home/user/other-project"
-    ]
+    "defaultAddr": "https://127.0.0.1:9876",
+    "defaultAPIKey": "a3f8b2c1...64-char-hex..."
   }
 }
 ```
 
-### `remote.defaultAddr`
-
-The default address of the remote API awman server. When set, you don't need to pass `--remote-addr` on every command.
-
-```sh
-awman config set --global remote.defaultAddr http://build-server.example.com:9876
-```
-
-Overridden per-invocation by `--remote-addr` or `AWMAN_REMOTE_ADDR`.
-
-### `remote.defaultAPIKey`
-
-The default API key to send when authenticating to the remote API server. When set alongside `remote.defaultAddr`, every `awman remote` command to that host is authenticated automatically with no extra flags.
-
-```sh
-awman config set --global remote.defaultAPIKey <your-api-key>
-```
-
-**Security constraint:** this key is **only sent when the target address exactly matches `remote.defaultAddr`** (scheme, host, and port, after stripping trailing slashes). If you use `--remote-addr` or `AWMAN_REMOTE_ADDR` to point at a different server, the stored key is ignored — it is never silently forwarded to an unintended host.
-
-Overridden per-invocation by `--api-key` or `AWMAN_API_KEY`.
-
-### `remote.savedDirs`
-
-A list of working directory paths (absolute paths on the remote host) for use by the TUI's saved-dir picker when running `remote session start` without a directory argument.
-
-```sh
-# Set a single directory
-awman config set --global remote.savedDirs /home/user/my-project
-
-# Set multiple directories (comma-separated)
-awman config set --global remote.savedDirs "/home/user/my-project,/home/user/other-project"
-
-# Clear all saved directories
-awman config set --global remote.savedDirs ""
-```
-
-Directories can also be added interactively from the TUI: when you start a session with a directory not already in the list, the TUI offers to save it for you.
-
----
-
-## Full example: end-to-end CLI workflow
-
-```sh
-# Configure the remote host and API key once
-awman config set --global remote.defaultAddr http://build-server.example.com:9876
-awman config set --global remote.defaultAPIKey <your-api-key>
-
-# Create a session on the remote host
-SESSION=$(awman remote session start /home/user/my-project | grep 'Session started:' | awk '{print $NF}')
-echo "Session: $SESSION"
-
-# Dispatch a workflow and stream its output
-awman remote exec workflow path/to/workflow.toml --session "$SESSION" --follow
-
-# Or pipe into a log file (no ANSI decoration)
-awman remote exec workflow path/to/workflow.toml --session "$SESSION" --follow > workflow.log
-
-# Kill the session when you are done
-awman remote session kill "$SESSION"
-```
+| Key | Meaning |
+|-----|---------|
+| `remote.defaultAddr` | Default server address. Overridden by `--remote-addr` or `AWMAN_REMOTE_ADDR` |
+| `remote.defaultAPIKey` | Key sent only to `remote.defaultAddr`. Overridden by `--api-key` or `AWMAN_API_KEY` |
 
 ---
 
 ## Full example: CI pipeline
 
 ```sh
-export AWMAN_REMOTE_ADDR=http://build-server.internal:9876
+export AWMAN_REMOTE_ADDR=https://127.0.0.1:9876   # tunnelled to the build host
 export AWMAN_API_KEY=<your-api-key>
-export AWMAN_REMOTE_SESSION=<pre-provisioned-session-id>
 
-# Dispatch the workflow; exit code reflects the command's exit code
-awman remote exec workflow path/to/workflow.toml --follow
+SESSION=$(awman remote session start --type remote \
+  --repo-url https://github.com/org/my-project --branch main \
+  | awk '/ created via / {print $2}')
+awman remote exec workflow aspec/workflows/implement-feature.toml \
+  --work-item 0042 --session "$SESSION" --follow | tee workflow.log
+awman remote session kill "$SESSION"
 ```
 
-For CI contexts where a session is long-lived and pre-provisioned, setting `AWMAN_REMOTE_SESSION` and `AWMAN_API_KEY` in the pipeline environment avoids per-command flags entirely.
-
----
-
-## Using cURL directly
-
-Because `remote exec` is built on the API HTTP API, you can use cURL (or any HTTP client) wherever `awman remote` is inconvenient — for example, in scripts with no awman binary available:
-
-```sh
-SERVER=http://build-server.example.com:9876
-KEY=<your-api-key>
-SESSION=a1b2c3d4-...
-
-# Submit a command
-CMD=$(curl -s -X POST "$SERVER/v1/commands" \
-  -H "Authorization: Bearer $KEY" \
-  -H 'Content-Type: application/json' \
-  -d '{"session_id":"'"$SESSION"'","subcommand":"exec workflow","args":["path/to/workflow.toml"]}' | jq -r .command_id)
-
-# Stream live output via SSE (prints each log line as it arrives)
-curl -s "$SERVER/v1/commands/$CMD/logs" \
-  -H "Authorization: Bearer $KEY" \
-| while IFS= read -r line; do
-  case "$line" in
-    "event: done") echo "--- done ---"; break ;;
-    data:\ *)             echo "${line#data: }" ;;
-  esac
-done
-
-# Or poll until done, then fetch the full log
-while true; do
-  STATUS=$(curl -s "$SERVER/v1/commands/$CMD/status" \
-    -H "Authorization: Bearer $KEY" | jq -r .status)
-  [ "$STATUS" = "done" ] || [ "$STATUS" = "error" ] && break
-  sleep 5
-done
-curl -s "$SERVER/v1/commands/$CMD/logs?format=json" \
-  -H "Authorization: Bearer $KEY" \
-  | jq -r '.events[] | select(.payload.type == "stdout_line" or .payload.type == "stderr_line") | .payload.data'
-```
-
-See [API mode](#api-mode) for the full HTTP API reference, including session management endpoints.
+For a pre-provisioned, long-lived session, set `AWMAN_REMOTE_SESSION` instead of passing `--session`.
 
 ---
 
@@ -2798,38 +2217,11 @@ See [API mode](#api-mode) for the full HTTP API reference, including session man
 
 | Situation | Behaviour |
 |-----------|-----------|
-| No remote address configured | Error with instructions to pass `--remote-addr`, set `AWMAN_REMOTE_ADDR`, or configure `remote.defaultAddr` |
-| `remote exec` without `--session` in CLI mode | Error with instructions to pass `--session` or set `AWMAN_REMOTE_SESSION` |
-| `remote session start` without a directory in CLI mode | Error with instructions to pass a directory argument |
-| `remote session kill` without a session ID in CLI mode | Error with instructions to pass a session ID |
-| Session not found on remote | HTTP 404 from the server; error message includes the session ID and suggests `remote session start` |
-| Remote host unreachable | Connection timeout after 10 s; error message includes the target address |
-| Session is busy (command already running) | HTTP 403 from the server; error message includes the running command ID |
-| `--follow` on a command that already completed | Full historical log is replayed, then summary is printed — no output is missed |
-| `--follow` command runs longer than 10 minutes with no output | Client times out and prints: `"Request to <addr> timed out after 10 minutes. The remote command may still be running on the server."` The command continues running on the server; reconnect with `remote exec` (without `--follow`) to check status |
-| `--follow` receives any output from server within 10 minutes | Timeout is reset on each received event; commands that produce incremental output can run for hours |
-| `remote session start` with a new dir (TUI) | Offers to save the path to `remote.savedDirs`; session starts regardless of whether you save |
-| TUI session picker: remote host has no active sessions | Picker modal shows "No active sessions" message; `Enter` and `Esc` both cancel |
-| TUI session picker: fetch fails | Error shown in command input bar; no modal opens |
-| TUI `remote session start` with no saved dirs and no dir argument | Error in command input bar: "No directory specified and no savedDirs configured" |
-| `remote session start` with a dir already in `savedDirs` | Dir is not duplicated in the list when the save-dir prompt is accepted |
-| Inner command flags (e.g. `--yolo`) | Forwarded to the remote host verbatim; not consumed by the `remote exec` parser |
-| No API key provided and server requires auth | HTTP 401; error body explains which header to use |
-| `remote.defaultAPIKey` set but target address differs from `remote.defaultAddr` | Config key is ignored; request proceeds without auth (server returns 401 if auth is required) |
-| `remote.defaultAPIKey` matches `remote.defaultAddr` with trailing slash difference | Trailing slashes are stripped from both sides before comparison; key is used |
-| Session closed between picker fetch and command dispatch | Server returns HTTP 404; client surfaces a clear error; session is not re-opened |
-| **Ctrl+T** with `remote.defaultAddr` not configured | New-tab dialog behaves exactly as before — no remote session list, no fetch, no binding option |
-| **Ctrl+T** opened while a previous remote session fetch is still in-flight | Previous fetch is cancelled; new fetch starts for the fresh modal open |
-| Remote-bound tab: auth error when dispatching a command | Error appears in the execution window; no `command_id` returned; workflow polling does not start; tab stays bound |
-| Remote-bound tab: remote session closed externally while tab is open | `POST /v1/commands` returns HTTP 404; error shown in execution window; subsequent commands also fail until the session is recreated on the remote host |
-| Remote-bound tab: command contains `--session` or `--remote-addr` flags | These flags are stripped before forwarding; the tab's binding supplies the target |
-| Remote-bound tab: tab closed while a command stream is in-flight | SSE stream task and any workflow poll task are cancelled; the remote command continues executing on the server |
-| Remote-bound tab: new command dispatched while workflow polling is active | Previous poll task cancelled; new poll task starts 5 seconds after the new command is dispatched |
-| Remote-bound tab: create-new-session sub-modal — remote dir creation fails | Modal shows error text; no tab created; press **Esc** and retry with **Ctrl+T** |
-| Remote Workflow Overview: `GET /v1/workflows/:command_id` returns HTTP 404 | Polling stops silently; no error shown; the overview does not appear |
-| Remote Workflow Overview: transient network errors during polling | Retried on next 5-second interval; not surfaced to user |
-| Remote Workflow Overview: parallel steps | Rendered stacked in the overview, identical to local workflow parallel steps |
-| Remote Workflow Overview: paused step | The overview shows the paused indicator on the paused step; polling continues since the workflow may resume |
+| Remote host unreachable | Fails after a 10-second connect timeout |
+| Session not ready yet | HTTP 409 `session_not_ready`; wait for `remote session start` to report ready |
+| Session closed or unknown on `remote exec` | HTTP 404 `session_not_found` |
+| No API key and the server requires one | HTTP 401 `unauthorized` |
+| `remote.defaultAPIKey` set but the target address differs from `remote.defaultAddr` | Config key ignored; the server answers 401 if auth is required |
 
 ---
 

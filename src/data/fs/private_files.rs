@@ -407,3 +407,7 @@ pub fn read_private_approval_json<T: DeserializeOwned>(
     }
     Ok(serde_json::from_slice(&bytes).ok())
 }
+
+#[cfg(all(test, unix))]
+#[path = "private_files_coverage_tests.rs"]
+mod coverage_tests;

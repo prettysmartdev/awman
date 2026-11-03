@@ -18,6 +18,25 @@ pub(super) struct Rig {
     pub backend: BuiltinBackend,
 }
 
+/// Take an image lease a launch or fence just released. A process forked by a
+/// concurrent test holds a copy of the lock descriptor until it execs, so a
+/// single zero-wait attempt can spuriously find it busy; retry briefly.
+pub(super) fn lease_after_forks(
+    paths: &BuiltinPaths,
+    image: &str,
+    exclusive: bool,
+) -> Result<std::fs::File, EngineError> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match paths.image_lease(image, exclusive) {
+            Err(_) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            result => return result,
+        }
+    }
+}
+
 pub(super) fn settings(state_dir: &std::path::Path) -> BuiltinRuntimeSettings {
     BuiltinRuntimeSettings {
         state_dir: state_dir.into(),
@@ -52,6 +71,7 @@ impl Rig {
             owner: owner.into(),
             background_env: Default::default(),
             notices: Default::default(),
+            cancel_grace: super::super::exec_bridge::DEFAULT_CANCEL_GRACE,
         }
     }
 
@@ -1257,7 +1277,9 @@ async fn a_newer_awman_with_the_same_protocol_attaches_to_an_older_owners_sandbo
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn cancelled_blocking_boot_stops_vm_removes_lease_and_catalog_entry() {
-    let rig = Rig::new("cancelled-boot");
+    let mut rig = Rig::new("cancelled-boot");
+    // The fake guest ignores the interrupt, so cleanup waits out the grace.
+    rig.backend.cancel_grace = Duration::from_millis(50);
     let instance = rig.backend.build(options("awman-cancelled-boot")).unwrap();
     let id = instance.handle_preview().id;
     let lease = rig.backend.paths.home.join("run/boot.lease");
@@ -1290,7 +1312,7 @@ async fn cancelled_blocking_boot_stops_vm_removes_lease_and_catalog_entry() {
     assert_eq!(rig.driver.finished().len(), 1);
     assert!(!attach.exists());
     // The launch's pre-publication image lease must also be released.
-    assert!(rig.backend.paths.image_lease("agent:latest", true).is_ok());
+    assert!(lease_after_forks(&rig.backend.paths, "agent:latest", true).is_ok());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -1351,7 +1373,7 @@ async fn attach_bind_failure_after_exec_cleans_up_created_sandbox_and_image_leas
         attach.exists(),
         "cleanup must preserve the pre-existing endpoint"
     );
-    assert!(rig.backend.paths.image_lease("agent:latest", true).is_ok());
+    assert!(lease_after_forks(&rig.backend.paths, "agent:latest", true).is_ok());
     std::fs::remove_file(attach).unwrap();
 }
 

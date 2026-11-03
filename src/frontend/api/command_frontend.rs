@@ -332,16 +332,7 @@ impl crate::engine::git::GitFrontend for ApiDispatchFrontend {}
 
 impl UserMessageSink for ApiDispatchFrontend {
     fn write_message(&mut self, msg: UserMessage) {
-        let phase = match msg.level {
-            crate::data::message::MessageLevel::Info => "info",
-            crate::data::message::MessageLevel::Warning => "warn",
-            crate::data::message::MessageLevel::Error => "error",
-            crate::data::message::MessageLevel::Success => "ok",
-        };
-        self.container_sender().emit(EventPayload::StatusMessage {
-            phase: phase.to_string(),
-            message: msg.text,
-        });
+        emit_user_message(&self.container_sender(), msg);
     }
 
     fn replay_queued(&mut self) {}
@@ -427,12 +418,6 @@ impl CommandFrontend for ApiDispatchFrontend {
 #[async_trait]
 impl AgentFrontend for ApiDispatchFrontend {
     fn report_status(&mut self, status: AgentStatus) {
-        if matches!(status, AgentStatus::Running { .. }) {
-            if let Some(writer) = &self.state_writer {
-                writer.record_container_started();
-            }
-        }
-        let message = container_status_message(&status);
         // The proxy has already written the container name into its source;
         // remember it so the step's own workflow events carry it too.
         if let (AgentStatus::Running { container_name }, Some(cell)) =
@@ -448,17 +433,15 @@ impl AgentFrontend for ApiDispatchFrontend {
                     .insert(step_name, container_name.clone());
             }
         }
-        self.container_sender().emit(EventPayload::StatusMessage {
-            phase: "container".to_string(),
-            message,
-        });
+        emit_container_status(
+            &self.container_sender(),
+            self.state_writer.as_ref(),
+            &status,
+        );
     }
 
     fn report_progress(&mut self, progress: AgentProgress) {
-        self.container_sender().emit(EventPayload::StatusMessage {
-            phase: progress.stage,
-            message: progress.message,
-        });
+        emit_progress(&self.container_sender(), progress);
     }
 
     fn take_io(&mut self) -> crate::engine::agent_runtime::frontend::AgentIo {
@@ -742,43 +725,69 @@ impl ApiContainerSink {
 
 impl UserMessageSink for ApiContainerSink {
     fn write_message(&mut self, msg: UserMessage) {
-        let phase = match msg.level {
-            crate::data::message::MessageLevel::Info => "info",
-            crate::data::message::MessageLevel::Warning => "warn",
-            crate::data::message::MessageLevel::Error => "error",
-            crate::data::message::MessageLevel::Success => "ok",
-        };
-        self.event_bus.emit(EventPayload::StatusMessage {
-            phase: phase.to_string(),
-            message: msg.text,
-        });
+        emit_user_message(&self.event_bus, msg);
     }
     fn replay_queued(&mut self) {}
+}
+
+/// The status-line projection both API agent frontends share (the dispatch
+/// frontend for workflow steps and `ApiContainerSink` for single-agent
+/// commands): a `Running` status marks the command's container as started,
+/// and every status becomes one `container` status message. Attribution
+/// (which source the sender stamps) stays with each caller.
+fn emit_container_status(
+    sender: &EventBusSender,
+    state_writer: Option<&CommandStateWriter>,
+    status: &AgentStatus,
+) {
+    if matches!(status, AgentStatus::Running { .. }) {
+        if let Some(writer) = state_writer {
+            writer.record_container_started();
+        }
+    }
+    sender.emit(EventPayload::StatusMessage {
+        phase: "container".to_string(),
+        message: container_status_message(status),
+    });
+}
+
+/// One agent progress report as a status message in its own stage.
+fn emit_progress(sender: &EventBusSender, progress: AgentProgress) {
+    sender.emit(EventPayload::StatusMessage {
+        phase: progress.stage,
+        message: progress.message,
+    });
+}
+
+/// One user message as a status message whose phase names its level.
+fn emit_user_message(sender: &EventBusSender, msg: UserMessage) {
+    let phase = match msg.level {
+        crate::data::message::MessageLevel::Info => "info",
+        crate::data::message::MessageLevel::Warning => "warn",
+        crate::data::message::MessageLevel::Error => "error",
+        crate::data::message::MessageLevel::Success => "ok",
+    };
+    sender.emit(EventPayload::StatusMessage {
+        phase: phase.to_string(),
+        message: msg.text,
+    });
 }
 
 #[async_trait]
 impl AgentFrontend for ApiContainerSink {
     fn report_status(&mut self, status: AgentStatus) {
+        // Attribute this and every later event to the running container
+        // before the status line is emitted.
         if let AgentStatus::Running { container_name } = &status {
-            if let Some(writer) = &self.state_writer {
-                writer.record_container_started();
-            }
             self.source
                 .lock()
                 .expect("event source lock poisoned")
                 .container = Some(container_name.clone());
         }
-        let message = container_status_message(&status);
-        self.event_bus.emit(EventPayload::StatusMessage {
-            phase: "container".to_string(),
-            message,
-        });
+        emit_container_status(&self.event_bus, self.state_writer.as_ref(), &status);
     }
     fn report_progress(&mut self, progress: AgentProgress) {
-        self.event_bus.emit(EventPayload::StatusMessage {
-            phase: progress.stage,
-            message: progress.message,
-        });
+        emit_progress(&self.event_bus, progress);
     }
 
     fn take_io(&mut self) -> crate::engine::agent_runtime::frontend::AgentIo {

@@ -268,7 +268,7 @@ Other WCB actions work identically to a regular step:
 
 ## Repair loop
 
-If the leader's `workflow.toml` is missing, fails to parse, or references agents the project does not have, awman does not abort immediately. Instead, it launches a **repair agent** — the same leader container and model — with a prompt that includes the exact validation error and the workflow format documentation.
+If the leader's `workflow.toml` is missing, fails to parse, or references agents the project does not have, awman does not abort immediately. Instead, it launches a **repair agent**, using the leader's agent and model, with a prompt that includes the exact validation error and the workflow format documentation.
 
 The repair loop runs up to **3 times** before giving up:
 
@@ -286,11 +286,9 @@ Attempt 2 repair: repair agent fixes agent name → validate → passes → proc
 If all 3 repair attempts fail, awman surfaces the final error and the path to the last generated file so you can inspect it manually:
 
 ```
-leader agent failed to produce a valid workflow.toml after 3 repair attempts
-last error: workflow.toml references agents with no Dockerfile in the project:
+leader agent failed to produce a valid workflow.toml after 3 repair attempts; last error: workflow.toml references agents with no Dockerfile in the project:
   - "gemini" (expected .awman/Dockerfile.gemini)
-  Available agents: claude, codex, opencode, gemini, copilot, cline, antigravity
-file is at: /home/user/.awman/context/workflow/abc123/workflow.toml
+Available agents: claude, codex; file is at /home/user/.awman/context/workflows/<run-id>/workflow.toml
 ```
 
 Each repair agent runs through the same stuck detection → yolo countdown → auto-advance pipeline as the original leader.
@@ -371,7 +369,7 @@ A dynamic run that finishes cleanly deletes both its saved workflow and its stat
 | `--dynamic` without `--work-item` | `--dynamic requires --work-item` |
 | `--leader` without `--dynamic` | `--leader is only valid with --dynamic` |
 | `--dynamic --plan` | `--dynamic cannot be used with --plan because dynamic mode enforces --yolo` |
-| Malformed `--leader` value | `invalid --leader value: expected agent::model (e.g. claude::claude-opus-4-8)` |
+| Malformed `--leader` value | `invalid --leader value "<value>"; expected agent::model (e.g. claude::claude-opus-4-8)` |
 
 All flag errors are surfaced before any container work begins.
 
@@ -384,7 +382,7 @@ All flag errors are surfaced before any container work begins.
 | `--dynamic` | Enable dynamic mode — the leader agent designs the workflow file |
 | `--work-item <N>` | Required with `--dynamic`; the work item number to pass to the leader |
 | `--leader <agent::model>` | Override the agent container and model used for the leader step |
-| `--model <NAME>` | Default model for the generated workflow's steps; also used as the leader model if `--leader` is not set |
+| `--model <NAME>` | Default model for the generated workflow's steps; also the leader's model when neither `--leader` nor `defaultLeader` is set |
 | `--agent-flag=<ARG>` | Extra argument for the selected agent (`--agent`, else config): the leader when it runs that agent, and generated steps that use the workflow's default agent. Other agents keep their configured [`agentFlags`](07-configuration.md#pass-extra-flags-to-an-agent) |
 
 The leader and every generated step also get their agent's configured `agentFlags`. These are read from the repository you launched from, not the worktree, so an `agentFlags` entry you haven't committed still reaches the leader.

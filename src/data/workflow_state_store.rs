@@ -298,4 +298,51 @@ mod tests {
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o640);
     }
+
+    /// A reader polling the checkpoint while another thread keeps replacing
+    /// it always parses a complete record — the old one or the new one, never
+    /// a truncated or half-written file. The two records differ in size so a
+    /// truncate-then-write save would be caught mid-write.
+    #[test]
+    fn a_concurrent_reader_always_sees_a_complete_old_or_new_record() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = WorkflowStateStore::at_git_root(tmp.path());
+        let small = fresh_state("wf");
+        let mut large = fresh_state("wf");
+        large.workflow_hash = "h".repeat(256 * 1024);
+        store.save(&small).unwrap();
+
+        let done = Arc::new(AtomicBool::new(false));
+        let reader = {
+            let done = Arc::clone(&done);
+            let store = WorkflowStateStore::at_git_root(tmp.path());
+            let (small_hash, large_hash) =
+                (small.workflow_hash.clone(), large.workflow_hash.clone());
+            std::thread::spawn(move || {
+                let mut reads = 0usize;
+                while !done.load(Ordering::Acquire) || reads == 0 {
+                    let state = store
+                        .load(None, "wf")
+                        .expect("every read parses a complete record")
+                        .expect("the record never disappears during replacement");
+                    assert!(
+                        state.workflow_hash == small_hash || state.workflow_hash == large_hash,
+                        "read a mixed record"
+                    );
+                    reads += 1;
+                }
+                reads
+            })
+        };
+        for i in 0..100 {
+            store
+                .save(if i % 2 == 0 { &large } else { &small })
+                .unwrap();
+        }
+        done.store(true, Ordering::Release);
+        assert!(reader.join().unwrap() > 0);
+    }
 }

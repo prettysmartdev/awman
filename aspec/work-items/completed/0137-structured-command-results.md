@@ -246,3 +246,58 @@ Append `structured_results`, `outputs`, `event_source` and `step_activity` to `A
   - the `?step=` filter;
   - `stages` and the snake_case fields in the workflow view, plus the `/v1/commands/{id}/workflow` alias.
 - Fix the polling example's `aborted|paused` case: the row status never takes those values; `result.outcome` does.
+
+## Implementation decisions
+
+- **`failure.code`, one per variant.** `CommandError::code()` gives every
+  variant its own snake_case code named after the condition. Where WI 0138's
+  HTTP error vocabulary already names the condition its spelling is reused
+  (`unknown_subcommand`, `unknown_flag`, `forbidden_workdir`, `worktree_exists`,
+  `merge_conflict`, `merge_target_dirty`, `workflow_prerequisites_unresolved`,
+  `unknown_agent`, `agent_untrusted`). Only the lower-layer wrappers `Engine`
+  and `Data` (apart from the two agent-definition engine errors) and the
+  untyped `Other` report `internal`. `Aborted` reports `aborted`, the same
+  word as its `outcome`; `cancelled` stays reserved for a cancel request,
+  which the queue worker assigns. HTTP admission errors keep WI 0138's class
+  codes (`invalid_request`, `not_found`, `forbidden`) for conditions its table
+  does not name, so an admission body and an asynchronous `failure.code` can
+  differ only for those classes.
+- **Legacy `stage`** is filled exactly as before this item:
+  `workflow_prerequisites` for an unresolved prerequisite, `push` for a push
+  failure, `setup` for a `/v1/runs` setup failure, absent otherwise and on
+  cancel. `failure.stage` is the field set for every failure; where the
+  legacy `stage` is present the two agree.
+- **The final `command_status.error`** is exactly the row's `result.error`.
+  The pre-0137 push-failure event's `push: ` prefix is dropped, because the
+  event is built from the row and must not disagree with it;
+  `result.failure.stage` carries `push`.
+- **`steps[i].container`** in the workflow view is the runtime container
+  *name*, the value events carry in `source.container`, so a client can
+  correlate the two. It is the name of the step's latest launch and is kept
+  after the step finishes (omitted while a step is pending again for a
+  rerun). A running step also exposes the runtime's `container_id`.
+- **Persisted launch records.** `WorkflowState` gains two additive maps,
+  `step_attempts` (launch count per main step) and `step_containers`
+  (container name of the latest launch). They are recorded engine facts, not
+  computed view fields: "`step_attempt` restarts from the saved state's
+  count" needs the count persisted, and the container name of a finished step
+  is not derivable at read time. Both use `#[serde(default)]` and are omitted
+  when empty, so pre-0137 state files load unchanged and an unlaunched state
+  serialises in the old shape; older binaries ignore them (no
+  `deny_unknown_fields`), so the schema version is unchanged. The computed
+  view fields (`index`, `stage`, `status`, `phase`, `state`, `stages`) are
+  still added only at read time.
+- **Outputs on non-Unix hosts** use the canonical-prefix check the spec names
+  for "elsewhere" (`command_outputs::portable`): every component is checked
+  with `symlink_metadata` before and after the open (no link or junction, plain
+  directories, a regular final file), the opened path must canonicalise
+  strictly beneath the canonical root, the handle's metadata must agree with
+  the name's, and Windows device names and names Windows would alias (a
+  trailing dot or space) are refused. The module is compiled under test on
+  every platform so the Unix suite exercises it.
+- **Sandbox runtimes** (no arbitrary host mounts) cannot bind-mount the
+  outputs directory. On those runtimes `/awman/output` is not mounted, the
+  prompt line naming it is omitted so agents are not pointed at a missing
+  directory, a warning is emitted, and the outputs routes and
+  `result.outputs` report an empty directory. This is a runtime capability
+  limit, documented in `docs/09`; it does not affect the security model.

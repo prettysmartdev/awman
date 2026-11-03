@@ -350,14 +350,27 @@ mod tests {
                 allowed: vec![],
                 roots: vec![],
             },
-            CommandError::WorkflowFileNotFound {
-                path: "/workflow".into(),
-            },
-            CommandError::SessionRepoUrlEmpty,
             CommandError::Other("failure".into()),
         ] {
             let api = ApiError::command_admission(&error);
             assert_eq!(api.code, error.code());
+            assert_eq!(api.status.as_u16(), error.http_status());
+            assert_eq!(api.message, error.to_string());
+        }
+        // Conditions WI 0138 has no code for keep its HTTP class code at
+        // admission; `result.failure.code` names the variant (WI 0137 §1).
+        for (error, class) in [
+            (
+                CommandError::WorkflowFileNotFound {
+                    path: "/workflow".into(),
+                },
+                "not_found",
+            ),
+            (CommandError::SessionRepoUrlEmpty, "invalid_request"),
+        ] {
+            let api = ApiError::command_admission(&error);
+            assert_eq!(api.code, class);
+            assert_ne!(api.code, error.code());
             assert_eq!(api.status.as_u16(), error.http_status());
             assert_eq!(api.message, error.to_string());
         }

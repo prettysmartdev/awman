@@ -64,3 +64,21 @@ fn real_git_previous_builtin_awman_is_the_last_commit_on_the_previous_protocol()
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+/// `make release` registers the Mac it runs on as a temporary runner for the
+/// Apple Silicon release job (`tools/release-runner.sh`); exercised against
+/// fakes for `gh`, the host probes and the runner archive.
+#[test]
+fn release_runner_verifies_registers_and_always_deregisters() {
+    let root = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."));
+    let output = Command::new("bash")
+        .arg(root.join("tools/test-release-runner.sh"))
+        .output()
+        .expect("run tools/test-release-runner.sh");
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

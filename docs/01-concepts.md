@@ -58,6 +58,8 @@ Overlays add things to an agent's container beyond the project mount:
 - `dir(host:container:ro|rw)` — mount an extra directory
 - `env(VAR)` — pass through a host environment variable
 - `skill(name)` / `skill(*)` — mount reusable skill files
+- `ssh()` — mount your `~/.ssh` read-only
+- `context(scope)` — mount a persistent context directory shared across sessions
 
 They can be set per-command (`--overlay`), per-repo or globally (config `overlays`), per workflow step, or via `AWMAN_OVERLAYS`. See [Overlays](08-overlays.md), including [Context overlays in depth](08-overlays.md#context-overlays-in-depth) for persistent context and system prompts.
 
@@ -80,12 +82,14 @@ Two JSON files: `<git root>/.awman/config.json` (per-repo, committed) and `~/.aw
 | `awman exec prompt` | One-shot prompt | [03](03-agent-sessions.md) |
 | `awman exec workflow` | Run a workflow file | [05](05-workflows.md) |
 | `awman new spec\|workflow\|skill` | Create artefacts | [03](03-agent-sessions.md), [05](05-workflows.md) |
+| `awman new agent` | Define a custom agent type | [15](15-custom-agents.md) |
 | `awman specs amend <N>` | Sync a spec with the implementation | [03](03-agent-sessions.md) |
 | `awman agents status` | Show running agents; add `--watch` to refresh continuously | [03](03-agent-sessions.md) |
 | `awman agents list` (`ps`, `ls`) | List agents; `--all` includes stopped agents eligible for cleanup | [03](03-agent-sessions.md) |
 | `awman agents detail` (`inspect`) | Show an agent's identity, lifecycle, resources, and runtime details | [03](03-agent-sessions.md) |
 | `awman agents kill` (`rm`) / `attach` | Stop and remove an agent, or connect to its terminal | [03](03-agent-sessions.md) |
-| `awman config show\|get\|set` | Inspect and edit config | [07](07-configuration.md) |
+| `awman config show\|get\|set\|migrate` | Inspect, edit and migrate config | [07](07-configuration.md) |
+| `awman config prerequisite-grants` | Review or revoke remembered workflow credential choices | [05](05-workflows.md#workflow-prerequisite-checks) |
 | `awman api start\|status\|logs\|kill` | HTTP API server | [09](09-api-and-remote-mode.md) |
 | `awman remote …` | Client for a remote awman server | [09](09-api-and-remote-mode.md) |
 | `awman squad …` | Your squad of agents, working unattended on the tasks you give them | [12](12-squad.md) |

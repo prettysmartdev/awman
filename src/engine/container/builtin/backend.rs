@@ -60,6 +60,10 @@ pub struct BuiltinBackend {
     pub background_env: Mutex<HashMap<String, BackgroundState>>,
     /// Notices from opening the driver, drained by `take_notices`.
     pub notices: Mutex<Vec<String>>,
+    /// Grace an interrupted agent gets before it is killed
+    /// ([`exec_bridge::DEFAULT_CANCEL_GRACE`](super::exec_bridge::DEFAULT_CANCEL_GRACE)
+    /// in production).
+    pub cancel_grace: std::time::Duration,
 }
 #[derive(Clone, Default)]
 pub struct BackgroundState {
@@ -461,6 +465,7 @@ impl ContainerBackend for BuiltinBackend {
                 paths: self.paths.clone(),
                 owner,
                 plan,
+                cancel_grace: self.cancel_grace,
             }),
             format,
         ))

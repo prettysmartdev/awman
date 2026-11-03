@@ -37,6 +37,11 @@
 | 2 (command) | Layers 0–1 + external crates, `crate::command::*` | Layer 3 |
 | 3 (frontend) | Layers 0–2 + external crates, `crate::frontend::*` | None (top layer) |
 
+Layer 3 may import Layer 0 data types and the frontend-facing traits/types
+Layer 1 defines, but may not call engine behavior directly (no method call on
+an `Engines` engine field from `src/frontend`); such calls go through a Layer 2
+type (Tenet 1, D1).
+
 **Check**: `make architecture-lint` (runs in CI)
 
 ---
@@ -91,10 +96,14 @@
 - SquadDaemonEngine (squad daemon bootstrap: store open/migrate, orphan-run
   reconciliation, scheduler spawn)
 - SquadSupervisor (squad daemon lifecycle: ensure running, key state, health)
-- `AgentMatrix` / `ContainerBackend` (`src/engine/agent/agent_matrix.rs`,
-  `src/engine/container/backend.rs`) — the only per-agent and per-backend
-  tables; adding an agent or a runtime backend is a new table row, not a new
-  `match agent.as_str()` arm scattered across the engine.
+- `AgentRegistry` / `AgentDefinition` (`src/engine/agent/registry.rs`,
+  `src/engine/agent/definition.rs`) with the first-party agent table
+  (`src/engine/agent/first_party.rs`) — the only place in the engine that
+  branches on agent name; custom agents convert `.awman/agents/<name>.toml`
+  into the same `AgentDefinition`. The module-private `ContainerBackend`
+  trait (`src/engine/container/backend.rs`) is the per-backend seam. Adding a
+  built-in agent or a runtime backend is a table row or a backend impl, not a
+  new `match agent.as_str()` arm scattered across the engine.
 - `HostAgentPinger` (`src/engine/ready/host_agent.rs`) — the only type
   permitted to spawn an agent binary on the host (see
   `aspec/architecture/security.md`).
@@ -130,7 +139,7 @@
 - `HeadlessDefaults` (`src/command/headless.rs`) — the named answer profiles
   (`::api()`, `::squad()`, `::cli()`) a command delegates to when no operator
   is attached, instead of each frontend answering its own `ask_*` inline.
-- `CommandCatalogue` (`src/command/dispatch/catalogue.rs`) owns command and
+- `CommandCatalogue` (`src/command/dispatch/catalogue/`) owns command and
   flag metadata. `dispatch/build.rs` is its constructor table: each runnable
   catalogue leaf points to a command-owned constructor, not command logic.
 - `LaunchPolicy` (`src/command/commands/launch_policy.rs`) — the decisions a
@@ -323,4 +332,4 @@ All three frontends now support `foo` identically — because the logic is in La
 
 ---
 
-**Last Updated**: October 19, 2026
+**Last Updated**: November 3, 2026

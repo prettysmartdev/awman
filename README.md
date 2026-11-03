@@ -105,7 +105,8 @@ Workflows are TOML or YAML files in your repo. Steps declare their dependencies 
 Two things make this more than a prompt runner:
 
 - **Per-step agents.** Any step can name the `agent` and `model` it runs with, so you can have Codex implement and Claude review in the same pipeline. Steps that don't specify one use your project's default.
-- **Per-step overlays.** Each step declares exactly what it needs from the host — `ssh()` to push, `env(GITHUB_TOKEN)` to open a PR, `skill(review)` for a review checklist. Nothing gets host access it didn't ask for.
+- **Per-step overlays.** Each step declares exactly what it needs from the host — `skill(review)` for a review checklist, `env(API_KEY)` for a tool it calls. Nothing gets host access it didn't ask for.
+- **Prerequisite checks.** Before anything starts, awman checks that commit, push, PR and CI steps have the Git identity, SSH key or GitHub token they need, and asks before handing a credential to the step that uses it.
 
 ![workflows screenshot](./docs/blog/images/dynamic-workflows.png)
 
@@ -152,16 +153,16 @@ command = "make test"
 [[teardown]]
 type = "commit_changes"
 message = "Implement {{work_item_number}}"
-add_all = true
 
 [[teardown]]
 type = "push_branch"
-overlays = ["ssh()"]
 
 [[teardown]]
 type = "create_pull_request"
 title = "Implement {{work_item_number}}"
-overlays = ["env(GITHUB_TOKEN)"]
+
+[[teardown]]
+type = "poll_ci"
 ```
 
 Supported agents: `claude`, `codex`, `opencode`, `gemini`, `antigravity`, `copilot`, `cline`, plus any custom agent you define (see [Custom Agents](docs/15-custom-agents.md); crush and maki ship as examples).
@@ -205,12 +206,15 @@ With `exec workflow`, `--yolo` automatically runs in an isolated Git worktree �
 
 ```sh
 # On the remote machine (prints an API key on first run)
-awman api start --port 9090
+awman api start --port 9090 --workdirs /workspace/myproject
 ```
+
+The server listens on loopback only, so reach it through an SSH tunnel (or a reverse proxy) and copy the server's `~/.awman/api/tls/cert.pem` to the same path on your laptop:
 
 ```sh
 # From your laptop
-awman config set --global remote.defaultAddr <host>
+ssh -N -L 9090:127.0.0.1:9090 build-host &
+awman config set --global remote.defaultAddr https://127.0.0.1:9090
 awman config set --global remote.defaultAPIKey <key>
 awman remote session start --workdir /workspace/myproject
 awman remote exec workflow aspec/workflows/implement-pr.toml --work-item 0027 --session <id> --follow
@@ -274,10 +278,13 @@ awman new workflow [--interview]       # create a workflow file
 awman new skill [--interview]          # create a skill file
 awman new skill --pull <repo> | --pull-all     # pull or refresh a published skills library from GitHub
 awman specs amend <nnnn>               # update a spec to match what was built
+awman new agent                        # define a custom agent type
 awman agents status [--watch]          # dashboard of running agents
 awman agents list | detail <id> | kill <id> | attach <id>
 awman clean [--dry-run] [--yes]        # remove stopped containers, stale images, and completed workflow data
-awman config show                      # view all config values
+awman config show | get <key> | set <key> <value>   # view and edit config
+awman config migrate                   # move deprecated config keys to their current place
+awman config prerequisite-grants list | revoke <index|all>   # review remembered workflow credential choices
 awman squad                            # open your squad's TUI tab
 awman squad start [--background]       # put your squad on duty (starts the squad daemon)
 awman squad add --name <name> --description <text> [--interval <dur>]   # create a new task for your squad to tackle
@@ -288,13 +295,13 @@ awman squad env [--push | --clear]     # report which env() values your squad's 
 awman squad list | show <name> | edit <name> | pause <name> | resume <name> | remove <name>
 awman squad stop | status | logs       # squad daemon lifecycle
 awman api start [--port <n>]           # start the HTTP API server (generates API key on first run)
-awman api status | kill                # check or stop the API server
+awman api status | logs | kill         # check, tail or stop the API server
 awman remote session start --workdir <dir>     # create a session on a remote server
 awman remote exec workflow <path> [--follow]   # run a workflow on a remote API server
 awman remote exec prompt "<text>" [--follow]   # run a one-shot prompt on a remote API server
 ```
 
-Every subcommand works in CLI mode and in the TUI command box (without the `awman` prefix). API mode accepts `exec prompt` and `exec workflow`.
+Every subcommand works in CLI mode and in the TUI command box (without the `awman` prefix). The API accepts `exec prompt`, `exec workflow`, and most `agents` and `squad` subcommands. The [Command Reference](docs/14-command-reference.md) lists every flag and where each command is available.
 
 ---
 
@@ -314,6 +321,8 @@ Every subcommand works in CLI mode and in the TUI command box (without the `awma
 - [Runtimes](docs/11-runtimes.md)
 - [squad](docs/12-squad.md)
 - [Cleaning Up](docs/13-cleaning-up.md)
+- [Command Reference](docs/14-command-reference.md)
+- [Custom Agents](docs/15-custom-agents.md)
 - [Architecture](docs/architecture.md)
 
 ---

@@ -107,7 +107,13 @@ pub(crate) struct StuckConfig {
     pub container_start_delay: Duration,
     /// See [`BridgeConfig::cancel_on_grace_expired`].
     pub cancel_on_grace_expired: Option<CancelFn>,
+    /// How often the detector samples the output clock. Every runtime uses
+    /// [`STUCK_POLL_INTERVAL`]; tests shorten it to exercise transitions fast.
+    pub poll_interval: Duration,
 }
+
+/// The [`StuckDetector`]'s sampling period in production.
+pub(crate) const STUCK_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Spawn the stuck detector task. Returns the broadcast sender (caller
 /// stores it in `AgentExecution`).
@@ -147,6 +153,7 @@ impl StuckDetector {
             stuck_timeout,
             container_start_delay,
             cancel_on_grace_expired,
+            poll_interval,
         } = config;
         let activity = Arc::clone(&output.last);
         let first_byte = Arc::clone(&output.first_byte);
@@ -172,7 +179,7 @@ impl StuckDetector {
             let mut is_stuck = false;
             let grace_start = Instant::now();
             loop {
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                tokio::time::sleep(poll_interval).await;
                 let tx = match weak.upgrade() {
                     Some(tx) => tx,
                     None => break,
@@ -322,6 +329,7 @@ pub(crate) fn bridge_pty(
             stuck_timeout: config.stuck_timeout,
             container_start_delay: config.container_start_delay,
             cancel_on_grace_expired: config.cancel_on_grace_expired,
+            poll_interval: STUCK_POLL_INTERVAL,
         },
         &output,
     );
@@ -445,6 +453,7 @@ pub(crate) fn bridge_piped(
             stuck_timeout: config.stuck_timeout,
             container_start_delay: config.container_start_delay,
             cancel_on_grace_expired: config.cancel_on_grace_expired,
+            poll_interval: STUCK_POLL_INTERVAL,
         },
         &output,
     );
@@ -462,132 +471,7 @@ mod tests {
     use std::time::{Duration, Instant};
     use tokio::sync::mpsc;
 
-    /// Test-only stuck detector with configurable timeout and fast poll
-    /// so tests don't have to wait 30 real seconds.
-    fn spawn_test_detector(
-        activity: SharedActivity,
-        timeout: Duration,
-    ) -> Arc<tokio::sync::broadcast::Sender<StuckEvent>> {
-        let (stuck_tx, _) = tokio::sync::broadcast::channel(16);
-        let stuck_tx = Arc::new(stuck_tx);
-        let tx = Arc::clone(&stuck_tx);
-        tokio::spawn(async move {
-            let mut is_stuck = false;
-            let start = Instant::now();
-            loop {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-                let elapsed = {
-                    let guard = match activity.lock() {
-                        Ok(g) => g,
-                        Err(_) => break,
-                    };
-                    match *guard {
-                        Some(t) => t.elapsed(),
-                        None => start.elapsed(),
-                    }
-                };
-                let now_stuck = elapsed >= timeout;
-                if now_stuck && !is_stuck {
-                    is_stuck = true;
-                    if tx.send(StuckEvent::Stuck).is_err() {
-                        break;
-                    }
-                } else if !now_stuck && is_stuck {
-                    is_stuck = false;
-                    if tx.send(StuckEvent::Unstuck).is_err() {
-                        break;
-                    }
-                }
-            }
-        });
-        stuck_tx
-    }
-
     // ── Stuck detector ────────────────────────────────────────────────────────
-
-    /// No activity (None) → start time is the baseline → Stuck fires once
-    /// the timeout elapses.
-    #[tokio::test]
-    async fn stuck_detector_emits_stuck_after_timeout_with_no_activity() {
-        let activity: SharedActivity = Arc::new(Mutex::new(None));
-        let timeout = Duration::from_millis(50);
-        let tx = spawn_test_detector(Arc::clone(&activity), timeout);
-        let mut rx = tx.subscribe();
-
-        let event = tokio::time::timeout(Duration::from_millis(500), rx.recv())
-            .await
-            .expect("timed out waiting for Stuck event")
-            .expect("broadcast channel closed unexpectedly");
-        assert_eq!(event, StuckEvent::Stuck, "expected first event to be Stuck");
-    }
-
-    /// Stuck fires → update activity to now → Unstuck fires.
-    #[tokio::test]
-    async fn stuck_detector_emits_unstuck_after_activity_resumes() {
-        let activity: SharedActivity = Arc::new(Mutex::new(None));
-        let timeout = Duration::from_millis(50);
-        let tx = spawn_test_detector(Arc::clone(&activity), timeout);
-        let mut rx = tx.subscribe();
-
-        // Wait for Stuck.
-        let first = tokio::time::timeout(Duration::from_millis(500), rx.recv())
-            .await
-            .expect("timed out waiting for Stuck")
-            .expect("channel closed");
-        assert_eq!(first, StuckEvent::Stuck);
-
-        // Refresh activity.
-        *activity.lock().unwrap() = Some(Instant::now());
-
-        // Wait for Unstuck.
-        let second = tokio::time::timeout(Duration::from_millis(500), rx.recv())
-            .await
-            .expect("timed out waiting for Unstuck")
-            .expect("channel closed");
-        assert_eq!(second, StuckEvent::Unstuck);
-    }
-
-    /// Recent activity → elapsed < timeout → no Stuck event within the window.
-    #[tokio::test]
-    async fn stuck_detector_no_event_when_activity_is_recent() {
-        let activity: SharedActivity = Arc::new(Mutex::new(Some(Instant::now())));
-        let timeout = Duration::from_millis(500);
-        let tx = spawn_test_detector(Arc::clone(&activity), timeout);
-        let mut rx = tx.subscribe();
-
-        // Wait well under the timeout.
-        tokio::time::sleep(Duration::from_millis(80)).await;
-
-        // No event should have been emitted.
-        let result = rx.try_recv();
-        assert!(
-            result.is_err(),
-            "should not have received any event with recent activity, got {:?}",
-            result
-        );
-    }
-
-    /// When all broadcast receivers are dropped, subsequent send() calls
-    /// return SendError. The detector task breaks on that error and stops.
-    #[tokio::test]
-    async fn stuck_detector_stops_when_all_receivers_dropped() {
-        let activity: SharedActivity = Arc::new(Mutex::new(None));
-        let timeout = Duration::from_millis(20);
-        let tx = spawn_test_detector(Arc::clone(&activity), timeout);
-        // Subscribe and then immediately drop the receiver.
-        let rx = tx.subscribe();
-        drop(rx);
-
-        // Give the task enough time to fire and discover no receivers.
-        tokio::time::sleep(Duration::from_millis(200)).await;
-
-        // The task should have exited; a new receiver gets nothing.
-        let mut rx2 = tx.subscribe();
-        let result = rx2.try_recv();
-        // Either no events (task exited) or a lagged/empty result is acceptable.
-        // What matters is that no panic occurred.
-        let _ = result;
-    }
 
     /// Production `StuckDetector::spawn` must terminate once its only
     /// `Arc<Sender>` is dropped, even if the timeout hasn't elapsed.
@@ -601,6 +485,7 @@ mod tests {
                 stuck_timeout: Duration::from_secs(30),
                 container_start_delay: Duration::ZERO,
                 cancel_on_grace_expired: None,
+                poll_interval: Duration::from_millis(10),
             },
             &output,
         );
@@ -608,14 +493,52 @@ mod tests {
         let weak = Arc::downgrade(&tx);
         drop(tx);
 
-        // Detector polls every 1s; give it 2.5s to notice the Arc is gone.
-        for _ in 0..25 {
+        // The detector polls every 10ms here; allow a loaded runner 5s to
+        // notice the Arc is gone.
+        for _ in 0..500 {
             if weak.upgrade().is_none() {
                 return; // task dropped its Arc clone → exited
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        panic!("StuckDetector::spawn did not exit within 2.5s of its Arc being dropped");
+        panic!("StuckDetector::spawn did not exit within 5s of its Arc being dropped");
+    }
+
+    /// Stuck phase, both directions: silence past `stuck_timeout` publishes
+    /// `Stuck` exactly once, and fresh output afterwards publishes `Unstuck`.
+    #[tokio::test]
+    async fn stuck_detector_reports_stuck_then_unstuck_when_output_resumes() {
+        let output = OutputActivity::with_state(Some(Instant::now()), true);
+        let tx = StuckDetector::spawn(
+            StuckConfig {
+                grace_timeout: Duration::from_secs(30),
+                stuck_timeout: Duration::from_millis(100),
+                container_start_delay: Duration::ZERO,
+                cancel_on_grace_expired: None,
+                poll_interval: Duration::from_millis(10),
+            },
+            &output,
+        );
+        let mut rx = tx.subscribe();
+        async fn next(rx: &mut tokio::sync::broadcast::Receiver<StuckEvent>) -> StuckEvent {
+            tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("timed out waiting for a stuck event")
+                .expect("channel closed")
+        }
+
+        assert_eq!(next(&mut rx).await, StuckEvent::Stuck);
+        // Stay silent for several more samples: a detector that re-published
+        // Stuck on every sample would hand the next `recv` a second Stuck
+        // instead of the Unstuck below.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // The container speaks again. The next sample sees fresh activity.
+        output.touch();
+        assert_eq!(next(&mut rx).await, StuckEvent::Unstuck);
+
+        // And silence after recovery makes it stuck again.
+        assert_eq!(next(&mut rx).await, StuckEvent::Stuck);
     }
 
     /// Grace phase: when no byte ever arrives and `grace_timeout` elapses,
@@ -636,6 +559,7 @@ mod tests {
                 stuck_timeout: Duration::from_secs(30),
                 container_start_delay: Duration::ZERO,
                 cancel_on_grace_expired: Some(cancel),
+                poll_interval: Duration::from_millis(10),
             },
             &output,
         );
@@ -647,12 +571,16 @@ mod tests {
             .expect("channel closed");
         assert_eq!(event, StuckEvent::StartupGraceExpired);
 
-        // Give the detector a tick to invoke the callback.
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(
-            cancel_called.load(Ordering::Acquire),
-            "grace expiry must invoke the cancel callback"
-        );
+        // The detector invokes the callback right after publishing the event;
+        // wait for it rather than for a fixed tick.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !cancel_called.load(Ordering::Acquire) {
+            assert!(
+                Instant::now() < deadline,
+                "grace expiry must invoke the cancel callback"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
     }
 
     /// Stuck phase: once `first_byte` flips true, the detector ignores grace
@@ -669,6 +597,7 @@ mod tests {
                 stuck_timeout: Duration::from_millis(50),
                 container_start_delay: Duration::ZERO,
                 cancel_on_grace_expired: None,
+                poll_interval: Duration::from_millis(10),
             },
             &output,
         );
@@ -702,6 +631,7 @@ mod tests {
                 stuck_timeout: Duration::from_secs(30),
                 container_start_delay: Duration::from_millis(150),
                 cancel_on_grace_expired: None,
+                poll_interval: Duration::from_millis(10),
             },
             &output,
         );
@@ -737,9 +667,9 @@ mod tests {
             total
         });
 
-        let bytes_received = tokio::time::timeout(Duration::from_millis(100), task)
+        let bytes_received = tokio::time::timeout(Duration::from_secs(5), task)
             .await
-            .expect("writer task should terminate within 100ms when stdin is EOF")
+            .expect("writer task should terminate promptly when stdin is EOF")
             .expect("writer task must not panic");
 
         assert_eq!(
@@ -802,7 +732,7 @@ mod tests {
         // runtime stays free to drive the bridge's reader/writer tasks.
         let _ = tokio::task::spawn_blocking(move || child.wait()).await;
 
-        let bytes = tokio::time::timeout(Duration::from_millis(500), stdout_rx.recv())
+        let bytes = tokio::time::timeout(Duration::from_secs(5), stdout_rx.recv())
             .await
             .expect("stdout bytes should arrive promptly")
             .expect("channel alive");
@@ -856,7 +786,7 @@ mod tests {
 
         let _ = tokio::task::spawn_blocking(move || child.wait()).await;
 
-        let bytes = tokio::time::timeout(Duration::from_millis(500), stderr_rx.recv())
+        let bytes = tokio::time::timeout(Duration::from_secs(5), stderr_rx.recv())
             .await
             .expect("stderr bytes should arrive promptly")
             .expect("channel alive");
@@ -924,10 +854,13 @@ mod tests {
         .expect("wait");
         assert!(status.success(), "cat must exit cleanly");
 
-        // Drain stdout — `cat` may emit the bytes in multiple chunks.
+        // Drain stdout — `cat` may emit the bytes in multiple chunks. The
+        // reader thread drops its sender at EOF, which ends the loop; the
+        // timeout only bounds a hang, it does not decide what was collected.
         let mut collected = Vec::new();
-        while let Ok(Some(bytes)) =
-            tokio::time::timeout(Duration::from_millis(200), stdout_rx.recv()).await
+        while let Some(bytes) = tokio::time::timeout(Duration::from_secs(5), stdout_rx.recv())
+            .await
+            .expect("the stdout channel must close once cat exits")
         {
             collected.extend_from_slice(&bytes);
         }
@@ -1019,7 +952,7 @@ mod tests {
             received
         });
 
-        let received = tokio::time::timeout(Duration::from_millis(100), task)
+        let received = tokio::time::timeout(Duration::from_secs(5), task)
             .await
             .expect("task should complete")
             .expect("no panic");

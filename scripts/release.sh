@@ -44,6 +44,14 @@ ask_proceed() {
   fi
 }
 
+# Like ask_proceed, but returns 1 on "no" instead of exiting.
+ask_yes_no() {
+  local default="${2:-n}" prompt="[y/N]"
+  [[ "$default" == "y" ]] && prompt="[Y/n]"
+  read -r -p "  ${YELLOW}?${NC} $1 $prompt " REPLY < /dev/tty
+  [[ "${REPLY:-$default}" =~ ^[Yy]$ ]]
+}
+
 # ── Args ──────────────────────────────────────────────────────────────────────
 
 VERSION="${1:-}"
@@ -104,7 +112,7 @@ fi
 # tag on remote
 if git ls-remote --tags origin "refs/tags/$VERSION" | grep -q "$VERSION"; then
   warn "Tag $VERSION already exists on origin."
-  ask_proceed "Proceed anyway? (GitHub release creation will be skipped if it exists)" y
+  ask_proceed "Proceed anyway? (its Release workflow run will be checked, and re-run if it failed)" y
 else
   ok "Tag $VERSION not yet on remote"
 fi
@@ -112,6 +120,41 @@ fi
 # tag may already exist locally from a prior interrupted run — that's OK
 if git tag -l "$VERSION" | grep -q "$VERSION"; then
   warn "Tag $VERSION already exists locally (prior run). Will push it."
+fi
+
+# Release runner. The Release workflow's Apple Silicon job needs a runner with
+# Hypervisor.framework, which no hosted runner offers. RELEASE_RUNNER=auto (the
+# default) registers this Mac as a temporary runner when no such runner is
+# online; local always uses this Mac; none leaves the job to a runner you run.
+REPO=$(gh repo view --json nameWithOwner -q .nameWithOwner)
+RELEASE_RUNNER="${RELEASE_RUNNER:-auto}"
+case "$RELEASE_RUNNER" in
+  auto|local|none) ;;
+  *) die "RELEASE_RUNNER must be auto, local or none, got: $RELEASE_RUNNER" ;;
+esac
+USE_LOCAL_RUNNER=false
+if [ "$RELEASE_RUNNER" = none ]; then
+  ok "Release runner: not managed (RELEASE_RUNNER=none)"
+else
+  EXISTING=$(bash tools/release-runner.sh busy "$REPO")
+  if [ -n "$EXISTING" ] && [ "$RELEASE_RUNNER" = auto ]; then
+    ok "Release runner: online runner(s) will take the Apple Silicon job: $(echo $EXISTING)"
+  elif bash tools/release-runner.sh check --hardware 2>/dev/null; then
+    # Install or refresh the job's /opt/awman scripts and guest fixture, so a
+    # release never depends on remembering to provision this Mac.
+    bash tools/release-runner.sh provision ||
+      die "Could not set up this Mac's release scripts (see above). Fix that, or use RELEASE_RUNNER=none."
+    RUNNER_CHECK=$(bash tools/release-runner.sh check 2>&1) ||
+      die "This Mac is still missing release prerequisites:\n$RUNNER_CHECK"
+    USE_LOCAL_RUNNER=true
+    ok "Release runner: this Mac will run the Apple Silicon job, then deregister"
+  else
+    RUNNER_CHECK=$(bash tools/release-runner.sh check --hardware 2>&1 || true)
+    [ "$RELEASE_RUNNER" != local ] || die "This host cannot run the Apple Silicon release job:\n$RUNNER_CHECK"
+    warn "No hypervisor runner is online, and this host cannot be one:"
+    echo "$RUNNER_CHECK" | sed 's/^/    /'
+    ask_proceed "Continue? (the Apple Silicon job will wait for a runner, and nothing publishes until it passes)" n
+  fi
 fi
 
 ok "Pre-checks done"
@@ -141,8 +184,8 @@ else
   sed -i.bak "0,/^version = \"${CURRENT_CARGO_VERSION}\"/{s/^version = \"${CURRENT_CARGO_VERSION}\"/version = \"${BARE_VERSION}\"/}" Cargo.toml
   rm -f Cargo.toml.bak
 
-  # Regenerate Cargo.lock.
-  cargo generate-lockfile --quiet
+  # Refresh only awman's own entry in Cargo.lock; leave dependencies pinned.
+  cargo update --workspace --quiet
 
   ok "Bumped Cargo.toml: $CURRENT_CARGO_VERSION → $BARE_VERSION"
 fi
@@ -278,7 +321,32 @@ else
   ok "Created tag $VERSION"
 fi
 
-# ── STEP 6: Push ──────────────────────────────────────────────────────────────
+# ── STEP 6: Release runner ────────────────────────────────────────────────────
+# Started before the tag is pushed, so a runner that cannot register stops the
+# release before anything is published. The EXIT trap stops and deregisters it
+# however the script ends — success, failure or Ctrl-C.
+
+if $USE_LOCAL_RUNNER; then
+  step "Release runner"
+
+  # Stale scheduled hardware runs queue for the same labels and would take the
+  # runner first, delaying the release job by hours.
+  STALE=$(gh run list --repo "$REPO" --workflow test.yml --status queued --limit 50 \
+    --json databaseId -q '.[].databaseId')
+  if [ -n "$STALE" ]; then
+    warn "$(echo "$STALE" | wc -l | tr -d ' ') queued Tests run(s) would take this runner before the release job."
+    if ask_yes_no "Cancel them?" y; then
+      for id in $STALE; do gh run cancel "$id" --repo "$REPO" >/dev/null; done
+      ok "Cancelled queued Tests runs"
+    fi
+  fi
+
+  trap 'bash tools/release-runner.sh down' EXIT
+  trap 'exit 130' INT TERM
+  bash tools/release-runner.sh up "$REPO" "$VERSION"
+fi
+
+# ── STEP 7: Push ──────────────────────────────────────────────────────────────
 
 step "Push"
 
@@ -297,19 +365,52 @@ else
   ok "Pushed tag $VERSION"
 fi
 
-# ── STEP 7: GitHub release ────────────────────────────────────────────────────
+# ── STEP 8: Release workflow ──────────────────────────────────────────────────
+# The release workflow (.github/workflows/release.yml) creates the GitHub
+# release from $NOTES_FILE once every binary is built and the macOS builtin
+# boot gate passes. Creating it here would publish a release with no assets.
 
-step "GitHub release"
+step "Release workflow"
 
-if gh release view "$VERSION" &>/dev/null; then
-  ok "GitHub release $VERSION already exists"
+if ! $USE_LOCAL_RUNNER; then
+  ok "Tag pushed; the Release workflow will publish $VERSION after the build gates pass"
+  echo "  Follow it with: gh run watch \$(gh run list --workflow release.yml --limit 1 --json databaseId -q '.[0].databaseId')"
+  echo ""
+  echo -e "${GREEN}${BOLD}Release ${VERSION} tagged!${NC}"
+  echo ""
+  exit 0
+fi
+
+# A tag push's run reports the tag as its head branch.
+RUN_ID=""
+for _ in $(seq 1 60); do
+  RUN_ID=$(gh run list --repo "$REPO" --workflow release.yml --event push --limit 20 \
+    --json databaseId,headBranch -q ".[] | select(.headBranch == \"$VERSION\") | .databaseId" | head -n1)
+  [ -n "$RUN_ID" ] && break
+  sleep 5
+done
+[ -n "$RUN_ID" ] || die "No Release workflow run appeared for $VERSION within 5 minutes. Check the repository's Actions tab."
+
+CONCLUSION=$(gh run view "$RUN_ID" --repo "$REPO" --json status,conclusion \
+  -q 'if .status == "completed" then .conclusion else "" end')
+if [ "$CONCLUSION" = success ]; then
+  ok "Release workflow run $RUN_ID already succeeded"
 else
-  gh release create "$VERSION" --title "$VERSION" --notes-file "$NOTES_FILE"
-  ok "Created GitHub release $VERSION"
+  if [ -n "$CONCLUSION" ]; then
+    warn "Release workflow run $RUN_ID finished earlier: $CONCLUSION"
+    ask_proceed "Re-run its failed jobs on this Mac?" y
+    gh run rerun "$RUN_ID" --repo "$REPO" --failed
+    sleep 5
+  fi
+  ok "Watching run $RUN_ID; this Mac serves the Apple Silicon job (up to 3 hours)"
+  if ! gh run watch "$RUN_ID" --repo "$REPO" --exit-status --interval 60; then
+    die "The Release workflow failed. See: gh run view $RUN_ID --repo $REPO --log-failed\n  Re-run this script to retry the failed jobs."
+  fi
 fi
 
 # ── Done ──────────────────────────────────────────────────────────────────────
+# The EXIT trap now stops and deregisters the runner.
 
 echo ""
-echo -e "${GREEN}${BOLD}Release ${VERSION} complete!${NC}"
+echo -e "${GREEN}${BOLD}Release ${VERSION} published!${NC}"
 echo ""

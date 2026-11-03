@@ -33,24 +33,7 @@ While a Claude session is running, awman's credential-refresh monitor watches th
 
 If the host can't refresh (asleep, logged out, offline), awman keeps the last-known-good token in place, warns loudly, and retries with backoff; it never leaves a container with no credential at all. This behavior is on by default and can be tuned or disabled — see [Control credential refresh](07-configuration.md#control-credential-refresh-authrefresh).
 
-### Transparency
-
-Every time awman runs a container or sandbox command, the full CLI invocation is printed before it executes:
-
-```
-$ docker run --rm -it -v /home/user/myproject:/workspace -w /workspace \
-    -v /tmp/awman-claude-dir-a1b2c3/.claude:/root/.claude -e GEMINI_API_KEY=*** awman-myproject:latest claude "..."
-```
-
-For Docker Sandboxes, every `sbx` invocation is announced the same way:
-
-```
-Running: sbx create --kit ~/.awman/kits/claude --name awman-ab12-claude claude /home/user/myproject
-Running: sbx secret set awman-ab12-claude anthropic (value piped via stdin)
-Running: sbx run awman-ab12-claude
-```
-
-Credential values never appear in a printed command. Env-delivered agent credentials show as a bare `-e VAR_NAME` — the value is passed straight from awman's own environment to the container CLI's process, never through argv. Claude Code's OAuth credential is instead delivered as a file (see [Live credential refresh](#live-credential-refresh)), so the printed command shows only the staged directory's mount path, never a token. Env vars you configure yourself (`env()` overlays, `envPassthrough`) still show as `VAR_NAME=***`. Everything else is visible in full. You can always see exactly what awman is doing.
+Every runtime command awman runs is printed before it executes; see [Command transparency](#command-transparency).
 
 ---
 
@@ -83,71 +66,34 @@ awman exec workflow path/to/workflow.toml --worktree
 
 ### How it works
 
-1. awman creates a branch `awman/work-item-NNNN` from your current `HEAD`
-2. A worktree is checked out at `~/.awman/worktrees/<repo-name>-<hash>/<NNNN>/` (`<hash>` is 8 hex characters derived from the repository's full path, so two checkouts with the same folder name never share a worktree)
+1. awman creates a branch from your current `HEAD`: `awman/work-item-NNNN` for a work item, `awman/workflow-<name>` for a named workflow
+2. A worktree is checked out under `~/.awman/worktrees/<repo-name>-<hash>/` (`<NNNN>/` or `wf-<name>/`; `<hash>` is 8 hex characters derived from the repository's full path, so two checkouts with the same folder name never share a worktree)
 3. The agent container mounts the worktree instead of your repo root
-4. After the agent exits, you choose what to do with the branch
+4. When the run ends, you choose what to do with the branch
 
-### Post-run options
+### After the run
 
-When a worktree run completes (or is aborted), the worktree is preserved on disk and awman asks what to do with it:
+When a worktree run completes or is aborted, the worktree is kept on disk and awman asks what to do with it:
 
 | Key | Action |
 |-----|--------|
-| `m` | Merge into the current branch (opens the merge-mode prompt below) |
-| `d` | Discard — remove worktree and delete branch |
-| `k` | Keep worktree and branch for manual review; prints the path |
+| `m` | Merge into the branch you started from, then pick a mode: `m` merge (no squash), `s` squash into one `Implement <branch>` commit, or `l` leave the branch alone |
+| `d` | Discard — remove the worktree and delete the branch |
+| `k` | Keep the worktree and branch for manual review |
 
-If you abort the workflow (Ctrl+C or the **Abort** action in the workflow control board), awman shows the same merge/discard dialog. The worktree is never automatically deleted on abort — your completed steps' changes are preserved and ready for review.
+An aborted run is never deleted automatically. If the merge fails, the worktree is kept and awman can launch a merge-fix agent. An interrupted run's worktree can be resumed or recreated (recreate deletes the branch and its commits). Dirty merge targets, merge failures and existing worktrees each have a flag to answer up front; see [Worktrees](05-workflows.md#worktrees) and [Worktree merge-back](05-workflows.md#worktree-merge-back).
 
-### Merge modes
+A `checkout_create_branch` setup step is skipped with a warning in a worktree run, since the run already has its own branch.
 
-Choosing **Merge** asks how the branch should be integrated:
+### Host-side Git
 
-| Key | Mode | Effect |
-|-----|------|--------|
-| `m` | Merge (no squash) | Plain `git merge` — the branch's individual commits are preserved (fast-forwards when possible) |
-| `s` | Squash | `git merge --squash` followed by a single commit `Implement <branch>` |
-| `l` | Leave branch alone | No merge; the worktree and branch are kept as-is |
-
-Whichever mode you pick — including *Leave branch alone* — awman then checks for uncommitted files in the worktree and offers to commit them, so nothing on the branch is left dangling. After a successful merge (squash or not), awman offers to clean up the worktree and delete the branch.
-
-The same dialogs appear whether the workflow completed successfully or was aborted, and in both CLI and TUI mode. Your partially completed work is preserved, allowing you to review, manually continue, or discard as you choose.
-
-### Setup steps in worktree runs
-
-If the workflow defines a `checkout_create_branch` setup step, it is **skipped with a warning** when running in a worktree — the run is already isolated on its own branch, so creating another branch inside the worktree is redundant. This is not an error; the remaining setup steps run normally.
-
-### Interrupted runs
-
-If a worktree already exists (previous run was interrupted), awman detects it:
-
-```
-Worktree already exists at ~/.awman/worktrees/myrepo-3fa91c2e/0030.
-[r]esume — reuse existing worktree
-[R]ecreate — delete the worktree, its branch and the commits on that branch, and start fresh
-```
-
-You can answer in advance with `--on-existing-worktree`; see [Worktrees](05-workflows.md#worktrees).
-
-### Merge conflicts
-
-If the merge fails, awman prints a recovery message and leaves the worktree in place:
-
-```
-Merge failed with conflicts — resolve manually in /path/to/repo,
-then run: git branch -d awman/work-item-0030 && git worktree remove ~/.awman/worktrees/myrepo-3fa91c2e/0030
-```
-
-### Commit signing (GPG, SSH, S/MIME)
-
-When Git commit signing is enabled, awman **suspends the TUI** around each `git commit` it runs, allowing your passphrase prompt to work normally. After the commit completes (or fails), the TUI is restored. Users without signing configured see no change.
+Git commands awman runs on the host (creating worktrees, merging back, committing) never execute repository-supplied code: hooks, fsmonitor, external diff/merge drivers and content filters are disabled, and so are commit, tag and push signing and automatic maintenance. Commits awman makes on the host are therefore unsigned; sign them yourself afterwards if your branch policy requires it. Git commands an agent runs inside its container use the repository's normal configuration.
 
 ### Edge cases
 
 | Situation | Behaviour |
 |-----------|-----------|
-| `git` < 2.5 | Error before launch: "git ≥ 2.5 is required for --worktree support" |
+| `git` < 2.5 | Error before launch: "git >= 2.5 is required for --worktree support" |
 | Detached HEAD | Warning printed; worktree created from current commit; continues |
 | Branch exists, no worktree dir | Worktree created using the existing branch |
 | Merge conflict | Error with manual resolution instructions; worktree kept |
@@ -171,10 +117,10 @@ Overlays extend the base isolation model: they are the *only* supported way to g
 
 **Read-only by default.** `dir()` mounts default to `:ro` when no permission is given. Only use `:rw` when the agent genuinely has to write there, and only with agent images you trust. Skills overlays are **always** mounted read-only regardless of source, so an agent can never modify a skill file.
 
-**Missing paths never fail open.** If a configured host path does not exist at launch, awman logs a warning and skips that overlay rather than aborting the session or substituting something else:
+**Missing paths fail closed.** If an overlay's host path does not exist at launch, awman stops before starting any container, rather than letting the runtime create an empty mount source:
 
 ```
-WARN overlay host path '/data/reference' does not exist; skipping
+overlay host path '/data/reference' does not exist (resolved to '/data/reference')
 ```
 
 **Everything is printed.** Like `ssh()` and `--allow-docker`, every overlay mount appears in the runtime command awman prints before it executes, so you can always see exactly what a container was given. Values of `env()` overlays are masked as `***`.
@@ -197,18 +143,14 @@ Use `--allow-docker` when the task requires the agent to:
 
 ### What happens
 
-Before launching the container, awman verifies the socket exists and prints a warning:
-
-```
-Docker socket: /var/run/docker.sock (found)
-WARNING: --allow-docker: mounting host Docker socket into container
-(/var/run/docker.sock:/var/run/docker.sock). This grants the agent elevated host access.
-```
+The socket mount appears in the printed `docker run` command:
 
 | Platform | Mount |
 |----------|-------|
-| Linux / macOS | `-v /var/run/docker.sock:/var/run/docker.sock` |
+| Linux / macOS | `-v /var/run/docker.sock:/var/run/docker.sock`, plus `--group-add <gid>` of the host's `docker` group when it exists |
 | Windows | `--mount type=npipe,source=\\.\pipe\docker_engine,target=\\.\pipe\docker_engine` |
+
+Under Docker Sandboxes the flag is ignored: each sandbox already has its own private Docker daemon.
 
 ### Security note
 
@@ -240,19 +182,12 @@ Use `--overlay ssh()` when the task requires the agent to:
 
 ### What happens
 
-Before launching the container, awman verifies `~/.ssh` exists and prints a warning:
-
-```
-WARNING: overlay ssh(): mounting host ~/.ssh into container (read-only). Ensure you trust the agent image.
-```
-
-The directory is mounted as `-v /home/user/.ssh:/root/.ssh:ro`. The `:ro` flag prevents the agent from modifying your host SSH keys.
+awman checks that `~/.ssh` exists (launch fails if it doesn't) and mounts it read-only at `.ssh` in the image user's home, for example `-v /home/user/.ssh:/home/awman/.ssh:ro`, which appears in the printed command. The agent can use your keys but cannot modify them.
 
 An `ssh()` overlay deliberately mounts the whole directory when you configure it in an overlay source. Workflow prerequisite checks also support a narrower, read-only mount of a selected key after you choose it, or the whole directory after you explicitly choose that option. A repository's `workflows.prerequisites.ssh.key` is only a suggested key; repository config cannot grant SSH access by itself. See [Workflow prerequisites](05-workflows.md#workflow-prerequisite-checks).
 
 ### Security notes
 
-- The mount is read-only; the agent can use your keys but cannot modify them
 - SSH key permissions must be correct on the host (`600` for private keys); Docker bind mounts inherit host permissions
 - Only use the `ssh()` overlay with agent images you trust
 
@@ -270,7 +205,9 @@ When used with a workflow, the SSH directory is mounted into every workflow-step
 
 Workflow credential grants are scoped to the current run, repository, remote, credential type, and the setup or teardown steps that need them. A selected SSH key is mounted read-only only for the relevant step containers. A granted GitHub token is passed only to the relevant PR, HTTPS-push, or API-polling step. awman redacts granted tokens from workflow output. Remembered choices store decisions only in `~/.awman/prerequisite-grants.json`; they do not store keys or token values, and each decision is limited to its repository, remote, and credential type.
 
-If you configure `workflows.prerequisites.githubToken.acquire.argv`, awman may run that token command on the host. It uses an argv list without a shell, shows the resolved executable during review, applies a timeout, and refuses known agent binaries (including configured custom agent binaries). A repository-configured command is additionally approved by its argument-list hash before use. The command output token is held as a secret and is not written to config or logs. See [Workflow prerequisites](05-workflows.md#workflow-prerequisite-checks) and [Configuration](07-configuration.md#workflow-prerequisites).
+Grants never reach `run_shell` or `run_script` steps, main agent steps, `on_failure` remediation agents, or dynamic and squad leaders. A selected SSH key is mounted read-only as `~/.ssh/awman_push_key` with `IdentitiesOnly=yes` and a private writable copy of `known_hosts`. Credentialed Git transport pins the approved URL and ignores checkout-supplied hooks, URL rewrites, credential helpers and SSH commands; HTTPS credentials are answered only for the approved host and path. A new destination needs a fresh decision.
+
+If you configure `workflows.prerequisites.githubToken.acquire.argv`, awman may run that token command on the host. It runs an argv list without a shell, with a timeout and bounded output, and the process group is cleaned up on every exit. The tool must be an installed program outside any Git checkout; known agent binaries (including configured custom agents), shells, interpreters and launch wrappers are refused. Approval binds the argv, the resolved executable and its content, and awman runs a verified private copy, so changing the installed program requires a new approval. A repository-configured command is approved by its argument-list hash before use. Approving a tool also trusts whatever it runs, so never approve one that delegates to an agent. The token is held as a secret, never written to config or logs, and redacted from all workflow output. See [Workflow prerequisites](05-workflows.md#workflow-prerequisite-checks) and [Configuration](07-configuration.md#workflow-prerequisites).
 
 ---
 
@@ -283,33 +220,21 @@ $ docker build -t awman-myapp:latest -f Dockerfile.dev /path/to/repo
 $ docker run --rm -it \
     -v /path/to/repo:/workspace \
     -w /workspace \
-    -v /tmp/awman-claude-dir-a1b2c3/.claude:/root/.claude \
-    awman-myapp:latest claude "Implement work item 0001..."
+    -v /tmp/awman-claude-dir-a1b2c3/.claude:/home/awman/.claude \
+    -e GEMINI_API_KEY \
+    awman-myapp-claude:latest claude "Implement work item 0001..."
 ```
 
-With the Apple Containers runtime, the same commands are shown with `container` instead of `docker`. With the Docker Sandboxes runtime, every `sbx` invocation is announced — `sbx run`, `sbx exec`, `sbx stop`, `sbx rm`, `sbx secret set`, `sbx kit validate` — without sensitive values. Credential values are never printed: env-delivered agent credentials render as a bare `-e VAR_NAME`, Claude's file-delivered OAuth credential shows only as the staged directory's ordinary mount path, and user-configured environment overlays render as `VAR_NAME=***`.
+With the Apple Containers runtime, the same commands are shown with `container` instead of `docker`. With the Docker Sandboxes runtime, every `sbx` invocation is announced — `sbx create`, `sbx run`, `sbx exec`, `sbx stop`, `sbx rm`, `sbx secret set`, `sbx kit validate` — without sensitive values:
+
+```
+Running: sbx create --kit ~/.awman/kits/claude --name awman-ab12-claude claude /home/user/myproject
+Running: sbx secret set awman-ab12-claude anthropic (value piped via stdin)
+Running: sbx run awman-ab12-claude
+```
+
+Credential values are never printed. Env-delivered agent credentials render as a bare `-e VAR_NAME`: the value is passed from awman's own environment to the container CLI process, never through argv. Claude's OAuth credential is a file (see [Live credential refresh](#live-credential-refresh)), so only the staged directory's mount path appears. Variables you configure yourself (`env()` overlays, `envPassthrough`) render as `VAR_NAME=***`. Everything else is shown in full.
 
 ---
 
 [← Agent Sessions](03-agent-sessions.md) · [Next: Workflows →](05-workflows.md)
-
-Workflow prerequisite grants exclude `run_shell`, `run_script`, main agent steps,
-`on_failure` remediation agents and dynamic/squad leaders. A single SSH key is
-mounted read-only as `~/.ssh/awman_push_key`, with `IdentitiesOnly=yes` and a
-writable private copy of `known_hosts`. Credentialed Git transport uses private,
-controlled metadata, a pinned approved URL, no checkout hooks or URL rewrites,
-and no checkout-selected helpers or SSH commands. HTTPS helpers answer only for
-the approved host and path. New generated destinations require a fresh decision.
-
-Host token tools are trusted installed programs outside Git checkouts. Known
-agent identities (including canonical paths and content hashes of configured
-agents), shells, interpreters and launch wrappers are refused. Review binds argv,
-canonical executable and executable content; execution uses a verified private
-snapshot. Changing installed content requires a new approval. This boundary
-cannot infer arbitrary program semantics: approving an installed token tool also
-trusts its interpreter, libraries and transitive behavior. Do not authorize a tool
-that delegates to an agent. Output is bounded while running, errors withhold
-untrusted diagnostics, and the process group is cleaned up on every exit. Tokens
-stay in secret-typed launch overrides until the runtime child environment is
-constructed; runs holding token grants use filtered phase streams, including
-CLI/TUI, so raw terminal or attach output cannot precede redaction.

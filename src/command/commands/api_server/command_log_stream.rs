@@ -860,7 +860,8 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
-    #[tokio::test]
+    // Paused time: the expected outcome is the 5s recovery deadline itself.
+    #[tokio::test(start_paused = true)]
     async fn unrecoverable_gap_does_not_advance_or_invent_done() {
         let tmp = tempfile::tempdir().unwrap();
         let source = source(tmp.path());
@@ -875,7 +876,8 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
-    #[tokio::test]
+    // Paused time: the expected outcome is the 5s recovery deadline itself.
+    #[tokio::test(start_paused = true)]
     async fn structured_terminal_without_a_log_uses_idless_recovery_pair() {
         let tmp = tempfile::tempdir().unwrap();
         let source = source(tmp.path());

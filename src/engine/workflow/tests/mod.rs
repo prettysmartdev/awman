@@ -5,6 +5,7 @@
 //! blocking factory the mid-step tests drive, and the mock background
 //! container the phase tests use.
 
+mod coverage_parallel;
 mod parallel;
 mod phases;
 mod single;
@@ -413,6 +414,19 @@ async fn wait_for_execution_count(count: &AtomicUsize, expected: usize) {
     assert_eq!(count.load(Ordering::Relaxed), expected);
 }
 
+/// Wait until `flag` is set (a container cancel, a frontend callback), with
+/// the same generous deadline as [`wait_for_execution_count`].
+async fn wait_for_flag(flag: &AtomicBool, what: &str) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !flag.load(Ordering::Relaxed) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for {what}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 struct BlockingFactory {
     execution_count: Arc<AtomicUsize>,
     inject_count: Arc<AtomicUsize>,
@@ -498,7 +512,7 @@ struct CapturingFrontend {
     actions: Mutex<VecDeque<NextAction>>,
     step_statuses: Mutex<Vec<(String, WorkflowStepStatus)>>,
     completed: Mutex<Option<WorkflowOutcome>>,
-    available_log: Mutex<Vec<AvailableActions>>,
+    available_log: Arc<Mutex<Vec<AvailableActions>>>,
     engine_tx: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<EngineRequest>>>>,
     /// Exit codes passed to `report_container_exited`, shared so tests
     /// can assert on them after the engine consumes the frontend.
@@ -514,7 +528,7 @@ impl CapturingFrontend {
             actions: Mutex::new(actions.into_iter().collect()),
             step_statuses: Mutex::new(Vec::new()),
             completed: Mutex::new(None),
-            available_log: Mutex::new(Vec::new()),
+            available_log: Arc::new(Mutex::new(Vec::new())),
             engine_tx,
             container_exits: Arc::new(Mutex::new(Vec::new())),
         }
@@ -583,9 +597,10 @@ fn make_capturing_engine(
     factory: BlockingFactory,
     actions: impl IntoIterator<Item = NextAction>,
     engine_tx: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<EngineRequest>>>>,
-) -> (WorkflowEngine, Arc<Mutex<Vec<i32>>>) {
+) -> (WorkflowEngine, Arc<Mutex<Vec<i32>>>, BoardLog) {
     let frontend = CapturingFrontend::new(actions, engine_tx);
     let container_exits = frontend.container_exits.clone();
+    let boards = frontend.available_log.clone();
     let engine = WorkflowEngine::new(
         session,
         WorkflowSpec::new(workflow).with_work_item_context(None),
@@ -595,7 +610,22 @@ fn make_capturing_engine(
         },
     )
     .unwrap();
-    (engine, container_exits)
+    (engine, container_exits, boards)
+}
+
+/// Every control board a [`CapturingFrontend`] was asked to show, in order.
+type BoardLog = Arc<Mutex<Vec<AvailableActions>>>;
+
+/// Wait until the frontend has been shown at least `count` control boards.
+async fn wait_for_boards(boards: &BoardLog, count: usize) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while boards.lock().unwrap().len() < count {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for control board #{count}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 // ── MockBackgroundContainer ───────────────────────────────────────────────

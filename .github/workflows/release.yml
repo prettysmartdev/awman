@@ -5,9 +5,30 @@ on:
     tags:
       - "v[0-9]+.[0-9]+.[0-9]+"
 
+# Least privilege by default; only the `release` job gets contents: write.
+permissions:
+  contents: read
+
 jobs:
+  # Cheap checks that would otherwise only fail after the (long, self-hosted)
+  # builds: the tag must match the Cargo.toml version (aspec/devops/cicd.md,
+  # Versioning) and the release notes the release body is built from must exist.
+  preflight:
+    name: Tag, version and release notes
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Tag matches Cargo.toml version and release notes exist
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          cargo_version=$(sed -n 's/^version = "\([^"]*\)"$/\1/p' Cargo.toml | head -1)
+          [ "$tag" = "v$cargo_version" ] || { echo "::error::tag $tag does not match Cargo.toml version $cargo_version (expected v$cargo_version)"; exit 1; }
+          [ -f "docs/releases/$tag.md" ] || { echo "::error::docs/releases/$tag.md is missing; it is the GitHub Release body"; exit 1; }
+          echo "OK: $tag, docs/releases/$tag.md"
+
   build:
     name: Build ${{ matrix.target }}
+    needs: preflight
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -106,6 +127,7 @@ jobs:
 
   release-macos-builtin:
     name: Apple Silicon builtin artifact and boot gate
+    needs: preflight
     runs-on: [self-hosted, macOS, ARM64, hypervisor]
     timeout-minutes: 180
     steps:
@@ -145,6 +167,7 @@ jobs:
       - name: Trace and boot the exact signed, distributed artifact
         run: |
           test -x /opt/awman/release-offline-session.sh || { echo "BLOCKED: native release runner must provision /opt/awman/release-offline-session.sh with cached fixture and enforced network denial"; exit 1; }
+          test -x /opt/awman/release-workload.sh || { echo "BLOCKED: native release runner must provision /opt/awman/release-workload.sh (realistic cached guest workload that writes guest RSS to AWMAN_GUEST_RSS_OUTPUT)"; exit 1; }
           bash tools/release-artifact-check.sh "$PWD/awman-macos-arm64" aarch64-apple-darwin release-evidence/macos /opt/awman/release-offline-session.sh
           bash tools/measure-release-artifact.sh "$PWD/awman-macos-arm64" aarch64-apple-darwin release-evidence/macos-measurements /opt/awman/release-workload.sh
       - uses: actions/upload-artifact@v7
@@ -176,36 +199,25 @@ jobs:
       - name: Collect binaries
         run: |
           mkdir -p release
-          find artifacts -type f \( -name 'awman-linux-amd64' -o -name 'awman-linux-arm64' -o -name 'awman-macos-arm64' -o -name 'awman-windows-amd64.exe' \) -exec cp {} release/ \;
+          for name in awman-linux-amd64 awman-linux-arm64 awman-macos-arm64 awman-windows-amd64.exe; do
+            matches=$(find artifacts -type f -name "$name")
+            [ "$(printf '%s\n' "$matches" | grep -c .)" = 1 ] || { echo "::error::expected exactly one $name in the downloaded artifacts, found: ${matches:-none}"; exit 1; }
+            cp "$matches" release/
+          done
+          # Published checksums (docs/11-runtimes.md tells macOS users to verify
+          # the ad-hoc signed binary against them).
+          (cd release && sha256sum awman-* > SHA256SUMS)
           ls -la release/
+          cat release/SHA256SUMS
 
       - name: Extract tag version
         id: tag
         run: echo "version=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
 
-      - name: Check for release notes
-        id: notes
-        run: |
-          NOTES_FILE="docs/releases/${{ steps.tag.outputs.version }}.md"
-          if [ -f "$NOTES_FILE" ]; then
-            echo "file=$NOTES_FILE" >> "$GITHUB_OUTPUT"
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-          fi
-
+      # The preflight job already required docs/releases/<tag>.md.
       - name: Create release with notes
-        if: steps.notes.outputs.exists == 'true'
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.tag.outputs.version }}
-          body_path: ${{ steps.notes.outputs.file }}
-          files: release/*
-
-      - name: Create release without notes
-        if: steps.notes.outputs.exists != 'true'
-        uses: softprops/action-gh-release@v3
-        with:
-          tag_name: ${{ steps.tag.outputs.version }}
-          generate_release_notes: true
+          body_path: docs/releases/${{ steps.tag.outputs.version }}.md
           files: release/*

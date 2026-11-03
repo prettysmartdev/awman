@@ -1085,7 +1085,7 @@ fn agents_docs_describe_current_scope_and_detach_controls() {
     assert!(!runtimes.contains("show sandbox running/stopped state"));
     assert!(runtimes.contains("agents list\x60 never samples resource metrics"));
     let sessions = include_str!("../../../../docs/03-agent-sessions.md");
-    assert!(sessions.contains("Press **Ctrl-C**"));
+    assert!(sessions.contains("**Ctrl-C** to detach"));
     assert!(sessions.contains("--json --yes"));
     let list = CommandCatalogue::get().lookup(&["agents", "list"]).unwrap();
     assert_eq!(
@@ -1101,7 +1101,7 @@ fn agents_docs_describe_current_scope_and_detach_controls() {
     assert!(api.contains("one \x60StdoutLine\x60 event"));
     let architecture = include_str!("../../../../docs/architecture.md");
     assert!(!architecture.contains("status.rs           StatusCommand"));
-    assert!(architecture.contains("agents/             AgentsCommandFrontend"));
+    assert!(architecture.contains("`agents/`"));
 }
 
 #[test]

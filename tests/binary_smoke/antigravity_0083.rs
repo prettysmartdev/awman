@@ -4,27 +4,12 @@
 //! before agent-image checks, and model-flag errors fire before image checks
 //! in exec-prompt's early-validation path).
 
+use crate::make_git_repo;
 use std::process::Command;
 use tempfile::TempDir;
 
 fn awman_bin() -> std::path::PathBuf {
     crate::awman_bin()
-}
-
-#[allow(dead_code)]
-fn awman() -> Command {
-    Command::new(awman_bin())
-}
-
-/// Initialise a fresh git repo in a temp directory and return the TempDir.
-fn make_git_repo() -> TempDir {
-    let repo = TempDir::new().expect("TempDir::new");
-    std::process::Command::new("git")
-        .args(["init", "--quiet"])
-        .current_dir(repo.path())
-        .status()
-        .expect("git init");
-    repo
 }
 
 /// Build an `awman` subprocess scoped to a fresh empty config home so the

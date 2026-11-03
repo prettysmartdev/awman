@@ -30,7 +30,6 @@ use crate::engine::workflow::actions::{
 type SharedPhaseFixingCalls = Arc<Mutex<Vec<(PhaseKind, String, u32, u32)>>>;
 
 pub(crate) struct FakeExecWorkflowFrontend {
-    pty_active_calls: Vec<bool>,
     /// Per-step container names received via `report_parallel_step_container`.
     parallel_containers: Arc<Mutex<Vec<(String, String)>>>,
     replay_queued_count: usize,
@@ -45,6 +44,8 @@ pub(crate) struct FakeExecWorkflowFrontend {
     /// Prompts the resume question was asked with.
     resume_prompts: Vec<WorkflowResumePrompt>,
     resume_prompt_calls: Arc<std::sync::atomic::AtomicUsize>,
+    /// `(work_item, reason)` of every "cannot be resumed" notice.
+    resume_unavailable: Vec<(u32, String)>,
     existing_default: ExistingWorktreeDecision,
     /// `on_phase_step_fixing` calls. Recorded through an `Arc` so a test
     /// can observe them after the fake has been boxed into the shared
@@ -58,7 +59,6 @@ pub(crate) struct FakeExecWorkflowFrontend {
 impl FakeExecWorkflowFrontend {
     pub(crate) fn new() -> Self {
         Self {
-            pty_active_calls: vec![],
             parallel_containers: Arc::new(Mutex::new(Vec::new())),
             replay_queued_count: 0,
             summary_calls: vec![],
@@ -69,6 +69,7 @@ impl FakeExecWorkflowFrontend {
             resume_response: WorkflowResumeDecision::Fresh,
             resume_prompts: Vec::new(),
             resume_prompt_calls: Default::default(),
+            resume_unavailable: Vec::new(),
             existing_default: ExistingWorktreeDecision::Resume,
             phase_fixing: Arc::new(Mutex::new(Vec::new())),
             take_io_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -278,9 +279,7 @@ impl crate::command::commands::agent_setup::HasAgentFrontend for FakeExecWorkflo
 
 impl crate::command::commands::agent_trust::AgentTrustFrontend for FakeExecWorkflowFrontend {}
 impl crate::command::commands::agent_setup::AgentLaunchFrontend for FakeExecWorkflowFrontend {
-    fn set_pty_active(&mut self, active: bool) {
-        self.pty_active_calls.push(active);
-    }
+    fn set_pty_active(&mut self, _active: bool) {}
 }
 
 impl crate::command::commands::workflow_prerequisites::WorkflowPrerequisiteFrontend
@@ -303,9 +302,11 @@ impl ExecWorkflowCommandFrontend for FakeExecWorkflowFrontend {
     }
     fn notify_dynamic_workflow_resume_unavailable(
         &mut self,
-        _work_item: u32,
-        _reason: &str,
+        work_item: u32,
+        reason: &str,
     ) -> Result<(), CommandError> {
+        self.resume_unavailable
+            .push((work_item, reason.to_string()));
         Ok(())
     }
 }
@@ -364,103 +365,6 @@ prompt = "do something"
 
 // ─── Tests ────────────────────────────────────────────────────────────────
 
-#[tokio::test]
-async fn set_pty_active_called_true_then_false_around_engine() {
-    // Arrange: minimal workflow in a temp dir that the engine can run.
-    let tmp = tempfile::tempdir().unwrap();
-    let wf_path = write_minimal_workflow(tmp.path(), "test.toml");
-
-    // Use a real git repo so Session::open_at_git_root succeeds.
-    std::process::Command::new("git")
-        .args(["init"])
-        .current_dir(tmp.path())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .unwrap();
-    std::process::Command::new("git")
-        .args(["config", "user.email", "t@t.t"])
-        .current_dir(tmp.path())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .unwrap();
-    std::process::Command::new("git")
-        .args(["config", "user.name", "t"])
-        .current_dir(tmp.path())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .unwrap();
-    std::fs::write(tmp.path().join("README"), "x").unwrap();
-    std::process::Command::new("git")
-        .args(["add", "."])
-        .current_dir(tmp.path())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .unwrap();
-    std::process::Command::new("git")
-        .args(["commit", "-m", "init"])
-        .current_dir(tmp.path())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .unwrap();
-
-    let mut engines = Engines::for_tests(Path::new("/tmp"));
-    // Override workflow_state_store to use the temp git repo.
-    engines.workflow_state_store =
-        Arc::new(crate::data::WorkflowStateStore::at_git_root(tmp.path()));
-
-    let flags = ExecWorkflowCommandFlags {
-        prerequisites: Default::default(),
-        squad_task_prerequisites: None,
-        workflow: Some(wf_path),
-        work_item: None,
-        non_interactive: true,
-        plan: false,
-        allow_docker: false,
-        worktree: false,
-
-        yolo: false,
-        auto: false,
-        agent: None,
-        model: None,
-        launch_mode: None,
-        overlay: vec![],
-        agent_flags: None,
-        max_concurrent: None,
-        issue_source: crate::engine::issue::IssueSourceFlags { issue: None },
-        dynamic: false,
-        leader: None,
-        on_dirty_merge_target: None,
-        on_merge_failure: None,
-        on_existing_worktree: None,
-    };
-    let session = {
-        let resolver = crate::data::session::StaticGitRootResolver::new(tmp.path());
-        Session::open(
-            tmp.path().to_path_buf(),
-            &resolver,
-            crate::data::session::SessionOpenOptions::default(),
-        )
-        .unwrap()
-    };
-    let cmd = ExecWorkflowCommand::new(flags, engines, session);
-    let fake = FakeExecWorkflowFrontend::new();
-
-    let result = cmd.run_with_frontend(Box::new(fake)).await;
-
-    // The outcome is Ok and set_pty_active was called true then false.
-    // (Engine result may be Ok or Err depending on the stub backend;
-    //  what matters is the ordering.)
-    // We can't easily inspect the fake after run_with_frontend consumes it.
-    // Instead, we use the shared-arc pattern to peek at the state after.
-    // For this test, simply verifying no panic is the structural assertion.
-    let _ = result;
-}
-
 /// A runtime that keeps every frontend it is handed past `wait()`: for
 /// `release_after` and then drops it from a thread of its own (a runtime that
 /// is merely slow to let go), or forever when that is `None`.
@@ -468,6 +372,28 @@ struct HoldingRuntime {
     capabilities: crate::engine::agent_runtime::Capabilities,
     frontends: Arc<Mutex<Vec<Box<dyn AgentFrontend>>>>,
     release_after: Option<std::time::Duration>,
+}
+
+/// A slow runtime (`release_after`) drops its frontend on its own thread, so
+/// poll for that; a runtime that holds forever is checked over a window
+/// comfortably longer than `release_after`.
+fn assert_released_by_runtime(
+    frontends: &Arc<Mutex<Vec<Box<dyn AgentFrontend>>>>,
+    hold_forever: bool,
+) {
+    let deadline = std::time::Instant::now()
+        + std::time::Duration::from_millis(if hold_forever { 600 } else { 5000 });
+    while std::time::Instant::now() < deadline {
+        if frontends.lock().unwrap().is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(
+        frontends.lock().unwrap().is_empty(),
+        !hold_forever,
+        "hold_forever={hold_forever}"
+    );
 }
 
 struct HoldingInstance {
@@ -692,12 +618,7 @@ async fn workflow_command_survives_runtime_holding_frontend_after_wait() {
             .any(|message| message.text == "held runtime message"));
         // The runtime, not the test, decides when the frontend goes: still held
         // after the command returned, then released (or never) by the runtime.
-        std::thread::sleep(std::time::Duration::from_millis(900));
-        assert_eq!(
-            frontends.lock().unwrap().is_empty(),
-            !hold_forever,
-            "hold_forever={hold_forever}"
-        );
+        assert_released_by_runtime(&frontends, hold_forever);
     }
 }
 
@@ -741,12 +662,7 @@ async fn interactive_phase_survives_runtime_holding_frontend_after_wait() {
             .unwrap()
             .iter()
             .any(|message| message.text == "held runtime message"));
-        std::thread::sleep(std::time::Duration::from_millis(900));
-        assert_eq!(
-            frontends.lock().unwrap().is_empty(),
-            !hold_forever,
-            "hold_forever={hold_forever}"
-        );
+        assert_released_by_runtime(&frontends, hold_forever);
     }
 }
 
@@ -866,10 +782,12 @@ async fn workflow_command_survives_retained_interactive_setup_frontend() {
         .any(|message| message.text == "held runtime message"));
 }
 
-#[tokio::test]
-async fn shared_frontend_handle_delegates_write_message_to_inner_frontend() {
+#[test]
+fn shared_frontend_handle_delegates_write_message_to_inner_frontend() {
+    let fake = FakeExecWorkflowFrontend::new();
+    let messages = fake.shared_messages.clone();
     let mut shared: Arc<Mutex<Box<dyn ExecWorkflowCommandFrontend>>> =
-        Arc::new(Mutex::new(Box::new(FakeExecWorkflowFrontend::new())));
+        Arc::new(Mutex::new(Box::new(fake)));
 
     use crate::data::message::MessageLevel;
     shared.write_message(UserMessage {
@@ -877,11 +795,11 @@ async fn shared_frontend_handle_delegates_write_message_to_inner_frontend() {
         text: "hello".into(),
     });
 
-    let guard = shared.lock().unwrap();
-    let fake = guard.as_ref();
-    // Can't easily downcast Box<dyn Trait>, but we can verify no panic
-    // and that the blanket impl compiled and delegated without crashing.
-    let _ = fake;
+    assert!(messages
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|message| message.text == "hello"));
 }
 
 #[test]
@@ -4874,3 +4792,6 @@ async fn run_outputs_workflow(mounts: bool) {
     let prompt = runtime.prompts.lock().unwrap()[0].clone();
     assert!(prompt.contains("/awman/output"), "{prompt}");
 }
+
+#[path = "dynamic_resume_tests.rs"]
+mod dynamic_resume_tests;

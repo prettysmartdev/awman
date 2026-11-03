@@ -46,7 +46,7 @@ impl WorkflowEngine {
             }
         }
 
-        let total = timing::YOLO_COUNTDOWN_DURATION;
+        let total = timing::yolo_countdown_duration();
         let mut failed: Vec<(String, i32)> = Vec::new();
         // Cloned so the select below borrows nothing of `self` for it.
         let cancel = self.cancel.clone();
@@ -133,7 +133,9 @@ impl WorkflowEngine {
                         // Every failure is recorded — each one gets its own
                         // recovery board once the group drains.
                         failed.push((name.clone(), exit_code));
-                    } else if self.active_steps.len() < slot_cap {
+                    } else if failed.is_empty() && self.active_steps.len() < slot_cap {
+                        // An unresolved failure freezes the queue (docs/05-workflows.md):
+                        // peers keep running, but nothing new starts until it is retried.
                         if let Some(next) = queue.pop_front() {
                             self.launch_parallel_step(next, &mut waits, &stuck_tx, true)?;
                         }
@@ -172,7 +174,15 @@ impl WorkflowEngine {
                     }
                 }
                 _ = tokio::time::sleep(Duration::from_millis(100)) => {
-                    self.tick_parallel_yolo(&mut waits, &mut queue, slot_cap, total, &stuck_tx)?;
+                    let launch_queued = failed.is_empty();
+                    self.tick_parallel_yolo(
+                        &mut waits,
+                        &mut queue,
+                        slot_cap,
+                        launch_queued,
+                        total,
+                        &stuck_tx,
+                    )?;
                 }
             }
         }
@@ -369,7 +379,7 @@ impl WorkflowEngine {
                         match self.active_steps.iter_mut().find(|s| s.step_name == name) {
                             Some(s) if s.yolo_deadline.is_none() => {
                                 s.yolo_deadline =
-                                    Some(Instant::now() + timing::YOLO_COUNTDOWN_DURATION);
+                                    Some(Instant::now() + timing::yolo_countdown_duration());
                                 true
                             }
                             _ => false,
@@ -419,6 +429,7 @@ impl WorkflowEngine {
         waits: &mut ParallelWaits,
         queue: &mut VecDeque<WorkflowStep>,
         slot_cap: usize,
+        launch_queued: bool,
         total: Duration,
         stuck_tx: &StuckFanIn,
     ) -> Result<(), EngineError> {
@@ -441,11 +452,25 @@ impl WorkflowEngine {
                     self.frontend.parallel_step_yolo_countdown_finished(&name);
                 }
                 YoloTickOutcome::AdvanceNow => {
-                    self.yolo_advance_parallel(&name, waits, queue, slot_cap, stuck_tx)?;
+                    self.yolo_advance_parallel(
+                        &name,
+                        waits,
+                        queue,
+                        slot_cap,
+                        launch_queued,
+                        stuck_tx,
+                    )?;
                 }
                 YoloTickOutcome::Continue => {
                     if remaining.is_zero() {
-                        self.yolo_advance_parallel(&name, waits, queue, slot_cap, stuck_tx)?;
+                        self.yolo_advance_parallel(
+                            &name,
+                            waits,
+                            queue,
+                            slot_cap,
+                            launch_queued,
+                            stuck_tx,
+                        )?;
                     }
                 }
             }
@@ -462,6 +487,7 @@ impl WorkflowEngine {
         waits: &mut ParallelWaits,
         queue: &mut VecDeque<WorkflowStep>,
         slot_cap: usize,
+        launch_queued: bool,
         stuck_tx: &StuckFanIn,
     ) -> Result<(), EngineError> {
         self.msg_info(format!("Yolo auto-advancing past step '{}'", name));
@@ -481,7 +507,7 @@ impl WorkflowEngine {
         self.persist()?;
         let progress = self.workflow_progress_info();
         self.frontend.report_workflow_progress(&progress);
-        if self.active_steps.len() < slot_cap {
+        if launch_queued && self.active_steps.len() < slot_cap {
             if let Some(next) = queue.pop_front() {
                 self.launch_parallel_step(next, waits, stuck_tx, true)?;
             }

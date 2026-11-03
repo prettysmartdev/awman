@@ -1,8 +1,10 @@
 # Guest fixtures for the builtin hardware tests. Sourced (not run) by
 # tools/test-builtin-hw.sh and tools/msb-payloads/payloads-verify.sh.
 #
-# prepare_builtin_hw_fixtures DIR exports AWMAN_TEST_BUILTIN_BASE_TAR and
-# AWMAN_TEST_BUILTIN_FIXTURE_ARCHIVE, using the caller's values when set.
+# build_builtin_hw_fixture_archives DIR exports AWMAN_TEST_BUILTIN_BASE_TAR and
+# AWMAN_TEST_BUILTIN_FIXTURE_ARCHIVE, using the caller's values when set;
+# prepare_builtin_hw_fixtures DIR does that and also loads the fixture into
+# Apple Containers on macOS (tools/release-runner.sh needs only the archives).
 # Otherwise skopeo makes the docker-archive alpine base under the local
 # container engine (Docker preferred, else Apple Containers), with only DIR
 # mounted, so nobody installs skopeo; tools/oci-runtime-spike/fixture then
@@ -21,7 +23,7 @@ builtin_hw_sha256() {
     if command -v sha256sum >/dev/null; then sha256sum | awk '{print $1}'; else shasum -a 256 | awk '{print $1}'; fi
 }
 
-prepare_builtin_hw_fixtures() {
+build_builtin_hw_fixture_archives() {
     local dir=$1 repo base_tar fixture engine key build
     repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
     mkdir -p "$dir"
@@ -56,6 +58,10 @@ prepare_builtin_hw_fixtures() {
     fi
     [ -f "$base_tar" ] && [ -f "$fixture" ] || builtin_hw_blocked "guest fixture archives missing"
     export AWMAN_TEST_BUILTIN_BASE_TAR=$base_tar AWMAN_TEST_BUILTIN_FIXTURE_ARCHIVE=$fixture
+}
+
+prepare_builtin_hw_fixtures() {
+    build_builtin_hw_fixture_archives "$1"
     if [ "$(uname -s)" = Darwin ]; then
         # The Apple-store guest tests import the fixture from a running Apple
         # Containers service (and stop and restart that service themselves).

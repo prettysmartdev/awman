@@ -12,7 +12,10 @@ use super::*;
 pub(crate) fn sanitize_claude_config(
     src: &Path,
 ) -> Result<(tempfile::TempDir, PathBuf), std::io::Error> {
-    let raw = std::fs::read_to_string(src)?;
+    // Decode lossily: a stray non-UTF-8 byte must not turn into an error that
+    // tempts a caller into mounting the unsanitized host file.
+    let raw = std::fs::read(src)?;
+    let raw = String::from_utf8_lossy(&raw);
     let mut value: serde_json::Value =
         serde_json::from_str(&raw).unwrap_or_else(|_| serde_json::json!({}));
     if let serde_json::Value::Object(obj) = &mut value {
@@ -38,7 +41,7 @@ pub(crate) fn sanitize_claude_config(
 
     let tmp_dir = tempfile::Builder::new().prefix("awman-claude-").tempdir()?;
     let dest = tmp_dir.path().join("claude.json");
-    let body = serde_json::to_string_pretty(&value).unwrap_or(raw);
+    let body = serde_json::to_string_pretty(&value).map_err(std::io::Error::other)?;
     std::fs::write(&dest, body)?;
     Ok((tmp_dir, dest))
 }
@@ -219,3 +222,7 @@ pub(crate) fn synthesize_settings_dir_with_secrets(
     }
     Ok((tmp, tmp_root))
 }
+
+#[cfg(all(test, unix))]
+#[path = "claude_scrub_tests.rs"]
+mod scrub_tests;

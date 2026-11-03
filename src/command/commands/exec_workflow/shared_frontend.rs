@@ -110,6 +110,30 @@ impl SharedWorkflowFrontend {
     }
 }
 
+/// The static-workflow image preflight asks through the shared handle, so the
+/// question reaches the same CLI prompt or TUI dialog as every other one.
+impl crate::command::commands::agent_setup::AgentSetupFrontend for SharedWorkflowFrontend {
+    fn ask_agent_setup(
+        &mut self,
+        requested: &crate::data::session::AgentName,
+        default: &crate::data::session::AgentName,
+        default_available: bool,
+        image_only: bool,
+    ) -> Result<crate::command::commands::agent_setup::AgentSetupDecision, CommandError> {
+        self.with(|frontend| {
+            frontend.ask_agent_setup(requested, default, default_available, image_only)
+        })
+    }
+
+    fn record_fallback(
+        &mut self,
+        requested: &crate::data::session::AgentName,
+        fallback: &crate::data::session::AgentName,
+    ) {
+        self.with(|frontend| frontend.record_fallback(requested, fallback));
+    }
+}
+
 impl UserMessageSink for SharedWorkflowFrontend {
     fn write_message(&mut self, message: UserMessage) {
         self.with(|frontend| frontend.write_message(message));

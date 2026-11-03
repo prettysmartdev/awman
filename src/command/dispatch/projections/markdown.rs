@@ -19,7 +19,7 @@ impl CommandCatalogue {
         let mut out = String::new();
         out.push_str("# Command Reference\n\n");
         out.push_str(
-            "Generated from `CommandCatalogue` (`src/command/dispatch/catalogue.rs`) — \
+            "Generated from `CommandCatalogue` (`src/command/dispatch/catalogue/`) — \
              do not hand-edit. Every command, flag, and argument awman accepts is listed \
              here exactly as the catalogue defines it.\n\n",
         );

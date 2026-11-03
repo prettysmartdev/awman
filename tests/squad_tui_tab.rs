@@ -349,7 +349,9 @@ impl TaskGateway for RecordingGateway {
     }
 }
 
-#[tokio::test]
+// Paused time: the poller is a pure `tokio::time::interval` loop, so the
+// sleeps below advance virtual time instead of waiting ~5.6s of real time.
+#[tokio::test(start_paused = true)]
 async fn poller_skips_its_fetch_while_the_tab_is_unfocused() {
     let state = SquadTabState::new();
     let gateway = Arc::new(RecordingGateway {

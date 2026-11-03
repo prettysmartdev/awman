@@ -850,3 +850,113 @@ async fn managed_session_admission_preserves_the_prerequisite_ceiling_and_policy
         "fail"
     );
 }
+
+// ── IdempotencyGate: the reservation sequence without HTTP ─────────────────
+
+fn gate(
+    f: &Fixture,
+    auth: &crate::engine::auth::AuthMode,
+    key: Option<&str>,
+    canonical: &str,
+) -> IdempotencyGate {
+    IdempotencyGate::open(&f.admission.store, "/v1/test", auth, key, canonical).unwrap()
+}
+
+fn fresh(gate: IdempotencyGate) -> IdempotentRun {
+    match gate {
+        IdempotencyGate::Fresh(run) => run,
+        _ => panic!("expected a fresh reservation"),
+    }
+}
+
+#[test]
+fn gate_without_a_key_runs_unjournaled_and_invalid_keys_are_refused() {
+    let f = Fixture::new();
+    let auth = crate::engine::auth::AuthMode::Disabled;
+    assert!(matches!(
+        gate(&f, &auth, None, "c"),
+        IdempotencyGate::Unkeyed
+    ));
+    let too_long = "k".repeat(crate::data::fs::api_db::IDEMPOTENCY_KEY_MAX_BYTES + 1);
+    for key in ["", "has space", "tab\tkey", "ключ", too_long.as_str()] {
+        assert!(
+            matches!(
+                IdempotencyGate::open(&f.admission.store, "/v1/test", &auth, Some(key), "c"),
+                Err(IdempotencyGateError::InvalidKey)
+            ),
+            "{key:?} must be refused"
+        );
+    }
+    let longest = "k".repeat(crate::data::fs::api_db::IDEMPOTENCY_KEY_MAX_BYTES);
+    fresh(gate(&f, &auth, Some(&longest), "c")).finish(IdempotentResult::ServerError);
+}
+
+#[test]
+fn gate_sequences_in_flight_replay_and_mismatch() {
+    let f = Fixture::new();
+    let auth = crate::engine::auth::AuthMode::Disabled;
+    let run = fresh(gate(&f, &auth, Some("k1"), "body"));
+    assert!(matches!(
+        gate(&f, &auth, Some("k1"), "body"),
+        IdempotencyGate::InFlight
+    ));
+    run.finish(IdempotentResult::Final {
+        status: 202,
+        body: r#"{"ok":true}"#,
+    });
+    match gate(&f, &auth, Some("k1"), "body") {
+        IdempotencyGate::Replay { status, body } => {
+            assert_eq!(status, 202);
+            assert_eq!(body, r#"{"ok":true}"#);
+        }
+        _ => panic!("a finished request must replay"),
+    }
+    assert!(matches!(
+        gate(&f, &auth, Some("k1"), "other body"),
+        IdempotencyGate::Mismatch
+    ));
+    // Client errors are final answers too and replay the same way.
+    fresh(gate(&f, &auth, Some("k2"), "bad")).finish(IdempotentResult::Final {
+        status: 400,
+        body: r#"{"error":"bad"}"#,
+    });
+    assert!(matches!(
+        gate(&f, &auth, Some("k2"), "bad"),
+        IdempotencyGate::Replay { status: 400, .. }
+    ));
+}
+
+#[test]
+fn gate_releases_after_a_server_error_or_a_dropped_run() {
+    let f = Fixture::new();
+    let auth = crate::engine::auth::AuthMode::Disabled;
+    fresh(gate(&f, &auth, Some("k"), "body")).finish(IdempotentResult::ServerError);
+    // A dropped (cancelled or panicking) handler releases its reservation.
+    drop(fresh(gate(&f, &auth, Some("k"), "body")));
+    let run = fresh(gate(&f, &auth, Some("k"), "body"));
+    // The journal lent to admission is the reservation itself: it stays
+    // held until the last clone is gone.
+    let journal = run.admission();
+    drop(run);
+    assert!(matches!(
+        gate(&f, &auth, Some("k"), "body"),
+        IdempotencyGate::InFlight
+    ));
+    drop(journal);
+    fresh(gate(&f, &auth, Some("k"), "body"));
+}
+
+#[test]
+fn gate_scopes_keys_by_principal() {
+    let f = Fixture::new();
+    let anonymous = crate::engine::auth::AuthMode::Disabled;
+    let alice = crate::engine::auth::AuthMode::Enabled {
+        key_hash: "alice".into(),
+    };
+    fresh(gate(&f, &anonymous, Some("k"), "body")).finish(IdempotentResult::Final {
+        status: 202,
+        body: "{}",
+    });
+    // The same key under another principal is a separate reservation.
+    fresh(gate(&f, &alice, Some("k"), "different body")).finish(IdempotentResult::ServerError);
+}

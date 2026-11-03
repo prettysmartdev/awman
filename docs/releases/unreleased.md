@@ -3,7 +3,46 @@
 Changes on `main` that have not yet been cut into a release. Grouped by what
 they mean for you, not by where they were made.
 
+## Highlights
+
+- **Builtin microVM runtime (experimental, Apple Silicon).** Run every agent
+  in a hardware-virtualized microVM that ships inside the awman binary — no
+  Docker, `container` or `sbx` needed at run time.
+- **Custom agents.** Teach awman a new agent with one TOML file and
+  `awman new agent`.
+- **`awman agents`.** Inspect, attach to and stop running agents on any
+  runtime, with Docker-style `list`/`ps`, `detail`/`inspect` and `kill`/`rm`.
+- **Workflow prerequisite checks.** Before a workflow starts, awman checks that
+  its commit, push, PR and CI steps have the identity and credentials they need,
+  and asks before handing any credential to a step.
+- **A sturdier API for automation.** Cancel a running command, label it,
+  retry safely with an idempotency key, run a one-shot job in one call, resume
+  an event stream, and read structured results.
+
 ## Breaking and behaviour changes
+
+### `awman status` is now `awman agents status`
+
+The top-level `awman status` command is gone, with no alias. Use
+`awman agents status` (add `--watch` to keep refreshing; it no longer watches
+by default). See [`awman agents`](#awman-agents-inspect-and-manage-running-agents).
+
+**Who is affected:** scripts and habits that run `awman status`.
+
+### `crush` and `maki` are custom agents now
+
+`crush` and `maki` are no longer built in. They ship as custom-agent examples:
+create the definition once and everything that names them keeps working.
+
+```sh
+awman new agent crush --from crush          # this repo
+awman new agent maki --from maki --global   # every repo
+awman ready --agent crush                   # review, approve, build
+```
+
+Without a definition, a run that names them fails with
+`unknown agent 'crush'; … define one with: awman new agent crush`. See
+[Custom Agents](../15-custom-agents.md#migrating-from-crush-and-maki).
 
 ### An API run no longer silently resumes an existing worktree
 
@@ -88,18 +127,6 @@ rather than at the first request. See
 answered. `""` and an explicit `none` opt-out were previously
 indistinguishable.
 
-### A tool restriction an agent cannot enforce refuses the launch on every runtime
-
-Passing allowed or disallowed tools to an agent that has no flag for that list
-used to drop the restriction silently on Docker and Apple Containers (the
-builtin runtime already refused). Every runtime now refuses the launch
-("this agent declares no allowed-tools flag, so its allowed-tools list cannot
-be applied…"), because running the agent without the restriction you asked
-for is the less safe outcome.
-
-**Who is affected:** workflows and commands that pass a tool list to such an
-agent. Remove the list for that agent, or pick an agent that supports it.
-
 ### Exit codes and messages for container failures
 
 - Exit code `3` now means only that the Docker or Apple Containers backend is
@@ -154,7 +181,117 @@ instead of failing the teardown.
 **Who is affected:** workflows that relied on committing only staged changes.
 Set `add_all = false` to keep that behaviour.
 
+### `yoloDisallowedTools` is enforced
+
+The list was validated and stored but never reached the agent. Every `--yolo`
+launch (`chat`, `exec prompt`, each workflow step, and API commands, which
+default to `--yolo`) now passes it to Claude as `--disallowedTools`. An agent
+with no way to enforce a disallowed-tools list — every first-party agent but
+Claude — is refused under `--yolo` while the list is non-empty, with an error
+that names the setting. To keep running such an agent with `--yolo` in a repo,
+clear the list there: `awman config set yoloDisallowedTools ""`. See
+[Disallowed tools](../03-agent-sessions.md#disallowed-tools).
+
+### `awman remote exec --follow` exits with the remote command's result
+
+It used to exit `0` whatever happened on the server. It now exits `0` only when
+the remote command finished `done`, with the command's own exit code when that
+is non-zero, and `1` when it failed, was cancelled, or following stopped before
+it finished. Without `--follow`, a successful submit still exits `0`.
+
 ## Features
+
+### Builtin microVM runtime (experimental)
+
+`runtime: "builtin-experimental"` runs each agent session in a
+hardware-virtualized Linux microVM. The VM code, kernel and guest agent are
+compiled into awman (powered by Microsandbox), so installing awman is the only
+install step: no Docker, `container` or `sbx` is needed to run agents.
+
+- **Where:** macOS on Apple Silicon only, in the `awman-macos-arm64` release
+  asset, which is ad-hoc signed with the hypervisor entitlement and not
+  notarized. Every other platform refuses the runtime with a clear message.
+- **Enabling it:** global config only, never a default:
+  `awman config set --global runtime builtin-experimental`.
+- **Images:** `awman ready` imports agent images from an explicit source
+  (`registry`, `docker-local`, `apple-local` or `archive`). With
+  `builtin.builder.enabled: true` and a local source, `ready` builds the
+  Dockerfiles in that Docker or Apple Containers store and imports the result
+  in one command; `chat`, `exec prompt` and API session setup build a missing
+  image the same way. Workflow preflight and squad never build.
+- **Per-session controls:** `builtin.network` (`public`, `allowlist` or
+  `none`; a repo may only narrow the global policy), `hostPorts`, `vcpus`
+  (default 2), `memoryMib` (4096), `rootDiskMib` (30 GiB) and `mountQuotaMib`
+  (30 GiB per host mount). Repo settings apply to every launch for that repo —
+  CLI, TUI tabs, API sessions, squad tasks and workflow worktrees — and a repo
+  with an invalid `builtin` block fails only its own launches.
+- **Upgrades:** a state directory written by an earlier worker protocol is
+  upgraded in place, with a `db.pre-*` backup kept for rollback.
+- **Not supported yet:** `--allow-docker`, and reattaching after the awman
+  process that launched the agent exits.
+
+Behaviour and config may change while the runtime is experimental. See
+[Runtimes](../11-runtimes.md#builtin-microvm-experimental).
+
+### Custom agents
+
+Define your own agent in TOML under `.awman/agents/` or `~/.awman/agents/` and
+awman builds, launches and operates it like a first-party one. `awman new agent
+<name> [--global] [--from crush|maki] [--force]` writes a starting definition.
+Repo definitions, and global ones that declare a host `[ping]`, are reviewed
+and approved once per content hash (`awman ready --agent <name>`); approvals
+live in `~/.awman/trusted-agents.json`. Custom agents run on Docker, Apple
+Containers and the builtin runtime, not yet on Docker Sandboxes.
+
+awman also ships builtin skills: `awman new skill --pull builtin` adds
+`create-custom-agent`, which teaches a code agent to write a definition for
+you. See [Custom Agents](../15-custom-agents.md).
+
+### `awman agents`: inspect and manage running agents
+
+`awman agents status [--watch]`, `list` (`ls`, `ps`; `--all` includes stopped
+agents), `detail` (`inspect`), `kill` (`rm`) and `attach` work on every
+runtime. Each agent shows its source: `session`, or `squad:<task>` for one your
+squad started. `status`, `list`, `detail` and `kill` are also available over
+the API.
+
+### Workflow prerequisite checks
+
+Before the first container starts, `exec workflow` checks what its setup and
+teardown steps need: a Git identity for `commit_changes`, an SSH key for an SSH
+`push_branch`, a GitHub token for `create_pull_request`, HTTPS pushes and
+`poll_ci`, and `gh` in the image. Interactive runs show a report and ask before
+using any host credential; credentials go only to the steps that need them and
+tokens are redacted from output. Headless runs use only what policy or flags
+grant — `--yes` never grants credentials.
+
+- `--prerequisite-identity`, `--prerequisite-ssh`, `--prerequisite-token` and
+  `--prerequisite-unresolved warn|fail` answer up front;
+  `--check-prerequisites` prints the report and exits.
+- The `workflows.prerequisites` config block sets policy (allowed token
+  variables, an `acquire` command, `refresh: "beforeTeardown"`, and the
+  global-only `allowApiClientGrants`).
+- Remembered SSH and token choices (decisions only, never secrets) are listed
+  and revoked with `awman config prerequisite-grants list|revoke`.
+- Before teardown, prerequisites are re-checked without prompting.
+
+See [Workflow prerequisite checks](../05-workflows.md#workflow-prerequisite-checks).
+
+### Worktree merge-back handles a dirty target and a failed merge
+
+`--on-dirty-merge-target ask|commit|stash|fail` decides what happens when the
+branch you merge back into has uncommitted changes, and
+`--on-merge-failure ask|agent|keep` decides whether a failed merge launches a
+merge-fix agent or keeps the worktree. See
+[Worktree merge-back](../05-workflows.md#worktree-merge-back).
+
+### The Workflow Overview scrolls sideways
+
+A workflow with more stages than fit across the terminal scrolls with
+**Shift+←/→** (or a horizontal wheel) instead of squeezing every stage into an
+unreadable column. `‹`/`›` markers show hidden stages, coloured red or blue
+when a hidden stage failed or is running, and the view follows the running
+stage until you scroll by hand.
 
 ### Dynamic workflow settings use `workflows.dynamic`
 
@@ -187,6 +324,42 @@ Related changes to how awman writes config files:
   that listed the same instruction twice gets one bullet in the leader prompt.
 
 
+### A sturdier HTTP API for automation
+
+Clients can drive a job end to end without scraping text. `GET /v1/status`
+lists each capability in `features`, so a client can detect it.
+
+- **Cancel a command:** `POST /v1/commands/{id}/cancel` stops a queued or
+  running command. A cancelled workflow still runs its cleanup teardown but
+  skips publishing steps and remediation, and ends `cancelled` (exit 130).
+- **Labels and idempotency:** tag sessions and commands with labels and filter
+  by them; send an `Idempotency-Key` so a retried `POST` returns the original
+  response instead of creating a duplicate.
+- **One-shot runs:** `POST /v1/runs` creates a session, runs one command and,
+  with `close_on_finish`, closes the session — one call instead of four.
+- **Resumable event streams:** SSE frames carry an `id:`, so a client resumes
+  with `Last-Event-ID` (or `?after=`) after a disconnect.
+- **Structured results:** a command's `result` reports `outcome`, `failure`,
+  `failed_steps`, `git`, `pull_request`, `final_message`, `outputs` and, for
+  `agents` commands, `data`. Files an agent writes to `/awman/output` are
+  listed and downloaded from `/v1/commands/{id}/outputs`. Events carry a
+  `source`, `?step=` filters the log to one step, and `step_activity` events
+  report live per-step output.
+- **Consistent resources and errors:** `GET /v1/commands/{id}` is the command
+  record and `/v1/commands/{id}/workflow` its workflow state (the old
+  `/status` and `/v1/workflows/{id}` paths still answer). Every error carries
+  a stable machine-readable `code` beside its message. Sessions report
+  `setup_status` and `setup_error`, filterable with `?setup_status=`, and
+  `POST /v1/commands` accepts `session_id` in the body.
+- **Remote sessions:** `exec workflow --dynamic` runs in a server-cloned
+  session. Create the session with `base_ref` to branch from any branch, tag or
+  commit, `merge_refs` to merge branches in first, and `push: true` to commit
+  and push the result when the command succeeds.
+- **Workflows finish cleanly:** API yolo workflows (every API `--dynamic` run)
+  no longer abort after their last step: their teardown now runs.
+
+See [API & Remote Mode](../09-api-and-remote-mode.md).
+
 ### API workdir roots: `--workdir-root` and `api.workDirRoots`
 
 `awman api start --workdir-root <dir>` (repeatable) and the global
@@ -207,57 +380,51 @@ Add arguments awman doesn't know about to an agent's command, per agent, in
 repo or global config (`"agentFlags": {"codex": ["--search"]}`) or for one run
 (`--agent-flag=--search` on `chat`, `exec prompt` and `exec workflow`). The
 flags go after awman's own and before a seeded prompt. A repo entry replaces
-the global one for that agent, and `[]` turns it off. `remote exec` accepts
-the flag but does not forward it, and now says so. See
-[Configuration](../07-configuration.md).
-
-### Builtin runtime: optional source-matched builder
-
-With `builtin.builder.enabled: true` and a `docker-local` or `apple-local`
-image source, `awman ready` builds the Dockerfiles in that local store and
-imports the result, in one command. Other sources warn once per image and keep
-importing. API session setup, `chat` and `exec prompt` build a missing image the same
-way, as the Docker and Apple runtimes do, so `awman chat --agent codex` works
-without running `ready` for that agent first. Workflow preflight and squad
-never build. `docker-store` and `apple-store` still work
-as aliases for `docker-local` and `apple-local`. See
-[Runtimes](../11-runtimes.md).
-
-## Builtin runtime behaviour
-
-- **Per-session settings.** A repo's `builtin.network`, `vcpus`, `memoryMib`,
-  `rootDiskMib`, `mountQuotaMib` and `registries` apply to every launch for that repo: CLI, each TUI tab, each
-  API session, each squad task and each workflow worktree, even when the
-  narrowing is not committed yet. A repo `builtin.stateDir` that differs from
-  the process's is refused for that repo's launches.
-- **Disk limits.** Agent VMs now get a 30 GiB writable root disk and may add
-  up to 30 GiB to each host mount, the workspace included (both were 4 GiB).
-  Set `builtin.rootDiskMib` and `builtin.mountQuotaMib` to change them.
-- **Relocated global config.** TUI tabs, API sessions and workflow worktrees
-  now read the global config from `AWMAN_CONFIG_HOME` when it is set. Before,
-  they read `~/.awman` and, when that file was missing, fell back to the
-  default `public` network instead of your global policy.
-- **One bad repo does not stop the process.** A repo whose `builtin` block is
-  invalid (for example a network block that widens the global one) fails that
-  repo's launches only. It no longer stops a TUI or API server started there.
-- **Builtin config stays out of other runtimes.** `awman ready` and API session
-  setup on Docker or Apple Containers no longer read or validate the `builtin`
-  block.
-- **One image rule.** Workflow preflight and squad prepare images by the same
-  rule as `ready`. An image installed from a different source is re-acquired,
-  and a workflow step for a non-default agent refuses a default source that
-  names a single image (an archive, or a fixed reference), as `ready` does.
-- **A failed base build for a non-default agent is not fatal.** When a
-  non-default agent's image source is a different local store, a failed
-  project-image build in that store is reported, but `ready` still succeeds
-  once every required image is ready.
-- **Waiting is visible.** `chat` and `exec` say when they are waiting for
-  another awman process (such as a running `awman ready --build`) to finish
-  with an image.
-- **Dropped waits release I/O at once.** Aborting a builtin agent releases its
-  terminal output streams immediately instead of at guest exit.
+the global one for that agent, and `[]` turns it off. `remote exec` forwards
+the flag to the remote host. See [Configuration](../07-configuration.md).
 
 ## Fixes
+
+### Claude's host config is always sanitized before it is mounted
+
+If `~/.claude.json` contained a byte that is not valid UTF-8, awman mounted
+the host file itself into the container, read-write and with your
+`oauthAccount` intact. The file is now always sanitized; if that is
+impossible, the container gets a minimal generated config instead.
+
+### A failed parallel step stops queued steps from starting
+
+When a step in a parallel group failed without `abort_on_failure`, a sibling
+that finished afterwards (or was advanced by a yolo countdown) could still
+start the next queued step. Queued steps now wait until the failure is
+retried from the recovery board, as
+[Workflows](../05-workflows.md) describes.
+
+### `awman remote exec` sends every flag to the server
+
+`remote exec workflow|prompt` used to send only `--work-item` and `--agent`
+and drop the rest silently (and `exec prompt`'s `--agent` arrived as part of
+the prompt text). Every `exec` flag you pass — `--yolo`, `--model`, `--issue`,
+`--plan`, `--overlay`, `--agent-flag`, the prerequisite grants and the rest —
+now reaches the server. `remote exec workflow --dynamic` works without a
+workflow path. `--json`, which shapes local output, is now refused as an
+unknown flag instead of being ignored. See
+[`awman remote exec workflow`](../09-api-and-remote-mode.md#awman-remote-exec-workflow).
+
+### A static workflow asks about a missing agent image again
+
+Before a static `exec workflow` starts its first container on Docker or Apple
+Containers, awman checks the image of every agent its steps run. For a missing one it asks — set it up (writing its Dockerfile from the
+agent definition and building it), run those steps with the default agent
+instead, or stop — in the CLI and the TUI alike. The run used to start and
+fail at the first step that needed the image. See
+[Agent images](../05-workflows.md#agent-images).
+
+### `awman remote` explains a refused connection to another machine
+
+The API server listens on `127.0.0.1` only. A refused connection to a
+non-loopback address now says so and suggests an SSH tunnel or a reverse
+proxy; a refused loopback connection asks whether `awman api start` is running.
 
 ### `create_pull_request` no longer fails right after a push
 
@@ -343,11 +510,6 @@ When a yolo countdown ended a step and the next step started right away, the
 new container's window and status bars sometimes stayed hidden until you
 pressed Ctrl-M. They now open as soon as the new container prints output.
 
-### Builtin agent containers have short names
-
-Under `builtin-experimental`, agent containers were named with a long random
-hash. They now use the same `awman-<pid>-<number>` form as the other runtimes.
-
 ### A setup step that fails gets the same failure file a teardown step gets
 
 A **setup** step that fails and has an `on_failure:` agent now writes the
@@ -388,8 +550,8 @@ predecessor carried. The enumerated values are listed in
 | Field | Values |
 |---|---|
 | `WorkflowStepTransition.from_status` / `.to_status` | `pending`, `running`, `succeeded`, `failed`, `cancelled`, `skipped` |
-| `CommandStatus.status` | `done`, `paused`, `aborted`, `error` |
-| `WorkflowPhaseTransition.status` | `running`, `succeeded`, `failed`, `paused`, `teardown_failed` |
+| `CommandStatus.status` | `done`, `paused`, `aborted`, `error`, `cancelled` |
+| `WorkflowPhaseTransition.status` | `running`, `succeeded`, `failed`, `paused`, `teardown_failed`, `cancelled` |
 | session `type` (create body, `session_type` column) | `local`, `remote` |
 | `awman squad env` row `state` | `set`, `unmet` |
 
@@ -447,6 +609,17 @@ therefore always fails, and credential refresh for antigravity cannot succeed.
 This is long-standing, not new; fixing it changes behaviour on the one
 sanctioned host-side agent execution path and is tracked separately.
 
+## Documentation corrections
+
+- An unqualified `dir()` overlay mounts **read-write**; the docs said
+  read-only. Add `:ro` to mounts that should be read-only.
+- The API server listens on `127.0.0.1` only. Reach it from another machine
+  through an SSH tunnel or a reverse proxy; see
+  [Reaching the server from another machine](../09-api-and-remote-mode.md#reaching-the-server-from-another-machine).
+- The TUI has no remote-bound tabs, and `remote.savedDirs` and
+  `api.alwaysNonInteractive` are not read; the docs that described them are
+  gone.
+
 ## New environment variables
 
 - `AWMAN_TEST_ISOLATION` — set to `1` to keep awman off your per-user OS
@@ -463,6 +636,8 @@ sanctioned host-side agent execution path and is tracked separately.
 No behaviour changed; these were previously read but undocumented. See
 [Configuration](../07-configuration.md).
 
+- `AWMAN_SQUAD_ROOT` — overrides where squad stores its tasks and state
+  (`<data home>/squad` by default).
 - `AWMAN_ATTACH_DIR` — overrides the attach-socket directory
   (`~/.awman/attach/` by default).
 - `AWMAN_API_VERBOSE_SETUP` — set to `0`, `false`, `no` or `off` to demote the

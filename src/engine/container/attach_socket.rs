@@ -414,6 +414,7 @@ mod unix_impl {
                     stuck_timeout,
                     container_start_delay: std::time::Duration::ZERO,
                     cancel_on_grace_expired: None,
+                    poll_interval: crate::engine::container::io_bridge::STUCK_POLL_INTERVAL,
                 },
                 &output_activity,
             );
@@ -897,3 +898,7 @@ impl crate::engine::agent_runtime::execution::AgentInstance for SocketAttachInst
         ))
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "attach_socket_tests.rs"]
+mod coverage_tests;

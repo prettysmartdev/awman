@@ -70,6 +70,9 @@ pub struct ExecBridgeOptions {
     /// it exits.
     pub prompt_files: Vec<crate::engine::container::options::PromptFileGuard>,
     pub io: AgentIo,
+    /// How long an interrupted agent gets to exit before it is killed and its
+    /// sandbox stopped. Production launches use [`DEFAULT_CANCEL_GRACE`].
+    pub cancel_grace: Duration,
 }
 pub struct ExecBridge(ExecBridgeOptions);
 
@@ -130,9 +133,10 @@ impl Drop for Execution {
         }
     }
 }
-/// Time an interrupted agent gets to exit before it is killed; matches the
+/// Default time an interrupted agent gets to exit before it is killed
+/// ([`ExecBridgeOptions::cancel_grace`]); matches the
 /// `docker stop` default used by the Docker backend's cancel.
-const CANCEL_GRACE: Duration = Duration::from_secs(10);
+pub const DEFAULT_CANCEL_GRACE: Duration = Duration::from_secs(10);
 
 /// Launch-scoped lifecycle target for automatic cleanup (cancel/stuck).
 #[derive(Clone)]
@@ -235,6 +239,7 @@ impl ExecBridge {
             leases,
             prompt_files,
             mut io,
+            cancel_grace,
         } = self.0;
         if let Some(prompt) = seeded_prompt {
             // Same bytes as the Docker path: the prompt plus a terminating newline.
@@ -282,7 +287,7 @@ impl ExecBridge {
             cleanup_claimed: cleanup_claimed.clone(),
             stop_result,
         });
-        let cancel = ExecCancelHandle::new(control.clone(), owner.clone(), CANCEL_GRACE);
+        let cancel = ExecCancelHandle::new(control.clone(), owner.clone(), cancel_grace);
         let stuck_cancel = cancel.clone();
         let cancel_grace = owner.is_some().then(|| {
             Arc::new(move || {
@@ -295,6 +300,7 @@ impl ExecBridge {
                 stuck_timeout: frontend.stuck_timeout(),
                 container_start_delay: Duration::ZERO,
                 cancel_on_grace_expired: cancel_grace,
+                poll_interval: crate::engine::container::io_bridge::STUCK_POLL_INTERVAL,
             },
             &output_activity,
         );
@@ -594,6 +600,7 @@ impl AgentInstance for AttachInstance {
                 leases: Vec::new(),
                 prompt_files: Vec::new(),
                 io,
+                cancel_grace: DEFAULT_CANCEL_GRACE,
             })
             .run(frontend)
         }
@@ -686,6 +693,7 @@ mod tests {
                     leases: Vec::new(),
                     prompt_files,
                     io,
+                    cancel_grace: DEFAULT_CANCEL_GRACE,
                 })
                 .run(frontend)
                 .unwrap()
@@ -725,6 +733,7 @@ mod tests {
             leases: Vec::new(),
             prompt_files: Vec::new(),
             io,
+            cancel_grace: DEFAULT_CANCEL_GRACE,
         })
         .run(frontend)
         .unwrap();
@@ -888,6 +897,7 @@ mod tests {
                 leases: Vec::new(),
                 prompt_files: Vec::new(),
                 io,
+                cancel_grace: DEFAULT_CANCEL_GRACE,
             })
             .run(frontend)
         }
@@ -966,6 +976,7 @@ mod tests {
                 leases: Vec::new(),
                 prompt_files: Vec::new(),
                 io,
+                cancel_grace: DEFAULT_CANCEL_GRACE,
             })
             .run(frontend)
         }
@@ -1004,6 +1015,7 @@ mod tests {
                 leases: Vec::new(),
                 prompt_files: Vec::new(),
                 io,
+                cancel_grace: DEFAULT_CANCEL_GRACE,
             })
             .run(frontend)
         }
@@ -1055,6 +1067,7 @@ mod tests {
                 leases: Vec::new(),
                 prompt_files: Vec::new(),
                 io,
+                cancel_grace: DEFAULT_CANCEL_GRACE,
             })
             .run(frontend)
         }

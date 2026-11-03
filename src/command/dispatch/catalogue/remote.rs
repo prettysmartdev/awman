@@ -48,9 +48,11 @@ pub(super) const REMOTE_EXEC_WORKFLOW: CommandSpec = CommandSpec {
     long_help: None,
     arguments: &[ArgumentSpec {
         name: "workflow",
-        help: "Path to the workflow file.",
+        // Optional at the catalogue level so `--dynamic` can omit it, as on
+        // `exec workflow`; the command still requires it otherwise.
+        help: "Path to the workflow file on the remote host (omit with --dynamic).",
         kind: ArgumentKind::Path,
-        optional: false,
+        optional: true,
     }],
     flags: &REMOTE_EXEC_WORKFLOW_FLAGS,
     api_allowed: false,

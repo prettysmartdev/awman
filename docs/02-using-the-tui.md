@@ -15,7 +15,7 @@ When you run `awman` with no arguments, the TUI opens immediately in an alternat
 
 **Inside a Git repository:**
 
-The TUI runs `awman ready` automatically on the first tab. This checks that your container runtime is available, that `Dockerfile.dev` and `.awman/Dockerfile.{agent}` exist, and that your agent image is built. If anything needs attention, `ready` will guide you through it. Once `ready` passes, the TUI shows the welcome message and waits for your first command.
+The TUI runs `awman ready` automatically on the first tab. This checks that your container runtime is available, that `Dockerfile.dev` and `.awman/Dockerfile.{agent}` exist, and that your agent image is built (or imported, on the builtin runtime). If anything needs attention, `ready` will guide you through it. Once `ready` passes, the TUI shows the welcome message and waits for your first command.
 
 **Outside a Git repository:**
 
@@ -147,8 +147,9 @@ The command box is where you interact with awman. Type any subcommand and press 
 | **Ctrl+Backspace** | Delete previous word |
 | **Tab** | Cycle to next autocomplete suggestion |
 | **Shift+Tab** | Cycle to previous autocomplete suggestion |
-| **q** | Quit awman (when command box is empty and idle) |
-| **Ctrl+C** | Close tab (multiple tabs) or open quit confirmation (single tab) |
+| **Ctrl+Y** | Copy the execution-window text selection without leaving the command box |
+| **q** | Open the quit confirmation (when the command box is empty and the tab is idle) |
+| **Ctrl+C** | Open the quit or close-tab confirmation (see [Quitting](#quitting)) |
 
 ### Input handling
 
@@ -235,22 +236,28 @@ did you mean: exec workflow?
 
 ### Quitting
 
-Press **Ctrl+C** from the command box to open the quit confirmation dialog:
+Press **Ctrl+C** (or **q** with an empty, idle command box) to open the quit confirmation:
 
 ```
-╭─── Quit awman? ───────────────────╮
-│  Are you sure you want to quit?   │
-│  [y/n]                            │
-╰───────────────────────────────────╯
+╭─── Quit awman? ────────────────────╮
+│  Press Ctrl-C again to quit awman  │
+│                                    │
+│  [Esc] cancel                      │
+╰────────────────────────────────────╯
 ```
 
-Press **y** to quit, **n** or **Esc** to cancel. With multiple tabs open, **Ctrl+C** instead shows a close-tab dialog:
+Press **Ctrl+C** again to quit, or **Esc** to cancel. With multiple tabs open, **Ctrl+C** shows a close-tab dialog instead:
 
 ```
-╭─── Close tab? ──────────────────────────────╮
-│  [q] Quit awman   [c] Close this tab   [n] Cancel │
-╰──────────────────────────────────────────────╯
+╭─── Close tab? ─────────────────────╮
+│  Press Ctrl-C again to quit awman  │
+│  Press Ctrl-T to close this tab    │
+│                                    │
+│  [Esc] cancel                      │
+╰────────────────────────────────────╯
 ```
+
+While a workflow is running on the tab, **Ctrl+C** first asks whether to cancel the workflow: **y** kills the running container and returns the current step to pending so the run can be resumed later; **n** or **Esc** keeps it running.
 
 ---
 
@@ -265,10 +272,13 @@ When the window is selected (press **↑** from the command box to select it):
 | Key / Action | Effect |
 |---|---|
 | **↑ / ↓** | Scroll line by line |
-| **PageUp / PageDown** | Scroll one full page |
+| **PageUp / PageDown** | Scroll 20 lines |
 | **b / e** | Jump to beginning / end |
+| **l** | Toggle the [status log](#status-log) |
 | Mouse scroll | Scroll at any time |
 | **Esc** | Return focus to command box |
+
+Once the command has finished, any other key also returns focus to the command box.
 
 ### Selecting and copying text
 
@@ -326,7 +336,7 @@ Workflow [setup and teardown](05-workflows.md#container-execution-model) steps g
   ctrl-m minimize  ·  ctrl-\ detach  ·  scroll ↕ history
 ```
 
-The title bar shows the container name, live CPU usage, memory, and total runtime. Stats are polled from the container runtime every 5 seconds.
+The title bar shows the agent, `(containerized)` — or `(sandboxed)` under `docker-sbx-experimental` — the workflow step when one is running, and on the right the container name, live CPU usage, memory, and total runtime. Stats are polled from the container runtime every 3 seconds.
 
 ### Keyboard and mouse
 
@@ -367,9 +377,9 @@ This mirrors tmux's copy-mode behavior: scrolling enters historical view, reachi
 
 Mouse click, drag, and drag-release events are never forwarded to the agent. They always perform awman's native text selection, ensuring you can always select and copy text from the container overlay, even when the agent has mouse tracking enabled.
 
-Scrollback holds up to 10,000 lines by default. While scrolled, the title bar shows `↑ scrollback (N / M lines)` where `N` is your current offset and `M` is the total depth.
+Scrollback holds up to 10,000 lines by default (`terminal_scrollback_lines` in [Configuration](07-configuration.md)). While scrolled, the title bar shows `↑ scrollback (N / M lines)` where `N` is your current offset and `M` is the total depth.
 
-**Ctrl+Y** with no active selection forwards the key to the agent instead of copying.
+awman always intercepts **Ctrl+Y**; with no active selection it does nothing, and the agent never receives it.
 
 ### Minimizing and restoring
 
@@ -419,7 +429,9 @@ forwarded to a container.
 The container window closes and a summary bar appears:
 
 ```
-── claude · myproject-12345 · avg CPU 4.2% · 210MiB · 1m 47s · exit 0 ──
+╭──────────────────────────────────────────────────────────────────────╮
+│ Claude Code | awman-12345-1 | avg 4.2% | avg 210MiB | 1m 47s | exit 0 │
+╰──────────────────────────────────────────────────────────────────────╯
 ```
 
 This summary persists until a new container is launched.
@@ -454,7 +466,7 @@ Each minimized bar reads `🔒 agent [step_name] | container | cpu | mem | durat
 | Appearance | Meaning |
 |---|---|
 | Green border and text | Container running normally |
-| Yellow, `⚠` prefix | No output for more than 30 seconds — [stuck](05-workflows.md#stuck-steps) |
+| Yellow, `⚠` prefix | No output for longer than the stuck timeout — [stuck](05-workflows.md#stuck-steps) |
 | Flashing purple / yellow, `Yolo in Ns` | A [yolo](03-agent-sessions.md#permission-modes) auto-advance countdown is running for that container; the color alternates every second and the bar shows the seconds remaining |
 
 The focused container never shows a bar of its own — its step name, container name, and live stats are already in the maximized window's title line. If the *focused* container is the one counting down, its countdown appears as the same modal dialog a single container shows (see [Auto-advance when stuck](05-workflows.md#auto-advance-when-stuck-yolo-mode)) instead of a minimized bar, since there's no bar for the focused container to show it in.
@@ -543,7 +555,7 @@ Press **Ctrl-M** to minimize the container if you want the overview to have the 
 
 ## Config dialog
 
-Press **Ctrl+,** from anywhere in the TUI to open the config dialog instantly — even while an agent is running or the container window is maximized. You can also type `config show` in the command box and press **Enter**. Either way opens the same modal overlay for viewing and editing all configuration fields without leaving the TUI. The dialog takes up 90% of the terminal in both dimensions, so as much of the table as possible is visible at once.
+Press **Ctrl+,** from anywhere in the TUI, or type `config show` in the command box, to open the config dialog: a modal covering 90% of the terminal for viewing and editing every configuration field.
 
 ```
 ╭──────────────────────────────── awman config ─────────────────────────────────╮
@@ -628,45 +640,34 @@ created and a **could not open new tab** modal shows the error. Press
 Ctrl+T          open a new tab (prompts for working directory)
 Ctrl+A          switch to the previous tab
 Ctrl+D          switch to the next tab
-Ctrl+C, Ctrl+T  (multiple tabs open) close current tab
+Ctrl+C, Ctrl+T  (multiple tabs open) close the current tab
 ```
 
 The tab bar shows each tab's project name, current or last command, and an arrow (`➡`) on the active tab. The active tab's bottom border is suppressed so it visually opens into the content area.
 
-Tab names are truncated with `…` only when they don't fit their tab: at the minimum tab width (20 columns) that means 14 characters of the name, and wider tabs show correspondingly more of a long name. The tab bar distributes width according to the number of open tabs:
-
-| Open tabs | Each tab gets |
-|-----------|--------------|
-| 1 | ¼ of terminal width |
-| 2 | ½ of terminal width |
-| 3 | ¾ ÷ 3 of terminal width |
-| 4+ | full width ÷ n |
+All tabs share one width: wide enough for the longest tab label (at least 20 columns), or, when that many tabs don't fit, the terminal width divided evenly between them (at least 12 columns each). Names that don't fit are truncated with `…` — at 20 columns that leaves 14 characters of the name.
 
 ### Tab colours
 
 | Colour | Meaning |
 |--------|---------|
 | Grey | Idle or completed |
-| Blue | Running (no container) |
-| Green | Running with active container |
+| Blue | Running (container window hidden, or no container) |
+| Green | Running with a visible container window |
+| Purple | Running with a visible [ACP](03-agent-sessions.md#acp-launch-mode) agent window |
 | Cyan | The [squad tab](#the-squad-tab) |
-| Purple / Magenta | Permanently bound to a remote API session |
+| Magenta | Showing a run in a remote (server-cloned) session, for example a squad run you attached to |
 | Red | Exited with error |
-| Yellow | Container silent for >30 seconds (stuck warning) |
-| Alternating Yellow / Purple | Background yolo countdown in progress: tab label alternates between `⚠️ yolo in Ns` and `🤘 yolo in Ns` every 2 seconds (see [Auto-advance when stuck](05-workflows.md#auto-advance-when-stuck-yolo-mode)) |
+| Yellow | Container silent past the stuck timeout (stuck warning) |
+| Alternating Yellow / Magenta | Background yolo countdown in progress: the colour and the label (`⚠️ yolo in Ns` / `🤘 yolo in Ns`) alternate every second (see [Auto-advance when stuck](05-workflows.md#auto-advance-when-stuck-yolo-mode)) |
 
-The squad tab's cyan and a remote-bound tab's purple/magenta are both fixed,
+The squad tab's cyan and a remote session's magenta are both fixed,
 kind-based colours: they take priority over the execution-phase colours
 above (grey/blue/green/red) but still yield to the yellow stuck warning and
 the yolo countdown, since those are live signals about a run in progress.
 
-### Remote-bound tabs
-
-When `remote.defaultAddr` is set in `~/.awman/config.json`, opening a new tab with **Ctrl+T** offers an option to bind the tab to a remote API session. A **remote-bound tab** forwards every command you type to the remote host via the API — no extra flags or session arguments needed.
-
-Remote-bound tabs are **purple** in the tab bar. The tab label shows `host:port` of the remote host instead of the local directory name. When a workflow runs on the remote session, the Workflow Overview appears automatically and updates every 5 seconds.
-
-For full details on creating remote-bound tabs, the create-session sub-modal, and Workflow Overview behavior, see [Remote-bound TUI tabs](09-api-and-remote-mode.md#remote-bound-tui-tabs).
+To drive an awman API server on another machine, use the `awman remote`
+commands; see [Remote mode](09-api-and-remote-mode.md#remote-mode).
 
 ### The squad tab
 
@@ -703,16 +704,17 @@ The task list is a grid of generously sized rounded cards rather than a
 table. The task name is the card's title, and every value below it carries a
 grey label: `Description`, `Last run` (when it last ran), `Outcome` (what that
 run did — `workflow executed`, `not triggered`, `failed`, `interrupted`,
-`running`, or `never run`), and `Next` (its next scheduled evaluation, which
+`canceled`, `running`, or `never run`), and `Next` (its next scheduled evaluation, which
 reads `paused` for a paused task). The grid reflows when the terminal is
 resized. Use **↑**, **↓**, **←**, and **→** to move among
 cards; selection remains on the same task when the number of columns changes.
 
-Press **Enter** to open a task's details. The modal includes the task's
-workspace, mount scope, interval, overlays, agent/model, timestamps, and run
-history. Its footer repeats the available actions: **a** attach, **e** edit,
-**t** trigger, **c** cancel, **p** pause, **r** resume, **d** delete, and **Esc** close. These
-actions apply to the task shown by the modal. **t**, **c**, **p**, and **d** open a
+Press **Enter** to open a task's details: its workspace, mount scope,
+interval, overlays, agent/model and timestamps. Press **h** (on a card or in
+the modal) for the task's run history; **Enter** on a run shows it in full.
+The modal's footer lists the available actions: **h** history, **a** attach,
+**e** edit, **t** trigger, **c** cancel, **p** pause, **r** resume, **d**
+delete, and **Esc** close. These actions apply to the task shown by the modal. **t**, **c**, **p**, and **d** open a
 `[y]es / [n]o` confirmation before acting, whether pressed on a card or in the
 modal.
 
@@ -757,13 +759,13 @@ bindings, and attaching to a running task.
 
 ## Stuck detection
 
-If a running container produces no output for more than 30 seconds, the tab turns yellow and the subcommand label gains a `⚠️` prefix (e.g. `⚠️ chat`). The warning clears automatically when you:
+If a running container produces no output for longer than the stuck timeout (30 seconds by default; `agentStuckTimeout` in [Configuration](07-configuration.md)), the tab turns yellow and the subcommand label gains a `⚠️` prefix (e.g. `⚠️ chat`). The warning clears automatically when you:
 
 - Switch to the yellow tab
 - Press any key while the tab is active
 - Scroll with the mouse wheel
 
-**Active-tab suppression:** On the currently active tab, any keypress or mouse scroll also resets the stuck timer directly. If you are actively reading or scrolling through output, the tab will not turn yellow or show any stuck indicator — the timer only starts when both the container and the user have been idle for 30 seconds. Background tabs are not affected by this; they use output time alone to determine stuck state.
+**Active-tab suppression:** On the currently active tab, any keypress or mouse scroll also resets the stuck timer directly. If you are actively reading or scrolling through output, the tab will not turn yellow or show any stuck indicator — the timer only starts when both the container and the user have been idle for the full timeout. Background tabs are not affected by this; they use output time alone to determine stuck state.
 
 For workflow tabs, awman goes further: the [workflow control board](05-workflows.md#workflow-control-board-tui-only) opens automatically so you can act without having to notice the yellow indicator. In yolo mode, background tabs show a live countdown directly in the tab bar instead of a dialog. See [Workflows](05-workflows.md) and [Permission modes](03-agent-sessions.md#permission-modes) for details.
 
@@ -772,8 +774,6 @@ For workflow tabs, awman goes further: the [workflow control board](05-workflows
 ## Reference: all keyboard shortcuts
 
 ### Global shortcuts (anywhere in TUI)
-
-While the current tab is running a workflow with a workflow context overlay, the bottom row shows its host directory alongside the CWD or worktree and the squad indicator. **Ctrl+Shift+C** copies the full directory path, even when the displayed path is shortened. The CWD/worktree and squad indicator take priority: the context widget uses only the remaining space and hides if its label, shortened path, and copy hint cannot fit. The copy shortcut remains available while the widget is hidden for lack of space. The widget and shortcut disappear when the workflow ends or you switch to a tab without an active workflow context overlay.
 
 | Key | Action |
 |-----|--------|
@@ -788,8 +788,10 @@ While the current tab is running a workflow with a workflow context overlay, the
 | **Ctrl+\\** | Detach from the container view, leaving every container running (see [Detaching](#detaching-from-a-container)) |
 | **Ctrl+S** | Switch focus to the next running container (only when [multiple parallel containers](#parallel-containers) are running; otherwise passed to the container's PTY) |
 | **Ctrl+W** | Open workflow control board (between steps or mid-step while running) |
-| **Ctrl+,** | Open / close the configuration dialog |
-| **Ctrl+C** | Quit awman (single tab) or close current tab (multiple tabs open) |
+| **Ctrl+,** | Open the configuration dialog |
+| **Ctrl+C** | Open the quit or close-tab confirmation, or the workflow-cancel confirmation while a workflow runs (forwarded to the agent while a container is maximized) |
+
+While the current tab is running a workflow with a [`context()` overlay](08-overlays.md), the bottom row shows that context's host directory after the CWD/worktree and the squad indicator, space permitting. **Ctrl+Shift+C** copies the full path even when the widget is shortened or hidden for lack of space.
 
 ### Command box
 
@@ -804,17 +806,19 @@ While the current tab is running a workflow with a workflow context overlay, the
 | **Backspace / Delete** | Delete characters |
 | **Ctrl+Backspace** | Delete the previous word |
 | **↑** | Focus the execution window (for scrolling) |
-| **q** | Quit awman (when command box is empty and tab is idle) |
+| **Ctrl+Y** | Copy the execution-window selection |
+| **q** | Open the quit confirmation (when the command box is empty and the tab is idle) |
 
 ### Execution window
 
 | Key | Action |
 |-----|--------|
 | **↑ / ↓** | Scroll output line by line |
-| **PageUp / PageDown** | Scroll output one full page |
+| **PageUp / PageDown** | Scroll output 20 lines |
 | **b** | Jump to beginning of output |
 | **e** | Jump to end (return to live view) |
 | **l** | Toggle status log between collapsed and expanded view |
+| **Ctrl+Y** | Copy the selected text |
 | **Esc** | Return focus to command box |
 | Mouse scroll | Scroll output at any time (focus not required) |
 
@@ -829,7 +833,8 @@ While the current tab is running a workflow with a workflow context overlay, the
 | **Ctrl+O** | Minimize / maximize the Workflow Overview (intercepted before the agent, like Ctrl+M) |
 | **Shift+← / Shift+→** | Scroll the Workflow Overview sideways instead of forwarding to the agent (only while it doesn't fit at full width) |
 | **Ctrl+\\** | Detach from the container view (intercepted before the agent — never reaches it) |
-| Mouse scroll | Scroll terminal scrollback history (5 lines per tick) |
+| **Ctrl+C** | Forwarded to the agent (interrupts it) |
+| Mouse scroll | Forwarded to the agent if it tracks the mouse; otherwise scrolls scrollback (5 lines per tick) |
 | Mouse drag | Select text in the terminal (highlighted with inverted colors) |
 | **Ctrl+Y** | Copy selected text to clipboard (ANSI codes stripped) |
 
@@ -841,13 +846,13 @@ While the current tab is running a workflow with a workflow context overlay, the
 | **←** | Cancel to previous step (rewind) |
 | **→** | Next step: advance in a new container |
 | **↓** | Next step: same container (reuse current container) |
-| **[d]** | Disable auto-advance for this step (toggle) |
+| **Enter** | Finish the workflow (offered after the last step) |
 | **r** | Retry a step that failed while its parallel group is still running (shown in red only when available) |
+| **p** | Pause the workflow (offered mid-step) |
+| **Ctrl+C** | Abort the workflow |
+| **Esc** | Mid-step: dismiss, leaving the step running. Between steps or after a failure: pause |
 
-While a parallel group is running, **↑**, **←** and **→** act on the whole group and are labelled accordingly: restart the group or one agent, go back (cancelling the group), or move on (cancelling the group). Each asks a follow-up question first. See [the control board with multiple agents running](05-workflows.md#the-workflow-control-board-with-multiple-agents-running).
-| **Enter** | Confirm selected action (lightweight step-confirm dialog) |
-| **Ctrl+W** | Escalate from lightweight dialog to full control board (while dialog is open) |
-| **Esc** | Dismiss without changing anything (mid-step: step keeps running) |
+An action that isn't available is greyed out with the reason, and its arrow does nothing. While a parallel group is running, **↑**, **←** and **→** act on the whole group and are labelled accordingly: restart the group or one agent, go back (cancelling the group), or move on (cancelling the group). Each asks a follow-up question first. See [the control board with multiple agents running](05-workflows.md#the-workflow-control-board-with-multiple-agents-running).
 
 ### Workflow Overview
 
@@ -870,17 +875,20 @@ While a parallel group is running, **↑**, **←** and **→** act on the whole
 | **Enter** (while editing) | Validate and write the value immediately to that scope's config file |
 | **Ctrl+N** | Add an `agentsToModels` mapping or a `guidance` entry |
 | **Esc** | Cancel edit without saving (edit mode) or close dialog (navigation mode) |
-| **Ctrl+,** | Close the dialog (same as Esc in navigation mode) |
 
 ### Dialogs
 
 | Context | Key | Action |
 |---------|-----|--------|
-| Quit confirmation | **y** | Confirm quit |
-| Quit confirmation | **n** or **Esc** | Cancel |
-| Close-tab dialog | **q** | Quit awman |
-| Close-tab dialog | **c** | Close current tab only |
-| Close-tab dialog | **n** or **Esc** | Cancel |
+| Quit confirmation | **Ctrl+C** | Confirm quit |
+| Quit confirmation | **Esc** | Cancel |
+| Close-tab dialog | **Ctrl+C** | Quit awman |
+| Close-tab dialog | **Ctrl+T** | Close current tab only |
+| Close-tab dialog | **Esc** | Cancel |
+| Cancel-workflow confirmation | **y** | Kill the running container and stop the workflow (resumable) |
+| Cancel-workflow confirmation | **n** or **Esc** | Keep running |
+| Yolo countdown | **Esc** | Cancel the auto-advance |
+| Yolo countdown | **Ctrl+W** | Open the full control board |
 | Lightweight step-confirm | **Enter** | Advance to next step |
 | Lightweight step-confirm | **Esc** | Pause workflow |
 | Lightweight step-confirm | **Ctrl+W** | Open full control board |

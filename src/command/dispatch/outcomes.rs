@@ -42,6 +42,8 @@ impl CommandOutcome {
             Self::ExecPrompt(outcome) => outcome.exit_code.unwrap_or(0),
             Self::SquadAttach(outcome) => outcome.exit_code,
             Self::Agents(outcome) => outcome.exit_code(),
+            // `remote exec --follow` reports the remote command's result.
+            Self::Remote(outcome) => outcome.exit_code(),
             // `ReadyOutcome::ready` is `ReadySummary::is_ready()` (WI 0125):
             // a failed required build/import stage must never exit 0, for
             // the CLI's process exit code and the API's command status alike.

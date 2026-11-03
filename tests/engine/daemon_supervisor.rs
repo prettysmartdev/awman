@@ -244,6 +244,7 @@ fn awman_named_test_process() -> Child {
             .args([
                 "--exact",
                 "daemon_supervisor::daemon_guard_helper_process_stays_alive",
+                "--ignored",
                 "--nocapture",
             ])
             .env("AWMAN_GUARD_HELPER", "1")
@@ -333,7 +334,10 @@ fn daemon_guard_check_rejects_live_api_when_checking_squad() {
     assert_guard_rejects_live_other(DaemonKind::Squad);
 }
 
+/// Not a test: the body the guard helper process runs. Ignored, so it runs
+/// only when the helper asks for it by name.
 #[test]
+#[ignore = "runs only as the body of the daemon-guard helper process"]
 fn daemon_guard_helper_process_stays_alive() {
     if std::env::var_os("AWMAN_GUARD_HELPER").is_some() {
         std::thread::sleep(Duration::from_secs(30));

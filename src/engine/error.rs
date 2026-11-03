@@ -258,6 +258,20 @@ pub enum EngineError {
     )]
     ToolRestrictionFlagMissing { restriction: ToolRestriction },
 
+    /// A `--yolo` launch would carry the configured `yoloDisallowedTools`
+    /// list, but this agent (or this runtime's delivery path for it) has no
+    /// way to enforce a disallowed-tools list. Refused like
+    /// [`Self::ToolRestrictionFlagMissing`], with the config key named so the
+    /// user knows where the list came from.
+    #[error(
+        "invalid configuration: yoloDisallowedTools ({}) is set, but agent '{agent}' has no way \
+         to enforce a disallowed-tools list here, so awman refuses to launch it with --yolo. \
+         Use an agent that supports it (claude), run without --yolo, or clear the list for this \
+         repository with `awman config set yoloDisallowedTools \"\"`.",
+        tools.join(", ")
+    )]
+    YoloDisallowedToolsUnsupported { agent: String, tools: Vec<String> },
+
     #[error("{source_kind} image source is not supported: {reason}")]
     UnsupportedImageSource {
         source_kind: ImageSourceKind,

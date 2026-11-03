@@ -110,6 +110,7 @@ pub(super) fn open(
             owner: uuid::Uuid::new_v4().to_string(),
             background_env: std::sync::Mutex::new(Default::default()),
             notices: std::sync::Mutex::new(upgraded.iter().map(|u| u.notice()).collect()),
+            cancel_grace: exec_bridge::DEFAULT_CANCEL_GRACE,
         }))
     }
     #[cfg(not(awman_builtin))]

@@ -76,7 +76,7 @@ impl Command for ExecWorkflowCommand {
             });
             return Err(err);
         }
-        let workflow = match Workflow::load(&workflow_path) {
+        let mut workflow = match Workflow::load(&workflow_path) {
             Ok(w) => w,
             Err(e) => {
                 let err = CommandError::Other(format!("loading workflow: {e}"));
@@ -447,6 +447,26 @@ impl Command for ExecWorkflowCommand {
             }
             all
         };
+
+        // 6. Every agent the steps launch needs its image. Ask about each
+        //    one that is missing (set up / fall back to the default agent /
+        //    abort) now, before any setup step or agent container starts.
+        //    Images are tagged by the invoking repo, not the worktree.
+        if let Err(e) = ensure_static_workflow_agent_images(
+            &mut workflow,
+            &self.engines,
+            &self.session,
+            &self.flags,
+            &mut frontend,
+        )
+        .await
+        {
+            frontend.write_message(UserMessage {
+                level: MessageLevel::Error,
+                text: format!("exec workflow: {e}"),
+            });
+            return Err(e);
+        }
 
         let prepared = PreparedRun {
             workflow,

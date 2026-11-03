@@ -9,20 +9,12 @@
 //! - E2E full flow (filesystem only, no Docker): completed workflow file is removed,
 //!   pending workflow preserved, exit 0
 
+use crate::git_init;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
 fn awman_bin() -> std::path::PathBuf {
     crate::awman_bin()
-}
-
-/// Initialise a minimal git repo at `path`.
-fn git_init(path: &Path) {
-    Command::new("git")
-        .args(["init", "--quiet"])
-        .current_dir(path)
-        .status()
-        .expect("git init");
 }
 
 /// A `PATH` value that shadows the OS keychain binaries with stubs that report

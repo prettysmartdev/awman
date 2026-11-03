@@ -545,6 +545,7 @@ mod tests {
             remote_addr: "localhost:9876".into(),
             status: None,
             exit_code: None,
+            followed: false,
         });
         assert!(s.contains("exec workflow"));
         assert!(s.contains("abc123"));

@@ -7,20 +7,11 @@
 //! - Setting a deprecated `AMUX_*` env var produces a deprecation warning on stderr.
 //! - `AWMAN_API_KEY` does NOT produce a spurious deprecation warning.
 
+use crate::make_git_repo;
 use std::process::{Command, Stdio};
 
 fn awman_bin() -> std::path::PathBuf {
     crate::awman_bin()
-}
-
-fn make_git_repo() -> tempfile::TempDir {
-    let repo = tempfile::tempdir().expect("TempDir::new");
-    Command::new("git")
-        .args(["init", "--quiet"])
-        .current_dir(repo.path())
-        .status()
-        .expect("git init");
-    repo
 }
 
 // ─── Binary name ─────────────────────────────────────────────────────────────
@@ -113,12 +104,9 @@ fn api_start_help_does_not_contain_headless_or_amux() {
 
 // ─── Deprecated AMUX_* env vars produce a deprecation warning ─────────────────
 
-/// Spawns the binary with a real subcommand and the given env var, kills it
-/// after a short window, then returns the stderr collected so far.
-///
-/// The deprecation warning is emitted early (before any Docker or git calls),
-/// so 1 second is ample even on slow machines. The binary itself may hang
-/// later (Docker unavailable) — we kill it before that becomes a problem.
+/// Runs the binary with a real subcommand and the given env var until it
+/// exits (killing it after a generous deadline should it ever block), then
+/// returns its stderr. The deprecation warning is emitted at startup.
 ///
 /// `HOME` and `AWMAN_CONFIG_HOME` are pointed at scratch directories so the
 /// child process cannot read or migrate the developer's real `~/.amux` or
@@ -150,9 +138,12 @@ fn stderr_from_brief_run(args: &[&str], env_key: &str, env_val: &str) -> String 
         .spawn()
         .unwrap_or_else(|e| panic!("spawn awman {args:?}: {e}"));
 
-    // Give the binary time to print the early-startup deprecation warning,
-    // then kill it before it blocks indefinitely on Docker/git checks.
-    std::thread::sleep(std::time::Duration::from_millis(1500));
+    // `config show` normally exits within milliseconds. Wait for it, but kill
+    // it after a generous deadline in case a regression makes it block.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while child.try_wait().expect("try_wait").is_none() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
     let _ = child.kill();
     let out = child.wait_with_output().expect("wait_with_output");
     String::from_utf8_lossy(&out.stderr).into_owned()

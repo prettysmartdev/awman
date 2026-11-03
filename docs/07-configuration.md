@@ -50,13 +50,12 @@ Created by `awman init`; commit it so the whole team shares the same setup.
 ```
 
 `worktree` controls the merge-back of an isolated workflow worktree. It can be
-set in repo config and global config; repo values take precedence. Command-line
-flags override both. With no configured value, the frontend's headless policy
+set in repo and global config; repo values take precedence and command-line
+flags override both. With no configured value, the frontend's own policy
 applies (for example, API workflows use `fail` for a dirty merge target and
-`keep` after a merge failure). These policies apply only at final merge-back.
-The API's existing preparation policy still automatically commits a checkout
-that is dirty before worktree creation; `fail` does not change that initial
-decision.
+`keep` after a merge failure). These settings apply only at final merge-back:
+an API run still commits a checkout that is dirty before the worktree is
+created, whatever `onDirtyMergeTarget` says.
 
 | JSON key | Type | Values / default | Meaning |
 |----------|------|------------------|---------|
@@ -101,8 +100,7 @@ Applies to every project on the machine unless a repo overrides it.
   "workers": 2,
   "api": {
     "workDirs": ["/home/user/my-project"],
-    "workDirRoots": ["/home/user/projects"],
-    "alwaysNonInteractive": false
+    "workDirRoots": ["/home/user/projects"]
   },
   "squad": {
     "agentsToModels": {
@@ -119,21 +117,20 @@ Applies to every project on the machine unless a repo overrides it.
     }
   },
   "remote": {
-    "defaultAddr": "http://build-server.example.com:9876",
-    "defaultAPIKey": "a3f8b2c1...",
-    "savedDirs": ["/home/user/my-project"]
+    "defaultAddr": "https://127.0.0.1:9876",
+    "defaultAPIKey": "a3f8b2c1..."
   }
 }
 ```
 
 ### A config file that doesn't parse
 
-A `config.json` that isn't valid JSON, or that fails schema validation, is no
-longer silently ignored in favor of defaults you didn't write. `awman api
-start` and `awman squad start` refuse to start against a malformed config,
-failing with `config parse error in <path>: <reason>` — naming the file and
-the offending key — instead of starting a daemon on settings you never set.
-Fix the file (or restore it from git, for the per-repo one) and try again.
+A `config.json` that isn't valid JSON, or that fails validation, is an error —
+awman never falls back to defaults you didn't write. `awman api start` and
+`awman squad start` refuse to start, failing with
+`config parse error in <path>: <reason>`, which names the file and the
+offending key. Fix the file (or restore the per-repo one from git) and try
+again.
 
 ## Workflow prerequisites
 
@@ -171,18 +168,30 @@ Repository config cannot grant access to host credentials. It can ask or deny, n
 
 Remembered SSH and token choices are stored as decisions in `~/.awman/prerequisite-grants.json`; the file does not contain credentials. A remembered choice applies only to its repository, remote, and credential type. Review or remove entries with `awman config prerequisite-grants list` and `awman config prerequisite-grants revoke <index|all>`.
 
-### Squad daemon configuration
+| Field (`workflows.prerequisites.` prefix) | Default | Scope |
+|---|---|---|
+| `preflight` | `warn` | Global or repo; repo cannot set `off` |
+| `unresolved` | Headless static workflows: `fail`; interactive, dynamic, squad: `warn` | Global or repo; repo may only set `fail` |
+| `gitIdentity.use`, `.name`, `.email` | `ask`, unset, unset | Global or repo; a fixed repo identity is non-secret |
+| `ssh.use`, `.key` | `ask`, unset | Global or repo; a repo key is only a suggestion and a repo cannot grant `allow` |
+| `githubToken.use`, `.envVars`, `.verify` | `ask`, `["GH_TOKEN","GITHUB_TOKEN"]`, `true` | Global or repo; repo may only narrow |
+| `githubToken.acquire` | unset | Edit the JSON (not settable with `config set`); a repo command requires exact-executable approval and cannot replace a global one |
+| `allowApiClientGrants` | `false` | Global only |
+
+The global `squad.workflows.prerequisites` block uses the same shape for
+daemon-wide defaults. A task's own decisions override only the credentials it
+explicitly chooses, and `--prerequisite-token acquire` keeps the trusted global
+acquisition command. A task-directory `config.json` cannot supply this policy.
+
+## Squad daemon configuration
 
 The optional `squad` block is global, so it belongs in
 `~/.awman/config.json` (or the relocated global config file). It controls the
 agents and models your squad may use and the guidance it passes to task
-evaluations:
-
-Task-specific workspace, interval, and overlay choices are configured with
-`awman squad add` rather than in this global block. See [Squad](12-squad.md)
-for the durable workspace, task-creation, and daemon details. The squad daemon
-and API server cannot run at the same time because they share the awman
-database; see [API server and squad daemon](09-api-and-remote-mode.md#api-server-and-squad-daemon).
+evaluations. Task-specific workspace, interval, and overlay choices are set
+with `awman squad add` instead; see [Squad](12-squad.md). The squad daemon and
+API server cannot run at the same time because they share the awman database;
+see [API server and squad daemon](09-api-and-remote-mode.md#api-server-and-squad-daemon).
 
 | Key | Type | Default | Meaning |
 |-----|------|---------|---------|
@@ -190,7 +199,7 @@ database; see [API server and squad daemon](09-api-and-remote-mode.md#api-server
 | `maxConcurrentEvaluations` | positive integer | `2` | Maximum number of task evaluations running at once |
 | `defaultLeader` | string (`agent::model`) | unset | Default agent and model for evaluations when a task does not specify them |
 | `guidance` | non-empty string array | unset | Instructions added to every task evaluation and generated workflow |
-| `envPersistence` | `"keychain"` \| `"none"` | `"keychain"` | Where the daemon persists the values it holds for `env()` overlays across an OS-initiated restart (launchd/systemd), so a task's variables don't have to be pushed again from a live shell after one. `"none"` opts out entirely — nothing is persisted anywhere, matching squad's behaviour before this setting existed. See [Squad: Task environment values](12-squad.md#task-environment-values) |
+| `envPersistence` | `"keychain"` \| `"none"` | `"keychain"` | Where the daemon persists the values it holds for `env()` overlays across an OS-initiated restart (launchd/systemd), so a task's variables don't have to be pushed again from a live shell after one. `"none"` opts out entirely: nothing is persisted anywhere. See [Squad: Task environment values](12-squad.md#task-environment-values) |
 
 All five keys are optional. Configuration is rejected when
 `maxConcurrentEvaluations` is zero; an `agentsToModels` entry has no models or
@@ -212,7 +221,7 @@ fallback and the reason as `persistence: unavailable(<reason>)`. An explicit
 `"none"` is never probed for and never produces that fallback message,
 because it's a deliberate choice rather than a degradation.
 
-#### Per-task squad settings
+### Per-task squad settings
 
 A squad task can carry its own copy of this block, in a `config.json` beside its
 durable workspace:
@@ -242,7 +251,7 @@ daemon's next scheduling tick, the same as edits to the global block. A task fil
 that does not parse fails that one task's next run with an error naming the file,
 rather than being silently ignored.
 
-> **Upgrading from an old config?** The `envPassthrough` field was removed. Express environment passthrough as `env(VAR)` entries in the `overlays` array instead — see [Overlays](08-overlays.md). The old object-style `overlays` block (`{"skills": …, "directories": …}`) is also gone; `overlays` is now a flat array of overlay specs and the old format produces a parse error.
+> **Upgrading from an old config?** The `envPassthrough` field was removed: a file that still has it loads with a warning and the field is ignored. Express environment passthrough as `env(VAR)` entries in the `overlays` array instead — see [Overlays](08-overlays.md). The old object-style `overlays` block (`{"skills": …, "directories": …}`) is also gone; `overlays` is a flat array of overlay specs and the old format is a config parse error.
 
 ---
 
@@ -488,7 +497,7 @@ The list applies to every launch of that agent, interactive and non-interactive 
 - **Repo replaces global, per agent.** In the example, the repo's `"claude": []` turns off a global `claude` entry for this repo; agents the repo doesn't list keep their global entries.
 - **For one run, use `--agent-flag`.** `awman chat --agent-flag=--search` replaces the configured list for the agent that command launches. See [`--agent-flag`](03-agent-sessions.md#--agent-flag-arg).
 - **Workflows:** every step gets the entry for the agent that step runs, including steps a dynamic workflow's leader generates, and the leader itself. Runs in a worktree (`--worktree`, `--yolo`, `--auto`, `--dynamic`) read `agentFlags` and the repo's default `agent` from the repository you launched from, so an edit you haven't committed still applies.
-- **Remote runs:** `remote exec prompt` and `remote exec workflow` accept `--agent-flag` but don't forward it; awman warns, and the remote host uses its own `agentFlags`.
+- **Remote runs:** `remote exec prompt` and `remote exec workflow` forward `--agent-flag` to the remote host. Without it, the remote host uses its own `agentFlags`.
 - **Docker Sandboxes runtime:** only agents with an argv channel (`kind: agent` kits) receive the flags; for the others awman prints a warning and launches without them.
 
 `agentFlags` is edited in the config file; it is not settable via `config set`.
@@ -546,7 +555,7 @@ The global `runtime` key selects how agent processes are isolated from your host
 | `docker` (default) | Linux, macOS, Windows | Standard Docker; ephemeral containers torn down when the session ends |
 | `apple-containers` | macOS 26+ only | Native `container` CLI; same user experience as Docker. On Linux/Windows this value is an error, not a silent fallback. `--allow-docker` is not supported under this runtime |
 | `docker-sbx-experimental` | macOS arm64, Windows x86_64 | Docker Sandboxes (persistent microVMs per session; hypervisor-grade isolation). Requires the `sbx` CLI and a Docker account. Linux is blocked by an upstream virtiofs bug. See [Runtimes](11-runtimes.md) |
-| `builtin-experimental` | macOS on Apple Silicon only (experimental) | MicroVM per session embedded in the awman binary; needs no Docker, `container`, or `sbx` to run agents. Included in the `awman-macos-arm64` release, which is ad-hoc signed (see [Gatekeeper and permissions](11-runtimes.md#the-macos-binary-gatekeeper-and-permissions)). Must be set explicitly in the global config. `awman ready` imports images from a configured source instead of building them. See [Runtimes](11-runtimes.md#builtin-microvm-experimental) |
+| `builtin-experimental` | macOS on Apple Silicon only (experimental) | MicroVM per session embedded in the awman binary; needs no Docker, `container`, or `sbx` to run agents. Included in the `awman-macos-arm64` release, which is ad-hoc signed (see [Gatekeeper and permissions](11-runtimes.md#the-macos-binary-gatekeeper-and-permissions)). Must be set explicitly in the global config. `awman ready` imports images from a configured source (and, with `builtin.builder.enabled`, can build them first in a local Docker or Apple Containers store). See [Runtimes](11-runtimes.md#builtin-microvm-experimental) |
 
 An unrecognized value (e.g. a typo) is a fatal error — awman never falls back to a different isolation model than the one you configured. CLI commands print the invalid value and the list of valid values, then exit; the TUI shows the same message in a startup modal (Enter quits). Fix the value in `$HOME/.awman/config.json` and relaunch.
 
@@ -610,7 +619,7 @@ To build with Apple Containers instead of Docker, use an `apple-local` source:
 
 Every source object, its fields, the registry settings, and the supported `apple-local` (Apple Containers) releases are described in [Runtimes: Image sources](11-runtimes.md#image-sources). There is no default image source: with none configured, `awman ready` explains how to provide one instead of guessing.
 
-`builtin.vcpus`, `builtin.memoryMib`, `builtin.rootDiskMib`, `builtin.mountQuotaMib`, and `builtin.stateDir` can be set with `awman config set`. The four object-valued keys appear read-only in `awman config show` and must be edited in the JSON file. A `builtin` block that fails validation (zero vCPUs or memory, a root disk under 256 MiB, a zero mount quota, an empty source field, a `tls` block on a non-`tcp://` Docker host, an unsupported Docker host scheme) is an error that names the offending key.
+`builtin.vcpus`, `builtin.memoryMib`, `builtin.rootDiskMib`, `builtin.mountQuotaMib`, `builtin.stateDir`, and `builtin.builder.enabled` can be set with `awman config set`. The four object-valued keys appear read-only in `awman config show` and must be edited in the JSON file. A `builtin` block that fails validation (zero vCPUs or memory, a root disk under 256 MiB, a zero mount quota, an empty source field, a `tls` block on a non-`tcp://` Docker host, an unsupported Docker host scheme) is an error that names the offending key.
 
 `builtin.network` layers global and repo config the same way: a repo block may only narrow what the global block allows (a stricter `mode`, a subset of the global `allow` list, a subset of the global `hostPorts`) — never widen it, since repo config ships with the checkout and may be untrusted. This effective policy applies to every builtin launch in that repo, including TUI, API, and squad sessions. `nameservers` and `trustHostCas` are read from the global config only. A block that widens the ceiling, mixes `allow`/`hostPorts` with an incompatible `mode`, or names an IP/CIDR/`localhost` in `allow` is a validation error naming the offending key.
 
@@ -631,7 +640,7 @@ awman keeps global config and data (workflows, skills, worktrees, API state) und
 - An XDG variable set to an empty string is treated as unset.
 - awman does **not** migrate existing data when you change these variables; move `~/.awman/` contents yourself if needed.
 - The shared SQLite database is `~/.awman/data/awman.db` at the default location. API logs, PID files, credentials, and session files remain under `~/.awman/api/`.
-- The API server's storage root can be moved independently with `AWMAN_API_ROOT`; this does not move the shared database.
+- The API server's storage root can be moved independently with `AWMAN_API_ROOT`, and the squad's with `AWMAN_SQUAD_ROOT`; neither moves the shared database.
 
 ---
 
@@ -645,7 +654,7 @@ awman keeps global config and data (workflows, skills, worktrees, API state) und
 | `launchMode` | `"stdio"` \| `"acp"` | `"stdio"` | Default agent launch mode for this repo | no (edit file) |
 | `auto_agent_auth_accepted` | bool | (unset) | Records that you accepted the agent auth consent prompt; managed by awman, shown read-only | no (managed) |
 | `terminal_scrollback_lines` | integer | 10000 | Scrollback lines in the container terminal | yes |
-| `yoloDisallowedTools` | string array | `[]` | Tools forbidden under `--yolo`; replaces the global list entirely | yes |
+| `yoloDisallowedTools` | string array | `[]` | Tools to forbid under `--yolo`; replaces the global list entirely (`[]` turns the global list off). A `--yolo` launch of an agent that cannot enforce it is refused; see [Disallowed tools](03-agent-sessions.md#disallowed-tools) | yes |
 | `workItems.dir` | string | `aspec/work-items` | Work items directory (relative to repo root or absolute) | yes, as `work_items.dir` |
 | `workItems.template` | string | `<workItems.dir>/0000-template.md` | Template for new work items | yes, as `work_items.template` |
 | `overlays` | string array | `[]` | Overlay specs (`dir(…)`, `env(…)`, `skill(…)`); merged with all other overlay sources | yes |
@@ -660,7 +669,7 @@ awman keeps global config and data (workflows, skills, worktrees, API state) und
 | `workflows.dynamic.maxConcurrentSteps` | integer | (unset → unlimited) | Advisory cap on concurrent workflow steps passed to the leader prompt | yes, as `workflows.dynamic.maxConcurrentSteps` |
 | `workflows.dynamic.defaultLeader` | string (`agent::model`) | (unset) | Default leader agent/model for `exec workflow --dynamic`; overridden by `--leader` | yes, as `workflows.dynamic.defaultLeader` |
 | `workflows.dynamic.guidance` | string array | (unset → no guidance block) | Global and repo instructions are combined in order, with duplicates dropped — see [Dynamic Workflows](06-dynamic-workflows.md#global-and-repo-settings) | yes, per entry as `workflows.dynamic.guidance.<index>` (empty value removes) |
-| `builtin` | object | (unset) | Repo overrides for the builtin runtime block, merged over the global one per field — see [Builtin runtime settings](#builtin-runtime-settings) | scalars only (`builtin.stateDir`, `builtin.vcpus`, `builtin.memoryMib`, `builtin.rootDiskMib`, `builtin.mountQuotaMib`) |
+| `builtin` | object | (unset) | Repo overrides for the builtin runtime block, merged over the global one per field — see [Builtin runtime settings](#builtin-runtime-settings) | scalars only (`builtin.stateDir`, `builtin.vcpus`, `builtin.memoryMib`, `builtin.rootDiskMib`, `builtin.mountQuotaMib`, `builtin.builder.enabled`) |
 | `auth` | `"keychain"` \| `"passthrough"` \| `"none"` | `"keychain"` | Credential injection mode — see [Control credential injection](#control-credential-injection-auth-mode) | no (edit file) |
 | `authRefresh` | object | (unset) | Live credential-refresh settings for Claude — see [Control credential refresh](#control-credential-refresh-authrefresh) | no (edit file) |
 | `agentFlags` | object (agent → string array) | (unset) | Extra arguments appended to that agent's command; each entry replaces the global entry for the same agent — see [Pass extra flags to an agent](#pass-extra-flags-to-an-agent) | no (edit file) |
@@ -672,8 +681,8 @@ awman keeps global config and data (workflows, skills, worktrees, API state) und
 | `default_agent` | string | (unset) | Agent used when no repo agent is configured | yes |
 | `terminal_scrollback_lines` | integer | 10000 | Default scrollback for all repos | yes |
 | `runtime` | string | `docker` | Container runtime: `docker`, `apple-containers`, `docker-sbx-experimental`, `builtin-experimental` (Apple Silicon only) | yes |
-| `builtin` | object | (unset) | Builtin microVM runtime settings; see [Builtin runtime settings](#builtin-runtime-settings) | scalars only (`builtin.stateDir`, `builtin.vcpus`, `builtin.memoryMib`, `builtin.rootDiskMib`, `builtin.mountQuotaMib`); edit the rest in the file |
-| `yoloDisallowedTools` | string array | `[]` | Machine-wide yolo tool denylist (unless a repo overrides it) | yes |
+| `builtin` | object | (unset) | Builtin microVM runtime settings; see [Builtin runtime settings](#builtin-runtime-settings) | scalars only (`builtin.stateDir`, `builtin.vcpus`, `builtin.memoryMib`, `builtin.rootDiskMib`, `builtin.mountQuotaMib`, `builtin.builder.enabled`); edit the rest in the file |
+| `yoloDisallowedTools` | string array | `[]` | Machine-wide yolo tool denylist (unless a repo overrides it); see [Disallowed tools](03-agent-sessions.md#disallowed-tools) | yes |
 | `overlays` | string array | `[]` | Overlay specs applied to every project; additive with other sources | yes |
 | `agentStuckTimeout` | integer (seconds) | 30 | Default agent-stuck timeout | yes |
 | `maxConcurrentAgents` | integer | (unset → unlimited) | Machine-wide default cap on concurrently-running workflow steps (unless a repo overrides it) — see [Parallel workflows](05-workflows.md#parallel-workflows) | yes |
@@ -684,10 +693,8 @@ awman keeps global config and data (workflows, skills, worktrees, API state) und
 | `worktree.mergeFix.promptTemplate` | string | (unset → built-in prompt) | Default merge-fix prompt template path relative to the Git root | yes |
 | `api.workDirs` | string array | `[]` | Directories pre-approved for API session creation; merged with `--workdirs` at server start | yes |
 | `api.workDirRoots` | string array | `[]` | Root directories; any git repository cloned directly beneath a root may be used as a local session workdir. Merged with `--workdir-root` at server start. See [Working directory allowlist](09-api-and-remote-mode.md#working-directory-allowlist) | yes |
-| `api.alwaysNonInteractive` | bool | `false` | Force non-interactive mode for all dispatched commands (useful on API servers with no TTY) | no (edit file) |
 | `remote.defaultAddr` | string | (unset) | Default remote awman API server address | yes |
 | `remote.defaultAPIKey` | string | (unset) | API key for the default remote server; only sent when the target address matches `remote.defaultAddr` | yes |
-| `remote.savedDirs` | string array | `[]` | Remote-host paths shown in the `remote session start` picker — see [Remote mode](09-api-and-remote-mode.md) | no (edit file) |
 | `squad` | object | (unset) | Global squad daemon settings; see [Squad daemon configuration](#squad-daemon-configuration) | no (edit file) |
 | `launchModeFallback` | `"stdio"` \| `"error"` | `"error"` | What to do when a requested ACP launch uses an agent without ACP support | no (edit file) |
 | `authRefresh` | object | (unset) | Machine-wide default live credential-refresh settings for Claude (unless a repo overrides a field) — see [Control credential refresh](#control-credential-refresh-authrefresh) | no (edit file) |
@@ -712,10 +719,10 @@ awman keeps global config and data (workflows, skills, worktrees, API state) und
 | Field name | Scope |
 |------------|-------|
 | `agent` | repo only |
-| `auto_agent_auth_accepted` | global only (read-only; managed by the auth flow) |
+| `auto_agent_auth_accepted` | read-only; managed by the auth flow |
 | `terminal_scrollback_lines` | repo or global |
 | `yoloDisallowedTools` | repo or global |
-| `workItems` | repo only |
+| `workItems` | repo only; shown read-only, set `work_items.dir` / `work_items.template` |
 | `overlays` | repo or global |
 | `agentStuckTimeout` | repo or global |
 | `maxConcurrentAgents` | repo or global |
@@ -725,6 +732,7 @@ awman keeps global config and data (workflows, skills, worktrees, API state) und
 | `builtin.memoryMib` | repo or global |
 | `builtin.rootDiskMib` | repo or global |
 | `builtin.mountQuotaMib` | repo or global |
+| `builtin.builder.enabled` | repo or global |
 | `builtin.imageSource`, `builtin.images`, `builtin.registries`, `builtin.network` | repo or global; shown read-only, edit the JSON |
 | `default_agent` | global only |
 | `remote.defaultAddr`, `remote.defaultAPIKey` | global only |
@@ -732,6 +740,8 @@ awman keeps global config and data (workflows, skills, worktrees, API state) und
 | `work_items.template` | repo only |
 | `api.workDirs` | global only |
 | `api.workDirRoots` | global only |
+| `worktree.onDirtyMergeTarget`, `worktree.mergeFix.onFailure`, `worktree.mergeFix.promptTemplate` | repo or global |
+| `workflows.prerequisites.*` | see [Workflow prerequisites](#workflow-prerequisites) |
 | `workflows.dynamic.defaultLeader` | repo or global |
 | `workflows.dynamic.maxConcurrentSteps` | repo or global |
 | `workflows.dynamic.agentsToModels` (and `.<agentName>`) | repo or global |
@@ -761,6 +771,7 @@ Value handling:
 | `XDG_CONFIG_HOME` | Global config goes to `$XDG_CONFIG_HOME/awman/` |
 | `XDG_DATA_HOME` | Global data (workflows, skills, worktrees, API state, and the shared database) goes to `$XDG_DATA_HOME/awman/` |
 | `AWMAN_API_ROOT` | Relocate only the API server storage root |
+| `AWMAN_SQUAD_ROOT` | Relocate only the squad storage root (task workspaces and squad state); defaults to `<data home>/squad` |
 | `AWMAN_BUILTIN_STATE_DIR` | Relocate the builtin runtime's private state directory; beats `builtin.stateDir` |
 | `MSB_PATH`, `MSB_LIBKRUNFW_PATH`, `MSB_AGENTD_PATH`, `MSB_HOME`, `MSB_BACKEND`, `MSB_CONFIG_PATH`, `MSB_PROFILE`, `MSB_CACHE_DIR`, `MSB_SANDBOXES_DIR`, `MSB_VOLUMES_DIR`, `MSB_SNAPSHOTS_DIR`, `MSB_LOGS_DIR`, `MSB_SECRETS_DIR` | Refused when set while starting the builtin runtime; unset the variable before launching builtin sessions |
 | `DOCKER_HOST`, `DOCKER_TLS_VERIFY`, `DOCKER_CERT_PATH` | Read only when importing a builtin image from a `docker-local` source that sets no `host` |
@@ -776,28 +787,10 @@ Value handling:
 | `AWMAN_API_VERBOSE_SETUP` | Demote the API server's per-session setup logging from `info` to `debug`; set to `0`, `false`, `no` or `off` (case-insensitive) to quiet it. Verbose is the default. |
 | `AWMAN_TEST_ISOLATION` | Set to `1` (or `true`, `yes`, `on`) to keep awman off your per-user OS resources: keychain reads, writes and deletes stay inside the awman process instead of reaching the macOS Keychain or Linux Secret Service; the TUI's copy actions go to an in-process buffer instead of the system clipboard; daemons start as plain background processes instead of through `launchd` or `systemd --user`; and downloads from the internet (the aspec template, agent Dockerfiles, GitHub issues and CI status) fail as if offline. Agent credentials stored in the keychain are not found, the squad daemon's `envPersistence` item lives only as long as the daemon, and a daemon started this way is not restarted at login. Intended for test runs; `make test` sets it. |
 | `AWMAN_TEST_DOCKER` / `AWMAN_TEST_APPLE_CONTAINER` / `AWMAN_TEST_SBX` | Only matter when `AWMAN_TEST_ISOLATION` is set, where `docker`, Apple's `container` and `sbx` are treated as not installed. Set one to `1` to let awman use that real CLI again. `make test-full` sets `AWMAN_TEST_DOCKER`. `AWMAN_TEST_BUILTIN` does the same for the builtin runtime, which is otherwise disabled under isolation; `make test-builtin` sets it. |
+| `AWMAN_TEST_YOLO_COUNTDOWN_MS` | Only matters when `AWMAN_TEST_ISOLATION` is set: shortens the 60-second yolo and failure-retry countdown to this many milliseconds so tests need not wait it out. Ignored in every normal run. |
 
 When the API or squad daemon is started as a background service (`systemd --user` on Linux, `launchd` on macOS), the launching process forwards a small, non-secret allowlist of variables into that service's environment, so the daemon resolves the same config and storage root as the process that started it: `PATH`, `HOME`, `RUST_LOG`, `AWMAN_CONFIG_HOME`, `AWMAN_API_ROOT`, `AWMAN_SQUAD_ROOT`, `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `AWMAN_OVERLAYS`, `AWMAN_MAX_CONCURRENT_AGENTS` and `AWMAN_LAUNCH_MODE`. Bearer keys (`AWMAN_API_KEY`, `AWMAN_SQUAD_KEY`) are never forwarded this way — the daemon authenticates against the key hash it reads from its storage root instead.
 
 ---
 
 [← Dynamic Workflows](06-dynamic-workflows.md) · [Next: Overlays →](08-overlays.md)
-
-### Workflow prerequisite field reference
-
-| Field (`workflows.prerequisites.` prefix) | Default | `config set` scope |
-|---|---|---|
-| `preflight` | `warn` | Global or repo; repo cannot set `off` |
-| `unresolved` | Headless static: `fail`; interactive, dynamic, squad: `warn` | Global or repo; repo may only set `fail` |
-| `gitIdentity.use`, `.name`, `.email` | `ask`, unset, unset | Global or repo; a fixed repo identity is non-secret |
-| `ssh.use`, `.key` | `ask`, unset | Global or repo; repo key is a suggestion and repo cannot grant `allow` |
-| `githubToken.use`, `.envVars`, `.verify` | `ask`, `["GH_TOKEN","GITHUB_TOKEN"]`, `true` | Global or repo; repo may only narrow |
-| `githubToken.acquire` | unset | GlobalOnly in `config set`; repo JSON commands require exact-executable approval and cannot replace a global command |
-| `allowApiClientGrants` | `false` | GlobalOnly |
-
-Global `squad.workflows.prerequisites` uses the same shape for daemon-wide
-defaults. Sparse task decisions override only the credentials explicitly chosen;
-`--prerequisite-token acquire` retains the trusted global acquisition command.
-Task-directory `config.json` cannot supply this trusted workflow policy.
-Remembered decisions use atomic per-key updates under a private cross-process
-lock. Revocation cannot be undone by a stale writer remembering another key.

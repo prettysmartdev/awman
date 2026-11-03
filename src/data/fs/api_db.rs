@@ -292,8 +292,11 @@ pub struct CommandResult {
     /// Kept, deprecated: use `failure.code`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_status: Option<u16>,
-    /// Kept, deprecated: equals `failure.stage`. Before 0137 it was set for
-    /// `"push"` and `"workflow_prerequisites"` only.
+    /// Kept, deprecated: use `failure.stage`. Filled exactly as before WI
+    /// 0137 (additive versioning): `"workflow_prerequisites"` for an
+    /// unresolved prerequisite, `"push"` for a push-back failure, `"setup"`
+    /// for a `/v1/runs` setup failure, and absent otherwise (and on cancel).
+    /// Where it is present it equals `failure.stage`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stage: Option<String>,
     /// Kept, deprecated: a `/v1/runs` setup failure's own `{stage, message}`

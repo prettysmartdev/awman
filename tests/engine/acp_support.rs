@@ -84,10 +84,7 @@ exit 0
     }
 
     fn command(&self, repo: &Path, args: &[&str]) -> Output {
-        let old_path = std::env::var_os("PATH").unwrap_or_default();
-        let mut paths = vec![self.bin_dir.path().to_path_buf()];
-        paths.extend(std::env::split_paths(&old_path));
-        let path = std::env::join_paths(paths).unwrap();
+        let path = crate::process_env::ProcessEnvGuard::child_path_with_first(self.bin_dir.path());
         Command::new(awman_bin())
             .current_dir(repo)
             .args(args)

@@ -13,9 +13,11 @@
 //!   uses, from the shared `WorkflowState::stages`;
 //! - on each `steps[i]`: `index`, `stage`, snake_case `status`
 //!   (`StepStatusKind`, the enum `workflow_step_transition` uses),
-//!   `exit_code` and `error` when failed, `container` while running;
+//!   `exit_code` and `error` when failed, `container` (the runtime container
+//!   name, as in `source.container`, kept once the step finishes) and
+//!   `container_id` while running;
 //!   `step_attempt` once the step has been launched (from the state's
-//!   additive `step_attempts`);
+//!   additive `step_attempts`; `container` from `step_containers`);
 //! - `phase`: `current_phase` in snake_case;
 //! - a snake_case `state` beside the legacy `status` on every
 //!   `setup_step_states` / `teardown_step_states` entry.
@@ -96,6 +98,15 @@ pub fn client_view(state: Value) -> Value {
             let step_state = parsed.step_states.get(&info.name);
             let kind = step_state.map_or(StepStatusKind::Pending, step_status_kind);
             obj.insert("status".into(), json!(kind));
+            // `container` is the runtime container *name*, the value events
+            // carry in `source.container`, so a client can correlate the two.
+            // It stays after the step finishes; a step reset to pending for a
+            // rerun has no current container.
+            if kind != StepStatusKind::Pending {
+                if let Some(name) = parsed.step_container(&info.name) {
+                    obj.insert("container".into(), json!(name));
+                }
+            }
             match step_state {
                 Some(StepState::Failed {
                     exit_code,
@@ -107,9 +118,9 @@ pub fn client_view(state: Value) -> Value {
                     }
                 }
                 Some(StepState::Running {
-                    container_id: Some(container),
+                    container_id: Some(id),
                 }) => {
-                    obj.insert("container".into(), json!(container));
+                    obj.insert("container_id".into(), json!(id));
                 }
                 _ => {}
             }
@@ -197,7 +208,7 @@ mod tests {
     }
 
     #[test]
-    fn running_step_exposes_container() {
+    fn running_step_exposes_container_name_and_id() {
         let (mut state, _) = state_value(&[step("a", &[])]);
         state.step_states.insert(
             "a".into(),
@@ -205,9 +216,40 @@ mod tests {
                 container_id: Some("c1".into()),
             },
         );
+        state.record_step_container("a", "awman-a-1");
         let view = client_view(serde_json::to_value(&state).unwrap());
         assert_eq!(view["steps"][0]["status"], "running");
-        assert_eq!(view["steps"][0]["container"], "c1");
+        // `container` is the name events carry in `source.container`.
+        assert_eq!(view["steps"][0]["container"], "awman-a-1");
+        assert_eq!(view["steps"][0]["container_id"], "c1");
+    }
+
+    #[test]
+    fn finished_step_keeps_container_name() {
+        let (mut state, _) = state_value(&[step("a", &[]), step("b", &[])]);
+        state.record_step_container("a", "awman-a-1");
+        state.record_step_container("b", "awman-b-1");
+        state.step_states.insert("a".into(), StepState::Succeeded);
+        state.step_states.insert(
+            "b".into(),
+            StepState::Failed {
+                exit_code: 2,
+                error_message: None,
+            },
+        );
+        let view = client_view(serde_json::to_value(&state).unwrap());
+        assert_eq!(view["steps"][0]["container"], "awman-a-1");
+        assert_eq!(view["steps"][1]["container"], "awman-b-1");
+        assert!(view["steps"][0].get("container_id").is_none());
+    }
+
+    #[test]
+    fn pending_rerun_step_has_no_container() {
+        let (mut state, _) = state_value(&[step("a", &[])]);
+        state.record_step_container("a", "awman-a-1");
+        state.step_states.insert("a".into(), StepState::Pending);
+        let view = client_view(serde_json::to_value(&state).unwrap());
+        assert!(view["steps"][0].get("container").is_none());
     }
 
     #[test]

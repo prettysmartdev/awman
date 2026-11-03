@@ -112,7 +112,7 @@ Key components:
   (`src/command/dispatch/engines.rs`) assemble session and daemon engine
   bundles. `HeadlessDefaults` (`src/command/headless.rs`) supplies named
   answer profiles for unattended API, squad, and CLI command paths.
-- `CommandCatalogue` (`src/command/dispatch/catalogue.rs`) is the source for
+- `CommandCatalogue` (`src/command/dispatch/catalogue/`) is the source for
   command and flag metadata and frontend projections. Its catalogue-driven
   build table (`src/command/dispatch/build.rs`) maps runnable leaves to
   per-command constructors; it does not contain command behavior.

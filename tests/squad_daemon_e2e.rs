@@ -34,6 +34,10 @@ use awman::engine::squad::{EvaluationOutcome, EvaluationRequest, TaskEvaluator};
 use serde_json::Value;
 use tokio::sync::Mutex;
 
+#[path = "helpers/in_process_daemon.rs"]
+mod in_process_daemon;
+use in_process_daemon::{EnvOverride, InProcessDaemon};
+
 static ENV_LOCK: Mutex<()> = Mutex::const_new(());
 
 struct NeverTriggeredEvaluator;
@@ -124,7 +128,10 @@ async fn curl_command(base: &str, subcommand: &str, args: &[&str]) -> (u16, Valu
     .await
 }
 
-async fn start_daemon(root: &std::path::Path) -> (tokio::task::JoinHandle<()>, String) {
+/// Start the daemon in-process. The returned [`InProcessDaemon`] keeps
+/// `AWMAN_CONFIG_HOME` pointed at `root` until it is aborted (or dropped by a
+/// panicking test), then restores it.
+async fn start_daemon(root: &std::path::Path) -> (InProcessDaemon, String) {
     let api_paths = ApiPaths::from_root(root);
     let auth_paths = AuthPathResolver::at_home(root);
     let overlay_engine = Arc::new(OverlayEngine::with_auth_resolver(auth_paths.clone()));
@@ -156,8 +163,7 @@ async fn start_daemon(root: &std::path::Path) -> (tokio::task::JoinHandle<()>, S
     std::fs::create_dir_all(root).unwrap();
     std::env::set_var("AWMAN_TEST_ISOLATION", "1");
 
-    let previous = std::env::var("AWMAN_CONFIG_HOME").ok();
-    std::env::set_var("AWMAN_CONFIG_HOME", root);
+    let env = EnvOverride::set(&[("AWMAN_CONFIG_HOME", root.as_os_str())]);
 
     // WI 0113 F-02: Layer 2 bootstraps the daemon, Layer 3 serves it. This is
     // the same seam `serve_with` was, split across the layer boundary.
@@ -186,13 +192,8 @@ async fn start_daemon(root: &std::path::Path) -> (tokio::task::JoinHandle<()>, S
         waited += Duration::from_millis(50);
     };
 
-    match previous {
-        Some(v) => std::env::set_var("AWMAN_CONFIG_HOME", v),
-        None => std::env::remove_var("AWMAN_CONFIG_HOME"),
-    }
-
     (
-        handle,
+        InProcessDaemon::new(handle, env),
         format!("{}://{}:{}", meta.scheme, meta.bind_ip, meta.port),
     )
 }

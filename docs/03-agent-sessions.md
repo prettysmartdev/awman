@@ -1,10 +1,9 @@
 # Agent Sessions
 
-An agent session is a Docker container running your configured AI agent (Claude Code, Codex, OpenCode, Gemini, Antigravity, GitHub Copilot CLI, Cline, or any [custom agent](15-custom-agents.md) you define) against your project. awman handles starting the container, injecting your credentials, and connecting your terminal to the agent's input/output.
+An agent session is a container (on whichever [runtime](11-runtimes.md) you use) running your configured AI agent (Claude Code, Codex, OpenCode, Gemini, Antigravity, GitHub Copilot CLI, Cline, or any [custom agent](15-custom-agents.md) you define) against your project. awman handles starting the container, injecting your credentials, and connecting your terminal to the agent's input/output.
 
-There are two session types: **freeform chat** and **work item implementation**.
-Either type normally uses the standard stdio launch mode. You can also use
-[ACP mode](03-agent-sessions.md#acp-launch-mode) when you want awman to render structured agent
+Sessions normally use the standard stdio launch mode. You can also use
+[ACP mode](#acp-launch-mode) when you want awman to render structured agent
 activity instead of the agent's raw terminal stream. ACP is currently
 supported only by **Cline**.
 
@@ -190,7 +189,7 @@ This overrides the `agent` field in your repo config for this run only — no co
 
 If the agent image does not yet exist, awman offers to download the template and build both the project base image (if needed) and the agent image before launching.
 
-Interactive Codex sessions run as `codex --no-daemon`: recent Codex releases otherwise try to start a background server that the container doesn't have, and exit with `daemon executable not found`. If an older Codex image rejects the flag, rebuild it with `awman ready --build --no-cache` (without `--no-cache`, Docker reuses the cached layer holding the old Codex). Non-interactive runs (`codex exec`) don't get the flag, because they reject it.
+Interactive Codex sessions run as `codex --no-daemon`: recent Codex releases otherwise try to start a background server that the container doesn't have, and exit with `daemon executable not found`. If an older Codex image rejects the flag, rebuild it with `awman ready --build --no-cache` (without `--no-cache`, Docker reuses the cached layer holding the old Codex). Non-interactive runs (`codex exec`) don't get the flag, because they reject it. An `agentFlags` entry for `--no-daemon` is redundant: awman drops it from interactive launches and warns that non-interactive runs may reject it.
 
 Passing an unknown agent name exits immediately with a list of valid options:
 
@@ -231,7 +230,7 @@ Per-agent translation and expected `<NAME>` format:
 
 For agents that support multiple providers (`opencode`, for example), the `provider/model` slash form lets you target a specific provider when more than one is configured. awman passes the value through verbatim — the agent does the routing.
 
-If an agent does not support `--model`, the behaviour varies. For Antigravity, the command exits with an error; configure the model via `~/.gemini/antigravity-cli/settings.json` or the `/model` slash command inside the agent session instead. GitHub Copilot CLI selects models via the `/model` interactive slash command rather than a CLI flag, so `--model` is silently dropped for copilot sessions.
+An agent with no model flag (Antigravity, or a custom agent whose definition declares none) refuses `--model` with `agent '<name>' does not support a model flag`. For Antigravity, configure the model in `~/.gemini/antigravity-cli/settings.json` or with the `/model` slash command inside the session instead.
 
 `--model` can be combined freely with `--agent`, `--yolo`, `--auto`, and all other flags. When used with `exec workflow`, the flag value acts as the default model for every workflow step that does not define its own `model` field. See [Per-step model overrides](05-workflows.md#per-step-model-overrides).
 
@@ -239,7 +238,7 @@ Under the `docker-sbx-experimental` runtime, the flag is delivered through the s
 
 ### `--non-interactive` / `-n`
 
-Run the agent in print/batch mode — no interactivity required. The agent executes, produces output, and exits. `-n` is a short alias for `--non-interactive` and works on all commands that support the flag (`chat`, `exec prompt`, `exec workflow`, `ready`, `specs amend`).
+Run the agent in print/batch mode — no interactivity required. The agent executes, produces output, and exits. `-n` is a short alias for `--non-interactive` and works on every command that has the flag (`chat`, `exec prompt`, `exec workflow`, `ready`, `specs amend`, `new spec`, `new skill`). It also makes awman's own prompts take their non-interactive answer instead of asking, even on a terminal; `--json` implies it.
 
 | Agent | Flag used |
 |-------|-----------|
@@ -278,7 +277,7 @@ See [Security & Isolation](04-security-and-isolation.md#overlay-mounts) for secu
 
 ### `--agent-flag <ARG>`
 
-Append an extra argument to the agent's command for this run. Repeat it for multiple arguments; they are appended in order, after awman's own flags and before the initial prompt. Available on `chat`, `exec prompt`, and `exec workflow`. `remote exec` accepts it but does not forward it to the remote host, and warns.
+Append an extra argument to the agent's command for this run. Repeat it for multiple arguments; they are appended in order, after awman's own flags and before the initial prompt. Available on `chat`, `exec prompt`, and `exec workflow`. `remote exec` forwards it to the remote host, where it replaces that host's `agentFlags` entry for the run.
 
 Because the value usually starts with `-`, write it in the `--agent-flag=<value>` form:
 
@@ -310,9 +309,9 @@ Every agent-launching command (`chat`, `exec prompt`, `exec workflow`, and their
 | **Auto** | `--auto` | Auto-approves file edits and writes; still prompts before shell commands and other high-risk operations |
 | **Yolo** | `--yolo` | Skips every permission prompt and never pauses for confirmation |
 
-When both `--yolo` and `--auto` are passed, `--yolo` wins.
+When both `--yolo` and `--auto` are passed, `--yolo` wins. `--plan` and `--yolo` together are refused (`plan and yolo modes are mutually exclusive`).
 
-Not every agent implements every level. Where an agent has no equivalent, awman simply omits the flag — the session still launches, but at the agent's own default permission level rather than the one you asked for. **Under the container runtimes this is silent**, so check the table for your agent before relying on a mode. (Under `docker-sbx-experimental` the unsupported combinations are warned about at launch — see [Runtimes](11-runtimes.md#known-limitations).)
+Not every agent implements every level. `--plan` on an agent with no plan mode is refused before launch, so a read-only request never runs with write access. For `--auto` and `--yolo`, awman simply omits the flag where an agent has no equivalent — the session still launches, but at the agent's own default permission level rather than the one you asked for. **Under the container runtimes this is silent**, so check the tables below before relying on a mode. (Under `docker-sbx-experimental` the unsupported combinations are warned about at launch — see [Runtimes](11-runtimes.md#known-limitations).)
 
 ### `--plan`
 
@@ -322,9 +321,9 @@ Run the agent in read-only mode — it can analyse the codebase and suggest chan
 |-------|-----------|
 | `claude` | `--permission-mode plan` |
 | `codex` | `--approval-mode plan` |
-| `opencode` | *(no equivalent — flag omitted)* |
+| `opencode` | *(not supported — refused)* |
 | `gemini` | `--approval-mode=plan` |
-| `antigravity` | *(no equivalent — flag omitted)* |
+| `antigravity` | *(not supported — refused)* |
 | `copilot` | `--plan` |
 | `cline` | `--plan` (on the `task` subcommand) |
 
@@ -344,7 +343,7 @@ Enable intermediate autonomous operation — the agent auto-approves file edits 
 | `copilot` | *(no equivalent — flag omitted)* |
 | `cline` | `--auto-approve-all` (auto-approves actions while keeping interactive mode) |
 
-`--auto` applies `yoloDisallowedTools` the same way `--yolo` does. Combined with `exec workflow` it implies `--worktree`, but it does **not** auto-advance stuck steps — that countdown is `--yolo`-only.
+Combined with `exec workflow`, `--auto` implies `--worktree`, but it does **not** auto-advance stuck steps — that countdown is `--yolo`-only.
 
 ### `--yolo`
 
@@ -357,7 +356,7 @@ awman chat --yolo
 
 Yolo mode is a good fit when you have a well-specified work item you trust the agent to implement, when you want a multi-step workflow to run end-to-end without manual advancement, or when you have already reviewed the approach in a `--plan` session. It is a poor fit for work that will hit decisions genuinely needing your input, for open-ended `chat` sessions, and for anything difficult to undo.
 
-`--yolo` does four things:
+`--yolo` does three things:
 
 **1. Skips all agent permission prompts.** The agent-specific flag is appended to the container entrypoint before launch:
 
@@ -371,21 +370,19 @@ Yolo mode is a good fit when you have a well-specified work item you trust the a
 | `copilot` | `--autopilot` (copilot's only CLI autonomous mode) |
 | `cline` | `--yolo` (on the `task` subcommand) |
 
-**2. Applies `yoloDisallowedTools`** — see [Disallowed tools](#disallowed-tools) below. Only Claude implements a deny list (`--disallowedTools tool1,tool2,…`); for every other agent the setting is omitted, so a yolo session with those agents runs unrestricted.
-
-**3. Implies `--worktree` for workflow execution.** Running a workflow with `--yolo` automatically creates an isolated Git worktree, and prints:
+**2. Implies `--worktree` for workflow execution.** Running a workflow with `--yolo` automatically creates an isolated Git worktree, and prints:
 
 ```
---yolo with workflow execution implies --worktree. Running in isolated worktree.
+--yolo implies --worktree. Running in isolated worktree.
 ```
 
-Passing `--worktree` as well is silently accepted — no duplicate worktree is created. With other commands (`chat`, `exec prompt`) `--worktree` is **not** implied; pass it explicitly if you want isolation.
+Passing `--worktree` as well is accepted — no duplicate worktree is created. `--worktree` exists only on `exec workflow`; `chat` and `exec prompt` always run in the current checkout.
 
-**4. Auto-advances stuck workflow steps.** When a step goes silent, a countdown advances the workflow for you. See [Auto-advance when stuck](05-workflows.md#auto-advance-when-stuck-yolo-mode) in the workflow guide for the countdown, how it appears in each frontend, and how to cancel it.
+**3. Auto-advances stuck workflow steps.** When a step goes silent, a countdown advances the workflow for you. See [Auto-advance when stuck](05-workflows.md#auto-advance-when-stuck-yolo-mode) in the workflow guide for the countdown, how it appears in each frontend, and how to cancel it.
 
 ### Disallowed tools
 
-Add `yoloDisallowedTools` to your per-repo or global config to restrict which tools the agent may use even under full autonomy:
+`yoloDisallowedTools` lists tools the agent may not use while `--yolo` is on. Set it in per-repo or global config (a repo list replaces the global one; lists are not merged):
 
 ```json
 {
@@ -393,9 +390,20 @@ Add `yoloDisallowedTools` to your per-repo or global config to restrict which to
 }
 ```
 
-This is your safety net for operations you never want the agent to perform autonomously, regardless of how well-specified the task is. `"Bash"` prevents arbitrary shell command execution; `"computer"` prevents GUI automation.
+Every `--yolo` launch — `chat`, `exec prompt`, each `exec workflow` step, and API commands, which default to `--yolo` — passes the list to the agent. Without `--yolo` the list is ignored.
 
-**Config precedence:** per-repo config replaces global config entirely (lists are not merged). To inherit the global list for a repo, omit the field from the repo config. See [Configuration](07-configuration.md).
+| Agent | How the list is applied |
+|-------|-------------------------|
+| `claude` | `--disallowedTools Bash,computer` (under Docker Sandboxes, its sandbox settings) |
+| every other agent | No disallowed-tools mechanism: the `--yolo` launch is refused |
+
+A tool restriction is never dropped silently. When the agent cannot enforce the list, awman refuses to start it:
+
+```
+invalid configuration: yoloDisallowedTools (Bash, computer) is set, but agent 'codex' has no way to enforce a disallowed-tools list here, so awman refuses to launch it with --yolo. ...
+```
+
+To run such an agent with `--yolo` in one repo, clear the list there with `awman config set yoloDisallowedTools ""` (an empty repo list replaces the global one), or run without `--yolo`. A custom agent applies the list when its definition declares a disallowed-tools flag.
 
 ### Yolo through the HTTP API
 
@@ -404,7 +412,6 @@ Commands submitted through the API (`POST /v1/commands`) run with `--yolo` appli
 ### Security considerations
 
 - `--yolo` removes the human checkpoints that catch unintended agent actions. Only use it with agents and work items you trust.
-- `yoloDisallowedTools` is a floor the agent can never cross — but only Claude enforces it. A launch that carries an allowed- or disallowed-tools list for an agent with no flag for it is refused on Docker, Apple Containers, the builtin runtime and Docker Sandboxes alike, with `invalid configuration: this agent declares no <allowed|disallowed>-tools flag, so its <allowed|disallowed>-tools list cannot be applied; awman refuses to launch it without the restriction. Remove the <allowed|disallowed>-tools list or use an agent that supports it.`, rather than starting the agent unrestricted.
 - `exec workflow --yolo` is the recommended autonomous pattern: isolated branch, structured phases, auto-advancing, easy to discard if the output isn't right.
 - Gemini's `--yolo` skips all tool confirmations including shell commands; `--auto` (`--approval-mode=auto_edit`) is the more conservative choice.
 - Copilot supports `--yolo` only — `--auto` has no equivalent and is dropped.
@@ -471,7 +478,7 @@ After implementing a work item, the actual implementation sometimes differs from
 
 ## Creating skills
 
-Claude Code skills are reusable instruction files (YAML frontmatter + Markdown) that teach an agent how to perform a specific task when invoked with `/skill-name`. Use `awman new skill` to create one interactively without copying and editing an existing file by hand.
+Skills are reusable instruction files that teach an agent how to perform a specific task when invoked with `/skill-name`. `awman new skill` scaffolds one:
 
 ```sh
 # CLI
@@ -481,30 +488,22 @@ awman new skill
 new skill
 ```
 
-Both modes prompt for:
+awman asks for:
 
-1. **Skill name** — a kebab-case slug used as the filename and as the slash-command trigger (e.g. `run-tests`). Must contain only letters, digits, hyphens, and underscores.
-2. **Description** — a one-line summary shown in the skill picker and in `/help` output.
-3. **Body** — the skill's instruction text. Enter multiple lines and end with a line containing only `.`.
+1. **Skill name** — used as the directory name and slash-command trigger (e.g. `run-tests`). Use a short kebab-case slug.
+2. **Body** — the skill's instruction text. The CLI reads a single line; the TUI opens a multi-line editor (**Enter** starts a new line, **Ctrl+Enter** or **Ctrl+S** submits, **Esc** cancels).
 
-The resulting file is written to `.claude/skills/<name>/SKILL.md` inside the current repo.
+The file is written to `.claude/skills/<name>/SKILL.md` in the current repo, headed `# Skill: <name>` and followed by your body. An empty body leaves a skeleton with `Description` and `Body` headings to fill in. An existing `SKILL.md` at that path is overwritten.
 
-### Skill file format
+Write the body in second-person imperative ("Run …", "Check …", "If … then …"):
 
 ```markdown
----
-name: run-tests
-description: Run the full test suite and report failures
----
-
-# Run Tests
+# Skill: run-tests
 
 Run `make test` and wait for output.
 If tests fail, show the failing test names and exit codes.
 If all tests pass, confirm success and stop.
 ```
-
-The `name` field is the skill's slug; the `description` is a single sentence; the body is free-form Markdown written in second-person imperative ("Run …", "Check …", "If … then …").
 
 ### Interview mode
 
@@ -512,19 +511,9 @@ The `name` field is the skill's slug; the `description` is a single sentence; th
 awman new skill --interview
 ```
 
-Describe what the skill should do. A code agent writes the complete skill body for you, following the second-person imperative style and adding any necessary commands, code examples, or decision trees.
+Instead of a body, describe what the skill should do; a code agent writes the skill for you, adding any commands, code examples, or decision trees it needs. The summary is multi-line: in the TUI, **Ctrl+Enter** submits; on the CLI, end it with a blank line or **Ctrl-D**.
 
-The summary is free-form and multi-line in both modes: in the TUI the Body field is replaced by a multi-line Summary editor (**Enter** starts a new line, **Ctrl-Enter** submits and starts the interview agent); on the CLI, type as many lines as you like and end with a blank line or **Ctrl-D**.
-
-The interview agent runs in a container with the new skill's own directory mounted at `/awman/skill`, and is told to edit `/awman/skill/SKILL.md` and nothing else. That mount is what makes `--interview` work together with `--global`: a global skill lives in `~/.awman/skills/`, outside the repo the container sees at `/workspace`, so without it the agent would have no path to the file it was asked to write.
-
-**TUI key bindings** (skill dialog):
-
-| Key | Action |
-|-----|--------|
-| **Tab** / **Shift-Tab** | Cycle through fields |
-| **Ctrl-Enter** | Finish — write the file (or start the interview agent) and close |
-| **Esc** | Cancel without writing |
+The interview agent runs in a container with the new skill's own directory mounted at `/awman/skill`, and is told to edit `/awman/skill/SKILL.md` and nothing else. That is what lets `--interview` work with `--global`, whose skills live outside the repo the container sees at `/workspace`. Interview mode is not available under the `docker-sbx-experimental` runtime.
 
 ### Global skills
 
@@ -533,6 +522,20 @@ awman new skill --global
 ```
 
 Writes to `~/.awman/skills/<name>/SKILL.md` instead of the current repo. Use this to maintain a personal library of skills that travel with you across projects.
+
+`--global` and `--interview` can be combined: the agent's extra mount is only `~/.awman/skills/<name>/`, never your home directory. This still has to be run inside a Git repository, whose agent image the interview uses.
+
+Global skills reach agent containers through the `skill()` overlay — `skill(*)` for all of them, `skill(<name>)` for one — in config or on the command line:
+
+```json
+{ "overlays": ["skill(*)"] }
+```
+
+```sh
+awman exec workflow path/to/workflow.toml --overlay "skill(*)"
+```
+
+Once mounted, they appear as slash commands. See [Overlays](08-overlays.md).
 
 ### Pulled skill libraries
 
@@ -583,42 +586,18 @@ awman only ever refreshes directories it created under `~/.awman/skills/.library
 
 In each case, remove the named directory yourself if you want to replace it.
 
-To make global skills available inside agent containers, enable the skills overlay via config:
-
-```json
-{ "overlays": ["skill(*)"] }
-```
-
-Or pass it at the command line:
-
-```sh
-awman exec workflow path/to/workflow.toml --overlay "skill(*)"
-```
-
-Once enabled, your global skills appear as slash commands. See [Overlays](08-overlays.md) for details.
-
-`--global` and `--interview` can be combined. When combined, the agent is given access only to the `~/.awman/skills/<name>/` directory — not the whole repo or home directory. This still requires being inside a git repository (for agent image lookup).
+Mount a pulled library with `skill(<library>)`, or one skill from it with `skill(<library>/<skill>)` — see [Overlays](08-overlays.md).
 
 ### Flags
 
 | Flag | Description |
 |------|-------------|
 | `--interview` | Let a code agent complete the skill body from a short summary |
+| `-n`, `--non-interactive` | Run the interview agent in print mode |
 | `--global` | Write to `~/.awman/skills/<name>/` instead of the current repo |
 | `--pull <repo>` | Pull a GitHub skills library, or refresh one by its short name |
 | `--pull-all` | Refresh every previously-pulled skills library |
 | `--subdir <path>` | Use a different relative folder inside the pulled repository instead of `skills/` |
-
-### Edge cases
-
-| Situation | Behaviour |
-|-----------|-----------|
-| Name contains spaces or path separators | Rejected immediately with a descriptive error |
-| Skill already exists at the destination | Error with the existing path; awman does not overwrite silently |
-| Empty description | Error before any file is written |
-| Not inside a git repo (non-global) | Error: run with `--global` to write to `~/.awman/` |
-| `--global --interview` outside a git repo | Error: agent image lookup requires a git repo |
-| Skill body is empty (CLI) | Warning logged; empty body written to file |
 
 ---
 
@@ -662,9 +641,11 @@ unavailable, `agents status` and `agents kill` surface the runtime failure
 rather than reporting that no agent exists. Restore runtime availability and
 retry.
 
-`agents attach <id>` connects to the running agent's terminal. Press **Ctrl-C**
-to detach in the CLI or TUI; this closes only your connection and leaves the
-agent running. Apple agents launched by older versions without launcher metadata
+`agents attach <id>` connects to the running agent's terminal. In the CLI,
+press **Ctrl-C** to detach; this closes only your connection and leaves the
+agent running. In the TUI the agent opens in the tab's container window, where
+keys (Ctrl-C included) go to the agent; **Ctrl-\\** leaves the view without
+touching it. Apple agents launched by older versions without launcher metadata
 must be restarted before they can be attached. The API exposes
 the `status` snapshot, `list`, `detail`, and `kill` commands; API `kill` calls
 must include `--yes`. `attach` and `status --watch` are available only in the
@@ -804,7 +785,7 @@ Antigravity does not support the `--model` flag. Configure the model in `~/.gemi
 The `gemini` agent is deprecated by Google in favor of Antigravity. When you launch a `gemini` session using `awman chat --agent gemini` or set `agent = "gemini"` in your config, a deprecation warning appears before the container starts:
 
 ```
-The 'gemini' agent is deprecated by Google. Migrate to 'antigravity' — run 'awman chat antigravity' (or 'awman config set agent antigravity' to change your default).
+The 'gemini' agent is deprecated by Google. Migrate to 'antigravity' — run 'awman chat --agent antigravity' (or 'awman config set agent antigravity' to change your default).
 ```
 
 The warning does not block execution — your gemini session still starts. However, you should plan to migrate to `antigravity`:
@@ -901,63 +882,28 @@ When `--aspec` is not passed and no `aspec/` folder exists, `init` offers to con
 ## Reference: `awman ready`
 
 ```sh
-awman ready [--refresh] [--build] [--no-cache] [--non-interactive] [-n] [--allow-docker] [--json]
+awman ready [--refresh] [--build] [--no-cache] [-n|--non-interactive] [--allow-docker] [--json] [--agent <name>]
 ```
 
-Verifies your environment is ready for agent sessions. Progress lines read `awman: ready: <phase>...` on stderr (suppressed with `--json`). A Docker or Apple Containers runtime error exits with status 3; every other engine failure, including builtin and image-builder errors, exits with status 1, and the CLI prints the same message the TUI and API show.
+Verifies your environment is ready for agent sessions. Progress lines read `ready: <phase>` on stderr (suppressed with `--json`). A Docker or Apple Containers runtime error exits with status 3; every other engine failure, including builtin and image-builder errors, exits with status 1, and the CLI prints the same message the TUI and API show.
 
 | Flag | Description |
 |------|-------------|
-| `--refresh` | Run the Dockerfile agent audit, update `Dockerfile.dev`, and rebuild both images |
-| `--build` | Rebuild the project base image and agent images in `.awman/`. When multiple agent Dockerfiles exist, awman asks which to build |
-| `--no-cache` | Pass `--no-cache` to every `docker build` invocation, including the project base image and all agent images |
-| `--non-interactive` / `-n` | Run the audit agent in print mode |
+| `--refresh` | Run the Dockerfile agent audit, which updates `Dockerfile.dev` for your project's toolchain (skipped by default) |
+| `--build` | Rebuild the project base image and every agent image with a `.awman/Dockerfile.<agent>` (on the [builtin runtime](11-runtimes.md), re-acquire them from their image source) |
+| `--no-cache` | Skip the build cache for any build `ready` runs; on the builtin runtime, also force a fresh image import |
+| `--non-interactive` / `-n` | Run the audit agent in print mode, and answer `ready`'s own questions non-interactively |
 | `--allow-docker` | Give the audit container access to the host Docker socket |
-| `--json` | Emit machine-readable JSON instead of the human-readable table. Implies `--non-interactive`. See [`ready --json`](#ready---json) |
+| `--json` | Emit machine-readable JSON instead of the summary table. Implies `--non-interactive`. See [`ready --json`](#ready---json) |
+| `--agent <name>` | Check and build this agent instead of the configured one. For a [custom agent](15-custom-agents.md) whose definition needs approval, this is where you review and approve it |
 
-Use `--refresh` after your project's toolchain changes to update `Dockerfile.dev` (the project base) and rebuild both images. The agent dockerfile is not touched by the audit.
+Use `--refresh` after your project's toolchain changes. The audit only edits `Dockerfile.dev`; agent Dockerfiles are not touched.
 
-### Rebuilding multiple agent images
+### Other agents' images
 
-If your `.awman/` directory contains Dockerfiles for more than one agent (for example, `.awman/Dockerfile.claude` and `.awman/Dockerfile.codex`), running `awman ready --build` prompts before starting any builds:
+`ready` checks the default agent's image and, for every other agent with a `.awman/Dockerfile.<agent>`, whether its image exists. Missing ones are listed on a `Missing images` row (a warning, not a failure) with a hint naming what `ready --build` would do for each. `ready --build` builds them all, one after another; a failed build for a non-default agent is reported but does not change `ready`'s exit status.
 
-```
-Found 2 agent Dockerfiles:
-  claude  (default)
-  codex   (extra)
-
-Build all agent images, or only the default (claude)? [all/default]:
-```
-
-- **all** — builds the project base image, then all agent images in `.awman/`, in sequence.
-- **default** — builds the project base image and only the default agent image from config.
-
-The `--no-cache` flag applies to every image built in this sequence.
-
-### Build output
-
-Each image build — project base or agent — is framed with prominent start and end markers so you can track progress across a multi-image sequence:
-
-```
-══════════════════════════════════════════════════
-  Building project base image: awman-myproject:latest
-══════════════════════════════════════════════════
-[build output...]
-
-══════════════════════════════════════════════════
-  ✓ Built awman-myproject:latest
-══════════════════════════════════════════════════
-
-
-══════════════════════════════════════════════════
-  Building agent image: awman-myproject-codex:latest
-══════════════════════════════════════════════════
-[build output...]
-```
-
-This applies whenever `ready` starts a build — `--build`, `--refresh`, or the initial `awman init` sequence.
-
-`awman ready` also checks whether work item paths are configured. If neither `aspec/work-items/` exists nor `work_items.dir` is set, the summary shows a `⚠ not configured` warning (not a failure) for the `work items config` row, and prints a tip to run `awman config set work_items.dir <path>`.
+The summary also warns (without failing) when the repo has no `aspec/` folder or no `.awman/config.json`; run `awman init` to create them.
 
 ### Credential health
 
@@ -971,45 +917,31 @@ If the credential can't be read, has already expired, or its expiry can't be det
 
 ### `ready --json`
 
-When `--json` is set, `awman ready` suppresses the human-readable table and instead prints structured JSON summarising the environment check results. This is useful for CI pipelines and scripts that need to inspect readiness programmatically.
-
-```sh
-awman ready --json
-```
+With `--json`, `awman ready` prints one JSON object on stdout instead of the summary table — useful for CI and scripts:
 
 ```json
 {
-  "docker": { "available": true },
-  "dockerfile": { "exists": true, "path": "/home/user/my-project/Dockerfile.dev" },
-  "base_image": { "built": true, "tag": "awman-myproject:latest" },
-  "agent_image": { "built": true, "tag": "awman-myproject-claude:latest" },
-  "audit": { "ran": false }
+  "ready": true,
+  "runtime": "docker",
+  "agent_credentials": [
+    { "agent": "claude", "refreshable": true, "expires_in_secs": 68432, "expired": false, "read_error": null }
+  ],
+  "steps": {
+    "docker_daemon":     { "status": "ok",      "message": "" },
+    "dockerfile":        { "status": "ok",      "message": "" },
+    "aspec_folder":      { "status": "skipped", "message": "" },
+    "work_items_config": { "status": "skipped", "message": "" },
+    "local_agent":       { "status": "ok",      "message": "" },
+    "dev_image":         { "status": "ok",      "message": "" },
+    "refresh":           { "status": "skipped", "message": "" },
+    "image_rebuild":     { "status": "skipped", "message": "" }
+  }
 }
 ```
 
-When `--refresh` is also set, the audit runs and its results are included once complete:
+Each step's `status` is `ok`, `skipped`, `warn`, `failed`, `pending` or `running`, with the reason in `message`. `refresh` is `ok` when `--refresh` ran the audit. On the builtin runtime the object also carries `steps.image_source` and, when images were built or imported, `image_results`, `base_image_results` and `warnings`.
 
-```json
-{
-  "docker": { "available": true },
-  "dockerfile": { "exists": true, "path": "/home/user/my-project/Dockerfile.dev" },
-  "base_image": { "built": true, "tag": "awman-myproject:latest" },
-  "agent_image": { "built": true, "tag": "awman-myproject-claude:latest" },
-  "audit": { "ran": true, "exit_code": 0 }
-}
-```
-
-`--json` implies `--non-interactive` — no interactive prompts are shown regardless of environment state. Streaming audit output is buffered internally and not printed; only the final JSON is written to stdout.
-
-Alongside the fields above, the output includes an `agent_credentials` array — one entry per agent with a live-refreshed credential — carrying only non-secret health data:
-
-```json
-"agent_credentials": [
-  { "agent": "claude", "refreshable": true, "expires_in_secs": 68432, "expired": false, "read_error": null }
-]
-```
-
-`expires_in_secs` is `null` when the expiry couldn't be determined; `read_error` is set instead of `expires_in_secs` when the credential couldn't be read at all. No token value ever appears in this output.
+`--json` implies `--non-interactive`, so no prompts are shown, and audit output is not streamed. In `agent_credentials` (one entry per agent with a live-refreshed credential), `expires_in_secs` is `null` when the expiry couldn't be determined, and `read_error` is set when the credential couldn't be read at all. No token value ever appears in this output.
 
 ---
 
@@ -1024,14 +956,20 @@ Alongside the fields above, the output includes an `agent_credentials` array —
 | `--plan` | ✓ | ✓ | ✓ | Read-only analysis mode |
 | `--allow-docker` | ✓ | ✓ | ✓ | Mount host Docker socket |
 | `--overlay=<SPEC>` | ✓ | ✓ | ✓ | `dir()`, `env()`, `skill()`, `ssh()` overlays (repeatable) |
+| `--agent-flag=<ARG>` | ✓ | ✓ | ✓ | Extra argument for the agent command (repeatable); replaces its `agentFlags` entry |
 | `--worktree` | — | — | ✓ | Run in isolated Git worktree |
 | `--auto` | ✓ | ✓ | ✓ | Auto-approve file edits, prompt for shell commands |
 | `--yolo` | ✓ | ✓ | ✓ | Fully autonomous mode |
 | `--work-item <N>` | — | — | ✓ | Work item number for template variable substitution |
-| `--issue <N|URL>` | — | ✓ | ✓ | Use a GitHub issue as the prompt / work item input — see [GitHub Integration](10-github-integration.md) |
+| `--issue <N\|URL>` | — | ✓ | ✓ | Use a GitHub issue as the prompt / work item input — see [GitHub Integration](10-github-integration.md) |
 | `--dynamic` | — | — | ✓ | Have a leader agent design the workflow; implies `--yolo`, `--worktree`, `context(workflow)` |
 | `--leader <agent::model>` | — | — | ✓ | Leader agent and model for `--dynamic` |
 | `--max-concurrent <N>` | — | — | ✓ | Cap concurrently-running workflow steps |
+| `--on-existing-worktree`, `--on-dirty-merge-target`, `--on-merge-failure` | — | — | ✓ | Answer worktree lifecycle questions up front — see [Workflows](05-workflows.md#worktrees) |
+| `--prerequisite-*`, `--check-prerequisites` | — | — | ✓ | Grant or check what setup/teardown steps need — see [Workflows](05-workflows.md) |
+| `--json` | — | — | ✓ | Print the workflow outcome and prerequisite report as JSON |
+
+The [Command Reference](14-command-reference.md) lists every flag with its exact values.
 
 ---
 

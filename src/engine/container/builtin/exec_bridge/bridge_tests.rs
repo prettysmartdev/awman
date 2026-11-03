@@ -119,6 +119,8 @@ async fn prompt_files_follow_confirmed_exit_or_stop_including_a_later_retry() {
             leases: vec![],
             prompt_files: vec![PromptFileGuard::new(file)],
             io,
+            // The retry case waits out a full grace; keep it short.
+            cancel_grace: Duration::from_millis(50),
         })
         .run(frontend)
         .unwrap();
@@ -148,7 +150,7 @@ async fn prompt_files_follow_confirmed_exit_or_stop_including_a_later_retry() {
             assert_eq!(driver.state.lock().unwrap().finish_attempts, 1);
             driver.state.lock().unwrap().fail_finish = false;
             cancel.cancel().unwrap();
-            tokio::time::timeout(Duration::from_secs(12), async {
+            tokio::time::timeout(Duration::from_secs(10), async {
                 while path.exists() {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }

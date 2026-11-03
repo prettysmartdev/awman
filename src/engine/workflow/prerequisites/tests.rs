@@ -879,8 +879,12 @@ fn preflight_off_makes_every_prerequisite_unknown_and_probes_nothing() {
 
 #[test]
 fn probe_timeout_yields_unknown_without_stalling_the_run() {
+    // The probe outlives the budget by orders of magnitude, so the bound
+    // below separates "returned at the budget" from "waited for the probe"
+    // however loaded the runner is.
+    let probe = Duration::from_secs(10);
     let mut f = Fixture::default();
-    f.git.delay = Duration::from_millis(400);
+    f.git.delay = probe;
     let mut o = options(vec![
         WorkflowPrerequisite::GitIdentity,
         WorkflowPrerequisite::NotDetachedHead,
@@ -889,8 +893,8 @@ fn probe_timeout_yields_unknown_without_stalling_the_run() {
     let started = Instant::now();
     let report = f.preflight(o).run();
     assert!(
-        started.elapsed() < Duration::from_millis(300),
-        "{:?}",
+        started.elapsed() < probe / 2,
+        "the run must not wait for a stalled probe: {:?}",
         started.elapsed()
     );
     assert_eq!(report.checks.len(), 2);
@@ -903,8 +907,13 @@ fn probe_timeout_yields_unknown_without_stalling_the_run() {
 
 #[test]
 fn concurrent_probes_respect_one_budget_not_the_sum() {
+    // Every delayed probe stalls far past the budget. Probes waited on one
+    // after another would take at least one full stall each; run
+    // concurrently under one budget, the whole run ends long before a
+    // single stall does, however loaded the runner is.
+    let probe = Duration::from_secs(10);
     let mut f = Fixture::default();
-    f.git.delay = Duration::from_millis(300);
+    f.git.delay = probe;
     let mut o = options(vec![
         WorkflowPrerequisite::GitIdentity,
         WorkflowPrerequisite::NotDetachedHead,
@@ -915,11 +924,18 @@ fn concurrent_probes_respect_one_budget_not_the_sum() {
     let started = Instant::now();
     let report = f.preflight(o).run();
     assert!(
-        started.elapsed() < Duration::from_millis(250),
-        "{:?}",
+        started.elapsed() < probe / 2,
+        "concurrent probes must share one budget: {:?}",
         started.elapsed()
     );
     assert!(!report.checks.is_empty());
+    let identity = report
+        .checks
+        .iter()
+        .find(|c| c.prerequisite == WorkflowPrerequisite::GitIdentity)
+        .expect("git identity check");
+    assert_eq!(identity.status, PrerequisiteStatus::Unknown);
+    assert!(identity.explanation.contains("timed out"), "{identity:?}");
     assert!(PROBE_BUDGET <= Duration::from_secs(10));
 }
 

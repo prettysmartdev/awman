@@ -116,7 +116,15 @@ impl QueuedCommandResult {
             outcome: Some(outcome),
             error: result.as_ref().err().map(ToString::to_string),
             error_status: result.as_ref().err().map(|error| error.http_status()),
-            stage: result.as_ref().err().map(|error| error.stage().to_string()),
+            // Legacy `stage`, filled exactly as before WI 0137: only for an
+            // unresolved prerequisite (WI 0149) and, below, a push failure.
+            // `failure.stage` is set for every failure.
+            stage: match result {
+                Err(error @ CommandError::WorkflowPrerequisitesUnresolved { .. }) => {
+                    Some(error.stage().to_string())
+                }
+                _ => None,
+            },
             failure: result
                 .as_ref()
                 .err()
@@ -172,10 +180,9 @@ impl QueuedCommandResult {
             if let Some(reason) = json
                 .failure
                 .as_mut()
-                .filter(|f| f.stage == "step" && f.code == failure_codes::INTERNAL)
+                .filter(|f| f.stage == "step" && f.code != failure_codes::ABORTED)
             {
                 reason.stage = "preflight".into();
-                json.stage = Some(reason.stage.clone());
             }
         }
         if outcome != CommandStatusKind::Done && json.failure.is_none() {
@@ -241,7 +248,6 @@ impl QueuedCommandResult {
                     }
                 });
             json.error = Some(reason.message.clone());
-            json.stage = Some(reason.stage.clone());
             json.failure = Some(reason);
         }
         if !failed.is_empty() {
@@ -266,9 +272,6 @@ impl QueuedCommandResult {
                 ));
                 json.pushed = Some(None);
             }
-        }
-        if let Some(reason) = &json.failure {
-            json.stage = Some(reason.stage.clone());
         }
         Self::from_result(json)
     }
@@ -419,20 +422,10 @@ pub(crate) fn terminal_payload(command: &CommandRecord) -> EventPayload {
             .as_ref()
             .and_then(|r| r.exit_code)
             .or(command.exit_code),
-        error: result.as_ref().and_then(|r| {
-            r.error.as_ref().map(|error| {
-                // Preserve the legacy event's push prefix; the embedded result
-                // retains the row's unchanged message and structured stage.
-                if r.failure
-                    .as_ref()
-                    .is_some_and(|f| f.code == failure_codes::PUSH_FAILED)
-                {
-                    format!("push: {error}")
-                } else {
-                    error.clone()
-                }
-            })
-        }),
+        // Exactly the row's `result.error` (WI 0137 §2): the event and the
+        // status route are two views of one value. The pre-0137 push-failure
+        // event's `push: ` prefix is gone; `result.failure.stage` names it.
+        error: result.as_ref().and_then(|r| r.error.clone()),
         result: result.map(Box::new),
     }
 }
@@ -1690,10 +1683,8 @@ mod adversarial_tests {
                 result.failure.as_ref().unwrap().stage,
                 if started { "step" } else { "preflight" }
             );
-            assert_eq!(
-                result.stage.as_deref(),
-                Some(result.failure.as_ref().unwrap().stage.as_str())
-            );
+            // The legacy `stage` keeps its pre-0137 meaning.
+            assert_eq!(result.stage, None);
         }
     }
 
@@ -1720,10 +1711,7 @@ mod adversarial_tests {
             result.error.as_deref(),
             Some(result.failure.as_ref().unwrap().message.as_str())
         );
-        assert_eq!(
-            result.stage.as_deref(),
-            Some(result.failure.as_ref().unwrap().stage.as_str())
-        );
+        assert_eq!(result.stage, None);
     }
 
     #[tokio::test]
