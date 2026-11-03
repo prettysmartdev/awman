@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use crate::data::workflow_definition::{CloneConflictMode, SetupStep, TeardownStep};
 use crate::data::workflow_prompt_template::{extract_section, substitute_prompt, WorkItemContext};
 use crate::data::workflow_state::PhaseKind;
+use crate::engine::git::AWMAN_BOOKKEEPING_EXCLUDES;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum PushAuth {
@@ -246,11 +247,22 @@ pub fn teardown_step_to_shell_with(
         TeardownStep::RunShell { command, env } => (command.clone(), env.clone()),
         TeardownStep::RunScript { path } => (format!("sh {}", sh_quote(path)), None),
         TeardownStep::CommitChanges { message, add_all } => {
-            let msg_q = sh_quote(message);
+            // An agent that already committed its own work leaves nothing
+            // staged. That is success, so the push and pull request steps
+            // that follow still run and publish those commits.
+            let commit = format!(
+                "if git diff --cached --quiet; then echo 'commit_changes: nothing to commit'; \
+                 else git commit -m {}; fi",
+                sh_quote(message)
+            );
             let cmd = if *add_all {
-                format!("git add -A && git commit -m {msg_q}")
+                let excludes: Vec<String> = AWMAN_BOOKKEEPING_EXCLUDES
+                    .iter()
+                    .map(|p| sh_quote(p))
+                    .collect();
+                format!("git add -A -- . {} && {commit}", excludes.join(" "))
             } else {
-                format!("git commit -m {msg_q}")
+                commit
             };
             (cmd, None)
         }
@@ -481,6 +493,24 @@ pub trait PhaseStepSpec: Sized {
     fn publishes(&self) -> bool {
         false
     }
+
+    /// Whether the step gets local work onto the remote branch (a commit or
+    /// a push). These are re-run after an on_failure agent fixes a failed
+    /// `poll_ci`, so CI sees the fix before it is polled again.
+    fn republishes_ci_fix(&self) -> bool {
+        false
+    }
+
+    /// Whether the step is a `push_branch`.
+    fn pushes_branch(&self) -> bool {
+        false
+    }
+
+    /// The step as re-run to publish a fix for `failed_jobs`, when that
+    /// differs from the step itself: a commit names what it fixes.
+    fn for_ci_fix(&self, _failed_jobs: &[String]) -> Option<Self> {
+        None
+    }
 }
 
 impl PhaseStepSpec for SetupStep {
@@ -557,6 +587,57 @@ impl PhaseStepSpec for TeardownStep {
     fn publishes(&self) -> bool {
         !super::WorkflowEngine::teardown_step_runs_when_cancelled(self)
     }
+
+    fn republishes_ci_fix(&self) -> bool {
+        matches!(
+            self,
+            TeardownStep::CommitChanges { .. } | TeardownStep::PushBranch { .. }
+        )
+    }
+
+    fn pushes_branch(&self) -> bool {
+        matches!(self, TeardownStep::PushBranch { .. })
+    }
+
+    fn for_ci_fix(&self, failed_jobs: &[String]) -> Option<Self> {
+        match self {
+            TeardownStep::CommitChanges { message, add_all } => Some(TeardownStep::CommitChanges {
+                message: ci_fix_commit_message(message, failed_jobs),
+                add_all: *add_all,
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// How many failed job names a CI fix commit message lists before
+/// summarising the rest as a count.
+const CI_FIX_MESSAGE_MAX_JOBS: usize = 5;
+
+/// `"<message>: fix CI job a, b, c"`, or `"<message>: fix CI"` when the
+/// failed jobs are unknown.
+fn ci_fix_commit_message(message: &str, failed_jobs: &[String]) -> String {
+    if failed_jobs.is_empty() {
+        return format!("{message}: fix CI");
+    }
+    let mut names = failed_jobs
+        .iter()
+        .take(CI_FIX_MESSAGE_MAX_JOBS)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if failed_jobs.len() > CI_FIX_MESSAGE_MAX_JOBS {
+        names.push_str(&format!(
+            " and {} more",
+            failed_jobs.len() - CI_FIX_MESSAGE_MAX_JOBS
+        ));
+    }
+    let noun = if failed_jobs.len() == 1 {
+        "job"
+    } else {
+        "jobs"
+    };
+    format!("{message}: fix CI {noun} {names}")
 }
 
 /// Defaults for a `poll_ci` step that names neither value. Unchanged from the
@@ -728,7 +809,13 @@ mod tests {
             add_all: true,
         };
         let (cmd, _) = teardown_step_to_shell(&step);
-        assert_eq!(cmd, "git add -A && git commit -m 'auto commit'");
+        assert_eq!(
+            cmd,
+            "git add -A -- . ':(exclude).awman/workflows/*.json' \
+             ':(exclude).awman/workflows/dynamic-*.toml' && \
+             if git diff --cached --quiet; then echo 'commit_changes: nothing to commit'; \
+             else git commit -m 'auto commit'; fi"
+        );
     }
 
     #[test]
@@ -738,7 +825,92 @@ mod tests {
             add_all: false,
         };
         let (cmd, _) = teardown_step_to_shell(&step);
-        assert_eq!(cmd, "git commit -m 'auto commit'");
+        assert_eq!(
+            cmd,
+            "if git diff --cached --quiet; then echo 'commit_changes: nothing to commit'; \
+             else git commit -m 'auto commit'; fi"
+        );
+    }
+
+    #[test]
+    fn ci_fix_commit_names_the_failed_jobs() {
+        let jobs = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            ci_fix_commit_message("Implement 0014", &jobs(&["test"])),
+            "Implement 0014: fix CI job test"
+        );
+        assert_eq!(
+            ci_fix_commit_message("Implement 0014", &jobs(&["clippy", "fmt", "test"])),
+            "Implement 0014: fix CI jobs clippy, fmt, test"
+        );
+        assert_eq!(
+            ci_fix_commit_message("m", &jobs(&["a", "b", "c", "d", "e", "f", "g"])),
+            "m: fix CI jobs a, b, c, d, e and 2 more"
+        );
+        assert_eq!(ci_fix_commit_message("m", &[]), "m: fix CI");
+    }
+
+    #[test]
+    fn only_commit_changes_is_rewritten_for_a_ci_fix() {
+        let commit = TeardownStep::CommitChanges {
+            message: "Implement 0014".to_string(),
+            add_all: true,
+        };
+        let fix = commit.for_ci_fix(&["test".to_string()]).unwrap();
+        let (cmd, _) = teardown_step_to_shell(&fix);
+        assert!(
+            cmd.contains("git commit -m 'Implement 0014: fix CI job test'"),
+            "{cmd}"
+        );
+        let push = TeardownStep::PushBranch {
+            remote: None,
+            branch: None,
+        };
+        assert!(push.for_ci_fix(&["test".to_string()]).is_none());
+    }
+
+    /// Runs the real commit command in a scratch repo: every change but
+    /// awman's bookkeeping is committed, and a clean tree is not an error.
+    #[test]
+    fn commit_changes_commits_everything_and_tolerates_a_clean_tree() {
+        use std::process::Command;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let sh = |cmd: &str| {
+            Command::new("sh")
+                .args(["-c", cmd])
+                .current_dir(dir)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .unwrap()
+        };
+        assert!(
+            sh("git init -q && echo a > a && git add a && git commit -qm init")
+                .status
+                .success()
+        );
+        sh("echo b > a && echo new > new && mkdir -p .awman/workflows \
+            && echo {} > .awman/workflows/state.json");
+
+        let step = TeardownStep::CommitChanges {
+            message: "work".to_string(),
+            add_all: true,
+        };
+        let (cmd, _) = teardown_step_to_shell(&step);
+        assert!(sh(&cmd).status.success());
+        let committed = sh("git show --name-only --format= HEAD");
+        let committed = String::from_utf8_lossy(&committed.stdout);
+        assert_eq!(committed.lines().collect::<Vec<_>>(), ["a", "new"]);
+
+        let again = sh(&cmd);
+        assert!(
+            again.status.success(),
+            "a clean tree must not fail the step"
+        );
+        assert!(String::from_utf8_lossy(&again.stdout).contains("nothing to commit"));
     }
 
     #[test]
@@ -869,7 +1041,7 @@ mod tests {
             add_all: false,
         };
         let (cmd, _) = teardown_step_to_shell(&step);
-        assert_eq!(cmd, "git commit -m 'it'\\''s done'");
+        assert!(cmd.contains("git commit -m 'it'\\''s done';"));
     }
 
     #[test]
@@ -894,7 +1066,7 @@ mod tests {
             add_all: false,
         };
         let (cmd, _) = teardown_step_to_shell(&step);
-        assert_eq!(cmd, "git commit -m ''\\''; rm -rf / #'");
+        assert!(cmd.contains("git commit -m ''\\''; rm -rf / #';"));
     }
 
     #[test]

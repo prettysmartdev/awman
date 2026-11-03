@@ -300,12 +300,23 @@ impl WorkflowEngine {
                     .and_then(|c| c.as_ref())
                     .cloned();
                 if let Some(rem_config) = rem {
+                    // A fix for failing CI only counts once it is pushed.
+                    let republish: Vec<(usize, &S)> = if step.poll_ci().is_some() {
+                        steps[..idx]
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, s)| s.republishes_ci_fix())
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
                     step_outcome = self.run_phase_remediation(
                         kind,
                         &rem_config,
                         step,
                         idx,
                         step_outcome,
+                        &republish,
                         &mut container_for_step,
                     );
                 }
@@ -445,14 +456,16 @@ impl WorkflowEngine {
         }
     }
 
-    /// Execute a PollCi step natively. Returns `true` if the step failed.
+    /// Execute a PollCi step natively. A failed outcome carries the recorded
+    /// error as stderr and, when CI itself failed, the failed jobs, steps and
+    /// log tails as stdout, so an on_failure agent sees what broke.
     pub(super) fn run_poll_ci_phase_step(
         &mut self,
         interval_secs: u32,
         max_retries: u32,
         kind: PhaseKind,
         idx: usize,
-    ) -> bool {
+    ) -> PhaseStepOutcome {
         let git_root = self.session.git_root().to_path_buf();
         let poller = poll_ci::CiPoller::new(
             std::sync::Arc::new(crate::engine::git::GitEngine::new()),
@@ -473,10 +486,14 @@ impl WorkflowEngine {
         if let Err(e) = result {
             let error = self.redaction.redact(&e.to_string());
             self.set_phase_step_failed(kind, idx, &error);
-            return true;
+            let failure = poller.take_failure().unwrap_or_default();
+            return PhaseStepOutcome {
+                ci_failed_jobs: failure.failed_jobs,
+                ..PhaseStepOutcome::failed(self.redaction.redact(&failure.report), error)
+            };
         }
 
-        false
+        PhaseStepOutcome::succeeded()
     }
 
     /// Execute a single phase step. Returns a [`PhaseStepOutcome`] carrying
@@ -494,24 +511,10 @@ impl WorkflowEngine {
         F: FnMut(&PhaseStepRef) -> Result<Box<dyn AgentExec>, EngineError>,
     {
         if let Some((interval_secs, max_retries)) = step.poll_ci() {
-            let failed = self.run_poll_ci_phase_step(interval_secs, max_retries, kind, idx);
-            // PollCi produces no command stdout/stderr; surface the recorded
-            // error string as the failure content so the file is still useful.
-            return if failed {
-                PhaseStepOutcome::failed(String::new(), self.phase_step_failed_error(kind, idx))
-            } else {
-                PhaseStepOutcome::succeeded()
-            };
+            return self.run_poll_ci_phase_step(interval_secs, max_retries, kind, idx);
         }
 
-        let default_options = StepCommandOptions::default();
-        let options = self
-            .step_command_options
-            .iter()
-            .find(|((phase, index), _)| *phase == kind && *index == idx)
-            .map(|(_, options)| options)
-            .unwrap_or(&default_options);
-        let (command, env) = step.to_shell_with(options);
+        let (command, env) = step.to_shell_with(&self.step_command_options_for(kind, idx));
         let step_ref = PhaseStepRef {
             kind,
             index: idx,
@@ -519,10 +522,28 @@ impl WorkflowEngine {
         };
         match container_for_step(&step_ref) {
             Ok(c) => {
-                let result = self.run_shell_phase_step(&*c, &command, env.as_ref(), kind, idx);
-                if !result.failed && kind == PhaseKind::Teardown && step.creates_pull_request() {
-                    if let Some(url) = parse_gh_pr_create_output(&result.stdout) {
-                        self.frontend.report_pull_request_created(&url);
+                let mut result = self.run_shell_phase_step(&*c, &command, env.as_ref(), kind, idx);
+                if kind == PhaseKind::Teardown && step.creates_pull_request() {
+                    // GitHub indexes a push asynchronously, so a pull request
+                    // opened right after push_branch can briefly see the
+                    // branch as identical to its base. Wait and try again.
+                    for delay in PR_BRANCH_NOT_INDEXED_RETRY_DELAYS {
+                        if !(result.failed && pr_branch_not_yet_indexed(&result))
+                            || self.cancel_requested()
+                        {
+                            break;
+                        }
+                        self.msg_info(format!(
+                            "GitHub has not indexed the pushed commits yet; retrying pull request creation in {}s...",
+                            delay.as_secs()
+                        ));
+                        std::thread::sleep(delay);
+                        result = self.run_shell_phase_step(&*c, &command, env.as_ref(), kind, idx);
+                    }
+                    if !result.failed {
+                        if let Some(url) = parse_gh_pr_create_output(&result.stdout) {
+                            self.frontend.report_pull_request_created(&url);
+                        }
                     }
                 }
                 result
@@ -543,6 +564,10 @@ impl WorkflowEngine {
     /// `failure` is the outcome that triggered this remediation. Each retry that fails again overwrites the failure file
     /// with its own fresh output, so the agent always sees the most recent
     /// failure.
+    ///
+    /// `republish` lists the phase's earlier commit and push steps when the
+    /// remediated step is `poll_ci`. They run again after each agent attempt
+    /// so the fix is on the remote before CI is polled again.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn run_phase_remediation<S, F>(
         &mut self,
@@ -551,6 +576,7 @@ impl WorkflowEngine {
         step: &S,
         idx: usize,
         failure: PhaseStepOutcome,
+        republish: &[(usize, &S)],
         container_for_step: &mut F,
     ) -> PhaseStepOutcome
     where
@@ -560,6 +586,12 @@ impl WorkflowEngine {
         use crate::data::workflow_state::PhaseStepStatus;
 
         let desc = self.state.phase_step_states(kind)[idx].description.clone();
+        if step.poll_ci().is_some() && !republish.iter().any(|(_, s)| s.pushes_branch()) {
+            self.msg_warning(
+                "on_failure for poll_ci: no push_branch step precedes it, so a fix cannot \
+                 reach CI; add commit_changes and push_branch before poll_ci",
+            );
+        }
         let mut last = failure;
         for attempt in 1..=config.max_attempts {
             if self.cancel_requested() {
@@ -594,6 +626,11 @@ impl WorkflowEngine {
                 break;
             }
 
+            if !republish.is_empty() {
+                let failed_jobs = last.ci_failed_jobs.clone();
+                self.republish_ci_fix(kind, republish, &failed_jobs, container_for_step);
+            }
+
             self.state.phase_step_states_mut(kind)[idx].status = PhaseStepStatus::Running;
             let _ = self.persist();
 
@@ -617,6 +654,67 @@ impl WorkflowEngine {
         }
 
         last
+    }
+
+    /// Re-run the phase's earlier commit_changes and push_branch steps after
+    /// an on_failure agent worked on a failed `poll_ci`, so the fix reaches
+    /// the remote before CI is polled again. Each runs in its own step's
+    /// container with that step's grants. The earlier steps' recorded
+    /// statuses are left alone; a failure here is a warning, and the poll
+    /// that follows reports whether CI passed. The commit message names the
+    /// `failed_jobs` the fix is for.
+    fn republish_ci_fix<S, F>(
+        &mut self,
+        kind: PhaseKind,
+        steps: &[(usize, &S)],
+        failed_jobs: &[String],
+        container_for_step: &mut F,
+    ) where
+        S: PhaseStepSpec,
+        F: FnMut(&PhaseStepRef) -> Result<Box<dyn AgentExec>, EngineError>,
+    {
+        self.msg_info("Committing and pushing the on_failure agent's CI fix...");
+        for (index, step) in steps {
+            let options = self.step_command_options_for(kind, *index);
+            let (command, env) = match step.for_ci_fix(failed_jobs) {
+                Some(fix_step) => fix_step.to_shell_with(&options),
+                None => step.to_shell_with(&options),
+            };
+            let step_ref = PhaseStepRef {
+                kind,
+                index: *index,
+                description: self.state.phase_step_states(kind)[*index]
+                    .description
+                    .clone(),
+            };
+            let frontend = &mut self.frontend;
+            let redaction = &self.redaction;
+            let result = container_for_step(&step_ref).and_then(|c| {
+                c.exec_streaming(&command, env.as_ref(), &mut |line| {
+                    frontend.on_phase_step_output(kind, &redaction.redact(line));
+                })
+            });
+            let error = match result {
+                Ok(out) if out.exit_code == 0 => continue,
+                Ok(out) => format!("exit {}: {}", out.exit_code, out.stderr.trim()),
+                Err(e) => e.to_string(),
+            };
+            let error = self.redaction.redact(&error);
+            self.msg_warning(format!(
+                "{} failed while publishing the CI fix: {error}",
+                step_ref.description
+            ));
+            return;
+        }
+    }
+
+    /// The command options (push auth, remote) recorded for one phase step.
+    fn step_command_options_for(&self, kind: PhaseKind, idx: usize) -> StepCommandOptions {
+        self.step_command_options
+            .iter()
+            .find(|((phase, index), _)| *phase == kind && *index == idx)
+            .map(|(_, options)| options.clone())
+            .unwrap_or_default()
     }
 
     /// Launch the on_failure agent container and wait for it to complete.
@@ -980,6 +1078,26 @@ impl WorkflowEngine {
             extra_overlay,
         })
     }
+}
+
+/// Waits between create_pull_request attempts while GitHub catches up with a
+/// push. Tests use zero delays so the retry path stays fast.
+#[cfg(not(test))]
+const PR_BRANCH_NOT_INDEXED_RETRY_DELAYS: [std::time::Duration; 4] = [
+    std::time::Duration::from_secs(3),
+    std::time::Duration::from_secs(5),
+    std::time::Duration::from_secs(10),
+    std::time::Duration::from_secs(15),
+];
+#[cfg(test)]
+const PR_BRANCH_NOT_INDEXED_RETRY_DELAYS: [std::time::Duration; 4] = [std::time::Duration::ZERO; 4];
+
+/// `gh pr create` fails with "No commits between <base> and <head>" when
+/// GitHub has not yet indexed the commits push_branch just sent. An
+/// interactive run merges stderr into stdout, so both are checked.
+fn pr_branch_not_yet_indexed(outcome: &PhaseStepOutcome) -> bool {
+    const MARKER: &str = "No commits between";
+    outcome.stderr.contains(MARKER) || outcome.stdout.contains(MARKER)
 }
 
 /// gh prints the created PR URL on stdout. This parser is used only by the

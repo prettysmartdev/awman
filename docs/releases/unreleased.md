@@ -142,6 +142,18 @@ Several prompts used to pick an answer for you when there was nobody to ask:
   accept only the digits both display, and dismissing the question abandons
   the interview instead of silently filing a Task.
 
+### `commit_changes` stages every change by default
+
+A `commit_changes` teardown step without `add_all` used to commit only what was
+already staged, so an agent's unstaged edits were left out of the pushed
+branch and the pull request. `add_all` now defaults to `true`: every change is
+staged except awman's run state under `.awman/workflows/`. A step with nothing
+to commit, for example because the agent committed its own work, now succeeds
+instead of failing the teardown.
+
+**Who is affected:** workflows that relied on committing only staged changes.
+Set `add_all = false` to keep that behaviour.
+
 ## Features
 
 ### Dynamic workflow settings use `workflows.dynamic`
@@ -246,6 +258,29 @@ as aliases for `docker-local` and `apple-local`. See
   terminal output streams immediately instead of at guest exit.
 
 ## Fixes
+
+### `create_pull_request` no longer fails right after a push
+
+GitHub indexes a push a moment after it arrives, so a pull request created
+straight after `push_branch` could fail with `No commits between main and
+<branch>`. awman now waits and retries for about 30 seconds before failing the
+step.
+
+### `poll_ci` judges only the pushed commit, and `on_failure` can fix CI
+
+- `poll_ci` no longer falls back to the branch's previous runs when the new
+  commit has none yet. It used to report an old commit's failure as the new
+  commit's result.
+- A re-run replaces the earlier run of the same workflow, and a run cancelled
+  by a concurrency group is ignored when another run of that workflow for the
+  same commit was not cancelled.
+- When CI fails, the `on_failure` agent's failure file now lists the failed
+  jobs and steps with the tail of each job's log.
+- After each `on_failure` attempt, awman re-runs the teardown's earlier
+  `commit_changes` and `push_branch` steps before polling again, so the
+  agent's fix actually reaches CI. Before, the retry polled the same failed
+  commit. The fix commit's message ends with the failed jobs, for
+  example `Implement 0014: fix CI jobs lint, test`.
 
 ### Running the test suite no longer touches your keychain or your squad daemon
 

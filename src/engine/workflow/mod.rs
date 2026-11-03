@@ -1019,6 +1019,9 @@ struct PhaseStepOutcome {
     exit_code: Option<i32>,
     stdout: String,
     stderr: String,
+    /// Names of the CI jobs a failed `poll_ci` saw fail, for the fix commit
+    /// message. Empty for every other step.
+    ci_failed_jobs: Vec<String>,
 }
 
 /// Exit code reported for a phase step that failed without one of its own
@@ -1032,6 +1035,7 @@ impl PhaseStepOutcome {
             exit_code: Some(0),
             stdout: String::new(),
             stderr: String::new(),
+            ci_failed_jobs: Vec::new(),
         }
     }
 
@@ -1041,6 +1045,7 @@ impl PhaseStepOutcome {
             exit_code: None,
             stdout,
             stderr,
+            ci_failed_jobs: Vec::new(),
         }
     }
 
@@ -1050,6 +1055,7 @@ impl PhaseStepOutcome {
             exit_code: Some(exit_code),
             stdout,
             stderr,
+            ci_failed_jobs: Vec::new(),
         }
     }
 

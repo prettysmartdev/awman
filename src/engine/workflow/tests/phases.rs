@@ -272,10 +272,10 @@ fn cancelled_teardown_skips_publishing_steps_runs_cleanup_and_does_not_remediate
         .unwrap();
 
     assert!(outcome.cancelled);
-    assert_eq!(
-        mocks.calls(),
-        ["cleanup-one", "git add -A && git commit -m 'cleanup-two'"]
-    );
+    let calls = mocks.calls();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0], "cleanup-one");
+    assert!(calls[1].contains("git commit -m 'cleanup-two'"));
     let statuses = &engine.state().teardown_step_states;
     assert_eq!(statuses[0].status, PhaseStepStatus::Skipped);
     assert_eq!(statuses[1].status, PhaseStepStatus::Skipped);
@@ -2868,4 +2868,208 @@ async fn cancelling_setup_remediation_stops_agent_and_runs_cleanup_without_retry
     assert_eq!(stopped.lock().unwrap().len(), 1);
     assert!(backend_cancelled.load(Ordering::Relaxed));
     assert_eq!(launches.load(Ordering::Relaxed), 1);
+}
+
+fn create_pull_request_step() -> Vec<crate::data::workflow_definition::TeardownStep> {
+    vec![
+        crate::data::workflow_definition::TeardownStep::CreatePullRequest {
+            title: None,
+            body: None,
+            base: None,
+        },
+    ]
+}
+
+#[test]
+fn create_pull_request_retries_while_github_has_not_indexed_the_push() {
+    use crate::data::workflow_state::PhaseStepStatus;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut engine = make_minimal_engine(&tmp);
+    let not_indexed = "pull request create failed: GraphQL: No commits between main and feat \
+                       (createPullRequest)";
+    let mock = Arc::new(MockBackgroundContainer::with_results([
+        (String::new(), not_indexed.to_string(), 1),
+        (String::new(), not_indexed.to_string(), 1),
+        (
+            "https://github.com/o/r/pull/12\n".to_string(),
+            String::new(),
+            0,
+        ),
+    ]));
+    let outcome = engine
+        .run_phase(
+            PhaseKind::Teardown,
+            &create_pull_request_step(),
+            &[false],
+            &[],
+            mock.factory(),
+        )
+        .unwrap();
+    assert!(!outcome.cancelled);
+    assert_eq!(mock.calls().len(), 3);
+    assert_eq!(
+        engine.state().teardown_step_states[0].status,
+        PhaseStepStatus::Succeeded
+    );
+}
+
+#[test]
+fn create_pull_request_does_not_retry_other_failures() {
+    use crate::data::workflow_state::PhaseStepStatus;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut engine = make_minimal_engine(&tmp);
+    let mock = Arc::new(MockBackgroundContainer::with_results([(
+        String::new(),
+        "a pull request for branch \"feat\" already exists".to_string(),
+        1,
+    )]));
+    engine
+        .run_phase(
+            PhaseKind::Teardown,
+            &create_pull_request_step(),
+            &[false],
+            &[],
+            mock.factory(),
+        )
+        .unwrap();
+    assert_eq!(mock.calls().len(), 1);
+    assert!(matches!(
+        engine.state().teardown_step_states[0].status,
+        PhaseStepStatus::Failed { .. }
+    ));
+}
+
+#[test]
+fn create_pull_request_gives_up_after_bounded_retries() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut engine = make_minimal_engine(&tmp);
+    let mock = Arc::new(MockBackgroundContainer::with_results(
+        std::iter::repeat_with(|| {
+            (
+                String::new(),
+                "GraphQL: No commits between main and feat".to_string(),
+                1,
+            )
+        })
+        .take(10),
+    ));
+    engine
+        .run_phase(
+            PhaseKind::Teardown,
+            &create_pull_request_step(),
+            &[false],
+            &[],
+            mock.factory(),
+        )
+        .unwrap();
+    assert_eq!(mock.calls().len(), 5, "one attempt plus four retries");
+}
+
+// A failed poll_ci's on_failure agent fixes code on disk; the phase's earlier
+// commit_changes and push_branch steps run again so CI sees the fix before
+// it is polled again. (The scratch dir has no origin, so every poll fails
+// without reaching the network.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn poll_ci_remediation_commits_and_pushes_the_fix_before_repolling() {
+    use crate::data::workflow_definition::TeardownStep;
+    use crate::data::workflow_state::PhaseStepStatus;
+
+    tokio::task::spawn_blocking(|| {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = make_session(&tmp);
+        let workflow = make_workflow(Some("wf"), Some("claude"), vec![make_step("a", &[], None)]);
+        let factory = FakeAgentExecutionFactory::always_success();
+        let (frontend, msgs) = MessageCapturingFrontend::new();
+        let mut engine = make_engine_capturing(&session, workflow, factory, frontend);
+
+        let steps = vec![
+            TeardownStep::CommitChanges {
+                message: "work".into(),
+                add_all: true,
+            },
+            TeardownStep::PushBranch {
+                remote: None,
+                branch: None,
+            },
+            TeardownStep::PollCi {
+                interval_secs: Some(0),
+                max_retries: Some(1),
+            },
+        ];
+        let mock = Arc::new(MockBackgroundContainer::always_success());
+        let on_failure_configs = vec![None, None, Some(remediation_config(2))];
+        engine
+            .run_phase(
+                PhaseKind::Teardown,
+                &steps,
+                &[false; 3],
+                &on_failure_configs,
+                mock.factory(),
+            )
+            .unwrap();
+
+        let calls = mock.calls();
+        assert_eq!(
+            calls.len(),
+            6,
+            "commit+push, then again after each of 2 attempts: {calls:?}"
+        );
+        // The first commit is the step itself; the fix commits say what they
+        // fix. This poll never reached GitHub, so no job names are known.
+        for (i, pair) in calls.chunks(2).enumerate() {
+            let message = if i == 0 { "'work'" } else { "'work: fix CI'" };
+            assert!(
+                pair[0].contains(&format!("git commit -m {message}")),
+                "{pair:?}"
+            );
+            assert!(pair[1].contains(" push -u -- 'origin' 'HEAD'"), "{pair:?}");
+        }
+        let states = &engine.state().teardown_step_states;
+        assert_eq!(states[0].status, PhaseStepStatus::Succeeded);
+        assert_eq!(states[1].status, PhaseStepStatus::Succeeded);
+        assert!(matches!(states[2].status, PhaseStepStatus::Failed { .. }));
+        let msgs = msgs.lock().unwrap();
+        assert!(!msgs.iter().any(|m| m.text.contains("no push_branch step")));
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn poll_ci_remediation_without_a_push_step_warns() {
+    use crate::data::workflow_definition::TeardownStep;
+
+    tokio::task::spawn_blocking(|| {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = make_session(&tmp);
+        let workflow = make_workflow(Some("wf"), Some("claude"), vec![make_step("a", &[], None)]);
+        let factory = FakeAgentExecutionFactory::always_success();
+        let (frontend, msgs) = MessageCapturingFrontend::new();
+        let mut engine = make_engine_capturing(&session, workflow, factory, frontend);
+
+        let steps = vec![TeardownStep::PollCi {
+            interval_secs: Some(0),
+            max_retries: Some(1),
+        }];
+        let mock = Arc::new(MockBackgroundContainer::always_success());
+        engine
+            .run_phase(
+                PhaseKind::Teardown,
+                &steps,
+                &[false],
+                &[Some(remediation_config(1))],
+                mock.factory(),
+            )
+            .unwrap();
+
+        assert!(mock.calls().is_empty());
+        let msgs = msgs.lock().unwrap();
+        assert!(
+            msgs.iter()
+                .any(|m| m.text.contains("no push_branch step precedes it")),
+            "{msgs:?}"
+        );
+    })
+    .await
+    .unwrap();
 }

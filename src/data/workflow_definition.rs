@@ -135,7 +135,9 @@ pub enum TeardownStep {
     },
     CommitChanges {
         message: String,
-        #[serde(default)]
+        /// Stage every change (except awman bookkeeping) before committing.
+        /// Defaults to `true` so a teardown never leaves the agent's work out.
+        #[serde(default = "default_add_all")]
         add_all: bool,
     },
     CreatePullRequest {
@@ -158,6 +160,10 @@ pub enum TeardownStep {
         #[serde(default)]
         max_retries: Option<u32>,
     },
+}
+
+fn default_add_all() -> bool {
+    true
 }
 
 /// A setup step entry with optional per-step overlays.
@@ -640,6 +646,33 @@ teardown:
         assert!(matches!(
             &wf.teardown[1].step,
             TeardownStep::PushBranch { remote, branch } if remote.is_none() && branch.is_none()
+        ));
+    }
+
+    #[test]
+    fn commit_changes_add_all_defaults_to_true_and_can_be_disabled() {
+        let toml = r#"
+[[step]]
+name = "a"
+prompt = "do A"
+
+[[teardown]]
+type = "commit_changes"
+message = "default"
+
+[[teardown]]
+type = "commit_changes"
+message = "staged only"
+add_all = false
+"#;
+        let wf = Workflow::parse(toml, WorkflowFormat::Toml).unwrap();
+        assert!(matches!(
+            &wf.teardown[0].step,
+            TeardownStep::CommitChanges { add_all: true, .. }
+        ));
+        assert!(matches!(
+            &wf.teardown[1].step,
+            TeardownStep::CommitChanges { add_all: false, .. }
         ));
     }
 

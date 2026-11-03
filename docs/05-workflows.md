@@ -374,7 +374,36 @@ The token is provided only to workflow steps that need it and is redacted from w
 
 **Handling missing or multiple CI runs:**
 
-If the branch was just pushed and GitHub hasn't created a run yet, the first few polls may return "not found". awman treats "not found" as a retryable condition (polling continues) for the first 3 attempts, then hard-fails with a message if no run is found. If multiple runs exist for the branch, awman uses the run whose commit SHA matches the current HEAD; if no match is found, it uses the most recent run with a warning.
+Only runs for the current HEAD commit count. Runs for earlier commits on the branch are ignored, so a previous commit's failure is never reported as this commit's result. If the branch was just pushed and GitHub hasn't created a run for HEAD yet, the poll reports "not found" and keeps waiting for the first 3 attempts, then fails if no run has appeared.
+
+When a commit has several runs:
+
+- For each workflow and trigger (`push`, `pull_request`, ...), only the newest run counts, so a successful re-run replaces an earlier failure.
+- A cancelled run is ignored when another run of the same workflow for this commit was not cancelled. This is what a concurrency group with `cancel-in-progress` does when a push and a pull request trigger the same workflow.
+- Any other failed, timed-out or cancelled run fails the step.
+
+**Fixing CI failures with `on_failure`:**
+
+When `poll_ci` fails because CI failed, awman fetches the failed jobs, their failed steps and the last 150 log lines of each (up to 3 jobs), and puts them in the failure file the `on_failure` agent reads (see [Step remediation](#step-remediation-with-on_failure)).
+
+After each agent attempt, awman runs the teardown's earlier `commit_changes` and `push_branch` steps again, each with the same credentials it had the first time, and only then polls CI again. The fix commit names the jobs it fixes: a `commit_changes` message of `Implement 0014` becomes `Implement 0014: fix CI jobs lint, test` (or `Implement 0014: fix CI` when the failed jobs could not be fetched). Put both steps before `poll_ci`; if no `push_branch` step precedes it, awman warns that a fix cannot reach CI.
+
+```toml
+[[teardown]]
+type = "commit_changes"
+message = "Implement feature"
+
+[[teardown]]
+type = "push_branch"
+
+[[teardown]]
+type = "poll_ci"
+interval_secs = 60
+max_retries = 20
+[teardown.on_failure]
+prompt = "CI failed. Read the failure file, fix the root cause, and run the failing check locally. Do not push; awman commits and pushes your fix."
+max_attempts = 2
+```
 
 **Example use case:**
 
@@ -607,9 +636,9 @@ Teardown steps are defined in a `[[teardown]]` (TOML) or `teardown:` (YAML) arra
 |------|--------|-------------|
 | `run_shell` | `command` (string, required), `env` (object, optional) | Execute a shell command. |
 | `run_script` | `path` (string, required), `env` (object, optional) | Execute a shell script file. |
-| `commit_changes` | `message` (string, required), `add_all` (boolean, optional) | Commit staged changes. If `add_all` is `true`, runs `git add -A` first. |
+| `commit_changes` | `message` (string, required), `add_all` (boolean, optional, default `true`) | Commit the agent's work. By default every change in the working tree is staged first (`git add -A`), except awman's own run state under `.awman/workflows/`. Set `add_all = false` to commit only what is already staged. If there is nothing to commit (for example, the agent already committed its own work), the step succeeds and says so, so the following push and pull request steps still run. |
 | `push_branch` | `remote` (string, optional), `branch` (string, optional) | Push the current branch to a remote and set it as the upstream (`git push -u`). `remote` defaults to `origin` and `branch` to the current branch (`HEAD`), so omitting both runs `git push -u -- origin HEAD`. The branch field accepts a branch name, not options or force refspecs. |
-| `create_pull_request` | `title` (string, optional), `body` (string, optional), `base` (string, optional) | Create a pull request using the GitHub CLI. If `base` is provided, it sets the branch the PR will be opened against (via the `--base` flag). Requires `gh` to be available in the base container image. |
+| `create_pull_request` | `title` (string, optional), `body` (string, optional), `base` (string, optional) | Create a pull request using the GitHub CLI. If `base` is provided, it sets the branch the PR will be opened against (via the `--base` flag). Requires `gh` to be available in the base container image. GitHub indexes a push a moment after it arrives; if `gh` reports "No commits between" the base and the branch, awman waits and retries up to four times (about 30 seconds in total) before failing the step. |
 | `poll_ci` | `interval_secs` (integer, optional), `max_retries` (integer, optional) | Poll GitHub for the CI run status of the current branch. Waits for the CI run to complete. `interval_secs` controls the polling interval in seconds (default: 30). `max_retries` limits the number of polling attempts (default: 10). See [Polling CI status](#polling-ci-status) for details. |
 
 If any teardown step is `commit_changes`, awman checks the identity available in the repository or worktree before starting. A complete repo-local identity is used as-is. If it is incomplete, awman offers choices in an interactive run, including entering an identity for this run or allowing the host-global identity for this run. No global Git config is changed. Headless runs need a complete repo-local identity or an explicit `--prerequisite-identity` choice.

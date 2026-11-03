@@ -1,4 +1,4 @@
-//! CI status polling via `gh` CLI or GitHub REST API fallback.
+//! CI status polling via `gh` CLI o        let normalized = serde_json::Value::Array(runs.iter().map(normalize_api_run).collect()); GitHub REST API fallback.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -21,6 +21,14 @@ pub enum CiStatus {
     Running,
     Success,
     Failed(String),
+}
+
+/// The detail behind a CI failure: a report for the on_failure agent (failed
+/// jobs, steps and log tails) and the failed jobs' names.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CiFailure {
+    pub report: String,
+    pub failed_jobs: Vec<String>,
 }
 
 fn parse_github_owner_repo(url: &str) -> Result<(String, String), EngineError> {
@@ -61,168 +69,329 @@ where
     Ok(rt.block_on(fut))
 }
 
-async fn fetch_workflow_runs_json(
-    url: String,
+/// How many failed jobs a failure report includes, and how much of each
+/// job's log. The report is for the on_failure agent: enough to see the
+/// failing step's output without flooding its context.
+const REPORT_MAX_JOBS: usize = 3;
+const REPORT_LOG_TAIL_LINES: usize = 150;
+
+/// A GitHub REST API client for one repository's Actions data.
+struct GitHubActionsApi {
+    base: String,
+    owner: String,
+    repo: String,
     token: SecretString,
-) -> Result<serde_json::Value, EngineError> {
-    HttpCore::refuse_public_host_under_test_isolation(&url)
-        .map_err(|e| EngineError::Other(format!("poll_ci: {e}")))?;
-    // The shared builder with every option left at its default, which is the
-    // untimed client this poller has always used (WI 0114 F-28).
-    let client = HttpCore::client(&HttpClientOptions::default())
-        .map_err(|e| EngineError::Other(format!("poll_ci: {e}")))?;
-    let resp = client
-        .get(&url)
-        .header("Authorization", {
-            let mut header =
-                reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token.expose()))
-                    .map_err(|_| EngineError::Other("poll_ci: invalid token header".into()))?;
-            header.set_sensitive(true);
-            header
+}
+
+impl GitHubActionsApi {
+    fn new(host: &str, owner: &str, repo: &str, token: &str) -> Self {
+        let base = if host == "github.com" {
+            "https://api.github.com".into()
+        } else {
+            format!("https://{host}/api/v3")
+        };
+        Self {
+            base,
+            owner: owner.into(),
+            repo: repo.into(),
+            token: SecretString::new(token),
+        }
+    }
+
+    fn repo_url(&self, path: &str) -> String {
+        format!("{}/repos/{}/{}/{path}", self.base, self.owner, self.repo)
+    }
+
+    async fn get(&self, url: String) -> Result<reqwest::Response, EngineError> {
+        HttpCore::refuse_public_host_under_test_isolation(&url)
+            .map_err(|e| EngineError::Other(format!("poll_ci: {e}")))?;
+        // Timed, so a stalled log download cannot hang the teardown.
+        let client = HttpCore::client(&HttpClientOptions {
+            connect_timeout: Some(std::time::Duration::from_secs(15)),
+            read_timeout: Some(std::time::Duration::from_secs(60)),
+            ..HttpClientOptions::default()
         })
-        .header("User-Agent", "awman")
-        .header("Accept", "application/vnd.github+json")
-        .send()
-        .await
-        .map_err(|e| EngineError::Other(format!("poll_ci: GitHub API request failed: {e}")))?;
-
-    let status_code = resp.status().as_u16();
-    if status_code == 403 || status_code == 429 {
-        return Err(EngineError::Other(format!(
-            "poll_ci: GitHub API rate limit (HTTP {status_code}); \
-             ensure GITHUB_TOKEN has sufficient permissions"
-        )));
-    }
-    if !resp.status().is_success() {
-        return Err(EngineError::Other(format!(
-            "poll_ci: GitHub API returned HTTP {status_code}"
-        )));
-    }
-
-    resp.json::<serde_json::Value>()
-        .await
-        .map_err(|e| EngineError::Other(format!("poll_ci: failed to parse API response: {e}")))
-}
-
-fn fetch_via_api(
-    host: &str,
-    owner: &str,
-    repo: &str,
-    branch: &str,
-    head_sha: &str,
-    token: &str,
-) -> Result<CiStatus, EngineError> {
-    let base = if host == "github.com" {
-        "https://api.github.com".into()
-    } else {
-        format!("https://{host}/api/v3")
-    };
-    let url = format!("{base}/repos/{owner}/{repo}/actions/runs?branch={branch}&per_page=5");
-
-    let json = run_async(fetch_workflow_runs_json(url, SecretString::new(token)))??;
-
-    let runs = json
-        .get("workflow_runs")
-        .and_then(|v| v.as_array())
-        .ok_or_else(|| {
-            EngineError::Other("poll_ci: unexpected GitHub API response structure".into())
-        })?;
-
-    if runs.is_empty() {
-        return Ok(CiStatus::NotFound);
-    }
-
-    let as_array = serde_json::Value::Array(
-        runs.iter()
-            .map(|r| {
-                serde_json::json!({
-                    "status": r.get("status").and_then(|v| v.as_str()).unwrap_or(""),
-                    "conclusion": r.get("conclusion").and_then(|v| v.as_str()).unwrap_or(""),
-                    "name": r.get("name").and_then(|v| v.as_str()).unwrap_or(""),
-                    "headSha": r.get("head_sha").and_then(|v| v.as_str()).unwrap_or(""),
-                })
+        .map_err(|e| EngineError::Other(format!("poll_ci: {e}")))?;
+        let resp = client
+            .get(&url)
+            .header("Authorization", {
+                let mut header = reqwest::header::HeaderValue::from_str(&format!(
+                    "Bearer {}",
+                    self.token.expose()
+                ))
+                .map_err(|_| EngineError::Other("poll_ci: invalid token header".into()))?;
+                header.set_sensitive(true);
+                header
             })
-            .collect(),
-    );
+            .header("User-Agent", "awman")
+            .header("Accept", "application/vnd.github+json")
+            .send()
+            .await
+            .map_err(|e| EngineError::Other(format!("poll_ci: GitHub API request failed: {e}")))?;
 
-    parse_run_list(&as_array, head_sha)
+        let status_code = resp.status().as_u16();
+        if status_code == 403 || status_code == 429 {
+            return Err(EngineError::Other(format!(
+                "poll_ci: GitHub API rate limit (HTTP {status_code}); \
+                 ensure GITHUB_TOKEN has sufficient permissions"
+            )));
+        }
+        if !resp.status().is_success() {
+            return Err(EngineError::Other(format!(
+                "poll_ci: GitHub API returned HTTP {status_code}"
+            )));
+        }
+        Ok(resp)
+    }
+
+    fn get_json(&self, url: String) -> Result<serde_json::Value, EngineError> {
+        run_async(async {
+            self.get(url)
+                .await?
+                .json::<serde_json::Value>()
+                .await
+                .map_err(|e| {
+                    EngineError::Other(format!("poll_ci: failed to parse API response: {e}"))
+                })
+        })?
+    }
+
+    fn get_text(&self, url: String) -> Result<String, EngineError> {
+        run_async(async {
+            self.get(url)
+                .await?
+                .text()
+                .await
+                .map_err(|e| EngineError::Other(format!("poll_ci: failed to read response: {e}")))
+        })?
+    }
+
+    /// The runs for `head_sha` on `branch`, normalised to the shape
+    /// [`parse_run_list`] reads.
+    fn runs(&self, branch: &str, head_sha: &str) -> Result<serde_json::Value, EngineError> {
+        let url = self.repo_url(&format!(
+            "actions/runs?branch={branch}&head_sha={head_sha}&per_page=100"
+        ));
+        let json = self.get_json(url)?;
+        let runs = json
+            .get("workflow_runs")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| {
+                EngineError::Other("poll_ci: unexpected GitHub API response structure".into())
+            })?;
+        Ok(serde_json::Value::Array(
+            runs.iter().map(normalize_api_run).collect(),
+        ))
+    }
+
+    /// Failed jobs of the failed `runs` (id, name), their failed steps and
+    /// the tail of each job's log. Best effort: what cannot be fetched is
+    /// noted, not fatal. Every failed job is named; only the first few get
+    /// their detail and log.
+    fn failure(&self, runs: &[(u64, String)]) -> CiFailure {
+        let mut report = String::new();
+        let mut failed_jobs: Vec<String> = Vec::new();
+        for (run_id, _) in runs {
+            let jobs = match self.get_json(self.repo_url(&format!(
+                "actions/runs/{run_id}/jobs?filter=latest&per_page=100"
+            ))) {
+                Ok(json) => json,
+                Err(e) => {
+                    report.push_str(&format!("Could not list jobs of run {run_id}: {e}\n"));
+                    continue;
+                }
+            };
+            let jobs = jobs
+                .get("jobs")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            for job in jobs
+                .iter()
+                .filter(|j| is_failed_conclusion(str_field(j, "conclusion")))
+            {
+                failed_jobs.push(str_field(job, "name").to_string());
+                if failed_jobs.len() > REPORT_MAX_JOBS {
+                    report.push_str(&format!("Also failed: {}\n\n", str_field(job, "name")));
+                    continue;
+                }
+                report.push_str(&format_failed_job(job));
+                if let Some(job_id) = job.get("id").and_then(serde_json::Value::as_u64) {
+                    match self.get_text(self.repo_url(&format!("actions/jobs/{job_id}/logs"))) {
+                        Ok(log) => {
+                            report.push_str(&format!(
+                                "Last {REPORT_LOG_TAIL_LINES} log lines:\n{}\n",
+                                tail_lines(&log, REPORT_LOG_TAIL_LINES)
+                            ));
+                        }
+                        Err(e) => report.push_str(&format!("Could not fetch the job log: {e}\n")),
+                    }
+                }
+                report.push('\n');
+            }
+        }
+        // Without job data, the failed workflows still say what broke.
+        if failed_jobs.is_empty() {
+            failed_jobs = runs.iter().map(|(_, name)| name.clone()).collect();
+        }
+        failed_jobs.retain(|name| !name.is_empty());
+        failed_jobs.sort();
+        failed_jobs.dedup();
+        CiFailure {
+            report,
+            failed_jobs,
+        }
+    }
 }
 
-/// Parse the JSON array of runs (same shape from `gh` and from the API adapter)
-/// and determine the overall CI status.
+fn normalize_api_run(r: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "id": r.get("id").and_then(serde_json::Value::as_u64).unwrap_or(0),
+        "workflowId": r.get("workflow_id").and_then(serde_json::Value::as_u64).unwrap_or(0),
+        "event": str_field(r, "event"),
+        "status": str_field(r, "status"),
+        "conclusion": str_field(r, "conclusion"),
+        "name": str_field(r, "name"),
+        "headSha": str_field(r, "head_sha"),
+        "htmlUrl": str_field(r, "html_url"),
+    })
+}
+
+fn format_failed_job(job: &serde_json::Value) -> String {
+    let failed_steps: Vec<&str> = job
+        .get("steps")
+        .and_then(|v| v.as_array())
+        .map(|steps| {
+            steps
+                .iter()
+                .filter(|s| is_failed_conclusion(str_field(s, "conclusion")))
+                .map(|s| str_field(s, "name"))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut out = format!(
+        "Failed job: {} ({})\n",
+        str_field(job, "name"),
+        str_field(job, "conclusion")
+    );
+    if !str_field(job, "html_url").is_empty() {
+        out.push_str(&format!("URL: {}\n", str_field(job, "html_url")));
+    }
+    if !failed_steps.is_empty() {
+        out.push_str(&format!("Failed steps: {}\n", failed_steps.join(", ")));
+    }
+    out
+}
+
+fn tail_lines(text: &str, n: usize) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    lines[lines.len().saturating_sub(n)..].join("\n")
+}
+
+fn str_field<'a>(v: &'a serde_json::Value, key: &str) -> &'a str {
+    v.get(key).and_then(serde_json::Value::as_str).unwrap_or("")
+}
+
+fn is_failed_conclusion(conclusion: &str) -> bool {
+    !matches!(conclusion, "" | "success" | "skipped" | "neutral")
+}
+
+/// The runs that decide CI for `head_sha`.
+///
+/// Only runs of that exact commit count: right after a push GitHub may not
+/// have queued the new runs yet, and judging the branch's previous commit
+/// instead would report its old result. Of several runs of one workflow for
+/// one trigger, only the newest counts (a re-run replaces the original). A
+/// cancelled run is ignored when another run of the same workflow did not
+/// cancel: that is a concurrency group replacing a duplicate run (a push and
+/// a pull_request trigger for the same commit), not a CI failure.
+fn decisive_runs<'a>(runs: &'a [serde_json::Value], head_sha: &str) -> Vec<&'a serde_json::Value> {
+    let workflow = |r: &serde_json::Value| match r.get("workflowId").and_then(|v| v.as_u64()) {
+        Some(id) if id != 0 => id.to_string(),
+        _ => str_field(r, "name").to_string(),
+    };
+    let run_id = |r: &serde_json::Value| r.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
+
+    // GitHub lists runs newest first, so without ids the first one seen wins.
+    let mut latest: Vec<&serde_json::Value> = Vec::new();
+    for run in runs.iter().filter(|r| str_field(r, "headSha") == head_sha) {
+        let key = (workflow(run), str_field(run, "event"));
+        match latest
+            .iter_mut()
+            .find(|l| (workflow(l), str_field(l, "event")) == key)
+        {
+            Some(slot) if run_id(run) > run_id(slot) => *slot = run,
+            Some(_) => {}
+            None => latest.push(run),
+        }
+    }
+
+    let superseded_cancel = |r: &serde_json::Value| {
+        str_field(r, "conclusion") == "cancelled"
+            && latest.iter().any(|other| {
+                !std::ptr::eq(*other, r)
+                    && workflow(other) == workflow(r)
+                    && str_field(other, "conclusion") != "cancelled"
+            })
+    };
+    latest
+        .iter()
+        .copied()
+        .filter(|r| !superseded_cancel(r))
+        .collect()
+}
+
+fn is_running(run: &serde_json::Value) -> bool {
+    str_field(run, "status") != "completed"
+}
+
+fn is_failed(run: &serde_json::Value) -> bool {
+    !is_running(run) && is_failed_conclusion(str_field(run, "conclusion"))
+}
+
+/// Ids and names of the failed decisive runs for `head_sha`.
+fn failed_runs(json: &serde_json::Value, head_sha: &str) -> Vec<(u64, String)> {
+    let runs = json.as_array().map(Vec::as_slice).unwrap_or_default();
+    decisive_runs(runs, head_sha)
+        .into_iter()
+        .filter(|r| is_failed(r))
+        .filter_map(|r| {
+            let id = r.get("id").and_then(|v| v.as_u64()).filter(|id| *id != 0)?;
+            Some((id, str_field(r, "name").to_string()))
+        })
+        .collect()
+}
+
+/// Parse the JSON array of runs (the normalised API shape) and determine
+/// the overall CI status of `head_sha`.
 fn parse_run_list(json: &serde_json::Value, head_sha: &str) -> Result<CiStatus, EngineError> {
     let runs = json
         .as_array()
         .ok_or_else(|| EngineError::Other("poll_ci: expected JSON array of runs".into()))?;
 
-    if runs.is_empty() {
+    let decisive = decisive_runs(runs, head_sha);
+    if decisive.is_empty() {
         return Ok(CiStatus::NotFound);
     }
 
-    // Prefer runs matching HEAD SHA; fall back to most recent run on branch.
-    let matching: Vec<&serde_json::Value> = runs
+    let failures: Vec<String> = decisive
         .iter()
-        .filter(|r| {
-            r.get("headSha")
-                .and_then(serde_json::Value::as_str)
-                .map(|s| s == head_sha)
-                .unwrap_or(false)
+        .filter(|r| is_failed(r))
+        .map(|r| {
+            let name = match str_field(r, "name") {
+                "" => "unknown",
+                name => name,
+            };
+            match str_field(r, "htmlUrl") {
+                "" => format!("{name}: {}", str_field(r, "conclusion")),
+                url => format!("{name}: {} ({url})", str_field(r, "conclusion")),
+            }
         })
         .collect();
 
-    let all_refs: Vec<&serde_json::Value> = runs.iter().collect();
-    let target_runs: &[&serde_json::Value] = if matching.is_empty() {
-        &all_refs
-    } else {
-        &matching
-    };
-
-    let mut any_running = false;
-    let mut any_failed = false;
-    let mut failure_detail = String::new();
-
-    for run in target_runs {
-        let status = run
-            .get("status")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("");
-        let conclusion = run
-            .get("conclusion")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("");
-        let name = run
-            .get("name")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("unknown");
-
-        match status {
-            "queued" | "in_progress" | "waiting" | "pending" | "requested" => {
-                any_running = true;
-            }
-            "completed" => match conclusion {
-                "success" | "skipped" | "neutral" => {}
-                "failure" | "timed_out" | "cancelled" | "action_required" => {
-                    any_failed = true;
-                    if failure_detail.is_empty() {
-                        failure_detail = format!("{name}: {conclusion}");
-                    }
-                }
-                other => {
-                    any_failed = true;
-                    if failure_detail.is_empty() {
-                        failure_detail = format!("{name}: {other}");
-                    }
-                }
-            },
-            _ => {
-                any_running = true;
-            }
-        }
-    }
-
-    if any_failed {
-        Ok(CiStatus::Failed(failure_detail))
-    } else if any_running {
+    if !failures.is_empty() {
+        Ok(CiStatus::Failed(failures.join("; ")))
+    } else if decisive.iter().any(|r| is_running(r)) {
         Ok(CiStatus::Running)
     } else {
         Ok(CiStatus::Success)
@@ -251,6 +420,9 @@ pub struct CiPoller {
     destination: Option<String>,
     refused_binaries: Vec<String>,
     redaction: RedactionSet,
+    /// What the last failed status check learned about the failure, for the
+    /// on_failure agent and its fix commit.
+    failure: std::sync::Mutex<Option<CiFailure>>,
 }
 
 impl CiPoller {
@@ -261,6 +433,7 @@ impl CiPoller {
             destination: None,
             refused_binaries: vec![],
             redaction: RedactionSet::new(),
+            failure: std::sync::Mutex::new(None),
         }
     }
     pub fn with_destination(mut self, destination: Option<String>) -> Self {
@@ -377,7 +550,20 @@ impl CiPoller {
                     EngineError::Other("poll_ci: invalid enterprise repository".into())
                 })?
         };
-        fetch_via_api(host, &owner, &repo, &branch, &head_sha, token)
+        let api = GitHubActionsApi::new(host, &owner, &repo, token);
+        let runs = api.runs(&branch, &head_sha)?;
+        let status = parse_run_list(&runs, &head_sha)?;
+        if matches!(status, CiStatus::Failed(_)) {
+            let mut failure = api.failure(&failed_runs(&runs, &head_sha));
+            failure.report = self.redaction.redact(&failure.report);
+            *self.failure.lock().unwrap() = Some(failure);
+        }
+        Ok(status)
+    }
+
+    /// What the last CI failure this poller saw was made of, if any.
+    pub fn take_failure(&self) -> Option<CiFailure> {
+        self.failure.lock().unwrap().take()
     }
 
     /// Poll until CI passes, fails, or `max_retries` attempts are spent.
@@ -531,12 +717,65 @@ mod tests {
     }
 
     #[test]
-    fn parse_run_list_falls_back_when_no_sha_match() {
+    fn parse_run_list_ignores_runs_of_other_commits() {
+        // Right after a push the new commit has no run yet; the previous
+        // commit's failed run must not be reported as this commit's result.
         let json = serde_json::json!([
             {"status": "completed", "conclusion": "failure", "name": "CI", "headSha": "old111"}
         ]);
         let result = parse_run_list(&json, "abc123").unwrap();
-        assert!(matches!(result, CiStatus::Failed(_)));
+        assert_eq!(result, CiStatus::NotFound);
+    }
+
+    #[test]
+    fn parse_run_list_counts_only_the_newest_run_per_workflow_and_trigger() {
+        let json = serde_json::json!([
+            {"id": 9, "workflowId": 1, "event": "push", "status": "completed", "conclusion": "success", "name": "CI", "headSha": "abc"},
+            {"id": 7, "workflowId": 1, "event": "push", "status": "completed", "conclusion": "failure", "name": "CI", "headSha": "abc"}
+        ]);
+        assert_eq!(parse_run_list(&json, "abc").unwrap(), CiStatus::Success);
+    }
+
+    #[test]
+    fn parse_run_list_ignores_a_run_cancelled_by_its_concurrency_group() {
+        let json = serde_json::json!([
+            {"id": 9, "workflowId": 1, "event": "pull_request", "status": "completed", "conclusion": "success", "name": "CI", "headSha": "abc"},
+            {"id": 8, "workflowId": 1, "event": "push", "status": "completed", "conclusion": "cancelled", "name": "CI", "headSha": "abc"}
+        ]);
+        assert_eq!(parse_run_list(&json, "abc").unwrap(), CiStatus::Success);
+    }
+
+    #[test]
+    fn parse_run_list_still_fails_a_real_failure_on_another_trigger() {
+        let json = serde_json::json!([
+            {"id": 9, "workflowId": 1, "event": "pull_request", "status": "completed", "conclusion": "failure", "name": "CI", "headSha": "abc", "htmlUrl": "https://github.com/o/r/actions/runs/9"},
+            {"id": 8, "workflowId": 1, "event": "push", "status": "completed", "conclusion": "success", "name": "CI", "headSha": "abc"}
+        ]);
+        let CiStatus::Failed(detail) = parse_run_list(&json, "abc").unwrap() else {
+            panic!("expected Failed");
+        };
+        assert_eq!(
+            detail,
+            "CI: failure (https://github.com/o/r/actions/runs/9)"
+        );
+        assert_eq!(failed_runs(&json, "abc"), [(9, "CI".to_string())]);
+    }
+
+    #[test]
+    fn failed_job_report_names_the_failed_steps() {
+        let job = serde_json::json!({
+            "name": "test", "conclusion": "failure", "html_url": "https://github.com/o/r/actions/runs/9/job/3",
+            "steps": [
+                {"name": "checkout", "conclusion": "success"},
+                {"name": "cargo test", "conclusion": "failure"}
+            ]
+        });
+        assert_eq!(
+            format_failed_job(&job),
+            "Failed job: test (failure)\nURL: https://github.com/o/r/actions/runs/9/job/3\nFailed steps: cargo test\n"
+        );
+        assert_eq!(tail_lines("a\nb\nc", 2), "b\nc");
+        assert_eq!(tail_lines("a", 5), "a");
     }
 
     #[test]
@@ -714,7 +953,7 @@ mod tests {
         assert!(detail.contains("cancelled"), "detail: {detail}");
     }
 
-    /// Verify that the `fetch_via_api` JSON normalisation (head_sha → headSha)
+    /// Verify that the API run normalisation (head_sha → headSha)
     /// produces a shape that `parse_run_list` can interpret correctly.
     #[test]
     fn github_api_workflow_runs_json_normalized_and_parsed() {
@@ -734,19 +973,7 @@ mod tests {
             .and_then(|v| v.as_array())
             .unwrap();
 
-        // Replicate the normalization performed inside fetch_via_api.
-        let normalized = serde_json::Value::Array(
-            runs.iter()
-                .map(|r| {
-                    serde_json::json!({
-                        "status":     r.get("status")    .and_then(|v| v.as_str()).unwrap_or(""),
-                        "conclusion": r.get("conclusion").and_then(|v| v.as_str()).unwrap_or(""),
-                        "name":       r.get("name")      .and_then(|v| v.as_str()).unwrap_or(""),
-                        "headSha":    r.get("head_sha")  .and_then(|v| v.as_str()).unwrap_or(""),
-                    })
-                })
-                .collect(),
-        );
+        let normalized = serde_json::Value::Array(runs.iter().map(normalize_api_run).collect());
 
         let result = parse_run_list(&normalized, "deadbeef").unwrap();
         assert_eq!(result, CiStatus::Success);
