@@ -161,6 +161,7 @@ pub(super) fn bridge_pty(
     // Writer task: stdin channel → PTY.
     let stdin_tx = io.stdin_tx;
     let mut stdin_rx = io.stdin_rx;
+    let slave_path = crate::engine::container::io_bridge::pty_slave_path(pair.master.as_ref());
     tokio::spawn(async move {
         use std::io::Write;
         while let Some(bytes) = stdin_rx.recv().await {
@@ -168,6 +169,7 @@ pub(super) fn bridge_pty(
                 break;
             }
         }
+        crate::engine::container::io_bridge::drop_pty_writer_quietly(writer, slave_path.as_deref());
     });
 
     // Resize task.

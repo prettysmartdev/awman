@@ -15,6 +15,51 @@ use crate::engine::agent_runtime::frontend::AgentIo;
 use crate::engine::agent_runtime::output_tail::OutputTail;
 use crate::engine::error::EngineError;
 
+/// Drop a PTY bridge's writer without typing into the session.
+///
+/// portable-pty's `take_writer` handle writes "\n" + VEOF when dropped, and a
+/// bridge's writer drops when its session ends — while the client on the
+/// slave may still be alive (a `docker attach` being detached, an unwaited
+/// `docker run -it` that must stay reattachable). The client would forward
+/// those bytes to the agent as Enter + Ctrl-D. The drop writes only when VEOF
+/// is set, and termios is shared by both ends, so clear VEOF on the slave
+/// first. The session is over, so its EOF character no longer matters.
+pub(crate) fn drop_pty_writer_quietly(
+    writer: Box<dyn std::io::Write + Send>,
+    slave_path: Option<&std::path::Path>,
+) {
+    #[cfg(unix)]
+    if let Some(path) = slave_path {
+        use nix::sys::termios::{tcgetattr, tcsetattr, SetArg, SpecialCharacterIndices};
+        use std::os::unix::fs::OpenOptionsExt;
+        if let Ok(slave) = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOCTTY)
+            .open(path)
+        {
+            if let Ok(mut termios) = tcgetattr(&slave) {
+                termios.control_chars[SpecialCharacterIndices::VEOF as usize] = 0;
+                let _ = tcsetattr(&slave, SetArg::TCSANOW, &termios);
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = slave_path;
+    drop(writer);
+}
+
+/// The slave device path for [`drop_pty_writer_quietly`]; `None` off Unix.
+pub(crate) fn pty_slave_path(master: &dyn portable_pty::MasterPty) -> Option<std::path::PathBuf> {
+    #[cfg(unix)]
+    return master.tty_name();
+    #[cfg(not(unix))]
+    {
+        let _ = master;
+        None
+    }
+}
+
 /// Shared last-activity timestamp. Updated by reader threads on every byte
 /// chunk from stdout or stderr. Read by the stuck detector task.
 pub(crate) type SharedActivity = Arc<Mutex<Option<Instant>>>;
@@ -292,6 +337,7 @@ pub(crate) fn bridge_pty(
     // Writer task: stdin channel → PTY.
     let stdin_tx = io.stdin_tx;
     let mut stdin_rx = io.stdin_rx;
+    let slave_path = pty_slave_path(pair.master.as_ref());
     tokio::spawn(async move {
         use std::io::Write;
         while let Some(bytes) = stdin_rx.recv().await {
@@ -302,6 +348,7 @@ pub(crate) fn bridge_pty(
                 break;
             }
         }
+        drop_pty_writer_quietly(writer, slave_path.as_deref());
     });
 
     // Resize task.
@@ -791,6 +838,70 @@ mod tests {
             .expect("stderr bytes should arrive promptly")
             .expect("channel alive");
         assert_eq!(bytes, b"oops\n");
+    }
+
+    /// Ending a PTY bridge's input while the client still runs (a detach)
+    /// types nothing into it: portable-pty's writer would otherwise send
+    /// "\n" + EOF on drop.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bridge_pty_input_close_sends_nothing_to_a_live_client() {
+        use crate::engine::agent_runtime::frontend::AgentIo;
+        use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+
+        let dir = tempfile::tempdir().unwrap();
+        let received = dir.path().join("received");
+        let (stdout_tx, _stdout_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (stderr_tx, _stderr_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (stdin_tx, stdin_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let io = AgentIo {
+            stdout: stdout_tx,
+            stderr: stderr_tx,
+            stdin_tx,
+            stdin_rx,
+            resize: None,
+            initial_size: Some((80, 24)),
+        };
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        let mut cmd = CommandBuilder::new("sh");
+        cmd.args(["-c", &format!("exec cat > '{}'", received.display())]);
+        let mut child = pair.slave.spawn_command(cmd).unwrap();
+        let (_master, bridge) = bridge_pty(
+            io,
+            pair,
+            BridgeConfig {
+                grace_timeout: Duration::from_secs(30),
+                stuck_timeout: Duration::from_secs(30),
+                container_start_delay: Duration::ZERO,
+                cancel_on_grace_expired: None,
+                output_tail: Arc::new(OutputTail::with_default_capacity()),
+                output_broadcast: None,
+            },
+        )
+        .unwrap();
+
+        bridge.stdin_injector.send(b"hello\n".to_vec()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while std::fs::read(&received).unwrap_or_default() != b"hello\n" {
+            assert!(Instant::now() < deadline, "input never reached the client");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        drop(bridge.stdin_injector);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "closing the bridge's input must not end the client"
+        );
+        assert_eq!(std::fs::read(&received).unwrap(), b"hello\n");
+        child.kill().unwrap();
+        let _ = child.wait();
     }
 
     /// Bytes pushed through `stdin_tx` reach the child's stdin. We use `cat`
