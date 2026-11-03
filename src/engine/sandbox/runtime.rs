@@ -384,10 +384,12 @@ fn bridge_attach_pty(
         .master
         .try_clone_reader()
         .map_err(|e| EngineError::Sandbox(format!("clone sbx pty reader: {e}")))?;
-    let mut writer = pair
+    let writer = pair
         .master
         .take_writer()
         .map_err(|e| EngineError::Sandbox(format!("take sbx pty writer: {e}")))?;
+    let mut writer =
+        crate::engine::container::io_bridge::QuietPtyWriter::new(writer, pair.master.as_ref());
 
     let stdout_tx = io.stdout;
     std::thread::spawn(move || {
@@ -406,7 +408,6 @@ fn bridge_attach_pty(
     });
 
     let mut stdin_rx = io.stdin_rx;
-    let slave_path = crate::engine::container::io_bridge::pty_slave_path(pair.master.as_ref());
     tokio::spawn(async move {
         use std::io::Write;
         while let Some(bytes) = stdin_rx.recv().await {
@@ -414,7 +415,6 @@ fn bridge_attach_pty(
                 break;
             }
         }
-        crate::engine::container::io_bridge::drop_pty_writer_quietly(writer, slave_path.as_deref());
     });
 
     let master_arc: SbxPtyMaster = std::sync::Arc::new(std::sync::Mutex::new(pair.master));
