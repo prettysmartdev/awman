@@ -3,7 +3,7 @@
 Title: Reference work server: GitHub issues as a work queue
 Issue: issuelink
 
-Depends on: 0147 (Work Server Protocol, `awman-wsp` crate).
+Depends on: 0147 (the worker feature's pull side: Work Server Protocol, `awman-wsp` crate), 0159 (wire conventions and `awman/` label prefix).
 
 ## Summary:
 - 0147 defines how awman workers pull work from a work server, but nothing ships that serves one. Add a small, production-usable **reference work server** that turns GitHub issues into work items:
@@ -43,10 +43,10 @@ So I can:
 make sure only workers labelled `gpu=true` take it
 
 ## Implementation Details:
-- **Shape.** A subcommand in the awman binary, `awman work-server github`, built on `awman-wsp`. There is no separate install, and it is not a daemon mode: it serves other machines, so it runs wherever the maintainer likes. State is a small SQLite database (`--data DIR`): workers, links, leases, the item cache and the event tail.
+- **Shape.** A subcommand in the awman binary, `awman work-server github`, built on `awman-wsp`. There is no separate install, and it is not a daemon feature: it serves other machines, so it runs wherever the maintainer likes. State is a small SQLite database (`--data DIR`): workers, links, leases, the item cache and the event tail.
 - **Config** (`work-server.toml`, or flags):
   ```toml
-  bind = "0.0.0.0:8787"            # behind TLS termination, or tls_cert/tls_key
+  listen = "0.0.0.0:8787"          # same name as daemon.network.listen (0159); behind TLS termination, or tls_cert/tls_key
   public_url = "https://work.example.com"
   [github]
   app_id = 123; private_key_path = "app.pem"   # GitHub App (recommended), or token_env = "GITHUB_TOKEN"
@@ -67,11 +67,11 @@ make sure only workers labelled `gpu=true` take it
   - `repo.url` is the repository's HTTPS clone URL, with `base_ref` set to the default branch and `branch`/`push.branch` set to `awman/issue-<n>`.
   - Credentials are a GitHub App installation token scoped to that repository with `contents: write`, minted per lease (1 h) and re-minted by `/credentials`.
 - **Labels to scheduling.**
-  - `awman:needs/<key>` becomes required `<key> Exists`.
+  - `awman:needs/<key>` becomes required `<key> Exists`. Keys are WSP label keys, so awman's reported labels are written with their `awman/` prefix (0159), for example `awman:needs/awman/agent.codex=true`.
   - `awman:needs/<key>=<value>` becomes required `<key> In [value]`.
   - `awman:prefer/<key>=<value>` becomes preferred with weight 50.
   - `priority:high`, `priority:low` and the `P0`–`P3` labels set priority. Ties are ordered by issue creation time.
-  - `awman:interactive` and `awman:non-interactive` set `exec.interaction`.
+  - `awman:interactive` and `awman:headless` set `exec.interaction` (0159's values).
   - `awman:leader/<agent>::<model>` overrides the leader.
 - **Assignees as affinity.** Linking is a GitHub device flow: the work server is a GitHub OAuth App, and the person who approves the `awman worker link` code signs in with GitHub. The worker then gets the server-assigned label `owner=github:<login>`. An issue with assignees becomes required `owner In [github:<login>…]`, so it is offered only to its assignees' machines. Unassigned issues are open to any worker the maintainer has allowlisted (`[workers] allow = ["github:alice", "team:acme/bots"]`).
 - **Reporting back.**
@@ -81,7 +81,7 @@ make sure only workers labelled `gpu=true` take it
   - On failure: mark it `awman:failed`, with the error stage and message and the failed steps. Removing `awman:failed` re-queues it.
   - On release: remove `awman:running`.
 - **Cancel.** Removing `queue_label` or closing the issue while a lease is running returns `cancel: true` on the next heartbeat.
-- **Viewers.** It accepts the lease terminal WebSocket (0147) and serves a minimal read-only page per running item (`/items/<id>`) with xterm.js, for maintainers who are signed in, so the reference also demonstrates terminal relay. It never grants remote input.
+- **Viewers.** It accepts the lease terminal WebSocket (0147, `awman.terminal.v1`) and serves a minimal read-only page per running item (`/items/<id>`) with xterm.js, for maintainers who are signed in, so the reference also demonstrates terminal relay. It never grants remote input.
 
 ## Edge Case Considerations:
 - Fork PRs and untrusted issue authors: only issues opened or labelled by people with write access are queued. The `queue_label` is applied by a maintainer, and the event's actor permission is checked, so an outsider cannot put work into the queue.

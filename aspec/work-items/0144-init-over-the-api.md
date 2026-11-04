@@ -3,6 +3,8 @@
 Title: `init` over the API
 Issue: issuelink
 
+Depends on: 0145 (`worker` push routes), 0159 (route names).
+
 ## Summary:
 - Dynamic workflows refuse any agent that has no `.awman/Dockerfile.<agent>` in the project (`workflow_preflight.rs`: "workflow.toml references agents with no Dockerfile in the project"). Only `awman init` writes those files, and `init` is not API-allowed (`catalogue/core.rs`: `api_allowed: false`). An API client given a repository awman has never seen cannot run a dynamic workflow on it. The leader burns its three repair attempts on a workflow that can never validate.
 - Make `init` API-allowed in local sessions, answered with the headless defaults the CLI already uses when stdin is not a terminal (keep an existing `Dockerfile.dev` and `aspec/`, skip the agent audit, no work-items setup). Better still, have dynamic mode's preflight provision a missing `.awman/Dockerfile.<agent>` for first-party agents itself, the way it already builds a missing agent image.
@@ -13,13 +15,13 @@ Issue: issuelink
 As a: API client (infact) running work on teams' repositories
 
 I want to:
-`POST /v1/commands {"subcommand":"init","args":["--agent","claude"]}` in a local session, or have `exec workflow --dynamic` set up a missing agent Dockerfile
+`POST /v1/worker/commands {"subcommand":"init","args":["--agent","claude"]}` in a local session, or have `exec workflow --dynamic` set up a missing agent Dockerfile
 
 So I can:
-run a team's first node without shelling out to the `awman` CLI on the API server's host
+run a team's first node without shelling out to the `awman` CLI on the daemon's host
 
 ## Implementation Details:
-- Mark `INIT` `api_allowed: true`. The API frontend answers `InitFrontend`'s questions with `HeadlessDefaults`, exactly as the CLI does for a non-TTY stdin. `--aspec` stays available.
+- Mark `INIT` `api_allowed: true`, which allows it on the `worker` feature's push routes (0145, `FrontendKind::Daemon { feature: Worker, .. }`). The push frontend answers `InitFrontend`'s questions with `HeadlessDefaults`, exactly as the CLI does for a non-TTY stdin. `--aspec` stays available.
 - Init's image build reports through the command's event stream like `ready` does.
 - Alternative: in `workflow_preflight`, when a referenced first-party agent has no project Dockerfile, run `provision_agent_dockerfile` (the step init uses) before failing, and tell the leader which agents are available before it designs the workflow, so a repair attempt is never spent on a missing file.
 

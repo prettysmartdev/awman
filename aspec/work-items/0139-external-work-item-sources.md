@@ -3,11 +3,13 @@
 Title: Work item sources: `workItems.source`, a unified `--work-item`, HTTP provider, inline bodies
 Issue: issuelink
 
+Depends on: 0159 (config tree and route names).
+
 ## Summary:
 - Today the only way to give dynamic mode its input is a file named `NNNN-*` in the repository (`dynamic.rs:279-299`). `--issue` exists but dynamic mode rejects it, and GitHub is the only `IssueSource` (`src/engine/issue/router.rs`). API clients that keep specs elsewhere must commit a file onto a branch just so awman can read it, and their numbers can collide with work items already in the repo. Teams that track work in GitHub issues have to keep passing `--issue`, and `new spec` can only ever write a file.
 - Add a repo-level work item source, `workItems.source` in `.awman/config.json`. When it is set, **all** work items are created in and read from that location: with `"source": "github"`, `new spec` opens a new GitHub issue instead of writing a file, and `--work-item 42` reads issue #42 on every command.
 - Remove `--issue` everywhere and rework `--work-item` into the one flag for every kind of work item: local files, GitHub issue numbers and links, and HTTP work items. A bare number follows `workItems.source`, which defaults to local files. URLs are auto-detected and routed to the right provider.
-- Add a generic HTTP work item provider, accept `--work-item` from any source in dynamic mode, and accept an inline work item on `POST /v1/commands`.
+- Add a generic HTTP work item provider, accept `--work-item` from any source in dynamic mode, and accept an inline work item on `POST /v1/worker/commands`.
 - Make `NNNN` resolution deterministic: today `read_dir` order decides which of two `0001-*` files wins (`issue.rs:26-49`). Error when more than one file matches.
 
 ## User Stories
@@ -51,7 +53,7 @@ avoid running the wrong spec silently
 ## Implementation Details:
 
 ### Configuration
-- Put the setting in the existing repo-only `workItems` block, as `workItems.source`, next to `dir` and `template`. All work item settings then live together, and `work_items.source` follows the existing CLI key naming. Add `source: Option<WorkItemSource>` to `WorkItemsConfig` in `data/config/repo.rs`:
+- Put the setting in the `workItems` section, as `workItems.source` (repo scope), next to `dir` and `template`. All work item settings then live together (0159 removes the `work_items.*` alias, so there is only one spelling). Add `source: Option<WorkItemSource>` to the `workItems` section of 0159's `ConfigFile`, and register it in the key table (`src/data/config/fields.rs`) with scope `repo`:
   ```json
   { "workItems": { "source": "github" } }
   ```
@@ -60,9 +62,9 @@ avoid running the wrong spec silently
   |---|---|
   | unset or `"local"` | Files in `workItems.dir`: today's behavior |
   | `"github"` | Issues in the repository of the `origin` remote |
-  | `"http:<name>"` | The entry with that `name` in global `issueSources.http` |
+  | `"http:<name>"` | The global provider `workItems.providers.<name>` |
 
-- Add `issueSources.http: [{ name, baseUrl, tokenEnv }]` to **global** config only. Repo config ships with the checkout and may be untrusted, so it can only select a provider by name. It can never supply a URL or token variable.
+- Add `workItems.providers.<name>: { baseUrl, tokenEnv }` with **global** scope only (a named map, per 0159's collection rule; names match `[a-z0-9][a-z0-9_-]{0,62}`). Repo config ships with the checkout and may be untrusted, so it can only select a provider by name. It can never supply a URL or token variable.
 - An unrecognized value, or an `http:<name>` with no matching global entry, is an error on any command that needs a work item. It must not fall back to local: that would write specs to a location the team is not using. Warn at load through `load_warnings`, too.
 - `workItems.dir` still locates local files when a source is set, including for explicit `local:` references. `workItems.template` still shapes new work items for every source.
 
@@ -72,7 +74,7 @@ Add `WorkItemRef::parse(input)` in `data/work_item_ref.rs` (Layer 0, pure, no I/
 | Input | Resolves to | Follows `source`? |
 |---|---|---|
 | `https://github.com/<o>/<r>/issues/<N>` | That GitHub issue | No |
-| Any other `http(s)://` URL | The `issueSources.http` entry whose `baseUrl` contains it; otherwise an error | No |
+| Any other `http(s)://` URL | The `workItems.providers` entry whose `baseUrl` contains it; otherwise an error | No |
 | `owner/repo#N` | That GitHub issue | No |
 | `github:<N>` or `#<N>` | Issue `N` on `origin` | No |
 | `local:<N>` | Local file number `N` | No |
@@ -163,7 +165,7 @@ The explicit forms always win over `workItems.source`, so a repo set to GitHub c
 - Require `https`, except for loopback addresses. Do not follow redirects to another origin with the token. Never send a request to a URL that matches no configured entry; this also stops an API client from using the awman host to reach arbitrary addresses.
 
 ### Inline work items
-- `POST /v1/commands` accepts an optional `work_item: { title, body, id? }`. awman writes it to the same temp file and treats it as a remote `ResolvedWorkItem`, whatever `workItems.source` says. This covers callers that cannot expose an HTTP endpoint the awman host can reach. Passing it along with a `--work-item` argument is a 400.
+- `POST /v1/worker/commands` accepts an optional `work_item: { title, body, id? }`. awman writes it to the same temp file and treats it as a remote `ResolvedWorkItem`, whatever `workItems.source` says. This covers callers that cannot expose an HTTP endpoint the awman host can reach. Passing it along with a `--work-item` argument is a 400.
 
 ## Edge Case Considerations:
 - **Migration from `--issue 42`:** with no source set, `--work-item 42` now means local file 0042. If that file does not exist, the error also suggests `--work-item github:42`. Scripts using `--issue` fail with the replacement message rather than doing something else silently.
@@ -193,7 +195,7 @@ The explicit forms always win over `workItems.source`, so a repo set to GitHub c
 
 ## Test Considerations:
 - **Unit, `WorkItemRef::parse`:** a table of every row in the grammar, leading zeros, `WI-42`, `PROJ-123`, malformed values, and precedence between rules.
-- **Unit, config:** `workItems.source` round trip; each accepted value; an unknown value and an unknown `http:<name>` give errors and do not fall back to local; `issueSources` in repo config has no effect; `config set work_items.source` works.
+- **Unit, config:** `workItems.source` round trip; each accepted value; an unknown value and an unknown `http:<name>` give errors and do not fall back to local; `workItems.providers` in a repo config is a validation error naming the global file; `config set workItems.source` writes the repo file.
 - **Resolver matrix:** every reference form against each of the three source settings, asserting which provider is called. Assert that a bare value never tries a second source.
 - **Router and provider tests:** HTTP base URL match including the look-alike host; provider tests against a local test server (JSON, markdown, 401, 404, a cross-origin redirect does not receive the token); non-`https` refused except on loopback.
 - **Creating:** fake `gh` executable (the `try_gh_cli_with_cmd` approach) and a test server for REST and HTTP. Cover: no file is written and no number is allocated with a remote source; a title starting with `-`; a create failure keeps the draft; no retry on timeout.
@@ -225,7 +227,7 @@ The explicit forms always win over `workItems.source`, so a repo set to GitHub c
 - Keep the `Issue` and `IssueSource` type names to limit churn. This item changes the user-facing concept, not the provider abstraction.
 - `parse_work_item_number` and `find_work_item_file` now serve only the local path. Move them out of `exec_workflow/issue.rs` to the new module. `push_back.rs` and `dynamic.rs` import them from `exec_workflow` today.
 - Other code that assumes a work item is a file or number: `worktree_lifecycle.rs` (`name_for`), `build_leader_prompt` placeholders, and `render_interview_prompt` and `render_amend_prompt`. Search for `work_item_number` and `{{work_item_` when implementing.
-- Update `aspec/uxui/cli.md` and `aspec/architecture/security.md` for the new flag, the global-only provider rule and the outbound request limits. Add `workItems.source` to the settings table used by `awman config` (`command/commands/config.rs`).
+- Update `aspec/uxui/cli.md` and `aspec/architecture/security.md` for the new flag, the global-only provider rule and the outbound request limits. Add `workItems.source` and `workItems.providers.*` rows to 0159's key table (`src/data/config/fields.rs`), which drives `awman config`, `--set` and the docs.
 - Related work items that mention `--issue` or this item's old scope: `aspec/work-items/README.md`, 0147 (uses the inline source), and 0151 (`--issue` with its new flags on `exec prompt`).
 
 ## Documentation
@@ -241,7 +243,7 @@ After implementation is complete, update user-facing documentation in `docs/` to
 See `CLAUDE.md` for more guidance on documentation standards.
 
 For this item, update:
-- `docs/07-configuration.md`: `workItems.source` and global `issueSources.http`.
+- `docs/07-configuration.md`: `workItems.source` and global `workItems.providers.<name>`.
 - `docs/10-github-integration.md`: rewrite around `--work-item` and `workItems.source`, including creating issues with `new spec`, how interview and amend publish edits while running, and the prompt injection warning.
 - `docs/06-dynamic-workflows.md`: work item inputs.
 - `docs/09-api-and-remote-mode.md`: inline work items, and how `remote` values are resolved on the server.

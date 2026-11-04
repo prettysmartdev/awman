@@ -430,7 +430,7 @@ For each finding, record: commit/change location, behavior before/after, focused
 - Moving idempotency logic (A01) must keep a retried request from creating a second session or command across a crash, and must keep the reservation released when a handler future is dropped.
 - Avoid widening mounts, network policy, credentials, or host execution while consolidating code. Keep native and sandbox capability refusals explicit.
 - Keep private-file versus repo-file permissions intentional; atomic publication must not silently change established symlink or concurrent-writer behavior.
-- Coordinate upstream runtime work with WI 0120, Linux/native gates with WI 0124, daemon structure with WI 0145, and live terminals with WI 0146. Do not duplicate their feature scope here.
+- Coordinate upstream runtime work with WI 0120, Linux/native gates with WI 0124, daemon structure with WI 0145, live terminals with WI 0146, and config keys and API routes with WI 0159 (A01–A03 build on today's routes; 0159's renames land after them and must keep the read models they introduce). Do not duplicate their feature scope here.
 
 ## Test Considerations:
 

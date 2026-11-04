@@ -125,7 +125,7 @@ return to existing work with a new agent session, without changing anything in t
 - These flags do not use `WorktreeLifecycle`, and there is no merge or discard prompt when the session ends. The worktree is the user's to keep working in, and removing it stays manual. Do not auto-delete a worktree or branch, including on abort or agent failure.
 
 ### Security
-- `--worktree <path>` lets the caller choose a host mount source, and the API's working-directory allowlist forbids linked worktrees (`aspec/architecture/security.md`). The flags are therefore CLI and TUI only. Verify that an API request for `exec prompt` containing them is refused.
+- `--worktree <path>` lets the caller choose a host mount source, and the `worker` push working-directory allowlist (`daemon.features.worker.push.workDirs`, 0159) forbids linked worktrees (`aspec/architecture/security.md`). The flags are therefore for local frontends only: the CLI and TUI, whether they run in-process or through the daemon's `engine` on the local listener (0154/0155). Verify that a `POST /v1/worker/commands` request for `exec prompt` containing them is refused.
 - `open_worktree_for` normally takes most repo config from the worktree checkout. With `--pr` and fetched branches, that checkout can be someone else's code, and its `.awman/config.json` could add overlays or env passthrough. For these flags, the invoker's repo config applies in full.
 - Host git goes through `host_command`, which already disables hooks, fsmonitor and content drivers. Add new git operations there, and do not spawn bare `git`.
 - Update `aspec/architecture/security.md`: the "only mount the current directory or repo root" rule needs to record these sessions, which mount a linked worktree of the same repo plus its main `.git`. Update `aspec/uxui/cli.md` too.
@@ -162,7 +162,7 @@ return to existing work with a new agent session, without changing anything in t
   - The three flags are on `chat` and `exec prompt`, and are mutually exclusive.
   - `exec workflow`'s `--worktree` is still boolean and it does not gain `--branch` or `--pr`.
   - `remote exec prompt` has none of them.
-  - All are hidden from the API.
+  - All are refused on the `worker` push routes (`/v1/worker/commands`, `/v1/worker/runs`).
   - Update `exec_prompt_flags_are_the_base_set_plus_issue` for the new set.
 - **Integration, `GitEngine`, using a real local bare repo as `origin`:**
   - One test per row of the `--branch` table, asserting whether a branch was created and where it points.

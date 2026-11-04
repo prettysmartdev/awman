@@ -3,6 +3,8 @@
 Title: Context over the API, and caller-chosen context keys
 Issue: issuelink
 
+Depends on: 0145 (daemon API), 0159 (route and naming rules).
+
 ## Summary:
 `context(repo)` is a good home for durable agent memory. It mounts a persistent directory and injects instructions telling the agent to read and update it. API clients cannot use it well, for three reasons:
 
@@ -31,20 +33,20 @@ So I can:
 show memory in my UI, let people edit it, back it up, and sync it across awman hosts
 
 ## Implementation Details:
-- Session field `context_key: Option<String>` (regex `^[a-z0-9][a-z0-9._-]{0,127}$`), stored on the session. When it is set, `repo_dir` resolves to `context/repo/_keyed/<key>/` instead of the origin-derived slug. The overlay grammar gains `context(repo@<key>[:ro|rw])` for CLI parity.
-- Routes, keyed by scope and key and restricted to `repo` (`global` stays host-private):
-  - `GET /v1/context/repo/{key}` returns `{files: [{path, size, sha256, modified_at}]}`.
-  - `GET` and `PUT /v1/context/repo/{key}/files/{path}`, with `If-Match: <sha256>` for optimistic concurrency.
-  - `DELETE /v1/context/repo/{key}/files/{path}`.
+- Session field `context_key: Option<String>` on `worker` push sessions (`POST /v1/worker/sessions`) (regex `^[a-z0-9][a-z0-9._-]{0,127}$`), stored on the session. When it is set, `repo_dir` resolves to `context/repo/_keyed/<key>/` instead of the origin-derived slug. The overlay grammar gains `context(repo@<key>[:ro|rw])` for CLI parity.
+- Routes. These are core daemon routes (0159 §5), shared by every feature and keyed by context key. Only `repo` context is exposed; `global` stays host-private, so the scope is not a path segment:
+  - `GET /v1/contexts/{key}` returns 0159's list shape: `{items: [{path, size_bytes, sha256, modified_at}], next_cursor}`.
+  - `GET` and `PUT /v1/contexts/{key}/files/{path}`, with `If-Match: <sha256>` for optimistic concurrency.
+  - `DELETE /v1/contexts/{key}/files/{path}`.
   - Paths are validated with `validate_context_path`; there is a size cap per file and per key.
-- Optional: `GET /v1/commands/{id}/context-changes` lists the files the command added, changed or removed in its context scopes (snapshot hashes at start and end).
+- Optional: `GET /v1/worker/commands/{id}/context_changes` lists the files the command added, changed or removed in its context scopes (snapshot hashes at start and end).
 
 ## Edge Case Considerations:
-- Two commands writing the same key concurrently: last writer wins on disk. `context-changes` lets the client detect this; document that `:ro` is the safe default for parallel jobs.
+- Two commands writing the same key concurrently: last writer wins on disk. `context_changes` lets the client detect this; document that `:ro` is the safe default for parallel jobs.
 - A key with no directory yet: `GET` returns an empty list, not 404.
 
 ## Test Considerations:
-- Key resolution (keyed vs inferred); traversal rejected; `If-Match` conflict returns 412; change listing.
+- Key resolution (keyed vs inferred); traversal rejected; `If-Match` conflict returns 412 with `code: precondition_failed`; change listing; responses follow 0159 (list shape, `size_bytes`, `_at` timestamps).
 
 ## Codebase Integration:
 - follow established conventions, best practices, testing, and architecture patterns from the project's aspec.
