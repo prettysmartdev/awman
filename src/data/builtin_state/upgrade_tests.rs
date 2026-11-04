@@ -412,7 +412,17 @@ fn held_locks_ignores_stale_files_symlinks_and_directories() {
     symlink(&held_path, locks.join("symlink.lock")).unwrap();
     assert_eq!(state.held_locks("run/locks").unwrap(), vec![held_path]);
     drop(held);
-    assert!(state.held_locks("run/locks").unwrap().is_empty());
+    // A child forked by a parallel test while `held` was open shares its
+    // flock until that child's exec closes the copy, so a released lock can
+    // read as held briefly. A leaked lock never clears.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !state.held_locks("run/locks").unwrap().is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a released lock must not stay held"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
 }
 
 fn ledger_catalog(state: &BuiltinState) {

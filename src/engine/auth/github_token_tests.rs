@@ -36,11 +36,14 @@ fn resolver_for(host: &str) -> GitHubTokenResolver {
     .with_env_snapshot(EnvSnapshot::empty())
 }
 
-/// Hold the process-wide PATH lock with `PATH` set to exactly `dir`.
-fn path_only(dir: &Path) -> PathGuard {
-    let guard = PathGuard::acquire();
-    std::env::set_var("PATH", dir);
-    guard
+/// Hold the process-wide PATH lock with `dir` first on `PATH`.
+///
+/// Never replace `PATH` outright: tests that do not take the lock run in
+/// parallel and would lose `sh`, `git` and `sleep`. A host `gh` left on
+/// `PATH` is invisible anyway, since test isolation only accepts a `gh`
+/// inside the temp dir.
+fn path_with(dir: &Path) -> PathGuard {
+    PathGuard::prepending(dir)
 }
 
 #[test]
@@ -48,7 +51,7 @@ fn gh_status_maps_exit_codes_and_missing_gh() {
     let dir = tempfile::tempdir().unwrap();
     let gh = write_exe(dir.path(), "gh", FAKE_GH);
     let gh = gh.canonicalize().unwrap();
-    let _path = path_only(dir.path());
+    let path = path_with(dir.path());
 
     let found = resolver_for("github.com").gh_on_path().unwrap();
     assert_eq!(found.canonicalize().unwrap(), gh);
@@ -82,8 +85,9 @@ fn gh_status_maps_exit_codes_and_missing_gh() {
         GhAuthStatus::Unknown { .. }
     ));
 
-    let empty = tempfile::tempdir().unwrap();
-    std::env::set_var("PATH", empty.path());
+    // Without the fake on PATH, no gh is found.
+    drop(path);
+    let _path = PathGuard::acquire();
     assert_eq!(
         resolver_for("github.com").host_gh_status(),
         GhAuthStatus::NotInstalled
@@ -110,7 +114,7 @@ fn gh_outside_the_temp_dir_is_invisible_under_test_isolation() {
         return;
     }
     write_exe(dir.path(), "gh", FAKE_GH);
-    let _path = path_only(dir.path());
+    let _path = path_with(dir.path());
     assert!(resolver_for("github.com").gh_on_path().is_none());
     assert_eq!(
         resolver_for("github.com").host_gh_status(),
@@ -122,7 +126,7 @@ fn gh_outside_the_temp_dir_is_invisible_under_test_isolation() {
 fn gh_token_and_login_commands_have_fixed_argv() {
     let dir = tempfile::tempdir().unwrap();
     write_exe(dir.path(), "gh", FAKE_GH);
-    let _path = path_only(dir.path());
+    let _path = path_with(dir.path());
     let r = resolver_for("ghe.example.com:8443");
 
     let token = r.gh_auth_token_command(HostStdin::Null).unwrap();

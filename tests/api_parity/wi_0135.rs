@@ -726,6 +726,19 @@ async fn real_network_cancel_during_run_setup_cancels_command_and_closes_session
     assert_eq!(status, 202, "{created}");
     let command = created["command_id"].as_str().unwrap();
     let session = created["session_id"].as_str().unwrap();
+    // Cancel only once the clone is in flight: it must be killed, not awaited.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let (_, row) = get(&server, &format!("/v1/sessions/{session}")).await;
+        if row["setup_status"] == "cloning_repository" {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "setup never began cloning: {row}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     let (_, before) = get(&server, &format!("/v1/commands/{command}/status")).await;
     assert_eq!(before["status"], "queued", "{before}");
 

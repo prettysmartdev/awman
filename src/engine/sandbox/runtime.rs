@@ -384,10 +384,12 @@ fn bridge_attach_pty(
         .master
         .try_clone_reader()
         .map_err(|e| EngineError::Sandbox(format!("clone sbx pty reader: {e}")))?;
-    let mut writer = pair
+    let writer = pair
         .master
         .take_writer()
         .map_err(|e| EngineError::Sandbox(format!("take sbx pty writer: {e}")))?;
+    let mut writer =
+        crate::engine::container::io_bridge::QuietPtyWriter::new(writer, pair.master.as_ref());
 
     let stdout_tx = io.stdout;
     std::thread::spawn(move || {

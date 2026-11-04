@@ -858,9 +858,12 @@ mod tests {
                         execution.wait().await.unwrap();
                     }
                     let (mut stdout, mut stderr) = receivers.lock().unwrap().take().unwrap();
+                    // Drain rather than expect silence: dropping portable-pty's
+                    // writer sends "\n" + EOF, which the line discipline can
+                    // echo as "\r\n" if the child still holds the slave.
                     tokio::time::timeout(Duration::from_secs(3), async {
-                        assert!(stdout.recv().await.is_none(), "stdout sender remained open");
-                        assert!(stderr.recv().await.is_none(), "stderr sender remained open");
+                        while stdout.recv().await.is_some() {}
+                        while stderr.recv().await.is_some() {}
                     })
                     .await
                     .expect("container bridge did not release output senders");

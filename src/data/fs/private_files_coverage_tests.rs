@@ -18,6 +18,22 @@ fn try_lock(path: &Path, mode: LockMode) -> Option<File> {
     lock_private_timeout(path, mode, Duration::ZERO, || Ok(())).unwrap()
 }
 
+/// `true` once `path` can be locked exclusively. A released flock can stay
+/// held briefly by a child a parallel test forked while it was open, until
+/// that child's exec closes its copy; a leaked lock never clears.
+fn lock_eventually(path: &Path) -> bool {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if try_lock(path, LockMode::Exclusive).is_some() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 #[test]
 fn create_private_dir_creates_nested_owner_only_dirs_and_is_idempotent() {
     let root = private_root();
@@ -124,7 +140,7 @@ fn exclusive_lock_excludes_every_other_holder_until_dropped() {
     assert!(try_lock(&path, LockMode::Exclusive).is_none());
     assert!(try_lock(&path, LockMode::Shared).is_none());
     drop(held);
-    assert!(try_lock(&path, LockMode::Exclusive).is_some());
+    assert!(lock_eventually(&path));
 }
 
 #[test]
@@ -137,7 +153,7 @@ fn shared_locks_coexist_but_exclude_an_exclusive_one() {
     drop(first);
     assert!(try_lock(&path, LockMode::Exclusive).is_none());
     drop(second);
-    assert!(try_lock(&path, LockMode::Exclusive).is_some());
+    assert!(lock_eventually(&path));
 }
 
 #[test]
@@ -168,7 +184,7 @@ fn lock_check_runs_before_and_after_acquisition_and_can_abort() {
     .unwrap_err();
     assert!(matches!(err, DataError::Other(ref m) if m == "cancelled"));
     assert!(
-        try_lock(&path, LockMode::Exclusive).is_some(),
+        lock_eventually(&path),
         "an abandoned lock must not stay held"
     );
 }

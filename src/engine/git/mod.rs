@@ -63,6 +63,77 @@ fn run_git_logged_env(
         .current_dir(cwd)
         .output()
         .map_err(|e| EngineError::Git(format!("invoke `{cmd_str}`: {e}")))?;
+    log_git_output(&output, sink);
+    Ok(output)
+}
+
+/// [`run_git_logged`] for a command that can wait on the network forever (a
+/// clone from an origin that accepts but never answers): the git process
+/// group is killed as soon as `cancel` fires. Output goes to files rather
+/// than pipes so a descendant holding them open cannot hang the wait.
+fn run_git_logged_cancellable(
+    args: &[&str],
+    cwd: &Path,
+    sink: &mut dyn GitFrontend,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<std::process::Output, EngineError> {
+    use std::io::{Read, Seek};
+    let command = GitCommand::new(args);
+    let cmd_str = command.display();
+    sink.command_started(&command);
+    let io = |e: std::io::Error| EngineError::Git(format!("invoke `{cmd_str}`: {e}"));
+    let mut stdout = tempfile::tempfile().map_err(io)?;
+    let mut stderr = tempfile::tempfile().map_err(io)?;
+    let mut git = host_command::command(cwd);
+    git.args(args)
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .stdout(stdout.try_clone().map_err(io)?)
+        .stderr(stderr.try_clone().map_err(io)?);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        git.process_group(0);
+    }
+    let mut child = git.spawn().map_err(io)?;
+    let status = loop {
+        if cancel.is_cancelled() {
+            #[cfg(unix)]
+            let _ = nix::sys::signal::killpg(
+                nix::unistd::Pid::from_raw(child.id() as i32),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(EngineError::Git(format!("`{cmd_str}` cancelled")));
+        }
+        match child.try_wait().map_err(io)? {
+            Some(status) => break status,
+            None => std::thread::sleep(std::time::Duration::from_millis(10)),
+        }
+    };
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    stdout
+        .rewind()
+        .and_then(|_| stdout.read_to_end(&mut out))
+        .map_err(io)?;
+    stderr
+        .rewind()
+        .and_then(|_| stderr.read_to_end(&mut err))
+        .map_err(io)?;
+    let output = std::process::Output {
+        status,
+        stdout: out,
+        stderr: err,
+    };
+    log_git_output(&output, sink);
+    Ok(output)
+}
+
+/// Stream a finished git command's non-blank output lines through `sink`:
+/// `Info` on success, `Warning` on failure.
+fn log_git_output(output: &std::process::Output, sink: &mut dyn GitFrontend) {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     for line in stdout.lines().chain(stderr.lines()) {
@@ -77,7 +148,6 @@ fn run_git_logged_env(
             });
         }
     }
-    Ok(output)
 }
 
 /// Host-side committer identity awman uses in a clone it owns (WI 0133).
@@ -1913,12 +1983,14 @@ impl GitEngine {
     /// Logged variant of [`clone_repo`]. Streams the command line and combined
     /// stdout/stderr through `sink`. Used by the API server's session-setup
     /// path so a remote-clone failure is captured in the server log file.
+    /// Firing `cancel` kills an in-flight clone and returns an error.
     pub fn clone_repo_logged(
         &self,
         url: &str,
         branch: Option<&str>,
         dest: &Path,
         sink: &mut dyn GitFrontend,
+        cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<(), EngineError> {
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent).map_err(|e| EngineError::io(parent, e))?;
@@ -1939,7 +2011,7 @@ impl GitEngine {
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_else(std::env::temp_dir);
-        let output = run_git_logged(&args, &cwd, sink)?;
+        let output = run_git_logged_cancellable(&args, &cwd, sink, cancel)?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(EngineError::Git(format!(
@@ -3151,6 +3223,44 @@ mod tests {
         let g = GitEngine::new();
         assert!(g.remote_ref_sha(&clone, "origin", "main").is_some());
         assert!(g.remote_ref_sha(&clone, "origin", "nope").is_none());
+    }
+
+    #[test]
+    fn clone_repo_logged_succeeds_and_is_killed_by_cancel_while_origin_hangs() {
+        let (_source, bare) = setup_upstream();
+        let g = GitEngine::new();
+        let mut sink = crate::data::message::RecordingMessageSink::new();
+        let dest = tempfile::tempdir().unwrap();
+        let never = tokio_util::sync::CancellationToken::new();
+        g.clone_repo_logged(
+            &bare_url(&bare),
+            None,
+            &dest.path().join("ok"),
+            &mut sink,
+            &never,
+        )
+        .unwrap();
+        assert!(dest.path().join("ok/.git").exists());
+
+        // An origin that accepts the connection and never answers.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("git://{}/hang.git", listener.local_addr().unwrap());
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let canceller = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            canceller.cancel();
+        });
+        let started = std::time::Instant::now();
+        let err = g
+            .clone_repo_logged(&url, None, &dest.path().join("hang"), &mut sink, &cancel)
+            .unwrap_err();
+        assert!(err.to_string().contains("cancelled"), "{err}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "cancel did not stop the clone"
+        );
+        drop(listener);
     }
 
     #[test]

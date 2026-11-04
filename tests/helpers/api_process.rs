@@ -314,13 +314,22 @@ impl ApiServer {
             if matches!(self.child.try_wait(), Ok(Some(_))) {
                 return false;
             }
+            // `free_port` releases its port before the server binds it, so a
+            // parallel test's server can take it first; then this server
+            // exits on the bind failure and we retry. Only our own pid counts
+            // as up, or the test would run against the other server.
             let probe = self
                 .client
                 .get(format!("{}/v1/status", self.url))
                 .send()
                 .await;
-            if matches!(probe, Ok(ref r) if r.status().is_success()) {
-                return true;
+            if let Ok(response) = probe {
+                if response.status().is_success() {
+                    let body: Value = response.json().await.unwrap_or(Value::Null);
+                    if body["pid"].as_u64() == Some(u64::from(self.child.id())) {
+                        return true;
+                    }
+                }
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
