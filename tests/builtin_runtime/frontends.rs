@@ -507,7 +507,13 @@ fn builtin_hw_actual_awman_owner_crash_then_clean_recovers() {
     let Some((binary, archive)) = gate(TEST) else {
         return;
     };
-    let p = Project::new(&binary, &archive, "awman-crash.");
+    let mut p = Project::new(&binary, &archive, "awman-crash.");
+    // Other hardware tests launch VMs from the shared test binary in
+    // parallel. Give this test its own signed copy so `live_vms()` observes
+    // only the guest whose owner we kill below.
+    let isolated_binary = p.temp.path().join("awman");
+    std::fs::copy(&binary, &isolated_binary).unwrap();
+    p.switch(&isolated_binary, "builtin-experimental");
     let mut child = p
         .cmd(&[
             "exec",
