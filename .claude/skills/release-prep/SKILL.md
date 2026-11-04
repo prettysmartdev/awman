@@ -47,13 +47,19 @@ Also read:
 
 ## Step 2: Bump the version
 
-**`Cargo.toml`** — the only place the version number lives:
+**`Cargo.toml`** — the source of the awman version:
 
 ```toml
 version = "X.Y.Z"   # was the old version
 ```
 
-Update to the new version. There is no `Cargo.lock` to worry about in this project (binary crate, not published to crates.io).
+After updating it, refresh the root `Cargo.lock` so the path dependencies record the new version. The standalone SQLite probe is an optional dependency investigation tool and is not part of release prep.
+
+```bash
+cargo update --workspace
+```
+
+Commit `Cargo.toml` and `Cargo.lock` with the release prep changes.
 
 ---
 
@@ -213,6 +219,7 @@ Header format:
 Before finishing, verify:
 
 - [ ] `Cargo.toml` version updated
+- [ ] Root `Cargo.lock` updated with `cargo update --workspace`
 - [ ] `README.md` reflects new commands/features
 - [ ] `docs/00-getting-started.md` covers new workflow steps
 - [ ] relevant numbered doc(s) under `docs/` document new subcommands/config fields (check, don't assume)

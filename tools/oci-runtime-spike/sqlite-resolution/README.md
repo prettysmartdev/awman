@@ -139,7 +139,7 @@ The checked-in patch targets its Cargo-normalized manifest; upstream's source
 manifest contains the same dependency stanza. `Cargo.toml.orig` remains the
 unmodified provenance copy, not the manifest used for building.
 
-## Current 0.7.8 compatibility gate
+## Optional 0.7.8 compatibility diagnostic
 
 The live `checks.sh auto` command now uses the four 0.7.8 patches and the production
 static provider from awman-host-shims. It does not depend on a deleted production
@@ -147,6 +147,10 @@ msb_krun tree. Its historical 0.7.2 reader downloads and patches its own SHA-pin
 0.1.39 source in the output directory; only that historical reader requires libcap-ng.
 The current provider has no dynamic-library fallback. Earlier results below remain
 historical and do not establish acceptance of the new dependency set.
+
+Run this diagnostic manually when changing the SQLx or SQLite dependency alignment.
+It is not part of normal CI, Apple Silicon prerelease, or the Release workflow.
+The production builtin tests and catalog compatibility check cover routine releases.
 
 Before the native-artifact checks, `tools/test-msb-catalog-compat.sh` runs the real
 published 27-to-29 migrations, both strict_sni values and labels, invalid-row refusal,

@@ -308,16 +308,6 @@ jobs:
           AWMAN_TEST_BUILTIN_NETWORK: "1"
           AWMAN_TEST_BUILTIN_PRESSURE: "1"
         run: bash tools/native-builtin-ci.sh "${{ matrix.target }}"
-      - name: SQLite exact dependency, cross-driver and catalog round trips
-        env:
-          SQLITE_SPIKE_OUTPUT_DIR: ${{ runner.temp }}/sqlite-results
-        run: bash tools/oci-runtime-spike/sqlite-resolution/checks.sh auto
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        if: always()
-        with:
-          name: sqlite-resolution-${{ matrix.name }}
-          path: ${{ runner.temp }}/sqlite-results/
-          if-no-files-found: ignore
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:

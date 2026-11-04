@@ -120,10 +120,6 @@ step "Real guest hardware suite"
 AWMAN_TEST_BUILTIN_BASE_TAR="$base" AWMAN_TEST_BUILTIN_FIXTURE_ARCHIVE="$fixture" \
   make --no-print-directory test-builtin-hw
 
-step "SQLite native compatibility gate"
-SQLITE_SPIKE_OUTPUT_DIR="$evidence/sqlite" \
-  bash tools/oci-runtime-spike/sqlite-resolution/checks.sh auto
-
 step "Exact Apple Silicon release artifact"
 bash tools/msb-payloads/fetch.sh aarch64-apple-darwin
 bash tools/msb-payloads/verify.sh aarch64-apple-darwin
