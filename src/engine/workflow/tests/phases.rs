@@ -2527,13 +2527,15 @@ impl WorkflowFrontend for OnFailureYoloFrontend {
 }
 
 /// Run a setup phase whose single step fails once, with an on_failure agent
-/// that blocks until killed or completed. Once the agent is up, send it a
-/// `Stuck` event; if it is still running 300ms later, complete it. Returns
-/// (countdown labels started, whether the agent was killed, final status).
+/// that blocks until killed or completed. Under yolo, send it a `Stuck`
+/// event and wait for the countdown to start before completing it. Returns
+/// (countdown labels started, whether the event was sent, whether the agent
+/// was killed, final status).
 fn run_stuck_on_failure_agent(
     yolo: bool,
 ) -> (
     Vec<String>,
+    bool,
     bool,
     crate::data::workflow_state::PhaseStepStatus,
 ) {
@@ -2561,23 +2563,36 @@ fn run_stuck_on_failure_agent(
     .unwrap();
     engine.set_yolo(yolo);
 
-    // Drives the agent from outside the blocked engine thread. Without
-    // yolo the engine never publishes the stuck channel, so fall back to
-    // completing the agent after the deadline.
+    // Drive the agent from outside the blocked engine thread. Without yolo,
+    // the engine never publishes the stuck channel.
     let driver = {
         let stuck_sender = Arc::clone(&stuck_sender);
+        let countdowns = Arc::clone(&countdowns);
         let completion = completion.clone();
         std::thread::spawn(move || {
-            let deadline = std::time::Instant::now() + Duration::from_millis(500);
-            while std::time::Instant::now() < deadline {
-                if let Some(tx) = stuck_sender.lock().unwrap().as_ref() {
-                    let _ = tx.send(StuckEvent::Stuck);
-                    break;
+            let mut sent_stuck = false;
+            if yolo {
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                while std::time::Instant::now() < deadline {
+                    if let Some(tx) = stuck_sender.lock().unwrap().as_ref() {
+                        sent_stuck = tx.send(StuckEvent::Stuck).is_ok();
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
                 }
-                std::thread::sleep(Duration::from_millis(10));
+                // Keep the agent running until the engine observes the event.
+                // A fixed delay can let the completion branch win its select.
+                while sent_stuck
+                    && countdowns.lock().unwrap().is_empty()
+                    && std::time::Instant::now() < deadline
+                {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            } else {
+                std::thread::sleep(Duration::from_millis(300));
             }
-            std::thread::sleep(Duration::from_millis(300));
             signal_completion(&completion, 0);
+            sent_stuck
         })
     };
 
@@ -2598,11 +2613,16 @@ fn run_stuck_on_failure_agent(
             mock.factory(),
         )
         .unwrap();
-    driver.join().unwrap();
+    let sent_stuck = driver.join().unwrap();
 
     let status = engine.state().setup_step_states[0].status.clone();
     let started = countdowns.lock().unwrap().clone();
-    (started, cancel_flag.load(Ordering::Relaxed), status)
+    (
+        started,
+        sent_stuck,
+        cancel_flag.load(Ordering::Relaxed),
+        status,
+    )
 }
 
 // --yolo (and so --dynamic): a stuck on_failure agent gets the yolo
@@ -2611,10 +2631,11 @@ fn run_stuck_on_failure_agent(
 async fn on_failure_agent_stuck_in_yolo_runs_countdown_and_advances() {
     use crate::data::workflow_state::PhaseStepStatus;
 
-    let (started, killed, status) =
+    let (started, sent_stuck, killed, status) =
         tokio::task::spawn_blocking(|| run_stuck_on_failure_agent(true))
             .await
             .unwrap();
+    assert!(sent_stuck, "stuck event reached an active receiver");
     assert_eq!(started.len(), 1, "exactly one countdown: {started:?}");
     assert!(
         started[0].starts_with("on_failure"),
@@ -2633,10 +2654,11 @@ async fn on_failure_agent_stuck_in_yolo_runs_countdown_and_advances() {
 async fn on_failure_agent_without_yolo_has_no_countdown() {
     use crate::data::workflow_state::PhaseStepStatus;
 
-    let (started, killed, status) =
+    let (started, sent_stuck, killed, status) =
         tokio::task::spawn_blocking(|| run_stuck_on_failure_agent(false))
             .await
             .unwrap();
+    assert!(!sent_stuck, "no stuck event is sent without yolo");
     assert!(started.is_empty(), "no countdown without yolo: {started:?}");
     assert!(!killed, "the agent must be left to finish on its own");
     assert_eq!(status, PhaseStepStatus::Succeeded);

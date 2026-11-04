@@ -899,10 +899,13 @@ impl WorkflowEngine {
         // Stuck detection only matters under yolo; without it the receiver
         // stays `None` and that branch never fires.
         let mut stuck_rx = if self.yolo {
+            // Subscribe before exposing the sender to the frontend. It may
+            // send a stuck event as soon as attach_engine returns.
+            let rx = exec.subscribe_stuck();
             // Same tab-colouring hookup a main step's container gets.
             self.frontend
                 .attach_engine(EngineHandles::stuck(exec.stuck_sender()));
-            Some(exec.subscribe_stuck())
+            Some(rx)
         } else {
             None
         };
