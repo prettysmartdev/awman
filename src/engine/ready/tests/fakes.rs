@@ -595,15 +595,20 @@ pub(crate) fn held_lock_files(dir: &std::path::Path) -> usize {
         .map(|e| e.path())
         .filter(|p| p.extension().is_some_and(|x| x == "lock"))
         .filter(|path| {
-            matches!(
-                crate::data::fs::private_files::lock_private_timeout(
-                    path,
-                    crate::data::fs::private_files::LockMode::Exclusive,
-                    std::time::Duration::ZERO,
-                    || Ok(()),
-                ),
-                Ok(None)
-            )
+            match crate::data::fs::private_files::lock_private_timeout(
+                path,
+                crate::data::fs::private_files::LockMode::Exclusive,
+                std::time::Duration::ZERO,
+                || Ok(()),
+            ) {
+                Ok(None) => true,
+                // Do not let a parallel test's fork extend a probe lock.
+                Ok(Some(file)) => {
+                    let _ = file.unlock();
+                    false
+                }
+                Err(_) => false,
+            }
         })
         .count()
 }

@@ -130,6 +130,14 @@ pub struct ImageBuildLease {
     _file: File,
 }
 
+impl Drop for ImageBuildLease {
+    fn drop(&mut self) {
+        // A fork can inherit this open file description. Closing our handle
+        // alone would leave its flock held until the child closes its copy.
+        let _ = self._file.unlock();
+    }
+}
+
 impl ImageBuildLease {
     pub fn store(&self) -> &BuildStoreKey {
         &self.store
@@ -210,5 +218,23 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_a_lease_unlocks_an_inherited_descriptor() {
+        let dir = tempfile::tempdir().unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let locks = ImageBuildLockStore::new(dir.path());
+        let store = BuildStoreKey::AppleLocal;
+        let held = locks.try_lock(&store, "agent:latest").unwrap().unwrap();
+        // A duplicated descriptor has the same lock lifetime as one inherited
+        // by a forked child, without forking a multithreaded test process.
+        let inherited = held._file.try_clone().unwrap();
+        assert!(locks.try_lock(&store, "agent:latest").unwrap().is_none());
+        drop(held);
+        assert!(locks.try_lock(&store, "agent:latest").unwrap().is_some());
+        drop(inherited);
     }
 }
