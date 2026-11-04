@@ -15,7 +15,7 @@ AWMAN_TEST_TMPROOT ?= /var/tmp/test-fixtures
 TEST_THREADS ?= $(shell n=$$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2); echo $$((n * 2)))
 export RUST_TEST_THREADS ?= $(TEST_THREADS)
 
-.PHONY: all build sign-macos install test test-fast test-full test-builtin test-builtin-hw payloads payloads-verify clean release architecture-lint pre-push docs-reference reproducible-build-audit native-builtin-ci
+.PHONY: all build sign-macos install test test-fast test-full test-builtin test-builtin-hw payloads payloads-verify clean release apple-silicon-prerelease architecture-lint pre-push docs-reference reproducible-build-audit native-builtin-ci
 
 all: build
 
@@ -136,7 +136,7 @@ docs-reference:
 # behind: every test body after the handful that need no temp directory
 # then dies on, or crawls against, a /tmp that cannot take another one.
 pre-push: architecture-lint
-	bash -n scripts/release.sh tools/release-runner.sh tools/test-release-runner.sh
+	bash -n scripts/release.sh tools/release-runner.sh tools/test-release-runner.sh tools/apple-silicon-prerelease.sh
 	bash tools/test-release-runner.sh
 	cargo fmt --all --check
 	cargo clippy --workspace --all-targets -- -D warnings
@@ -144,6 +144,11 @@ pre-push: architecture-lint
 
 clean:
 	cargo clean
+
+# Run every local/native Apple Silicon gate against the final clean main commit,
+# including the exact signed release artifact, without creating a tag.
+apple-silicon-prerelease:
+	@bash tools/apple-silicon-prerelease.sh
 
 # Release VERSION. On an Apple Silicon Mac with Hypervisor.framework, the
 # release job's /opt/awman scripts are installed or refreshed and the Mac is

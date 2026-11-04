@@ -163,6 +163,14 @@ check "a mismatched archive is never registered" bash -c '! grep -q registration
 check "a mismatched archive is not kept in the cache" \
   bash -c '[ -z "$(ls -A "$0/cache")" ]' "$AWMAN_RELEASE_RUNNER_HOME"
 
+# ── verify without registering ──
+reset
+check "verify-archive accepts the published checksum" \
+  bash -c 'bash "$0" verify-archive >/dev/null' "$script"
+check "verify-archive caches the verified runner" \
+  bash -c '[ -f "$0/cache/actions-runner-osx-arm64-9.9.9.tar.gz" ]' "$AWMAN_RELEASE_RUNNER_HOME"
+check "verify-archive does not register a runner" bash -c '! grep -q registration-token "$0"' "$log"
+
 # ── up ──
 reset
 check "up registers and starts the runner" bash -c 'bash "$0" up o/r v1.2.3 >/dev/null' "$script"

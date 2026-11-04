@@ -42,7 +42,7 @@ jobs:
 
       - name: Release runner script
         run: |
-          bash -n scripts/release.sh tools/release-runner.sh tools/test-release-runner.sh
+          bash -n scripts/release.sh tools/release-runner.sh tools/test-release-runner.sh tools/apple-silicon-prerelease.sh
           bash tools/test-release-runner.sh
 
       - name: Format check
@@ -114,7 +114,7 @@ jobs:
 
       - name: Release runner script (macOS)
         run: |
-          bash -n scripts/release.sh tools/release-runner.sh tools/test-release-runner.sh
+          bash -n scripts/release.sh tools/release-runner.sh tools/test-release-runner.sh tools/apple-silicon-prerelease.sh
           bash tools/test-release-runner.sh
 
       - name: Build release

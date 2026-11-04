@@ -88,6 +88,23 @@ Triggered on tag pushes matching `v[0-9]+.[0-9]+.[0-9]+`.
 
 ### Release runner (`make release`)
 
+Before tagging, run `make apple-silicon-prerelease` on the bare-metal Apple
+Silicon Mac that will serve the release. It requires a clean `main` checkout
+matching `origin/main`, release notes for the version in `Cargo.toml`, a
+successful `Tests` push run for that commit, and a `gh` login with repository
+runner-admin access. It runs `make pre-push`, provisions and checks the release
+runner's cached guest fixture and `/opt/awman` wrappers, verifies the runner
+archive checksum without registering it, exercises the real
+guest hardware and clean native provider suites plus SQLite compatibility,
+then builds, signs, boots, and measures the exact optimized Mac release binary.
+The real guest suite needs Apple Containers installed, and the command starts
+its service if needed. The heavy checks run in a temporary detached worktree
+so payload extraction cannot dirty the release checkout; the worktree is
+removed on exit and evidence remains under the printed
+`/tmp/awman-prerelease.*` directory. This command does not register a runner,
+create or push a tag, or publish a release. Linux and Windows release assets
+are still built by the tagged `Release` workflow.
+
 No hosted macOS runner can boot a guest (every hosted Mac is itself a VM, and
 macOS guests cannot nest Hypervisor.framework), so `release-macos-builtin`
 needs a bare-metal Apple Silicon Mac. `make release VERSION=vX.Y.Z` provides

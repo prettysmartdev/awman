@@ -10,6 +10,7 @@
 #   tools/release-runner.sh check [--hardware]  # can this host serve the release job?
 #   tools/release-runner.sh provision           # install the /opt/awman release scripts
 #   tools/release-runner.sh busy <repo>         # print online runners that already can
+#   tools/release-runner.sh verify-archive      # download and checksum-check the runner
 #   tools/release-runner.sh up <repo> <tag>     # download, register and start a runner
 #   tools/release-runner.sh down                # stop and deregister it (idempotent)
 #
@@ -156,6 +157,12 @@ fetch_runner() {
   echo "$RUNNER_HOME/cache/$asset"
 }
 
+cmd_verify_archive() {
+  local archive
+  archive=$(fetch_runner)
+  say "Verified $(basename "$archive")"
+}
+
 runner_id() { # repo name
   gh api "repos/$1/actions/runners" --paginate -q ".runners[] | select(.name == \"$2\") | .id"
 }
@@ -248,7 +255,8 @@ case "${1:-}" in
   check) cmd_check "${2:-}" ;;
   provision) cmd_provision ;;
   busy) [ $# -eq 2 ] || die "usage: $0 busy <owner/repo>"; cmd_busy "$2" ;;
+  verify-archive) [ $# -eq 1 ] || die "usage: $0 verify-archive"; cmd_verify_archive ;;
   up) [ $# -eq 3 ] || die "usage: $0 up <owner/repo> <tag>"; cmd_up "$2" "$3" ;;
   down) cmd_down ;;
-  *) die "usage: $0 check [--hardware] | provision | busy <owner/repo> | up <owner/repo> <tag> | down" ;;
+  *) die "usage: $0 check [--hardware] | provision | busy <owner/repo> | verify-archive | up <owner/repo> <tag> | down" ;;
 esac
