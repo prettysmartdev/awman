@@ -1,5 +1,5 @@
 {
-  "agent": "claude",
+  "agent": "codex",
   "terminal_scrollback_lines": 7500,
   "workflows": {
     "dynamic": {

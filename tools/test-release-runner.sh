@@ -23,7 +23,7 @@ echo base > "$scratch/fixtures/base.tar"
 echo fixture-v1 > "$scratch/fixtures/fixture-oci.tar"
 export AWMAN_TEST_BUILTIN_BASE_TAR="$scratch/fixtures/base.tar"
 export AWMAN_TEST_BUILTIN_FIXTURE_ARCHIVE="$scratch/fixtures/fixture-oci.tar"
-export FAKE_LOG="$log" FAKE_ONLINE="" FAKE_BAD_SHA="" FAKE_RUN_EXITS="" FAKE_INSTALL_FAILS=""
+export FAKE_LOG="$log" FAKE_ONLINE="" FAKE_BAD_SHA="" FAKE_NO_SHA="" FAKE_PLAIN_SHA="" FAKE_RUN_EXITS="" FAKE_INSTALL_FAILS=""
 
 # The runner archive: config.sh records its arguments; run.sh announces it
 # started and records the signal that stops it.
@@ -41,7 +41,11 @@ while :; do sleep 0.2; done
 EOF
 chmod +x "$scratch/archive/"*.sh
 tar -czf "$scratch/runner.tar.gz" -C "$scratch/archive" .
-FAKE_SHA=$(sha256sum "$scratch/runner.tar.gz" | cut -d' ' -f1)
+if command -v shasum >/dev/null 2>&1; then
+  FAKE_SHA=$(shasum -a 256 "$scratch/runner.tar.gz" | cut -d' ' -f1)
+else
+  FAKE_SHA=$(sha256sum "$scratch/runner.tar.gz" | cut -d' ' -f1)
+fi
 export FAKE_TARBALL="$scratch/runner.tar.gz" FAKE_SHA
 
 cat > "$bin/gh" <<'EOF'
@@ -55,7 +59,14 @@ case "$args" in
     cp "$FAKE_TARBALL" "$dir/actions-runner-osx-arm64-9.9.9.tar.gz" ;;
   "api repos/actions/runner/releases/tags/v9.9.9 -q .body")
     sha=${FAKE_BAD_SHA:-$FAKE_SHA}
-    printf 'Notes\n- osx-arm64 <!-- BEGIN SHA osx-arm64 -->%s<!-- END SHA osx-arm64 -->\n' "$sha" ;;
+    printf 'Notes\n## SHA-256 Checksums\n'
+    if [ -z "$FAKE_NO_SHA" ]; then
+      if [ -n "$FAKE_PLAIN_SHA" ]; then
+        printf '  * actions-runner-osx-arm64-9.9.9.tar.gz %s\n' "$sha"
+      else
+        printf '%s\n' "- actions-runner-osx-arm64-9.9.9.tar.gz <!-- BEGIN SHA osx-arm64 -->${sha}<!-- END SHA osx-arm64 -->"
+      fi
+    fi ;;
   *registration-token*) echo regtok ;;
   *remove-token*) echo rmtok ;;
   "api repos/o/r/actions/runners --paginate -q "*'index("hypervisor")'*)
@@ -142,6 +153,10 @@ check "and removes its staging directory" bash -c '[ -z "$(ls -A "$0")" ]' "$scr
 
 # ── up refuses an archive whose checksum does not match ──
 reset
+check "up refuses release notes without an osx-arm64 checksum" \
+  bash -c '! FAKE_NO_SHA=1 bash "$0" up o/r v1.2.3 2>/dev/null' "$script"
+check "a missing checksum never registers the runner" bash -c '! grep -q registration-token "$0"' "$log"
+reset
 check "up refuses a mismatched runner checksum" \
   bash -c '! FAKE_BAD_SHA=0000000000000000000000000000000000000000000000000000000000000000 bash "$0" up o/r v1.2.3 2>/dev/null' "$script"
 check "a mismatched archive is never registered" bash -c '! grep -q registration-token "$0"' "$log"
@@ -178,6 +193,10 @@ check "state, runner and work directories are removed" \
 check "the verified archive stays cached" \
   bash -c '[ -f "$0/cache/actions-runner-osx-arm64-9.9.9.tar.gz" ]' "$AWMAN_RELEASE_RUNNER_HOME"
 check "down is idempotent" bash "$script" down
+reset
+check "up accepts a plain SHA-256 checksum line" \
+  bash -c 'FAKE_PLAIN_SHA=1 bash "$0" up o/r v1.2.3 >/dev/null' "$script"
+check "plain-checksum runner deregisters" bash -c 'bash "$0" down >/dev/null' "$script"
 mkdir -p "$AWMAN_RELEASE_RUNNER_WORK"
 check "a work directory it did not create is never deleted" \
   bash -c 'bash "$0" down >/dev/null; [ -d "$1" ]' "$script" "$AWMAN_RELEASE_RUNNER_WORK"

@@ -124,9 +124,9 @@ cmd_busy() {
   [ -z "$names" ] || printf '%s\n' "$names" | awk -v ours="$ours" '$0 != ours'
 }
 
-# Download (once) and verify the latest osx-arm64 runner. The checksum comes
-# from the release notes GitHub publishes with every actions/runner release;
-# an archive that is missing one or does not match it is refused.
+# Download (once) and verify the latest osx-arm64 runner. The GitHub API's
+# release body has checksum markers; rendered notes show a plain checksum line.
+# An archive with no unique matching checksum or a mismatched hash is refused.
 fetch_runner() {
   local tag version asset body want got
   tag=$(gh api repos/actions/runner/releases/latest -q .tag_name)
@@ -139,8 +139,15 @@ fetch_runner() {
       --dir "$RUNNER_HOME/cache" --clobber
   fi
   body=$(gh api "repos/actions/runner/releases/tags/$tag" -q .body)
-  want=$(printf '%s\n' "$body" | sed -n 's/.*<!-- BEGIN SHA osx-arm64 -->\([0-9a-f]\{64\}\)<!-- END SHA osx-arm64 -->.*/\1/p' | head -n1)
-  [ -n "$want" ] || die "actions/runner $tag publishes no osx-arm64 checksum; refusing to run it"
+  want=$(printf '%s\n' "$body" | awk -v asset="$asset" \
+    '($1 == "*" || $1 == "-") && $2 == asset { print }' |
+    sed -n 's/.*<!-- BEGIN SHA osx-arm64 -->\([0-9a-fA-F]\{64\}\)<!-- END SHA osx-arm64 -->.*/\1/p')
+  if [ -z "$want" ]; then
+    want=$(printf '%s\n' "$body" | awk -v asset="$asset" \
+      '($1 == "*" || $1 == "-") && $2 == asset && length($3) == 64 && $3 ~ /^[[:xdigit:]]+$/ && NF == 3 { print tolower($3) }')
+  fi
+  [ -n "$want" ] && [ "${want#*$'\n'}" = "$want" ] ||
+    die "actions/runner $tag publishes no unique osx-arm64 checksum; refusing to run it"
   got=$(sha256 "$RUNNER_HOME/cache/$asset")
   if [ "$got" != "$want" ]; then
     rm -f "$RUNNER_HOME/cache/$asset"

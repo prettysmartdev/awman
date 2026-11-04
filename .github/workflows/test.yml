@@ -40,6 +40,11 @@ jobs:
       - name: Architecture lint
         run: make architecture-lint
 
+      - name: Release runner script
+        run: |
+          bash -n scripts/release.sh tools/release-runner.sh tools/test-release-runner.sh
+          bash tools/test-release-runner.sh
+
       - name: Format check
         run: cargo fmt --all --check
 
@@ -106,6 +111,11 @@ jobs:
       # only works with GNU tools fails here instead of passing silently.
       - name: Architecture lint (BSD tools)
         run: make architecture-lint
+
+      - name: Release runner script (macOS)
+        run: |
+          bash -n scripts/release.sh tools/release-runner.sh tools/test-release-runner.sh
+          bash tools/test-release-runner.sh
 
       - name: Build release
         run: cargo build --workspace --release

@@ -251,8 +251,10 @@ if [ -f "$TESTS_SENTINEL" ]; then
   ok "Tests already passed (sentinel present)"
 else
   TEST_LOG=$(mktemp)
-  # tee so the user sees output in real-time; pipefail captures cargo's exit code.
-  if cargo test 2>&1 | tee "$TEST_LOG"; then
+  # Use the same isolated test target as CI and pre-push, so release checks
+  # never touch the developer's keychain, clipboard or per-user daemons.
+  # tee keeps output visible; pipefail captures make's exit code.
+  if make test 2>&1 | tee "$TEST_LOG"; then
     touch "$TESTS_SENTINEL"
     rm -f "$TEST_LOG"
     ok "All tests passed"

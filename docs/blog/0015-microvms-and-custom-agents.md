@@ -1,8 +1,8 @@
 # awman 0.13: a microVM per agent, and any agent you like
 
-The rule at the heart of awman has always been that agents never run on your host. Keeping that rule meant installing something else first: Docker, Apple Containers, or Docker Sandboxes. On a Mac that's one more daemon to keep running and update, and a shared container kernel standing between an agent and your machine.
+A core rule of awman has always been that agents never run on your host. This meant installing something else first: Docker, Apple Containers, or Docker Sandboxes. On a Mac that's one more daemon to keep running and update, and second set of tools you need to reference to understand what's running.
 
-v0.13 removes that extra install on Apple Silicon. It also stops me being the bottleneck for which agents awman supports.
+v0.13 removes that extra install on Apple Silicon by adding a builtin microVM engine powered by macOS native virtualization. It also adds custom agent support so you can use absolutely any harness you prefer.
 
 ---
 
@@ -15,24 +15,21 @@ curl -s https://prettysmart.dev/install/awman.sh | sh
 
 ## A microVM that ships inside awman
 
-The new `builtin-experimental` runtime runs every agent session in its own hardware-virtualized Linux microVM. The VM code, kernel and guest agent are compiled into the awman binary (powered by Microsandbox), so installing awman is the whole install. Running agents doesn't need Docker, `container` or `sbx`.
+The new `builtin-experimental` runtime runs every agent session in its own hardware-virtualized Linux microVM. The VM code, kernel and guest agent are compiled into the awman binary, so installing awman is all you need. Running agents require need Docker, `container` or `sbx`.
 
 ```sh
 awman config set --global runtime builtin-experimental
 awman ready
 ```
 
-What I care about most is the isolation. Each agent gets its own kernel behind Apple's hypervisor instead of sharing one with every other container. The only host files it can see are your project and the overlays you name, and there's no Docker socket to hand over. Network access is a per-session policy (`public`, `allowlist` or `none`), and a repo can narrow the global policy but never widen it. CPU, memory and disk are capped per session too.
+What I care about most is the isolation. Each agent gets its own kernel behind Apple's hypervisor instead of sharing one with every other container. The only host files it can see are your project and the overlays you configure, and there's no Docker socket to hand over. Network access is a per-session policy (`public`, `allowlist` or `none`), and a repo can narrow the global policy but never widen it. CPU, memory and disk are configurable per session too.
 
-<!-- SCREENSHOT PLACEHOLDER: `awman ready` output under builtin-experimental importing an agent image.
-     Save it as docs/blog/images/builtin-ready.png and replace this comment with:
-     ![awman ready on the builtin runtime](./images/builtin-ready.png) -->
 
-It's experimental, and for now it runs only on macOS on Apple Silicon, from the `awman-macos-arm64` release. That binary is ad-hoc signed with the hypervisor entitlement but not notarized, so the [runtimes guide](../11-runtimes.md#builtin-microvm-experimental) explains how to verify it. Images still come from a source you choose (a registry, an archive, or your local Docker or Apple Containers store), and `awman ready` imports them. Treat its behaviour and config as subject to change, and tell me where it falls short for you.
+It's experimental, and for now it runs only on macOS on Apple Silicon, from the `awman-macos-arm64` release. Images come from a source you choose (a registry, an archive, or your local Docker or Apple Containers store), and `awman ready` imports them automatically. Its behaviour and config as subject to change, and I really hope you'll reach out to let me know how it's performing.
 
 ## Bring your own agent
 
-New coding agents show up every few weeks, and until now each one had to wait for me to add it. In v0.13 an agent is a single TOML file: how to install it, how to launch it, and which flags it understands. awman then builds, launches and isolates it like the built-in agents.
+New coding agents show up every few weeks, and until now each one had to wait for awman to add it. In v0.13 any agent can be added via a single TOML file. The file describes how to install it, how to launch it, and which flags it understands. awman then builds, launches and isolates it like the built-in agents.
 
 ```sh
 awman new agent pi            # writes .awman/agents/pi.toml
@@ -40,7 +37,7 @@ awman ready --agent pi        # review, approve, build
 awman chat --agent pi
 ```
 
-A repo definition (or a global one that runs a host check) is reviewed and approved once per content hash before anything runs. If it changes, you're asked again, so a teammate's edit to a repo's agent file doesn't take effect without you seeing it. `crush` and `maki` now ship as example definitions (`awman new agent crush --from crush`), and `awman new skill --pull builtin` gives a code agent a skill for writing new definitions.
+A repo definition (or a global one that runs a host check) is reviewed and approved once per content hash before anything runs. If it changes, you're asked again, so a teammate's edit to a repo's agent file doesn't take effect without you seeing it. `crush` and `maki` now ship as example definitions. The new set of awman builtin skills (`awman new skill --pull builtin`) gives any code agent a skill for writing new agent types so you don't have to.
 
 ## Also in 0.13
 
