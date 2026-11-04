@@ -136,8 +136,9 @@ docs-reference:
 # behind: every test body after the handful that need no temp directory
 # then dies on, or crawls against, a /tmp that cannot take another one.
 pre-push: architecture-lint
-	bash -n scripts/release.sh tools/release-runner.sh tools/test-release-runner.sh tools/apple-silicon-prerelease.sh
+	bash -n scripts/release.sh tools/release-runner.sh tools/test-release-runner.sh tools/apple-silicon-prerelease.sh tools/prerelease-ci-gate.sh tools/test-prerelease-ci-gate.sh
 	bash tools/test-release-runner.sh
+	bash tools/test-prerelease-ci-gate.sh
 	cargo fmt --all --check
 	cargo clippy --workspace --all-targets -- -D warnings
 	$(MAKE) --no-print-directory test

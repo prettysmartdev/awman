@@ -90,11 +90,14 @@ Triggered on tag pushes matching `v[0-9]+.[0-9]+.[0-9]+`.
 
 Before tagging, run `make apple-silicon-prerelease` on the bare-metal Apple
 Silicon Mac that will serve the release. It requires a clean `main` checkout
-matching `origin/main`, release notes for the version in `Cargo.toml`, a
-successful `Tests` push run for that commit, and a `gh` login with repository
-runner-admin access. It runs `make pre-push`, provisions and checks the release
-runner's cached guest fixture and `/opt/awman` wrappers, verifies the runner
-archive checksum without registering it, exercises the real
+matching `origin/main`, release notes for the version in `Cargo.toml`, success
+for every required non-macOS job in that commit's `Tests` push run, and a `gh`
+login with repository runner-admin access. It does not wait for the hosted
+`build-macos` job: `make pre-push` and a `cargo build --workspace --release`
+smoke run its macOS checks on the release Mac, so hosted arm64 runner capacity
+cannot block the prerelease gate. It then provisions and
+checks the release runner's cached guest fixture and `/opt/awman` wrappers,
+verifies the runner archive checksum without registering it, exercises the real
 guest hardware and clean native provider suites plus SQLite compatibility,
 then builds, signs, boots, and measures the exact optimized Mac release binary.
 The real guest suite needs Apple Containers installed, and the command starts

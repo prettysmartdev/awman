@@ -42,8 +42,9 @@ jobs:
 
       - name: Release runner script
         run: |
-          bash -n scripts/release.sh tools/release-runner.sh tools/test-release-runner.sh tools/apple-silicon-prerelease.sh
+          bash -n scripts/release.sh tools/release-runner.sh tools/test-release-runner.sh tools/apple-silicon-prerelease.sh tools/prerelease-ci-gate.sh tools/test-prerelease-ci-gate.sh
           bash tools/test-release-runner.sh
+          bash tools/test-prerelease-ci-gate.sh
 
       - name: Format check
         run: cargo fmt --all --check
@@ -114,8 +115,9 @@ jobs:
 
       - name: Release runner script (macOS)
         run: |
-          bash -n scripts/release.sh tools/release-runner.sh tools/test-release-runner.sh tools/apple-silicon-prerelease.sh
+          bash -n scripts/release.sh tools/release-runner.sh tools/test-release-runner.sh tools/apple-silicon-prerelease.sh tools/prerelease-ci-gate.sh tools/test-prerelease-ci-gate.sh
           bash tools/test-release-runner.sh
+          bash tools/test-prerelease-ci-gate.sh
 
       - name: Build release
         run: cargo build --workspace --release

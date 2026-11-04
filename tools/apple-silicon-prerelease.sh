@@ -60,8 +60,8 @@ for _ in $(seq 1 60); do
 done
 test -n "$ci_run" || die "no Tests push run appeared for $head within 5 minutes"
 step "Tests CI run $ci_run"
-gh run watch "$ci_run" --repo "$repo" --exit-status --interval 60 ||
-  die "Tests CI run $ci_run did not succeed"
+bash tools/prerelease-ci-gate.sh "$repo" "$ci_run" ||
+  die "required non-macOS Tests CI jobs did not succeed in run $ci_run"
 
 evidence=$(mktemp -d /tmp/awman-prerelease.XXXXXX)
 printf 'Evidence: %s\n' "$evidence"
@@ -98,6 +98,9 @@ cd "$source_dir"
 
 step "Local pre-push gate"
 make --no-print-directory pre-push
+
+step "macOS release build smoke"
+cargo build --workspace --release
 
 step "Release runner provisioning"
 container system status >/dev/null 2>&1 || container system start
