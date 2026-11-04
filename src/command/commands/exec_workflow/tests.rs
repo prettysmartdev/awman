@@ -1964,22 +1964,26 @@ fn build_repair_prompt_no_unreplaced_placeholders() {
 // ── Embedded assets ───────────────────────────────────────────────────────
 
 #[test]
-fn example_workflow_toml_parses_as_valid_workflow() {
+fn inline_workflow_examples_parse_as_valid_workflows() {
     use crate::data::workflow_definition::WorkflowFormat;
-    let result = crate::data::workflow_definition::Workflow::parse(
-        crate::data::dynamic_workflow_assets::EXAMPLE_WORKFLOW_TOML,
-        WorkflowFormat::Toml,
-    );
-    assert!(
-        result.is_ok(),
-        "EXAMPLE_WORKFLOW_TOML must parse as a valid Workflow: {:?}",
-        result.err()
-    );
-    let wf = result.unwrap();
-    assert!(
-        !wf.steps.is_empty(),
-        "example workflow must have at least one step"
-    );
+    let usage = crate::data::dynamic_workflow_assets::WORKFLOW_USAGE_MD;
+    for heading in [
+        "## Focused Workflow Example",
+        "### Parallel branches and joins",
+    ] {
+        let section = usage.split_once(heading).unwrap().1;
+        let snippet = section
+            .split_once("```toml")
+            .unwrap()
+            .1
+            .split_once("```")
+            .unwrap()
+            .0;
+        let workflow =
+            crate::data::workflow_definition::Workflow::parse(snippet, WorkflowFormat::Toml)
+                .unwrap_or_else(|error| panic!("{heading} must contain a valid workflow: {error}"));
+        assert!(!workflow.steps.is_empty(), "{heading} must contain a step");
+    }
 }
 
 #[test]

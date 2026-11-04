@@ -160,8 +160,8 @@ Agent steps run inside isolated Docker containers. The `name` and `prompt` field
 
 ```toml
 [[step]]
-name = "implement"                  # Required. Unique name for this step.
-prompt = "Implement the feature."   # Required. Sent to the agent as its initial task.
+name = "step-name"                 # Required. Unique name for this step.
+prompt = "Do the specified work."  # Required. Sent to the agent as its initial task.
 
 depends_on = ["other-step"]         # Optional. List of step names that must complete first.
                                     # Steps with no depends_on run in parallel with other
@@ -178,6 +178,44 @@ abort_on_failure = false            # Optional. Default: false. When true, the e
 
 Steps with `depends_on` run after all named dependencies complete successfully. Steps with
 no `depends_on` may run in parallel with each other (subject to the configured worker count).
+
+### Parallel branches and joins
+
+This is dependency syntax for a hypothetical file-format change, not a prescribed
+workflow shape. `update-parser` and `update-writer` can start together because they
+own separate modules. `roundtrip-integration` waits for both; two independent tasks
+can then start after that join. Use a different graph when the actual work has
+different file ownership or dependencies.
+
+```toml
+[[step]]
+name = "update-parser"
+prompt = "Update the parser module for the new format and verify its focused tests."
+
+[[step]]
+name = "update-writer"
+prompt = "Update the writer module for the new format and verify its focused tests."
+
+[[step]]
+name = "roundtrip-integration"
+depends_on = ["update-parser", "update-writer"]
+prompt = "Add and run cross-module roundtrip checks for the new format."
+
+[[step]]
+name = "compatibility-check"
+depends_on = ["roundtrip-integration"]
+prompt = "Check old-format fixtures against the completed roundtrip behavior."
+
+[[step]]
+name = "format-guide"
+depends_on = ["roundtrip-integration"]
+prompt = "Update the user guide for the now-verified format behavior."
+```
+
+The first two steps form one parallel stage; the last two form another. The join
+waits for both inputs. A branch may contain its own chain of dependent steps.
+All branches still share one checkout, so parallel steps must not edit the same
+files, and available worker capacity may limit how many actually run at once.
 
 ---
 
@@ -218,7 +256,7 @@ Push the current branch to a remote.
 ```toml
 [[teardown]]
 type = "push_branch"
-overlays = ["ssh()"]      # Typically needed for SSH authentication.
+# awman supplies the configured SSH key or token automatically.
 # remote = "origin"       # Optional.
 # branch = "HEAD"         # Optional.
 ```
@@ -228,7 +266,7 @@ Open a pull request via the GitHub API.
 ```toml
 [[teardown]]
 type = "create_pull_request"
-overlays = ["env(GITHUB_TOKEN)"]   # Required for GitHub API access.
+# awman supplies the GitHub token automatically.
 # title = "Implement {{work_item_number}}"  # Optional.
 # body = "Automated PR."                   # Optional.
 # base = "main"                            # Optional. Target branch. Defaults to repo default.
@@ -330,14 +368,21 @@ Both `[[setup]]` and `[[teardown]]` entries support:
 
 ---
 
-## Minimal Valid Workflow
+## Focused Workflow Example
 
-A workflow must have at least one `[[step]]`:
+A workflow must have at least one `[[step]]`. For a small work item, one
+agent can make the change and verify it in the same step:
 
 ```toml
 [[step]]
-name = "implement"
-prompt = "Implement the feature described in the work item."
+name = "change-and-verify"
+prompt = """
+Read work item {{work_item_number}}. Make the focused change, update the
+tests for the affected behavior, and run the relevant project checks.
+
+Work item content:
+{{work_item_content}}
+"""
 ```
 
 ---
@@ -349,11 +394,12 @@ When designing a workflow for a specific work item, consider:
 1. **Read the work item carefully** — use `{{work_item_content}}` in your first step's
    prompt, or pull specific sections with `{{work_item_section:[Section Name]}}`
 
-2. **Parallelize independent work** — steps with no shared `depends_on` run concurrently;
-   e.g. a `tests` step and a `docs` step can both depend on `implement` and run in parallel
+2. **Parallelize independent work** — omit `depends_on` only when steps can start
+   independently and their file edits cannot conflict; join branches before work
+   that needs all of their outputs
 
-3. **Use `abort_on_failure`** on critical steps like a final `review` or a `run_shell` test
-   command — fail fast rather than continuing with broken output
+3. **Use `abort_on_failure`** on critical validation steps or `run_shell` checks
+   that must pass before the workflow can continue
 
 4. **Use `on_failure` remediation** on `run_shell` teardown steps that run the test suite —
    this gives an agent a chance to fix failures before the workflow aborts
@@ -361,9 +407,9 @@ When designing a workflow for a specific work item, consider:
 5. **Keep prompts specific** — reference the work item number, paste relevant spec sections,
    and give the agent precise success criteria rather than open-ended instructions
 
-6. **Match model to task complexity** — use the most capable model available to you for
-   the implementation and review steps; a lighter one is usually enough for documentation
+6. **Match model to task complexity** — select from the listed models for each
+   step's actual work; omit `model` when the agent has no listed models
 
 7. **Teardown for automation** — include `commit_changes`, `push_branch`, and
-   `create_pull_request` teardown steps if you want the workflow to produce a PR automatically;
-   include `ssh()` on `push_branch` and `env(GITHUB_TOKEN)` on `create_pull_request`
+   `create_pull_request` only when the run should publish its result and the
+   prerequisites are available; awman supplies their credentials automatically

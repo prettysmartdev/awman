@@ -43,7 +43,7 @@ When you run `exec workflow --dynamic`, awman follows these steps:
 1. **Validate flags** — checks for conflicts before doing any work (see [Flag rules](#flag-rules))
 2. **Read the work item** — loads the work item file; fails immediately if it cannot be found or read
 3. **Set up the worktree** — creates an isolated Git worktree (the same path as `--yolo --worktree`); all subsequent agent work runs inside it
-4. **Seed the context directory** — writes `example-workflow.toml` and `workflow-usage.md` into the `context(workflow)` directory so the leader has reference material
+4. **Seed the context directory** — writes `workflow-usage.md`, including several inline examples, into the `context(workflow)` directory so the leader has reference material
 5. **Launch the leader agent** — starts a container with a pre-built prompt describing the work item, available agents, and path conventions; the agent's job is to write a `workflow.toml` to the context directory
 6. **Wait for the leader to finish** — stuck detection runs normally; after 30 seconds of silence the 60-second yolo countdown starts; when it expires (or you press `[n]`), the container is killed and awman reads the file
 7. **Validate the workflow** — checks that `workflow.toml` is valid TOML, references only agents that exist in the project, and has all required fields; if validation fails, a repair agent is launched (see [Repair loop](#repair-loop))

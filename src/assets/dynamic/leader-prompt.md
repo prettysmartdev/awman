@@ -9,16 +9,13 @@ Do not modify source files. Do not run tests. Do not implement the work item you
 
 ## Reference Materials
 
-Both files are already in your context directory. Read them before writing anything.
+Read this reference in your context directory before writing anything:
 
     /awman/context/workflow/workflow-usage.md      The workflow file-format specification:
-                                                   field types, overlay syntax, prompt
-                                                   template variables, and every setup and
-                                                   teardown step type.
-
-    /awman/context/workflow/example-workflow.toml  A worked example. Adapt its structure —
-                                                   never copy its literal agent names, model
-                                                   names, or shell commands.
+                                                   field types, overlays, template variables,
+                                                   setup and teardown, and examples of both
+                                                   focused and parallel workflows. Use them
+                                                   for syntax, not as a plan to copy.
 
 
 ## Work Item
@@ -30,9 +27,9 @@ Work item {{work_item_number}}, at:
 Read it in full. It drives every decision below:
 
   - Summary                    overall scope
-  - Implementation Details     how to break the work into steps
-  - Edge Case Considerations   what the review step must verify
-  - Test Considerations        what the test step must cover
+  - Implementation Details     concrete changes and their dependencies
+  - Edge Case Considerations   risks to verify during the work
+  - Test Considerations        behaviors and commands that need checking
   - Codebase Integration       paths and patterns the steps should follow
 
 
@@ -69,39 +66,53 @@ Project-specific instructions you MUST follow when building the workflow.
 
 ### Step decomposition
 
-Break the work item into discrete steps; each gets its own container and its own
-prompt. The usual roles are implement, tests, docs, and review. Include only the ones
-this work item warrants — a small fix may need two steps, a large feature more than four.
+Design the graph from the work item, not from a standard set of roles. First identify
+the concrete deliverables, which files they are likely to touch, and what must be
+known or completed before each can start. Then choose the smallest useful set of
+agent steps. A focused change can be one step that implements and verifies it. A
+larger change may call for discovery, separate components, integration, migration,
+or focused verification steps. Use names that describe the actual work.
+
+Include tests with the implementation step when that agent needs them to know the
+change works; split testing into a separate step only when it has a clear handoff or
+independent scope. Add documentation work when the change affects users or existing
+docs need correction. Add an independent review when the change's risk or complexity
+justifies it, and give the reviewer specific behaviors or failure modes to check.
+Do not create a step merely to fill an implement, tests, docs, or review slot.
 
 ### Ordering with depends_on
 
 Steps run in parallel by default. `depends_on` imposes order, forming a DAG that awman
-executes with as much parallelism as the dependencies allow.
-
-    implement
-      ├── tests    depends_on = ["implement"]
-      ├── docs     depends_on = ["implement"]
-      └── review   depends_on = ["tests", "docs"]
+executes with as much parallelism as the dependencies allow. Add each edge because
+one step needs another's output or because their edits would conflict. Do not add
+edges just to reproduce a familiar sequence.
 
 All steps share a single checkout of the repository. Two steps editing the same files
 at once will overwrite each other, so any steps touching overlapping files must be
 chained with `depends_on`. Steps confined to separate areas can safely run together.
 
+For a complex work item, use parallel branches where each step owns distinct files
+and can begin without another branch's output. A later integration step can name
+both branches in `depends_on` to wait for them; independent checks after that join
+can branch again. The "Parallel branches and joins" example in `workflow-usage.md`
+shows the TOML syntax. Adapt the graph to this work item's actual dependencies,
+and respect the advised concurrency limit above. Multiple steps with no dependency
+between them can still conflict if they edit the same files, so inspect ownership
+before putting them in parallel.
+
 ### Assigning agents
 
-When more than one agent is listed, give the building work (implement, tests, docs) to
-one agent and the checking work (review) to a *different* one. Code assistants have
-different blind spots, so an independent reviewer catches what self-review cannot. With
-three or more, you may also split genuinely independent implementation work across agents.
-
-When only one agent is listed, use it for every step and still include a review step.
-Self-review is worth less than cross-agent review, but it is not worth nothing.
+Assign agents to the actual steps and their strengths. When a separate review is
+warranted and more than one agent is listed, use a different agent for the review.
+With multiple agents, split implementation only where work is genuinely independent.
+When only one agent is listed, use it for every step; a separate self-review step is
+optional and should have a specific purpose.
 
 ### Passing context between steps
 
 `/awman/context/workflow/` is a shared read-write directory that persists across every
-step in the run. Steps are otherwise fully isolated from one another, so it is the only
-channel between them.
+step in the run. Steps also see the shared checkout; use the context directory for
+notes and artifacts that cannot be recovered from the code and diff.
 
 In a step's prompt, tell it to leave artifacts there for later steps to read: a summary
 of what changed and why, a script that exercises the new behavior, a note on which
@@ -113,8 +124,7 @@ not a substitute for writing a clear prompt.
 
 Each step's prompt should:
 
-  1. State exactly what to do, and what not to do (e.g. "do not write tests" on an
-     implement step).
+  1. State the step's concrete deliverable, boundaries, and any relevant file ownership.
   2. Pull in the work item context the step needs, using the prompt template variables
      documented in `workflow-usage.md`.
   3. Give concrete success criteria the agent can check for itself.
@@ -162,7 +172,8 @@ Re-read the file you wrote and confirm every point:
   5. Every `agent` appears in the Available Agents listing, and every `model` appears
      on that agent's line there.
   6. Steps touching the same files are chained by `depends_on` rather than parallel.
-  7. If the project has a test command, a teardown step runs it.
+  7. The workflow verifies affected behavior with appropriate project commands,
+     either in an agent step or in teardown.
   8. You created no other file and modified no source file.
 
 Fix anything that fails, then stop.

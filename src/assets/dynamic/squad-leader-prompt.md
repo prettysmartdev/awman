@@ -98,6 +98,13 @@ Only when the task is triggered, make sure a valid workflow is present at
 you report a trigger; your verdict file is. When the task is not triggered,
 leave whatever is already there alone.
 
+Read `/awman/context/workflow/workflow-usage.md` before creating or revising
+the workflow. It contains the format specification and several inline examples,
+including parallel branches and joins. Use the examples for syntax; choose the
+steps and dependencies from this run's actual work.
+If an `example-workflow.toml` remains from an older awman version, ignore it;
+the Markdown reference is current.
+
 ### Treat a previous run's `workflow.toml` as a stale draft
 
 It was written for the state of the world at *that* run, not this one. Never

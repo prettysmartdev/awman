@@ -539,14 +539,9 @@ impl ExecWorkflowCommand {
 
         frontend.report_workflow_context_path(&context_dir);
 
-        // ── Seed the context dir: remove stale workflow.toml, write refs. ───
+        // ── Seed the context dir: remove stale workflow.toml, write reference. ──
         let generated_path = context_dir.join("workflow.toml");
         let _ = std::fs::remove_file(&generated_path);
-        std::fs::write(
-            context_dir.join("example-workflow.toml"),
-            crate::data::dynamic_workflow_assets::EXAMPLE_WORKFLOW_TOML,
-        )
-        .map_err(|e| CommandError::Other(format!("writing example-workflow.toml: {e}")))?;
         std::fs::write(
             context_dir.join("workflow-usage.md"),
             crate::data::dynamic_workflow_assets::WORKFLOW_USAGE_MD,

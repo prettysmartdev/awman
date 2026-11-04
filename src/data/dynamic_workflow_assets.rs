@@ -4,16 +4,12 @@
 //! always regenerated from this embedded content at runtime — never read from
 //! the host filesystem. See WI-0092.
 //!
-//! - [`EXAMPLE_WORKFLOW_TOML`] and [`WORKFLOW_USAGE_MD`] are written into the
-//!   leader's workflow context directory as reference material.
+//! - [`WORKFLOW_USAGE_MD`] is written into the leader's workflow context
+//!   directory as reference material, including several inline examples.
 //! - [`LEADER_PROMPT_MD`] is the leader prompt template; it is substituted in
 //!   code (never written to disk) before being delivered to the leader agent.
 //! - [`LEADER_REPAIR_PROMPT`] is the repair prompt template used when the
 //!   leader's `workflow.toml` fails validation.
-
-/// A complete example workflow shown to the leader agent as reference. Written
-/// to `<context_dir>/example-workflow.toml`.
-pub const EXAMPLE_WORKFLOW_TOML: &str = include_str!("../assets/dynamic/example-workflow.toml");
 
 /// The complete workflow file-format documentation. Written to
 /// `<context_dir>/workflow-usage.md`.

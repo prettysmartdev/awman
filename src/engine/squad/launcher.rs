@@ -15,7 +15,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::data::dynamic_workflow_assets::{EXAMPLE_WORKFLOW_TOML, WORKFLOW_USAGE_MD};
+use crate::data::dynamic_workflow_assets::WORKFLOW_USAGE_MD;
 use crate::data::session::{AgentName, Session};
 use crate::data::RepoDockerfilePaths;
 use crate::engine::agent::{AgentEngine, AgentRunOptions};
@@ -368,14 +368,11 @@ impl SquadAgentLauncher {
     /// gone with it, and the leader is free to reuse a `workflow.toml` it
     /// wrote on an earlier run.
     ///
-    /// What remains is idempotently rewriting the two *static* reference
-    /// assets. They are read-only documentation shipped with the binary, not
-    /// task state, so rewriting them cannot lose anything.
+    /// What remains is idempotently rewriting the *static* workflow reference.
+    /// It is documentation shipped with the binary, not task state, so
+    /// rewriting it cannot lose anything.
     fn seed_task_dir(dir: &Path) -> Result<(), EngineError> {
         std::fs::create_dir_all(dir).map_err(|e| EngineError::io(dir, e))?;
-        let example = dir.join("example-workflow.toml");
-        std::fs::write(&example, EXAMPLE_WORKFLOW_TOML)
-            .map_err(|e| EngineError::io(&example, e))?;
         let usage = dir.join("workflow-usage.md");
         std::fs::write(&usage, WORKFLOW_USAGE_MD).map_err(|e| EngineError::io(&usage, e))?;
         Ok(())
@@ -548,13 +545,10 @@ mod tests {
             "seeding must never touch any other leader-written file"
         );
         assert_eq!(
-            std::fs::read_to_string(dir.join("example-workflow.toml")).unwrap(),
-            EXAMPLE_WORKFLOW_TOML
-        );
-        assert_eq!(
             std::fs::read_to_string(dir.join("workflow-usage.md")).unwrap(),
             WORKFLOW_USAGE_MD
         );
+        assert!(!dir.join("example-workflow.toml").exists());
     }
 
     #[test]
@@ -564,7 +558,7 @@ mod tests {
         SquadAgentLauncher::seed_task_dir(&dir).unwrap();
         // A second seed over an existing directory must not error.
         SquadAgentLauncher::seed_task_dir(&dir).unwrap();
-        assert!(dir.join("example-workflow.toml").exists());
+        assert!(dir.join("workflow-usage.md").exists());
     }
 
     // ── BLOCKER-1: one stamping implementation for every task container ──
