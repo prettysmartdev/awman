@@ -197,6 +197,18 @@ mod tests {
         assert!(locks.try_lock(&store, "agent:latest").unwrap().is_none());
         assert!(locks.try_lock(&store, "other:latest").unwrap().is_some());
         drop(held);
-        assert!(locks.try_lock(&store, "agent:latest").unwrap().is_some());
+        // A parallel test can fork while the lock is open. Its child keeps
+        // the flock until exec closes the inherited descriptor.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if locks.try_lock(&store, "agent:latest").unwrap().is_some() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a released build lock must not stay held"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 }
