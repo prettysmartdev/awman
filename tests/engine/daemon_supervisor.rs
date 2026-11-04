@@ -220,7 +220,7 @@ fn daemon_guard_check_accepts_absent_and_stale_pidfiles_in_both_directions() {
 }
 
 #[cfg(unix)]
-fn awman_named_test_process() -> Child {
+fn awman_named_test_process() -> (Child, tempfile::TempDir) {
     // The guard deliberately rejects a live PID belonging to an unrelated
     // process. Copying the test harness to an `awman` basename gives the
     // child the same process identity a real daemon has without starting a
@@ -228,6 +228,7 @@ fn awman_named_test_process() -> Child {
     let source = std::env::current_exe().unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let helper = tmp.path().join("awman");
+    let ready = tmp.path().join("ready");
     std::fs::copy(source, &helper).unwrap();
     // A concurrent test function forking anywhere in this process can inherit
     // the still-open write descriptor on `helper`, which makes `execve` report
@@ -247,7 +248,7 @@ fn awman_named_test_process() -> Child {
                 "--ignored",
                 "--nocapture",
             ])
-            .env("AWMAN_GUARD_HELPER", "1")
+            .env("AWMAN_GUARD_HELPER", &ready)
             .spawn();
         match spawned {
             Ok(child) => break child,
@@ -258,23 +259,20 @@ fn awman_named_test_process() -> Child {
             Err(e) => panic!("spawn awman-named helper process: {e}"),
         }
     };
-    // Wait on the *identity*, not merely on liveness. `spawn` returns once the
-    // child exists, and a forked-but-not-yet-exec'd child is already alive
-    // while still reporting the command name it inherited from this thread —
-    // so `is_process_alive` can pass a whole tick before the child looks like
-    // an awman process to the guard under test.
+    // Wait for the ignored test body to start, as well as the process name.
+    // The executable can appear in `ps` before libtest has selected the test
+    // body; an unmatched filter would then exit before the guard checks it.
     for _ in 0..500 {
-        if DaemonSupervisor::pid_is_awman(child.id()) {
-            // Exec has landed, so the child no longer needs the copied file.
-            // Dropping the TempDir avoids leaking a test binary.
-            drop(tmp);
-            return child;
+        if ready.exists() && DaemonSupervisor::pid_is_awman(child.id()) {
+            // Keep the copied executable until the caller stops the child.
+            // macOS uses its path to report the command name to `ps`.
+            return (child, tmp);
         }
         std::thread::sleep(Duration::from_millis(10));
     }
     let _ = child.kill();
     let _ = child.wait();
-    panic!("awman-named helper process never presented an awman command name");
+    panic!("awman-named helper process never entered its test body with an awman command name");
 }
 
 #[cfg(unix)]
@@ -291,7 +289,7 @@ fn assert_guard_rejects_live_other(kind: DaemonKind) {
         DaemonKind::Api => &api_root,
         DaemonKind::Squad => &squad_root,
     };
-    let mut child = awman_named_test_process();
+    let (mut child, _helper_dir) = awman_named_test_process();
     for _ in 0..40 {
         if DaemonSupervisor::is_process_alive(child.id()) {
             break;
@@ -339,7 +337,8 @@ fn daemon_guard_check_rejects_live_api_when_checking_squad() {
 #[test]
 #[ignore = "runs only as the body of the daemon-guard helper process"]
 fn daemon_guard_helper_process_stays_alive() {
-    if std::env::var_os("AWMAN_GUARD_HELPER").is_some() {
+    if let Some(ready) = std::env::var_os("AWMAN_GUARD_HELPER") {
+        std::fs::write(ready, b"ready").unwrap();
         std::thread::sleep(Duration::from_secs(30));
     }
 }
