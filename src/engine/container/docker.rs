@@ -119,7 +119,7 @@ fn query_agent_listing(args: &[&str]) -> Result<Vec<AgentHandle>, EngineError> {
     ))
 }
 
-/// Docker label applied to every amux-spawned container so `list_running`
+/// Docker label applied to every awman-spawned container so `list_running`
 /// can filter to ours. Lives on `ContainerCli` so the shared process module
 /// and this backend cannot drift apart.
 const AWMAN_LABEL: &str = ContainerCli::DOCKER.label;

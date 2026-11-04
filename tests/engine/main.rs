@@ -10,7 +10,7 @@ mod helpers;
 mod acp_support;
 mod container_docker;
 mod container_io;
-mod context_overlay_0087;
+mod context_overlay;
 mod credential_argv_docker;
 mod credential_refresh_integration;
 mod custom_agents;

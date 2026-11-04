@@ -652,7 +652,7 @@ must include `--yes`. `attach` and `status --watch` are available only in the
 CLI and TUI.
 
 Status and list output include a source marker for each agent. Ordinary user
-sessions are marked `session`; an agent launched by the squad daemon is marked
+sessions are marked `session`; an agent your squad launched is marked
 `squad:<task>`, such as `squad:issue-triage`. This marker identifies which task
 owns the background evaluation or generated workflow. It can appear even if
 you have never enabled squad; it does not indicate a problem with a regular

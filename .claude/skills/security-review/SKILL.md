@@ -1,44 +1,44 @@
 ---
 name: security-review
-description: A guided agent security review of amux, its CI/CD, and repo.
+description: A guided agent security review of awman, its CI/CD, and repo.
 ---
 
 # Security Review
 
-Conduct a systematic security review of amux across five domains: container security, network and API security, secrets and credentials, CI/CD supply chain, and codebase hygiene. Work through each section in order. For each finding, note the file path and line number, the severity (Critical / High / Medium / Low / Info), and a one-sentence description of the risk. Collect all findings, then print a summary table at the end.
+Conduct a systematic security review of awman across five domains: container security, network and API security, secrets and credentials, CI/CD supply chain, and codebase hygiene. Work through each section in order. For each finding, note the file path and line number, the severity (Critical / High / Medium / Low / Info), and a one-sentence description of the risk. Collect all findings, then print a summary table at the end.
 
 ---
 
 ## 1. Container Security
 
-Containers are amux's primary security boundary. Verify that boundary is correctly enforced.
+Containers are awman's primary security boundary. Verify that boundary is correctly enforced.
 
 ### 1a. Agent image Dockerfiles
 
-Check every Dockerfile in `templates/` and `.amux/`:
+Check every Dockerfile in `templates/` and `.awman/`:
 
 ```bash
-find templates/ .amux/ -name 'Dockerfile.*' | sort
+find templates/ .awman/ -name 'Dockerfile.*' | sort
 ```
 
 For each file:
 
-- **Non-root user** — Verify the file contains `USER amux` (or another non-root user) before the final `CMD`/`ENTRYPOINT`. Flag any image that runs as root.
+- **Non-root user** — Verify the file contains `USER awman` (or another non-root user) before the final `CMD`/`ENTRYPOINT`. Flag any image that runs as root.
 - **Install scripts via curl** — Search for `curl … | bash` or `curl … | sh` patterns. Each one is a supply-chain risk: the remote server can serve arbitrary code. Note the URL and whether a checksum or signature is verified.
   ```bash
-  grep -n 'curl.*|.*sh\|curl.*sh.*bash' templates/Dockerfile.* .amux/Dockerfile.*
+  grep -n 'curl.*|.*sh\|curl.*sh.*bash' templates/Dockerfile.* .awman/Dockerfile.*
   ```
 - **Package pinning** — Check whether apt packages and tool versions are pinned (`= x.y.z` or `--locked`). Unpinned installs allow silent version drift.
 - **Secrets baked in** — Scan for any `ENV`, `ARG`, or `COPY` that brings a credential, token, or private key into the image layer.
   ```bash
-  grep -niE 'ENV.*(KEY|TOKEN|SECRET|PASSWORD|PASS)\s*=' templates/Dockerfile.* .amux/Dockerfile.*
+  grep -niE 'ENV.*(KEY|TOKEN|SECRET|PASSWORD|PASS)\s*=' templates/Dockerfile.* .awman/Dockerfile.*
   ```
 
 ### 1b. Mount configuration
 
 Read `src/runtime/docker.rs` (and `src/runtime/apple_containers.rs` if present). For each `--volume` / `-v` / `--mount` flag passed to `docker run`:
 
-- **Repo root scope** — Verify amux mounts only the current directory or the Git repo root, never a parent directory above the repo root.
+- **Repo root scope** — Verify awman mounts only the current directory or the Git repo root, never a parent directory above the repo root.
 - **SSH key mount** — Locate the SSH mount (search for `.ssh`). Confirm it is mounted read-only (`:ro`). If it is read-write, flag it High.
   ```bash
   grep -n '\.ssh' src/runtime/docker.rs
@@ -61,10 +61,10 @@ grep -rn 'env_passthrough\|envPassthrough\|passthrough' src/ --include='*.rs'
 ```
 
 Confirm that:
-- Only the **variable names** listed in config are forwarded — amux reads the value from the host environment at runtime and passes `-e NAME=VALUE` to Docker. If the names are baked into the image or config file, flag it.
-- No passthrough list is stored in a world-readable file (check the repo config at `.amux/config.json` for actual secrets embedded as values, not just names).
+- Only the **variable names** listed in config are forwarded — awman reads the value from the host environment at runtime and passes `-e NAME=VALUE` to Docker. If the names are baked into the image or config file, flag it.
+- No passthrough list is stored in a world-readable file (check the repo config at `.awman/config.json` for actual secrets embedded as values, not just names).
   ```bash
-  cat .amux/config.json
+  cat .awman/config.json
   ```
 
 ### 1d. Privileged mode and capabilities
@@ -106,7 +106,7 @@ If TLS is absent, the API key and all command payloads travel in plaintext. Flag
 
 Read `src/commands/headless/auth.rs`. Verify:
 
-- **`--dangerously-skip-auth` flag** — Confirm it exists and check whether amux emits a prominent warning when it is used.
+- **`--dangerously-skip-auth` flag** — Confirm it exists and check whether awman emits a prominent warning when it is used.
   ```bash
   grep -n 'skip.auth\|dangerously' src/commands/headless/server.rs src/commands/headless/auth.rs
   ```
@@ -159,7 +159,7 @@ grep -rn --include='*.rs' -E \
 ```bash
 grep -rn --include='*.json' -E \
   '"(key|secret|token|password)":\s*"[^{]' \
-  .amux/ aspec/
+  .awman/ aspec/
 ```
 
 Any match outside of test fixtures or documentation is Critical if it looks like a real credential.
@@ -310,7 +310,7 @@ The following patterns should be present (or the files should not exist in the r
 - `.env`, `.env.*`
 - `*.pem`, `*.key`, `*.p12`, `*.pfx`
 - `secrets.json`, `credentials.json`
-- `~/.amux/config.json` (global config — should not be in this repo)
+- `~/.awman/config.json` (global config — should not be in this repo)
 
 If any of these files are tracked by git:
 ```bash

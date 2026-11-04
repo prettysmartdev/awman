@@ -35,19 +35,18 @@ pub(crate) async fn spawn_router(
 }
 
 mod auth_modes;
+mod command_lifecycle;
+mod command_log_stream;
+mod command_outputs;
+mod command_queue;
+mod command_results;
+mod frontend_layering;
+mod http_consistency;
 mod http_core;
 mod live_server;
-mod rename_0077;
+mod remote_session;
+mod request_validation;
 mod routes;
-mod wi_0078;
-mod wi_0079;
-mod wi_0097;
-mod wi_0097_architecture;
-mod wi_0132;
-mod wi_0133_remote;
-mod wi_0134;
-mod wi_0135;
-mod wi_0136;
-mod wi_0137_results;
-mod wi_0137_surface;
-mod wi_0138;
+mod session_setup_and_event_bus;
+mod workdir_allowlist;
+mod workflow_state;

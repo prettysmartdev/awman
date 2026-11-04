@@ -17,7 +17,7 @@ jobs:
     name: Tag, version and release notes
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Tag matches Cargo.toml version and release notes exist
         run: |
           tag="${GITHUB_REF#refs/tags/}"
@@ -53,10 +53,10 @@ jobs:
             builtin: false
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable (toolchain pinned below)
         with:
           toolchain: "1.94.0"
           targets: ${{ matrix.target }}
@@ -104,7 +104,7 @@ jobs:
 
       - name: Upload dependency listing
         if: runner.os != 'Windows'
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: dependency-listing-${{ matrix.target }}
           path: |
@@ -120,7 +120,7 @@ jobs:
         run: cp target/${{ matrix.target }}/release/awman.exe ${{ matrix.artifact }}
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}
@@ -131,13 +131,13 @@ jobs:
     runs-on: [self-hosted, macOS, ARM64, hypervisor]
     timeout-minutes: 180
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # The builtin state upgrade policy compares against the previous
           # release tag, so it needs the full history and tags.
           fetch-depth: 0
           fetch-tags: true
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable (toolchain pinned below)
         with:
           toolchain: "1.94.0"
           targets: aarch64-apple-darwin
@@ -170,7 +170,7 @@ jobs:
           test -x /opt/awman/release-workload.sh || { echo "BLOCKED: native release runner must provision /opt/awman/release-workload.sh (realistic cached guest workload that writes guest RSS to AWMAN_GUEST_RSS_OUTPUT)"; exit 1; }
           bash tools/release-artifact-check.sh "$PWD/awman-macos-arm64" aarch64-apple-darwin release-evidence/macos /opt/awman/release-offline-session.sh
           bash tools/measure-release-artifact.sh "$PWD/awman-macos-arm64" aarch64-apple-darwin release-evidence/macos-measurements /opt/awman/release-workload.sh
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: awman-macos-arm64-builtin
@@ -189,10 +189,10 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: artifacts
 
@@ -216,7 +216,7 @@ jobs:
 
       # The preflight job already required docs/releases/<tag>.md.
       - name: Create release with notes
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           tag_name: ${{ steps.tag.outputs.version }}
           body_path: docs/releases/${{ steps.tag.outputs.version }}.md

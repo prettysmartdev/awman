@@ -1,4 +1,4 @@
-//! WI 0137: structured command results and the one final `command_status`.
+//! Structured command results and the one final `command_status`.
 //!
 //! * `CommandError::code()` / `stage()` — pure table tests over every variant.
 //! * `GitEngine::command_result` — real `git` in a temp repo, no server.
@@ -9,7 +9,7 @@
 //!   both.
 //!
 //! Outputs, translators, attribution, the workflow view and the `?step=`
-//! filter are covered by `wi_0137_surface.rs`.
+//! filter are covered by `command_outputs.rs`.
 
 use awman::command::error::{failure_stages, CommandError};
 use awman::engine::error::EngineError;
@@ -289,7 +289,7 @@ fn every_command_error_variant_has_a_snake_case_code_and_a_known_stage() {
     }
 }
 
-/// WI 0137 §1: one code per variant. Only the lower-layer wrappers
+/// One code per variant. Only the lower-layer wrappers
 /// (`Engine`, `Data`) and the untyped `Other` share `internal`; the two
 /// agent-definition engine errors keep their own codes; every other variant
 /// has a code no other variant uses.
@@ -308,7 +308,7 @@ fn every_command_error_variant_has_its_own_code() {
             assert_eq!(other, name, "code {code} is shared by {other} and {name}");
         }
     }
-    // WI 0138's HTTP vocabulary is reused where the conditions overlap.
+    // The HTTP error vocabulary is reused where the conditions overlap.
     for code in [
         "unknown_subcommand",
         "unknown_flag",
@@ -1148,7 +1148,7 @@ abort_on_failure = true
         // Legacy fields are filled exactly as before; `error` equals the message.
         assert_eq!(result["error"], result["failure"]["message"]);
         assert_eq!(result["error_status"], 404);
-        // `stage` keeps its pre-0137 meaning: absent outside prerequisites/push.
+        // `stage` keeps its original meaning: absent outside prerequisites/push.
         assert!(result.get("stage").is_none(), "{result}");
         assert_eq!(result["exit_code"], 4);
         assert_eq!(record["exit_code"], 4);
@@ -1842,7 +1842,7 @@ depends_on = ["first"]
 prompt = "work slowly"
 "#;
 
-    /// WI 0137 §3 and §5 through a real daemon restart: the re-queued workflow
+    /// Outputs and step attribution through a real daemon restart: the re-queued workflow
     /// resumes from its saved state, keeps the outputs of the step it keeps,
     /// and attributes the rerun step by its definition index (1, though it
     /// is the first step this attempt launches) with the saved launch count
@@ -1945,7 +1945,7 @@ mod result_shape {
     use serde_json::{json, Value};
 
     #[test]
-    fn a_pre_0137_result_round_trips_with_every_original_key_and_no_new_ones() {
+    fn a_legacy_result_round_trips_with_every_original_key_and_no_new_ones() {
         let legacy = json!({
             "exit_code": 1,
             "error": "push: rejected",

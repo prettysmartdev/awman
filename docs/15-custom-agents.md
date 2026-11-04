@@ -263,7 +263,7 @@ In the TUI the same review appears in a scrollable dialog: long commands wrap, �
 
 - **`y`** records the approval and continues.
 - **`n`**, Esc or end-of-input stops with `agent definition '<name>' was not approved` (exit 1).
-- **No one to ask** — `--non-interactive`/`-n`, `--json`, no terminal, the HTTP API, or the squad daemon — never prompts. The command fails with `agent definition '<name>' (<path>) has not been approved for this repo; run 'awman ready --agent <name>' interactively to review it` (exit 2, or HTTP 403 through the API). `--yes` does not approve anything.
+- **No one to ask** — `--non-interactive`/`-n`, `--json`, no terminal, the HTTP API, or a squad task — never prompts. The command fails with `agent definition '<name>' (<path>) has not been approved for this repo; run 'awman ready --agent <name>' interactively to review it` (exit 2, or HTTP 403 through the API). `--yes` does not approve anything.
 
 An unknown agent name exits with status 4 and lists the known agents; a definition that fails validation exits with status 1 and lists every problem.
 

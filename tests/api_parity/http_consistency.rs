@@ -1,4 +1,5 @@
-//! WI 0138 HTTP API consistency regressions.
+//! HTTP API consistency: error codes, resource aliases, session forms and
+//! stored-status wire spellings.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -25,7 +26,7 @@ use awman::frontend::api::routes::{build_router, AppState, AuthMode, API_FEATURE
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 
-const SESSION: &str = "wi-0138-session";
+const SESSION: &str = "http-consistency-session";
 
 fn state(root: &std::path::Path) -> Arc<AppState> {
     let paths = ApiPaths::from_root(root);
@@ -631,7 +632,7 @@ async fn pending_alias_unknown_flags_and_exec_parent_refusal_are_pinned() {
     let unknown_flag = client
         .post(format!("{base}/v1/commands"))
         .header("x-awman-session", SESSION)
-        .json(&serde_json::json!({"subcommand":"exec workflow", "args":["--wi-0138-nope"]}))
+        .json(&serde_json::json!({"subcommand":"exec workflow", "args":["--no-such-flag"]}))
         .send()
         .await
         .unwrap();
@@ -802,7 +803,7 @@ async fn framework_and_admission_errors_have_codes_over_http() {
     assert_eq!(json["code"], "unauthorized");
 }
 
-/// WI 0129 F10: the wire keeps the stored spellings, and a stored value no
+/// The wire keeps the stored spellings, and a stored value no
 /// enum names is a server error, never a guessed state.
 #[tokio::test]
 async fn stored_statuses_keep_their_wire_spelling_and_unknown_values_fail_explicitly() {

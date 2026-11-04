@@ -5,7 +5,7 @@ use super::*;
 
 /// Render the command box.
 ///
-/// Matches old amux:
+/// Layout:
 /// - 3-row rounded border
 /// - Title `" command "` when focused, `" command (inactive) "` when blurred
 /// - Border + prefix Cyan when focused; DarkGray when blurred

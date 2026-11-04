@@ -1714,12 +1714,12 @@ impl crate::command::commands::workflow_prerequisites::WorkflowPrerequisiteFront
 mod tests {
     use super::*;
 
-    #[path = "wi0132_e2e.rs"]
-    mod wi0132_e2e;
-    #[path = "wi0132_engine.rs"]
-    mod wi0132_engine;
-    #[path = "wi0137_agent_output.rs"]
-    mod wi0137_agent_output;
+    #[path = "agent_output.rs"]
+    mod agent_output;
+    #[path = "dynamic_workflow_e2e.rs"]
+    mod dynamic_workflow_e2e;
+    #[path = "live_engine_state.rs"]
+    mod live_engine_state;
 
     use crate::command::dispatch::projections::raw_args::shared_cases::{
         assert_reads, classification, CASES, ERROR_CASES,

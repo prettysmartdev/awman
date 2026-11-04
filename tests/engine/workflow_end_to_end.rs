@@ -312,7 +312,7 @@ fn state_next_ready_uses_dag_correctly() {
 // ─── Captured fixture forward-compat ─────────────────────────────────────────
 //
 // `tests/fixtures/workflow_state/v1.json` is a captured snapshot of the
-// schema-v1 on-disk shape that prior amux releases wrote. The new
+// schema-v1 on-disk shape that earlier releases wrote. The new
 // `WorkflowState` deserializer must continue to load it without loss.
 
 #[test]

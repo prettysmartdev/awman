@@ -1073,7 +1073,7 @@ choose what happens with `--on-existing-worktree`:
 When the flag is absent, the TUI and an interactive CLI ask, unless you have
 accepted a workflow or dynamic-workflow resume, in which case the existing
 worktree is reused without a second question. A piped or `--non-interactive` CLI
-run, and the squad daemon, resume. The API fails (see
+run, and a squad task's run, resume. The API fails (see
 [Existing worktrees](09-api-and-remote-mode.md#existing-worktrees)). An explicit
 value always wins.
 
@@ -1471,7 +1471,7 @@ The question is asked before the worktree is prepared, so cancelling really does
 
 When the previous run completed every step there is nothing to resume, so awman says so and starts fresh rather than offering a choice with one sane answer.
 
-Runs with nobody at the keyboard (`--non-interactive`, the API server) resume at the step the previous run stopped on, preserving the work already done. The squad daemon is the exception: each scheduled evaluation is its own run, so it always starts over. None of them can cancel — there is nobody to press Esc.
+Runs with nobody at the keyboard (`--non-interactive`, the API server) resume at the step the previous run stopped on, preserving the work already done. A squad task is the exception: each scheduled evaluation is its own run, so it always starts over. None of them can cancel — there is nobody to press Esc.
 
 ### Workflow file changed
 

@@ -1,7 +1,7 @@
 //! Engine-level workflow state persistence — Layer 0.
 //!
 //! Persists `WorkflowState` snapshots under `<git-root>/.awman/workflows/`.
-//! The filename pattern matches old-amux: `<repohash8>-[<wi>-]<name>.json`,
+//! The filename pattern is `<repohash8>-[<wi>-]<name>.json`,
 //! where `repohash8` is the first 8 hex characters of SHA-256(git_root path).
 
 use std::path::{Path, PathBuf};

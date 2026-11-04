@@ -1,6 +1,6 @@
-//! Integration tests for WI-0087 context overlay feature.
+//! Integration tests for the context overlay.
 //!
-//! Covers the cross-layer flows described in the WI-0087 test considerations:
+//! Covers the cross-layer flows:
 //! exec_prompt + context(global) pipeline, workflow overlay merging, and the
 //! context(workflow) dynamic prompt step-progression markers.
 

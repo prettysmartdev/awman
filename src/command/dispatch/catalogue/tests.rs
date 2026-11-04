@@ -1173,7 +1173,7 @@ fn agent_tips_name_real_commands_and_stay_short() {
         .iter()
         .filter(|t| t.contains("awman new agent") || t.contains("--pull builtin"))
         .collect();
-    assert_eq!(tips.len(), 2, "{tips:?}");
+    assert_eq!(tips.len(), 3, "{tips:?}");
     let cat = CommandCatalogue::get();
     assert!(cat.lookup(&["new", "agent"]).is_some());
     assert!(cat

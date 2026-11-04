@@ -1,4 +1,4 @@
-//! Binary-level tests for WI-0083: antigravity agent and gemini deprecation.
+//! Binary-level tests for the antigravity agent and the gemini deprecation.
 //!
 //! Tests that can be validated without a live Docker daemon (warnings fire
 //! before agent-image checks, and model-flag errors fire before image checks
@@ -33,7 +33,7 @@ fn awman_isolated(repo: &TempDir) -> (TempDir, Command) {
 
 // ─── Gemini deprecation warning — chat ───────────────────────────────────────
 
-/// `amux chat gemini` must emit a deprecation warning containing "deprecated"
+/// `awman chat --agent gemini` must emit a deprecation warning containing "deprecated"
 /// to stderr before the container launch is attempted. The process exits
 /// non-zero (no Docker images), but the warning must still be present.
 #[test]
@@ -48,7 +48,7 @@ fn chat_gemini_emits_deprecation_warning_before_container_start() {
     // Must exit non-zero (no Docker images available in test environment).
     assert!(
         !output.status.success(),
-        "amux chat gemini should exit non-zero in a test environment without Docker images"
+        "`chat --agent gemini` should exit non-zero in a test environment without Docker images"
     );
 
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -64,7 +64,7 @@ fn chat_gemini_emits_deprecation_warning_before_container_start() {
 
 // ─── Gemini deprecation warning — exec-workflow ───────────────────────────────
 
-/// `amux exec-workflow --agent gemini` must emit a deprecation warning even
+/// `awman exec workflow --agent gemini` must emit a deprecation warning even
 /// when the workflow file does not exist (warning fires before file check).
 #[test]
 fn exec_workflow_gemini_emits_deprecation_warning() {
@@ -83,7 +83,7 @@ fn exec_workflow_gemini_emits_deprecation_warning() {
 
     assert!(
         !output.status.success(),
-        "amux exec workflow with missing file must exit non-zero"
+        "`exec workflow` with missing file must exit non-zero"
     );
 
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -93,9 +93,8 @@ fn exec_workflow_gemini_emits_deprecation_warning() {
     );
 }
 
-/// The deprecation warning must reference real `awman` commands, not the
-/// previous draft `amux agent install …` (which does not exist). This catches
-/// regressions of the WI-0083 review fix that replaced the placeholder text.
+/// The deprecation warning must reference real `awman` commands, not a
+/// non-existent `agent install` subcommand.
 #[test]
 fn gemini_deprecation_warning_uses_real_commands() {
     let repo = make_git_repo();
@@ -106,10 +105,6 @@ fn gemini_deprecation_warning_uses_real_commands() {
         .expect("failed to run awman");
 
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        !stderr.contains("amux "),
-        "deprecation warning must not reference the non-existent 'amux' binary; got:\n{stderr}"
-    );
     assert!(
         !stderr.contains("agent install"),
         "deprecation warning must not reference the non-existent 'agent install' subcommand; got:\n{stderr}"
@@ -123,7 +118,7 @@ fn gemini_deprecation_warning_uses_real_commands() {
 
 // ─── antigravity --model → non-zero exit + clear error ───────────────────────
 
-/// `amux chat antigravity --model gemini-3.5-flash` must exit non-zero.
+/// `awman chat --agent antigravity --model gemini-3.5-flash` must exit non-zero.
 /// The error must name both "antigravity" and indicate that a model flag is
 /// not supported. Because build_options fires after agent-image checks, the
 /// most we can guarantee at the binary level is a non-zero exit; the model-
@@ -145,37 +140,7 @@ fn chat_antigravity_model_flag_exits_nonzero() {
 
     assert!(
         !output.status.success(),
-        "amux chat antigravity --model must exit non-zero; exit code: {:?}",
+        "`chat --agent antigravity --model` must exit non-zero; exit code: {:?}",
         output.status.code()
-    );
-}
-
-/// Verify that the model-flag error message naming "antigravity" and
-/// "does not support a model flag" appears somewhere in the combined output
-/// when the binary reaches build_options (possible only when images exist, but
-/// the unit test in engine/agent/mod.rs covers this definitively).
-/// This binary test checks exit code + that no silent success occurs.
-#[test]
-fn chat_antigravity_model_flag_stderr_or_exit_nonzero() {
-    let repo = make_git_repo();
-    let (_cfg, mut cmd) = awman_isolated(&repo);
-    let output = cmd
-        .args([
-            "chat",
-            "--agent",
-            "antigravity",
-            "--model",
-            "gemini-3.5-flash",
-        ])
-        .output()
-        .expect("failed to run awman");
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    // Must exit non-zero AND (if images are available) stderr must contain the
-    // model-flag rejection message. In CI without Docker, the earlier
-    // "project image" error is acceptable — non-zero exit is the invariant.
-    assert!(
-        !output.status.success(),
-        "amux chat antigravity --model must never succeed; stderr:\n{stderr}"
     );
 }

@@ -40,7 +40,7 @@ The installer detects your platform and puts `awman` on your `PATH`.
 mise use -g github:prettysmartdev/awman
 ```
 
-To pin to a specific version: `mise use -g github:prettysmartdev/awman@0.12.0`
+To pin to a specific version: `mise use -g github:prettysmartdev/awman@0.13.0`
 
 **From GitHub Releases** — download the binary for your platform from [GitHub Releases](https://github.com/prettysmartdev/awman/releases):
 
@@ -102,7 +102,7 @@ A workflow breaks complex work into phases — plan → implement → review →
 
 Workflows are TOML or YAML files in your repo. Steps declare their dependencies with `depends_on`, and independent steps run in parallel. Around them, setup and teardown phases prepare the branch and handle the finish: run tests, commit, push, open the PR, and block on CI until it goes green. Any of those can carry an `on_failure` block that launches an agent to fix the problem and retries.
 
-Two things make this more than a prompt runner:
+Three things make this more than a prompt runner:
 
 - **Per-step agents.** Any step can name the `agent` and `model` it runs with, so you can have Codex implement and Claude review in the same pipeline. Steps that don't specify one use your project's default.
 - **Per-step overlays.** Each step declares exactly what it needs from the host — `skill(review)` for a review checklist, `env(API_KEY)` for a tool it calls. Nothing gets host access it didn't ask for.
@@ -171,7 +171,7 @@ Supported agents: `claude`, `codex`, `opencode`, `gemini`, `antigravity`, `copil
 
 Don't want to write the file at all? `awman exec workflow --dynamic --work-item 0027` puts a leader agent in a container, has it design a workflow for that work item, validates the result, and runs it. See [Dynamic Workflows](docs/06-dynamic-workflows.md).
 
-### Create a squad to automate your work
+### Give tasks to your squad of agents
 
 Workflows still need you to start them. Your **squad** is a group of agents that work on your behalf while you're doing something else. You give the squad tasks — "when a new issue is opened, triage it and post a plan", "if any open PR has failing tests, fix them" — and it watches for each one and runs a workflow when it fires.
 
@@ -278,7 +278,7 @@ awman new workflow [--interview]       # create a workflow file
 awman new skill [--interview]          # create a skill file
 awman new skill --pull <repo> | --pull-all     # pull or refresh a published skills library from GitHub
 awman specs amend <nnnn>               # update a spec to match what was built
-awman new agent                        # define a custom agent type
+awman new agent <name> [--from crush|maki] [--global]   # define a custom agent type
 awman agents status [--watch]          # dashboard of running agents
 awman agents list | detail <id> | kill <id> | attach <id>
 awman clean [--dry-run] [--yes]        # remove stopped containers, stale images, and completed workflow data
@@ -297,6 +297,7 @@ awman squad stop | status | logs       # squad daemon lifecycle
 awman api start [--port <n>]           # start the HTTP API server (generates API key on first run)
 awman api status | logs | kill         # check, tail or stop the API server
 awman remote session start --workdir <dir>     # create a session on a remote server
+awman remote session kill <id>                  # close a remote session
 awman remote exec workflow <path> [--follow]   # run a workflow on a remote API server
 awman remote exec prompt "<text>" [--follow]   # run a one-shot prompt on a remote API server
 ```

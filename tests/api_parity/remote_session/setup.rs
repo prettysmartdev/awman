@@ -1,4 +1,4 @@
-//! Remote session setup against a `git daemon` origin (WI 0133): base ref,
+//! Remote session setup against a `git daemon` origin: base ref,
 //! merge refs, their failures, commit identity and restore.
 
 use serde_json::json;
@@ -212,7 +212,7 @@ async fn real_git_restored_session_keeps_repo_url_branch_and_push() {
     );
 }
 
-/// The WI 0133 request rules surface as 400s on the live HTTP API. Needs no
+/// The session request rules (base ref, merge refs, push-back) surface as 400s on the live HTTP API. Needs no
 /// git: every request is refused before a clone is attempted.
 #[tokio::test(flavor = "multi_thread")]
 async fn real_network_session_request_validation_over_http_returns_400() {

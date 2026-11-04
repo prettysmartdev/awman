@@ -1,4 +1,4 @@
-//! WI-0079 test suite: Queue-and-Worker Execution System.
+//! Queue-and-worker command execution over the API.
 //!
 //! Test categories:
 //!   - Queue unit tests (SqliteSessionStore queue operations)
@@ -454,7 +454,7 @@ fn backward_compat_legacy_pending_commands_are_claimable() {
         })
         .unwrap();
 
-    // The old insert_command entry point now writes `queued` (WI 0138);
+    // The old insert_command entry point now writes `queued`;
     // pre-existing `pending` rows are migrated (see api_db.rs).
     store
         .insert_command("legacy-c1", "s1", "exec workflow", "[]", "/logs/legacy")
@@ -2033,7 +2033,7 @@ fn close_session_force_is_idempotent_for_already_closed() {
     );
 }
 
-// ─── Regression tests for review-cycle fixes ─────────────────────────────────
+// ─── Queue, session and status regressions ───────────────────────────────────
 
 /// GET /v1/sessions/{id}/queue must report queued commands oldest-first
 /// (position 0 = next to run). Previously the handler iterated the
@@ -2319,12 +2319,12 @@ async fn real_network_post_after_delete_is_rejected() {
     server.abort();
 }
 
-// ─── Status-event `phase` labels (WI 0114, F-33 / midpoint finding 3) ────────
+// ─── Status-event `phase` labels ──────────────────────────────────────────────
 //
 // The merged `AgentImageFrontend` impl tags every setup status event with the
-// command's own name, read from `ApiDispatchFrontend::command_path`. Before
-// WI 0114 that field held `body.subcommand` verbatim, so a request could
-// choose its own label; it is now the catalogue's canonical spelling. These
+// command's own name, read from `ApiDispatchFrontend::command_path`. That
+// field is the catalogue's canonical spelling, never `body.subcommand`
+// verbatim, so a request cannot choose its own label. These
 // assertions read the serialised JSON, not the enum, because the label is a
 // wire contract for every client that groups setup events by phase.
 
@@ -2380,7 +2380,7 @@ async fn a_padded_subcommand_still_emits_the_canonical_phase_label() {
     );
 }
 
-// ─── Typed wire enums (WI 0114, F-48) ───────────────────────────────────────
+// ─── Typed wire enums ─────────────────────────────────────────────────────────
 //
 // `from_status`/`to_status`, `CommandStatus.status`, `WorkflowPhaseTransition
 // .status`, the `session_type` column and `awman squad env`'s state column

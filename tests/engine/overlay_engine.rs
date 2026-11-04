@@ -10,7 +10,7 @@ use awman::engine::overlay::{DirectorySpec, OverlayEngine, OverlayRequest, CLAUD
 
 /// Set `AWMAN_CONFIG_HOME` to `home`, run `f`, then restore the previous value
 /// (even if `f` panics) under the engine binary's shared environment guard.
-fn with_amux_config_home<F, R>(home: &std::path::Path, f: F) -> R
+fn with_awman_config_home<F, R>(home: &std::path::Path, f: F) -> R
 where
     F: FnOnce() -> R,
 {
@@ -97,7 +97,7 @@ fn skill_overlays_claude_ro_mount_when_skills_dir_exists() {
     let engine = make_engine(tmp.path());
     let agent = AgentName::new("claude").unwrap();
 
-    let specs = with_amux_config_home(tmp.path(), || {
+    let specs = with_awman_config_home(tmp.path(), || {
         engine
             .skill_overlays(&agent, true, &[], &None, std::path::Path::new("/"))
             .unwrap()
@@ -130,7 +130,7 @@ fn skill_overlays_empty_when_global_skills_dir_absent() {
     let engine = make_engine(tmp.path());
     let agent = AgentName::new("claude").unwrap();
 
-    let specs = with_amux_config_home(tmp.path(), || {
+    let specs = with_awman_config_home(tmp.path(), || {
         engine
             .skill_overlays(&agent, true, &[], &None, std::path::Path::new("/"))
             .unwrap()
@@ -151,7 +151,7 @@ fn skill_overlays_empty_for_an_undefined_agent_no_error() {
     let agent = AgentName::new("not-defined").unwrap();
 
     // Must return Ok(vec![]) — not an error — even though the agent has no definition (and so no skills dir).
-    let result = with_amux_config_home(tmp.path(), || {
+    let result = with_awman_config_home(tmp.path(), || {
         engine.skill_overlays(&agent, true, &[], &None, std::path::Path::new("/"))
     });
 

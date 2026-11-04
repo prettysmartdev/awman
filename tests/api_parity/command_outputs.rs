@@ -1,4 +1,5 @@
-//! WI 0137 API and engine surface regression tests.
+//! Command outputs, structured-agent translators, step attribution, the
+//! workflow view and the `?step=` log filter over the API.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -413,7 +414,7 @@ async fn workflow_alias_matches_canonical_route_and_status_is_snake_case() {
 }
 
 #[test]
-fn api_features_advertise_wi_0137_surface() {
+fn api_features_advertise_structured_results_and_outputs() {
     for feature in [
         "structured_results",
         "outputs",

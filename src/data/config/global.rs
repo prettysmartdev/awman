@@ -182,6 +182,10 @@ impl GlobalConfig {
     fn validate_loaded(&mut self, path: &std::path::Path) -> Result<(), DataError> {
         let cfg = self;
         validate_max_concurrent_agents(cfg.max_concurrent_agents)?;
+        // Zero workers would accept API commands that never run.
+        if cfg.workers == Some(0) {
+            return Err(DataError::Other("workers must be >= 1".to_string()));
+        }
         if let Some(squad) = &cfg.squad {
             squad
                 .validate()
@@ -424,6 +428,19 @@ mod tests {
         original.save_with(&env).unwrap();
         let reloaded = GlobalConfig::load_with(&env).unwrap();
         assert_eq!(original, reloaded);
+    }
+
+    #[test]
+    fn load_rejects_workers_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = isolated_env(tmp.path());
+        write_global(&env, r#"{"workers": 0}"#);
+
+        let err = GlobalConfig::load_with(&env).unwrap_err();
+        assert!(
+            err.to_string().contains("workers must be >= 1"),
+            "error must explain the >= 1 requirement, got: {err}"
+        );
     }
 
     #[test]

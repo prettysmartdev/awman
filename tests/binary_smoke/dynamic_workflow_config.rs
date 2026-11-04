@@ -1,4 +1,4 @@
-//! WI 0150 — `workflows.dynamic` end to end through the real binary.
+//! `workflows.dynamic` end to end through the real binary.
 //!
 //! Each test builds a throwaway git repo and `HOME`, puts the fake container
 //! CLI from `helpers/api_process.rs` first on `PATH` (so no Docker is ever

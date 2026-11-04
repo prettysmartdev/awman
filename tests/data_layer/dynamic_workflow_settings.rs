@@ -1,4 +1,4 @@
-//! WI 0150 Layer 0 dynamic-workflow schema, merge and migration coverage.
+//! Layer 0 dynamic-workflow settings: schema, repo/global merge and migration.
 
 use awman::data::config::env::{EnvSnapshot, AWMAN_CONFIG_HOME};
 use awman::data::config::global::GlobalConfig;

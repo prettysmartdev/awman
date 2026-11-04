@@ -208,7 +208,7 @@ pub const CONFIG_FIELDS: &[ConfigFieldSpec] = &[
     ),
     ConfigFieldSpec {
         name: "auto_agent_auth_accepted",
-        scope: FieldScope::GlobalOnly,
+        scope: FieldScope::RepoOnly,
         kind: ConfigFieldKind::Bool,
         comma_list: false,
         read_only: true,
@@ -242,7 +242,7 @@ pub const CONFIG_FIELDS: &[ConfigFieldSpec] = &[
         "runtime",
         FieldScope::GlobalOnly,
         ConfigFieldKind::Enum,
-        Some("docker | apple-container | builtin-experimental"),
+        Some("docker | apple-containers | docker-sbx-experimental | builtin-experimental"),
     ),
     f(
         "builtin.stateDir",

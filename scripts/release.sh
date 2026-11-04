@@ -9,12 +9,13 @@ set -euo pipefail
 
 # ── Colours ───────────────────────────────────────────────────────────────────
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-BOLD='\033[1m'
-NC='\033[0m'
+# ANSI-C quoted so `read -p` prompts show colour too, not a literal \033.
+RED=$'\033[0;31m'
+GREEN=$'\033[0;32m'
+YELLOW=$'\033[1;33m'
+BLUE=$'\033[0;34m'
+BOLD=$'\033[1m'
+NC=$'\033[0m'
 
 step() { echo -e "\n${BLUE}${BOLD}==>${NC}${BOLD} $*${NC}"; }
 ok()   { echo -e "  ${GREEN}✓${NC} $*"; }
@@ -61,8 +62,10 @@ if [ -z "$VERSION" ]; then
   exit 1
 fi
 
-if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9._-]+)?$ ]]; then
-  die "Version must match vX.Y.Z format, got: $VERSION"
+# Plain vX.Y.Z only: release.yml runs on tags matching v[0-9]+.[0-9]+.[0-9]+, so
+# a pre-release tag (v1.2.3-rc1) would never start the Release workflow.
+if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  die "Version must match vX.Y.Z (no pre-release suffix), got: $VERSION"
 fi
 
 echo -e "\n${BOLD}Releasing awman ${VERSION}${NC}"
@@ -99,8 +102,7 @@ else
 fi
 
 # clean working tree — allow only files this script manages
-MANAGED_FILES="Cargo.toml Cargo.lock docs/releases/"
-DIRTY=$(git status --porcelain | grep -v "^.. Cargo\.\(toml\|lock\)" | grep -v "^.. docs/releases/" || true)
+DIRTY=$(git status --porcelain | grep -Ev "^.. (Cargo\.(toml|lock)|docs/releases/)" || true)
 if [ -n "$DIRTY" ]; then
   warn "Working tree has unexpected changes:"
   echo "$DIRTY" | sed 's/^/    /'
@@ -180,9 +182,11 @@ else
     fi
   fi
 
-  # Bump the version field in Cargo.toml (first occurrence only).
-  sed -i.bak "0,/^version = \"${CURRENT_CARGO_VERSION}\"/{s/^version = \"${CURRENT_CARGO_VERSION}\"/version = \"${BARE_VERSION}\"/}" Cargo.toml
-  rm -f Cargo.toml.bak
+  # Bump the version field in Cargo.toml (first occurrence only). awk, not
+  # sed's GNU-only `0,/re/` address, which BSD sed on macOS rejects.
+  awk -v old="version = \"${CURRENT_CARGO_VERSION}\"" -v new="version = \"${BARE_VERSION}\"" \
+    '!done && $0 == old { $0 = new; done = 1 } { print }' Cargo.toml > Cargo.toml.tmp
+  mv Cargo.toml.tmp Cargo.toml
 
   # Refresh only awman's own entry in Cargo.lock; leave dependencies pinned.
   cargo update --workspace --quiet
@@ -330,18 +334,31 @@ if $USE_LOCAL_RUNNER; then
   step "Release runner"
 
   # Stale scheduled hardware runs queue for the same labels and would take the
-  # runner first, delaying the release job by hours.
-  STALE=$(gh run list --repo "$REPO" --workflow test.yml --status queued --limit 50 \
-    --json databaseId -q '.[].databaseId')
+  # runner first, delaying the release job by hours. That is any Tests run,
+  # queued or already in progress (its hosted jobs started), with a
+  # hypervisor-labelled job still waiting for a runner. One the nightly cron
+  # queues later in the release fails its first step on this runner
+  # (test.yml refuses `awman-release-*` runners), freeing it in seconds.
+  STALE=""
+  for status in queued in_progress; do
+    for id in $(gh run list --repo "$REPO" --workflow test.yml --status "$status" --limit 50 \
+        --json databaseId -q '.[].databaseId'); do
+      WAITING=$(gh api "repos/$REPO/actions/runs/$id/jobs" --paginate \
+        -q '.jobs[] | select(.status != "completed" and .status != "in_progress") | select(.labels | index("hypervisor")) | .id')
+      [ -z "$WAITING" ] || STALE="$STALE $id"
+    done
+  done
   if [ -n "$STALE" ]; then
-    warn "$(echo "$STALE" | wc -l | tr -d ' ') queued Tests run(s) would take this runner before the release job."
+    warn "$(echo "$STALE" | wc -w | tr -d ' ') Tests run(s) waiting for a hypervisor runner would take this runner before the release job."
     if ask_yes_no "Cancel them?" y; then
       for id in $STALE; do gh run cancel "$id" --repo "$REPO" >/dev/null; done
-      ok "Cancelled queued Tests runs"
+      ok "Cancelled those Tests runs"
     fi
   fi
 
-  trap 'bash tools/release-runner.sh down' EXIT
+  # A second Ctrl-C must not interrupt the teardown and leave the runner
+  # registered, so `down` (and what it runs) ignores INT and TERM.
+  trap 'trap "" INT TERM; bash tools/release-runner.sh down' EXIT
   trap 'exit 130' INT TERM
   bash tools/release-runner.sh up "$REPO" "$VERSION"
 fi

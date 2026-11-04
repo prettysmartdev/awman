@@ -149,7 +149,7 @@ impl RefreshableCredentialDelivery {
 }
 
 /// Newtype around a generated API key (32 random bytes encoded as 64-char
-/// lowercase hex — matches old-amux wire format).
+/// lowercase hex).
 #[derive(Debug, Clone)]
 pub struct ApiKey(String);
 
@@ -449,8 +449,8 @@ impl AuthEngine {
 
     // ── API-key lifecycle ──────────────────────────────────────────────────
 
-    /// Generate a fresh 32-byte API key, hex-encoded (64 chars). Matches
-    /// the old-amux wire format so existing scripts/regex/docs keep working.
+    /// Generate a fresh 32-byte API key, hex-encoded (64 chars). The
+    /// format is stable so existing scripts/regex/docs keep working.
     pub fn generate_api_key(&self) -> Result<ApiKey, EngineError> {
         let mut buf = [0u8; 32];
         SystemRandom::new()

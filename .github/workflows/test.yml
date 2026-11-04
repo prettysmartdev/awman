@@ -18,16 +18,16 @@ jobs:
     name: Fast checks (lint, fmt, clippy, hermetic tests)
     runs-on: ubuntu-26.04
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable (toolchain pinned below)
         with:
           toolchain: "1.94.0"
           components: rustfmt, clippy
 
       - name: Cache cargo registry and build
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -54,15 +54,15 @@ jobs:
     runs-on: ubuntu-26.04
     needs: fast
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable (toolchain pinned below)
         with:
           toolchain: "1.94.0"
 
       - name: Cache cargo registry and build
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -83,15 +83,15 @@ jobs:
     runs-on: macos-latest
     needs: fast
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable (toolchain pinned below)
         with:
           toolchain: "1.94.0"
 
       - name: Cache cargo registry and build
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -122,8 +122,8 @@ jobs:
       matrix:
         features: ["", "builtin-runtime"]
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable (toolchain pinned below)
         with:
           toolchain: "1.94.0"
           targets: x86_64-unknown-linux-musl
@@ -156,11 +156,11 @@ jobs:
           # refuses the others. Add x86_64 Linux and Apple Silicon once verified.
           - { target: aarch64-unknown-linux-gnu, os: ubuntu-24.04-arm }
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable (toolchain pinned below)
         with:
           toolchain: "1.94.0"
-      - uses: actions/cache@v6
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -207,11 +207,18 @@ jobs:
       AWMAN_TEST_BUILTIN_PRESSURE: "1"
       AWMAN_TEST_BUILTIN_REPORT: ${{ github.workspace }}/builtin-hw-report.tsv
     steps:
-      - uses: actions/checkout@v7
+      # tools/release-runner.sh registers a Mac as `awman-release-<tag>-<host>`
+      # for one release. A Tests job that lands on it (the nightly cron during a
+      # release, say) fails here at once, so the Release job gets the runner.
+      - name: Not on a temporary release runner
+        shell: bash
+        run: |
+          case "$RUNNER_NAME" in awman-release-*) echo "BLOCKED: $RUNNER_NAME is a temporary release runner; re-run once a CI hypervisor runner is online"; exit 1 ;; esac
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # The builtin upgrade test builds the previous awman from git history.
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable (toolchain pinned below)
         with:
           toolchain: "1.94.0"
       - name: Check hardware prerequisites (fails, never skips)
@@ -260,11 +267,16 @@ jobs:
         include:
           - { name: macos-arm64-hvf, target: aarch64-apple-darwin, runs-on: [self-hosted, macOS, ARM64, hypervisor] }
     steps:
-      - uses: actions/checkout@v7
+      # See builtin-hardware: never hold a temporary release runner.
+      - name: Not on a temporary release runner
+        shell: bash
+        run: |
+          case "$RUNNER_NAME" in awman-release-*) echo "BLOCKED: $RUNNER_NAME is a temporary release runner; re-run once a CI hypervisor runner is online"; exit 1 ;; esac
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # The builtin upgrade test builds the previous awman from git history.
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable (toolchain pinned below)
         with:
           toolchain: "1.94.0"
           targets: ${{ matrix.target }}
@@ -288,13 +300,13 @@ jobs:
         env:
           SQLITE_SPIKE_OUTPUT_DIR: ${{ runner.temp }}/sqlite-results
         run: bash tools/oci-runtime-spike/sqlite-resolution/checks.sh auto
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: sqlite-resolution-${{ matrix.name }}
           path: ${{ runner.temp }}/sqlite-results/
           if-no-files-found: ignore
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: native-payload-evidence-${{ matrix.name }}
@@ -313,8 +325,8 @@ jobs:
         include:
           - { name: windows-x86_64, target: x86_64-pc-windows-msvc, runs-on: windows-2025 }
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable (toolchain pinned below)
         with:
           toolchain: "1.94.0"
           targets: ${{ matrix.target }}

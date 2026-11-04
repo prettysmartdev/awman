@@ -82,7 +82,7 @@ That's it — you have an isolated agent working in your repo.
 | Method | Command |
 |--------|---------|
 | Installer script | `curl -s https://prettysmart.dev/install/awman.sh \| sh` |
-| mise | `mise use -g github:prettysmartdev/awman` (pin: `@0.12.0`) |
+| mise | `mise use -g github:prettysmartdev/awman` (pin: `@0.13.0`) |
 | GitHub Releases | Download the asset for your platform, `chmod +x`, move onto `PATH` |
 | From source | `git clone https://github.com/prettysmartdev/awman.git && cd awman && make install` (Rust 1.94+) |
 
@@ -119,6 +119,7 @@ Then `awman ready` builds the Dockerfiles in that Docker Engine (`apple-local` u
 | `-n`, `--non-interactive` | Run the verification agent in non-interactive mode |
 | `--json` | Print structured JSON instead of human output (implies `-n`) |
 | `--allow-docker` | Mount the host Docker socket into the agent container (not supported by the builtin runtime) |
+| `--agent <name>` | Check and build this agent instead of the repo default; reviews and approves a [custom agent](15-custom-agents.md) definition that needs approval |
 
 ---
 

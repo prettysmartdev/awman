@@ -70,8 +70,8 @@ pub(super) fn handle(app: &mut App, action: Action) {
                 return;
             }
             // If a workflow is active in the focused tab, prefer the
-            // workflow-cancel confirmation over the close-tab one — old amux
-            // semantics. The user can still escape and Ctrl+C again to close
+            // workflow-cancel confirmation over the close-tab one.
+            // The user can still escape and Ctrl+C again to close
             // the tab if they really mean it.
             let workflow_active = app.active_tab().shared.workflow.snapshot().view.is_some();
             if workflow_active

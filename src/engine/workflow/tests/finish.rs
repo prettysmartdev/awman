@@ -1,4 +1,7 @@
-//! Work item 0132 Part A regression coverage.
+//! How a workflow reaches its end: YOLO and unattended runs offering (or
+//! skipping) the finish board on the last step, multi-sink DAGs, resumed
+//! workflows whose steps are all done, terminal parallel groups, and the
+//! control boards raised while parallel peers are still running.
 
 use super::*;
 
@@ -7,7 +10,7 @@ async fn yolo_last_step_offers_finish_and_finishes_workflow() {
     let tmp = tempfile::tempdir().unwrap();
     let session = make_session(&tmp);
     let workflow = make_workflow(
-        Some("wi0132-yolo-chain"),
+        Some("yolo-chain"),
         Some("claude"),
         vec![make_step("a", &[], None), make_step("b", &["a"], None)],
     );
@@ -39,7 +42,7 @@ async fn yolo_multiple_sink_dag_offers_finish_and_finishes_workflow() {
     let tmp = tempfile::tempdir().unwrap();
     let session = super::parallel::make_session_with_max_concurrent(&tmp, Some(2));
     let workflow = make_workflow(
-        Some("wi0132-multi-sink"),
+        Some("multi-sink"),
         Some("claude"),
         vec![
             make_step("a", &[], None),
@@ -74,7 +77,7 @@ async fn api_default_failure_board_aborts_and_never_offers_finish() {
     let tmp = tempfile::tempdir().unwrap();
     let session = make_session(&tmp);
     let workflow = make_workflow(
-        Some("wi0132-failed-last"),
+        Some("failed-last"),
         Some("claude"),
         vec![make_step("a", &[], None)],
     );
@@ -102,12 +105,12 @@ async fn resumed_workflow_with_all_steps_done_finishes() {
     let tmp = tempfile::tempdir().unwrap();
     let session = make_session(&tmp);
     let workflow = make_workflow(
-        Some("wi0132-resumed-complete"),
+        Some("resumed-complete"),
         Some("claude"),
         vec![make_step("a", &[], None), make_step("b", &["a"], None)],
     );
     let mut state = WorkflowState::new(
-        "wi0132-resumed-complete".into(),
+        "resumed-complete".into(),
         &workflow.steps,
         "test-hash".into(),
         None,
@@ -143,7 +146,7 @@ async fn terminal_parallel_group_completes_without_control_boards() {
     let tmp = tempfile::tempdir().unwrap();
     let session = super::parallel::make_session_with_max_concurrent(&tmp, Some(2));
     let workflow = make_workflow(
-        Some("wi0132-parallel-terminal"),
+        Some("parallel-terminal"),
         Some("claude"),
         vec![make_step("a", &[], None), make_step("b", &[], None)],
     );
@@ -232,7 +235,7 @@ async fn parallel_peers_running_control_board_answers_launch_next() {
     let tmp = tempfile::tempdir().unwrap();
     let session = super::parallel::make_session_with_max_concurrent(&tmp, Some(2));
     let workflow = make_workflow(
-        Some("wi0132-parallel-peers"),
+        Some("parallel-peers"),
         Some("claude"),
         vec![make_step("a", &[], None), make_step("b", &[], None)],
     );

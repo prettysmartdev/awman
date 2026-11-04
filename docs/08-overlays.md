@@ -556,7 +556,7 @@ The three scopes:
 | **repo** | `~/.awman/context/repo/{owner}/{repo}/` | Project-specific architecture notes, gotchas, accumulated team knowledge | All agents working on this repo |
 | **workflow** | `~/.awman/context/workflows/<run-id>/` (one per workflow run) | Shared state and coordination between steps in a multi-agent workflow | All steps in the same workflow run |
 
-The squad daemon keeps each task's durable context in
+Your squad keeps each task's durable context in
 `~/.awman/squad/tasks/{name}/workspace/`. It is a task-scoped location in
 addition to the ordinary global, repo, and workflow contexts. A task's
 workspace is long-lived: it is created once and reused for every evaluation

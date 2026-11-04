@@ -305,7 +305,7 @@ awman config migrate                       # move legacy dynamic-workflow settin
 - `remote.defaultAPIKey` is masked in `config show`/`config get` output.
 - Setting the removed `envPassthrough` field errors with guidance to use `env(VAR)` overlay entries instead.
 
-`awman config migrate` moves a repo's old dynamic-workflow block to
+`awman config migrate` moves a repo's old `dynamicWorkflows` block to
 `workflows.dynamic`. It shows the before/after JSON and asks before writing
 (in the TUI the preview scrolls with **↑ / ↓ / PgUp / PgDn**; press **y** to move
 it, **n** or **Esc** to cancel). Use `--dry-run` to preview the changes, or
@@ -652,7 +652,7 @@ awman keeps global config and data (workflows, skills, worktrees, API state) und
 |----------|------|---------|---------|---------------------------|
 | `agent` | string | (unset → global `default_agent`) | Agent for this repo | yes (repo only) |
 | `launchMode` | `"stdio"` \| `"acp"` | `"stdio"` | Default agent launch mode for this repo | no (edit file) |
-| `auto_agent_auth_accepted` | bool | (unset) | Records that you accepted the agent auth consent prompt; managed by awman, shown read-only | no (managed) |
+| `auto_agent_auth_accepted` | bool | (unset) | Legacy consent flag from older releases; awman no longer reads or writes it. Shown read-only if present | no (read-only) |
 | `terminal_scrollback_lines` | integer | 10000 | Scrollback lines in the container terminal | yes |
 | `yoloDisallowedTools` | string array | `[]` | Tools to forbid under `--yolo`; replaces the global list entirely (`[]` turns the global list off). A `--yolo` launch of an agent that cannot enforce it is refused; see [Disallowed tools](03-agent-sessions.md#disallowed-tools) | yes |
 | `workItems.dir` | string | `aspec/work-items` | Work items directory (relative to repo root or absolute) | yes, as `work_items.dir` |
@@ -686,7 +686,7 @@ awman keeps global config and data (workflows, skills, worktrees, API state) und
 | `overlays` | string array | `[]` | Overlay specs applied to every project; additive with other sources | yes |
 | `agentStuckTimeout` | integer (seconds) | 30 | Default agent-stuck timeout | yes |
 | `maxConcurrentAgents` | integer | (unset → unlimited) | Machine-wide default cap on concurrently-running workflow steps (unless a repo overrides it) — see [Parallel workflows](05-workflows.md#parallel-workflows) | yes |
-| `workers` | integer | 2 | API server worker tasks processing the command queue in parallel — see [API mode](09-api-and-remote-mode.md) | no (edit file) |
+| `workers` | integer (>= 1) | 2 | API server worker tasks processing the command queue in parallel — see [API mode](09-api-and-remote-mode.md) | no (edit file) |
 | `baseImage` | string | (unset) | Default image tag for workflow setup/teardown containers | no (edit file) |
 | `worktree.onDirtyMergeTarget` | string | (unset → frontend default) | Default dirty merge-target action: `ask`, `commit`, `stash`, or `fail` | yes |
 | `worktree.mergeFix.onFailure` | string | (unset → frontend default) | Default merge-failure action: `ask`, `agent`, or `keep` | yes |
@@ -719,7 +719,7 @@ awman keeps global config and data (workflows, skills, worktrees, API state) und
 | Field name | Scope |
 |------------|-------|
 | `agent` | repo only |
-| `auto_agent_auth_accepted` | read-only; managed by the auth flow |
+| `auto_agent_auth_accepted` | read-only; legacy, no longer used |
 | `terminal_scrollback_lines` | repo or global |
 | `yoloDisallowedTools` | repo or global |
 | `workItems` | repo only; shown read-only, set `work_items.dir` / `work_items.template` |
@@ -738,6 +738,7 @@ awman keeps global config and data (workflows, skills, worktrees, API state) und
 | `remote.defaultAddr`, `remote.defaultAPIKey` | global only |
 | `work_items.dir` | repo only |
 | `work_items.template` | repo only |
+| `api`, `remote` | global only; shown read-only, set their dotted fields (`api.workDirs`, `remote.defaultAddr`, …) |
 | `api.workDirs` | global only |
 | `api.workDirRoots` | global only |
 | `worktree.onDirtyMergeTarget`, `worktree.mergeFix.onFailure`, `worktree.mergeFix.promptTemplate` | repo or global |

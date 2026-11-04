@@ -509,7 +509,7 @@ impl AgentExecutionFactory for CommandLayerFactory {
         execution: &crate::engine::agent_runtime::execution::AgentExecution,
         prompt: &str,
     ) -> Result<Option<()>, EngineError> {
-        // Mirror old amux's `launch_next_workflow_step_in_current_container`:
+        // Reuse the running container for the next step:
         // write the prompt followed by `\r` (Enter) directly into the running
         // container's PTY stdin. The Container Execution back-end returns
         // `Ok(true)` if it accepted the bytes (PTY-bridged backends do),

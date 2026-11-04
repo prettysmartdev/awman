@@ -1,13 +1,13 @@
 ---
 name: blog-post
-description: Write a blog post in the preferred style related to amux
+description: Write a blog post in the preferred style related to awman
 ---
 
 # Skill: blog-post
 
 ## Description
 
-Write a new blog post for amux in the established first-person, problem-driven style. Posts live in `docs/blog/` and are numbered sequentially.
+Write a new blog post for awman in the established first-person, problem-driven style. Posts live in `docs/blog/` and are numbered sequentially.
 
 ## Body
 
@@ -52,7 +52,7 @@ The filename is: `docs/blog/NNNN-slug.md`
 Follow this structure exactly:
 
 ```markdown
-# amux X.Y: Short title     ← or a plain title if not release-tied
+# awman X.Y: Short title     ← or a plain title if not release-tied
 
 <one or two sentences — the problem or itch, not the solution>
 
@@ -60,7 +60,7 @@ Follow this structure exactly:
 
 ```sh
 # install or upgrade
-curl -s https://prettysmart.dev/install/amux.sh | sh
+curl -s https://prettysmart.dev/install/awman.sh | sh
 ```
 
 ---
@@ -73,7 +73,7 @@ curl -s https://prettysmart.dev/install/amux.sh | sh
 
 ---
 
-Source and issues at [github.com/prettysmartdev/amux](https://github.com/prettysmartdev/amux). More at [prettysmart.dev](https://prettysmart.dev). Feedback and contributions welcome.
+Source and issues at [github.com/prettysmartdev/awman](https://github.com/prettysmartdev/awman). More at [prettysmart.dev](https://prettysmart.dev). Feedback and contributions welcome.
 ```
 
 ### Step 5: Apply the style rules
@@ -110,7 +110,7 @@ Source and issues at [github.com/prettysmartdev/amux](https://github.com/prettys
        Save it as docs/blog/images/NNNN-slug-01.png and replace this comment with:
        ![TUI showing the new dialog](./images/NNNN-slug-01.png) -->
   ```
-- The install snippet (`curl -s https://prettysmart.dev/install/amux.sh | sh`) in the first third of the post, inside a `---` fenced section
+- The install snippet (`curl -s https://prettysmart.dev/install/awman.sh | sh`) in the first third of the post, inside a `---` fenced section
 - Concrete "before vs. after" framing when the post is about a fix or refactor
 
 **Length**
@@ -131,7 +131,7 @@ Did the user specify a topic?
   No  → ask before writing anything
 
 Is the topic tied to a specific release version?
-  Yes → include "amux X.Y:" in the title
+  Yes → include "awman X.Y:" in the title
   No  → use a plain descriptive title
 
 Does the topic involve new commands or flags?

@@ -1,4 +1,5 @@
-//! WI 0132 API workflow-state contract regression tests.
+//! API workflow-state contract: atomic state writes, wire shapes, the status
+//! feature flag and the remote workflow poller.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -31,7 +32,7 @@ fn test_step(name: &str) -> WorkflowStep {
 
 fn sample_state() -> WorkflowState {
     WorkflowState::new(
-        "wi0132".into(),
+        "api-workflow-state".into(),
         &[test_step("agent")],
         "test-hash".into(),
         None,

@@ -946,7 +946,7 @@ the standing instructions every task evaluation must follow:
 | `defaultLeader` | The `agent::model` used for a task's evaluation when the task doesn't specify its own. |
 | `guidance` | Standing instructions applied to **every** task evaluation and every workflow it generates — the same mechanism as [dynamic workflow guidance](06-dynamic-workflows.md#guidance), injected as a bulleted "Developer Guidance" block in the agent's prompt. |
 
-This is all global rather than per-repo, because one squad daemon watches
+This is all global rather than per-repo, because your squad watches
 tasks across every repo you point it at. Editing this block takes
 effect on the daemon's next scheduling tick — no restart needed. If a live
 reload finds malformed or unreadable global config, the scheduler reports the

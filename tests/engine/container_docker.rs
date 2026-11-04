@@ -48,7 +48,7 @@ fn docker_image_exists_false_for_unknown_tag() {
     }
     let runtime = ContainerRuntime::docker();
     assert!(
-        !runtime.image_exists("amux-test-image-that-does-not-exist:latest"),
+        !runtime.image_exists("awman-test-image-that-does-not-exist:latest"),
         "image_exists must return false for an unknown tag"
     );
 }
@@ -307,7 +307,7 @@ fn docker_background_container_image_not_found() {
     let runtime = ContainerRuntime::docker();
     let env = HashMap::new();
     let overlays = [];
-    let bad_image = "amux-nonexistent-image-xyzzy:no-such-tag";
+    let bad_image = "awman-nonexistent-image-xyzzy:no-such-tag";
 
     let result = runtime.start_background(
         &awman::engine::container::background::BackgroundLaunchRequest {
@@ -336,10 +336,10 @@ fn docker_background_container_image_not_found() {
 }
 
 /// Run hello-world directly via `docker run`, wait for it to exit, then
-/// confirm the runtime's view of running amux-labeled containers is unaffected
-/// (hello-world is not amux-labeled, so it must NOT show up).
+/// confirm the runtime's view of running awman-labeled containers is unaffected
+/// (hello-world is not awman-labeled, so it must NOT show up).
 #[test]
-fn docker_hello_world_run_does_not_appear_in_amux_listing() {
+fn docker_hello_world_run_does_not_appear_in_awman_listing() {
     if !docker_available() {
         eprintln!("SKIP: Docker not available");
         return;
@@ -368,6 +368,6 @@ fn docker_hello_world_run_does_not_appear_in_amux_listing() {
         !after
             .iter()
             .any(|h| h.name == name || h.image_tag.starts_with("hello-world")),
-        "non-amux container must not appear in amux's labeled listing: {after:?}"
+        "non-awman container must not appear in awman's labeled listing: {after:?}"
     );
 }

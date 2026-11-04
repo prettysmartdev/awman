@@ -1,12 +1,10 @@
-//! WI-0097 — architecture-conformance guard for the API frontend.
+//! Architecture-conformance guard for the API frontend.
 //!
-//! The refactor's central rule (grand-architecture Tenet 2) is that the
+//! The central layering rule (grand-architecture Tenet 2) is that the
 //! presentation layer `src/frontend/api/` must not own storage or per-command
 //! dispatch: filesystem side-effects belong to Layer 0 (`ApiPaths` /
 //! `CommandLogWriter`) and argument parsing to Layer 2
-//! (`CommandCatalogue::parse_raw_args`). This source-scan test enforces both,
-//! matching the source-scanning style already used in `rename_0077.rs`
-//! (`api_startup_log_message_contains_awman_and_api_mode`).
+//! (`CommandCatalogue::parse_raw_args`). This source-scan test enforces both.
 //!
 //! Two properties are asserted over the **runtime** portion of each file (the
 //! trailing `#[cfg(test)]` module is excluded so test helpers may still use

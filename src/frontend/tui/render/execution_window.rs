@@ -158,7 +158,7 @@ pub(super) fn capture_buffer_grid(buf: &Buffer, area: Rect) -> Vec<Vec<String>> 
 ///
 /// Long lines are wrapped (preserving leading whitespace). The visual scroll
 /// offset is computed against wrapped row count so `scroll_offset` is in
-/// "screen rows", not log entries — matches old amux's behavior where the
+/// "screen rows", not log entries. The
 /// scroll is anchored to the bottom and increasing offset moves toward older.
 fn render_output_content(tab: &tabs::Tab, area: Rect, frame: &mut Frame) {
     let log = match tab.shared.status_log.lock() {

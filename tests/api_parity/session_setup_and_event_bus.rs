@@ -1,5 +1,4 @@
-//! WI-0078 test suite: API Frontend Hardening, Remote Restructure & Unified
-//! Event Bus.
+//! API frontend restrictions, async session setup and the unified event bus.
 //!
 //! Test categories:
 //!   - Dispatch catalogue unit tests (api_allowed_commands, validate_for_frontend)
@@ -132,7 +131,7 @@ fn catalogue_api_allowed_commands_includes_exec_and_squad_commands() {
         ("squad", "status"),
         ("squad", "logs"),
         ("squad", "add"),
-        // WI 0110: `squad edit` is API-allowed for the same reason `add` is —
+        // `squad edit` is API-allowed for the same reason `add` is —
         // the daemon re-executes it from the remote gateway.
         ("squad", "edit"),
         ("squad", "list"),
@@ -819,7 +818,7 @@ async fn session_setup_bus_initial_state_is_initializing() {
     assert!(state.error.is_none());
 }
 
-// Since WI 0114 F-41 the transition rules below are `SessionSetupState`
+// The transition rules below are `SessionSetupState`
 // methods, not bus methods: the bus broadcasts and holds the shared handle,
 // and everything that writes to a setup snapshot — the orchestrator, the ready
 // frontend, a future second multi-session frontend — goes through the same
@@ -1162,7 +1161,7 @@ fn remote_exec_subcommands_are_not_api_allowed() {
 
 /// The API frontend's `flag_bool` must return `true` for `yolo` and
 /// `non-interactive` regardless of whether they were sent in the request.
-/// This is the WI's always-yolo contract enforced inside the Layer 3
+/// This is the API's always-yolo contract enforced inside the Layer 3
 /// frontend — independent of how the command layer interprets the values.
 #[test]
 fn api_frontend_always_returns_yolo_true_regardless_of_input() {
@@ -1253,7 +1252,7 @@ async fn real_network_exec_response_advertises_flags_applied() {
 
 // ─── Session status response shape ────────────────────────────────────────────
 
-/// The `/status` response shape must include `current_ready_phase` (per WI).
+/// The `/status` response shape must include `current_ready_phase`.
 #[tokio::test]
 async fn real_network_session_status_includes_current_ready_phase_field() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1433,7 +1432,7 @@ fn setup_state_serializes_correctly_to_disk_format() {
 
 /// Every flag in `exec workflow` (except those explicitly excluded) is
 /// available on `remote exec workflow`. Drift between the two specs would
-/// be a regression of the WI's programmatic-derivation requirement.
+/// be a regression: remote flags are derived programmatically from the local spec.
 #[test]
 fn remote_exec_workflow_flags_parity_with_local() {
     let cat = CommandCatalogue::get();
@@ -1534,7 +1533,7 @@ async fn api_frontend_write_message_emits_status_message_event() {
 
 /// Reporting a workflow step transition through the frontend must emit a
 /// `WorkflowStepTransition` event whose `step_index` is the step's position in
-/// `WorkflowState.steps` (WI 0137 §5), whatever order the steps launch in,
+/// `WorkflowState.steps`, whatever order the steps launch in,
 /// and whose envelope `source` names the step.
 #[tokio::test]
 async fn api_frontend_workflow_step_transition_index_is_per_step() {
@@ -1626,13 +1625,13 @@ async fn sse_lagged_branch_uses_expected_event_count_format() {
     // The SSE handler constructs its comment via this exact format string —
     // the call site in routes.rs is
     //     Event::default().comment(format!("lagged: {n} events skipped"))
-    // so locking down the format here catches any drift between the WI's
+    // so locking down the format here catches any drift between the
     // documented wire format and the producer.
     let comment_text = format!("lagged: {lagged_n} events skipped");
     assert_eq!(comment_text, "lagged: 6 events skipped");
 
     // After recovering from Lagged, the subscriber must drain the remaining
-    // events in the ring buffer (per the WI: "continue streaming from the
+    // events in the ring buffer ("continue streaming from the
     // next available event").
     for expected_idx in 6u32..10 {
         let ev = rx.recv().await.expect("post-lag recv must succeed");
@@ -1819,7 +1818,7 @@ mod remote_session_start_wait_tests {
             "poll loop should print 'Session ... is ready.'; got:\n{all_text}"
         );
         // The summary is reported through the frontend, which titles it with
-        // the runtime name (WI 0114 F-23: Layer 2 no longer draws the box).
+        // the runtime name (Layer 2 does not draw the box).
         assert!(
             all_text.contains("Ready Summary (docker)"),
             "poll loop must report the ready summary; got:\n{all_text}"

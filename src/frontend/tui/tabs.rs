@@ -1096,7 +1096,7 @@ pub fn format_duration(secs: u64) -> String {
 pub fn tab_color(tab: &Tab) -> ratatui::style::Color {
     use ratatui::style::Color;
     // Yolo countdown in progress: alternate yellow/magenta each second so
-    // background tabs flash visibly, matching old-amux behavior.
+    // background tabs flash visibly.
     if let Ok(guard) = tab.shared.yolo_state.lock() {
         if let Some(ref state) = *guard {
             return if state.remaining_secs % 2 == 0 {

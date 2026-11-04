@@ -1,4 +1,4 @@
-//! Tests for `engine::workflow`, split by what they exercise (WI 0114 F-51).
+//! Tests for `engine::workflow`, split by what they exercise.
 //!
 //! This module holds only what more than one of them needs: the fake runtime,
 //! factory and frontend implementations, the session/workflow builders, the
@@ -6,11 +6,11 @@
 //! container the phase tests use.
 
 mod coverage_parallel;
+mod finish;
 mod parallel;
 mod phases;
 mod single;
-mod wi0132_a;
-mod wi0132_d;
+mod state_snapshot;
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -636,7 +636,7 @@ struct MockBackgroundContainer {
     /// Recorded commands (in call order).
     calls: Mutex<Vec<String>>,
     /// Number of times a fresh container was handed out — exercised by
-    /// per-step-container assertions (WI-0082).
+    /// per-step-container assertions.
     container_handouts: Mutex<usize>,
 }
 

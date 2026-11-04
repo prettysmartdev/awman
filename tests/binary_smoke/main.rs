@@ -1,6 +1,6 @@
 //! Binary-level smoke tests (WI 0073).
 //!
-//! These tests invoke the real `amux` binary as a subprocess and verify
+//! These tests invoke the real `awman` binary as a subprocess and verify
 //! exit codes, stdout shapes, and basic CLI behaviour.
 //!
 //! All tests here run under `make test-fast` because they don't need Docker.
@@ -39,17 +39,15 @@ pub(crate) fn make_git_repo() -> tempfile::TempDir {
 mod agents_docker;
 #[cfg(unix)]
 mod agents_review;
-mod antigravity_0083;
+mod antigravity_agent;
 mod build_cfg;
 mod clean_command;
 mod cli_subprocess;
-mod context_overlay_0087;
 mod custom_agents;
-mod dynamic_config_0150;
-mod hardening_0098;
+mod dynamic_workflow_config;
+mod fatal_cli_errors;
 mod headless_no_tty;
-mod overlay_0082;
+mod overlay_cli;
 #[cfg(unix)]
 mod prerequisite_grants_cli;
-mod rename_0077;
 mod skill_libraries;

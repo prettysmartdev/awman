@@ -1,16 +1,14 @@
-//! WI-0097 regression-pinning suite: API frontend architecture-conformance.
+//! API request validation and argument-mapping contract.
 //!
-//! These tests capture the **current externally visible behavior** of the API
-//! frontend (`src/frontend/api/`) BEFORE the Layer 2/Layer 0 refactor begins.
-//! They form the backward-compatibility contract the refactor must preserve.
+//! These tests pin the externally visible behaviour of the API frontend
+//! (`src/frontend/api/`) for malformed or disallowed requests.
 //!
-//! Contract rules for downstream steps:
-//!   * **Status-code assertions are the hard contract** — they MUST survive the
-//!     refactor unchanged.
+//! Contract rules:
+//!   * **Status-code assertions are the hard contract** — they must not change.
 //!   * **Error-text assertions are soft** — every line that inspects an error
-//!     string is marked `TEXT-ASSERTION (relaxable)`. Later steps may loosen or
-//!     change the wording (e.g. when validation moves into Layer 2), but must
-//!     NOT change the accompanying status code.
+//!     string is marked `TEXT-ASSERTION (relaxable)`. The wording may change
+//!     (e.g. when validation moves between layers), but the accompanying status
+//!     code must not.
 //!
 //! Covered surfaces:
 //!   1. `handle_create_session` (POST /v1/sessions) validation-failure paths.
@@ -18,10 +16,10 @@
 //!      and session state-transition rejections.
 //!   3. `parse_args_to_flags()` command-dispatch positional mapping for every
 //!      special-cased subcommand (including `exec prompt` prompt-joining) and
-//!      the forced `non-interactive`/`yolo` flag defaults (Finding D).
+//!      the forced `non-interactive`/`yolo` flag defaults.
 //!
 //! Network-bound tests are prefixed `real_network_` so `make test-fast` can
-//! skip them, matching the convention in `live_server.rs` / `wi_0079.rs`.
+//! skip them, matching the convention in `live_server.rs` / `command_queue.rs`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -741,7 +739,7 @@ async fn real_network_create_command_session_not_ready_returns_409() {
 }
 
 /// PINS: POST /v1/commands for an active + ready session → 202 Accepted, and
-/// the response advertises the forced `flags_applied` (Finding D — yolo /
+/// the response advertises the forced `flags_applied` (yolo /
 /// non_interactive forced true).
 #[tokio::test]
 async fn real_network_create_command_active_ready_session_returns_202() {
@@ -769,8 +767,8 @@ async fn real_network_create_command_active_ready_session_returns_202() {
     );
     let body: serde_json::Value = resp.json().await.unwrap();
     assert!(body["command_id"].as_str().is_some(), "got {body}");
-    // Finding D: the API frontend forces yolo + non_interactive to true and
-    // advertises this in flags_applied. This pins the CURRENT policy location.
+    // The API frontend forces yolo + non_interactive to true and
+    // advertises this in flags_applied.
     assert_eq!(
         body["flags_applied"]["yolo"],
         serde_json::json!(true),
@@ -786,7 +784,7 @@ async fn real_network_create_command_active_ready_session_returns_202() {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  Part 3 — parse_args_to_flags() command-dispatch mapping (Findings A + D)
+//  Part 3 — parse_args_to_flags() command-dispatch mapping
 //
 //  These exercise the private parser through the public `ApiDispatchFrontend`
 //  + `CommandFrontend` trait. They pin how positionals are mapped to named
@@ -930,7 +928,7 @@ fn parse_args_remote_session_kill_maps_session_id() {
     );
 }
 
-/// PINS (Finding D): `non-interactive` and `yolo` are ALWAYS forced to true in
+/// PINS: `non-interactive` and `yolo` are ALWAYS forced to true in
 /// API dispatch, regardless of subcommand or supplied args.
 #[test]
 fn parse_args_forces_non_interactive_and_yolo() {

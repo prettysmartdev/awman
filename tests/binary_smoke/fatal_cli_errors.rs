@@ -1,11 +1,9 @@
-//! Binary-level end-to-end tests for WI-0098 (architecture hardening).
+//! Binary-level tests for CLI errors that must exit with code `2`.
 //!
-//! These invoke the compiled `awman` binary as a subprocess and pin down the
-//! two Finding-B behaviours the work item calls out under "Test Considerations":
+//! These invoke the compiled `awman` binary as a subprocess and pin down:
 //!
 //!   * `awman --mount-ssh` prints the migration hint and exits with code `2`
-//!     (unchanged behaviour after the removed-flag knowledge moved from
-//!     `main.rs` into the catalogue).
+//!     (the removed-flag scan lives in the catalogue and runs before clap).
 //!   * An invalid `runtime:` in the global config is a fatal error for CLI
 //!     invocations — it names the bad runtime and exits `2`, never silently
 //!     falling back to Docker.
@@ -17,7 +15,7 @@
 
 use crate::{awman, make_git_repo};
 
-// ─── Finding B: removed-flag migration hint exits 2 ───────────────────────────
+// ─── Removed-flag migration hint exits 2 ───────────────────────────
 
 /// The catalogue's removed-flag scan runs before clap in `main.rs`, so a bare
 /// `awman --mount-ssh` (no subcommand) still yields the migration hint and the
@@ -49,8 +47,8 @@ fn mount_ssh_prints_migration_hint_and_exits_exactly_2() {
     );
 }
 
-/// The `=`-bearing form is intercepted identically (edge case called out in the
-/// work item): same hint, same exit code 2.
+/// The `=`-bearing form is intercepted identically: same hint, same exit
+/// code 2.
 #[test]
 fn mount_ssh_value_form_exits_exactly_2() {
     let repo = make_git_repo();
@@ -74,7 +72,7 @@ fn mount_ssh_value_form_exits_exactly_2() {
     );
 }
 
-// ─── Finding B: invalid `runtime:` config is fatal for the CLI ────────────────
+// ─── Invalid `runtime:` config is fatal for the CLI ───────────────────────────
 
 /// An unrecognised `runtime:` string in the global config must fatal-error a
 /// CLI invocation: the message names the bad runtime and lists the valid ones,

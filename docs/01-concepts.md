@@ -96,8 +96,8 @@ Two JSON files: `<git root>/.awman/config.json` (per-repo, committed) and `~/.aw
 | `awman clean` | Reclaim stopped containers, stale workflow data, dangling images | [13](13-cleaning-up.md) |
 
 `awman agents status` and `awman agents list` show each agent's source:
-`session` for agents started directly and `squad:<task>` for agents started by
-the squad daemon, such as `squad:issue-triage`. This makes background
+`session` for agents started directly and `squad:<task>` for agents your squad started,
+such as `squad:issue-triage`. This makes background
 evaluations identifiable even if you have never configured squad.
 
 ### Key locations

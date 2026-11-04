@@ -10,6 +10,6 @@
 mod helpers;
 
 mod catalogue_completeness;
-mod config_migrate_0150;
+mod config_migrate;
 mod json_outputs;
 mod squad_catalogue;

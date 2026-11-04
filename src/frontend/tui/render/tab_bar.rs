@@ -2,7 +2,7 @@
 
 use super::*;
 
-/// Render the tab bar — matches old amux:
+/// Render the tab bar:
 /// - 3-row tall cells with rounded borders
 /// - Active tab: omits the bottom border so it visually merges into the
 ///   execution window below; title gets `➡` prefix and is bold + tab color

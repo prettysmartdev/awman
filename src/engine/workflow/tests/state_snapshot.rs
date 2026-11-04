@@ -1,4 +1,5 @@
-//! Work item 0132 Part D engine snapshot and phase-state coverage.
+//! Engine workflow-state snapshots: what is persisted and published, and how
+//! setup/teardown phase state is declared and refreshed.
 
 use super::*;
 use crate::data::workflow_prompt_template::WorkItemContext;
@@ -50,11 +51,7 @@ impl WorkflowFrontend for StateSpy {
 
 fn spy_engine(tmp: &tempfile::TempDir, frontend: Box<dyn WorkflowFrontend>) -> WorkflowEngine {
     let session = make_session(tmp);
-    let wf = make_workflow(
-        Some("wi0132-spy"),
-        Some("claude"),
-        vec![make_step("a", &[], None)],
-    );
+    let wf = make_workflow(Some("spy"), Some("claude"), vec![make_step("a", &[], None)]);
     WorkflowEngine::new(
         &session,
         WorkflowSpec::new(wf).with_work_item_context(None),
@@ -69,7 +66,7 @@ fn spy_engine(tmp: &tempfile::TempDir, frontend: Box<dyn WorkflowFrontend>) -> W
 fn local_engine(tmp: &tempfile::TempDir) -> WorkflowEngine {
     let session = make_session(tmp);
     let wf = make_workflow(
-        Some("wi0132-phase-state"),
+        Some("phase-state"),
         Some("claude"),
         vec![make_step("a", &[], None)],
     );
@@ -96,7 +93,7 @@ fn persist_reports_the_state_after_it_has_been_saved() {
     engine.persist().unwrap();
     let reported = seen.lock().unwrap().last().unwrap().clone();
     let store = WorkflowStateStore::at_git_root(tmp.path());
-    let saved = store.load(None, "wi0132-spy").unwrap().unwrap();
+    let saved = store.load(None, "spy").unwrap().unwrap();
     assert_eq!(reported, saved);
 }
 
@@ -117,7 +114,7 @@ fn declaration_lists_pending_steps_with_substituted_descriptions() {
     let tmp = tempfile::tempdir().unwrap();
     let session = make_session(&tmp);
     let wf = make_workflow(
-        Some("wi0132-phase-declare"),
+        Some("phase-declare"),
         Some("claude"),
         vec![make_step("a", &[], None)],
     );

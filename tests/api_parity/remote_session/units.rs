@@ -1,4 +1,4 @@
-//! `push_branch` translation and session-request validation (WI 0133).
+//! `push_branch` translation and session-request validation.
 
 use std::path::PathBuf;
 
@@ -48,7 +48,7 @@ fn push_branch_translation_quotes_hostile_names() {
 }
 
 fn policy() -> SessionCreatePolicy {
-    let base = std::env::temp_dir().join("awman-wi0133-clones");
+    let base = std::env::temp_dir().join("awman-remote-session-clones");
     SessionCreatePolicy::new(vec![], base)
 }
 
@@ -252,7 +252,7 @@ fn session_request_invalid_branch_is_rejected() {
 }
 
 /// `file://` is not a default scheme; a test policy can opt into it, and the
-/// WI 0133 fields validate the same way under it.
+/// base-ref, merge-ref and push-back fields validate the same way under it.
 #[test]
 fn session_request_file_scheme_only_with_a_test_policy() {
     let request = SessionCreateRequest {

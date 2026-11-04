@@ -328,7 +328,7 @@ These were checked and need no work. Do not reopen them under this item:
 
 **Remediation:** after F10, move these to Layer 2/Layer 0 read-model methods returning typed views: `SessionStatus::parse`, `CommandStatus::is_terminal`, a queue-view method, and the status fallback. Share F01's stored-args decoding. Field-level request shape validation remains acceptable where serde does it. WI 0138 has landed; its error codes in `src/frontend/api/error.rs` are the contract, and mapping typed outcomes to them stays in Layer 3.
 
-**Acceptance:** status codes, error codes, and bodies are unchanged, with `tests/api_parity/wi_0138.rs` passing. No lifecycle literal comparisons remain in `routes.rs`.
+**Acceptance:** status codes, error codes, and bodies are unchanged, with `tests/api_parity/http_consistency.rs` passing. No lifecycle literal comparisons remain in `routes.rs`.
 
 ### A04 — P2: The CLI routes `exec workflow` itself
 

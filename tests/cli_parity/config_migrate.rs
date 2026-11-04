@@ -1,4 +1,4 @@
-//! `config migrate` catalogue parity (WI 0150).
+//! `config migrate` catalogue parity.
 //!
 //! One catalogue entry drives the CLI parser, the TUI command box and the API
 //! admission check, so these tests pin what each frontend can reach and that

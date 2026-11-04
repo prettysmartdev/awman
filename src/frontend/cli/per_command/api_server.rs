@@ -66,9 +66,7 @@ mod tests {
         assert!(out.contains(&key), "banner must include the key inline");
     }
 
-    /// The key banner presented on key generation must use "awman" branding,
-    /// not the pre-rename "amux"/"headless". Moved here with the renderer
-    /// from `tests/api_parity/rename_0077.rs`.
+    /// The key banner presented on key generation uses "awman" branding.
     #[test]
     fn banner_uses_awman_branding() {
         let banner = render_api_key_banner(&"a".repeat(64));
@@ -76,10 +74,6 @@ mod tests {
         assert!(
             lower.contains("awman"),
             "API key banner must mention 'awman'; got:\n{banner}"
-        );
-        assert!(
-            !lower.contains("amux"),
-            "API key banner must not mention 'amux'; got:\n{banner}"
         );
         assert!(
             !lower.contains("headless"),

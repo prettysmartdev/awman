@@ -23,14 +23,14 @@ echo base > "$scratch/fixtures/base.tar"
 echo fixture-v1 > "$scratch/fixtures/fixture-oci.tar"
 export AWMAN_TEST_BUILTIN_BASE_TAR="$scratch/fixtures/base.tar"
 export AWMAN_TEST_BUILTIN_FIXTURE_ARCHIVE="$scratch/fixtures/fixture-oci.tar"
-export FAKE_LOG="$log" FAKE_ONLINE="" FAKE_BAD_SHA="" FAKE_RUN_EXITS=""
+export FAKE_LOG="$log" FAKE_ONLINE="" FAKE_BAD_SHA="" FAKE_RUN_EXITS="" FAKE_INSTALL_FAILS=""
 
 # The runner archive: config.sh records its arguments; run.sh announces it
 # started and records the signal that stops it.
 mkdir -p "$scratch/archive"
 cat > "$scratch/archive/config.sh" <<'EOF'
 #!/usr/bin/env bash
-echo "config.sh $*" >> "$FAKE_LOG"
+echo "config.sh $* token=${ACTIONS_RUNNER_INPUT_TOKEN:-}" >> "$FAKE_LOG"
 EOF
 cat > "$scratch/archive/run.sh" <<'EOF'
 #!/usr/bin/env bash
@@ -63,6 +63,8 @@ case "$args" in
     [ -f "$AWMAN_RELEASE_RUNNER_HOME/.fake-online" ] && echo "awman-release-v1.2.3-mac" || true ;;
   "api repos/o/r/actions/runners --paginate -q "*.status*)
     [ -f "$AWMAN_RELEASE_RUNNER_HOME/.fake-online" ] && echo online || echo offline ;;
+  "api repos/o/denied/actions/runners"*) echo "gh: Must have admin rights to Repository. (HTTP 403)" >&2; exit 1 ;;
+  "api repos/o/broken/actions/runners"*) echo "gh: connection reset" >&2; exit 1 ;;
   *) echo "fake gh: unexpected: $args" >&2; exit 1 ;;
 esac
 EOF
@@ -70,6 +72,20 @@ printf '#!/bin/sh\ncase "$1" in -s) echo "${FAKE_OS:-Darwin}";; -m) echo "${FAKE
 printf '#!/bin/sh\necho "${FAKE_HV:-1}"\n' > "$bin/sysctl"
 printf '#!/bin/sh\necho mac\n' > "$bin/hostname"
 printf '#!/bin/sh\necho "sudo $*" >> "$FAKE_LOG"\nexec "$@"\n' > "$bin/sudo"
+printf '#!/bin/sh\n[ -z "$FAKE_INSTALL_FAILS" ] || exit 1\nexec /usr/bin/install "$@"\n' > "$bin/install"
+# `down` reads process groups with `ps -A -o pgid= -o command=`; hosts without
+# ps (minimal Linux containers) get the same listing from /proc.
+if ! command -v ps >/dev/null 2>&1; then
+  cat > "$bin/ps" <<'EOF'
+#!/usr/bin/env bash
+for d in /proc/[0-9]*; do
+  stat=$(cat "$d/stat" 2>/dev/null) || continue
+  read -r _ _ pgid _ <<< "${stat##*) }"
+  cmd=$(tr '\0' ' ' < "$d/cmdline" 2>/dev/null) || continue
+  [ -z "$cmd" ] || echo "$pgid $cmd"
+done
+EOF
+fi
 chmod +x "$bin/"*
 
 check() { # name condition...
@@ -118,6 +134,11 @@ check "a wrapper this script did not write is kept as .bak" grep -qx "#!/bin/sh"
 check "and replaced by the provisioned one" grep -qF "Provisioned by" "$opt/release-workload.sh"
 check "an unchanged file is left alone" \
   bash -c '! grep -q "Installed $0/release-offline-session.sh$" <(bash "$1" provision)' "$opt" "$script"
+mkdir -p "$scratch/tmp"
+echo fixture-v3 > "$AWMAN_TEST_BUILTIN_FIXTURE_ARCHIVE"
+check "provision fails when a file cannot be installed" \
+  bash -c '! TMPDIR="$1" FAKE_INSTALL_FAILS=1 bash "$0" provision >/dev/null 2>&1' "$script" "$scratch/tmp"
+check "and removes its staging directory" bash -c '[ -z "$(ls -A "$0")" ]' "$scratch/tmp"
 
 # ── up refuses an archive whose checksum does not match ──
 reset
@@ -131,20 +152,27 @@ check "a mismatched archive is not kept in the cache" \
 reset
 check "up registers and starts the runner" bash -c 'bash "$0" up o/r v1.2.3 >/dev/null' "$script"
 check "registers with the hypervisor label, a release name and the repo URL" \
-  logged "config.sh --unattended --url https://github.com/o/r --token regtok --name awman-release-v1.2.3-mac --labels hypervisor --work $AWMAN_RELEASE_RUNNER_WORK --replace --disableupdate"
+  logged "config.sh --unattended --url https://github.com/o/r --name awman-release-v1.2.3-mac --labels hypervisor --work $AWMAN_RELEASE_RUNNER_WORK --replace --disableupdate token=regtok"
+check "the registration token is never a command-line argument" bash -c '! grep -q -- --token "$0"' "$log"
+check "the work directory it creates is private" \
+  bash -c '[ "$(ls -ld "$0" | cut -c1-10)" = drwx------ ]' "$AWMAN_RELEASE_RUNNER_WORK"
 check "the runner is running" bash -c 'kill -0 "$(sed -n "s/^pid=//p" "$0/state")"' "$AWMAN_RELEASE_RUNNER_HOME"
 
 # ── busy ──
 check "busy ignores our own runner" bash -c '[ -z "$(bash "$0" busy o/r)" ]' "$script"
 check "busy reports another online hypervisor runner" \
   bash -c '[ "$(FAKE_ONLINE=$'"'"'studio\n'"'"' bash "$0" busy o/r)" = studio ]' "$script"
+check "busy explains that listing runners needs admin rights" \
+  bash -c 'if bash "$0" busy o/denied 2>"$1"; then exit 1; fi; grep -q "needs repository admin rights" "$1" && ! grep -q "HTTP 403" "$1"' "$script" "$scratch/busy.err"
+check "busy shows any other gh failure as it is" \
+  bash -c 'if bash "$0" busy o/broken 2>"$1"; then exit 1; fi; grep -q "connection reset" "$1"' "$script" "$scratch/busy.err"
 
 # ── down ──
 pid=$(sed -n 's/^pid=//p' "$AWMAN_RELEASE_RUNNER_HOME/state")
 check "down stops and deregisters the runner" bash -c 'bash "$0" down >/dev/null' "$script"
 check "the runner got a graceful SIGINT" logged "run.sh stopped by INT"
 check "the runner process is gone" bash -c '! kill -0 "$0" 2>/dev/null' "$pid"
-check "deregistered with a removal token" logged "config.sh remove --token rmtok"
+check "deregistered with a removal token" logged "config.sh remove token=rmtok"
 check "state, runner and work directories are removed" \
   bash -c '[ ! -e "$0/state" ] && [ ! -e "$0/run" ] && [ ! -e "$1" ]' "$AWMAN_RELEASE_RUNNER_HOME" "$AWMAN_RELEASE_RUNNER_WORK"
 check "the verified archive stays cached" \
@@ -153,13 +181,39 @@ check "down is idempotent" bash "$script" down
 mkdir -p "$AWMAN_RELEASE_RUNNER_WORK"
 check "a work directory it did not create is never deleted" \
   bash -c 'bash "$0" down >/dev/null; [ -d "$1" ]' "$script" "$AWMAN_RELEASE_RUNNER_WORK"
-rmdir "$AWMAN_RELEASE_RUNNER_WORK"
+touch "$AWMAN_RELEASE_RUNNER_WORK/keep"
+reset
+check "up reuses a work directory that was already there" bash -c 'bash "$0" up o/r v1.2.3 >/dev/null' "$script"
+check "down leaves that work directory and its files alone" \
+  bash -c 'bash "$0" down >/dev/null; [ -f "$1/keep" ]' "$script" "$AWMAN_RELEASE_RUNNER_WORK"
+rm -rf "$AWMAN_RELEASE_RUNNER_WORK"
+ln -s "$scratch" "$AWMAN_RELEASE_RUNNER_WORK"
+check "up refuses a work directory path that is not a plain directory" \
+  bash -c '! bash "$0" up o/r v1.2.3 >/dev/null 2>&1' "$script"
+rm -f "$AWMAN_RELEASE_RUNNER_WORK"
+
+# ── a saved pid that is no longer the runner (reused after a reboot) ──
+reset
+bash "$script" up o/r v1.2.3 >/dev/null
+runner=$(sed -n 's/^pid=//p' "$AWMAN_RELEASE_RUNNER_HOME/state")
+set -m
+sleep 300 &
+other=$!
+set +m
+awk -v p="$other" '/^pid=/ { $0 = "pid=" p } { print }' "$AWMAN_RELEASE_RUNNER_HOME/state" > "$scratch/state"
+mv "$scratch/state" "$AWMAN_RELEASE_RUNNER_HOME/state"
+check "down refuses to signal a process group that is not the runner" \
+  bash -c 'bash "$0" down 2>"$1" >/dev/null; grep -q "no longer the runner" "$1"' "$script" "$scratch/down.err"
+check "that unrelated process is left running" kill -0 "$other"
+check "the runner is still deregistered" logged "config.sh remove token=rmtok"
+{ kill -KILL "$other"; wait "$other"; } 2>/dev/null || true
+kill -KILL -- "-$runner" 2>/dev/null || true
 
 # ── a runner that dies before coming online ──
 reset
 check "up fails when the runner exits before coming online" \
   bash -c '! FAKE_RUN_EXITS=1 bash "$0" up o/r v1.2.3 >/dev/null 2>&1' "$script"
-check "the dead runner is deregistered" logged "config.sh remove --token rmtok"
+check "the dead runner is deregistered" logged "config.sh remove token=rmtok"
 check "no state is left behind" bash -c '[ ! -e "$0/state" ]' "$AWMAN_RELEASE_RUNNER_HOME"
 
 if [ "$failures" -gt 0 ]; then

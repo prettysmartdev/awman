@@ -32,7 +32,7 @@ pub(super) async fn run(
 
         // Resolve destination directory. Non-global workflows go
         // under <git_root>/aspec/workflows/ (the user-facing
-        // definitions directory), matching old-amux behaviour.
+        // definitions directory).
         let dir = if f.global {
             let git_root = session.as_ref().map(|s| s.git_root().to_path_buf());
             let workflow_dirs = match WorkflowDirs::from_process_env(git_root) {

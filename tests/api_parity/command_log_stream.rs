@@ -1,4 +1,4 @@
-//! WI 0136: resumable, unambiguous command event streams.
+//! Resumable, unambiguous command event streams.
 //!
 //! In-process tests drive the real Axum router (`GET /v1/commands/{id}/logs`)
 //! over loopback with a hand-rolled SSE reader. A worker is modelled with the
@@ -317,7 +317,7 @@ async fn within_real_time<F: std::future::Future>(body: F) -> F::Output {
     }
 }
 
-// ─── Item 3: queued past 300 s ───────────────────────────────────────────────
+// ─── Queued past 300 s ───────────────────────────────────────────────
 
 #[tokio::test(start_paused = true)]
 async fn queued_command_waiting_past_300s_keeps_the_stream_open_with_15s_keepalives() {
@@ -414,7 +414,7 @@ async fn a_queued_stream_resumes_by_id_after_the_client_reconnects_past_300s() {
     .await;
 }
 
-// ─── Item 4: resume by id ────────────────────────────────────────────────────
+// ─── Resume by id ────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn ids_are_attempt_colon_sequence_and_done_has_the_next_id() {
@@ -661,7 +661,7 @@ async fn malformed_ids_are_rejected_with_400() {
     assert_eq!(json["attempt"], 1);
 }
 
-// ─── Item 6: old clients ─────────────────────────────────────────────────────
+// ─── Old clients ─────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn clients_that_ignore_id_see_unchanged_event_names_and_payloads() {
@@ -681,7 +681,7 @@ async fn clients_that_ignore_id_see_unchanged_event_names_and_payloads() {
     });
     attempt.finish(&state, "old").await;
 
-    // Read the raw bytes the way a pre-WI-0136 client does: only `event:` and
+    // Read the raw bytes the way a client without resume support does: only `event:` and
     // `data:` lines matter, `id:` lines are skipped.
     let raw = reqwest::get(format!("{base}/v1/commands/old/logs"))
         .await
@@ -756,7 +756,7 @@ async fn a_pre_attempt_events_log_streams_as_attempt_one() {
     assert_eq!(ids(&resumed), ["1:1"]);
 }
 
-// ─── Item 7: output right up to exit ─────────────────────────────────────────
+// ─── Output right up to exit ─────────────────────────────────────────
 
 /// One run through the real frontend drains, bus and log writer, read back
 /// over the real route. The last stdout line must precede `Done` in both the
@@ -862,7 +862,7 @@ async fn stress_last_stdout_line_precedes_done_in_stream_and_events_log() {
     }
 }
 
-// ─── Item 5: a real re-queue after restart ───────────────────────────────────
+// ─── A real re-queue after restart ───────────────────────────────────
 
 #[cfg(unix)]
 mod restart {

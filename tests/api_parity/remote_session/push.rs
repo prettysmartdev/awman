@@ -1,5 +1,5 @@
 //! The push stage after a successful command in a remote session, and the
-//! `push_branch` step's git semantics, against a `git daemon` origin (WI 0133).
+//! `push_branch` step's git semantics, against a `git daemon` origin.
 
 use serde_json::{json, Value};
 
@@ -364,7 +364,7 @@ async fn real_git_non_fast_forward_push_errors_at_stage_push_and_is_never_forced
         last_status["payload"]["data"]["status"], "error",
         "{events}"
     );
-    // WI 0137: one final status whose `error` is the row's `result.error`;
+    // One final status whose `error` is the row's `result.error`;
     // the push stage is in `result.failure.stage`, not an error prefix.
     assert_eq!(
         last_status["payload"]["data"]["error"], record["result"]["error"],

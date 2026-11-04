@@ -13,7 +13,6 @@ use crate::command::dispatch::catalogue::CommandCatalogue;
 use crate::command::dispatch::Engines;
 use crate::data::config::env::EnvSnapshot;
 use crate::data::error::DataError;
-use crate::data::migration;
 use crate::data::session::{GitRootResolver, Session, SessionOpenOptions};
 use crate::engine::error::EngineError;
 use crate::engine::git::GitEngine;
@@ -52,21 +51,12 @@ impl Startup {
 
     /// Perform ordered application startup for `working_dir` and `env`.
     pub fn run(&self, working_dir: PathBuf, env: EnvSnapshot) -> Result<StartupOutcome> {
-        let mut messages = Vec::new();
-
-        // One-time migration from legacy amux paths and env vars.
-        if let Some(msg) = migration::migrate_global_dir() {
-            messages.push(msg);
-        }
-        messages.extend(migration::check_deprecated_env_vars());
+        let messages = Vec::new();
 
         let path_refs: Vec<&str> = self.command_path.iter().map(String::as_str).collect();
         let git_engine = GitEngine::new();
 
-        // Resolve git root first so we can migrate the repo-local `.amux/` → `.awman/`
-        // BEFORE `Session::open` reads `RepoConfig` from disk. If we deferred this,
-        // a user's first post-rename run would silently fall back to default repo
-        // config because the load would miss the legacy `.amux/config.json`.
+        // Outside a Git repo the working directory stands in for the root.
         let git_root = match git_engine.resolve(&working_dir) {
             Ok(root) => root,
             Err(DataError::GitRootNotFound { .. }) => working_dir.clone(),
@@ -74,9 +64,6 @@ impl Startup {
                 return Err(anyhow::Error::new(other).context("failed to resolve git root"));
             }
         };
-        if let Some(msg) = migration::migrate_repo_dir(&git_root) {
-            messages.push(msg);
-        }
 
         let session = Session::open_at_git_root(
             working_dir,

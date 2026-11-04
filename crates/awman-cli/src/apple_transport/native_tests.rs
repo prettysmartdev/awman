@@ -90,7 +90,7 @@ fn apple_native_stop_cancels_an_outstanding_request() {
 
 /// Exports a real store image through the production acquirer and
 /// validates it. `AWMAN_TEST_APPLE_IMAGE` names the image (default
-/// `awman-amux:latest`).
+/// `awman-awman:latest`).
 #[test]
 fn apple_native_export_round_trip() {
     if !native_enabled() {
@@ -110,7 +110,7 @@ fn apple_native_export_round_trip() {
         }
     }
     let image =
-        std::env::var("AWMAN_TEST_APPLE_IMAGE").unwrap_or_else(|_| "awman-amux:latest".into());
+        std::env::var("AWMAN_TEST_APPLE_IMAGE").unwrap_or_else(|_| "awman-awman:latest".into());
     let state = tempfile::tempdir().unwrap();
     let acq = CachingAcquirer::new(
         state.path(),
@@ -167,7 +167,8 @@ fn native_request(policy: awman::engine::oci::AcquirePolicy) -> awman::engine::o
     use awman::data::config::image_source::ImageSourceSpec;
     use awman::data::oci_identity::OciPlatform;
     awman::engine::oci::AcquireRequest {
-        tag: std::env::var("AWMAN_TEST_APPLE_IMAGE").unwrap_or_else(|_| "awman-amux:latest".into()),
+        tag: std::env::var("AWMAN_TEST_APPLE_IMAGE")
+            .unwrap_or_else(|_| "awman-awman:latest".into()),
         source: ImageSourceSpec::AppleStore { reference: None },
         platform: OciPlatform::host_linux(),
         policy,

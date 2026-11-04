@@ -5,8 +5,8 @@ use super::*;
 
 /// Render the 1-row status hint bar above the command box.
 ///
-/// Content is a `(phase, focus, container)` decision matrix copied from
-/// old amux: tells the user which keybinding is most relevant right now
+/// Content is a `(phase, focus, container)` decision matrix that
+/// tells the user which keybinding is most relevant right now
 /// (Esc to deselect, ↑ to focus the window, ctrl-m to cycle the container,
 /// etc.). Background is forced black so the row stands out against the
 /// surrounding chrome.

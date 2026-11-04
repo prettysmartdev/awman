@@ -1,4 +1,4 @@
-//! WI 0134 allowlist-root contract: `GET /v1/workdirs` and the 403/202
+//! Workdir allowlist-root contract: `GET /v1/workdirs` and the 403/202
 //! decisions of `POST /v1/sessions` for directories under `--workdir-root`.
 //!
 //! Loopback-only and not named `real_network_*`, so `make test-fast` runs them.

@@ -540,7 +540,7 @@ sbx ls                     # shows all sandboxes including non-awman ones
 ```
 
 `awman agents status` includes a source marker for running agents. Regular user
-sessions are marked `session`; containers launched by the squad daemon are
+sessions are marked `session`; containers your squad launched are
 marked `squad:<task>` (for example, `squad:issue-triage`). The marker is
 informational and may be visible whether or not you use squad.
 
@@ -630,7 +630,7 @@ All seven built-in agents are supported under `docker-sbx-experimental`:
 
 **`--allow-docker`:** Docker-in-Docker is always on inside an sbx sandbox (each VM has a private Docker daemon). The `--allow-docker` flag (which mounts the host daemon socket into Docker containers) is a no-op under sbx — it is ignored (noted in the debug log).
 
-**Directory overlays, skills, and context mounts:** the VM can only see the workspace, which is virtiofs-mounted at sandbox creation. `dir(...)` overlays, skill mounts (`--include-all-skills` / `skill(...)`), and context directory mounts (`context(...)`) cannot be honored — awman warns at launch and continues without them. For `context(...)`, the rendered system prompt text is still delivered to the agent; only the directory mount is skipped.
+**Directory overlays, skills, and context mounts:** the VM can only see the workspace, which is virtiofs-mounted at sandbox creation. `dir(...)` overlays, skill mounts (`skill(*)` / `skill(...)`), and context directory mounts (`context(...)`) cannot be honored — awman warns at launch and continues without them. For `context(...)`, the rendered system prompt text is still delivered to the agent; only the directory mount is skipped.
 
 **Mixin launch flags:** mixin kits launch the agent through Docker's built-in template, whose launch command takes no CLI flags from awman. Anything with a native config-file equivalent is delivered through `session.json` (see [Session config](#session-config-and-seeded-prompts)); the rest is warned about at launch instead of silently dropped:
 

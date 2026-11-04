@@ -1,4 +1,4 @@
-//! WI 0132 end-to-end: an API-mode dynamic workflow through the real
+//! End-to-end: an API-mode dynamic workflow through the real
 //! `ExecWorkflowCommand`, the API frontend, and the real `/v1/workflows/{id}`
 //! route, with a container runtime that only records what it was asked to run.
 

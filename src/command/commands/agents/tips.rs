@@ -38,6 +38,9 @@ pub const TIPS: &[&str] = &[
     "`awman exec workflow <file> --worktree` runs in an isolated Git worktree.",
     "`--yolo` and `--auto` on a workflow imply `--worktree`, keeping your checkout untouched.",
     "`awman exec workflow <file> --max-concurrent 2` caps how many steps run in parallel.",
+    "`awman exec workflow <file> --check-prerequisites` reports what setup and teardown steps need.",
+    "`awman exec workflow <file> --on-existing-worktree resume` skips the existing-worktree question.",
+    "`awman exec workflow <file> --on-merge-failure agent` has an agent fix a failed merge-back.",
     "Workflow files can be TOML or YAML, with optional setup and teardown phases.",
     "`awman new workflow` builds a workflow step by step; `--interview` lets an agent draft it.",
     "`awman new workflow --global` saves the workflow to `~/.awman/workflows/` for every repo.",
@@ -53,6 +56,7 @@ pub const TIPS: &[&str] = &[
     "`awman new skill --pull-all` refreshes every skills library you've pulled.",
     "`awman new skill --pull builtin` pulls awman's own skills, like `create-custom-agent`.",
     "`awman new agent <name>` scaffolds a custom agent definition in `.awman/agents/`.",
+    "`awman new agent crush --from crush` restores `crush` as a custom agent; `maki` works too.",
     // ── Overlays ─────────────────────────────────────────────────────────────
     "`--overlay \"dir(~/notes:/mnt/notes:ro)\"` mounts a host directory into the agent read-only.",
     "The `ssh()` overlay gives the agent your SSH keys so it can push to remotes.",
@@ -93,6 +97,8 @@ pub const TIPS: &[&str] = &[
     "`awman config show` lists every setting at global and repo level.",
     "`awman config get <field>` shows a setting's global, repo and effective values.",
     "`awman config set <field> <value> --global` writes to global instead of repo config.",
+    "`awman config migrate` moves a repo's `dynamicWorkflows` block into `workflows.dynamic`.",
+    "`awman config prerequisite-grants list` shows the workflow credential choices awman remembers.",
     // ── Runtimes and security ────────────────────────────────────────────────
     "Agents never run on your host: they run in Docker, Apple Containers, Docker Sandboxes or a microVM.",
     "`awman config set runtime apple-containers --global` switches to Apple Containers.",
@@ -112,7 +118,8 @@ pub const TIPS: &[&str] = &[
     "`awman api start --background` runs the awman HTTP API as a background service.",
     "`awman api status` and `awman api logs` check on the background API server.",
     "`awman remote exec workflow <file> --follow` runs a workflow on a remote awman host.",
-    "Set `remote.defaultAddr` in config to bind new TUI tabs to a remote API session.",
+    "Set `remote.defaultAddr` in global config so `awman remote` commands need no `--remote-addr`.",
+    "`awman api start --workdir-root ~/src` lets API sessions use any repo cloned under `~/src`.",
 ];
 
 /// Select a tip using the current unix-second as a seed. Seconds (not nanos)

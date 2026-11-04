@@ -19,8 +19,8 @@ runners don't have:
 
 | Job | Runner | What it runs |
 |---|---|---|
-| `fast` | `ubuntu-latest` | `make architecture-lint`, `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `make test-fast`. Hermetic — no Docker, no real git, no real network. Should finish in under two minutes warm. |
-| `full-linux-docker` | `ubuntu-latest` | `make test-full` against the runner's Docker daemon (`test-full` sets `AWMAN_TEST_DOCKER=1`; without it the Docker tests see Docker as not installed). Includes the `docker_*`, `real_git_*`, and `real_network_*` integration tests. Depends on `fast`. |
+| `fast` | `ubuntu-26.04` | `make architecture-lint`, `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `make test-fast`. Hermetic — no Docker, no real git, no real network. Should finish in under two minutes warm. |
+| `full-linux-docker` | `ubuntu-26.04` | `make test-full` against the runner's Docker daemon (`test-full` sets `AWMAN_TEST_DOCKER=1`; without it the Docker tests see Docker as not installed). Includes the `docker_*`, `real_git_*`, and `real_network_*` integration tests. Depends on `fast`. |
 | `build-macos` | `macos-latest` | `cargo build --release` and `make test-fast`. Smoke-tests cross-platform compilation; does not run Docker tests (macOS hosted runners lack Docker). Depends on `fast`. |
 | `builtin-build` | Linux ARM64 (`ubuntu-24.04-arm`, hosted) | Fetches and verifies the payload, builds the `builtin-runtime` feature, inspects dynamic dependencies, and runs `make test-builtin` — on a hosted runner with no KVM, so `builtin_hw_*` tests SKIP. A build/hermetic gate, not proof of guest execution. Runs on every PR and push to `main` (the only builtin job that does). |
 | `builtin-hardware` | self-hosted `macOS/ARM64/hypervisor` (the released platform; WI 0124 re-adds `linux/arm64/kvm` and `linux/x64/kvm`) | Opt-in real-guest matrix (`AWMAN_TEST_BUILTIN=1 AWMAN_TEST_BUILTIN_REQUIRE_HW=1`): checks hardware prerequisites first and **fails** (never skips) if they're missing, builds a disposable fixture image, then runs `make test-builtin` for real — same-executable worker boot, image import, execution. `make test-builtin` builds the guest drivers explicitly and ad-hoc signs awman and the drivers with the hypervisor entitlement (`tools/macos-sign-test-artifacts.sh`) between building and running. It also builds the previous-protocol awman from git history for the old-to-new upgrade test (`tools/build-previous-builtin-awman.sh`), so the job checks out full history (`fetch-depth: 0`). Only on `workflow_dispatch` or the nightly `schedule`. |
@@ -36,6 +36,8 @@ The builtin and unsupported-target matrices use the same workspace. The musl
 feature build reports builtin as unsupported and excludes the GNU-only SDK dependencies.
 
 Cargo's registry, git cache, and `target/` are cached per-OS to keep warm runs fast.
+
+Every action in `test.yml` and `release.yml` is pinned to a full commit SHA, with the release it was resolved from as a trailing comment (`# v7.0.1`); `dtolnay/rust-toolchain` is pinned to its `stable` branch head and always given an explicit `toolchain:`. Update a pin by resolving the new tag with `git ls-remote` (the peeled `^{}` commit for an annotated tag).
 
 The hardware-gated jobs are separate from `fast` and `full-linux-docker`; those
 never boot a guest. Each native job first checks host architecture, verified
@@ -111,21 +113,31 @@ one on demand through `tools/release-runner.sh`:
   heavier git/build workload.
 - **Short work directory.** Jobs run under `/tmp/awr` rather than the runner's
   install directory, because the job's builtin state directories hold Unix
-  sockets and macOS caps socket paths at 103 bytes.
+  sockets and macOS caps socket paths at 103 bytes. `up` creates it private
+  (mode 0700) and refuses a path that is a symlink or someone else's
+  directory; only a directory it created is deleted afterwards.
 - **Before the tag is pushed.** The script downloads the latest
   `actions/runner` osx-arm64 archive into `~/.awman/release-runner/cache`,
   refuses it unless its SHA-256 matches the checksum in that runner release's
-  notes, registers it with a repository registration token (labels
+  notes, registers it with a repository registration token (passed in the
+  environment, never on a command line; labels
   `self-hosted, macOS, ARM64, hypervisor`, name `awman-release-<tag>-<host>`),
-  starts it under `caffeinate`, and waits for it to come online. Queued
-  `Tests` runs that would take the runner first are offered for cancellation.
-  A runner that cannot register stops the release before anything is pushed.
+  starts it under `caffeinate`, and waits for it to come online. `Tests` runs,
+  queued or in progress, with a `hypervisor` job still waiting for a runner
+  would take it first, so they are listed and offered for cancellation. A
+  `Tests` self-hosted job that reaches the release runner later (the nightly
+  cron, say) fails its first step on any `awman-release-*` runner, freeing it
+  in seconds. A runner that cannot register stops the release before
+  anything is pushed.
 - **During.** The script waits for the tag's `Release` run, re-running its
   failed jobs if the run already finished unsuccessfully, and follows it with
   `gh run watch` until every job has finished.
 - **After.** An `EXIT` trap stops the runner's process group (SIGINT, then
   SIGKILL) and deregisters it, whether the run succeeded, failed or the script
-  was interrupted. Re-running the script picks up where it stopped.
+  was interrupted; a second Ctrl-C does not interrupt that teardown. The group
+  is signalled only while it still holds the runner's processes, so a saved
+  pid reused after a reboot is never signalled. Re-running the script picks up
+  where it stopped.
 
 The runner executes jobs as the invoking user on that Mac, and accepts any
 job whose labels it matches while it is online. The committed self-hosted
@@ -134,12 +146,14 @@ request runs the workflow file from its own branch, so a fork PR could target
 these labels. For a public repository, set **Settings → Actions → General → fork
 pull request workflows** to require approval for every outside contributor
 (the strictest option), and don't approve fork workflow runs during a release. Registration and removal need repository
-admin rights for the `gh` login.
+admin rights for the `gh` login (so does listing runners for `RELEASE_RUNNER=auto`;
+without it the script says so and suggests `RELEASE_RUNNER=none`).
 
 ## Versioning
 
 - Semantic versioning. Major version bumps reserved for incompatible CLI or on-disk format changes.
 - The `Cargo.toml` `version` is the source of truth. The release workflow assumes the tag matches it (`v<Cargo version>`).
+- Release tags are plain `vX.Y.Z`. Pre-release suffixes (`v1.2.3-rc1`) are not supported: `release.yml` runs only on `v[0-9]+.[0-9]+.[0-9]+` tags, and `scripts/release.sh` refuses any other version.
 - `docs/releases/v<version>.md` MUST exist before the tag is pushed. The release workflow inlines it as the GitHub Release body.
 
 ## Publishing

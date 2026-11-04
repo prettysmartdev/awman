@@ -633,7 +633,7 @@ fn double_fork_spawn(
         .stdout(open_log())
         .stderr(open_log());
 
-    // On Unix this matches old-amux exactly: a single Command::spawn. True
+    // On Unix this is a single Command::spawn. True
     // setsid daemonization would require `pre_exec`, which is unsafe — and this crate's
     // `#![forbid(unsafe_code)]` rule disallows. The systemd-run / launchd happy paths
     // above handle real detachment when the OS supports it.

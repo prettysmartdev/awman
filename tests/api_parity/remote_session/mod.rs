@@ -1,4 +1,4 @@
-//! Remote API session tests (WI 0133): base ref, merge refs, push-back, and
+//! Remote API session tests: base ref, merge refs, push-back, and
 //! dynamic workflows in a remote session's clone.
 //!
 //! units.rs  — `push_branch` translation and session-request validation,

@@ -1,4 +1,4 @@
-//! WI 0135 command lifecycle over the API: cancel, labels, `Idempotency-Key`
+//! Command lifecycle over the API: cancel, labels, `Idempotency-Key`
 //! replay and `POST /v1/runs`.
 //!
 //! Runs the real `awman api start` binary with the fake `docker` of

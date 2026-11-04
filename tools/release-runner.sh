@@ -77,7 +77,7 @@ install_opt() { # src name mode
 # the cached fixture's path baked in. The session script records guest RSS
 # when AWMAN_GUEST_RSS_OUTPUT is set, which is all the workload wrapper needs.
 cmd_provision() {
-  local fixture stage name
+  local fixture name
   cmd_check --hardware || die "this host cannot run the Apple Silicon release job"
   fixture=$(
     # shellcheck source=tools/builtin-hw-fixtures.sh
@@ -93,7 +93,9 @@ cmd_provision() {
   fi
   mkdir -p "$OPT_DIR/lib"
 
+  # Not local: the EXIT trap removes it however provision ends.
   stage=$(mktemp -d "${TMPDIR:-/tmp}/awman-provision.XXXXXX")
+  trap 'rm -rf "$stage"' EXIT
   for name in release-offline-session release-workload; do
     printf '#!/bin/bash\n# %s; re-run on every `make release`, so do not edit.\nexec /bin/bash %q --fixture %q "$@"\n' \
       "$MARKER" "$OPT_DIR/lib/release-offline-session.sh" "$OPT_DIR/fixture-oci.tar" > "$stage/$name.sh"
@@ -102,16 +104,24 @@ cmd_provision() {
   install_opt "$fixture" fixture-oci.tar 644
   install_opt "$stage/release-offline-session.sh" release-offline-session.sh 755
   install_opt "$stage/release-workload.sh" release-workload.sh 755
-  rm -rf "$stage"
 }
 
 # Online runners in <repo> that carry the hypervisor label, excluding ours.
+# Listing (and registering) runners needs repository admin rights.
 cmd_busy() {
-  local repo=$1 ours=""
+  local repo=$1 ours="" names
   [ -f "$STATE" ] && ours=$(sed -n 's/^name=//p' "$STATE")
-  gh api "repos/$repo/actions/runners" --paginate \
-    -q ".runners[] | select(.status == \"online\") | select([.labels[].name] | index(\"$LABEL\")) | .name" |
-    awk -v ours="$ours" '$0 != ours'
+  mkdir -p "$RUNNER_HOME"
+  if ! names=$(gh api "repos/$repo/actions/runners" --paginate \
+    -q ".runners[] | select(.status == \"online\") | select([.labels[].name] | index(\"$LABEL\")) | .name" \
+    2> "$RUNNER_HOME/busy.err"); then
+    case "$(cat "$RUNNER_HOME/busy.err")" in
+      *"HTTP 403"*|*"HTTP 404"*)
+        die "listing $repo's self-hosted runners needs repository admin rights for the gh login. Ask an admin to run the release, or use RELEASE_RUNNER=none with a hypervisor runner someone else runs (RELEASE_RUNNER=local needs admin too, to register this Mac)." ;;
+      *) cat "$RUNNER_HOME/busy.err" >&2; die "could not list $repo's self-hosted runners" ;;
+    esac
+  fi
+  [ -z "$names" ] || printf '%s\n' "$names" | awk -v ours="$ours" '$0 != ours'
 }
 
 # Download (once) and verify the latest osx-arm64 runner. The checksum comes
@@ -148,12 +158,23 @@ cmd_up() {
   [ -f "$STATE" ] && cmd_down
   archive=$(fetch_runner)
   rm -rf "$RUN_DIR"
-  mkdir -p "$RUN_DIR" "$WORK_DIR"
-  touch "$WORK_DIR/.awman-release-runner"
+  mkdir -p "$RUN_DIR"
+  # Only a work directory this script creates is marked, so `down` never
+  # deletes one that was already there. It must be private and ours: the
+  # default lives in the shared /tmp.
+  if [ ! -e "$WORK_DIR" ]; then
+    mkdir -p "$(dirname "$WORK_DIR")"
+    mkdir -m 700 "$WORK_DIR"
+    touch "$WORK_DIR/.awman-release-runner"
+  fi
+  [ ! -L "$WORK_DIR" ] && [ -d "$WORK_DIR" ] && [ -O "$WORK_DIR" ] ||
+    die "$WORK_DIR is not a directory owned by $(id -un)"
   tar -xzf "$archive" -C "$RUN_DIR"
   name="awman-release-$tag-$(hostname -s)"
   token=$(gh api -X POST "repos/$repo/actions/runners/registration-token" -q .token)
-  (cd "$RUN_DIR" && ./config.sh --unattended --url "https://github.com/$repo" --token "$token" \
+  # The runner reads ACTIONS_RUNNER_INPUT_<ARG> as <ARG>, which keeps the
+  # token out of the process list (an argument is visible to every user).
+  (cd "$RUN_DIR" && ACTIONS_RUNNER_INPUT_TOKEN="$token" ./config.sh --unattended --url "https://github.com/$repo" \
     --name "$name" --labels "$LABEL" --work "$WORK_DIR" --replace --disableupdate) > "$RUNNER_HOME/config.log" 2>&1 ||
     { cat "$RUNNER_HOME/config.log" >&2; die "runner registration failed"; }
   printf 'repo=%s\nname=%s\n' "$repo" "$name" > "$STATE"
@@ -181,20 +202,31 @@ cmd_up() {
   say "Runner '$name' is online (log: $RUNNER_HOME/runner.log)"
 }
 
+# Is process group <pgid> still the runner `up` started? Its saved pid leads
+# that group, but after a reboot the pid may belong to an unrelated program,
+# whose group must never be signalled. A pgid stays taken while any member
+# lives, so this also finds a runner whose leader has already exited.
+is_runner_group() { # pgid
+  ps -A -o pgid= -o command= 2>/dev/null |
+    awk -v g="$1" '$1 == g && /run\.sh|run-helper\.sh|Runner\.Listener|Runner\.Worker/ { found = 1 } END { exit !found }'
+}
+
 cmd_down() {
   [ -f "$STATE" ] || return 0
-  local repo name pid id token i
+  local repo name pid id token
   repo=$(sed -n 's/^repo=//p' "$STATE")
   name=$(sed -n 's/^name=//p' "$STATE")
   pid=$(sed -n 's/^pid=//p' "$STATE")
-  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+  if [ -n "$pid" ] && is_runner_group "$pid"; then
     # SIGINT is the listener's graceful shutdown; escalate if it lingers.
     kill -INT -- "-$pid" 2>/dev/null || kill -INT "$pid" 2>/dev/null || true
-    for i in $(seq 1 30); do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
+    for _ in $(seq 1 30); do is_runner_group "$pid" || break; sleep 1; done
     kill -KILL -- "-$pid" 2>/dev/null || true
+  elif [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+    echo "release-runner: pid $pid is no longer the runner; not signalling it" >&2
   fi
   token=$(gh api -X POST "repos/$repo/actions/runners/remove-token" -q .token 2>/dev/null || true)
-  if [ -z "$token" ] || ! (cd "$RUN_DIR" && ./config.sh remove --token "$token") >/dev/null 2>&1; then
+  if [ -z "$token" ] || ! (cd "$RUN_DIR" && ACTIONS_RUNNER_INPUT_TOKEN="$token" ./config.sh remove) >/dev/null 2>&1; then
     id=$(runner_id "$repo" "$name" 2>/dev/null || true)
     [ -z "$id" ] || gh api -X DELETE "repos/$repo/actions/runners/$id" >/dev/null 2>&1 ||
       echo "release-runner: could not deregister '$name'; remove it under Settings → Actions → Runners" >&2

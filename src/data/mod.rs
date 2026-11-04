@@ -25,7 +25,6 @@ pub mod image_tags;
 pub mod issue;
 pub mod merge_fix_prompt;
 pub mod message;
-pub mod migration;
 pub mod network;
 pub mod oci_cache;
 pub mod oci_identity;
