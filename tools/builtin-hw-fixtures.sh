@@ -63,18 +63,24 @@ build_builtin_hw_fixture_archives() {
 prepare_builtin_hw_fixtures() {
     build_builtin_hw_fixture_archives "$1"
     if [ "$(uname -s)" = Darwin ]; then
-        # The Apple-store guest tests import the fixture from a running Apple
-        # Containers service (and stop and restart that service themselves).
-        local apple_cli
-        apple_cli=$(command -v container) || builtin_hw_blocked "install Apple Containers (https://github.com/apple/container/releases)"
-        container system status >/dev/null 2>&1 || container system start
-        container image load --input "$fixture"
-        container image inspect awman-spike/fixture:latest >/dev/null ||
-            builtin_hw_blocked "Apple Containers did not load the fixture as awman-spike/fixture:latest"
-        builtin_hw_apple_ref=awman-spike/fixture:latest
-        export AWMAN_TEST_APPLE_CONTAINER=1 AWMAN_TEST_APPLE_CLI=$apple_cli
-        export AWMAN_TEST_APPLE_FIXTURE_REF=$builtin_hw_apple_ref AWMAN_TEST_APPLE_IMAGE=$builtin_hw_apple_ref
+        load_builtin_hw_apple_fixture
     fi
+}
+
+load_builtin_hw_apple_fixture() {
+    # The Apple-store guest tests import the fixture from a running Apple
+    # Containers service (and stop and restart that service themselves).
+    local apple_cli
+    apple_cli=$(command -v container) || builtin_hw_blocked "install Apple Containers (https://github.com/apple/container/releases)"
+    [ -s "${AWMAN_TEST_BUILTIN_FIXTURE_ARCHIVE:-}" ] ||
+        builtin_hw_blocked "AWMAN_TEST_BUILTIN_FIXTURE_ARCHIVE must name a nonempty OCI fixture archive"
+    container system status >/dev/null 2>&1 || container system start
+    container image load --input "$AWMAN_TEST_BUILTIN_FIXTURE_ARCHIVE"
+    container image inspect awman-spike/fixture:latest >/dev/null ||
+        builtin_hw_blocked "Apple Containers did not load the fixture as awman-spike/fixture:latest"
+    builtin_hw_apple_ref=awman-spike/fixture:latest
+    export AWMAN_TEST_APPLE_CONTAINER=1 AWMAN_TEST_APPLE_CLI=$apple_cli
+    export AWMAN_TEST_APPLE_FIXTURE_REF=$builtin_hw_apple_ref AWMAN_TEST_APPLE_IMAGE=$builtin_hw_apple_ref
 }
 
 release_builtin_hw_fixtures() {

@@ -367,15 +367,16 @@ impl LocalTaskEvaluator {
                 (repo_scope, git_root)
             }
         };
-        Session::open_at_git_root(
-            working_dir,
-            git_root,
-            SessionOpenOptions {
-                env: Some(self.env.clone()),
-                ..Default::default()
-            },
-        )
-        .map_err(|error| CommandError::Other(format!("opening squad task session: {error}")))
+        let opts = SessionOpenOptions {
+            env: Some(self.env.clone()),
+            ..Default::default()
+        };
+        let session = if task.mount_scope.is_git_repo() {
+            Session::open_at_git_root(working_dir, git_root, opts)
+        } else {
+            Session::open_at_directory_root(working_dir, opts)
+        };
+        session.map_err(|error| CommandError::Other(format!("opening squad task session: {error}")))
     }
 
     /// Give a plain-directory task root the image definitions an ordinary

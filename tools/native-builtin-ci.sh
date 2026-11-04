@@ -69,6 +69,13 @@ env -i PATH=/usr/bin:/bin HOME="$(mktemp -d)" "$AWMAN_TEST_BUILTIN_ARTIFACT" __a
 if [ -z "${AWMAN_TEST_BUILTIN_FIXTURE_ARCHIVE:-}" ] || [ ! -f "$AWMAN_TEST_BUILTIN_FIXTURE_ARCHIVE" ]; then
   echo "BLOCKED: AWMAN_TEST_BUILTIN_FIXTURE_ARCHIVE must name a disposable OCI fixture archive" >&2; exit 2
 fi
+if [ "$target" = aarch64-apple-darwin ]; then
+  # The native gate runs the Apple-store hardware test too. Load its fixture
+  # before requiring hardware coverage, then remove it when the gate exits.
+  . tools/builtin-hw-fixtures.sh
+  trap release_builtin_hw_fixtures EXIT
+  load_builtin_hw_apple_fixture
+fi
 # Hardware suite fails on missing prerequisites due to REQUIRE_HW. It records
 # each exercised scenario and includes current typed provider guest coverage.
 cargo test --locked --features builtin-runtime --target "$target" --test builtin_runtime builtin_hw -- --nocapture

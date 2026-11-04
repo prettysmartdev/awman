@@ -883,7 +883,8 @@ fn probes_as_awman_cli(path: &Path) -> bool {
 fn run_binary(root: &Path, cwd: &Path, args: &[&str]) -> Output {
     let home = root.join("home");
     std::fs::create_dir_all(&home).expect("test home");
-    Command::new(awman_under_test(root))
+    let mut command = Command::new(awman_under_test(root));
+    command
         .args(args)
         .current_dir(cwd)
         .env("HOME", &home)
@@ -893,9 +894,26 @@ fn run_binary(root: &Path, cwd: &Path, args: &[&str]) -> Output {
         // launchd / systemd, whose squad item, label and unit are one fixed
         // name each — and never send the developer's own squad key.
         .env("AWMAN_TEST_ISOLATION", "1")
-        .env_remove("AWMAN_SQUAD_KEY")
-        .output()
-        .expect("awman subprocess must start")
+        .env_remove("AWMAN_SQUAD_KEY");
+    output_awman(&mut command)
+}
+
+fn output_awman(command: &mut Command) -> Output {
+    // A concurrent test can fork while the shared test binary is being
+    // copied. Its child briefly retains the copy's write descriptor, so
+    // execve can report ETXTBSY even after the copy itself has finished.
+    for attempt in 0..100 {
+        match command.output() {
+            Ok(output) => return output,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::ExecutableFileBusy && attempt < 99 =>
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("awman subprocess must start: {error}"),
+        }
+    }
+    unreachable!()
 }
 
 /// The CLI must have reused the in-process test daemon: its pidfile still
@@ -1120,14 +1138,14 @@ fn json_cli_failure_is_a_structured_error_with_nonzero_exit() {
 
     let home = root.path().join("home");
     std::fs::create_dir_all(&home).expect("test home");
-    let output = Command::new(awman_under_test(root.path()))
+    let mut command = Command::new(awman_under_test(root.path()));
+    command
         .args(["squad", "list", "--json"])
         .current_dir(&repo)
         .env("HOME", &home)
         .env("AWMAN_CONFIG_HOME", root.path().join("config"))
-        .env("AWMAN_SQUAD_ROOT", &invalid_squad_root)
-        .output()
-        .expect("awman subprocess must start");
+        .env("AWMAN_SQUAD_ROOT", &invalid_squad_root);
+    let output = output_awman(&mut command);
 
     assert!(
         !output.status.success(),

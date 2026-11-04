@@ -415,8 +415,8 @@ pub struct Session {
     /// Whether `git_root` is a real repository root, as the `GitRootResolver`
     /// answered at open time.
     ///
-    /// `false` only for a session opened over a directory git does not know
-    /// about (`open_or_workdir_fallback`) or over the squad storage root.
+    /// `false` for a session opened over a plain directory or the squad
+    /// storage root.
     /// Recorded here rather than probed for later: the resolver is the one
     /// place that decides, a `.git` probe is wrong for a worktree or a
     /// submodule, and a frontend must not be the layer asking.
@@ -509,15 +509,22 @@ impl Session {
 
     /// Open a session with an explicit, pre-resolved git root.
     ///
-    /// The caller supplying a git root asserts that it is one; the two callers
-    /// that know otherwise ([`Session::open_or_workdir_fallback`]'s fallback
-    /// arm and [`Session::open_squad_root`]) go through `open_resolved`.
+    /// The caller supplying a git root asserts that it is one. Plain
+    /// directories use [`Session::open_at_directory_root`] instead.
     pub fn open_at_git_root(
         working_dir: PathBuf,
         git_root: PathBuf,
         opts: SessionOpenOptions,
     ) -> Result<Self, DataError> {
         Self::open_resolved(working_dir, git_root, opts, true)
+    }
+
+    /// Open a session rooted at a plain directory with no Git repository.
+    pub fn open_at_directory_root(
+        root: PathBuf,
+        opts: SessionOpenOptions,
+    ) -> Result<Self, DataError> {
+        Self::open_resolved(root.clone(), root, opts, false)
     }
 
     /// Open a session re-rooted at a workflow worktree on behalf of `invoker`.
@@ -834,6 +841,22 @@ mod tests {
                 working_dir: working_dir.to_path_buf(),
             })
         }
+    }
+
+    #[test]
+    fn explicit_directory_root_is_not_marked_as_a_git_repo() {
+        let setup = IsolatedSetup::new();
+        let root = setup.git_root.path().to_path_buf();
+        let session = Session::open_at_directory_root(
+            root.clone(),
+            SessionOpenOptions {
+                env: Some(setup.env()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(session.git_root(), root);
+        assert!(!session.is_git_repo());
     }
 
     // ─── AgentName tests ─────────────────────────────────────────────────────
