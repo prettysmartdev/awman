@@ -3,33 +3,22 @@
 use async_trait::async_trait;
 use serde::Serialize;
 
+use super::session_worktree::{report_kept_session_worktree, resolve_session_worktree};
 use crate::command::commands::launch_policy::{
     ensure_agent_trusted, LaunchModeDecision, LaunchPolicy,
 };
 use crate::command::commands::Command;
-use crate::command::dispatch::{BuildContext, Engines};
+use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
 use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
 use crate::data::session::{AgentName, Session};
 use crate::engine::agent::AgentRunOptions;
 use crate::engine::container::options::{AutoMode, PlanMode, YoloMode};
 
-#[derive(Debug, Clone)]
-pub struct ExecPromptCommandFlags {
-    pub prompt: Option<String>,
-    pub non_interactive: bool,
-    pub plan: bool,
-    pub allow_docker: bool,
-    pub yolo: bool,
-    pub auto: bool,
-    pub agent: Option<String>,
-    pub model: Option<String>,
-    pub launch_mode: Option<crate::data::config::repo::LaunchMode>,
-    pub overlay: Vec<String>,
-    /// `--agent-flag` values; `None` lets config `agentFlags` apply.
-    pub agent_flags: Option<Vec<String>>,
-    pub issue_source: crate::engine::issue::IssueSourceFlags,
-}
+mod flags;
+#[cfg(test)]
+pub(crate) use flags::refuse_selector_in_prompt;
+pub use flags::ExecPromptCommandFlags;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ExecPromptOutcome {
@@ -44,6 +33,7 @@ pub trait ExecPromptCommandFrontend:
     + Send
     + Sync
 {
+    fn report_session_worktree(&mut self, _path: &std::path::Path, _branch: Option<&str>) {}
 }
 
 async fn ensure_exec_prompt_agent_setup(
@@ -75,6 +65,8 @@ pub(crate) fn build_prompt_string(
 }
 
 pub struct ExecPromptCommand {
+    #[cfg(test)]
+    pull_request_client: Option<crate::engine::git::pull_request::PullRequestClient>,
     flags: ExecPromptCommandFlags,
     engines: Engines,
     session: Session,
@@ -90,51 +82,14 @@ pub struct ExecPromptCommand {
 impl ExecPromptCommand {
     pub fn new(flags: ExecPromptCommandFlags, engines: Engines, session: Session) -> Self {
         Self {
+            #[cfg(test)]
+            pull_request_client: None,
             flags,
             engines,
             session,
             cancel: tokio_util::sync::CancellationToken::new(),
             output_dir: None,
         }
-    }
-
-    /// Construct from the catalogue-resolved input (WI 0113 F-10). A
-    /// whitespace-only positional prompt is normalised to `None`; the
-    /// prompt-or-issue requirement is checked at run time, where `--issue`
-    /// can still supply the text.
-    pub fn from_input(ctx: &BuildContext) -> Result<Self, CommandError> {
-        let prompt = match ctx.args.get("prompt") {
-            Some(prompt) if prompt.trim().is_empty() => None,
-            other => other.map(str::to_string),
-        };
-        Ok(Self::new(
-            ExecPromptCommandFlags {
-                prompt,
-                non_interactive: ctx.flags.bool("non-interactive"),
-                plan: ctx.flags.bool("plan"),
-                allow_docker: ctx.flags.bool("allow-docker"),
-                yolo: ctx.flags.bool("yolo"),
-                auto: ctx.flags.bool("auto"),
-                agent: ctx.flags.string("agent"),
-                model: ctx.flags.string("model"),
-                launch_mode: crate::command::dispatch::parse_launch_mode(
-                    ctx.flags.string("launch-mode"),
-                    &ctx.path(),
-                )?,
-                overlay: ctx.flags.strs("overlay").to_vec(),
-                agent_flags: crate::command::dispatch::parse_agent_flags(
-                    ctx.flags.strs("agent-flag"),
-                    &ctx.path(),
-                )?,
-                issue_source: crate::engine::issue::IssueSourceFlags {
-                    issue: ctx.flags.string("issue"),
-                },
-            },
-            ctx.engines.clone(),
-            ctx.session.clone(),
-        )
-        .with_cancellation(ctx.cancel.clone())
-        .with_output_dir(ctx.output_dir.clone()))
     }
 
     /// Observe `token`: once it fires the agent container is stopped and the
@@ -147,6 +102,17 @@ impl ExecPromptCommand {
     /// Mount `dir` at `/awman/output` into the agent container (WI 0137 §3).
     pub fn with_output_dir(mut self, dir: Option<std::path::PathBuf>) -> Self {
         self.output_dir = dir;
+        self
+    }
+
+    /// Hermetic PR metadata integration for full launch tests.
+    #[cfg(test)]
+    #[allow(dead_code)] // consumed by the subsequent launch-test workflow step
+    pub(crate) fn with_pull_request_client(
+        mut self,
+        client: crate::engine::git::pull_request::PullRequestClient,
+    ) -> Self {
+        self.pull_request_client = Some(client);
         self
     }
 
@@ -238,335 +204,412 @@ impl Command for ExecPromptCommand {
             });
             return Err(e);
         }
-        // Resolve ACP policy before overlays or container setup. A direct ACP
-        // request is deliberately never eligible for fallback.
-        let launch_decision = LaunchPolicy::for_session(&session).single_agent_launch_mode(
-            &agent,
-            &self.flags.agent,
-            &self.flags.model,
-            self.flags.launch_mode,
-        )?;
-        if launch_decision == LaunchModeDecision::StdioWithFallbackWarning {
-            frontend.write_message(UserMessage {
-                level: MessageLevel::Warning,
-                text: LaunchPolicy::acp_fallback_warning(&agent),
-            });
-        }
-        if let Some(note) = LaunchPolicy::deprecation_warning(&agent) {
-            frontend.write_message(note);
-        }
-
-        frontend.write_message(UserMessage {
-            level: MessageLevel::Info,
-            text: format!("exec prompt: using agent '{}'", agent.as_str()),
-        });
-
-        let cli_typed = match LaunchPolicy::parse_overlay_flags(&self.flags.overlay) {
-            Ok(overlays) => overlays,
-            Err(e) => {
-                frontend.write_message(UserMessage {
-                    level: MessageLevel::Error,
-                    text: format!("exec prompt: invalid overlay spec: {e}"),
-                });
-                return Err(e);
-            }
-        };
-        let collected = session
-            .effective_config()
-            .collected_overlays(cli_typed, None, None)?;
-
-        // Emit deprecation warnings for legacy config fields.
-        LaunchPolicy::for_session(&session)
-            .warn_config(&self.engines.config_notices, frontend.as_mut());
-
-        // The Dockerfile + image setup is container-paradigm only; sandbox
-        // runtimes get their per-agent kits from `awman ready` instead.
-        if self.engines.runtime.capabilities().kit_declarative {
-            frontend.write_message(UserMessage {
-                level: MessageLevel::Info,
-                text: format!(
-                    "exec prompt: {} runtime active — using the agent kit prepared by \
-                     `awman ready` (no image build needed)",
-                    self.engines.runtime.display_name()
-                ),
-            });
+        let invoker = session;
+        let worktree = if let Some(target) = &self.flags.session_worktree {
+            #[cfg(test)]
+            let resolved = if let Some(client) = self.pull_request_client {
+                super::session_worktree::resolve_session_worktree_with_client(
+                    target,
+                    &invoker,
+                    self.engines.git_engine.clone(),
+                    client,
+                    frontend.as_mut(),
+                )
+                .await
+            } else {
+                resolve_session_worktree(
+                    target,
+                    &invoker,
+                    self.engines.git_engine.clone(),
+                    frontend.as_mut(),
+                )
+                .await
+            };
+            #[cfg(not(test))]
+            let resolved = resolve_session_worktree(
+                target,
+                &invoker,
+                self.engines.git_engine.clone(),
+                frontend.as_mut(),
+            )
+            .await;
+            let worktree = resolved?;
+            report_kept_session_worktree(&worktree, frontend.as_mut());
+            frontend.report_session_worktree(&worktree.path, worktree.branch.as_deref());
+            Some(worktree)
         } else {
+            None
+        };
+
+        // Keep one reporting tail for all post-resolution returns, including
+        // setup/launch/ACP errors. The worktree is always retained.
+        let outcome = async {
+            let session = match &worktree {
+                Some(worktree) => Session::open_worktree_with_invoker_config(
+                    worktree.path.clone(), worktree.path.clone(), &invoker,
+                )?,
+                None => invoker.clone(),
+            };
+            let image_session = match &worktree {
+                Some(worktree) => Session::open_worktree_with_invoker_config(
+                    worktree.invoker_root.clone(), worktree.invoker_root.clone(), &invoker,
+                )?,
+                None => invoker.clone(),
+            };
+
+            // Resolve ACP policy before overlays or container setup. A direct ACP
+            // request is deliberately never eligible for fallback.
+            let launch_decision = LaunchPolicy::for_session(&session).single_agent_launch_mode(
+                &agent,
+                &self.flags.agent,
+                &self.flags.model,
+                self.flags.launch_mode,
+            )?;
+            if launch_decision == LaunchModeDecision::StdioWithFallbackWarning {
+                frontend.write_message(UserMessage {
+                    level: MessageLevel::Warning,
+                    text: LaunchPolicy::acp_fallback_warning(&agent),
+                });
+            }
+            if let Some(note) = LaunchPolicy::deprecation_warning(&agent) {
+                frontend.write_message(note);
+            }
+
             frontend.write_message(UserMessage {
                 level: MessageLevel::Info,
-                text: "Checking agent availability…".into(),
+                text: format!("exec prompt: using agent '{}'", agent.as_str()),
             });
-            if let Err(e) = ensure_exec_prompt_agent_setup(
-                self.engines.agent_engine.as_ref(),
+
+            let cli_typed = match LaunchPolicy::parse_overlay_flags(&self.flags.overlay) {
+                Ok(overlays) => overlays,
+                Err(e) => {
+                    frontend.write_message(UserMessage {
+                        level: MessageLevel::Error,
+                        text: format!("exec prompt: invalid overlay spec: {e}"),
+                    });
+                    return Err(e);
+                }
+            };
+            let collected = session
+                .effective_config()
+                .collected_overlays(cli_typed, None, None)?;
+
+            // Emit deprecation warnings for legacy config fields.
+            LaunchPolicy::for_session(&session)
+                .warn_config(&self.engines.config_notices, frontend.as_mut());
+
+            // The Dockerfile + image setup is container-paradigm only; sandbox
+            // runtimes get their per-agent kits from `awman ready` instead.
+            if self.engines.runtime.capabilities().kit_declarative {
+                frontend.write_message(UserMessage {
+                    level: MessageLevel::Info,
+                    text: format!(
+                        "exec prompt: {} runtime active — using the agent kit prepared by \
+                         `awman ready` (no image build needed)",
+                        self.engines.runtime.display_name()
+                    ),
+                });
+            } else {
+                frontend.write_message(UserMessage {
+                    level: MessageLevel::Info,
+                    text: "Checking agent availability…".into(),
+                });
+                if let Err(e) = ensure_exec_prompt_agent_setup(
+                    self.engines.agent_engine.as_ref(),
+                    &image_session,
+                    &agent,
+                    &mut frontend,
+                )
+                .await
+                {
+                    frontend.write_message(UserMessage {
+                        level: MessageLevel::Error,
+                        text: format!("exec prompt: agent setup failed: {e}"),
+                    });
+                    return Err(e);
+                }
+            }
+
+            frontend.write_message(UserMessage {
+                level: MessageLevel::Info,
+                text: "Resolving agent credentials…".into(),
+            });
+            let resolved_credentials = match self
+                .engines
+                .auth_engine
+                .resolve_agent_auth(&session, &agent)
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    frontend.write_message(UserMessage {
+                        level: MessageLevel::Error,
+                        text: format!("exec prompt: credential resolution failed: {e}"),
+                    });
+                    return Err(CommandError::from(e));
+                }
+            };
+            // File delivery is container-only; preserve sbx's existing env-only
+            // Claude credential path without touching its auth implementation.
+            let credentials = if self.engines.runtime.capabilities().kit_declarative
+                && matches!(
+                    resolved_credentials.delivery,
+                    crate::engine::auth::CredentialDelivery::File(_)
+                ) {
+                self.engines.auth_engine.agent_env_credentials(&agent)?
+            } else {
+                resolved_credentials
+            };
+
+            let (context_overlays, system_prompt) = LaunchPolicy::for_session(&session)
+                .with_git(&self.engines.git_engine)
+                .resolve_context_overlays(
+                    &collected.context_overlays,
+                    &agent,
+                    None,
+                    None,
+                    frontend.as_mut(),
+                )?;
+            let mut directory_overlays = collected.directories;
+            let system_prompt = match self
+                .output_dir
+                .as_ref()
+                .filter(|_| self.engines.runtime.capabilities().arbitrary_host_mounts)
+            {
+                Some(dir) => {
+                    directory_overlays.push(crate::data::fs::command_outputs::output_dir_overlay(dir));
+                    Some(crate::engine::context_prompt::with_outputs_section(
+                        system_prompt,
+                        crate::engine::context_prompt::OutputsPromptRole::Prompt,
+                    ))
+                }
+                None => system_prompt,
+            };
+
+            let mut run_opts = AgentRunOptions {
+                yolo: self.flags.yolo.then_some(YoloMode::Enabled),
+                auto: self.flags.auto.then_some(AutoMode::Enabled),
+                plan: self.flags.plan.then_some(PlanMode::Enabled),
+                allow_docker: self.flags.allow_docker,
+                non_interactive: self.flags.non_interactive,
+                structured_output: self.output_dir.is_some(),
+                model: self.flags.model.clone(),
+                agent_flags: self.flags.agent_flags.clone(),
+                // ACP sends its initial turn after the initialize/session-new
+                // handshake; stdio retains the existing seeded-launch behavior.
+                initial_prompt: (launch_decision != LaunchModeDecision::Acp)
+                    .then(|| final_prompt.clone()),
+                env_passthrough: if collected.env_passthrough.is_empty() {
+                    None
+                } else {
+                    Some(collected.env_passthrough)
+                },
+                directory_overlays,
+                include_all_skills: collected.include_all_skills,
+                named_skills: collected.named_skills,
+                system_prompt,
+                context_overlays,
+                launch_mode: match launch_decision {
+                    LaunchModeDecision::Acp => crate::data::config::repo::LaunchMode::Acp,
+                    _ => crate::data::config::repo::LaunchMode::Stdio,
+                },
+                ..Default::default()
+            };
+
+            if let Some(worktree) = &worktree {
+                if !self.engines.runtime.capabilities().arbitrary_host_mounts {
+                    return Err(CommandError::Other(
+                        "This runtime cannot mount the linked worktree's required Git directory".into(),
+                    ));
+                }
+                run_opts.image_tag_override = Some(crate::data::image_tags::agent_image_tag(
+                    &worktree.invoker_root, agent.as_str(),
+                ));
+                super::session_worktree::anchor_relative_overlays(
+                    &mut run_opts.directory_overlays,
+                    invoker.working_dir(),
+                )?;
+                if let Some(overlay) = worktree.git_directory_overlay(self.engines.git_engine.clone()).await? {
+                    run_opts.directory_overlays.push(overlay);
+                }
+            }
+
+            let resolved = match self.engines.agent_engine.resolve_agent_options(
                 &session,
                 &agent,
-                &mut frontend,
-            )
-            .await
-            {
-                frontend.write_message(UserMessage {
-                    level: MessageLevel::Error,
-                    text: format!("exec prompt: agent setup failed: {e}"),
-                });
-                return Err(e);
-            }
-        }
-
-        frontend.write_message(UserMessage {
-            level: MessageLevel::Info,
-            text: "Resolving agent credentials…".into(),
-        });
-        let resolved_credentials = match self
-            .engines
-            .auth_engine
-            .resolve_agent_auth(&session, &agent)
-        {
-            Ok(c) => c,
-            Err(e) => {
-                frontend.write_message(UserMessage {
-                    level: MessageLevel::Error,
-                    text: format!("exec prompt: credential resolution failed: {e}"),
-                });
-                return Err(CommandError::from(e));
-            }
-        };
-        // File delivery is container-only; preserve sbx's existing env-only
-        // Claude credential path without touching its auth implementation.
-        let credentials = if self.engines.runtime.capabilities().kit_declarative
-            && matches!(
-                resolved_credentials.delivery,
-                crate::engine::auth::CredentialDelivery::File(_)
+                &run_opts,
+                &credentials,
             ) {
-            self.engines.auth_engine.agent_env_credentials(&agent)?
-        } else {
-            resolved_credentials
-        };
-
-        let (context_overlays, system_prompt) = LaunchPolicy::for_session(&session)
-            .with_git(&self.engines.git_engine)
-            .resolve_context_overlays(
-                &collected.context_overlays,
-                &agent,
-                None,
-                None,
-                frontend.as_mut(),
-            )?;
-        let mut directory_overlays = collected.directories;
-        let system_prompt = match self
-            .output_dir
-            .as_ref()
-            .filter(|_| self.engines.runtime.capabilities().arbitrary_host_mounts)
-        {
-            Some(dir) => {
-                directory_overlays.push(crate::data::fs::command_outputs::output_dir_overlay(dir));
-                Some(crate::engine::context_prompt::with_outputs_section(
-                    system_prompt,
-                    crate::engine::context_prompt::OutputsPromptRole::Prompt,
-                ))
-            }
-            None => system_prompt,
-        };
-
-        let run_opts = AgentRunOptions {
-            yolo: self.flags.yolo.then_some(YoloMode::Enabled),
-            auto: self.flags.auto.then_some(AutoMode::Enabled),
-            plan: self.flags.plan.then_some(PlanMode::Enabled),
-            allow_docker: self.flags.allow_docker,
-            non_interactive: self.flags.non_interactive,
-            structured_output: self.output_dir.is_some(),
-            model: self.flags.model.clone(),
-            agent_flags: self.flags.agent_flags.clone(),
-            // ACP sends its initial turn after the initialize/session-new
-            // handshake; stdio retains the existing seeded-launch behavior.
-            initial_prompt: (launch_decision != LaunchModeDecision::Acp)
-                .then(|| final_prompt.clone()),
-            env_passthrough: if collected.env_passthrough.is_empty() {
-                None
-            } else {
-                Some(collected.env_passthrough)
-            },
-            directory_overlays,
-            include_all_skills: collected.include_all_skills,
-            named_skills: collected.named_skills,
-            system_prompt,
-            context_overlays,
-            launch_mode: match launch_decision {
-                LaunchModeDecision::Acp => crate::data::config::repo::LaunchMode::Acp,
-                _ => crate::data::config::repo::LaunchMode::Stdio,
-            },
-            ..Default::default()
-        };
-
-        let resolved = match self.engines.agent_engine.resolve_agent_options(
-            &session,
-            &agent,
-            &run_opts,
-            &credentials,
-        ) {
-            Ok(o) => o,
-            Err(e) => {
-                frontend.write_message(UserMessage {
-                    level: MessageLevel::Error,
-                    text: format!("exec prompt: failed to build agent options: {e}"),
-                });
-                return Err(CommandError::from(e));
-            }
-        };
-
-        let instance = match self.engines.runtime.build(resolved) {
-            Ok(i) => i,
-            Err(e) => {
-                frontend.write_message(UserMessage {
-                    level: MessageLevel::Error,
-                    text: format!("exec prompt: failed to build agent: {e}"),
-                });
-                return Err(CommandError::from(e));
-            }
-        };
-        frontend.write_message(UserMessage {
-            level: MessageLevel::Info,
-            text: format!("Launching agent ({})…", self.engines.runtime.display_name()),
-        });
-        let mut cancelled = false;
-        let exit = if launch_decision == LaunchModeDecision::Acp {
-            let (runtime_frontend, transport) = crate::engine::acp::AcpTransport::channel();
-            let execution = match instance.run_with_frontend(Box::new(runtime_frontend)) {
-                Ok(execution) => execution,
+                Ok(o) => o,
                 Err(e) => {
                     frontend.write_message(UserMessage {
                         level: MessageLevel::Error,
-                        text: format!("exec prompt: failed to launch ACP agent: {e}"),
+                        text: format!("exec prompt: failed to build agent options: {e}"),
                     });
                     return Err(CommandError::from(e));
                 }
             };
-            let acp_handle = execution.handle().clone();
-            let mut acp = crate::engine::acp::AcpSession::from_transport(
-                execution,
-                transport,
-                Box::new(crate::data::message::StderrMessageSink::new()),
-                // Layer 2 owns the flags, so Layer 2 turns them into the
-                // permission policy (F-46).
-                if matches!(run_opts.yolo, Some(YoloMode::Enabled))
-                    || matches!(run_opts.auto, Some(AutoMode::Enabled))
-                {
-                    crate::engine::acp::PermissionPolicy::AutoApprove
-                } else {
-                    crate::engine::acp::PermissionPolicy::Ask
-                },
-            );
-            // The handshake and every turn race an external cancel, as the
-            // stdio wait does.
-            let driven = tokio::select! {
-                biased;
-                _ = self.cancel.cancelled() => None,
-                driven = async {
-                    acp.initialize("/workspace").await?;
-                    // The seeded prompt is the first ACP turn, driven inside
-                    // the same loop as follow-ups so its `session/update`s are
-                    // rendered (the subscription is taken before the prompt is
-                    // sent) and any permission request during that turn is
-                    // serviced.
-                    Ok::<_, crate::engine::error::EngineError>(acp
-                        .drive_with_initial_prompt(frontend.as_mut(), Some(final_prompt))
-                        .await)
-                } => Some(driven),
-            };
-            match driven {
-                Some(Ok(exit)) => exit,
-                Some(Err(e)) => {
-                    // Reap the launched container before returning on a failed
-                    // handshake so it is not left running.
-                    let _ = acp.shutdown().await;
-                    return Err(CommandError::from(e));
-                }
-                None => {
-                    cancelled = true;
-                    frontend.write_message(UserMessage {
-                        level: MessageLevel::Warning,
-                        text: "exec prompt: cancelled; stopping the agent".to_string(),
-                    });
-                    // Stopped through the runtime like `agents kill`, then
-                    // reaped: the ACP client process alone is not the container.
-                    if let Err(e) = crate::command::commands::agents::kill::stop_and_remove_agent(
-                        self.engines.runtime.as_ref(),
-                        &acp_handle,
-                    ) {
-                        tracing::warn!(error = %e, "cancel: stopping the exec prompt agent failed");
-                    }
-                    acp.shutdown().await
-                }
-            }
-        } else {
-            frontend.set_pty_active(true);
-            let container_frontend = frontend.container_frontend_for_pty();
-            let mut execution = match instance.run_with_frontend(container_frontend) {
-                Ok(e) => e,
+
+            let instance = match self.engines.runtime.build(resolved) {
+                Ok(i) => i,
                 Err(e) => {
-                    frontend.set_pty_active(false);
-                    frontend.replay_queued();
                     frontend.write_message(UserMessage {
                         level: MessageLevel::Error,
-                        text: format!("exec prompt: agent launch failed: {e}"),
+                        text: format!("exec prompt: failed to build agent: {e}"),
                     });
                     return Err(CommandError::from(e));
                 }
             };
-            frontend.set_stuck_sender(execution.stuck_sender());
-            // Raced against an external cancel, the way a workflow step's
-            // wait is: the execution moves into a wait task, and a cancel
-            // kills it and stops it through the runtime like `agents kill`.
-            let handle = execution.handle().clone();
-            let cancel_handle = execution.cancel_handle();
-            let (wait_tx, mut wait_rx) = tokio::sync::oneshot::channel();
-            tokio::spawn(async move {
-                let _ = wait_tx.send(execution.wait().await);
+            frontend.write_message(UserMessage {
+                level: MessageLevel::Info,
+                text: format!("Launching agent ({})…", self.engines.runtime.display_name()),
             });
-            let dropped = || {
-                Err(crate::engine::error::EngineError::Other(
-                    "exec prompt wait task dropped unexpectedly".into(),
-                ))
-            };
-            let exit = tokio::select! {
-                biased;
-                result = &mut wait_rx => result.unwrap_or_else(|_| dropped()),
-                _ = self.cancel.cancelled() => {
-                    cancelled = true;
-                    frontend.write_message(UserMessage {
-                        level: MessageLevel::Warning,
-                        text: "exec prompt: cancelled; stopping the agent".to_string(),
-                    });
-                    if let Some(ch) = &cancel_handle {
-                        let _ = ch.cancel();
+            let mut cancelled = false;
+            let exit = if launch_decision == LaunchModeDecision::Acp {
+                let (runtime_frontend, transport) = crate::engine::acp::AcpTransport::channel();
+                let execution = match instance.run_with_frontend(Box::new(runtime_frontend)) {
+                    Ok(execution) => execution,
+                    Err(e) => {
+                        frontend.write_message(UserMessage {
+                            level: MessageLevel::Error,
+                            text: format!("exec prompt: failed to launch ACP agent: {e}"),
+                        });
+                        return Err(CommandError::from(e));
                     }
-                    if let Err(e) = crate::command::commands::agents::kill::stop_and_remove_agent(
-                        self.engines.runtime.as_ref(),
-                        &handle,
-                    ) {
-                        tracing::warn!(error = %e, "cancel: stopping the exec prompt agent failed");
+                };
+                let acp_handle = execution.handle().clone();
+                let mut acp = crate::engine::acp::AcpSession::from_transport(
+                    execution,
+                    transport,
+                    Box::new(crate::data::message::StderrMessageSink::new()),
+                    // Layer 2 owns the flags, so Layer 2 turns them into the
+                    // permission policy (F-46).
+                    if matches!(run_opts.yolo, Some(YoloMode::Enabled))
+                        || matches!(run_opts.auto, Some(AutoMode::Enabled))
+                    {
+                        crate::engine::acp::PermissionPolicy::AutoApprove
+                    } else {
+                        crate::engine::acp::PermissionPolicy::Ask
+                    },
+                );
+                // The handshake and every turn race an external cancel, as the
+                // stdio wait does.
+                let driven = tokio::select! {
+                    biased;
+                    _ = self.cancel.cancelled() => None,
+                    driven = async {
+                        acp.initialize("/workspace").await?;
+                        // The seeded prompt is the first ACP turn, driven inside
+                        // the same loop as follow-ups so its `session/update`s are
+                        // rendered (the subscription is taken before the prompt is
+                        // sent) and any permission request during that turn is
+                        // serviced.
+                        Ok::<_, crate::engine::error::EngineError>(acp
+                            .drive_with_initial_prompt(frontend.as_mut(), Some(final_prompt))
+                            .await)
+                    } => Some(driven),
+                };
+                match driven {
+                    Some(Ok(exit)) => exit,
+                    Some(Err(e)) => {
+                        // Reap the launched container before returning on a failed
+                        // handshake so it is not left running.
+                        let _ = acp.shutdown().await;
+                        return Err(CommandError::from(e));
                     }
-                    (&mut wait_rx).await.unwrap_or_else(|_| dropped())
+                    None => {
+                        cancelled = true;
+                        frontend.write_message(UserMessage {
+                            level: MessageLevel::Warning,
+                            text: "exec prompt: cancelled; stopping the agent".to_string(),
+                        });
+                        // Stopped through the runtime like `agents kill`, then
+                        // reaped: the ACP client process alone is not the container.
+                        if let Err(e) = crate::command::commands::agents::kill::stop_and_remove_agent(
+                            self.engines.runtime.as_ref(),
+                            &acp_handle,
+                        ) {
+                            tracing::warn!(error = %e, "cancel: stopping the exec prompt agent failed");
+                        }
+                        acp.shutdown().await
+                    }
                 }
+            } else {
+                frontend.set_pty_active(true);
+                let container_frontend = frontend.container_frontend_for_pty();
+                let mut execution = match instance.run_with_frontend(container_frontend) {
+                    Ok(e) => e,
+                    Err(e) => {
+                        frontend.set_pty_active(false);
+                        frontend.replay_queued();
+                        frontend.write_message(UserMessage {
+                            level: MessageLevel::Error,
+                            text: format!("exec prompt: agent launch failed: {e}"),
+                        });
+                        return Err(CommandError::from(e));
+                    }
+                };
+                frontend.set_stuck_sender(execution.stuck_sender());
+                // Raced against an external cancel, the way a workflow step's
+                // wait is: the execution moves into a wait task, and a cancel
+                // kills it and stops it through the runtime like `agents kill`.
+                let handle = execution.handle().clone();
+                let cancel_handle = execution.cancel_handle();
+                let (wait_tx, mut wait_rx) = tokio::sync::oneshot::channel();
+                tokio::spawn(async move {
+                    let _ = wait_tx.send(execution.wait().await);
+                });
+                let dropped = || {
+                    Err(crate::engine::error::EngineError::Other(
+                        "exec prompt wait task dropped unexpectedly".into(),
+                    ))
+                };
+                let exit = tokio::select! {
+                    biased;
+                    result = &mut wait_rx => result.unwrap_or_else(|_| dropped()),
+                    _ = self.cancel.cancelled() => {
+                        cancelled = true;
+                        frontend.write_message(UserMessage {
+                            level: MessageLevel::Warning,
+                            text: "exec prompt: cancelled; stopping the agent".to_string(),
+                        });
+                        if let Some(ch) = &cancel_handle {
+                            let _ = ch.cancel();
+                        }
+                        if let Err(e) = crate::command::commands::agents::kill::stop_and_remove_agent(
+                            self.engines.runtime.as_ref(),
+                            &handle,
+                        ) {
+                            tracing::warn!(error = %e, "cancel: stopping the exec prompt agent failed");
+                        }
+                        (&mut wait_rx).await.unwrap_or_else(|_| dropped())
+                    }
+                };
+                frontend.set_pty_active(false);
+                frontend.replay_queued();
+                exit
             };
-            frontend.set_pty_active(false);
-            frontend.replay_queued();
-            exit
-        };
 
-        crate::command::commands::LaunchPolicy::report_session_end(
-            frontend.as_mut(),
-            "exec prompt",
-            &exit,
-        );
+            crate::command::commands::LaunchPolicy::report_session_end(
+                frontend.as_mut(),
+                "exec prompt",
+                &exit,
+            );
 
-        let exit_code = if cancelled {
-            Some(crate::data::command_status::CANCELLED_EXIT_CODE)
-        } else {
-            exit.map(|e| e.exit_code).ok()
-        };
-        Ok(ExecPromptOutcome {
-            agent: Some(agent.as_str().to_string()),
-            exit_code,
-        })
+            let exit_code = if cancelled {
+                Some(crate::data::command_status::CANCELLED_EXIT_CODE)
+            } else {
+                exit.map(|e| e.exit_code).ok()
+            };
+            Ok(ExecPromptOutcome {
+                agent: Some(agent.as_str().to_string()),
+                exit_code,
+            })
+        }
+        .await;
+        if let Some(worktree) = &worktree {
+            report_kept_session_worktree(worktree, frontend.as_mut());
+        }
+        outcome
     }
 }
 

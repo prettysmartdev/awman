@@ -607,6 +607,7 @@ mod exec;
 mod new;
 mod remote;
 mod shared_flags;
+pub use shared_flags::SessionWorktreeTarget;
 mod squad;
 
 #[cfg(test)]

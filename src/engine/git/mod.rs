@@ -19,9 +19,12 @@ use crate::engine::error::{EngineError, MergeFailedDetail};
 mod command_result;
 pub mod frontend;
 mod host_command;
+pub mod pull_request;
 pub mod remote_push;
+mod session_worktree;
 
 pub use frontend::{GitCommand, GitFrontend};
+pub use session_worktree::{FetchLocalOutcome, WorktreeEntry, WorktreeUpdate};
 
 fn path_from_git_bytes(bytes: &[u8]) -> PathBuf {
     #[cfg(unix)]
@@ -626,9 +629,10 @@ impl GitEngine {
         }
     }
 
-    /// Paths of every worktree of `git_root` (including the main checkout),
-    /// parsed from the `worktree <path>` lines of
-    /// `git worktree list --porcelain`.
+    /// Paths of every worktree of `git_root` (including the main checkout,
+    /// always first), parsed from `git worktree list --porcelain -z`. Stale
+    /// (`prunable`) registrations are left out; see
+    /// [`Self::list_worktree_entries`] for the full records.
     pub fn list_worktrees(&self, git_root: &Path) -> Result<Vec<PathBuf>, EngineError> {
         let output = host_command::command(git_root)
             .args(["worktree", "list", "--porcelain", "-z"])
@@ -642,31 +646,11 @@ impl GitEngine {
                 stderr.trim()
             )));
         }
-        let mut paths = Vec::new();
-        let mut path = None;
-        let mut prunable = false;
-        for field in output.stdout.split(|byte| *byte == 0) {
-            if field.is_empty() {
-                if !prunable {
-                    paths.extend(path.take());
-                }
-                path = None;
-                prunable = false;
-            } else if let Some(bytes) = field.strip_prefix(b"worktree ") {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::ffi::OsStrExt;
-                    path = Some(PathBuf::from(std::ffi::OsStr::from_bytes(bytes)));
-                }
-                #[cfg(not(unix))]
-                {
-                    path = Some(PathBuf::from(String::from_utf8_lossy(bytes).as_ref()));
-                }
-            } else if field.starts_with(b"prunable") {
-                prunable = true;
-            }
-        }
-        Ok(paths)
+        Ok(session_worktree::parse_worktree_entries(&output.stdout)
+            .into_iter()
+            .filter(|entry| !entry.prunable)
+            .map(|entry| entry.path)
+            .collect())
     }
 
     /// Validate both sides of a linked-worktree registration. A stale list

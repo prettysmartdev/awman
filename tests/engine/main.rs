@@ -21,6 +21,7 @@ mod issue_integration;
 mod overlay_engine;
 mod process_env;
 mod sbx;
+mod session_worktree;
 mod stuck_event_wiring;
 mod workflow_end_to_end;
 mod workflow_on_failure;

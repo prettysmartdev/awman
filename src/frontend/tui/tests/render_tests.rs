@@ -2541,3 +2541,48 @@ fn trust_review_and_custom_dialogs_survive_narrow_and_tiny_terminals() {
         render_app(&mut app, w, h);
     }
 }
+
+/// `chat` / `exec prompt` report the selected session worktree through their
+/// frontend traits; the command box then shows that path instead of the CWD,
+/// and a new command clears it again.
+#[test]
+fn command_box_shows_the_worktree_path_after_report_session_worktree() {
+    use crate::command::commands::chat::ChatCommandFrontend;
+    use crate::command::commands::exec_prompt::ExecPromptCommandFrontend;
+
+    let mut app = make_app();
+    let before = bottom_row(&render_app(&mut app, 160, 24));
+    assert!(!before.contains("/worktrees/chat-session"), "{before}");
+
+    let (mut frontend, _dialogs, _responses) = {
+        let (frontend, req_rx, resp_tx) = test_command_frontend(
+            &["chat"],
+            crate::command::dispatch::projections::raw_args::ParsedArgs::default(),
+        );
+        (frontend, req_rx, resp_tx)
+    };
+    // Rebind the frontend to the active tab's shared presentation state, as
+    // the app does when it launches a command in that tab.
+    frontend.workflow = app.active_tab().shared.workflow.clone();
+
+    ChatCommandFrontend::report_session_worktree(
+        &mut frontend,
+        std::path::Path::new("/worktrees/chat-session"),
+        Some("feature/x"),
+    );
+    let row = bottom_row(&render_app(&mut app, 160, 24));
+    assert!(row.contains("Worktree: /worktrees/chat-session"), "{row}");
+
+    ExecPromptCommandFrontend::report_session_worktree(
+        &mut frontend,
+        std::path::Path::new("/worktrees/prompt-session"),
+        None,
+    );
+    let row = bottom_row(&render_app(&mut app, 160, 24));
+    assert!(row.contains("Worktree: /worktrees/prompt-session"), "{row}");
+    assert!(!row.contains("chat-session"), "{row}");
+
+    app.active_tab().shared.workflow.set_worktree_path(None);
+    let row = bottom_row(&render_app(&mut app, 160, 24));
+    assert!(!row.contains("prompt-session"), "{row}");
+}

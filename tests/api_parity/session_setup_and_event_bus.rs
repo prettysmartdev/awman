@@ -1464,7 +1464,7 @@ fn remote_exec_prompt_flags_parity_with_local() {
     let cat = CommandCatalogue::get();
     let local = cat.lookup(&["exec", "prompt"]).unwrap();
     let remote = cat.lookup(&["remote", "exec", "prompt"]).unwrap();
-    let excluded: &[&str] = &["workdir", "worktree"];
+    let excluded: &[&str] = &["workdir", "worktree", "branch", "pr"];
     for flag in local.flags {
         if excluded.contains(&flag.long) {
             continue;

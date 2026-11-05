@@ -978,8 +978,7 @@ fn every_exec_workflow_override_replaces_a_base_flag() {
     }
 }
 
-/// `exec prompt` is the base set plus `--issue`, in that order — what the
-/// literal spelled out before it was derived.
+/// `exec prompt` is the base set plus `--issue` and session-worktree flags.
 #[test]
 fn exec_prompt_flags_are_the_base_set_plus_issue() {
     let names: Vec<&str> = super::shared_flags::EXEC_PROMPT_FLAGS
@@ -991,7 +990,40 @@ fn exec_prompt_flags_are_the_base_set_plus_issue() {
         .map(|f| f.long)
         .collect();
     assert_eq!(&names[..base.len()], &base[..]);
-    assert_eq!(&names[base.len()..], &["issue"]);
+    assert_eq!(&names[base.len()..], &["issue", "branch", "pr", "worktree"]);
+}
+
+#[test]
+fn session_worktree_flags_are_local_and_pairwise_conflicting() {
+    let cat = CommandCatalogue::get();
+    let worktree_names = ["branch", "pr", "worktree"];
+    for path in [&["chat"][..], &["exec", "prompt"][..]] {
+        let command = cat.lookup(path).unwrap();
+        for name in worktree_names {
+            let flag = command.find_flag(name).unwrap();
+            assert!(matches!(flag.kind, FlagKind::OptionalString));
+            assert_eq!(flag.frontends, FrontendVisibility::CliAndTui);
+            for other in worktree_names {
+                if name != other {
+                    assert!(
+                        flag.conflicts_with(other),
+                        "{name} must conflict with {other}"
+                    );
+                }
+            }
+        }
+    }
+    let workflow = cat.lookup(&["exec", "workflow"]).unwrap();
+    assert!(matches!(
+        workflow.find_flag("worktree").unwrap().kind,
+        FlagKind::Bool
+    ));
+    assert!(workflow.find_flag("branch").is_none());
+    assert!(workflow.find_flag("pr").is_none());
+    let remote_prompt = cat.lookup(&["remote", "exec", "prompt"]).unwrap();
+    for name in worktree_names {
+        assert!(remote_prompt.find_flag(name).is_none());
+    }
 }
 
 /// `exec workflow`'s order is the one `--help` and the generated command
@@ -1192,4 +1224,196 @@ fn committed_command_reference_documents_new_agent() {
     assert!(reference.contains("awman new agent"));
     assert!(reference.contains("--from"));
     assert!(reference.contains("awman ready"));
+}
+
+// ── session worktree selectors (WI 0153) ─────────────────────────────────
+
+fn argv(parts: &[&str]) -> Vec<String> {
+    parts.iter().map(|s| s.to_string()).collect()
+}
+
+/// The selectors are available to the local frontends and refused by every
+/// remote profile — including a `POST /v1/worker/commands` style `exec prompt`
+/// request, which is parsed by the same profile parser the push routes will
+/// use once they exist.
+#[test]
+fn session_worktree_selectors_are_refused_for_every_remote_profile() {
+    let cat = CommandCatalogue::get();
+    for path in [&["chat"][..], &["exec", "prompt"][..]] {
+        for selector in ["--branch", "--pr", "--worktree"] {
+            let mut args = argv(&[selector, "value"]);
+            if path.len() == 2 {
+                args.push("prompt text".into());
+            }
+            for local in [FrontendKind::Cli, FrontendKind::Tui] {
+                let parsed = cat
+                    .parse_raw_args_with_profile(path, &args, local)
+                    .unwrap_or_else(|e| panic!("{path:?} {selector} on {local:?}: {e}"));
+                assert_eq!(parsed.flag_string(&selector[2..]).as_deref(), Some("value"));
+            }
+            for remote in [FrontendKind::Api, FrontendKind::SquadDaemon] {
+                let error = cat
+                    .parse_raw_args_with_profile(path, &args, remote)
+                    .expect_err(&format!(
+                        "{path:?} {selector} must be refused on {remote:?}"
+                    ))
+                    .to_string();
+                assert!(error.contains(&selector[2..]), "{error}");
+            }
+        }
+    }
+}
+
+#[test]
+fn worker_style_exec_prompt_request_with_selectors_is_refused() {
+    let cat = CommandCatalogue::get();
+    let request = argv(&["--pr", "42", "review", "this"]);
+    assert!(cat
+        .parse_raw_args_with_profile(&["exec", "prompt"], &request, FrontendKind::Api)
+        .is_err());
+    // The same prompt without the selector parses, so the refusal is the flag.
+    let plain = argv(&["review", "this"]);
+    let parsed = cat
+        .parse_raw_args_with_profile(&["exec", "prompt"], &plain, FrontendKind::Api)
+        .unwrap();
+    assert_eq!(parsed.argument("prompt").as_deref(), Some("review this"));
+    assert_eq!(parsed.flag_string("pr"), None);
+}
+
+#[test]
+fn session_worktree_selectors_conflict_when_parsed_together() {
+    let cat = CommandCatalogue::get();
+    for path in [&["chat"][..], &["exec", "prompt"][..]] {
+        for (a, b) in [
+            ("--branch", "--pr"),
+            ("--branch", "--worktree"),
+            ("--pr", "--worktree"),
+        ] {
+            let args = argv(&[a, "x", b, "y"]);
+            let outcome = cat.parse_raw_args_with_profile(path, &args, FrontendKind::Cli);
+            assert!(outcome.is_err(), "{path:?} {a} + {b} must conflict");
+        }
+    }
+}
+
+/// `--yolo` and `--auto` must not select, imply or default a session target.
+#[test]
+fn yolo_and_auto_stay_inert_for_session_worktree_selectors() {
+    let cat = CommandCatalogue::get();
+    for path in [&["chat"][..], &["exec", "prompt"][..]] {
+        let command = cat.lookup(path).unwrap();
+        for mode in ["yolo", "auto"] {
+            let flag = command.find_flag(mode).unwrap();
+            for selector in ["branch", "pr", "worktree"] {
+                assert!(
+                    !flag.implies.contains(&selector),
+                    "--{mode} must not imply --{selector} on {path:?}"
+                );
+            }
+        }
+        for mode in ["--yolo", "--auto"] {
+            let parsed = cat
+                .parse_raw_args_with_profile(path, &argv(&[mode]), FrontendKind::Cli)
+                .unwrap();
+            for selector in ["branch", "pr", "worktree"] {
+                assert_eq!(
+                    parsed.flag_string(selector),
+                    None,
+                    "{mode} set --{selector}"
+                );
+            }
+        }
+    }
+    // Only the workflow command keeps the boolean `--worktree` implication.
+    let workflow = cat.lookup(&["exec", "workflow"]).unwrap();
+    assert!(workflow
+        .find_flag("yolo")
+        .unwrap()
+        .implies
+        .contains(&"worktree"));
+}
+
+#[test]
+fn exec_workflow_worktree_is_still_boolean_and_has_no_branch_or_pr() {
+    let cat = CommandCatalogue::get();
+    let workflow = cat.lookup(&["exec", "workflow"]).unwrap();
+    assert!(matches!(
+        workflow.find_flag("worktree").unwrap().kind,
+        FlagKind::Bool
+    ));
+    assert!(workflow.find_flag("branch").is_none());
+    assert!(workflow.find_flag("pr").is_none());
+    let parsed = cat
+        .parse_raw_args_with_profile(
+            &["exec", "workflow"],
+            &argv(&["--worktree", "wf.toml"]),
+            FrontendKind::Cli,
+        )
+        .unwrap();
+    assert_eq!(parsed.flag_bool("worktree"), Some(true));
+    assert_eq!(parsed.argument("workflow").as_deref(), Some("wf.toml"));
+}
+
+#[test]
+fn remote_exec_prompt_has_none_of_the_session_worktree_flags() {
+    let cat = CommandCatalogue::get();
+    let remote = cat.lookup(&["remote", "exec", "prompt"]).unwrap();
+    for name in ["branch", "pr", "worktree"] {
+        assert!(remote.find_flag(name).is_none(), "--{name}");
+    }
+    for selector in ["--branch", "--pr", "--worktree"] {
+        assert!(cat
+            .parse_raw_args_with_profile(
+                &["remote", "exec", "prompt"],
+                &argv(&[selector, "x", "p"]),
+                FrontendKind::Cli
+            )
+            .is_err());
+    }
+}
+
+#[test]
+fn selectors_before_the_prompt_are_parsed_and_after_it_are_refused() {
+    use crate::command::commands::exec_prompt::refuse_selector_in_prompt;
+    let cat = CommandCatalogue::get();
+    for frontend in [FrontendKind::Cli, FrontendKind::Tui] {
+        // The documented order selects the worktree.
+        let parsed = cat
+            .parse_raw_args_with_profile(
+                &["exec", "prompt"],
+                &argv(&["--pr", "482", "Fix the failing test"]),
+                frontend,
+            )
+            .unwrap();
+        assert_eq!(parsed.flag_string("pr").as_deref(), Some("482"));
+        let tokens = parsed.arguments("prompt");
+        assert!(refuse_selector_in_prompt(&tokens, &["exec", "prompt"]).is_ok());
+
+        // After the prompt the greedy argument swallows the selector; the
+        // input adapter must refuse it instead of launching in place.
+        for selector in ["--branch", "--pr", "--worktree"] {
+            let inline = format!("{selector}=x");
+            for spelling in [vec![selector, "x"], vec![inline.as_str()]] {
+                let mut args = vec!["Fix the failing test"];
+                args.extend(spelling);
+                let parsed = cat
+                    .parse_raw_args_with_profile(&["exec", "prompt"], &argv(&args), frontend)
+                    .unwrap();
+                assert_eq!(parsed.flag_string(&selector[2..]), None);
+                let error =
+                    refuse_selector_in_prompt(&parsed.arguments("prompt"), &["exec", "prompt"])
+                        .unwrap_err()
+                        .to_string();
+                assert!(error.contains("after the prompt"), "{args:?}: {error}");
+            }
+        }
+    }
+    // Prompt text that merely mentions a selector, quoted as one argument,
+    // stays a prompt.
+    assert!(refuse_selector_in_prompt(
+        &["explain what --pr does".to_string()],
+        &["exec", "prompt"]
+    )
+    .is_ok());
+    assert!(refuse_selector_in_prompt(&["--yolo".to_string()], &["exec", "prompt"]).is_ok());
 }

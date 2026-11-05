@@ -944,3 +944,142 @@ fn parse_args_forces_non_interactive_and_yolo() {
         "yolo must be forced true in API mode"
     );
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+//  Part 4 — session worktree selectors are CLI/TUI-only
+//
+//  `--branch`, `--pr` and `--worktree` choose a host path to mount, an
+//  authority only a local frontend holds. The HTTP admission step must refuse
+//  them before any session lookup or queueing, even though the API profile
+//  forces `--yolo`.
+// ════════════════════════════════════════════════════════════════════════════
+
+const SESSION_WORKTREE_SELECTORS: [&str; 3] = ["--branch", "--pr", "--worktree"];
+
+/// PINS: every selector is refused with 400 and the flag-availability error on
+/// `POST /v1/commands`, for a session that *would* accept the command.
+#[tokio::test]
+async fn real_network_session_worktree_selectors_are_refused_on_commands_route() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = make_app_state(tmp.path());
+    let Some((addr, server)) = spawn_router(Arc::clone(&state)).await else {
+        eprintln!("SKIP: cannot bind 127.0.0.1");
+        return;
+    };
+    insert_ready_session(&state.store, "ready-sess", "/work");
+
+    for selector in SESSION_WORKTREE_SELECTORS {
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/commands"))
+            .header("x-awman-session", "ready-sess")
+            .json(&serde_json::json!({
+                "subcommand": "exec prompt",
+                "args": [selector, "example", "do the thing"]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 400, "{selector} must be refused");
+        let body = resp.text().await.unwrap();
+        // TEXT-ASSERTION (relaxable).
+        assert!(
+            body.contains("not available via the api frontend"),
+            "{selector}: {body}"
+        );
+        assert!(
+            !body.contains("command_id"),
+            "{selector} was queued: {body}"
+        );
+    }
+
+    // The same session still accepts the command without a selector.
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/commands"))
+        .header("x-awman-session", "ready-sess")
+        .json(&serde_json::json!({ "subcommand": "exec prompt", "args": ["hi"] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 202);
+
+    server.abort();
+}
+
+/// PINS: every selector is refused with 400 on `POST /v1/runs` too.
+#[tokio::test]
+async fn real_network_session_worktree_selectors_are_refused_on_runs_route() {
+    let tmp = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+    let state = make_app_state_with_workdirs(tmp.path(), vec![work.clone()]);
+    let Some((addr, server)) = spawn_router(state).await else {
+        eprintln!("SKIP: cannot bind 127.0.0.1");
+        return;
+    };
+
+    for selector in SESSION_WORKTREE_SELECTORS {
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/runs"))
+            .json(&serde_json::json!({
+                "session": { "session_type": "local", "workdir": work },
+                "command": { "subcommand": "exec prompt", "args": [selector, "example", "text"] }
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 400, "{selector} must be refused");
+        let body = resp.text().await.unwrap();
+        // TEXT-ASSERTION (relaxable).
+        assert!(
+            body.contains("not available via the api frontend"),
+            "{selector}: {body}"
+        );
+    }
+
+    server.abort();
+}
+
+/// PINS: the worker push routes do not exist yet. A request carrying a
+/// selector is a 404, which is **not** the admission proof (the two real
+/// routes above are); the worker routes must inherit the same refusal when
+/// they are added.
+#[tokio::test]
+async fn real_network_worker_push_routes_are_absent_and_never_accept_selectors() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = make_app_state(tmp.path());
+    let Some((addr, server)) = spawn_router(state).await else {
+        eprintln!("SKIP: cannot bind 127.0.0.1");
+        return;
+    };
+
+    for selector in SESSION_WORKTREE_SELECTORS {
+        for route in ["/v1/worker/commands", "/v1/worker/runs"] {
+            let resp = reqwest::Client::new()
+                .post(format!("http://{addr}{route}"))
+                .json(&serde_json::json!({
+                    "session_id": "probe",
+                    "subcommand": "exec prompt",
+                    "args": [selector, "example", "text"]
+                }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status().as_u16(), 404, "{route} {selector}");
+        }
+    }
+
+    server.abort();
+}
+
+/// PINS: the API profile's forced yolo/non-interactive defaults stay inert:
+/// they neither add a selector nor make one acceptable.
+#[test]
+fn parse_args_forced_defaults_never_supply_session_worktree_flags() {
+    let f = make_frontend("exec prompt", &["hi"]);
+    for name in ["branch", "pr", "worktree"] {
+        assert_eq!(
+            f.flag_string(&["exec", "prompt"], name).unwrap(),
+            None,
+            "--{name} must not be supplied by the profile"
+        );
+    }
+}

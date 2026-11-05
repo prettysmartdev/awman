@@ -51,7 +51,7 @@ Every runtime command awman runs is printed before it executes; see [Command tra
 
 ## Worktree isolation
 
-The `--worktree` flag runs agent sessions in an isolated Git worktree rather than your main working directory. The agent's changes land on a separate branch, completely isolated from your current work until you decide what to do with them.
+The `--worktree` flag on `exec workflow` runs agent sessions in an isolated Git worktree rather than your main working directory. `chat` and `exec prompt` can use worktrees too; see [Session worktrees](#session-worktrees). The agent's changes land on a separate branch, completely isolated from your current work until you decide what to do with them.
 
 ```sh
 awman exec workflow path/to/workflow.toml --worktree
@@ -84,6 +84,16 @@ When a worktree run completes or is aborted, the worktree is kept on disk and aw
 An aborted run is never deleted automatically. If the merge fails, the worktree is kept and awman can launch a merge-fix agent. An interrupted run's worktree can be resumed or recreated (recreate deletes the branch and its commits). Dirty merge targets, merge failures and existing worktrees each have a flag to answer up front; see [Worktrees](05-workflows.md#worktrees) and [Worktree merge-back](05-workflows.md#worktree-merge-back).
 
 A `checkout_create_branch` setup step is skipped with a warning in a worktree run, since the run already has its own branch.
+
+### Session worktrees
+
+`chat` and `exec prompt` can also run in a worktree with `--branch`, `--pr` or `--worktree <name|path>` (see [Agent Sessions](03-agent-sessions.md#--branch---pr-and---worktree)). The agent's changes land in a linked worktree of your repository under `~/.awman/worktrees/`, not in your checkout. Unlike a workflow worktree, awman keeps it afterwards: there is no merge or discard prompt, and you remove it yourself with `git worktree remove`.
+
+- **What is mounted.** The container gets the worktree plus the repository's main `.git` directory, because a linked worktree stores its history there. Nothing else from your checkout is mounted, and never a parent directory. A checkout that isn't a real linked worktree of this repository (for example a path you point `--worktree` at that belongs to another repository) is refused.
+- **Your checkout's configuration applies.** Repo config, trust decisions for custom agents, network policy narrowing and overlays all come from the checkout you ran the command in, in full. The config inside the worktree is never read, so a branch or pull request cannot change how its own session is launched.
+- **Local only.** These flags are accepted on the CLI and in the TUI. The HTTP API, including remote and worker routes, rejects them, so a remote caller cannot choose a host directory to mount.
+- **Remote access from the host.** To check and fetch a branch or pull request, awman runs `git ls-remote` and `git fetch` on the host against your repository. Because an agent can write your repository's `.git/config`, awman refuses to contact the remote when that repository-level (local or worktree) config sets a program or credential source for transport: `core.sshCommand`, `core.gitProxy`, `core.askPass`, a `credential.helper`, `remote.<name>.vcs`, `uploadpack`, `receivepack` or `proxy`, or an `http` proxy, TLS certificate/key/CA, `sslVerify`, cookie file or resolve override. The error names the key; remove it, or move it to your global Git config, which awman trusts. SSH runs in batch mode so it can never prompt, and each network call is limited to five minutes.
+- **Git content drivers.** Host-side Git never runs LFS or other configured filters, so files stored with Git LFS or a similar filter may be checked out as pointer files in a new worktree. Fetch the real content yourself (for example `git lfs pull` inside the worktree) before starting the session.
 
 ### Host-side Git
 

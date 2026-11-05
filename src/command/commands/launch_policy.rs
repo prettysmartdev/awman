@@ -881,6 +881,7 @@ mod cross_entrypoint_tests {
         errors.push(
             ChatCommand::new(
                 ChatCommandFlags {
+                    session_worktree: None,
                     non_interactive: case.non_interactive,
                     plan: case.plan,
                     allow_docker: false,
@@ -904,6 +905,7 @@ mod cross_entrypoint_tests {
         errors.push(
             ExecPromptCommand::new(
                 ExecPromptCommandFlags {
+                    session_worktree: None,
                     prompt: Some("seeded test prompt".into()),
                     non_interactive: case.non_interactive,
                     plan: case.plan,

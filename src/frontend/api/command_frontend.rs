@@ -1959,11 +1959,10 @@ mod tests {
 
     #[test]
     fn flag_bool_presence_sets_true() {
-        // Bools are `SetTrue` (clap parity): presence implies true; no value
-        // token is consumed. `--background` is a real flag on `api start`.
-        let f = make_frontend("api start", &["--background"]);
+        // Workflow's boolean worktree flag remains available via the API.
+        let f = make_frontend("exec workflow", &["--worktree"]);
         assert_eq!(
-            f.flag_bool(&["api", "start"], "background").unwrap(),
+            f.flag_bool(&["exec", "workflow"], "worktree").unwrap(),
             Some(true)
         );
     }
@@ -1982,6 +1981,11 @@ mod tests {
     #[test]
     fn shared_cases_read_the_same_through_the_api_profile() {
         for case in CASES {
+            // CLI-only flags on commands unavailable via API are exercised
+            // through the CLI/TUI versions of this shared table.
+            if !CommandCatalogue::get().is_allowed_for_frontend(FrontendKind::Api, case.path) {
+                continue;
+            }
             let f = make_frontend(&case.path.join(" "), case.args);
             assert_eq!(f.command_path, case.canonical.join(" "), "{}", case.name);
             assert_reads(&f, case, case.reads);
@@ -2053,9 +2057,12 @@ mod tests {
     // ─── flag_u16 ─────────────────────────────────────────────────────────────
 
     #[test]
-    fn flag_u16_parses_port_value() {
+    fn cli_only_port_flag_is_refused_by_api_profile() {
         let f = make_frontend("api start", &["--port", "9876"]);
-        assert_eq!(f.flag_u16(&["api", "start"], "port").unwrap(), Some(9876));
+        assert!(matches!(
+            f.flag_u16(&["api", "start"], "port").unwrap_err(),
+            CommandError::InvalidFlagValue { flag, .. } if flag == "port"
+        ));
     }
 
     // ─── argument (positional) ────────────────────────────────────────────────
@@ -2097,8 +2104,8 @@ mod tests {
 
     #[test]
     fn flag_strings_collects_multiple_values() {
-        let f = make_frontend("api start", &["--workdirs", "/a", "--workdirs", "/b"]);
-        let dirs = f.flag_strings(&["api", "start"], "workdirs").unwrap();
+        let f = make_frontend("exec prompt", &["--overlay", "/a", "--overlay", "/b"]);
+        let dirs = f.flag_strings(&["exec", "prompt"], "overlay").unwrap();
         assert!(dirs.contains(&"/a".to_string()));
         assert!(dirs.contains(&"/b".to_string()));
     }

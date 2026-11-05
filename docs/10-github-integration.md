@@ -1,6 +1,6 @@
 # GitHub Integration
 
-The `--issue` flag runs awman commands directly against a GitHub issue, without creating a local work item file first:
+The `--issue` flag runs awman commands directly against a GitHub issue, without creating a local work item file first: A separate `--pr` flag on `chat` and `exec prompt` opens a pull request in a worktree; see [Pull requests for `--pr`](#pull-requests-for---pr).
 
 | Command | What the issue becomes |
 |---|---|
@@ -113,6 +113,34 @@ Review this for security issues
 ```
 
 No files are created.
+
+---
+
+## Pull requests for `--pr`
+
+`awman chat --pr <ref>` and `awman exec prompt --pr <ref>` run the session in a worktree for a GitHub pull request. See [Agent Sessions](03-agent-sessions.md#--branch---pr-and---worktree) for the worktree behavior.
+
+### Accepted formats
+
+| Form | Example |
+|---|---|
+| PR number | `--pr 482` |
+| github.com URL | `--pr https://github.com/acme/widgets/pull/482` |
+| `owner/repo#N` | `--pr acme/widgets#482` |
+
+A bare number uses your `origin` remote, which must be on github.com. For the other two forms, the pull request's repository must match one of your repository's configured remotes (`origin` is preferred if several match); a pull request from an unrelated repository is refused. Only `https://github.com/` pull request URLs are accepted: issue URLs, `http://`, other hosts, and URLs with queries or fragments are rejected.
+
+### How the pull request is looked up
+
+Like issues, the lookup runs on the host. awman first runs `gh pr view` against `github.com` explicitly (a `GH_HOST` pointing at a GitHub Enterprise server is not used for these lookups) and, if `gh` is missing or fails, falls back to the GitHub REST API. Authenticate once with `gh auth login`, or export `GITHUB_TOKEN`. Without a token, public repositories still work (at GitHub's unauthenticated rate limit); private repositories need authentication. A missing or unauthorized pull request fails with a hint to run `gh auth login` or set `GITHUB_TOKEN`.
+
+### Fork and deleted-branch pull requests
+
+- **Same repository.** The worktree uses the PR's head branch, so pushes from the session update the PR.
+- **From a fork, or head branch deleted.** The worktree uses a local branch named `pr/<N>`, created from GitHub's pull ref. It does not track the fork's branch, so pushing to `origin` will not update the pull request. awman warns about this; to push to the fork, add the fork as a remote and push there yourself.
+- **Closed or merged.** awman warns and continues with the PR's code.
+
+Worktrees for pull requests are kept in a `pr-<N>` directory; reopen one with `--worktree pr-<N>`.
 
 ---
 

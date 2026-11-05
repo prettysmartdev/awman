@@ -315,9 +315,9 @@ impl ResolvedFlags {
     ///
     /// Only boolean implications exist in the catalogue (`--json` implies
     /// `--non-interactive`; `--yolo` and `--auto` imply `--worktree`), and an
-    /// edge whose target this command does not declare is skipped: the shared
-    /// flag arrays give `--yolo` to `chat` and `exec prompt`, neither of which
-    /// has a `--worktree` to set.
+    /// edge whose target this command does not declare is skipped: chat and
+    /// exec prompt have no boolean workflow `--worktree` for those mode flags
+    /// to set; their optional-string selector is independent.
     fn close_over_implications(mut self, flags: &'static [FlagSpec]) -> Self {
         loop {
             let mut changed = false;
@@ -705,8 +705,8 @@ mod tests {
 
     #[test]
     fn an_implication_whose_target_the_command_lacks_is_skipped() {
-        // `chat` shares `--yolo` with `exec workflow` but declares no
-        // `--worktree`; resolving must not panic or invent one.
+        // `chat` shares `--yolo` with `exec workflow` but declares no boolean
+        // workflow `--worktree`; resolving must not invent one.
         let mut frontend = FakeCommandFrontend::new();
         frontend.bools.insert("yolo".into(), true);
         let flags = resolve(&["chat"], &frontend);

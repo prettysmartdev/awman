@@ -53,6 +53,9 @@ Available via: CLI, TUI
 | `--model` | string (optional) | — | — | — | CLI, TUI, API | Override the model used by the launched agent. |
 | `--overlay` | string (repeatable) | [] | — | — | CLI, TUI, API | Mount a host directory into the agent container. Repeatable. |
 | `--agent-flag` | string (repeatable) | [] | — | — | CLI, TUI, API | Repeatable extra argument for the agent command, replacing its agentFlags entry (pass as --agent-flag=--verbose). |
+| `--branch` | string (optional) | — | — | `--pr`, `--worktree` | CLI, TUI | Run in a worktree for this branch. |
+| `--pr` | string (optional) | — | — | `--branch`, `--worktree` | CLI, TUI | Run in a worktree for this GitHub pull request. |
+| `--worktree` | string (optional) | — | — | `--branch`, `--pr` | CLI, TUI | Reuse an existing named or path-based Git worktree. |
 
 ---
 
@@ -277,6 +280,9 @@ Available via: CLI, TUI, API
 | `--overlay` | string (repeatable) | [] | — | — | CLI, TUI, API | Mount a host directory into the agent container. Repeatable. |
 | `--agent-flag` | string (repeatable) | [] | — | — | CLI, TUI, API | Repeatable extra argument for the agent command, replacing its agentFlags entry (pass as --agent-flag=--verbose). |
 | `--issue` | string (optional) | — | — | — | CLI, TUI, API | GitHub issue number, URL, or owner/repo#N to use as the prompt. |
+| `--branch` | string (optional) | — | — | `--pr`, `--worktree` | CLI, TUI | Run in a worktree for this branch. |
+| `--pr` | string (optional) | — | — | `--branch`, `--worktree` | CLI, TUI | Run in a worktree for this GitHub pull request. |
+| `--worktree` | string (optional) | — | — | `--branch`, `--pr` | CLI, TUI | Reuse an existing named or path-based Git worktree. |
 
 ### `awman exec workflow`
 
