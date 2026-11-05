@@ -548,6 +548,16 @@ async fn real_git_dynamic_teardown_push_pr_and_automatic_push_execute_in_order()
     let Some(origin) = Origin::start() else {
         return;
     };
+    // This test checks push/PR ordering, not publication of awman's generated
+    // workflow state. Mirror a normal awman repository's ignore rule here;
+    // real_git_host_commit_follows_repository_ignore_rules covers the
+    // unignored case separately.
+    origin.commit_on(
+        "main",
+        None,
+        &[(".gitignore", ".awman/workflows\n")],
+        "ignore generated workflow state",
+    );
     for (branch, after_pr) in [
         ("double-push", ""),
         (
@@ -606,8 +616,10 @@ type = "create_pull_request"
             assert_eq!(record["result"]["pushed"]["sha"], final_sha, "{record}");
             if branch == "double-push" {
                 assert_eq!(
-                    final_sha, pr_head,
-                    "automatic push must not create a redundant commit"
+                    final_sha,
+                    pr_head,
+                    "automatic push must not create a redundant commit; changed files: {}",
+                    origin.git_bare(&["diff", "--name-only", &pr_head, &final_sha])
                 );
             } else {
                 assert_ne!(final_sha, pr_head);
