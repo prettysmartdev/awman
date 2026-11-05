@@ -228,7 +228,7 @@ The explicit forms always win over `workItems.source`, so a repo set to GitHub c
 - `parse_work_item_number` and `find_work_item_file` now serve only the local path. Move them out of `exec_workflow/issue.rs` to the new module. `push_back.rs` and `dynamic.rs` import them from `exec_workflow` today.
 - Other code that assumes a work item is a file or number: `worktree_lifecycle.rs` (`name_for`), `build_leader_prompt` placeholders, and `render_interview_prompt` and `render_amend_prompt`. Search for `work_item_number` and `{{work_item_` when implementing.
 - Update `aspec/uxui/cli.md` and `aspec/architecture/security.md` for the new flag, the global-only provider rule and the outbound request limits. Add `workItems.source` and `workItems.providers.*` rows to 0139's key table (`src/data/config/fields.rs`), which drives `awman config`, `--set` and the docs.
-- Related work items that mention `--issue` or this item's old scope: `aspec/work-items/README.md`, 0143 (uses the inline source), and 0153 (`--issue` with its new flags on `exec prompt`).
+- Related work items that mention `--issue` or this item's old scope: `aspec/work-items/README.md`, 0143 (uses the inline source), and 0151 (`--issue` with its new flags on `exec prompt`).
 
 ## Documentation
 

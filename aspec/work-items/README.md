@@ -29,9 +29,9 @@ Every item below depends on the completed 0139–0143 daemon gate. Additional de
 | 8 | [0146 — Context API and keys](0146-context-api-and-keys.md) | Context access over the finalized worker API. | 0140 |
 | 9 | [0147 — Per-session credentials and secrets](0147-per-session-credentials-and-secrets.md) | Credential and secret delivery over the finalized worker API. | 0141 |
 | 10 | [0148 — External work item sources](0148-external-work-item-sources.md) | HTTP and inline work items. | 0139 |
-| 11 | [0151 — Read-only planning sessions](0151-read-only-planning-sessions.md) | Read-only workspaces for planning. | 0143 |
+| 11 | [0151 — Branch, PR and worktree for chat](0151-branch-pr-worktree-for-chat.md) | Chat git workflow. | 0151 |
 | 12 | [0152 — Init over the API](0152-init-over-the-api.md) | API-driven project setup. | 0144 |
-| 13 | [0153 — Branch, PR and worktree for chat](0153-branch-pr-worktree-for-chat.md) | Chat git workflow. | 0151 |
+| 13 | [0153 — Read-only planning sessions](0153-read-only-planning-sessions.md) | Read-only workspaces for planning. | 0143 |
 | 14 | [0154 — Rex integration](0154-rex-integration.md) | Present the finished daemon engine in Rex. | 0153 |
 | 15 | [0155 — Daemon work in Rex](0155-daemon-work-in-rex.md) | Present squad and worker work in Rex. | 0157 |
 | 16 | [0156 — Rex action pack](0156-rex-action-pack.md) | Palette actions over the finalized daemon API. | 0158 |

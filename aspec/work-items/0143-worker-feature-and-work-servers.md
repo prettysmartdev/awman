@@ -180,7 +180,7 @@ take work without the TUI
       "dynamic": true, "leader": "claude::claude-opus-5-5",   // workflow kind
       "workflow_toml": null,                                   // or an inline workflow (file mode)
       "agent": "claude", "model": null,                        // prompt kind
-      "read_only": false,                                      // 0151
+      "read_only": false,                                      // 0153
       "overlays": [], "interaction": "interactive" | "headless" | null,
       "yolo": true,                                            // false: step dialogs wait for a person (manual picks)
       "timeout_ms": 7200000
