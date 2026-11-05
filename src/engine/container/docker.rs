@@ -37,7 +37,12 @@ const AGENT_LIST_FORMAT: &str = "{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.CreatedAt}}
 fn listing_command() -> Command {
     #[cfg(all(test, unix))]
     if let Some(path) = docker_listing_tests::CLI.with(|cli| cli.borrow().clone()) {
-        return Command::new(path);
+        // The fixture is a freshly written shell script. Concurrent test
+        // forks can briefly inherit its write descriptor and make execve
+        // return ETXTBSY; run it through the stable system shell instead.
+        let mut command = Command::new("/bin/sh");
+        command.arg(path);
+        return command;
     }
     Command::new(crate::engine::host_cli::program("docker"))
 }
@@ -2026,14 +2031,16 @@ esac
     #[test]
     fn listing_override_is_local_to_its_thread() {
         let fake = FakeDocker::new();
+        let command = listing_command();
+        assert_eq!(command.get_program(), "/bin/sh");
         assert_eq!(
-            listing_command().get_program(),
-            fake.dir.path().join("docker")
+            command.get_args().collect::<Vec<_>>(),
+            [fake.dir.path().join("docker").as_os_str()]
         );
         let other = std::thread::spawn(|| listing_command().get_program().to_os_string())
             .join()
             .unwrap();
-        assert_ne!(other, fake.dir.path().join("docker"));
+        assert_ne!(other, "/bin/sh");
     }
 
     #[test]
