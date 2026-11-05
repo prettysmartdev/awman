@@ -29,7 +29,7 @@ Split from: [WI 0123](completed/0123-builtin-native-verification-and-release-clo
 As a: user on Linux
 
 I want to:
-Use the builtin runtime (`runtime.kind: "builtin"`, 0159) on Linux arm64 or x86_64 with KVM, and import
+Use the builtin runtime (`runtime.kind: "builtin"`, 0139) on Linux arm64 or x86_64 with KVM, and import
 images from Docker Engine and authenticated registries.
 
 So I can:
@@ -129,7 +129,7 @@ secrets, redact evidence, and never dump ambient credentials.
 - [ ] D-13/D-14: Linux release artifacts boot and pass native scans; materials
   and measurements recorded.
 - [ ] D-15: full format × template corpus and Docker backend regressions.
-- [ ] Linux enabled for `runtime.kind: "builtin"` (0159 drops the `-experimental` value suffix; maturity is stated in docs and `awman config show`); docs updated.
+- [ ] Linux enabled for `runtime.kind: "builtin"` (0139 drops the `-experimental` value suffix; maturity is stated in docs and `awman config show`); docs updated.
 - [ ] Registry edge cases (package 6) pass against disposable services.
 - [ ] Register rows updated from Deferred to PASS as packages land. Each
   package can be completed and released on its own.

@@ -1,22 +1,190 @@
-# Work Item: Task
+# Work Item: Feature
 
-Title: Support OSC 7501 status codes
+Title: Complete daemon terminal, interaction and agent-status foundation
 Issue: https://github.com/prettysmartdev/awman/issues/30
 
-Depends on: 0159 (config and API naming)
+Depends on: 0139 (config and API surface), 0140 (one daemon, local and network listeners). This item supplies the shared terminal and status foundation consumed by 0142 and 0143.
 
 ## Summary:
+- Build one terminal hub for squad, worker and engine, with local and network viewing, input grants and per-feature interaction. Parse OSC 7501 status, filter agent output before it reaches a host TTY, emit sanitized status and scrub the terminal environment.
+- This work item completes the daemon terminal and status contract before the singleton engine frontend and worker pull items consume it.
+
+## Part: Interaction modes and live terminals
+
+### Summary:
+- Today, how agents run is fixed by where the command came from:
+  - squad runs every agent in a PTY (`SquadRunFrontends::take_io`, fixed 120×40, `non_interactive: false`), with no headless option;
+  - the API forces `--non-interactive` (`API_FLAG_DEFAULTS` in `projections/raw_args.rs`) and pipes every agent (`initial_size: None`);
+  - `api.alwaysNonInteractive` is documented but unused (`EffectiveConfig::always_non_interactive` is only called from tests).
+- Make interaction a setting of each daemon feature (0140), overridable per command or work item where the feature allows it. The values are 0139's `interactive` | `headless`:
+  - `interactive`: the agent runs in a PTY, exactly as in the TUI.
+  - `headless`: piped print mode, as the API does today.
+
+  | Feature | Interaction |
+  |---|---|
+  | `squad` | `daemon.features.squad.interaction`; defaults to `interactive`, as today. |
+  | `worker` push | `daemon.features.worker.push.interaction`; defaults to `headless`, today's API behaviour. |
+  | `worker` pull | `daemon.features.worker.pull.interaction`; defaults to `interactive`. |
+  | `engine` (0142) | Always interactive, with dialogs **relayed to its frontends** (0142) instead of taking yolo answers. |
+- Make interactive agents **watchable from anywhere.** Today a running agent's PTY can only be attached locally (`squad attach`, over unix sockets via `attach_protocol.rs`). Build one **terminal hub** in the daemon's **shared core** (0140). It keeps a screen mirror per agent container, for every feature, and serves it through one core resource, `/v1/terminals`:
+  - to local attach (`awman attach`), as today;
+  - to push clients over a WebSocket;
+  - to work servers over the worker's outbound connection (0143);
+  - to engine frontends, including Rex agent blocks (0154).
+
+  A late viewer sees the current screen, not a blank one.
+
+### User Stories
+
+#### User Story 1:
+As a: API client that shows runs to people (e.g. infact's webapp)
+
+I want to:
+push `exec workflow --dynamic --interactive`, list `GET /v1/terminals?owner_id=cmd_…`, and open `wss://…/v1/terminals/term_…`
+
+So I can:
+show the agent's real, live TUI (colours, spinners, tool calls, diffs) instead of a final message printed at exit
+
+#### User Story 2:
+As a: developer using squad
+
+I want to:
+`awman config set daemon.features.squad.interaction headless` for cheap, quiet evaluation runs
+
+So I can:
+skip PTYs and screen mirrors for tasks nobody watches
+
+#### User Story 3:
+As a: developer
+
+I want to:
+`awman attach cmd_…` (or `--read-only`) to a run that a push client, a work server or squad started on my machine
+
+So I can:
+watch it, or step in when it is stuck, with the same keys as `squad attach`
+
+### Implementation Details:
+- **Settings** (all in 0139's key table, `global` scope, live):
+  - `daemon.features.squad.interaction`, `daemon.features.worker.push.interaction` and `daemon.features.worker.pull.interaction` are each `interactive` or `headless`. The defaults keep today's behaviour: squad `interactive`, push `headless`, pull `interactive`.
+  - `allowOverride` (default `true`) on each lets a command or work item choose otherwise.
+  - `engine` has no setting: it is always interactive.
+  - `daemon.terminal.cols` / `rows` (default 120×40) set the PTY size for unattended runs, and `daemon.terminal.remoteInput` (default `false`) gates network input (below).
+  - The API's forced `--non-interactive` (renamed `--headless`, 0139) becomes push's default when overrides are allowed. `exec workflow` and `exec prompt` accept `--interactive` through `POST /v1/worker/commands`.
+  - `api.alwaysNonInteractive` is removed with no migration (0139). Its effect is `daemon.features.worker.push = { interaction: "headless", allowOverride: false }`.
+- **Interactive unattended runs** (squad, push, pull):
+  - Daemon frontends set `AgentIo.initial_size` from `daemon.terminal.{cols,rows}`, so `spawn_pty_bridged` is used.
+  - Dialogs that would wait for a person (step confirmation, control board) take the yolo answers.
+  - Stuck agents get the existing 60 s countdown, then auto-advance.
+  - A person attached with input rights can cancel a countdown exactly as in the TUI.
+- **Engine sessions.** Agents run in a PTY at the frontend's terminal size. Dialogs are relayed to the instance's frontends over 0142's protocol and wait for an answer, exactly as the in-process TUI does. Yolo sessions keep their countdowns.
+- **Terminal hub** (`src/engine/terminal_hub/`). One per daemon, built here for squad, worker and engine PTYs, bounded screen mirrors and subscriptions. Reuse the existing `attach_protocol.rs` framing where possible and define `awman.terminal.v1` wire frames in Layer 0 once; 0142 consumes this hub for engine PTYs. Layer 2 owns viewer admission, owner lookup, interaction mode and input-grant policy. Layer 3 owns WebSocket upgrades, frame transport and host-terminal presentation. The hub never imports HTTP, command or TUI types.
+  - Every PTY-bridged container registers a terminal: `{id: "term_…", owner_id: "cmd_…" | "tab_…" | "lease_…", feature, source, agent, model, attempt, cols, rows, state, created_at}`.
+    - `source` is 0137's event-envelope object (phase, step name and index, container, `step_attempt`).
+    - `attempt` is the command's execution number (0136).
+  - The hub tees PTY output into a `vt100::Parser`, the same crate the TUI's `container_view.rs` uses, plus a bounded ring buffer, then fans it out to subscribers.
+  - Slow subscribers get `lagged` and a fresh snapshot rather than unbounded buffering.
+  - Today's attach socket and exec bridge become hub subscribers, so local attach works for every feature.
+- **API** (core routes, 0139 §5):
+  - `GET /v1/terminals?owner_id=…` lists terminals as `{items, next_cursor}`, including finished ones while the owning record exists.
+  - `GET /v1/terminals/{id}` returns the terminal record, or upgrades to a WebSocket with subprotocol `awman.terminal.v1`.
+  - **Access** follows the owner's rules:
+    - a command's terminals are served wherever `worker` is served, network listener included;
+    - an engine tab's terminals are local only unless `engine` is persistently listed in `daemon.network.features` (0140);
+    - a lease's terminals are relayed to its work server by 0143.
+  - There are no per-feature terminal routes (`/v1/commands/{id}/terminals*` and `/v1/engine/terminals/*` are gone).
+  - Server-to-client frames:
+    - `snapshot{cols, rows, screen}`: the screen as ANSI that redraws it, sent on connect and after `lagged`;
+    - `output{bytes}`;
+    - `resize{cols, rows}`;
+    - `exit{code}`;
+    - `lagged`.
+  - Client-to-server frames: `input{bytes}` and `resize{cols, rows}`. Both are accepted only from a client holding the input grant (below).
+  - The frame set mirrors `attach_protocol.rs`, so one codec serves local and network viewers.
+- **Input over the network is off by default.** Two things must both allow it: `daemon.terminal.remoteInput` and a per-command `allow_remote_input`.
+  - When allowed, the first client that sends `take_control` holds the input grant, and others stay read-only.
+  - Every grant and release is written to the owner's event log as `terminal_control{terminal_id, holder, annotations}`. The holder is named by the client's `x-awman-actor` header for network clients, or `local` for local attaches, and `annotations` are the subscription's annotations (below), which is how an integration such as Rex identifies its block. Keystrokes are not logged.
+  - Local attaches to an engine instance's own terminals get the grant the same way the TUI's maximized view does today.
+- **Events.**
+  - Add `terminal_opened{terminal_id, agent, model, cols, rows}` and `terminal_closed{terminal_id, exit_code}` to the execution events. SSE followers of `/v1/worker/commands/{id}/events` then know when to open a socket.
+  - Step, phase, container and retry come from the event envelope's `source` (0137), not from fields repeated in these payloads.
+  - Attributed output lines (0137) continue for clients that only want text.
+  - The engine publishes the same events to host presenters (0142), plus `terminal_viewer_detached{terminal_id, reason: user | hangup, annotations}` for local attach subscriptions.
+- **CLI.**
+  - `awman attach <terminal-id | command-id | task-id> [--step NAME] [--read-only] [--annotation k=v]...` (0139 §7). The ID prefix says what it is:
+    - `term_…` opens that terminal;
+    - `cmd_…` opens the command's current terminal, or with `--step` that step's;
+    - `task_…` opens the squad task's running terminal.
+  - `--annotation k=v` (repeatable) attaches generic integration metadata to the subscription. Keys and values follow 0139 §1 and 0142's limits. They appear in `terminal_control` and in the engine's terminal events, so a host presenter can recognise its own views. There is no integration-specific attach flag.
+  - **Hang-up:** when the attach loses its terminal (SIGHUP, or stdout closed), it tells the hub `detached{reason: hangup}` before exiting. The engine forwards that to host presenters with the subscription's annotations (0154 maps it to "un-maximize"). A normal detach (Ctrl-C) reports `detached{reason: user}`.
+  - **Host-terminal hygiene:** whenever stdout is a TTY, `awman attach` passes agent bytes through 0141's output filter and OSC 7501 re-encoding. There is no flag.
+  - `--read-only` drops stdin, never requests the input grant, and never resizes the PTY. 0154 and 0155 use it for presented blocks.
+  - `awman squad attach <task>` is a shortcut for `awman attach task_…`.
+
+### Edge Case Considerations:
+- **Resize:** the agent's PTY size is owned by the input holder, or by `daemon.terminal.{cols,rows}` when nobody holds input. Read-only viewers scale their own view and never resize the PTY. For engine sessions with no holder, the primary frontend's size wins, as in the TUI today.
+- **A command that falls back to headless** (an agent with no PTY support, or ACP-launched agents): `GET /v1/terminals?owner_id=…` returns no items and the client uses the event stream. ACP agents may later get a structured viewer, but that is out of scope here.
+- **Secrets on screen:** terminals carry exactly what the agent prints, which is the same exposure as the event stream. Access uses the same key and session scope as `/v1/worker/commands/{id}/events`.
+- **Daemon restart:** re-queued commands get new terminals with a new `attempt`. Old terminal IDs answer `410 terminal_gone`.
+- **A feature cancelled with `awman daemon api jobs.cancel feature=…`:** its terminals send `exit` and close. Viewers of other features' terminals are unaffected.
+- **Changing `daemon.terminal.cols`/`rows` live:** new terminals use the new size, and running terminals keep theirs.
+
+### Test Considerations:
+- A squad task with `interaction: headless` runs piped. A pushed command with `--interactive` runs in a PTY. With `allowOverride: false`, the override is refused at submit with `400 interaction_override_refused`.
+- A pulled item uses `daemon.features.worker.pull.interaction` unless the item's `exec.interaction` overrides it and overrides are allowed.
+- Engine sessions always run in a PTY, and their dialogs reach the frontend, not the yolo answerer.
+- `/v1/terminals`:
+  - lists by `owner_id` with `items`/`next_cursor`;
+  - IDs carry `term_`;
+  - an engine tab's terminal is refused on the network listener unless `engine` is persistently listed;
+  - the removed per-feature terminal paths return 404.
+- The terminal WebSocket:
+  - a snapshot on connect matches the vt100 state, and output streams;
+  - a late joiner gets the current screen;
+  - a slow consumer gets `lagged` plus a snapshot.
+- Input is refused without both settings. `take_control` is exclusive, and `terminal_control` events appear in the event log.
+- `awman attach`:
+  - it resolves `term_`, `cmd_` (with and without `--step`) and `task_` IDs;
+  - `--read-only` never sends input or resize frames;
+  - `--annotation` values are validated and appear unchanged in `terminal_control` and `terminal_viewer_detached`;
+  - SIGHUP produces `reason: hangup`, and Ctrl-C produces `reason: user`.
+- With stdout a TTY, a container printing OSC 52 or DCS through `awman attach` shows none of it (0141).
+- A yolo countdown on a stuck interactive agent auto-advances with no viewer attached.
+
+### Codebase Integration:
+- Follow `aspec/architecture/2026-grand-architecture.md`: terminal/OSC mechanics are Layer 1, status/access policy is Layer 2, wire types are Layer 0, and host-terminal writing is Layer 3. The terminal hub never owns an HTTP route or a viewer admission decision.
+- follow established conventions, best practices, testing, and architecture patterns from the project's aspec.
+- **Code:**
+  - `src/engine/container/{process,attach_protocol,attach_socket}.rs`;
+  - `src/engine/terminal_hub/`, built in 0140's shared core as a PTY/snapshot/subscription primitive; Layer 0 defines terminal records and wire frames, Layer 2 exposes typed terminal operations and policy, and `src/frontend/api/` implements the `/v1/terminals` HTTP/WebSocket transport;
+  - `src/frontend/tui/container_view.rs` (reuse its vt100 handling);
+  - `projections/raw_args.rs`;
+  - `awman attach` in `src/command/commands/attach.rs`, replacing `agents attach` and folding in `squad attach`'s resolver.
+- **Config:** the interaction and terminal keys are rows in 0139's key table, `src/data/config/fields.rs`.
+- **Related:**
+  - 0142: engine sessions and dialog relay;
+  - 0154 and 0155: Rex blocks as hub subscribers;
+  - 0141: the host-terminal output filter applied by `awman attach`;
+  - 0139: naming, routes and IDs.
+
+### Documentation
+- `docs/03-agent-sessions.md`: interaction per feature (`interactive` | `headless`) and `awman attach`.
+- `docs/09-api-and-remote-mode.md`: `/v1/terminals`, the WebSocket frames, and the input grant.
+- `docs/16-daemon.md`: `daemon.terminal.*` and per-feature interaction.
+
+## Part: OSC 7501 program status
+
+### Summary:
 - OSC 7501 (the "Program Status Protocol", draft rev 0.4: https://www.superlogical.com/rex/docs/build/program-status) is an open terminal escape sequence. A program running in a PTY uses it to tell the hosting terminal whether it is `idle`, `working`, `done`, `blocked` (on `permission`, `question` or `auth`), or in `error`. Coding agents are starting to emit it, and Claude Code reportedly does.
 - awman already acts as the terminal for every agent it runs: it owns the PTY or pipes in each runtime bridge. Today it guesses agent state from one signal, output silence (`StuckDetector`, 30s `agents.stuckTimeout`). This work item makes awman parse OSC 7501 reports from agent output. **Once an agent has sent a valid report, its reported status supersedes the built-in silence heuristic for the rest of that execution.** A self-report says what the agent is doing; silence only suggests it.
   - **Agents that report:** silence never marks them stuck and never starts a yolo countdown. `working` means busy, however long the agent stays quiet. `done` (and `idle`, meaning the turn has ended) means the step has finished. `blocked` and `error` mean there is a problem, and **the workflow never advances past a problem**: it pauses for the user, or, when no user is present, the step fails through the existing failure path.
   - **Agents that don't report:** behaviour is unchanged. Silence detection, the startup grace timer and the yolo countdown all work exactly as they do today.
   - **Basic information:** the TUI tab bar, container window title, workflow overview, `awman agents status`, the CLI message sink and the API event stream show the reported state, kind, progress and message.
 - awman answers the protocol's feature-detection query (`OSC 7501 ; ? ST`) so agents that only report after detecting support will start reporting.
-- No new commands. One new config key, `agents.programStatus.enabled` (bool, default `true`; named per 0159): set it to `false` to ignore reports and keep using silence detection only.
+- No new commands. One new config key, `agents.programStatus.enabled` (bool, default `true`; named per 0139): set it to `false` to ignore reports and keep using silence detection only.
 
-## User Stories
+### User Stories
 
-### User Story 1:
+#### User Story 1:
 As a: user
 
 I want to:
@@ -25,7 +193,7 @@ see in the TUI tab bar and in `awman agents status` whether each agent is workin
 So I can:
 go straight to the agent that needs me. I don't have to wait for a 30-second "stuck" guess, and an agent that is quietly running a long build is never flagged stuck by mistake.
 
-### User Story 2:
+#### User Story 2:
 As a: user running `awman exec workflow --yolo`
 
 I want to:
@@ -34,7 +202,7 @@ have a step advance as soon as its agent reports `done`, and have the workflow s
 So I can:
 trust unattended workflows. A finished step moves on right away, with no 30s silence plus 60s countdown. A failing or stuck-on-a-question step never gets pushed forward as if it had succeeded.
 
-### User Story 3:
+#### User Story 3:
 As a: user running a non-yolo workflow
 
 I want to:
@@ -44,9 +212,9 @@ So I can:
 act at the moment a decision is needed. Agents that don't support OSC 7501 keep today's behaviour.
 
 
-## Implementation Details:
+### Implementation Details:
 
-### 1. Protocol model and parser (Layer 0, pure): `src/data/program_status.rs`
+#### 1. Protocol model and parser (Layer 0, pure): `src/data/program_status.rs`
 - Types:
   ```rust
   pub enum ProgramState { Idle, Working, Done, Blocked, Error }
@@ -77,7 +245,7 @@ act at the moment a decision is needed. Agents that don't support OSC 7501 keep 
   - `effective() -> Option<EffectiveStatus>` returns one aggregate for the agent. Priority is `blocked > error > working > idle > done`, so any problem in any record wins and a busy child keeps the agent from counting as finished. Kind, msg and progress come from the winning record. Child records inherit `app` from their nearest ancestor.
 - Expose `ProgramState::as_str()`/`parse()` in the same style as `SessionStatus` (`src/data/session_status.rs`), so CLI/API JSON uses the spec spellings.
 
-### 2. Stream scanner (Layer 1, runtime-neutral): `src/engine/agent_runtime/program_status.rs`
+#### 2. Stream scanner (Layer 1, runtime-neutral): `src/engine/agent_runtime/program_status.rs`
 - `Osc7501Scanner` is a small state machine fed every output chunk, `fn feed(&mut self, chunk: &[u8]) -> ScanResult`. It finds `ESC ] 7501 ;` … terminated by BEL (0x07) or ST (`ESC \`), and it also spots RIS (`ESC c`).
   - It must handle sequences **split across chunk boundaries**. The reader threads read in 4 KiB blocks, so splits are routine.
   - It buffers at most 4096 bytes of one sequence. On overflow it drops that sequence and returns to ground state; it never grows without bound.
@@ -87,7 +255,7 @@ act at the moment a decision is needed. Agents that don't support OSC 7501 keep 
 - A query by itself does **not** count as support: only an accepted report does (see §3).
 - Disabled via config (`agents.programStatus.enabled: false`): the scanner still removes queries, and the bridge neither replies nor publishes. awman then behaves exactly as it does today.
 
-### 3. Supersede silence detection in the bridges and the `StuckDetector`
+#### 3. Supersede silence detection in the bridges and the `StuckDetector`
 - Each bridge reader thread already calls `act.touch()` per chunk. It should also run that chunk through its own scanner (one per stream: stdout and stderr each get one in piped mode). Accepted events update a shared `ProgramStatusTracker` (`Arc<Mutex<…>>`) stored next to `OutputActivity`. The tracker holds:
   - the `ProgramStatusSet`
   - a `reporting: bool` latch, set by the first accepted report (any state, including `clear`) and kept for the rest of the execution.
@@ -109,7 +277,7 @@ act at the moment a decision is needed. Agents that don't support OSC 7501 keep 
 - Drop all records and the `reporting` latch when the execution ends and at each new step/container. This follows the spec rule that `working`/`blocked` are dropped on process exit. A new container may run a different agent, so support is re-learned.
 - `AgentExecution` gets `program_status() -> Option<EffectiveStatus>` and `reports_program_status() -> bool`, snapshot reads for frontends and `agents status`.
 
-### 4. Workflow engine behaviour (`src/engine/workflow/single_step.rs`, `parallel.rs`, `phases.rs`; squad `src/engine/squad/launcher.rs`)
+#### 4. Workflow engine behaviour (`src/engine/workflow/single_step.rs`, `parallel.rs`, `phases.rs`; squad `src/engine/squad/launcher.rs`)
 - Map `Reported(s)` events inside the step loops (the existing `Some(event) = Self::recv_stuck(..)` arms). These rules only ever apply to reporting agents, because silence `Stuck` is never emitted for them (§3). **Problems (`blocked`, `error`) never lead to an advance in any mode.**
 
   | Effective state | yolo | non-yolo (TUI) | no user (squad / API / `--headless`) |
@@ -126,7 +294,7 @@ act at the moment a decision is needed. Agents that don't support OSC 7501 keep 
 - Parallel groups: `handle_parallel_stuck_event` gets the same mapping per step, and each container is tracked independently (the fan-in already tags events with the step name). One step's `error` pauses or fails only that step. The group advances only when every sibling has finished; that rule is unchanged.
 - Respect `--plan`/`--auto`: only `--yolo` (and frontends with no user) auto-advance on `done`/`idle`, matching current rules.
 
-### 5. Frontends (Layer 3, presentation only)
+#### 5. Frontends (Layer 3, presentation only)
 - **TUI**:
   - Store the `EffectiveStatus` on each tab/container slot, using the same path `git_poll.rs` uses for `StuckEvent`.
   - The tab label gets a state glyph: `◐` working (with `NN%` if progress is set), `?` blocked question, `🔒` blocked permission/auth, `✓` done, `✗` error.
@@ -136,20 +304,20 @@ act at the moment a decision is needed. Agents that don't support OSC 7501 keep 
   - The workflow overview shows `blocked: permission` / `error` etc. under the step box.
   - **Active-tab suppression** also applies to reports. On the active tab, if the user typed or scrolled within the last `agents.stuckTimeout`, an `idle`/`done` event shows its indicator but **does not** auto-open the dialog or start the countdown until the user has been idle that long. This avoids a dialog on every turn of an interactive step. `blocked` and `error` are not deferred.
 - **CLI**: status lines go to the message sink (stderr), at most one per state change ("Agent is waiting for permission: <msg>"). Reports still pass through to the user's terminal unchanged.
-- **API**: a new `program_status` event in the command event stream (`GET /v1/worker/commands/{id}/events`, 0159) with `{state, kind, progress, msg, app}` (snake_case per 0159; values use the spec spellings). Add it alongside the existing agent output events in `src/frontend/api/command_frontend.rs`.
+- **API**: a new `program_status` event in the command event stream (`GET /v1/worker/commands/{id}/events`, 0139) with `{state, kind, progress, msg, app}` (snake_case per 0139; values use the spec spellings). Add it alongside the existing agent output events in `src/frontend/api/command_frontend.rs`.
 - **`awman agents status` / `agents ls`** (`src/command/commands/agents/snapshot.rs`):
   - Add `AgentState::Waiting` (blocked, glyph `◆`, sorted first), `AgentState::Errored` (glyph `✗`, sorted with Waiting) and `AgentState::Done` (glyph `✓`).
   - `Stuck` now only applies to non-reporting agents.
   - Add `program_status: Option<…>` to the tab snapshot (next to `is_stuck`), and add `kind`/`msg` fields to the JSON output.
   - The table STATUS column shows e.g. `waiting (permission)`.
 
-### 6. Config
-- `agents.programStatus.enabled` (bool, default `true`, scope `repo`: global and repo, repo wins) is one row in the 0159 key table (`src/data/config/fields.rs`), in the `agents` section struct (`src/data/config/agents.rs`). That one row gives validation, `config show/get/set/unset`, `--set agents.programStatus.enabled=false` and `AWMAN_AGENTS_PROGRAM_STATUS_ENABLED`. `false` = ignore reports and use silence detection only. It is the escape hatch for an agent whose reports turn out to be unreliable.
-- Add it to `aspec/uxui/cli.md`'s config section. The `docs/07-configuration.md` reference table is generated from the key table (0159).
+#### 6. Config
+- `agents.programStatus.enabled` (bool, default `true`, scope `repo`: global and repo, repo wins) is one row in the 0139 key table (`src/data/config/fields.rs`), in the `agents` section struct (`src/data/config/agents.rs`). That one row gives validation, `config show/get/set/unset`, `--set agents.programStatus.enabled=false` and `AWMAN_AGENTS_PROGRAM_STATUS_ENABLED`. `false` = ignore reports and use silence detection only. It is the escape hatch for an agent whose reports turn out to be unreliable.
+- Add it to `aspec/uxui/cli.md`'s config section. The `docs/07-configuration.md` reference table is generated from the key table (0139).
 - The `AgentDone` countdown duration is a timing constant in `src/engine/container/timing.rs` (alongside `yolo_countdown_duration()`), not a config key.
 
 
-## Edge Case Considerations:
+### Edge Case Considerations:
 - **Agents that never emit OSC 7501:** behaviour must be exactly what it is today. With no latch there are no events, and the silence detector, grace timer and countdowns are untouched. This is the default case and must stay covered by regression tests.
 - **Hung agent after `working`:** silence detection no longer applies once an agent reports, and the protocol has no heartbeat. An agent that freezes mid-`working` therefore sits as `working` indefinitely. This is the accepted cost of trusting the agent:
   - The TUI shows "working · silent 12m" (information only; no action is taken), so the user can notice and use Ctrl+W.
@@ -184,7 +352,7 @@ act at the moment a decision is needed. Agents that don't support OSC 7501 keep 
   - Truncate them for display.
   - The only bytes awman ever writes back in response are the fixed query reply, which contains no report data (spec security section). This adds no new host execution path; everything stays inside the existing container I/O boundary (aspec/architecture/security.md).
 
-## Test Considerations:
+### Test Considerations:
 - **Unit: `src/data/program_status.rs`**:
   - Each state, kind and progress bound (0, 100, 101, -1, `abc`).
   - Whitespace trimming, malformed pairs skipped, unknown keys ignored, last value wins.
@@ -237,7 +405,7 @@ act at the moment a decision is needed. Agents that don't support OSC 7501 keep 
   - Fixture C sends the query and asserts it reads back exactly `\033]7501;?\033\\` on stdin.
 - **Config tests:** `agents.programStatus.enabled` parse, repo-over-global precedence, `config set/get` round trip. `false` restores silence-only behaviour end to end.
 
-## Codebase Integration:
+### Codebase Integration:
 - Follow established conventions, best practices, testing, and architecture patterns from the project's aspec.
 - **Layering** (aspec/architecture/design.md):
   - The pure protocol types and parser go in `src/data/`.
@@ -253,10 +421,10 @@ act at the moment a decision is needed. Agents that don't support OSC 7501 keep 
 - Update the `AgentStatus`/`StuckEvent` doc comments (`src/engine/agent_runtime/frontend.rs`, `execution.rs`) and `DEFAULT_STUCK_TIMEOUT`'s comment in `timing.rs` so they describe what each runtime emits, the supersede rule, and the latch lifetime, keeping the existing "what a frontend can rely on" style.
 - **Bridges to touch:** `src/engine/container/io_bridge.rs` (`bridge_pty`, `bridge_piped`), `src/engine/container/attach_socket.rs`, `src/engine/container/builtin/exec_bridge.rs`, `src/engine/sandbox/dsbx/io_bridge.rs`. Keep the per-chunk hot path allocation-free when a chunk contains no `ESC` byte.
 - **Timing constants** live in `src/engine/container/timing.rs`. Add `agent_done_countdown_duration()` next to `yolo_countdown_duration()`, with test overrides the same way.
-- **Config fields:** the 0159 key table (`src/data/config/fields.rs`) and `src/data/config/agents.rs`, with spec text in `aspec/uxui/cli.md`.
+- **Config fields:** the 0139 key table (`src/data/config/fields.rs`) and `src/data/config/agents.rs`, with spec text in `aspec/uxui/cli.md`.
 - Keep the code readable for an intermediate Rust developer: a plain state machine for the scanner, no parser-combinator crates. The base64 decode should use the crate the workspace already depends on, if there is one.
 
-## Documentation
+### Documentation
 
 After implementation is complete, update user-facing documentation in `docs/` to reflect the current state of the tool:
 
@@ -275,3 +443,159 @@ Specific docs to update for this item:
 - `docs/14-command-reference.md`: `agents status` states (`waiting`, `errored`, `done`).
 
 See `CLAUDE.md` for more guidance on documentation standards.
+
+## Part: Host-terminal hygiene
+
+### Summary:
+- Agent bytes reach the user's **host terminal** in several places:
+  - `awman agents attach`;
+  - `awman squad attach`;
+  - 0141's `awman attach`;
+  - the TUI's maximized view, when it passes sequences through.
+- Today those bytes are forwarded with almost no filtering, so an agent in a container can use control sequences the host terminal acts on:
+  - writing the host clipboard (OSC 52);
+  - spoofing the host shell's cwd (OSC 7);
+  - raising desktop notifications (OSC 9/99/777);
+  - triggering file transfers (OSC 1337, kitty);
+  - tunnelling sequences through DCS/APC passthrough.
+- In the other direction, containers can inherit host-terminal variables (`TMUX`, `REX_*`, `TERM_PROGRAM`, …) that describe and sometimes address the host's multiplexer, and an exotic host `TERM` (`xterm-rex`, `xterm-kitty`) has no terminfo entry inside the image.
+- awman knows each agent's state but tells the host terminal nothing. OSC 7501, the Program Status Protocol (0141), lets a terminal show "working / blocked / done" in its tab bar.
+- The output filter, status parser and emitter are one terminal safety contract in this item. They ship before the 0142 engine frontend and later Rex work consume them:
+  1. a **host-terminal output filter** applied wherever agent bytes reach a host terminal;
+  2. **OSC 7501 emission** from the TUI to its own terminal;
+  3. a **container env deny-list** for host-terminal variables, and `TERM` normalisation.
+
+### User Stories
+
+#### User Story 1:
+As a: security-conscious user
+
+I want to:
+be sure an agent's output can never write my clipboard, spoof my shell's directory, raise notifications or start file transfers in my terminal when I attach to it
+
+So I can:
+attach to agents freely without trusting what they print.
+
+#### User Story 2:
+As a: user of a terminal or multiplexer that supports OSC 7501 (Rex and others)
+
+I want to:
+see in my terminal's tab bar whether the awman tab is working, waiting on me, done or failed
+
+So I can:
+notice an agent waiting on me even when the awman tab isn't focused.
+
+#### User Story 3:
+As a: user running awman inside tmux, zellij or Rex
+
+I want to:
+my agents' containers to see neither my multiplexer's variables nor a `TERM` they can't render
+
+So I can:
+get correct rendering in the container, with nothing about my host terminal leaking into it.
+
+
+### Implementation Details:
+
+#### 1. Host-terminal output filter: `src/frontend/terminal_output_filter.rs` (Layer 3, pure presentation safety)
+- `HostOutputFilter` is a streaming state machine: `fn feed(&mut self, chunk: &[u8], out: &mut Vec<u8>)`, plus `fn finish(&mut self, out)`.
+  - It holds a partial escape sequence across chunks, capped at 4 KiB. A sequence that exceeds the cap is dropped up to its terminator, and plain text is never held back.
+  - It never rewrites printable text, CSI sequences (colour, cursor, modes), or ordinary OSC 0/1/2 titles.
+- **Stripped by default:**
+  - OSC 52 (clipboard write and query);
+  - OSC 7 (cwd);
+  - OSC 9, OSC 99 and OSC 777 (desktop notifications);
+  - OSC 1337 (iTerm2 file transfer, `SetUserVar`, etc.);
+  - OSC 5113 / kitty file-transfer and APC `_G` graphics transfer;
+  - all DCS (`ESC P … ST`, including tmux passthrough `ESC Ptmux;`), SOS, PM and APC strings.
+- **OSC 7501** reports are parsed with this item's parser and **re-encoded** from the sanitized record, never forwarded raw. OSC 7501 queries are dropped, because awman's bridge answers them. Unknown or invalid reports are stripped.
+- `HostOutputPolicy { allow_notifications: bool, program_status: Reencode | Strip }` is a Layer 0 value resolved by Layer 2 from config and host-integration state, then passed to the Layer 3 writer. The default strips notifications. Rex (0154) maps `tui.integrations.rex.forwardAgentNotifications` onto `allow_notifications` through the Layer 2 integration policy; the frontend does not choose the policy. No flag selects it.
+- **Where it is applied** (every place agent bytes reach a host terminal):
+  - `awman agents attach`: the CLI writer in `src/frontend/cli/per_command/container_frontend_marker.rs`, before raw stdout.
+  - `awman squad attach`: `src/frontend/cli/per_command/squad_attach.rs` and `src/frontend/tui/squad_attach.rs`.
+  - this item's `awman attach`. The filter and OSC 7501 re-encoding are applied **whenever its stdout is a TTY**, with no flag. This is what agent blocks opened by host presenters (0154's Rex blocks, 0155) rely on.
+  - The TUI's own renderer is unaffected: it parses agent bytes into `vt100` and never forwards raw OSC to the host. Add a regression test that it still doesn't.
+- The existing CLI ACP OSC 52 strip (`acp_frontend.rs`) is replaced by the shared filter, so there is one implementation.
+
+#### 2. OSC 7501 emission: Layer 2 status projection + Layer 3 terminal codec
+- Layer 2's `ProgramStatusProjection::reports(state: &EmitInput) -> Vec<Osc7501Report>` is pure command/presentation policy over Layer 0 status types. `EmitInput` lists each tab and its agent slots, with their 0141 `EffectiveStatus` and any awman-originated states. Layer 3 encodes those reports as terminal escape sequences and writes them; Layer 1 does not decide a tab's displayed status or write to the host terminal.
+  - **Root record:** `app=awman`. Its state is the aggregate across all tabs and agents, by priority **blocked > error > working > idle > done**. `msg` is the highest-priority record's message.
+  - **Child records:** one per agent, `id=tab<N>/<slot>`, with `title` = the tab label and `msg` = the agent's sanitized message. On `blocked` they carry `kind` and `progress`.
+  - **awman-originated states**, which need no 0141:
+    - a dialog waiting on the user → `blocked`, `kind=question`;
+    - an agent-auth dialog → `blocked`, `kind=auth`;
+    - a running command → `working`;
+    - a command finished → `done`; failed → `error`.
+  - It encodes base64 `msg`/`title` and enforces the protocol caps: 4096-byte sequence, 192-byte `title`, 2048-byte `msg`, 128-byte `id`, at most 64 records.
+- **TUI hook** (`src/frontend/tui/event_loop.rs`): after each tick, if the emitter's output changed, write the sequences straight to the TUI's stdout, outside the ratatui frame buffer.
+  - **Coalesced**: at most 4 writes per second, and only on change.
+  - **Cleared** with `state=clear` (no `id`) on normal exit and in the existing panic hook, so the terminal never keeps a stale "working".
+- **Feature-detect gating:** at startup the TUI sends `OSC 7501 ; ? ST` followed by `CSI c` (primary device attributes).
+  - It emits only if the 7501 reply arrives before the DA reply.
+  - No reply, or DA first, means no emission ever, so terminals that would print junk never see the sequences.
+  - The probe reuses the event loop's input reader. The replies are consumed and never reach the key handler.
+- **Config:** `tui.programStatus.emit` (bool, default `true`, scope `repo`: global and repo), one row in the 0139 key table. For one run: `--set tui.programStatus.emit=false` (or `AWMAN_TUI_PROGRAM_STATUS_EMIT=false`); there is no dedicated flag. Emission is also off under `TERM=dumb` and when stdout isn't a TTY.
+
+#### 3. Container env deny-list and `TERM` normalisation
+- `src/engine/container/host_env_denylist.rs` (pure) has `fn is_host_terminal_var(name) -> bool` for:
+  - `REX_*`, `TMUX`, `TMUX_*`, `ZELLIJ`, `ZELLIJ_*`, `STY`, `WINDOW`;
+  - `TERM_PROGRAM`, `TERM_PROGRAM_VERSION`, `TERM_SESSION_ID`;
+  - `WEZTERM_*`, `KITTY_*`, `ITERM_*`, `LC_TERMINAL*`, `ALACRITTY_*`, `GHOSTTY_*`, `VTE_VERSION`, `WT_SESSION`, `WT_PROFILE_ID`.
+- It is applied at the single point where each runtime backend's container run spec gets its env: Docker, Apple `container`, builtin and sandbox, in `src/engine/container/` and `src/engine/sandbox/`.
+  - It applies after overlays and agent env are merged, so even an overlay that requests one of these names gets a notice and the variable is not passed.
+  - Explicit per-session secrets (0147) are unaffected, because those names never match.
+- `TERM` is always `xterm-256color` inside containers, whatever the host `TERM` (`xterm-rex`, `xterm-kitty`, `tmux-256color`, …). The current pass-through (`src/engine/auth/host_secret_command.rs` passes `TERM` for host-side helpers only) is unchanged, because that is a host process. `COLORTERM=truecolor` is passed only when the host sets it.
+
+### Edge Case Considerations:
+- **A sequence split across chunk boundaries** (`ESC ]` in one chunk, `52;c;…BEL` in the next): the filter buffers it and still strips it.
+- **An unterminated OSC** (an agent prints `ESC ]52;` and never terminates it): after 4 KiB, or at `finish()` / detach, the buffered bytes are dropped, never flushed raw.
+- **Both `ESC \` and BEL terminators**, and 8-bit C1 forms (`0x9D` OSC, `0x90` DCS, `0x9C` ST), must be handled.
+- **An agent relying on OSC 8 hyperlinks:** allowed through, since they are inert until clicked. Revisit if a terminal is found that auto-opens them.
+- **The TUI inside tmux:** tmux swallows unknown OSC unless `allow-passthrough` is on. Feature-detect then fails, so there is no emission, which is correct.
+- **Several awman TUIs in one terminal multiplexer:** each emits for its own terminal only. Records are per terminal, so they don't collide.
+- **A user who wants clipboard writes from an agent:** not supported here, on purpose. Agents should write files to `/awman/output` instead.
+- **A deny-listed variable the user needs in a container:** they must re-export it under a different name via an overlay `env()`. The deny-list is not configurable, so the safety default can't be bypassed by a repo config.
+
+### Test Considerations:
+- **Filter unit tests:**
+  - each stripped family, with both terminators and C1 forms;
+  - sequences split at every byte offset;
+  - an oversized unterminated sequence;
+  - CSI, SGR and OSC 0/2/8 preserved byte for byte;
+  - OSC 7501 re-encoded (with 0141) or stripped (without);
+  - `allow_notifications` on and off.
+- **Property test:** for arbitrary input, the output contains no byte sequence starting OSC 52/7/9/99/777/1337 or DCS/APC, and the printable text is preserved.
+- **Emitter unit tests:**
+  - aggregate priority across mixed states;
+  - child IDs and titles;
+  - the caps (truncation stays valid UTF-8);
+  - base64 encoding;
+  - coalescing (no write when unchanged; ≤4/sec);
+  - the clear sequence on exit and in the panic path.
+- **Feature-detect:** a fake terminal answering 7501 then DA → emits; DA only → never emits; a 7501 reply after DA → never emits; replies never reach the key handler.
+- **Env:** container specs built under an `EnvSnapshot` full of the deny-listed names contain none of them, for every backend. `TERM` is `xterm-256color` whatever the host `TERM`. An overlay requesting `TMUX` produces a notice and no variable.
+- **End-to-end:** gated by `AWMAN_TEST_DOCKER`, `awman agents attach` to a container that prints OSC 52, OSC 7, OSC 9 and DCS shows none of them on the captured host stdout.
+
+### Codebase Integration:
+- follow established conventions, best practices, testing, and architecture patterns from the project's aspec.
+- The OSC parser and PTY hub are Layer 1 mechanics; `ProgramStatusReport`, `EffectiveStatus`, `HostOutputPolicy` and wire frames are Layer 0 data. Layer 2 resolves status aggregation and output policy. The filter and OSC encoder are pure Layer 3 presentation utilities; frontends own writing to stdout and cannot call a Layer 1 engine object directly. Reuse the one protocol model instead of duplicating it.
+- The deny-list is one function, called from each backend's run-spec builder. Don't scatter checks.
+- These modules are reused by 0154 (Rex agent blocks), 0142 (TUI frontends) and 0155.
+
+### Documentation
+
+After implementation is complete, update user-facing documentation in `docs/` to reflect the current state of the tool:
+
+- **Update existing feature docs** (e.g., if implementing headless features, update `docs/08-headless-mode.md`)
+- **Create new user guides only if a new user-visible feature warrants it** (e.g., `docs/10-my-feature.md`)
+- **Never create work-item-specific docs** (e.g., no "WI 0123 implementation guide" in published docs)
+- **Keep all technical/implementation details in work item specs or code comments**, not in `docs/`
+- **Docs are for end users**, not for developers trying to understand implementation
+
+See `CLAUDE.md` for more guidance on documentation standards.
+
+Specifically for this item:
+- `docs/04-security-and-isolation.md`: which control sequences from agents are filtered, and which host-terminal variables never reach containers.
+- `docs/02-using-the-tui.md`: terminal tab status (OSC 7501), and `tui.programStatus.emit` (and `--set tui.programStatus.emit=false` for one run).
+- `docs/07-configuration.md`: `tui.programStatus.emit`.
+- `docs/03-agent-sessions.md`: the filtering applies to `agents attach` and `squad attach`.

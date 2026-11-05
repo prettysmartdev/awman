@@ -3,9 +3,11 @@
 Title: Improve builtin runtime image-source setup and `ready` errors
 Issue: issuelink
 
+Depends on: 0143 (completed daemon block).
+
 ## Summary:
 
-- Under `builtin-experimental`, a new user can reach `awman ready` without `builtin.imageSource` or a matching `builtin.images` entry. Today `ready` fails with configuration and build instructions. In an interactive CLI or TUI session, offer to configure an explicit source and continue the same `ready` run after the choice is saved. Keep non-interactive and API runs deterministic and free of configuration writes.
+- With `runtime.kind: "builtin"` (0139), a new user can reach `awman ready` without `runtime.builtin.imageSource` or a matching `runtime.builtin.images` entry. Today `ready` fails with configuration and build instructions. In an interactive CLI or TUI session, offer to configure an explicit source and continue the same `ready` run after the choice is saved. Keep non-interactive and API runs deterministic and free of configuration writes.
 - Make `ready` failures readable. The shared `render_summary_box` in `src/frontend/render_helpers.rs` measures the entire status text and writes it into one table cell. Long errors make an enormous box; embedded newlines break its borders. Format concise, width-bounded rows with wrapped, indented error details and one clear recovery instruction. Keep `ready --json` structured and machine-readable.
 - For a `docker-local` source with an unavailable local Docker socket, report that Docker is not running and how to retry. Preserve distinct diagnostics for permission errors, malformed endpoints, TLS failures, remote Docker hosts, and missing images. Do not infer daemon state from arbitrary text in an HTTP error.
 
@@ -18,7 +20,7 @@ I want to:
 choose and save an image source when `awman ready` finds none for the required agent image
 
 So I can:
-complete setup without manually locating and editing the `builtin` JSON block
+complete setup without manually locating and editing the `runtime.builtin` JSON block
 
 ### User Story 2:
 As a: user troubleshooting `awman ready`
@@ -42,9 +44,9 @@ start Docker and rerun `awman ready` instead of investigating an unexplained soc
 
 ### 1. Offer explicit image-source configuration
 
-- In the builtin `ready` path, distinguish an unconfigured source for an image being prepared from an invalid configured source. Cover the default required image and non-default agent images included by `ready --build`. Use the existing effective-config resolution order: a matching `builtin.images` entry wins over `builtin.imageSource`, and repo values win over global values per field. Do not offer to replace a configured but failing source as if it were missing.
-- Add one frontend request, backed by a typed source choice, to the `ReadyFrontend` contract. The interactive CLI and TUI offer `docker-local`, `apple-local` where supported, `archive`, `registry`, and “leave unconfigured.” Ask for the fields required by the selected type, show the destination config file and exact JSON change, and let the user choose repo or global scope. Validate the complete choice with the existing `ImageSourceSpec` and config validators before writing. Write atomically through the existing config-edit path, preserving unrelated keys and file permissions. Re-resolve builtin settings and continue this `ready` invocation after a successful write; do not require a second invocation.
-- A local source choice does not silently enable `builtin.builder.enabled` or start Docker/Apple Containers. Explain that import requires an existing image, and offer a separate, explicit builder choice when the selected local store can build. If enabled, the next image-preparation step may build using the existing source-matched builder rules. Registry and archive choices remain import-only.
+- In the builtin `ready` path, distinguish an unconfigured source for an image being prepared from an invalid configured source. Cover the default required image and non-default agent images included by `ready --build`. Use the finalized effective-config resolution order: a matching `runtime.builtin.images` entry wins over `runtime.builtin.imageSource`, and repo values win over global values per field. Do not offer to replace a configured but failing source as if it were missing.
+- Add one typed source-choice request to the `ReadyFrontend` contract. Layer 2's `ReadyCommand` decides when to ask and builds the available choices; interactive CLI and TUI present `docker-local`, `apple-local` where supported, `archive`, `registry`, and “leave unconfigured.” Layer 2 gathers the selected fields, asks Layer 0 to compute the destination and exact JSON preview and validate the complete `ImageSourceSpec`, then invokes Layer 0's atomic config edit while preserving unrelated keys and permissions. Layer 3 displays the request and returns the typed answer; it never validates policy or writes config. Layer 2 uses Layer 0 to re-resolve builtin settings and continues the same `ready` invocation after a successful write.
+- A local source choice does not silently enable `runtime.builtin.builder.enabled` or start Docker/Apple Containers. Explain that import requires an existing image, and offer a separate, explicit builder choice when the selected local store can build. If enabled, the next image-preparation step may build using the existing source-matched builder rules. Registry and archive choices remain import-only.
 - Prompt at most once per `ready` run. Decline, cancel, EOF, or failed validation leave config unchanged and retain the current actionable missing-source result. A missing source with an already installed usable image may still be offered, but declining it must not make that image unusable. `--non-interactive`, `--json`, API session setup, workflow preflight, and squad never prompt or write config; their errors identify the missing source and the config fields needed to fix it.
 
 ### 2. Render failure output cleanly
@@ -61,7 +63,7 @@ start Docker and rerun `awman ready` instead of investigating an unexplained soc
 
 ## Edge Case Considerations:
 
-- When only a non-default agent lacks a source, offer a `builtin.images` entry for that image instead of changing a default source that already serves other agents. A default source with a fixed `reference` or archive may name only one image; do not apply it to a different agent tag.
+- When only a non-default agent lacks a source, offer a `runtime.builtin.images` entry for that image instead of changing a default source that already serves other agents. A default source with a fixed `reference` or archive may name only one image; do not apply it to a different agent tag.
 - A repo config may override a global source. The preview must show the effective result and the selected scope, so a global write is not presented as fixing a repo override that still wins.
 - `DOCKER_HOST` or an explicit `host` may name a custom Unix socket. Report the actual selected endpoint. Reserve the “Docker is not running” wording for a local socket that is absent or refusing connections; a remote endpoint failure must not claim the user's local Docker installation is stopped.
 - Narrow terminals, Unicode text, multiline causes, very long paths, and malicious control characters must leave the summary legible. The original full diagnostic remains available in JSON and logs where appropriate.
@@ -74,8 +76,8 @@ start Docker and rerun `awman ready` instead of investigating an unexplained soc
 
 ## Codebase Integration:
 
-- Follow the existing `ReadyEngine`/`ReadyFrontend` separation (`src/engine/ready/`, `src/frontend/cli/per_command/ready.rs`, `src/frontend/tui/per_command/ready.rs`, API frontend) and the shared image-source resolver in `src/engine/image_prep/` and `src/engine/oci/`. Keep source selection explicit as required by `aspec/architecture/security.md`; a prompt acceptance is the authorization for the chosen config write.
-- Reuse config writing and validation behavior from `src/command/commands/config.rs`. Keep structured error classification below presentation, and keep human layout in Layer 3.
+- Follow `aspec/architecture/2026-grand-architecture.md` and the existing `ReadyEngine`/`ReadyFrontend` separation: Layer 0 owns config/source types and atomic writes; Layer 1 (`src/engine/ready/`, `image_prep/`, `oci/`) owns source probes and typed Docker transport errors; Layer 2 (`src/command/commands/ready.rs`) owns source choice, validation, retry and recovery policy; Layer 3 CLI/TUI/API frontends render or serialize the result. Keep source selection explicit as required by `aspec/architecture/security.md`.
+- Reuse the command's config validation path and Layer 0 writer. Keep human layout solely in Layer 3 and do not let frontend adapters choose a source or write configuration.
 
 ## Documentation
 

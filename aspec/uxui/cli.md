@@ -167,7 +167,7 @@ belongs to rather than inventing a new code.
 - The API server binds `127.0.0.1` only, with no option to listen elsewhere;
   a client on another machine reaches it through an SSH tunnel or a reverse
   proxy on the server host. A configurable bind address — with TLS required
-  for any non-loopback address — is specified by WI 0142 and is not part of
+  for any non-loopback address — is specified by WI 0140 and is not part of
   the current surface. A remote client whose connection to a non-loopback
   address is refused says this in its error instead of reporting only the
   transport failure.

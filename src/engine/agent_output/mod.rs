@@ -97,7 +97,7 @@ pub fn translator_for(format: AgentOutputFormat) -> Box<dyn AgentOutputTranslato
 
 /// Shared emission keeps the displayed transcript and result message identical.
 fn final_message(message: String) -> Vec<Translated> {
-    // WI 0141: apply the same redaction as ordinary output to this message.
+    // WI 0147: apply the same redaction as ordinary output to this message.
     let mut items: Vec<_> = message
         .lines()
         .map(|line| Translated::Line {
@@ -110,7 +110,7 @@ fn final_message(message: String) -> Vec<Translated> {
 }
 
 fn activity(kind: StepActivityKind, summary: &str) -> Translated {
-    // WI 0141: apply the same redaction as ordinary output to this summary.
+    // WI 0147: apply the same redaction as ordinary output to this summary.
     Translated::Activity {
         kind,
         summary: bound_summary(summary),

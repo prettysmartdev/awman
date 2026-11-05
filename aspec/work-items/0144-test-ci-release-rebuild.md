@@ -1,0 +1,147 @@
+# Work Item: Task
+
+Title: Rebuild awman's test, CI, and release system around fast feedback and promoted artifacts
+Issue: issuelink
+
+Depends on: 0143 (completed daemon block).
+
+## Summary:
+
+- Redesign the full path from a developer edit to a published release. The current Apple Silicon prerelease takes **40+ minutes on a high-end Mac Studio** (reported during v0.13), and the v0.13 release required a day of trial and error. The goal is a simpler, measured pipeline with short feedback loops, deterministic tests, credible hardware evidence, and one release candidate per target that is tested and then promoted.
+- Reassess every test and release layer across the repository. The November 2026 release is one case study in a longer history of hangs, platform failures, false-green skips, cache problems, and process races. Replace the test topology, fixture model, job graph, and release state machine where they create serial work, hide missing coverage, or allow unrelated tests to interfere.
+- Preserve the real safety requirements: untrusted code cannot access a privileged Mac; a required hardware check cannot silently skip; the signed Apple Silicon executable must actually boot; old-to-new state compatibility must be checked; and publication must require every declared release gate.
+
+## User Stories
+
+### User Story 1:
+As a: developer
+
+I want to:
+get a trustworthy result for my change in minutes, with a direct link to the failing test and its evidence
+
+So I can:
+fix defects without waiting for several full builds or rerunning unrelated suites.
+
+### User Story 2:
+As a: release operator
+
+I want to:
+validate a candidate once, see which exact artifacts passed, and promote those same bytes
+
+So I can:
+ship without a day of repeated prerelease runs, runner cleanup, and post-tag surprises.
+
+### User Story 3:
+As a: maintainer
+
+I want to:
+see queue, build, fixture, test, and release times and distinguish product failures from infrastructure failures
+
+So I can:
+improve the critical path and prevent flakes from becoming routine.
+
+## Evidence and current-state diagnosis
+
+### Repository-wide scope and failure classes
+
+This work item covers the Rust library and CLI (`src/`, `crates/`), all registered and unregistered tests (`tests/` and inline unit tests), shell checks and fixtures (`tools/`, including payload, OCI, and architecture checks), `templates/`, Cargo/toolchain/build configuration, `Makefile`, release scripts, both Actions workflows, runner setup, cache/artifact storage, branch protection, and the developer/release documentation. Inventory historical failures across the whole repository, not only the v0.13 commits; confirm each class against CI logs during phase 0.
+
+| Failure class | Repository evidence | Redesign requirement |
+|---|---|---|
+| Missing or silently skipped coverage | `crates/awman-cli/Cargo.toml` disables automatic integration-test discovery and requires hand-maintained `[[test]]` entries. `make test-fast` selects by `--skip real_git --skip real_network --skip builtin_hw`; many Docker, Apple, sandbox, real-store, corpus, and keychain scenarios return early unless environment opt-ins are set. `tests/helpers/mod.rs` still says `test-fast` skips `docker` by name, although the Make target no longer does. Tracked checks such as `tools/test-release-upgrade-policy.sh`, `test-build-previous-builtin-awman.sh`, `test-static-krunfw.sh`, and `test-review-build-inputs.sh` have no Make/Actions caller. | Discover every test target and expected scenario, make test selection and skip reasons explicit, and fail closed when required coverage did not run. Audit coverage of every shipped runtime/frontend/target and every shell gate. |
+| Shared state and unsafe process lifecycle | Historic fixes include a test-harness re-exec fork bomb (`2110d050`), API tests reaching another server (`585680c3`), inherited locks (`e6a2d429`, `f5b724fc`), executable-busy launches (`39fe0e05`, `d5043695`), and VM-owner collisions (`4aaef99f`). | Give tests owned processes, ports, files, images, and VMs; bound subprocess trees and clean them after failure or cancellation. |
+| Timing, scheduling, and hangs | Hanging tests were removed in `776e56d6`, `58a1dadb`, and `e1f959c0`. Slow-runner parallel workflow failures needed `204cea73`; paused Tokio time versus real sockets needed `4d3ba70f`; stream/lease stalls needed `3e8d7e6c`. | Use explicit readiness/completion signals, virtual time only for virtual resources, wall-clock watchdogs for I/O, and per-test resource/time budgets. |
+| Environment and platform differences | `e28d35a1` repaired Windows, Linux builtin, and Docker jobs; `02fe8c41` repaired a native libcap-ng build; `9f63d915` included macOS/Linux and action-runtime fixes; `32a8e59a` corrected macOS credential-source isolation. | Run an intentional supported-platform matrix with isolated host state and platform-specific contracts; test build and execution separately. |
+| External inputs and fixtures | Payload verification, promoted OCI fixtures, previous-protocol builds, real Docker/registry/Apple stores, network probes, and host keychain tests have distinct opt-ins and prerequisites. `tests/oci_import/real_stores.rs` and `corpus.rs` can skip unless `AWMAN_TEST_REQUIRE_EXTERNAL=1`; the ordinary CI jobs do not set their inputs. | Declare which external contracts are release-critical, provision versioned fixtures, and record a blocked result if required services or evidence are absent. Keep destructive host-service tests on isolated hosts. |
+| Build fanout and cache correctness | The test profile already disables debug info and incremental builds because many binaries link the full library/VM stack. `f462fa2e` had to bust a stale CI cache after source restructuring. Native clean checks intentionally discard Cargo caches; prerelease/release rebuild the same source repeatedly. | Measure compile/link/cache costs, minimize target fanout, key and validate caches by all build inputs, and reuse the exact candidate artifact across gates. |
+| CI graph, runner capacity, and policy drift | Hosted Docker/macOS jobs wait for `fast`; hardware jobs share labels with a temporary release runner; prerelease parses job display names; `aspec/devops/cicd.md` still describes a removed SQLite gate and an obsolete Windows limitation. | Use a generated/validated gate contract, stable required checks, bounded runner pools, PR supersession, and documentation verified against configuration. |
+| Release integrity and recovery | A version-only local test sentinel can survive source changes; final tag push precedes expensive tagged builds; prerelease-tested Mac bytes are rebuilt for publication; reruns rely on an operator and GitHub run state. `measure-release-artifact.sh` captures measurements but declares no thresholds; the release matrix only runs host measurements for ordinary Linux and no Windows executable smoke. | Bind evidence to commit/input/artifact digests and gate versions, test exact distributed bytes, define calibrated performance policy, promote atomically, and make interruption/retry/rollback deterministic. |
+
+The table describes observed code and representative history, not a claim that every historical failure has been counted. The phase-0 inventory must enumerate all test targets and shell checks, classify every recent CI/release failure and rerun, and identify any additional failure class before locking the new architecture.
+
+### November 3–5 v0.13 case study
+
+- November 3 already had a suite speed/flake pass (`9d4fec2b`) and follow-up CI fixes for inherited `PATH`, private-file locks held through fork, PTY close behavior, and API tests reaching another test's server (`8b4d5273`, `e6a2d429`, `72dff6de`, `585680c3`). These are different symptoms of process-global state, subprocess inheritance, port/process collisions, and timing-dependent assertions.
+- November 4 started with v0.13 preparation (`146510ec` at 08:33 -05), then changed runner setup and prerelease checks (`edd9dc9a`, `4a2853d7`, `824aeda9`). `824aeda9` replaced waiting for the entire Tests workflow with a script that checks a hand-maintained list of required jobs, after the hosted macOS smoke job could remain queued or fail from runner allocation. The prerelease command then had to repeat macOS checks locally.
+- The same day's test fixes addressed a build lock inherited by forked children (`e6322996`, then a second fix `f5b724fc`), an event subscriber attached after the sender was exposed and a test that relied on a 300 ms delay (`8cf45de1`), an executable-busy race during parallel test subprocess launches (`72537ed5`), a fixture missing from the native Apple-store gate (`72537ed5`), daemon-helper readiness (`f23e75a4`), and hardware tests seeing one another's VMs (`4aaef99f`). A late change removed a separate SQLite spike gate from prerelease/CI (`d0a29ec2`), yet `aspec/devops/cicd.md` still says it runs.
+- Further fixes landed at 19:15 (`d5043695`, executable-busy fake Docker CLI) and 20:27 (`9eac9cda`, real Git fixture). The `v0.13.0` tag is at `cff7be64` on November 5. This history supports a broad design problem; commit messages alone do not prove which individual CI run failed or its exact duration. Collect those logs and timings in phase 0.
+
+### Pipeline map and structural bottlenecks
+
+| Area | Current path | Cost or reliability problem |
+|---|---|
+| Local / PR | `make pre-push` runs architecture lint, shell checks, fmt, clippy, and the full default workspace test suite. `fast` runs a near duplicate, then `full-linux-docker` and `build-macos` wait on `fast`; other build matrices run separately. | Rust source contains roughly 5,600 test annotations across hundreds of modules; a name-based `--skip` filter defines part of the “fast” suite. CI repeats compilation and tests across runner OSes and features. `needs: fast` adds avoidable wall-clock latency after a slow fast job. |
+| Apple prerelease | `tools/apple-silicon-prerelease.sh` waits for selected push jobs, creates a detached worktree, runs `pre-push`, builds a macOS release smoke binary, provisions a fixture and runner scripts, runs `native-builtin-ci.sh`, runs `test-builtin-hw`, then builds/signs/tests/measures an optimized release binary in a fresh target directory. | Several full current-source builds, two real-guest suites, old-version build(s), image setup, and artifact measurement are serial. `native-builtin-ci.sh` deliberately creates fresh Cargo source and target caches, so its build cannot reuse the preceding one. The exact release build uses another fresh target. |
+| Native tests | `make test-builtin` compiles test targets, separately builds guest drivers, signs, builds the previous builtin awman if absent, then runs tests and network checks. `test-builtin-hw` wraps it with fixture preparation and a catalog compatibility pass. | Broad target selection links the VM stack into multiple test binaries. The previous-version executable is built from Git history; clean native jobs discard the target cache. The test harness contains stateful guest, Docker, API, Git, daemon, and process tests with shared resource hazards. |
+| CI and runner scheduling | `test.yml` has hosted PR jobs plus nightly/manual Mac hardware jobs; `release.yml` has another Mac job. The release script creates a temporary runner and searches for queued Tests jobs to cancel because both use the same labels. | Runner assignment is coupled to release timing. A Tests job can take the release runner and fail itself to free it. A human must inspect/cancel stale jobs. The workflows have no PR supersession policy. |
+| Release | `scripts/release.sh` has a `.git/.release-tests-passed-<version>` sentinel, creates/pushes a final tag, and waits for `release.yml`, which builds the Mac executable again and boots that rebuilt artifact before publishing. | The sentinel is keyed only by version, not commit, inputs, or gate results; it can outlive source changes. The prerelease-tested signed binary is not the published Mac binary. Expensive release validation occurs again after the final tag exists. Only plain final-version tags trigger the workflow, so there is no first-class candidate/promotion path. |
+| Reporting and policy | Test output is mostly `cargo test --quiet`; hardware uses an ad hoc TSV; required prerelease jobs are matched by display name in `prerelease-ci-gate.sh`. `aspec/devops/cicd.md` has stale SQLite and Windows descriptions. | No durable timing breakdown, test history, flaky-test rate, or single source of truth for gate membership. A renamed/added job can silently diverge from the prerelease checker or documentation. |
+
+The 40+ minute figure is a user-observed baseline, not a benchmark produced by this repository. GitHub run logs were unavailable in this review because `gh` is not authenticated here. The implementation must capture a fresh baseline, including cold and warm Mac runs, before claiming a specific speedup.
+
+## Implementation Details:
+
+### 0. Measure and define the gate contract
+
+- Inventory every Rust test target, inline unit test group, shell test, image/payload verification, real Git/Docker/network test, guest scenario, upgrade check, build smoke, artifact check, measurement, and release step. Include `[[test]]` registration and every tracked `tools/test-*.sh` file, then map each to the Make/Actions/release caller or mark it deliberately manual. Record purpose, owner, required environment, side effects, expected duration, and whether it guards merge, candidate creation, promotion, or periodic health. Delete obsolete spike gates or move them to an explicit maintained suite; no undocumented `--skip` convention.
+- Audit the full available Git and Actions failure history by failure class, OS, runtime, and gate, with particular attention to repeated fixes, disabled tests, skipped prerequisites, hangs, and failures first seen only after tagging. Capture v0.13 as a detailed case study (including each rerun and queue time) and a reproducible Apple Silicon trace: step start/end, compilation, cache restore, fixture setup, previous-version build, VM boot/runtime, signing, and upload. Record p50/p95 for PR checks, Mac candidate validation, and full release over enough runs to distinguish warm/cold behavior. Persist machine-readable results and the critical-path report as CI artifacts.
+- Write a versioned gate manifest with stable identifiers, required test/scenario names or selectors, supported platforms, and `pass`/`fail`/`blocked`/`skip` semantics. Generate or validate CI job names, prerelease requirements, local commands, and documentation against it. A required gate that is missing, skipped, or inconclusive fails closed.
+- Establish initial service-level targets from the baseline. Aim for **under 10 minutes p95 for the required PR path** and **under 20 minutes p95 warm for the Apple Silicon candidate gate**, while retaining a separate cold-run target and full-suite budget. If baseline data shows these are infeasible, document the limiting cost and a staged, numeric reduction plan; do not lower coverage to manufacture a faster result.
+
+### 1. Rebuild the test architecture
+
+- Define tiers by purpose: (a) pure unit/contract and CLI parse checks on every edit; (b) hermetic component tests with owned fake services and deterministic clocks; (c) bounded integration tests for real Git, Docker, network, API, and process behavior on PR; (d) a small native guest smoke for candidate and selected main changes; (e) full guest, upgrade, fault, pressure, and long-running compatibility suites on a schedule and before promotion when their release contract requires them. Name/select tiers explicitly rather than by substrings in test function names.
+- Remove cross-test coupling. Each test gets its own HOME, temp root, daemon/process group, ports, images, and VM namespace or unique binary/owner identity. Make fixture creation atomic and immutable after publication; enforce cleanup for crashes and timeouts. Process-global `PATH`/env edits, inherited file descriptors, and writable binaries must not be shared across concurrent tests. Use readiness signals and virtual/deterministic clocks rather than arbitrary sleeps for protocol assertions.
+- Split or group test binaries around ownership and dependency weight so the builtin VM stack is linked only where needed. Build test executables once per target/profile, then run selected suites from those executables. Evaluate a runner such as cargo-nextest for per-test timing, partitioning, process isolation, and structured output, but retain libtest or custom harnesses where guest lifecycle and resource limits require it. Run hardware tests with an explicit VM concurrency budget; parallelize only independent scenarios.
+- Generate pinned, content-addressed OCI fixtures and previous-release binaries outside the hot path, then verify their digests and provenance when used. Rebuild them when their inputs change or for a dedicated reproducibility audit. Keep a controlled clean-build gate for supply-chain confidence, but do not make every native test pay for a fresh registry and target cache.
+- Rework the suite based on observable behavior: consolidate repeated end-to-end variants into contract/property tests plus a smaller scenario matrix; keep one real integration proof per critical boundary and one real guest proof for each released runtime contract. Remove tests that assert incidental timing or implementation order. Preserve/strengthen coverage for failures found in the v0.13 timeline, including forked locks, concurrent subprocesses, API server isolation, VM ownership, guest fixture availability, and event handoff.
+- Validate coverage discovery itself: a new Rust integration target, shell check, runtime, or release target must enter an explicit inventory and receive a gate decision. Test-only `return` paths and `#[ignore]` cases must produce machine-readable skip reasons; a required suite passes only when its expected scenarios actually executed. Include crash, cancellation, timeout, and resource-exhaustion behavior for daemons, subprocesses, OCI sources, and guests in the appropriate tier.
+- A failing test records seed, test ID, target, toolchain, fixture digests, logs, relevant process/VM IDs, and a one-command local reproduction. Retries may classify transient infrastructure setup/runner faults, but a product-test failure must remain visible and fail the gate. Track flaky tests with owner, issue, expiry, and rate; do not let quarantine silently turn required coverage green.
+
+### 2. Replace the CI graph
+
+- Design a small, documented job graph driven by the gate manifest. Run independent lint, build, and test work concurrently; keep prerequisites only where an artifact truly depends on another job. Cancel superseded PR runs while preserving main, candidate, and release runs. Pin toolchains/actions and verify the workflow syntax and generated matrix in CI.
+- Run the core contract suite and `make architecture-lint` for every code change, with no path-based exemption for layer boundaries, catalogue integrity, or frontend parity. The lint must reject upward imports and engine behavior called directly from Layer 3, and the contract suite must exercise the same Layer 2 command behavior through builtin and daemon backends. Select additional domain suites from an explicit dependency map, with a conservative full-run fallback for shared infrastructure, build scripts, and unknown paths; run the complete supported matrix on a schedule and before promotion as required by the gate contract. Show exactly which suites were selected and why.
+- Cache compiled dependencies and test executables with keys that include OS, architecture, toolchain, profile, feature set, lockfile, and relevant build inputs. Separate dependency caches from result artifacts. Record hit/miss, transfer size, and saved time; use immutable, trusted cache scopes so PR code cannot poison a privileged release build. Audit whether remote compilation or a persistent trusted Mac build cache helps after measuring it.
+- Make one required summary check report the manifest's result for the commit. Include a readable matrix of passed, failed, blocked, and intentionally unrun tiers; report queue versus execution time and the slowest tests. Ensure branch protection depends on stable gate IDs and that absent Mac hardware is surfaced as blocked when its gate is required.
+- Resolve self-hosted Mac scheduling through a dedicated release runner group/label or an equivalent reservation policy. Keep untrusted PR code and credentials away from the release Mac, and make the runner ephemeral or reset it between trusted jobs. A scheduled test must never occupy the release runner merely to fail and free it.
+
+### 3. Replace prerelease and release with build–validate–promote
+
+- Introduce a candidate run for an exact commit and version before the final tag. Build each distributable target **once**, producing immutable artifacts with checksums, toolchain/build-input metadata, and provenance. The Apple Silicon candidate is signed once with the shipping entitlement. Pass the exact signed bytes through offline boot, upgrade, dependency/helper, startup/resource, and release smoke checks. Never rebuild an artifact merely to publish it; promotion verifies the candidate digest and uses those same bytes. Keep a separate clean reproducibility audit of unsigned bytes.
+- Make candidate validation resumable by content digest and gate version. A failed test can rerun its failed/blocked suite against the same artifact and fixtures; any source, dependency, signing input, or required gate change invalidates the affected evidence. Replace the version-only `.git` sentinel with commit/digest-bound CI attestations. Human overrides must be explicit, recorded, narrowly scoped, and unable to turn a required hardware or artifact-integrity failure into a pass.
+- Move cheap preflight (version, notes, target availability, fixture/payload digest, runner capacity, toolchain, disk) before expensive work. Separate functional acceptance gates from performance regression monitoring and full payload provenance audits according to the documented release contract. A performance threshold that is release blocking must be calibrated for machine variance; always retain raw measurements.
+- Support a candidate or RC lifecycle without publishing a final tag first. Publish the final tag/release only after all required candidate gates pass, and make publication idempotent. Verify downloaded artifact checksums and expected target set before release creation; document failed-promotion recovery and rollback. Ensure Linux/Windows assets get artifact-level smoke appropriate to their platform and that the published Mac executable is the one that booted on real hardware.
+- Keep a single operator command/dashboard for candidate status, failed gate, retry, and promotion. The implementation may replace `make apple-silicon-prerelease`, `scripts/release.sh`, `tools/prerelease-ci-gate.sh`, and the two Actions workflows rather than layering another script over them.
+
+### 4. Migrate with evidence
+
+- Land instrumentation and manifest validation first. Run the new tiers in shadow mode beside the existing gates for a bounded period; compare test inventory, detected failures, and artifact hashes. Then switch branch protection and release promotion to the new summary gate. Remove legacy duplicate jobs, scripts, caches, and stale documentation after parity is demonstrated.
+- Include a rollback path for the CI configuration and release process during cutover. Retain the ability to run the old full test command manually until the new suite demonstrates equivalent coverage; remove it from the normal critical path once the explicit gate contract is proven.
+
+## Edge Case Considerations:
+
+- First release on a new Mac, cold caches, offline or rate-limited fixture registries, missing Apple Containers/Docker, low disk, interrupted jobs, stale runner registrations, and concurrent candidate attempts must produce actionable `blocked` or `failed` outcomes without publishing partial assets.
+- A candidate artifact must be tied to the exact source commit, dependency lockfile, payload/fixture digests, target, toolchain, signing inputs, and gate version. A force-push or changed release notes must not reuse stale evidence.
+- Separate finite resource pools for Docker, Apple Containers, and Hypervisor.framework guests. Timeouts must terminate child process groups and release image/VM leases, including after a cancelled workflow.
+- Preserve explicit, isolated coverage on Linux, Windows, and Apple Silicon; a cross-build or hosted Mac build cannot be recorded as a real-guest pass.
+- Self-hosted runner and cache trust boundaries need review before PR, candidate, and release workflows share any artifacts or machines.
+
+## Test Considerations:
+
+- Validate the gate manifest against test discovery and workflow configuration; deliberately remove/rename a required job or test and verify the summary gate fails closed.
+- Exercise each failure class in the repository-wide table with controlled faults: unavailable service, stale/wrong fixture, cache mismatch, leaked subprocess, occupied port, slow runner, platform-specific build failure, missing test registration, skipped required hardware, and interrupted release. Verify the correct gate fails or blocks with a usable diagnostic and retained evidence.
+- Prove per-test isolation by running the previously flaky API, Docker fake, lock, subprocess, daemon, and VM-owner scenarios repeatedly under parallel load, then reproduce each from saved evidence. Avoid fixed sleeps or blanket retries as the success criterion.
+- Verify warm and cold runs, cache invalidation, cancellation, hardware unavailability, fixture drift, old-version artifact retrieval, failed candidate rerun, and interrupted promotion. Compare produced and published SHA-256 values for every target, including the signed Mac binary, and boot the published Mac bytes.
+- Report baseline and post-migration p50/p95 times, runner queue time, per-tier failure/flake rate, rebuild counts, cache hit rate, and manual interventions. Accept the migration only when required coverage is preserved, no stale evidence can satisfy a gate, and measured critical-path time materially improves against the v0.13 baseline.
+- Assert from build logs that a candidate's optimized executable is built once per target and its digest is unchanged through testing and publication; record any separate test-binary build and clean reproducibility audit explicitly. A prerelease run must not repeat the entire default suite already proved for the same commit and gate version.
+
+## Codebase Integration:
+
+- Start from `.github/workflows/test.yml`, `.github/workflows/release.yml`, `Makefile`, `scripts/release.sh`, `tools/apple-silicon-prerelease.sh`, `tools/native-builtin-ci.sh`, `tools/test-builtin-hw.sh`, `tools/isolated-test.sh`, `tools/build-previous-builtin-awman.sh`, fixture/payload tools, and the Rust suites under `src/`, `crates/`, and `tests/`. Replace entry points as needed; do not preserve their present shape as a requirement.
+- Keep `aspec/architecture/2026-grand-architecture.md` and the security rules in `aspec/` as hard acceptance constraints, especially layer boundaries, mode parity, test isolation, verified payloads, explicit native hardware coverage, and the signed artifact's offline guest check. The gate manifest and CI scripts are build infrastructure, not a second runtime policy source. Update `aspec/devops/cicd.md` and `aspec/devops/localdev.md` to be generated from or checked against the actual gate contract.
+- GitHub Actions features to evaluate: [concurrency and PR cancellation](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/control-workflow-concurrency), [artifact sharing and digest validation](https://docs.github.com/en/actions/tutorials/store-and-share-data), and [cache scope/security](https://docs.github.com/en/actions/reference/workflows-and-actions/dependency-caching). For Rust test orchestration, evaluate [cargo-nextest's timing and partitioning features](https://nexte.st/docs/running/) against the hardware isolation requirements; do not adopt a tool solely for its advertised speed.
+
+## Documentation
+
+After implementation, update `aspec/devops/cicd.md`, `aspec/devops/localdev.md`, the release operator instructions, and the user-facing install/release verification instructions. Document the exact local fast command, full-suite command, candidate/promotion procedure, gate meanings, artifact verification, and failed-run recovery. Remove statements about gates that no longer exist.

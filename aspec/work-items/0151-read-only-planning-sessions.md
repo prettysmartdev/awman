@@ -3,9 +3,11 @@
 Title: Read-only workspace for `exec prompt`
 Issue: issuelink
 
+Depends on: 0143 (completed daemon block).
+
 ## Summary:
 - `exec prompt` runs in the session directory with no worktree. With the API's default `--yolo`, the agent can modify that directory. Clients that use a long-lived checkout for a planning or review agent must reset it (`git reset --hard`) before every call and hope nothing important was written.
-- Add `--read-only-workspace`: the workspace is mounted `:ro`. Durable writes go to the context (0140) or outputs (0137) directories.
+- Add `--read-only-workspace`: the workspace is mounted `:ro`. Durable writes go to the context (0146) or outputs (0137) directories.
 
 ## User Stories
 
@@ -31,7 +33,7 @@ reuse one checkout safely, and run several planning prompts against it at once
 - Write attempt fails inside the container on each runtime; context and output stay writable.
 
 ## Codebase Integration:
-- follow established conventions, best practices, testing, and architecture patterns from the project's aspec.
+- Follow `aspec/architecture/2026-grand-architecture.md`: Layer 0 owns the workspace intent and mount spec; Layer 1 enforces read-only mounts and writable scratch in every runtime; Layer 2 owns the catalogue flag, preflight and prompt policy; Layer 3 only collects the option and renders the result. The same Layer 2 path must apply in builtin, daemon, CLI, TUI and API frontends; no runtime may silently turn read-only into read-write.
 
 ## Documentation
 - `docs/03-agent-sessions.md`, `docs/14-command-reference.md`.

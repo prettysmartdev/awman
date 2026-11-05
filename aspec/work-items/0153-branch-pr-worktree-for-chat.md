@@ -3,6 +3,8 @@
 Title: branch, pr, worktree for chat
 Issue: issuelink
 
+Depends on: 0143 (completed daemon block).
+
 ## Summary:
 - This item adds `--branch`, `--pr` and `--worktree` flags to `awman chat` and `awman exec prompt`. They automate common git/GitHub workflows by launching the agent container in a linked worktree instead of the main checkout.
 - `--branch <name>` finds (fetches) or creates the branch, creates a worktree for it, and mounts that worktree in the agent container.
@@ -125,7 +127,7 @@ return to existing work with a new agent session, without changing anything in t
 - These flags do not use `WorktreeLifecycle`, and there is no merge or discard prompt when the session ends. The worktree is the user's to keep working in, and removing it stays manual. Do not auto-delete a worktree or branch, including on abort or agent failure.
 
 ### Security
-- `--worktree <path>` lets the caller choose a host mount source, and the `worker` push working-directory allowlist (`daemon.features.worker.push.workDirs`, 0159) forbids linked worktrees (`aspec/architecture/security.md`). The flags are therefore for local frontends only: the CLI and TUI, whether they run in-process or through the daemon's `engine` on the local listener (0154/0155). Verify that a `POST /v1/worker/commands` request for `exec prompt` containing them is refused.
+- `--worktree <path>` lets the caller choose a host mount source, and the `worker` push working-directory allowlist (`daemon.features.worker.push.workDirs`, 0139) forbids linked worktrees (`aspec/architecture/security.md`). The flags are therefore for local frontends only: the CLI and TUI, whether they run in-process or through the daemon's `engine` on the local listener (0142). Verify that a `POST /v1/worker/commands` request for `exec prompt` containing them is refused.
 - `open_worktree_for` normally takes most repo config from the worktree checkout. With `--pr` and fetched branches, that checkout can be someone else's code, and its `.awman/config.json` could add overlays or env passthrough. For these flags, the invoker's repo config applies in full.
 - Host git goes through `host_command`, which already disables hooks, fsmonitor and content drivers. Add new git operations there, and do not spawn bare `git`.
 - Update `aspec/architecture/security.md`: the "only mount the current directory or repo root" rule needs to record these sessions, which mount a linked worktree of the same repo plus its main `.git`. Update `aspec/uxui/cli.md` too.
@@ -152,7 +154,7 @@ return to existing work with a new agent session, without changing anything in t
 - **Uncommitted changes in the invoking checkout:** they are not carried into the worktree. Mention this when a new branch is created.
 - **LFS or filter-based repos:** `host_command` disables content drivers, so a checkout on the host can contain LFS pointers rather than file contents. Note this in the docs.
 - **Two sessions on one worktree, or two simultaneous `--branch` launches:** the first is allowed, as with two sessions in one checkout. For the second, a failed `worktree add` re-runs the lookup once and reuses the worktree it finds.
-- **Combining flags:** `--work-item` (see 0139) works with all three on `exec prompt`, and is resolved from the invoking repo, including its `workItems.source`. `--plan`, `--yolo` and `--auto` work unchanged and do not imply any of these flags.
+- **Combining flags:** `--work-item` (see 0148) works with all three on `exec prompt`, and is resolved from the invoking repo, including its `workItems.source`. `--plan`, `--yolo` and `--auto` work unchanged and do not imply any of these flags.
 
 
 ## Test Considerations:
@@ -185,6 +187,7 @@ return to existing work with a new agent session, without changing anything in t
 
 
 ## Codebase Integration:
+- Follow `aspec/architecture/2026-grand-architecture.md`: Layer 0 owns validated path/ref types; Layer 1 owns Git/GitHub operations; Layer 2 owns catalogue flags, worktree/PR decisions and command orchestration; Layer 3 only asks typed questions and renders progress. CLI and TUI use the same Layer 2 command path through builtin and daemon backends.
 - Follow established conventions, best practices, testing, and architecture patterns from the project's aspec.
 - Layering: paths in `data/worktree_paths.rs` (Layer 0, no git calls), git and GitHub calls in `engine/git/`, the decision flow in `command/commands/session_worktree.rs`. Frontends only render messages.
 - Declare flags in the catalogue, not per frontend. The CLI, TUI and generated reference pick them up from there.

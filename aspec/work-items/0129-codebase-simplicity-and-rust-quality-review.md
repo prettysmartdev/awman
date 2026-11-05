@@ -302,7 +302,7 @@ These were checked and need no work. Do not reopen them under this item:
 
 **Evidence:** in `src/frontend/api/routes.rs`, `create_submission` (950) inserts the session row (1034), records remote fields (1048) and labels (1065), records the run (1080), enqueues the command, compensates by closing the session on failure, and creates the setup bus. `enqueue_command` (1656) performs the command insert. `AdmissionJournal` and `with_idempotency` (584–790) implement the idempotency reservation state machine, including its `Drop` release (650). WI 0138 added `command_idempotency_canonical` here as well.
 
-**Impact:** the ordering of these writes is crash-consistency logic, as the file's own comments say. Any other HTTP host, including the daemon proposed by WI 0145, would have to reproduce it. It is also not testable without HTTP.
+**Impact:** the ordering of these writes is crash-consistency logic, as the file's own comments say. Any other HTTP host, including the daemon proposed by WI 0140, would have to reproduce it. It is also not testable without HTTP.
 
 **Remediation:** add a Layer 2 admission type under `src/command/commands/api_server/` that takes typed session/command submissions and an idempotency key, owns the writes, compensation, and reservation lifecycle, and returns a typed outcome. Routes parse requests, call it, and map outcomes to status codes, following the `CloseOutcome` pattern already in `runtime.rs`.
 
@@ -314,7 +314,7 @@ These were checked and need no work. Do not reopen them under this item:
 
 **Evidence:** `CommandLogCursor` (`routes.rs:1741`), `ReplayFrom` use, `command_log_events` (1887), `finish_terminal_log` (1902), `recover_command_log_gap` (1987), and `wait_for_worker` (2021) implement resume, deduplication, gap repair, and terminal-event rules. `handle_stream_command_logs` (2061) runs them inline in the SSE stream.
 
-**Impact:** event delivery guarantees are business rules in a transport adapter. WI 0146's live terminals and any non-SSE consumer would need the same rules.
+**Impact:** event delivery guarantees are business rules in a transport adapter. WI 0141's live terminals and any non-SSE consumer would need the same rules.
 
 **Remediation:** move the cursor and replay logic to a Layer 2 stream type next to the event bus, yielding `ExecutionEvent`s. The route keeps only SSE encoding, the query mapping, and shutdown wiring.
 
@@ -380,7 +380,7 @@ These were checked and need no work. Do not reopen them under this item:
 
 **Evidence:** Layer 3 lists CLI, TUI, and API, but `src/frontend/squad/` is a fourth frontend. `Engines`, `Startup`, `HeadlessDefaults`, the squad engine, and the catalogue-driven build table are not described. The list of key Layer 1 components omits `squad`, `oci`, `acp`, and `credential_refresh`. `aspec/architecture/four-layer-summary.md` and `docs/architecture.md` should be checked for the same gaps.
 
-**Remediation:** make a short factual update after A01–A05 settle, so the document describes the final state. WI 0145 will change the daemon section, so keep daemon wording minimal. Leave the document's historic framing alone.
+**Remediation:** make a short factual update after A01–A05 settle, so the document describes the final state. WI 0140 will change the daemon section, so keep daemon wording minimal. Leave the document's historic framing alone.
 
 **Acceptance:** each top-level module in `src/engine` and each directory in `src/frontend` is either described or covered by a stated general rule.
 
@@ -402,7 +402,7 @@ Use a coordinating integrator and bounded implementers. These are future assignm
 | Integrator | Baseline, shared interface decisions, final review, F12, A05, A06, A08 | Reserve `dispatch/mod.rs`, manifests, module exports, and common error variants; approve small interface changes before consumers branch |
 | Persistence/config implementer | F01, F03, F04, F07, F10 | Land F03/F04 first; coordinate typed statuses with queue completion and with the API implementer |
 | Runtime implementer | F02, F08, F09, F11, A07 | Agree launch-resource ownership first; hand typed launch inputs to command changes |
-| API implementer | A01, A02, A03, F05 | A03 follows F10. Agree the admission type with the integrator. Coordinate with the WI 0145 owner |
+| API implementer | A01, A02, A03, F05 | A03 follows F10. Agree the admission type with the integrator. Coordinate with the WI 0140 owner |
 | Frontend implementer | F06, F13, A04 | Agree the typed input boundary with the integrator. A04 follows F06 |
 | Verification/cleanup implementer | F14–F17 | Run after or alongside independent fixes; the integrator owns final manifest edits; never change other agents' source to make a check pass silently |
 
@@ -413,7 +413,7 @@ Landing sequence:
 1. Establish the baseline and focused failing regressions; agree DB status, input, resource, and admission contracts.
 2. Land F01–F04 correctness fixes with their tests. Review F03/F04 together for reload behavior.
 3. Land F05–F11 in independently reviewable behavior/duplication batches.
-4. Land A01–A03 before WI 0145 starts, because it changes the same API and daemon code. WI 0138 has already landed, so A01–A03 build on its routes. If WI 0145 has started, the integrator re-sequences with its owner.
+4. Land A01–A03 before WI 0140 starts, because it changes the same API and daemon code. WI 0138 has already landed, so A01–A03 build on its routes. If WI 0140 has started, the integrator re-sequences with its owner.
 5. Land F12, F13, A04, and A05 after the affected contracts settle, preserving behavior.
 6. Finish F14–F17 and A06–A08, then run the integrated validation matrix.
 
@@ -430,7 +430,7 @@ For each finding, record: commit/change location, behavior before/after, focused
 - Moving idempotency logic (A01) must keep a retried request from creating a second session or command across a crash, and must keep the reservation released when a handler future is dropped.
 - Avoid widening mounts, network policy, credentials, or host execution while consolidating code. Keep native and sandbox capability refusals explicit.
 - Keep private-file versus repo-file permissions intentional; atomic publication must not silently change established symlink or concurrent-writer behavior.
-- Coordinate upstream runtime work with WI 0120, Linux/native gates with WI 0124, daemon structure with WI 0145, live terminals with WI 0146, and config keys and API routes with WI 0159 (A01–A03 build on today's routes; 0159's renames land after them and must keep the read models they introduce). Do not duplicate their feature scope here.
+- Coordinate upstream runtime work with WI 0120, Linux/native gates with WI 0124, daemon structure with WI 0140, live terminals with WI 0141, and config keys and API routes with WI 0139 (A01–A03 build on today's routes; 0139's renames land after them and must keep the read models they introduce). Do not duplicate their feature scope here.
 
 ## Test Considerations:
 
@@ -735,7 +735,7 @@ unchanged successful API/idempotency fixtures. Deliberate corrections prevent
 orphan duplicate sessions and incomplete-admission success replay. Retain tiny
 typed access adapters, byte-order-preserving response structs and raw JSON
 fingerprints; setup presentation remains frontend-owned under the contract.
-No new platform gate; WI 0145 orchestration scope is not duplicated.
+No new platform gate; WI 0140 orchestration scope is not duplicated.
 
 **A02 — log stream.** Location:
 `src/command/commands/api_server/command_log_stream.rs`; routes consume it and
@@ -747,7 +747,7 @@ worker-failure live/reconnect tests and WI 0136 resume/step-filter fixtures.
 Retain JSON snapshot transport handling, separate setup streams and id-less
 recovery notifications; historical Done alone cannot finish a running attempt.
 The sidecar completion correction is deliberate; wire names/IDs are preserved.
-No platform-specific blocker or WI 0146 terminal feature added.
+No platform-specific blocker or WI 0141 terminal feature added.
 
 **A03 — read models.** Locations: API runtime's `ApiSessionLifecycle`,
 `src/data/fs/api_db.rs` queue records and routes. Before, routes chose lifecycle,
@@ -850,7 +850,7 @@ HeadlessDefaults and catalogue construction named. CX-04 completes design.md.
 Evidence: current module declarations and constructor paths checked against the
 document maps. Retain short repeated inventories for independently readable
 references and the grand document's historical framing; daemon wording stays
-minimal for WI 0145. No runtime behavior change or platform blocker.
+minimal for WI 0140. No runtime behavior change or platform blocker.
 
 ### Final integrated validation (2026-10-31)
 

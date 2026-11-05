@@ -22,7 +22,7 @@ open WI 0124, and upstream as listed in "Upstream state" below.
 - WI 0119/0121 delivered the builtin runtime on a vendored
   `msb_krun 0.1.39` patch (a typed, process-lifetime `EmbeddedKernel`
   registry). WI 0122/0123 then booted that patch natively on Apple Silicon and
-  shipped it as `builtin-experimental` (macOS/aarch64 only; 0159 renames the value to `runtime.kind: "builtin"`). Linux KVM boots
+  shipped it as `builtin-experimental` (macOS/aarch64 only; 0139 renames the value to `runtime.kind: "builtin"`). Linux KVM boots
   are still unproven and belong to optional
   [WI 0124](0124-builtin-linux-and-docker-gates.md).
 - **Upstream changed after this item was written.** libkrun PR #144 (commit

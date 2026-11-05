@@ -3,7 +3,7 @@
 Title: Work item sources: `workItems.source`, a unified `--work-item`, HTTP provider, inline bodies
 Issue: issuelink
 
-Depends on: 0159 (config tree and route names).
+Depends on: 0143 (the complete daemon and finalized config/API surface).
 
 ## Summary:
 - Today the only way to give dynamic mode its input is a file named `NNNN-*` in the repository (`dynamic.rs:279-299`). `--issue` exists but dynamic mode rejects it, and GitHub is the only `IssueSource` (`src/engine/issue/router.rs`). API clients that keep specs elsewhere must commit a file onto a branch just so awman can read it, and their numbers can collide with work items already in the repo. Teams that track work in GitHub issues have to keep passing `--issue`, and `new spec` can only ever write a file.
@@ -53,7 +53,7 @@ avoid running the wrong spec silently
 ## Implementation Details:
 
 ### Configuration
-- Put the setting in the `workItems` section, as `workItems.source` (repo scope), next to `dir` and `template`. All work item settings then live together (0159 removes the `work_items.*` alias, so there is only one spelling). Add `source: Option<WorkItemSource>` to the `workItems` section of 0159's `ConfigFile`, and register it in the key table (`src/data/config/fields.rs`) with scope `repo`:
+- Put the setting in the `workItems` section, as `workItems.source` (repo scope), next to `dir` and `template`. All work item settings then live together (0139 removes the `work_items.*` alias, so there is only one spelling). Add `source: Option<WorkItemSource>` to the `workItems` section of 0139's `ConfigFile`, and register it in the key table (`src/data/config/fields.rs`) with scope `repo`:
   ```json
   { "workItems": { "source": "github" } }
   ```
@@ -64,7 +64,7 @@ avoid running the wrong spec silently
   | `"github"` | Issues in the repository of the `origin` remote |
   | `"http:<name>"` | The global provider `workItems.providers.<name>` |
 
-- Add `workItems.providers.<name>: { baseUrl, tokenEnv }` with **global** scope only (a named map, per 0159's collection rule; names match `[a-z0-9][a-z0-9_-]{0,62}`). Repo config ships with the checkout and may be untrusted, so it can only select a provider by name. It can never supply a URL or token variable.
+- Add `workItems.providers.<name>: { baseUrl, tokenEnv }` with **global** scope only (a named map, per 0139's collection rule; names match `[a-z0-9][a-z0-9_-]{0,62}`). Repo config ships with the checkout and may be untrusted, so it can only select a provider by name. It can never supply a URL or token variable.
 - An unrecognized value, or an `http:<name>` with no matching global entry, is an error on any command that needs a work item. It must not fall back to local: that would write specs to a location the team is not using. Warn at load through `load_warnings`, too.
 - `workItems.dir` still locates local files when a source is set, including for explicit `local:` references. `workItems.template` still shapes new work items for every source.
 
@@ -143,7 +143,7 @@ The explicit forms always win over `workItems.source`, so a repo set to GitHub c
 
 ### Live sync for interview and `specs amend`
 - While the agent runs, awman watches the draft and uploads changes, so the user can read the work item on the tracker and keep iterating with the agent. Sync is one-way, from the draft to the tracker. It applies only to remote sources.
-- Add `src/engine/issue/draft_sync.rs` with a task that runs alongside `execution.wait().await` in `create_new_spec` and `specs amend`, and share that wiring between the two.
+- Add `src/command/work_item/draft_sync.rs` with a Layer 2 task that runs alongside `execution.wait().await` in `create_new_spec` and `specs amend`, and share that wiring between the two. Layer 0 supplies safe draft-file reads, Layer 1 supplies provider transport, and sync timing, conflict and retry decisions stay in Layer 2.
 - **Detecting changes:** poll the draft once per second, comparing size and modification time, then a hash of the content. Do not use filesystem events: they do not reliably cross the VM-backed mounts used by the Apple and builtin runtimes.
 - **Debounce:** upload after the draft has been unchanged for 5 seconds. During continuous edits, upload at most once every 30 seconds, using the latest content. Allow one request at a time, and on `RateLimited`, back off and let later uploads replace the skipped ones. Define these as constants in `draft_sync.rs`; do not add config settings. Put the timing decisions in a small pure state machine so tests do not depend on real time.
 - **What is uploaded:** skip any content identical to the last upload. Never upload an empty draft during the run, since this is usually a save in progress.
@@ -223,12 +223,12 @@ The explicit forms always win over `workItems.source`, so a repo set to GitHub c
 
 ## Codebase Integration:
 - Follow established conventions, best practices, testing, and architecture patterns from the project's aspec.
-- Layering: config and `WorkItemRef` in `data/` (no I/O), providers in `engine/issue/`, the flow in `command/commands/work_item_source.rs`. Frontends only render.
+- Follow `aspec/architecture/2026-grand-architecture.md`: Layer 0 owns config, `WorkItemRef`, issue DTOs and safe scratch-file persistence/reads; Layer 1 `engine/issue/` owns provider HTTP/GitHub transport; Layer 2 `command/work_item/` owns source selection, issue creation, draft sync, conflict/retry and command orchestration; Layer 3 only renders typed messages. Provider transport never chooses a source or calls frontend code.
 - Keep the `Issue` and `IssueSource` type names to limit churn. This item changes the user-facing concept, not the provider abstraction.
 - `parse_work_item_number` and `find_work_item_file` now serve only the local path. Move them out of `exec_workflow/issue.rs` to the new module. `push_back.rs` and `dynamic.rs` import them from `exec_workflow` today.
 - Other code that assumes a work item is a file or number: `worktree_lifecycle.rs` (`name_for`), `build_leader_prompt` placeholders, and `render_interview_prompt` and `render_amend_prompt`. Search for `work_item_number` and `{{work_item_` when implementing.
-- Update `aspec/uxui/cli.md` and `aspec/architecture/security.md` for the new flag, the global-only provider rule and the outbound request limits. Add `workItems.source` and `workItems.providers.*` rows to 0159's key table (`src/data/config/fields.rs`), which drives `awman config`, `--set` and the docs.
-- Related work items that mention `--issue` or this item's old scope: `aspec/work-items/README.md`, 0147 (uses the inline source), and 0151 (`--issue` with its new flags on `exec prompt`).
+- Update `aspec/uxui/cli.md` and `aspec/architecture/security.md` for the new flag, the global-only provider rule and the outbound request limits. Add `workItems.source` and `workItems.providers.*` rows to 0139's key table (`src/data/config/fields.rs`), which drives `awman config`, `--set` and the docs.
+- Related work items that mention `--issue` or this item's old scope: `aspec/work-items/README.md`, 0143 (uses the inline source), and 0153 (`--issue` with its new flags on `exec prompt`).
 
 ## Documentation
 

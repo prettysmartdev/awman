@@ -3,29 +3,33 @@
 Title: Worker feature: run pushed and pulled jobs (API, remote and work servers), with label affinity and a queue picker
 Issue: issuelink
 
-Depends on: 0145 (one daemon, one API, features), 0146 (interaction, terminal hub), 0159 (naming rules, config tree, route tree), 0133 (dynamic runs in a fresh clone, `base_ref`, `merge_refs`, push), 0137 (structured results). Related: 0154/0155 (engine instances host TUI-picked items).
+Depends on: 0139 (completed config and API foundation), 0140 (single daemon and worker push), 0141 (terminal, status and interaction foundation), 0142 (singleton engine and TUI/CLI frontends), completed 0133 (fresh-clone dynamic runs), completed 0137 (structured results).
+
+## Daemon completion gate
+
+The 0139–0143 block is one release gate. This item closes it only when the daemon runs squad, worker push and pull, and the singleton engine together on one process and one database; the local and network APIs, terminal hub, status, output filtering, frontend hand-off and key rotation meet their respective acceptance criteria; and 0139's full config, route, CLI, documentation and old-surface audit passes. No later active work item depends on an incomplete daemon slice.
 
 ## Summary:
 - Today something outside awman must push work into it:
   - a person at the TUI or CLI;
   - a squad task;
   - an API client holding a key and reaching awman's loopback port.
-  
+
   There is no way for awman to **go and get** work. So every API client has to run on the same machine, or tunnel in. A team cannot spread work across laptops and build boxes. A person cannot say "give me the next thing to do".
-- Make **`worker`** a daemon feature (0145) that runs **jobs**, which arrive in one of two ways:
-  - **Push.** A client submits the job. This is today's API server and today's `awman remote exec`, moved onto the daemon's API under `/v1/worker/*` (0159 §5): sessions, commands with cancel, events SSE, workflow and outputs, runs, and workdirs. Push is served on the network listener when `worker` is listed in `daemon.network.features`, and always on the local listener.
+- Extend the **`worker`** daemon feature introduced by 0140 into one job model for two arrival paths:
+  - **Push.** A client submits the job. 0140 already moves today's API server and `awman remote exec` onto the daemon under `/v1/worker/*` (0139 §5). This item folds those pushed commands into the unified job model. Push is served on the network listener when `worker` is listed in `daemon.network.features`, and always on the local listener.
   - **Pull.** The worker connects **out** to one or more **work servers**, registers with labels, and takes work items from a queue the server keeps.
     - **In the background daemon:** items are claimed and run **immediately, in queue order**, up to the worker's capacity.
     - **In the TUI or CLI:** the worker is optional and runs **manual** claims. Queued items appear in a list, and the person **chooses** one with an interactive picker. It then runs in their TUI exactly as if they had typed `exec workflow --dynamic` themselves.
 - **One job model.** Pushed commands and pulled leases are both `Job { id, origin: Push{session_id, command_id} | Pull{server, lease_id, epoch}, spec, state }`. They share:
   - the executor share (`daemon.features.worker.maxConcurrentJobs`);
   - the event stream (execution events with 0137 envelopes);
-  - terminals (0146);
+  - terminals (0141);
   - results (0137's `CommandResult`).
-  
+
   A push client and a work server see the same states and the same result shape.
 - **Node affinity.** Each pulled item may carry label selectors, and the server offers it only to workers whose labels match. Labels the worker reports about itself (OS, agents, GPU) are kept apart from labels the server assigns (who owns the worker, which team it serves), so an item can be pinned to one person's machine.
-- Define the **Work Server Protocol (WSP) v1**: plain HTTPS+JSON, worker-initiated only, and generic. It follows 0159's wire rules: `snake_case` fields, `{items, next_cursor}` lists, `{error, code}` errors, `_ms` durations, `_at` timestamps and `awman/` label prefixes. infact (its work item 0023) is one implementation and the GitHub issues reference server (0148) is another. Anyone can write their own.
+- Define the **Work Server Protocol (WSP) v1**: plain HTTPS+JSON, worker-initiated only, and generic. It follows 0139's wire rules: `snake_case` fields, `{items, next_cursor}` lists, `{error, code}` errors, `_ms` durations, `_at` timestamps and `awman/` label prefixes. infact (its work item 0023) is one implementation and the GitHub issues reference server (0145) is another. Anyone can write their own.
 
 ## User Stories
 
@@ -68,31 +72,28 @@ take work without the TUI
 ## Implementation Details:
 
 ### The worker feature
-- `worker` is a `DaemonFeature` (0145) whose router is mounted at `/v1/worker`. It has two sides, each switchable on its own (live keys in 0159's table):
+- `worker` is a Layer 1 `DaemonFeature` (0140) whose typed Layer 2 operations are exposed by the Layer 3 API adapter at `/v1/worker`. It has two sides, each switchable on its own (live keys in 0139's table):
   - `daemon.features.worker.push.enabled`: the push routes;
   - `daemon.features.worker.pull.enabled`: the claim loop over `workServers`.
-  
-  `awman config set daemon.features.worker.enabled true` turns the feature on, persisted and applied live to a running daemon (0159 §4). Both sides start as configured. For example, `awman config set daemon.features.worker.pull.enabled false` switches one side off live.
-- **Push** is today's API server code moved behind the feature. Its behaviour (admission, session FIFO, SSE, cancel, outputs, errors) is unchanged, at 0159's paths:
+
+  `awman config set daemon.features.worker.enabled true` turns the feature on, persisted and applied live to a running daemon (0139 §4). Both sides start as configured. For example, `awman config set daemon.features.worker.pull.enabled false` switches one side off live.
+- **Push** is today's API server code moved behind the feature. Its behaviour (admission, session FIFO, SSE, cancel, outputs, errors) is unchanged, at 0139's paths:
   - `GET /v1/worker/workdirs`, allowed by `daemon.features.worker.push.workDirs.{allow,roots}`;
   - `GET|POST /v1/worker/sessions`, `GET|DELETE /v1/worker/sessions/{id}`, `GET /v1/worker/sessions/{id}/queue`;
   - `GET|POST /v1/worker/commands`, `GET /v1/worker/commands/{id}`, `POST …/cancel`, `GET …/events` (SSE), `GET …/workflow`, `GET …/outputs[/{path}]`;
   - `POST /v1/worker/runs`.
-  
-  `awman remote …` uses these against the target chosen with `--remote <target>` (0159 `remote.targets`). There is no `awman api` command. The push routes are served on the network listener when `daemon.network.enabled` is on and `worker` is in `daemon.network.features` (0145, 0142).
-- **Pull** is exposed on the daemon's own API (0159 §5), for the CLI, the TUI and `awman daemon api`:
+
+  `awman remote …` uses these against the target chosen with `--remote <target>` (0139 `remote.targets`). There is no `awman api` command. The push routes are served on the network listener when `daemon.network.enabled` is on and `worker` is in `daemon.network.features` (0140).
+- **Pull** is exposed on the daemon's own API (0139 §5), for the CLI, the TUI and `awman daemon api`:
   - `GET /v1/worker/servers`, `GET /v1/worker/servers/{name}`: connection state per `workServers` entry (registered, labels, server labels, last claim, error);
   - `GET /v1/worker/queue?server=…`: eligible items (what `awman queue` shows), as `{items, next_cursor}`;
   - `POST /v1/worker/queue/{item_id}/claim`: a manual pick;
   - `GET /v1/worker/leases`, `GET /v1/worker/leases/{id}`, `POST /v1/worker/leases/{id}/release`.
     - awman's lease resources have `lease_…` IDs and carry the server's own lease ID as `server_lease_id`.
-- **Interaction** follows 0146: `daemon.features.worker.push.interaction` (default `headless`) and `daemon.features.worker.pull.interaction` (default `interactive`), each with `allowOverride`.
-- **Status.** `/v1/status` reports `worker` in 0145's per-feature shape (`state`, `max_concurrent_jobs`, `running`, `queued`, `oldest_queued_age_ms`), plus `push: {running, queued}` and `pull: {servers: [{name, state, running, queued_eligible}]}`. `awman daemon status` shows the same.
-- **`awman daemon api` actions** this item adds (0159 §6): `leases.list` and `leases.release id=…`. `jobs.cancel` (0145) covers worker jobs.
-- **Code.** `src/engine/worker/{job,push,pull}.rs`.
-  - `job.rs` is the shared `Job` model and its executor adapter.
-  - `push.rs` wraps today's API runtime (`src/command/commands/api_server*`, `src/frontend/api/`).
-  - `pull.rs` is the claim loop and lease runner below.
+- **Interaction** follows 0141: `daemon.features.worker.push.interaction` (default `headless`) and `daemon.features.worker.pull.interaction` (default `interactive`), each with `allowOverride`.
+- **Status.** `/v1/status` reports `worker` in 0140's per-feature shape (`state`, `max_concurrent_jobs`, `running`, `queued`, `oldest_queued_age_ms`), plus `push: {running, queued}` and `pull: {servers: [{name, state, running, queued_eligible}]}`. `awman daemon status` shows the same.
+- **`awman daemon api` actions** this item adds (0139 §6): `leases.list` and `leases.release id=…`. `jobs.cancel` (0140) covers worker jobs.
+- **Code.** `src/data/worker/` and the pure type portion of `crates/awman-wsp` own serializable `Job`, lease and WSP types and durable state. `src/engine/worker/` owns protocol transport, heartbeats, executor mechanics and terminal streams without importing command or frontend modules; the WSP crate cannot contain worker policy or HTTP route construction. `src/command/worker/` owns push/pull admission, claim and retry policy, job construction through Dispatch, linking and manual-pick behavior. `src/frontend/api/` maps HTTP to typed Layer 2 operations; it does not own the worker runtime.
 
 ### Work servers: configuration and linking
 - `awman worker link <server-url> [--name NAME] [--label k=v]... [--token TOKEN | --token -]` adds a server:
@@ -102,15 +103,15 @@ take work without the TUI
     - It receives a refresh token, stored in `<data>/work_servers/<name>.json` (0600). Tokens are state, not config.
     - The server decides who may approve and which server-assigned labels the worker gets, for example `owner`.
   - **Static token** (`--token TOKEN`, or `--token -` to read it from stdin) for servers that issue tokens out of band.
-  - `link` writes the `workServers.<name>` config entry (global scope): `url`, `enabled: true`, and any `--label`s. `--name` defaults to the server's host name, normalised to 0159's name rule.
-- Linked servers are managed as ordinary config (0159 §4), with no extra subcommands:
+  - `link` writes the `workServers.<name>` config entry (global scope): `url`, `enabled: true`, and any `--label`s. `--name` defaults to the server's host name, normalised to 0139's name rule.
+- Linked servers are managed as ordinary config (0139 §4), with no extra subcommands:
   - list them with `awman config get workServers`;
   - change labels with `awman config set workServers.<name>.labels.<k> <v>`;
   - disable one with `awman config set workServers.<name>.enabled false`;
   - unlink with `awman config unset workServers.<name>`, which also deletes `<data>/work_servers/<name>.json`, so the stored refresh token goes with it.
-  
+
   `awman worker link` is the only `worker` subcommand, because the device flow is interactive.
-- Config (0159 §2; all keys `global`, live):
+- Config (0139 §2; all keys `global`, live):
   ```json
   "workServers": {
     "infact": { "url": "https://infact.example/awman", "enabled": true, "claim": "auto",
@@ -125,9 +126,9 @@ take work without the TUI
 
 ### Labels and affinity
 - **Worker labels** (`labels`) are a string map from three sources:
-  1. **Reported automatically**, under the reserved `awman/` prefix (0159 §1):
+  1. **Reported automatically**, under the reserved `awman/` prefix (0139 §1):
      - `awman/os`, `awman/arch`, `awman/version`;
-     - `awman/runtime` (`docker`, `apple`, `sbx`, `builtin`; 0159's `runtime.kind` values);
+     - `awman/runtime` (`docker`, `apple`, `sbx`, `builtin`; 0139's `runtime.kind` values);
      - `awman/agent.<name>=true` for each agent with a working image;
      - `awman/interaction.interactive` and `awman/interaction.headless`, as allowed by the pull interaction setting and its `allowOverride`;
      - `awman/host=tui` for a TUI-hosted worker, `awman/host=daemon` otherwise.
@@ -143,7 +144,7 @@ take work without the TUI
 - **Requests.** All calls are from the worker to the server, under the server's base URL, with `Authorization: Bearer <access token>`.
   - Access tokens come from `POST /v1/token {refresh_token}` and are short-lived.
   - Every request carries `x-wsp-version: 1`.
-- **Conventions:** 0159 §1's wire conventions.
+- **Conventions:** 0139 §1's wire conventions.
   - Errors are `{error, code}`, the same shape and code style as awman's own API.
   - Lists are `{items, next_cursor}` with `?limit=&cursor=`.
   - Durations are `_ms` integers and timestamps are `_at` RFC 3339 strings.
@@ -156,8 +157,8 @@ take work without the TUI
 | `GET /v1/queue?limit=50&cursor=…` | Items **eligible for this worker**, in the server's order (priority, then age, then preferred weight). Returns `{items: [{id, title, summary, kind, labels, priority, enqueued_at, assigned_to_me}], next_cursor}`. Used by the picker. |
 | `POST /v1/claims` | `{item_id?}`: with `item_id`, claim that item (manual pick); without it, the next eligible item. Supports long-polling with `?wait_ms=30000`. Returns `201 {lease}`, `204` if nothing is eligible, or `409 taken`. |
 | `POST /v1/leases/{id}/heartbeat` | `{state: "preparing"\|"running"\|"awaiting_input"\|"pushing", step?, progress?}` → `{expires_at, cancel: bool, cancel_reason?}`. `awaiting_input` means a step dialog or stuck agent is waiting for a person. Missing heartbeats past `expires_at` make the server re-queue the item. |
-| `POST /v1/leases/{id}/events` | `{events: [ExecutionEvent…]}`, using awman's own event JSON (including 0137's `source` attribution and `step_activity`, and 0146's terminal events), each with its `sequence` and `attempt`. Idempotent by `(attempt, sequence)`. |
-| `GET /v1/leases/{id}/terminal` (WebSocket, `awman.terminal.v1`) | The worker opens this only if the lease has `terminal: true`. It multiplexes 0146's terminal frames for every terminal of the run, each tagged with `terminal_id`. The server fans them out to its own viewers. `input` frames flow back only when the lease grants `remote_input` **and** `daemon.terminal.remoteInput` allows it. |
+| `POST /v1/leases/{id}/events` | `{events: [ExecutionEvent…]}`, using awman's own event JSON (including 0137's `source` attribution and `step_activity`, and 0141's terminal events), each with its `sequence` and `attempt`. Idempotent by `(attempt, sequence)`. |
+| `GET /v1/leases/{id}/terminal` (WebSocket, `awman.terminal.v1`) | The worker opens this only if the lease has `terminal: true`. It multiplexes 0141's terminal frames for every terminal of the run, each tagged with `terminal_id`. The server fans them out to its own viewers. `input` frames flow back only when the lease grants `remote_input` **and** `daemon.terminal.remoteInput` allows it. |
 | `POST /v1/leases/{id}/result` | The final result (below). Ends the lease. |
 | `POST /v1/leases/{id}/release` | `{reason: "user_declined"\|"ineligible"\|"shutdown"\|"error", message?}` hands the item back unrun, or abandons it mid-run with the partial result attached. |
 | `POST /v1/leases/{id}/credentials` | Fresh repo credentials for a long run (see Edge Cases). |
@@ -179,7 +180,7 @@ take work without the TUI
       "dynamic": true, "leader": "claude::claude-opus-5-5",   // workflow kind
       "workflow_toml": null,                                   // or an inline workflow (file mode)
       "agent": "claude", "model": null,                        // prompt kind
-      "read_only": false,                                      // 0143
+      "read_only": false,                                      // 0151
       "overlays": [], "interaction": "interactive" | "headless" | null,
       "yolo": true,                                            // false: step dialogs wait for a person (manual picks)
       "timeout_ms": 7200000
@@ -197,36 +198,36 @@ take work without the TUI
 
 ### Running a lease
 - The worker runs each lease in a fresh clone at `<workRoot>/leases/<lease_id>/`, using 0133's remote-session machinery:
-  1. clone `repo.url` with the lease's credentials, through a one-shot credential helper, never in the URL or argv (0141);
+  1. clone `repo.url` with the lease's credentials, through a one-shot credential helper, never in the URL or argv (0147);
   2. check out `branch` from `base_ref` and merge `merge_refs`;
-  3. run `exec workflow --dynamic`, with the work item passed in as `body` (the 0139 inline source, so no file is committed), or `exec prompt`;
+  3. run `exec workflow --dynamic`, with the work item passed in as `body` (the 0148 inline source, so no file is committed), or `exec prompt`;
   4. push `push.branch` on success;
   5. post the result;
   6. delete the clone.
-- **Interaction.** The run gets `daemon.features.worker.pull.interaction` (0146), or the server entry's `interaction`, unless `exec.interaction` overrides it and `allowOverride` permits it.
-- **Uninitialised repositories.** If the clone has no `.awman/Dockerfile.<agent>` for an agent the run needs, the worker provisions it the way `awman init` does (headless defaults, 0144) inside the clone, and does not push it unless the item asks to. A work server never needs the repository to be awman-initialised.
+- **Interaction.** The run gets `daemon.features.worker.pull.interaction` (0141), or the server entry's `interaction`, unless `exec.interaction` overrides it and `allowOverride` permits it.
+- **Uninitialised pulled clones.** During pull-lease workspace preparation, if a first-party agent the run needs has no `.awman/Dockerfile.<agent>`, Layer 2 invokes the existing `provision_agent_dockerfile` behavior with headless defaults inside that disposable clone, before dynamic preflight; Layer 0 performs the file write. It does not push the generated file unless the item asks to. Custom agents and local/push sessions with missing Dockerfiles fail preflight before the leader runs, naming the missing agent and `awman init --agent <name>` remedy. WI0152 makes that explicit init command available to API clients; no later item is required for pull leases to work.
 - **Capacity.** A worker claims while all of these have room:
   - `running < workServers.<name>.maxConcurrentJobs`;
   - the worker feature's share, `daemon.features.worker.maxConcurrentJobs`;
-  - the host-wide `daemon.maxConcurrentJobs` (0145).
-  
+  - the host-wide `daemon.maxConcurrentJobs` (0140).
+
   Pushed and pulled jobs draw on the same share. `auto` claims long-poll, so a new item starts within a second of being queued. Items start in the order the server hands them out, which is the queue order; the worker never reorders.
 - **Heartbeats** every `heartbeat_ms` (the server's value; 15 s if absent). A `cancel: true` answer cancels the run (0135 semantics), and the worker posts the partial result as `cancelled`.
 
 ### TUI and CLI
-- **TUI-hosted worker.** `tui.worker.enabled: true` (or `--set tui.worker.enabled=true` for one run, 0159 §3) makes the TUI register a `manual` worker per enabled `workServers` entry, with `awman/host=tui`, for the TUI's lifetime.
-  - If the daemon's `worker` feature is already pulling from that server, the TUI does not register a second worker. It uses the daemon's registration through `/v1/worker/*` on the local listener (0145).
+- **TUI-hosted worker.** `tui.worker.enabled: true` (or `--set tui.worker.enabled=true` for one run, 0139 §3) makes a Layer 2 worker controller register a `manual` worker per enabled `workServers` entry, with `awman/host=tui`, for the TUI's lifetime. The TUI only presents queue data and returns a typed selection.
+  - If the daemon's `worker` feature is already pulling from that server, the TUI does not register a second worker. It uses the daemon's registration through `/v1/worker/*` on the local listener (0140).
   - Where a manual pick runs:
     - **with the builtin engine**, in the TUI process, with the daemon proxying heartbeats, events and the terminal;
-    - **when the TUI is an engine frontend** (0155, including every TUI in Rex), in the TUI's engine instance (0154). The lease is still held by the worker feature, and the instance's tab is the job's frontend.
-    
+    - **when the TUI is an engine frontend** (0142, including every TUI in Rex), in the TUI's engine instance (0142). The lease is still held by the worker feature, and the instance's tab is the job's frontend.
+
     Either way the person sees the same tab, dialogs and overview.
 - **Queue panel.**
   - `Ctrl-Q` opens a list of eligible items: title, server, labels, priority, age, and "for you" when an `owner` affinity names this worker's owner.
   - New items raise a badge in the status bar.
   - Enter shows the item's body, and `p` picks it. The claim opens a new tab running the workflow exactly as `exec workflow --dynamic` would, interactive by default, with the usual Workflow Overview and step dialogs. The tab title carries the item's title and server.
   - Closing the tab mid-run asks whether to release the item back to the queue or cancel it.
-- **CLI** (0159 §7):
+- **CLI** (0139 §7):
   - `awman queue [--server NAME] [--json]` lists eligible items (no subcommand).
   - `awman queue pick [<item-id>] [--json]`: with no ID, an interactive picker (arrow keys, `/` to filter) when stdin is a TTY, otherwise an error that asks for an ID. It runs the item in the foreground like `exec workflow`.
   - Releasing a lease is `awman daemon api leases.release id=<lease_…>` (→ `POST /v1/worker/leases/{id}/release`). There is no `queue release`.
@@ -245,14 +246,14 @@ take work without the TUI
 - Push and pull at once under load: both draw on `daemon.features.worker.maxConcurrentJobs`. The executor alternates between pushed and pulled jobs, so a long push queue cannot stop a worker from honouring leases it has already claimed, and vice versa.
 
 ## Test Considerations:
-- **Protocol conformance suite** in a new crate, `awman-wsp`, shared by awman, the reference server (0148) and third parties. It holds the types, a mock server and a mock worker, and covers:
+- **Protocol conformance suite** in a new crate, `awman-wsp`, shared by awman, the reference server (0145) and third parties. It holds the types, a mock server and a mock worker, and covers:
   - linking and register;
   - queue filtering by affinity (`In`, `NotIn`, `Exists`, `DoesNotExist`, required plus preferred ordering);
   - claim races;
   - heartbeat expiry and fencing;
   - idempotent events;
   - the result;
-  - 0159 wire conventions on every message (`items`/`next_cursor`, `_ms`, `_at`, `{error, code}`, `awman/` labels).
+  - 0139 wire conventions on every message (`items`/`next_cursor`, `_ms`, `_at`, `{error, code}`, `awman/` labels).
 - **Worker end to end** against the mock server, with a local bare repo over smart HTTP:
   - an `auto` worker runs three items in order;
   - `maxConcurrentJobs: 2` runs two at once;
@@ -262,7 +263,7 @@ take work without the TUI
   - `awman worker link` writes `workServers.<name>` and the token file;
   - `awman config unset workServers.<name>` removes both;
   - labels under `awman/` are refused in config;
-  - names violating 0159's name rule are refused.
+  - names violating 0139's name rule are refused.
 - **Daemon pull routes:** `/v1/worker/servers`, `/v1/worker/queue`, claim, `/v1/worker/leases` and release, with `lease_` IDs and `server_lease_id`. `leases.release` matches its `--raw` equivalent.
 - **TUI and CLI:** picker snapshot tests, `queue pick` with and without a TTY, and the "run in my checkout" path.
 - **Security:**
@@ -272,14 +273,16 @@ take work without the TUI
 - **Push regression:** today's API and `awman remote` e2e suites pass against `/v1/worker/*`, with only the paths changed. A pushed job and a pulled job run concurrently with one event stream shape and one `CommandResult` shape.
 
 ## Codebase Integration:
+- Follow `aspec/architecture/2026-grand-architecture.md`: Layer 0 owns WSP/job data, Layer 1 transport/execution, Layer 2 worker policy and Dispatch, and Layer 3 HTTP/TUI projection. Pull, push and manual selection share one command path and never import upward.
 - follow established conventions, best practices, testing, and architecture patterns from the project's aspec.
-- **Protocol:** new `crates/awman-wsp` (protocol types, client, conformance tests), using 0159's shared wire helpers (`List<T>`, `ApiError`, duration and timestamp serde).
-- **Engine:** `src/engine/worker/{job,push,pull}.rs`, with `worker` as a `DaemonFeature` (0145) whose router is mounted at `/v1/worker`. Push wraps today's `src/frontend/api/` and `src/command/commands/api_server*`.
-- **Config:** `src/data/config/work_servers.rs` (the `workServers` section) and the `daemon.features.worker.*` rows in 0159's key table.
+- **Protocol:** new `crates/awman-wsp` (protocol types, client, conformance tests), using 0139's shared wire helpers (`List<T>`, `ApiError`, duration and timestamp serde).
+- **Layers:** `src/data/worker/` owns wire and persisted job/lease types; `src/engine/worker/` owns WSP transport and execution primitives; `src/command/worker/` owns push/pull policy and calls existing command constructors through Dispatch; `src/frontend/api/` binds the worker HTTP routes to Layer 2. The Layer 1 `DaemonFeature` has no router and never wraps `src/frontend/api/` or `src/command/`.
+- Every worker command is instantiated from a Layer 0 `Session` through the same Layer 2 Dispatch/catalogue path as CLI and TUI commands. The WSP `Job` and lease describe scheduling; they are not a second command or session model. Conformance checks compare push, pull, manual and builtin outcomes for the same typed command.
+- **Config:** `src/data/config/work_servers.rs` (the `workServers` section) and the `daemon.features.worker.*` rows in 0139's key table.
 - **TUI and CLI:**
   - the TUI queue panel lives under `src/frontend/tui/`;
   - the catalogue entries are `worker link` and `queue` (with its optional `pick`), neither `api_allowed`;
-  - `leases.list|release` go in the client-side action table, `src/command/commands/daemon/actions.rs` (0159 §6);
+  - `leases.list|release` go in the client-side action table, `src/command/commands/daemon/actions.rs` (0139 §6);
   - push commands keep their existing `api_allowed` rules under `FrontendKind::Daemon { feature: Worker, listener }`.
 
 ## Documentation
