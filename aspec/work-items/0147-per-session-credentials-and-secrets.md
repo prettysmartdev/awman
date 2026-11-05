@@ -35,13 +35,14 @@ give each project its own token for `gh pr create` without restarting awman
 
 ## Implementation Details:
 - Session `git_auth` (token or basic) is kept in the runtime's in-memory session map and never persisted. If awman restarts, the session's next git operation fails with `credentials_lost`, and the client opens a new session.
-- Clone and push use a one-shot credential helper (`git -c credential.helper=` plus an awman helper that reads from a unix socket or fd), so the secret never lands in argv, the environment or `.git/config`. The clone's `origin` is the clean URL.
+- Push-session clone, setup fetches, merge-ref `ls-remote`, push-back `ls-remote` and push all use the one shared host Git transport builder required by 0143 and WI0163. It applies one Git configuration (no system gitconfig) and a one-shot credential helper (`git -c credential.helper=` plus an awman helper that reads from a private socket or fd) to every transport operation. The secret never lands in argv, the environment or `.git/config`; `origin` keeps the clean URL. The lease-side helper is already required by 0143; this item extends it to push sessions.
 - Teardown steps that run git (`push_branch`, `pull_branch`, `create_pull_request`) inside containers get the same helper through a mounted socket that answers only for the session's host.
 - `secrets` on `POST /v1/worker/commands` (and `POST /v1/worker/runs`): kept in memory, injected as container env for names the command's overlays request with `env(NAME)`, and they take precedence over host env. Values are redacted (exact-match replacement with `***`) from every event payload that carries agent text: `StdoutLine`, `StderrLine`, `StatusMessage`, `StepActivity.summary`, and `result.final_message`/`failure.message` (0137). Redaction lives in one place, the event bus sender, so a new event type cannot bypass it. Files the agent writes to `/awman/output` and terminal bytes (0141) are not redacted; document that.
 - Validation: max 32 secrets of 8 KiB each; names must match `^[A-Z_][A-Z0-9_]*$`.
+- Add `session_git_auth` and `command_secrets` to `capabilities` in `/v1/status` when their respective push fields and delivery paths work. WSP `lease_credentials` retains the same capability name defined in 0143.
 
 ## Edge Case Considerations:
-- Token expiry mid-run: git fails with an auth error. Surface it as `result.failure.stage = "git_auth"` with `code: git_auth_failed` (0137 and 0139 shapes) so clients can retry with a fresh token.
+- Token expiry mid-run: git fails with an auth error. Surface it as `result.failure.stage = "git_auth"` with `code: git_auth_failed` (0137 and 0139 shapes), the same code used for ordinary Git authentication failures by WI0163, so clients can retry with a fresh token.
 - A restarted command after an awman restart has lost its secrets: fail fast with a clear error instead of running without them.
 
 ## Test Considerations:

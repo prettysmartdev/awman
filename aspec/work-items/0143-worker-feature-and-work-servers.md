@@ -29,7 +29,7 @@ The 0139–0143 block is one release gate. This item closes it only when the dae
 
   A push client and a work server see the same states and the same result shape.
 - **Node affinity.** Each pulled item may carry label selectors, and the server offers it only to workers whose labels match. Labels the worker reports about itself (OS, agents, GPU) are kept apart from labels the server assigns (who owns the worker, which team it serves), so an item can be pinned to one person's machine.
-- Define the **Work Server Protocol (WSP) v1**: plain HTTPS+JSON, worker-initiated only, and generic. It follows 0139's wire rules: `snake_case` fields, `{items, next_cursor}` lists, `{error, code}` errors, `_ms` durations, `_at` timestamps and `awman/` label prefixes. infact (its work item 0023) is one implementation and the GitHub issues reference server (0145) is another. Anyone can write their own.
+- Define the **Work Server Protocol (WSP) v1**: plain HTTPS+JSON, worker-initiated only, and generic. It follows 0139's wire rules: `snake_case` fields, `{items, next_cursor}` lists, `{error, code}` errors, `_ms` durations, `_at` timestamps and `awman/` label prefixes. infact is one implementation and the GitHub issues reference server (0145) is another. Anyone can write their own.
 
 ## User Stories
 
@@ -153,11 +153,11 @@ take work without the TUI
 | Call | Purpose |
 |---|---|
 | `POST /v1/link`, `POST /v1/link/{id}/token`, `POST /v1/token` | Device-flow linking and token refresh. |
-| `POST /v1/workers/register` | `{name, labels, capacity, features}`, sent on start and when labels change. Returns `{worker_id, server_labels, heartbeat_ms, poll_ms}`. `features` lists what this awman supports (`terminal`, `interactive`, `prompt`, `workflow.dynamic`, `workflow.file`, `outputs`). |
+| `POST /v1/workers/register` | `{name, labels, capacity, features}`, sent on start and when labels change. Returns `{worker_id, server_labels, heartbeat_ms, poll_ms}`. `features` is a subset of status `capabilities` using the same names, including `terminal`, `interactive`, `prompt`, `workflow_dynamic`, `workflow_file`, `outputs`, `outputs_mount_state`, `workflow_state_events`, `lease_credentials`, `lease_inline_work_item`, `lease_read_only`, `lease_git_auth_failure`, and `lease_push_retry` only when the worker can honor them for eligible runtimes. Re-check each claimed item against its actual runtime. |
 | `GET /v1/queue?limit=50&cursor=…` | Items **eligible for this worker**, in the server's order (priority, then age, then preferred weight). Returns `{items: [{id, title, summary, kind, labels, priority, enqueued_at, assigned_to_me}], next_cursor}`. Used by the picker. |
 | `POST /v1/claims` | `{item_id?}`: with `item_id`, claim that item (manual pick); without it, the next eligible item. Supports long-polling with `?wait_ms=30000`. Returns `201 {lease}`, `204` if nothing is eligible, or `409 taken`. |
 | `POST /v1/leases/{id}/heartbeat` | `{state: "preparing"\|"running"\|"awaiting_input"\|"pushing", step?, progress?}` → `{expires_at, cancel: bool, cancel_reason?}`. `awaiting_input` means a step dialog or stuck agent is waiting for a person. Missing heartbeats past `expires_at` make the server re-queue the item. |
-| `POST /v1/leases/{id}/events` | `{events: [ExecutionEvent…]}`, using awman's own event JSON (including 0137's `source` attribution and `step_activity`, and 0141's terminal events), each with its `sequence` and `attempt`. Idempotent by `(attempt, sequence)`. |
+| `POST /v1/leases/{id}/events` | `{events: [ExecutionEvent…]}`, using awman's own event JSON (including 0137's `source` attribution and `step_activity`, 0141's terminal events, and `workflow_state` snapshots), each with its `sequence` and `attempt`. Idempotent by `(attempt, sequence)`. |
 | `GET /v1/leases/{id}/terminal` (WebSocket, `awman.terminal.v1`) | The worker opens this only if the lease has `terminal: true`. It multiplexes 0141's terminal frames for every terminal of the run, each tagged with `terminal_id`. The server fans them out to its own viewers. `input` frames flow back only when the lease grants `remote_input` **and** `daemon.terminal.remoteInput` allows it. |
 | `POST /v1/leases/{id}/result` | The final result (below). Ends the lease. |
 | `POST /v1/leases/{id}/release` | `{reason: "user_declined"\|"ineligible"\|"shutdown"\|"error", message?}` hands the item back unrun, or abandons it mid-run with the partial result attached. |
@@ -180,7 +180,7 @@ take work without the TUI
       "dynamic": true, "leader": "claude::claude-opus-5-5",   // workflow kind
       "workflow_toml": null,                                   // or an inline workflow (file mode)
       "agent": "claude", "model": null,                        // prompt kind
-      "read_only": false,                                      // 0153
+      "read_only": false,                                      // lease minimum here; 0153 generalizes
       "overlays": [], "interaction": "interactive" | "headless" | null,
       "yolo": true,                                            // false: step dialogs wait for a person (manual picks)
       "timeout_ms": 7200000
@@ -191,19 +191,26 @@ take work without the TUI
     "affinity": { "required": [], "preferred": [] }
   }
   ```
-- **Result** = `{result: CommandResult, outputs?: {path: base64}, duration_ms}`.
+- **Result** = `{result: CommandResult, outputs?: {path: base64}, outputs_mounted: bool, duration_ms}`.
   - `result` is 0137's `CommandResult`, embedded unchanged (`outcome`, `failure{stage, code, message}`, `failed_steps`, `git`, `pushed`, `pull_request`, `final_message`), so push clients and work servers decode one shape.
   - `outputs` inlines the 0137 outputs directory up to `outputs.max_bytes`.
+  - `outputs_mounted` reports whether `/awman/output` was actually mounted for this command. `outputs` may be advertised at registration only for runtimes that mount it; a request requiring outputs on an unsupported runtime is released as `ineligible`. Push command records report the same boolean. An empty output directory is distinguishable from a missing mount.
+  - Advertise `outputs_mount_state` in `capabilities` in `/v1/status` and WSP `register.features` when the boolean is accurate for all commands; advertise `outputs` only for runtimes that can mount the directory.
   - WSP does not define a second status vocabulary (`succeeded|failed`).
+
+- **Workflow-state events.** Whenever `workflow.state.json` is persisted, publish an `ExecutionEvent` with `type: "workflow_state"` and `data` equal to the complete `GET /v1/worker/commands/{id}/workflow` snapshot (phases, planned steps, status and `invocation_id`). It carries the normal `sequence` and `attempt` envelope. Both push SSE and WSP event delivery use the same ordered event log, including the initial and final snapshots. Advertise `workflow_state_events` in status and WSP registration. Followers can reconstruct the latest workflow state without polling.
+- Advertise `worker_pull`, `workflow_dynamic`, `workflow_file`, `prompt`, and the applicable `terminal`/`interactive` capabilities in `GET /v1/status` as the contracts ship. WSP registration uses the same spellings and may omit capabilities unavailable to that worker. `lease_push_retry` is likewise present in status when the lease retry behavior ships.
 
 ### Running a lease
 - The worker runs each lease in a fresh clone at `<workRoot>/leases/<lease_id>/`, using 0133's remote-session machinery:
-  1. clone `repo.url` with the lease's credentials, through a one-shot credential helper, never in the URL or argv (0147);
+  1. clone `repo.url` with the lease's credentials, through a one-shot credential helper, never in the URL or argv; this lease minimum ships here, before 0147 extends the helper to push sessions;
   2. check out `branch` from `base_ref` and merge `merge_refs`;
-  3. run `exec workflow --dynamic`, with the work item passed in as `body` (the 0148 inline source, so no file is committed), or `exec prompt`;
+  3. run `exec workflow --dynamic`, with the work item passed in as `body` through a private temporary inline source (no file is committed), or `exec prompt`; 0148 later exposes the generalized inline source to push clients and CLI;
   4. push `push.branch` on success;
   5. post the result;
   6. delete the clone.
+- **Lease-side minimum before the gate closes.** `repo.credentials`, `body`, and `exec.read_only` are executable contracts in this item. The shared host Git transport builder used for clone, setup fetches, merge-ref and push-back `ls-remote`, and push applies the same Git configuration and lease credential helper to every operation, with no system gitconfig; WI0163 verifies and repairs push-session parity. A private owner-only temp source carries `body` into the run. `exec.read_only` mounts the workspace read-only on every runtime used for leases, with writable scratch/agent home; 0153 exposes the general CLI and push-session option. If a runtime cannot enforce it, release the lease as `ineligible` and omit `lease_read_only` when registering for that runtime. Unsupported credential, inline-body, output, or execution requirements likewise fail closed before work starts, with `release(ineligible)`; do not ignore fields. Advertise `lease_credentials`, `lease_inline_work_item`, and `lease_read_only` in status and WSP registration only after their paths work.
+- **Lease push reliability.** Retry only failures before a remote response with short bounded backoff, record each retry in the event stream, recognize an already-published `head` as success, and cancel during backoff. Bound the retry window by heartbeat and lease expiry; if the lease cannot remain valid, release or report the distinct `push_unreachable` failure, never continue on an expired epoch. Lease Git authentication failures use `failure.stage: "git_auth"` and `failure.code: "git_auth_failed"`; authentication and remote refusals are not retried. Advertise `lease_git_auth_failure` and `lease_push_retry` in status and WSP registration when they work; WI0163 applies the auth classification to pushed sessions and WI0164 extends and audits the retry policy there.
 - **Interaction.** The run gets `daemon.features.worker.pull.interaction` (0141), or the server entry's `interaction`, unless `exec.interaction` overrides it and `allowOverride` permits it.
 - **Uninitialised pulled clones.** During pull-lease workspace preparation, if a first-party agent the run needs has no `.awman/Dockerfile.<agent>`, Layer 2 invokes the existing `provision_agent_dockerfile` behavior with headless defaults inside that disposable clone, before dynamic preflight; Layer 0 performs the file write. It does not push the generated file unless the item asks to. Custom agents and local/push sessions with missing Dockerfiles fail preflight before the leader runs, naming the missing agent and `awman init --agent <name>` remedy. WI0152 makes that explicit init command available to API clients; no later item is required for pull leases to work.
 - **Capacity.** A worker claims while all of these have room:
@@ -239,6 +246,7 @@ take work without the TUI
 - Token expiry mid-run: the worker refreshes. If refresh is refused (the link was revoked), it cancels running leases and stops claiming from that server.
 - A server lists an item the worker cannot run (the label re-check fails): the worker releases it with `ineligible`, and the server should then exclude this worker for that item.
 - Clone credentials expire during a long run: push uses credentials from a fresh `POST /v1/leases/{id}/credentials` call, which servers must support when they issue expiring credentials.
+- A lease field or required capability that the chosen runtime cannot honor is rejected before execution with `release(ineligible)`; the corresponding feature is omitted at registration when it cannot be offered at all.
 - Manual pick of an item that is no longer eligible (its labels changed): `409 ineligible`, and the TUI refreshes the list.
 - Daemon shutdown with leases running: release them with `shutdown` and the partial state, unless `awman daemon stop` waits for them (the default waits, and `--now` releases).
 - `awman config set daemon.features.worker.enabled false` while jobs run: push submissions get `503 feature_disabled` and pull stops claiming. Running jobs of both kinds finish. `awman daemon api jobs.cancel feature=worker` cancels them, and pulled ones are released with their partial result.
@@ -258,6 +266,9 @@ take work without the TUI
   - an `auto` worker runs three items in order;
   - `maxConcurrentJobs: 2` runs two at once;
   - the pushed sha appears in the result;
+  - lease credentials are used for clone, fetch, `ls-remote`, and push without system gitconfig or secret exposure; lease auth failures return `git_auth_failed`; inline body runs without a repo file; read-only denies workspace writes on each supported runtime;
+  - workflow snapshots arrive in order on push SSE and WSP after each persisted state; unsupported lease requirements are released as `ineligible`; `outputs_mounted` reflects the actual runtime mount;
+  - a lease push retries only pre-response transport failures within its expiry, logs retries, honors cancellation and never retries auth or remote rejection;
   - a cancel by heartbeat stops containers.
 - **Config:**
   - `awman worker link` writes `workServers.<name>` and the token file;

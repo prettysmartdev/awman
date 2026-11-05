@@ -63,6 +63,7 @@ enable it, or let a host integration enable it ephemerally, without widening awm
 
 
 ### Implementation Details:
+- Advertise `engine_instances` and `frontend_protocol` in `capabilities` in `GET /v1/status` when the engine instance routes and frontend WebSocket contract ship. WI0155 adds a separate flag for its later `focus_work` request.
 
 #### 1. The feature
 - `EngineFeature` implements 0140's Layer 1 `DaemonFeature` lifecycle (`start(&Core)`, `drain()`, `stop_now()`, `status()`) in `src/engine/daemon/features/engine.rs`. Layer 2's `EngineInstanceHost` owns sessions, Dispatch, command threads, dialogs, admission and exit policy. Layer 3 maps the engine API and frontend WebSocket to typed Layer 2 operations; neither `EngineFeature` nor its primitives construct routes.

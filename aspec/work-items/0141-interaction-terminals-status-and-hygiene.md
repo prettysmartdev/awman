@@ -64,6 +64,7 @@ So I can:
 watch it, or step in when it is stuck, with the same keys as `squad attach`
 
 ### Implementation Details:
+- Advertise `terminal` and `interactive` in `capabilities` in `GET /v1/status` when the shared terminal/event protocol and remote interaction controls work; advertise `agent_status` when the status fields and events in this item ship. WI0143 uses the same `terminal` and `interactive` spellings in WSP registration, subject to worker/runtime support.
 - **Settings** (all in 0139's key table, `global` scope, live):
   - `daemon.features.squad.interaction`, `daemon.features.worker.push.interaction` and `daemon.features.worker.pull.interaction` are each `interactive` or `headless`. The defaults keep today's behaviour: squad `interactive`, push `headless`, pull `interactive`.
   - `allowOverride` (default `true`) on each lets a command or work item choose otherwise.

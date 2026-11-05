@@ -21,6 +21,7 @@ So I can:
 run a team's first node without shelling out to the `awman` CLI on the daemon's host
 
 ## Implementation Details:
+- Advertise `api_init` in `capabilities` in `/v1/status` once the init command and accepted API fields in this item are available.
 - Mark `INIT` `api_allowed: true`, which allows it on the `worker` feature's push routes (0140, `FrontendKind::Daemon { feature: Worker, .. }`). Layer 2's `InitCommand` selects `HeadlessDefaults::api()` for API invocations and owns validation and orchestration; the Layer 3 push adapter only maps typed request and result. `--aspec` stays available.
 - Init's image build reports through the command's event stream like `ready` does.
 - In `workflow_preflight`, when a referenced agent has no project Dockerfile after any pull-lease preparation (0143), fail before launching the leader with the missing agent names and the `init` action to run. Do not consume a leader repair attempt or implicitly modify a local/push session's project files.

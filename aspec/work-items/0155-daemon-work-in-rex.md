@@ -96,6 +96,7 @@ make sure Rex's remote access can't quietly be used to type into unattended agen
 - If `engine` is off and was never enabled, nothing is presented. `awman daemon status` reports `rex daemon work: idle (engine off)`. This item never enables `engine` by itself, because only a frontend's hand-off may do that.
 
 ### 5. Squad and attach in Rex frontends
+- The new `focus_work` UI request is advertised as `focus_work_request` in `/v1/status`'s `capabilities` only when the daemon accepts and routes it. Existing `ui_requests` remain covered by 0142's engine capability.
 - In a TUI frontend claimed by the Rex presenter (its `Hello.annotations` carry `rex/*`, 0154), when `squad` is in `show`:
   - The squad tab's per-task "attach" action, and `awman squad attach <task>` run in a Rex terminal (where Rex detection produces the same annotations), **focus that task's daemon-work window** (`session.focus_window`) instead of attaching inline.
   - If the task isn't presented (it is overflowed, or Rex is unreachable), they fall back to today's inline attach with a one-line notice.

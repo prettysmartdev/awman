@@ -39,14 +39,18 @@ show memory in my UI, let people edit it, back it up, and sync it across awman h
   - `GET` and `PUT /v1/contexts/{key}/files/{path}`, with `If-Match: <sha256>` for optimistic concurrency.
   - `DELETE /v1/contexts/{key}/files/{path}`.
   - Paths are validated with `validate_context_path`; there is a size cap per file and per key.
-- `GET /v1/worker/commands/{id}/context_changes` lists the files the command added, changed or removed in its context scopes (snapshot hashes at start and end).
+- `GET /v1/worker/commands/{id}/context_changes` returns 0139's list shape, `{items: [{path, change: "added"|"modified"|"deleted", size_bytes?, sha256?}], next_cursor}`, for files the command added, changed or removed in its context scopes (snapshot hashes at start and end).
+- **Pulled jobs:** extend 0143's WSP `WorkItem` with optional `context: {files: [{path, content_base64}], max_bytes}`. The work server owns this per-item snapshot. After path and size validation, the worker stages it as that lease's `context(repo)`; it never reuses a host context key or carries state from another lease. The WSP result adds `context_changes: {items: [{path, change: "added"|"modified"|"deleted", size_bytes?, sha256?, content_base64?}], next_cursor: null}` for changed files, with content inlined up to `max_bytes` and deletion represented without content. If changed content exceeds the cap, report an explicit `context_too_large` failure instead of silently dropping it. The server applies returned changes to its own store before the next lease. The worker needs no inbound API access from the server.
+- Advertise `context_api` in `capabilities` in `/v1/status` for keyed push context/routes, and `lease_context` in status and WSP `register.features` only when pulled context staging and returned changes are supported. A server offers context-bearing items only to workers advertising `lease_context`; a mismatch is released as `ineligible` before execution. WI0165 handles the separate `context(workflow)` scratch files.
 
 ## Edge Case Considerations:
 - Two commands writing the same key concurrently: last writer wins on disk. `context_changes` lets the client detect this; document that `:ro` is the safe default for parallel jobs.
 - A key with no directory yet: `GET` returns an empty list, not 404.
+- A malformed, symlinked, duplicate or traversal path in a pulled context snapshot is rejected before the lease starts. Size limits apply to decoded bytes. A failed/cancelled lease returns any safe context changes with its partial result under the same cap; a lost lease epoch cannot publish changes.
 
 ## Test Considerations:
 - Key resolution (keyed vs inferred); traversal rejected; `If-Match` conflict returns 412 with `code: precondition_failed`; change listing; responses follow 0139 (list shape, `size_bytes`, `_at` timestamps).
+- WSP conformance: two workers on distinct hosts receive the same server-owned context, changed and deleted files return to the server, and the next lease observes the update; oversized/malformed snapshots and unsupported workers fail closed. Assert both capability flags.
 
 ## Codebase Integration:
 - Follow `aspec/architecture/2026-grand-architecture.md`: Layer 0 owns `ContextKey`, path validation, file metadata and atomic context storage; Layer 2 owns session key resolution, scope/authorization, concurrency rules and the typed context operations; Layer 3 maps the core HTTP routes to those operations. The API adapter does not resolve keys, validate filesystem policy or read context files directly. Keep the one overlay grammar and one session context model across CLI, TUI and API.

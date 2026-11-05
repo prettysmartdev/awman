@@ -22,6 +22,7 @@ reuse one checkout safely, and run several planning prompts against it at once
 
 ## Implementation Details:
 - New flag on `exec prompt` (and `exec workflow` agent steps, for review-only steps), mapped to a `:ro` workspace mount in every runtime. It is API-allowed.
+- Reuse the lease-side read-only mount enforcement delivered in 0143. This item generalizes the option to CLI/TUI and push commands and advertises `read_only_workspace` in `capabilities` in `/v1/status`; `lease_read_only` remains the WSP registration flag.
 - The system prompt gains one line saying the workspace is read-only and naming the writable locations (`/awman/output`, mounted contexts).
 - Agents that need a scratch directory get a tmpfs `/tmp`.
 

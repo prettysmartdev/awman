@@ -76,7 +76,7 @@ keep the surface consistent without reviewing naming by hand.
 | Lists | `{ "items": [...], "next_cursor": "…" \| null }`, with `?limit=` (default 50, max 500) and `?cursor=`. | |
 | Errors | `{ "error": "<message>", "code": "<snake_case>" }` (0138's shape, kept), with one code table for the whole API. | `feature_disabled` |
 | WebSocket subprotocols | `awman.<name>.v1` | `awman.terminal.v1`, `awman.frontend.v1` |
-| Labels and annotations | `<namespace>/<name>`, lowercase `[a-z0-9.-]`. `awman/` is reserved for awman; integrations use their registry name. | `awman/os`, `rex/block` |
+| Labels and annotations | `<namespace>/<name>`, lowercase `[a-z0-9.-]`. This applies to session and command labels from 0135, worker and WSP labels, and engine annotations. `awman/` is reserved for awman; integrations use their registry name. Newly submitted dotted keys such as `infact.kind` fail validation; migrated stored labels remain readable. | `awman/os`, `rex/block` |
 | CLI | Command and flag names are `kebab-case`. A flag exists only for per-invocation intent (`--yolo`, `--leader`, `--remote`). Anything that is also a setting uses `--set`. | |
 | Environment | `AWMAN_` plus the config path in `SCREAMING_SNAKE` (dots and camel humps both become `_`), generated from the key table. Only the non-config process variables are listed separately (§3). | `AWMAN_WORKFLOWS_MAX_CONCURRENT_STEPS` |
 
@@ -209,7 +209,7 @@ One tree, served by the daemon on its local listener and, for the features in `d
 
 | Route | Purpose |
 |---|---|
-| `GET /v1/status` | Build, protocol versions, features and their state (`on`, `off`, `ephemeral`, `draining`), capacity (`max_concurrent_jobs`, running and queued per feature), and listeners. |
+| `GET /v1/status` | Build, protocol versions, `capabilities: [string]` (API/WSP contract support), `features` and their state (`on`, `off`, `ephemeral`, `draining`), capacity (`max_concurrent_jobs`, running and queued per feature), and listeners. |
 | `GET /v1/health` | Unauthenticated `{status}` (0140). |
 | `GET /v1/features`, `GET /v1/features/{feature}`, `PATCH /v1/features/{feature}` | List and inspect features. `PATCH {enabled, ephemeral: true}` is the local-only ephemeral switch (0140/0142). Persistent changes go through config. |
 | `GET /v1/config`, `POST /v1/config/reload` | The effective daemon config (sensitive values masked), and reload after `config set`. Local listener only. |
@@ -253,6 +253,8 @@ Today's squad gateway forwards CLI command lines (`POST /v1/commands` on the squ
 | `GET /v1/worker/leases`, `GET /v1/worker/leases/{id}`, `POST /v1/worker/leases/{id}/release` | |
 
 The Work Server Protocol (0143) is a separate API that awman *calls*. It follows the same naming rules (§1): `snake_case` fields, `items`/`next_cursor` lists, the `{error, code}` shape, and `awman/` label prefixes (was `awman.dev/`).
+
+**Capability discovery.** `capabilities` in `GET /v1/status` is an append-only list of implemented API contract flags, separate from `features`, which reports daemon feature state. Carry forward every current `API_FEATURES` string unchanged: `error_codes`, `workflow_state`, `command_cancel`, `labels`, `idempotency`, `runs`, `structured_results`, `outputs`, `event_source`, `step_activity`, `command_record`, `session_setup_status`, `command_session_body`. Add the already shipped but unadvertised `remote_dynamic`, `workdir_roots`, and `event_ids`. A version number does not replace these flags. Every newly shipped route, response field or event adds a named flag in the implementing work item and the central registry; the status response contains only flags actually implemented by that build. The WSP `register.features` list (0143) uses the same strings for shared capabilities, including `outputs`; it lists capabilities the worker can honor on eligible runtimes and rechecks the selected runtime for each lease. WSP-only execution kinds also use snake_case capability strings.
 
 **`engine`:**
 
@@ -316,6 +318,8 @@ The table lists the daemon command groups after 0140–0143; later integration i
 - **Live apply of a key that can't change live** (`daemon.network.listen` while the listener runs): `config set` writes the file and says `restart the daemon to apply` (`awman daemon stop && awman daemon start`). It never half-applies.
 - **Task-scope keys in a repo file** (`workflows.dynamic.*`) are allowed: task scope includes repo. Daemon-process keys (`daemon.*`) in a task file are rejected.
 - **ID prefixes** on existing stored records: the store migrates IDs on first start of the new version, with a schema bump in `awman.db` (data, not config, so a migration is fine). External clients must re-read IDs; awman is in beta.
+- **Pre-upgrade IDs held by clients:** old unprefixed IDs return `404 not_found` after migration; no lookup alias is retained. A client holding an in-flight old ID reconciles it by listing records and matching the stable session/command metadata or its own idempotency key, then uses the canonical prefixed `id`. Document this in the upgrade table and test an in-flight command across the upgrade.
+- **Prerequisite widening refusal:** the public API returns HTTP 403 with `code: prerequisite_widening_refused` from the existing `CommandError::code()`. `PREFLIGHT` remains only the internal error class; the message is never needed for client branching.
 - **`--set` on a daemon-served command** (`awman --set … exec workflow` with `tui.backend: daemon`): the override travels in the frontend `Hello`'s argv (0142) and applies to that instance only, exactly as in-process.
 
 ## Test Considerations:
@@ -333,6 +337,9 @@ The table lists the daemon command groups after 0140–0143; later integration i
   - removed paths return 404;
   - list responses carry `items`/`next_cursor`;
   - every error carries `code`;
+  - `PrerequisiteWideningRefused` maps to `prerequisite_widening_refused` over the API, distinct from other preflight codes;
+  - `capabilities` carries the existing flag set plus `remote_dynamic`, `workdir_roots`, and `event_ids`, independently of feature state; every new route, field and event has a registry entry;
+  - new session and command labels reject dotted keys, while previously stored dotted labels remain readable;
   - IDs carry their prefix;
   - timestamps and durations follow §1 (a serde round-trip on every response type).
 - **Network listener tests:** unlisted features → 404, a disabled feature → 503, owner-only routes refused with API keys.
@@ -371,5 +378,6 @@ Specifically for this item:
   - a generated reference table (key, type, default, scope, live, environment variable);
   - a one-time "upgrading from earlier betas" table of moved keys.
 - `docs/09-api-and-remote-mode.md` gets the §1 conventions and the §5 route tree as the API reference.
+- Its upgrade table also maps old routes and fields to new ones (`/logs` to `/events`, removed `/status` aliases, root routes to `/v1/worker/*`, `non_interactive` to `headless`). Correct the `StepActivity` example to `{type, data: {kind, summary}}` and explain that a setup failure's legacy `error` value is the literal `"setup_error"`; the details live in `setup_error`/structured `failure`.
 - `docs/14-command-reference.md`: §7, `--set`, and the removed flags.
 - Every doc that shows a config key, route, flag or environment variable is updated to the new names (`docs/03`, `05`, `06`, `08`, `11`, `12`, `16`–`19`).

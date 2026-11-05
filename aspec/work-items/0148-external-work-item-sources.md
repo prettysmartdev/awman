@@ -166,6 +166,7 @@ The explicit forms always win over `workItems.source`, so a repo set to GitHub c
 
 ### Inline work items
 - `POST /v1/worker/commands` accepts an optional `work_item: { title, body, id? }`. awman writes it to the same temp file and treats it as a remote `ResolvedWorkItem`, whatever `workItems.source` says. This covers callers that cannot expose an HTTP endpoint the awman host can reach. Passing it along with a `--work-item` argument is a 400.
+- This generalizes 0143's private inline-body staging for pulled leases to pushed commands. Advertise `inline_work_item` in `capabilities` in `/v1/status` only when the push field is accepted and staged; `lease_inline_work_item` remains the WSP capability for pulled items. Also advertise `work_item_sources` when the new provider/flag behavior is implemented.
 
 ## Edge Case Considerations:
 - **Migration from `--issue 42`:** with no source set, `--work-item 42` now means local file 0042. If that file does not exist, the error also suggests `--work-item github:42`. Scripts using `--issue` fail with the replacement message rather than doing something else silently.
@@ -228,7 +229,7 @@ The explicit forms always win over `workItems.source`, so a repo set to GitHub c
 - `parse_work_item_number` and `find_work_item_file` now serve only the local path. Move them out of `exec_workflow/issue.rs` to the new module. `push_back.rs` and `dynamic.rs` import them from `exec_workflow` today.
 - Other code that assumes a work item is a file or number: `worktree_lifecycle.rs` (`name_for`), `build_leader_prompt` placeholders, and `render_interview_prompt` and `render_amend_prompt`. Search for `work_item_number` and `{{work_item_` when implementing.
 - Update `aspec/uxui/cli.md` and `aspec/architecture/security.md` for the new flag, the global-only provider rule and the outbound request limits. Add `workItems.source` and `workItems.providers.*` rows to 0139's key table (`src/data/config/fields.rs`), which drives `awman config`, `--set` and the docs.
-- Related work items that mention `--issue` or this item's old scope: `aspec/work-items/README.md`, 0143 (uses the inline source), and 0151 (`--issue` with its new flags on `exec prompt`).
+- Related work items that mention `--issue` or this item's old scope: `aspec/work-items/README.md`, 0143 (already stages lease bodies privately), and 0151 (`--issue` with its new flags on `exec prompt`).
 
 ## Documentation
 

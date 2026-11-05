@@ -82,6 +82,7 @@ make sure only workers labelled `gpu=true` take it
   - On release: remove `awman:running`.
 - **Cancel.** Removing `queue_label` or closing the issue while a lease is running returns `cancel: true` on the next heartbeat.
 - **Viewers.** It accepts the lease terminal WebSocket (0143, `awman.terminal.v1`) and serves a minimal read-only page per running item (`/items/<id>`) with xterm.js, for maintainers who are signed in, so the reference also demonstrates terminal relay. It never grants remote input.
+- **Workflow progress.** Persist 0143's `workflow_state` snapshots from the WSP event stream with their `(attempt, sequence)` ordering. The item page can show planned phases and steps, including pending ones, from the latest snapshot. Match requested work to `register.features`; do not offer a worker a capability it did not advertise. WI0165 adds optional workflow context attachments to this server later.
 
 ## Edge Case Considerations:
 - Fork PRs and untrusted issue authors: only issues opened or labelled by people with write access are queued. The `queue_label` is applied by a maintainer, and the event's actor permission is checked, so an outsider cannot put work into the queue.

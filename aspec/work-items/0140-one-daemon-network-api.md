@@ -18,7 +18,7 @@ Depends on: 0139 (config and API surface). This item completes the unified proce
   - the API server (`awman api start`).
 
   `DaemonGuard` (`src/engine/daemon/guard.rs`) exists so that only one process ever holds `~/.awman/data/awman.db`. Its error reads "awman api and the squad daemon cannot run at the same time". So a machine can automate with squad tasks *or* serve API clients, never both. Clients work around it with a second awman home (infact's `make dev` does exactly that).
-- Replace both with **one daemon process** that owns the database and serves **one API**. Its capabilities are **features**, each enabled and disabled independently, in config or at runtime, without restarting the daemon or the work running under the other features:
+- Replace both with **one daemon process** that owns the database and serves **one API**. Its runtime components are **features**, each enabled and disabled independently, in config or at runtime, without restarting the daemon or the work running under the other features:
   - **`squad`**: today's squad functionality, unchanged: the scheduler, tasks, triggers, evaluations and env sync. It becomes a feature of the one daemon instead of its own daemon.
   - **`worker`**: runs jobs that are **pushed** to it or **pulled** by it.
     - Push is today's API server and `awman remote` job submission.
@@ -136,7 +136,7 @@ see one picture of everything awman is doing on this machine
 
   | Route | Notes |
   |---|---|
-  | `GET /v1/status` | Build, protocol versions, features and state, capacity (`max_concurrent_jobs`, running and queued per feature), listeners. |
+  | `GET /v1/status` | Build, protocol versions, append-only `capabilities: [string]` (0139), features and state, capacity (`max_concurrent_jobs`, running and queued per feature), listeners. |
   | `GET /v1/health` | Unauthenticated, from 0140. |
   | `GET /v1/features`, `GET /v1/features/{feature}`, `PATCH /v1/features/{feature}` | `PATCH {enabled, ephemeral: true}` is the ephemeral switch, local listener only. A persistent change goes through config and `POST /v1/config/reload`. |
   | `GET /v1/config`, `POST /v1/config/reload` | Effective daemon config, with sensitive values masked. Local listener only. |
@@ -306,14 +306,16 @@ rotate credentials without downtime
   - The local listener is unaffected by `listen`.
   - `listen` is not live: `awman config set daemon.network.listen …` persists the value and says `restart the daemon to apply`, as 0139 specifies. Toggling `daemon.network.enabled` *is* live: it opens or closes the network listener without touching the local listener or running work.
 - **Certificate names.** `tlsSans` entries are added to the generated certificate's SANs, and `::1` is always included. Changing the SANs regenerates the certificate, reloads it into the running listener, and says so.
-- **`/v1/status` and `/v1/health`** are core daemon routes (0140, 0139 §5), present whatever features are on.
+- **`/v1/status` and `/v1/health`** are core daemon routes (0140, 0139 §5), present whatever features are on. `capabilities` advertises implemented API contracts independently of daemon feature state; `features` remains the per-feature state map.
   - `/v1/status` includes:
     - `version`;
+    - `capabilities` (append-only contract flags);
     - `features` (per feature: `state`, `max_concurrent_jobs`, `running`, `queued`, `oldest_queued_age_ms`);
     - the host-wide `max_concurrent_jobs`;
     - `agents` (installed agent names);
     - `listeners` (local, and network with its `listen` address and served features).
   - An unauthenticated `GET /v1/health` returns only `{status}`, for load balancers.
+- Add `daemon_features`, `network_listener`, and `api_keys` to `capabilities` when their respective routes and fields ship. Enabling or disabling a feature changes its state in `features`, never the build's capability list.
 - **Keys** are credentials for the optional network listener only. They are the core resource `/v1/keys` (0139 §5), callable only by the owner through the authenticated local socket or named pipe:
   - `POST /v1/keys {name}` → `{id: "key_…", name, key, created_at}`, with `key` shown only in this response;
   - `GET /v1/keys` → `{items: [{id, name, created_at, last_used_at}], next_cursor}`, never key material;
