@@ -154,14 +154,6 @@ fn log_git_output(output: &std::process::Output, sink: &mut dyn GitFrontend) {
 pub const FALLBACK_COMMIT_NAME: &str = "awman";
 pub const FALLBACK_COMMIT_EMAIL: &str = "awman@localhost";
 
-/// Pathspecs that keep awman's own bookkeeping out of a leftover-changes commit:
-/// the engine's `WorkflowState` JSON and the saved dynamic workflow copy, both of
-/// which live under `<root>/.awman/workflows/` and are never gitignored.
-pub const AWMAN_BOOKKEEPING_EXCLUDES: &[&str] = &[
-    ":(exclude).awman/workflows/*.json",
-    ":(exclude).awman/workflows/dynamic-*.toml",
-];
-
 /// The identity a host-side commit in a clone will be recorded with.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommitIdentity {
@@ -2258,8 +2250,9 @@ impl GitEngine {
         }
     }
 
-    /// `git add -A -- . <AWMAN_BOOKKEEPING_EXCLUDES>`, then commit with `message` as
-    /// `identity` if anything is staged. No changes is `NothingToCommit`, not an error.
+    /// Stage changes according to the repository's Git ignore rules, then commit
+    /// with `message` as `identity` if anything is staged. No changes is
+    /// `NothingToCommit`, not an error.
     pub fn commit_all_with_identity_logged(
         &self,
         repo: &Path,
@@ -2267,27 +2260,7 @@ impl GitEngine {
         identity: &CommitIdentity,
         sink: &mut dyn GitFrontend,
     ) -> Result<CommitAllOutcome, EngineError> {
-        // Exclusions must apply to entries already staged by an agent as well.
-        let output = run_git_logged(
-            &[
-                "reset",
-                "-q",
-                "HEAD",
-                "--",
-                ".awman/workflows/*.json",
-                ".awman/workflows/dynamic-*.toml",
-            ],
-            repo,
-            sink,
-        )?;
-        if !output.status.success() {
-            return Err(EngineError::Git(
-                String::from_utf8_lossy(&output.stderr).trim().into(),
-            ));
-        }
-        let mut add: Vec<&str> = vec!["add", "-A", "--", "."];
-        add.extend_from_slice(AWMAN_BOOKKEEPING_EXCLUDES);
-        let output = run_git_logged(&add, repo, sink)?;
+        let output = run_git_logged(&["add", "-A", "--", "."], repo, sink)?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(EngineError::Git(format!(
@@ -3479,10 +3452,24 @@ mod tests {
     }
 
     #[test]
-    fn commit_all_ignores_awman_workflow_bookkeeping() {
+    fn commit_all_respects_gitignore() {
         let (_s, _b, _w, clone) = clone_of_upstream();
         let g = GitEngine::new();
         let mut sink = crate::data::message::RecordingMessageSink::new();
+        std::fs::write(clone.join(".gitignore"), ".awman/workflows\n").unwrap();
+        run_git(&clone, &["add", ".gitignore"]);
+        run_git(
+            &clone,
+            &[
+                "-c",
+                "user.name=T",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-qm",
+                "ignore workflow state",
+            ],
+        );
         let dir = clone.join(".awman/workflows");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("abc-0001-wf.json"), "{}").unwrap();
@@ -3494,65 +3481,46 @@ mod tests {
     }
 
     #[test]
-    fn commit_all_excludes_pre_staged_bookkeeping_additions_modifications_and_deletions() {
-        for source_edit in [false, true] {
-            let (_s, _b, _w, clone) = clone_of_upstream();
-            let dir = clone.join(".awman/workflows");
-            std::fs::create_dir_all(&dir).unwrap();
-            for name in ["modified.json", "deleted.json"] {
-                std::fs::write(dir.join(name), "original").unwrap();
-            }
-            run_git(&clone, &["add", "-A"]);
-            run_git(
-                &clone,
-                &[
-                    "-c",
-                    "user.name=T",
-                    "-c",
-                    "user.email=t@t",
-                    "commit",
-                    "-qm",
-                    "baseline",
-                ],
-            );
-            std::fs::write(dir.join("modified.json"), "modified").unwrap();
-            std::fs::remove_file(dir.join("deleted.json")).unwrap();
-            std::fs::write(dir.join("new.json"), "new").unwrap();
-            std::fs::write(dir.join("dynamic-0042.toml"), "new").unwrap();
-            if source_edit {
-                std::fs::write(clone.join("work.txt"), "work").unwrap();
-            }
-            run_git(&clone, &["add", "-A"]);
-            let before = GitEngine::new().head_sha(&clone).unwrap();
-            let result = GitEngine::new()
-                .commit_all_with_identity_logged(
-                    &clone,
-                    "leftovers",
-                    &test_identity(),
-                    &mut crate::data::message::RecordingMessageSink::new(),
-                )
-                .unwrap();
-            if source_edit {
-                assert!(matches!(result, CommitAllOutcome::Committed { .. }));
-                assert_eq!(
-                    git_out(&clone, &["diff", "--name-only", &before, "HEAD"]),
-                    "work.txt"
-                );
-            } else {
-                assert_eq!(result, CommitAllOutcome::NothingToCommit);
-                assert_eq!(GitEngine::new().head_sha(&clone).unwrap(), before);
-            }
-            assert_eq!(
-                git_out(&clone, &["show", "HEAD:.awman/workflows/modified.json"]),
-                "original"
-            );
-            assert_eq!(
-                git_out(&clone, &["show", "HEAD:.awman/workflows/deleted.json"]),
-                "original"
-            );
-            assert!(dir.join("new.json").exists());
-            assert!(!dir.join("deleted.json").exists());
+    fn commit_all_includes_workflow_files_when_not_ignored() {
+        let (_s, _b, _w, clone) = clone_of_upstream();
+        let dir = clone.join(".awman/workflows");
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["modified.json", "deleted.json"] {
+            std::fs::write(dir.join(name), "original").unwrap();
         }
+        run_git(&clone, &["add", "-A"]);
+        run_git(
+            &clone,
+            &[
+                "-c",
+                "user.name=T",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-qm",
+                "baseline",
+            ],
+        );
+        std::fs::write(dir.join("modified.json"), "modified").unwrap();
+        std::fs::remove_file(dir.join("deleted.json")).unwrap();
+        std::fs::write(dir.join("new.json"), "new").unwrap();
+        std::fs::write(dir.join("dynamic-0042.toml"), "new").unwrap();
+        std::fs::write(clone.join("work.txt"), "work").unwrap();
+        run_git(&clone, &["add", "-A"]);
+        let before = GitEngine::new().head_sha(&clone).unwrap();
+        let result = GitEngine::new()
+            .commit_all_with_identity_logged(
+                &clone,
+                "leftovers",
+                &test_identity(),
+                &mut crate::data::message::RecordingMessageSink::new(),
+            )
+            .unwrap();
+        assert!(matches!(result, CommitAllOutcome::Committed { .. }));
+        assert_eq!(
+            git_out(&clone, &["diff", "--name-only", &before, "HEAD"]),
+            ".awman/workflows/deleted.json\n.awman/workflows/dynamic-0042.toml\n.awman/workflows/modified.json\n.awman/workflows/new.json\nwork.txt"
+        );
     }
 
     #[test]

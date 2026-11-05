@@ -135,7 +135,7 @@ pub enum TeardownStep {
     },
     CommitChanges {
         message: String,
-        /// Stage every change (except awman bookkeeping) before committing.
+        /// Stage changes according to Git's ignore rules before committing.
         /// Defaults to `true` so a teardown never leaves the agent's work out.
         #[serde(default = "default_add_all")]
         add_all: bool,

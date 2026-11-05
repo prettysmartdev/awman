@@ -6,7 +6,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use super::{CommitIdentity, GitCommand, GitEngine, GitFrontend, AWMAN_BOOKKEEPING_EXCLUDES};
+use super::{CommitIdentity, GitCommand, GitEngine, GitFrontend};
 use crate::data::config::env::{host_var_os, GIT_SSH, GIT_SSH_COMMAND};
 use crate::data::message::{MessageLevel, UserMessage};
 use crate::engine::error::EngineError;
@@ -387,11 +387,9 @@ impl RemotePushGit {
             level: MessageLevel::Info,
             text: identity.describe(),
         });
-        // Start at HEAD: previously staged bookkeeping can never enter this index.
+        // Start at HEAD so staging reflects the worktree's current state.
         self.run(&["read-tree", "HEAD"], false, sink)?;
-        let mut add = vec!["add", "-A", "--", "."];
-        add.extend_from_slice(AWMAN_BOOKKEEPING_EXCLUDES);
-        self.run(&add, false, sink)?;
+        self.run(&["add", "-A", "--", "."], false, sink)?;
         // --exit-code=1 means changes, so use the name list rather than swallowing
         // failures of diff as if they meant an empty index.
         let changed = self.text(&["diff", "--cached", "--name-only"], false, sink)?;

@@ -86,11 +86,6 @@ async fn real_git_dynamic_remote_run_on_fresh_branch_with_base_ref_and_two_merge
     }
     // Cut from `v1`, not from where `main` is now.
     assert!(!tree.iter().any(|f| f == "after-v1.txt"), "{tree:?}");
-    // awman's own workflow bookkeeping is never committed.
-    assert!(
-        !tree.iter().any(|f| f.starts_with(".awman/workflows/")),
-        "{tree:?}"
-    );
     let history = origin.git_bare(&["rev-list", &sha]);
     for ancestor in [&base, &one, &two] {
         assert!(history.contains(ancestor.as_str()), "{ancestor} not merged");
@@ -693,7 +688,7 @@ async fn real_git_remote_leader_cannot_rewrite_dirty_files_or_create_clean_commi
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn real_git_host_commit_excludes_pre_staged_bookkeeping() {
+async fn real_git_host_commit_follows_repository_ignore_rules() {
     crate::real_git_skip!();
     let Some(origin) = Origin::start() else {
         return;
@@ -708,9 +703,10 @@ async fn real_git_host_commit_excludes_pre_staged_bookkeeping() {
         ],
         "tracked state",
     );
-    for (branch, mode) in [
-        ("state-only", AgentMode::NoOp),
-        ("state-and-work", AgentMode::Edit),
+    for (branch, mode, ignore_workflows) in [
+        ("state-only", AgentMode::NoOp, false),
+        ("state-and-work", AgentMode::Edit, false),
+        ("ignored-state", AgentMode::NoOp, true),
     ] {
         let home = ApiHome::new();
         let server = home.start().await;
@@ -720,6 +716,9 @@ async fn real_git_host_commit_excludes_pre_staged_bookkeeping() {
             .await;
         let clone = clone_path(&server.session(&id).await);
         let dir = clone.join(".awman/workflows");
+        if ignore_workflows {
+            std::fs::write(clone.join(".gitignore"), ".awman/workflows\n").unwrap();
+        }
         std::fs::write(dir.join("modified.json"), "modified").unwrap();
         std::fs::remove_file(dir.join("deleted.json")).unwrap();
         std::fs::write(dir.join("new.json"), "new").unwrap();
@@ -729,17 +728,28 @@ async fn real_git_host_commit_excludes_pre_staged_bookkeeping() {
         home.set_agent(mode);
         let record = server.run_command(&id, "exec prompt", &["inspect"]).await;
         assert_eq!(record["status"], "done", "{record}");
-        if branch == "state-only" {
-            assert_eq!(record["result"]["pushed"], Value::Null);
-            assert_eq!(git(&clone, &["rev-parse", "HEAD"]), before);
-            assert_eq!(origin.branch_sha(branch), None);
-        } else {
-            let sha = origin.branch_sha(branch).unwrap();
-            assert_eq!(
-                origin.git_bare(&["diff", "--name-only", &before, &sha]),
-                "agent-edit.txt"
-            );
+        let sha = origin.branch_sha(branch).unwrap();
+        let mut expected = vec![
+            ".awman/workflows/deleted.json",
+            ".awman/workflows/dynamic-0042.toml",
+            ".awman/workflows/modified.json",
+            ".awman/workflows/new.json",
+        ];
+        if branch == "state-and-work" {
+            expected.push("agent-edit.txt");
         }
+        if ignore_workflows {
+            expected.retain(|path| {
+                path == &".awman/workflows/deleted.json"
+                    || path == &".awman/workflows/modified.json"
+            });
+            expected.push(".gitignore");
+            expected.sort_unstable();
+        }
+        assert_eq!(
+            origin.git_bare(&["diff", "--name-only", &before, &sha]),
+            expected.join("\n")
+        );
         assert_eq!(
             std::fs::read_to_string(dir.join("modified.json")).unwrap(),
             "modified"

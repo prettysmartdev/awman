@@ -9,7 +9,6 @@ use std::collections::HashMap;
 use crate::data::workflow_definition::{CloneConflictMode, SetupStep, TeardownStep};
 use crate::data::workflow_prompt_template::{extract_section, substitute_prompt, WorkItemContext};
 use crate::data::workflow_state::PhaseKind;
-use crate::engine::git::AWMAN_BOOKKEEPING_EXCLUDES;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum PushAuth {
@@ -256,11 +255,7 @@ pub fn teardown_step_to_shell_with(
                 sh_quote(message)
             );
             let cmd = if *add_all {
-                let excludes: Vec<String> = AWMAN_BOOKKEEPING_EXCLUDES
-                    .iter()
-                    .map(|p| sh_quote(p))
-                    .collect();
-                format!("git add -A -- . {} && {commit}", excludes.join(" "))
+                format!("git add -A -- . && {commit}")
             } else {
                 commit
             };
@@ -811,8 +806,7 @@ mod tests {
         let (cmd, _) = teardown_step_to_shell(&step);
         assert_eq!(
             cmd,
-            "git add -A -- . ':(exclude).awman/workflows/*.json' \
-             ':(exclude).awman/workflows/dynamic-*.toml' && \
+            "git add -A -- . && \
              if git diff --cached --quiet; then echo 'commit_changes: nothing to commit'; \
              else git commit -m 'auto commit'; fi"
         );
@@ -869,8 +863,8 @@ mod tests {
         assert!(push.for_ci_fix(&["test".to_string()]).is_none());
     }
 
-    /// Runs the real commit command in a scratch repo: every change but
-    /// awman's bookkeeping is committed, and a clean tree is not an error.
+    /// Runs the real commit command in a scratch repo: ignored files stay out,
+    /// while explicitly staged ignored files follow normal Git behavior.
     #[test]
     fn commit_changes_commits_everything_and_tolerates_a_clean_tree() {
         use std::process::Command;
@@ -887,11 +881,12 @@ mod tests {
                 .output()
                 .unwrap()
         };
-        assert!(
-            sh("git init -q && echo a > a && git add a && git commit -qm init")
-                .status
-                .success()
-        );
+        assert!(sh(
+            "git init -q && echo a > a && printf '.awman/workflows\\n' > .gitignore \
+                && git add a .gitignore && git commit -qm init"
+        )
+        .status
+        .success());
         sh("echo b > a && echo new > new && mkdir -p .awman/workflows \
             && echo {} > .awman/workflows/state.json");
 
@@ -904,6 +899,16 @@ mod tests {
         let committed = sh("git show --name-only --format= HEAD");
         let committed = String::from_utf8_lossy(&committed.stdout);
         assert_eq!(committed.lines().collect::<Vec<_>>(), ["a", "new"]);
+
+        assert!(sh("git add -f .awman/workflows/state.json")
+            .status
+            .success());
+        assert!(sh(&cmd).status.success());
+        let committed = sh("git show --name-only --format= HEAD");
+        assert_eq!(
+            String::from_utf8_lossy(&committed.stdout).trim(),
+            ".awman/workflows/state.json"
+        );
 
         let again = sh(&cmd);
         assert!(
