@@ -813,6 +813,9 @@ pub(crate) fn parse_agent_flags(
 #[cfg(all(test, unix))]
 mod builtin_launch_tests;
 
+#[cfg(all(test, unix))]
+mod session_worktree_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;

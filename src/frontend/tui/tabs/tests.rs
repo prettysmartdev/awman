@@ -2043,3 +2043,34 @@ fn stale_events_for_an_absent_parallel_slot_do_not_reenable_auto_open() {
     assert!(tab.suppress_container_auto_open);
     assert!(!tab.stuck);
 }
+
+#[tokio::test]
+async fn a_reported_session_worktree_moves_the_git_poll_and_a_reset_moves_it_back() {
+    let tmp = tempfile::tempdir().unwrap();
+    for dir in ["repo", "worktree"] {
+        std::fs::create_dir_all(tmp.path().join(dir)).unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(tmp.path().join(dir))
+            .status()
+            .unwrap()
+            .success());
+    }
+    let repo = tmp.path().join("repo");
+    let worktree = tmp.path().join("worktree");
+    let mut tab = Tab::new(Session::for_tests(&repo));
+    assert_eq!(tab.git_poll_root.as_deref(), Some(repo.as_path()));
+
+    // `report_session_worktree` stores the path in this shared state.
+    tab.shared
+        .workflow
+        .set_worktree_path(Some(worktree.clone()));
+    tab.refresh_git_poll();
+    assert_eq!(tab.git_poll_root.as_deref(), Some(worktree.as_path()));
+
+    // Starting the next command clears the target, so no stale root survives.
+    tab.shared.reset_for_new_command();
+    assert!(tab.shared.workflow.snapshot().worktree_path.is_none());
+    tab.refresh_git_poll();
+    assert_eq!(tab.git_poll_root.as_deref(), Some(repo.as_path()));
+}

@@ -38,9 +38,11 @@ pub mod prompt_templates;
 pub mod ready;
 pub mod remote;
 pub mod remote_client;
+pub(crate) mod session_worktree;
 pub mod skill_library;
 pub mod specs;
 pub mod worktree_lifecycle;
+pub(crate) mod worktree_overlay;
 
 pub use command_trait::Command;
 

@@ -70,6 +70,53 @@ command or flag.
   correctness is declared as an implication (`implies`) rather than
   silently required.
 
+## Session worktree selectors
+
+The two single-agent session commands (interactive chat and the one-shot
+prompt) accept three mutually exclusive, valued selectors that run the session
+in a linked Git worktree of the invoking repository instead of the invoking
+checkout:
+
+- The branch selector picks a worktree for a branch. Remote-only: fetch it and
+  track the remote branch (adding a fetch mapping for it when the remote's
+  refspecs do not cover it). Remote and local: fast-forward the local branch
+  when possible, never discarding local commits. Local-only: use it. Neither:
+  create it from the invoking checkout's `HEAD`, reporting that uncommitted
+  changes are not carried over. A missing `origin` is warned about and treated
+  as no remote; network or authentication failures are errors, never a
+  fallback to creation.
+- The pull-request selector (a number, a github.com pull-request URL, or
+  `owner/repo#N`) picks a worktree for a GitHub pull request. A
+  same-repository PR uses its head branch like the branch selector; a fork or
+  deleted-head PR uses a local `pr/<N>` branch from `refs/pull/<N>/head` and
+  warns that pushes to `origin` will not update the PR.
+- The existing-worktree selector (a name or a path) reuses an existing linked
+  worktree of this repository. It never fetches, checks out, merges or creates.
+
+The selectors are catalogued for the CLI and TUI only; every other frontend
+refuses them with the standard "not available" error. The workflow command's
+boolean worktree switch is unrelated and keeps its workflow-managed lifecycle.
+
+Flags precede the prompt. The one-shot prompt is a greedy trailing argument,
+so a selector written after the prompt text would become prompt words and the
+session would run un-isolated. That order is refused with an error saying to
+move the selector before the prompt, or to quote the prompt as one argument
+when the words are intended.
+
+Host Git that contacts a remote for these selectors refuses repository-scoped
+(local or worktree) configuration that selects a transport program, proxy,
+credential helper or TLS material; never lets SSH prompt (batch mode, unless
+the user chose an SSH command in their environment or global config); and is
+bounded by a timeout. The pull-request lookup always names the `github.com`
+host explicitly.
+
+Created worktrees live under `~/.awman/worktrees/<repo-key>/` as `br-<branch>`
+(with a hash suffix when the branch name had to be sanitised) or `pr-<N>`.
+They are retained: the commands report `Worktree kept at <path> (<branch>).`
+on exit and never merge, delete or prune.
+Agent, trust, config and overlays resolve from the invoking checkout, not the
+worktree.
+
 ## Credential prerequisite decisions
 
 Credential grants require explicit decisions and are never implied by bulk

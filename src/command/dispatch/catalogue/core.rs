@@ -199,7 +199,7 @@ pub(super) const CHAT: CommandSpec = CommandSpec {
     help: "Start a freeform chat session with the configured agent in a container.",
     long_help: None,
     arguments: &[],
-    flags: &AGENT_RUN_FLAGS_NO_WORKTREE,
+    flags: &CHAT_FLAGS,
     api_allowed: false,
     build: crate::command::dispatch::build::chat,
     gateway_need: GatewayNeed::None,

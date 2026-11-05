@@ -17,7 +17,7 @@ Depends on: 0159 (naming rules, config tree, route tree).
     - Push is today's API server and `awman remote` job submission.
     - Pull is the Work Server Protocol (0147, infact's pull mode).
     - Both share one job model, one executor share and one event stream.
-  - **`engine`**: a singleton awman instance hosted in the daemon. It can drive one or more TUI instances, the Rex integration (0153), and any future awman frontend. Its behaviour is specified in 0154 and its frontend protocol in 0155. This item provides the feature slot, the local listener it is served on, and ephemeral enablement.
+  - **`engine`**: a singleton awman instance hosted in the daemon. It can drive one or more TUI instances, the Rex integration (0151), and any future awman frontend. Its behaviour is specified in 0154 and its frontend protocol in 0155. This item provides the feature slot, the local listener it is served on, and ephemeral enablement.
 - There are no modes, and no client-specific or Rex-specific features.
 - Every config key, route, ID, list, error, duration and CLI verb in this item follows **0159**, which is the reference for the whole surface.
 - awman is in beta, so this is a clean break, with no compatibility spellings, aliases or config migrations:
@@ -159,7 +159,7 @@ see one picture of everything awman is doing on this machine
   - **persistently**, through config;
   - **ephemerally**, when a local client needs it. This is `PATCH /v1/features/{feature} {enabled: true, ephemeral: true}`, accepted on the local listener only.
   
-  The first user is 0155's hand-off, which enables `engine` when a TUI starts in Rex (0153).
+  The first user is 0155's hand-off, which enables `engine` when a TUI starts in Rex (0151).
   - An ephemeral feature is never served on the network listener.
   - An ephemeral `engine` disables itself after `daemon.features.engine.idleTimeout` with no frontends, instances or running work (0154 defines what counts, including 0157's presenter hold). If no feature is left, the daemon exits.
   - `daemon.features.engine.allowEphemeral: false` forbids it.
@@ -224,7 +224,7 @@ see one picture of everything awman is doing on this machine
   - 0147: the worker feature;
   - 0154: the engine feature;
   - 0155: the frontend protocol and hand-off;
-  - 0153: Rex, the first ephemeral-engine client;
+  - 0151: Rex, the first ephemeral-engine client;
   - 0159: naming, config and routes.
 
 ## Documentation

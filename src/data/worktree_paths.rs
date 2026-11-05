@@ -20,6 +20,35 @@ pub fn worktree_branch_name_for_workflow(name: &str) -> String {
     format!("awman/workflow-{name}")
 }
 
+/// Directory name for a session worktree created by `--branch <branch>`:
+/// `br-<sanitized>`. Every character outside ASCII `[A-Za-z0-9._-]` becomes
+/// `-` (case is preserved). When that changed the name, `-<hash8>` of the
+/// original branch name's SHA-256 is appended, so `a/b` and `a-b` map to
+/// different directories. Names are never truncated.
+pub fn branch_worktree_dir_name(branch: &str) -> String {
+    let sanitized: String = branch
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    if sanitized == branch {
+        format!("br-{sanitized}")
+    } else {
+        let hash = sha256_hex(branch.as_bytes());
+        format!("br-{sanitized}-{}", &hash[..8])
+    }
+}
+
+/// Directory name for a session worktree created by `--pr <N>`: `pr-<N>`.
+pub fn pull_request_worktree_dir_name(number: u32) -> String {
+    format!("pr-{number}")
+}
+
 /// `<dirname>-<hash8>`: dirname = last component of `git_root` (or `repo`),
 /// hash8 = first 8 lowercase hex digits of SHA-256 over the path's
 /// `to_string_lossy()` bytes. Two checkouts that share a directory name get
@@ -82,6 +111,19 @@ impl WorktreePaths {
             .join(format!("wf-{name}"))
     }
 
+    /// `~/.awman/worktrees/<dirname>-<hash8>/<name>/`, with `name` joined
+    /// verbatim (no `wf-` prefix). The caller must pass one validated, normal
+    /// path component; this layer does no validation.
+    pub fn named(&self, git_root: &Path, name: &str) -> PathBuf {
+        self.repo_dir(&repo_key(git_root)).join(name)
+    }
+
+    /// Legacy unhashed `~/.awman/worktrees/<dirname>/<name>/`. Only used to
+    /// find worktrees created before the hashed key; never for new ones.
+    pub fn legacy_named(&self, git_root: &Path, name: &str) -> PathBuf {
+        self.repo_dir(repo_dirname(git_root)).join(name)
+    }
+
     /// `~/.awman/worktrees/<dir>/`.
     fn repo_dir(&self, dir: &str) -> PathBuf {
         self.home.join(".awman").join("worktrees").join(dir)
@@ -136,6 +178,53 @@ mod tests {
                 .for_workflow(root, "same")
                 .ends_with(format!("worktrees/{key}/wf-same")));
         }
+    }
+
+    #[test]
+    fn named_paths_join_verbatim_under_hashed_and_legacy_dirs() {
+        let p = WorktreePaths::with_home("/h");
+        let root = Path::new("/r/myproj");
+        assert!(p
+            .named(root, "br-feature")
+            .ends_with(format!("worktrees/{}/br-feature", repo_key(root))));
+        assert!(p
+            .legacy_named(root, "0123")
+            .ends_with("worktrees/myproj/0123"));
+        assert_eq!(p.named(root, "wf-x"), p.for_workflow(root, "x"));
+    }
+
+    #[test]
+    fn branch_dir_name_unchanged_names_have_no_hash() {
+        assert_eq!(
+            branch_worktree_dir_name("feature-1.2_x"),
+            "br-feature-1.2_x"
+        );
+        assert_eq!(branch_worktree_dir_name("CamelCase"), "br-CamelCase");
+    }
+
+    #[test]
+    fn branch_dir_name_sanitized_names_get_hash_suffix() {
+        let slash = branch_worktree_dir_name("a/b");
+        let dash = branch_worktree_dir_name("a-b");
+        assert_eq!(dash, "br-a-b");
+        let hash = &sha256_hex(b"a/b")[..8];
+        assert_eq!(slash, format!("br-a-b-{hash}"));
+        assert_ne!(slash, dash);
+
+        let unicode = branch_worktree_dir_name("fé/ü");
+        assert!(unicode.starts_with("br-f---"));
+        assert!(unicode.is_ascii());
+        assert_eq!(unicode, branch_worktree_dir_name("fé/ü"));
+
+        let punct = branch_worktree_dir_name("x+y@z");
+        assert!(punct.starts_with("br-x-y-z-"));
+        assert_eq!(punct.len(), "br-x-y-z-".len() + 8);
+    }
+
+    #[test]
+    fn pull_request_dir_name() {
+        assert_eq!(pull_request_worktree_dir_name(1), "pr-1");
+        assert_eq!(pull_request_worktree_dir_name(4242), "pr-4242");
     }
 
     #[test]

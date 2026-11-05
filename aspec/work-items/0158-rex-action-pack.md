@@ -3,7 +3,7 @@
 Title: Rex action pack and the generic `awman integration` command
 Issue: issuelink
 
-Depends on: 0159 (config and API naming, route tree, client-side `awman daemon api` actions), 0153 (Rex integration), 0154 (`engine` instances, annotations, integration registry), 0155 (frontend protocol, hand-off).
+Depends on: 0159 (config and API naming, route tree, client-side `awman daemon api` actions), 0151 (Rex integration), 0154 (`engine` instances, annotations, integration registry), 0155 (frontend protocol, hand-off).
 
 ## Summary:
 - Rex lets users define custom actions in Lua (`rex.action{…}` in `init.lua`). Actions appear in Rex's command palette, can be bound to keys, and can run programs with `rex.exec`.
@@ -86,13 +86,13 @@ install it without opening a new control channel into awman.
 
   | Action | Runs |
   |---|---|
-  | `awman_new_tab` | A new Rex window with `awman` in the focused block's cwd. Typing `awman` there starts a new TUI instance (0153 parity). |
+  | `awman_new_tab` | A new Rex window with `awman` in the focused block's cwd. Typing `awman` there starts a new TUI instance (0151 parity). |
   | `awman_attach_agent` | `awman agents list --json` → a Rex picker over the results → a split running `awman agents attach <id>`. |
   | `awman_workflow_overview` | `awman daemon api overview.open instance=<ins_id>` for the awman instance owning the focused Rex window. |
   | `awman_approve_step` | `awman daemon api steps.approve instance=<ins_id>` for the step waiting in that instance, after a Rex confirm prompt that shows the step name (read from `dialogs.list`). |
   | `awman_status` | A floating layer running `awman agents status --watch`. |
 - **Finding the instance:** an action resolves "the awman instance for this window" with the generic annotation filter, `awman daemon api instances.list annotation.rex/block=$REX_BLOCK --json` (the focused block's ID from Rex's `ctx`, passed as the value).
-  - 0153's presenter records `rex/window` on tabs, and frontends carry `rex/block` in their `Hello.annotations`, so the engine answers from annotations it already holds. No Rex-specific lookup exists.
+  - 0151's presenter records `rex/window` on tabs, and frontends carry `rex/block` in their `Hello.annotations`, so the engine answers from annotations it already holds. No Rex-specific lookup exists.
   - If there is no awman instance, the action shows a Rex notification ("No awman instance in this window") and does nothing.
 - **Argument hygiene:**
   - Every call uses `rex.exec{ argv… }` with an argv list and no shell (`io.popen`/`os.execute` are unavailable in Rex Lua anyway).
@@ -149,7 +149,7 @@ install it without opening a new control channel into awman.
 - Rex's `setup`/`remove` live in `src/engine/integrations/rex/setup.rs`, behind the registry entry.
 - The Lua template is an embedded asset under `src/assets/integrations/rex/` (as the other templates are), rendered by pure code in the Rex integration module.
 - The actions route is part of the `engine` feature's router (0154). It reuses 0155's `DialogResponse` path and doesn't add a second way to answer dialogs.
-- Rex calls (`rex actions`, `server.config_reload`) go through `host_cli::program("rex")` and 0153's `RexApi`.
+- Rex calls (`rex actions`, `server.config_reload`) go through `host_cli::program("rex")` and 0151's `RexApi`.
 
 ## Documentation
 
@@ -164,6 +164,6 @@ After implementation is complete, update user-facing documentation in `docs/` to
 See `CLAUDE.md` for more guidance on documentation standards.
 
 Specifically for this item:
-- The Rex guide (`docs/18-rex-integration.md`, from 0153): an "awman in Rex's command palette" section covering `awman integration setup rex`, the `dofile` line, the action list, and approve-step behaviour.
+- The Rex guide (`docs/18-rex-integration.md`, from 0151): an "awman in Rex's command palette" section covering `awman integration setup rex`, the `dofile` line, the action list, and approve-step behaviour.
 - `docs/19-engine-and-frontends.md` (from 0154/0155): `awman integration <status|setup|remove>` and the `annotation.<k>=<v>` filter on `awman daemon api instances.list`.
 - `docs/14-command-reference.md`: `awman integration <status|setup|remove> [<name>]`, and the `steps.approve` and `overview.open` actions of `awman daemon api` (with their route compositions).

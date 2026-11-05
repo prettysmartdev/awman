@@ -754,7 +754,13 @@ impl AgentEngine {
         }
         let container_home = image_home.or_else(|| {
             let home = dirs::home_dir().unwrap_or_default();
-            crate::engine::overlay::detect_container_home(&home, agent.as_str(), session.git_root())
+            // The definition root is the invoking checkout for session worktrees, so a
+            // branch or PR cannot pick the credential mount point via its Dockerfile.
+            crate::engine::overlay::detect_container_home(
+                &home,
+                agent.as_str(),
+                session.definition_root(),
+            )
         });
         let request = OverlayRequest {
             directories: run.directory_overlays.clone(),

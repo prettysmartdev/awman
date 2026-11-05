@@ -38,6 +38,7 @@ use crate::engine::workflow::frontend::WorkflowFrontend;
 use crate::engine::workflow::{EngineRequest, WorkflowEngine};
 
 use super::dynamic_repair::{RepairDecision, WorkflowRepairLoop};
+use super::worktree_overlay::worktree_git_overlay;
 
 #[derive(Debug, Clone)]
 pub struct ExecWorkflowCommandFlags {

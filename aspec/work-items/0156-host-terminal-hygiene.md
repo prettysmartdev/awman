@@ -19,7 +19,7 @@ Depends on: 0159 (config naming) for the key; nothing else to start. OSC 7501 em
   - tunnelling sequences through DCS/APC passthrough.
 - In the other direction, containers can inherit host-terminal variables (`TMUX`, `REX_*`, `TERM_PROGRAM`, …) that describe and sometimes address the host's multiplexer, and an exotic host `TERM` (`xterm-rex`, `xterm-kitty`) has no terminfo entry inside the image.
 - awman knows each agent's state but tells the host terminal nothing. OSC 7501, the Program Status Protocol (0152), lets a terminal show "working / blocked / done" in its tab bar.
-- This item adds three small, independent pieces. Each can ship before the daemon and Rex work (0145, 0153–0158), and those items build on them:
+- This item adds three small, independent pieces. Each can ship before the daemon and Rex work (0145, 0151, 0154–0158), and those items build on them:
   1. a **host-terminal output filter** applied wherever agent bytes reach a host terminal;
   2. **OSC 7501 emission** from the TUI to its own terminal;
   3. a **container env deny-list** for host-terminal variables, and `TERM` normalisation.
@@ -68,11 +68,11 @@ get correct rendering in the container, with nothing about my host terminal leak
   - OSC 5113 / kitty file-transfer and APC `_G` graphics transfer;
   - all DCS (`ESC P … ST`, including tmux passthrough `ESC Ptmux;`), SOS, PM and APC strings.
 - **OSC 7501** reports are parsed with 0152's parser and **re-encoded** from the sanitized record, never forwarded raw. OSC 7501 queries are dropped, because awman's bridge answers them (0152). Until 0152 lands, OSC 7501 is stripped.
-- `HostOutputPolicy { allow_notifications: bool, program_status: Reencode | Strip }` is passed in by the caller. The default policy strips notifications. The caller builds it from config. An integration can contribute through 0154's registry when its detection is `Present` in the current terminal: Rex (0153) maps `tui.integrations.rex.forwardAgentNotifications` onto `allow_notifications`. No flag selects a policy.
+- `HostOutputPolicy { allow_notifications: bool, program_status: Reencode | Strip }` is passed in by the caller. The default policy strips notifications. The caller builds it from config. An integration can contribute through 0154's registry when its detection is `Present` in the current terminal: Rex (0151) maps `tui.integrations.rex.forwardAgentNotifications` onto `allow_notifications`. No flag selects a policy.
 - **Where it is applied** (every place agent bytes reach a host terminal):
   - `awman agents attach`: the CLI writer in `src/frontend/cli/per_command/container_frontend_marker.rs`, before raw stdout.
   - `awman squad attach`: `src/frontend/cli/per_command/squad_attach.rs` and `src/frontend/tui/squad_attach.rs`.
-  - 0146's `awman attach` (once it lands). The filter and OSC 7501 re-encoding are applied **whenever its stdout is a TTY**, with no flag. This is what agent blocks opened by host presenters (0153's Rex blocks, 0157) rely on.
+  - 0146's `awman attach` (once it lands). The filter and OSC 7501 re-encoding are applied **whenever its stdout is a TTY**, with no flag. This is what agent blocks opened by host presenters (0151's Rex blocks, 0157) rely on.
   - The TUI's own renderer is unaffected: it parses agent bytes into `vt100` and never forwards raw OSC to the host. Add a regression test that it still doesn't.
 - The existing CLI ACP OSC 52 strip (`acp_frontend.rs`) is replaced by the shared filter, so there is one implementation.
 
@@ -139,7 +139,7 @@ get correct rendering in the container, with nothing about my host terminal leak
 - follow established conventions, best practices, testing, and architecture patterns from the project's aspec.
 - The filter and emitter are pure Layer 1 modules with no I/O. Frontends own writing to stdout. Reuse 0152's `ProgramStatusReport` and `EffectiveStatus` instead of duplicating the protocol model.
 - The deny-list is one function, called from each backend's run-spec builder. Don't scatter checks.
-- These modules are reused by 0153 (Rex agent blocks), 0155 (TUI frontends) and 0157.
+- These modules are reused by 0151 (Rex agent blocks), 0155 (TUI frontends) and 0157.
 
 ## Documentation
 

@@ -24,7 +24,7 @@ Depends on: 0145 (one daemon, one API, features), 0159 (naming rules, config tre
   - to local attach (`awman attach`), as today;
   - to push clients over a WebSocket;
   - to work servers over the worker's outbound connection (0147);
-  - to engine frontends, including Rex agent blocks (0153).
+  - to engine frontends, including Rex agent blocks (0151).
   
   A late viewer sees the current screen, not a blank one.
 
@@ -109,9 +109,9 @@ watch it, or step in when it is stuck, with the same keys as `squad attach`
     - `cmd_…` opens the command's current terminal, or with `--step` that step's;
     - `task_…` opens the squad task's running terminal.
   - `--annotation k=v` (repeatable) attaches generic integration metadata to the subscription. Keys and values follow 0159 §1 and 0154's limits. They appear in `terminal_control` and in the engine's terminal events, so a host presenter can recognise its own views. There is no integration-specific attach flag.
-  - **Hang-up:** when the attach loses its terminal (SIGHUP, or stdout closed), it tells the hub `detached{reason: hangup}` before exiting. The engine forwards that to host presenters with the subscription's annotations (0153 maps it to "un-maximize"). A normal detach (Ctrl-C) reports `detached{reason: user}`.
+  - **Hang-up:** when the attach loses its terminal (SIGHUP, or stdout closed), it tells the hub `detached{reason: hangup}` before exiting. The engine forwards that to host presenters with the subscription's annotations (0151 maps it to "un-maximize"). A normal detach (Ctrl-C) reports `detached{reason: user}`.
   - **Host-terminal hygiene:** whenever stdout is a TTY, `awman attach` passes agent bytes through 0156's output filter and OSC 7501 re-encoding. There is no flag.
-  - `--read-only` drops stdin, never requests the input grant, and never resizes the PTY. 0153 and 0157 use it for presented blocks.
+  - `--read-only` drops stdin, never requests the input grant, and never resizes the PTY. 0151 and 0157 use it for presented blocks.
   - `awman squad attach <task>` is a shortcut for `awman attach task_…`.
 
 ## Edge Case Considerations:
@@ -155,7 +155,7 @@ watch it, or step in when it is stuck, with the same keys as `squad attach`
 - **Config:** the interaction and terminal keys are rows in 0159's key table, `src/data/config/fields.rs`.
 - **Related:**
   - 0154 and 0155: engine sessions and dialog relay;
-  - 0153 and 0157: Rex blocks as hub subscribers;
+  - 0151 and 0157: Rex blocks as hub subscribers;
   - 0156: the host-terminal output filter applied by `awman attach`;
   - 0159: naming, routes and IDs.
 

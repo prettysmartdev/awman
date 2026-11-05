@@ -133,7 +133,7 @@ keep the surface consistent without reviewing naming by hand.
     "backend": "auto",                         // 0155: auto | daemon | builtin
     "programStatus": { "emit": true },         // 0156
     "worker": { "enabled": false },            // 0147: TUI-hosted manual worker
-    "integrations": { "rex": { /* 0153, 0157 */ } }
+    "integrations": { "rex": { /* 0151, 0157 */ } }
   },
   "daemon": {
     "maxConcurrentJobs": 4,                    // host-wide cap (was workers)
@@ -184,7 +184,7 @@ keep the surface consistent without reviewing naming by hand.
   - `--max-concurrent` → `--set workflows.maxConcurrentSteps=…`;
   - `--launch-mode` → `--set agents.launchMode=…`;
   - 0155's `--engine` → `--set tui.backend=…`;
-  - 0153's `--integration` / `--no-integrations` → `--set tui.integrations.rex.enabled=off`;
+  - 0151's `--integration` / `--no-integrations` → `--set tui.integrations.rex.enabled=off`;
   - `--remote-addr` / `--api-key` → `--remote <target>` (intent: which target) plus `remote.targets.*`.
 - **`AWMAN_*` config variables** are derived from the key table. For example, `AWMAN_WORKFLOWS_MAX_CONCURRENT_STEPS`, `AWMAN_AGENTS_LAUNCH_MODE` and `AWMAN_TUI_BACKEND`. Removed hand-named variables: `AWMAN_MAX_CONCURRENT_AGENTS`, `AWMAN_LAUNCH_MODE`, `AWMAN_REMOTE_ADDR`, and `AWMAN_API_KEY` (→ `AWMAN_REMOTE_TARGETS_<NAME>_API_KEY`). `AWMAN_OVERLAYS` keeps its name, because the derived name for `overlays` is the same.
 - **Process variables that are not config** stay, in one documented list:
@@ -262,7 +262,7 @@ The Work Server Protocol (0147) is a separate API that awman *calls*. It follows
 | `GET /v1/engine/instances/{id}/tabs`, `GET /v1/engine/instances/{id}/tabs/{id}` | Tabs, with their sessions, container slots and annotations. |
 | `GET /v1/engine/instances/{id}/dialogs`, `POST /v1/engine/instances/{id}/dialogs/{id}/answer` | Pending dialogs and answering one. The first answer wins, exactly as from a frontend. This replaces 0158's `step.approve` route. |
 | `POST /v1/engine/instances/{id}/ui_requests` | `{request: "open_overview" \| …}`, for integrations' palette actions. This replaces `overview.open`. |
-| `PATCH /v1/engine/instances/{id}`, `PATCH /v1/engine/instances/{id}/tabs/{id}` | `{annotations}` only, for host presenters (0153) through the API. |
+| `PATCH /v1/engine/instances/{id}`, `PATCH /v1/engine/instances/{id}/tabs/{id}` | `{annotations}` only, for host presenters (0151) through the API. |
 
 - **Removed, with no alias:**
   - `/v1/sessions*`, `/v1/commands*`, `/v1/runs` and `/v1/workdirs` at the root (now under `/v1/worker`);

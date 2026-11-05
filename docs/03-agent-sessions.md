@@ -292,9 +292,47 @@ awman exec prompt --agent-flag=--config --agent-flag=key=value "fix the build"
 
 Mount the host Docker socket into the container, giving the agent the ability to build and run Docker containers. See [Security & Isolation](04-security-and-isolation.md#docker-socket-access) for details on when to use this.
 
-### `--worktree`
+### `--branch`, `--pr` and `--worktree`
 
-(`exec workflow` only) Run in an isolated Git worktree under `~/.awman/worktrees/`. Implied by `--yolo` and `--auto` when used with `exec workflow`. See [Security & Isolation](04-security-and-isolation.md).
+`chat` and `exec prompt` normally run in your current checkout. Three mutually exclusive flags run the session in a separate Git worktree instead, so the agent works on a branch without touching your checkout. They are available on the CLI and in the TUI, not through the HTTP API.
+
+```sh
+awman chat --branch feature/login
+awman exec prompt --pr 482 "Fix the failing test"
+awman chat --worktree pr-482
+```
+
+Put these flags, like every other flag, before the prompt text. `exec prompt` reads everything after the prompt as more prompt, so `awman exec prompt "Fix the failing test" --pr 482` would send `--pr 482` to the agent and run in your checkout. awman refuses that order with an error rather than launching outside the worktree; quote the whole prompt as one argument if those words really belong in it.
+
+Before launch awman prints the worktree path and branch. The session's container mounts that worktree (see [Security & Isolation](04-security-and-isolation.md#session-worktrees)).
+
+**`--branch <name>`** runs in a worktree for that branch. What happens depends on where the branch exists:
+
+| On `origin` | Local | Result |
+|---|---|---|
+| Yes | No | The branch is fetched and a worktree is created with a local branch tracking it |
+| Yes | Yes | The local branch is fast-forwarded to `origin` when it can be, then used. If it has local commits that `origin` lacks, awman warns and keeps them |
+| No | Yes | The existing local branch is used as it is |
+| No | No | A new branch is created from the `HEAD` of the checkout you ran the command in. Uncommitted changes there are not carried over, and awman says so |
+
+If there is no `origin` remote, awman warns and treats the branch as absent from the remote. A network or authentication failure while checking `origin` stops the command rather than quietly creating a new branch. awman never waits for a password or SSH prompt: SSH runs in batch mode (unless you set `GIT_SSH_COMMAND`, `GIT_SSH` or a global `core.sshCommand`), so connect to a new SSH host once outside awman to accept its host key, and use an SSH agent for keys with a passphrase. A remote that does not answer within five minutes is reported as an error. A remote-only branch in a single-branch clone gets a fetch mapping for that branch added to the remote, so its upstream works.
+
+**`--pr <number|URL|owner/repo#N>`** runs in a worktree for a GitHub pull request. For a pull request from the same repository, the worktree uses the PR's head branch just like `--branch`. A pull request from a fork, or whose head branch was deleted, gets a local `pr/<N>` branch created from GitHub's pull ref; pushes from it do not update the PR. A closed or merged PR still works, with a warning. See [GitHub Integration](10-github-integration.md#pull-requests-for---pr) for accepted formats, authentication and fork details.
+
+**`--worktree <name|path>`** reuses a worktree that already exists. A bare name is looked up under `~/.awman/worktrees/`; a value containing a path separator or starting with `.` is a path, and a relative path is resolved from the directory you ran the command in. A numeric name is also tried zero-padded to four digits (`7` also tries `0007`). The worktree must belong to this repository. Nothing is fetched, checked out or merged, and a worktree with a detached HEAD runs with a warning. If the name isn't found, the error lists the directories searched and the worktrees available.
+
+Worktrees created by `--branch` and `--pr` live under `~/.awman/worktrees/<repo-name>-<hash>/`, in a directory named `br-<branch>` or `pr-<N>`. Characters in a branch name other than letters, digits, `.`, `_` and `-` become `-`, with a short hash appended so `a/b` and `a-b` never collide. Because of that hash, `--branch feature/login` creates a directory such as `br-feature-login-1a2b3c4d`, while `--branch fix-123` creates plain `br-fix-123`. Reopen one later with the directory name awman printed, for example `--worktree br-feature-login-1a2b3c4d` or `--worktree pr-482`; if you get the name wrong, the error lists the worktrees that exist.
+
+Details that apply to all three:
+
+- **Worktrees are kept.** awman never merges, discards or deletes these worktrees, and there is no prompt afterwards. When the session ends it prints `Worktree kept at <path> (<branch>).` Remove one yourself with `git worktree remove`.
+- **Already checked out is reused.** If the branch is already checked out in another worktree of this repository, awman uses that one. If it is checked out in your main checkout, the command stops and tells you to switch that checkout to another branch or run without the flag.
+- **Reused worktrees are refreshed carefully.** awman fast-forwards a reused worktree only if it is clean and strictly behind its remote; one with uncommitted changes, local commits or diverged history is left as it is, with a warning. This also applies when another session is already running in that worktree: if its tree is clean and behind, the second launch fast-forwards it underneath the first. Use `--worktree <name>` for the second session if you want to join it without any fetch or fast-forward.
+- **A taken path is never overwritten.** If the default `br-`/`pr-` directory already exists for something else, the command stops and names it. A stale worktree registration also stops the command; run `git worktree prune` yourself after inspecting it.
+- **Your checkout's configuration applies.** Agent, trust, repo config and overlays come from the checkout you ran the command in, not from the worktree. See [Security & Isolation](04-security-and-isolation.md#session-worktrees).
+- The repository must have at least one commit.
+
+`exec workflow` also has a `--worktree` flag, but there it is a switch that creates and manages a workflow worktree, implied by `--yolo` and `--auto`, with a merge-back prompt at the end; see [Workflows](05-workflows.md#worktrees).
 
 ---
 
@@ -376,7 +414,7 @@ Yolo mode is a good fit when you have a well-specified work item you trust the a
 --yolo implies --worktree. Running in isolated worktree.
 ```
 
-Passing `--worktree` as well is accepted — no duplicate worktree is created. `--worktree` exists only on `exec workflow`; `chat` and `exec prompt` always run in the current checkout.
+Passing `--worktree` as well is accepted — no duplicate worktree is created. This applies to `exec workflow` only: on `chat` and `exec prompt`, `--yolo` does not create a worktree. Use `--branch`, `--pr` or `--worktree <name>` there if you want isolation (see [`--branch`, `--pr` and `--worktree`](#--branch---pr-and---worktree)).
 
 **3. Auto-advances stuck workflow steps.** When a step goes silent, a countdown advances the workflow for you. See [Auto-advance when stuck](05-workflows.md#auto-advance-when-stuck-yolo-mode) in the workflow guide for the countdown, how it appears in each frontend, and how to cancel it.
 
@@ -957,7 +995,10 @@ Each step's `status` is `ok`, `skipped`, `warn`, `failed`, `pending` or `running
 | `--allow-docker` | ✓ | ✓ | ✓ | Mount host Docker socket |
 | `--overlay=<SPEC>` | ✓ | ✓ | ✓ | `dir()`, `env()`, `skill()`, `ssh()` overlays (repeatable) |
 | `--agent-flag=<ARG>` | ✓ | ✓ | ✓ | Extra argument for the agent command (repeatable); replaces its `agentFlags` entry |
-| `--worktree` | — | — | ✓ | Run in isolated Git worktree |
+| `--branch <NAME>` | ✓ | ✓ | — | Run in a worktree for this branch (CLI/TUI only) |
+| `--pr <N\|URL\|owner/repo#N>` | ✓ | ✓ | — | Run in a worktree for a GitHub pull request (CLI/TUI only) |
+| `--worktree <NAME\|PATH>` | ✓ | ✓ | — | Reuse an existing worktree (CLI/TUI only) |
+| `--worktree` | — | — | ✓ | Run in an isolated, managed Git worktree (a switch on this command) |
 | `--auto` | ✓ | ✓ | ✓ | Auto-approve file edits, prompt for shell commands |
 | `--yolo` | ✓ | ✓ | ✓ | Fully autonomous mode |
 | `--work-item <N>` | — | — | ✓ | Work item number for template variable substitution |

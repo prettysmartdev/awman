@@ -3,12 +3,12 @@
 Title: Frontend protocol: the TUI and CLI as engine frontends
 Issue: issuelink
 
-Depends on: 0159 (config and API naming, route tree), 0154 (engine feature), 0145 (one daemon, one API, local listener, ephemeral enablement), 0146 (terminal hub, relayed dialogs). Used by: 0153 (Rex), 0157, 0158.
+Depends on: 0159 (config and API naming, route tree), 0154 (engine feature), 0145 (one daemon, one API, local listener, ephemeral enablement), 0146 (terminal hub, relayed dialogs). Used by: 0151 (Rex), 0157, 0158.
 
 ## Summary:
 - 0154 hosts awman instances in the daemon's `engine` feature. This item defines how a TUI or CLI process becomes a **frontend** of such an instance, and when it does so.
 - **Protocol `awman.frontend.v1`.** It is a WebSocket on `/v1/engine/instances/{id}/frontend`, on the daemon's local listener. It serialises the channels a `Tab` already uses to talk to its command thread (`command_result_rx`, `dialog_request_rx`, `dialog_response_tx`, `TabSharedState`, the `ContainerSlotEvent` queue). The TUI keeps its rendering and input code; only the producer side of those channels moves.
-- **Hand-off.** Each invocation decides once, before dispatch, whether it runs on the **builtin** in-process engine or the **daemon** engine. The inputs are one config key, `tui.backend: "auto" | "daemon" | "builtin"` (overridable for one run with 0159's generic `--set tui.backend=…` or `AWMAN_TUI_BACKEND`), whether an enabled host integration requires the daemon (Rex, 0153), and each integration's `tui.integrations.<name>.enabled` (likewise overridable with `--set`). There are no dedicated flags.
+- **Hand-off.** Each invocation decides once, before dispatch, whether it runs on the **builtin** in-process engine or the **daemon** engine. The inputs are one config key, `tui.backend: "auto" | "daemon" | "builtin"` (overridable for one run with 0159's generic `--set tui.backend=…` or `AWMAN_TUI_BACKEND`), whether an enabled host integration requires the daemon (Rex, 0151), and each integration's `tui.integrations.<name>.enabled` (likewise overridable with `--set`). There are no dedicated flags.
   - Under `auto`, the daemon engine is used when a host integration requires it, or when `engine` is persistently enabled. Otherwise today's builtin engine is used.
   - Any failure under `auto` falls back to builtin with a one-line notice.
 - **Parity.** A TUI or CLI frontend is indistinguishable from the builtin engine (0154's contract): the same keys, dialogs, output, prompts, Ctrl-C behaviour, exit codes and fatal-error handling.
@@ -50,7 +50,7 @@ present awman natively without forking its TUI.
 - **Inputs:**
   - `tui.backend: "auto" | "daemon" | "builtin"`: default `"auto"`, scope `repo` (global and repo), one row in 0159's key table. For one run, use `--set tui.backend=builtin` or `AWMAN_TUI_BACKEND=builtin`; 0159 removes per-setting flags, so there is no `--engine`;
   - `tui.integrations.<name>.enabled: "auto" | "on" | "off"` for each registered integration, which `detect()` reads. For one run, use `--set tui.integrations.rex.enabled=off`. There is no integration-specific or integration-wide flag;
-  - `HostRequirement` (`None | Optional(Annotations) | Required(Annotations)`), returned by each enabled integration's `detect()` in 0154's registry. Rex (0153) returns `Required` with its `rex/*` annotations when Rex is `Present`. Detected annotations from all integrations are merged into `Hello.annotations`; a namespace clash is a bug and is rejected.
+  - `HostRequirement` (`None | Optional(Annotations) | Required(Annotations)`), returned by each enabled integration's `detect()` in 0154's registry. Rex (0151) returns `Required` with its `rex/*` annotations when Rex is `Present`. Detected annotations from all integrations are merged into `Hello.annotations`; a namespace clash is a bug and is rejected.
 - **Decision:**
 
   | `tui.backend` | Host requires daemon | `engine` persistently on | Result |
@@ -103,7 +103,7 @@ present awman natively without forking its TUI.
 - **`TerminalRelease`/`TerminalRestore`** (awman hands the terminal to a host process such as an auth flow): the engine runs that process in a PTY with the instance's env and exposes it as a hub terminal. The frontend leaves raw mode and alternate screen, bridges its real terminal to that hub terminal, and restores afterwards. This is the same sequence the user sees today.
 - **UiRequest claiming:**
   - The frontend sends a `UiRequest` for every window-management transition: tab open, next, previous or close, container-window state change, overview, workflow window.
-  - With `claimed_by_host: true`, a host presenter (0153) does it, and the frontend only updates its state. For example, the tab bar stays collapsed and the maximized slot renders as Minimized because Rex shows it.
+  - With `claimed_by_host: true`, a host presenter (0151) does it, and the frontend only updates its state. For example, the tab bar stays collapsed and the maximized slot renders as Minimized because Rex shows it.
   - With `false`, the frontend does exactly what today's TUI does.
   - Without a host, every request is unclaimed, so behaviour is identical to builtin.
 - **Hidden entry point** `awman view --instance <id> --tab <session-id> [--annotation k=v]...`: a secondary TUI frontend rendering one tab of an existing instance. Its `Hello.annotations` are its own detected annotations plus the given ones, which is how a presenter matches the view to the window it opened. It is used by host presenters, marked internal in the catalogue, and absent from `--help` and the docs.
@@ -153,7 +153,7 @@ present awman natively without forking its TUI.
   - `src/frontend/tui/dialog_router.rs` (unchanged, now fed remotely).
   - `src/frontend/cli/command_frontend.rs` and `per_command/*` (relay adapters).
   - `src/frontend/tui/event_loop.rs` (terminal release and restore around relayed host processes).
-- Catalogue: no new global flags (0159's `--set` covers `tui.backend` and integration switches). Add the `tui.backend` row to the key table (`src/data/config/fields.rs`, section struct `src/data/config/tui.rs`, shared with 0153 and 0156), and the hidden `view` command (`--instance ins_…`, `--tab tab_…`, `--annotation k=v`).
+- Catalogue: no new global flags (0159's `--set` covers `tui.backend` and integration switches). Add the `tui.backend` row to the key table (`src/data/config/fields.rs`, section struct `src/data/config/tui.rs`, shared with 0151 and 0156), and the hidden `view` command (`--instance ins_…`, `--tab tab_…`, `--annotation k=v`).
 - Reuse 0146's `attach_protocol.rs` framing for terminal subscriptions. Do not duplicate it.
 
 ## Documentation

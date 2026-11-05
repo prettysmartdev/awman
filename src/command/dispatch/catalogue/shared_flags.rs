@@ -14,7 +14,7 @@ use super::*;
 //
 // Per the work item: `remote exec workflow` accepts the same flags as the
 // local `exec workflow`, minus flags that make no sense remotely (`--workdir`
-// is implicit, `--worktree` is a server-side concern, and `--json` shapes the
+// is implicit, `--worktree` is a local-session concern, and `--json` shapes the
 // local outcome, which the server reports itself). Plus remote-transport
 // flags (`--remote-addr`, `--session`, `--api-key`, `--follow`). Every kept
 // flag is forwarded to the server; an excluded one is an unknown flag, so it
@@ -24,7 +24,8 @@ use super::*;
 // addition to AGENT_RUN_FLAGS_NO_WORKTREE / EXEC_WORKFLOW_FLAGS is picked up
 // automatically — no manual list maintenance.
 
-pub(super) const REMOTE_EXEC_EXCLUDED_FLAG_NAMES: &[&str] = &["workdir", "worktree", "json"];
+pub(super) const REMOTE_EXEC_EXCLUDED_FLAG_NAMES: &[&str] =
+    &["workdir", "worktree", "branch", "pr", "json"];
 
 pub(super) const REMOTE_TRANSPORT_FLAGS: [FlagSpec; 4] = [
     FlagSpec {
@@ -159,9 +160,8 @@ pub(super) const REMOTE_EXEC_PROMPT_FLAGS: [FlagSpec; REMOTE_EXEC_PROMPT_TOTAL] 
 
 // ─── Reusable agent-run flag arrays ─────────────────────────────────────────
 
-/// Agent-run flag set used by `chat` and `exec prompt` (no worktree, no
-/// workflow). All optional. Mode flags `yolo` / `auto` / `plan` are mutually
-/// exclusive.
+/// Shared agent-run flags for `chat` and `exec prompt` (without workflow-only
+/// flags). Mode flags `yolo` / `auto` / `plan` are mutually exclusive.
 pub(super) const AGENT_RUN_FLAGS_NO_WORKTREE: [FlagSpec; 10] = [
     FlagSpec {
         long: "non-interactive",
@@ -276,9 +276,54 @@ pub(super) const AGENT_RUN_FLAGS_NO_WORKTREE: [FlagSpec; 10] = [
     },
 ];
 
-/// Agent-run flags for `exec prompt` — extends `AGENT_RUN_FLAGS_NO_WORKTREE`
-/// with `--issue`. Scoped to `exec prompt` only; `chat` retains the base set.
-/// The one flag `exec prompt` adds to the base agent-run set.
+/// Selectors for choosing a persistent session worktree. These are limited to
+/// local frontends because they can select a host directory to mount.
+pub(super) const SESSION_WORKTREE_FLAGS: [FlagSpec; 3] = [
+    FlagSpec {
+        long: "branch",
+        short: None,
+        help: "Run in a worktree for this branch.",
+        kind: FlagKind::OptionalString,
+        default: FlagDefault::None,
+        frontends: FrontendVisibility::CliAndTui,
+        conflicts_with: &["pr", "worktree"],
+        implies: &[],
+        optional: true,
+    },
+    FlagSpec {
+        long: "pr",
+        short: None,
+        help: "Run in a worktree for this GitHub pull request.",
+        kind: FlagKind::OptionalString,
+        default: FlagDefault::None,
+        frontends: FrontendVisibility::CliAndTui,
+        conflicts_with: &["branch", "worktree"],
+        implies: &[],
+        optional: true,
+    },
+    FlagSpec {
+        long: "worktree",
+        short: None,
+        help: "Reuse an existing named or path-based Git worktree.",
+        kind: FlagKind::OptionalString,
+        default: FlagDefault::None,
+        frontends: FrontendVisibility::CliAndTui,
+        conflicts_with: &["branch", "pr"],
+        implies: &[],
+        optional: true,
+    },
+];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionWorktreeTarget {
+    Branch(String),
+    PullRequest(String),
+    Existing(String),
+}
+
+/// Agent-run flags for `exec prompt` — extends the common flags with
+/// `--issue` and persistent session-worktree selectors.
+/// `--issue` remains exclusive to `exec prompt`.
 pub(super) const EXEC_PROMPT_EXTRA_FLAGS: [FlagSpec; 1] = [FlagSpec {
     long: "issue",
     short: None,
@@ -291,14 +336,23 @@ pub(super) const EXEC_PROMPT_EXTRA_FLAGS: [FlagSpec; 1] = [FlagSpec {
     optional: true,
 }];
 
-/// Agent-run flags for `exec prompt` — the base set plus `--issue`.
+/// Agent-run flags for `exec prompt` — common flags plus `--issue` and
+/// persistent session-worktree selectors.
 ///
-/// Derived rather than copied (WI 0114 F-51): the nine base flags were written
+/// Derived rather than copied (WI 0114 F-51): the base flags were written
 /// out a second time here, so a change to one of them silently applied to
 /// `chat` and not to `exec prompt`. The arity is checked by the compiler.
+pub(super) const CHAT_FLAGS: [FlagSpec;
+    AGENT_RUN_FLAGS_NO_WORKTREE.len() + SESSION_WORKTREE_FLAGS.len()] =
+    concat_flags(&[&AGENT_RUN_FLAGS_NO_WORKTREE, &SESSION_WORKTREE_FLAGS]);
+
 pub(super) const EXEC_PROMPT_FLAGS: [FlagSpec;
-    AGENT_RUN_FLAGS_NO_WORKTREE.len() + EXEC_PROMPT_EXTRA_FLAGS.len()] =
-    concat_flags(&[&AGENT_RUN_FLAGS_NO_WORKTREE, &EXEC_PROMPT_EXTRA_FLAGS]);
+    AGENT_RUN_FLAGS_NO_WORKTREE.len() + EXEC_PROMPT_EXTRA_FLAGS.len() + SESSION_WORKTREE_FLAGS.len()] =
+    concat_flags(&[
+        &AGENT_RUN_FLAGS_NO_WORKTREE,
+        &EXEC_PROMPT_EXTRA_FLAGS,
+        &SESSION_WORKTREE_FLAGS,
+    ]);
 
 /// `--work-item`, which `exec workflow` lists before everything else.
 pub(super) const EXEC_WORKFLOW_LEADING_FLAGS: [FlagSpec; 1] = [FlagSpec {

@@ -21,6 +21,7 @@ use std::path::PathBuf;
 
 use crate::command::dispatch::catalogue::{
     ArgumentKind, CommandCatalogue, CommandSpec, FlagDefault, FlagKind, FlagSpec, FrontendKind,
+    FrontendVisibility,
 };
 use crate::command::error::CommandError;
 
@@ -280,6 +281,36 @@ impl CommandCatalogue {
             .ok_or_else(|| CommandError::unknown_command(path))?;
         let canonical = self.canonical_path(path);
         let mut parsed = parse_against_spec(spec, &canonical, args)?;
+        // Visibility is also an admission boundary. In particular, API and
+        // squad workers must not accept local-only host-mount selectors.
+        // Check parsed flags so greedy prompt tokens remain prompt text.
+        for flag in spec.flags {
+            if !parsed.flags.contains_key(flag.long) {
+                continue;
+            }
+            let allowed = match flag.frontends {
+                FrontendVisibility::All => true,
+                FrontendVisibility::CliOnly => frontend == FrontendKind::Cli,
+                FrontendVisibility::TuiOnly => frontend == FrontendKind::Tui,
+                FrontendVisibility::CliAndTui => {
+                    matches!(frontend, FrontendKind::Cli | FrontendKind::Tui)
+                }
+                FrontendVisibility::Hidden => false,
+            };
+            // A forced technical setting is applied even without an argv
+            // token, and the client cannot override its value. Accepting its
+            // spelling (e.g. a daemon's non-interactive mode) grants nothing.
+            let forced_by_profile = frontend_flag_defaults(frontend)
+                .iter()
+                .any(|entry| entry.flag == flag.long && entry.forced);
+            if !allowed && !forced_by_profile {
+                return Err(CommandError::InvalidFlagValue {
+                    command: canonical.iter().map(|part| (*part).to_string()).collect(),
+                    flag: flag.long.to_string(),
+                    reason: format!("not available via the {} frontend", frontend.label()),
+                });
+            }
+        }
         apply_frontend_defaults(&mut parsed, spec, frontend);
         Ok(parsed)
     }

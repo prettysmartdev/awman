@@ -565,6 +565,39 @@ impl Session {
         Ok(session)
     }
 
+    /// Re-root a validated session without reading configuration from the target.
+    ///
+    /// Branch/PR checkouts can contain untrusted repo configuration. Preserve
+    /// the complete invoker snapshot and definition provenance, with a fresh
+    /// identity and execution state. Workflow sessions retain their separate
+    /// `open_worktree_for` behavior.
+    pub fn open_worktree_with_invoker_config(
+        working_dir: PathBuf,
+        git_root: PathBuf,
+        invoker: &Session,
+    ) -> Result<Self, DataError> {
+        let now = SystemTime::now();
+        Ok(Self {
+            id: SessionId::new(),
+            session_type: SessionType::Local {
+                workdir: working_dir,
+            },
+            git_root,
+            definition_root: invoker.definition_root.clone(),
+            is_git_repo: true,
+            repo_config: invoker.repo_config.clone(),
+            global_config: invoker.global_config.clone(),
+            env: invoker.env.clone(),
+            flags: invoker.flags.clone(),
+            default_agent: invoker.default_agent.clone(),
+            available_agents: invoker.available_agents.clone(),
+            state: SessionState::new(),
+            created_at: now,
+            last_active_at: now,
+            created_at_instant: Instant::now(),
+        })
+    }
+
     /// The one constructor. `is_git_repo` records what the caller's resolution
     /// actually established, so nothing downstream has to probe for it.
     fn open_resolved(

@@ -78,12 +78,12 @@ On infact's side the matching items are 0023 (infact is a work server; the worke
 
 Once 0147 lands, proposals 0133, 0134 and 0139 no longer matter to infact; the worker uses 0133's clone machinery internally. The same goes for 0142, and for 0144's API route: workers provision missing agent Dockerfiles themselves. 0135, 0137, 0141 and 0143 are still needed; the WSP `cancel`, `result`, `credentials` and `read_only` fields are their worker-side form.
 
-## The engine, frontends and Rex (0152–0158)
+## The engine, frontends and Rex (0151, 0152, 0154–0158)
 
 | Proposal | What it adds | Status |
 |---|---|---|
+| [0151](0151-rex-integration.md) | Rex integration: in Rex, awman uses the daemon `engine` and presents tabs as Rex windows, maximized agents as Rex blocks, and parallel steps as tiled windows, with parity with the normal TUI | design |
 | [0152](0152-ghb30-support-osc-7501-status-codes.md) | Agents report their own state through OSC 7501, which replaces silence-based stuck detection for agents that report | design |
-| [0153](0153-rex-integration.md) | Rex integration: in Rex, awman uses the daemon `engine` and presents tabs as Rex windows, maximized agents as Rex blocks, and parallel steps as tiled windows, with parity with the normal TUI | design |
 | [0154](0154-engine-feature-singleton-awman-instance.md) | Engine feature: a singleton awman instance for many frontends, with a per-instance environment and a parity contract | design |
 | [0155](0155-frontend-protocol-tui-and-cli-as-engine-frontends.md) | Frontend protocol: TUI and CLI as engine frontends (`awman.frontend.v1`, dialog relay, hand-off, `tui.backend`) | design |
 | [0156](0156-host-terminal-hygiene.md) | Host-terminal hygiene: output filter, OSC 7501 emission, env deny-list | design; independent, can ship first |
@@ -97,5 +97,5 @@ Once 0147 lands, proposals 0133, 0134 and 0139 no longer matter to infact; the w
 3. 0146, then 0147, then 0148.
 4. 0152.
 5. 0154, then 0155.
-6. 0153.
+6. 0151.
 7. 0157 and 0158.

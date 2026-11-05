@@ -3,7 +3,7 @@
 Title: Engine feature: a singleton awman instance for many frontends
 Issue: issuelink
 
-Depends on: 0159 (config and API naming, route tree), 0145 (one daemon, one API, features), 0146 (terminal hub in the shared core, relayed dialogs). Lands together with 0155 (frontend protocol), which follows it in the order. Used by: 0153 (Rex integration), 0157 (daemon work in Rex), 0158 (Rex action pack).
+Depends on: 0159 (config and API naming, route tree), 0145 (one daemon, one API, features), 0146 (terminal hub in the shared core, relayed dialogs). Lands together with 0155 (frontend protocol), which follows it in the order. Used by: 0151 (Rex integration), 0157 (daemon work in Rex), 0158 (Rex action pack).
 
 ## Summary:
 - Today every `awman` TUI process builds its own awman instance in-process. `tui::run()` creates an `App` that holds:
@@ -14,7 +14,7 @@ Depends on: 0159 (config and API naming, route tree), 0145 (one daemon, one API,
   - container slots fed by `ContainerLifecycle` (`src/frontend/tui/tabs.rs`).
   
   The CLI does the same for each command. Nothing outside that process can drive or present its work.
-- **Add `engine`, the third feature of the 0145 daemon:** a singleton awman instance host that runs this same non-UI half of awman **once, in the daemon**, and drives any number of **frontends**: one or more TUI instances, the Rex integration (0153), and any future awman frontend (a web UI, an IDE extension…). Frontends speak the frontend protocol (0155) over the daemon's local listener.
+- **Add `engine`, the third feature of the 0145 daemon:** a singleton awman instance host that runs this same non-UI half of awman **once, in the daemon**, and drives any number of **frontends**: one or more TUI instances, the Rex integration (0151), and any future awman frontend (a web UI, an IDE extension…). Frontends speak the frontend protocol (0155) over the daemon's local listener.
 - **Instance model, unchanged from today.**
   - The engine hosts **instances**. An instance is exactly what one TUI process holds in-process today.
   - Typing `awman` creates a new instance. Two `awman`s are two independent instances, exactly as today.
@@ -33,7 +33,7 @@ I want to:
 run awman's TUI with the daemon `engine` as its backend and notice no difference at all from the normal TUI
 
 So I can:
-get host integrations such as Rex (0153) and future frontends without relearning anything or losing any behaviour.
+get host integrations such as Rex (0151) and future frontends without relearning anything or losing any behaviour.
 
 ### User Story 2:
 As a: frontend author (Rex integration, a future web or IDE frontend)
@@ -105,7 +105,7 @@ enable it, or let a host integration enable it ephemerally, without widening awm
 - **Lifecycle mapping, identical to today:**
   - Quit from any frontend (`Quit`, after `QuitConfirm` as today) → today's TUI-exit policy for the whole instance. All frontends get `Detach{reason: "quit"}`.
   - The primary frontend disconnects without `Quit` (killed or hung up) → treated as today's TUI process being killed: the same exit policy, with no prompt. A short grace period (2 s) covers a reconnect after a transient socket error (0155), so parity holds for genuine exits only.
-  - A secondary frontend disconnects → nothing happens to the instance. Host presenters may map it to a tab action (0153 maps closing a Rex tab window to close-tab).
+  - A secondary frontend disconnects → nothing happens to the instance. Host presenters may map it to a tab action (0151 maps closing a Rex tab window to close-tab).
   - Close tab → today's close-tab semantics (cancel the running command, end the session). Closing the last tab quits the instance, as today.
   - `Ctrl-\` detach containers → identical to today.
 - **Nothing survives that wouldn't survive in-process**, and nothing is killed that wouldn't be. There is no "detached instance" state.
@@ -169,7 +169,7 @@ This order keeps every step shippable: step 2 with only `LocalInstanceBackend` i
   - stdout, stderr and exit codes.
   
   The rendered TUI frames must also be identical.
-- **Allowed differences:** none in the TUI or CLI. `awman daemon status` and `awman daemon api instances.list` show engine state. Host presenters may add host-native presentation (0153), but never change outcomes.
+- **Allowed differences:** none in the TUI or CLI. `awman daemon status` and `awman daemon api instances.list` show engine state. Host presenters may add host-native presentation (0151), but never change outcomes.
 - **Suite** (`tests/engine_parity/`):
   - Run the existing TUI tests (`src/frontend/tui/tests/*`, `tabs/tests.rs`) and CLI end-to-end tests twice, with a backend switch (`AWMAN_TEST_BACKEND=builtin|daemon`).
   - The daemon run starts an in-process daemon core on a temp `<data>` with a Unix socket.
