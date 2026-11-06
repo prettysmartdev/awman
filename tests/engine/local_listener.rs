@@ -8,6 +8,7 @@
 #![cfg(unix)]
 
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -89,10 +90,24 @@ impl FakeDaemon {
         let binary = dir.path().join("awman-fake");
         std::fs::copy(sleep, &binary).unwrap();
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let child = std::process::Command::new(&binary)
-            .arg("60")
-            .spawn()
-            .unwrap();
+        // Some hosts provide sleep through a multi-call binary that dispatches
+        // by argv[0]. Keep the executable name for daemon identity checks, but
+        // ask that binary to run its sleep applet.
+        let mut command = std::process::Command::new(&binary);
+        command.arg0("sleep").arg("60");
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        let child = loop {
+            match command.spawn() {
+                Ok(child) => break child,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::ExecutableFileBusy
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => panic!("spawn fake daemon: {error}"),
+            }
+        };
         Self { _dir: dir, child }
     }
     fn pid(&self) -> u32 {

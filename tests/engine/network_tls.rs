@@ -257,6 +257,39 @@ fn a_missing_san_record_forces_regeneration() {
 }
 
 #[test]
+fn legacy_and_expired_certificates_are_rotated() {
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = DaemonPaths::new(tmp.path().join("daemon"));
+    let auth = engine(tmp.path());
+    let (first, _) = auth.ensure_network_tls(&paths, unspecified(), &[]).unwrap();
+
+    let record_path = paths.tls_sans_file();
+    let mut record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&record_path).unwrap()).unwrap();
+    record.as_object_mut().unwrap().remove("renew_after_unix");
+    std::fs::write(&record_path, serde_json::to_vec(&record).unwrap()).unwrap();
+    assert_eq!(auth.load_network_tls(&paths).unwrap(), None);
+    let (second, regenerated) = auth.ensure_network_tls(&paths, unspecified(), &[]).unwrap();
+    assert!(regenerated);
+    assert_ne!(
+        first.material.fingerprint_sha256_hex,
+        second.material.fingerprint_sha256_hex
+    );
+
+    let mut record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&record_path).unwrap()).unwrap();
+    record["renew_after_unix"] = serde_json::json!(0);
+    std::fs::write(&record_path, serde_json::to_vec(&record).unwrap()).unwrap();
+    assert_eq!(auth.load_network_tls(&paths).unwrap(), None);
+    let (third, regenerated) = auth.ensure_network_tls(&paths, unspecified(), &[]).unwrap();
+    assert!(regenerated);
+    assert_ne!(
+        second.material.fingerprint_sha256_hex,
+        third.material.fingerprint_sha256_hex
+    );
+}
+
+#[test]
 fn files_are_owner_only_and_key_is_redacted_in_debug() {
     let tmp = tempfile::tempdir().unwrap();
     let paths = DaemonPaths::new(tmp.path().join("daemon"));
