@@ -110,9 +110,9 @@ impl AuthEngine {
         let Some(record) = read_private_json::<SansRecord>(&paths.tls_sans_file())? else {
             return Ok(None);
         };
-        if !record
+        if record
             .renew_after_unix
-            .is_some_and(|deadline| deadline > chrono::Utc::now().timestamp())
+            .is_none_or(|deadline| deadline <= chrono::Utc::now().timestamp())
         {
             return Ok(None);
         }
