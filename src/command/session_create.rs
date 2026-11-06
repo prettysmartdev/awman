@@ -59,7 +59,8 @@ pub struct SessionCreateRequest {
 /// remote clone is planned.
 #[derive(Debug, Clone)]
 pub struct SessionCreatePolicy {
-    /// Canonicalized directories a `local` session is permitted to mount.
+    /// Directories a `local` session is permitted to mount. Entries are
+    /// canonicalized when checked against the requested workdir.
     pub workdirs: Vec<PathBuf>,
     /// Roots whose direct children may be used when they are independent git
     /// repositories. Resolved again per request; roots may not exist yet.
@@ -95,7 +96,10 @@ impl SessionCreatePolicy {
         requested: &Path,
         git: &dyn GitRootResolver,
     ) -> Result<(), CommandError> {
-        if self.workdirs.iter().any(|path| path == requested) {
+        if self.workdirs.iter().any(|path| {
+            path.canonicalize()
+                .is_ok_and(|resolved| resolved == requested)
+        }) {
             return Ok(());
         }
 
@@ -703,6 +707,21 @@ mod validate_tests {
         assert_eq!(plan.resolved_workdir, canon);
         assert!(plan.cloned_path.is_none());
         assert!(plan.repo_url.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_allowlist_path_alias_resolves_to_requested_workdir() {
+        let target = tempfile::tempdir().unwrap();
+        let canonical = target.path().canonicalize().unwrap();
+        let link_parent = tempfile::tempdir().unwrap();
+        let alias = link_parent.path().join("workdir-alias");
+        std::os::unix::fs::symlink(&canonical, &alias).unwrap();
+
+        let plan = local(Some(canonical.to_str().unwrap()))
+            .validate(&policy(vec![alias]), &StaticGitRootResolver::new("/unused"))
+            .expect("configured alias must allow its resolved workdir");
+        assert_eq!(plan.resolved_workdir, canonical);
     }
 
     #[cfg(unix)]

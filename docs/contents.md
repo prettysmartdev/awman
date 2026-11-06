@@ -15,7 +15,7 @@ A guide to using awman, the containerized multi-agent terminal multiplexer.
 | 04 | [Security & Isolation](04-security-and-isolation.md) | Worktrees, Docker socket, SSH keys, custom agent approval, command transparency |
 | 05 | [Workflows](05-workflows.md) | Multi-step workflows, setup/teardown, control board, parallel groups, state persistence |
 | 06 | [Dynamic Workflows](06-dynamic-workflows.md) | `--dynamic` — leader agent designs the workflow, repair loop, `--leader` |
-| 07 | [Configuration](07-configuration.md) | Config files, precedence, runtime selection, builtin runtime settings, every field |
+| 07 | [Configuration](07-configuration.md) | Config files, precedence, runtime selection, builtin runtime settings, every key, upgrading from earlier betas |
 | 08 | [Overlays](08-overlays.md) | `dir()`, `env()`, `skill()`, `ssh()`, `context()` — sources, merge semantics |
 | 09 | [API & Remote Mode](09-api-and-remote-mode.md) | HTTP server, command cancel, labels, idempotency, one-shot runs, headless operation, CI/automation, and the `awman remote` client |
 | 10 | [GitHub Integration](10-github-integration.md) | `--issue` flag, fetching issues, authentication |
@@ -24,6 +24,7 @@ A guide to using awman, the containerized multi-agent terminal multiplexer.
 | 13 | [Cleaning Up](13-cleaning-up.md) | `awman clean` — remove containers, workflow files, and dangling images |
 | 14 | [Command Reference](14-command-reference.md) | Every command, subcommand, flag, and argument awman accepts, generated from the source of truth |
 | 15 | [Custom Agents](15-custom-agents.md) | Define your own agents in TOML: locations, reference, images, approval and trust, `awman new agent`, crush/maki migration |
+| 16 | [The Daemon](16-daemon.md) | Shared daemon features, lifecycle, local API, network listener and keys |
 | — | [Architecture (Detailed)](architecture.md) | Source layout, in-depth design decisions |
 
 ---

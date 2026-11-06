@@ -21,8 +21,7 @@ use chrono::{DateTime, Utc};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
-use crate::data::config::global::task_squad_config;
-use crate::data::config::{EnvSnapshot, GlobalConfig};
+use crate::data::config::{ConfigFile, EnvSnapshot, FileKind};
 use crate::data::fs::SquadRunPaths;
 use crate::data::fs::{RunDetail, RunId, RunStatus, SquadPaths, Task, TaskStore};
 use crate::engine::agent_runtime::AgentRuntimeEngine;
@@ -96,6 +95,7 @@ pub struct SchedulerStatus {
     /// `squad cancel` fires it; the evaluation removes its own entry when it
     /// ends, however it ends.
     pub cancellations: HashMap<String, RunCancellation>,
+    pub pending_runs: HashMap<String, RunId>,
 }
 
 /// The handle `squad cancel` uses to stop one in-flight evaluation.
@@ -105,6 +105,18 @@ pub struct RunCancellation {
     /// of a newer run for the same task.
     pub run_id: RunId,
     token: CancellationToken,
+}
+
+impl RunCancellation {
+    pub fn new(run_id: RunId) -> Self {
+        Self {
+            run_id,
+            token: CancellationToken::new(),
+        }
+    }
+    pub fn cancel(&self) {
+        self.token.cancel();
+    }
 }
 
 impl SchedulerStatus {
@@ -123,6 +135,7 @@ impl SchedulerStatus {
 
 /// The always-on task scheduler.
 pub struct SquadScheduler {
+    executor: Option<Arc<crate::engine::daemon::executor::SharedExecutor>>,
     store: Arc<TaskStore>,
     paths: SquadPaths,
     evaluator: Arc<dyn TaskEvaluator>,
@@ -161,6 +174,7 @@ impl SquadScheduler {
         env: EnvSnapshot,
     ) -> Self {
         Self {
+            executor: None,
             store,
             paths,
             evaluator,
@@ -172,6 +186,18 @@ impl SquadScheduler {
             tick_interval: TICK_INTERVAL,
             resolved_leaders: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    pub fn with_executor(
+        mut self,
+        executor: Arc<crate::engine::daemon::executor::SharedExecutor>,
+    ) -> Self {
+        self.executor = Some(executor);
+        self
+    }
+    pub fn with_status(mut self, status: Arc<Mutex<SchedulerStatus>>) -> Self {
+        self.status = status;
+        self
     }
 
     /// Share the daemon's payload-environment state, so each run records the
@@ -209,7 +235,7 @@ impl SquadScheduler {
             // Reap any finished evaluations so the set does not grow unbounded.
             while tasks.try_join_next().is_some() {}
 
-            self.tick(&mut tasks);
+            tokio::select! { biased; _=shutdown.cancelled()=>break, _=self.tick(&mut tasks)=>{} }
 
             tokio::select! {
                 _ = shutdown.cancelled() => break,
@@ -225,13 +251,13 @@ impl SquadScheduler {
     /// the documented defaults; an unreadable or invalid one yields `None`
     /// (admit nothing) and its named error is logged once per distinct error.
     fn reload_squad_config(&self) -> Option<crate::data::config::SquadConfig> {
-        let loaded = self.load_global_config();
+        let loaded = self.resolve_squad_config(None);
         let mut status = self.status.lock().expect("scheduler status mutex poisoned");
         let reported = &mut status.config_error;
         match loaded {
             Ok(cfg) => {
                 *reported = None;
-                Some(cfg.squad.unwrap_or_default())
+                Some(cfg)
             }
             Err(error) => {
                 let text = error.to_string();
@@ -248,15 +274,44 @@ impl SquadScheduler {
 
     /// `GlobalConfig` treats a path that `exists()` denies as absent, which here
     /// would admit work under default policy. Only a real `NotFound` is absence.
-    fn load_global_config(&self) -> Result<GlobalConfig, crate::data::error::DataError> {
-        let path = GlobalConfig::path_with(&self.env)?;
+    fn load_global_config(&self) -> Result<ConfigFile, crate::data::error::DataError> {
+        let path = crate::data::config::file::global_config_path(&self.env)?;
         path.try_exists()
             .map_err(|error| crate::data::error::DataError::io(&path, error))?;
-        GlobalConfig::load_path(&path)
+        ConfigFile::load(&path, FileKind::Global)
+    }
+
+    /// The squad view through the shared resolver: global file, then the
+    /// task's own file (when `task` names one), then the daemon's `AWMAN_*`
+    /// environment, so an operator override outranks every file exactly as it
+    /// does for any other command. Re-read on every call (every tick), which
+    /// is why the dynamic-workflow and concurrency keys are `live`.
+    fn resolve_squad_config(
+        &self,
+        task: Option<&str>,
+    ) -> Result<crate::data::config::SquadConfig, crate::data::error::DataError> {
+        use crate::data::config::{ConfigLayers, EffectiveConfig, FlagConfig};
+        let global = self.load_global_config()?;
+        let task_file = match task {
+            Some(name) => crate::data::config::squad::load_task_file(&self.paths, name)?,
+            None => None,
+        };
+        let env_layer = crate::data::config::effective::env_overrides(&self.env, &[&global])?;
+        let layers = ConfigLayers {
+            global,
+            repo: ConfigFile::default(),
+            task: task_file,
+            env: env_layer,
+            set: Default::default(),
+        };
+        let effective = EffectiveConfig::resolve(layers, FlagConfig::default(), self.env.clone())?;
+        Ok(crate::data::config::SquadConfig::from_global(
+            effective.config(),
+        ))
     }
 
     /// One tick: re-read config, select due tasks, dispatch each.
-    fn tick(&self, tasks: &mut JoinSet<()>) {
+    async fn tick(&self, tasks: &mut JoinSet<()>) {
         // Re-read config every tick — never cached at startup — so guidance /
         // agentsToModels / defaultLeader / maxConcurrentEvaluations edits take
         // effect on the next tick with no restart. A config that fails to load
@@ -287,13 +342,29 @@ impl SquadScheduler {
         // The whole admission predicate — active, off-backoff, interval
         // elapsed, and not already running — is enforced in SQL. Never
         // re-derive it here.
-        let due = match self.store.due_for_evaluation(now) {
+        let mut due = match self.store.due_for_evaluation(now) {
             Ok(due) => due,
             Err(error) => {
                 tracing::warn!("squad: due_for_evaluation failed: {error}");
                 return;
             }
         };
+        let pending = self
+            .status
+            .lock()
+            .expect("scheduler status mutex")
+            .pending_runs
+            .clone();
+        {
+            if !pending.is_empty() {
+                if let Ok(tasks) = self.store.list() {
+                    due.extend(tasks.into_iter().filter(|t| {
+                        pending.contains_key(t.id.as_str())
+                            && t.status == crate::data::fs::task_store::TaskStatus::Active
+                    }));
+                }
+            }
+        }
         if due.is_empty() {
             return;
         }
@@ -324,6 +395,15 @@ impl SquadScheduler {
         }
 
         for task in due.into_iter().take(capacity) {
+            let permit = if let Some(executor) = &self.executor {
+                Some(
+                    executor
+                        .acquire(crate::data::daemon_state::FeatureName::Squad)
+                        .await,
+                )
+            } else {
+                None
+            };
             // The run row is opened *before* the task is spawned, so the
             // task is excluded from the very next tick's SQL selection by
             // its own `running` row. Opening it inside the task would let a
@@ -355,10 +435,24 @@ impl SquadScheduler {
                 }
                 None => Vec::new(),
             };
-            let run_id = match self
-                .store
-                .start_run_with_env(&task.id, None, started_at, &unmet_env)
-            {
+            let pending_id = self
+                .status
+                .lock()
+                .expect("scheduler status mutex")
+                .pending_runs
+                .remove(task.id.as_str());
+            // A cancellation may remove a reserved run after the due snapshot.
+            // It must not cause a fresh run to be allocated in its place.
+            if pending.contains_key(task.id.as_str()) && pending_id.is_none() {
+                continue;
+            }
+            let opened = match pending_id {
+                Some(id) => Ok(id),
+                None => self
+                    .store
+                    .start_run_with_env(&task.id, None, started_at, &unmet_env),
+            };
+            let run_id = match opened {
                 Ok(run_id) => run_id,
                 Err(error) => {
                     tracing::warn!("squad: failed to open run row for {:?}: {error}", task.name);
@@ -399,7 +493,7 @@ impl SquadScheduler {
             // task file fails that task's run with a named error rather than
             // being ignored — it is scoped to one task, so one run can say what
             // is wrong with it.
-            let effective = match task_squad_config(&self.paths, &task.name, &squad) {
+            let effective = match self.resolve_squad_config(Some(&task.name)) {
                 Ok(effective) => effective,
                 Err(error) => {
                     let detail = RunDetail {
@@ -419,18 +513,23 @@ impl SquadScheduler {
                 }
             };
             adjust_in_flight(&self.status, 1);
-            let cancel = CancellationToken::new();
-            self.status
-                .lock()
-                .expect("scheduler status poisoned")
-                .cancellations
-                .insert(
-                    task.id.clone(),
+            let cancel = {
+                let mut status = self.status.lock().expect("scheduler status poisoned");
+                let cancel = status
+                    .cancellations
+                    .get(task.id.as_str())
+                    .filter(|owner| owner.run_id == run_id)
+                    .map(|owner| owner.token.clone())
+                    .unwrap_or_default();
+                status.cancellations.insert(
+                    task.id.to_string(),
                     RunCancellation {
                         run_id: run_id.clone(),
                         token: cancel.clone(),
                     },
                 );
+                cancel
+            };
 
             let runtime = self.runtime.clone();
             let resolved_leaders = Arc::clone(&self.resolved_leaders);
@@ -442,6 +541,7 @@ impl SquadScheduler {
             let agents_to_models = effective.agents_to_models.clone();
             let default_leader = effective.default_leader.clone();
             tasks.spawn(async move {
+                let _permit = permit;
                 evaluate_task(EvaluateArgs {
                     store,
                     evaluator,
@@ -612,7 +712,7 @@ async fn evaluate_task(args: EvaluateArgs) {
     // the evaluation panics or returns early.
     let _guard = InFlightGuard {
         status: Arc::clone(&status),
-        task_id: task.id.clone(),
+        task_id: task.id.to_string(),
         run_id: run_id.clone(),
     };
 
@@ -676,7 +776,7 @@ async fn evaluate_task(args: EvaluateArgs) {
     if failed {
         let attempt = {
             let mut counts = failures.lock().expect("failure counts poisoned");
-            let entry = counts.entry(task.id.clone()).or_insert(0);
+            let entry = counts.entry(task.id.to_string()).or_insert(0);
             *entry = entry.saturating_add(1);
             *entry
         };
@@ -698,7 +798,7 @@ async fn evaluate_task(args: EvaluateArgs) {
         failures
             .lock()
             .expect("failure counts poisoned")
-            .remove(&task.id);
+            .remove(task.id.as_str());
         if task.backoff_until.is_some() {
             if let Err(error) = store.set_backoff(&task.name, None) {
                 tracing::warn!(
@@ -1021,7 +1121,7 @@ mod tests {
         store
             .create(&Task {
                 prerequisites: None,
-                id: "id-alpha".into(),
+                id: crate::data::ids::TaskId::new(),
                 name: "alpha".into(),
                 description: "d".into(),
                 repo_scope: tmp.to_path_buf(),
@@ -1043,7 +1143,7 @@ mod tests {
         let home = tmp.join("home");
         std::fs::create_dir_all(&home).unwrap();
         let env = EnvSnapshot::with_overrides([(
-            crate::data::config::env::AWMAN_CONFIG_HOME,
+            crate::data::fs::data_paths::AWMAN_HOME,
             home.to_str().unwrap(),
         )]);
         let scheduler = SquadScheduler::new(
@@ -1074,7 +1174,7 @@ mod tests {
         // in-flight count is untouched, and the tick is still counted.
         adjust_in_flight(&scheduler.status, 1);
         std::fs::write(&config, "{ not json").unwrap();
-        scheduler.tick(&mut tasks);
+        scheduler.tick(&mut tasks).await;
         assert!(!task_admitted(&scheduler), "default policy must not admit");
         {
             let status = scheduler.status.lock().unwrap();
@@ -1085,14 +1185,18 @@ mod tests {
         assert!(first.is_some(), "the named error is recorded");
 
         // The same error on a later tick is not a new report.
-        scheduler.tick(&mut tasks);
+        scheduler.tick(&mut tasks).await;
         assert_eq!(scheduler.status.lock().unwrap().config_error, first);
         assert!(!task_admitted(&scheduler));
 
         // A valid reload resumes admission with no restart, and the in-flight
         // run still counts against the cap.
-        std::fs::write(&config, r#"{"squad":{"maxConcurrentEvaluations":1}}"#).unwrap();
-        scheduler.tick(&mut tasks);
+        std::fs::write(
+            &config,
+            r#"{"daemon":{"features":{"squad":{"maxConcurrentEvaluations":1}}}}"#,
+        )
+        .unwrap();
+        scheduler.tick(&mut tasks).await;
         assert!(scheduler
             .status_handle()
             .lock()
@@ -1101,7 +1205,7 @@ mod tests {
             .is_none());
         assert!(!task_admitted(&scheduler), "cap of 1 is still full");
         adjust_in_flight(&scheduler.status, -1);
-        scheduler.tick(&mut tasks);
+        scheduler.tick(&mut tasks).await;
         assert!(task_admitted(&scheduler));
         while tasks.join_next().await.is_some() {}
     }
@@ -1112,7 +1216,11 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
         let (scheduler, config) = config_scheduler(tmp.path());
-        std::fs::write(&config, r#"{"squad":{"maxConcurrentEvaluations":1}}"#).unwrap();
+        std::fs::write(
+            &config,
+            r#"{"daemon":{"features":{"squad":{"maxConcurrentEvaluations":1}}}}"#,
+        )
+        .unwrap();
         let parent = config.parent().unwrap();
         let mut tasks = JoinSet::new();
         adjust_in_flight(&scheduler.status, 1);
@@ -1123,7 +1231,7 @@ mod tests {
             let enforced = std::fs::read_to_string(&config).is_err();
             if enforced {
                 // Running as root the mode cannot deny access.
-                scheduler.tick(&mut tasks);
+                scheduler.tick(&mut tasks).await;
             }
             std::fs::set_permissions(denied, original).unwrap();
             if !enforced {
@@ -1139,7 +1247,7 @@ mod tests {
                 .is_some());
 
             // Restored: a valid reload clears the error with no restart.
-            scheduler.tick(&mut tasks);
+            scheduler.tick(&mut tasks).await;
             assert!(scheduler
                 .status_handle()
                 .lock()
@@ -1149,7 +1257,7 @@ mod tests {
             assert!(!task_admitted(&scheduler), "cap of 1 is still full");
         }
         adjust_in_flight(&scheduler.status, -1);
-        scheduler.tick(&mut tasks);
+        scheduler.tick(&mut tasks).await;
         assert!(task_admitted(&scheduler));
         while tasks.join_next().await.is_some() {}
     }
@@ -1160,9 +1268,54 @@ mod tests {
         let (scheduler, config) = config_scheduler(tmp.path());
         assert!(!config.exists());
         let mut tasks = JoinSet::new();
-        scheduler.tick(&mut tasks);
+        scheduler.tick(&mut tasks).await;
         assert!(task_admitted(&scheduler));
         while tasks.join_next().await.is_some() {}
+    }
+
+    #[test]
+    fn operator_env_outranks_global_and_task_files_in_the_squad_view() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut scheduler, config) = config_scheduler(tmp.path());
+        std::fs::write(
+            &config,
+            r#"{"daemon":{"features":{"squad":{"maxConcurrentEvaluations":2}}},
+                "workflows":{"dynamic":{"defaultLeader":"claude::file"}}}"#,
+        )
+        .unwrap();
+        let task_file = scheduler.paths.task_config_file("alpha").unwrap();
+        std::fs::create_dir_all(task_file.parent().unwrap()).unwrap();
+        std::fs::write(
+            &task_file,
+            r#"{"workflows":{"dynamic":{"defaultLeader":"claude::task"}}}"#,
+        )
+        .unwrap();
+        // Files alone: the task file wins the leader.
+        let task_view = scheduler.resolve_squad_config(Some("alpha")).unwrap();
+        assert_eq!(task_view.default_leader.as_deref(), Some("claude::task"));
+        assert_eq!(task_view.max_concurrent_evaluations, Some(2));
+        // The daemon's environment outranks both files.
+        scheduler.env = EnvSnapshot::with_overrides([
+            (
+                crate::data::fs::data_paths::AWMAN_HOME,
+                config.parent().unwrap().to_str().unwrap(),
+            ),
+            (
+                "AWMAN_DAEMON_FEATURES_SQUAD_MAX_CONCURRENT_EVALUATIONS",
+                "1",
+            ),
+            ("AWMAN_WORKFLOWS_DYNAMIC_DEFAULT_LEADER", "claude::env"),
+        ]);
+        let task_view = scheduler.resolve_squad_config(Some("alpha")).unwrap();
+        assert_eq!(task_view.default_leader.as_deref(), Some("claude::env"));
+        assert_eq!(task_view.max_concurrent_evaluations, Some(1));
+        assert_eq!(
+            scheduler
+                .reload_squad_config()
+                .unwrap()
+                .max_concurrent_evaluations,
+            Some(1)
+        );
     }
 
     #[test]
@@ -1172,7 +1325,11 @@ mod tests {
         std::fs::write(&config, "{ not json").unwrap();
         assert!(scheduler.reload_squad_config().is_none());
         let first = scheduler.status.lock().unwrap().config_error.clone();
-        std::fs::write(&config, r#"{"maxConcurrentAgents":0}"#).unwrap();
+        std::fs::write(
+            &config,
+            r#"{"daemon":{"features":{"squad":{"maxConcurrentEvaluations":0}}}}"#,
+        )
+        .unwrap();
         assert!(scheduler.reload_squad_config().is_none());
         assert_ne!(scheduler.status.lock().unwrap().config_error, first);
     }
@@ -1245,7 +1402,7 @@ mod tests {
         let now = Utc::now();
         let mut configured = Task {
             prerequisites: None,
-            id: "id-triage".into(),
+            id: crate::data::ids::TaskId::new(),
             name: "issue-triage".into(),
             description: "d".into(),
             repo_scope: tmp.path().to_path_buf(),
@@ -1264,7 +1421,7 @@ mod tests {
             unmet_env: Vec::new(),
         };
         store.create(&configured).unwrap();
-        configured.id = "id-nightly".into();
+        configured.id = crate::data::ids::TaskId::new();
         configured.name = "nightly-sweep".into();
         configured.agent = None;
         configured.model = None;

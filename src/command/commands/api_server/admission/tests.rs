@@ -118,7 +118,7 @@ impl Fixture {
                 workdir: Some(self.tmp.path().to_string_lossy().into_owned()),
                 ..Default::default()
             },
-            labels: serde_json::from_value(json!({"team": "test"})).unwrap(),
+            labels: serde_json::from_value(json!({"test/team": "test"})).unwrap(),
         }
     }
 
@@ -145,6 +145,7 @@ impl Fixture {
 
 fn command() -> CommandSubmission {
     CommandSubmission {
+        interaction: None,
         subcommand: "exec prompt".into(),
         args: vec!["once".into()],
         labels: Labels::empty(),
@@ -300,7 +301,11 @@ fn assert_replay(journal: &IdempotentAdmission, body: &str) {
     assert_eq!(
         journal.begin("canonical").unwrap(),
         IdempotencyBegin::Replay {
-            status: 202,
+            status: if journal.route.ends_with("/sessions") {
+                201
+            } else {
+                202
+            },
             body: body.into(),
         }
     );
@@ -323,7 +328,7 @@ async fn run_crash_order_records_barrier_then_session_fields_and_labels_then_lin
                     AND repo_url='https://example.com/repo.git' AND branch='topic' AND push=1
             ) OR NOT EXISTS (
                 SELECT 1 FROM labels WHERE owner_kind='session' AND owner_id=NEW.session_id
-                    AND key='team' AND value='test'
+                    AND key='test/team' AND value='test'
             ) THEN RAISE(ABORT, 'link before session metadata') END;
         END;
         CREATE TRIGGER check_command_order BEFORE INSERT ON commands BEGIN
@@ -333,7 +338,7 @@ async fn run_crash_order_records_barrier_then_session_fields_and_labels_then_lin
         END;
     "#,
     );
-    let journal = f.journal("/v1/runs", "run");
+    let journal = f.journal("/v1/runs", "cmd_a53108f7543b75adbb34afc035d4cdf6");
     assert_eq!(journal.begin("canonical").unwrap(), IdempotencyBegin::Fresh);
     let mut submission = f.local();
     submission.request = SessionCreateRequest {
@@ -364,7 +369,7 @@ async fn run_crash_order_records_barrier_then_session_fields_and_labels_then_lin
     assert_eq!(
         f.admission
             .store
-            .get_command(&run.command_id)
+            .get_command(run.command_id.as_str())
             .unwrap()
             .unwrap()
             .session_id,
@@ -373,7 +378,10 @@ async fn run_crash_order_records_barrier_then_session_fields_and_labels_then_lin
     // No HTTP response has been completed: dropping here models a cancelled
     // handler after the last write, and must still replay the exact bytes.
     drop(journal);
-    assert_replay(&f.journal("/v1/runs", "run"), &admitted.response_body);
+    assert_replay(
+        &f.journal("/v1/runs", "cmd_a53108f7543b75adbb34afc035d4cdf6"),
+        &admitted.response_body,
+    );
     assert_eq!(
         f.admission
             .store
@@ -397,7 +405,7 @@ async fn fully_recorded_session_replays_without_setup() {
         END;
     "#,
     );
-    let journal = f.journal("/v1/sessions", "session");
+    let journal = f.journal("/v1/sessions", "ses_21d6f40cfb511982e4424e0e250a9557");
     assert_eq!(journal.begin("canonical").unwrap(), IdempotencyBegin::Fresh);
     let admitted = f
         .admission
@@ -407,7 +415,7 @@ async fn fully_recorded_session_replays_without_setup() {
     assert!(admitted.run.is_none());
     drop(journal);
     assert_replay(
-        &f.journal("/v1/sessions", "session"),
+        &f.journal("/v1/sessions", "ses_21d6f40cfb511982e4424e0e250a9557"),
         &admitted.response_body,
     );
     assert_eq!(f.only_session().status, SessionStatus::Active);
@@ -435,10 +443,10 @@ async fn command_admission_records_intent_before_the_row_and_preserves_flags_and
         END;
     "#,
     );
-    let journal = f.journal("/v1/commands", "command");
+    let journal = f.journal("/v1/commands", "cmd_1dccadfed7bcbb036c56a4afb97e906f");
     assert_eq!(journal.begin("canonical").unwrap(), IdempotencyBegin::Fresh);
     let mut submission = command();
-    submission.labels = serde_json::from_value(json!({"job": "check"})).unwrap();
+    submission.labels = serde_json::from_value(json!({"test/job": "check"})).unwrap();
     let command = f
         .admission
         .admit_command(&admitted.session_id, submission, Some(&journal))
@@ -446,19 +454,19 @@ async fn command_admission_records_intent_before_the_row_and_preserves_flags_and
         .unwrap();
     let response: serde_json::Value = serde_json::from_str(&command.response_body).unwrap();
     assert_eq!(response["flags_applied"]["yolo"], true);
-    assert_eq!(response["flags_applied"]["non_interactive"], true);
+    assert_eq!(response["flags_applied"]["headless"], true);
     assert_eq!(response["flags_applied"], command.flags_applied);
     assert_eq!(
         f.admission
             .store
             .labels_for(LabelOwner::Command, &command.command_id)
             .unwrap()
-            .get("job"),
+            .get("test/job"),
         Some("check")
     );
     drop(journal);
     assert_replay(
-        &f.journal("/v1/commands", "command"),
+        &f.journal("/v1/commands", "cmd_1dccadfed7bcbb036c56a4afb97e906f"),
         &command.response_body,
     );
 }
@@ -495,7 +503,7 @@ async fn failed_labels_run_link_and_enqueue_close_the_session_without_admitting_
         assert_eq!(
             f.admission
                 .lifecycle_store
-                .run_for_session(&session.id)
+                .run_for_session(&crate::data::ids::WorkerSessionId::parse(&session.id).unwrap())
                 .unwrap()
                 .is_some(),
             has_run
@@ -653,6 +661,7 @@ async fn failed_response_storage_does_not_release_admitted_work() {
 async fn validation_precedes_writes_and_session_and_setup_rejections_are_typed() {
     let f = Fixture::new();
     let invalid = CommandSubmission {
+        interaction: None,
         args: vec!["--unknown-flag".into()],
         ..command()
     };
@@ -695,16 +704,20 @@ async fn validation_precedes_writes_and_session_and_setup_rejections_are_typed()
 fn canonical_fingerprint_keeps_legacy_raw_fields_and_shares_session_selection_forms() {
     let header = json!({"subcommand": "ready", "args": [], "unknown": 1});
     let mut body = header.clone();
-    body["session_id"] = json!("s");
-    let canonical = CommandSubmission::idempotency_canonical(&header, "s");
-    assert_eq!(canonical, format!("{header}\ns"));
+    body["session_id"] = json!("ses_03c7c0ace395d80182db07ae2c30f034");
+    let canonical =
+        CommandSubmission::idempotency_canonical(&header, "ses_03c7c0ace395d80182db07ae2c30f034");
     assert_eq!(
-        CommandSubmission::idempotency_canonical(&body, "s"),
+        canonical,
+        format!("{header}\nses_03c7c0ace395d80182db07ae2c30f034")
+    );
+    assert_eq!(
+        CommandSubmission::idempotency_canonical(&body, "ses_03c7c0ace395d80182db07ae2c30f034"),
         canonical
     );
     body["labels"] = json!({});
     assert_ne!(
-        CommandSubmission::idempotency_canonical(&body, "s"),
+        CommandSubmission::idempotency_canonical(&body, "ses_03c7c0ace395d80182db07ae2c30f034"),
         canonical
     );
 }
@@ -814,6 +827,7 @@ async fn managed_session_admission_preserves_the_prerequisite_ceiling_and_policy
         )
         .unwrap();
     let workflow = |token: &str| CommandSubmission {
+        interaction: None,
         subcommand: "exec workflow".into(),
         args: vec![
             "workflow.toml".into(),
@@ -853,12 +867,7 @@ async fn managed_session_admission_preserves_the_prerequisite_ceiling_and_policy
 
 // ── IdempotencyGate: the reservation sequence without HTTP ─────────────────
 
-fn gate(
-    f: &Fixture,
-    auth: &crate::engine::auth::AuthMode,
-    key: Option<&str>,
-    canonical: &str,
-) -> IdempotencyGate {
+fn gate(f: &Fixture, auth: &str, key: Option<&str>, canonical: &str) -> IdempotencyGate {
     IdempotencyGate::open(&f.admission.store, "/v1/test", auth, key, canonical).unwrap()
 }
 
@@ -872,39 +881,51 @@ fn fresh(gate: IdempotencyGate) -> IdempotentRun {
 #[test]
 fn gate_without_a_key_runs_unjournaled_and_invalid_keys_are_refused() {
     let f = Fixture::new();
-    let auth = crate::engine::auth::AuthMode::Disabled;
+    let auth = "owner";
     assert!(matches!(
-        gate(&f, &auth, None, "c"),
+        gate(&f, auth, None, "cmd_4a8a08f09d37b73795649038408b5f33"),
         IdempotencyGate::Unkeyed
     ));
     let too_long = "k".repeat(crate::data::fs::api_db::IDEMPOTENCY_KEY_MAX_BYTES + 1);
     for key in ["", "has space", "tab\tkey", "ключ", too_long.as_str()] {
         assert!(
             matches!(
-                IdempotencyGate::open(&f.admission.store, "/v1/test", &auth, Some(key), "c"),
+                IdempotencyGate::open(
+                    &f.admission.store,
+                    "/v1/test",
+                    auth,
+                    Some(key),
+                    "cmd_4a8a08f09d37b73795649038408b5f33"
+                ),
                 Err(IdempotencyGateError::InvalidKey)
             ),
             "{key:?} must be refused"
         );
     }
     let longest = "k".repeat(crate::data::fs::api_db::IDEMPOTENCY_KEY_MAX_BYTES);
-    fresh(gate(&f, &auth, Some(&longest), "c")).finish(IdempotentResult::ServerError);
+    fresh(gate(
+        &f,
+        auth,
+        Some(&longest),
+        "cmd_4a8a08f09d37b73795649038408b5f33",
+    ))
+    .finish(IdempotentResult::ServerError);
 }
 
 #[test]
 fn gate_sequences_in_flight_replay_and_mismatch() {
     let f = Fixture::new();
-    let auth = crate::engine::auth::AuthMode::Disabled;
-    let run = fresh(gate(&f, &auth, Some("k1"), "body"));
+    let auth = "owner";
+    let run = fresh(gate(&f, auth, Some("k1"), "body"));
     assert!(matches!(
-        gate(&f, &auth, Some("k1"), "body"),
+        gate(&f, auth, Some("k1"), "body"),
         IdempotencyGate::InFlight
     ));
     run.finish(IdempotentResult::Final {
         status: 202,
         body: r#"{"ok":true}"#,
     });
-    match gate(&f, &auth, Some("k1"), "body") {
+    match gate(&f, auth, Some("k1"), "body") {
         IdempotencyGate::Replay { status, body } => {
             assert_eq!(status, 202);
             assert_eq!(body, r#"{"ok":true}"#);
@@ -912,16 +933,22 @@ fn gate_sequences_in_flight_replay_and_mismatch() {
         _ => panic!("a finished request must replay"),
     }
     assert!(matches!(
-        gate(&f, &auth, Some("k1"), "other body"),
+        gate(&f, auth, Some("k1"), "other body"),
         IdempotencyGate::Mismatch
     ));
     // Client errors are final answers too and replay the same way.
-    fresh(gate(&f, &auth, Some("k2"), "bad")).finish(IdempotentResult::Final {
+    fresh(gate(
+        &f,
+        auth,
+        Some("k2"),
+        "cmd_bae60998ffe4923b131e3d6e4c19993e",
+    ))
+    .finish(IdempotentResult::Final {
         status: 400,
-        body: r#"{"error":"bad"}"#,
+        body: r#"{"error":"cmd_bae60998ffe4923b131e3d6e4c19993e"}"#,
     });
     assert!(matches!(
-        gate(&f, &auth, Some("k2"), "bad"),
+        gate(&f, auth, Some("k2"), "cmd_bae60998ffe4923b131e3d6e4c19993e"),
         IdempotencyGate::Replay { status: 400, .. }
     ));
 }
@@ -929,34 +956,32 @@ fn gate_sequences_in_flight_replay_and_mismatch() {
 #[test]
 fn gate_releases_after_a_server_error_or_a_dropped_run() {
     let f = Fixture::new();
-    let auth = crate::engine::auth::AuthMode::Disabled;
-    fresh(gate(&f, &auth, Some("k"), "body")).finish(IdempotentResult::ServerError);
+    let auth = "owner";
+    fresh(gate(&f, auth, Some("k"), "body")).finish(IdempotentResult::ServerError);
     // A dropped (cancelled or panicking) handler releases its reservation.
-    drop(fresh(gate(&f, &auth, Some("k"), "body")));
-    let run = fresh(gate(&f, &auth, Some("k"), "body"));
+    drop(fresh(gate(&f, auth, Some("k"), "body")));
+    let run = fresh(gate(&f, auth, Some("k"), "body"));
     // The journal lent to admission is the reservation itself: it stays
     // held until the last clone is gone.
     let journal = run.admission();
     drop(run);
     assert!(matches!(
-        gate(&f, &auth, Some("k"), "body"),
+        gate(&f, auth, Some("k"), "body"),
         IdempotencyGate::InFlight
     ));
     drop(journal);
-    fresh(gate(&f, &auth, Some("k"), "body"));
+    fresh(gate(&f, auth, Some("k"), "body"));
 }
 
 #[test]
 fn gate_scopes_keys_by_principal() {
     let f = Fixture::new();
-    let anonymous = crate::engine::auth::AuthMode::Disabled;
-    let alice = crate::engine::auth::AuthMode::Enabled {
-        key_hash: "alice".into(),
-    };
-    fresh(gate(&f, &anonymous, Some("k"), "body")).finish(IdempotentResult::Final {
+    let anonymous = "owner";
+    let alice = "key_alice";
+    fresh(gate(&f, anonymous, Some("k"), "body")).finish(IdempotentResult::Final {
         status: 202,
         body: "{}",
     });
     // The same key under another principal is a separate reservation.
-    fresh(gate(&f, &alice, Some("k"), "different body")).finish(IdempotentResult::ServerError);
+    fresh(gate(&f, alice, Some("k"), "different body")).finish(IdempotentResult::ServerError);
 }

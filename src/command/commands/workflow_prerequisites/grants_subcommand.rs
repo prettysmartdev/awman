@@ -7,7 +7,6 @@
 use serde::Serialize;
 
 use crate::command::error::CommandError;
-use crate::data::config::global::GlobalConfig;
 use crate::data::fs::prerequisite_grants::{
     GrantSelector, PrerequisiteGrantStore, RememberedGrant, RememberedKind,
 };
@@ -72,7 +71,8 @@ pub fn run_prerequisite_grants(
     session: &Session,
     action: &PrerequisiteGrantsAction,
 ) -> Result<PrerequisiteGrantsOutcome, CommandError> {
-    let data_home = GlobalConfig::data_home_with(session.env()).map_err(CommandError::from)?;
+    let data_home =
+        crate::data::fs::data_paths::data_home(session.env()).map_err(CommandError::from)?;
     let mut store = PrerequisiteGrantStore::load(&data_home);
     let revoked = match action {
         PrerequisiteGrantsAction::List => None,

@@ -4,6 +4,8 @@ The tables below give implementation order. Work item numbers are stable identif
 
 Every active item from 0139 onward uses [the grand architecture](../architecture/2026-grand-architecture.md) as an acceptance gate. Exchangeable types, configuration resolution and filesystem/database access belong to Layer 0; reusable runtime and transport mechanics to Layer 1; Session-based command behavior, catalogue definitions and policy to Layer 2; input and presentation adapters to Layer 3. Lower layers never import higher layers, and frontends never call engine behavior directly. New command paths must preserve builtin/daemon and CLI/TUI/API parity where the command is available. `make architecture-lint` and the relevant parity tests must pass before an item closes; its own layer contract in Codebase Integration specifies the concrete boundary.
 
+The standalone reference server in 0145 applies those separation principles within its own package. It adds no awman command path or frontend parity obligation.
+
 ## 0139–0143: complete the daemon
 
 These five items form **one completion gate**. Finish the single process, full config and API migration, local and network listeners, terminals, agent status, TUI/CLI engine, and worker push and pull before starting any later active item. WI0143 closes the gate only after the end-to-end daemon and 0139 surface audits pass. Lease credentials, inline bodies, read-only execution, ordered workflow-state events and lease push transport retries are part of that gate; later items extend or audit the push side. No legacy squad or API daemon remains, and no core daemon capability in this plan is deferred to a later work item. Later API proposals add product features on top of that completed foundation.
@@ -16,7 +18,7 @@ These five items form **one completion gate**. Finish the single process, full c
 | 4 | [0142 — Singleton engine and frontends](0142-engine-and-frontends.md) | Daemon-hosted instances, frontend protocol, TUI and CLI hand-off, dialog relay and builtin/daemon parity. Host and frontends are one acceptance gate. | 0154 + 0155 |
 | 5 | [0143 — Worker push and pull](0143-worker-feature-and-work-servers.md) | One job model, Work Server Protocol, label affinity, lease-side execution minimum and the TUI queue picker; closes the full daemon gate. | 0147 |
 
-The five-item split keeps each reviewable while avoiding separate work items for a server with no frontend, a terminal bridge without its safety and status rules, or a config migration stranded after the daemon. The reference GitHub work server is an external service and follows the daemon.
+The five-item split keeps each reviewable while avoiding separate work items for a server with no frontend, a terminal bridge without its safety and status rules, or a config migration stranded after the daemon. The GitHub work server follows the daemon as standalone reference source in this repository; it is built explicitly from a clone and is not part of awman's binary or releases.
 
 ## After the complete daemon
 
@@ -27,7 +29,7 @@ Every item below depends on the completed 0139–0143 daemon gate. Additional de
 | 6 | [0163 — Consistent host Git transport](0163-consistent-host-git-transport-and-auth-errors.md) | Audit push-side clone/push credential parity and classify Git authentication failures. | new |
 | 7 | [0164 — Retry unreachable push-back](0164-retry-unreachable-push-back.md) | Recover a successful run from short transport outages; distinguish unreachable from rejected pushes. | new |
 | 8 | [0144 — Test, CI and release rebuild](0144-test-ci-release-rebuild.md) | Fast feedback and promoted release artifacts. | 0162 |
-| 9 | [0145 — GitHub issues work server](0145-github-issues-work-server.md) | Reference Work Server Protocol implementation. | 0148 |
+| 9 | [0145 — GitHub issues work server](0145-github-issues-work-server.md) | Standalone Work Server Protocol reference source, built separately from a repository clone. | 0148 |
 | 10 | [0146 — Context API and keys](0146-context-api-and-keys.md) | Keyed push context and server-owned context for pulled leases. | 0140 |
 | 11 | [0165 — Workflow context artifacts](0165-workflow-context-artifacts.md) | Read per-run workflow notes over the push API and WSP. | new |
 | 12 | [0147 — Per-session credentials and secrets](0147-per-session-credentials-and-secrets.md) | Credential and secret delivery over the finalized worker API. | 0141 |

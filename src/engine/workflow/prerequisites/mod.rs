@@ -1,4 +1,4 @@
-//! Bounded, non-interactive workflow prerequisite preflight.
+//! Bounded, headless workflow prerequisite preflight.
 
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc};

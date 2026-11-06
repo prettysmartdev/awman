@@ -4,8 +4,8 @@ An agent session is a container (on whichever [runtime](11-runtimes.md) you use)
 
 Sessions normally use the standard stdio launch mode. You can also use
 [ACP mode](#acp-launch-mode) when you want awman to render structured agent
-activity instead of the agent's raw terminal stream. ACP is currently
-supported only by **Cline**.
+activity instead of the agent's raw terminal stream. ACP currently supports
+**Cline**, **OpenCode**, and **Gemini CLI**.
 
 ---
 
@@ -26,7 +26,7 @@ Press **Ctrl+C** to exit the agent session when you're done.
 `awman chat`'s own exit code is the agent's exit code — a session whose agent
 crashed or was killed is reported as a failure (non-zero), and the CLI, TUI
 tab colour, and any API client watching the command's status all agree on
-that result. This matters most for `awman chat --non-interactive` run from a
+that result. This matters most for `awman chat --headless` run from a
 script or CI job, where the exit code is how the caller finds out whether the
 agent succeeded.
 
@@ -39,8 +39,8 @@ agent session. Instead of showing the agent's terminal stream directly, awman
 renders the agent's messages, tool activity, plans, and permission requests in
 its own interface.
 
-ACP is currently supported only by **Cline**. Other agents continue to use the
-standard stdio launch mode.
+ACP is supported by **Cline**, **OpenCode** (`opencode acp`), and **Gemini CLI**
+(`gemini --experimental-acp`). Other agents use the standard stdio launch mode.
 
 ACP is available with the Docker and Apple Containers runtimes. The
 `docker-sbx-experimental` runtime does not currently support ACP. The `builtin-experimental` runtime carries ACP over its own binary-clean stream: frames reach the agent byte-for-byte, and closing the client's stdin ends the agent's input as it does on Docker.
@@ -51,23 +51,23 @@ below for the current limits.
 
 ### Start an ACP session
 
-Use `--launch-mode acp` for a single session. Put the flags before the prompt
+Use `--set agents.launchMode=acp` for a single session. Put the flags before the prompt
 positional so they are parsed:
 
 ```sh
-awman chat --agent cline --launch-mode acp
-awman exec prompt --agent cline --launch-mode acp "Review the failing tests"
+awman chat --agent cline --set agents.launchMode=acp
+awman exec prompt --agent cline --set agents.launchMode=acp "Review the failing tests"
 ```
 
-The flag is available on `chat` and `exec prompt`. The shortest form uses your
+`--set` is accepted by every command. The shortest form uses your
 configured agent, provided it supports ACP:
 
 ```sh
-awman chat --launch-mode acp
+awman chat --set agents.launchMode=acp
 ```
 
 To return to the normal terminal experience for one invocation, use
-`--launch-mode stdio`.
+`--set agents.launchMode=stdio`.
 
 ---
 
@@ -96,7 +96,7 @@ For `exec prompt`, the supplied prompt starts the first turn. For `chat`, you
 can begin by entering prompts as the session runs. Press **Ctrl+D** when you
 are finished entering follow-up prompts, or **Ctrl+C** to exit the session.
 
-In a non-interactive run (`--non-interactive`, or with `--yolo`/`--auto`), the
+In a non-interactive run (`--headless`, or with `--yolo`/`--auto`), the
 CLI does not prompt for follow-ups or permissions — it runs the seeded turn and
 exits, matching the headless behavior of stdio agents.
 
@@ -111,26 +111,26 @@ update summaries in the message area and does not present interactive follow-up
 or permission dialogs; a permission request that is not pre-approved by
 `--yolo`/`--auto` is denied.
 
-For the interactive ACP experience today, run `awman chat --launch-mode acp`
+For the interactive ACP experience today, run `awman chat --set agents.launchMode=acp`
 from the CLI (outside the TUI).
 
 ---
 
 ### Selecting a launch mode
 
-The `--launch-mode` flag accepts exactly two values:
+`agents.launchMode` accepts exactly two values:
 
 ```sh
-awman chat --agent cline --launch-mode acp
-awman chat --agent cline --launch-mode stdio
+awman chat --agent cline --set agents.launchMode=acp
+awman chat --agent cline --set agents.launchMode=stdio
 ```
 
-For persistent settings, set `launchMode` in the repository's
-`.awman/config.json`. The default is `stdio`. The effective launch mode is
-chosen in this order:
+For persistent settings, run `awman config set agents.launchMode acp` (repo
+config) or set it with `--global`. The default is `stdio`. The effective launch
+mode is chosen in this order:
 
 ```
---launch-mode  >  AWMAN_LAUNCH_MODE  >  repo launchMode  >  stdio
+--set agents.launchMode  >  AWMAN_AGENTS_LAUNCH_MODE  >  repo agents.launchMode  >  global agents.launchMode  >  stdio
 ```
 
 See [Configuration](07-configuration.md) for the config fields and the
@@ -141,26 +141,26 @@ environment variable.
 ### Workflows and unsupported agents
 
 ACP is **not yet available for `exec workflow` steps**. If a repository sets
-`launchMode: acp` and a workflow step resolves to an ACP-capable agent, the
+`agents.launchMode` is `acp` and a workflow step resolves to an ACP-capable agent, the
 workflow fails before any step starts, directing you to run that agent over ACP
-with `awman chat` or `awman exec prompt` instead — or to set `launchMode: stdio`
+with `awman chat` or `awman exec prompt` instead — or to set `agents.launchMode` to `stdio`
 for workflows.
 
 Workflow steps whose agents do **not** support ACP are governed by the global
-`launchModeFallback` setting, which defaults to `error`:
+`agents.acpFallback` setting, which defaults to `error`:
 
 - `error` stops the workflow before any step starts and reports the step and
   agent that cannot use ACP.
 - `stdio` runs those steps in the regular stdio mode and prints a warning per
   step, and the workflow proceeds.
 
-Set the policy in `$HOME/.awman/config.json`:
+Set the policy in your global or repo config:
 
 ```json
-{ "launchModeFallback": "stdio" }
+{ "agents": { "acpFallback": "stdio" } }
 ```
 
-An explicit `--launch-mode acp` request for a single unsupported agent remains
+An explicit `--set agents.launchMode=acp` request for a single unsupported agent remains
 an error, so a one-off request cannot silently change modes. See
 [Workflows](05-workflows.md) for workflow setup and execution.
 
@@ -189,7 +189,7 @@ This overrides the `agent` field in your repo config for this run only — no co
 
 If the agent image does not yet exist, awman offers to download the template and build both the project base image (if needed) and the agent image before launching.
 
-Interactive Codex sessions run as `codex --no-daemon`: recent Codex releases otherwise try to start a background server that the container doesn't have, and exit with `daemon executable not found`. If an older Codex image rejects the flag, rebuild it with `awman ready --build --no-cache` (without `--no-cache`, Docker reuses the cached layer holding the old Codex). Non-interactive runs (`codex exec`) don't get the flag, because they reject it. An `agentFlags` entry for `--no-daemon` is redundant: awman drops it from interactive launches and warns that non-interactive runs may reject it.
+Interactive Codex sessions run as `codex --no-daemon`: recent Codex releases otherwise try to start a background server that the container doesn't have, and exit with `daemon executable not found`. If an older Codex image rejects the flag, rebuild it with `awman ready --build --no-cache` (without `--no-cache`, Docker reuses the cached layer holding the old Codex). Non-interactive runs (`codex exec`) don't get the flag, because they reject it. An `agents.flags` entry for `--no-daemon` is redundant: awman drops it from interactive launches and warns that non-interactive runs may reject it.
 
 Passing an unknown agent name exits immediately with a list of valid options:
 
@@ -223,32 +223,32 @@ Per-agent translation and expected `<NAME>` format:
 | `claude` | `--model <NAME>` | bare model ID (e.g. `claude-opus-4-6`) |
 | `codex` | `--model <NAME>` | bare model ID (e.g. `gpt-4o`) |
 | `gemini` | `--model <NAME>` | bare model ID (e.g. `gemini-2.0-flash`) |
-| `antigravity` | *(not supported — an error is returned)* | — |
+| `antigravity` | `--model <NAME>` | model slug from `agy models` |
 | `opencode` | `--model <NAME>` | **`provider/model` required** (e.g. `anthropic/claude-3-5-sonnet`) |
-| `cline` | `--model <NAME>` (on the `task` subcommand) | bare model ID; the provider is selected separately via `cline auth -p <provider>` and is not switchable per-invocation |
+| `cline` | `--model <NAME>` | model ID for the selected provider; use `--agent-flag --provider` to select a provider for one run |
 | `copilot` | `--model <NAME>` | bare model ID; cannot be applied under the `docker-sbx-experimental` runtime (use the `/model` slash command there) |
 
 For agents that support multiple providers (`opencode`, for example), the `provider/model` slash form lets you target a specific provider when more than one is configured. awman passes the value through verbatim — the agent does the routing.
 
-An agent with no model flag (Antigravity, or a custom agent whose definition declares none) refuses `--model` with `agent '<name>' does not support a model flag`. For Antigravity, configure the model in `~/.gemini/antigravity-cli/settings.json` or with the `/model` slash command inside the session instead.
+An agent with no model flag (a custom agent whose definition declares none) refuses `--model` with `agent '<name>' does not support a model flag`.
 
 `--model` can be combined freely with `--agent`, `--yolo`, `--auto`, and all other flags. When used with `exec workflow`, the flag value acts as the default model for every workflow step that does not define its own `model` field. See [Per-step model overrides](05-workflows.md#per-step-model-overrides).
 
 Under the `docker-sbx-experimental` runtime, the flag is delivered through the sandbox's per-launch session config (built-in template agents) or as launch arguments (custom-kit agents) rather than directly on the command line; the supported agents and modes are the same, except copilot, which cannot receive a model override there. See [Runtimes](11-runtimes.md#known-limitations).
 
-### `--non-interactive` / `-n`
+### `--headless` / `-n`
 
-Run the agent in print/batch mode — no interactivity required. The agent executes, produces output, and exits. `-n` is a short alias for `--non-interactive` and works on every command that has the flag (`chat`, `exec prompt`, `exec workflow`, `ready`, `specs amend`, `new spec`, `new skill`). It also makes awman's own prompts take their non-interactive answer instead of asking, even on a terminal; `--json` implies it.
+Run the agent in print/batch mode — no interactivity required. The agent executes, produces output, and exits. `-n` is a short alias for `--headless` and works on every command that has the flag (`chat`, `exec prompt`, `exec workflow`, `ready`, `specs amend`, `new spec`, `new skill`). It also makes awman's own prompts take their non-interactive answer instead of asking, even on a terminal; `--json` implies it.
 
 | Agent | Flag used |
 |-------|-----------|
 | Claude | `--print` |
 | Codex | `exec` subcommand |
 | OpenCode | `run` subcommand |
-| Gemini | *(not supported — agent launches in interactive mode)* |
+| Gemini | `--prompt` / `-p` |
 | Antigravity | `--print` |
-| Copilot | *(not supported — agent launches in interactive mode)* |
-| Cline | `task` subcommand |
+| Copilot | `-p <prompt>` |
+| Cline | positional prompt (one-shot) |
 
 Useful for CI pipelines, scripting, or when you want the output captured rather than live.
 
@@ -277,7 +277,7 @@ See [Security & Isolation](04-security-and-isolation.md#overlay-mounts) for secu
 
 ### `--agent-flag <ARG>`
 
-Append an extra argument to the agent's command for this run. Repeat it for multiple arguments; they are appended in order, after awman's own flags and before the initial prompt. Available on `chat`, `exec prompt`, and `exec workflow`. `remote exec` forwards it to the remote host, where it replaces that host's `agentFlags` entry for the run.
+Append an extra argument to the agent's command for this run. Repeat it for multiple arguments; they are appended in order, after awman's own flags and before the initial prompt. Available on `chat`, `exec prompt`, and `exec workflow`. `remote exec` forwards it to the remote host, where it replaces that host's `agents.flags` entry for the run.
 
 Because the value usually starts with `-`, write it in the `--agent-flag=<value>` form:
 
@@ -286,7 +286,7 @@ awman chat --agent codex --agent-flag=--search
 awman exec prompt --agent-flag=--config --agent-flag=key=value "fix the build"
 ```
 
-`--agent-flag` replaces the [`agentFlags`](07-configuration.md#pass-extra-flags-to-an-agent) config entry for the agent the command launches; it does not add to it. In `exec workflow` it applies to the workflow's default agent (the workflow's `agent` field, else `--agent`, else config); steps that name a different agent keep that agent's configured `agentFlags`. With `--dynamic`, it also reaches the leader when the leader's agent is the selected one (`--agent`, else config).
+`--agent-flag` replaces the [`agents.flags`](07-configuration.md#pass-extra-flags-to-an-agent) config entry for the agent the command launches; it does not add to it. In `exec workflow` it applies to the workflow's default agent (the workflow's `agent` field, else `--agent`, else config); steps that name a different agent keep that agent's configured `agents.flags`. With `--dynamic`, it also reaches the leader when the leader's agent is the selected one (`--agent`, else config).
 
 ### `--allow-docker`
 
@@ -353,39 +353,39 @@ Not every agent implements every level. `--plan` on an agent with no plan mode i
 
 ### `--plan`
 
-Run the agent in read-only mode — it can analyse the codebase and suggest changes, but cannot modify files. Useful for getting a second opinion on an approach before committing to implementation.
+Start the agent in its planning mode. Each CLI enforces its own planning permissions; use this to explore an approach before implementation.
 
 | Agent | Plan mode |
 |-------|-----------|
 | `claude` | `--permission-mode plan` |
-| `codex` | `--approval-mode plan` |
+| `codex` | *(no startup plan flag — refused; use `/plan` interactively)* |
 | `opencode` | *(not supported — refused)* |
 | `gemini` | `--approval-mode=plan` |
-| `antigravity` | *(not supported — refused)* |
+| `antigravity` | `--mode plan` |
 | `copilot` | `--plan` |
-| `cline` | `--plan` (on the `task` subcommand) |
+| `cline` | `--plan` |
 
-`--plan` can be combined with `--non-interactive`.
+`--plan` can be combined with `--headless`.
 
 ### `--auto`
 
-Enable intermediate autonomous operation — the agent auto-approves file edits and writes, but still prompts before shell commands and other high-risk operations.
+Enable the agent's intermediate automatic approval mode. The exact permissions vary by CLI: OpenCode approves actions that are not explicitly denied, Cline approves all tools with this flag, and Codex permits writes inside its workspace sandbox.
 
 | Agent | `--auto` flag |
 |-------|--------------|
 | `claude` | `--permission-mode auto` |
 | `codex` | `--sandbox workspace-write` |
-| `opencode` | *(no equivalent — flag omitted)* |
+| `opencode` | `--auto` |
 | `gemini` | `--approval-mode=auto_edit` |
-| `antigravity` | *(no equivalent — flag omitted)* |
+| `antigravity` | `--mode accept-edits` |
 | `copilot` | *(no equivalent — flag omitted)* |
-| `cline` | `--auto-approve-all` (auto-approves actions while keeping interactive mode) |
+| `cline` | `--auto-approve true` |
 
 Combined with `exec workflow`, `--auto` implies `--worktree`, but it does **not** auto-advance stuck steps — that countdown is `--yolo`-only.
 
 ### `--yolo`
 
-Fully autonomous operation. Use it when you want to hand a task to the agent and come back to a finished result.
+Unattended workflow operation. awman applies the agent's permission bypass flag where one exists and advances workflow steps without waiting for approval.
 
 ```sh
 awman exec workflow aspec/workflows/implement-feature.toml --yolo
@@ -396,17 +396,17 @@ Yolo mode is a good fit when you have a well-specified work item you trust the a
 
 `--yolo` does three things:
 
-**1. Skips all agent permission prompts.** The agent-specific flag is appended to the container entrypoint before launch:
+**1. Requests the agent's permission bypass mode where supported.** The agent-specific flag is appended to the container entrypoint before launch:
 
 | Agent | Flag appended |
 |-------|--------------|
 | `claude` | `--dangerously-skip-permissions` |
 | `codex` | `--dangerously-bypass-approvals-and-sandbox` |
 | `opencode` | *(no equivalent — flag omitted)* |
-| `gemini` | `--yolo` |
+| `gemini` | `--approval-mode=yolo` |
 | `antigravity` | `--dangerously-skip-permissions` |
-| `copilot` | `--autopilot` (copilot's only CLI autonomous mode) |
-| `cline` | `--yolo` (on the `task` subcommand) |
+| `copilot` | `--yolo` (allow all permissions) |
+| `cline` | `--yolo` |
 
 **2. Implies `--worktree` for workflow execution.** Running a workflow with `--yolo` automatically creates an isolated Git worktree, and prints:
 
@@ -420,11 +420,11 @@ Passing `--worktree` as well is accepted — no duplicate worktree is created. T
 
 ### Disallowed tools
 
-`yoloDisallowedTools` lists tools the agent may not use while `--yolo` is on. Set it in per-repo or global config (a repo list replaces the global one; lists are not merged):
+`agents.yolo.disallowedTools` lists tools the agent may not use while `--yolo` is on. Set it in per-repo or global config (a repo list replaces the global one; lists are not merged):
 
 ```json
 {
-  "yoloDisallowedTools": ["Bash", "computer"]
+  "agents": { "yolo": { "disallowedTools": ["Bash", "computer"] } }
 }
 ```
 
@@ -438,14 +438,14 @@ Every `--yolo` launch — `chat`, `exec prompt`, each `exec workflow` step, and 
 A tool restriction is never dropped silently. When the agent cannot enforce the list, awman refuses to start it:
 
 ```
-invalid configuration: yoloDisallowedTools (Bash, computer) is set, but agent 'codex' has no way to enforce a disallowed-tools list here, so awman refuses to launch it with --yolo. ...
+invalid configuration: agents.yolo.disallowedTools (Bash, computer) is set, but agent 'codex' has no way to enforce a disallowed-tools list here, so awman refuses to launch it with --yolo. ...
 ```
 
-To run such an agent with `--yolo` in one repo, clear the list there with `awman config set yoloDisallowedTools ""` (an empty repo list replaces the global one), or run without `--yolo`. A custom agent applies the list when its definition declares a disallowed-tools flag.
+To run such an agent with `--yolo` in one repo, clear the list there with `awman config set agents.yolo.disallowedTools ""` (an empty repo list replaces the global one), or run without `--yolo`. A custom agent applies the list when its definition declares a disallowed-tools flag.
 
 ### Yolo through the HTTP API
 
-Commands submitted through the API (`POST /v1/commands`) run with `--yolo` applied **by default** for `chat`, `exec prompt`, and `exec workflow` — the server assumes unattended execution unless your request specifies the flag itself. The response's `flags_applied` field confirms which defaults were used; see [Submit a command](09-api-and-remote-mode.md#submit-a-command).
+Commands submitted through the API (`POST /v1/worker/commands`) run with `--yolo` applied **by default** for `chat`, `exec prompt`, and `exec workflow` — the server assumes unattended execution unless your request specifies the flag itself. The response's `flags_applied` field confirms which defaults were used; see [Submit a command](09-api-and-remote-mode.md#submit-a-command).
 
 ### Security considerations
 
@@ -453,7 +453,7 @@ Commands submitted through the API (`POST /v1/commands`) run with `--yolo` appli
 - `exec workflow --yolo` is the recommended autonomous pattern: isolated branch, structured phases, auto-advancing, easy to discard if the output isn't right.
 - Gemini's `--yolo` skips all tool confirmations including shell commands; `--auto` (`--approval-mode=auto_edit`) is the more conservative choice.
 - Copilot supports `--yolo` only — `--auto` has no equivalent and is dropped.
-- Cline's `--auto` keeps interactive mode while auto-approving; its `--yolo` fully skips confirmations and implies non-interactive operation.
+- Cline's `--auto` enables tool auto-approval; its `--yolo` skips confirmations and exits after the turn.
 
 ---
 
@@ -478,8 +478,8 @@ Prompts for a type (Feature, Bug, Task, or Enhancement) and a title, then create
 By default, awman writes to `aspec/work-items/` and uses `aspec/work-items/0000-template.md`. If neither exists, awman auto-discovers any `*template.md` file in the work items directory and prompts you to confirm it. You can also configure the paths explicitly:
 
 ```sh
-awman config set work_items.dir docs/work-items
-awman config set work_items.template docs/work-items/my-template.md
+awman config set workItems.dir docs/work-items
+awman config set workItems.template docs/work-items/my-template.md
 ```
 
 If no template is found or confirmed, the new file is created with a minimal stub (`# Kind: Title`). See [Configuration: Work item paths](07-configuration.md#custom-work-item-paths) for full details on path resolution and auto-discovery.
@@ -631,7 +631,7 @@ Mount a pulled library with `skill(<library>)`, or one skill from it with `skill
 | Flag | Description |
 |------|-------------|
 | `--interview` | Let a code agent complete the skill body from a short summary |
-| `-n`, `--non-interactive` | Run the interview agent in print mode |
+| `-n`, `--headless` | Run the interview agent in print mode |
 | `--global` | Write to `~/.awman/skills/<name>/` instead of the current repo |
 | `--pull <repo>` | Pull a GitHub skills library, or refresh one by its short name |
 | `--pull-all` | Refresh every previously-pulled skills library |
@@ -700,25 +700,27 @@ session. See [Squad](12-squad.md) for task management and unattended execution.
 
 ## Agent authentication
 
-awman automatically passes your agent's credentials into the container — you never have to log in manually inside a container session.
+awman mounts supported on-disk credentials or passes the host environment variables you select with `env()`. Host keyring credentials are available only where awman explicitly stages them; see the per-agent paths below.
 
 For Claude Code, awman reads your OAuth credential from the macOS Keychain (service: `Claude Code-credentials`) — or, on non-macOS hosts, from `~/.claude/.credentials.json` — and writes an awman-authored `.credentials.json` (access token, expiry, and scopes only) into the staged `~/.claude` directory that's mounted into the container. Your refresh token is never captured from the host credential and never mounted into a container.
 
-While the session is running, a background monitor tracks the token's expiry and, before it runs out, pings your host's local Claude Code installation — the same sanctioned check `awman ready` uses — so it rotates its own Keychain entry. awman then atomically rewrites the staged credential file for every live session, so a long-running container picks up the new token on its next request with no restart. If the host can't refresh (asleep, logged out, offline), awman keeps the last-known-good token, warns you, and retries; a workflow step that fails on an auth error is retried once automatically after a fresh refresh. See [Control credential refresh](07-configuration.md#control-credential-refresh-authrefresh) to change the refresh threshold or turn this off.
+While the session is running, a background monitor tracks the token's expiry and, before it runs out, pings your host's local Claude Code installation — the same sanctioned check `awman ready` uses — so it rotates its own Keychain entry. awman then atomically rewrites the staged credential file for every live session, so a long-running container picks up the new token on its next request with no restart. If the host can't refresh (asleep, logged out, offline), awman keeps the last-known-good token, warns you, and retries; a workflow step that fails on an auth error is retried once automatically after a fresh refresh. See [Control credential refresh](07-configuration.md#control-credential-refresh-agentsauthrefresh) to change the refresh threshold or turn this off.
 
 The token value is never shown in displayed container commands; the mounted `~/.claude` directory appears only as an ordinary bind-mount path.
 
 | Agent | Auth mechanism |
 |-------|---------------|
 | `claude` | OAuth credential read from macOS Keychain (or `~/.claude/.credentials.json`), delivered as a live-refreshed `.credentials.json` file in the staged `~/.claude` mount — never as an env var |
-| `codex` | — |
-| `opencode` | — |
+| `codex` | `~/.codex/` mounted directly when present (including file-backed `auth.json`); or `OPENAI_API_KEY` through `env()`. Each container launch also receives a private temporary SQLite directory at `$HOME/.codex-sqlite`. |
+| `opencode` | `~/.config/opencode/` config and `~/.local/share/opencode/` provider credentials mounted directly when present; or provider key through `env()` |
 | `gemini` | API key via `env()` overlay and/or `~/.gemini/` OAuth directory (auto-mounted) |
-| `antigravity` | API key via `env()` overlay (`ANTIGRAVITY_API_KEY`) and/or `~/.gemini/antigravity-cli/` OAuth directory (auto-mounted) |
-| `copilot` | GitHub token via `env()` overlay (`COPILOT_GITHUB_TOKEN` or `GH_TOKEN`) |
-| `cline` | `~/.cline/data/` directory mount (contains `secrets.json` with API keys) — auto-mounted |
+| `antigravity` | Google account credential staged under `~/.gemini/antigravity-cli/`, or `GEMINI_API_KEY` through `env()` when `modelProvider` is `gemini` |
+| `copilot` | `~/.copilot/` mounted directly when present (including `settings.json` and any file-backed token in `config.json`); or GitHub token via `env()` overlay (`COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, or `GITHUB_TOKEN`) |
+| `cline` | `~/.cline/data/` mounted directly when present (current provider settings are in `settings/providers.json`) |
 
-Gemini and Copilot authenticate via API keys passed from your host environment using `env()` overlays. Cline uses an auto-mounted directory. See [Gemini authentication](#gemini-authentication) for the full Gemini auth options, and [Copilot authentication](#copilot-authentication) and [Cline authentication](#cline-authentication) below.
+`env()` overlays pass named host variables into the agent container. Host directories mounted directly are live and writable from the container; account credentials in those directories should be treated as secrets. Claude and Antigravity use staged copies.
+
+For Codex container launches, awman sets `CODEX_SQLITE_HOME` and a `sqlite_home` CLI override to the private directory, so a host `config.toml` setting cannot redirect the database back into the shared `~/.codex` mount. The directory is removed after the container or microVM exits. This isolates SQLite storage; file-backed `auth.json` remains on the direct host mount and is still shared by parallel Codex sessions.
 
 ### Host settings injection
 
@@ -726,8 +728,8 @@ For Claude sessions, awman also mounts sanitized copies of your Claude Code sett
 
 | Host file | Container path | Notes |
 |-----------|----------------|-------|
-| `~/.claude.json` | `/root/.claude.json:ro` | `oauthAccount` field stripped to prevent broken auth state |
-| `~/.claude/settings.json` | `/root/.claude/settings.json:ro` | Model preferences, plugins — copied as-is |
+| `~/.claude.json` | `$HOME/.claude.json` | `oauthAccount` field stripped to prevent broken auth state |
+| `~/.claude/settings.json` | `$HOME/.claude/settings.json` | Model preferences and plugins in the staged settings directory |
 
 Your original files are never modified. The copies are created in a temporary directory before each launch and cleaned up when the container exits.
 
@@ -747,14 +749,14 @@ Add `GEMINI_API_KEY` (or one of the Vertex AI variables) to your overlays config
 
 Or pass it per-command: `awman chat --agent gemini --overlay "env(GEMINI_API_KEY)"`.
 
-Get a free API key from [Google AI Studio](https://aistudio.google.com/apikey) (1,000 requests/day on the free tier). awman reads the value from your host shell and injects it into the container. The value is masked (`***`) in all displayed Docker commands.
+Get an API key from [Google AI Studio](https://aistudio.google.com/apikey). awman reads the value from your host shell and injects it into the container. The value is masked (`***`) in displayed Docker commands.
 
 Supported Gemini auth environment variables:
 
 | Variable | Description |
 |----------|-------------|
 | `GEMINI_API_KEY` | API key from Google AI Studio |
-| `GOOGLE_API_KEY` | Vertex AI API key (takes precedence over `GEMINI_API_KEY`) |
+| `GOOGLE_API_KEY` | Alternate Gemini API key variable; select the appropriate auth method in Gemini CLI |
 | `GOOGLE_CLOUD_PROJECT` | Vertex AI project ID |
 | `GOOGLE_CLOUD_LOCATION` | Vertex AI region |
 | `GOOGLE_GENAI_USE_VERTEXAI` | Set to `true` to enable the Vertex AI auth path |
@@ -763,58 +765,51 @@ Supported Gemini auth environment variables:
 
 ### OAuth token (`~/.gemini/` mount)
 
-Gemini's default interactive auth stores OAuth tokens in `~/.gemini/settings.json` on your host after you run `gemini` for the first time and complete the browser login flow. awman automatically copies `~/.gemini/` into a temporary directory and mounts it into the container at `/root/.gemini`, so the agent picks up your existing OAuth session without a manual login step.
+Gemini's Google sign-in caches its credential under `~/.gemini/` (typically `oauth_creds.json`); `settings.json` holds configuration, not the token. When the host directory exists, awman mounts it at the container user's `$HOME/.gemini`.
 
-If `~/.gemini/` does not exist on the host (you've never run `gemini` locally), awman creates an empty directory and mounts that instead. Gemini will prompt for authentication inside the container on first use.
+If `~/.gemini/` does not exist on the host, awman does not mount it. Gemini will need an API key or an interactive sign-in.
 
-The mount is a copy, not a bind mount — changes the agent makes to its auth state inside the container are isolated and do not affect the live `~/.gemini/` on your host.
+The mount is a live bind mount. Gemini can update the host's credential cache while a session runs.
 
 ### Auth precedence
 
-When both an API key env var and OAuth tokens are present, Gemini uses the API key. This is Gemini's own resolution logic — awman does not arbitrate. If you want to use OAuth auth exclusively, omit the key variables from your overlays config.
+The selected Gemini CLI authentication method determines which credential is used. awman does not choose between a key and Google sign-in.
 
 ---
 
 ## Antigravity authentication
 
-Antigravity supports two authentication paths, similar to Gemini. You can use either or both — awman sets up both automatically.
+Antigravity supports Google account sign-in and direct Gemini API access. Direct API access requires a matching setting and key.
 
 ### API key (`env()` overlay)
 
-Add `ANTIGRAVITY_API_KEY` to your overlays config:
+Set `"modelProvider": "gemini"` in `~/.gemini/antigravity-cli/settings.json`, then add `GEMINI_API_KEY` to your overlays config:
 
 ```json
-{ "overlays": ["env(ANTIGRAVITY_API_KEY)"] }
+{ "overlays": ["env(GEMINI_API_KEY)"] }
 ```
 
-Or pass it per-command: `awman chat --agent antigravity --overlay "env(ANTIGRAVITY_API_KEY)"`.
+Or pass it per-command: `awman chat --agent antigravity --overlay "env(GEMINI_API_KEY)"`.
 
-Get an API key from [Google AI Studio](https://aistudio.google.com/apikey) or through your Antigravity account. awman reads the value from your host shell and injects it into the container. The value is masked (`***`) in all displayed Docker commands.
+Get an API key from [Google AI Studio](https://aistudio.google.com/apikey). awman reads the value from your host shell and injects it into the container. The value is masked (`***`) in displayed Docker commands. `GOOGLE_API_KEY` and `ANTIGRAVITY_API_KEY` are not recognized by this auth path.
 
-Supported Antigravity auth environment variables:
-
-| Variable | Description |
-|----------|-------------|
-| `ANTIGRAVITY_API_KEY` | Antigravity API key |
-| `GOOGLE_API_KEY` | Vertex AI API key (takes precedence over `ANTIGRAVITY_API_KEY`) |
-| `GOOGLE_CLOUD_PROJECT` | Vertex AI project ID |
-| `GOOGLE_CLOUD_LOCATION` | Vertex AI region |
+If you remove `GEMINI_API_KEY`, also remove `modelProvider: "gemini"`; otherwise `agy` exits at startup.
 
 ### OAuth token (`~/.gemini/antigravity-cli/` mount)
 
-Antigravity's interactive auth stores OAuth tokens in `~/.gemini/antigravity-cli/settings.json` after you run `agy` for the first time and complete authentication. awman automatically copies `~/.gemini/antigravity-cli/` into a temporary directory and mounts it into the container at `/root/.gemini/antigravity-cli`, so the agent picks up your existing OAuth session without a manual login step.
+`settings.json` holds preferences, not the OAuth token. awman stages a copy of the host's `~/.gemini/` directory and seeds `antigravity-cli/antigravity-oauth-token` from the host credential store when available. It mounts the staged directory at the container user's `$HOME/.gemini`.
 
-If `~/.gemini/antigravity-cli/` does not exist on the host (you've never run `agy` locally), awman creates an empty directory and mounts that instead. Antigravity will prompt for authentication inside the container on first interactive use.
+If neither host settings nor a usable host credential exists, there is no staged auth mount. Sign in with `agy` on the host first or configure the Gemini API key path above.
 
-The mount is a copy, not a bind mount — changes the agent makes to its auth state inside the container do not affect the live `~/.gemini/antigravity-cli/` on your host.
+Changes inside the staged copy do not modify the host directory.
 
 ### Auth precedence
 
-When both an API key env var and OAuth tokens are present, Antigravity uses the API key. If you want to use OAuth auth exclusively, omit the key variables from your overlays config.
+Antigravity uses the Gemini API key only when `modelProvider` is `gemini`. Without that setting it uses account sign-in.
 
 ### Model configuration
 
-Antigravity does not support the `--model` flag. Configure the model in `~/.gemini/antigravity-cli/settings.json` on your host, or use the `/model` slash command inside an interactive session to change the model for that session only.
+Use awman's `--model <slug>` for one session; `agy models` lists available slugs. For a persistent choice, use `/model` in `agy` or edit `~/.gemini/antigravity-cli/settings.json`.
 
 ---
 
@@ -832,13 +827,13 @@ The warning does not block execution — your gemini session still starts. Howev
 2. Make it your default: `awman config set agent antigravity` (add `--global` to apply across all repos).
 3. Set up authentication as described in [Antigravity authentication](#antigravity-authentication) above.
 
-Antigravity is a drop-in replacement for Gemini with the same CLI interface and Docker-based isolation.
+Antigravity uses a separate `agy` CLI and its own settings and authentication paths.
 
 ---
 
 ## Copilot authentication
 
-GitHub Copilot CLI authenticates entirely via a GitHub token — there is no OAuth config directory to mount. Set your token via overlays config:
+awman mounts `~/.copilot/` when it exists, carrying `settings.json` and any token Copilot stored in `config.json` on a host without a usable keyring. Credentials in the host keyring are not available inside the container. You can also pass a token through an environment overlay:
 
 ```json
 { "overlays": ["env(COPILOT_GITHUB_TOKEN)"] }
@@ -879,22 +874,22 @@ Only variables present in your host shell are injected, and values are masked (`
 
 ## Cline authentication
 
-Cline stores API keys in `~/.cline/data/secrets.json` on your host, written there by `cline auth`. awman automatically copies `~/.cline/data/` into a temporary directory and mounts it into the container at `/home/awman/.cline/data`, so the agent picks up your existing credentials without re-running `cline auth` inside every container.
+Cline's current CLI stores provider configuration and keys in `~/.cline/data/settings/providers.json`; older installations may still have `secrets.json` for migration. When `~/.cline/data/` exists, awman mounts it directly into the container at `$HOME/.cline/data`, so `cline auth` does not need to run again in every container.
 
 No overlay configuration is needed — credentials travel with the auto-mounted directory.
 
-If `~/.cline/data/` does not exist on the host (you've never run `cline auth`), awman creates an empty temporary directory and mounts that instead. Cline will prompt for authentication inside the container on first interactive use.
+If `~/.cline/data/` does not exist on the host, awman skips the mount. Configure Cline on the host with `cline auth` first, or authenticate inside an interactive session.
 
-The mount is a copy, not a bind mount — changes the agent makes to its credentials inside the container do not affect the live `~/.cline/data/` on your host. Task history (`tasks/`) and workspace state (`workspace/`) are excluded from the copy; only the config and secrets files are included.
+The mount is a live bind mount. Cline can update host credentials and session state while it runs.
 
 To set up credentials on the host before running awman:
 
 ```sh
 # Authenticate with Anthropic (example)
-cline auth -p anthropic -k <your-api-key> -m claude-sonnet-4-6
+cline auth -p anthropic -k <your-api-key> -m claude-sonnet-5-5
 
 # Verify credentials were written
-cat ~/.cline/data/secrets.json
+test -f ~/.cline/data/settings/providers.json
 ```
 
 
@@ -913,14 +908,14 @@ Initialises the current Git repository for use with awman. See [Getting Started]
 
 `--aspec` downloads the `aspec/` folder from `github.com/prettysmartdev/aspec`, providing spec templates and work item scaffolding. Skipped without the flag.
 
-When `--aspec` is not passed and no `aspec/` folder exists, `init` offers to configure a custom work items directory and template path interactively. This sets `work_items.dir` (and optionally `work_items.template`) in the repo config so commands like `new spec` and `exec workflow` work without requiring the `aspec/` folder layout. See [Work item paths](07-configuration.md#custom-work-item-paths).
+When `--aspec` is not passed and no `aspec/` folder exists, `init` offers to configure a custom work items directory and template path interactively. This sets `workItems.dir` (and optionally `workItems.template`) in the repo config so commands like `new spec` and `exec workflow` work without requiring the `aspec/` folder layout. See [Work item paths](07-configuration.md#custom-work-item-paths).
 
 ---
 
 ## Reference: `awman ready`
 
 ```sh
-awman ready [--refresh] [--build] [--no-cache] [-n|--non-interactive] [--allow-docker] [--json] [--agent <name>]
+awman ready [--refresh] [--build] [--no-cache] [-n|--headless] [--allow-docker] [--json] [--agent <name>]
 ```
 
 Verifies your environment is ready for agent sessions. Progress lines read `ready: <phase>` on stderr (suppressed with `--json`). A Docker or Apple Containers runtime error exits with status 3; every other engine failure, including builtin and image-builder errors, exits with status 1, and the CLI prints the same message the TUI and API show.
@@ -930,9 +925,9 @@ Verifies your environment is ready for agent sessions. Progress lines read `read
 | `--refresh` | Run the Dockerfile agent audit, which updates `Dockerfile.dev` for your project's toolchain (skipped by default) |
 | `--build` | Rebuild the project base image and every agent image with a `.awman/Dockerfile.<agent>` (on the [builtin runtime](11-runtimes.md), re-acquire them from their image source) |
 | `--no-cache` | Skip the build cache for any build `ready` runs; on the builtin runtime, also force a fresh image import |
-| `--non-interactive` / `-n` | Run the audit agent in print mode, and answer `ready`'s own questions non-interactively |
+| `--headless` / `-n` | Run the audit agent in print mode, and answer `ready`'s own questions non-interactively |
 | `--allow-docker` | Give the audit container access to the host Docker socket |
-| `--json` | Emit machine-readable JSON instead of the summary table. Implies `--non-interactive`. See [`ready --json`](#ready---json) |
+| `--json` | Emit machine-readable JSON instead of the summary table. Implies `--headless`. See [`ready --json`](#ready---json) |
 | `--agent <name>` | Check and build this agent instead of the configured one. For a [custom agent](15-custom-agents.md) whose definition needs approval, this is where you review and approve it |
 
 Use `--refresh` after your project's toolchain changes. The audit only edits `Dockerfile.dev`; agent Dockerfiles are not touched.
@@ -979,7 +974,7 @@ With `--json`, `awman ready` prints one JSON object on stdout instead of the sum
 
 Each step's `status` is `ok`, `skipped`, `warn`, `failed`, `pending` or `running`, with the reason in `message`. `refresh` is `ok` when `--refresh` ran the audit. On the builtin runtime the object also carries `steps.image_source` and, when images were built or imported, `image_results`, `base_image_results` and `warnings`.
 
-`--json` implies `--non-interactive`, so no prompts are shown, and audit output is not streamed. In `agent_credentials` (one entry per agent with a live-refreshed credential), `expires_in_secs` is `null` when the expiry couldn't be determined, and `read_error` is set when the credential couldn't be read at all. No token value ever appears in this output.
+`--json` implies `--headless`, so no prompts are shown, and audit output is not streamed. In `agent_credentials` (one entry per agent with a live-refreshed credential), `expires_in_secs` is `null` when the expiry couldn't be determined, and `read_error` is set when the credential couldn't be read at all. No token value ever appears in this output.
 
 ---
 
@@ -989,12 +984,12 @@ Each step's `status` is `ok`, `skipped`, `warn`, `failed`, `pending` or `running
 |------|--------|---------------|-----------------|-------------|
 | `--agent=<name>` | ✓ | ✓ | ✓ | Override the agent for this session |
 | `--model=<NAME>` | ✓ | ✓ | ✓ | Override the model used by the agent |
-| `--non-interactive` / `-n` | ✓ | ✓ | ✓ | Print/batch mode |
-| `--launch-mode <stdio\|acp>` | ✓ | ✓ | ✓ | Choose standard stdio or ACP mode |
+| `--headless` / `-n` | ✓ | ✓ | ✓ | Print/batch mode |
+| `--set agents.launchMode=<stdio\|acp>` | ✓ | ✓ | ✓ | Choose standard stdio or ACP mode |
 | `--plan` | ✓ | ✓ | ✓ | Read-only analysis mode |
 | `--allow-docker` | ✓ | ✓ | ✓ | Mount host Docker socket |
 | `--overlay=<SPEC>` | ✓ | ✓ | ✓ | `dir()`, `env()`, `skill()`, `ssh()` overlays (repeatable) |
-| `--agent-flag=<ARG>` | ✓ | ✓ | ✓ | Extra argument for the agent command (repeatable); replaces its `agentFlags` entry |
+| `--agent-flag=<ARG>` | ✓ | ✓ | ✓ | Extra argument for the agent command (repeatable); replaces its `agents.flags` entry |
 | `--branch <NAME>` | ✓ | ✓ | — | Run in a worktree for this branch (CLI/TUI only) |
 | `--pr <N\|URL\|owner/repo#N>` | ✓ | ✓ | — | Run in a worktree for a GitHub pull request (CLI/TUI only) |
 | `--worktree <NAME\|PATH>` | ✓ | ✓ | — | Reuse an existing worktree (CLI/TUI only) |
@@ -1005,7 +1000,6 @@ Each step's `status` is `ok`, `skipped`, `warn`, `failed`, `pending` or `running
 | `--issue <N\|URL>` | — | ✓ | ✓ | Use a GitHub issue as the prompt / work item input — see [GitHub Integration](10-github-integration.md) |
 | `--dynamic` | — | — | ✓ | Have a leader agent design the workflow; implies `--yolo`, `--worktree`, `context(workflow)` |
 | `--leader <agent::model>` | — | — | ✓ | Leader agent and model for `--dynamic` |
-| `--max-concurrent <N>` | — | — | ✓ | Cap concurrently-running workflow steps |
 | `--on-existing-worktree`, `--on-dirty-merge-target`, `--on-merge-failure` | — | — | ✓ | Answer worktree lifecycle questions up front — see [Workflows](05-workflows.md#worktrees) |
 | `--prerequisite-*`, `--check-prerequisites` | — | — | ✓ | Grant or check what setup/teardown steps need — see [Workflows](05-workflows.md) |
 | `--json` | — | — | ✓ | Print the workflow outcome and prerequisite report as JSON |

@@ -262,7 +262,7 @@ fn make_session(tmp: &tempfile::TempDir) -> Session {
     Session::for_tests(tmp.path())
 }
 
-/// Session whose env snapshot pins `AWMAN_CONFIG_HOME` to `home`, so the
+/// Session whose env snapshot pins `AWMAN_HOME` to `home`, so the
 /// engine resolves `~/.awman/logs/` under a temp dir instead of the real
 /// home — no process-global env mutation, no cross-test races.
 fn make_session_with_home(tmp: &tempfile::TempDir, home: &std::path::Path) -> Session {

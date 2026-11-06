@@ -2,7 +2,7 @@
 //! answered with when there is nobody to ask.
 //!
 //! Three hosts run commands with no operator attached: the API server, the
-//! squad daemon, and the CLI with a piped stdin (or `--non-interactive`).
+//! squad daemon, and the CLI with a piped stdin (or `--headless`).
 //! Before WI 0114 F-13 each of them carried its own answers, inline in its
 //! Layer 3 frontend, and they had drifted: the same `exec workflow` squash-
 //! merged under the API, left a branch alone under squad, and asked for
@@ -130,7 +130,7 @@ use crate::command::commands::worktree_lifecycle::{
     DirtyMergeTargetDecision, ExistingWorktreeDecision, PostWorkflowWorktreeAction,
     PostWorkflowWorktreePrompt, PreWorktreeDecision, WorktreeMergeMode,
 };
-use crate::data::config::repo::WorkItemsConfig;
+use crate::data::config::work_items::WorkItemsConfig;
 use crate::data::config::workflows::{CredentialUse, UnresolvedMode};
 use crate::data::workflow_prerequisites::PrerequisiteOrigin;
 use crate::engine::acp::protocol::{PermissionDecision, PermissionOption};
@@ -183,7 +183,7 @@ impl HeadlessDefaults {
         }
     }
 
-    /// The CLI's policy when stdin is not a TTY or `--non-interactive` is set:
+    /// The CLI's policy when stdin is not a TTY or `--headless` is set:
     /// squad's caution about the working tree, but the user's own host
     /// credentials are never injected without them saying so.
     pub fn cli() -> Self {

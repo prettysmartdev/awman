@@ -478,7 +478,8 @@ fn submit_command_blocked_while_running() {
 #[test]
 fn submitting_a_bad_enum_value_leaves_the_box_with_an_error() {
     let mut app = make_app();
-    app.command_input.set_text("chat --launch-mode banana");
+    app.command_input
+        .set_text("exec workflow --on-merge-failure banana");
 
     press_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
 
@@ -487,29 +488,12 @@ fn submitting_a_bad_enum_value_leaves_the_box_with_an_error() {
         .as_deref()
         .expect("a bad enum value must be reported in the command box");
     assert!(
-        error.contains("banana") && error.contains("stdio"),
+        error.contains("banana") && error.contains("keep"),
         "the hint must name the bad value and the allowed set: {error}"
     );
     assert!(
         !app.command_input.text.is_empty(),
         "the typed text must survive so the user can correct it"
-    );
-}
-
-#[test]
-fn submitting_a_non_numeric_number_leaves_the_box_with_an_error() {
-    let mut app = make_app();
-    app.command_input.set_text("squad start --port abc");
-
-    press_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
-
-    let error = app
-        .input_error
-        .as_deref()
-        .expect("a non-numeric number must be reported in the command box");
-    assert!(
-        error.contains("abc"),
-        "the hint must name the bad value: {error}"
     );
 }
 
@@ -1148,7 +1132,7 @@ fn fake_task(name: &str) -> crate::data::fs::task_store::Task {
     let now = chrono::Utc::now();
     crate::data::fs::task_store::Task {
         prerequisites: None,
-        id: name.to_string(),
+        id: crate::frontend::test_ids::task_id(name),
         name: name.to_string(),
         description: "test task".into(),
         repo_scope: std::path::PathBuf::from("/tmp"),
@@ -1693,8 +1677,8 @@ fn set_squad_runs(app: &mut App, task: &str, count: usize) {
     let mut snap = state.snapshot.lock().unwrap();
     snap.runs = (0..count)
         .map(|i| Run {
-            id: format!("run-{i}"),
-            task_id: task.to_string(),
+            id: crate::frontend::test_ids::run_id(&format!("run-{i}")),
+            task_id: crate::frontend::test_ids::task_id(task),
             status: RunStatus::WorkflowExecuted,
             workflow_path: None,
             workflow_state_path: None,
@@ -1826,7 +1810,11 @@ fn squad_history_enter_opens_the_selected_runs_detail_and_esc_returns_to_the_tab
     match &app.active_dialog {
         Some(Dialog::SquadTaskHistory(state)) => {
             let detail = state.run_detail.as_ref().expect("Enter opens the detail");
-            assert_eq!(detail.run.id, "run-1", "the detail is the selected run's");
+            assert_eq!(
+                detail.run.id,
+                crate::frontend::test_ids::run_id("run-1"),
+                "the detail is the selected run's"
+            );
             assert_eq!(detail.scroll, 0);
         }
         _ => panic!("the history modal must stay up under its run detail"),
@@ -2258,124 +2246,54 @@ fn a_failed_daemon_start_is_reported_in_a_modal() {
     );
 }
 
-// ─── the missing-key recovery ───────────────────────────────────────────────
+// ─── opening the squad tab over the daemon ──────────────────────────────────
 
-/// A gateway pointing nowhere. `poll_squad_startup` never calls it in the
-/// `Missing` arm — it discards it and raises the dialog — so a real endpoint
-/// is not needed to prove which arm ran.
-fn unreachable_gateway() -> crate::command::commands::squad::gateway::RemoteTaskGateway {
-    use crate::command::commands::squad::gateway::RemoteTaskGateway;
-    use crate::engine::remote::HttpCore;
-    RemoteTaskGateway::new(HttpCore::new("http://127.0.0.1:1", "v1", None).unwrap())
+/// A gateway pointing at no daemon. `poll_squad_startup` never calls it; it
+/// only installs it, so a real endpoint is not needed.
+fn unreachable_gateway() -> crate::command::commands::squad::client::DaemonSquadClient {
+    use crate::data::fs::daemon_sidecar::{ServerSidecar, SidecarTransport, SidecarTransportKind};
+    let address = std::path::PathBuf::from("/nonexistent/awman/api.sock");
+    let sidecar = ServerSidecar::current(
+        1,
+        SidecarTransport {
+            kind: SidecarTransportKind::native(),
+            address: address.display().to_string(),
+        },
+    );
+    crate::command::commands::squad::client::DaemonSquadClient::new(
+        crate::command::commands::daemon::client::DaemonClient::from_endpoint(
+            crate::engine::remote::local::LocalEndpoint {
+                address,
+                pid: 1,
+                sidecar,
+            },
+        ),
+    )
 }
 
-/// A daemon this process cannot authenticate to gets the recovery dialog, not
-/// a tab. A tab would poll, be refused with 401, and render nothing but that.
+/// A completed start opens the squad tab with no key disclosure: the local
+/// listener needs no bearer key.
 #[test]
-fn a_daemon_with_no_usable_key_raises_the_recovery_instead_of_opening_a_tab() {
-    let mut app = make_app();
-    let tabs_before = app.tabs.len();
-    let (tx, rx) = std::sync::mpsc::channel();
-    tx.send(Err(crate::frontend::tui::app::SquadStartError::KeyMissing))
-        .unwrap();
-    app.squad_startup_rx = Some(rx);
-    app.active_dialog = Some(Dialog::Loading {
-        title: "Starting squad daemon".to_string(),
-    });
-
-    app.poll_squad_startup();
-
-    assert!(
-        matches!(app.active_dialog, Some(Dialog::SquadKeyMissing)),
-        "a missing key must raise its own recovery, not a generic failure"
-    );
-    assert_eq!(
-        app.tabs.len(),
-        tabs_before,
-        "no squad tab is opened for a daemon every request would be refused by"
-    );
-}
-
-/// Declining the recovery opens no tab and says why, rather than leaving the
-/// user staring at an unexplained absence.
-#[test]
-fn declining_the_key_recovery_opens_no_tab_and_says_so() {
-    let mut app = make_app();
-    let tabs_before = app.tabs.len();
-    app.active_dialog = Some(Dialog::SquadKeyMissing);
-
-    press_key(&mut app, KeyCode::Char('n'), KeyModifiers::NONE);
-
-    assert!(app.active_dialog.is_none());
-    assert_eq!(app.tabs.len(), tabs_before);
-    assert!(
-        app.status_bar.text.contains("key") && app.status_bar.text.contains("was not opened"),
-        "declining must say what happened: {:?}",
-        app.status_bar.text
-    );
-}
-
-/// A refresh already in flight makes a second `y` inert, so two presses cannot
-/// mint two keys and restart the daemon twice.
-///
-/// The accepting press is deliberately not exercised against a real daemon:
-/// `y` terminates and restarts one, which a unit test must not do.
-#[test]
-fn a_key_refresh_already_in_flight_makes_a_second_acceptance_inert() {
-    let mut app = make_app();
-    let (_tx, rx) = std::sync::mpsc::channel();
-    app.squad_startup_rx = Some(rx);
-    app.active_dialog = Some(Dialog::SquadKeyMissing);
-
-    press_key(&mut app, KeyCode::Char('y'), KeyModifiers::NONE);
-
-    assert!(
-        app.squad_startup_rx.is_some(),
-        "the outstanding refresh is left alone rather than replaced"
-    );
-    assert_eq!(app.tabs.len(), 1, "no tab appears until the refresh lands");
-}
-
-/// A refresh ends where a first run does — a key to display — and takes the
-/// same drain, so the recovery finishes by showing the user the key they were
-/// missing.
-#[test]
-fn a_completed_key_refresh_opens_the_tab_and_displays_the_new_key() {
-    use crate::command::commands::squad::daemon::SquadKeyState;
-    use crate::engine::squad::key_setup::{KeyDisclosure, ShellFlavor};
-
+fn a_completed_daemon_start_opens_the_squad_tab_without_a_key_notice() {
     let mut app = make_app();
     let (tx, rx) = std::sync::mpsc::channel();
     tx.send(Ok(crate::frontend::tui::app::SquadStartup {
         gateway: std::sync::Arc::new(unreachable_gateway()),
-        key_state: SquadKeyState::Minted(KeyDisclosure::new("deadbeef", ShellFlavor::Zsh)),
-        key_setup: Some(crate::frontend::tui::app::SquadKeySetup::for_key(
-            "deadbeef",
-            ShellFlavor::Zsh,
-        )),
     }))
     .unwrap();
     app.squad_startup_rx = Some(rx);
     app.active_dialog = Some(Dialog::Loading {
-        title: "Refreshing the squad key".to_string(),
+        title: "Starting the awman daemon".to_string(),
     });
 
     app.poll_squad_startup();
 
+    assert!(app.tabs.iter().any(|tab| tab.is_squad));
     assert!(
-        app.tabs.iter().any(|tab| tab.is_squad),
-        "a usable key means the squad tab opens"
+        app.active_dialog.is_none(),
+        "there is no key to disclose any more"
     );
-    match &app.active_dialog {
-        Some(Dialog::Notice { body, .. }) => assert!(
-            body.contains("deadbeef"),
-            "the new key must be displayed — it exists nowhere else: {body}"
-        ),
-        other => panic!(
-            "a minted key must be shown, not swallowed (dialog present: {})",
-            other.is_some()
-        ),
-    }
+    assert!(app.squad_startup_rx.is_none());
 }
 
 /// `c` and `z` copy the key/snippet to the clipboard but must not dismiss the

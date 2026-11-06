@@ -6,7 +6,7 @@
 //! agent window: no raw mode, no PTY, just read/print like the rest of the
 //! CLI's interactive Q&A (see `per_command/helpers.rs`).
 //!
-//! Headless runs (`-n`/`--non-interactive`, and `--yolo`/`--auto` which the
+//! Headless runs (`-n`/`--headless`, and `--yolo`/`--auto` which the
 //! engine driver already handles by never calling `request_permission` at
 //! all) must never block on stdin: `non_interactive` degrades
 //! `request_permission` to auto-approve and `next_prompt` to "no follow-up",
@@ -247,7 +247,7 @@ fn match_permission_option(options: &[PermissionOption], input: &str) -> Option<
 /// `Some(String::new())` for a blank line. `per_command::helpers::read_line`
 /// cannot be reused here because it collapses "not a TTY" and "EOF" into the
 /// same `None`, while an ACP session must react to those differently (a
-/// live-but-non-interactive run degrades before ever calling this; a live
+/// live-but-headless run degrades before ever calling this; a live
 /// interactive run's EOF must end the session).
 fn read_stdin_line() -> Option<String> {
     let mut buf = String::new();
@@ -263,7 +263,7 @@ mod tests {
     use super::*;
     use crate::command::dispatch::catalogue::CommandCatalogue;
 
-    /// Build a non-interactive `CliFrontend` for unit tests — exactly the
+    /// Build a headless `CliFrontend` for unit tests — exactly the
     /// degrade path `request_permission`/`next_prompt` must take without
     /// blocking on a read. Forced rather than inferred: `cargo test` run from
     /// a terminal inherits a TTY stdin, so the mode cannot be left to

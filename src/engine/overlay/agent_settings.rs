@@ -36,11 +36,9 @@ impl OverlayEngine {
             git_root,
             container_home_override,
             false,
-            crate::data::config::global::GlobalConfig::data_home_with(
-                &crate::data::config::env::Env::from_process(),
-            )
-            .ok()
-            .as_deref(),
+            crate::data::fs::data_paths::data_home(&crate::data::config::env::Env::from_process())
+                .ok()
+                .as_deref(),
         )
         .map(|(overlays, _)| overlays)
     }
@@ -172,47 +170,54 @@ impl OverlayEngine {
             // reproduces exactly.
             SettingsMount::Direct(rel) => {
                 use crate::data::config::agent_definition::is_deny_listed_host_dir;
-                if is_deny_listed_host_dir(&rel)
-                    || rel.is_empty()
-                    || !std::path::Path::new(&rel)
-                        .components()
-                        .all(|c| matches!(c, std::path::Component::Normal(_)))
-                {
-                    let path = definition
-                        .and_then(|d| match &d.origin {
-                            crate::engine::agent::AgentOrigin::Custom { path, .. } => {
-                                Some(path.clone())
-                            }
-                            _ => None,
-                        })
-                        .unwrap_or_else(|| home.join(&rel));
-                    return Err(EngineError::AgentDefinitionInvalid {
-                        path,
-                        problems: vec![format!(
-                            "settings.host_dir: '{rel}' is not an allowed host directory"
-                        )],
-                    });
-                }
-                let dir = home.join(&rel);
-                if dir.is_dir() {
-                    let canonical_home =
-                        std::fs::canonicalize(home).map_err(|e| EngineError::io(home, e))?;
-                    let dir = std::fs::canonicalize(&dir).map_err(|e| EngineError::io(&dir, e))?;
-                    let allowed = dir.strip_prefix(&canonical_home).ok().is_some_and(|path| {
-                        !path.as_os_str().is_empty()
-                            && !is_deny_listed_host_dir(&path.to_string_lossy())
-                    }) && !overlaps_protected_root(&dir, home, data_home);
-                    if !allowed {
+                for rel in std::iter::once(rel).chain(
+                    definition
+                        .into_iter()
+                        .flat_map(|d| d.extra_settings_mounts.iter().cloned()),
+                ) {
+                    if is_deny_listed_host_dir(&rel)
+                        || rel.is_empty()
+                        || !std::path::Path::new(&rel)
+                            .components()
+                            .all(|c| matches!(c, std::path::Component::Normal(_)))
+                    {
+                        let path = definition
+                            .and_then(|d| match &d.origin {
+                                crate::engine::agent::AgentOrigin::Custom { path, .. } => {
+                                    Some(path.clone())
+                                }
+                                _ => None,
+                            })
+                            .unwrap_or_else(|| home.join(&rel));
                         return Err(EngineError::AgentDefinitionInvalid {
+                            path,
+                            problems: vec![format!(
+                                "settings.host_dir: '{rel}' is not an allowed host directory"
+                            )],
+                        });
+                    }
+                    let dir = home.join(&rel);
+                    if dir.is_dir() {
+                        let canonical_home =
+                            std::fs::canonicalize(home).map_err(|e| EngineError::io(home, e))?;
+                        let dir =
+                            std::fs::canonicalize(&dir).map_err(|e| EngineError::io(&dir, e))?;
+                        let allowed = dir.strip_prefix(&canonical_home).ok().is_some_and(|path| {
+                            !path.as_os_str().is_empty()
+                                && !is_deny_listed_host_dir(&path.to_string_lossy())
+                        }) && !overlaps_protected_root(&dir, home, data_home);
+                        if !allowed {
+                            return Err(EngineError::AgentDefinitionInvalid {
                             path: home.join(&rel),
                             problems: vec!["settings.host_dir resolves outside HOME or overlaps a protected directory".into()],
                         });
+                        }
+                        out.push(OverlaySpec {
+                            host_path: dir,
+                            container_path: PathBuf::from(format!("{container_home}/{rel}")),
+                            permission: OverlayPermission::ReadWrite,
+                        });
                     }
-                    out.push(OverlaySpec {
-                        host_path: dir,
-                        container_path: PathBuf::from(format!("{container_home}/{rel}")),
-                        permission: OverlayPermission::ReadWrite,
-                    });
                 }
             }
             SettingsMount::Antigravity => {
@@ -257,8 +262,8 @@ impl OverlayEngine {
                     }
                 }
             }
-            // copilot, and any agent without a resolved definition: no host
-            // overlays.
+            // Agents without a settings mount (including unresolved custom
+            // definitions): no host overlays.
             SettingsMount::None => {}
         }
 
@@ -306,10 +311,13 @@ mod image_home_tests {
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().join("host-home");
         for agent in FIRST_PARTY_AGENTS {
-            if let SettingsMount::Direct(relative) = first_party(agent).unwrap().settings_mount {
-                let dir = home.join(relative);
-                std::fs::create_dir_all(&dir).unwrap();
-                std::fs::write(dir.join("settings.json"), b"{}").unwrap();
+            let definition = first_party(agent).unwrap();
+            if let SettingsMount::Direct(relative) = definition.settings_mount {
+                for relative in std::iter::once(relative).chain(definition.extra_settings_mounts) {
+                    let dir = home.join(relative);
+                    std::fs::create_dir_all(&dir).unwrap();
+                    std::fs::write(dir.join("settings.json"), b"{}").unwrap();
+                }
             }
             let paths = AuthPathResolver::at_home(&home).resolve(agent);
             if let Some(dir) = paths.settings_dir {
@@ -366,7 +374,15 @@ mod image_home_tests {
             match first_party(agent).unwrap().settings_mount {
                 SettingsMount::None => assert!(found.is_empty(), "{agent}: {destinations:?}"),
                 SettingsMount::Direct(relative) => {
-                    assert_eq!(destinations, [format!("/home/probe/{relative}")], "{agent}");
+                    let mut expected = vec![format!("/home/probe/{relative}")];
+                    expected.extend(
+                        first_party(agent)
+                            .unwrap()
+                            .extra_settings_mounts
+                            .iter()
+                            .map(|p| format!("/home/probe/{p}")),
+                    );
+                    assert_eq!(destinations, expected, "{agent}");
                     // The host directory itself is bound: live, not a copy.
                     assert_eq!(
                         found[0].host_path,
@@ -527,14 +543,14 @@ mod custom_tests {
 
 /// Whether canonical `dir` contains, or is inside, a directory a settings
 /// mount must never expose: awman's real data home (wherever XDG or
-/// `AWMAN_CONFIG_HOME` put it — it holds the trust store and global
+/// `AWMAN_HOME` put it — it holds the trust store and global
 /// definitions) and the real target of every deny-listed HOME directory, so
 /// a relocated `~/.awman -> ~/state` is protected under its alias too. A
 /// root that does not exist yet is compared through its nearest existing
 /// ancestor, so mounting a parent cannot let an agent create it. ASCII case
 /// is folded, as for the deny list.
 ///
-/// When the data home *is* HOME (an `AWMAN_CONFIG_HOME=$HOME` setup), every
+/// When the data home *is* HOME (an `AWMAN_HOME=$HOME` setup), every
 /// settings directory is inside it, so only its awman-owned children
 /// (`agents/`, `squad/`) are protected in both directions; HOME itself, which
 /// holds the trust store, is never mountable anyway.

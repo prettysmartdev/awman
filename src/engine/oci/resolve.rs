@@ -286,16 +286,20 @@ mod tests {
                 "registries":{"localhost:5000":{"insecure":true}}}"#,
         )
         .unwrap();
-        let global = crate::data::config::global::GlobalConfig {
-            builtin: Some(config.clone()),
+        let global = crate::data::config::ConfigFile {
+            runtime: Some(crate::data::config::RuntimeConfig {
+                builtin: Some(config.clone()),
+                ..Default::default()
+            }),
             ..Default::default()
         };
-        let effective = crate::data::config::EffectiveConfig::new(
+        let effective = crate::data::config::EffectiveConfig::from_files(
+            global,
+            Default::default(),
             crate::data::config::flags::FlagConfig::default(),
             crate::data::config::env::EnvSnapshot::empty(),
-            crate::data::config::RepoConfig::default(),
-            global,
-        );
+        )
+        .unwrap();
         let sources = ImageSources::from_resolved(&effective.builtin_settings().unwrap());
         assert_eq!(sources.registries, config.registries);
         assert!(sources.registries["localhost:5000"].insecure);
@@ -542,8 +546,8 @@ mod tests {
     }
 
     #[test]
-    fn canonical_and_alias_source_spellings_resolve_to_typed_kinds() {
-        for spelling in ["docker-local", "docker-store", "apple-local", "apple-store"] {
+    fn canonical_source_spellings_resolve_to_typed_kinds() {
+        for spelling in ["docker-local", "apple-local"] {
             let raw = if spelling.starts_with("docker") {
                 format!(
                     r#"{{"type":"{spelling}","host":"unix:///run/docker.sock","reference":"team/a:4"}}"#

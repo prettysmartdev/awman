@@ -52,8 +52,7 @@ fn make_engine_and_frontend(
     };
     let engine = ReadyEngine::new(
         ReadyEngine::builtin_inputs(&session, runtime.as_ref()).unwrap(),
-        crate::data::config::global::GlobalConfig::data_home_with(session.effective_config().env())
-            .unwrap(),
+        crate::data::fs::data_paths::data_home(session.effective_config().env()).unwrap(),
         session,
         Arc::new(GitEngine::new()),
         overlay,
@@ -136,8 +135,7 @@ async fn creating_dockerfile_phase_writes_file() {
     };
     let mut engine2 = ReadyEngine::new(
         ReadyEngine::builtin_inputs(&session, runtime.as_ref()).unwrap(),
-        crate::data::config::global::GlobalConfig::data_home_with(session.effective_config().env())
-            .unwrap(),
+        crate::data::fs::data_paths::data_home(session.effective_config().env()).unwrap(),
         session,
         Arc::new(GitEngine::new()),
         overlay,
@@ -202,8 +200,7 @@ fn make_engine_at(git_root: &std::path::Path) -> ReadyEngine {
     };
     ReadyEngine::new(
         ReadyEngine::builtin_inputs(&session, runtime.as_ref()).unwrap(),
-        crate::data::config::global::GlobalConfig::data_home_with(session.effective_config().env())
-            .unwrap(),
+        crate::data::fs::data_paths::data_home(session.effective_config().env()).unwrap(),
         session,
         Arc::new(GitEngine::new()),
         overlay,
@@ -221,7 +218,7 @@ async fn ready_with_configured_dockerfile_reports_configured_path_when_missing()
     std::fs::create_dir_all(&awman_dir).unwrap();
     std::fs::write(
         awman_dir.join("config.json"),
-        r#"{"dockerfile":"infra/Dockerfile.base"}"#,
+        r#"{"runtime": {"dockerfile": "infra/Dockerfile.base"}}"#,
     )
     .unwrap();
 
@@ -256,7 +253,7 @@ async fn ready_with_configured_dockerfile_skips_decision_when_present() {
     std::fs::create_dir_all(&awman_dir).unwrap();
     std::fs::write(
         awman_dir.join("config.json"),
-        r#"{"dockerfile":"infra/Dockerfile.base"}"#,
+        r#"{"runtime": {"dockerfile": "infra/Dockerfile.base"}}"#,
     )
     .unwrap();
     // Create the configured Dockerfile so Preflight short-circuits past
@@ -327,8 +324,7 @@ async fn ready_on_a_kit_declarative_runtime_applies_the_kit_and_skips_image_phas
     ));
     let mut engine = ReadyEngine::new(
         ReadyEngine::builtin_inputs(&session, runtime.as_ref()).unwrap(),
-        crate::data::config::global::GlobalConfig::data_home_with(session.effective_config().env())
-            .unwrap(),
+        crate::data::fs::data_paths::data_home(session.effective_config().env()).unwrap(),
         session,
         Arc::new(GitEngine::new()),
         overlay,
@@ -406,8 +402,7 @@ pub(crate) fn import_engine(
     ));
     let engine = ReadyEngine::new(
         ReadyEngine::builtin_inputs(&session, dyn_runtime.as_ref()).unwrap(),
-        crate::data::config::global::GlobalConfig::data_home_with(session.effective_config().env())
-            .unwrap(),
+        crate::data::fs::data_paths::data_home(session.effective_config().env()).unwrap(),
         session,
         Arc::new(GitEngine::new()),
         overlay,
@@ -535,10 +530,10 @@ async fn a_repo_registries_block_drives_both_resolution_and_the_pull() {
     std::fs::create_dir_all(tmp.path().join(".awman")).unwrap();
     std::fs::write(
         tmp.path().join(".awman").join("config.json"),
-        r#"{"builtin":{
+        r#"{"runtime":{"builtin":{
                 "imageSource":{"type":"archive","path":"/exports/agent.tar"},
                 "registries":{"registry.example:5000":{"insecure":true}}
-            }}"#,
+            }}}"#,
     )
     .unwrap();
     let session = Arc::new(crate::data::session::Session::for_tests_isolated(
@@ -563,8 +558,7 @@ async fn a_repo_registries_block_drives_both_resolution_and_the_pull() {
     ));
     let mut engine = ReadyEngine::new(
         ReadyEngine::builtin_inputs(&session, dyn_runtime.as_ref()).unwrap(),
-        crate::data::config::global::GlobalConfig::data_home_with(session.effective_config().env())
-            .unwrap(),
+        crate::data::fs::data_paths::data_home(session.effective_config().env()).unwrap(),
         session,
         Arc::new(GitEngine::new()),
         overlay,
@@ -1002,7 +996,7 @@ pub(crate) fn builder_engine(
     std::fs::write(awman_dir.join("Dockerfile.claude"), "FROM scratch\n").unwrap();
     std::fs::write(
         awman_dir.join("config.json"),
-        r#"{"builtin":{"builder":{"enabled":true}}}"#,
+        r#"{"runtime":{"builtin":{"builder":{"enabled":true}}}}"#,
     )
     .unwrap();
     let resolver = StaticGitRootResolver::new(tmp.path());
@@ -1026,8 +1020,7 @@ pub(crate) fn builder_engine(
     let receipts = PendingBuiltImageStore::new(tmp.path().join("receipts"));
     let engine = ReadyEngine::new(
         ReadyEngine::builtin_inputs(&session, dyn_runtime.as_ref()).unwrap(),
-        crate::data::config::global::GlobalConfig::data_home_with(session.effective_config().env())
-            .unwrap(),
+        crate::data::fs::data_paths::data_home(session.effective_config().env()).unwrap(),
         session,
         Arc::new(GitEngine::new()),
         overlay,
@@ -1088,8 +1081,7 @@ pub(crate) fn reopen_builder_engine(
     ));
     let engine = ReadyEngine::new(
         ReadyEngine::builtin_inputs(&session, dyn_runtime.as_ref()).unwrap(),
-        crate::data::config::global::GlobalConfig::data_home_with(session.effective_config().env())
-            .unwrap(),
+        crate::data::fs::data_paths::data_home(session.effective_config().env()).unwrap(),
         session,
         Arc::new(GitEngine::new()),
         overlay,
@@ -1377,10 +1369,18 @@ fn builtin_inputs_are_resolved_only_for_an_importing_runtime() {
     std::fs::create_dir_all(tmp.path().join(".awman")).unwrap();
     std::fs::write(
         tmp.path().join(".awman/config.json"),
-        r#"{"builtin":{"vcpus":0,"network":{"mode":"public"}}}"#,
+        r#"{"runtime":{"builtin":{"network":{"mode":"public"}}}}"#,
     )
     .unwrap();
-    let session = Session::for_tests(tmp.path());
+    // A global ceiling the repo block widens: invalid only at launch time.
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(
+        home.join("config.json"),
+        r#"{"runtime":{"builtin":{"network":{"mode":"none"}}}}"#,
+    )
+    .unwrap();
+    let session = Session::for_tests_isolated(tmp.path(), &home);
     assert!(session.effective_config().builtin_settings().is_err());
 
     let builds = FakeKitRuntime::new();

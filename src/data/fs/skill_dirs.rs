@@ -3,7 +3,6 @@
 use std::path::{Path, PathBuf};
 
 use crate::data::config::env::{Env, EnvSnapshot};
-use crate::data::config::global::GlobalConfig;
 use crate::data::error::DataError;
 use crate::data::fs::skill_library::read_library_meta;
 
@@ -36,14 +35,14 @@ pub struct SkillDirs {
 
 impl SkillDirs {
     /// Construct from the current process environment, resolving the global
-    /// home via `AWMAN_CONFIG_HOME` (when set) or `$HOME/.awman`.
+    /// home via `AWMAN_HOME` (when set) or `$HOME/.awman`.
     pub fn from_process_env(git_root: Option<PathBuf>) -> Result<Self, DataError> {
         Self::from_env(&Env::from_process(), git_root)
     }
 
     /// Same as [`from_process_env`] but reads from a supplied env snapshot.
     pub fn from_env(env: &EnvSnapshot, git_root: Option<PathBuf>) -> Result<Self, DataError> {
-        let global_home = GlobalConfig::data_home_with(env)?;
+        let global_home = crate::data::fs::data_paths::data_home(env)?;
         Ok(Self {
             global_home,
             git_root,
@@ -181,12 +180,13 @@ impl SkillDirs {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::config::env::{EnvSnapshot, AWMAN_CONFIG_HOME};
+    use crate::data::config::env::EnvSnapshot;
+    use crate::data::fs::data_paths::AWMAN_HOME;
     use crate::data::fs::skill_library::{write_library_meta, SkillLibraryMeta};
 
     /// Build a `SkillDirs` whose global home is `home`, with no git root bound.
     fn skill_dirs_at(home: &Path) -> SkillDirs {
-        let env = EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, home.to_str().unwrap())]);
+        let env = EnvSnapshot::with_overrides([(AWMAN_HOME, home.to_str().unwrap())]);
         SkillDirs::from_env(&env, None).unwrap()
     }
 

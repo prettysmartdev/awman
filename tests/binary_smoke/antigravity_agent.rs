@@ -20,13 +20,9 @@ fn awman_isolated(repo: &TempDir) -> (TempDir, Command) {
     let cfg_home = TempDir::new().expect("config TempDir::new");
     let mut cmd = Command::new(awman_bin());
     cmd.current_dir(repo.path())
-        .env("AWMAN_CONFIG_HOME", cfg_home.path())
-        // Also pin the API root so the binary doesn't notice the dev
-        // machine's real `~/.awman/api/` (sessions DB etc.). Belt and braces.
-        .env("AWMAN_API_ROOT", cfg_home.path().join("api"))
-        .env_remove("AWMAN_REMOTE_ADDR")
+        .env("AWMAN_HOME", cfg_home.path())
+        // `AWMAN_HOME` also roots `api/`, `squad/` and `attach/`.
         .env_remove("AWMAN_REMOTE_SESSION")
-        .env_remove("AWMAN_API_KEY")
         .env_remove("AWMAN_OVERLAYS");
     (cfg_home, cmd)
 }
@@ -113,34 +109,5 @@ fn gemini_deprecation_warning_uses_real_commands() {
         stderr.contains("awman chat antigravity")
             || stderr.contains("awman config set agent antigravity"),
         "deprecation warning must point users at a real awman command; got:\n{stderr}"
-    );
-}
-
-// ─── antigravity --model → non-zero exit + clear error ───────────────────────
-
-/// `awman chat --agent antigravity --model gemini-3.5-flash` must exit non-zero.
-/// The error must name both "antigravity" and indicate that a model flag is
-/// not supported. Because build_options fires after agent-image checks, the
-/// most we can guarantee at the binary level is a non-zero exit; the model-
-/// flag message is verified at the unit level in engine/agent/mod.rs.
-#[test]
-fn chat_antigravity_model_flag_exits_nonzero() {
-    let repo = make_git_repo();
-    let (_cfg, mut cmd) = awman_isolated(&repo);
-    let output = cmd
-        .args([
-            "chat",
-            "--agent",
-            "antigravity",
-            "--model",
-            "gemini-3.5-flash",
-        ])
-        .output()
-        .expect("failed to run awman");
-
-    assert!(
-        !output.status.success(),
-        "`chat --agent antigravity --model` must exit non-zero; exit code: {:?}",
-        output.status.code()
     );
 }

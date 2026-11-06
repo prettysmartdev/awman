@@ -10,15 +10,22 @@ use std::process::ExitCode;
 
 use anyhow::{Context, Result};
 
-use awman::command::dispatch::catalogue::CommandCatalogue;
+use awman::command::dispatch::catalogue::{CommandCatalogue, SET_FLAG};
 use awman::command::dispatch::RuntimeContext;
 use awman::command::startup::Startup;
 use awman::data::config::env::Env;
+use awman::data::config::fields::KeyError;
+use awman::data::config::overrides::ConfigOverrides;
 use awman::engine::error::EngineError;
 use awman::frontend::cli;
 use awman::frontend::tui;
 
 fn main() -> Result<ExitCode> {
+    #[cfg(windows)]
+    awman::engine::remote::local::install_owner_pipe(
+        awman_host_shims::owner_pipe,
+        awman_host_shims::verify_client,
+    );
     if awman_host_shims::dispatch_worker(std::env::vars_os(), std::env::args_os()) {
         return Ok(ExitCode::SUCCESS);
     }
@@ -44,26 +51,52 @@ async fn frontend_main() -> Result<ExitCode> {
     let clap_cmd = CommandCatalogue::get().build_clap_command();
     let matches = clap_cmd.get_matches();
 
+    // `--set key=value` (global, repeatable): resolved against the key table
+    // and parsed by the key's type before anything reads config. A bad key or
+    // value is a usage error, like any other bad flag.
+    let overrides = match set_overrides(&matches) {
+        Ok(overrides) => overrides,
+        Err(error) => {
+            eprintln!("error: invalid value for '--set <KEY=VALUE>': {error}");
+            return Ok(ExitCode::from(2));
+        }
+    };
+
     init_tracing();
 
     let path = cli::command_path_from_matches(&matches);
     let launch = LaunchMode::from_matches(&matches);
     // The bare-squad TUI launch (`awman squad` from a TTY, no --json/
-    // --non-interactive) has a non-empty command path but still lands in the
+    // --headless) has a non-empty command path but still lands in the
     // TUI, not the CLI. `Engines::detect`'s unknown-runtime policy branches
     // on "is this path empty" as its CLI/TUI proxy (a fatal exit for CLI, a
-    // startup-modal message for TUI) — an unrelated launch-mode decision
+    // startup-modal message for TUI) — an unrelated frontend-choice decision
     // must not defeat that proxy, so the path used for detection reflects
     // the launch mode this invocation actually resolves to, not the raw
     // parsed subcommand path.
     let detect_path: Vec<String> = if launch.is_tui() { Vec::new() } else { path };
     let working_dir = std::env::current_dir().context("could not read current directory")?;
     let startup = Startup::new(detect_path);
-    let outcome = match startup.run(working_dir, Env::from_process()) {
+    let outcome = match startup.run_with_overrides(working_dir, Env::from_process(), overrides) {
         Ok(outcome) => outcome,
         Err(error) => match error.downcast::<EngineError>() {
             Ok(error) => return Ok(cli::render_startup_error(matches, error.into())),
-            Err(error) => return Err(error),
+            Err(error) => {
+                if error
+                    .downcast_ref::<awman::data::error::DataError>()
+                    .is_some_and(|e| {
+                        matches!(
+                            e,
+                            awman::data::error::DataError::ConfigParse { .. }
+                                | awman::data::error::DataError::Other(_)
+                        )
+                    })
+                {
+                    eprintln!("error: {error:#}");
+                    return Ok(ExitCode::from(2));
+                }
+                return Err(error);
+            }
         },
     };
     // Each frontend's `run` prints these: stderr in command mode, and the
@@ -84,6 +117,25 @@ async fn frontend_main() -> Result<ExitCode> {
         Some(tab) => Ok(tui::run(matches, ctx, fatal_runtime_error, tab, messages, notices).await),
         None => Ok(cli::run(matches, ctx, messages, notices).await),
     }
+}
+
+/// The global `--set` values, wherever on the command line they appeared,
+/// parsed against the key table.
+fn set_overrides(matches: &clap::ArgMatches) -> Result<ConfigOverrides, KeyError> {
+    ConfigOverrides::parse_set_args(&set_args(matches))
+}
+
+/// Raw `--set` values. clap propagates a global arg's values to every level,
+/// so the deepest subcommand's matches hold them all.
+fn set_args(matches: &clap::ArgMatches) -> Vec<String> {
+    let mut current = matches;
+    while let Some((_, sub)) = current.subcommand() {
+        current = sub;
+    }
+    current
+        .get_many::<String>(SET_FLAG)
+        .map(|values| values.cloned().collect())
+        .unwrap_or_default()
 }
 
 /// Which frontend this invocation resolves to, and — for the TUI arms —
@@ -118,7 +170,7 @@ impl LaunchMode {
 ///
 /// Without this, every `tracing::info!`/`warn!`/`error!` call in the
 /// codebase (notably the API-server startup messages in `frontend::api`)
-/// is silently dropped, which made `awman api start` look like it was
+/// is silently dropped, which made `awman daemon start` look like it was
 /// hanging until Ctrl-C. We write to stderr (so stdout stays clean for
 /// `--json` callers), default to `info`-level for awman code, and honor
 /// `RUST_LOG` for overrides. ANSI colors are auto-enabled by the `fmt`
@@ -201,7 +253,7 @@ mod tests {
             vec!["awman", "chat"],
             vec!["awman", "init"],
             vec!["awman", "exec", "workflow", "wf.toml"],
-            vec!["awman", "api", "start"],
+            vec!["awman", "daemon", "start"],
             vec!["awman", "remote", "session", "start"],
         ] {
             let m = cmd
@@ -281,5 +333,101 @@ mod tests {
         let path = command_path_from_matches(&m);
         // Clap resolves the alias to canonical `workflow`.
         assert_eq!(path, vec!["exec", "workflow"]);
+    }
+}
+
+#[cfg(test)]
+mod set_flag_tests {
+    use awman::command::dispatch::catalogue::CommandCatalogue;
+
+    fn set_args(argv: &[&str]) -> Vec<String> {
+        let m = CommandCatalogue::get()
+            .build_clap_command()
+            .try_get_matches_from(argv)
+            .unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+        super::set_args(&m)
+    }
+
+    /// `--set` is global: accepted before or after the subcommand, repeatable.
+    #[test]
+    fn set_is_accepted_anywhere_and_repeatable() {
+        assert_eq!(
+            set_args(&[
+                "awman",
+                "chat",
+                "--set",
+                "agents.launchMode=acp",
+                "--set=tui.scrollbackLines=5"
+            ]),
+            vec!["agents.launchMode=acp", "tui.scrollbackLines=5"]
+        );
+        assert_eq!(
+            set_args(&[
+                "awman",
+                "--set",
+                "agents.launchMode=acp",
+                "exec",
+                "workflow",
+                "wf.toml"
+            ]),
+            vec!["agents.launchMode=acp"]
+        );
+        assert!(set_args(&["awman", "ready"]).is_empty());
+        assert!(set_args(&["awman"]).is_empty());
+    }
+
+    #[test]
+    fn a_bad_set_is_a_key_table_error() {
+        let m = CommandCatalogue::get()
+            .build_clap_command()
+            .try_get_matches_from(["awman", "ready", "--set", "maxConcurrentAgents=2"])
+            .unwrap();
+        let err = super::set_overrides(&m).unwrap_err().to_string();
+        assert!(
+            err.contains("unknown config key `maxConcurrentAgents`"),
+            "{err}"
+        );
+    }
+
+    /// Removed per-setting flags are plain unknown flags to clap.
+    #[test]
+    fn removed_flags_fail_with_clap_unknown_argument() {
+        for argv in [
+            &["awman", "chat", "--non-interactive"][..],
+            &["awman", "chat", "--launch-mode", "acp"],
+            &[
+                "awman",
+                "exec",
+                "workflow",
+                "wf.toml",
+                "--max-concurrent",
+                "2",
+            ],
+            &["awman", "config", "migrate"],
+            &["awman", "config", "prerequisite-grants", "list"],
+            &["awman", "api", "start"],
+            &["awman", "squad", "start"],
+            &["awman", "squad", "status"],
+            &["awman", "squad", "logs"],
+            &["awman", "squad", "stop"],
+        ] {
+            let err = CommandCatalogue::get()
+                .build_clap_command()
+                .try_get_matches_from(argv)
+                .expect_err("removed surface must not parse");
+            assert!(
+                matches!(
+                    err.kind(),
+                    clap::error::ErrorKind::UnknownArgument
+                        | clap::error::ErrorKind::InvalidSubcommand
+                ),
+                "{argv:?}: {:?}",
+                err.kind()
+            );
+        }
+        let ok = CommandCatalogue::get()
+            .build_clap_command()
+            .try_get_matches_from(["awman", "chat", "-n"]);
+        assert!(ok.is_ok());
     }
 }

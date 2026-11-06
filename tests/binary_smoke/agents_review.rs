@@ -13,11 +13,7 @@ impl Fixture {
         let f = Self(tempfile::tempdir().unwrap());
         std::fs::create_dir(f.path().join("bin")).unwrap();
         std::fs::create_dir(f.path().join(".awman")).unwrap();
-        std::fs::write(
-            f.path().join(".awman/config.json"),
-            r#"{"runtime":"docker"}"#,
-        )
-        .unwrap();
+        std::fs::write(f.path().join(".awman/config.json"), r#"{}"#).unwrap();
         let script = r##"#!/bin/sh
 root=$(dirname "$(dirname "$0")")
 mode=$(cat "$root/mode" 2>/dev/null)
@@ -90,7 +86,7 @@ esac
         command
             .current_dir(self.path())
             .env("HOME", self.path())
-            .env("AWMAN_CONFIG_HOME", self.path().join(".awman"))
+            .env("AWMAN_HOME", self.path().join(".awman"))
             .env("AWMAN_TEST_ISOLATION", "1")
             .env(
                 "PATH",
@@ -297,7 +293,8 @@ fn apple_adapter_child() {
             .contains("launching awman process has exited"),
         "{err}"
     );
-    let attach_dir = std::env::var_os("AWMAN_ATTACH_DIR").unwrap();
+    let attach_dir =
+        std::path::PathBuf::from(std::env::var_os("AWMAN_HOME").unwrap()).join("attach");
     for entry in std::fs::read_dir(attach_dir).unwrap() {
         std::fs::remove_file(entry.unwrap().path()).unwrap();
     }
@@ -316,7 +313,7 @@ fn apple_adapter_child() {
 fn apple_adapter_rejects_unowned_nanoclaw_names_and_reads_dead_launcher_identity() {
     let f = Fixture::new();
     std::fs::write(f.path().join("apple.json"), r#"[{"configuration":{"id":"my-nanoclaw-production"},"status":"running"},{"configuration":{"id":"awman-example"},"status":"running"}]"#).unwrap();
-    let attach_dir = f.path().join("attach");
+    let attach_dir = f.path().join(".awman/attach");
     std::fs::create_dir(&attach_dir).unwrap();
     let hash = awman::data::fs::hash::sha256_hex("awman-example");
     std::fs::write(
@@ -328,7 +325,6 @@ fn apple_adapter_rejects_unowned_nanoclaw_names_and_reads_dead_launcher_identity
     f.env(&mut command);
     let output = command
         .env("AWMAN_REVIEW_APPLE_CHILD", "1")
-        .env("AWMAN_ATTACH_DIR", attach_dir)
         .args([
             "--exact",
             "agents_review::apple_adapter_child",
@@ -362,7 +358,7 @@ impl PtySession {
         command.args(args);
         command.cwd(fixture.path());
         command.env("HOME", fixture.path());
-        command.env("AWMAN_CONFIG_HOME", fixture.path().join(".awman"));
+        command.env("AWMAN_HOME", fixture.path().join(".awman"));
         command.env("AWMAN_TEST_ISOLATION", "1");
         command.env("TERM", "xterm");
         command.env(

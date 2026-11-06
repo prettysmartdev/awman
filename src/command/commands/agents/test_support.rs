@@ -360,7 +360,7 @@ pub(crate) struct FakeFrontend {
     pub attach_token: CancellationToken,
     /// Cancel the watch token after this many renders.
     pub cancel_after_renders: Option<usize>,
-    /// `None` → the trait default (non-interactive refusal).
+    /// `None` → the trait default (headless refusal).
     pub kill_answer: Option<KillChoice>,
 }
 

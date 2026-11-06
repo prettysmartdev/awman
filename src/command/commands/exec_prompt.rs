@@ -296,7 +296,7 @@ impl Command for ExecPromptCommand {
 
             // Emit deprecation warnings for legacy config fields.
             LaunchPolicy::for_session(&session)
-                .warn_config(&self.engines.config_notices, frontend.as_mut());
+                .warn_config(frontend.as_mut());
 
             // The Dockerfile + image setup is container-paradigm only; sandbox
             // runtimes get their per-agent kits from `awman ready` instead.
@@ -409,8 +409,8 @@ impl Command for ExecPromptCommand {
                 system_prompt,
                 context_overlays,
                 launch_mode: match launch_decision {
-                    LaunchModeDecision::Acp => crate::data::config::repo::LaunchMode::Acp,
-                    _ => crate::data::config::repo::LaunchMode::Stdio,
+                    LaunchModeDecision::Acp => crate::data::config::agents::LaunchMode::Acp,
+                    _ => crate::data::config::agents::LaunchMode::Stdio,
                 },
                 ..Default::default()
             };

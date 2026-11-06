@@ -1,4 +1,4 @@
-//! E2E: verify the `awman` binary behaves non-interactively when stdin is
+//! E2E: verify the `awman` binary behaves headlessly when stdin is
 //! not a TTY (CI/CD pipelines, cron, etc.). Replaces the stale
 //! `tests/headless_e2e.rs` which referenced the removed
 //! `awman::commands::headless::db` API.
@@ -74,7 +74,7 @@ fn exec_workflow_yolo_no_tty_exits_without_prompting() {
                     let _ = child.wait();
                     panic!(
                         "awman exec workflow --yolo hung for 10s with no TTY on stdin — \
-                         non-interactive auto-enforcement is not working"
+                         headless auto-enforcement is not working"
                     );
                 }
                 std::thread::sleep(Duration::from_millis(100));

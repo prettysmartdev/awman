@@ -3,7 +3,7 @@
 use crate::command::dispatch::catalogue::SessionWorktreeTarget;
 use crate::command::dispatch::BuildContext;
 use crate::command::error::CommandError;
-use crate::data::config::repo::LaunchMode;
+use crate::data::config::agents::LaunchMode;
 
 #[derive(Debug, Clone)]
 pub struct ChatCommandFlags {
@@ -26,17 +26,14 @@ impl super::ChatCommand {
     pub fn from_input(ctx: &BuildContext) -> Result<Self, CommandError> {
         Ok(Self::new(
             ChatCommandFlags {
-                non_interactive: ctx.flags.bool("non-interactive"),
+                non_interactive: ctx.flags.bool("headless"),
                 plan: ctx.flags.bool("plan"),
                 allow_docker: ctx.flags.bool("allow-docker"),
                 yolo: ctx.flags.bool("yolo"),
                 auto: ctx.flags.bool("auto"),
                 agent: ctx.flags.string("agent"),
                 model: ctx.flags.string("model"),
-                launch_mode: crate::command::dispatch::parse_launch_mode(
-                    ctx.flags.string("launch-mode"),
-                    &ctx.path(),
-                )?,
+                launch_mode: None, // `--set agents.launchMode=…` (WI 0139)
                 overlay: ctx.flags.strs("overlay").to_vec(),
                 agent_flags: crate::command::dispatch::parse_agent_flags(
                     ctx.flags.strs("agent-flag"),

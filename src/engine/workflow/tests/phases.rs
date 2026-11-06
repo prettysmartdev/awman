@@ -1843,7 +1843,7 @@ fn workflow_context_overlay_writable_uses_active_permission_override() {
 // `prepare_phase_failure_file` resolves the host directory via
 // `ContextDirResolver::from_process_env()`, which reads the *real* process
 // environment (there is no test-injectable `EnvSnapshot` seam on that call
-// path). These tests therefore pin `AWMAN_CONFIG_HOME` to a temp dir for
+// path). These tests therefore pin `AWMAN_HOME` to a temp dir for
 // their duration, through `ConfigHomeGuard` — the one lock over that
 // process-wide variable, which also restores the previous value on drop.
 // A mutex private to this file would serialise these six tests against each

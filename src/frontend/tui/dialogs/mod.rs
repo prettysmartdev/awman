@@ -210,12 +210,6 @@ pub enum Dialog {
     /// process; `y` builds the tab (and with it the daemon), `n`/`Esc` opens
     /// no tab at all. Never raised when a daemon is already up.
     SquadStartConfirm,
-    /// The squad daemon requires a bearer key this process does not hold: a
-    /// hash exists on disk, `AWMAN_SQUAD_KEY` is unset here, and the plaintext
-    /// key is unrecoverable. `y` mints a new key and restarts the daemon onto
-    /// it; `n`/`Esc` opens no squad tab, because one that 401s on every poll
-    /// would show nothing but that.
-    SquadKeyMissing,
     Loading {
         title: String,
     },
@@ -333,7 +327,7 @@ pub struct WorkflowControlBoardState {
     /// focused step is not part of a multi-step parallel batch.
     pub parallel_peer_count: usize,
     /// Live peers still running in the focused step's parallel group (excludes
-    /// the focused step). Non-zero disables back/finish in the WCB.
+    /// the focused step). A final yolo review can finish with peers still live.
     pub parallel_peers_running: usize,
     /// Detail lines for the failure that opened this board (exit code, signal,
     /// run duration), copied from `AvailableActions::step_failure`. Empty on an
@@ -487,7 +481,7 @@ pub struct ConfigShowRow {
     /// can find the map and list headers — and build a new member's field
     /// name from the header's own prefix — without spelling a config path
     /// (WI 0114 F-20).
-    pub shape: crate::command::commands::config::ConfigRowShape,
+    pub shape: crate::command::commands::config::ConfigRowKind,
 }
 
 /// Compute a centered rect for a dialog.

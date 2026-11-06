@@ -257,8 +257,8 @@ async fn real_network_session_request_validation_over_http_returns_400() {
         let error = response["error"].as_str().unwrap_or_default();
         assert!(error.contains(expected), "{body} → {error}");
     }
-    let sessions = server.get("/v1/sessions").await;
-    assert_eq!(sessions["sessions"].as_array().map(Vec::len), Some(0));
+    let sessions = server.get("/v1/worker/sessions").await;
+    assert_eq!(sessions["items"].as_array().map(Vec::len), Some(0));
 }
 
 #[tokio::test(flavor = "multi_thread")]

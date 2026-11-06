@@ -1,4 +1,4 @@
-//! Single choke-point for every non-interactive `sbx` subprocess awman runs.
+//! Single choke-point for every headless `sbx` subprocess awman runs.
 //!
 //! Implements the "Subprocess transparency via the user message sink"
 //! requirement from WI 0090: announce the argv before spawning, publish

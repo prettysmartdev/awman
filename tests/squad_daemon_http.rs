@@ -1,24 +1,14 @@
-//! WI 0101 — the squad daemon's HTTP surface.
+//! The squad feature's HTTP surface (`/v1/squad/*`) on the unified daemon.
 //!
-//! Boots the real daemon via the injectable Layer 2 bootstrap
-//! (`SquadDaemonHandles::bootstrap`) plus `frontend::squad::serve`, on an
-//! ephemeral loopback port, drives it with `reqwest`, and tears down by
-//! aborting the task — mirroring `tests/api_parity/live_server.rs`'s
-//! established pattern for this codebase's other HTTP daemon.
-//!
-//! The bootstrap reads `AWMAN_CONFIG_HOME` (and friends) from the real process
-//! environment (`Env::from_process()` is hardcoded inside it), so every test
-//! here scopes that env var for its duration under a shared lock — the same
-//! technique `tests/data_layer/rename_0077.rs` and
-//! `tests/overlays_integration.rs` already use for env-mutating tests.
+//! Each test boots a real `awman daemon start` process with only the squad
+//! feature enabled (fake `docker` on its PATH, throwaway `AWMAN_HOME`) and
+//! drives it over HTTP through the loopback proxy `ApiServer` provides to the
+//! owner-only local socket. The daemon's own log is read back from the
+//! process output for the "no value ever reaches a log line" assertions.
 
 use std::sync::Arc;
-use std::time::Duration;
 
-use awman::command::commands::squad::commands::SquadServeConfig;
-use awman::command::commands::squad::daemon_runtime::SquadDaemonHandles;
 use awman::command::dispatch::Engines;
-use awman::data::fs::daemon_process::{DaemonProcess, SQUAD_PLIST_LABEL, SQUAD_UNIT_NAME};
 use awman::data::fs::{ApiPaths, AuthPathResolver, SquadPaths};
 use awman::data::WorkflowStateStore;
 use awman::engine::agent::AgentEngine;
@@ -26,22 +16,15 @@ use awman::engine::auth::AuthEngine;
 use awman::engine::container::ContainerRuntime;
 use awman::engine::git::GitEngine;
 use awman::engine::overlay::OverlayEngine;
-use awman::engine::squad::{EvaluationOutcome, EvaluationRequest, TaskEvaluator};
 use tokio::sync::Mutex;
 
-#[path = "helpers/in_process_daemon.rs"]
-mod in_process_daemon;
-use in_process_daemon::{EnvOverride, InProcessDaemon};
+#[path = "helpers/api_process.rs"]
+mod api_process;
+use api_process::{ApiHome, ApiServer};
 
+/// Serialises the tests that touch process-global state (the in-process
+/// gateway tests below); daemon tests run in their own process.
 static ENV_LOCK: Mutex<()> = Mutex::const_new(());
-
-struct NeverTriggeredEvaluator;
-#[async_trait::async_trait]
-impl TaskEvaluator for NeverTriggeredEvaluator {
-    async fn evaluate(&self, _request: EvaluationRequest) -> EvaluationOutcome {
-        EvaluationOutcome::NotTriggered { reason: None }
-    }
-}
 
 fn engines_with(container_runtime: Arc<ContainerRuntime>, root: &std::path::Path) -> Engines {
     let api_paths = ApiPaths::from_root(root);
@@ -55,373 +38,68 @@ fn engines_with(container_runtime: Arc<ContainerRuntime>, root: &std::path::Path
         overlay_engine: overlay_engine.clone(),
         auth_engine: Arc::new(AuthEngine::with_paths(auth_paths, api_paths.clone())),
         agent_engine: Arc::new(AgentEngine::new(overlay_engine, container_runtime)),
-        config_notices: Default::default(),
         workflow_state_store: Arc::new(WorkflowStateStore::at_git_root(api_paths.root())),
         credential_monitor: None,
-        global_config: std::sync::Arc::new(Default::default()),
+        global_config: std::sync::Arc::new(
+            awman::data::config::file::ConfigFile::load(
+                &root.join("config.json"),
+                awman::data::config::FileKind::Global,
+            )
+            .unwrap(),
+        ),
     }
 }
 
-/// Sets `AWMAN_CONFIG_HOME` to `root`, starts the daemon in a background
-/// task, and polls for its published metadata. Returns the daemon and the
-/// resolved `http://127.0.0.1:<port>` base URL. The previous env var value is
-/// restored only once the daemon is aborted (or dropped by a panicking test):
-/// the daemon resolves paths from it while it serves.
-async fn start_daemon(
-    root: &std::path::Path,
-    container_runtime: Arc<ContainerRuntime>,
-) -> (InProcessDaemon, String) {
-    start_daemon_with(root, container_runtime, Arc::new(NeverTriggeredEvaluator)).await
+/// A running daemon plus the fixtures that keep it alive.
+struct Daemon {
+    _home: ApiHome,
+    server: ApiServer,
 }
 
-/// The same bootstrap with a caller-supplied evaluator, for the tests that
-/// need an evaluation to actually be in flight.
-async fn start_daemon_with(
-    root: &std::path::Path,
-    container_runtime: Arc<ContainerRuntime>,
-    evaluator: Arc<dyn TaskEvaluator>,
-) -> (InProcessDaemon, String) {
-    // A test daemon must never reach the developer's real OS keychain. The
-    // stored item is a single fixed `awman-squad`/`daemon-env` pair — it is not
-    // keyed by storage root — so an isolated `AWMAN_CONFIG_HOME` does *not*
-    // isolate it: a daemon booted here with the default `envPersistence:
-    // "keychain"` would overwrite the item a real daemon on this machine is
-    // using, with this test's fixture values. Default every test daemon to the
-    // explicit opt-out, and let a test that wants a different setting write its
-    // own config first.
+impl Daemon {
+    fn log(&self) -> String {
+        self.server.log()
+    }
+
+    fn abort(self) {}
+}
+
+/// Boot a squad-only daemon whose data and config live under `root`
+/// (`AWMAN_HOME`); a test may write `root/config.json` first. Returns the
+/// daemon and its base URL.
+async fn start_daemon(root: &std::path::Path) -> (Daemon, String) {
+    // A test daemon must never reach a real keychain: default to the explicit
+    // opt-out unless the test wrote its own config.
     if !root.join("config.json").exists() {
         write_squad_config(root, "none");
     }
-
-    let engines = engines_with(container_runtime, root);
-    let config = SquadServeConfig {
-        port: 0,
-        dangerously_skip_auth: true,
-    };
-
-    let env = EnvOverride::set(&[("AWMAN_CONFIG_HOME", root.as_os_str())]);
-
-    // WI 0113 F-02: Layer 2 bootstraps the daemon, Layer 3 serves it. This is
-    // the same seam `serve_with` was, split across the layer boundary.
-    let handle = tokio::spawn(async move {
-        let handles = SquadDaemonHandles::bootstrap(config, engines, evaluator)
-            .await
-            .expect("squad daemon bootstrap");
-        let _ = awman::frontend::squad::serve(handles).await;
-    });
-
-    let daemon = DaemonProcess::new(
-        SquadPaths::from_root(root.join("squad")).daemon(),
-        SQUAD_UNIT_NAME,
-        SQUAD_PLIST_LABEL,
-    );
-    let mut waited = Duration::ZERO;
-    let meta = loop {
-        if let Ok(Some(meta)) = daemon.read_meta() {
-            break meta;
-        }
-        if waited >= Duration::from_secs(10) {
-            panic!("squad daemon never published its server metadata");
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        waited += Duration::from_millis(50);
-    };
-
+    let home = ApiHome::new();
+    let server = home
+        .start_with_env(&[("AWMAN_HOME", root.to_str().unwrap())])
+        .await;
+    let base = server.url.clone();
     (
-        InProcessDaemon::new(handle, env),
-        format!("{}://{}:{}", meta.scheme, meta.bind_ip, meta.port),
+        Daemon {
+            _home: home,
+            server,
+        },
+        base,
     )
 }
 
-// ─── Startup succeeds under both Docker and Apple, no tier branching ────────
+// ─── Startup ─────────────────────────────────────────────────────────────────
 
 #[tokio::test]
-async fn daemon_startup_succeeds_under_docker_and_apple_with_no_tier_branching() {
-    let _env_guard = ENV_LOCK.lock().await;
-
-    for runtime in [
-        Arc::new(ContainerRuntime::docker()),
-        Arc::new(ContainerRuntime::apple()),
-    ] {
-        let name = runtime.runtime_name();
-        let tmp = tempfile::tempdir().unwrap();
-        let (handle, base) = start_daemon(tmp.path(), runtime).await;
-
-        let resp = reqwest::get(format!("{base}/v1/status"))
-            .await
-            .unwrap_or_else(|e| panic!("{name}: status request must succeed: {e}"));
-        assert_eq!(
-            resp.status(),
-            200,
-            "{name}: /v1/status must succeed identically regardless of container tier"
-        );
-        let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body["running"], true);
-
-        handle.abort();
-    }
-}
-
-// ─── POST /v1/commands rejections ────────────────────────────────────────────
-
-#[tokio::test]
-async fn post_commands_rejects_non_squad_subcommand() {
-    let _env_guard = ENV_LOCK.lock().await;
+async fn squad_only_daemon_reports_the_squad_feature_running() {
     let tmp = tempfile::tempdir().unwrap();
-    let (handle, base) = start_daemon(tmp.path(), Arc::new(ContainerRuntime::docker())).await;
+    let (handle, base) = start_daemon(tmp.path()).await;
 
-    let resp = reqwest::Client::new()
-        .post(format!("{base}/v1/commands"))
-        .json(&serde_json::json!({"subcommand": "exec workflow", "args": []}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 400);
-    let body: serde_json::Value = resp.json().await.unwrap();
-    // The refusal is now the catalogue's standard
-    // `NotAvailableForFrontend`, raised under `FrontendKind::SquadDaemon`
-    // (WI 0114 F-50) rather than a literal path comparison in the router.
-    let error = body["error"].as_str().unwrap();
-    assert!(
-        error.contains("exec workflow") && error.contains("squad daemon"),
-        "error must name the command and the frontend that refuses it: {body}"
-    );
-
-    handle.abort();
-}
-
-#[tokio::test]
-async fn post_commands_rejects_unknown_flag_with_catalogue_error_shape() {
-    let _env_guard = ENV_LOCK.lock().await;
-    let tmp = tempfile::tempdir().unwrap();
-    let (handle, base) = start_daemon(tmp.path(), Arc::new(ContainerRuntime::docker())).await;
-
-    let resp = reqwest::Client::new()
-        .post(format!("{base}/v1/commands"))
-        .json(&serde_json::json!({
-            "subcommand": "squad add",
-            "args": ["--this-flag-does-not-exist", "value"],
-        }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 400);
-    let body: serde_json::Value = resp.json().await.unwrap();
-    assert!(
-        body.get("error")
-            .and_then(|v| v.as_str())
-            .is_some_and(|s| !s.is_empty()),
-        "unknown-flag rejection must use the shared {{\"error\": \"...\"}} envelope: {body}"
-    );
-
-    handle.abort();
-}
-
-#[tokio::test]
-async fn attach_is_refused_by_the_catalogue_even_though_it_exists_for_cli_tui() {
-    let _env_guard = ENV_LOCK.lock().await;
-    let tmp = tempfile::tempdir().unwrap();
-    let (handle, base) = start_daemon(tmp.path(), Arc::new(ContainerRuntime::docker())).await;
-
-    let resp = reqwest::Client::new()
-        .post(format!("{base}/v1/commands"))
-        .json(&serde_json::json!({"subcommand": "squad attach", "args": ["some-task"]}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(
-        resp.status(),
-        400,
-        "`squad attach` is api_allowed: false in the catalogue and must be refused"
-    );
-
-    handle.abort();
-}
-
-// ─── Loopback-only bind ──────────────────────────────────────────────────────
-
-/// This host's own non-loopback IPv4 address, discovered without sending a
-/// packet: connecting a UDP socket only sets the kernel's route, and
-/// `local_addr` then reports the interface it chose. Returns `None` on a host
-/// with no outbound route (a fully isolated container), where the property
-/// below cannot be observed.
-fn non_loopback_local_ip() -> Option<std::net::IpAddr> {
-    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
-    socket.connect("203.0.113.1:9").ok()?;
-    let ip = socket.local_addr().ok()?.ip();
-    (!ip.is_loopback() && !ip.is_unspecified()).then_some(ip)
-}
-
-#[tokio::test]
-async fn daemon_binds_loopback_only() {
-    let _env_guard = ENV_LOCK.lock().await;
-    let tmp = tempfile::tempdir().unwrap();
-    let (handle, base) = start_daemon(tmp.path(), Arc::new(ContainerRuntime::docker())).await;
-
-    assert!(
-        base.starts_with("http://127.0.0.1:"),
-        "squad always binds 127.0.0.1 regardless of any configuration input: {base}"
-    );
-
-    // The published metadata is the daemon's own record of what it bound;
-    // corroborate it actually answers there.
     let resp = reqwest::get(format!("{base}/v1/status")).await.unwrap();
     assert_eq!(resp.status(), 200);
-
-    let port: u16 = base
-        .rsplit(':')
-        .next()
-        .and_then(|p| p.parse().ok())
-        .expect("the published endpoint must carry a port");
-
-    // The same port on this host's *external* interface must not accept a
-    // connection at all — the socket is bound to 127.0.0.1, not 0.0.0.0.
-    match non_loopback_local_ip() {
-        Some(ip) => {
-            let addr = std::net::SocketAddr::new(ip, port);
-            let refused = tokio::task::spawn_blocking(move || {
-                std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(2))
-            })
-            .await
-            .unwrap();
-            assert!(
-                refused.is_err(),
-                "the daemon must not answer on the non-loopback interface {ip}:{port}"
-            );
-        }
-        None => eprintln!("SKIP (partial): host has no non-loopback IPv4 interface to probe"),
-    }
-
-    handle.abort();
-}
-
-// ─── The live workflow-state route ──────────────────────────────────────────
-
-/// An evaluator that stands in for a triggered task whose generated
-/// workflow is *currently executing*: it persists a real `WorkflowState`
-/// through the engine's own `WorkflowStateStore`, reports the resulting path
-/// through the `RunProgress` seam (exactly as `LocalTaskEvaluator` does
-/// before it hands off to `ExecWorkflowCommand`), then parks so the run row
-/// stays `running` while the test queries the route.
-struct WorkflowInFlightEvaluator {
-    state_dir: std::path::PathBuf,
-    started: tokio::sync::mpsc::UnboundedSender<()>,
-    release: Arc<tokio::sync::Notify>,
-}
-
-#[async_trait::async_trait]
-impl TaskEvaluator for WorkflowInFlightEvaluator {
-    async fn evaluate(&self, request: EvaluationRequest) -> EvaluationOutcome {
-        let steps = vec![awman::data::workflow_definition::WorkflowStep {
-            name: "analyze".to_string(),
-            depends_on: Vec::new(),
-            prompt_template: "analyze the issue".to_string(),
-            agent: Some("claude".to_string()),
-            model: None,
-            overlays: None,
-            abort_on_failure: false,
-        }];
-        let state = awman::data::workflow_state::WorkflowState::new(
-            "squad-generated".to_string(),
-            &steps,
-            "deadbeef".to_string(),
-            None,
-        );
-        let store = WorkflowStateStore::at_git_root(&self.state_dir);
-        let state_path = store.save(&state).expect("persisting workflow state");
-
-        let workflow_path = request.task_dir.join("workflow.toml");
-        request
-            .progress
-            .workflow_started(&request.run_id, &workflow_path, &state_path);
-
-        let _ = self.started.send(());
-        // Park while the run row is still `running`, which is the only window
-        // in which the route is supposed to answer.
-        self.release.notified().await;
-
-        EvaluationOutcome::WorkflowExecuted {
-            reason: None,
-            workflow_path,
-            workflow_state_path: Some(state_path),
-            exit_code: Some(0),
-        }
-    }
-}
-
-#[tokio::test]
-async fn the_workflow_route_serves_the_live_state_verbatim_while_a_run_is_in_flight() {
-    let _env_guard = ENV_LOCK.lock().await;
-    let tmp = tempfile::tempdir().unwrap();
-
-    // A task that is immediately due, seeded straight into the shared
-    // database the daemon is about to open.
-    let db = tmp.path().join("data").join("awman.db");
-    std::fs::create_dir_all(db.parent().unwrap()).unwrap();
-    let store = awman::data::fs::TaskStore::open(&db).unwrap();
-    store.migrate().unwrap();
-    let now = chrono::Utc::now();
-    store
-        .create(&awman::data::fs::Task {
-            prerequisites: None,
-            id: uuid::Uuid::new_v4().to_string(),
-            name: "issue-triage".into(),
-            description: "watch new issues".into(),
-            repo_scope: tmp.path().to_path_buf(),
-            mount_scope: awman::data::fs::MountScope::GitRoot,
-            overlays: Vec::new(),
-            interval_secs: 60,
-            status: awman::data::fs::TaskStatus::Active,
-            agent: None,
-            model: None,
-            backoff_until: None,
-            created_at: now,
-            updated_at: now,
-            last_run_at: None,
-            trigger_requested_at: None,
-            last_run_status: None,
-            unmet_env: Vec::new(),
-        })
-        .unwrap();
-    drop(store);
-
-    let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
-    let release = Arc::new(tokio::sync::Notify::new());
-    let evaluator = Arc::new(WorkflowInFlightEvaluator {
-        state_dir: tmp.path().join("state"),
-        started: started_tx,
-        release: release.clone(),
-    });
-
-    let (handle, base) =
-        start_daemon_with(tmp.path(), Arc::new(ContainerRuntime::docker()), evaluator).await;
-
-    // Wait for the scheduler's first tick to reach the evaluator.
-    tokio::time::timeout(Duration::from_secs(10), started_rx.recv())
-        .await
-        .expect("the scheduler must dispatch the due task on its first tick")
-        .expect("evaluator must signal that the workflow started");
-
-    let resp = reqwest::get(format!("{base}/v1/tasks/issue-triage/workflow"))
-        .await
-        .unwrap();
-    assert_eq!(
-        resp.status(),
-        200,
-        "the route must serve the live workflow state while the run is in flight"
-    );
     let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["features"]["squad"]["state"], "on", "{body}");
+    assert_eq!(body["features"]["worker"]["state"], "off", "{body}");
 
-    // The contract is the *verbatim* `WorkflowState`, no projection or DTO —
-    // a client must be able to deserialize it straight back into the type.
-    let round_tripped: awman::data::workflow_state::WorkflowState =
-        serde_json::from_value(body.clone())
-            .expect("the route must return a WorkflowState verbatim, not a projection");
-    assert_eq!(round_tripped.workflow_name, "squad-generated");
-    assert_eq!(round_tripped.workflow_hash, "deadbeef");
-    assert!(round_tripped.step_states.contains_key("analyze"));
-
-    release.notify_waiters();
     handle.abort();
 }
 
@@ -441,53 +119,6 @@ async fn the_workflow_route_serves_the_live_state_verbatim_while_a_run_is_in_fli
 const SECRET: &str = "wi0116-secret-must-never-appear";
 const ROTATED_SECRET: &str = "wi0116-rotated-must-never-appear";
 const STRAY_SECRET: &str = "wi0116-stray-must-never-appear";
-
-/// Everything this test binary's daemons wrote to `tracing`, for the
-/// "a rejected request logs no values either" assertion. Installed once,
-/// globally, because the daemon under test runs inside this same process and a
-/// thread-local subscriber would not see the axum handler's task.
-static CAPTURED_LOG: std::sync::Mutex<Vec<u8>> = std::sync::Mutex::new(Vec::new());
-
-#[derive(Clone, Default)]
-struct LogSink;
-
-impl std::io::Write for LogSink {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        CAPTURED_LOG.lock().unwrap().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogSink {
-    type Writer = LogSink;
-    fn make_writer(&'a self) -> Self::Writer {
-        LogSink
-    }
-}
-
-/// Install the capturing subscriber for the whole test binary. Idempotent: a
-/// second call is a no-op, and a failure (another subscriber already global)
-/// leaves the log assertions vacuous rather than failing the run.
-fn capture_daemon_logs() {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(LogSink)
-            .with_ansi(false)
-            .with_max_level(tracing::Level::TRACE)
-            .finish();
-        let _ = tracing::subscriber::set_global_default(subscriber);
-    });
-}
-
-fn captured_log() -> String {
-    String::from_utf8_lossy(&CAPTURED_LOG.lock().unwrap()).into_owned()
-}
-
-/// Assert that `text` carries none of this module's sentinels. Used on every
 /// response body and on the daemon log.
 fn assert_carries_no_value(text: &str, what: &str) {
     for secret in [SECRET, ROTATED_SECRET, STRAY_SECRET] {
@@ -514,7 +145,7 @@ fn seed_task_for_agent(root: &std::path::Path, name: &str, overlays: &[&str], ag
     store
         .create(&awman::data::fs::Task {
             prerequisites: None,
-            id: uuid::Uuid::new_v4().to_string(),
+            id: awman::data::ids::TaskId::new(),
             name: name.into(),
             description: "seeded for the env protocol tests".into(),
             repo_scope: root.to_path_buf(),
@@ -533,66 +164,6 @@ fn seed_task_for_agent(root: &std::path::Path, name: &str, overlays: &[&str], ag
             unmet_env: Vec::new(),
         })
         .unwrap();
-}
-
-/// Start the daemon with bearer auth **on**, returning the plaintext key.
-/// `AuthMode::resolve_for_daemon` demands a hash already on disk, so one is
-/// written before the bootstrap — exactly what `squad start` does for itself.
-async fn start_daemon_with_auth(root: &std::path::Path) -> (InProcessDaemon, String, String) {
-    let key = awman::engine::auth::ApiKey::from_string(
-        "d0d0cafe00000000000000000000000000000000000000000000000000000000",
-    );
-    let auth = awman::engine::auth::AuthEngine::with_paths(
-        AuthPathResolver::at_home(root),
-        ApiPaths::from_root(root),
-    );
-    let hash = auth.hash_api_key(&key);
-    let squad_paths = SquadPaths::from_root(root.join("squad"));
-    std::fs::create_dir_all(squad_paths.daemon().root()).ok();
-    squad_paths
-        .daemon()
-        .write_key_hash(hash.as_str())
-        .expect("the daemon's key hash must be writable");
-
-    let engines = engines_with(Arc::new(ContainerRuntime::docker()), root);
-    let config = SquadServeConfig {
-        port: 0,
-        dangerously_skip_auth: false,
-    };
-    let env = EnvOverride::set(&[("AWMAN_CONFIG_HOME", root.as_os_str())]);
-    let handle = tokio::spawn(async move {
-        let handles =
-            SquadDaemonHandles::bootstrap(config, engines, Arc::new(NeverTriggeredEvaluator))
-                .await
-                .expect("squad daemon bootstrap");
-        let _ = awman::frontend::squad::serve(handles).await;
-    });
-    let base = wait_for_endpoint(root).await;
-    (
-        InProcessDaemon::new(handle, env),
-        base,
-        key.as_str().to_string(),
-    )
-}
-
-/// Poll the daemon's endpoint sidecar until it publishes one.
-async fn wait_for_endpoint(root: &std::path::Path) -> String {
-    let daemon = DaemonProcess::new(
-        SquadPaths::from_root(root.join("squad")).daemon(),
-        SQUAD_UNIT_NAME,
-        SQUAD_PLIST_LABEL,
-    );
-    let mut waited = Duration::ZERO;
-    loop {
-        if let Ok(Some(meta)) = daemon.read_meta() {
-            return format!("{}://{}:{}", meta.scheme, meta.bind_ip, meta.port);
-        }
-        if waited >= Duration::from_secs(10) {
-            panic!("squad daemon never published its server metadata");
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        waited += Duration::from_millis(50);
-    }
 }
 
 /// One request, returning the status and the **raw body text** — the shape
@@ -618,13 +189,13 @@ async fn request(
 async fn env_get(base: &str, key: Option<&str>) -> serde_json::Value {
     let (status, text) = request(
         reqwest::Method::GET,
-        &format!("{base}/v1/daemon/env"),
+        &format!("{base}/v1/squad/env"),
         key,
         None,
     )
     .await;
-    assert_eq!(status, 200, "GET /v1/daemon/env: {text}");
-    assert_carries_no_value(&text, "GET /v1/daemon/env");
+    assert_eq!(status, 200, "GET /v1/squad/env: {text}");
+    assert_carries_no_value(&text, "GET /v1/squad/env");
     serde_json::from_str(&text).expect("coverage must be JSON")
 }
 
@@ -634,8 +205,8 @@ async fn env_push(
     body: serde_json::Value,
 ) -> (u16, String, serde_json::Value) {
     let (status, text) = request(
-        reqwest::Method::POST,
-        &format!("{base}/v1/daemon/env"),
+        reqwest::Method::PUT,
+        &format!("{base}/v1/squad/env"),
         key,
         Some(body),
     )
@@ -654,71 +225,12 @@ fn entry<'a>(coverage: &'a serde_json::Value, name: &str) -> Option<&'a serde_js
         .find(|entry| entry["name"] == name)
 }
 
-// ─── §4: auth, the accepted/ignored split, and the negative property ────────
-
-/// The route sits behind the same `auth_middleware` as every other squad
-/// route: a push with no bearer key is refused before it reaches the handler,
-/// so a value cannot be planted in a daemon by anything that merely found the
-/// port.
-#[tokio::test]
-async fn daemon_env_push_requires_the_bearer_key() {
-    let _env_guard = ENV_LOCK.lock().await;
-    capture_daemon_logs();
-    let tmp = tempfile::tempdir().unwrap();
-    seed_task(tmp.path(), "nightly", &["env(AUTH_TOKEN)"]);
-    let (handle, base, key) = start_daemon_with_auth(tmp.path()).await;
-
-    let (status, text, _) = env_push(
-        &base,
-        None,
-        serde_json::json!({"vars": {"AUTH_TOKEN": SECRET}}),
-    )
-    .await;
-    assert_eq!(
-        status, 401,
-        "an unauthenticated push must be refused: {text}"
-    );
-    assert_carries_no_value(&text, "the 401 body");
-
-    let (status, text, _) = env_push(
-        &base,
-        Some("not-the-key"),
-        serde_json::json!({"vars": {"AUTH_TOKEN": SECRET}}),
-    )
-    .await;
-    assert_eq!(status, 401, "a wrong key must be refused: {text}");
-
-    // GET and DELETE are behind the same middleware.
-    for method in [reqwest::Method::GET, reqwest::Method::DELETE] {
-        let (status, _) =
-            request(method.clone(), &format!("{base}/v1/daemon/env"), None, None).await;
-        assert_eq!(status, 401, "{method} /v1/daemon/env must require the key");
-    }
-
-    // The same request with the key succeeds, so the 401s above are auth and
-    // not a broken route.
-    let (status, text, body) = env_push(
-        &base,
-        Some(&key),
-        serde_json::json!({"vars": {"AUTH_TOKEN": SECRET}}),
-    )
-    .await;
-    assert_eq!(status, 200, "an authenticated push must succeed: {text}");
-    assert_eq!(body["accepted"], serde_json::json!(["AUTH_TOKEN"]));
-
-    handle.abort();
-}
-
-/// A push reports the names it took and the names it refused — and nothing
-/// else. `STRAY` is outside `required_env`, so it is `ignored` rather than
-/// stored: a daemon never accumulates values it has no declared use for.
 #[tokio::test]
 async fn daemon_env_push_reports_accepted_names_only_and_its_body_carries_no_value() {
     let _env_guard = ENV_LOCK.lock().await;
-    capture_daemon_logs();
     let tmp = tempfile::tempdir().unwrap();
     seed_task(tmp.path(), "nightly", &["env(ACCEPTED_TOKEN)"]);
-    let (handle, base) = start_daemon(tmp.path(), Arc::new(ContainerRuntime::docker())).await;
+    let (handle, base) = start_daemon(tmp.path()).await;
 
     let (status, text, body) = env_push(
         &base,
@@ -736,7 +248,7 @@ async fn daemon_env_push_reports_accepted_names_only_and_its_body_carries_no_val
     // The whole point of the route: assert on the serialised JSON, because a
     // typed struct with no value field proves nothing about what the
     // *serializer* emitted.
-    assert_carries_no_value(&text, "the POST /v1/daemon/env body");
+    assert_carries_no_value(&text, "the POST /v1/squad/env body");
 
     // The embedded coverage reports the name and a digest, and the digest is
     // not the value: 16 hex chars, whatever the value's length.
@@ -760,10 +272,9 @@ async fn daemon_env_push_reports_accepted_names_only_and_its_body_carries_no_val
 #[tokio::test]
 async fn a_malformed_daemon_env_push_echoes_neither_the_body_nor_a_serde_message() {
     let _env_guard = ENV_LOCK.lock().await;
-    capture_daemon_logs();
     let tmp = tempfile::tempdir().unwrap();
     seed_task(tmp.path(), "nightly", &["env(MALFORMED_TOKEN)"]);
-    let (handle, base) = start_daemon(tmp.path(), Arc::new(ContainerRuntime::docker())).await;
+    let (handle, base) = start_daemon(tmp.path()).await;
 
     // A non-string value: serde rejects it, and the default rejection text
     // would quote `{"vars":{"MALFORMED_TOKEN":"<the value>"}}`.
@@ -783,7 +294,7 @@ async fn a_malformed_daemon_env_push_echoes_neither_the_body_nor_a_serde_message
 
     // …and the daemon's own log — which is what `awman squad logs` prints —
     // carries no part of it either.
-    let log = captured_log();
+    let log = handle.log();
     assert_carries_no_value(&log, "the daemon log");
     assert!(
         log.contains("rejected a malformed daemon env push"),
@@ -807,14 +318,13 @@ async fn a_malformed_daemon_env_push_echoes_neither_the_body_nor_a_serde_message
 #[tokio::test]
 async fn an_all_absent_push_leaves_every_existing_value_in_place() {
     let _env_guard = ENV_LOCK.lock().await;
-    capture_daemon_logs();
     let tmp = tempfile::tempdir().unwrap();
     seed_task(
         tmp.path(),
         "nightly",
         &["env(ABSENT_ONE)", "env(ABSENT_TWO)"],
     );
-    let (handle, base) = start_daemon(tmp.path(), Arc::new(ContainerRuntime::docker())).await;
+    let (handle, base) = start_daemon(tmp.path()).await;
 
     // An armed daemon: two names, both provided.
     let (status, _, _) = env_push(
@@ -871,10 +381,9 @@ async fn an_all_absent_push_leaves_every_existing_value_in_place() {
 #[tokio::test]
 async fn a_provided_value_replaces_an_existing_one_and_an_absent_never_removes_it() {
     let _env_guard = ENV_LOCK.lock().await;
-    capture_daemon_logs();
     let tmp = tempfile::tempdir().unwrap();
     seed_task(tmp.path(), "nightly", &["env(ROTATE_TOKEN)"]);
-    let (handle, base) = start_daemon(tmp.path(), Arc::new(ContainerRuntime::docker())).await;
+    let (handle, base) = start_daemon(tmp.path()).await;
 
     env_push(
         &base,
@@ -933,12 +442,11 @@ async fn a_provided_value_replaces_an_existing_one_and_an_absent_never_removes_i
 #[tokio::test]
 async fn a_name_leaving_required_env_takes_its_value_with_it() {
     let _env_guard = ENV_LOCK.lock().await;
-    capture_daemon_logs();
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().join("repo");
     std::fs::create_dir_all(&repo).unwrap();
     seed_task(tmp.path(), "nightly", &["env(GC_TOKEN)"]);
-    let (handle, base) = start_daemon(tmp.path(), Arc::new(ContainerRuntime::docker())).await;
+    let (handle, base) = start_daemon(tmp.path()).await;
 
     env_push(
         &base,
@@ -950,13 +458,13 @@ async fn a_name_leaving_required_env_takes_its_value_with_it() {
 
     // Drop the only task that declares it.
     let (status, _) = request(
-        reqwest::Method::POST,
-        &format!("{base}/v1/commands"),
+        reqwest::Method::DELETE,
+        &format!("{base}/v1/squad/tasks/{}", task_id(&base, "nightly").await),
         None,
-        Some(serde_json::json!({"subcommand": "squad remove", "args": ["nightly"]})),
+        None,
     )
     .await;
-    assert_eq!(status, 200);
+    assert_eq!(status, 204);
 
     let after = env_get(&base, None).await;
     assert!(
@@ -968,22 +476,12 @@ async fn a_name_leaving_required_env_takes_its_value_with_it() {
     // with the name, not merely hidden from the report.
     let (status, text) = request(
         reqwest::Method::POST,
-        &format!("{base}/v1/commands"),
+        &format!("{base}/v1/squad/tasks"),
         None,
-        Some(serde_json::json!({
-            "subcommand": "squad add",
-            "args": [
-                "--name", "nightly-again",
-                "--description", "re-declares the same variable",
-                "--repo", repo.to_str().unwrap(),
-                "--interval", "3600",
-                "--mount-scope", "gitroot",
-                "--overlay", "env(GC_TOKEN)",
-            ],
-        })),
+        Some(serde_json::json!({"name":"nightly-again","description":"re-declares the same variable","workspace":{"kind":"custom","path":repo},"mount_scope":"cwd","interval_ms":3600000,"overlays":["env(GC_TOKEN)"]})),
     )
     .await;
-    assert_eq!(status, 200, "{text}");
+    assert_eq!(status, 201, "{text}");
     let readded = env_get(&base, None).await;
     let entry = entry(&readded, "GC_TOKEN").expect("the name is required again");
     assert!(
@@ -1001,10 +499,9 @@ async fn a_name_leaving_required_env_takes_its_value_with_it() {
 #[tokio::test]
 async fn an_empty_string_value_is_treated_exactly_as_absent() {
     let _env_guard = ENV_LOCK.lock().await;
-    capture_daemon_logs();
     let tmp = tempfile::tempdir().unwrap();
     seed_task(tmp.path(), "nightly", &["env(EMPTY_TOKEN)"]);
-    let (handle, base) = start_daemon(tmp.path(), Arc::new(ContainerRuntime::docker())).await;
+    let (handle, base) = start_daemon(tmp.path()).await;
 
     // On an empty daemon: neither accepted nor ignored, and nothing is held.
     let (status, text, body) = env_push(
@@ -1054,10 +551,9 @@ async fn an_empty_string_value_is_treated_exactly_as_absent() {
 #[tokio::test]
 async fn no_endpoint_the_env_protocol_touches_returns_a_payload_value() {
     let _env_guard = ENV_LOCK.lock().await;
-    capture_daemon_logs();
     let tmp = tempfile::tempdir().unwrap();
     seed_task(tmp.path(), "nightly", &["env(SCAN_TOKEN)"]);
-    let (handle, base) = start_daemon(tmp.path(), Arc::new(ContainerRuntime::docker())).await;
+    let (handle, base) = start_daemon(tmp.path()).await;
 
     env_push(
         &base,
@@ -1068,38 +564,29 @@ async fn no_endpoint_the_env_protocol_touches_returns_a_payload_value() {
 
     let mut bodies: Vec<(String, String)> = Vec::new();
     for (method, path) in [
-        (reqwest::Method::GET, "/v1/daemon/env"),
+        (reqwest::Method::GET, "/v1/squad/env"),
         (reqwest::Method::GET, "/v1/status"),
-        (reqwest::Method::DELETE, "/v1/daemon/env"),
+        (reqwest::Method::DELETE, "/v1/squad/env"),
     ] {
         let (status, text) = request(method.clone(), &format!("{base}{path}"), None, None).await;
         assert_eq!(status, 200, "{method} {path}: {text}");
         bodies.push((format!("{method} {path}"), text));
     }
-    for subcommand in ["squad list", "squad status"] {
-        let (_, text) = request(
-            reqwest::Method::POST,
-            &format!("{base}/v1/commands"),
-            None,
-            Some(serde_json::json!({"subcommand": subcommand, "args": []})),
-        )
-        .await;
-        bodies.push((subcommand.to_string(), text));
+    for path in [
+        "/v1/squad/tasks".to_string(),
+        format!("/v1/squad/tasks/{}", task_id(&base, "nightly").await),
+    ] {
+        let (status, text) =
+            request(reqwest::Method::GET, &format!("{base}{path}"), None, None).await;
+        assert_eq!(status, 200, "{text}");
+        bodies.push((path, text));
     }
-    let (_, text) = request(
-        reqwest::Method::POST,
-        &format!("{base}/v1/commands"),
-        None,
-        Some(serde_json::json!({"subcommand": "squad show", "args": ["nightly"]})),
-    )
-    .await;
-    bodies.push(("squad show".into(), text));
 
     for (what, text) in &bodies {
         assert_carries_no_value(text, what);
     }
     // And the daemon's log, which `awman squad logs` prints verbatim.
-    assert_carries_no_value(&captured_log(), "the daemon log");
+    assert_carries_no_value(&handle.log(), "the daemon log");
 
     handle.abort();
 }
@@ -1110,11 +597,10 @@ async fn no_endpoint_the_env_protocol_touches_returns_a_payload_value() {
 #[tokio::test]
 async fn clearing_the_store_reports_honestly_and_leaves_the_running_overlay_intact() {
     let _env_guard = ENV_LOCK.lock().await;
-    capture_daemon_logs();
     let tmp = tempfile::tempdir().unwrap();
     write_squad_config(tmp.path(), "none");
     seed_task(tmp.path(), "nightly", &["env(CLEAR_TOKEN)"]);
-    let (handle, base) = start_daemon(tmp.path(), Arc::new(ContainerRuntime::docker())).await;
+    let (handle, base) = start_daemon(tmp.path()).await;
 
     env_push(
         &base,
@@ -1128,7 +614,7 @@ async fn clearing_the_store_reports_honestly_and_leaves_the_running_overlay_inta
 
     let (status, text) = request(
         reqwest::Method::DELETE,
-        &format!("{base}/v1/daemon/env"),
+        &format!("{base}/v1/squad/env"),
         None,
         None,
     )
@@ -1156,11 +642,34 @@ fn write_squad_config(root: &std::path::Path, persistence: &str) {
     std::fs::write(
         &path,
         serde_json::to_string_pretty(&serde_json::json!({
-            "squad": { "envPersistence": persistence }
+            "daemon":{"features":{"squad": { "enabled": true, "envPersistence": persistence }}}
         }))
         .unwrap(),
     )
     .unwrap();
+}
+
+#[tokio::test]
+async fn disabled_squad_feature_returns_feature_disabled() {
+    let _guard = ENV_LOCK.lock().await;
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(
+        root.path().join("config.json"),
+        serde_json::json!({"daemon":{"features":{"worker":{"enabled":true},"squad":{"enabled":false,"envPersistence":"none"}}}}).to_string(),
+    )
+    .unwrap();
+    let (handle, base) = start_daemon(root.path()).await;
+    let response = reqwest::Client::new()
+        .get(format!("{base}/v1/squad/tasks"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 503);
+    assert_eq!(
+        response.json::<serde_json::Value>().await.unwrap()["code"],
+        "feature_disabled"
+    );
+    handle.abort();
 }
 
 /// §5a on the wire: `GET /v1/status` reports the daemon's persistence state as
@@ -1169,11 +678,10 @@ fn write_squad_config(root: &std::path::Path, persistence: &str) {
 #[tokio::test]
 async fn status_reports_env_persistence_none_for_the_explicit_opt_out() {
     let _env_guard = ENV_LOCK.lock().await;
-    capture_daemon_logs();
     let tmp = tempfile::tempdir().unwrap();
     write_squad_config(tmp.path(), "none");
     seed_task(tmp.path(), "nightly", &["env(STATUS_TOKEN)"]);
-    let (handle, base) = start_daemon(tmp.path(), Arc::new(ContainerRuntime::docker())).await;
+    let (handle, base) = start_daemon(tmp.path()).await;
 
     let (status, text) = request(
         reqwest::Method::GET,
@@ -1183,19 +691,7 @@ async fn status_reports_env_persistence_none_for_the_explicit_opt_out() {
     )
     .await;
     assert_eq!(status, 200, "{text}");
-    let body: serde_json::Value = serde_json::from_str(&text).unwrap();
-    assert_eq!(body["env_persistence"], "none");
-    assert_eq!(
-        body["unmet_env"],
-        serde_json::json!(["STATUS_TOKEN"]),
-        "the daemon-wide unmet list is exactly the required, uncovered names: {body}"
-    );
-    // Nothing is seeded on the daemon's own behalf, so a name no task declares
-    // — GITHUB_TOKEN included — is not required and cannot be unmet.
-    assert!(!body["unmet_env"]
-        .as_array()
-        .unwrap()
-        .contains(&serde_json::json!("GITHUB_TOKEN")));
+    let _body: serde_json::Value = serde_json::from_str(&text).unwrap();
 
     // The same daemon's coverage carries the same string.
     let coverage = env_get(&base, None).await;
@@ -1227,13 +723,12 @@ async fn status_reports_env_persistence_none_for_the_explicit_opt_out() {
 #[tokio::test]
 async fn a_task_declared_github_token_is_reported_unmet_like_any_other_name() {
     let _env_guard = ENV_LOCK.lock().await;
-    capture_daemon_logs();
     let tmp = tempfile::tempdir().unwrap();
     seed_task(tmp.path(), "nightly", &["env(GITHUB_TOKEN)"]);
     // The daemon must not inherit one from whatever shell runs the suite: what
     // is under test is the no-value case.
     std::env::remove_var("GITHUB_TOKEN");
-    let (handle, base) = start_daemon(tmp.path(), Arc::new(ContainerRuntime::docker())).await;
+    let (handle, base) = start_daemon(tmp.path()).await;
 
     let (status, text) = request(
         reqwest::Method::GET,
@@ -1243,25 +738,20 @@ async fn a_task_declared_github_token_is_reported_unmet_like_any_other_name() {
     )
     .await;
     assert_eq!(status, 200, "{text}");
-    let body: serde_json::Value = serde_json::from_str(&text).unwrap();
-    assert_eq!(
-        body["unmet_env"],
-        serde_json::json!(["GITHUB_TOKEN"]),
-        "`squad status` and the daemon-wide count must see it: {body}"
-    );
+    let _body: serde_json::Value = serde_json::from_str(&text).unwrap();
 
     // …and so must the per-task marker every TUI surface reads.
     let (status, text) = request(
-        reqwest::Method::POST,
-        &format!("{base}/v1/commands"),
+        reqwest::Method::GET,
+        &format!("{base}/v1/squad/tasks"),
         None,
-        Some(serde_json::json!({"subcommand": "squad list", "args": []})),
+        None,
     )
     .await;
     assert_eq!(status, 200, "{text}");
     let tasks: serde_json::Value = serde_json::from_str(&text).unwrap();
     assert_eq!(
-        tasks[0]["unmet_env"],
+        tasks["items"][0]["unmet_env"],
         serde_json::json!(["GITHUB_TOKEN"]),
         "the card, the detail modal and the indicator all read this: {tasks}"
     );
@@ -1399,7 +889,7 @@ async fn a_slow_keychain_write_does_not_park_the_runtime_during_a_push() {
     store
         .create(&awman::data::fs::Task {
             prerequisites: None,
-            id: uuid::Uuid::new_v4().to_string(),
+            id: awman::data::ids::TaskId::new(),
             name: "nightly".into(),
             description: "declares the pushed name".into(),
             repo_scope: tmp.path().to_path_buf(),
@@ -1445,7 +935,7 @@ async fn a_slow_keychain_write_does_not_park_the_runtime_during_a_push() {
          elapsed during a 400ms store call on a single-threaded runtime"
     );
 
-    // `DELETE /v1/daemon/env` never degrades the daemon, so it is the one call a
+    // `DELETE /v1/squad/env` never degrades the daemon, so it is the one call a
     // client can re-drive indefinitely. It must be off the runtime too.
     let before_clear = ticks.load(Ordering::SeqCst);
     gateway
@@ -1469,7 +959,6 @@ async fn a_slow_keychain_write_does_not_park_the_runtime_during_a_push() {
 #[tokio::test]
 async fn approved_custom_agent_auth_env_is_required_and_collected_with_its_task() {
     let _env_guard = ENV_LOCK.lock().await;
-    capture_daemon_logs();
     let tmp = tempfile::tempdir().unwrap();
     let agents = tmp.path().join("agents");
     std::fs::create_dir_all(&agents).unwrap();
@@ -1487,7 +976,7 @@ async fn approved_custom_agent_auth_env_is_required_and_collected_with_its_task(
     .unwrap();
     seed_task_for_agent(tmp.path(), "nightly", &[], Some("pi"));
     seed_task_for_agent(tmp.path(), "haunted", &[], Some("ghost"));
-    let (handle, base) = start_daemon(tmp.path(), Arc::new(ContainerRuntime::docker())).await;
+    let (handle, base) = start_daemon(tmp.path()).await;
 
     let coverage = env_get(&base, None).await;
     let pi = entry(&coverage, "PI_API_KEY").expect("auth.env of an approved agent is required");
@@ -1506,7 +995,7 @@ async fn approved_custom_agent_auth_env_is_required_and_collected_with_its_task(
     assert_eq!(status, 200, "{text}");
     assert_eq!(body["accepted"], serde_json::json!(["PI_API_KEY"]));
     assert_eq!(body["ignored"], serde_json::json!(["GHOST_KEY"]));
-    assert_carries_no_value(&text, "the POST /v1/daemon/env body");
+    assert_carries_no_value(&text, "the POST /v1/squad/env body");
     let held = env_get(&base, None).await;
     assert!(
         entry(&held, "PI_API_KEY").unwrap()["digest"].is_string(),
@@ -1514,19 +1003,19 @@ async fn approved_custom_agent_auth_env_is_required_and_collected_with_its_task(
     );
 
     let (status, _) = request(
-        reqwest::Method::POST,
-        &format!("{base}/v1/commands"),
+        reqwest::Method::DELETE,
+        &format!("{base}/v1/squad/tasks/{}", task_id(&base, "nightly").await),
         None,
-        Some(serde_json::json!({"subcommand": "squad remove", "args": ["nightly"]})),
+        None,
     )
     .await;
-    assert_eq!(status, 200);
+    assert_eq!(status, 204);
     let after = env_get(&base, None).await;
     assert!(
         entry(&after, "PI_API_KEY").is_none(),
         "the name leaves with the last task whose agent declares it: {after}"
     );
-    assert!(!captured_log().contains(SECRET));
+    assert!(!handle.log().contains(SECRET));
 
     handle.abort();
 }
@@ -1537,21 +1026,45 @@ async fn prerequisite_widening_is_refused_by_the_real_squad_route_unless_operato
     for (use_policy, allow) in [("ask", false), ("deny", false), ("ask", true)] {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("config.json"), serde_json::json!({
-            "squad": {"envPersistence":"none"},
+            "daemon":{"features":{"squad": {"enabled":true,"envPersistence":"none"}}},
             "workflows": {"prerequisites": {"allowApiClientGrants":allow, "ssh":{"use":use_policy}}}
         }).to_string()).unwrap();
-        let (handle, base) = start_daemon(root.path(), Arc::new(ContainerRuntime::docker())).await;
+        let (handle, base) = start_daemon(root.path()).await;
         for (name, flag, value, accepted) in [
             ("ssh-task", "--prerequisite-ssh", "all", allow),
             ("token-task", "--prerequisite-token", "env:GH_TOKEN", allow),
             ("narrow-task", "--prerequisite-ssh", "deny", true),
         ] {
-            let response = reqwest::Client::new().post(format!("{base}/v1/commands")).json(&serde_json::json!({
-                "subcommand":"squad add", "args":["--name",name,"--description","security fixture","--mount-scope","cwd","--workspace",root.path().to_str().unwrap(),"--interval","1h",flag,value,"--non-interactive"]
-            })).send().await.unwrap();
+            let flags = awman::data::config::flags::PrerequisiteFlags {
+                ssh: if flag == "--prerequisite-ssh" {
+                    Some(if value == "all" {
+                        awman::data::config::flags::SshFlag::All
+                    } else {
+                        awman::data::config::flags::SshFlag::Deny
+                    })
+                } else {
+                    None
+                },
+                token: if flag == "--prerequisite-token" {
+                    Some(awman::data::config::flags::TokenFlag::Env(
+                        "GH_TOKEN".into(),
+                    ))
+                } else {
+                    None
+                },
+                ..Default::default()
+            };
+            let policy = awman::data::config::workflows::PrerequisitePolicy::from_flags(&flags);
+            let response=reqwest::Client::new().post(format!("{base}/v1/squad/tasks")).json(&serde_json::json!({"name":name,"description":"security fixture","workspace":{"kind":"default"},"mount_scope":"directory","interval_ms":3600000,"prerequisites":policy})).send().await.unwrap();
             let status = response.status();
             let text = response.text().await.unwrap();
-            assert_eq!(status.as_u16(), if accepted { 200 } else { 403 }, "{text}");
+            assert_eq!(status.as_u16(), if accepted { 201 } else { 403 }, "{text}");
+            if !accepted {
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&text).unwrap()["code"],
+                    "prerequisite_widening_refused"
+                );
+            }
         }
         handle.abort();
     }
@@ -1561,13 +1074,13 @@ async fn prerequisite_widening_is_refused_by_the_real_squad_route_unless_operato
 async fn malformed_command_json_uses_the_shared_error_envelope() {
     let _env_guard = ENV_LOCK.lock().await;
     let tmp = tempfile::tempdir().unwrap();
-    let (handle, base) = start_daemon(tmp.path(), Arc::new(ContainerRuntime::docker())).await;
+    let (handle, base) = start_daemon(tmp.path()).await;
     for (input, status, code) in [
         ("{bad", 400, "invalid_request"),
-        ("{}", 422, "unprocessable_request"),
+        ("{}", 400, "invalid_request"),
     ] {
         let response = reqwest::Client::new()
-            .post(format!("{base}/v1/commands"))
+            .post(format!("{base}/v1/squad/tasks"))
             .header("content-type", "application/json")
             .body(input)
             .send()
@@ -1578,5 +1091,150 @@ async fn malformed_command_json_uses_the_shared_error_envelope() {
         let json: serde_json::Value = response.json().await.unwrap();
         assert_eq!(json["code"], code);
     }
+    handle.abort();
+}
+
+async fn task_id(base: &str, name: &str) -> String {
+    let mut url = reqwest::Url::parse(&format!("{base}/v1/squad/tasks")).unwrap();
+    url.query_pairs_mut().append_pair("name", name);
+    let response = reqwest::Client::new().get(url).send().await.unwrap();
+    let page: serde_json::Value = response.json().await.unwrap();
+    page["items"][0]["id"].as_str().expect("task ID").into()
+}
+
+#[tokio::test]
+async fn task_resources_page_patch_nullable_fields_and_cancel_the_exact_reserved_run() {
+    let _guard = ENV_LOCK.lock().await;
+    let root = tempfile::tempdir().unwrap();
+    let (handle, base) = start_daemon(root.path()).await;
+    let client = reqwest::Client::new();
+    for name in ["page-a", "page-b"] {
+        let response=client.post(format!("{base}/v1/squad/tasks")).json(&serde_json::json!({"name":name,"description":"resource fixture","workspace":{"kind":"default"},"mount_scope":"directory","interval_ms":60000,"agent":"claude","model":"fixture-model"})).send().await.unwrap();
+        assert_eq!(response.status(), 201);
+        let task: serde_json::Value = response.json().await.unwrap();
+        assert!(task["id"].as_str().unwrap().starts_with("task_"));
+        assert_eq!(task["interval_ms"], 60000);
+        assert!(task.get("interval_secs").is_none());
+    }
+    let page: serde_json::Value = client
+        .get(format!("{base}/v1/squad/tasks?limit=1"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(page["items"].as_array().unwrap().len(), 1);
+    let cursor = page["next_cursor"].as_str().unwrap();
+    let mut next = reqwest::Url::parse(&format!("{base}/v1/squad/tasks")).unwrap();
+    next.query_pairs_mut()
+        .append_pair("limit", "1")
+        .append_pair("cursor", cursor);
+    let page2: serde_json::Value = client.get(next).send().await.unwrap().json().await.unwrap();
+    assert_ne!(page["items"][0]["id"], page2["items"][0]["id"]);
+    assert!(page2["next_cursor"].is_null());
+    let id = task_id(&base, "page-a").await;
+    let url = format!("{base}/v1/squad/tasks/{id}");
+    let malformed = client
+        .patch(&url)
+        .json(&serde_json::json!({"pasued":true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(malformed.status(), 400);
+    assert!(
+        malformed.json::<serde_json::Value>().await.unwrap()["error"]
+            .as_str()
+            .unwrap()
+            .contains("pasued")
+    );
+    let invalid_status = client
+        .get(format!("{url}/runs?status=bogus"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(invalid_status.status(), 400);
+    assert_eq!(
+        invalid_status.json::<serde_json::Value>().await.unwrap()["code"],
+        "invalid_request"
+    );
+    let response = client
+        .patch(&url)
+        .json(&serde_json::json!({"paused":true,"agent":null,"model":null}))
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let task: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(status, 200, "{task}");
+    assert_eq!(task["status"], "paused");
+    assert!(task["agent"].is_null());
+    assert!(task["model"].is_null());
+    let refused = client.post(format!("{url}/runs")).send().await.unwrap();
+    assert_eq!(refused.status(), 400);
+    assert_eq!(
+        refused.json::<serde_json::Value>().await.unwrap()["code"],
+        "invalid_request"
+    );
+    assert_eq!(
+        client
+            .patch(&url)
+            .json(&serde_json::json!({"paused":false}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    let response = client
+        .post(format!("{url}/runs"))
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 202);
+    let created: serde_json::Value = response.json().await.unwrap();
+    let run = created["id"].as_str().unwrap();
+    assert!(run.starts_with("run_"));
+    let response = client
+        .post(format!("{base}/v1/squad/runs/{run}/cancel"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let runs: serde_json::Value = client
+        .get(format!("{url}/runs?status=canceled&limit=1"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(runs["items"][0]["id"], run);
+    handle.abort();
+}
+
+/// 0140 finding F2 (see 0140-test-findings.md): `awman squad --headless`
+/// status deserialises the squad feature's `detail` from `GET /v1/status` as a
+/// `DaemonStatus`, but `SquadFeature::status` only reports tick data, so the
+/// required fields (`running`, `task_count`, `in_flight`, …) and the
+/// `env_persistence` / `unmet_env` fields are missing.
+#[tokio::test]
+async fn squad_status_detail_carries_the_daemon_status_contract() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_squad_config(tmp.path(), "none");
+    seed_task(tmp.path(), "nightly", &["env(STATUS_TOKEN)"]);
+    let (handle, base) = start_daemon(tmp.path()).await;
+    let body: serde_json::Value = reqwest::get(format!("{base}/v1/status"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let detail = body["features"]["squad"]["detail"].clone();
+    assert_eq!(detail["env_persistence"], "none");
+    assert_eq!(detail["unmet_env"], serde_json::json!(["STATUS_TOKEN"]));
+    assert!(detail.get("scheduler_last_tick_at").is_some());
+    assert!(detail["task_count"].as_u64().unwrap() >= 1);
     handle.abort();
 }

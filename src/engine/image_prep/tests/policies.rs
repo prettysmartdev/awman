@@ -714,10 +714,15 @@ async fn check_only_uses_the_configured_project_dockerfile_in_its_hint() {
     let (mut run, mut sink, tmp) = import_engine(runtime.clone(), false, ImageSources::default());
     run.preparer.context = ImageBuildContext::for_repo(
         tmp.path(),
-        &crate::data::config::RepoConfig {
-            dockerfile: Some("containers/Project.Dockerfile".into()),
-            ..Default::default()
-        },
+        &crate::data::config::EffectiveConfig::from_files(
+            Default::default(),
+            crate::data::config::ConfigFile::test_json(serde_json::json!(
+                {"runtime": {"dockerfile": "containers/Project.Dockerfile"}}
+            )),
+            Default::default(),
+            crate::data::config::EnvSnapshot::empty(),
+        )
+        .unwrap(),
         "claude",
     );
     let tag = crate::data::image_tags::agent_image_tag(tmp.path(), "claude");

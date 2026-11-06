@@ -1,5 +1,4 @@
-//! The client-ready view of `GET /v1/workflows/{command_id}` and its alias
-//! `GET /v1/commands/{id}/workflow` (WI 0137 §6).
+//! The client-ready view of `GET /v1/worker/commands/{id}/workflow`.
 //!
 //! The route reads the engine's persisted `WorkflowState` JSON and hands it
 //! to [`client_view`], which adds computed fields **at read time** — the
@@ -213,7 +212,7 @@ mod tests {
         state.step_states.insert(
             "a".into(),
             StepState::Running {
-                container_id: Some("c1".into()),
+                container_id: Some("cmd_a9f7e97965d6cf799a529102a973b8b9".into()),
             },
         );
         state.record_step_container("a", "awman-a-1");
@@ -221,7 +220,10 @@ mod tests {
         assert_eq!(view["steps"][0]["status"], "running");
         // `container` is the name events carry in `source.container`.
         assert_eq!(view["steps"][0]["container"], "awman-a-1");
-        assert_eq!(view["steps"][0]["container_id"], "c1");
+        assert_eq!(
+            view["steps"][0]["container_id"],
+            "cmd_a9f7e97965d6cf799a529102a973b8b9"
+        );
     }
 
     #[test]

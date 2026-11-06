@@ -248,6 +248,25 @@ fn mount<'a>(plan: &'a LaunchPlan, guest: &str) -> Option<&'a MountSpec> {
     plan.spec.mounts.iter().find(|m| m.guest == guest)
 }
 
+#[test]
+fn codex_private_sqlite_storage_reaches_builtin_guest() {
+    let world = world(Some(HOME));
+    let run = world.run_options(false);
+    let first = world.plan("codex", &run).unwrap();
+    let second = world.plan("codex", &run).unwrap();
+    let destination = format!("{HOME}/.codex-sqlite");
+    let first_mount = mount(&first, &destination).unwrap();
+    let second_mount = mount(&second, &destination).unwrap();
+    assert_ne!(first_mount.host, second_mount.host);
+    assert!(!first_mount.read_only);
+    assert!(first_mount.host.is_dir());
+    assert!(first
+        .command
+        .env
+        .iter()
+        .any(|(key, value)| key == "CODEX_SQLITE_HOME" && value == &destination));
+}
+
 fn window(argv: &[String], first: &str, second: &str) -> bool {
     argv.windows(2).any(|w| w[0] == first && w[1] == second)
 }
@@ -257,7 +276,7 @@ fn every_settings_family_and_prompt_mode_belongs_to_some_agent() {
     let mut settings = [false; 4];
     // `Unsupported` delivery has no first-party agent since crush and maki
     // became custom definitions; it is covered through a custom fixture.
-    let mut prompts = [false; 6];
+    let mut prompts = [false; 7];
     for agent in FIRST_PARTY_AGENTS {
         let matrix = first_party(agent).unwrap();
         settings[match matrix.settings_mount {
@@ -272,12 +291,17 @@ fn every_settings_family_and_prompt_mode_belongs_to_some_agent() {
             SystemPromptMode::Replace => prompts[2] = true,
             SystemPromptMode::AgentsMd => prompts[3] = true,
             SystemPromptMode::EnvFile { .. } => prompts[4] = true,
-            SystemPromptMode::AddDir { .. } => prompts[5] = true,
+            SystemPromptMode::EnvDir { .. } => prompts[5] = true,
+            SystemPromptMode::AddDir { .. } => prompts[6] = true,
             SystemPromptMode::Unsupported => panic!("{agent}: unexpected Unsupported delivery"),
         }
     }
-    assert_eq!(settings, [true; 4], "a SettingsMount family has no agent");
-    assert_eq!(prompts, [true; 6], "a SystemPromptMode has no agent");
+    assert_eq!(
+        settings,
+        [false, true, true, true],
+        "first-party settings families changed"
+    );
+    assert_eq!(prompts, [true; 7], "a SystemPromptMode has no agent");
 }
 
 #[test]
@@ -419,6 +443,15 @@ fn every_agent_plans_every_overlay_settings_and_prompt_variant() {
                     assert!(m.read_only && m.host.is_file(), "{context}");
                     assert_eq!(std::fs::read_to_string(&m.host).unwrap(), PROMPT);
                 }
+                SystemPromptMode::EnvDir { var } => {
+                    let (_, guest) = plan.command.env.iter().find(|(k, _)| k == var).unwrap();
+                    let m = mount(&plan, guest).expect("instructions directory mounted");
+                    assert!(m.read_only && m.host.is_dir(), "{context}");
+                    assert_eq!(
+                        std::fs::read_to_string(m.host.join("AGENTS.md")).unwrap(),
+                        PROMPT
+                    );
+                }
                 SystemPromptMode::AddDir { flag } => {
                     for dir in ["/awman/context/global", "/awman/context/workflow"] {
                         assert!(window(argv, flag, dir), "{context}: {argv:?}");
@@ -431,7 +464,7 @@ fn every_agent_plans_every_overlay_settings_and_prompt_variant() {
                 }
             }
 
-            // The non-interactive subcommand or flag appears exactly once.
+            // The headless subcommand or flag appears exactly once.
             if let Some(flag) = matrix.non_interactive_flag.as_deref() {
                 let count = argv.iter().filter(|a| a.as_str() == flag).count();
                 assert_eq!(
@@ -443,12 +476,21 @@ fn every_agent_plans_every_overlay_settings_and_prompt_variant() {
             // The seeded initial prompt.
             assert_eq!(argv[0], matrix.interactive_entrypoint[0], "{context}");
             if non_interactive {
-                assert_eq!(
-                    plan.seeded_prompt.as_deref(),
-                    Some("task: fix it"),
-                    "{context}"
-                );
-                assert!(!argv.iter().any(|a| a == "task: fix it"), "{context}");
+                if matrix.headless_prompt_in_argv {
+                    assert_eq!(plan.seeded_prompt, None, "{context}");
+                    assert_eq!(
+                        argv.last().map(String::as_str),
+                        Some("task: fix it"),
+                        "{context}"
+                    );
+                } else {
+                    assert_eq!(
+                        plan.seeded_prompt.as_deref(),
+                        Some("task: fix it"),
+                        "{context}"
+                    );
+                    assert!(!argv.iter().any(|a| a == "task: fix it"), "{context}");
+                }
             } else {
                 assert_eq!(plan.seeded_prompt, None, "{context}");
                 assert_eq!(argv.last().unwrap(), "task: fix it", "{context}");
@@ -470,7 +512,7 @@ fn every_agent_plans_every_overlay_settings_and_prompt_variant() {
 /// three, with the same typed error.
 #[test]
 fn docker_apple_and_builtin_render_the_same_agent_argv_for_every_agent() {
-    use crate::data::config::repo::LaunchMode;
+    use crate::data::config::agents::LaunchMode;
     use crate::engine::agent::definition::ModelFlagDelivery;
     use crate::engine::container::options::{AutoMode, PlanMode, YoloMode};
     use crate::engine::error::ToolRestriction;
@@ -491,7 +533,7 @@ fn docker_apple_and_builtin_render_the_same_agent_argv_for_every_agent() {
                 },
             ),
             ("interactive", world.run_options(false)),
-            ("non-interactive", world.run_options(true)),
+            ("headless", world.run_options(true)),
             (
                 "yolo+model",
                 AgentRunOptions {
@@ -528,7 +570,7 @@ fn docker_apple_and_builtin_render_the_same_agent_argv_for_every_agent() {
             },
         ));
         table.push((
-            "agent-flags+non-interactive",
+            "agent-flags+headless",
             AgentRunOptions {
                 agent_flags: Some(vec!["--user-b".into()]),
                 ..world.run_options(true)
@@ -703,7 +745,7 @@ fn the_same_options_yield_the_same_mounts_for_the_same_image() {
 fn acp_launch_keeps_the_agent_entrypoint_and_is_persistent() {
     let world = world(Some(HOME));
     let mut run = world.run_options(false);
-    run.launch_mode = crate::data::config::repo::LaunchMode::Acp;
+    run.launch_mode = crate::data::config::agents::LaunchMode::Acp;
     let plan = world.plan("cline", &run).unwrap();
     assert_eq!(plan.command.argv, ["cline", "--acp"]);
     assert!(plan.persistent_stdin);

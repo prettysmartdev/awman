@@ -10,69 +10,17 @@
 use std::path::{Path, PathBuf};
 
 use crate::command::commands::squad::commands::{SquadCommandFrontend, TaskWorkspaceChoice};
-use crate::command::commands::squad::supervisor::SquadKeySetup;
 use crate::command::error::CommandError;
 use crate::data::fs::task_store::MountScope;
 use crate::data::prompt::{Prompt, TextPrompt};
 use crate::frontend::tui::command_frontend::TuiCommandFrontend;
-use crate::frontend::tui::dialogs::{Dialog, DialogRequest, DialogResponse};
+use crate::frontend::tui::dialogs::{DialogRequest, DialogResponse};
 
 /// The task-description modal's title. Deliberately short — it is drawn into
 /// the dialog rect's upper border, where a long sentence overflows or clips.
 /// The full instruction lives in the dialog body (`ask_task_description`'s
 /// prompt), which wraps and is always readable.
 pub const TASK_DESCRIPTION_TITLE: &str = "New squad task description";
-
-/// The title of the one-shot squad key disclosure, in the modal's border.
-pub(crate) const KEY_SETUP_TITLE: &str = "squad authentication";
-
-/// Draw the one-time squad key disclosure for the TUI.
-///
-/// The TUI's counterpart to the CLI's `render_key_setup` (WI 0114 F-56):
-/// Layer 2 supplies the key, the shell and the export line, and each frontend
-/// says them its own way. There is no box here — `Dialog::Notice` draws the
-/// frame, and box-drawing inside one would sit inside another.
-pub(crate) fn key_setup_body(setup: &SquadKeySetup) -> String {
-    format!(
-        "squad API key (store this — it will not be shown again):\n\n  \
-         {key}\n\n\
-         Add this to {rc_file} so the awman CLI and TUI can authenticate to \
-         squad:\n\n  {export_line}\n\n\
-         Until you do, export it in the current shell — `awman squad` commands \
-         without the key are refused by the daemon with 401 Unauthorized.\n\n\
-         Prefer to run without a key? Stop the daemon and start it with\n  \
-         awman squad start --dangerously-skip-auth\n\
-         which mints no key and accepts unauthenticated requests. squad binds \
-         to loopback (127.0.0.1) only, so nothing off this machine can reach it.",
-        key = setup.key,
-        rc_file = setup.rc_file(),
-        export_line = setup.export_line,
-    )
-}
-
-/// The key-disclosure notice, built the one way for all three sites that
-/// raise it (the command thread, and the two squad-tab startup paths).
-pub(crate) fn key_setup_notice(setup: &SquadKeySetup) -> DialogRequest {
-    DialogRequest::KeySetupNotice {
-        title: KEY_SETUP_TITLE.to_string(),
-        body: key_setup_body(setup),
-        copy_key: setup.key.clone(),
-        copy_zshrc_snippet: setup.export_line.clone(),
-    }
-}
-
-/// The same notice as a ready-built [`Dialog`], for the two startup paths that
-/// raise it straight on the `App` rather than through the command thread's
-/// `DialogRequest` channel. One spelling, so a first run and a key refresh
-/// cannot drift apart in what they show.
-pub(crate) fn key_setup_dialog(setup: &SquadKeySetup) -> Dialog {
-    Dialog::Notice {
-        title: KEY_SETUP_TITLE.to_string(),
-        body: key_setup_body(setup),
-        copy_key: Some(setup.key.clone()),
-        copy_zshrc_snippet: Some(setup.export_line.clone()),
-    }
-}
 
 impl TuiCommandFrontend {
     /// One optional-field edit prompt (WI 0110): prefilled with the current
@@ -102,14 +50,6 @@ impl TuiCommandFrontend {
 }
 
 impl SquadCommandFrontend for TuiCommandFrontend {
-    /// The same dismissable notice the squad tab raises on a first start,
-    /// with the `[c]`/`[z]` copy actions the key snippet needs. Sent, not
-    /// asked: a notice has no answer, so blocking the command thread on it
-    /// would only stall the command that minted the key.
-    fn show_key_setup(&mut self, setup: &SquadKeySetup) {
-        let _ = self.dialog_tx.send(key_setup_notice(setup));
-    }
-
     fn ask_task_name(&mut self) -> Result<String, CommandError> {
         let response = self.ask_dialog(DialogRequest::TextInput {
             title: "Task name".into(),

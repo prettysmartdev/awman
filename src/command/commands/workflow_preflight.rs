@@ -14,9 +14,7 @@
 /// replace the streamed lines.
 use std::collections::HashMap;
 
-use crate::command::commands::exec_workflow::{
-    parse_leader_flag, workflow_flag_config, ExecWorkflowCommandFlags,
-};
+use crate::command::commands::exec_workflow::{parse_leader_flag, ExecWorkflowCommandFlags};
 use crate::command::commands::launch_policy::LaunchPolicy;
 use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
@@ -39,13 +37,8 @@ pub(crate) fn ensure_workflow_agents_approved(
     flags: &ExecWorkflowCommandFlags,
     frontend: &mut dyn crate::command::commands::agent_trust::AgentTrustFrontend,
 ) -> Result<(), CommandError> {
-    let current = session.effective_config();
-    let config = crate::data::config::effective::EffectiveConfig::new(
-        workflow_flag_config(flags),
-        current.env().clone(),
-        current.repo().clone(),
-        current.global().clone(),
-    );
+    let config = crate::command::commands::exec_workflow::workflow_effective_config(session, flags)
+        .map_err(EngineError::Data)?;
     let default_agent = config.agent();
     let mut agents = Vec::new();
     for step in &workflow.steps {
@@ -68,17 +61,12 @@ pub(crate) fn validate_workflow_acp_preflight(
     session: &Session,
     flags: &ExecWorkflowCommandFlags,
     sink: &mut dyn UserMessageSink,
-) -> Result<HashMap<String, crate::data::config::repo::LaunchMode>, EngineError> {
-    use crate::data::config::global::LaunchModeFallback;
-    use crate::data::config::repo::LaunchMode;
+) -> Result<HashMap<String, crate::data::config::agents::LaunchMode>, EngineError> {
+    use crate::data::config::agents::AcpFallback;
+    use crate::data::config::agents::LaunchMode;
 
-    let current = session.effective_config();
-    let config = crate::data::config::effective::EffectiveConfig::new(
-        workflow_flag_config(flags),
-        current.env().clone(),
-        current.repo().clone(),
-        current.global().clone(),
-    );
+    let config = crate::command::commands::exec_workflow::workflow_effective_config(session, flags)
+        .map_err(EngineError::Data)?;
     let requested = config.launch_mode();
     let effective_default_agent = config.agent();
     let mut modes = HashMap::with_capacity(workflow.steps.len());
@@ -97,7 +85,7 @@ pub(crate) fn validate_workflow_acp_preflight(
         let agent = crate::data::session::AgentName::new(agent_name).map_err(EngineError::Data)?;
         let definition = crate::engine::agent::AgentRegistry::resolve_for_session(session, &agent)?;
         let mode = if requested == LaunchMode::Acp && !definition.supports_acp {
-            if config.launch_mode_fallback() == LaunchModeFallback::Error {
+            if config.acp_fallback() == AcpFallback::Error {
                 return Err(EngineError::Other(format!(
                     "workflow ACP pre-flight failed: step '{}' uses agent '{}', which does not support ACP",
                     step.name,
@@ -107,7 +95,7 @@ pub(crate) fn validate_workflow_acp_preflight(
             sink.write_message(UserMessage {
                 level: MessageLevel::Warning,
                 text: format!(
-                    "workflow step '{}': agent '{}' does not support ACP; falling back to stdio for this session — see launchModeFallback",
+                    "workflow step '{}': agent '{}' does not support ACP; falling back to stdio for this session — see agents.acpFallback",
                     step.name,
                     agent.as_str()
                 ),
@@ -194,14 +182,9 @@ pub(crate) fn resolve_dynamic_workflows(
     session: &Session,
     flags: &ExecWorkflowCommandFlags,
 ) -> Result<ResolvedDynamicWorkflows, CommandError> {
-    crate::data::config::EffectiveConfig::new(
-        workflow_flag_config(flags),
-        session.env().clone(),
-        session.repo_config().clone(),
-        session.global_config().clone(),
-    )
-    .dynamic_workflows()
-    .map_err(CommandError::from)
+    crate::command::commands::exec_workflow::workflow_effective_config(session, flags)?
+        .dynamic_workflows()
+        .map_err(CommandError::from)
 }
 
 /// Resolve the leader agent name and optional model override (WI-0092 §7,
@@ -436,7 +419,7 @@ pub(crate) fn agents_section_for_leader(
     let Some(map) = &resolved.agents_to_models else {
         return Ok((format_available_agents(available_agents), warnings));
     };
-    let key_label = format!("{}.agentsToModels", map.source.key_prefix());
+    let key_label = "workflows.dynamic.agentsToModels".to_string();
     let policy = match map.source {
         DynamicWorkflowsSource::Global => MissingDockerfilePolicy::SkipWithWarning,
         _ => MissingDockerfilePolicy::Fail,
@@ -578,13 +561,8 @@ pub(crate) async fn ensure_static_workflow_agent_images(
     flags: &ExecWorkflowCommandFlags,
     frontend: &mut dyn crate::command::commands::agent_setup::AgentSetupFrontend,
 ) -> Result<(), CommandError> {
-    let current = session.effective_config();
-    let config = crate::data::config::effective::EffectiveConfig::new(
-        workflow_flag_config(flags),
-        current.env().clone(),
-        current.repo().clone(),
-        current.global().clone(),
-    );
+    let config = crate::command::commands::exec_workflow::workflow_effective_config(session, flags)
+        .map_err(EngineError::Data)?;
     let default_agent = match config.agent() {
         Some(name) => crate::data::session::AgentName::new(name).map_err(EngineError::Data)?,
         None => session.configured_agent(),
@@ -687,15 +665,13 @@ async fn import_agent_image_for_step(
     let mut preparer = AgentImagePreparer::new(
         session.effective_config().builtin_settings()?,
         runtime,
-        crate::data::config::global::GlobalConfig::data_home_with(
-            session.effective_config().env(),
-        )?,
+        crate::data::fs::data_paths::data_home(session.effective_config().env())?,
         // The context's default agent is the session's configured one, not the
         // agent being prepared: a non-default agent must not reuse a
         // single-image default source, exactly as `ready` refuses it.
         ImageBuildContext::for_repo(
             git_root,
-            session.repo_config(),
+            &session.effective_config(),
             session.configured_agent().as_str(),
         ),
     )
@@ -1444,7 +1420,7 @@ mod import_tests {
         std::fs::create_dir_all(root.path().join(".awman")).unwrap();
         std::fs::write(
             root.path().join(".awman/config.json"),
-            r#"{"agent":"claude","builtin":{"imageSource":{"type":"archive","path":"/images/claude.tar"}}}"#,
+            r#"{"agents":{"default":"claude"},"runtime":{"builtin":{"imageSource":{"type":"archive","path":"/images/claude.tar"}}}}"#,
         )
         .unwrap();
         let session = Session::for_tests(root.path());

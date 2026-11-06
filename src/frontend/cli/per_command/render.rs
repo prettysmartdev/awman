@@ -9,10 +9,6 @@
 //! The whole module is pure: it never touches I/O or globals. Tests can call
 //! any renderer directly with a synthesised outcome.
 
-use crate::command::commands::api_server::{
-    ApiServerKillOutcome, ApiServerLogsOutcome, ApiServerOutcome, ApiServerStartOutcome,
-    ApiServerStatusOutcome,
-};
 use crate::command::commands::chat::ChatOutcome;
 use crate::command::commands::config::{
     ConfigGetOutcome, ConfigOutcome, ConfigSetOutcome, ConfigShowOutcome,
@@ -29,7 +25,7 @@ use crate::command::commands::remote::{
 };
 use crate::command::commands::specs::{SpecsAmendOutcome, SpecsOutcome};
 use crate::command::CommandOutcome;
-use crate::frontend::render_helpers::{format_table, render_config_migrate};
+use crate::frontend::render_helpers::format_table;
 
 // ─── Top-level dispatcher ────────────────────────────────────────────────────
 
@@ -48,8 +44,9 @@ pub fn render(outcome: &CommandOutcome, json: bool) -> Option<String> {
             Some(serde_json::to_string(o).expect("workflow outcome serializes"))
         }
         CommandOutcome::ExecWorkflow(o) => render_exec_workflow(o),
-        CommandOutcome::Config(o) => render_config(o),
-        CommandOutcome::ApiServer(o) => render_api_server(o),
+        CommandOutcome::Config(o) => render_config(o, json),
+        CommandOutcome::Daemon(o) => super::daemon::render(o, json),
+        CommandOutcome::DaemonApi(o) => Some(super::daemon::render_api(o, json)),
         CommandOutcome::Remote(o) => render_remote(o),
         CommandOutcome::New(o) => render_new(o),
         CommandOutcome::Specs(o) => render_specs(o),
@@ -135,67 +132,31 @@ fn render_ready(o: &ReadyOutcome) -> Option<String> {
 
 // ─── config ──────────────────────────────────────────────────────────────────
 
-fn render_config(o: &ConfigOutcome) -> Option<String> {
+fn render_config(o: &ConfigOutcome, json: bool) -> Option<String> {
     match o {
+        ConfigOutcome::Show(s) if json => Some(to_json(s)),
+        ConfigOutcome::Get(g) if json => Some(to_json(g)),
         ConfigOutcome::Show(s) => Some(render_config_show(s)),
         ConfigOutcome::Get(g) => Some(render_config_get(g)),
-        ConfigOutcome::Set(s) => Some(render_config_set(s)),
-        ConfigOutcome::PrerequisiteGrants(g) => Some(render_prerequisite_grants(g)),
-        ConfigOutcome::Migrate(m) => Some(render_config_migrate(m)),
+        ConfigOutcome::Set(s) | ConfigOutcome::Unset(s) => Some(render_config_set(s)),
     }
 }
 
-/// `config prerequisite-grants list|revoke`: the remembered decisions as a
-/// table, numbered as `revoke` takes them.
-fn render_prerequisite_grants(
-    g: &crate::command::commands::workflow_prerequisites::PrerequisiteGrantsOutcome,
-) -> String {
-    use crate::data::fs::prerequisite_grants::RememberedKind;
-    let mut out = String::new();
-    if let Some(warning) = &g.warning {
-        out.push_str(&format!("Warning: {warning}\n"));
-    }
-    if let Some(n) = g.revoked {
-        out.push_str(&format!(
-            "Revoked {n} remembered prerequisite decision(s).\n"
-        ));
-    }
-    if g.rows.is_empty() {
-        out.push_str(&format!(
-            "No remembered prerequisite decisions ({}).",
-            g.path
-        ));
-        return out;
-    }
-    let rows: Vec<Vec<String>> = g
-        .rows
-        .iter()
-        .map(|row| {
-            let kind = match row.prerequisite {
-                RememberedKind::Ssh => "ssh",
-                RememberedKind::GithubToken => "github token",
-                RememberedKind::GitIdentity => "git identity",
-            };
-            vec![
-                row.index.to_string(),
-                row.git_root.clone(),
-                row.remote_url.clone(),
-                kind.to_string(),
-                row.decision.clone(),
-                row.recorded_at.clone(),
-            ]
-        })
-        .collect();
-    out.push_str(&format_table(
-        &["#", "Repository", "Remote", "Kind", "Decision", "Recorded"],
-        &rows,
-    ));
-    out
+fn to_json<T: serde::Serialize>(value: &T) -> String {
+    serde_json::to_string_pretty(value).expect("config outcome serializes")
+}
+
+/// The `source` column: which layer the effective value comes from.
+fn layer_label(layer: crate::data::config::effective::Layer) -> String {
+    serde_json::to_value(layer)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_default()
 }
 
 fn render_config_show(o: &ConfigShowOutcome) -> String {
     let na = "—";
-    let headers = ["Field", "Global", "Repo", "Effective"];
+    let headers = ["Key", "Global", "Repo", "Effective", "Source", "Type"];
     let rows: Vec<Vec<String>> = o
         .rows
         .iter()
@@ -205,110 +166,70 @@ fn render_config_show(o: &ConfigShowOutcome) -> String {
             } else {
                 r.field.clone()
             };
+            let (source, kind) = if r.shape.is_header() {
+                (String::new(), String::new())
+            } else {
+                (layer_label(r.source), r.type_name.clone())
+            };
             vec![
                 label,
                 r.global_value.clone().unwrap_or_else(|| na.to_string()),
                 r.repo_value.clone().unwrap_or_else(|| na.to_string()),
                 r.effective_value.clone().unwrap_or_else(|| na.to_string()),
+                source,
+                kind,
             ]
         })
         .collect();
     let mut out = String::from("AWMAN CONFIG\n\n");
     out.push_str(&format_table(&headers, &rows));
+    if let Some(state) = &o.state {
+        let accepted = state
+            .auto_agent_auth_accepted
+            .map_or_else(|| na.to_string(), |b| b.to_string());
+        out.push_str(&format!(
+            "\n\nSTATE (read-only, not config: {})\n\n",
+            state.path
+        ));
+        out.push_str(&format_table(
+            &["Item", "Value"],
+            &[vec!["autoAgentAuthAccepted".to_string(), accepted]],
+        ));
+    }
+    for note in &o.notes {
+        out.push_str(&format!("\n\nNote: {note}"));
+    }
     out
 }
 
 fn render_config_get(o: &ConfigGetOutcome) -> String {
-    let na = || "N/A".to_string();
+    let na = || "—".to_string();
     format!(
-        "Field: {}\n  Global:    {}\n  Repo:      {}\n  Effective: {}",
+        "Key: {}\n  Global:    {}\n  Repo:      {}\n  Effective: {}\n  Source:    {}\n  Type:      {}",
         o.field,
         o.global_value.clone().unwrap_or_else(na),
         o.repo_value.clone().unwrap_or_else(na),
         o.effective_value.clone().unwrap_or_else(na),
+        layer_label(o.source),
+        o.type_name,
     )
 }
 
+/// `wrote <path>` first, always, then the live-apply line.
 fn render_config_set(o: &ConfigSetOutcome) -> String {
-    format!("Set {} ({}) = {}", o.field, o.scope, o.value)
+    let what = match &o.value {
+        Some(value) => format!("set {} = {value}", o.field),
+        None => format!("unset {}", o.field),
+    };
+    format!(
+        "{what} ({} config)\nwrote {}\n{}",
+        o.scope,
+        o.path,
+        o.live.message()
+    )
 }
 
 // ─── api ────────────────────────────────────────────────────────────────
-
-fn render_api_server(o: &ApiServerOutcome) -> Option<String> {
-    match o {
-        // In foreground mode the "started" message is printed at server
-        // boot (before the accept loop blocks). When that future finally
-        // returns it's because the server has *shut down* — printing
-        // "API server started …" at that point is misleading and looked
-        // like noise dumped after Ctrl-C.
-        ApiServerOutcome::Start(s) if !s.background => None,
-        ApiServerOutcome::Start(s) => Some(render_api_server_start(s)),
-        ApiServerOutcome::Kill(k) => Some(render_api_server_kill(k)),
-        ApiServerOutcome::Logs(l) => Some(render_api_server_logs(l)),
-        ApiServerOutcome::Status(s) => Some(render_api_server_status(s)),
-    }
-}
-
-fn render_api_server_start(o: &ApiServerStartOutcome) -> String {
-    let mode = if o.background {
-        "background"
-    } else {
-        "foreground"
-    };
-    let workdirs = if o.workdirs.is_empty() {
-        "<none>".to_string()
-    } else {
-        o.workdirs.join(", ")
-    };
-    let key = if o.refreshed_key {
-        " (api key refreshed)"
-    } else {
-        ""
-    };
-    format!(
-        "API server started on port {} in {mode} mode.\n  workdirs: {workdirs}{key}",
-        o.port
-    )
-}
-
-fn render_api_server_kill(o: &ApiServerKillOutcome) -> String {
-    match o.stopped_pid {
-        Some(pid) => format!("API server (PID {pid}) stopped."),
-        None => "API server is not running.".to_string(),
-    }
-}
-
-fn render_api_server_logs(o: &ApiServerLogsOutcome) -> String {
-    if o.log_path.is_empty() {
-        "No API server log found.".to_string()
-    } else {
-        format!("Tailing API server logs at {}", o.log_path)
-    }
-}
-
-fn render_api_server_status(o: &ApiServerStatusOutcome) -> String {
-    if !o.running {
-        return "API server is not running.".to_string();
-    }
-    let pid_part = o.pid.map(|p| format!(" (PID {p})")).unwrap_or_default();
-    let addr_part = o
-        .bound_addr
-        .as_deref()
-        .map(|a| format!(" at {a}"))
-        .unwrap_or_default();
-    let version_part = o
-        .version
-        .as_deref()
-        .map(|v| format!(", version {v}"))
-        .unwrap_or_default();
-    let responsive_part = if o.responsive {
-        ""
-    } else {
-        " — process alive but HTTP probe failed"
-    };
-    format!("API server is running{pid_part}{addr_part}{version_part}{responsive_part}.")
-}
 
 // ─── remote ──────────────────────────────────────────────────────────────────
 
@@ -487,53 +408,15 @@ mod tests {
             global_value: Some("claude".into()),
             repo_value: None,
             effective_value: Some("claude".into()),
-            alias_used: None,
+            source: crate::data::config::effective::Layer::Global,
+            type_name: "string".into(),
         };
         let s = render_config_get(&o);
-        assert!(s.contains("Field: agent"));
+        assert!(s.contains("Key: agent"));
+        assert!(s.contains("Source:    global"), "{s}");
         assert!(s.contains("Global:    claude"));
-        assert!(s.contains("Repo:      N/A"));
+        assert!(s.contains("Repo:      —"));
         assert!(s.contains("Effective: claude"));
-    }
-
-    #[test]
-    fn render_api_server_status_running_with_pid() {
-        let s = render_api_server_status(&ApiServerStatusOutcome {
-            running: true,
-            pid: Some(1234),
-            bound_addr: Some("https://127.0.0.1:9876".into()),
-            version: Some("0.7.0".into()),
-            responsive: true,
-        });
-        assert!(s.contains("API server is running"));
-        assert!(s.contains("PID 1234"));
-        assert!(s.contains("at https://127.0.0.1:9876"));
-        assert!(s.contains("version 0.7.0"));
-        assert!(!s.contains("HTTP probe failed"));
-    }
-
-    #[test]
-    fn render_api_server_status_alive_but_unresponsive() {
-        let s = render_api_server_status(&ApiServerStatusOutcome {
-            running: true,
-            pid: Some(1234),
-            bound_addr: None,
-            version: None,
-            responsive: false,
-        });
-        assert!(s.contains("HTTP probe failed"));
-    }
-
-    #[test]
-    fn render_api_server_status_not_running() {
-        let s = render_api_server_status(&ApiServerStatusOutcome {
-            running: false,
-            pid: None,
-            bound_addr: None,
-            version: None,
-            responsive: false,
-        });
-        assert_eq!(s, "API server is not running.");
     }
 
     #[test]
@@ -638,38 +521,50 @@ mod tests {
     fn render_config_show_renders_4_column_table_with_field_values() {
         use crate::command::commands::config::{ConfigFieldKind, ConfigFieldRow};
         let o = ConfigShowOutcome {
-            global: serde_json::json!({"agent": "claude"}),
-            repo: serde_json::json!({}),
+            state: None,
+            notes: vec![],
             rows: vec![
                 ConfigFieldRow {
                     field: "agent".into(),
                     global_value: Some("claude".into()),
                     repo_value: None,
                     effective_value: Some("claude".into()),
+                    task_value: None,
+                    source: crate::data::config::effective::Layer::Default,
+                    type_name: "string".into(),
+                    sensitive: false,
                     kind: ConfigFieldKind::Enum,
                     read_only: false,
                     global_writable: true,
                     repo_writable: true,
                     value_hint: None,
-                    shape: crate::command::commands::config::ConfigRowShape::Scalar,
+                    shape: crate::command::commands::config::ConfigRowKind::Scalar,
                 },
                 ConfigFieldRow {
                     field: "auto_agent_auth_accepted".into(),
                     global_value: Some("true".into()),
                     repo_value: None,
                     effective_value: Some("true".into()),
+                    task_value: None,
+                    source: crate::data::config::effective::Layer::Default,
+                    type_name: "string".into(),
+                    sensitive: false,
                     kind: ConfigFieldKind::Bool,
                     read_only: true,
                     global_writable: false,
                     repo_writable: false,
                     value_hint: None,
-                    shape: crate::command::commands::config::ConfigRowShape::Scalar,
+                    shape: crate::command::commands::config::ConfigRowKind::Scalar,
                 },
             ],
         };
         let s = render_config_show(&o);
         assert!(s.contains("AWMAN CONFIG"), "must have header");
-        assert!(s.contains("Field"), "must have Field column");
+        assert!(s.contains("Key"), "must have Key column");
+        assert!(
+            s.contains("Source") && s.contains("Type"),
+            "must have Source and Type columns"
+        );
         assert!(s.contains("Global"), "must have Global column");
         assert!(s.contains("Repo"), "must have Repo column");
         assert!(s.contains("Effective"), "must have Effective column");
@@ -687,44 +582,56 @@ mod tests {
         let long_models = "claude-opus-4-8, claude-sonnet-4-6, claude-haiku-4-5, \
                             gemini-2.5-pro, codex-mini-latest";
         let o = ConfigShowOutcome {
-            global: serde_json::json!({}),
-            repo: serde_json::json!({}),
+            state: None,
+            notes: vec![],
             rows: vec![
                 ConfigFieldRow {
                     field: "demo.leader".into(),
                     global_value: None,
                     repo_value: Some("claude::claude-opus-4-8".into()),
                     effective_value: Some("claude::claude-opus-4-8".into()),
+                    task_value: None,
+                    source: crate::data::config::effective::Layer::Default,
+                    type_name: "string".into(),
+                    sensitive: false,
                     kind: ConfigFieldKind::String,
                     read_only: false,
                     global_writable: false,
                     repo_writable: true,
                     value_hint: None,
-                    shape: crate::command::commands::config::ConfigRowShape::Scalar,
+                    shape: crate::command::commands::config::ConfigRowKind::Scalar,
                 },
                 ConfigFieldRow {
                     field: "demo.limit".into(),
                     global_value: None,
                     repo_value: Some("3".into()),
                     effective_value: Some("3".into()),
+                    task_value: None,
+                    source: crate::data::config::effective::Layer::Default,
+                    type_name: "string".into(),
+                    sensitive: false,
                     kind: ConfigFieldKind::Number,
                     read_only: false,
                     global_writable: false,
                     repo_writable: true,
                     value_hint: None,
-                    shape: crate::command::commands::config::ConfigRowShape::Scalar,
+                    shape: crate::command::commands::config::ConfigRowKind::Scalar,
                 },
                 ConfigFieldRow {
                     field: "demo.map.claude".into(),
                     global_value: None,
                     repo_value: Some(long_models.into()),
                     effective_value: Some(long_models.into()),
+                    task_value: None,
+                    source: crate::data::config::effective::Layer::Default,
+                    type_name: "string".into(),
+                    sensitive: false,
                     kind: ConfigFieldKind::String,
                     read_only: false,
                     global_writable: false,
                     repo_writable: true,
                     value_hint: None,
-                    shape: crate::command::commands::config::ConfigRowShape::Scalar,
+                    shape: crate::command::commands::config::ConfigRowKind::Scalar,
                 },
             ],
         };
@@ -761,7 +668,7 @@ mod tests {
     /// the CLI view must render it without knowing any real field name.
     fn shaped_row(
         field: &str,
-        shape: crate::command::commands::config::ConfigRowShape,
+        shape: crate::command::commands::config::ConfigRowKind,
         global: Option<&str>,
         repo: Option<&str>,
         effective: Option<&str>,
@@ -772,6 +679,10 @@ mod tests {
             global_value: global.map(Into::into),
             repo_value: repo.map(Into::into),
             effective_value: effective.map(Into::into),
+            task_value: None,
+            source: crate::data::config::effective::Layer::Default,
+            type_name: "string".into(),
+            sensitive: false,
             kind: crate::command::commands::config::ConfigFieldKind::String,
             read_only,
             global_writable: !read_only,
@@ -782,10 +693,10 @@ mod tests {
     }
 
     fn shape_driven_outcome() -> ConfigShowOutcome {
-        use crate::command::commands::config::ConfigRowShape as Shape;
+        use crate::command::commands::config::ConfigRowKind as Shape;
         ConfigShowOutcome {
-            global: serde_json::json!({}),
-            repo: serde_json::json!({}),
+            state: None,
+            notes: vec![],
             rows: vec![
                 shaped_row(
                     "demo.map",
@@ -881,7 +792,7 @@ mod tests {
         let s = render_config_show(&shape_driven_outcome());
         let header = s
             .lines()
-            .find(|l| l.contains("Field") && l.contains("Global"))
+            .find(|l| l.contains("Key") && l.contains("Global"))
             .expect("table header");
         let global_col = header.find("Global").unwrap();
         let repo_col = header.find("Repo").unwrap();
@@ -908,83 +819,48 @@ mod tests {
         }
     }
 
-    fn migrate_outcome(
-        changes: Vec<crate::data::config::ConfigMigrationChange>,
-        applied: bool,
-        dry_run: bool,
-    ) -> crate::command::commands::config::ConfigMigrateOutcome {
-        crate::command::commands::config::ConfigMigrateOutcome {
-            scope: crate::data::config::ConfigMigrationScope::Repo,
-            path: "/r/.awman/config.json".into(),
-            changes,
-            preview: "PREVIEW TEXT".into(),
-            applied,
-            dry_run,
-            global_has_never_read_dynamic_workflows: false,
-            note: None,
-        }
-    }
-
-    fn one_change() -> crate::data::config::ConfigMigrationChange {
-        crate::data::config::ConfigMigrationChange {
-            id: "demo-step",
-            summary: "Moved the demo block.",
-            before: serde_json::json!({"a": 1}),
-            after: serde_json::json!({"b": 1}),
-        }
-    }
-
     #[test]
-    fn render_config_migrate_nothing_dry_run_and_applied() {
-        let nothing = render(
-            &CommandOutcome::Config(ConfigOutcome::Migrate(migrate_outcome(
-                vec![],
-                false,
-                false,
-            ))),
-            false,
-        )
-        .unwrap();
-        assert_eq!(nothing, "nothing to migrate");
-
-        let dry = render(
-            &CommandOutcome::Config(ConfigOutcome::Migrate(migrate_outcome(
-                vec![one_change()],
-                false,
-                true,
-            ))),
-            false,
-        )
-        .unwrap();
-        assert!(dry.starts_with("PREVIEW TEXT"), "{dry}");
-        assert!(dry.ends_with("dry run: nothing written"), "{dry}");
-
-        let applied = render(
-            &CommandOutcome::Config(ConfigOutcome::Migrate(migrate_outcome(
-                vec![one_change()],
-                true,
-                false,
-            ))),
-            false,
-        )
-        .unwrap();
-        assert!(applied.contains("/r/.awman/config.json"), "{applied}");
-        assert!(applied.contains("Moved the demo block."), "{applied}");
-    }
-
-    #[test]
-    fn render_config_set_formats_field_scope_and_value() {
+    fn render_config_set_always_prints_the_file_written_and_the_live_line() {
+        use crate::command::commands::config::LiveApply;
         let o = ConfigSetOutcome {
-            field: "agent".into(),
-            value: "gemini".into(),
+            field: "agents.stuckTimeout".into(),
+            value: Some("45s".into()),
             scope: "repo".into(),
-            moved_legacy_dynamic_workflows: false,
-            alias_used: None,
+            path: "/r/.awman/config.json".into(),
+            live: LiveApply::NextStart,
         };
         let s = render_config_set(&o);
-        assert!(s.contains("agent"), "field name must appear");
-        assert!(s.contains("repo"), "scope must appear");
-        assert!(s.contains("gemini"), "value must appear");
+        assert_eq!(
+            s,
+            "set agents.stuckTimeout = 45s (repo config)\nwrote /r/.awman/config.json\ntakes effect on next start"
+        );
+        let o = ConfigSetOutcome {
+            value: None,
+            live: LiveApply::Applied,
+            ..o
+        };
+        let s = render_config_set(&o);
+        assert!(s.starts_with("unset agents.stuckTimeout"), "{s}");
+        assert!(s.ends_with("applied to the running daemon"), "{s}");
+    }
+
+    #[test]
+    fn render_config_show_prints_the_state_heading_and_json_on_request() {
+        use crate::command::commands::config::ConfigStateSection;
+        let mut o = shape_driven_outcome();
+        o.state = Some(ConfigStateSection {
+            path: "/h/data/repos/abc/state.json".into(),
+            auto_agent_auth_accepted: Some(true),
+        });
+        let s = render_config_show(&o);
+        assert!(
+            s.contains("STATE (read-only, not config: /h/data/repos/abc/state.json)"),
+            "{s}"
+        );
+        assert!(s.contains("autoAgentAuthAccepted"), "{s}");
+        let json = render(&CommandOutcome::Config(ConfigOutcome::Show(o)), true).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["state"]["autoAgentAuthAccepted"], true);
     }
 
     // ── render_new ────────────────────────────────────────────────────────────
@@ -1173,74 +1049,6 @@ mod tests {
             s.contains("3") || s.contains("exit"),
             "exit code must appear: {s}"
         );
-    }
-
-    // ── render_api_server ───────────────────────────────────────────────────────
-
-    use crate::command::commands::api_server::{
-        ApiServerKillOutcome, ApiServerLogsOutcome, ApiServerStartOutcome,
-    };
-
-    #[test]
-    fn render_api_server_start_shows_port_and_mode() {
-        let o = ApiServerStartOutcome {
-            port: 9876,
-            background: true,
-            workdirs: vec!["/repo".into()],
-            workdir_roots: vec![],
-            refreshed_key: false,
-        };
-        let s = render_api_server_start(&o);
-        assert!(s.contains("9876"), "port must appear: {s}");
-        assert!(s.contains("background"), "mode must appear: {s}");
-    }
-
-    #[test]
-    fn render_api_server_start_foreground_mode() {
-        let o = ApiServerStartOutcome {
-            port: 8080,
-            background: false,
-            workdirs: vec![],
-            workdir_roots: vec![],
-            refreshed_key: true,
-        };
-        let s = render_api_server_start(&o);
-        assert!(s.contains("foreground"), "must say foreground: {s}");
-        assert!(
-            s.contains("api key refreshed"),
-            "refreshed_key must be mentioned: {s}"
-        );
-    }
-
-    #[test]
-    fn render_api_server_kill_with_stopped_pid() {
-        let s = render_api_server_kill(&ApiServerKillOutcome {
-            stopped_pid: Some(5678),
-        });
-        assert!(s.contains("5678"), "PID must appear: {s}");
-        assert!(s.contains("stopped"), "must say stopped: {s}");
-    }
-
-    #[test]
-    fn render_api_server_kill_without_pid_says_not_running() {
-        let s = render_api_server_kill(&ApiServerKillOutcome { stopped_pid: None });
-        assert!(s.contains("not running"), "must say not running: {s}");
-    }
-
-    #[test]
-    fn render_api_server_logs_with_path() {
-        let s = render_api_server_logs(&ApiServerLogsOutcome {
-            log_path: "/tmp/awman.log".into(),
-        });
-        assert!(s.contains("/tmp/awman.log"), "log path must appear: {s}");
-    }
-
-    #[test]
-    fn render_api_server_logs_empty_path() {
-        let s = render_api_server_logs(&ApiServerLogsOutcome {
-            log_path: String::new(),
-        });
-        assert!(s.contains("No API server log"), "must say no log: {s}");
     }
 
     // ── render_remote ─────────────────────────────────────────────────────────

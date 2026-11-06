@@ -220,7 +220,7 @@ impl AcpSession {
     /// **before** the first prompt is sent, so no `session/update` of the seeded
     /// turn is lost — a `tokio::broadcast` drops any message published while it
     /// has no subscribers, which previously silenced the entire first turn of a
-    /// headless `exec prompt --launch-mode acp` run. Running the seeded turn
+    /// headless `exec prompt --set agents.launchMode=acp` run. Running the seeded turn
     /// inside the same driver loop also services `session/request_permission`
     /// during that turn, avoiding the permission-before-prompt-response
     /// circular wait.
@@ -480,7 +480,7 @@ mod tests {
     async fn seeded_turn_updates_are_rendered_not_dropped() {
         // Regression for M3: the update subscription must be taken before the
         // seeded prompt is sent, or the broadcast drops every update of the
-        // first turn (silencing headless `exec prompt --launch-mode acp`).
+        // first turn (silencing headless `exec prompt --set agents.launchMode=acp`).
         let (frontend, transport) = AcpTransport::channel();
         let mut io = frontend.into_io_for_test();
         let client = AcpClient::new(transport, Box::new(RecordingMessageSink::new()));

@@ -142,7 +142,7 @@ async fn resumed_workflow_with_all_steps_done_finishes() {
 }
 
 #[tokio::test]
-async fn terminal_parallel_group_completes_without_control_boards() {
+async fn terminal_parallel_group_opens_final_control_board() {
     let tmp = tempfile::tempdir().unwrap();
     let session = super::parallel::make_session_with_max_concurrent(&tmp, Some(2));
     let workflow = make_workflow(
@@ -167,10 +167,9 @@ async fn terminal_parallel_group_completes_without_control_boards() {
         engine.run_to_completion().await.unwrap(),
         WorkflowOutcome::Completed
     );
-    assert!(
-        boards.lock().unwrap().is_empty(),
-        "terminal parallel execution does not open a final board"
-    );
+    let boards = boards.lock().unwrap();
+    assert_eq!(boards.len(), 1);
+    assert!(boards[0].can_finish_workflow);
 }
 
 struct PeerBoardFrontend {

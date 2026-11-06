@@ -1,5 +1,5 @@
 //! End-to-end: an API-mode dynamic workflow through the real
-//! `ExecWorkflowCommand`, the API frontend, and the real `/v1/workflows/{id}`
+//! `ExecWorkflowCommand`, the API frontend, and the real `/v1/worker/commands/{id}`/workflow
 //! route, with a container runtime that only records what it was asked to run.
 
 use super::super::*;
@@ -12,7 +12,7 @@ use crate::command::commands::api_server::event_bus::EventBus;
 use crate::command::commands::command_trait::Command;
 use crate::command::commands::exec_workflow::{ExecWorkflowCommand, ExecWorkflowCommandFlags};
 use crate::command::dispatch::Engines;
-use crate::data::config::repo::OnDirtyMergeTarget;
+use crate::data::config::worktree::OnDirtyMergeTarget;
 use crate::data::execution_event::{EventPayload, PhaseStatusKind};
 use crate::data::fs::api_command_log::CommandStateWriter;
 use crate::data::fs::api_db::{NewSessionRow, SqliteSessionStore};
@@ -21,7 +21,7 @@ use crate::data::session::{Session, SessionKind};
 use crate::data::session_setup_event::SessionSetupStatus;
 use crate::data::workflow_state::{PhaseStepStatus, StepState, WorkflowPhase, WorkflowState};
 use crate::engine::git::GitEngine;
-use crate::frontend::api::routes::{build_router, AppState, AuthMode};
+use crate::frontend::api::routes::{build_router, AppState};
 
 const WORKFLOW: &str = r#"
 [[setup]]
@@ -83,6 +83,8 @@ fn app_state(root: &Path) -> Arc<AppState> {
         Arc::clone(&setup_cancels),
     );
     Arc::new(AppState {
+        live_config: std::sync::RwLock::new(None),
+        settings_tx: None,
         lifecycle_store,
         setup_cancels,
         canceller,
@@ -92,7 +94,6 @@ fn app_state(root: &Path) -> Arc<AppState> {
         workdir_roots: Vec::new(),
         started_at: std::time::Instant::now(),
         task_handles: tokio::sync::Mutex::new(Vec::new()),
-        auth_mode: AuthMode::Disabled,
         engines: Engines::for_tests(root),
         sessions: Arc::new(crate::data::session_manager::SessionManager::in_memory(
             crate::data::config::env::EnvSnapshot::empty(),
@@ -137,7 +138,7 @@ struct Run {
     commands: Vec<String>,
     /// `(phase, status)` of every setup/teardown transition event, in order.
     phase_events: Vec<(String, PhaseStatusKind)>,
-    /// The snapshot served by `GET /v1/workflows/{id}` after the run.
+    /// The snapshot served by `GET /v1/worker/commands/{id}`/workflow after the run.
     served: WorkflowState,
     /// Distinct snapshots a poller saw while the command ran, in order.
     polled: Vec<WorkflowState>,
@@ -170,7 +171,7 @@ async fn run_api_dynamic_workflow_with_initial_dirty(
     let app = app_state(&tmp.path().join("api"));
     app.store
         .insert_session_full(NewSessionRow {
-            id: "session",
+            id: "ses_21d6f40cfb511982e4424e0e250a9557",
             workdir: repo.to_str().unwrap(),
             created_at: &chrono::Utc::now().to_rfc3339(),
             setup_status: SessionSetupStatus::Ready,
@@ -179,14 +180,25 @@ async fn run_api_dynamic_workflow_with_initial_dirty(
         })
         .unwrap();
     app.store
-        .enqueue_command("command", "session", "exec workflow", "[]", "/log")
+        .enqueue_command(
+            "cmd_1dccadfed7bcbb036c56a4afb97e906f",
+            "ses_21d6f40cfb511982e4424e0e250a9557",
+            "exec workflow",
+            "[]",
+            "/log",
+        )
         .unwrap();
-    std::fs::create_dir_all(app.paths.command_dir("session", "command")).unwrap();
+    std::fs::create_dir_all(app.paths.command_dir(
+        "ses_21d6f40cfb511982e4424e0e250a9557",
+        "cmd_1dccadfed7bcbb036c56a4afb97e906f",
+    ))
+    .unwrap();
     let router = build_router(app.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-    let endpoint = format!("http://{addr}/v1/workflows/command");
+    let endpoint =
+        format!("http://{addr}/v1/worker/commands/cmd_1dccadfed7bcbb036c56a4afb97e906f/workflow");
 
     let commands = Arc::new(Mutex::new(Vec::<String>::new()));
     let hook_commands = commands.clone();
@@ -217,9 +229,16 @@ async fn run_api_dynamic_workflow_with_initial_dirty(
     let bus = EventBus::new(256);
     let mut events = bus.subscribe();
     let frontend = crate::frontend::api::ApiFrontendFactory.frontend_for(
-        &app.store.get_command("command").unwrap().unwrap(),
+        &app.store
+            .get_command("cmd_1dccadfed7bcbb036c56a4afb97e906f")
+            .unwrap()
+            .unwrap(),
         bus.sender(),
-        CommandStateWriter::new(app.paths.clone(), "session", "command"),
+        CommandStateWriter::new(
+            app.paths.clone(),
+            "ses_21d6f40cfb511982e4424e0e250a9557",
+            "cmd_1dccadfed7bcbb036c56a4afb97e906f",
+        ),
     );
     let session = Session::for_tests_isolated(&repo, &tmp.path().join("config-home"));
 
@@ -311,7 +330,7 @@ async fn api_dynamic_workflow_runs_teardown_and_squash_merges() {
         ]
     );
 
-    // GET /v1/workflows/{id} shows the finished run.
+    // GET /v1/worker/commands/{id}/workflow shows the finished run.
     let state = &run.served;
     assert_eq!(state.current_phase, WorkflowPhase::Done);
     assert!(state.teardown_completed);
@@ -416,7 +435,7 @@ enum RepairCase {
 /// Exercise the command's real finalize -> remediation factory -> runtime ->
 /// verification path, including API output forwarding and parent checkout mount.
 async fn run_merge_repair(case: RepairCase) {
-    use crate::data::config::repo::OnMergeFailure;
+    use crate::data::config::worktree::OnMergeFailure;
     use crate::engine::container::options::ModelFlagForm;
     use crate::engine::error::EngineError;
     const PARALLEL: &str = r#"
@@ -457,7 +476,7 @@ command = "make-conflict"
     let app = app_state(&tmp.path().join("api"));
     app.store
         .insert_session_full(NewSessionRow {
-            id: "s",
+            id: "ses_03c7c0ace395d80182db07ae2c30f034",
             workdir: repo.to_str().unwrap(),
             created_at: "now",
             setup_status: SessionSetupStatus::Ready,
@@ -466,13 +485,30 @@ command = "make-conflict"
         })
         .unwrap();
     app.store
-        .enqueue_command("c", "s", "exec workflow", "[]", "/log")
+        .enqueue_command(
+            "cmd_4a8a08f09d37b73795649038408b5f33",
+            "ses_03c7c0ace395d80182db07ae2c30f034",
+            "exec workflow",
+            "[]",
+            "/log",
+        )
         .unwrap();
-    std::fs::create_dir_all(app.paths.command_dir("s", "c")).unwrap();
+    std::fs::create_dir_all(app.paths.command_dir(
+        "ses_03c7c0ace395d80182db07ae2c30f034",
+        "cmd_4a8a08f09d37b73795649038408b5f33",
+    ))
+    .unwrap();
     let frontend = crate::frontend::api::ApiFrontendFactory.frontend_for(
-        &app.store.get_command("c").unwrap().unwrap(),
+        &app.store
+            .get_command("cmd_4a8a08f09d37b73795649038408b5f33")
+            .unwrap()
+            .unwrap(),
         bus.sender(),
-        CommandStateWriter::new(app.paths.clone(), "s", "c"),
+        CommandStateWriter::new(
+            app.paths.clone(),
+            "ses_03c7c0ace395d80182db07ae2c30f034",
+            "cmd_4a8a08f09d37b73795649038408b5f33",
+        ),
     );
 
     let calls = Arc::new(Mutex::new(Vec::<(String, Option<ModelFlagForm>)>::new()));

@@ -518,7 +518,7 @@ pub(super) fn finalize_unowned_command(
 /// rows were finalized. Every other row is still processed, but any error is
 /// returned afterwards and refuses startup: the requeue that follows would run a
 /// command that may already have finished a second time.
-pub(super) fn finalize_completed_from_sidecars(
+pub(crate) fn finalize_completed_from_sidecars(
     store: &SqliteSessionStore,
     paths: &ApiPaths,
 ) -> Result<usize, crate::data::error::DataError> {
@@ -631,6 +631,7 @@ pub trait ApiCommandFrontendFactory: Send + Sync {
 }
 
 pub struct QueueWorker<F: ApiCommandFrontendFactory> {
+    executor: Option<Arc<crate::engine::daemon::executor::SharedExecutor>>,
     worker_id: String,
     store: Arc<SqliteSessionStore>,
     engines: Engines,
@@ -672,10 +673,13 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
         &self,
     ) -> Result<(), crate::command::error::CommandError> {
         for id in self.lifecycle_store.cancelled_command_ids()? {
-            let Some(cmd) = self.store.get_command(&id)? else {
+            let Some(cmd) = self.store.get_command(id.as_str())? else {
                 continue;
             };
-            let Some(cleanup) = self.paths.read_command_cleanup(&cmd.session_id, &id)? else {
+            let Some(cleanup) = self
+                .paths
+                .read_command_cleanup(&cmd.session_id, id.as_str())?
+            else {
                 continue;
             };
             let session = self.sessions.get_by_key(&cmd.session_id).ok_or_else(|| {
@@ -686,14 +690,14 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
             })?;
             let session = session.read().await.clone();
             let bus = EventBus::for_attempt(4096, cmd.attempt);
-            let writer = CommandStateWriter::new(self.paths.clone(), &cmd.session_id, &id);
+            let writer = CommandStateWriter::new(self.paths.clone(), &cmd.session_id, id.as_str());
             let frontend = self
                 .frontend_factory
                 .frontend_for(&cmd, bus.sender(), writer);
             let mut engines = self.engines.clone();
             engines.runtime = Arc::new(super::owned_runtime::CommandOwnedRuntime::new(
                 Arc::clone(&engines.runtime),
-                &id,
+                id.as_str(),
             ));
             crate::command::commands::exec_workflow::finish_cancelled_cleanup(
                 &engines,
@@ -707,14 +711,17 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
             // Recovery only finishes teardown for an already-cancelled row.
             // Its private bus is intentionally neither published nor logged;
             // restarting sequence zero must not append duplicate event ids.
-            self.paths.remove_command_cleanup(&cmd.session_id, &id)?;
-            self.post_execution_check(&cmd.session_id, &id).await;
+            self.paths
+                .remove_command_cleanup(&cmd.session_id, id.as_str())?;
+            self.post_execution_check(&cmd.session_id, id.as_str())
+                .await;
         }
         Ok(())
     }
 
     pub fn new(worker_id: String, deps: QueueWorkerDeps<F>) -> Self {
         Self {
+            executor: None,
             worker_id,
             store: deps.store,
             engines: deps.engines,
@@ -728,8 +735,33 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
         }
     }
 
+    pub fn with_executor(
+        mut self,
+        executor: Arc<crate::engine::daemon::executor::SharedExecutor>,
+    ) -> Self {
+        self.executor = Some(executor);
+        self
+    }
+
     pub async fn run(self) {
+        self.run_until(tokio_util::sync::CancellationToken::new())
+            .await
+    }
+    pub async fn run_until(self, stop: tokio_util::sync::CancellationToken) {
         loop {
+            if stop.is_cancelled() {
+                return;
+            }
+            let permit = if let Some(executor) = &self.executor {
+                Some(
+                    tokio::select! { biased; _=stop.cancelled()=>return, permit=executor.acquire(crate::data::daemon_state::FeatureName::Worker)=>permit },
+                )
+            } else {
+                None
+            };
+            if stop.is_cancelled() {
+                return;
+            }
             // Claim and register the cancel token in one step, so a cancel
             // request never finds this command running without an owner.
             let claimed = self.cancels.claim(
@@ -743,16 +775,20 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
                         command_id = %cmd.id,
                         session_id = %cmd.session_id,
                         subcommand = %cmd.subcommand,
+                        trace_parent = ?cmd.trace_parent,
+                        listener = %cmd.listener,
                         "Worker claimed command"
                     );
                     let command_id = cmd.id.clone();
-                    self.execute_command(cmd, cancel).await;
+                    Box::pin(self.execute_command(cmd, cancel)).await;
                     self.cancels.unregister(&command_id);
                 }
                 Ok(None) => {
+                    drop(permit);
                     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                 }
                 Err(e) => {
+                    drop(permit);
                     tracing::error!(
                         worker_id = %self.worker_id,
                         error = %e,
@@ -777,7 +813,10 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
         // race with the claim) still applies.
         let cancel_requested_at = self
             .lifecycle_store
-            .cancel_requested_at(&command_id)
+            .cancel_requested_at(
+                &crate::data::ids::CommandId::parse(&command_id)
+                    .expect("validated persisted resource id"),
+            )
             .ok()
             .flatten();
         if cancel_requested_at.is_some() {
@@ -851,6 +890,8 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
                 "attempt": cmd.attempt,
                 "started_at": cmd.started_at,
                 "worker_id": self.worker_id,
+                "listener":cmd.listener,
+                "trace_parent":cmd.trace_parent,
             });
             self.write_metadata(&session_id, &command_id, &metadata);
         }
@@ -912,7 +953,7 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
         // output restarts (WI 0136).
         if cmd.attempt > FIRST_ATTEMPT {
             event_bus.sender().emit(EventPayload::StatusMessage {
-                phase: "queue".into(),
+                phase: "ses_a9d1cbf71942327e98b40cf5ef38a960".into(),
                 message: format!("re-queued after restart (attempt {})", cmd.attempt),
             });
         }
@@ -1012,9 +1053,34 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
         // `running` forever. Without this, any unwrap()/expect() that
         // fires inside the engine would vanish into tokio's task harness.
         use futures_util::FutureExt as _;
-        let dispatch_outcome = std::panic::AssertUnwindSafe(dispatch.run_command(&path_parts))
-            .catch_unwind()
-            .await;
+        // Dispatch includes the concrete command futures. Construct and poll
+        // them on a job thread with room for those futures, while I/O and
+        // spawned tasks continue using the daemon's Tokio runtime. This also
+        // keeps a long synchronous command off a listener's runtime thread.
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        let handle = tokio::runtime::Handle::current();
+        let command_path = subcommand.clone();
+        let span = tracing::Span::current();
+        let job = std::thread::Builder::new()
+            .name("awman-command".into())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(move || {
+                let _span = span.enter();
+                let outcome = handle.block_on(
+                    std::panic::AssertUnwindSafe(async move {
+                        let parts: Vec<_> = command_path.split_whitespace().collect();
+                        dispatch.run_command(&parts).await
+                    })
+                    .catch_unwind(),
+                );
+                let _ = result_tx.send(outcome);
+            });
+        let dispatch_outcome = match job {
+            Ok(_) => result_rx
+                .await
+                .unwrap_or_else(|e| Err(Box::new(e) as Box<dyn std::any::Any + Send>)),
+            Err(e) => Err(Box::new(e) as Box<dyn std::any::Any + Send>),
+        };
         let result = match dispatch_outcome {
             Ok(r) => r,
             Err(panic_payload) => {
@@ -1051,7 +1117,10 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
         // it runs still determines the final command status below.
         let cancelled_before_push = if command_succeeded_for_push(&result) {
             self.lifecycle_store
-                .cancel_requested_at(&command_id)
+                .cancel_requested_at(
+                    &crate::data::ids::CommandId::parse(&command_id)
+                        .expect("validated persisted resource id"),
+                )
                 .ok()
                 .flatten()
         } else {
@@ -1104,8 +1173,10 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
         // including a request received during automatic push-back.
         if let Some(requested_at) = &cancelled_before_push {
             completion = completion.cancelled(requested_at);
-        } else if let Ok(Some(requested_at)) = self.lifecycle_store.cancel_requested_at(&command_id)
-        {
+        } else if let Ok(Some(requested_at)) = self.lifecycle_store.cancel_requested_at(
+            &crate::data::ids::CommandId::parse(&command_id)
+                .expect("validated persisted resource id"),
+        ) {
             completion = completion.cancelled(&requested_at);
         }
         // This runs before post_execution_check can remove a remote clone.
@@ -1157,7 +1228,10 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
         });
         // Git collection and output summarization can take time; observe a
         // cancellation accepted during either before publishing the row.
-        if let Ok(Some(requested_at)) = self.lifecycle_store.cancel_requested_at(&command_id) {
+        if let Ok(Some(requested_at)) = self.lifecycle_store.cancel_requested_at(
+            &crate::data::ids::CommandId::parse(&command_id)
+                .expect("validated persisted resource id"),
+        ) {
             completion = completion.cancelled(&requested_at);
         }
         let exit_code = completion.exit_code;
@@ -1270,8 +1344,8 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
             }
         };
         let run_finished = matches!(
-            self.lifecycle_store.run_for_session(session_id),
-            Ok(Some(ref run)) if run.close_on_finish && run.command_id == command_id
+            self.lifecycle_store.run_for_session(&crate::data::ids::WorkerSessionId::parse(session_id).expect("validated persisted resource id")),
+            Ok(Some(ref run)) if run.close_on_finish && run.command_id.as_str() == command_id
         );
         if closing || run_finished {
             if let Err(error) = self.lifecycle.close(session_id).await {
@@ -1540,7 +1614,11 @@ mod completion_tests {
         let temp = tempfile::tempdir().unwrap();
         let store = SqliteSessionStore::open(temp.path()).unwrap();
         store
-            .insert_session("session", "/work", "2026-10-02")
+            .insert_session(
+                "ses_21d6f40cfb511982e4424e0e250a9557",
+                "/work",
+                "2026-10-02",
+            )
             .unwrap();
         for (index, (error, expected)) in [
             (
@@ -1570,7 +1648,13 @@ mod completion_tests {
         {
             let id = index.to_string();
             store
-                .enqueue_command(&id, "session", "prompt", "{}", "log")
+                .enqueue_command(
+                    &id,
+                    "ses_21d6f40cfb511982e4424e0e250a9557",
+                    "prompt",
+                    "{}",
+                    "log",
+                )
                 .unwrap();
             let command = store.claim_next_command("worker").unwrap().unwrap();
             assert_eq!(command.id, id);
@@ -1590,7 +1674,11 @@ mod completion_tests {
         for resumed in [false, true] {
             let tmp = tempfile::tempdir().unwrap();
             let paths = ApiPaths::at_root(tmp.path());
-            let writer = CommandStateWriter::new(paths, "session", "command");
+            let writer = CommandStateWriter::new(
+                paths,
+                "ses_21d6f40cfb511982e4424e0e250a9557",
+                "cmd_1dccadfed7bcbb036c56a4afb97e906f",
+            );
             let wt = tmp.path().join("worktree");
             std::fs::create_dir(&wt).unwrap();
             let prepared_writer = writer.clone();
@@ -1633,19 +1721,32 @@ mod adversarial_tests {
         let tmp = tempfile::tempdir().unwrap();
         let paths = ApiPaths::from_root(tmp.path());
         let store = SqliteSessionStore::open(tmp.path()).unwrap();
-        store.insert_session("s", "/work", "then").unwrap();
         store
-            .enqueue_command("c", "s", "exec prompt", "[]", "log")
+            .insert_session("ses_03c7c0ace395d80182db07ae2c30f034", "/work", "then")
+            .unwrap();
+        store
+            .enqueue_command(
+                "cmd_4a8a08f09d37b73795649038408b5f33",
+                "ses_03c7c0ace395d80182db07ae2c30f034",
+                "exec prompt",
+                "[]",
+                "log",
+            )
             .unwrap();
         store
             .complete_command(
-                "c",
+                "cmd_4a8a08f09d37b73795649038408b5f33",
                 CommandStatus::Done,
                 Some(0),
                 Some(r#"{"exit_code":0}"#),
             )
             .unwrap();
-        paths.prepare_command_dir("s", "c").unwrap();
+        paths
+            .prepare_command_dir(
+                "ses_03c7c0ace395d80182db07ae2c30f034",
+                "cmd_4a8a08f09d37b73795649038408b5f33",
+            )
+            .unwrap();
         let done = ExecutionEvent {
             timestamp: chrono::Utc::now(),
             attempt: 1,
@@ -1654,11 +1755,35 @@ mod adversarial_tests {
             payload: EventPayload::Done,
         };
         let text = format!("{}\n", serde_json::to_string(&done).unwrap());
-        std::fs::write(paths.command_events_log_path("s", "c"), &text).unwrap();
-        let before = store.get_command("c").unwrap().unwrap();
-        finalize_unowned_command(&store, &paths, "c").unwrap();
-        assert_eq!(store.get_command("c").unwrap().unwrap(), before);
-        assert_eq!(paths.read_command_events_raw("s", "c").unwrap(), text);
+        std::fs::write(
+            paths.command_events_log_path(
+                "ses_03c7c0ace395d80182db07ae2c30f034",
+                "cmd_4a8a08f09d37b73795649038408b5f33",
+            ),
+            &text,
+        )
+        .unwrap();
+        let before = store
+            .get_command("cmd_4a8a08f09d37b73795649038408b5f33")
+            .unwrap()
+            .unwrap();
+        finalize_unowned_command(&store, &paths, "cmd_4a8a08f09d37b73795649038408b5f33").unwrap();
+        assert_eq!(
+            store
+                .get_command("cmd_4a8a08f09d37b73795649038408b5f33")
+                .unwrap()
+                .unwrap(),
+            before
+        );
+        assert_eq!(
+            paths
+                .read_command_events_raw(
+                    "ses_03c7c0ace395d80182db07ae2c30f034",
+                    "cmd_4a8a08f09d37b73795649038408b5f33"
+                )
+                .unwrap(),
+            text
+        );
     }
 
     #[test]
@@ -1718,11 +1843,22 @@ mod adversarial_tests {
     async fn persistence_failure_still_publishes_the_in_memory_terminal_pair() {
         let tmp = tempfile::tempdir().unwrap();
         let store = SqliteSessionStore::open(tmp.path()).unwrap();
-        store.insert_session("s", "/work", "then").unwrap();
         store
-            .enqueue_command("c", "s", "exec prompt", "[]", "log")
+            .insert_session("ses_03c7c0ace395d80182db07ae2c30f034", "/work", "then")
             .unwrap();
-        let command = store.get_command("c").unwrap().unwrap();
+        store
+            .enqueue_command(
+                "cmd_4a8a08f09d37b73795649038408b5f33",
+                "ses_03c7c0ace395d80182db07ae2c30f034",
+                "exec prompt",
+                "[]",
+                "log",
+            )
+            .unwrap();
+        let command = store
+            .get_command("cmd_4a8a08f09d37b73795649038408b5f33")
+            .unwrap()
+            .unwrap();
         let connection = rusqlite::Connection::open(tmp.path().join("awman.db")).unwrap();
         connection.execute_batch("CREATE TRIGGER refuse_completion BEFORE UPDATE ON commands BEGIN SELECT RAISE(FAIL, 'injected'); END;").unwrap();
         let completion = QueuedCommandResult::new(
@@ -1756,11 +1892,12 @@ mod sidecar_tests {
     use crate::command::commands::api_server::cancel::{
         CancelOutcome, CommandCanceller, TokenRegistry,
     };
-    use crate::command::commands::api_server::runtime::ApiServerRuntime;
-    use crate::command::commands::api_server::ApiServeConfig;
+    use crate::command::commands::api_server::runtime::WorkerServices;
+    use crate::command::commands::api_server::WorkerConfig;
     use crate::command::error::CommandError;
-    use crate::data::config::env::{EnvSnapshot, AWMAN_CONFIG_HOME};
+    use crate::data::config::env::EnvSnapshot;
     use crate::data::execution_event::ExecutionEvent;
+    use crate::data::fs::data_paths::AWMAN_HOME;
 
     const REFUSE: &str = "CREATE TRIGGER refuse_completion BEFORE UPDATE ON commands BEGIN SELECT RAISE(FAIL, 'injected'); END;";
 
@@ -1777,15 +1914,23 @@ mod sidecar_tests {
             // Separate API and data roots, as `serve` resolves them: bootstrap
             // treats a database under the API root as a legacy one to migrate.
             let paths = ApiPaths::from_env(&EnvSnapshot::with_overrides([(
-                AWMAN_CONFIG_HOME,
+                AWMAN_HOME,
                 tmp.path().to_str().unwrap(),
             )]))
             .unwrap();
             paths.data_paths().ensure_root().unwrap();
             let store = Arc::new(SqliteSessionStore::open_from_paths(&paths).unwrap());
-            store.insert_session("s", "/missing", "then").unwrap();
             store
-                .enqueue_command("c", "s", "exec prompt", "[]", "log")
+                .insert_session("ses_03c7c0ace395d80182db07ae2c30f034", "/missing", "then")
+                .unwrap();
+            store
+                .enqueue_command(
+                    "cmd_4a8a08f09d37b73795649038408b5f33",
+                    "ses_03c7c0ace395d80182db07ae2c30f034",
+                    "exec prompt",
+                    "[]",
+                    "log",
+                )
                 .unwrap();
             Self {
                 tmp,
@@ -1817,7 +1962,7 @@ mod sidecar_tests {
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let bus = Arc::new(EventBus::for_attempt(16, command.attempt));
             let buses = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::from([
-                ("c".into(), bus.clone()),
+                ("cmd_4a8a08f09d37b73795649038408b5f33".into(), bus.clone()),
             ])));
             let mut stream = super::super::command_log_stream::CommandLogStream::open(
                 self.store.clone(),
@@ -1830,10 +1975,19 @@ mod sidecar_tests {
             )
             .await;
             let mut log_rx = bus.subscribe_log();
-            self.paths.prepare_command_dir("s", "c").unwrap();
-            let mut writer = CommandLogWriter::open_append(&self.paths, "s", "c")
-                .await
+            self.paths
+                .prepare_command_dir(
+                    "ses_03c7c0ace395d80182db07ae2c30f034",
+                    "cmd_4a8a08f09d37b73795649038408b5f33",
+                )
                 .unwrap();
+            let mut writer = CommandLogWriter::open_append(
+                &self.paths,
+                "ses_03c7c0ace395d80182db07ae2c30f034",
+                "cmd_4a8a08f09d37b73795649038408b5f33",
+            )
+            .await
+            .unwrap();
             completion
                 .publish(&self.store, &self.paths, &command, &bus.sender())
                 .await;
@@ -1900,20 +2054,18 @@ mod sidecar_tests {
         }
 
         /// A real daemon restart, through the same bootstrap `serve` runs.
-        fn restart(&self) -> Result<ApiServerRuntime, CommandError> {
+        fn restart(&self) -> Result<WorkerServices, CommandError> {
             let mut engines = Engines::for_tests(self.tmp.path());
             engines.auth_engine = Arc::new(crate::engine::auth::AuthEngine::with_paths(
                 crate::data::fs::auth_paths::AuthPathResolver::at_home(self.tmp.path()),
                 self.paths.clone(),
             ));
-            ApiServerRuntime::bootstrap(
-                ApiServeConfig {
+            WorkerServices::bootstrap(
+                WorkerConfig {
                     port: 0,
                     bind_ip: std::net::IpAddr::from([127, 0, 0, 1]),
                     workdirs: vec![],
                     workdir_roots: vec![],
-                    dangerously_skip_auth: true,
-                    tls_material: None,
                     env: crate::data::config::env::EnvSnapshot::empty(),
                 },
                 engines,
@@ -1921,16 +2073,27 @@ mod sidecar_tests {
         }
 
         fn row(&self) -> CommandRecord {
-            self.store.get_command("c").unwrap().unwrap()
+            self.store
+                .get_command("cmd_4a8a08f09d37b73795649038408b5f33")
+                .unwrap()
+                .unwrap()
         }
 
         fn sidecar_exists(&self) -> bool {
-            self.paths.command_completion_path("s", "c").exists()
+            self.paths
+                .command_completion_path(
+                    "ses_03c7c0ace395d80182db07ae2c30f034",
+                    "cmd_4a8a08f09d37b73795649038408b5f33",
+                )
+                .exists()
         }
 
         fn terminal_events(&self) -> Vec<ExecutionEvent> {
             self.paths
-                .read_command_events("s", "c")
+                .read_command_events(
+                    "ses_03c7c0ace395d80182db07ae2c30f034",
+                    "cmd_4a8a08f09d37b73795649038408b5f33",
+                )
                 .into_iter()
                 .filter(|event| {
                     matches!(
@@ -1943,7 +2106,11 @@ mod sidecar_tests {
 
         fn write_sidecar(&self, attempt: u32, completion: &QueuedCommandResult) {
             self.paths
-                .write_command_completion("s", "c", &completion.sidecar(attempt))
+                .write_command_completion(
+                    "ses_03c7c0ace395d80182db07ae2c30f034",
+                    "cmd_4a8a08f09d37b73795649038408b5f33",
+                    &completion.sidecar(attempt),
+                )
                 .unwrap();
         }
     }
@@ -1994,10 +2161,16 @@ mod sidecar_tests {
             assert_eq!(fixture.row().status.as_str(), "running");
             let recorded = fixture
                 .paths
-                .read_command_completion("s", "c")
+                .read_command_completion(
+                    "ses_03c7c0ace395d80182db07ae2c30f034",
+                    "cmd_4a8a08f09d37b73795649038408b5f33",
+                )
                 .unwrap()
                 .expect("sidecar survives a failed row write");
-            let live_events = fixture.paths.read_command_events_raw("s", "c");
+            let live_events = fixture.paths.read_command_events_raw(
+                "ses_03c7c0ace395d80182db07ae2c30f034",
+                "cmd_4a8a08f09d37b73795649038408b5f33",
+            );
             assert_one_terminal_pair(&fixture, &completion);
 
             fixture.sql("DROP TRIGGER refuse_completion;");
@@ -2017,7 +2190,13 @@ mod sidecar_tests {
                 1
             );
             // The terminal event clients already saw is the only one logged.
-            assert_eq!(fixture.paths.read_command_events_raw("s", "c"), live_events);
+            assert_eq!(
+                fixture.paths.read_command_events_raw(
+                    "ses_03c7c0ace395d80182db07ae2c30f034",
+                    "cmd_4a8a08f09d37b73795649038408b5f33"
+                ),
+                live_events
+            );
         }
     }
 
@@ -2033,12 +2212,21 @@ mod sidecar_tests {
         assert_eq!(row.status.as_str(), "done");
         assert!(!fixture.sidecar_exists());
         assert_one_terminal_pair(&fixture, &completion);
-        let events = fixture.paths.read_command_events_raw("s", "c");
+        let events = fixture.paths.read_command_events_raw(
+            "ses_03c7c0ace395d80182db07ae2c30f034",
+            "cmd_4a8a08f09d37b73795649038408b5f33",
+        );
 
         // A second restart has nothing left to do.
         fixture.restart().unwrap();
         assert_eq!(fixture.row(), row);
-        assert_eq!(fixture.paths.read_command_events_raw("s", "c"), events);
+        assert_eq!(
+            fixture.paths.read_command_events_raw(
+                "ses_03c7c0ace395d80182db07ae2c30f034",
+                "cmd_4a8a08f09d37b73795649038408b5f33"
+            ),
+            events
+        );
     }
 
     #[test]
@@ -2050,7 +2238,10 @@ mod sidecar_tests {
             finalize_completed_from_sidecars(&fixture.store, &fixture.paths).unwrap(),
             0
         );
-        assert_eq!(fixture.store.recover_stale_commands(0).unwrap(), ["c"]);
+        assert_eq!(
+            fixture.store.recover_stale_commands(0).unwrap(),
+            ["cmd_4a8a08f09d37b73795649038408b5f33"]
+        );
         let row = fixture.row();
         assert_eq!((row.status.as_str(), row.attempt), ("queued", 2));
     }
@@ -2066,15 +2257,31 @@ mod sidecar_tests {
             0
         );
         assert!(!fixture.sidecar_exists());
-        assert_eq!(fixture.store.recover_stale_commands(0).unwrap(), ["c"]);
+        assert_eq!(
+            fixture.store.recover_stale_commands(0).unwrap(),
+            ["cmd_4a8a08f09d37b73795649038408b5f33"]
+        );
     }
 
     #[test]
     fn malformed_sidecar_refuses_startup_and_never_requeues() {
         let fixture = Fixture::new();
         fixture.claim();
-        fixture.paths.prepare_command_dir("s", "c").unwrap();
-        std::fs::write(fixture.paths.command_completion_path("s", "c"), "{").unwrap();
+        fixture
+            .paths
+            .prepare_command_dir(
+                "ses_03c7c0ace395d80182db07ae2c30f034",
+                "cmd_4a8a08f09d37b73795649038408b5f33",
+            )
+            .unwrap();
+        std::fs::write(
+            fixture.paths.command_completion_path(
+                "ses_03c7c0ace395d80182db07ae2c30f034",
+                "cmd_4a8a08f09d37b73795649038408b5f33",
+            ),
+            "{",
+        )
+        .unwrap();
         let error = fixture.restart().err().expect("startup must refuse");
         assert!(
             error.to_string().contains("completion.json"),
@@ -2086,7 +2293,13 @@ mod sidecar_tests {
         assert!(fixture.store.claim_next_command("next").unwrap().is_none());
 
         // The named repair: remove the evidence to allow the command to rerun.
-        fixture.paths.remove_command_completion("s", "c").unwrap();
+        fixture
+            .paths
+            .remove_command_completion(
+                "ses_03c7c0ace395d80182db07ae2c30f034",
+                "cmd_4a8a08f09d37b73795649038408b5f33",
+            )
+            .unwrap();
         assert_eq!(
             finalize_completed_from_sidecars(&fixture.store, &fixture.paths).unwrap(),
             0
@@ -2100,7 +2313,10 @@ mod sidecar_tests {
         let fixture = Fixture::new();
         let command = fixture.claim();
         fixture.write_sidecar(command.attempt, &completed());
-        let path = fixture.paths.command_completion_path("s", "c");
+        let path = fixture.paths.command_completion_path(
+            "ses_03c7c0ace395d80182db07ae2c30f034",
+            "cmd_4a8a08f09d37b73795649038408b5f33",
+        );
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
         if std::fs::read(&path).is_ok() {
             return; // Running as root: the mode cannot deny access.
@@ -2118,24 +2334,57 @@ mod sidecar_tests {
     fn one_unreadable_sidecar_does_not_stop_the_others_from_finalizing() {
         let fixture = Fixture::new();
         fixture.claim();
-        fixture.paths.prepare_command_dir("s", "c").unwrap();
-        std::fs::write(fixture.paths.command_completion_path("s", "c"), "{").unwrap();
-        fixture
-            .store
-            .insert_session("s2", "/missing", "then")
-            .unwrap();
-        fixture
-            .store
-            .enqueue_command("good", "s2", "exec prompt", "[]", "log")
-            .unwrap();
-        let good = fixture.store.claim_next_command("worker").unwrap().unwrap();
-        fixture.paths.prepare_command_dir("s2", "good").unwrap();
         fixture
             .paths
-            .write_command_completion("s2", "good", &completed().sidecar(good.attempt))
+            .prepare_command_dir(
+                "ses_03c7c0ace395d80182db07ae2c30f034",
+                "cmd_4a8a08f09d37b73795649038408b5f33",
+            )
+            .unwrap();
+        std::fs::write(
+            fixture.paths.command_completion_path(
+                "ses_03c7c0ace395d80182db07ae2c30f034",
+                "cmd_4a8a08f09d37b73795649038408b5f33",
+            ),
+            "{",
+        )
+        .unwrap();
+        fixture
+            .store
+            .insert_session("ses_fac989447cad2edbc89fbcba70003b36", "/missing", "then")
+            .unwrap();
+        fixture
+            .store
+            .enqueue_command(
+                "cmd_755f85c2723bb39381c7379a604160d8",
+                "ses_fac989447cad2edbc89fbcba70003b36",
+                "exec prompt",
+                "[]",
+                "log",
+            )
+            .unwrap();
+        let good = fixture.store.claim_next_command("worker").unwrap().unwrap();
+        fixture
+            .paths
+            .prepare_command_dir(
+                "ses_fac989447cad2edbc89fbcba70003b36",
+                "cmd_755f85c2723bb39381c7379a604160d8",
+            )
+            .unwrap();
+        fixture
+            .paths
+            .write_command_completion(
+                "ses_fac989447cad2edbc89fbcba70003b36",
+                "cmd_755f85c2723bb39381c7379a604160d8",
+                &completed().sidecar(good.attempt),
+            )
             .unwrap();
         assert!(finalize_completed_from_sidecars(&fixture.store, &fixture.paths).is_err());
-        let good = fixture.store.get_command("good").unwrap().unwrap();
+        let good = fixture
+            .store
+            .get_command("cmd_755f85c2723bb39381c7379a604160d8")
+            .unwrap()
+            .unwrap();
         assert_eq!(good.status.as_str(), "done");
         assert_eq!(fixture.row().status.as_str(), "running");
     }
@@ -2156,15 +2405,23 @@ mod sidecar_tests {
         let completion = completed();
         fixture.run_fake_command(&completion, true).await;
         fixture.sql("DROP TRIGGER refuse_completion;");
-        let events = fixture.paths.read_command_events_raw("s", "c");
+        let events = fixture.paths.read_command_events_raw(
+            "ses_03c7c0ace395d80182db07ae2c30f034",
+            "cmd_4a8a08f09d37b73795649038408b5f33",
+        );
         let recorded = fixture
             .paths
-            .read_command_completion("s", "c")
+            .read_command_completion(
+                "ses_03c7c0ace395d80182db07ae2c30f034",
+                "cmd_4a8a08f09d37b73795649038408b5f33",
+            )
             .unwrap()
             .unwrap();
 
         // The worker returned and unregistered; its row write never landed.
-        let outcome = unowned_canceller(&fixture).cancel("c").unwrap();
+        let outcome = unowned_canceller(&fixture)
+            .cancel("cmd_4a8a08f09d37b73795649038408b5f33")
+            .unwrap();
         let CancelOutcome::AlreadyTerminal(row) = outcome else {
             panic!("a published completion cannot be cancelled: {outcome:?}");
         };
@@ -2175,12 +2432,20 @@ mod sidecar_tests {
         // A repeat cancel and a restart both leave what clients were told.
         let row = fixture.row();
         assert!(matches!(
-            unowned_canceller(&fixture).cancel("c").unwrap(),
+            unowned_canceller(&fixture)
+                .cancel("cmd_4a8a08f09d37b73795649038408b5f33")
+                .unwrap(),
             CancelOutcome::AlreadyTerminal(_)
         ));
         let runtime = fixture.restart().unwrap();
         assert_eq!(fixture.row(), row);
-        assert_eq!(fixture.paths.read_command_events_raw("s", "c"), events);
+        assert_eq!(
+            fixture.paths.read_command_events_raw(
+                "ses_03c7c0ace395d80182db07ae2c30f034",
+                "cmd_4a8a08f09d37b73795649038408b5f33"
+            ),
+            events
+        );
         assert!(runtime.store.claim_next_command("next").unwrap().is_none());
     }
 
@@ -2188,9 +2453,24 @@ mod sidecar_tests {
     fn cancel_refuses_to_overwrite_an_unreadable_completion() {
         let fixture = Fixture::new();
         fixture.claim();
-        fixture.paths.prepare_command_dir("s", "c").unwrap();
-        std::fs::write(fixture.paths.command_completion_path("s", "c"), "{").unwrap();
-        assert!(unowned_canceller(&fixture).cancel("c").is_err());
+        fixture
+            .paths
+            .prepare_command_dir(
+                "ses_03c7c0ace395d80182db07ae2c30f034",
+                "cmd_4a8a08f09d37b73795649038408b5f33",
+            )
+            .unwrap();
+        std::fs::write(
+            fixture.paths.command_completion_path(
+                "ses_03c7c0ace395d80182db07ae2c30f034",
+                "cmd_4a8a08f09d37b73795649038408b5f33",
+            ),
+            "{",
+        )
+        .unwrap();
+        assert!(unowned_canceller(&fixture)
+            .cancel("cmd_4a8a08f09d37b73795649038408b5f33")
+            .is_err());
         assert_eq!(fixture.row().status.as_str(), "running");
         assert!(fixture.sidecar_exists());
     }
@@ -2201,7 +2481,9 @@ mod sidecar_tests {
         fixture.claim();
         fixture.write_sidecar(7, &completed());
         assert!(matches!(
-            unowned_canceller(&fixture).cancel("c").unwrap(),
+            unowned_canceller(&fixture)
+                .cancel("cmd_4a8a08f09d37b73795649038408b5f33")
+                .unwrap(),
             CancelOutcome::Cancelled(_)
         ));
         assert_eq!(fixture.row().status.as_str(), "cancelled");
@@ -2215,7 +2497,12 @@ mod sidecar_tests {
         fixture.write_sidecar(command.attempt, &completed());
         fixture
             .store
-            .complete_command("c", CommandStatus::Cancelled, Some(130), Some("{}"))
+            .complete_command(
+                "cmd_4a8a08f09d37b73795649038408b5f33",
+                CommandStatus::Cancelled,
+                Some(130),
+                Some("{}"),
+            )
             .unwrap();
         let before = fixture.row();
         fixture.restart().unwrap();
@@ -2245,7 +2532,13 @@ mod sidecar_tests {
         let command = fixture.claim();
         fixture.write_sidecar(command.attempt, &completed());
         let lifecycle = CommandLifecycleStore::open(fixture.store.clone()).unwrap();
-        lifecycle.request_cancel("c", "later").unwrap();
+        lifecycle
+            .request_cancel(
+                &crate::data::ids::CommandId::parse("cmd_4a8a08f09d37b73795649038408b5f33")
+                    .unwrap(),
+                "later",
+            )
+            .unwrap();
         fixture.restart().unwrap();
         let row = fixture.row();
         assert_eq!((row.status.as_str(), row.exit_code), ("done", Some(0)));
@@ -2259,14 +2552,17 @@ mod sidecar_tests {
         fixture.write_sidecar(command.attempt, &completed());
         fixture
             .store
-            .update_session_status("s", SessionStatus::Closing)
+            .update_session_status(
+                "ses_03c7c0ace395d80182db07ae2c30f034",
+                SessionStatus::Closing,
+            )
             .unwrap();
         fixture.restart().unwrap();
         assert_eq!(fixture.row().status.as_str(), "done");
         assert_eq!(
             fixture
                 .store
-                .get_session("s")
+                .get_session("ses_03c7c0ace395d80182db07ae2c30f034")
                 .unwrap()
                 .unwrap()
                 .status
@@ -2278,7 +2574,7 @@ mod sidecar_tests {
     fn session_status(fixture: &Fixture) -> String {
         fixture
             .store
-            .get_session("s")
+            .get_session("ses_03c7c0ace395d80182db07ae2c30f034")
             .unwrap()
             .unwrap()
             .status
@@ -2295,14 +2591,22 @@ mod sidecar_tests {
             let command = fixture.claim();
             fixture
                 .store
-                .update_session_status("s", SessionStatus::Closing)
+                .update_session_status(
+                    "ses_03c7c0ace395d80182db07ae2c30f034",
+                    SessionStatus::Closing,
+                )
                 .unwrap();
             if keep_sidecar {
                 fixture.write_sidecar(command.attempt, &completed());
             }
             fixture
                 .store
-                .complete_command("c", CommandStatus::Done, Some(0), Some("{}"))
+                .complete_command(
+                    "cmd_4a8a08f09d37b73795649038408b5f33",
+                    CommandStatus::Done,
+                    Some(0),
+                    Some("{}"),
+                )
                 .unwrap();
             fixture.restart().unwrap();
             assert_eq!(session_status(&fixture), "closed", "{keep_sidecar}");
@@ -2316,7 +2620,10 @@ mod sidecar_tests {
         let fixture = Fixture::new();
         fixture
             .store
-            .update_session_status("s", SessionStatus::Closing)
+            .update_session_status(
+                "ses_03c7c0ace395d80182db07ae2c30f034",
+                SessionStatus::Closing,
+            )
             .unwrap();
         fixture.restart().unwrap();
         assert_eq!(fixture.row().status.as_str(), "queued");
@@ -2329,9 +2636,18 @@ mod sidecar_tests {
         fixture.claim();
         fixture
             .store
-            .update_session_status("s", SessionStatus::Closing)
+            .update_session_status(
+                "ses_03c7c0ace395d80182db07ae2c30f034",
+                SessionStatus::Closing,
+            )
             .unwrap();
-        fixture.paths.prepare_command_dir("s", "c").unwrap();
+        fixture
+            .paths
+            .prepare_command_dir(
+                "ses_03c7c0ace395d80182db07ae2c30f034",
+                "cmd_4a8a08f09d37b73795649038408b5f33",
+            )
+            .unwrap();
         let cleanup = crate::data::workflow_cleanup::WorkflowCleanup {
             workflow: crate::data::workflow_definition::Workflow {
                 title: None,
@@ -2353,11 +2669,20 @@ mod sidecar_tests {
         };
         fixture
             .paths
-            .write_command_cleanup("s", "c", &cleanup)
+            .write_command_cleanup(
+                "ses_03c7c0ace395d80182db07ae2c30f034",
+                "cmd_4a8a08f09d37b73795649038408b5f33",
+                &cleanup,
+            )
             .unwrap();
         fixture
             .store
-            .complete_command("c", CommandStatus::Cancelled, Some(130), Some("{}"))
+            .complete_command(
+                "cmd_4a8a08f09d37b73795649038408b5f33",
+                CommandStatus::Cancelled,
+                Some(130),
+                Some("{}"),
+            )
             .unwrap();
         fixture.restart().unwrap();
         assert_eq!(session_status(&fixture), "closing");
@@ -2375,7 +2700,9 @@ mod sidecar_tests {
     async fn unwritable_sidecar_does_not_stop_the_row_write() {
         let fixture = Fixture::new();
         let command = fixture.claim();
-        let directory = fixture.paths.session_commands_dir("s");
+        let directory = fixture
+            .paths
+            .session_commands_dir("ses_03c7c0ace395d80182db07ae2c30f034");
         std::fs::create_dir_all(directory.parent().unwrap()).unwrap();
         std::fs::write(&directory, "not a directory").unwrap();
         let bus = EventBus::new(8);

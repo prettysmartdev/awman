@@ -19,13 +19,13 @@ fn make_api_frontend(subcommand: &str) -> (ApiDispatchFrontend, EventBus) {
 }
 
 /// A non-interactive `CliFrontend`. The mode is asked for with
-/// `--non-interactive` rather than inferred: `cargo test` run from a terminal
+/// `--headless` rather than inferred: `cargo test` run from a terminal
 /// inherits a TTY stdin, which would otherwise select the interactive path.
 fn make_cli_frontend() -> CliFrontend {
     use awman::command::dispatch::catalogue::CommandCatalogue;
     let cmd = CommandCatalogue::get().build_clap_command();
     let m = cmd
-        .try_get_matches_from(["awman", "exec", "workflow", "--non-interactive", "wf.toml"])
+        .try_get_matches_from(["awman", "exec", "workflow", "--headless", "wf.toml"])
         .unwrap();
     CliFrontend::new(m)
 }

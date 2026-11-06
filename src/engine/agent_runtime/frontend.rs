@@ -91,12 +91,12 @@ pub struct AgentIo {
     /// (`try_inject_stdin`) push into the matching sender.
     pub stdin_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
     /// PTY resize requests from the frontend. `Some` for interactive
-    /// frontends (TUI, CLI with TTY), `None` for non-interactive (CLI
-    /// `--non-interactive`, API). When `None`, the engine uses
+    /// frontends (TUI, CLI with TTY), `None` for headless (CLI
+    /// `--headless`, API). When `None`, the engine uses
     /// `Stdio::piped()` for the agent process.
     pub resize: Option<tokio::sync::mpsc::UnboundedReceiver<(u16, u16)>>,
     /// Initial PTY size at spawn time. `Some` for interactive frontends,
-    /// `None` for non-interactive. When `None`, the engine uses
+    /// `None` for headless. When `None`, the engine uses
     /// `Stdio::piped()`.
     pub initial_size: Option<(u16, u16)>,
 }

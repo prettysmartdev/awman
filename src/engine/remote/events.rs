@@ -19,7 +19,7 @@ pub trait RemoteEventSink: Send + Sync {
 }
 
 /// Sink for typed `ExecutionEvent`s streaming over SSE from the per-job
-/// `/logs` endpoint. The default impl ignores everything — callers override
+/// `/events` endpoint. The default impl ignores everything — callers override
 /// the methods they care about. Each callback returns `bool`; returning
 /// `true` from any callback ends the stream early (e.g. on Ctrl-C).
 pub trait ExecutionEventSink: Send {
@@ -33,7 +33,7 @@ pub trait ExecutionEventSink: Send {
 }
 
 impl RemoteClient {
-    /// `GET /v1/commands/{id}/logs` (SSE) — stream typed
+    /// `GET /v1/worker/commands/{id}/events` (SSE) — stream typed
     /// `ExecutionEvent` values to the sink. Terminates when the server sends
     /// a `Done` event or the sink returns `true` from any callback.
     pub async fn stream_job_logs(
@@ -45,7 +45,7 @@ impl RemoteClient {
         use crate::data::execution_event::EventPayload;
         use futures_util::StreamExt;
 
-        let url = self.core.url(&["commands", job_id, "logs"]);
+        let url = self.core.url(&["worker", "commands", job_id, "events"]);
 
         let resp = self
             .core
@@ -210,7 +210,9 @@ mod tests {
 
         let server = MockServer::start().await;
         Mock::given(matchers::method("GET"))
-            .and(matchers::path("/v1/commands/cmd-1/logs/stream"))
+            .and(matchers::path(
+                "/v1/worker/commands/cmd_00000000000000000000000000000001/events",
+            ))
             .respond_with(
                 ResponseTemplate::new(200)
                     .insert_header("content-type", "text/event-stream")
@@ -239,7 +241,16 @@ mod tests {
             done: false,
         };
         let result = client
-            .stream_command_legacy(&["commands", "cmd-1", "logs", "stream"], &[], &mut sink)
+            .stream_command_legacy(
+                &[
+                    "worker",
+                    "commands",
+                    "cmd_00000000000000000000000000000001",
+                    "events",
+                ],
+                &[],
+                &mut sink,
+            )
             .await;
         assert!(result.is_ok(), "stream_command should succeed: {result:?}");
         assert!(sink.done, "on_done must be called");

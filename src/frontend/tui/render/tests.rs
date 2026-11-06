@@ -257,7 +257,7 @@ fn config_show_truncates_long_cell_and_shows_full_value_in_detail_line() {
             global_writable: false,
             repo_writable: true,
             value_hint: None,
-            shape: crate::command::commands::config::ConfigRowShape::Scalar,
+            shape: crate::command::commands::config::ConfigRowKind::Scalar,
         }],
         selected: 0,
         editing: false,
@@ -311,7 +311,7 @@ fn config_show_scrolls_to_reveal_rows_past_the_visible_window() {
                 global_writable: true,
                 repo_writable: true,
                 value_hint: None,
-                shape: crate::command::commands::config::ConfigRowShape::Scalar,
+                shape: crate::command::commands::config::ConfigRowKind::Scalar,
             })
             .collect();
         rows.push(dialogs::ConfigShowRow {
@@ -323,7 +323,7 @@ fn config_show_scrolls_to_reveal_rows_past_the_visible_window() {
             global_writable: false,
             repo_writable: true,
             value_hint: None,
-            shape: crate::command::commands::config::ConfigRowShape::Scalar,
+            shape: crate::command::commands::config::ConfigRowKind::Scalar,
         });
         rows
     }
@@ -417,7 +417,7 @@ fn config_show_editing_long_value_keeps_cursor_visible_in_cell() {
             global_writable: true,
             repo_writable: true,
             value_hint: None,
-            shape: crate::command::commands::config::ConfigRowShape::Scalar,
+            shape: crate::command::commands::config::ConfigRowKind::Scalar,
         }],
         selected: 0,
         editing: true,
@@ -469,7 +469,7 @@ fn config_show_add_mapping_prompts_render_per_phase() {
             global_writable: false,
             repo_writable: false,
             value_hint: None,
-            shape: crate::command::commands::config::ConfigRowShape::MapHeader {
+            shape: crate::command::commands::config::ConfigRowKind::MapHeader {
                 child_prefix: "demo.map.",
             },
         }],
@@ -491,8 +491,8 @@ fn config_show_add_mapping_prompts_render_per_phase() {
 
 #[test]
 fn config_show_ctrl_n_hint_only_on_map_and_list_rows() {
-    use crate::command::commands::config::ConfigRowShape;
-    fn browse_state(field: &str, shape: ConfigRowShape) -> dialogs::ConfigShowState {
+    use crate::command::commands::config::ConfigRowKind;
+    fn browse_state(field: &str, shape: ConfigRowKind) -> dialogs::ConfigShowState {
         dialogs::ConfigShowState {
             rows: vec![dialogs::ConfigShowRow {
                 field: field.to_string(),
@@ -515,7 +515,7 @@ fn config_show_ctrl_n_hint_only_on_map_and_list_rows() {
     }
 
     let unrelated = buffer_text(&render_to_buffer(140, 30, |area, frame| {
-        render_config_show(&browse_state("agent", ConfigRowShape::Scalar), area, frame);
+        render_config_show(&browse_state("agent", ConfigRowKind::Scalar), area, frame);
     }));
     assert!(
         !unrelated.contains("Ctrl+N"),
@@ -525,11 +525,11 @@ fn config_show_ctrl_n_hint_only_on_map_and_list_rows() {
     for (field, shape) in [
         (
             "demo.map",
-            ConfigRowShape::MapHeader {
+            ConfigRowKind::MapHeader {
                 child_prefix: "demo.map.",
             },
         ),
-        ("demo.map.claude", ConfigRowShape::MapEntry),
+        ("demo.map.claude", ConfigRowKind::MapEntry),
     ] {
         let mapping = buffer_text(&render_to_buffer(140, 30, |area, frame| {
             render_config_show(&browse_state(field, shape), area, frame);
@@ -555,7 +555,7 @@ fn config_show_renders_rejection_reason_over_format_hint() {
             global_writable: false,
             repo_writable: true,
             value_hint: Some("agent::model".to_string()),
-            shape: crate::command::commands::config::ConfigRowShape::Scalar,
+            shape: crate::command::commands::config::ConfigRowKind::Scalar,
         }],
         selected: 0,
         editing: true,
@@ -748,7 +748,7 @@ fn command_box_scroll_offset_zero_width_does_not_underflow() {
 // ─── Shape-driven rows in both scope views (WI 0150) ────────────────────────
 
 fn shaped_state(edit_column: usize, selected: usize) -> dialogs::ConfigShowState {
-    use crate::command::commands::config::ConfigRowShape as Shape;
+    use crate::command::commands::config::ConfigRowKind as Shape;
     let row =
         |field: &str, shape: Shape, global: &str, repo: &str, effective: &str, header: bool| {
             dialogs::ConfigShowRow {

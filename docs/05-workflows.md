@@ -693,7 +693,7 @@ Every setup and teardown step that runs a command (every step type except `poll_
 3. When the command exits, the container exits and is removed. In the TUI the container window closes, leaving the summary bar
 4. All of the command's output is also recorded, so a failing step's [`on_failure` agent](#step-remediation-with-on_failure) still gets it in its failure file. A terminal merges a command's stdout and stderr into one stream, so the whole transcript appears under `STDOUT` and `STDERR` reads `(empty)`; color codes are stripped
 
-**Headless (`--non-interactive` CLI, the API server, and squad), and any run holding a token grant:**
+**Headless (`--headless` CLI, the API server, and squad), and any run holding a token grant:**
 1. awman starts a background container, runs the step's command in it with no terminal attached, then removes the container
 2. Each line of output is redacted, then streamed as it's printed: in the TUI into the step's container window (which closes when the step ends), in the CLI to your terminal, and in the API/squad event stream
 3. stdout and stderr are captured separately for the `on_failure` failure file
@@ -896,7 +896,7 @@ awman: Set up agent codex? [y]es / [n]o / [f]allback to claude
 - **Fallback** — the steps that would have run `codex` run with the default agent instead (the `--agent` flag, else the configured `agent`, else `claude`). It is offered only when the default agent's image exists.
 - **No** (or Esc in the TUI) — the run stops before any container starts and tells you to prepare the agent with `awman ready --agent codex`.
 
-The TUI asks the same question in a dialog. A run with no terminal to ask (piped CLI, `--non-interactive`, squad) sets the agent up; the HTTP API sets it up when the default agent's image exists and otherwise refuses the command. You can always prepare images ahead of time:
+The TUI asks the same question in a dialog. A run with no terminal to ask (piped CLI, `--headless`, squad) sets the agent up; the HTTP API sets it up when the default agent's image exists and otherwise refuses the command. You can always prepare images ahead of time:
 
 ```sh
 awman ready --agent codex
@@ -904,7 +904,7 @@ awman ready --agent codex
 
 This check applies to the Docker and Apple Containers runtimes, which build images; when the runtime itself is unreachable, the run reports that instead. A [dynamic workflow](06-dynamic-workflows.md) checks the generated workflow's agents after the leader finishes and builds any missing image from `.awman/Dockerfile.<agent>` before the first step; a failed build stops the run.
 
-**Builtin runtime.** Image preparation for workflows (and squad) is import-only: it never starts a host build, even when `builtin.builder.enabled` is true, but it re-acquires an image that was installed from a different source than the one now configured (an installed image with no configured source is kept). A step that runs an agent other than the repo's default one stops when `builtin.imageSource` names a single image (an archive, or a fixed `reference`): give that agent its own `builtin.images` entry. In a worktree, the repo's `builtin` settings and default `agent` come from the checkout you launched from, not the worktree's commit. If a required agent image is not imported, the run stops and tells you to prepare it with `awman ready` (or to configure an image source). Setup and teardown steps run in the imported agent image of the repo's configured agent (or in the `baseImage` you set, which must also be imported). See [Runtimes: Builtin microVM](11-runtimes.md#builtin-microvm-experimental).
+**Builtin runtime.** Image preparation for workflows (and squad) is import-only: it never starts a host build, even when `runtime.builtin.builder.enabled` is true, but it re-acquires an image that was installed from a different source than the one now configured (an installed image with no configured source is kept). A step that runs an agent other than the repo's default one stops when `runtime.builtin.imageSource` names a single image (an archive, or a fixed `reference`): give that agent its own `runtime.builtin.images` entry. In a worktree, the repo's `runtime.builtin` settings and default `agents.default` come from the checkout you launched from, not the worktree's commit. If a required agent image is not imported, the run stops and tells you to prepare it with `awman ready` (or to configure an image source). Setup and teardown steps run in the imported agent image of the repo's configured agent (or in the `runtime.baseImage` you set, which must also be imported). See [Runtimes: Builtin microVM](11-runtimes.md#builtin-microvm-experimental).
 
 ### Unknown agents
 
@@ -1034,21 +1034,19 @@ The main `exec workflow` flags (see the [Command Reference](14-command-reference
 | `--work-item <N>` / `--issue <REF>` | Supply a work item (a local spec, or a GitHub issue number, URL or `owner/repo#N`) for [template variables](#template-variables) |
 | `--agent <NAME>` | Default agent for steps that don't name one (a workflow-level `agent` takes precedence) |
 | `--model <NAME>` | Default model for steps that don't set one (a workflow-level `model` takes precedence) |
-| `--agent-flag=<ARG>` | Extra argument for the default agent's command, replacing its `agentFlags` entry. Repeatable |
-| `-n, --non-interactive` | Run each step's agent in print mode, and answer every prompt with its headless default |
+| `--agent-flag=<ARG>` | Extra argument for the default agent's command, replacing its `agents.flags` entry. Repeatable |
+| `-n, --headless` | Run each step's agent in print mode, and answer every prompt with its headless default |
 | `--plan` / `--auto` / `--yolo` | [Permission mode](03-agent-sessions.md#permission-modes) for every step. `--auto` and `--yolo` imply `--worktree`; `--yolo` also auto-advances stuck steps |
-| `--launch-mode <stdio\|acp>` | How awman talks to each step's agent |
 | `--allow-docker` | Mount the Docker socket into each step's container |
 | `--overlay <SPEC>` | Apply overlay(s) to every step; see [Overlays](08-overlays.md). Repeatable |
 | `--worktree` | Run all steps in an isolated Git worktree — see [Worktrees](#worktrees) |
 | `--on-existing-worktree <POLICY>` | `ask`, `resume`, `recreate` or `fail` when the run's worktree already exists |
 | `--on-dirty-merge-target <POLICY>` | `ask`, `commit`, `stash` or `fail` for uncommitted changes in the merge target |
 | `--on-merge-failure <POLICY>` | `ask`, `agent` or `keep` after a failed merge-back |
-| `--max-concurrent <N>` | Cap on concurrently running steps (≥ 1); overrides `maxConcurrentAgents` — see [Parallel workflows](#parallel-workflows) |
 | `--dynamic` / `--leader <agent::model>` | Let a leader agent design the workflow; see [Dynamic Workflows](06-dynamic-workflows.md) |
 | `--check-prerequisites` | Print the [prerequisite report](#workflow-prerequisite-checks) and exit without running |
 | `--prerequisite-identity`, `--prerequisite-ssh`, `--prerequisite-token`, `--prerequisite-unresolved` | Answer prerequisite questions up front, for headless runs |
-| `--json` | Print the workflow outcome and prerequisite report as JSON (implies `--non-interactive`) |
+| `--json` | Print the workflow outcome and prerequisite report as JSON (implies `--headless`) |
 
 ### Worktrees
 
@@ -1072,7 +1070,7 @@ choose what happens with `--on-existing-worktree`:
 
 When the flag is absent, the TUI and an interactive CLI ask, unless you have
 accepted a workflow or dynamic-workflow resume, in which case the existing
-worktree is reused without a second question. A piped or `--non-interactive` CLI
+worktree is reused without a second question. A piped or `--headless` CLI
 run, and a squad task's run, resume. The API fails (see
 [Existing worktrees](09-api-and-remote-mode.md#existing-worktrees)). An explicit
 value always wins.
@@ -1250,7 +1248,7 @@ In command mode the same choices are printed as a menu on stderr (`[r]` restart,
 
 If several steps of a [parallel group](#parallel-workflows) fail, the board opens once per failed step, in the order the containers exited. Each failure is a separate decision — recovering one does not quietly decide the others.
 
-### Failed steps without a user (squad, API, `--non-interactive`)
+### Failed steps without a user (squad, API, `--headless`)
 
 An unattended run has nobody to ask, so the engine handles a failed step itself:
 
@@ -1320,7 +1318,7 @@ You can always open the control board manually via **Ctrl+W** regardless of stuc
 
 ### Parallel step groups
 
-Steps that share the same dependencies form a **parallel group** and run concurrently, each in its own container, up to the [`maxConcurrentAgents`](07-configuration.md#reference) cap (unlimited by default).
+Steps that share the same dependencies form a **parallel group** and run concurrently, each in its own container, up to the [`workflows.maxConcurrentSteps`](07-configuration.md#reference-all-keys) cap (unlimited by default). An interactive final yolo group starts all its members together for review, even when that exceeds the cap.
 
 The overview shows a parallel group in one of two ways, toggled with **Ctrl-O**:
 
@@ -1394,8 +1392,9 @@ This lets you monitor all tabs' countdown state without leaving your current wor
 
 **When the countdown expires:**
 
-- If this is not the last step — awman kills the stuck step's container and advances to the next step in a new container
-- If this is the last step — the workflow transitions to complete
+- In an earlier stage, awman kills the stuck step's container and advances to the next ready step.
+- In an interactive final parallel group, each expired countdown leaves its agent running. Once every member is ready for review, the Workflow Control Board opens; finishing there stops the agents before teardown.
+- A sequential step that is last in topological order opens the Workflow Control Board when its agent exits; it does not start a yolo countdown.
 - In the TUI, the killed container's window closes immediately, leaving the [summary bar](02-using-the-tui.md#when-the-container-exits) behind — the window only closes on actual container death, never while the container is merely stuck or while the countdown is still running
 
 In the background this happens without you switching to the tab; the tab returns to its normal colour and label as soon as it moves on to the next step.
@@ -1471,11 +1470,11 @@ The question is asked before the worktree is prepared, so cancelling really does
 
 When the previous run completed every step there is nothing to resume, so awman says so and starts fresh rather than offering a choice with one sane answer.
 
-Runs with nobody at the keyboard (`--non-interactive`, the API server) resume at the step the previous run stopped on, preserving the work already done. A squad task is the exception: each scheduled evaluation is its own run, so it always starts over. None of them can cancel — there is nobody to press Esc.
+Runs with nobody at the keyboard (`--headless`, the API server) resume at the step the previous run stopped on, preserving the work already done. A squad task is the exception: each scheduled evaluation is its own run, so it always starts over. None of them can cancel — there is nobody to press Esc.
 
 ### Workflow file changed
 
-If the workflow file has changed since the state was saved, awman asks before resuming: `awman: workflow file changed since last run; resume anyway? [y/n]` in the CLI, or a **Resume workflow?** dialog in the TUI. Answering no stops the command and leaves the saved state alone. A `--non-interactive` CLI run answers no, and the API answers yes.
+If the workflow file has changed since the state was saved, awman asks before resuming: `awman: workflow file changed since last run; resume anyway? [y/n]` in the CLI, or a **Resume workflow?** dialog in the TUI. Answering no stops the command and leaves the saved state alone. A `--headless` CLI run answers no, and the API answers yes.
 
 If you resume, steps the saved run has but the file no longer defines are dropped (see [Unfinished steps](#unfinished-steps)).
 
@@ -1524,25 +1523,25 @@ This is entirely driven by your workflow file's `depends_on` graph — you don't
 
 ---
 
-### Configuring `maxConcurrentAgents`
+### Configuring `workflows.maxConcurrentSteps`
 
-`maxConcurrentAgents` caps how many containers can run at once, machine-wide or per-repo. It's a plain [config field](07-configuration.md#reference), so it follows the same precedence as everything else:
+`workflows.maxConcurrentSteps` caps how many containers can run at once, machine-wide or per-repo. An interactive final yolo group is the exception: all remaining agents start together so they stay available for review. It's a plain [config key](07-configuration.md#reference-all-keys), so it follows the same precedence as everything else:
 
 ```
---max-concurrent  >  AWMAN_MAX_CONCURRENT_AGENTS  >  repo config  >  global config  >  unlimited
+--set  >  AWMAN_WORKFLOWS_MAX_CONCURRENT_STEPS  >  repo config  >  global config  >  unlimited
 ```
 
 ```sh
-awman config set maxConcurrentAgents 3              # this repo
-awman config set --global maxConcurrentAgents 2     # every project on this machine
-awman exec workflow workflow.toml --max-concurrent 4   # this run only
+awman config set workflows.maxConcurrentSteps 3            # this repo
+awman config set workflows.maxConcurrentSteps 2 --global   # every project on this machine
+awman exec workflow workflow.toml --set workflows.maxConcurrentSteps=4   # this run only
 ```
 
 Left unset at every level, there is **no cap** — every step whose dependencies are satisfied launches immediately. In practice you'll usually want a cap that matches your machine's CPU/memory headroom and your Docker daemon's capacity, since each parallel step is a full container running its own agent.
 
-A `maxConcurrentAgents` of `1` disables parallelism entirely: steps run one at a time, in the same order they would without any concurrency at all. `0` is rejected — if you want to pause parallelism, unset the field or set it to `1`.
+A `workflows.maxConcurrentSteps` of `1` disables parallelism entirely: steps run one at a time, in the same order they would without any concurrency at all. `0` is rejected — if you want to pause parallelism, unset the field or set it to `1`.
 
-> `workflows.dynamic.maxConcurrentSteps` is a different, unrelated setting: it's an advisory hint passed to the leader agent that *designs* a `--dynamic` workflow. `maxConcurrentAgents` is what the engine actually enforces at run time, for any workflow, dynamic or not.
+> The same key is also the cap the leader agent is told about when it *designs* a `--dynamic` workflow, and what the engine enforces at run time for any workflow, dynamic or not, subject to the interactive final yolo review exception above.
 
 ---
 
@@ -1563,7 +1562,7 @@ If a workflow resumes from a saved state mid-group, any steps that were interrup
 Every running container is tracked independently — one noisy or slow agent never masks or delays detection on its siblings.
 
 - **Stuck detection (yolo off):** if a container produces no output for 30 seconds, that container alone is marked stuck. Its siblings keep running unaffected. The stuck container's slot stays occupied — no new step launches into it — until you switch to it and send Ctrl-C to kill it, at which point its slot frees up like any other completion.
-- **Yolo mode:** each container gets its own independent 60-second auto-advance countdown. When one container's countdown expires, only that container is killed and its step marked advanced; the rest of the group is untouched, and the next queued step (if any) starts into the freed slot. If the group has nothing left queued, the remaining containers simply keep running until they finish.
+- **Yolo mode:** each container gets its own independent 60-second countdown. In a non-final group, expiry kills that container, advances its step, and starts the next queued step if there is one. In an interactive final group, every agent stays alive after its countdown expires. The control board opens after all members have reached review readiness or exited naturally. An interactive final group starts all its members together even when `maxConcurrentAgents` is lower than the group size, so each remains available for review.
 
 **Where the countdown appears in the TUI:** a yoloing container that is *not* the focused one shows its countdown in its minimized status bar (`Yolo in Ns`, flashing purple/yellow — see [Using the TUI: Parallel containers](02-using-the-tui.md#parallel-containers)). If it's the focused container, the countdown instead opens the same modal dialog a single container shows. Pressing **Ctrl-S** to rotate focus away closes that modal — the countdown itself keeps running in the background regardless — and rotating back onto a container still counting down reopens the modal automatically.
 
@@ -1582,13 +1581,13 @@ Restart, cancel-to-previous and next act on the group as a whole, and the board 
 | Restart current step | Asks whether to restart the **whole group** or a **single agent**. Whole group: every running container is stopped and the entire group starts again from scratch, including agents that already finished. Single agent: pick any member of the group (running, finished, failed or still queued). That agent restarts in a fresh container while the others keep running. |
 | Cancel to previous step | Asks you to confirm cancelling the **entire group**. If you confirm, every running container in the group is stopped and the workflow goes back to the step or group the group depends on. That step and everything after it runs again. Not available for a group with nothing before it. |
 | Next | Asks you to confirm cancelling the **entire group**. If you confirm, every running container in the group is stopped, members that haven't finished are marked skipped, and the workflow moves on to the steps that come after the group. If nothing comes after it, the workflow finishes. |
-| Finish workflow | Disabled while any peer is still running: the workflow can't finish while part of it is still in flight. |
+| Finish workflow | Available after every member of the final yolo group reaches review readiness. Stops all live agents in that group before teardown. Otherwise disabled while peers are running. |
 | Pause | Always available — suspends the whole workflow, killing every active container in the group. |
 | Abort | Always available — same, but marks the workflow aborted rather than paused. |
 
 When an action is unavailable, the reason is shown alongside it rather than just being greyed out silently.
 
-Each parallel step gets its own control board when it completes or gets stuck; you're never blocked from acting on one step because another is still busy — you just can't finish the workflow until the whole group has drained.
+In a final yolo group, dismissing the review board leaves every agent running. Use Ctrl-S to switch among their containers, then Ctrl-W to reopen the board and finish. Earlier groups keep their usual per-step controls.
 
 **Retrying a failed step mid-group.** If a step in the group fails while its peers are still running, opening the control board (Ctrl-W) adds a red `(r)etry failed step <name>` line below the arrow options. Press **r** to relaunch that step immediately, alongside the peers that are still running. If more than one step has failed, the board offers the earliest failure first. Any failure you don't retry this way still gets its usual recovery board after the whole group finishes.
 

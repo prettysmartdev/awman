@@ -376,7 +376,20 @@ impl LocalTaskEvaluator {
         } else {
             Session::open_at_directory_root(working_dir, opts)
         };
-        session.map_err(|error| CommandError::Other(format!("opening squad task session: {error}")))
+        let mut session = session
+            .map_err(|error| CommandError::Other(format!("opening squad task session: {error}")))?;
+        // The task's own config file is a config layer for everything this
+        // session runs; env and `--set` still sit above it.
+        let task_file = crate::data::fs::SquadPaths::from_env(&self.env)
+            .and_then(|paths| paths.task_config_file(&task.name))
+            .and_then(|path| {
+                crate::data::config::ConfigFile::load(&path, crate::data::config::FileKind::Task)
+            })
+            .map_err(CommandError::Data)?;
+        session
+            .set_task_config(task_file)
+            .map_err(CommandError::Data)?;
+        Ok(session)
     }
 
     /// Give a plain-directory task root the image definitions an ordinary
@@ -487,13 +500,6 @@ impl LocalTaskEvaluator {
             .transpose()?;
 
         let mut sink = TracingSink::new(&task.name);
-        // The once-per-repo deprecation notice belongs to the first
-        // evaluation, not to the first one that triggers: a leader that never
-        // triggers would otherwise never show it. The generated workflow
-        // shares this gate through `engines`, so it does not repeat it.
-        self.engines
-            .config_notices
-            .warn_legacy_dynamic_workflows(&session, &mut sink);
         // Raw container image build output goes to per-build files under
         // `<squad root>/builds/<task>/`, never into the daemon log; the daemon
         // log gets one lifecycle line per build naming the file instead.
@@ -889,7 +895,7 @@ impl LocalTaskEvaluator {
         );
         if let Some(task_policy) = &task.prerequisites {
             let options = crate::command::commands::workflow_prerequisites::WorkflowPrerequisiteFlowOptions::for_session(
-                &session, crate::command::dispatch::catalogue::FrontendKind::SquadDaemon, &Default::default(), None,
+                &session, crate::command::dispatch::catalogue::FrontendKind::SQUAD_LOCAL, &Default::default(), None,
                 crate::data::workflow_prerequisites::PrerequisiteOrigin::AssumedAll, None);
             crate::command::commands::workflow_prerequisites::check_task_widening(
                 task_policy,
@@ -906,7 +912,7 @@ impl LocalTaskEvaluator {
             self.engines.clone(),
             session,
         )
-        .with_frontend_kind(crate::command::dispatch::catalogue::FrontendKind::SquadDaemon)
+        .with_frontend_kind(crate::command::dispatch::catalogue::FrontendKind::SQUAD_LOCAL)
         .with_squad_identity(squad_identity)
         // Every step container also gets the durable task workspace at the
         // stable `context(workflow)` path, so a task's persistent data is
@@ -1315,7 +1321,7 @@ fn with_prerequisite_summary(
     use crate::data::workflow_prerequisites::{PrerequisiteOrigin, WorkflowPrerequisites};
     let options = WorkflowPrerequisiteFlowOptions::for_session(
         session,
-        crate::command::dispatch::catalogue::FrontendKind::SquadDaemon,
+        crate::command::dispatch::catalogue::FrontendKind::SQUAD_LOCAL,
         &Default::default(),
         task.prerequisites.as_ref(),
         PrerequisiteOrigin::AssumedAll,
@@ -1454,10 +1460,7 @@ mod tests {
         let messages = Arc::new(std::sync::Mutex::new(Vec::new()));
         let evaluator = LocalTaskEvaluator::new(
             engines,
-            EnvSnapshot::with_overrides([(
-                "AWMAN_SQUAD_ROOT",
-                temp.path().join("squad").to_string_lossy().as_ref(),
-            )]),
+            EnvSnapshot::with_overrides([("AWMAN_HOME", temp.path().to_str().unwrap())]),
             Arc::new(HoldingFrontends {
                 messages: messages.clone(),
             }),
@@ -1582,7 +1585,7 @@ mod tests {
         let now = Utc::now();
         Task {
             prerequisites: None,
-            id: "id".into(),
+            id: crate::data::ids::TaskId::new(),
             name: "issue-triage".into(),
             description: "when an issue opens, plan it".into(),
             repo_scope: PathBuf::from("/repo"),

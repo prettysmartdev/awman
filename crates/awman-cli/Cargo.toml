@@ -39,6 +39,7 @@ microsandbox = { workspace = true, optional = true }
 sqlx = { workspace = true, optional = true }
 
 [dev-dependencies]
+awman = { workspace = true, features = ["test-support"] }
 tokio = { workspace = true, features = ["test-util"] }
 reqwest = { workspace = true }
 wiremock = { workspace = true }
@@ -94,6 +95,10 @@ path = "../../tests/command/main.rs"
 [[test]]
 name = "cli_parity"
 path = "../../tests/cli_parity/main.rs"
+
+[[test]]
+name = "daemon_e2e"
+path = "../../tests/daemon/main.rs"
 
 [[test]]
 name = "api_parity"
@@ -155,16 +160,8 @@ name = "squad_daemon_e2e"
 path = "../../tests/squad_daemon_e2e.rs"
 
 [[test]]
-name = "squad_mutual_exclusion"
-path = "../../tests/squad_mutual_exclusion.rs"
-
-[[test]]
 name = "squad_sandbox_refusal"
 path = "../../tests/squad_sandbox_refusal.rs"
-
-[[test]]
-name = "squad_cli_gateway"
-path = "../../tests/squad_cli_gateway.rs"
 
 [[test]]
 name = "squad_tui_tab"
@@ -177,10 +174,6 @@ path = "../../tests/squad_attach_frontends.rs"
 [[test]]
 name = "squad_blockers"
 path = "../../tests/squad_blockers.rs"
-
-[[test]]
-name = "squad_auth_key"
-path = "../../tests/squad_auth_key.rs"
 
 [[test]]
 name = "squad_env_sync"

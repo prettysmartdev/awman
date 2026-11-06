@@ -31,10 +31,7 @@ pub(crate) fn find_work_item_file(
     // The session's own repo config, not a fresh load (F-31): the session
     // already merged it, and a second read here could answer from a file the
     // command was not built against.
-    let dir = session
-        .effective_config()
-        .repo()
-        .work_items_dir_or_default(git_root);
+    let dir = session.effective_config().work_items_dir(git_root);
     let prefix = format!("{:04}-", number);
     std::fs::read_dir(&dir)
         .ok()?

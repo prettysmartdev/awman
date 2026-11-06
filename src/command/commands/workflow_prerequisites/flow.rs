@@ -25,7 +25,6 @@ use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
 use crate::command::headless::HeadlessDefaults;
 use crate::data::config::flags::{IdentityFlag, PrerequisiteFlags, SshFlag, TokenFlag};
-use crate::data::config::global::GlobalConfig;
 use crate::data::config::workflows::{
     AcquirePolicy, CredentialUse, PolicySource, PrerequisitePolicy, UnresolvedMode,
 };
@@ -103,7 +102,7 @@ impl WorkflowPrerequisiteFlowOptions {
         Self {
             frontend_kind,
             headless: headless_for(frontend_kind),
-            origin: if frontend_kind == FrontendKind::SquadDaemon {
+            origin: if frontend_kind == FrontendKind::SQUAD_LOCAL {
                 PrerequisiteOrigin::AssumedAll
             } else {
                 origin
@@ -111,7 +110,7 @@ impl WorkflowPrerequisiteFlowOptions {
             policy: {
                 let mut session = session.clone();
                 let mut config = session.flags().clone();
-                config.squad_prerequisites = frontend_kind == FrontendKind::SquadDaemon;
+                config.squad_prerequisites = frontend_kind == FrontendKind::SQUAD_LOCAL;
                 session.set_flags(config);
                 policy_for(&session, flags, squad_task)
             },
@@ -129,8 +128,16 @@ impl WorkflowPrerequisiteFlowOptions {
 /// The headless profile a frontend kind answers from.
 pub fn headless_for(kind: FrontendKind) -> HeadlessDefaults {
     match kind {
-        FrontendKind::Api => HeadlessDefaults::api(),
-        FrontendKind::SquadDaemon => HeadlessDefaults::squad(
+        FrontendKind::Daemon {
+            feature:
+                crate::data::daemon_state::FeatureName::Worker
+                | crate::data::daemon_state::FeatureName::Engine,
+            ..
+        } => HeadlessDefaults::api(),
+        FrontendKind::Daemon {
+            feature: crate::data::daemon_state::FeatureName::Squad,
+            ..
+        } => HeadlessDefaults::squad(
             crate::command::commands::mount_scope::MountScopeDecision::MountGitRoot,
         ),
         FrontendKind::Cli | FrontendKind::Tui => HeadlessDefaults::cli(),
@@ -191,7 +198,8 @@ pub fn custom_agent_binaries(session: &Session) -> Vec<String> {
 /// Credential-bearing overlays the repository's `.awman/config.json` adds to
 /// every step, so the summary shows what the checkout itself mounts.
 pub fn repo_overlay_notes(session: &Session) -> Vec<String> {
-    let Some(overlays) = session.repo_config().overlays.as_ref() else {
+    let effective = session.effective_config();
+    let Some(overlays) = effective.layers().repo.overlays.as_ref() else {
         return Vec::new();
     };
     let mut notes = Vec::new();
@@ -292,7 +300,7 @@ impl WorkflowPrerequisiteFlow {
         session: &Session,
         options: WorkflowPrerequisiteFlowOptions,
     ) -> Self {
-        let data_home = GlobalConfig::data_home_with(session.env()).ok();
+        let data_home = crate::data::fs::data_paths::data_home(session.env()).ok();
         let grant_store = data_home.as_deref().map(PrerequisiteGrantStore::load);
         let home = session
             .env()
@@ -613,7 +621,7 @@ impl WorkflowPrerequisiteFlow {
             UnresolvedMode::Warn
         } else {
             self.options.headless.prerequisite_unresolved(
-                if self.options.frontend_kind == FrontendKind::SquadDaemon {
+                if self.options.frontend_kind == FrontendKind::SQUAD_LOCAL {
                     PrerequisiteOrigin::AssumedAll
                 } else {
                     needs.origin
@@ -1478,7 +1486,7 @@ impl WorkflowPrerequisiteFlow {
 
     // ─── Later phases ───────────────────────────────────────────────────────
 
-    /// The non-interactive re-check just before teardown: verifies granted
+    /// The headless re-check just before teardown: verifies granted
     /// env vars are still set and re-runs a `refresh: "beforeTeardown"`
     /// token command. Writes **one** warning when anything is not satisfied.
     pub fn recheck_before_teardown(

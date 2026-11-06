@@ -190,13 +190,13 @@ API use, so it rejects what they would reject rather than carrying a bad value
 into the command:
 
 ```
-chat --launch-mode banana
+chat --set agents.launchMode=banana
 ```
 ```
-invalid value for flag 'launch-mode' on ["chat"]: 'banana' is not one of ["stdio", "acp"]
+invalid value for `agents.launchMode`: expected one of stdio, acp, got "banana"
 ```
 
-A non-numeric value for a numeric flag (`squad start --port abc`) is rejected
+A non-numeric value for a numeric flag is rejected
 the same way. In both cases the text you typed stays in the box so you can fix
 just the bad part instead of retyping the whole command. A `-`-prefixed token
 is never accepted as a flag's value (`--agent -c` is a missing value for
@@ -377,7 +377,7 @@ This mirrors tmux's copy-mode behavior: scrolling enters historical view, reachi
 
 Mouse click, drag, and drag-release events are never forwarded to the agent. They always perform awman's native text selection, ensuring you can always select and copy text from the container overlay, even when the agent has mouse tracking enabled.
 
-Scrollback holds up to 10,000 lines by default (`terminal_scrollback_lines` in [Configuration](07-configuration.md)). While scrolled, the title bar shows `↑ scrollback (N / M lines)` where `N` is your current offset and `M` is the total depth.
+Scrollback holds up to 10,000 lines by default (`tui.scrollbackLines` in [Configuration](07-configuration.md)). While scrolled, the title bar shows `↑ scrollback (N / M lines)` where `N` is your current offset and `M` is the total depth.
 
 awman always intercepts **Ctrl+Y**; with no active selection it does nothing, and the agent never receives it.
 
@@ -560,9 +560,9 @@ Press **Ctrl+,** from anywhere in the TUI, or type `config show` in the command 
 ```
 ╭──────────────────────────────── awman config ─────────────────────────────────╮
 │  Field                              Global        Repo           Effective     │
-│  agent                              claude                       claude        │
-│  runtime                            docker                       docker        │
-│  terminal_scrollback_lines          10000         5000           5000          │
+│  agents.default                     claude                       claude        │
+│  runtime.kind                       docker                       docker        │
+│  tui.scrollbackLines                10000         5000           5000          │
 │  ...                                                                           │
 │  workflows.dynamic.agentsToModels                 2 agents ma…   2 agents ma…  │
 │▶ workflows.dynamic.agentsToModels.…               claude-opus…   claude-opus…  │
@@ -589,13 +589,13 @@ Press **Ctrl+,** from anywhere in the TUI, or type `config show` in the command 
 
 While editing, the value is edited inline in its table cell with a visible `|` cursor; **← / →**, **Home / End**, **Backspace**, and **Delete** work as expected. Values longer than the cell scroll horizontally so the cursor never leaves view. Row navigation is frozen until you save or cancel.
 
-A detail pane below the table always shows the full, untruncated value of the selected row's focused column — long values wrap across multiple lines there, and while editing it mirrors the complete edit buffer. Beneath it, a hint line shows the accepted value format for the field (e.g. `one of: claude, codex, …` for `agent`, `positive integer` for numeric fields, `comma-separated list` for list fields).
+A detail pane below the table always shows the full, untruncated value of the selected row's focused column — long values wrap across multiple lines there, and while editing it mirrors the complete edit buffer. Beneath it, a hint line shows the accepted value format for the field (e.g. `one of: claude, codex, …` for `agents.default`, `positive integer` for numeric fields, `comma-separated list` for list fields).
 
 Each edit is validated and written immediately when you press **Enter** (surrounding whitespace is trimmed first). If the value is invalid (an unknown agent name, a non-numeric value for a numeric field, a malformed `agent::model` leader) or the config file cannot be written, nothing is saved: the dialog stays in edit mode with your input intact and shows the reason in red where the format hint normally appears, so you can correct the value instead of retyping it. Press **Esc** to abandon the rejected edit. After a successful save the table refreshes with the selected row preserved, so consecutive edits don't send you back to the top.
 
-Editing targets the column the selection is on: the **Global** column writes `$HOME/.awman/config.json`, the **Repo** column writes `GITROOT/.awman/config.json`. Scope-restricted fields snap automatically — starting an edit on the Global column of a repo-only field moves the edit to the Repo column with a status-bar note, and vice versa for global-only fields (like `runtime`). Dynamic workflow settings can be edited in either column.
+Editing targets the column the selection is on: the **Global** column writes the global config (`$AWMAN_HOME/config.json`, default `~/.awman/config.json`), the **Repo** column writes `GITROOT/.awman/config.json`. Scope-restricted fields snap automatically — starting an edit on the Global column of a repo-only field moves the edit to the Repo column with a status-bar note, and vice versa for global-only fields (like `runtime.kind`). Dynamic workflow settings can be edited in either column.
 
-Fields marked read-only — such as `auto_agent_auth_accepted` — are shown dimmed; pressing **Enter** on one shows `This field is read-only` in the status bar.
+Fields marked read-only — such as map and object headers — are shown dimmed; pressing **Enter** on one shows `This field is read-only` in the status bar.
 
 There are more fields than fit at once — the table scrolls automatically to keep the selected row visible as you move past the bottom or top of the visible window.
 
@@ -619,7 +619,7 @@ The [leader guidance list](06-dynamic-workflows.md#guidance) — project-specifi
 - **Ctrl+N** appends a new entry to the selected scope in a single step: type the instruction text and press **Enter**. **Esc** cancels. Unlike `agentsToModels`, there's no key to type first — the index is assigned automatically as the next position in the selected list.
 - Saving an **empty** value on an entry row removes it; the remaining entries shift down and re-index, and the row list refreshes to reflect the new indices.
 
-The same per-entry edits work on the command line: `awman config set workflows.dynamic.guidance.0 "Never spawn more than two agents in parallel."` or pass `--global` to edit global config.
+The same per-entry edits work on the command line: `awman config set workflows.dynamic.guidance "Never spawn more than two agents in parallel."` (a list value; separate several entries with commas) or pass `--global` to edit global config.
 
 ---
 
@@ -759,7 +759,7 @@ bindings, and attaching to a running task.
 
 ## Stuck detection
 
-If a running container produces no output for longer than the stuck timeout (30 seconds by default; `agentStuckTimeout` in [Configuration](07-configuration.md)), the tab turns yellow and the subcommand label gains a `⚠️` prefix (e.g. `⚠️ chat`). The warning clears automatically when you:
+If a running container produces no output for longer than the stuck timeout (30 seconds by default; `agents.stuckTimeout` in [Configuration](07-configuration.md)), the tab turns yellow and the subcommand label gains a `⚠️` prefix (e.g. `⚠️ chat`). The warning clears automatically when you:
 
 - Switch to the yellow tab
 - Press any key while the tab is active

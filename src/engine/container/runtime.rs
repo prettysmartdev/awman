@@ -97,11 +97,10 @@ pub struct ContainerRuntime {
 
 fn new_phase_tools_cache() -> std::sync::Mutex<crate::data::fs::phase_tools_cache::PhaseToolsCache>
 {
-    let cache = crate::data::config::global::GlobalConfig::data_home_with(
-        &crate::data::config::env::Env::from_process(),
-    )
-    .map(|root| crate::data::fs::phase_tools_cache::PhaseToolsCache::load(&root))
-    .unwrap_or_else(|_| crate::data::fs::phase_tools_cache::PhaseToolsCache::in_memory());
+    let cache =
+        crate::data::fs::data_paths::data_home(&crate::data::config::env::Env::from_process())
+            .map(|root| crate::data::fs::phase_tools_cache::PhaseToolsCache::load(&root))
+            .unwrap_or_else(|_| crate::data::fs::phase_tools_cache::PhaseToolsCache::in_memory());
     std::sync::Mutex::new(cache)
 }
 
@@ -575,29 +574,25 @@ mod tests {
 
     #[test]
     fn builtin_process_settings_hold_only_process_wide_values() {
-        use crate::data::config::builtin_runtime::BuiltinRuntimeConfig;
-        use crate::data::config::env::{EnvSnapshot, AWMAN_BUILTIN_STATE_DIR, MSB_PATH};
-        use crate::data::config::{FlagConfig, GlobalConfig, RepoConfig};
+        use crate::data::config::env::{EnvSnapshot, MSB_PATH};
+        use crate::data::config::{ConfigFile, FlagConfig};
 
-        let env = EnvSnapshot::with_overrides([
-            (AWMAN_BUILTIN_STATE_DIR, "/s"),
-            (MSB_PATH, "/elsewhere/msb"),
-        ]);
+        let env = EnvSnapshot::with_overrides([(MSB_PATH, "/elsewhere/msb")]);
         let layered = |global: &str, repo: &str| {
-            EffectiveConfig::new(
+            let mut global: serde_json::Value = serde_json::from_str(global).unwrap();
+            global["stateDir"] = serde_json::json!("/s");
+            let repo: serde_json::Value = serde_json::from_str(repo).unwrap();
+            EffectiveConfig::from_files(
+                ConfigFile::test_json(serde_json::json!({"runtime": {"builtin": global}})),
+                ConfigFile::test_json(serde_json::json!({"runtime": {"builtin": repo}})),
                 FlagConfig::default(),
                 env.clone(),
-                RepoConfig {
-                    builtin: Some(serde_json::from_str(repo).unwrap()),
-                    ..Default::default()
-                },
-                GlobalConfig {
-                    builtin: Some(serde_json::from_str(global).unwrap()),
-                    ..Default::default()
-                },
             )
         };
-        let resolved = layered("{}", "{}").builtin_process_settings().unwrap();
+        let resolved = layered("{}", "{}")
+            .unwrap()
+            .builtin_process_settings()
+            .unwrap();
         let settings = BuiltinRuntimeSettings::resolve(&resolved);
         assert_eq!(
             settings,
@@ -617,33 +612,20 @@ mod tests {
             ),
             (r#"{}"#, r#"{"network":{"hostPorts":[8765]}}"#),
             (r#"{}"#, r#"{"vcpus":0}"#),
-            (r#"{}"#, r#"{"memoryMib":64}"#),
+            (r#"{}"#, r#"{"memory":"64MiB"}"#),
         ] {
             assert!(
-                layered(global, repo).builtin_settings().is_err(),
+                layered(global, repo)
+                    .and_then(|c| c.builtin_settings())
+                    .is_err(),
                 "{repo} must fail during Layer 0 resolution"
             );
         }
 
         // A meaningless image source is still refused up front.
-        let bad_source = EffectiveConfig::new(
-            FlagConfig::default(),
-            env.clone(),
-            RepoConfig::default(),
-            GlobalConfig {
-                builtin: Some(BuiltinRuntimeConfig {
-                    image_source: Some(
-                        crate::data::config::image_source::ImageSourceSpec::Archive {
-                            path: "".into(),
-                        },
-                    ),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            },
-        );
+        let bad_source = layered(r#"{"imageSource":{"type":"archive","path":""}}"#, "{}");
         assert!(matches!(
-            bad_source.builtin_settings(),
+            bad_source.and_then(|c| c.builtin_settings()),
             Err(crate::data::error::DataError::BuiltinConfig(_))
         ));
 

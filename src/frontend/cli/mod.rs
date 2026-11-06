@@ -96,8 +96,8 @@ fn render_error_for_mode(error: &CommandError, json: bool) -> ExitCode {
 /// Which commands those are is the catalogue's fact
 /// ([`CommandCatalogue::opens_tui_when_bare`]); this keeps only the two facts
 /// about *this invocation* that a frontend is the right place to read — is
-/// stdin a terminal, and did the user ask for non-interactive output.
-/// `--json` implies `--non-interactive` through the catalogue's own `implies`
+/// stdin a terminal, and did the user ask for headless output.
+/// `--json` implies `--headless` through the catalogue's own `implies`
 /// edge, which `CliFrontend::explicit_non_interactive` resolves, so this no
 /// longer spells that rule out a second time.
 pub fn is_bare_tui_invocation(matches: &ArgMatches) -> bool {
@@ -220,15 +220,10 @@ pub(crate) fn format_error(err: &CommandError) -> String {
         CommandError::ApiWorkdirNotFound { path } => {
             format!("API workdir not found: {}", path.display())
         }
-        CommandError::ApiServerAlreadyRunning { pid } => {
-            format!(
-                "API server is already running on PID {pid}; run `awman api kill` first"
-            )
-        }
-        CommandError::ApiServerNotRunning => "API server is not running".into(),
-        CommandError::ApiServerAuthMissing => {
-            "no API key configured. Run `awman api start --refresh-key` first, or pass `--dangerously-skip-auth`.".into()
-        }
+        CommandError::DaemonNotRunning
+        | CommandError::DaemonAlreadyRunning { .. }
+        | CommandError::DaemonNoFeatures
+        | CommandError::DaemonHttpStatus { .. } => err.to_string(),
         CommandError::RemoteSessionMissing => {
             "no remote session id; pass --session <id> or run `awman remote session start` first".into()
         }
@@ -275,9 +270,6 @@ pub(crate) fn format_error(err: &CommandError) -> String {
         CommandError::NotAvailableForFrontend { command, frontend } => {
             format!("command `{command}` is not available via the {frontend} frontend")
         }
-        // The squad missing-key answer authors its own full text, including
-        // the variable to set and the command to mint a new key.
-        CommandError::SquadKeyMissing => err.to_string(),
         // Session-creation validation errors (surfaced by multi-session
         // frontends); their Display text is already user-appropriate.
         CommandError::SessionInvalidType { .. }
@@ -356,6 +348,111 @@ mod tests {
             .unwrap()
     }
 
+    #[tokio::test]
+    async fn each_command_reloads_global_and_repo_config() {
+        use crate::command::commands::config::ConfigOutcome;
+        use crate::command::dispatch::Engines;
+        use crate::data::config::env::EnvSnapshot;
+        use crate::data::config::overrides::ConfigOverrides;
+        use crate::data::fs::data_paths::AWMAN_HOME;
+        use crate::data::session::Session;
+        use crate::data::session::SessionOpenOptions;
+        use std::sync::Arc;
+        use tokio::sync::RwLock;
+
+        let repo = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let repo_config = repo.path().join(".awman/config.json");
+        std::fs::create_dir_all(repo_config.parent().unwrap()).unwrap();
+        let global_config = home.path().join("config.json");
+        std::fs::write(
+            &global_config,
+            r#"{"agents":{"default":"codex"},"tui":{"scrollbackLines":1000}}"#,
+        )
+        .unwrap();
+        std::fs::write(&repo_config, r#"{"tui":{"scrollbackLines":2000}}"#).unwrap();
+
+        let env = EnvSnapshot::with_overrides([(AWMAN_HOME, home.path().to_str().unwrap())]);
+        let overrides =
+            ConfigOverrides::parse_set_args(&["agents.auth.refresh.enabled=false".to_string()])
+                .unwrap();
+        let session = Arc::new(RwLock::new(
+            Session::open_at_git_root(
+                repo.path().to_path_buf(),
+                repo.path().to_path_buf(),
+                SessionOpenOptions {
+                    env: Some(env),
+                    overrides,
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        ));
+
+        let engine_root = repo.path().to_path_buf();
+        let frontend = || {
+            let matches = CommandCatalogue::get()
+                .build_clap_command()
+                .try_get_matches_from(["awman", "config", "get", "tui.scrollbackLines"])
+                .unwrap();
+            CliFrontend::new(matches)
+        };
+        let get = |session: Arc<RwLock<Session>>| {
+            let engine_root = engine_root.clone();
+            async move {
+                let result = Dispatch::new(frontend(), session, Engines::for_tests(&engine_root))
+                    .run_command(&["config", "get"])
+                    .await
+                    .unwrap();
+                let CommandOutcome::Config(ConfigOutcome::Get(value)) = result else {
+                    panic!("expected config get outcome");
+                };
+                value
+            }
+        };
+
+        let first = get(session.clone()).await;
+        assert_eq!(first.global_value.as_deref(), Some("1000"));
+        assert_eq!(first.repo_value.as_deref(), Some("2000"));
+        assert_eq!(first.effective_value.as_deref(), Some("2000"));
+
+        std::fs::write(
+            &global_config,
+            r#"{"agents":{"default":"gemini"},"tui":{"scrollbackLines":3000}}"#,
+        )
+        .unwrap();
+        std::fs::write(&repo_config, r#"{"tui":{"scrollbackLines":4000}}"#).unwrap();
+        let preview = Dispatch::new(frontend(), session.clone(), Engines::for_tests(repo.path()))
+            .launch_display(&["config", "get"]);
+        assert_eq!(preview.agent_display_name, "gemini");
+        let second = get(session.clone()).await;
+        assert_eq!(second.global_value.as_deref(), Some("3000"));
+        assert_eq!(second.repo_value.as_deref(), Some("4000"));
+        assert_eq!(second.effective_value.as_deref(), Some("4000"));
+        {
+            let current = session.read().await;
+            assert_eq!(current.default_agent().unwrap().as_str(), "gemini");
+            assert_eq!(
+                current.effective_config().value()["agents"]["auth"]["refresh"]["enabled"],
+                false
+            );
+        }
+
+        std::fs::write(&repo_config, "{ invalid json }").unwrap();
+        let error = Dispatch::new(frontend(), session.clone(), Engines::for_tests(repo.path()))
+            .run_command(&["config", "get"])
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            CommandError::Data(crate::data::error::DataError::ConfigParse { .. })
+        ));
+        assert_eq!(
+            session.read().await.effective_config().value()["tui"]["scrollbackLines"],
+            4000
+        );
+    }
+
     /// `exec workflow` runs under the parallel-step chrome. The boxed trait hides
     /// the concrete type, but not its size, and the wrapper is larger than what
     /// it wraps.
@@ -398,7 +495,7 @@ mod tests {
                 "exec",
                 spelling,
                 missing.to_str().unwrap(),
-                "--non-interactive",
+                "--headless",
             ]);
 
             let code = run_command(matches, ctx).await;
@@ -603,7 +700,7 @@ mod tests {
             CommandError::RemoteTimeout,
             CommandError::MissingRemoteAddress,
             CommandError::MissingApiKey,
-            CommandError::ApiServerAlreadyRunning { pid: 42 },
+            CommandError::DaemonAlreadyRunning { pid: 42 },
         ];
         for err in other_errors {
             assert_eq!(
@@ -673,10 +770,10 @@ mod tests {
     /// The squad daemon serves the squad subtree and nothing else, and the
     /// catalogue is what says so (F-50).
     #[test]
-    fn the_squad_daemon_frontend_admits_only_the_squad_subtree() {
+    fn squad_daemon_admits_only_its_noninteractive_subtree() {
         use crate::command::dispatch::catalogue::FrontendKind;
         let catalogue = CommandCatalogue::get();
-        assert!(catalogue.is_allowed_for_frontend(FrontendKind::SquadDaemon, &["squad", "list"]));
+        assert!(catalogue.is_allowed_for_frontend(FrontendKind::SQUAD_LOCAL, &["squad", "list"]));
         for outside in [
             vec!["exec", "workflow"],
             vec!["ready"],
@@ -684,14 +781,14 @@ mod tests {
             vec!["agents", "status"],
         ] {
             assert!(
-                !catalogue.is_allowed_for_frontend(FrontendKind::SquadDaemon, &outside),
+                !catalogue.is_allowed_for_frontend(FrontendKind::SQUAD_LOCAL, &outside),
                 "{outside:?} is outside the squad subtree"
             );
         }
         // A squad leaf the API itself refuses (interactive/PTY) is refused
         // here too: `SquadDaemon` narrows the API profile, it does not widen
         // it.
-        assert!(!catalogue.is_allowed_for_frontend(FrontendKind::SquadDaemon, &["squad", "attach"]));
+        assert!(!catalogue.is_allowed_for_frontend(FrontendKind::SQUAD_LOCAL, &["squad", "attach"]));
     }
 
     /// Which commands have a bare TUI form is the catalogue's fact, so
@@ -712,7 +809,7 @@ mod tests {
         assert!(!catalogue.opens_tui_when_bare(&[]));
     }
 
-    /// `--json` implies `--non-interactive`, so a `--json` invocation never
+    /// `--json` implies `--headless`, so a `--json` invocation never
     /// opens the TUI even though it is otherwise the bare form. This module
     /// used to re-check `--json` itself; it now goes through the one resolver.
     #[test]
@@ -720,13 +817,13 @@ mod tests {
         let cmd = CommandCatalogue::get().build_clap_command();
         for argv in [
             vec!["awman", "squad", "--json"],
-            vec!["awman", "squad", "--non-interactive"],
+            vec!["awman", "squad", "--headless"],
         ] {
             let m = cmd.clone().try_get_matches_from(&argv).unwrap();
             let path = command_path_from_matches(&m);
             assert!(
                 CliFrontend::explicit_non_interactive(&m, &path),
-                "{argv:?} must resolve to non-interactive"
+                "{argv:?} must resolve to headless"
             );
             assert!(
                 !is_bare_tui_invocation(&m),

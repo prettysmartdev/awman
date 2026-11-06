@@ -12,6 +12,7 @@ use anyhow::{Context, Result};
 use crate::command::dispatch::catalogue::CommandCatalogue;
 use crate::command::dispatch::Engines;
 use crate::data::config::env::EnvSnapshot;
+use crate::data::config::ConfigOverrides;
 use crate::data::error::DataError;
 use crate::data::session::{GitRootResolver, Session, SessionOpenOptions};
 use crate::engine::error::EngineError;
@@ -51,28 +52,43 @@ impl Startup {
 
     /// Perform ordered application startup for `working_dir` and `env`.
     pub fn run(&self, working_dir: PathBuf, env: EnvSnapshot) -> Result<StartupOutcome> {
+        self.run_with_overrides(working_dir, env, ConfigOverrides::default())
+    }
+
+    /// [`Startup::run`] with `--set` overrides (already parsed against the key
+    /// table) applied to the session's config.
+    pub fn run_with_overrides(
+        &self,
+        working_dir: PathBuf,
+        env: EnvSnapshot,
+        overrides: ConfigOverrides,
+    ) -> Result<StartupOutcome> {
         let messages = Vec::new();
 
         let path_refs: Vec<&str> = self.command_path.iter().map(String::as_str).collect();
         let git_engine = GitEngine::new();
 
         // Outside a Git repo the working directory stands in for the root.
-        let git_root = match git_engine.resolve(&working_dir) {
-            Ok(root) => root,
-            Err(DataError::GitRootNotFound { .. }) => working_dir.clone(),
+        let (git_root, in_repo) = match git_engine.resolve(&working_dir) {
+            Ok(root) => (root, true),
+            Err(DataError::GitRootNotFound { .. }) => (working_dir.clone(), false),
             Err(other) => {
                 return Err(anyhow::Error::new(other).context("failed to resolve git root"));
             }
         };
 
-        let session = Session::open_at_git_root(
-            working_dir,
-            git_root,
-            SessionOpenOptions {
-                env: Some(env),
-                ..Default::default()
-            },
-        )
+        let opts = SessionOpenOptions {
+            env: Some(env),
+            overrides,
+            ..Default::default()
+        };
+        // Outside a Git repo the directory is not a repository: config scope
+        // and `--repo` must not treat it as one.
+        let session = if in_repo {
+            Session::open_at_git_root(working_dir, git_root, opts)
+        } else {
+            Session::open_at_directory_root(git_root, opts)
+        }
         .context("failed to open session")?;
         // Detect after opening the session so repo builtin settings participate
         // in the same effective configuration used by command execution.
@@ -144,19 +160,20 @@ impl StartupOutcome {
 mod tests {
     use super::*;
     use crate::command::error::CommandError;
-    use crate::data::config::env::{EnvSnapshot, AMBIENT_MSB_OVERRIDES, AWMAN_CONFIG_HOME};
+    use crate::data::config::env::{EnvSnapshot, AMBIENT_MSB_OVERRIDES};
+    use crate::data::fs::data_paths::AWMAN_HOME;
 
     #[test]
     fn tui_startup_preserves_override_failure_for_the_fatal_frontend() {
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(
             temp.path().join("config.json"),
-            r#"{"runtime":"builtin-experimental"}"#,
+            r#"{"runtime":{"kind":"builtin"}}"#,
         )
         .unwrap();
         for variable in AMBIENT_MSB_OVERRIDES {
             let env = EnvSnapshot::with_overrides([
-                (AWMAN_CONFIG_HOME, temp.path().to_str().unwrap()),
+                (AWMAN_HOME, temp.path().to_str().unwrap()),
                 (*variable, ""),
             ]);
             let outcome = Startup::new(Vec::new())
@@ -186,10 +203,10 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(
             temp.path().join("config.json"),
-            r#"{"runtime":"builtin-experimental"}"#,
+            r#"{"runtime":{"kind":"builtin"}}"#,
         )
         .unwrap();
-        let env = EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, temp.path().to_str().unwrap())]);
+        let env = EnvSnapshot::with_overrides([(AWMAN_HOME, temp.path().to_str().unwrap())]);
         let outcome = Startup::new(Vec::new())
             .run(temp.path().into(), env)
             .unwrap();
@@ -197,5 +214,22 @@ mod tests {
             outcome.fatal_runtime_error.unwrap().error,
             CommandError::Engine(EngineError::BuiltinTargetUnreleased { .. })
         ));
+    }
+}
+
+#[cfg(test)]
+mod scope_tests {
+    use super::*;
+    use crate::data::fs::data_paths::AWMAN_HOME;
+
+    #[test]
+    fn startup_outside_a_git_repo_does_not_mark_the_directory_as_a_repo() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let env = EnvSnapshot::with_overrides([(AWMAN_HOME, home.path().to_str().unwrap())]);
+        let outcome = Startup::new(vec!["config".into()])
+            .run(dir.path().into(), env)
+            .unwrap();
+        assert!(!outcome.session.is_git_repo());
     }
 }

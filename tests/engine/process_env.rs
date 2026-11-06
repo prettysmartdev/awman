@@ -2,7 +2,7 @@
 //!
 //! `daemon_supervisor`, `git_engine` and `overlay_engine` all compile into this
 //! executable and all probe code that reads `HOME`, `PATH` or
-//! `AWMAN_CONFIG_HOME` straight from the process. Three private locks over one
+//! `AWMAN_HOME` straight from the process. Three private locks over one
 //! environment serialize nothing, so every such test takes this guard instead.
 //! Other test executables are separate processes and keep their own state.
 //!

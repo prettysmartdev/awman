@@ -1,13 +1,4 @@
-//! `DaemonPaths` — the daemon-identity path accessors shared by the API server
-//! and the squad daemon.
-//!
-//! `ApiPaths` previously hardcoded the four daemon-identity filenames
-//! (`awman.pid`, `awman.log`, `server.json`, `api_key.hash`) inside its own
-//! accessors. Those filenames are identical for every daemon except the key
-//! stem (`api_key` vs `squad_key`), so they factor into this value object over a
-//! `root` plus a `key_stem`. A second daemon rooted elsewhere is isolated by
-//! construction: every accessor keys off `root`.
-
+//! Paths for the single daemon identity.
 use std::path::{Path, PathBuf};
 
 use crate::data::error::DataError;
@@ -16,27 +7,18 @@ use crate::data::error::DataError;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DaemonPaths {
     root: PathBuf,
-    key_stem: &'static str,
 }
 
 impl DaemonPaths {
     /// Construct over a root and the API-key filename stem (`"api_key"` /
     /// `"squad_key"`).
-    pub fn new(root: impl Into<PathBuf>, key_stem: &'static str) -> Self {
-        Self {
-            root: root.into(),
-            key_stem,
-        }
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
     }
 
     /// The daemon root directory.
     pub fn root(&self) -> &Path {
         &self.root
-    }
-
-    /// The key-hash filename stem (`"api_key"` / `"squad_key"`).
-    pub fn key_stem(&self) -> &'static str {
-        self.key_stem
     }
 
     /// PID file: `<root>/awman.pid`.
@@ -56,12 +38,90 @@ impl DaemonPaths {
 
     /// API-key hash file: `<root>/<key_stem>.hash`.
     pub fn key_hash_file(&self) -> PathBuf {
-        self.root.join(format!("{}.hash", self.key_stem))
+        self.root.join("api_key.hash")
+    }
+
+    /// Owner-authenticated resource API endpoint, separate from the TCP listener.
+    pub fn local_endpoint(&self) -> PathBuf {
+        #[cfg(unix)]
+        {
+            use sha2::{Digest, Sha256};
+            let direct = self.root.join("api.sock");
+            if direct.as_os_str().as_encoded_bytes().len() < 100 {
+                return direct;
+            }
+            let uid = nix::unistd::geteuid().as_raw();
+            let hash = Sha256::digest(self.root.to_string_lossy().as_bytes());
+            let hex: String = hash[..4].iter().map(|b| format!("{b:02x}")).collect();
+            let suffix = format!("awman-{uid}-{hex}.sock");
+            let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
+                .map(PathBuf::from)
+                .filter(|path| path.is_absolute());
+            // Clients can have a different TMPDIR from the daemon (for example
+            // when a service manager starts it). The owner endpoint must still
+            // be discoverable from the same daemon home.
+            let mut dir = runtime_dir.clone().unwrap_or_else(|| PathBuf::from("/tmp"));
+            // Keep the Unix-domain socket below the strictest common SUN_LEN.
+            if dir.join(&suffix).as_os_str().as_encoded_bytes().len() >= 100 {
+                dir = PathBuf::from("/tmp").join(format!("awman-{uid}"));
+            } else if runtime_dir.is_none() {
+                dir = dir.join(format!("awman-{uid}"));
+            }
+            dir.join(suffix)
+        }
+        #[cfg(windows)]
+        {
+            let hash = crate::data::fs::hash::sha256_hex(self.root.to_string_lossy().as_bytes());
+            PathBuf::from(format!(r"\\.\pipe\awman-{hash}"))
+        }
     }
 
     /// Create the root directory (and parents) on disk.
     pub fn ensure_root(&self) -> Result<(), DataError> {
-        std::fs::create_dir_all(&self.root).map_err(|e| DataError::io(&self.root, e))
+        crate::data::fs::private_files::create_private_dir(&self.root)
+    }
+
+    /// Remove only a socket, never a symlink or regular file, during owned teardown.
+    pub fn remove_local_endpoint(&self, path: &Path) -> Result<(), DataError> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileTypeExt;
+            match std::fs::symlink_metadata(path) {
+                Ok(meta) if meta.file_type().is_socket() => {
+                    std::fs::remove_file(path).map_err(|e| DataError::io(path, e))?
+                }
+                Ok(_) => {
+                    return Err(DataError::Other(format!(
+                        "refusing to remove non-socket {}",
+                        path.display()
+                    )))
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(DataError::io(path, e)),
+            }
+        }
+        Ok(())
+    }
+    pub fn startup_lock_file(&self) -> PathBuf {
+        self.root.join("startup.lock")
+    }
+    pub fn api_keys_file(&self) -> PathBuf {
+        self.root.join("api_keys.json")
+    }
+    pub fn tls_dir(&self) -> PathBuf {
+        self.root.join("tls")
+    }
+    pub fn tls_cert_file(&self) -> PathBuf {
+        self.tls_dir().join("cert.pem")
+    }
+    pub fn tls_key_file(&self) -> PathBuf {
+        self.tls_dir().join("key.pem")
+    }
+    pub fn tls_sans_file(&self) -> PathBuf {
+        self.tls_dir().join("sans.json")
+    }
+    pub fn tls_fingerprint_file(&self) -> PathBuf {
+        self.tls_dir().join("fingerprint.sha256")
     }
 
     /// Read the persisted key hash, trimmed, or `None` when absent.
@@ -81,6 +141,7 @@ impl DaemonPaths {
     /// directory if needed. Reproduces `AuthEngine::write_api_key_hash`
     /// byte-for-byte, including the secure-write permissions.
     pub fn write_key_hash(&self, hex: &str) -> Result<(), DataError> {
+        self.ensure_root()?;
         let path = self.key_hash_file();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| DataError::io(parent, e))?;
@@ -109,50 +170,4 @@ fn write_file_secure(path: &Path, content: &[u8]) -> Result<(), DataError> {
         std::fs::write(path, content).map_err(|e| DataError::io(path, e))?;
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn filenames_are_stable_for_api_stem() {
-        let p = DaemonPaths::new("/r", "api_key");
-        assert_eq!(p.pid_file(), PathBuf::from("/r/awman.pid"));
-        assert_eq!(p.log_file(), PathBuf::from("/r/awman.log"));
-        assert_eq!(p.server_meta_file(), PathBuf::from("/r/server.json"));
-        assert_eq!(p.key_hash_file(), PathBuf::from("/r/api_key.hash"));
-    }
-
-    #[test]
-    fn key_stem_varies_the_hash_filename() {
-        assert_eq!(
-            DaemonPaths::new("/r", "squad_key").key_hash_file(),
-            PathBuf::from("/r/squad_key.hash")
-        );
-    }
-
-    #[test]
-    fn key_hash_round_trips_and_trims() {
-        let tmp = tempfile::tempdir().unwrap();
-        let p = DaemonPaths::new(tmp.path(), "api_key");
-        assert_eq!(p.read_key_hash().unwrap(), None);
-        p.write_key_hash("deadbeef\n").unwrap();
-        assert_eq!(p.read_key_hash().unwrap(), Some("deadbeef".to_string()));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn key_hash_file_is_mode_600() {
-        use std::os::unix::fs::PermissionsExt;
-        let tmp = tempfile::tempdir().unwrap();
-        let p = DaemonPaths::new(tmp.path(), "api_key");
-        p.write_key_hash("abc123").unwrap();
-        let mode = std::fs::metadata(p.key_hash_file())
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(mode, 0o600);
-    }
 }

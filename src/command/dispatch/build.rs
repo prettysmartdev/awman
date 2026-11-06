@@ -8,13 +8,12 @@
 //! `from_input` constructor, so the construction logic itself lives with the
 //! command in `src/command/commands/`, never here.
 //!
-//! A command with several subcommands (`agents`, `config`, `api`, `squad`, `new`,
+//! A command with several subcommands (`agents`, `config`, `daemon`, `squad`, `new`,
 //! `remote`, `specs`) registers the *same* function on every leaf: its
 //! `from_input` selects the subcommand from
 //! [`CallerContext::leaf`](crate::command::dispatch::CallerContext::leaf).
 
 use crate::command::commands::agents::AgentsCommand;
-use crate::command::commands::api_server::ApiServerCommand;
 use crate::command::commands::chat::ChatCommand;
 use crate::command::commands::clean::CleanCommand;
 use crate::command::commands::config::ConfigCommand;
@@ -80,8 +79,10 @@ pub fn exec_workflow(ctx: &BuildContext) -> Result<BuiltCommand, CommandError> {
     )?))
 }
 
-pub fn api_server(ctx: &BuildContext) -> Result<BuiltCommand, CommandError> {
-    Ok(BuiltCommand::ApiServer(ApiServerCommand::from_input(ctx)?))
+pub fn daemon(ctx: &BuildContext) -> Result<BuiltCommand, CommandError> {
+    Ok(BuiltCommand::Daemon(
+        crate::command::commands::daemon::lifecycle::DaemonCommand::from_input(ctx)?,
+    ))
 }
 
 pub fn squad(ctx: &BuildContext) -> Result<BuiltCommand, CommandError> {
@@ -104,4 +105,10 @@ pub fn new(ctx: &BuildContext) -> Result<BuiltCommand, CommandError> {
 
 pub fn clean(ctx: &BuildContext) -> Result<BuiltCommand, CommandError> {
     Ok(BuiltCommand::Clean(CleanCommand::from_input(ctx)?))
+}
+
+pub fn daemon_api(ctx: &BuildContext) -> Result<BuiltCommand, CommandError> {
+    Ok(BuiltCommand::DaemonApi(
+        crate::command::commands::daemon::api::DaemonApiCommand::from_input(ctx)?,
+    ))
 }

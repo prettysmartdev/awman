@@ -1,4 +1,4 @@
-//! `BuiltinNetworkConfig` — the `builtin.network` block of global and repo
+//! `BuiltinNetworkConfig` — the `runtime.builtin.network` block of global and repo
 //! config, and the resolved [`BuiltinNetworkSettings`] the engine enforces.
 //!
 //! The builtin runtime gives every session VM its own user-space network
@@ -69,7 +69,7 @@ impl NetworkMode {
     }
 }
 
-/// The `builtin.network` block as written in one config file. Every field is
+/// The `runtime.builtin.network` block as written in one config file. Every field is
 /// optional; see the module docs for how global and repo blocks combine.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -266,25 +266,28 @@ impl BuiltinNetworkConfig {
         let global = global
             .map(|g| {
                 g.parsed()
-                    .map_err(|e| format!("global builtin.network: {e}"))
+                    .map_err(|e| format!("global runtime.builtin.network: {e}"))
             })
             .transpose()?
             .unwrap_or_default();
         let repo = repo
-            .map(|r| r.parsed().map_err(|e| format!("repo builtin.network: {e}")))
+            .map(|r| {
+                r.parsed()
+                    .map_err(|e| format!("repo runtime.builtin.network: {e}"))
+            })
             .transpose()?
             .unwrap_or_default();
 
         if repo.nameservers.is_some() {
             return Err(
-                "repo builtin.network.nameservers is not allowed: host-side resolvers are set in \
+                "repo runtime.builtin.network.nameservers is not allowed: host-side resolvers are set in \
                  the global config only"
                     .into(),
             );
         }
         if repo.trust_host_cas.is_some() {
             return Err(
-                "repo builtin.network.trustHostCas is not allowed: host trust is shared into \
+                "repo runtime.builtin.network.trustHostCas is not allowed: host trust is shared into \
                  guests from the global config only"
                     .into(),
             );
@@ -294,7 +297,7 @@ impl BuiltinNetworkConfig {
         let mode = match repo.mode {
             Some(requested) if requested > global_mode => {
                 return Err(format!(
-                    "repo builtin.network.mode {:?} is less restrictive than the global mode {:?}",
+                    "repo runtime.builtin.network.mode {:?} is less restrictive than the global mode {:?}",
                     requested.as_str(),
                     global_mode.as_str()
                 ));
@@ -304,7 +307,9 @@ impl BuiltinNetworkConfig {
         };
 
         if global.allow.is_some() && global_mode != NetworkMode::Allowlist {
-            return Err("global builtin.network.allow only applies to mode \"allowlist\"".into());
+            return Err(
+                "global runtime.builtin.network.allow only applies to mode \"allowlist\"".into(),
+            );
         }
         let allow = if mode == NetworkMode::Allowlist {
             let ceiling = global.allow.clone().unwrap_or_default();
@@ -315,7 +320,7 @@ impl BuiltinNetworkConfig {
                         .find(|entry| !ceiling.iter().any(|c| entry.within(c)))
                     {
                         return Err(format!(
-                            "repo builtin.network.allow entry {extra} is not permitted by the \
+                            "repo runtime.builtin.network.allow entry {extra} is not permitted by the \
                              global allow list"
                         ));
                     }
@@ -328,7 +333,7 @@ impl BuiltinNetworkConfig {
         } else {
             if repo.allow.is_some() {
                 return Err(format!(
-                    "repo builtin.network.allow only applies to mode \"allowlist\" (effective mode \
+                    "repo runtime.builtin.network.allow only applies to mode \"allowlist\" (effective mode \
                      is {:?})",
                     mode.as_str()
                 ));
@@ -341,7 +346,7 @@ impl BuiltinNetworkConfig {
             Some(requested) => {
                 if let Some(port) = requested.iter().find(|p| !authorised.contains(p)) {
                     return Err(format!(
-                        "repo builtin.network.hostPorts port {port} is not authorised by the \
+                        "repo runtime.builtin.network.hostPorts port {port} is not authorised by the \
                          global hostPorts"
                     ));
                 }
@@ -351,7 +356,7 @@ impl BuiltinNetworkConfig {
         };
         if mode == NetworkMode::None && !host_ports.is_empty() {
             return Err(
-                "builtin.network.hostPorts cannot be reached in mode \"none\" (no network device); \
+                "runtime.builtin.network.hostPorts cannot be reached in mode \"none\" (no network device); \
                  remove hostPorts or choose another mode"
                     .into(),
             );
@@ -360,7 +365,7 @@ impl BuiltinNetworkConfig {
         let trust_host_cas = global.trust_host_cas.unwrap_or(false);
         if mode == NetworkMode::None && (!nameservers.is_empty() || trust_host_cas) {
             return Err(
-                "builtin.network.nameservers and trustHostCas have no effect in mode \"none\"; \
+                "runtime.builtin.network.nameservers and trustHostCas have no effect in mode \"none\"; \
                  remove them or choose another mode"
                     .into(),
             );

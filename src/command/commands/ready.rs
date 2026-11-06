@@ -213,7 +213,7 @@ impl ReadyCommand {
     }
 
     /// Construct from the catalogue-resolved input (WI 0113 F-10). `--json`
-    /// declares `implies: ["non-interactive"]`, so the implication is already
+    /// declares `implies: ["headless"]`, so the implication is already
     /// applied in `flags` and is not re-derived here.
     pub fn from_input(ctx: &BuildContext) -> Result<Self, CommandError> {
         Ok(Self::new(
@@ -221,7 +221,7 @@ impl ReadyCommand {
                 refresh: ctx.flags.bool("refresh"),
                 build: ctx.flags.bool("build"),
                 no_cache: ctx.flags.bool("no-cache"),
-                non_interactive: ctx.flags.bool("non-interactive"),
+                non_interactive: ctx.flags.bool("headless"),
                 allow_docker: ctx.flags.bool("allow-docker"),
                 json: ctx.flags.bool("json"),
                 agent: ctx.flags.string("agent"),
@@ -311,9 +311,7 @@ impl Command for ReadyCommand {
         let resolved_builtin = ReadyEngine::builtin_inputs(&session, runtime.as_ref())?;
         let mut engine = ReadyEngine::new(
             resolved_builtin,
-            crate::data::config::global::GlobalConfig::data_home_with(
-                session.effective_config().env(),
-            )?,
+            crate::data::fs::data_paths::data_home(session.effective_config().env())?,
             std::sync::Arc::new(session),
             self.engines.git_engine.clone(),
             self.engines.overlay_engine.clone(),

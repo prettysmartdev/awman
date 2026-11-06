@@ -80,7 +80,7 @@ pub trait TokenProbeSource: Send + Sync {
     fn gh_on_path(&self) -> Option<PathBuf>;
     fn host_gh_status(&self, host: &str) -> GhAuthStatus;
     fn verify(&self, token: &SecretString, host: &str) -> TokenVerification;
-    /// Optional value access for verification and non-interactive refresh.
+    /// Optional value access for verification and headless refresh.
     /// Defaults let name-only probe fakes remain valid without reading the host env.
     fn env_token(&self, _var: &str) -> Option<SecretString> {
         None

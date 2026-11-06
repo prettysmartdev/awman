@@ -102,6 +102,8 @@ pub enum ArgumentKind {
     /// `<COMMAND>...` style: collect every remaining token verbatim,
     /// including hyphen-prefixed values, into a single argument.
     TrailingVarArgs,
+    /// Multiple positionals; flags can appear between or after values.
+    VarArgs,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -117,19 +119,21 @@ pub struct ArgumentSpec {
 pub enum FrontendKind {
     Cli,
     Tui,
-    Api,
-    /// The squad daemon's HTTP frontend.
-    ///
-    /// Distinct from [`Api`](FrontendKind::Api) because it serves a *narrower*
-    /// catalogue: only the `squad` subtree. `src/frontend/squad/routes.rs`
-    /// used to enforce that by comparing the first path segment against the
-    /// literal `"squad"` (WI 0114 F-50); the catalogue enforces it now, so
-    /// renaming the subtree cannot leave the daemon accepting a path it no
-    /// longer serves.
-    SquadDaemon,
+    Daemon {
+        feature: crate::data::daemon_state::FeatureName,
+        listener: crate::data::daemon_state::CommandListener,
+    },
 }
 
 impl FrontendKind {
+    pub const WORKER_LOCAL: Self = Self::Daemon {
+        feature: crate::data::daemon_state::FeatureName::Worker,
+        listener: crate::data::daemon_state::CommandListener::Local,
+    };
+    pub const SQUAD_LOCAL: Self = Self::Daemon {
+        feature: crate::data::daemon_state::FeatureName::Squad,
+        listener: crate::data::daemon_state::CommandListener::Local,
+    };
     /// Whether this frontend is the user's own session on the host that chose
     /// the paths in a request.
     ///
@@ -141,21 +145,21 @@ impl FrontendKind {
     pub fn is_local_user(self) -> bool {
         match self {
             FrontendKind::Cli | FrontendKind::Tui => true,
-            FrontendKind::Api | FrontendKind::SquadDaemon => false,
+            FrontendKind::Daemon { .. } => false,
         }
     }
 
     /// Whether a human can be asked a question through this frontend.
     ///
     /// The mirror of [`is_local_user`](Self::is_local_user) for the HTTP
-    /// frontends, and the constant half of the non-interactive rule: the CLI's
+    /// frontends, and the constant half of the headless rule: the CLI's
     /// answer additionally depends on whether stdin is a terminal, which only
     /// the CLI can see, so it supplies that through
     /// [`CommandFrontend::input_available`](crate::command::dispatch::CommandFrontend::input_available).
     pub fn can_ask_a_human(self) -> bool {
         match self {
             FrontendKind::Cli | FrontendKind::Tui => true,
-            FrontendKind::Api | FrontendKind::SquadDaemon => false,
+            FrontendKind::Daemon { .. } => false,
         }
     }
 
@@ -164,8 +168,32 @@ impl FrontendKind {
         match self {
             FrontendKind::Cli => "cli",
             FrontendKind::Tui => "tui",
-            FrontendKind::Api => "api",
-            FrontendKind::SquadDaemon => "squad daemon",
+            FrontendKind::Daemon { feature, listener } => match (feature, listener) {
+                (
+                    crate::data::daemon_state::FeatureName::Worker,
+                    crate::data::daemon_state::CommandListener::Local,
+                ) => "daemon:worker:local",
+                (
+                    crate::data::daemon_state::FeatureName::Worker,
+                    crate::data::daemon_state::CommandListener::Network,
+                ) => "daemon:worker:network",
+                (
+                    crate::data::daemon_state::FeatureName::Squad,
+                    crate::data::daemon_state::CommandListener::Local,
+                ) => "daemon:squad:local",
+                (
+                    crate::data::daemon_state::FeatureName::Squad,
+                    crate::data::daemon_state::CommandListener::Network,
+                ) => "daemon:squad:network",
+                (
+                    crate::data::daemon_state::FeatureName::Engine,
+                    crate::data::daemon_state::CommandListener::Local,
+                ) => "daemon:engine:local",
+                (
+                    crate::data::daemon_state::FeatureName::Engine,
+                    crate::data::daemon_state::CommandListener::Network,
+                ) => "daemon:engine:network",
+            },
         }
     }
 }
@@ -247,7 +275,7 @@ pub struct CommandSpec {
     ///
     /// The frontend still supplies the two facts about *this invocation* that
     /// the catalogue cannot know — whether stdin is a terminal, and whether
-    /// the user asked for non-interactive output. This is only "does this
+    /// the user asked for headless output. This is only "does this
     /// command have a TUI form at all", which is a catalogue fact: renaming
     /// `squad` must not leave a stale literal in a frontend (midpoint
     /// finding 24).
@@ -296,7 +324,7 @@ impl CommandCatalogue {
     ///
     /// The caller still supplies the two *facts about this invocation* that
     /// the catalogue cannot know: whether stdin is a terminal, and whether the
-    /// user asked for non-interactive output.
+    /// user asked for headless output.
     pub fn opens_tui_when_bare(&self, path: &[&str]) -> bool {
         self.lookup_with_aliases(path)
             .map(|spec| spec.opens_tui_when_bare)
@@ -305,6 +333,16 @@ impl CommandCatalogue {
 
     pub fn root(&self) -> &'static CommandSpec {
         self.root
+    }
+
+    /// The flags every command accepts (`--set`). See [`GLOBAL_FLAGS`].
+    pub fn global_flags(&self) -> &'static [FlagSpec] {
+        GLOBAL_FLAGS
+    }
+
+    /// A global flag by long name.
+    pub fn find_global_flag(&self, name: &str) -> Option<&'static FlagSpec> {
+        GLOBAL_FLAGS.iter().find(|f| f.long == name)
     }
 
     pub fn path_aliases(&self) -> &'static [(&'static [&'static str], &'static [&'static str])] {
@@ -365,15 +403,18 @@ impl CommandCatalogue {
     pub fn is_allowed_for_frontend(&self, frontend: FrontendKind, path: &[&str]) -> bool {
         match frontend {
             FrontendKind::Cli | FrontendKind::Tui => true,
-            FrontendKind::Api => self.is_api_allowed(path),
-            // The squad daemon serves the `squad` subtree and nothing else:
-            // it has no session store, no image builds and no PTY. Which
-            // subtree that is comes from `SQUAD_DAEMON_SUBTREE`, not from a
-            // literal in the daemon's router (WI 0114 F-50).
-            FrontendKind::SquadDaemon => {
-                let canonical = self.canonical_path(path);
-                canonical.first() == SQUAD_DAEMON_SUBTREE.first() && self.is_api_allowed(path)
-            }
+            FrontendKind::Daemon {
+                feature: crate::data::daemon_state::FeatureName::Worker,
+                ..
+            } => self.is_api_allowed(path),
+            FrontendKind::Daemon {
+                feature: crate::data::daemon_state::FeatureName::Squad,
+                ..
+            } => path.first() == Some(&"squad") && self.is_api_allowed(path),
+            FrontendKind::Daemon {
+                feature: crate::data::daemon_state::FeatureName::Engine,
+                ..
+            } => false,
         }
     }
 
@@ -550,29 +591,49 @@ const ROOT: CommandSpec = CommandSpec {
         },
     ],
     subcommands: &[
-        &INIT,
-        &READY,
-        &CHAT,
-        &SPECS,
-        &AGENTS,
-        &CONFIG,
-        &EXEC,
-        &API_SERVER,
-        &SQUAD,
-        &REMOTE,
-        &NEW,
+        &INIT, &READY, &CHAT, &SPECS, &AGENTS, &CONFIG, &EXEC, &DAEMON, &SQUAD, &REMOTE, &NEW,
         &CLEAN,
     ],
 };
 
-const PATH_ALIASES: &[(&[&str], &[&str])] = &[];
-
-/// The one command subtree the squad daemon's HTTP frontend serves.
+/// Flags every command accepts, wherever they appear before `--`.
 ///
-/// Named here so the daemon's router does not spell it (WI 0114 F-50): a
-/// rename of the subtree moves this constant, not a string comparison in
-/// Layer 3.
-const SQUAD_DAEMON_SUBTREE: &[&str] = &["squad"];
+/// Declared once here rather than on every spec: clap marks them
+/// `global(true)`, the raw-args parser (TUI command box, API `args`) accepts
+/// them on any command, and none of them reaches a command's
+/// [`ResolvedFlags`](crate::command::dispatch::ResolvedFlags): `main` applies
+/// `--set` to the session at startup, and dispatch applies a command box's or
+/// request's `--set` to that one command's session.
+const GLOBAL_FLAGS: &[FlagSpec] = &[
+    FlagSpec {
+        long: SET_FLAG,
+        short: None,
+        help: "Override a config key for this invocation: --set key=value (repeatable). Beats \
+           config files and AWMAN_* variables. `awman config show` lists the keys.",
+        kind: FlagKind::VecString,
+        default: FlagDefault::EmptyVec,
+        frontends: FrontendVisibility::All,
+        conflicts_with: &[],
+        implies: &[],
+        optional: true,
+    },
+    FlagSpec {
+        long: "remote",
+        short: None,
+        help: "Named remote target from remote.targets.",
+        kind: FlagKind::OptionalString,
+        default: FlagDefault::None,
+        frontends: FrontendVisibility::All,
+        conflicts_with: &[],
+        implies: &[],
+        optional: true,
+    },
+];
+
+/// The long name of the global `--set` flag.
+pub const SET_FLAG: &str = "set";
+
+const PATH_ALIASES: &[(&[&str], &[&str])] = &[];
 
 /// The `--type` flag's accepted values: every [`SessionKind`] spelled the way
 /// it serialises.
@@ -601,8 +662,8 @@ const REMOVED_FLAGS: &[RemovedFlagSpec] = &[
 // what assembles them into the tree, so this file remains the one place the
 // catalogue's shape is visible.
 mod agents;
-mod api;
 mod core;
+mod daemon;
 mod exec;
 mod new;
 mod remote;
@@ -614,8 +675,8 @@ mod squad;
 mod tests;
 
 use agents::*;
-use api::*;
 use core::*;
+use daemon::*;
 use exec::*;
 use new::*;
 use remote::*;

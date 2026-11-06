@@ -126,10 +126,7 @@ impl Command for ExecWorkflowCommand {
         }
 
         // Emit deprecation warnings for legacy config fields.
-        frontend.with(|frontend| {
-            LaunchPolicy::for_session(&self.session)
-                .warn_config(&self.engines.config_notices, frontend)
-        });
+        frontend.with(|frontend| LaunchPolicy::for_session(&self.session).warn_config(frontend));
 
         if self.flags.yolo && self.flags.worktree {
             frontend.write_message(UserMessage {
@@ -204,8 +201,8 @@ impl Command for ExecWorkflowCommand {
                 Ok((issue, source)) => {
                     let work_items_dir = self
                         .session
-                        .repo_config()
-                        .work_items_dir_or_default(&git_root_for_scope);
+                        .effective_config()
+                        .work_items_dir(&git_root_for_scope);
                     let build = match issue_source_overlay(
                         source,
                         &issue,

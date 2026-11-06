@@ -1,40 +1,34 @@
-//! WI 0116 §4a — the client half of the daemon-env protocol, end to end.
+//! The client half of the daemon-env protocol, end to end, against a real
+//! daemon (WI 0116 §4a on the WI 0140 transport).
 //!
-//! `SquadGatewayResolver::ensure_running` is the one call every squad command
-//! makes before it talks to a daemon, and WI 0116 hangs the coverage sync off
-//! it. What that sync actually does can only be observed from the daemon's
-//! side, so these tests put a **recording HTTP server** where the daemon would
-//! be — `wiremock`, the same fake this tree already uses for `HttpCore` — write
-//! the endpoint sidecar and pidfile a running daemon would have left, and then
-//! assert on the request sequence the supervisor produced.
+//! `DaemonResolver::gateway_for(GatewayNeed::Running)` is the one call every
+//! squad command makes before it talks to the daemon, and the coverage sync
+//! hangs off it. The daemon is a real `awman daemon start` process with only
+//! the squad feature on; the resolver reaches it over its owner-only local
+//! socket (there is no TCP and no bearer key). What the sync did is observed
+//! from the daemon's side: the coverage it reports (digest, `last_provided_at`)
+//! and the sync report the client returns.
 //!
-//! Everything here moves the real process environment (`SquadSupervisor` reads
-//! `Env::from_process()`), so it lives in its own test binary and every test
-//! takes the same lock.
-//!
-//! The sidecar is written with `auth_disabled: true`: a supervisor facing a
-//! daemon that checks no bearer token mints no key, which keeps these tests
-//! from writing an `squad_key.hash` nobody holds.
+//! The resolver reads the real process environment, so every test takes the
+//! same lock and scopes the variables it sets.
 
 #![cfg(unix)]
 
 use std::sync::Arc;
-use std::time::Duration;
 
+use awman::command::commands::squad::client::DaemonSquadClient;
+use awman::command::commands::squad::env_sync;
 use awman::command::commands::squad::gateway::{EnvCoverage, TaskGateway};
-use awman::command::commands::squad::supervisor::SquadGatewayResolver;
+use awman::command::commands::squad::supervisor::DaemonResolver;
+use awman::command::dispatch::catalogue::GatewayNeed;
 use awman::data::config::env::Env;
-use awman::data::fs::daemon_process::{
-    DaemonProcess, ServerMeta, SQUAD_PLIST_LABEL, SQUAD_UNIT_NAME,
-};
-use awman::data::fs::{MountScope, SquadPaths, Task, TaskStatus};
+use awman::data::fs::{MountScope, Task, TaskStatus};
 use awman::engine::squad::env_state::{coverage_digest, Salt};
 use tokio::sync::Mutex as AsyncMutex;
-use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
 
-#[path = "helpers/fake_awman.rs"]
-mod fake_awman;
-use fake_awman::FakeAwmanProcess;
+#[path = "helpers/api_process.rs"]
+mod api_process;
+use api_process::RootDaemon;
 
 static PROCESS_ENV_LOCK: AsyncMutex<()> = AsyncMutex::const_new(());
 
@@ -54,8 +48,10 @@ impl ScopedEnv {
         )
     }
 
-    /// Remember a variable's current value so the test can unset it and have
-    /// it restored on drop.
+    fn update(&mut self, key: &str, value: &str) {
+        std::env::set_var(key, value);
+    }
+
     fn clear(&mut self, key: &str) {
         self.0.push((key.to_string(), std::env::var(key).ok()));
         std::env::remove_var(key);
@@ -73,442 +69,234 @@ impl Drop for ScopedEnv {
     }
 }
 
-/// Write the pidfile and endpoint sidecar a daemon serving `base` would have
-/// left behind, so `ensure_running` takes its **already-running** branch.
-fn publish_running_daemon(root: &std::path::Path, base: &str, pid: u32) {
-    let daemon = DaemonProcess::new(
-        SquadPaths::from_root(root.join("squad")).daemon(),
-        SQUAD_UNIT_NAME,
-        SQUAD_PLIST_LABEL,
-    );
-    let url = base.strip_prefix("http://").expect("wiremock serves http");
-    let (host, port) = url.rsplit_once(':').expect("host:port");
-    daemon
-        .write_meta(&ServerMeta {
-            port: port.parse().expect("port"),
-            bind_ip: host.to_string(),
-            scheme: "http".into(),
-            auth_disabled: true,
+/// A task seeded into the shared database before the daemon boots, so its
+/// `env()` names are in `required_env` from the first tick.
+fn seed_task(root: &std::path::Path, name: &str, overlays: &[&str]) {
+    let db = root.join("data").join("awman.db");
+    std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+    let store = awman::data::fs::TaskStore::open(&db).unwrap();
+    store.migrate().unwrap();
+    let now = chrono::Utc::now();
+    store
+        .create(&Task {
+            prerequisites: None,
+            id: awman::data::ids::TaskId::new(),
+            name: name.into(),
+            description: "seeded for the env sync tests".into(),
+            repo_scope: root.to_path_buf(),
+            mount_scope: MountScope::GitRoot,
+            overlays: overlays.iter().map(|s| s.to_string()).collect(),
+            interval_secs: 3600,
+            status: TaskStatus::Active,
+            agent: None,
+            model: None,
+            backoff_until: None,
+            created_at: now,
+            updated_at: now,
+            last_run_at: None,
+            trigger_requested_at: None,
+            last_run_status: None,
+            unmet_env: Vec::new(),
         })
-        .expect("endpoint sidecar");
-    daemon.force_write_pidfile(pid).expect("pidfile");
+        .unwrap();
 }
 
-/// One coverage body, as `GET /v1/daemon/env` returns it.
-fn coverage_body(salt: &Salt, entries: &[(&str, Option<String>)]) -> serde_json::Value {
-    serde_json::json!({
-        "salt": salt.to_hex(),
-        "persistence": "none",
-        "required": entries
-            .iter()
-            .map(|(name, digest)| serde_json::json!({
-                "name": name,
-                "required_by": ["nightly"],
-                "required_since": "2026-09-09T20:19:54.417577053Z",
-                "last_provided_at": null,
-                "unmet_since": null,
-                "source": digest.as_ref().map(|_| "pushed"),
-                "digest": digest,
-            }))
-            .collect::<Vec<_>>(),
-    })
+async fn boot(root: &std::path::Path, overlays: &[&str]) -> RootDaemon {
+    std::fs::write(
+        root.join("config.json"),
+        r#"{"daemon":{"features":{"squad":{"enabled":true,"envPersistence":"none"}}}}"#,
+    )
+    .unwrap();
+    seed_task(root, "nightly", overlays);
+    RootDaemon::start(root).await
 }
 
-/// Every request the fake daemon received, as `(method, path, body)`.
-async fn requests(server: &MockServer) -> Vec<(String, String, serde_json::Value)> {
-    server
-        .received_requests()
+fn resolver() -> DaemonResolver {
+    DaemonResolver::from_env(&Env::from_process()).unwrap()
+}
+
+fn entry<'a>(
+    coverage: &'a EnvCoverage,
+    name: &str,
+) -> Option<&'a awman::engine::squad::env_state::RequiredEnvEntry> {
+    coverage.required.iter().find(|e| e.name == name)
+}
+
+async fn gateway(resolver: &DaemonResolver, need: GatewayNeed) -> Arc<dyn TaskGateway> {
+    resolver
+        .gateway_for(need)
         .await
-        .unwrap_or_default()
-        .into_iter()
-        .map(|request| {
-            let body = serde_json::from_slice(&request.body).unwrap_or(serde_json::Value::Null);
-            (
-                request.method.to_string().to_uppercase(),
-                request.url.path().to_string(),
-                body,
-            )
-        })
-        .collect()
+        .expect("the daemon answers")
+        .expect("a gateway")
 }
 
-async fn mount_env_routes(server: &MockServer, coverage: serde_json::Value) {
-    Mock::given(matchers::method("GET"))
-        .and(matchers::path("/v1/daemon/env"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(coverage.clone()))
-        .mount(server)
-        .await;
-    Mock::given(matchers::method("POST"))
-        .and(matchers::path("/v1/daemon/env"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "accepted": ["WI0116_SYNC_TOKEN"],
-            "ignored": [],
-            "coverage": coverage,
-        })))
-        .mount(server)
-        .await;
-}
-
-// ─── §4a: the cold call, and the already-running branch ─────────────────────
-
-/// **The cold-call round trip, and the already-running branch of
-/// `ensure_running`.**
-///
-/// A client cannot know `required_env` before the daemon answers, so the
-/// exchange resolves it in one pass: the first request sends *nothing* (a bare
-/// GET), the answer names what the daemon wants, and the single POST that
-/// follows carries the intersection of that list with this shell — never more.
+/// **The cold call.** A client cannot know `required_env` before the daemon
+/// answers, so one pass learns the list and sends the intersection with this
+/// shell: the required name it holds goes, the one it lacks is reported absent
+/// and nothing the daemon did not ask for is sent.
 #[tokio::test]
-async fn ensure_running_against_a_live_daemon_learns_required_env_then_sends_the_intersection() {
+async fn gateway_for_running_learns_required_env_then_sends_the_intersection() {
     let _lock = PROCESS_ENV_LOCK.lock().await;
     let tmp = tempfile::tempdir().unwrap();
-    let server = MockServer::start().await;
-    let salt = Salt::random();
-    // The daemon holds nothing yet: two required names, no digests.
-    mount_env_routes(
-        &server,
-        coverage_body(
-            &salt,
-            &[("WI0116_SYNC_TOKEN", None), ("WI0116_ABSENT", None)],
-        ),
+    let daemon = boot(
+        tmp.path(),
+        &["env(WI0116_SYNC_TOKEN)", "env(WI0116_ABSENT)"],
     )
     .await;
-
-    let holder = FakeAwmanProcess::spawn("env-sync");
-    publish_running_daemon(tmp.path(), &server.uri(), holder.id());
     let mut env = ScopedEnv::set(&[
-        ("AWMAN_CONFIG_HOME", tmp.path().to_str().unwrap()),
-        (
-            "AWMAN_SQUAD_ROOT",
-            tmp.path().join("squad").to_str().unwrap(),
-        ),
+        ("AWMAN_HOME", tmp.path().to_str().unwrap()),
         ("WI0116_SYNC_TOKEN", "the-value"),
         // Set, but outside `required_env`: it must never be transmitted.
         ("WI0116_NOT_REQUIRED", "never-sent"),
     ]);
     env.clear("WI0116_ABSENT");
-    env.clear("AWMAN_SQUAD_KEY");
 
-    let resolver = SquadGatewayResolver::from_env(&Env::from_process()).unwrap();
-    resolver
-        .ensure_running()
-        .await
-        .expect("the already-running branch must return the sidecar's endpoint");
+    let resolver = resolver();
+    let gateway = gateway(&resolver, GatewayNeed::Running).await;
+    let coverage = gateway.env_coverage().await.expect("coverage");
 
-    let seen = requests(&server).await;
+    let held = entry(&coverage, "WI0116_SYNC_TOKEN").expect("required");
+    let salt = Salt::from_hex(&coverage.salt).expect("salt");
     assert_eq!(
-        seen.len(),
-        2,
-        "one coverage check and one push, no more: {seen:?}"
+        held.digest.as_deref(),
+        Some(coverage_digest(&salt, "WI0116_SYNC_TOKEN", "the-value").as_str()),
+        "the daemon holds exactly the value this shell exported"
     );
-    assert_eq!(
-        (seen[0].0.as_str(), seen[0].1.as_str()),
-        ("GET", "/v1/daemon/env"),
-        "the cold call sends nothing first — it asks"
-    );
-    assert_eq!(
-        (seen[1].0.as_str(), seen[1].1.as_str()),
-        ("POST", "/v1/daemon/env")
-    );
-
-    let push = &seen[1].2;
-    assert_eq!(
-        push["vars"],
-        serde_json::json!({"WI0116_SYNC_TOKEN": "the-value"}),
-        "only the intersection of `required_env` and this shell is sent: {push}"
-    );
-    assert_eq!(
-        push["absent"],
-        serde_json::json!(["WI0116_ABSENT"]),
-        "a required name this shell lacks is reported absent, not omitted: {push}"
-    );
+    assert!(entry(&coverage, "WI0116_ABSENT").unwrap().digest.is_none());
     assert!(
-        !push.to_string().contains("WI0116_NOT_REQUIRED"),
-        "nothing outside required_env is ever transmitted: {push}"
+        entry(&coverage, "WI0116_NOT_REQUIRED").is_none(),
+        "a name nothing declares is not collected"
     );
-
+    let rendered = serde_json::to_string(&coverage).unwrap();
+    assert!(
+        !rendered.contains("the-value") && !rendered.contains("never-sent"),
+        "{rendered}"
+    );
     drop(env);
-    drop(holder);
+    daemon.abort();
 }
 
-/// Steady state: the daemon reports a digest that matches what this shell
-/// holds, so `ensure_running` sends **nothing at all** beyond the check. This
-/// is why a coverage sync on every command is affordable — and why looking at a
-/// list does not move a secret.
+/// Steady state: the digest already matches, so the next sync sends nothing —
+/// `last_provided_at` does not move and the report says `unchanged`.
 #[tokio::test]
-async fn a_matching_digest_costs_one_get_and_puts_no_secret_on_the_wire() {
+async fn a_matching_digest_sends_nothing_on_the_next_sync() {
     let _lock = PROCESS_ENV_LOCK.lock().await;
     let tmp = tempfile::tempdir().unwrap();
-    let server = MockServer::start().await;
-    let salt = Salt::random();
-    let digest = coverage_digest(&salt, "WI0116_SYNC_TOKEN", "the-value");
-    mount_env_routes(
-        &server,
-        coverage_body(&salt, &[("WI0116_SYNC_TOKEN", Some(digest))]),
-    )
-    .await;
-
-    let holder = FakeAwmanProcess::spawn("env-sync");
-    publish_running_daemon(tmp.path(), &server.uri(), holder.id());
-    let mut env = ScopedEnv::set(&[
-        ("AWMAN_CONFIG_HOME", tmp.path().to_str().unwrap()),
-        (
-            "AWMAN_SQUAD_ROOT",
-            tmp.path().join("squad").to_str().unwrap(),
-        ),
+    let daemon = boot(tmp.path(), &["env(WI0116_SYNC_TOKEN)"]).await;
+    let _env = ScopedEnv::set(&[
+        ("AWMAN_HOME", tmp.path().to_str().unwrap()),
         ("WI0116_SYNC_TOKEN", "the-value"),
     ]);
-    env.clear("AWMAN_SQUAD_KEY");
 
-    let resolver = SquadGatewayResolver::from_env(&Env::from_process()).unwrap();
-    resolver.ensure_running().await.expect("endpoint");
+    let resolver = resolver();
+    let gateway = gateway(&resolver, GatewayNeed::Running).await;
+    let first = gateway.env_coverage().await.unwrap();
+    let provided = entry(&first, "WI0116_SYNC_TOKEN").unwrap().last_provided_at;
+    assert!(provided.is_some());
 
-    let seen = requests(&server).await;
+    let report = env_sync::sync_env(gateway.as_ref(), false).await;
+    assert_eq!(report.unchanged, vec!["WI0116_SYNC_TOKEN".to_string()]);
+    assert!(report.pushed.is_empty(), "{report:?}");
+    let second = gateway.env_coverage().await.unwrap();
     assert_eq!(
-        seen.iter().map(|r| r.0.as_str()).collect::<Vec<_>>(),
-        vec!["GET"],
-        "a matching digest sends nothing: {seen:?}"
+        entry(&second, "WI0116_SYNC_TOKEN")
+            .unwrap()
+            .last_provided_at,
+        provided,
+        "nothing crossed the socket"
     );
-
-    drop(env);
-    drop(holder);
+    daemon.abort();
 }
 
-/// A rotated value is the case a push exists for: the digests differ, so the
-/// new value goes — over the same already-running daemon, with no restart.
+/// A rotated value is what a push exists for: the digests differ, so the new
+/// value goes to the already-running daemon with no restart.
 #[tokio::test]
-async fn a_rotated_value_is_pushed_to_an_already_running_daemon() {
+async fn a_rotated_value_is_pushed_to_the_running_daemon() {
     let _lock = PROCESS_ENV_LOCK.lock().await;
     let tmp = tempfile::tempdir().unwrap();
-    let server = MockServer::start().await;
-    let salt = Salt::random();
-    let stale = coverage_digest(&salt, "WI0116_SYNC_TOKEN", "the-old-value");
-    mount_env_routes(
-        &server,
-        coverage_body(&salt, &[("WI0116_SYNC_TOKEN", Some(stale))]),
-    )
-    .await;
-
-    let holder = FakeAwmanProcess::spawn("env-sync");
-    publish_running_daemon(tmp.path(), &server.uri(), holder.id());
+    let daemon = boot(tmp.path(), &["env(WI0116_SYNC_TOKEN)"]).await;
     let mut env = ScopedEnv::set(&[
-        ("AWMAN_CONFIG_HOME", tmp.path().to_str().unwrap()),
-        (
-            "AWMAN_SQUAD_ROOT",
-            tmp.path().join("squad").to_str().unwrap(),
-        ),
-        ("WI0116_SYNC_TOKEN", "the-new-value"),
+        ("AWMAN_HOME", tmp.path().to_str().unwrap()),
+        ("WI0116_SYNC_TOKEN", "the-old-value"),
     ]);
-    env.clear("AWMAN_SQUAD_KEY");
 
-    let resolver = SquadGatewayResolver::from_env(&Env::from_process()).unwrap();
-    resolver.ensure_running().await.expect("endpoint");
+    let resolver = resolver();
+    let gateway = gateway(&resolver, GatewayNeed::Running).await;
+    let before = gateway.env_coverage().await.unwrap();
+    let old = entry(&before, "WI0116_SYNC_TOKEN").unwrap().digest.clone();
 
-    let seen = requests(&server).await;
-    assert_eq!(seen.len(), 2, "{seen:?}");
+    env.update("WI0116_SYNC_TOKEN", "the-new-value");
+    let report = env_sync::sync_env(gateway.as_ref(), false).await;
+    assert_eq!(report.pushed, vec!["WI0116_SYNC_TOKEN".to_string()]);
+    let after = gateway.env_coverage().await.unwrap();
+    let salt = Salt::from_hex(&after.salt).unwrap();
+    assert_ne!(entry(&after, "WI0116_SYNC_TOKEN").unwrap().digest, old);
     assert_eq!(
-        seen[1].2["vars"],
-        serde_json::json!({"WI0116_SYNC_TOKEN": "the-new-value"}),
-        "a long-lived daemon picks up a rotated token from the next command"
+        entry(&after, "WI0116_SYNC_TOKEN")
+            .unwrap()
+            .digest
+            .as_deref(),
+        Some(coverage_digest(&salt, "WI0116_SYNC_TOKEN", "the-new-value").as_str())
     );
-
     drop(env);
-    drop(holder);
+    daemon.abort();
 }
 
-/// `squad status` and the TUI's ten-second indicator poller use
-/// `gateway_from_meta` / `probe_gateway`, which deliberately do **not** sync:
-/// a read-only look at a daemon must not push anything.
+/// `IfRunning` is the read-only look (`squad` status, the TUI indicator): it
+/// builds a client without syncing, so nothing is pushed.
 #[tokio::test]
-async fn a_read_only_probe_gateway_pushes_nothing() {
+async fn an_if_running_gateway_pushes_nothing() {
     let _lock = PROCESS_ENV_LOCK.lock().await;
     let tmp = tempfile::tempdir().unwrap();
-    let server = MockServer::start().await;
-    let salt = Salt::random();
-    mount_env_routes(
-        &server,
-        coverage_body(&salt, &[("WI0116_SYNC_TOKEN", None)]),
-    )
-    .await;
-
-    let holder = FakeAwmanProcess::spawn("env-sync");
-    publish_running_daemon(tmp.path(), &server.uri(), holder.id());
-    let mut env = ScopedEnv::set(&[
-        ("AWMAN_CONFIG_HOME", tmp.path().to_str().unwrap()),
-        (
-            "AWMAN_SQUAD_ROOT",
-            tmp.path().join("squad").to_str().unwrap(),
-        ),
+    let daemon = boot(tmp.path(), &["env(WI0116_SYNC_TOKEN)"]).await;
+    let _env = ScopedEnv::set(&[
+        ("AWMAN_HOME", tmp.path().to_str().unwrap()),
         ("WI0116_SYNC_TOKEN", "the-value"),
     ]);
-    env.clear("AWMAN_SQUAD_KEY");
 
-    let resolver = SquadGatewayResolver::from_env(&Env::from_process()).unwrap();
-    assert!(resolver.probe_gateway().unwrap().is_some());
-    assert!(resolver.gateway_from_meta().unwrap().is_some());
-
+    let resolver = resolver();
+    let gateway = gateway(&resolver, GatewayNeed::IfRunning).await;
+    let coverage = gateway.env_coverage().await.unwrap();
+    let held = entry(&coverage, "WI0116_SYNC_TOKEN").unwrap();
     assert!(
-        requests(&server).await.is_empty(),
-        "building a read-only gateway must not touch the daemon at all"
+        held.digest.is_none() && held.last_provided_at.is_none(),
+        "looking at a daemon must not move a secret: {held:?}"
     );
-
-    drop(env);
-    drop(holder);
+    // A bare client built from the discovered endpoint behaves the same.
+    let client = resolver.client().unwrap().expect("a running daemon");
+    let bare = DaemonSquadClient::new(client);
+    assert!(
+        entry(&bare.env_coverage().await.unwrap(), "WI0116_SYNC_TOKEN")
+            .unwrap()
+            .digest
+            .is_none()
+    );
+    daemon.abort();
 }
 
-// ─── §6c: the indicator's probe still costs exactly one `list` ──────────────
-
-/// The seventh indicator state costs **no second round trip**. `unmet_env` is a
-/// field on `Task`, so it arrives on the very `list` the poller already makes;
-/// the probe must not also fetch coverage or status.
-///
-/// Driven through the public `SquadIndicatorPoller`, because `probe_once` is
-/// private — which is the point: the poller is the only caller, and this pins
-/// what it actually does over the wire.
+/// No daemon: `Running` refuses with `DaemonNotRunning` (nothing is started on
+/// the caller's behalf); `IfRunning` simply has no gateway.
 #[tokio::test]
-async fn the_indicator_probe_makes_exactly_one_list_call_per_tick() {
-    use awman::engine::squad::SquadHealth as SquadIndicator;
-    use awman::frontend::tui::squad_indicator::SquadIndicatorPoller;
-
+async fn without_a_daemon_running_refuses_and_if_running_answers_none() {
     let _lock = PROCESS_ENV_LOCK.lock().await;
     let tmp = tempfile::tempdir().unwrap();
-    let server = MockServer::start().await;
+    let _env = ScopedEnv::set(&[("AWMAN_HOME", tmp.path().to_str().unwrap())]);
 
-    // One task, carrying an unmet name on the `list` response itself.
-    let task = Task {
-        prerequisites: None,
-        id: "deploy".into(),
-        name: "deploy".into(),
-        description: "d".into(),
-        repo_scope: tmp.path().to_path_buf(),
-        mount_scope: MountScope::GitRoot,
-        overlays: vec!["env(AWS_PROFILE)".into()],
-        interval_secs: 600,
-        status: TaskStatus::Active,
-        agent: None,
-        model: None,
-        backoff_until: None,
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
-        last_run_at: None,
-        trigger_requested_at: None,
-        last_run_status: None,
-        unmet_env: vec!["AWS_PROFILE".into()],
-    };
-    Mock::given(matchers::method("POST"))
-        .and(matchers::path("/v1/commands"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(vec![task]))
-        .mount(&server)
-        .await;
-    // Coverage and status are mounted too, so a probe that *did* make a second
-    // call would succeed rather than error — the assertion below is then about
-    // what the probe chose to do, not about what happened to be reachable.
-    mount_env_routes(&server, coverage_body(&Salt::random(), &[])).await;
-
-    let holder = FakeAwmanProcess::spawn("env-sync");
-    publish_running_daemon(tmp.path(), &server.uri(), holder.id());
-    let mut env = ScopedEnv::set(&[
-        ("AWMAN_CONFIG_HOME", tmp.path().to_str().unwrap()),
-        (
-            "AWMAN_SQUAD_ROOT",
-            tmp.path().join("squad").to_str().unwrap(),
-        ),
-    ]);
-    env.clear("AWMAN_SQUAD_KEY");
-
-    let shared: Arc<std::sync::Mutex<SquadIndicator>> =
-        Arc::new(std::sync::Mutex::new(SquadIndicator::Unknown));
-    let cancel = tokio_util::sync::CancellationToken::new();
-    let handle = SquadIndicatorPoller::new(shared.clone()).start(cancel.clone());
-
-    // The first probe runs immediately; wait for it to land.
-    let mut waited = Duration::ZERO;
-    loop {
-        if *shared.lock().unwrap() != SquadIndicator::Unknown {
-            break;
-        }
-        assert!(
-            waited < Duration::from_secs(5),
-            "the first probe never landed"
-        );
-        tokio::time::sleep(Duration::from_millis(25)).await;
-        waited += Duration::from_millis(25);
+    let resolver = resolver();
+    assert!(!resolver.daemon_is_running().unwrap());
+    match resolver.gateway_for(GatewayNeed::Running).await {
+        Err(awman::command::error::CommandError::DaemonNotRunning) => {}
+        Err(other) => panic!("unexpected error: {other}"),
+        Ok(_) => panic!("Running must refuse without a daemon"),
     }
-    cancel.cancel();
-    let _ = handle.await;
-
-    assert_eq!(
-        *shared.lock().unwrap(),
-        SquadIndicator::EnvUnmet,
-        "`unmet_env` rides on the task list, so one `list` is enough to classify"
-    );
-    let seen = requests(&server).await;
-    assert_eq!(
-        seen.len(),
-        1,
-        "exactly one call per tick — the seventh state added no round trip: {seen:?}"
-    );
-    assert_eq!(
-        (seen[0].0.as_str(), seen[0].1.as_str()),
-        ("POST", "/v1/commands")
-    );
-    assert_eq!(
-        seen[0].2["subcommand"], "squad list",
-        "and that one call is the `list` the poller already made"
-    );
-
-    drop(env);
-    drop(holder);
-}
-
-// ─── The gateway's own env surface, over the wire ───────────────────────────
-
-/// `env_coverage()` deserialises the daemon's body into the shape every
-/// frontend reads, and carries no value because the body carries none.
-#[tokio::test]
-async fn the_remote_gateway_reads_coverage_as_names_digests_and_timestamps() {
-    let _lock = PROCESS_ENV_LOCK.lock().await;
-    let tmp = tempfile::tempdir().unwrap();
-    let server = MockServer::start().await;
-    let salt = Salt::random();
-    let digest = coverage_digest(&salt, "WI0116_SYNC_TOKEN", "the-value");
-    mount_env_routes(
-        &server,
-        coverage_body(&salt, &[("WI0116_SYNC_TOKEN", Some(digest.clone()))]),
-    )
-    .await;
-
-    let holder = FakeAwmanProcess::spawn("env-sync");
-    publish_running_daemon(tmp.path(), &server.uri(), holder.id());
-    let mut env = ScopedEnv::set(&[
-        ("AWMAN_CONFIG_HOME", tmp.path().to_str().unwrap()),
-        (
-            "AWMAN_SQUAD_ROOT",
-            tmp.path().join("squad").to_str().unwrap(),
-        ),
-    ]);
-    env.clear("AWMAN_SQUAD_KEY");
-
-    let resolver = SquadGatewayResolver::from_env(&Env::from_process()).unwrap();
-    let gateway = resolver.probe_gateway().unwrap().expect("a gateway");
-    let coverage: EnvCoverage = gateway.env_coverage().await.expect("coverage");
-
-    assert_eq!(coverage.salt, salt.to_hex());
-    assert_eq!(
-        coverage.persistence,
-        awman::data::fs::daemon_env::EnvPersistence::None
-    );
-    assert_eq!(coverage.required.len(), 1);
-    assert_eq!(coverage.required[0].name, "WI0116_SYNC_TOKEN");
-    assert_eq!(
-        coverage.required[0].digest.as_deref(),
-        Some(digest.as_str())
-    );
-    // The typed form has nowhere to put a value: the fields are a name, a
-    // digest, three timestamps, a source and two booleans.
-    let round_tripped = serde_json::to_string(&coverage).unwrap();
-    assert!(!round_tripped.contains("the-value"), "{round_tripped}");
-
-    drop(env);
-    drop(holder);
+    assert!(resolver
+        .gateway_for(GatewayNeed::IfRunning)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(resolver
+        .gateway_for(GatewayNeed::None)
+        .await
+        .unwrap()
+        .is_none());
 }

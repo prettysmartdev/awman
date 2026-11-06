@@ -24,6 +24,10 @@ pub enum LabelError {
     KeyContainsEquals { key: String },
     #[error("label key or value for '{key}' contains a control character")]
     ControlCharacter { key: String },
+    #[error("label keys are <namespace>/<name> in lowercase [a-z0-9.-]")]
+    KeyFormat { key: String },
+    #[error("label namespace `awman/` is reserved")]
+    ReservedNamespace { key: String },
 }
 
 impl Labels {
@@ -40,6 +44,11 @@ impl Labels {
 
     pub fn empty() -> Self {
         Self(BTreeMap::new())
+    }
+    /// Construct a view of persisted labels without applying today's write
+    /// rules, preserving values written by older awman versions.
+    pub fn from_stored(map: BTreeMap<String, String>) -> Self {
+        Self(map)
     }
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
@@ -88,6 +97,20 @@ fn validate_key(key: &str) -> Result<(), LabelError> {
     if key.chars().any(char::is_control) {
         return Err(LabelError::ControlCharacter { key: key.into() });
     }
+    let mut parts = key.split('/');
+    let namespace = parts.next().unwrap_or_default();
+    let name = parts.next().unwrap_or_default();
+    let allowed = |s: &str| {
+        !s.is_empty()
+            && s.bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'-')
+    };
+    if parts.next().is_some() || !allowed(namespace) || !allowed(name) {
+        return Err(LabelError::KeyFormat { key: key.into() });
+    }
+    if namespace == "awman" {
+        return Err(LabelError::ReservedNamespace { key: key.into() });
+    }
     Ok(())
 }
 
@@ -112,9 +135,22 @@ pub enum LabelSelector {
 
 impl LabelSelector {
     pub fn parse(term: &str) -> Result<Self, LabelError> {
+        Self::parse_with(term, validate_key)
+    }
+
+    /// Query parsing intentionally accepts legacy key spellings so stored
+    /// dotted labels remain filterable after the write contract tightens.
+    pub fn parse_query(term: &str) -> Result<Self, LabelError> {
+        Self::parse_with(term, validate_query_key)
+    }
+
+    fn parse_with(
+        term: &str,
+        validate: fn(&str) -> Result<(), LabelError>,
+    ) -> Result<Self, LabelError> {
         match term.split_once('=') {
             Some((key, value)) => {
-                validate_key(key)?;
+                validate(key)?;
                 validate_value(key, value)?;
                 Ok(Self::Equals {
                     key: key.into(),
@@ -122,10 +158,61 @@ impl LabelSelector {
                 })
             }
             None => {
-                validate_key(term)?;
+                validate(term)?;
                 Ok(Self::Exists { key: term.into() })
             }
         }
+    }
+}
+
+fn validate_query_key(key: &str) -> Result<(), LabelError> {
+    if key.is_empty() {
+        return Err(LabelError::KeyEmpty);
+    }
+    if key.len() > MAX_LABEL_BYTES {
+        return Err(LabelError::KeyTooLong {
+            key: key.into(),
+            bytes: key.len(),
+        });
+    }
+    if key.contains('=') {
+        return Err(LabelError::KeyContainsEquals { key: key.into() });
+    }
+    if key.chars().any(char::is_control) {
+        return Err(LabelError::ControlCharacter { key: key.into() });
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod wire_contract_tests {
+    use super::*;
+    #[test]
+    fn write_keys_are_namespaced_and_reserved_prefix_is_blocked() {
+        let mut map = BTreeMap::new();
+        map.insert("team/owner".into(), "alice".into());
+        assert!(Labels::new(map).is_ok());
+        for key in [
+            "infact.kind",
+            "/name",
+            "team/",
+            "Team/name",
+            "a/b/c",
+            "awman/internal",
+        ] {
+            let mut map = BTreeMap::new();
+            map.insert(key.into(), "value".into());
+            assert!(Labels::new(map).is_err(), "{key}");
+        }
+    }
+    #[test]
+    fn stored_dotted_labels_remain_readable_and_queryable() {
+        let labels = Labels::from_stored(BTreeMap::from([("infact.kind".into(), "yes".into())]));
+        assert_eq!(labels.get("infact.kind"), Some("yes"));
+        assert!(
+            matches!(LabelSelector::parse_query("infact.kind=yes").unwrap(),LabelSelector::Equals{key,..} if key=="infact.kind")
+        );
+        assert!(serde_json::from_str::<Labels>(r#"{"infact.kind":"yes"}"#).is_err());
     }
 }
 
@@ -135,7 +222,7 @@ mod tests {
 
     #[test]
     fn validates_and_round_trips_labels() {
-        let labels = Labels::new(BTreeMap::from([("env".into(), "prod".into())])).unwrap();
+        let labels = Labels::new(BTreeMap::from([("team/env".into(), "prod".into())])).unwrap();
         assert_eq!(
             serde_json::from_str::<Labels>(&serde_json::to_string(&labels).unwrap()).unwrap(),
             labels
@@ -148,15 +235,17 @@ mod tests {
     #[test]
     fn parses_exact_and_presence_selectors() {
         assert_eq!(
-            LabelSelector::parse("env=prod").unwrap(),
+            LabelSelector::parse("team/env=prod").unwrap(),
             LabelSelector::Equals {
-                key: "env".into(),
+                key: "team/env".into(),
                 value: "prod".into()
             }
         );
         assert_eq!(
-            LabelSelector::parse("env").unwrap(),
-            LabelSelector::Exists { key: "env".into() }
+            LabelSelector::parse("team/env").unwrap(),
+            LabelSelector::Exists {
+                key: "team/env".into()
+            }
         );
         assert!(LabelSelector::parse("=prod").is_err());
     }
@@ -164,32 +253,30 @@ mod tests {
     #[test]
     fn enforces_pair_count_and_utf8_byte_boundaries() {
         let sixteen = (0..16)
-            .map(|index| (format!("k{index}"), String::new()))
+            .map(|index| (format!("team/k{index}"), String::new()))
             .collect();
         assert_eq!(Labels::new(sixteen).unwrap().len(), 16);
 
         let seventeen = (0..17)
-            .map(|index| (format!("k{index}"), String::new()))
+            .map(|index| (format!("team/k{index}"), String::new()))
             .collect();
         assert!(matches!(
             Labels::new(seventeen),
             Err(LabelError::TooMany { count: 17 })
         ));
 
-        // 64 four-byte scalars are exactly 256 UTF-8 bytes. The next scalar
-        // crosses the limit even though it is only one more character.
-        let boundary = "🦀".repeat(64);
+        let boundary = format!("a/{}", "a".repeat(254));
         assert_eq!(boundary.len(), MAX_LABEL_BYTES);
         assert!(Labels::new(BTreeMap::from([(boundary.clone(), boundary.clone())])).is_ok());
 
-        let too_long = format!("{boundary}🦀");
-        assert_eq!(too_long.len(), MAX_LABEL_BYTES + 4);
+        let too_long = format!("a/{}", "a".repeat(255));
+        assert_eq!(too_long.len(), MAX_LABEL_BYTES + 1);
         assert!(matches!(
             Labels::new(BTreeMap::from([(too_long.clone(), String::new())])),
-            Err(LabelError::KeyTooLong { bytes: 260, .. })
+            Err(LabelError::KeyTooLong { bytes: 257, .. })
         ));
         assert!(matches!(
-            Labels::new(BTreeMap::from([("key".into(), too_long)])),
+            Labels::new(BTreeMap::from([("team/key".into(), "🦀".repeat(65))])),
             Err(LabelError::ValueTooLong { bytes: 260, .. })
         ));
     }

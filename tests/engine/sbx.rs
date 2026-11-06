@@ -19,7 +19,7 @@
 //! Requires `sbx` on PATH and an authenticated Docker Sandboxes session
 //! (`sbx login`).
 
-use awman::data::config::global::GlobalConfig;
+use awman::data::config::{ConfigFile, FileKind};
 use awman::data::message::{MessageLevel, UserMessage, UserMessageSink};
 use awman::engine::agent_runtime::AgentRuntimeEngine;
 use awman::engine::error::EngineError;
@@ -169,12 +169,12 @@ fn awman_ready_sbx_runtime_succeeds() {
     }
 
     let tmp_config = tempfile::tempdir().unwrap();
-    let config_content = r#"{"runtime":"docker-sbx-experimental","default_agent":"claude"}"#;
+    let config_content = r#"{"runtime":{"kind":"sbx"},"agents":{"default":"claude"}}"#;
     std::fs::write(tmp_config.path().join("config.json"), config_content).unwrap();
 
     let status = std::process::Command::new(env!("CARGO_BIN_EXE_awman"))
         .args(["ready"])
-        .env("AWMAN_CONFIG_HOME", tmp_config.path())
+        .env("AWMAN_HOME", tmp_config.path())
         .status()
         .expect("awman binary must be executable");
     assert!(
@@ -217,10 +217,11 @@ fn sandbox_name_encodes_both_hash_and_agent() {
 fn detect_sbx_unsupported_platform() {
     use awman::engine::agent_runtime;
 
-    let cfg = GlobalConfig {
-        runtime: Some("docker-sbx-experimental".into()),
-        ..Default::default()
-    };
+    let cfg = ConfigFile::from_value(
+        serde_json::json!({"runtime": {"kind": "sbx"}}),
+        FileKind::Global,
+    )
+    .unwrap();
     let result = agent_runtime::detect(&cfg);
 
     if cfg!(target_os = "linux") {
@@ -267,7 +268,7 @@ fn exec_prompt_non_interactive_sbx_does_not_return_not_implemented() {
         .status()
         .expect("git init must succeed");
 
-    let config_content = r#"{"runtime":"docker-sbx-experimental","default_agent":"claude"}"#;
+    let config_content = r#"{"runtime":{"kind":"sbx"},"agents":{"default":"claude"}}"#;
     std::fs::write(tmp_config.path().join("config.json"), config_content).unwrap();
 
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_awman"))
@@ -280,7 +281,7 @@ fn exec_prompt_non_interactive_sbx_does_not_return_not_implemented() {
             "hello from test",
         ])
         .current_dir(tmp_root.path())
-        .env("AWMAN_CONFIG_HOME", tmp_config.path())
+        .env("AWMAN_HOME", tmp_config.path())
         .output()
         .expect("awman binary must be executable");
 
@@ -340,7 +341,7 @@ fn workflow_two_step_sbx_does_not_error_with_not_implemented() {
         .status()
         .expect("git init must succeed");
 
-    let config_content = r#"{"runtime":"docker-sbx-experimental","default_agent":"claude"}"#;
+    let config_content = r#"{"runtime":{"kind":"sbx"},"agents":{"default":"claude"}}"#;
     std::fs::write(tmp_config.path().join("config.json"), config_content).unwrap();
 
     // Minimal two-step workflow: both steps use the same agent (claude) so
@@ -360,7 +361,7 @@ fn workflow_two_step_sbx_does_not_error_with_not_implemented() {
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_awman"))
         .args(["exec", "workflow", workflow_path.to_str().unwrap()])
         .current_dir(tmp_root.path())
-        .env("AWMAN_CONFIG_HOME", tmp_config.path())
+        .env("AWMAN_HOME", tmp_config.path())
         .output()
         .expect("awman binary must be executable");
 
@@ -443,7 +444,8 @@ fn runtime_switching_docker_sbx_docker_real_launch_paths() {
         .expect("git init must succeed");
 
     let run_with_runtime = |runtime: &str| -> String {
-        let config = format!(r#"{{"runtime":"{runtime}","default_agent":"claude"}}"#);
+        let config =
+            format!(r#"{{"runtime":{{"kind":"{runtime}"}},"agents":{{"default":"claude"}}}}"#);
         std::fs::write(tmp_config.path().join("config.json"), config).unwrap();
         let output = std::process::Command::new(env!("CARGO_BIN_EXE_awman"))
             .args([
@@ -455,7 +457,7 @@ fn runtime_switching_docker_sbx_docker_real_launch_paths() {
                 "ping",
             ])
             .current_dir(tmp_root.path())
-            .env("AWMAN_CONFIG_HOME", tmp_config.path())
+            .env("AWMAN_HOME", tmp_config.path())
             .output()
             .expect("awman binary must be executable");
         format!(
@@ -477,7 +479,7 @@ fn runtime_switching_docker_sbx_docker_real_launch_paths() {
     );
 
     // 2. sbx: must skip image setup and take the kit path.
-    let sbx_run = run_with_runtime("docker-sbx-experimental");
+    let sbx_run = run_with_runtime("sbx");
     assert!(
         sbx_run.contains("using the agent kit"),
         "sbx run must take the kit path (image setup skipped); output: {sbx_run}"

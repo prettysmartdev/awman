@@ -28,12 +28,17 @@ const BUILDS_SUBDIR: &str = "builds";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SquadPaths {
     root: PathBuf,
+    data_root: PathBuf,
 }
 
 impl SquadPaths {
     /// Build `SquadPaths` rooted at an explicit directory.
     pub fn from_root(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        let root = root.into();
+        Self {
+            data_root: root.clone(),
+            root,
+        }
     }
 
     /// Resolve from the current process environment.
@@ -43,20 +48,14 @@ impl SquadPaths {
 
     /// Resolve from a supplied env snapshot.
     ///
-    /// Precedence: `AWMAN_SQUAD_ROOT` → `AWMAN_CONFIG_HOME/squad` →
-    /// `XDG_DATA_HOME/awman/squad` → `$HOME/.awman/squad`.
+    /// `<data home>/squad` (see [`crate::data::fs::data_paths`]).
     pub fn from_env(env: &EnvSnapshot) -> Result<Self, DataError> {
-        if let Some(root) = env.squad_root() {
-            return Ok(Self::from_root(root));
-        }
-        if let Some(home) = env.config_home() {
-            return Ok(Self::from_root(home.join(SQUAD_SUBDIR)));
-        }
-        if let Some(xdg) = env.xdg_data_home() {
-            return Ok(Self::from_root(xdg.join("awman").join(SQUAD_SUBDIR)));
-        }
-        let home = dirs::home_dir().ok_or(DataError::HomeNotFound)?;
-        Ok(Self::from_root(home.join(".awman").join(SQUAD_SUBDIR)))
+        Ok(Self {
+            root: crate::data::fs::data_paths::data_home(env)?.join(SQUAD_SUBDIR),
+            data_root: crate::data::fs::data_paths::DataPaths::from_env(env)?
+                .root()
+                .to_path_buf(),
+        })
     }
 
     /// The squad root directory.
@@ -64,9 +63,9 @@ impl SquadPaths {
         &self.root
     }
 
-    /// Daemon-identity paths for the squad daemon (key stem `squad_key`).
+    /// The unified daemon owns the process identity for these paths.
     pub fn daemon(&self) -> DaemonPaths {
-        DaemonPaths::new(self.root.clone(), "squad_key")
+        crate::data::fs::data_paths::DataPaths::at_root(&self.data_root).daemon()
     }
 
     /// Directory holding per-task context directories.
@@ -108,7 +107,7 @@ impl SquadPaths {
             &base,
             "task directory must reside under the squad tasks root",
         )?;
-        Ok(base.join(crate::data::config::global::GLOBAL_CONFIG_FILENAME))
+        Ok(base.join(crate::data::config::file::CONFIG_FILENAME))
     }
 
     /// Directory holding per-task container image build logs.
@@ -362,21 +361,12 @@ impl SharedSquadRunLog {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::config::env::{AWMAN_CONFIG_HOME, AWMAN_SQUAD_ROOT, XDG_DATA_HOME};
+    use crate::data::config::env::XDG_DATA_HOME;
+    use crate::data::fs::data_paths::AWMAN_HOME;
 
     #[test]
-    fn squad_root_override_wins() {
-        let env = EnvSnapshot::with_overrides([
-            (AWMAN_SQUAD_ROOT, "/custom/squad"),
-            (XDG_DATA_HOME, "/xdg/data"),
-        ]);
-        let paths = SquadPaths::from_env(&env).unwrap();
-        assert_eq!(paths.root(), Path::new("/custom/squad"));
-    }
-
-    #[test]
-    fn config_home_produces_squad_subdir() {
-        let env = EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, "/cfg")]);
+    fn awman_home_produces_squad_subdir() {
+        let env = EnvSnapshot::with_overrides([(AWMAN_HOME, "/cfg"), (XDG_DATA_HOME, "/xdg")]);
         let paths = SquadPaths::from_env(&env).unwrap();
         assert_eq!(paths.root(), Path::new("/cfg/squad"));
     }
@@ -389,12 +379,15 @@ mod tests {
     }
 
     #[test]
-    fn daemon_uses_squad_key_stem() {
+    fn explicit_root_keeps_the_daemon_identity_local_to_the_fixture() {
         let paths = SquadPaths::from_root("/r");
-        assert_eq!(paths.daemon().key_stem(), "squad_key");
+        assert_eq!(
+            paths.daemon().api_keys_file(),
+            paths.daemon().root().join("api_keys.json")
+        );
         assert_eq!(
             paths.daemon().key_hash_file(),
-            PathBuf::from("/r/squad_key.hash")
+            PathBuf::from("/r/daemon/api_key.hash")
         );
     }
 

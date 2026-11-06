@@ -534,7 +534,7 @@ mod tests {
         let now = Utc::now();
         Task {
             prerequisites: None,
-            id: "t".into(),
+            id: crate::frontend::test_ids::task_id("t"),
             name: "t".into(),
             description: "d".into(),
             repo_scope: std::path::PathBuf::from("/workspace"),

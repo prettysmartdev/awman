@@ -2,9 +2,10 @@
 
 use std::path::{Path, PathBuf};
 
-use awman::data::config::env::{EnvSnapshot, AWMAN_CONFIG_HOME, XDG_DATA_HOME};
-use awman::data::config::global::GlobalConfig;
+use awman::data::config::env::{EnvSnapshot, XDG_DATA_HOME};
 use awman::data::fs::api_db::SqliteSessionStore;
+use awman::data::fs::data_paths::data_home;
+use awman::data::fs::data_paths::AWMAN_HOME;
 use awman::data::fs::data_paths::{DataPaths, MigrationOutcome, DB_FILENAME};
 
 fn roots(tmp: &tempfile::TempDir) -> (PathBuf, PathBuf, DataPaths) {
@@ -24,10 +25,7 @@ fn data_paths_db_path_matches_global_data_home_precedence() {
     let xdg_data_home = tempfile::tempdir().unwrap();
     let cases = [
         EnvSnapshot::with_overrides([
-            (
-                AWMAN_CONFIG_HOME,
-                config_home.path().to_string_lossy().to_string(),
-            ),
+            (AWMAN_HOME, config_home.path().to_string_lossy().to_string()),
             (
                 XDG_DATA_HOME,
                 xdg_data_home.path().to_string_lossy().to_string(),
@@ -41,10 +39,7 @@ fn data_paths_db_path_matches_global_data_home_precedence() {
     ];
 
     for env in cases {
-        let expected = GlobalConfig::data_home_with(&env)
-            .unwrap()
-            .join("data")
-            .join(DB_FILENAME);
+        let expected = data_home(&env).unwrap().join("data").join(DB_FILENAME);
         assert_eq!(DataPaths::from_env(&env).unwrap().db_path(), expected);
     }
 }
@@ -123,29 +118,41 @@ fn migrate_legacy_db_preserves_session_and_command_rows_byte_for_byte() {
     let (legacy, _, data) = roots(&tmp);
     let legacy_store = SqliteSessionStore::open(&legacy).unwrap();
     legacy_store
-        .insert_session("legacy-session", "/legacy/repo", "2026-08-27T00:00:00Z")
+        .insert_session(
+            "ses_11111111111141118111111111111111",
+            "/legacy/repo",
+            "2026-08-27T00:00:00Z",
+        )
         .unwrap();
     legacy_store
         .insert_command(
-            "legacy-command",
-            "legacy-session",
+            "cmd_22222222222242228222222222222222",
+            "ses_11111111111141118111111111111111",
             "status",
             "[\"--json\"]",
             "/legacy/output.log",
         )
         .unwrap();
-    let expected_session = legacy_store.get_session("legacy-session").unwrap();
-    let expected_command = legacy_store.get_command("legacy-command").unwrap();
+    let expected_session = legacy_store
+        .get_session("ses_11111111111141118111111111111111")
+        .unwrap();
+    let expected_command = legacy_store
+        .get_command("cmd_22222222222242228222222222222222")
+        .unwrap();
     drop(legacy_store);
 
     data.migrate_legacy_db(&legacy).unwrap();
     let migrated = SqliteSessionStore::open_at(&data.db_path()).unwrap();
     assert_eq!(
-        migrated.get_session("legacy-session").unwrap(),
+        migrated
+            .get_session("ses_11111111111141118111111111111111")
+            .unwrap(),
         expected_session
     );
     assert_eq!(
-        migrated.get_command("legacy-command").unwrap(),
+        migrated
+            .get_command("cmd_22222222222242228222222222222222")
+            .unwrap(),
         expected_command
     );
 }

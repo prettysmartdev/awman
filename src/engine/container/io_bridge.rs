@@ -723,12 +723,12 @@ mod tests {
 
     // ── stdin EOF ─────────────────────────────────────────────────────────────
 
-    /// When all stdin senders are dropped (non-interactive path), the writer
+    /// When all stdin senders are dropped (headless path), the writer
     /// task draining stdin_rx terminates cleanly without errors.
     #[tokio::test]
     async fn stdin_eof_non_interactive_terminates_writer_task_cleanly() {
         let (stdin_tx, stdin_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        // Drop the sole sender immediately — simulates non-interactive frontend.
+        // Drop the sole sender immediately — simulates headless frontend.
         drop(stdin_tx);
 
         let mut stdin_rx = stdin_rx;
@@ -756,7 +756,7 @@ mod tests {
     /// Spawn a real subprocess with piped stdio, wire it through
     /// `bridge_piped`, and verify that stdout bytes from the child arrive at
     /// the frontend's stdout sink. This exercises the same code path both
-    /// the Docker and Apple backends use for non-interactive runs, without
+    /// the Docker and Apple backends use for headless runs, without
     /// requiring an actual container runtime.
     #[cfg(unix)]
     #[tokio::test]
@@ -797,7 +797,7 @@ mod tests {
                 output_broadcast: None,
             },
         );
-        // Non-interactive flow: drop the engine's stdin handle so the writer
+        // Headless flow: drop the engine's stdin handle so the writer
         // task exits and child stdin closes (mirrors `spawn_piped_docker`).
         drop(bridge.stdin_injector);
 

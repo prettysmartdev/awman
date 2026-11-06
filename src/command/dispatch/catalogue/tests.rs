@@ -136,11 +136,11 @@ fn string_alias_wf_resolves_to_workflow() {
 }
 
 #[test]
-fn ready_json_implies_non_interactive() {
+fn ready_json_implies_headless() {
     let cat = CommandCatalogue::get();
     let ready = cat.lookup(&["ready"]).unwrap();
     let json_flag = ready.find_flag("json").unwrap();
-    assert!(json_flag.implies.contains(&"non-interactive"));
+    assert!(json_flag.implies.contains(&"headless"));
 }
 
 #[test]
@@ -173,7 +173,8 @@ fn plan_and_yolo_are_mutually_exclusive_on_chat() {
 fn every_top_level_command_is_present() {
     let cat = CommandCatalogue::get();
     for name in [
-        "init", "ready", "chat", "specs", "agents", "config", "exec", "api", "remote", "new",
+        "init", "ready", "chat", "specs", "agents", "config", "exec", "daemon", "squad", "remote",
+        "new",
     ] {
         assert!(cat.lookup(&[name]).is_some(), "missing top-level '{name}'");
     }
@@ -306,7 +307,7 @@ const FLAG_TABLE: &[FlagCheck] = &[
     },
     FlagCheck {
         path: &["ready"],
-        flag: "non-interactive",
+        flag: "headless",
         is_bool: true,
         is_optional: true,
     },
@@ -324,7 +325,7 @@ const FLAG_TABLE: &[FlagCheck] = &[
     },
     FlagCheck {
         path: &["chat"],
-        flag: "non-interactive",
+        flag: "headless",
         is_bool: true,
         is_optional: true,
     },
@@ -425,62 +426,56 @@ const FLAG_TABLE: &[FlagCheck] = &[
         is_optional: true,
     },
     FlagCheck {
-        path: &["config", "migrate"],
-        flag: "yes",
+        path: &["config", "set"],
+        flag: "repo",
         is_bool: true,
         is_optional: true,
     },
     FlagCheck {
-        path: &["config", "migrate"],
-        flag: "dry-run",
-        is_bool: true,
-        is_optional: true,
-    },
-    FlagCheck {
-        path: &["config", "migrate"],
-        flag: "global",
-        is_bool: true,
-        is_optional: true,
-    },
-    FlagCheck {
-        path: &["config", "migrate"],
-        flag: "non-interactive",
-        is_bool: true,
-        is_optional: true,
-    },
-    FlagCheck {
-        path: &["api", "start"],
-        flag: "port",
+        path: &["config", "unset"],
+        flag: "task",
         is_bool: false,
         is_optional: true,
     },
     FlagCheck {
-        path: &["api", "start"],
-        flag: "workdirs",
-        is_bool: false,
-        is_optional: true,
-    },
-    FlagCheck {
-        path: &["api", "start"],
+        path: &["daemon", "start"],
         flag: "background",
         is_bool: true,
         is_optional: true,
     },
     FlagCheck {
-        path: &["api", "start"],
-        flag: "refresh-key",
+        path: &["daemon", "stop"],
+        flag: "now",
         is_bool: true,
         is_optional: true,
     },
     FlagCheck {
-        path: &["api", "start"],
-        flag: "dangerously-skip-auth",
+        path: &["daemon", "status"],
+        flag: "json",
         is_bool: true,
         is_optional: true,
     },
     FlagCheck {
-        path: &["api", "start"],
-        flag: "dangerously-skip-tls",
+        path: &["daemon", "logs"],
+        flag: "follow",
+        is_bool: true,
+        is_optional: true,
+    },
+    FlagCheck {
+        path: &["daemon", "api"],
+        flag: "raw",
+        is_bool: false,
+        is_optional: true,
+    },
+    FlagCheck {
+        path: &["daemon", "api"],
+        flag: "data",
+        is_bool: false,
+        is_optional: true,
+    },
+    FlagCheck {
+        path: &["daemon", "api"],
+        flag: "list",
         is_bool: true,
         is_optional: true,
     },
@@ -488,30 +483,6 @@ const FLAG_TABLE: &[FlagCheck] = &[
         path: &["remote", "exec", "workflow"],
         flag: "follow",
         is_bool: true,
-        is_optional: true,
-    },
-    FlagCheck {
-        path: &["remote", "exec", "workflow"],
-        flag: "api-key",
-        is_bool: false,
-        is_optional: true,
-    },
-    FlagCheck {
-        path: &["remote", "exec", "workflow"],
-        flag: "remote-addr",
-        is_bool: false,
-        is_optional: true,
-    },
-    FlagCheck {
-        path: &["remote", "session", "start"],
-        flag: "api-key",
-        is_bool: false,
-        is_optional: true,
-    },
-    FlagCheck {
-        path: &["remote", "session", "kill"],
-        flag: "remote-addr",
-        is_bool: false,
         is_optional: true,
     },
     FlagCheck {
@@ -552,7 +523,7 @@ const FLAG_TABLE: &[FlagCheck] = &[
     },
     FlagCheck {
         path: &["specs", "amend"],
-        flag: "non-interactive",
+        flag: "headless",
         is_bool: true,
         is_optional: true,
     },
@@ -597,13 +568,14 @@ fn all_expected_subcommands_are_present() {
         (&["config"], "show"),
         (&["config"], "get"),
         (&["config"], "set"),
-        (&["config"], "migrate"),
+        (&["config"], "unset"),
         (&["exec"], "prompt"),
         (&["exec"], "workflow"),
-        (&["api"], "start"),
-        (&["api"], "kill"),
-        (&["api"], "logs"),
-        (&["api"], "status"),
+        (&["daemon"], "start"),
+        (&["daemon"], "stop"),
+        (&["daemon"], "status"),
+        (&["daemon"], "logs"),
+        (&["daemon"], "api"),
         (&["remote"], "exec"),
         (&["remote"], "session"),
         (&["remote", "exec"], "workflow"),
@@ -636,7 +608,7 @@ fn config_commands_do_not_require_runtime() {
         &["config", "show"],
         &["config", "get"],
         &["config", "set"],
-        &["config", "migrate"],
+        &["config", "unset"],
     ] {
         assert!(
             !cat.requires_runtime(path),
@@ -668,7 +640,7 @@ fn config_commands_do_not_require_runtime() {
 /// command that declares `requires_runtime: false` without meaning to fails
 /// here.
 #[test]
-fn only_the_config_subtree_declares_requires_runtime_false() {
+fn config_and_transport_clients_can_run_without_a_local_runtime() {
     fn walk(spec: &'static CommandSpec, path: Vec<&'static str>, out: &mut Vec<String>) {
         if !spec.requires_runtime {
             out.push(path.join(" "));
@@ -692,14 +664,24 @@ fn only_the_config_subtree_declares_requires_runtime_false() {
         vec![
             "config",
             "config get",
-            "config migrate",
-            "config prerequisite-grants",
-            "config prerequisite-grants list",
-            "config prerequisite-grants revoke",
             "config set",
             "config show",
+            "config unset",
+            "daemon",
+            "daemon api",
+            "daemon logs",
+            "daemon start",
+            "daemon status",
+            "daemon stop",
             // Writes a definition file and never builds.
             "new agent",
+            "remote",
+            "remote exec",
+            "remote exec prompt",
+            "remote exec workflow",
+            "remote session",
+            "remote session kill",
+            "remote session start",
         ],
     );
 }
@@ -740,22 +722,62 @@ fn flag_spec_conflicts_with_accessor_is_symmetric_on_chat() {
     assert!(plan.conflicts_with("yolo"), "plan must conflict with yolo");
     assert!(yolo.conflicts_with("plan"), "yolo must conflict with plan");
     assert!(
-        !plan.conflicts_with("non-interactive"),
-        "plan must NOT conflict with non-interactive"
+        !plan.conflicts_with("headless"),
+        "plan must NOT conflict with headless"
     );
 }
 
+/// WI 0140: `awman daemon` has exactly five verbs; the `api` group and the
+/// squad lifecycle verbs are gone.
 #[test]
-fn api_start_flags_are_cli_only() {
+fn daemon_has_exactly_five_verbs_and_the_old_lifecycles_are_gone() {
     let cat = CommandCatalogue::get();
-    let start = cat.lookup(&["api", "start"]).unwrap();
-    for flag in start.flags {
+    let daemon = cat.lookup(&["daemon"]).unwrap();
+    let verbs: Vec<_> = daemon.subcommands.iter().map(|spec| spec.name).collect();
+    assert_eq!(verbs, ["start", "stop", "status", "logs", "api"]);
+    for verb in &verbs {
+        let spec = cat.lookup(&["daemon", verb]).unwrap();
+        assert!(!spec.api_allowed, "daemon {verb} is local-only");
+        assert_eq!(spec.gateway_need, GatewayNeed::None, "daemon {verb}");
         assert!(
-            matches!(flag.frontends, FrontendVisibility::CliOnly),
-            "api start flag '{}' must be CliOnly, got {:?}",
-            flag.long,
-            flag.frontends
+            !spec.requires_runtime,
+            "daemon {verb} needs no container runtime"
         );
+    }
+    assert!(cat.lookup(&["api"]).is_none(), "the api group is deleted");
+    for gone in ["start", "stop", "status", "logs"] {
+        assert!(
+            cat.lookup(&["squad", gone]).is_none(),
+            "squad {gone} moved to awman daemon"
+        );
+    }
+    let clap = cat.build_clap_command();
+    for argv in [
+        &["awman", "api", "start"][..],
+        &["awman", "squad", "start"],
+        &["awman", "daemon", "set"],
+        &["awman", "config", "prerequisite-grants", "list"],
+    ] {
+        assert!(
+            clap.clone().try_get_matches_from(argv).is_err(),
+            "{argv:?} must not parse"
+        );
+    }
+    for argv in [
+        &["awman", "daemon", "start", "--background"][..],
+        &["awman", "daemon", "stop", "--now"],
+        &["awman", "daemon", "status", "--json"],
+        &["awman", "daemon", "logs", "-f"],
+        &["awman", "daemon", "api", "--list"],
+        &["awman", "daemon", "api", "keys.create", "name=ci"],
+        &["awman", "daemon", "api", "--raw", "GET", "/v1/status"],
+        &[
+            "awman", "daemon", "api", "--raw", "POST", "/v1/keys", "--data", "-",
+        ],
+    ] {
+        clap.clone()
+            .try_get_matches_from(argv)
+            .unwrap_or_else(|e| panic!("{argv:?}: {e}"));
     }
 }
 
@@ -769,17 +791,17 @@ fn exec_workflow_arguments_include_workflow_path() {
 }
 
 #[test]
-fn config_get_and_set_have_required_field_argument() {
+fn config_get_and_set_have_required_key_argument() {
     let cat = CommandCatalogue::get();
     let get = cat.lookup(&["config", "get"]).unwrap();
     assert_eq!(get.arguments.len(), 1);
-    assert_eq!(get.arguments[0].name, "field");
+    assert_eq!(get.arguments[0].name, "key");
     assert!(!get.arguments[0].optional);
 
     let set = cat.lookup(&["config", "set"]).unwrap();
     assert_eq!(set.arguments.len(), 2);
     let names: Vec<&str> = set.arguments.iter().map(|a| a.name).collect();
-    assert!(names.contains(&"field") && names.contains(&"value"));
+    assert!(names.contains(&"key") && names.contains(&"value"));
 }
 
 // ── WI-0098 Finding B: removed-flag migration hints ───────────────────────
@@ -817,9 +839,7 @@ fn removed_flag_hint_none_for_live_flags() {
     assert!(cat
         .removed_flag_hint(["chat", "--overlay", "ssh()"])
         .is_none());
-    assert!(cat
-        .removed_flag_hint(["chat", "--non-interactive"])
-        .is_none());
+    assert!(cat.removed_flag_hint(["chat", "--headless"]).is_none());
     // A flag that merely contains the removed name as a substring must not match.
     assert!(cat
         .removed_flag_hint(["chat", "--mount-ssh-extra"])
@@ -827,32 +847,7 @@ fn removed_flag_hint_none_for_live_flags() {
     assert!(cat.removed_flag_hint(Vec::<String>::new()).is_none());
 }
 
-#[test]
-fn launch_mode_rejects_unknown_enum_value() {
-    let cat = CommandCatalogue::get();
-    let err = cat
-        .parse_raw_args(
-            &["exec", "prompt"],
-            &["--launch-mode".to_string(), "bogus".to_string()],
-        )
-        .expect_err("an unrecognized launch mode must be rejected");
-
-    match err {
-        crate::command::error::CommandError::InvalidFlagValue {
-            command,
-            flag,
-            reason,
-        } => {
-            assert_eq!(command, vec!["exec".to_string(), "prompt".to_string()]);
-            assert_eq!(flag, "launch-mode");
-            assert_eq!(reason, "'bogus' is not one of [\"stdio\", \"acp\"]");
-        }
-        other => panic!("expected InvalidFlagValue, got {other:?}"),
-    }
-}
-
-/// Every squad subcommand that talks to the daemon declares the need, and
-/// the three lifecycle commands declare none.
+/// Every squad subcommand talks to the daemon, so every one declares the need.
 ///
 /// This is the guard on the root cause of F-04: two frontends each carried
 /// a hand-written list of these names, and the lists had already drifted
@@ -862,7 +857,7 @@ fn launch_mode_rejects_unknown_enum_value() {
 /// running gateway through Dispatch (WI 0113 Step 10).
 #[test]
 fn every_squad_subcommand_declares_whether_it_needs_a_gateway() {
-    const NO_GATEWAY: &[&str] = &["start", "stop", "logs"];
+    const NO_GATEWAY: &[&str] = &[];
     let squad = CommandCatalogue::get()
         .lookup(&["squad"])
         .expect("squad must exist");
@@ -889,16 +884,11 @@ fn every_squad_subcommand_declares_whether_it_needs_a_gateway() {
     }
 }
 
-/// `squad status` reports on a daemon rather than requiring one, so it must
-/// never start one: with nothing running it still succeeds with a "not
-/// running" summary.
+/// Bare `squad --headless` reports on the daemon rather than requiring one:
+/// with nothing running it still succeeds with a "not running" summary.
 #[test]
-fn squad_status_asks_for_a_gateway_only_if_one_is_already_running() {
+fn bare_squad_asks_for_a_gateway_only_if_one_is_already_running() {
     let catalogue = CommandCatalogue::get();
-    let status = catalogue
-        .lookup(&["squad", "status"])
-        .expect("squad status must exist");
-    assert_eq!(status.gateway_need, GatewayNeed::IfRunning);
     let bare = catalogue.lookup(&["squad"]).expect("squad must exist");
     assert_eq!(bare.gateway_need, GatewayNeed::IfRunning);
 }
@@ -940,23 +930,6 @@ fn the_container_tier_requirement_is_the_squad_subtree_and_nothing_else() {
             Some(&"squad"),
             "only squad requires a container tier; found {path:?}"
         );
-    }
-}
-
-#[test]
-fn launch_mode_is_registered_on_each_local_agent_command() {
-    let cat = CommandCatalogue::get();
-    let paths: &[&[&str]] = &[&["chat"], &["exec", "prompt"], &["exec", "workflow"]];
-    for path in paths {
-        let command = cat.lookup(path).expect("agent command must exist");
-        let flag = command
-            .find_flag("launch-mode")
-            .expect("agent command must expose --launch-mode");
-        assert!(flag.optional);
-        match flag.kind {
-            FlagKind::Enum(values) => assert_eq!(values, &["stdio", "acp"]),
-            other => panic!("expected enum flag, got {other:?}"),
-        }
     }
 }
 
@@ -1038,10 +1011,9 @@ fn exec_workflow_flags_keep_their_documented_order() {
         names,
         vec![
             "work-item",
-            "non-interactive",
+            "headless",
             "plan",
             "allow-docker",
-            "launch-mode",
             "worktree",
             "yolo",
             "auto",
@@ -1052,7 +1024,6 @@ fn exec_workflow_flags_keep_their_documented_order() {
             "issue",
             "dynamic",
             "leader",
-            "max-concurrent",
             "on-dirty-merge-target",
             "on-merge-failure",
             "on-existing-worktree",
@@ -1078,7 +1049,7 @@ fn existing_worktree_policy_flag_is_api_allowed_and_has_all_choices() {
     assert!(
         matches!(flag.kind, FlagKind::Enum(values) if values == ["ask", "resume", "recreate", "fail"])
     );
-    assert!(cat.is_allowed_for_frontend(FrontendKind::Api, &["exec", "workflow"]));
+    assert!(cat.is_allowed_for_frontend(FrontendKind::WORKER_LOCAL, &["exec", "workflow"]));
 }
 
 #[test]
@@ -1251,7 +1222,7 @@ fn session_worktree_selectors_are_refused_for_every_remote_profile() {
                     .unwrap_or_else(|e| panic!("{path:?} {selector} on {local:?}: {e}"));
                 assert_eq!(parsed.flag_string(&selector[2..]).as_deref(), Some("value"));
             }
-            for remote in [FrontendKind::Api, FrontendKind::SquadDaemon] {
+            for remote in [FrontendKind::WORKER_LOCAL, FrontendKind::SQUAD_LOCAL] {
                 let error = cat
                     .parse_raw_args_with_profile(path, &args, remote)
                     .expect_err(&format!(
@@ -1269,12 +1240,12 @@ fn worker_style_exec_prompt_request_with_selectors_is_refused() {
     let cat = CommandCatalogue::get();
     let request = argv(&["--pr", "42", "review", "this"]);
     assert!(cat
-        .parse_raw_args_with_profile(&["exec", "prompt"], &request, FrontendKind::Api)
+        .parse_raw_args_with_profile(&["exec", "prompt"], &request, FrontendKind::WORKER_LOCAL)
         .is_err());
     // The same prompt without the selector parses, so the refusal is the flag.
     let plain = argv(&["review", "this"]);
     let parsed = cat
-        .parse_raw_args_with_profile(&["exec", "prompt"], &plain, FrontendKind::Api)
+        .parse_raw_args_with_profile(&["exec", "prompt"], &plain, FrontendKind::WORKER_LOCAL)
         .unwrap();
     assert_eq!(parsed.argument("prompt").as_deref(), Some("review this"));
     assert_eq!(parsed.flag_string("pr"), None);
@@ -1416,4 +1387,104 @@ fn selectors_before_the_prompt_are_parsed_and_after_it_are_refused() {
     )
     .is_ok());
     assert!(refuse_selector_in_prompt(&["--yolo".to_string()], &["exec", "prompt"]).is_ok());
+}
+
+/// WI 0139: settings are config keys, set per invocation with `--set`. The
+/// per-setting flags are gone and are plain unknown flags (no removed-flag
+/// hint), on every frontend's parser.
+#[test]
+fn removed_per_setting_flags_are_unknown_flags() {
+    let cat = CommandCatalogue::get();
+    let cases: &[(&[&str], &str)] = &[
+        (&["chat"], "launch-mode"),
+        (&["exec", "prompt"], "launch-mode"),
+        (&["exec", "workflow"], "launch-mode"),
+        (&["exec", "workflow"], "max-concurrent"),
+        (&["remote", "exec", "workflow"], "max-concurrent"),
+        (&["chat"], "non-interactive"),
+        (&["exec", "prompt"], "non-interactive"),
+        (&["exec", "workflow"], "non-interactive"),
+        (&["ready"], "non-interactive"),
+        (&["daemon", "start"], "port"),
+        (&["daemon", "start"], "workdirs"),
+        (&["daemon", "start"], "refresh-key"),
+        (&["daemon", "start"], "dangerously-skip-auth"),
+    ];
+    for (path, flag) in cases {
+        let spec = cat.lookup(path).unwrap();
+        assert!(
+            spec.find_flag(flag).is_none(),
+            "{path:?} still declares --{flag}"
+        );
+        let err = cat
+            .parse_raw_args(path, &[format!("--{flag}"), "1".into()])
+            .expect_err("a removed flag must not parse");
+        assert!(
+            matches!(err, crate::command::error::CommandError::UnknownFlag { .. }),
+            "{path:?} --{flag}: {err:?}"
+        );
+        assert!(
+            cat.removed_flag_hint([format!("--{flag}")]).is_none(),
+            "--{flag} must fail as an unknown flag, not with a migration hint"
+        );
+    }
+}
+
+/// `--headless` (short `-n`) replaces `--non-interactive` on every command
+/// that had it.
+#[test]
+fn headless_replaces_non_interactive_with_the_same_short_flag() {
+    let cat = CommandCatalogue::get();
+    for path in [
+        &["chat"][..],
+        &["exec", "prompt"],
+        &["exec", "workflow"],
+        &["remote", "exec", "prompt"],
+        &["remote", "exec", "workflow"],
+        &["ready"],
+        &["specs", "amend"],
+        &["squad"],
+    ] {
+        let spec = cat.lookup(path).unwrap();
+        let flag = spec
+            .find_flag("headless")
+            .unwrap_or_else(|| panic!("{path:?} must declare --headless"));
+        assert_eq!(flag.short, Some('n'), "{path:?}");
+    }
+}
+
+/// `config migrate` and `config prerequisite-grants` are gone; `unset` is new.
+#[test]
+fn config_subcommands_are_show_get_set_unset() {
+    let cat = CommandCatalogue::get();
+    let config = cat.lookup(&["config"]).unwrap();
+    let names: Vec<&str> = config.subcommands.iter().map(|s| s.name).collect();
+    assert_eq!(names, vec!["show", "get", "set", "unset"]);
+    for leaf in ["set", "unset"] {
+        let spec = cat.lookup(&["config", leaf]).unwrap();
+        for flag in ["global", "repo", "task"] {
+            assert!(spec.find_flag(flag).is_some(), "config {leaf} --{flag}");
+        }
+    }
+}
+
+/// `--set` is the one global flag: declared once, visible to every frontend.
+#[test]
+fn set_is_a_global_repeatable_flag() {
+    let cat = CommandCatalogue::get();
+    let set = cat
+        .global_flags()
+        .iter()
+        .find(|f| f.long == "set")
+        .expect("--set must be global");
+    assert!(matches!(set.kind, FlagKind::VecString));
+    assert!(matches!(set.frontends, FrontendVisibility::All));
+    // A global flag parses on any command, in any position before `--`.
+    let parsed = cat
+        .parse_raw_args(
+            &["agents", "status"],
+            &["--set".into(), "a=1".into(), "--set=b=2".into()],
+        )
+        .unwrap();
+    assert_eq!(parsed.flag_strings("set"), vec!["a=1", "b=2"]);
 }

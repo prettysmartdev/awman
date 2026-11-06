@@ -36,8 +36,8 @@
 //!
 //! ## Socket path
 //!
-//! This rendezvous socket lives under `~/.awman/attach/` (or
-//! `$AWMAN_ATTACH_DIR`), named by a hash of the container name. The builtin
+//! This rendezvous socket lives under `<data home>/attach/` (`$AWMAN_HOME/attach`,
+//! else `$XDG_DATA_HOME/awman/attach`, else `~/.awman/attach`), named by a hash of the container name. The builtin
 //! runtime resolves its own attach sockets with `BuiltinPaths::attach`, inside
 //! its private state home (keyed by sandbox id and owner, subject to that
 //! home's socket-length budget and `AWMAN_BUILTIN_STATE_DIR`). The two stay
@@ -53,17 +53,17 @@ use crate::data::config::env::EnvSnapshot;
 use crate::data::session::AgentHandle;
 use crate::engine::error::EngineError;
 
-/// The directory attach sockets live in: `$AWMAN_ATTACH_DIR` when set (used
-/// by tests and relocated setups), else `~/.awman/attach/`. Both the serving
-/// process and the attaching process derive it the same way, which is what
-/// makes the socket discoverable across processes of the same user.
-///
-/// The variable is declared and parsed in Layer 0
-/// ([`EnvSnapshot::attach_dir`]); nothing above Layer 0 reads the environment
-/// directly (F-37).
+/// The directory attach sockets live in: `<data home>/attach/` (`$AWMAN_HOME`,
+/// else `$XDG_DATA_HOME/awman`, else `~/.awman`). Both the serving process and
+/// the attaching process derive it the same way, which is what makes the
+/// socket discoverable across processes of the same user. With none of those
+/// in the snapshot there is no ambient fallback.
 pub(crate) fn default_attach_socket_dir(env: &EnvSnapshot) -> Option<PathBuf> {
-    if let Some(dir) = env.attach_dir() {
-        return Some(dir);
+    if let Some(home) = crate::data::fs::data_paths::awman_home(env) {
+        return Some(home.join("attach"));
+    }
+    if let Some(xdg) = env.xdg_data_home() {
+        return Some(xdg.join("awman").join("attach"));
     }
     env.home_dir()
         .map(|home| home.join(".awman").join("attach"))
@@ -524,7 +524,7 @@ mod tests {
 
     #[test]
     fn socket_paths_are_deterministic_short_and_name_scoped() {
-        let env = EnvSnapshot::with_overrides([("AWMAN_ATTACH_DIR", "/tmp/awman-attach-test")]);
+        let env = EnvSnapshot::with_overrides([("AWMAN_HOME", "/tmp/awman-attach-test")]);
         let a = attach_socket_path(&env, "awman-squad-some-quite-long-task-name-0123abcd").unwrap();
         let b = attach_socket_path(&env, "awman-squad-some-quite-long-task-name-0123abcd").unwrap();
         let c = attach_socket_path(&env, "awman-squad-other-89abcdef").unwrap();
@@ -545,12 +545,15 @@ mod tests {
         );
         // No HOME in the snapshot: no ambient fallback.
         assert_eq!(default_attach_socket_dir(&EnvSnapshot::empty()), None);
-        // An explicit attach dir wins over HOME.
-        let both =
-            EnvSnapshot::with_overrides([("HOME", "/home/a"), ("AWMAN_ATTACH_DIR", "/run/x")]);
+        // AWMAN_HOME wins over HOME; the removed AWMAN_ATTACH_DIR is ignored.
+        let both = EnvSnapshot::with_overrides([
+            ("HOME", "/home/a"),
+            ("AWMAN_HOME", "/run/x"),
+            ("AWMAN_ATTACH_DIR", "/old"),
+        ]);
         assert_eq!(
             default_attach_socket_dir(&both),
-            Some(PathBuf::from("/run/x"))
+            Some(PathBuf::from("/run/x/attach"))
         );
     }
 

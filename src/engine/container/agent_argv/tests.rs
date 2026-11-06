@@ -118,6 +118,18 @@ fn seeded_prompt_is_argv_only_when_interactive() {
 }
 
 #[test]
+fn headless_prompt_argv_delivery_follows_cli_contract() {
+    let options = ResolvedContainerOptions {
+        interactive: false,
+        headless_prompt_in_argv: true,
+        agent_mode_flags: vec!["--approval-mode=yolo".into()],
+        seeded_prompt: Some("fix this".into()),
+        ..Default::default()
+    };
+    assert_eq!(tail(&options), vec!["--approval-mode=yolo", "fix this"]);
+}
+
+#[test]
 fn missing_tool_flag_fails_closed_with_a_typed_error() {
     for (restriction, options) in [
         (
@@ -283,5 +295,26 @@ fn appends_agent_flags_before_the_prompt_and_after_acp_entrypoint() {
             .unwrap()
             .append_to(vec!["cline".into(), "--acp".into()]),
         vec!["cline", "--acp", "--no-daemon"]
+    );
+}
+
+#[test]
+fn managed_storage_override_follows_user_flags() {
+    let options = ResolvedContainerOptions {
+        agent_flags: vec!["--config".into(), "sqlite_home=/shared".into()],
+        managed_agent_flags: vec!["--config".into(), "sqlite_home=/private".into()],
+        ..Default::default()
+    };
+    assert_eq!(
+        AgentArgv::from_options(&options)
+            .unwrap()
+            .append_to(vec!["codex".into()]),
+        vec![
+            "codex",
+            "--config",
+            "sqlite_home=/shared",
+            "--config",
+            "sqlite_home=/private"
+        ]
     );
 }

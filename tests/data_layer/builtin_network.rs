@@ -1,4 +1,4 @@
-//! `builtin.network` and builtin resource settings as they travel from the
+//! `runtime.builtin.network` and builtin resource settings as they travel from the
 //! global and repo config files to the effective policy (D-05). Hermetic: the
 //! files live in a temp directory and nothing is booted or dialled.
 
@@ -7,10 +7,33 @@ use std::path::Path;
 use awman::data::config::builtin_network::MAX_NETWORK_ENTRIES;
 use awman::data::config::effective::EffectiveConfig;
 use awman::data::config::env::EnvSnapshot;
-use awman::data::config::fields::field_spec;
+use awman::data::config::fields::{resolve, ValueKind};
+use awman::data::config::units::Size;
 use awman::data::config::{
-    BuiltinRuntimeConfig, FlagConfig, GlobalConfig, NetworkAllowEntry, NetworkMode, RepoConfig,
+    BuiltinRuntimeConfig, ConfigFile, FileKind, FlagConfig, NetworkAllowEntry, NetworkMode,
 };
+
+/// The fixtures below are written in the compact `{"builtin": …}` form; nest
+/// them under `runtime` (and `"runtime": "<kind>"` under `runtime.kind`).
+fn nest(json: &str) -> String {
+    let mut value: serde_json::Value = serde_json::from_str(json).unwrap();
+    let object = value.as_object_mut().unwrap();
+    let mut runtime = serde_json::Map::new();
+    if let Some(kind) = object.remove("runtime") {
+        runtime.insert("kind".into(), kind);
+    }
+    if let Some(builtin) = object.remove("builtin") {
+        runtime.insert("builtin".into(), builtin);
+    }
+    if !runtime.is_empty() {
+        object.insert("runtime".into(), runtime.into());
+    }
+    value.to_string()
+}
+
+fn load(path: &Path, kind: FileKind) -> Result<ConfigFile, awman::data::error::DataError> {
+    ConfigFile::load(path, kind)
+}
 
 fn write(dir: &Path, name: &str, json: &str) -> std::path::PathBuf {
     let path = dir.join(name);
@@ -20,18 +43,20 @@ fn write(dir: &Path, name: &str, json: &str) -> std::path::PathBuf {
 
 fn effective(global: &str, repo: &str) -> EffectiveConfig {
     let dir = tempfile::tempdir().unwrap();
-    let global = GlobalConfig::load_path(&write(dir.path(), "global.json", global)).unwrap();
-    let git_root = dir.path().join("repo");
-    std::fs::create_dir_all(git_root.join(".awman")).unwrap();
-    write(&git_root.join(".awman"), "config.json", repo);
-    let repo = RepoConfig::load(&git_root).unwrap();
-    EffectiveConfig::new(FlagConfig::default(), EnvSnapshot::default(), repo, global)
+    let global = load(
+        &write(dir.path(), "global.json", &nest(global)),
+        FileKind::Global,
+    )
+    .unwrap();
+    let repo = load(&write(dir.path(), "repo.json", &nest(repo)), FileKind::Repo).unwrap();
+    EffectiveConfig::from_files(global, repo, FlagConfig::default(), EnvSnapshot::default())
+        .unwrap()
 }
 
 #[test]
 fn network_config_merge_and_unknown_fields() {
     let eff = effective(
-        r#"{"runtime":"builtin-experimental","builtin":{"network":{"mode":"allowlist",
+        r#"{"runtime":"builtin","builtin":{"network":{"mode":"allowlist",
             "allow":["*.example.com","api.anthropic.com"],"hostPorts":[8765,9000],
             "nameservers":["1.1.1.1"],"trustHostCas":true}}}"#,
         r#"{"builtin":{"vcpus":4,"network":{"allow":["api.example.com"],"hostPorts":[8765]}}}"#,
@@ -53,20 +78,20 @@ fn network_config_merge_and_unknown_fields() {
     let bad = write(
         dir.path(),
         "g.json",
-        r#"{"builtin":{"network":{"mode":"public","proxy":"socks5://x"}}}"#,
+        &nest(r#"{"builtin":{"network":{"mode":"public","proxy":"socks5://x"}}}"#),
     );
-    assert!(GlobalConfig::load_path(&bad).is_err());
+    assert!(load(&bad, FileKind::Global).is_err());
     let bad_mode = write(
         dir.path(),
         "m.json",
-        r#"{"builtin":{"network":{"mode":"host"}}}"#,
+        &nest(r#"{"builtin":{"network":{"mode":"host"}}}"#),
     );
-    assert!(GlobalConfig::load_path(&bad_mode).is_err());
+    assert!(load(&bad_mode, FileKind::Global).is_err());
 }
 
 #[test]
 fn default_policy_is_public_without_host_access() {
-    let network = effective(r#"{"runtime":"builtin-experimental"}"#, "{}")
+    let network = effective(r#"{"runtime":"builtin"}"#, "{}")
         .builtin_network()
         .unwrap();
     assert_eq!(network.mode, NetworkMode::Public);
@@ -122,15 +147,18 @@ fn network_unsupported_policy_is_an_explicit_error() {
             "allowlist",
         ),
     ] {
-        let global = format!(r#"{{"builtin":{{"network":{block}}}}}"#);
-        let eff = effective(&global, "{}");
-        let error = eff.builtin_network().unwrap_err();
+        // A block that is invalid on its own fails when its file loads, so
+        // no launch can ever see it.
+        let dir = tempfile::tempdir().unwrap();
+        let global = nest(&format!(r#"{{"builtin":{{"network":{block}}}}}"#));
+        let error = load(&write(dir.path(), "g.json", &global), FileKind::Global)
+            .unwrap_err()
+            .to_string();
         assert!(error.contains(needle), "{block}: {error}");
-        // Every launch refuses it too: per-launch settings resolve the network
-        // through the same layered check (the merged `builtin` view carries
-        // no network of its own to validate).
-        assert!(eff.builtin_launch_settings().is_err(), "{block}");
-        assert_eq!(eff.builtin_runtime().network, None, "{block}");
+        assert!(
+            error.contains("runtime.builtin.network"),
+            "{block}: {error}"
+        );
     }
     let too_many: Vec<String> = (0..=MAX_NETWORK_ENTRIES)
         .map(|i| format!("\"h{i}.example.com\""))
@@ -139,7 +167,12 @@ fn network_unsupported_policy_is_an_explicit_error() {
         r#"{{"builtin":{{"network":{{"mode":"allowlist","allow":[{}]}}}}}}"#,
         too_many.join(",")
     );
-    assert!(effective(&global, "{}").builtin_network().is_err());
+    let dir = tempfile::tempdir().unwrap();
+    assert!(load(
+        &write(dir.path(), "g.json", &nest(&global)),
+        FileKind::Global
+    )
+    .is_err());
 }
 
 #[test]
@@ -149,11 +182,11 @@ fn resource_limits_reject_fractional_invalid_and_out_of_range() {
         r#"{"builtin":{"vcpus":1.5}}"#,
         r#"{"builtin":{"vcpus":256}}"#,
         r#"{"builtin":{"vcpus":-1}}"#,
-        r#"{"builtin":{"memoryMib":4294967296}}"#,
-        r#"{"builtin":{"memoryMib":512.5}}"#,
+        r#"{"builtin":{"memory":"4294967296TiB"}}"#,
+        r#"{"builtin":{"memory":"512.5MiB"}}"#,
     ] {
         assert!(
-            GlobalConfig::load_path(&write(dir.path(), "r.json", bad)).is_err(),
+            load(&write(dir.path(), "r.json", &nest(bad)), FileKind::Global).is_err(),
             "{bad}"
         );
     }
@@ -162,11 +195,11 @@ fn resource_limits_reject_fractional_invalid_and_out_of_range() {
         (None, Some(0), false),
         (None, Some(127), false),
         (Some(1), Some(128), true),
-        (Some(255), Some(u32::MAX), true),
+        (Some(255), Some(u64::from(u32::MAX)), true),
     ] {
         let config = BuiltinRuntimeConfig {
             vcpus,
-            memory_mib: memory,
+            memory: memory.map(Size::from_mib),
             ..Default::default()
         };
         assert_eq!(config.validate().is_ok(), ok, "{vcpus:?} {memory:?}");
@@ -175,9 +208,11 @@ fn resource_limits_reject_fractional_invalid_and_out_of_range() {
 
 #[test]
 fn builtin_network_is_listed_read_only_for_config_show() {
-    let spec = field_spec("builtin.network").expect("listed");
-    assert!(
-        spec.read_only,
-        "the network object is edited in the JSON file"
+    // Each network leaf is a key-table row; the image source is an object
+    // edited in the JSON file.
+    assert!(resolve("runtime.builtin.network.mode").is_ok());
+    assert_eq!(
+        resolve("runtime.builtin.imageSource").unwrap().key.kind,
+        ValueKind::Object
     );
 }

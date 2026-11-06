@@ -4,7 +4,7 @@
 //! Every prompt is built in `src/command/prompts.rs`; a frontend renders the
 //! `Prompt<D>` / `TextPrompt` it is handed and returns the chosen value. The
 //! defaults refuse, so a frontend with nobody at it (the API, the squad
-//! daemon, a `--non-interactive` CLI) never grants a credential: the flow
+//! daemon, a `--headless` CLI) never grants a credential: the flow
 //! only calls an `ask_*` method when [`can_ask_prerequisites`] is `true`.
 //!
 //! [`can_ask_prerequisites`]: WorkflowPrerequisiteFrontend::can_ask_prerequisites
@@ -142,13 +142,13 @@ pub trait WorkflowPrerequisiteFrontend: UserMessageSink {
         Ok(())
     }
 
-    /// The report of the non-interactive re-check run just before teardown.
+    /// The report of the headless re-check run just before teardown.
     /// The flow has already written one warning when it found gaps; the API
     /// emits it as a `before_teardown` event. Default: nothing more to show.
     fn report_workflow_prerequisites_recheck(&mut self, _report: &WorkflowPrerequisiteReport) {}
 
     /// `true` only for a frontend with a person at it: the CLI on a TTY
-    /// without `--non-interactive`/`--json`, and the TUI.
+    /// without `--headless`/`--json`, and the TUI.
     fn can_ask_prerequisites(&self) -> bool {
         false
     }
@@ -223,7 +223,7 @@ pub trait WorkflowPrerequisiteFrontend: UserMessageSink {
 
     /// Approve a repository-defined token command for its exact content hash.
     /// The default declines, like `AgentTrustFrontend`: API, squad and a
-    /// non-interactive CLI never approve one, and `--yes` plays no part.
+    /// headless CLI never approve one, and `--yes` plays no part.
     fn confirm_prerequisite_host_command(
         &mut self,
         _review: &HostSecretCommandReview,

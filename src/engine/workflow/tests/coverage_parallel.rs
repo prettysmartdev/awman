@@ -728,6 +728,8 @@ fn tick(h: &mut Harness, queue: &mut VecDeque<WorkflowStep>) {
             true,
             timing::YOLO_COUNTDOWN_DURATION,
             &stuck_tx,
+            false,
+            &mut HashSet::new(),
         )
         .unwrap();
 }

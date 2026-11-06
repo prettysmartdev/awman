@@ -196,7 +196,7 @@ Overlays can be configured in these places, and awman reads them in this order:
 |-------|--------|---------|
 | 1 | Global config `~/.awman/config.json` | `"overlays": ["dir(~/shared:/mnt/shared:ro)"]` |
 | 2 | Per-repo config `.awman/config.json` | `"overlays": ["skill(lint)"]` |
-| 3 | `AWMAN_OVERLAYS` environment variable | `export AWMAN_OVERLAYS="dir(/data:/mnt:ro),env(TOKEN)"` |
+| 3 | `AWMAN_OVERLAYS` environment variable (the derived variable for the `overlays` key) | `export AWMAN_OVERLAYS="dir(/data:/mnt:ro),env(TOKEN)"` |
 | 4 | `--overlay` CLI flags | `--overlay "ssh()" --overlay "env(GITHUB_TOKEN)"` |
 | 5 | Workflow-level `overlays` | `overlays = ["context(repo)"]` at the top of a workflow file |
 | 6 | Per-step overlays in workflows | `overlays = ["ssh()"]` in TOML |
@@ -290,7 +290,7 @@ Set `AWMAN_OVERLAYS` in your shell profile to inject overlays without modifying 
 export AWMAN_OVERLAYS="ssh(),dir(~/team-data:/mnt/data:ro),env(GITHUB_TOKEN),skill(fetch)"
 ```
 
-Expressions are comma-separated. They are added to the config-file overlays and any `--overlay` flags.
+Expressions are comma-separated. They are added to the config-file overlays and any `--overlay` flags. `--set overlays=…` adds to them the same way, and applies to one invocation only.
 
 ---
 
@@ -776,7 +776,7 @@ invalid overlay spec 'AWMAN_OVERLAYS: skill()': skill() requires an argument; us
 
 ### Removed forms
 
-The old object form, `{ "overlays": { "skills": true, "directories": [...] } }`, is a config parse error. Use the array form, `"overlays": ["skill(*)", "dir(...)"]`. The `skills()` expression is also gone (use `skill(*)`), and the old `envPassthrough` field is ignored with a warning; use `env()` overlay expressions instead.
+The old object form, `{ "overlays": { "skills": true, "directories": [...] } }`, is a config parse error. Use the array form, `"overlays": ["skill(*)", "dir(...)"]`. The `skills()` expression is also gone (use `skill(*)`), and the old `envPassthrough` field is rejected as an unknown config key (the error points at `env()` overlay entries); use `env()` overlay expressions instead.
 
 ---
 

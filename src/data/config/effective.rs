@@ -1,104 +1,221 @@
-//! Merged configuration view: flags > env > repo > global > built-in default.
+//! The effective config: built-in defaults → global → repo → task → env →
+//! `--set`, merged per leaf.
 //!
-//! The merge precedence is encoded once, in this module, and is the single
-//! source of truth.
+//! Precedence is encoded once, here:
+//!
+//! - an object at a non-leaf path recurses (per-leaf merge);
+//! - a leaf (scalar, `null`, array, or an object at an `Object`/`StringMap`
+//!   row) replaces the lower value, except the two additive rows
+//!   (`overlays`, `workflows.dynamic.guidance`), which concatenate in
+//!   precedence order and de-duplicate by trimmed value, first occurrence
+//!   kept;
+//! - a map keyed by user-chosen names (`workServers`, `remote.targets`,
+//!   `agents.flags`, …) replaces as a whole when a file sets it;
+//! - `null` from env or `--set` resets a leaf to its built-in default; `null`
+//!   in a file means "not set here".
+//!
+//! Env and `--set` arrive as [`ConfigOverrides`] (see `overrides.rs`; parsed by
+//! `env.rs`) and are applied leaf by leaf at their concrete path.
+//!
+//! Some policies are not a plain merge and keep reading the individual
+//! layers: the builtin network policy (the trusted layers set a ceiling the
+//! repo may only narrow) and workflow prerequisites (repo and task files may
+//! narrow, never grant).
 
-use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use serde_json::Value;
+
+use crate::data::config::agents::{AcpFallback, AgentAuthMode, LaunchMode};
 use crate::data::config::builtin_launch::BuiltinLaunchSettings;
 use crate::data::config::builtin_network::{BuiltinNetworkConfig, BuiltinNetworkSettings};
 use crate::data::config::builtin_runtime::{BuiltinRuntimeConfig, DEFAULT_STATE_SUBDIR};
+use crate::data::config::daemon::{DaemonSettings, Interaction};
 use crate::data::config::env::EnvSnapshot;
+use crate::data::config::fields::{self, ConfigKey, Merge, CONFIG_KEYS};
+use crate::data::config::file::ConfigFile;
 use crate::data::config::flags::FlagConfig;
-use crate::data::config::global::{GlobalConfig, LaunchModeFallback};
-use crate::data::config::repo::{
-    AgentAuthMode, DynamicWorkflowsKey, LaunchMode, OnDirtyMergeTarget, OnMergeFailure, RepoConfig,
-    WorktreeConfig, GUIDANCE_MAX_ENTRIES,
-};
+use crate::data::config::overrides::ConfigOverrides;
+use crate::data::config::remote::ResolvedRemoteTarget;
 use crate::data::config::resolved_builtin::ResolvedBuiltinConfig;
-use crate::data::config::runtime_selection::{RuntimeSelection, UnknownRuntimeValue};
-use crate::data::config::{DEFAULT_AGENT_STUCK_TIMEOUT_SECS, DEFAULT_SCROLLBACK_LINES};
+use crate::data::config::runtime::{RuntimeSelection, UnknownRuntimeValue};
+use crate::data::config::state::RepoState;
+use crate::data::config::work_items::{
+    WorkItemsConfig, DEFAULT_WORK_ITEMS_DIR, DEFAULT_WORK_ITEM_TEMPLATE,
+};
+use crate::data::config::workflows::GUIDANCE_MAX_ENTRIES;
+use crate::data::config::worktree::{OnDirtyMergeTarget, OnMergeFailure};
 use crate::data::error::DataError;
 
-/// Merged view of every configuration source, in precedence order.
-///
-/// The fields are intentionally `pub(crate)`-free; access goes through
-/// dedicated methods so that callers cannot accidentally bypass the merge.
-#[derive(Debug, Clone)]
-pub struct EffectiveConfig {
-    flags: FlagConfig,
-    env: EnvSnapshot,
-    repo: RepoConfig,
-    global: GlobalConfig,
+/// The config sources, lowest precedence first (after the built-in
+/// defaults, which come from the key table).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ConfigLayers {
+    pub global: ConfigFile,
+    /// `Default` when not in a repo.
+    pub repo: ConfigFile,
+    /// A squad task's own file, during that task's evaluation only.
+    pub task: Option<ConfigFile>,
+    /// Derived `AWMAN_*` variables, resolved by `ConfigOverrides::from_env`.
+    pub env: ConfigOverrides,
+    /// `--set key=value`, resolved by `ConfigOverrides::parse_set_args`.
+    pub set: ConfigOverrides,
 }
 
-/// Where a resolved dynamic-workflow value came from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+impl ConfigLayers {
+    /// Load the global file and, with a `git_root`, the repo file; derive the
+    /// env layer from `env`; take `set` (`--set`) as given.
+    pub fn load(
+        env: &EnvSnapshot,
+        git_root: Option<&Path>,
+        set: ConfigOverrides,
+    ) -> Result<Self, DataError> {
+        use crate::data::config::file::{global_config_path, repo_config_path, FileKind};
+        let global = ConfigFile::load(&global_config_path(env)?, FileKind::Global)?;
+        let repo = match git_root {
+            Some(root) => ConfigFile::load(&repo_config_path(root), FileKind::Repo)?,
+            None => ConfigFile::default(),
+        };
+        let env_layer = env_overrides(env, &[&global, &repo])?;
+        Ok(Self {
+            global,
+            repo,
+            task: None,
+            env: env_layer,
+            set,
+        })
+    }
+
+    /// The map keys present in these layers' files under `section` (a map
+    /// path such as `workServers` or `remote.targets`), for splitting `*`
+    /// segments of env names.
+    pub fn map_names(&self, section: &str) -> Vec<String> {
+        let mut files = vec![&self.global, &self.repo];
+        files.extend(self.task.as_ref());
+        map_names(&files, section)
+    }
+}
+
+/// The map keys under `section` in `files`, de-duplicated, in order.
+pub fn map_names(files: &[&ConfigFile], section: &str) -> Vec<String> {
+    let segments: Vec<&str> = section.split('.').collect();
+    let mut names: Vec<String> = Vec::new();
+    for file in files {
+        let value = file.to_value();
+        if let Some(object) = get_path(&value, &segments).and_then(Value::as_object) {
+            for name in object.keys() {
+                if !names.contains(name) {
+                    names.push(name.clone());
+                }
+            }
+        }
+    }
+    names
+}
+
+/// The env layer: every `AWMAN_*` config variable in `env`, resolved against
+/// the key table by `ConfigOverrides::from_env` (`env.rs`). Map entries bind
+/// to the names already present in `files`; a name only the environment uses
+/// creates a new entry.
+pub fn env_overrides(
+    env: &EnvSnapshot,
+    files: &[&ConfigFile],
+) -> Result<ConfigOverrides, DataError> {
+    ConfigOverrides::from_env(env, |section| map_names(files, section))
+        .map_err(|e| DataError::Other(e.to_string()))
+}
+
+/// Where an effective value came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum DynamicWorkflowsSource {
+pub enum Layer {
+    Default,
     Global,
     Repo,
-    LegacyRepo,
+    Task,
+    Env,
+    Set,
+    /// A per-invocation flag (`--leader`); not a config layer, but a source
+    /// a resolved dynamic-workflow value can report.
     Flag,
 }
 
-impl DynamicWorkflowsSource {
-    pub fn key_prefix(self) -> &'static str {
+impl Layer {
+    pub fn as_str(self) -> &'static str {
         match self {
-            Self::Global | Self::Repo => "workflows.dynamic",
-            Self::LegacyRepo => "dynamicWorkflows",
-            Self::Flag => "--leader",
+            Self::Default => "default",
+            Self::Global => "global",
+            Self::Repo => "repo",
+            Self::Task => "task",
+            Self::Env => "env",
+            Self::Set => "set",
+            Self::Flag => "flag",
         }
     }
 
+    /// The file a layer is read from, for messages; `None` for non-file
+    /// layers.
     pub fn file(self) -> Option<&'static str> {
         match self {
-            Self::Global => Some("~/.awman/config.json"),
-            Self::Repo | Self::LegacyRepo => Some(".awman/config.json"),
-            Self::Flag => None,
+            Self::Global => Some("<AWMAN_HOME>/config.json"),
+            Self::Repo => Some(".awman/config.json"),
+            Self::Task => Some("the squad task config.json"),
+            _ => None,
         }
     }
 
-    /// Label the key and file the user actually wrote.
+    /// Label a key and where the user set it: `workflows.dynamic.<field> in
+    /// .awman/config.json`, `--leader`, `AWMAN_…`, `--set`.
     pub fn describe(self, field: &str) -> String {
-        match self.file() {
-            Some(file) => format!("{}.{field} in {file}", self.key_prefix()),
-            None => self.key_prefix().to_string(),
+        match self {
+            Self::Flag => "--leader".into(),
+            Self::Env => format!("workflows.dynamic.{field} (environment)"),
+            Self::Set => format!("workflows.dynamic.{field} (--set)"),
+            Self::Default => format!("workflows.dynamic.{field} (default)"),
+            _ => format!(
+                "workflows.dynamic.{field} in {}",
+                self.file().unwrap_or_default()
+            ),
         }
     }
 }
+
+/// The resolved dynamic-workflow source; one of the config [`Layer`]s or
+/// the `--leader` flag.
+pub type DynamicWorkflowsSource = Layer;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Sourced<T> {
     pub value: T,
-    pub source: DynamicWorkflowsSource,
+    pub source: Layer,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GuidanceEntry {
     pub text: String,
-    pub source: DynamicWorkflowsSource,
+    pub source: Layer,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// Guidance entries per layer, after trimmed de-duplication.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GuidanceCounts {
     pub global: usize,
     pub repo: usize,
+    pub task: usize,
+    pub overrides: usize,
 }
 
-/// Per-field layering, with attribution retained for views and diagnostics.
+/// `workflows.dynamic` resolved, with attribution retained for views and
+/// diagnostics.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedDynamicWorkflows {
     pub default_leader: Option<Sourced<String>>,
-    pub max_concurrent_steps: Option<Sourced<usize>>,
-    /// Always non-empty when set. A repo map replaces the entire global map.
+    /// Always non-empty when set. A higher layer's map replaces the lower.
     pub agents_to_models: Option<Sourced<HashMap<String, Vec<String>>>>,
     pub guidance: Vec<GuidanceEntry>,
-    /// Counts after trimmed de-duplication, per scope.
     pub guidance_counts: GuidanceCounts,
-    pub repo_uses_legacy_key: bool,
 }
 
 impl ResolvedDynamicWorkflows {
@@ -112,8 +229,7 @@ impl ResolvedDynamicWorkflows {
     }
 }
 
-/// Resolved live credential-refresh settings. Repository fields override the
-/// corresponding global fields; absent values use the built-in defaults.
+/// Resolved live credential-refresh settings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AuthRefreshSettings {
     pub enabled: bool,
@@ -121,129 +237,129 @@ pub struct AuthRefreshSettings {
     pub tick: Duration,
 }
 
+/// The merged view of every config source, plus the invocation's flags and
+/// environment snapshot. Access goes through methods so callers cannot
+/// bypass the merge.
+#[derive(Debug, Clone)]
+pub struct EffectiveConfig {
+    layers: ConfigLayers,
+    merged: ConfigFile,
+    merged_value: Value,
+    provenance: BTreeMap<String, Layer>,
+    flags: FlagConfig,
+    env: EnvSnapshot,
+}
+
 impl Default for EffectiveConfig {
     fn default() -> Self {
-        Self::new(
+        Self::resolve(
+            ConfigLayers::default(),
             FlagConfig::default(),
-            crate::data::config::env::EnvSnapshot::default(),
-            RepoConfig::default(),
-            GlobalConfig::default(),
+            EnvSnapshot::empty(),
         )
+        .expect("the built-in defaults resolve")
     }
 }
 
 impl EffectiveConfig {
-    /// Resolve dynamic settings: flags > repo > global, with a replacing map
-    /// and global-then-repo guidance (trimmed duplicates dropped, never truncated).
-    pub fn dynamic_workflows(&self) -> Result<ResolvedDynamicWorkflows, DataError> {
-        let repo = self.repo.dynamic_workflows_block()?;
-        let repo_source = match repo.map(|(_, key)| key) {
-            Some(DynamicWorkflowsKey::Legacy) => DynamicWorkflowsSource::LegacyRepo,
-            _ => DynamicWorkflowsSource::Repo,
-        };
-        let repo = repo.map(|(block, _)| block);
-        let global = self
-            .global
-            .workflows
-            .as_ref()
-            .and_then(|w| w.dynamic.as_ref());
-        let blocks = [
-            (repo, repo_source),
-            (global, DynamicWorkflowsSource::Global),
-        ];
-        let default_leader = self
-            .flags
-            .leader
-            .as_ref()
-            .map(|leader| Sourced {
-                value: leader.clone(),
-                source: DynamicWorkflowsSource::Flag,
-            })
-            .or_else(|| {
-                blocks.iter().find_map(|(block, source)| {
-                    block
-                        .and_then(|b| b.default_leader.as_ref())
-                        .map(|value| Sourced {
-                            value: value.clone(),
-                            source: *source,
-                        })
-                })
-            });
-        let max_concurrent_steps = blocks.iter().find_map(|(block, source)| {
-            block
-                .and_then(|b| b.max_concurrent_steps)
-                .map(|value| Sourced {
-                    value,
-                    source: *source,
-                })
-        });
-        let agents_to_models = blocks.iter().find_map(|(block, source)| {
-            block
-                .and_then(|b| b.agents_to_models.as_ref())
-                .filter(|map| !map.is_empty())
-                .map(|value| Sourced {
-                    value: value.clone(),
-                    source: *source,
-                })
-        });
-        let mut seen = HashSet::new();
-        let mut guidance = Vec::new();
-        let mut guidance_counts = GuidanceCounts::default();
-        for (block, source) in [
-            (global, DynamicWorkflowsSource::Global),
-            (repo, repo_source),
-        ] {
-            for text in block
-                .and_then(|b| b.guidance.as_ref())
-                .into_iter()
-                .flatten()
-            {
-                if seen.insert(text.trim()) {
-                    guidance.push(GuidanceEntry {
-                        text: text.clone(),
-                        source,
-                    });
-                    if source == DynamicWorkflowsSource::Global {
-                        guidance_counts.global += 1;
-                    } else {
-                        guidance_counts.repo += 1;
-                    }
-                }
-            }
+    /// Merge `layers` over the built-in defaults.
+    ///
+    /// Fails when the merged result is invalid (e.g. more than 50 guidance
+    /// entries across layers, or an override value of the wrong type).
+    pub fn resolve(
+        layers: ConfigLayers,
+        flags: FlagConfig,
+        env: EnvSnapshot,
+    ) -> Result<Self, DataError> {
+        let (merged_value, provenance) = merge(&layers)?;
+        // A name that differs from another only by `-` versus `_` would give
+        // one env name two members; reject it across layers and overrides.
+        fields::validate_map_names(&merged_value).map_err(|e| DataError::Other(e.to_string()))?;
+        let merged: ConfigFile = serde_json::from_value(merged_value.clone())
+            .map_err(|e| DataError::Other(format!("effective config is invalid: {e}")))?;
+        // The network block is per-layer policy (ceiling + narrowing), so a
+        // per-leaf merge of it is meaningless; each file validated its own.
+        let mut check = merged.clone();
+        if let Some(builtin) = check.runtime.as_mut().and_then(|r| r.builtin.as_mut()) {
+            builtin.network = None;
         }
-        if guidance.len() > GUIDANCE_MAX_ENTRIES {
-            return Err(DataError::Other(format!(
-                "workflows.dynamic.guidance: {} global + {} repo entries exceeds the limit of \
-                 {GUIDANCE_MAX_ENTRIES}; remove entries from either ~/.awman/config.json or \
-                 .awman/config.json",
-                guidance_counts.global, guidance_counts.repo,
-            )));
-        }
-        Ok(ResolvedDynamicWorkflows {
-            default_leader,
-            max_concurrent_steps,
-            agents_to_models,
-            guidance,
-            guidance_counts,
-            repo_uses_legacy_key: self.repo.uses_legacy_dynamic_workflows(),
+        check.validate_semantics()?;
+        Ok(Self {
+            layers,
+            merged,
+            merged_value,
+            provenance,
+            flags,
+            env,
         })
     }
 
-    /// Construct a merged view from the four source layers.
-    ///
-    /// Precedence (highest → lowest): `flags` > `env` > `repo` > `global` > built-in.
-    pub fn new(
+    /// Shorthand for global + repo files and no overrides.
+    pub fn from_files(
+        global: ConfigFile,
+        repo: ConfigFile,
         flags: FlagConfig,
         env: EnvSnapshot,
-        repo: RepoConfig,
-        global: GlobalConfig,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, DataError> {
+        Self::resolve(
+            ConfigLayers {
+                global,
+                repo,
+                ..Default::default()
+            },
             flags,
             env,
-            repo,
-            global,
+        )
+    }
+
+    /// The same merge with different invocation flags.
+    pub fn with_flags(mut self, flags: FlagConfig) -> Self {
+        self.flags = flags;
+        self
+    }
+
+    /// The same merge with a different environment snapshot (paths and
+    /// process variables only; the env *layer* is part of [`ConfigLayers`]).
+    pub fn with_env(mut self, env: EnvSnapshot) -> Self {
+        self.env = env;
+        self
+    }
+
+    /// The merged config, defaults applied.
+    pub fn config(&self) -> &ConfigFile {
+        &self.merged
+    }
+
+    /// The merged config as JSON (for `config show` / `GET /v1/config`).
+    pub fn value(&self) -> &Value {
+        &self.merged_value
+    }
+
+    /// The source layers.
+    pub fn layers(&self) -> &ConfigLayers {
+        &self.layers
+    }
+
+    /// Which layer set the effective value at a concrete path (a leaf, or a
+    /// map entry). [`Layer::Default`] when no layer set it.
+    pub fn source_of(&self, path: &str) -> Layer {
+        let mut current = path;
+        loop {
+            if let Some(layer) = self.provenance.get(current) {
+                return *layer;
+            }
+            match current.rsplit_once('.') {
+                Some((parent, _)) => current = parent,
+                None => return Layer::Default,
+            }
         }
+    }
+
+    /// The merged JSON with every sensitive leaf masked (`••••` + last 4).
+    pub fn masked_value(&self) -> Value {
+        let mut value = self.merged_value.clone();
+        mask_sensitive(&mut value, "", "");
+        value
     }
 
     pub fn flags(&self) -> &FlagConfig {
@@ -254,238 +370,133 @@ impl EffectiveConfig {
         &self.env
     }
 
-    pub fn repo(&self) -> &RepoConfig {
-        &self.repo
+    fn agents(&self) -> crate::data::config::agents::AgentsConfig {
+        self.merged.agents.clone().unwrap_or_default()
     }
 
-    pub fn global(&self) -> &GlobalConfig {
-        &self.global
-    }
-
-    /// Resolve the model override (flag only; no repo/global level for model).
+    /// The model override (flag only).
     pub fn model(&self) -> Option<String> {
         self.flags.model.clone()
     }
 
-    /// Resolve the agent name (flag > repo.agent > global.default_agent).
+    /// The agent: `--agent` > `agents.default`.
     pub fn agent(&self) -> Option<String> {
-        if let Some(a) = self.flags.agent.as_deref() {
-            return Some(a.to_string());
-        }
-        if let Some(a) = self.repo.agent.as_deref() {
-            return Some(a.to_string());
-        }
-        self.global.default_agent.clone()
+        self.flags.agent.clone().or_else(|| self.agents().default)
     }
 
-    /// Effective `yoloDisallowedTools` list.
+    /// `agents.yolo.disallowedTools`.
     pub fn yolo_disallowed_tools(&self) -> Vec<String> {
-        if let Some(values) = self.flags.yolo_disallowed_tools.as_ref() {
-            return values.clone();
-        }
-        if let Some(values) = self.repo.yolo_disallowed_tools.as_ref() {
-            return values.clone();
-        }
-        if let Some(values) = self.global.yolo_disallowed_tools.as_ref() {
-            return values.clone();
-        }
-        Vec::new()
+        self.agents()
+            .yolo
+            .and_then(|y| y.disallowed_tools)
+            .unwrap_or_default()
     }
 
-    /// Effective extra arguments for `agent`'s launch command
-    /// (flag > repo entry > global entry > none).
-    ///
-    /// Each level replaces the lower ones for that agent, so an empty repo
-    /// entry turns off a global one. `--agent-flag` targets the agent this
-    /// invocation selects ([`Self::agent`]), so it applies only when `agent` is
-    /// that one; other agents (e.g. a workflow step that names its own) fall
-    /// through to config.
+    /// Extra launch arguments for `agent`: `--agent-flag` when `agent` is
+    /// the one this invocation selects, else `agents.flags.<agent>`.
     pub fn agent_flags(&self, agent: &str) -> Vec<String> {
         if let Some(values) = self.flags.agent_flags.as_ref() {
             if self.agent().as_deref() == Some(agent) {
                 return values.clone();
             }
         }
-        [
-            self.repo.agent_flags.as_ref(),
-            self.global.agent_flags.as_ref(),
-        ]
-        .into_iter()
-        .flatten()
-        .find_map(|map| map.get(agent))
-        .cloned()
-        .unwrap_or_default()
-    }
-
-    /// Effective scrollback line count for the container terminal.
-    pub fn scrollback_lines(&self) -> usize {
-        if let Some(n) = self.flags.terminal_scrollback_lines {
-            return n;
-        }
-        if let Some(n) = self.repo.terminal_scrollback_lines {
-            return n;
-        }
-        if let Some(n) = self.global.terminal_scrollback_lines {
-            return n;
-        }
-        DEFAULT_SCROLLBACK_LINES
-    }
-
-    /// Effective agent-stuck timeout.
-    pub fn agent_stuck_timeout(&self) -> Duration {
-        if let Some(d) = self.flags.agent_stuck_timeout {
-            return d;
-        }
-        if let Some(secs) = self.repo.agent_stuck_timeout_secs {
-            return Duration::from_secs(secs);
-        }
-        if let Some(secs) = self.global.agent_stuck_timeout_secs {
-            return Duration::from_secs(secs);
-        }
-        Duration::from_secs(DEFAULT_AGENT_STUCK_TIMEOUT_SECS)
-    }
-
-    /// Effective API work-dirs allowlist.
-    pub fn api_work_dirs(&self) -> Vec<String> {
-        if let Some(api_cfg) = self.global.api.as_ref() {
-            if let Some(dirs) = api_cfg.work_dirs.as_ref() {
-                return dirs.clone();
-            }
-        }
-        Vec::new()
-    }
-
-    /// Effective API workdir roots allowlist.
-    pub fn api_work_dir_roots(&self) -> Vec<String> {
-        if let Some(api_cfg) = self.global.api.as_ref() {
-            if let Some(roots) = api_cfg.work_dir_roots.as_ref() {
-                return roots.clone();
-            }
-        }
-        Vec::new()
-    }
-
-    /// Effective `alwaysNonInteractive` setting.
-    pub fn always_non_interactive(&self) -> bool {
-        if let Some(value) = self.flags.non_interactive {
-            return value;
-        }
-        self.global
-            .api
-            .as_ref()
-            .and_then(|h| h.always_non_interactive)
-            .unwrap_or(false)
-    }
-
-    /// Effective remote default address (flag > env > global config).
-    pub fn remote_default_addr(&self) -> Option<String> {
-        if let Some(v) = self.flags.remote_addr.as_deref() {
-            return Some(v.to_string());
-        }
-        if let Some(v) = self.env.remote_addr() {
-            return Some(v.to_string());
-        }
-        self.global
-            .remote
-            .as_ref()
-            .and_then(|r| r.default_addr.clone())
-    }
-
-    /// Effective remote default API key (flag > env > global config).
-    pub fn remote_default_api_key(&self) -> Option<String> {
-        if let Some(v) = self.flags.api_key.as_deref() {
-            return Some(v.to_string());
-        }
-        if let Some(v) = self.env.api_key() {
-            return Some(v.to_string());
-        }
-        self.global
-            .remote
-            .as_ref()
-            .and_then(|r| r.default_api_key.clone())
-    }
-
-    /// Effective remote saved-dirs list.
-    pub fn remote_saved_dirs(&self) -> Vec<String> {
-        self.global
-            .remote
-            .as_ref()
-            .and_then(|r| r.saved_dirs.clone())
+        self.agents()
+            .flags
+            .and_then(|map| map.get(agent).cloned())
             .unwrap_or_default()
     }
 
-    /// Effective sticky remote session id (flag > env).
-    pub fn remote_session(&self) -> Option<String> {
-        if let Some(v) = self.flags.remote_session.as_deref() {
-            return Some(v.to_string());
-        }
-        self.env.remote_session().map(|s| s.to_string())
+    /// `tui.scrollbackLines`.
+    pub fn scrollback_lines(&self) -> usize {
+        self.merged
+            .tui
+            .as_ref()
+            .and_then(|t| t.scrollback_lines)
+            .unwrap_or(10_000)
     }
 
-    /// Effective container runtime name (e.g. `"docker"`, `"apple-containers"`).
-    pub fn runtime(&self) -> Option<String> {
-        self.global.runtime.clone()
+    /// `agents.stuckTimeout`.
+    pub fn agent_stuck_timeout(&self) -> Duration {
+        self.agents()
+            .stuck_timeout
+            .map_or(Duration::from_secs(30), |d| d.to_duration())
     }
 
-    /// Effective agent launch mode (flag > env > repo > built-in `stdio`).
-    ///
-    /// Launch mode is intentionally not inherited from global configuration;
-    /// it is scoped to an invocation or repository. The repository setting is
-    /// agent-independent, so no agent name is needed here (the agent-support
-    /// check happens separately, in the command layer and `build_options`).
+    /// `agents.launchMode`.
     pub fn launch_mode(&self) -> LaunchMode {
-        if let Some(mode) = self.flags.launch_mode {
-            return mode;
-        }
-        if let Some(mode) = self.env.launch_mode() {
-            return mode;
-        }
-        self.repo.launch_mode.unwrap_or_default()
+        self.agents().launch_mode.unwrap_or_default()
     }
 
-    /// Effective ACP fallback policy. This is global-only; flags, environment
-    /// and repository configuration do not override it.
-    pub fn launch_mode_fallback(&self) -> LaunchModeFallback {
-        self.global.launch_mode_fallback.unwrap_or_default()
+    /// `agents.acpFallback`.
+    pub fn acp_fallback(&self) -> AcpFallback {
+        self.agents().acp_fallback.unwrap_or_default()
     }
 
-    /// Effective runtime selection (global only, like [`Self::runtime`]).
+    /// `agents.auth.mode`.
+    pub fn auth_mode(&self) -> AgentAuthMode {
+        self.agents().auth.and_then(|a| a.mode).unwrap_or_default()
+    }
+
+    /// `agents.auth.refresh.*`. `enabled: false` restores env-variable
+    /// credential delivery.
+    pub fn auth_refresh(&self) -> AuthRefreshSettings {
+        let refresh = self
+            .agents()
+            .auth
+            .and_then(|a| a.refresh)
+            .unwrap_or_default();
+        AuthRefreshSettings {
+            enabled: refresh.enabled.unwrap_or(true),
+            threshold: refresh
+                .threshold
+                .map_or(Duration::from_secs(20 * 60), |d| d.to_duration()),
+            tick: refresh
+                .tick
+                .map_or(Duration::from_secs(60), |d| d.to_duration()),
+        }
+    }
+
+    /// `--remote-session` > `AWMAN_REMOTE_SESSION`.
+    pub fn remote_session(&self) -> Option<String> {
+        self.flags
+            .remote_session
+            .clone()
+            .or_else(|| self.env.remote_session().map(str::to_string))
+    }
+
+    /// `--headless` (flag only; daemon interaction defaults are
+    /// `daemon.features.*.interaction`).
+    pub fn headless(&self) -> bool {
+        self.flags.headless.unwrap_or(false)
+    }
+
+    /// `runtime.kind`. Serde has already rejected an unknown spelling, so
+    /// this is always `Ok`; the `Result` keeps the engine's error path.
     pub fn runtime_selection(&self) -> Result<RuntimeSelection, UnknownRuntimeValue> {
-        self.global.runtime_selection()
+        Ok(self
+            .merged
+            .runtime
+            .as_ref()
+            .and_then(|r| r.kind)
+            .unwrap_or_default())
     }
 
-    /// Effective builtin-runtime settings: the repo `builtin` block merged over
-    /// the global one field by field (map entries per key). Defaults and
-    /// validation are applied by Layer 0 in [`Self::builtin_settings`].
-    ///
-    /// The view never carries `network`: the enforced policy is
-    /// [`Self::builtin_network`] (global ceiling, repo may only narrow), and
-    /// a merged copy would be a value nobody enforces.
+    /// `runtime.builtin` merged per leaf, defaults applied, without
+    /// `network` (the enforced network policy is [`Self::builtin_network`]).
     pub fn builtin_runtime(&self) -> BuiltinRuntimeConfig {
-        let global = self.global.builtin.clone().unwrap_or_default();
-        let merged = match &self.repo.builtin {
-            Some(repo) => repo.merged_over(&global),
-            None => global,
-        };
+        let merged = self
+            .merged
+            .runtime
+            .as_ref()
+            .and_then(|r| r.builtin.clone())
+            .unwrap_or_default();
         BuiltinRuntimeConfig {
             network: None,
             ..merged
         }
     }
 
-    /// Effective `builtin.builder.enabled`: repo over global per leaf,
-    /// default `false`. Whether it applies to a runtime is the engine's
-    /// decision.
-    #[cfg(test)]
-    fn builtin_builder_enabled(&self) -> bool {
-        self.builtin_runtime().builder_enabled()
-    }
-
-    /// Resolve all builtin-runtime settings for the engine boundary.
-    ///
-    /// Layer 0 applies defaults, validates resources and image sources,
-    /// enforces global network ceilings against repo policy, and supplies the
-    /// session's image-acquisition inputs in one typed value.
+    /// Every builtin-runtime setting the engine boundary needs, validated.
     pub fn builtin_settings(&self) -> Result<ResolvedBuiltinConfig, DataError> {
         let builtin = self.builtin_runtime();
         builtin
@@ -506,30 +517,52 @@ impl EffectiveConfig {
         })
     }
 
-    /// Effective builtin network policy: the global `builtin.network` block is
-    /// the ceiling and the repo block may only narrow it (see
-    /// [`BuiltinNetworkConfig::resolve`]). Errors name the offending key.
+    /// The builtin network policy: the trusted layers (global file, env,
+    /// `--set`) set the ceiling and the repo block may only narrow it.
     pub fn builtin_network(&self) -> Result<BuiltinNetworkSettings, String> {
-        BuiltinNetworkConfig::resolve(
-            self.global
-                .builtin
+        let network = |file: &ConfigFile| -> Option<BuiltinNetworkConfig> {
+            file.runtime
                 .as_ref()
-                .and_then(|b| b.network.as_ref()),
-            self.repo.builtin.as_ref().and_then(|b| b.network.as_ref()),
-        )
+                .and_then(|r| r.builtin.as_ref())
+                .and_then(|b| b.network.clone())
+        };
+        let ceiling = self.trusted_network_value();
+        let ceiling: Option<BuiltinNetworkConfig> = match ceiling {
+            Some(value) => Some(
+                serde_json::from_value(value)
+                    .map_err(|e| format!("runtime.builtin.network: {e}"))?,
+            ),
+            None => None,
+        };
+        BuiltinNetworkConfig::resolve(ceiling.as_ref(), network(&self.layers.repo).as_ref())
     }
 
-    /// The builtin settings one launch for this session is sized and confined
-    /// by: default vCPUs and memory, and the network policy (global ceiling
-    /// narrowed by the repo block). Resolved per session at every launch, so
-    /// many sessions can share one builtin runtime and each keep its own
-    /// repo's values.
-    ///
-    /// Fails closed: zero resources or a repo network block that would widen
-    /// the global one is a [`DataError::BuiltinConfig`] for this launch. A
-    /// repo `builtin.stateDir` is resolved (with the usual precedence) into
-    /// [`BuiltinLaunchSettings::repo_state_dir`] for the runtime to compare
-    /// with its own process-wide directory.
+    /// The global file's `runtime.builtin.network` with env and `--set`
+    /// network leaves applied over it.
+    fn trusted_network_value(&self) -> Option<Value> {
+        const PREFIX: &str = "runtime.builtin.network.";
+        let mut value = self
+            .layers
+            .global
+            .runtime
+            .as_ref()
+            .and_then(|r| r.builtin.as_ref())
+            .and_then(|b| b.network.as_ref())
+            .map(|n| serde_json::to_value(n).expect("network serializes"));
+        for (path, v) in self.layers.env.iter().chain(self.layers.set.iter()) {
+            if let Some(leaf) = path.strip_prefix(PREFIX) {
+                let object = value.get_or_insert_with(|| Value::Object(Default::default()));
+                if v.is_null() {
+                    object.as_object_mut().map(|o| o.remove(leaf));
+                } else {
+                    object[leaf] = v.clone();
+                }
+            }
+        }
+        value
+    }
+
+    /// The sizing and network policy of one builtin launch for this session.
     pub fn builtin_launch_settings(&self) -> Result<BuiltinLaunchSettings, DataError> {
         let builtin = self.builtin_runtime();
         builtin
@@ -537,9 +570,11 @@ impl EffectiveConfig {
             .map_err(DataError::BuiltinConfig)?;
         let network = self.builtin_network().map_err(DataError::BuiltinConfig)?;
         let repo_sets_state_dir = self
+            .layers
             .repo
-            .builtin
+            .runtime
             .as_ref()
+            .and_then(|r| r.builtin.as_ref())
             .is_some_and(|b| b.state_dir.is_some());
         let repo_state_dir = if repo_sets_state_dir {
             Some(self.builtin_state_dir()?)
@@ -556,2063 +591,544 @@ impl EffectiveConfig {
         })
     }
 
-    /// The process-wide builtin settings runtime detection needs. Unlike
-    /// [`EffectiveConfig::builtin_settings`] it does not validate the
-    /// per-session parts (network narrowing, vCPUs, memory, image sources):
-    /// those fail each launch of the repo that sets them, not the process.
+    /// The process-wide builtin settings runtime detection needs.
     pub fn builtin_process_settings(
         &self,
     ) -> Result<crate::data::config::resolved_builtin::BuiltinProcessConfig, DataError> {
-        let env = self.env();
         Ok(
             crate::data::config::resolved_builtin::BuiltinProcessConfig {
                 state_dir: self.builtin_state_dir()?,
-                ambient_overrides: env.ambient_msb_overrides(),
+                ambient_overrides: self.env.ambient_msb_overrides(),
                 test_isolation: crate::data::config::env::test_isolation_active()
-                    && !env.test_builtin(),
+                    && !self.env.test_builtin(),
             },
         )
     }
 
-    /// Effective builtin-runtime state directory:
-    /// `AWMAN_BUILTIN_STATE_DIR` > `builtin.stateDir` (repo > global) >
-    /// `<data home>/builtin`.
+    /// `runtime.builtin.stateDir`, else `<data home>/builtin`.
     pub fn builtin_state_dir(&self) -> Result<PathBuf, DataError> {
-        if let Some(dir) = self.env.builtin_state_dir() {
-            return Ok(dir);
-        }
         if let Some(dir) = self.builtin_runtime().state_dir {
             return Ok(dir);
         }
-        Ok(GlobalConfig::data_home_with(&self.env)?.join(DEFAULT_STATE_SUBDIR))
+        Ok(crate::data::fs::data_paths::data_home(&self.env)?.join(DEFAULT_STATE_SUBDIR))
     }
 
-    /// Effective base image tag for setup/teardown containers (repo > global > None).
+    /// `runtime.baseImage`.
     pub fn base_image(&self) -> Option<String> {
-        if let Some(v) = self.repo.base_image.as_deref() {
-            return Some(v.to_string());
-        }
-        self.global.base_image.clone()
+        self.merged
+            .runtime
+            .as_ref()
+            .and_then(|r| r.base_image.clone())
     }
 
-    /// Effective cap on concurrently-running workflow steps
-    /// (flags > env > repo > global > `None` = unlimited).
-    pub fn effective_max_concurrent_agents(&self) -> Option<usize> {
-        if let Some(n) = self.flags.max_concurrent_agents {
-            return Some(n);
-        }
-        if let Some(n) = self.env.max_concurrent_agents() {
-            return Some(n);
-        }
-        if let Some(n) = self.repo.max_concurrent_agents {
-            return Some(n);
-        }
-        self.global.max_concurrent_agents
+    /// `runtime.dockerfile` resolved against `git_root`.
+    pub fn dockerfile_path(&self, git_root: &Path) -> PathBuf {
+        let dockerfile = self
+            .merged
+            .runtime
+            .as_ref()
+            .and_then(|r| r.dockerfile.clone())
+            .unwrap_or_else(|| "Dockerfile.dev".into());
+        resolve_under(git_root, &dockerfile)
     }
 
-    /// Effective credential injection mode (repo > built-in default `keychain`).
-    ///
-    /// `passthrough` skips keychain injection entirely; `none` disables keychain
-    /// injection; `keychain` (default) injects host keychain creds, subject to
-    /// injection-time dedup of any repo-declared env vars.
-    ///
-    /// Single-layer resolution (repo only, no global flag override) is a
-    /// deliberate conservative choice: a credential toggle must be an explicit
-    /// per-repo decision, not silently inherited from a global default that the
-    /// operator may not realize is set.
-    pub fn auth_mode(&self) -> AgentAuthMode {
-        self.repo.auth.unwrap_or_default()
+    /// `workItems.dir` resolved against `git_root`.
+    pub fn work_items_dir(&self, git_root: &Path) -> PathBuf {
+        let dir = self
+            .merged
+            .work_items
+            .as_ref()
+            .and_then(|w| w.dir.clone())
+            .unwrap_or_else(|| DEFAULT_WORK_ITEMS_DIR.into());
+        resolve_under(git_root, &dir)
     }
 
-    /// Effective live credential-refresh configuration (repo > global >
-    /// built-in). `enabled: false` is the escape hatch that restores legacy
-    /// env-variable credential delivery.
-    pub fn auth_refresh(&self) -> AuthRefreshSettings {
-        let repo = self.repo.auth_refresh.as_ref();
-        let global = self.global.auth_refresh.as_ref();
-        AuthRefreshSettings {
-            enabled: repo
-                .and_then(|c| c.enabled)
-                .or_else(|| global.and_then(|c| c.enabled))
-                .unwrap_or(true),
-            threshold: Duration::from_secs(
-                repo.and_then(|c| c.threshold_minutes)
-                    .or_else(|| global.and_then(|c| c.threshold_minutes))
-                    .unwrap_or(20)
-                    .saturating_mul(60),
-            ),
-            tick: Duration::from_secs(
-                repo.and_then(|c| c.tick_seconds)
-                    .or_else(|| global.and_then(|c| c.tick_seconds))
-                    .unwrap_or(60),
-            ),
+    /// `workItems.template` resolved against `git_root`, else
+    /// `<work items dir>/0000-template.md`.
+    pub fn work_items_template(&self, git_root: &Path) -> PathBuf {
+        match &self.merged.work_items {
+            Some(WorkItemsConfig {
+                template: Some(template),
+                ..
+            }) => resolve_under(git_root, template),
+            _ => self
+                .work_items_dir(git_root)
+                .join(DEFAULT_WORK_ITEM_TEMPLATE),
         }
     }
 
-    /// `worktree.onDirtyMergeTarget`: repo over global. `None` when neither
-    /// sets it, so the host's headless default applies.
+    /// `workflows.maxConcurrentSteps` (`None` = unlimited).
+    pub fn max_concurrent_steps(&self) -> Option<usize> {
+        self.merged
+            .workflows
+            .as_ref()
+            .and_then(|w| w.max_concurrent_steps)
+    }
+
+    /// `worktree.onDirtyMergeTarget`, when a layer sets it. `None` otherwise,
+    /// so the frontend class default (interactive: ask; headless: its own)
+    /// applies.
     pub fn worktree_on_dirty_merge_target(&self) -> Option<OnDirtyMergeTarget> {
-        self.repo
+        if self.source_of("worktree.onDirtyMergeTarget") == Layer::Default {
+            return None;
+        }
+        self.merged
             .worktree
             .as_ref()
             .and_then(|w| w.on_dirty_merge_target)
-            .or_else(|| {
-                self.global
-                    .worktree
-                    .as_ref()
-                    .and_then(|w| w.on_dirty_merge_target)
-            })
     }
 
-    /// `worktree.mergeFix.onFailure`: repo over global.
+    /// `worktree.mergeFix.onFailure`, when a layer sets it (see above).
     pub fn worktree_merge_fix_on_failure(&self) -> Option<OnMergeFailure> {
-        let merge_fix = |w: &Option<WorktreeConfig>| w.as_ref().and_then(|w| w.merge_fix.clone());
-        merge_fix(&self.repo.worktree)
+        if self.source_of("worktree.mergeFix.onFailure") == Layer::Default {
+            return None;
+        }
+        self.merged
+            .worktree
+            .as_ref()
+            .and_then(|w| w.merge_fix.as_ref())
             .and_then(|m| m.on_failure)
-            .or_else(|| merge_fix(&self.global.worktree).and_then(|m| m.on_failure))
     }
 
-    /// `worktree.mergeFix.promptTemplate`: repo over global. A path relative
-    /// to the git root.
+    /// `worktree.mergeFix.promptTemplate`, relative to the git root.
     pub fn worktree_merge_fix_prompt_template(&self) -> Option<String> {
-        let merge_fix = |w: &Option<WorktreeConfig>| w.as_ref().and_then(|w| w.merge_fix.clone());
-        merge_fix(&self.repo.worktree)
-            .and_then(|m| m.prompt_template)
-            .or_else(|| merge_fix(&self.global.worktree).and_then(|m| m.prompt_template))
+        self.merged
+            .worktree
+            .as_ref()
+            .and_then(|w| w.merge_fix.as_ref())
+            .and_then(|m| m.prompt_template.clone())
     }
-}
 
-impl EffectiveConfig {
+    /// Every `daemon` leaf with defaults applied.
+    pub fn daemon(&self) -> DaemonSettings {
+        DaemonSettings::from_merged(&self.merged.daemon.clone().unwrap_or_default())
+    }
+
+    /// The typed network listener address after defaults and config layers.
+    pub fn network_listen(&self) -> crate::data::config::network::ListenAddr {
+        self.daemon().network.listen
+    }
+
+    /// The daemon features exposed through the network listener.
+    pub fn network_features(&self) -> Vec<crate::data::daemon_state::FeatureName> {
+        self.daemon().network.features
+    }
+
+    /// `daemon.features.worker.push.workDirs.allow`.
+    pub fn worker_push_work_dirs(&self) -> Vec<String> {
+        self.daemon().worker.push_work_dirs
+    }
+
+    /// `daemon.features.worker.push.workDirs.roots`.
+    pub fn worker_push_work_dir_roots(&self) -> Vec<String> {
+        self.daemon().worker.push_work_dir_roots
+    }
+
+    /// `daemon.features.worker.push.interaction` and `.allowOverride`.
+    pub fn worker_push_interaction(&self) -> (Interaction, bool) {
+        let worker = self.daemon().worker;
+        (worker.push_interaction, worker.push_allow_override)
+    }
+
+    /// `name`, else `remote.default`, resolved to a configured target.
+    pub fn remote_target(&self, name: Option<&str>) -> Result<ResolvedRemoteTarget, DataError> {
+        self.merged
+            .remote
+            .clone()
+            .unwrap_or_default()
+            .resolve_target(name)
+    }
+
+    /// Per-repo state (not config) for `git_root`.
+    pub fn repo_state(&self, git_root: &Path) -> RepoState {
+        crate::data::fs::DataPaths::from_env(&self.env)
+            .and_then(|data| RepoState::load(&data, git_root))
+            .unwrap_or_default()
+    }
+
+    /// Workflow prerequisite policy: global (with env and `--set` leaves,
+    /// the trusted layers) → repo (narrow only) → task file (narrow only) →
+    /// a stored task policy → flags.
     pub fn prerequisite_policy(
         &self,
         context: super::workflows::PrerequisiteResolveContext,
     ) -> super::workflows::PrerequisitePolicy {
-        use super::workflows::{PrerequisitePolicy, PrerequisitePolicyLayers};
+        use super::workflows::{PrerequisitePolicy, PrerequisitePolicyLayers, PrerequisitesConfig};
+        let prerequisites = |file: &ConfigFile| -> Option<PrerequisitesConfig> {
+            file.workflows
+                .as_ref()
+                .and_then(|w| w.prerequisites.clone())
+        };
+        let trusted = self.trusted_prerequisites();
+        let repo = prerequisites(&self.layers.repo);
+        let task = self.layers.task.as_ref().and_then(prerequisites);
         PrerequisitePolicy::resolve(PrerequisitePolicyLayers {
-            global: self
-                .global
-                .workflows
-                .as_ref()
-                .and_then(|w| w.prerequisites.as_ref()),
-            squad_global: self
-                .flags
-                .squad_prerequisites
-                .then_some(())
-                .and(self.global.squad.as_ref())
-                .and_then(|s| s.workflows.as_ref())
-                .and_then(|w| w.prerequisites.as_ref()),
-            repo: self
-                .repo
-                .workflows
-                .as_ref()
-                .and_then(|w| w.prerequisites.as_ref()),
+            global: trusted.as_ref(),
+            task_file: task.as_ref(),
+            repo: repo.as_ref(),
             task: self.flags.squad_task_prerequisites.as_ref(),
             flags: &self.flags.prerequisites,
             context,
         })
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::data::config::env::{
-        EnvSnapshot, AWMAN_API_KEY, AWMAN_REMOTE_ADDR, AWMAN_REMOTE_SESSION,
-    };
-    use crate::data::config::repo::{
-        AgentAuthMode, AgentFlagsConfig, ApiConfig, AuthRefreshConfig, RemoteConfig,
-    };
-    use std::time::Duration;
-
-    fn make_effective(
-        flags: FlagConfig,
-        env: EnvSnapshot,
-        repo: RepoConfig,
-        global: GlobalConfig,
-    ) -> EffectiveConfig {
-        EffectiveConfig::new(flags, env, repo, global)
-    }
-
-    // ─── agent ────────────────────────────────────────────────────────────────
-
-    #[test]
-    fn agent_flag_beats_repo_and_global() {
-        let flags = FlagConfig {
-            agent: Some("flag-agent".to_string()),
-            ..Default::default()
-        };
-        let repo = RepoConfig {
-            agent: Some("repo-agent".to_string()),
-            ..Default::default()
-        };
-        let global = GlobalConfig {
-            default_agent: Some("global-agent".to_string()),
-            ..Default::default()
-        };
-        let ec = make_effective(flags, EnvSnapshot::empty(), repo, global);
-        assert_eq!(ec.agent().as_deref(), Some("flag-agent"));
-    }
-
-    #[test]
-    fn agent_repo_beats_global() {
-        let repo = RepoConfig {
-            agent: Some("repo-agent".to_string()),
-            ..Default::default()
-        };
-        let global = GlobalConfig {
-            default_agent: Some("global-agent".to_string()),
-            ..Default::default()
-        };
-        let ec = make_effective(FlagConfig::default(), EnvSnapshot::empty(), repo, global);
-        assert_eq!(ec.agent().as_deref(), Some("repo-agent"));
-    }
-
-    #[test]
-    fn agent_global_is_used_when_repo_unset() {
-        let global = GlobalConfig {
-            default_agent: Some("global-agent".to_string()),
-            ..Default::default()
-        };
-        let ec = make_effective(
-            FlagConfig::default(),
-            EnvSnapshot::empty(),
-            RepoConfig::default(),
-            global,
-        );
-        assert_eq!(ec.agent().as_deref(), Some("global-agent"));
-    }
-
-    #[test]
-    fn agent_none_when_all_unset() {
-        let ec = make_effective(
-            FlagConfig::default(),
-            EnvSnapshot::empty(),
-            RepoConfig::default(),
-            GlobalConfig::default(),
-        );
-        assert_eq!(ec.agent(), None);
-    }
-
-    // ─── scrollback_lines ─────────────────────────────────────────────────────
-
-    #[test]
-    fn scrollback_flag_beats_repo_and_global() {
-        let flags = FlagConfig {
-            terminal_scrollback_lines: Some(9999),
-            ..Default::default()
-        };
-        let repo = RepoConfig {
-            terminal_scrollback_lines: Some(5000),
-            ..Default::default()
-        };
-        let global = GlobalConfig {
-            terminal_scrollback_lines: Some(2000),
-            ..Default::default()
-        };
-        let ec = make_effective(flags, EnvSnapshot::empty(), repo, global);
-        assert_eq!(ec.scrollback_lines(), 9999);
-    }
-
-    #[test]
-    fn scrollback_repo_beats_global() {
-        let repo = RepoConfig {
-            terminal_scrollback_lines: Some(5000),
-            ..Default::default()
-        };
-        let global = GlobalConfig {
-            terminal_scrollback_lines: Some(2000),
-            ..Default::default()
-        };
-        let ec = make_effective(FlagConfig::default(), EnvSnapshot::empty(), repo, global);
-        assert_eq!(ec.scrollback_lines(), 5000);
-    }
-
-    #[test]
-    fn scrollback_global_beats_built_in_default() {
-        let global = GlobalConfig {
-            terminal_scrollback_lines: Some(3333),
-            ..Default::default()
-        };
-        let ec = make_effective(
-            FlagConfig::default(),
-            EnvSnapshot::empty(),
-            RepoConfig::default(),
-            global,
-        );
-        assert_eq!(ec.scrollback_lines(), 3333);
-    }
-
-    #[test]
-    fn scrollback_built_in_default_is_10000() {
-        let ec = make_effective(
-            FlagConfig::default(),
-            EnvSnapshot::empty(),
-            RepoConfig::default(),
-            GlobalConfig::default(),
-        );
-        assert_eq!(ec.scrollback_lines(), DEFAULT_SCROLLBACK_LINES);
-        assert_eq!(ec.scrollback_lines(), 10_000);
-    }
-
-    // ─── agent_stuck_timeout ──────────────────────────────────────────────────
-
-    #[test]
-    fn timeout_flag_beats_repo_and_global() {
-        let flags = FlagConfig {
-            agent_stuck_timeout: Some(Duration::from_secs(999)),
-            ..Default::default()
-        };
-        let repo = RepoConfig {
-            agent_stuck_timeout_secs: Some(100),
-            ..Default::default()
-        };
-        let global = GlobalConfig {
-            agent_stuck_timeout_secs: Some(50),
-            ..Default::default()
-        };
-        let ec = make_effective(flags, EnvSnapshot::empty(), repo, global);
-        assert_eq!(ec.agent_stuck_timeout(), Duration::from_secs(999));
-    }
-
-    #[test]
-    fn timeout_repo_beats_global() {
-        let repo = RepoConfig {
-            agent_stuck_timeout_secs: Some(77),
-            ..Default::default()
-        };
-        let global = GlobalConfig {
-            agent_stuck_timeout_secs: Some(50),
-            ..Default::default()
-        };
-        let ec = make_effective(FlagConfig::default(), EnvSnapshot::empty(), repo, global);
-        assert_eq!(ec.agent_stuck_timeout(), Duration::from_secs(77));
-    }
-
-    #[test]
-    fn timeout_global_beats_built_in_default() {
-        let global = GlobalConfig {
-            agent_stuck_timeout_secs: Some(120),
-            ..Default::default()
-        };
-        let ec = make_effective(
-            FlagConfig::default(),
-            EnvSnapshot::empty(),
-            RepoConfig::default(),
-            global,
-        );
-        assert_eq!(ec.agent_stuck_timeout(), Duration::from_secs(120));
-    }
-
-    #[test]
-    fn timeout_built_in_default_is_30s() {
-        let ec = make_effective(
-            FlagConfig::default(),
-            EnvSnapshot::empty(),
-            RepoConfig::default(),
-            GlobalConfig::default(),
-        );
-        assert_eq!(
-            ec.agent_stuck_timeout(),
-            Duration::from_secs(DEFAULT_AGENT_STUCK_TIMEOUT_SECS)
-        );
-        assert_eq!(ec.agent_stuck_timeout(), Duration::from_secs(30));
-    }
-
-    // ─── yolo_disallowed_tools ────────────────────────────────────────────────
-
-    #[test]
-    fn yolo_disallowed_tools_flag_beats_repo() {
-        let flags = FlagConfig {
-            yolo_disallowed_tools: Some(vec!["flag-tool".to_string()]),
-            ..Default::default()
-        };
-        let repo = RepoConfig {
-            yolo_disallowed_tools: Some(vec!["repo-tool".to_string()]),
-            ..Default::default()
-        };
-        let ec = make_effective(flags, EnvSnapshot::empty(), repo, GlobalConfig::default());
-        assert_eq!(ec.yolo_disallowed_tools(), vec!["flag-tool"]);
-    }
-
-    #[test]
-    fn yolo_disallowed_tools_repo_beats_global() {
-        let repo = RepoConfig {
-            yolo_disallowed_tools: Some(vec!["repo-tool".to_string()]),
-            ..Default::default()
-        };
-        let global = GlobalConfig {
-            yolo_disallowed_tools: Some(vec!["global-tool".to_string()]),
-            ..Default::default()
-        };
-        let ec = make_effective(FlagConfig::default(), EnvSnapshot::empty(), repo, global);
-        assert_eq!(ec.yolo_disallowed_tools(), vec!["repo-tool"]);
-    }
-
-    #[test]
-    fn yolo_disallowed_tools_empty_when_all_unset() {
-        let ec = make_effective(
-            FlagConfig::default(),
-            EnvSnapshot::empty(),
-            RepoConfig::default(),
-            GlobalConfig::default(),
-        );
-        assert!(ec.yolo_disallowed_tools().is_empty());
-    }
-
-    // ─── agent_flags ──────────────────────────────────────────────────────────
-
-    fn agent_flags_map(entries: &[(&str, &[&str])]) -> Option<AgentFlagsConfig> {
-        Some(
-            entries
-                .iter()
-                .map(|(agent, values)| {
-                    (
-                        agent.to_string(),
-                        values.iter().map(|v| v.to_string()).collect(),
-                    )
-                })
-                .collect(),
-        )
-    }
-
-    fn strings(values: &[&str]) -> Vec<String> {
-        values.iter().map(|v| v.to_string()).collect()
-    }
-
-    #[test]
-    fn agent_flags_empty_when_all_unset() {
-        let ec = EffectiveConfig::default();
-        assert!(ec.agent_flags("codex").is_empty());
-    }
-
-    #[test]
-    fn agent_flags_global_entry_used_when_repo_has_none() {
-        let global = GlobalConfig {
-            agent_flags: agent_flags_map(&[("codex", &["--no-daemon"])]),
-            ..Default::default()
-        };
-        let ec = make_effective(
-            FlagConfig::default(),
-            EnvSnapshot::empty(),
-            RepoConfig::default(),
-            global,
-        );
-        assert_eq!(ec.agent_flags("codex"), strings(&["--no-daemon"]));
-        assert!(ec.agent_flags("claude").is_empty());
-    }
-
-    #[test]
-    fn agent_flags_repo_entry_replaces_global_entry_per_agent() {
-        let repo = RepoConfig {
-            agent_flags: agent_flags_map(&[
-                ("codex", &["--no-daemon", "--config", "x=y"]),
-                ("claude", &[]),
-            ]),
-            ..Default::default()
-        };
-        let global = GlobalConfig {
-            agent_flags: agent_flags_map(&[
-                ("codex", &["--no-daemon"]),
-                ("claude", &["--verbose"]),
-                ("gemini", &["--debug"]),
-            ]),
-            ..Default::default()
-        };
-        let ec = make_effective(FlagConfig::default(), EnvSnapshot::empty(), repo, global);
-        assert_eq!(
-            ec.agent_flags("codex"),
-            strings(&["--no-daemon", "--config", "x=y"])
-        );
-        // An empty repo entry turns the global one off.
-        assert!(ec.agent_flags("claude").is_empty());
-        // Agents the repo does not mention keep their global entry.
-        assert_eq!(ec.agent_flags("gemini"), strings(&["--debug"]));
-    }
-
-    #[test]
-    fn agent_flags_cli_replaces_config_for_the_selected_agent_only() {
-        let flags = FlagConfig {
-            agent: Some("codex".into()),
-            agent_flags: Some(strings(&["--search"])),
-            ..Default::default()
-        };
-        let repo = RepoConfig {
-            agent_flags: agent_flags_map(&[
-                ("codex", &["--no-daemon"]),
-                ("claude", &["--verbose"]),
-            ]),
-            ..Default::default()
-        };
-        let ec = make_effective(flags, EnvSnapshot::empty(), repo, GlobalConfig::default());
-        assert_eq!(ec.agent_flags("codex"), strings(&["--search"]));
-        // A different agent (e.g. a workflow step override) keeps its config.
-        assert_eq!(ec.agent_flags("claude"), strings(&["--verbose"]));
-    }
-
-    #[test]
-    fn agent_flags_cli_targets_the_config_selected_agent_without_agent_flag() {
-        let flags = FlagConfig {
-            agent_flags: Some(strings(&["--search"])),
-            ..Default::default()
-        };
-        let repo = RepoConfig {
-            agent: Some("codex".into()),
-            ..Default::default()
-        };
-        let ec = make_effective(flags, EnvSnapshot::empty(), repo, GlobalConfig::default());
-        assert_eq!(ec.agent_flags("codex"), strings(&["--search"]));
-        assert!(ec.agent_flags("claude").is_empty());
-    }
-
-    // ─── remote_default_addr ──────────────────────────────────────────────────
-
-    #[test]
-    fn remote_addr_flag_beats_env_and_global() {
-        let flags = FlagConfig {
-            remote_addr: Some("flag-addr".to_string()),
-            ..Default::default()
-        };
-        let env = EnvSnapshot::with_overrides([(AWMAN_REMOTE_ADDR, "env-addr")]);
-        let global = GlobalConfig {
-            remote: Some(RemoteConfig {
-                default_addr: Some("global-addr".to_string()),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        let ec = make_effective(flags, env, RepoConfig::default(), global);
-        assert_eq!(ec.remote_default_addr().as_deref(), Some("flag-addr"));
-    }
-
-    #[test]
-    fn remote_addr_env_beats_global() {
-        let env = EnvSnapshot::with_overrides([(AWMAN_REMOTE_ADDR, "env-addr")]);
-        let global = GlobalConfig {
-            remote: Some(RemoteConfig {
-                default_addr: Some("global-addr".to_string()),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        let ec = make_effective(FlagConfig::default(), env, RepoConfig::default(), global);
-        assert_eq!(ec.remote_default_addr().as_deref(), Some("env-addr"));
-    }
-
-    #[test]
-    fn remote_addr_global_is_used_when_flag_and_env_unset() {
-        let global = GlobalConfig {
-            remote: Some(RemoteConfig {
-                default_addr: Some("global-addr".to_string()),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        let ec = make_effective(
-            FlagConfig::default(),
-            EnvSnapshot::empty(),
-            RepoConfig::default(),
-            global,
-        );
-        assert_eq!(ec.remote_default_addr().as_deref(), Some("global-addr"));
-    }
-
-    #[test]
-    fn remote_addr_none_when_all_unset() {
-        let ec = make_effective(
-            FlagConfig::default(),
-            EnvSnapshot::empty(),
-            RepoConfig::default(),
-            GlobalConfig::default(),
-        );
-        assert_eq!(ec.remote_default_addr(), None);
-    }
-
-    // ─── remote_default_api_key ───────────────────────────────────────────────
-
-    #[test]
-    fn remote_api_key_flag_beats_env() {
-        let flags = FlagConfig {
-            api_key: Some("flag-key".to_string()),
-            ..Default::default()
-        };
-        let env = EnvSnapshot::with_overrides([(AWMAN_API_KEY, "env-key")]);
-        let ec = make_effective(flags, env, RepoConfig::default(), GlobalConfig::default());
-        assert_eq!(ec.remote_default_api_key().as_deref(), Some("flag-key"));
-    }
-
-    #[test]
-    fn remote_api_key_env_beats_global() {
-        let env = EnvSnapshot::with_overrides([(AWMAN_API_KEY, "env-key")]);
-        let global = GlobalConfig {
-            remote: Some(RemoteConfig {
-                default_api_key: Some("global-key".to_string()),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        let ec = make_effective(FlagConfig::default(), env, RepoConfig::default(), global);
-        assert_eq!(ec.remote_default_api_key().as_deref(), Some("env-key"));
-    }
-
-    // ─── remote_session ───────────────────────────────────────────────────────
-
-    #[test]
-    fn remote_session_flag_beats_env() {
-        let flags = FlagConfig {
-            remote_session: Some("flag-session".to_string()),
-            ..Default::default()
-        };
-        let env = EnvSnapshot::with_overrides([(AWMAN_REMOTE_SESSION, "env-session")]);
-        let ec = make_effective(flags, env, RepoConfig::default(), GlobalConfig::default());
-        assert_eq!(ec.remote_session().as_deref(), Some("flag-session"));
-    }
-
-    #[test]
-    fn remote_session_from_env_when_flag_unset() {
-        let env = EnvSnapshot::with_overrides([(AWMAN_REMOTE_SESSION, "env-session")]);
-        let ec = make_effective(
-            FlagConfig::default(),
-            env,
-            RepoConfig::default(),
-            GlobalConfig::default(),
-        );
-        assert_eq!(ec.remote_session().as_deref(), Some("env-session"));
-    }
-
-    #[test]
-    fn remote_session_none_when_both_unset() {
-        let ec = make_effective(
-            FlagConfig::default(),
-            EnvSnapshot::empty(),
-            RepoConfig::default(),
-            GlobalConfig::default(),
-        );
-        assert_eq!(ec.remote_session(), None);
-    }
-
-    // ─── always_non_interactive ───────────────────────────────────────────────
-
-    #[test]
-    fn always_non_interactive_flag_wins() {
-        let flags = FlagConfig {
-            non_interactive: Some(true),
-            ..Default::default()
-        };
-        let global = GlobalConfig {
-            api: Some(ApiConfig {
-                always_non_interactive: Some(false),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        let ec = make_effective(flags, EnvSnapshot::empty(), RepoConfig::default(), global);
-        assert!(ec.always_non_interactive());
-    }
-
-    #[test]
-    fn always_non_interactive_from_global_when_flag_unset() {
-        let global = GlobalConfig {
-            api: Some(ApiConfig {
-                always_non_interactive: Some(true),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        let ec = make_effective(
-            FlagConfig::default(),
-            EnvSnapshot::empty(),
-            RepoConfig::default(),
-            global,
-        );
-        assert!(ec.always_non_interactive());
-    }
-
-    #[test]
-    fn always_non_interactive_default_is_false() {
-        let ec = make_effective(
-            FlagConfig::default(),
-            EnvSnapshot::empty(),
-            RepoConfig::default(),
-            GlobalConfig::default(),
-        );
-        assert!(!ec.always_non_interactive());
-    }
-
-    // ─── api_work_dirs ───────────────────────────────────────────────────
-
-    #[test]
-    fn api_work_dirs_from_global() {
-        let global = GlobalConfig {
-            api: Some(ApiConfig {
-                work_dirs: Some(vec!["/data".to_string(), "/work".to_string()]),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        let ec = make_effective(
-            FlagConfig::default(),
-            EnvSnapshot::empty(),
-            RepoConfig::default(),
-            global,
-        );
-        assert_eq!(ec.api_work_dirs(), vec!["/data", "/work"]);
-    }
-
-    #[test]
-    fn api_work_dirs_empty_when_not_set() {
-        let ec = make_effective(
-            FlagConfig::default(),
-            EnvSnapshot::empty(),
-            RepoConfig::default(),
-            GlobalConfig::default(),
-        );
-        assert!(ec.api_work_dirs().is_empty());
-    }
-
-    // ─── api_work_dir_roots ──────────────────────────────────────────────
-
-    #[test]
-    fn api_work_dir_roots_from_global() {
-        let global = GlobalConfig {
-            api: Some(ApiConfig {
-                work_dir_roots: Some(vec!["/srv/repos".to_string(), "/more".to_string()]),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        let ec = make_effective(
-            FlagConfig::default(),
-            EnvSnapshot::empty(),
-            RepoConfig::default(),
-            global,
-        );
-        assert_eq!(ec.api_work_dir_roots(), vec!["/srv/repos", "/more"]);
-        assert!(
-            ec.api_work_dirs().is_empty(),
-            "roots do not leak into workdirs"
-        );
-    }
-
-    #[test]
-    fn api_work_dir_roots_empty_when_not_set() {
-        let ec = make_effective(
-            FlagConfig::default(),
-            EnvSnapshot::empty(),
-            RepoConfig::default(),
-            GlobalConfig::default(),
-        );
-        assert!(ec.api_work_dir_roots().is_empty());
-    }
-
-    // ─── runtime ─────────────────────────────────────────────────────────────
-
-    #[test]
-    fn runtime_from_global() {
-        let global = GlobalConfig {
-            runtime: Some("podman".to_string()),
-            ..Default::default()
-        };
-        let ec = make_effective(
-            FlagConfig::default(),
-            EnvSnapshot::empty(),
-            RepoConfig::default(),
-            global,
-        );
-        assert_eq!(ec.runtime().as_deref(), Some("podman"));
-    }
-
-    #[test]
-    fn runtime_none_when_not_set() {
-        let ec = make_effective(
-            FlagConfig::default(),
-            EnvSnapshot::empty(),
-            RepoConfig::default(),
-            GlobalConfig::default(),
-        );
-        assert_eq!(ec.runtime(), None);
-    }
-
-    // ─── full-stack precedence tests ─────────────────────────────────────────
-
-    #[test]
-    fn full_stack_agent_precedence_flag_beats_repo_beats_global_beats_none() {
-        let flags = FlagConfig {
-            agent: Some("flag-agent".to_string()),
-            ..Default::default()
-        };
-        let repo = RepoConfig {
-            agent: Some("repo-agent".to_string()),
-            ..Default::default()
-        };
-        let global = GlobalConfig {
-            default_agent: Some("global-agent".to_string()),
-            ..Default::default()
-        };
-
-        // Flag wins over all.
-        let ec = make_effective(
-            flags.clone(),
-            EnvSnapshot::empty(),
-            repo.clone(),
-            global.clone(),
-        );
-        assert_eq!(
-            ec.agent().as_deref(),
-            Some("flag-agent"),
-            "flag should beat repo and global"
-        );
-
-        // Remove flag → repo wins.
-        let ec2 = make_effective(
-            FlagConfig::default(),
-            EnvSnapshot::empty(),
-            repo.clone(),
-            global.clone(),
-        );
-        assert_eq!(
-            ec2.agent().as_deref(),
-            Some("repo-agent"),
-            "repo should beat global"
-        );
-
-        // Remove repo → global wins.
-        let ec3 = make_effective(
-            FlagConfig::default(),
-            EnvSnapshot::empty(),
-            RepoConfig::default(),
-            global,
-        );
-        assert_eq!(
-            ec3.agent().as_deref(),
-            Some("global-agent"),
-            "global used when flag and repo absent"
-        );
-
-        // Remove all → None.
-        let ec4 = make_effective(
-            FlagConfig::default(),
-            EnvSnapshot::empty(),
-            RepoConfig::default(),
-            GlobalConfig::default(),
-        );
-        assert_eq!(ec4.agent(), None, "None when nothing is set");
-    }
-
-    #[test]
-    fn full_stack_flag_wins_over_all_levels_for_scrollback() {
-        // Set scrollback at every level; flag must win.
-        let flags = FlagConfig {
-            terminal_scrollback_lines: Some(1111),
-            ..Default::default()
-        };
-        let repo = RepoConfig {
-            terminal_scrollback_lines: Some(2222),
-            ..Default::default()
-        };
-        let global = GlobalConfig {
-            terminal_scrollback_lines: Some(3333),
-            ..Default::default()
-        };
-        let ec = make_effective(flags, EnvSnapshot::empty(), repo, global);
-        assert_eq!(ec.scrollback_lines(), 1111);
-
-        // Remove flag — repo wins.
-        let flags2 = FlagConfig::default();
-        let repo2 = RepoConfig {
-            terminal_scrollback_lines: Some(2222),
-            ..Default::default()
-        };
-        let global2 = GlobalConfig {
-            terminal_scrollback_lines: Some(3333),
-            ..Default::default()
-        };
-        let ec2 = make_effective(flags2, EnvSnapshot::empty(), repo2, global2);
-        assert_eq!(ec2.scrollback_lines(), 2222);
-
-        // Remove repo — global wins.
-        let ec3 = make_effective(
-            FlagConfig::default(),
-            EnvSnapshot::empty(),
-            RepoConfig::default(),
-            GlobalConfig {
-                terminal_scrollback_lines: Some(3333),
-                ..Default::default()
-            },
-        );
-        assert_eq!(ec3.scrollback_lines(), 3333);
-
-        // Remove global — built-in default wins.
-        let ec4 = make_effective(
-            FlagConfig::default(),
-            EnvSnapshot::empty(),
-            RepoConfig::default(),
-            GlobalConfig::default(),
-        );
-        assert_eq!(ec4.scrollback_lines(), DEFAULT_SCROLLBACK_LINES);
-    }
-
-    // ─── effective_max_concurrent_agents (WI-0096) ──────────────────────────
-
-    fn env_with_max_concurrent(n: &str) -> EnvSnapshot {
-        EnvSnapshot::with_overrides([(crate::data::config::env::AWMAN_MAX_CONCURRENT_AGENTS, n)])
-    }
-
-    #[test]
-    fn max_concurrent_flag_beats_env_repo_and_global() {
-        let flags = FlagConfig {
-            max_concurrent_agents: Some(1),
-            ..Default::default()
-        };
-        let repo = RepoConfig {
-            max_concurrent_agents: Some(3),
-            ..Default::default()
-        };
-        let global = GlobalConfig {
-            max_concurrent_agents: Some(4),
-            ..Default::default()
-        };
-        let ec = make_effective(flags, env_with_max_concurrent("2"), repo, global);
-        assert_eq!(ec.effective_max_concurrent_agents(), Some(1));
-    }
-
-    #[test]
-    fn max_concurrent_env_beats_repo_and_global() {
-        let repo = RepoConfig {
-            max_concurrent_agents: Some(3),
-            ..Default::default()
-        };
-        let global = GlobalConfig {
-            max_concurrent_agents: Some(4),
-            ..Default::default()
-        };
-        let ec = make_effective(
-            FlagConfig::default(),
-            env_with_max_concurrent("2"),
-            repo,
-            global,
-        );
-        assert_eq!(ec.effective_max_concurrent_agents(), Some(2));
-    }
-
-    #[test]
-    fn max_concurrent_repo_beats_global() {
-        let repo = RepoConfig {
-            max_concurrent_agents: Some(3),
-            ..Default::default()
-        };
-        let global = GlobalConfig {
-            max_concurrent_agents: Some(4),
-            ..Default::default()
-        };
-        let ec = make_effective(FlagConfig::default(), EnvSnapshot::empty(), repo, global);
-        assert_eq!(ec.effective_max_concurrent_agents(), Some(3));
-    }
-
-    #[test]
-    fn max_concurrent_global_used_when_repo_env_flag_unset() {
-        let global = GlobalConfig {
-            max_concurrent_agents: Some(4),
-            ..Default::default()
-        };
-        let ec = make_effective(
-            FlagConfig::default(),
-            EnvSnapshot::empty(),
-            RepoConfig::default(),
-            global,
-        );
-        assert_eq!(ec.effective_max_concurrent_agents(), Some(4));
-    }
-
-    #[test]
-    fn max_concurrent_none_when_all_unset_means_unlimited() {
-        let ec = make_effective(
-            FlagConfig::default(),
-            EnvSnapshot::empty(),
-            RepoConfig::default(),
-            GlobalConfig::default(),
-        );
-        assert_eq!(ec.effective_max_concurrent_agents(), None);
-    }
-
-    // ── Part B: auth_mode ─────────────────────────────────────────────────────
-
-    #[test]
-    fn auth_mode_default_is_keychain() {
-        let ec = make_effective(
-            FlagConfig::default(),
-            EnvSnapshot::empty(),
-            RepoConfig::default(),
-            GlobalConfig::default(),
-        );
-        assert_eq!(
-            ec.auth_mode(),
-            AgentAuthMode::Keychain,
-            "default auth mode must be keychain"
-        );
-    }
-
-    #[test]
-    fn auth_mode_passthrough_from_repo() {
-        let repo = RepoConfig {
-            auth: Some(AgentAuthMode::Passthrough),
-            ..Default::default()
-        };
-        let ec = make_effective(
-            FlagConfig::default(),
-            EnvSnapshot::empty(),
-            repo,
-            GlobalConfig::default(),
-        );
-        assert_eq!(
-            ec.auth_mode(),
-            AgentAuthMode::Passthrough,
-            "passthrough set in repo config must be effective"
-        );
-    }
-
-    #[test]
-    fn auth_mode_none_from_repo() {
-        let repo = RepoConfig {
-            auth: Some(AgentAuthMode::None),
-            ..Default::default()
-        };
-        let ec = make_effective(
-            FlagConfig::default(),
-            EnvSnapshot::empty(),
-            repo,
-            GlobalConfig::default(),
-        );
-        assert_eq!(
-            ec.auth_mode(),
-            AgentAuthMode::None,
-            "none set in repo config must be effective"
-        );
-    }
-
-    #[test]
-    fn auth_mode_keychain_explicitly_set_in_repo() {
-        let repo = RepoConfig {
-            auth: Some(AgentAuthMode::Keychain),
-            ..Default::default()
-        };
-        let ec = make_effective(
-            FlagConfig::default(),
-            EnvSnapshot::empty(),
-            repo,
-            GlobalConfig::default(),
-        );
-        assert_eq!(ec.auth_mode(), AgentAuthMode::Keychain);
-    }
-
-    // ── launch_mode ──────────────────────────────────────────────────────────
-
-    #[test]
-    fn launch_mode_defaults_to_stdio_and_ignores_global_config() {
-        let global = GlobalConfig {
-            launch_mode_fallback: Some(LaunchModeFallback::Stdio),
-            ..Default::default()
-        };
-        let ec = make_effective(
-            FlagConfig::default(),
-            EnvSnapshot::empty(),
-            RepoConfig::default(),
-            global,
-        );
-        assert_eq!(ec.launch_mode(), LaunchMode::Stdio);
-    }
-
-    #[test]
-    fn launch_mode_uses_repo_when_flag_and_env_are_unset() {
-        let repo = RepoConfig {
-            launch_mode: Some(LaunchMode::Acp),
-            ..Default::default()
-        };
-        let ec = make_effective(
-            FlagConfig::default(),
-            EnvSnapshot::empty(),
-            repo,
-            GlobalConfig::default(),
-        );
-        assert_eq!(ec.launch_mode(), LaunchMode::Acp);
-    }
-
-    #[test]
-    fn launch_mode_env_beats_repo() {
-        let env =
-            EnvSnapshot::with_overrides([(crate::data::config::env::AWMAN_LAUNCH_MODE, "stdio")]);
-        let repo = RepoConfig {
-            launch_mode: Some(LaunchMode::Acp),
-            ..Default::default()
-        };
-        let ec = make_effective(FlagConfig::default(), env, repo, GlobalConfig::default());
-        assert_eq!(ec.launch_mode(), LaunchMode::Stdio);
-    }
-
-    #[test]
-    fn launch_mode_flag_beats_env_and_repo() {
-        let flags = FlagConfig {
-            launch_mode: Some(LaunchMode::Acp),
-            ..Default::default()
-        };
-        let env =
-            EnvSnapshot::with_overrides([(crate::data::config::env::AWMAN_LAUNCH_MODE, "stdio")]);
-        let repo = RepoConfig {
-            launch_mode: Some(LaunchMode::Stdio),
-            ..Default::default()
-        };
-        let ec = make_effective(flags, env, repo, GlobalConfig::default());
-        assert_eq!(ec.launch_mode(), LaunchMode::Acp);
-    }
-
-    // ── launch_mode_fallback ─────────────────────────────────────────────────
-
-    #[test]
-    fn launch_mode_fallback_defaults_to_error() {
-        let ec = make_effective(
-            FlagConfig::default(),
-            EnvSnapshot::empty(),
-            RepoConfig::default(),
-            GlobalConfig::default(),
-        );
-        assert_eq!(ec.launch_mode_fallback(), LaunchModeFallback::Error);
-    }
-
-    #[test]
-    fn launch_mode_fallback_uses_global_config_only() {
-        let global = GlobalConfig {
-            launch_mode_fallback: Some(LaunchModeFallback::Stdio),
-            ..Default::default()
-        };
-        let ec = make_effective(
-            FlagConfig::default(),
-            EnvSnapshot::empty(),
-            RepoConfig::default(),
-            global,
-        );
-        assert_eq!(ec.launch_mode_fallback(), LaunchModeFallback::Stdio);
-    }
-
-    // ── worktree merge-back settings (WI-0132 Part B) ────────────────────────
-
-    #[test]
-    fn worktree_on_dirty_merge_target_repo_overrides_global() {
-        use crate::data::config::repo::{OnDirtyMergeTarget, WorktreeConfig};
-        let worktree = |v| {
-            Some(WorktreeConfig {
-                on_dirty_merge_target: Some(v),
-                merge_fix: None,
-            })
-        };
-        let unset = make_effective(
-            FlagConfig::default(),
-            EnvSnapshot::empty(),
-            RepoConfig::default(),
-            GlobalConfig::default(),
-        );
-        assert_eq!(unset.worktree_on_dirty_merge_target(), None);
-
-        let global_only = make_effective(
-            FlagConfig::default(),
-            EnvSnapshot::empty(),
-            RepoConfig::default(),
-            GlobalConfig {
-                worktree: worktree(OnDirtyMergeTarget::Stash),
-                ..Default::default()
-            },
-        );
-        assert_eq!(
-            global_only.worktree_on_dirty_merge_target(),
-            Some(OnDirtyMergeTarget::Stash)
-        );
-
-        let both = make_effective(
-            FlagConfig::default(),
-            EnvSnapshot::empty(),
-            RepoConfig {
-                worktree: worktree(OnDirtyMergeTarget::Commit),
-                ..Default::default()
-            },
-            GlobalConfig {
-                worktree: worktree(OnDirtyMergeTarget::Stash),
-                ..Default::default()
-            },
-        );
-        assert_eq!(
-            both.worktree_on_dirty_merge_target(),
-            Some(OnDirtyMergeTarget::Commit)
-        );
-    }
-
-    // ── auth_refresh (WI-0107 §6) ────────────────────────────────────────────
-
-    #[test]
-    fn auth_refresh_defaults_when_unset_anywhere() {
-        let ec = make_effective(
-            FlagConfig::default(),
-            EnvSnapshot::empty(),
-            RepoConfig::default(),
-            GlobalConfig::default(),
-        );
-        assert_eq!(
-            ec.auth_refresh(),
-            AuthRefreshSettings {
-                enabled: true,
-                threshold: Duration::from_secs(20 * 60),
-                tick: Duration::from_secs(60),
+    /// The global file's `workflows.prerequisites` with env and `--set`
+    /// prerequisite leaves applied over it.
+    fn trusted_prerequisites(&self) -> Option<super::workflows::PrerequisitesConfig> {
+        const PREFIX: &str = "workflows.prerequisites.";
+        let mut value = self
+            .layers
+            .global
+            .workflows
+            .as_ref()
+            .and_then(|w| w.prerequisites.as_ref())
+            .map(|p| serde_json::to_value(p).expect("prerequisites serialize"));
+        for (path, v) in self.layers.env.iter().chain(self.layers.set.iter()) {
+            if let Some(leaf) = path.strip_prefix(PREFIX) {
+                let root = value.get_or_insert_with(|| Value::Object(Default::default()));
+                set_path(root, &leaf.split('.').collect::<Vec<_>>(), v.clone());
             }
-        );
+        }
+        value.and_then(|v| serde_json::from_value(v).ok())
     }
 
-    #[test]
-    fn auth_refresh_repo_overrides_global_per_field() {
-        let repo = RepoConfig {
-            auth_refresh: Some(AuthRefreshConfig {
-                enabled: None,
-                threshold_minutes: Some(5),
-                tick_seconds: None,
+    /// `workflows.dynamic`, attributed: `--leader` > the layer that set
+    /// `defaultLeader`; the map from the highest layer that set it; guidance
+    /// from every layer in precedence order, de-duplicated.
+    pub fn dynamic_workflows(&self) -> Result<ResolvedDynamicWorkflows, DataError> {
+        let dynamic = self
+            .merged
+            .workflows
+            .as_ref()
+            .and_then(|w| w.dynamic.clone())
+            .unwrap_or_default();
+        let default_leader = match self.flags.leader.clone() {
+            Some(value) => Some(Sourced {
+                value,
+                source: Layer::Flag,
             }),
-            ..Default::default()
-        };
-        let global = GlobalConfig {
-            auth_refresh: Some(AuthRefreshConfig {
-                enabled: Some(false),
-                threshold_minutes: Some(30),
-                tick_seconds: Some(15),
+            None => dynamic.default_leader.map(|value| Sourced {
+                value,
+                source: self.source_of("workflows.dynamic.defaultLeader"),
             }),
-            ..Default::default()
         };
-        let ec = make_effective(FlagConfig::default(), EnvSnapshot::empty(), repo, global);
-        let settings = ec.auth_refresh();
-        // repo sets threshold_minutes explicitly, so it wins over global's.
-        assert_eq!(
-            settings.threshold,
-            Duration::from_secs(5 * 60),
-            "repo threshold_minutes must override global"
-        );
-        // repo leaves `enabled` and `tick_seconds` unset, so each falls
-        // through to global independently (per-field precedence, not
-        // per-object).
-        assert!(
-            !settings.enabled,
-            "repo left `enabled` unset; must inherit global's false"
-        );
-        assert_eq!(
-            settings.tick,
-            Duration::from_secs(15),
-            "repo left tick_seconds unset; must inherit global's value"
-        );
-    }
-
-    #[test]
-    fn auth_refresh_repo_kill_switch_overrides_global_enabled_true() {
-        let repo = RepoConfig {
-            auth_refresh: Some(AuthRefreshConfig {
-                enabled: Some(false),
-                threshold_minutes: None,
-                tick_seconds: None,
-            }),
-            ..Default::default()
+        let agents_to_models = dynamic
+            .agents_to_models
+            .filter(|map| !map.is_empty())
+            .map(|map| Sourced {
+                source: self.source_of("workflows.dynamic.agentsToModels"),
+                value: map.into_iter().collect(),
+            });
+        // Re-attribute each merged guidance entry to the first layer that
+        // contributed it.
+        let mut sources: Vec<(String, Layer)> = Vec::new();
+        let layer_guidance = |file: &ConfigFile| -> Vec<String> {
+            file.workflows
+                .as_ref()
+                .and_then(|w| w.dynamic.as_ref())
+                .and_then(|d| d.guidance.clone())
+                .unwrap_or_default()
         };
-        let global = GlobalConfig {
-            auth_refresh: Some(AuthRefreshConfig {
-                enabled: Some(true),
-                threshold_minutes: None,
-                tick_seconds: None,
-            }),
-            ..Default::default()
-        };
-        let ec = make_effective(FlagConfig::default(), EnvSnapshot::empty(), repo, global);
-        assert!(
-            !ec.auth_refresh().enabled,
-            "repo-level kill switch (enabled: false) must win over an enabled global default"
-        );
-    }
-
-    #[test]
-    fn auth_refresh_global_only_is_used_when_repo_unset() {
-        let global = GlobalConfig {
-            auth_refresh: Some(AuthRefreshConfig {
-                enabled: Some(true),
-                threshold_minutes: Some(45),
-                tick_seconds: Some(90),
-            }),
-            ..Default::default()
-        };
-        let ec = make_effective(
-            FlagConfig::default(),
-            EnvSnapshot::empty(),
-            RepoConfig::default(),
-            global,
-        );
-        let settings = ec.auth_refresh();
-        assert!(settings.enabled);
-        assert_eq!(settings.threshold, Duration::from_secs(45 * 60));
-        assert_eq!(settings.tick, Duration::from_secs(90));
-    }
-
-    #[test]
-    fn builtin_runtime_merges_repo_over_global() {
-        let global = GlobalConfig {
-            builtin: Some(BuiltinRuntimeConfig {
-                vcpus: Some(2),
-                memory_mib: Some(8192),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        let repo = RepoConfig {
-            builtin: Some(BuiltinRuntimeConfig {
-                vcpus: Some(4),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        let eff = make_effective(FlagConfig::default(), EnvSnapshot::default(), repo, global);
-        let merged = eff.builtin_runtime();
-        assert_eq!(merged.vcpus, Some(4));
-        assert_eq!(merged.memory_mib, Some(8192));
-        assert_eq!(
-            EffectiveConfig::default().builtin_runtime(),
-            BuiltinRuntimeConfig::default()
-        );
-    }
-
-    #[test]
-    fn builtin_settings_resolve_defaults_and_process_values() {
-        let resolved = EffectiveConfig::default().builtin_settings().unwrap();
-        assert_eq!(
-            resolved.launch.vcpus,
-            crate::data::config::builtin_runtime::DEFAULT_VCPUS
-        );
-        assert_eq!(
-            resolved.launch.memory_mib,
-            crate::data::config::builtin_runtime::DEFAULT_MEMORY_MIB
-        );
-        assert_eq!(resolved.launch.network, BuiltinNetworkSettings::default());
-        assert!(!resolved.builder_enabled);
-        assert!(resolved.image_source.is_none());
-        assert!(resolved.images.is_empty());
-        assert!(resolved.registries.is_empty());
-        assert!(!resolved.state_dir.as_os_str().is_empty());
-    }
-
-    #[test]
-    fn builtin_settings_apply_network_narrowing_and_reject_widening() {
-        use crate::data::config::builtin_network::{BuiltinNetworkConfig, NetworkMode};
-        let global = GlobalConfig {
-            builtin: Some(BuiltinRuntimeConfig {
-                network: Some(BuiltinNetworkConfig {
-                    mode: Some(NetworkMode::Allowlist),
-                    allow: Some(vec!["*.example.com".into()]),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        let narrowed = RepoConfig {
-            builtin: Some(BuiltinRuntimeConfig {
-                network: Some(BuiltinNetworkConfig {
-                    mode: Some(NetworkMode::Allowlist),
-                    allow: Some(vec!["api.example.com".into()]),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        let resolved = make_effective(
-            FlagConfig::default(),
-            EnvSnapshot::empty(),
-            narrowed,
-            global.clone(),
-        )
-        .builtin_settings()
-        .unwrap();
-        assert_eq!(resolved.launch.network.allow.len(), 1);
-        assert_eq!(resolved.launch.network.allow[0].name(), "api.example.com");
-
-        let widening = RepoConfig {
-            builtin: Some(BuiltinRuntimeConfig {
-                network: Some(BuiltinNetworkConfig {
-                    mode: Some(NetworkMode::Public),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        assert!(matches!(
-            make_effective(
-                FlagConfig::default(),
-                EnvSnapshot::empty(),
-                widening,
-                global
-            )
-            .builtin_settings(),
-            Err(DataError::BuiltinConfig(_))
-        ));
-
-        let invalid_resources = RepoConfig {
-            builtin: Some(BuiltinRuntimeConfig {
-                vcpus: Some(0),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        assert!(matches!(
-            make_effective(
-                FlagConfig::default(),
-                EnvSnapshot::empty(),
-                invalid_resources,
-                GlobalConfig::default(),
-            )
-            .builtin_settings(),
-            Err(DataError::BuiltinConfig(_))
-        ));
-    }
-
-    #[test]
-    fn builtin_settings_return_registry_builder_and_normalized_legacy_sources() {
-        use crate::data::config::image_source::{ImageSourceKind, ImageSourceSpec};
-        let global: BuiltinRuntimeConfig = serde_json::from_str(
-            r#"{
-                "imageSource":{"type":"docker-store","host":"unix:///tmp/docker.sock"},
-                "images":{"agent:latest":{"type":"apple-store"}},
-                "registries":{"registry.example":{"insecure":true}},
-                "builder":{"enabled":true}
-            }"#,
-        )
-        .unwrap();
-        let resolved = make_effective(
-            FlagConfig::default(),
-            EnvSnapshot::empty(),
-            RepoConfig::default(),
-            GlobalConfig {
-                builtin: Some(global),
-                ..Default::default()
-            },
-        )
-        .builtin_settings()
-        .unwrap();
-
-        assert!(resolved.builder_enabled);
-        assert!(resolved.registries.contains_key("registry.example"));
-        assert!(matches!(
-            resolved.image_source,
-            Some(ImageSourceSpec::DockerStore { .. })
-        ));
-        assert_eq!(
-            resolved.image_source.as_ref().unwrap().kind(),
-            ImageSourceKind::DockerStore
-        );
-        assert_eq!(
-            resolved.images.get("agent:latest").unwrap().kind(),
-            ImageSourceKind::AppleStore
-        );
-    }
-
-    #[test]
-    fn builtin_settings_preserve_session_state_dir_for_runtime_check() {
-        let repo = RepoConfig {
-            builtin: Some(BuiltinRuntimeConfig {
-                state_dir: Some("/repo/builtin-state".into()),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        let resolved = make_effective(
-            FlagConfig::default(),
-            EnvSnapshot::empty(),
-            repo,
-            GlobalConfig::default(),
-        )
-        .builtin_settings()
-        .unwrap();
-        assert_eq!(
-            resolved.launch.repo_state_dir,
-            Some("/repo/builtin-state".into())
-        );
-        assert_eq!(resolved.state_dir, resolved.launch.repo_state_dir.unwrap());
-    }
-
-    #[test]
-    fn builtin_builder_enabled_inherits_and_repo_can_disable_global() {
-        use crate::data::config::builtin_runtime::BuiltinBuilderConfig;
-        let global = GlobalConfig {
-            builtin: Some(BuiltinRuntimeConfig {
-                builder: Some(BuiltinBuilderConfig {
-                    enabled: Some(true),
-                }),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        let inherited = make_effective(
-            FlagConfig::default(),
-            EnvSnapshot::empty(),
-            RepoConfig::default(),
-            global.clone(),
-        );
-        assert!(inherited.builtin_builder_enabled());
-        let repo = RepoConfig {
-            builtin: Some(BuiltinRuntimeConfig {
-                builder: Some(BuiltinBuilderConfig {
-                    enabled: Some(false),
-                }),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        let disabled = make_effective(FlagConfig::default(), EnvSnapshot::empty(), repo, global);
-        assert!(!disabled.builtin_builder_enabled());
-        assert!(!EffectiveConfig::default().builtin_builder_enabled());
-    }
-
-    #[test]
-    fn builder_enablement_does_not_select_a_non_builtin_runtime() {
-        use crate::data::config::builtin_runtime::BuiltinBuilderConfig;
-        let global = GlobalConfig {
-            runtime: Some("docker".into()),
-            builtin: Some(BuiltinRuntimeConfig {
-                builder: Some(BuiltinBuilderConfig {
-                    enabled: Some(true),
-                }),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        let effective = make_effective(
-            FlagConfig::default(),
-            EnvSnapshot::empty(),
-            RepoConfig::default(),
-            global,
-        );
-        assert!(effective.builtin_builder_enabled());
-        assert_eq!(effective.runtime_selection(), Ok(RuntimeSelection::Docker));
-    }
-
-    #[test]
-    fn builtin_state_dir_precedence() {
-        let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path().to_str().unwrap().to_string();
-        let env = EnvSnapshot::with_overrides([(
-            crate::data::config::env::AWMAN_CONFIG_HOME,
-            home.as_str(),
-        )]);
-        let eff = make_effective(
-            FlagConfig::default(),
-            env.clone(),
-            RepoConfig::default(),
-            GlobalConfig::default(),
-        );
-        assert_eq!(
-            eff.builtin_state_dir().unwrap(),
-            tmp.path().join(DEFAULT_STATE_SUBDIR)
-        );
-
-        let global = GlobalConfig {
-            builtin: Some(BuiltinRuntimeConfig {
-                state_dir: Some("/cfg-state".into()),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        let eff = make_effective(
-            FlagConfig::default(),
-            env,
-            RepoConfig::default(),
-            global.clone(),
-        );
-        assert_eq!(
-            eff.builtin_state_dir().unwrap(),
-            PathBuf::from("/cfg-state")
-        );
-
-        let env = EnvSnapshot::with_overrides([
-            (crate::data::config::env::AWMAN_CONFIG_HOME, home.as_str()),
+        for (layer, entries) in [
+            (Layer::Global, layer_guidance(&self.layers.global)),
+            (Layer::Repo, layer_guidance(&self.layers.repo)),
             (
-                crate::data::config::env::AWMAN_BUILTIN_STATE_DIR,
-                "/env-state",
+                Layer::Task,
+                self.layers
+                    .task
+                    .as_ref()
+                    .map(layer_guidance)
+                    .unwrap_or_default(),
             ),
-        ]);
-        let eff = make_effective(FlagConfig::default(), env, RepoConfig::default(), global);
-        assert_eq!(
-            eff.builtin_state_dir().unwrap(),
-            PathBuf::from("/env-state")
-        );
-    }
-
-    fn builtin_layers(global: &str, repo: Option<&str>, env: EnvSnapshot) -> EffectiveConfig {
-        make_effective(
-            FlagConfig::default(),
-            env,
-            RepoConfig {
-                builtin: repo.map(|r| serde_json::from_str(r).unwrap()),
-                ..Default::default()
-            },
-            GlobalConfig {
-                builtin: Some(serde_json::from_str(global).unwrap()),
-                ..Default::default()
-            },
-        )
-    }
-
-    #[test]
-    fn builtin_runtime_view_has_no_network_in_either_layer_shape() {
-        let global_only = builtin_layers(
-            r#"{"network":{"mode":"none"},"vcpus":3}"#,
-            None,
-            EnvSnapshot::empty(),
-        );
-        assert_eq!(global_only.builtin_runtime().network, None);
-        assert_eq!(global_only.builtin_runtime().vcpus, Some(3));
-        let layered = builtin_layers(
-            r#"{"network":{"mode":"allowlist","allow":["*.example.com"]}}"#,
-            Some(r#"{"network":{"allow":["api.example.com"]}}"#),
-            EnvSnapshot::empty(),
-        );
-        assert_eq!(layered.builtin_runtime().network, None);
-        assert_eq!(layered.builtin_network().unwrap().allow.len(), 1);
-    }
-
-    /// `BuiltinRuntimeConfig::validate` no longer checks the network block:
-    /// `builtin_network` rejects a self-contradictory block in either layer,
-    /// naming the layer, which covers everything the merged-block check did.
-    #[test]
-    fn builtin_network_rejects_a_contradictory_block_in_either_layer() {
-        let contradictory = r#"{"network":{"mode":"none","hostPorts":[8765]}}"#;
-        let global = builtin_layers(contradictory, None, EnvSnapshot::empty());
-        let error = global.builtin_network().unwrap_err();
-        assert!(error.starts_with("global builtin.network: "), "{error}");
-        assert!(matches!(
-            global.builtin_launch_settings(),
-            Err(DataError::BuiltinConfig(_))
-        ));
-        let repo = builtin_layers("{}", Some(contradictory), EnvSnapshot::empty());
-        let error = repo.builtin_network().unwrap_err();
-        assert!(error.starts_with("repo builtin.network: "), "{error}");
-        // A repo block that only restates the global mode is not narrowing
-        // anything, but is consistent and accepted.
-        let shadowing = builtin_layers(
-            r#"{"network":{"mode":"none"}}"#,
-            Some(r#"{"network":{"mode":"none"}}"#),
-            EnvSnapshot::empty(),
-        );
-        assert!(shadowing.builtin_network().is_ok());
-    }
-
-    #[test]
-    fn builtin_launch_settings_default_without_any_builtin_block() {
-        assert_eq!(
-            EffectiveConfig::default()
-                .builtin_launch_settings()
-                .unwrap(),
-            BuiltinLaunchSettings::default()
-        );
-    }
-
-    #[test]
-    fn builtin_launch_settings_take_repo_resources_and_narrowed_network() {
-        let settings = builtin_layers(
-            r#"{"vcpus":4,"memoryMib":8192,"rootDiskMib":8192,"mountQuotaMib":1024,"network":{"hostPorts":[8765]}}"#,
-            Some(r#"{"vcpus":1,"mountQuotaMib":512,"network":{"mode":"allowlist","allow":["api.example.com"]}}"#),
-            EnvSnapshot::empty(),
-        )
-        .builtin_launch_settings()
-        .unwrap();
-        assert_eq!((settings.vcpus, settings.memory_mib), (1, 8192));
-        assert_eq!(
-            (settings.root_disk_mib, settings.mount_quota_mib),
-            (8192, 512)
-        );
-        assert_eq!(
-            settings.network.mode,
-            crate::data::config::NetworkMode::Allowlist
-        );
-        assert_eq!(settings.network.allow.len(), 1);
-        assert_eq!(settings.network.host_ports, vec![8765]);
-        assert_eq!(settings.repo_state_dir, None);
-    }
-
-    #[test]
-    fn builtin_launch_settings_reject_widening_and_bad_resources() {
-        for (global, repo) in [
-            (
-                r#"{"network":{"mode":"none"}}"#,
-                r#"{"network":{"mode":"public"}}"#,
-            ),
-            (r#"{}"#, r#"{"network":{"hostPorts":[8765]}}"#),
         ] {
-            match builtin_layers(global, Some(repo), EnvSnapshot::empty()).builtin_launch_settings()
-            {
-                Err(DataError::BuiltinConfig(message)) => {
-                    assert!(message.contains("builtin.network"), "{message}")
+            sources.extend(entries.into_iter().map(|e| (e.trim().to_string(), layer)));
+        }
+        let mut counts = GuidanceCounts::default();
+        let guidance: Vec<GuidanceEntry> = dynamic
+            .guidance
+            .unwrap_or_default()
+            .into_iter()
+            .map(|text| {
+                let source = sources
+                    .iter()
+                    .find(|(t, _)| *t == text.trim())
+                    .map_or(Layer::Set, |(_, l)| *l);
+                match source {
+                    Layer::Global => counts.global += 1,
+                    Layer::Repo => counts.repo += 1,
+                    Layer::Task => counts.task += 1,
+                    _ => counts.overrides += 1,
                 }
-                other => panic!("a widening repo block must fail closed: {other:?}"),
+                GuidanceEntry { text, source }
+            })
+            .collect();
+        Ok(ResolvedDynamicWorkflows {
+            default_leader,
+            agents_to_models,
+            guidance,
+            guidance_counts: counts,
+        })
+    }
+}
+
+fn resolve_under(git_root: &Path, raw: &str) -> PathBuf {
+    let p = Path::new(raw);
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        git_root.join(p)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The merge
+// ---------------------------------------------------------------------------
+
+/// The built-in defaults as one document: every row's default at its path;
+/// `*` rows contribute only an empty map at their map's path.
+pub fn default_document() -> Value {
+    let mut doc = Value::Object(Default::default());
+    for key in CONFIG_KEYS {
+        let segments: Vec<&str> = key.path.split('.').collect();
+        match segments.iter().position(|s| *s == "*") {
+            Some(star) => {
+                if get_path(&doc, &segments[..star]).is_none() {
+                    set_path(
+                        &mut doc,
+                        &segments[..star],
+                        Value::Object(Default::default()),
+                    );
+                }
+            }
+            None => set_path(&mut doc, &segments, key.default_value()),
+        }
+    }
+    doc
+}
+
+fn get_path<'a>(doc: &'a Value, segments: &[&str]) -> Option<&'a Value> {
+    segments.iter().try_fold(doc, |v, s| v.get(*s))
+}
+
+fn set_path(doc: &mut Value, segments: &[&str], value: Value) {
+    let mut current = doc;
+    for (i, segment) in segments.iter().enumerate() {
+        if !current.is_object() {
+            *current = Value::Object(Default::default());
+        }
+        let object = current.as_object_mut().expect("just made an object");
+        if i + 1 == segments.len() {
+            object.insert((*segment).to_string(), value);
+            return;
+        }
+        current = object
+            .entry((*segment).to_string())
+            .or_insert_with(|| Value::Object(Default::default()));
+    }
+}
+
+fn row_for(pattern: &str) -> Option<&'static ConfigKey> {
+    CONFIG_KEYS.iter().find(|k| k.path == pattern)
+}
+
+fn is_map_level(pattern: &str) -> bool {
+    let star = if pattern.is_empty() {
+        "*".to_string()
+    } else {
+        format!("{pattern}.*")
+    };
+    CONFIG_KEYS
+        .iter()
+        .any(|k| k.path == star || k.path.starts_with(&format!("{star}.")))
+}
+
+fn child(prefix: &str, segment: &str) -> String {
+    if prefix.is_empty() {
+        segment.to_string()
+    } else {
+        format!("{prefix}.{segment}")
+    }
+}
+
+/// Merge every layer over the defaults; returns the document and, per
+/// concrete path, the layer that set it.
+fn merge(layers: &ConfigLayers) -> Result<(Value, BTreeMap<String, Layer>), DataError> {
+    let mut doc = default_document();
+    let mut provenance = BTreeMap::new();
+    let files = [
+        (Layer::Global, Some(&layers.global)),
+        (Layer::Repo, Some(&layers.repo)),
+        (Layer::Task, layers.task.as_ref()),
+    ];
+    for (layer, file) in files {
+        if let Some(file) = file {
+            merge_file(&mut doc, &file.to_value(), "", "", layer, &mut provenance);
+        }
+    }
+    for (layer, overrides) in [(Layer::Env, &layers.env), (Layer::Set, &layers.set)] {
+        for (path, value) in overrides.iter() {
+            apply_override(&mut doc, path, value.clone(), layer, &mut provenance)?;
+        }
+    }
+    fill_map_defaults(&mut doc, &mut provenance);
+    let guidance = get_path(&doc, &["workflows", "dynamic", "guidance"])
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    if guidance > GUIDANCE_MAX_ENTRIES {
+        return Err(DataError::Other(format!(
+            "workflows.dynamic.guidance has {guidance} entries across the global, repo and task \
+             config files and overrides; the limit is {GUIDANCE_MAX_ENTRIES}"
+        )));
+    }
+    Ok((doc, provenance))
+}
+
+/// Give every existing named-map entry the table defaults of its leaves
+/// (`workServers.prod.enabled` → `true`), reported with default provenance.
+/// A wildcard row never invents an entry; it only completes existing ones.
+fn fill_map_defaults(doc: &mut Value, provenance: &mut BTreeMap<String, Layer>) {
+    for key in CONFIG_KEYS {
+        let Some((map_path, leaf)) = key.path.split_once(".*.") else {
+            continue;
+        };
+        let default = key.default_value();
+        if leaf.contains('*') || map_path.contains('*') || default.is_null() {
+            continue;
+        }
+        let map_segments: Vec<&str> = map_path.split('.').collect();
+        let leaf_segments: Vec<&str> = leaf.split('.').collect();
+        let Some(names) = get_path(doc, &map_segments)
+            .and_then(Value::as_object)
+            .map(|m| m.keys().cloned().collect::<Vec<_>>())
+        else {
+            continue;
+        };
+        for name in names {
+            let mut full: Vec<&str> = map_segments.clone();
+            full.push(&name);
+            full.extend(&leaf_segments);
+            if get_path(doc, &full).is_some_and(|v| !v.is_null()) {
+                continue;
+            }
+            if get_path(doc, &full[..map_segments.len() + 1]).is_some_and(Value::is_object) {
+                set_path(doc, &full, default.clone());
+                provenance.insert(full.join("."), Layer::Default);
             }
         }
-        for repo in [
-            r#"{"vcpus":0}"#,
-            r#"{"memoryMib":64}"#,
-            r#"{"rootDiskMib":64}"#,
-            r#"{"mountQuotaMib":0}"#,
-        ] {
-            assert!(matches!(
-                builtin_layers("{}", Some(repo), EnvSnapshot::empty()).builtin_launch_settings(),
-                Err(DataError::BuiltinConfig(_))
-            ));
+    }
+}
+
+fn merge_file(
+    target: &mut Value,
+    incoming: &Value,
+    concrete: &str,
+    pattern: &str,
+    layer: Layer,
+    provenance: &mut BTreeMap<String, Layer>,
+) {
+    let Some(object) = incoming.as_object() else {
+        return;
+    };
+    for (name, value) in object {
+        if value.is_null() {
+            // `null` in a file means "not set here".
+            continue;
+        }
+        let path = child(concrete, name);
+        let child_pattern = child(pattern, name);
+        if let Some(key) = row_for(&child_pattern) {
+            set_leaf(target, &path, key, value.clone(), layer, provenance);
+        } else if is_map_level(&child_pattern) {
+            // A map keyed by user-chosen names replaces as a whole.
+            let segments: Vec<&str> = path.split('.').collect();
+            set_path(target, &segments, value.clone());
+            let prefix = format!("{path}.");
+            provenance.retain(|p, _| !p.starts_with(&prefix));
+            provenance.insert(path.clone(), layer);
+        } else {
+            merge_file(target, value, &path, &child_pattern, layer, provenance);
         }
     }
+}
 
-    #[test]
-    fn builtin_launch_settings_name_a_repo_state_dir_only_when_the_repo_sets_one() {
-        let global_only = builtin_layers(r#"{"stateDir":"/g"}"#, None, EnvSnapshot::empty());
-        assert_eq!(
-            global_only
-                .builtin_launch_settings()
-                .unwrap()
-                .repo_state_dir,
-            None
-        );
-        let repo = builtin_layers(
-            r#"{"stateDir":"/g"}"#,
-            Some(r#"{"stateDir":"/r"}"#),
-            EnvSnapshot::empty(),
-        );
-        assert_eq!(
-            repo.builtin_launch_settings().unwrap().repo_state_dir,
-            Some(PathBuf::from("/r"))
-        );
-        // The environment variable outranks every config layer, so the repo
-        // value resolves to the same directory the process uses.
-        let env = EnvSnapshot::with_overrides([(
-            crate::data::config::env::AWMAN_BUILTIN_STATE_DIR,
-            "/env-state",
-        )]);
-        let overridden = builtin_layers("{}", Some(r#"{"stateDir":"/r"}"#), env);
-        assert_eq!(
-            overridden.builtin_launch_settings().unwrap().repo_state_dir,
-            Some(PathBuf::from("/env-state"))
-        );
+/// Set one leaf (by concrete path) with the leaf rule: replace, or
+/// concatenate and de-duplicate for additive rows.
+fn set_leaf(
+    target: &mut Value,
+    path: &str,
+    key: &ConfigKey,
+    value: Value,
+    layer: Layer,
+    provenance: &mut BTreeMap<String, Layer>,
+) {
+    let segments: Vec<&str> = path.split('.').collect();
+    if value.is_null() {
+        set_path(target, &segments, key.default_value());
+        provenance.remove(path);
+        return;
     }
+    let value = if key.merge == Merge::Concat {
+        let mut items: Vec<Value> = get_path(target, &segments)
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        items.extend(value.as_array().cloned().unwrap_or_default());
+        let mut seen = HashSet::new();
+        items.retain(|v| seen.insert(v.as_str().map(str::trim).unwrap_or_default().to_string()));
+        Value::Array(items)
+    } else {
+        value
+    };
+    set_path(target, &segments, value);
+    provenance.insert(path.to_string(), layer);
+}
 
-    #[test]
-    fn runtime_selection_is_global_only_and_defaults_to_docker() {
-        assert_eq!(
-            EffectiveConfig::default().runtime_selection(),
-            Ok(RuntimeSelection::Docker)
-        );
+fn apply_override(
+    target: &mut Value,
+    path: &str,
+    value: Value,
+    layer: Layer,
+    provenance: &mut BTreeMap<String, Layer>,
+) -> Result<(), DataError> {
+    let resolved = fields::resolve(path).map_err(|e| DataError::Other(e.to_string()))?;
+    fields::validate_value(resolved.key, &value).map_err(|e| DataError::Other(e.to_string()))?;
+    set_leaf(target, path, resolved.key, value, layer, provenance);
+    Ok(())
+}
+
+fn mask_sensitive(value: &mut Value, concrete: &str, pattern: &str) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    let map_level = is_map_level(pattern);
+    for (name, child_value) in object.iter_mut() {
+        let path = child(concrete, name);
+        let child_pattern = if map_level {
+            child(pattern, "*")
+        } else {
+            child(pattern, name)
+        };
+        if let Some(key) = row_for(&child_pattern) {
+            if key.sensitive {
+                if let Some(s) = child_value.as_str() {
+                    *child_value = Value::String(mask(s));
+                }
+            }
+        } else {
+            mask_sensitive(child_value, &path, &child_pattern);
+        }
     }
+}
+
+/// `••••` plus the last four characters (all bullets for short values).
+pub fn mask(secret: &str) -> String {
+    let chars: Vec<char> = secret.chars().collect();
+    if chars.len() <= 8 {
+        return "••••".into();
+    }
+    let tail: String = chars[chars.len() - 4..].iter().collect();
+    format!("••••{tail}")
 }
 
 #[cfg(test)]
-mod squad_prerequisite_review_tests {
-    use super::*;
-    use crate::data::config::repo::DynamicWorkflowsConfig;
-    use std::collections::HashMap;
-
-    fn make_effective(
-        flags: FlagConfig,
-        env: EnvSnapshot,
-        repo: RepoConfig,
-        global: GlobalConfig,
-    ) -> EffectiveConfig {
-        EffectiveConfig::new(flags, env, repo, global)
-    }
-    #[test]
-    fn squad_defaults_apply_without_a_stored_task_policy_and_only_to_squad_runs() {
-        let global: GlobalConfig = serde_json::from_value(serde_json::json!({"squad":{"workflows":{"prerequisites":{"ssh":{"use":"deny"},"unresolved":"warn"}}}})).unwrap();
-        for squad in [true, false] {
-            let config = EffectiveConfig::new(
-                FlagConfig {
-                    squad_prerequisites: squad,
-                    ..Default::default()
-                },
-                EnvSnapshot::default(),
-                RepoConfig::default(),
-                global.clone(),
-            );
-            let policy = config.prerequisite_policy(Default::default());
-            assert_eq!(
-                policy.ssh.use_ == crate::data::config::workflows::CredentialUse::Deny,
-                squad
-            );
-        }
-    }
-
-    fn dynamic(
-        leader: Option<&str>,
-        max: Option<usize>,
-        agents: Option<HashMap<String, Vec<String>>>,
-        guidance: Option<Vec<&str>>,
-    ) -> DynamicWorkflowsConfig {
-        DynamicWorkflowsConfig {
-            default_leader: leader.map(str::to_owned),
-            max_concurrent_steps: max,
-            agents_to_models: agents,
-            guidance: guidance.map(|v| v.into_iter().map(str::to_owned).collect()),
-        }
-    }
-
-    fn dynamic_effective(
-        flags: FlagConfig,
-        repo: Option<DynamicWorkflowsConfig>,
-        global: Option<DynamicWorkflowsConfig>,
-    ) -> EffectiveConfig {
-        make_effective(
-            flags,
-            EnvSnapshot::empty(),
-            RepoConfig {
-                workflows: repo.map(|dynamic| crate::data::config::workflows::WorkflowsConfig {
-                    dynamic: Some(dynamic),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            },
-            GlobalConfig {
-                workflows: global.map(|dynamic| crate::data::config::workflows::WorkflowsConfig {
-                    dynamic: Some(dynamic),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            },
-        )
-    }
-
-    #[test]
-    fn dynamic_default_leader_precedence_is_flag_repo_global() {
-        let global = dynamic(Some("g::m"), None, None, None);
-        let repo = dynamic(Some("r::m"), None, None, None);
-        let result = dynamic_effective(
-            FlagConfig {
-                leader: Some("f::m".into()),
-                ..Default::default()
-            },
-            Some(repo.clone()),
-            Some(global.clone()),
-        )
-        .dynamic_workflows()
-        .unwrap();
-        assert_eq!(
-            result.default_leader.unwrap().source,
-            DynamicWorkflowsSource::Flag
-        );
-        let result = dynamic_effective(FlagConfig::default(), Some(repo), Some(global))
-            .dynamic_workflows()
-            .unwrap();
-        assert_eq!(
-            result.default_leader.unwrap().source,
-            DynamicWorkflowsSource::Repo
-        );
-        let result = dynamic_effective(
-            FlagConfig::default(),
-            None,
-            Some(dynamic(Some("g::m"), None, None, None)),
-        )
-        .dynamic_workflows()
-        .unwrap();
-        assert_eq!(
-            result.default_leader.unwrap().source,
-            DynamicWorkflowsSource::Global
-        );
-    }
-
-    #[test]
-    fn dynamic_max_concurrent_steps_falls_through_to_global() {
-        let result = dynamic_effective(
-            FlagConfig::default(),
-            Some(dynamic(None, None, None, None)),
-            Some(dynamic(None, Some(7), None, None)),
-        )
-        .dynamic_workflows()
-        .unwrap();
-        assert_eq!(result.max_concurrent_steps.unwrap().value, 7);
-        let result = dynamic_effective(
-            FlagConfig::default(),
-            Some(dynamic(None, Some(3), None, None)),
-            Some(dynamic(None, Some(7), None, None)),
-        )
-        .dynamic_workflows()
-        .unwrap();
-        assert_eq!(result.max_concurrent_steps.unwrap().value, 3);
-    }
-
-    #[test]
-    fn dynamic_repo_agent_map_replaces_global_but_empty_repo_map_falls_through() {
-        let global = HashMap::from([
-            ("global-only".into(), vec!["m".into()]),
-            ("shared".into(), vec!["g".into()]),
-        ]);
-        let repo = HashMap::from([("shared".into(), vec!["r".into()])]);
-        let result = dynamic_effective(
-            FlagConfig::default(),
-            Some(dynamic(None, None, Some(repo), None)),
-            Some(dynamic(None, None, Some(global.clone()), None)),
-        )
-        .dynamic_workflows()
-        .unwrap();
-        let map = &result.agents_to_models.unwrap().value;
-        assert!(!map.contains_key("global-only"));
-        assert_eq!(map["shared"], vec!["r"]);
-        let result = dynamic_effective(
-            FlagConfig::default(),
-            Some(dynamic(None, None, Some(HashMap::new()), None)),
-            Some(dynamic(None, None, Some(global), None)),
-        )
-        .dynamic_workflows()
-        .unwrap();
-        assert_eq!(
-            result.agents_to_models.unwrap().source,
-            DynamicWorkflowsSource::Global
-        );
-    }
-
-    #[test]
-    fn dynamic_guidance_concatenates_deduplicates_attributes_and_enforces_combined_cap() {
-        let result = dynamic_effective(
-            FlagConfig::default(),
-            Some(dynamic(None, None, None, Some(vec![" repo ", "same"]))),
-            Some(dynamic(None, None, None, Some(vec!["global", "same"]))),
-        )
-        .dynamic_workflows()
-        .unwrap();
-        assert_eq!(
-            result
-                .guidance
-                .iter()
-                .map(|e| e.text.as_str())
-                .collect::<Vec<_>>(),
-            vec!["global", "same", " repo "]
-        );
-        assert_eq!(result.guidance[0].source, DynamicWorkflowsSource::Global);
-        assert_eq!(result.guidance[2].source, DynamicWorkflowsSource::Repo);
-        let result = dynamic_effective(
-            FlagConfig::default(),
-            Some(DynamicWorkflowsConfig {
-                guidance: Some((0..26).map(|i| format!("repo-{i}")).collect()),
-                ..Default::default()
-            }),
-            Some(DynamicWorkflowsConfig {
-                guidance: Some((0..25).map(|i| format!("global-{i}")).collect()),
-                ..Default::default()
-            }),
-        )
-        .dynamic_workflows()
-        .unwrap_err()
-        .to_string();
-        assert!(result.contains("25 global + 26 repo entries"), "{result}");
-        assert!(
-            result.contains("limit of 50")
-                && result.contains("~/.awman/config.json")
-                && result.contains(" .awman/config.json"),
-            "the error must suggest trimming either scope: {result}"
-        );
-    }
-
-    #[test]
-    fn dynamic_sources_attribute_every_field_including_legacy_repo() {
-        let mut repo: RepoConfig = serde_json::from_value(serde_json::json!({"dynamicWorkflows":{"defaultLeader":"r::m","maxConcurrentSteps":2,"agentsToModels":{"r":["m"]},"guidance":["r"]}})).unwrap();
-        let global: GlobalConfig = serde_json::from_value(serde_json::json!({"workflows":{"dynamic":{"defaultLeader":"g::m","maxConcurrentSteps":3,"agentsToModels":{"g":["m"]},"guidance":["g"]}}})).unwrap();
-        let result = make_effective(
-            FlagConfig::default(),
-            EnvSnapshot::empty(),
-            repo.clone(),
-            global,
-        )
-        .dynamic_workflows()
-        .unwrap();
-        assert_eq!(
-            result.default_leader.unwrap().source,
-            DynamicWorkflowsSource::LegacyRepo
-        );
-        assert_eq!(
-            result.max_concurrent_steps.unwrap().source,
-            DynamicWorkflowsSource::LegacyRepo
-        );
-        assert_eq!(
-            result.agents_to_models.unwrap().source,
-            DynamicWorkflowsSource::LegacyRepo
-        );
-        assert_eq!(
-            result.guidance.iter().map(|e| e.source).collect::<Vec<_>>(),
-            vec![
-                DynamicWorkflowsSource::Global,
-                DynamicWorkflowsSource::LegacyRepo
-            ]
-        );
-        repo.adopt_legacy_dynamic_workflows();
-        let result = make_effective(
-            FlagConfig::default(),
-            EnvSnapshot::empty(),
-            repo,
-            GlobalConfig::default(),
-        )
-        .dynamic_workflows()
-        .unwrap();
-        assert_eq!(
-            result.default_leader.unwrap().source,
-            DynamicWorkflowsSource::Repo
-        );
-        let result = dynamic_effective(
-            FlagConfig {
-                leader: Some("f::m".into()),
-                ..Default::default()
-            },
-            None,
-            None,
-        )
-        .dynamic_workflows()
-        .unwrap();
-        assert_eq!(
-            result.default_leader.unwrap().source,
-            DynamicWorkflowsSource::Flag
-        );
-
-        let global = dynamic(
-            Some("g::m"),
-            Some(8),
-            Some(HashMap::from([("global".into(), vec!["model".into()])])),
-            Some(vec!["global guidance"]),
-        );
-        let result = dynamic_effective(FlagConfig::default(), None, Some(global))
-            .dynamic_workflows()
-            .unwrap();
-        assert_eq!(
-            result.default_leader.unwrap().source,
-            DynamicWorkflowsSource::Global
-        );
-        assert_eq!(
-            result.max_concurrent_steps.unwrap().source,
-            DynamicWorkflowsSource::Global
-        );
-        assert_eq!(
-            result.agents_to_models.unwrap().source,
-            DynamicWorkflowsSource::Global
-        );
-        assert_eq!(result.guidance[0].source, DynamicWorkflowsSource::Global);
-
-        let repo = dynamic(
-            Some("r::m"),
-            Some(4),
-            Some(HashMap::from([("repo".into(), vec!["model".into()])])),
-            Some(vec!["repo guidance"]),
-        );
-        let result = dynamic_effective(FlagConfig::default(), Some(repo), None)
-            .dynamic_workflows()
-            .unwrap();
-        assert_eq!(
-            result.default_leader.unwrap().source,
-            DynamicWorkflowsSource::Repo
-        );
-        assert_eq!(
-            result.max_concurrent_steps.unwrap().source,
-            DynamicWorkflowsSource::Repo
-        );
-        assert_eq!(
-            result.agents_to_models.unwrap().source,
-            DynamicWorkflowsSource::Repo
-        );
-        assert_eq!(result.guidance[0].source, DynamicWorkflowsSource::Repo);
-    }
-}
+mod tests;

@@ -594,7 +594,7 @@ impl WorkflowFrontend for CliParallelFrontend {
                 level: MessageLevel::Warning,
                 text: format!(
                     "{} agents are launching in parallel, but output merging is not \
-                     supported in non-interactive mode; step output will interleave \
+                     supported in headless mode; step output will interleave \
                      without chrome",
                     step_names.len()
                 ),

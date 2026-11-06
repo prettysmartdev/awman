@@ -120,16 +120,20 @@ pub struct AgentSettings {
     pub overlays: Vec<OverlaySpec>,
 }
 
-/// Owns one launch's system-prompt temp file. Clones share the file and the
+/// Owns one launch's temporary mounted file or directory. Clones share it and the
 /// last one normally deletes it. The file follows this launch's options,
 /// instance and execution; an observer lost before confirmed termination can
 /// preserve the path while still releasing the descriptor.
 #[derive(Debug, Clone)]
-pub struct PromptFileGuard(Arc<PromptFile>);
+pub struct MountGuard(Arc<PromptFile>);
+
+/// Historical name retained for the system-prompt mount paths.
+pub type PromptFileGuard = MountGuard;
 
 #[derive(Debug)]
 struct PromptFile {
-    file: tempfile::NamedTempFile,
+    file: Option<tempfile::NamedTempFile>,
+    dir: Option<tempfile::TempDir>,
     preserve: std::sync::atomic::AtomicBool,
 }
 
@@ -138,21 +142,40 @@ impl Drop for PromptFile {
         // If the last observer disappears before guest termination is known,
         // leave the path readable but close the descriptor normally.
         if self.preserve.load(std::sync::atomic::Ordering::Acquire) {
-            self.file.disable_cleanup(true);
+            if let Some(file) = &mut self.file {
+                file.disable_cleanup(true);
+            }
+            if let Some(dir) = self.dir.take() {
+                std::mem::forget(dir);
+            }
         }
     }
 }
 
-impl PromptFileGuard {
+impl MountGuard {
     pub fn new(file: tempfile::NamedTempFile) -> Self {
         Self(Arc::new(PromptFile {
-            file,
+            file: Some(file),
+            dir: None,
+            preserve: std::sync::atomic::AtomicBool::new(false),
+        }))
+    }
+
+    pub fn new_dir(dir: tempfile::TempDir) -> Self {
+        Self(Arc::new(PromptFile {
+            file: None,
+            dir: Some(dir),
             preserve: std::sync::atomic::AtomicBool::new(false),
         }))
     }
 
     pub fn host_path(&self) -> &Path {
-        self.0.file.path()
+        self.0
+            .file
+            .as_ref()
+            .map(|f| f.path())
+            .or_else(|| self.0.dir.as_ref().map(|d| d.path()))
+            .expect("prompt guard has a file or directory")
     }
 
     pub(super) fn preserve_for_unconfirmed_guest(&self) {
@@ -162,7 +185,7 @@ impl PromptFileGuard {
     }
 }
 
-impl PartialEq for PromptFileGuard {
+impl PartialEq for MountGuard {
     fn eq(&self, other: &Self) -> bool {
         self.host_path() == other.host_path()
     }
@@ -175,6 +198,13 @@ pub enum ContainerOption {
     Image(ImageRef),
     Entrypoint(Entrypoint),
     Overlay(OverlaySpec),
+    /// A private host directory mounted read-write for this execution. The
+    /// guard follows the same confirmed-guest-exit lifecycle as prompt mounts.
+    TemporaryDirectoryMount {
+        container_path: PathBuf,
+        env_var: Option<String>,
+        guard: MountGuard,
+    },
     EnvPassthrough(EnvVar),
     /// Per-launch value, kept out of argv and redacted in Debug.
     EnvOverride {
@@ -183,6 +213,7 @@ pub enum ContainerOption {
     },
     EnvLiteral(EnvLiteral),
     SeededPrompt(String),
+    HeadlessPromptInArgv(bool),
     /// Flag used to deliver the seeded prompt in *interactive* mode (e.g.
     /// opencode `--prompt <text>`). Absent means the prompt is appended as a
     /// trailing positional argv arg, which is what most agents expect. Emitted
@@ -190,7 +221,7 @@ pub enum ContainerOption {
     /// `interactive_seed_delivery` is `Flag`.
     InteractiveSeedFlag(String),
     Interactive(bool),
-    /// Structured stdout protocol for a non-interactive stdio launch.
+    /// Structured stdout protocol for a headless stdio launch.
     AgentOutputFormat(AgentOutputFormat),
     /// Launch the agent over ACP (Agent Client Protocol) instead of raw
     /// container stdio. Selects the persistent-piped spawn path (`-i`, no PTY)
@@ -242,6 +273,9 @@ pub enum ContainerOption {
     /// appended after every awman-generated agent flag and before the seeded
     /// prompt.
     AgentFlags(Vec<String>),
+    /// Per-launch agent flags derived from awman-owned mounts. These follow
+    /// user flags so a user config cannot redirect private session storage.
+    ManagedAgentFlags(Vec<String>),
     /// The flag name to use when emitting disallowed tools (e.g. `--disallowedTools`).
     DisallowedToolsFlag(String),
     /// The flag name to use when emitting allowed tools (e.g. `--allowedTools`).
@@ -480,6 +514,7 @@ pub struct ResolvedContainerOptions {
     pub env_overrides: Vec<(String, crate::engine::auth::credential::SecretString)>,
     pub env_literal: Vec<EnvLiteral>,
     pub seeded_prompt: Option<String>,
+    pub headless_prompt_in_argv: bool,
     /// Flag used to deliver `seeded_prompt` in interactive mode. When `None`,
     /// the prompt is appended as a trailing positional argv arg. When `Some`,
     /// it is delivered as `<flag> <text>` (e.g. opencode `--prompt <text>`,
@@ -525,14 +560,15 @@ pub struct ResolvedContainerOptions {
     pub agent_mode_flags: Vec<String>,
     /// From `ContainerOption::AgentFlags`.
     pub agent_flags: Vec<String>,
+    pub managed_agent_flags: Vec<String>,
     pub disallowed_tools_flag: Option<String>,
     pub allowed_tools_flag: Option<String>,
     pub remove_on_exit: bool,
     pub system_prompt_file: Option<(PathBuf, PathBuf, String)>,
     pub system_prompt_env_file: Option<(String, PathBuf, PathBuf)>,
     pub system_prompt_inline: Option<(String, String)>,
-    /// Keeps the files behind `system_prompt_file` / `system_prompt_env_file`
-    /// on disk. Each backend moves these into its execution at spawn.
+    /// Keeps temporary mounts (prompt files and private directories) on disk.
+    /// Each backend moves these into its execution at spawn.
     pub prompt_files: Vec<PromptFileGuard>,
     pub agent_add_dirs: Vec<(String, PathBuf)>,
     /// From `ContainerOption::StartupGrace`; `None` uses the frontend's.
@@ -598,10 +634,29 @@ impl ResolvedContainerOptions {
             ContainerOption::Image(v) => self.image = Some(v),
             ContainerOption::Entrypoint(v) => self.entrypoint = Some(v),
             ContainerOption::Overlay(v) => self.overlays.push(v),
+            ContainerOption::TemporaryDirectoryMount {
+                container_path,
+                env_var,
+                guard,
+            } => {
+                self.overlays.push(OverlaySpec {
+                    host_path: guard.host_path().to_path_buf(),
+                    container_path: container_path.clone(),
+                    permission: OverlayPermission::ReadWrite,
+                });
+                if let Some(key) = env_var {
+                    self.env_literal.push(EnvLiteral {
+                        key,
+                        value: container_path.to_string_lossy().into_owned(),
+                    });
+                }
+                self.prompt_files.push(guard);
+            }
             ContainerOption::EnvPassthrough(v) => self.env_passthrough.push(v),
             ContainerOption::EnvOverride { key, value } => self.env_overrides.push((key, value)),
             ContainerOption::EnvLiteral(v) => self.env_literal.push(v),
             ContainerOption::SeededPrompt(v) => self.seeded_prompt = Some(v),
+            ContainerOption::HeadlessPromptInArgv(v) => self.headless_prompt_in_argv = v,
             ContainerOption::InteractiveSeedFlag(v) => self.interactive_seed_flag = Some(v),
             ContainerOption::Interactive(v) => self.interactive = v,
             ContainerOption::AgentOutputFormat(v) => self.agent_output_format = v,
@@ -631,6 +686,7 @@ impl ResolvedContainerOptions {
             ContainerOption::Label { key, value } => self.labels.push((key, value)),
             ContainerOption::AgentModeFlags(v) => self.agent_mode_flags.extend(v),
             ContainerOption::AgentFlags(v) => self.agent_flags.extend(v),
+            ContainerOption::ManagedAgentFlags(v) => self.managed_agent_flags.extend(v),
             ContainerOption::DisallowedToolsFlag(v) => self.disallowed_tools_flag = Some(v),
             ContainerOption::AllowedToolsFlag(v) => self.allowed_tools_flag = Some(v),
             ContainerOption::KeepContainer => self.remove_on_exit = false,
@@ -835,6 +891,40 @@ mod tests {
         assert!(file_path.exists() && env_path.exists());
         drop(clone);
         assert!(!file_path.exists() && !env_path.exists());
+    }
+
+    #[test]
+    fn temporary_directory_mount_is_private_and_lives_with_resolved_options() {
+        let first = MountGuard::new_dir(tempfile::tempdir().unwrap());
+        let second = MountGuard::new_dir(tempfile::tempdir().unwrap());
+        let first_host = first.host_path().to_path_buf();
+        let second_host = second.host_path().to_path_buf();
+        assert_ne!(first_host, second_host);
+        let destination = PathBuf::from("/home/agent/.private-db");
+        let first = ResolvedContainerOptions::resolve([ContainerOption::TemporaryDirectoryMount {
+            container_path: destination.clone(),
+            env_var: Some("AGENT_DB_HOME".into()),
+            guard: first,
+        }])
+        .unwrap();
+        let second =
+            ResolvedContainerOptions::resolve([ContainerOption::TemporaryDirectoryMount {
+                container_path: destination.clone(),
+                env_var: Some("AGENT_DB_HOME".into()),
+                guard: second,
+            }])
+            .unwrap();
+        assert_eq!(first.overlays[0].host_path, first_host);
+        assert_eq!(second.overlays[0].host_path, second_host);
+        assert_eq!(first.overlays[0].container_path, destination);
+        assert_eq!(first.overlays[0].permission, OverlayPermission::ReadWrite);
+        assert_eq!(first.env_literal[0].key, "AGENT_DB_HOME");
+        assert_eq!(first.env_literal[0].value, "/home/agent/.private-db");
+        drop(first);
+        assert!(!first_host.exists());
+        assert!(second_host.exists());
+        drop(second);
+        assert!(!second_host.exists());
     }
 
     #[test]

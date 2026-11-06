@@ -116,7 +116,7 @@ fn fake_task(name: &str) -> Task {
     let now = chrono::Utc::now();
     Task {
         prerequisites: None,
-        id: name.to_string(),
+        id: awman::data::ids::TaskId::new(),
         name: name.to_string(),
         description: "a test task".into(),
         repo_scope: std::path::PathBuf::from("/tmp"),

@@ -4,7 +4,7 @@
 use super::*;
 use crate::data::session::AgentName;
 
-/// Set `AWMAN_CONFIG_HOME` to `home`, run `f`, then restore the previous value.
+/// Set `AWMAN_HOME` to `home`, run `f`, then restore the previous value.
 ///
 /// The lock and the restore both belong to `ConfigHomeGuard`: a mutex private
 /// to this file would serialise these tests against each other only, and the
@@ -219,8 +219,8 @@ fn skill_overlays_returns_single_ro_spec_for_claude() {
         specs[0]
             .container_path
             .to_string_lossy()
-            .contains("/.claude/commands"),
-        "claude container path must contain /.claude/commands; got {:?}",
+            .contains("/.claude/skills"),
+        "claude container path must contain /.claude/skills; got {:?}",
         specs[0].container_path
     );
 }
@@ -269,8 +269,8 @@ fn skill_overlays_returns_single_ro_spec_for_gemini() {
         specs[0]
             .container_path
             .to_string_lossy()
-            .contains("/.gemini/commands"),
-        "gemini container path must contain /.gemini/commands; got {:?}",
+            .contains("/.gemini/skills"),
+        "gemini container path must contain /.gemini/skills; got {:?}",
         specs[0].container_path
     );
 }
@@ -319,8 +319,8 @@ fn skill_overlays_returns_single_ro_spec_for_opencode() {
         specs[0]
             .container_path
             .to_string_lossy()
-            .contains("/.config/opencode/commands"),
-        "opencode container path must contain /.config/opencode/commands; got {:?}",
+            .contains("/.config/opencode/skills"),
+        "opencode container path must contain /.config/opencode/skills; got {:?}",
         specs[0].container_path
     );
 }
@@ -344,8 +344,8 @@ fn skill_overlays_returns_single_ro_spec_for_copilot() {
         specs[0]
             .container_path
             .to_string_lossy()
-            .contains("/.copilot/instructions"),
-        "copilot container path must contain /.copilot/instructions; got {:?}",
+            .contains("/.copilot/skills"),
+        "copilot container path must contain /.copilot/skills; got {:?}",
         specs[0].container_path
     );
 }

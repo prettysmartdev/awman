@@ -273,7 +273,7 @@ fn fake_task(name: &str) -> crate::data::fs::task_store::Task {
     let now = chrono::Utc::now();
     crate::data::fs::task_store::Task {
         prerequisites: None,
-        id: name.to_string(),
+        id: crate::frontend::test_ids::task_id(name),
         name: name.to_string(),
         description: "a test task".into(),
         repo_scope: std::path::PathBuf::from("/tmp"),
@@ -1162,8 +1162,8 @@ fn the_squad_detail_modal_shows_no_run_history_and_gives_a_long_description_the_
 fn the_squad_history_modal_renders_the_run_table_and_its_esc_wording() {
     use crate::data::fs::task_store::{Run, RunStatus};
     let run = Run {
-        id: "run-1".into(),
-        task_id: "issue-triage".into(),
+        id: crate::frontend::test_ids::run_id("run-1"),
+        task_id: crate::frontend::test_ids::task_id("issue-triage"),
         status: RunStatus::Failed,
         workflow_path: None,
         workflow_state_path: None,
@@ -1226,8 +1226,8 @@ fn the_squad_history_modal_clips_a_long_reason_and_keeps_every_column() {
     let reason =
         "no new issues were opened against the repository since the previous evaluation ran";
     let run = Run {
-        id: "run-1".into(),
-        task_id: "issue-triage".into(),
+        id: crate::frontend::test_ids::run_id("run-1"),
+        task_id: crate::frontend::test_ids::task_id("issue-triage"),
         status: RunStatus::NotTriggered,
         workflow_path: None,
         workflow_state_path: None,
@@ -1287,8 +1287,8 @@ fn the_squad_run_detail_modal_shows_the_full_reason_and_error() {
         .collect::<Vec<_>>()
         .join("\n");
     let run = Run {
-        id: "run-7".into(),
-        task_id: "issue-triage".into(),
+        id: crate::frontend::test_ids::run_id("run-7"),
+        task_id: crate::frontend::test_ids::task_id("issue-triage"),
         status: RunStatus::Failed,
         workflow_path: None,
         workflow_state_path: None,
@@ -1317,7 +1317,10 @@ fn the_squad_run_detail_modal_shows_the_full_reason_and_error() {
 
     let text = buffer_text(&render_app(&mut app, 120, 30));
     assert!(
-        text.contains("run run-7"),
+        text.contains(&format!(
+            "run {}",
+            crate::frontend::test_ids::run_id("run-7")
+        )),
         "the detail titles itself with the run: {text}"
     );
     assert!(
@@ -1657,33 +1660,6 @@ fn a_failed_squad_action_is_reported_in_the_hint_bar_not_above_the_card_grid() {
     assert!(
         !text.contains("Exit code"),
         "a squad tab has no execution window, so its exit-code hint is noise: {text}"
-    );
-}
-
-/// The missing-key recovery has to explain three things a 401 does not: that
-/// the key is unrecoverable, what accepting will do, and what it costs.
-#[test]
-fn the_missing_key_dialog_explains_the_recovery_and_its_key_bindings() {
-    let mut app = make_app();
-    app.active_dialog = Some(Dialog::SquadKeyMissing);
-
-    let text = buffer_text(&render_app(&mut app, 100, 30));
-
-    assert!(
-        text.contains("AWMAN_SQUAD_KEY"),
-        "the variable to set must be named: {text}"
-    );
-    assert!(
-        text.contains("only once"),
-        "why the key cannot simply be looked up must be stated: {text}"
-    );
-    assert!(
-        text.contains("[y]") && text.contains("[n / Esc]"),
-        "both answers must be offered: {text}"
-    );
-    assert!(
-        text.contains("old key will stop working"),
-        "the cost of refreshing must be stated before it is accepted: {text}"
     );
 }
 

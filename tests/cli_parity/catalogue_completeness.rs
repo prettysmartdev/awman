@@ -15,7 +15,8 @@ fn cat() -> &'static CommandCatalogue {
 fn all_documented_top_level_commands_present() {
     let names: Vec<&str> = cat().root().subcommands.iter().map(|s| s.name).collect();
     for expected in &[
-        "init", "ready", "chat", "specs", "agents", "config", "exec", "api", "remote", "new",
+        "init", "ready", "chat", "specs", "agents", "config", "exec", "daemon", "squad", "remote",
+        "new",
     ] {
         assert!(
             names.contains(expected),
@@ -68,19 +69,13 @@ fn exec_workflow_has_worktree_flag() {
 #[test]
 fn chat_has_non_interactive_short_flag() {
     let cmd = cat().lookup(&["chat"]).unwrap();
-    let flag = cmd.find_flag("non-interactive");
+    let flag = cmd.find_flag("headless");
     assert!(flag.is_some());
     // Short flag is `-n`.
     assert_eq!(flag.unwrap().short, Some('n'));
 }
 
 // ─── api start ──────────────────────────────────────────────────────────
-
-#[test]
-fn api_start_has_workdirs_flag() {
-    let cmd = cat().lookup(&["api", "start"]).unwrap();
-    assert!(cmd.find_flag("workdirs").is_some());
-}
 
 // ─── remote exec ─────────────────────────────────────────────────────────────
 
@@ -138,14 +133,19 @@ fn config_get_has_field_argument() {
 }
 
 #[test]
-fn api_start_has_workdir_root_flag() {
-    let cmd = cat().lookup(&["api", "start"]).unwrap();
-    let flag = cmd.find_flag("workdir-root").expect("workdir-root flag");
-    assert!(
-        matches!(flag.kind, FlagKind::VecString),
-        "repeatable flag, like workdirs"
-    );
-    assert!(cmd.find_flag("workdirs").is_some(), "workdirs is unchanged");
+fn daemon_start_settings_are_config_not_flags() {
+    // WI 0139/0140: listen address, workdirs and keys are config or `daemon api`.
+    assert!(cat().lookup(&["api"]).is_none(), "the api group is gone");
+    let cmd = cat().lookup(&["daemon", "start"]).unwrap();
+    for removed in [
+        "port",
+        "workdirs",
+        "workdir-root",
+        "refresh-key",
+        "dangerously-skip-auth",
+    ] {
+        assert!(cmd.find_flag(removed).is_none(), "--{removed} must be gone");
+    }
 }
 
 // ─── session worktree selectors (WI 0153) ────────────────────────────────────

@@ -22,13 +22,13 @@ use awman::engine::container::ContainerRuntime;
 use awman::engine::git::GitEngine;
 use awman::engine::overlay::OverlayEngine;
 use awman::frontend::api::error::ApiError;
-use awman::frontend::api::routes::{build_router, AppState, AuthMode, API_FEATURES};
+use awman::frontend::api::routes::{build_router, AppState, API_FEATURES};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 
-const SESSION: &str = "http-consistency-session";
+const SESSION: &str = "ses_4c6906233871615c8475a306c8dea09b";
 
-fn state(root: &std::path::Path) -> Arc<AppState> {
+pub(super) fn state(root: &std::path::Path) -> Arc<AppState> {
     let paths = ApiPaths::from_root(root);
     paths.ensure_root().unwrap();
     let store = Arc::new(SqliteSessionStore::open(paths.root()).unwrap());
@@ -43,7 +43,6 @@ fn state(root: &std::path::Path) -> Arc<AppState> {
         overlay_engine: overlay.clone(),
         auth_engine: Arc::new(AuthEngine::with_paths(auth_paths, paths.clone())),
         agent_engine: Arc::new(AgentEngine::new(overlay, runtime)),
-        config_notices: Default::default(),
         workflow_state_store: Arc::new(WorkflowStateStore::at_git_root(paths.root())),
         credential_monitor: None,
         global_config: Arc::new(Default::default()),
@@ -67,6 +66,8 @@ fn state(root: &std::path::Path) -> Arc<AppState> {
         })
         .unwrap();
     Arc::new(AppState {
+        live_config: std::sync::RwLock::new(None),
+        settings_tx: None,
         lifecycle_store,
         setup_cancels,
         canceller,
@@ -76,7 +77,6 @@ fn state(root: &std::path::Path) -> Arc<AppState> {
         workdir_roots: vec![],
         started_at: Instant::now(),
         task_handles: tokio::sync::Mutex::new(Vec::new()),
-        auth_mode: AuthMode::Disabled,
         engines,
         sessions: Arc::new(awman::data::session_manager::SessionManager::in_memory(
             awman::data::config::env::EnvSnapshot::empty(),
@@ -116,10 +116,28 @@ async fn server(app: Arc<AppState>) -> String {
 async fn server_with_peer(app: Arc<AppState>, peer: SocketAddr) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let router = build_router(app).layer(axum::middleware::from_fn(move |mut req: axum::http::Request<axum::body::Body>, next: axum::middleware::Next| async move {
-        req.extensions_mut().insert(axum::extract::ConnectInfo(peer));
-        next.run(req).await
-    }));
+    let api = Arc::new(awman::command::daemon_api::DaemonApi::for_worker_tests(app));
+    let (_, key) = api
+        .runtime
+        .keys()
+        .create(&format!("peer-fixture-{}", addr.port()))
+        .unwrap();
+    let bearer: axum::http::HeaderValue = format!("Bearer {}", key.as_str()).parse().unwrap();
+    let router = awman::frontend::api::routes::build_router_for_listener(
+        api,
+        awman::frontend::api::routes::ListenerPolicy::Network,
+    )
+    .layer(axum::middleware::from_fn(
+        move |mut req: axum::http::Request<axum::body::Body>, next: axum::middleware::Next| {
+            let bearer = bearer.clone();
+            async move {
+                req.headers_mut().insert("authorization", bearer);
+                req.extensions_mut()
+                    .insert(axum::extract::ConnectInfo(peer));
+                next.run(req).await
+            }
+        },
+    ));
     tokio::spawn(async move {
         axum::serve(listener, router).await.unwrap();
     });
@@ -140,9 +158,9 @@ async fn every_route_error_has_code_and_authoritative_code_status_table_is_exerc
     let base = server(state(tmp.path())).await;
     let client = reqwest::Client::new();
     for path in [
-        "/v1/sessions/missing",
-        "/v1/commands/missing",
-        "/v1/workflows/missing",
+        "/v1/worker/sessions/missing",
+        "/v1/worker/commands/missing",
+        "/v1/worker/commands/missing/workflow",
     ] {
         let response = client.get(format!("{base}{path}")).send().await.unwrap();
         let (status, json) = body(response).await;
@@ -153,6 +171,13 @@ async fn every_route_error_has_code_and_authoritative_code_status_table_is_exerc
         assert!(json["code"].is_string(), "{path}: {json}");
     }
     let expected = [
+        ("feature_disabled", 503),
+        ("config_invalid", 422),
+        ("task_not_found", 404),
+        ("run_not_found", 404),
+        ("grant_not_found", 404),
+        ("task_exists", 409),
+        ("prerequisite_widening_refused", 403),
         ("unauthorized", 401),
         ("forbidden_workdir", 403),
         ("invalid_request", 400),
@@ -180,9 +205,12 @@ async fn every_route_error_has_code_and_authoritative_code_status_table_is_exerc
         ("worktree_exists", 409),
         ("merge_conflict", 409),
         ("merge_target_dirty", 409),
+        ("conflict", 409),
         ("workflow_prerequisites_unresolved", 409),
         ("unknown_agent", 404),
         ("agent_untrusted", 403),
+        ("feature_degraded", 503),
+        ("ephemeral_not_allowed", 403),
     ]
     .into_iter()
     .collect::<std::collections::HashSet<_>>();
@@ -216,13 +244,13 @@ async fn every_route_error_has_code_and_authoritative_code_status_table_is_exerc
 async fn legacy_error_messages_and_command_resource_aliases_are_stable() {
     let tmp = tempfile::tempdir().unwrap();
     let app = state(tmp.path());
-    enqueue(&app, "alias-command");
+    enqueue(&app, "cmd_72adfca29b17d2f50b597c80959a24eb");
     app.paths
-        .prepare_command_dir(SESSION, "queued-workflow")
+        .prepare_command_dir(SESSION, "cmd_03f9998a9980d5a24178a279d79d88e2")
         .unwrap();
     app.store
         .enqueue_command(
-            "queued-workflow",
+            "cmd_03f9998a9980d5a24178a279d79d88e2",
             SESSION,
             "exec workflow",
             "[]",
@@ -230,11 +258,11 @@ async fn legacy_error_messages_and_command_resource_aliases_are_stable() {
         )
         .unwrap();
     app.paths
-        .prepare_command_dir(SESSION, "finished-workflow")
+        .prepare_command_dir(SESSION, "cmd_70ea773ae2bfb7c4cd55a4a8a6185cef")
         .unwrap();
     app.store
         .enqueue_command(
-            "finished-workflow",
+            "cmd_70ea773ae2bfb7c4cd55a4a8a6185cef",
             SESSION,
             "exec workflow",
             "[]",
@@ -242,16 +270,33 @@ async fn legacy_error_messages_and_command_resource_aliases_are_stable() {
         )
         .unwrap();
     app.store
-        .complete_command("finished-workflow", CommandStatus::Done, Some(0), None)
+        .complete_command(
+            "cmd_70ea773ae2bfb7c4cd55a4a8a6185cef",
+            CommandStatus::Done,
+            Some(0),
+            None,
+        )
         .unwrap();
     let base = server(app.clone()).await;
     let client = reqwest::Client::new();
 
     for (path, expected) in [
-        ("/v1/workflows/no-such", "command not found"),
-        ("/v1/commands/no-such/workflow", "command not found"),
-        ("/v1/commands/no-such/status", "Command 'no-such' not found"),
-        ("/v1/commands/no-such", "Command 'no-such' not found"),
+        (
+            "/v1/worker/commands/cmd_81febbbb13aeb0302ae17ad28d75fdc0/workflow",
+            "command not found",
+        ),
+        (
+            "/v1/worker/commands/cmd_81febbbb13aeb0302ae17ad28d75fdc0/workflow",
+            "command not found",
+        ),
+        (
+            "/v1/worker/commands/cmd_81febbbb13aeb0302ae17ad28d75fdc0",
+            "Command 'cmd_81febbbb13aeb0302ae17ad28d75fdc0' not found",
+        ),
+        (
+            "/v1/worker/commands/cmd_81febbbb13aeb0302ae17ad28d75fdc0",
+            "Command 'cmd_81febbbb13aeb0302ae17ad28d75fdc0' not found",
+        ),
     ] {
         let (status, json) = body(client.get(format!("{base}{path}")).send().await.unwrap()).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
@@ -261,24 +306,24 @@ async fn legacy_error_messages_and_command_resource_aliases_are_stable() {
 
     for (id, expected_error, expected_code) in [
         (
-            "alias-command",
+            "cmd_72adfca29b17d2f50b597c80959a24eb",
             "no workflow for this command",
             "no_workflow",
         ),
         (
-            "queued-workflow",
+            "cmd_03f9998a9980d5a24178a279d79d88e2",
             "workflow not started",
             "workflow_not_started",
         ),
         (
-            "finished-workflow",
+            "cmd_70ea773ae2bfb7c4cd55a4a8a6185cef",
             "workflow never started",
             "workflow_never_started",
         ),
     ] {
         let (status, json) = body(
             client
-                .get(format!("{base}/v1/workflows/{id}"))
+                .get(format!("{base}/v1/worker/commands/{id}/workflow"))
                 .send()
                 .await
                 .unwrap(),
@@ -291,12 +336,12 @@ async fn legacy_error_messages_and_command_resource_aliases_are_stable() {
 
     for (left, right) in [
         (
-            "/v1/commands/alias-command",
-            "/v1/commands/alias-command/status",
+            "/v1/worker/commands/cmd_72adfca29b17d2f50b597c80959a24eb",
+            "/v1/worker/commands/cmd_72adfca29b17d2f50b597c80959a24eb",
         ),
         (
-            "/v1/commands/alias-command/workflow",
-            "/v1/workflows/alias-command",
+            "/v1/worker/commands/cmd_72adfca29b17d2f50b597c80959a24eb/workflow",
+            "/v1/worker/commands/cmd_72adfca29b17d2f50b597c80959a24eb/workflow",
         ),
     ] {
         let a = client.get(format!("{base}{left}")).send().await.unwrap();
@@ -315,7 +360,11 @@ async fn session_setup_status_filters_errors_and_closed_stage_are_returned() {
     let tmp = tempfile::tempdir().unwrap();
     let app = state(tmp.path());
     app.store
-        .insert_session("ready-session", "/ready", "2026-01-01")
+        .insert_session(
+            "ses_b88b12360be075845ba67c1aade91ba0",
+            "/ready",
+            "2026-01-01T00:00:00.000Z",
+        )
         .unwrap();
     app.store
         .update_setup_status(SESSION, SessionSetupStatus::Failed)
@@ -328,13 +377,13 @@ async fn session_setup_status_filters_errors_and_closed_stage_are_returned() {
 
     let (_, list) = body(
         client
-            .get(format!("{base}/v1/sessions"))
+            .get(format!("{base}/v1/worker/sessions"))
             .send()
             .await
             .unwrap(),
     )
     .await;
-    let item = list["sessions"]
+    let item = list["items"]
         .as_array()
         .unwrap()
         .iter()
@@ -345,7 +394,7 @@ async fn session_setup_status_filters_errors_and_closed_stage_are_returned() {
     assert_eq!(item["setup_error"]["message"], "git clone failed");
     let (_, detail) = body(
         client
-            .get(format!("{base}/v1/sessions/{SESSION}"))
+            .get(format!("{base}/v1/worker/sessions/{SESSION}"))
             .send()
             .await
             .unwrap(),
@@ -355,27 +404,30 @@ async fn session_setup_status_filters_errors_and_closed_stage_are_returned() {
     assert_eq!(detail["setup_error"]["stage"], "clone");
     let (_, filtered) = body(
         client
-            .get(format!("{base}/v1/sessions?setup_status=failed"))
+            .get(format!("{base}/v1/worker/sessions?setup_status=failed"))
             .send()
             .await
             .unwrap(),
     )
     .await;
-    assert_eq!(filtered["sessions"].as_array().unwrap().len(), 1);
-    assert_eq!(filtered["sessions"][0]["id"], SESSION);
+    assert_eq!(filtered["items"].as_array().unwrap().len(), 1);
+    assert_eq!(filtered["items"][0]["id"], SESSION);
     let (_, ready) = body(
         client
-            .get(format!("{base}/v1/sessions?setup_status=ready"))
+            .get(format!("{base}/v1/worker/sessions?setup_status=ready"))
             .send()
             .await
             .unwrap(),
     )
     .await;
-    assert_eq!(ready["sessions"].as_array().unwrap().len(), 1);
-    assert_eq!(ready["sessions"][0]["id"], "ready-session");
+    assert_eq!(ready["items"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        ready["items"][0]["id"],
+        "ses_b88b12360be075845ba67c1aade91ba0"
+    );
     let (status, invalid) = body(
         client
-            .get(format!("{base}/v1/sessions?setup_status=wat"))
+            .get(format!("{base}/v1/worker/sessions?setup_status=wat"))
             .send()
             .await
             .unwrap(),
@@ -389,7 +441,7 @@ async fn session_setup_status_filters_errors_and_closed_stage_are_returned() {
         .unwrap();
     let (_, closed) = body(
         client
-            .get(format!("{base}/v1/sessions/{SESSION}"))
+            .get(format!("{base}/v1/worker/sessions/{SESSION}"))
             .send()
             .await
             .unwrap(),
@@ -398,7 +450,7 @@ async fn session_setup_status_filters_errors_and_closed_stage_are_returned() {
     assert_eq!(closed["status"], "closed");
     assert_eq!(closed["setup_status"], "failed");
     let deleted = client
-        .delete(format!("{base}/v1/sessions/{SESSION}"))
+        .delete(format!("{base}/v1/worker/sessions/{SESSION}"))
         .send()
         .await
         .unwrap();
@@ -412,11 +464,15 @@ async fn command_body_and_header_session_forms_and_idempotent_replays_work() {
     let tmp = tempfile::tempdir().unwrap();
     let app = state(tmp.path());
     app.store
-        .insert_session("other-session", "/other", "2026-01-01T00:00:00Z")
+        .insert_session(
+            "ses_5cad80ad570259209f805583acd4e8b0",
+            "/other",
+            "2026-01-01T00:00:00Z",
+        )
         .unwrap();
     let base = server(app.clone()).await;
     let client = reqwest::Client::new();
-    let url = format!("{base}/v1/commands");
+    let url = format!("{base}/v1/worker/commands");
     let command = |session: Option<&str>| {
         let mut value = serde_json::json!({"subcommand":"exec prompt","args":["hello"]});
         if let Some(session) = session {
@@ -439,7 +495,7 @@ async fn command_body_and_header_session_forms_and_idempotent_replays_work() {
         let response = request.send().await.unwrap();
         assert_eq!(response.status(), StatusCode::ACCEPTED);
         let first: serde_json::Value = response.json().await.unwrap();
-        let command_id = first["command_id"]
+        let command_id = first["id"]
             .as_str()
             .expect("command id in admission response");
         assert_eq!(
@@ -469,7 +525,7 @@ async fn command_body_and_header_session_forms_and_idempotent_replays_work() {
     let conflicting = client
         .post(&url)
         .json(&command(Some(SESSION)))
-        .header("x-awman-session", "other-session")
+        .header("x-awman-session", "ses_5cad80ad570259209f805583acd4e8b0")
         .send()
         .await
         .unwrap();
@@ -514,7 +570,7 @@ async fn command_body_and_header_session_forms_and_idempotent_replays_work() {
         client
             .post(&url)
             .json(&command(None))
-            .header("x-awman-session", "other-session")
+            .header("x-awman-session", "ses_5cad80ad570259209f805583acd4e8b0")
             .header("idempotency-key", "body")
             .send()
             .await
@@ -525,7 +581,7 @@ async fn command_body_and_header_session_forms_and_idempotent_replays_work() {
     assert_eq!(error["code"], "idempotency_conflict");
     // Selection validation must precede replay and hash mismatch handling.
     for header in [
-        axum::http::HeaderValue::from_static("other-session"),
+        axum::http::HeaderValue::from_static("ses_5cad80ad570259209f805583acd4e8b0"),
         axum::http::HeaderValue::from_bytes(&[0xff]).unwrap(),
     ] {
         let response = client
@@ -571,7 +627,7 @@ async fn command_body_and_header_session_forms_and_idempotent_replays_work() {
                 "INSERT INTO idempotency_keys(scope,key,request_hash,status,body,created_at)
             VALUES (?1,?2,?3,202,?4,?5)",
                 rusqlite::params![
-                    "/v1/commands|anonymous",
+                    "/v1/worker/commands|owner",
                     "pre-upgrade",
                     old_hash,
                     r#"{"command_id":"old-command"}"#,
@@ -600,28 +656,28 @@ async fn command_body_and_header_session_forms_and_idempotent_replays_work() {
 async fn pending_alias_unknown_flags_and_exec_parent_refusal_are_pinned() {
     let tmp = tempfile::tempdir().unwrap();
     let app = state(tmp.path());
-    enqueue(&app, "legacy-command");
+    enqueue(&app, "cmd_4d5a9faee0a21ab92307fab5cfbf197e");
     let base = server(app).await;
     let client = reqwest::Client::new();
     let (_, filtered) = body(
         client
-            .get(format!("{base}/v1/commands?status=pending"))
+            .get(format!("{base}/v1/worker/commands?status=pending"))
             .send()
             .await
             .unwrap(),
     )
     .await;
     assert!(
-        filtered["commands"]
+        filtered["items"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|c| c["id"] == "legacy-command" && c["status"] == "queued"),
+            .any(|c| c["id"] == "cmd_4d5a9faee0a21ab92307fab5cfbf197e" && c["status"] == "queued"),
         "{filtered}"
     );
     let (_, all) = body(
         client
-            .get(format!("{base}/v1/commands"))
+            .get(format!("{base}/v1/worker/commands"))
             .send()
             .await
             .unwrap(),
@@ -630,7 +686,7 @@ async fn pending_alias_unknown_flags_and_exec_parent_refusal_are_pinned() {
     assert!(!all.to_string().contains("pending"));
 
     let unknown_flag = client
-        .post(format!("{base}/v1/commands"))
+        .post(format!("{base}/v1/worker/commands"))
         .header("x-awman-session", SESSION)
         .json(&serde_json::json!({"subcommand":"exec workflow", "args":["--no-such-flag"]}))
         .send()
@@ -641,7 +697,7 @@ async fn pending_alias_unknown_flags_and_exec_parent_refusal_are_pinned() {
     assert_eq!(error["code"], "unknown_flag");
 
     let parent = client
-        .post(format!("{base}/v1/commands"))
+        .post(format!("{base}/v1/worker/commands"))
         .header("x-awman-session", SESSION)
         .json(&serde_json::json!({"subcommand":"exec", "args":["prompt", "hello"]}))
         .send()
@@ -657,7 +713,7 @@ async fn pending_alias_unknown_flags_and_exec_parent_refusal_are_pinned() {
 async fn log_path_is_loopback_only_and_status_features_are_unique() {
     let tmp = tempfile::tempdir().unwrap();
     let app = state(tmp.path());
-    enqueue(&app, "log-path");
+    enqueue(&app, "cmd_595342ead1613db554baa065d7c45e6b");
     let loopback_base = server_with_peer(
         app.clone(),
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1234),
@@ -675,14 +731,18 @@ async fn log_path_is_loopback_only_and_status_features_are_unique() {
     let remote_base = server_with_peer(app, "192.0.2.1:1234".parse().unwrap()).await;
     let client = reqwest::Client::new();
     let loopback = client
-        .get(format!("{loopback_base}/v1/commands/log-path"))
+        .get(format!(
+            "{loopback_base}/v1/worker/commands/cmd_595342ead1613db554baa065d7c45e6b"
+        ))
         .send()
         .await
         .unwrap();
     let value: serde_json::Value = loopback.json().await.unwrap();
     assert!(value["log_path"].is_string());
     let remote = client
-        .get(format!("{remote_base}/v1/commands/log-path"))
+        .get(format!(
+            "{remote_base}/v1/worker/commands/cmd_595342ead1613db554baa065d7c45e6b"
+        ))
         .send()
         .await
         .unwrap();
@@ -690,7 +750,9 @@ async fn log_path_is_loopback_only_and_status_features_are_unique() {
     assert!(value.get("log_path").is_none());
     // A local proxy is a loopback peer, even if forwarding headers name a remote client.
     let proxy_response: serde_json::Value = client
-        .get(format!("http://{proxy_addr}/v1/commands/log-path"))
+        .get(format!(
+            "http://{proxy_addr}/v1/worker/commands/cmd_595342ead1613db554baa065d7c45e6b"
+        ))
         .header("x-forwarded-for", "192.0.2.1")
         .send()
         .await
@@ -719,14 +781,14 @@ async fn log_path_is_loopback_only_and_status_features_are_unique() {
 async fn closing_acknowledgements_retain_readiness() {
     let tmp = tempfile::tempdir().unwrap();
     let app = state(tmp.path());
-    enqueue(&app, "draining-command");
+    enqueue(&app, "cmd_5c1009da042c75e1fc0998768c7e4add");
     app.store.claim_next_command("worker").unwrap().unwrap();
     let base = server(app).await;
     let client = reqwest::Client::new();
     for expected in [StatusCode::ACCEPTED, StatusCode::OK] {
         let (status, json) = body(
             client
-                .delete(format!("{base}/v1/sessions/{SESSION}"))
+                .delete(format!("{base}/v1/worker/sessions/{SESSION}"))
                 .send()
                 .await
                 .unwrap(),
@@ -735,7 +797,10 @@ async fn closing_acknowledgements_retain_readiness() {
         assert_eq!(status, expected);
         assert_eq!(json["status"], "closing");
         assert_eq!(json["setup_status"], "ready");
-        assert_eq!(json["running_command_id"], "draining-command");
+        assert_eq!(
+            json["running_command_id"],
+            "cmd_5c1009da042c75e1fc0998768c7e4add"
+        );
     }
 }
 
@@ -743,24 +808,24 @@ async fn closing_acknowledgements_retain_readiness() {
 async fn framework_and_admission_errors_have_codes_over_http() {
     let tmp = tempfile::tempdir().unwrap();
     let app = state(tmp.path());
-    enqueue(&app, "outputs-command");
+    enqueue(&app, "cmd_59d2526a727160cf21fbc98620519c32");
     let base = server(app.clone()).await;
     let client = reqwest::Client::new();
     let submit = || {
-        client.post(format!("{base}/v1/commands")).json(
+        client.post(format!("{base}/v1/worker/commands")).json(
             &serde_json::json!({"session_id":SESSION,"subcommand":"exec prompt","args":["hello"]}),
         )
     };
     let cases = [
         (client.get(format!("{base}/v1/nope")), 404, "not_found"),
-        (client.delete(format!("{base}/v1/commands")), 405, "method_not_allowed"),
-        (client.post(format!("{base}/v1/commands")).header("content-type", "application/json").body("{bad"), 400, "invalid_request"),
-        (client.post(format!("{base}/v1/commands")).body("{}"), 415, "unsupported_media_type"),
-        (client.post(format!("{base}/v1/commands")).header("content-type", "application/json").body(" ".repeat(3 * 1024 * 1024)), 413, "request_too_large"),
-        (client.get(format!("{base}/v1/commands/outputs-command/outputs/missing.txt")), 404, "output_not_found"),
-        (client.get(format!("{base}/v1/commands/outputs-command/logs?after=bad")), 400, "invalid_request"),
-        (client.post(format!("{base}/v1/sessions")).json(&serde_json::json!({"workdir": tmp.path()})), 403, "forbidden_workdir"),
-        (client.post(format!("{base}/v1/runs")).json(&serde_json::json!({"session":{"workdir":tmp.path()},"command":{"session_id":SESSION,"subcommand":"exec prompt","args":["hello"]}})), 400, "invalid_request"),
+        (client.delete(format!("{base}/v1/worker/commands")), 405, "method_not_allowed"),
+        (client.post(format!("{base}/v1/worker/commands")).header("content-type", "application/json").body("{bad"), 400, "invalid_request"),
+        (client.post(format!("{base}/v1/worker/commands")).body("{}"), 415, "unsupported_media_type"),
+        (client.post(format!("{base}/v1/worker/commands")).header("content-type", "application/json").body(" ".repeat(3 * 1024 * 1024)), 413, "request_too_large"),
+        (client.get(format!("{base}/v1/worker/commands/cmd_59d2526a727160cf21fbc98620519c32/outputs/missing.txt")), 404, "output_not_found"),
+        (client.get(format!("{base}/v1/worker/commands/cmd_59d2526a727160cf21fbc98620519c32/events?after=bad")), 400, "invalid_request"),
+        (client.post(format!("{base}/v1/worker/sessions")).json(&serde_json::json!({"workdir": tmp.path()})), 403, "forbidden_workdir"),
+        (client.post(format!("{base}/v1/worker/runs")).json(&serde_json::json!({"session":{"workdir":tmp.path()},"command":{"session_id":SESSION,"subcommand":"exec prompt","args":["hello"]}})), 400, "invalid_request"),
     ];
     for (request, expected_status, code) in cases {
         let response = request.send().await.unwrap();
@@ -787,11 +852,23 @@ async fn framework_and_admission_errors_have_codes_over_http() {
     assert_eq!(json["code"], "session_closing");
 
     let auth_tmp = tempfile::tempdir().unwrap();
-    let mut authenticated = state(auth_tmp.path());
-    Arc::get_mut(&mut authenticated).unwrap().auth_mode = AuthMode::Enabled {
-        key_hash: "unused-test-hash".into(),
-    };
-    let auth_base = server(authenticated).await;
+    let authenticated = state(auth_tmp.path());
+    let api = Arc::new(awman::command::daemon_api::DaemonApi::for_worker_tests(
+        authenticated,
+    ));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let auth_base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            awman::frontend::api::routes::build_router_for_listener(
+                api,
+                awman::frontend::api::routes::ListenerPolicy::Network,
+            ),
+        )
+        .await
+        .unwrap();
+    });
     let response = client
         .get(format!("{auth_base}/v1/status"))
         .send()
@@ -810,7 +887,13 @@ async fn stored_statuses_keep_their_wire_spelling_and_unknown_values_fail_explic
     let tmp = tempfile::tempdir().unwrap();
     let app = state(tmp.path());
     app.store
-        .enqueue_command("legacy", SESSION, "agents status", "[]", "/l")
+        .enqueue_command(
+            "cmd_228c70bfc5589c58c044e03fff0e17eb",
+            SESSION,
+            "agents status",
+            "[]",
+            "/l",
+        )
         .unwrap();
     let raw = |sql: &str| {
         app.store
@@ -820,7 +903,7 @@ async fn stored_statuses_keep_their_wire_spelling_and_unknown_values_fail_explic
             })
             .unwrap();
     };
-    raw("UPDATE commands SET status='pending' WHERE id='legacy'");
+    raw("UPDATE commands SET status='pending' WHERE id='cmd_228c70bfc5589c58c044e03fff0e17eb'");
     let base = server(app.clone()).await;
     let client = reqwest::Client::new();
     let get = |path: String| {
@@ -831,31 +914,32 @@ async fn stored_statuses_keep_their_wire_spelling_and_unknown_values_fail_explic
 
     // Legacy `pending` is `queued` on the wire, and still a filter alias.
     for filter in ["pending", "queued"] {
-        let (status, json) = get(format!("/v1/commands?status={filter}")).await;
+        let (status, json) = get(format!("/v1/worker/commands?status={filter}")).await;
         assert_eq!(status, StatusCode::OK, "{json}");
-        assert_eq!(json["commands"][0]["status"], "queued", "{json}");
+        assert_eq!(json["items"][0]["status"], "queued", "{json}");
     }
-    let (_, json) = get(format!("/v1/sessions/{SESSION}")).await;
+    let (_, json) = get(format!("/v1/worker/sessions/{SESSION}")).await;
     assert_eq!(json["status"], "active", "{json}");
     assert_eq!(json["setup_status"], "ready", "{json}");
     for query in ["status=wat", "setup_status=wat"] {
-        let (status, _) = get(format!("/v1/sessions?{query}")).await;
+        let (status, _) = get(format!("/v1/worker/sessions?{query}")).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{query}");
     }
 
-    raw("UPDATE commands SET status='wat' WHERE id='legacy'");
-    let (status, _) = get("/v1/commands/legacy".to_string()).await;
+    raw("UPDATE commands SET status='wat' WHERE id='cmd_228c70bfc5589c58c044e03fff0e17eb'");
+    let (status, _) =
+        get("/v1/worker/commands/cmd_228c70bfc5589c58c044e03fff0e17eb".to_string()).await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-    let (status, _) = get("/v1/commands".to_string()).await;
+    let (status, _) = get("/v1/worker/commands".to_string()).await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
 
-    raw("UPDATE commands SET status='done' WHERE id='legacy'");
+    raw("UPDATE commands SET status='done' WHERE id='cmd_228c70bfc5589c58c044e03fff0e17eb'");
     raw("UPDATE sessions SET setup_status='wat'");
-    let (status, _) = get(format!("/v1/sessions/{SESSION}")).await;
+    let (status, _) = get(format!("/v1/worker/sessions/{SESSION}")).await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     // No setup_state.json exists, so this reaches the row: it must not report
     // the default `ready` for a stage it could not read.
-    let (status, json) = get(format!("/v1/sessions/{SESSION}/status")).await;
+    let (status, json) = get(format!("/v1/worker/sessions/{SESSION}")).await;
     assert_ne!(json["status"], "ready", "{status} {json}");
 }
 
@@ -863,10 +947,10 @@ async fn stored_statuses_keep_their_wire_spelling_and_unknown_values_fail_explic
 async fn closing_a_session_cancels_pending_written_after_open() {
     let tmp = tempfile::tempdir().unwrap();
     let app = state(tmp.path());
-    enqueue(&app, "legacy");
+    enqueue(&app, "cmd_228c70bfc5589c58c044e03fff0e17eb");
     app.store
         .with_conn(|conn| {
-            conn.execute("UPDATE commands SET status='pending' WHERE id='legacy'", [])
+            conn.execute("UPDATE commands SET status='pending' WHERE id='cmd_228c70bfc5589c58c044e03fff0e17eb'", [])
                 .map_err(awman::data::error::DataError::from)
         })
         .unwrap();
@@ -874,7 +958,7 @@ async fn closing_a_session_cancels_pending_written_after_open() {
 
     let (status, json) = body(
         reqwest::Client::new()
-            .delete(format!("{base}/v1/sessions/{SESSION}"))
+            .delete(format!("{base}/v1/worker/sessions/{SESSION}"))
             .send()
             .await
             .unwrap(),
@@ -884,7 +968,11 @@ async fn closing_a_session_cancels_pending_written_after_open() {
     assert_eq!(status, StatusCode::OK, "{json}");
     assert_eq!(json["status"], "closed", "{json}");
     assert_eq!(
-        app.store.get_command("legacy").unwrap().unwrap().status,
+        app.store
+            .get_command("cmd_228c70bfc5589c58c044e03fff0e17eb")
+            .unwrap()
+            .unwrap()
+            .status,
         CommandStatus::Cancelled
     );
     assert!(app.store.claim_next_command("worker").unwrap().is_none());
@@ -894,19 +982,22 @@ async fn closing_a_session_cancels_pending_written_after_open() {
 async fn session_queue_reports_an_unreadable_row_instead_of_an_empty_queue() {
     let tmp = tempfile::tempdir().unwrap();
     let app = state(tmp.path());
-    enqueue(&app, "good");
-    enqueue(&app, "corrupt");
+    enqueue(&app, "cmd_755f85c2723bb39381c7379a604160d8");
+    enqueue(&app, "cmd_bc2f39d437ff13dff05f5cfda14327cc");
     let set_status = |status: &str| {
         app.store
             .with_conn(|conn| {
-                conn.execute("UPDATE commands SET status=?1 WHERE id='corrupt'", [status])
-                    .map_err(awman::data::error::DataError::from)
+                conn.execute(
+                    "UPDATE commands SET status=?1 WHERE id='cmd_bc2f39d437ff13dff05f5cfda14327cc'",
+                    [status],
+                )
+                .map_err(awman::data::error::DataError::from)
             })
             .unwrap();
     };
     set_status("wat");
     let base = server(app.clone()).await;
-    let url = format!("{base}/v1/sessions/{SESSION}/queue");
+    let url = format!("{base}/v1/worker/sessions/{SESSION}/queue");
     let client = reqwest::Client::new();
 
     let (status, json) = body(client.get(&url).send().await.unwrap()).await;
@@ -916,5 +1007,9 @@ async fn session_queue_reports_an_unreadable_row_instead_of_an_empty_queue() {
     set_status("done");
     let (status, json) = body(client.get(&url).send().await.unwrap()).await;
     assert_eq!(status, StatusCode::OK, "{json}");
-    assert_eq!(json["queued"][0]["command_id"], "good", "{json}");
+    let json = crate::queue_view(json);
+    assert_eq!(
+        json["queued"][0]["command_id"], "cmd_755f85c2723bb39381c7379a604160d8",
+        "{json}"
+    );
 }

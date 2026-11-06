@@ -6,7 +6,7 @@
 //! (frontends) or Layer 4 (the binary entrypoints).
 
 pub mod commands;
-pub mod config_notices;
+pub mod daemon_api;
 pub mod dispatch;
 pub mod error;
 pub mod git_summary;
@@ -28,3 +28,5 @@ pub use session_create::{
 };
 pub use session_setup::{SessionSetup, SessionSetupPresenter};
 pub use startup::{Startup, StartupOutcome};
+
+pub mod daemon_runtime;

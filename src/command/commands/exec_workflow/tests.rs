@@ -904,7 +904,7 @@ fn workflow_agent_flags_resolve_config_per_step_agent() {
     let invoking = agent_flags_session(
         tmp.path(),
         "repo",
-        Some(r#"{"agent": "claude", "agentFlags": {"codex": ["--no-daemon"]}}"#),
+        Some(r#"{"agents": {"default": "claude", "flags": {"codex": ["--no-daemon"]}}}"#),
     );
     let resolver = workflow_agent_flags(&invoking, None, None);
     // Generated / per-step agents each get their own entry.
@@ -922,7 +922,7 @@ fn workflow_agent_flags_come_from_the_invoking_session_not_the_worktree() {
     let invoking = agent_flags_session(
         tmp.path(),
         "repo",
-        Some(r#"{"agentFlags": {"codex": ["--no-daemon"]}}"#),
+        Some(r#"{"agents": {"flags": {"codex": ["--no-daemon"]}}}"#),
     );
     let worktree = agent_flags_session(tmp.path(), "worktree", None);
     assert!(worktree.effective_config().agent_flags("codex").is_empty());
@@ -938,7 +938,7 @@ fn workflow_agent_flags_cli_targets_the_workflow_default_agent() {
     let invoking = agent_flags_session(
         tmp.path(),
         "repo",
-        Some(r#"{"agent": "claude", "agentFlags": {"claude": ["--verbose"]}}"#),
+        Some(r#"{"agents": {"default": "claude", "flags": {"claude": ["--verbose"]}}}"#),
     );
     // Workflow `agent = "codex"` overrides the configured claude.
     let resolver = workflow_agent_flags(
@@ -1007,11 +1007,12 @@ fn workflow_summary_steps_failed_zero_on_success() {
 /// calls, sibling steps would inherit each other's overlays.
 #[test]
 fn collect_single_entry_overlays_isolates_env_per_entry() {
-    use crate::data::config::env::{EnvSnapshot, AWMAN_CONFIG_HOME};
+    use crate::data::config::env::EnvSnapshot;
+    use crate::data::fs::data_paths::AWMAN_HOME;
     use crate::data::session::{SessionOpenOptions, StaticGitRootResolver};
 
     let tmp = tempfile::tempdir().unwrap();
-    let env = EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, tmp.path().to_str().unwrap())]);
+    let env = EnvSnapshot::with_overrides([(AWMAN_HOME, tmp.path().to_str().unwrap())]);
     let resolver = StaticGitRootResolver::new(tmp.path());
     let session = Session::open(
         tmp.path().to_path_buf(),
@@ -1064,7 +1065,8 @@ fn collect_single_entry_overlays_isolates_env_per_entry() {
 /// hard-coded `git_root.join("Dockerfile.dev")`.
 #[test]
 fn collect_single_entry_overlays_uses_repo_config_dockerfile_path() {
-    use crate::data::config::env::{EnvSnapshot, AWMAN_CONFIG_HOME};
+    use crate::data::config::env::EnvSnapshot;
+    use crate::data::fs::data_paths::AWMAN_HOME;
     use crate::data::session::{SessionOpenOptions, StaticGitRootResolver};
 
     let tmp = tempfile::tempdir().unwrap();
@@ -1074,7 +1076,7 @@ fn collect_single_entry_overlays_uses_repo_config_dockerfile_path() {
     std::fs::create_dir_all(&awman_dir).unwrap();
     std::fs::write(
         awman_dir.join("config.json"),
-        r#"{"dockerfile": "infra/Dockerfile.base"}"#,
+        r#"{"runtime": {"dockerfile": "infra/Dockerfile.base"}}"#,
     )
     .unwrap();
 
@@ -1087,7 +1089,7 @@ fn collect_single_entry_overlays_uses_repo_config_dockerfile_path() {
     )
     .unwrap();
 
-    let env = EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, tmp.path().to_str().unwrap())]);
+    let env = EnvSnapshot::with_overrides([(AWMAN_HOME, tmp.path().to_str().unwrap())]);
     let resolver = StaticGitRootResolver::new(tmp.path());
     let session = Session::open(
         tmp.path().to_path_buf(),
@@ -1101,8 +1103,8 @@ fn collect_single_entry_overlays_uses_repo_config_dockerfile_path() {
 
     // The session must resolve dockerfile from repo config, not Dockerfile.dev.
     let resolved = session
-        .repo_config()
-        .dockerfile_path_or_default(session.git_root());
+        .effective_config()
+        .dockerfile_path(session.git_root());
     assert_eq!(
         resolved,
         tmp.path().join("infra/Dockerfile.base"),
@@ -1121,14 +1123,14 @@ fn collect_single_entry_overlays_uses_repo_config_dockerfile_path() {
 // ─── Gemini deprecation: workflow-level scan (WI-0083 review fix) ────────
 
 /// A session over a repo whose `.awman/config.json` names `default_agent`,
-/// with `AWMAN_CONFIG_HOME` pinned at the fixture so the developer's own
+/// with `AWMAN_HOME` pinned at the fixture so the developer's own
 /// global config cannot supply a different default.
 fn make_session_with_default_agent(
     tmp: &tempfile::TempDir,
     default_agent: Option<&str>,
 ) -> Session {
     if let Some(agent) = default_agent {
-        write_repo_config(tmp, &format!(r#"{{"agent": "{agent}"}}"#));
+        write_repo_config(tmp, &format!(r#"{{"agents": {{"default": "{agent}"}}}}"#));
     }
     Session::for_tests_isolated(tmp.path(), tmp.path())
 }
@@ -1172,7 +1174,7 @@ fn acp_preflight_rejects_before_workflow_launch_when_fallback_is_error() {
     let workflow = make_workflow(None, &[Some("cline"), Some("claude")]);
     let mut sink = crate::data::message::RecordingMessageSink::new();
     let mut flags = make_dynamic_flags(false, Some("wf.toml"), None, None, false, None);
-    flags.launch_mode = Some(crate::data::config::repo::LaunchMode::Acp);
+    flags.launch_mode = Some(crate::data::config::agents::LaunchMode::Acp);
 
     let error = validate_workflow_acp_preflight(&workflow, &session, &flags, &mut sink)
         .expect_err("unsupported step must stop ACP workflow pre-flight");
@@ -1190,19 +1192,25 @@ fn acp_preflight_downgrades_unsupported_steps_to_stdio_and_runs() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::write(
         tmp.path().join("config.json"),
-        r#"{"launchModeFallback":"stdio"}"#,
+        r#"{"agents":{"acpFallback":"stdio"}}"#,
     )
     .unwrap();
     let session = make_session_with_default_agent(&tmp, None);
     let workflow = make_workflow(None, &[Some("claude"), Some("codex")]);
     let mut sink = crate::data::message::RecordingMessageSink::new();
     let mut flags = make_dynamic_flags(false, Some("wf.toml"), None, None, false, None);
-    flags.launch_mode = Some(crate::data::config::repo::LaunchMode::Acp);
+    flags.launch_mode = Some(crate::data::config::agents::LaunchMode::Acp);
 
     let modes = validate_workflow_acp_preflight(&workflow, &session, &flags, &mut sink)
         .expect("stdio fallback of all-unsupported steps must permit the workflow");
-    assert_eq!(modes["step0"], crate::data::config::repo::LaunchMode::Stdio);
-    assert_eq!(modes["step1"], crate::data::config::repo::LaunchMode::Stdio);
+    assert_eq!(
+        modes["step0"],
+        crate::data::config::agents::LaunchMode::Stdio
+    );
+    assert_eq!(
+        modes["step1"],
+        crate::data::config::agents::LaunchMode::Stdio
+    );
     let messages = sink.all();
     assert_eq!(messages.len(), 2, "one downgrade warning per step");
     assert!(messages.iter().all(|m| m.level == MessageLevel::Warning));
@@ -1219,14 +1227,14 @@ fn acp_preflight_rejects_workflow_acp_as_not_yet_implemented() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::write(
         tmp.path().join("config.json"),
-        r#"{"launchModeFallback":"stdio"}"#,
+        r#"{"agents":{"acpFallback":"stdio"}}"#,
     )
     .unwrap();
     let session = make_session_with_default_agent(&tmp, None);
     let workflow = make_workflow(None, &[Some("cline")]);
     let mut sink = crate::data::message::RecordingMessageSink::new();
     let mut flags = make_dynamic_flags(false, Some("wf.toml"), None, None, false, None);
-    flags.launch_mode = Some(crate::data::config::repo::LaunchMode::Acp);
+    flags.launch_mode = Some(crate::data::config::agents::LaunchMode::Acp);
 
     let error = validate_workflow_acp_preflight(&workflow, &session, &flags, &mut sink)
         .expect_err("workflow ACP must be rejected as not yet implemented");
@@ -1525,7 +1533,7 @@ fn make_session_with_default_leader(
 ) -> crate::data::session::Session {
     write_repo_config(
         tmp,
-        &format!(r#"{{"dynamicWorkflows": {{"defaultLeader": "{default_leader}"}}}}"#),
+        &format!(r#"{{"workflows": {{"dynamic": {{"defaultLeader": "{default_leader}"}}}}}}"#),
     );
     Session::for_tests_isolated(tmp.path(), tmp.path())
 }
@@ -2584,14 +2592,12 @@ fn global_agent_map_skips_missing_dockerfiles_warns_and_falls_back_when_all_skip
         std::collections::HashMap::from([("missing".to_string(), vec!["m".to_string()])]);
     let resolved = crate::data::config::ResolvedDynamicWorkflows {
         default_leader: None,
-        max_concurrent_steps: None,
         agents_to_models: Some(crate::data::config::Sourced {
             value: only_missing,
             source: crate::data::config::DynamicWorkflowsSource::Global,
         }),
         guidance: Vec::new(),
         guidance_counts: Default::default(),
-        repo_uses_legacy_key: false,
     };
     let (section, warnings) = agents_section_for_leader(&resolved, &available).unwrap();
     assert!(
@@ -2889,17 +2895,25 @@ fn repair_prompt_substitution_contains_verbatim_validation_error() {
 
 /// The repo config at `root` layered over an empty global config, resolved
 /// the way `run_dynamic` resolves it.
+fn effective_for_repo(root: &std::path::Path) -> crate::data::config::EffectiveConfig {
+    let repo = crate::data::config::ConfigFile::load(
+        &crate::data::config::repo_config_path(root),
+        crate::data::config::FileKind::Repo,
+    )
+    .unwrap();
+    crate::data::config::EffectiveConfig::from_files(
+        Default::default(),
+        repo,
+        crate::data::config::FlagConfig::default(),
+        Default::default(),
+    )
+    .unwrap()
+}
+
 fn resolved_dynamic_workflows(
     root: &std::path::Path,
 ) -> crate::data::config::ResolvedDynamicWorkflows {
-    crate::data::config::EffectiveConfig::new(
-        crate::data::config::FlagConfig::default(),
-        Default::default(),
-        crate::data::config::repo::RepoConfig::load(root).unwrap(),
-        crate::data::config::global::GlobalConfig::default(),
-    )
-    .dynamic_workflows()
-    .unwrap()
+    effective_for_repo(root).dynamic_workflows().unwrap()
 }
 //
 // These exercise the same sequence `run_dynamic` performs — RepoConfig
@@ -2919,12 +2933,14 @@ fn integration_dynamic_config_valid_agents_produces_leader_prompt_with_models_an
     std::fs::write(
         awman_dir.join("config.json"),
         r#"{
-                "dynamicWorkflows": {
-                    "agentsToModels": {
-                        "claude": ["claude-opus-4-8"],
-                        "codex": ["codex-mini-latest"]
-                    },
-                    "maxConcurrentSteps": 2
+                "workflows": {
+                    "maxConcurrentSteps": 2,
+                    "dynamic": {
+                        "agentsToModels": {
+                            "claude": ["claude-opus-4-8"],
+                            "codex": ["codex-mini-latest"]
+                        }
+                    }
                 }
             }"#,
     )
@@ -2942,7 +2958,7 @@ fn integration_dynamic_config_valid_agents_produces_leader_prompt_with_models_an
         "0042",
         "/workspace/aspec/work-items/0042-item.md",
         &agents_section,
-        dw.max_concurrent_steps.as_ref().map(|s| s.value),
+        effective_for_repo(tmp.path()).max_concurrent_steps(),
         dw.guidance_texts().as_deref(),
     );
 
@@ -2971,12 +2987,12 @@ fn integration_dynamic_config_guidance_entries_appear_in_leader_prompt() {
     std::fs::write(
         awman_dir.join("config.json"),
         r#"{
-                "dynamicWorkflows": {
+                "workflows": {"dynamic": {
                     "guidance": [
                         "never spawn more than two agents in parallel",
                         "always include a validation step after each implementation step"
                     ]
-                }
+                }}
             }"#,
     )
     .unwrap();
@@ -2987,7 +3003,7 @@ fn integration_dynamic_config_guidance_entries_appear_in_leader_prompt() {
         "0099",
         "/workspace/aspec/work-items/0099-item.md",
         "  - claude",
-        dw.max_concurrent_steps.as_ref().map(|s| s.value),
+        effective_for_repo(tmp.path()).max_concurrent_steps(),
         dw.guidance_texts().as_deref(),
     );
 
@@ -3015,11 +3031,11 @@ fn integration_dynamic_config_mismatched_agents_fails_before_container_spawn() {
     std::fs::write(
         awman_dir.join("config.json"),
         r#"{
-                "dynamicWorkflows": {
+                "workflows": {"dynamic": {
                     "agentsToModels": {
                         "gemini": ["gemini-2.5-pro"]
                     }
-                }
+                }}
             }"#,
     )
     .unwrap();
@@ -3732,7 +3748,7 @@ fn agent_flags_workflow_repo(tmp: &Path, workflow_toml: &str) -> (PathBuf, PathB
     git_in(&repo, &["commit", "-m", "init"]);
     std::fs::write(
         repo.join(".awman").join("config.json"),
-        r#"{"agentFlags": {"codex": ["--no-daemon"], "claude": ["--verbose"]}}"#,
+        r#"{"agents": {"flags": {"codex": ["--no-daemon"], "claude": ["--verbose"]}}}"#,
     )
     .unwrap();
     (repo, wf)
@@ -3874,7 +3890,7 @@ async fn record_leader_launch(
     let invoking = agent_flags_session(
         tmp,
         "repo",
-        Some(r#"{"agentFlags": {"codex": ["--no-daemon"]}}"#),
+        Some(r#"{"agents": {"flags": {"codex": ["--no-daemon"]}}}"#),
     );
     let worktree = agent_flags_session(tmp, "worktree", None);
 
@@ -3969,21 +3985,22 @@ async fn dynamic_leader_keeps_config_when_cli_targets_another_agent() {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn interactive_setup_and_teardown_factories_use_each_sessions_policy() {
-    use crate::data::config::env::{EnvSnapshot, AWMAN_CONFIG_HOME};
+    use crate::data::config::env::EnvSnapshot;
+    use crate::data::fs::data_paths::AWMAN_HOME;
     use crate::data::session::{SessionOpenOptions, StaticGitRootResolver};
     use crate::engine::agent_runtime::DetectedRuntime;
     use crate::engine::container::FakeBuiltin;
     let home = tempfile::tempdir().unwrap();
     std::fs::write(
         home.path().join("config.json"),
-        r#"{"builtin":{"network":{"mode":"allowlist","allow":["*.example.com"]}}}"#,
+        r#"{"runtime":{"builtin":{"network":{"mode":"allowlist","allow":["*.example.com"]}}}}"#,
     )
     .unwrap();
     let fake = Arc::new(FakeBuiltin::new());
     fake.import("phase-image");
     for (policy, should_fail) in [
         (
-            r#"{"vcpus":1,"memoryMib":1024,"network":{"allow":["api.example.com"]}}"#,
+            r#"{"vcpus":1,"memory":"1024MiB","network":{"allow":["api.example.com"]}}"#,
             false,
         ),
         (r#"{"vcpus":3,"network":{"mode":"none"}}"#, false),
@@ -3994,7 +4011,7 @@ async fn interactive_setup_and_teardown_factories_use_each_sessions_policy() {
         std::fs::create_dir(repo.path().join(".awman")).unwrap();
         std::fs::write(
             repo.path().join(".awman/config.json"),
-            format!(r#"{{"builtin":{policy}}}"#),
+            format!(r#"{{"runtime":{{"builtin":{policy}}}}}"#),
         )
         .unwrap();
         let session = Session::open(
@@ -4002,7 +4019,7 @@ async fn interactive_setup_and_teardown_factories_use_each_sessions_policy() {
             &StaticGitRootResolver::new(repo.path()),
             SessionOpenOptions {
                 env: Some(EnvSnapshot::with_overrides([(
-                    AWMAN_CONFIG_HOME,
+                    AWMAN_HOME,
                     home.path().to_str().unwrap(),
                 )])),
                 ..Default::default()
@@ -4075,8 +4092,8 @@ async fn interactive_setup_and_teardown_factories_use_each_sessions_policy() {
 // ─── WI 0132 Parts B and C: merge-back policy and merge-fix prompt ───────────
 
 fn merge_policy_flags(
-    dirty: Option<crate::data::config::repo::OnDirtyMergeTarget>,
-    failure: Option<crate::data::config::repo::OnMergeFailure>,
+    dirty: Option<crate::data::config::worktree::OnDirtyMergeTarget>,
+    failure: Option<crate::data::config::worktree::OnMergeFailure>,
 ) -> ExecWorkflowCommandFlags {
     ExecWorkflowCommandFlags {
         prerequisites: Default::default(),
@@ -4125,7 +4142,7 @@ fn merge_policy_is_unset_without_flags_or_config() {
 
 #[test]
 fn merge_policy_global_config_applies() {
-    use crate::data::config::repo::{OnDirtyMergeTarget as D, OnMergeFailure as F};
+    use crate::data::config::worktree::{OnDirtyMergeTarget as D, OnMergeFailure as F};
     let tmp = tempfile::tempdir().unwrap();
     let session = merge_policy_session(
         tmp.path(),
@@ -4139,7 +4156,7 @@ fn merge_policy_global_config_applies() {
 
 #[test]
 fn merge_policy_repo_config_beats_global() {
-    use crate::data::config::repo::{OnDirtyMergeTarget as D, OnMergeFailure as F};
+    use crate::data::config::worktree::{OnDirtyMergeTarget as D, OnMergeFailure as F};
     let tmp = tempfile::tempdir().unwrap();
     let session = merge_policy_session(
         tmp.path(),
@@ -4155,7 +4172,7 @@ fn merge_policy_repo_config_beats_global() {
 
 #[test]
 fn merge_policy_flag_beats_repo_and_global() {
-    use crate::data::config::repo::{OnDirtyMergeTarget as D, OnMergeFailure as F};
+    use crate::data::config::worktree::{OnDirtyMergeTarget as D, OnMergeFailure as F};
     let tmp = tempfile::tempdir().unwrap();
     let session = merge_policy_session(
         tmp.path(),
@@ -4172,7 +4189,7 @@ fn merge_policy_flag_beats_repo_and_global() {
 
 #[test]
 fn merge_policy_settings_resolve_independently() {
-    use crate::data::config::repo::{OnDirtyMergeTarget as D, OnMergeFailure as F};
+    use crate::data::config::worktree::{OnDirtyMergeTarget as D, OnMergeFailure as F};
     let tmp = tempfile::tempdir().unwrap();
     let session = merge_policy_session(
         tmp.path(),
@@ -4599,7 +4616,7 @@ async fn wi0149_dynamic_preflight_before_leader_and_narrowing_excludes_ssh_from_
         root,
         crate::data::config::env::EnvSnapshot::with_overrides([
             ("HOME", home.path().to_str().unwrap()),
-            ("AWMAN_CONFIG_HOME", home.path().to_str().unwrap()),
+            ("AWMAN_HOME", home.path().to_str().unwrap()),
         ]),
     );
     let messages = Arc::new(Mutex::new(Vec::<UserMessage>::new()));

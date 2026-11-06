@@ -98,10 +98,13 @@ fn every_variant() -> Vec<CommandError> {
             root: "/r".into(),
             git_root: "/g".into(),
         },
-        CommandError::ApiServerAlreadyRunning { pid: 1 },
-        CommandError::ApiServerNotRunning,
-        CommandError::ApiServerAuthMissing,
-        CommandError::SquadKeyMissing,
+        CommandError::DaemonAlreadyRunning { pid: 1 },
+        CommandError::DaemonNotRunning,
+        CommandError::DaemonNoFeatures,
+        CommandError::DaemonHttpStatus {
+            status: 409,
+            body: "b".into(),
+        },
         CommandError::SessionInvalidType { got: "x".into() },
         CommandError::SessionWorkdirRequired,
         CommandError::SessionWorkdirUnresolvable { path: "/p".into() },
@@ -123,18 +126,18 @@ fn every_variant() -> Vec<CommandError> {
         },
         CommandError::RemoteSessionMissing,
         CommandError::RemoteSessionKillFailed {
-            session_id: "s".into(),
+            session_id: "ses_03c7c0ace395d80182db07ae2c30f034".into(),
             reason: "r".into(),
         },
         CommandError::WorkItemNotFound { number: 1 },
         CommandError::SpecTemplateMissing { path: "/p".into() },
         CommandError::InvalidOverlaySpec {
-            spec: "s".into(),
+            spec: "ses_03c7c0ace395d80182db07ae2c30f034".into(),
             reason: "r".into(),
         },
         CommandError::UnknownConfigField {
             name: "n".into(),
-            suggestions: "s".into(),
+            suggestions: "ses_03c7c0ace395d80182db07ae2c30f034".into(),
         },
         CommandError::InteractiveInputUnavailable {
             prompt: "prompt".into(),
@@ -218,10 +221,10 @@ fn variant_witness(error: &CommandError) -> &'static str {
         CommandError::RemoteTransport(_) => "RemoteTransport",
         CommandError::ApiWorkdirNotFound { .. } => "ApiWorkdirNotFound",
         CommandError::ApiWorkdirRootInvalid { .. } => "ApiWorkdirRootInvalid",
-        CommandError::ApiServerAlreadyRunning { .. } => "ApiServerAlreadyRunning",
-        CommandError::ApiServerNotRunning => "ApiServerNotRunning",
-        CommandError::ApiServerAuthMissing => "ApiServerAuthMissing",
-        CommandError::SquadKeyMissing => "SquadKeyMissing",
+        CommandError::DaemonAlreadyRunning { .. } => "DaemonAlreadyRunning",
+        CommandError::DaemonNotRunning => "DaemonNotRunning",
+        CommandError::DaemonNoFeatures => "DaemonNoFeatures",
+        CommandError::DaemonHttpStatus { .. } => "DaemonHttpStatus",
         CommandError::SessionInvalidType { .. } => "SessionInvalidType",
         CommandError::SessionWorkdirRequired => "SessionWorkdirRequired",
         CommandError::SessionWorkdirUnresolvable { .. } => "SessionWorkdirUnresolvable",
@@ -795,13 +798,7 @@ mod server {
             git(&path, &["config", "user.email", "fixture@awman.test"]);
             git(&path, &["add", "-A"]);
             git(&path, &["commit", "-q", "-m", "base"]);
-            let config = home.home().join(".config/awman");
-            std::fs::create_dir_all(&config).unwrap();
-            std::fs::write(
-                config.join("config.json"),
-                json!({"api": {"workDirs": [path.display().to_string()]}}).to_string(),
-            )
-            .unwrap();
+            home.write_config(json!({"daemon":{"features":{"worker":{"push":{"workDirs":{"allow":[path.display().to_string()]}}}}}}));
             Self { _dir: dir, path }
         }
 
@@ -846,19 +843,19 @@ mod server {
         let (status, body) = http(
             server,
             reqwest::Method::POST,
-            "/v1/commands",
+            "/v1/worker/commands",
             Some(session),
             Some(json!({"subcommand": subcommand, "args": args})),
         )
         .await;
         assert_eq!(status, 202, "{body}");
-        body["command_id"].as_str().unwrap().to_string()
+        body["id"].as_str().unwrap().to_string()
     }
 
     async fn wait_status(server: &ApiServer, id: &str, wanted: &[&str]) -> Value {
         let deadline = Instant::now() + Duration::from_secs(90);
         loop {
-            let record = server.get(&format!("/v1/commands/{id}/status")).await;
+            let record = server.get(&format!("/v1/worker/commands/{id}")).await;
             if wanted.contains(&record["status"].as_str().unwrap_or("")) {
                 return record;
             }
@@ -1696,7 +1693,7 @@ exit 0
         assert_eq!(status["result"]["failure"]["stage"], "push");
     }
 
-    // ── /v1/runs setup failure ───────────────────────────────────────────────
+    // ── /v1/worker/runs setup failure ───────────────────────────────────────────────
 
     #[tokio::test(flavor = "multi_thread")]
     async fn real_network_runs_setup_failure_gets_one_final_status_with_stage_setup() {
@@ -1705,11 +1702,11 @@ exit 0
         let (status, created) = http(
             &server,
             reqwest::Method::POST,
-            "/v1/runs",
+            "/v1/worker/runs",
             None,
             Some(json!({
                 "session": remote(BAD_REPO),
-                "command": {"subcommand": "exec prompt", "args": ["x"]},
+                "command": {"subcommand": "exec prompt", "args": ["test/x"]},
             })),
         )
         .await;
@@ -1735,7 +1732,7 @@ exit 0
         // An unowned failure writes its row twice: `error`, then again with the
         // output summary just before the final pair. Compare with the settled row.
         let id = created["command_id"].as_str().unwrap();
-        let record = server.get(&format!("/v1/commands/{id}/status")).await;
+        let record = server.get(&format!("/v1/worker/commands/{id}")).await;
         let final_status = assert_one_final_status(&events, &record);
         assert_eq!(final_status["status"], "error");
         assert_eq!(final_status["exit_code"], 1);
@@ -1757,7 +1754,7 @@ exit 0
         let (status, body) = http(
             &server,
             reqwest::Method::POST,
-            &format!("/v1/commands/{command}/cancel"),
+            &format!("/v1/worker/commands/{command}/cancel"),
             None,
             Some(Value::Null),
         )
@@ -1792,13 +1789,13 @@ exit 0
         let first = submit(&server, &id, "exec prompt", &["occupy the session"]).await;
         wait_slow_agent(&home).await;
         let queued = submit(&server, &id, "exec prompt", &["never runs"]).await;
-        let before = server.get(&format!("/v1/commands/{queued}/status")).await;
+        let before = server.get(&format!("/v1/worker/commands/{queued}")).await;
         assert_eq!(before["status"], "queued", "{before}");
 
         let (status, body) = http(
             &server,
             reqwest::Method::POST,
-            &format!("/v1/commands/{queued}/cancel"),
+            &format!("/v1/worker/commands/{queued}/cancel"),
             None,
             Some(Value::Null),
         )
@@ -1820,7 +1817,7 @@ exit 0
         let _ = http(
             &server,
             reqwest::Method::POST,
-            &format!("/v1/commands/{first}/cancel"),
+            &format!("/v1/worker/commands/{first}/cancel"),
             None,
             Some(Value::Null),
         )
@@ -1876,8 +1873,10 @@ prompt = "work slowly"
         assert_eq!(record["attempt"], 2, "{record}");
 
         // The kept step's output survived the restart and the resume.
-        let listing = server.get(&format!("/v1/commands/{id}/outputs")).await;
-        let paths: Vec<&str> = listing["files"]
+        let listing = server
+            .get(&format!("/v1/worker/commands/{id}/outputs"))
+            .await;
+        let paths: Vec<&str> = listing["items"]
             .as_array()
             .expect("files")
             .iter()
@@ -1885,7 +1884,7 @@ prompt = "work slowly"
             .collect();
         assert_eq!(paths, ["first/result.json"], "{listing}");
         let body = reqwest::get(format!(
-            "{}/v1/commands/{id}/outputs/first/result.json",
+            "{}/v1/worker/commands/{id}/outputs/first/result.json",
             server.url
         ))
         .await
@@ -1922,7 +1921,9 @@ prompt = "work slowly"
         assert_eq!(first_attempt_index, Some(&json!(1)));
 
         // The workflow view agrees with the events, after the step finished.
-        let view = server.get(&format!("/v1/commands/{id}/workflow")).await;
+        let view = server
+            .get(&format!("/v1/worker/commands/{id}/workflow"))
+            .await;
         let steps = view["steps"].as_array().expect("steps");
         assert_eq!(steps[0]["status"], "succeeded", "{view}");
         assert!(steps[0]["container"].is_string(), "{view}");
@@ -2030,7 +2031,11 @@ mod result_shape {
 
     fn writer() -> (tempfile::TempDir, CommandStateWriter) {
         let dir = tempfile::tempdir().unwrap();
-        let writer = CommandStateWriter::new(ApiPaths::from_root(dir.path()), "s", "c");
+        let writer = CommandStateWriter::new(
+            ApiPaths::from_root(dir.path()),
+            "ses_03c7c0ace395d80182db07ae2c30f034",
+            "cmd_4a8a08f09d37b73795649038408b5f33",
+        );
         (dir, writer)
     }
 
@@ -2059,7 +2064,12 @@ mod result_shape {
         let (_dir, writer) = writer();
         writer.record_failed_step(step("a", 0, FailedStepPhase::Setup, 1));
         writer.record_failed_step(step("b", 0, FailedStepPhase::Main, 1));
-        writer.record_failed_step(step("c", 0, FailedStepPhase::Teardown, 1));
+        writer.record_failed_step(step(
+            "cmd_4a8a08f09d37b73795649038408b5f33",
+            0,
+            FailedStepPhase::Teardown,
+            1,
+        ));
         assert_eq!(writer.result_contributions().failed_steps.len(), 3);
     }
 

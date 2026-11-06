@@ -2,23 +2,24 @@
 
 use std::path::{Path, PathBuf};
 
-use awman::data::config::env::{EnvSnapshot, AWMAN_CONFIG_HOME, AWMAN_SQUAD_ROOT, XDG_DATA_HOME};
+use awman::data::config::env::{EnvSnapshot, XDG_DATA_HOME};
+use awman::data::fs::data_paths::AWMAN_HOME;
 use awman::data::fs::SquadPaths;
 
 #[test]
-fn squad_paths_env_precedence_prefers_squad_root_then_config_then_xdg() {
+fn squad_paths_env_precedence_prefers_awman_home_then_xdg() {
+    // The removed AWMAN_SQUAD_ROOT is ignored.
     let env = EnvSnapshot::with_overrides([
-        (AWMAN_SQUAD_ROOT, "/explicit/squad"),
-        (AWMAN_CONFIG_HOME, "/config"),
+        ("AWMAN_SQUAD_ROOT", "/explicit/squad"),
+        (AWMAN_HOME, "/config"),
         (XDG_DATA_HOME, "/xdg/data"),
     ]);
     assert_eq!(
         SquadPaths::from_env(&env).unwrap().root(),
-        Path::new("/explicit/squad")
+        Path::new("/config/squad")
     );
 
-    let env =
-        EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, "/config"), (XDG_DATA_HOME, "/xdg/data")]);
+    let env = EnvSnapshot::with_overrides([(AWMAN_HOME, "/config"), (XDG_DATA_HOME, "/xdg/data")]);
     assert_eq!(
         SquadPaths::from_env(&env).unwrap().root(),
         Path::new("/config/squad")

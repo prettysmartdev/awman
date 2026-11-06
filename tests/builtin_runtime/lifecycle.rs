@@ -88,7 +88,7 @@ pub(crate) fn awman(binary: &Path, repo: &Path, home: &Path, bin_dir: &Path) -> 
         .env("TMPDIR", home)
         .env("PATH", format!("{}:/usr/bin:/bin", bin_dir.display()))
         .env("AWMAN_TEST_ISOLATION", "0")
-        .env("AWMAN_CONFIG_HOME", home.join(".awman"));
+        .env("AWMAN_HOME", home.join(".awman"));
     command
 }
 

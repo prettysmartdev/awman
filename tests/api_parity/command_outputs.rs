@@ -22,10 +22,10 @@ use awman::engine::auth::AuthEngine;
 use awman::engine::container::ContainerRuntime;
 use awman::engine::git::GitEngine;
 use awman::engine::overlay::OverlayEngine;
-use awman::frontend::api::routes::{build_router, AppState, AuthMode, API_FEATURES};
+use awman::frontend::api::routes::{build_router, AppState, API_FEATURES};
 use axum::http::header::CONTENT_TYPE;
 
-const SESSION: &str = "surface-session";
+const SESSION: &str = "ses_8650a82d8311b72b61b1d10bead4dec8";
 
 fn state(root: &std::path::Path) -> Arc<AppState> {
     let paths = ApiPaths::from_root(root);
@@ -42,7 +42,6 @@ fn state(root: &std::path::Path) -> Arc<AppState> {
         overlay_engine: overlay.clone(),
         auth_engine: Arc::new(AuthEngine::with_paths(auth_paths, paths.clone())),
         agent_engine: Arc::new(AgentEngine::new(overlay, runtime)),
-        config_notices: Default::default(),
         workflow_state_store: Arc::new(WorkflowStateStore::at_git_root(paths.root())),
         credential_monitor: None,
         global_config: Arc::new(Default::default()),
@@ -66,6 +65,8 @@ fn state(root: &std::path::Path) -> Arc<AppState> {
         })
         .unwrap();
     Arc::new(AppState {
+        live_config: std::sync::RwLock::new(None),
+        settings_tx: None,
         lifecycle_store,
         setup_cancels,
         canceller,
@@ -75,7 +76,6 @@ fn state(root: &std::path::Path) -> Arc<AppState> {
         workdir_roots: vec![],
         started_at: Instant::now(),
         task_handles: tokio::sync::Mutex::new(Vec::new()),
-        auth_mode: AuthMode::Disabled,
         engines,
         sessions: Arc::new(awman::data::session_manager::SessionManager::in_memory(
             awman::data::config::env::EnvSnapshot::empty(),
@@ -113,7 +113,7 @@ fn command(state: &AppState, id: &str) -> std::path::PathBuf {
 async fn outputs_routes_list_fetch_headers_and_reject_unsafe_paths() {
     let tmp = tempfile::tempdir().unwrap();
     let app = state(tmp.path());
-    let output = command(&app, "outputs");
+    let output = command(&app, "cmd_25bef4f25b60430e2ef377f1a2b97577");
     std::fs::create_dir_all(output.join("nested")).unwrap();
     std::fs::write(output.join("nested/report.json"), b"{\"ok\":true}").unwrap();
     std::fs::write(output.join("plain.unknown"), b"data").unwrap();
@@ -127,25 +127,27 @@ async fn outputs_routes_list_fetch_headers_and_reject_unsafe_paths() {
     let base = server(app.clone()).await;
     let client = reqwest::Client::new();
     let listing: serde_json::Value = client
-        .get(format!("{base}/v1/commands/outputs/outputs"))
+        .get(format!(
+            "{base}/v1/worker/commands/cmd_25bef4f25b60430e2ef377f1a2b97577/outputs"
+        ))
         .send()
         .await
         .unwrap()
         .json()
         .await
         .unwrap();
-    let paths: Vec<_> = listing["files"]
+    let paths: Vec<_> = listing["items"]
         .as_array()
         .unwrap()
         .iter()
         .map(|file| file["path"].as_str().unwrap())
         .collect();
     assert_eq!(paths, ["nested/report.json", "plain.unknown"]);
-    assert_eq!(listing["total"]["files"], 2);
+    assert_eq!(listing["items"].as_array().unwrap().len(), 2);
 
     let response = client
         .get(format!(
-            "{base}/v1/commands/outputs/outputs/nested/report.json"
+            "{base}/v1/worker/commands/cmd_25bef4f25b60430e2ef377f1a2b97577/outputs/nested/report.json"
         ))
         .send()
         .await
@@ -154,7 +156,9 @@ async fn outputs_routes_list_fetch_headers_and_reject_unsafe_paths() {
     assert_eq!(response.headers()[CONTENT_TYPE], "application/json");
     assert_eq!(response.bytes().await.unwrap(), "{\"ok\":true}");
     let unknown_type = client
-        .get(format!("{base}/v1/commands/outputs/outputs/plain.unknown"))
+        .get(format!(
+            "{base}/v1/worker/commands/cmd_25bef4f25b60430e2ef377f1a2b97577/outputs/plain.unknown"
+        ))
         .send()
         .await
         .unwrap();
@@ -167,7 +171,9 @@ async fn outputs_routes_list_fetch_headers_and_reject_unsafe_paths() {
     for path in ["passwd-link", "host-dir/passwd"] {
         assert_eq!(
             client
-                .get(format!("{base}/v1/commands/outputs/outputs/{path}"))
+                .get(format!(
+                    "{base}/v1/worker/commands/cmd_25bef4f25b60430e2ef377f1a2b97577/outputs/{path}"
+                ))
                 .send()
                 .await
                 .unwrap()
@@ -201,9 +207,9 @@ async fn output_handler_returns_400_for_dot_absolute_and_empty_segments() {
 fn prompt_output_directory_clears_on_rerun_and_workflow_preparation_keeps_files() {
     use awman::data::fs::command_outputs::prepare_output_dir;
     let tmp = tempfile::tempdir().unwrap();
-    let dir = tmp.path().join("outputs");
+    let dir = tmp.path().join("cmd_25bef4f25b60430e2ef377f1a2b97577");
     prepare_output_dir(&dir, true).unwrap();
-    std::fs::write(dir.join("old.json"), "old").unwrap();
+    std::fs::write(dir.join("old.json"), "cmd_149603e6c03516362a8da23f624db945").unwrap();
     prepare_output_dir(&dir, true).unwrap();
     assert!(
         !dir.join("old.json").exists(),
@@ -221,23 +227,27 @@ fn prompt_output_directory_clears_on_rerun_and_workflow_preparation_keeps_files(
 async fn outputs_route_lists_but_does_not_serve_files_over_16_mib() {
     let tmp = tempfile::tempdir().unwrap();
     let app = state(tmp.path());
-    let output = command(&app, "large-output");
+    let output = command(&app, "cmd_e7390b62f56cb49ed274f49139599ea5");
     std::fs::create_dir_all(&output).unwrap();
     let file = std::fs::File::create(output.join("large.bin")).unwrap();
     file.set_len(16 * 1024 * 1024 + 1).unwrap();
     let base = server(app).await;
     let client = reqwest::Client::new();
     let listing: serde_json::Value = client
-        .get(format!("{base}/v1/commands/large-output/outputs"))
+        .get(format!(
+            "{base}/v1/worker/commands/cmd_e7390b62f56cb49ed274f49139599ea5/outputs"
+        ))
         .send()
         .await
         .unwrap()
         .json()
         .await
         .unwrap();
-    assert_eq!(listing["total"]["bytes"], 16 * 1024 * 1024 + 1);
+    assert_eq!(listing["items"][0]["size_bytes"], 16 * 1024 * 1024 + 1);
     let response = client
-        .get(format!("{base}/v1/commands/large-output/outputs/large.bin"))
+        .get(format!(
+            "{base}/v1/worker/commands/cmd_e7390b62f56cb49ed274f49139599ea5/outputs/large.bin"
+        ))
         .send()
         .await
         .unwrap();
@@ -261,11 +271,11 @@ fn log_event(sequence: u64, step: &str, index: usize, text: &str) -> ExecutionEv
 async fn step_filter_applies_to_replay_and_resumes_from_its_global_cursor() {
     let tmp = tempfile::tempdir().unwrap();
     let app = state(tmp.path());
-    command(&app, "step-filter");
+    command(&app, "cmd_317f2b45b3ae38b15bbc4a2ccf291b41");
     let mut writer = awman::data::fs::api_command_log::CommandLogWriter::open_append(
         &app.paths,
         SESSION,
-        "step-filter",
+        "cmd_317f2b45b3ae38b15bbc4a2ccf291b41",
     )
     .await
     .unwrap();
@@ -286,12 +296,19 @@ async fn step_filter_applies_to_replay_and_resumes_from_its_global_cursor() {
     writer.write_event(&done).await;
     writer.flush().await;
     app.store
-        .complete_command("step-filter", CommandStatus::Done, Some(0), None)
+        .complete_command(
+            "cmd_317f2b45b3ae38b15bbc4a2ccf291b41",
+            CommandStatus::Done,
+            Some(0),
+            None,
+        )
         .unwrap();
     let base = server(app).await;
     let client = reqwest::Client::new();
     let first = client
-        .get(format!("{base}/v1/commands/step-filter/logs?step=alpha"))
+        .get(format!(
+            "{base}/v1/worker/commands/cmd_317f2b45b3ae38b15bbc4a2ccf291b41/events?step=alpha"
+        ))
         .send()
         .await
         .unwrap()
@@ -308,7 +325,9 @@ async fn step_filter_applies_to_replay_and_resumes_from_its_global_cursor() {
     assert!(first.contains("event: done"));
 
     let resumed = client
-        .get(format!("{base}/v1/commands/step-filter/logs?step=alpha"))
+        .get(format!(
+            "{base}/v1/worker/commands/cmd_317f2b45b3ae38b15bbc4a2ccf291b41/events?step=alpha"
+        ))
         .header("Last-Event-ID", "1:2")
         .send()
         .await
@@ -326,16 +345,16 @@ async fn step_filter_applies_to_live_bus_events_and_keeps_terminal_events() {
     use awman::command::commands::api_server::event_bus::EventBus;
     let tmp = tempfile::tempdir().unwrap();
     let app = state(tmp.path());
-    command(&app, "live-step-filter");
+    command(&app, "cmd_28921b79295af5f104541f533de7e2bf");
     let bus = Arc::new(EventBus::for_attempt(32, 1));
     app.event_buses
         .lock()
         .await
-        .insert("live-step-filter".into(), bus.clone());
+        .insert("cmd_28921b79295af5f104541f533de7e2bf".into(), bus.clone());
     let base = server(app.clone()).await;
     let response = reqwest::Client::new()
         .get(format!(
-            "{base}/v1/commands/live-step-filter/logs?step=alpha"
+            "{base}/v1/worker/commands/cmd_28921b79295af5f104541f533de7e2bf/events?step=alpha"
         ))
         .send()
         .await
@@ -350,7 +369,12 @@ async fn step_filter_applies_to_live_bus_events_and_keeps_terminal_events() {
     alpha.emit(EventPayload::StdoutLine("live alpha".into()));
     beta.emit(EventPayload::StdoutLine("live beta hidden".into()));
     app.store
-        .complete_command("live-step-filter", CommandStatus::Done, Some(0), None)
+        .complete_command(
+            "cmd_28921b79295af5f104541f533de7e2bf",
+            CommandStatus::Done,
+            Some(0),
+            None,
+        )
         .unwrap();
     bus.sender().emit(EventPayload::Done);
     let body = tokio::time::timeout(std::time::Duration::from_secs(3), response.text())
@@ -369,7 +393,7 @@ async fn step_filter_applies_to_live_bus_events_and_keeps_terminal_events() {
 async fn workflow_alias_matches_canonical_route_and_status_is_snake_case() {
     let tmp = tempfile::tempdir().unwrap();
     let app = state(tmp.path());
-    command(&app, "workflow-alias");
+    command(&app, "cmd_5ebc828d04f6b77e3840ab71c121ae91");
     use awman::data::workflow_definition::WorkflowStep;
     use awman::data::workflow_state::StepState;
     let step = WorkflowStep {
@@ -387,12 +411,14 @@ async fn workflow_alias_matches_canonical_route_and_status_is_snake_case() {
         .step_states
         .insert("done-step".into(), StepState::Succeeded);
     app.paths
-        .write_command_workflow_state(SESSION, "workflow-alias", &workflow)
+        .write_command_workflow_state(SESSION, "cmd_5ebc828d04f6b77e3840ab71c121ae91", &workflow)
         .unwrap();
     let base = server(app).await;
     let client = reqwest::Client::new();
     let a = client
-        .get(format!("{base}/v1/workflows/workflow-alias"))
+        .get(format!(
+            "{base}/v1/worker/commands/cmd_5ebc828d04f6b77e3840ab71c121ae91/workflow"
+        ))
         .send()
         .await
         .unwrap()
@@ -400,7 +426,9 @@ async fn workflow_alias_matches_canonical_route_and_status_is_snake_case() {
         .await
         .unwrap();
     let b = client
-        .get(format!("{base}/v1/commands/workflow-alias/workflow"))
+        .get(format!(
+            "{base}/v1/worker/commands/cmd_5ebc828d04f6b77e3840ab71c121ae91/workflow"
+        ))
         .send()
         .await
         .unwrap()
@@ -616,7 +644,7 @@ fn api_workflow_view_stages_match_shared_tui_grouping_with_setup_and_teardown() 
         status: PhaseStepStatus::Succeeded,
     }];
     state.teardown_step_states = vec![PhaseStepState {
-        description: "cleanup".into(),
+        description: "ses_ecfb9f08f09baba9587e427bc8a820b1".into(),
         status: PhaseStepStatus::Pending,
     }];
     state
@@ -707,14 +735,20 @@ fn workflow_attempt_counter_survives_restore_and_retry() {
 async fn active_outputs_are_downloads_with_a_scriptless_sandbox() {
     let tmp = tempfile::tempdir().unwrap();
     let app = state(tmp.path());
-    let output = command(&app, "active");
+    let output = command(&app, "cmd_c76a5e84e4bdee527e274ea30c680d79");
     std::fs::create_dir_all(&output).unwrap();
     let base = server(app).await;
     for path in ["report.html", "report.svg"] {
-        std::fs::write(output.join(path), "<script>fetch('/v1/sessions')</script>").unwrap();
-        let response = reqwest::get(format!("{base}/v1/commands/active/outputs/{path}"))
-            .await
-            .unwrap();
+        std::fs::write(
+            output.join(path),
+            "<script>fetch('/v1/worker/sessions')</script>",
+        )
+        .unwrap();
+        let response = reqwest::get(format!(
+            "{base}/v1/worker/commands/cmd_c76a5e84e4bdee527e274ea30c680d79/outputs/{path}"
+        ))
+        .await
+        .unwrap();
         assert_eq!(response.status(), 200);
         assert_eq!(response.headers()["content-disposition"], "attachment");
         assert_eq!(
@@ -729,9 +763,11 @@ async fn active_outputs_are_downloads_with_a_scriptless_sandbox() {
 async fn json_log_snapshots_apply_the_step_filter_without_renumbering() {
     let tmp = tempfile::tempdir().unwrap();
     let app = state(tmp.path());
-    command(&app, "snapshot");
+    command(&app, "cmd_c322d3de29d2b0c5e2e011dad5e77df2");
     let mut writer = awman::data::fs::api_command_log::CommandLogWriter::open_append(
-        &app.paths, SESSION, "snapshot",
+        &app.paths,
+        SESSION,
+        "cmd_c322d3de29d2b0c5e2e011dad5e77df2",
     )
     .await
     .unwrap();
@@ -749,7 +785,7 @@ async fn json_log_snapshots_apply_the_step_filter_without_renumbering() {
     writer.flush().await;
     let base = server(app).await;
     let json: serde_json::Value = reqwest::get(format!(
-        "{base}/v1/commands/snapshot/logs?format=json&step=alpha"
+        "{base}/v1/worker/commands/cmd_c322d3de29d2b0c5e2e011dad5e77df2/events?format=json&step=alpha"
     ))
     .await
     .unwrap()
@@ -775,7 +811,7 @@ async fn terminal_row_waits_for_the_actual_final_pair_and_preserves_resume() {
     for step in ["", "?step=alpha"] {
         let tmp = tempfile::tempdir().unwrap();
         let app = state(tmp.path());
-        command(&app, "race");
+        command(&app, "cmd_2e2a7a2e57d1578bf33a559b20c463f6");
         let result = CommandResult {
             outcome: Some(CommandStatusKind::Done),
             exit_code: Some(0),
@@ -783,15 +819,19 @@ async fn terminal_row_waits_for_the_actual_final_pair_and_preserves_resume() {
         };
         app.store
             .complete_command(
-                "race",
+                "cmd_2e2a7a2e57d1578bf33a559b20c463f6",
                 CommandStatus::Done,
                 Some(0),
                 Some(&serde_json::to_string(&result).unwrap()),
             )
             .unwrap();
-        let mut writer = CommandLogWriter::open_append(&app.paths, SESSION, "race")
-            .await
-            .unwrap();
+        let mut writer = CommandLogWriter::open_append(
+            &app.paths,
+            SESSION,
+            "cmd_2e2a7a2e57d1578bf33a559b20c463f6",
+        )
+        .await
+        .unwrap();
         writer
             .write_event(&ExecutionEvent {
                 timestamp: chrono::Utc::now(),
@@ -803,7 +843,8 @@ async fn terminal_row_waits_for_the_actual_final_pair_and_preserves_resume() {
             .await;
         writer.flush().await;
         let base = server(app).await;
-        let url = format!("{base}/v1/commands/race/logs{step}");
+        let url =
+            format!("{base}/v1/worker/commands/cmd_2e2a7a2e57d1578bf33a559b20c463f6/events{step}");
         let request_url = url.clone();
         let request = tokio::spawn(async move {
             reqwest::get(request_url)
@@ -870,7 +911,7 @@ async fn terminal_row_waits_for_the_actual_final_pair_and_preserves_resume() {
 async fn oversized_sparse_listing_returns_busy_without_hashing_the_entire_file() {
     let tmp = tempfile::tempdir().unwrap();
     let app = state(tmp.path());
-    let output = command(&app, "sparse");
+    let output = command(&app, "cmd_5dabba66ddc7b1e6f193ff73d3c55e94");
     std::fs::create_dir_all(&output).unwrap();
     std::fs::File::create(output.join("huge"))
         .unwrap()
@@ -879,7 +920,9 @@ async fn oversized_sparse_listing_returns_busy_without_hashing_the_entire_file()
     let base = server(app).await;
     let response = tokio::time::timeout(
         std::time::Duration::from_secs(2),
-        reqwest::get(format!("{base}/v1/commands/sparse/outputs")),
+        reqwest::get(format!(
+            "{base}/v1/worker/commands/cmd_5dabba66ddc7b1e6f193ff73d3c55e94/outputs"
+        )),
     )
     .await
     .unwrap()
@@ -893,7 +936,7 @@ async fn a_terminal_row_without_a_writable_log_recovers_without_minting_cursor_i
     use awman::data::fs::api_db::CommandResult;
     let tmp = tempfile::tempdir().unwrap();
     let app = state(tmp.path());
-    command(&app, "no-log");
+    command(&app, "cmd_2bf923c4efea09c7d7b9c89764c5b815");
     let result = CommandResult {
         outcome: Some(CommandStatusKind::Error),
         exit_code: Some(1),
@@ -901,7 +944,7 @@ async fn a_terminal_row_without_a_writable_log_recovers_without_minting_cursor_i
     };
     app.store
         .complete_command(
-            "no-log",
+            "cmd_2bf923c4efea09c7d7b9c89764c5b815",
             CommandStatus::Error,
             Some(1),
             Some(&serde_json::to_string(&result).unwrap()),
@@ -909,12 +952,14 @@ async fn a_terminal_row_without_a_writable_log_recovers_without_minting_cursor_i
         .unwrap();
     let base = server(app).await;
     let body = tokio::time::timeout(std::time::Duration::from_secs(7), async {
-        reqwest::get(format!("{base}/v1/commands/no-log/logs"))
-            .await
-            .unwrap()
-            .text()
-            .await
-            .unwrap()
+        reqwest::get(format!(
+            "{base}/v1/worker/commands/cmd_2bf923c4efea09c7d7b9c89764c5b815/events"
+        ))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap()
     })
     .await
     .unwrap();

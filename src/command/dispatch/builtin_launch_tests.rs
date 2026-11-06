@@ -11,7 +11,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use super::Engines;
-use crate::data::config::env::{EnvSnapshot, AWMAN_CONFIG_HOME, HOME};
+use crate::data::config::env::{EnvSnapshot, HOME};
+use crate::data::fs::data_paths::AWMAN_HOME;
 use crate::data::ready_summary::ReadyImageAction;
 use crate::data::session::{AgentName, Session, SessionOpenOptions};
 use crate::data::session_manager::SessionManager;
@@ -24,9 +25,9 @@ use crate::engine::error::EngineError;
 
 /// The global policy every test starts from: an allowlist the repos narrow.
 const GLOBAL: &str =
-    r#"{"vcpus":2,"memoryMib":4096,"network":{"mode":"allowlist","allow":["*.example.com"]}}"#;
+    r#"{"vcpus":2,"memory":"4096MiB","network":{"mode":"allowlist","allow":["*.example.com"]}}"#;
 /// Repo A narrows the allowlist to one host and runs smaller VMs.
-const REPO_A: &str = r#"{"vcpus":1,"memoryMib":1024,"network":{"allow":["api.example.com"]}}"#;
+const REPO_A: &str = r#"{"vcpus":1,"memory":"1024MiB","network":{"allow":["api.example.com"]}}"#;
 /// Repo B turns the network off.
 const REPO_B: &str = r#"{"vcpus":3,"network":{"mode":"none"}}"#;
 
@@ -41,7 +42,7 @@ impl Host {
         let home = tempfile::tempdir().unwrap();
         std::fs::write(
             home.path().join("config.json"),
-            format!(r#"{{"builtin":{global_builtin}}}"#),
+            format!(r#"{{"runtime":{{"builtin":{global_builtin}}}}}"#),
         )
         .unwrap();
         Self { home }
@@ -49,7 +50,7 @@ impl Host {
 
     fn env(&self) -> EnvSnapshot {
         let home = self.home.path().to_str().unwrap();
-        EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, home), (HOME, home)])
+        EnvSnapshot::with_overrides([(AWMAN_HOME, home), (HOME, home)])
     }
 
     fn options(&self) -> SessionOpenOptions {
@@ -109,7 +110,11 @@ fn repo(builtin: Option<&str>) -> tempfile::TempDir {
     if let Some(block) = builtin {
         let dir = root.path().join(".awman");
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("config.json"), format!(r#"{{"builtin":{block}}}"#)).unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            format!(r#"{{"runtime":{{"builtin":{block}}}}}"#),
+        )
+        .unwrap();
     }
     root
 }
@@ -362,10 +367,7 @@ fn a_tui_tab_and_an_api_session_each_honour_their_own_builder_flag() {
     let ready = |session: &Session| {
         crate::engine::ready::ReadyEngine::new(
             Some(session.effective_config().builtin_settings().unwrap()),
-            crate::data::config::global::GlobalConfig::data_home_with(
-                session.effective_config().env(),
-            )
-            .unwrap(),
+            crate::data::fs::data_paths::data_home(session.effective_config().env()).unwrap(),
             Arc::new(session.clone()),
             engines.git_engine.clone(),
             engines.overlay_engine.clone(),
@@ -564,7 +566,7 @@ async fn shared_engines_preparation_obeys_each_sessions_builder_flag() {
 
 /// A TUI tab or API session opened with default options gets the process's
 /// environment from its `SessionManager`, so a global network policy under a
-/// relocated `AWMAN_CONFIG_HOME` still confines it. An empty env would read
+/// relocated `AWMAN_HOME` still confines it. An empty env would read
 /// `~/.awman` instead and fall back to the `public` default.
 #[tokio::test(flavor = "multi_thread")]
 async fn sessions_opened_with_default_options_keep_a_relocated_global_policy() {
@@ -574,10 +576,7 @@ async fn sessions_opened_with_default_options_keep_a_relocated_global_policy() {
     let tab = host.tui_tab(plain.path());
     let engines = engines(&fake, &tab);
     for session in [tab, host.api_session(plain.path())] {
-        assert_eq!(
-            session.env().get(AWMAN_CONFIG_HOME),
-            host.env().get(AWMAN_CONFIG_HOME)
-        );
+        assert_eq!(session.env().get(AWMAN_HOME), host.env().get(AWMAN_HOME));
         let vm = launch(&fake, &engines, &session).await;
         assert!(
             !vm.network_enabled,
@@ -596,7 +595,14 @@ async fn sessions_opened_with_default_options_keep_a_relocated_global_policy() {
         },
     )
     .unwrap();
-    assert!(empty.global_config().builtin.is_none());
+    assert!(empty
+        .effective_config()
+        .layers()
+        .global
+        .runtime
+        .as_ref()
+        .and_then(|r| r.builtin.as_ref())
+        .is_none());
 }
 
 /// A worktree checkout is cut from the last commit, so its config can lack
@@ -608,7 +614,7 @@ async fn a_worktree_session_keeps_the_invokers_uncommitted_narrowing() {
     let invoking = repo(Some(REPO_B));
     std::fs::write(
         invoking.path().join(".awman/config.json"),
-        format!(r#"{{"agent":"codex","builtin":{REPO_B}}}"#),
+        format!(r#"{{"agents":{{"default":"codex"}},"runtime":{{"builtin":{REPO_B}}}}}"#),
     )
     .unwrap();
     // The checkout's committed config: no builtin block, a different agent.
@@ -616,7 +622,7 @@ async fn a_worktree_session_keeps_the_invokers_uncommitted_narrowing() {
     std::fs::create_dir_all(checkout.path().join(".awman")).unwrap();
     std::fs::write(
         checkout.path().join(".awman/config.json"),
-        r#"{"agent":"claude"}"#,
+        r#"{"agents":{"default":"claude"}}"#,
     )
     .unwrap();
     let fake = FakeBuiltin::new();

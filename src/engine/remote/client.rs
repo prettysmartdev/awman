@@ -11,7 +11,6 @@ use std::time::Duration;
 use serde::Deserialize;
 
 use crate::data::fs::api_labels::Labels;
-use crate::data::session::Session;
 use crate::data::session_setup_event::SessionSetupState;
 use crate::engine::auth::ApiKey;
 use crate::engine::error::EngineError;
@@ -47,7 +46,7 @@ impl JobStatus {
         matches!(self, Self::Done | Self::Error | Self::Cancelled)
     }
 }
-/// Request body for `POST /v1/sessions`.
+/// Request body for `POST /v1/worker/sessions`.
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct StartSessionRequest {
     pub session_type: String,
@@ -67,9 +66,11 @@ pub struct StartSessionRequest {
     pub labels: Option<Labels>,
 }
 
-/// Command accepted by `POST /v1/commands` or nested in `POST /v1/runs`.
+/// Command accepted by `POST /v1/worker/commands` or nested in `POST /v1/worker/runs`.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct StartCommandRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interaction: Option<crate::data::config::daemon::Interaction>,
     pub subcommand: String,
     pub args: Vec<String>,
     #[serde(default)]
@@ -116,6 +117,7 @@ pub struct CommandListQuery {
 /// `StartSession` response body.
 #[derive(Debug, Clone, Deserialize)]
 pub struct StartSessionResponse {
+    #[serde(rename = "id")]
     pub session_id: String,
 }
 
@@ -128,7 +130,7 @@ pub enum ExecArg {
 }
 
 impl ExecArg {
-    /// The `POST /v1/commands` body for this exec with `flags` (argv tokens).
+    /// The `POST /v1/worker/commands` body for this exec with `flags` (argv tokens).
     /// Flags come first and the positional follows a `--`: `exec prompt`'s
     /// prompt is a greedy trailing argument that would otherwise swallow
     /// every flag after it, and a prompt or path starting with `-` must never
@@ -138,12 +140,21 @@ impl ExecArg {
             ExecArg::Workflow(path) => ("exec workflow", path),
             ExecArg::Prompt(text) => ("exec prompt", Some(text)),
         };
-        let mut args = flags.to_vec();
+        let interaction = flags
+            .iter()
+            .any(|s| s == "--headless" || s == "-n")
+            .then_some(crate::data::config::daemon::Interaction::Headless);
+        let mut args: Vec<String> = flags
+            .iter()
+            .filter(|s| s.as_str() != "--headless" && s.as_str() != "-n")
+            .cloned()
+            .collect();
         if let Some(positional) = positional {
             args.push("--".into());
             args.push(positional);
         }
         StartCommandRequest {
+            interaction,
             subcommand: subcommand.into(),
             args,
             labels: Labels::empty(),
@@ -151,15 +162,16 @@ impl ExecArg {
     }
 }
 
-/// Response for `POST /v1/commands`.
+/// Response for `POST /v1/worker/commands`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ExecJobResponse {
+    #[serde(rename = "id")]
     pub command_id: String,
     #[serde(default)]
     pub flags_applied: serde_json::Value,
 }
 
-/// Response body for `GET /v1/sessions/{id}/status`. Wraps a `SessionSetupState`
+/// Response body for `GET /v1/worker/sessions/{id}/status`. Wraps a `SessionSetupState`
 /// with the session id echoed back.
 #[derive(Debug, Clone, Deserialize)]
 pub struct SessionSetupStatusResponse {
@@ -172,6 +184,12 @@ impl RemoteClient {
     /// The API version prefix. Hardcoded here (rather than at every call site)
     /// and threaded into the shared [`HttpCore`].
     const PREFIX: &'static str = "v1";
+    pub fn for_target(
+        target: &crate::data::config::remote::ResolvedRemoteTarget,
+    ) -> Result<Self, EngineError> {
+        let key = target.api_key.as_deref().map(ApiKey::from_string);
+        Self::new(&target.url, key.as_ref())
+    }
 
     pub const CONNECT_TIMEOUT: Duration = HttpCore::CONNECT_TIMEOUT;
     pub const READ_TIMEOUT: Duration = HttpCore::READ_TIMEOUT;
@@ -203,43 +221,9 @@ impl RemoteClient {
         HttpCore::is_loopback_addr(addr)
     }
 
-    /// API-key resolution per spec §6.5: explicit > AWMAN_API_KEY > global
-    /// config (only when target_addr matches global default_addr).
-    pub fn resolve_api_key(
-        session: &Session,
-        target_addr: &str,
-        explicit: Option<&str>,
-    ) -> Result<Option<ApiKey>, EngineError> {
-        if let Some(explicit) = explicit {
-            let trimmed = explicit.trim();
-            if !trimmed.is_empty() {
-                return Ok(Some(ApiKey::from_string(trimmed)));
-            }
-        }
-        if let Some(env) = session.env().api_key() {
-            let trimmed = env.trim();
-            if !trimmed.is_empty() {
-                return Ok(Some(ApiKey::from_string(trimmed)));
-            }
-        }
-        // Compare canonicalized URLs against the global config default.
-        let global = session.global_config();
-        if let Some(remote) = global.remote.as_ref() {
-            if let (Some(default_addr), Some(default_key)) = (
-                remote.default_addr.as_deref(),
-                remote.default_api_key.as_deref(),
-            ) {
-                if canonicalize_url(target_addr) == canonicalize_url(default_addr) {
-                    return Ok(Some(ApiKey::from_string(default_key)));
-                }
-            }
-        }
-        Ok(None)
-    }
-
     // ─── Typed methods (preferred public surface) ────────────────────────────
 
-    /// `POST /v1/sessions` — request session creation. Returns the new session
+    /// `POST /v1/worker/sessions` — request session creation. Returns the new session
     /// id; setup runs asynchronously and the session is not ready for jobs
     /// until its `/status` endpoint returns `"ready"`.
     pub async fn start_session(
@@ -254,7 +238,7 @@ impl RemoteClient {
         req: &StartSessionRequest,
         idempotency_key: Option<&str>,
     ) -> Result<StartSessionResponse, EngineError> {
-        let url = self.core.url(&["sessions"]);
+        let url = self.core.url(&["worker", "sessions"]);
         let mut request = self.core.http().post(&url).json(req);
         if let Some(key) = idempotency_key {
             request = request.header("Idempotency-Key", key);
@@ -275,20 +259,36 @@ impl RemoteClient {
             .map_err(|e| EngineError::Other(format!("invalid start-session response: {e}")))
     }
 
-    /// `DELETE /v1/sessions/{id}` — kill a session.
+    /// `DELETE /v1/worker/sessions/{id}` — kill a session.
     pub async fn kill_session(&self, session_id: &str) -> Result<(), EngineError> {
-        let _ = self.delete(&["sessions", session_id]).await?;
+        let _ = self.delete(&["worker", "sessions", session_id]).await?;
         Ok(())
     }
 
-    /// `GET /v1/sessions/{id}/status` — fetch the deserialized setup state.
-    pub async fn get_session_status(
+    /// `GET /v1/worker/sessions/{id}/status` — fetch the deserialized setup state.
+    pub async fn get_session(
         &self,
         session_id: &str,
     ) -> Result<SessionSetupStatusResponse, EngineError> {
-        let resp = self.get(&["sessions", session_id, "status"]).await?;
-        serde_json::from_value::<SessionSetupStatusResponse>(resp.body)
-            .map_err(|e| EngineError::Other(format!("invalid session-status response: {e}")))
+        let resp = self.get(&["worker", "sessions", session_id]).await?;
+        let mut state: SessionSetupState = resp
+            .body
+            .get("setup")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|e| EngineError::RemoteTransport(e.to_string()))?
+            .unwrap_or_default();
+        state.status = serde_json::from_value(resp.body["setup_status"].clone())
+            .map_err(|e| EngineError::RemoteTransport(e.to_string()))?;
+        if let Some(error) = resp.body.get("setup_error") {
+            state.error = serde_json::from_value(error.clone())
+                .map_err(|e| EngineError::RemoteTransport(e.to_string()))?;
+        }
+        Ok(SessionSetupStatusResponse {
+            session_id: session_id.into(),
+            state,
+        })
     }
 
     /// Submit an exec-prompt or exec-workflow job. Returns the command id.
@@ -327,9 +327,10 @@ impl RemoteClient {
 
         let resp = self
             .send_command_with_headers(
-                &["commands"],
+                &["worker", "commands"],
                 &[
                     ("subcommand", serde_json::json!(request.subcommand)),
+                    ("interaction", serde_json::json!(request.interaction)),
                     ("args", serde_json::json!(request.args)),
                     ("labels", serde_json::json!(request.labels)),
                 ],
@@ -341,7 +342,7 @@ impl RemoteClient {
             .map_err(|e| EngineError::Other(format!("invalid exec response: {e}")))
     }
 
-    /// `POST /v1/runs` accepts the command immediately; no readiness polling.
+    /// `POST /v1/worker/runs` accepts the command immediately; no readiness polling.
     pub async fn start_run(
         &self,
         request: &StartRunRequest,
@@ -352,7 +353,7 @@ impl RemoteClient {
             .unwrap_or_default();
         let response = self
             .send_command_with_headers(
-                &["runs"],
+                &["worker", "runs"],
                 &[
                     ("session", serde_json::json!(request.session)),
                     ("command", serde_json::json!(request.command)),
@@ -370,7 +371,7 @@ impl RemoteClient {
 
     pub async fn cancel_command(&self, id: &str) -> Result<CancelCommandResponse, EngineError> {
         let response = self
-            .send_command_with_headers(&["commands", id, "cancel"], &[], &[])
+            .send_command_with_headers(&["worker", "commands", id, "cancel"], &[], &[])
             .await?;
         serde_json::from_value(response.body)
             .map_err(|e| EngineError::Other(format!("invalid cancel response: {e}")))
@@ -396,7 +397,7 @@ impl RemoteClient {
         if let Some(limit) = query.limit {
             pairs.push(("limit", limit.to_string()));
         }
-        let mut url = reqwest::Url::parse(&self.core.url(&["commands"]))
+        let mut url = reqwest::Url::parse(&self.core.url(&["worker", "commands"]))
             .map_err(|e| EngineError::RemoteTransport(e.to_string()))?;
         url.query_pairs_mut().extend_pairs(pairs);
         let response = self
@@ -420,15 +421,15 @@ impl RemoteClient {
         Ok(RemoteResponse { status, body })
     }
 
-    /// `GET /v1/commands/{id}/status` — fetch a job's metadata.
-    pub async fn get_job(&self, command_id: &str) -> Result<RemoteResponse, EngineError> {
-        self.get(&["commands", command_id, "status"]).await
+    /// `GET /v1/worker/commands/{id}/status` — fetch a job's metadata.
+    pub async fn get_command(&self, command_id: &str) -> Result<RemoteResponse, EngineError> {
+        self.get(&["worker", "commands", command_id]).await
     }
 
-    /// `GET /v1/commands/{id}/status` — fetch the typed job status used by
+    /// `GET /v1/worker/commands/{id}/status` — fetch the typed job status used by
     /// remote workflow polling.
     pub async fn job_status(&self, id: &str) -> Result<JobStatus, EngineError> {
-        let response = self.get_job(id).await?;
+        let response = self.get_command(id).await?;
         let status = response.body["status"].as_str().ok_or_else(|| {
             EngineError::RemoteTransport("remote job status response has no status".into())
         })?;
@@ -444,13 +445,16 @@ impl RemoteClient {
         }
     }
 
-    /// `GET /v1/workflows/{id}` — fetch the workflow state JSON for a job.
+    /// `GET /v1/worker/commands/{id}/workflow` — fetch the workflow state JSON for a job.
     /// Returns `None` on HTTP 404 (job is a prompt job or pending).
     pub async fn get_workflow_state(
         &self,
         command_id: &str,
     ) -> Result<Option<serde_json::Value>, EngineError> {
-        match self.get(&["workflows", command_id]).await {
+        match self
+            .get(&["worker", "commands", command_id, "workflow"])
+            .await
+        {
             Ok(resp) => Ok(Some(resp.body)),
             Err(EngineError::RemoteHttpStatus { status: 404, .. }) => Ok(None),
             Err(e) => Err(e),
@@ -468,7 +472,7 @@ impl RemoteClient {
     }
 
     /// Like `send_command` but also attaches request headers — used to set
-    /// `x-awman-session` on `POST /v1/commands` (the server reads the session
+    /// `x-awman-session` on `POST /v1/worker/commands` (the server reads the session
     /// from the header, not the body).
     pub(crate) async fn send_command_with_headers(
         &self,
@@ -497,6 +501,7 @@ impl RemoteClient {
 ///   - lowercase host
 ///   - elide default ports (80/http, 443/https)
 ///   - normalize trailing slash
+#[cfg(test)]
 fn canonicalize_url(s: &str) -> String {
     let s = s.trim();
     let (scheme_part, rest) = match s.split_once("://") {
@@ -527,7 +532,6 @@ fn canonicalize_url(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::config::env::EnvSnapshot;
 
     // ─── is_loopback_addr ─────────────────────────────────────────────────────
 
@@ -570,123 +574,6 @@ mod tests {
         assert_ne!(
             canonicalize_url("https://example.com/"),
             canonicalize_url("http://example.com/"),
-        );
-    }
-
-    // ─── Test-session helpers ─────────────────────────────────────────────────
-
-    /// `env`'s keys, plus `AWMAN_CONFIG_HOME` pinned at an empty fixture dir so
-    /// the session cannot fall through to the developer's real
-    /// `~/.awman/config.json` — which on a working machine may legitimately
-    /// have `remote` configured and would invalidate the "no source" and
-    /// "addr mismatch" assertions.
-    fn make_session(env: EnvSnapshot) -> (tempfile::TempDir, Session) {
-        let tmp = tempfile::tempdir().unwrap();
-        let mut entries: Vec<(String, String)> = Vec::new();
-        for key in [
-            "AWMAN_API_KEY",
-            "AWMAN_REMOTE_ADDR",
-            "AWMAN_REMOTE_SESSION",
-            "AWMAN_OVERLAYS",
-            "AWMAN_API_ROOT",
-        ] {
-            if let Some(v) = env.get(key) {
-                entries.push((key.to_string(), v.to_string()));
-            }
-        }
-        entries.push((
-            "AWMAN_CONFIG_HOME".to_string(),
-            tmp.path().to_str().unwrap().to_string(),
-        ));
-        let session = Session::for_tests_with_env(tmp.path(), EnvSnapshot::with_overrides(entries));
-        (tmp, session)
-    }
-
-    fn make_session_with_global_config(config_json: &str) -> (tempfile::TempDir, Session) {
-        let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(tmp.path().join("config.json"), config_json).unwrap();
-        let session = Session::for_tests_isolated(tmp.path(), tmp.path());
-        (tmp, session)
-    }
-
-    // ─── resolve_api_key tests ────────────────────────────────────────────────
-
-    #[test]
-    fn resolve_api_key_explicit_takes_priority_over_env_and_config() {
-        let env = EnvSnapshot::with_overrides([("AWMAN_API_KEY", "env-key")]);
-        let (_tmp, session) = make_session(env);
-        let result =
-            RemoteClient::resolve_api_key(&session, "http://localhost:9876", Some("explicit-key"));
-        assert!(result.is_ok());
-        assert_eq!(
-            result.unwrap().unwrap().as_str(),
-            "explicit-key",
-            "explicit key must win over env"
-        );
-    }
-
-    #[test]
-    fn resolve_api_key_env_var_used_when_no_explicit() {
-        let env = EnvSnapshot::with_overrides([("AWMAN_API_KEY", "env-key")]);
-        let (_tmp, session) = make_session(env);
-        let result = RemoteClient::resolve_api_key(&session, "http://localhost:9876", None);
-        assert!(result.is_ok());
-        assert_eq!(
-            result.unwrap().unwrap().as_str(),
-            "env-key",
-            "env var must be used when no explicit key"
-        );
-    }
-
-    #[test]
-    fn resolve_api_key_global_config_matched_by_default_addr() {
-        let config_json =
-            r#"{"remote":{"defaultAddr":"http://localhost:9876","defaultAPIKey":"config-key"}}"#;
-        let (_tmp, session) = make_session_with_global_config(config_json);
-        let result = RemoteClient::resolve_api_key(&session, "http://localhost:9876", None);
-        assert!(result.is_ok());
-        assert_eq!(
-            result.unwrap().unwrap().as_str(),
-            "config-key",
-            "global config key must be returned when target_addr matches default_addr"
-        );
-    }
-
-    #[test]
-    fn resolve_api_key_global_config_not_used_when_addr_differs() {
-        let config_json =
-            r#"{"remote":{"defaultAddr":"http://other-host:9876","defaultAPIKey":"config-key"}}"#;
-        let (_tmp, session) = make_session_with_global_config(config_json);
-        let result = RemoteClient::resolve_api_key(&session, "http://localhost:9876", None);
-        assert!(result.is_ok());
-        assert!(
-            result.unwrap().is_none(),
-            "config key must NOT be returned when addr does not match"
-        );
-    }
-
-    #[test]
-    fn resolve_api_key_returns_none_when_no_source_available() {
-        let (_tmp, session) = make_session(EnvSnapshot::empty());
-        let result = RemoteClient::resolve_api_key(&session, "http://localhost:9876", None);
-        assert!(result.is_ok());
-        assert!(
-            result.unwrap().is_none(),
-            "must return None when no key source exists"
-        );
-    }
-
-    #[test]
-    fn resolve_api_key_explicit_blank_falls_through_to_env() {
-        let env = EnvSnapshot::with_overrides([("AWMAN_API_KEY", "env-key")]);
-        let (_tmp, session) = make_session(env);
-        // An explicit empty string should fall through to env.
-        let result = RemoteClient::resolve_api_key(&session, "http://localhost:9876", Some("   "));
-        assert!(result.is_ok());
-        assert_eq!(
-            result.unwrap().unwrap().as_str(),
-            "env-key",
-            "blank explicit key must fall through to env"
         );
     }
 

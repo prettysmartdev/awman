@@ -7,7 +7,7 @@
 //!
 //! Every manager is built with the owning process's environment snapshot, and
 //! a session it opens without an explicit `env` inherits it. An empty snapshot
-//! would make `GlobalConfig` ignore a relocated `AWMAN_CONFIG_HOME` and fall
+//! would make `GlobalConfig` ignore a relocated `AWMAN_HOME` and fall
 //! back to defaults, which for the builtin runtime means a public network
 //! instead of the user's global policy.
 

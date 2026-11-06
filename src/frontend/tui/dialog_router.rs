@@ -132,7 +132,7 @@ fn open_squad_run_detail(app: &mut App) {
 /// Handle Enter in the ConfigShow dialog: advance the add-mapping flow, save
 /// the active inline edit, or begin editing the selected row.
 fn config_show_submit(app: &mut App) {
-    use crate::command::commands::config::{ConfigEditRequest, ConfigRowShape};
+    use crate::command::commands::config::{ConfigEditRequest, ConfigRowKind};
     use dialogs::NewMapEntryPhase;
 
     let mut toast: Option<String> = None;
@@ -213,7 +213,7 @@ fn config_show_submit(app: &mut App) {
                         .map(|(index, _)| {
                             state.rows[index + 1..]
                                 .iter()
-                                .take_while(|row| matches!(row.shape, ConfigRowShape::ListEntry))
+                                .take_while(|row| matches!(row.shape, ConfigRowKind::ListEntry))
                                 .filter(|row| {
                                     let value = if state.edit_column == 0 {
                                         &row.global
@@ -480,22 +480,6 @@ pub(super) fn handle_dialog_char(app: &mut App, c: char) {
             'n' | 'N' => {
                 // Just dismiss — the engine keeps running.
                 app.active_dialog = None;
-            }
-            _ => {}
-        },
-        // `y` is the only recovery there is: the previous key was never stored
-        // in plaintext, so a working client means a *new* key, which means a
-        // new hash and a restarted daemon. `n` opens no tab — see the variant's
-        // doc comment.
-        Some(Dialog::SquadKeyMissing) => match c {
-            'y' | 'Y' => {
-                app.active_dialog = None;
-                app.start_squad_key_refresh();
-            }
-            'n' | 'N' => {
-                app.active_dialog = None;
-                app.status_bar.text =
-                    "squad needs a bearer key; the squad tab was not opened.".to_string();
             }
             _ => {}
         },

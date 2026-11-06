@@ -9,8 +9,18 @@
 use super::*;
 
 impl WorkflowEngine {
+    pub(super) fn is_final_yolo_group(&self, ready: &[WorkflowStep]) -> bool {
+        self.yolo
+            && self.frontend.supports_interactive_recovery()
+            && self.workflow.steps.iter().all(|step| {
+                self.state.completed_steps.contains(&step.name)
+                    || ready.iter().any(|candidate| candidate.name == step.name)
+            })
+    }
+
     /// Run a whole parallel group to completion. Launches up to
-    /// `max_concurrent` of `ready` (source-file order), queuing the rest, then
+    /// `max_concurrent` of `ready` (source-file order), except for an
+    /// interactive final yolo group, and queues the rest. Then it
     /// drives all live containers concurrently through a `FuturesUnordered`
     /// select loop — launching queued steps as slots free up, running per-step
     /// stuck detection and per-step yolo countdowns independently, and honoring
@@ -19,11 +29,20 @@ impl WorkflowEngine {
         &mut self,
         ready: Vec<WorkflowStep>,
     ) -> Result<GroupOutcome, EngineError> {
+        // Only a group containing every remaining step is a final review
+        // stage. Earlier groups still free their slots on yolo expiry.
+        let final_yolo_group = self.is_final_yolo_group(&ready);
         let group_names: Vec<String> = ready.iter().map(|s| s.name.clone()).collect();
         self.frontend.report_parallel_group_started(&group_names);
-        let slot_cap = match self.max_concurrent {
-            Some(n) => n.max(1),
-            None => ready.len().max(1),
+        // Final review needs every remaining agent visible and alive together.
+        // The normal cap still governs every non-final group.
+        let slot_cap = if final_yolo_group {
+            ready.len().max(1)
+        } else {
+            match self.max_concurrent {
+                Some(n) => n.max(1),
+                None => ready.len().max(1),
+            }
         };
         self.msg_info(format!(
             "Launching parallel group: {} step(s), up to {} at once",
@@ -48,10 +67,49 @@ impl WorkflowEngine {
 
         let total = timing::yolo_countdown_duration();
         let mut failed: Vec<(String, i32)> = Vec::new();
+        let mut review_ready = HashSet::new();
+        let mut final_review_shown = false;
         // Cloned so the select below borrows nothing of `self` for it.
         let cancel = self.cancel.clone();
 
-        while !self.active_steps.is_empty() {
+        while !self.active_steps.is_empty() || (final_yolo_group && failed.is_empty()) {
+            // A final group stays alive after its countdowns. Once every live
+            // member has reached review readiness (or exited), ask once; Esc
+            // returns to the live containers, and Ctrl-W can reopen the board.
+            if final_yolo_group
+                && !final_review_shown
+                && failed.is_empty()
+                && queue.is_empty()
+                && self
+                    .active_steps
+                    .iter()
+                    .all(|slot| review_ready.contains(&slot.step_name))
+            {
+                final_review_shown = true;
+                let step_name = self
+                    .active_steps
+                    .first()
+                    .map(|slot| slot.step_name.clone())
+                    .or_else(|| group_names.last().cloned())
+                    .unwrap_or_default();
+                match self.handle_parallel_engine_request(
+                    EngineRequest::OpenControlBoard { step_name },
+                    &group_names,
+                    None,
+                    true,
+                )? {
+                    ParallelRequestOutcome::Continue => {}
+                    ParallelRequestOutcome::Ended(wo) => return Ok(GroupOutcome::Ended(wo)),
+                    ParallelRequestOutcome::Rewound => return Ok(GroupOutcome::Rewound),
+                    ParallelRequestOutcome::RestartStep(name) => {
+                        review_ready.remove(&name);
+                        self.restart_parallel_step(
+                            &name, &mut waits, &mut queue, slot_cap, &stuck_tx,
+                        )?;
+                        final_review_shown = false;
+                    }
+                }
+            }
             tokio::select! {
                 biased;
                 Some((name, launch_id, result)) = waits.next() => {
@@ -84,6 +142,7 @@ impl WorkflowEngine {
                     }
                     let auth_recovered = exit.exit_code != 0 && self.recover_auth_failure(&name)?;
                     self.remove_active_step(&name);
+                    review_ready.remove(&name);
                     self.last_exit_info = Some(exit.clone());
 
                     let (status, step_state) = if exit.exit_code == 0 {
@@ -110,6 +169,7 @@ impl WorkflowEngine {
                     }
 
                     if auth_recovered {
+                        final_review_shown = false;
                         // Put the same step back at the head of this parallel
                         // batch. `auth_retries_used` ensures this automatic
                         // relaunch can happen only once.
@@ -133,6 +193,39 @@ impl WorkflowEngine {
                         // Every failure is recorded — each one gets its own
                         // recovery board once the group drains.
                         failed.push((name.clone(), exit_code));
+                        if final_yolo_group {
+                            // Final agents may already be held alive for
+                            // review, so waiting for the group to drain would
+                            // strand recovery. Offer the failed peer now.
+                            match self.handle_parallel_engine_request(
+                                EngineRequest::OpenControlBoard {
+                                    step_name: name.clone(),
+                                },
+                                &group_names,
+                                Some(&name),
+                                false,
+                            )? {
+                                ParallelRequestOutcome::Continue => {}
+                                ParallelRequestOutcome::Ended(wo) => {
+                                    return Ok(GroupOutcome::Ended(wo));
+                                }
+                                ParallelRequestOutcome::Rewound => {
+                                    return Ok(GroupOutcome::Rewound);
+                                }
+                                ParallelRequestOutcome::RestartStep(restart) => {
+                                    failed.retain(|(failed_name, _)| *failed_name != restart);
+                                    review_ready.remove(&restart);
+                                    final_review_shown = false;
+                                    self.restart_parallel_step(
+                                        &restart,
+                                        &mut waits,
+                                        &mut queue,
+                                        slot_cap,
+                                        &stuck_tx,
+                                    )?;
+                                }
+                            }
+                        }
                     } else if failed.is_empty() && self.active_steps.len() < slot_cap {
                         // An unresolved failure freezes the queue (docs/05-workflows.md):
                         // peers keep running, but nothing new starts until it is retried.
@@ -157,12 +250,15 @@ impl WorkflowEngine {
                         req,
                         &group_names,
                         retryable.as_deref(),
+                        final_yolo_group && final_review_shown && failed.is_empty() && queue.is_empty(),
                     )? {
                         ParallelRequestOutcome::Continue => {}
                         ParallelRequestOutcome::Ended(wo) => return Ok(GroupOutcome::Ended(wo)),
                         ParallelRequestOutcome::Rewound => return Ok(GroupOutcome::Rewound),
                         ParallelRequestOutcome::RestartStep(name) => {
                             failed.retain(|(n, _)| *n != name);
+                            review_ready.remove(&name);
+                            final_review_shown = false;
                             self.restart_parallel_step(
                                 &name,
                                 &mut waits,
@@ -175,6 +271,7 @@ impl WorkflowEngine {
                 }
                 _ = tokio::time::sleep(Duration::from_millis(100)) => {
                     let launch_queued = failed.is_empty();
+                    let final_batch = final_yolo_group && queue.is_empty();
                     self.tick_parallel_yolo(
                         &mut waits,
                         &mut queue,
@@ -182,6 +279,8 @@ impl WorkflowEngine {
                         launch_queued,
                         total,
                         &stuck_tx,
+                        final_batch,
+                        &mut review_ready,
                     )?;
                 }
             }
@@ -424,6 +523,7 @@ impl WorkflowEngine {
 
     /// Drive every in-flight per-step yolo countdown one tick. Independent per
     /// slot — expiry kills only that container and advances the queue.
+    #[allow(clippy::too_many_arguments)] // The parallel scheduler passes its coordinated phase queues together.
     pub(super) fn tick_parallel_yolo(
         &mut self,
         waits: &mut ParallelWaits,
@@ -432,6 +532,8 @@ impl WorkflowEngine {
         launch_queued: bool,
         total: Duration,
         stuck_tx: &StuckFanIn,
+        final_review: bool,
+        review_ready: &mut HashSet<String>,
     ) -> Result<(), EngineError> {
         let now = Instant::now();
         let ticking: Vec<(String, Instant)> = self
@@ -452,17 +554,9 @@ impl WorkflowEngine {
                     self.frontend.parallel_step_yolo_countdown_finished(&name);
                 }
                 YoloTickOutcome::AdvanceNow => {
-                    self.yolo_advance_parallel(
-                        &name,
-                        waits,
-                        queue,
-                        slot_cap,
-                        launch_queued,
-                        stuck_tx,
-                    )?;
-                }
-                YoloTickOutcome::Continue => {
-                    if remaining.is_zero() {
+                    if final_review {
+                        self.mark_final_parallel_step_ready(&name, review_ready);
+                    } else {
                         self.yolo_advance_parallel(
                             &name,
                             waits,
@@ -473,9 +567,38 @@ impl WorkflowEngine {
                         )?;
                     }
                 }
+                YoloTickOutcome::Continue => {
+                    if remaining.is_zero() {
+                        if final_review {
+                            self.mark_final_parallel_step_ready(&name, review_ready);
+                        } else {
+                            self.yolo_advance_parallel(
+                                &name,
+                                waits,
+                                queue,
+                                slot_cap,
+                                launch_queued,
+                                stuck_tx,
+                            )?;
+                        }
+                    }
+                }
             }
         }
         Ok(())
+    }
+
+    fn mark_final_parallel_step_ready(&mut self, name: &str, ready: &mut HashSet<String>) {
+        if let Some(slot) = self
+            .active_steps
+            .iter_mut()
+            .find(|slot| slot.step_name == name)
+        {
+            slot.yolo_deadline = None;
+            ready.insert(name.to_string());
+            self.frontend.parallel_step_yolo_countdown_finished(name);
+            self.msg_info(format!("Final step '{name}' is ready for review"));
+        }
     }
 
     /// Yolo countdown expired (or user forced advance) for one parallel slot:
@@ -674,6 +797,9 @@ impl WorkflowEngine {
     ) -> Result<AvailableActions, EngineError> {
         let mut a = self.compute_available_actions()?;
         a.retry_failed_step = retryable.map(str::to_string);
+        a.can_finish_workflow = false;
+        a.finish_workflow_unavailable_reason =
+            Some("Finish after the parallel group is ready for review.".into());
         if self.parallel_group_prompts.is_none() {
             a.can_restart_current_step = false;
             a.can_cancel_to_previous_step = false;
@@ -786,6 +912,7 @@ impl WorkflowEngine {
         req: EngineRequest,
         group: &[String],
         retryable: Option<&str>,
+        final_review: bool,
     ) -> Result<ParallelRequestOutcome, EngineError> {
         match req {
             EngineRequest::StepStuck { step_name } => {
@@ -799,11 +926,25 @@ impl WorkflowEngine {
             EngineRequest::OpenControlBoard { step_name } => {
                 // Scope the board to the focused container; peers keep running.
                 self.focus_parallel_step(&step_name);
-                let available = self.parallel_group_board_actions(group, retryable)?;
+                let mut available = self.parallel_group_board_actions(group, retryable)?;
+                if final_review {
+                    available.acts_on_parallel_group = true;
+                    available.can_finish_workflow = true;
+                    available.finish_workflow_unavailable_reason = None;
+                    available.can_launch_next = false;
+                    available.can_dismiss = !self.active_steps.is_empty();
+                    available.simple_advance = None;
+                }
                 let action = self
                     .frontend
                     .show_workflow_control_board(&self.state, &available)?;
                 match action {
+                    NextAction::FinishWorkflow if final_review => {
+                        self.log_wcb_action(&action);
+                        Ok(ParallelRequestOutcome::Ended(
+                            self.finish_final_parallel_group(group)?,
+                        ))
+                    }
                     NextAction::Pause => {
                         self.log_wcb_action(&action);
                         Ok(ParallelRequestOutcome::Ended(self.pause_parallel_group()?))
@@ -833,6 +974,53 @@ impl WorkflowEngine {
                 }
             }
         }
+    }
+
+    /// The review decision closes every surviving final-stage container
+    /// before the caller can enter teardown.
+    fn finish_final_parallel_group(
+        &mut self,
+        group: &[String],
+    ) -> Result<WorkflowOutcome, EngineError> {
+        let live: Vec<ActiveParallelStep> = self.active_steps.drain(..).collect();
+        let mut stop_error = None;
+        for slot in &live {
+            if let Some(handle) = &slot.cancel_handle {
+                let _ = handle.cancel();
+            }
+            if slot.yolo_deadline.is_some() {
+                self.frontend
+                    .parallel_step_yolo_countdown_finished(&slot.step_name);
+            }
+            if let Err(error) = self.agent_factory.stop_agent(&slot.handle) {
+                tracing::error!(step = %slot.step_name, error = %error,
+                    "final workflow agent could not be stopped");
+                stop_error.get_or_insert(error);
+            } else {
+                self.frontend
+                    .report_parallel_step_exited(&slot.step_name, KILLED_EXIT_CODE);
+            }
+        }
+        if let Some(error) = stop_error {
+            // Teardown may publish the worktree, so a failed stop cannot be
+            // treated as successful completion.
+            self.abort_on_failure_triggered = true;
+            self.frontend.report_parallel_group_finished();
+            return Err(error);
+        }
+        for name in group {
+            if matches!(self.state.status_of(name), Some(StepState::Running { .. })) {
+                self.state.set_status(name, StepState::Succeeded);
+                let step = self.find_step(name)?;
+                self.frontend
+                    .report_step_status(&step, WorkflowStepStatus::Succeeded);
+            }
+        }
+        self.persist()?;
+        self.frontend.report_parallel_group_finished();
+        let progress = self.workflow_progress_info();
+        self.frontend.report_workflow_progress(&progress);
+        self.handle_finish_workflow()
     }
 
     /// Make `step_name` the focused slot (index 0) so `compute_available_actions`

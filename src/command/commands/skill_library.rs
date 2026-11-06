@@ -300,7 +300,8 @@ fn discover_skills(skills_dir: &Path) -> Result<Vec<String>, CommandError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::config::env::{EnvSnapshot, AWMAN_CONFIG_HOME};
+    use crate::data::config::env::EnvSnapshot;
+    use crate::data::fs::data_paths::AWMAN_HOME;
     use std::process::Command;
 
     /// Serialises tests that toggle the process-global `GIT_CONFIG_*` env vars.
@@ -373,7 +374,7 @@ mod tests {
     }
 
     fn skill_dirs_at(home: &Path) -> SkillDirs {
-        let env = EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, home.to_str().unwrap())]);
+        let env = EnvSnapshot::with_overrides([(AWMAN_HOME, home.to_str().unwrap())]);
         SkillDirs::from_env(&env, None).unwrap()
     }
 
@@ -736,7 +737,7 @@ mod tests {
 
         // The error names the real library directory rather than a hardcoded
         // `~/.awman/skills/.library/...` layout literal, which would be wrong
-        // under an AWMAN_CONFIG_HOME override.
+        // under an AWMAN_HOME override.
         let dir = dirs.library_dir("superpowers");
         assert!(
             msg.contains(&dir.display().to_string()),

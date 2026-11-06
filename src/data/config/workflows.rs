@@ -1,5 +1,7 @@
-//! Workflow prerequisite data and policy.
+//! `workflows` section: concurrency, prerequisite (credential) policy and
+//! dynamic-workflow settings.
 
+use crate::data::config::units::DurationStr;
 use crate::data::error::DataError;
 use crate::data::workflow_prerequisites::AcquireScope;
 use serde::{Deserialize, Serialize};
@@ -11,14 +13,130 @@ pub const ACQUIRE_TIMEOUT_DEFAULT_SECS: u64 = 30;
 pub const ACQUIRE_TIMEOUT_MAX_SECS: u64 = 300;
 pub const PREREQUISITE_POLICY_VERSION: u32 = 1;
 
-/// Top-level `workflows` block. Unknown keys are ignored.
+/// Maximum number of `workflows.dynamic.guidance` entries after merging every
+/// layer. Caps prompt bloat.
+pub const GUIDANCE_MAX_ENTRIES: usize = 50;
+
+/// Maximum length of a single `workflows.dynamic.guidance` entry, in chars.
+pub const GUIDANCE_MAX_ENTRY_LEN: usize = 1000;
+
+/// The `workflows` block.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WorkflowsConfig {
+    /// Cap on concurrently running workflow steps (`None` = unlimited).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrent_steps: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prerequisites: Option<PrerequisitesConfig>,
-    /// Dynamic-workflow settings, read from both global and repo config.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub dynamic: Option<super::repo::DynamicWorkflowsConfig>,
+    pub dynamic: Option<DynamicConfig>,
+}
+
+/// `workflows.dynamic`: which agents/models a dynamic workflow's leader may
+/// schedule, the default leader, and project guidance for the leader.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DynamicConfig {
+    /// Default leader spec in `agent::model` form; `--leader` overrides it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_leader: Option<String>,
+    /// Agent name → model names available for that agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agents_to_models: Option<BTreeMap<String, Vec<String>>>,
+    /// Instructions the leader follows, rendered as a bullet list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guidance: Option<Vec<String>>,
+}
+
+impl DynamicConfig {
+    /// Semantic checks the key table cannot express. `field_path` prefixes
+    /// every message (`workflows.dynamic`).
+    pub fn validate(&self, field_path: &str) -> Result<(), DataError> {
+        if let Some(leader) = &self.default_leader {
+            validate_leader_spec(field_path, leader)?;
+        }
+        for (agent, models) in self.agents_to_models.iter().flatten() {
+            if models.is_empty() {
+                return Err(DataError::Other(format!(
+                    "{field_path}.agentsToModels.{agent} has an empty model list. \
+                     Provide at least one model name."
+                )));
+            }
+            if models.iter().any(|m| m.trim().is_empty()) {
+                return Err(DataError::Other(format!(
+                    "{field_path}.agentsToModels.{agent} contains an empty model name."
+                )));
+            }
+        }
+        if let Some(entries) = &self.guidance {
+            validate_guidance(field_path, entries)?;
+        }
+        Ok(())
+    }
+
+    /// Whether every field is unset or an empty collection.
+    pub fn is_empty(&self) -> bool {
+        self.default_leader.is_none()
+            && self
+                .agents_to_models
+                .as_ref()
+                .is_none_or(BTreeMap::is_empty)
+            && self.guidance.as_ref().is_none_or(Vec::is_empty)
+    }
+}
+
+/// `workflows.dynamic.defaultLeader` syntax: `agent::model`, two non-empty
+/// components without surrounding whitespace, and a valid agent name.
+pub(crate) fn validate_leader_spec(field_path: &str, raw: &str) -> Result<(), DataError> {
+    let parts: Vec<&str> = raw.split("::").collect();
+    if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
+        return Err(DataError::Other(format!(
+            "{field_path}.defaultLeader {raw:?} is invalid; expected agent::model \
+             (e.g. claude::claude-opus-4-8)"
+        )));
+    }
+    let (agent, model) = (parts[0], parts[1]);
+    if agent != agent.trim() || model != model.trim() {
+        return Err(DataError::Other(format!(
+            "{field_path}.defaultLeader {raw:?} must not have leading or trailing whitespace \
+             in the agent or model component"
+        )));
+    }
+    if crate::data::session::AgentName::new(agent).is_err() {
+        return Err(DataError::Other(format!(
+            "{field_path}.defaultLeader agent component {agent:?} is not a valid agent name: \
+             only ASCII alphanumerics, '-', and '_' are allowed, length 1..=64"
+        )));
+    }
+    Ok(())
+}
+
+/// Per-entry guidance checks (non-empty, bounded length). The 50-entry limit
+/// is checked after merging every layer.
+pub(crate) fn validate_guidance(field_path: &str, entries: &[String]) -> Result<(), DataError> {
+    if entries.len() > GUIDANCE_MAX_ENTRIES {
+        return Err(DataError::Other(format!(
+            "{field_path}.guidance has {} entries; the maximum is {GUIDANCE_MAX_ENTRIES}.",
+            entries.len()
+        )));
+    }
+    for (i, entry) in entries.iter().enumerate() {
+        if entry.trim().is_empty() {
+            return Err(DataError::Other(format!(
+                "{field_path}.guidance[{i}] is empty or whitespace-only. \
+                 Remove it or provide a non-empty instruction."
+            )));
+        }
+        if entry.chars().count() > GUIDANCE_MAX_ENTRY_LEN {
+            return Err(DataError::Other(format!(
+                "{field_path}.guidance[{i}] is {} characters; the maximum is \
+                 {GUIDANCE_MAX_ENTRY_LEN}.",
+                entry.chars().count()
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -43,7 +161,7 @@ pub enum CredentialUse {
     Deny,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 pub enum AcquireRefresh {
     #[default]
     Start,
@@ -51,118 +169,76 @@ pub enum AcquireRefresh {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct GitIdentityConfig {
-    #[serde(rename = "use", default)]
+    #[serde(rename = "use", default, skip_serializing_if = "Option::is_none")]
     pub use_: Option<CredentialUse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
 }
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SshConfig {
-    #[serde(rename = "use", default)]
+    #[serde(rename = "use", default, skip_serializing_if = "Option::is_none")]
     pub use_: Option<CredentialUse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,
 }
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AcquireCommandConfig {
-    pub argv: Vec<String>,
-    pub timeout_secs: Option<u64>,
+    /// The command; absent means no acquire command is configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub argv: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<DurationStr>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refresh: Option<AcquireRefresh>,
 }
+
+impl AcquireCommandConfig {
+    /// Configured timeout in whole seconds (rounded up), or the default.
+    pub fn timeout_secs(&self) -> u64 {
+        self.timeout
+            .as_ref()
+            .map_or(ACQUIRE_TIMEOUT_DEFAULT_SECS, |d| {
+                let d = d.to_duration();
+                d.as_secs() + u64::from(d.subsec_nanos() > 0)
+            })
+    }
+}
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct GithubTokenConfig {
-    #[serde(rename = "use", default)]
+    #[serde(rename = "use", default, skip_serializing_if = "Option::is_none")]
     pub use_: Option<CredentialUse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub env_vars: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acquire: Option<AcquireCommandConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verify: Option<bool>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PrerequisitesConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preflight: Option<PreflightMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unresolved: Option<UnresolvedMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git_identity: Option<GitIdentityConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssh: Option<SshConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub github_token: Option<GithubTokenConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allow_api_client_grants: Option<bool>,
-    /// Unknown key names become warnings. Their ignored values are discarded.
-    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub unknown: BTreeMap<String, serde_json::Value>,
 }
 
-impl<'de> Deserialize<'de> for PrerequisitesConfig {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        // Keep only names for ignored configuration: a misspelled token key
-        // must not retain its value in config Debug output or saved JSON.
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Known {
-            preflight: Option<PreflightMode>,
-            unresolved: Option<UnresolvedMode>,
-            git_identity: Option<GitIdentityConfig>,
-            ssh: Option<SshConfig>,
-            github_token: Option<GithubTokenConfig>,
-            allow_api_client_grants: Option<bool>,
-        }
-        let mut value = serde_json::Value::deserialize(deserializer)?;
-        let mut unknown = BTreeMap::new();
-        for (path, names) in [
-            (
-                "",
-                &[
-                    "preflight",
-                    "unresolved",
-                    "gitIdentity",
-                    "ssh",
-                    "githubToken",
-                    "allowApiClientGrants",
-                ][..],
-            ),
-            ("gitIdentity", &["use", "name", "email"][..]),
-            ("ssh", &["use", "key"][..]),
-            ("githubToken", &["use", "envVars", "acquire", "verify"][..]),
-            (
-                "githubToken.acquire",
-                &["argv", "timeoutSecs", "refresh"][..],
-            ),
-        ] {
-            let mut block = Some(&mut value);
-            for part in path.split('.').filter(|p| !p.is_empty()) {
-                block = block.and_then(|v| v.get_mut(part));
-            }
-            if let Some(object) = block.and_then(serde_json::Value::as_object_mut) {
-                object.retain(|key, _| {
-                    if names.contains(&key.as_str()) {
-                        return true;
-                    }
-                    let name = if path.is_empty() {
-                        key.clone()
-                    } else {
-                        format!("{path}.{key}")
-                    };
-                    unknown.insert(name, serde_json::Value::Null);
-                    false
-                });
-            }
-        }
-        let known: Known = serde_json::from_value(value).map_err(serde::de::Error::custom)?;
-        Ok(Self {
-            preflight: known.preflight,
-            unresolved: known.unresolved,
-            git_identity: known.git_identity,
-            ssh: known.ssh,
-            github_token: known.github_token,
-            allow_api_client_grants: known.allow_api_client_grants,
-            unknown,
-        })
-    }
-}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigScope {
     Global,
@@ -251,7 +327,9 @@ pub struct PrerequisiteResolveContext {
 
 pub struct PrerequisitePolicyLayers<'a> {
     pub global: Option<&'a PrerequisitesConfig>,
-    pub squad_global: Option<&'a PrerequisitesConfig>,
+    /// A squad task file's `workflows.prerequisites` block. Task files are
+    /// agent-writable, so it applies with repo semantics: it may narrow, never grant.
+    pub task_file: Option<&'a PrerequisitesConfig>,
     pub repo: Option<&'a PrerequisitesConfig>,
     pub task: Option<&'a PrerequisitePolicy>,
     pub flags: &'a crate::data::config::flags::PrerequisiteFlags,
@@ -297,31 +375,28 @@ impl PrerequisitesConfig {
                 ));
             }
             if let Some(acquire) = &token.acquire {
-                if acquire.argv.is_empty()
-                    || acquire.argv[0].trim().is_empty()
-                    || acquire.argv.iter().any(|a| a.chars().any(char::is_control))
-                {
+                if acquire.argv.as_ref().is_some_and(|argv| {
+                    argv.is_empty()
+                        || argv[0].trim().is_empty()
+                        || argv.iter().any(|a| a.chars().any(char::is_control))
+                }) {
                     return Err(invalid(
                         "githubToken.acquire.argv",
                         "requires a command and arguments without control characters",
                     ));
                 }
-                if acquire
-                    .timeout_secs
-                    .is_some_and(|t| !(1..=ACQUIRE_TIMEOUT_MAX_SECS).contains(&t))
-                {
+                if acquire.timeout.as_ref().is_some_and(|t| {
+                    let d = t.to_duration();
+                    d.is_zero() || d > std::time::Duration::from_secs(ACQUIRE_TIMEOUT_MAX_SECS)
+                }) {
                     return Err(invalid(
-                        "githubToken.acquire.timeoutSecs",
-                        "must be between 1 and 300",
+                        "githubToken.acquire.timeout",
+                        "must be greater than zero and at most 300s",
                     ));
                 }
             }
         }
-        let mut warnings: Vec<_> = self
-            .unknown
-            .keys()
-            .map(|key| format!("unknown config key workflows.prerequisites.{key} (ignored)"))
-            .collect();
+        let mut warnings = Vec::new();
         if scope == ConfigScope::Repo && self.allow_api_client_grants.is_some() {
             warnings.push(
                 "workflows.prerequisites.allowApiClientGrants is global-only; repo value ignored"
@@ -377,12 +452,13 @@ impl Default for PrerequisitePolicy {
 impl AcquirePolicy {
     fn from_config(config: &AcquireCommandConfig, scope: AcquireScope) -> Self {
         Self {
-            argv: config.argv.clone(),
-            timeout_secs: config.timeout_secs.unwrap_or(ACQUIRE_TIMEOUT_DEFAULT_SECS),
+            argv: config.argv.clone().unwrap_or_default(),
+            timeout_secs: config.timeout_secs(),
             refresh: config.refresh.unwrap_or_default(),
             scope,
             sha256: crate::data::fs::hash::sha256_hex(
-                serde_json::to_vec(&config.argv).expect("argv serializes"),
+                serde_json::to_vec(&config.argv.clone().unwrap_or_default())
+                    .expect("argv serializes"),
             ),
         }
     }
@@ -401,19 +477,18 @@ impl PrerequisitePolicy {
             policy.apply_config(global, PolicySource::Global, false);
             policy.allow_api_client_grants = global.allow_api_client_grants.unwrap_or(false);
         }
-        if let Some(squad) = layers.squad_global {
-            policy.apply_config(squad, PolicySource::SquadGlobal, false);
-        }
         if let Some(repo) = layers.repo {
             policy.apply_config(repo, PolicySource::Repo, true);
+        }
+        if let Some(task) = layers.task_file {
+            policy.apply_config(task, PolicySource::Task, true);
         }
         if let Some(task) = layers.task {
             policy.apply_task(task);
         }
-        let global_ssh_allow = [layers.global, layers.squad_global]
-            .into_iter()
-            .flatten()
-            .any(|c| c.ssh.as_ref().and_then(|s| s.use_) == Some(CredentialUse::Allow));
+        let global_ssh_allow = layers
+            .global
+            .is_some_and(|c| c.ssh.as_ref().and_then(|s| s.use_) == Some(CredentialUse::Allow));
         if layers.context.remote_session && !global_ssh_allow {
             policy.ssh.use_ = CredentialUse::Deny;
         }
@@ -463,7 +538,7 @@ impl PrerequisitePolicy {
     pub fn from_flags(flags: &crate::data::config::flags::PrerequisiteFlags) -> Self {
         Self::resolve(PrerequisitePolicyLayers {
             global: None,
-            squad_global: None,
+            task_file: None,
             repo: None,
             task: None,
             flags,
@@ -572,7 +647,7 @@ impl PrerequisitePolicy {
                     self.github_token.source = source;
                 }
             }
-            if let Some(acquire) = &token.acquire {
+            if let Some(acquire) = token.acquire.as_ref().filter(|a| a.argv.is_some()) {
                 if repo
                     && self
                         .github_token
@@ -692,7 +767,7 @@ mod tests {
         let flags = PrerequisiteFlags::default();
         let policy = PrerequisitePolicy::resolve(PrerequisitePolicyLayers {
             global: Some(&global),
-            squad_global: None,
+            task_file: None,
             repo: Some(&repo),
             task: None,
             flags: &flags,
@@ -721,7 +796,7 @@ mod tests {
         let resolve = |flags: &PrerequisiteFlags| {
             PrerequisitePolicy::resolve(PrerequisitePolicyLayers {
                 global: None,
-                squad_global: None,
+                task_file: None,
                 repo: None,
                 task: None,
                 flags,
@@ -746,32 +821,12 @@ mod tests {
     }
 
     #[test]
-    fn load_ignores_reserved_workflows_keys_and_warns_for_prerequisite_typos() {
-        let root = tempfile::tempdir().unwrap();
-        let path = crate::data::config::repo::RepoConfig::path(root.path());
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &path,
-            r#"{"workflows":{"dynamic":{},"future":true,"prerequisites":{"typo":true}}}"#,
-        )
-        .unwrap();
-        let config = crate::data::config::repo::RepoConfig::load(root.path()).unwrap();
-        assert_eq!(config.load_warnings.len(), 1);
-        assert!(config.load_warnings[0].contains("typo"));
-        let nested: PrerequisitesConfig =
-            serde_json::from_str(r#"{"githubToken":{"typo":"ignored-value"}}"#).unwrap();
-        assert!(nested.validate(ConfigScope::Global).unwrap()[0].contains("githubToken.typo"));
-        assert!(!format!("{nested:?}").contains("ignored-value"));
-        std::fs::write(
-            &path,
-            r#"{"workflows":{"prerequisites":{"githubToken":{"envVars":["not-valid"]}}}}"#,
-        )
-        .unwrap();
-        let error = crate::data::config::repo::RepoConfig::load(root.path())
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("envVars"));
-        assert!(error.contains(&path.display().to_string()));
+    fn unknown_prerequisite_keys_are_rejected_not_ignored() {
+        assert!(serde_json::from_str::<PrerequisitesConfig>(r#"{"typo":true}"#).is_err());
+        assert!(
+            serde_json::from_str::<PrerequisitesConfig>(r#"{"githubToken":{"typo":"x"}}"#).is_err()
+        );
+        assert!(serde_json::from_str::<WorkflowsConfig>(r#"{"future":true}"#).is_err());
     }
 }
 
@@ -791,7 +846,7 @@ mod policy_merge_tests {
     ) -> PrerequisitePolicy {
         PrerequisitePolicy::resolve(PrerequisitePolicyLayers {
             global,
-            squad_global: None,
+            task_file: None,
             repo,
             task: None,
             flags,
@@ -981,9 +1036,6 @@ mod policy_merge_tests {
         let global = cfg(serde_json::json!({"allowApiClientGrants": true}));
         let p = resolve(Some(&global), None, &PrerequisiteFlags::default());
         assert!(p.allow_api_client_grants);
-        // Validation warns for repo scope only.
-        assert!(repo.validate(ConfigScope::Repo).unwrap()[0].contains("global-only"));
-        assert!(global.validate(ConfigScope::Global).unwrap().is_empty());
     }
 
     #[test]
@@ -994,7 +1046,7 @@ mod policy_merge_tests {
         let r = |global: Option<&PrerequisitesConfig>| {
             PrerequisitePolicy::resolve(PrerequisitePolicyLayers {
                 global,
-                squad_global: None,
+                task_file: None,
                 repo: None,
                 task: None,
                 flags: &PrerequisiteFlags::default(),
@@ -1007,30 +1059,24 @@ mod policy_merge_tests {
     }
 
     #[test]
-    fn squad_global_layers_between_global_and_repo_and_task_replaces_both() {
-        let global = cfg(serde_json::json!({"ssh": {"use": "deny"}}));
-        let squad = cfg(serde_json::json!({"ssh": {"use": "allow"}}));
+    fn task_file_narrows_like_repo_and_cannot_grant() {
+        let global =
+            cfg(serde_json::json!({"ssh": {"use": "allow"}, "githubToken": {"use": "ask"}}));
+        let task_file =
+            cfg(serde_json::json!({"ssh": {"use": "deny"}, "githubToken": {"use": "allow"}}));
         let flags = PrerequisiteFlags::default();
-        let layered = |repo: Option<&PrerequisitesConfig>, task: Option<&PrerequisitePolicy>| {
-            PrerequisitePolicy::resolve(PrerequisitePolicyLayers {
-                global: Some(&global),
-                squad_global: Some(&squad),
-                repo,
-                task,
-                flags: &flags,
-                context: PrerequisiteResolveContext::default(),
-            })
-        };
-        assert_eq!(layered(None, None).ssh.use_, CredentialUse::Allow);
-        assert_eq!(layered(None, None).ssh.source, PolicySource::SquadGlobal);
-        let repo = cfg(serde_json::json!({"ssh": {"use": "deny"}}));
-        assert_eq!(layered(Some(&repo), None).ssh.use_, CredentialUse::Deny);
-        let mut task = PrerequisitePolicy::default();
-        task.ssh.use_ = CredentialUse::Deny;
-        task.ssh.source = PolicySource::Task;
-        let p = layered(None, Some(&task));
+        let p = PrerequisitePolicy::resolve(PrerequisitePolicyLayers {
+            global: Some(&global),
+            task_file: Some(&task_file),
+            repo: None,
+            task: None,
+            flags: &flags,
+            context: PrerequisiteResolveContext::default(),
+        });
         assert_eq!(p.ssh.use_, CredentialUse::Deny);
         assert_eq!(p.ssh.source, PolicySource::Task);
+        assert_eq!(p.github_token.use_, CredentialUse::Ask);
+        assert!(has_warning(&p, "githubToken.use"));
     }
 
     #[test]
@@ -1096,43 +1142,6 @@ mod policy_merge_tests {
     }
 
     #[test]
-    fn unknown_key_under_prerequisites_is_a_warning_not_an_error() {
-        let c = cfg(serde_json::json!({
-            "sshh": {"use": "allow"}, "ssh": {"usee": "allow"},
-            "githubToken": {"acquire": {"argv": ["x"], "tiemout": 3}}
-        }));
-        let warnings = c.validate(ConfigScope::Global).unwrap();
-        assert_eq!(warnings.len(), 3, "{warnings:?}");
-        assert!(warnings.iter().any(|w| w.contains("sshh")));
-        assert!(warnings.iter().any(|w| w.contains("ssh.usee")));
-        assert!(warnings.iter().any(|w| w.contains("acquire.tiemout")));
-        // The misspelt grant did nothing: the safe default applies.
-        let p = resolve(Some(&c), None, &PrerequisiteFlags::default());
-        assert_eq!(p.ssh.use_, CredentialUse::Ask);
-    }
-
-    #[test]
-    fn unknown_keys_under_workflows_and_dynamic_are_ignored() {
-        let w: WorkflowsConfig = serde_json::from_value(serde_json::json!({
-            "dynamic": {"anything": 1}, "future": [1, 2],
-            "prerequisites": {"unresolved": "fail"}
-        }))
-        .unwrap();
-        assert_eq!(
-            w.prerequisites.unwrap().unresolved,
-            Some(UnresolvedMode::Fail)
-        );
-        let w: WorkflowsConfig =
-            serde_json::from_value(serde_json::json!({"dynamic": {}})).unwrap();
-        assert_eq!(
-            w.dynamic,
-            Some(super::super::repo::DynamicWorkflowsConfig::default())
-        );
-        // Round trip retains the supported dynamic block.
-        assert_eq!(serde_json::to_string(&w).unwrap(), r#"{"dynamic":{}}"#);
-    }
-
-    #[test]
     fn validate_rejects_bad_env_var_names_and_timeouts() {
         for bad in ["lower", "1ABC", "A-B", "", "A B"] {
             let c = cfg(serde_json::json!({"githubToken": {"envVars": [bad]}}));
@@ -1140,13 +1149,13 @@ mod policy_merge_tests {
         }
         for t in [0u64, 301, 10_000] {
             let c = cfg(
-                serde_json::json!({"githubToken": {"acquire": {"argv": ["x"], "timeoutSecs": t}}}),
+                serde_json::json!({"githubToken": {"acquire": {"argv": ["x"], "timeout": format!("{t}s")}}}),
             );
             assert!(c.validate(ConfigScope::Global).is_err(), "{t}");
         }
         for t in [1u64, 30, 300] {
             let c = cfg(
-                serde_json::json!({"githubToken": {"acquire": {"argv": ["x"], "timeoutSecs": t}}}),
+                serde_json::json!({"githubToken": {"acquire": {"argv": ["x"], "timeout": format!("{t}s")}}}),
             );
             assert!(c.validate(ConfigScope::Global).is_ok(), "{t}");
         }
@@ -1215,7 +1224,7 @@ mod review_regression_tests {
             let task = PrerequisitePolicy::from_flags(&flags);
             let result = PrerequisitePolicy::resolve(PrerequisitePolicyLayers {
                 global: Some(&global),
-                squad_global: None,
+                task_file: None,
                 repo: Some(&repo),
                 task: Some(&task),
                 flags: &Default::default(),
@@ -1228,7 +1237,7 @@ mod review_regression_tests {
         }
         let default_policy = PrerequisitePolicy::resolve(PrerequisitePolicyLayers {
             global: None,
-            squad_global: None,
+            task_file: None,
             repo: Some(&repo),
             task: None,
             flags: &Default::default(),

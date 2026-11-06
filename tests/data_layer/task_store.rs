@@ -22,7 +22,7 @@ use chrono::{Duration, Utc};
 fn task(name: &str, now: chrono::DateTime<Utc>) -> Task {
     Task {
         prerequisites: None,
-        id: format!("id-{name}"),
+        id: awman::data::ids::TaskId::new(),
         name: name.into(),
         description: format!("when {name} happens"),
         repo_scope: "/repo".into(),
@@ -56,7 +56,6 @@ fn test_engines(root: &std::path::Path) -> Engines {
         overlay_engine: overlay,
         auth_engine: Arc::new(AuthEngine::with_paths(auth_paths, api_paths)),
         agent_engine: agent,
-        config_notices: Default::default(),
         workflow_state_store: Arc::new(WorkflowStateStore::at_git_root(root)),
         credential_monitor: None,
         global_config: std::sync::Arc::new(Default::default()),
@@ -89,11 +88,11 @@ fn squad_schema_and_workspace_overlay_fields_round_trip() {
     let db = DataPaths::at_root(tmp.path().join("data")).db_path();
     let store = TaskStore::open(&db).unwrap();
     store.migrate().unwrap();
-    let now = Utc::now();
+    let now = awman::data::wire::now();
     let workspace = tmp.path().join("squad/tasks/durable/workspace");
     let stored = Task {
         prerequisites: None,
-        id: "durable-id".into(),
+        id: awman::data::ids::TaskId::new(),
         name: "durable".into(),
         description: "preserve task state".into(),
         // `TaskWorkspace` is resolved before persistence.  This is the
@@ -125,7 +124,13 @@ fn squad_schema_and_workspace_overlay_fields_round_trip() {
         "the persisted default-workspace representation must mount directly"
     );
 
-    let run_id = store.start_run(&stored.id, Some("session"), now).unwrap();
+    let run_id = store
+        .start_run(
+            &stored.id,
+            Some(&awman::data::ids::WorkerSessionId::new()),
+            now,
+        )
+        .unwrap();
     store
         .finish_run(&run_id, RunStatus::NotTriggered, &RunDetail::default(), now)
         .unwrap();
@@ -196,7 +201,7 @@ fn due_for_evaluation_applies_pause_backoff_interval_and_running_filters() {
     let db = DataPaths::at_root(tmp.path().join("data")).db_path();
     let store = TaskStore::open(&db).unwrap();
     store.migrate().unwrap();
-    let now = Utc::now();
+    let now = awman::data::wire::now();
 
     let due_fresh = task("fresh", now);
     let due_elapsed = Task {
@@ -232,7 +237,13 @@ fn due_for_evaluation_applies_pause_backoff_interval_and_running_filters() {
     ] {
         store.create(&item).unwrap();
     }
-    store.start_run(&running.id, Some("session"), now).unwrap();
+    store
+        .start_run(
+            &running.id,
+            Some(&awman::data::ids::WorkerSessionId::new()),
+            now,
+        )
+        .unwrap();
 
     let names: std::collections::BTreeSet<_> = store
         .due_for_evaluation(now)
@@ -258,7 +269,7 @@ fn a_trigger_request_overrides_the_interval_and_backoff_but_not_pause_or_a_runni
     let db = DataPaths::at_root(tmp.path().join("data")).db_path();
     let store = TaskStore::open(&db).unwrap();
     store.migrate().unwrap();
-    let now = Utc::now();
+    let now = awman::data::wire::now();
 
     let not_elapsed = Task {
         interval_secs: 3600,
@@ -415,7 +426,7 @@ fn list_and_get_carry_each_tasks_latest_run_outcome() {
     let db = DataPaths::at_root(tmp.path().join("data")).db_path();
     let store = TaskStore::open(&db).unwrap();
     store.migrate().unwrap();
-    let now = Utc::now();
+    let now = awman::data::wire::now();
 
     let never_run = task("never-run", now);
     let ran = task("ran", now);
@@ -578,7 +589,7 @@ fn deleting_a_task_that_has_run_history_removes_the_task_and_its_runs() {
     let db = DataPaths::at_root(tmp.path().join("data")).db_path();
     let store = TaskStore::open(&db).unwrap();
     store.migrate().unwrap();
-    let now = Utc::now();
+    let now = awman::data::wire::now();
 
     let doomed = task("doomed", now);
     let keeper = task("keeper", now);
@@ -836,10 +847,12 @@ async fn the_task_agent_pool_round_trips_through_its_own_config_file() {
         .unwrap();
 
     let config_path = paths.task_config_file("pooled").unwrap();
-    let document = awman::data::config::global::GlobalConfig::load_path(&config_path).unwrap();
-    let squad = document
-        .squad
-        .expect("the task config carries a squad block");
+    let document = awman::data::config::file::ConfigFile::load(
+        &config_path,
+        awman::data::config::FileKind::Task,
+    )
+    .unwrap();
+    let squad = awman::data::config::squad::SquadConfig::from_task_file(&document);
     assert_eq!(
         squad
             .agents_to_models
@@ -875,13 +888,12 @@ async fn the_task_agent_pool_round_trips_through_its_own_config_file() {
 /// global one, and a task with no file inherits the global block whole.
 #[tokio::test]
 async fn a_task_config_layers_over_the_global_squad_block() {
-    use awman::data::config::global::task_squad_config;
-    use awman::data::config::repo::SquadConfig;
+    use awman::data::config::squad::task_squad_config;
+    use awman::data::config::squad::SquadConfig;
 
     let tmp = tempfile::tempdir().unwrap();
     let (_store, gateway, paths) = edit_fixture(&tmp);
     let global = SquadConfig {
-        workflows: None,
         agents_to_models: Some(std::collections::HashMap::from([(
             "claude".to_string(),
             vec!["claude-opus-4-8".to_string()],
@@ -929,8 +941,8 @@ async fn a_task_config_layers_over_the_global_squad_block() {
 /// not a silent fall back to the global pool.
 #[test]
 fn a_malformed_task_config_is_reported_rather_than_ignored() {
-    use awman::data::config::global::task_squad_config;
-    use awman::data::config::repo::SquadConfig;
+    use awman::data::config::squad::task_squad_config;
+    use awman::data::config::squad::SquadConfig;
 
     let tmp = tempfile::tempdir().unwrap();
     let paths = awman::data::fs::SquadPaths::from_root(tmp.path().join("squad"));
@@ -1016,7 +1028,8 @@ async fn triggering_leaves_the_tasks_schedule_and_every_other_field_untouched() 
 /// cancel — with nothing left running — is refused.
 #[tokio::test]
 async fn cancel_stops_an_in_flight_run_and_records_it_as_canceled() {
-    use awman::data::config::env::{EnvSnapshot, AWMAN_CONFIG_HOME};
+    use awman::data::config::env::EnvSnapshot;
+    use awman::data::fs::data_paths::AWMAN_HOME;
     use awman::engine::squad::{
         EvaluationOutcome, EvaluationRequest, SquadScheduler, TaskEvaluator,
     };
@@ -1036,8 +1049,10 @@ async fn cancel_stops_an_in_flight_run_and_records_it_as_canceled() {
     let store = Arc::new(TaskStore::open(&db).unwrap());
     store.migrate().unwrap();
     let paths = awman::data::fs::SquadPaths::from_root(tmp.path().join("squad"));
-    let env = EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, tmp.path().to_str().unwrap())]);
-    store.create(&task("long-run", Utc::now())).unwrap();
+    let env = EnvSnapshot::with_overrides([(AWMAN_HOME, tmp.path().to_str().unwrap())]);
+    store
+        .create(&task("long-run", awman::data::wire::now()))
+        .unwrap();
 
     let scheduler = SquadScheduler::new(store.clone(), paths.clone(), Arc::new(NeverFinishes), env)
         .with_tick_interval(std::time::Duration::from_millis(50));

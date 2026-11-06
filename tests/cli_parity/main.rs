@@ -10,6 +10,8 @@
 mod helpers;
 
 mod catalogue_completeness;
-mod config_migrate;
+mod config_commands;
+mod daemon_surface;
 mod json_outputs;
+mod set_overrides;
 mod squad_catalogue;

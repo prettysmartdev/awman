@@ -6,7 +6,7 @@ use std::path::{Component, Path, PathBuf};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-use crate::data::config::{Env, GlobalConfig};
+use crate::data::config::Env;
 use crate::data::fs::agent_dirs::DefinitionScope;
 
 pub const AGENT_DEFINITION_SCHEMA: u32 = 1;
@@ -92,7 +92,7 @@ pub struct RunTable {
     pub seed_prompt: SeedPromptSpec, // default Positional
     #[serde(default)]
     pub model: ModelFlagSpec, // default Space
-    /// The structured output mode a non-interactive run can print in
+    /// The structured output mode a headless run can print in
     /// (WI 0137 §4): `"text"` (default), `"claude_stream_json"` or
     /// `"codex_json"`. A structured format lets an API run produce
     /// `step_activity` events and a `final_message`.
@@ -589,7 +589,7 @@ impl AgentDefinitionFile {
             problems.push("image.install: required unless image.dockerfile is set".into());
         }
         if self.sandbox.is_some() {
-            problems.push("custom agents do not support Docker Sandboxes yet; remove [sandbox] and use docker, apple or builtin-experimental".into());
+            problems.push("custom agents do not support Docker Sandboxes yet; remove [sandbox] and use runtime.kind docker, apple or builtin".into());
         }
         problems
     }
@@ -652,7 +652,7 @@ pub fn content_hash(toml_bytes: &[u8], dockerfile_bytes: Option<&[u8]>) -> Strin
 /// Load using the process's global data home to identify the scope for diagnostics.
 /// Callers with an explicit environment/scope should use `load_agent_definition_with_scope`.
 pub fn load_agent_definition(path: &Path) -> Result<LoadedAgentDefinition, AgentDefinitionInvalid> {
-    let global = GlobalConfig::data_home_with(&Env::from_process())
+    let global = crate::data::fs::data_paths::data_home(&Env::from_process())
         .ok()
         .map(|home| home.join("agents"));
     let parent = path.parent().unwrap_or(Path::new("."));
@@ -1193,7 +1193,9 @@ mod tests {
             "['/usr/bin/pi']"
         };
         for command in ["['pi']", absolute] {
-            let source = format!("schema=1\ndisplay_name='Pi'\n[run]\ncommand=['pi']\n[ping]\ncommand={command}\n[image]\ninstall=['x']\n");
+            let source = format!(
+                "schema=1\ndisplay_name='Pi'\n[run]\ncommand=['pi']\n[ping]\ncommand={command}\n[image]\ninstall=['x']\n"
+            );
             let file: AgentDefinitionFile = toml::from_str(&source).unwrap();
             assert!(
                 file.validate().is_empty(),
@@ -1206,7 +1208,9 @@ mod tests {
             ("['./pi']", "ping.command[0]"),
             ("['bin/pi']", "ping.command[0]"),
         ] {
-            let source = format!("schema=1\ndisplay_name='Pi'\n[run]\ncommand=['pi']\n[ping]\ncommand={command}\n[image]\ninstall=['x']\n");
+            let source = format!(
+                "schema=1\ndisplay_name='Pi'\n[run]\ncommand=['pi']\n[ping]\ncommand={command}\n[image]\ninstall=['x']\n"
+            );
             let file: AgentDefinitionFile = toml::from_str(&source).unwrap();
             assert!(
                 file.validate()
@@ -1219,14 +1223,18 @@ mod tests {
         let long = std::iter::repeat_n("'x'", MAX_PING_TOKENS + 1)
             .collect::<Vec<_>>()
             .join(",");
-        let source = format!("schema=1\ndisplay_name='Pi'\n[run]\ncommand=['pi']\n[ping]\ncommand=['pi',{long}]\n[image]\ninstall=['x']\n");
+        let source = format!(
+            "schema=1\ndisplay_name='Pi'\n[run]\ncommand=['pi']\n[ping]\ncommand=['pi',{long}]\n[image]\ninstall=['x']\n"
+        );
         let file: AgentDefinitionFile = toml::from_str(&source).unwrap();
         assert!(file
             .validate()
             .iter()
             .any(|problem| problem.contains("ping.command: must have at most 16 tokens")));
         for token in ["bad\\u0000token", "bad\\ntoken"] {
-            let source = format!("schema=1\ndisplay_name='Pi'\n[run]\ncommand=['pi']\n[ping]\ncommand=['pi',\"{token}\"]\n[image]\ninstall=['x']\n");
+            let source = format!(
+                "schema=1\ndisplay_name='Pi'\n[run]\ncommand=['pi']\n[ping]\ncommand=['pi',\"{token}\"]\n[image]\ninstall=['x']\n"
+            );
             let file: AgentDefinitionFile = toml::from_str(&source).unwrap();
             assert!(
                 file.validate()

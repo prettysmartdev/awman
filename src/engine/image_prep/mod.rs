@@ -83,16 +83,20 @@ pub struct ImageBuildContext {
 }
 impl ImageBuildContext {
     pub fn for_session(session: &crate::data::session::Session, default_agent: &str) -> Self {
-        Self::for_repo(session.git_root(), session.repo_config(), default_agent)
+        Self::for_repo(
+            session.git_root(),
+            &session.effective_config(),
+            default_agent,
+        )
     }
     pub fn for_repo(
         git_root: &std::path::Path,
-        config: &crate::data::config::RepoConfig,
+        config: &crate::data::config::EffectiveConfig,
         default_agent: &str,
     ) -> Self {
         Self {
             git_root: git_root.to_path_buf(),
-            project_dockerfile: config.dockerfile_path_or_default(git_root),
+            project_dockerfile: config.dockerfile_path(git_root),
             default_agent: default_agent.to_string(),
         }
     }

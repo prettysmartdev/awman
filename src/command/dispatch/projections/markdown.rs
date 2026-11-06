@@ -24,6 +24,17 @@ impl CommandCatalogue {
              here exactly as the catalogue defines it.\n\n",
         );
         out.push_str("---\n\n");
+        out.push_str("## Global flags\n\n");
+        out.push_str(
+            "Accepted by every command, anywhere before `--`, from the CLI, the TUI command \
+             box and API `args`.\n\n",
+        );
+        out.push_str("| Flag | Kind | Default | Implies | Conflicts | Frontends | Help |\n");
+        out.push_str("|---|---|---|---|---|---|---|\n");
+        for flag in self.global_flags() {
+            out.push_str(&render_flag_row(flag));
+        }
+        out.push_str("\n---\n\n");
         for sub in self.root().subcommands {
             render_command(sub, &["awman"], 2, &mut out);
             out.push_str("---\n\n");
@@ -182,7 +193,7 @@ fn argument_kind_label(kind: ArgumentKind) -> &'static str {
         ArgumentKind::OptionalString => "string (optional)",
         ArgumentKind::Path => "path",
         ArgumentKind::OptionalPath => "path (optional)",
-        ArgumentKind::TrailingVarArgs => "trailing args",
+        ArgumentKind::TrailingVarArgs | ArgumentKind::VarArgs => "trailing args",
     }
 }
 
@@ -225,8 +236,8 @@ mod tests {
     fn reference_contains_every_top_level_command() {
         let generated = CommandCatalogue::get().markdown_reference();
         for name in &[
-            "init", "ready", "chat", "specs", "agents", "config", "exec", "api", "squad", "remote",
-            "new", "clean",
+            "init", "ready", "chat", "specs", "agents", "config", "exec", "daemon", "squad",
+            "remote", "new", "clean",
         ] {
             assert!(
                 generated.contains(&format!("`awman {name}`")),
@@ -305,12 +316,12 @@ mod tests {
     /// `aspec/uxui/cli.md` (WI 0114 F-25) documents UX standards, not the
     /// command surface — that surface is `markdown_reference()`'s job. The
     /// only flags it names are the cross-cutting pair it exists to explain
-    /// (`--json` implies `--non-interactive`, per decision Q8); every other
+    /// (`--json` implies `--headless`, per decision Q8); every other
     /// real command, alias, or flag name — and the removed `--format md`
     /// value (decision Q9) — must never reappear in it.
     #[test]
     fn cli_md_documents_ux_standards_not_specific_commands_or_flags() {
-        const ALLOWED_FLAG_MENTIONS: &[&str] = &["json", "non-interactive"];
+        const ALLOWED_FLAG_MENTIONS: &[&str] = &["json", "headless"];
 
         let cli_md =
             std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/aspec/uxui/cli.md"))

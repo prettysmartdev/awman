@@ -98,7 +98,7 @@ fn task(name: &str, overlays: &[&str]) -> Task {
     let now = chrono::Utc::now();
     Task {
         prerequisites: None,
-        id: name.into(),
+        id: awman::data::ids::TaskId::new(),
         name: name.into(),
         description: "d".into(),
         repo_scope: std::path::PathBuf::from("/repo"),

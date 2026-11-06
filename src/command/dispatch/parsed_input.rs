@@ -160,9 +160,9 @@ mod tests {
         let parsed = parse("ready -n", cat).unwrap();
         assert_eq!(parsed.path, vec!["ready"]);
         assert_eq!(
-            parsed.args.flag_bool("non-interactive"),
+            parsed.args.flag_bool("headless"),
             Some(true),
-            "-n must map to non-interactive flag"
+            "-n must map to headless flag"
         );
     }
 }
@@ -181,12 +181,16 @@ mod shared_parser_tests {
     /// carried as a string into the command.
     #[test]
     fn a_bad_enum_value_is_rejected_at_parse_time() {
-        let err = parse("chat --launch-mode banana", CommandCatalogue::get()).unwrap_err();
+        let err = parse(
+            "exec workflow --on-merge-failure banana",
+            CommandCatalogue::get(),
+        )
+        .unwrap_err();
         match err {
             CommandError::InvalidFlagValue { flag, reason, .. } => {
-                assert_eq!(flag, "launch-mode");
+                assert_eq!(flag, "on-merge-failure");
                 assert!(
-                    reason.contains("banana") && reason.contains("stdio"),
+                    reason.contains("banana") && reason.contains("keep"),
                     "the reason must name the bad value and the allowed set: {reason}"
                 );
             }
@@ -198,44 +202,14 @@ mod shared_parser_tests {
     #[test]
     fn a_bad_enum_value_gives_the_same_error_as_the_api() {
         let catalogue = CommandCatalogue::get();
-        let from_box = parse("chat --launch-mode banana", catalogue).unwrap_err();
+        let from_box = parse("exec workflow --on-merge-failure banana", catalogue).unwrap_err();
         let from_api = catalogue
-            .parse_raw_args(&["chat"], &["--launch-mode".into(), "banana".into()])
+            .parse_raw_args(
+                &["exec", "workflow"],
+                &["--on-merge-failure".into(), "banana".into()],
+            )
             .unwrap_err();
         assert_eq!(from_box.to_string(), from_api.to_string());
-    }
-
-    /// A non-numeric value for a numeric flag is rejected at parse time.
-    #[test]
-    fn a_non_numeric_number_is_rejected_at_parse_time() {
-        let err = parse("squad start --port abc", CommandCatalogue::get()).unwrap_err();
-        match err {
-            CommandError::InvalidFlagValue { flag, reason, .. } => {
-                assert_eq!(flag, "port");
-                assert!(
-                    reason.contains("abc"),
-                    "the reason must name the bad value: {reason}"
-                );
-            }
-            other => panic!("expected InvalidFlagValue, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn a_non_numeric_number_gives_the_same_error_as_the_api() {
-        let catalogue = CommandCatalogue::get();
-        let from_box = parse("squad start --port abc", catalogue).unwrap_err();
-        let from_api = catalogue
-            .parse_raw_args(&["squad", "start"], &["--port".into(), "abc".into()])
-            .unwrap_err();
-        assert_eq!(from_box.to_string(), from_api.to_string());
-    }
-
-    /// A well-formed numeric value reaches the frontend already typed.
-    #[test]
-    fn a_valid_number_arrives_typed() {
-        let parsed = parse("squad start --port 9000", CommandCatalogue::get()).unwrap();
-        assert_eq!(parsed.args.flag_u16("port"), Some(9000));
     }
 
     /// A short-flag cluster is an unknown flag now, as it is on the CLI and in

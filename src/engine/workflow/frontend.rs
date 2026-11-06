@@ -144,7 +144,7 @@ pub trait WorkflowFrontend: UserMessageSink + Send {
     /// `true` puts the engine on the interactive recovery path: it opens the
     /// Workflow Control Board with the failure attached and waits for a
     /// restart / back / next / abort decision. `false` — the squad daemon, the
-    /// API server, a `--non-interactive` CLI run — puts it on the unattended
+    /// API server, a `--headless` CLI run — puts it on the unattended
     /// path: one yolo countdown, one automatic retry, then the workflow fails
     /// (WI-0115 §3).
     ///

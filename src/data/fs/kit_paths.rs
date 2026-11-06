@@ -8,13 +8,12 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::data::config::global::GlobalConfig;
 use crate::data::error::DataError;
 
 /// Resolves host-global kit directory paths for the sbx runtime.
 #[derive(Debug, Clone)]
 pub struct SandboxKitPaths {
-    /// The resolved `$HOME/.awman` (or `$AWMAN_CONFIG_HOME`) directory.
+    /// The resolved `$HOME/.awman` (or `$AWMAN_HOME`) directory.
     home: PathBuf,
 }
 
@@ -25,9 +24,11 @@ impl SandboxKitPaths {
     }
 
     /// Resolve from the current process environment, honouring
-    /// `AWMAN_CONFIG_HOME` / `XDG_CONFIG_HOME` exactly as the global config does.
+    /// `AWMAN_HOME` / `XDG_CONFIG_HOME` exactly as the global config does.
     pub fn from_process_env() -> Result<Self, DataError> {
-        Ok(Self::at_home(GlobalConfig::home_dir()?))
+        Ok(Self::at_home(crate::data::fs::data_paths::config_home(
+            &crate::data::config::env::Env::from_process(),
+        )?))
     }
 
     /// The awman home directory this resolver is bound to.

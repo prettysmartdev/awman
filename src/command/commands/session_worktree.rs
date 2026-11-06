@@ -612,16 +612,22 @@ impl Resolver<'_> {
             .into_iter()
             .filter_map(|path| path.parent().map(Path::to_path_buf))
             .collect::<Vec<_>>();
+            let canonical_directories = directories
+                .iter()
+                .filter_map(|dir| dir.canonicalize().ok())
+                .collect::<Vec<_>>();
             let available = self
                 .git
                 .list_worktree_entries(self.root)?
                 .into_iter()
                 .filter(|entry: &WorktreeEntry| {
                     !entry.prunable
-                        && entry
-                            .path
-                            .parent()
-                            .is_some_and(|p| directories.iter().any(|dir| p == dir))
+                        && entry.path.parent().is_some_and(|parent| {
+                            directories.iter().any(|dir| parent == dir)
+                                || parent.canonicalize().is_ok_and(|canonical| {
+                                    canonical_directories.contains(&canonical)
+                                })
+                        })
                 })
                 .filter(|entry| {
                     self.git

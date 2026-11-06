@@ -614,7 +614,7 @@ fn spawn_piped_attach(
     let child_pid = Some(child.id());
 
     let bridge = crate::engine::container::io_bridge::bridge_piped(io, &mut child, bridge_cfg);
-    // Non-interactive attach: close the child's stdin after the bridge wires up
+    // Headless attach: close the child's stdin after the bridge wires up
     // so a shell that reads to EOF exits cleanly (matches the run piped path).
     drop(bridge.stdin_injector);
 
@@ -810,7 +810,7 @@ pub(super) fn build_run_argv(
         // agent receives it without piping; stdin stays inherited for the user.
         args.push("-it".into());
     } else if options.seeded_prompt.is_some() {
-        // Non-interactive with a seeded prompt: pipe stdin so we can write the
+        // Headless with a seeded prompt: pipe stdin so we can write the
         // prompt, then close it. No PTY — allocating one fails when there is no
         // host TTY (ENOTTY / "Inappropriate ioctl for device").
         args.push("-i".into());
@@ -876,8 +876,7 @@ pub(super) fn build_run_argv(
         args.push(name);
     }
     // Env literals — unlike env_passthrough above, these keep the `KEY=VALUE`
-    // form. Literal values are constants awman itself supplies (e.g.
-    // `COPILOT_OFFLINE=true`), never a user secret, so there is nothing here
+    // form. Literal values are constants awman itself supplies, never a user secret, so there is nothing here
     // that argv's world-readability could expose.
     for lit in &options.env_literal {
         args.push("-e".into());
@@ -1564,7 +1563,7 @@ mod tests {
         .unwrap();
         assert!(
             argv.contains(&"-i".to_string()),
-            "non-interactive ACP run still needs -i; argv: {argv:?}"
+            "headless ACP run still needs -i; argv: {argv:?}"
         );
         assert!(
             !argv.contains(&"-it".to_string()),
@@ -1596,8 +1595,8 @@ mod tests {
     #[test]
     fn build_run_argv_acp_emits_nothing_after_the_entrypoint() {
         // Regression for the "corrupted ACP argv" blocker: an ACP launch that
-        // also carries a non-interactive subcommand flag and agent mode flags
-        // (as every `exec workflow` / `--non-interactive` / `--yolo` ACP launch
+        // also carries a headless subcommand flag and agent mode flags
+        // (as every `exec workflow` / `--headless` / `--yolo` ACP launch
         // does) must NOT graft any of them onto `cline --acp` — the ACP argv is
         // complete at the entrypoint. Before the fix this produced
         // `cline --acp task --yolo`, silently corrupting the JSON-RPC launch.

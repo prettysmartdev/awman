@@ -1,7 +1,7 @@
 //! `WorkflowFrontend` impl for the CLI.
 //!
 //! The CLI prompts on stdin (when it is a TTY) and falls back to the safe
-//! non-interactive defaults otherwise. The
+//! headless defaults otherwise. The
 //! prompt presents only the actions in `AvailableActions` whose `can_*`
 //! flags are true; excluded actions are skipped (with their
 //! `*_unavailable_reason` printed as a parenthetical note).
@@ -248,7 +248,7 @@ impl WorkflowFrontend for CliFrontend {
         Ok(matches!(buf.trim(), "y" | "Y"))
     }
 
-    /// A CLI on a TTY can ask; `--non-interactive` cannot, and falls to the
+    /// A CLI on a TTY can ask; `--headless` cannot, and falls to the
     /// engine's unattended retry path instead.
     fn supports_interactive_recovery(&self) -> bool {
         !self.non_interactive
@@ -484,7 +484,7 @@ mod tests {
         }
     }
 
-    /// Build a non-interactive `CliFrontend` suitable for unit tests.
+    /// Build a headless `CliFrontend` suitable for unit tests.
     /// In the test environment stdin is never a TTY, so `non_interactive` is
     /// always set to `true` by `CliFrontend::new`.
     fn make_frontend() -> CliFrontend {

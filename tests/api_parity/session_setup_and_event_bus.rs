@@ -37,17 +37,16 @@ use awman::engine::auth::AuthEngine;
 use awman::engine::container::ContainerRuntime;
 use awman::engine::git::GitEngine;
 use awman::engine::overlay::OverlayEngine;
-use awman::frontend::api::routes::{AppState, AuthMode};
+use awman::frontend::api::routes::AppState;
 
 // ─── Test helpers ─────────────────────────────────────────────────────────────
 
-fn make_app_state(root: &std::path::Path, auth: AuthMode) -> Arc<AppState> {
-    make_app_state_with_workdirs(root, auth, vec![])
+fn make_app_state(root: &std::path::Path) -> Arc<AppState> {
+    make_app_state_with_workdirs(root, vec![])
 }
 
 fn make_app_state_with_workdirs(
     root: &std::path::Path,
-    auth: AuthMode,
     workdirs: Vec<std::path::PathBuf>,
 ) -> Arc<AppState> {
     let paths = ApiPaths::from_root(root);
@@ -63,7 +62,6 @@ fn make_app_state_with_workdirs(
     let workflow_state_store = Arc::new(WorkflowStateStore::at_git_root(paths.root()));
 
     let engines = Engines {
-        config_notices: Default::default(),
         runtime: runtime.clone(),
         container_runtime: Some(runtime),
         sandbox_runtime: None,
@@ -90,6 +88,8 @@ fn make_app_state_with_workdirs(
     );
 
     Arc::new(AppState {
+        live_config: std::sync::RwLock::new(None),
+        settings_tx: None,
         lifecycle_store,
         setup_cancels,
         canceller,
@@ -100,7 +100,6 @@ fn make_app_state_with_workdirs(
         workdir_roots: Vec::new(),
         started_at: Instant::now(),
         task_handles: tokio::sync::Mutex::new(Vec::new()),
-        auth_mode: auth,
         engines,
         sessions: Arc::new(awman::data::session_manager::SessionManager::in_memory(
             awman::data::config::env::EnvSnapshot::empty(),
@@ -126,10 +125,6 @@ fn catalogue_api_allowed_commands_includes_exec_and_squad_commands() {
         ("agents", "kill"),
         ("exec", "prompt"),
         ("exec", "workflow"),
-        ("squad", "start"),
-        ("squad", "stop"),
-        ("squad", "status"),
-        ("squad", "logs"),
         ("squad", "add"),
         // `squad edit` is API-allowed for the same reason `add` is —
         // the daemon re-executes it from the remote gateway.
@@ -166,7 +161,7 @@ fn catalogue_ready_not_in_api_allowed_commands() {
 #[test]
 fn catalogue_validate_for_frontend_rejects_chat_for_api() {
     let cat = CommandCatalogue::get();
-    let result = cat.validate_for_frontend(FrontendKind::Api, &["chat"]);
+    let result = cat.validate_for_frontend(FrontendKind::WORKER_LOCAL, &["chat"]);
 
     match result {
         Err(CommandError::NotAvailableForFrontend { command, frontend }) => {
@@ -174,7 +169,7 @@ fn catalogue_validate_for_frontend_rejects_chat_for_api() {
                 command.contains("chat"),
                 "error should name the blocked command; got {command:?}"
             );
-            assert_eq!(frontend, "api");
+            assert_eq!(frontend, "daemon:worker:local");
         }
         other => panic!(
             "expected Err(NotAvailableForFrontend) for 'chat' on Api frontend, got {other:?}"
@@ -185,7 +180,7 @@ fn catalogue_validate_for_frontend_rejects_chat_for_api() {
 #[test]
 fn catalogue_validate_for_frontend_rejects_ready_for_api() {
     let cat = CommandCatalogue::get();
-    let result = cat.validate_for_frontend(FrontendKind::Api, &["ready"]);
+    let result = cat.validate_for_frontend(FrontendKind::WORKER_LOCAL, &["ready"]);
     assert!(
         matches!(result, Err(CommandError::NotAvailableForFrontend { .. })),
         "\"ready\" must be rejected for Api frontend"
@@ -195,7 +190,7 @@ fn catalogue_validate_for_frontend_rejects_ready_for_api() {
 #[test]
 fn catalogue_validate_for_frontend_accepts_exec_workflow_for_api() {
     let cat = CommandCatalogue::get();
-    let result = cat.validate_for_frontend(FrontendKind::Api, &["exec", "workflow"]);
+    let result = cat.validate_for_frontend(FrontendKind::WORKER_LOCAL, &["exec", "workflow"]);
     assert!(
         result.is_ok(),
         "\"exec workflow\" must be accepted for Api frontend; got {result:?}"
@@ -205,7 +200,7 @@ fn catalogue_validate_for_frontend_accepts_exec_workflow_for_api() {
 #[test]
 fn catalogue_validate_for_frontend_accepts_exec_prompt_for_api() {
     let cat = CommandCatalogue::get();
-    let result = cat.validate_for_frontend(FrontendKind::Api, &["exec", "prompt"]);
+    let result = cat.validate_for_frontend(FrontendKind::WORKER_LOCAL, &["exec", "prompt"]);
     assert!(
         result.is_ok(),
         "\"exec prompt\" must be accepted for Api frontend; got {result:?}"
@@ -235,7 +230,7 @@ fn catalogue_cli_and_tui_frontends_allow_all_commands() {
 
 // ─── API restriction live-server tests ────────────────────────────────────────
 
-/// Helper: POST /v1/commands with the given subcommand and optional session header.
+/// Helper: POST /v1/worker/commands with the given subcommand and optional session header.
 /// Returns (status_code, body_json).
 async fn post_command(
     client: &reqwest::Client,
@@ -243,7 +238,7 @@ async fn post_command(
     subcommand: &str,
     session_id: Option<&str>,
 ) -> (u16, serde_json::Value) {
-    let url = format!("http://{addr}/v1/commands");
+    let url = format!("http://{addr}/v1/worker/commands");
     let body = serde_json::json!({
         "subcommand": subcommand,
         "args": []
@@ -252,7 +247,7 @@ async fn post_command(
     if let Some(sid) = session_id {
         req = req.header("x-awman-session", sid);
     }
-    let resp = req.send().await.expect("POST /v1/commands");
+    let resp = req.send().await.expect("POST /v1/worker/commands");
     let status = resp.status().as_u16();
     let json: serde_json::Value = resp.json().await.unwrap_or_default();
     (status, json)
@@ -261,7 +256,7 @@ async fn post_command(
 #[tokio::test]
 async fn real_network_api_rejects_chat_with_400() {
     let tmp = tempfile::tempdir().unwrap();
-    let state = make_app_state(tmp.path(), AuthMode::Disabled);
+    let state = make_app_state(tmp.path());
     let Some((addr, server)) = spawn_router(state).await else {
         eprintln!("SKIP: cannot bind 127.0.0.1");
         return;
@@ -286,7 +281,7 @@ async fn real_network_api_rejects_chat_with_400() {
 #[tokio::test]
 async fn real_network_api_rejects_ready_with_400() {
     let tmp = tempfile::tempdir().unwrap();
-    let state = make_app_state(tmp.path(), AuthMode::Disabled);
+    let state = make_app_state(tmp.path());
     let Some((addr, server)) = spawn_router(state).await else {
         eprintln!("SKIP: cannot bind 127.0.0.1");
         return;
@@ -305,7 +300,7 @@ async fn real_network_api_rejects_ready_with_400() {
 #[tokio::test]
 async fn real_network_api_rejects_init_with_400() {
     let tmp = tempfile::tempdir().unwrap();
-    let state = make_app_state(tmp.path(), AuthMode::Disabled);
+    let state = make_app_state(tmp.path());
     let Some((addr, server)) = spawn_router(state).await else {
         eprintln!("SKIP: cannot bind 127.0.0.1");
         return;
@@ -324,7 +319,7 @@ async fn real_network_api_rejects_init_with_400() {
 #[tokio::test]
 async fn real_network_api_accepts_agents_status_and_rejects_attach() {
     let tmp = tempfile::tempdir().unwrap();
-    let state = make_app_state(tmp.path(), AuthMode::Disabled);
+    let state = make_app_state(tmp.path());
     let Some((addr, server)) = spawn_router(state).await else {
         eprintln!("SKIP: cannot bind 127.0.0.1");
         return;
@@ -348,7 +343,7 @@ async fn real_network_api_accepts_agents_status_and_rejects_attach() {
 #[tokio::test]
 async fn real_network_api_rejects_api_server_start_with_400() {
     let tmp = tempfile::tempdir().unwrap();
-    let state = make_app_state(tmp.path(), AuthMode::Disabled);
+    let state = make_app_state(tmp.path());
     let Some((addr, server)) = spawn_router(state).await else {
         eprintln!("SKIP: cannot bind 127.0.0.1");
         return;
@@ -370,7 +365,7 @@ async fn real_network_api_rejects_api_server_start_with_400() {
 #[tokio::test]
 async fn real_network_api_accepts_exec_workflow_routing_not_command_restriction_400() {
     let tmp = tempfile::tempdir().unwrap();
-    let state = make_app_state(tmp.path(), AuthMode::Disabled);
+    let state = make_app_state(tmp.path());
     let Some((addr, server)) = spawn_router(state).await else {
         eprintln!("SKIP: cannot bind 127.0.0.1");
         return;
@@ -398,7 +393,7 @@ async fn real_network_api_accepts_exec_workflow_routing_not_command_restriction_
 #[tokio::test]
 async fn real_network_api_accepts_exec_prompt_routing_not_command_restriction_400() {
     let tmp = tempfile::tempdir().unwrap();
-    let state = make_app_state(tmp.path(), AuthMode::Disabled);
+    let state = make_app_state(tmp.path());
     let Some((addr, server)) = spawn_router(state).await else {
         eprintln!("SKIP: cannot bind 127.0.0.1");
         return;
@@ -425,7 +420,7 @@ async fn real_network_api_accepts_exec_prompt_routing_not_command_restriction_40
 #[tokio::test]
 async fn real_network_api_rejection_body_lists_available_commands() {
     let tmp = tempfile::tempdir().unwrap();
-    let state = make_app_state(tmp.path(), AuthMode::Disabled);
+    let state = make_app_state(tmp.path());
     let Some((addr, server)) = spawn_router(state).await else {
         eprintln!("SKIP: cannot bind 127.0.0.1");
         return;
@@ -464,8 +459,7 @@ async fn real_network_post_sessions_returns_202_immediately() {
     let workdir = tempfile::tempdir().unwrap();
     let workdir_path = workdir.path().canonicalize().unwrap();
 
-    let state =
-        make_app_state_with_workdirs(tmp.path(), AuthMode::Disabled, vec![workdir_path.clone()]);
+    let state = make_app_state_with_workdirs(tmp.path(), vec![workdir_path.clone()]);
     let Some((addr, server)) = spawn_router(state).await else {
         eprintln!("SKIP: cannot bind 127.0.0.1");
         return;
@@ -478,17 +472,17 @@ async fn real_network_post_sessions_returns_202_immediately() {
 
     let start = std::time::Instant::now();
     let resp = client
-        .post(format!("http://{addr}/v1/sessions"))
+        .post(format!("http://{addr}/v1/worker/sessions"))
         .json(&serde_json::json!({ "workdir": workdir_path.display().to_string() }))
         .send()
         .await
-        .expect("POST /v1/sessions");
+        .expect("POST /v1/worker/sessions");
     let elapsed = start.elapsed();
 
     assert_eq!(
         resp.status().as_u16(),
-        202,
-        "POST /sessions must return 202 Accepted immediately"
+        201,
+        "POST /sessions must return 201 Accepted immediately"
     );
     assert!(
         elapsed < std::time::Duration::from_secs(1),
@@ -497,8 +491,8 @@ async fn real_network_post_sessions_returns_202_immediately() {
 
     let body: serde_json::Value = resp.json().await.unwrap();
     assert!(
-        body["session_id"].is_string(),
-        "202 body must contain a string session_id; got {body}"
+        body["id"].is_string(),
+        "201 body must contain a string session_id; got {body}"
     );
 
     server.abort();
@@ -508,15 +502,17 @@ async fn real_network_post_sessions_returns_202_immediately() {
 #[tokio::test]
 async fn real_network_session_status_unknown_id_returns_404() {
     let tmp = tempfile::tempdir().unwrap();
-    let state = make_app_state(tmp.path(), AuthMode::Disabled);
+    let state = make_app_state(tmp.path());
     let Some((addr, server)) = spawn_router(state).await else {
         eprintln!("SKIP: cannot bind 127.0.0.1");
         return;
     };
 
-    let resp = reqwest::get(format!("http://{addr}/v1/sessions/nonexistent/status"))
-        .await
-        .expect("GET /sessions/nonexistent/status");
+    let resp = reqwest::get(format!(
+        "http://{addr}/v1/worker/sessions/ses_357f5c155c9da6842b84ad1066996928"
+    ))
+    .await
+    .expect("GET /sessions/nonexistent/status");
     assert_eq!(
         resp.status().as_u16(),
         404,
@@ -534,8 +530,7 @@ async fn real_network_session_status_returns_valid_body_after_create() {
     let workdir = tempfile::tempdir().unwrap();
     let workdir_path = workdir.path().canonicalize().unwrap();
 
-    let state =
-        make_app_state_with_workdirs(tmp.path(), AuthMode::Disabled, vec![workdir_path.clone()]);
+    let state = make_app_state_with_workdirs(tmp.path(), vec![workdir_path.clone()]);
     let Some((addr, server)) = spawn_router(state).await else {
         eprintln!("SKIP: cannot bind 127.0.0.1");
         return;
@@ -545,18 +540,18 @@ async fn real_network_session_status_returns_valid_body_after_create() {
 
     // Create session.
     let create_resp = client
-        .post(format!("http://{addr}/v1/sessions"))
+        .post(format!("http://{addr}/v1/worker/sessions"))
         .json(&serde_json::json!({ "workdir": workdir_path.display().to_string() }))
         .send()
         .await
-        .expect("POST /v1/sessions");
-    assert_eq!(create_resp.status().as_u16(), 202);
+        .expect("POST /v1/worker/sessions");
+    assert_eq!(create_resp.status().as_u16(), 201);
     let create_body: serde_json::Value = create_resp.json().await.unwrap();
-    let session_id = create_body["session_id"].as_str().unwrap();
+    let session_id = create_body["id"].as_str().unwrap();
 
     // Poll status — setup is async so this should return quickly.
     let status_resp = client
-        .get(format!("http://{addr}/v1/sessions/{session_id}/status"))
+        .get(format!("http://{addr}/v1/worker/sessions/{session_id}"))
         .send()
         .await
         .expect("GET /sessions/{id}/status");
@@ -564,7 +559,7 @@ async fn real_network_session_status_returns_valid_body_after_create() {
     let status_body: serde_json::Value = status_resp.json().await.unwrap();
 
     assert_eq!(
-        status_body["session_id"].as_str().unwrap(),
+        status_body["id"].as_str().unwrap(),
         session_id,
         "status body must echo session_id"
     );
@@ -584,8 +579,7 @@ async fn real_network_job_rejected_during_session_setup() {
     let workdir = tempfile::tempdir().unwrap();
     let workdir_path = workdir.path().canonicalize().unwrap();
 
-    let state =
-        make_app_state_with_workdirs(tmp.path(), AuthMode::Disabled, vec![workdir_path.clone()]);
+    let state = make_app_state_with_workdirs(tmp.path(), vec![workdir_path.clone()]);
     let Some((addr, server)) = spawn_router(state).await else {
         eprintln!("SKIP: cannot bind 127.0.0.1");
         return;
@@ -595,14 +589,14 @@ async fn real_network_job_rejected_during_session_setup() {
 
     // Create session — returns 202 before setup finishes.
     let create_resp = client
-        .post(format!("http://{addr}/v1/sessions"))
+        .post(format!("http://{addr}/v1/worker/sessions"))
         .json(&serde_json::json!({ "workdir": workdir_path.display().to_string() }))
         .send()
         .await
-        .expect("POST /v1/sessions");
-    assert_eq!(create_resp.status().as_u16(), 202);
+        .expect("POST /v1/worker/sessions");
+    assert_eq!(create_resp.status().as_u16(), 201);
     let create_body: serde_json::Value = create_resp.json().await.unwrap();
-    let session_id = create_body["session_id"].as_str().unwrap();
+    let session_id = create_body["id"].as_str().unwrap();
 
     // Immediately submit a job — setup has not completed.
     let (status, body) = post_command(&client, addr, "exec workflow", Some(session_id)).await;
@@ -641,7 +635,7 @@ fn sse_event_type_names_are_correct_snake_case() {
         ),
         (
             WorkflowStepTransition {
-                step_name: "s".into(),
+                step_name: "ses_03c7c0ace395d80182db07ae2c30f034".into(),
                 step_index: 0,
                 from_status: StepStatusKind::Pending,
                 to_status: StepStatusKind::Running,
@@ -823,7 +817,7 @@ async fn session_setup_bus_initial_state_is_initializing() {
 // and everything that writes to a setup snapshot — the orchestrator, the ready
 // frontend, a future second multi-session frontend — goes through the same
 // Layer 0 methods. These tests exercise them through the handle the bus hands
-// out, so they still cover what a client of `GET /v1/sessions/:id/setup` sees.
+// out, so they still cover what a client of `GET /v1/worker/sessions/:id/setup` sees.
 
 /// Write through the bus's shared state handle, the way the orchestrator and
 /// the ready frontend do.
@@ -1170,13 +1164,13 @@ fn api_frontend_always_returns_yolo_true_regardless_of_input() {
     use awman::frontend::api::command_frontend::ApiDispatchFrontend;
 
     let bus = EventBus::new(8);
-    // Send the explicit "--yolo false --non-interactive false" args — the
+    // Send the explicit "--yolo false --headless false" args — the
     // frontend must still report `true`.
     let args: Vec<String> = vec![
         "some-prompt".into(),
         "--yolo".into(),
         "false".into(),
-        "--non-interactive".into(),
+        "--headless".into(),
         "false".into(),
     ];
     let fe = ApiDispatchFrontend::new("exec prompt", &args, bus.sender());
@@ -1187,8 +1181,7 @@ fn api_frontend_always_returns_yolo_true_regardless_of_input() {
         "API frontend must always force yolo=true"
     );
     assert_eq!(
-        fe.flag_bool(&["exec", "prompt"], "non-interactive")
-            .unwrap(),
+        fe.flag_bool(&["exec", "prompt"], "headless").unwrap(),
         Some(true),
         "API frontend must always force non-interactive=true"
     );
@@ -1202,8 +1195,7 @@ async fn real_network_exec_response_advertises_flags_applied() {
     let workdir = tempfile::tempdir().unwrap();
     let workdir_path = workdir.path().canonicalize().unwrap();
 
-    let state =
-        make_app_state_with_workdirs(tmp.path(), AuthMode::Disabled, vec![workdir_path.clone()]);
+    let state = make_app_state_with_workdirs(tmp.path(), vec![workdir_path.clone()]);
     let Some((addr, server)) = spawn_router(state.clone()).await else {
         eprintln!("SKIP: cannot bind 127.0.0.1");
         return;
@@ -1214,7 +1206,7 @@ async fn real_network_exec_response_advertises_flags_applied() {
     state
         .store
         .insert_session_full(NewSessionRow {
-            id: "flags-session",
+            id: "ses_e1575ed5290991a8cfeac3ed3aa5e025",
             workdir: &workdir_path.display().to_string(),
             created_at: "2026-01-01T00:00:00Z",
             setup_status: SessionSetupStatus::Ready,
@@ -1225,15 +1217,15 @@ async fn real_network_exec_response_advertises_flags_applied() {
 
     let client = reqwest::Client::new();
     let resp = client
-        .post(format!("http://{addr}/v1/commands"))
-        .header("x-awman-session", "flags-session")
+        .post(format!("http://{addr}/v1/worker/commands"))
+        .header("x-awman-session", "ses_e1575ed5290991a8cfeac3ed3aa5e025")
         .json(&serde_json::json!({
             "subcommand": "exec prompt",
             "args": ["hello", "--yolo", "false"],
         }))
         .send()
         .await
-        .expect("POST /v1/commands");
+        .expect("POST /v1/worker/commands");
     assert_eq!(resp.status().as_u16(), 202);
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(
@@ -1242,7 +1234,7 @@ async fn real_network_exec_response_advertises_flags_applied() {
         "flags_applied.yolo must be true; got {body}"
     );
     assert_eq!(
-        body["flags_applied"]["non_interactive"],
+        body["flags_applied"]["headless"],
         serde_json::Value::Bool(true),
         "flags_applied.non_interactive must be true; got {body}"
     );
@@ -1259,8 +1251,7 @@ async fn real_network_session_status_includes_current_ready_phase_field() {
     let workdir = tempfile::tempdir().unwrap();
     let workdir_path = workdir.path().canonicalize().unwrap();
 
-    let state =
-        make_app_state_with_workdirs(tmp.path(), AuthMode::Disabled, vec![workdir_path.clone()]);
+    let state = make_app_state_with_workdirs(tmp.path(), vec![workdir_path.clone()]);
     let Some((addr, server)) = spawn_router(state).await else {
         eprintln!("SKIP: cannot bind 127.0.0.1");
         return;
@@ -1268,22 +1259,22 @@ async fn real_network_session_status_includes_current_ready_phase_field() {
 
     let client = reqwest::Client::new();
     let create_resp = client
-        .post(format!("http://{addr}/v1/sessions"))
+        .post(format!("http://{addr}/v1/worker/sessions"))
         .json(&serde_json::json!({ "workdir": workdir_path.display().to_string() }))
         .send()
         .await
-        .expect("POST /v1/sessions");
+        .expect("POST /v1/worker/sessions");
     let body: serde_json::Value = create_resp.json().await.unwrap();
-    let sid = body["session_id"].as_str().unwrap();
+    let sid = body["id"].as_str().unwrap();
 
     let status_resp = client
-        .get(format!("http://{addr}/v1/sessions/{sid}/status"))
+        .get(format!("http://{addr}/v1/worker/sessions/{sid}"))
         .send()
         .await
         .unwrap();
     let status_body: serde_json::Value = status_resp.json().await.unwrap();
     assert!(
-        status_body.get("current_ready_phase").is_some(),
+        status_body["setup"].get("current_ready_phase").is_some(),
         "status response must include `current_ready_phase` key; got {status_body}"
     );
 
@@ -1301,7 +1292,7 @@ fn list_sessions_with_in_progress_setup_finds_non_terminal_sessions() {
 
     store
         .insert_session_full(NewSessionRow {
-            id: "s1",
+            id: "ses_8ddf878039b70767c4a5bcf4f0c4f65e",
             workdir: "/wd1",
             created_at: "ts",
             setup_status: SessionSetupStatus::RunningReady,
@@ -1311,7 +1302,7 @@ fn list_sessions_with_in_progress_setup_finds_non_terminal_sessions() {
         .unwrap();
     store
         .insert_session_full(NewSessionRow {
-            id: "s2",
+            id: "ses_fac989447cad2edbc89fbcba70003b36",
             workdir: "/wd2",
             created_at: "ts",
             setup_status: SessionSetupStatus::CloningRepository,
@@ -1321,7 +1312,7 @@ fn list_sessions_with_in_progress_setup_finds_non_terminal_sessions() {
         .unwrap();
     store
         .insert_session_full(NewSessionRow {
-            id: "s3",
+            id: "ses_c0828e0381730befd1f7a025057c74fb",
             workdir: "/wd3",
             created_at: "ts",
             setup_status: SessionSetupStatus::Ready,
@@ -1331,7 +1322,7 @@ fn list_sessions_with_in_progress_setup_finds_non_terminal_sessions() {
         .unwrap();
     store
         .insert_session_full(NewSessionRow {
-            id: "s4",
+            id: "ses_7e7cb6814b74d6596098fc80127569a5",
             workdir: "/wd4",
             created_at: "ts",
             setup_status: SessionSetupStatus::Failed,
@@ -1342,13 +1333,22 @@ fn list_sessions_with_in_progress_setup_finds_non_terminal_sessions() {
 
     let in_progress = store.list_sessions_with_in_progress_setup().unwrap();
     let ids: Vec<&str> = in_progress.iter().map(|s| s.id.as_str()).collect();
-    assert!(ids.contains(&"s1"), "running_ready must be in-progress");
     assert!(
-        ids.contains(&"s2"),
+        ids.contains(&"ses_8ddf878039b70767c4a5bcf4f0c4f65e"),
+        "running_ready must be in-progress"
+    );
+    assert!(
+        ids.contains(&"ses_fac989447cad2edbc89fbcba70003b36"),
         "cloning_repository must be in-progress"
     );
-    assert!(!ids.contains(&"s3"), "ready is terminal, not in-progress");
-    assert!(!ids.contains(&"s4"), "failed is terminal, not in-progress");
+    assert!(
+        !ids.contains(&"ses_c0828e0381730befd1f7a025057c74fb"),
+        "ready is terminal, not in-progress"
+    );
+    assert!(
+        !ids.contains(&"ses_7e7cb6814b74d6596098fc80127569a5"),
+        "failed is terminal, not in-progress"
+    );
     assert_eq!(in_progress.len(), 2);
 }
 
@@ -1359,7 +1359,7 @@ fn update_setup_status_round_trips() {
     let store = SqliteSessionStore::open(tmp.path()).unwrap();
     store
         .insert_session_full(NewSessionRow {
-            id: "sid",
+            id: "ses_b8c1a3069167247e3503f0daba6c5723",
             workdir: "/wd",
             created_at: "ts",
             setup_status: SessionSetupStatus::Initializing,
@@ -1368,31 +1368,42 @@ fn update_setup_status_round_trips() {
         })
         .unwrap();
 
-    let s = store.get_session("sid").unwrap().unwrap();
+    let s = store
+        .get_session("ses_b8c1a3069167247e3503f0daba6c5723")
+        .unwrap()
+        .unwrap();
     assert_eq!(s.setup_status.as_str(), "initializing");
 
     assert!(store
-        .update_setup_status("sid", SessionSetupStatus::Ready)
+        .update_setup_status(
+            "ses_b8c1a3069167247e3503f0daba6c5723",
+            SessionSetupStatus::Ready
+        )
         .unwrap());
-    let s2 = store.get_session("sid").unwrap().unwrap();
+    let s2 = store
+        .get_session("ses_b8c1a3069167247e3503f0daba6c5723")
+        .unwrap()
+        .unwrap();
     assert_eq!(s2.setup_status.as_str(), "ready");
 }
 
 // ─── Per-job SSE endpoint ─────────────────────────────────────────────────────
 
-/// GET /v1/commands/{id}/logs for a non-existent command returns 404.
+/// GET /v1/worker/commands/{id}/events for a non-existent command returns 404.
 #[tokio::test]
 async fn real_network_job_logs_404_for_unknown_job() {
     let tmp = tempfile::tempdir().unwrap();
-    let state = make_app_state(tmp.path(), AuthMode::Disabled);
+    let state = make_app_state(tmp.path());
     let Some((addr, server)) = spawn_router(state).await else {
         eprintln!("SKIP: cannot bind 127.0.0.1");
         return;
     };
 
-    let resp = reqwest::get(format!("http://{addr}/v1/commands/no-such-cmd/logs"))
-        .await
-        .expect("GET /commands/logs");
+    let resp = reqwest::get(format!(
+        "http://{addr}/v1/worker/commands/cmd_c3351b5b86f370db09105235178e4a53/events"
+    ))
+    .await
+    .expect("GET /commands/logs");
     assert_eq!(resp.status().as_u16(), 404);
 
     server.abort();
@@ -1451,7 +1462,7 @@ fn remote_exec_workflow_flags_parity_with_local() {
         );
     }
     // Plus remote transport flags.
-    for transport in &["remote-addr", "session", "api-key", "follow"] {
+    for transport in &["session", "follow"] {
         assert!(
             remote.find_flag(transport).is_some(),
             "remote exec workflow is missing transport flag `--{transport}`"
@@ -1651,6 +1662,9 @@ async fn sse_lagged_branch_uses_expected_event_count_format() {
 // the mock answers with a terminal state on first poll.
 
 mod remote_session_start_wait_tests {
+    fn mock_record(state: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({"id":state["session_id"],"setup_status":state["status"],"setup":state})
+    }
     use std::sync::{Arc, Mutex};
 
     use awman::command::commands::remote::{
@@ -1693,7 +1707,6 @@ mod remote_session_start_wait_tests {
         let git_engine = Arc::new(GitEngine::new());
         let workflow_state_store = Arc::new(WorkflowStateStore::at_git_root(root));
         Engines {
-            config_notices: Default::default(),
             runtime: runtime.clone(),
             container_runtime: Some(runtime),
             sandbox_runtime: None,
@@ -1743,10 +1756,11 @@ mod remote_session_start_wait_tests {
         let workdir = tempfile::tempdir().unwrap();
 
         Mock::given(matchers::method("POST"))
-            .and(matchers::path("/v1/sessions"))
+            .and(matchers::path("/v1/worker/sessions"))
             .respond_with(
-                ResponseTemplate::new(202)
-                    .set_body_json(serde_json::json!({ "session_id": "sid-ready" })),
+                ResponseTemplate::new(201).set_body_json(
+                    serde_json::json!({ "id": "ses_de3ab657e5d6ded751a86ac72d1daf76" }),
+                ),
             )
             .mount(&mock)
             .await;
@@ -1764,32 +1778,45 @@ mod remote_session_start_wait_tests {
             "non_default_agent_images": [],
         });
         Mock::given(matchers::method("GET"))
-            .and(matchers::path("/v1/sessions/sid-ready/status"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "session_id": "sid-ready",
-                "status": "ready",
-                "current_stage": "Setup complete",
-                "current_ready_phase": null,
-                "ready_step_statuses": [
-                    { "step": "Dockerfile", "status": "Done" },
-                    { "step": "Base image", "status": "Done" }
-                ],
-                "ready_summary": ready_summary,
-                "error": null,
-            })))
+            .and(matchers::path(
+                "/v1/worker/sessions/ses_de3ab657e5d6ded751a86ac72d1daf76",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(mock_record(
+                serde_json::json!({
+                    "session_id": "ses_de3ab657e5d6ded751a86ac72d1daf76",
+                    "status": "ready",
+                    "current_stage": "Setup complete",
+                    "current_ready_phase": null,
+                    "ready_step_statuses": [
+                        { "step": "Dockerfile", "status": "Done" },
+                        { "step": "Base image", "status": "Done" }
+                    ],
+                    "ready_summary": ready_summary,
+                    "error": null,
+                }),
+            )))
             .expect(1..)
             .mount(&mock)
             .await;
 
         let messages = Arc::new(Mutex::new(Vec::new()));
         let engines = build_engines(root.path());
-        let session = build_session(workdir.path());
+        let mut session = build_session(workdir.path());
+        session
+            .add_overrides(awman::data::config::overrides::ConfigOverrides(vec![
+                (
+                    "remote.targets.mock.url".into(),
+                    serde_json::json!(mock.uri()),
+                ),
+                ("remote.default".into(), serde_json::json!("mock")),
+            ]))
+            .unwrap();
         let flags = RemoteSessionStartFlags {
             session_type: "local".into(),
             workdir: Some(workdir.path().display().to_string()),
             repo_url: None,
             branch: None,
-            remote_addr: Some(mock.uri()),
+            remote_addr: Some("mock".into()),
             api_key: None,
         };
         let cmd = RemoteCommand::new(RemoteSubcommand::SessionStart(flags), engines, session);
@@ -1802,7 +1829,7 @@ mod remote_session_start_wait_tests {
 
         match outcome {
             RemoteOutcome::SessionStart(o) => {
-                assert_eq!(o.session_id, "sid-ready");
+                assert_eq!(o.session_id, "ses_de3ab657e5d6ded751a86ac72d1daf76");
                 assert_eq!(o.setup_status.as_deref(), Some("ready"));
             }
             other => panic!("expected SessionStart outcome; got {other:?}"),
@@ -1842,18 +1869,19 @@ mod remote_session_start_wait_tests {
         let workdir = tempfile::tempdir().unwrap();
 
         Mock::given(matchers::method("POST"))
-            .and(matchers::path("/v1/sessions"))
+            .and(matchers::path("/v1/worker/sessions"))
             .respond_with(
-                ResponseTemplate::new(202)
-                    .set_body_json(serde_json::json!({ "session_id": "sid-failed" })),
+                ResponseTemplate::new(201).set_body_json(
+                    serde_json::json!({ "id": "ses_c13d7dcf4959eea40f610d98778a28cd" }),
+                ),
             )
             .mount(&mock)
             .await;
 
         Mock::given(matchers::method("GET"))
-            .and(matchers::path("/v1/sessions/sid-failed/status"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "session_id": "sid-failed",
+            .and(matchers::path("/v1/worker/sessions/ses_c13d7dcf4959eea40f610d98778a28cd"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(mock_record(serde_json::json!({
+                "session_id": "ses_c13d7dcf4959eea40f610d98778a28cd",
                 "status": "failed",
                 "current_stage": "Failed: Docker daemon not running",
                 "current_ready_phase": null,
@@ -1863,20 +1891,29 @@ mod remote_session_start_wait_tests {
                 ],
                 "ready_summary": null,
                 "error": { "stage": "ready", "message": "Docker daemon not running" },
-            })))
+            }))))
             .expect(1..)
             .mount(&mock)
             .await;
 
         let messages = Arc::new(Mutex::new(Vec::new()));
         let engines = build_engines(root.path());
-        let session = build_session(workdir.path());
+        let mut session = build_session(workdir.path());
+        session
+            .add_overrides(awman::data::config::overrides::ConfigOverrides(vec![
+                (
+                    "remote.targets.mock.url".into(),
+                    serde_json::json!(mock.uri()),
+                ),
+                ("remote.default".into(), serde_json::json!("mock")),
+            ]))
+            .unwrap();
         let flags = RemoteSessionStartFlags {
             session_type: "local".into(),
             workdir: Some(workdir.path().display().to_string()),
             repo_url: None,
             branch: None,
-            remote_addr: Some(mock.uri()),
+            remote_addr: Some("mock".into()),
             api_key: None,
         };
         let cmd = RemoteCommand::new(RemoteSubcommand::SessionStart(flags), engines, session);

@@ -6,13 +6,14 @@
 #[path = "../helpers/mod.rs"]
 mod helpers;
 
+mod home_layout;
+mod key_table_docs_golden;
+
 mod builtin_network;
 mod config_session_roundtrip;
 mod daemon_primitives;
 mod db_migration;
 mod docs_links;
-mod dynamic_workflow_settings;
 mod sqlite_upgrade_compat;
-mod squad_config;
 mod squad_paths;
 mod task_store;

@@ -1,7 +1,7 @@
 //! `AgentFrontend` impl for the CLI.
 //!
 //! All container I/O flows through `AgentIo` channels. The CLI
-//! constructs either interactive (PTY with raw mode) or non-interactive
+//! constructs either interactive (PTY with raw mode) or headless
 //! (piped, no PTY) channels depending on `self.non_interactive`.
 
 use async_trait::async_trait;
@@ -27,7 +27,7 @@ impl AgentFrontend for CliFrontend {
 }
 
 impl CliFrontend {
-    /// Non-interactive: piped stdout/stderr; the frontend keeps no stdin
+    /// Headless: piped stdout/stderr; the frontend keeps no stdin
     /// sender. The engine owns the single `stdin_tx` returned in
     /// `AgentIo`, writes the seeded prompt through it, then drops it so
     /// the writer task sees EOF (see `spawn_piped_docker` /

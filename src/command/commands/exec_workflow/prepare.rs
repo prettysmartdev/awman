@@ -209,7 +209,7 @@ pub(crate) struct PreparedRun {
     /// Kept alive for the duration of the run; its Drop removes the issue temp
     /// file. `None` for non-issue invocations.
     pub(crate) issue_temp_file: Option<IssueTempFile>,
-    pub(crate) launch_modes: HashMap<String, crate::data::config::repo::LaunchMode>,
+    pub(crate) launch_modes: HashMap<String, crate::data::config::agents::LaunchMode>,
     /// Skip the persisted-state resume prompt below. Set only by the dynamic
     /// resume path, which has already asked the user a strictly better version
     /// of the same question (WI-0115 §2).
@@ -371,6 +371,7 @@ pub(crate) async fn execute_prepared_with_outputs(
         original_session
     };
     session.set_flags(workflow_flag_config(flags));
+    session.add_overrides(workflow_flag_overrides(flags))?;
 
     // 9. Run the engine with three-phase coordination.
     let yolo = flags.yolo;
@@ -507,7 +508,7 @@ pub(crate) async fn execute_prepared_with_outputs(
         // setup/teardown shell step runs as a foreground, PTY-attached
         // container they can watch and type into, like an agent step.
         // Everything else — the API server, the squad daemon, a
-        // `--non-interactive` CLI — keeps the headless background container.
+        // `--headless` CLI — keeps the headless background container.
         // A squad-generated workflow is always headless, whichever frontend
         // is driving it.
         let interactive_phase_steps = prerequisites.redaction.is_empty()
@@ -1093,6 +1094,10 @@ async fn run_merge_fix_agent(
         }
     };
     session.set_flags(workflow_flag_config(flags));
+    if let Err(e) = session.add_overrides(workflow_flag_overrides(flags)) {
+        warn(format!("merge-fix: {e}"));
+        return false;
+    }
 
     let prompt = match merge_fix_prompt(&session.effective_config(), failure, work_item) {
         Ok(prompt) => prompt,
@@ -1158,22 +1163,57 @@ async fn run_merge_fix_agent(
     }
 }
 
+/// Settings the workflow flags still carry that are config keys now
+/// (`agents.launchMode`, `workflows.maxConcurrentSteps`), as `--set`-layer
+/// overrides.
+pub(crate) fn workflow_flag_overrides(
+    flags: &ExecWorkflowCommandFlags,
+) -> crate::data::config::ConfigOverrides {
+    let mut pairs = Vec::new();
+    if let Some(mode) = flags.launch_mode {
+        pairs.push((
+            "agents.launchMode".to_string(),
+            serde_json::to_value(mode).expect("launch mode serializes"),
+        ));
+    }
+    if let Some(n) = flags.max_concurrent {
+        pairs.push((
+            "workflows.maxConcurrentSteps".to_string(),
+            serde_json::Value::from(n),
+        ));
+    }
+    crate::data::config::ConfigOverrides::new(pairs)
+}
+
+/// The invoking session's effective config with the workflow flags applied.
+pub(crate) fn workflow_effective_config(
+    session: &Session,
+    flags: &ExecWorkflowCommandFlags,
+) -> Result<crate::data::config::EffectiveConfig, crate::data::error::DataError> {
+    let current = session.effective_config();
+    let mut layers = current.layers().clone();
+    layers.set.0.extend(workflow_flag_overrides(flags).0);
+    crate::data::config::EffectiveConfig::resolve(
+        layers,
+        workflow_flag_config(flags),
+        current.env().clone(),
+    )
+}
+
 pub(crate) fn workflow_flag_config(
     flags: &ExecWorkflowCommandFlags,
 ) -> crate::data::config::FlagConfig {
     crate::data::config::FlagConfig {
         agent: flags.agent.clone(),
         model: flags.model.clone(),
-        launch_mode: flags.launch_mode,
         yolo: Some(flags.yolo),
         auto: Some(flags.auto),
-        non_interactive: Some(flags.non_interactive),
+        headless: Some(flags.non_interactive),
         overlays_raw: (!flags.overlay.is_empty()).then_some(flags.overlay.clone()),
         work_item: flags
             .work_item
             .as_deref()
             .and_then(|raw| raw.parse::<u32>().ok()),
-        max_concurrent_agents: flags.max_concurrent,
         leader: flags.leader.clone(),
         ..Default::default()
     }
@@ -1368,8 +1408,8 @@ pub(crate) fn collect_single_entry_overlays(
     // rebuilt yet, in which case mounting at the Dockerfile-derived path
     // silently breaks credential passthrough.
     let dockerfile_path = session
-        .repo_config()
-        .dockerfile_path_or_default(session.git_root());
+        .effective_config()
+        .dockerfile_path(session.git_root());
     // detect_home_from_dockerfile silently returns None when the file is
     // missing — surface that as a warning so a misconfigured `dockerfile`
     // key doesn't cause overlays to fall back to a default container home

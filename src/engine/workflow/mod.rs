@@ -310,7 +310,7 @@ pub struct WorkflowEngine {
     /// Containers currently alive. The single-step path keeps exactly one
     /// entry (the focused step); the parallel path keeps up to `max_concurrent`.
     active_steps: Vec<ActiveParallelStep>,
-    /// Resolved once at construction from `effective_max_concurrent_agents()`.
+    /// Resolved once at construction from `max_concurrent_steps()`.
     /// `None` means unlimited.
     max_concurrent: Option<usize>,
     current_step_name: Option<String>,
@@ -528,7 +528,7 @@ impl WorkflowEngine {
     }
 
     /// The resolved per-workflow concurrency cap (`None` = unlimited). Resolved
-    /// once at construction from `effective_max_concurrent_agents()`. Frontends
+    /// once at construction from `max_concurrent_steps()`. Frontends
     /// read this to size the Workflow Overview / parallel UX.
     pub fn max_concurrent(&self) -> Option<usize> {
         self.max_concurrent
@@ -740,7 +740,7 @@ impl WorkflowEngine {
         let workflow_context_permission =
             workflow_context_permission_from_overlay_strings(workflow.overlays.as_deref());
         let effective_config = session.effective_config();
-        let max_concurrent = effective_config.effective_max_concurrent_agents();
+        let max_concurrent = effective_config.max_concurrent_steps();
         tracing::debug!(
             ?max_concurrent,
             "workflow_engine resolved max_concurrent_agents"
@@ -891,13 +891,13 @@ impl WorkflowEngine {
             }
 
             // Determine the current parallel group: every step whose
-            // dependencies are already satisfied (source-file order). When more
-            // than one is ready and the concurrency cap is not pinned to 1, run
-            // them through the parallel-group path; otherwise fall back to the
-            // single-step interactive path (behaviourally identical to the
-            // pre-WI-0096 sequential engine).
+            // dependencies are already satisfied (source-file order). A cap
+            // of 1 uses the single-step path except for the interactive final
+            // yolo group, whose members must stay alive together for review.
             let ready = self.next_ready_steps()?;
-            let use_parallel = ready.len() > 1 && self.max_concurrent != Some(1);
+            let final_yolo_group = self.is_final_yolo_group(&ready);
+            let use_parallel =
+                ready.len() > 1 && (self.max_concurrent != Some(1) || final_yolo_group);
 
             if use_parallel {
                 match self.run_parallel_group(ready).await? {

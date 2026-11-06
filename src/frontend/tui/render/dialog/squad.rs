@@ -14,41 +14,10 @@ pub(crate) fn render_start_confirm(area: Rect, frame: &mut Frame) {
     let dialog_area = dialogs::centered_fixed(width, 9, area);
     let inner =
         dialogs::render_dialog_frame("Start squad daemon?", Color::Cyan, dialog_area, frame);
-    let text = "  The squad daemon is not running.\n\
-                \n  Start it in the background and open the squad tab?\n\
+    let text = "  The awman daemon is not running.\n\
+                \n  Start it in the background (awman daemon start --background)\n  and open the squad tab?\n\
                 \n  [y] start   [n / Esc] cancel";
     frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), inner);
-}
-
-pub(crate) fn render_key_missing(area: Rect, frame: &mut Frame) {
-    let width = 74u16.min(area.width.saturating_sub(4).max(40));
-    let lines: Vec<Line> = vec![
-        Line::from(Span::styled(
-            "  The squad daemon requires a key, and this session has none.",
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-        Line::from("  AWMAN_SQUAD_KEY is not set here, and squad's key was shown"),
-        Line::from("  only once when it was minted — only its hash is stored, so"),
-        Line::from("  the key itself cannot be read back."),
-        Line::from(""),
-        Line::from("  Mint a new key and restart the squad daemon onto it?"),
-        Line::from(Span::styled(
-            "  Any other shell still exporting the old key will stop working.",
-            Style::default().fg(Color::DarkGray),
-        )),
-        Line::from(""),
-        Line::from(Span::styled(
-            "  [y] mint a new key and restart squad   [n / Esc] cancel",
-            Style::default().fg(Color::DarkGray),
-        )),
-    ];
-    // +4 for the frame's borders and padding.
-    let height = (lines.len() as u16 + 4).min(area.height.saturating_sub(2));
-    let dialog_area = dialogs::centered_fixed(width, height, area);
-    let inner =
-        dialogs::render_dialog_frame("squad authentication", Color::Yellow, dialog_area, frame);
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
 pub(crate) fn render_remove_confirm(name: &str, area: Rect, frame: &mut Frame) {

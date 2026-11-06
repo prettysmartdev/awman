@@ -136,7 +136,8 @@ mod tests {
             vec!["config", "show"],
             vec!["config", "get"],
             vec!["config", "set"],
-            vec!["api", "start"],
+            vec!["daemon", "start"],
+            vec!["daemon", "api"],
             vec!["remote", "exec", "workflow"],
             vec!["new", "spec"],
         ] {
@@ -181,13 +182,7 @@ mod tests {
         // typing "chat " (with trailing space) should yield flags for chat
         let comps = cat.tui_completions("chat ");
         let flag_completions: Vec<&str> = comps.iter().map(|c| c.completion.as_str()).collect();
-        for expected_flag in &[
-            "--yolo",
-            "--plan",
-            "--non-interactive",
-            "--auto",
-            "--overlay",
-        ] {
+        for expected_flag in &["--yolo", "--plan", "--headless", "--auto", "--overlay"] {
             assert!(
                 flag_completions.iter().any(|c| c == expected_flag),
                 "completion '{expected_flag}' missing from: {flag_completions:?}"

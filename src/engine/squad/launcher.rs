@@ -554,7 +554,7 @@ mod tests {
     #[test]
     fn seed_is_idempotent() {
         let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("c");
+        let dir = tmp.path().join("cmd_4a8a08f09d37b73795649038408b5f33");
         SquadAgentLauncher::seed_task_dir(&dir).unwrap();
         // A second seed over an existing directory must not error.
         SquadAgentLauncher::seed_task_dir(&dir).unwrap();
@@ -597,7 +597,8 @@ mod tests {
     fn stamp_generates_a_fresh_name_each_call() {
         // Every generated-workflow step gets its own container, so two stamps
         // of the same identity must not collide on the unique suffix.
-        let identity = SquadContainerIdentity::new("release-notes", "s");
+        let identity =
+            SquadContainerIdentity::new("release-notes", "ses_03c7c0ace395d80182db07ae2c30f034");
         let first = match identity
             .stamp(ResolvedAgentOptions::container(Vec::new()).unwrap())
             .unwrap()
@@ -617,7 +618,8 @@ mod tests {
 
     #[test]
     fn stamp_rejects_the_sandbox_variant() {
-        let identity = SquadContainerIdentity::new("issue-triage", "s");
+        let identity =
+            SquadContainerIdentity::new("issue-triage", "ses_03c7c0ace395d80182db07ae2c30f034");
         let sandbox = ResolvedAgentOptions::sandbox(Vec::new());
         let error = identity.stamp(sandbox).unwrap_err();
         assert!(
@@ -708,7 +710,7 @@ mod tests {
         let home = temp.path().join("global");
         std::fs::create_dir_all(&root).unwrap();
         let env = crate::data::config::env::EnvSnapshot::with_overrides([(
-            "AWMAN_CONFIG_HOME",
+            "AWMAN_HOME",
             home.to_str().unwrap(),
         )]);
         crate::engine::agent::custom::install_crush_fixture(&root, &env);

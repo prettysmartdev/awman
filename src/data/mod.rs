@@ -19,6 +19,7 @@ pub mod dynamic_workflow_assets;
 pub mod error;
 pub mod execution_event;
 pub mod fs;
+pub mod ids;
 pub mod image_build_lock;
 pub mod image_build_state;
 pub mod image_tags;
@@ -42,6 +43,7 @@ pub mod setup_step;
 pub mod step_status;
 pub mod templates;
 pub mod text;
+pub mod wire;
 pub mod workflow_cleanup;
 pub mod workflow_dag;
 pub mod workflow_definition;
@@ -69,3 +71,5 @@ pub use workflow_state::{
 pub use workflow_state_store::WorkflowStateStore;
 pub use worktree_paths::{worktree_branch_name, worktree_branch_name_for_workflow, WorktreePaths};
 pub mod workflow_prerequisites;
+
+pub mod daemon_state;

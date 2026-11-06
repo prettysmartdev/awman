@@ -1,79 +1,53 @@
-//! Part 0 daemon primitive regression tests — the Layer 0 half.
-//!
-//! Paths, PID files and the `ServerMeta` sidecar: everything
-//! `data::fs::daemon_process` still owns after WI 0114 F-29 moved process
-//! spawning, liveness probing and the daemon guard up to Layer 1. The engine
-//! half lives in `tests/engine/daemon_supervisor.rs`.
-
-use std::path::{Path, PathBuf};
-
-use awman::data::fs::daemon_process::{
-    DaemonProcess, ServerMeta, API_PLIST_LABEL, API_UNIT_NAME, SQUAD_PLIST_LABEL, SQUAD_UNIT_NAME,
+//! Unified daemon paths and private on-disk identity.
+use awman::data::fs::{
+    daemon_process::{DaemonProcess, DAEMON_PLIST_LABEL, DAEMON_UNIT_NAME},
+    DataPaths,
 };
-use awman::data::fs::{DaemonPaths, SquadPaths};
-use awman::engine::daemon::DaemonKind;
-
-fn daemon(root: &Path, kind: DaemonKind) -> DaemonProcess {
-    match kind {
-        DaemonKind::Api => DaemonProcess::new(
-            DaemonPaths::new(root, "api_key"),
-            API_UNIT_NAME,
-            API_PLIST_LABEL,
-        ),
-        DaemonKind::Squad => DaemonProcess::new(
-            DaemonPaths::new(root, "squad_key"),
-            SQUAD_UNIT_NAME,
-            SQUAD_PLIST_LABEL,
-        ),
+#[test]
+fn daemon_identity_is_under_the_shared_data_root() {
+    let paths = DataPaths::at_root("/home/example/data").daemon();
+    assert_eq!(
+        paths.pid_file(),
+        std::path::PathBuf::from("/home/example/data/daemon/awman.pid")
+    );
+    assert_eq!(paths.startup_lock_file(), paths.root().join("startup.lock"));
+    assert_eq!(paths.api_keys_file(), paths.root().join("api_keys.json"));
+    assert_eq!(paths.tls_sans_file(), paths.root().join("tls/sans.json"));
+    #[cfg(unix)]
+    assert_eq!(paths.local_endpoint(), paths.root().join("api.sock"));
+}
+#[test]
+fn pidfile_claim_and_owned_release_are_private_and_atomic() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = DataPaths::at_root(dir.path()).daemon();
+    let process = DaemonProcess::unified(paths.clone());
+    assert_eq!(process.unit_name(), DAEMON_UNIT_NAME);
+    assert_eq!(process.plist_label(), DAEMON_PLIST_LABEL);
+    assert!(process.claim_pidfile(42).unwrap());
+    assert!(!process.claim_pidfile(99).unwrap());
+    assert_eq!(process.read_pid().unwrap(), Some(42));
+    assert!(!process.release_pidfile_owned_by(99).unwrap());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(paths.pid_file())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(paths.root())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
     }
-}
-
-#[test]
-fn daemon_paths_preserve_api_filenames_and_isolate_squad_key() {
-    let api = DaemonPaths::new("/tmp/api", "api_key");
-    assert_eq!(api.pid_file(), PathBuf::from("/tmp/api/awman.pid"));
-    assert_eq!(api.log_file(), PathBuf::from("/tmp/api/awman.log"));
-    assert_eq!(
-        api.server_meta_file(),
-        PathBuf::from("/tmp/api/server.json")
-    );
-    assert_eq!(api.key_hash_file(), PathBuf::from("/tmp/api/api_key.hash"));
-
-    let squad = SquadPaths::from_root("/tmp/squad").daemon();
-    assert_eq!(squad.pid_file(), PathBuf::from("/tmp/squad/awman.pid"));
-    assert_eq!(squad.log_file(), PathBuf::from("/tmp/squad/awman.log"));
-    assert_eq!(
-        squad.server_meta_file(),
-        PathBuf::from("/tmp/squad/server.json")
-    );
-    assert_eq!(
-        squad.key_hash_file(),
-        PathBuf::from("/tmp/squad/squad_key.hash")
-    );
-    assert_ne!(api.key_hash_file(), squad.key_hash_file());
-}
-
-#[test]
-fn daemon_process_pidfile_and_server_meta_round_trip() {
-    let tmp = tempfile::tempdir().unwrap();
-    let process = daemon(tmp.path(), DaemonKind::Api);
-
-    assert_eq!(process.read_pid().unwrap(), None);
-    assert!(process.claim_pidfile(4242).unwrap());
-    assert!(!process.claim_pidfile(9999).unwrap());
-    assert_eq!(process.read_pid().unwrap(), Some(4242));
-    process.release_pidfile().unwrap();
-    assert_eq!(process.read_pid().unwrap(), None);
-
-    let meta = ServerMeta {
-        port: 3210,
-        bind_ip: "127.0.0.1".into(),
-        scheme: "http".into(),
-        auth_disabled: false,
-    };
-    assert_eq!(process.read_meta().unwrap(), None);
-    process.write_meta(&meta).unwrap();
-    assert_eq!(process.read_meta().unwrap(), Some(meta));
-    process.clear_meta().unwrap();
-    assert_eq!(process.read_meta().unwrap(), None);
+    assert!(process.release_pidfile_owned_by(42).unwrap());
+    process.force_write_pidfile(99).unwrap();
+    assert_eq!(process.read_pid().unwrap(), Some(99));
 }
