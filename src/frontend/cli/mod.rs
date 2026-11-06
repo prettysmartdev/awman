@@ -374,7 +374,7 @@ mod tests {
 
         let env = EnvSnapshot::with_overrides([(AWMAN_HOME, home.path().to_str().unwrap())]);
         let overrides =
-            ConfigOverrides::parse_set_args(&["workflows.maxConcurrentSteps=3".to_string()])
+            ConfigOverrides::parse_set_args(&["agents.auth.refresh.enabled=false".to_string()])
                 .unwrap();
         let session = Arc::new(RwLock::new(
             Session::open_at_git_root(
@@ -433,8 +433,8 @@ mod tests {
             let current = session.read().await;
             assert_eq!(current.default_agent().unwrap().as_str(), "gemini");
             assert_eq!(
-                current.effective_config().value()["workflows"]["maxConcurrentSteps"],
-                3
+                current.effective_config().value()["agents"]["auth"]["refresh"]["enabled"],
+                false
             );
         }
 
