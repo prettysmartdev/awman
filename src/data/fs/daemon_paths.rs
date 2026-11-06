@@ -71,9 +71,8 @@ impl DaemonPaths {
         }
         #[cfg(windows)]
         {
-            use sha2::{Digest, Sha256};
-            let hash = Sha256::digest(self.root.to_string_lossy().as_bytes());
-            PathBuf::from(format!(r"\\.\pipe\awman-{:x}", hash))
+            let hash = crate::data::fs::hash::sha256_hex(self.root.to_string_lossy().as_bytes());
+            PathBuf::from(format!(r"\\.\pipe\awman-{hash}"))
         }
     }
 

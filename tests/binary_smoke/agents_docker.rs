@@ -5,7 +5,11 @@ use std::process::{Command, Output};
 fn run_awman(args: &[&str], root: &std::path::Path) -> Output {
     let config = root.join(".awman");
     std::fs::create_dir_all(&config).unwrap();
-    std::fs::write(config.join("config.json"), br#"{"runtime":"docker"}"#).unwrap();
+    std::fs::write(
+        config.join("config.json"),
+        br#"{"runtime":{"kind":"docker"}}"#,
+    )
+    .unwrap();
     Command::new(crate::awman_bin())
         .current_dir(root)
         .env("HOME", root)
