@@ -183,7 +183,12 @@ fn pid_is_awman(pid: u32) -> bool {
     std::process::Command::new("ps")
         .args(["-ww", "-p", &pid.to_string(), "-o", "comm="])
         .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().contains("awman"))
+        .map(|o| {
+            let command = String::from_utf8_lossy(&o.stdout);
+            Path::new(command.trim())
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().contains("awman"))
+        })
         .unwrap_or(false)
 }
 

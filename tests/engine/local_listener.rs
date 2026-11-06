@@ -8,6 +8,7 @@
 #![cfg(unix)]
 
 use std::os::unix::fs::PermissionsExt;
+#[cfg(target_os = "linux")]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -90,11 +91,13 @@ impl FakeDaemon {
         let binary = dir.path().join("awman-fake");
         std::fs::copy(sleep, &binary).unwrap();
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
-        // Some hosts provide sleep through a multi-call binary that dispatches
-        // by argv[0]. Keep the executable name for daemon identity checks, but
-        // ask that binary to run its sleep applet.
+        // Some Linux hosts provide sleep through a multi-call binary that
+        // dispatches by argv[0]. macOS `ps comm` observes argv[0], so leave
+        // the executable name intact there for the daemon identity check.
         let mut command = std::process::Command::new(&binary);
-        command.arg0("sleep").arg("60");
+        #[cfg(target_os = "linux")]
+        command.arg0("sleep");
+        command.arg("60");
         let deadline = std::time::Instant::now() + Duration::from_secs(1);
         let child = loop {
             match command.spawn() {
