@@ -372,19 +372,17 @@ impl AgentFrontend for CapturingFrontend {
 /// 2. A shell that **has** the variable exported runs the ordinary client sync
 ///    (`env_sync::sync_env`, the exact call `SquadGatewayResolver` makes before
 ///    every command). The daemon takes the value into its overlay.
-/// 3. The variable is then removed from the process environment, so the value
-///    lives **only** in the daemon's in-memory overlay — precisely the state a
-///    real background daemon is in, where `std::env::var` cannot see it and
-///    `data::config::env::host_var` can.
-/// 4. The task's declared overlay is resolved into container options through
-///    the production path and a container is launched. It must print the value.
+/// 3. The variable is removed from the client process environment. The daemon
+///    API confirms that its separate process still holds the value.
+/// 4. The test mirrors that value into its own daemon overlay, then resolves
+///    the task's declared overlay through the production container builder.
+///    The launched container must print the value.
 ///
 /// **This test must fail against `main`, and it must fail against any tree
 /// whose `-e` gate still reads `std::env::var`** — the container is launched
 /// with no `-e NAME` at all in that case and `printenv` finds nothing. It is
-/// the one assertion that distinguishes "the daemon knows the value" (which
-/// every other test in this work item covers) from "the container gets it"
-/// (which is what a user asked for).
+/// The API assertion checks the remote daemon's state, while the container
+/// assertion checks the host-side environment passthrough path.
 ///
 /// Gated on Docker exactly like the rest of this tree's live-backend tests, and
 /// named with `docker` so `make test-fast`'s `--skip docker` filter excludes it;
@@ -449,15 +447,31 @@ async fn docker_a_squad_task_env_overlay_value_reaches_its_container() {
         std::env::var(E2E_ENV_NAME).is_err(),
         "the discriminator: the process environment no longer has it"
     );
+    // The daemon is a separate process. Check its coverage through the API,
+    // then mirror that value in this process to exercise the same container
+    // option builder that runs inside the daemon.
+    let task = gateway.get("env-e2e").await.expect("the task");
+    assert!(
+        task.unmet_env.is_empty(),
+        "the daemon must hold the synced value: {:?}",
+        task.unmet_env
+    );
+    struct RestoreOverlay(awman::data::config::env::DaemonEnvMap);
+    impl Drop for RestoreOverlay {
+        fn drop(&mut self) {
+            awman::data::config::env::set_daemon_overlay(std::mem::take(&mut self.0));
+        }
+    }
+    let _restore = RestoreOverlay(awman::data::config::env::daemon_overlay_snapshot());
+    awman::data::config::env::set_daemon_overlay(
+        awman::data::config::env::DaemonEnvMap::from_pairs([(E2E_ENV_NAME, E2E_ENV_VALUE)]),
+    );
     assert_eq!(
         awman::data::config::env::host_var(E2E_ENV_NAME).as_deref(),
-        Some(E2E_ENV_VALUE),
-        "…but the daemon overlay does, which is exactly the state a background \
-         daemon's container launch runs in"
+        Some(E2E_ENV_VALUE)
     );
 
     // ── 4. launch a container the way a task's overlays say to ──────────────
-    let task = gateway.get("env-e2e").await.expect("the task");
     let declared = env_overlay_names(&task.overlays);
     assert_eq!(
         declared,
@@ -504,7 +518,7 @@ async fn docker_a_squad_task_env_overlay_value_reaches_its_container() {
     assert!(
         printed.contains(E2E_ENV_VALUE),
         "THE WI 0116 REGRESSION: a squad task's `env({E2E_ENV_NAME})` value did not \
-         reach its container. The value is in the daemon's overlay (asserted \
+         reach its container. The value is in the local overlay (asserted \
          above) but the container was launched without it — the `-e` gate in \
          `src/engine/container/docker.rs` still reads `std::env::var`, which \
          cannot see the overlay, and nothing injects the resolved value into \
