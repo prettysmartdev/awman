@@ -711,7 +711,7 @@ The token value is never shown in displayed container commands; the mounted `~/.
 | Agent | Auth mechanism |
 |-------|---------------|
 | `claude` | OAuth credential read from macOS Keychain (or `~/.claude/.credentials.json`), delivered as a live-refreshed `.credentials.json` file in the staged `~/.claude` mount — never as an env var |
-| `codex` | `~/.codex/` mounted directly when present (including file-backed `auth.json`); or `OPENAI_API_KEY` through `env()` |
+| `codex` | `~/.codex/` mounted directly when present (including file-backed `auth.json`); or `OPENAI_API_KEY` through `env()`. Each container launch also receives a private temporary SQLite directory at `$HOME/.codex-sqlite`. |
 | `opencode` | `~/.config/opencode/` config and `~/.local/share/opencode/` provider credentials mounted directly when present; or provider key through `env()` |
 | `gemini` | API key via `env()` overlay and/or `~/.gemini/` OAuth directory (auto-mounted) |
 | `antigravity` | Google account credential staged under `~/.gemini/antigravity-cli/`, or `GEMINI_API_KEY` through `env()` when `modelProvider` is `gemini` |
@@ -719,6 +719,8 @@ The token value is never shown in displayed container commands; the mounted `~/.
 | `cline` | `~/.cline/data/` mounted directly when present (current provider settings are in `settings/providers.json`) |
 
 `env()` overlays pass named host variables into the agent container. Host directories mounted directly are live and writable from the container; account credentials in those directories should be treated as secrets. Claude and Antigravity use staged copies.
+
+For Codex container launches, awman sets `CODEX_SQLITE_HOME` and a `sqlite_home` CLI override to the private directory, so a host `config.toml` setting cannot redirect the database back into the shared `~/.codex` mount. The directory is removed after the container or microVM exits. This isolates SQLite storage; file-backed `auth.json` remains on the direct host mount and is still shared by parallel Codex sessions.
 
 ### Host settings injection
 

@@ -766,6 +766,39 @@ impl AgentEngine {
                 session.definition_root(),
             )
         });
+        // Private writable mounts are definition facts. The generic mount
+        // option owns each tempdir through the execution's guest-exit guard;
+        // an OverlayEngine-wide TempDir would be shared across launches.
+        for storage in &def.session_storage_dirs {
+            let relative = std::path::Path::new(&storage.home_relative_path);
+            if storage.home_relative_path.is_empty()
+                || !relative
+                    .components()
+                    .all(|part| matches!(part, std::path::Component::Normal(_)))
+            {
+                return Err(EngineError::Config(format!(
+                    "invalid session storage path: {}",
+                    storage.home_relative_path
+                )));
+            }
+            let guest_path =
+                std::path::Path::new(container_home.as_deref().unwrap_or("/root")).join(relative);
+            let dir = tempfile::Builder::new()
+                .prefix("awman-session-storage-")
+                .tempdir()
+                .map_err(|e| EngineError::Other(format!("create session storage: {e}")))?;
+            options.push(ContainerOption::TemporaryDirectoryMount {
+                container_path: guest_path.clone(),
+                env_var: storage.env_var.clone(),
+                guard: crate::engine::container::options::MountGuard::new_dir(dir),
+            });
+            if let Some((flag, key)) = &storage.config_override {
+                options.push(ContainerOption::ManagedAgentFlags(vec![
+                    flag.clone(),
+                    format!("{key}={}", guest_path.display()),
+                ]));
+            }
+        }
         let request = OverlayRequest {
             directories: run.directory_overlays.clone(),
             include_all_skills: run.include_all_skills,
@@ -1553,6 +1586,58 @@ mod tests {
         assert!(opts
             .iter()
             .any(|o| matches!(o, ContainerOption::Entrypoint(_))));
+    }
+
+    #[test]
+    fn codex_sqlite_storage_is_private_per_launch_and_overrides_user_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, session) = make_agent_engine(tmp.path());
+        let agent = AgentName::new("codex").unwrap();
+        let run = AgentRunOptions {
+            agent_flags: Some(vec!["--config".into(), "sqlite_home=/shared".into()]),
+            ..Default::default()
+        };
+        let first = crate::engine::container::options::ResolvedContainerOptions::resolve(
+            engine.build_options(&session, &agent, &run).unwrap(),
+        )
+        .unwrap();
+        let second = crate::engine::container::options::ResolvedContainerOptions::resolve(
+            engine.build_options(&session, &agent, &run).unwrap(),
+        )
+        .unwrap();
+        let first_mount = first
+            .overlays
+            .iter()
+            .find(|mount| mount.container_path.ends_with(".codex-sqlite"))
+            .unwrap();
+        let second_mount = second
+            .overlays
+            .iter()
+            .find(|mount| mount.container_path.ends_with(".codex-sqlite"))
+            .unwrap();
+        assert_ne!(first_mount.host_path, second_mount.host_path);
+        assert_eq!(
+            first_mount.permission,
+            crate::engine::container::options::OverlayPermission::ReadWrite
+        );
+        assert_eq!(
+            first
+                .env_literal
+                .iter()
+                .find(|env| env.key == "CODEX_SQLITE_HOME")
+                .unwrap()
+                .value,
+            first_mount.container_path.to_string_lossy()
+        );
+        assert_eq!(
+            first.managed_agent_flags,
+            vec![
+                "--config",
+                &format!("sqlite_home={}", first_mount.container_path.display())
+            ]
+        );
+        assert_eq!(first.agent_flags, vec!["--config", "sqlite_home=/shared"]);
+        assert!(first_mount.host_path.exists() && second_mount.host_path.exists());
     }
 
     #[test]

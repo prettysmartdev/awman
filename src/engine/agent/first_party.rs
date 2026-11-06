@@ -4,7 +4,8 @@
 
 use super::definition::{
     AgentDefinition, AgentImageSource, AgentOrigin, AgentOutputFormat, CredentialSource,
-    InteractiveSeedDelivery, ModelFlagDelivery, SbxKitKind, SettingsMount, SystemPromptMode,
+    InteractiveSeedDelivery, ModelFlagDelivery, SbxKitKind, SessionStorageDir, SettingsMount,
+    SystemPromptMode,
 };
 
 /// The seven built-in agents. Same slice as the Layer 0 constant so Layer 0
@@ -50,6 +51,7 @@ fn base(name: &str, display_name: &str) -> AgentDefinition {
         sbx_kit_kind: SbxKitKind::Mixin,
         settings_mount: SettingsMount::None,
         extra_settings_mounts: Vec::new(),
+        session_storage_dirs: Vec::new(),
         skills_mount: None,
         credential_source: CredentialSource::None,
         ping_argv: None,
@@ -118,6 +120,11 @@ pub fn first_party(name: &str) -> Option<AgentDefinition> {
             },
             system_prompt_flag: Some("--config".into()),
             settings_mount: SettingsMount::Direct(".codex".into()),
+            session_storage_dirs: vec![SessionStorageDir {
+                home_relative_path: ".codex-sqlite".into(),
+                env_var: Some("CODEX_SQLITE_HOME".into()),
+                config_override: Some(("--config".into(), "sqlite_home".into())),
+            }],
             skills_mount: Some(".codex/skills".into()),
             ping_argv: Some(strings(&["codex", "exec"])),
             sandbox_auth_env_vars: strings(&["OPENAI_API_KEY"]),

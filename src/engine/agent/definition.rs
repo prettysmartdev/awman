@@ -96,6 +96,19 @@ pub enum SettingsMount {
     Antigravity,
 }
 
+/// A private host directory mounted for one agent execution. The directory
+/// follows the container execution's lifetime, rather than the engine's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionStorageDir {
+    /// Destination relative to the container's effective HOME.
+    pub home_relative_path: String,
+    /// Optional environment variable set to the absolute destination.
+    pub env_var: Option<String>,
+    /// Optional CLI flag and config key for agents whose config file takes
+    /// precedence over the environment variable. Emitted after user flags.
+    pub config_override: Option<(String, String)>,
+}
+
 /// Which host credential scheme awman reads for an agent.
 ///
 /// Each variant names one concrete scheme, not a generic shape: adding an
@@ -245,6 +258,8 @@ pub struct AgentDefinition {
     /// Additional host directories mounted at the same relative location in
     /// the guest (for agents that split configuration and credentials).
     pub extra_settings_mounts: Vec<String>,
+    /// Private writable directories mounted for one execution.
+    pub session_storage_dirs: Vec<SessionStorageDir>,
     /// Where the global skills directory is mounted inside the container,
     /// relative to the container `$HOME`. `None` means the agent has no known
     /// skills directory and the skills overlay is skipped with a warning.

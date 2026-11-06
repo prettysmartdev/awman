@@ -84,6 +84,7 @@ pub fn convert(
             .map(SettingsMount::Direct)
             .unwrap_or(SettingsMount::None),
         extra_settings_mounts: Vec::new(),
+        session_storage_dirs: Vec::new(),
         skills_mount: file.settings.as_ref().and_then(|s| s.skills_dir.clone()),
         credential_source: CredentialSource::None,
         ping_argv: file.ping.as_ref().map(|p| p.command.clone()),

@@ -248,6 +248,25 @@ fn mount<'a>(plan: &'a LaunchPlan, guest: &str) -> Option<&'a MountSpec> {
     plan.spec.mounts.iter().find(|m| m.guest == guest)
 }
 
+#[test]
+fn codex_private_sqlite_storage_reaches_builtin_guest() {
+    let world = world(Some(HOME));
+    let run = world.run_options(false);
+    let first = world.plan("codex", &run).unwrap();
+    let second = world.plan("codex", &run).unwrap();
+    let destination = format!("{HOME}/.codex-sqlite");
+    let first_mount = mount(&first, &destination).unwrap();
+    let second_mount = mount(&second, &destination).unwrap();
+    assert_ne!(first_mount.host, second_mount.host);
+    assert!(!first_mount.read_only);
+    assert!(first_mount.host.is_dir());
+    assert!(first
+        .command
+        .env
+        .iter()
+        .any(|(key, value)| key == "CODEX_SQLITE_HOME" && value == &destination));
+}
+
 fn window(argv: &[String], first: &str, second: &str) -> bool {
     argv.windows(2).any(|w| w[0] == first && w[1] == second)
 }
