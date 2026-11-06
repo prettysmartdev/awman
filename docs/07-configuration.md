@@ -12,6 +12,8 @@ awman has one configuration tree. Every setting is a dotted key such as `agents.
 | Repository | `<git_root>/.awman/config.json` | Settings for one project; created by `awman init`; commit it so the team shares the setup |
 | Squad task | `<AWMAN_HOME>/squad/tasks/<name>/config.json` | Settings for one [squad](12-squad.md) task; written when you answer the agent and model questions in `awman squad add` |
 
+A running TUI tab or API session reloads the global and repository files before each command. Edits made after the session opened take effect on the next command. If a file is invalid, that command fails and the session keeps its last valid configuration until you fix the file.
+
 Each file is JSON that mirrors the dotted keys as nested objects. A key written as `agents.stuckTimeout` is stored as:
 
 ```json
