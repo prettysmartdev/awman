@@ -314,15 +314,7 @@ async fn assert_status_marks_squad_on(cli: &str, runtime: Arc<ContainerRuntime>)
     for name in [&squad_name, &session_name] {
         if !cli_ok(
             cli,
-            &[
-                "cmd_a53108f7543b75adbb34afc035d4cdf6",
-                "-d",
-                "--name",
-                name,
-                "alpine:latest",
-                "sleep",
-                "120",
-            ],
+            &["run", "-d", "--name", name, "alpine:latest", "sleep", "120"],
         ) {
             remove_container(cli, &squad_name);
             remove_container(cli, &session_name);
