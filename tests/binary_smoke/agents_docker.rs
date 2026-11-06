@@ -3,7 +3,7 @@
 use std::process::{Command, Output};
 
 fn run_awman(args: &[&str], root: &std::path::Path) -> Output {
-    let config = root.join(".awman");
+    let config = root.join("config-home");
     std::fs::create_dir_all(&config).unwrap();
     std::fs::write(
         config.join("config.json"),
