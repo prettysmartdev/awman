@@ -492,8 +492,16 @@ impl<F: CommandFrontend> Dispatch<F> {
         let Ok(session) = self.session.try_read() else {
             return LaunchDisplay::unknown();
         };
+        // The TUI draws this before the command future starts. Use the same
+        // fresh files and per-command overrides that run_command will use.
+        let mut preview = session.clone();
+        if preview.reload_config().is_err()
+            || self.apply_set_overrides(&canonical, &mut preview).is_err()
+        {
+            return LaunchDisplay::unknown();
+        }
         let agent_flag = spec.find_flag("agent").and_then(|_| flags.string("agent"));
-        let agent_display_name = crate::command::commands::LaunchPolicy::for_session(&session)
+        let agent_display_name = crate::command::commands::LaunchPolicy::for_session(&preview)
             .resolve_agent(&agent_flag)
             .map(|name| name.into_string())
             .unwrap_or_else(|_| agent_flag.unwrap_or_default());
@@ -546,6 +554,16 @@ impl<F: DispatchFrontend> Dispatch<F> {
     /// (WI 0113 F-04): the runtime-tier guard, and squad gateway resolution.
     /// Running is then one call through the [`Command`] trait.
     pub async fn run_command(mut self, path: &[&str]) -> Result<CommandOutcome, CommandError> {
+        // Sessions outlive commands in the TUI and API. Read every config
+        // file again before admission or construction so this invocation uses
+        // edits made since the session was opened or its previous command.
+        {
+            let mut session = self.session.write().await;
+            if let Err(error) = session.reload_config() {
+                session.state_mut().fail_command(error.to_string());
+                return Err(error.into());
+            }
+        }
         self.admit(path).await?;
         let session = Arc::clone(&self.session);
         let built = self.build_command(path)?;
@@ -940,6 +958,107 @@ mod tests {
     fn make_session() -> Arc<RwLock<Session>> {
         let tmp = tempfile::tempdir().unwrap();
         Arc::new(RwLock::new(Session::for_tests(tmp.path())))
+    }
+
+    #[tokio::test]
+    async fn each_command_reloads_global_and_repo_config() {
+        use crate::command::commands::config::ConfigOutcome;
+        use crate::data::config::env::EnvSnapshot;
+        use crate::data::config::overrides::ConfigOverrides;
+        use crate::data::fs::data_paths::AWMAN_HOME;
+        use crate::data::session::SessionOpenOptions;
+
+        let repo = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let repo_config = repo.path().join(".awman/config.json");
+        std::fs::create_dir_all(repo_config.parent().unwrap()).unwrap();
+        let global_config = home.path().join("config.json");
+        std::fs::write(
+            &global_config,
+            r#"{"agents":{"default":"codex"},"tui":{"scrollbackLines":1000}}"#,
+        )
+        .unwrap();
+        std::fs::write(&repo_config, r#"{"tui":{"scrollbackLines":2000}}"#).unwrap();
+
+        let env = EnvSnapshot::with_overrides([(AWMAN_HOME, home.path().to_str().unwrap())]);
+        let overrides =
+            ConfigOverrides::parse_set_args(&["workflows.maxConcurrentSteps=3".to_string()])
+                .unwrap();
+        let session = Arc::new(RwLock::new(
+            Session::open_at_git_root(
+                repo.path().to_path_buf(),
+                repo.path().to_path_buf(),
+                SessionOpenOptions {
+                    env: Some(env),
+                    overrides,
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        ));
+
+        let engine_root = repo.path().to_path_buf();
+        let frontend = || {
+            let mut frontend = FakeCommandFrontend::new();
+            frontend
+                .args
+                .insert("key".into(), "tui.scrollbackLines".into());
+            frontend
+        };
+        let get = |session: Arc<RwLock<Session>>| {
+            let engine_root = engine_root.clone();
+            async move {
+                let result = Dispatch::new(frontend(), session, Engines::for_tests(&engine_root))
+                    .run_command(&["config", "get"])
+                    .await
+                    .unwrap();
+                let CommandOutcome::Config(ConfigOutcome::Get(value)) = result else {
+                    panic!("expected config get outcome");
+                };
+                value
+            }
+        };
+
+        let first = get(session.clone()).await;
+        assert_eq!(first.global_value.as_deref(), Some("1000"));
+        assert_eq!(first.repo_value.as_deref(), Some("2000"));
+        assert_eq!(first.effective_value.as_deref(), Some("2000"));
+
+        std::fs::write(
+            &global_config,
+            r#"{"agents":{"default":"gemini"},"tui":{"scrollbackLines":3000}}"#,
+        )
+        .unwrap();
+        std::fs::write(&repo_config, r#"{"tui":{"scrollbackLines":4000}}"#).unwrap();
+        let preview = Dispatch::new(frontend(), session.clone(), Engines::for_tests(repo.path()))
+            .launch_display(&["config", "get"]);
+        assert_eq!(preview.agent_display_name, "gemini");
+        let second = get(session.clone()).await;
+        assert_eq!(second.global_value.as_deref(), Some("3000"));
+        assert_eq!(second.repo_value.as_deref(), Some("4000"));
+        assert_eq!(second.effective_value.as_deref(), Some("4000"));
+        {
+            let current = session.read().await;
+            assert_eq!(current.default_agent().unwrap().as_str(), "gemini");
+            assert_eq!(
+                current.effective_config().value()["workflows"]["maxConcurrentSteps"],
+                3
+            );
+        }
+
+        std::fs::write(&repo_config, "{ invalid json }").unwrap();
+        let error = Dispatch::new(frontend(), session.clone(), Engines::for_tests(repo.path()))
+            .run_command(&["config", "get"])
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            CommandError::Data(crate::data::error::DataError::ConfigParse { .. })
+        ));
+        assert_eq!(
+            session.read().await.effective_config().value()["tui"]["scrollbackLines"],
+            4000
+        );
     }
 
     /// Who the caller is comes from the frontend's declared kind, once, at

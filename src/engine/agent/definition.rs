@@ -64,6 +64,8 @@ pub enum SystemPromptMode {
     AgentsMd,
     /// Env var pointing to a file.
     EnvFile { var: String },
+    /// Env var pointing to a directory containing AGENTS.md.
+    EnvDir { var: String },
     /// Extra workspace dir flag (agy --add-dir) + AGENTS.md.
     AddDir { flag: String },
     /// Not supported.
@@ -92,6 +94,19 @@ pub enum SettingsMount {
     /// token read from the host keychain, synthesized when the host dir is
     /// absent but a keychain token exists.
     Antigravity,
+}
+
+/// A private host directory mounted for one agent execution. The directory
+/// follows the container execution's lifetime, rather than the engine's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionStorageDir {
+    /// Destination relative to the container's effective HOME.
+    pub home_relative_path: String,
+    /// Optional environment variable set to the absolute destination.
+    pub env_var: Option<String>,
+    /// Optional CLI flag and config key for agents whose config file takes
+    /// precedence over the environment variable. Emitted after user flags.
+    pub config_override: Option<(String, String)>,
 }
 
 /// Which host credential scheme awman reads for an agent.
@@ -182,6 +197,9 @@ pub struct AgentDefinition {
     pub interactive_entrypoint: Vec<String>,
     /// Print/headless entrypoint suffix (e.g. `--print` for Claude).
     pub non_interactive_flag: Option<String>,
+    /// Headless invocation takes the prompt as the argument after its mode
+    /// flag rather than reading plain text from stdin.
+    pub headless_prompt_in_argv: bool,
     /// The structured output mode a headless run can print in
     /// (WI 0137 §4). A capability of the table, not a name match: under the
     /// API an agent with a structured format runs in that mode (claude
@@ -237,6 +255,11 @@ pub struct AgentDefinition {
     /// How the host agent's settings/credential directory is passed into a
     /// container. Consumed by `OverlayEngine::agent_settings_overlays_*`.
     pub settings_mount: SettingsMount,
+    /// Additional host directories mounted at the same relative location in
+    /// the guest (for agents that split configuration and credentials).
+    pub extra_settings_mounts: Vec<String>,
+    /// Private writable directories mounted for one execution.
+    pub session_storage_dirs: Vec<SessionStorageDir>,
     /// Where the global skills directory is mounted inside the container,
     /// relative to the container `$HOME`. `None` means the agent has no known
     /// skills directory and the skills overlay is skipped with a warning.

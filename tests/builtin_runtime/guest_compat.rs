@@ -65,6 +65,9 @@ printf workflow-write > /awman/context/workflow/writeback
         SystemPromptMode::EnvFile { var } => script.push_str(&format!(
             "prompt_file=$(printenv {var})\ngrep -q 'Global Developer Context' \"$prompt_file\"\n"
         )),
+        SystemPromptMode::EnvDir { var } => script.push_str(&format!(
+            "prompt_dir=$(printenv {var})\ngrep -q 'Global Developer Context' \"$prompt_dir/AGENTS.md\"\n"
+        )),
         SystemPromptMode::AddDir { .. } => script.push_str(
             "found=0\nwhile [ $# -gt 0 ]; do if [ \"$1\" = --add-dir ]; then shift; if [ \"$1\" = /awman/context/global ]; then found=1; fi; fi; shift; done\ntest $found = 1\ngrep -q 'Global Developer Context' /awman/context/global/AGENTS.md\n"
         ),

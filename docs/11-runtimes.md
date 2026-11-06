@@ -564,7 +564,7 @@ Each agent accepts a specific allowlist of auth variables (matching the [Docker 
 | `claude` | `ANTHROPIC_API_KEY` | `anthropic` |
 | `codex` | `OPENAI_API_KEY` | `openai` |
 | `gemini` | `GEMINI_API_KEY` or `GOOGLE_API_KEY` | `google` |
-| `copilot` | `GH_TOKEN` or `GITHUB_TOKEN` | `github` |
+| `copilot` | `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, or `GITHUB_TOKEN` | `github` |
 | `opencode` | `ANTHROPIC_API_KEY` | `anthropic` |
 
 Rules:
@@ -598,7 +598,7 @@ Mixin startup scripts consume these `session.json` fields where the agent suppor
 - `system_prompt_inline.text` — applies an inline system prompt via the agent's native config
 - `allowed_tools` / `disallowed_tools` — Claude applies tool allow/deny lists through its native permissions settings. Other sandbox agents reject these lists before launch because their startup scripts cannot apply them.
 
-If a mixin agent cannot express a field through its native config, awman prints a warning at launch time. Tool allow/deny lists instead refuse the launch when they cannot be applied. `kind: agent` kits do not consume these fields from `session.json` — configuration is delivered as launch arguments appended after the `--` delimiter, mirroring the container runtimes' argv: the non-interactive subcommand/flag (e.g. `cline task`), mode flags (`--yolo`, …), the model flag (`--model <NAME>`), then the seeded prompt. (`antigravity` delivers system prompts through extra directory mounts under the container runtimes; those mounts don't exist under sbx, so awman warns that the system prompt was not applied.)
+If a mixin agent cannot express a field through its native config, awman prints a warning at launch time. Tool allow/deny lists instead refuse the launch when they cannot be applied. `kind: agent` kits do not consume these fields from `session.json` — configuration is delivered as launch arguments appended after the `--` delimiter, mirroring the container runtimes' argv: any non-interactive flag (for example `agy --print`), mode flags (`--yolo`, …), the model flag (`--model <NAME>`), then the seeded prompt. (`antigravity` delivers system prompts through extra directory mounts under the container runtimes; those mounts don't exist under sbx, so awman warns that the system prompt was not applied.)
 
 No prompt is delivered twice: mixin kits use stdin; `kind: agent` kits use positional arguments; neither path uses both.
 
@@ -641,7 +641,7 @@ All seven built-in agents are supported under `sbx`:
 | `--headless` | **not deliverable** — warned; the prompt is still piped to the agent's interactive entrypoint | same | same |
 | `agents.flags` / `--agent-flag` | **not deliverable** — warned | **not deliverable** — warned | **not deliverable** — warned |
 
-`kind: agent` kits (`antigravity`, `cline`) are unaffected: awman owns their entrypoint and passes mode flags, `--model`, `agents.flags`, and the non-interactive subcommand as launch arguments, exactly like the container runtimes. (`antigravity` rejects `--model` on every runtime — it has no model flag.)
+`kind: agent` kits (`antigravity`, `cline`) are unaffected: awman owns their entrypoint and passes mode flags, `--model`, `agents.flags`, and any non-interactive flag as launch arguments, exactly like the container runtimes.
 
 **Port mappings:** if a workflow binds a port inside the sandbox, that port mapping is lost when the sandbox stops. Port-based workflows must keep the sandbox running continuously.
 

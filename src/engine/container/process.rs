@@ -230,7 +230,11 @@ impl AgentInstance for ContainerInstance {
         let post_bridge = self.post_bridge;
         let argv = super::docker::build_run_argv(&self.name, &self.image, &self.options)?;
         let started_at = chrono::Utc::now();
-        let seeded = self.options.seeded_prompt.clone();
+        let seeded = if self.options.headless_prompt_in_argv && !self.options.interactive {
+            None
+        } else {
+            self.options.seeded_prompt.clone()
+        };
         let handle = handle_now(&self.id, &self.name, &self.image);
 
         if self.options.agent_output_format.is_structured() {
@@ -655,7 +659,7 @@ pub(super) struct ContainerExecution {
     /// drop. Not read directly — held purely for its `Drop`.
     #[allow(dead_code)]
     leases: Vec<CredentialLease>,
-    /// This launch's mounted system-prompt files. Released when the child
+    /// This launch's temporary mounts. Released when the child
     /// exits: `wait_blocking` consumes this backend then, and an unwaited drop
     /// hands them to a thread that outlasts the child.
     prompt_files: Vec<PromptFileGuard>,
@@ -663,7 +667,7 @@ pub(super) struct ContainerExecution {
 
 impl Drop for ContainerExecution {
     /// An execution dropped unwaited leaves its container running for a later
-    /// reattach, and the guest can still read its mounted prompt files. Keep
+    /// reattach, and the guest can still read its temporary mounts. Keep
     /// them until the CLI child exits. When awman exits first the thread dies
     /// with it and the files stay on disk for that guest.
     fn drop(&mut self) {

@@ -11,7 +11,7 @@ use std::time::{Instant, SystemTime};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::data::config::effective::{ConfigLayers, EffectiveConfig};
+use crate::data::config::effective::{env_overrides, ConfigLayers, EffectiveConfig};
 use crate::data::config::env::EnvSnapshot;
 use crate::data::config::file::ConfigFile;
 use crate::data::config::flags::FlagConfig;
@@ -422,8 +422,8 @@ pub struct Session {
     /// submodule, and a frontend must not be the layer asking.
     is_git_repo: bool,
     /// The merged config (global → repo → env → `--set`), resolved and
-    /// validated once at open. [`Session::effective_config`] pairs it with the
-    /// current flags and env snapshot.
+    /// validated at open and before each command. [`Session::effective_config`]
+    /// pairs it with the current flags and env snapshot.
     config: EffectiveConfig,
     env: EnvSnapshot,
     flags: FlagConfig,
@@ -773,6 +773,31 @@ impl Session {
         self.flags = flags;
     }
 
+    /// Reload file-backed config and resolve the complete layer stack for
+    /// the next command. Keep invocation overrides and an installed task
+    /// layer; replace the snapshot only after every file and the merge pass
+    /// validation, so a bad edit cannot partially update this session.
+    pub fn reload_config(&mut self) -> Result<(), DataError> {
+        let previous = self.config.layers();
+        let mut layers = ConfigLayers::load(&self.env, Some(&self.git_root), previous.set.clone())?;
+        layers.task = previous.task.clone();
+        if let Some(task) = &layers.task {
+            layers.env = env_overrides(&self.env, &[&layers.global, &layers.repo, task])?;
+        }
+        let config = EffectiveConfig::resolve(layers, self.flags.clone(), self.env.clone())?;
+        self.replace_config(config)
+    }
+
+    fn replace_config(&mut self, config: EffectiveConfig) -> Result<(), DataError> {
+        let default_agent = config
+            .agent()
+            .map(|name| AgentName::new(&name))
+            .transpose()?;
+        self.config = config;
+        self.default_agent = default_agent;
+        Ok(())
+    }
+
     /// Add `--set`-layer overrides (applied after any already present) and
     /// re-resolve the merged config.
     pub fn add_overrides(&mut self, overrides: ConfigOverrides) -> Result<(), DataError> {
@@ -781,8 +806,11 @@ impl Session {
         }
         let mut layers = self.config.layers().clone();
         layers.set.0.extend(overrides.0);
-        self.config = EffectiveConfig::resolve(layers, self.flags.clone(), self.env.clone())?;
-        Ok(())
+        self.replace_config(EffectiveConfig::resolve(
+            layers,
+            self.flags.clone(),
+            self.env.clone(),
+        )?)
     }
 
     /// Install a squad task's config file as the task layer (above global
@@ -795,8 +823,11 @@ impl Session {
     ) -> Result<(), DataError> {
         let mut layers = self.config.layers().clone();
         layers.task = Some(task);
-        self.config = EffectiveConfig::resolve(layers, self.flags.clone(), self.env.clone())?;
-        Ok(())
+        self.replace_config(EffectiveConfig::resolve(
+            layers,
+            self.flags.clone(),
+            self.env.clone(),
+        )?)
     }
 
     /// Replace the captured env snapshot.

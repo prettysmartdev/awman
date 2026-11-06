@@ -378,7 +378,8 @@ impl BuiltinBackend {
             name,
             remove_on_exit: options.remove_on_exit,
             persistent_stdin: options.acp || options.interactive,
-            seeded_prompt: if options.acp || options.interactive {
+            seeded_prompt: if options.acp || options.interactive || options.headless_prompt_in_argv
+            {
                 None
             } else {
                 options.seeded_prompt

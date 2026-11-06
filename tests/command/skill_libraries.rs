@@ -396,12 +396,12 @@ fn real_git_subdir_is_persisted_and_library_and_single_skill_overlay_mounts_are_
         (
             "skill(custom-library)",
             library.join("custom-skills"),
-            PathBuf::from("/root/.claude/commands/custom-library"),
+            PathBuf::from("/root/.claude/skills/custom-library"),
         ),
         (
             "skill(custom-library/brainstorming)",
             library.join("custom-skills/brainstorming"),
-            PathBuf::from("/root/.claude/commands/custom-library/brainstorming"),
+            PathBuf::from("/root/.claude/skills/custom-library/brainstorming"),
         ),
     ] {
         let collected = session

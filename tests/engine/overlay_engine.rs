@@ -117,8 +117,8 @@ fn skill_overlays_claude_ro_mount_when_skills_dir_exists() {
         specs[0]
             .container_path
             .to_string_lossy()
-            .contains("/.claude/commands"),
-        "container path must target /.claude/commands; got {:?}",
+            .contains("/.claude/skills"),
+        "container path must target /.claude/skills; got {:?}",
         specs[0].container_path
     );
 }

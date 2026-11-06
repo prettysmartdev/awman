@@ -876,8 +876,7 @@ pub(super) fn build_run_argv(
         args.push(name);
     }
     // Env literals — unlike env_passthrough above, these keep the `KEY=VALUE`
-    // form. Literal values are constants awman itself supplies (e.g.
-    // `COPILOT_OFFLINE=true`), never a user secret, so there is nothing here
+    // form. Literal values are constants awman itself supplies, never a user secret, so there is nothing here
     // that argv's world-readability could expose.
     for lit in &options.env_literal {
         args.push("-e".into());

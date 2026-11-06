@@ -690,9 +690,13 @@ impl AgentEngine {
         // Initial prompt. In interactive mode most agents receive it as a
         // trailing positional arg; agents whose bare positional means something
         // else (opencode: a project dir) declare a delivery flag in their definition.
-        // Headless runs pipe it over stdin regardless.
+        // Headless delivery follows each CLI's prompt contract: some expect
+        // an argv operand, while the others read stdin.
         if let Some(prompt) = run.initial_prompt.as_ref() {
             options.push(ContainerOption::SeededPrompt(prompt.clone()));
+            if def.headless_prompt_in_argv {
+                options.push(ContainerOption::HeadlessPromptInArgv(true));
+            }
             if let InteractiveSeedDelivery::Flag(flag) = &def.interactive_seed_delivery {
                 options.push(ContainerOption::InteractiveSeedFlag(flag.to_string()));
             }
@@ -762,6 +766,39 @@ impl AgentEngine {
                 session.definition_root(),
             )
         });
+        // Private writable mounts are definition facts. The generic mount
+        // option owns each tempdir through the execution's guest-exit guard;
+        // an OverlayEngine-wide TempDir would be shared across launches.
+        for storage in &def.session_storage_dirs {
+            let relative = std::path::Path::new(&storage.home_relative_path);
+            if storage.home_relative_path.is_empty()
+                || !relative
+                    .components()
+                    .all(|part| matches!(part, std::path::Component::Normal(_)))
+            {
+                return Err(EngineError::Config(format!(
+                    "invalid session storage path: {}",
+                    storage.home_relative_path
+                )));
+            }
+            let guest_path =
+                std::path::Path::new(container_home.as_deref().unwrap_or("/root")).join(relative);
+            let dir = tempfile::Builder::new()
+                .prefix("awman-session-storage-")
+                .tempdir()
+                .map_err(|e| EngineError::Other(format!("create session storage: {e}")))?;
+            options.push(ContainerOption::TemporaryDirectoryMount {
+                container_path: guest_path.clone(),
+                env_var: storage.env_var.clone(),
+                guard: crate::engine::container::options::MountGuard::new_dir(dir),
+            });
+            if let Some((flag, key)) = &storage.config_override {
+                options.push(ContainerOption::ManagedAgentFlags(vec![
+                    flag.clone(),
+                    format!("{key}={}", guest_path.display()),
+                ]));
+            }
+        }
         let request = OverlayRequest {
             directories: run.directory_overlays.clone(),
             include_all_skills: run.include_all_skills,
@@ -965,7 +1002,11 @@ impl AgentEngine {
         // User-configured extra agent args. Only `kind: agent` kits have an
         // argv channel; a mixin kit's launch command belongs to Docker's
         // built-in template, so the flags are warned about, not dropped.
-        let agent_flags = resolve_agent_flags(session, agent, run);
+        let mut agent_flags = resolve_agent_flags(session, agent, run);
+        if matches!(def.sbx_kit_kind, SbxKitKind::Agent) {
+            let managed = def.entrypoint_managed_flags(run.non_interactive);
+            agent_flags.retain(|flag| !managed.contains(flag));
+        }
         if !agent_flags.is_empty() {
             match def.sbx_kit_kind {
                 SbxKitKind::Agent => {
@@ -1129,6 +1170,15 @@ impl AgentEngine {
                     guard,
                 });
             }
+            SystemPromptMode::EnvDir { var } => {
+                let (guard, container_path) = write_prompt_temp_dir(prompt_text)?;
+                options.push(ContainerOption::SystemPromptEnvFile {
+                    env_var: var.to_string(),
+                    host_path: guard.host_path().to_path_buf(),
+                    container_path,
+                    guard,
+                });
+            }
             SystemPromptMode::AddDir { flag } => {
                 for ctx in context_overlays {
                     plant_agents_md(&ctx.host_path, prompt_text);
@@ -1172,6 +1222,29 @@ fn write_prompt_temp_file(
         std::path::PathBuf::from("/tmp").join(tmp.path().file_name().unwrap_or_default());
     Ok((
         crate::engine::container::options::PromptFileGuard::new(tmp),
+        container_path,
+    ))
+}
+
+fn write_prompt_temp_dir(
+    text: &str,
+) -> Result<
+    (
+        crate::engine::container::options::PromptFileGuard,
+        std::path::PathBuf,
+    ),
+    EngineError,
+> {
+    let dir = tempfile::Builder::new()
+        .prefix("awman-ctx-instructions-")
+        .tempdir()
+        .map_err(|e| EngineError::io(std::path::PathBuf::from("/tmp"), e))?;
+    let file = dir.path().join("AGENTS.md");
+    std::fs::write(&file, text).map_err(|e| EngineError::io(&file, e))?;
+    let container_path =
+        std::path::PathBuf::from("/tmp").join(dir.path().file_name().unwrap_or_default());
+    Ok((
+        crate::engine::container::options::PromptFileGuard::new_dir(dir),
         container_path,
     ))
 }
@@ -1224,7 +1297,7 @@ fn emit_sandbox_system_prompt_options(
                 text: format!("{preamble}{prompt_text}"),
             });
         }
-        SystemPromptMode::EnvFile { var } => {
+        SystemPromptMode::EnvFile { var } | SystemPromptMode::EnvDir { var } => {
             // The mixin apply script materializes the text into a VM-local file
             // and points `var` at it; the flag slot carries the env-var name.
             options.push(SandboxOption::SystemPromptInline {
@@ -1284,7 +1357,7 @@ mod tests {
     use super::*;
     use crate::data::config::effective::EffectiveConfig;
     use crate::data::session::{SessionOpenOptions, StaticGitRootResolver};
-    use crate::engine::container::options::{ContainerOption, PlanMode, YoloMode};
+    use crate::engine::container::options::{ContainerOption, ModelFlagForm, PlanMode, YoloMode};
     use crate::engine::overlay::OverlayEngine;
 
     #[test]
@@ -1308,7 +1381,7 @@ mod tests {
     fn build_options_rejects_acp_for_unsupported_agent() {
         let tmp = tempfile::tempdir().unwrap();
         let (engine, session) = make_agent_engine(tmp.path());
-        // codex does not support ACP (only cline does today).
+        // Codex has no ACP entrypoint in the first-party catalogue.
         let agent = crate::data::session::AgentName::new("codex").unwrap();
         let run = AgentRunOptions {
             launch_mode: LaunchMode::Acp,
@@ -1516,6 +1589,58 @@ mod tests {
     }
 
     #[test]
+    fn codex_sqlite_storage_is_private_per_launch_and_overrides_user_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, session) = make_agent_engine(tmp.path());
+        let agent = AgentName::new("codex").unwrap();
+        let run = AgentRunOptions {
+            agent_flags: Some(vec!["--config".into(), "sqlite_home=/shared".into()]),
+            ..Default::default()
+        };
+        let first = crate::engine::container::options::ResolvedContainerOptions::resolve(
+            engine.build_options(&session, &agent, &run).unwrap(),
+        )
+        .unwrap();
+        let second = crate::engine::container::options::ResolvedContainerOptions::resolve(
+            engine.build_options(&session, &agent, &run).unwrap(),
+        )
+        .unwrap();
+        let first_mount = first
+            .overlays
+            .iter()
+            .find(|mount| mount.container_path.ends_with(".codex-sqlite"))
+            .unwrap();
+        let second_mount = second
+            .overlays
+            .iter()
+            .find(|mount| mount.container_path.ends_with(".codex-sqlite"))
+            .unwrap();
+        assert_ne!(first_mount.host_path, second_mount.host_path);
+        assert_eq!(
+            first_mount.permission,
+            crate::engine::container::options::OverlayPermission::ReadWrite
+        );
+        assert_eq!(
+            first
+                .env_literal
+                .iter()
+                .find(|env| env.key == "CODEX_SQLITE_HOME")
+                .unwrap()
+                .value,
+            first_mount.container_path.to_string_lossy()
+        );
+        assert_eq!(
+            first.managed_agent_flags,
+            vec![
+                "--config",
+                &format!("sqlite_home={}", first_mount.container_path.display())
+            ]
+        );
+        assert_eq!(first.agent_flags, vec!["--config", "sqlite_home=/shared"]);
+        assert!(first_mount.host_path.exists() && second_mount.host_path.exists());
+    }
+
+    #[test]
     fn build_options_with_yolo_includes_yolo_option() {
         let tmp = tempfile::tempdir().unwrap();
         let (engine, session) = make_agent_engine(tmp.path());
@@ -1662,7 +1787,7 @@ mod tests {
     }
 
     #[test]
-    fn build_options_non_interactive_true_includes_print_flag_for_cline() {
+    fn build_options_non_interactive_cline_uses_stdin_without_task_subcommand() {
         let tmp = tempfile::tempdir().unwrap();
         let (engine, session) = make_agent_engine(tmp.path());
         let agent = crate::data::session::AgentName::new("cline").unwrap();
@@ -1671,9 +1796,7 @@ mod tests {
             ..Default::default()
         };
         let opts = engine.build_options(&session, &agent, &run).unwrap();
-        // The entrypoint carries the headless form, exactly once; no
-        // other option repeats it (it used to be emitted twice).
-        assert_eq!(non_interactive_tokens(&opts, "task"), 1, "cline");
+        assert_eq!(non_interactive_tokens(&opts, "task"), 0, "cline");
     }
 
     #[test]
@@ -1791,12 +1914,7 @@ mod tests {
     }
 
     #[test]
-    fn build_options_antigravity_plan_returns_plan_unsupported_error() {
-        // agy has no `--approval-mode=plan` CLI flag (verified against
-        // `agy --help`; plan/auto modes live only in settings.json's
-        // `toolPermission` field or interactive slash commands). Asking for
-        // plan mode on antigravity must surface as `PlanModeUnsupported`
-        // rather than silently emitting a flag agy treats as garbage.
+    fn build_options_antigravity_plan_uses_mode_plan() {
         let tmp = tempfile::tempdir().unwrap();
         let (engine, session) = make_agent_engine(tmp.path());
         let agent = crate::data::session::AgentName::new("antigravity").unwrap();
@@ -1805,18 +1923,14 @@ mod tests {
             non_interactive: true,
             ..Default::default()
         };
-        let err = engine
-            .build_options(&session, &agent, &run)
-            .expect_err("plan mode on antigravity must be rejected");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("antigravity") && msg.to_lowercase().contains("plan"),
-            "error must call out plan-mode for antigravity; got: {msg}"
-        );
+        let opts = engine.build_options(&session, &agent, &run).unwrap();
+        assert!(opts.iter().any(
+            |o| matches!(o, ContainerOption::AgentModeFlags(flags) if flags == &["--mode", "plan"])
+        ));
     }
 
     #[test]
-    fn build_options_antigravity_model_flag_returns_error() {
+    fn build_options_antigravity_model_flag_uses_model() {
         let tmp = tempfile::tempdir().unwrap();
         let (engine, session) = make_agent_engine(tmp.path());
         let agent = crate::data::session::AgentName::new("antigravity").unwrap();
@@ -1824,20 +1938,8 @@ mod tests {
             model: Some("gemini-3.5-flash".to_string()),
             ..Default::default()
         };
-        let result = engine.build_options(&session, &agent, &run);
-        assert!(
-            result.is_err(),
-            "build_options with model for antigravity must return Err; got {result:?}"
-        );
-        let msg = result.unwrap_err().to_string();
-        assert!(
-            msg.contains("antigravity"),
-            "error must name the agent 'antigravity'; got: {msg}"
-        );
-        assert!(
-            msg.contains("does not support a model flag"),
-            "error must say 'does not support a model flag'; got: {msg}"
-        );
+        let opts = engine.build_options(&session, &agent, &run).unwrap();
+        assert!(opts.iter().any(|o| matches!(o, ContainerOption::Model { flag: ModelFlagForm::Argument(model) } if model == "gemini-3.5-flash")));
     }
 
     #[test]
@@ -2962,7 +3064,7 @@ mod tests {
     }
 
     #[test]
-    fn build_sandbox_options_copilot_has_static_offline_env_literal() {
+    fn build_sandbox_options_copilot_does_not_force_offline_mode() {
         let tmp = tempfile::tempdir().unwrap();
         let (engine, session) = make_agent_engine(tmp.path());
         let agent = crate::data::session::AgentName::new("copilot").unwrap();
@@ -2977,8 +3079,8 @@ mod tests {
             }
         });
         assert!(
-            has_offline,
-            "copilot must have COPILOT_OFFLINE=true EnvLiteral; got {opts:?}"
+            !has_offline,
+            "copilot must permit GitHub authentication; got {opts:?}"
         );
     }
 

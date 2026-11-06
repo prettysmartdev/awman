@@ -4,7 +4,8 @@
 
 use super::definition::{
     AgentDefinition, AgentImageSource, AgentOrigin, AgentOutputFormat, CredentialSource,
-    InteractiveSeedDelivery, ModelFlagDelivery, SbxKitKind, SettingsMount, SystemPromptMode,
+    InteractiveSeedDelivery, ModelFlagDelivery, SbxKitKind, SessionStorageDir, SettingsMount,
+    SystemPromptMode,
 };
 
 /// The seven built-in agents. Same slice as the Layer 0 constant so Layer 0
@@ -32,6 +33,7 @@ fn base(name: &str, display_name: &str) -> AgentDefinition {
         image: AgentImageSource::Download,
         interactive_entrypoint: vec![name.to_string()],
         non_interactive_flag: None,
+        headless_prompt_in_argv: false,
         output_format: AgentOutputFormat::Text,
         interactive_only_flags: Vec::new(),
         plan_flags: Vec::new(),
@@ -48,6 +50,8 @@ fn base(name: &str, display_name: &str) -> AgentDefinition {
         system_prompt_flag: None,
         sbx_kit_kind: SbxKitKind::Mixin,
         settings_mount: SettingsMount::None,
+        extra_settings_mounts: Vec::new(),
+        session_storage_dirs: Vec::new(),
         skills_mount: None,
         credential_source: CredentialSource::None,
         ping_argv: None,
@@ -78,7 +82,7 @@ pub fn first_party(name: &str) -> Option<AgentDefinition> {
             system_prompt_delivery: SystemPromptMode::Append,
             system_prompt_flag: Some("--append-system-prompt-file".into()),
             settings_mount: SettingsMount::Claude,
-            skills_mount: Some(".claude/commands".into()),
+            skills_mount: Some(".claude/skills".into()),
             credential_source: CredentialSource::ClaudeKeychainOauth,
             // The cheapest Claude model is pinned so the refresh ping never
             // uses the account default (which may be a premium model).
@@ -98,7 +102,10 @@ pub fn first_party(name: &str) -> Option<AgentDefinition> {
             // the TUI exits 1 ("daemon executable not found"). `codex exec`
             // never uses the daemon and rejects the flag, so interactive only.
             interactive_only_flags: strings(&["--no-daemon"]),
-            plan_flags: strings(&["--approval-mode", "plan"]),
+            // Codex exposes Plan through its interactive /plan command, not a
+            // startup flag. Reject awman's --plan instead of passing an
+            // unknown --approval-mode option.
+            plan_flags: Vec::new(),
             // `--full-auto` is exec-only (and deprecated); the global flag
             // below is accepted by both interactive `codex` and `codex exec`.
             yolo_flags: strings(&["--dangerously-bypass-approvals-and-sandbox"]),
@@ -113,6 +120,11 @@ pub fn first_party(name: &str) -> Option<AgentDefinition> {
             },
             system_prompt_flag: Some("--config".into()),
             settings_mount: SettingsMount::Direct(".codex".into()),
+            session_storage_dirs: vec![SessionStorageDir {
+                home_relative_path: ".codex-sqlite".into(),
+                env_var: Some("CODEX_SQLITE_HOME".into()),
+                config_override: Some(("--config".into(), "sqlite_home".into())),
+            }],
             skills_mount: Some(".codex/skills".into()),
             ping_argv: Some(strings(&["codex", "exec"])),
             sandbox_auth_env_vars: strings(&["OPENAI_API_KEY"]),
@@ -120,30 +132,36 @@ pub fn first_party(name: &str) -> Option<AgentDefinition> {
         },
         "opencode" => AgentDefinition {
             non_interactive_flag: Some("run".into()),
+            headless_prompt_in_argv: true,
+            auto_flags: strings(&["--auto"]),
             // opencode's bare command treats a positional as a project dir, so a
             // seeded prompt must go through `--prompt <text>`; a positional
             // prompt makes opencode `open()` the prompt as a path (ENAMETOOLONG).
             interactive_seed_delivery: InteractiveSeedDelivery::Flag("--prompt".into()),
-            // TODO(acp): verify and wire up if/when opencode ships ACP support
-            supports_acp: false,
+            supports_acp: true,
+            acp_entrypoint: Some(strings(&["opencode", "acp"])),
             system_prompt_delivery: SystemPromptMode::AgentsMd,
             settings_mount: SettingsMount::Direct(".config/opencode".into()),
-            skills_mount: Some(".config/opencode/commands".into()),
+            extra_settings_mounts: strings(&[".local/share/opencode"]),
+            skills_mount: Some(".config/opencode/skills".into()),
             ping_argv: Some(strings(&["opencode", "run"])),
             sandbox_auth_env_vars: strings(&["ANTHROPIC_API_KEY"]),
             ..base("opencode", "OpenCode")
         },
         "gemini" => AgentDefinition {
+            non_interactive_flag: Some("--prompt".into()),
+            headless_prompt_in_argv: true,
+            interactive_seed_delivery: InteractiveSeedDelivery::Flag("--prompt-interactive".into()),
             plan_flags: strings(&["--approval-mode=plan"]),
-            yolo_flags: strings(&["--yolo"]),
+            yolo_flags: strings(&["--approval-mode=yolo"]),
             auto_flags: strings(&["--approval-mode=auto_edit"]),
-            // TODO(acp): verify and wire up if/when gemini ships ACP support
-            supports_acp: false,
+            supports_acp: true,
+            acp_entrypoint: Some(strings(&["gemini", "--experimental-acp"])),
             system_prompt_delivery: SystemPromptMode::EnvFile {
                 var: "GEMINI_SYSTEM_MD".into(),
             },
             settings_mount: SettingsMount::Direct(".gemini".into()),
-            skills_mount: Some(".gemini/commands".into()),
+            skills_mount: Some(".gemini/skills".into()),
             ping_argv: Some(strings(&["gemini", "-p"])),
             sandbox_auth_env_vars: strings(&["GEMINI_API_KEY", "GOOGLE_API_KEY"]),
             deprecation_note: Some(
@@ -155,32 +173,37 @@ pub fn first_party(name: &str) -> Option<AgentDefinition> {
             ..base("gemini", "Gemini CLI")
         },
         "copilot" => AgentDefinition {
-            interactive_entrypoint: strings(&["copilot", "-i"]),
+            non_interactive_flag: Some("-p".into()),
+            headless_prompt_in_argv: true,
+            interactive_seed_delivery: InteractiveSeedDelivery::Flag("-i".into()),
             plan_flags: strings(&["--plan"]),
-            yolo_flags: strings(&["--autopilot"]),
+            yolo_flags: strings(&["--yolo"]),
             // TODO(acp): verify and wire up if/when copilot ships ACP support
             supports_acp: false,
-            system_prompt_delivery: SystemPromptMode::EnvFile {
+            system_prompt_delivery: SystemPromptMode::EnvDir {
                 var: "COPILOT_CUSTOM_INSTRUCTIONS_DIRS".into(),
             },
-            settings_mount: SettingsMount::None,
-            skills_mount: Some(".copilot/instructions".into()),
-            ping_argv: Some(strings(&["copilot", "-p", "-i"])),
-            static_env: vec![("COPILOT_OFFLINE".into(), "true".into())],
+            settings_mount: SettingsMount::Direct(".copilot".into()),
+            skills_mount: Some(".copilot/skills".into()),
+            ping_argv: Some(strings(&["copilot", "-p"])),
             sandbox_model_note: Some(
                 "--model cannot be applied to copilot under the sandbox runtime (no \
                  mixin-safe config); use the /model slash command inside the session \
                  instead"
                     .into(),
             ),
-            sandbox_auth_env_vars: strings(&["GH_TOKEN", "GITHUB_TOKEN"]),
+            sandbox_auth_env_vars: strings(&["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"]),
             ..base("copilot", "GitHub Copilot CLI")
         },
         "cline" => AgentDefinition {
-            non_interactive_flag: Some("task".into()),
+            // A positional prompt starts a one-shot run. A seeded interactive
+            // prompt therefore needs `--tui`, and `task` is not a subcommand.
+            non_interactive_flag: None,
+            headless_prompt_in_argv: true,
+            interactive_only_flags: strings(&["--tui"]),
             plan_flags: strings(&["--plan"]),
             yolo_flags: strings(&["--yolo"]),
-            auto_flags: strings(&["--auto-approve-all"]),
+            auto_flags: strings(&["--auto-approve", "true"]),
             supports_acp: true,
             acp_entrypoint: Some(strings(&["cline", "--acp"])),
             system_prompt_delivery: SystemPromptMode::Replace,
@@ -188,32 +211,18 @@ pub fn first_party(name: &str) -> Option<AgentDefinition> {
             sbx_kit_kind: SbxKitKind::Agent,
             settings_mount: SettingsMount::Direct(".cline/data".into()),
             skills_mount: Some(".cline/skills".into()),
-            ping_argv: Some(strings(&["cline", "task"])),
+            ping_argv: Some(strings(&["cline", "--json"])),
             ..base("cline", "Cline")
         },
         "antigravity" => AgentDefinition {
-            // Verified against `agy --help` (v1.0.x). Flags actually accepted:
-            //   --print / -p / --prompt           (headless)
-            //   --prompt-interactive / -i         (interactive seed)
-            //   --dangerously-skip-permissions    (yolo)
-            //   --print-timeout                   (default 5m, not surfaced here)
-            //   --continue / --conversation       (session resume, not wired)
-            //   --add-dir                         (extra workspace dirs)
-            //   --log-file, --sandbox
-            // There is **no** `--approval-mode` / `--plan` / `--auto-edit`
-            // CLI flag — those are settings.json (`toolPermission`) values
-            // surfaced through agy's interactive `/...` slash commands.
-            // Don't emit them; the binary just dumps `--help` and treats the
-            // prompt as the agy executable name. Leaving plan/auto empty
-            // keeps non-yolo modes a silent no-op (matches opencode).
+            // Antigravity CLI exposes startup execution modes and models.
             interactive_entrypoint: strings(&["agy"]),
             non_interactive_flag: Some("--print".into()),
+            headless_prompt_in_argv: true,
+            plan_flags: strings(&["--mode", "plan"]),
             yolo_flags: strings(&["--dangerously-skip-permissions"]),
-            model_flag: ModelFlagDelivery::Unsupported,
-            // agy accepts `--prompt-interactive`/`-i` for an interactive seed,
-            // but awman has always seeded it positionally; keep that behavior
-            // until the flag form is verified end-to-end.
-            interactive_seed_delivery: InteractiveSeedDelivery::Positional,
+            auto_flags: strings(&["--mode", "accept-edits"]),
+            interactive_seed_delivery: InteractiveSeedDelivery::Flag("--prompt-interactive".into()),
             // TODO(acp): verify and wire up if/when antigravity ships ACP support
             supports_acp: false,
             system_prompt_delivery: SystemPromptMode::AddDir {
@@ -223,10 +232,7 @@ pub fn first_party(name: &str) -> Option<AgentDefinition> {
             settings_mount: SettingsMount::Antigravity,
             skills_mount: Some(".gemini/antigravity-cli/skills".into()),
             credential_source: CredentialSource::AntigravityKeychainFile,
-            // The ping binary is `antigravity`, NOT the `agy` interactive
-            // entrypoint. That is what the pre-F-32 fallback arm produced and
-            // it is preserved verbatim here; see the ping_argv doc comment.
-            ping_argv: Some(strings(&["antigravity", "--print"])),
+            ping_argv: Some(strings(&["agy", "--print"])),
             ..base("antigravity", "Antigravity")
         },
         _ => return None,
@@ -310,7 +316,7 @@ mod tests {
     #[test]
     fn unsupported_agents_have_no_acp_entrypoint() {
         for agent in FIRST_PARTY_AGENTS {
-            if *agent == "cline" {
+            if ["cline", "opencode", "gemini"].contains(agent) {
                 continue;
             }
             let d = def(agent);
@@ -339,11 +345,11 @@ mod tests {
     }
 
     #[test]
-    fn only_opencode_uses_a_seed_flag_others_are_positional() {
+    fn seed_delivery_matches_cli_syntax() {
         for a in FIRST_PARTY_AGENTS {
             let d = def(a);
             match *a {
-                "opencode" => assert!(matches!(
+                "opencode" | "gemini" | "copilot" | "antigravity" => assert!(matches!(
                     d.interactive_seed_delivery,
                     InteractiveSeedDelivery::Flag(_)
                 )),
@@ -394,20 +400,19 @@ mod tests {
     }
 
     #[test]
-    fn antigravity_model_flag_unsupported_returns_err() {
-        let result = def("antigravity").model_flag_for("gemini-3.5-flash");
-        assert!(
-            result.is_err(),
-            "model_flag_for antigravity must return Err (Unsupported); got {result:?}"
+    fn antigravity_model_and_modes_match_current_cli() {
+        assert_eq!(
+            def("antigravity")
+                .model_flag_for("gemini-3.8-flash-medium")
+                .unwrap(),
+            crate::engine::container::options::ModelFlagForm::Argument(
+                "gemini-3.8-flash-medium".into()
+            )
         );
-        let msg = result.unwrap_err().to_string();
-        assert!(
-            msg.contains("antigravity"),
-            "error must name the agent; got: {msg}"
-        );
-        assert!(
-            msg.contains("does not support a model flag"),
-            "error must say 'does not support a model flag'; got: {msg}"
+        assert_eq!(def("antigravity").plan_flags, strings(&["--mode", "plan"]));
+        assert_eq!(
+            def("antigravity").auto_flags,
+            strings(&["--mode", "accept-edits"])
         );
     }
 
@@ -421,10 +426,10 @@ mod tests {
     }
 
     #[test]
-    fn only_codex_declares_interactive_only_flags() {
+    fn interactive_only_flags_follow_vendor_launch_shapes() {
         for agent in FIRST_PARTY_AGENTS {
             let d = def(agent);
-            if *agent != "codex" {
+            if !["codex", "cline"].contains(agent) {
                 assert!(d.interactive_only_flags.is_empty(), "{agent}");
                 assert_eq!(
                     d.entrypoint_for(false).0,
@@ -433,6 +438,8 @@ mod tests {
                 );
             }
         }
+        assert_eq!(def("cline").entrypoint_for(false).0, vec!["cline", "--tui"]);
+        assert_eq!(def("cline").entrypoint_for(true).0, vec!["cline"]);
     }
 
     #[test]
@@ -498,7 +505,7 @@ mod tests {
     }
 
     #[test]
-    fn env_file_system_prompt_delivery_for_gemini_and_copilot() {
+    fn environment_system_prompt_delivery_matches_cli_contracts() {
         assert_eq!(
             def("gemini").system_prompt_delivery,
             SystemPromptMode::EnvFile {
@@ -507,7 +514,7 @@ mod tests {
         );
         assert_eq!(
             def("copilot").system_prompt_delivery,
-            SystemPromptMode::EnvFile {
+            SystemPromptMode::EnvDir {
                 var: "COPILOT_CUSTOM_INSTRUCTIONS_DIRS".into()
             }
         );
@@ -521,13 +528,13 @@ mod tests {
     // overlay mounting, credential delivery or the sanctioned host ping.
 
     #[test]
-    fn settings_mount_table_matches_the_pre_f32_arms() {
+    fn settings_mount_table_matches_current_agent_paths() {
         let expected: &[(&str, SettingsMount)] = &[
             ("claude", SettingsMount::Claude),
             ("codex", SettingsMount::Direct(".codex".into())),
             ("opencode", SettingsMount::Direct(".config/opencode".into())),
             ("gemini", SettingsMount::Direct(".gemini".into())),
-            ("copilot", SettingsMount::None),
+            ("copilot", SettingsMount::Direct(".copilot".into())),
             ("cline", SettingsMount::Direct(".cline/data".into())),
             ("antigravity", SettingsMount::Antigravity),
         ];
@@ -559,11 +566,11 @@ mod tests {
     #[test]
     fn skills_mount_table_matches_the_pre_f32_arms() {
         let expected: &[(&str, Option<&str>)] = &[
-            ("claude", Some(".claude/commands")),
+            ("claude", Some(".claude/skills")),
             ("codex", Some(".codex/skills")),
-            ("opencode", Some(".config/opencode/commands")),
-            ("gemini", Some(".gemini/commands")),
-            ("copilot", Some(".copilot/instructions")),
+            ("opencode", Some(".config/opencode/skills")),
+            ("gemini", Some(".gemini/skills")),
+            ("copilot", Some(".copilot/skills")),
             ("cline", Some(".cline/skills")),
             ("antigravity", Some(".gemini/antigravity-cli/skills")),
         ];
@@ -594,7 +601,7 @@ mod tests {
     }
 
     #[test]
-    fn ping_argv_table_matches_the_pre_f32_ready_arms() {
+    fn ping_argv_matches_current_cli_commands() {
         let expected: &[(&str, &[&str])] = &[
             // The cheapest Claude model is pinned so the refresh ping never
             // uses the account default (which may be a premium model).
@@ -602,10 +609,9 @@ mod tests {
             ("codex", &["codex", "exec"]),
             ("opencode", &["opencode", "run"]),
             ("gemini", &["gemini", "-p"]),
-            ("copilot", &["copilot", "-p", "-i"]),
-            ("cline", &["cline", "task"]),
-            // Reproduces the pre-F-32 catch-all arm exactly, `agy` notwithstanding.
-            ("antigravity", &["antigravity", "--print"]),
+            ("copilot", &["copilot", "-p"]),
+            ("cline", &["cline", "--json"]),
+            ("antigravity", &["agy", "--print"]),
         ];
         assert_eq!(expected.len(), FIRST_PARTY_AGENTS.len());
         for (agent, want) in expected {
@@ -645,19 +651,13 @@ mod tests {
     }
 
     #[test]
-    fn static_env_is_copilot_offline_and_nothing_else() {
+    fn no_agent_forces_static_environment() {
         for agent in FIRST_PARTY_AGENTS {
             let d = def(agent);
-            match *agent {
-                "copilot" => assert_eq!(
-                    d.static_env,
-                    vec![("COPILOT_OFFLINE".to_string(), "true".to_string())]
-                ),
-                _ => assert!(
-                    d.static_env.is_empty(),
-                    "{agent} must declare no static env vars"
-                ),
-            }
+            assert!(
+                d.static_env.is_empty(),
+                "{agent} must declare no static env vars"
+            );
         }
     }
 
@@ -701,7 +701,10 @@ mod tests {
             ("codex", &["OPENAI_API_KEY"]),
             ("opencode", &["ANTHROPIC_API_KEY"]),
             ("gemini", &["GEMINI_API_KEY", "GOOGLE_API_KEY"]),
-            ("copilot", &["GH_TOKEN", "GITHUB_TOKEN"]),
+            (
+                "copilot",
+                &["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"],
+            ),
             // Agent-kit agents are out of scope for auto-auth.
             ("cline", &[]),
             ("antigravity", &[]),
@@ -792,25 +795,28 @@ mod tests {
     }
 
     #[test]
-    fn mode_flags_are_empty_when_the_agent_declares_no_flag() {
+    fn opencode_auto_mode_uses_supported_flag() {
         let d = def("opencode");
         assert!(d
             .mode_flags(&run_with(Some(YoloMode::Disabled), None, None))
             .is_empty());
-        assert!(d
-            .mode_flags(&run_with(None, Some(AutoMode::Enabled), None))
-            .is_empty());
+        assert_eq!(
+            d.mode_flags(&run_with(None, Some(AutoMode::Enabled), None)),
+            strings(&["--auto"])
+        );
     }
 
     #[test]
     fn validate_run_rejects_plan_on_an_agent_without_a_plan_flag() {
-        let d = def("opencode");
         let run = run_with(None, None, Some(PlanMode::Enabled));
-        for paradigm in [RunParadigm::Container, RunParadigm::Sandbox] {
-            assert!(matches!(
-                d.validate_run(&run, paradigm),
-                Err(EngineError::PlanModeUnsupported { ref agent }) if agent == "opencode"
-            ));
+        for agent in ["opencode", "codex"] {
+            let d = def(agent);
+            for paradigm in [RunParadigm::Container, RunParadigm::Sandbox] {
+                assert!(matches!(
+                    d.validate_run(&run, paradigm),
+                    Err(EngineError::PlanModeUnsupported { agent: ref name }) if name == agent
+                ));
+            }
         }
     }
 
@@ -887,7 +893,7 @@ mod family_coverage_tests {
     fn every_settings_family_and_first_party_prompt_mode_belongs_to_some_agent() {
         let mut settings = [false; 4];
         // `Unsupported` has no first-party users; custom conversion covers it.
-        let mut prompts = [false; 6];
+        let mut prompts = [false; 7];
         for agent in FIRST_PARTY_AGENTS {
             let d = first_party(agent).unwrap();
             settings[match d.settings_mount {
@@ -902,14 +908,19 @@ mod family_coverage_tests {
                 SystemPromptMode::Replace => prompts[2] = true,
                 SystemPromptMode::AgentsMd => prompts[3] = true,
                 SystemPromptMode::EnvFile { .. } => prompts[4] = true,
-                SystemPromptMode::AddDir { .. } => prompts[5] = true,
+                SystemPromptMode::EnvDir { .. } => prompts[5] = true,
+                SystemPromptMode::AddDir { .. } => prompts[6] = true,
                 SystemPromptMode::Unsupported => {
                     panic!("{agent}: no first-party agent uses Unsupported delivery")
                 }
             }
         }
-        assert_eq!(settings, [true; 4], "a SettingsMount family has no agent");
-        assert_eq!(prompts, [true; 6], "a SystemPromptMode has no agent");
+        assert_eq!(
+            settings,
+            [false, true, true, true],
+            "first-party settings families changed"
+        );
+        assert_eq!(prompts, [true; 7], "a SystemPromptMode has no agent");
     }
 
     #[test]
@@ -931,7 +942,7 @@ mod family_coverage_tests {
     fn prompt_delivery_parameters_are_well_formed() {
         for agent in FIRST_PARTY_AGENTS {
             match first_party(agent).unwrap().system_prompt_delivery {
-                SystemPromptMode::EnvFile { var } => {
+                SystemPromptMode::EnvFile { var } | SystemPromptMode::EnvDir { var } => {
                     assert!(
                         var.chars()
                             .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'),
