@@ -354,7 +354,7 @@ async fn wi0149_api_secret_usage_error_and_ssh_widening_gate() {
         let f = Fixture::new();
         let home = api_process::ApiHome::new();
         std::fs::create_dir_all(home.home().join(".config/awman")).unwrap();
-        std::fs::write(home.home().join(".config/awman/config.json"), json!({"daemon":{"features":{"worker":{"push":{"workDirs":{"allow":[f.path("repo")]}}}}}, "workflows":{"prerequisites":{"allowApiClientGrants":allow}}}).to_string()).unwrap();
+        home.write_config(json!({"daemon":{"features":{"worker":{"push":{"workDirs":{"allow":[f.path("repo")]}}}}}, "workflows":{"prerequisites":{"allowApiClientGrants":allow}}}));
         let server = home.start().await;
         let session = server
             .ready_session(json!({"session_type":"local","workdir":f.path("repo")}))
@@ -503,7 +503,7 @@ fn wi0149_acquire_token_scoped_to_pr_and_redacted_in_output_failure_file_and_age
 
 fn configure_api(home: &api_process::ApiHome, fixture: &Fixture, allow: bool) {
     std::fs::create_dir_all(home.home().join(".config/awman")).unwrap();
-    std::fs::write(home.home().join(".config/awman/config.json"), json!({"daemon":{"features":{"worker":{"push":{"workDirs":{"allow":[fixture.path("repo")]}}}}},"workflows":{"prerequisites":{"allowApiClientGrants":allow}}}).to_string()).unwrap();
+    home.write_config(json!({"daemon":{"features":{"worker":{"push":{"workDirs":{"allow":[fixture.path("repo")]}}}}},"workflows":{"prerequisites":{"allowApiClientGrants":allow}}}));
 }
 
 #[test]
@@ -633,6 +633,7 @@ async fn wi0149_grants_list_revoke_persists_decisions_never_token_values() {
     assert!(!persisted.contains(TOKEN));
     let daemon_home = api_process::ApiHome::new();
     let home = f.path("home/.awman");
+    f.global(json!({"daemon":{"features":{"worker":{"enabled":true}}}}));
     let _server = daemon_home
         .start_with_env(&[("AWMAN_HOME", home.to_str().unwrap())])
         .await;
@@ -671,7 +672,7 @@ async fn wi0149_api_acquire_output_is_redacted_in_sse_events_and_daemon_logs() {
     executable(&acquire, &format!("#!/bin/sh\necho {TOKEN}\n"));
     let home = api_process::ApiHome::new();
     configure_api(&home, &f, false);
-    std::fs::write(home.home().join(".config/awman/config.json"), json!({"daemon":{"features":{"worker":{"push":{"workDirs":{"allow":[f.path("repo")]}}}}},"workflows":{"prerequisites":{"unresolved":"warn","githubToken":{"use":"allow","acquire":{"argv":[acquire]}}}}}).to_string()).unwrap();
+    home.write_config(json!({"daemon":{"features":{"worker":{"push":{"workDirs":{"allow":[f.path("repo")]}}}}},"workflows":{"prerequisites":{"unresolved":"warn","githubToken":{"use":"allow","acquire":{"argv":[acquire]}}}}}));
     executable(
         &home.home().parent().unwrap().join("bin/docker"),
         &RECORDING_DOCKER.replace("WI0149_CONTROL", "FAKE_DOCKER_CONTROL"),

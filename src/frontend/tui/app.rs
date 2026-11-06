@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use crate::command::commands::squad::supervisor::SquadGatewayResolver;
+use crate::command::commands::squad::supervisor::DaemonResolver;
 use crate::command::dispatch::catalogue::CommandCatalogue;
 use crate::command::dispatch::parsed_input::ParsedCommandBoxInput;
 use crate::command::dispatch::{CommandOutcome, Dispatch, Engines};
@@ -37,30 +37,19 @@ pub struct StatusBar {
 }
 
 /// The outcome of the pre-event-loop squad tab build (`awman squad`).
-///
-/// `KeyMissing` is not an error — the daemon is up and healthy — but no tab is
-/// assembled for it, because a tab whose every poll is refused with 401 shows
-/// nothing but that. The caller raises [`Dialog::SquadKeyMissing`] instead, and
-/// accepting it builds the tab through the ordinary
-/// [`App::poll_squad_startup`] path once a usable key exists.
 pub enum SquadTabStart {
     Ready(Box<SquadTabBuild>),
-    KeyMissing,
 }
 
-/// A live squad gateway plus what this process can authenticate to it with,
-/// as Layer 2 reports it.
+/// A live squad gateway, as Layer 2 reports it.
 pub use crate::command::commands::squad::supervisor::{
-    SquadKeySetup, SquadStartError, SquadStartup, SquadStartupResult,
+    SquadStartError, SquadStartup, SquadStartupResult,
 };
 
-/// Everything [`App::build_squad_tab`] produces. `key_setup` is `Some` only on
-/// the run that minted the squad bearer key, and carries the shell snippet the
-/// caller must show before it is lost — the plaintext key exists nowhere else.
+/// Everything [`App::build_squad_tab`] produces.
 pub struct SquadTabBuild {
     pub tab: Tab,
     pub gateway: Arc<dyn crate::command::commands::squad::gateway::TaskGateway>,
-    pub key_setup: Option<SquadKeySetup>,
 }
 
 /// Hand the terminal to a host command, or take it back (see
@@ -93,7 +82,7 @@ pub struct App {
     pub terminal_op: Option<TerminalOp>,
     pub runtime_handle: tokio::runtime::Handle,
     /// Gateway for the singleton squad tab, obtained from
-    /// `SquadGatewayResolver::ensure_running()` when the tab is opened. Injected into
+    /// `DaemonResolver::ensure_running()` when the tab is opened. Injected into
     /// `Dispatch` for `squad` in-tab actions so they reach the daemon. `None`
     /// until the squad tab exists.
     pub squad_gateway: Option<Arc<dyn crate::command::commands::squad::gateway::TaskGateway>>,
@@ -254,7 +243,7 @@ impl App {
         // The runtime refusal comes first: a sandbox-class runtime cannot back
         // squad at all, so asking whether to start a daemon would be asking a
         // question whose "yes" could not be honoured.
-        if let Err(error) = SquadGatewayResolver::admit_runtime(&self.engines) {
+        if let Err(error) = DaemonResolver::admit_runtime(&self.engines) {
             self.status_bar.text = error.to_string();
             return;
         }
@@ -272,11 +261,11 @@ impl App {
     }
 
     /// Whether a squad daemon is already running for this squad root. Starts
-    /// nothing and writes nothing — see [`SquadGatewayResolver::daemon_is_running`].
+    /// nothing and writes nothing — see [`DaemonResolver::daemon_is_running`].
     ///
-    /// [`SquadGatewayResolver::daemon_is_running`]: crate::command::commands::squad::supervisor::SquadGatewayResolver::daemon_is_running
+    /// [`DaemonResolver::daemon_is_running`]: crate::command::commands::squad::supervisor::DaemonResolver::daemon_is_running
     fn squad_daemon_is_running() -> Result<bool, crate::command::error::CommandError> {
-        SquadGatewayResolver::from_env(&Env::from_process())?.daemon_is_running()
+        DaemonResolver::from_env(&Env::from_process())?.daemon_is_running()
     }
 
     /// Start the squad tab and install it as the active tab, starting the
@@ -307,7 +296,7 @@ impl App {
         // The runtime refusal is synchronous and immediate — there is nothing
         // to wait for — so it is reported without ever showing a "Starting…"
         // modal the user would watch fail.
-        if let Err(error) = SquadGatewayResolver::admit_runtime(&self.engines) {
+        if let Err(error) = DaemonResolver::admit_runtime(&self.engines) {
             self.status_bar.text = error.to_string();
             self.needs_redraw = true;
             return;
@@ -320,29 +309,7 @@ impl App {
         });
         self.squad_startup_rx = Some(rx);
         self.active_dialog = Some(Dialog::Loading {
-            title: "Starting squad daemon".to_string(),
-        });
-        self.needs_redraw = true;
-    }
-
-    /// Mint a new squad bearer key and restart the daemon onto it, then open
-    /// the tab. The `y` answer to [`Dialog::SquadKeyMissing`].
-    ///
-    /// Shares `squad_startup_rx` and [`App::poll_squad_startup`] with an
-    /// ordinary start: a refresh ends in the same place a first run does — a
-    /// live gateway and a a minted key to display — so there is
-    /// one drain, one progress modal, and one error path rather than two.
-    pub fn start_squad_key_refresh(&mut self) {
-        if self.squad_startup_rx.is_some() {
-            return;
-        }
-        let (tx, rx) = std::sync::mpsc::channel();
-        self.runtime_handle.spawn(async move {
-            let _ = tx.send(Self::refresh_squad_key().await);
-        });
-        self.squad_startup_rx = Some(rx);
-        self.active_dialog = Some(Dialog::Loading {
-            title: "Refreshing the squad key".to_string(),
+            title: "Starting the awman daemon".to_string(),
         });
         self.needs_redraw = true;
     }
@@ -379,25 +346,13 @@ impl App {
                 self.squad_gateway = Some(build.gateway);
                 self.tabs.push(build.tab);
                 self.active_tab = self.tabs.len() - 1;
-                if let Some(key_setup) = build.key_setup {
-                    self.active_dialog = Some(crate::frontend::tui::per_command::key_setup_dialog(
-                        &key_setup,
-                    ));
-                }
-            }
-            // A daemon this process cannot authenticate to is not worth a tab:
-            // every poll would 401 and the grid would show nothing but that.
-            // Offer the one recovery there is instead, and build nothing until
-            // it is taken — see `Dialog::SquadKeyMissing`.
-            Err(SquadStartError::KeyMissing) => {
-                self.active_dialog = Some(Dialog::SquadKeyMissing);
             }
             Err(error) => self.report_squad_start_failure(&error),
         }
     }
 
     /// Raise a squad start failure as a modal, and leave its text in the
-    /// status bar behind it. Every variant but `KeyMissing` lands here: each
+    /// status bar behind it. Every variant lands here: each
     /// already carries text that names the problem, so there is nothing to
     /// classify — see [`SquadStartError`].
     fn report_squad_start_failure(&mut self, error: &SquadStartError) {
@@ -422,7 +377,7 @@ impl App {
     ) -> Result<SquadTabStart, SquadStartError> {
         // A sandbox-class runtime cannot back squad: report the runtime error,
         // never a generic connection failure.
-        SquadGatewayResolver::admit_runtime(engines)?;
+        DaemonResolver::admit_runtime(engines)?;
 
         // `ensure_squad_gateway` is async, but the caller may be on a tokio
         // worker thread where `Handle::block_on` would panic. Drive it on the
@@ -447,7 +402,6 @@ impl App {
         match startup {
             Ok(startup) => Self::assemble_squad_tab(startup, runtime_handle)
                 .map(|build| SquadTabStart::Ready(Box::new(build))),
-            Err(SquadStartError::KeyMissing) => Ok(SquadTabStart::KeyMissing),
             Err(error) => Err(error),
         }
     }
@@ -462,15 +416,7 @@ impl App {
     pub(crate) async fn ensure_squad_gateway(
         engines: crate::command::dispatch::Engines,
     ) -> SquadStartupResult {
-        SquadGatewayResolver::open_from_env(&Env::from_process(), &engines).await
-    }
-
-    /// Mint a new bearer key, restart the daemon onto it, and return the same
-    /// startup an ordinary open does — so the caller drains both through one
-    /// path. The key is always `Minted` here, which is the point: the recovery
-    /// ends by showing the user the key they were missing.
-    pub(crate) async fn refresh_squad_key() -> SquadStartupResult {
-        SquadGatewayResolver::refresh_key_from_env(&Env::from_process()).await
+        DaemonResolver::open_from_env(&Env::from_process(), &engines).await
     }
 
     /// Turn a live startup into the squad tab: the squad-root session, the tab
@@ -507,11 +453,7 @@ impl App {
                 .expect("new_squad always installs squad state")
                 .set_poll_handle(handle);
         }
-        Ok(SquadTabBuild {
-            tab,
-            gateway,
-            key_setup: startup.key_setup,
-        })
+        Ok(SquadTabBuild { tab, gateway })
     }
 
     /// Spawn a parsed command as an async tokio task, wiring up all channels

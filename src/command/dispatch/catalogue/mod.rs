@@ -119,12 +119,21 @@ pub struct ArgumentSpec {
 pub enum FrontendKind {
     Cli,
     Tui,
-    Api,
-    /// Internal unattended workflow execution (never an HTTP catalogue).
-    Background,
+    Daemon {
+        feature: crate::data::daemon_state::FeatureName,
+        listener: crate::data::daemon_state::CommandListener,
+    },
 }
 
 impl FrontendKind {
+    pub const WORKER_LOCAL: Self = Self::Daemon {
+        feature: crate::data::daemon_state::FeatureName::Worker,
+        listener: crate::data::daemon_state::CommandListener::Local,
+    };
+    pub const SQUAD_LOCAL: Self = Self::Daemon {
+        feature: crate::data::daemon_state::FeatureName::Squad,
+        listener: crate::data::daemon_state::CommandListener::Local,
+    };
     /// Whether this frontend is the user's own session on the host that chose
     /// the paths in a request.
     ///
@@ -136,7 +145,7 @@ impl FrontendKind {
     pub fn is_local_user(self) -> bool {
         match self {
             FrontendKind::Cli | FrontendKind::Tui => true,
-            FrontendKind::Api | FrontendKind::Background => false,
+            FrontendKind::Daemon { .. } => false,
         }
     }
 
@@ -150,7 +159,7 @@ impl FrontendKind {
     pub fn can_ask_a_human(self) -> bool {
         match self {
             FrontendKind::Cli | FrontendKind::Tui => true,
-            FrontendKind::Api | FrontendKind::Background => false,
+            FrontendKind::Daemon { .. } => false,
         }
     }
 
@@ -159,8 +168,32 @@ impl FrontendKind {
         match self {
             FrontendKind::Cli => "cli",
             FrontendKind::Tui => "tui",
-            FrontendKind::Api => "api",
-            FrontendKind::Background => "squad daemon",
+            FrontendKind::Daemon { feature, listener } => match (feature, listener) {
+                (
+                    crate::data::daemon_state::FeatureName::Worker,
+                    crate::data::daemon_state::CommandListener::Local,
+                ) => "daemon:worker:local",
+                (
+                    crate::data::daemon_state::FeatureName::Worker,
+                    crate::data::daemon_state::CommandListener::Network,
+                ) => "daemon:worker:network",
+                (
+                    crate::data::daemon_state::FeatureName::Squad,
+                    crate::data::daemon_state::CommandListener::Local,
+                ) => "daemon:squad:local",
+                (
+                    crate::data::daemon_state::FeatureName::Squad,
+                    crate::data::daemon_state::CommandListener::Network,
+                ) => "daemon:squad:network",
+                (
+                    crate::data::daemon_state::FeatureName::Engine,
+                    crate::data::daemon_state::CommandListener::Local,
+                ) => "daemon:engine:local",
+                (
+                    crate::data::daemon_state::FeatureName::Engine,
+                    crate::data::daemon_state::CommandListener::Network,
+                ) => "daemon:engine:network",
+            },
         }
     }
 }
@@ -370,8 +403,18 @@ impl CommandCatalogue {
     pub fn is_allowed_for_frontend(&self, frontend: FrontendKind, path: &[&str]) -> bool {
         match frontend {
             FrontendKind::Cli | FrontendKind::Tui => true,
-            FrontendKind::Api => self.is_api_allowed(path),
-            FrontendKind::Background => false,
+            FrontendKind::Daemon {
+                feature: crate::data::daemon_state::FeatureName::Worker,
+                ..
+            } => self.is_api_allowed(path),
+            FrontendKind::Daemon {
+                feature: crate::data::daemon_state::FeatureName::Squad,
+                ..
+            } => path.first() == Some(&"squad") && self.is_api_allowed(path),
+            FrontendKind::Daemon {
+                feature: crate::data::daemon_state::FeatureName::Engine,
+                ..
+            } => false,
         }
     }
 
@@ -548,18 +591,7 @@ const ROOT: CommandSpec = CommandSpec {
         },
     ],
     subcommands: &[
-        &INIT,
-        &READY,
-        &CHAT,
-        &SPECS,
-        &AGENTS,
-        &CONFIG,
-        &EXEC,
-        &API_SERVER,
-        &DAEMON,
-        &SQUAD,
-        &REMOTE,
-        &NEW,
+        &INIT, &READY, &CHAT, &SPECS, &AGENTS, &CONFIG, &EXEC, &DAEMON, &SQUAD, &REMOTE, &NEW,
         &CLEAN,
     ],
 };
@@ -630,7 +662,6 @@ const REMOVED_FLAGS: &[RemovedFlagSpec] = &[
 // what assembles them into the tree, so this file remains the one place the
 // catalogue's shape is visible.
 mod agents;
-mod api;
 mod core;
 mod daemon;
 mod exec;
@@ -644,7 +675,6 @@ mod squad;
 mod tests;
 
 use agents::*;
-use api::*;
 use core::*;
 use daemon::*;
 use exec::*;

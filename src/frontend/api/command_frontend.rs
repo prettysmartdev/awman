@@ -34,9 +34,6 @@ use crate::command::commands::agent_setup::{
     AgentSetupDecision, AgentSetupFrontend, HasAgentFrontend,
 };
 use crate::command::commands::agents::AgentsCommandFrontend;
-use crate::command::commands::api_server::{
-    ApiKeyDisclosure, ApiServerCommandFrontend, ApiServerRuntime,
-};
 use crate::command::commands::chat::ChatCommandFrontend;
 use crate::command::commands::config::{ConfigCommandFrontend, ConfigEditRequest, ConfigFieldRow};
 use crate::command::commands::exec_prompt::ExecPromptCommandFrontend;
@@ -59,7 +56,7 @@ use crate::command::headless::HeadlessDefaults;
 use crate::data::config::work_items::WorkItemsConfig;
 use crate::data::fs::api_command_log::CommandStateWriter;
 use crate::data::fs::api_db::{FailedStep, FailedStepPhase};
-use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
+use crate::data::message::{UserMessage, UserMessageSink};
 use crate::data::ready_phase::ReadyPhase;
 use crate::data::ready_summary::ReadySummary;
 use crate::data::session::AgentName;
@@ -177,7 +174,7 @@ impl ApiDispatchFrontend {
     /// 0097, Findings A + D). The `Api` frontend profile is what forces
     /// `non-interactive=true` and defaults `yolo=true`.
     pub fn new(subcommand: &str, args: &[String], event_bus: EventBusSender) -> Self {
-        Self::for_frontend(subcommand, args, event_bus, FrontendKind::Api)
+        Self::for_frontend(subcommand, args, event_bus, FrontendKind::WORKER_LOCAL)
     }
 
     pub fn for_frontend(
@@ -1598,27 +1595,17 @@ impl crate::command::commands::clean::CleanCommandFrontend for ApiDispatchFronte
 }
 
 #[async_trait]
-impl ApiServerCommandFrontend for ApiDispatchFrontend {
-    async fn serve_until_shutdown(
+impl crate::command::commands::daemon::lifecycle::DaemonCommandFrontend for ApiDispatchFrontend {
+    /// The daemon is not a command an API request can become.
+    async fn host_daemon(
         &mut self,
-        _runtime: ApiServerRuntime,
+        _env: crate::data::config::env::EnvSnapshot,
+        _set: crate::data::config::overrides::ConfigOverrides,
     ) -> Result<(), CommandError> {
-        Err(CommandError::Other(
-            "Cannot start a nested API server from within API dispatch".into(),
-        ))
-    }
-
-    /// The key as text, on the message stream the caller is already reading.
-    /// The API used to receive the CLI's banner and serialise the `═` runs
-    /// into JSON, which no HTTP client wanted.
-    fn show_api_key(&mut self, disclosure: &ApiKeyDisclosure) {
-        self.write_message(UserMessage {
-            level: MessageLevel::Info,
-            text: format!(
-                "awman API key (store this — it will not be shown again): {}",
-                disclosure.key()
-            ),
-        });
+        Err(CommandError::NotAvailableForFrontend {
+            command: "daemon start".into(),
+            frontend: "api".into(),
+        })
     }
 }
 
@@ -1999,7 +1986,9 @@ mod tests {
         for case in CASES {
             // CLI-only flags on commands unavailable via API are exercised
             // through the CLI/TUI versions of this shared table.
-            if !CommandCatalogue::get().is_allowed_for_frontend(FrontendKind::Api, case.path) {
+            if !CommandCatalogue::get()
+                .is_allowed_for_frontend(FrontendKind::WORKER_LOCAL, case.path)
+            {
                 continue;
             }
             let f = make_frontend(&case.path.join(" "), case.args);
@@ -2017,7 +2006,7 @@ mod tests {
                 .parse_raw_args_with_profile(
                     path,
                     &args.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
-                    FrontendKind::Api,
+                    FrontendKind::WORKER_LOCAL,
                 )
                 .expect_err("the case must be rejected");
             let reads = [
@@ -2069,19 +2058,6 @@ mod tests {
         let f = make_frontend("exec prompt", &[]);
         assert_eq!(f.flag_string(&["exec", "prompt"], "agent").unwrap(), None);
     }
-
-    // ─── flag_u16 ─────────────────────────────────────────────────────────────
-
-    #[test]
-    fn cli_only_port_flag_is_refused_by_api_profile() {
-        let f = make_frontend("api start", &["--port", "9876"]);
-        assert!(matches!(
-            f.flag_u16(&["api", "start"], "port").unwrap_err(),
-            CommandError::UnknownFlag { flag, .. } if flag.contains("port")
-        ));
-    }
-
-    // ─── argument (positional) ────────────────────────────────────────────────
 
     #[test]
     fn argument_exec_prompt_maps_positional_to_prompt() {

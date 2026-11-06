@@ -873,3 +873,106 @@ fn no_probed_payload_still_reads_the_store() {
     );
     assert_eq!(loads.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
+
+#[test]
+fn live_backend_switch_preserves_overlay_and_opt_out_stops_writes() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct Recording(Arc<AtomicUsize>);
+    impl DaemonEnvStore for Recording {
+        fn backend_name(&self) -> &'static str {
+            "keychain"
+        }
+        fn store(&self, _: &DaemonEnvMap) -> Result<(), DataError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        fn load(&self) -> Result<Option<DaemonEnvMap>, DataError> {
+            Ok(None)
+        }
+        fn clear(&self) -> Result<(), DataError> {
+            Ok(())
+        }
+    }
+    let _lock = guard();
+    let state = state();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let overlay = DaemonEnvMap::from_pairs([("TOKEN", "held-in-memory")]);
+    set_daemon_overlay(overlay.clone());
+    state.replace_store(Box::new(Recording(calls.clone())), EnvPersistence::Keychain);
+    state.persist(&overlay);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    state.replace_store(Box::new(NoStore), EnvPersistence::None);
+    state.persist(&overlay);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(state.persistence(), EnvPersistence::None);
+    assert_eq!(
+        daemon_overlay_snapshot().get("TOKEN"),
+        Some("held-in-memory")
+    );
+    state.replace_store(Box::new(Recording(calls.clone())), EnvPersistence::Keychain);
+    state.persist(&overlay);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn opt_out_waits_for_an_actual_in_progress_write() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct Blocked {
+        started: std::sync::mpsc::SyncSender<()>,
+        release: Arc<(Mutex<bool>, std::sync::Condvar)>,
+        calls: Arc<AtomicUsize>,
+    }
+    impl DaemonEnvStore for Blocked {
+        fn backend_name(&self) -> &'static str {
+            "keychain"
+        }
+        fn store(&self, _: &DaemonEnvMap) -> Result<(), DataError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.started.send(()).unwrap();
+            let (lock, ready) = &*self.release;
+            let mut released = lock.lock().unwrap();
+            while !*released {
+                released = ready.wait(released).unwrap();
+            }
+            Ok(())
+        }
+        fn load(&self) -> Result<Option<DaemonEnvMap>, DataError> {
+            Ok(None)
+        }
+        fn clear(&self) -> Result<(), DataError> {
+            Ok(())
+        }
+    }
+    let (started, rx) = std::sync::mpsc::sync_channel(1);
+    let release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let state = Arc::new(DaemonEnvState::new(
+        Box::new(Blocked {
+            started,
+            release: release.clone(),
+            calls: calls.clone(),
+        }),
+        EnvPersistence::Keychain,
+        Salt::random(),
+    ));
+    let writer = state.clone();
+    let write =
+        std::thread::spawn(move || writer.persist(&DaemonEnvMap::from_pairs([("TOKEN", "value")])));
+    rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+    let transition = state.clone();
+    let (done, completed) = std::sync::mpsc::sync_channel(1);
+    let opt_out = std::thread::spawn(move || {
+        transition.replace_store(Box::new(NoStore), EnvPersistence::None);
+        done.send(()).unwrap();
+    });
+    assert!(completed
+        .recv_timeout(std::time::Duration::from_millis(20))
+        .is_err());
+    *release.0.lock().unwrap() = true;
+    release.1.notify_all();
+    write.join().unwrap();
+    opt_out.join().unwrap();
+    completed.recv().unwrap();
+    state.persist(&DaemonEnvMap::from_pairs([("TOKEN", "new-value")]));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}

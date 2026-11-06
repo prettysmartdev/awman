@@ -146,7 +146,7 @@ fn wi0149_flag_parsing_and_identity_validation_matrix() {
 }
 #[test]
 fn wi0149_remote_frontends_refuse_widening_but_accept_narrowing() {
-    for kind in [FrontendKind::Api, FrontendKind::Background] {
+    for kind in [FrontendKind::WORKER_LOCAL, FrontendKind::SQUAD_LOCAL] {
         for flags in [
             PrerequisiteFlags {
                 ssh: Some(SshFlag::All),
@@ -231,7 +231,7 @@ fn wi0149_remote_grants_are_limited_to_the_operators_exact_key_and_env_list() {
         ),
     ] {
         assert_eq!(
-            check_flag_widening(FrontendKind::Api, &flags, &policy).is_ok(),
+            check_flag_widening(FrontendKind::WORKER_LOCAL, &flags, &policy).is_ok(),
             allowed
         );
     }
@@ -489,8 +489,8 @@ fn wi0149_repo_acquire_requires_exact_hash_approval_in_all_headless_frontends() 
         PrerequisiteStatus::Missing,
     )]);
     for kind in [
-        FrontendKind::Api,
-        FrontendKind::Background,
+        FrontendKind::WORKER_LOCAL,
+        FrontendKind::SQUAD_LOCAL,
         FrontendKind::Cli,
     ] {
         let session = Session::for_tests_isolated(dir.path(), dir.path());
@@ -672,8 +672,8 @@ fn wi0149_repo_allow_and_acquire_cannot_grant_to_api_squad_or_headless_cli() {
     );
     std::fs::write(repo.join(".awman/config.json"), serde_json::json!({"workflows":{"prerequisites":{"ssh":{"use":"allow","key":key},"githubToken":{"use":"allow"}}}}).to_string()).unwrap();
     for kind in [
-        FrontendKind::Api,
-        FrontendKind::Background,
+        FrontendKind::WORKER_LOCAL,
+        FrontendKind::SQUAD_LOCAL,
         FrontendKind::Cli,
     ] {
         let session = Session::for_tests_with_env(

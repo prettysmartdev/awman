@@ -92,7 +92,6 @@ pub(super) fn render_dialog(dialog: &dialogs::Dialog, area: Rect, frame: &mut Fr
             render_squad_history(state, area, frame);
         }
         dialogs::Dialog::SquadStartConfirm => squad::render_start_confirm(area, frame),
-        dialogs::Dialog::SquadKeyMissing => squad::render_key_missing(area, frame),
         dialogs::Dialog::SquadRemoveConfirm { name } => {
             squad::render_remove_confirm(name, area, frame)
         }

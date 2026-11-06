@@ -315,7 +315,7 @@ fn explain_unreachable(addr: Option<&str>, error: CommandError) -> CommandError 
     };
     let hint = if RemoteClient::is_loopback_addr(addr) {
         format!(
-            "is the API server running on this machine at {addr}? Start it with `awman api start`"
+            "is the awman daemon running on this machine at {addr} with its network listener on? Start it with `awman daemon start` and set `daemon.network.enabled true`"
         )
     } else {
         format!(
@@ -1068,7 +1068,7 @@ mod tests {
         assert!(remote.contains("listens on 127.0.0.1 only"), "{remote}");
         assert!(remote.contains("ssh -N -L"), "{remote}");
         let local = explain_unreachable(Some("https://127.0.0.1:9876"), refused()).to_string();
-        assert!(local.contains("awman api start"), "{local}");
+        assert!(local.contains("awman daemon start"), "{local}");
         // Other errors, and calls with no address, are left alone.
         assert!(matches!(
             explain_unreachable(Some("https://build-host:9876"), CommandError::RemoteTimeout),

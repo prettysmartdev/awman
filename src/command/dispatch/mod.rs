@@ -12,11 +12,11 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use crate::command::commands::agents::{AgentsCommand, AgentsCommandFrontend};
-use crate::command::commands::api_server::{ApiServerCommand, ApiServerCommandFrontend};
 use crate::command::commands::chat::{ChatCommand, ChatCommandFrontend};
 use crate::command::commands::clean::{CleanCommand, CleanCommandFrontend};
 use crate::command::commands::config::{ConfigCommand, ConfigCommandFrontend};
 use crate::command::commands::daemon::api::{DaemonApiCommand, DaemonApiCommandFrontend};
+use crate::command::commands::daemon::lifecycle::{DaemonCommand, DaemonCommandFrontend};
 use crate::command::commands::exec_prompt::{ExecPromptCommand, ExecPromptCommandFrontend};
 use crate::command::commands::exec_workflow::{ExecWorkflowCommand, ExecWorkflowCommandFrontend};
 use crate::command::commands::init::{InitCommand, InitCommandFrontend};
@@ -28,7 +28,7 @@ use crate::command::commands::squad::attach::{SquadAttachCommand, SquadAttachFro
 use crate::command::commands::squad::commands::{SquadCommand, SquadCommandFrontend};
 use crate::command::commands::squad::gateway::TaskGateway;
 use crate::command::commands::squad::runtime_guard::require_container_tier;
-use crate::command::commands::squad::supervisor::SquadGatewayResolver;
+use crate::command::commands::squad::supervisor::DaemonResolver;
 use crate::command::commands::Command;
 use crate::command::dispatch::catalogue::{CommandCatalogue, FrontendKind, GatewayNeed};
 use crate::command::error::CommandError;
@@ -122,7 +122,7 @@ pub trait DispatchFrontend:
     + ConfigCommandFrontend
     + ExecPromptCommandFrontend
     + ExecWorkflowCommandFrontend
-    + ApiServerCommandFrontend
+    + DaemonCommandFrontend
     + DaemonApiCommandFrontend
     + SquadCommandFrontend
     + SquadAttachFrontend
@@ -143,7 +143,7 @@ impl<T> DispatchFrontend for T where
         + ConfigCommandFrontend
         + ExecPromptCommandFrontend
         + ExecWorkflowCommandFrontend
-        + ApiServerCommandFrontend
+        + DaemonCommandFrontend
         + DaemonApiCommandFrontend
         + SquadCommandFrontend
         + SquadAttachFrontend
@@ -169,7 +169,7 @@ pub enum BuiltCommand {
     Config(ConfigCommand),
     ExecPrompt(ExecPromptCommand),
     ExecWorkflow(ExecWorkflowCommand),
-    ApiServer(ApiServerCommand),
+    Daemon(DaemonCommand),
     DaemonApi(DaemonApiCommand),
     Squad(SquadCommand),
     SquadAttach(SquadAttachCommand),
@@ -533,20 +533,9 @@ impl<F: DispatchFrontend> Dispatch<F> {
         if spec.gateway_need == GatewayNeed::None || self.squad_gateway.is_some() {
             return Ok(());
         }
-        // The live process environment, not the session's startup snapshot: a
-        // key minted earlier in this process is published into the former (see
-        // `SquadSupervisor`), and the snapshot predates it.
-        let resolver =
-            SquadGatewayResolver::from_env(&crate::data::config::env::Env::from_process())?;
-        let gateway = resolver.gateway_for(spec.gateway_need).await?;
-        // The only moment the plaintext key exists outside the daemon's hash
-        // file. A frontend that cannot show it drops it (see the trait's
-        // default), which is why this is offered before the command runs
-        // rather than folded into its output.
-        if let Some(setup) = resolver.take_key_setup() {
-            self.frontend.show_key_setup(&setup);
-        }
-        self.squad_gateway = gateway;
+        let env = self.session.read().await.env().clone();
+        let resolver = DaemonResolver::from_env(&env)?;
+        self.squad_gateway = resolver.gateway_for(spec.gateway_need).await?;
         Ok(())
     }
 
@@ -703,7 +692,7 @@ impl BuiltCommand {
             Agents => AgentsCommandFrontend,
             Config => ConfigCommandFrontend,
             ExecPrompt => ExecPromptCommandFrontend,
-            ApiServer => ApiServerCommandFrontend,
+            Daemon => DaemonCommandFrontend,
             DaemonApi => DaemonApiCommandFrontend,
             Squad => SquadCommandFrontend,
             SquadAttach => SquadAttachFrontend,
@@ -964,7 +953,7 @@ mod tests {
         for (kind, local) in [
             (FrontendKind::Cli, true),
             (FrontendKind::Tui, true),
-            (FrontendKind::Api, false),
+            (FrontendKind::WORKER_LOCAL, false),
         ] {
             let caller = CallerContext::new(&["squad", "add"], kind);
             assert_eq!(caller.frontend(), kind);
@@ -1057,7 +1046,7 @@ mod tests {
         match built {
             BuiltCommand::Squad(command) => assert!(matches!(
                 command.subcommand(),
-                crate::command::commands::squad::commands::SquadSubcommand::Status(_)
+                crate::command::commands::squad::commands::SquadSubcommand::Status
             )),
             _ => panic!("expected Squad"),
         }
@@ -1235,14 +1224,22 @@ mod tests {
     }
 
     #[test]
-    fn build_api_start() {
+    fn build_daemon_verbs() {
         let dispatch = Dispatch::new(
             FakeCommandFrontend::new(),
             make_session(),
             Engines::for_tests(std::path::Path::new("/tmp")),
         );
-        let built = dispatch.build_command(&["api", "start"]).unwrap();
-        assert!(matches!(built, BuiltCommand::ApiServer(_)));
+        for verb in ["start", "stop", "status", "logs"] {
+            let built = dispatch.build_command(&["daemon", verb]).unwrap();
+            assert!(matches!(built, BuiltCommand::Daemon(_)), "{verb}");
+        }
+        assert!(matches!(
+            dispatch.build_command(&["daemon", "api"]),
+            Err(_) | Ok(BuiltCommand::DaemonApi(_))
+        ));
+        assert!(dispatch.build_command(&["api", "start"]).is_err());
+        assert!(dispatch.build_command(&["squad", "start"]).is_err());
     }
 
     #[test]

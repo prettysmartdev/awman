@@ -19,7 +19,7 @@ use awman::engine::auth::AuthEngine;
 use awman::engine::container::ContainerRuntime;
 use awman::engine::git::GitEngine;
 use awman::engine::overlay::OverlayEngine;
-use awman::frontend::api::routes::{build_router, AppState, AuthMode};
+use awman::frontend::api::routes::{build_router, AppState};
 
 fn state(root: &Path, workdirs: Vec<PathBuf>, roots: Vec<PathBuf>) -> Arc<AppState> {
     let paths = ApiPaths::from_root(root);
@@ -62,7 +62,6 @@ fn state(root: &Path, workdirs: Vec<PathBuf>, roots: Vec<PathBuf>) -> Arc<AppSta
         workdir_roots: roots,
         started_at: Instant::now(),
         task_handles: tokio::sync::Mutex::new(Vec::new()),
-        auth_mode: AuthMode::Disabled,
         engines,
         sessions: Arc::new(awman::data::session_manager::SessionManager::in_memory(
             awman::data::config::env::EnvSnapshot::empty(),

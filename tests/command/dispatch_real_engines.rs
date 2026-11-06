@@ -53,8 +53,9 @@ fn catalogue_has_exec_command() {
 }
 
 #[test]
-fn catalogue_has_api_command() {
-    assert!(top_level_names().contains(&"api"));
+fn catalogue_has_daemon_command_and_no_api_group() {
+    assert!(top_level_names().contains(&"daemon"));
+    assert!(!top_level_names().contains(&"api"));
 }
 
 #[test]
@@ -101,12 +102,11 @@ fn exec_has_prompt_and_workflow_subcommands() {
 }
 
 #[test]
-fn api_has_start_kill_logs_status_subcommands() {
-    let names = subcommand_names("api");
-    assert!(names.contains(&"start"));
-    assert!(names.contains(&"kill"));
-    assert!(names.contains(&"logs"));
-    assert!(names.contains(&"status"));
+fn daemon_has_the_five_verbs() {
+    assert_eq!(
+        subcommand_names("daemon"),
+        ["start", "stop", "status", "logs", "api"]
+    );
 }
 
 #[test]
@@ -210,31 +210,19 @@ fn exec_workflow_has_wf_alias() {
 }
 
 #[test]
-fn api_start_reads_listen_from_config() {
+fn daemon_start_reads_its_settings_from_config() {
     let cat = CommandCatalogue::get();
-    let start = cat.lookup(&["api", "start"]).unwrap();
-    assert!(start.find_flag("port").is_none());
-}
-
-#[test]
-fn api_start_has_background_flag() {
-    let cat = CommandCatalogue::get();
-    let start = cat.lookup(&["api", "start"]).unwrap();
+    let start = cat.lookup(&["daemon", "start"]).unwrap();
     assert!(start.find_flag("background").is_some());
-}
-
-#[test]
-fn api_start_has_refresh_key_flag() {
-    let cat = CommandCatalogue::get();
-    let start = cat.lookup(&["api", "start"]).unwrap();
-    assert!(start.find_flag("refresh-key").is_some());
-}
-
-#[test]
-fn api_start_has_dangerously_skip_auth_flag() {
-    let cat = CommandCatalogue::get();
-    let start = cat.lookup(&["api", "start"]).unwrap();
-    assert!(start.find_flag("dangerously-skip-auth").is_some());
+    for gone in [
+        "port",
+        "refresh-key",
+        "dangerously-skip-auth",
+        "dangerously-skip-tls",
+    ] {
+        assert!(start.find_flag(gone).is_none(), "--{gone}");
+    }
+    assert!(cat.lookup(&["api", "start"]).is_none());
 }
 
 #[test]

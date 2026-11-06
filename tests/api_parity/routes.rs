@@ -60,11 +60,16 @@ fn api_paths_tls_dir_under_root() {
 /// `/v1/worker/commands/{id}/events`, and added `GET /v1/worker/sessions/:id/queue` and
 /// `GET /v1/worker/commands/:id/status`. WI 0138 added `GET /v1/worker/commands/:id`.
 const EXPECTED_ROUTES: &[(&str, &str)] = &[
+    ("GET", "/v1/health"),
+    ("GET", "/v1/keys"),
+    ("POST", "/v1/keys"),
+    ("DELETE", "/v1/keys/{id}"),
     ("GET", "/v1/status"),
     ("GET", "/v1/config"),
     ("POST", "/v1/config/reload"),
     ("GET", "/v1/features"),
     ("GET", "/v1/features/{feature}"),
+    ("PATCH", "/v1/features/{feature}"),
     ("GET", "/v1/grants"),
     ("DELETE", "/v1/grants/{id}"),
     ("GET", "/v1/worker/workdirs"),
@@ -119,14 +124,41 @@ fn route_table_has_exactly_the_contract_and_one_owner_per_operation() {
     }
 }
 #[test]
-fn every_client_action_is_exactly_its_resource_route() {
-    use awman::command::commands::daemon::actions::{route, ACTIONS};
+fn every_client_action_is_a_registered_route() {
+    use awman::command::commands::daemon::actions::ACTIONS;
     use awman::frontend::api::routes::ROUTES;
     for a in ACTIONS {
-        let r = ROUTES.iter().find(|r| r.op == a.op).unwrap();
-        let (method, path) = route(a.op);
-        assert_eq!((method, path.as_str()), (r.method, r.path));
+        assert!(
+            ROUTES
+                .iter()
+                .any(|r| r.method == a.method && r.path == a.path),
+            "action {} targets {} {} which is not a route",
+            a.name,
+            a.method,
+            a.path
+        );
     }
+}
+
+#[test]
+fn key_routes_are_local_socket_only() {
+    use awman::frontend::api::routes::ROUTES;
+    let keys: Vec<_> = ROUTES
+        .iter()
+        .filter(|r| r.path.starts_with("/v1/keys"))
+        .collect();
+    assert_eq!(keys.len(), 3);
+    assert!(keys.iter().all(|r| r.local_only));
+}
+
+/// WI 0140 §3: `PATCH /v1/features/{feature}` is the ephemeral enable/disable
+/// route. The router does not register it yet (0140-test-findings.md F1).
+#[test]
+fn patch_features_route_is_registered() {
+    use awman::frontend::api::routes::ROUTES;
+    assert!(ROUTES
+        .iter()
+        .any(|r| r.method == "PATCH" && r.path == "/v1/features/{feature}"));
 }
 
 // ─── SqliteSessionStore as API persistence layer ────────────────────────

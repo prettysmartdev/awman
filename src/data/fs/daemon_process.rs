@@ -1,10 +1,9 @@
 //! `DaemonProcess` — PID-file lifecycle and server-meta persistence for a
-//! long-lived awman daemon (the API server or squad).
+//! single awman daemon.
 //!
 //! Layer 0 owns the on-disk state: the PID file, the `ServerMeta` sidecar,
-//! the daemon's paths, and the systemd unit name / launchd plist label that
-//! identify it, so two daemons never collide on `--unit=awman-api` or the
-//! `io.awman.api` plist.
+//! the daemon's paths, and its fixed `awman-daemon` systemd unit and
+//! `io.awman.daemon` launchd label.
 //!
 //! The *process* half — liveness probes, `systemd-run`, launchd, the direct
 //! spawn, SIGTERM/`taskkill` — moved to `engine::daemon::DaemonSupervisor` in
@@ -20,12 +19,14 @@ use crate::data::fs::config_file::write_config_file_atomically;
 use crate::data::fs::daemon_paths::DaemonPaths;
 
 /// systemd unit name / launchd plist label for the API daemon.
-pub const API_UNIT_NAME: &str = "awman-api";
-pub const API_PLIST_LABEL: &str = "io.awman.api";
+pub const DAEMON_UNIT_NAME: &str = "awman-daemon";
+pub const DAEMON_PLIST_LABEL: &str = "io.awman.daemon";
+pub const API_UNIT_NAME: &str = DAEMON_UNIT_NAME;
+pub const API_PLIST_LABEL: &str = DAEMON_PLIST_LABEL;
 
 /// systemd unit name / launchd plist label for the squad daemon.
-pub const SQUAD_UNIT_NAME: &str = "awman-squad";
-pub const SQUAD_PLIST_LABEL: &str = "io.awman.squad";
+pub const SQUAD_UNIT_NAME: &str = DAEMON_UNIT_NAME;
+pub const SQUAD_PLIST_LABEL: &str = DAEMON_PLIST_LABEL;
 
 /// Sidecar metadata for a running daemon. Written next to the PID file when
 /// the server boots so other commands (status, kill) can locate the bound
@@ -52,12 +53,17 @@ pub struct DaemonProcess {
 
 impl DaemonProcess {
     /// Construct over a daemon's paths and its systemd/launchd identity.
-    pub fn new(paths: DaemonPaths, unit_name: &'static str, plist_label: &'static str) -> Self {
+    pub fn new(paths: DaemonPaths, _unit_name: &'static str, _plist_label: &'static str) -> Self {
         Self {
             paths,
-            unit_name,
-            plist_label,
+            unit_name: DAEMON_UNIT_NAME,
+            plist_label: DAEMON_PLIST_LABEL,
         }
+    }
+
+    /// Unified constructor; `new` is a temporary legacy shim.
+    pub fn unified(paths: DaemonPaths) -> Self {
+        Self::new(paths, DAEMON_UNIT_NAME, DAEMON_PLIST_LABEL)
     }
 
     /// The daemon's paths.
@@ -138,10 +144,16 @@ impl DaemonProcess {
 
 /// Truncating PID write — overwrites whatever is already on disk.
 pub(crate) fn write_pid(pid_path: &Path, pid: u32) -> Result<(), DataError> {
-    if let Some(parent) = pid_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| DataError::io(parent, e))?;
+    let parent = pid_path.parent().unwrap_or_else(|| Path::new("."));
+    if !parent.exists() {
+        crate::data::fs::private_files::create_private_dir(parent)?;
     }
-    std::fs::write(pid_path, pid.to_string()).map_err(|e| DataError::io(pid_path, e))
+    let mut file = tempfile::NamedTempFile::new_in(parent).map_err(|e| DataError::io(parent, e))?;
+    std::io::Write::write_all(&mut file, pid.to_string().as_bytes())
+        .map_err(|e| DataError::io(pid_path, e))?;
+    file.persist(pid_path)
+        .map_err(|e| DataError::io(pid_path, e.error))?;
+    Ok(())
 }
 
 /// Race-safe PID write via `O_CREAT|O_EXCL`. `Ok(false)` when the file exists.
@@ -156,7 +168,9 @@ pub(crate) fn write_pid(pid_path: &Path, pid: u32) -> Result<(), DataError> {
 /// seeing the claim or finding nothing.
 pub(crate) fn write_pid_exclusive(pid_path: &Path, pid: u32) -> Result<bool, DataError> {
     if let Some(parent) = pid_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| DataError::io(parent, e))?;
+        if !parent.exists() {
+            crate::data::fs::private_files::create_private_dir(parent)?;
+        }
     }
     let tmp_path = pid_path.with_file_name(format!(
         "{}.tmp.{}",
@@ -164,9 +178,13 @@ pub(crate) fn write_pid_exclusive(pid_path: &Path, pid: u32) -> Result<bool, Dat
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("pidfile"),
-        std::process::id()
+        uuid::Uuid::new_v4()
     ));
-    std::fs::write(&tmp_path, pid.to_string()).map_err(|e| DataError::io(&tmp_path, e))?;
+    let mut file = crate::data::fs::private_files::create_private_file_new(&tmp_path)?;
+    if let Err(e) = std::io::Write::write_all(&mut file, pid.to_string().as_bytes()) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(DataError::io(&tmp_path, e));
+    }
     let result = std::fs::hard_link(&tmp_path, pid_path);
     let _ = std::fs::remove_file(&tmp_path);
     match result {
@@ -301,11 +319,7 @@ mod tests {
     }
 
     fn api_daemon(root: &Path) -> DaemonProcess {
-        DaemonProcess::new(
-            DaemonPaths::new(root, "api_key"),
-            API_UNIT_NAME,
-            API_PLIST_LABEL,
-        )
+        DaemonProcess::new(DaemonPaths::new(root), API_UNIT_NAME, API_PLIST_LABEL)
     }
 
     #[test]
@@ -390,8 +404,8 @@ mod tests {
     }
 
     #[test]
-    fn distinct_unit_and_plist_for_api_and_squad() {
-        assert_ne!(API_UNIT_NAME, SQUAD_UNIT_NAME);
-        assert_ne!(API_PLIST_LABEL, SQUAD_PLIST_LABEL);
+    fn legacy_selectors_share_unit_and_plist() {
+        assert_eq!(API_UNIT_NAME, SQUAD_UNIT_NAME);
+        assert_eq!(API_PLIST_LABEL, SQUAD_PLIST_LABEL);
     }
 }

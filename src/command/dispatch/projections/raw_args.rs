@@ -186,7 +186,7 @@ pub(crate) fn frontend_flag_defaults(frontend: FrontendKind) -> &'static [Fronte
     match frontend {
         // The squad daemon runs unattended for the same reasons the API
         // server does, and applies the same profile.
-        FrontendKind::Api | FrontendKind::Background => API_FLAG_DEFAULTS,
+        FrontendKind::Daemon { .. } => API_FLAG_DEFAULTS,
         // CLI and TUI resolve flag defaults through clap / the command layer;
         // no profile overrides apply, guaranteeing this mechanism cannot alter
         // their behavior.
@@ -744,22 +744,6 @@ mod tests {
     }
 
     #[test]
-    fn u16_type_mismatch_is_structured_error() {
-        let err = cat()
-            .parse_raw_args(&["squad", "start"], &argv(&["--port", "not-a-number"]))
-            .unwrap_err();
-        assert!(matches!(err, CommandError::InvalidFlagValue { .. }));
-    }
-
-    #[test]
-    fn u16_flag_coerces_value() {
-        let p = cat()
-            .parse_raw_args(&["squad", "start"], &argv(&["--port", "9876"]))
-            .unwrap();
-        assert_eq!(p.flag_u16("port"), Some(9876));
-    }
-
-    #[test]
     fn bad_enum_value_is_structured_error() {
         let err = cat()
             .parse_raw_args(
@@ -773,7 +757,11 @@ mod tests {
     #[test]
     fn api_profile_forces_non_interactive_and_defaults_yolo() {
         let p = cat()
-            .parse_raw_args_with_profile(&["exec", "prompt"], &argv(&["hi"]), FrontendKind::Api)
+            .parse_raw_args_with_profile(
+                &["exec", "prompt"],
+                &argv(&["hi"]),
+                FrontendKind::WORKER_LOCAL,
+            )
             .unwrap();
         assert_eq!(p.flag_bool("headless"), Some(true));
         assert_eq!(p.flag_bool("yolo"), Some(true));
@@ -787,7 +775,11 @@ mod tests {
         // present, so yolo stays unset and dispatch sees a coherent request.
         // headless stays forced regardless.
         let p = cat()
-            .parse_raw_args_with_profile(&["exec", "prompt"], &argv(&["--plan"]), FrontendKind::Api)
+            .parse_raw_args_with_profile(
+                &["exec", "prompt"],
+                &argv(&["--plan"]),
+                FrontendKind::WORKER_LOCAL,
+            )
             .unwrap();
         assert_eq!(p.flag_bool("plan"), Some(true));
         assert_eq!(p.flag_bool("headless"), Some(true));
@@ -833,7 +825,11 @@ mod tests {
         // yolo is an overridable default, so if the request already set it the
         // profile must not clobber it.
         let p = cat()
-            .parse_raw_args_with_profile(&["exec", "prompt"], &argv(&["--yolo"]), FrontendKind::Api)
+            .parse_raw_args_with_profile(
+                &["exec", "prompt"],
+                &argv(&["--yolo"]),
+                FrontendKind::WORKER_LOCAL,
+            )
             .unwrap();
         assert_eq!(p.flag_bool("yolo"), Some(true));
     }
@@ -853,7 +849,6 @@ pub(crate) mod shared_cases {
         Str(&'static str, &'static str),
         Strs(&'static str, &'static [&'static str]),
         Path(&'static str, &'static str),
-        U16(&'static str, u16),
         Arg(&'static str, &'static str),
         Args(&'static str, &'static [&'static str]),
     }
@@ -950,15 +945,6 @@ pub(crate) mod shared_cases {
             api_reads: &[],
         },
         Case {
-            name: "the largest port arrives typed",
-            path: &["squad", "start"],
-            canonical: &["squad", "start"],
-            args: &["--port=65535"],
-            reads: &[Read::U16("port", 65535)],
-            tui_reads: &[],
-            api_reads: &[],
-        },
-        Case {
             name: "a path positional reads as both a path and an argument",
             path: WORKFLOW,
             canonical: WORKFLOW,
@@ -1025,8 +1011,11 @@ pub(crate) mod shared_cases {
         (PROMPT, &["-ab"], "UnknownFlag"),
         (&["nope"], &[], "UnknownCommand"),
         (WORKFLOW, &["a.toml", "stray"], "UnexpectedArgument"),
-        (&["squad", "start"], &["--port=65536"], "InvalidFlagValue"),
-        (&["squad", "start"], &["--port=abc"], "InvalidFlagValue"),
+        (
+            &["remote", "session", "start"],
+            &["--type=banana"],
+            "InvalidFlagValue",
+        ),
         (WORKFLOW, &["--max-concurrent=1"], "UnknownFlag"),
         (&["chat"], &["--launch-mode=acp"], "UnknownFlag"),
         (&["chat"], &["--non-interactive"], "UnknownFlag"),
@@ -1068,11 +1057,6 @@ pub(crate) mod shared_cases {
                 Read::Path(flag, want) => assert_eq!(
                     frontend.flag_path(path, flag).unwrap(),
                     Some(PathBuf::from(want)),
-                    "{name}: --{flag}"
-                ),
-                Read::U16(flag, want) => assert_eq!(
-                    frontend.flag_u16(path, flag).unwrap(),
-                    Some(want),
                     "{name}: --{flag}"
                 ),
                 Read::Arg(arg, want) => assert_eq!(

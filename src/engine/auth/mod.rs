@@ -1,9 +1,9 @@
 //! `engine::auth` — `AuthEngine`. Consolidates host-side agent credential
-//! resolution and API server authentication (API key generation,
-//! hashing, comparison, persistence, refresh, TLS material).
+//! resolution and the daemon network listener's credentials: named API keys
+//! ([`api_keys::ApiKeyStore`], hashes only) and its self-signed TLS identity
+//! ([`tls`], SANs from `daemon.network.tlsSans`).
 
-use std::net::IpAddr;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::SystemTime;
 
 use ring::digest;
@@ -12,15 +12,19 @@ use ring::rand::{SecureRandom, SystemRandom};
 use crate::data::config::agents::AgentAuthMode;
 use crate::data::fs::api_paths::ApiPaths;
 use crate::data::fs::auth_paths::AuthPathResolver;
-use crate::data::fs::daemon_paths::DaemonPaths;
 use crate::data::session::{AgentName, Session};
 use crate::engine::error::EngineError;
 
+pub mod api_keys;
 pub mod credential;
 pub mod github_token;
 pub mod host_secret_command;
 pub mod keychain;
 pub mod redaction;
+pub mod tls;
+
+pub use api_keys::{ApiKeyStore, KeyVerdict};
+pub use tls::TlsIdentity;
 
 use credential::{CredentialFingerprint, CredentialReadError, RefreshableCredentialSpec};
 
@@ -149,9 +153,15 @@ impl RefreshableCredentialDelivery {
 }
 
 /// Newtype around a generated API key (32 random bytes encoded as 64-char
-/// lowercase hex).
-#[derive(Debug, Clone)]
+/// lowercase hex). Its `Debug` output never shows the key.
+#[derive(Clone)]
 pub struct ApiKey(String);
+
+impl std::fmt::Debug for ApiKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ApiKey(<redacted>)")
+    }
+}
 
 impl ApiKey {
     pub fn from_string(s: impl Into<String>) -> Self {
@@ -175,61 +185,23 @@ impl ApiKeyHash {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AuthOutcome {
-    Authorized,
-    Unauthorized,
-    /// The daemon demands no key, so nothing was compared. Distinct from
-    /// `Authorized` so a caller can tell "this request proved a key" from
-    /// "this daemon asks for none".
-    Disabled,
-}
-
-/// Whether a daemon's HTTP surface demands a bearer key, and the hash it
-/// compares against when it does.
-///
-/// Lives at Layer 1 because it is an *auth* decision, not a transport one:
-/// both the API server and the squad daemon resolve it during bootstrap,
-/// before any router exists. Layer 3 only compares a presented key against it.
-#[derive(Clone, Debug)]
-pub enum AuthMode {
-    Enabled { key_hash: String },
-    Disabled,
-}
-
-impl AuthMode {
-    /// Resolve the mode for a daemon from its key-hash file plus a
-    /// `--dangerously-skip-auth` flag.
-    ///
-    /// `skip` short-circuits to [`AuthMode::Disabled`]; otherwise a missing
-    /// hash is fatal and names the command that mints one, because a daemon
-    /// that served with no hash would accept every request.
-    pub fn resolve_for_daemon(
-        paths: &DaemonPaths,
-        skip: bool,
-        refresh_hint: &str,
-    ) -> Result<AuthMode, EngineError> {
-        if skip {
-            return Ok(AuthMode::Disabled);
-        }
-        let hash = paths
-            .read_key_hash()
-            .map_err(EngineError::Data)?
-            .ok_or_else(|| {
-                EngineError::Auth(format!(
-                    "No API key hash on disk. Run `{refresh_hint}` to generate one."
-                ))
-            })?;
-        Ok(AuthMode::Enabled { key_hash: hash })
-    }
-}
-
 /// PEM-encoded TLS material.
-#[derive(Debug, Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct TlsMaterial {
     pub cert_pem: String,
     pub key_pem: String,
     pub fingerprint_sha256_hex: String,
+}
+
+/// The private key never reaches a log line through `{:?}`.
+impl std::fmt::Debug for TlsMaterial {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TlsMaterial")
+            .field("cert_pem", &self.cert_pem)
+            .field("key_pem", &"<redacted>")
+            .field("fingerprint_sha256_hex", &self.fingerprint_sha256_hex)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -446,266 +418,14 @@ impl AuthEngine {
             AgentAuthMode::Passthrough | AgentAuthMode::None => Ok(AgentCredentials::default()),
         }
     }
-
-    // ── API-key lifecycle ──────────────────────────────────────────────────
-
-    /// Generate a fresh 32-byte API key, hex-encoded (64 chars). The
-    /// format is stable so existing scripts/regex/docs keep working.
-    pub fn generate_api_key(&self) -> Result<ApiKey, EngineError> {
-        let mut buf = [0u8; 32];
-        SystemRandom::new()
-            .fill(&mut buf)
-            .map_err(|_| EngineError::Auth("failed to generate random bytes".into()))?;
-        Ok(ApiKey(hex_encode(&buf)))
-    }
-
-    /// Hash an API key (SHA-256 → hex).
-    pub fn hash_api_key(&self, key: &ApiKey) -> ApiKeyHash {
-        let h = digest::digest(&digest::SHA256, key.0.as_bytes());
-        ApiKeyHash(hex_encode(h.as_ref()))
-    }
-
-    /// Persist the hash to `<api-root>/api_key.hash` with mode 0o600 on Unix.
-    /// Delegates to `DaemonPaths::write_key_hash` so the secure-write logic
-    /// lives in Layer 0 and is shared by both daemons.
-    pub fn write_api_key_hash(&self, hash: &ApiKeyHash) -> Result<(), EngineError> {
-        self.api_paths.daemon().write_key_hash(&hash.0)?;
-        Ok(())
-    }
-
-    /// Read the persisted hash, or `None` when absent. Delegates to
-    /// `DaemonPaths::read_key_hash` (trim-on-read preserved).
-    pub fn read_api_key_hash(&self) -> Result<Option<ApiKeyHash>, EngineError> {
-        Ok(self.api_paths.daemon().read_key_hash()?.map(ApiKeyHash))
-    }
-
-    /// Constant-time API-key verification. Even when no hash exists on disk,
-    /// the implementation performs a sentinel comparison so timing does not
-    /// leak whether auth is configured.
-    pub fn verify_api_key(&self, presented: &ApiKey) -> Result<AuthOutcome, EngineError> {
-        let presented_hash = self.hash_api_key(presented);
-        let on_disk = self.read_api_key_hash()?;
-        let target = on_disk.unwrap_or_else(|| ApiKeyHash(SENTINEL_HASH.to_string()));
-
-        if constant_time_hex_eq(&presented_hash.0, &target.0) {
-            Ok(AuthOutcome::Authorized)
-        } else {
-            Ok(AuthOutcome::Unauthorized)
-        }
-    }
-
-    /// Resolve this daemon's [`AuthMode`] from its key-hash file.
-    ///
-    /// `skip` is the `--dangerously-skip-auth` flag. A missing hash with
-    /// `skip` unset is fatal and names the command that mints one: a daemon
-    /// that served with no hash would accept every request.
-    pub fn request_auth_mode(&self, skip: bool) -> Result<AuthMode, EngineError> {
-        AuthMode::resolve_for_daemon(&self.api_paths.daemon(), skip, API_KEY_REFRESH_HINT)
-    }
-
-    /// Verify a presented `Authorization` header value against `mode`.
-    ///
-    /// The header value is taken as the caller extracted it: `Bearer <key>`
-    /// (the prefix is matched case-insensitively) or a bare key. `None` means
-    /// the request carried no usable header.
-    ///
-    /// Two security properties live here rather than in a router, so neither
-    /// daemon can hold a second copy that drifts (WI 0114 F-14):
-    ///
-    /// * the comparison is constant-time over the hex digests;
-    /// * a request with no header still performs a full hash and compare
-    ///   against a sentinel, so an absent header, a malformed one and a wrong
-    ///   key all cost the same.
-    ///
-    /// [`AuthMode::Disabled`] authorises without comparing: there is nothing
-    /// to compare against, and the fact that auth is off is already public —
-    /// it is a flag the operator passed.
-    pub fn verify_bearer(&self, mode: &AuthMode, header: Option<&str>) -> AuthOutcome {
-        let AuthMode::Enabled { key_hash } = mode else {
-            return AuthOutcome::Disabled;
-        };
-        let supplied = header
-            .map(|value| match value.get(..7) {
-                Some(prefix) if prefix.eq_ignore_ascii_case("bearer ") => &value[7..],
-                _ => value,
-            })
-            .unwrap_or("");
-        let supplied_hash = self.hash_api_key(&ApiKey(supplied.to_string()));
-        if constant_time_hex_eq(&supplied_hash.0, key_hash) {
-            // An absent header hashes to a real digest, never to the target:
-            // the empty string is not a key any minting path can produce.
-            AuthOutcome::Authorized
-        } else {
-            AuthOutcome::Unauthorized
-        }
-    }
-
-    /// Generate, persist, and return a fresh API key (rotation).
-    pub fn refresh_api_key(&self) -> Result<ApiKey, EngineError> {
-        let key = self.generate_api_key()?;
-        let hash = self.hash_api_key(&key);
-        self.write_api_key_hash(&hash)?;
-        Ok(key)
-    }
-
-    // ── TLS material ───────────────────────────────────────────────────────
-
-    /// Generate or load a self-signed certificate for the bind IP. Idempotent
-    /// when the existing cert was generated for the same bind IP — the
-    /// authoritative record of the cert's bind IP is the `bind_ip` sidecar
-    /// next to the cert file (rather than substring-scanning the DER, which
-    /// is brittle for short IPv4 byte sequences).
-    ///
-    /// Returns `(material, regenerated)` so the caller can surface the
-    /// "TLS cert regenerated for new bind IP — pinned remote clients will
-    /// need to re-pin" warning.
-    pub fn ensure_self_signed_tls(
-        &self,
-        bind_ip: IpAddr,
-    ) -> Result<(TlsMaterial, bool), EngineError> {
-        let tls_dir = self.api_paths.tls_dir();
-        let cert_path = self.api_paths.tls_cert_file();
-        let key_path = self.api_paths.tls_key_file();
-        let bind_ip_path = self.api_paths.tls_bind_ip_file();
-        let fingerprint_path = self.api_paths.tls_fingerprint_file();
-
-        if cert_path.exists() && key_path.exists() {
-            let stored_ip = std::fs::read_to_string(&bind_ip_path)
-                .ok()
-                .map(|s| s.trim().to_string());
-            if stored_ip.as_deref() == Some(&bind_ip.to_string()) {
-                let material = self.load_tls_from_paths_with_fingerprint(
-                    &cert_path,
-                    &key_path,
-                    &fingerprint_path,
-                )?;
-                return Ok((material, false));
-            }
-        }
-
-        std::fs::create_dir_all(&tls_dir).map_err(|e| EngineError::io(&tls_dir, e))?;
-
-        let san_ip = bind_ip.to_string();
-        let sans = vec![san_ip.clone(), "localhost".to_string()];
-        let mut params = rcgen::CertificateParams::new(sans)
-            .map_err(|e| EngineError::Auth(format!("TLS cert params: {e}")))?;
-
-        let ip_short_hash = {
-            let h = digest::digest(&digest::SHA256, san_ip.as_bytes());
-            hex_encode(&h.as_ref()[..4])
-        };
-        params.distinguished_name = rcgen::DistinguishedName::new();
-        params.distinguished_name.push(
-            rcgen::DnType::CommonName,
-            format!("awman-api-{ip_short_hash}"),
-        );
-
-        params.not_before = rcgen::date_time_ymd(2024, 1, 1);
-        params.not_after = rcgen::date_time_ymd(2034, 1, 1);
-
-        let key_pair = rcgen::KeyPair::generate()
-            .map_err(|e| EngineError::Auth(format!("TLS keygen: {e}")))?;
-        let cert = params
-            .self_signed(&key_pair)
-            .map_err(|e| EngineError::Auth(format!("TLS self-sign: {e}")))?;
-
-        let cert_pem = cert.pem();
-        let key_pem = key_pair.serialize_pem();
-
-        std::fs::write(&cert_path, cert_pem.as_bytes())
-            .map_err(|e| EngineError::io(&cert_path, e))?;
-        write_file_secure(&key_path, key_pem.as_bytes())?;
-        std::fs::write(&bind_ip_path, san_ip.as_bytes())
-            .map_err(|e| EngineError::io(&bind_ip_path, e))?;
-
-        let fingerprint = {
-            let der_bytes: &[u8] = cert.der().as_ref();
-            let h = digest::digest(&digest::SHA256, der_bytes);
-            hex_encode(h.as_ref())
-        };
-
-        // Cache the fingerprint to a sidecar file so subsequent loads do not
-        // need to re-parse PEM/DER. This is the canonical authoritative
-        // record going forward; the file is informational only (not used for
-        // auth decisions).
-        std::fs::write(&fingerprint_path, fingerprint.as_bytes())
-            .map_err(|e| EngineError::io(&fingerprint_path, e))?;
-
-        Ok((
-            TlsMaterial {
-                cert_pem,
-                key_pem,
-                fingerprint_sha256_hex: fingerprint,
-            },
-            true,
-        ))
-    }
-
-    /// Load TLS material from explicit paths, reading the cached fingerprint
-    /// from the sidecar file rather than re-deriving it from PEM. Falls back
-    /// to recomputing-and-caching the fingerprint over the cert's DER bytes
-    /// when the sidecar is missing (e.g. legacy installs that predate the
-    /// sidecar). We rely on `rcgen` re-parsing of the PEM rather than a
-    /// hand-rolled base64 decoder.
-    fn load_tls_from_paths_with_fingerprint(
-        &self,
-        cert: &Path,
-        key: &Path,
-        fingerprint_sidecar: &Path,
-    ) -> Result<TlsMaterial, EngineError> {
-        let cert_pem = std::fs::read_to_string(cert).map_err(|e| EngineError::io(cert, e))?;
-        let key_pem = std::fs::read_to_string(key).map_err(|e| EngineError::io(key, e))?;
-
-        let fingerprint = match std::fs::read_to_string(fingerprint_sidecar) {
-            Ok(s) => s.trim().to_string(),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // Recompute over the PEM string itself; this is stable enough
-                // for an informational identifier and avoids pulling in a
-                // PEM/base64 dependency. Persist for next time.
-                let h = digest::digest(&digest::SHA256, cert_pem.as_bytes());
-                let f = hex_encode(h.as_ref());
-                let _ = std::fs::write(fingerprint_sidecar, f.as_bytes());
-                f
-            }
-            Err(e) => return Err(EngineError::io(fingerprint_sidecar, e)),
-        };
-
-        Ok(TlsMaterial {
-            cert_pem,
-            key_pem,
-            fingerprint_sha256_hex: fingerprint,
-        })
-    }
-
-    /// Legacy path-based loader retained for callers that did not write a
-    /// fingerprint sidecar. Hashes the PEM bytes directly (not DER) for
-    /// informational use.
-    pub fn load_tls_from_paths(&self, cert: &Path, key: &Path) -> Result<TlsMaterial, EngineError> {
-        let cert_pem = std::fs::read_to_string(cert).map_err(|e| EngineError::io(cert, e))?;
-        let key_pem = std::fs::read_to_string(key).map_err(|e| EngineError::io(key, e))?;
-        let h = digest::digest(&digest::SHA256, cert_pem.as_bytes());
-        Ok(TlsMaterial {
-            cert_pem,
-            key_pem,
-            fingerprint_sha256_hex: hex_encode(h.as_ref()),
-        })
-    }
 }
-
-/// Sentinel hash used by `verify_api_key` when no on-disk hash exists.
-/// 64 hex zeros.
-const SENTINEL_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
-
-/// The command that mints an API-mode key, named in the refusal a daemon
-/// raises when it finds no hash on disk.
-const API_KEY_REFRESH_HINT: &str = "awman api start --refresh-key";
 
 /// Constant-time comparison of two hex digests.
 ///
 /// Both are 64 hex characters from SHA-256 in every real call; the buffers are
 /// padded to a common length anyway, so a caller that ever passes something
 /// shorter compares in constant time rather than returning early on length.
-fn constant_time_hex_eq(a: &str, b: &str) -> bool {
+pub(crate) fn constant_time_hex_eq(a: &str, b: &str) -> bool {
     use subtle::ConstantTimeEq;
     let a = a.as_bytes();
     let b = b.as_bytes();
@@ -717,7 +437,7 @@ fn constant_time_hex_eq(a: &str, b: &str) -> bool {
     bool::from(a_buf.ct_eq(&b_buf))
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
+pub(crate) fn hex_encode(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for b in bytes {
         use std::fmt::Write as _;
@@ -726,24 +446,19 @@ fn hex_encode(bytes: &[u8]) -> String {
     out
 }
 
-fn write_file_secure(path: &Path, content: &[u8]) -> Result<PathBuf, EngineError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)
-            .map_err(|e| EngineError::io(path, e))?;
-        std::io::Write::write_all(&mut f, content).map_err(|e| EngineError::io(path, e))?;
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(path, content).map_err(|e| EngineError::io(path, e))?;
-    }
-    Ok(path.to_path_buf())
+/// Generate a fresh API key: 32 random bytes as 64 lowercase hex characters.
+pub(crate) fn generate_key() -> Result<ApiKey, EngineError> {
+    let mut buf = [0u8; 32];
+    SystemRandom::new()
+        .fill(&mut buf)
+        .map_err(|_| EngineError::Auth("failed to generate random bytes".into()))?;
+    Ok(ApiKey(hex_encode(&buf)))
+}
+
+/// SHA-256 of a presented or minted key, lowercase hex. Keys are 256-bit
+/// random values, so a fast unsalted digest is sufficient.
+pub(crate) fn hash_key(key: &str) -> String {
+    hex_encode(digest::digest(&digest::SHA256, key.as_bytes()).as_ref())
 }
 
 #[cfg(test)]
@@ -751,6 +466,7 @@ mod tests {
     use super::*;
     use crate::data::fs::api_paths::ApiPaths;
     use crate::data::fs::auth_paths::AuthPathResolver;
+    use std::path::Path;
 
     fn engine_with(home: &Path, api_root: &Path) -> AuthEngine {
         AuthEngine::with_paths(AuthPathResolver::at_home(home), ApiPaths::at_root(api_root))
@@ -771,340 +487,6 @@ mod tests {
         assert!(keychain::refreshable_spec_for(&agent).is_none());
         let creds = engine.agent_env_credentials(&agent).unwrap();
         assert!(creds.env_vars.is_empty());
-    }
-
-    // ── verify_bearer / request_auth_mode ────────────────────────────────────
-
-    fn enabled_for(key: &str) -> (AuthEngine, AuthMode) {
-        let tmp = tempfile::tempdir().expect("scratch");
-        let head = tmp.path().join("h");
-        std::fs::create_dir_all(&head).expect("api root");
-        let engine = engine_with(tmp.path(), &head);
-        let mode = AuthMode::Enabled {
-            key_hash: engine.hash_api_key(&ApiKey::from_string(key)).0,
-        };
-        std::mem::forget(tmp);
-        (engine, mode)
-    }
-
-    #[test]
-    fn verify_bearer_accepts_the_key_with_or_without_the_prefix() {
-        let (engine, mode) = enabled_for("s3cret");
-        for header in ["Bearer s3cret", "bearer s3cret", "BEARER s3cret", "s3cret"] {
-            assert_eq!(
-                engine.verify_bearer(&mode, Some(header)),
-                AuthOutcome::Authorized,
-                "{header:?} presents the right key"
-            );
-        }
-    }
-
-    #[test]
-    fn verify_bearer_rejects_a_wrong_key() {
-        let (engine, mode) = enabled_for("s3cret");
-        assert_eq!(
-            engine.verify_bearer(&mode, Some("Bearer wrong")),
-            AuthOutcome::Unauthorized
-        );
-    }
-
-    /// The timing-shape property, mirroring `verify_with_no_hash_rejects_
-    /// constant_time`: an absent header takes the same path as a wrong key —
-    /// hash, then constant-time compare — rather than returning early. A
-    /// short-circuit here would let a caller distinguish "this daemon wants a
-    /// key" from "this key is wrong" by timing alone.
-    #[test]
-    fn verify_bearer_with_no_header_still_hashes_and_compares() {
-        let (engine, mode) = enabled_for("s3cret");
-        assert_eq!(
-            engine.verify_bearer(&mode, None),
-            AuthOutcome::Unauthorized,
-            "an absent header is unauthorized, not a separate outcome"
-        );
-        // The empty string is a real input to the same digest, and no minting
-        // path can produce a key that hashes to the empty string's digest.
-        assert_ne!(
-            engine.hash_api_key(&ApiKey::from_string("")).0,
-            engine.hash_api_key(&ApiKey::from_string("s3cret")).0
-        );
-    }
-
-    #[test]
-    fn verify_bearer_reports_disabled_without_comparing() {
-        let (engine, _) = enabled_for("s3cret");
-        assert_eq!(
-            engine.verify_bearer(&AuthMode::Disabled, None),
-            AuthOutcome::Disabled
-        );
-        assert_eq!(
-            engine.verify_bearer(&AuthMode::Disabled, Some("Bearer anything")),
-            AuthOutcome::Disabled
-        );
-    }
-
-    #[test]
-    fn request_auth_mode_skips_and_refuses_a_missing_hash() {
-        let tmp = tempfile::tempdir().unwrap();
-        let head = tmp.path().join("h");
-        let engine = engine_with(tmp.path(), &head);
-
-        assert!(matches!(
-            engine.request_auth_mode(true).unwrap(),
-            AuthMode::Disabled
-        ));
-
-        let error = engine
-            .request_auth_mode(false)
-            .expect_err("no hash on disk must refuse rather than serve open");
-        let message = error.to_string();
-        assert!(
-            message.contains("awman api start --refresh-key"),
-            "the refusal must name the command that mints a key; got {message}"
-        );
-    }
-
-    #[test]
-    fn request_auth_mode_reads_the_hash_that_was_written() {
-        let tmp = tempfile::tempdir().unwrap();
-        let head = tmp.path().join("h");
-        std::fs::create_dir_all(&head).unwrap();
-        let engine = engine_with(tmp.path(), &head);
-        let key = engine.generate_api_key().unwrap();
-        engine
-            .write_api_key_hash(&engine.hash_api_key(&key))
-            .unwrap();
-
-        let mode = engine.request_auth_mode(false).unwrap();
-        assert_eq!(
-            engine.verify_bearer(&mode, Some(&format!("Bearer {}", key.as_str()))),
-            AuthOutcome::Authorized
-        );
-    }
-
-    #[test]
-    fn generate_then_verify_round_trip() {
-        let tmp = tempfile::tempdir().unwrap();
-        let head = tmp.path().join("h");
-        std::fs::create_dir_all(&head).unwrap();
-        let e = engine_with(tmp.path(), &head);
-        let key = e.generate_api_key().unwrap();
-        let hash = e.hash_api_key(&key);
-        e.write_api_key_hash(&hash).unwrap();
-        let outcome = e.verify_api_key(&key).unwrap();
-        assert_eq!(outcome, AuthOutcome::Authorized);
-    }
-
-    #[test]
-    fn verify_wrong_key_rejected() {
-        let tmp = tempfile::tempdir().unwrap();
-        let head = tmp.path().join("h");
-        std::fs::create_dir_all(&head).unwrap();
-        let e = engine_with(tmp.path(), &head);
-        let key = e.generate_api_key().unwrap();
-        let hash = e.hash_api_key(&key);
-        e.write_api_key_hash(&hash).unwrap();
-        let bogus = ApiKey::from_string("not-the-key");
-        assert_eq!(e.verify_api_key(&bogus).unwrap(), AuthOutcome::Unauthorized);
-    }
-
-    #[test]
-    fn verify_with_no_hash_rejects_constant_time() {
-        let tmp = tempfile::tempdir().unwrap();
-        let head = tmp.path().join("h");
-        let e = engine_with(tmp.path(), &head);
-        let key = ApiKey::from_string("anything");
-        assert_eq!(e.verify_api_key(&key).unwrap(), AuthOutcome::Unauthorized);
-    }
-
-    #[test]
-    fn read_api_key_hash_returns_none_when_absent() {
-        let tmp = tempfile::tempdir().unwrap();
-        let head = tmp.path().join("api");
-        let e = engine_with(tmp.path(), &head);
-        assert!(e.read_api_key_hash().unwrap().is_none());
-    }
-
-    #[test]
-    fn generate_api_key_produces_64_char_lowercase_hex() {
-        let tmp = tempfile::tempdir().unwrap();
-        let head = tmp.path().join("h");
-        let e = engine_with(tmp.path(), &head);
-        let key = e.generate_api_key().unwrap();
-        assert_eq!(key.as_str().len(), 64, "API key must be 64-char hex");
-        assert!(
-            key.as_str()
-                .chars()
-                .all(|c| c.is_ascii_hexdigit() && (c.is_ascii_digit() || c.is_ascii_lowercase())),
-            "API key must be lowercase hex; got {:?}",
-            key.as_str()
-        );
-    }
-
-    #[test]
-    fn hash_is_deterministic() {
-        let tmp = tempfile::tempdir().unwrap();
-        let head = tmp.path().join("h");
-        let e = engine_with(tmp.path(), &head);
-        let key = ApiKey::from_string("my-test-key");
-        let h1 = e.hash_api_key(&key);
-        let h2 = e.hash_api_key(&key);
-        assert_eq!(h1.as_str(), h2.as_str());
-    }
-
-    #[test]
-    fn verify_uses_sentinel_when_hash_absent_so_timing_path_runs() {
-        let tmp = tempfile::tempdir().unwrap();
-        let head = tmp.path().join("h");
-        let e = engine_with(tmp.path(), &head);
-        // Even without a stored hash the verify path must complete without panic
-        // (it compares against the sentinel). Outcome must be Unauthorized.
-        let key = ApiKey::from_string("guess-attempt");
-        let outcome = e.verify_api_key(&key).unwrap();
-        assert_eq!(outcome, AuthOutcome::Unauthorized);
-    }
-
-    #[test]
-    fn write_then_read_api_key_hash_round_trips() {
-        let tmp = tempfile::tempdir().unwrap();
-        let head = tmp.path().join("h");
-        std::fs::create_dir_all(&head).unwrap();
-        let e = engine_with(tmp.path(), &head);
-        let key = e.generate_api_key().unwrap();
-        let hash = e.hash_api_key(&key);
-        e.write_api_key_hash(&hash).unwrap();
-        let read_back = e.read_api_key_hash().unwrap().unwrap();
-        assert_eq!(hash.as_str(), read_back.as_str());
-    }
-
-    #[test]
-    fn ensure_self_signed_tls_generates_cert_and_key() {
-        let tmp = tempfile::tempdir().unwrap();
-        let head = tmp.path().join("api");
-        std::fs::create_dir_all(&head).unwrap();
-        let e = engine_with(tmp.path(), &head);
-
-        let bind_ip: std::net::IpAddr = "127.0.0.1".parse().unwrap();
-        let (material, regenerated) = e.ensure_self_signed_tls(bind_ip).unwrap();
-        assert!(regenerated, "first call must report regenerated=true");
-
-        // Both files must exist on disk.
-        assert!(
-            head.join("tls").join("cert.pem").exists(),
-            "cert.pem not written"
-        );
-        assert!(
-            head.join("tls").join("key.pem").exists(),
-            "key.pem not written"
-        );
-        assert!(
-            head.join("tls").join("bind_ip").exists(),
-            "bind_ip sidecar must be written"
-        );
-
-        // PEM content must be non-empty.
-        assert!(!material.cert_pem.is_empty(), "cert_pem must be non-empty");
-        assert!(!material.key_pem.is_empty(), "key_pem must be non-empty");
-
-        // Fingerprint must be a 64-char lowercase hex string (SHA-256).
-        assert_eq!(
-            material.fingerprint_sha256_hex.len(),
-            64,
-            "fingerprint must be 64 hex chars"
-        );
-        assert!(
-            material
-                .fingerprint_sha256_hex
-                .chars()
-                .all(|c| c.is_ascii_hexdigit()),
-            "fingerprint must be all hex digits"
-        );
-    }
-
-    #[test]
-    fn ensure_self_signed_tls_is_idempotent() {
-        let tmp = tempfile::tempdir().unwrap();
-        let head = tmp.path().join("api");
-        std::fs::create_dir_all(&head).unwrap();
-        let e = engine_with(tmp.path(), &head);
-
-        let bind_ip: std::net::IpAddr = "127.0.0.1".parse().unwrap();
-        let (m1, regen1) = e.ensure_self_signed_tls(bind_ip).unwrap();
-        let (m2, regen2) = e.ensure_self_signed_tls(bind_ip).unwrap();
-
-        assert!(regen1, "first call must regenerate");
-        assert!(!regen2, "second call must not regenerate");
-        assert_eq!(
-            m1.cert_pem, m2.cert_pem,
-            "second call must return byte-identical cert"
-        );
-        assert_eq!(
-            m1.fingerprint_sha256_hex, m2.fingerprint_sha256_hex,
-            "fingerprint must be stable across calls"
-        );
-    }
-
-    #[test]
-    fn ensure_self_signed_tls_regenerates_on_bind_ip_change() {
-        let tmp = tempfile::tempdir().unwrap();
-        let head = tmp.path().join("api");
-        std::fs::create_dir_all(&head).unwrap();
-        let e = engine_with(tmp.path(), &head);
-
-        let ip1: std::net::IpAddr = "127.0.0.1".parse().unwrap();
-        let ip2: std::net::IpAddr = "10.0.0.1".parse().unwrap();
-
-        let (m1, regen1) = e.ensure_self_signed_tls(ip1).unwrap();
-        let (m2, regen2) = e.ensure_self_signed_tls(ip2).unwrap();
-
-        assert!(regen1, "first call must regenerate");
-        assert!(regen2, "bind_ip change must trigger regeneration");
-        assert_ne!(
-            m1.cert_pem, m2.cert_pem,
-            "cert must be regenerated when bind_ip changes"
-        );
-        assert_ne!(
-            m1.fingerprint_sha256_hex, m2.fingerprint_sha256_hex,
-            "fingerprint must differ for different bind_ips"
-        );
-    }
-
-    #[test]
-    fn refresh_api_key_writes_hash_and_returns_plaintext() {
-        let tmp = tempfile::tempdir().unwrap();
-        let head = tmp.path().join("api");
-        std::fs::create_dir_all(&head).unwrap();
-        let e = engine_with(tmp.path(), &head);
-
-        let key = e.refresh_api_key().unwrap();
-
-        // Plaintext key must be non-empty.
-        assert!(!key.as_str().is_empty(), "returned key must be non-empty");
-
-        // Hash file must be on disk and match the SHA-256 of the plaintext key.
-        let hash_on_disk = e
-            .read_api_key_hash()
-            .unwrap()
-            .expect("hash file must exist");
-        let expected_hash = e.hash_api_key(&key);
-        assert_eq!(
-            hash_on_disk.as_str(),
-            expected_hash.as_str(),
-            "on-disk hash must be SHA-256 of the returned plaintext"
-        );
-
-        // On Unix, the hash file must have mode 0600.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let hash_path = head.join("api_key.hash");
-            let meta = std::fs::metadata(&hash_path).unwrap();
-            let mode = meta.permissions().mode() & 0o777;
-            assert_eq!(mode, 0o600, "hash file must have mode 0600, got {mode:o}");
-        }
-
-        // Verification with the returned plaintext must succeed.
-        let outcome = e.verify_api_key(&key).unwrap();
-        assert_eq!(outcome, AuthOutcome::Authorized);
     }
 
     // ── Part B: resolve_agent_auth auth-mode gating ───────────────────────────

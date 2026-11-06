@@ -220,15 +220,10 @@ pub(crate) fn format_error(err: &CommandError) -> String {
         CommandError::ApiWorkdirNotFound { path } => {
             format!("API workdir not found: {}", path.display())
         }
-        CommandError::ApiServerAlreadyRunning { pid } => {
-            format!(
-                "API server is already running on PID {pid}; run `awman api kill` first"
-            )
-        }
-        CommandError::ApiServerNotRunning => "API server is not running".into(),
-        CommandError::ApiServerAuthMissing => {
-            "no API key configured. Run `awman api start --refresh-key` first, or pass `--dangerously-skip-auth`.".into()
-        }
+        CommandError::DaemonNotRunning
+        | CommandError::DaemonAlreadyRunning { .. }
+        | CommandError::DaemonNoFeatures
+        | CommandError::DaemonHttpStatus { .. } => err.to_string(),
         CommandError::RemoteSessionMissing => {
             "no remote session id; pass --session <id> or run `awman remote session start` first".into()
         }
@@ -275,9 +270,6 @@ pub(crate) fn format_error(err: &CommandError) -> String {
         CommandError::NotAvailableForFrontend { command, frontend } => {
             format!("command `{command}` is not available via the {frontend} frontend")
         }
-        // The squad missing-key answer authors its own full text, including
-        // the variable to set and the command to mint a new key.
-        CommandError::SquadKeyMissing => err.to_string(),
         // Session-creation validation errors (surfaced by multi-session
         // frontends); their Display text is already user-appropriate.
         CommandError::SessionInvalidType { .. }
@@ -603,7 +595,7 @@ mod tests {
             CommandError::RemoteTimeout,
             CommandError::MissingRemoteAddress,
             CommandError::MissingApiKey,
-            CommandError::ApiServerAlreadyRunning { pid: 42 },
+            CommandError::DaemonAlreadyRunning { pid: 42 },
         ];
         for err in other_errors {
             assert_eq!(
@@ -673,10 +665,10 @@ mod tests {
     /// The squad daemon serves the squad subtree and nothing else, and the
     /// catalogue is what says so (F-50).
     #[test]
-    fn background_execution_never_admits_a_catalogue_request() {
+    fn squad_daemon_admits_only_its_noninteractive_subtree() {
         use crate::command::dispatch::catalogue::FrontendKind;
         let catalogue = CommandCatalogue::get();
-        assert!(!catalogue.is_allowed_for_frontend(FrontendKind::Background, &["squad", "list"]));
+        assert!(catalogue.is_allowed_for_frontend(FrontendKind::SQUAD_LOCAL, &["squad", "list"]));
         for outside in [
             vec!["exec", "workflow"],
             vec!["ready"],
@@ -684,14 +676,14 @@ mod tests {
             vec!["agents", "status"],
         ] {
             assert!(
-                !catalogue.is_allowed_for_frontend(FrontendKind::Background, &outside),
+                !catalogue.is_allowed_for_frontend(FrontendKind::SQUAD_LOCAL, &outside),
                 "{outside:?} is outside the squad subtree"
             );
         }
         // A squad leaf the API itself refuses (interactive/PTY) is refused
         // here too: `SquadDaemon` narrows the API profile, it does not widen
         // it.
-        assert!(!catalogue.is_allowed_for_frontend(FrontendKind::Background, &["squad", "attach"]));
+        assert!(!catalogue.is_allowed_for_frontend(FrontendKind::SQUAD_LOCAL, &["squad", "attach"]));
     }
 
     /// Which commands have a bare TUI form is the catalogue's fact, so

@@ -196,7 +196,7 @@ chat --set agents.launchMode=banana
 invalid value for `agents.launchMode`: expected one of stdio, acp, got "banana"
 ```
 
-A non-numeric value for a numeric flag (`squad start --port abc`) is rejected
+A non-numeric value for a numeric flag is rejected
 the same way. In both cases the text you typed stays in the box so you can fix
 just the bad part instead of retyping the whole command. A `-`-prefixed token
 is never accepted as a flag's value (`--agent -c` is a missing value for

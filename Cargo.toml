@@ -102,6 +102,7 @@ name = "awman"
 path = "src/lib.rs"
 
 [features]
+test-support = []
 default = []
 builtin-runtime = ["dep:microsandbox", "dep:microsandbox-cli", "dep:microsandbox-image", "dep:microsandbox-network", "dep:sqlx", "dep:msb_krun", "msb_krun/static-krunfw", "dep:hyper-rustls"]
 

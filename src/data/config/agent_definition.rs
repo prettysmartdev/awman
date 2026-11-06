@@ -1193,7 +1193,9 @@ mod tests {
             "['/usr/bin/pi']"
         };
         for command in ["['pi']", absolute] {
-            let source = format!("schema=1\ndisplay_name='Pi'\n[run]\ncommand=['pi']\n[ping]\ncommand={command}\n[image]\ninstall=['x']\n");
+            let source = format!(
+                "schema=1\ndisplay_name='Pi'\n[run]\ncommand=['pi']\n[ping]\ncommand={command}\n[image]\ninstall=['x']\n"
+            );
             let file: AgentDefinitionFile = toml::from_str(&source).unwrap();
             assert!(
                 file.validate().is_empty(),
@@ -1206,7 +1208,9 @@ mod tests {
             ("['./pi']", "ping.command[0]"),
             ("['bin/pi']", "ping.command[0]"),
         ] {
-            let source = format!("schema=1\ndisplay_name='Pi'\n[run]\ncommand=['pi']\n[ping]\ncommand={command}\n[image]\ninstall=['x']\n");
+            let source = format!(
+                "schema=1\ndisplay_name='Pi'\n[run]\ncommand=['pi']\n[ping]\ncommand={command}\n[image]\ninstall=['x']\n"
+            );
             let file: AgentDefinitionFile = toml::from_str(&source).unwrap();
             assert!(
                 file.validate()
@@ -1219,14 +1223,18 @@ mod tests {
         let long = std::iter::repeat_n("'x'", MAX_PING_TOKENS + 1)
             .collect::<Vec<_>>()
             .join(",");
-        let source = format!("schema=1\ndisplay_name='Pi'\n[run]\ncommand=['pi']\n[ping]\ncommand=['pi',{long}]\n[image]\ninstall=['x']\n");
+        let source = format!(
+            "schema=1\ndisplay_name='Pi'\n[run]\ncommand=['pi']\n[ping]\ncommand=['pi',{long}]\n[image]\ninstall=['x']\n"
+        );
         let file: AgentDefinitionFile = toml::from_str(&source).unwrap();
         assert!(file
             .validate()
             .iter()
             .any(|problem| problem.contains("ping.command: must have at most 16 tokens")));
         for token in ["bad\\u0000token", "bad\\ntoken"] {
-            let source = format!("schema=1\ndisplay_name='Pi'\n[run]\ncommand=['pi']\n[ping]\ncommand=['pi',\"{token}\"]\n[image]\ninstall=['x']\n");
+            let source = format!(
+                "schema=1\ndisplay_name='Pi'\n[run]\ncommand=['pi']\n[ping]\ncommand=['pi',\"{token}\"]\n[image]\ninstall=['x']\n"
+            );
             let file: AgentDefinitionFile = toml::from_str(&source).unwrap();
             assert!(
                 file.validate()

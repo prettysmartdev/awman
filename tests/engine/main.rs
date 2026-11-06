@@ -8,6 +8,7 @@
 mod helpers;
 
 mod acp_support;
+mod api_keys;
 mod container_docker;
 mod container_io;
 mod context_overlay;
@@ -18,6 +19,8 @@ mod daemon_supervisor;
 mod git_engine;
 mod issue_e2e;
 mod issue_integration;
+mod local_listener;
+mod network_tls;
 mod overlay_engine;
 mod process_env;
 mod sbx;

@@ -523,6 +523,7 @@ impl WorkflowEngine {
 
     /// Drive every in-flight per-step yolo countdown one tick. Independent per
     /// slot — expiry kills only that container and advances the queue.
+    #[allow(clippy::too_many_arguments)] // The parallel scheduler passes its coordinated phase queues together.
     pub(super) fn tick_parallel_yolo(
         &mut self,
         waits: &mut ParallelWaits,

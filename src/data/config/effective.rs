@@ -704,6 +704,16 @@ impl EffectiveConfig {
         DaemonSettings::from_merged(&self.merged.daemon.clone().unwrap_or_default())
     }
 
+    /// The typed network listener address after defaults and config layers.
+    pub fn network_listen(&self) -> crate::data::config::network::ListenAddr {
+        self.daemon().network.listen
+    }
+
+    /// The daemon features exposed through the network listener.
+    pub fn network_features(&self) -> Vec<crate::data::daemon_state::FeatureName> {
+        self.daemon().network.features
+    }
+
     /// `daemon.features.worker.push.workDirs.allow`.
     pub fn worker_push_work_dirs(&self) -> Vec<String> {
         self.daemon().worker.push_work_dirs

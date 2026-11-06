@@ -483,22 +483,6 @@ pub(super) fn handle_dialog_char(app: &mut App, c: char) {
             }
             _ => {}
         },
-        // `y` is the only recovery there is: the previous key was never stored
-        // in plaintext, so a working client means a *new* key, which means a
-        // new hash and a restarted daemon. `n` opens no tab — see the variant's
-        // doc comment.
-        Some(Dialog::SquadKeyMissing) => match c {
-            'y' | 'Y' => {
-                app.active_dialog = None;
-                app.start_squad_key_refresh();
-            }
-            'n' | 'N' => {
-                app.active_dialog = None;
-                app.status_bar.text =
-                    "squad needs a bearer key; the squad tab was not opened.".to_string();
-            }
-            _ => {}
-        },
         // WI 0110: `y` accepts starting a squad daemon in the background and
         // opening the tab; `n`/`Esc` opens no tab and starts nothing. The
         // dialog decides nothing itself — it only collects the consent

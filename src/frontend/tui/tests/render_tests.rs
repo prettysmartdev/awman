@@ -1663,33 +1663,6 @@ fn a_failed_squad_action_is_reported_in_the_hint_bar_not_above_the_card_grid() {
     );
 }
 
-/// The missing-key recovery has to explain three things a 401 does not: that
-/// the key is unrecoverable, what accepting will do, and what it costs.
-#[test]
-fn the_missing_key_dialog_explains_the_recovery_and_its_key_bindings() {
-    let mut app = make_app();
-    app.active_dialog = Some(Dialog::SquadKeyMissing);
-
-    let text = buffer_text(&render_app(&mut app, 100, 30));
-
-    assert!(
-        text.contains("AWMAN_SQUAD_KEY"),
-        "the variable to set must be named: {text}"
-    );
-    assert!(
-        text.contains("only once"),
-        "why the key cannot simply be looked up must be stated: {text}"
-    );
-    assert!(
-        text.contains("[y]") && text.contains("[n / Esc]"),
-        "both answers must be offered: {text}"
-    );
-    assert!(
-        text.contains("old key will stop working"),
-        "the cost of refreshing must be stated before it is accepted: {text}"
-    );
-}
-
 // ─── WI 0112: squad indicator, card colours, inactive command box ──────────
 
 /// Render and also report whether the terminal cursor was left visible.

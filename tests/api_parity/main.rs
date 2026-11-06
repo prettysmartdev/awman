@@ -1,12 +1,12 @@
 //! Headless parity tests (WI 0073).
 //!
 //! routes.rs       — verifies the route table and API paths.
-//! auth_modes.rs   — auth-mode-related path/type smoke checks.
+//! auth_modes.rs   — API-key store header verdicts (WI 0140).
 //! live_server.rs  — boots the real Axum router on an ephemeral port and
 //!                   hits it with reqwest. Tests are prefixed `real_network_`
 //!                   so `make test-fast` can skip them.
 //!
-//! SSE wire-format and WebSocket tests against a fully booted `awman api
+//! SSE wire-format and WebSocket tests against a fully booted `awman daemon
 //! start` subprocess are deferred to WI 0076.
 
 #[path = "../helpers/mod.rs"]
@@ -87,3 +87,4 @@ pub(crate) fn test_command_id(name: &str) -> String {
         .collect::<String>();
     format!("cmd_{hex:0<32}")
 }
+mod trace_propagation;

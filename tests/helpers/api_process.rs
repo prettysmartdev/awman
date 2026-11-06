@@ -1,4 +1,4 @@
-//! A real `awman api start` process with a fake `docker` on its `PATH`
+//! A real `awman daemon start` process (the worker feature) with a fake `docker` on its `PATH`
 //! (WI 0133).
 //!
 //! The remote-session flows — clone, branch, merge, run a command, push — span
@@ -17,6 +17,11 @@
 //! so no real container CLI or daemon is ever reached. The server runs with a
 //! throwaway `HOME`, no global or system git config (so the clone has no git
 //! identity) and `AWMAN_TEST_ISOLATION=1`, whatever the calling shell has.
+//!
+//! The unified daemon (WI 0140) serves its API on an owner-only local socket, not TCP
+//! (the network listener needs an API key and TLS). So that the many tests which
+//! speak HTTP to `ApiServer::url` stay unchanged, each [`ApiServer`] runs a
+//! loopback TCP proxy that forwards raw bytes to the daemon's local socket.
 //!
 //! Included with `#[path = "../helpers/api_process.rs"] mod api_process;`.
 
@@ -78,6 +83,9 @@ case "$1" in
     done
     [ -n "$background" ] && { echo fake-background; exit 0; }
     if [ -n "$leader" ]; then
+      # Status regressions can hold an actual evaluation long enough to poll
+      # its shared executor permit, without requiring a fabricated verdict.
+      [ -f "$ctl/hold-leader" ] && sleep 5
       printf '[[steps]]\nname = "implement"\nagent = "claude"\nprompt = "implement the work item"\n' > "$leader/workflow.toml"
       [ -f "$ctl/teardown.toml" ] && cat "$ctl/teardown.toml" >> "$leader/workflow.toml"
       [ "$mode" = "leader-rewrite" ] && echo rewritten > "$workspace/shared.txt"
@@ -185,11 +193,35 @@ impl ApiHome {
         std::fs::create_dir_all(&config).unwrap();
         std::fs::write(
             config.join("config.json"),
-            r#"{"daemon":{"verboseSetup":true}}"#,
+            r#"{"daemon":{"verboseSetup":true,"features":{"worker":{"enabled":true,"push":{"enabled":true}}}}}"#,
         )
         .unwrap();
         home.set_agent(AgentMode::Edit);
         home
+    }
+
+    /// Replace the global config with `config`, keeping the worker feature (and
+    /// its push side) enabled: the daemon refuses to start with no feature on.
+    pub fn write_config(&self, mut config: Value) {
+        let worker = &mut config["daemon"]["features"]["worker"];
+        if !worker.is_object() {
+            *worker = serde_json::json!({});
+        }
+        worker["enabled"] = true.into();
+        if !worker["push"].is_object() {
+            worker["push"] = serde_json::json!({});
+        }
+        worker["push"]["enabled"] = true.into();
+        let dir = self.home().join(".config/awman");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
+    }
+
+    /// Replace the global config with exactly `config` (no features forced on).
+    pub fn write_config_exact(&self, config: Value) {
+        let dir = self.home().join(".config/awman");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
     }
 
     pub fn home(&self) -> PathBuf {
@@ -235,8 +267,8 @@ exit 0
         std::fs::set_permissions(gh, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
-    /// Start `awman api start` on a free loopback port and wait until it
-    /// answers `/v1/status`.
+    /// Start `awman daemon start` (worker feature on) and wait until its local
+    /// socket answers `/v1/status`; `ApiServer::url` is a loopback proxy to it.
     pub async fn start(&self) -> ApiServer {
         self.start_with_env(&[]).await
     }
@@ -244,33 +276,86 @@ exit 0
     /// [`Self::start`] with extra environment variables for the server, such
     /// as a test-isolation-only timing override.
     pub async fn start_with_env(&self, env: &[(&str, &str)]) -> ApiServer {
-        let mut last_log = String::new();
-        for attempt in 0..3 {
-            let port = free_port();
-            let log_path = self.dir.path().join(format!("server-{port}-{attempt}.log"));
-            let log = std::fs::File::create(&log_path).unwrap();
-            let child = self
-                .server_command(port, env)
-                .stdout(Stdio::from(log.try_clone().unwrap()))
-                .stderr(Stdio::from(log))
-                .spawn()
-                .expect("spawn awman api start");
-            let mut server = ApiServer {
-                child,
-                url: format!("http://127.0.0.1:{port}"),
-                log_path,
-                client: reqwest::Client::new(),
-            };
-            if server.wait_until_up().await {
-                return server;
-            }
-            last_log = server.log();
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let attempt = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let log_path = self.dir.path().join(format!("daemon-{attempt}.log"));
+        let log = std::fs::File::create(&log_path).unwrap();
+        let child = self
+            .server_command(env)
+            .stdout(Stdio::from(log.try_clone().unwrap()))
+            .stderr(Stdio::from(log))
+            .spawn()
+            .expect("spawn awman daemon start");
+        let mut server = ApiServer {
+            child,
+            url: String::new(),
+            log_path,
+            client: reqwest::Client::new(),
+            proxy: None,
+        };
+        let Some(socket) = self.wait_for_socket(&mut server.child, env).await else {
+            let log = server.log();
             server.kill();
-        }
-        panic!("awman api start never came up; last log:\n{last_log}");
+            panic!("awman daemon start never came up; last log:\n{log}");
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the loopback proxy");
+        server.url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        server.proxy = Some(tokio::spawn(proxy(listener, socket)));
+        assert!(
+            server.wait_until_up().await,
+            "daemon never answered /v1/status:\n{}",
+            server.log()
+        );
+        server
     }
 
-    fn server_command(&self, port: u16, env: &[(&str, &str)]) -> Command {
+    /// The daemon's local socket once this very child owns it.
+    async fn wait_for_socket(&self, child: &mut Child, extra: &[(&str, &str)]) -> Option<PathBuf> {
+        let home = self.home();
+        let mut vars = vec![
+            ("HOME", home.to_str().unwrap().to_string()),
+            (
+                "XDG_CONFIG_HOME",
+                home.join(".config").to_str().unwrap().to_string(),
+            ),
+            (
+                "XDG_DATA_HOME",
+                home.join(".local/share").to_str().unwrap().to_string(),
+            ),
+        ];
+        for (k, v) in extra {
+            vars.retain(|(name, _)| name != k);
+            vars.push((k, v.to_string()));
+        }
+        let env = awman::data::config::env::EnvSnapshot::with_overrides(vars);
+        let paths = awman::data::fs::DataPaths::from_env(&env).ok()?.daemon();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while Instant::now() < deadline {
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                return None;
+            }
+            if let Ok(Some(endpoint)) = awman::engine::remote::local::discover(&paths) {
+                // A crash/restart test must kill a fully started daemon, not
+                // the tiny sidecar-publication window while it still owns
+                // startup.lock (whose abandoned-lock grace is 30 seconds).
+                if endpoint.pid == child.id() && !paths.startup_lock_file().exists() {
+                    return Some(endpoint.address);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        None
+    }
+
+    fn server_command(&self, env: &[(&str, &str)]) -> Command {
+        self.command(env, &["daemon", "start"])
+    }
+
+    /// An `awman` invocation in this home's isolated environment (the same one
+    /// its daemons run in), so it finds the daemon's local socket.
+    pub fn command(&self, env: &[(&str, &str)], args: &[&str]) -> Command {
         let home = self.home();
         let path = format!(
             "{}:{}",
@@ -279,14 +364,7 @@ exit 0
         );
         let mut command = Command::new(env!("CARGO_BIN_EXE_awman"));
         command
-            .args([
-                "api",
-                "start",
-                "--set",
-                &format!("daemon.network.listen=127.0.0.1:{port}"),
-                "--dangerously-skip-auth",
-                "--dangerously-skip-tls",
-            ])
+            .args(args)
             .current_dir(&home)
             .env_clear()
             .env("PATH", path)
@@ -306,12 +384,14 @@ exit 0
     }
 }
 
-/// One running `awman api start` process; killed on drop.
+/// One running `awman daemon start` process; killed on drop. `url` is the
+/// loopback proxy to its local socket.
 pub struct ApiServer {
     child: Child,
     pub url: String,
     log_path: PathBuf,
     client: reqwest::Client,
+    proxy: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl ApiServer {
@@ -321,10 +401,7 @@ impl ApiServer {
             if matches!(self.child.try_wait(), Ok(Some(_))) {
                 return false;
             }
-            // `free_port` releases its port before the server binds it, so a
-            // parallel test's server can take it first; then this server
-            // exits on the bind failure and we retry. Only our own pid counts
-            // as up, or the test would run against the other server.
+            // Only our own pid counts as up.
             let probe = self
                 .client
                 .get(format!("{}/v1/status", self.url))
@@ -333,7 +410,9 @@ impl ApiServer {
             if let Ok(response) = probe {
                 if response.status().is_success() {
                     let body: Value = response.json().await.unwrap_or(Value::Null);
-                    if body["pid"].as_u64() == Some(u64::from(self.child.id())) {
+                    if body["pid"].as_u64() == Some(u64::from(self.child.id()))
+                        && !body["listeners"]["local"].is_null()
+                    {
                         return true;
                     }
                 }
@@ -351,6 +430,9 @@ impl ApiServer {
 
     /// Stop the process the way a crash or `kill -9` would.
     pub fn kill(&mut self) {
+        if let Some(proxy) = self.proxy.take() {
+            proxy.abort();
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -456,11 +538,17 @@ impl Drop for ApiServer {
     }
 }
 
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .and_then(|listener| listener.local_addr())
-        .map(|addr| addr.port())
-        .expect("bind an ephemeral loopback port")
+/// Forward every accepted loopback connection to the daemon's local socket,
+/// byte for byte (HTTP, SSE and all).
+async fn proxy(listener: tokio::net::TcpListener, socket: PathBuf) {
+    while let Ok((mut tcp, _)) = listener.accept().await {
+        let socket = socket.clone();
+        tokio::spawn(async move {
+            if let Ok(mut unix) = tokio::net::UnixStream::connect(socket).await {
+                let _ = tokio::io::copy_bidirectional(&mut tcp, &mut unix).await;
+            }
+        });
+    }
 }
 
 /// The persisted event stream of a finished command (`events.log`, beside the
@@ -495,4 +583,72 @@ pub async fn events_log(command: &Value) -> String {
 /// The clone a remote session works in, as `GET /v1/worker/sessions/{id}` reports it.
 pub fn clone_path(session: &Value) -> PathBuf {
     Path::new(session["workdir"].as_str().expect("session workdir")).to_path_buf()
+}
+
+/// A daemon whose data and config live under an explicit `AWMAN_HOME` root,
+/// together with the fixtures (fake `docker`, throwaway HOME) keeping it
+/// alive. Dropping it stops the daemon.
+pub struct RootDaemon {
+    _home: ApiHome,
+    pub server: ApiServer,
+}
+
+impl RootDaemon {
+    /// Start `awman daemon start` with `AWMAN_HOME=root`; the caller writes
+    /// `root/config.json` first (some feature must be enabled).
+    pub async fn start(root: &Path) -> Self {
+        let home = ApiHome::new();
+        let server = home
+            .start_with_env(&[("AWMAN_HOME", root.to_str().unwrap())])
+            .await;
+        Self {
+            _home: home,
+            server,
+        }
+    }
+
+    /// The loopback URL that reaches the daemon's local socket.
+    pub fn base(&self) -> String {
+        self.server.url.clone()
+    }
+
+    pub fn log(&self) -> String {
+        self.server.log()
+    }
+
+    pub fn abort(self) {}
+}
+
+impl ApiHome {
+    /// Run `awman args…` to completion in this home's environment.
+    pub fn cli(&self, args: &[&str]) -> std::process::Output {
+        self.command(&[], args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("run awman")
+    }
+
+    /// [`Self::cli`] that must exit 0; returns stdout.
+    pub fn cli_ok(&self, args: &[&str]) -> String {
+        let output = self.cli(args);
+        assert!(
+            output.status.success(),
+            "awman {args:?} failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    /// [`Self::cli`] that must exit nonzero; returns stderr.
+    pub fn cli_err(&self, args: &[&str]) -> String {
+        let output = self.cli(args);
+        assert!(
+            !output.status.success(),
+            "awman {args:?} unexpectedly succeeded: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        String::from_utf8_lossy(&output.stderr).into_owned()
+    }
 }

@@ -95,12 +95,15 @@ impl CommandSubmission {
     }
 
     pub(crate) fn validate(&self) -> Result<ParsedArgs, AdmissionError> {
+        self.validate_for(FrontendKind::WORKER_LOCAL)
+    }
+    fn validate_for(&self, frontend: FrontendKind) -> Result<ParsedArgs, AdmissionError> {
         Labels::new(self.labels.clone().into_inner())
             .map_err(|e| AdmissionError::CommandValidation(CommandError::Other(e.to_string())))?;
         let catalogue = CommandCatalogue::get();
         let path: Vec<&str> = self.subcommand.split_whitespace().collect();
         if let Err(CommandError::NotAvailableForFrontend { command, .. }) =
-            catalogue.validate_for_frontend(FrontendKind::Api, &path)
+            catalogue.validate_for_frontend(frontend, &path)
         {
             return Err(AdmissionError::Unavailable {
                 command,
@@ -112,7 +115,7 @@ impl CommandSubmission {
             });
         }
         catalogue
-            .parse_raw_args_with_profile(&path, &self.args, FrontendKind::Api)
+            .parse_raw_args_with_profile(&path, &self.args, frontend)
             .map_err(AdmissionError::CommandValidation)
     }
 }
@@ -120,6 +123,7 @@ impl CommandSubmission {
 /// Owns admission validation, durable write order and failure compensation.
 #[derive(Clone)]
 pub struct ApiAdmission {
+    request_context: crate::data::daemon_state::CommandRequestContext,
     store: Arc<SqliteSessionStore>,
     lifecycle_store: CommandLifecycleStore,
     paths: ApiPaths,
@@ -130,6 +134,22 @@ pub struct ApiAdmission {
 }
 
 impl ApiAdmission {
+    fn frontend_kind(&self) -> FrontendKind {
+        FrontendKind::Daemon {
+            feature: crate::data::daemon_state::FeatureName::Worker,
+            listener: self.request_context.listener,
+        }
+    }
+    /// Set transport metadata once on the admission object. Keeping it separate
+    /// from the wire body prevents callers from spoofing their source listener.
+    pub fn with_request_context(
+        mut self,
+        context: crate::data::daemon_state::CommandRequestContext,
+    ) -> Self {
+        self.request_context = context;
+        self
+    }
+
     fn resolve_interaction(
         &self,
         mut command: CommandSubmission,
@@ -192,6 +212,7 @@ impl ApiAdmission {
         workdir_roots: Vec<PathBuf>,
     ) -> Self {
         Self {
+            request_context: Default::default(),
             store,
             lifecycle_store,
             paths,
@@ -235,7 +256,7 @@ impl ApiAdmission {
             .await
             .map_err(AdmissionError::SessionCreation)?;
         if let Some(command) = &command {
-            command.validate()?;
+            command.validate_for(self.frontend_kind())?;
         }
 
         // Create session storage directories (Layer 0).
@@ -400,7 +421,7 @@ impl ApiAdmission {
         journal: Option<&IdempotentAdmission>,
     ) -> Result<AdmittedCommand, AdmissionError> {
         let submission = self.resolve_interaction(submission)?;
-        let parsed = submission.validate()?;
+        let parsed = submission.validate_for(self.frontend_kind())?;
         match self
             .store
             .command_admission(session_id)
@@ -417,7 +438,7 @@ impl ApiAdmission {
         let command_id = crate::data::ids::CommandId::new().to_string();
         let mut flags_applied = serde_json::Value::Object(
             CommandCatalogue::get()
-                .frontend_profile(FrontendKind::Api, &path_parts)
+                .frontend_profile(self.frontend_kind(), &path_parts)
                 .into_iter()
                 .map(|(flag, value)| (flag.replace('-', "_"), flag_default_json(&value)))
                 .collect(),
@@ -430,7 +451,7 @@ impl ApiAdmission {
         }
         if let Some(session) = self.sessions.get_by_key(session_id) {
             let dispatch = Dispatch::new(
-                AdmissionInput(parsed, submission.interaction),
+                AdmissionInput(parsed, submission.interaction, self.frontend_kind()),
                 session,
                 self.engines.clone(),
             );
@@ -474,13 +495,14 @@ impl ApiAdmission {
 
         let log_path = self.paths.command_log_path(session_id, command_id);
 
-        if let Err(e) = self.store.enqueue_command_with_labels(
+        if let Err(e) = self.store.enqueue_command_with_context(
             command_id,
             session_id,
             &body.subcommand,
             &args_json,
             &log_path.to_string_lossy(),
             &body.labels,
+            &self.request_context,
         ) {
             tracing::error!(error = %e, "Failed to enqueue command");
             return Err(storage("Failed to enqueue command", e));
@@ -535,7 +557,11 @@ fn flag_default_json(
 
 /// Only the catalogue accessors used by Dispatch's admission policy. It never
 /// executes a command or constructs an execution frontend.
-struct AdmissionInput(ParsedArgs, Option<crate::data::config::daemon::Interaction>);
+struct AdmissionInput(
+    ParsedArgs,
+    Option<crate::data::config::daemon::Interaction>,
+    FrontendKind,
+);
 impl UserMessageSink for AdmissionInput {
     fn write_message(&mut self, _message: UserMessage) {}
     fn replay_queued(&mut self) {}
@@ -545,7 +571,7 @@ impl CommandFrontend for AdmissionInput {
         self.1 == Some(crate::data::config::daemon::Interaction::Interactive)
     }
     fn kind(&self) -> FrontendKind {
-        FrontendKind::Api
+        self.2
     }
     fn flag_bool(&self, _path: &[&str], name: &str) -> Result<Option<bool>, CommandError> {
         if name == "headless" {
@@ -764,7 +790,7 @@ impl IdempotencyGate {
     pub fn open(
         store: &Arc<SqliteSessionStore>,
         route: &'static str,
-        auth: &crate::engine::auth::AuthMode,
+        principal: &str,
         key: Option<&str>,
         canonical: &str,
     ) -> Result<Self, IdempotencyGateError> {
@@ -774,10 +800,6 @@ impl IdempotencyGate {
         if !is_valid_idempotency_key(key) {
             return Err(IdempotencyGateError::InvalidKey);
         }
-        let principal = match auth {
-            crate::engine::auth::AuthMode::Enabled { key_hash } => key_hash.as_str(),
-            crate::engine::auth::AuthMode::Disabled => "anonymous",
-        };
         let journal = Arc::new(IdempotentAdmission::new(
             Arc::clone(store),
             route,

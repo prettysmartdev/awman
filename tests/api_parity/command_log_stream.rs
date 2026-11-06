@@ -31,7 +31,7 @@ use awman::engine::container::ContainerRuntime;
 use awman::engine::git::GitEngine;
 use awman::engine::overlay::OverlayEngine;
 use awman::frontend::api::command_frontend::ApiDispatchFrontend;
-use awman::frontend::api::routes::{build_router, AppState, AuthMode};
+use awman::frontend::api::routes::{build_router, AppState};
 
 // ─── Fixtures ────────────────────────────────────────────────────────────────
 
@@ -86,7 +86,6 @@ fn make_state(root: &std::path::Path) -> Arc<AppState> {
         workdir_roots: Vec::new(),
         started_at: Instant::now(),
         task_handles: tokio::sync::Mutex::new(Vec::new()),
-        auth_mode: AuthMode::Disabled,
         engines,
         sessions: Arc::new(awman::data::session_manager::SessionManager::in_memory(
             awman::data::config::env::EnvSnapshot::empty(),

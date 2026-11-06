@@ -11,8 +11,9 @@ use std::time::Instant;
 use super::cancel::{CommandCanceller, TokenRegistry};
 use super::event_bus::EventBus;
 use super::owned_runtime::stop_command_containers;
+#[cfg(any(test, feature = "test-support"))]
 use super::queue_worker::{ApiCommandFrontendFactory, QueueWorker, QueueWorkerDeps};
-use super::ApiServeConfig;
+use super::WorkerConfig;
 use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
 use crate::data::api_lifecycle_store::CommandLifecycleStore;
@@ -24,7 +25,6 @@ use crate::data::session::{Session, SessionOpenOptions, SessionType, StaticGitRo
 use crate::data::session_manager::SessionManager;
 use crate::data::session_setup_event::{SessionSetupError, SessionSetupStatus};
 use crate::data::session_status::SessionStatus;
-use crate::engine::auth::AuthMode;
 
 /// Outcome of the one API session drain-and-close state machine.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -156,13 +156,14 @@ impl SetupReadiness {
 
 /// The API daemon's Layer 2 state. The HTTP frontend receives this fully
 /// bootstrapped runtime and only builds a router, listener, and shutdown loop.
-pub struct ApiServerRuntime {
+// unified-router/cli-surface remove their callers. DaemonRuntime::bootstrap uses
+// from_core, which reuses Core's store rather than opening another database.
+pub struct WorkerServices {
     pub config: crate::data::config::EffectiveConfig,
     pub store: Arc<SqliteSessionStore>,
     pub sessions: Arc<SessionManager>,
     pub event_buses: Arc<tokio::sync::Mutex<HashMap<String, Arc<EventBus>>>>,
     pub paths: ApiPaths,
-    pub auth_mode: AuthMode,
     pub workdirs: Vec<std::path::PathBuf>,
     pub workdir_roots: Vec<std::path::PathBuf>,
     pub started_at: Instant,
@@ -171,7 +172,6 @@ pub struct ApiServerRuntime {
     pub worker_count: usize,
     pub bind_ip: std::net::IpAddr,
     pub port: u16,
-    pub tls_material: Option<crate::engine::auth::TlsMaterial>,
     /// Cancel markers and `/v1/runs` linkage (WI 0135).
     pub lifecycle_store: CommandLifecycleStore,
     /// Tokens of running commands, keyed by command id; registered by the
@@ -182,9 +182,24 @@ pub struct ApiServerRuntime {
     pub setup_cancels: Arc<TokenRegistry>,
 }
 
-impl ApiServerRuntime {
+impl WorkerServices {
     /// Construct all daemon state before Layer 3 starts listening.
-    pub fn bootstrap(config: ApiServeConfig, engines: Engines) -> Result<Self, CommandError> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn bootstrap(config: WorkerConfig, engines: Engines) -> Result<Self, CommandError> {
+        Self::bootstrap_inner(config, engines, None)
+    }
+    pub fn from_core(
+        config: WorkerConfig,
+        engines: Engines,
+        core: &crate::engine::daemon::core::Core,
+    ) -> Result<Self, CommandError> {
+        Self::bootstrap_inner(config, engines, Some(core))
+    }
+    fn bootstrap_inner(
+        config: WorkerConfig,
+        engines: Engines,
+        core: Option<&crate::engine::daemon::core::Core>,
+    ) -> Result<Self, CommandError> {
         // Reuse the `ApiPaths` the caller's `Engines` was built with, rather
         // than re-deriving one from the process environment: the two must
         // agree, or auth-mode resolution below checks a key hash at a
@@ -198,14 +213,23 @@ impl ApiServerRuntime {
         // two daemons would open different files and API-mode data would appear to
         // vanish after squad migrated it.
         let data_paths = paths.data_paths();
-        let migration = data_paths
-            .migrate_legacy_db(paths.root())
-            .map_err(CommandError::Data)?;
+        let migration = if core.is_none() {
+            Some(
+                data_paths
+                    .migrate_legacy_db(paths.root())
+                    .map_err(CommandError::Data)?,
+            )
+        } else {
+            None
+        };
         tracing::info!(migration = ?migration, "api database migration outcome");
 
         let db_path = paths.db_path();
         tracing::info!(db = %db_path.display(), "Opening session store");
-        let store = Arc::new(SqliteSessionStore::open_at(&db_path).map_err(CommandError::Data)?);
+        let store = match core {
+            Some(core) => core.session_store().clone(),
+            None => Arc::new(SqliteSessionStore::open_at(&db_path).map_err(CommandError::Data)?),
+        };
         // The WI 0135 lifecycle tables (cancel markers, `/v1/runs` linkage)
         // must exist before any recovery below reads them.
         let lifecycle_store =
@@ -224,9 +248,6 @@ impl ApiServerRuntime {
             Err(error) => tracing::warn!(%error, "Failed to prune lifecycle rows"),
         }
 
-        let auth_mode = engines
-            .auth_engine
-            .request_auth_mode(config.dangerously_skip_auth)?;
         // The config the daemon's engine bundle was assembled from, not a
         // fresh read: the two could otherwise see different files (F-31).
         let global_config = (*engines.global_config).clone();
@@ -434,12 +455,18 @@ impl ApiServerRuntime {
         finish_drained_closes(&store, &paths, &engines, &sessions);
 
         Ok(Self {
-            config: crate::command::daemon_api::DaemonApi::effective(&engines),
+            config: crate::data::config::EffectiveConfig::resolve(
+                crate::data::config::ConfigLayers {
+                    global: (*engines.global_config).clone(),
+                    ..Default::default()
+                },
+                Default::default(),
+                config.env.clone(),
+            )?,
             store,
             sessions,
             event_buses: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             paths,
-            auth_mode,
             workdirs: config.workdirs,
             workdir_roots: config.workdir_roots,
             started_at: Instant::now(),
@@ -451,7 +478,6 @@ impl ApiServerRuntime {
             .max_concurrent_jobs,
             bind_ip: config.bind_ip,
             port: config.port,
-            tls_material: config.tls_material,
             lifecycle_store,
             command_cancels: Arc::new(TokenRegistry::new()),
             setup_cancels: Arc::new(TokenRegistry::new()),
@@ -475,10 +501,6 @@ impl ApiServerRuntime {
 
     pub fn bind_addr(&self) -> std::net::SocketAddr {
         std::net::SocketAddr::from((self.bind_ip, self.port))
-    }
-
-    pub fn tls_material(&self) -> Option<crate::engine::auth::TlsMaterial> {
-        self.tls_material.clone()
     }
 
     pub fn lifecycle(&self) -> ApiSessionLifecycle {
@@ -505,6 +527,7 @@ impl ApiServerRuntime {
 
     /// Resize the worker pool after a validated config reload. Retiring workers
     /// finish their current command and stop claiming new work.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn spawn_workers<F>(
         &self,
         frontend_factory: F,
@@ -1244,6 +1267,8 @@ mod tests {
     #[test]
     fn stored_args_projection_omits_server_injected_interaction_flags() {
         let record = crate::data::fs::api_db::CommandRecord {
+            listener: "local".into(),
+            trace_parent: None,
             id: "cmd_00000000000000000000000000000001".into(),
             session_id: "ses_00000000000000000000000000000001".into(),
             subcommand: "exec prompt".into(),

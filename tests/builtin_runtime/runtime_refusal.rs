@@ -173,7 +173,7 @@ fn builtin_test_gate_is_off_by_default_in_resolved_settings() {
     let launch = config.builtin_launch_settings().unwrap();
     assert_eq!(
         (launch.vcpus, launch.memory_mib),
-        (2, 4096),
+        (4, 4096),
         "documented per-launch defaults"
     );
     assert!(resolved.ambient_overrides.is_empty());

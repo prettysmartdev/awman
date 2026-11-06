@@ -18,14 +18,7 @@ impl Feature {
         }
     }
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum FeatureState {
-    On,
-    Off,
-    Ephemeral,
-    Draining,
-}
+pub use crate::data::daemon_state::FeatureState;
 #[derive(Debug, Clone)]
 pub struct FeatureSet(pub std::collections::HashMap<Feature, FeatureState>);
 impl FeatureSet {
@@ -42,6 +35,11 @@ impl FeatureSet {
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Operation {
+    CoreHealth,
+    CoreFeaturesPatch,
+    CoreKeysList,
+    CoreKeysCreate,
+    CoreKeysDelete,
     CoreStatus,
     CoreConfigGet,
     CoreConfigReload,
@@ -80,6 +78,11 @@ pub enum Operation {
 impl Operation {
     pub fn owner(self) -> Feature {
         match self {
+            Self::CoreHealth
+            | Self::CoreFeaturesPatch
+            | Self::CoreKeysList
+            | Self::CoreKeysCreate
+            | Self::CoreKeysDelete => Feature::Core,
             Self::CoreStatus => Feature::Core,
             Self::CoreConfigGet => Feature::Core,
             Self::CoreConfigReload => Feature::Core,
@@ -118,6 +121,11 @@ impl Operation {
     }
     pub fn name(self) -> &'static str {
         match self {
+            Self::CoreHealth => "core.health",
+            Self::CoreFeaturesPatch => "core.features.patch",
+            Self::CoreKeysList => "core.keys.list",
+            Self::CoreKeysCreate => "core.keys.create",
+            Self::CoreKeysDelete => "core.keys.delete",
             Self::CoreStatus => "core.status",
             Self::CoreConfigGet => "core.config.get",
             Self::CoreConfigReload => "core.config.reload",
@@ -163,5 +171,37 @@ impl Operation {
                 | Self::SquadTasksCreate
                 | Self::SquadRunsCreate
         )
+    }
+}
+impl From<crate::data::daemon_state::FeatureName> for Feature {
+    fn from(f: crate::data::daemon_state::FeatureName) -> Self {
+        match f {
+            crate::data::daemon_state::FeatureName::Squad => Self::Squad,
+            crate::data::daemon_state::FeatureName::Worker => Self::Worker,
+            crate::data::daemon_state::FeatureName::Engine => Self::Engine,
+        }
+    }
+}
+impl Feature {
+    pub fn feature_name(self) -> Option<crate::data::daemon_state::FeatureName> {
+        crate::data::daemon_state::FeatureName::parse(self.name())
+    }
+}
+impl Operation {
+    pub fn local_only(self) -> bool {
+        matches!(
+            self,
+            Self::CoreConfigGet
+                | Self::CoreConfigReload
+                | Self::CoreFeaturesPatch
+                | Self::CoreKeysList
+                | Self::CoreKeysCreate
+                | Self::CoreKeysDelete
+                | Self::CoreGrantsList
+                | Self::CoreGrantsDelete
+        )
+    }
+    pub fn unauthenticated(self) -> bool {
+        self == Self::CoreHealth
     }
 }

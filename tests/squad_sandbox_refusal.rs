@@ -9,11 +9,9 @@
 //! is itself platform-gated to macOS arm64 and unavailable in CI).
 
 use std::sync::{Arc, Mutex};
-
 use tokio::sync::Mutex as AsyncMutex;
+static ENV_LOCK: AsyncMutex<()> = AsyncMutex::const_new(());
 
-use awman::command::commands::squad::commands::SquadServeConfig;
-use awman::command::commands::squad::daemon_runtime::SquadDaemonHandles;
 use awman::command::commands::squad::gateway::{CreateTask, LocalTaskGateway, TaskGateway};
 use awman::command::dispatch::Engines;
 use awman::data::fs::{
@@ -31,7 +29,6 @@ use awman::engine::container::ContainerRuntime;
 use awman::engine::error::EngineError;
 use awman::engine::git::GitEngine;
 use awman::engine::overlay::OverlayEngine;
-use awman::engine::squad::{EvaluationOutcome, EvaluationRequest, TaskEvaluator};
 
 // ─── A fake runtime that only ever reports the sandbox tier's name ──────────
 
@@ -108,14 +105,6 @@ impl AgentRuntimeEngine for FakeSandboxRuntime {
     }
 }
 
-struct NeverCalledEvaluator;
-#[async_trait::async_trait]
-impl TaskEvaluator for NeverCalledEvaluator {
-    async fn evaluate(&self, _request: EvaluationRequest) -> EvaluationOutcome {
-        panic!("must never be called — the daemon must refuse before the scheduler ever ticks");
-    }
-}
-
 fn engines_with(
     runtime: Arc<dyn AgentRuntimeEngine>,
     container_runtime: Option<Arc<ContainerRuntime>>,
@@ -151,27 +140,7 @@ async fn daemon_startup_under_sandbox_runtime_fails_opens_no_store_binds_no_port
     let tmp = tempfile::tempdir().unwrap();
     let engines = engines_with(Arc::new(FakeSandboxRuntime), None, tmp.path());
 
-    let config = SquadServeConfig {
-        port: 0,
-        dangerously_skip_auth: true,
-    };
-
-    // The bootstrap reads `AWMAN_HOME`/friends from the real process
-    // environment (`Env::from_process()`), so scope it to this isolated root
-    // for the duration of the call.
-    let _env_guard = ENV_LOCK.lock().await;
-    let previous = std::env::var("AWMAN_HOME").ok();
-    std::env::set_var("AWMAN_HOME", tmp.path());
-
-    let result = SquadDaemonHandles::bootstrap(config, engines, Arc::new(NeverCalledEvaluator))
-        .await
-        .map(|_| ());
-
-    match previous {
-        Some(v) => std::env::set_var("AWMAN_HOME", v),
-        None => std::env::remove_var("AWMAN_HOME"),
-    }
-
+    let result = awman::command::commands::squad::runtime_guard::require_container_tier(&engines);
     let err = result.expect_err("startup under the sandbox tier must fail");
     assert_eq!(err.to_string(), EXPECTED_REFUSAL);
 
@@ -192,8 +161,6 @@ async fn daemon_startup_under_sandbox_runtime_fails_opens_no_store_binds_no_port
         "no port must be bound / published"
     );
 }
-
-static ENV_LOCK: AsyncMutex<()> = AsyncMutex::const_new(());
 
 // ─── Task creation ──────────────────────────────────────────────────────
 

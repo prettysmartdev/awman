@@ -61,7 +61,9 @@ impl FromStr for DurationStr {
 }
 
 fn duration_error(s: &str) -> String {
-    format!("{s:?} is not a duration; use a whole number and a unit, e.g. \"500ms\", \"30s\", \"15m\", \"2h\"")
+    format!(
+        "{s:?} is not a duration; use a whole number and a unit, e.g. \"500ms\", \"30s\", \"15m\", \"2h\""
+    )
 }
 
 /// `"512MiB" | "4GiB"`: one non-negative integer followed by a binary unit

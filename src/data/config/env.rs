@@ -26,12 +26,6 @@ pub const AWMAN_OVERLAYS: &str = "AWMAN_OVERLAYS";
 /// form of `--session`. A session id is not a setting, so this is not config.
 pub const AWMAN_REMOTE_SESSION: &str = "AWMAN_REMOTE_SESSION";
 
-/// `AWMAN_SQUAD_KEY` — bearer key the CLI and TUI authenticate to the squad
-/// daemon with. Minted on the daemon's first start and printed once as a
-/// shell-export snippet; see `awman squad start`. Process-level until the
-/// owner-only local socket replaces it.
-pub const AWMAN_SQUAD_KEY: &str = "AWMAN_SQUAD_KEY";
-
 /// The prefix every awman variable shares. A captured `AWMAN_*` variable that
 /// is not a [`PROCESS_VARS`] entry and not in the [`AWMAN_TEST_PREFIX`]
 /// namespace is a config variable: its name is derived from the key table
@@ -112,7 +106,6 @@ pub const AWMAN_TEST_YOLO_COUNTDOWN_MS: &str = "AWMAN_TEST_YOLO_COUNTDOWN_MS";
 pub const PROCESS_VARS: &[&str] = &[
     AWMAN_HOME,
     AWMAN_REMOTE_SESSION,
-    AWMAN_SQUAD_KEY,
     AWMAN_TEST_ISOLATION,
     AWMAN_TEST_DOCKER,
     AWMAN_TEST_APPLE_CONTAINER,
@@ -220,7 +213,7 @@ pub const RUST_LOG: &str = "RUST_LOG";
 /// This is the **bootstrap class** — values the daemon needs before it can
 /// open its storage root or start listening. **[`ForwardedEnv::NAMES`] is a
 /// non-secret allowlist, and nothing that could hold a secret may ever be
-/// added to it.** [`AWMAN_SQUAD_KEY`] is deliberately absent, and so is every
+/// added to it.** `AWMAN_SQUAD_KEY` is deliberately absent, and so is every
 /// config variable of a `sensitive` key (`AWMAN_REMOTE_TARGETS_<NAME>_API_KEY`):
 /// this list is serialized into a plist on disk and passed as
 /// `--setenv` arguments on a visible `systemd-run` invocation, and a bearer
@@ -342,11 +335,6 @@ impl EnvSnapshot {
     /// `AWMAN_REMOTE_SESSION` if set.
     pub fn remote_session(&self) -> Option<&str> {
         self.get(AWMAN_REMOTE_SESSION)
-    }
-
-    /// `AWMAN_SQUAD_KEY` if set and non-empty.
-    pub fn squad_key(&self) -> Option<&str> {
-        self.get(AWMAN_SQUAD_KEY).filter(|v| !v.is_empty())
     }
 
     /// `GITHUB_TOKEN` if set and non-empty.
@@ -541,26 +529,6 @@ fn awman_vars_os() -> Vec<(String, String)> {
 pub struct Env;
 
 impl Env {
-    /// The bearer keys a snapshot resolves through [`host_var`] rather than
-    /// straight from the process environment.
-    ///
-    /// These two are *published* into a running process, not merely inherited
-    /// by it. The process that mints a squad key is the TUI (or CLI) that
-    /// started the daemon, and it cannot be told to `export` the key
-    /// afterwards, so `SquadSupervisor::provision_key` writes the key into the
-    /// Layer 0 daemon overlay instead. Every later reader builds a *new*
-    /// supervisor from a *fresh* snapshot — `Dispatch::admit`, `squad attach`,
-    /// the TUI's `refresh_squad_key` — so a snapshot that read only
-    /// `std::env::var` would not see it, `provision_key` would return `None`,
-    /// and the daemon would answer 401 to the very process that minted its key
-    /// (WI 0114 F-47).
-    ///
-    /// Only this one. Everything else in the snapshot is a property of *this*
-    /// process — its storage root, its config variables, its shell — which
-    /// nothing publishes at run time and which therefore keeps reading the
-    /// real environment.
-    const PUBLISHED_KEYS: &'static [&'static str] = &[AWMAN_SQUAD_KEY];
-
     /// Capture every awman-relevant env var from the current process: the
     /// fixed list below, plus every variable whose name starts with
     /// [`AWMAN_PREFIX`], so derived config names reach the snapshot without a
@@ -569,7 +537,6 @@ impl Env {
         let keys = [
             AWMAN_HOME,
             AWMAN_REMOTE_SESSION,
-            AWMAN_SQUAD_KEY,
             GITHUB_TOKEN,
             XDG_CONFIG_HOME,
             XDG_DATA_HOME,
@@ -599,11 +566,7 @@ impl Env {
             }
         }
         for k in keys {
-            let read = if Self::PUBLISHED_KEYS.contains(&k) {
-                host_var(k)
-            } else {
-                std::env::var(k).ok()
-            };
+            let read = std::env::var(k).ok();
             if let Some(v) = read {
                 values.insert(k.to_string(), v);
             }
@@ -693,7 +656,7 @@ pub fn test_isolation_active() -> bool {
 //
 // `std::env::var` remains correct — and is deliberately kept — for awman's own
 // invariants (storage-root resolution, launch mode, and every `EnvSnapshot`
-// key but the two in [`Env::PUBLISHED_KEYS`]): those are properties of *this*
+// key but the two in the daemon overlay): those are properties of *this*
 // process, not values a daemon's client can supply.
 
 /// The daemon's payload environment. Empty in every process that never calls
@@ -1262,7 +1225,7 @@ mod tests {
     /// leaves the daemon unable to find `docker`.
     #[test]
     fn no_secret_is_ever_forwarded_to_a_daemon_job() {
-        assert!(!ForwardedEnv::NAMES.contains(&AWMAN_SQUAD_KEY));
+        assert!(!ForwardedEnv::NAMES.contains(&"AWMAN_SQUAD_KEY"));
         assert!(ForwardedEnv::NAMES.contains(&"PATH"));
         assert!(ForwardedEnv::NAMES.contains(&AWMAN_HOME));
         // Config variables ride along (WI 0116 §2: overlays included), but a
@@ -1275,7 +1238,7 @@ mod tests {
             "AWMAN_REMOTE_TARGETS_PROD_API_KEY"
         ));
         assert!(!ForwardedEnv::forwards_config_var("AWMAN_NOT_A_KEY"));
-        assert!(!ForwardedEnv::forwards_config_var(AWMAN_SQUAD_KEY));
+        assert!(!ForwardedEnv::forwards_config_var("AWMAN_SQUAD_KEY"));
     }
 
     #[test]
@@ -1486,7 +1449,6 @@ mod override_tests {
     fn config_vars_skip_process_and_test_variables() {
         let env = EnvSnapshot::with_overrides([
             (AWMAN_HOME, "/h"),
-            (AWMAN_SQUAD_KEY, "k"),
             (AWMAN_REMOTE_SESSION, "s"),
             (AWMAN_TEST_ISOLATION, "1"),
             ("AWMAN_TEST_SOMETHING_ADHOC", "1"),
@@ -1693,33 +1655,7 @@ mod override_tests {
 mod published_key_tests {
     use super::*;
 
-    /// The regression F-47 introduced and this restores: the process that mints
-    /// a squad key publishes it into the daemon overlay, and every *later*
-    /// reader in that process resolves it through a fresh `EnvSnapshot`. If
-    /// `Env::from_process` read only `std::env::var`, the second supervisor in
-    /// the minting process would see no key at all.
-    #[test]
-    fn a_snapshot_taken_after_a_key_is_published_sees_that_key() {
-        let _lock = DAEMON_OVERLAY_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let previous = daemon_overlay_snapshot();
-
-        update_daemon_overlay(|vars| {
-            vars.insert(AWMAN_SQUAD_KEY.to_string(), "minted-squad-key".to_string());
-        });
-
-        let snapshot = Env::from_process();
-        assert_eq!(
-            snapshot.squad_key(),
-            Some("minted-squad-key"),
-            "a snapshot built after the mint must carry the published squad key"
-        );
-
-        set_daemon_overlay(previous);
-    }
-
-    /// The counterpart: nothing *but* the published key is resolved through
+    /// Snapshots take process configuration only: nothing *but* the published key is resolved through
     /// the overlay, so a daemon client cannot redirect this process's storage
     /// root, or change its config, by pushing an `env(VAR)` payload named
     /// like one of awman's own variables.

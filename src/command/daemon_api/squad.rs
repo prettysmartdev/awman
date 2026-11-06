@@ -244,9 +244,8 @@ fn admit_policy(
     use crate::data::config::flags::{IdentityFlag, PrerequisiteFlags, SshFlag, TokenFlag};
     use crate::data::config::workflows::{CredentialUse, PolicySource, PrerequisiteResolveContext};
     let global = api
-        .config
-        .lock()
-        .expect("config mutex")
+        .runtime
+        .config()
         .prerequisite_policy(PrerequisiteResolveContext {
             remote_session: false,
         });
@@ -275,7 +274,7 @@ fn admit_policy(
             return Err(refuse());
         });
     }
-    check_flag_widening(FrontendKind::Api, &flags, &global)?;
+    check_flag_widening(FrontendKind::WORKER_LOCAL, &flags, &global)?;
     if let Some(acquire) = &policy.github_token.acquire {
         if global.github_token.acquire.as_ref() != Some(acquire) {
             return Err(refuse());
@@ -290,11 +289,11 @@ fn admit_policy(
                 token: Some(TokenFlag::Env(name.clone())),
                 ..Default::default()
             };
-            check_flag_widening(FrontendKind::Api, &flags, &global)?;
+            check_flag_widening(FrontendKind::WORKER_LOCAL, &flags, &global)?;
         }
         if policy.github_token.acquire.is_some() {
             check_flag_widening(
-                FrontendKind::Api,
+                FrontendKind::WORKER_LOCAL,
                 &PrerequisiteFlags {
                     token: Some(TokenFlag::Acquire),
                     ..Default::default()

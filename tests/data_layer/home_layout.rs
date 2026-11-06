@@ -16,6 +16,14 @@ fn awman_home_roots_config_data_api_and_squad() {
     assert_eq!(config_home(&env).unwrap(), PathBuf::from("/aw"));
     assert_eq!(data_home(&env).unwrap(), PathBuf::from("/aw"));
     assert_eq!(
+        DataPaths::from_env(&env).unwrap().daemon().root(),
+        std::path::Path::new("/aw/data/daemon")
+    );
+    assert_eq!(
+        ApiPaths::from_env(&env).unwrap().daemon(),
+        SquadPaths::from_env(&env).unwrap().daemon()
+    );
+    assert_eq!(
         DataPaths::from_env(&env).unwrap().db_path(),
         PathBuf::from("/aw/data/awman.db")
     );

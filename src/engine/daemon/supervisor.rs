@@ -25,9 +25,7 @@ use std::path::Path;
 use crate::data::config::env::ForwardedEnv;
 use crate::data::error::DataError;
 use crate::data::fs::daemon_paths::DaemonPaths;
-use crate::data::fs::daemon_process::{
-    clear_pid, ensure_private_log, read_pid, DaemonProcess, API_UNIT_NAME, SQUAD_UNIT_NAME,
-};
+use crate::data::fs::daemon_process::{ensure_private_log, read_pid, DaemonProcess};
 use crate::engine::error::EngineError;
 
 /// Supervises one daemon: liveness, background spawn, termination.
@@ -63,12 +61,8 @@ impl DaemonSupervisor {
 
     /// Supervise the daemon at `paths` under the given systemd unit name and
     /// launchd plist label.
-    pub fn for_paths(
-        paths: DaemonPaths,
-        unit_name: &'static str,
-        plist_label: &'static str,
-    ) -> Self {
-        Self::new(DaemonProcess::new(paths, unit_name, plist_label))
+    pub fn for_paths(paths: DaemonPaths) -> Self {
+        Self::new(DaemonProcess::unified(paths))
     }
 
     /// The Layer 0 PID / meta / paths object this supervisor drives.
@@ -105,14 +99,7 @@ impl DaemonSupervisor {
             self.process.plist_label(),
             self.service_manager,
         )
-        .map_err(|error| {
-            let daemon = match self.process.unit_name() {
-                SQUAD_UNIT_NAME => "squad",
-                API_UNIT_NAME => "API",
-                _ => "background",
-            };
-            EngineError::Other(format!("failed to start the {daemon} daemon: {error}"))
-        })
+        .map_err(|error| EngineError::Other(format!("failed to start the awman daemon: {error}")))
     }
 
     /// Terminate the running daemon: read the PID, and if it is a live awman
@@ -136,7 +123,9 @@ impl DaemonSupervisor {
                 Termination::Terminated { pid }
             }
         };
-        self.process.release_pidfile()?;
+        if let Termination::StalePidFile { pid } | Termination::NotAwman { pid } = outcome {
+            self.process.release_pidfile_owned_by(pid)?;
+        }
         Ok(outcome)
     }
 }
@@ -149,6 +138,9 @@ impl DaemonSupervisor {
 /// a type (Tenet 3's stateless-helper exception).
 #[cfg(unix)]
 fn is_process_alive(pid: u32) -> bool {
+    if pid == 0 || pid > i32::MAX as u32 {
+        return false;
+    }
     nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_ok()
 }
 
@@ -218,8 +210,8 @@ fn pid_is_awman(_pid: u32) -> bool {
 pub(crate) fn check_already_running(pid_path: &Path) -> Result<Option<u32>, DataError> {
     match read_pid(pid_path)? {
         Some(pid) if is_process_alive(pid) && pid_is_awman(pid) => Ok(Some(pid)),
-        Some(_) => {
-            clear_pid(pid_path)?;
+        Some(pid) => {
+            crate::data::fs::daemon_process::clear_pid_owned_by(pid_path, pid)?;
             Ok(None)
         }
         None => Ok(None),
@@ -397,7 +389,7 @@ fn try_systemd_run(
         args,
         unit_name,
         log_path,
-        &ForwardedEnv::from_process(),
+        &daemon_unit_env(ForwardedEnv::from_process()),
     );
     let mut cmd = std::process::Command::new("systemd-run");
     cmd.args(&argv);
@@ -535,7 +527,7 @@ fn try_launchd(
         binary_path,
         args,
         log_path,
-        &ForwardedEnv::from_process(),
+        &daemon_unit_env(ForwardedEnv::from_process()),
         std::env::current_dir().ok().as_deref(),
     );
     std::fs::write(&plist_path, plist).map_err(|e| DataError::io(&plist_path, e))?;
@@ -653,9 +645,47 @@ fn double_fork_spawn(
     Ok(child.id())
 }
 
+/// The environment the `awman-daemon` unit / `io.awman.daemon` agent is started
+/// with: the process basics (`PATH`, `HOME`, `RUST_LOG`, XDG dirs) and
+/// `AWMAN_HOME`, so the daemon resolves the same home as the process that
+/// started it. No other `AWMAN_*` variable rides along: the daemon reads its
+/// configuration from that home, and `--set` overrides travel as argv.
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
+pub(crate) fn daemon_unit_env(forwarded: Vec<(String, String)>) -> Vec<(String, String)> {
+    forwarded
+        .into_iter()
+        .filter(|(name, _)| !name.starts_with("AWMAN_") || name == "AWMAN_HOME")
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_daemon_unit_is_started_with_awman_home_only() {
+        let env = daemon_unit_env(vec![
+            ("PATH".into(), "/usr/bin".into()),
+            ("AWMAN_HOME".into(), "/custom/home".into()),
+            ("AWMAN_OVERLAYS".into(), "ssh()".into()),
+            ("AWMAN_DAEMON_MAX_CONCURRENT_JOBS".into(), "8".into()),
+        ]);
+        assert_eq!(
+            env,
+            vec![
+                ("PATH".to_string(), "/usr/bin".to_string()),
+                ("AWMAN_HOME".to_string(), "/custom/home".to_string()),
+            ]
+        );
+        assert_eq!(
+            crate::data::fs::daemon_process::DAEMON_UNIT_NAME,
+            "awman-daemon"
+        );
+        assert_eq!(
+            crate::data::fs::daemon_process::DAEMON_PLIST_LABEL,
+            "io.awman.daemon"
+        );
+    }
     use crate::data::fs::daemon_process::write_pid;
 
     #[test]

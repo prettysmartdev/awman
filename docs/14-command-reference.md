@@ -322,58 +322,71 @@ Available via: CLI, TUI, API
 
 ---
 
-## `awman api`
-
-Run awman as an API HTTP server for remote/automated access.
-
-Available via: CLI, TUI
-
-### `awman api start`
-
-Start the API HTTP server.
-
-Available via: CLI, TUI
-
-| Flag | Kind | Default | Implies | Conflicts | Frontends | Help |
-|---|---|---|---|---|---|---|
-| `--background` | bool | false | — | — | CLI | Daemonize via the OS process manager. |
-| `--refresh-key` | bool | false | — | — | CLI | Regenerate the API key. |
-| `--dangerously-skip-auth` | bool | false | — | — | CLI | Disable authentication for this execution even if a key hash exists on disk. |
-| `--dangerously-skip-tls` | bool | false | — | — | CLI | Serve plain HTTP instead of HTTPS. Intended for localhost/test only. |
-
-### `awman api kill`
-
-Stop the background API server.
-
-Available via: CLI, TUI
-
-### `awman api logs`
-
-Stream the background server log file to stdout.
-
-Available via: CLI, TUI
-
-### `awman api status`
-
-Show API server status.
-
-Available via: CLI, TUI
-
----
-
 ## `awman daemon`
 
-Control daemon resources.
+Run and control the awman daemon (squad, worker and engine features).
+
+One daemon serves every enabled feature. Turn features on and off with `awman config set daemon.features.<name>.enabled true\|false`.
 
 Available via: CLI, TUI
 
 Runs without a working agent runtime — reachable even when the configured runtime cannot be started on this host.
 
+### `awman daemon start`
+
+Start the daemon in the foreground (Ctrl-C stops it).
+
+Refuses when no feature is enabled. With --background the daemon runs under the OS service manager (systemd user unit awman-daemon, launchd label io.awman.daemon).
+
+Available via: CLI, TUI
+
+Runs without a working agent runtime — reachable even when the configured runtime cannot be started on this host.
+
+| Flag | Kind | Default | Implies | Conflicts | Frontends | Help |
+|---|---|---|---|---|---|---|
+| `--background` | bool | false | — | — | CLI, TUI, API | Run the daemon in the background under the OS service manager. |
+
+### `awman daemon stop`
+
+Stop the daemon; running work drains first.
+
+Available via: CLI, TUI
+
+Runs without a working agent runtime — reachable even when the configured runtime cannot be started on this host.
+
+| Flag | Kind | Default | Implies | Conflicts | Frontends | Help |
+|---|---|---|---|---|---|---|
+| `--now` | bool | false | — | — | CLI, TUI, API | Cancel running jobs of every feature before stopping instead of letting them finish. |
+
+### `awman daemon status`
+
+Show the daemon's features, listeners and capacity.
+
+Available via: CLI, TUI
+
+Runs without a working agent runtime — reachable even when the configured runtime cannot be started on this host.
+
+| Flag | Kind | Default | Implies | Conflicts | Frontends | Help |
+|---|---|---|---|---|---|---|
+| `--json` | bool | false | — | — | CLI, TUI, API | Print GET /v1/status as JSON. |
+
+### `awman daemon logs`
+
+Print the daemon log.
+
+Available via: CLI, TUI
+
+Runs without a working agent runtime — reachable even when the configured runtime cannot be started on this host.
+
+| Flag | Kind | Default | Implies | Conflicts | Frontends | Help |
+|---|---|---|---|---|---|---|
+| `-f, --follow` | bool | false | — | — | CLI, TUI, API | Keep printing new lines until Ctrl-C. |
+
 ### `awman daemon api`
 
-Call the daemon resource API over the owner-authenticated local socket, or a named remote target.
+Call the daemon API over the owner-only local socket or named pipe.
 
-Use an action with key=value arguments, --list to list actions, or --raw METHOD /v1/path with optional --data JSON, @file, or - for stdin.
+Use an action with key=value arguments, --list to list actions with their routes, or --raw METHOD /v1/path with optional --data JSON, @file, or - for stdin.
 
 Available via: CLI, TUI
 
@@ -386,7 +399,7 @@ Runs without a working agent runtime — reachable even when the configured runt
 
 | Flag | Kind | Default | Implies | Conflicts | Frontends | Help |
 |---|---|---|---|---|---|---|
-| `--list` | bool | false | — | `--raw`, `--data` | CLI, TUI, API | List every action and its method/path. |
+| `--list` | bool | false | — | `--raw`, `--data` | CLI, TUI, API | List every action with its arguments and route. |
 | `--raw` | string (optional) | — | — | `--list` | CLI, TUI, API | HTTP method for a raw /v1/path request. |
 | `--data` | string (optional) | — | — | `--list` | CLI, TUI, API | JSON body, @file, or - for stdin (requires --raw). |
 | `--json` | bool | false | — | — | CLI, TUI, API | Print the response body as JSON. |
@@ -395,7 +408,7 @@ Runs without a working agent runtime — reachable even when the configured runt
 
 ## `awman squad`
 
-Manage the squad task daemon and scheduled tasks.
+Manage squad tasks (served by the daemon's squad feature).
 
 Available via: CLI, TUI
 
@@ -403,47 +416,6 @@ Available via: CLI, TUI
 |---|---|---|---|---|---|---|
 | `-n, --headless` | bool | false | — | — | CLI, TUI | Print the squad status summary instead of opening the TUI. |
 | `--json` | bool | false | `--headless` | — | CLI, TUI, API | Emit JSON output. |
-
-### `awman squad start`
-
-Start the squad daemon.
-
-Available via: CLI, TUI, API
-
-| Flag | Kind | Default | Implies | Conflicts | Frontends | Help |
-|---|---|---|---|---|---|---|
-| `--port` | u16 | 0 | — | — | CLI, TUI, API | Port to listen on (0 selects an OS-assigned port). |
-| `--background` | bool | false | — | — | CLI, TUI, API | Daemonize via the OS process manager. |
-| `--refresh-key` | bool | false | — | — | CLI, TUI, API | Regenerate the squad key and print its AWMAN_SQUAD_KEY export snippet. |
-| `--dangerously-skip-auth` | bool | false | — | — | CLI, TUI, API | Skip key creation and authentication for this run (loopback-only). |
-
-### `awman squad stop`
-
-Alias: `kill`
-
-Stop the squad daemon.
-
-Available via: CLI, TUI, API
-
-### `awman squad status`
-
-Show squad daemon status.
-
-Available via: CLI, TUI, API
-
-| Flag | Kind | Default | Implies | Conflicts | Frontends | Help |
-|---|---|---|---|---|---|---|
-| `--json` | bool | false | — | — | CLI, TUI, API | Emit JSON output. |
-
-### `awman squad logs`
-
-Show the squad daemon log.
-
-Available via: CLI, TUI, API
-
-| Flag | Kind | Default | Implies | Conflicts | Frontends | Help |
-|---|---|---|---|---|---|---|
-| `-f, --follow` | bool | false | — | — | CLI, TUI, API | Follow the log as it grows. |
 
 ### `awman squad add`
 

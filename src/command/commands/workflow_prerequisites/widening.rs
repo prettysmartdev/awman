@@ -131,5 +131,5 @@ pub fn check_task_widening(
             None => TokenFlag::Acquire,
         });
     }
-    check_flag_widening(FrontendKind::Background, &flags, global)
+    check_flag_widening(FrontendKind::SQUAD_LOCAL, &flags, global)
 }

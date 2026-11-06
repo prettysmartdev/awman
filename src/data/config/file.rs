@@ -234,9 +234,11 @@ mod tests {
     fn sample(key: &fields::ConfigKey) -> serde_json::Value {
         use serde_json::json;
         match key.path {
+            "daemon.network.features" => return json!(["worker"]),
+            "daemon.network.listen" => return json!("127.0.0.1:9876"),
             "runtime.builtin.stateDir" => return json!("/state"),
             "runtime.builtin.imageSource" | "runtime.builtin.images.*" => {
-                return json!({"type": "registry", "registry": "localhost:5000"})
+                return json!({"type": "registry", "registry": "localhost:5000"});
             }
             "runtime.builtin.registries.*" => return json!({"insecure": false}),
             "runtime.builtin.network.mode" => return json!("allowlist"),
@@ -247,7 +249,7 @@ mod tests {
             "workflows.prerequisites.gitIdentity.email" => return json!("a@b.c"),
             "workflows.prerequisites.githubToken.envVars" => return json!(["GH_TOKEN"]),
             "workflows.prerequisites.githubToken.acquire.argv" => {
-                return json!(["gh", "auth", "token"])
+                return json!(["gh", "auth", "token"]);
             }
             "agents.flags.*" | "workflows.dynamic.agentsToModels.*" => return json!(["x"]),
             "workServers.*.labels" => return json!({"zone": "eu"}),

@@ -6,10 +6,6 @@ use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 use serde::Serialize;
 
-use crate::command::commands::squad::daemon::{
-    SquadDaemon, SquadDaemonSubcommand, SquadLogsFlags, SquadStartFlags, SquadStatusFlags,
-    SquadStopFlags,
-};
 use crate::command::commands::squad::env_sync::sync_env;
 use crate::command::commands::squad::gateway::{
     CreateTask, DaemonStatus, EnvCoverage, TaskDetail, TaskGateway, UpdateTask,
@@ -58,12 +54,6 @@ pub enum SquadConfirmDecision {
     Dismiss,
 }
 
-#[derive(Debug, Clone)]
-pub struct SquadServeConfig {
-    pub port: u16,
-    pub dangerously_skip_auth: bool,
-}
-
 #[async_trait]
 pub trait SquadCommandFrontend:
     UserMessageSink
@@ -71,42 +61,6 @@ pub trait SquadCommandFrontend:
     + Send
     + Sync
 {
-    /// The unattended frontends the daemon's evaluator drives leader agents
-    /// and workflows with. Only the host that can actually serve the daemon
-    /// supplies them; every other frontend answers `None` and is refused a
-    /// foreground start.
-    fn squad_run_frontends(
-        &self,
-    ) -> Option<std::sync::Arc<dyn crate::command::commands::squad::evaluation::SquadRunFrontends>>
-    {
-        None
-    }
-
-    /// Serve the bootstrapped daemon until shutdown. Layer 2 has already
-    /// opened the store, reconciled orphaned runs and started the scheduler;
-    /// the frontend builds a router over `_handles`, binds, and serves.
-    async fn serve_squad_daemon(
-        &mut self,
-        _handles: crate::command::commands::squad::daemon_runtime::SquadDaemonHandles,
-    ) -> Result<(), CommandError> {
-        Err(CommandError::NotAvailableForFrontend {
-            command: "squad start".into(),
-            frontend: "this".into(),
-        })
-    }
-
-    /// Disclose a squad bearer key this process just minted.
-    ///
-    /// Called by `Dispatch` immediately after the gateway is resolved, and
-    /// exactly once per key: the plaintext exists nowhere else, so a frontend
-    /// that drops it has lost it. The default does nothing, which is right
-    /// only for a frontend with no user in front of it (the daemon's own).
-    fn show_key_setup(
-        &mut self,
-        _setup: &crate::command::commands::squad::supervisor::SquadKeySetup,
-    ) {
-    }
-
     // ── Task-creation interview (BLOCKER-3, §9.3) ──────────────────────
     //
     // These COLLECT input; they must not validate or reject an answer — that
@@ -290,10 +244,9 @@ pub struct SquadAddRequest {
 }
 
 pub enum SquadSubcommand {
-    Start(SquadStartFlags),
-    Stop(SquadStopFlags),
-    Status(SquadStatusFlags),
-    Logs(SquadLogsFlags),
+    /// Bare `awman squad --headless`: the squad feature's summary, from the
+    /// running daemon when there is one.
+    Status,
     Add(SquadAddRequest),
     /// Change an existing task (WI 0110). `interview` collects `update`'s
     /// fields through the frontend instead of taking them from flags.
@@ -369,18 +322,7 @@ pub struct EnvReport {
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", content = "payload")]
 pub enum SquadOutcome {
-    Started {
-        port: u16,
-        background: bool,
-        refreshed_key: bool,
-    },
-    Stopped {
-        stopped_pid: Option<u32>,
-    },
     Status(DaemonStatus),
-    Logs {
-        log_path: String,
-    },
     Task(#[serde(serialize_with = "crate::command::daemon_api::squad::task_wire::serialize")] Task),
     Detail(TaskDetail),
     Tasks(#[serde(serialize_with = "crate::command::daemon_api::squad::task_list_wire")] Vec<Task>),
@@ -481,19 +423,7 @@ impl SquadCommand {
     /// (`"gitroot"`) and both `--port`s come from the catalogue.
     pub fn from_input(ctx: &BuildContext) -> Result<Self, CommandError> {
         let sub = match ctx.caller.leaf() {
-            "start" => SquadSubcommand::Start(SquadStartFlags {
-                port: ctx.flags.require_u16("port")?,
-                background: ctx.flags.bool("background"),
-                refresh_key: ctx.flags.bool("refresh-key"),
-                dangerously_skip_auth: ctx.flags.bool("dangerously-skip-auth"),
-            }),
-            "stop" => SquadSubcommand::Stop(SquadStopFlags),
-            // Carries the gateway so Layer 2 can overlay live scheduler counts
-            // onto the pidfile-derived liveness (§9.4).
-            "squad" | "status" => SquadSubcommand::Status(SquadStatusFlags),
-            "logs" => SquadSubcommand::Logs(SquadLogsFlags {
-                follow: ctx.flags.bool("follow"),
-            }),
+            "squad" => SquadSubcommand::Status,
             "add" => SquadSubcommand::Add(squad_add_request(ctx)?),
             "edit" => SquadSubcommand::Edit {
                 name: ctx.args.require("name")?,
@@ -702,54 +632,28 @@ impl Command for SquadCommand {
             local_user,
         } = self;
         match sub {
-            SquadSubcommand::Start(flags) => {
-                SquadDaemon::new(SquadDaemonSubcommand::Start(flags), engines)
-                    .run(&mut *frontend)
-                    .await
-            }
-            SquadSubcommand::Stop(flags) => {
-                SquadDaemon::new(SquadDaemonSubcommand::Stop(flags), engines)
-                    .run(&mut *frontend)
-                    .await
-            }
-            SquadSubcommand::Status(flags) => {
-                // Liveness, PID and bound address come from the pidfile/sidecar
-                // (correct even when the daemon is down). A gateway is injected
-                // only when the daemon has published its endpoint, so its
-                // presence is the "daemon reachable" signal: overlay the live
-                // scheduler counts from `gateway.status()`. A stopped daemon
-                // means no gateway (no HTTP call); a present-but-failing gateway
-                // degrades to the pidfile-only answer rather than failing (§9.4).
-                let outcome = SquadDaemon::new(SquadDaemonSubcommand::Status(flags), engines)
-                    .run(&mut *frontend)
-                    .await?;
-                let SquadOutcome::Status(mut status) = outcome else {
-                    unreachable!("status subcommand yields a status outcome");
+            SquadSubcommand::Status => {
+                // The squad feature's summary comes from the running daemon;
+                // without one (no gateway) the answer is "not running".
+                let mut status = DaemonStatus {
+                    running: false,
+                    pid: None,
+                    bound_addr: None,
+                    task_count: 0,
+                    active_count: 0,
+                    last_tick: None,
+                    in_flight: 0,
+                    config_error: None,
+                    env_persistence: None,
+                    unmet_env: Vec::new(),
                 };
                 if let Some(gateway) = &gateway {
-                    if let Ok(live) = gateway.status().await {
-                        status.running = live.running;
-                        status.task_count = live.task_count;
-                        status.active_count = live.active_count;
-                        status.last_tick = live.last_tick;
-                        status.in_flight = live.in_flight;
-                        // Both are daemon-only facts (WI 0116 §5a, §6b): the
-                        // pidfile sidecar cannot know either, and leaving them
-                        // at their defaults would silently report full
-                        // coverage for a daemon that just said otherwise.
-                        status.env_persistence = live.env_persistence;
-                        status.unmet_env = live.unmet_env;
-                    }
+                    status = gateway.status().await?;
                 }
                 Ok(SquadOutcome::Status(status))
             }
-            SquadSubcommand::Logs(flags) => {
-                SquadDaemon::new(SquadDaemonSubcommand::Logs(flags), engines)
-                    .run(&mut *frontend)
-                    .await
-            }
             sub => {
-                let gateway = gateway.ok_or_else(|| CommandError::Other("squad tasks are served by the squad daemon; start it with `awman squad start`".into()))?;
+                let gateway = gateway.ok_or_else(|| CommandError::Other("squad tasks are served by the awman daemon; start it with `awman daemon start`".into()))?;
                 match sub {
                     SquadSubcommand::Add(request) => {
                         // In interview mode Layer 2 collects every field through
@@ -1560,7 +1464,7 @@ mod scripted_workspace_scope_tests {
         confirm_scripted_workspace_scope(
             &mut DaemonFrontend,
             // The daemon is not the user's own session: `CallerContext`
-            // reports `local_user == false` for `FrontendKind::Api`.
+            // reports `local_user == false` for `FrontendKind::WORKER_LOCAL`.
             false,
             &TaskWorkspace::Custom(parent),
             Some(&child),

@@ -185,6 +185,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn global_evaluation_settings_come_from_dynamic_workflows() {
+        let global: ConfigFile = serde_json::from_value(serde_json::json!({
+            "workflows": { "dynamic": {
+                "agentsToModels": { "codex": ["model-a"] },
+                "defaultLeader": "claude::leader",
+                "guidance": ["run checks"]
+            }}
+        }))
+        .unwrap();
+        let resolved = SquadConfig::from_global(&global);
+        assert_eq!(resolved.agents_to_models.unwrap()["codex"], ["model-a"]);
+        assert_eq!(resolved.default_leader.as_deref(), Some("claude::leader"));
+        assert_eq!(resolved.guidance.unwrap(), ["run checks"]);
+
+        let legacy = serde_json::json!({"squad": {"guidance": ["old location"]}});
+        let err =
+            crate::data::config::fields::validate_document(&legacy, FileKind::Global).unwrap_err();
+        assert!(err.to_string().contains("workflows.dynamic.guidance"));
+    }
+
+    #[test]
     fn task_layers_over_global_with_additive_guidance() {
         let global = SquadConfig {
             default_leader: Some("claude::a".into()),

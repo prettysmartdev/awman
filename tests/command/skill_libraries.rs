@@ -553,7 +553,7 @@ fn api_and_tui_parsers_reject_pull_conflicts_before_dispatch() {
         .parse_raw_args_with_profile(
             &["new", "skill"],
             &argv,
-            awman::command::dispatch::catalogue::FrontendKind::Api,
+            awman::command::dispatch::catalogue::FrontendKind::WORKER_LOCAL,
         )
         .expect_err("API parser must reject --pull with --global");
     assert!(api_error.to_string().contains("conflicts"), "{api_error}");

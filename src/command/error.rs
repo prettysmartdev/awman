@@ -131,37 +131,24 @@ pub enum CommandError {
     #[error("API workdir root '{root}' is inside a git repository ({git_root}); list it with --workdirs instead, or choose a directory that only contains repositories")]
     ApiWorkdirRootInvalid { root: PathBuf, git_root: PathBuf },
 
-    #[error("API server already running on PID {pid}")]
-    ApiServerAlreadyRunning { pid: u32 },
+    // ── Daemon ────────────────────────────────────────────────────────────
+    #[error("the awman daemon is not running; start it with `awman daemon start`")]
+    DaemonNotRunning,
 
-    #[error("API server is not running")]
-    ApiServerNotRunning,
+    #[error("the awman daemon is already running (PID {pid}); stop it with `awman daemon stop`")]
+    DaemonAlreadyRunning { pid: u32 },
 
     #[error(
-        "no API key configured; run `awman api start --refresh-key` first, or pass `--dangerously-skip-auth`"
+        "no daemon feature is enabled; enable one first, for example \
+         `awman config set daemon.features.worker.enabled true`"
     )]
-    ApiServerAuthMissing,
+    DaemonNoFeatures,
 
-    // ── Squad ─────────────────────────────────────────────────────────────
-    /// The squad daemon is reachable but this process holds no bearer key for
-    /// it. Reported *before* the request rather than after it, because the
-    /// request's own answer is a bare `HTTP 401: API key required`, which
-    /// names neither the variable to set nor the fact that the key can no
-    /// longer be read back — it was shown once and is stored only as a hash.
-    ///
-    /// Typed (WI 0113 F-04) so the CLI and TUI stop authoring this text
-    /// themselves; the wording is byte-identical to the CLI's former
-    /// `missing_squad_key_error`, and tests assert it.
-    #[error(
-        "squad requires a bearer key and none is set in this shell.\n\n\
-         The key is shown only once, when it is minted, and only its hash is \
-         stored — so it cannot be read back. Set {} if you saved it, or mint a \
-         new one with:\n    awman squad start --refresh-key\n\
-         which invalidates the previous key, so any shell still exporting it \
-         must be updated too.",
-        crate::data::config::env::AWMAN_SQUAD_KEY
-    )]
-    SquadKeyMissing,
+    /// The daemon answered a local request with a 4xx/5xx status; `body` is
+    /// the response body as returned.
+    #[error("the daemon returned HTTP {status}: {body}")]
+    DaemonHttpStatus { status: u16, body: String },
+
     // ── Session creation (multi-session frontends: API, future desktop, …) ──
     // Typed so that a frontend can map each to the right transport status
     // (e.g. HTTP 400 vs 403) without inspecting the message string. Display
@@ -470,14 +457,14 @@ impl CommandError {
         | CommandError::RemoteHttpStatus { .. }
         | CommandError::MalformedSseEvent(_)
         | CommandError::RemoteTransport(_) => 1,
-        CommandError::ApiServerAlreadyRunning { .. }
-        | CommandError::ApiServerNotRunning
-        | CommandError::ApiServerAuthMissing
+        CommandError::DaemonNotRunning
+        | CommandError::DaemonAlreadyRunning { .. }
+        | CommandError::DaemonNoFeatures
+        | CommandError::DaemonHttpStatus { .. }
         | CommandError::RemoteSessionMissing
         | CommandError::RemoteSessionKillFailed { .. } => 1,
         CommandError::NotImplemented(_) => 1,
         CommandError::NotAvailableForFrontend { .. } => 1,
-        CommandError::SquadKeyMissing => 1,
         CommandError::AgentOwnerGone { .. } => 1,
         CommandError::Other(_) => 1,
     }
@@ -582,10 +569,10 @@ impl CommandError {
             | CommandError::MissingApiKey
             | CommandError::ApiWorkdirNotFound { .. }
             | CommandError::ApiWorkdirRootInvalid { .. }
-            | CommandError::ApiServerAlreadyRunning { .. }
-            | CommandError::ApiServerNotRunning
-            | CommandError::ApiServerAuthMissing
-            | CommandError::SquadKeyMissing
+            | CommandError::DaemonNotRunning
+            | CommandError::DaemonAlreadyRunning { .. }
+            | CommandError::DaemonNoFeatures
+            | CommandError::DaemonHttpStatus { .. }
             | CommandError::SessionInvalidType { .. }
             | CommandError::SessionWorkdirRequired
             | CommandError::SessionWorkdirUnresolvable { .. }
@@ -681,10 +668,10 @@ impl CommandError {
 
             CommandError::ApiWorkdirNotFound { .. } => "api_workdir_not_found",
             CommandError::ApiWorkdirRootInvalid { .. } => "api_workdir_root_invalid",
-            CommandError::ApiServerAlreadyRunning { .. } => "api_server_already_running",
-            CommandError::ApiServerNotRunning => "api_server_not_running",
-            CommandError::ApiServerAuthMissing => "api_server_auth_missing",
-            CommandError::SquadKeyMissing => "squad_key_missing",
+            CommandError::DaemonNotRunning => "daemon_not_running",
+            CommandError::DaemonAlreadyRunning { .. } => "daemon_already_running",
+            CommandError::DaemonNoFeatures => "daemon_no_features",
+            CommandError::DaemonHttpStatus { .. } => "daemon_http_status",
 
             CommandError::SessionInvalidType { .. } => "session_invalid_type",
             CommandError::SessionWorkdirRequired => "session_workdir_required",

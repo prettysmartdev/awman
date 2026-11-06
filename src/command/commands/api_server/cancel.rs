@@ -22,7 +22,7 @@ use crate::data::fs::api_db::{CommandRecord, SqliteSessionStore};
 
 /// In-process map from an id (command id, or session id for setups) to the
 /// token the owning task observes. One instance per daemon for commands and
-/// one for setups; both hang off `ApiServerRuntime`.
+/// one for setups; both hang off `WorkerServices`.
 #[derive(Default)]
 pub struct TokenRegistry {
     tokens: Mutex<HashMap<String, CancellationToken>>,
@@ -57,6 +57,16 @@ impl TokenRegistry {
         }
     }
 
+    pub fn cancel_all(&self) -> Vec<String> {
+        let tokens = self.lock();
+        tokens
+            .iter()
+            .map(|(id, token)| {
+                token.cancel();
+                id.clone()
+            })
+            .collect()
+    }
     pub fn is_registered(&self, id: &str) -> bool {
         self.lock().contains_key(id)
     }

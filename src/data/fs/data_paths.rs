@@ -62,6 +62,8 @@ fn user_home(env: &EnvSnapshot) -> Result<PathBuf, DataError> {
 }
 
 /// Subdirectory under the data home that hosts the shared database.
+pub const DAEMON_SUBDIR: &str = "daemon";
+
 pub const DATA_SUBDIR: &str = "data";
 
 /// Filename of the shared sqlite database. Identical to
@@ -118,6 +120,11 @@ impl DataPaths {
     /// The shared data root (`<data_home>/data`).
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// The single daemon identity directory.
+    pub fn daemon(&self) -> crate::data::fs::daemon_paths::DaemonPaths {
+        crate::data::fs::daemon_paths::DaemonPaths::new(self.root.join(DAEMON_SUBDIR))
     }
 
     /// The data home this root sits in (`<data_home>`).

@@ -14,7 +14,7 @@ pub enum CommandOutcome {
     ExecPrompt(crate::command::commands::exec_prompt::ExecPromptOutcome),
     ExecWorkflow(crate::command::commands::exec_workflow::ExecWorkflowOutcome),
     DaemonApi(crate::command::commands::daemon::api::DaemonApiOutcome),
-    ApiServer(crate::command::commands::api_server::ApiServerOutcome),
+    Daemon(crate::command::commands::daemon::lifecycle::DaemonOutcome),
     Squad(crate::command::commands::squad::commands::SquadOutcome),
     SquadAttach(crate::command::commands::squad::attach::SquadAttachOutcome),
     Remote(crate::command::commands::remote::RemoteOutcome),

@@ -21,7 +21,7 @@ use crate::data::session::{Session, SessionKind};
 use crate::data::session_setup_event::SessionSetupStatus;
 use crate::data::workflow_state::{PhaseStepStatus, StepState, WorkflowPhase, WorkflowState};
 use crate::engine::git::GitEngine;
-use crate::frontend::api::routes::{build_router, AppState, AuthMode};
+use crate::frontend::api::routes::{build_router, AppState};
 
 const WORKFLOW: &str = r#"
 [[setup]]
@@ -94,7 +94,6 @@ fn app_state(root: &Path) -> Arc<AppState> {
         workdir_roots: Vec::new(),
         started_at: std::time::Instant::now(),
         task_handles: tokio::sync::Mutex::new(Vec::new()),
-        auth_mode: AuthMode::Disabled,
         engines: Engines::for_tests(root),
         sessions: Arc::new(crate::data::session_manager::SessionManager::in_memory(
             crate::data::config::env::EnvSnapshot::empty(),

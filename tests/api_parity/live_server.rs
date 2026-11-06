@@ -20,9 +20,9 @@ use awman::engine::auth::AuthEngine;
 use awman::engine::container::ContainerRuntime;
 use awman::engine::git::GitEngine;
 use awman::engine::overlay::OverlayEngine;
-use awman::frontend::api::routes::{AppState, AuthMode};
+use awman::frontend::api::routes::AppState;
 
-fn make_app_state(root: &std::path::Path, auth: AuthMode) -> Arc<AppState> {
+fn make_app_state(root: &std::path::Path) -> Arc<AppState> {
     let paths = ApiPaths::from_root(root);
     paths.ensure_root().expect("ensure_root");
     let store = SqliteSessionStore::open(paths.root()).expect("open sqlite");
@@ -74,7 +74,6 @@ fn make_app_state(root: &std::path::Path, auth: AuthMode) -> Arc<AppState> {
         workdir_roots: Vec::new(),
         started_at: Instant::now(),
         task_handles: tokio::sync::Mutex::new(Vec::new()),
-        auth_mode: auth,
         engines,
         sessions: Arc::new(awman::data::session_manager::SessionManager::in_memory(
             awman::data::config::env::EnvSnapshot::empty(),
@@ -87,7 +86,7 @@ fn make_app_state(root: &std::path::Path, auth: AuthMode) -> Arc<AppState> {
 #[tokio::test]
 async fn real_network_api_status_endpoint_returns_ok() {
     let tmp = tempfile::tempdir().unwrap();
-    let state = make_app_state(tmp.path(), AuthMode::Disabled);
+    let state = make_app_state(tmp.path());
     let Some((addr, server)) = spawn_router(state).await else {
         eprintln!("SKIP: cannot bind 127.0.0.1");
         return;
@@ -116,7 +115,7 @@ async fn real_network_api_status_endpoint_returns_ok() {
 #[tokio::test]
 async fn real_network_api_unknown_route_returns_404() {
     let tmp = tempfile::tempdir().unwrap();
-    let state = make_app_state(tmp.path(), AuthMode::Disabled);
+    let state = make_app_state(tmp.path());
     let Some((addr, server)) = spawn_router(state).await else {
         eprintln!("SKIP: cannot bind 127.0.0.1");
         return;
@@ -132,7 +131,7 @@ async fn real_network_api_unknown_route_returns_404() {
 #[tokio::test]
 async fn real_network_api_workdirs_endpoint_returns_200() {
     let tmp = tempfile::tempdir().unwrap();
-    let state = make_app_state(tmp.path(), AuthMode::Disabled);
+    let state = make_app_state(tmp.path());
     let Some((addr, server)) = spawn_router(state).await else {
         eprintln!("SKIP: cannot bind 127.0.0.1");
         return;
@@ -151,13 +150,10 @@ async fn real_network_api_workdirs_endpoint_returns_200() {
 #[tokio::test]
 async fn real_network_api_auth_required_when_enabled() {
     let tmp = tempfile::tempdir().unwrap();
-    let state = make_app_state(
-        tmp.path(),
-        AuthMode::Enabled {
-            key_hash: "deadbeef".to_string(),
-        },
-    );
-    let Some((addr, server)) = spawn_router(state).await else {
+    let api = Arc::new(awman::command::daemon_api::DaemonApi::for_worker_tests(
+        make_app_state(tmp.path()),
+    ));
+    let Some((addr, server)) = spawn_network(api).await else {
         eprintln!("SKIP: cannot bind 127.0.0.1");
         return;
     };
@@ -175,20 +171,14 @@ async fn real_network_api_auth_required_when_enabled() {
 
 #[tokio::test]
 async fn real_network_api_auth_accepts_valid_key() {
-    use ring::digest;
     let tmp = tempfile::tempdir().unwrap();
 
-    // Choose a known key, hash it, hand the hash to the server.
-    let key = "test-api-key-xyz";
-    let h = digest::digest(&digest::SHA256, key.as_bytes());
-    let hash = h
-        .as_ref()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect::<String>();
-
-    let state = make_app_state(tmp.path(), AuthMode::Enabled { key_hash: hash });
-    let Some((addr, server)) = spawn_router(state).await else {
+    let api = Arc::new(awman::command::daemon_api::DaemonApi::for_worker_tests(
+        make_app_state(tmp.path()),
+    ));
+    let (_, key) = api.runtime.keys().create("test").unwrap();
+    let key = key.as_str();
+    let Some((addr, server)) = spawn_network(api).await else {
         eprintln!("SKIP: cannot bind 127.0.0.1");
         return;
     };
@@ -203,4 +193,21 @@ async fn real_network_api_auth_accepts_valid_key() {
     assert_eq!(resp.status(), 200, "valid bearer key must be accepted");
 
     server.abort();
+}
+
+async fn spawn_network(
+    api: Arc<awman::command::daemon_api::DaemonApi>,
+) -> Option<(std::net::SocketAddr, tokio::task::JoinHandle<()>)> {
+    let app = awman::frontend::api::routes::build_router_for_listener(
+        api,
+        awman::frontend::api::routes::ListenerPolicy::Network,
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.ok()?;
+    let addr = listener.local_addr().unwrap();
+    Some((
+        addr,
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        }),
+    ))
 }

@@ -98,10 +98,13 @@ fn every_variant() -> Vec<CommandError> {
             root: "/r".into(),
             git_root: "/g".into(),
         },
-        CommandError::ApiServerAlreadyRunning { pid: 1 },
-        CommandError::ApiServerNotRunning,
-        CommandError::ApiServerAuthMissing,
-        CommandError::SquadKeyMissing,
+        CommandError::DaemonAlreadyRunning { pid: 1 },
+        CommandError::DaemonNotRunning,
+        CommandError::DaemonNoFeatures,
+        CommandError::DaemonHttpStatus {
+            status: 409,
+            body: "b".into(),
+        },
         CommandError::SessionInvalidType { got: "x".into() },
         CommandError::SessionWorkdirRequired,
         CommandError::SessionWorkdirUnresolvable { path: "/p".into() },
@@ -218,10 +221,10 @@ fn variant_witness(error: &CommandError) -> &'static str {
         CommandError::RemoteTransport(_) => "RemoteTransport",
         CommandError::ApiWorkdirNotFound { .. } => "ApiWorkdirNotFound",
         CommandError::ApiWorkdirRootInvalid { .. } => "ApiWorkdirRootInvalid",
-        CommandError::ApiServerAlreadyRunning { .. } => "ApiServerAlreadyRunning",
-        CommandError::ApiServerNotRunning => "ApiServerNotRunning",
-        CommandError::ApiServerAuthMissing => "ApiServerAuthMissing",
-        CommandError::SquadKeyMissing => "SquadKeyMissing",
+        CommandError::DaemonAlreadyRunning { .. } => "DaemonAlreadyRunning",
+        CommandError::DaemonNotRunning => "DaemonNotRunning",
+        CommandError::DaemonNoFeatures => "DaemonNoFeatures",
+        CommandError::DaemonHttpStatus { .. } => "DaemonHttpStatus",
         CommandError::SessionInvalidType { .. } => "SessionInvalidType",
         CommandError::SessionWorkdirRequired => "SessionWorkdirRequired",
         CommandError::SessionWorkdirUnresolvable { .. } => "SessionWorkdirUnresolvable",
@@ -795,13 +798,7 @@ mod server {
             git(&path, &["config", "user.email", "fixture@awman.test"]);
             git(&path, &["add", "-A"]);
             git(&path, &["commit", "-q", "-m", "base"]);
-            let config = home.home().join(".config/awman");
-            std::fs::create_dir_all(&config).unwrap();
-            std::fs::write(
-                config.join("config.json"),
-                json!({"daemon":{"features":{"worker":{"push":{"workDirs":{"allow":[path.display().to_string()]}}}}}}).to_string(),
-            )
-            .unwrap();
+            home.write_config(json!({"daemon":{"features":{"worker":{"push":{"workDirs":{"allow":[path.display().to_string()]}}}}}}));
             Self { _dir: dir, path }
         }
 

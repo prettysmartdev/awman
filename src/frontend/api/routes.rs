@@ -24,7 +24,6 @@ use crate::command::commands::api_server::event_bus::EventBus;
 use crate::command::commands::api_server::session_setup::{
     log_session_setup, SessionSetupBus, SessionSetupBusSender, SetupReadyFrontend, TracingSetupSink,
 };
-pub use crate::command::commands::api_server::AuthMode;
 use crate::command::commands::api_server::{CancelOutcome, CloseOutcome, SetupReadiness};
 use crate::command::session_create::{SessionCreatePlan, SessionCreateRequest};
 use crate::command::session_setup::{SessionSetup, SessionSetupPresenter};
@@ -199,6 +198,10 @@ struct CreateCommandRequest {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CommandResponse {
+    #[serde(default)]
+    listener: String,
+    #[serde(default)]
+    trace_parent: Option<String>,
     id: crate::data::ids::CommandId,
     attempt: u32,
     session_id: crate::data::ids::WorkerSessionId,
@@ -382,6 +385,8 @@ fn command_response(
         .queue_position(&c)
         .map_err(|_| internal_error("Failed to read queue position"))?;
     Ok(CommandResponse {
+        listener: c.listener.clone(),
+        trace_parent: c.trace_parent.clone(),
         args: crate::command::commands::api_server::runtime::stored_args_view(&c),
         result: c
             .result
@@ -582,6 +587,7 @@ fn accepted_json(body: String) -> Response {
 /// Which requests run, replay, wait or conflict is the gate's decision.
 async fn with_idempotency<F, Fut>(
     state: &AppState,
+    principal: &str,
     headers: &HeaderMap,
     route: &'static str,
     canonical: &str,
@@ -596,7 +602,7 @@ where
         Some(Ok(key)) => Some(key),
         Some(Err(_)) => return bad_request("invalid Idempotency-Key header"),
     };
-    let run = match IdempotencyGate::open(&state.store, route, &state.auth_mode, key, canonical) {
+    let run = match IdempotencyGate::open(&state.store, route, principal, key, canonical) {
         Ok(IdempotencyGate::Unkeyed) => return handler(None).await,
         Ok(IdempotencyGate::Fresh(run)) => run,
         Ok(IdempotencyGate::Replay { status, body }) => {
@@ -678,6 +684,34 @@ pub struct RouteSpec {
 pub const ROUTES: &[RouteSpec] = &[
     RouteSpec {
         method: "GET",
+        path: "/v1/health",
+        op: Operation::CoreHealth,
+        local_only: false,
+        capability: Some("health"),
+    },
+    RouteSpec {
+        method: "GET",
+        path: "/v1/keys",
+        op: Operation::CoreKeysList,
+        local_only: true,
+        capability: Some("api_keys"),
+    },
+    RouteSpec {
+        method: "POST",
+        path: "/v1/keys",
+        op: Operation::CoreKeysCreate,
+        local_only: true,
+        capability: Some("api_keys"),
+    },
+    RouteSpec {
+        method: "DELETE",
+        path: "/v1/keys/{id}",
+        op: Operation::CoreKeysDelete,
+        local_only: true,
+        capability: Some("api_keys"),
+    },
+    RouteSpec {
+        method: "GET",
         path: "/v1/status",
         op: Operation::CoreStatus,
         local_only: false,
@@ -710,6 +744,13 @@ pub const ROUTES: &[RouteSpec] = &[
         op: Operation::CoreFeaturesGet,
         local_only: false,
         capability: Some("feature_states"),
+    },
+    RouteSpec {
+        method: "PATCH",
+        path: "/v1/features/{feature}",
+        op: Operation::CoreFeaturesPatch,
+        local_only: true,
+        capability: Some("daemon_features"),
     },
     RouteSpec {
         method: "GET",
@@ -921,11 +962,13 @@ pub const ROUTES: &[RouteSpec] = &[
 #[derive(Debug, Clone)]
 pub enum ListenerPolicy {
     Local,
-    Network { features: Vec<Feature> },
+    Network,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub fn build_router(state: impl Into<DaemonApi>) -> Router {
     build_router_for_listener(Arc::new(state.into()), ListenerPolicy::Local)
+        .layer(axum::Extension(super::local::OwnerAuthenticated))
 }
 pub fn build_router_for_listener(api: Arc<DaemonApi>, policy: ListenerPolicy) -> Router {
     let mut router = Router::new();
@@ -956,14 +999,18 @@ pub fn build_router_for_listener(api: Arc<DaemonApi>, policy: ListenerPolicy) ->
                 let api = gate_api.clone();
                 let policy = gate_policy.clone();
                 async move {
-                    if matches!(&policy, ListenerPolicy::Network { .. }) && spec.local_only {
+                    if matches!(&policy, ListenerPolicy::Network) && spec.local_only {
                         return ApiError::not_found("resource not found").into_response();
                     }
-                    let state = api
-                        .features
-                        .read()
-                        .expect("feature set lock")
-                        .state(spec.op.owner());
+                    let state = spec
+                        .op
+                        .owner()
+                        .feature_name()
+                        .map(|name| api.runtime.feature_state(name).state)
+                        .unwrap_or(FeatureState::On);
+                    if state == FeatureState::Degraded && spec.op.creates() {
+                        return ApiError::feature_degraded("feature is recovering").into_response();
+                    }
                     if state == FeatureState::Off
                         || (state == FeatureState::Draining && spec.op.creates())
                     {
@@ -998,26 +1045,13 @@ pub fn build_router_for_listener(api: Arc<DaemonApi>, policy: ListenerPolicy) ->
     }
     router
         .fallback(|| async { ApiError::not_found("resource not found") })
-        .method_not_allowed_fallback(move |request: axum::http::Request<axum::body::Body>| {
-            let policy = policy.clone();
-            async move {
-                // Hidden resources must not be revealed by a different verb.
-                if let ListenerPolicy::Network { .. } = policy {
-                    let path = request
-                        .extensions()
-                        .get::<axum::extract::MatchedPath>()
-                        .map(|p| p.as_str());
-                    if ROUTES
-                        .iter()
-                        .any(|spec| Some(spec.path) == path && spec.local_only)
-                    {
-                        return ApiError::not_found("resource not found").into_response();
-                    }
-                }
-                ApiError::method_not_allowed("method not allowed").into_response()
-            }
+        .method_not_allowed_fallback(|| async {
+            ApiError::method_not_allowed("method not allowed")
         })
-        .layer(axum::middleware::from_fn_with_state(api, daemon_auth))
+        .layer(axum::middleware::from_fn_with_state(
+            (api, policy),
+            daemon_auth,
+        ))
         .layer(axum::middleware::from_fn(
             super::error::normalize_rejections,
         ))
@@ -1047,26 +1081,79 @@ fn worker_route(op: Operation, filter: MethodFilter) -> MethodRouter<Arc<AppStat
         _ => unreachable!("non-worker operation"),
     }
 }
+#[derive(Clone)]
+struct RequestPrincipal(String);
 async fn daemon_auth(
-    State(api): State<Arc<DaemonApi>>,
-    request: axum::http::Request<axum::body::Body>,
+    State((api, policy)): State<(Arc<DaemonApi>, ListenerPolicy)>,
+    mut request: axum::http::Request<axum::body::Body>,
     next: axum::middleware::Next,
 ) -> Response {
+    let path = request
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .map(|p| p.as_str());
+    let selected = ROUTES
+        .iter()
+        .find(|s| Some(s.path) == path && s.method == request.method().as_str());
+    if matches!(policy, ListenerPolicy::Network) {
+        let hidden = |spec: &RouteSpec| {
+            spec.op.local_only()
+                || spec
+                    .op
+                    .owner()
+                    .feature_name()
+                    .is_some_and(|f| !api.runtime.network_serves(f))
+        };
+        if selected
+            .map(&hidden)
+            .unwrap_or_else(|| ROUTES.iter().any(|s| Some(s.path) == path && hidden(s)))
+        {
+            return ApiError::not_found("resource not found").into_response();
+        }
+    }
+    if let Some(spec) = selected {
+        request.extensions_mut().insert(spec.op);
+    }
+    request.extensions_mut().insert(match policy {
+        ListenerPolicy::Local => crate::data::daemon_state::CommandListener::Local,
+        ListenerPolicy::Network => crate::data::daemon_state::CommandListener::Network,
+    });
     if request
         .extensions()
         .get::<super::local::OwnerAuthenticated>()
         .is_some()
     {
+        request
+            .extensions_mut()
+            .insert(RequestPrincipal("owner".into()));
         return next.run(request).await;
     }
-    if let Some(rejection) = crate::frontend::api::serve::check_bearer_auth(
-        &api.engines,
-        &api.auth_mode,
-        request.headers(),
-    ) {
-        return rejection;
+    if request.extensions().get::<Operation>() == Some(&Operation::CoreHealth)
+        || request.uri().path() == "/v1/health"
+    {
+        return next.run(request).await;
     }
-    next.run(request).await
+    {
+        let runtime = &api.runtime;
+        let header = request
+            .headers()
+            .get("authorization")
+            .and_then(|value| value.to_str().ok());
+        match runtime.keys().verify(header) {
+            crate::engine::auth::api_keys::KeyVerdict::Accepted { id } => {
+                request
+                    .extensions_mut()
+                    .insert(RequestPrincipal(id.to_string()));
+                next.run(request).await
+            }
+            crate::engine::auth::api_keys::KeyVerdict::NoKeys => {
+                ApiError::unauthorized("no API keys are configured on this daemon").into_response()
+            }
+            crate::engine::auth::api_keys::KeyVerdict::Rejected => {
+                ApiError::unauthorized("Invalid API key.").into_response()
+            }
+        }
+    }
 }
 
 // Handlers
@@ -1079,13 +1166,20 @@ async fn handle_workdirs(
 }
 
 async fn handle_create_session(
+    axum::Extension(principal): axum::Extension<RequestPrincipal>,
     State(state): State<Arc<AppState>>,
+    axum::Extension(listener): axum::Extension<crate::data::daemon_state::CommandListener>,
     headers: HeaderMap,
     Json(value): Json<serde_json::Value>,
 ) -> Response {
+    let context = crate::data::daemon_state::CommandRequestContext::from_header(
+        listener,
+        headers.get("traceparent").and_then(|v| v.to_str().ok()),
+    );
     let st = &state;
     with_idempotency(
         &state,
+        &principal.0,
         &headers,
         "/v1/worker/sessions",
         &value.to_string(),
@@ -1094,21 +1188,28 @@ async fn handle_create_session(
                 Ok(body) => body,
                 Err(error) => return bad_request(error.to_string()),
             };
-            create_submission(st, body, None, false, journal.as_deref()).await
+            create_submission(st, context, body, None, false, journal.as_deref()).await
         },
     )
     .await
 }
 
 async fn handle_create_run(
+    axum::Extension(principal): axum::Extension<RequestPrincipal>,
     State(state): State<Arc<AppState>>,
+    axum::Extension(listener): axum::Extension<crate::data::daemon_state::CommandListener>,
     headers: HeaderMap,
     Json(value): Json<serde_json::Value>,
 ) -> Response {
+    let context = crate::data::daemon_state::CommandRequestContext::from_header(
+        listener,
+        headers.get("traceparent").and_then(|v| v.to_str().ok()),
+    );
     let st = &state;
     let canonical = value.to_string();
     with_idempotency(
         &state,
+        &principal.0,
         &headers,
         "/v1/worker/runs",
         &canonical,
@@ -1124,6 +1225,7 @@ async fn handle_create_run(
             }
             create_submission(
                 st,
+                context,
                 body.session,
                 Some(body.command),
                 body.close_on_finish,
@@ -1137,6 +1239,7 @@ async fn handle_create_run(
 
 async fn create_submission(
     state: &Arc<AppState>,
+    context: crate::data::daemon_state::CommandRequestContext,
     body: CreateSessionRequest,
     command: Option<CreateCommandRequest>,
     close_on_finish: bool,
@@ -1159,9 +1262,20 @@ async fn create_submission(
     };
     let result = match command {
         Some(command) => {
-            worker::runs_create(state, submission, command.into(), close_on_finish, journal).await
+            worker::runs_create(
+                state,
+                context,
+                submission,
+                command.into(),
+                close_on_finish,
+                journal,
+            )
+            .await
         }
-        None => worker::sessions_create(state, submission, None, close_on_finish, journal).await,
+        None => {
+            worker::sessions_create(state, context, submission, None, close_on_finish, journal)
+                .await
+        }
     };
     let admitted = match result {
         Ok(admitted) => admitted,
@@ -1469,10 +1583,16 @@ async fn handle_close_session(
 }
 
 async fn handle_create_command(
+    axum::Extension(principal): axum::Extension<RequestPrincipal>,
     State(state): State<Arc<AppState>>,
+    axum::Extension(listener): axum::Extension<crate::data::daemon_state::CommandListener>,
     headers: HeaderMap,
     Json(value): Json<serde_json::Value>,
 ) -> Response {
+    let context = crate::data::daemon_state::CommandRequestContext::from_header(
+        listener,
+        headers.get("traceparent").and_then(|v| v.to_str().ok()),
+    );
     let body: CreateCommandRequest = match serde_json::from_value(value.clone()) {
         Ok(body) => body,
         Err(error) => return bad_request(error.to_string()),
@@ -1485,16 +1605,18 @@ async fn handle_create_command(
     let (st, hd) = (&state, &headers);
     with_idempotency(
         &state,
+        &principal.0,
         &headers,
         "/v1/worker/commands",
         &canonical,
-        |journal| async move { create_command(st, hd, body, journal.as_deref()).await },
+        |journal| async move { create_command(st, context, hd, body, journal.as_deref()).await },
     )
     .await
 }
 
 async fn create_command(
     state: &AppState,
+    context: crate::data::daemon_state::CommandRequestContext,
     headers: &HeaderMap,
     body: CreateCommandRequest,
     journal: Option<&IdempotentAdmission>,
@@ -1512,7 +1634,7 @@ async fn create_command(
         Ok(id) => id,
         Err(_) => return ApiError::session_not_found("session not found").into_response(),
     };
-    match worker::commands_create(state, &id, submission, journal).await {
+    match worker::commands_create(state, context, &id, submission, journal).await {
         Ok(admitted) => accepted_json(admitted.response_body),
         Err(error) => admission_error(error, &session_id),
     }
@@ -1687,6 +1809,7 @@ async fn handle_stream_command_logs(
                     Some(CommandLogUpdate::Lagged(n)) => Event::default().comment(
                         format!("lagged: recovering {n} events from log")
                     ),
+                    Some(CommandLogUpdate::QueueStatus(status)) => Event::default().event("queue_status").data(serde_json::to_string(&status).expect("queue status serializes")),
                     Some(CommandLogUpdate::Event { event, cursor }) => execution_event_to_sse(&event, cursor),
                 }
             };
@@ -1923,7 +2046,14 @@ mod tests {
         Arc::get_mut(&mut state).unwrap().workdirs = vec![tmp.path().canonicalize().unwrap()];
         let bus_guard = state.setup_buses.lock().await;
         let request = serde_json::from_value(serde_json::json!({"workdir": tmp.path()})).unwrap();
-        let mut submission = Box::pin(create_submission(&state, request, None, false, None));
+        let mut submission = Box::pin(create_submission(
+            &state,
+            Default::default(),
+            request,
+            None,
+            false,
+            None,
+        ));
         // Even with the bus lock held, admission and spawn finish in one poll.
         let response = match futures_util::poll!(&mut submission) {
             std::task::Poll::Ready(response) => response,
@@ -2162,7 +2292,6 @@ mod tests {
             workdir_roots: Vec::new(),
             started_at: Instant::now(),
             task_handles: tokio::sync::Mutex::new(Vec::new()),
-            auth_mode: AuthMode::Disabled,
             engines,
             sessions: Arc::new(SessionManager::in_memory(
                 crate::data::config::env::EnvSnapshot::empty(),
@@ -2177,7 +2306,7 @@ mod tests {
         // Guard: if someone adds a route without updating this table, the count drifts.
         assert_eq!(
             EXPECTED_ROUTES.len(),
-            34,
+            39,
             "route count mismatch — update EXPECTED_ROUTES"
         );
     }
@@ -2382,19 +2511,11 @@ mod tests {
     #[tokio::test]
     async fn auth_enabled_rejects_bad_key_with_401() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut state = make_test_state(tmp.path());
-
-        // Set up auth with a known key hash.
-        let key = "my-test-api-key";
-        let hash: String = {
-            use ring::digest;
-            let h = digest::digest(&digest::SHA256, key.as_bytes());
-            h.as_ref().iter().map(|b| format!("{b:02x}")).collect()
-        };
-        // Replace auth_mode with Enabled.
-        Arc::get_mut(&mut state).unwrap().auth_mode = AuthMode::Enabled { key_hash: hash };
-
-        let app = build_router(state);
+        let state = make_test_state(tmp.path());
+        let api = Arc::new(DaemonApi::for_worker_tests(state));
+        let (_, key) = api.runtime.keys().create("test").unwrap();
+        let key = key.as_str();
+        let app = build_router_for_listener(api, ListenerPolicy::Network);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -2549,7 +2670,32 @@ async fn resource_handler(
     match op {
         Operation::CoreStatus => command!(core::status(&api).await),
         Operation::CoreConfigGet => Json(core::config_get(&api)).into_response(),
-        Operation::CoreConfigReload => match api.reload_config() {
+        Operation::CoreHealth => Json(core::health().await).into_response(),
+        Operation::CoreKeysList => match crate::command::daemon_api::keys::keys_list(&api) {
+            Ok(v) => page_response(v.items, &query.page),
+            Err(e) => key_error(e),
+        },
+        Operation::CoreKeysCreate => {
+            #[derive(serde::Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct CreateKey {
+                name: String,
+            }
+            let request = decode!(CreateKey);
+            match crate::command::daemon_api::keys::keys_create(&api, &request.name) {
+                Ok(v) => (StatusCode::CREATED, Json(v)).into_response(),
+                Err(e) => key_error(e),
+            }
+        }
+        Operation::CoreKeysDelete => match crate::data::ids::KeyId::parse(id) {
+            Ok(id) => match crate::command::daemon_api::keys::keys_delete(&api, &id) {
+                Ok(true) => StatusCode::NO_CONTENT.into_response(),
+                Ok(false) => ApiError::not_found("key not found").into_response(),
+                Err(e) => key_error(e),
+            },
+            Err(_) => ApiError::not_found("resource not found").into_response(),
+        },
+        Operation::CoreConfigReload => match core::config_reload(&api).await {
             Ok(v) => Json(v).into_response(),
             Err(e) => ApiError::config_invalid("configuration validation failed")
                 .with_details(serde_json::json!({"errors":[e.to_string()]})),
@@ -2565,6 +2711,38 @@ async fn resource_handler(
             {
                 Some(f) => command!(core::feature(&api, f).await),
                 None => ApiError::not_found("feature not found").into_response(),
+            }
+        }
+        Operation::CoreFeaturesPatch => {
+            use crate::command::daemon_api::core::FeaturePatchError;
+            use crate::command::daemon_runtime::FeatureChangeError;
+            let Some(feature) = crate::data::daemon_state::FeatureName::ALL
+                .into_iter()
+                .find(|f| params.get("feature").is_some_and(|p| p == f.as_str()))
+            else {
+                return ApiError::not_found("feature not found").into_response();
+            };
+            match core::feature_patch(&api, feature, decode!(core::FeaturePatch)).await {
+                Ok(record) => Json(record).into_response(),
+                Err(FeaturePatchError::PersistentChange) => {
+                    ApiError::invalid_request("persistent changes go through awman config set")
+                        .into_response()
+                }
+                Err(FeaturePatchError::Change(FeatureChangeError::UnknownFeature)) => {
+                    ApiError::not_found("feature not found").into_response()
+                }
+                Err(FeaturePatchError::Change(FeatureChangeError::EphemeralNotAllowed(f))) => {
+                    ApiError::ephemeral_not_allowed(format!(
+                        "ephemeral enablement is not allowed for {f}"
+                    ))
+                    .into_response()
+                }
+                Err(FeaturePatchError::Change(FeatureChangeError::EnabledByConfig(f))) => {
+                    ApiError::conflict(format!("{f} is enabled by config")).into_response()
+                }
+                Err(FeaturePatchError::Change(FeatureChangeError::Engine(e))) => {
+                    ApiError::internal(e.to_string()).into_response()
+                }
             }
         }
         Operation::CoreGrantsList => match core::grants_list(&api) {
@@ -2670,6 +2848,20 @@ async fn resource_handler(
     }
 }
 
+fn key_error(error: crate::command::daemon_api::keys::KeyError) -> Response {
+    use crate::command::daemon_api::keys::KeyError;
+    match error {
+        KeyError::InvalidName => {
+            ApiError::invalid_request("invalid key name: use [a-z0-9][a-z0-9_-]{0,62}")
+                .into_response()
+        }
+        KeyError::NameTaken => {
+            ApiError::conflict("a key with this name already exists").into_response()
+        }
+        KeyError::Engine(e) => ApiError::internal(e.to_string()).into_response(),
+    }
+}
+
 fn parse_at(raw: &str) -> Result<chrono::DateTime<chrono::Utc>, chrono::ParseError> {
     chrono::DateTime::parse_from_rfc3339(raw).map(|t| t.with_timezone(&chrono::Utc))
 }
@@ -2735,10 +2927,10 @@ mod wire_contract_tests {
             serde_json::json!({"session_id":session,"setup_status":"ready","status":"closing","running_command_id":command,"cancelled_count":1,"message":"closing"}),
         );
         round::<crate::command::daemon_api::core::StatusResponse>(
-            serde_json::json!({"status":"ok","version":"test","protocol":{"api":1},"capabilities":[],"features":{},"max_concurrent_jobs":2,"pid":1,"uptime_ms":1234,"listeners":[]}),
+            serde_json::json!({"status":"ok","version":"test","protocol":{"api":1},"capabilities":[],"features":{},"max_concurrent_jobs":2,"pid":1,"uptime_ms":1234,"listeners":{"local":null,"network":null},"agents":[]}),
         );
         round::<crate::command::daemon_api::core::FeatureRecord>(
-            serde_json::json!({"name":"worker","state":"on","running":1,"queued":2}),
+            serde_json::json!({"name":"worker","state":"on","running":1,"queued":2,"enabled_by":"config","oldest_queued_age_ms":4100,"restarts":0,"last_error":null,"since_at":"2026-11-06T10:00:00Z"}),
         );
         round::<crate::command::daemon_api::core::ReloadResponse>(
             serde_json::json!({"applied":[],"restart_required":[]}),

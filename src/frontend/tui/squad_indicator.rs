@@ -7,7 +7,7 @@
 //! tab.
 //!
 //! The poller holds no policy. *What the daemon's state is* is
-//! `SquadGatewayResolver::health_from_env`, classified by
+//! `DaemonResolver::health_from_env`, classified by
 //! `SquadSupervisor::health` at Layer 1 (WI 0114 F-17) — including the case
 //! where no resolver can be built at all. What is left here is the cadence,
 //! the shared slot and — in `render::command_box` — the colour.
@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
-use crate::command::commands::squad::supervisor::SquadGatewayResolver;
+use crate::command::commands::squad::supervisor::DaemonResolver;
 use crate::data::config::env::Env;
 use crate::engine::squad::SquadHealth;
 
@@ -55,7 +55,7 @@ impl SquadIndicatorPoller {
                 tokio::select! {
                     _ = cancel.cancelled() => break,
                     _ = ticker.tick() => {
-                        let state = SquadGatewayResolver::health_from_env(
+                        let state = DaemonResolver::health_from_env(
                             &Env::from_process(),
                             SQUAD_INDICATOR_PROBE_TIMEOUT,
                         )
