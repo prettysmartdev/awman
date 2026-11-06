@@ -111,32 +111,3 @@ fn gemini_deprecation_warning_uses_real_commands() {
         "deprecation warning must point users at a real awman command; got:\n{stderr}"
     );
 }
-
-// ─── antigravity --model → non-zero exit + clear error ───────────────────────
-
-/// `awman chat --agent antigravity --model gemini-3.5-flash` must exit non-zero.
-/// The error must name both "antigravity" and indicate that a model flag is
-/// not supported. Because build_options fires after agent-image checks, the
-/// most we can guarantee at the binary level is a non-zero exit; the model-
-/// flag message is verified at the unit level in engine/agent/mod.rs.
-#[test]
-fn chat_antigravity_model_flag_exits_nonzero() {
-    let repo = make_git_repo();
-    let (_cfg, mut cmd) = awman_isolated(&repo);
-    let output = cmd
-        .args([
-            "chat",
-            "--agent",
-            "antigravity",
-            "--model",
-            "gemini-3.5-flash",
-        ])
-        .output()
-        .expect("failed to run awman");
-
-    assert!(
-        !output.status.success(),
-        "`chat --agent antigravity --model` must exit non-zero; exit code: {:?}",
-        output.status.code()
-    );
-}

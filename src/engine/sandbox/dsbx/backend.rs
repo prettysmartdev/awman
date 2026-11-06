@@ -438,7 +438,9 @@ fn agent_args_for(
         return Vec::new();
     }
     let mut args = Vec::new();
-    if !options.interactive {
+    if options.interactive {
+        args.extend(def.interactive_only_flags.iter().cloned());
+    } else {
         if let Some(flag) = &def.non_interactive_flag {
             args.push(flag.clone());
         }
@@ -455,6 +457,13 @@ fn agent_args_for(
     }
     args.extend(options.agent_flags.iter().cloned());
     if let Some(prompt) = &options.seeded_prompt {
+        if options.interactive {
+            if let crate::engine::agent::InteractiveSeedDelivery::Flag(flag) =
+                &def.interactive_seed_delivery
+            {
+                args.push(flag.clone());
+            }
+        }
         args.push(prompt.clone());
     }
     args
@@ -1037,10 +1046,10 @@ mod tests {
         ]);
         let argv = run_argv("awman-h-cline", "cline", &cline);
         assert_eq!(argv.last().unwrap(), "do the thing");
+        assert_eq!(argv[2], "--", "agent args must follow the -- delimiter");
         assert_eq!(
-            argv[argv.len() - 2],
-            "--",
-            "prompt must follow the -- delimiter"
+            argv[3], "--tui",
+            "a seeded Cline TUI must remain interactive"
         );
 
         // claude is a `kind: mixin` kit → prompt delivered via stdin.
@@ -1259,6 +1268,7 @@ mod tests {
                 "run",
                 "awman-h-cline",
                 "--",
+                "--tui",
                 "--model",
                 "anthropic/claude-opus-4-6"
             ],
@@ -1277,7 +1287,10 @@ mod tests {
             },
         ]);
         let argv = run_argv("awman-h-cline", "cline", &o);
-        assert_eq!(argv, vec!["run", "awman-h-cline", "--", "--model=sonnet"]);
+        assert_eq!(
+            argv,
+            vec!["run", "awman-h-cline", "--", "--tui", "--model=sonnet"]
+        );
     }
 
     #[test]
@@ -1315,6 +1328,7 @@ mod tests {
                 "run",
                 "awman-h-cline",
                 "--",
+                "--tui",
                 "--yolo",
                 "--model",
                 "gpt-5",
@@ -1342,6 +1356,7 @@ mod tests {
                 "run",
                 "awman-h-cline",
                 "--",
+                "--tui",
                 "--model",
                 "gpt-5",
                 "--debug",
@@ -1352,23 +1367,42 @@ mod tests {
 
     #[test]
     fn non_interactive_prepends_definition_flag_for_agent_kits() {
-        // cline's headless shape is the `task` subcommand — it must be
-        // the first agent arg, before flags and the prompt, mirroring the
-        // container path's `entrypoint_for`.
+        // Cline accepts a headless prompt without a `task` subcommand.
         let o = opts(vec![
             SandboxOption::AgentId("cline".into()),
             SandboxOption::Interactive(false),
             SandboxOption::SeededPrompt("do it".into()),
         ]);
         let argv = run_argv("awman-h-cline", "cline", &o);
-        assert_eq!(argv, vec!["run", "awman-h-cline", "--", "task", "do it"]);
+        assert_eq!(argv, vec!["run", "awman-h-cline", "--", "do it"]);
+    }
+
+    #[test]
+    fn agent_kits_use_interactive_seed_flags() {
+        let o = opts(vec![
+            SandboxOption::AgentId("antigravity".into()),
+            SandboxOption::Interactive(true),
+            SandboxOption::SeededPrompt("do it".into()),
+        ]);
+        assert_eq!(
+            run_argv("awman-h-agy", "antigravity", &o),
+            vec!["run", "awman-h-agy", "--", "--prompt-interactive", "do it"]
+        );
+
+        let o = opts(vec![
+            SandboxOption::AgentId("cline".into()),
+            SandboxOption::Interactive(true),
+            SandboxOption::SeededPrompt("do it".into()),
+        ]);
+        assert_eq!(
+            run_argv("awman-h-cline", "cline", &o),
+            vec!["run", "awman-h-cline", "--", "--tui", "do it"]
+        );
     }
 
     #[test]
     fn non_interactive_adds_no_token_for_an_agent_kit_without_one() {
-        // Every first-party `kind: agent` kit declares a headless
-        // token; this needs a test-only definition (the former maki shape).
-        // maki has no headless flag → no extra token.
+        // A test-only custom kit with no headless token adds none.
         let o = opts(vec![
             SandboxOption::AgentId("maki".into()),
             SandboxOption::Interactive(false),
@@ -1412,10 +1446,8 @@ mod tests {
                 "agent-kit {agent}: seeded prompt must be the final agent arg"
             );
             assert_eq!(
-                argv[argv.len() - 2],
-                "--",
-                "agent-kit {agent}: prompt must follow the -- delimiter or sbx \
-                 parses it as a workspace PATH"
+                argv[2], "--",
+                "agent-kit {agent}: args must follow the delimiter"
             );
         }
     }

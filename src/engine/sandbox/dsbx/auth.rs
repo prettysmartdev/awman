@@ -590,7 +590,7 @@ mod tests {
         );
         assert_eq!(
             supported_auth_env_vars("copilot"),
-            &["GH_TOKEN", "GITHUB_TOKEN"]
+            &["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"]
         );
         assert_eq!(supported_auth_env_vars("opencode"), &["ANTHROPIC_API_KEY"]);
         // Agent-kit agents are out of scope for now.

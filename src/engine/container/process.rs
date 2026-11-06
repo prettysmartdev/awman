@@ -230,7 +230,11 @@ impl AgentInstance for ContainerInstance {
         let post_bridge = self.post_bridge;
         let argv = super::docker::build_run_argv(&self.name, &self.image, &self.options)?;
         let started_at = chrono::Utc::now();
-        let seeded = self.options.seeded_prompt.clone();
+        let seeded = if self.options.headless_prompt_in_argv && !self.options.interactive {
+            None
+        } else {
+            self.options.seeded_prompt.clone()
+        };
         let handle = handle_now(&self.id, &self.name, &self.image);
 
         if self.options.agent_output_format.is_structured() {

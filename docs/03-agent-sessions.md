@@ -4,8 +4,8 @@ An agent session is a container (on whichever [runtime](11-runtimes.md) you use)
 
 Sessions normally use the standard stdio launch mode. You can also use
 [ACP mode](#acp-launch-mode) when you want awman to render structured agent
-activity instead of the agent's raw terminal stream. ACP is currently
-supported only by **Cline**.
+activity instead of the agent's raw terminal stream. ACP currently supports
+**Cline**, **OpenCode**, and **Gemini CLI**.
 
 ---
 
@@ -39,8 +39,8 @@ agent session. Instead of showing the agent's terminal stream directly, awman
 renders the agent's messages, tool activity, plans, and permission requests in
 its own interface.
 
-ACP is currently supported only by **Cline**. Other agents continue to use the
-standard stdio launch mode.
+ACP is supported by **Cline**, **OpenCode** (`opencode acp`), and **Gemini CLI**
+(`gemini --experimental-acp`). Other agents use the standard stdio launch mode.
 
 ACP is available with the Docker and Apple Containers runtimes. The
 `docker-sbx-experimental` runtime does not currently support ACP. The `builtin-experimental` runtime carries ACP over its own binary-clean stream: frames reach the agent byte-for-byte, and closing the client's stdin ends the agent's input as it does on Docker.
@@ -223,14 +223,14 @@ Per-agent translation and expected `<NAME>` format:
 | `claude` | `--model <NAME>` | bare model ID (e.g. `claude-opus-4-6`) |
 | `codex` | `--model <NAME>` | bare model ID (e.g. `gpt-4o`) |
 | `gemini` | `--model <NAME>` | bare model ID (e.g. `gemini-2.0-flash`) |
-| `antigravity` | *(not supported — an error is returned)* | — |
+| `antigravity` | `--model <NAME>` | model slug from `agy models` |
 | `opencode` | `--model <NAME>` | **`provider/model` required** (e.g. `anthropic/claude-3-5-sonnet`) |
-| `cline` | `--model <NAME>` (on the `task` subcommand) | bare model ID; the provider is selected separately via `cline auth -p <provider>` and is not switchable per-invocation |
+| `cline` | `--model <NAME>` | model ID for the selected provider; use `--agent-flag --provider` to select a provider for one run |
 | `copilot` | `--model <NAME>` | bare model ID; cannot be applied under the `docker-sbx-experimental` runtime (use the `/model` slash command there) |
 
 For agents that support multiple providers (`opencode`, for example), the `provider/model` slash form lets you target a specific provider when more than one is configured. awman passes the value through verbatim — the agent does the routing.
 
-An agent with no model flag (Antigravity, or a custom agent whose definition declares none) refuses `--model` with `agent '<name>' does not support a model flag`. For Antigravity, configure the model in `~/.gemini/antigravity-cli/settings.json` or with the `/model` slash command inside the session instead.
+An agent with no model flag (a custom agent whose definition declares none) refuses `--model` with `agent '<name>' does not support a model flag`.
 
 `--model` can be combined freely with `--agent`, `--yolo`, `--auto`, and all other flags. When used with `exec workflow`, the flag value acts as the default model for every workflow step that does not define its own `model` field. See [Per-step model overrides](05-workflows.md#per-step-model-overrides).
 
@@ -245,10 +245,10 @@ Run the agent in print/batch mode — no interactivity required. The agent execu
 | Claude | `--print` |
 | Codex | `exec` subcommand |
 | OpenCode | `run` subcommand |
-| Gemini | *(not supported — agent launches in interactive mode)* |
+| Gemini | `--prompt` / `-p` |
 | Antigravity | `--print` |
-| Copilot | *(not supported — agent launches in interactive mode)* |
-| Cline | `task` subcommand |
+| Copilot | `-p <prompt>` |
+| Cline | positional prompt (one-shot) |
 
 Useful for CI pipelines, scripting, or when you want the output captured rather than live.
 
@@ -353,39 +353,39 @@ Not every agent implements every level. `--plan` on an agent with no plan mode i
 
 ### `--plan`
 
-Run the agent in read-only mode — it can analyse the codebase and suggest changes, but cannot modify files. Useful for getting a second opinion on an approach before committing to implementation.
+Start the agent in its planning mode. Each CLI enforces its own planning permissions; use this to explore an approach before implementation.
 
 | Agent | Plan mode |
 |-------|-----------|
 | `claude` | `--permission-mode plan` |
-| `codex` | `--approval-mode plan` |
+| `codex` | *(no startup plan flag — refused; use `/plan` interactively)* |
 | `opencode` | *(not supported — refused)* |
 | `gemini` | `--approval-mode=plan` |
-| `antigravity` | *(not supported — refused)* |
+| `antigravity` | `--mode plan` |
 | `copilot` | `--plan` |
-| `cline` | `--plan` (on the `task` subcommand) |
+| `cline` | `--plan` |
 
 `--plan` can be combined with `--headless`.
 
 ### `--auto`
 
-Enable intermediate autonomous operation — the agent auto-approves file edits and writes, but still prompts before shell commands and other high-risk operations.
+Enable the agent's intermediate automatic approval mode. The exact permissions vary by CLI: OpenCode approves actions that are not explicitly denied, Cline approves all tools with this flag, and Codex permits writes inside its workspace sandbox.
 
 | Agent | `--auto` flag |
 |-------|--------------|
 | `claude` | `--permission-mode auto` |
 | `codex` | `--sandbox workspace-write` |
-| `opencode` | *(no equivalent — flag omitted)* |
+| `opencode` | `--auto` |
 | `gemini` | `--approval-mode=auto_edit` |
-| `antigravity` | *(no equivalent — flag omitted)* |
+| `antigravity` | `--mode accept-edits` |
 | `copilot` | *(no equivalent — flag omitted)* |
-| `cline` | `--auto-approve-all` (auto-approves actions while keeping interactive mode) |
+| `cline` | `--auto-approve true` |
 
 Combined with `exec workflow`, `--auto` implies `--worktree`, but it does **not** auto-advance stuck steps — that countdown is `--yolo`-only.
 
 ### `--yolo`
 
-Fully autonomous operation. Use it when you want to hand a task to the agent and come back to a finished result.
+Unattended workflow operation. awman applies the agent's permission bypass flag where one exists and advances workflow steps without waiting for approval.
 
 ```sh
 awman exec workflow aspec/workflows/implement-feature.toml --yolo
@@ -396,17 +396,17 @@ Yolo mode is a good fit when you have a well-specified work item you trust the a
 
 `--yolo` does three things:
 
-**1. Skips all agent permission prompts.** The agent-specific flag is appended to the container entrypoint before launch:
+**1. Requests the agent's permission bypass mode where supported.** The agent-specific flag is appended to the container entrypoint before launch:
 
 | Agent | Flag appended |
 |-------|--------------|
 | `claude` | `--dangerously-skip-permissions` |
 | `codex` | `--dangerously-bypass-approvals-and-sandbox` |
 | `opencode` | *(no equivalent — flag omitted)* |
-| `gemini` | `--yolo` |
+| `gemini` | `--approval-mode=yolo` |
 | `antigravity` | `--dangerously-skip-permissions` |
-| `copilot` | `--autopilot` (copilot's only CLI autonomous mode) |
-| `cline` | `--yolo` (on the `task` subcommand) |
+| `copilot` | `--yolo` (allow all permissions) |
+| `cline` | `--yolo` |
 
 **2. Implies `--worktree` for workflow execution.** Running a workflow with `--yolo` automatically creates an isolated Git worktree, and prints:
 
@@ -453,7 +453,7 @@ Commands submitted through the API (`POST /v1/worker/commands`) run with `--yolo
 - `exec workflow --yolo` is the recommended autonomous pattern: isolated branch, structured phases, auto-advancing, easy to discard if the output isn't right.
 - Gemini's `--yolo` skips all tool confirmations including shell commands; `--auto` (`--approval-mode=auto_edit`) is the more conservative choice.
 - Copilot supports `--yolo` only — `--auto` has no equivalent and is dropped.
-- Cline's `--auto` keeps interactive mode while auto-approving; its `--yolo` fully skips confirmations and implies non-interactive operation.
+- Cline's `--auto` enables tool auto-approval; its `--yolo` skips confirmations and exits after the turn.
 
 ---
 
@@ -700,7 +700,7 @@ session. See [Squad](12-squad.md) for task management and unattended execution.
 
 ## Agent authentication
 
-awman automatically passes your agent's credentials into the container — you never have to log in manually inside a container session.
+awman mounts supported on-disk credentials or passes the host environment variables you select with `env()`. Host keyring credentials are available only where awman explicitly stages them; see the per-agent paths below.
 
 For Claude Code, awman reads your OAuth credential from the macOS Keychain (service: `Claude Code-credentials`) — or, on non-macOS hosts, from `~/.claude/.credentials.json` — and writes an awman-authored `.credentials.json` (access token, expiry, and scopes only) into the staged `~/.claude` directory that's mounted into the container. Your refresh token is never captured from the host credential and never mounted into a container.
 
@@ -711,14 +711,14 @@ The token value is never shown in displayed container commands; the mounted `~/.
 | Agent | Auth mechanism |
 |-------|---------------|
 | `claude` | OAuth credential read from macOS Keychain (or `~/.claude/.credentials.json`), delivered as a live-refreshed `.credentials.json` file in the staged `~/.claude` mount — never as an env var |
-| `codex` | — |
-| `opencode` | — |
+| `codex` | `~/.codex/` mounted directly when present (including file-backed `auth.json`); or `OPENAI_API_KEY` through `env()` |
+| `opencode` | `~/.config/opencode/` config and `~/.local/share/opencode/` provider credentials mounted directly when present; or provider key through `env()` |
 | `gemini` | API key via `env()` overlay and/or `~/.gemini/` OAuth directory (auto-mounted) |
-| `antigravity` | API key via `env()` overlay (`ANTIGRAVITY_API_KEY`) and/or `~/.gemini/antigravity-cli/` OAuth directory (auto-mounted) |
-| `copilot` | GitHub token via `env()` overlay (`COPILOT_GITHUB_TOKEN` or `GH_TOKEN`) |
-| `cline` | `~/.cline/data/` directory mount (contains `secrets.json` with API keys) — auto-mounted |
+| `antigravity` | Google account credential staged under `~/.gemini/antigravity-cli/`, or `GEMINI_API_KEY` through `env()` when `modelProvider` is `gemini` |
+| `copilot` | `~/.copilot/` mounted directly when present (including `settings.json` and any file-backed token in `config.json`); or GitHub token via `env()` overlay (`COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, or `GITHUB_TOKEN`) |
+| `cline` | `~/.cline/data/` mounted directly when present (current provider settings are in `settings/providers.json`) |
 
-Gemini and Copilot authenticate via API keys passed from your host environment using `env()` overlays. Cline uses an auto-mounted directory. See [Gemini authentication](#gemini-authentication) for the full Gemini auth options, and [Copilot authentication](#copilot-authentication) and [Cline authentication](#cline-authentication) below.
+`env()` overlays pass named host variables into the agent container. Host directories mounted directly are live and writable from the container; account credentials in those directories should be treated as secrets. Claude and Antigravity use staged copies.
 
 ### Host settings injection
 
@@ -726,8 +726,8 @@ For Claude sessions, awman also mounts sanitized copies of your Claude Code sett
 
 | Host file | Container path | Notes |
 |-----------|----------------|-------|
-| `~/.claude.json` | `/root/.claude.json:ro` | `oauthAccount` field stripped to prevent broken auth state |
-| `~/.claude/settings.json` | `/root/.claude/settings.json:ro` | Model preferences, plugins — copied as-is |
+| `~/.claude.json` | `$HOME/.claude.json` | `oauthAccount` field stripped to prevent broken auth state |
+| `~/.claude/settings.json` | `$HOME/.claude/settings.json` | Model preferences and plugins in the staged settings directory |
 
 Your original files are never modified. The copies are created in a temporary directory before each launch and cleaned up when the container exits.
 
@@ -747,14 +747,14 @@ Add `GEMINI_API_KEY` (or one of the Vertex AI variables) to your overlays config
 
 Or pass it per-command: `awman chat --agent gemini --overlay "env(GEMINI_API_KEY)"`.
 
-Get a free API key from [Google AI Studio](https://aistudio.google.com/apikey) (1,000 requests/day on the free tier). awman reads the value from your host shell and injects it into the container. The value is masked (`***`) in all displayed Docker commands.
+Get an API key from [Google AI Studio](https://aistudio.google.com/apikey). awman reads the value from your host shell and injects it into the container. The value is masked (`***`) in displayed Docker commands.
 
 Supported Gemini auth environment variables:
 
 | Variable | Description |
 |----------|-------------|
 | `GEMINI_API_KEY` | API key from Google AI Studio |
-| `GOOGLE_API_KEY` | Vertex AI API key (takes precedence over `GEMINI_API_KEY`) |
+| `GOOGLE_API_KEY` | Alternate Gemini API key variable; select the appropriate auth method in Gemini CLI |
 | `GOOGLE_CLOUD_PROJECT` | Vertex AI project ID |
 | `GOOGLE_CLOUD_LOCATION` | Vertex AI region |
 | `GOOGLE_GENAI_USE_VERTEXAI` | Set to `true` to enable the Vertex AI auth path |
@@ -763,58 +763,51 @@ Supported Gemini auth environment variables:
 
 ### OAuth token (`~/.gemini/` mount)
 
-Gemini's default interactive auth stores OAuth tokens in `~/.gemini/settings.json` on your host after you run `gemini` for the first time and complete the browser login flow. awman automatically copies `~/.gemini/` into a temporary directory and mounts it into the container at `/root/.gemini`, so the agent picks up your existing OAuth session without a manual login step.
+Gemini's Google sign-in caches its credential under `~/.gemini/` (typically `oauth_creds.json`); `settings.json` holds configuration, not the token. When the host directory exists, awman mounts it at the container user's `$HOME/.gemini`.
 
-If `~/.gemini/` does not exist on the host (you've never run `gemini` locally), awman creates an empty directory and mounts that instead. Gemini will prompt for authentication inside the container on first use.
+If `~/.gemini/` does not exist on the host, awman does not mount it. Gemini will need an API key or an interactive sign-in.
 
-The mount is a copy, not a bind mount — changes the agent makes to its auth state inside the container are isolated and do not affect the live `~/.gemini/` on your host.
+The mount is a live bind mount. Gemini can update the host's credential cache while a session runs.
 
 ### Auth precedence
 
-When both an API key env var and OAuth tokens are present, Gemini uses the API key. This is Gemini's own resolution logic — awman does not arbitrate. If you want to use OAuth auth exclusively, omit the key variables from your overlays config.
+The selected Gemini CLI authentication method determines which credential is used. awman does not choose between a key and Google sign-in.
 
 ---
 
 ## Antigravity authentication
 
-Antigravity supports two authentication paths, similar to Gemini. You can use either or both — awman sets up both automatically.
+Antigravity supports Google account sign-in and direct Gemini API access. Direct API access requires a matching setting and key.
 
 ### API key (`env()` overlay)
 
-Add `ANTIGRAVITY_API_KEY` to your overlays config:
+Set `"modelProvider": "gemini"` in `~/.gemini/antigravity-cli/settings.json`, then add `GEMINI_API_KEY` to your overlays config:
 
 ```json
-{ "overlays": ["env(ANTIGRAVITY_API_KEY)"] }
+{ "overlays": ["env(GEMINI_API_KEY)"] }
 ```
 
-Or pass it per-command: `awman chat --agent antigravity --overlay "env(ANTIGRAVITY_API_KEY)"`.
+Or pass it per-command: `awman chat --agent antigravity --overlay "env(GEMINI_API_KEY)"`.
 
-Get an API key from [Google AI Studio](https://aistudio.google.com/apikey) or through your Antigravity account. awman reads the value from your host shell and injects it into the container. The value is masked (`***`) in all displayed Docker commands.
+Get an API key from [Google AI Studio](https://aistudio.google.com/apikey). awman reads the value from your host shell and injects it into the container. The value is masked (`***`) in displayed Docker commands. `GOOGLE_API_KEY` and `ANTIGRAVITY_API_KEY` are not recognized by this auth path.
 
-Supported Antigravity auth environment variables:
-
-| Variable | Description |
-|----------|-------------|
-| `ANTIGRAVITY_API_KEY` | Antigravity API key |
-| `GOOGLE_API_KEY` | Vertex AI API key (takes precedence over `ANTIGRAVITY_API_KEY`) |
-| `GOOGLE_CLOUD_PROJECT` | Vertex AI project ID |
-| `GOOGLE_CLOUD_LOCATION` | Vertex AI region |
+If you remove `GEMINI_API_KEY`, also remove `modelProvider: "gemini"`; otherwise `agy` exits at startup.
 
 ### OAuth token (`~/.gemini/antigravity-cli/` mount)
 
-Antigravity's interactive auth stores OAuth tokens in `~/.gemini/antigravity-cli/settings.json` after you run `agy` for the first time and complete authentication. awman automatically copies `~/.gemini/antigravity-cli/` into a temporary directory and mounts it into the container at `/root/.gemini/antigravity-cli`, so the agent picks up your existing OAuth session without a manual login step.
+`settings.json` holds preferences, not the OAuth token. awman stages a copy of the host's `~/.gemini/` directory and seeds `antigravity-cli/antigravity-oauth-token` from the host credential store when available. It mounts the staged directory at the container user's `$HOME/.gemini`.
 
-If `~/.gemini/antigravity-cli/` does not exist on the host (you've never run `agy` locally), awman creates an empty directory and mounts that instead. Antigravity will prompt for authentication inside the container on first interactive use.
+If neither host settings nor a usable host credential exists, there is no staged auth mount. Sign in with `agy` on the host first or configure the Gemini API key path above.
 
-The mount is a copy, not a bind mount — changes the agent makes to its auth state inside the container do not affect the live `~/.gemini/antigravity-cli/` on your host.
+Changes inside the staged copy do not modify the host directory.
 
 ### Auth precedence
 
-When both an API key env var and OAuth tokens are present, Antigravity uses the API key. If you want to use OAuth auth exclusively, omit the key variables from your overlays config.
+Antigravity uses the Gemini API key only when `modelProvider` is `gemini`. Without that setting it uses account sign-in.
 
 ### Model configuration
 
-Antigravity does not support the `--model` flag. Configure the model in `~/.gemini/antigravity-cli/settings.json` on your host, or use the `/model` slash command inside an interactive session to change the model for that session only.
+Use awman's `--model <slug>` for one session; `agy models` lists available slugs. For a persistent choice, use `/model` in `agy` or edit `~/.gemini/antigravity-cli/settings.json`.
 
 ---
 
@@ -832,13 +825,13 @@ The warning does not block execution — your gemini session still starts. Howev
 2. Make it your default: `awman config set agent antigravity` (add `--global` to apply across all repos).
 3. Set up authentication as described in [Antigravity authentication](#antigravity-authentication) above.
 
-Antigravity is a drop-in replacement for Gemini with the same CLI interface and Docker-based isolation.
+Antigravity uses a separate `agy` CLI and its own settings and authentication paths.
 
 ---
 
 ## Copilot authentication
 
-GitHub Copilot CLI authenticates entirely via a GitHub token — there is no OAuth config directory to mount. Set your token via overlays config:
+awman mounts `~/.copilot/` when it exists, carrying `settings.json` and any token Copilot stored in `config.json` on a host without a usable keyring. Credentials in the host keyring are not available inside the container. You can also pass a token through an environment overlay:
 
 ```json
 { "overlays": ["env(COPILOT_GITHUB_TOKEN)"] }
@@ -879,22 +872,22 @@ Only variables present in your host shell are injected, and values are masked (`
 
 ## Cline authentication
 
-Cline stores API keys in `~/.cline/data/secrets.json` on your host, written there by `cline auth`. awman automatically copies `~/.cline/data/` into a temporary directory and mounts it into the container at `/home/awman/.cline/data`, so the agent picks up your existing credentials without re-running `cline auth` inside every container.
+Cline's current CLI stores provider configuration and keys in `~/.cline/data/settings/providers.json`; older installations may still have `secrets.json` for migration. When `~/.cline/data/` exists, awman mounts it directly into the container at `$HOME/.cline/data`, so `cline auth` does not need to run again in every container.
 
 No overlay configuration is needed — credentials travel with the auto-mounted directory.
 
-If `~/.cline/data/` does not exist on the host (you've never run `cline auth`), awman creates an empty temporary directory and mounts that instead. Cline will prompt for authentication inside the container on first interactive use.
+If `~/.cline/data/` does not exist on the host, awman skips the mount. Configure Cline on the host with `cline auth` first, or authenticate inside an interactive session.
 
-The mount is a copy, not a bind mount — changes the agent makes to its credentials inside the container do not affect the live `~/.cline/data/` on your host. Task history (`tasks/`) and workspace state (`workspace/`) are excluded from the copy; only the config and secrets files are included.
+The mount is a live bind mount. Cline can update host credentials and session state while it runs.
 
 To set up credentials on the host before running awman:
 
 ```sh
 # Authenticate with Anthropic (example)
-cline auth -p anthropic -k <your-api-key> -m claude-sonnet-4-6
+cline auth -p anthropic -k <your-api-key> -m claude-sonnet-5-5
 
 # Verify credentials were written
-cat ~/.cline/data/secrets.json
+test -f ~/.cline/data/settings/providers.json
 ```
 
 

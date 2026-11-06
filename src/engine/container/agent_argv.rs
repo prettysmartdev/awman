@@ -106,11 +106,14 @@ impl AgentArgv {
         // Interactive + seeded prompt: most agents take the prompt as the final
         // positional; agents with an `interactive_seed_flag` (opencode
         // `--prompt`) take a flag pair, because their bare positional means
-        // something else. Headless prompts are piped on stdin instead.
-        if options.interactive {
+        // something else. Headless delivery follows each CLI's contract:
+        // either a final argv operand or stdin.
+        if options.interactive || options.headless_prompt_in_argv {
             if let Some(prompt) = &options.seeded_prompt {
-                if let Some(flag) = &options.interactive_seed_flag {
-                    argv.push(flag.clone());
+                if options.interactive {
+                    if let Some(flag) = &options.interactive_seed_flag {
+                        argv.push(flag.clone());
+                    }
                 }
                 argv.push(prompt.clone());
             }

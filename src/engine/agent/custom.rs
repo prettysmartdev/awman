@@ -40,6 +40,7 @@ pub fn convert(
         image,
         interactive_entrypoint: file.run.command.clone(),
         non_interactive_flag: file.run.non_interactive.clone(),
+        headless_prompt_in_argv: false,
         output_format: file.run.output_format,
         interactive_only_flags: file.run.interactive_only_flags.clone(),
         plan_flags: file.modes.plan.clone(),
@@ -82,6 +83,7 @@ pub fn convert(
             .and_then(|s| s.host_dir.clone())
             .map(SettingsMount::Direct)
             .unwrap_or(SettingsMount::None),
+        extra_settings_mounts: Vec::new(),
         skills_mount: file.settings.as_ref().and_then(|s| s.skills_dir.clone()),
         credential_source: CredentialSource::None,
         ping_argv: file.ping.as_ref().map(|p| p.command.clone()),

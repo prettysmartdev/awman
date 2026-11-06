@@ -44,7 +44,7 @@ pub fn service_for_credential(key: &str) -> Option<&'static str> {
         // authenticate the same provider so both map to the same service here.
         "ANTHROPIC_API_KEY" | "CLAUDE_CODE_OAUTH_TOKEN" => Some("anthropic"),
         "OPENAI_API_KEY" => Some("openai"),
-        "GH_TOKEN" | "GITHUB_TOKEN" => Some("github"),
+        "COPILOT_GITHUB_TOKEN" | "GH_TOKEN" | "GITHUB_TOKEN" => Some("github"),
         "GEMINI_API_KEY" | "GOOGLE_API_KEY" => Some("google"),
         "AWS_ACCESS_KEY_ID" | "AWS_SECRET_ACCESS_KEY" => Some("aws"),
         "GROQ_API_KEY" => Some("groq"),

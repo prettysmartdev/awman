@@ -118,6 +118,18 @@ fn seeded_prompt_is_argv_only_when_interactive() {
 }
 
 #[test]
+fn headless_prompt_argv_delivery_follows_cli_contract() {
+    let options = ResolvedContainerOptions {
+        interactive: false,
+        headless_prompt_in_argv: true,
+        agent_mode_flags: vec!["--approval-mode=yolo".into()],
+        seeded_prompt: Some("fix this".into()),
+        ..Default::default()
+    };
+    assert_eq!(tail(&options), vec!["--approval-mode=yolo", "fix this"]);
+}
+
+#[test]
 fn missing_tool_flag_fails_closed_with_a_typed_error() {
     for (restriction, options) in [
         (

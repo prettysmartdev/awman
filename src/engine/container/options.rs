@@ -129,7 +129,8 @@ pub struct PromptFileGuard(Arc<PromptFile>);
 
 #[derive(Debug)]
 struct PromptFile {
-    file: tempfile::NamedTempFile,
+    file: Option<tempfile::NamedTempFile>,
+    dir: Option<tempfile::TempDir>,
     preserve: std::sync::atomic::AtomicBool,
 }
 
@@ -138,7 +139,12 @@ impl Drop for PromptFile {
         // If the last observer disappears before guest termination is known,
         // leave the path readable but close the descriptor normally.
         if self.preserve.load(std::sync::atomic::Ordering::Acquire) {
-            self.file.disable_cleanup(true);
+            if let Some(file) = &mut self.file {
+                file.disable_cleanup(true);
+            }
+            if let Some(dir) = self.dir.take() {
+                std::mem::forget(dir);
+            }
         }
     }
 }
@@ -146,13 +152,27 @@ impl Drop for PromptFile {
 impl PromptFileGuard {
     pub fn new(file: tempfile::NamedTempFile) -> Self {
         Self(Arc::new(PromptFile {
-            file,
+            file: Some(file),
+            dir: None,
+            preserve: std::sync::atomic::AtomicBool::new(false),
+        }))
+    }
+
+    pub fn new_dir(dir: tempfile::TempDir) -> Self {
+        Self(Arc::new(PromptFile {
+            file: None,
+            dir: Some(dir),
             preserve: std::sync::atomic::AtomicBool::new(false),
         }))
     }
 
     pub fn host_path(&self) -> &Path {
-        self.0.file.path()
+        self.0
+            .file
+            .as_ref()
+            .map(|f| f.path())
+            .or_else(|| self.0.dir.as_ref().map(|d| d.path()))
+            .expect("prompt guard has a file or directory")
     }
 
     pub(super) fn preserve_for_unconfirmed_guest(&self) {
@@ -183,6 +203,7 @@ pub enum ContainerOption {
     },
     EnvLiteral(EnvLiteral),
     SeededPrompt(String),
+    HeadlessPromptInArgv(bool),
     /// Flag used to deliver the seeded prompt in *interactive* mode (e.g.
     /// opencode `--prompt <text>`). Absent means the prompt is appended as a
     /// trailing positional argv arg, which is what most agents expect. Emitted
@@ -480,6 +501,7 @@ pub struct ResolvedContainerOptions {
     pub env_overrides: Vec<(String, crate::engine::auth::credential::SecretString)>,
     pub env_literal: Vec<EnvLiteral>,
     pub seeded_prompt: Option<String>,
+    pub headless_prompt_in_argv: bool,
     /// Flag used to deliver `seeded_prompt` in interactive mode. When `None`,
     /// the prompt is appended as a trailing positional argv arg. When `Some`,
     /// it is delivered as `<flag> <text>` (e.g. opencode `--prompt <text>`,
@@ -602,6 +624,7 @@ impl ResolvedContainerOptions {
             ContainerOption::EnvOverride { key, value } => self.env_overrides.push((key, value)),
             ContainerOption::EnvLiteral(v) => self.env_literal.push(v),
             ContainerOption::SeededPrompt(v) => self.seeded_prompt = Some(v),
+            ContainerOption::HeadlessPromptInArgv(v) => self.headless_prompt_in_argv = v,
             ContainerOption::InteractiveSeedFlag(v) => self.interactive_seed_flag = Some(v),
             ContainerOption::Interactive(v) => self.interactive = v,
             ContainerOption::AgentOutputFormat(v) => self.agent_output_format = v,

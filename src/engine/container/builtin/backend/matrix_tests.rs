@@ -257,7 +257,7 @@ fn every_settings_family_and_prompt_mode_belongs_to_some_agent() {
     let mut settings = [false; 4];
     // `Unsupported` delivery has no first-party agent since crush and maki
     // became custom definitions; it is covered through a custom fixture.
-    let mut prompts = [false; 6];
+    let mut prompts = [false; 7];
     for agent in FIRST_PARTY_AGENTS {
         let matrix = first_party(agent).unwrap();
         settings[match matrix.settings_mount {
@@ -272,12 +272,17 @@ fn every_settings_family_and_prompt_mode_belongs_to_some_agent() {
             SystemPromptMode::Replace => prompts[2] = true,
             SystemPromptMode::AgentsMd => prompts[3] = true,
             SystemPromptMode::EnvFile { .. } => prompts[4] = true,
-            SystemPromptMode::AddDir { .. } => prompts[5] = true,
+            SystemPromptMode::EnvDir { .. } => prompts[5] = true,
+            SystemPromptMode::AddDir { .. } => prompts[6] = true,
             SystemPromptMode::Unsupported => panic!("{agent}: unexpected Unsupported delivery"),
         }
     }
-    assert_eq!(settings, [true; 4], "a SettingsMount family has no agent");
-    assert_eq!(prompts, [true; 6], "a SystemPromptMode has no agent");
+    assert_eq!(
+        settings,
+        [false, true, true, true],
+        "first-party settings families changed"
+    );
+    assert_eq!(prompts, [true; 7], "a SystemPromptMode has no agent");
 }
 
 #[test]
@@ -419,6 +424,15 @@ fn every_agent_plans_every_overlay_settings_and_prompt_variant() {
                     assert!(m.read_only && m.host.is_file(), "{context}");
                     assert_eq!(std::fs::read_to_string(&m.host).unwrap(), PROMPT);
                 }
+                SystemPromptMode::EnvDir { var } => {
+                    let (_, guest) = plan.command.env.iter().find(|(k, _)| k == var).unwrap();
+                    let m = mount(&plan, guest).expect("instructions directory mounted");
+                    assert!(m.read_only && m.host.is_dir(), "{context}");
+                    assert_eq!(
+                        std::fs::read_to_string(m.host.join("AGENTS.md")).unwrap(),
+                        PROMPT
+                    );
+                }
                 SystemPromptMode::AddDir { flag } => {
                     for dir in ["/awman/context/global", "/awman/context/workflow"] {
                         assert!(window(argv, flag, dir), "{context}: {argv:?}");
@@ -443,12 +457,21 @@ fn every_agent_plans_every_overlay_settings_and_prompt_variant() {
             // The seeded initial prompt.
             assert_eq!(argv[0], matrix.interactive_entrypoint[0], "{context}");
             if non_interactive {
-                assert_eq!(
-                    plan.seeded_prompt.as_deref(),
-                    Some("task: fix it"),
-                    "{context}"
-                );
-                assert!(!argv.iter().any(|a| a == "task: fix it"), "{context}");
+                if matrix.headless_prompt_in_argv {
+                    assert_eq!(plan.seeded_prompt, None, "{context}");
+                    assert_eq!(
+                        argv.last().map(String::as_str),
+                        Some("task: fix it"),
+                        "{context}"
+                    );
+                } else {
+                    assert_eq!(
+                        plan.seeded_prompt.as_deref(),
+                        Some("task: fix it"),
+                        "{context}"
+                    );
+                    assert!(!argv.iter().any(|a| a == "task: fix it"), "{context}");
+                }
             } else {
                 assert_eq!(plan.seeded_prompt, None, "{context}");
                 assert_eq!(argv.last().unwrap(), "task: fix it", "{context}");
