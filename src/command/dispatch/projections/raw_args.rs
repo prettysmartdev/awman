@@ -155,7 +155,7 @@ pub(crate) struct FrontendFlagDefault {
 
 /// API-profile flag defaults.
 ///
-/// `non-interactive` is FORCED: HTTP workers have no TTY, and on Apple's
+/// `headless` is FORCED: HTTP workers have no TTY, and on Apple's
 /// `container` CLI a PTY request with piped stdin fails with `ENOTTY`, so this
 /// is a technical requirement, not a preference.
 ///
@@ -166,7 +166,7 @@ pub(crate) struct FrontendFlagDefault {
 /// the API frontend. See work item 0097, Finding D.
 const API_FLAG_DEFAULTS: &[FrontendFlagDefault] = &[
     FrontendFlagDefault {
-        flag: "non-interactive",
+        flag: "headless",
         value: FlagDefault::Bool(true),
         forced: true,
     },
@@ -186,7 +186,7 @@ pub(crate) fn frontend_flag_defaults(frontend: FrontendKind) -> &'static [Fronte
     match frontend {
         // The squad daemon runs unattended for the same reasons the API
         // server does, and applies the same profile.
-        FrontendKind::Api | FrontendKind::SquadDaemon => API_FLAG_DEFAULTS,
+        FrontendKind::Api | FrontendKind::Background => API_FLAG_DEFAULTS,
         // CLI and TUI resolve flag defaults through clap / the command layer;
         // no profile overrides apply, guaranteeing this mechanism cannot alter
         // their behavior.
@@ -299,7 +299,7 @@ impl CommandCatalogue {
             };
             // A forced technical setting is applied even without an argv
             // token, and the client cannot override its value. Accepting its
-            // spelling (e.g. a daemon's non-interactive mode) grants nothing.
+            // spelling (e.g. a daemon's headless mode) grants nothing.
             let forced_by_profile = frontend_flag_defaults(frontend)
                 .iter()
                 .any(|entry| entry.flag == flag.long && entry.forced);
@@ -358,7 +358,12 @@ fn parse_against_spec(
     let fixed_arg_count = spec
         .arguments
         .iter()
-        .filter(|a| !matches!(a.kind, ArgumentKind::TrailingVarArgs))
+        .filter(|a| {
+            !matches!(
+                a.kind,
+                ArgumentKind::TrailingVarArgs | ArgumentKind::VarArgs
+            )
+        })
         .count();
 
     let mut greedy = false;
@@ -387,6 +392,7 @@ fn parse_against_spec(
             };
             let flag_spec = spec
                 .find_flag(name)
+                .or_else(|| CommandCatalogue::get().find_global_flag(name))
                 .ok_or_else(|| CommandError::unknown_flag(path, name))?;
             cursor.apply_flag(flag_spec, inline, &mut flags)?;
         } else if let Some(short) = arg.strip_prefix('-') {
@@ -438,7 +444,7 @@ fn parse_against_spec(
     let mut pos_idx = 0;
     for arg_spec in spec.arguments {
         match arg_spec.kind {
-            ArgumentKind::TrailingVarArgs => {
+            ArgumentKind::TrailingVarArgs | ArgumentKind::VarArgs => {
                 let collected: Vec<String> = positionals[pos_idx..].to_vec();
                 if !collected.is_empty() {
                     arguments.insert(arg_spec.name.to_string(), collected);
@@ -740,7 +746,7 @@ mod tests {
     #[test]
     fn u16_type_mismatch_is_structured_error() {
         let err = cat()
-            .parse_raw_args(&["api", "start"], &argv(&["--port", "not-a-number"]))
+            .parse_raw_args(&["squad", "start"], &argv(&["--port", "not-a-number"]))
             .unwrap_err();
         assert!(matches!(err, CommandError::InvalidFlagValue { .. }));
     }
@@ -748,7 +754,7 @@ mod tests {
     #[test]
     fn u16_flag_coerces_value() {
         let p = cat()
-            .parse_raw_args(&["api", "start"], &argv(&["--port", "9876"]))
+            .parse_raw_args(&["squad", "start"], &argv(&["--port", "9876"]))
             .unwrap();
         assert_eq!(p.flag_u16("port"), Some(9876));
     }
@@ -769,7 +775,7 @@ mod tests {
         let p = cat()
             .parse_raw_args_with_profile(&["exec", "prompt"], &argv(&["hi"]), FrontendKind::Api)
             .unwrap();
-        assert_eq!(p.flag_bool("non-interactive"), Some(true));
+        assert_eq!(p.flag_bool("headless"), Some(true));
         assert_eq!(p.flag_bool("yolo"), Some(true));
     }
 
@@ -779,12 +785,12 @@ mod tests {
         // catalogue) must genuinely override the overridable yolo default: the
         // fills-when-absent default is suppressed because a conflicting flag is
         // present, so yolo stays unset and dispatch sees a coherent request.
-        // non-interactive stays forced regardless.
+        // headless stays forced regardless.
         let p = cat()
             .parse_raw_args_with_profile(&["exec", "prompt"], &argv(&["--plan"]), FrontendKind::Api)
             .unwrap();
         assert_eq!(p.flag_bool("plan"), Some(true));
-        assert_eq!(p.flag_bool("non-interactive"), Some(true));
+        assert_eq!(p.flag_bool("headless"), Some(true));
         // yolo default suppressed by the conflicting --plan (real override).
         assert_eq!(p.flag_bool("yolo"), None);
     }
@@ -794,8 +800,8 @@ mod tests {
         let p = cat()
             .parse_raw_args_with_profile(&["exec", "prompt"], &argv(&["hi"]), FrontendKind::Cli)
             .unwrap();
-        // No profile override: non-interactive/yolo are absent unless supplied.
-        assert_eq!(p.flag_bool("non-interactive"), None);
+        // No profile override: headless/yolo are absent unless supplied.
+        assert_eq!(p.flag_bool("headless"), None);
         assert_eq!(p.flag_bool("yolo"), None);
     }
 
@@ -810,7 +816,7 @@ mod tests {
         let p = cat()
             .parse_raw_args(&["config", "set"], &argv(&["agent", "claude"]))
             .unwrap();
-        assert_eq!(p.argument("field").as_deref(), Some("agent"));
+        assert_eq!(p.argument("key").as_deref(), Some("agent"));
         assert_eq!(p.argument("value").as_deref(), Some("claude"));
     }
 
@@ -848,7 +854,6 @@ pub(crate) mod shared_cases {
         Strs(&'static str, &'static [&'static str]),
         Path(&'static str, &'static str),
         U16(&'static str, u16),
-        Usize(&'static str, usize),
         Arg(&'static str, &'static str),
         Args(&'static str, &'static [&'static str]),
     }
@@ -875,23 +880,17 @@ pub(crate) mod shared_cases {
             canonical: PROMPT,
             args: &["hi"],
             reads: &[Read::Bool("plan", false)],
-            tui_reads: &[
-                Read::Bool("yolo", false),
-                Read::Bool("non-interactive", false),
-            ],
-            api_reads: &[
-                Read::Bool("yolo", true),
-                Read::Bool("non-interactive", true),
-            ],
+            tui_reads: &[Read::Bool("yolo", false), Read::Bool("headless", false)],
+            api_reads: &[Read::Bool("yolo", true), Read::Bool("headless", true)],
         },
         Case {
             name: "explicit false beats a default but not a forced flag",
             path: PROMPT,
             canonical: PROMPT,
-            args: &["--yolo=false", "--non-interactive=false", "hi"],
+            args: &["--yolo=false", "--headless=false", "hi"],
             reads: &[Read::Bool("yolo", false)],
-            tui_reads: &[Read::Bool("non-interactive", false)],
-            api_reads: &[Read::Bool("non-interactive", true)],
+            tui_reads: &[Read::Bool("headless", false)],
+            api_reads: &[Read::Bool("headless", true)],
         },
         Case {
             name: "a conflicting flag suppresses the API's yolo default",
@@ -944,25 +943,16 @@ pub(crate) mod shared_cases {
             canonical: WORKFLOW,
             args: &["a.toml", "-n"],
             reads: &[
-                Read::Bool("non-interactive", true),
+                Read::Bool("headless", true),
                 Read::Arg("workflow", "a.toml"),
             ],
             tui_reads: &[],
             api_reads: &[],
         },
         Case {
-            name: "numeric flags at their bounds arrive typed",
-            path: WORKFLOW,
-            canonical: WORKFLOW,
-            args: &["a.toml", "--max-concurrent", "1"],
-            reads: &[Read::Usize("max-concurrent", 1)],
-            tui_reads: &[],
-            api_reads: &[],
-        },
-        Case {
             name: "the largest port arrives typed",
-            path: &["api", "start"],
-            canonical: &["api", "start"],
+            path: &["squad", "start"],
+            canonical: &["squad", "start"],
             args: &["--port=65535"],
             reads: &[Read::U16("port", 65535)],
             tui_reads: &[],
@@ -1035,10 +1025,11 @@ pub(crate) mod shared_cases {
         (PROMPT, &["-ab"], "UnknownFlag"),
         (&["nope"], &[], "UnknownCommand"),
         (WORKFLOW, &["a.toml", "stray"], "UnexpectedArgument"),
-        (&["api", "start"], &["--port=65536"], "InvalidFlagValue"),
-        (&["api", "start"], &["--port=abc"], "InvalidFlagValue"),
-        (WORKFLOW, &["--max-concurrent=0"], "InvalidFlagValue"),
-        (&["chat"], &["--launch-mode=banana"], "InvalidFlagValue"),
+        (&["squad", "start"], &["--port=65536"], "InvalidFlagValue"),
+        (&["squad", "start"], &["--port=abc"], "InvalidFlagValue"),
+        (WORKFLOW, &["--max-concurrent=1"], "UnknownFlag"),
+        (&["chat"], &["--launch-mode=acp"], "UnknownFlag"),
+        (&["chat"], &["--non-interactive"], "UnknownFlag"),
         (&["chat"], &["--agent-flag", "-v"], "InvalidFlagValue"),
         (PROMPT, &["--plan", "--yolo"], "InvalidFlagValue"),
     ];
@@ -1081,11 +1072,6 @@ pub(crate) mod shared_cases {
                 ),
                 Read::U16(flag, want) => assert_eq!(
                     frontend.flag_u16(path, flag).unwrap(),
-                    Some(want),
-                    "{name}: --{flag}"
-                ),
-                Read::Usize(flag, want) => assert_eq!(
-                    frontend.flag_usize(path, flag).unwrap(),
                     Some(want),
                     "{name}: --{flag}"
                 ),

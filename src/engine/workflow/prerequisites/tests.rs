@@ -1210,7 +1210,7 @@ fn repo_policy_with_allow_and_acquire_grants_nothing_in_a_headless_report() {
     .unwrap();
     let policy = PrerequisitePolicy::resolve(PrerequisitePolicyLayers {
         global: None,
-        squad_global: None,
+        task_file: None,
         repo: Some(&repo),
         task: None,
         flags: &PrerequisiteFlags::default(),

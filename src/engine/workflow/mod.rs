@@ -310,7 +310,7 @@ pub struct WorkflowEngine {
     /// Containers currently alive. The single-step path keeps exactly one
     /// entry (the focused step); the parallel path keeps up to `max_concurrent`.
     active_steps: Vec<ActiveParallelStep>,
-    /// Resolved once at construction from `effective_max_concurrent_agents()`.
+    /// Resolved once at construction from `max_concurrent_steps()`.
     /// `None` means unlimited.
     max_concurrent: Option<usize>,
     current_step_name: Option<String>,
@@ -528,7 +528,7 @@ impl WorkflowEngine {
     }
 
     /// The resolved per-workflow concurrency cap (`None` = unlimited). Resolved
-    /// once at construction from `effective_max_concurrent_agents()`. Frontends
+    /// once at construction from `max_concurrent_steps()`. Frontends
     /// read this to size the Workflow Overview / parallel UX.
     pub fn max_concurrent(&self) -> Option<usize> {
         self.max_concurrent
@@ -740,7 +740,7 @@ impl WorkflowEngine {
         let workflow_context_permission =
             workflow_context_permission_from_overlay_strings(workflow.overlays.as_deref());
         let effective_config = session.effective_config();
-        let max_concurrent = effective_config.effective_max_concurrent_agents();
+        let max_concurrent = effective_config.max_concurrent_steps();
         tracing::debug!(
             ?max_concurrent,
             "workflow_engine resolved max_concurrent_agents"

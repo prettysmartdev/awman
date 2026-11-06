@@ -9,7 +9,7 @@ fn run_awman(args: &[&str], root: &std::path::Path) -> Output {
     Command::new(crate::awman_bin())
         .current_dir(root)
         .env("HOME", root)
-        .env("AWMAN_CONFIG_HOME", &config)
+        .env("AWMAN_HOME", &config)
         .env_remove("XDG_CONFIG_HOME")
         .args(args)
         .output()

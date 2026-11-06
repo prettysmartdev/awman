@@ -5,18 +5,17 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use crate::data::ids::RunId;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 
 use crate::command::commands::squad::commands::resolved_git_root;
 use crate::command::commands::squad::runtime_guard::require_container_tier;
 use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
 use crate::data::config::env::DaemonEnvMap;
-use crate::data::config::global::GlobalConfig;
-use crate::data::config::repo::SquadConfig;
+use crate::data::config::squad::SquadConfig;
 use crate::data::fs::daemon_env::{env_overlay_names, EnvPersistence};
 use crate::data::fs::task_store::{
     MountScope, Run, Task, TaskStatus, TaskStore, TaskUpdate, TaskWorkspace,
@@ -25,8 +24,6 @@ use crate::data::fs::SquadPaths;
 use crate::data::repo_dockerfile_paths::RepoDockerfilePaths;
 use crate::data::workflow_state::WorkflowState;
 use crate::engine::container::naming::validate_task_slug;
-use crate::engine::error::EngineError;
-use crate::engine::remote::HttpCore;
 use crate::engine::squad::env_state::{DaemonEnvState, RequiredEnvEntry};
 use crate::engine::squad::SchedulerStatus;
 
@@ -55,6 +52,9 @@ pub struct CreateTask {
     /// effective root is not a git repository, because there is then no git
     /// root for `cwd` and `gitroot` to differ about.
     pub mount_scope: MountScope,
+    /// The scheduler stores whole seconds; the wire field is milliseconds and
+    /// therefore currently accepts values divisible by 1000 only.
+    #[serde(rename = "interval_ms", with = "seconds_as_ms")]
     pub interval_secs: u64,
     pub agent: Option<String>,
     pub model: Option<String>,
@@ -72,7 +72,7 @@ pub struct CreateTask {
     /// The task's workflow prerequisite policy (WI 0149): decisions only, never
     /// a credential value. `None` means "not set", which headless resolves to
     /// deny.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prerequisites: Option<crate::data::config::workflows::PrerequisitePolicy>,
 }
 
@@ -88,26 +88,39 @@ pub struct CreateTask {
 /// different task.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UpdateTask {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    #[serde(default)]
+    #[serde(
+        default,
+        rename = "interval_ms",
+        with = "optional_seconds_as_ms",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub interval_secs: Option<u64>,
     /// `None` leaves the agent alone; `Some(None)` clears it back to the squad
     /// default; `Some(Some(a))` sets it.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "nullable",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub agent: Option<Option<String>>,
     /// As [`agent`](Self::agent), for the model.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "nullable",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub model: Option<Option<String>>,
     /// Replaces the whole overlay list when given (an empty vector clears it).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub overlays: Option<Vec<String>>,
     /// Replaces the task's `config.json` agent pool when given; an empty map
     /// removes the task config so the task inherits the global block again.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agents_to_models: Option<BTreeMap<String, Vec<String>>>,
     /// Replaces the task's workflow prerequisite policy when given (WI 0149).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prerequisites: Option<crate::data::config::workflows::PrerequisitePolicy>,
 }
 
@@ -188,7 +201,9 @@ pub fn format_agent_models_specs(map: &BTreeMap<String, Vec<String>>) -> Vec<Str
 /// between the daemon-local and HTTP paths.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskDetail {
+    #[serde(with = "crate::command::daemon_api::squad::task_wire")]
     pub task: Task,
+    #[serde(with = "crate::command::daemon_api::squad::run_list_wire")]
     pub runs: Vec<Run>,
 }
 
@@ -199,6 +214,7 @@ pub struct DaemonStatus {
     pub bound_addr: Option<String>,
     pub task_count: usize,
     pub active_count: usize,
+    #[serde(default, with = "crate::data::wire::opt_timestamp")]
     pub last_tick: Option<DateTime<Utc>>,
     pub in_flight: usize,
     /// A live scheduler reload failure; absent for healthy or older daemons.
@@ -297,6 +313,14 @@ pub struct EnvPushResponse {
 
 #[async_trait]
 pub trait TaskGateway: Send + Sync {
+    /// Allocate the run accepted by the resource API. Implementations without a scheduler refuse it.
+    async fn create_run(&self, _name: &str) -> Result<RunId, CommandError> {
+        Err(CommandError::Other("run creation unavailable".into()))
+    }
+    async fn cancel_run_id(&self, _id: &RunId) -> Result<(), CommandError> {
+        Err(CommandError::Other("run cancellation unavailable".into()))
+    }
+
     async fn create(&self, req: CreateTask) -> Result<Task, CommandError>;
     /// Apply an edit to an existing task, returning it as it now stands.
     async fn update(&self, name: &str, req: UpdateTask) -> Result<Task, CommandError>;
@@ -347,6 +371,13 @@ pub struct SharedTaskGateway(pub Arc<dyn TaskGateway>);
 
 #[async_trait]
 impl TaskGateway for SharedTaskGateway {
+    async fn create_run(&self, name: &str) -> Result<RunId, CommandError> {
+        self.0.create_run(name).await
+    }
+    async fn cancel_run_id(&self, id: &RunId) -> Result<(), CommandError> {
+        self.0.cancel_run_id(id).await
+    }
+
     async fn create(&self, req: CreateTask) -> Result<Task, CommandError> {
         self.0.create(req).await
     }
@@ -470,7 +501,7 @@ impl LocalTaskGateway {
     async fn refresh_required_env_from(&self, tasks: &[Task]) {
         let required = self.required_env_map(tasks);
         let state = Arc::clone(&self.env_state);
-        let now = Utc::now();
+        let now = crate::data::wire::now();
         if let Err(error) =
             tokio::task::spawn_blocking(move || state.set_required(required, now)).await
         {
@@ -516,7 +547,7 @@ impl LocalTaskGateway {
         task_custom_auth_env_names(
             &self.env,
             &self.paths,
-            self.engines.global_config.squad.clone().unwrap_or_default(),
+            SquadConfig::from_global(&self.engines.global_config),
             task,
         )
     }
@@ -617,13 +648,7 @@ impl LocalTaskGateway {
         // picks its workflow's step agents from whichever pool applies, and
         // every one of them needs a Dockerfile in the repository (WI 0110).
         agents.extend(req.agents_to_models.keys().cloned());
-        if let Some(pool) = self
-            .engines
-            .global_config
-            .squad
-            .as_ref()
-            .and_then(|cfg| cfg.agents_to_models.clone())
-        {
+        if let Some(pool) = SquadConfig::from_global(&self.engines.global_config).agents_to_models {
             agents.extend(pool.into_keys());
         }
         // Agent Dockerfiles are discovered from the repository a task is bound
@@ -743,8 +768,8 @@ impl LocalTaskGateway {
     /// "no task config" has exactly one on-disk representation and a task that
     /// gives up its pool goes back to inheriting the global one cleanly.
     ///
-    /// The document written is a whole [`GlobalConfig`] carrying only its
-    /// `squad` block, so the file the daemon writes and the file a user may
+    /// The document written is a task-scope config file carrying only
+    /// `workflows.dynamic.agentsToModels`, so the file the daemon writes and the file a user may
     /// hand-edit are the same shape, parsed by the same loader.
     fn write_task_config(
         &self,
@@ -768,10 +793,7 @@ impl LocalTaskGateway {
         // is held to, so the daemon can never author a task file its own
         // loader would later reject.
         squad.validate()?;
-        let document = GlobalConfig {
-            squad: Some(squad),
-            ..Default::default()
-        };
+        let document = squad.to_task_file();
         crate::data::fs::TaskStore::write_config(&path, &document).map_err(CommandError::Data)
     }
 }
@@ -792,6 +814,57 @@ pub struct ResolvedWorkspace {
 
 #[async_trait]
 impl TaskGateway for LocalTaskGateway {
+    async fn create_run(&self, name: &str) -> Result<RunId, CommandError> {
+        let task = self.get(name).await?;
+        let mut status = self.status.lock().expect("scheduler status mutex");
+        if let Some(id) = status.pending_runs.get(task.id.as_str()) {
+            return Ok(id.clone());
+        }
+        if let Some(run) = self.store.running_run_for(&task.id)? {
+            return Ok(run.id);
+        }
+        let unmet = self.env_state.unmet_for_task(&task);
+        let id = self
+            .store
+            .start_run_with_env(&task.id, None, crate::data::wire::now(), &unmet)?;
+        // The scheduler consumes this already allocated run on its next tick.
+        // A daemon restart records it interrupted through normal orphan recovery.
+        status.pending_runs.insert(task.id.to_string(), id.clone());
+        status.cancellations.insert(
+            task.id.to_string(),
+            crate::engine::squad::scheduler::RunCancellation::new(id.clone()),
+        );
+        Ok(id)
+    }
+    async fn cancel_run_id(&self, id: &RunId) -> Result<(), CommandError> {
+        let mut status = self.status.lock().expect("scheduler status mutex");
+        let pending = status
+            .pending_runs
+            .iter()
+            .find(|(_, run)| *run == id)
+            .map(|(task, _)| task.clone());
+        if let Some(task) = pending {
+            status.pending_runs.remove(&task);
+            status.cancellations.remove(&task);
+            self.store.finish_run(
+                id,
+                crate::data::fs::task_store::RunStatus::Canceled,
+                &Default::default(),
+                crate::data::wire::now(),
+            )?;
+            return Ok(());
+        }
+        if let Some(cancel) = status
+            .cancellations
+            .values()
+            .find(|cancel| &cancel.run_id == id)
+        {
+            cancel.cancel();
+            return Ok(());
+        }
+        Err(CommandError::Other("run not found".into()))
+    }
+
     async fn create(&self, req: CreateTask) -> Result<Task, CommandError> {
         tracing::info!(task = %req.name, "squad administrator requested task creation");
         // Must remain first: changing a runtime must never mutate existing
@@ -801,10 +874,10 @@ impl TaskGateway for LocalTaskGateway {
         // Only now, with every check passed, does anything reach the disk.
         Self::ensure_durable_workspace(&resolved.durable_workspace)?;
         self.write_task_config(&req.name, &req.agents_to_models)?;
-        let now = Utc::now();
+        let now = crate::data::wire::now();
         let task = Task {
             prerequisites: req.prerequisites.clone(),
-            id: uuid::Uuid::new_v4().to_string(),
+            id: crate::data::ids::TaskId::new(),
             name: req.name,
             description: req.description,
             repo_scope: resolved.repo_scope,
@@ -969,7 +1042,7 @@ impl TaskGateway for LocalTaskGateway {
                  run `awman squad resume {name}` first"
             )));
         }
-        if !self.store.request_trigger(name, Utc::now())? {
+        if !self.store.request_trigger(name, crate::data::wire::now())? {
             return Err(CommandError::Other(format!("task {name:?} was not found")));
         }
         tracing::info!(task = %name, "squad administrator triggered task");
@@ -990,14 +1063,22 @@ impl TaskGateway for LocalTaskGateway {
             .status
             .lock()
             .expect("scheduler status mutex poisoned")
-            .cancel_run(&task.id)
+            .cancel_run(task.id.as_str())
             .ok_or_else(|| CommandError::Other(format!("task {name:?} has no run in progress")))?;
         tracing::info!(task = %name, run_id = %run_id, "squad administrator canceled run");
         Ok(())
     }
 
     async fn delete(&self, name: &str) -> Result<(), CommandError> {
+        let task = self.store.get(name)?;
         if self.store.delete(name)? {
+            if let Some(task) = task {
+                let mut status = self.status.lock().expect("scheduler status mutex");
+                status.pending_runs.remove(task.id.as_str());
+                if let Some(cancel) = status.cancellations.remove(task.id.as_str()) {
+                    cancel.cancel();
+                }
+            }
             tracing::info!(task = %name, "squad administrator removed task");
             // Removing the last task that named a variable is the one
             // unambiguous signal that nothing needs its value any more, and
@@ -1046,7 +1127,7 @@ impl TaskGateway for LocalTaskGateway {
         // worker for the whole cap on a locked keychain, once per push, which
         // an authenticated client can drive concurrently.
         let state = Arc::clone(&self.env_state);
-        let now = Utc::now();
+        let now = crate::data::wire::now();
         let (accepted, ignored) =
             tokio::task::spawn_blocking(move || state.apply_push(push.vars, &push.absent, now))
                 .await
@@ -1092,231 +1173,8 @@ impl TaskGateway for LocalTaskGateway {
     }
 }
 
-/// HTTP-only gateway. It intentionally makes no validation decisions.
-pub struct RemoteTaskGateway {
-    core: HttpCore,
-}
-
-impl RemoteTaskGateway {
-    pub fn new(core: HttpCore) -> Self {
-        Self { core }
-    }
-    pub fn core(&self) -> &HttpCore {
-        &self.core
-    }
-
-    async fn command<T: serde::de::DeserializeOwned>(
-        &self,
-        subcommand: &str,
-        args: Vec<String>,
-    ) -> Result<T, CommandError> {
-        let response = self
-            .core
-            .post_command(
-                &["commands"],
-                &[("subcommand", json!(subcommand)), ("args", json!(args))],
-                &[],
-            )
-            .await?;
-        serde_json::from_value(response.body).map_err(|error| {
-            CommandError::RemoteTransport(format!("invalid squad daemon response: {error}"))
-        })
-    }
-}
-
-#[async_trait]
-impl TaskGateway for RemoteTaskGateway {
-    async fn create(&self, req: CreateTask) -> Result<Task, CommandError> {
-        let mut args = vec![
-            "--name".into(),
-            req.name,
-            "--description".into(),
-            req.description,
-            "--workspace".into(),
-            match &req.workspace {
-                TaskWorkspace::Default => DEFAULT_WORKSPACE_FLAG_VALUE.to_string(),
-                TaskWorkspace::Custom(path) => path.display().to_string(),
-            },
-            "--interval".into(),
-            req.interval_secs.to_string(),
-            "--mount-scope".into(),
-            match req.mount_scope {
-                MountScope::Cwd => "cwd",
-                // A directory workspace has no cwd/gitroot distinction; the
-                // daemon-side resolution decides it either way, so send the
-                // safe default rather than a value the catalogue enum rejects.
-                MountScope::GitRoot | MountScope::Directory => "gitroot",
-            }
-            .into(),
-        ];
-        if let Some(agent) = req.agent {
-            args.extend(["--agent".into(), agent]);
-        }
-        if let Some(model) = req.model {
-            args.extend(["--model".into(), model]);
-        }
-        for overlay in req.overlays {
-            args.extend(["--overlay".into(), overlay]);
-        }
-        for spec in format_agent_models_specs(&req.agents_to_models) {
-            args.extend(["--agent-models".into(), spec]);
-        }
-        if let Some(policy) = &req.prerequisites {
-            args.extend(
-                crate::command::commands::workflow_prerequisites::prerequisite_flag_args(policy),
-            );
-        }
-        self.command("squad add", args).await
-    }
-    /// Re-serialise the edit as the `squad edit` argv the daemon parses.
-    ///
-    /// The empty-vector cases are load-bearing and must stay explicit:
-    /// `--clear-overlays` and `--clear-agent-models` exist because "replace
-    /// with nothing" cannot be expressed by repeating a flag zero times, which
-    /// is indistinguishable from not mentioning it at all.
-    async fn update(&self, name: &str, req: UpdateTask) -> Result<Task, CommandError> {
-        let mut args = vec![name.to_string()];
-        if let Some(description) = req.description {
-            args.extend(["--description".into(), description]);
-        }
-        if let Some(interval) = req.interval_secs {
-            args.extend(["--interval".into(), interval.to_string()]);
-        }
-        match req.agent {
-            Some(Some(agent)) => args.extend(["--agent".into(), agent]),
-            Some(None) => args.push("--clear-agent".into()),
-            None => {}
-        }
-        match req.model {
-            Some(Some(model)) => args.extend(["--model".into(), model]),
-            Some(None) => args.push("--clear-model".into()),
-            None => {}
-        }
-        match req.overlays {
-            Some(overlays) if overlays.is_empty() => args.push("--clear-overlays".into()),
-            Some(overlays) => {
-                for overlay in overlays {
-                    args.extend(["--overlay".into(), overlay]);
-                }
-            }
-            None => {}
-        }
-        match req.agents_to_models {
-            Some(pool) if pool.is_empty() => args.push("--clear-agent-models".into()),
-            Some(pool) => {
-                for spec in format_agent_models_specs(&pool) {
-                    args.extend(["--agent-models".into(), spec]);
-                }
-            }
-            None => {}
-        }
-        if let Some(policy) = &req.prerequisites {
-            args.extend(
-                crate::command::commands::workflow_prerequisites::prerequisite_flag_args(policy),
-            );
-        }
-        self.command("squad edit", args).await
-    }
-    async fn list(&self) -> Result<Vec<Task>, CommandError> {
-        self.command("squad list", vec![]).await
-    }
-    async fn get(&self, name: &str) -> Result<Task, CommandError> {
-        let detail: TaskDetail = self.command("squad show", vec![name.into()]).await?;
-        Ok(detail.task)
-    }
-    async fn runs(&self, name: &str, limit: usize) -> Result<Vec<Run>, CommandError> {
-        let detail: TaskDetail = self.command("squad show", vec![name.into()]).await?;
-        let mut runs = detail.runs;
-        runs.truncate(limit);
-        Ok(runs)
-    }
-    async fn set_status(&self, name: &str, status: TaskStatus) -> Result<(), CommandError> {
-        let subcommand = match status {
-            TaskStatus::Active => "squad resume",
-            TaskStatus::Paused => "squad pause",
-        };
-        self.command::<serde_json::Value>(subcommand, vec![name.into()])
-            .await
-            .map(|_| ())
-    }
-    async fn trigger(&self, name: &str) -> Result<(), CommandError> {
-        self.command::<serde_json::Value>("squad trigger", vec![name.into()])
-            .await
-            .map(|_| ())
-    }
-    async fn cancel(&self, name: &str) -> Result<(), CommandError> {
-        self.command::<serde_json::Value>("squad cancel", vec![name.into()])
-            .await
-            .map(|_| ())
-    }
-    async fn delete(&self, name: &str) -> Result<(), CommandError> {
-        self.command::<serde_json::Value>("squad remove", vec![name.into()])
-            .await
-            .map(|_| ())
-    }
-    async fn status(&self) -> Result<DaemonStatus, CommandError> {
-        let response = self.core.get(&["status"]).await?;
-        serde_json::from_value(response.body).map_err(|error| {
-            CommandError::RemoteTransport(format!("invalid squad daemon status: {error}"))
-        })
-    }
-
-    /// `GET /v1/daemon/env` — a dedicated typed route, never the
-    /// `{subcommand, args}` command envelope.
-    async fn env_coverage(&self) -> Result<EnvCoverage, CommandError> {
-        let response = self.core.get(&["daemon", "env"]).await?;
-        serde_json::from_value(response.body).map_err(|error| {
-            CommandError::RemoteTransport(format!("invalid squad env coverage: {error}"))
-        })
-    }
-
-    /// `POST /v1/daemon/env`.
-    ///
-    /// The body is the only place in squad's client where a payload value
-    /// travels, and it travels as a typed JSON object rather than as argv-shaped
-    /// strings. The response carries names, never values, so an error path here
-    /// cannot echo a secret either.
-    async fn push_env(&self, push: EnvPush) -> Result<EnvPushResponse, CommandError> {
-        let response = self
-            .core
-            .post_command(
-                &["daemon", "env"],
-                &[("vars", json!(push.vars)), ("absent", json!(push.absent))],
-                &[],
-            )
-            .await?;
-        serde_json::from_value(response.body).map_err(|error| {
-            CommandError::RemoteTransport(format!("invalid squad env push response: {error}"))
-        })
-    }
-
-    /// `DELETE /v1/daemon/env`.
-    async fn clear_env_store(&self) -> Result<bool, CommandError> {
-        let response = self.core.delete(&["daemon", "env"]).await?;
-        Ok(response
-            .body
-            .get("cleared")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false))
-    }
-
-    async fn workflow_state(&self, task: &str) -> Result<Option<WorkflowState>, CommandError> {
-        // This route belongs to the remote gateway so route knowledge cannot
-        // leak into a frontend or a shared polling implementation.
-        let response = match self.core.get(&["tasks", task, "workflow"]).await {
-            Ok(response) => response,
-            Err(EngineError::RemoteHttpStatus { status: 404, .. }) => return Ok(None),
-            Err(error) => return Err(CommandError::from(error)),
-        };
-        serde_json::from_value(response.body)
-            .map(Some)
-            .map_err(|error| {
-                CommandError::RemoteTransport(format!(
-                    "invalid squad workflow state for {task:?}: {error}"
-                ))
-            })
-    }
-}
+/// Compatibility type import for in-process callers; the HTTP gateway envelope is gone.
+pub use super::client::RemoteSquadClient as RemoteTaskGateway;
 
 fn task_custom_auth_env_names(
     env: &crate::data::config::env::EnvSnapshot,
@@ -1324,7 +1182,7 @@ fn task_custom_auth_env_names(
     global_squad: SquadConfig,
     task: &Task,
 ) -> Vec<String> {
-    let pool = crate::data::config::global::task_squad_config(paths, &task.name, &global_squad)
+    let pool = crate::data::config::squad::task_squad_config(paths, &task.name, &global_squad)
         .unwrap_or(global_squad);
     let mut agents: BTreeSet<String> = task.agent.iter().cloned().collect();
     agents.extend(pool.agents_to_models.unwrap_or_default().into_keys());
@@ -1422,6 +1280,16 @@ fn prerequisite_token_env_names(task: &Task) -> Vec<String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn task_interval_validation_explains_second_granularity() {
+        let result = serde_json::from_value::<CreateTask>(serde_json::json!({
+            "name":"nightly", "description":"test", "workspace":{"kind":"default"},
+            "mount_scope":"directory", "interval_ms":1500
+        }));
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("multiple of 1000 milliseconds"), "{error}");
+    }
+
     #[tokio::test]
     async fn status_projects_reload_error_and_clears_on_recovery() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1457,12 +1325,13 @@ mod tests {
     /// is never advertised as available.
     #[test]
     fn task_agents_must_resolve_and_leftover_dockerfiles_are_not_available() {
-        use crate::data::config::env::{EnvSnapshot, AWMAN_CONFIG_HOME};
+        use crate::data::config::env::EnvSnapshot;
+        use crate::data::fs::data_paths::AWMAN_HOME;
         use crate::data::session::AgentName;
         use crate::engine::agent::AgentRegistry;
         let repo = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
-        let env = EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, home.path().to_str().unwrap())]);
+        let env = EnvSnapshot::with_overrides([(AWMAN_HOME, home.path().to_str().unwrap())]);
         let awman = repo.path().join(".awman");
         std::fs::create_dir_all(awman.join("agents")).unwrap();
         let def = "schema=1\ndisplay_name='Pi'\n[run]\ncommand=['pi']\n[image]\ninstall=['true']\n";
@@ -1632,7 +1501,7 @@ mod tests {
             required: vec![RequiredEnvEntry {
                 name: "GITHUB_TOKEN".to_string(),
                 required_by: vec!["nightly".to_string()],
-                required_since: Utc::now(),
+                required_since: crate::data::wire::now(),
                 last_provided_at: None,
                 unmet_since: None,
                 source: None,
@@ -1655,10 +1524,10 @@ mod wi0149_tests {
     use super::*;
     #[test]
     fn wi0149_only_allowed_task_token_env_names_enter_daemon_required_set() {
-        let now = Utc::now();
+        let now = crate::data::wire::now();
         let mut task = Task {
             prerequisites: None,
-            id: "0149".into(),
+            id: crate::data::ids::TaskId::new(),
             name: "regression".into(),
             description: "test".into(),
             repo_scope: PathBuf::from("/repo"),
@@ -1695,5 +1564,46 @@ mod wi0149_tests {
                 }
             );
         }
+    }
+}
+
+fn nullable<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
+    d: D,
+) -> Result<Option<Option<T>>, D::Error> {
+    Option::<T>::deserialize(d).map(Some)
+}
+mod seconds_as_ms {
+    pub fn serialize<S: serde::Serializer>(v: &u64, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_u64(v.saturating_mul(1000))
+    }
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
+        use serde::Deserialize;
+        let ms = u64::deserialize(d)?;
+        if ms % 1000 != 0 {
+            return Err(serde::de::Error::custom(
+                "interval_ms must be a multiple of 1000 milliseconds (the scheduler interval has one-second granularity)",
+            ));
+        }
+        Ok(ms / 1000)
+    }
+}
+mod optional_seconds_as_ms {
+    pub fn serialize<S: serde::Serializer>(v: &Option<u64>, s: S) -> Result<S::Ok, S::Error> {
+        use serde::Serialize;
+        v.map(|v| v.saturating_mul(1000)).serialize(s)
+    }
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
+        use serde::Deserialize;
+        Option::<u64>::deserialize(d)?
+            .map(|ms| {
+                if ms % 1000 != 0 {
+                    Err(serde::de::Error::custom(
+                        "interval_ms must be a multiple of 1000 milliseconds (the scheduler interval has one-second granularity)",
+                    ))
+                } else {
+                    Ok(ms / 1000)
+                }
+            })
+            .transpose()
     }
 }

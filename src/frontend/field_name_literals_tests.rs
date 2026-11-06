@@ -1,7 +1,7 @@
 //! Layer 3 names no config field (WI 0150).
 //!
 //! The map, list and scalar rows of the config views, and the editors behind
-//! them, are driven by each row's `ConfigRowShape` and the hints Layer 2
+//! them, are driven by each row's `ConfigRowKind` and the hints Layer 2
 //! supplies. A frontend source file that spells out the dynamic-workflow
 //! setting names would be back to matching on field names, so none may.
 //! Tests use synthetic names (`demo.map`, `demo.list.0`) for the same reason.

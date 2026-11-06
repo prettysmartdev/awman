@@ -2,6 +2,7 @@
 
 pub mod command_frontend;
 pub mod error;
+pub mod local;
 pub mod outputs;
 pub mod routes;
 pub mod serve;
@@ -29,6 +30,17 @@ impl ApiCommandFrontendFactory for ApiFrontendFactory {
     ) -> Self::Frontend {
         let args: Vec<String> = serde_json::from_str(&command.args).unwrap_or_default();
         command_frontend::ApiDispatchFrontend::new(&command.subcommand, &args, event_bus)
+            .with_interaction(
+                if args
+                    .iter()
+                    .take_while(|s| s.as_str() != "--")
+                    .any(|s| s == "--headless=false")
+                {
+                    crate::data::config::daemon::Interaction::Interactive
+                } else {
+                    crate::data::config::daemon::Interaction::Headless
+                },
+            )
             .with_state_writer(state_writer)
             .deferring_done()
     }
@@ -37,11 +49,14 @@ impl ApiCommandFrontendFactory for ApiFrontendFactory {
 /// Serve a fully bootstrapped API runtime until the shutdown signal arrives.
 pub async fn serve(runtime: ApiServerRuntime) -> Result<(), CommandError> {
     let auth_enabled = matches!(runtime.auth_mode, AuthMode::Enabled { .. });
-    runtime.spawn_workers(ApiFrontendFactory);
+    let settings_tx = runtime.spawn_workers(ApiFrontendFactory);
     let addr = runtime.bind_addr();
     let tls = runtime.tls_material();
     let canceller = runtime.canceller();
+    let config = runtime.config.clone();
     let state = Arc::new(routes::AppState {
+        live_config: std::sync::RwLock::new(Some(config.clone())),
+        settings_tx: Some(settings_tx),
         lifecycle_store: runtime.lifecycle_store,
         setup_cancels: runtime.setup_cancels,
         canceller,
@@ -57,7 +72,42 @@ pub async fn serve(runtime: ApiServerRuntime) -> Result<(), CommandError> {
         event_buses: runtime.event_buses,
         setup_buses: tokio::sync::Mutex::new(std::collections::HashMap::new()),
     });
-    let app = routes::build_router(Arc::clone(&state));
+    let api = Arc::new(
+        crate::command::daemon_api::DaemonApi::from_worker_with_config(state.clone(), config),
+    );
+    *api.bound_addr.lock().expect("bound address mutex") = Some(addr.to_string());
+    *api.listener.lock().expect("listener mutex") = vec![
+        crate::command::daemon_api::core::ListenerRecord {
+            kind: "local".into(),
+            address: addr.to_string(),
+            tls: tls.is_some(),
+        },
+        crate::command::daemon_api::core::ListenerRecord {
+            kind: "ipc".into(),
+            address: state.paths.daemon().local_endpoint().display().to_string(),
+            tls: false,
+        },
+    ];
+    let policy = routes::ListenerPolicy::Network {
+        features: crate::command::daemon_api::Feature::ALL
+            .into_iter()
+            .filter(|f| {
+                api.config
+                    .lock()
+                    .expect("config mutex")
+                    .daemon()
+                    .network
+                    .features
+                    .iter()
+                    .any(|name| name == f.name())
+            })
+            .collect(),
+    };
+    let _local = local::start(
+        &state.paths.daemon().local_endpoint(),
+        routes::build_router_for_listener(api.clone(), routes::ListenerPolicy::Local),
+    )?;
+    let app = routes::build_router_for_listener(api, policy);
     tracing::info!(addr = %addr, tls = tls.is_some(), auth = auth_enabled, "awman API mode starting");
     serve::serve_router(
         app,

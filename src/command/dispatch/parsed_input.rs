@@ -160,9 +160,9 @@ mod tests {
         let parsed = parse("ready -n", cat).unwrap();
         assert_eq!(parsed.path, vec!["ready"]);
         assert_eq!(
-            parsed.args.flag_bool("non-interactive"),
+            parsed.args.flag_bool("headless"),
             Some(true),
-            "-n must map to non-interactive flag"
+            "-n must map to headless flag"
         );
     }
 }
@@ -181,12 +181,16 @@ mod shared_parser_tests {
     /// carried as a string into the command.
     #[test]
     fn a_bad_enum_value_is_rejected_at_parse_time() {
-        let err = parse("chat --launch-mode banana", CommandCatalogue::get()).unwrap_err();
+        let err = parse(
+            "exec workflow --on-merge-failure banana",
+            CommandCatalogue::get(),
+        )
+        .unwrap_err();
         match err {
             CommandError::InvalidFlagValue { flag, reason, .. } => {
-                assert_eq!(flag, "launch-mode");
+                assert_eq!(flag, "on-merge-failure");
                 assert!(
-                    reason.contains("banana") && reason.contains("stdio"),
+                    reason.contains("banana") && reason.contains("keep"),
                     "the reason must name the bad value and the allowed set: {reason}"
                 );
             }
@@ -198,9 +202,12 @@ mod shared_parser_tests {
     #[test]
     fn a_bad_enum_value_gives_the_same_error_as_the_api() {
         let catalogue = CommandCatalogue::get();
-        let from_box = parse("chat --launch-mode banana", catalogue).unwrap_err();
+        let from_box = parse("exec workflow --on-merge-failure banana", catalogue).unwrap_err();
         let from_api = catalogue
-            .parse_raw_args(&["chat"], &["--launch-mode".into(), "banana".into()])
+            .parse_raw_args(
+                &["exec", "workflow"],
+                &["--on-merge-failure".into(), "banana".into()],
+            )
             .unwrap_err();
         assert_eq!(from_box.to_string(), from_api.to_string());
     }

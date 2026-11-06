@@ -2,7 +2,7 @@
 //! add-mapping flow, both routed through `dialog_router`.
 
 use super::*;
-use crate::command::commands::config::{ConfigEditRequest, ConfigRowShape};
+use crate::command::commands::config::{ConfigEditRequest, ConfigRowKind};
 
 // ─── ConfigShow dialog behavior ──────────────────────────────────────────
 
@@ -13,7 +13,7 @@ fn config_row(
     read_only: bool,
     global_writable: bool,
     repo_writable: bool,
-    shape: ConfigRowShape,
+    shape: ConfigRowKind,
 ) -> crate::frontend::tui::dialogs::ConfigShowRow {
     crate::frontend::tui::dialogs::ConfigShowRow {
         field: field.into(),
@@ -24,10 +24,10 @@ fn config_row(
         global_writable,
         repo_writable,
         value_hint: match shape {
-            ConfigRowShape::MapHeader { .. } => {
+            ConfigRowKind::MapHeader { .. } => {
                 Some("Press Ctrl+N to add a mapping, or edit a per-agent row below".into())
             }
-            ConfigRowShape::ListHeader { .. } => {
+            ConfigRowKind::ListHeader { .. } => {
                 Some("Press Ctrl+N to add a guidance entry, or edit a per-entry row below".into())
             }
             _ => None,
@@ -45,7 +45,7 @@ fn map_rows(repo: serde_json::Value) -> Vec<crate::frontend::tui::dialogs::Confi
         true,
         false,
         false,
-        ConfigRowShape::MapHeader {
+        ConfigRowKind::MapHeader {
             child_prefix: "demo.map.",
         },
     )];
@@ -65,7 +65,7 @@ fn map_rows(repo: serde_json::Value) -> Vec<crate::frontend::tui::dialogs::Confi
                 false,
                 true,
                 true,
-                ConfigRowShape::MapEntry,
+                ConfigRowKind::MapEntry,
             ));
         }
     }
@@ -81,7 +81,7 @@ fn guidance_rows(repo: serde_json::Value) -> Vec<crate::frontend::tui::dialogs::
         true,
         false,
         false,
-        ConfigRowShape::ListHeader {
+        ConfigRowKind::ListHeader {
             child_prefix: "demo.list.",
         },
     )];
@@ -94,7 +94,7 @@ fn guidance_rows(repo: serde_json::Value) -> Vec<crate::frontend::tui::dialogs::
                 false,
                 true,
                 true,
-                ConfigRowShape::ListEntry,
+                ConfigRowKind::ListEntry,
             ));
         }
     }
@@ -128,7 +128,7 @@ fn enter_on_read_only_shows_toast() {
             true,
             false,
             false,
-            ConfigRowShape::Scalar,
+            ConfigRowKind::Scalar,
         )]),
     );
 
@@ -157,7 +157,7 @@ fn enter_on_agents_to_models_summary_row_points_at_ctrl_n() {
             true,
             false,
             false,
-            ConfigRowShape::MapHeader {
+            ConfigRowKind::MapHeader {
                 child_prefix: "demo.map.",
             },
         )]),
@@ -184,7 +184,7 @@ fn enter_on_agents_to_models_row_starts_inline_edit_in_repo_column() {
             false,
             false,
             true,
-            ConfigRowShape::MapEntry,
+            ConfigRowKind::MapEntry,
         )]),
     );
 
@@ -215,7 +215,7 @@ fn e_key_starts_editing_like_enter() {
             false,
             true,
             true,
-            ConfigRowShape::Scalar,
+            ConfigRowKind::Scalar,
         )]),
     );
 
@@ -243,7 +243,7 @@ fn global_only_field_snaps_edit_to_global_column() {
             false,
             true,
             false,
-            ConfigRowShape::Scalar,
+            ConfigRowKind::Scalar,
         )]),
     );
     if let Some(Dialog::ConfigShow(state)) = &mut app.active_dialog {
@@ -275,7 +275,7 @@ fn arrow_keys_do_not_change_row_while_editing() {
                 false,
                 true,
                 true,
-                ConfigRowShape::Scalar,
+                ConfigRowKind::Scalar,
             ),
             config_row(
                 "runtime",
@@ -284,7 +284,7 @@ fn arrow_keys_do_not_change_row_while_editing() {
                 false,
                 true,
                 false,
-                ConfigRowShape::Scalar,
+                ConfigRowKind::Scalar,
             ),
         ]),
     );
@@ -314,7 +314,7 @@ fn enter_while_editing_sends_field_value_scope_response() {
             false,
             true,
             true,
-            ConfigRowShape::Scalar,
+            ConfigRowKind::Scalar,
         )]),
     );
 
@@ -348,7 +348,7 @@ fn enter_while_editing_trims_whitespace_before_saving() {
             false,
             false,
             true,
-            ConfigRowShape::Scalar,
+            ConfigRowKind::Scalar,
         )]),
     );
 
@@ -381,7 +381,7 @@ fn esc_cancels_edit_and_clears_rejection_error() {
             false,
             false,
             true,
-            ConfigRowShape::Scalar,
+            ConfigRowKind::Scalar,
         )]),
     );
     if let Some(Dialog::ConfigShow(state)) = &mut app.active_dialog {
@@ -536,7 +536,7 @@ fn enter_on_guidance_summary_row_points_at_ctrl_n() {
             true,
             false,
             false,
-            ConfigRowShape::ListHeader {
+            ConfigRowKind::ListHeader {
                 child_prefix: "demo.list.",
             },
         )]),
@@ -563,7 +563,7 @@ fn enter_on_guidance_row_starts_inline_edit_in_repo_column() {
             false,
             false,
             true,
-            ConfigRowShape::ListEntry,
+            ConfigRowKind::ListEntry,
         )]),
     );
 
@@ -592,7 +592,7 @@ fn enter_while_editing_guidance_entry_sends_response() {
             false,
             false,
             true,
-            ConfigRowShape::ListEntry,
+            ConfigRowKind::ListEntry,
         )]),
     );
 
@@ -625,7 +625,7 @@ fn enter_while_editing_guidance_entry_to_empty_value_sends_removal_response() {
             false,
             false,
             true,
-            ConfigRowShape::ListEntry,
+            ConfigRowKind::ListEntry,
         )]),
     );
 
@@ -661,7 +661,7 @@ fn ctrl_n_on_guidance_row_starts_guidance_entry_phase() {
             true,
             false,
             false,
-            ConfigRowShape::ListHeader {
+            ConfigRowKind::ListHeader {
                 child_prefix: "demo.list.",
             },
         )]),
@@ -726,7 +726,7 @@ fn ctrl_n_guidance_flow_empty_value_shows_toast_and_stays_in_phase() {
             true,
             false,
             false,
-            ConfigRowShape::ListHeader {
+            ConfigRowKind::ListHeader {
                 child_prefix: "demo.list.",
             },
         )]),

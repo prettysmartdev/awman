@@ -273,7 +273,7 @@ fn fake_task(name: &str) -> crate::data::fs::task_store::Task {
     let now = chrono::Utc::now();
     crate::data::fs::task_store::Task {
         prerequisites: None,
-        id: name.to_string(),
+        id: crate::frontend::test_ids::task_id(name),
         name: name.to_string(),
         description: "a test task".into(),
         repo_scope: std::path::PathBuf::from("/tmp"),
@@ -1162,8 +1162,8 @@ fn the_squad_detail_modal_shows_no_run_history_and_gives_a_long_description_the_
 fn the_squad_history_modal_renders_the_run_table_and_its_esc_wording() {
     use crate::data::fs::task_store::{Run, RunStatus};
     let run = Run {
-        id: "run-1".into(),
-        task_id: "issue-triage".into(),
+        id: crate::frontend::test_ids::run_id("run-1"),
+        task_id: crate::frontend::test_ids::task_id("issue-triage"),
         status: RunStatus::Failed,
         workflow_path: None,
         workflow_state_path: None,
@@ -1226,8 +1226,8 @@ fn the_squad_history_modal_clips_a_long_reason_and_keeps_every_column() {
     let reason =
         "no new issues were opened against the repository since the previous evaluation ran";
     let run = Run {
-        id: "run-1".into(),
-        task_id: "issue-triage".into(),
+        id: crate::frontend::test_ids::run_id("run-1"),
+        task_id: crate::frontend::test_ids::task_id("issue-triage"),
         status: RunStatus::NotTriggered,
         workflow_path: None,
         workflow_state_path: None,
@@ -1287,8 +1287,8 @@ fn the_squad_run_detail_modal_shows_the_full_reason_and_error() {
         .collect::<Vec<_>>()
         .join("\n");
     let run = Run {
-        id: "run-7".into(),
-        task_id: "issue-triage".into(),
+        id: crate::frontend::test_ids::run_id("run-7"),
+        task_id: crate::frontend::test_ids::task_id("issue-triage"),
         status: RunStatus::Failed,
         workflow_path: None,
         workflow_state_path: None,
@@ -1317,7 +1317,10 @@ fn the_squad_run_detail_modal_shows_the_full_reason_and_error() {
 
     let text = buffer_text(&render_app(&mut app, 120, 30));
     assert!(
-        text.contains("run run-7"),
+        text.contains(&format!(
+            "run {}",
+            crate::frontend::test_ids::run_id("run-7")
+        )),
         "the detail titles itself with the run: {text}"
     );
     assert!(

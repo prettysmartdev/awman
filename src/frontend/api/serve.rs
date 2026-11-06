@@ -190,7 +190,7 @@ fn bind_error(addr: SocketAddr, error: std::io::Error) -> CommandError {
         // Linux EADDRINUSE = 98, macOS = 48, Windows = 10048
         if matches!(io, 98 | 48 | 10048) {
             return CommandError::Other(format!(
-                "Port {} is already in use. Use --port to choose a different port.",
+                "Port {} is already in use. Set daemon.network.listen with `--set daemon.network.listen=127.0.0.1:<port>` to choose a different port.",
                 addr.port()
             ));
         }
@@ -201,7 +201,7 @@ fn bind_error(addr: SocketAddr, error: std::io::Error) -> CommandError {
         .contains("address already in use")
     {
         return CommandError::Other(format!(
-            "Port {} is already in use. Use --port to choose a different port.",
+            "Port {} is already in use. Set daemon.network.listen with `--set daemon.network.listen=127.0.0.1:<port>` to choose a different port.",
             addr.port()
         ));
     }
@@ -266,6 +266,17 @@ mod auth_tests {
     use super::*;
     use crate::engine::auth::ApiKey;
     use axum::http::{HeaderValue, StatusCode};
+
+    #[test]
+    fn bind_error_points_to_the_network_listen_setting() {
+        let error = bind_error(
+            "127.0.0.1:9876".parse().unwrap(),
+            std::io::Error::from_raw_os_error(98),
+        )
+        .to_string();
+        assert!(error.contains("daemon.network.listen"), "{error}");
+        assert!(error.contains("--set daemon.network.listen="), "{error}");
+    }
 
     async fn rejection_message(rejection: Option<Response>) -> String {
         let response = rejection.expect("request must be refused");

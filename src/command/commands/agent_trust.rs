@@ -8,7 +8,7 @@
 //! [`AgentTrustFrontend`], and records the approval on an explicit yes.
 //!
 //! A frontend with no user present (the API, the squad daemon, a CLI run that
-//! is non-interactive) keeps the default refusal. `--yes` is never consulted:
+//! is headless) keeps the default refusal. `--yes` is never consulted:
 //! approving content that runs builds — and, with `[ping]`, a command on the
 //! host — must be an explicit, per-definition act.
 
@@ -320,7 +320,7 @@ pub fn ensure_agent_trusted(
 /// custom agents. Engines are built from the same effective config.
 fn runtime_is_sandbox(session: &Session) -> bool {
     matches!(
-        RuntimeSelection::parse(session.effective_config().runtime().as_deref()),
+        session.effective_config().runtime_selection(),
         Ok(RuntimeSelection::DockerSbxExperimental)
     )
 }
@@ -590,11 +590,7 @@ mod tests {
             let root = tempfile::tempdir().unwrap();
             let home = root.path().join("global");
             std::fs::create_dir_all(&home).unwrap();
-            std::fs::write(
-                home.join("config.json"),
-                r#"{"runtime":"docker-sbx-experimental"}"#,
-            )
-            .unwrap();
+            std::fs::write(home.join("config.json"), r#"{"runtime":{"kind":"sbx"}}"#).unwrap();
             let session = Session::for_tests_isolated(root.path(), &home);
             let err = ensure_agent_trusted(&session, &AgentName::new(name).unwrap(), &mut NoUser)
                 .unwrap_err();

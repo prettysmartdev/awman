@@ -136,7 +136,6 @@ fn engines_with(
         overlay_engine: overlay_engine.clone(),
         auth_engine: Arc::new(AuthEngine::with_paths(auth_paths, api_paths.clone())),
         agent_engine: Arc::new(AgentEngine::new(overlay_engine, agent_engine_runtime)),
-        config_notices: Default::default(),
         workflow_state_store: Arc::new(WorkflowStateStore::at_git_root(api_paths.root())),
         credential_monitor: None,
         global_config: std::sync::Arc::new(Default::default()),
@@ -157,20 +156,20 @@ async fn daemon_startup_under_sandbox_runtime_fails_opens_no_store_binds_no_port
         dangerously_skip_auth: true,
     };
 
-    // The bootstrap reads `AWMAN_CONFIG_HOME`/friends from the real process
+    // The bootstrap reads `AWMAN_HOME`/friends from the real process
     // environment (`Env::from_process()`), so scope it to this isolated root
     // for the duration of the call.
     let _env_guard = ENV_LOCK.lock().await;
-    let previous = std::env::var("AWMAN_CONFIG_HOME").ok();
-    std::env::set_var("AWMAN_CONFIG_HOME", tmp.path());
+    let previous = std::env::var("AWMAN_HOME").ok();
+    std::env::set_var("AWMAN_HOME", tmp.path());
 
     let result = SquadDaemonHandles::bootstrap(config, engines, Arc::new(NeverCalledEvaluator))
         .await
         .map(|_| ());
 
     match previous {
-        Some(v) => std::env::set_var("AWMAN_CONFIG_HOME", v),
-        None => std::env::remove_var("AWMAN_CONFIG_HOME"),
+        Some(v) => std::env::set_var("AWMAN_HOME", v),
+        None => std::env::remove_var("AWMAN_HOME"),
     }
 
     let err = result.expect_err("startup under the sandbox tier must fail");
@@ -228,8 +227,8 @@ async fn task_creation_under_sandbox_runtime_is_rejected_with_the_same_error() {
     // `~/.awman/config.json` (e.g. a configured `squad.agentsToModels` there
     // would otherwise demand Dockerfiles this test repo doesn't have).
     let _env_guard = ENV_LOCK.lock().await;
-    let previous = std::env::var("AWMAN_CONFIG_HOME").ok();
-    std::env::set_var("AWMAN_CONFIG_HOME", tmp.path());
+    let previous = std::env::var("AWMAN_HOME").ok();
+    std::env::set_var("AWMAN_HOME", tmp.path());
 
     let store = Arc::new(TaskStore::open(&tmp.path().join("squad.db")).unwrap());
 
@@ -305,7 +304,7 @@ async fn task_creation_under_sandbox_runtime_is_rejected_with_the_same_error() {
     assert_eq!(tasks[0].name, "existing-task");
 
     match previous {
-        Some(v) => std::env::set_var("AWMAN_CONFIG_HOME", v),
-        None => std::env::remove_var("AWMAN_CONFIG_HOME"),
+        Some(v) => std::env::set_var("AWMAN_HOME", v),
+        None => std::env::remove_var("AWMAN_HOME"),
     }
 }

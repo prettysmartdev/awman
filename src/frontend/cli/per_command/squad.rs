@@ -12,10 +12,17 @@ use crate::frontend::render_helpers::format_table;
 /// Render a squad outcome through the CLI's common table/JSON conventions.
 pub(crate) fn render_squad(outcome: &SquadOutcome, json: bool) -> Option<String> {
     if json {
-        return Some(
-            serde_json::to_string_pretty(outcome)
-                .unwrap_or_else(|error| format!("failed to serialize squad outcome: {error}")),
-        );
+        let value = serde_json::to_value(outcome).map(|value| match outcome {
+            SquadOutcome::Task(_)
+            | SquadOutcome::Updated(_)
+            | SquadOutcome::Tasks(_)
+            | SquadOutcome::Detail(_) => value["payload"].clone(),
+            _ => value,
+        });
+        return Some(match value {
+            Ok(value) => serde_json::to_string_pretty(&value).expect("JSON value serializes"),
+            Err(error) => format!("failed to serialize squad outcome: {error}"),
+        });
     }
 
     match outcome {
@@ -389,7 +396,7 @@ mod tests {
     fn task(name: &str, unmet: &[&str]) -> Task {
         Task {
             prerequisites: None,
-            id: name.into(),
+            id: crate::frontend::test_ids::task_id(name),
             name: name.into(),
             description: "a task".into(),
             repo_scope: std::path::PathBuf::from("/repo"),
@@ -411,8 +418,8 @@ mod tests {
 
     fn run(unmet: &[&str]) -> Run {
         Run {
-            id: "run-1".into(),
-            task_id: "t".into(),
+            id: crate::frontend::test_ids::run_id("run-1"),
+            task_id: crate::frontend::test_ids::task_id("t"),
             status: RunStatus::Failed,
             workflow_path: None,
             workflow_state_path: None,
@@ -880,9 +887,9 @@ mod tests {
         .unwrap();
         assert!(!json.contains("\u{26a0} env"), "{json}");
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed["payload"][0]["name"], "nightly-triage");
+        assert_eq!(parsed["items"][0]["name"], "nightly-triage");
         assert_eq!(
-            parsed["payload"][0]["unmet_env"],
+            parsed["items"][0]["unmet_env"],
             serde_json::json!(["ANTHROPIC_KEY"])
         );
     }
@@ -1004,7 +1011,7 @@ mod wi0149_tests {
         let now = chrono::Utc::now();
         let mut task = Task {
             prerequisites: None,
-            id: "149".into(),
+            id: crate::frontend::test_ids::task_id("149"),
             name: "regression".into(),
             description: "test".into(),
             repo_scope: "/repo".into(),

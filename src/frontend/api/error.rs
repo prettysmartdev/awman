@@ -55,6 +55,13 @@ constructors! {
     invalid_request => (failure_codes::INVALID_REQUEST, BAD_REQUEST),
     request_forbidden => ("forbidden", FORBIDDEN),
     request_not_found => ("not_found", NOT_FOUND),
+    feature_disabled => ("feature_disabled", SERVICE_UNAVAILABLE),
+    config_invalid => ("config_invalid", UNPROCESSABLE_ENTITY),
+    task_not_found => ("task_not_found", NOT_FOUND),
+    run_not_found => ("run_not_found", NOT_FOUND),
+    grant_not_found => ("grant_not_found", NOT_FOUND),
+    task_exists => ("task_exists", CONFLICT),
+    prerequisite_widening_refused => ("prerequisite_widening_refused", FORBIDDEN),
     method_not_allowed => ("method_not_allowed", METHOD_NOT_ALLOWED),
     output_not_found => ("output_not_found", NOT_FOUND),
     request_too_large => ("request_too_large", PAYLOAD_TOO_LARGE),
@@ -83,6 +90,28 @@ constructors! {
 }
 
 impl ApiError {
+    /// Generic resource or route not found response.
+    pub fn not_found(message: impl Into<String>) -> Self {
+        Self::request_not_found(message)
+    }
+
+    /// Central mapping from command failure codes to HTTP status and response
+    /// code. All API handlers should use this instead of maintaining mappings.
+    pub fn from_command_error(error: &CommandError) -> Self {
+        let code = error.code();
+        let status = Self::ALL
+            .iter()
+            .find_map(|(registered, status)| (*registered == code).then_some(*status))
+            .unwrap_or_else(|| {
+                StatusCode::from_u16(error.http_status()).unwrap_or(StatusCode::BAD_REQUEST)
+            });
+        Self {
+            status,
+            code,
+            message: error.to_string(),
+        }
+    }
+
     /// Catalogue parsing always rejects at admission with HTTP 400.
     pub fn command_validation(error: &CommandError) -> Self {
         match error {
@@ -112,35 +141,7 @@ impl ApiError {
     /// Preserve command admission's status and reuse asynchronous failure codes
     /// for typed conditions shared with `result.failure` (WI 0137).
     pub fn command_admission(error: &CommandError) -> Self {
-        match error {
-            CommandError::SessionWorkdirNotAllowed { .. } => {
-                Self::forbidden_workdir(error.to_string())
-            }
-            CommandError::WorktreeExists { .. } => Self::worktree_exists(error.to_string()),
-            CommandError::MergeConflict { .. } => Self::merge_conflict(error.to_string()),
-            CommandError::MergeTargetDirty { .. } => Self::merge_target_dirty(error.to_string()),
-            CommandError::WorkflowPrerequisitesUnresolved { .. } => {
-                Self::workflow_prerequisites_unresolved(error.to_string())
-            }
-            CommandError::Engine(crate::engine::error::EngineError::UnknownAgent { .. }) => {
-                Self::unknown_agent(error.to_string())
-            }
-            CommandError::Engine(crate::engine::error::EngineError::AgentDefinitionUntrusted {
-                ..
-            }) => Self::agent_untrusted(error.to_string()),
-            _ => match error.http_status() {
-                403 => Self::request_forbidden(error.to_string()),
-                404 => Self::request_not_found(error.to_string()),
-                500 => Self::internal(error.to_string()),
-                400 => Self::command_validation(error),
-                status => Self {
-                    status: StatusCode::from_u16(status)
-                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-                    code: error.code(),
-                    message: error.to_string(),
-                },
-            },
-        }
+        Self::from_command_error(error)
     }
 
     /// Retain existing route-specific fields alongside the shared envelope.
@@ -357,22 +358,42 @@ mod tests {
             assert_eq!(api.status.as_u16(), error.http_status());
             assert_eq!(api.message, error.to_string());
         }
-        // Conditions WI 0138 has no code for keep its HTTP class code at
-        // admission; `result.failure.code` names the variant (WI 0137 §1).
-        for (error, class) in [
-            (
-                CommandError::WorkflowFileNotFound {
-                    path: "/workflow".into(),
-                },
-                "not_found",
-            ),
-            (CommandError::SessionRepoUrlEmpty, "invalid_request"),
+        // Admission uses the central stable code directly; response status is
+        // selected separately from that code.
+        for error in [
+            CommandError::WorkflowFileNotFound {
+                path: "/workflow".into(),
+            },
+            CommandError::SessionRepoUrlEmpty,
         ] {
             let api = ApiError::command_admission(&error);
-            assert_eq!(api.code, class);
-            assert_ne!(api.code, error.code());
+            assert_eq!(api.code, error.code());
             assert_eq!(api.status.as_u16(), error.http_status());
             assert_eq!(api.message, error.to_string());
+        }
+    }
+
+    #[test]
+    fn prerequisite_widening_has_its_own_forbidden_code() {
+        let error = CommandError::PrerequisiteWideningRefused {
+            flag: "--prerequisite-ssh".into(),
+        };
+        let api = ApiError::from_command_error(&error);
+        assert_eq!(api.status, StatusCode::FORBIDDEN);
+        assert_eq!(api.code, "prerequisite_widening_refused");
+        assert_ne!(api.code, "forbidden");
+        assert!(ApiError::ALL.contains(&("feature_disabled", StatusCode::SERVICE_UNAVAILABLE)));
+        assert!(ApiError::ALL.contains(&("not_found", StatusCode::NOT_FOUND)));
+    }
+
+    #[test]
+    fn all_error_codes_are_unique_snake_case_entries() {
+        let mut seen = std::collections::BTreeSet::new();
+        for (code, _) in ApiError::ALL {
+            assert!(seen.insert(*code), "duplicate API error code: {code}");
+            assert!(code
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'));
         }
     }
 }

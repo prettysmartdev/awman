@@ -105,3 +105,9 @@ pub fn new(ctx: &BuildContext) -> Result<BuiltCommand, CommandError> {
 pub fn clean(ctx: &BuildContext) -> Result<BuiltCommand, CommandError> {
     Ok(BuiltCommand::Clean(CleanCommand::from_input(ctx)?))
 }
+
+pub fn daemon_api(ctx: &BuildContext) -> Result<BuiltCommand, CommandError> {
+    Ok(BuiltCommand::DaemonApi(
+        crate::command::commands::daemon::api::DaemonApiCommand::from_input(ctx)?,
+    ))
+}

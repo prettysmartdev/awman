@@ -726,7 +726,7 @@ mod tests {
             Path::new("/home/u/.awman/squad/awman.log"),
             &[
                 ("PATH".to_string(), "/usr/local/bin:/usr/bin".to_string()),
-                ("AWMAN_SQUAD_ROOT".to_string(), "/custom/squad".to_string()),
+                ("AWMAN_HOME".to_string(), "/custom/home".to_string()),
             ],
             Some(Path::new("/home/u/project")),
         );
@@ -737,7 +737,7 @@ mod tests {
             plist.contains("<string>/usr/local/bin:/usr/bin</string>"),
             "{plist}"
         );
-        assert!(plist.contains("<key>AWMAN_SQUAD_ROOT</key>"), "{plist}");
+        assert!(plist.contains("<key>AWMAN_HOME</key>"), "{plist}");
         assert!(
             plist.contains("<key>WorkingDirectory</key>\n    <string>/home/u/project</string>"),
             "{plist}"
@@ -870,13 +870,10 @@ mod tests {
                     "env(DEPLOY_TOKEN)".to_string(),
                 ),
                 (
-                    crate::data::config::env::AWMAN_MAX_CONCURRENT_AGENTS.to_string(),
+                    "AWMAN_WORKFLOWS_MAX_CONCURRENT_STEPS".to_string(),
                     "4".to_string(),
                 ),
-                (
-                    crate::data::config::env::AWMAN_LAUNCH_MODE.to_string(),
-                    "stdio".to_string(),
-                ),
+                ("AWMAN_AGENTS_LAUNCH_MODE".to_string(), "stdio".to_string()),
             ],
             None,
         );
@@ -886,11 +883,14 @@ mod tests {
             "{plist}"
         );
         assert!(
-            plist.contains("<key>AWMAN_MAX_CONCURRENT_AGENTS</key>"),
+            plist.contains("<key>AWMAN_WORKFLOWS_MAX_CONCURRENT_STEPS</key>"),
             "{plist}"
         );
         assert!(plist.contains("<string>4</string>"), "{plist}");
-        assert!(plist.contains("<key>AWMAN_LAUNCH_MODE</key>"), "{plist}");
+        assert!(
+            plist.contains("<key>AWMAN_AGENTS_LAUNCH_MODE</key>"),
+            "{plist}"
+        );
         assert!(plist.contains("<string>stdio</string>"), "{plist}");
     }
 

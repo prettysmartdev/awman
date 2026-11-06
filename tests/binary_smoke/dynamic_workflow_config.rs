@@ -143,7 +143,7 @@ impl Fixture {
             "--dynamic",
             "--work-item",
             "1",
-            "--non-interactive",
+            "--headless",
             "--on-existing-worktree",
             "recreate",
         ]);
@@ -160,31 +160,32 @@ impl Fixture {
 }
 
 const LEGACY_REPO: &str = r#"{"agent":"claude","dynamicWorkflows":{"guidance":["be nice","use tabs"],"maxConcurrentSteps":2}}"#;
-const NEW_REPO: &str = r#"{"agent":"claude","workflows":{"dynamic":{"guidance":["be nice","use tabs"],"maxConcurrentSteps":2}}}"#;
-const DEPRECATION: &str = "uses `dynamicWorkflows`, which has moved to `workflows.dynamic`";
+const NEW_REPO: &str = r#"{"agents":{"default":"claude"},"workflows":{"maxConcurrentSteps":2,"dynamic":{"guidance":["be nice","use tabs"]}}}"#;
 
-fn deprecation_count(stderr: &str) -> usize {
-    stderr.matches(DEPRECATION).count()
-}
-
-// ─── legacy-only repo, no global block ──────────────────────────────────────
+// ─── a pre-0139 repo file fails with the moved-to hint ──────────────────────
 
 #[test]
-fn legacy_only_repo_gives_the_same_leader_prompt_as_the_new_location() {
-    let legacy = Fixture::new(Some(LEGACY_REPO), None);
-    let (legacy_prompt, stderr) = legacy.run_dynamic();
-    assert_eq!(deprecation_count(&stderr), 1, "warned once: {stderr}");
-
-    let modern = Fixture::new(Some(NEW_REPO), None);
-    let (modern_prompt, stderr) = modern.run_dynamic();
-    assert_eq!(deprecation_count(&stderr), 0, "{stderr}");
-
-    assert_eq!(legacy_prompt, modern_prompt, "byte-identical leader prompt");
-}
-
-#[test]
-fn legacy_only_repo_prompt_carries_the_guidance_block_and_concurrency_note() {
+fn an_old_repo_file_fails_naming_the_new_keys_and_is_not_rewritten() {
     let fx = Fixture::new(Some(LEGACY_REPO), None);
+    let out = fx.awman(&["config", "show"]);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!out.status.success(), "{text}");
+    assert!(text.contains("unknown config key"), "{text}");
+    assert!(text.contains("agents.default"), "{text}");
+    assert_eq!(
+        std::fs::read_to_string(fx.repo_config_path()).unwrap(),
+        LEGACY_REPO,
+        "an old file is never rewritten"
+    );
+}
+
+#[test]
+fn repo_prompt_carries_the_guidance_block_and_concurrency_note() {
+    let fx = Fixture::new(Some(NEW_REPO), None);
     let (prompt, _) = fx.run_dynamic();
     let section = config_fed_section(&prompt);
     assert!(
@@ -206,9 +207,9 @@ fn legacy_only_repo_prompt_carries_the_guidance_block_and_concurrency_note() {
 
 #[test]
 fn global_only_block_applies_the_global_leader_guidance_and_concurrency() {
-    let global = r#"{"workflows":{"dynamic":{"defaultLeader":"claude::sonnet-global","maxConcurrentSteps":3,"guidance":["global rule"]}}}"#;
-    let fx = Fixture::new(Some(r#"{"agent":"claude"}"#), Some(global));
-    let (prompt, stderr) = fx.run_dynamic();
+    let global = r#"{"workflows":{"maxConcurrentSteps":3,"dynamic":{"defaultLeader":"claude::sonnet-global","guidance":["global rule"]}}}"#;
+    let fx = Fixture::new(Some(r#"{"agents":{"default":"claude"}}"#), Some(global));
+    let (prompt, _) = fx.run_dynamic();
     let section = config_fed_section(&prompt);
     assert!(section.contains("advised: 3."), "{section}");
     assert!(section.contains("- global rule"), "{section}");
@@ -217,15 +218,14 @@ fn global_only_block_applies_the_global_leader_guidance_and_concurrency() {
         "global leader model reaches the container: {}",
         fx.docker_log()
     );
-    assert_eq!(deprecation_count(&stderr), 0, "{stderr}");
 }
 
 // ─── global + repo ──────────────────────────────────────────────────────────
 
 #[test]
 fn global_plus_repo_merges_guidance_and_uses_the_repo_agent_map() {
-    let global = r#"{"workflows":{"dynamic":{"maxConcurrentSteps":5,"guidance":["first","shared"],"agentsToModels":{"claude":["global-model"],"codex":["codex-model"]}}}}"#;
-    let repo = r#"{"agent":"claude","workflows":{"dynamic":{"guidance":["shared","last"],"agentsToModels":{"claude":["repo-model"]}}}}"#;
+    let global = r#"{"workflows":{"maxConcurrentSteps":5,"dynamic":{"guidance":["first","shared"],"agentsToModels":{"claude":["global-model"],"codex":["codex-model"]}}}}"#;
+    let repo = r#"{"agents":{"default":"claude"},"workflows":{"dynamic":{"guidance":["shared","last"],"agentsToModels":{"claude":["repo-model"]}}}}"#;
     let fx = Fixture::new(Some(repo), Some(global));
     let (prompt, _) = fx.run_dynamic();
     let section = config_fed_section(&prompt);
@@ -235,114 +235,16 @@ fn global_plus_repo_merges_guidance_and_uses_the_repo_agent_map() {
     assert_eq!(section.matches("- shared").count(), 1, "{section}");
     // maxConcurrentSteps falls through from the global scope.
     assert!(section.contains("advised: 5."), "{section}");
-    // The non-empty repo map replaces the global one outright.
+    // The repo map replaces the global one outright.
     assert!(section.contains("repo-model"), "{section}");
     assert!(!section.contains("global-model"), "{section}");
     assert!(!section.contains("codex"), "{section}");
 }
 
-// ─── migrate, then the same run ─────────────────────────────────────────────
-
-#[test]
-fn config_migrate_yes_then_the_same_run_gives_the_identical_prompt() {
-    let fx = Fixture::new(Some(LEGACY_REPO), None);
-    let (before, _) = fx.run_dynamic();
-
-    let out = fx.awman(&["config", "migrate", "--yes"]);
-    assert!(out.status.success(), "{out:?}");
-    let config = fx.repo_config();
-    assert!(config.get("dynamicWorkflows").is_none(), "{config}");
-    assert_eq!(config["workflows"]["dynamic"]["maxConcurrentSteps"], 2);
-    assert_eq!(config["agent"], "claude", "unrelated keys kept");
-    // The migrated file is no longer committed-clean, but the run reads the
-    // working copy; commit it so the worktree matches.
-    fx.git(&["add", "-A"]);
-    fx.git(&[
-        "-c",
-        "user.name=t",
-        "-c",
-        "user.email=t@t",
-        "commit",
-        "-qm",
-        "m",
-    ]);
-
-    let (after, stderr) = fx.run_dynamic();
-    assert_eq!(deprecation_count(&stderr), 0, "{stderr}");
-    assert_eq!(
-        before, after,
-        "byte-identical leader prompt after migrating"
-    );
-}
-
-// ─── older-format file + config set ─────────────────────────────────────────
-
-#[test]
-fn older_format_repo_file_is_migrated_by_an_unrelated_config_set() {
-    let older = r#"{"agent":"claude","dynamicWorkflows":{"guidance":["keep me"],"agentsToModels":{"claude":["m1"]}}}"#;
-    let fx = Fixture::new(Some(older), None);
-    let out = fx.awman(&["config", "set", "agent", "codex"]);
-    let text = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(out.status.success(), "{text}");
-    let config = fx.repo_config();
-    assert!(config.get("dynamicWorkflows").is_none(), "{config}");
-    assert_eq!(config["workflows"]["dynamic"]["guidance"][0], "keep me");
-    assert_eq!(
-        config["workflows"]["dynamic"]["agentsToModels"]["claude"][0],
-        "m1"
-    );
-    assert_eq!(config["agent"], "codex", "{config}");
-    assert!(
-        text.contains("workflows.dynamic"),
-        "the move is reported: {text}"
-    );
-}
-
-// ─── `config migrate` through the CLI ───────────────────────────────────────
-
-#[test]
-fn config_migrate_dry_run_writes_nothing() {
-    let fx = Fixture::new(Some(LEGACY_REPO), None);
-    let out = fx.awman(&["config", "migrate", "--dry-run"]);
-    assert!(out.status.success(), "{out:?}");
-    assert!(String::from_utf8_lossy(&out.stdout).contains("dry run: nothing written"));
-    assert_eq!(
-        std::fs::read_to_string(fx.repo_config_path()).unwrap(),
-        LEGACY_REPO
-    );
-}
-
-#[test]
-fn config_migrate_non_interactive_without_yes_exits_2_and_writes_nothing() {
-    let fx = Fixture::new(Some(LEGACY_REPO), None);
-    let out = fx.awman(&["config", "migrate", "--non-interactive"]);
-    assert_eq!(out.status.code(), Some(2), "{out:?}");
-    assert_eq!(
-        std::fs::read_to_string(fx.repo_config_path()).unwrap(),
-        LEGACY_REPO
-    );
-}
-
-#[test]
-fn config_migrate_with_nothing_to_migrate_exits_zero() {
-    let fx = Fixture::new(Some(NEW_REPO), None);
-    let out = fx.awman(&["config", "migrate", "--yes"]);
-    assert!(out.status.success(), "{out:?}");
-    assert!(String::from_utf8_lossy(&out.stdout).contains("nothing to migrate"));
-    assert_eq!(
-        std::fs::read_to_string(fx.repo_config_path()).unwrap(),
-        NEW_REPO
-    );
-}
-
 #[test]
 fn config_set_work_items_dir_persists_on_a_current_format_file() {
     let fx = Fixture::new(Some(NEW_REPO), None);
-    let out = fx.awman(&["config", "set", "work_items.dir", "x"]);
+    let out = fx.awman(&["config", "set", "workItems.dir", "x"]);
     assert!(out.status.success(), "{out:?}");
     let config = fx.repo_config();
     assert_eq!(config["workItems"]["dir"], "x", "{config}");

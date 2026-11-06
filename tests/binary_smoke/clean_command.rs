@@ -23,7 +23,7 @@ fn awman_bin() -> std::path::PathBuf {
 ///
 /// That item is a single fixed service/account pair by design (`awman clean`
 /// must find it whatever storage root the daemon used), which is exactly why an
-/// isolated `AWMAN_CONFIG_HOME` does not isolate it. `KeychainStore` shells out
+/// isolated `AWMAN_HOME` does not isolate it. `KeychainStore` shells out
 /// to `security` (macOS) and `secret-tool` (Linux) by bare name, so putting a
 /// stub earlier on `PATH` is enough: `item_present()` then answers `false` and
 /// the category is never offered, on any host.
@@ -174,7 +174,7 @@ fn clean_non_tty_stdin_without_yes_aborts() {
     let out = Command::new(awman_bin())
         .args(["clean"])
         .current_dir(repo.path())
-        .env("AWMAN_CONFIG_HOME", home.path())
+        .env("AWMAN_HOME", home.path())
         .env("PATH", &keychain_path)
         .stdin(null_stdin())
         .output()
@@ -219,7 +219,7 @@ fn clean_nothing_to_clean_exits_zero_with_no_tty() {
     let out = Command::new(awman_bin())
         .args(["clean"])
         .current_dir(repo.path())
-        .env("AWMAN_CONFIG_HOME", home.path())
+        .env("AWMAN_HOME", home.path())
         .env("PATH", &keychain_path)
         .stdin(null_stdin())
         .output()
@@ -252,7 +252,7 @@ fn clean_dry_run_lists_items_and_deletes_nothing() {
     let out = Command::new(awman_bin())
         .args(["clean", "--dry-run"])
         .current_dir(repo.path())
-        .env("AWMAN_CONFIG_HOME", home.path())
+        .env("AWMAN_HOME", home.path())
         .env("PATH", &keychain_path)
         .stdin(null_stdin())
         .output()
@@ -297,7 +297,7 @@ fn clean_dry_run_nothing_to_clean_exits_zero() {
     let out = Command::new(awman_bin())
         .args(["clean", "--dry-run"])
         .current_dir(repo.path())
-        .env("AWMAN_CONFIG_HOME", home.path())
+        .env("AWMAN_HOME", home.path())
         .env("PATH", &keychain_path)
         .stdin(null_stdin())
         .output()
@@ -338,7 +338,7 @@ fn clean_yes_deletes_completed_workflow_and_preserves_pending() {
     let out = Command::new(awman_bin())
         .args(["clean", "--yes"])
         .current_dir(repo.path())
-        .env("AWMAN_CONFIG_HOME", home.path())
+        .env("AWMAN_HOME", home.path())
         .env("PATH", &keychain_path)
         .stdin(null_stdin())
         .output()
@@ -371,7 +371,7 @@ fn clean_yes_empty_repo_exits_zero() {
     let out = Command::new(awman_bin())
         .args(["clean", "--yes"])
         .current_dir(repo.path())
-        .env("AWMAN_CONFIG_HOME", home.path())
+        .env("AWMAN_HOME", home.path())
         .env("PATH", &keychain_path)
         .stdin(null_stdin())
         .output()
@@ -411,7 +411,7 @@ fn clean_removes_pre_migration_backups_and_preserves_live_database() {
     let out = Command::new(awman_bin())
         .args(["clean", "--yes"])
         .current_dir(repo.path())
-        .env("AWMAN_CONFIG_HOME", home.path())
+        .env("AWMAN_HOME", home.path())
         .env("PATH", &keychain_path)
         .stdin(null_stdin())
         .output()
@@ -448,7 +448,7 @@ fn clean_dry_run_and_yes_deletes_nothing() {
     let out = Command::new(awman_bin())
         .args(["clean", "--dry-run", "--yes"])
         .current_dir(repo.path())
-        .env("AWMAN_CONFIG_HOME", home.path())
+        .env("AWMAN_HOME", home.path())
         .env("PATH", &keychain_path)
         .stdin(null_stdin())
         .output()

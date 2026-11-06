@@ -17,10 +17,9 @@ use awman::command::commands::squad::key_setup::{export_snippet, ShellFlavor};
 use awman::command::commands::squad::supervisor::SquadKeySetup;
 use awman::command::dispatch::Engines;
 use awman::command::error::CommandError;
-use awman::data::config::env::{
-    Env, EnvSnapshot, AWMAN_API_ROOT, AWMAN_CONFIG_HOME, AWMAN_SQUAD_KEY, AWMAN_SQUAD_ROOT, SHELL,
-};
+use awman::data::config::env::{Env, EnvSnapshot, AWMAN_SQUAD_KEY, SHELL};
 use awman::data::fs::daemon_process::ServerMeta;
+use awman::data::fs::data_paths::AWMAN_HOME;
 use awman::data::fs::{ApiPaths, SquadPaths};
 use awman::data::message::{UserMessage, UserMessageSink};
 use awman::data::WorkflowStateStore;
@@ -109,7 +108,6 @@ fn engines_at(root: &Path) -> Engines {
         overlay_engine: overlay_engine.clone(),
         auth_engine: Arc::new(AuthEngine::with_paths(auth_paths, api_paths.clone())),
         agent_engine: Arc::new(AgentEngine::new(overlay_engine, runtime)),
-        config_notices: Default::default(),
         workflow_state_store: Arc::new(WorkflowStateStore::at_git_root(api_paths.root())),
         credential_monitor: None,
         global_config: std::sync::Arc::new(Default::default()),
@@ -148,12 +146,7 @@ impl Drop for ScopedEnv {
 async fn run_start(home: &Path, flags: SquadStartFlags) -> (RecordingFrontend, SquadPaths) {
     let squad_root = home.join("squad");
     std::fs::create_dir_all(&squad_root).unwrap();
-    let _scoped = ScopedEnv::set(&[
-        (AWMAN_API_ROOT, home.join("api").to_str().unwrap()),
-        (AWMAN_SQUAD_ROOT, squad_root.to_str().unwrap()),
-        (AWMAN_CONFIG_HOME, home.to_str().unwrap()),
-        (SHELL, "/bin/zsh"),
-    ]);
+    let _scoped = ScopedEnv::set(&[(AWMAN_HOME, home.to_str().unwrap()), (SHELL, "/bin/zsh")]);
     let frontend = RecordingFrontend::default();
     SquadDaemon::new(SquadDaemonSubcommand::Start(flags), engines_at(home))
         .run(&mut frontend.clone())

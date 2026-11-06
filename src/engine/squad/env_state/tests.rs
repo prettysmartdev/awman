@@ -51,7 +51,7 @@ fn task(name: &str, overlays: &[&str]) -> Task {
     let now = Utc::now();
     Task {
         prerequisites: None,
-        id: uuid::Uuid::new_v4().to_string(),
+        id: crate::data::ids::TaskId::new(),
         name: name.to_string(),
         description: String::new(),
         repo_scope: PathBuf::from("/repo"),
@@ -313,7 +313,10 @@ fn unmet_for_task_covers_its_own_names_and_the_global_ones() {
     );
 
     state.apply_push(
-        DaemonEnvMap::from_pairs([("TOKEN", "v"), ("SHARED", "s")]),
+        DaemonEnvMap::from_pairs([
+            ("TOKEN", "v"),
+            ("SHARED", "ses_03c7c0ace395d80182db07ae2c30f034"),
+        ]),
         &[],
         now,
     );

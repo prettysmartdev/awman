@@ -234,7 +234,7 @@ fn builtin_documented_network_example_validates() {
         .unwrap();
     let value: serde_json::Value = serde_json::from_str(json).unwrap();
     let config: BuiltinNetworkConfig =
-        serde_json::from_value(value["builtin"]["network"].clone()).unwrap();
+        serde_json::from_value(value["runtime"]["builtin"]["network"].clone()).unwrap();
     BuiltinNetworkConfig::resolve(Some(&config), None).unwrap();
 }
 

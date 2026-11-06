@@ -324,10 +324,7 @@ impl ExecWorkflowCommand {
             PrerequisiteStart::CheckOnly(outcome) => return Ok(outcome),
         };
 
-        frontend.with(|frontend| {
-            LaunchPolicy::for_session(&self.session)
-                .warn_config(&self.engines.config_notices, frontend)
-        });
+        frontend.with(|frontend| LaunchPolicy::for_session(&self.session).warn_config(frontend));
 
         // ── Worktree prepare BEFORE launching the leader (WI-0092 §5). ──────
         let remote_clone = base_session.session_type().is_remote();
@@ -586,12 +583,19 @@ impl ExecWorkflowCommand {
         .await
         .map_err(|e| attribute_leader_error(&dynamic, e))?;
 
+        let session_max_concurrent_steps =
+            crate::command::commands::exec_workflow::workflow_effective_config(
+                &self.session,
+                &self.flags,
+            )
+            .map_err(CommandError::from)?
+            .max_concurrent_steps();
         let guidance = dynamic.guidance_texts();
         let leader_prompt = crate::data::dynamic_workflow_assets::build_leader_prompt(
             &format!("{wi_number:04}"),
             &leader_work_item_path.display().to_string(),
             &agents_section,
-            dynamic.max_concurrent_steps.as_ref().map(|s| s.value),
+            session_max_concurrent_steps,
             guidance.as_deref(),
         );
         let leader_prompt = crate::data::dynamic_workflow_assets::substitute_workflow_prerequisites(

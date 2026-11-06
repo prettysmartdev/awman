@@ -487,7 +487,7 @@ pub struct ConfigShowRow {
     /// can find the map and list headers — and build a new member's field
     /// name from the header's own prefix — without spelling a config path
     /// (WI 0114 F-20).
-    pub shape: crate::command::commands::config::ConfigRowShape,
+    pub shape: crate::command::commands::config::ConfigRowKind,
 }
 
 /// Compute a centered rect for a dialog.

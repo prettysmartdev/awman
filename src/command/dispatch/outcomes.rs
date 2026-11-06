@@ -13,6 +13,7 @@ pub enum CommandOutcome {
     Config(crate::command::commands::config::ConfigOutcome),
     ExecPrompt(crate::command::commands::exec_prompt::ExecPromptOutcome),
     ExecWorkflow(crate::command::commands::exec_workflow::ExecWorkflowOutcome),
+    DaemonApi(crate::command::commands::daemon::api::DaemonApiOutcome),
     ApiServer(crate::command::commands::api_server::ApiServerOutcome),
     Squad(crate::command::commands::squad::commands::SquadOutcome),
     SquadAttach(crate::command::commands::squad::attach::SquadAttachOutcome),

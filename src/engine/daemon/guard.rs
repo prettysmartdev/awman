@@ -288,20 +288,14 @@ impl DaemonGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::config::env::{AWMAN_API_ROOT, AWMAN_CONFIG_HOME, AWMAN_SQUAD_ROOT};
+    use crate::data::fs::data_paths::AWMAN_HOME;
 
-    /// `AWMAN_CONFIG_HOME` is set as well so the shared startup-arbitration
-    /// lock (which lives beside the shared database) also lands in the
-    /// fixture, never in the developer's real `~/.awman`.
-    fn env_for(api_root: &std::path::Path, squad_root: &std::path::Path) -> EnvSnapshot {
-        EnvSnapshot::with_overrides([
-            (AWMAN_API_ROOT, api_root.to_str().unwrap()),
-            (AWMAN_SQUAD_ROOT, squad_root.to_str().unwrap()),
-            (
-                AWMAN_CONFIG_HOME,
-                api_root.parent().unwrap_or(api_root).to_str().unwrap(),
-            ),
-        ])
+    /// Both daemon roots derive from `AWMAN_HOME` (`<home>/api`, `<home>/squad`),
+    /// so pointing it at a fixture keeps the pidfiles and the startup lock out
+    /// of the developer's real `~/.awman`. `_squad_root` is kept so callers
+    /// still own a second tempdir; it is unused since WI 0139.
+    fn env_for(api_root: &std::path::Path, _squad_root: &std::path::Path) -> EnvSnapshot {
+        EnvSnapshot::with_overrides([(AWMAN_HOME, api_root.to_str().unwrap())])
     }
 
     #[test]

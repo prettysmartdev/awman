@@ -1,4 +1,5 @@
 pub mod attach;
+pub mod client;
 pub mod commands;
 pub mod daemon;
 pub mod daemon_runtime;

@@ -223,7 +223,7 @@ mod tests {
         let now = Utc::now();
         Task {
             prerequisites: None,
-            id: name.to_string(),
+            id: crate::frontend::test_ids::task_id(name),
             name: name.to_string(),
             description: "test task".to_string(),
             repo_scope: PathBuf::from("/workspace"),

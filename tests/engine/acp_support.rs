@@ -90,7 +90,7 @@ exit 0
             .args(args)
             .env("PATH", path)
             .env("HOME", self.home.path())
-            .env("AWMAN_CONFIG_HOME", self.home.path())
+            .env("AWMAN_HOME", self.home.path())
             .env("AWMAN_TEST_DOCKER_LOG", &self.log)
             .output()
             .unwrap()
@@ -150,7 +150,7 @@ fn chat_acp_unsupported_agent_fails_before_container_spawn() {
     let fake = FakeDocker::new();
     let out = fake.command(
         repo.path(),
-        &["chat", "--agent", "codex", "--launch-mode", "acp"],
+        &["chat", "--agent", "codex", "--set", "agents.launchMode=acp"],
     );
     assert!(!out.status.success());
     let text = String::from_utf8_lossy(&out.stderr);
@@ -166,11 +166,11 @@ fn chat_acp_unsupported_agent_fails_before_container_spawn() {
 fn chat_acp_cline_uses_acp_entrypoint_and_piped_stdin() {
     let repo = git_repo();
     write_agent_dockerfiles(repo.path(), &["cline"]);
-    write_repo_config(repo.path(), r#"{"auth":"none"}"#);
+    write_repo_config(repo.path(), r#"{"agents":{"auth":{"mode":"none"}}}"#);
     let fake = FakeDocker::new();
     let out = fake.command(
         repo.path(),
-        &["chat", "--agent", "cline", "--launch-mode", "acp"],
+        &["chat", "--agent", "cline", "--set", "agents.launchMode=acp"],
     );
     assert!(
         out.status.success(),
@@ -193,7 +193,10 @@ fn chat_acp_cline_uses_acp_entrypoint_and_piped_stdin() {
 #[test]
 fn exec_workflow_acp_error_fails_preflight_without_run() {
     let repo = git_repo();
-    write_repo_config(repo.path(), r#"{"launchMode":"acp","auth":"none"}"#);
+    write_repo_config(
+        repo.path(),
+        r#"{"agents":{"launchMode":"acp","auth":{"mode":"none"}}}"#,
+    );
     let workflow = r#"
 [[step]]
 name = "supported"
@@ -209,7 +212,7 @@ prompt = "two"
     let fake = FakeDocker::new();
     let out = fake.command(
         repo.path(),
-        &["exec", "workflow", "workflow.toml", "--non-interactive"],
+        &["exec", "workflow", "workflow.toml", "--headless"],
     );
     assert!(!out.status.success());
     let text = String::from_utf8_lossy(&out.stderr);
@@ -230,7 +233,10 @@ fn exec_workflow_acp_stdio_fallback_launches_each_step_in_stdio() {
     // of the way — the whole workflow completes over PTY/stdio.
     let repo = git_repo();
     write_agent_dockerfiles(repo.path(), &["claude", "codex"]);
-    write_repo_config(repo.path(), r#"{"launchMode":"acp","auth":"none"}"#);
+    write_repo_config(
+        repo.path(),
+        r#"{"agents":{"launchMode":"acp","auth":{"mode":"none"}}}"#,
+    );
     let workflow = r#"
 [[step]]
 name = "first"
@@ -246,12 +252,12 @@ prompt = "two"
     let fake = FakeDocker::new();
     fs::write(
         fake.home.path().join("config.json"),
-        r#"{"launchModeFallback":"stdio"}"#,
+        r#"{"agents":{"acpFallback":"stdio"}}"#,
     )
     .unwrap();
     let out = fake.command(
         repo.path(),
-        &["exec", "workflow", "workflow.toml", "--non-interactive"],
+        &["exec", "workflow", "workflow.toml", "--headless"],
     );
     assert!(
         out.status.success(),
@@ -283,7 +289,10 @@ fn exec_workflow_acp_supported_step_rejected_before_any_run() {
     // the "workflow launches an ACP container it never talks to" blocker.
     let repo = git_repo();
     write_agent_dockerfiles(repo.path(), &["cline"]);
-    write_repo_config(repo.path(), r#"{"launchMode":"acp","auth":"none"}"#);
+    write_repo_config(
+        repo.path(),
+        r#"{"agents":{"launchMode":"acp","auth":{"mode":"none"}}}"#,
+    );
     let workflow = r#"
 [[step]]
 name = "solo"
@@ -294,12 +303,12 @@ prompt = "one"
     let fake = FakeDocker::new();
     fs::write(
         fake.home.path().join("config.json"),
-        r#"{"launchModeFallback":"stdio"}"#,
+        r#"{"agents":{"acpFallback":"stdio"}}"#,
     )
     .unwrap();
     let out = fake.command(
         repo.path(),
-        &["exec", "workflow", "workflow.toml", "--non-interactive"],
+        &["exec", "workflow", "workflow.toml", "--headless"],
     );
     assert!(!out.status.success(), "workflow ACP must fail pre-flight");
     let text = String::from_utf8_lossy(&out.stderr);

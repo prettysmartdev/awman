@@ -1,6 +1,6 @@
 //! Agent output translators (WI 0137 §4).
 //!
-//! A non-interactive agent with a structured [`AgentOutputFormat`] prints a
+//! A headless agent with a structured [`AgentOutputFormat`] prints a
 //! machine-readable stream instead of plain text (claude `--output-format
 //! stream-json --verbose`, codex `exec --json`). One translator per format
 //! turns that stream into three things, from a single parse:

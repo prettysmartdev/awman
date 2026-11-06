@@ -11,8 +11,8 @@
 //!     code must not.
 //!
 //! Covered surfaces:
-//!   1. `handle_create_session` (POST /v1/sessions) validation-failure paths.
-//!   2. `handle_create_command` (POST /v1/commands) validation-failure paths
+//!   1. `handle_create_session` (POST /v1/worker/sessions) validation-failure paths.
+//!   2. `handle_create_command` (POST /v1/worker/commands) validation-failure paths
 //!      and session state-transition rejections.
 //!   3. `parse_args_to_flags()` command-dispatch positional mapping for every
 //!      special-cased subcommand (including `exec prompt` prompt-joining) and
@@ -64,7 +64,6 @@ fn make_app_state_with_workdirs(
     let workflow_state_store = Arc::new(WorkflowStateStore::at_git_root(paths.root()));
 
     let engines = Engines {
-        config_notices: Default::default(),
         runtime: runtime.clone(),
         container_runtime: Some(runtime),
         sandbox_runtime: None,
@@ -91,6 +90,8 @@ fn make_app_state_with_workdirs(
     );
 
     Arc::new(AppState {
+        live_config: std::sync::RwLock::new(None),
+        settings_tx: None,
         lifecycle_store,
         setup_cancels,
         canceller,
@@ -139,7 +140,7 @@ fn make_frontend(subcommand: &str, args: &[&str]) -> ApiDispatchFrontend {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  Part 1 — handle_create_session (POST /v1/sessions) validation paths
+//  Part 1 — handle_create_session (POST /v1/worker/sessions) validation paths
 // ════════════════════════════════════════════════════════════════════════════
 
 /// PINS: unknown session_type → 400 Bad Request.
@@ -153,7 +154,7 @@ async fn real_network_create_session_invalid_type_returns_400() {
     };
 
     let resp = reqwest::Client::new()
-        .post(format!("http://{addr}/v1/sessions"))
+        .post(format!("http://{addr}/v1/worker/sessions"))
         .json(&serde_json::json!({ "session_type": "banana" }))
         .send()
         .await
@@ -188,7 +189,7 @@ async fn real_network_create_session_local_missing_workdir_returns_400() {
     };
 
     let resp = reqwest::Client::new()
-        .post(format!("http://{addr}/v1/sessions"))
+        .post(format!("http://{addr}/v1/worker/sessions"))
         .json(&serde_json::json!({ "session_type": "local" }))
         .send()
         .await
@@ -220,7 +221,7 @@ async fn real_network_create_session_local_noncanonical_workdir_returns_400() {
     };
 
     let resp = reqwest::Client::new()
-        .post(format!("http://{addr}/v1/sessions"))
+        .post(format!("http://{addr}/v1/worker/sessions"))
         .json(&serde_json::json!({
             "session_type": "local",
             "workdir": "/this/path/definitely/does/not/exist/awman-0097"
@@ -265,7 +266,7 @@ async fn real_network_create_session_local_offallowlist_workdir_returns_403() {
     };
 
     let resp = reqwest::Client::new()
-        .post(format!("http://{addr}/v1/sessions"))
+        .post(format!("http://{addr}/v1/worker/sessions"))
         .json(&serde_json::json!({
             "session_type": "local",
             "workdir": requested_path.display().to_string()
@@ -306,7 +307,7 @@ async fn real_network_create_session_local_allowlisted_workdir_returns_202() {
     };
 
     let resp = reqwest::Client::new()
-        .post(format!("http://{addr}/v1/sessions"))
+        .post(format!("http://{addr}/v1/worker/sessions"))
         .json(&serde_json::json!({
             "session_type": "local",
             "workdir": workdir_path.display().to_string()
@@ -317,11 +318,11 @@ async fn real_network_create_session_local_allowlisted_workdir_returns_202() {
 
     assert_eq!(
         resp.status().as_u16(),
-        202,
-        "allowlisted local session must be 202"
+        201,
+        "allowlisted local session must be 201"
     );
     let body: serde_json::Value = resp.json().await.unwrap();
-    assert!(body["session_id"].as_str().is_some(), "got {body}");
+    assert!(body["id"].as_str().is_some(), "got {body}");
 
     server.abort();
 }
@@ -337,7 +338,7 @@ async fn real_network_create_session_remote_missing_repo_url_returns_400() {
     };
 
     let resp = reqwest::Client::new()
-        .post(format!("http://{addr}/v1/sessions"))
+        .post(format!("http://{addr}/v1/worker/sessions"))
         .json(&serde_json::json!({ "session_type": "remote", "branch": "main" }))
         .send()
         .await
@@ -368,7 +369,7 @@ async fn real_network_create_session_remote_empty_repo_url_returns_400() {
     };
 
     let resp = reqwest::Client::new()
-        .post(format!("http://{addr}/v1/sessions"))
+        .post(format!("http://{addr}/v1/worker/sessions"))
         .json(&serde_json::json!({ "session_type": "remote", "repo_url": "   " }))
         .send()
         .await
@@ -396,7 +397,7 @@ async fn real_network_create_session_remote_file_scheme_returns_400() {
     };
 
     let resp = reqwest::Client::new()
-        .post(format!("http://{addr}/v1/sessions"))
+        .post(format!("http://{addr}/v1/worker/sessions"))
         .json(&serde_json::json!({
             "session_type": "remote",
             "repo_url": "file:///etc/passwd"
@@ -427,7 +428,7 @@ async fn real_network_create_session_remote_bare_path_returns_400() {
     };
 
     let resp = reqwest::Client::new()
-        .post(format!("http://{addr}/v1/sessions"))
+        .post(format!("http://{addr}/v1/worker/sessions"))
         .json(&serde_json::json!({
             "session_type": "remote",
             "repo_url": "/srv/git/local-repo"
@@ -476,7 +477,7 @@ async fn real_network_create_session_remote_accepted_schemes_return_202() {
         };
 
         let resp = reqwest::Client::new()
-            .post(format!("http://{addr}/v1/sessions"))
+            .post(format!("http://{addr}/v1/worker/sessions"))
             .json(&serde_json::json!({
                 "session_type": "remote",
                 "repo_url": url
@@ -487,13 +488,13 @@ async fn real_network_create_session_remote_accepted_schemes_return_202() {
 
         assert_eq!(
             resp.status().as_u16(),
-            202,
-            "accepted scheme '{url}' must return 202; got {}",
+            201,
+            "accepted scheme '{url}' must return 201; got {}",
             resp.status()
         );
         let body: serde_json::Value = resp.json().await.unwrap();
         assert!(
-            body["session_id"].as_str().is_some(),
+            body["id"].as_str().is_some(),
             "accepted scheme '{url}' must return a session_id; got {body}"
         );
 
@@ -502,10 +503,10 @@ async fn real_network_create_session_remote_accepted_schemes_return_202() {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  Part 2 — handle_create_command (POST /v1/commands) validation paths
+//  Part 2 — handle_create_command (POST /v1/worker/commands) validation paths
 // ════════════════════════════════════════════════════════════════════════════
 
-/// PINS: POST /v1/commands without the `x-awman-session` header → 400.
+/// PINS: POST /v1/worker/commands without the `x-awman-session` header → 400.
 #[tokio::test]
 async fn real_network_create_command_missing_session_header_returns_400() {
     let tmp = tempfile::tempdir().unwrap();
@@ -516,7 +517,7 @@ async fn real_network_create_command_missing_session_header_returns_400() {
     };
 
     let resp = reqwest::Client::new()
-        .post(format!("http://{addr}/v1/commands"))
+        .post(format!("http://{addr}/v1/worker/commands"))
         .json(&serde_json::json!({ "subcommand": "exec prompt", "args": [] }))
         .send()
         .await
@@ -553,8 +554,8 @@ async fn real_network_create_command_not_api_allowed_returns_400() {
     };
 
     let resp = reqwest::Client::new()
-        .post(format!("http://{addr}/v1/commands"))
-        .header("x-awman-session", "any-session")
+        .post(format!("http://{addr}/v1/worker/commands"))
+        .header("x-awman-session", "ses_00000000000000000000000000000000")
         .json(&serde_json::json!({ "subcommand": "clean", "args": [] }))
         .send()
         .await
@@ -576,7 +577,7 @@ async fn real_network_create_command_not_api_allowed_returns_400() {
     server.abort();
 }
 
-/// PINS: POST /v1/commands for a session that does not exist → 404.
+/// PINS: POST /v1/worker/commands for a session that does not exist → 404.
 #[tokio::test]
 async fn real_network_create_command_unknown_session_returns_404() {
     let tmp = tempfile::tempdir().unwrap();
@@ -587,7 +588,7 @@ async fn real_network_create_command_unknown_session_returns_404() {
     };
 
     let resp = reqwest::Client::new()
-        .post(format!("http://{addr}/v1/commands"))
+        .post(format!("http://{addr}/v1/worker/commands"))
         .header("x-awman-session", "ghost-session")
         .json(&serde_json::json!({ "subcommand": "exec prompt", "args": ["hi"] }))
         .send()
@@ -605,7 +606,7 @@ async fn real_network_create_command_unknown_session_returns_404() {
     server.abort();
 }
 
-/// PINS: POST /v1/commands for a closed session → 404.
+/// PINS: POST /v1/worker/commands for a closed session → 404.
 #[tokio::test]
 async fn real_network_create_command_closed_session_returns_404() {
     let tmp = tempfile::tempdir().unwrap();
@@ -619,7 +620,7 @@ async fn real_network_create_command_closed_session_returns_404() {
     state
         .store
         .insert_session_full(NewSessionRow {
-            id: "closed-sess",
+            id: "ses_5fb974e8f3e919536674840e16e04c9c",
             workdir: "/work",
             created_at: &ts,
             setup_status: SessionSetupStatus::Ready,
@@ -627,11 +628,14 @@ async fn real_network_create_command_closed_session_returns_404() {
             cloned_path: None,
         })
         .unwrap();
-    state.store.close_session_force("closed-sess", &ts).unwrap();
+    state
+        .store
+        .close_session_force("ses_5fb974e8f3e919536674840e16e04c9c", &ts)
+        .unwrap();
 
     let resp = reqwest::Client::new()
-        .post(format!("http://{addr}/v1/commands"))
-        .header("x-awman-session", "closed-sess")
+        .post(format!("http://{addr}/v1/worker/commands"))
+        .header("x-awman-session", "ses_5fb974e8f3e919536674840e16e04c9c")
         .json(&serde_json::json!({ "subcommand": "exec prompt", "args": ["hi"] }))
         .send()
         .await
@@ -648,7 +652,7 @@ async fn real_network_create_command_closed_session_returns_404() {
     server.abort();
 }
 
-/// PINS: POST /v1/commands for a 'closing' session → 409.
+/// PINS: POST /v1/worker/commands for a 'closing' session → 409.
 #[tokio::test]
 async fn real_network_create_command_closing_session_returns_409() {
     let tmp = tempfile::tempdir().unwrap();
@@ -662,7 +666,7 @@ async fn real_network_create_command_closing_session_returns_409() {
     state
         .store
         .insert_session_full(NewSessionRow {
-            id: "closing-sess",
+            id: "ses_94eb7da54cbeff7c297f5a9aa069ac1e",
             workdir: "/work",
             created_at: &ts,
             setup_status: SessionSetupStatus::Ready,
@@ -672,12 +676,15 @@ async fn real_network_create_command_closing_session_returns_409() {
         .unwrap();
     state
         .store
-        .update_session_status("closing-sess", SessionStatus::Closing)
+        .update_session_status(
+            "ses_94eb7da54cbeff7c297f5a9aa069ac1e",
+            SessionStatus::Closing,
+        )
         .unwrap();
 
     let resp = reqwest::Client::new()
-        .post(format!("http://{addr}/v1/commands"))
-        .header("x-awman-session", "closing-sess")
+        .post(format!("http://{addr}/v1/worker/commands"))
+        .header("x-awman-session", "ses_94eb7da54cbeff7c297f5a9aa069ac1e")
         .json(&serde_json::json!({ "subcommand": "exec prompt", "args": [] }))
         .send()
         .await
@@ -694,7 +701,7 @@ async fn real_network_create_command_closing_session_returns_409() {
     server.abort();
 }
 
-/// PINS: POST /v1/commands for an active session whose setup is NOT ready
+/// PINS: POST /v1/worker/commands for an active session whose setup is NOT ready
 /// → 409 (job-submission readiness guard).
 #[tokio::test]
 async fn real_network_create_command_session_not_ready_returns_409() {
@@ -710,7 +717,7 @@ async fn real_network_create_command_session_not_ready_returns_409() {
     state
         .store
         .insert_session_full(NewSessionRow {
-            id: "notready-sess",
+            id: "ses_597394ea88ec1b93383d8f34ed1ac554",
             workdir: "/work",
             created_at: &ts,
             setup_status: SessionSetupStatus::RunningReady,
@@ -720,8 +727,8 @@ async fn real_network_create_command_session_not_ready_returns_409() {
         .unwrap();
 
     let resp = reqwest::Client::new()
-        .post(format!("http://{addr}/v1/commands"))
-        .header("x-awman-session", "notready-sess")
+        .post(format!("http://{addr}/v1/worker/commands"))
+        .header("x-awman-session", "ses_597394ea88ec1b93383d8f34ed1ac554")
         .json(&serde_json::json!({ "subcommand": "exec prompt", "args": [] }))
         .send()
         .await
@@ -738,7 +745,7 @@ async fn real_network_create_command_session_not_ready_returns_409() {
     server.abort();
 }
 
-/// PINS: POST /v1/commands for an active + ready session → 202 Accepted, and
+/// PINS: POST /v1/worker/commands for an active + ready session → 202 Accepted, and
 /// the response advertises the forced `flags_applied` (yolo /
 /// non_interactive forced true).
 #[tokio::test]
@@ -750,11 +757,15 @@ async fn real_network_create_command_active_ready_session_returns_202() {
         return;
     };
 
-    insert_ready_session(&state.store, "ok-sess", "/work");
+    insert_ready_session(
+        &state.store,
+        "ses_9331119fe8c8a6e709ab2f07fc32332e",
+        "/work",
+    );
 
     let resp = reqwest::Client::new()
-        .post(format!("http://{addr}/v1/commands"))
-        .header("x-awman-session", "ok-sess")
+        .post(format!("http://{addr}/v1/worker/commands"))
+        .header("x-awman-session", "ses_9331119fe8c8a6e709ab2f07fc32332e")
         .json(&serde_json::json!({ "subcommand": "exec prompt", "args": ["hi"] }))
         .send()
         .await
@@ -766,7 +777,7 @@ async fn real_network_create_command_active_ready_session_returns_202() {
         "active + ready session must be 202"
     );
     let body: serde_json::Value = resp.json().await.unwrap();
-    assert!(body["command_id"].as_str().is_some(), "got {body}");
+    assert!(body["id"].as_str().is_some(), "got {body}");
     // The API frontend forces yolo + non_interactive to true and
     // advertises this in flags_applied.
     assert_eq!(
@@ -775,7 +786,7 @@ async fn real_network_create_command_active_ready_session_returns_202() {
         "got {body}"
     );
     assert_eq!(
-        body["flags_applied"]["non_interactive"],
+        body["flags_applied"]["headless"],
         serde_json::json!(true),
         "got {body}"
     );
@@ -867,7 +878,7 @@ fn parse_args_rejects_positional_beyond_declared_arguments() {
 fn parse_args_config_get_maps_field() {
     let f = make_frontend("config get", &["agent"]);
     assert_eq!(
-        f.argument(&["config", "get"], "field").unwrap().as_deref(),
+        f.argument(&["config", "get"], "key").unwrap().as_deref(),
         Some("agent")
     );
 }
@@ -877,7 +888,7 @@ fn parse_args_config_get_maps_field() {
 fn parse_args_config_set_maps_field_and_value() {
     let f = make_frontend("config set", &["agent", "claude"]);
     assert_eq!(
-        f.argument(&["config", "set"], "field").unwrap().as_deref(),
+        f.argument(&["config", "set"], "key").unwrap().as_deref(),
         Some("agent")
     );
     assert_eq!(
@@ -934,7 +945,7 @@ fn parse_args_remote_session_kill_maps_session_id() {
 fn parse_args_forces_non_interactive_and_yolo() {
     let f = make_frontend("exec prompt", &["hi"]);
     assert_eq!(
-        f.flag_bool(&["exec", "prompt"], "non-interactive").unwrap(),
+        f.flag_bool(&["exec", "prompt"], "headless").unwrap(),
         Some(true),
         "non-interactive must be forced true in API mode"
     );
@@ -957,7 +968,7 @@ fn parse_args_forces_non_interactive_and_yolo() {
 const SESSION_WORKTREE_SELECTORS: [&str; 3] = ["--branch", "--pr", "--worktree"];
 
 /// PINS: every selector is refused with 400 and the flag-availability error on
-/// `POST /v1/commands`, for a session that *would* accept the command.
+/// `POST /v1/worker/commands`, for a session that *would* accept the command.
 #[tokio::test]
 async fn real_network_session_worktree_selectors_are_refused_on_commands_route() {
     let tmp = tempfile::tempdir().unwrap();
@@ -966,12 +977,16 @@ async fn real_network_session_worktree_selectors_are_refused_on_commands_route()
         eprintln!("SKIP: cannot bind 127.0.0.1");
         return;
     };
-    insert_ready_session(&state.store, "ready-sess", "/work");
+    insert_ready_session(
+        &state.store,
+        "ses_4278c439e5420f1f57655d0111a7fed7",
+        "/work",
+    );
 
     for selector in SESSION_WORKTREE_SELECTORS {
         let resp = reqwest::Client::new()
-            .post(format!("http://{addr}/v1/commands"))
-            .header("x-awman-session", "ready-sess")
+            .post(format!("http://{addr}/v1/worker/commands"))
+            .header("x-awman-session", "ses_4278c439e5420f1f57655d0111a7fed7")
             .json(&serde_json::json!({
                 "subcommand": "exec prompt",
                 "args": [selector, "example", "do the thing"]
@@ -994,8 +1009,8 @@ async fn real_network_session_worktree_selectors_are_refused_on_commands_route()
 
     // The same session still accepts the command without a selector.
     let resp = reqwest::Client::new()
-        .post(format!("http://{addr}/v1/commands"))
-        .header("x-awman-session", "ready-sess")
+        .post(format!("http://{addr}/v1/worker/commands"))
+        .header("x-awman-session", "ses_4278c439e5420f1f57655d0111a7fed7")
         .json(&serde_json::json!({ "subcommand": "exec prompt", "args": ["hi"] }))
         .send()
         .await
@@ -1005,7 +1020,7 @@ async fn real_network_session_worktree_selectors_are_refused_on_commands_route()
     server.abort();
 }
 
-/// PINS: every selector is refused with 400 on `POST /v1/runs` too.
+/// PINS: every selector is refused with 400 on `POST /v1/worker/runs` too.
 #[tokio::test]
 async fn real_network_session_worktree_selectors_are_refused_on_runs_route() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1018,7 +1033,7 @@ async fn real_network_session_worktree_selectors_are_refused_on_runs_route() {
 
     for selector in SESSION_WORKTREE_SELECTORS {
         let resp = reqwest::Client::new()
-            .post(format!("http://{addr}/v1/runs"))
+            .post(format!("http://{addr}/v1/worker/runs"))
             .json(&serde_json::json!({
                 "session": { "session_type": "local", "workdir": work },
                 "command": { "subcommand": "exec prompt", "args": [selector, "example", "text"] }
@@ -1052,7 +1067,7 @@ async fn real_network_worker_push_routes_are_absent_and_never_accept_selectors()
     };
 
     for selector in SESSION_WORKTREE_SELECTORS {
-        for route in ["/v1/worker/commands", "/v1/worker/runs"] {
+        for route in ["/v1/worker/servers", "/v1/worker/leases"] {
             let resp = reqwest::Client::new()
                 .post(format!("http://{addr}{route}"))
                 .json(&serde_json::json!({

@@ -20,7 +20,7 @@ use crate::command::dispatch::frontend_action::FrontendAction;
 use crate::command::dispatch::{BuildContext, Engines};
 use crate::command::error::CommandError;
 use crate::data::config::env::host_var;
-use crate::data::config::global::GlobalConfig;
+use crate::data::config::ConfigFile;
 use crate::data::fs::daemon_env::{EnvPersistence, EnvVarState};
 use crate::data::fs::task_store::{MountScope, Task, TaskStatus, TaskWorkspace};
 use crate::data::fs::SquadPaths;
@@ -381,9 +381,9 @@ pub enum SquadOutcome {
     Logs {
         log_path: String,
     },
-    Task(Task),
+    Task(#[serde(serialize_with = "crate::command::daemon_api::squad::task_wire::serialize")] Task),
     Detail(TaskDetail),
-    Tasks(Vec<Task>),
+    Tasks(#[serde(serialize_with = "crate::command::daemon_api::squad::task_list_wire")] Vec<Task>),
     /// A task asked to run ahead of its schedule by `squad trigger`. It
     /// names the task so a frontend can confirm *which* one was triggered
     /// without holding onto the request, and is distinct from
@@ -399,7 +399,9 @@ pub enum SquadOutcome {
     /// A task as it stands after `squad edit` (WI 0110). Distinct from
     /// [`SquadOutcome::Task`] so a frontend can say "updated" rather than
     /// "created" without inspecting anything.
-    Updated(Task),
+    Updated(
+        #[serde(serialize_with = "crate::command::daemon_api::squad::task_wire::serialize")] Task,
+    ),
     Removed {
         name: String,
         /// The persistent task directory that was deleted, when one was.
@@ -533,7 +535,7 @@ fn squad_add_request(ctx: &BuildContext) -> Result<SquadAddRequest, CommandError
     // `-n` never reaches the interview (the catalogue makes the two flags
     // conflict); it governs the one confirmation scripted creation can still
     // raise — the parent-directory mount scope.
-    let non_interactive = ctx.flags.bool("non-interactive");
+    let non_interactive = ctx.flags.bool("headless");
     if ctx.flags.bool("interview") {
         return Ok(SquadAddRequest {
             interview: true,
@@ -956,7 +958,7 @@ fn ask_task_prerequisites(
 fn collect_task_interview(
     frontend: &mut dyn SquadCommandFrontend,
     git_engine: &GitEngine,
-    global_config: &GlobalConfig,
+    global_config: &ConfigFile,
 ) -> Result<CreateTask, CommandError> {
     let name = frontend.ask_task_name()?;
     let description = frontend.ask_task_description()?;
@@ -1013,11 +1015,12 @@ fn collect_task_interview(
 /// interview is only as long as the user makes it.
 fn collect_agent_pool(
     frontend: &mut dyn SquadCommandFrontend,
-    global_config: &GlobalConfig,
+    global_config: &ConfigFile,
     task_agent: Option<&str>,
 ) -> Result<BTreeMap<String, Vec<String>>, CommandError> {
     // The config this command was built with, not a fresh read (F-31).
-    let global = global_config.squad.clone();
+    let global = Some(crate::data::config::SquadConfig::from_global(global_config))
+        .filter(crate::data::config::SquadConfig::has_dynamic_settings);
     if global.is_some() && frontend.ask_use_global_squad_config()? {
         return Ok(BTreeMap::new());
     }
@@ -1079,7 +1082,7 @@ fn read_task_agent_pool(name: &str) -> Result<BTreeMap<String, Vec<String>>, Com
     // outside its schema and must not change what the interview accepts.
     let paths = SquadPaths::from_process_env()?;
     Ok(
-        crate::data::config::global::task_own_squad_config(&paths, name)?
+        crate::data::config::squad::task_own_squad_config(&paths, name)?
             .and_then(|squad| squad.agents_to_models)
             .map(|map| map.into_iter().collect())
             .unwrap_or_default(),
@@ -1096,7 +1099,7 @@ fn collect_task_edit_interview(
     frontend: &mut dyn SquadCommandFrontend,
     current: &Task,
     current_pool: &BTreeMap<String, Vec<String>>,
-    global_config: &GlobalConfig,
+    global_config: &ConfigFile,
 ) -> Result<UpdateTask, CommandError> {
     let mut update = UpdateTask::default();
 
@@ -1391,8 +1394,8 @@ mod workspace_choice_tests {
     #[test]
     fn non_git_custom_workspace_warns_and_loops_when_user_changes_their_choice() {
         let tmp = tempfile::tempdir().unwrap();
-        let first = tmp.path().join("first");
-        let second = tmp.path().join("second");
+        let first = tmp.path().join("cmd_8b04d5e3775d298e78455efc5ca404d5");
+        let second = tmp.path().join("cmd_a9f0e61a137d86aa9db53465e0801612");
         std::fs::create_dir(&first).unwrap();
         std::fs::create_dir(&second).unwrap();
         let mut frontend =
@@ -1745,7 +1748,7 @@ mod unmet_env_warning_tests {
         let now = Utc::now();
         Task {
             prerequisites: None,
-            id: name.into(),
+            id: crate::data::ids::TaskId::new(),
             name: name.into(),
             description: "a task".into(),
             repo_scope: PathBuf::from("/repo"),

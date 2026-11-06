@@ -267,14 +267,14 @@ impl NewCommand {
         let sub = match ctx.caller.leaf() {
             "spec" => NewSubcommand::Spec(NewSpecFlags {
                 interview: ctx.flags.bool("interview"),
-                non_interactive: ctx.flags.bool("non-interactive"),
+                non_interactive: ctx.flags.bool("headless"),
                 issue_source: crate::engine::issue::IssueSourceFlags {
                     issue: ctx.flags.string("issue"),
                 },
             }),
             "workflow" => NewSubcommand::Workflow(NewWorkflowFlags {
                 interview: ctx.flags.bool("interview"),
-                non_interactive: ctx.flags.bool("non-interactive"),
+                non_interactive: ctx.flags.bool("headless"),
                 global: ctx.flags.bool("global"),
                 format: ctx.flags.require_str("format")?,
             }),
@@ -294,7 +294,7 @@ impl NewCommand {
                 }
                 NewSubcommand::Skill(NewSkillFlags {
                     interview: ctx.flags.bool("interview"),
-                    non_interactive: ctx.flags.bool("non-interactive"),
+                    non_interactive: ctx.flags.bool("headless"),
                     global: ctx.flags.bool("global"),
                     pull,
                     pull_all,

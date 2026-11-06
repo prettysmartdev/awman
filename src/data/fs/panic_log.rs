@@ -25,7 +25,7 @@ impl PanicLog {
     /// `None` when there is no home directory to resolve — a panic still
     /// aborts the TUI cleanly, it just leaves no file behind.
     pub fn from_env(env: &EnvSnapshot) -> Option<Self> {
-        let home = match env.config_home() {
+        let home = match crate::data::fs::data_paths::awman_home(env) {
             Some(dir) => dir,
             None => dirs::home_dir()?,
         };
@@ -127,7 +127,7 @@ mod tests {
     #[test]
     fn from_env_prefers_the_configured_home() {
         let env = EnvSnapshot::with_overrides([(
-            crate::data::config::env::AWMAN_CONFIG_HOME,
+            crate::data::fs::data_paths::AWMAN_HOME,
             "/tmp/awman-home",
         )]);
         let log = PanicLog::from_env(&env).expect("a configured home always resolves");

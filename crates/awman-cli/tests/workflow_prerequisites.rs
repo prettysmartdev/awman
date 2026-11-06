@@ -63,7 +63,7 @@ impl Fixture {
                 ),
             )
             .env("HOME", self.path("home"))
-            .env("AWMAN_CONFIG_HOME", self.path("home/.awman"))
+            .env("AWMAN_HOME", self.path("home/.awman"))
             .env("XDG_CONFIG_HOME", self.path("home/.config"))
             .env("XDG_DATA_HOME", self.path("home/.local/share"))
             .env("XDG_CACHE_HOME", self.path("home/.cache"))
@@ -138,7 +138,7 @@ fn wi0149_static_missing_token_unresolved_fail_launches_zero_containers() {
         "exec",
         "workflow",
         "wf.toml",
-        "--non-interactive",
+        "--headless",
         "--prerequisite-unresolved",
         "fail",
     ]);
@@ -159,7 +159,7 @@ fn wi0149_non_interactive_env_token_explicit_grant_and_json_are_secret_free() {
             "workflow",
             "--json",
             "wf.toml",
-            "--non-interactive",
+            "--headless",
             "--prerequisite-token",
             "env:GH_TOKEN",
             "--check-prerequisites",
@@ -215,7 +215,7 @@ fn wi0149_secret_name_is_usage_error_and_headless_never_grants() {
     let out = f
         .command()
         .env("GH_TOKEN", TOKEN)
-        .args(["exec", "workflow", "wf.toml", "--non-interactive"])
+        .args(["exec", "workflow", "wf.toml", "--headless"])
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(2), "{}", output(&out));
@@ -233,7 +233,7 @@ fn wi0149_untrusted_repo_allow_and_acquire_never_spawn_or_mount_in_cli() {
         &format!("#!/bin/sh\ntouch '{}'\necho {TOKEN}\n", marker.display()),
     );
     std::fs::write(f.path("repo/.awman/config.json"), json!({"workflows":{"prerequisites":{"ssh":{"use":"allow"},"githubToken":{"use":"allow","acquire":{"argv":[acquire]}}}}}).to_string()).unwrap();
-    let out = f.run(&["exec", "workflow", "wf.toml", "--non-interactive"]);
+    let out = f.run(&["exec", "workflow", "wf.toml", "--headless"]);
     assert_eq!(out.status.code(), Some(2), "{}", output(&out));
     assert!(!marker.exists());
     assert_eq!(f.launches(), 0);
@@ -287,7 +287,7 @@ async fn wi0149_api_prerequisite_event_precedes_steps_and_failure_has_stage() {
         .await;
     assert_eq!(record["status"], "error", "{record}");
     assert_eq!(
-        record["result"]["stage"], "workflow_prerequisites",
+        record["result"]["failure"]["stage"], "workflow_prerequisites",
         "{record}"
     );
     let events = api_process::events_log(&record).await;
@@ -296,7 +296,7 @@ async fn wi0149_api_prerequisite_event_precedes_steps_and_failure_has_stage() {
         .expect("prerequisite event");
     let sse = reqwest::Client::new()
         .get(format!(
-            "{}/v1/commands/{}/logs",
+            "{}/v1/worker/commands/{}/events",
             server.url,
             record["id"].as_str().unwrap()
         ))
@@ -354,18 +354,18 @@ async fn wi0149_api_secret_usage_error_and_ssh_widening_gate() {
         let f = Fixture::new();
         let home = api_process::ApiHome::new();
         std::fs::create_dir_all(home.home().join(".config/awman")).unwrap();
-        std::fs::write(home.home().join(".config/awman/config.json"), json!({"api":{"workDirs":[f.path("repo")]}, "workflows":{"prerequisites":{"allowApiClientGrants":allow}}}).to_string()).unwrap();
+        std::fs::write(home.home().join(".config/awman/config.json"), json!({"daemon":{"features":{"worker":{"push":{"workDirs":{"allow":[f.path("repo")]}}}}}, "workflows":{"prerequisites":{"allowApiClientGrants":allow}}}).to_string()).unwrap();
         let server = home.start().await;
         let session = server
             .ready_session(json!({"session_type":"local","workdir":f.path("repo")}))
             .await;
         for (value, expected) in [("secret:NAME", 400), ("deny", 202)] {
-            let response = reqwest::Client::new().post(format!("{}/v1/commands", server.url)).header("x-awman-session", &session).json(&json!({"subcommand":"exec workflow", "args":["wf.toml","--check-prerequisites","--prerequisite-token",value]})).send().await.unwrap();
+            let response = reqwest::Client::new().post(format!("{}/v1/worker/commands", server.url)).header("x-awman-session", &session).json(&json!({"session_id":&session,"subcommand":"exec workflow", "args":["wf.toml","--check-prerequisites","--prerequisite-token",value]})).send().await.unwrap();
             let status = response.status().as_u16();
             let body: Value = response.json().await.unwrap();
             assert_eq!(status, expected, "{body}");
         }
-        let response = reqwest::Client::new().post(format!("{}/v1/commands", server.url)).header("x-awman-session", &session).json(&json!({"subcommand":"exec workflow", "args":["wf.toml","--check-prerequisites","--prerequisite-ssh","all"]})).send().await.unwrap();
+        let response = reqwest::Client::new().post(format!("{}/v1/worker/commands", server.url)).header("x-awman-session", &session).json(&json!({"session_id":&session,"subcommand":"exec workflow", "args":["wf.toml","--check-prerequisites","--prerequisite-ssh","all"]})).send().await.unwrap();
         let status = response.status().as_u16();
         let body: Value = response.json().await.unwrap();
         assert_eq!(status, if allow { 202 } else { 403 }, "{body}");
@@ -426,14 +426,14 @@ fn wi0149_acquire_token_scoped_to_pr_and_redacted_in_output_failure_file_and_age
     f.git(&["config", "user.email", "ada@example.com"]);
     let acquire = f.path("bin/acquire-token");
     executable(&acquire, &format!("#!/bin/sh\nprintf '%s\\n' '{TOKEN}'\n"));
-    f.global(json!({"workflows":{"prerequisites":{"unresolved":"warn","githubToken":{"use":"allow","acquire":{"argv":[acquire],"timeoutSecs":3}}}}}));
+    f.global(json!({"workflows":{"prerequisites":{"unresolved":"warn","githubToken":{"use":"allow","acquire":{"argv":[acquire],"timeout":"3s"}}}}}));
     std::fs::write(
         f.path("repo/wf.toml"),
         format!("{SIMPLE}{TEARDOWN}\non_failure={{prompt='repair the failure',max_attempts=1}}\n"),
     )
     .unwrap();
     executable(&f.path("bin/docker"), RECORDING_DOCKER);
-    let out = f.run(&["exec", "workflow", "wf.toml", "--non-interactive", "--yolo"]);
+    let out = f.run(&["exec", "workflow", "wf.toml", "--headless", "--yolo"]);
     let text = output(&out);
     let phases = std::fs::read_to_string(f.path("control/phases"))
         .unwrap_or_else(|_| panic!("phase containers did not run: {text}"));
@@ -503,7 +503,7 @@ fn wi0149_acquire_token_scoped_to_pr_and_redacted_in_output_failure_file_and_age
 
 fn configure_api(home: &api_process::ApiHome, fixture: &Fixture, allow: bool) {
     std::fs::create_dir_all(home.home().join(".config/awman")).unwrap();
-    std::fs::write(home.home().join(".config/awman/config.json"), json!({"api":{"workDirs":[fixture.path("repo")]},"workflows":{"prerequisites":{"allowApiClientGrants":allow}}}).to_string()).unwrap();
+    std::fs::write(home.home().join(".config/awman/config.json"), json!({"daemon":{"features":{"worker":{"push":{"workDirs":{"allow":[fixture.path("repo")]}}}}},"workflows":{"prerequisites":{"allowApiClientGrants":allow}}}).to_string()).unwrap();
 }
 
 #[test]
@@ -519,7 +519,7 @@ fn wi0149_non_interactive_env_token_grants_without_prompt() {
             "exec",
             "workflow",
             "wf.toml",
-            "--non-interactive",
+            "--headless",
             "--prerequisite-token",
             "env:GH_TOKEN",
             "--yolo",
@@ -557,20 +557,28 @@ async fn wi0149_api_repo_allow_and_acquire_never_spawn_or_mount() {
     configure_api(&home, &f, false);
     let server = home.start().await;
     let session = server
-        .ready_session(json!({"session_type":"local","workdir":f.path("repo")}))
+        .create_session(json!({"session_type":"local","workdir":f.path("repo")}))
         .await;
-    let record = server
-        .run_command(&session, "exec workflow", &["wf.toml"])
-        .await;
-    assert_eq!(
-        record["result"]["stage"], "workflow_prerequisites",
-        "{record}"
-    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let state = server.session(&session).await;
+        if state["setup_status"] == "failed" {
+            assert!(
+                state["setup_error"]["message"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("global config file"),
+                "{state}"
+            );
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "{state}");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
     assert!(!marker.exists());
     let argv = std::fs::read_to_string(home.control().join("docker.log")).unwrap_or_default();
     assert!(!argv.lines().any(|l| l.starts_with("docker run ")));
     assert!(!argv.contains(".ssh"));
-    assert!(!api_process::events_log(&record).await.contains(TOKEN));
     assert!(!server.log().contains(TOKEN));
 }
 
@@ -583,7 +591,7 @@ async fn wi0149_api_flags_applied_contains_resolved_secret_free_policy() {
     let session = server
         .ready_session(json!({"session_type":"local","workdir":f.path("repo")}))
         .await;
-    let response: Value = reqwest::Client::new().post(format!("{}/v1/commands", server.url)).header("x-awman-session", &session).json(&json!({"subcommand":"exec workflow", "args":["wf.toml","--check-prerequisites","--prerequisite-ssh","deny"]})).send().await.unwrap().json().await.unwrap();
+    let response: Value = reqwest::Client::new().post(format!("{}/v1/worker/commands", server.url)).header("x-awman-session", &session).json(&json!({"session_id":&session,"subcommand":"exec workflow", "args":["wf.toml","--check-prerequisites","--prerequisite-ssh","deny"]})).send().await.unwrap().json().await.unwrap();
     assert!(
         response["flags_applied"]["prerequisites"].is_object(),
         "{response}"
@@ -599,8 +607,8 @@ async fn wi0149_api_flags_applied_contains_resolved_secret_free_policy() {
     assert!(!response.to_string().contains(TOKEN));
 }
 
-#[test]
-fn wi0149_grants_list_revoke_persists_decisions_never_token_values() {
+#[tokio::test]
+async fn wi0149_grants_list_revoke_persists_decisions_never_token_values() {
     use awman::data::fs::prerequisite_grants::{
         GrantKey, PrerequisiteGrantStore, RememberedGrant, RememberedKind,
     };
@@ -623,16 +631,28 @@ fn wi0149_grants_list_revoke_persists_decisions_never_token_values() {
         std::fs::read_to_string(f.path("home/.awman/prerequisite-grants.json")).unwrap();
     assert!(persisted.contains("GH_TOKEN"));
     assert!(!persisted.contains(TOKEN));
+    let daemon_home = api_process::ApiHome::new();
+    let home = f.path("home/.awman");
+    let _server = daemon_home
+        .start_with_env(&[("AWMAN_HOME", home.to_str().unwrap())])
+        .await;
+    let id = store.records()[0].id.to_string();
     let out = f
         .command()
         .env("GH_TOKEN", TOKEN)
-        .args(["config", "prerequisite-grants", "list"])
+        .args(["daemon", "api", "grants.list", "--json"])
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(0), "{}", output(&out));
     assert!(output(&out).contains("GH_TOKEN"));
     assert!(!output(&out).contains(TOKEN));
-    let out = f.run(&["config", "prerequisite-grants", "revoke", "1"]);
+    let out = f.run(&[
+        "daemon",
+        "api",
+        "grants.delete",
+        &format!("id={id}"),
+        "--json",
+    ]);
     assert_eq!(out.status.code(), Some(0), "{}", output(&out));
     assert!(PrerequisiteGrantStore::load(&f.path("home/.awman"))
         .records()
@@ -651,7 +671,7 @@ async fn wi0149_api_acquire_output_is_redacted_in_sse_events_and_daemon_logs() {
     executable(&acquire, &format!("#!/bin/sh\necho {TOKEN}\n"));
     let home = api_process::ApiHome::new();
     configure_api(&home, &f, false);
-    std::fs::write(home.home().join(".config/awman/config.json"), json!({"api":{"workDirs":[f.path("repo")]},"workflows":{"prerequisites":{"unresolved":"warn","githubToken":{"use":"allow","acquire":{"argv":[acquire]}}}}}).to_string()).unwrap();
+    std::fs::write(home.home().join(".config/awman/config.json"), json!({"daemon":{"features":{"worker":{"push":{"workDirs":{"allow":[f.path("repo")]}}}}},"workflows":{"prerequisites":{"unresolved":"warn","githubToken":{"use":"allow","acquire":{"argv":[acquire]}}}}}).to_string()).unwrap();
     executable(
         &home.home().parent().unwrap().join("bin/docker"),
         &RECORDING_DOCKER.replace("WI0149_CONTROL", "FAKE_DOCKER_CONTROL"),
@@ -690,7 +710,7 @@ async fn wi0149_api_acquire_output_is_redacted_in_sse_events_and_daemon_logs() {
     assert!(!server.log().contains(TOKEN));
     let sse = reqwest::Client::new()
         .get(format!(
-            "{}/v1/commands/{}/logs",
+            "{}/v1/worker/commands/{}/events",
             server.url,
             record["id"].as_str().unwrap()
         ))

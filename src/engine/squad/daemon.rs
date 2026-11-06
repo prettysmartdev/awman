@@ -13,7 +13,6 @@ use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 
 use crate::data::config::env::EnvSnapshot;
-use crate::data::config::global::GlobalConfig;
 use crate::data::fs::daemon_env::{DaemonEnvStore, EnvPersistence, EnvPersistenceSetting, NoStore};
 use crate::data::fs::daemon_process::ServerMeta;
 use crate::data::fs::{DataPaths, SquadPaths, TaskStore};
@@ -136,10 +135,22 @@ impl SquadDaemonEngine {
         // the daemon to be a daemon at all. Both the probe and the load are
         // capped and best-effort: a locked keychain must not be able to delay
         // `listen`, and it is never an error that fails a start.
-        let squad_config = GlobalConfig::load_with(&env)
-            .unwrap_or_default()
-            .squad
-            .unwrap_or_default();
+        // Through the shared resolver, so `AWMAN_DAEMON_FEATURES_SQUAD_ENV_PERSISTENCE`
+        // outranks the file like every other operator override.
+        let squad_config = crate::data::config::ConfigLayers::load(
+            &env,
+            None,
+            crate::data::config::ConfigOverrides::default(),
+        )
+        .and_then(|layers| {
+            crate::data::config::EffectiveConfig::resolve(
+                layers,
+                crate::data::config::FlagConfig::default(),
+                env.clone(),
+            )
+        })
+        .map(|effective| crate::data::config::SquadConfig::from_global(effective.config()))
+        .unwrap_or_default();
         let setting = squad_config.env_persistence_or_default();
         let resolved = tokio::task::spawn_blocking(move || env_store::resolve(&squad_config))
             .await
@@ -280,7 +291,8 @@ impl SquadDaemonEngine {
 mod tests {
     use super::*;
 
-    use crate::data::config::env::{AWMAN_CONFIG_HOME, AWMAN_SQUAD_ROOT};
+    use crate::data::fs::data_paths::AWMAN_HOME;
+
     use crate::data::fs::task_store::{MountScope, Task, TaskStatus};
     use crate::engine::agent_runtime::Capabilities;
     use crate::engine::squad::{EvaluationOutcome, EvaluationRequest};
@@ -410,10 +422,7 @@ mod tests {
     }
 
     fn deps(root: &std::path::Path, runtime: Arc<dyn AgentRuntimeEngine>) -> SquadDaemonDeps {
-        let env = EnvSnapshot::with_overrides([
-            (AWMAN_CONFIG_HOME, root.to_str().unwrap()),
-            (AWMAN_SQUAD_ROOT, root.join("squad").to_str().unwrap()),
-        ]);
+        let env = EnvSnapshot::with_overrides([(AWMAN_HOME, root.to_str().unwrap())]);
         let squad_paths = SquadPaths::from_env(&env).unwrap();
         squad_paths.ensure_root().unwrap();
         let data_paths = DataPaths::from_env(&env).unwrap();
@@ -435,7 +444,7 @@ mod tests {
         let now = chrono::Utc::now();
         Task {
             prerequisites: None,
-            id: uuid::Uuid::new_v4().to_string(),
+            id: crate::data::ids::TaskId::new(),
             name: name.to_string(),
             description: "test task".into(),
             repo_scope: std::path::PathBuf::from("/repo"),
@@ -537,7 +546,9 @@ mod tests {
         );
         let seeded = TaskStore::open(&legacy_db).unwrap();
         seeded.migrate().unwrap();
-        seeded.create(&task("legacy")).unwrap();
+        seeded
+            .create(&task("cmd_228c70bfc5589c58c044e03fff0e17eb"))
+            .unwrap();
         drop(seeded);
 
         let new_db = deps.data_paths.db_path();
@@ -549,7 +560,7 @@ mod tests {
         assert!(!legacy_db.exists(), "and must not be left behind");
         let tasks = engine.store().list().unwrap();
         assert_eq!(tasks.len(), 1);
-        assert_eq!(tasks[0].name, "legacy");
+        assert_eq!(tasks[0].name, "cmd_228c70bfc5589c58c044e03fff0e17eb");
 
         engine.shutdown().await;
     }

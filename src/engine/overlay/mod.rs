@@ -495,7 +495,7 @@ impl OverlayEngine {
                 session.git_root(),
                 request.container_home.as_deref(),
                 request.materialize_credentials,
-                crate::data::config::global::GlobalConfig::data_home_with(session.env())
+                crate::data::fs::data_paths::data_home(session.env())
                     .ok()
                     .as_deref(),
             )?;
@@ -669,7 +669,7 @@ pub(crate) fn detect_home_from_dockerfile(path: &Path) -> Option<String> {
 
 /// Resolve `agent` for an overlay entry point that was not handed a
 /// definition. The overlay engine holds no `EnvSnapshot`, so this reads the
-/// process environment (which honours `AWMAN_CONFIG_HOME`). `None` when the
+/// process environment (which honours `AWMAN_HOME`). `None` when the
 /// agent does not resolve; the caller degrades exactly as for an unknown name.
 fn resolve_definition(
     agent: &AgentName,

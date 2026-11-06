@@ -94,7 +94,7 @@ pub trait SpecsCommandFrontend:
     }
 
     /// Prompt for a summary pre-populated with `content`. The TUI implementation
-    /// renders the text box pre-filled; non-interactive frontends return the
+    /// renders the text box pre-filled; headless frontends return the
     /// content unmodified.
     fn ask_spec_summary_prefilled(&mut self, content: &str) -> Result<String, CommandError> {
         Ok(content.to_string())
@@ -127,7 +127,7 @@ impl SpecsCommand {
         let sub = match ctx.caller.leaf() {
             "amend" => SpecsSubcommand::Amend(SpecsAmendFlags {
                 work_item: ctx.args.require("work_item")?,
-                non_interactive: ctx.flags.bool("non-interactive"),
+                non_interactive: ctx.flags.bool("headless"),
                 allow_docker: ctx.flags.bool("allow-docker"),
             }),
             _ => return Err(CommandError::unknown_command(&ctx.path())),
@@ -153,7 +153,7 @@ impl Command for SpecsCommand {
             SpecsSubcommand::Amend(f) => {
                 let session = self.session;
                 let git_root = session.git_root().to_path_buf();
-                let work_items_dir = session.repo_config().work_items_dir_or_default(&git_root);
+                let work_items_dir = session.effective_config().work_items_dir(&git_root);
                 // Look up the file for the requested work-item number.
                 let n: u32 = f.work_item.trim_start_matches('0').parse().unwrap_or(0);
                 let prefix = format!("{:04}-", n);
@@ -178,7 +178,7 @@ impl Command for SpecsCommand {
                 }
 
                 // Run the amend agent to review the file against the
-                // implementation. Honors --non-interactive and --allow-docker.
+                // implementation. Honors --headless and --allow-docker.
                 let agent = match LaunchPolicy::for_session(&session).resolve_agent(&None) {
                     Ok(a) => a,
                     Err(e) => {
@@ -284,10 +284,9 @@ pub(crate) async fn create_new_spec(
     frontend: &mut dyn SpecsCommandFrontend,
 ) -> Result<NewSpecOutcome, CommandError> {
     let git_root = session.git_root().to_path_buf();
-    let work_items_dir = session.repo_config().work_items_dir_or_default(&git_root);
-    let template_path = session
-        .repo_config()
-        .work_items_template_or_default(&git_root);
+    let config = session.effective_config();
+    let work_items_dir = config.work_items_dir(&git_root);
+    let template_path = config.work_items_template(&git_root);
 
     if !template_path.exists() {
         let err = CommandError::SpecTemplateMissing {
@@ -728,9 +727,9 @@ mod tests {
         // file lookup succeeded by asserting the error is NOT
         // `WorkItemNotFound`.
         let tmp = tempfile::tempdir().unwrap();
-        let work_items = tmp.path().join("aspec").join("work-items");
-        std::fs::create_dir_all(&work_items).unwrap();
-        std::fs::write(work_items.join("0042-my-feature.md"), "# My Feature").unwrap();
+        let items_dir = tmp.path().join("aspec").join("work-items");
+        std::fs::create_dir_all(&items_dir).unwrap();
+        std::fs::write(items_dir.join("0042-my-feature.md"), "# My Feature").unwrap();
 
         let engines = Engines::for_tests(tmp.path());
         let session = Session::for_tests(tmp.path());

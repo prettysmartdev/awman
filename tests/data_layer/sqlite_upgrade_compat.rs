@@ -273,18 +273,24 @@ fn sqlite_upgrade_compat_legacy_fixture_opens_cleanly() {
                 log_path    TEXT NOT NULL
             );
             INSERT INTO sessions (id, workdir, created_at) VALUES
-                ('legacy-sess', '/old/workdir', '2025-01-01T00:00:00Z');
+                ('11111111-1111-4111-8111-111111111111', '/old/workdir', '2025-01-01T00:00:00Z');
             INSERT INTO commands (id, session_id, subcommand, args, log_path) VALUES
-                ('legacy-cmd', 'legacy-sess', 'implement', '[]', '/logs/legacy-cmd.log');",
+                ('22222222-2222-4222-8222-222222222222', '11111111-1111-4111-8111-111111111111', 'implement', '[]', '/logs/legacy-cmd.log');",
         )
         .unwrap();
     }
 
     // Re-open with SqliteSessionStore — should not lose data or error.
     let store = SqliteSessionStore::open(tmp.path()).expect("legacy DB opens");
-    let sess = store.get_session("legacy-sess").unwrap().expect("session");
+    let sess = store
+        .get_session("ses_11111111111141118111111111111111")
+        .unwrap()
+        .expect("session");
     assert_eq!(sess.workdir, "/old/workdir");
 
-    let cmd = store.get_command("legacy-cmd").unwrap().expect("command");
+    let cmd = store
+        .get_command("cmd_22222222222242228222222222222222")
+        .unwrap()
+        .expect("command");
     assert_eq!(cmd.subcommand, "implement");
 }

@@ -9,7 +9,7 @@ use std::path::PathBuf;
 pub use crate::data::agent_output_format::AgentOutputFormat;
 pub use crate::data::fs::agent_dirs::DefinitionScope;
 
-use crate::data::config::repo::LaunchMode;
+use crate::data::config::agents::LaunchMode;
 use crate::engine::container::options::{AutoMode, Entrypoint, ModelFlagForm, PlanMode, YoloMode};
 use crate::engine::error::EngineError;
 
@@ -133,7 +133,7 @@ pub enum ModelFlagDelivery {
 /// container. Those agents declare a dedicated flag instead (opencode
 /// `--prompt <text>`).
 ///
-/// This only governs interactive delivery. Non-interactive runs use the
+/// This only governs interactive delivery. Headless runs use the
 /// agent's `non_interactive_flag` entrypoint shape (e.g. `opencode run`) and
 /// receive the prompt over stdin.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -180,9 +180,9 @@ pub struct AgentDefinition {
     pub image: AgentImageSource,
     /// Bare interactive entrypoint (e.g. `["claude"]`, `["copilot", "-i"]`).
     pub interactive_entrypoint: Vec<String>,
-    /// Print/non-interactive entrypoint suffix (e.g. `--print` for Claude).
+    /// Print/headless entrypoint suffix (e.g. `--print` for Claude).
     pub non_interactive_flag: Option<String>,
-    /// The structured output mode a non-interactive run can print in
+    /// The structured output mode a headless run can print in
     /// (WI 0137 §4). A capability of the table, not a name match: under the
     /// API an agent with a structured format runs in that mode (claude
     /// `--output-format stream-json --verbose`, codex `exec --json`) and the
@@ -191,7 +191,7 @@ pub struct AgentDefinition {
     /// for every other agent and for a custom definition that declares none.
     pub output_format: AgentOutputFormat,
     /// Flags appended to the entrypoint only for an interactive (non-`-n`)
-    /// launch — for options the agent's non-interactive mode rejects (codex
+    /// launch — for options the agent's headless mode rejects (codex
     /// `--no-daemon`, which `codex exec` refuses). Not used for ACP launches.
     pub interactive_only_flags: Vec<String>,
     /// Plan-mode flags. Empty means plan mode is unsupported
@@ -403,7 +403,7 @@ impl AgentDefinition {
     }
 
     /// The flags [`Self::entrypoint_for`] itself adds for this launch shape,
-    /// beyond the bare entrypoint and the non-interactive form. A user
+    /// beyond the bare entrypoint and the headless form. A user
     /// `agentFlags` entry naming one of them is dropped from that launch
     /// rather than passed twice.
     pub fn entrypoint_managed_flags(&self, non_interactive: bool) -> &[String] {
@@ -414,7 +414,7 @@ impl AgentDefinition {
         }
     }
 
-    /// Build the entrypoint with optional non-interactive shape.
+    /// Build the entrypoint with optional headless shape.
     pub fn entrypoint_for(&self, non_interactive: bool) -> Entrypoint {
         let mut parts = self.interactive_entrypoint.clone();
         if non_interactive {

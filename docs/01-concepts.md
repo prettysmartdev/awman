@@ -88,8 +88,8 @@ Two JSON files: `<git root>/.awman/config.json` (per-repo, committed) and `~/.aw
 | `awman agents list` (`ps`, `ls`) | List agents; `--all` includes stopped agents eligible for cleanup | [03](03-agent-sessions.md) |
 | `awman agents detail` (`inspect`) | Show an agent's identity, lifecycle, resources, and runtime details | [03](03-agent-sessions.md) |
 | `awman agents kill` (`rm`) / `attach` | Stop and remove an agent, or connect to its terminal | [03](03-agent-sessions.md) |
-| `awman config show\|get\|set\|migrate` | Inspect, edit and migrate config | [07](07-configuration.md) |
-| `awman config prerequisite-grants` | Review or revoke remembered workflow credential choices | [05](05-workflows.md#workflow-prerequisite-checks) |
+| `awman config show\|get\|set\|unset` | Inspect and edit config; `--set key=value` overrides any key for one command | [07](07-configuration.md) |
+| `awman daemon api` | Call the daemon API by action name (`grants.list`, `jobs.cancel`, …) | [09](09-api-and-remote-mode.md#awman-daemon-api) |
 | `awman api start\|status\|logs\|kill` | HTTP API server | [09](09-api-and-remote-mode.md) |
 | `awman remote …` | Client for a remote awman server | [09](09-api-and-remote-mode.md) |
 | `awman squad …` | Your squad of agents, working unattended on the tasks you give them | [12](12-squad.md) |

@@ -9,9 +9,9 @@
 
 use std::sync::Arc;
 
+use crate::data::config::agents::LaunchMode;
 use crate::data::config::builtin_launch::BuiltinLaunchSettings;
 use crate::data::config::effective::EffectiveConfig;
-use crate::data::config::repo::LaunchMode;
 use crate::data::image_tags::{agent_image_tag, project_image_tag};
 use crate::data::repo_dockerfile_paths::RepoDockerfilePaths;
 use crate::data::session::{AgentName, Session};
@@ -380,7 +380,7 @@ impl AgentEngine {
             let mut preparer = AgentImagePreparer::new(
                 resolved,
                 self.runtime.clone(),
-                crate::data::config::global::GlobalConfig::data_home_with(config.env())?,
+                crate::data::fs::data_paths::data_home(config.env())?,
                 // Default agent = the configured one, as `ready` and preflight
                 // use it, so a single-image default source is refused for
                 // any other agent here too.
@@ -690,7 +690,7 @@ impl AgentEngine {
         // Initial prompt. In interactive mode most agents receive it as a
         // trailing positional arg; agents whose bare positional means something
         // else (opencode: a project dir) declare a delivery flag in their definition.
-        // Non-interactive runs pipe it over stdin regardless.
+        // Headless runs pipe it over stdin regardless.
         if let Some(prompt) = run.initial_prompt.as_ref() {
             options.push(ContainerOption::SeededPrompt(prompt.clone()));
             if let InteractiveSeedDelivery::Flag(flag) = &def.interactive_seed_delivery {
@@ -990,16 +990,16 @@ impl AgentEngine {
             )));
         }
 
-        // Non-interactive shape (`--print` / `exec` / `run` / `task`): the
+        // Headless shape (`--print` / `exec` / `run` / `task`): the
         // dsbx driver appends it as an agent arg for `kind: agent` kits, but
         // mixin kits launch through the built-in template's interactive
         // entrypoint — the prompt still arrives via piped stdin, the agent's
-        // own non-interactive mode just cannot be enabled. Warn, don't drop
+        // own headless mode just cannot be enabled. Warn, don't drop
         // silently.
         if run.non_interactive && matches!(def.sbx_kit_kind, SbxKitKind::Mixin) {
             if let Some(flag) = &def.non_interactive_flag {
                 options.push(SandboxOption::UnsupportedNote(format!(
-                    "non-interactive mode ('{flag}') cannot be enabled for '{agent}' \
+                    "headless mode ('{flag}') cannot be enabled for '{agent}' \
                      under the sandbox runtime (the built-in template owns the launch \
                      command); the prompt is piped to the agent's interactive \
                      entrypoint instead",
@@ -1656,7 +1656,7 @@ mod tests {
             ..Default::default()
         };
         let opts = engine.build_options(&session, &agent, &run).unwrap();
-        // The entrypoint carries the non-interactive form, exactly once; no
+        // The entrypoint carries the headless form, exactly once; no
         // other option repeats it (it used to be emitted twice).
         assert_eq!(non_interactive_tokens(&opts, "--print"), 1, "claude");
     }
@@ -1671,7 +1671,7 @@ mod tests {
             ..Default::default()
         };
         let opts = engine.build_options(&session, &agent, &run).unwrap();
-        // The entrypoint carries the non-interactive form, exactly once; no
+        // The entrypoint carries the headless form, exactly once; no
         // other option repeats it (it used to be emitted twice).
         assert_eq!(non_interactive_tokens(&opts, "task"), 1, "cline");
     }
@@ -1942,7 +1942,7 @@ mod tests {
         use crate::engine::ready::tests::fakes::{FakeImportRuntime, FakeLocalBuilder};
         use crate::engine::ready::tests::{built_identity, script_missing_image_build};
         let (config_home, repo, session) = builtin_launch_fixture(
-            r#"{"builtin":{"imageSource":{"type":"apple-local"},"builder":{"enabled":true}}}"#,
+            r#"{"runtime":{"builtin":{"imageSource":{"type":"apple-local"},"builder":{"enabled":true}}}}"#,
         );
         let tag = agent_image_tag(repo.path(), "codex");
         let base = project_image_tag(repo.path());
@@ -1986,10 +1986,13 @@ mod tests {
         use crate::engine::ready::tests::fakes::{FakeImportRuntime, FakeLocalBuilder};
         for (global, unconfigured) in [
             (
-                r#"{"builtin":{"imageSource":{"type":"apple-local"},"builder":{"enabled":false}}}"#,
+                r#"{"runtime":{"builtin":{"imageSource":{"type":"apple-local"},"builder":{"enabled":false}}}}"#,
                 false,
             ),
-            (r#"{"builtin":{"builder":{"enabled":true}}}"#, true),
+            (
+                r#"{"runtime":{"builtin":{"builder":{"enabled":true}}}}"#,
+                true,
+            ),
         ] {
             let (config_home, _repo, session) = builtin_launch_fixture(global);
             let builder = Arc::new(FakeLocalBuilder::new());
@@ -2031,7 +2034,7 @@ mod tests {
         use crate::engine::oci::SourceImage;
         use crate::engine::ready::tests::fakes::{FakeImportRuntime, FakeLocalBuilder};
         let (config_home, repo, session) = builtin_launch_fixture(
-            r#"{"builtin":{"imageSource":{"type":"apple-local"},"builder":{"enabled":true}}}"#,
+            r#"{"runtime":{"builtin":{"imageSource":{"type":"apple-local"},"builder":{"enabled":true}}}}"#,
         );
         let tag = agent_image_tag(repo.path(), "codex");
         let base = project_image_tag(repo.path());
@@ -2065,10 +2068,7 @@ mod tests {
     #[tokio::test]
     async fn ensure_available_checks_enabled_builder_provenance_and_pending_receipts() {
         use crate::data::config::{
-            env::{EnvSnapshot, AWMAN_CONFIG_HOME},
-            flags::FlagConfig,
-            global::GlobalConfig,
-            repo::RepoConfig,
+            env::EnvSnapshot, file::ConfigFile, flags::FlagConfig, AWMAN_HOME,
         };
         use crate::data::image_build_lock::BuildStoreKey;
         use crate::data::image_build_state::{
@@ -2099,18 +2099,22 @@ mod tests {
                     registries: Default::default(),
                 });
             let config = |source| {
-                let mut global: GlobalConfig =
-                    serde_json::from_str(r#"{"builtin":{"builder":{"enabled":true}}}"#).unwrap();
-                global.builtin.as_mut().unwrap().image_source = Some(source);
-                EffectiveConfig::new(
-                    FlagConfig::default(),
-                    EnvSnapshot::with_overrides([(
-                        AWMAN_CONFIG_HOME,
-                        tmp.path().to_str().unwrap(),
-                    )]),
-                    RepoConfig::default(),
+                let mut global = ConfigFile::test_json(serde_json::json!(
+                    {"runtime": {"builtin": {"builder": {"enabled": true}}}}
+                ));
+                global
+                    .runtime
+                    .as_mut()
+                    .and_then(|r| r.builtin.as_mut())
+                    .unwrap()
+                    .image_source = Some(source);
+                EffectiveConfig::from_files(
                     global,
+                    ConfigFile::default(),
+                    FlagConfig::default(),
+                    EnvSnapshot::with_overrides([(AWMAN_HOME, tmp.path().to_str().unwrap())]),
                 )
+                .unwrap()
             };
             let mut frontend = FakeAgentFrontend::new();
             engine
@@ -2780,9 +2784,9 @@ mod tests {
         assert!(
             opts.iter().any(|o| matches!(
                 o,
-                SandboxOption::UnsupportedNote(n) if n.contains("non-interactive")
+                SandboxOption::UnsupportedNote(n) if n.contains("headless")
             )),
-            "mixin non-interactive mode under sbx must warn; got {opts:?}"
+            "mixin headless mode under sbx must warn; got {opts:?}"
         );
 
         // kind: agent kits CAN take the flag as an agent arg — no note.
@@ -2793,9 +2797,9 @@ mod tests {
         assert!(
             !opts.iter().any(|o| matches!(
                 o,
-                SandboxOption::UnsupportedNote(n) if n.contains("non-interactive")
+                SandboxOption::UnsupportedNote(n) if n.contains("headless")
             )),
-            "agent-kit non-interactive mode is deliverable — no note expected; got {opts:?}"
+            "agent-kit headless mode is deliverable — no note expected; got {opts:?}"
         );
     }
 
@@ -3351,14 +3355,18 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         std::fs::write(
             home.path().join("config.json"),
-            format!(r#"{{"builtin":{global_builtin}}}"#),
+            format!(r#"{{"runtime":{{"builtin":{global_builtin}}}}}"#),
         )
         .unwrap();
         let repo = tempfile::tempdir().unwrap();
         if let Some(block) = repo_builtin {
             let dir = repo.path().join(".awman");
             std::fs::create_dir_all(&dir).unwrap();
-            std::fs::write(dir.join("config.json"), format!(r#"{{"builtin":{block}}}"#)).unwrap();
+            std::fs::write(
+                dir.join("config.json"),
+                format!(r#"{{"runtime":{{"builtin":{block}}}}}"#),
+            )
+            .unwrap();
         }
         let session = crate::data::session::Session::for_tests_isolated(repo.path(), home.path());
         (session, repo, home)
@@ -3674,7 +3682,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (engine, session) = engine_with_repo_config(
             tmp.path(),
-            r#"{"yoloDisallowedTools": ["Bash", "computer"]}"#,
+            r#"{"agents": {"yolo": {"disallowedTools": ["Bash", "computer"]}}}"#,
         );
         let claude = AgentName::new("claude").unwrap();
         let opts = engine
@@ -3693,8 +3701,10 @@ mod tests {
     #[test]
     fn non_yolo_launch_ignores_yolo_disallowed_tools() {
         let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) =
-            engine_with_repo_config(tmp.path(), r#"{"yoloDisallowedTools": ["Bash"]}"#);
+        let (engine, session) = engine_with_repo_config(
+            tmp.path(),
+            r#"{"agents": {"yolo": {"disallowedTools": ["Bash"]}}}"#,
+        );
         let claude = AgentName::new("claude").unwrap();
         let opts = engine
             .build_options(&session, &claude, &AgentRunOptions::default())
@@ -3711,8 +3721,10 @@ mod tests {
     #[test]
     fn yolo_disallowed_tools_merge_with_explicit_list_without_duplicates() {
         let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) =
-            engine_with_repo_config(tmp.path(), r#"{"yoloDisallowedTools": ["Bash", "Write"]}"#);
+        let (engine, session) = engine_with_repo_config(
+            tmp.path(),
+            r#"{"agents": {"yolo": {"disallowedTools": ["Bash", "Write"]}}}"#,
+        );
         let claude = AgentName::new("claude").unwrap();
         let run = AgentRunOptions {
             disallowed_tools: vec!["Bash".into()],
@@ -3725,8 +3737,10 @@ mod tests {
     #[test]
     fn yolo_with_disallowed_tools_is_refused_for_an_agent_without_the_flag() {
         let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) =
-            engine_with_repo_config(tmp.path(), r#"{"yoloDisallowedTools": ["Bash"]}"#);
+        let (engine, session) = engine_with_repo_config(
+            tmp.path(),
+            r#"{"agents": {"yolo": {"disallowedTools": ["Bash"]}}}"#,
+        );
         let codex = AgentName::new("codex").unwrap();
         let err = engine
             .build_options(&session, &codex, &yolo_run())
@@ -3755,8 +3769,10 @@ mod tests {
     #[test]
     fn empty_repo_yolo_disallowed_tools_lets_any_agent_run_yolo() {
         let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) =
-            engine_with_repo_config(tmp.path(), r#"{"yoloDisallowedTools": []}"#);
+        let (engine, session) = engine_with_repo_config(
+            tmp.path(),
+            r#"{"agents": {"yolo": {"disallowedTools": []}}}"#,
+        );
         let codex = AgentName::new("codex").unwrap();
         let opts = engine.build_options(&session, &codex, &yolo_run()).unwrap();
         assert!(container_disallowed(&opts).is_empty());
@@ -3765,8 +3781,10 @@ mod tests {
     #[test]
     fn sandbox_yolo_launch_carries_configured_disallowed_tools() {
         let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) =
-            engine_with_repo_config(tmp.path(), r#"{"yoloDisallowedTools": ["Bash"]}"#);
+        let (engine, session) = engine_with_repo_config(
+            tmp.path(),
+            r#"{"agents": {"yolo": {"disallowedTools": ["Bash"]}}}"#,
+        );
         let claude = AgentName::new("claude").unwrap();
         let opts = engine
             .build_sandbox_options(&session, &claude, &yolo_run())
@@ -3793,8 +3811,10 @@ mod tests {
     #[test]
     fn build_options_emits_configured_agent_flags_for_that_agent_only() {
         let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) =
-            engine_with_repo_config(tmp.path(), r#"{"agentFlags": {"codex": ["--search"]}}"#);
+        let (engine, session) = engine_with_repo_config(
+            tmp.path(),
+            r#"{"agents": {"flags": {"codex": ["--search"]}}}"#,
+        );
         let codex = AgentName::new("codex").unwrap();
         let claude = AgentName::new("claude").unwrap();
 
@@ -3816,13 +3836,13 @@ mod tests {
 
     /// awman passes codex `--no-daemon` itself on interactive launches. A user
     /// entry for it is dropped there (not doubled), and kept as configured on a
-    /// non-interactive launch, where the entrypoint does not carry it.
+    /// headless launch, where the entrypoint does not carry it.
     #[test]
     fn build_options_drops_an_agent_flag_the_entrypoint_already_carries() {
         let tmp = tempfile::tempdir().unwrap();
         let (engine, session) = engine_with_repo_config(
             tmp.path(),
-            r#"{"agentFlags": {"codex": ["--no-daemon", "--search"]}}"#,
+            r#"{"agents": {"flags": {"codex": ["--no-daemon", "--search"]}}}"#,
         );
         let codex = AgentName::new("codex").unwrap();
         let interactive = engine
@@ -3846,8 +3866,10 @@ mod tests {
     #[test]
     fn build_options_cli_agent_flags_replace_configured_entry() {
         let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) =
-            engine_with_repo_config(tmp.path(), r#"{"agentFlags": {"codex": ["--no-daemon"]}}"#);
+        let (engine, session) = engine_with_repo_config(
+            tmp.path(),
+            r#"{"agents": {"flags": {"codex": ["--no-daemon"]}}}"#,
+        );
         let codex = AgentName::new("codex").unwrap();
         let run = AgentRunOptions {
             agent_flags: Some(vec!["--search".into()]),
@@ -3860,8 +3882,10 @@ mod tests {
     #[test]
     fn build_options_empty_cli_agent_flags_emit_nothing() {
         let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) =
-            engine_with_repo_config(tmp.path(), r#"{"agentFlags": {"codex": ["--no-daemon"]}}"#);
+        let (engine, session) = engine_with_repo_config(
+            tmp.path(),
+            r#"{"agents": {"flags": {"codex": ["--no-daemon"]}}}"#,
+        );
         let codex = AgentName::new("codex").unwrap();
         let run = AgentRunOptions {
             agent_flags: Some(vec![]),
@@ -3874,8 +3898,10 @@ mod tests {
     #[test]
     fn build_sandbox_options_agent_kit_gets_agent_flags() {
         let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) =
-            engine_with_repo_config(tmp.path(), r#"{"agentFlags": {"cline": ["--debug"]}}"#);
+        let (engine, session) = engine_with_repo_config(
+            tmp.path(),
+            r#"{"agents": {"flags": {"cline": ["--debug"]}}}"#,
+        );
         let cline = AgentName::new("cline").unwrap();
         let opts = engine
             .build_sandbox_options(&session, &cline, &AgentRunOptions::default())
@@ -3891,8 +3917,10 @@ mod tests {
     #[test]
     fn build_sandbox_options_mixin_agent_flags_become_unsupported_note() {
         let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) =
-            engine_with_repo_config(tmp.path(), r#"{"agentFlags": {"codex": ["--no-daemon"]}}"#);
+        let (engine, session) = engine_with_repo_config(
+            tmp.path(),
+            r#"{"agents": {"flags": {"codex": ["--no-daemon"]}}}"#,
+        );
         let codex = AgentName::new("codex").unwrap();
         let opts = engine
             .build_sandbox_options(&session, &codex, &AgentRunOptions::default())

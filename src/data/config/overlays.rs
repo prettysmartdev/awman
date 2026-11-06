@@ -6,7 +6,7 @@
 //! of them a run gets is config resolution: the six sources (global config,
 //! repo config, `AWMAN_OVERLAYS`, CLI flags, workflow-level and per-step
 //! values) merge here, beside every other config merge, so the grammar has one
-//! definition and `RepoConfig.overlays` is no longer an opaque `Vec<String>`
+//! definition and `overlays` is no longer an opaque `Vec<String>`
 //! that only Layer 2 could read.
 //!
 //! `OverlayPermission`, `DirectorySpec` and `ContextScope` live here rather
@@ -351,6 +351,28 @@ fn parse_dir_overlay_args(args: &str, full_expr: &str) -> Result<DirectorySpec, 
     })
 }
 
+/// Where a merged `overlays` entry came from, for error messages: the
+/// override channel names itself (`--set overlays=…`, `AWMAN_OVERLAYS`);
+/// anything else is a config file.
+fn overlay_source(ec: &EffectiveConfig, spec: &str) -> &'static str {
+    let names = |pairs: &crate::data::config::overrides::ConfigOverrides| {
+        pairs.iter().any(|(path, value)| {
+            path == "overlays"
+                && value
+                    .as_array()
+                    .is_some_and(|items| items.iter().any(|v| v.as_str() == Some(spec)))
+        })
+    };
+    let layers = ec.layers();
+    if names(&layers.set) {
+        "--set overlays"
+    } else if names(&layers.env) {
+        crate::data::config::env::AWMAN_OVERLAYS
+    } else {
+        "the `overlays` config key"
+    }
+}
+
 impl EffectiveConfig {
     /// Collect every overlay source into one `CollectedOverlays`.
     ///
@@ -395,41 +417,13 @@ impl EffectiveConfig {
             }
         };
 
-        // 1. Global config overlays (lowest priority).
-        if let Some(overlay_strs) = ec.global().overlays.as_ref() {
-            for s in overlay_strs {
-                let parsed =
-                    parse_overlay_list(s).map_err(|reason| DataError::InvalidOverlaySpec {
-                        spec: s.clone(),
-                        reason,
-                    })?;
-                for typed in parsed {
-                    process_typed(typed);
-                }
-            }
-        }
-
-        // 2. Repo config overlays.
-        if let Some(overlay_strs) = ec.repo().overlays.as_ref() {
-            for s in overlay_strs {
-                let parsed =
-                    parse_overlay_list(s).map_err(|reason| DataError::InvalidOverlaySpec {
-                        spec: s.clone(),
-                        reason,
-                    })?;
-                for typed in parsed {
-                    process_typed(typed);
-                }
-            }
-        }
-
-        // 3. AWMAN_OVERLAYS env var.
-        if let Some(env_str) = ec.env().overlays() {
-            let parsed =
-                parse_overlay_list(env_str).map_err(|reason| DataError::InvalidOverlaySpec {
-                    spec: format!("AWMAN_OVERLAYS: {env_str}"),
-                    reason,
-                })?;
+        // 1-3. Config overlays: global, repo, task, env, `--set` — additive
+        // across layers, already merged and de-duplicated by `EffectiveConfig`.
+        for s in ec.config().overlays.iter().flatten() {
+            let parsed = parse_overlay_list(s).map_err(|reason| DataError::InvalidOverlaySpec {
+                spec: s.clone(),
+                reason: format!("{reason} (from {})", overlay_source(ec, s)),
+            })?;
             for typed in parsed {
                 process_typed(typed);
             }
@@ -783,9 +777,9 @@ mod skill_parser_tests {
 #[cfg(test)]
 mod collect_overlay_specs_tests {
     use super::*;
-    use crate::data::config::env::{EnvSnapshot, AWMAN_CONFIG_HOME, AWMAN_OVERLAYS};
-    use crate::data::config::global::GlobalConfig;
-    use crate::data::config::repo::RepoConfig;
+    use crate::data::config::env::{EnvSnapshot, AWMAN_OVERLAYS};
+    use crate::data::config::file::ConfigFile;
+    use crate::data::fs::data_paths::AWMAN_HOME;
     use crate::data::session::{Session, SessionOpenOptions, StaticGitRootResolver};
 
     fn open_session(git_root: &std::path::Path, env: EnvSnapshot) -> Session {
@@ -794,6 +788,7 @@ mod collect_overlay_specs_tests {
             flags: Default::default(),
             env: Some(env),
             available_agents: None,
+            overrides: Default::default(),
         };
         Session::open(git_root.to_path_buf(), &resolver, opts).unwrap()
     }
@@ -802,13 +797,12 @@ mod collect_overlay_specs_tests {
     fn skills_enabled_when_repo_config_has_skill_star() {
         let git_tmp = tempfile::tempdir().unwrap();
         let cfg_tmp = tempfile::tempdir().unwrap();
-        let repo_config = RepoConfig {
+        let repo_config = ConfigFile {
             overlays: Some(vec!["skill(*)".to_string()]),
             ..Default::default()
         };
-        repo_config.save(git_tmp.path()).unwrap();
-        let env =
-            EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, cfg_tmp.path().to_str().unwrap())]);
+        repo_config.save_repo(git_tmp.path()).unwrap();
+        let env = EnvSnapshot::with_overrides([(AWMAN_HOME, cfg_tmp.path().to_str().unwrap())]);
         let session = open_session(git_tmp.path(), env);
 
         let collected = session
@@ -825,13 +819,12 @@ mod collect_overlay_specs_tests {
     fn skills_enabled_when_global_config_has_skill_star() {
         let git_tmp = tempfile::tempdir().unwrap();
         let cfg_tmp = tempfile::tempdir().unwrap();
-        let global_config = GlobalConfig {
+        let global_config = ConfigFile {
             overlays: Some(vec!["skill(*)".to_string()]),
             ..Default::default()
         };
-        let env =
-            EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, cfg_tmp.path().to_str().unwrap())]);
-        global_config.save_with(&env).unwrap();
+        let env = EnvSnapshot::with_overrides([(AWMAN_HOME, cfg_tmp.path().to_str().unwrap())]);
+        global_config.save_global(&env).unwrap();
         let session = open_session(git_tmp.path(), env);
 
         let collected = session
@@ -848,7 +841,7 @@ mod collect_overlay_specs_tests {
     fn skills_enabled_when_awman_overlays_env_contains_skill() {
         let tmp = tempfile::tempdir().unwrap();
         let env = EnvSnapshot::with_overrides([
-            (AWMAN_CONFIG_HOME, tmp.path().to_str().unwrap()),
+            (AWMAN_HOME, tmp.path().to_str().unwrap()),
             (AWMAN_OVERLAYS, "skill(*)"),
         ]);
         let session = open_session(tmp.path(), env);
@@ -866,7 +859,7 @@ mod collect_overlay_specs_tests {
     #[test]
     fn skills_enabled_when_cli_typed_overlays_contains_skill() {
         let tmp = tempfile::tempdir().unwrap();
-        let env = EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, tmp.path().to_str().unwrap())]);
+        let env = EnvSnapshot::with_overrides([(AWMAN_HOME, tmp.path().to_str().unwrap())]);
         let session = open_session(tmp.path(), env);
 
         let collected = session
@@ -882,7 +875,7 @@ mod collect_overlay_specs_tests {
     #[test]
     fn skills_disabled_when_no_source_enables_it() {
         let tmp = tempfile::tempdir().unwrap();
-        let env = EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, tmp.path().to_str().unwrap())]);
+        let env = EnvSnapshot::with_overrides([(AWMAN_HOME, tmp.path().to_str().unwrap())]);
         let session = open_session(tmp.path(), env);
 
         let collected = session
@@ -901,13 +894,12 @@ mod collect_overlay_specs_tests {
         // include_all_skills must still be true — OR semantics, not AND.
         let git_tmp = tempfile::tempdir().unwrap();
         let cfg_tmp = tempfile::tempdir().unwrap();
-        let global_config = GlobalConfig {
+        let global_config = ConfigFile {
             overlays: Some(vec!["skill(*)".to_string()]),
             ..Default::default()
         };
-        let env =
-            EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, cfg_tmp.path().to_str().unwrap())]);
-        global_config.save_with(&env).unwrap();
+        let env = EnvSnapshot::with_overrides([(AWMAN_HOME, cfg_tmp.path().to_str().unwrap())]);
+        global_config.save_global(&env).unwrap();
         // Repo config has no overlays; no CLI TypedOverlay::Skill.
         let session = open_session(git_tmp.path(), env);
 
@@ -925,7 +917,7 @@ mod collect_overlay_specs_tests {
     fn env_passthrough_collected_from_overlay_expressions() {
         let tmp = tempfile::tempdir().unwrap();
         let env = EnvSnapshot::with_overrides([
-            (AWMAN_CONFIG_HOME, tmp.path().to_str().unwrap()),
+            (AWMAN_HOME, tmp.path().to_str().unwrap()),
             (AWMAN_OVERLAYS, "env(GH_TOKEN),env(AWS_PROFILE)"),
         ]);
         let session = open_session(tmp.path(), env);
@@ -943,7 +935,7 @@ mod collect_overlay_specs_tests {
     fn malformed_awman_overlays_env_var_returns_err() {
         let tmp = tempfile::tempdir().unwrap();
         let env = EnvSnapshot::with_overrides([
-            (AWMAN_CONFIG_HOME, tmp.path().to_str().unwrap()),
+            (AWMAN_HOME, tmp.path().to_str().unwrap()),
             (AWMAN_OVERLAYS, "###not-an-overlay###"),
         ]);
         let session = open_session(tmp.path(), env);
@@ -962,7 +954,7 @@ mod collect_overlay_specs_tests {
     #[test]
     fn skill_star_in_flag_and_named_in_step_union_semantics() {
         let tmp = tempfile::tempdir().unwrap();
-        let env = EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, tmp.path().to_str().unwrap())]);
+        let env = EnvSnapshot::with_overrides([(AWMAN_HOME, tmp.path().to_str().unwrap())]);
         let session = open_session(tmp.path(), env);
 
         let cli_overlays = vec![TypedOverlay::Skill(SkillSpec::All)];
@@ -987,13 +979,12 @@ mod collect_overlay_specs_tests {
     fn skill_named_in_repo_and_step_both_accumulate() {
         let git_tmp = tempfile::tempdir().unwrap();
         let cfg_tmp = tempfile::tempdir().unwrap();
-        let repo_config = RepoConfig {
+        let repo_config = ConfigFile {
             overlays: Some(vec!["skill(foo)".to_string()]),
             ..Default::default()
         };
-        repo_config.save(git_tmp.path()).unwrap();
-        let env =
-            EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, cfg_tmp.path().to_str().unwrap())]);
+        repo_config.save_repo(git_tmp.path()).unwrap();
+        let env = EnvSnapshot::with_overrides([(AWMAN_HOME, cfg_tmp.path().to_str().unwrap())]);
         let session = open_session(git_tmp.path(), env);
 
         let step_overlays = vec!["skill(bar)".to_string()];
@@ -1022,13 +1013,12 @@ mod collect_overlay_specs_tests {
     fn skills_plural_in_repo_config_returns_err_with_migration_message() {
         let git_tmp = tempfile::tempdir().unwrap();
         let cfg_tmp = tempfile::tempdir().unwrap();
-        let repo_config = RepoConfig {
+        let repo_config = ConfigFile {
             overlays: Some(vec!["skills()".to_string()]),
             ..Default::default()
         };
-        repo_config.save(git_tmp.path()).unwrap();
-        let env =
-            EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, cfg_tmp.path().to_str().unwrap())]);
+        repo_config.save_repo(git_tmp.path()).unwrap();
+        let env = EnvSnapshot::with_overrides([(AWMAN_HOME, cfg_tmp.path().to_str().unwrap())]);
         let session = open_session(git_tmp.path(), env);
 
         let result = session
@@ -1046,7 +1036,7 @@ mod collect_overlay_specs_tests {
     fn skills_plural_named_in_env_var_returns_err_with_migration_message() {
         let tmp = tempfile::tempdir().unwrap();
         let env = EnvSnapshot::with_overrides([
-            (AWMAN_CONFIG_HOME, tmp.path().to_str().unwrap()),
+            (AWMAN_HOME, tmp.path().to_str().unwrap()),
             (AWMAN_OVERLAYS, "skills(foo)"),
         ]);
         let session = open_session(tmp.path(), env);
@@ -1071,7 +1061,7 @@ mod collect_overlay_specs_tests {
         // After passing through OverlayEngine::build_overlays, there must be
         // exactly one mount for that path (insert_or_merge deduplication).
         let tmp = tempfile::tempdir().unwrap();
-        let env = EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, tmp.path().to_str().unwrap())]);
+        let env = EnvSnapshot::with_overrides([(AWMAN_HOME, tmp.path().to_str().unwrap())]);
         let session = open_session(tmp.path(), env);
 
         let ssh_typed = parse_overlay_list("ssh()").unwrap().remove(0);
@@ -1104,13 +1094,12 @@ mod collect_overlay_specs_tests {
     fn env_from_two_sources_deduplicates_to_one_entry() {
         let git_tmp = tempfile::tempdir().unwrap();
         let cfg_tmp = tempfile::tempdir().unwrap();
-        let repo_config = RepoConfig {
+        let repo_config = ConfigFile {
             overlays: Some(vec!["env(MY_TOKEN)".to_string()]),
             ..Default::default()
         };
-        repo_config.save(git_tmp.path()).unwrap();
-        let env =
-            EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, cfg_tmp.path().to_str().unwrap())]);
+        repo_config.save_repo(git_tmp.path()).unwrap();
+        let env = EnvSnapshot::with_overrides([(AWMAN_HOME, cfg_tmp.path().to_str().unwrap())]);
         let session = open_session(git_tmp.path(), env);
 
         let step_overlays = vec!["env(MY_TOKEN)".to_string()];
@@ -1136,13 +1125,12 @@ mod collect_overlay_specs_tests {
     fn env_from_repo_config_and_step_both_present_in_passthrough() {
         let git_tmp = tempfile::tempdir().unwrap();
         let cfg_tmp = tempfile::tempdir().unwrap();
-        let repo_config = RepoConfig {
+        let repo_config = ConfigFile {
             overlays: Some(vec!["env(REPO_VAR)".to_string()]),
             ..Default::default()
         };
-        repo_config.save(git_tmp.path()).unwrap();
-        let env =
-            EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, cfg_tmp.path().to_str().unwrap())]);
+        repo_config.save_repo(git_tmp.path()).unwrap();
+        let env = EnvSnapshot::with_overrides([(AWMAN_HOME, cfg_tmp.path().to_str().unwrap())]);
         let session = open_session(git_tmp.path(), env);
 
         let step_overlays = vec!["env(STEP_VAR)".to_string()];
@@ -1322,8 +1310,9 @@ mod context_parser_tests {
 #[cfg(test)]
 mod context_collect_0087_tests {
     use super::*;
-    use crate::data::config::env::{EnvSnapshot, AWMAN_CONFIG_HOME};
-    use crate::data::config::global::GlobalConfig;
+    use crate::data::config::env::EnvSnapshot;
+    use crate::data::config::file::ConfigFile;
+    use crate::data::fs::data_paths::AWMAN_HOME;
     use crate::data::session::{Session, SessionOpenOptions, StaticGitRootResolver};
 
     fn open_session(git_root: &std::path::Path, env: EnvSnapshot) -> Session {
@@ -1332,6 +1321,7 @@ mod context_collect_0087_tests {
             flags: Default::default(),
             env: Some(env),
             available_agents: None,
+            overrides: Default::default(),
         };
         Session::open(git_root.to_path_buf(), &resolver, opts).unwrap()
     }
@@ -1340,13 +1330,12 @@ mod context_collect_0087_tests {
     fn context_global_from_global_config_appears_in_context_overlays() {
         let git_tmp = tempfile::tempdir().unwrap();
         let cfg_tmp = tempfile::tempdir().unwrap();
-        let global_config = GlobalConfig {
+        let global_config = ConfigFile {
             overlays: Some(vec!["context(global)".to_string()]),
             ..Default::default()
         };
-        let env =
-            EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, cfg_tmp.path().to_str().unwrap())]);
-        global_config.save_with(&env).unwrap();
+        let env = EnvSnapshot::with_overrides([(AWMAN_HOME, cfg_tmp.path().to_str().unwrap())]);
+        global_config.save_global(&env).unwrap();
         let session = open_session(git_tmp.path(), env);
 
         let collected = session
@@ -1367,13 +1356,12 @@ mod context_collect_0087_tests {
         // context(global) in both global config and step overlays → exactly one entry.
         let git_tmp = tempfile::tempdir().unwrap();
         let cfg_tmp = tempfile::tempdir().unwrap();
-        let global_config = GlobalConfig {
+        let global_config = ConfigFile {
             overlays: Some(vec!["context(global)".to_string()]),
             ..Default::default()
         };
-        let env =
-            EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, cfg_tmp.path().to_str().unwrap())]);
-        global_config.save_with(&env).unwrap();
+        let env = EnvSnapshot::with_overrides([(AWMAN_HOME, cfg_tmp.path().to_str().unwrap())]);
+        global_config.save_global(&env).unwrap();
         let session = open_session(git_tmp.path(), env);
 
         let step_overlays = vec!["context(global)".to_string()];
@@ -1398,7 +1386,7 @@ mod context_collect_0087_tests {
     #[test]
     fn workflow_level_context_global_applies_to_step() {
         let tmp = tempfile::tempdir().unwrap();
-        let env = EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, tmp.path().to_str().unwrap())]);
+        let env = EnvSnapshot::with_overrides([(AWMAN_HOME, tmp.path().to_str().unwrap())]);
         let session = open_session(tmp.path(), env);
 
         let workflow_overlays = vec!["context(global)".to_string()];
@@ -1421,7 +1409,7 @@ mod context_collect_0087_tests {
     fn workflow_and_step_context_union_produces_two_entries() {
         // Workflow-level context(repo) + step-level context(global) → two entries.
         let tmp = tempfile::tempdir().unwrap();
-        let env = EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, tmp.path().to_str().unwrap())]);
+        let env = EnvSnapshot::with_overrides([(AWMAN_HOME, tmp.path().to_str().unwrap())]);
         let session = open_session(tmp.path(), env);
 
         let workflow_overlays = vec!["context(repo)".to_string()];
@@ -1454,7 +1442,7 @@ mod context_collect_0087_tests {
     fn step_context_workflow_does_not_override_workflow_level() {
         // Step-level context(workflow) + workflow-level context(global) → two entries (union).
         let tmp = tempfile::tempdir().unwrap();
-        let env = EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, tmp.path().to_str().unwrap())]);
+        let env = EnvSnapshot::with_overrides([(AWMAN_HOME, tmp.path().to_str().unwrap())]);
         let session = open_session(tmp.path(), env);
 
         let workflow_overlays = vec!["context(global)".to_string()];

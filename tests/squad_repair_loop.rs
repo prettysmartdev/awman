@@ -27,8 +27,9 @@ use chrono::Utc;
 use tokio_util::sync::CancellationToken;
 
 use awman::command::commands::{RepairDecision, WorkflowRepairLoop};
-use awman::data::config::env::{EnvSnapshot, AWMAN_CONFIG_HOME};
+use awman::data::config::env::EnvSnapshot;
 use awman::data::dynamic_workflow_assets::{build_leader_prompt, build_squad_leader_prompt};
+use awman::data::fs::data_paths::AWMAN_HOME;
 use awman::data::fs::{MountScope, SquadPaths, Task, TaskStatus, TaskStore};
 use awman::data::workflow_definition::Workflow;
 use awman::engine::squad::{EvaluationOutcome, EvaluationRequest, SquadScheduler, TaskEvaluator};
@@ -202,7 +203,7 @@ fn task(name: &str) -> Task {
     let now = Utc::now();
     Task {
         prerequisites: None,
-        id: uuid::Uuid::new_v4().to_string(),
+        id: awman::data::ids::TaskId::new(),
         name: name.to_string(),
         description: "test task".into(),
         repo_scope: PathBuf::from("/repo"),
@@ -237,7 +238,7 @@ async fn repair_exhaustion_is_recorded_as_failed_and_grows_backoff_like_any_othe
     let store = Arc::new(TaskStore::open(&tmp.path().join("squad.db")).unwrap());
     store.migrate().unwrap();
     let paths = SquadPaths::from_root(tmp.path());
-    let env = EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, tmp.path().to_str().unwrap())]);
+    let env = EnvSnapshot::with_overrides([(AWMAN_HOME, tmp.path().to_str().unwrap())]);
 
     let task_row = task("flaky-task");
     store.create(&task_row).unwrap();

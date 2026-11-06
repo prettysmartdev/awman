@@ -136,7 +136,7 @@ fn build_argv(spec: &CommandSpec) -> (Vec<String>, Vec<&'static FlagSpec>) {
     // Positionals last so a greedy trailing var-arg captures exactly its tokens.
     for a in spec.arguments {
         match a.kind {
-            ArgumentKind::TrailingVarArgs => {
+            ArgumentKind::TrailingVarArgs | ArgumentKind::VarArgs => {
                 argv.push("tv1".to_string());
                 argv.push("tv2".to_string());
             }
@@ -245,7 +245,7 @@ fn raw_flag(p: &ParsedArgs, f: &FlagSpec) -> Cmp {
 
 fn arg_values(m: &ArgMatches, p: &ParsedArgs, a: &ArgumentSpec) -> (Cmp, Cmp) {
     match a.kind {
-        ArgumentKind::TrailingVarArgs => {
+        ArgumentKind::TrailingVarArgs | ArgumentKind::VarArgs => {
             let c = m
                 .get_many::<String>(a.name)
                 .map(|v| v.cloned().collect())
@@ -466,7 +466,7 @@ fn coercion_errors_produce_typed_errors_and_clap_rejects() {
 
     // Non-numeric value for a u16 flag → InvalidFlagValue; clap also rejects.
     let err = cat
-        .parse_raw_args(&["api", "start"], &to_vec(&["--port", "not-a-number"]))
+        .parse_raw_args(&["squad", "start"], &to_vec(&["--port", "not-a-number"]))
         .unwrap_err();
     assert!(
         matches!(err, CommandError::InvalidFlagValue { .. }),
@@ -474,7 +474,7 @@ fn coercion_errors_produce_typed_errors_and_clap_rejects() {
     );
     assert!(cat
         .build_clap_command()
-        .try_get_matches_from(["awman", "api", "start", "--port", "not-a-number"])
+        .try_get_matches_from(["awman", "squad", "start", "--port", "not-a-number"])
         .is_err());
 
     // Bad enum value → InvalidFlagValue; clap also rejects.
@@ -511,7 +511,7 @@ fn coercion_errors_produce_typed_errors_and_clap_rejects() {
 //  Per-frontend flag defaults (Finding D)
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// The API profile resolves `non-interactive=true` (forced) and `yolo=true`
+/// The API profile resolves `headless=true` (forced) and `yolo=true`
 /// (overridable default, per architecture-decisions.md D1) via the catalogue,
 /// while the CLI dispatch of the very same command + argv is unaffected.
 #[test]
@@ -524,9 +524,9 @@ fn api_profile_applies_defaults_cli_dispatch_unaffected() {
         .parse_raw_args_with_profile(&path, &argv, FrontendKind::Api)
         .unwrap();
     assert_eq!(
-        api.flag_bool("non-interactive"),
+        api.flag_bool("headless"),
         Some(true),
-        "API profile must force non-interactive=true"
+        "API profile must force headless=true"
     );
     assert_eq!(
         api.flag_bool("yolo"),
@@ -538,9 +538,9 @@ fn api_profile_applies_defaults_cli_dispatch_unaffected() {
         .parse_raw_args_with_profile(&path, &argv, FrontendKind::Cli)
         .unwrap();
     assert_eq!(
-        cli.flag_bool("non-interactive"),
+        cli.flag_bool("headless"),
         None,
-        "CLI dispatch must NOT have profile-forced non-interactive"
+        "CLI dispatch must NOT have profile-forced headless"
     );
     assert_eq!(
         cli.flag_bool("yolo"),
@@ -554,7 +554,7 @@ fn api_profile_applies_defaults_cli_dispatch_unaffected() {
 }
 
 /// The yolo default is overridable: an explicit request value survives under the
-/// API profile (whereas non-interactive is forced regardless).
+/// API profile (whereas headless is forced regardless).
 #[test]
 fn api_profile_yolo_is_overridable_non_interactive_is_forced() {
     let cat = CommandCatalogue::get();
@@ -563,12 +563,12 @@ fn api_profile_yolo_is_overridable_non_interactive_is_forced() {
     // Explicitly opting into --plan (mutually exclusive with yolo in the
     // catalogue) genuinely overrides the overridable yolo default: it is
     // suppressed because a conflicting flag is present, so yolo stays unset.
-    // non-interactive stays forced regardless.
+    // headless stays forced regardless.
     let with_plan = cat
         .parse_raw_args_with_profile(&path, &to_vec(&["--plan", "hi"]), FrontendKind::Api)
         .unwrap();
     assert_eq!(with_plan.flag_bool("plan"), Some(true));
-    assert_eq!(with_plan.flag_bool("non-interactive"), Some(true));
+    assert_eq!(with_plan.flag_bool("headless"), Some(true));
     assert_eq!(with_plan.flag_bool("yolo"), None);
 }
 
@@ -708,7 +708,7 @@ fn every_flag_default_is_what_resolution_answers() {
 
 /// Sweep 2 — every `implies` edge in the catalogue is honoured. Before F-10
 /// this relation had no non-test consumer: dispatch re-derived
-/// `json → non-interactive` and `yolo|auto → worktree` by hand, in three
+/// `json → headless` and `yolo|auto → worktree` by hand, in three
 /// places, for three of the commands that declare them.
 #[test]
 fn every_implies_edge_is_honoured() {
@@ -777,17 +777,6 @@ fn every_non_trivial_default_reaches_the_built_command() {
         _ => panic!("expected Init"),
     }
     covered.push((vec!["init"], "agent"));
-
-    match build(&["api", "start"]) {
-        BuiltCommand::ApiServer(cmd) => match cmd.subcommand() {
-            crate::command::commands::api_server::ApiServerSubcommand::Start(flags) => {
-                assert_eq!(flags.port, 9876)
-            }
-            _ => panic!("expected api start"),
-        },
-        _ => panic!("expected ApiServer"),
-    }
-    covered.push((vec!["api", "start"], "port"));
 
     match build(&["squad", "start"]) {
         BuiltCommand::Squad(cmd) => match cmd.subcommand() {
@@ -877,10 +866,9 @@ fn every_catalogue_command_leaf_is_buildable_by_dispatch() {
         &[],
         &["agents"],
         &["specs"],
-        &["config"],
-        &["config", "prerequisite-grants"],
         &["exec"],
         &["api"],
+        &["daemon"],
         &["remote"],
         &["remote", "exec"],
         &["remote", "session"],

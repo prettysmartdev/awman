@@ -137,9 +137,9 @@ pub(super) const READY: CommandSpec = CommandSpec {
             optional: true,
         },
         FlagSpec {
-            long: "non-interactive",
+            long: "headless",
             short: Some('n'),
-            help: "Run the agent in non-interactive (print) mode instead of interactive mode.",
+            help: "Run the agent headless (print mode) instead of interactive mode.",
             kind: FlagKind::Bool,
             default: FlagDefault::Bool(false),
             frontends: FrontendVisibility::All,
@@ -161,12 +161,12 @@ pub(super) const READY: CommandSpec = CommandSpec {
         FlagSpec {
             long: "json",
             short: None,
-            help: "Suppress human output and print structured JSON. Implies --non-interactive.",
+            help: "Suppress human output and print structured JSON. Implies --headless.",
             kind: FlagKind::Bool,
             default: FlagDefault::Bool(false),
             frontends: FrontendVisibility::All,
             conflicts_with: &[],
-            implies: &["non-interactive"],
+            implies: &["headless"],
             optional: true,
         },
         FlagSpec {
@@ -240,9 +240,9 @@ pub(super) const SPECS_AMEND: CommandSpec = CommandSpec {
     }],
     flags: &[
         FlagSpec {
-            long: "non-interactive",
+            long: "headless",
             short: Some('n'),
-            help: "Run the agent in non-interactive (print) mode.",
+            help: "Run the agent headless (print mode).",
             kind: FlagKind::Bool,
             default: FlagDefault::Bool(false),
             frontends: FrontendVisibility::All,
@@ -273,43 +273,95 @@ pub(super) const SPECS_AMEND: CommandSpec = CommandSpec {
 
 // ── config ───────────────────────────────────────────────────────────────────
 
+/// `--global` / `--repo` / `--task <name>`: which file `config set` and
+/// `config unset` write. Without one the key's own scope picks the file.
+const CONFIG_SCOPE_FLAGS: [FlagSpec; 3] = [
+    FlagSpec {
+        long: "global",
+        short: None,
+        help: "Write the global config file.",
+        kind: FlagKind::Bool,
+        default: FlagDefault::Bool(false),
+        frontends: FrontendVisibility::All,
+        conflicts_with: &["repo", "task"],
+        implies: &[],
+        optional: true,
+    },
+    FlagSpec {
+        long: "repo",
+        short: None,
+        help: "Write this repository's config file (.awman/config.json).",
+        kind: FlagKind::Bool,
+        default: FlagDefault::Bool(false),
+        frontends: FrontendVisibility::All,
+        conflicts_with: &["global", "task"],
+        implies: &[],
+        optional: true,
+    },
+    FlagSpec {
+        long: "task",
+        short: None,
+        help: "Write the config file of the named squad task (task-scope keys only).",
+        kind: FlagKind::OptionalString,
+        default: FlagDefault::None,
+        frontends: FrontendVisibility::All,
+        conflicts_with: &["global", "repo"],
+        implies: &[],
+        optional: true,
+    },
+];
+
+const CONFIG_JSON_FLAG: FlagSpec = FlagSpec {
+    long: "json",
+    short: None,
+    help: "Print the result as JSON.",
+    kind: FlagKind::Bool,
+    default: FlagDefault::Bool(false),
+    frontends: FrontendVisibility::All,
+    conflicts_with: &[],
+    implies: &[],
+    optional: true,
+};
+
+const CONFIG_KEY_ARGUMENT: ArgumentSpec = ArgumentSpec {
+    name: "key",
+    help: "Config key, as a dotted path (e.g. agents.stuckTimeout).",
+    kind: ArgumentKind::String,
+    optional: false,
+};
+
+/// `awman config` with no subcommand is `awman config show`, so the group is
+/// runnable and takes `show`'s flags.
 pub(super) const CONFIG: CommandSpec = CommandSpec {
     name: "config",
     aliases: &[],
-    help: "View and edit global and repo configuration.",
+    help: "Show, get, set and unset configuration keys (bare `config` is `config show`).",
     long_help: None,
     arguments: &[],
-    flags: &[],
-    api_allowed: false,
-    build: crate::command::dispatch::build::unsupported,
-    gateway_need: GatewayNeed::None,
-    requires_container_tier: false,
-    // The recovery path when the configured runtime cannot be constructed
-    // on this host: `awman config set runtime …` must stay reachable.
-    requires_runtime: false,
-    opens_tui_when_bare: false,
-    subcommands: &[
-        &CONFIG_SHOW,
-        &CONFIG_GET,
-        &CONFIG_SET,
-        &CONFIG_MIGRATE,
-        &CONFIG_PREREQUISITE_GRANTS,
-    ],
-};
-
-pub(super) const CONFIG_SHOW: CommandSpec = CommandSpec {
-    name: "show",
-    aliases: &[],
-    help: "Display all config fields at both global and repo level.",
-    long_help: None,
-    arguments: &[],
-    flags: &[],
+    flags: &[CONFIG_JSON_FLAG],
     api_allowed: false,
     build: crate::command::dispatch::build::config,
     gateway_need: GatewayNeed::None,
     requires_container_tier: false,
     // The recovery path when the configured runtime cannot be constructed
-    // on this host: `awman config set runtime …` must stay reachable.
+    // on this host: `awman config set runtime.kind …` must stay reachable.
+    requires_runtime: false,
+    opens_tui_when_bare: false,
+    subcommands: &[&CONFIG_SHOW, &CONFIG_GET, &CONFIG_SET, &CONFIG_UNSET],
+};
+
+pub(super) const CONFIG_SHOW: CommandSpec = CommandSpec {
+    name: "show",
+    aliases: &[],
+    help: "Show every key: its global, repo and effective value, where the effective value \
+           comes from, and its type.",
+    long_help: None,
+    arguments: &[],
+    flags: &[CONFIG_JSON_FLAG],
+    api_allowed: false,
+    build: crate::command::dispatch::build::config,
+    gateway_need: GatewayNeed::None,
+    requires_container_tier: false,
     requires_runtime: false,
     opens_tui_when_bare: false,
     subcommands: &[],
@@ -318,21 +370,14 @@ pub(super) const CONFIG_SHOW: CommandSpec = CommandSpec {
 pub(super) const CONFIG_GET: CommandSpec = CommandSpec {
     name: "get",
     aliases: &[],
-    help: "Show a single field's global value, repo value, and effective value.",
+    help: "Show one key's global, repo and effective value and where it comes from.",
     long_help: None,
-    arguments: &[ArgumentSpec {
-        name: "field",
-        help: "Config field name (e.g. terminal_scrollback_lines).",
-        kind: ArgumentKind::String,
-        optional: false,
-    }],
-    flags: &[],
+    arguments: &[CONFIG_KEY_ARGUMENT],
+    flags: &[CONFIG_JSON_FLAG],
     api_allowed: false,
     build: crate::command::dispatch::build::config,
     gateway_need: GatewayNeed::None,
     requires_container_tier: false,
-    // The recovery path when the configured runtime cannot be constructed
-    // on this host: `awman config set runtime …` must stay reachable.
     requires_runtime: false,
     opens_tui_when_bare: false,
     subcommands: &[],
@@ -341,144 +386,24 @@ pub(super) const CONFIG_GET: CommandSpec = CommandSpec {
 pub(super) const CONFIG_SET: CommandSpec = CommandSpec {
     name: "set",
     aliases: &[],
-    help: "Set a config field value (repo scope by default).",
-    long_help: None,
+    help: "Set a key in a config file. The key's scope picks the file unless --global, --repo \
+           or --task names one; the file written is printed.",
+    long_help: Some(
+        "Values are parsed by the key's type: lists are comma-separated, maps are \
+         k=v,k2=v2, durations look like 30s or 15m, sizes like 4GiB. Global-scope keys go \
+         to the global file; repo- and task-scope keys go to the repo file inside a Git \
+         repository and to the global file outside one. Use `config unset` to remove a key.",
+    ),
     arguments: &[
-        ArgumentSpec {
-            name: "field",
-            help: "Config field name.",
-            kind: ArgumentKind::String,
-            optional: false,
-        },
+        CONFIG_KEY_ARGUMENT,
         ArgumentSpec {
             name: "value",
-            help: "New value for the field.",
+            help: "New value, parsed by the key's type.",
             kind: ArgumentKind::String,
             optional: false,
         },
     ],
-    flags: &[FlagSpec {
-        long: "global",
-        short: None,
-        help: "Write to global config instead of repo config.",
-        kind: FlagKind::Bool,
-        default: FlagDefault::Bool(false),
-        frontends: FrontendVisibility::All,
-        conflicts_with: &[],
-        implies: &[],
-        optional: true,
-    }],
-    api_allowed: false,
-    build: crate::command::dispatch::build::config,
-    gateway_need: GatewayNeed::None,
-    requires_container_tier: false,
-    // The recovery path when the configured runtime cannot be constructed
-    // on this host: `awman config set runtime …` must stay reachable.
-    requires_runtime: false,
-    opens_tui_when_bare: false,
-    subcommands: &[],
-};
-
-pub(super) const CONFIG_MIGRATE: CommandSpec = CommandSpec {
-    name: "migrate",
-    aliases: &[],
-    help: "Move settings awman has renamed to their current keys in the repo config, after \
-           confirmation.",
-    long_help: Some(
-        "Runs every known config migration for the chosen scope. Today that is one: \
-         `dynamicWorkflows` moves to `workflows.dynamic`. Shows the before/after JSON and asks \
-         first; teammates on awman versions before this release stop seeing migrated settings \
-         once the change is committed.",
-    ),
-    arguments: &[],
-    flags: &[
-        FlagSpec {
-            long: "yes",
-            short: Some('y'),
-            help: "Skip the confirmation prompt (for scripting).",
-            kind: FlagKind::Bool,
-            default: FlagDefault::Bool(false),
-            frontends: FrontendVisibility::All,
-            conflicts_with: &[],
-            implies: &[],
-            optional: true,
-        },
-        FlagSpec {
-            long: "dry-run",
-            short: None,
-            help: "Show what would change without writing anything.",
-            kind: FlagKind::Bool,
-            default: FlagDefault::Bool(false),
-            frontends: FrontendVisibility::All,
-            conflicts_with: &[],
-            implies: &[],
-            optional: true,
-        },
-        FlagSpec {
-            long: "global",
-            short: None,
-            help: "Migrate the global config instead of the repo config.",
-            kind: FlagKind::Bool,
-            default: FlagDefault::Bool(false),
-            frontends: FrontendVisibility::All,
-            conflicts_with: &[],
-            implies: &[],
-            optional: true,
-        },
-        FlagSpec {
-            long: "non-interactive",
-            short: Some('n'),
-            help: "Never prompt: refuse instead of asking for confirmation (pass --yes to \
-                   proceed).",
-            kind: FlagKind::Bool,
-            default: FlagDefault::Bool(false),
-            frontends: FrontendVisibility::All,
-            conflicts_with: &[],
-            implies: &[],
-            optional: true,
-        },
-    ],
-    // Same visibility as `config set`.
-    api_allowed: false,
-    build: crate::command::dispatch::build::config,
-    gateway_need: GatewayNeed::None,
-    requires_container_tier: false,
-    // A config repair path, like the other config leaves: it must stay
-    // reachable when the configured runtime cannot be constructed.
-    requires_runtime: false,
-    opens_tui_when_bare: false,
-    subcommands: &[],
-};
-
-/// `config prerequisite-grants` (WI 0149): the remembered workflow
-/// prerequisite decisions in `~/.awman/prerequisite-grants.json`.
-pub(super) const CONFIG_PREREQUISITE_GRANTS: CommandSpec = CommandSpec {
-    name: "prerequisite-grants",
-    aliases: &[],
-    help: "List or revoke remembered workflow prerequisite decisions (SSH key, token variable).",
-    long_help: None,
-    arguments: &[],
-    flags: &[],
-    api_allowed: false,
-    build: crate::command::dispatch::build::unsupported,
-    gateway_need: GatewayNeed::None,
-    requires_container_tier: false,
-    requires_runtime: false,
-    opens_tui_when_bare: false,
-    subcommands: &[
-        &CONFIG_PREREQUISITE_GRANTS_LIST,
-        &CONFIG_PREREQUISITE_GRANTS_REVOKE,
-    ],
-};
-
-pub(super) const CONFIG_PREREQUISITE_GRANTS_LIST: CommandSpec = CommandSpec {
-    name: "list",
-    aliases: &[],
-    help:
-        "List remembered workflow prerequisite decisions. They hold decisions only, never secrets.",
-    long_help: None,
-    arguments: &[],
-    flags: &[],
+    flags: &CONFIG_SCOPE_FLAGS,
     api_allowed: false,
     build: crate::command::dispatch::build::config,
     gateway_need: GatewayNeed::None,
@@ -488,18 +413,14 @@ pub(super) const CONFIG_PREREQUISITE_GRANTS_LIST: CommandSpec = CommandSpec {
     subcommands: &[],
 };
 
-pub(super) const CONFIG_PREREQUISITE_GRANTS_REVOKE: CommandSpec = CommandSpec {
-    name: "revoke",
+pub(super) const CONFIG_UNSET: CommandSpec = CommandSpec {
+    name: "unset",
     aliases: &[],
-    help: "Revoke a remembered workflow prerequisite decision.",
+    help: "Remove a key (or a whole named map entry) from a config file. Picks the file like \
+           `config set`; the file written is printed.",
     long_help: None,
-    arguments: &[ArgumentSpec {
-        name: "selector",
-        help: "The record number shown by `config prerequisite-grants list`, or all.",
-        kind: ArgumentKind::String,
-        optional: false,
-    }],
-    flags: &[],
+    arguments: &[CONFIG_KEY_ARGUMENT],
+    flags: &CONFIG_SCOPE_FLAGS,
     api_allowed: false,
     build: crate::command::dispatch::build::config,
     gateway_need: GatewayNeed::None,

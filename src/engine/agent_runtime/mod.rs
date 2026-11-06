@@ -15,11 +15,10 @@ use std::sync::Arc;
 
 use crate::data::config::effective::EffectiveConfig;
 use crate::data::config::env::Env;
+use crate::data::config::file::ConfigFile;
 use crate::data::config::flags::FlagConfig;
-use crate::data::config::global::GlobalConfig;
 use crate::data::config::image_source::{ImageSourceSpec, RegistryHostConfig};
-use crate::data::config::repo::RepoConfig;
-use crate::data::config::runtime_selection::RuntimeSelection;
+use crate::data::config::runtime::RuntimeSelection;
 use crate::data::oci_identity::{ImageIdentity, OciPlatform};
 use crate::data::session::Session;
 use crate::engine::container::options::ResolvedContainerOptions;
@@ -390,7 +389,7 @@ impl DetectedRuntime {
     }
 }
 
-/// Every value `GlobalConfig::runtime` accepts, in `RuntimeSelection::ALL`
+/// Every value `runtime.kind` accepts, in `RuntimeSelection::ALL`
 /// order. Quoted in the fatal invalid-runtime error so the user can see what
 /// to fix the config to.
 pub const VALID_RUNTIMES: &[&str] = &[
@@ -400,17 +399,18 @@ pub const VALID_RUNTIMES: &[&str] = &[
     RuntimeSelection::BuiltinExperimental.as_str(),
 ];
 
-/// Factory: pick the right runtime based on `GlobalConfig::runtime`.
+/// Factory: pick the right runtime from the global config file's `runtime.kind`.
 ///
-/// Reads the builtin runtime's settings from `global_config` and the process
+/// Reads the builtin runtime's settings from `global` and the process
 /// environment only; a caller holding repo config uses [`detect_effective`].
-pub fn detect(global_config: &GlobalConfig) -> Result<DetectedRuntime, EngineError> {
-    detect_effective(&EffectiveConfig::new(
+pub fn detect(global: &ConfigFile) -> Result<DetectedRuntime, EngineError> {
+    let config = EffectiveConfig::from_files(
+        global.clone(),
+        ConfigFile::default(),
         FlagConfig::default(),
         Env::from_process(),
-        RepoConfig::default(),
-        global_config.clone(),
-    ))
+    )?;
+    detect_effective(&config)
 }
 
 /// Factory: pick the right runtime based on the effective config.
@@ -478,18 +478,15 @@ mod tests {
     use super::*;
     use crate::engine::container::options::{ContainerOption, ImageRef};
 
-    fn docker_cfg() -> GlobalConfig {
-        GlobalConfig {
-            runtime: Some("docker".into()),
-            ..Default::default()
-        }
+    fn docker_cfg() -> ConfigFile {
+        ConfigFile::with_runtime("docker")
     }
 
     // ─── Detection ────────────────────────────────────────────────────────────
 
     #[test]
     fn detect_none_runtime_picks_docker() {
-        let cfg = GlobalConfig::default();
+        let cfg = ConfigFile::default();
         let rt = detect(&cfg).unwrap();
         assert_eq!(rt.engine().runtime_name(), "docker");
         assert!(rt.container_runtime().is_some());
@@ -504,21 +501,8 @@ mod tests {
     }
 
     #[test]
-    fn detect_empty_runtime_string_falls_back_to_docker() {
-        let cfg = GlobalConfig {
-            runtime: Some("  ".into()),
-            ..Default::default()
-        };
-        let rt = detect(&cfg).unwrap();
-        assert_eq!(rt.engine().runtime_name(), "docker");
-    }
-
-    #[test]
     fn detect_apple_on_non_mac_errors() {
-        let cfg = GlobalConfig {
-            runtime: Some("apple-containers".into()),
-            ..Default::default()
-        };
+        let cfg = ConfigFile::with_runtime("apple");
         let res = detect(&cfg);
         if cfg!(target_os = "macos") {
             assert!(res.is_ok());
@@ -534,10 +518,7 @@ mod tests {
 
     #[test]
     fn detect_dsbx_routes_to_sandbox_or_errors_on_unsupported_platform() {
-        let cfg = GlobalConfig {
-            runtime: Some("docker-sbx-experimental".into()),
-            ..Default::default()
-        };
+        let cfg = ConfigFile::with_runtime("sbx");
         let res = detect(&cfg);
         // dsbx is only supported on macOS arm64 and Windows.
         if cfg!(target_os = "linux") {
@@ -555,82 +536,17 @@ mod tests {
     }
 
     #[test]
-    fn detect_unknown_runtime_is_a_fatal_error() {
-        let cfg = GlobalConfig {
-            runtime: Some("blarg".into()),
-            ..Default::default()
-        };
-        // Unknown runtime must error — never silently fall back to Docker.
-        match detect(&cfg) {
-            Err(EngineError::UnknownRuntime { value, valid }) => {
-                assert_eq!(value, "blarg");
-                for name in VALID_RUNTIMES {
-                    assert!(
-                        valid.contains(name),
-                        "error must list valid runtime '{name}'; got: {valid}"
-                    );
-                }
-            }
-            Err(e) => panic!("expected UnknownRuntime error, got {e:?}"),
-            Ok(_) => panic!("expected UnknownRuntime error, got Ok"),
-        }
-    }
-
-    #[test]
-    fn unknown_runtime_error_message_names_value_and_valid_set() {
-        let cfg = GlobalConfig {
-            runtime: Some("dokcer".into()),
-            ..Default::default()
-        };
-        let msg = match detect(&cfg) {
-            Err(e) => e.to_string(),
-            Ok(_) => panic!("expected UnknownRuntime error, got Ok"),
-        };
-        assert!(
-            msg.contains("'dokcer'"),
-            "message must quote the bad value: {msg}"
-        );
-        assert!(
-            msg.contains("docker"),
-            "message must list valid values: {msg}"
-        );
-        assert!(msg.contains("apple-containers"), "{msg}");
-        assert!(msg.contains("docker-sbx-experimental"), "{msg}");
-    }
-
-    #[test]
     fn valid_runtimes_follow_runtime_selection() {
         let from_selection: Vec<&str> = RuntimeSelection::ALL.iter().map(|s| s.as_str()).collect();
         assert_eq!(VALID_RUNTIMES, from_selection.as_slice());
-        assert!(VALID_RUNTIMES.contains(&"builtin-experimental"));
-        assert!(!VALID_RUNTIMES.contains(&"builtin"));
-    }
-
-    /// The unreleased `builtin` spelling is an unknown runtime whose error
-    /// names `builtin-experimental`, never Docker.
-    #[test]
-    fn plain_builtin_is_refused_with_the_experimental_name() {
-        let cfg = GlobalConfig {
-            runtime: Some("builtin".into()),
-            ..Default::default()
-        };
-        match detect(&cfg) {
-            Err(e @ EngineError::UnknownRuntime { .. }) => {
-                assert!(e.to_string().contains("builtin-experimental"), "{e}")
-            }
-            Err(e) => panic!("expected UnknownRuntime, got {e:?}"),
-            Ok(_) => panic!("plain `builtin` must not select a runtime"),
-        }
+        assert_eq!(VALID_RUNTIMES, ["docker", "apple", "sbx", "builtin"]);
     }
 
     /// Selecting `builtin-experimental` yields the builtin runtime or the
     /// precise reason it cannot run — never Docker, never a panic.
     #[test]
     fn detect_builtin_never_falls_back_to_another_runtime() {
-        let cfg = GlobalConfig {
-            runtime: Some("builtin-experimental".into()),
-            ..Default::default()
-        };
+        let cfg = ConfigFile::with_runtime("builtin");
         match detect(&cfg) {
             Ok(rt) => assert_eq!(rt.engine().runtime_name(), "builtin"),
             Err(EngineError::BuiltinRuntimeUnavailable { reason }) => {
@@ -652,22 +568,16 @@ mod tests {
     /// for the whole process, must not refuse on it.
     #[test]
     fn detect_builtin_ignores_a_repos_invalid_launch_settings() {
-        use crate::data::config::{FlagConfig, RepoConfig};
-        let config = EffectiveConfig::new(
+        use crate::data::config::FlagConfig;
+        let config = EffectiveConfig::from_files(
+            ConfigFile::test_json(serde_json::json!({"runtime": {"kind": "builtin",
+                "builtin": {"network": {"mode": "none"}}}})),
+            ConfigFile::test_json(serde_json::json!({"runtime": {"builtin": {
+                "network": {"mode": "public"}}}})),
             FlagConfig::default(),
             crate::data::config::env::EnvSnapshot::empty(),
-            RepoConfig {
-                builtin: Some(
-                    serde_json::from_str(r#"{"network":{"mode":"public"},"vcpus":0}"#).unwrap(),
-                ),
-                ..Default::default()
-            },
-            GlobalConfig {
-                runtime: Some("builtin-experimental".into()),
-                builtin: Some(serde_json::from_str(r#"{"network":{"mode":"none"}}"#).unwrap()),
-                ..Default::default()
-            },
-        );
+        )
+        .unwrap();
         assert!(
             config.builtin_settings().is_err(),
             "the launch settings are invalid"
@@ -721,16 +631,16 @@ mod tests {
 
     // ─── Runtime switching (host-side, no live sbx needed) ───────────────────
     //
-    // Mutate GlobalConfig::runtime between values and re-detect. Each detection
+    // Mutate runtime.kind between values and re-detect. Each detection
     // must return a runtime whose runtime_name() matches the config — no state
     // leaks between calls.
 
     #[test]
     fn default_runtime_resolves_to_docker() {
-        let cfg = GlobalConfig::default();
+        let cfg = ConfigFile::default();
         assert!(
             cfg.runtime.is_none(),
-            "default GlobalConfig must have no runtime set"
+            "default config must have no runtime set"
         );
         let rt = detect(&cfg).unwrap();
         assert_eq!(
@@ -744,18 +654,9 @@ mod tests {
 
     #[test]
     fn runtime_switching_docker_to_sandbox_and_back() {
-        let docker_cfg = GlobalConfig {
-            runtime: Some("docker".into()),
-            ..Default::default()
-        };
-        let sbx_cfg = GlobalConfig {
-            runtime: Some("docker-sbx-experimental".into()),
-            ..Default::default()
-        };
-        let docker_again = GlobalConfig {
-            runtime: Some("docker".into()),
-            ..Default::default()
-        };
+        let docker_cfg = ConfigFile::with_runtime("docker");
+        let sbx_cfg = ConfigFile::with_runtime("sbx");
+        let docker_again = ConfigFile::with_runtime("docker");
 
         // Step 1: docker → ContainerRuntime
         let rt1 = detect(&docker_cfg).unwrap();
@@ -782,20 +683,6 @@ mod tests {
         assert_eq!(rt3.engine().runtime_name(), "docker");
         assert!(rt3.container_runtime().is_some());
         assert!(rt3.sandbox_runtime().is_none());
-    }
-
-    #[test]
-    fn unknown_runtime_string_never_selects_a_runtime() {
-        // "blarg" must not accidentally select sbx or any other runtime —
-        // and must not fall back to Docker either.
-        let cfg = GlobalConfig {
-            runtime: Some("blarg".into()),
-            ..Default::default()
-        };
-        assert!(matches!(
-            detect(&cfg),
-            Err(EngineError::UnknownRuntime { .. })
-        ));
     }
 
     // ─── Option-variant mismatch via ContainerRuntime ─────────────────────────

@@ -6,7 +6,7 @@
 //! aborting the task — mirroring `tests/api_parity/live_server.rs`'s
 //! established pattern for this codebase's other HTTP daemon.
 //!
-//! The bootstrap reads `AWMAN_CONFIG_HOME` (and friends) from the real process
+//! The bootstrap reads `AWMAN_HOME` (and friends) from the real process
 //! environment (`Env::from_process()` is hardcoded inside it), so every test
 //! here scopes that env var for its duration under a shared lock — the same
 //! technique `tests/data_layer/rename_0077.rs` and
@@ -55,14 +55,19 @@ fn engines_with(container_runtime: Arc<ContainerRuntime>, root: &std::path::Path
         overlay_engine: overlay_engine.clone(),
         auth_engine: Arc::new(AuthEngine::with_paths(auth_paths, api_paths.clone())),
         agent_engine: Arc::new(AgentEngine::new(overlay_engine, container_runtime)),
-        config_notices: Default::default(),
         workflow_state_store: Arc::new(WorkflowStateStore::at_git_root(api_paths.root())),
         credential_monitor: None,
-        global_config: std::sync::Arc::new(Default::default()),
+        global_config: std::sync::Arc::new(
+            awman::data::config::file::ConfigFile::load(
+                &root.join("config.json"),
+                awman::data::config::FileKind::Global,
+            )
+            .unwrap(),
+        ),
     }
 }
 
-/// Sets `AWMAN_CONFIG_HOME` to `root`, starts the daemon in a background
+/// Sets `AWMAN_HOME` to `root`, starts the daemon in a background
 /// task, and polls for its published metadata. Returns the daemon and the
 /// resolved `http://127.0.0.1:<port>` base URL. The previous env var value is
 /// restored only once the daemon is aborted (or dropped by a panicking test):
@@ -83,7 +88,7 @@ async fn start_daemon_with(
 ) -> (InProcessDaemon, String) {
     // A test daemon must never reach the developer's real OS keychain. The
     // stored item is a single fixed `awman-squad`/`daemon-env` pair — it is not
-    // keyed by storage root — so an isolated `AWMAN_CONFIG_HOME` does *not*
+    // keyed by storage root — so an isolated `AWMAN_HOME` does *not*
     // isolate it: a daemon booted here with the default `envPersistence:
     // "keychain"` would overwrite the item a real daemon on this machine is
     // using, with this test's fixture values. Default every test daemon to the
@@ -99,7 +104,7 @@ async fn start_daemon_with(
         dangerously_skip_auth: true,
     };
 
-    let env = EnvOverride::set(&[("AWMAN_CONFIG_HOME", root.as_os_str())]);
+    let env = EnvOverride::set(&[("AWMAN_HOME", root.as_os_str())]);
 
     // WI 0113 F-02: Layer 2 bootstraps the daemon, Layer 3 serves it. This is
     // the same seam `serve_with` was, split across the layer boundary.
@@ -156,7 +161,7 @@ async fn daemon_startup_succeeds_under_docker_and_apple_with_no_tier_branching()
             "{name}: /v1/status must succeed identically regardless of container tier"
         );
         let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body["running"], true);
+        assert_eq!(body["features"]["squad"]["detail"]["running"], true);
 
         handle.abort();
     }
@@ -176,17 +181,9 @@ async fn post_commands_rejects_non_squad_subcommand() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 400);
+    assert_eq!(resp.status(), 404);
     let body: serde_json::Value = resp.json().await.unwrap();
-    // The refusal is now the catalogue's standard
-    // `NotAvailableForFrontend`, raised under `FrontendKind::SquadDaemon`
-    // (WI 0114 F-50) rather than a literal path comparison in the router.
-    let error = body["error"].as_str().unwrap();
-    assert!(
-        error.contains("exec workflow") && error.contains("squad daemon"),
-        "error must name the command and the frontend that refuses it: {body}"
-    );
-
+    assert_eq!(body["code"], "not_found");
     handle.abort();
 }
 
@@ -205,7 +202,7 @@ async fn post_commands_rejects_unknown_flag_with_catalogue_error_shape() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 400);
+    assert_eq!(resp.status(), 404);
     let body: serde_json::Value = resp.json().await.unwrap();
     assert!(
         body.get("error")
@@ -231,7 +228,7 @@ async fn attach_is_refused_by_the_catalogue_even_though_it_exists_for_cli_tui() 
         .unwrap();
     assert_eq!(
         resp.status(),
-        400,
+        404,
         "`squad attach` is api_allowed: false in the catalogue and must be refused"
     );
 
@@ -364,7 +361,7 @@ async fn the_workflow_route_serves_the_live_state_verbatim_while_a_run_is_in_fli
     store
         .create(&awman::data::fs::Task {
             prerequisites: None,
-            id: uuid::Uuid::new_v4().to_string(),
+            id: awman::data::ids::TaskId::new(),
             name: "issue-triage".into(),
             description: "watch new issues".into(),
             repo_scope: tmp.path().to_path_buf(),
@@ -402,9 +399,12 @@ async fn the_workflow_route_serves_the_live_state_verbatim_while_a_run_is_in_fli
         .expect("the scheduler must dispatch the due task on its first tick")
         .expect("evaluator must signal that the workflow started");
 
-    let resp = reqwest::get(format!("{base}/v1/tasks/issue-triage/workflow"))
-        .await
-        .unwrap();
+    let resp = reqwest::get(format!(
+        "{base}/v1/squad/tasks/{}/workflow",
+        task_id(&base, "issue-triage").await
+    ))
+    .await
+    .unwrap();
     assert_eq!(
         resp.status(),
         200,
@@ -514,7 +514,7 @@ fn seed_task_for_agent(root: &std::path::Path, name: &str, overlays: &[&str], ag
     store
         .create(&awman::data::fs::Task {
             prerequisites: None,
-            id: uuid::Uuid::new_v4().to_string(),
+            id: awman::data::ids::TaskId::new(),
             name: name.into(),
             description: "seeded for the env protocol tests".into(),
             repo_scope: root.to_path_buf(),
@@ -539,6 +539,7 @@ fn seed_task_for_agent(root: &std::path::Path, name: &str, overlays: &[&str], ag
 /// `AuthMode::resolve_for_daemon` demands a hash already on disk, so one is
 /// written before the bootstrap — exactly what `squad start` does for itself.
 async fn start_daemon_with_auth(root: &std::path::Path) -> (InProcessDaemon, String, String) {
+    write_squad_config(root, "none");
     let key = awman::engine::auth::ApiKey::from_string(
         "d0d0cafe00000000000000000000000000000000000000000000000000000000",
     );
@@ -559,7 +560,7 @@ async fn start_daemon_with_auth(root: &std::path::Path) -> (InProcessDaemon, Str
         port: 0,
         dangerously_skip_auth: false,
     };
-    let env = EnvOverride::set(&[("AWMAN_CONFIG_HOME", root.as_os_str())]);
+    let env = EnvOverride::set(&[("AWMAN_HOME", root.as_os_str())]);
     let handle = tokio::spawn(async move {
         let handles =
             SquadDaemonHandles::bootstrap(config, engines, Arc::new(NeverTriggeredEvaluator))
@@ -618,13 +619,13 @@ async fn request(
 async fn env_get(base: &str, key: Option<&str>) -> serde_json::Value {
     let (status, text) = request(
         reqwest::Method::GET,
-        &format!("{base}/v1/daemon/env"),
+        &format!("{base}/v1/squad/env"),
         key,
         None,
     )
     .await;
-    assert_eq!(status, 200, "GET /v1/daemon/env: {text}");
-    assert_carries_no_value(&text, "GET /v1/daemon/env");
+    assert_eq!(status, 200, "GET /v1/squad/env: {text}");
+    assert_carries_no_value(&text, "GET /v1/squad/env");
     serde_json::from_str(&text).expect("coverage must be JSON")
 }
 
@@ -634,8 +635,8 @@ async fn env_push(
     body: serde_json::Value,
 ) -> (u16, String, serde_json::Value) {
     let (status, text) = request(
-        reqwest::Method::POST,
-        &format!("{base}/v1/daemon/env"),
+        reqwest::Method::PUT,
+        &format!("{base}/v1/squad/env"),
         key,
         Some(body),
     )
@@ -691,8 +692,8 @@ async fn daemon_env_push_requires_the_bearer_key() {
     // GET and DELETE are behind the same middleware.
     for method in [reqwest::Method::GET, reqwest::Method::DELETE] {
         let (status, _) =
-            request(method.clone(), &format!("{base}/v1/daemon/env"), None, None).await;
-        assert_eq!(status, 401, "{method} /v1/daemon/env must require the key");
+            request(method.clone(), &format!("{base}/v1/squad/env"), None, None).await;
+        assert_eq!(status, 401, "{method} /v1/squad/env must require the key");
     }
 
     // The same request with the key succeeds, so the 401s above are auth and
@@ -736,7 +737,7 @@ async fn daemon_env_push_reports_accepted_names_only_and_its_body_carries_no_val
     // The whole point of the route: assert on the serialised JSON, because a
     // typed struct with no value field proves nothing about what the
     // *serializer* emitted.
-    assert_carries_no_value(&text, "the POST /v1/daemon/env body");
+    assert_carries_no_value(&text, "the POST /v1/squad/env body");
 
     // The embedded coverage reports the name and a digest, and the digest is
     // not the value: 16 hex chars, whatever the value's length.
@@ -950,13 +951,13 @@ async fn a_name_leaving_required_env_takes_its_value_with_it() {
 
     // Drop the only task that declares it.
     let (status, _) = request(
-        reqwest::Method::POST,
-        &format!("{base}/v1/commands"),
+        reqwest::Method::DELETE,
+        &format!("{base}/v1/squad/tasks/{}", task_id(&base, "nightly").await),
         None,
-        Some(serde_json::json!({"subcommand": "squad remove", "args": ["nightly"]})),
+        None,
     )
     .await;
-    assert_eq!(status, 200);
+    assert_eq!(status, 204);
 
     let after = env_get(&base, None).await;
     assert!(
@@ -968,22 +969,12 @@ async fn a_name_leaving_required_env_takes_its_value_with_it() {
     // with the name, not merely hidden from the report.
     let (status, text) = request(
         reqwest::Method::POST,
-        &format!("{base}/v1/commands"),
+        &format!("{base}/v1/squad/tasks"),
         None,
-        Some(serde_json::json!({
-            "subcommand": "squad add",
-            "args": [
-                "--name", "nightly-again",
-                "--description", "re-declares the same variable",
-                "--repo", repo.to_str().unwrap(),
-                "--interval", "3600",
-                "--mount-scope", "gitroot",
-                "--overlay", "env(GC_TOKEN)",
-            ],
-        })),
+        Some(serde_json::json!({"name":"nightly-again","description":"re-declares the same variable","workspace":{"kind":"custom","path":repo},"mount_scope":"cwd","interval_ms":3600000,"overlays":["env(GC_TOKEN)"]})),
     )
     .await;
-    assert_eq!(status, 200, "{text}");
+    assert_eq!(status, 201, "{text}");
     let readded = env_get(&base, None).await;
     let entry = entry(&readded, "GC_TOKEN").expect("the name is required again");
     assert!(
@@ -1068,32 +1059,23 @@ async fn no_endpoint_the_env_protocol_touches_returns_a_payload_value() {
 
     let mut bodies: Vec<(String, String)> = Vec::new();
     for (method, path) in [
-        (reqwest::Method::GET, "/v1/daemon/env"),
+        (reqwest::Method::GET, "/v1/squad/env"),
         (reqwest::Method::GET, "/v1/status"),
-        (reqwest::Method::DELETE, "/v1/daemon/env"),
+        (reqwest::Method::DELETE, "/v1/squad/env"),
     ] {
         let (status, text) = request(method.clone(), &format!("{base}{path}"), None, None).await;
         assert_eq!(status, 200, "{method} {path}: {text}");
         bodies.push((format!("{method} {path}"), text));
     }
-    for subcommand in ["squad list", "squad status"] {
-        let (_, text) = request(
-            reqwest::Method::POST,
-            &format!("{base}/v1/commands"),
-            None,
-            Some(serde_json::json!({"subcommand": subcommand, "args": []})),
-        )
-        .await;
-        bodies.push((subcommand.to_string(), text));
+    for path in [
+        "/v1/squad/tasks".to_string(),
+        format!("/v1/squad/tasks/{}", task_id(&base, "nightly").await),
+    ] {
+        let (status, text) =
+            request(reqwest::Method::GET, &format!("{base}{path}"), None, None).await;
+        assert_eq!(status, 200, "{text}");
+        bodies.push((path, text));
     }
-    let (_, text) = request(
-        reqwest::Method::POST,
-        &format!("{base}/v1/commands"),
-        None,
-        Some(serde_json::json!({"subcommand": "squad show", "args": ["nightly"]})),
-    )
-    .await;
-    bodies.push(("squad show".into(), text));
 
     for (what, text) in &bodies {
         assert_carries_no_value(text, what);
@@ -1128,7 +1110,7 @@ async fn clearing_the_store_reports_honestly_and_leaves_the_running_overlay_inta
 
     let (status, text) = request(
         reqwest::Method::DELETE,
-        &format!("{base}/v1/daemon/env"),
+        &format!("{base}/v1/squad/env"),
         None,
         None,
     )
@@ -1156,11 +1138,34 @@ fn write_squad_config(root: &std::path::Path, persistence: &str) {
     std::fs::write(
         &path,
         serde_json::to_string_pretty(&serde_json::json!({
-            "squad": { "envPersistence": persistence }
+            "daemon":{"features":{"squad": { "enabled": true, "envPersistence": persistence }}}
         }))
         .unwrap(),
     )
     .unwrap();
+}
+
+#[tokio::test]
+async fn disabled_squad_feature_returns_feature_disabled() {
+    let _guard = ENV_LOCK.lock().await;
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(
+        root.path().join("config.json"),
+        serde_json::json!({"daemon":{"features":{"squad":{"enabled":false,"envPersistence":"none"}}}}).to_string(),
+    )
+    .unwrap();
+    let (handle, base) = start_daemon(root.path(), Arc::new(ContainerRuntime::docker())).await;
+    let response = reqwest::Client::new()
+        .get(format!("{base}/v1/squad/tasks"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 503);
+    assert_eq!(
+        response.json::<serde_json::Value>().await.unwrap()["code"],
+        "feature_disabled"
+    );
+    handle.abort();
 }
 
 /// §5a on the wire: `GET /v1/status` reports the daemon's persistence state as
@@ -1184,15 +1189,18 @@ async fn status_reports_env_persistence_none_for_the_explicit_opt_out() {
     .await;
     assert_eq!(status, 200, "{text}");
     let body: serde_json::Value = serde_json::from_str(&text).unwrap();
-    assert_eq!(body["env_persistence"], "none");
     assert_eq!(
-        body["unmet_env"],
+        body["features"]["squad"]["detail"]["env_persistence"],
+        "none"
+    );
+    assert_eq!(
+        body["features"]["squad"]["detail"]["unmet_env"],
         serde_json::json!(["STATUS_TOKEN"]),
         "the daemon-wide unmet list is exactly the required, uncovered names: {body}"
     );
     // Nothing is seeded on the daemon's own behalf, so a name no task declares
     // — GITHUB_TOKEN included — is not required and cannot be unmet.
-    assert!(!body["unmet_env"]
+    assert!(!body["features"]["squad"]["detail"]["unmet_env"]
         .as_array()
         .unwrap()
         .contains(&serde_json::json!("GITHUB_TOKEN")));
@@ -1245,23 +1253,23 @@ async fn a_task_declared_github_token_is_reported_unmet_like_any_other_name() {
     assert_eq!(status, 200, "{text}");
     let body: serde_json::Value = serde_json::from_str(&text).unwrap();
     assert_eq!(
-        body["unmet_env"],
+        body["features"]["squad"]["detail"]["unmet_env"],
         serde_json::json!(["GITHUB_TOKEN"]),
         "`squad status` and the daemon-wide count must see it: {body}"
     );
 
     // …and so must the per-task marker every TUI surface reads.
     let (status, text) = request(
-        reqwest::Method::POST,
-        &format!("{base}/v1/commands"),
+        reqwest::Method::GET,
+        &format!("{base}/v1/squad/tasks"),
         None,
-        Some(serde_json::json!({"subcommand": "squad list", "args": []})),
+        None,
     )
     .await;
     assert_eq!(status, 200, "{text}");
     let tasks: serde_json::Value = serde_json::from_str(&text).unwrap();
     assert_eq!(
-        tasks[0]["unmet_env"],
+        tasks["items"][0]["unmet_env"],
         serde_json::json!(["GITHUB_TOKEN"]),
         "the card, the detail modal and the indicator all read this: {tasks}"
     );
@@ -1399,7 +1407,7 @@ async fn a_slow_keychain_write_does_not_park_the_runtime_during_a_push() {
     store
         .create(&awman::data::fs::Task {
             prerequisites: None,
-            id: uuid::Uuid::new_v4().to_string(),
+            id: awman::data::ids::TaskId::new(),
             name: "nightly".into(),
             description: "declares the pushed name".into(),
             repo_scope: tmp.path().to_path_buf(),
@@ -1445,7 +1453,7 @@ async fn a_slow_keychain_write_does_not_park_the_runtime_during_a_push() {
          elapsed during a 400ms store call on a single-threaded runtime"
     );
 
-    // `DELETE /v1/daemon/env` never degrades the daemon, so it is the one call a
+    // `DELETE /v1/squad/env` never degrades the daemon, so it is the one call a
     // client can re-drive indefinitely. It must be off the runtime too.
     let before_clear = ticks.load(Ordering::SeqCst);
     gateway
@@ -1506,7 +1514,7 @@ async fn approved_custom_agent_auth_env_is_required_and_collected_with_its_task(
     assert_eq!(status, 200, "{text}");
     assert_eq!(body["accepted"], serde_json::json!(["PI_API_KEY"]));
     assert_eq!(body["ignored"], serde_json::json!(["GHOST_KEY"]));
-    assert_carries_no_value(&text, "the POST /v1/daemon/env body");
+    assert_carries_no_value(&text, "the POST /v1/squad/env body");
     let held = env_get(&base, None).await;
     assert!(
         entry(&held, "PI_API_KEY").unwrap()["digest"].is_string(),
@@ -1514,13 +1522,13 @@ async fn approved_custom_agent_auth_env_is_required_and_collected_with_its_task(
     );
 
     let (status, _) = request(
-        reqwest::Method::POST,
-        &format!("{base}/v1/commands"),
+        reqwest::Method::DELETE,
+        &format!("{base}/v1/squad/tasks/{}", task_id(&base, "nightly").await),
         None,
-        Some(serde_json::json!({"subcommand": "squad remove", "args": ["nightly"]})),
+        None,
     )
     .await;
-    assert_eq!(status, 200);
+    assert_eq!(status, 204);
     let after = env_get(&base, None).await;
     assert!(
         entry(&after, "PI_API_KEY").is_none(),
@@ -1537,7 +1545,7 @@ async fn prerequisite_widening_is_refused_by_the_real_squad_route_unless_operato
     for (use_policy, allow) in [("ask", false), ("deny", false), ("ask", true)] {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("config.json"), serde_json::json!({
-            "squad": {"envPersistence":"none"},
+            "daemon":{"features":{"squad": {"enabled":true,"envPersistence":"none"}}},
             "workflows": {"prerequisites": {"allowApiClientGrants":allow, "ssh":{"use":use_policy}}}
         }).to_string()).unwrap();
         let (handle, base) = start_daemon(root.path(), Arc::new(ContainerRuntime::docker())).await;
@@ -1546,12 +1554,36 @@ async fn prerequisite_widening_is_refused_by_the_real_squad_route_unless_operato
             ("token-task", "--prerequisite-token", "env:GH_TOKEN", allow),
             ("narrow-task", "--prerequisite-ssh", "deny", true),
         ] {
-            let response = reqwest::Client::new().post(format!("{base}/v1/commands")).json(&serde_json::json!({
-                "subcommand":"squad add", "args":["--name",name,"--description","security fixture","--mount-scope","cwd","--workspace",root.path().to_str().unwrap(),"--interval","1h",flag,value,"--non-interactive"]
-            })).send().await.unwrap();
+            let flags = awman::data::config::flags::PrerequisiteFlags {
+                ssh: if flag == "--prerequisite-ssh" {
+                    Some(if value == "all" {
+                        awman::data::config::flags::SshFlag::All
+                    } else {
+                        awman::data::config::flags::SshFlag::Deny
+                    })
+                } else {
+                    None
+                },
+                token: if flag == "--prerequisite-token" {
+                    Some(awman::data::config::flags::TokenFlag::Env(
+                        "GH_TOKEN".into(),
+                    ))
+                } else {
+                    None
+                },
+                ..Default::default()
+            };
+            let policy = awman::data::config::workflows::PrerequisitePolicy::from_flags(&flags);
+            let response=reqwest::Client::new().post(format!("{base}/v1/squad/tasks")).json(&serde_json::json!({"name":name,"description":"security fixture","workspace":{"kind":"default"},"mount_scope":"directory","interval_ms":3600000,"prerequisites":policy})).send().await.unwrap();
             let status = response.status();
             let text = response.text().await.unwrap();
-            assert_eq!(status.as_u16(), if accepted { 200 } else { 403 }, "{text}");
+            assert_eq!(status.as_u16(), if accepted { 201 } else { 403 }, "{text}");
+            if !accepted {
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&text).unwrap()["code"],
+                    "prerequisite_widening_refused"
+                );
+            }
         }
         handle.abort();
     }
@@ -1564,10 +1596,10 @@ async fn malformed_command_json_uses_the_shared_error_envelope() {
     let (handle, base) = start_daemon(tmp.path(), Arc::new(ContainerRuntime::docker())).await;
     for (input, status, code) in [
         ("{bad", 400, "invalid_request"),
-        ("{}", 422, "unprocessable_request"),
+        ("{}", 400, "invalid_request"),
     ] {
         let response = reqwest::Client::new()
-            .post(format!("{base}/v1/commands"))
+            .post(format!("{base}/v1/squad/tasks"))
             .header("content-type", "application/json")
             .body(input)
             .send()
@@ -1578,5 +1610,125 @@ async fn malformed_command_json_uses_the_shared_error_envelope() {
         let json: serde_json::Value = response.json().await.unwrap();
         assert_eq!(json["code"], code);
     }
+    handle.abort();
+}
+
+async fn task_id(base: &str, name: &str) -> String {
+    let mut url = reqwest::Url::parse(&format!("{base}/v1/squad/tasks")).unwrap();
+    url.query_pairs_mut().append_pair("name", name);
+    let response = reqwest::Client::new().get(url).send().await.unwrap();
+    let page: serde_json::Value = response.json().await.unwrap();
+    page["items"][0]["id"].as_str().expect("task ID").into()
+}
+
+#[tokio::test]
+async fn task_resources_page_patch_nullable_fields_and_cancel_the_exact_reserved_run() {
+    let _guard = ENV_LOCK.lock().await;
+    let root = tempfile::tempdir().unwrap();
+    let (handle, base) = start_daemon(root.path(), Arc::new(ContainerRuntime::docker())).await;
+    let client = reqwest::Client::new();
+    for name in ["page-a", "page-b"] {
+        let response=client.post(format!("{base}/v1/squad/tasks")).json(&serde_json::json!({"name":name,"description":"resource fixture","workspace":{"kind":"default"},"mount_scope":"directory","interval_ms":60000,"agent":"claude","model":"fixture-model"})).send().await.unwrap();
+        assert_eq!(response.status(), 201);
+        let task: serde_json::Value = response.json().await.unwrap();
+        assert!(task["id"].as_str().unwrap().starts_with("task_"));
+        assert_eq!(task["interval_ms"], 60000);
+        assert!(task.get("interval_secs").is_none());
+    }
+    let page: serde_json::Value = client
+        .get(format!("{base}/v1/squad/tasks?limit=1"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(page["items"].as_array().unwrap().len(), 1);
+    let cursor = page["next_cursor"].as_str().unwrap();
+    let mut next = reqwest::Url::parse(&format!("{base}/v1/squad/tasks")).unwrap();
+    next.query_pairs_mut()
+        .append_pair("limit", "1")
+        .append_pair("cursor", cursor);
+    let page2: serde_json::Value = client.get(next).send().await.unwrap().json().await.unwrap();
+    assert_ne!(page["items"][0]["id"], page2["items"][0]["id"]);
+    assert!(page2["next_cursor"].is_null());
+    let id = task_id(&base, "page-a").await;
+    let url = format!("{base}/v1/squad/tasks/{id}");
+    let malformed = client
+        .patch(&url)
+        .json(&serde_json::json!({"pasued":true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(malformed.status(), 400);
+    assert!(
+        malformed.json::<serde_json::Value>().await.unwrap()["error"]
+            .as_str()
+            .unwrap()
+            .contains("pasued")
+    );
+    let invalid_status = client
+        .get(format!("{url}/runs?status=bogus"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(invalid_status.status(), 400);
+    assert_eq!(
+        invalid_status.json::<serde_json::Value>().await.unwrap()["code"],
+        "invalid_request"
+    );
+    let response = client
+        .patch(&url)
+        .json(&serde_json::json!({"paused":true,"agent":null,"model":null}))
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let task: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(status, 200, "{task}");
+    assert_eq!(task["status"], "paused");
+    assert!(task["agent"].is_null());
+    assert!(task["model"].is_null());
+    let refused = client.post(format!("{url}/runs")).send().await.unwrap();
+    assert_eq!(refused.status(), 400);
+    assert_eq!(
+        refused.json::<serde_json::Value>().await.unwrap()["code"],
+        "invalid_request"
+    );
+    assert_eq!(
+        client
+            .patch(&url)
+            .json(&serde_json::json!({"paused":false}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    let response = client
+        .post(format!("{url}/runs"))
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 202);
+    let created: serde_json::Value = response.json().await.unwrap();
+    let run = created["id"].as_str().unwrap();
+    assert!(run.starts_with("run_"));
+    let response = client
+        .post(format!("{base}/v1/squad/runs/{run}/cancel"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let runs: serde_json::Value = client
+        .get(format!("{url}/runs?status=canceled&limit=1"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(runs["items"][0]["id"], run);
     handle.abort();
 }

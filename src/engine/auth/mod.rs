@@ -9,7 +9,7 @@ use std::time::SystemTime;
 use ring::digest;
 use ring::rand::{SecureRandom, SystemRandom};
 
-use crate::data::config::repo::AgentAuthMode;
+use crate::data::config::agents::AgentAuthMode;
 use crate::data::fs::api_paths::ApiPaths;
 use crate::data::fs::auth_paths::AuthPathResolver;
 use crate::data::fs::daemon_paths::DaemonPaths;
@@ -1109,21 +1109,19 @@ mod tests {
 
     // ── Part B: resolve_agent_auth auth-mode gating ───────────────────────────
 
-    use crate::data::config::env::AWMAN_CONFIG_HOME;
-    use crate::data::config::repo::{
-        AgentAuthMode, AuthRefreshConfig, RepoConfig, REPO_CONFIG_FILENAME, REPO_CONFIG_SUBDIR,
-    };
+    use crate::data::config::file::{CONFIG_FILENAME as REPO_CONFIG_FILENAME, REPO_CONFIG_SUBDIR};
     use crate::data::config::EnvSnapshot;
+    use crate::data::fs::data_paths::AWMAN_HOME;
     use crate::data::session::{Session, SessionOpenOptions};
 
-    /// Build an isolated session with the given `RepoConfig` written to disk.
+    /// Build an isolated session with the given repo config JSON written to disk.
     ///
-    /// Uses a temp home dir (via `AWMAN_CONFIG_HOME`) so no process-global env
+    /// Uses a temp home dir (via `AWMAN_HOME`) so no process-global env
     /// is read or mutated.
     fn session_with_repo_config(
         git_root: &std::path::Path,
         home_dir: &std::path::Path,
-        repo_cfg: &RepoConfig,
+        repo_cfg: &serde_json::Value,
     ) -> Session {
         // Write repo config.
         let awman_dir = git_root.join(REPO_CONFIG_SUBDIR);
@@ -1131,7 +1129,7 @@ mod tests {
         let cfg_json = serde_json::to_string_pretty(repo_cfg).unwrap();
         std::fs::write(awman_dir.join(REPO_CONFIG_FILENAME), cfg_json).unwrap();
 
-        let env = EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, home_dir.to_str().unwrap())]);
+        let env = EnvSnapshot::with_overrides([(AWMAN_HOME, home_dir.to_str().unwrap())]);
 
         let resolver = crate::data::session::StaticGitRootResolver::new(git_root);
         Session::open(
@@ -1154,10 +1152,7 @@ mod tests {
         let session = session_with_repo_config(
             git_tmp.path(),
             home_tmp.path(),
-            &RepoConfig {
-                auth: Some(AgentAuthMode::Passthrough),
-                ..Default::default()
-            },
+            &serde_json::json!({"agents": {"auth": {"mode": "passthrough"}}}),
         );
         let engine = engine_with(home_tmp.path(), home_tmp.path());
         let agent = crate::data::session::AgentName::new("claude").unwrap();
@@ -1177,10 +1172,7 @@ mod tests {
         let session = session_with_repo_config(
             git_tmp.path(),
             home_tmp.path(),
-            &RepoConfig {
-                auth: Some(AgentAuthMode::None),
-                ..Default::default()
-            },
+            &serde_json::json!({"agents": {"auth": {"mode": "none"}}}),
         );
         let engine = engine_with(home_tmp.path(), home_tmp.path());
         let agent = crate::data::session::AgentName::new("claude").unwrap();
@@ -1203,10 +1195,7 @@ mod tests {
         let session = session_with_repo_config(
             git_tmp.path(),
             home_tmp.path(),
-            &RepoConfig {
-                auth: Some(AgentAuthMode::Keychain),
-                ..Default::default()
-            },
+            &serde_json::json!({"agents": {"auth": {"mode": "keychain"}}}),
         );
         let engine = engine_with(home_tmp.path(), home_tmp.path());
         let agent = crate::data::session::AgentName::new("claude").unwrap();
@@ -1224,7 +1213,7 @@ mod tests {
         let git_tmp = tempfile::tempdir().unwrap();
         let home_tmp = tempfile::tempdir().unwrap();
         let session =
-            session_with_repo_config(git_tmp.path(), home_tmp.path(), &RepoConfig::default());
+            session_with_repo_config(git_tmp.path(), home_tmp.path(), &serde_json::json!({}));
         let engine = engine_with(home_tmp.path(), home_tmp.path());
         let agent = crate::data::session::AgentName::new("claude").unwrap();
         let result = engine.resolve_agent_auth(&session, &agent);
@@ -1247,10 +1236,7 @@ mod tests {
         let session = session_with_repo_config(
             git_tmp.path(),
             home_tmp.path(),
-            &RepoConfig {
-                auth: Some(AgentAuthMode::Keychain),
-                ..Default::default()
-            },
+            &serde_json::json!({"agents": {"auth": {"mode": "keychain"}}}),
         );
         let engine = engine_with(home_tmp.path(), home_tmp.path());
         let agent = crate::data::session::AgentName::new("claude").unwrap();
@@ -1277,10 +1263,7 @@ mod tests {
         let session = session_with_repo_config(
             git_tmp.path(),
             home_tmp.path(),
-            &RepoConfig {
-                auth: Some(AgentAuthMode::Keychain),
-                ..Default::default()
-            },
+            &serde_json::json!({"agents": {"auth": {"mode": "keychain"}}}),
         );
         let engine = engine_with(home_tmp.path(), home_tmp.path());
         for name in [
@@ -1310,15 +1293,7 @@ mod tests {
         let session = session_with_repo_config(
             git_tmp.path(),
             home_tmp.path(),
-            &RepoConfig {
-                auth: Some(AgentAuthMode::Keychain),
-                auth_refresh: Some(AuthRefreshConfig {
-                    enabled: Some(false),
-                    threshold_minutes: None,
-                    tick_seconds: None,
-                }),
-                ..Default::default()
-            },
+            &serde_json::json!({"agents": {"auth": {"mode": "keychain", "refresh": {"enabled": false}}}}),
         );
         let engine = engine_with(home_tmp.path(), home_tmp.path());
         let agent = crate::data::session::AgentName::new("claude").unwrap();
@@ -1352,15 +1327,7 @@ mod tests {
         let session = session_with_repo_config(
             git_tmp.path(),
             home_tmp.path(),
-            &RepoConfig {
-                auth: Some(AgentAuthMode::Keychain),
-                auth_refresh: Some(AuthRefreshConfig {
-                    enabled: Some(false),
-                    threshold_minutes: None,
-                    tick_seconds: None,
-                }),
-                ..Default::default()
-            },
+            &serde_json::json!({"agents": {"auth": {"mode": "keychain", "refresh": {"enabled": false}}}}),
         );
         let engine = engine_with(home_tmp.path(), home_tmp.path());
         let agent = crate::data::session::AgentName::new("claude").unwrap();

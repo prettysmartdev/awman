@@ -163,14 +163,17 @@ pub struct RequiredEnvEntry {
     /// because something declared it.
     pub required_by: Vec<String>,
     /// When the name first entered `required_env` in this daemon's lifetime.
+    #[serde(with = "crate::data::wire::timestamp")]
     pub required_since: DateTime<Utc>,
     /// When a push last supplied a value for it.
+    #[serde(default, with = "crate::data::wire::opt_timestamp")]
     pub last_provided_at: Option<DateTime<Utc>>,
     /// Since when the daemon has had no usable value.
     ///
     /// Stamped when a name first becomes *required* while uncovered — never
     /// when a push happens to omit it — so a typo'd `env(GTIHUB_TOKEN)` reads
     /// as long-unmet rather than newly-unmet. `None` when covered.
+    #[serde(default, with = "crate::data::wire::opt_timestamp")]
     pub unmet_since: Option<DateTime<Utc>>,
     /// Where the held value came from. `None` when the daemon holds none.
     pub source: Option<EnvSource>,

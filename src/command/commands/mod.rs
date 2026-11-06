@@ -15,6 +15,7 @@ pub mod chat;
 pub mod clean;
 pub mod command_trait;
 pub mod config;
+pub mod daemon;
 pub mod exec_prompt;
 pub mod exec_workflow;
 pub mod squad;

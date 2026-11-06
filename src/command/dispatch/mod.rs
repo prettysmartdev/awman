@@ -16,6 +16,7 @@ use crate::command::commands::api_server::{ApiServerCommand, ApiServerCommandFro
 use crate::command::commands::chat::{ChatCommand, ChatCommandFrontend};
 use crate::command::commands::clean::{CleanCommand, CleanCommandFrontend};
 use crate::command::commands::config::{ConfigCommand, ConfigCommandFrontend};
+use crate::command::commands::daemon::api::{DaemonApiCommand, DaemonApiCommandFrontend};
 use crate::command::commands::exec_prompt::{ExecPromptCommand, ExecPromptCommandFrontend};
 use crate::command::commands::exec_workflow::{ExecWorkflowCommand, ExecWorkflowCommandFrontend};
 use crate::command::commands::init::{InitCommand, InitCommandFrontend};
@@ -68,7 +69,7 @@ pub trait CommandFrontend: UserMessageSink + Send + Sync {
     /// Whether there is somewhere to read an answer from right now.
     ///
     /// The frontend reports the *fact*; Layer 2 applies the rule
-    /// ([`ResolvedFlags::is_non_interactive`]). For the CLI the fact is
+    /// ([`ResolvedFlags::is_headless`]). For the CLI the fact is
     /// whether stdin is a terminal, which only the CLI can see; for every
     /// other frontend it follows from the kind, which is why the default
     /// answers from [`FrontendKind::can_ask_a_human`].
@@ -122,6 +123,7 @@ pub trait DispatchFrontend:
     + ExecPromptCommandFrontend
     + ExecWorkflowCommandFrontend
     + ApiServerCommandFrontend
+    + DaemonApiCommandFrontend
     + SquadCommandFrontend
     + SquadAttachFrontend
     + RemoteCommandFrontend
@@ -142,6 +144,7 @@ impl<T> DispatchFrontend for T where
         + ExecPromptCommandFrontend
         + ExecWorkflowCommandFrontend
         + ApiServerCommandFrontend
+        + DaemonApiCommandFrontend
         + SquadCommandFrontend
         + SquadAttachFrontend
         + RemoteCommandFrontend
@@ -167,6 +170,7 @@ pub enum BuiltCommand {
     ExecPrompt(ExecPromptCommand),
     ExecWorkflow(ExecWorkflowCommand),
     ApiServer(ApiServerCommand),
+    DaemonApi(DaemonApiCommand),
     Squad(SquadCommand),
     SquadAttach(SquadAttachCommand),
     Remote(RemoteCommand),
@@ -298,7 +302,7 @@ impl<F: CommandFrontend> Dispatch<F> {
     /// Callers used to gate this on `path.first() == Some("squad")`, a
     /// command-name fact restated in Layer 3 (WI 0114 F-15). `gateway_need`
     /// is the same fact where the catalogue can maintain it.
-    pub fn with_squad_gateway(mut self, gateway: Arc<dyn TaskGateway>) -> Self {
+    pub fn with_task_gateway(mut self, gateway: Arc<dyn TaskGateway>) -> Self {
         self.squad_gateway = Some(gateway);
         self
     }
@@ -318,6 +322,34 @@ impl<F: CommandFrontend> Dispatch<F> {
         ResolvedFlags::resolve(&self.frontend, &canonical, spec)
     }
 
+    /// Apply this invocation's global `--set key=value` flags to the session
+    /// clone one command is built with.
+    ///
+    /// The CLI's `--set` is part of argv, so `main` already applied it to the
+    /// process session at startup. The TUI command box and API `args` carry a
+    /// `--set` per command: it changes that one command's session, never the
+    /// tab's or the server's.
+    fn apply_set_overrides(
+        &self,
+        path: &[&str],
+        session: &mut Session,
+    ) -> Result<(), CommandError> {
+        if self.frontend.kind() == FrontendKind::Cli {
+            return Ok(());
+        }
+        let set = self.frontend.flag_strings(path, catalogue::SET_FLAG)?;
+        if set.is_empty() {
+            return Ok(());
+        }
+        let overrides = crate::data::config::overrides::ConfigOverrides::parse_set_args(&set)
+            .map_err(|e| CommandError::InvalidFlagValue {
+                command: path.iter().map(|p| (*p).to_string()).collect(),
+                flag: catalogue::SET_FLAG.into(),
+                reason: e.to_string(),
+            })?;
+        session.add_overrides(overrides).map_err(CommandError::from)
+    }
+
     /// Read flags from the frontend and construct the typed `*Command`. No
     /// engine work happens at this point — the command is "ready to run".
     ///
@@ -333,12 +365,17 @@ impl<F: CommandFrontend> Dispatch<F> {
         let args = ResolvedArgs::resolve(&self.frontend, &canonical, spec.arguments)?;
         // Read the session from the shared state so every command operates
         // in the correct working directory (tab-specific in the TUI).
-        let session = self
+        let mut session = self
             .session
             .try_read()
             .map_err(|_| CommandError::Other("session is write-locked".into()))?
             .clone();
+        self.apply_set_overrides(&canonical, &mut session)?;
         let ctx = BuildContext {
+            remote_target: self.frontend.flag_string(&canonical, "remote")?,
+            set_args: crate::data::config::overrides::forwardable_set_args(
+                &self.frontend.flag_strings(&canonical, "set")?,
+            ),
             flags: &flags,
             args: &args,
             engines: &self.engines,
@@ -392,6 +429,10 @@ impl<F: CommandFrontend> Dispatch<F> {
         context_flags.squad_prerequisites = !with_check;
         session.set_flags(context_flags);
         let ctx = BuildContext {
+            remote_target: self.frontend.flag_string(&canonical, "remote")?,
+            set_args: crate::data::config::overrides::forwardable_set_args(
+                &self.frontend.flag_strings(&canonical, "set")?,
+            ),
             flags: &flags,
             args: &args,
             engines: &self.engines,
@@ -663,6 +704,7 @@ impl BuiltCommand {
             Config => ConfigCommandFrontend,
             ExecPrompt => ExecPromptCommandFrontend,
             ApiServer => ApiServerCommandFrontend,
+            DaemonApi => DaemonApiCommandFrontend,
             Squad => SquadCommandFrontend,
             SquadAttach => SquadAttachFrontend,
             Remote => RemoteCommandFrontend,
@@ -710,31 +752,12 @@ pub(crate) fn parse_squad_agent_models(
     })
 }
 
-/// Convert the catalogue-validated launch-mode enum into the Layer 0 type.
-/// Keeping this conversion at the dispatch boundary means command wiring only
-/// ever sees a typed `LaunchMode`.
-pub(crate) fn parse_launch_mode(
-    raw: Option<String>,
-    command: &[&str],
-) -> Result<Option<crate::data::config::repo::LaunchMode>, CommandError> {
-    match raw.as_deref() {
-        None => Ok(None),
-        Some("stdio") => Ok(Some(crate::data::config::repo::LaunchMode::Stdio)),
-        Some("acp") => Ok(Some(crate::data::config::repo::LaunchMode::Acp)),
-        Some(value) => Err(CommandError::InvalidFlagValue {
-            command: command.iter().map(|part| (*part).to_string()).collect(),
-            flag: "launch-mode".into(),
-            reason: format!("unknown enum value {value:?}"),
-        }),
-    }
-}
-
 /// Typed `--on-dirty-merge-target`: `None` when not passed, so config and the
 /// host's headless default apply.
 pub(crate) fn parse_on_dirty_merge_target(
     raw: Option<String>,
     command: &[&str],
-) -> Result<Option<crate::data::config::repo::OnDirtyMergeTarget>, CommandError> {
+) -> Result<Option<crate::data::config::worktree::OnDirtyMergeTarget>, CommandError> {
     raw.map(|value| {
         value
             .parse()
@@ -751,7 +774,7 @@ pub(crate) fn parse_on_dirty_merge_target(
 pub(crate) fn parse_on_merge_failure(
     raw: Option<String>,
     command: &[&str],
-) -> Result<Option<crate::data::config::repo::OnMergeFailure>, CommandError> {
+) -> Result<Option<crate::data::config::worktree::OnMergeFailure>, CommandError> {
     raw.map(|value| {
         value
             .parse()
@@ -800,7 +823,7 @@ pub(crate) fn parse_agent_flags(
     if raw.is_empty() {
         return Ok(None);
     }
-    crate::data::config::repo::validate_agent_flag_values("--agent-flag", raw).map_err(|e| {
+    crate::data::config::agents::validate_agent_flag_values("--agent-flag", raw).map_err(|e| {
         CommandError::InvalidFlagValue {
             command: command.iter().map(|part| (*part).to_string()).collect(),
             flag: "agent-flag".into(),
@@ -1169,26 +1192,12 @@ mod tests {
         assert!(matches!(built, BuiltCommand::Config(_)));
     }
 
-    /// A built config command keeps the once-per-repo state of the host's
-    /// bundle, so a notice is not repeated for each command the host runs.
     #[test]
-    fn build_config_shares_the_bundles_notices_handle() {
-        let engines = Engines::for_tests(std::path::Path::new("/tmp"));
-        let notices = engines.config_notices.clone();
-        let dispatch = Dispatch::new(FakeCommandFrontend::new(), make_session(), engines);
-        let BuiltCommand::Config(command) = dispatch.build_command(&["config", "show"]).unwrap()
-        else {
-            panic!("expected Config");
-        };
-        assert!(Arc::ptr_eq(command.notices(), &notices));
-    }
-
-    #[test]
-    fn build_config_get_with_field_argument() {
+    fn build_config_get_with_key_argument() {
         let mut frontend = FakeCommandFrontend::new();
         frontend
             .args
-            .insert("field".into(), "terminal_scrollback_lines".into());
+            .insert("key".into(), "tui.scrollbackLines".into());
         let dispatch = Dispatch::new(
             frontend,
             make_session(),
@@ -1226,11 +1235,9 @@ mod tests {
     }
 
     #[test]
-    fn build_api_start_with_port() {
-        let mut frontend = FakeCommandFrontend::new();
-        frontend.u16s.insert("port".into(), 1234);
+    fn build_api_start() {
         let dispatch = Dispatch::new(
-            frontend,
+            FakeCommandFrontend::new(),
             make_session(),
             Engines::for_tests(std::path::Path::new("/tmp")),
         );
@@ -1545,7 +1552,7 @@ mod tests {
     fn parse_command_box_input_short_flag_non_interactive() {
         let parsed = Dispatch::<FakeCommandFrontend>::parse_command_box_input("ready -n").unwrap();
         assert_eq!(parsed.path, vec!["ready"]);
-        assert_eq!(parsed.args.flag_bool("non-interactive"), Some(true));
+        assert_eq!(parsed.args.flag_bool("headless"), Some(true));
     }
 
     #[test]

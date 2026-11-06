@@ -100,7 +100,7 @@ fn task(name: &str) -> Task {
     let now = chrono::Utc::now();
     Task {
         prerequisites: None,
-        id: format!("task-{name}"),
+        id: awman::data::ids::TaskId::new(),
         name: name.to_string(),
         description: "recorded task".into(),
         repo_scope: Path::new("/recorded/repo").to_path_buf(),
@@ -153,8 +153,8 @@ impl TaskGateway for RecordingGateway {
     async fn runs(&self, name: &str, limit: usize) -> Result<Vec<Run>, CommandError> {
         self.push(format!("runs:{name}:{limit}"));
         Ok(vec![Run {
-            id: "run-recorded".into(),
-            task_id: format!("task-{name}"),
+            id: awman::data::ids::RunId::new(),
+            task_id: awman::data::ids::TaskId::new(),
             status: RunStatus::NotTriggered,
             workflow_path: None,
             workflow_state_path: None,
@@ -223,10 +223,15 @@ fn engines_at(root: &Path) -> Engines {
         overlay_engine: overlay_engine.clone(),
         auth_engine: Arc::new(AuthEngine::with_paths(auth_paths, api_paths.clone())),
         agent_engine: Arc::new(AgentEngine::new(overlay_engine, runtime)),
-        config_notices: Default::default(),
         workflow_state_store: Arc::new(WorkflowStateStore::at_git_root(api_paths.root())),
         credential_monitor: None,
-        global_config: std::sync::Arc::new(Default::default()),
+        global_config: std::sync::Arc::new(
+            awman::data::config::ConfigFile::load(
+                &root.join("config.json"),
+                awman::data::config::FileKind::Global,
+            )
+            .unwrap(),
+        ),
     }
 }
 
@@ -277,7 +282,7 @@ async fn run_cli(
         Arc::new(tokio::sync::RwLock::new(session.clone())),
         engines,
     )
-    .with_squad_gateway(gateway);
+    .with_task_gateway(gateway);
     let built = dispatch
         .build_command(&path_refs)
         .unwrap_or_else(|error| panic!("CLI failed to build {raw}: {error}"));
@@ -303,7 +308,7 @@ async fn run_tui(
         Arc::new(tokio::sync::RwLock::new(session.clone())),
         engines,
     )
-    .with_squad_gateway(gateway);
+    .with_task_gateway(gateway);
     let built = dispatch
         .build_command(&path_refs)
         .unwrap_or_else(|error| panic!("TUI failed to build {raw}: {error}"));
@@ -480,11 +485,11 @@ async fn cli_dispatch_succeeds_with_an_empty_home_and_never_reads_awman_db() {
     let _env_guard = ENV_LOCK.lock().await;
     let home = tempfile::tempdir().expect("temporary home");
     let previous_home = std::env::var("HOME").ok();
-    let previous_config = std::env::var("AWMAN_CONFIG_HOME").ok();
-    let previous_squad = std::env::var("AWMAN_SQUAD_ROOT").ok();
+    let previous_config = std::env::var("AWMAN_HOME").ok();
+    let previous_squad = std::env::var("AWMAN_HOME").ok();
     std::env::set_var("HOME", home.path());
-    std::env::set_var("AWMAN_CONFIG_HOME", home.path().join("config"));
-    std::env::set_var("AWMAN_SQUAD_ROOT", home.path().join("squad"));
+    std::env::set_var("AWMAN_HOME", home.path().join("config"));
+    std::env::set_var("AWMAN_HOME", home.path().join("squad"));
 
     let env = helpers::IsolatedEnv::new();
     let session = env.open_session();
@@ -502,12 +507,12 @@ async fn cli_dispatch_succeeds_with_an_empty_home_and_never_reads_awman_db() {
         None => std::env::remove_var("HOME"),
     }
     match previous_config {
-        Some(value) => std::env::set_var("AWMAN_CONFIG_HOME", value),
-        None => std::env::remove_var("AWMAN_CONFIG_HOME"),
+        Some(value) => std::env::set_var("AWMAN_HOME", value),
+        None => std::env::remove_var("AWMAN_HOME"),
     }
     match previous_squad {
-        Some(value) => std::env::set_var("AWMAN_SQUAD_ROOT", value),
-        None => std::env::remove_var("AWMAN_SQUAD_ROOT"),
+        Some(value) => std::env::set_var("AWMAN_HOME", value),
+        None => std::env::remove_var("AWMAN_HOME"),
     }
 
     result.expect("CLI dispatch must use the injected gateway without a database");
@@ -557,12 +562,7 @@ async fn a_running_need_with_no_key_in_this_shell_is_refused_before_the_request(
 
     let restore = ScopedProcessEnv::set(&[
         ("HOME", home.path().to_str().unwrap()),
-        (
-            "AWMAN_CONFIG_HOME",
-            home.path().join("config").to_str().unwrap(),
-        ),
-        ("AWMAN_API_ROOT", home.path().join("api").to_str().unwrap()),
-        ("AWMAN_SQUAD_ROOT", squad_root.to_str().unwrap()),
+        ("AWMAN_HOME", home.path().to_str().unwrap()),
         // An empty key is treated as unset, which is the state under test.
         ("AWMAN_SQUAD_KEY", ""),
     ]);
@@ -668,15 +668,16 @@ fn init_repo(path: &Path) {
 
 #[cfg(unix)]
 /// Start the daemon in-process. The returned [`InProcessDaemon`] keeps
-/// `AWMAN_CONFIG_HOME` / `AWMAN_SQUAD_ROOT` pointed at `root` until it is
+/// `AWMAN_HOME` / `AWMAN_HOME` pointed at `root` until it is
 /// aborted (or dropped by a panicking test), then restores them.
 async fn start_daemon(root: &Path) -> (InProcessDaemon, String, FakeAwmanProcess) {
+    std::fs::write(
+        root.join("config.json"),
+        r#"{"daemon":{"features":{"squad":{"enabled":true}}}}"#,
+    )
+    .unwrap();
     let engines = engines_at(root);
-    let squad_root = root.join("squad");
-    let env = EnvOverride::set(&[
-        ("AWMAN_CONFIG_HOME", root.as_os_str()),
-        ("AWMAN_SQUAD_ROOT", squad_root.as_os_str()),
-    ]);
+    let env = EnvOverride::set(&[("AWMAN_HOME", root.as_os_str())]);
     let daemon_guard = DaemonGuard::for_daemon(DaemonKind::Squad, &Env::from_process())
         .expect("test daemon guard");
     let holder = FakeAwmanProcess::spawn("squad");
@@ -888,8 +889,7 @@ fn run_binary(root: &Path, cwd: &Path, args: &[&str]) -> Output {
         .args(args)
         .current_dir(cwd)
         .env("HOME", &home)
-        .env("AWMAN_CONFIG_HOME", root)
-        .env("AWMAN_SQUAD_ROOT", root.join("squad"))
+        .env("AWMAN_HOME", root)
         // If this ever has to start a daemon, keep it off the keychain and
         // launchd / systemd, whose squad item, label and unit are one fixed
         // name each — and never send the developer's own squad key.
@@ -984,10 +984,9 @@ fn stdout_json(output: &Output) -> Value {
     })
 }
 
-async fn daemon_command(base: &str, subcommand: &str, args: &[&str]) -> Value {
+async fn daemon_resource(base: &str, path: &str) -> Value {
     reqwest::Client::new()
-        .post(format!("{base}/v1/commands"))
-        .json(&serde_json::json!({ "subcommand": subcommand, "args": args }))
+        .get(format!("{base}{path}"))
         .send()
         .await
         .expect("daemon command request")
@@ -1038,12 +1037,10 @@ async fn cli_crud_round_trip_and_json_payloads_match_the_live_daemon() {
         &repo,
         &["squad", "list", "--json"],
     ));
-    let list_payload = list_json
-        .get("payload")
-        .expect("CLI list JSON must contain a payload");
+    let list_payload = &list_json;
     assert_eq!(
         list_payload,
-        &daemon_command(&base, "squad list", &[]).await
+        &daemon_resource(&base, "/v1/squad/tasks").await
     );
 
     let show_json = stdout_json(&run_binary(
@@ -1051,12 +1048,14 @@ async fn cli_crud_round_trip_and_json_payloads_match_the_live_daemon() {
         &repo,
         &["squad", "show", "cli-roundtrip", "--json"],
     ));
-    let show_payload = show_json
-        .get("payload")
-        .expect("CLI show JSON must contain a payload");
+    let show_payload = &show_json;
+    let id = list_payload["items"][0]["id"].as_str().unwrap();
     assert_eq!(
         show_payload,
-        &daemon_command(&base, "squad show", &["cli-roundtrip"]).await
+        &serde_json::json!({
+            "task":daemon_resource(&base, &format!("/v1/squad/tasks/{id}")).await,
+            "runs":daemon_resource(&base, &format!("/v1/squad/tasks/{id}/runs")).await,
+        })
     );
 
     let pause = run_binary(root.path(), &repo, &["squad", "pause", "cli-roundtrip"]);
@@ -1066,7 +1065,7 @@ async fn cli_crud_round_trip_and_json_payloads_match_the_live_daemon() {
         &repo,
         &["squad", "show", "cli-roundtrip", "--json"],
     ));
-    assert_eq!(paused["payload"]["task"]["status"], "paused");
+    assert_eq!(paused["task"]["status"], "paused");
 
     let resume = run_binary(root.path(), &repo, &["squad", "resume", "cli-roundtrip"]);
     assert!(resume.status.success(), "squad resume failed");
@@ -1075,7 +1074,7 @@ async fn cli_crud_round_trip_and_json_payloads_match_the_live_daemon() {
         &repo,
         &["squad", "show", "cli-roundtrip", "--json"],
     ));
-    assert_eq!(resumed["payload"]["task"]["status"], "active");
+    assert_eq!(resumed["task"]["status"], "active");
 
     let status_json = stdout_json(&run_binary(
         root.path(),
@@ -1096,7 +1095,7 @@ async fn cli_crud_round_trip_and_json_payloads_match_the_live_daemon() {
         .expect("CLI status payload must be an object")
         .keys()
         .collect();
-    let mut daemon_keys: Vec<_> = daemon_status
+    let mut daemon_keys: Vec<_> = daemon_status["features"]["squad"]["detail"]
         .as_object()
         .expect("daemon status response must be an object")
         .keys()
@@ -1119,7 +1118,10 @@ async fn cli_crud_round_trip_and_json_payloads_match_the_live_daemon() {
         &repo,
         &["squad", "list", "--json"],
     ));
-    assert_eq!(final_list["payload"], serde_json::json!([]));
+    assert_eq!(
+        final_list,
+        serde_json::json!({"items":[],"next_cursor":null})
+    );
 
     daemon.abort();
 }
@@ -1133,7 +1135,7 @@ fn json_cli_failure_is_a_structured_error_with_nonzero_exit() {
     let root = tempfile::tempdir().expect("temporary root");
     let repo = root.path().join("repo");
     init_repo(&repo);
-    let invalid_squad_root = root.path().join("squad-file");
+    let invalid_squad_root = root.path().join("squad");
     std::fs::write(&invalid_squad_root, "not a directory").expect("invalid squad root fixture");
 
     let home = root.path().join("home");
@@ -1143,8 +1145,7 @@ fn json_cli_failure_is_a_structured_error_with_nonzero_exit() {
         .args(["squad", "list", "--json"])
         .current_dir(&repo)
         .env("HOME", &home)
-        .env("AWMAN_CONFIG_HOME", root.path().join("config"))
-        .env("AWMAN_SQUAD_ROOT", &invalid_squad_root);
+        .env("AWMAN_HOME", root.path());
     let output = output_awman(&mut command);
 
     assert!(

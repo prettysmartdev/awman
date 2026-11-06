@@ -190,7 +190,7 @@ pub enum ContainerOption {
     /// `interactive_seed_delivery` is `Flag`.
     InteractiveSeedFlag(String),
     Interactive(bool),
-    /// Structured stdout protocol for a non-interactive stdio launch.
+    /// Structured stdout protocol for a headless stdio launch.
     AgentOutputFormat(AgentOutputFormat),
     /// Launch the agent over ACP (Agent Client Protocol) instead of raw
     /// container stdio. Selects the persistent-piped spawn path (`-i`, no PTY)

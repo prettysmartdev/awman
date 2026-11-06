@@ -22,7 +22,7 @@
 use std::path::Path;
 use std::sync::{Arc, Barrier};
 
-use awman::data::config::env::{EnvSnapshot, AWMAN_API_ROOT, AWMAN_CONFIG_HOME, AWMAN_SQUAD_ROOT};
+use awman::data::config::env::{EnvSnapshot, AWMAN_HOME};
 use awman::data::fs::{ApiPaths, SquadPaths};
 use awman::engine::daemon::{DaemonGuard, DaemonKind};
 use awman::engine::error::EngineError;
@@ -31,15 +31,16 @@ use awman::engine::error::EngineError;
 mod fake_awman;
 use fake_awman::FakeAwmanProcess;
 
-/// `AWMAN_CONFIG_HOME` is scoped to a fixture too: `DaemonGuard`'s shared
+/// `AWMAN_HOME` is scoped to a fixture too: `DaemonGuard`'s shared
 /// startup-arbitration lock lives beside the shared database, and a test must
 /// never touch the developer's real `~/.awman`.
-fn env_for(api_root: &Path, squad_root: &Path) -> EnvSnapshot {
-    EnvSnapshot::with_overrides([
-        (AWMAN_API_ROOT, api_root.to_str().unwrap()),
-        (AWMAN_SQUAD_ROOT, squad_root.to_str().unwrap()),
-        (AWMAN_CONFIG_HOME, api_root.to_str().unwrap()),
-    ])
+fn env_for(api_root: &Path, _squad_root: &Path) -> EnvSnapshot {
+    let home = if api_root.file_name().is_some_and(|n| n == "api") {
+        api_root.parent().unwrap()
+    } else {
+        api_root
+    };
+    EnvSnapshot::with_overrides([(AWMAN_HOME, home.to_str().unwrap())])
 }
 
 // ─── Both directions ──────────────────────────────────────────────────────
@@ -252,7 +253,6 @@ fn engines_at(root: &Path) -> Engines {
         overlay_engine: overlay_engine.clone(),
         auth_engine: Arc::new(AuthEngine::with_paths(auth_paths, api_paths.clone())),
         agent_engine: Arc::new(AgentEngine::new(overlay_engine, runtime)),
-        config_notices: Default::default(),
         workflow_state_store: Arc::new(WorkflowStateStore::at_git_root(api_paths.root())),
         credential_monitor: None,
         global_config: std::sync::Arc::new(Default::default()),
@@ -304,11 +304,7 @@ async fn a_live_api_daemon_stops_squad_startup_before_any_store_pidfile_or_port(
     let api_guard = DaemonGuard::for_daemon(DaemonKind::Api, &env).unwrap();
     api_guard.acquire(fake_api.id()).unwrap();
 
-    let _scoped = ScopedEnv::set(&[
-        (AWMAN_API_ROOT, &api_root),
-        (AWMAN_SQUAD_ROOT, &squad_root),
-        (AWMAN_CONFIG_HOME, home.path()),
-    ]);
+    let _scoped = ScopedEnv::set(&[(AWMAN_HOME, home.path())]);
 
     let command = SquadDaemon::new(
         SquadDaemonSubcommand::Start(SquadStartFlags {

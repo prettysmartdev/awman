@@ -1,6 +1,6 @@
 //! `InitFrontend` impl for the TUI.
 
-use crate::data::config::repo::WorkItemsConfig;
+use crate::data::config::work_items::WorkItemsConfig;
 use crate::data::message::UserMessageSink;
 use crate::data::prompt::Prompt;
 use crate::engine::error::EngineError;

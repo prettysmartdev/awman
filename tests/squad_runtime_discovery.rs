@@ -196,7 +196,15 @@ fn cli_available(bin: &str, args: &[&str]) -> bool {
 /// nothing about awman's own run path is involved in the fixture.
 fn start_container(cli: &str, name: &str) -> bool {
     Command::new(cli)
-        .args(["run", "-d", "--name", name, "alpine:latest", "sleep", "120"])
+        .args([
+            "cmd_a53108f7543b75adbb34afc035d4cdf6",
+            "-d",
+            "--name",
+            name,
+            "alpine:latest",
+            "sleep",
+            "120",
+        ])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()

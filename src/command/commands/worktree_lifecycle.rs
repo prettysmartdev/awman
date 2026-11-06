@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::command::error::CommandError;
-use crate::data::config::repo::{OnDirtyMergeTarget, OnMergeFailure};
+use crate::data::config::worktree::{OnDirtyMergeTarget, OnMergeFailure};
 use crate::data::merge_fix_prompt::has_conflict_markers;
 use crate::data::message::{MessageLevel, UserMessage};
 use crate::engine::error::{EngineError, MergeFailedDetail};

@@ -2,12 +2,13 @@
 
 use crate::data::error::DataError;
 use crate::data::fs::private_files::{create_private_dir, write_private_json_atomic};
+use crate::data::ids::GrantId;
 use crate::data::workflow_prerequisites::GitRemoteUrl;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 pub const PREREQUISITE_GRANTS_FILENAME: &str = "prerequisite-grants.json";
-pub const PREREQUISITE_GRANTS_VERSION: u32 = 1;
+pub const PREREQUISITE_GRANTS_VERSION: u32 = 2;
 pub const PREREQUISITE_GRANTS_MAX_BYTES: usize = 1024 * 1024;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -32,6 +33,8 @@ pub enum RememberedGrant {
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GrantRecord {
+    #[serde(default)]
+    pub id: GrantId,
     pub key: GrantKey,
     pub grant: RememberedGrant,
     pub recorded_at: String,
@@ -43,9 +46,8 @@ pub struct GrantStoreFile {
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GrantSelector {
-    Index(usize),
+    Id(GrantId),
     All,
-    Key(GrantKey),
 }
 #[derive(Debug, Clone)]
 pub struct PrerequisiteGrantStore {
@@ -59,7 +61,14 @@ impl PrerequisiteGrantStore {
         data_home.join(PREREQUISITE_GRANTS_FILENAME)
     }
     pub fn load(data_home: &Path) -> Self {
+        Self::load_inner(data_home, true)
+    }
+    fn load_without_persist(data_home: &Path) -> Self {
+        Self::load_inner(data_home, false)
+    }
+    fn load_inner(data_home: &Path, persist_ids: bool) -> Self {
         let path = Self::path_for(data_home);
+        let mut needs_persist = false;
         let loaded = (|| {
             use std::io::Read;
             let mut options = std::fs::OpenOptions::new();
@@ -104,9 +113,20 @@ impl PrerequisiteGrantStore {
             }
             let mut file: GrantStoreFile =
                 serde_json::from_slice(&bytes).map_err(|_| "corrupt file")?;
-            if file.version != PREREQUISITE_GRANTS_VERSION {
+            if !matches!(file.version, 1 | PREREQUISITE_GRANTS_VERSION) {
                 return Err("unsupported version");
             }
+            let had_ids = serde_json::from_slice::<serde_json::Value>(&bytes)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("records")
+                        .and_then(serde_json::Value::as_array)
+                        .cloned()
+                })
+                .is_some_and(|records| records.iter().all(|record| record.get("id").is_some()));
+            needs_persist = file.version != PREREQUISITE_GRANTS_VERSION || !had_ids;
+            file.version = PREREQUISITE_GRANTS_VERSION;
             for record in &mut file.records {
                 if !record.key.git_root.is_absolute() || !valid_decision(&record.key, &record.grant)
                 {
@@ -127,6 +147,18 @@ impl PrerequisiteGrantStore {
                 (None, Some(warning))
             }
         };
+        if persist_ids && needs_persist {
+            if let Some(file) = &file {
+                let persisted = crate::data::fs::private_files::lock_private_exclusive(
+                    &path.with_extension("lock"),
+                    || Ok(()),
+                )
+                .and_then(|_lock| write_private_json_atomic(&path, file, || Ok(())));
+                if let Err(error) = persisted {
+                    tracing::warn!(%error, path = %path.display(), "could not persist migrated prerequisite grant IDs");
+                }
+            }
+        }
         Self {
             path,
             file: file.unwrap_or(GrantStoreFile {
@@ -159,9 +191,17 @@ impl PrerequisiteGrantStore {
             &self.path.with_extension("lock"),
             || Ok(()),
         )?;
-        let mut file = Self::load(parent).file;
+        let mut file = Self::load_without_persist(parent).file;
+        self.preserve_assigned_ids(&mut file);
+        let id = file
+            .records
+            .iter()
+            .find(|record| record.key == key && record.grant == grant)
+            .map(|record| record.id.clone())
+            .unwrap_or_default();
         file.records.retain(|r| r.key != key);
         file.records.push(GrantRecord {
+            id,
             key,
             grant,
             recorded_at: chrono::Utc::now().to_rfc3339(),
@@ -177,18 +217,12 @@ impl PrerequisiteGrantStore {
             &self.path.with_extension("lock"),
             || Ok(()),
         )?;
-        let mut file = Self::load(parent).file;
+        let mut file = Self::load_without_persist(parent).file;
+        self.preserve_assigned_ids(&mut file);
         let before = file.records.len();
         match selector {
             GrantSelector::All => file.records.clear(),
-            GrantSelector::Index(i) if *i > 0 && *i <= file.records.len() => {
-                file.records.remove(*i - 1);
-            }
-            GrantSelector::Index(_) => {}
-            GrantSelector::Key(key) => {
-                let key = canonical_key(key)?;
-                file.records.retain(|r| r.key != key);
-            }
+            GrantSelector::Id(id) => file.records.retain(|r| &r.id != id),
         }
         let removed = before - file.records.len();
         self.save(file)?;
@@ -215,6 +249,21 @@ impl PrerequisiteGrantStore {
         self.file = file;
         self.load_warning = None;
         Ok(())
+    }
+
+    /// A v1 record gets an ephemeral ID when loaded. Preserve that ID when a
+    /// subsequent write reloads the file under the lock, as long as the
+    /// record itself is unchanged.
+    fn preserve_assigned_ids(&self, file: &mut GrantStoreFile) {
+        for record in &mut file.records {
+            if let Some(previous) = self.file.records.iter().find(|previous| {
+                previous.key == record.key
+                    && previous.grant == record.grant
+                    && previous.recorded_at == record.recorded_at
+            }) {
+                record.id = previous.id.clone();
+            }
+        }
     }
 }
 fn canonical_key(key: &GrantKey) -> Result<GrantKey, DataError> {
@@ -262,8 +311,40 @@ mod tests {
         assert!(!text.contains("password"));
         let mut store = PrerequisiteGrantStore::load(&home);
         assert_eq!(store.lookup(&key), Some(&grant));
-        assert_eq!(store.revoke(&GrantSelector::Index(1)).unwrap(), 1);
+        let id = store.records()[0].id.clone();
+        assert_eq!(store.revoke(&GrantSelector::Id(id)).unwrap(), 1);
         assert!(store.lookup(&key).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn v1_records_receive_stable_grant_ids_on_first_load() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let path = PrerequisiteGrantStore::path_for(root.path());
+        std::fs::write(&path, r#"{"version":1,"records":[{"key":{"git_root":"/repo","remote_url":"https://example.com/o/r","prerequisite":"github_token"},"grant":{"type":"token_env","var":"GH_TOKEN"},"recorded_at":"2026-01-01T00:00:00Z"}]}"#).unwrap();
+        let mut legacy: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        legacy["records"][0]["key"]["git_root"] = serde_json::json!(root.path());
+        std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let mut store = PrerequisiteGrantStore::load(root.path());
+        let assigned = store.records()[0].id.clone();
+        let persisted: GrantStoreFile =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(persisted.records[0].id, assigned);
+        assert_eq!(persisted.version, PREREQUISITE_GRANTS_VERSION);
+        assert!(assigned.as_str().starts_with("grant_"));
+        let key = store.records()[0].key.clone();
+        let grant = store.records()[0].grant.clone();
+        store.remember(key, grant).unwrap();
+        let reopened = PrerequisiteGrantStore::load(root.path());
+        assert_eq!(reopened.records()[0].id, store.records()[0].id);
+        assert_eq!(
+            reopened.records()[0].id,
+            GrantId::parse(assigned.as_str()).unwrap()
+        );
+        assert_eq!(reopened.file.version, 2);
     }
 
     #[cfg(unix)]
@@ -397,7 +478,7 @@ mod store_tests {
     }
 
     #[test]
-    fn revoke_by_index_key_and_all() {
+    fn revoke_by_id_and_all() {
         let root = tempfile::tempdir().unwrap();
         let state = root.path().join("state");
         let mut store = PrerequisiteGrantStore::load(&state);
@@ -430,11 +511,23 @@ mod store_tests {
                 },
             )
             .unwrap();
-        assert_eq!(store.revoke(&GrantSelector::Index(0)).unwrap(), 0);
-        assert_eq!(store.revoke(&GrantSelector::Index(9)).unwrap(), 0);
-        assert_eq!(store.revoke(&GrantSelector::Index(1)).unwrap(), 1);
+        let a_id = store
+            .records()
+            .iter()
+            .find(|r| r.key == canonical_key(&a).unwrap())
+            .unwrap()
+            .id
+            .clone();
+        assert_eq!(store.revoke(&GrantSelector::Id(a_id)).unwrap(), 1);
         assert!(store.lookup(&a).is_none());
-        assert_eq!(store.revoke(&GrantSelector::Key(b.clone())).unwrap(), 1);
+        let b_id = store
+            .records()
+            .iter()
+            .find(|r| r.key == canonical_key(&b).unwrap())
+            .unwrap()
+            .id
+            .clone();
+        assert_eq!(store.revoke(&GrantSelector::Id(b_id)).unwrap(), 1);
         assert!(store.lookup(&b).is_none());
         assert!(store.lookup(&c).is_some());
         assert_eq!(store.revoke(&GrantSelector::All).unwrap(), 1);
@@ -504,7 +597,7 @@ mod store_tests {
             ("not json".into(), 0o600),
             (r#"{"version":1,"records":[]}"#.into(), 0o644),
             (r#"{"version":1,"records":[]}"#.into(), 0o660),
-            (r#"{"version":2,"records":[]}"#.into(), 0o600),
+            (r#"{"version":3,"records":[]}"#.into(), 0o600),
             (oversized, 0o600),
             // Relative git root.
             (

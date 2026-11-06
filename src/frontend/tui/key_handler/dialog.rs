@@ -93,20 +93,20 @@ pub(super) fn handle(app: &mut App, action: Action) {
         Action::NewMapEntry => {
             // Maps collect a key then a value; lists collect one value.
             // Keep the selected scope and ignore scalar rows.
-            use crate::command::commands::config::ConfigRowShape;
+            use crate::command::commands::config::ConfigRowKind;
             if let Some(Dialog::ConfigShow(state)) = &mut app.active_dialog {
                 if !state.editing && state.new_entry.is_none() {
                     let phase = state
                         .rows
                         .get(state.selected)
                         .and_then(|row| match row.shape {
-                            ConfigRowShape::MapHeader { .. } | ConfigRowShape::MapEntry => {
+                            ConfigRowKind::MapHeader { .. } | ConfigRowKind::MapEntry => {
                                 Some(dialogs::NewMapEntryPhase::Key)
                             }
-                            ConfigRowShape::ListHeader { .. } | ConfigRowShape::ListEntry => {
+                            ConfigRowKind::ListHeader { .. } | ConfigRowKind::ListEntry => {
                                 Some(dialogs::NewMapEntryPhase::ListEntry)
                             }
-                            ConfigRowShape::Scalar => None,
+                            ConfigRowKind::Scalar => None,
                         });
                     if let Some(phase) = phase {
                         state.new_entry = Some(phase);

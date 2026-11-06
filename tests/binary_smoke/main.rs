@@ -49,6 +49,5 @@ mod fatal_cli_errors;
 mod headless_no_tty;
 mod overlay_cli;
 #[cfg(unix)]
-mod prerequisite_grants_cli;
 mod session_worktree;
 mod skill_libraries;

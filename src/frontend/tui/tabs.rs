@@ -139,7 +139,7 @@ impl WorkflowOverviewState {
 pub struct WorkflowViewState {
     pub steps: Vec<WorkflowStepView>,
     pub current_step: Option<String>,
-    /// Effective `maxConcurrentAgents` for the running workflow (WI-0096 §11),
+    /// Effective step-concurrency cap for the running workflow (WI-0096 §11),
     /// set by the frontend when the engine reports a parallel group start.
     /// `None` means unlimited — the overview caps parallel rows at the legacy 3
     /// and renders no "queued" markers, so behavior is unchanged.

@@ -8,14 +8,14 @@ use awman::data::session::AgentName;
 use awman::engine::container::options::OverlayPermission;
 use awman::engine::overlay::{DirectorySpec, OverlayEngine, OverlayRequest, CLAUDE_DENYLIST};
 
-/// Set `AWMAN_CONFIG_HOME` to `home`, run `f`, then restore the previous value
+/// Set `AWMAN_HOME` to `home`, run `f`, then restore the previous value
 /// (even if `f` panics) under the engine binary's shared environment guard.
 fn with_awman_config_home<F, R>(home: &std::path::Path, f: F) -> R
 where
     F: FnOnce() -> R,
 {
     let mut env = crate::process_env::ProcessEnvGuard::lock();
-    env.set("AWMAN_CONFIG_HOME", home);
+    env.set("AWMAN_HOME", home);
     f()
 }
 
@@ -182,7 +182,7 @@ fn build_overlays_includes_skills_mount_when_include_skills_true() {
             &resolver,
             SessionOpenOptions {
                 env: Some(awman::data::config::env::EnvSnapshot::with_overrides([(
-                    "AWMAN_CONFIG_HOME",
+                    "AWMAN_HOME",
                     tmp.path().to_str().unwrap(),
                 )])),
                 ..Default::default()
@@ -231,7 +231,7 @@ fn build_overlays_skills_and_dir_overlay_both_present() {
             &resolver,
             SessionOpenOptions {
                 env: Some(awman::data::config::env::EnvSnapshot::with_overrides([(
-                    "AWMAN_CONFIG_HOME",
+                    "AWMAN_HOME",
                     tmp.path().to_str().unwrap(),
                 )])),
                 ..Default::default()

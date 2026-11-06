@@ -28,8 +28,8 @@ pub const TIPS: &[&str] = &[
     "`awman exec prompt --issue 42` uses a GitHub issue as the prompt.",
     "`--yolo` enables fully autonomous mode; `--auto` enables auto permission mode.",
     "`--agent-flag=--verbose` passes an extra argument straight to the agent command.",
-    "`--launch-mode acp` launches the agent over ACP instead of a raw terminal.",
-    "`-n` runs the agent in non-interactive (print) mode instead of an interactive session.",
+    "`--set agents.launchMode=acp` launches the agent over ACP instead of a raw terminal.",
+    "`-n` (`--headless`) runs the agent in print mode instead of an interactive session.",
     // ── Workflows ────────────────────────────────────────────────────────────
     "`awman exec workflow <file>` (or `awman exec wf`) runs a multi-step workflow.",
     "`awman exec workflow <file> --work-item 0042` fills workflow templates from a work item.",
@@ -37,7 +37,7 @@ pub const TIPS: &[&str] = &[
     "`awman exec workflow --dynamic --work-item 0042` lets a leader agent design the workflow.",
     "`awman exec workflow <file> --worktree` runs in an isolated Git worktree.",
     "`--yolo` and `--auto` on a workflow imply `--worktree`, keeping your checkout untouched.",
-    "`awman exec workflow <file> --max-concurrent 2` caps how many steps run in parallel.",
+    "`--set workflows.maxConcurrentSteps=2` caps how many workflow steps run in parallel.",
     "`awman exec workflow <file> --check-prerequisites` reports what setup and teardown steps need.",
     "`awman exec workflow <file> --on-existing-worktree resume` skips the existing-worktree question.",
     "`awman exec workflow <file> --on-merge-failure agent` has an agent fix a failed merge-back.",
@@ -97,12 +97,12 @@ pub const TIPS: &[&str] = &[
     "`awman config show` lists every setting at global and repo level.",
     "`awman config get <field>` shows a setting's global, repo and effective values.",
     "`awman config set <field> <value> --global` writes to global instead of repo config.",
-    "`awman config migrate` moves a repo's `dynamicWorkflows` block into `workflows.dynamic`.",
-    "`awman config prerequisite-grants list` shows the workflow credential choices awman remembers.",
+    "`awman config set <key> <value>` writes the file the key belongs in and prints its path.",
+    "`--set key=value` overrides any config key for one run; `awman config show` lists them.",
     // ── Runtimes and security ────────────────────────────────────────────────
     "Agents never run on your host: they run in Docker, Apple Containers, Docker Sandboxes or a microVM.",
     "`awman config set runtime apple-containers --global` switches to Apple Containers.",
-    "On Apple Silicon Macs, the `builtin-experimental` runtime runs each agent in a microVM.",
+    "On Apple Silicon Macs, the experimental `builtin` runtime runs each agent in a microVM.",
     "The builtin runtime's `network` setting can be `public`, `allowlist` or `none`.",
     "Only the current Git repo root is mounted into agents — never its parent directories.",
     "`--allow-docker` mounts the host Docker socket into the agent; use it only when needed.",
@@ -119,7 +119,7 @@ pub const TIPS: &[&str] = &[
     "`awman api status` and `awman api logs` check on the background API server.",
     "`awman remote exec workflow <file> --follow` runs a workflow on a remote awman host.",
     "Set `remote.defaultAddr` in global config so `awman remote` commands need no `--remote-addr`.",
-    "`awman api start --workdir-root ~/src` lets API sessions use any repo cloned under `~/src`.",
+    "`daemon.features.worker.push.workDirs.roots` lets API sessions use any repo cloned under one.",
 ];
 
 /// Select a tip using the current unix-second as a seed. Seconds (not nanos)
@@ -170,7 +170,9 @@ mod tests {
         for token in tokens {
             if let Some(long) = token.strip_prefix("--") {
                 let name = long.split('=').next().unwrap_or(long);
-                if spec.find_flag(name).is_none() {
+                if spec.find_flag(name).is_none()
+                    && CommandCatalogue::get().find_global_flag(name).is_none()
+                {
                     return Err(format!("unknown flag `--{name}` in `{invocation}`"));
                 }
             } else if let Some(short) = token.strip_prefix('-') {

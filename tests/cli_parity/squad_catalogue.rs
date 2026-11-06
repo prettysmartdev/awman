@@ -48,19 +48,19 @@ fn squad_is_a_top_level_command_with_its_root_flags() {
         "squad must be in the top-level catalogue"
     );
 
-    assert_eq!(flag_names(&["squad"]), vec!["json", "non-interactive"]);
+    assert_eq!(flag_names(&["squad"]), vec!["headless", "json"]);
     assert!(cat()
         .lookup(&["squad"])
         .unwrap()
         .find_flag("json")
         .unwrap()
         .implies
-        .contains(&"non-interactive"));
+        .contains(&"headless"));
 
     let non_interactive = cat()
         .lookup(&["squad"])
         .unwrap()
-        .find_flag("non-interactive")
+        .find_flag("headless")
         .unwrap();
     assert_eq!(non_interactive.short, Some('n'));
     assert!(matches!(non_interactive.kind, FlagKind::Bool));
@@ -85,12 +85,12 @@ fn every_squad_subcommand_has_the_contract_shape() {
                 // WI 0110: the task-scoped agent pool, shared with `squad edit`.
                 "agent-models",
                 "description",
+                "headless",
                 "interval",
                 "interview",
                 "model",
                 "mount-scope",
                 "name",
-                "non-interactive",
                 // WI 0106: task overlays and the default-vs-custom workspace
                 // choice are part of `squad add`'s scripted surface.
                 "overlay",
@@ -117,10 +117,10 @@ fn every_squad_subcommand_has_the_contract_shape() {
                 "clear-model",
                 "clear-overlays",
                 "description",
+                "headless",
                 "interval",
                 "interview",
                 "model",
-                "non-interactive",
                 "overlay",
                 "prerequisite-identity",
                 "prerequisite-ssh",
@@ -187,7 +187,7 @@ fn squad_flag_types_and_short_forms_are_projection_safe() {
         add.find_flag("mount-scope").unwrap().kind,
         FlagKind::Enum(_)
     ));
-    assert_eq!(add.find_flag("non-interactive").unwrap().short, Some('n'));
+    assert_eq!(add.find_flag("headless").unwrap().short, Some('n'));
 
     let logs = cat().lookup(&["squad", "logs"]).unwrap();
     assert_eq!(logs.find_flag("follow").unwrap().short, Some('f'));

@@ -166,7 +166,7 @@ mod tests {
     #[test]
     fn a_different_value_is_sent() {
         let salt = Salt::random();
-        let digest = coverage_digest(&salt, "TOKEN", "old");
+        let digest = coverage_digest(&salt, "TOKEN", "cmd_149603e6c03516362a8da23f624db945");
         let coverage = coverage(&salt, vec![entry("TOKEN", Some(&digest))]);
 
         let push = plan_push(&coverage, &|_| Some("new".to_string()), false);

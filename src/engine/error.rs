@@ -480,7 +480,7 @@ pub enum EngineError {
     },
 
     #[error(
-        "custom agent '{name}' runs only on container runtimes (docker, apple, builtin-experimental); '{runtime}' is not supported for custom agents yet"
+        "custom agent '{name}' runs only on container runtimes (runtime.kind docker, apple or builtin); '{runtime}' is not supported for custom agents yet"
     )]
     CustomAgentRuntimeUnsupported { name: String, runtime: String },
     #[error("{0}")]

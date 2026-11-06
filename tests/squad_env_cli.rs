@@ -10,7 +10,7 @@
 //! built binary can, which is what this file does — and the sync-on-spawn is
 //! the half of §4a that arms a daemon the user never had to think about.
 //!
-//! The daemon is started with an isolated `AWMAN_CONFIG_HOME`/`AWMAN_SQUAD_ROOT`
+//! The daemon is started with an isolated `AWMAN_HOME`
 //! and stopped again by the test, so nothing here touches the developer's own
 //! `~/.awman`. Skipped when the built binary cannot be found.
 
@@ -55,8 +55,7 @@ fn run(binary: &Path, root: &Path, extra: &[(&str, &str)], args: &[&str]) -> Out
     command
         .args(args)
         .current_dir(root)
-        .env("AWMAN_CONFIG_HOME", root)
-        .env("AWMAN_SQUAD_ROOT", root.join("squad"))
+        .env("AWMAN_HOME", root)
         .env("HOME", root)
         // This spawns a real daemon. Keep it off the keychain and launchd /
         // systemd, whose squad item, label and unit are one fixed name each:
@@ -147,6 +146,11 @@ fn squad_env_arms_a_daemon_on_both_the_spawn_and_already_running_branches() {
 
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
+    std::fs::write(
+        root.join("config.json"),
+        r#"{"daemon":{"features":{"squad":{"enabled":true}}}}"#,
+    )
+    .unwrap();
     let repo = root.join("repo");
     init_repo(&repo);
 
@@ -170,7 +174,7 @@ fn squad_env_arms_a_daemon_on_both_the_spawn_and_already_running_branches() {
             "gitroot",
             "--overlay",
             "env(WI0116_CLI_TOKEN)",
-            "--non-interactive",
+            "--headless",
         ],
     );
     let text = combined(&created);

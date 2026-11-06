@@ -25,3 +25,8 @@ mod apple_xpc;
 pub mod xpc;
 #[cfg(target_os = "macos")]
 pub use apple_xpc::NativeXpc;
+
+#[cfg(windows)]
+mod local_pipe;
+#[cfg(windows)]
+pub use local_pipe::create as owner_pipe;

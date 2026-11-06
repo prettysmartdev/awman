@@ -4,7 +4,7 @@
 use super::*;
 use crate::data::session::AgentName;
 
-/// Set `AWMAN_CONFIG_HOME` to `home`, run `f`, then restore the previous value.
+/// Set `AWMAN_HOME` to `home`, run `f`, then restore the previous value.
 ///
 /// The lock and the restore both belong to `ConfigHomeGuard`: a mutex private
 /// to this file would serialise these tests against each other only, and the

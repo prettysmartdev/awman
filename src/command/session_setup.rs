@@ -620,10 +620,8 @@ impl SessionSetup {
             container_runtime.as_ref(),
         )
         .and_then(|resolved| {
-            crate::data::config::global::GlobalConfig::data_home_with(
-                session_guard.effective_config().env(),
-            )
-            .map(|data_home| (resolved, data_home))
+            crate::data::fs::data_paths::data_home(session_guard.effective_config().env())
+                .map(|data_home| (resolved, data_home))
         }) {
             Ok(resolved) => resolved,
             Err(e) => {
@@ -818,7 +816,6 @@ mod tests {
             overlay_engine: overlay,
             auth_engine,
             agent_engine,
-            config_notices: Default::default(),
             workflow_state_store,
             credential_monitor: None,
             global_config: std::sync::Arc::new(Default::default()),

@@ -214,8 +214,7 @@ impl Command for ChatCommand {
                 .collected_overlays(cli_typed, None, None)?;
 
             // Emit deprecation warnings for legacy config fields.
-            LaunchPolicy::for_session(&session)
-                .warn_config(&self.engines.config_notices, frontend.as_mut());
+            LaunchPolicy::for_session(&session).warn_config(frontend.as_mut());
 
             // 3. Ensure the agent is available. The Dockerfile + image setup is
             //    container-paradigm only; kit-declarative (sandbox) runtimes get
@@ -319,8 +318,8 @@ impl Command for ChatCommand {
                 system_prompt,
                 context_overlays,
                 launch_mode: match launch_decision {
-                    LaunchModeDecision::Acp => crate::data::config::repo::LaunchMode::Acp,
-                    _ => crate::data::config::repo::LaunchMode::Stdio,
+                    LaunchModeDecision::Acp => crate::data::config::agents::LaunchMode::Acp,
+                    _ => crate::data::config::agents::LaunchMode::Stdio,
                 },
                 ..Default::default()
             };

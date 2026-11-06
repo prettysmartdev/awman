@@ -58,13 +58,16 @@ mod tests {
     use super::*;
 
     fn run_id() -> RunId {
-        RunId("run-0001".to_string())
+        RunId::parse("run_00000000000000000000000000000001").unwrap()
     }
 
     #[test]
     fn log_dir_is_a_sibling_of_the_workspace_not_a_child() {
         let paths = SquadRunPaths::new(Path::new("/root/tasks/t/workspace"), &run_id()).unwrap();
-        assert_eq!(paths.log_dir(), Path::new("/root/tasks/t/runs/run-0001"));
+        assert_eq!(
+            paths.log_dir(),
+            Path::new("/root/tasks/t/runs/run_00000000000000000000000000000001")
+        );
     }
 
     #[test]

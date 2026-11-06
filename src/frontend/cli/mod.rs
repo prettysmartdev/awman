@@ -96,8 +96,8 @@ fn render_error_for_mode(error: &CommandError, json: bool) -> ExitCode {
 /// Which commands those are is the catalogue's fact
 /// ([`CommandCatalogue::opens_tui_when_bare`]); this keeps only the two facts
 /// about *this invocation* that a frontend is the right place to read — is
-/// stdin a terminal, and did the user ask for non-interactive output.
-/// `--json` implies `--non-interactive` through the catalogue's own `implies`
+/// stdin a terminal, and did the user ask for headless output.
+/// `--json` implies `--headless` through the catalogue's own `implies`
 /// edge, which `CliFrontend::explicit_non_interactive` resolves, so this no
 /// longer spells that rule out a second time.
 pub fn is_bare_tui_invocation(matches: &ArgMatches) -> bool {
@@ -398,7 +398,7 @@ mod tests {
                 "exec",
                 spelling,
                 missing.to_str().unwrap(),
-                "--non-interactive",
+                "--headless",
             ]);
 
             let code = run_command(matches, ctx).await;
@@ -673,10 +673,10 @@ mod tests {
     /// The squad daemon serves the squad subtree and nothing else, and the
     /// catalogue is what says so (F-50).
     #[test]
-    fn the_squad_daemon_frontend_admits_only_the_squad_subtree() {
+    fn background_execution_never_admits_a_catalogue_request() {
         use crate::command::dispatch::catalogue::FrontendKind;
         let catalogue = CommandCatalogue::get();
-        assert!(catalogue.is_allowed_for_frontend(FrontendKind::SquadDaemon, &["squad", "list"]));
+        assert!(!catalogue.is_allowed_for_frontend(FrontendKind::Background, &["squad", "list"]));
         for outside in [
             vec!["exec", "workflow"],
             vec!["ready"],
@@ -684,14 +684,14 @@ mod tests {
             vec!["agents", "status"],
         ] {
             assert!(
-                !catalogue.is_allowed_for_frontend(FrontendKind::SquadDaemon, &outside),
+                !catalogue.is_allowed_for_frontend(FrontendKind::Background, &outside),
                 "{outside:?} is outside the squad subtree"
             );
         }
         // A squad leaf the API itself refuses (interactive/PTY) is refused
         // here too: `SquadDaemon` narrows the API profile, it does not widen
         // it.
-        assert!(!catalogue.is_allowed_for_frontend(FrontendKind::SquadDaemon, &["squad", "attach"]));
+        assert!(!catalogue.is_allowed_for_frontend(FrontendKind::Background, &["squad", "attach"]));
     }
 
     /// Which commands have a bare TUI form is the catalogue's fact, so
@@ -712,7 +712,7 @@ mod tests {
         assert!(!catalogue.opens_tui_when_bare(&[]));
     }
 
-    /// `--json` implies `--non-interactive`, so a `--json` invocation never
+    /// `--json` implies `--headless`, so a `--json` invocation never
     /// opens the TUI even though it is otherwise the bare form. This module
     /// used to re-check `--json` itself; it now goes through the one resolver.
     #[test]
@@ -720,13 +720,13 @@ mod tests {
         let cmd = CommandCatalogue::get().build_clap_command();
         for argv in [
             vec!["awman", "squad", "--json"],
-            vec!["awman", "squad", "--non-interactive"],
+            vec!["awman", "squad", "--headless"],
         ] {
             let m = cmd.clone().try_get_matches_from(&argv).unwrap();
             let path = command_path_from_matches(&m);
             assert!(
                 CliFrontend::explicit_non_interactive(&m, &path),
-                "{argv:?} must resolve to non-interactive"
+                "{argv:?} must resolve to headless"
             );
             assert!(
                 !is_bare_tui_invocation(&m),

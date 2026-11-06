@@ -45,7 +45,6 @@ fn app_state(root: &std::path::Path) -> Arc<AppState> {
         overlay_engine,
         auth_engine,
         agent_engine,
-        config_notices: Default::default(),
         workflow_state_store: Arc::new(crate::data::WorkflowStateStore::at_git_root(paths.root())),
         credential_monitor: None,
         global_config: Arc::new(Default::default()),
@@ -60,6 +59,8 @@ fn app_state(root: &std::path::Path) -> Arc<AppState> {
         Arc::clone(&setup_cancels),
     );
     Arc::new(AppState {
+        live_config: std::sync::RwLock::new(None),
+        settings_tx: None,
         lifecycle_store,
         setup_cancels,
         canceller,
@@ -158,7 +159,7 @@ async fn api_frontend_mirrors_live_engine_state_and_phase_events() {
     let app = app_state(&tmp.path().join("api"));
     app.store
         .insert_session_full(NewSessionRow {
-            id: "session",
+            id: "ses_21d6f40cfb511982e4424e0e250a9557",
             workdir: worktree.to_str().unwrap(),
             created_at: &chrono::Utc::now().to_rfc3339(),
             setup_status: SessionSetupStatus::Ready,
@@ -167,13 +168,23 @@ async fn api_frontend_mirrors_live_engine_state_and_phase_events() {
         })
         .unwrap();
     app.store
-        .enqueue_command("command", "session", "exec workflow", "[]", "/log")
+        .enqueue_command(
+            "cmd_1dccadfed7bcbb036c56a4afb97e906f",
+            "ses_21d6f40cfb511982e4424e0e250a9557",
+            "exec workflow",
+            "[]",
+            "/log",
+        )
         .unwrap();
     let (addr, server) = serve_router(app.clone()).await;
-    let endpoint = format!("http://{addr}/v1/workflows/command");
+    let endpoint =
+        format!("http://{addr}/v1/worker/commands/cmd_1dccadfed7bcbb036c56a4afb97e906f/workflow");
     let client = reqwest::Client::new();
     let api_paths = app.paths.clone();
-    let command_dir = api_paths.command_dir("session", "command");
+    let command_dir = api_paths.command_dir(
+        "ses_21d6f40cfb511982e4424e0e250a9557",
+        "cmd_1dccadfed7bcbb036c56a4afb97e906f",
+    );
     std::fs::create_dir_all(&command_dir).unwrap();
 
     let bus = EventBus::new(128);
@@ -182,8 +193,8 @@ async fn api_frontend_mirrors_live_engine_state_and_phase_events() {
         ApiDispatchFrontend::new("exec workflow", &["workflow.toml".into()], bus.sender())
             .with_state_writer(CommandStateWriter::new(
                 api_paths.clone(),
-                "session",
-                "command",
+                "ses_21d6f40cfb511982e4424e0e250a9557",
+                "cmd_1dccadfed7bcbb036c56a4afb97e906f",
             ));
 
     let workflow = Workflow {
@@ -220,7 +231,10 @@ async fn api_frontend_mirrors_live_engine_state_and_phase_events() {
     let read_state = || -> WorkflowState {
         serde_json::from_str(
             &api_paths
-                .read_command_workflow_state_raw("session", "command")
+                .read_command_workflow_state_raw(
+                    "ses_21d6f40cfb511982e4424e0e250a9557",
+                    "cmd_1dccadfed7bcbb036c56a4afb97e906f",
+                )
                 .unwrap()
                 .unwrap(),
         )

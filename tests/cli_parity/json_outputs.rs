@@ -30,12 +30,12 @@ fn status_watch_flag_exists_in_catalogue() {
 
 #[test]
 fn ready_non_interactive_implied_by_json() {
-    // Per parity item 3: `--json` implies `--non-interactive`.
+    // Per parity item 3: `--json` implies `--headless`.
     let cmd = cat().lookup(&["ready"]).unwrap();
     let json_flag = cmd.find_flag("json").expect("--json flag");
     assert!(
-        json_flag.implies.contains(&"non-interactive"),
-        "--json must imply --non-interactive; implies = {:?}",
+        json_flag.implies.contains(&"headless"),
+        "--json must imply --headless; implies = {:?}",
         json_flag.implies
     );
 }

@@ -7,7 +7,7 @@
 //! interactive decisions that the catalogue requires.
 //!
 //! The full per-command rendering (dialog widgets, progress UIs, etc.) is
-//! handled by the TUI; the CLI uses safe non-interactive defaults for any
+//! handled by the TUI; the CLI uses safe headless defaults for any
 //! interactive Q&A when stdin is not a TTY.
 
 use std::path::{Path, PathBuf};
@@ -39,11 +39,11 @@ pub struct CliFrontend {
     /// Cached canonical command path (resolved via `command_path_from_matches`).
     pub(crate) command_path: Vec<String>,
     pub(crate) messages: CliUserMessageQueue,
-    /// Effective non-interactive mode: true when explicitly requested via
-    /// `--non-interactive` OR when stdin is not a TTY.
+    /// Effective headless mode: true when explicitly requested via
+    /// `--headless` OR when stdin is not a TTY.
     pub(crate) non_interactive: bool,
     /// Every answer the CLI gives when it reaches a question it cannot ask —
-    /// stdin is not a TTY, or `--non-interactive` was passed. See
+    /// stdin is not a TTY, or `--headless` was passed. See
     /// `src/command/headless.rs` for the table and why the CLI's row differs
     /// from the API's and squad's.
     pub(crate) headless: HeadlessDefaults,
@@ -448,7 +448,7 @@ impl CliFrontend {
         // the same Layer 2 function — not a second formula (F-50). Caching it
         // here is what lets the `ask_*` bodies below be one-liners.
         let non_interactive =
-            ResolvedFlags::is_non_interactive(explicit_flag, super::output::stdin_is_tty());
+            ResolvedFlags::is_headless(explicit_flag, super::output::stdin_is_tty());
         Self {
             matches,
             command_path,
@@ -469,14 +469,14 @@ impl CliFrontend {
     }
 
     /// The raw, TTY-independent half of the cached `non_interactive` mode:
-    /// `true` if either `--non-interactive` was passed explicitly, or
-    /// `--json` was — `--json` implies `--non-interactive` (one of the
+    /// `true` if either `--headless` was passed explicitly, or
+    /// `--json` was — `--json` implies `--headless` (one of the
     /// catalogue's documented `implies` edges, see `ResolvedFlags`/F-10).
     /// The built command's own flags always see this implication via
     /// catalogue resolution; this cache must agree, or a `--json` caller on
     /// a TTY gets a frontend that still thinks it is interactive while the
-    /// command it built believes it is non-interactive JSON. Callers pass
-    /// this into [`ResolvedFlags::is_non_interactive`] to fold in the
+    /// command it built believes it is headless JSON. Callers pass
+    /// this into [`ResolvedFlags::is_headless`] to fold in the
     /// no-input fallback.
     pub(crate) fn explicit_non_interactive(matches: &ArgMatches, command_path: &[String]) -> bool {
         let mut m = matches;
@@ -493,7 +493,7 @@ impl CliFrontend {
                 .copied()
                 .unwrap_or(false)
         };
-        flag("non-interactive") || flag("json")
+        flag("headless") || flag("json")
     }
 
     /// Returns `true` when the `--json` flag is active for the current
@@ -647,7 +647,10 @@ impl CommandFrontend for CliFrontend {
         // clap stores the single value as a String.
         if let Some(spec) = CommandCatalogue::get().lookup(command_path) {
             if let Some(arg) = spec.arguments.iter().find(|a| a.name == name) {
-                if matches!(arg.kind, ArgumentKind::TrailingVarArgs) {
+                if matches!(
+                    arg.kind,
+                    ArgumentKind::TrailingVarArgs | ArgumentKind::VarArgs
+                ) {
                     let collected: Vec<String> = m
                         .get_many::<String>(name)
                         .map(|v| v.cloned().collect())
@@ -685,18 +688,6 @@ impl CommandFrontend for CliFrontend {
 // modules under `src/frontend/cli/per_command/`.
 
 impl ConfigCommandFrontend for CliFrontend {
-    fn confirm_config_migration(
-        &mut self,
-        prompt: &Prompt<crate::command::commands::config::MigrateChoice>,
-    ) -> Result<crate::command::commands::config::MigrateChoice, CommandError> {
-        if self.non_interactive {
-            return Err(CommandError::InteractiveInputUnavailable {
-                prompt: "yes".into(),
-            });
-        }
-        self.pick_from_prompt(prompt)
-    }
-
     fn present_config_table(
         &mut self,
         _rows: &[crate::command::commands::config::ConfigFieldRow],
@@ -908,14 +899,14 @@ mod tests {
         assert_eq!(path, vec!["remote", "session", "start"]);
     }
 
-    // ─── explicit_non_interactive (--json implies --non-interactive) ──────────
+    // ─── explicit_non_interactive (--json implies --headless) ──────────
 
-    /// Regression: `--json` alone (no explicit `--non-interactive`) must
+    /// Regression: `--json` alone (no explicit `--headless`) must
     /// still resolve `explicit_non_interactive` to `true`, matching
-    /// `ResolvedFlags`' `json -> non-interactive` catalogue implication —
+    /// `ResolvedFlags`' `json -> headless` catalogue implication —
     /// otherwise a `--json` caller on a TTY gets a frontend that still
     /// thinks it is interactive while the command it built (which reads its
-    /// flags through `ResolvedFlags`) believes it is non-interactive JSON.
+    /// flags through `ResolvedFlags`) believes it is headless JSON.
     #[test]
     fn json_alone_implies_explicit_non_interactive() {
         let cmd = CommandCatalogue::get().build_clap_command();
@@ -930,7 +921,7 @@ mod tests {
     fn explicit_non_interactive_flag_alone_is_still_honoured() {
         let cmd = CommandCatalogue::get().build_clap_command();
         let m = cmd
-            .try_get_matches_from(["awman", "ready", "--non-interactive"])
+            .try_get_matches_from(["awman", "ready", "--headless"])
             .unwrap();
         let path = command_path_from_matches(&m);
         assert!(CliFrontend::explicit_non_interactive(&m, &path));
@@ -1245,21 +1236,23 @@ mod tests {
     fn flag_u16_reads_port_flag() {
         let cmd = CommandCatalogue::get().build_clap_command();
         let m = cmd
-            .try_get_matches_from(["awman", "api", "start", "--port", "1234"])
+            .try_get_matches_from(["awman", "squad", "start", "--port", "1234"])
             .unwrap();
         let frontend = CliFrontend::new(m);
-        let v = frontend.flag_u16(&["api", "start"], "port").unwrap();
+        let v = frontend.flag_u16(&["squad", "start"], "port").unwrap();
         assert_eq!(v, Some(1234u16));
     }
 
     #[test]
     fn flag_u16_default_value_when_absent() {
         let cmd = CommandCatalogue::get().build_clap_command();
-        let m = cmd.try_get_matches_from(["awman", "api", "start"]).unwrap();
+        let m = cmd
+            .try_get_matches_from(["awman", "squad", "start"])
+            .unwrap();
         let frontend = CliFrontend::new(m);
-        // Default for `--port` on `api start` is 9876.
-        let v = frontend.flag_u16(&["api", "start"], "port").unwrap();
-        assert_eq!(v, Some(9876u16));
+        // Default for `--port` on `squad start` is 0 (an OS-assigned port).
+        let v = frontend.flag_u16(&["squad", "start"], "port").unwrap();
+        assert_eq!(v, Some(0u16));
     }
 
     #[test]

@@ -56,7 +56,7 @@ pub struct ApiServeConfig {
     /// explicitly passed `--dangerously-skip-tls`.
     pub tls_material: Option<TlsMaterial>,
     /// The environment of the invocation that started the server. Every API
-    /// session inherits it, so a relocated `AWMAN_CONFIG_HOME` (and the global
+    /// session inherits it, so a relocated `AWMAN_HOME` (and the global
     /// builtin network policy in it) applies to API sessions too.
     pub env: crate::data::config::env::EnvSnapshot,
 }
@@ -205,9 +205,19 @@ impl ApiServerCommand {
     pub fn from_input(ctx: &BuildContext) -> Result<Self, CommandError> {
         let sub = match ctx.caller.leaf() {
             "start" => ApiServerSubcommand::Start(ApiServerStartFlags {
-                port: ctx.flags.require_u16("port")?,
-                workdirs: ctx.flags.strs("workdirs").to_vec(),
-                workdir_roots: ctx.flags.strs("workdir-root").to_vec(),
+                port: ctx
+                    .session
+                    .effective_config()
+                    .daemon()
+                    .network
+                    .listen
+                    .parse::<std::net::SocketAddr>()
+                    .map_err(|_| {
+                        CommandError::Other("daemon.network.listen must be IP:port".into())
+                    })?
+                    .port(),
+                workdirs: Vec::new(),
+                workdir_roots: Vec::new(),
                 background: ctx.flags.bool("background"),
                 refresh_key: ctx.flags.bool("refresh-key"),
                 dangerously_skip_auth: ctx.flags.bool("dangerously-skip-auth"),
@@ -282,10 +292,13 @@ async fn run_start(
     // dirs. Read from the session's own effective config, not from a fresh
     // `GlobalConfig::load()`: the session already merged global, repo, env and
     // flags, and a second load here would answer from a different one (F-31).
-    let workdirs = resolve_workdirs(&flags.workdirs, &session.effective_config().api_work_dirs())?;
+    let workdirs = resolve_workdirs(
+        &flags.workdirs,
+        &session.effective_config().worker_push_work_dirs(),
+    )?;
     let workdir_roots = resolve_workdir_roots(
         &flags.workdir_roots,
-        &session.effective_config().api_work_dir_roots(),
+        &session.effective_config().worker_push_work_dir_roots(),
         engines.git_engine.as_ref(),
         frontend,
     )?;
@@ -345,8 +358,24 @@ async fn run_start(
         guard.check().map_err(CommandError::from)?;
         let binary = std::env::current_exe()
             .map_err(|e| CommandError::Other(format!("cannot determine awman binary: {e}")))?;
-        let args = background_args(&flags, &workdir_strings, &root_strings);
+        let mut args = background_args(&flags, &workdir_strings, &root_strings);
+        if let Some(value) = args.get_mut(3) {
+            *value = format!(
+                "daemon.network.listen={}",
+                session.effective_config().daemon().network.listen
+            );
+        }
 
+        // Keep the initiating invocation's overrides in the child as argv.
+        // The canonical listen/workdir settings below them retain precedence.
+        let startup_args = session
+            .effective_config()
+            .layers()
+            .set
+            .set_args()
+            .into_iter()
+            .flat_map(|arg| ["--set".to_string(), arg]);
+        args.splice(2..2, startup_args);
         let child_pid = daemon.spawn_detached(&binary, &args)?;
         if child_pid > 0 {
             // Use exclusive write so a racing parallel `api start --background`
@@ -392,7 +421,14 @@ async fn run_start(
 
     // TLS material: generate or load now (unless explicitly skipped) so the
     // bind_ip warning surfaces BEFORE we hand off to serve_until_shutdown.
-    let bind_ip: std::net::IpAddr = "127.0.0.1".parse().expect("static loopback ip");
+    let bind_ip = session
+        .effective_config()
+        .daemon()
+        .network
+        .listen
+        .parse::<std::net::SocketAddr>()
+        .map_err(|_| CommandError::Other("daemon.network.listen must be IP:port".into()))?
+        .ip();
     let tls_material = if flags.dangerously_skip_tls {
         frontend.write_message(UserMessage {
             level: MessageLevel::Warning,
@@ -461,7 +497,23 @@ async fn run_start(
         env: session.env().clone(),
     };
 
-    let runtime = ApiServerRuntime::bootstrap(config, engines.clone())?;
+    let mut runtime = ApiServerRuntime::bootstrap(config, engines.clone())?;
+    // A daemon's trusted defaults come from operator config. A repository
+    // the CLI happens to start in must not become the policy ceiling for
+    // unrelated sessions admitted later.
+    let initiating_config = session.effective_config();
+    let layers = initiating_config.layers();
+    runtime.config = crate::data::config::EffectiveConfig::resolve(
+        crate::data::config::ConfigLayers {
+            global: layers.global.clone(),
+            env: layers.env.clone(),
+            set: layers.set.clone(),
+            ..Default::default()
+        },
+        Default::default(),
+        session.env().clone(),
+    )?;
+    runtime.worker_count = runtime.config.daemon().max_concurrent_jobs;
     let serve_result = frontend.serve_until_shutdown(runtime).await;
 
     // Always clean up PID + meta files.
@@ -653,8 +705,8 @@ fn background_args(
     let mut args = vec![
         "api".into(),
         "start".into(),
-        "--port".into(),
-        flags.port.to_string(),
+        "--set".into(),
+        format!("daemon.network.listen=127.0.0.1:{}", flags.port),
     ];
     if flags.dangerously_skip_auth {
         args.push("--dangerously-skip-auth".into());
@@ -662,11 +714,23 @@ fn background_args(
     if flags.dangerously_skip_tls {
         args.push("--dangerously-skip-tls".into());
     }
-    for path in workdirs {
-        args.extend(["--workdirs".into(), path.clone()]);
+    if !workdirs.is_empty() {
+        args.extend([
+            "--set".into(),
+            format!(
+                "daemon.features.worker.push.workDirs.allow={}",
+                workdirs.join(",")
+            ),
+        ]);
     }
-    for path in roots {
-        args.extend(["--workdir-root".into(), path.clone()]);
+    if !roots.is_empty() {
+        args.extend([
+            "--set".into(),
+            format!(
+                "daemon.features.worker.push.workDirs.roots={}",
+                roots.join(",")
+            ),
+        ]);
     }
     args
 }
@@ -1322,15 +1386,21 @@ mod workdir_root_tests {
             &["/absolute/checkout".into()],
             &["/absolute/root".into(), "/absolute/missing".into()],
         );
-        assert!(args
-            .windows(2)
-            .any(|pair| pair == ["--workdirs", "/absolute/checkout"]));
-        assert!(args
-            .windows(2)
-            .any(|pair| pair == ["--workdir-root", "/absolute/root"]));
-        assert!(args
-            .windows(2)
-            .any(|pair| pair == ["--workdir-root", "/absolute/missing"]));
+        assert!(args.windows(2).any(|pair| pair
+            == [
+                "--set",
+                "daemon.features.worker.push.workDirs.allow=/absolute/checkout"
+            ]));
+        assert!(args.windows(2).any(|pair| pair
+            == [
+                "--set",
+                "daemon.features.worker.push.workDirs.roots=/absolute/root,/absolute/missing"
+            ]));
+        assert!(args.windows(2).any(|pair| pair
+            == [
+                "--set",
+                "daemon.features.worker.push.workDirs.roots=/absolute/root,/absolute/missing"
+            ]));
         assert!(!args.iter().any(|arg| arg == "." || arg == "relative"));
     }
 

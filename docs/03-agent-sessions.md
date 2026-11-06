@@ -26,7 +26,7 @@ Press **Ctrl+C** to exit the agent session when you're done.
 `awman chat`'s own exit code is the agent's exit code — a session whose agent
 crashed or was killed is reported as a failure (non-zero), and the CLI, TUI
 tab colour, and any API client watching the command's status all agree on
-that result. This matters most for `awman chat --non-interactive` run from a
+that result. This matters most for `awman chat --headless` run from a
 script or CI job, where the exit code is how the caller finds out whether the
 agent succeeded.
 
@@ -51,23 +51,23 @@ below for the current limits.
 
 ### Start an ACP session
 
-Use `--launch-mode acp` for a single session. Put the flags before the prompt
+Use `--set agents.launchMode=acp` for a single session. Put the flags before the prompt
 positional so they are parsed:
 
 ```sh
-awman chat --agent cline --launch-mode acp
-awman exec prompt --agent cline --launch-mode acp "Review the failing tests"
+awman chat --agent cline --set agents.launchMode=acp
+awman exec prompt --agent cline --set agents.launchMode=acp "Review the failing tests"
 ```
 
-The flag is available on `chat` and `exec prompt`. The shortest form uses your
+`--set` is accepted by every command. The shortest form uses your
 configured agent, provided it supports ACP:
 
 ```sh
-awman chat --launch-mode acp
+awman chat --set agents.launchMode=acp
 ```
 
 To return to the normal terminal experience for one invocation, use
-`--launch-mode stdio`.
+`--set agents.launchMode=stdio`.
 
 ---
 
@@ -96,7 +96,7 @@ For `exec prompt`, the supplied prompt starts the first turn. For `chat`, you
 can begin by entering prompts as the session runs. Press **Ctrl+D** when you
 are finished entering follow-up prompts, or **Ctrl+C** to exit the session.
 
-In a non-interactive run (`--non-interactive`, or with `--yolo`/`--auto`), the
+In a non-interactive run (`--headless`, or with `--yolo`/`--auto`), the
 CLI does not prompt for follow-ups or permissions — it runs the seeded turn and
 exits, matching the headless behavior of stdio agents.
 
@@ -111,26 +111,26 @@ update summaries in the message area and does not present interactive follow-up
 or permission dialogs; a permission request that is not pre-approved by
 `--yolo`/`--auto` is denied.
 
-For the interactive ACP experience today, run `awman chat --launch-mode acp`
+For the interactive ACP experience today, run `awman chat --set agents.launchMode=acp`
 from the CLI (outside the TUI).
 
 ---
 
 ### Selecting a launch mode
 
-The `--launch-mode` flag accepts exactly two values:
+`agents.launchMode` accepts exactly two values:
 
 ```sh
-awman chat --agent cline --launch-mode acp
-awman chat --agent cline --launch-mode stdio
+awman chat --agent cline --set agents.launchMode=acp
+awman chat --agent cline --set agents.launchMode=stdio
 ```
 
-For persistent settings, set `launchMode` in the repository's
-`.awman/config.json`. The default is `stdio`. The effective launch mode is
-chosen in this order:
+For persistent settings, run `awman config set agents.launchMode acp` (repo
+config) or set it with `--global`. The default is `stdio`. The effective launch
+mode is chosen in this order:
 
 ```
---launch-mode  >  AWMAN_LAUNCH_MODE  >  repo launchMode  >  stdio
+--set agents.launchMode  >  AWMAN_AGENTS_LAUNCH_MODE  >  repo agents.launchMode  >  global agents.launchMode  >  stdio
 ```
 
 See [Configuration](07-configuration.md) for the config fields and the
@@ -141,26 +141,26 @@ environment variable.
 ### Workflows and unsupported agents
 
 ACP is **not yet available for `exec workflow` steps**. If a repository sets
-`launchMode: acp` and a workflow step resolves to an ACP-capable agent, the
+`agents.launchMode` is `acp` and a workflow step resolves to an ACP-capable agent, the
 workflow fails before any step starts, directing you to run that agent over ACP
-with `awman chat` or `awman exec prompt` instead — or to set `launchMode: stdio`
+with `awman chat` or `awman exec prompt` instead — or to set `agents.launchMode` to `stdio`
 for workflows.
 
 Workflow steps whose agents do **not** support ACP are governed by the global
-`launchModeFallback` setting, which defaults to `error`:
+`agents.acpFallback` setting, which defaults to `error`:
 
 - `error` stops the workflow before any step starts and reports the step and
   agent that cannot use ACP.
 - `stdio` runs those steps in the regular stdio mode and prints a warning per
   step, and the workflow proceeds.
 
-Set the policy in `$HOME/.awman/config.json`:
+Set the policy in your global or repo config:
 
 ```json
-{ "launchModeFallback": "stdio" }
+{ "agents": { "acpFallback": "stdio" } }
 ```
 
-An explicit `--launch-mode acp` request for a single unsupported agent remains
+An explicit `--set agents.launchMode=acp` request for a single unsupported agent remains
 an error, so a one-off request cannot silently change modes. See
 [Workflows](05-workflows.md) for workflow setup and execution.
 
@@ -189,7 +189,7 @@ This overrides the `agent` field in your repo config for this run only — no co
 
 If the agent image does not yet exist, awman offers to download the template and build both the project base image (if needed) and the agent image before launching.
 
-Interactive Codex sessions run as `codex --no-daemon`: recent Codex releases otherwise try to start a background server that the container doesn't have, and exit with `daemon executable not found`. If an older Codex image rejects the flag, rebuild it with `awman ready --build --no-cache` (without `--no-cache`, Docker reuses the cached layer holding the old Codex). Non-interactive runs (`codex exec`) don't get the flag, because they reject it. An `agentFlags` entry for `--no-daemon` is redundant: awman drops it from interactive launches and warns that non-interactive runs may reject it.
+Interactive Codex sessions run as `codex --no-daemon`: recent Codex releases otherwise try to start a background server that the container doesn't have, and exit with `daemon executable not found`. If an older Codex image rejects the flag, rebuild it with `awman ready --build --no-cache` (without `--no-cache`, Docker reuses the cached layer holding the old Codex). Non-interactive runs (`codex exec`) don't get the flag, because they reject it. An `agents.flags` entry for `--no-daemon` is redundant: awman drops it from interactive launches and warns that non-interactive runs may reject it.
 
 Passing an unknown agent name exits immediately with a list of valid options:
 
@@ -236,9 +236,9 @@ An agent with no model flag (Antigravity, or a custom agent whose definition dec
 
 Under the `docker-sbx-experimental` runtime, the flag is delivered through the sandbox's per-launch session config (built-in template agents) or as launch arguments (custom-kit agents) rather than directly on the command line; the supported agents and modes are the same, except copilot, which cannot receive a model override there. See [Runtimes](11-runtimes.md#known-limitations).
 
-### `--non-interactive` / `-n`
+### `--headless` / `-n`
 
-Run the agent in print/batch mode — no interactivity required. The agent executes, produces output, and exits. `-n` is a short alias for `--non-interactive` and works on every command that has the flag (`chat`, `exec prompt`, `exec workflow`, `ready`, `specs amend`, `new spec`, `new skill`). It also makes awman's own prompts take their non-interactive answer instead of asking, even on a terminal; `--json` implies it.
+Run the agent in print/batch mode — no interactivity required. The agent executes, produces output, and exits. `-n` is a short alias for `--headless` and works on every command that has the flag (`chat`, `exec prompt`, `exec workflow`, `ready`, `specs amend`, `new spec`, `new skill`). It also makes awman's own prompts take their non-interactive answer instead of asking, even on a terminal; `--json` implies it.
 
 | Agent | Flag used |
 |-------|-----------|
@@ -277,7 +277,7 @@ See [Security & Isolation](04-security-and-isolation.md#overlay-mounts) for secu
 
 ### `--agent-flag <ARG>`
 
-Append an extra argument to the agent's command for this run. Repeat it for multiple arguments; they are appended in order, after awman's own flags and before the initial prompt. Available on `chat`, `exec prompt`, and `exec workflow`. `remote exec` forwards it to the remote host, where it replaces that host's `agentFlags` entry for the run.
+Append an extra argument to the agent's command for this run. Repeat it for multiple arguments; they are appended in order, after awman's own flags and before the initial prompt. Available on `chat`, `exec prompt`, and `exec workflow`. `remote exec` forwards it to the remote host, where it replaces that host's `agents.flags` entry for the run.
 
 Because the value usually starts with `-`, write it in the `--agent-flag=<value>` form:
 
@@ -286,7 +286,7 @@ awman chat --agent codex --agent-flag=--search
 awman exec prompt --agent-flag=--config --agent-flag=key=value "fix the build"
 ```
 
-`--agent-flag` replaces the [`agentFlags`](07-configuration.md#pass-extra-flags-to-an-agent) config entry for the agent the command launches; it does not add to it. In `exec workflow` it applies to the workflow's default agent (the workflow's `agent` field, else `--agent`, else config); steps that name a different agent keep that agent's configured `agentFlags`. With `--dynamic`, it also reaches the leader when the leader's agent is the selected one (`--agent`, else config).
+`--agent-flag` replaces the [`agents.flags`](07-configuration.md#pass-extra-flags-to-an-agent) config entry for the agent the command launches; it does not add to it. In `exec workflow` it applies to the workflow's default agent (the workflow's `agent` field, else `--agent`, else config); steps that name a different agent keep that agent's configured `agents.flags`. With `--dynamic`, it also reaches the leader when the leader's agent is the selected one (`--agent`, else config).
 
 ### `--allow-docker`
 
@@ -365,7 +365,7 @@ Run the agent in read-only mode — it can analyse the codebase and suggest chan
 | `copilot` | `--plan` |
 | `cline` | `--plan` (on the `task` subcommand) |
 
-`--plan` can be combined with `--non-interactive`.
+`--plan` can be combined with `--headless`.
 
 ### `--auto`
 
@@ -420,11 +420,11 @@ Passing `--worktree` as well is accepted — no duplicate worktree is created. T
 
 ### Disallowed tools
 
-`yoloDisallowedTools` lists tools the agent may not use while `--yolo` is on. Set it in per-repo or global config (a repo list replaces the global one; lists are not merged):
+`agents.yolo.disallowedTools` lists tools the agent may not use while `--yolo` is on. Set it in per-repo or global config (a repo list replaces the global one; lists are not merged):
 
 ```json
 {
-  "yoloDisallowedTools": ["Bash", "computer"]
+  "agents": { "yolo": { "disallowedTools": ["Bash", "computer"] } }
 }
 ```
 
@@ -438,14 +438,14 @@ Every `--yolo` launch — `chat`, `exec prompt`, each `exec workflow` step, and 
 A tool restriction is never dropped silently. When the agent cannot enforce the list, awman refuses to start it:
 
 ```
-invalid configuration: yoloDisallowedTools (Bash, computer) is set, but agent 'codex' has no way to enforce a disallowed-tools list here, so awman refuses to launch it with --yolo. ...
+invalid configuration: agents.yolo.disallowedTools (Bash, computer) is set, but agent 'codex' has no way to enforce a disallowed-tools list here, so awman refuses to launch it with --yolo. ...
 ```
 
-To run such an agent with `--yolo` in one repo, clear the list there with `awman config set yoloDisallowedTools ""` (an empty repo list replaces the global one), or run without `--yolo`. A custom agent applies the list when its definition declares a disallowed-tools flag.
+To run such an agent with `--yolo` in one repo, clear the list there with `awman config set agents.yolo.disallowedTools ""` (an empty repo list replaces the global one), or run without `--yolo`. A custom agent applies the list when its definition declares a disallowed-tools flag.
 
 ### Yolo through the HTTP API
 
-Commands submitted through the API (`POST /v1/commands`) run with `--yolo` applied **by default** for `chat`, `exec prompt`, and `exec workflow` — the server assumes unattended execution unless your request specifies the flag itself. The response's `flags_applied` field confirms which defaults were used; see [Submit a command](09-api-and-remote-mode.md#submit-a-command).
+Commands submitted through the API (`POST /v1/worker/commands`) run with `--yolo` applied **by default** for `chat`, `exec prompt`, and `exec workflow` — the server assumes unattended execution unless your request specifies the flag itself. The response's `flags_applied` field confirms which defaults were used; see [Submit a command](09-api-and-remote-mode.md#submit-a-command).
 
 ### Security considerations
 
@@ -478,8 +478,8 @@ Prompts for a type (Feature, Bug, Task, or Enhancement) and a title, then create
 By default, awman writes to `aspec/work-items/` and uses `aspec/work-items/0000-template.md`. If neither exists, awman auto-discovers any `*template.md` file in the work items directory and prompts you to confirm it. You can also configure the paths explicitly:
 
 ```sh
-awman config set work_items.dir docs/work-items
-awman config set work_items.template docs/work-items/my-template.md
+awman config set workItems.dir docs/work-items
+awman config set workItems.template docs/work-items/my-template.md
 ```
 
 If no template is found or confirmed, the new file is created with a minimal stub (`# Kind: Title`). See [Configuration: Work item paths](07-configuration.md#custom-work-item-paths) for full details on path resolution and auto-discovery.
@@ -631,7 +631,7 @@ Mount a pulled library with `skill(<library>)`, or one skill from it with `skill
 | Flag | Description |
 |------|-------------|
 | `--interview` | Let a code agent complete the skill body from a short summary |
-| `-n`, `--non-interactive` | Run the interview agent in print mode |
+| `-n`, `--headless` | Run the interview agent in print mode |
 | `--global` | Write to `~/.awman/skills/<name>/` instead of the current repo |
 | `--pull <repo>` | Pull a GitHub skills library, or refresh one by its short name |
 | `--pull-all` | Refresh every previously-pulled skills library |
@@ -704,7 +704,7 @@ awman automatically passes your agent's credentials into the container — you n
 
 For Claude Code, awman reads your OAuth credential from the macOS Keychain (service: `Claude Code-credentials`) — or, on non-macOS hosts, from `~/.claude/.credentials.json` — and writes an awman-authored `.credentials.json` (access token, expiry, and scopes only) into the staged `~/.claude` directory that's mounted into the container. Your refresh token is never captured from the host credential and never mounted into a container.
 
-While the session is running, a background monitor tracks the token's expiry and, before it runs out, pings your host's local Claude Code installation — the same sanctioned check `awman ready` uses — so it rotates its own Keychain entry. awman then atomically rewrites the staged credential file for every live session, so a long-running container picks up the new token on its next request with no restart. If the host can't refresh (asleep, logged out, offline), awman keeps the last-known-good token, warns you, and retries; a workflow step that fails on an auth error is retried once automatically after a fresh refresh. See [Control credential refresh](07-configuration.md#control-credential-refresh-authrefresh) to change the refresh threshold or turn this off.
+While the session is running, a background monitor tracks the token's expiry and, before it runs out, pings your host's local Claude Code installation — the same sanctioned check `awman ready` uses — so it rotates its own Keychain entry. awman then atomically rewrites the staged credential file for every live session, so a long-running container picks up the new token on its next request with no restart. If the host can't refresh (asleep, logged out, offline), awman keeps the last-known-good token, warns you, and retries; a workflow step that fails on an auth error is retried once automatically after a fresh refresh. See [Control credential refresh](07-configuration.md#control-credential-refresh-agentsauthrefresh) to change the refresh threshold or turn this off.
 
 The token value is never shown in displayed container commands; the mounted `~/.claude` directory appears only as an ordinary bind-mount path.
 
@@ -913,14 +913,14 @@ Initialises the current Git repository for use with awman. See [Getting Started]
 
 `--aspec` downloads the `aspec/` folder from `github.com/prettysmartdev/aspec`, providing spec templates and work item scaffolding. Skipped without the flag.
 
-When `--aspec` is not passed and no `aspec/` folder exists, `init` offers to configure a custom work items directory and template path interactively. This sets `work_items.dir` (and optionally `work_items.template`) in the repo config so commands like `new spec` and `exec workflow` work without requiring the `aspec/` folder layout. See [Work item paths](07-configuration.md#custom-work-item-paths).
+When `--aspec` is not passed and no `aspec/` folder exists, `init` offers to configure a custom work items directory and template path interactively. This sets `workItems.dir` (and optionally `workItems.template`) in the repo config so commands like `new spec` and `exec workflow` work without requiring the `aspec/` folder layout. See [Work item paths](07-configuration.md#custom-work-item-paths).
 
 ---
 
 ## Reference: `awman ready`
 
 ```sh
-awman ready [--refresh] [--build] [--no-cache] [-n|--non-interactive] [--allow-docker] [--json] [--agent <name>]
+awman ready [--refresh] [--build] [--no-cache] [-n|--headless] [--allow-docker] [--json] [--agent <name>]
 ```
 
 Verifies your environment is ready for agent sessions. Progress lines read `ready: <phase>` on stderr (suppressed with `--json`). A Docker or Apple Containers runtime error exits with status 3; every other engine failure, including builtin and image-builder errors, exits with status 1, and the CLI prints the same message the TUI and API show.
@@ -930,9 +930,9 @@ Verifies your environment is ready for agent sessions. Progress lines read `read
 | `--refresh` | Run the Dockerfile agent audit, which updates `Dockerfile.dev` for your project's toolchain (skipped by default) |
 | `--build` | Rebuild the project base image and every agent image with a `.awman/Dockerfile.<agent>` (on the [builtin runtime](11-runtimes.md), re-acquire them from their image source) |
 | `--no-cache` | Skip the build cache for any build `ready` runs; on the builtin runtime, also force a fresh image import |
-| `--non-interactive` / `-n` | Run the audit agent in print mode, and answer `ready`'s own questions non-interactively |
+| `--headless` / `-n` | Run the audit agent in print mode, and answer `ready`'s own questions non-interactively |
 | `--allow-docker` | Give the audit container access to the host Docker socket |
-| `--json` | Emit machine-readable JSON instead of the summary table. Implies `--non-interactive`. See [`ready --json`](#ready---json) |
+| `--json` | Emit machine-readable JSON instead of the summary table. Implies `--headless`. See [`ready --json`](#ready---json) |
 | `--agent <name>` | Check and build this agent instead of the configured one. For a [custom agent](15-custom-agents.md) whose definition needs approval, this is where you review and approve it |
 
 Use `--refresh` after your project's toolchain changes. The audit only edits `Dockerfile.dev`; agent Dockerfiles are not touched.
@@ -979,7 +979,7 @@ With `--json`, `awman ready` prints one JSON object on stdout instead of the sum
 
 Each step's `status` is `ok`, `skipped`, `warn`, `failed`, `pending` or `running`, with the reason in `message`. `refresh` is `ok` when `--refresh` ran the audit. On the builtin runtime the object also carries `steps.image_source` and, when images were built or imported, `image_results`, `base_image_results` and `warnings`.
 
-`--json` implies `--non-interactive`, so no prompts are shown, and audit output is not streamed. In `agent_credentials` (one entry per agent with a live-refreshed credential), `expires_in_secs` is `null` when the expiry couldn't be determined, and `read_error` is set when the credential couldn't be read at all. No token value ever appears in this output.
+`--json` implies `--headless`, so no prompts are shown, and audit output is not streamed. In `agent_credentials` (one entry per agent with a live-refreshed credential), `expires_in_secs` is `null` when the expiry couldn't be determined, and `read_error` is set when the credential couldn't be read at all. No token value ever appears in this output.
 
 ---
 
@@ -989,12 +989,12 @@ Each step's `status` is `ok`, `skipped`, `warn`, `failed`, `pending` or `running
 |------|--------|---------------|-----------------|-------------|
 | `--agent=<name>` | ✓ | ✓ | ✓ | Override the agent for this session |
 | `--model=<NAME>` | ✓ | ✓ | ✓ | Override the model used by the agent |
-| `--non-interactive` / `-n` | ✓ | ✓ | ✓ | Print/batch mode |
-| `--launch-mode <stdio\|acp>` | ✓ | ✓ | ✓ | Choose standard stdio or ACP mode |
+| `--headless` / `-n` | ✓ | ✓ | ✓ | Print/batch mode |
+| `--set agents.launchMode=<stdio\|acp>` | ✓ | ✓ | ✓ | Choose standard stdio or ACP mode |
 | `--plan` | ✓ | ✓ | ✓ | Read-only analysis mode |
 | `--allow-docker` | ✓ | ✓ | ✓ | Mount host Docker socket |
 | `--overlay=<SPEC>` | ✓ | ✓ | ✓ | `dir()`, `env()`, `skill()`, `ssh()` overlays (repeatable) |
-| `--agent-flag=<ARG>` | ✓ | ✓ | ✓ | Extra argument for the agent command (repeatable); replaces its `agentFlags` entry |
+| `--agent-flag=<ARG>` | ✓ | ✓ | ✓ | Extra argument for the agent command (repeatable); replaces its `agents.flags` entry |
 | `--branch <NAME>` | ✓ | ✓ | — | Run in a worktree for this branch (CLI/TUI only) |
 | `--pr <N\|URL\|owner/repo#N>` | ✓ | ✓ | — | Run in a worktree for a GitHub pull request (CLI/TUI only) |
 | `--worktree <NAME\|PATH>` | ✓ | ✓ | — | Reuse an existing worktree (CLI/TUI only) |
@@ -1005,7 +1005,6 @@ Each step's `status` is `ok`, `skipped`, `warn`, `failed`, `pending` or `running
 | `--issue <N\|URL>` | — | ✓ | ✓ | Use a GitHub issue as the prompt / work item input — see [GitHub Integration](10-github-integration.md) |
 | `--dynamic` | — | — | ✓ | Have a leader agent design the workflow; implies `--yolo`, `--worktree`, `context(workflow)` |
 | `--leader <agent::model>` | — | — | ✓ | Leader agent and model for `--dynamic` |
-| `--max-concurrent <N>` | — | — | ✓ | Cap concurrently-running workflow steps |
 | `--on-existing-worktree`, `--on-dirty-merge-target`, `--on-merge-failure` | — | — | ✓ | Answer worktree lifecycle questions up front — see [Workflows](05-workflows.md#worktrees) |
 | `--prerequisite-*`, `--check-prerequisites` | — | — | ✓ | Grant or check what setup/teardown steps need — see [Workflows](05-workflows.md) |
 | `--json` | — | — | ✓ | Print the workflow outcome and prerequisite report as JSON |

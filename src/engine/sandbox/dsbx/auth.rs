@@ -236,7 +236,7 @@ fn set_secret(
 
 /// One `sbx secret set` invocation with the value piped via stdin.
 ///
-/// The sbx docs are inconsistent about whether non-interactive input needs a
+/// The sbx docs are inconsistent about whether headless input needs a
 /// `--password-stdin` flag; plain stdin piping is confirmed working against
 /// the current sbx, so it is the primary form. When it fails with an error
 /// that looks like sbx tried to prompt interactively, retry once with
@@ -932,7 +932,7 @@ mod tests {
                 "#!/bin/sh\n\
                  case \"$@\" in\n\
                    *--password-stdin*) cat > /dev/null; exit 0;;\n\
-                   *) echo 'ERROR: cannot prompt for password in non-interactive terminal' >&2; exit 1;;\n\
+                   *) echo 'ERROR: cannot prompt for password in headless terminal' >&2; exit 1;;\n\
                  esac\n",
                 || {
                     let mut sink = VecSink::default();
@@ -945,7 +945,10 @@ mod tests {
                         &no_secret,
                         &mut sink,
                     );
-                    assert!(result.is_ok(), "retry with --password-stdin must succeed: {result:?}");
+                    assert!(
+                        result.is_ok(),
+                        "retry with --password-stdin must succeed: {result:?}"
+                    );
                     assert!(
                         sink.messages.iter().any(|m| {
                             m.text.contains(

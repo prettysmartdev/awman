@@ -21,7 +21,7 @@ fn cli(root: &Path, home: &Path) -> Command {
     command
         .current_dir(root)
         .env("HOME", home)
-        .env("AWMAN_CONFIG_HOME", home.join(".awman"))
+        .env("AWMAN_HOME", home.join(".awman"))
         .env("XDG_CONFIG_HOME", home.join(".config"))
         .env("XDG_DATA_HOME", home.join(".local/share"))
         .env("XDG_CACHE_HOME", home.join(".cache"))
@@ -44,7 +44,7 @@ fn chat_maki_without_definition_exits_four_with_migration_hint() {
     let home = tempfile::tempdir().unwrap();
     git(root.path(), &["init", "--quiet"]);
     let output = cli(root.path(), home.path())
-        .args(["chat", "--agent", "maki", "--non-interactive"])
+        .args(["chat", "--agent", "maki", "--headless"])
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(4), "{output:?}");
@@ -88,7 +88,7 @@ fn new_agent_shipped_examples_match_the_binary_schema_and_are_approved() {
         );
         awman::data::config::agent_definition::load_agent_definition(&path).unwrap();
         let env = awman::data::config::EnvSnapshot::with_overrides([(
-            "AWMAN_CONFIG_HOME",
+            "AWMAN_HOME",
             home.path().join(".awman").to_str().unwrap(),
         )]);
         let agent = awman::data::session::AgentName::new(name).unwrap();
@@ -351,7 +351,7 @@ fn smoke_container_runtime(program: &'static str, runtime: &str) {
     assert_eq!(json["ready"], true, "{json}");
     assert!(root.path().join(".awman/Dockerfile.pi").is_file());
     let output = cli(root.path(), home.path())
-        .args(["chat", "--agent", "pi", "--non-interactive"])
+        .args(["chat", "--agent", "pi", "--headless"])
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(37), "{output:?}");
@@ -505,7 +505,7 @@ fn unattended_invocations_never_approve_or_ping() {
         &["ready", "--agent", "pi", "-n"],
         &["ready", "--agent", "pi", "--json"],
         &["ready", "--agent", "pi", "--yes"],
-        &["chat", "--agent", "pi", "--non-interactive"],
+        &["chat", "--agent", "pi", "--headless"],
         &["exec", "prompt", "--agent", "pi", "-n", "hi"],
     ] {
         let output = cli(root.path(), home.path()).args(argv).output().unwrap();

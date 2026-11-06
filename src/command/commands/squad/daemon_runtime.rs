@@ -17,8 +17,6 @@ use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
 use crate::data::config::env::Env;
 use crate::data::fs::{DataPaths, SquadPaths};
-use crate::data::session::{SessionId, SessionOpenOptions};
-use crate::data::session_manager::{ManagedSession, SessionManager};
 use crate::data::workflow_state::WorkflowState;
 use crate::engine::squad::{SquadDaemonDeps, SquadDaemonEngine, TaskEvaluator};
 
@@ -36,8 +34,6 @@ pub enum SquadWorkflowLookup {
 pub struct SquadDaemonHandles {
     engine: SquadDaemonEngine,
     gateway: Arc<LocalTaskGateway>,
-    sessions: Arc<SessionManager>,
-    session_id: SessionId,
     engines: Engines,
 }
 
@@ -85,17 +81,9 @@ impl SquadDaemonHandles {
             tracing::debug!(error = %error, "squad env: initial required_env refresh failed");
         }
 
-        let cwd = std::env::current_dir().map_err(|error| {
-            CommandError::Other(format!("cannot resolve squad working directory: {error}"))
-        })?;
-        let sessions = Arc::new(SessionManager::in_memory(Env::from_process()));
-        let session_id = sessions.open_or_create(cwd, SessionOpenOptions::default())?;
-
         Ok(Self {
             engine,
             gateway,
-            sessions,
-            session_id,
             engines,
         })
     }
@@ -118,18 +106,6 @@ impl SquadDaemonHandles {
     /// The gateway the daemon's own command route dispatches through.
     pub fn gateway(&self) -> Arc<dyn TaskGateway> {
         self.gateway.clone()
-    }
-
-    /// The session every dispatched command runs against.
-    pub fn session(&self) -> ManagedSession {
-        self.sessions
-            .get(&self.session_id)
-            .expect("squad daemon session must be registered")
-    }
-
-    /// The daemon's shared session owner, for the HTTP transport state.
-    pub fn session_manager(&self) -> Arc<SessionManager> {
-        Arc::clone(&self.sessions)
     }
 
     /// The engine bundle Dispatch needs.

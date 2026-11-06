@@ -1,12 +1,14 @@
-//! `DataPaths` — the shared (non-API-specific) data root.
+//! `DataPaths` — the awman home layout and the shared data root.
 //!
-//! The sqlite database moves out of the API-mode directory (`~/.awman/api/`)
-//! into a shared `~/.awman/data/` once squad also owns tables in it. `DataPaths`
-//! resolves `<data_home>/data/awman.db` using the same precedence
-//! `GlobalConfig::data_home_with` implements (`AWMAN_CONFIG_HOME` →
-//! `XDG_DATA_HOME/awman` → `$HOME/.awman`). No new env var — the DB relocates
-//! in lockstep with every other relocatable path.
+//! Every awman path derives from two homes:
 //!
+//! | Need | `AWMAN_HOME` set | unset, XDG set | unset, no XDG |
+//! |---|---|---|---|
+//! | config home (`config.json`) | `$AWMAN_HOME` | `$XDG_CONFIG_HOME/awman` | `~/.awman` |
+//! | data home (everything else) | `$AWMAN_HOME` | `$XDG_DATA_HOME/awman` | `~/.awman` |
+//!
+//! Under the data home: `data/awman.db`, `data/repos/<hash>/state.json`,
+//! `api/`, `squad/`, `attach/`, `builtin/`, and the other data dirs.
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -14,8 +16,50 @@ use std::time::{Duration, SystemTime};
 use sha2::{Digest, Sha256};
 
 use crate::data::config::env::{Env, EnvSnapshot};
-use crate::data::config::global::GlobalConfig;
 use crate::data::error::DataError;
+
+/// The one process variable that relocates every awman path.
+pub const AWMAN_HOME: &str = "AWMAN_HOME";
+
+/// Subdirectory of `$HOME` used when neither `AWMAN_HOME` nor XDG is set.
+pub const HOME_SUBDIR: &str = ".awman";
+
+/// `AWMAN_HOME`, when set and non-empty.
+pub fn awman_home(env: &EnvSnapshot) -> Option<PathBuf> {
+    env.get(AWMAN_HOME)
+        .filter(|v| !v.trim().is_empty())
+        .map(PathBuf::from)
+}
+
+/// Where `config.json` lives: `$AWMAN_HOME` → `$XDG_CONFIG_HOME/awman` → `~/.awman`.
+pub fn config_home(env: &EnvSnapshot) -> Result<PathBuf, DataError> {
+    if let Some(home) = awman_home(env) {
+        return Ok(home);
+    }
+    if let Some(xdg) = env.xdg_config_home() {
+        return Ok(xdg.join("awman"));
+    }
+    user_home(env)
+}
+
+/// Where everything else lives: `$AWMAN_HOME` → `$XDG_DATA_HOME/awman` → `~/.awman`.
+pub fn data_home(env: &EnvSnapshot) -> Result<PathBuf, DataError> {
+    if let Some(home) = awman_home(env) {
+        return Ok(home);
+    }
+    if let Some(xdg) = env.xdg_data_home() {
+        return Ok(xdg.join("awman"));
+    }
+    user_home(env)
+}
+
+fn user_home(env: &EnvSnapshot) -> Result<PathBuf, DataError> {
+    let home = env
+        .home_dir()
+        .or_else(dirs::home_dir)
+        .ok_or(DataError::HomeNotFound)?;
+    Ok(home.join(HOME_SUBDIR))
+}
 
 /// Subdirectory under the data home that hosts the shared database.
 pub const DATA_SUBDIR: &str = "data";
@@ -62,13 +106,29 @@ impl DataPaths {
 
     /// Resolve from a supplied env snapshot: `<data_home>/data`.
     pub fn from_env(env: &EnvSnapshot) -> Result<Self, DataError> {
-        let data_home = GlobalConfig::data_home_with(env)?;
+        let data_home = data_home(env)?;
         Ok(Self::at_root(data_home.join(DATA_SUBDIR)))
+    }
+
+    /// Where `config.json` lives for `env` (see [`config_home`]).
+    pub fn config_home(env: &EnvSnapshot) -> Result<PathBuf, DataError> {
+        config_home(env)
     }
 
     /// The shared data root (`<data_home>/data`).
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// The data home this root sits in (`<data_home>`).
+    pub fn home(&self) -> &Path {
+        self.root.parent().unwrap_or(&self.root)
+    }
+
+    /// Per-repo state directory: `<root>/repos/<first 16 hex of sha256(git_root)>`.
+    pub fn repo_state_dir(&self, git_root: &Path) -> PathBuf {
+        let hash = crate::data::fs::hash::sha256_hex(git_root.to_string_lossy().as_bytes());
+        self.root.join("repos").join(&hash[..16])
     }
 
     /// Path to the shared sqlite database (`<root>/awman.db`).
@@ -289,11 +349,11 @@ fn rename_legacy_aside(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::config::env::{AWMAN_CONFIG_HOME, XDG_DATA_HOME};
+    use crate::data::config::env::{XDG_CONFIG_HOME, XDG_DATA_HOME};
 
     #[test]
-    fn from_env_uses_config_home_data_subdir() {
-        let env = EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, "/cfg/home")]);
+    fn from_env_uses_awman_home_data_subdir() {
+        let env = EnvSnapshot::with_overrides([(AWMAN_HOME, "/cfg/home")]);
         let paths = DataPaths::from_env(&env).unwrap();
         assert_eq!(paths.root(), Path::new("/cfg/home/data"));
         assert_eq!(paths.db_path(), PathBuf::from("/cfg/home/data/awman.db"));
@@ -304,6 +364,46 @@ mod tests {
         let env = EnvSnapshot::with_overrides([(XDG_DATA_HOME, "/xdg/data")]);
         let paths = DataPaths::from_env(&env).unwrap();
         assert_eq!(paths.root(), Path::new("/xdg/data/awman/data"));
+    }
+
+    #[test]
+    fn awman_home_wins_over_xdg_for_both_homes() {
+        let env = EnvSnapshot::with_overrides([
+            (AWMAN_HOME, "/aw"),
+            (XDG_CONFIG_HOME, "/xc"),
+            (XDG_DATA_HOME, "/xd"),
+        ]);
+        assert_eq!(config_home(&env).unwrap(), PathBuf::from("/aw"));
+        assert_eq!(data_home(&env).unwrap(), PathBuf::from("/aw"));
+    }
+
+    #[test]
+    fn xdg_splits_config_and_data_homes_when_awman_home_is_unset() {
+        let env = EnvSnapshot::with_overrides([(XDG_CONFIG_HOME, "/xc"), (XDG_DATA_HOME, "/xd")]);
+        assert_eq!(config_home(&env).unwrap(), PathBuf::from("/xc/awman"));
+        assert_eq!(data_home(&env).unwrap(), PathBuf::from("/xd/awman"));
+    }
+
+    #[test]
+    fn removed_path_variables_are_ignored() {
+        let env = EnvSnapshot::with_overrides([
+            ("AWMAN_CONFIG_HOME", "/old"),
+            ("AWMAN_API_ROOT", "/old"),
+            ("AWMAN_SQUAD_ROOT", "/old"),
+            ("HOME", "/h"),
+        ]);
+        assert_eq!(config_home(&env).unwrap(), PathBuf::from("/h/.awman"));
+        assert_eq!(data_home(&env).unwrap(), PathBuf::from("/h/.awman"));
+    }
+
+    #[test]
+    fn repo_state_dir_is_stable_per_git_root() {
+        let paths = DataPaths::at_root("/aw/data");
+        let dir = paths.repo_state_dir(Path::new("/repo"));
+        assert!(dir.starts_with("/aw/data/repos"));
+        assert_eq!(dir.file_name().unwrap().len(), 16);
+        assert_eq!(dir, paths.repo_state_dir(Path::new("/repo")));
+        assert_eq!(paths.home(), Path::new("/aw"));
     }
 
     #[test]

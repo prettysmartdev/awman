@@ -1,5 +1,5 @@
 //! `AgentOutputFormat` — the structured output mode an agent CLI can print in
-//! non-interactive runs (WI 0137 §4).
+//! headless runs (WI 0137 §4).
 //!
 //! A capability of the agent table, not a name match: `claude` prints
 //! `--output-format stream-json`, `codex exec --json` prints its own JSON

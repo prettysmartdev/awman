@@ -193,7 +193,7 @@ pub fn first_party(name: &str) -> Option<AgentDefinition> {
         },
         "antigravity" => AgentDefinition {
             // Verified against `agy --help` (v1.0.x). Flags actually accepted:
-            //   --print / -p / --prompt           (non-interactive)
+            //   --print / -p / --prompt           (headless)
             //   --prompt-interactive / -i         (interactive seed)
             //   --dangerously-skip-permissions    (yolo)
             //   --print-timeout                   (default 5m, not surfaced here)
@@ -236,7 +236,7 @@ pub fn first_party(name: &str) -> Option<AgentDefinition> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::config::repo::LaunchMode;
+    use crate::data::config::agents::LaunchMode;
     use crate::engine::container::options::{AutoMode, Entrypoint, PlanMode, YoloMode};
     use crate::engine::error::EngineError;
 
@@ -412,7 +412,7 @@ mod tests {
     }
 
     /// Interactive codex runs without the app-server daemon; `codex exec`
-    /// rejects `--no-daemon`, so the non-interactive launch must not carry it.
+    /// rejects `--no-daemon`, so the headless launch must not carry it.
     #[test]
     fn codex_no_daemon_is_interactive_only() {
         let d = def("codex");

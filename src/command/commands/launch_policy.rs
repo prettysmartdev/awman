@@ -14,8 +14,8 @@ pub use crate::command::commands::agent_trust::{
     HostCommandReview, TrustDecision, TrustOutcome,
 };
 use crate::command::error::CommandError;
+use crate::data::config::agents::LaunchMode;
 use crate::data::config::overlays::{ContextOverlaySpec, ContextScope, TypedOverlay};
-use crate::data::config::repo::LaunchMode;
 use crate::data::config::EffectiveConfig;
 use crate::data::fs::ContextDirResolver;
 use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
@@ -102,17 +102,18 @@ impl<'a> LaunchPolicy<'a> {
         let mut flags = current.flags().clone();
         flags.agent = agent_flag.clone();
         flags.model = model_flag.clone();
-        flags.launch_mode = launch_mode_flag;
-        let config = EffectiveConfig::new(
-            flags,
-            current.env().clone(),
-            current.repo().clone(),
-            current.global().clone(),
-        );
-        let repo = current.repo();
+        let mut layers = current.layers().clone();
+        if let Some(mode) = launch_mode_flag {
+            layers.set.0.push((
+                "agents.launchMode".into(),
+                serde_json::to_value(mode).expect("launch mode serializes"),
+            ));
+        }
+        let config = EffectiveConfig::resolve(layers, flags, current.env().clone())?;
+        let repo = current.layers().repo.agents.clone().unwrap_or_default();
         let explicit_acp = launch_mode_flag == Some(LaunchMode::Acp)
             || (agent_flag.is_none()
-                && repo.agent.is_some()
+                && repo.default.is_some()
                 && repo.launch_mode == Some(LaunchMode::Acp));
         Self::resolve_launch_mode(self.session, &config, agent, explicit_acp)
     }
@@ -141,8 +142,8 @@ impl<'a> LaunchPolicy<'a> {
         agent: &AgentName,
         explicit_single_agent_acp: bool,
     ) -> Result<LaunchModeDecision, EngineError> {
-        use crate::data::config::global::LaunchModeFallback;
-        use crate::data::config::repo::LaunchMode;
+        use crate::data::config::agents::AcpFallback;
+        use crate::data::config::agents::LaunchMode;
 
         if config.launch_mode() == LaunchMode::Stdio {
             return Ok(LaunchModeDecision::Stdio);
@@ -150,7 +151,7 @@ impl<'a> LaunchPolicy<'a> {
         if AgentRegistry::resolve_for_session(session, agent)?.supports_acp {
             return Ok(LaunchModeDecision::Acp);
         }
-        if explicit_single_agent_acp || config.launch_mode_fallback() == LaunchModeFallback::Error {
+        if explicit_single_agent_acp || config.acp_fallback() == AcpFallback::Error {
             return Err(EngineError::AcpUnsupported {
                 agent: agent.as_str().to_string(),
             });
@@ -160,7 +161,7 @@ impl<'a> LaunchPolicy<'a> {
 
     pub fn acp_fallback_warning(agent: &AgentName) -> String {
         format!(
-            "agent '{}' does not support ACP; falling back to stdio for this session — see launchModeFallback",
+            "agent '{}' does not support ACP; falling back to stdio for this session — see agents.acpFallback",
             agent.as_str()
         )
     }
@@ -328,48 +329,17 @@ impl<'a> LaunchPolicy<'a> {
         Ok((overlays, prompt))
     }
 
-    /// Emit launch-time configuration warnings: the once-per-repo
-    /// `dynamicWorkflows` deprecation notice (gated by `notices`), deprecated
-    /// `envPassthrough` fields and `agentFlags` entries awman already manages.
-    pub fn warn_config(
-        &self,
-        notices: &crate::command::config_notices::ConfigNotices,
-        sink: &mut dyn UserMessageSink,
-    ) {
-        notices.warn_legacy_dynamic_workflows(self.session, sink);
+    /// Emit launch-time configuration warnings: `agents.flags` entries awman
+    /// already manages.
+    pub fn warn_config(&self, sink: &mut dyn UserMessageSink) {
         let ec = self.session.effective_config();
-        if ec.repo().legacy_env_passthrough.is_some() {
-            sink.write_message(UserMessage {
-                level: MessageLevel::Warning,
-                text: "'.awman/config.json' contains a deprecated 'envPassthrough' field. Move these vars to the 'overlays' array as env() expressions, e.g. \"env(VAR_NAME)\", then remove 'envPassthrough'.".into(),
-            });
-        }
-        if ec.global().legacy_env_passthrough.is_some() {
-            sink.write_message(UserMessage {
-                level: MessageLevel::Warning,
-                text: "'~/.awman/config.json' contains a deprecated 'envPassthrough' field. Move these vars to the 'overlays' array as env() expressions, e.g. \"env(VAR_NAME)\", then remove 'envPassthrough'.".into(),
-            });
-        }
-        // Load-time warnings (an unknown `workflows.prerequisites` key, a repo
-        // `allowApiClientGrants`, …): surfaced, never fatal (WI 0149 §5).
-        for (file, warnings) in [
-            ("'~/.awman/config.json'", &ec.global().load_warnings),
-            ("'.awman/config.json'", &ec.repo().load_warnings),
-        ] {
-            for warning in warnings {
-                sink.write_message(UserMessage {
-                    level: MessageLevel::Warning,
-                    text: format!("{file}: {warning}"),
-                });
-            }
-        }
         self.warn_redundant_agent_flags(&ec, sink);
     }
 
     /// Warn once per agent and flag when `agentFlags` (or `--agent-flag`)
     /// names a flag awman already passes on that agent's interactive
     /// launches (codex `--no-daemon`). The engine drops the duplicate on
-    /// those launches; a non-interactive launch keeps it as configured, and
+    /// those launches; a headless launch keeps it as configured, and
     /// the agent may reject it there (`codex exec` refuses `--no-daemon`).
     fn warn_redundant_agent_flags(&self, ec: &EffectiveConfig, sink: &mut dyn UserMessageSink) {
         for agent in FIRST_PARTY_AGENTS {
@@ -384,7 +354,7 @@ impl<'a> LaunchPolicy<'a> {
                         text: format!(
                             "agentFlags for {agent} includes `{flag}`, which awman already passes \
                              on interactive {agent} launches; it is not added twice there, and \
-                             non-interactive runs may reject it. Remove it from agentFlags."
+                             headless runs may reject it. Remove it from agentFlags."
                         ),
                     });
                 }
@@ -422,22 +392,20 @@ impl<'a> LaunchPolicy<'a> {
 #[cfg(test)]
 mod launch_mode_tests {
     use super::*;
-    use crate::data::config::global::{GlobalConfig, LaunchModeFallback};
-    use crate::data::config::repo::LaunchMode;
+    use crate::data::config::agents::AcpFallback;
+    use crate::data::config::ConfigFile;
 
-    fn config(fallback: LaunchModeFallback) -> EffectiveConfig {
-        EffectiveConfig::new(
-            crate::data::config::FlagConfig {
-                launch_mode: Some(LaunchMode::Acp),
-                ..Default::default()
-            },
+    fn config(fallback: AcpFallback) -> EffectiveConfig {
+        EffectiveConfig::from_files(
+            ConfigFile::test_json(serde_json::json!({"agents": {
+                "launchMode": "acp",
+                "acpFallback": fallback,
+            }})),
             Default::default(),
             Default::default(),
-            GlobalConfig {
-                launch_mode_fallback: Some(fallback),
-                ..Default::default()
-            },
+            Default::default(),
         )
+        .unwrap()
     }
 
     #[test]
@@ -464,13 +432,8 @@ mod launch_mode_tests {
         std::fs::write(&path, format!("{source}[acp]\ncommand=['pi','--acp']\n")).unwrap();
         approve();
         assert_eq!(
-            LaunchPolicy::resolve_launch_mode(
-                &session,
-                &config(LaunchModeFallback::Stdio),
-                &name,
-                false
-            )
-            .unwrap(),
+            LaunchPolicy::resolve_launch_mode(&session, &config(AcpFallback::Stdio), &name, false)
+                .unwrap(),
             LaunchModeDecision::Acp
         );
         std::fs::create_dir_all(home.join("agents")).unwrap();
@@ -482,13 +445,8 @@ mod launch_mode_tests {
         std::fs::write(&path, source).unwrap();
         approve();
         assert_eq!(
-            LaunchPolicy::resolve_launch_mode(
-                &session,
-                &config(LaunchModeFallback::Stdio),
-                &name,
-                false
-            )
-            .unwrap(),
+            LaunchPolicy::resolve_launch_mode(&session, &config(AcpFallback::Stdio), &name, false)
+                .unwrap(),
             LaunchModeDecision::StdioWithFallbackWarning
         );
     }
@@ -503,7 +461,7 @@ mod launch_mode_tests {
         assert_eq!(
             LaunchPolicy::resolve_launch_mode(
                 &session,
-                &config(LaunchModeFallback::Error),
+                &config(AcpFallback::Error),
                 &supported,
                 false
             )
@@ -513,7 +471,7 @@ mod launch_mode_tests {
         assert!(matches!(
             LaunchPolicy::resolve_launch_mode(
                 &session,
-                &config(LaunchModeFallback::Error),
+                &config(AcpFallback::Error),
                 &unsupported,
                 false
             ),
@@ -522,7 +480,7 @@ mod launch_mode_tests {
         assert_eq!(
             LaunchPolicy::resolve_launch_mode(
                 &session,
-                &config(LaunchModeFallback::Stdio),
+                &config(AcpFallback::Stdio),
                 &unsupported,
                 false
             )
@@ -532,7 +490,7 @@ mod launch_mode_tests {
         assert!(matches!(
             LaunchPolicy::resolve_launch_mode(
                 &session,
-                &config(LaunchModeFallback::Stdio),
+                &config(AcpFallback::Stdio),
                 &unsupported,
                 true
             ),
@@ -544,49 +502,13 @@ mod launch_mode_tests {
 #[cfg(test)]
 mod warn_config_tests {
     use super::*;
-    use crate::data::config::env::{EnvSnapshot, AWMAN_CONFIG_HOME};
+    use crate::data::config::env::EnvSnapshot;
+    use crate::data::fs::data_paths::AWMAN_HOME;
     use crate::data::message::{MessageLevel, RecordingMessageSink};
     use crate::data::session::Session;
 
     fn open_session(git_root: &std::path::Path, env: EnvSnapshot) -> Session {
         Session::for_tests_with_env(git_root, env)
-    }
-
-    #[test]
-    fn repo_legacy_env_passthrough_triggers_warning_mentioning_config_path() {
-        let git_tmp = tempfile::tempdir().unwrap();
-        let cfg_tmp = tempfile::tempdir().unwrap();
-
-        // Write a repo config with the legacy envPassthrough field.
-        let awman_dir = git_tmp.path().join(".awman");
-        std::fs::create_dir_all(&awman_dir).unwrap();
-        std::fs::write(
-            awman_dir.join("config.json"),
-            r#"{"envPassthrough": ["MY_VAR"]}"#,
-        )
-        .unwrap();
-
-        let env =
-            EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, cfg_tmp.path().to_str().unwrap())]);
-        let session = open_session(git_tmp.path(), env);
-
-        let mut sink = RecordingMessageSink::new();
-        LaunchPolicy::for_session(&session).warn_config(&Default::default(), &mut sink);
-
-        let warnings: Vec<_> = sink
-            .queued()
-            .iter()
-            .filter(|m| m.level == MessageLevel::Warning)
-            .collect();
-        assert!(
-            !warnings.is_empty(),
-            "must emit at least one warning for legacy envPassthrough in repo config"
-        );
-        let text = &warnings[0].text;
-        assert!(
-            text.contains(".awman/config.json"),
-            "warning must mention .awman/config.json to identify the source file; got: {text}"
-        );
     }
 
     /// An `agentFlags` entry awman already manages warns once, naming the
@@ -599,15 +521,14 @@ mod warn_config_tests {
         std::fs::create_dir_all(&awman_dir).unwrap();
         std::fs::write(
             awman_dir.join("config.json"),
-            r#"{"agentFlags": {"codex": ["--no-daemon", "--search"], "claude": ["--verbose"]}}"#,
+            r#"{"agents": {"flags": {"codex": ["--no-daemon", "--search"], "claude": ["--verbose"]}}}"#,
         )
         .unwrap();
-        let env =
-            EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, cfg_tmp.path().to_str().unwrap())]);
+        let env = EnvSnapshot::with_overrides([(AWMAN_HOME, cfg_tmp.path().to_str().unwrap())]);
         let session = open_session(git_tmp.path(), env);
 
         let mut sink = RecordingMessageSink::new();
-        LaunchPolicy::for_session(&session).warn_config(&Default::default(), &mut sink);
+        LaunchPolicy::for_session(&session).warn_config(&mut sink);
         let warnings: Vec<_> = sink
             .queued()
             .iter()
@@ -623,48 +544,13 @@ mod warn_config_tests {
     }
 
     #[test]
-    fn global_legacy_env_passthrough_triggers_warning_mentioning_global_config_path() {
-        let git_tmp = tempfile::tempdir().unwrap();
-        let cfg_tmp = tempfile::tempdir().unwrap();
-
-        // Write a global config with the legacy envPassthrough field.
-        std::fs::write(
-            cfg_tmp.path().join("config.json"),
-            r#"{"envPassthrough": ["GLOBAL_VAR"]}"#,
-        )
-        .unwrap();
-
-        let env =
-            EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, cfg_tmp.path().to_str().unwrap())]);
-        let session = open_session(git_tmp.path(), env);
-
-        let mut sink = RecordingMessageSink::new();
-        LaunchPolicy::for_session(&session).warn_config(&Default::default(), &mut sink);
-
-        let warnings: Vec<_> = sink
-            .queued()
-            .iter()
-            .filter(|m| m.level == MessageLevel::Warning)
-            .collect();
-        assert!(
-            !warnings.is_empty(),
-            "must emit at least one warning for legacy envPassthrough in global config"
-        );
-        let text = &warnings[0].text;
-        assert!(
-            text.contains("~/.awman/config.json"),
-            "warning must mention ~/.awman/config.json to identify the source file; got: {text}"
-        );
-    }
-
-    #[test]
     fn no_legacy_fields_produces_no_warning() {
         let tmp = tempfile::tempdir().unwrap();
-        let env = EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, tmp.path().to_str().unwrap())]);
+        let env = EnvSnapshot::with_overrides([(AWMAN_HOME, tmp.path().to_str().unwrap())]);
         let session = open_session(tmp.path(), env);
 
         let mut sink = RecordingMessageSink::new();
-        LaunchPolicy::for_session(&session).warn_config(&Default::default(), &mut sink);
+        LaunchPolicy::for_session(&session).warn_config(&mut sink);
 
         assert!(
             sink.queued().is_empty(),
@@ -850,18 +736,18 @@ mod cross_entrypoint_tests {
         std::fs::create_dir(tmp.path().join(".awman")).unwrap();
         std::fs::write(
             tmp.path().join(".awman/config.json"),
-            serde_json::to_vec(&serde_json::json!({
-                "agent": case.repo_agent,
+            serde_json::to_vec(&serde_json::json!({"agents": {
+                "default": case.repo_agent,
                 "launchMode": case.repo_mode,
-                "auth": "none",
-            }))
+                "auth": {"mode": "none"},
+            }}))
             .unwrap(),
         )
         .unwrap();
         std::fs::create_dir(tmp.path().join("home")).unwrap();
         std::fs::write(
             tmp.path().join("home/config.json"),
-            r#"{"launchModeFallback":"stdio"}"#,
+            r#"{"agents":{"acpFallback":"stdio"}}"#,
         )
         .unwrap();
         let session = Session::for_tests_isolated(tmp.path(), &tmp.path().join("home"));

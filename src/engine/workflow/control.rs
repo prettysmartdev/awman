@@ -91,7 +91,7 @@ impl WorkflowEngine {
     ///
     /// Interactive frontends (CLI on a TTY, TUI) get the Workflow Control Board
     /// with the failure attached and drive the recovery themselves. Unattended
-    /// frontends (squad daemon, API server, `--non-interactive`) get one yolo
+    /// frontends (squad daemon, API server, `--headless`) get one yolo
     /// countdown and one automatic retry; a second failure of the same step
     /// fails the workflow (WI-0115 §1, §3).
     pub(super) async fn handle_step_failure(

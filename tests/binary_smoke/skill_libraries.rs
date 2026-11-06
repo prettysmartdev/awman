@@ -41,7 +41,7 @@ fn pull_conflicts_are_rejected_before_git_or_container_launch() {
     for conflicting_flag in ["--interview", "--global"] {
         let output = Command::new(awman_bin())
             .env("PATH", &path)
-            .env("AWMAN_CONFIG_HOME", tmp.path().join("home"))
+            .env("AWMAN_HOME", tmp.path().join("home"))
             .args([
                 "new",
                 "skill",
@@ -169,7 +169,7 @@ fn pull_all_with_one_unreachable_remote_refreshes_the_rest_and_exits_nonzero() {
 
     let output = Command::new(awman_bin())
         .current_dir(&work)
-        .env("AWMAN_CONFIG_HOME", &home)
+        .env("AWMAN_HOME", &home)
         .args(["new", "skill", "--pull-all"])
         .output()
         .expect("run awman new skill --pull-all");
@@ -216,7 +216,7 @@ fn pull_all_with_no_libraries_is_informational_and_exits_zero() {
 
     let output = Command::new(awman_bin())
         .current_dir(&work)
-        .env("AWMAN_CONFIG_HOME", tmp.path().join("home"))
+        .env("AWMAN_HOME", tmp.path().join("home"))
         .args(["new", "skill", "--pull-all"])
         .output()
         .expect("run awman new skill --pull-all");
@@ -288,7 +288,7 @@ fn pull_by_short_name_reports_the_refresh_and_exits_zero() {
     let output = Command::new(awman_bin())
         .current_dir(&work)
         .env("PATH", &path)
-        .env("AWMAN_CONFIG_HOME", &home)
+        .env("AWMAN_HOME", &home)
         .args(["new", "skill", "--pull", "good"])
         .output()
         .expect("run awman new skill --pull good");

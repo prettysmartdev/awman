@@ -210,10 +210,10 @@ fn exec_workflow_has_wf_alias() {
 }
 
 #[test]
-fn api_start_has_port_flag() {
+fn api_start_reads_listen_from_config() {
     let cat = CommandCatalogue::get();
     let start = cat.lookup(&["api", "start"]).unwrap();
-    assert!(start.find_flag("port").is_some());
+    assert!(start.find_flag("port").is_none());
 }
 
 #[test]
@@ -429,7 +429,7 @@ async fn workflow_mixed_agents_refuses_untrusted_before_start_and_deleted_defini
             runtime.clone(),
         ));
         let bus = EventBus::new(64);
-        let argv = vec![workflow.display().to_string(), "--non-interactive".into()];
+        let argv = vec![workflow.display().to_string(), "--headless".into()];
         let frontend = ApiDispatchFrontend::new("exec workflow", &argv, bus.sender());
         let dispatch = Dispatch::new(
             frontend,

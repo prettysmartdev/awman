@@ -3,7 +3,7 @@
 //! The lifecycle itself (is a daemon running, what key does this process hold,
 //! start one on demand) is Layer 1's [`SquadSupervisor`]. What stays here is
 //! the part that is genuinely Layer 2: turning the endpoint the supervisor
-//! reports into the [`RemoteTaskGateway`] commands speak through, and mapping
+//! reports into the [`RemoteSquadClient`] commands speak through, and mapping
 //! `EngineError` onto `CommandError`.
 //!
 //! WI 0114 F-28 moves the transport itself down, at
@@ -12,8 +12,9 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::command::commands::squad::client::RemoteSquadClient;
 use crate::command::commands::squad::env_sync;
-use crate::command::commands::squad::gateway::{RemoteTaskGateway, TaskGateway};
+use crate::command::commands::squad::gateway::TaskGateway;
 use crate::command::commands::squad::runtime_guard::require_container_tier;
 use crate::command::dispatch::catalogue::GatewayNeed;
 use crate::command::dispatch::Engines;
@@ -184,7 +185,7 @@ impl SquadGatewayResolver {
     }
 
     /// Mint a fresh key and restart the daemon onto it.
-    pub async fn refresh_key(&self) -> Result<RemoteTaskGateway, CommandError> {
+    pub async fn refresh_key(&self) -> Result<RemoteSquadClient, CommandError> {
         let endpoint = self.inner.refresh_key().await?;
         Self::synced_gateway(endpoint).await
     }
@@ -203,14 +204,14 @@ impl SquadGatewayResolver {
     /// Deliberately not called from [`Self::gateway_from_meta`] or
     /// [`Self::probe_gateway`]: `awman squad status` and the TUI's 10-second
     /// indicator poller use those, and neither should be pushing anything.
-    async fn synced_gateway(endpoint: SquadEndpoint) -> Result<RemoteTaskGateway, CommandError> {
+    async fn synced_gateway(endpoint: SquadEndpoint) -> Result<RemoteSquadClient, CommandError> {
         let gateway = Self::gateway_for_endpoint(endpoint)?;
         env_sync::sync_env(&gateway, false).await;
         Ok(gateway)
     }
 
     /// A gateway to the daemon named by its endpoint sidecar, if one exists.
-    pub fn gateway_from_meta(&self) -> Result<Option<RemoteTaskGateway>, CommandError> {
+    pub fn gateway_from_meta(&self) -> Result<Option<RemoteSquadClient>, CommandError> {
         self.inner
             .endpoint_from_meta()?
             .map(Self::gateway_for_endpoint)
@@ -219,7 +220,7 @@ impl SquadGatewayResolver {
 
     /// A gateway for a read-only health probe. Never mints a key — see
     /// [`SquadSupervisor::probe_endpoint`].
-    pub fn probe_gateway(&self) -> Result<Option<RemoteTaskGateway>, CommandError> {
+    pub fn probe_gateway(&self) -> Result<Option<RemoteSquadClient>, CommandError> {
         self.inner
             .probe_endpoint()?
             .map(Self::gateway_for_endpoint)
@@ -278,7 +279,7 @@ impl SquadGatewayResolver {
     }
 
     /// A gateway to a running daemon, starting one only when needed.
-    pub async fn ensure_running(&self) -> Result<RemoteTaskGateway, CommandError> {
+    pub async fn ensure_running(&self) -> Result<RemoteSquadClient, CommandError> {
         let endpoint = self.inner.ensure_running().await?;
         Self::synced_gateway(endpoint).await
     }
@@ -420,8 +421,8 @@ impl SquadGatewayResolver {
             .expect("squad pending key-setup mutex poisoned")
     }
 
-    fn gateway_for_endpoint(endpoint: SquadEndpoint) -> Result<RemoteTaskGateway, CommandError> {
-        Ok(RemoteTaskGateway::new(HttpCore::new(
+    fn gateway_for_endpoint(endpoint: SquadEndpoint) -> Result<RemoteSquadClient, CommandError> {
+        Ok(RemoteSquadClient::new(HttpCore::new(
             &endpoint.address,
             "v1",
             endpoint.key.as_ref(),
@@ -432,7 +433,7 @@ impl SquadGatewayResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::config::env::AWMAN_SQUAD_ROOT;
+    use crate::data::fs::data_paths::AWMAN_HOME;
 
     /// `health_from_env` classifies in Layer 2 for a caller that holds no
     /// resolver. With a squad root that exists but has no daemon behind it,
@@ -442,10 +443,8 @@ mod tests {
     #[tokio::test]
     async fn health_from_env_classifies_an_empty_squad_root_as_not_running() {
         let tmp = tempfile::tempdir().unwrap();
-        let env = EnvSnapshot::with_overrides([(
-            AWMAN_SQUAD_ROOT,
-            tmp.path().to_string_lossy().to_string(),
-        )]);
+        let env =
+            EnvSnapshot::with_overrides([(AWMAN_HOME, tmp.path().to_string_lossy().to_string())]);
 
         let health = SquadGatewayResolver::health_from_env(&env, Duration::from_secs(2)).await;
 

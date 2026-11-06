@@ -132,7 +132,7 @@ fn open_squad_run_detail(app: &mut App) {
 /// Handle Enter in the ConfigShow dialog: advance the add-mapping flow, save
 /// the active inline edit, or begin editing the selected row.
 fn config_show_submit(app: &mut App) {
-    use crate::command::commands::config::{ConfigEditRequest, ConfigRowShape};
+    use crate::command::commands::config::{ConfigEditRequest, ConfigRowKind};
     use dialogs::NewMapEntryPhase;
 
     let mut toast: Option<String> = None;
@@ -213,7 +213,7 @@ fn config_show_submit(app: &mut App) {
                         .map(|(index, _)| {
                             state.rows[index + 1..]
                                 .iter()
-                                .take_while(|row| matches!(row.shape, ConfigRowShape::ListEntry))
+                                .take_while(|row| matches!(row.shape, ConfigRowKind::ListEntry))
                                 .filter(|row| {
                                     let value = if state.edit_column == 0 {
                                         &row.global

@@ -1,734 +1,2309 @@
-//! `ConfigFieldSpec` — one row per config field.
+//! The key table: the single source of truth for every leaf config key.
 //!
-//! Before WI 0114 F-51 a config field's properties were spread over seven
-//! string-keyed lookups in `commands/config.rs`: a `(name, scope)` table, a
-//! `match name` for the value kind, a `READ_ONLY_FIELDS` slice, a
-//! `field_writability` derivation, a `match name` for the format hint, and a
-//! `SENSITIVE_FIELDS` slice. Adding a field meant editing up to six of them,
-//! and nothing made it obvious which.
+//! One row per leaf of the config tree. File validation (unknown keys, scope,
+//! value shape), the built-in defaults layer, merge behaviour, `config show`
+//! data, masking, live-reload classification, derived environment-variable
+//! names and the generated docs table all come from [`CONFIG_KEYS`].
 //!
-//! Layer 0 because the fields *are* the config schema: what `RepoConfig` and
-//! `GlobalConfig` accept, which of the two a value may be written to, and what
-//! shape a value has.
+//! Layer 0: the rows *are* the config schema.
 
-/// Which config file a field may be written to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FieldScope {
-    /// May only be written to global config.
-    GlobalOnly,
-    /// May only be written to repo config.
-    RepoOnly,
-    /// May be written to either global or repo config.
-    Both,
-}
+use std::collections::BTreeMap;
 
-/// What kind of value a field accepts.
-///
-/// Lets a renderer format the value cell and lets `set` reject bad input
-/// early. Distinct from a field's *shape* (scalar, map member, array element),
-/// which is `ConfigRowShape` — that is about what a frontend may
-/// do with a row, not about what the value is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+use serde_json::Value;
+
+/// Which files a key may appear in. `Task` includes repo and global; `Repo`
+/// includes global.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ConfigFieldKind {
-    Bool,
-    Number,
-    /// Fixed enum (e.g. agent name); the `set` validator rejects values
-    /// outside the documented set.
-    Enum,
-    String,
+pub enum KeyScope {
+    Global,
+    Repo,
+    Task,
 }
 
-/// One config field, whole.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ConfigFieldSpec {
-    /// Dotted name, as `awman config get|set` takes it.
-    pub name: &'static str,
-    pub scope: FieldScope,
-    pub kind: ConfigFieldKind,
-    /// Scalar editor input is a comma-separated string array.
-    pub comma_list: bool,
-    /// Computed by awman itself and not settable by the user. Surfaced with
-    /// `(read-only)` in the table.
-    pub read_only: bool,
-    /// Holds a credential: shown masked, never in full.
-    pub sensitive: bool,
-    /// Human-readable format hint shown while editing. `None` for fields
-    /// whose shape is evident from the current value.
-    pub hint: Option<&'static str>,
-    /// Legacy spellings are accepted as input only, in their original scope.
-    pub aliases: &'static [FieldAlias],
-    pub shape: ConfigRowShape,
-}
-
-/// A row's editing behavior, supplied to frontends as registry data.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ConfigRowShape {
-    Scalar,
-    MapHeader { child_prefix: &'static str },
-    ListHeader { child_prefix: &'static str },
-    MapEntry,
-    ListEntry,
-}
-
-impl ConfigRowShape {
-    pub fn child_prefix(self) -> Option<&'static str> {
+impl KeyScope {
+    pub fn as_str(self) -> &'static str {
         match self {
-            Self::MapHeader { child_prefix } | Self::ListHeader { child_prefix } => {
-                Some(child_prefix)
+            Self::Global => "global",
+            Self::Repo => "repo",
+            Self::Task => "task",
+        }
+    }
+
+    /// The files a key of this scope may appear in, for error messages.
+    pub fn allowed_files(self) -> &'static str {
+        match self {
+            Self::Global => "the global config file (<AWMAN_HOME>/config.json)",
+            Self::Repo => {
+                "the global or repo config file (<AWMAN_HOME>/config.json, <repo>/.awman/config.json)"
             }
-            _ => None,
+            Self::Task => {
+                "the global, repo or squad task config file (<AWMAN_HOME>/config.json, \
+                 <repo>/.awman/config.json, <AWMAN_HOME>/squad/tasks/<name>/config.json)"
+            }
         }
     }
+}
 
-    pub fn is_header(self) -> bool {
-        self.child_prefix().is_some()
-    }
+/// The kind of file a key was found in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileKind {
+    Global,
+    Repo,
+    Task,
+}
 
-    pub fn member_shape(self) -> Option<ConfigRowShape> {
+impl FileKind {
+    pub fn as_str(self) -> &'static str {
         match self {
-            Self::MapHeader { .. } => Some(Self::MapEntry),
-            Self::ListHeader { .. } => Some(Self::ListEntry),
-            _ => None,
+            Self::Global => "the global config file",
+            Self::Repo => "a repo config file",
+            Self::Task => "a squad task config file",
+        }
+    }
+
+    /// Whether a key of `scope` may appear in a file of this kind.
+    pub fn admits(self, scope: KeyScope) -> bool {
+        match self {
+            Self::Global => true,
+            Self::Repo => scope >= KeyScope::Repo,
+            Self::Task => scope == KeyScope::Task,
         }
     }
 }
 
+/// What a leaf value is. Drives parsing of `--set`/env/`config set` input,
+/// validation of file values, and the docs "type" column.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FieldAlias {
-    pub name: &'static str,
-    pub scope: FieldScope,
+pub enum ValueKind {
+    Bool,
+    /// Inclusive bounds; `None` = unbounded on that side.
+    Int {
+        min: Option<i64>,
+        max: Option<i64>,
+    },
+    String,
+    /// Closed set of lowercase / snake_case spellings.
+    Enum(&'static [&'static str]),
+    /// `"500ms" | "30s" | "15m" | "2h"`.
+    Duration,
+    /// `"512MiB" | "4GiB"`. Binary units only.
+    Size,
+    /// Comma-separated on `--set`/env/`config set`; a JSON array in files.
+    StringList,
+    IntList,
+    /// `k=v,k2=v2` on scalar input; a JSON object of strings in files.
+    StringMap,
+    /// Opaque typed JSON (`ImageSourceSpec`, `RegistryHostConfig`, …): shown
+    /// as a summary, never settable through `--set`/env/`config set`.
+    Object,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ResolvedFieldName {
-    pub canonical: String,
-    pub spec: &'static ConfigFieldSpec,
-    pub via_alias: Option<FieldAlias>,
-    pub member: Option<String>,
-    pub shape: ConfigRowShape,
-}
-
-pub const MAP_ENTRY_HINT: &str = "comma-separated model names; save an empty value to remove";
-pub const LIST_ENTRY_HINT: &str = "a single instruction; save an empty value to remove";
-
-impl ConfigFieldSpec {
-    /// Whether this field may be written to `(global, repo)`. A read-only
-    /// field is writable in neither.
-    pub fn writability(&self) -> (bool, bool) {
-        if self.read_only {
-            return (false, false);
-        }
-        match self.scope {
-            FieldScope::GlobalOnly => (true, false),
-            FieldScope::RepoOnly => (false, true),
-            FieldScope::Both => (true, true),
+impl ValueKind {
+    /// The docs "type" column.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Bool => "bool".into(),
+            Self::Int { min, max } => match (min, max) {
+                (Some(lo), Some(hi)) => format!("int {lo}..{hi}"),
+                (Some(lo), None) => format!("int ≥ {lo}"),
+                (None, Some(hi)) => format!("int ≤ {hi}"),
+                (None, None) => "int".into(),
+            },
+            Self::String => "string".into(),
+            Self::Enum(values) => format!("enum `{}`", values.join("\\|")),
+            Self::Duration => "duration".into(),
+            Self::Size => "size".into(),
+            Self::StringList => "list<string>".into(),
+            Self::IntList => "list<int>".into(),
+            Self::StringMap => "map<string,string>".into(),
+            Self::Object => "object".into(),
         }
     }
 }
 
-/// Every config field `awman config` accepts.
-///
-/// Order is display order in `awman config show`.
-pub const CONFIG_FIELDS: &[ConfigFieldSpec] = &[
-    f(
+/// How a key combines across layers. Scalars always replace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Merge {
+    Replace,
+    /// Arrays only: concatenate in precedence order, dedupe by trimmed value.
+    Concat,
+}
+
+/// One leaf key. `path` segments are `camelCase`; a `*` segment is a
+/// user-chosen name (`workServers.*.url`), validated by [`MAP_NAME`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConfigKey {
+    pub path: &'static str,
+    pub kind: ValueKind,
+    /// JSON literal text of the built-in default (`"null"`, `"\"30s\""`,
+    /// `"[]"`, `"{}"`, `"2"`). Parsed by [`ConfigKey::default_value`].
+    pub default: &'static str,
+    pub scope: KeyScope,
+    /// Masked in every output (`config show/get`, `GET /v1/config`, logs).
+    pub sensitive: bool,
+    /// A running daemon picks it up on `POST /v1/config/reload`.
+    pub live: bool,
+    pub merge: Merge,
+    /// One sentence; the docs "meaning" column.
+    pub doc: &'static str,
+}
+
+/// `[a-z0-9][a-z0-9_-]{0,62}` — the only shape a `*` segment may take.
+pub const MAP_NAME: &str = "[a-z0-9][a-z0-9_-]{0,62}";
+
+/// Process variables the derived names may never collide with.
+pub const RESERVED_ENV: &[&str] = &[
+    "AWMAN_HOME",
+    "AWMAN_REMOTE_SESSION",
+    // Until 0140 replaces the squad bearer key with the owner-only socket.
+    "AWMAN_SQUAD_KEY",
+    "AWMAN_TEST_ISOLATION",
+    "AWMAN_TEST_DOCKER",
+    "AWMAN_TEST_APPLE_CONTAINER",
+    "AWMAN_TEST_SBX",
+    "AWMAN_TEST_BUILTIN",
+    "AWMAN_TEST_YOLO_COUNTDOWN_MS",
+];
+
+/// Whether `name` matches [`MAP_NAME`].
+pub fn is_valid_map_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    let ok_first = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit();
+    let ok_rest = |b: u8| ok_first(b) || b == b'_' || b == b'-';
+    !bytes.is_empty()
+        && bytes.len() <= 63
+        && ok_first(bytes[0])
+        && bytes[1..].iter().all(|b| ok_rest(*b))
+}
+
+/// The duplicate-detection form of a map name: `-` folded to `_`.
+pub fn fold_map_name(name: &str) -> String {
+    name.replace('-', "_")
+}
+
+const fn row(
+    path: &'static str,
+    kind: ValueKind,
+    default: &'static str,
+    scope: KeyScope,
+    live: bool,
+    doc: &'static str,
+) -> ConfigKey {
+    ConfigKey {
+        path,
+        kind,
+        default,
+        scope,
+        sensitive: false,
+        live,
+        merge: Merge::Replace,
+        doc,
+    }
+}
+
+const fn int(min: Option<i64>, max: Option<i64>) -> ValueKind {
+    ValueKind::Int { min, max }
+}
+
+const POSITIVE: ValueKind = int(Some(1), None);
+const CREDENTIAL_USE: ValueKind = ValueKind::Enum(&["ask", "allow", "deny"]);
+const INTERACTION: ValueKind = ValueKind::Enum(&["interactive", "headless"]);
+
+use KeyScope::{Global, Repo, Task};
+use ValueKind::{Bool, Duration, Object, Size, StringList, StringMap};
+
+/// Every leaf, in `config show` display order.
+pub const CONFIG_KEYS: &[ConfigKey] = &[
+    // agents
+    row(
+        "agents.default",
+        ValueKind::String,
+        "null",
+        Task,
+        false,
+        "Agent used when no --agent flag names one.",
+    ),
+    row(
+        "agents.stuckTimeout",
+        Duration,
+        "\"30s\"",
+        Task,
+        false,
+        "Inactivity after which an agent is reported as stuck.",
+    ),
+    row(
+        "agents.launchMode",
+        ValueKind::Enum(&["stdio", "acp"]),
+        "\"stdio\"",
+        Task,
+        false,
+        "How an agent process is connected to awman.",
+    ),
+    row(
+        "agents.acpFallback",
+        ValueKind::Enum(&["stdio", "error"]),
+        "\"error\"",
+        Repo,
+        false,
+        "What to do when ACP is requested for an agent that does not support it.",
+    ),
+    row(
+        "agents.flags.*",
+        StringList,
+        "[]",
+        Task,
+        false,
+        "Extra arguments appended to the named agent's launch command.",
+    ),
+    row(
+        "agents.yolo.disallowedTools",
+        StringList,
+        "[]",
+        Task,
+        false,
+        "Tools an agent may not use in yolo mode.",
+    ),
+    row(
+        "agents.auth.mode",
+        ValueKind::Enum(&["keychain", "passthrough", "none"]),
+        "\"keychain\"",
+        Repo,
+        false,
+        "How host credentials are injected into agent containers.",
+    ),
+    row(
+        "agents.auth.refresh.enabled",
+        Bool,
+        "true",
+        Repo,
+        false,
+        "Refresh agent credentials while an agent runs.",
+    ),
+    row(
+        "agents.auth.refresh.threshold",
+        Duration,
+        "\"20m\"",
+        Repo,
+        false,
+        "Refresh a credential when it expires sooner than this.",
+    ),
+    row(
+        "agents.auth.refresh.tick",
+        Duration,
+        "\"60s\"",
+        Repo,
+        false,
+        "How often credential expiry is checked.",
+    ),
+    row(
+        "agents.programStatus.enabled",
+        Bool,
+        "true",
+        Repo,
+        false,
+        "Collect program status from agents (read from 0141).",
+    ),
+    // runtime
+    row(
+        "runtime.kind",
+        ValueKind::Enum(&["docker", "apple", "sbx", "builtin"]),
+        "\"docker\"",
+        Global,
+        false,
+        "Container runtime agents run in; sbx and builtin are experimental.",
+    ),
+    row(
+        "runtime.baseImage",
+        ValueKind::String,
+        "null",
+        Repo,
+        false,
+        "Base image tag for setup and teardown containers.",
+    ),
+    row(
+        "runtime.dockerfile",
+        ValueKind::String,
+        "\"Dockerfile.dev\"",
+        Repo,
+        false,
+        "Dockerfile, relative to the repo root, that agent images are built from.",
+    ),
+    row(
+        "runtime.builtin.stateDir",
+        ValueKind::String,
+        "null",
+        Repo,
+        false,
+        "Absolute private state directory of the builtin runtime (default <AWMAN_HOME>/builtin).",
+    ),
+    row(
+        "runtime.builtin.vcpus",
+        int(Some(1), Some(255)),
+        "2",
+        Repo,
+        false,
+        "Whole vCPUs per builtin agent VM.",
+    ),
+    row(
+        "runtime.builtin.memory",
+        Size,
+        "\"4GiB\"",
+        Repo,
+        false,
+        "Guest memory per builtin agent VM (at least 128MiB).",
+    ),
+    row(
+        "runtime.builtin.rootDisk",
+        Size,
+        "\"30GiB\"",
+        Repo,
+        false,
+        "Writable root disk per builtin agent VM (at least 256MiB).",
+    ),
+    row(
+        "runtime.builtin.mountQuota",
+        Size,
+        "\"30GiB\"",
+        Repo,
+        false,
+        "How much a builtin guest may add to each host mount (at least 1MiB).",
+    ),
+    row(
+        "runtime.builtin.builder.enabled",
+        Bool,
+        "false",
+        Repo,
+        false,
+        "Let awman ready build missing builtin images locally.",
+    ),
+    row(
+        "runtime.builtin.imageSource",
+        Object,
+        "null",
+        Repo,
+        false,
+        "Where awman ready acquires builtin images that are not cached.",
+    ),
+    row(
+        "runtime.builtin.images.*",
+        Object,
+        "{}",
+        Repo,
+        false,
+        "Per-image source overrides keyed by awman image tag.",
+    ),
+    row(
+        "runtime.builtin.registries.*",
+        Object,
+        "{}",
+        Repo,
+        false,
+        "Registry host settings keyed by host[:port].",
+    ),
+    row(
+        "runtime.builtin.network.mode",
+        ValueKind::Enum(&["none", "allowlist", "public"]),
+        "null",
+        Repo,
+        false,
+        "Builtin guest network policy; a repo may only narrow the global one.",
+    ),
+    row(
+        "runtime.builtin.network.allow",
+        StringList,
+        "null",
+        Repo,
+        false,
+        "Names a builtin guest may reach in allowlist mode.",
+    ),
+    row(
+        "runtime.builtin.network.hostPorts",
+        ValueKind::IntList,
+        "null",
+        Repo,
+        false,
+        "Host ports a builtin guest may reach.",
+    ),
+    row(
+        "runtime.builtin.network.nameservers",
+        StringList,
+        "null",
+        Repo,
+        false,
+        "DNS servers a builtin guest uses.",
+    ),
+    row(
+        "runtime.builtin.network.trustHostCas",
+        Bool,
+        "null",
+        Repo,
+        false,
+        "Install the host's trusted CA certificates in builtin guests.",
+    ),
+    // overlays
+    ConfigKey {
+        merge: Merge::Concat,
+        ..row(
+            "overlays",
+            StringList,
+            "[]",
+            Task,
+            false,
+            "Overlays applied to every agent container; layers add to each other.",
+        )
+    },
+    // workItems
+    row(
+        "workItems.dir",
+        ValueKind::String,
+        "\"aspec/work-items\"",
+        Repo,
+        false,
+        "Work items directory, relative to the repo root.",
+    ),
+    row(
+        "workItems.template",
+        ValueKind::String,
+        "null",
+        Repo,
+        false,
+        "Work item template (default <dir>/0000-template.md).",
+    ),
+    // workflows
+    row(
+        "workflows.maxConcurrentSteps",
+        POSITIVE,
+        "null",
+        Task,
+        false,
+        "Cap on concurrently running workflow steps (null = unlimited).",
+    ),
+    row(
         "workflows.prerequisites.preflight",
-        FieldScope::Both,
-        ConfigFieldKind::Enum,
-        Some("warn | off"),
+        ValueKind::Enum(&["warn", "off"]),
+        "\"warn\"",
+        Task,
+        false,
+        "Whether workflow prerequisites are checked before a run.",
     ),
-    f(
+    row(
         "workflows.prerequisites.unresolved",
-        FieldScope::Both,
-        ConfigFieldKind::Enum,
-        Some("warn | fail"),
+        ValueKind::Enum(&["warn", "fail"]),
+        "null",
+        Task,
+        false,
+        "What an unresolved prerequisite does (null = frontend default).",
     ),
-    f(
+    row(
         "workflows.prerequisites.gitIdentity.use",
-        FieldScope::Both,
-        ConfigFieldKind::Enum,
-        Some("ask | allow | deny"),
+        CREDENTIAL_USE,
+        "\"ask\"",
+        Task,
+        false,
+        "Whether workflows may use a git identity.",
     ),
-    f(
+    row(
         "workflows.prerequisites.gitIdentity.name",
-        FieldScope::Both,
-        ConfigFieldKind::String,
-        None,
+        ValueKind::String,
+        "null",
+        Task,
+        false,
+        "Fixed git author name for workflows.",
     ),
-    f(
+    row(
         "workflows.prerequisites.gitIdentity.email",
-        FieldScope::Both,
-        ConfigFieldKind::String,
-        None,
+        ValueKind::String,
+        "null",
+        Task,
+        false,
+        "Fixed git author email for workflows.",
     ),
-    f(
+    row(
         "workflows.prerequisites.ssh.use",
-        FieldScope::Both,
-        ConfigFieldKind::Enum,
-        Some("ask | allow | deny"),
+        CREDENTIAL_USE,
+        "\"ask\"",
+        Task,
+        false,
+        "Whether workflows may use an SSH key.",
     ),
-    f(
+    row(
         "workflows.prerequisites.ssh.key",
-        FieldScope::Both,
-        ConfigFieldKind::String,
-        Some("Path under ~/.ssh"),
+        ValueKind::String,
+        "null",
+        Task,
+        false,
+        "SSH key under ~/.ssh offered to workflows.",
     ),
-    f(
+    row(
         "workflows.prerequisites.githubToken.use",
-        FieldScope::Both,
-        ConfigFieldKind::Enum,
-        Some("ask | allow | deny"),
+        CREDENTIAL_USE,
+        "\"ask\"",
+        Task,
+        false,
+        "Whether workflows may use a GitHub token.",
     ),
-    list(
+    row(
         "workflows.prerequisites.githubToken.envVars",
-        FieldScope::Both,
+        StringList,
+        "[]",
+        Task,
+        false,
+        "Host variables a GitHub token is read from (empty = GH_TOKEN, GITHUB_TOKEN).",
     ),
-    f(
+    row(
         "workflows.prerequisites.githubToken.verify",
-        FieldScope::Both,
-        ConfigFieldKind::Bool,
-        None,
+        Bool,
+        "true",
+        Task,
+        false,
+        "Verify a GitHub token before a run.",
     ),
-    object(
-        "workflows.prerequisites.githubToken.acquire",
-        FieldScope::GlobalOnly,
+    row(
+        "workflows.prerequisites.githubToken.acquire.argv",
+        StringList,
+        "null",
+        Global,
+        false,
+        "Command that prints a GitHub token.",
     ),
-    f(
+    row(
+        "workflows.prerequisites.githubToken.acquire.timeout",
+        Duration,
+        "\"30s\"",
+        Global,
+        false,
+        "How long the token command may run (at most 300s).",
+    ),
+    row(
+        "workflows.prerequisites.githubToken.acquire.refresh",
+        ValueKind::Enum(&["start", "before_teardown"]),
+        "\"start\"",
+        Global,
+        false,
+        "When the token command runs.",
+    ),
+    row(
         "workflows.prerequisites.allowApiClientGrants",
-        FieldScope::GlobalOnly,
-        ConfigFieldKind::Bool,
-        None,
+        Bool,
+        "false",
+        Global,
+        false,
+        "Let API clients rely on stored prerequisite grants.",
     ),
-    f(
-        "agent",
-        FieldScope::RepoOnly,
-        ConfigFieldKind::Enum,
-        AGENT_HINT,
+    row(
+        "workflows.dynamic.defaultLeader",
+        ValueKind::String,
+        "null",
+        Task,
+        true,
+        "Default dynamic-workflow leader as agent::model.",
     ),
-    ConfigFieldSpec {
-        name: "auto_agent_auth_accepted",
-        scope: FieldScope::RepoOnly,
-        kind: ConfigFieldKind::Bool,
-        comma_list: false,
-        read_only: true,
-        sensitive: false,
-        aliases: &[],
-        shape: ConfigRowShape::Scalar,
-        hint: Some("true or false"),
+    row(
+        "workflows.dynamic.agentsToModels.*",
+        StringList,
+        "[]",
+        Task,
+        true,
+        "Models a dynamic-workflow leader may schedule for the named agent.",
+    ),
+    ConfigKey {
+        merge: Merge::Concat,
+        ..row(
+            "workflows.dynamic.guidance",
+            StringList,
+            "[]",
+            Task,
+            true,
+            "Instructions the dynamic-workflow leader follows; layers add (at most 50).",
+        )
     },
-    f(
-        "terminal_scrollback_lines",
-        FieldScope::Both,
-        ConfigFieldKind::Number,
-        Some("non-negative integer"),
-    ),
-    list("yoloDisallowedTools", FieldScope::Both),
-    object("workItems", FieldScope::RepoOnly),
-    list("overlays", FieldScope::Both),
-    f(
-        "agentStuckTimeout",
-        FieldScope::Both,
-        ConfigFieldKind::Number,
-        Some("non-negative integer (seconds)"),
-    ),
-    f(
-        "maxConcurrentAgents",
-        FieldScope::Both,
-        ConfigFieldKind::Number,
-        Some("integer >= 1 (unset = unlimited)"),
-    ),
-    f(
-        "runtime",
-        FieldScope::GlobalOnly,
-        ConfigFieldKind::Enum,
-        Some("docker | apple-containers | docker-sbx-experimental | builtin-experimental"),
-    ),
-    f(
-        "builtin.stateDir",
-        FieldScope::Both,
-        ConfigFieldKind::String,
-        Some("absolute private state path"),
-    ),
-    f(
-        "builtin.vcpus",
-        FieldScope::Both,
-        ConfigFieldKind::Number,
-        Some("whole vCPUs, 1-255"),
-    ),
-    f(
-        "builtin.memoryMib",
-        FieldScope::Both,
-        ConfigFieldKind::Number,
-        Some("memory in MiB, at least 128"),
-    ),
-    f(
-        "builtin.rootDiskMib",
-        FieldScope::Both,
-        ConfigFieldKind::Number,
-        Some("writable root disk in MiB, at least 256 (default 30720)"),
-    ),
-    f(
-        "builtin.mountQuotaMib",
-        FieldScope::Both,
-        ConfigFieldKind::Number,
-        Some("MiB the agent may add to each mount, at least 1 (default 30720)"),
-    ),
-    f(
-        "builtin.builder.enabled",
-        FieldScope::Both,
-        ConfigFieldKind::Bool,
-        Some("true or false (default false): build missing images in the source's own store"),
-    ),
-    ConfigFieldSpec {
-        name: "builtin.imageSource",
-        scope: FieldScope::Both,
-        kind: ConfigFieldKind::String,
-        comma_list: false,
-        read_only: true,
-        sensitive: false,
-        aliases: &[],
-        shape: ConfigRowShape::Scalar,
-        hint: Some("edit the typed source object in config JSON"),
-    },
-    ConfigFieldSpec {
-        name: "builtin.images",
-        scope: FieldScope::Both,
-        kind: ConfigFieldKind::String,
-        comma_list: false,
-        read_only: true,
-        sensitive: false,
-        aliases: &[],
-        shape: ConfigRowShape::Scalar,
-        hint: Some("edit per-image sources in config JSON"),
-    },
-    ConfigFieldSpec {
-        name: "builtin.registries",
-        scope: FieldScope::Both,
-        kind: ConfigFieldKind::String,
-        comma_list: false,
-        read_only: true,
-        sensitive: false,
-        aliases: &[],
-        shape: ConfigRowShape::Scalar,
-        hint: Some("edit registry settings in config JSON"),
-    },
-    ConfigFieldSpec {
-        name: "builtin.network",
-        scope: FieldScope::Both,
-        kind: ConfigFieldKind::String,
-        comma_list: false,
-        read_only: true,
-        sensitive: false,
-        aliases: &[],
-        shape: ConfigRowShape::Scalar,
-        hint: Some("edit the network policy object in config JSON"),
-    },
-    f(
-        "default_agent",
-        FieldScope::GlobalOnly,
-        ConfigFieldKind::Enum,
-        AGENT_HINT,
-    ),
-    object("api", FieldScope::GlobalOnly),
-    object("remote", FieldScope::GlobalOnly),
-    // Dot-notation nested fields
-    f(
-        "work_items.dir",
-        FieldScope::RepoOnly,
-        ConfigFieldKind::String,
-        None,
-    ),
-    f(
-        "work_items.template",
-        FieldScope::RepoOnly,
-        ConfigFieldKind::String,
-        None,
-    ),
-    list("api.workDirs", FieldScope::GlobalOnly),
-    list("api.workDirRoots", FieldScope::GlobalOnly),
-    f(
-        "remote.defaultAddr",
-        FieldScope::GlobalOnly,
-        ConfigFieldKind::String,
-        None,
-    ),
-    ConfigFieldSpec {
-        name: "remote.defaultAPIKey",
-        scope: FieldScope::GlobalOnly,
-        kind: ConfigFieldKind::String,
-        comma_list: false,
-        read_only: false,
-        sensitive: true,
-        aliases: &[],
-        shape: ConfigRowShape::Scalar,
-        hint: None,
-    },
-    f(
+    // worktree
+    row(
         "worktree.onDirtyMergeTarget",
-        FieldScope::Both,
-        ConfigFieldKind::Enum,
-        Some("ask | commit | stash | fail"),
+        ValueKind::Enum(&["ask", "commit", "stash", "fail"]),
+        "\"ask\"",
+        Repo,
+        false,
+        "What to do when the merge target has uncommitted changes.",
     ),
-    f(
+    row(
         "worktree.mergeFix.onFailure",
-        FieldScope::Both,
-        ConfigFieldKind::Enum,
-        Some("ask | agent | keep"),
+        ValueKind::Enum(&["ask", "agent", "keep"]),
+        "\"ask\"",
+        Repo,
+        false,
+        "What to do when merging a worktree branch fails.",
     ),
-    f(
+    row(
         "worktree.mergeFix.promptTemplate",
-        FieldScope::Both,
-        ConfigFieldKind::String,
-        Some("path relative to the git root"),
+        ValueKind::String,
+        "null",
+        Repo,
+        false,
+        "Prompt template, relative to the repo root, for the merge-fix agent.",
     ),
-    // Dynamic-workflow settings, available in both scopes.
-    ConfigFieldSpec {
-        aliases: &[FieldAlias {
-            name: "dynamicWorkflows.defaultLeader",
-            scope: FieldScope::RepoOnly,
-        }],
-        ..f(
-            "workflows.dynamic.defaultLeader",
-            FieldScope::Both,
-            ConfigFieldKind::String,
-            Some("agent::model (e.g. claude::claude-opus-4-8)"),
+    // tui
+    row(
+        "tui.scrollbackLines",
+        int(Some(0), None),
+        "10000",
+        Repo,
+        false,
+        "Scrollback lines kept per container terminal.",
+    ),
+    row(
+        "tui.backend",
+        ValueKind::Enum(&["auto", "daemon", "builtin"]),
+        "\"auto\"",
+        Repo,
+        false,
+        "Where the TUI runs commands (read from 0142).",
+    ),
+    row(
+        "tui.programStatus.emit",
+        Bool,
+        "true",
+        Repo,
+        false,
+        "Emit program status from the TUI (read from 0141).",
+    ),
+    row(
+        "tui.worker.enabled",
+        Bool,
+        "false",
+        Repo,
+        false,
+        "Run a pull worker inside the TUI (read from 0143).",
+    ),
+    row(
+        "tui.integrations.*",
+        Object,
+        "{}",
+        Repo,
+        false,
+        "Per-integration TUI settings (read from 0154).",
+    ),
+    // daemon
+    row(
+        "daemon.maxConcurrentJobs",
+        POSITIVE,
+        "2",
+        Global,
+        true,
+        "Jobs the daemon runs at once.",
+    ),
+    row(
+        "daemon.verboseSetup",
+        Bool,
+        "false",
+        Global,
+        true,
+        "Log session setup in detail.",
+    ),
+    row(
+        "daemon.terminal.cols",
+        POSITIVE,
+        "120",
+        Global,
+        true,
+        "Default daemon terminal width (read from 0141).",
+    ),
+    row(
+        "daemon.terminal.rows",
+        POSITIVE,
+        "40",
+        Global,
+        true,
+        "Default daemon terminal height (read from 0141).",
+    ),
+    row(
+        "daemon.terminal.remoteInput",
+        Bool,
+        "false",
+        Global,
+        true,
+        "Accept terminal input from network clients (read from 0141).",
+    ),
+    row(
+        "daemon.network.enabled",
+        Bool,
+        "false",
+        Global,
+        false,
+        "Serve the API on the network listener (read from 0140).",
+    ),
+    row(
+        "daemon.network.listen",
+        ValueKind::String,
+        "\"127.0.0.1:9876\"",
+        Global,
+        false,
+        "host:port the API listener binds; changing it needs a daemon restart.",
+    ),
+    row(
+        "daemon.network.tlsSans",
+        StringList,
+        "[]",
+        Global,
+        false,
+        "Extra names in the listener's TLS certificate (read from 0140).",
+    ),
+    row(
+        "daemon.network.features",
+        StringList,
+        "[\"worker\"]",
+        Global,
+        false,
+        "Features served on the network listener (read from 0140).",
+    ),
+    row(
+        "daemon.features.squad.enabled",
+        Bool,
+        "false",
+        Global,
+        true,
+        "Run the squad scheduler.",
+    ),
+    row(
+        "daemon.features.squad.interaction",
+        INTERACTION,
+        "\"interactive\"",
+        Global,
+        true,
+        "How squad evaluations interact.",
+    ),
+    row(
+        "daemon.features.squad.maxConcurrentJobs",
+        POSITIVE,
+        "1",
+        Global,
+        true,
+        "Squad runs at once.",
+    ),
+    row(
+        "daemon.features.squad.maxConcurrentEvaluations",
+        POSITIVE,
+        "2",
+        Global,
+        true,
+        "Squad evaluations at once.",
+    ),
+    row(
+        "daemon.features.squad.envPersistence",
+        ValueKind::Enum(&["keychain", "none"]),
+        "\"keychain\"",
+        Global,
+        false,
+        "Where the squad daemon persists pushed task environment.",
+    ),
+    row(
+        "daemon.features.worker.enabled",
+        Bool,
+        "false",
+        Global,
+        true,
+        "Run the worker feature.",
+    ),
+    row(
+        "daemon.features.worker.maxConcurrentJobs",
+        POSITIVE,
+        "2",
+        Global,
+        true,
+        "Worker jobs at once.",
+    ),
+    row(
+        "daemon.features.worker.push.enabled",
+        Bool,
+        "true",
+        Global,
+        true,
+        "Accept jobs pushed by API clients.",
+    ),
+    row(
+        "daemon.features.worker.push.interaction",
+        INTERACTION,
+        "\"headless\"",
+        Global,
+        true,
+        "Default interaction of pushed jobs.",
+    ),
+    row(
+        "daemon.features.worker.push.allowOverride",
+        Bool,
+        "true",
+        Global,
+        true,
+        "Let a pushed job choose its own interaction.",
+    ),
+    row(
+        "daemon.features.worker.push.workDirs.allow",
+        StringList,
+        "[]",
+        Global,
+        true,
+        "Directories pushed jobs may run in.",
+    ),
+    row(
+        "daemon.features.worker.push.workDirs.roots",
+        StringList,
+        "[]",
+        Global,
+        true,
+        "Directories whose children pushed jobs may run in.",
+    ),
+    row(
+        "daemon.features.worker.pull.enabled",
+        Bool,
+        "true",
+        Global,
+        true,
+        "Claim jobs from work servers (read from 0143).",
+    ),
+    row(
+        "daemon.features.worker.pull.interaction",
+        INTERACTION,
+        "\"interactive\"",
+        Global,
+        true,
+        "Default interaction of pulled jobs (read from 0143).",
+    ),
+    row(
+        "daemon.features.worker.pull.allowOverride",
+        Bool,
+        "true",
+        Global,
+        true,
+        "Let a pulled job choose its own interaction (read from 0143).",
+    ),
+    row(
+        "daemon.features.worker.pull.workRoot",
+        ValueKind::String,
+        "null",
+        Global,
+        true,
+        "Directory pulled jobs check out into (read from 0143).",
+    ),
+    row(
+        "daemon.features.engine.enabled",
+        Bool,
+        "false",
+        Global,
+        true,
+        "Serve TUI engines from the daemon (read from 0142).",
+    ),
+    row(
+        "daemon.features.engine.allowEphemeral",
+        Bool,
+        "true",
+        Global,
+        true,
+        "Start the engine feature on demand (read from 0142).",
+    ),
+    row(
+        "daemon.features.engine.idleTimeout",
+        Duration,
+        "\"15m\"",
+        Global,
+        true,
+        "Idle time after which an on-demand engine stops (read from 0142).",
+    ),
+    row(
+        "daemon.features.engine.maxConcurrentJobs",
+        POSITIVE,
+        "4",
+        Global,
+        true,
+        "Engine jobs at once (read from 0142).",
+    ),
+    // workServers
+    row(
+        "workServers.*.url",
+        ValueKind::String,
+        "null",
+        Global,
+        true,
+        "Work server URL; required for every entry (read from 0143).",
+    ),
+    row(
+        "workServers.*.enabled",
+        Bool,
+        "true",
+        Global,
+        true,
+        "Claim work from this server (read from 0143).",
+    ),
+    row(
+        "workServers.*.claim",
+        ValueKind::Enum(&["auto", "manual"]),
+        "\"auto\"",
+        Global,
+        true,
+        "Whether work is claimed automatically (read from 0143).",
+    ),
+    row(
+        "workServers.*.maxConcurrentJobs",
+        POSITIVE,
+        "1",
+        Global,
+        true,
+        "Jobs from this server at once (read from 0143).",
+    ),
+    row(
+        "workServers.*.interaction",
+        INTERACTION,
+        "null",
+        Global,
+        true,
+        "Interaction override for this server's jobs (read from 0143).",
+    ),
+    row(
+        "workServers.*.labels",
+        StringMap,
+        "{}",
+        Global,
+        true,
+        "Labels this worker advertises to the server (read from 0143).",
+    ),
+    // remote
+    row(
+        "remote.default",
+        ValueKind::String,
+        "null",
+        Global,
+        false,
+        "Target used when --remote names none.",
+    ),
+    row(
+        "remote.targets.*.url",
+        ValueKind::String,
+        "null",
+        Global,
+        false,
+        "Target API URL (https://host:port); required for every entry.",
+    ),
+    ConfigKey {
+        sensitive: true,
+        ..row(
+            "remote.targets.*.apiKey",
+            ValueKind::String,
+            "null",
+            Global,
+            false,
+            "Bearer API key for the target.",
         )
-    },
-    ConfigFieldSpec {
-        aliases: &[FieldAlias {
-            name: "dynamicWorkflows.maxConcurrentSteps",
-            scope: FieldScope::RepoOnly,
-        }],
-        ..f(
-            "workflows.dynamic.maxConcurrentSteps",
-            FieldScope::Both,
-            ConfigFieldKind::Number,
-            Some("integer >= 1"),
-        )
-    },
-    ConfigFieldSpec {
-        name: "workflows.dynamic.agentsToModels",
-        scope: FieldScope::Both,
-        kind: ConfigFieldKind::String,
-        comma_list: false,
-        // The map's own row is a header; the per-agent rows beneath it are
-        // editable.
-        read_only: true,
-        sensitive: false,
-        aliases: &[FieldAlias {
-            name: "dynamicWorkflows.agentsToModels",
-            scope: FieldScope::RepoOnly,
-        }],
-        shape: ConfigRowShape::MapHeader {
-            child_prefix: "workflows.dynamic.agentsToModels.",
-        },
-        hint: Some("press Ctrl+N to add an agent; edit per-agent rows inline"),
-    },
-    ConfigFieldSpec {
-        name: "workflows.dynamic.guidance",
-        scope: FieldScope::Both,
-        kind: ConfigFieldKind::String,
-        comma_list: false,
-        read_only: true,
-        sensitive: false,
-        aliases: &[FieldAlias {
-            name: "dynamicWorkflows.guidance",
-            scope: FieldScope::RepoOnly,
-        }],
-        shape: ConfigRowShape::ListHeader {
-            child_prefix: "workflows.dynamic.guidance.",
-        },
-        hint: Some(
-            "press Ctrl+N to add a guidance entry; edit per-entry rows inline; save an empty \
-             value to remove",
-        ),
     },
 ];
 
-/// The hint shared by the two agent-name fields. Filled in at use time with
-/// the catalogue's agent list, which is why it is not a plain string here.
-const AGENT_HINT: Option<&'static str> = Some("one of: {agents}");
-const LIST_HINT: Option<&'static str> = Some("comma-separated list");
+/// Old leaf path → new leaf path (+ an example value when the type changed).
+///
+/// Read only by [`KeyError::Unknown`] construction. Never consulted for
+/// input: an old key fails validation like any unknown key, and the hint
+/// only tells the user where it went. Delete this table one release after
+/// the item that introduced it ships.
+pub const MOVED_KEYS: &[(&str, &str, Option<&str>)] = &[
+    ("default_agent", "agents.default", None),
+    ("agent", "agents.default", None),
+    ("agentStuckTimeout", "agents.stuckTimeout", Some("\"30s\"")),
+    ("launchMode", "agents.launchMode", None),
+    ("launchModeFallback", "agents.acpFallback", None),
+    ("agentFlags", "agents.flags", None),
+    ("yoloDisallowedTools", "agents.yolo.disallowedTools", None),
+    ("auth", "agents.auth.mode", None),
+    ("authRefresh", "agents.auth.refresh", None),
+    (
+        "authRefresh.thresholdMinutes",
+        "agents.auth.refresh.threshold",
+        Some("\"20m\""),
+    ),
+    (
+        "authRefresh.tickSeconds",
+        "agents.auth.refresh.tick",
+        Some("\"60s\""),
+    ),
+    (
+        "runtime",
+        "runtime.kind",
+        Some("\"docker\" | \"apple\" | \"sbx\" | \"builtin\""),
+    ),
+    ("baseImage", "runtime.baseImage", None),
+    ("dockerfile", "runtime.dockerfile", None),
+    ("builtin", "runtime.builtin", None),
+    (
+        "builtin.memoryMib",
+        "runtime.builtin.memory",
+        Some("\"4GiB\""),
+    ),
+    (
+        "builtin.rootDiskMib",
+        "runtime.builtin.rootDisk",
+        Some("\"30GiB\""),
+    ),
+    (
+        "builtin.mountQuotaMib",
+        "runtime.builtin.mountQuota",
+        Some("\"30GiB\""),
+    ),
+    ("work_items", "workItems", None),
+    ("maxConcurrentAgents", "workflows.maxConcurrentSteps", None),
+    (
+        "workflows.dynamic.maxConcurrentSteps",
+        "workflows.maxConcurrentSteps",
+        None,
+    ),
+    ("dynamicWorkflows", "workflows.dynamic", None),
+    (
+        "workflows.prerequisites.githubToken.acquire.timeoutSecs",
+        "workflows.prerequisites.githubToken.acquire.timeout",
+        Some("\"30s\""),
+    ),
+    ("terminal_scrollback_lines", "tui.scrollbackLines", None),
+    ("workers", "daemon.maxConcurrentJobs", None),
+    (
+        "api.workDirs",
+        "daemon.features.worker.push.workDirs.allow",
+        None,
+    ),
+    (
+        "api.workDirRoots",
+        "daemon.features.worker.push.workDirs.roots",
+        None,
+    ),
+    (
+        "api.alwaysNonInteractive",
+        "daemon.features.worker.push.allowOverride",
+        Some("false (with interaction: \"headless\")"),
+    ),
+    (
+        "api.port",
+        "daemon.network.listen",
+        Some("\"127.0.0.1:9876\""),
+    ),
+    (
+        "squad.maxConcurrentEvaluations",
+        "daemon.features.squad.maxConcurrentEvaluations",
+        None,
+    ),
+    (
+        "squad.envPersistence",
+        "daemon.features.squad.envPersistence",
+        None,
+    ),
+    (
+        "squad.agentsToModels",
+        "workflows.dynamic.agentsToModels",
+        None,
+    ),
+    (
+        "squad.defaultLeader",
+        "workflows.dynamic.defaultLeader",
+        None,
+    ),
+    ("squad.guidance", "workflows.dynamic.guidance", None),
+    ("squad.workflows", "workflows", None),
+    (
+        "remote.defaultAddr",
+        "remote.targets.<name>.url (and remote.default = <name>)",
+        None,
+    ),
+    ("remote.defaultAPIKey", "remote.targets.<name>.apiKey", None),
+    ("remote.savedDirs", "(removed)", None),
+    (
+        "auto_agent_auth_accepted",
+        "(state, not config: <AWMAN_HOME>/data/repos/<hash>/state.json)",
+        None,
+    ),
+    ("envPassthrough", "overlays (env(VAR) entries)", None),
+];
 
-/// The common case: not read-only, not sensitive.
-const fn f(
-    name: &'static str,
-    scope: FieldScope,
-    kind: ConfigFieldKind,
-    hint: Option<&'static str>,
-) -> ConfigFieldSpec {
-    ConfigFieldSpec {
-        name,
-        scope,
-        kind,
-        comma_list: false,
-        read_only: false,
-        sensitive: false,
-        aliases: &[],
-        shape: ConfigRowShape::Scalar,
-        hint,
+/// The hint for an unknown path: the longest [`MOVED_KEYS`] entry that is the
+/// path itself or one of its prefixes. `""` when none matches.
+pub fn moved_hint(path: &str) -> String {
+    moved_entry(path).map(render_moved).unwrap_or_default()
+}
+
+type MovedEntry = (&'static str, &'static str, Option<&'static str>);
+
+fn moved_entry(path: &str) -> Option<&'static MovedEntry> {
+    MOVED_KEYS
+        .iter()
+        .filter(|(old, _, _)| path == *old || path.starts_with(&format!("{old}.")))
+        .max_by_key(|(old, _, _)| old.len())
+}
+
+fn render_moved(entry: &MovedEntry) -> String {
+    let (old, new, example) = entry;
+    match example {
+        Some(example) => format!("; `{old}` moved to `{new}` ({example})"),
+        None if new.starts_with('(') => format!("; `{old}` was removed {new}"),
+        None => format!("; `{old}` moved to `{new}`"),
     }
 }
 
-const fn list(name: &'static str, scope: FieldScope) -> ConfigFieldSpec {
-    let mut spec = f(name, scope, ConfigFieldKind::String, LIST_HINT);
-    spec.comma_list = true;
-    spec
-}
-
-const fn object(name: &'static str, scope: FieldScope) -> ConfigFieldSpec {
-    let mut spec = f(
-        name,
-        scope,
-        ConfigFieldKind::String,
-        Some("edit this object in config JSON"),
-    );
-    spec.read_only = true;
-    spec
-}
-
-/// The spec for `name`, if it is a known field.
-pub fn field_spec(name: &str) -> Option<&'static ConfigFieldSpec> {
-    CONFIG_FIELDS.iter().find(|spec| spec.name == name)
-}
-
-/// Dotted-name prefixes that are spelled differently in `config.json`.
-const JSON_KEY_PREFIXES: &[(&str, &str)] = &[("work_items.", "workItems.")];
-
-/// Where a canonical field name lives in the config JSON. Most names are
-/// their own path; `work_items.*` is stored under the `workItems` key.
-pub fn json_path(name: &str) -> std::borrow::Cow<'_, str> {
-    for (field_prefix, json_prefix) in JSON_KEY_PREFIXES {
-        if let Some(rest) = name.strip_prefix(field_prefix) {
-            return format!("{json_prefix}{rest}").into();
+/// The hint for an unknown key holding `value`: the most specific
+/// [`MOVED_KEYS`] entries for the key and every path inside it, so
+/// `{"squad": {"guidance": […]}}` names `workflows.dynamic.guidance`, not
+/// just the block.
+pub fn moved_hint_for_value(path: &str, value: &Value) -> String {
+    let mut paths = vec![path.to_string()];
+    let mut stack = vec![(path.to_string(), value)];
+    while let Some((prefix, node)) = stack.pop() {
+        if let Some(object) = node.as_object() {
+            for (name, child) in object {
+                let child_path = format!("{prefix}.{name}");
+                paths.push(child_path.clone());
+                stack.push((child_path, child));
+            }
         }
     }
-    name.into()
+    let own = moved_entry(path);
+    let mut entries: Vec<&MovedEntry> = Vec::new();
+    for p in &paths {
+        if let Some(entry) = moved_entry(p) {
+            if !entries.iter().any(|e| e.0 == entry.0) {
+                entries.push(entry);
+            }
+        }
+    }
+    // Prefer the specific entries inside the block over the block's own.
+    if entries.len() > 1 {
+        entries.retain(|e| Some(*e) != own);
+    }
+    entries.sort_by_key(|e| e.0);
+    entries.into_iter().map(render_moved).collect()
 }
 
-/// Resolve a canonical name, a header member, or either's legacy spelling.
-pub fn resolve_field_name(input: &str) -> Option<ResolvedFieldName> {
-    for spec in CONFIG_FIELDS {
-        let names = std::iter::once((spec.name, None))
-            .chain(spec.aliases.iter().map(|alias| (alias.name, Some(*alias))));
-        for (name, via_alias) in names {
-            if input == name {
-                return Some(ResolvedFieldName {
-                    canonical: spec.name.into(),
-                    spec,
-                    via_alias,
-                    member: None,
-                    shape: spec.shape,
+/// A key-table error. Every config validation message comes from here.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum KeyError {
+    #[error("unknown config key `{path}`{location}; valid keys here: {}{moved}", siblings.join(", "))]
+    Unknown {
+        path: String,
+        /// `""` or ` in <file>`.
+        location: String,
+        siblings: Vec<&'static str>,
+        /// `""` or `; \`old\` moved to \`new\` ("30s")`.
+        moved: String,
+    },
+    #[error("`{path}` may only be set in {allowed} (found in {found})")]
+    Scope {
+        path: String,
+        allowed: &'static str,
+        found: &'static str,
+    },
+    #[error("invalid value for `{path}`: {reason}")]
+    Value { path: String, reason: String },
+    #[error("invalid name `{name}` in `{path}`: must match {MAP_NAME}")]
+    Name { path: String, name: String },
+    #[error("`{a}` and `{b}` differ only by `-` versus `_`")]
+    DuplicateName { a: String, b: String },
+    #[error("`{path}` is an object; edit it in the config file")]
+    ObjectNotSettable { path: String },
+}
+
+impl KeyError {
+    /// An unknown-key error for `path` (concrete), listing what is valid next
+    /// to it and the moved-to hint.
+    pub fn unknown(path: &str) -> Self {
+        let parent = path.rsplit_once('.').map(|(p, _)| p).unwrap_or("");
+        Self::Unknown {
+            path: path.to_string(),
+            location: String::new(),
+            siblings: siblings(parent),
+            moved: moved_hint(path),
+        }
+    }
+
+    /// Attach the file the error was found in.
+    pub fn in_file(mut self, file: &std::path::Path) -> Self {
+        if let Self::Unknown { location, .. } = &mut self {
+            *location = format!(" in {}", file.display());
+        }
+        self
+    }
+}
+
+impl ConfigKey {
+    pub fn default_value(&self) -> Value {
+        serde_json::from_str(self.default).expect("key table defaults are valid JSON")
+    }
+
+    /// Whether the key has an environment-variable form (objects do not).
+    pub fn has_env(&self) -> bool {
+        self.kind != ValueKind::Object
+    }
+
+    /// `AWMAN_` + SCREAMING_SNAKE(path), `*` kept as a placeholder:
+    /// `agents.stuckTimeout` → `AWMAN_AGENTS_STUCK_TIMEOUT`,
+    /// `workServers.*.url` → `AWMAN_WORK_SERVERS_*_URL`.
+    pub fn env_pattern(&self) -> String {
+        let mut out = String::from("AWMAN");
+        for segment in self.path.split('.') {
+            out.push('_');
+            out.push_str(&screaming_snake(segment));
+        }
+        out
+    }
+
+    /// The concrete env name for a map entry: each `*` → upper(name) with
+    /// `-` → `_`, in order.
+    pub fn env_name(&self, names: &[&str]) -> String {
+        let mut names = names.iter();
+        let mut out = String::from("AWMAN");
+        for segment in self.path.split('.') {
+            out.push('_');
+            if segment == "*" {
+                let name = names.next().copied().unwrap_or("*");
+                out.push_str(&name.to_ascii_uppercase().replace('-', "_"));
+            } else {
+                out.push_str(&screaming_snake(segment));
+            }
+        }
+        out
+    }
+
+    /// Whether the path contains a user-chosen `*` segment.
+    pub fn is_map_member(&self) -> bool {
+        self.path.split('.').any(|s| s == "*")
+    }
+
+    /// First path segment.
+    pub fn section(&self) -> &'static str {
+        self.path.split('.').next().unwrap_or(self.path)
+    }
+
+    /// Whether `*` segments of this row are free-form (any non-empty JSON
+    /// key) rather than [`MAP_NAME`]. Only object maps with no env form —
+    /// image tags (`awman-x:latest`) and registry hosts (`ghcr.io`) — are.
+    fn free_form_names(&self) -> bool {
+        self.kind == ValueKind::Object && self.path.ends_with(".*")
+    }
+}
+
+fn screaming_snake(segment: &str) -> String {
+    let mut out = String::new();
+    for (i, c) in segment.chars().enumerate() {
+        if c.is_ascii_uppercase() && i > 0 {
+            out.push('_');
+        }
+        out.push(c.to_ascii_uppercase());
+    }
+    out
+}
+
+/// A concrete path bound to its row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedKey {
+    pub key: &'static ConfigKey,
+    /// The concrete path as given.
+    pub path: String,
+    /// Bound `*` segments, in order.
+    pub names: Vec<String>,
+}
+
+/// Whether a concrete path matches a row pattern, collecting `*` bindings.
+fn match_pattern(pattern: &str, segments: &[&str]) -> Option<Vec<String>> {
+    let parts: Vec<&str> = pattern.split('.').collect();
+    if parts.len() != segments.len() {
+        return None;
+    }
+    let mut names = Vec::new();
+    for (p, s) in parts.iter().zip(segments) {
+        if *p == "*" {
+            names.push((*s).to_string());
+        } else if p != s {
+            return None;
+        }
+    }
+    Some(names)
+}
+
+/// Split a concrete dotted path into its segments. A free-form object-map
+/// member (an image tag or a registry host such as `ghcr.io`) may itself
+/// contain dots, so everything after such a map's prefix is one segment.
+pub fn path_segments(path: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut pattern = String::new();
+    let mut rest = path;
+    while !rest.is_empty() {
+        let star = join(&pattern, "*");
+        if CONFIG_KEYS
+            .iter()
+            .any(|k| k.path == star && k.free_form_names())
+        {
+            out.push(rest.to_string());
+            return out;
+        }
+        let (segment, tail) = rest.split_once('.').unwrap_or((rest, ""));
+        let literal = join(&pattern, segment);
+        pattern = if is_known_pattern(&literal) {
+            literal
+        } else {
+            star
+        };
+        out.push(segment.to_string());
+        rest = tail;
+    }
+    out
+}
+
+/// Resolve a concrete dotted path (`workServers.infact.url`) to its row and
+/// the bound `*` names. Rejects names that fail [`MAP_NAME`].
+pub fn resolve(path: &str) -> Result<ResolvedKey, KeyError> {
+    let owned = path_segments(path);
+    let segments: Vec<&str> = owned.iter().map(String::as_str).collect();
+    for key in CONFIG_KEYS {
+        if let Some(names) = match_pattern(key.path, &segments) {
+            if !key.free_form_names() {
+                if let Some(bad) = names.iter().find(|n| !is_valid_map_name(n)) {
+                    return Err(KeyError::Name {
+                        path: path.to_string(),
+                        name: bad.clone(),
+                    });
+                }
+            }
+            return Ok(ResolvedKey {
+                key,
+                path: path.to_string(),
+                names,
+            });
+        }
+    }
+    Err(KeyError::unknown(path))
+}
+
+/// Whether `pattern` (a row path, or a prefix of one) has children, i.e. is a
+/// section or map rather than a leaf.
+fn pattern_is_branch(pattern: &str) -> bool {
+    let prefix = format!("{pattern}.");
+    CONFIG_KEYS.iter().any(|k| k.path.starts_with(&prefix))
+}
+
+/// The row-pattern form of a concrete path prefix: map-name positions become
+/// `*`. `None` when the prefix names nothing in the table.
+pub fn pattern_of(concrete: &str) -> Option<String> {
+    if concrete.is_empty() {
+        return Some(String::new());
+    }
+    let mut pattern = String::new();
+    for segment in concrete.split('.') {
+        let literal = join(&pattern, segment);
+        let star = join(&pattern, "*");
+        pattern = if is_known_pattern(&literal) {
+            literal
+        } else if is_known_pattern(&star) {
+            star
+        } else {
+            return None;
+        };
+    }
+    Some(pattern)
+}
+
+fn join(prefix: &str, segment: &str) -> String {
+    if prefix.is_empty() {
+        segment.to_string()
+    } else {
+        format!("{prefix}.{segment}")
+    }
+}
+
+fn is_known_pattern(pattern: &str) -> bool {
+    CONFIG_KEYS.iter().any(|k| k.path == pattern) || pattern_is_branch(pattern)
+}
+
+/// Valid children of a concrete object path, for unknown-key errors. A map
+/// level answers `<name>`.
+pub fn siblings(path_prefix: &str) -> Vec<&'static str> {
+    let Some(pattern) = pattern_of(path_prefix) else {
+        return Vec::new();
+    };
+    let prefix = if pattern.is_empty() {
+        String::new()
+    } else {
+        format!("{pattern}.")
+    };
+    let mut out: Vec<&'static str> = CONFIG_KEYS
+        .iter()
+        .filter_map(|k| k.path.strip_prefix(prefix.as_str()))
+        .map(|rest| rest.split('.').next().unwrap_or(rest))
+        .map(|child| if child == "*" { "<name>" } else { child })
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// Resolve an environment variable name to a key (and bound names).
+///
+/// `known_names` answers the map keys present in the merged file config for
+/// a map's section path (`workServers`, `remote.targets`), so a `*` segment
+/// splits unambiguously: the middle is compared case-insensitively with `-`
+/// and `_` folded. No match → a new entry named by the lower-cased middle.
+pub fn resolve_env(var: &str, known_names: &dyn Fn(&str) -> Vec<String>) -> Option<ResolvedKey> {
+    let mut best: Option<(bool, usize, ResolvedKey)> = None;
+    for key in CONFIG_KEYS.iter().filter(|k| k.has_env()) {
+        let pattern = key.env_pattern();
+        let Some((prefix, suffix)) = pattern.split_once('*') else {
+            if pattern == var {
+                return Some(ResolvedKey {
+                    key,
+                    path: key.path.to_string(),
+                    names: Vec::new(),
                 });
             }
-            if let Some(shape) = spec.shape.member_shape() {
-                if let Some(member) = input
-                    .strip_prefix(name)
-                    .and_then(|suffix| suffix.strip_prefix('.'))
-                {
-                    if !member.is_empty() && !member.contains('.') {
-                        return Some(ResolvedFieldName {
-                            canonical: format!(
-                                "{}{member}",
-                                spec.shape.child_prefix().expect("header prefix")
-                            ),
-                            spec,
-                            via_alias,
-                            member: Some(member.into()),
-                            shape,
-                        });
-                    }
+            continue;
+        };
+        if suffix.contains('*') || !var.starts_with(prefix) || !var.ends_with(suffix) {
+            continue;
+        }
+        if var.len() <= prefix.len() + suffix.len() {
+            continue;
+        }
+        let middle = &var[prefix.len()..var.len() - suffix.len()];
+        let section = key.path.split(".*").next().unwrap_or("");
+        let known = known_names(section)
+            .into_iter()
+            .find(|n| fold_map_name(n).eq_ignore_ascii_case(middle));
+        let matched_known = known.is_some();
+        let name = known.unwrap_or_else(|| middle.to_ascii_lowercase());
+        let path = key.path.replacen('*', &name, 1);
+        let candidate = ResolvedKey {
+            key,
+            path,
+            names: vec![name],
+        };
+        // Prefer a known name, then the longest literal suffix.
+        let rank = (matched_known, suffix.len());
+        if best.as_ref().is_none_or(|(k, s, _)| rank > (*k, *s)) {
+            best = Some((rank.0, rank.1, candidate));
+        }
+    }
+    best.map(|(_, _, r)| r)
+}
+
+/// Parse scalar/list input (`--set`, env, `config set`) by `kind`. The
+/// literal `null` resets the key to its default.
+pub fn parse_input(key: &ConfigKey, raw: &str) -> Result<Value, KeyError> {
+    let invalid = |reason: String| KeyError::Value {
+        path: key.path.to_string(),
+        reason,
+    };
+    let trimmed = raw.trim();
+    if trimmed == "null" {
+        return Ok(Value::Null);
+    }
+    let value = match key.kind {
+        ValueKind::Bool => match trimmed {
+            "true" => Value::Bool(true),
+            "false" => Value::Bool(false),
+            other => return Err(invalid(format!("expected true or false, got {other:?}"))),
+        },
+        ValueKind::Int { .. } => {
+            let n: i64 = trimmed
+                .parse()
+                .map_err(|_| invalid(format!("expected a whole number, got {trimmed:?}")))?;
+            Value::from(n)
+        }
+        ValueKind::String | ValueKind::Enum(_) | ValueKind::Duration | ValueKind::Size => {
+            Value::String(trimmed.to_string())
+        }
+        ValueKind::StringList => Value::Array(
+            split_list(trimmed)
+                .map(|s| Value::String(s.to_string()))
+                .collect(),
+        ),
+        ValueKind::IntList => Value::Array(
+            split_list(trimmed)
+                .map(|s| {
+                    s.parse::<i64>()
+                        .map(Value::from)
+                        .map_err(|_| invalid(format!("{s:?} is not a whole number")))
+                })
+                .collect::<Result<_, _>>()?,
+        ),
+        ValueKind::StringMap => {
+            let mut map = serde_json::Map::new();
+            for pair in split_list(trimmed) {
+                let (k, v) = pair
+                    .split_once('=')
+                    .ok_or_else(|| invalid(format!("expected key=value, got {pair:?}")))?;
+                map.insert(k.trim().to_string(), Value::String(v.trim().to_string()));
+            }
+            Value::Object(map)
+        }
+        ValueKind::Object => {
+            return Err(KeyError::ObjectNotSettable {
+                path: key.path.to_string(),
+            })
+        }
+    };
+    validate_value(key, &value)?;
+    Ok(value)
+}
+
+fn split_list(raw: &str) -> impl Iterator<Item = &str> {
+    raw.split(',').map(str::trim).filter(|s| !s.is_empty())
+}
+
+/// Validate a file-shaped JSON value for a row (type + bounds + enum set).
+/// `null` is always accepted: it means "not set here".
+pub fn validate_value(key: &ConfigKey, value: &Value) -> Result<(), KeyError> {
+    let invalid = |reason: String| KeyError::Value {
+        path: key.path.to_string(),
+        reason,
+    };
+    let shown = if key.sensitive {
+        "<hidden: sensitive value>".to_string()
+    } else {
+        value.to_string()
+    };
+    if value.is_null() {
+        return Ok(());
+    }
+    match key.kind {
+        ValueKind::Bool => {
+            if !value.is_boolean() {
+                return Err(invalid(format!("expected true or false, got {shown}")));
+            }
+        }
+        ValueKind::Int { min, max } => {
+            let n = value
+                .as_i64()
+                .ok_or_else(|| invalid(format!("expected a whole number, got {shown}")))?;
+            if min.is_some_and(|m| n < m) || max.is_some_and(|m| n > m) {
+                return Err(invalid(format!(
+                    "{n} is out of range ({})",
+                    key.kind.describe()
+                )));
+            }
+        }
+        ValueKind::String => {
+            if !value.is_string() {
+                return Err(invalid(format!("expected a string, got {shown}")));
+            }
+        }
+        ValueKind::Enum(values) => {
+            let s = value.as_str().unwrap_or_default();
+            if !values.contains(&s) {
+                return Err(invalid(format!(
+                    "expected one of {}, got {shown}",
+                    values.join(", ")
+                )));
+            }
+        }
+        ValueKind::Duration => {
+            let s = value.as_str().ok_or_else(|| {
+                invalid(format!(
+                    "expected a duration string such as \"30s\", got {shown}"
+                ))
+            })?;
+            s.parse::<super::units::DurationStr>().map_err(invalid)?;
+        }
+        ValueKind::Size => {
+            let s = value.as_str().ok_or_else(|| {
+                invalid(format!(
+                    "expected a size string such as \"4GiB\", got {shown}"
+                ))
+            })?;
+            s.parse::<super::units::Size>().map_err(invalid)?;
+        }
+        ValueKind::StringList => {
+            let ok = value
+                .as_array()
+                .is_some_and(|a| a.iter().all(Value::is_string));
+            if !ok {
+                return Err(invalid(format!("expected a list of strings, got {shown}")));
+            }
+        }
+        ValueKind::IntList => {
+            let ok = value
+                .as_array()
+                .is_some_and(|a| a.iter().all(|v| v.as_i64().is_some()));
+            if !ok {
+                return Err(invalid(format!(
+                    "expected a list of whole numbers, got {shown}"
+                )));
+            }
+        }
+        ValueKind::StringMap => {
+            let ok = value
+                .as_object()
+                .is_some_and(|m| m.values().all(Value::is_string));
+            if !ok {
+                return Err(invalid(format!(
+                    "expected an object of strings, got {shown}"
+                )));
+            }
+        }
+        ValueKind::Object => {
+            if !value.is_object() {
+                return Err(invalid(format!("expected an object, got {shown}")));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Walk a whole config file's JSON and check every key against the table:
+/// unknown keys (with siblings and moved-to hints), map names, `-`/`_`
+/// duplicates, value shapes and scope for `kind`.
+pub fn validate_document(document: &Value, kind: FileKind) -> Result<(), KeyError> {
+    let Some(object) = document.as_object() else {
+        return Err(KeyError::Value {
+            path: "(root)".into(),
+            reason: format!("a config file must be a JSON object, got {document}"),
+        });
+    };
+    walk(object, "", "", kind)
+}
+
+fn walk(
+    object: &serde_json::Map<String, Value>,
+    concrete: &str,
+    pattern: &str,
+    kind: FileKind,
+) -> Result<(), KeyError> {
+    let star = join(pattern, "*");
+    let star_row = CONFIG_KEYS.iter().find(|k| k.path == star);
+    let is_map_level = pattern_is_branch(&star) || star_row.is_some();
+    if is_map_level {
+        let free_form = star_row.is_some_and(ConfigKey::free_form_names);
+        let mut folded: BTreeMap<String, &str> = BTreeMap::new();
+        for name in object.keys() {
+            let path = join(concrete, name);
+            if free_form {
+                if name.is_empty() {
+                    return Err(KeyError::Name {
+                        path,
+                        name: name.clone(),
+                    });
+                }
+            } else {
+                if !is_valid_map_name(name) {
+                    return Err(KeyError::Name {
+                        path,
+                        name: name.clone(),
+                    });
+                }
+                if let Some(previous) = folded.insert(fold_map_name(name), name) {
+                    return Err(KeyError::DuplicateName {
+                        a: join(concrete, previous),
+                        b: path,
+                    });
                 }
             }
         }
     }
-    None
+    for (name, value) in object {
+        let path = join(concrete, name);
+        let child = if is_map_level {
+            star.clone()
+        } else {
+            join(pattern, name)
+        };
+        if let Some(key) = CONFIG_KEYS.iter().find(|k| k.path == child) {
+            if !kind.admits(key.scope) {
+                return Err(KeyError::Scope {
+                    path,
+                    allowed: key.scope.allowed_files(),
+                    found: kind.as_str(),
+                });
+            }
+            validate_value(key, value).map_err(|e| match e {
+                KeyError::Value { reason, .. } => KeyError::Value {
+                    path: path.clone(),
+                    reason,
+                },
+                other => other,
+            })?;
+            continue;
+        }
+        if !pattern_is_branch(&child) {
+            let mut error = KeyError::unknown(&path);
+            if let KeyError::Unknown { moved, .. } = &mut error {
+                *moved = moved_hint_for_value(&path, value);
+            }
+            return Err(error);
+        }
+        match value {
+            Value::Null => {}
+            Value::Object(inner) => walk(inner, &path, &child, kind)?,
+            other => {
+                // An old scalar key whose name is now a section (`runtime`).
+                let hint = moved_hint(&path);
+                return Err(KeyError::Value {
+                    reason: format!("expected an object, got {other}{hint}"),
+                    path,
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
-/// Members are writable wherever their header's scope allows; the header
-/// itself remains read-only. Alias scope is checked by the command layer.
-pub fn writability(resolved: &ResolvedFieldName) -> (bool, bool) {
-    if resolved.member.is_none() {
-        return resolved.spec.writability();
-    }
-    match resolved.spec.scope {
-        FieldScope::GlobalOnly => (true, false),
-        FieldScope::RepoOnly => (false, true),
-        FieldScope::Both => (true, true),
+/// Check the map-name invariants (valid names, no two names that differ only
+/// by `-` versus `_`) over a merged document. Layers are validated one file
+/// at a time, so a collision between layers, or one introduced by an
+/// override, is only visible here.
+pub fn validate_map_names(document: &Value) -> Result<(), KeyError> {
+    match document.as_object() {
+        Some(object) => check_names(object, "", ""),
+        None => Ok(()),
     }
 }
 
-/// The value a field takes when neither scope sets it, for fields whose
-/// typed effective view has a fixed default the raw JSON does not show.
-/// `config show` / `config get` use it for the effective column only, so the
-/// global and repo cells still show that nothing is set.
-pub fn implicit_default(name: &str) -> Option<&'static str> {
-    match name {
-        crate::data::config::builtin_runtime::BUILDER_ENABLED_FIELD => Some("false"),
-        _ => None,
+fn check_names(
+    object: &serde_json::Map<String, Value>,
+    concrete: &str,
+    pattern: &str,
+) -> Result<(), KeyError> {
+    let star = join(pattern, "*");
+    let star_row = CONFIG_KEYS.iter().find(|k| k.path == star);
+    let is_map_level = pattern_is_branch(&star) || star_row.is_some();
+    if is_map_level && !star_row.is_some_and(ConfigKey::free_form_names) {
+        let mut folded: BTreeMap<String, &str> = BTreeMap::new();
+        for name in object.keys() {
+            let path = join(concrete, name);
+            if !is_valid_map_name(name) {
+                return Err(KeyError::Name {
+                    path,
+                    name: name.clone(),
+                });
+            }
+            if let Some(previous) = folded.insert(fold_map_name(name), name) {
+                return Err(KeyError::DuplicateName {
+                    a: join(concrete, previous),
+                    b: path,
+                });
+            }
+        }
     }
+    for (name, value) in object {
+        let child = if is_map_level {
+            star.clone()
+        } else {
+            join(pattern, name)
+        };
+        if let Value::Object(inner) = value {
+            if pattern_is_branch(&child) {
+                check_names(inner, &join(concrete, name), &child)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The Markdown key table embedded in `docs/07-configuration.md` between
+/// `<!-- key-table:start -->` and `<!-- key-table:end -->`.
+pub fn render_docs_table() -> String {
+    let mut out = String::from(
+        "| Key | Type | Default | Scope | Sensitive | Live | Env | Meaning |\n\
+         |---|---|---|---|---|---|---|---|\n",
+    );
+    for key in CONFIG_KEYS {
+        let merge = if key.merge == Merge::Concat {
+            " (additive)"
+        } else {
+            ""
+        };
+        let env = if key.has_env() {
+            format!("`{}`", key.env_pattern().replace('*', "<NAME>"))
+        } else {
+            "—".into()
+        };
+        out.push_str(&format!(
+            "| `{}`{merge} | {} | `{}` | {} | {} | {} | {env} | {} |\n",
+            key.path,
+            key.kind.describe(),
+            key.default,
+            key.scope.as_str(),
+            if key.sensitive { "yes" } else { "no" },
+            if key.live { "yes" } else { "no" },
+            key.doc,
+        ));
+    }
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn every_field_name_is_unique() {
-        let mut names: Vec<&str> = CONFIG_FIELDS.iter().map(|f| f.name).collect();
-        let total = names.len();
-        names.sort_unstable();
-        names.dedup();
-        assert_eq!(names.len(), total, "duplicate field name in CONFIG_FIELDS");
+    fn segments(key: &ConfigKey) -> impl Iterator<Item = &'static str> {
+        key.path.split('.')
     }
 
     #[test]
-    fn work_items_fields_map_to_the_work_items_json_key() {
-        assert_eq!(json_path("work_items.dir"), "workItems.dir");
-        assert_eq!(json_path("work_items.template"), "workItems.template");
-        assert_eq!(json_path("api.port"), "api.port");
-        assert_eq!(json_path("default_agent"), "default_agent");
-    }
-
-    #[test]
-    fn api_work_dir_roots_is_a_global_only_list_like_work_dirs() {
-        let find = |name: &str| CONFIG_FIELDS.iter().find(|f| f.name == name).unwrap();
-        let roots = find("api.workDirRoots");
-        let dirs = find("api.workDirs");
-        assert!(matches!(roots.scope, FieldScope::GlobalOnly));
-        assert_eq!(roots.writability(), (true, false));
-        assert_eq!(roots.writability(), dirs.writability());
-        assert_eq!(roots.hint, dirs.hint);
-    }
-
-    #[test]
-    fn a_read_only_field_is_writable_in_neither_scope() {
-        for spec in CONFIG_FIELDS.iter().filter(|f| f.read_only) {
-            assert_eq!(
-                spec.writability(),
-                (false, false),
-                "{} is read-only",
-                spec.name
-            );
-        }
-    }
-
-    #[test]
-    fn writability_follows_scope() {
-        for spec in CONFIG_FIELDS.iter().filter(|f| !f.read_only) {
-            let expected = match spec.scope {
-                FieldScope::GlobalOnly => (true, false),
-                FieldScope::RepoOnly => (false, true),
-                FieldScope::Both => (true, true),
-            };
-            assert_eq!(spec.writability(), expected, "{}", spec.name);
-        }
-    }
-
-    /// The one credential field. A new sensitive field must be added here
-    /// deliberately, because forgetting `sensitive` prints a key in full.
-    #[test]
-    fn only_the_remote_api_key_is_sensitive() {
-        let sensitive: Vec<&str> = CONFIG_FIELDS
-            .iter()
-            .filter(|f| f.sensitive)
-            .map(|f| f.name)
-            .collect();
-        assert_eq!(sensitive, vec!["remote.defaultAPIKey"]);
-    }
-
-    #[test]
-    fn builder_enabled_is_a_boolean_editable_in_both_scopes_with_false_default() {
-        let spec = field_spec("builtin.builder.enabled").unwrap();
-        assert_eq!(spec.scope, FieldScope::Both);
-        assert_eq!(spec.kind, ConfigFieldKind::Bool);
-        assert!(!spec.read_only);
-        assert_eq!(implicit_default(spec.name), Some("false"));
-        assert!(spec.hint.unwrap().contains("source's own store"));
-    }
-
-    #[test]
-    fn every_dynamic_workflows_alias_maps_to_canonical_repo_only_name() {
-        let expected = [
-            (
-                "dynamicWorkflows.defaultLeader",
-                "workflows.dynamic.defaultLeader",
-            ),
-            (
-                "dynamicWorkflows.maxConcurrentSteps",
-                "workflows.dynamic.maxConcurrentSteps",
-            ),
-            (
-                "dynamicWorkflows.agentsToModels",
-                "workflows.dynamic.agentsToModels",
-            ),
-            ("dynamicWorkflows.guidance", "workflows.dynamic.guidance"),
+    fn every_path_is_camel_case_without_units() {
+        const UNIT_SUFFIXES: &[&str] = &[
+            "Secs", "Seconds", "Minutes", "Mins", "Hours", "Ms", "Millis", "Mib", "Kib", "Gib",
+            "Mb", "Gb", "Bytes",
         ];
-        for (old, new) in expected {
-            let resolved = resolve_field_name(old).unwrap_or_else(|| panic!("missing alias {old}"));
-            assert_eq!(resolved.canonical, new);
-            assert_eq!(resolved.via_alias.unwrap().scope, FieldScope::RepoOnly);
-            assert!(resolve_field_name(new).unwrap().via_alias.is_none());
+        for key in CONFIG_KEYS {
+            for segment in segments(key) {
+                if segment == "*" {
+                    continue;
+                }
+                let mut chars = segment.chars();
+                assert!(
+                    chars.next().is_some_and(|c| c.is_ascii_lowercase())
+                        && chars.all(|c| c.is_ascii_alphanumeric()),
+                    "{} segment {segment:?} is not camelCase",
+                    key.path
+                );
+                for unit in UNIT_SUFFIXES {
+                    assert!(
+                        !segment.ends_with(unit),
+                        "{} carries a unit ({unit}) in its name; put it in the value",
+                        key.path
+                    );
+                }
+            }
         }
-        let actual = CONFIG_FIELDS
-            .iter()
-            .flat_map(|spec| {
-                spec.aliases
-                    .iter()
-                    .map(move |alias| (alias.name, spec.name))
-            })
-            .filter(|(old, _)| old.starts_with("dynamicWorkflows."))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            actual.len(),
-            expected.len(),
-            "alias registry needs explicit coverage for every key"
-        );
-        for (old, new) in expected {
-            assert!(actual.contains(&(old, new)), "missing {old} -> {new}");
-        }
-        assert!(
-            resolve_field_name("dynamicWorkflows.guidance.0")
-                .unwrap()
-                .via_alias
-                .unwrap()
-                .scope
-                == FieldScope::RepoOnly
-        );
-        assert!(resolve_field_name("workflows.dynamic.guidance.0")
-            .unwrap()
-            .via_alias
-            .is_none());
     }
 
     #[test]
-    fn dynamic_workflows_registry_has_two_well_formed_map_and_list_headers() {
-        let headers = CONFIG_FIELDS
-            .iter()
-            .filter(|spec| spec.shape.is_header())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            headers.len(),
-            2,
-            "only the agent map and guidance list are dynamic-workflow headers"
-        );
-        for spec in headers {
-            let prefix = spec.shape.child_prefix().unwrap();
-            assert!(
-                prefix.starts_with(spec.name),
-                "{} child prefix {prefix:?} must derive from its registry name",
-                spec.name
-            );
-            assert!(
-                prefix.ends_with('.'),
-                "{} child prefix must end in a dot: {prefix:?}",
-                spec.name
-            );
-            assert!(matches!(
-                spec.shape.member_shape(),
-                Some(ConfigRowShape::MapEntry | ConfigRowShape::ListEntry)
-            ));
+    fn no_abbreviations_except_id_url_tls_api() {
+        // Abbreviations a key must spell out. `id`, `url`, `tls` and `api`
+        // are the sanctioned exceptions and are not listed.
+        const FORBIDDEN: &[&str] = &[
+            "cfg",
+            "conf",
+            "addr",
+            "num",
+            "cnt",
+            "ctx",
+            "tmp",
+            "msg",
+            "idx",
+            "secs",
+            "mins",
+            "pwd",
+            "opts",
+            "params",
+            "max",
+            "min",
+            "concurrent",
+            "acp",
+            "vcpus",
+            "cols",
+            "rows",
+            "env",
+            "sans",
+        ];
+        // Segments the work item's own schema (and design §1) spells with an
+        // abbreviation: protocol and domain terms with no clearer spelling.
+        // Adding a name here is a contract change, not a test tweak.
+        const APPROVED: &[&str] = &[
+            "acpFallback",
+            "vcpus",
+            "cols",
+            "rows",
+            "envVars",
+            "envPersistence",
+            "tlsSans",
+        ];
+        for key in CONFIG_KEYS {
+            for segment in segments(key).filter(|s| *s != "*") {
+                if APPROVED.contains(&segment) {
+                    continue;
+                }
+                let words = screaming_snake(segment).to_ascii_lowercase();
+                for word in words.split('_') {
+                    // `max`/`concurrent` only appear inside `maxConcurrent<Noun>`.
+                    if (word == "max" || word == "concurrent")
+                        && segment.starts_with("maxConcurrent")
+                    {
+                        continue;
+                    }
+                    assert!(
+                        !FORBIDDEN.contains(&word),
+                        "{} uses the abbreviation {word:?}",
+                        key.path
+                    );
+                }
+            }
         }
+    }
+
+    #[test]
+    fn toggles_are_named_enabled() {
+        for key in CONFIG_KEYS.iter().filter(|k| k.kind == ValueKind::Bool) {
+            let last = key.path.rsplit('.').next().unwrap();
+            let lower = last.to_ascii_lowercase();
+            // Toggles at a distance are forbidden except where the work item's
+            // schema names them (`allowOverride`, `allowEphemeral`) and the
+            // credential-policy gate in design §1.8.
+            const APPROVED: &[&str] = &["allowOverride", "allowEphemeral", "allowApiClientGrants"];
+            let distant = ["use", "allow", "disable", "enable"].iter().any(|p| {
+                last.starts_with(p)
+                    && last.len() > p.len()
+                    && last[p.len()..].starts_with(char::is_uppercase)
+            });
+            if distant {
+                assert!(
+                    APPROVED.contains(&last),
+                    "{}: toggles are `enabled` inside the thing, not `{last}`",
+                    key.path
+                );
+            }
+            if lower.contains("enable") || lower.contains("disable") || lower == "on" {
+                assert_eq!(last, "enabled", "{}: toggles are named `enabled`", key.path);
+            }
+        }
+    }
+
+    #[test]
+    fn concurrency_keys_are_max_concurrent_noun() {
+        for key in CONFIG_KEYS {
+            for segment in segments(key) {
+                let lower = segment.to_ascii_lowercase();
+                if lower.contains("concurren")
+                    || lower.contains("workers")
+                    || lower.contains("parallel")
+                {
+                    let noun = segment.strip_prefix("maxConcurrent").unwrap_or_else(|| {
+                        panic!("{}: concurrency keys are maxConcurrent<Noun>", key.path)
+                    });
+                    assert!(
+                        noun.starts_with(|c: char| c.is_ascii_uppercase()) && noun.ends_with('s'),
+                        "{}: {noun:?} is not a plural noun",
+                        key.path
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_row_is_complete() {
+        for key in CONFIG_KEYS {
+            let default = key.default_value();
+            assert!(!key.doc.trim().is_empty(), "{} has no doc", key.path);
+            assert!(key.doc.ends_with('.'), "{} doc is not a sentence", key.path);
+            validate_value(key, &default)
+                .unwrap_or_else(|e| panic!("{} default does not validate: {e}", key.path));
+            if key.merge == Merge::Concat {
+                assert_eq!(key.kind, ValueKind::StringList, "{}", key.path);
+            }
+        }
+    }
+
+    #[test]
+    fn paths_are_unique() {
+        let mut seen = std::collections::HashSet::new();
+        for key in CONFIG_KEYS {
+            assert!(seen.insert(key.path), "duplicate row {}", key.path);
+        }
+    }
+
+    #[test]
+    fn derived_env_names_are_unique_and_not_reserved() {
+        let mut seen = std::collections::HashSet::new();
+        for key in CONFIG_KEYS.iter().filter(|k| k.has_env()) {
+            let env = key.env_pattern();
+            assert!(seen.insert(env.clone()), "{env} derived twice");
+            assert!(!RESERVED_ENV.contains(&env.as_str()), "{env} is reserved");
+            assert!(
+                !env.starts_with("AWMAN_TEST_"),
+                "{env} is in the test namespace"
+            );
+            // A map row could expand to a reserved name: `AWMAN_<prefix>*<suffix>`
+            // must not be able to produce one.
+            if let Some((prefix, suffix)) = env.split_once('*') {
+                for reserved in RESERVED_ENV {
+                    assert!(
+                        !(reserved.starts_with(prefix)
+                            && reserved.ends_with(suffix)
+                            && reserved.len() > prefix.len() + suffix.len()),
+                        "{env} can expand to reserved {reserved}"
+                    );
+                }
+            }
+        }
+        for section in CONFIG_KEYS.iter().map(ConfigKey::section) {
+            assert!(
+                !["home", "test"].contains(&section),
+                "top-level `{section}` is reserved"
+            );
+        }
+    }
+
+    #[test]
+    fn env_names_derive_from_the_path() {
+        let key = resolve("agents.stuckTimeout").unwrap().key;
+        assert_eq!(key.env_pattern(), "AWMAN_AGENTS_STUCK_TIMEOUT");
+        let key = resolve("workServers.in-fact.url").unwrap().key;
+        assert_eq!(key.env_pattern(), "AWMAN_WORK_SERVERS_*_URL");
+        assert_eq!(key.env_name(&["in-fact"]), "AWMAN_WORK_SERVERS_IN_FACT_URL");
+        assert_eq!(
+            resolve("overlays").unwrap().key.env_pattern(),
+            "AWMAN_OVERLAYS"
+        );
+    }
+
+    #[test]
+    fn only_these_rows_are_sensitive() {
+        let sensitive: Vec<_> = CONFIG_KEYS
+            .iter()
+            .filter(|k| k.sensitive)
+            .map(|k| k.path)
+            .collect();
+        assert_eq!(sensitive, ["remote.targets.*.apiKey"]);
+    }
+
+    #[test]
+    fn only_overlays_and_guidance_are_additive() {
+        let concat: Vec<_> = CONFIG_KEYS
+            .iter()
+            .filter(|k| k.merge == Merge::Concat)
+            .map(|k| k.path)
+            .collect();
+        assert_eq!(concat, ["overlays", "workflows.dynamic.guidance"]);
+    }
+
+    #[test]
+    fn resolve_binds_names_and_rejects_bad_ones() {
+        let r = resolve("remote.targets.prod.apiKey").unwrap();
+        assert_eq!(r.key.path, "remote.targets.*.apiKey");
+        assert_eq!(r.names, ["prod"]);
+        assert!(matches!(
+            resolve("remote.targets.Prod.apiKey"),
+            Err(KeyError::Name { .. })
+        ));
+        assert!(matches!(
+            resolve("workServers._x.url"),
+            Err(KeyError::Name { .. })
+        ));
+        assert!(matches!(
+            resolve("agents.nope"),
+            Err(KeyError::Unknown { .. })
+        ));
+    }
+
+    #[test]
+    fn map_name_rule() {
+        for ok in ["a", "0", "in-fact", "prod_2", &"a".repeat(63)] {
+            assert!(is_valid_map_name(ok), "{ok}");
+        }
+        for bad in ["", "-a", "_a", "A", "a.b", "a b", &"a".repeat(64)] {
+            assert!(!is_valid_map_name(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn resolve_env_splits_map_names_with_known_names_first() {
+        let none = |_: &str| Vec::<String>::new();
+        let r = resolve_env("AWMAN_AGENTS_STUCK_TIMEOUT", &none).unwrap();
+        assert_eq!(r.path, "agents.stuckTimeout");
+        let r = resolve_env("AWMAN_REMOTE_TARGETS_PROD_API_KEY", &none).unwrap();
+        assert_eq!(r.path, "remote.targets.prod.apiKey");
+        let known = |section: &str| {
+            if section == "workServers" {
+                vec!["in-fact".to_string()]
+            } else {
+                vec![]
+            }
+        };
+        let r = resolve_env("AWMAN_WORK_SERVERS_IN_FACT_URL", &known).unwrap();
+        assert_eq!(r.path, "workServers.in-fact.url");
+        let r = resolve_env("AWMAN_WORK_SERVERS_IN_FACT_URL", &none).unwrap();
+        assert_eq!(r.path, "workServers.in_fact.url");
+        assert!(resolve_env("AWMAN_HOME", &none).is_none());
+        assert!(resolve_env("AWMAN_RUNTIME_BUILTIN_IMAGES_X", &none).is_none());
+    }
+
+    #[test]
+    fn parse_input_by_kind() {
+        let k = |p: &str| resolve(p).unwrap().key;
+        assert_eq!(
+            parse_input(k("daemon.verboseSetup"), "true").unwrap(),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            parse_input(k("daemon.maxConcurrentJobs"), "3").unwrap(),
+            Value::from(3)
+        );
+        assert!(parse_input(k("daemon.maxConcurrentJobs"), "0").is_err());
+        assert_eq!(
+            parse_input(k("overlays"), "ssh(), env(A)").unwrap(),
+            serde_json::json!(["ssh()", "env(A)"])
+        );
+        assert!(parse_input(k("agents.stuckTimeout"), "30").is_err());
+        assert_eq!(
+            parse_input(k("agents.stuckTimeout"), "45s").unwrap(),
+            Value::from("45s")
+        );
+        assert!(parse_input(k("runtime.kind"), "docker-sbx-experimental").is_err());
+        assert_eq!(
+            parse_input(k("workServers.a.labels"), "zone=eu, gpu=yes").unwrap(),
+            serde_json::json!({"zone": "eu", "gpu": "yes"})
+        );
+        assert!(matches!(
+            parse_input(k("runtime.builtin.imageSource"), "{}"),
+            Err(KeyError::ObjectNotSettable { .. })
+        ));
+        assert_eq!(
+            parse_input(k("agents.default"), "null").unwrap(),
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn siblings_list_children_and_map_levels() {
+        let top = siblings("");
+        assert!(
+            top.contains(&"agents") && top.contains(&"workServers"),
+            "{top:?}"
+        );
+        assert_eq!(siblings("remote"), ["default", "targets"]);
+        assert_eq!(siblings("workServers"), ["<name>"]);
+        assert!(siblings("workServers.x").contains(&"url"));
+    }
+
+    #[test]
+    fn moved_hint_uses_the_longest_prefix() {
+        assert_eq!(
+            moved_hint("agentStuckTimeout"),
+            "; `agentStuckTimeout` moved to `agents.stuckTimeout` (\"30s\")"
+        );
+        assert_eq!(
+            moved_hint("builtin.vcpus"),
+            "; `builtin` moved to `runtime.builtin`"
+        );
+        assert_eq!(
+            moved_hint("builtin.memoryMib"),
+            "; `builtin.memoryMib` moved to `runtime.builtin.memory` (\"4GiB\")"
+        );
+        assert_eq!(moved_hint("nothing"), "");
+    }
+
+    #[test]
+    fn unknown_key_message_lists_siblings_and_hint() {
+        let doc = serde_json::json!({"agentStuckTimeout": 30});
+        let err = validate_document(&doc, FileKind::Repo).unwrap_err();
+        let text = err
+            .in_file(std::path::Path::new("/repo/.awman/config.json"))
+            .to_string();
+        assert!(text.starts_with("unknown config key `agentStuckTimeout` in /repo/.awman/config.json; valid keys here: agents, daemon,"), "{text}");
+        assert!(
+            text.ends_with("`agentStuckTimeout` moved to `agents.stuckTimeout` (\"30s\")"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn scope_is_enforced_per_file_kind() {
+        let global_only = serde_json::json!({"runtime": {"kind": "docker"}});
+        assert!(validate_document(&global_only, FileKind::Global).is_ok());
+        let err = validate_document(&global_only, FileKind::Repo).unwrap_err();
+        assert!(matches!(err, KeyError::Scope { .. }), "{err}");
+        assert!(err.to_string().contains("runtime.kind"), "{err}");
+        assert!(err.to_string().contains("global config file"), "{err}");
+
+        let daemon = serde_json::json!({"daemon": {"maxConcurrentJobs": 3}});
+        assert!(matches!(
+            validate_document(&daemon, FileKind::Task),
+            Err(KeyError::Scope { .. })
+        ));
+        // Task-scope keys are allowed in repo files (task scope includes repo).
+        let dynamic = serde_json::json!({"workflows": {"dynamic": {"guidance": ["x"]}}});
+        assert!(validate_document(&dynamic, FileKind::Repo).is_ok());
+        assert!(validate_document(&dynamic, FileKind::Task).is_ok());
+        // Repo-scope keys are not allowed in task files.
+        let repo = serde_json::json!({"agents": {"auth": {"mode": "none"}}});
+        assert!(matches!(
+            validate_document(&repo, FileKind::Task),
+            Err(KeyError::Scope { .. })
+        ));
+    }
+
+    #[test]
+    fn map_names_are_validated_and_dash_underscore_duplicates_rejected() {
+        let bad = serde_json::json!({"remote": {"targets": {"Prod": {"url": "https://x"}}}});
+        assert!(matches!(
+            validate_document(&bad, FileKind::Global),
+            Err(KeyError::Name { .. })
+        ));
+        let dup =
+            serde_json::json!({"workServers": {"in-fact": {"url": "u"}, "in_fact": {"url": "u"}}});
+        let err = validate_document(&dup, FileKind::Global).unwrap_err();
+        assert!(matches!(err, KeyError::DuplicateName { .. }), "{err}");
+        let dup = serde_json::json!({"agents": {"flags": {"my-agent": [], "my_agent": []}}});
+        assert!(matches!(
+            validate_document(&dup, FileKind::Repo),
+            Err(KeyError::DuplicateName { .. })
+        ));
+        // Image tags and registry hosts are free-form object-map keys.
+        let images = serde_json::json!({"runtime": {"builtin": {
+            "images": {"awman-x-claude:latest": {}},
+            "registries": {"ghcr.io": {}}
+        }}});
+        assert!(validate_document(&images, FileKind::Repo).is_ok());
+    }
+
+    #[test]
+    fn values_are_type_checked_with_the_concrete_path() {
+        let doc = serde_json::json!({"workServers": {"a": {"maxConcurrentJobs": 0}}});
+        let err = validate_document(&doc, FileKind::Global)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("workServers.a.maxConcurrentJobs"), "{err}");
+        let doc = serde_json::json!({"agents": "claude"});
+        assert!(validate_document(&doc, FileKind::Repo).is_err());
+    }
+
+    #[test]
+    fn sensitive_values_never_appear_in_validation_errors() {
+        for bad in [
+            serde_json::json!(["FAKE_REVIEW_SECRET_123456"]),
+            serde_json::json!({"k": "FAKE_REVIEW_SECRET_123456"}),
+            serde_json::json!(12345678),
+        ] {
+            let doc = serde_json::json!({"remote": {"targets": {"prod": {
+                "url": "https://example.com", "apiKey": bad}}}});
+            let err = validate_document(&doc, FileKind::Global)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("remote.targets.prod.apiKey"), "{err}");
+            assert!(!err.contains("FAKE_REVIEW_SECRET_123456"), "{err}");
+            assert!(!err.contains("12345678"), "{err}");
+        }
+    }
+
+    #[test]
+    fn docs_table_has_one_line_per_row() {
+        let table = render_docs_table();
+        assert_eq!(table.lines().count(), CONFIG_KEYS.len() + 2);
+        assert!(table.contains("`AWMAN_WORK_SERVERS_<NAME>_URL`"));
+    }
+}
+
+#[cfg(test)]
+mod dotted_member_tests {
+    use super::*;
+    use crate::data::config::config_json::{config_field_value, remove_config_field};
+
+    #[test]
+    fn dotted_free_form_map_members_are_one_segment() {
+        assert_eq!(
+            path_segments("runtime.builtin.registries.ghcr.io"),
+            ["runtime", "builtin", "registries", "ghcr.io"]
+        );
+        let resolved = resolve("runtime.builtin.registries.ghcr.io").unwrap();
+        assert_eq!(resolved.names, ["ghcr.io"]);
+        let mut doc = serde_json::json!({"runtime": {"builtin": {"registries": {"ghcr.io": {"insecure": false}}}}});
+        assert_eq!(
+            config_field_value(&doc, "runtime.builtin.registries.ghcr.io").as_deref(),
+            Some(r#"{"insecure":false}"#)
+        );
+        remove_config_field(&mut doc, "runtime.builtin.registries.ghcr.io");
+        assert_eq!(
+            doc["runtime"]["builtin"]["registries"],
+            serde_json::json!({})
+        );
     }
 }

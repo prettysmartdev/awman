@@ -36,9 +36,9 @@ use async_trait::async_trait;
 use chrono::Utc;
 use tokio_util::sync::CancellationToken;
 
-use awman::data::config::env::{EnvSnapshot, AWMAN_CONFIG_HOME};
-use awman::data::config::global::GlobalConfig;
-use awman::data::config::repo::SquadConfig;
+use awman::data::config::env::EnvSnapshot;
+use awman::data::config::ConfigFile;
+use awman::data::fs::data_paths::AWMAN_HOME;
 use awman::data::fs::{MountScope, SquadPaths, Task, TaskStatus, TaskStore};
 use awman::engine::squad::{EvaluationOutcome, EvaluationRequest, SquadScheduler, TaskEvaluator};
 
@@ -81,7 +81,7 @@ fn task(name: &str, interval_secs: u64) -> Task {
     let now = Utc::now();
     Task {
         prerequisites: None,
-        id: uuid::Uuid::new_v4().to_string(),
+        id: awman::data::ids::TaskId::new(),
         name: name.to_string(),
         description: "test task".into(),
         repo_scope: PathBuf::from("/repo"),
@@ -116,7 +116,7 @@ async fn run_one_tick(scheduler: SquadScheduler) {
 }
 
 fn squad_root_env(tmp: &std::path::Path) -> EnvSnapshot {
-    EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, tmp.to_str().unwrap())])
+    EnvSnapshot::with_overrides([(AWMAN_HOME, tmp.to_str().unwrap())])
 }
 
 // ─── Full lifecycle: mocked evaluation agent writes workflow.toml ───────────
@@ -162,10 +162,10 @@ async fn full_lifecycle_mocked_evaluator_writes_workflow_and_records_run() {
     let recorded = recorded.lock().unwrap();
     assert_eq!(recorded.len(), 1, "evaluator must be invoked exactly once");
     assert_eq!(recorded[0].task_name, "issue-triage");
-    // No `squad.agentsToModels` / `defaultLeader` was configured, so both
-    // pass through as the un-set defaults — proving the scheduler forwards
+    // No `workflows.dynamic.agentsToModels` / `defaultLeader` was configured,
+    // so both pass through with their key-table defaults — proving the scheduler forwards
     // whatever the config actually has, rather than inventing a value.
-    assert_eq!(recorded[0].agents_to_models, None);
+    assert_eq!(recorded[0].agents_to_models, Some(Default::default()));
     assert_eq!(recorded[0].default_leader, None);
     assert!(
         recorded[0].task_dir.join("workflow.toml").exists(),
@@ -328,14 +328,15 @@ async fn squad_config_edits_take_effect_on_the_next_tick_without_a_restart() {
     let task_row = task("config-reread", 0);
     store.create(&task_row).unwrap();
 
-    GlobalConfig {
-        squad: Some(SquadConfig {
-            guidance: Some(vec!["v1-guidance".to_string()]),
-            ..Default::default()
-        }),
-        ..Default::default()
-    }
-    .save_with(&env)
+    ConfigFile::from_value(
+        serde_json::json!({"workflows":{"dynamic":{"guidance":["v1-guidance"]}}}),
+        awman::data::config::FileKind::Global,
+    )
+    .unwrap()
+    .save(
+        &awman::data::config::file::global_config_path(&env).unwrap(),
+        awman::data::config::FileKind::Global,
+    )
     .unwrap();
 
     let recorded1 = Arc::new(Mutex::new(Vec::new()));
@@ -352,14 +353,15 @@ async fn squad_config_edits_take_effect_on_the_next_tick_without_a_restart() {
 
     // Edit config on disk — no scheduler restart, no new env, nothing but
     // rewriting the file the scheduler already points at.
-    GlobalConfig {
-        squad: Some(SquadConfig {
-            guidance: Some(vec!["v2-guidance".to_string()]),
-            ..Default::default()
-        }),
-        ..Default::default()
-    }
-    .save_with(&env)
+    ConfigFile::from_value(
+        serde_json::json!({"workflows":{"dynamic":{"guidance":["v2-guidance"]}}}),
+        awman::data::config::FileKind::Global,
+    )
+    .unwrap()
+    .save(
+        &awman::data::config::file::global_config_path(&env).unwrap(),
+        awman::data::config::FileKind::Global,
+    )
     .unwrap();
 
     let recorded2 = Arc::new(Mutex::new(Vec::new()));
@@ -475,14 +477,15 @@ async fn concurrency_cap_bounds_the_whole_in_flight_set_and_never_queues_an_uncl
     let paths = SquadPaths::from_root(tmp.path());
     let env = squad_root_env(tmp.path());
 
-    GlobalConfig {
-        squad: Some(SquadConfig {
-            max_concurrent_evaluations: Some(1),
-            ..Default::default()
-        }),
-        ..Default::default()
-    }
-    .save_with(&env)
+    ConfigFile::from_value(
+        serde_json::json!({"daemon":{"features":{"squad":{"maxConcurrentEvaluations":1}}}}),
+        awman::data::config::FileKind::Global,
+    )
+    .unwrap()
+    .save(
+        &awman::data::config::file::global_config_path(&env).unwrap(),
+        awman::data::config::FileKind::Global,
+    )
     .unwrap();
 
     let first = task("cap-one", 0);
@@ -567,14 +570,15 @@ async fn a_running_scheduler_observes_a_config_edit_on_its_next_tick() {
 
     store.create(&task("live-reread", 0)).unwrap();
 
-    GlobalConfig {
-        squad: Some(SquadConfig {
-            guidance: Some(vec!["v1-guidance".to_string()]),
-            ..Default::default()
-        }),
-        ..Default::default()
-    }
-    .save_with(&env)
+    ConfigFile::from_value(
+        serde_json::json!({"workflows":{"dynamic":{"guidance":["v1-guidance"]}}}),
+        awman::data::config::FileKind::Global,
+    )
+    .unwrap()
+    .save(
+        &awman::data::config::file::global_config_path(&env).unwrap(),
+        awman::data::config::FileKind::Global,
+    )
     .unwrap();
 
     let recorded = Arc::new(Mutex::new(Vec::new()));
@@ -597,14 +601,15 @@ async fn a_running_scheduler_observes_a_config_edit_on_its_next_tick() {
     );
 
     // Rewrite the config under the still-running scheduler.
-    GlobalConfig {
-        squad: Some(SquadConfig {
-            guidance: Some(vec!["v2-guidance".to_string()]),
-            ..Default::default()
-        }),
-        ..Default::default()
-    }
-    .save_with(&env)
+    ConfigFile::from_value(
+        serde_json::json!({"workflows":{"dynamic":{"guidance":["v2-guidance"]}}}),
+        awman::data::config::FileKind::Global,
+    )
+    .unwrap()
+    .save(
+        &awman::data::config::file::global_config_path(&env).unwrap(),
+        awman::data::config::FileKind::Global,
+    )
     .unwrap();
 
     // Later ticks of the same scheduler must pick the edit up.

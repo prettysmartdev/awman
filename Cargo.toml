@@ -66,8 +66,8 @@ thiserror = "2"
 async-trait = "0.1"
 futures-util = "0.3"
 which = "8"
-hyper = { version = "1", features = ["client", "http1"] }
-hyper-util = { version = "0.1", features = ["tokio", "client-legacy", "http1"] }
+hyper = { version = "1", features = ["client", "server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "client-legacy", "http1", "service"] }
 http-body-util = "0.1"
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "tls12", "ring", "rustls-native-certs"] }
 # Features vary per member (each adds its own).
@@ -103,7 +103,7 @@ path = "src/lib.rs"
 
 [features]
 default = []
-builtin-runtime = ["dep:microsandbox", "dep:microsandbox-cli", "dep:microsandbox-image", "dep:microsandbox-network", "dep:sqlx", "dep:msb_krun", "msb_krun/static-krunfw", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:hyper-rustls"]
+builtin-runtime = ["dep:microsandbox", "dep:microsandbox-cli", "dep:microsandbox-image", "dep:microsandbox-network", "dep:sqlx", "dep:msb_krun", "msb_krun/static-krunfw", "dep:hyper-rustls"]
 
 [dependencies]
 anyhow = { workspace = true }
@@ -147,9 +147,9 @@ thiserror = { workspace = true }
 async-trait = { workspace = true }
 futures-util = { workspace = true }
 which = { workspace = true }
-hyper = { workspace = true, optional = true }
-hyper-util = { workspace = true, optional = true }
-http-body-util = { workspace = true, optional = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
 hyper-rustls = { workspace = true, optional = true }
 
 [build-dependencies]

@@ -94,7 +94,7 @@ fn publish_running_daemon(root: &std::path::Path, base: &str, pid: u32) {
     daemon.force_write_pidfile(pid).expect("pidfile");
 }
 
-/// One coverage body, as `GET /v1/daemon/env` returns it.
+/// One coverage body, as `GET /v1/squad/env` returns it.
 fn coverage_body(salt: &Salt, entries: &[(&str, Option<String>)]) -> serde_json::Value {
     serde_json::json!({
         "salt": salt.to_hex(),
@@ -134,12 +134,12 @@ async fn requests(server: &MockServer) -> Vec<(String, String, serde_json::Value
 
 async fn mount_env_routes(server: &MockServer, coverage: serde_json::Value) {
     Mock::given(matchers::method("GET"))
-        .and(matchers::path("/v1/daemon/env"))
+        .and(matchers::path("/v1/squad/env"))
         .respond_with(ResponseTemplate::new(200).set_body_json(coverage.clone()))
         .mount(server)
         .await;
-    Mock::given(matchers::method("POST"))
-        .and(matchers::path("/v1/daemon/env"))
+    Mock::given(matchers::method("PUT"))
+        .and(matchers::path("/v1/squad/env"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "accepted": ["WI0116_SYNC_TOKEN"],
             "ignored": [],
@@ -177,11 +177,7 @@ async fn ensure_running_against_a_live_daemon_learns_required_env_then_sends_the
     let holder = FakeAwmanProcess::spawn("env-sync");
     publish_running_daemon(tmp.path(), &server.uri(), holder.id());
     let mut env = ScopedEnv::set(&[
-        ("AWMAN_CONFIG_HOME", tmp.path().to_str().unwrap()),
-        (
-            "AWMAN_SQUAD_ROOT",
-            tmp.path().join("squad").to_str().unwrap(),
-        ),
+        ("AWMAN_HOME", tmp.path().to_str().unwrap()),
         ("WI0116_SYNC_TOKEN", "the-value"),
         // Set, but outside `required_env`: it must never be transmitted.
         ("WI0116_NOT_REQUIRED", "never-sent"),
@@ -203,12 +199,12 @@ async fn ensure_running_against_a_live_daemon_learns_required_env_then_sends_the
     );
     assert_eq!(
         (seen[0].0.as_str(), seen[0].1.as_str()),
-        ("GET", "/v1/daemon/env"),
+        ("GET", "/v1/squad/env"),
         "the cold call sends nothing first — it asks"
     );
     assert_eq!(
         (seen[1].0.as_str(), seen[1].1.as_str()),
-        ("POST", "/v1/daemon/env")
+        ("PUT", "/v1/squad/env")
     );
 
     let push = &seen[1].2;
@@ -251,11 +247,7 @@ async fn a_matching_digest_costs_one_get_and_puts_no_secret_on_the_wire() {
     let holder = FakeAwmanProcess::spawn("env-sync");
     publish_running_daemon(tmp.path(), &server.uri(), holder.id());
     let mut env = ScopedEnv::set(&[
-        ("AWMAN_CONFIG_HOME", tmp.path().to_str().unwrap()),
-        (
-            "AWMAN_SQUAD_ROOT",
-            tmp.path().join("squad").to_str().unwrap(),
-        ),
+        ("AWMAN_HOME", tmp.path().to_str().unwrap()),
         ("WI0116_SYNC_TOKEN", "the-value"),
     ]);
     env.clear("AWMAN_SQUAD_KEY");
@@ -292,11 +284,7 @@ async fn a_rotated_value_is_pushed_to_an_already_running_daemon() {
     let holder = FakeAwmanProcess::spawn("env-sync");
     publish_running_daemon(tmp.path(), &server.uri(), holder.id());
     let mut env = ScopedEnv::set(&[
-        ("AWMAN_CONFIG_HOME", tmp.path().to_str().unwrap()),
-        (
-            "AWMAN_SQUAD_ROOT",
-            tmp.path().join("squad").to_str().unwrap(),
-        ),
+        ("AWMAN_HOME", tmp.path().to_str().unwrap()),
         ("WI0116_SYNC_TOKEN", "the-new-value"),
     ]);
     env.clear("AWMAN_SQUAD_KEY");
@@ -334,11 +322,7 @@ async fn a_read_only_probe_gateway_pushes_nothing() {
     let holder = FakeAwmanProcess::spawn("env-sync");
     publish_running_daemon(tmp.path(), &server.uri(), holder.id());
     let mut env = ScopedEnv::set(&[
-        ("AWMAN_CONFIG_HOME", tmp.path().to_str().unwrap()),
-        (
-            "AWMAN_SQUAD_ROOT",
-            tmp.path().join("squad").to_str().unwrap(),
-        ),
+        ("AWMAN_HOME", tmp.path().to_str().unwrap()),
         ("WI0116_SYNC_TOKEN", "the-value"),
     ]);
     env.clear("AWMAN_SQUAD_KEY");
@@ -377,7 +361,7 @@ async fn the_indicator_probe_makes_exactly_one_list_call_per_tick() {
     // One task, carrying an unmet name on the `list` response itself.
     let task = Task {
         prerequisites: None,
-        id: "deploy".into(),
+        id: awman::data::ids::TaskId::new(),
         name: "deploy".into(),
         description: "d".into(),
         repo_scope: tmp.path().to_path_buf(),
@@ -395,9 +379,9 @@ async fn the_indicator_probe_makes_exactly_one_list_call_per_tick() {
         last_run_status: None,
         unmet_env: vec!["AWS_PROFILE".into()],
     };
-    Mock::given(matchers::method("POST"))
-        .and(matchers::path("/v1/commands"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(vec![task]))
+    Mock::given(matchers::method("GET"))
+        .and(matchers::path("/v1/squad/tasks"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"items":[awman::command::daemon_api::squad::TaskResponse(task)],"next_cursor":null})))
         .mount(&server)
         .await;
     // Coverage and status are mounted too, so a probe that *did* make a second
@@ -407,13 +391,7 @@ async fn the_indicator_probe_makes_exactly_one_list_call_per_tick() {
 
     let holder = FakeAwmanProcess::spawn("env-sync");
     publish_running_daemon(tmp.path(), &server.uri(), holder.id());
-    let mut env = ScopedEnv::set(&[
-        ("AWMAN_CONFIG_HOME", tmp.path().to_str().unwrap()),
-        (
-            "AWMAN_SQUAD_ROOT",
-            tmp.path().join("squad").to_str().unwrap(),
-        ),
-    ]);
+    let mut env = ScopedEnv::set(&[("AWMAN_HOME", tmp.path().to_str().unwrap())]);
     env.clear("AWMAN_SQUAD_KEY");
 
     let shared: Arc<std::sync::Mutex<SquadIndicator>> =
@@ -450,12 +428,9 @@ async fn the_indicator_probe_makes_exactly_one_list_call_per_tick() {
     );
     assert_eq!(
         (seen[0].0.as_str(), seen[0].1.as_str()),
-        ("POST", "/v1/commands")
+        ("GET", "/v1/squad/tasks")
     );
-    assert_eq!(
-        seen[0].2["subcommand"], "squad list",
-        "and that one call is the `list` the poller already made"
-    );
+    assert!(seen[0].2.is_null(), "resource GET has no command envelope");
 
     drop(env);
     drop(holder);
@@ -480,13 +455,7 @@ async fn the_remote_gateway_reads_coverage_as_names_digests_and_timestamps() {
 
     let holder = FakeAwmanProcess::spawn("env-sync");
     publish_running_daemon(tmp.path(), &server.uri(), holder.id());
-    let mut env = ScopedEnv::set(&[
-        ("AWMAN_CONFIG_HOME", tmp.path().to_str().unwrap()),
-        (
-            "AWMAN_SQUAD_ROOT",
-            tmp.path().join("squad").to_str().unwrap(),
-        ),
-    ]);
+    let mut env = ScopedEnv::set(&[("AWMAN_HOME", tmp.path().to_str().unwrap())]);
     env.clear("AWMAN_SQUAD_KEY");
 
     let resolver = SquadGatewayResolver::from_env(&Env::from_process()).unwrap();

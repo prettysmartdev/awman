@@ -38,6 +38,7 @@ pub struct SessionSubmission {
 
 /// Catalogue command tokens and validated label values, independent of HTTP.
 pub struct CommandSubmission {
+    pub interaction: Option<crate::data::config::daemon::Interaction>,
     pub subcommand: String,
     pub args: Vec<String>,
     pub labels: Labels,
@@ -93,7 +94,9 @@ impl CommandSubmission {
         format!("{value}\n{session}")
     }
 
-    fn validate(&self) -> Result<ParsedArgs, AdmissionError> {
+    pub(crate) fn validate(&self) -> Result<ParsedArgs, AdmissionError> {
+        Labels::new(self.labels.clone().into_inner())
+            .map_err(|e| AdmissionError::CommandValidation(CommandError::Other(e.to_string())))?;
         let catalogue = CommandCatalogue::get();
         let path: Vec<&str> = self.subcommand.split_whitespace().collect();
         if let Err(CommandError::NotAvailableForFrontend { command, .. }) =
@@ -127,6 +130,58 @@ pub struct ApiAdmission {
 }
 
 impl ApiAdmission {
+    fn resolve_interaction(
+        &self,
+        mut command: CommandSubmission,
+    ) -> Result<CommandSubmission, AdmissionError> {
+        use crate::data::config::daemon::{DaemonSettings, Interaction};
+        let settings = DaemonSettings::from_merged(
+            &self
+                .engines
+                .global_config
+                .daemon
+                .clone()
+                .unwrap_or_default(),
+        )
+        .worker;
+        let interaction = command.interaction.unwrap_or(settings.push_interaction);
+        if command.interaction.is_some()
+            && interaction != settings.push_interaction
+            && !settings.push_allow_override
+        {
+            return Err(AdmissionError::CommandValidation(CommandError::Other(
+                "interaction override is disabled".into(),
+            )));
+        }
+        let supports = CommandCatalogue::get()
+            .lookup_with_aliases(&command.subcommand.split_whitespace().collect::<Vec<_>>())
+            .is_some_and(|s| s.find_flag("headless").is_some());
+        if supports {
+            let mut positional = false;
+            command.args.retain(|arg| {
+                if positional {
+                    return true;
+                }
+                if arg == "--" {
+                    positional = true;
+                    return true;
+                }
+                arg != "--headless" && arg != "-n" && !arg.starts_with("--headless=")
+            });
+            command.args.insert(
+                0,
+                if interaction == Interaction::Headless {
+                    "--headless"
+                } else {
+                    "--headless=false"
+                }
+                .into(),
+            );
+        }
+        command.interaction = Some(interaction);
+        Ok(command)
+    }
+
     pub fn new(
         store: Arc<SqliteSessionStore>,
         lifecycle_store: CommandLifecycleStore,
@@ -163,8 +218,9 @@ impl ApiAdmission {
         close_on_finish: bool,
         journal: Option<&IdempotentAdmission>,
     ) -> Result<AdmittedSession, AdmissionError> {
-        let session_id = uuid::Uuid::new_v4().to_string();
-        let created_at = chrono::Utc::now().to_rfc3339();
+        let command = command.map(|c| self.resolve_interaction(c)).transpose()?;
+        let session_id = crate::data::ids::WorkerSessionId::new().to_string();
+        let created_at = crate::data::wire::format_timestamp(chrono::Utc::now());
         let session_dir = self.paths.session_dir(&session_id);
 
         // Validate and plan the session in Layer 2. The route only maps the typed
@@ -191,7 +247,9 @@ impl ApiAdmission {
         // Fix the response before durable writes. The provisional insertion
         // replaces this intent with a rollback barrier; only complete admission
         // restores it for crash recovery from the session or command resource.
-        let command_id = command.as_ref().map(|_| uuid::Uuid::new_v4().to_string());
+        let command_id = command
+            .as_ref()
+            .map(|_| crate::data::ids::CommandId::new().to_string());
         let response_body = match &command_id {
             Some(command_id) => admission_body(
                 journal,
@@ -203,9 +261,7 @@ impl ApiAdmission {
             ),
             None => admission_body(
                 journal,
-                &SessionResponse {
-                    session_id: session_id.clone(),
-                },
+                &serde_json::json!({"id":session_id,"workdir":plan.resolved_workdir,"created_at":created_at,"status":"active","setup_status":"initializing","session_type":plan.kind.as_str(),"repo_url":plan.repo_url,"branch":plan.branch,"base_ref":plan.base_ref,"merge_refs":plan.merge_refs,"push":plan.push,"labels":submission.labels}),
                 IdempotencyResource::Session(&session_id),
             ),
         };
@@ -275,8 +331,10 @@ impl ApiAdmission {
             // The run link precedes the command row: the row is the admission
             // point, and setup/bootstrap always find the link for it.
             let run = RunRecord {
-                session_id: session_id.clone(),
-                command_id,
+                session_id: crate::data::ids::WorkerSessionId::parse(&session_id)
+                    .expect("generated session id"),
+                command_id: crate::data::ids::CommandId::parse(&command_id)
+                    .expect("generated command id"),
                 close_on_finish,
                 created_at,
             };
@@ -285,7 +343,8 @@ impl ApiAdmission {
                 self.compensate_session(&session_id, journal).await;
                 return Err(storage("Failed to record run", error));
             }
-            if let Err(error) = self.enqueue_command(&run.command_id, &session_id, &command) {
+            if let Err(error) = self.enqueue_command(run.command_id.as_str(), &session_id, &command)
+            {
                 self.compensate_session(&session_id, journal).await;
                 return Err(error);
             }
@@ -297,7 +356,7 @@ impl ApiAdmission {
         // Only fully populated resources may recover an accepted response.
         if let Some(journal) = journal {
             let resource = match &run {
-                Some(run) => IdempotencyResource::Command(&run.command_id),
+                Some(run) => IdempotencyResource::Command(run.command_id.as_str()),
                 None => IdempotencyResource::Session(&session_id),
             };
             if let Err(error) = journal.record(&response_body, resource) {
@@ -340,6 +399,7 @@ impl ApiAdmission {
         submission: CommandSubmission,
         journal: Option<&IdempotentAdmission>,
     ) -> Result<AdmittedCommand, AdmissionError> {
+        let submission = self.resolve_interaction(submission)?;
         let parsed = submission.validate()?;
         match self
             .store
@@ -354,7 +414,7 @@ impl ApiAdmission {
             return Err(AdmissionError::Setup(readiness));
         }
         let path_parts: Vec<&str> = submission.subcommand.split_whitespace().collect();
-        let command_id = uuid::Uuid::new_v4().to_string();
+        let command_id = crate::data::ids::CommandId::new().to_string();
         let mut flags_applied = serde_json::Value::Object(
             CommandCatalogue::get()
                 .frontend_profile(FrontendKind::Api, &path_parts)
@@ -362,8 +422,18 @@ impl ApiAdmission {
                 .map(|(flag, value)| (flag.replace('-', "_"), flag_default_json(&value)))
                 .collect(),
         );
+        if flags_applied.get("headless").is_some() {
+            flags_applied["headless"] = serde_json::json!(
+                submission.interaction
+                    != Some(crate::data::config::daemon::Interaction::Interactive)
+            );
+        }
         if let Some(session) = self.sessions.get_by_key(session_id) {
-            let dispatch = Dispatch::new(AdmissionInput(parsed), session, self.engines.clone());
+            let dispatch = Dispatch::new(
+                AdmissionInput(parsed, submission.interaction),
+                session,
+                self.engines.clone(),
+            );
             if let Some(policy) = dispatch
                 .prerequisite_admission(&path_parts)
                 .map_err(AdmissionError::CommandAdmission)?
@@ -375,6 +445,8 @@ impl ApiAdmission {
             journal,
             &CommandResponse {
                 command_id: command_id.clone(),
+                session_id: session_id.to_string(),
+                status: "queued",
                 flags_applied: flags_applied.clone(),
             },
             IdempotencyResource::Command(&command_id),
@@ -426,12 +498,10 @@ impl ApiAdmission {
 }
 
 #[derive(Serialize)]
-struct SessionResponse {
-    session_id: String,
-}
-
-#[derive(Serialize)]
 struct CommandResponse {
+    session_id: String,
+    status: &'static str,
+    #[serde(rename = "id")]
     command_id: String,
     /// Server-enforced flags whose values the API frontend always overrides.
     /// Documents to clients that `yolo` and `non_interactive` are forced to
@@ -465,16 +535,26 @@ fn flag_default_json(
 
 /// Only the catalogue accessors used by Dispatch's admission policy. It never
 /// executes a command or constructs an execution frontend.
-struct AdmissionInput(ParsedArgs);
+struct AdmissionInput(ParsedArgs, Option<crate::data::config::daemon::Interaction>);
 impl UserMessageSink for AdmissionInput {
     fn write_message(&mut self, _message: UserMessage) {}
     fn replay_queued(&mut self) {}
 }
 impl CommandFrontend for AdmissionInput {
+    fn input_available(&self) -> bool {
+        self.1 == Some(crate::data::config::daemon::Interaction::Interactive)
+    }
     fn kind(&self) -> FrontendKind {
         FrontendKind::Api
     }
     fn flag_bool(&self, _path: &[&str], name: &str) -> Result<Option<bool>, CommandError> {
+        if name == "headless" {
+            if let Some(mode) = self.1 {
+                return Ok(Some(
+                    mode == crate::data::config::daemon::Interaction::Headless,
+                ));
+            }
+        }
         Ok(self.0.flag_bool(name))
     }
     fn flag_string(&self, _path: &[&str], name: &str) -> Result<Option<String>, CommandError> {
@@ -507,7 +587,7 @@ impl CommandFrontend for AdmissionInput {
 /// process's intent, but cannot take over another live request here.
 fn daemon_instance() -> &'static str {
     static INSTANCE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    INSTANCE.get_or_init(|| uuid::Uuid::new_v4().to_string())
+    INSTANCE.get_or_init(|| crate::data::ids::CommandId::new().to_string())
 }
 
 /// Owns a request's reservation, including release when its future is dropped
@@ -534,7 +614,7 @@ impl IdempotentAdmission {
             route,
             principal: principal.into(),
             key: key.into(),
-            request: uuid::Uuid::new_v4().to_string(),
+            request: crate::data::ids::CommandId::new().to_string(),
             active: AtomicBool::new(false),
         }
     }
@@ -582,7 +662,11 @@ impl IdempotentAdmission {
             self.scope(),
             &self.key,
             self.owner(),
-            202,
+            if matches!(resource, IdempotencyResource::Session(_)) {
+                201
+            } else {
+                202
+            },
             body,
             resource,
         ) {

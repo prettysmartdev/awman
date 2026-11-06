@@ -60,7 +60,7 @@ impl AgentArgv {
             argv.extend(options.agent_flags.iter().cloned());
             return Ok(Self(argv));
         }
-        // The non-interactive sub-command or flag (`exec`, `run`, `--print`) is
+        // The headless sub-command or flag (`exec`, `run`, `--print`) is
         // already part of the entrypoint (`AgentDefinition::entrypoint_for`); it
         // is never repeated here.
         // Per-agent mode flags (yolo, auto, plan) — literal args.
@@ -106,7 +106,7 @@ impl AgentArgv {
         // Interactive + seeded prompt: most agents take the prompt as the final
         // positional; agents with an `interactive_seed_flag` (opencode
         // `--prompt`) take a flag pair, because their bare positional means
-        // something else. Non-interactive prompts are piped on stdin instead.
+        // something else. Headless prompts are piped on stdin instead.
         if options.interactive {
             if let Some(prompt) = &options.seeded_prompt {
                 if let Some(flag) = &options.interactive_seed_flag {

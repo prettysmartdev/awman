@@ -209,7 +209,7 @@ async fn squad_and_api_workflow_routes_publish_the_same_view_state() {
             Some("sonnet"),
         ),
         (
-            "run",
+            "cmd_a53108f7543b75adbb34afc035d4cdf6",
             &["done"],
             StepState::Running {
                 container_id: Some("run-1".into()),
@@ -280,7 +280,6 @@ fn squad_app() -> App {
             ApiPaths::at_root("/tmp"),
         )),
         agent_engine: Arc::new(AgentEngine::new(overlay, runtime)),
-        config_notices: Default::default(),
         workflow_state_store: Arc::new(WorkflowStateStore::at_git_root(
             tempfile::tempdir().unwrap().path(),
         )),

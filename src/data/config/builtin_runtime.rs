@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::data::config::builtin_network::BuiltinNetworkConfig;
 use crate::data::config::image_source::{ImageSourceSpec, RegistryHostConfig};
+use crate::data::config::units::Size;
 
 /// Whole vCPUs per agent VM when none are configured.
 pub const DEFAULT_VCPUS: u8 = 2;
@@ -54,18 +55,18 @@ pub struct BuiltinRuntimeConfig {
     /// requests are rejected, never rounded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vcpus: Option<u8>,
-    /// Guest memory in MiB. Default [`DEFAULT_MEMORY_MIB`], at least
-    /// [`MIN_MEMORY_MIB`].
+    /// Guest memory (`"4GiB"`). Default [`DEFAULT_MEMORY_MIB`] MiB, at least
+    /// [`MIN_MEMORY_MIB`] MiB.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub memory_mib: Option<u32>,
-    /// Writable root disk in MiB. Default [`DEFAULT_ROOT_DISK_MIB`], at least
-    /// [`MIN_ROOT_DISK_MIB`].
+    pub memory: Option<Size>,
+    /// Writable root disk (`"30GiB"`). Default [`DEFAULT_ROOT_DISK_MIB`] MiB, at
+    /// least [`MIN_ROOT_DISK_MIB`] MiB.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub root_disk_mib: Option<u32>,
-    /// Guest-write budget per host mount in MiB. Default
-    /// [`DEFAULT_MOUNT_QUOTA_MIB`], at least 1.
+    pub root_disk: Option<Size>,
+    /// Guest-write budget per host mount (`"30GiB"`). Default
+    /// [`DEFAULT_MOUNT_QUOTA_MIB`] MiB, at least 1MiB.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mount_quota_mib: Option<u32>,
+    pub mount_quota: Option<Size>,
     /// Where `awman ready` acquires images that are not cached yet. No
     /// default: its absence is an error with guidance, never an implicit
     /// registry or daemon lookup.
@@ -96,7 +97,7 @@ pub struct BuiltinRuntimeConfig {
 
 /// Dotted name of the builder switch, as config errors and `awman config`
 /// name it.
-pub const BUILDER_ENABLED_FIELD: &str = "builtin.builder.enabled";
+pub const BUILDER_ENABLED_FIELD: &str = "runtime.builtin.builder.enabled";
 
 /// The `builtin.builder` block: whether `awman ready` may build a missing or
 /// explicitly rebuilt image into the store its configured source exports
@@ -167,7 +168,7 @@ where
     let value = serde_json::Value::deserialize(deserializer)?;
     if !value.is_object() {
         return Err(D::Error::custom(format!(
-            "builtin.builder must be an object holding {BUILDER_ENABLED_FIELD}, not {value}"
+            "runtime.builtin.builder must be an object holding {BUILDER_ENABLED_FIELD}, not {value}"
         )));
     }
     serde_json::from_value(value).map_err(|e| {
@@ -175,9 +176,14 @@ where
         if message.contains(BUILDER_ENABLED_FIELD) {
             D::Error::custom(message)
         } else {
-            D::Error::custom(format!("builtin.builder: {message}"))
+            D::Error::custom(format!("runtime.builtin.builder: {message}"))
         }
     })
+}
+
+/// Whole MiB of a configured size, saturating at `u32::MAX`.
+fn size_mib(size: &Size) -> u32 {
+    u32::try_from(size.mib()).unwrap_or(u32::MAX)
 }
 
 impl BuiltinRuntimeConfig {
@@ -196,9 +202,12 @@ impl BuiltinRuntimeConfig {
         BuiltinRuntimeConfig {
             state_dir: self.state_dir.clone().or_else(|| base.state_dir.clone()),
             vcpus: self.vcpus.or(base.vcpus),
-            memory_mib: self.memory_mib.or(base.memory_mib),
-            root_disk_mib: self.root_disk_mib.or(base.root_disk_mib),
-            mount_quota_mib: self.mount_quota_mib.or(base.mount_quota_mib),
+            memory: self.memory.clone().or_else(|| base.memory.clone()),
+            root_disk: self.root_disk.clone().or_else(|| base.root_disk.clone()),
+            mount_quota: self
+                .mount_quota
+                .clone()
+                .or_else(|| base.mount_quota.clone()),
             image_source: self
                 .image_source
                 .clone()
@@ -229,17 +238,21 @@ impl BuiltinRuntimeConfig {
 
     /// Configured memory, or [`DEFAULT_MEMORY_MIB`].
     pub fn memory_mib_or_default(&self) -> u32 {
-        self.memory_mib.unwrap_or(DEFAULT_MEMORY_MIB)
+        self.memory.as_ref().map_or(DEFAULT_MEMORY_MIB, size_mib)
     }
 
     /// Configured root disk, or [`DEFAULT_ROOT_DISK_MIB`].
     pub fn root_disk_mib_or_default(&self) -> u32 {
-        self.root_disk_mib.unwrap_or(DEFAULT_ROOT_DISK_MIB)
+        self.root_disk
+            .as_ref()
+            .map_or(DEFAULT_ROOT_DISK_MIB, size_mib)
     }
 
     /// Configured per-mount quota, or [`DEFAULT_MOUNT_QUOTA_MIB`].
     pub fn mount_quota_mib_or_default(&self) -> u32 {
-        self.mount_quota_mib.unwrap_or(DEFAULT_MOUNT_QUOTA_MIB)
+        self.mount_quota
+            .as_ref()
+            .map_or(DEFAULT_MOUNT_QUOTA_MIB, size_mib)
     }
 
     /// Reject values that cannot be honoured: zero vCPUs, memory below
@@ -261,20 +274,28 @@ impl BuiltinRuntimeConfig {
     /// checks.
     pub fn validate_resources(&self) -> Result<(), String> {
         if self.vcpus == Some(0) {
-            return Err("builtin.vcpus must be at least 1".into());
+            return Err("runtime.builtin.vcpus must be at least 1".into());
         }
-        if self.memory_mib.is_some_and(|m| m < MIN_MEMORY_MIB) {
+        if self
+            .memory
+            .as_ref()
+            .is_some_and(|m| m.mib() < u64::from(MIN_MEMORY_MIB))
+        {
             return Err(format!(
-                "builtin.memoryMib must be at least {MIN_MEMORY_MIB}"
+                "runtime.builtin.memory must be at least {MIN_MEMORY_MIB}MiB"
             ));
         }
-        if self.root_disk_mib.is_some_and(|m| m < MIN_ROOT_DISK_MIB) {
+        if self
+            .root_disk
+            .as_ref()
+            .is_some_and(|m| m.mib() < u64::from(MIN_ROOT_DISK_MIB))
+        {
             return Err(format!(
-                "builtin.rootDiskMib must be at least {MIN_ROOT_DISK_MIB}"
+                "runtime.builtin.rootDisk must be at least {MIN_ROOT_DISK_MIB}MiB"
             ));
         }
-        if self.mount_quota_mib == Some(0) {
-            return Err("builtin.mountQuotaMib must be at least 1".into());
+        if self.mount_quota.as_ref().is_some_and(|m| m.mib() < 1) {
+            return Err("runtime.builtin.mountQuota must be at least 1MiB".into());
         }
         Ok(())
     }
@@ -284,12 +305,12 @@ impl BuiltinRuntimeConfig {
         if let Some(source) = &self.image_source {
             source
                 .validate()
-                .map_err(|e| format!("builtin.imageSource: {e}"))?;
+                .map_err(|e| format!("runtime.builtin.imageSource: {e}"))?;
         }
         for (tag, source) in &self.images {
             source
                 .validate()
-                .map_err(|e| format!("builtin.images[{tag}]: {e}"))?;
+                .map_err(|e| format!("runtime.builtin.images[{tag}]: {e}"))?;
         }
         Ok(())
     }
@@ -308,7 +329,7 @@ mod tests {
     #[test]
     fn camel_case_fields_parse_and_unknown_fields_are_rejected() {
         let cfg: BuiltinRuntimeConfig = serde_json::from_str(
-            r#"{"stateDir":"/s","vcpus":4,"memoryMib":2048,
+            r#"{"stateDir":"/s","vcpus":4,"memory":"2048MiB",
                 "imageSource":{"type":"registry","registry":"localhost:5000"}}"#,
         )
         .unwrap();
@@ -336,7 +357,7 @@ mod tests {
     fn repo_merges_over_global_per_field_and_per_key() {
         let global = BuiltinRuntimeConfig {
             vcpus: Some(2),
-            memory_mib: Some(8192),
+            memory: Some(Size::from_mib(8192)),
             image_source: Some(ImageSourceSpec::Registry {
                 registry: Some("global".into()),
                 reference: None,
@@ -369,7 +390,7 @@ mod tests {
         };
         let merged = repo.merged_over(&global);
         assert_eq!(merged.vcpus, Some(6));
-        assert_eq!(merged.memory_mib, Some(8192));
+        assert_eq!(merged.memory, Some(Size::from_mib(8192)));
         assert_eq!(merged.image_source, global.image_source);
         assert_eq!(
             merged.images.get("a").or(merged.image_source.as_ref()),
@@ -415,26 +436,26 @@ mod tests {
         .validate()
         .is_err());
         assert!(BuiltinRuntimeConfig {
-            memory_mib: Some(0),
+            memory: Some(Size::from_mib(0)),
             ..Default::default()
         }
         .validate()
         .is_err());
         assert!(BuiltinRuntimeConfig {
-            root_disk_mib: Some(MIN_ROOT_DISK_MIB - 1),
+            root_disk: Some(Size::from_mib(u64::from(MIN_ROOT_DISK_MIB) - 1)),
             ..Default::default()
         }
         .validate()
         .is_err());
         assert!(BuiltinRuntimeConfig {
-            mount_quota_mib: Some(0),
+            mount_quota: Some(Size::from_mib(0)),
             ..Default::default()
         }
         .validate()
         .is_err());
         assert!(BuiltinRuntimeConfig {
-            root_disk_mib: Some(MIN_ROOT_DISK_MIB),
-            mount_quota_mib: Some(1),
+            root_disk: Some(Size::from_mib(u64::from(MIN_ROOT_DISK_MIB))),
+            mount_quota: Some(Size::from_mib(1)),
             ..Default::default()
         }
         .validate()

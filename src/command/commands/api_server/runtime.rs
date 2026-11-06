@@ -157,6 +157,7 @@ impl SetupReadiness {
 /// The API daemon's Layer 2 state. The HTTP frontend receives this fully
 /// bootstrapped runtime and only builds a router, listener, and shutdown loop.
 pub struct ApiServerRuntime {
+    pub config: crate::data::config::EffectiveConfig,
     pub store: Arc<SqliteSessionStore>,
     pub sessions: Arc<SessionManager>,
     pub event_buses: Arc<tokio::sync::Mutex<HashMap<String, Arc<EventBus>>>>,
@@ -209,6 +210,7 @@ impl ApiServerRuntime {
         // must exist before any recovery below reads them.
         let lifecycle_store =
             CommandLifecycleStore::open(Arc::clone(&store)).map_err(CommandError::Data)?;
+        crate::data::fs::id_migration::rename_session_dirs(&paths).map_err(CommandError::Data)?;
 
         // Startup cleanup: remove closed sessions older than 24 hours.
         if let Ok(deleted) = store.delete_closed_sessions_older_than(24) {
@@ -308,7 +310,7 @@ impl ApiServerRuntime {
                 }
                 // A `/v1/runs` command queued behind this setup can never run.
                 if let Ok(Some(run)) =
-                    lifecycle_store.run_for_session(&rec.id).inspect_err(|error| {
+                    lifecycle_store.run_for_session(&crate::data::ids::WorkerSessionId::parse(&rec.id).expect("validated persisted resource id")).inspect_err(|error| {
                         tracing::error!(session_id = %rec.id, %error, "Failed to read run of interrupted setup")
                     })
                 {
@@ -319,14 +321,14 @@ impl ApiServerRuntime {
                             .as_ref(),
                     );
                     if let Err(error) =
-                        lifecycle_store.fail_if_queued(&run.command_id, &now, &result)
+                        lifecycle_store.fail_if_queued(run.command_id.as_str(), &now, &result)
                     {
                         tracing::error!(session_id = %rec.id, command_id = %run.command_id, %error, "Failed to fail run command of interrupted setup");
                     }
                     if let Err(error) = super::queue_worker::finalize_unowned_command(
                         &store,
                         &paths,
-                        &run.command_id,
+                        run.command_id.as_str(),
                     ) {
                         tracing::error!(session_id = %rec.id, command_id = %run.command_id, %error, "Failed to finalize run command of interrupted setup");
                     }
@@ -363,7 +365,7 @@ impl ApiServerRuntime {
             Ok(cancelled) => {
                 for id in &cancelled {
                     if let Err(error) =
-                        super::queue_worker::finalize_unowned_command(&store, &paths, id)
+                        super::queue_worker::finalize_unowned_command(&store, &paths, id.as_str())
                     {
                         tracing::warn!(%error, %id, "Failed to publish recovered cancellation");
                     }
@@ -408,7 +410,11 @@ impl ApiServerRuntime {
         let cancelled = lifecycle_store
             .cancelled_command_ids()
             .map_err(CommandError::Data)?;
-        for command_id in cancelled.iter().chain(&recovered) {
+        for command_id in cancelled
+            .iter()
+            .map(|id| id.as_str())
+            .chain(recovered.iter().map(String::as_str))
+        {
             match stop_command_containers(engines.runtime.as_ref(), command_id) {
                 Ok(0) => {}
                 Ok(count) => {
@@ -428,6 +434,7 @@ impl ApiServerRuntime {
         finish_drained_closes(&store, &paths, &engines, &sessions);
 
         Ok(Self {
+            config: crate::command::daemon_api::DaemonApi::effective(&engines),
             store,
             sessions,
             event_buses: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -438,7 +445,10 @@ impl ApiServerRuntime {
             started_at: Instant::now(),
             task_handles: tokio::sync::Mutex::new(Vec::new()),
             engines,
-            worker_count: global_config.workers() as usize,
+            worker_count: crate::data::config::DaemonSettings::from_merged(
+                &global_config.daemon.clone().unwrap_or_default(),
+            )
+            .max_concurrent_jobs,
             bind_ip: config.bind_ip,
             port: config.port,
             tls_material: config.tls_material,
@@ -493,47 +503,90 @@ impl ApiServerRuntime {
         )
     }
 
-    /// Start exactly the configured worker pool after Layer 3 provides its
-    /// frontend factory. The command layer never names an API frontend type.
-    pub fn spawn_workers<F>(&self, frontend_factory: F)
+    /// Resize the worker pool after a validated config reload. Retiring workers
+    /// finish their current command and stop claiming new work.
+    pub fn spawn_workers<F>(
+        &self,
+        frontend_factory: F,
+    ) -> tokio::sync::watch::Sender<crate::data::config::DaemonSettings>
     where
         F: ApiCommandFrontendFactory + 'static,
     {
-        if self.worker_count == 0 {
-            tracing::warn!("workers config is 0 — no queue workers will run; commands will be enqueued but never processed");
-        }
+        let mut settings = self.config.daemon();
+        settings.max_concurrent_jobs = self.worker_count;
+        let (tx, mut rx) = tokio::sync::watch::channel(settings);
+        let store = self.store.clone();
+        let engines = self.engines.clone();
+        let sessions = self.sessions.clone();
+        let event_buses = self.event_buses.clone();
+        let paths = self.paths.clone();
+        let lifecycle = self.lifecycle();
+        let lifecycle_store = self.lifecycle_store.clone();
+        let cancels = self.command_cancels.clone();
         let frontend_factory = Arc::new(frontend_factory);
-        let mut workers = Vec::new();
-        for worker_index in 0..self.worker_count {
-            let worker = QueueWorker::new(
-                format!("worker-{worker_index}-{}", uuid::Uuid::new_v4()),
-                QueueWorkerDeps {
-                    store: Arc::clone(&self.store),
-                    engines: self.engines.clone(),
-                    sessions: Arc::clone(&self.sessions),
-                    event_buses: Arc::clone(&self.event_buses),
-                    paths: self.paths.clone(),
-                    frontend_factory: Arc::clone(&frontend_factory),
-                    lifecycle: self.lifecycle(),
-                    lifecycle_store: self.lifecycle_store.clone(),
-                    cancels: Arc::clone(&self.command_cancels),
-                },
-            );
-            workers.push(worker);
-            tracing::debug!(worker_index, "Spawned queue worker");
-        }
-        tracing::info!(count = self.worker_count, "Queue workers started");
         tokio::spawn(async move {
-            if let Some(worker) = workers.first() {
-                if let Err(error) = worker.recover_cancelled_cleanup().await {
-                    tracing::error!(%error, "Cancelled cleanup recovery failed; queue workers were not started");
-                    return;
+            let make_worker = || {
+                QueueWorker::new(
+                    format!("worker-{}", uuid::Uuid::new_v4()),
+                    QueueWorkerDeps {
+                        store: store.clone(),
+                        engines: engines.clone(),
+                        sessions: sessions.clone(),
+                        event_buses: event_buses.clone(),
+                        paths: paths.clone(),
+                        frontend_factory: frontend_factory.clone(),
+                        lifecycle: lifecycle.clone(),
+                        lifecycle_store: lifecycle_store.clone(),
+                        cancels: cancels.clone(),
+                    },
+                )
+            };
+            if let Err(error) = make_worker().recover_cancelled_cleanup().await {
+                tracing::error!(%error,"Cancelled cleanup recovery failed");
+                return;
+            }
+            let mut workers: Vec<(
+                tokio_util::sync::CancellationToken,
+                tokio::task::JoinHandle<()>,
+            )> = Vec::new();
+            loop {
+                workers.retain(|(_, job)| !job.is_finished());
+                let settings = rx.borrow_and_update().clone();
+                let target = settings
+                    .max_concurrent_jobs
+                    .min(settings.worker.max_concurrent_jobs);
+                let active = workers
+                    .iter()
+                    .filter(|(stop, _)| !stop.is_cancelled())
+                    .count();
+                for (stop, _) in workers
+                    .iter()
+                    .rev()
+                    .filter(|(stop, _)| !stop.is_cancelled())
+                    .take(active.saturating_sub(target))
+                {
+                    stop.cancel();
+                }
+                // Retiring jobs still occupy capacity until they finish. A
+                // shrink followed by a grow must never start replacement
+                // work on top of those in-flight commands.
+                while workers.len() < target {
+                    let stop = tokio_util::sync::CancellationToken::new();
+                    let job = tokio::spawn(make_worker().run_until(stop.clone()));
+                    workers.push((stop, job));
+                }
+                tokio::select! {
+                    changed = rx.changed() => if changed.is_err() {
+                        for (stop, _) in workers { stop.cancel(); }
+                        return;
+                    },
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {
+                        // Reap retirees and replenish a pool after a job exits.
+                    }
                 }
             }
-            for worker in workers {
-                tokio::spawn(worker.run());
-            }
         });
+        tx
     }
 }
 
@@ -624,11 +677,14 @@ impl ApiSessionLifecycle {
         {
             if !setup_cancels.is_registered(&row.session_id) {
                 if let Some(run) = lifecycle
-                    .run_for_command(command_id)
+                    .run_for_command(
+                        &crate::data::ids::CommandId::parse(command_id)
+                            .expect("validated persisted resource id"),
+                    )
                     .map_err(CancelSessionError::Run)?
                 {
                     if run.close_on_finish {
-                        self.close(&run.session_id)
+                        self.close(run.session_id.as_str())
                             .await
                             .map_err(CancelSessionError::Close)?;
                     }
@@ -645,7 +701,7 @@ impl ApiSessionLifecycle {
         run: &crate::data::api_lifecycle_store::RunRecord,
         token: &tokio_util::sync::CancellationToken,
     ) -> Result<(), crate::data::error::DataError> {
-        match self.store.get_command(&run.command_id) {
+        match self.store.get_command(run.command_id.as_str()) {
             Ok(command) => {
                 if command.is_some_and(|c| c.status == CommandStatus::Cancelled) {
                     token.cancel();
@@ -776,15 +832,15 @@ impl ApiSessionLifecycle {
         lifecycle: &CommandLifecycleStore,
         run: &crate::data::api_lifecycle_store::RunRecord,
     ) -> Result<(), CommandError> {
-        let readiness = self.setup_readiness(&run.session_id).await;
+        let readiness = self.setup_readiness(run.session_id.as_str()).await;
         if !readiness.is_ready() {
             lifecycle.fail_if_queued(
-                &run.command_id,
+                run.command_id.as_str(),
                 &chrono::Utc::now().to_rfc3339(),
                 &run_setup_error_result(readiness.error()),
             )?;
         }
-        let command = self.store.get_command(&run.command_id)?;
+        let command = self.store.get_command(run.command_id.as_str())?;
         if command.as_ref().is_some_and(|c| {
             c.started_at.is_none()
                 && matches!(c.status, CommandStatus::Error | CommandStatus::Cancelled)
@@ -792,7 +848,7 @@ impl ApiSessionLifecycle {
             super::queue_worker::finalize_unowned_command(
                 &self.store,
                 &self.paths,
-                &run.command_id,
+                run.command_id.as_str(),
             )?;
         }
         let terminal = command.as_ref().is_some_and(|c| c.status.is_terminal());
@@ -801,7 +857,7 @@ impl ApiSessionLifecycle {
             .as_ref()
             .is_some_and(|c| c.status == CommandStatus::Cancelled && c.started_at.is_none());
         if cancelled_during_setup || (run.close_on_finish && terminal) {
-            self.close(&run.session_id).await?;
+            self.close(run.session_id.as_str()).await?;
         }
         Ok(())
     }
@@ -939,7 +995,23 @@ fn decode_queue_command(
 /// must not hide the rest of a session's queue from an operator.
 pub fn stored_args_view(record: &CommandRecord) -> serde_json::Value {
     match record.decode_args() {
-        Ok(args) => serde_json::json!(args),
+        Ok(args) => {
+            let mut positional = false;
+            let visible: Vec<_> = args
+                .into_iter()
+                .filter(|arg| {
+                    if positional {
+                        return true;
+                    }
+                    if arg == "--" {
+                        positional = true;
+                        return true;
+                    }
+                    arg != "--headless" && arg != "-n" && !arg.starts_with("--headless=")
+                })
+                .collect();
+            serde_json::json!(visible)
+        }
         Err(error) => {
             tracing::warn!(command_id = %record.id, %error, "Invalid stored command args in read projection");
             serde_json::from_str(&record.args).unwrap_or_else(|_| serde_json::json!([]))
@@ -995,7 +1067,7 @@ fn reconcile_runs(
         }
     };
     for run in runs {
-        let session = match store.get_session(&run.session_id) {
+        let session = match store.get_session(run.session_id.as_str()) {
             Ok(Some(session)) => session,
             Ok(None) => continue,
             Err(error) => {
@@ -1009,29 +1081,31 @@ fn reconcile_runs(
         let now = chrono::Utc::now().to_rfc3339();
         if session.setup_status == SessionSetupStatus::Failed {
             let error = paths
-                .read_setup_state(&run.session_id)
+                .read_setup_state(run.session_id.as_str())
                 .and_then(|state| state.error)
                 .and_then(|error| serde_json::to_value(error).ok());
             let result = run_setup_error_result(error.as_ref());
-            if let Err(error) = lifecycle_store.fail_if_queued(&run.command_id, &now, &result) {
+            if let Err(error) =
+                lifecycle_store.fail_if_queued(run.command_id.as_str(), &now, &result)
+            {
                 tracing::warn!(command_id = %run.command_id, %error, "Failed to fail a run whose setup failed");
             }
         }
         if let Err(error) =
-            super::queue_worker::finalize_unowned_command(store, paths, &run.command_id)
+            super::queue_worker::finalize_unowned_command(store, paths, run.command_id.as_str())
         {
             tracing::warn!(%error, command_id = %run.command_id, "Failed to publish terminal run result");
         }
         let terminal = store
-            .get_command(&run.command_id)
+            .get_command(run.command_id.as_str())
             .ok()
             .flatten()
             .is_some_and(|c| c.status.is_terminal());
         // The worker finishes durable cancelled cleanup before closing a
         // one-shot session and deleting the workspace it still needs.
-        if matches!(store.get_command(&run.command_id), Ok(Some(c)) if c.status == CommandStatus::Cancelled)
+        if matches!(store.get_command(run.command_id.as_str()), Ok(Some(c)) if c.status == CommandStatus::Cancelled)
             && !matches!(
-                paths.read_command_cleanup(&run.session_id, &run.command_id),
+                paths.read_command_cleanup(run.session_id.as_str(), run.command_id.as_str()),
                 Ok(None)
             )
         {
@@ -1167,6 +1241,29 @@ fn readiness_from_state(
 mod tests {
     use super::*;
 
+    #[test]
+    fn stored_args_projection_omits_server_injected_interaction_flags() {
+        let record = crate::data::fs::api_db::CommandRecord {
+            id: "cmd_00000000000000000000000000000001".into(),
+            session_id: "ses_00000000000000000000000000000001".into(),
+            subcommand: "exec prompt".into(),
+            args: r#"["--headless=false","hello","--","--headless"]"#.into(),
+            status: crate::data::command_status::CommandStatus::Queued,
+            exit_code: None,
+            started_at: None,
+            finished_at: None,
+            log_path: String::new(),
+            worker_id: None,
+            queued_at: None,
+            result: None,
+            attempt: 1,
+        };
+        assert_eq!(
+            stored_args_view(&record),
+            serde_json::json!(["hello", "--", "--headless"])
+        );
+    }
+
     fn lifecycle(tmp: &std::path::Path) -> (ApiSessionLifecycle, Arc<SqliteSessionStore>) {
         let store = Arc::new(SqliteSessionStore::open(tmp).unwrap());
         let lifecycle = ApiSessionLifecycle::new(
@@ -1190,34 +1287,65 @@ mod tests {
     fn queue_view_assigns_oldest_first_positions_and_preserves_legacy_args_projection() {
         let tmp = tempfile::tempdir().unwrap();
         let (lifecycle, store) = lifecycle(tmp.path());
-        insert_active(&store, "queue");
+        insert_active(&store, "ses_a9d1cbf71942327e98b40cf5ef38a960");
         store
-            .enqueue_command("first", "queue", "agents status", "[\"a\"]", "log")
+            .enqueue_command(
+                "cmd_8b04d5e3775d298e78455efc5ca404d5",
+                "ses_a9d1cbf71942327e98b40cf5ef38a960",
+                "agents status",
+                "[\"a\"]",
+                "log",
+            )
             .unwrap();
         store
-            .enqueue_command("second", "queue", "agents status", "[]", "log")
+            .enqueue_command(
+                "cmd_a9f0e61a137d86aa9db53465e0801612",
+                "ses_a9d1cbf71942327e98b40cf5ef38a960",
+                "agents status",
+                "[]",
+                "log",
+            )
             .unwrap();
 
-        let view = lifecycle.queue_view("queue").unwrap().unwrap();
+        let view = lifecycle
+            .queue_view("ses_a9d1cbf71942327e98b40cf5ef38a960")
+            .unwrap()
+            .unwrap();
         assert_eq!(view.queue_depth, 2);
         assert_eq!(
             view.queued
                 .iter()
                 .map(|command| (command.command_id.as_str(), command.position))
                 .collect::<Vec<_>>(),
-            vec![("first", Some(0)), ("second", Some(1))]
+            vec![
+                ("cmd_8b04d5e3775d298e78455efc5ca404d5", Some(0)),
+                ("cmd_a9f0e61a137d86aa9db53465e0801612", Some(1))
+            ]
         );
         assert_eq!(view.queued[0].args, serde_json::json!(["a"]));
 
         for (id, args, expected) in [
-            ("bad", "{", serde_json::json!([])),
+            (
+                "cmd_bae60998ffe4923b131e3d6e4c19993e",
+                "{",
+                serde_json::json!([]),
+            ),
             ("object", "{}", serde_json::json!({})),
             ("numbers", "[1]", serde_json::json!([1])),
         ] {
             store
-                .enqueue_command(id, "queue", "agents status", args, "log")
+                .enqueue_command(
+                    id,
+                    "ses_a9d1cbf71942327e98b40cf5ef38a960",
+                    "agents status",
+                    args,
+                    "log",
+                )
                 .unwrap();
-            let view = lifecycle.queue_view("queue").unwrap().unwrap();
+            let view = lifecycle
+                .queue_view("ses_a9d1cbf71942327e98b40cf5ef38a960")
+                .unwrap()
+                .unwrap();
             assert_eq!(
                 view.queued
                     .iter()
@@ -1226,8 +1354,14 @@ mod tests {
                     .args,
                 expected
             );
-            assert_eq!(view.queued[0].command_id, "first");
-            assert_eq!(view.queued[1].command_id, "second");
+            assert_eq!(
+                view.queued[0].command_id,
+                "cmd_8b04d5e3775d298e78455efc5ca404d5"
+            );
+            assert_eq!(
+                view.queued[1].command_id,
+                "cmd_a9f0e61a137d86aa9db53465e0801612"
+            );
             assert!(store
                 .get_command(id)
                 .unwrap()
@@ -1241,7 +1375,9 @@ mod tests {
     fn status_fallback_keeps_ready_for_legacy_missing_session() {
         let tmp = tempfile::tempdir().unwrap();
         let (lifecycle, _) = lifecycle(tmp.path());
-        let fallback = lifecycle.status_fallback("legacy").unwrap();
+        let fallback = lifecycle
+            .status_fallback("cmd_228c70bfc5589c58c044e03fff0e17eb")
+            .unwrap();
         assert_eq!(fallback.setup_status, SessionSetupStatus::Ready);
         assert!(fallback.labels.is_empty());
     }
@@ -1251,33 +1387,51 @@ mod tests {
         use crate::data::session_setup_event::SessionSetupState;
         let tmp = tempfile::tempdir().unwrap();
         let (lifecycle, store) = lifecycle(tmp.path());
-        insert_active(&store, "s");
+        insert_active(&store, "ses_03c7c0ace395d80182db07ae2c30f034");
         store
-            .update_setup_status("s", SessionSetupStatus::Ready)
+            .update_setup_status(
+                "ses_03c7c0ace395d80182db07ae2c30f034",
+                SessionSetupStatus::Ready,
+            )
             .unwrap();
         let mut disk = SessionSetupState::new();
         disk.mark_failed("clone", "disk failure");
-        lifecycle.paths.save_setup_state("s", &disk).unwrap();
+        lifecycle
+            .paths
+            .save_setup_state("ses_03c7c0ace395d80182db07ae2c30f034", &disk)
+            .unwrap();
         let mut memory = SessionSetupState::new();
         memory.current_stage = Some("from memory".into());
-        match lifecycle.session_status_view("s", Some(memory)).unwrap() {
+        match lifecycle
+            .session_status_view("ses_03c7c0ace395d80182db07ae2c30f034", Some(memory))
+            .unwrap()
+        {
             SessionStatusView::Snapshot { state, .. } => {
                 assert_eq!(state.current_stage.as_deref(), Some("from memory"))
             }
             _ => panic!("memory snapshot lost"),
         }
-        match lifecycle.session_status_view("s", None).unwrap() {
+        match lifecycle
+            .session_status_view("ses_03c7c0ace395d80182db07ae2c30f034", None)
+            .unwrap()
+        {
             SessionStatusView::Snapshot { state, .. } => {
                 assert_eq!(state.status, SessionSetupStatus::Failed)
             }
             _ => panic!("disk snapshot lost"),
         }
         std::fs::write(
-            lifecycle.paths.session_dir("s").join("setup_state.json"),
+            lifecycle
+                .paths
+                .session_dir("ses_03c7c0ace395d80182db07ae2c30f034")
+                .join("setup_state.json"),
             "{",
         )
         .unwrap();
-        match lifecycle.session_status_view("s", None).unwrap() {
+        match lifecycle
+            .session_status_view("ses_03c7c0ace395d80182db07ae2c30f034", None)
+            .unwrap()
+        {
             SessionStatusView::Fallback(fallback) => {
                 assert_eq!(fallback.setup_status, SessionSetupStatus::Ready)
             }
@@ -1289,20 +1443,32 @@ mod tests {
     fn early_setup_cancel_carries_cancelled_row_and_fails_closed_on_read_error() {
         let tmp = tempfile::tempdir().unwrap();
         let (lifecycle, store) = lifecycle(tmp.path());
-        insert_active(&store, "s");
+        insert_active(&store, "ses_03c7c0ace395d80182db07ae2c30f034");
         store
-            .enqueue_command("c", "s", "exec prompt", "[]", "log")
+            .enqueue_command(
+                "cmd_4a8a08f09d37b73795649038408b5f33",
+                "ses_03c7c0ace395d80182db07ae2c30f034",
+                "exec prompt",
+                "[]",
+                "log",
+            )
             .unwrap();
         let run = crate::data::api_lifecycle_store::RunRecord {
-            session_id: "s".into(),
-            command_id: "c".into(),
+            session_id: crate::data::ids::WorkerSessionId::parse(
+                "ses_03c7c0ace395d80182db07ae2c30f034",
+            )
+            .unwrap(),
+            command_id: crate::data::ids::CommandId::parse("cmd_4a8a08f09d37b73795649038408b5f33")
+                .unwrap(),
             close_on_finish: true,
             created_at: "now".into(),
         };
         let token = tokio_util::sync::CancellationToken::new();
         lifecycle.reconcile_setup_cancel(&run, &token).unwrap();
         assert!(!token.is_cancelled());
-        store.cancel_queued_for_session("s").unwrap();
+        store
+            .cancel_queued_for_session("ses_03c7c0ace395d80182db07ae2c30f034")
+            .unwrap();
         lifecycle.reconcile_setup_cancel(&run, &token).unwrap();
         assert!(token.is_cancelled());
         store
@@ -1321,20 +1487,32 @@ mod tests {
         for setup_owns in [false, true] {
             let tmp = tempfile::tempdir().unwrap();
             let (lifecycle, store) = lifecycle(tmp.path());
-            insert_active(&store, "s");
+            insert_active(&store, "ses_03c7c0ace395d80182db07ae2c30f034");
             let runs = CommandLifecycleStore::open(Arc::clone(&store)).unwrap();
             runs.record_run(&crate::data::api_lifecycle_store::RunRecord {
-                session_id: "s".into(),
-                command_id: "c".into(),
+                session_id: crate::data::ids::WorkerSessionId::parse(
+                    "ses_03c7c0ace395d80182db07ae2c30f034",
+                )
+                .unwrap(),
+                command_id: crate::data::ids::CommandId::parse(
+                    "cmd_4a8a08f09d37b73795649038408b5f33",
+                )
+                .unwrap(),
                 close_on_finish: true,
                 created_at: "now".into(),
             })
             .unwrap();
             store
-                .enqueue_command("c", "s", "exec prompt", "[]", "log")
+                .enqueue_command(
+                    "cmd_4a8a08f09d37b73795649038408b5f33",
+                    "ses_03c7c0ace395d80182db07ae2c30f034",
+                    "exec prompt",
+                    "[]",
+                    "log",
+                )
                 .unwrap();
             let setups = Arc::new(TokenRegistry::new());
-            let token = setup_owns.then(|| setups.register("s"));
+            let token = setup_owns.then(|| setups.register("ses_03c7c0ace395d80182db07ae2c30f034"));
             let canceller = CommandCanceller::new(
                 Arc::clone(&store),
                 runs.clone(),
@@ -1345,7 +1523,12 @@ mod tests {
                 store.with_conn(|conn| { conn.execute_batch("CREATE TRIGGER fail_close BEFORE UPDATE OF status ON sessions BEGIN SELECT RAISE(ABORT, 'close failed'); END;")?; Ok(()) }).unwrap();
                 assert!(matches!(
                     lifecycle
-                        .cancel_command("c", &canceller, &setups, &runs)
+                        .cancel_command(
+                            "cmd_4a8a08f09d37b73795649038408b5f33",
+                            &canceller,
+                            &setups,
+                            &runs
+                        )
                         .await,
                     Err(CancelSessionError::Close(_))
                 ));
@@ -1357,11 +1540,20 @@ mod tests {
                     .unwrap();
             }
             lifecycle
-                .cancel_command("c", &canceller, &setups, &runs)
+                .cancel_command(
+                    "cmd_4a8a08f09d37b73795649038408b5f33",
+                    &canceller,
+                    &setups,
+                    &runs,
+                )
                 .await
                 .unwrap();
             assert_eq!(
-                store.get_session("s").unwrap().unwrap().status,
+                store
+                    .get_session("ses_03c7c0ace395d80182db07ae2c30f034")
+                    .unwrap()
+                    .unwrap()
+                    .status,
                 if setup_owns {
                     SessionStatus::Active
                 } else {
@@ -1393,20 +1585,32 @@ mod tests {
     async fn close_outcome_drains_a_running_command_then_reports_already_closing() {
         let tmp = tempfile::tempdir().unwrap();
         let (lifecycle, store) = lifecycle(tmp.path());
-        insert_active(&store, "busy");
+        insert_active(&store, "ses_8bc1b2f84252c3df4edd53e4aad097a7");
         store
-            .enqueue_command("running", "busy", "agents status", "[]", "log")
+            .enqueue_command(
+                "cmd_75101dcdfc88455bcafc9e53e0b06689",
+                "ses_8bc1b2f84252c3df4edd53e4aad097a7",
+                "agents status",
+                "[]",
+                "log",
+            )
             .unwrap();
         store.claim_next_command("worker").unwrap();
         assert_eq!(
-            lifecycle.close("busy").await.unwrap(),
+            lifecycle
+                .close("ses_8bc1b2f84252c3df4edd53e4aad097a7")
+                .await
+                .unwrap(),
             CloseOutcome::Draining {
-                running_command_id: "running".into(),
+                running_command_id: "cmd_75101dcdfc88455bcafc9e53e0b06689".into(),
                 cancelled: Vec::new()
             }
         );
         assert_eq!(
-            lifecycle.close("busy").await.unwrap(),
+            lifecycle
+                .close("ses_8bc1b2f84252c3df4edd53e4aad097a7")
+                .await
+                .unwrap(),
             CloseOutcome::AlreadyClosing
         );
     }
@@ -1425,16 +1629,30 @@ mod tests {
     async fn close_waits_for_cancelled_cleanup_before_retiring_the_session() {
         let tmp = tempfile::tempdir().unwrap();
         let (lifecycle, store) = lifecycle(tmp.path());
-        insert_active(&store, "cleanup");
+        insert_active(&store, "ses_ecfb9f08f09baba9587e427bc8a820b1");
         store
-            .enqueue_command("command", "cleanup", "exec workflow", "[]", "log")
+            .enqueue_command(
+                "cmd_1dccadfed7bcbb036c56a4afb97e906f",
+                "ses_ecfb9f08f09baba9587e427bc8a820b1",
+                "exec workflow",
+                "[]",
+                "log",
+            )
             .unwrap();
         store
-            .complete_command("command", CommandStatus::Cancelled, Some(130), None)
+            .complete_command(
+                "cmd_1dccadfed7bcbb036c56a4afb97e906f",
+                CommandStatus::Cancelled,
+                Some(130),
+                None,
+            )
             .unwrap();
         lifecycle
             .paths
-            .prepare_command_dir("cleanup", "command")
+            .prepare_command_dir(
+                "ses_ecfb9f08f09baba9587e427bc8a820b1",
+                "cmd_1dccadfed7bcbb036c56a4afb97e906f",
+            )
             .unwrap();
         let cleanup = crate::data::workflow_cleanup::WorkflowCleanup {
             workflow: crate::data::workflow_definition::Workflow {
@@ -1457,15 +1675,22 @@ mod tests {
         };
         lifecycle
             .paths
-            .write_command_cleanup("cleanup", "command", &cleanup)
+            .write_command_cleanup(
+                "ses_ecfb9f08f09baba9587e427bc8a820b1",
+                "cmd_1dccadfed7bcbb036c56a4afb97e906f",
+                &cleanup,
+            )
             .unwrap();
         assert!(matches!(
-            lifecycle.close("cleanup").await.unwrap(),
+            lifecycle
+                .close("ses_ecfb9f08f09baba9587e427bc8a820b1")
+                .await
+                .unwrap(),
             CloseOutcome::Draining { .. }
         ));
         assert_eq!(
             store
-                .get_session("cleanup")
+                .get_session("ses_ecfb9f08f09baba9587e427bc8a820b1")
                 .unwrap()
                 .unwrap()
                 .status
@@ -1473,20 +1698,29 @@ mod tests {
             "closing"
         );
         assert_eq!(
-            lifecycle.close("cleanup").await.unwrap(),
+            lifecycle
+                .close("ses_ecfb9f08f09baba9587e427bc8a820b1")
+                .await
+                .unwrap(),
             CloseOutcome::AlreadyClosing
         );
         lifecycle
             .paths
-            .remove_command_cleanup("cleanup", "command")
+            .remove_command_cleanup(
+                "ses_ecfb9f08f09baba9587e427bc8a820b1",
+                "cmd_1dccadfed7bcbb036c56a4afb97e906f",
+            )
             .unwrap();
         assert_eq!(
-            lifecycle.close("cleanup").await.unwrap(),
+            lifecycle
+                .close("ses_ecfb9f08f09baba9587e427bc8a820b1")
+                .await
+                .unwrap(),
             CloseOutcome::Closed
         );
         assert_eq!(
             store
-                .get_session("cleanup")
+                .get_session("ses_ecfb9f08f09baba9587e427bc8a820b1")
                 .unwrap()
                 .unwrap()
                 .status

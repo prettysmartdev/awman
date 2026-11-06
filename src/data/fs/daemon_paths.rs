@@ -59,6 +59,38 @@ impl DaemonPaths {
         self.root.join(format!("{}.hash", self.key_stem))
     }
 
+    /// Owner-authenticated resource API endpoint, separate from the TCP listener.
+    pub fn local_endpoint(&self) -> PathBuf {
+        #[cfg(unix)]
+        {
+            use sha2::{Digest, Sha256};
+            let uid = nix::unistd::geteuid().as_raw();
+            let hash = Sha256::digest(self.root.to_string_lossy().as_bytes());
+            let hex: String = hash[..8].iter().map(|b| format!("{b:02x}")).collect();
+            let suffix = format!("awman-{uid}-{hex}.sock");
+            let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
+                .map(PathBuf::from)
+                .filter(|path| path.is_absolute());
+            // Clients can have a different TMPDIR from the daemon (for example
+            // when a service manager starts it). The owner endpoint must still
+            // be discoverable from the same daemon home.
+            let mut dir = runtime_dir.clone().unwrap_or_else(|| PathBuf::from("/tmp"));
+            // Keep the Unix-domain socket below the strictest common SUN_LEN.
+            if dir.join(&suffix).as_os_str().as_encoded_bytes().len() >= 100 {
+                dir = PathBuf::from("/tmp").join(format!("awman-{uid}"));
+            } else if runtime_dir.is_none() {
+                dir = dir.join(format!("awman-{uid}"));
+            }
+            dir.join(suffix)
+        }
+        #[cfg(windows)]
+        {
+            use sha2::{Digest, Sha256};
+            let hash = Sha256::digest(self.root.to_string_lossy().as_bytes());
+            PathBuf::from(format!(r"\\.\pipe\awman-{:x}", hash))
+        }
+    }
+
     /// Create the root directory (and parents) on disk.
     pub fn ensure_root(&self) -> Result<(), DataError> {
         std::fs::create_dir_all(&self.root).map_err(|e| DataError::io(&self.root, e))
@@ -154,5 +186,17 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_endpoint_does_not_inherit_a_long_home_path() {
+        let root = PathBuf::from(format!("/tmp/{}", "very-long-home/".repeat(20)));
+        let endpoint = DaemonPaths::new(root, "api_key").local_endpoint();
+        assert!(
+            endpoint.as_os_str().as_encoded_bytes().len() < 104,
+            "{}",
+            endpoint.display()
+        );
     }
 }

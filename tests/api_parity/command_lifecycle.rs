@@ -1,5 +1,5 @@
 //! Command lifecycle over the API: cancel, labels, `Idempotency-Key`
-//! replay and `POST /v1/runs`.
+//! replay and `POST /v1/worker/runs`.
 //!
 //! Runs the real `awman api start` binary with the fake `docker` of
 //! `helpers/api_process.rs`. Tests that need a `git daemon` origin carry
@@ -49,13 +49,21 @@ async fn post(
 }
 
 async fn get(server: &ApiServer, path: &str) -> (u16, Value) {
-    json_of(send(server, reqwest::Method::GET, path, &[], None).await).await
+    let (status, value) = json_of(send(server, reqwest::Method::GET, path, &[], None).await).await;
+    (
+        status,
+        if path.ends_with("/queue") {
+            crate::queue_view(value)
+        } else {
+            value
+        },
+    )
 }
 
 async fn cancel(server: &ApiServer, id: &str) -> (u16, Value) {
     post(
         server,
-        &format!("/v1/commands/{id}/cancel"),
+        &format!("/v1/worker/commands/{id}/cancel"),
         &[],
         Value::Null,
     )
@@ -65,19 +73,19 @@ async fn cancel(server: &ApiServer, id: &str) -> (u16, Value) {
 async fn submit(server: &ApiServer, session: &str, subcommand: &str, args: &[&str]) -> String {
     let (status, body) = post(
         server,
-        "/v1/commands",
+        "/v1/worker/commands",
         &[("x-awman-session", session)],
         json!({"subcommand": subcommand, "args": args}),
     )
     .await;
     assert_eq!(status, 202, "{body}");
-    body["command_id"].as_str().unwrap().to_string()
+    body["id"].as_str().unwrap().to_string()
 }
 
 async fn wait_command(server: &ApiServer, id: &str, wanted: &[&str]) -> Value {
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
-        let (_, record) = get(server, &format!("/v1/commands/{id}/status")).await;
+        let (_, record) = get(server, &format!("/v1/worker/commands/{id}")).await;
         if wanted.contains(&record["status"].as_str().unwrap_or("")) {
             return record;
         }
@@ -93,7 +101,7 @@ async fn wait_command(server: &ApiServer, id: &str, wanted: &[&str]) -> Value {
 async fn wait_session_closed(server: &ApiServer, id: &str) -> Value {
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
-        let (_, session) = get(server, &format!("/v1/sessions/{id}")).await;
+        let (_, session) = get(server, &format!("/v1/worker/sessions/{id}")).await;
         if session["status"] == "closed" {
             return session;
         }
@@ -145,7 +153,7 @@ async fn real_network_cancel_unknown_command_is_404() {
     let server = home.start().await;
     let (status, body) = cancel(&server, "no-such-command").await;
     assert_eq!(status, 404, "{body}");
-    assert!(body["error"].as_str().unwrap().contains("no-such-command"));
+    assert_eq!(body["code"], "not_found");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -164,22 +172,22 @@ async fn real_git_cancel_queued_command_marks_it_cancelled_without_running() {
     wait_slow_agent(&home).await;
     let (status, created) = post(
         &server,
-        "/v1/commands",
+        "/v1/worker/commands",
         &[("x-awman-session", &id)],
         json!({
-            "subcommand": "exec prompt", "args": ["never runs"], "labels": {"node": "queued"}
+            "subcommand": "exec prompt", "args": ["never runs"], "labels": {"test/node": "queued"}
         }),
     )
     .await;
     assert_eq!(status, 202, "{created}");
-    let queued = created["command_id"].as_str().unwrap().to_owned();
-    let (_, before) = get(&server, &format!("/v1/commands/{queued}/status")).await;
+    let queued = created["id"].as_str().unwrap().to_owned();
+    let (_, before) = get(&server, &format!("/v1/worker/commands/{queued}")).await;
     assert_eq!(before["status"], "queued", "{before}");
-    let (_, queue) = get(&server, &format!("/v1/sessions/{id}/queue")).await;
+    let (_, queue) = get(&server, &format!("/v1/worker/sessions/{id}/queue")).await;
     assert_eq!(queue["running"]["labels"], json!({}), "{queue}");
     assert_eq!(
         queue["queued"][0]["labels"],
-        json!({"node": "queued"}),
+        json!({"test/node": "queued"}),
         "{queue}"
     );
 
@@ -188,18 +196,18 @@ async fn real_git_cancel_queued_command_marks_it_cancelled_without_running() {
     assert_eq!(body["status"], "cancelled", "{body}");
     assert_eq!(body["exit_code"], 130, "{body}");
     assert_eq!(body["result"]["error"], "cancelled", "{body}");
-    let (_, queue) = get(&server, &format!("/v1/sessions/{id}/queue")).await;
+    let (_, queue) = get(&server, &format!("/v1/worker/sessions/{id}/queue")).await;
     assert_eq!(
         queue["recent_completed"][0]["labels"],
-        json!({"node": "queued"}),
+        json!({"test/node": "queued"}),
         "{queue}"
     );
 
     // The other command is untouched.
-    let (_, other) = get(&server, &format!("/v1/commands/{first}/status")).await;
+    let (_, other) = get(&server, &format!("/v1/worker/commands/{first}")).await;
     assert_eq!(other["status"], "running", "{other}");
-    let (_, listed) = get(&server, "/v1/commands?status=cancelled").await;
-    let ids: Vec<_> = listed["commands"]
+    let (_, listed) = get(&server, "/v1/worker/commands?status=cancelled").await;
+    let ids: Vec<_> = listed["items"]
         .as_array()
         .unwrap()
         .iter()
@@ -246,14 +254,17 @@ type = "create_pull_request"
     )
     .await;
     wait_slow_agent(&home).await;
-    let (_, running) = get(&server, &format!("/v1/commands/{command}/status")).await;
+    let (_, running) = get(&server, &format!("/v1/worker/commands/{command}")).await;
     assert_eq!(running["status"], "running", "{running}");
 
     let (status, body) = cancel(&server, &command).await;
     assert_eq!(status, 202, "{body}");
     assert_eq!(body["command_id"], json!(command));
     assert_eq!(body["session_id"], json!(id));
-    assert!(body["cancel_requested_at"].is_string(), "{body}");
+    let cancel_at = body["cancel_requested_at"].as_str().expect("timestamp");
+    let parsed = chrono::DateTime::parse_from_rfc3339(cancel_at).expect("RFC3339 timestamp");
+    assert!(cancel_at.ends_with('Z'), "{body}");
+    assert_eq!(parsed.timestamp_subsec_nanos() % 1_000_000, 0, "{body}");
     assert!(
         body["message"].as_str().unwrap().contains("cancelled"),
         "{body}"
@@ -299,7 +310,7 @@ async fn real_git_cancel_after_done_returns_200_and_leaves_status_unchanged() {
     let (status, body) = cancel(&server, command).await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["status"], "done", "{body}");
-    let (_, after) = get(&server, &format!("/v1/commands/{command}/status")).await;
+    let (_, after) = get(&server, &format!("/v1/worker/commands/{command}")).await;
     assert_eq!(after["status"], "done");
     assert_eq!(after["exit_code"], 0);
 }
@@ -315,30 +326,30 @@ async fn real_network_invalid_labels_are_rejected_with_400() {
     let bad = [
         json!({"": "v"}),
         json!({"a=b": "v"}),
-        json!({"k": "line\nbreak"}),
-        json!({"k": "x".repeat(257)}),
+        json!({"test/k": "line\nbreak"}),
+        json!({"test/k": "x".repeat(257)}),
         json!({"x".repeat(257): "v"}),
         Value::Object(too_many),
-        json!({"k": 1}),
+        json!({"test/k": 1}),
     ];
     for labels in bad {
         let mut spec = remote(BAD_REPO);
         spec["labels"] = labels.clone();
-        let (status, body) = post(&server, "/v1/sessions", &[], spec).await;
+        let (status, body) = post(&server, "/v1/worker/sessions", &[], spec).await;
         assert_eq!(status, 400, "labels {labels} accepted: {body}");
     }
     // Empty values are valid.
     let mut spec = remote(BAD_REPO);
-    spec["labels"] = json!({"k": ""});
-    let (status, body) = post(&server, "/v1/sessions", &[], spec).await;
-    assert_eq!(status, 202, "{body}");
-    let (status, body) = get(&server, "/v1/sessions?label==bad").await;
+    spec["labels"] = json!({"test/k": ""});
+    let (status, body) = post(&server, "/v1/worker/sessions", &[], spec).await;
+    assert_eq!(status, 201, "{body}");
+    let (status, body) = get(&server, "/v1/worker/sessions?label==bad").await;
     assert_eq!(status, 400, "{body}");
-    let (status, body) = get(&server, "/v1/sessions?status=bogus").await;
+    let (status, body) = get(&server, "/v1/worker/sessions?status=bogus").await;
     assert_eq!(status, 400, "{body}");
-    let (status, body) = get(&server, "/v1/commands?status=bogus").await;
+    let (status, body) = get(&server, "/v1/worker/commands?status=bogus").await;
     assert_eq!(status, 400, "{body}");
-    let (status, body) = get(&server, "/v1/commands?limit=abc").await;
+    let (status, body) = get(&server, "/v1/worker/commands?limit=abc").await;
     assert_eq!(status, 400, "{body}");
 }
 
@@ -352,22 +363,28 @@ async fn real_git_labels_are_stored_returned_on_every_read_and_filterable() {
     let server = home.start().await;
 
     let mut labelled = remote(&origin.url);
-    labelled["labels"] = json!({"team": "infra", "run": "7"});
+    labelled["labels"] = json!({"test/team": "infra", "test/run": "7"});
     let a = server.ready_session(labelled).await;
     let mut other = remote(&origin.url);
-    other["labels"] = json!({"team": "web"});
+    other["labels"] = json!({"test/team": "web"});
     let b = server.ready_session(other).await;
     let plain = server.ready_session(remote(&origin.url)).await;
 
     // Session reads all carry labels; unlabelled sessions get `{}`.
     let session = server.session(&a).await;
-    assert_eq!(session["labels"], json!({"team": "infra", "run": "7"}));
-    let (_, status) = get(&server, &format!("/v1/sessions/{a}/status")).await;
-    assert_eq!(status["labels"], json!({"team": "infra", "run": "7"}));
+    assert_eq!(
+        session["labels"],
+        json!({"test/team": "infra", "test/run": "7"})
+    );
+    let (_, status) = get(&server, &format!("/v1/worker/sessions/{a}")).await;
+    assert_eq!(
+        status["labels"],
+        json!({"test/team": "infra", "test/run": "7"})
+    );
     assert_eq!(server.session(&plain).await["labels"], json!({}));
 
-    let ids = |body: &Value, key: &str| -> Vec<String> {
-        let mut ids: Vec<String> = body[key]
+    let ids = |body: &Value, _key: &str| -> Vec<String> {
+        let mut ids: Vec<String> = body["items"]
             .as_array()
             .unwrap()
             .iter()
@@ -380,73 +397,93 @@ async fn real_git_labels_are_stored_returned_on_every_read_and_filterable() {
         v.sort();
         v
     };
-    let (_, exact) = get(&server, "/v1/sessions?label=team=infra").await;
+    let (_, exact) = get(&server, "/v1/worker/sessions?label=test/team=infra").await;
     assert_eq!(ids(&exact, "sessions"), vec![a.clone()]);
-    let (_, presence) = get(&server, "/v1/sessions?label=team").await;
+    let (_, presence) = get(&server, "/v1/worker/sessions?label=test/team").await;
     assert_eq!(
         ids(&presence, "sessions"),
         sorted(vec![a.clone(), b.clone()])
     );
-    let (_, anded) = get(&server, "/v1/sessions?label=team=infra&label=run=7").await;
+    let (_, anded) = get(
+        &server,
+        "/v1/worker/sessions?label=test/team=infra&label=test/run=7",
+    )
+    .await;
     assert_eq!(ids(&anded, "sessions"), vec![a.clone()]);
-    let (_, none) = get(&server, "/v1/sessions?label=team=infra&label=run=8").await;
-    assert!(none["sessions"].as_array().unwrap().is_empty());
-    let (_, active) = get(&server, "/v1/sessions?status=active&label=team=web").await;
+    let (_, none) = get(
+        &server,
+        "/v1/worker/sessions?label=test/team=infra&label=test/run=8",
+    )
+    .await;
+    assert!(none["items"].as_array().unwrap().is_empty());
+    let (_, active) = get(
+        &server,
+        "/v1/worker/sessions?status=active&label=test/team=web",
+    )
+    .await;
     assert_eq!(ids(&active, "sessions"), vec![b.clone()]);
 
     // Command labels.
     let (status, body) = post(
         &server,
-        "/v1/commands",
+        "/v1/worker/commands",
         &[("x-awman-session", &a)],
-        json!({"subcommand": "exec prompt", "args": ["hi"], "labels": {"job": "one"}}),
+        json!({"subcommand": "exec prompt", "args": ["hi"], "labels": {"test/job": "one"}}),
     )
     .await;
     assert_eq!(status, 202, "{body}");
-    let first = body["command_id"].as_str().unwrap().to_string();
+    let first = body["id"].as_str().unwrap().to_string();
     let done = wait_command(&server, &first, &["done", "error"]).await;
     assert_eq!(
         done["labels"],
-        json!({"job": "one"}),
+        json!({"test/job": "one"}),
         "terminal read keeps labels"
     );
     let second = submit(&server, &a, "exec prompt", &["unlabelled"]).await;
     let second_rec = wait_command(&server, &second, &["done", "error"]).await;
     assert_eq!(second_rec["labels"], json!({}));
-    let (_, queue) = get(&server, &format!("/v1/sessions/{a}/queue")).await;
+    let (_, queue) = get(&server, &format!("/v1/worker/sessions/{a}/queue")).await;
     let completed = queue["recent_completed"].as_array().unwrap();
     assert!(
         completed
             .iter()
-            .any(|c| c["command_id"] == first && c["labels"] == json!({"job": "one"})),
+            .any(|c| c["command_id"] == first && c["labels"] == json!({"test/job": "one"})),
         "{queue}"
     );
 
-    let (_, listed) = get(&server, "/v1/commands?label=job=one").await;
+    let (_, listed) = get(&server, "/v1/worker/commands?label=test/job=one").await;
     assert_eq!(ids(&listed, "commands"), vec![first.clone()]);
     let (_, listed) = get(
         &server,
-        &format!("/v1/commands?label=job&status=done&session_id={a}"),
+        &format!("/v1/worker/commands?label=test/job&status=done&session_id={a}"),
     )
     .await;
     assert_eq!(ids(&listed, "commands"), vec![first.clone()]);
-    let (_, listed) = get(&server, "/v1/commands?label=job=one&status=error").await;
-    assert!(listed["commands"].as_array().unwrap().is_empty());
-    let (_, listed) = get(&server, &format!("/v1/commands?session_id={a}&limit=1")).await;
-    assert_eq!(listed["commands"].as_array().unwrap().len(), 1);
-    assert_eq!(listed["commands"][0]["id"], json!(second), "newest first");
+    let (_, listed) = get(
+        &server,
+        "/v1/worker/commands?label=test/job=one&status=error",
+    )
+    .await;
+    assert!(listed["items"].as_array().unwrap().is_empty());
+    let (_, listed) = get(
+        &server,
+        &format!("/v1/worker/commands?session_id={a}&limit=1"),
+    )
+    .await;
+    assert_eq!(listed["items"].as_array().unwrap().len(), 1);
+    assert_eq!(listed["items"][0]["id"], json!(second), "newest first");
 
     // Invalid command labels are rejected and nothing is queued.
     let (status, body) = post(
         &server,
-        "/v1/commands",
+        "/v1/worker/commands",
         &[("x-awman-session", &a)],
         json!({"subcommand": "exec prompt", "args": ["hi"], "labels": {"a=b": "v"}}),
     )
     .await;
     assert_eq!(status, 400, "{body}");
-    let (_, all) = get(&server, &format!("/v1/commands?session_id={a}")).await;
-    assert_eq!(all["commands"].as_array().unwrap().len(), 2);
+    let (_, all) = get(&server, &format!("/v1/worker/commands?session_id={a}")).await;
+    assert_eq!(all["items"].as_array().unwrap().len(), 2);
 }
 
 // ─── idempotency ─────────────────────────────────────────────────────────
@@ -461,40 +498,40 @@ async fn real_network_session_idempotency_key_replays_and_creates_no_duplicate()
     let first = send(
         &server,
         reqwest::Method::POST,
-        "/v1/sessions",
+        "/v1/worker/sessions",
         &key,
         Some(&spec),
     )
     .await;
     assert!(first.headers().get("idempotent-replayed").is_none());
     let (status, original) = json_of(first).await;
-    assert_eq!(status, 202, "{original}");
+    assert_eq!(status, 201, "{original}");
 
     let replay = send(
         &server,
         reqwest::Method::POST,
-        "/v1/sessions",
+        "/v1/worker/sessions",
         &key,
         Some(&spec),
     )
     .await;
     assert_eq!(replay.headers()["idempotent-replayed"], "true");
     let (status, again) = json_of(replay).await;
-    assert_eq!(status, 202);
+    assert_eq!(status, 201);
     assert_eq!(again, original);
 
     let mut changed = spec.clone();
-    changed["labels"] = json!({"x": "y"});
-    let (status, body) = post(&server, "/v1/sessions", &key, changed).await;
+    changed["labels"] = json!({"test/x": "y"});
+    let (status, body) = post(&server, "/v1/worker/sessions", &key, changed).await;
     assert_eq!(status, 422, "{body}");
 
-    let (_, sessions) = get(&server, "/v1/sessions").await;
-    assert_eq!(sessions["sessions"].as_array().unwrap().len(), 1);
+    let (_, sessions) = get(&server, "/v1/worker/sessions").await;
+    assert_eq!(sessions["items"].as_array().unwrap().len(), 1);
 
     // Invalid keys are rejected; a different key creates a new session.
     let (status, _) = post(
         &server,
-        "/v1/sessions",
+        "/v1/worker/sessions",
         &[("Idempotency-Key", "")],
         spec.clone(),
     )
@@ -502,13 +539,13 @@ async fn real_network_session_idempotency_key_replays_and_creates_no_duplicate()
     assert_eq!(status, 400);
     let (status, fresh) = post(
         &server,
-        "/v1/sessions",
+        "/v1/worker/sessions",
         &[("Idempotency-Key", "sess-key-2")],
         spec,
     )
     .await;
-    assert_eq!(status, 202);
-    assert_ne!(fresh["session_id"], original["session_id"]);
+    assert_eq!(status, 201);
+    assert_ne!(fresh["id"], original["id"]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -526,12 +563,12 @@ async fn real_git_command_and_run_idempotency_keys_replay_and_create_no_duplicat
         ("Idempotency-Key", "cmd-key"),
     ];
     let body = json!({"subcommand": "exec prompt", "args": ["once"]});
-    let (status, original) = post(&server, "/v1/commands", &headers, body.clone()).await;
+    let (status, original) = post(&server, "/v1/worker/commands", &headers, body.clone()).await;
     assert_eq!(status, 202, "{original}");
     let replay = send(
         &server,
         reqwest::Method::POST,
-        "/v1/commands",
+        "/v1/worker/commands",
         &headers,
         Some(&body),
     )
@@ -542,7 +579,7 @@ async fn real_git_command_and_run_idempotency_keys_replay_and_create_no_duplicat
     assert_eq!(again, original);
     let (status, _) = post(
         &server,
-        "/v1/commands",
+        "/v1/worker/commands",
         &headers,
         json!({"subcommand": "exec prompt", "args": ["different"]}),
     )
@@ -550,25 +587,25 @@ async fn real_git_command_and_run_idempotency_keys_replay_and_create_no_duplicat
     assert_eq!(status, 422);
     wait_command(
         &server,
-        original["command_id"].as_str().unwrap(),
+        original["id"].as_str().unwrap(),
         &["done", "error"],
     )
     .await;
-    let (_, listed) = get(&server, &format!("/v1/commands?session_id={id}")).await;
-    assert_eq!(listed["commands"].as_array().unwrap().len(), 1);
+    let (_, listed) = get(&server, &format!("/v1/worker/commands?session_id={id}")).await;
+    assert_eq!(listed["items"].as_array().unwrap().len(), 1);
 
-    // /v1/runs
+    // /v1/worker/runs
     let run = json!({
         "session": remote(&origin.url),
         "command": {"subcommand": "exec prompt", "args": ["run once"]},
     });
     let run_headers = [("Idempotency-Key", "run-key")];
-    let (status, created) = post(&server, "/v1/runs", &run_headers, run.clone()).await;
+    let (status, created) = post(&server, "/v1/worker/runs", &run_headers, run.clone()).await;
     assert_eq!(status, 202, "{created}");
     let replay = send(
         &server,
         reqwest::Method::POST,
-        "/v1/runs",
+        "/v1/worker/runs",
         &run_headers,
         Some(&run),
     )
@@ -582,17 +619,17 @@ async fn real_git_command_and_run_idempotency_keys_replay_and_create_no_duplicat
         &["done", "error"],
     )
     .await;
-    let (_, sessions) = get(&server, "/v1/sessions").await;
+    let (_, sessions) = get(&server, "/v1/worker/sessions").await;
     assert_eq!(
-        sessions["sessions"].as_array().unwrap().len(),
+        sessions["items"].as_array().unwrap().len(),
         2,
         "one session + one run session"
     );
-    let (_, commands) = get(&server, "/v1/commands").await;
-    assert_eq!(commands["commands"].as_array().unwrap().len(), 2);
+    let (_, commands) = get(&server, "/v1/worker/commands").await;
+    assert_eq!(commands["items"].as_array().unwrap().len(), 2);
 }
 
-// ─── POST /v1/runs ───────────────────────────────────────────────────────
+// ─── POST /v1/worker/runs ───────────────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread")]
 async fn real_git_run_starts_command_after_setup_and_close_on_finish_closes_session() {
@@ -605,11 +642,11 @@ async fn real_git_run_starts_command_after_setup_and_close_on_finish_closes_sess
 
     let (status, created) = post(
         &server,
-        "/v1/runs",
+        "/v1/worker/runs",
         &[],
         json!({
-            "session": {"session_type": "remote", "repo_url": origin.url, "labels": {"who": "run"}},
-            "command": {"subcommand": "exec prompt", "args": ["hello"], "labels": {"c": "1"}},
+            "session": {"session_type": "remote", "repo_url": origin.url, "labels": {"test/who": "cmd_a53108f7543b75adbb34afc035d4cdf6"}},
+            "command": {"subcommand": "exec prompt", "args": ["hello"], "labels": {"test/c": "1"}},
             "close_on_finish": true,
         }),
     )
@@ -621,14 +658,17 @@ async fn real_git_run_starts_command_after_setup_and_close_on_finish_closes_sess
     let record = wait_command(&server, &command_id, &["done", "error", "cancelled"]).await;
     assert_eq!(record["status"], "done", "{record}\n{}", server.log());
     assert_eq!(record["session_id"], json!(session_id));
-    assert_eq!(record["labels"], json!({"c": "1"}));
+    assert_eq!(record["labels"], json!({"test/c": "1"}));
     let closed = wait_session_closed(&server, &session_id).await;
-    assert_eq!(closed["labels"], json!({"who": "run"}));
+    assert_eq!(
+        closed["labels"],
+        json!({"test/who": "cmd_a53108f7543b75adbb34afc035d4cdf6"})
+    );
 
     // Without close_on_finish the session stays active.
     let (status, kept) = post(
         &server,
-        "/v1/runs",
+        "/v1/worker/runs",
         &[],
         json!({
             "session": remote(&origin.url),
@@ -655,7 +695,7 @@ async fn real_network_run_validation_errors_create_nothing() {
     let server = home.start().await;
     let (status, body) = post(
         &server,
-        "/v1/runs",
+        "/v1/worker/runs",
         &[],
         json!({"session": remote(BAD_REPO), "command": {"subcommand": "bogus nonsense", "args": []}}),
     )
@@ -663,19 +703,19 @@ async fn real_network_run_validation_errors_create_nothing() {
     assert_eq!(status, 400, "{body}");
     let (status, body) = post(
         &server,
-        "/v1/runs",
+        "/v1/worker/runs",
         &[],
         json!({
             "session": {"session_type": "remote", "repo_url": BAD_REPO, "labels": {"": "v"}},
-            "command": {"subcommand": "exec prompt", "args": ["x"]},
+            "command": {"subcommand": "exec prompt", "args": ["test/x"]},
         }),
     )
     .await;
     assert_eq!(status, 400, "{body}");
-    let (_, sessions) = get(&server, "/v1/sessions").await;
-    assert!(sessions["sessions"].as_array().unwrap().is_empty());
-    let (_, commands) = get(&server, "/v1/commands").await;
-    assert!(commands["commands"].as_array().unwrap().is_empty());
+    let (_, sessions) = get(&server, "/v1/worker/sessions").await;
+    assert!(sessions["items"].as_array().unwrap().is_empty());
+    let (_, commands) = get(&server, "/v1/worker/commands").await;
+    assert!(commands["items"].as_array().unwrap().is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -684,11 +724,11 @@ async fn real_network_run_setup_failure_errors_the_command_and_close_on_finish_c
     let server = home.start().await;
     let (status, created) = post(
         &server,
-        "/v1/runs",
+        "/v1/worker/runs",
         &[],
         json!({
             "session": remote(BAD_REPO),
-            "command": {"subcommand": "exec prompt", "args": ["x"]},
+            "command": {"subcommand": "exec prompt", "args": ["test/x"]},
             "close_on_finish": true,
         }),
     )
@@ -714,11 +754,11 @@ async fn real_network_cancel_during_run_setup_cancels_command_and_closes_session
     let (_listener, url) = hanging_origin();
     let (status, created) = post(
         &server,
-        "/v1/runs",
+        "/v1/worker/runs",
         &[],
         json!({
             "session": remote(&url),
-            "command": {"subcommand": "exec prompt", "args": ["x"]},
+            "command": {"subcommand": "exec prompt", "args": ["test/x"]},
             "close_on_finish": false,
         }),
     )
@@ -729,7 +769,7 @@ async fn real_network_cancel_during_run_setup_cancels_command_and_closes_session
     // Cancel only once the clone is in flight: it must be killed, not awaited.
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
-        let (_, row) = get(&server, &format!("/v1/sessions/{session}")).await;
+        let (_, row) = get(&server, &format!("/v1/worker/sessions/{session}")).await;
         if row["setup_status"] == "cloning_repository" {
             break;
         }
@@ -739,7 +779,7 @@ async fn real_network_cancel_during_run_setup_cancels_command_and_closes_session
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    let (_, before) = get(&server, &format!("/v1/commands/{command}/status")).await;
+    let (_, before) = get(&server, &format!("/v1/worker/commands/{command}")).await;
     assert_eq!(before["status"], "queued", "{before}");
 
     let (status, body) = cancel(&server, command).await;
@@ -752,9 +792,9 @@ async fn real_network_cancel_during_run_setup_cancels_command_and_closes_session
         !api_process::clone_path(&closed).exists(),
         "cancelled setup retained its clone"
     );
-    let (_, setup) = get(&server, &format!("/v1/sessions/{session}/status")).await;
-    assert_eq!(setup["status"], "failed", "{setup}");
-    assert_eq!(setup["error"]["stage"], "cancelled", "{setup}");
+    let (_, setup) = get(&server, &format!("/v1/worker/sessions/{session}")).await;
+    assert_eq!(setup["setup_status"], "failed", "{setup}");
+    assert_eq!(setup["setup_error"]["stage"], "cancelled", "{setup}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -792,7 +832,7 @@ type = "create_pull_request"
     let mut server = home.start().await;
     let (status, created) = post(
         &server,
-        "/v1/runs",
+        "/v1/worker/runs",
         &[],
         json!({
             "session": remote(&origin.url),
@@ -805,7 +845,7 @@ type = "create_pull_request"
     let id = created["command_id"].as_str().unwrap();
     let session = created["session_id"].as_str().unwrap();
     wait_slow_agent(&home).await;
-    let (_, details) = get(&server, &format!("/v1/sessions/{session}")).await;
+    let (_, details) = get(&server, &format!("/v1/worker/sessions/{session}")).await;
     let clone = api_process::clone_path(&details);
     assert!(clone.exists());
     // Model the crash immediately after the cancel marker was committed,
@@ -815,13 +855,16 @@ type = "create_pull_request"
         std::sync::Arc::new(awman::data::fs::api_db::SqliteSessionStore::open_at(&db).unwrap());
     let lifecycle = awman::data::api_lifecycle_store::CommandLifecycleStore::open(store).unwrap();
     lifecycle
-        .request_cancel(id, &chrono::Utc::now().to_rfc3339())
+        .request_cancel(
+            &awman::data::ids::CommandId::parse(id).unwrap(),
+            &chrono::Utc::now().to_rfc3339(),
+        )
         .unwrap();
     server.kill();
     drop(lifecycle);
     let server = home.start().await;
     wait_session_closed(&server, session).await;
-    let (_, record) = get(&server, &format!("/v1/commands/{id}/status")).await;
+    let (_, record) = get(&server, &format!("/v1/worker/commands/{id}")).await;
     assert_eq!(record["status"], "cancelled", "{record}\n{}", server.log());
     assert_eq!(record["exit_code"], 130);
     assert_eq!(std::fs::read_to_string(&sentinel).unwrap(), "cleanup\n");
@@ -829,7 +872,7 @@ type = "create_pull_request"
         !clone.exists(),
         "close_on_finish retained clone after cleanup"
     );
-    let (_, state) = get(&server, &format!("/v1/workflows/{id}")).await;
+    let (_, state) = get(&server, &format!("/v1/worker/commands/{id}/workflow")).await;
     assert!(state.to_string().contains("Cancelled"), "{state}");
     assert!(!home.control().join("pr-head").exists());
     let launches = std::fs::read_to_string(home.control().join("docker.log")).unwrap();
@@ -843,7 +886,7 @@ type = "create_pull_request"
     );
     drop(server);
     let server = home.start().await;
-    let (_, record) = get(&server, &format!("/v1/commands/{id}/status")).await;
+    let (_, record) = get(&server, &format!("/v1/worker/commands/{id}")).await;
     assert_eq!(record["status"], "cancelled");
     assert_eq!(
         std::fs::read_to_string(&sentinel).unwrap(),

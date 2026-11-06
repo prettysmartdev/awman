@@ -36,11 +36,9 @@ impl OverlayEngine {
             git_root,
             container_home_override,
             false,
-            crate::data::config::global::GlobalConfig::data_home_with(
-                &crate::data::config::env::Env::from_process(),
-            )
-            .ok()
-            .as_deref(),
+            crate::data::fs::data_paths::data_home(&crate::data::config::env::Env::from_process())
+                .ok()
+                .as_deref(),
         )
         .map(|(overlays, _)| overlays)
     }
@@ -527,14 +525,14 @@ mod custom_tests {
 
 /// Whether canonical `dir` contains, or is inside, a directory a settings
 /// mount must never expose: awman's real data home (wherever XDG or
-/// `AWMAN_CONFIG_HOME` put it — it holds the trust store and global
+/// `AWMAN_HOME` put it — it holds the trust store and global
 /// definitions) and the real target of every deny-listed HOME directory, so
 /// a relocated `~/.awman -> ~/state` is protected under its alias too. A
 /// root that does not exist yet is compared through its nearest existing
 /// ancestor, so mounting a parent cannot let an agent create it. ASCII case
 /// is folded, as for the deny list.
 ///
-/// When the data home *is* HOME (an `AWMAN_CONFIG_HOME=$HOME` setup), every
+/// When the data home *is* HOME (an `AWMAN_HOME=$HOME` setup), every
 /// settings directory is inside it, so only its awman-owned children
 /// (`agents/`, `squad/`) are protected in both directions; HOME itself, which
 /// holds the trust store, is never mountable anyway.

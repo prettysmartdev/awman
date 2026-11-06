@@ -11,7 +11,7 @@ fn mount_ssh_flag_rejected_with_nonzero_exit() {
     let repo = make_git_repo();
     let output = awman()
         .current_dir(repo.path())
-        .args(["chat", "--non-interactive", "--mount-ssh"])
+        .args(["chat", "--headless", "--mount-ssh"])
         .output()
         .expect("failed to run awman");
 
@@ -40,7 +40,7 @@ fn mount_ssh_with_value_form_also_rejected_with_guidance() {
     let repo = make_git_repo();
     let output = awman()
         .current_dir(repo.path())
-        .args(["chat", "--non-interactive", "--mount-ssh=true"])
+        .args(["chat", "--headless", "--mount-ssh=true"])
         .output()
         .expect("failed to run awman");
 
@@ -63,7 +63,7 @@ fn skills_plural_named_in_overlay_flag_exits_nonzero() {
     let repo = make_git_repo();
     let output = awman()
         .current_dir(repo.path())
-        .args(["chat", "--non-interactive", "--overlay", "skills(lint)"])
+        .args(["chat", "--headless", "--overlay", "skills(lint)"])
         .output()
         .expect("failed to run awman");
 
@@ -83,7 +83,7 @@ fn skills_plural_empty_in_overlay_flag_exits_nonzero() {
     let repo = make_git_repo();
     let output = awman()
         .current_dir(repo.path())
-        .args(["chat", "--non-interactive", "--overlay", "skills()"])
+        .args(["chat", "--headless", "--overlay", "skills()"])
         .output()
         .expect("failed to run awman");
 
@@ -104,7 +104,7 @@ fn skills_plural_in_awman_overlays_env_exits_nonzero() {
     let output = awman()
         .current_dir(repo.path())
         .env("AWMAN_OVERLAYS", "skills(foo)")
-        .args(["chat", "--non-interactive"])
+        .args(["chat", "--headless"])
         .output()
         .expect("failed to run awman");
 
@@ -127,7 +127,7 @@ fn malformed_awman_overlays_causes_fatal_exit_and_names_env_var() {
     let output = awman()
         .current_dir(repo.path())
         .env("AWMAN_OVERLAYS", "###not-an-overlay###")
-        .args(["chat", "--non-interactive"])
+        .args(["chat", "--headless"])
         .output()
         .expect("failed to run awman");
 
@@ -201,7 +201,7 @@ fn exec_prompt_context_global_overlay_accepted_by_cli() {
         .args([
             "exec",
             "prompt",
-            "--non-interactive",
+            "--headless",
             "--overlay",
             "context(global)",
             "hello",
@@ -224,7 +224,7 @@ fn exec_prompt_context_global_overlay_accepted_by_cli() {
         "--overlay context(global) must not trigger 'unknown context scope'; stderr: {stderr}"
     );
     // Any failure must be for a reason unrelated to overlay parsing (e.g. no
-    // Docker / no project image / non-interactive limitation).
+    // Docker / no project image / headless limitation).
 }
 
 /// Verify that `--overlay context(repo)` is also accepted by the CLI.
@@ -236,7 +236,7 @@ fn exec_prompt_context_repo_overlay_accepted_by_cli() {
         .args([
             "exec",
             "prompt",
-            "--non-interactive",
+            "--headless",
             "--overlay",
             "context(repo)",
             "hello",
@@ -264,7 +264,7 @@ fn exec_prompt_context_global_ro_overlay_accepted_by_cli() {
         .args([
             "exec",
             "prompt",
-            "--non-interactive",
+            "--headless",
             "--overlay",
             "context(global:ro)",
             "hello",
@@ -292,7 +292,7 @@ fn exec_prompt_context_unknown_scope_rejected_with_parse_error() {
         .args([
             "exec",
             "prompt",
-            "--non-interactive",
+            "--headless",
             "--overlay",
             "context(notascope)",
             "hello",

@@ -165,7 +165,7 @@ mod tests {
 
     fn session(session_type: &str, push: bool) -> SessionRecord {
         SessionRecord {
-            id: "session".into(),
+            id: "ses_21d6f40cfb511982e4424e0e250a9557".into(),
             workdir: "/missing".into(),
             created_at: "now".into(),
             status: crate::data::session_status::SessionStatus::Active,
@@ -220,7 +220,11 @@ mod tests {
         ] {
             let args: Vec<String> = args.into_iter().map(String::from).collect();
             assert_eq!(
-                leftover_commit_message("session", "exec workflow", &args),
+                leftover_commit_message(
+                    "ses_21d6f40cfb511982e4424e0e250a9557",
+                    "exec workflow",
+                    &args
+                ),
                 "Implement work item 0133"
             );
         }
@@ -236,8 +240,8 @@ mod tests {
         ] {
             let args: Vec<String> = args.into_iter().map(String::from).collect();
             assert_eq!(
-                leftover_commit_message("session", command, &args),
-                format!("awman: {command} in session session")
+                leftover_commit_message("ses_21d6f40cfb511982e4424e0e250a9557", command, &args),
+                format!("awman: {command} in session ses_21d6f40cfb511982e4424e0e250a9557")
             );
         }
     }

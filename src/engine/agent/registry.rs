@@ -16,7 +16,6 @@ use crate::data::config::agent_definition::{
     load_agent_definition_with_scope, validate_agent_file_stem,
 };
 use crate::data::config::env::EnvSnapshot;
-use crate::data::config::global::GlobalConfig;
 use crate::data::fs::agent_dirs::AgentDirs;
 use crate::data::fs::agent_dirs::{DefinitionScope, SkippedDefinition};
 use crate::data::fs::agent_trust::{TrustKey, TrustStore};
@@ -258,7 +257,7 @@ impl AgentRegistry {
         if !Self::needs_approval(def) {
             return Ok(TrustStatus::NotRequired);
         }
-        let store = TrustStore::load(&GlobalConfig::data_home_with(env)?);
+        let store = TrustStore::load(&crate::data::fs::data_paths::data_home(env)?);
         if let Some(warning) = &store.load_warning {
             tracing::warn!("{warning}");
         }
@@ -284,7 +283,7 @@ impl AgentRegistry {
         let AgentOrigin::Custom { sha256, .. } = &def.origin else {
             unreachable!()
         };
-        let mut store = TrustStore::load(&GlobalConfig::data_home_with(env)?);
+        let mut store = TrustStore::load(&crate::data::fs::data_paths::data_home(env)?);
         if let Some(warning) = &store.load_warning {
             tracing::warn!("{warning}");
         }
@@ -309,7 +308,7 @@ impl AgentRegistry {
         }
         if runtime_is_sandbox {
             notes.push(
-                "(custom agents run on docker, apple or builtin-experimental; Docker Sandboxes \
+                "(custom agents run on runtime.kind docker, apple or builtin; Docker Sandboxes \
                  support is not available for them yet)"
                     .to_string(),
             );
@@ -432,7 +431,7 @@ mod custom_tests {
         let root = temp.path().join("repo");
         std::fs::create_dir_all(home.join("agents")).unwrap();
         std::fs::create_dir_all(root.join(".awman/agents")).unwrap();
-        let env = EnvSnapshot::with_overrides([("AWMAN_CONFIG_HOME", home.to_str().unwrap())]);
+        let env = EnvSnapshot::with_overrides([("AWMAN_HOME", home.to_str().unwrap())]);
         (temp, env, home, root)
     }
     fn source(ping: bool) -> String {

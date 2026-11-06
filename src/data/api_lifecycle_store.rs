@@ -14,12 +14,13 @@ use rusqlite::{params, OptionalExtension};
 use crate::data::command_status::{cancelled_result_json, CANCELLED_EXIT_CODE};
 use crate::data::error::DataError;
 use crate::data::fs::api_db::SqliteSessionStore;
+use crate::data::ids::{CommandId, WorkerSessionId};
 
 /// A `/v1/runs` command and the session created for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunRecord {
-    pub session_id: String,
-    pub command_id: String,
+    pub session_id: WorkerSessionId,
+    pub command_id: CommandId,
     /// Close the session once the command reaches a terminal status.
     pub close_on_finish: bool,
     pub created_at: String,
@@ -55,7 +56,11 @@ impl CommandLifecycleStore {
     /// Mark a still-queued command `cancelled` (exit 130). `Ok(true)` when a
     /// row changed; `Ok(false)` when it was no longer queued (a worker claimed
     /// it, or it already finished).
-    pub fn cancel_if_queued(&self, command_id: &str, finished_at: &str) -> Result<bool, DataError> {
+    pub fn cancel_if_queued(
+        &self,
+        command_id: &CommandId,
+        finished_at: &str,
+    ) -> Result<bool, DataError> {
         let result = cancelled_result_json(None);
         self.store.with_conn(|conn| {
             let changed = conn.execute(
@@ -72,7 +77,7 @@ impl CommandLifecycleStore {
     /// owned row is finalised by its worker. `Ok(true)` when a row changed.
     pub fn cancel_if_running(
         &self,
-        command_id: &str,
+        command_id: &CommandId,
         finished_at: &str,
         requested_at: &str,
     ) -> Result<bool, DataError> {
@@ -88,7 +93,11 @@ impl CommandLifecycleStore {
     }
 
     /// Record a cancel request. Idempotent: a repeat keeps the first time.
-    pub fn request_cancel(&self, command_id: &str, requested_at: &str) -> Result<(), DataError> {
+    pub fn request_cancel(
+        &self,
+        command_id: &CommandId,
+        requested_at: &str,
+    ) -> Result<(), DataError> {
         self.store.with_conn(|conn| {
             conn.execute(
                 "INSERT OR IGNORE INTO command_cancellations (command_id, requested_at)
@@ -99,7 +108,7 @@ impl CommandLifecycleStore {
         })
     }
 
-    pub fn cancel_requested_at(&self, command_id: &str) -> Result<Option<String>, DataError> {
+    pub fn cancel_requested_at(&self, command_id: &CommandId) -> Result<Option<String>, DataError> {
         self.store.with_conn(|conn| {
             Ok(conn
                 .query_row(
@@ -112,7 +121,7 @@ impl CommandLifecycleStore {
     }
 
     /// Includes previously finalized rows so crash recovery is repeatable.
-    pub fn cancelled_command_ids(&self) -> Result<Vec<String>, DataError> {
+    pub fn cancelled_command_ids(&self) -> Result<Vec<CommandId>, DataError> {
         self.store.with_conn(|conn| {
             let mut stmt = conn.prepare("SELECT c.id FROM commands c JOIN command_cancellations k ON k.command_id=c.id WHERE c.status='cancelled'")?;
             let rows = stmt.query_map([], |row| row.get(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -126,9 +135,9 @@ impl CommandLifecycleStore {
     pub fn finalize_interrupted_cancellations(
         &self,
         finished_at: &str,
-    ) -> Result<Vec<String>, DataError> {
+    ) -> Result<Vec<CommandId>, DataError> {
         self.store.with_conn(|conn| {
-            let rows: Vec<(String, String)> = {
+            let rows: Vec<(CommandId, String)> = {
                 let mut stmt = conn.prepare(
                     "SELECT c.id, k.requested_at FROM commands c
                      JOIN command_cancellations k ON k.command_id = c.id
@@ -211,12 +220,15 @@ impl CommandLifecycleStore {
         })
     }
 
-    pub fn run_for_session(&self, session_id: &str) -> Result<Option<RunRecord>, DataError> {
-        self.run_where("session_id", session_id)
+    pub fn run_for_session(
+        &self,
+        session_id: &WorkerSessionId,
+    ) -> Result<Option<RunRecord>, DataError> {
+        self.run_where("session_id", session_id.as_str())
     }
 
-    pub fn run_for_command(&self, command_id: &str) -> Result<Option<RunRecord>, DataError> {
-        self.run_where("command_id", command_id)
+    pub fn run_for_command(&self, command_id: &CommandId) -> Result<Option<RunRecord>, DataError> {
+        self.run_where("command_id", command_id.as_str())
     }
 
     /// `column` is one of the two literal names above, never user input.

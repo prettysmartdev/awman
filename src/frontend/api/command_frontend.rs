@@ -56,7 +56,7 @@ use crate::command::dispatch::projections::raw_args::ParsedArgs;
 use crate::command::dispatch::CommandFrontend;
 use crate::command::error::CommandError;
 use crate::command::headless::HeadlessDefaults;
-use crate::data::config::repo::WorkItemsConfig;
+use crate::data::config::work_items::WorkItemsConfig;
 use crate::data::fs::api_command_log::CommandStateWriter;
 use crate::data::fs::api_db::{FailedStep, FailedStepPhase};
 use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
@@ -82,6 +82,7 @@ use crate::engine::workflow::frontend::{ContainerSource, WorkflowFrontend};
 /// The API dispatch frontend. Emits typed events to an `EventBusSender`
 /// for distribution to logfile writers and SSE clients.
 pub struct ApiDispatchFrontend {
+    interaction: Option<crate::data::config::daemon::Interaction>,
     frontend_kind: FrontendKind,
     /// The outcome of Layer 2 parsing (`CommandCatalogue::parse_raw_args`),
     /// captured at construction. Every `CommandFrontend` accessor reports a
@@ -190,6 +191,7 @@ impl ApiDispatchFrontend {
             CommandCatalogue::get().parse_raw_args_with_profile(&path, args, frontend_kind);
 
         Self {
+            interaction: None,
             frontend_kind,
             parsed: Arc::new(parsed),
             event_bus,
@@ -221,6 +223,11 @@ impl ApiDispatchFrontend {
     }
 
     /// Mirror workflow snapshots into the command directory for API polling.
+    pub fn with_interaction(mut self, mode: crate::data::config::daemon::Interaction) -> Self {
+        self.interaction = Some(mode);
+        self
+    }
+
     pub fn with_state_writer(mut self, writer: CommandStateWriter) -> Self {
         self.state_writer = Some(writer);
         self
@@ -353,10 +360,19 @@ impl ApiDispatchFrontend {
 }
 
 impl CommandFrontend for ApiDispatchFrontend {
+    fn input_available(&self) -> bool {
+        self.interaction == Some(crate::data::config::daemon::Interaction::Interactive)
+    }
     fn kind(&self) -> crate::command::dispatch::catalogue::FrontendKind {
         self.frontend_kind
     }
     fn flag_bool(&self, _command_path: &[&str], flag: &str) -> Result<Option<bool>, CommandError> {
+        self.parsed()?;
+        if flag == "headless"
+            && self.interaction == Some(crate::data::config::daemon::Interaction::Interactive)
+        {
+            return Ok(Some(false));
+        }
         Ok(self.parsed()?.flag_bool(flag))
     }
 
@@ -2061,7 +2077,7 @@ mod tests {
         let f = make_frontend("api start", &["--port", "9876"]);
         assert!(matches!(
             f.flag_u16(&["api", "start"], "port").unwrap_err(),
-            CommandError::InvalidFlagValue { flag, .. } if flag == "port"
+            CommandError::UnknownFlag { flag, .. } if flag.contains("port")
         ));
     }
 
@@ -2081,10 +2097,10 @@ mod tests {
     // ─── non-interactive and yolo flags are always set ────────────────────────
 
     #[test]
-    fn non_interactive_flag_always_set() {
+    fn headless_flag_defaults_on() {
         let f = make_frontend("chat", &[]);
         assert_eq!(
-            f.flag_bool(&["chat"], "non-interactive").unwrap(),
+            f.flag_bool(&["chat"], "headless").unwrap(),
             Some(true),
             "non-interactive must always be set in API mode"
         );
@@ -2412,7 +2428,11 @@ mod tests {
     fn worktree_preparation_and_resume_record_structured_result_path() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = crate::data::fs::api_paths::ApiPaths::at_root(tmp.path());
-        let writer = CommandStateWriter::new(paths, "s", "c");
+        let writer = CommandStateWriter::new(
+            paths,
+            "ses_03c7c0ace395d80182db07ae2c30f034",
+            "cmd_4a8a08f09d37b73795649038408b5f33",
+        );
         let bus = crate::command::commands::api_server::event_bus::EventBus::new(16);
         let mut frontend = ApiDispatchFrontend::new("exec workflow", &[], bus.sender())
             .with_state_writer(writer.clone());
@@ -2430,30 +2450,5 @@ mod tests {
         // explicit cleanup must clear this command's ownership of the path.
         frontend.report_worktree_discarded("branch");
         assert!(writer.kept_worktree().is_none());
-    }
-}
-
-#[cfg(test)]
-mod config_migrate_tests {
-    use super::*;
-
-    /// `config migrate` is not API-allowed, but if its frontend trait is ever
-    /// reached the API must refuse to confirm rather than guess: the answer
-    /// is the same as the CLI's `--non-interactive` without `--yes`.
-    #[test]
-    fn api_frontend_never_confirms_a_config_migration() {
-        let bus = crate::command::commands::api_server::event_bus::EventBus::new(16);
-        let mut fe = ApiDispatchFrontend::new("config migrate", &[], bus.sender());
-        let prompt = crate::command::prompts::config_migrate_confirm("PREVIEW");
-        let err = fe
-            .confirm_config_migration(&prompt)
-            .expect_err("the API cannot answer a confirmation");
-        assert!(
-            matches!(
-                err,
-                CommandError::InteractiveInputUnavailable { ref prompt } if prompt == "yes"
-            ),
-            "{err:?}"
-        );
     }
 }

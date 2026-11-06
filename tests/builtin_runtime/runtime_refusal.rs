@@ -5,9 +5,8 @@
 use awman::data::config::effective::EffectiveConfig;
 use awman::data::config::env::EnvSnapshot;
 use awman::data::config::flags::FlagConfig;
-use awman::data::config::global::GlobalConfig;
-use awman::data::config::repo::RepoConfig;
-use awman::data::config::runtime_selection::RuntimeSelection;
+use awman::data::config::runtime::RuntimeSelection;
+use awman::data::config::{ConfigFile, FileKind};
 use awman::engine::agent_runtime::detect_effective;
 use awman::engine::container::runtime::BuiltinRuntimeSettings;
 use awman::engine::container::ContainerRuntime;
@@ -20,7 +19,7 @@ fn startup_overrides_use_the_json_frontend_and_hide_values() {
     std::fs::create_dir(&config).unwrap();
     std::fs::write(
         config.join("config.json"),
-        r#"{"runtime":"builtin-experimental"}"#,
+        r#"{"runtime":{"kind":"builtin"}}"#,
     )
     .unwrap();
     for variable in awman::data::config::env::AMBIENT_MSB_OVERRIDES {
@@ -33,7 +32,7 @@ fn startup_overrides_use_the_json_frontend_and_hide_values() {
             let output = std::process::Command::new(env!("CARGO_BIN_EXE_awman"))
                 .args(["ready", "--json"])
                 .current_dir(tmp.path())
-                .env("AWMAN_CONFIG_HOME", &config)
+                .env("AWMAN_HOME", &config)
                 .env(variable, &value)
                 .output()
                 .unwrap();
@@ -66,15 +65,12 @@ fn open(settings: BuiltinRuntimeSettings) -> Result<ContainerRuntime, EngineErro
 }
 
 fn builtin_config(env: EnvSnapshot) -> EffectiveConfig {
-    EffectiveConfig::new(
-        FlagConfig::default(),
-        env,
-        RepoConfig::default(),
-        GlobalConfig {
-            runtime: Some("builtin-experimental".into()),
-            ..Default::default()
-        },
+    let global = ConfigFile::from_value(
+        serde_json::json!({"runtime": {"kind": "builtin"}}),
+        FileKind::Global,
     )
+    .unwrap();
+    EffectiveConfig::from_files(global, ConfigFile::default(), FlagConfig::default(), env).unwrap()
 }
 
 #[test]
@@ -163,7 +159,7 @@ fn builtin_test_gate_is_off_by_default_in_resolved_settings() {
     let temp = tempfile::tempdir().unwrap();
     let dir = temp.path().to_string_lossy().into_owned();
     let config = builtin_config(EnvSnapshot::with_overrides([
-        ("AWMAN_CONFIG_HOME", dir.as_str()),
+        ("AWMAN_HOME", dir.as_str()),
         ("AWMAN_TEST_ISOLATION", "1"),
     ]));
     let resolved = BuiltinRuntimeSettings::resolve(&config.builtin_process_settings().unwrap());
@@ -183,7 +179,7 @@ fn builtin_test_gate_is_off_by_default_in_resolved_settings() {
     assert!(resolved.ambient_overrides.is_empty());
 
     let gated = builtin_config(EnvSnapshot::with_overrides([
-        ("AWMAN_CONFIG_HOME", dir.as_str()),
+        ("AWMAN_HOME", dir.as_str()),
         ("AWMAN_TEST_BUILTIN", "1"),
     ]));
     let resolved = BuiltinRuntimeSettings::resolve(&gated.builtin_process_settings().unwrap());
@@ -198,7 +194,7 @@ fn builtin_ambient_msb_variables_reach_the_settings_and_block_detection() {
     let temp = tempfile::tempdir().unwrap();
     let dir = temp.path().to_string_lossy().into_owned();
     let config = builtin_config(EnvSnapshot::with_overrides([
-        ("AWMAN_CONFIG_HOME", dir.as_str()),
+        ("AWMAN_HOME", dir.as_str()),
         ("MSB_PATH", "/somewhere/else/msb"),
         ("MSB_LIBKRUNFW_PATH", "/somewhere/else/libkrunfw"),
     ]));
@@ -220,58 +216,52 @@ fn builtin_ambient_msb_variables_reach_the_settings_and_block_detection() {
 fn builtin_never_falls_back_to_docker_and_a_typo_is_fatal() {
     let temp = tempfile::tempdir().unwrap();
     let dir = temp.path().to_string_lossy().into_owned();
-    let env =
-        EnvSnapshot::with_overrides([("AWMAN_CONFIG_HOME", dir.as_str()), ("MSB_HOME", "/x")]);
+    let env = EnvSnapshot::with_overrides([("AWMAN_HOME", dir.as_str()), ("MSB_HOME", "/x")]);
     // A failing builtin selection is an error value, not a Docker runtime.
     assert!(detect_effective(&builtin_config(env)).is_err());
 
-    let typo = EffectiveConfig::new(
-        FlagConfig::default(),
-        EnvSnapshot::empty(),
-        RepoConfig::default(),
-        GlobalConfig {
-            runtime: Some("builtn".into()),
-            ..Default::default()
-        },
+    // A typo never reaches detection: the config file does not load.
+    let typo = ConfigFile::from_value(
+        serde_json::json!({"runtime": {"kind": "builtn"}}),
+        FileKind::Global,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        typo.contains("runtime.kind") && typo.contains("builtin"),
+        "{typo}"
     );
-    match detect_effective(&typo) {
-        Err(EngineError::UnknownRuntime { value, valid }) => {
-            assert_eq!(value, "builtn");
-            assert!(valid.contains("builtin"), "{valid}");
-        }
-        other => panic!("expected UnknownRuntime: {:?}", other.map(|_| ())),
-    }
 }
 
 #[test]
 fn builtin_selection_parses_and_round_trips() {
     assert_eq!(
-        RuntimeSelection::parse(Some("builtin-experimental")),
+        RuntimeSelection::parse(Some("builtin")),
         Ok(RuntimeSelection::BuiltinExperimental)
     );
-    assert_eq!(
-        RuntimeSelection::BuiltinExperimental.as_str(),
-        "builtin-experimental"
-    );
+    assert_eq!(RuntimeSelection::BuiltinExperimental.as_str(), "builtin");
     assert_eq!(
         RuntimeSelection::parse(None),
         Ok(RuntimeSelection::Docker),
         "default unchanged"
     );
     assert_eq!(
-        RuntimeSelection::parse(Some(" builtin-experimental ")),
+        RuntimeSelection::parse(Some(" builtin ")),
         Ok(RuntimeSelection::BuiltinExperimental),
         "whitespace is trimmed"
     );
     assert!(
-        RuntimeSelection::parse(Some("Builtin-Experimental")).is_err(),
+        RuntimeSelection::parse(Some("Builtin")).is_err(),
         "spellings are exact, never guessed"
     );
     assert!(
-        RuntimeSelection::parse(Some("builtin")).is_err(),
-        "the unreleased spelling is not accepted"
+        RuntimeSelection::parse(Some("builtin-experimental")).is_err(),
+        "the pre-0139 spelling is not accepted"
     );
-    assert!(RuntimeSelection::valid_values().contains("builtin-experimental"));
+    assert_eq!(
+        RuntimeSelection::valid_values(),
+        "docker, apple, sbx, builtin"
+    );
 }
 
 #[test]

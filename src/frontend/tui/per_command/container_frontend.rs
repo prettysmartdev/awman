@@ -51,7 +51,7 @@ impl AgentFrontend for TuiCommandFrontend {
 /// trait impls.
 ///
 /// Two modes:
-/// - **Without `AgentIo`** (`new`): creates a non-interactive AgentIo
+/// - **Without `AgentIo`** (`new`): creates a headless AgentIo
 ///   that routes stdout/stderr into the shared status log.
 /// - **With `AgentIo`** (`with_io`): hands the byte channels to the
 ///   engine's container backend so it can bridge a real PTY directly. Used by
@@ -65,12 +65,12 @@ pub struct TuiContainerProxy {
 
 impl TuiContainerProxy {
     /// Construct a status-log-only proxy (no PTY bridging).
-    /// Creates non-interactive AgentIo channels that route to the status log.
+    /// Creates headless AgentIo channels that route to the status log.
     pub fn new(log: SharedStatusLog) -> Self {
         let (stdout_tx, stdout_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
         let (stderr_tx, stderr_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
         let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel();
-        // Non-interactive: engine owns the single stdin_tx and drops it
+        // Headless: engine owns the single stdin_tx and drops it
         // after seeding so the child sees EOF (see `spawn_piped_docker`).
 
         // Spawn drain tasks that route stdout/stderr into the status log.

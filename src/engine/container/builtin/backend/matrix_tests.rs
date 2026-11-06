@@ -431,7 +431,7 @@ fn every_agent_plans_every_overlay_settings_and_prompt_variant() {
                 }
             }
 
-            // The non-interactive subcommand or flag appears exactly once.
+            // The headless subcommand or flag appears exactly once.
             if let Some(flag) = matrix.non_interactive_flag.as_deref() {
                 let count = argv.iter().filter(|a| a.as_str() == flag).count();
                 assert_eq!(
@@ -470,7 +470,7 @@ fn every_agent_plans_every_overlay_settings_and_prompt_variant() {
 /// three, with the same typed error.
 #[test]
 fn docker_apple_and_builtin_render_the_same_agent_argv_for_every_agent() {
-    use crate::data::config::repo::LaunchMode;
+    use crate::data::config::agents::LaunchMode;
     use crate::engine::agent::definition::ModelFlagDelivery;
     use crate::engine::container::options::{AutoMode, PlanMode, YoloMode};
     use crate::engine::error::ToolRestriction;
@@ -491,7 +491,7 @@ fn docker_apple_and_builtin_render_the_same_agent_argv_for_every_agent() {
                 },
             ),
             ("interactive", world.run_options(false)),
-            ("non-interactive", world.run_options(true)),
+            ("headless", world.run_options(true)),
             (
                 "yolo+model",
                 AgentRunOptions {
@@ -528,7 +528,7 @@ fn docker_apple_and_builtin_render_the_same_agent_argv_for_every_agent() {
             },
         ));
         table.push((
-            "agent-flags+non-interactive",
+            "agent-flags+headless",
             AgentRunOptions {
                 agent_flags: Some(vec!["--user-b".into()]),
                 ..world.run_options(true)
@@ -703,7 +703,7 @@ fn the_same_options_yield_the_same_mounts_for_the_same_image() {
 fn acp_launch_keeps_the_agent_entrypoint_and_is_persistent() {
     let world = world(Some(HOME));
     let mut run = world.run_options(false);
-    run.launch_mode = crate::data::config::repo::LaunchMode::Acp;
+    run.launch_mode = crate::data::config::agents::LaunchMode::Acp;
     let plan = world.plan("cline", &run).unwrap();
     assert_eq!(plan.command.argv, ["cline", "--acp"]);
     assert!(plan.persistent_stdin);

@@ -4,8 +4,9 @@
 //! exec_prompt + context(global) pipeline, workflow overlay merging, and the
 //! context(workflow) dynamic prompt step-progression markers.
 
-use awman::data::config::env::{EnvSnapshot, AWMAN_CONFIG_HOME};
+use awman::data::config::env::EnvSnapshot;
 use awman::data::config::overlays::ContextScope;
+use awman::data::fs::data_paths::AWMAN_HOME;
 use awman::data::fs::ContextDirResolver;
 use awman::data::session::{AgentName, Session, SessionOpenOptions, StaticGitRootResolver};
 use awman::engine::agent::{AgentEngine, AgentRunOptions};
@@ -24,6 +25,7 @@ fn open_session_with_env(git_root: &std::path::Path, env: EnvSnapshot) -> Sessio
         flags: Default::default(),
         env: Some(env),
         available_agents: None,
+        overrides: Default::default(),
     };
     Session::open(git_root.to_path_buf(), &resolver, opts).expect("Session::open")
 }
@@ -55,7 +57,7 @@ fn exec_prompt_context_global_emits_overlay_at_awman_context_global() {
     };
 
     let session_tmp = tempfile::tempdir().unwrap();
-    let env = EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, tmp.path().to_str().unwrap())]);
+    let env = EnvSnapshot::with_overrides([(AWMAN_HOME, tmp.path().to_str().unwrap())]);
     let session = open_session_with_env(session_tmp.path(), env);
     let engine = make_agent_engine(tmp.path());
     let agent = AgentName::new("claude").unwrap();
@@ -99,7 +101,7 @@ fn exec_prompt_context_global_emits_overlay_at_awman_context_global() {
 #[test]
 fn workflow_top_level_context_repo_and_step_context_global_produce_two_specs() {
     let tmp = tempfile::tempdir().unwrap();
-    let env = EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, tmp.path().to_str().unwrap())]);
+    let env = EnvSnapshot::with_overrides([(AWMAN_HOME, tmp.path().to_str().unwrap())]);
     let session = open_session_with_env(tmp.path(), env);
 
     let workflow_overlays = vec!["context(repo)".to_string()];
@@ -140,7 +142,7 @@ fn workflow_top_level_context_repo_and_step_context_global_produce_two_specs() {
 #[test]
 fn workflow_context_global_at_top_level_plus_step_context_workflow_union_semantics() {
     let tmp = tempfile::tempdir().unwrap();
-    let env = EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, tmp.path().to_str().unwrap())]);
+    let env = EnvSnapshot::with_overrides([(AWMAN_HOME, tmp.path().to_str().unwrap())]);
     let session = open_session_with_env(tmp.path(), env);
 
     let workflow_overlays = vec!["context(global)".to_string()];

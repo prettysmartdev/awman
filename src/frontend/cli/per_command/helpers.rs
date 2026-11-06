@@ -4,7 +4,7 @@
 //! is a terminal and none of them invents an answer when it is not: that is
 //! the pattern F-50 step 1 removes. Whether this run can ask a human at all
 //! is `CliFrontend::non_interactive` — one resolved flag, computed once from
-//! Layer 2's `ResolvedFlags::is_non_interactive` — and *what to answer* when
+//! Layer 2's `ResolvedFlags::is_headless` — and *what to answer* when
 //! it cannot is the CLI profile in `src/command/headless.rs`. An `ask_*` body
 //! consults those two before reaching for anything here.
 //!

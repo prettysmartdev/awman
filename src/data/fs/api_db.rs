@@ -616,6 +616,7 @@ impl SqliteSessionStore {
         Self::add_column_if_missing(conn, "idempotency_keys", "intent_body", "TEXT")?;
         Self::add_column_if_missing(conn, "idempotency_keys", "resource_kind", "TEXT")?;
         Self::add_column_if_missing(conn, "idempotency_keys", "resource_id", "TEXT")?;
+        crate::data::fs::schema_version::migrate_ids(conn)?;
         Ok(())
     }
 
@@ -1698,7 +1699,7 @@ fn command_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CommandR
 }
 
 fn labels_from_map(map: BTreeMap<String, String>) -> Result<Labels, DataError> {
-    Labels::new(map).map_err(|e| DataError::Other(format!("invalid labels in API database: {e}")))
+    Ok(Labels::from_stored(map))
 }
 
 fn append_label_predicates(
@@ -1887,8 +1888,8 @@ mod tests {
             .insert_command("c-partial", "s-partial", "chat", "[]", "/tmp/log-2")
             .unwrap();
         let labels = Labels::new(BTreeMap::from([
-            ("env".to_owned(), "prod".to_owned()),
-            ("tier".to_owned(), "api".to_owned()),
+            ("team/env".to_owned(), "prod".to_owned()),
+            ("team/tier".to_owned(), "api".to_owned()),
         ]))
         .unwrap();
         store
@@ -1897,7 +1898,8 @@ mod tests {
         store
             .set_labels(LabelOwner::Command, "c-label", &labels)
             .unwrap();
-        let partial = Labels::new(BTreeMap::from([("env".to_owned(), "prod".to_owned())])).unwrap();
+        let partial =
+            Labels::new(BTreeMap::from([("team/env".to_owned(), "prod".to_owned())])).unwrap();
         store
             .set_labels(LabelOwner::Session, "s-partial", &partial)
             .unwrap();
@@ -1915,8 +1917,8 @@ mod tests {
             labels
         );
         let selectors = [
-            LabelSelector::parse("env=prod").unwrap(),
-            LabelSelector::parse("tier").unwrap(),
+            LabelSelector::parse_query("team/env=prod").unwrap(),
+            LabelSelector::parse_query("team/tier").unwrap(),
         ];
         assert_eq!(
             store
@@ -2154,6 +2156,45 @@ mod tests {
         let records = store2.list_sessions().unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].id, "s1");
+    }
+
+    #[test]
+    fn in_flight_command_survives_prefixed_id_migration_without_old_alias() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("awman.db");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions(id TEXT PRIMARY KEY,workdir TEXT NOT NULL,created_at TEXT NOT NULL,status TEXT NOT NULL,closed_at TEXT);
+             CREATE TABLE commands(id TEXT PRIMARY KEY,session_id TEXT NOT NULL,subcommand TEXT NOT NULL,args TEXT NOT NULL,status TEXT NOT NULL,exit_code INTEGER,started_at TEXT,finished_at TEXT,log_path TEXT NOT NULL,queued_at TEXT);
+             CREATE TABLE labels(owner_kind TEXT NOT NULL,owner_id TEXT NOT NULL,key TEXT NOT NULL,value TEXT NOT NULL,PRIMARY KEY(owner_kind,owner_id,key));",
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO sessions VALUES(?1,'/work','2026-11-05T12:00:00Z','active',NULL)",
+            ["00000000-0000-0000-0000-000000000001"],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO commands VALUES(?1,?2,'chat','[]','running',NULL,'2026-11-05T12:01:00Z',NULL,'/log','2026-11-05T12:00:30Z')", ["00000000-0000-0000-0000-000000000002", "00000000-0000-0000-0000-000000000001"]).unwrap();
+        conn.execute(
+            "INSERT INTO labels VALUES('command',?1,'infact.kind','legacy')",
+            ["00000000-0000-0000-0000-000000000002"],
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = SqliteSessionStore::open(tmp.path()).unwrap();
+        let command = store
+            .get_command("cmd_00000000000000000000000000000002")
+            .unwrap()
+            .unwrap();
+        assert_eq!(command.status, CommandStatus::Running);
+        assert_eq!(command.session_id, "ses_00000000000000000000000000000001");
+        assert_eq!(command.queued_at.as_deref(), Some("2026-11-05T12:00:30Z"));
+        assert!(store
+            .get_command("00000000-0000-0000-0000-000000000002")
+            .unwrap()
+            .is_none());
+        let labels = store.labels_for(LabelOwner::Command, &command.id).unwrap();
+        assert_eq!(labels.get("infact.kind"), Some("legacy"));
     }
 
     // ─── Session CRUD ─────────────────────────────────────────────────────────
@@ -2467,28 +2508,45 @@ mod tests {
                     status TEXT NOT NULL DEFAULT 'pending', exit_code INTEGER,
                     started_at TEXT, finished_at TEXT, log_path TEXT NOT NULL
                 );
-                INSERT INTO sessions (id, workdir, created_at) VALUES ('s', '/w', '2023-01-01');
+                INSERT INTO sessions (id, workdir, created_at) VALUES ('33333333-3333-4333-8333-333333333333', '/w', '2023-01-01');
                 INSERT INTO commands (id, session_id, subcommand, args, status, log_path)
-                    VALUES ('old-1', 's', 'chat', '[]', 'running', '/l1'),
-                           ('old-2', 's', 'chat', '[]', 'done', '/l2');",
+                    VALUES ('11111111-1111-4111-8111-111111111111', '33333333-3333-4333-8333-333333333333', 'chat', '[]', 'running', '/l1'),
+                           ('22222222-2222-4222-8222-222222222222', '33333333-3333-4333-8333-333333333333', 'chat', '[]', 'done', '/l2');",
             )
             .unwrap();
         }
         let store = SqliteSessionStore::open(tmp.path()).unwrap();
-        for id in ["old-1", "old-2"] {
+        for id in [
+            "cmd_11111111111141118111111111111111",
+            "cmd_22222222222242228222222222222222",
+        ] {
             assert_eq!(store.get_command(id).unwrap().unwrap().attempt, 1, "{id}");
         }
         // Opening again is idempotent and keeps later increments.
         store
             .with_conn(|conn| {
-                conn.execute("UPDATE commands SET attempt = 4 WHERE id = 'old-1'", [])
+                conn.execute("UPDATE commands SET attempt = 4 WHERE id = 'cmd_11111111111141118111111111111111'", [])
                     .map_err(DataError::from)
             })
             .unwrap();
         drop(store);
         let store = SqliteSessionStore::open(tmp.path()).unwrap();
-        assert_eq!(store.get_command("old-1").unwrap().unwrap().attempt, 4);
-        assert_eq!(store.get_command("old-2").unwrap().unwrap().attempt, 1);
+        assert_eq!(
+            store
+                .get_command("cmd_11111111111141118111111111111111")
+                .unwrap()
+                .unwrap()
+                .attempt,
+            4
+        );
+        assert_eq!(
+            store
+                .get_command("cmd_22222222222242228222222222222222")
+                .unwrap()
+                .unwrap()
+                .attempt,
+            1
+        );
     }
 
     #[test]
@@ -2510,13 +2568,13 @@ mod tests {
                     queued_at TEXT
                 );
                 INSERT INTO sessions (id, workdir, created_at)
-                    VALUES ('s-later', '/w', '2026-01-01'),
-                           ('s-first', '/w', '2026-01-01'),
-                           ('s-same-next', '/w', '2026-01-01');
+                    VALUES ('ses_33333333333343338333333333333333', '/w', '2026-01-01'),
+                           ('ses_44444444444444448444444444444444', '/w', '2026-01-01'),
+                           ('ses_55555555555545558555555555555555', '/w', '2026-01-01');
                 INSERT INTO commands (id, session_id, subcommand, args, status, log_path, queued_at)
-                    VALUES ('later', 's-later', 'chat', '[]', 'pending', '/later', '2026-01-02T00:00:00Z'),
-                           ('first', 's-first', 'chat', '[]', 'pending', '/first', '2026-01-01T00:00:00Z'),
-                           ('same-time-next', 's-same-next', 'chat', '[]', 'pending', '/next', '2026-01-01T00:00:00Z');",
+                    VALUES ('cmd_88888888888848888888888888888888', 'ses_33333333333343338333333333333333', 'chat', '[]', 'pending', '/later', '2026-01-02T00:00:00Z'),
+                           ('cmd_77777777777747778777777777777777', 'ses_44444444444444448444444444444444', 'chat', '[]', 'pending', '/first', '2026-01-01T00:00:00Z'),
+                           ('cmd_66666666666646668666666666666666', 'ses_55555555555545558555555555555555', 'chat', '[]', 'pending', '/next', '2026-01-01T00:00:00Z');",
             )
             .unwrap();
         }
@@ -2535,7 +2593,11 @@ mod tests {
 
         // Migration leaves both ordering columns alone: queued_at first,
         // then the original rowid for ties.
-        for expected_id in ["first", "same-time-next", "later"] {
+        for expected_id in [
+            "cmd_77777777777747778777777777777777",
+            "cmd_66666666666646668666666666666666",
+            "cmd_88888888888848888888888888888888",
+        ] {
             let claimed = store.claim_next_command("worker").unwrap().unwrap();
             assert_eq!(claimed.id, expected_id);
         }
@@ -2729,13 +2791,13 @@ mod tests {
             // Insert rows as the old awman code would have.
             conn.execute(
                 "INSERT INTO sessions (id, workdir, created_at, status) \
-                 VALUES ('legacy-id-1', '/old/repo', '2023-06-01T10:00:00Z', 'active')",
+                 VALUES ('11111111-1111-4111-8111-111111111111', '/old/repo', '2023-06-01T10:00:00Z', 'active')",
                 [],
             )
             .unwrap();
             conn.execute(
                 "INSERT INTO commands (id, session_id, subcommand, args, status, log_path) \
-                 VALUES ('cmd-1', 'legacy-id-1', 'chat', '[]', 'pending', '/logs/cmd-1.log')",
+                 VALUES ('22222222-2222-4222-8222-222222222222', '11111111-1111-4111-8111-111111111111', 'chat', '[]', 'pending', '/logs/22222222-2222-4222-8222-222222222222.log')",
                 [],
             )
             .unwrap();
@@ -2751,13 +2813,17 @@ mod tests {
         )
         .unwrap();
         assert!(lifecycle
-            .cancel_if_queued("cmd-1", "2026-10-28T00:00:00Z")
+            .cancel_if_queued(
+                &crate::data::ids::CommandId::parse("cmd_22222222222242228222222222222222")
+                    .unwrap(),
+                "2026-10-28T00:00:00Z"
+            )
             .unwrap());
 
         // Step 3: verify the legacy rows are readable.
         let sessions = store.list_sessions().unwrap();
         assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].id, "legacy-id-1");
+        assert_eq!(sessions[0].id, "ses_11111111111141118111111111111111");
         assert_eq!(sessions[0].workdir, "/old/repo");
         assert_eq!(sessions[0].status.as_str(), "active");
         // WI 0133: a pre-existing row restores with no remote fields.
@@ -2767,8 +2833,11 @@ mod tests {
         assert!(sessions[0].merge_refs.is_empty());
         assert!(!sessions[0].push);
 
-        let cmd = store.get_command("cmd-1").unwrap().unwrap();
-        assert_eq!(cmd.session_id, "legacy-id-1");
+        let cmd = store
+            .get_command("cmd_22222222222242228222222222222222")
+            .unwrap()
+            .unwrap();
+        assert_eq!(cmd.session_id, "ses_11111111111141118111111111111111");
         assert_eq!(cmd.subcommand, "chat");
         assert_eq!(cmd.status.as_str(), "cancelled");
         assert_eq!(

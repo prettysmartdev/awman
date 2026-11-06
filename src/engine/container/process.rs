@@ -281,7 +281,7 @@ impl AgentInstance for ContainerInstance {
             return spawn_piped_interactive(cli, self, req);
         }
 
-        // Piped path: non-interactive or no PTY.
+        // Piped path: headless or no PTY.
         spawn_piped(cli, self, req)
     }
 }
@@ -503,12 +503,12 @@ pub(super) fn spawn_piped(
 
     let bridge = crate::engine::container::io_bridge::bridge_piped(io, &mut child, bridge_cfg);
 
-    // Non-interactive (piped) path: drop the engine's stdin_injector so the
+    // Headless (piped) path: drop the engine's stdin_injector so the
     // writer task sees EOF after draining the seeded prompt and closes the
     // child's stdin pipe. Without this, an agent that probes stdin for EOF
     // would hang waiting for input that will never come.
     // `try_inject_stdin` falls back to launching a fresh container — which
-    // is the correct behaviour for a non-interactive run that has already
+    // is the correct behaviour for a headless run that has already
     // consumed its single prompt.
     drop(bridge.stdin_injector);
 
@@ -542,7 +542,7 @@ pub(super) fn spawn_piped(
 /// alive. That keeps the container's stdin pipe open so the ACP driver can
 /// write JSON-RPC request lines (via `try_inject_stdin`) across a full
 /// bidirectional exchange, instead of the one-write-then-EOF an ordinary
-/// non-interactive run performs.
+/// headless run performs.
 ///
 /// No seeded prompt is written to stdin here: an ACP session delivers its
 /// prompt over the JSON-RPC channel (`session/prompt`), so writing raw text to

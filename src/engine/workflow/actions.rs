@@ -253,7 +253,7 @@ pub enum WorkflowOutcome {
     },
     /// Main workflow completed but a teardown step with `abort_on_failure`
     /// failed. Post-workflow actions (worktree flows) should still run, but
-    /// non-interactive contexts should default to keeping the worktree.
+    /// headless contexts should default to keeping the worktree.
     CompletedTeardownFailed,
 }
 

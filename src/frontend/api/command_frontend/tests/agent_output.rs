@@ -52,7 +52,11 @@ async fn api_output_emits_only_a_marked_bounded_prefix_for_an_overlong_line() {
 async fn drain_preserves_split_unicode_and_collects_only_prompt_final_messages() {
     for command in ["exec prompt", "exec workflow"] {
         let tmp = tempfile::tempdir().unwrap();
-        let writer = CommandStateWriter::new(ApiPaths::from_root(tmp.path()), "s", "c");
+        let writer = CommandStateWriter::new(
+            ApiPaths::from_root(tmp.path()),
+            "ses_03c7c0ace395d80182db07ae2c30f034",
+            "cmd_4a8a08f09d37b73795649038408b5f33",
+        );
         let bus = EventBus::new(64);
         let mut events = bus.subscribe();
         let mut frontend =
@@ -118,7 +122,11 @@ async fn closing_a_stale_sender_finalizes_the_buffered_message_before_the_snapsh
 #[tokio::test]
 async fn unknown_steps_are_not_given_first_seen_indices_and_success_clears_failure() {
     let tmp = tempfile::tempdir().unwrap();
-    let writer = CommandStateWriter::new(ApiPaths::from_root(tmp.path()), "s", "c");
+    let writer = CommandStateWriter::new(
+        ApiPaths::from_root(tmp.path()),
+        "ses_03c7c0ace395d80182db07ae2c30f034",
+        "cmd_4a8a08f09d37b73795649038408b5f33",
+    );
     let bus = EventBus::new(16);
     let mut events = bus.subscribe();
     let mut frontend = ApiDispatchFrontend::new("exec workflow", &[], bus.sender())
@@ -172,12 +180,22 @@ mod early_worker_path_tests {
             let tmp = tempfile::tempdir().unwrap();
             let paths = ApiPaths::from_root(tmp.path());
             let store = Arc::new(SqliteSessionStore::open(tmp.path()).unwrap());
-            store.insert_session("s", "/missing", "then").unwrap();
             store
-                .enqueue_command("c", "s", "exec prompt", "not json", "log")
+                .insert_session("ses_03c7c0ace395d80182db07ae2c30f034", "/missing", "then")
+                .unwrap();
+            store
+                .enqueue_command(
+                    "cmd_4a8a08f09d37b73795649038408b5f33",
+                    "ses_03c7c0ace395d80182db07ae2c30f034",
+                    "exec prompt",
+                    "not json",
+                    "log",
+                )
                 .unwrap();
             let command = store.claim_next_command("worker").unwrap().unwrap();
-            store.update_session_status("s", session_status).unwrap();
+            store
+                .update_session_status("ses_03c7c0ace395d80182db07ae2c30f034", session_status)
+                .unwrap();
             let engines = Engines::for_tests(&tmp.path().join("home"));
             let sessions = Arc::new(SessionManager::in_memory(
                 crate::data::config::env::EnvSnapshot::empty(),
@@ -190,7 +208,13 @@ mod early_worker_path_tests {
             );
             let lifecycle_store = CommandLifecycleStore::open(store.clone()).unwrap();
             if cancelled {
-                lifecycle_store.request_cancel("c", "at").unwrap();
+                lifecycle_store
+                    .request_cancel(
+                        &crate::data::ids::CommandId::parse("cmd_4a8a08f09d37b73795649038408b5f33")
+                            .unwrap(),
+                        "at",
+                    )
+                    .unwrap();
             }
             let worker = QueueWorker::new(
                 "worker".into(),
@@ -207,7 +231,10 @@ mod early_worker_path_tests {
                 },
             );
             worker.execute_for_test(command).await;
-            let row = store.get_command("c").unwrap().unwrap();
+            let row = store
+                .get_command("cmd_4a8a08f09d37b73795649038408b5f33")
+                .unwrap()
+                .unwrap();
             let result =
                 serde_json::from_str::<CommandResult>(row.result.as_deref().unwrap()).unwrap();
             if cancelled {
@@ -226,9 +253,19 @@ mod early_worker_path_tests {
                     failure.message
                 );
             }
-            assert!(!paths.command_completion_path("s", "c").exists());
+            assert!(!paths
+                .command_completion_path(
+                    "ses_03c7c0ace395d80182db07ae2c30f034",
+                    "cmd_4a8a08f09d37b73795649038408b5f33"
+                )
+                .exists());
             assert_eq!(
-                store.get_session("s").unwrap().unwrap().status.as_str(),
+                store
+                    .get_session("ses_03c7c0ace395d80182db07ae2c30f034")
+                    .unwrap()
+                    .unwrap()
+                    .status
+                    .as_str(),
                 if session_status == SessionStatus::Closing {
                     "closed"
                 } else {
@@ -244,11 +281,27 @@ mod early_worker_path_tests {
             let tmp = tempfile::tempdir().unwrap();
             let paths = ApiPaths::from_root(tmp.path());
             let store = Arc::new(SqliteSessionStore::open(tmp.path()).unwrap());
-            store.insert_session("s", "/missing", "then").unwrap();
-            paths.prepare_command_dir("s", "c").unwrap();
-            let log = paths.command_log_path("s", "c");
             store
-                .enqueue_command("c", "s", "exec prompt", "[]", &log.to_string_lossy())
+                .insert_session("ses_03c7c0ace395d80182db07ae2c30f034", "/missing", "then")
+                .unwrap();
+            paths
+                .prepare_command_dir(
+                    "ses_03c7c0ace395d80182db07ae2c30f034",
+                    "cmd_4a8a08f09d37b73795649038408b5f33",
+                )
+                .unwrap();
+            let log = paths.command_log_path(
+                "ses_03c7c0ace395d80182db07ae2c30f034",
+                "cmd_4a8a08f09d37b73795649038408b5f33",
+            );
+            store
+                .enqueue_command(
+                    "cmd_4a8a08f09d37b73795649038408b5f33",
+                    "ses_03c7c0ace395d80182db07ae2c30f034",
+                    "exec prompt",
+                    "[]",
+                    &log.to_string_lossy(),
+                )
                 .unwrap();
             let command = store.claim_next_command("worker").unwrap().unwrap();
             if unwritable_directory {
@@ -282,14 +335,20 @@ mod early_worker_path_tests {
                 },
             );
             worker.execute_for_test(command).await;
-            let row = store.get_command("c").unwrap().unwrap();
+            let row = store
+                .get_command("cmd_4a8a08f09d37b73795649038408b5f33")
+                .unwrap()
+                .unwrap();
             let result =
                 serde_json::from_str::<CommandResult>(row.result.as_deref().unwrap()).unwrap();
             assert_eq!(row.status.as_str(), "error");
             assert_eq!(result.outcome, Some(CommandStatusKind::Error));
             assert_eq!(result.failure.unwrap().stage, "preflight");
             if !unwritable_directory {
-                let events = paths.read_command_events("s", "c");
+                let events = paths.read_command_events(
+                    "ses_03c7c0ace395d80182db07ae2c30f034",
+                    "cmd_4a8a08f09d37b73795649038408b5f33",
+                );
                 assert_eq!(
                     events
                         .iter()
@@ -443,7 +502,11 @@ async fn structured_large_frames_preserve_results_and_never_echo_tool_payloads()
         for kind in ["result", "error", "tool"] {
             for interim in [false, true] {
                 let tmp = tempfile::tempdir().unwrap();
-                let writer = CommandStateWriter::new(ApiPaths::from_root(tmp.path()), "s", "c");
+                let writer = CommandStateWriter::new(
+                    ApiPaths::from_root(tmp.path()),
+                    "ses_03c7c0ace395d80182db07ae2c30f034",
+                    "cmd_4a8a08f09d37b73795649038408b5f33",
+                );
                 let bus = EventBus::new(32);
                 let mut events = bus.subscribe();
                 let mut frontend = ApiDispatchFrontend::new("exec prompt", &[], bus.sender())

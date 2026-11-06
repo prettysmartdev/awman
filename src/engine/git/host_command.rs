@@ -72,7 +72,7 @@ pub(super) const NETWORK_TIMEOUT: std::time::Duration = std::time::Duration::fro
 /// A [`command`] for an operation that contacts `remote`. On top of the
 /// local hardening it refuses repository-scoped transport executables and
 /// credential sources, pins the remote's upload/receive-pack programs, and
-/// makes SSH non-interactive unless the user chose an SSH command through
+/// makes SSH headless unless the user chose an SSH command through
 /// their environment or global configuration.
 pub(super) fn transport_command(
     cwd: &Path,

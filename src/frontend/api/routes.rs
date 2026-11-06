@@ -1,17 +1,14 @@
 //! HTTP route registration and handlers for the API server.
 //!
-//! Routes preserve the API's established request and response contract.
+//! One method/path table over the typed resource operations.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
 
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::FutureExt;
 use serde::{Deserialize, Serialize};
@@ -19,31 +16,26 @@ use tokio_stream::wrappers::ReceiverStream;
 use tower_http::trace::TraceLayer;
 
 use crate::command::commands::api_server::admission::{
-    AdmissionError, ApiAdmission, CommandSubmission, IdempotencyGate, IdempotencyGateError,
-    IdempotentAdmission, IdempotentResult, SessionSubmission,
+    AdmissionError, CommandSubmission, IdempotencyGate, IdempotencyGateError, IdempotentAdmission,
+    IdempotentResult, SessionSubmission,
 };
-use crate::command::commands::api_server::command_log_stream::{
-    CommandLogStream, CommandLogUpdate,
-};
+use crate::command::commands::api_server::command_log_stream::CommandLogUpdate;
 use crate::command::commands::api_server::event_bus::EventBus;
 use crate::command::commands::api_server::session_setup::{
     log_session_setup, SessionSetupBus, SessionSetupBusSender, SetupReadyFrontend, TracingSetupSink,
 };
 pub use crate::command::commands::api_server::AuthMode;
-use crate::command::commands::api_server::{
-    ApiSessionLifecycle, CancelOutcome, CloseOutcome, CommandCanceller, SetupReadiness,
-    TokenRegistry,
-};
+use crate::command::commands::api_server::{CancelOutcome, CloseOutcome, SetupReadiness};
 use crate::command::session_create::{SessionCreatePlan, SessionCreateRequest};
 use crate::command::session_setup::{SessionSetup, SessionSetupPresenter};
-use crate::data::api_lifecycle_store::{CommandLifecycleStore, RunRecord};
+use crate::data::api_lifecycle_store::RunRecord;
 use crate::data::command_status::CommandStatus;
 use crate::data::execution_event::{EventCursor, ExecutionEvent};
+use crate::data::fs::api_db::SessionCommandAdmission;
 use crate::data::fs::api_db::SessionRecord;
 use crate::data::fs::api_db::{CommandListFilter, CommandRecord, LabelOwner};
-use crate::data::fs::api_db::{SessionCommandAdmission, SqliteSessionStore};
 use crate::data::fs::api_labels::{LabelSelector, Labels};
-use crate::data::fs::api_paths::ApiPaths;
+#[cfg(test)]
 use crate::data::session_manager::SessionManager;
 use crate::data::session_setup_event::SessionSetupStatus;
 use crate::data::session_setup_event::SetupEventPayload;
@@ -53,49 +45,10 @@ use crate::engine::ready::frontend::ReadyFrontend;
 
 // ─── Auth mode ───────────────────────────────────────────────────────────────
 
-// ─── Shared state ────────────────────────────────────────────────────────────
-pub struct AppState {
-    pub store: Arc<SqliteSessionStore>,
-    pub lifecycle_store: CommandLifecycleStore,
-    pub canceller: CommandCanceller,
-    pub setup_cancels: Arc<TokenRegistry>,
-    pub paths: ApiPaths,
-    pub workdirs: Vec<PathBuf>,
-    pub workdir_roots: Vec<PathBuf>,
-    pub started_at: Instant,
-    pub task_handles: tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
-    pub auth_mode: AuthMode,
-    pub engines: crate::command::dispatch::Engines,
-    pub sessions: Arc<SessionManager>,
-    pub event_buses: Arc<tokio::sync::Mutex<HashMap<String, Arc<EventBus>>>>,
-    pub setup_buses: tokio::sync::Mutex<HashMap<String, Arc<SessionSetupBus>>>,
-}
+pub use crate::command::daemon_api::worker::WorkerApi as AppState;
 
-impl AppState {
-    fn admission(&self) -> ApiAdmission {
-        ApiAdmission::new(
-            Arc::clone(&self.store),
-            self.lifecycle_store.clone(),
-            self.paths.clone(),
-            self.engines.clone(),
-            Arc::clone(&self.sessions),
-            self.workdirs.clone(),
-            self.workdir_roots.clone(),
-        )
-    }
-
-    fn lifecycle(&self) -> ApiSessionLifecycle {
-        ApiSessionLifecycle::new(
-            Arc::clone(&self.store),
-            self.engines.clone(),
-            Arc::clone(&self.sessions),
-            self.paths.clone(),
-        )
-    }
-}
-
-#[derive(Serialize)]
-struct SessionClosingResponse {
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SessionClosingResponse {
     setup_status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     setup_error: Option<serde_json::Value>,
@@ -105,6 +58,16 @@ struct SessionClosingResponse {
     running_command_id: Option<String>,
     cancelled_count: usize,
     message: String,
+}
+
+#[derive(Debug, Serialize)]
+struct CancellationStoppingResponse {
+    command_id: crate::data::ids::CommandId,
+    session_id: crate::data::ids::WorkerSessionId,
+    status: &'static str,
+    #[serde(with = "crate::data::wire::timestamp")]
+    cancel_requested_at: chrono::DateTime<chrono::Utc>,
+    message: &'static str,
 }
 
 // ─── Request / Response types (API compatibility contract) ───────────────────
@@ -136,14 +99,18 @@ struct CreateSessionRequest {
     labels: Labels,
 }
 
-#[derive(Serialize)]
-struct SessionResponse {
-    id: String,
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SessionResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    setup: Option<crate::data::session_setup_event::SessionSetupState>,
+    id: crate::data::ids::WorkerSessionId,
     workdir: String,
-    created_at: String,
+    #[serde(with = "crate::data::wire::timestamp")]
+    created_at: chrono::DateTime<chrono::Utc>,
     status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    closed_at: Option<String>,
+    #[serde(default, with = "crate::data::wire::opt_timestamp")]
+    closed_at: Option<chrono::DateTime<chrono::Utc>>,
     session_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     repo_url: Option<String>,
@@ -151,10 +118,11 @@ struct SessionResponse {
     branch: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     base_ref: Option<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     merge_refs: Vec<String>,
     push: bool,
     #[serde(default)]
+    #[serde(deserialize_with = "crate::command::daemon_api::worker::stored_labels")]
     labels: Labels,
     /// The setup stage stored on the row (`SessionSetupStatus` spelling). A
     /// closed session keeps its last stage.
@@ -175,6 +143,17 @@ impl SessionResponse {
         Self {
             labels,
             setup_error,
+            setup: {
+                let mut setup = state
+                    .setup_buses
+                    .try_lock()
+                    .ok()
+                    .and_then(|buses| buses.get(&row.id).map(|bus| bus.snapshot()))
+                    .or_else(|| state.paths.read_setup_state(&row.id))
+                    .unwrap_or_default();
+                setup.status = row.setup_status;
+                Some(setup)
+            },
             ..Self::from(row)
         }
     }
@@ -183,13 +162,16 @@ impl SessionResponse {
 impl From<SessionRecord> for SessionResponse {
     fn from(s: SessionRecord) -> Self {
         Self {
-            id: s.id,
+            setup: None,
+            id: crate::data::ids::WorkerSessionId::parse(&s.id).expect("stored session id"),
             workdir: s.workdir,
-            created_at: s.created_at,
+            created_at: parse_at(&s.created_at).expect("stored session created_at"),
             status: s.status.as_str().to_string(),
             setup_status: s.setup_status.as_str().to_string(),
             setup_error: None,
-            closed_at: s.closed_at,
+            closed_at: s
+                .closed_at
+                .map(|v| parse_at(&v).expect("stored session closed_at")),
             session_type: s.session_type,
             repo_url: s.repo_url,
             branch: s.branch,
@@ -203,82 +185,56 @@ impl From<SessionRecord> for SessionResponse {
 
 #[derive(Deserialize)]
 struct CreateCommandRequest {
+    #[serde(default)]
+    interaction: Option<crate::data::config::daemon::Interaction>,
     subcommand: String,
     args: Vec<String>,
     #[serde(default)]
     labels: Labels,
-    /// `POST /v1/commands` only: the session, as an alternative to the
+    /// `POST /v1/worker/commands` only: the session, as an alternative to the
     /// `x-awman-session` header. A run's command must not name one.
     #[serde(default)]
     session_id: Option<String>,
 }
 
-#[derive(Serialize)]
-struct CommandResponse {
-    id: String,
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CommandResponse {
+    id: crate::data::ids::CommandId,
     attempt: u32,
-    session_id: String,
+    session_id: crate::data::ids::WorkerSessionId,
     subcommand: String,
     args: serde_json::Value,
     status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     exit_code: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    started_at: Option<String>,
+    #[serde(default, with = "crate::data::wire::opt_timestamp")]
+    started_at: Option<chrono::DateTime<chrono::Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    finished_at: Option<String>,
+    #[serde(default, with = "crate::data::wire::opt_timestamp")]
+    finished_at: Option<chrono::DateTime<chrono::Utc>>,
     /// Deprecated: a server-side path a remote client cannot open, so it is
-    /// sent only to loopback peers. Clients read `GET /v1/commands/{id}/logs`.
+    /// sent only to loopback peers. Clients read `GET /v1/worker/commands/{id}/events`.
     #[serde(skip_serializing_if = "Option::is_none")]
     log_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    queued_at: Option<String>,
+    #[serde(default, with = "crate::data::wire::opt_timestamp")]
+    queued_at: Option<chrono::DateTime<chrono::Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     queue_position: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     worker_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     result: Option<serde_json::Value>,
+    #[serde(deserialize_with = "crate::command::daemon_api::worker::stored_labels")]
     labels: Labels,
     #[serde(skip_serializing_if = "Option::is_none")]
-    cancel_requested_at: Option<String>,
+    #[serde(default, with = "crate::data::wire::opt_timestamp")]
+    cancel_requested_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Capabilities a client can detect without parsing the version. Append only.
-pub const API_FEATURES: &[&str] = &[
-    "error_codes",
-    "workflow_state",
-    "command_cancel",
-    "labels",
-    "idempotency",
-    "runs",
-    // WI 0137: `result.{outcome,failure,failed_steps,git,pull_request,
-    // final_message,outputs,data}` and the one final `command_status`.
-    "structured_results",
-    // WI 0137: `GET /v1/commands/{id}/outputs[/{path}]`.
-    "outputs",
-    // WI 0137: `source` on the event envelope and `?step=` on the logs.
-    "event_source",
-    // WI 0137: `step_activity` events from structured-output agents.
-    "step_activity",
-    // WI 0138: `GET /v1/commands/{id}`, the command record.
-    "command_record",
-    // WI 0138: `setup_status`/`setup_error` on session records and the
-    // `?setup_status=` filter on `GET /v1/sessions`.
-    "session_setup_status",
-    // WI 0138: `session_id` in the `POST /v1/commands` body.
-    "command_session_body",
-];
-
-#[derive(Serialize)]
-struct StatusResponse {
-    status: String,
-    pid: u32,
-    uptime_seconds: u64,
-    active_sessions: i64,
-    running_commands: i64,
-    features: Vec<String>,
-}
+pub use crate::command::daemon_api::capabilities::CAPABILITIES as API_FEATURES;
 
 #[derive(Deserialize)]
 struct CreateRunRequest {
@@ -296,6 +252,7 @@ impl From<CreateCommandRequest> for CommandSubmission {
             subcommand: body.subcommand,
             args: body.args,
             labels: body.labels,
+            interaction: body.interaction,
         }
     }
 }
@@ -327,7 +284,7 @@ fn admission_error(error: AdmissionError, session_id: &str) -> Response {
         AdmissionError::Setup(readiness) => {
             let mut body = serde_json::json!({
                 "setup_status": readiness.status(),
-                "hint": "Poll GET /v1/sessions/{id}/status to check setup progress"
+                "hint": "Poll GET /v1/worker/sessions/{id} to check setup progress"
             });
             let mut message = "session is not ready";
             if let Some(err) = readiness.error().cloned() {
@@ -367,15 +324,16 @@ fn session_response(state: &AppState, row: SessionRecord) -> Response {
 type RouteResult<T> = Result<T, Box<Response>>;
 
 /// The TCP peer of a request, from the `ConnectInfo` the server installs.
-/// Only the socket address counts; `Forwarded`/`X-Forwarded-For` are never
-/// read. No `ConnectInfo` (a router served without it) reads as not loopback.
+/// Owner-authenticated IPC is also trusted to access host-local paths.
 #[derive(Clone, Copy)]
-pub(crate) struct Peer(Option<std::net::SocketAddr>);
+pub(crate) struct Peer(Option<std::net::SocketAddr>, bool);
 
 impl Peer {
     fn is_loopback(self) -> bool {
-        self.0
-            .is_some_and(|addr| addr.ip().to_canonical().is_loopback())
+        self.1
+            || self
+                .0
+                .is_some_and(|addr| addr.ip().to_canonical().is_loopback())
     }
 }
 
@@ -391,6 +349,10 @@ impl<S: Send + Sync> axum::extract::FromRequestParts<S> for Peer {
                 .extensions
                 .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
                 .map(|info| info.0),
+            parts
+                .extensions
+                .get::<super::local::OwnerAuthenticated>()
+                .is_some(),
         ))
     }
 }
@@ -410,7 +372,10 @@ fn command_response(
     };
     let cancel_requested_at = state
         .lifecycle_store
-        .cancel_requested_at(&c.id)
+        .cancel_requested_at(
+            &crate::data::ids::CommandId::parse(&c.id)
+                .map_err(|_| internal_error("invalid stored command id"))?,
+        )
         .map_err(|_| internal_error("Failed to read cancel request"))?;
     let queue_position = state
         .lifecycle()
@@ -422,26 +387,36 @@ fn command_response(
             .result
             .as_deref()
             .and_then(|r| serde_json::from_str(r).ok()),
-        id: c.id,
+        id: crate::data::ids::CommandId::parse(&c.id)
+            .map_err(|_| internal_error("invalid stored command id"))?,
         attempt: c.attempt,
-        session_id: c.session_id,
+        session_id: crate::data::ids::WorkerSessionId::parse(&c.session_id)
+            .map_err(|_| internal_error("invalid stored session id"))?,
         subcommand: c.subcommand,
         // Rows migrate `pending` → `queued`; never show the legacy name.
         status: c.status.canonical().as_str().to_string(),
         exit_code: c.exit_code,
-        started_at: c.started_at,
-        finished_at: c.finished_at,
+        started_at: c
+            .started_at
+            .map(|v| parse_at(&v).expect("stored command timestamp")),
+        finished_at: c
+            .finished_at
+            .map(|v| parse_at(&v).expect("stored command timestamp")),
         log_path: peer.is_loopback().then_some(c.log_path),
-        queued_at: c.queued_at,
+        queued_at: c
+            .queued_at
+            .map(|v| parse_at(&v).expect("stored command timestamp")),
         queue_position,
         worker_id: c.worker_id,
         labels,
-        cancel_requested_at,
+        cancel_requested_at: cancel_requested_at
+            .map(|v| parse_at(&v).expect("stored cancel timestamp")),
     })
 }
 
 #[derive(Default)]
 struct ListQuery {
+    page: crate::data::wire::ListQuery,
     command_status: Option<CommandStatus>,
     session_status: Option<SessionStatus>,
     setup_status: Option<SessionSetupStatus>,
@@ -453,14 +428,14 @@ struct ListQuery {
 impl ListQuery {
     fn parse(pairs: Vec<(String, String)>, commands: bool) -> RouteResult<Self> {
         let mut query = Self {
-            limit: 100,
+            limit: i64::MAX,
             ..Self::default()
         };
         for (key, value) in pairs {
             match key.as_str() {
-                "label" => query
-                    .labels
-                    .push(LabelSelector::parse(&value).map_err(|e| bad_request(e.to_string()))?),
+                "label" => query.labels.push(
+                    LabelSelector::parse_query(&value).map_err(|e| bad_request(e.to_string()))?,
+                ),
                 "status" if commands => {
                     query.command_status = Some(CommandStatus::parse(&value).ok_or_else(|| {
                         let valid: Vec<_> = CommandStatus::ALL.iter().map(|s| s.as_str()).collect();
@@ -491,15 +466,18 @@ impl ListQuery {
                         })?);
                 }
                 "session_id" if commands => query.session_id = Some(value),
-                "limit" if commands => {
-                    query.limit = value
-                        .parse::<i64>()
-                        .map_err(|_| bad_request("limit must be an integer"))?
-                        .clamp(1, 1000)
+                "limit" => {
+                    query.page.limit = Some(
+                        value
+                            .parse()
+                            .map_err(|_| bad_request("limit must be an integer"))?,
+                    );
                 }
+                "cursor" => query.page.cursor = Some(value),
                 _ => {}
             }
         }
+        query.page.page().map_err(|e| bad_request(e.to_string()))?;
         Ok(query)
     }
 }
@@ -513,12 +491,15 @@ async fn handle_list_commands(
         Ok(query) => query,
         Err(response) => return *response,
     };
-    let rows = match state.store.list_commands_filtered(&CommandListFilter {
-        status: query.command_status,
-        session_id: query.session_id.as_deref(),
-        labels: &query.labels,
-        limit: query.limit,
-    }) {
+    let rows = match worker::commands_list(
+        &state,
+        &CommandListFilter {
+            status: query.command_status,
+            session_id: query.session_id.as_deref(),
+            labels: &query.labels,
+            limit: query.limit,
+        },
+    ) {
         Ok(rows) => rows,
         Err(_) => return internal_error("Failed to list commands"),
     };
@@ -535,7 +516,7 @@ async fn handle_list_commands(
             Err(response) => return *response,
         }
     }
-    Json(serde_json::json!({ "commands": commands })).into_response()
+    keyed_response(commands, &query.page, |v| v.id.as_str())
 }
 
 async fn handle_cancel_command(
@@ -543,7 +524,12 @@ async fn handle_cancel_command(
     peer: Peer,
     AxumPath(id): AxumPath<String>,
 ) -> Response {
-    match state.lifecycle().cancel_command(&id, &state.canceller, &state.setup_cancels, &state.lifecycle_store).await {
+    match worker::commands_cancel(
+        &state,
+        &crate::data::ids::CommandId::parse(&id).expect("route validated command id"),
+    )
+    .await
+    {
         Ok(CancelOutcome::NotFound) => {
             ApiError::command_not_found(format!("Command '{id}' not found")).into_response()
         }
@@ -557,15 +543,23 @@ async fn handle_cancel_command(
             command_id,
             session_id,
             requested_at,
-        }) => (
-            StatusCode::ACCEPTED,
-            Json(serde_json::json!({
-                "command_id": command_id, "session_id": session_id, "status": CommandStatus::Running.as_str(),
-                "cancel_requested_at": requested_at,
-                "message": "Stopping. Poll GET /v1/commands/{id}/status until status is cancelled.",
-            })),
-        )
-            .into_response(),
+        }) => match parse_at(&requested_at) {
+            Ok(cancel_requested_at) => (
+                StatusCode::ACCEPTED,
+                Json(CancellationStoppingResponse {
+                    command_id: crate::data::ids::CommandId::parse(&command_id)
+                        .expect("stored command id"),
+                    session_id: crate::data::ids::WorkerSessionId::parse(&session_id)
+                        .expect("stored session id"),
+                    status: CommandStatus::Running.as_str(),
+                    cancel_requested_at,
+                    message:
+                        "Stopping. Poll GET /v1/worker/commands/{id} until status is cancelled.",
+                }),
+            )
+                .into_response(),
+            Err(_) => internal_error("Invalid stored cancellation timestamp"),
+        },
         Err(error) => {
             tracing::error!(?error, command_id = %id, "Command cancellation failed");
             internal_error(&error.to_string())
@@ -670,104 +664,418 @@ where
 
 // ─── Router ──────────────────────────────────────────────────────────────────
 
-pub fn build_router(state: Arc<AppState>) -> Router {
-    Router::new()
-        .route("/v1/status", get(handle_status))
-        .route("/v1/workdirs", get(handle_workdirs))
-        .route(
-            "/v1/sessions",
-            get(handle_list_sessions).post(handle_create_session),
-        )
-        .route(
-            "/v1/sessions/{id}",
-            get(handle_get_session).delete(handle_close_session),
-        )
-        .route("/v1/sessions/{id}/status", get(handle_get_session_status))
-        .route("/v1/sessions/{id}/queue", get(handle_get_session_queue))
-        .route(
-            "/v1/commands",
-            get(handle_list_commands).post(handle_create_command),
-        )
-        .route("/v1/commands/{id}/cancel", post(handle_cancel_command))
-        .route("/v1/runs", post(handle_create_run))
-        // WI 0138: the command record itself; `/status` stays as an alias.
-        .route("/v1/commands/{id}", get(handle_get_command))
-        .route("/v1/commands/{id}/status", get(handle_get_command))
-        .route("/v1/commands/{id}/logs", get(handle_stream_command_logs))
-        .route("/v1/workflows/{command_id}", get(handle_get_workflow))
-        // WI 0137 §6: every per-command resource under /v1/commands/{id}/.
-        .route("/v1/commands/{id}/workflow", get(handle_get_workflow))
-        // WI 0137 §3: the agent-written outputs directory.
-        .route(
-            "/v1/commands/{id}/outputs",
-            get(crate::frontend::api::outputs::handle_list_outputs),
-        )
-        .route(
-            "/v1/commands/{id}/outputs/{*path}",
-            get(crate::frontend::api::outputs::handle_get_output),
-        )
-        .layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            auth_middleware,
-        ))
+use crate::command::daemon_api::{worker, DaemonApi, Feature, FeatureState, Operation};
+use axum::routing::{MethodFilter, MethodRouter};
+/// The only path/method catalogue served by either daemon process.
+#[derive(Debug, Clone, Copy)]
+pub struct RouteSpec {
+    pub method: &'static str,
+    pub path: &'static str,
+    pub op: Operation,
+    pub local_only: bool,
+    pub capability: Option<&'static str>,
+}
+pub const ROUTES: &[RouteSpec] = &[
+    RouteSpec {
+        method: "GET",
+        path: "/v1/status",
+        op: Operation::CoreStatus,
+        local_only: false,
+        capability: Some("feature_states"),
+    },
+    RouteSpec {
+        method: "GET",
+        path: "/v1/config",
+        op: Operation::CoreConfigGet,
+        local_only: true,
+        capability: Some("config_routes"),
+    },
+    RouteSpec {
+        method: "POST",
+        path: "/v1/config/reload",
+        op: Operation::CoreConfigReload,
+        local_only: true,
+        capability: Some("config_routes"),
+    },
+    RouteSpec {
+        method: "GET",
+        path: "/v1/features",
+        op: Operation::CoreFeaturesList,
+        local_only: false,
+        capability: Some("feature_states"),
+    },
+    RouteSpec {
+        method: "GET",
+        path: "/v1/features/{feature}",
+        op: Operation::CoreFeaturesGet,
+        local_only: false,
+        capability: Some("feature_states"),
+    },
+    RouteSpec {
+        method: "GET",
+        path: "/v1/grants",
+        op: Operation::CoreGrantsList,
+        local_only: true,
+        capability: Some("grant_routes"),
+    },
+    RouteSpec {
+        method: "DELETE",
+        path: "/v1/grants/{id}",
+        op: Operation::CoreGrantsDelete,
+        local_only: true,
+        capability: Some("grant_routes"),
+    },
+    RouteSpec {
+        method: "GET",
+        path: "/v1/worker/workdirs",
+        op: Operation::WorkerWorkdirs,
+        local_only: false,
+        capability: Some("resource_routes"),
+    },
+    RouteSpec {
+        method: "GET",
+        path: "/v1/worker/sessions",
+        op: Operation::WorkerSessionsList,
+        local_only: false,
+        capability: None,
+    },
+    RouteSpec {
+        method: "POST",
+        path: "/v1/worker/sessions",
+        op: Operation::WorkerSessionsCreate,
+        local_only: false,
+        capability: None,
+    },
+    RouteSpec {
+        method: "GET",
+        path: "/v1/worker/sessions/{id}",
+        op: Operation::WorkerSessionsGet,
+        local_only: false,
+        capability: None,
+    },
+    RouteSpec {
+        method: "DELETE",
+        path: "/v1/worker/sessions/{id}",
+        op: Operation::WorkerSessionsDelete,
+        local_only: false,
+        capability: None,
+    },
+    RouteSpec {
+        method: "GET",
+        path: "/v1/worker/sessions/{id}/queue",
+        op: Operation::WorkerSessionsQueue,
+        local_only: false,
+        capability: None,
+    },
+    RouteSpec {
+        method: "GET",
+        path: "/v1/worker/commands",
+        op: Operation::WorkerCommandsList,
+        local_only: false,
+        capability: None,
+    },
+    RouteSpec {
+        method: "POST",
+        path: "/v1/worker/commands",
+        op: Operation::WorkerCommandsCreate,
+        local_only: false,
+        capability: None,
+    },
+    RouteSpec {
+        method: "GET",
+        path: "/v1/worker/commands/{id}",
+        op: Operation::WorkerCommandsGet,
+        local_only: false,
+        capability: None,
+    },
+    RouteSpec {
+        method: "POST",
+        path: "/v1/worker/commands/{id}/cancel",
+        op: Operation::WorkerCommandsCancel,
+        local_only: false,
+        capability: None,
+    },
+    RouteSpec {
+        method: "GET",
+        path: "/v1/worker/commands/{id}/events",
+        op: Operation::WorkerCommandsEvents,
+        local_only: false,
+        capability: None,
+    },
+    RouteSpec {
+        method: "GET",
+        path: "/v1/worker/commands/{id}/workflow",
+        op: Operation::WorkerCommandsWorkflow,
+        local_only: false,
+        capability: None,
+    },
+    RouteSpec {
+        method: "GET",
+        path: "/v1/worker/commands/{id}/outputs",
+        op: Operation::WorkerCommandsOutputs,
+        local_only: false,
+        capability: None,
+    },
+    RouteSpec {
+        method: "GET",
+        path: "/v1/worker/commands/{id}/outputs/{*path}",
+        op: Operation::WorkerCommandsOutput,
+        local_only: false,
+        capability: None,
+    },
+    RouteSpec {
+        method: "POST",
+        path: "/v1/worker/runs",
+        op: Operation::WorkerRunsCreate,
+        local_only: false,
+        capability: None,
+    },
+    RouteSpec {
+        method: "GET",
+        path: "/v1/squad/tasks",
+        op: Operation::SquadTasksList,
+        local_only: false,
+        capability: Some("resource_routes"),
+    },
+    RouteSpec {
+        method: "POST",
+        path: "/v1/squad/tasks",
+        op: Operation::SquadTasksCreate,
+        local_only: false,
+        capability: None,
+    },
+    RouteSpec {
+        method: "GET",
+        path: "/v1/squad/tasks/{id}",
+        op: Operation::SquadTasksGet,
+        local_only: false,
+        capability: None,
+    },
+    RouteSpec {
+        method: "PATCH",
+        path: "/v1/squad/tasks/{id}",
+        op: Operation::SquadTasksUpdate,
+        local_only: false,
+        capability: None,
+    },
+    RouteSpec {
+        method: "DELETE",
+        path: "/v1/squad/tasks/{id}",
+        op: Operation::SquadTasksDelete,
+        local_only: false,
+        capability: None,
+    },
+    RouteSpec {
+        method: "GET",
+        path: "/v1/squad/tasks/{id}/workflow",
+        op: Operation::SquadTasksWorkflow,
+        local_only: false,
+        capability: None,
+    },
+    RouteSpec {
+        method: "POST",
+        path: "/v1/squad/tasks/{id}/runs",
+        op: Operation::SquadRunsCreate,
+        local_only: false,
+        capability: None,
+    },
+    RouteSpec {
+        method: "GET",
+        path: "/v1/squad/tasks/{id}/runs",
+        op: Operation::SquadRunsList,
+        local_only: false,
+        capability: None,
+    },
+    RouteSpec {
+        method: "POST",
+        path: "/v1/squad/runs/{id}/cancel",
+        op: Operation::SquadRunsCancel,
+        local_only: false,
+        capability: None,
+    },
+    RouteSpec {
+        method: "GET",
+        path: "/v1/squad/env",
+        op: Operation::SquadEnvGet,
+        local_only: false,
+        capability: None,
+    },
+    RouteSpec {
+        method: "PUT",
+        path: "/v1/squad/env",
+        op: Operation::SquadEnvPut,
+        local_only: false,
+        capability: None,
+    },
+    RouteSpec {
+        method: "DELETE",
+        path: "/v1/squad/env",
+        op: Operation::SquadEnvClear,
+        local_only: false,
+        capability: None,
+    },
+];
+/// Listener exposure controls owner-only paths; feature state controls whether
+/// a feature route is available and reports disabled features as 503. Network
+/// API keys never grant owner access.
+#[derive(Debug, Clone)]
+pub enum ListenerPolicy {
+    Local,
+    Network { features: Vec<Feature> },
+}
+
+pub fn build_router(state: impl Into<DaemonApi>) -> Router {
+    build_router_for_listener(Arc::new(state.into()), ListenerPolicy::Local)
+}
+pub fn build_router_for_listener(api: Arc<DaemonApi>, policy: ListenerPolicy) -> Router {
+    let mut router = Router::new();
+    for spec in ROUTES {
+        let filter = match spec.method {
+            "GET" => MethodFilter::GET,
+            "POST" => MethodFilter::POST,
+            "PATCH" => MethodFilter::PATCH,
+            "PUT" => MethodFilter::PUT,
+            "DELETE" => MethodFilter::DELETE,
+            _ => unreachable!(),
+        };
+        let route: MethodRouter = match spec.op.owner() {
+            Feature::Worker => match &api.worker {
+                Some(worker) => worker_route(spec.op, filter).with_state(worker.clone()),
+                None => axum::routing::on(filter, || async {
+                    ApiError::feature_disabled("worker feature is disabled")
+                }),
+            },
+            _ => axum::routing::on(filter, resource_handler).with_state(api.clone()),
+        };
+        let gate_api = api.clone();
+        let gate_policy = policy.clone();
+        let spec = *spec;
+        let route = route.layer(axum::middleware::from_fn(
+            move |mut request: axum::http::Request<axum::body::Body>,
+                  next: axum::middleware::Next| {
+                let api = gate_api.clone();
+                let policy = gate_policy.clone();
+                async move {
+                    if matches!(&policy, ListenerPolicy::Network { .. }) && spec.local_only {
+                        return ApiError::not_found("resource not found").into_response();
+                    }
+                    let state = api
+                        .features
+                        .read()
+                        .expect("feature set lock")
+                        .state(spec.op.owner());
+                    if state == FeatureState::Off
+                        || (state == FeatureState::Draining && spec.op.creates())
+                    {
+                        return ApiError::feature_disabled(format!(
+                            "{} feature is disabled",
+                            spec.op.owner().name()
+                        ))
+                        .into_response();
+                    }
+                    // Worker IDs are validated even though the legacy store uses string keys.
+                    if spec.op.owner() == Feature::Worker {
+                        let parts: Vec<_> = request.uri().path().split('/').collect();
+                        if let Some(id) = parts.get(4) {
+                            let valid = match parts.get(3) {
+                                Some(&"sessions") => {
+                                    crate::data::ids::WorkerSessionId::parse(id).is_ok()
+                                }
+                                Some(&"commands") => crate::data::ids::CommandId::parse(id).is_ok(),
+                                _ => true,
+                            };
+                            if !valid {
+                                return ApiError::not_found("resource not found").into_response();
+                            }
+                        }
+                    }
+                    request.extensions_mut().insert(spec.op);
+                    next.run(request).await
+                }
+            },
+        ));
+        router = router.route(spec.path, route);
+    }
+    router
+        .fallback(|| async { ApiError::not_found("resource not found") })
+        .method_not_allowed_fallback(move |request: axum::http::Request<axum::body::Body>| {
+            let policy = policy.clone();
+            async move {
+                // Hidden resources must not be revealed by a different verb.
+                if let ListenerPolicy::Network { .. } = policy {
+                    let path = request
+                        .extensions()
+                        .get::<axum::extract::MatchedPath>()
+                        .map(|p| p.as_str());
+                    if ROUTES
+                        .iter()
+                        .any(|spec| Some(spec.path) == path && spec.local_only)
+                    {
+                        return ApiError::not_found("resource not found").into_response();
+                    }
+                }
+                ApiError::method_not_allowed("method not allowed").into_response()
+            }
+        })
+        .layer(axum::middleware::from_fn_with_state(api, daemon_auth))
         .layer(axum::middleware::from_fn(
             super::error::normalize_rejections,
         ))
         .layer(TraceLayer::new_for_http())
-        .with_state(state)
 }
-
-// ─── Auth middleware ─────────────────────────────────────────────────────────
-
-async fn auth_middleware(
-    State(state): State<Arc<AppState>>,
-    req: axum::http::Request<axum::body::Body>,
+fn worker_route(op: Operation, filter: MethodFilter) -> MethodRouter<Arc<AppState>> {
+    match op {
+        Operation::WorkerWorkdirs => axum::routing::on(filter, handle_workdirs),
+        Operation::WorkerSessionsList => axum::routing::on(filter, handle_list_sessions),
+        Operation::WorkerSessionsCreate => axum::routing::on(filter, handle_create_session),
+        Operation::WorkerSessionsGet => axum::routing::on(filter, handle_get_session),
+        Operation::WorkerSessionsDelete => axum::routing::on(filter, handle_close_session),
+        Operation::WorkerSessionsQueue => axum::routing::on(filter, handle_get_session_queue),
+        Operation::WorkerCommandsList => axum::routing::on(filter, handle_list_commands),
+        Operation::WorkerCommandsCreate => axum::routing::on(filter, handle_create_command),
+        Operation::WorkerCommandsGet => axum::routing::on(filter, handle_get_command),
+        Operation::WorkerCommandsCancel => axum::routing::on(filter, handle_cancel_command),
+        Operation::WorkerCommandsEvents => axum::routing::on(filter, handle_stream_command_logs),
+        Operation::WorkerCommandsWorkflow => axum::routing::on(filter, handle_get_workflow),
+        Operation::WorkerCommandsOutputs => {
+            axum::routing::on(filter, crate::frontend::api::outputs::handle_list_outputs)
+        }
+        Operation::WorkerCommandsOutput => {
+            axum::routing::on(filter, crate::frontend::api::outputs::handle_get_output)
+        }
+        Operation::WorkerRunsCreate => axum::routing::on(filter, handle_create_run),
+        _ => unreachable!("non-worker operation"),
+    }
+}
+async fn daemon_auth(
+    State(api): State<Arc<DaemonApi>>,
+    request: axum::http::Request<axum::body::Body>,
     next: axum::middleware::Next,
 ) -> Response {
-    // State extraction only: the decision itself lives in one shared place so
-    // the API and squad daemons can never diverge on how a key is accepted.
+    if request
+        .extensions()
+        .get::<super::local::OwnerAuthenticated>()
+        .is_some()
+    {
+        return next.run(request).await;
+    }
     if let Some(rejection) = crate::frontend::api::serve::check_bearer_auth(
-        &state.engines,
-        &state.auth_mode,
-        req.headers(),
+        &api.engines,
+        &api.auth_mode,
+        request.headers(),
     ) {
         return rejection;
     }
-    next.run(req).await
+    next.run(request).await
 }
 
-// ─── Handlers ────────────────────────────────────────────────────────────────
+// Handlers
 
-async fn handle_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let active_sessions = state.store.count_active_sessions().unwrap_or(0);
-    let running_commands = state.store.count_running_commands().unwrap_or(0);
-    let uptime = state.started_at.elapsed().as_secs();
-
-    Json(StatusResponse {
-        status: "ok".to_string(),
-        pid: std::process::id(),
-        uptime_seconds: uptime,
-        active_sessions,
-        running_commands,
-        features: API_FEATURES
-            .iter()
-            .map(|feature| (*feature).to_string())
-            .collect(),
-    })
-}
-
-async fn handle_workdirs(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let dirs: Vec<String> = state
-        .workdirs
-        .iter()
-        .map(|p| p.display().to_string())
-        .collect();
-    let roots: Vec<String> = state
-        .workdir_roots
-        .iter()
-        .map(|p| p.display().to_string())
-        .collect();
-    Json(serde_json::json!({ "workdirs": dirs, "roots": roots }))
+async fn handle_workdirs(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<crate::data::wire::ListQuery>,
+) -> Response {
+    page_response(worker::workdirs(&state), &query)
 }
 
 async fn handle_create_session(
@@ -779,7 +1087,7 @@ async fn handle_create_session(
     with_idempotency(
         &state,
         &headers,
-        "/v1/sessions",
+        "/v1/worker/sessions",
         &value.to_string(),
         |journal| async move {
             let body = match serde_json::from_value(value) {
@@ -802,7 +1110,7 @@ async fn handle_create_run(
     with_idempotency(
         &state,
         &headers,
-        "/v1/runs",
+        "/v1/worker/runs",
         &canonical,
         |journal| async move {
             let body: CreateRunRequest = match serde_json::from_value(value) {
@@ -834,6 +1142,9 @@ async fn create_submission(
     close_on_finish: bool,
     journal: Option<&IdempotentAdmission>,
 ) -> Response {
+    if let Err(error) = Labels::new(body.labels.clone().into_inner()) {
+        return bad_request(error.to_string());
+    }
     let submission = SessionSubmission {
         request: SessionCreateRequest {
             session_type: body.session_type,
@@ -846,16 +1157,13 @@ async fn create_submission(
         },
         labels: body.labels,
     };
-    let admitted = match state
-        .admission()
-        .admit_session(
-            submission,
-            command.map(CommandSubmission::from),
-            close_on_finish,
-            journal,
-        )
-        .await
-    {
+    let result = match command {
+        Some(command) => {
+            worker::runs_create(state, submission, command.into(), close_on_finish, journal).await
+        }
+        None => worker::sessions_create(state, submission, None, close_on_finish, journal).await,
+    };
+    let admitted = match result {
         Ok(admitted) => admitted,
         Err(error) => return admission_error(error, ""),
     };
@@ -891,7 +1199,16 @@ async fn create_submission(
             .insert(sid.clone(), Arc::clone(&setup_bus));
         run_session_setup(state_clone, sid, plan, setup_bus, token, run_for_setup).await;
     });
-    accepted_json(response_body)
+    if run.is_none() {
+        (
+            StatusCode::CREATED,
+            [("content-type", "application/json")],
+            response_body,
+        )
+            .into_response()
+    } else {
+        accepted_json(response_body)
+    }
 }
 
 /// Drive the Layer 2 [`SessionSetup`] orchestrator with an
@@ -924,7 +1241,23 @@ async fn run_session_setup(
         setup_bus,
         state: Arc::clone(&state),
         session_id: session_id.clone(),
-        verbose_setup: crate::data::config::env::Env::from_process().api_verbose_setup(),
+        verbose_setup: state
+            .live_config
+            .read()
+            .expect("worker config lock")
+            .as_ref()
+            .map(|c| c.daemon().verbose_setup)
+            .unwrap_or_else(|| {
+                crate::data::config::daemon::DaemonSettings::from_merged(
+                    &state
+                        .engines
+                        .global_config
+                        .daemon
+                        .clone()
+                        .unwrap_or_default(),
+                )
+                .verbose_setup
+            }),
     };
     // Lists can expose the queued row before this task is spawned (or even
     // before run linkage/token registration). Carry that early cancel into
@@ -1014,7 +1347,8 @@ async fn handle_list_sessions(
         Ok(query) => query,
         Err(response) => return *response,
     };
-    match state.store.list_sessions_filtered(
+    match worker::sessions_list(
+        &state,
         query.session_status,
         query.setup_status,
         &query.labels,
@@ -1032,7 +1366,7 @@ async fn handle_list_sessions(
                     SessionResponse::new(&state, s, labels)
                 })
                 .collect();
-            Json(serde_json::json!({ "sessions": list })).into_response()
+            keyed_response(list, &query.page, |v| v.id.as_str())
         }
         Err(e) => {
             tracing::error!(error = %e, "Failed to list sessions");
@@ -1045,7 +1379,10 @@ async fn handle_get_session(
     State(state): State<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Response {
-    match state.store.get_session(&id) {
+    match worker::sessions_get(
+        &state,
+        &crate::data::ids::WorkerSessionId::parse(&id).expect("route validated session id"),
+    ) {
         Ok(Some(s)) => session_response(&state, s),
         Ok(None) => {
             ApiError::session_not_found(format!("Session '{}' not found", id)).into_response()
@@ -1067,7 +1404,12 @@ async fn handle_close_session(
             _ => Err(Box::new(internal_error("Failed to get session"))),
         }
     };
-    match state.lifecycle().close(&id).await {
+    match worker::sessions_delete(
+        &state,
+        &crate::data::ids::WorkerSessionId::parse(&id).expect("route validated session id"),
+    )
+    .await
+    {
         Ok(CloseOutcome::NotFound) => {
             ApiError::session_not_found(format!("Session '{id}' not found")).into_response()
         }
@@ -1088,7 +1430,7 @@ async fn handle_close_session(
                 status: SessionStatus::Closing.as_str().to_string(),
                 running_command_id: Some(running_command_id),
                 cancelled_count: cancelled.len(),
-                message: "Session is closing. Waiting for running command to complete. Poll GET /v1/sessions/{id}/status to monitor.".to_string(),
+                message: "Session is closing. Waiting for running command to complete. Poll GET /v1/worker/sessions/{id} to monitor.".to_string(),
             }),
         ).into_response()
         }
@@ -1110,7 +1452,7 @@ async fn handle_close_session(
                     .map(|command| command.id),
                 cancelled_count: 0,
                 message:
-                    "Session is already closing. Poll GET /v1/sessions/{id}/status to monitor."
+                    "Session is already closing. Poll GET /v1/worker/sessions/{id} to monitor."
                         .to_string(),
             })
             .into_response()
@@ -1124,79 +1466,6 @@ async fn handle_close_session(
             ApiError::internal("Failed to clean up remote session directory").into_response()
         }
     }
-}
-
-async fn handle_get_session_status(
-    State(state): State<Arc<AppState>>,
-    AxumPath(id): AxumPath<String>,
-) -> Response {
-    // Check if session exists at all.
-    match state.store.get_session(&id) {
-        Ok(None) => {
-            return ApiError::session_not_found(format!("Session '{}' not found", id))
-                .into_response();
-        }
-        Err(e) => {
-            tracing::error!(error = %e, "Failed to get session");
-            return ApiError::internal("Failed to get session").into_response();
-        }
-        Ok(Some(_)) => {}
-    }
-
-    // Capturing the frontend's bus is wiring; Layer 2 owns source precedence.
-    let snapshot = state
-        .setup_buses
-        .lock()
-        .await
-        .get(&id)
-        .map(|bus| bus.snapshot());
-    use crate::command::commands::api_server::runtime::SessionStatusView;
-    match state.lifecycle().session_status_view(&id, snapshot) {
-        Ok(SessionStatusView::Snapshot {
-            labels,
-            state: setup_state,
-        }) => Json(serde_json::json!({
-            "session_id": id,
-            "labels": labels,
-            "status": setup_state.status,
-            "current_stage": setup_state.current_stage,
-            "current_ready_phase": setup_state.current_ready_phase,
-            "ready_step_statuses": setup_state.ready_step_statuses,
-            "ready_summary": setup_state.ready_summary,
-            "error": setup_state.error,
-        }))
-        .into_response(),
-        Ok(SessionStatusView::Fallback(fallback)) => status_fallback_response(&id, fallback),
-        Err(error) => status_fallback_error(&id, error),
-    }
-}
-
-fn status_fallback_error(
-    id: &str,
-    error: crate::command::commands::api_server::runtime::StatusFallbackError,
-) -> Response {
-    match error {
-        crate::command::commands::api_server::runtime::StatusFallbackError::Session(error) => {
-            tracing::error!(session_id = id, %error, "Failed to read session setup status");
-            internal_error("Failed to read session")
-        }
-        crate::command::commands::api_server::runtime::StatusFallbackError::Labels(error) => {
-            tracing::error!(session_id = id, %error, "Failed to read session labels");
-            internal_error("Failed to read session labels")
-        }
-    }
-}
-
-fn status_fallback_response(
-    id: &str,
-    fallback: crate::command::commands::api_server::runtime::SessionStatusFallback,
-) -> Response {
-    Json(serde_json::json!({
-        "session_id": id,
-        "labels": fallback.labels,
-        "status": fallback.setup_status.as_str(),
-    }))
-    .into_response()
 }
 
 async fn handle_create_command(
@@ -1217,7 +1486,7 @@ async fn handle_create_command(
     with_idempotency(
         &state,
         &headers,
-        "/v1/commands",
+        "/v1/worker/commands",
         &canonical,
         |journal| async move { create_command(st, hd, body, journal.as_deref()).await },
     )
@@ -1235,17 +1504,21 @@ async fn create_command(
         Err(response) => return *response,
     };
 
-    match state
-        .admission()
-        .admit_command(&session_id, body.into(), journal)
-        .await
-    {
+    let submission: CommandSubmission = body.into();
+    if let Err(error) = submission.validate() {
+        return admission_error(error, &session_id);
+    }
+    let id = match crate::data::ids::WorkerSessionId::parse(&session_id) {
+        Ok(id) => id,
+        Err(_) => return ApiError::session_not_found("session not found").into_response(),
+    };
+    match worker::commands_create(state, &id, submission, journal).await {
         Ok(admitted) => accepted_json(admitted.response_body),
         Err(error) => admission_error(error, &session_id),
     }
 }
 
-/// The session a `POST /v1/commands` targets: the body's `session_id`, the
+/// The session a `POST /v1/worker/commands` targets: the body's `session_id`, the
 /// `x-awman-session` header, or both when they agree. Two different values
 /// are refused; awman never picks one.
 fn command_session_id(headers: &HeaderMap, body: Option<&str>) -> RouteResult<String> {
@@ -1277,7 +1550,10 @@ async fn handle_get_command(
     peer: Peer,
     AxumPath(id): AxumPath<String>,
 ) -> Response {
-    match state.store.get_command(&id) {
+    match worker::commands_get(
+        &state,
+        &crate::data::ids::CommandId::parse(&id).expect("route validated command id"),
+    ) {
         Ok(Some(c)) => match command_response(&state, peer, c, None) {
             Ok(response) => Json(response).into_response(),
             Err(response) => *response,
@@ -1311,7 +1587,7 @@ struct CommandLogsQuery {
 const WORKER_WAIT_KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(15);
 const COMMAND_STATUS_POLL: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// `GET /v1/commands/{id}/logs` — structured event stream.
+/// `GET /v1/worker/commands/{id}/events` — structured event stream.
 ///
 /// Persisted frames carry `<attempt>:<sequence>` ids. `?after=` overrides
 /// Last-Event-ID; malformed cursors return the usual JSON 400 response.
@@ -1325,7 +1601,10 @@ async fn handle_stream_command_logs(
     headers: HeaderMap,
     shutdown: Option<axum::Extension<tokio_util::sync::CancellationToken>>,
 ) -> Response {
-    let command = match state.store.get_command(&command_id) {
+    let command = match worker::commands_get(
+        &state,
+        &crate::data::ids::CommandId::parse(&command_id).expect("route validated command id"),
+    ) {
         Ok(Some(c)) => c,
         Ok(None) => {
             return ApiError::command_not_found(format!("Command '{command_id}' not found"))
@@ -1379,16 +1658,9 @@ async fn handle_stream_command_logs(
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, std::convert::Infallible>>(256);
     let shutdown = shutdown.map(|extension| extension.0).unwrap_or_default();
     let stream = async move {
-        let mut events = CommandLogStream::open(
-            Arc::clone(&state.store),
-            state.paths.clone(),
-            Arc::clone(&state.event_buses),
-            command,
-            requested,
-            query.step,
-            COMMAND_STATUS_POLL,
-        )
-        .await;
+        let mut events =
+            worker::commands_events(&state, command, requested, query.step, COMMAND_STATUS_POLL)
+                .await;
         let mut waiting = false;
         let mut keepalive = tokio::time::interval_at(
             tokio::time::Instant::now() + WORKER_WAIT_KEEPALIVE,
@@ -1445,8 +1717,12 @@ fn execution_event_to_sse(event: &ExecutionEvent, cursor: Option<EventCursor>) -
 async fn handle_get_session_queue(
     State(state): State<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
+    Query(query): Query<crate::data::wire::ListQuery>,
 ) -> Response {
-    match state.lifecycle().queue_view(&id) {
+    match worker::sessions_queue(
+        &state,
+        &crate::data::ids::WorkerSessionId::parse(&id).expect("route validated session id"),
+    ) {
         Ok(None) => {
             ApiError::session_not_found(format!("Session '{}' not found", id)).into_response()
         }
@@ -1462,35 +1738,68 @@ async fn handle_get_session_queue(
             tracing::error!(%error, "Failed to read command labels");
             internal_error("Failed to read command labels")
         }
-        Ok(Some(view)) => Json(serde_json::json!({
-            "session_id": id,
-            "queue_depth": view.queue_depth,
-            "running": view.running.map(|item| serde_json::json!({
-                "command_id": item.command_id,
-                "subcommand": item.subcommand,
-                "args": item.args,
-                "started_at": item.started_at,
-                "worker_id": item.worker_id,
-                "labels": item.labels,
-            })),
-            "queued": view.queued.into_iter().map(|item| serde_json::json!({
-                "command_id": item.command_id,
-                "subcommand": item.subcommand,
-                "args": item.args,
-                "queued_at": item.timestamp,
-                "position": item.position,
-                "labels": item.labels,
-            })).collect::<Vec<_>>(),
-            "recent_completed": view.recent_completed.into_iter().map(|item| serde_json::json!({
-                "command_id": item.command_id,
-                "subcommand": item.subcommand,
-                "status": item.status.as_str(),
-                "exit_code": item.exit_code,
-                "finished_at": item.finished_at,
-                "labels": item.labels,
-            })).collect::<Vec<_>>(),
-        }))
-        .into_response(),
+        Ok(Some(view)) => {
+            let value = serde_json::json!({
+                "session_id": id,
+                "queue_depth": view.queue_depth,
+                "running": view.running.map(|item| serde_json::json!({
+                    "command_id": item.command_id,
+                    "subcommand": item.subcommand,
+                    "args": item.args,
+                    "started_at": item.started_at,
+                    "worker_id": item.worker_id,
+                    "labels": item.labels,
+                })),
+                "queued": view.queued.into_iter().map(|item| serde_json::json!({
+                    "command_id": item.command_id,
+                    "subcommand": item.subcommand,
+                    "args": item.args,
+                    "queued_at": item.timestamp,
+                    "position": item.position,
+                    "labels": item.labels,
+                })).collect::<Vec<_>>(),
+                "recent_completed": view.recent_completed.into_iter().map(|item| serde_json::json!({
+                    "command_id": item.command_id,
+                    "subcommand": item.subcommand,
+                    "status": item.status.as_str(),
+                    "exit_code": item.exit_code,
+                    "finished_at": item.finished_at,
+                    "labels": item.labels,
+                })).collect::<Vec<_>>(),
+            });
+            let mut items = Vec::new();
+            if !value["running"].is_null() {
+                let mut running = value["running"].clone();
+                running["status"] = serde_json::json!("running");
+                items.push(running);
+            }
+            items.extend(
+                value["queued"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|mut v| {
+                        v["status"] = serde_json::json!("queued");
+                        v
+                    }),
+            );
+            items.extend(
+                value["recent_completed"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default(),
+            );
+            let items = match items
+                .into_iter()
+                .map(serde_json::from_value::<worker::QueueRecord>)
+                .collect::<Result<Vec<_>, _>>()
+            {
+                Ok(items) => items,
+                Err(_) => return internal_error("invalid stored queue record"),
+            };
+            page_response(items, &query)
+        }
     }
 }
 
@@ -1498,7 +1807,8 @@ async fn handle_get_workflow(
     State(state): State<Arc<AppState>>,
     AxumPath(command_id): AxumPath<String>,
 ) -> Response {
-    let cmd = match state.store.get_command(&command_id) {
+    let id = crate::data::ids::CommandId::parse(&command_id).expect("route validated command id");
+    let cmd = match worker::commands_get(&state, &id) {
         Ok(Some(c)) => c,
         Ok(None) => {
             return ApiError::command_not_found("command not found").into_response();
@@ -1509,19 +1819,12 @@ async fn handle_get_workflow(
         }
     };
 
-    match state
-        .paths
-        .read_command_workflow_state_raw(&cmd.session_id, &command_id)
-    {
-        Ok(Some(content)) => match serde_json::from_str::<serde_json::Value>(&content) {
-            // WI 0137 §6: computed, client-ready fields are added at read
-            // time; the persisted state file stays an engine format.
-            Ok(val) => Json(crate::frontend::api::workflow_view::client_view(val)).into_response(),
-            Err(e) => {
-                tracing::error!(error = %e, "Failed to parse workflow state");
-                ApiError::internal("Failed to parse workflow state").into_response()
-            }
-        },
+    match worker::commands_workflow(&state, &id) {
+        // WI 0137 §6: computed, client-ready fields are added at read
+        // time; the persisted state file stays an engine format.
+        Ok(Some(val)) => {
+            Json(crate::frontend::api::workflow_view::client_view(val)).into_response()
+        }
         Ok(None) => {
             let error = match state.lifecycle().workflow_state_availability(&cmd) {
                 crate::command::commands::api_server::runtime::WorkflowStateAvailability::NotStarted => {
@@ -1546,6 +1849,20 @@ async fn handle_get_workflow(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn owner_socket_peer_is_considered_local_for_path_projection() {
+        use axum::extract::FromRequestParts;
+        let request = axum::http::Request::builder()
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let (mut parts, _) = request.into_parts();
+        parts
+            .extensions
+            .insert(super::super::local::OwnerAuthenticated);
+        let peer = Peer::from_request_parts(&mut parts, &()).await.unwrap();
+        assert!(peer.is_loopback());
+    }
     use std::sync::Arc;
     use std::time::Instant;
 
@@ -1565,6 +1882,7 @@ mod tests {
                     labels: Labels::empty(),
                 },
                 Some(CommandSubmission {
+                    interaction: None,
                     subcommand: "exec prompt".into(),
                     args: vec!["hello".into()],
                     labels: Labels::empty(),
@@ -1611,7 +1929,7 @@ mod tests {
             std::task::Poll::Ready(response) => response,
             std::task::Poll::Pending => panic!("setup scheduling yielded after admission"),
         };
-        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert_eq!(response.status(), StatusCode::CREATED);
         drop(submission);
         let session = state.store.list_sessions().unwrap().pop().unwrap();
         assert!(state.setup_cancels.is_registered(&session.id));
@@ -1637,36 +1955,70 @@ mod tests {
     async fn queue_and_command_reads_preserve_each_legacy_args_value_without_hiding_other_rows() {
         let tmp = tempfile::tempdir().unwrap();
         let state = make_test_state(tmp.path());
-        state.store.insert_session("s", "/tmp", "now").unwrap();
         state
             .store
-            .enqueue_command("valid", "s", "exec prompt", "[\"hello\"]", "log")
+            .insert_session("ses_03c7c0ace395d80182db07ae2c30f034", "/tmp", "now")
+            .unwrap();
+        state
+            .store
+            .enqueue_command(
+                "cmd_9f7d0ee82b6a6ca7ddeae841f3253059",
+                "ses_03c7c0ace395d80182db07ae2c30f034",
+                "exec prompt",
+                "[\"hello\"]",
+                "log",
+            )
             .unwrap();
         for (id, raw, expected) in [
-            ("object", "{}", serde_json::json!({})),
-            ("number", "[1]", serde_json::json!([1])),
-            ("truncated", "{", serde_json::json!([])),
+            (
+                "cmd_00000000000000000000000000000001",
+                "{}",
+                serde_json::json!({}),
+            ),
+            (
+                "cmd_00000000000000000000000000000002",
+                "[1]",
+                serde_json::json!([1]),
+            ),
+            (
+                "cmd_00000000000000000000000000000003",
+                "{",
+                serde_json::json!([]),
+            ),
         ] {
             state
                 .store
-                .enqueue_command(id, "s", "exec prompt", raw, "log")
+                .enqueue_command(
+                    id,
+                    "ses_03c7c0ace395d80182db07ae2c30f034",
+                    "exec prompt",
+                    raw,
+                    "log",
+                )
                 .unwrap();
-            let response =
-                handle_get_session_queue(State(Arc::clone(&state)), AxumPath("s".into())).await;
+            let response = handle_get_session_queue(
+                State(Arc::clone(&state)),
+                AxumPath("ses_03c7c0ace395d80182db07ae2c30f034".into()),
+                Query(Default::default()),
+            )
+            .await;
             assert_eq!(response.status(), StatusCode::OK);
             let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
                 .await
                 .unwrap();
             let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-            let queued = body["queued"].as_array().unwrap();
+            let queued = body["items"].as_array().unwrap();
             assert_eq!(
                 queued.iter().find(|row| row["command_id"] == id).unwrap()["args"],
                 expected
             );
-            assert_eq!(queued[0]["command_id"], "valid");
+            assert_eq!(
+                queued[0]["command_id"],
+                "cmd_9f7d0ee82b6a6ca7ddeae841f3253059"
+            );
             let command = command_response(
                 &state,
-                Peer(None),
+                Peer(None, false),
                 state.store.get_command(id).unwrap().unwrap(),
                 None,
             )
@@ -1711,7 +2063,7 @@ mod tests {
         state
             .store
             .insert_session_full(crate::data::fs::api_db::NewSessionRow {
-                id: "s",
+                id: "ses_03c7c0ace395d80182db07ae2c30f034",
                 workdir: "/work",
                 created_at: &chrono::Utc::now().to_rfc3339(),
                 setup_status: SessionSetupStatus::Ready,
@@ -1721,11 +2073,17 @@ mod tests {
             .unwrap();
         state
             .store
-            .enqueue_command("c", "s", "exec prompt", "[]", "/unused")
+            .enqueue_command(
+                "cmd_4a8a08f09d37b73795649038408b5f33",
+                "ses_03c7c0ace395d80182db07ae2c30f034",
+                "exec prompt",
+                "[]",
+                "/unused",
+            )
             .unwrap();
         let response = handle_stream_command_logs(
             State(state),
-            AxumPath("c".into()),
+            AxumPath("cmd_4a8a08f09d37b73795649038408b5f33".into()),
             Query(CommandLogsQuery::default()),
             HeaderMap::new(),
             None,
@@ -1746,27 +2104,7 @@ mod tests {
 
     // Route table — assertion guard. Every entry here must be registered in
     // build_router; any divergence is a regression.
-    const EXPECTED_ROUTES: &[(&str, &str)] = &[
-        ("GET", "/v1/status"),
-        ("GET", "/v1/workdirs"),
-        ("GET", "/v1/sessions"),
-        ("POST", "/v1/sessions"),
-        ("GET", "/v1/sessions/{id}"),
-        ("DELETE", "/v1/sessions/{id}"),
-        ("GET", "/v1/sessions/{id}/status"),
-        ("GET", "/v1/sessions/{id}/queue"),
-        ("POST", "/v1/commands"),
-        ("GET", "/v1/commands"),
-        ("POST", "/v1/commands/{id}/cancel"),
-        ("POST", "/v1/runs"),
-        ("GET", "/v1/commands/{id}"),
-        ("GET", "/v1/commands/{id}/status"),
-        ("GET", "/v1/commands/{id}/logs"),
-        ("GET", "/v1/workflows/{command_id}"),
-        ("GET", "/v1/commands/{id}/workflow"),
-        ("GET", "/v1/commands/{id}/outputs"),
-        ("GET", "/v1/commands/{id}/outputs/{*path}"),
-    ];
+    const EXPECTED_ROUTES: &[RouteSpec] = ROUTES;
 
     fn make_test_state(tmp: &std::path::Path) -> Arc<AppState> {
         use crate::command::dispatch::Engines;
@@ -1803,7 +2141,6 @@ mod tests {
             workflow_state_store,
             credential_monitor: None,
             global_config: std::sync::Arc::new(Default::default()),
-            config_notices: Default::default(),
         };
         let lifecycle_store = crate::data::CommandLifecycleStore::open(Arc::clone(&store)).unwrap();
         let setup_cancels = Arc::new(crate::command::commands::api_server::TokenRegistry::new());
@@ -1814,6 +2151,8 @@ mod tests {
             Arc::clone(&setup_cancels),
         );
         Arc::new(AppState {
+            live_config: std::sync::RwLock::new(None),
+            settings_tx: None,
             lifecycle_store,
             setup_cancels,
             canceller,
@@ -1838,7 +2177,7 @@ mod tests {
         // Guard: if someone adds a route without updating this table, the count drifts.
         assert_eq!(
             EXPECTED_ROUTES.len(),
-            19,
+            34,
             "route count mismatch — update EXPECTED_ROUTES"
         );
     }
@@ -1872,9 +2211,9 @@ mod tests {
         // These only depend on server state, not on specific resource IDs.
         let unconditional_routes: &[(&str, &str)] = &[
             ("GET", "/v1/status"),
-            ("GET", "/v1/workdirs"),
-            ("GET", "/v1/sessions"),
-            ("GET", "/v1/commands"),
+            ("GET", "/v1/worker/workdirs"),
+            ("GET", "/v1/worker/sessions"),
+            ("GET", "/v1/worker/commands"),
         ];
 
         for (method, path) in unconditional_routes {
@@ -1912,14 +2251,46 @@ mod tests {
         // We assert they respond with something (connection succeeds and we get any HTTP response).
         let resource_routes: &[(&str, &str, u16)] = &[
             // (method, path, expected_status_for_missing_resource)
-            ("GET", "/v1/sessions/test-id", 404), // session not found
-            ("DELETE", "/v1/sessions/test-id", 404), // session not found
-            ("GET", "/v1/sessions/test-id/status", 404), // session not found
-            ("GET", "/v1/sessions/test-id/queue", 404), // session not found
-            ("GET", "/v1/commands/test-id", 404), // command not found
-            ("GET", "/v1/commands/test-id/status", 404), // command not found
-            ("GET", "/v1/commands/test-id/logs", 404), // command not found
-            ("POST", "/v1/commands/test-id/cancel", 404), // command not found
+            (
+                "GET",
+                "/v1/worker/sessions/cmd_361dc45aacd2d2a1961554d12a2d666b",
+                404,
+            ), // session not found
+            (
+                "DELETE",
+                "/v1/worker/sessions/cmd_361dc45aacd2d2a1961554d12a2d666b",
+                404,
+            ), // session not found
+            (
+                "GET",
+                "/v1/worker/sessions/cmd_361dc45aacd2d2a1961554d12a2d666b/status",
+                404,
+            ), // session not found
+            (
+                "GET",
+                "/v1/worker/sessions/cmd_361dc45aacd2d2a1961554d12a2d666b/queue",
+                404,
+            ), // session not found
+            (
+                "GET",
+                "/v1/worker/commands/cmd_361dc45aacd2d2a1961554d12a2d666b",
+                404,
+            ), // command not found
+            (
+                "GET",
+                "/v1/worker/commands/cmd_361dc45aacd2d2a1961554d12a2d666b/status",
+                404,
+            ), // command not found
+            (
+                "GET",
+                "/v1/worker/commands/cmd_361dc45aacd2d2a1961554d12a2d666b/events",
+                404,
+            ), // command not found
+            (
+                "POST",
+                "/v1/worker/commands/cmd_361dc45aacd2d2a1961554d12a2d666b/cancel",
+                404,
+            ), // command not found
             ("GET", "/v1/workflows/test-cmd", 404), // command not found
         ];
 
@@ -1946,38 +2317,38 @@ mod tests {
             );
         }
 
-        // POST /v1/sessions — check it responds (even with 400/422 for missing body).
+        // POST /v1/worker/sessions — check it responds (even with 400/422 for missing body).
         let resp = client
-            .post(format!("http://{addr}/v1/sessions"))
+            .post(format!("http://{addr}/v1/worker/sessions"))
             .send()
             .await
             .unwrap();
         assert_ne!(
             resp.status().as_u16(),
             404,
-            "POST /v1/sessions returned 404 — route may not be registered"
+            "POST /v1/worker/sessions returned 404 — route may not be registered"
         );
 
-        // POST /v1/commands — check it responds (even with 400 for missing headers).
+        // POST /v1/worker/commands — check it responds (even with 400 for missing headers).
         let resp = client
-            .post(format!("http://{addr}/v1/commands"))
+            .post(format!("http://{addr}/v1/worker/commands"))
             .send()
             .await
             .unwrap();
         assert_ne!(
             resp.status().as_u16(),
             404,
-            "POST /v1/commands returned 404 — route may not be registered"
+            "POST /v1/worker/commands returned 404 — route may not be registered"
         );
         let resp = client
-            .post(format!("http://{addr}/v1/runs"))
+            .post(format!("http://{addr}/v1/worker/runs"))
             .send()
             .await
             .unwrap();
         assert_ne!(
             resp.status().as_u16(),
             404,
-            "POST /v1/runs must be registered"
+            "POST /v1/worker/runs must be registered"
         );
     }
 
@@ -2082,5 +2453,342 @@ mod tests {
             401,
             "disabled auth must not block requests"
         );
+    }
+}
+
+fn page_response<T: Serialize>(items: Vec<T>, query: &crate::data::wire::ListQuery) -> Response {
+    match crate::command::daemon_api::core::page(items, query) {
+        Ok(page) => Json(page).into_response(),
+        Err(e) => ApiError::invalid_request(e.to_string()).into_response(),
+    }
+}
+fn squad_error(error: crate::command::daemon_api::squad::SquadError) -> Response {
+    use crate::command::daemon_api::squad::SquadError;
+    match error {
+        SquadError::TaskNotFound => ApiError::task_not_found("task not found"),
+        SquadError::RunNotFound => ApiError::run_not_found("run not found"),
+        SquadError::TaskExists => ApiError::task_exists("task already exists"),
+        SquadError::TaskPaused => {
+            ApiError::invalid_request("task is paused; resume it before starting a run")
+        }
+        SquadError::NoWorkflow => ApiError::no_workflow("no workflow for this task"),
+        SquadError::Command(e) => ApiError::from_command_error(&e),
+    }
+    .into_response()
+}
+#[derive(Default)]
+struct ResourceQuery {
+    name: Option<String>,
+    status: Option<String>,
+    page: crate::data::wire::ListQuery,
+}
+async fn resource_handler(
+    State(api): State<Arc<DaemonApi>>,
+    axum::Extension(op): axum::Extension<Operation>,
+    params: Option<AxumPath<HashMap<String, String>>>,
+    Query(pairs): Query<Vec<(String, String)>>,
+    body: axum::body::Bytes,
+) -> Response {
+    use crate::command::daemon_api::{core, squad};
+    use crate::data::ids::{GrantId, RunId, TaskId};
+    let mut query = ResourceQuery::default();
+    for (key, value) in pairs {
+        match key.as_str() {
+            "name" => query.name = Some(value),
+            "status" => query.status = Some(value),
+            "cursor" => query.page.cursor = Some(value),
+            "limit" => {
+                query.page.limit = match value.parse() {
+                    Ok(n) => Some(n),
+                    Err(_) => {
+                        return ApiError::invalid_request("limit must be an integer")
+                            .into_response()
+                    }
+                };
+            }
+            _ => {}
+        }
+    }
+    let params = params.map(|AxumPath(p)| p).unwrap_or_default();
+    let id = params.get("id").map(String::as_str).unwrap_or("");
+    macro_rules! command {
+        ($value:expr) => {
+            match $value {
+                Ok(v) => Json(v).into_response(),
+                Err(e) => ApiError::from_command_error(&e).into_response(),
+            }
+        };
+    }
+    macro_rules! sq {
+        ($value:expr) => {
+            match $value {
+                Ok(v) => Json(v).into_response(),
+                Err(e) => squad_error(e),
+            }
+        };
+    }
+    macro_rules! task_id {
+        () => {
+            match TaskId::parse(id) {
+                Ok(id) => id,
+                Err(_) => return ApiError::not_found("resource not found").into_response(),
+            }
+        };
+    }
+    macro_rules! decode {
+        ($ty:ty) => {
+            match serde_json::from_slice::<$ty>(&body) {
+                Ok(v) => v,
+                Err(error) => {
+                    return ApiError::invalid_request(format!("malformed resource request: {error}"))
+                        .into_response()
+                }
+            }
+        };
+    }
+    match op {
+        Operation::CoreStatus => command!(core::status(&api).await),
+        Operation::CoreConfigGet => Json(core::config_get(&api)).into_response(),
+        Operation::CoreConfigReload => match api.reload_config() {
+            Ok(v) => Json(v).into_response(),
+            Err(e) => ApiError::config_invalid("configuration validation failed")
+                .with_details(serde_json::json!({"errors":[e.to_string()]})),
+        },
+        Operation::CoreFeaturesList => match core::features_list(&api).await {
+            Ok(v) => page_response(v, &query.page),
+            Err(e) => ApiError::from_command_error(&e).into_response(),
+        },
+        Operation::CoreFeaturesGet => {
+            match Feature::ALL
+                .into_iter()
+                .find(|f| params.get("feature").is_some_and(|p| p == f.name()))
+            {
+                Some(f) => command!(core::feature(&api, f).await),
+                None => ApiError::not_found("feature not found").into_response(),
+            }
+        }
+        Operation::CoreGrantsList => match core::grants_list(&api) {
+            Ok(v) => page_response(v, &query.page),
+            Err(e) => ApiError::from_command_error(&e).into_response(),
+        },
+        Operation::CoreGrantsDelete => match GrantId::parse(id) {
+            Ok(id) => match core::grants_delete(&api, id) {
+                Ok(true) => StatusCode::NO_CONTENT.into_response(),
+                Ok(false) => ApiError::grant_not_found("grant not found").into_response(),
+                Err(e) => ApiError::from_command_error(&e).into_response(),
+            },
+            Err(_) => ApiError::not_found("resource not found").into_response(),
+        },
+        Operation::SquadTasksList => match squad::tasks_list(&api, query.name.as_deref()).await {
+            Ok(v) => keyed_response(
+                v.into_iter().map(squad::TaskResponse).collect(),
+                &query.page,
+                |v| v.0.id.as_str(),
+            ),
+            Err(e) => squad_error(e),
+        },
+        Operation::SquadTasksCreate => match squad::tasks_create(
+            &api,
+            decode!(crate::command::commands::squad::gateway::CreateTask),
+        )
+        .await
+        {
+            Ok(v) => (StatusCode::CREATED, Json(squad::TaskResponse(v))).into_response(),
+            Err(e) => squad_error(e),
+        },
+        Operation::SquadTasksGet => sq!(squad::tasks_get(&api, &task_id!())
+            .await
+            .map(squad::TaskResponse)),
+        Operation::SquadTasksUpdate => {
+            sq!(
+                squad::tasks_update(&api, &task_id!(), decode!(squad::TaskPatch))
+                    .await
+                    .map(squad::TaskResponse)
+            )
+        }
+        Operation::SquadTasksDelete => match squad::tasks_delete(&api, &task_id!()).await {
+            Ok(()) => StatusCode::NO_CONTENT.into_response(),
+            Err(e) => squad_error(e),
+        },
+        Operation::SquadTasksWorkflow => match squad::tasks_workflow(&api, &task_id!()).await {
+            Ok(v) => Json(super::workflow_view::client_view(
+                serde_json::to_value(v).expect("workflow serializes"),
+            ))
+            .into_response(),
+            Err(e) => squad_error(e),
+        },
+        Operation::SquadRunsCreate => match squad::runs_create(&api, &task_id!()).await {
+            Ok(v) => (StatusCode::ACCEPTED, Json(v)).into_response(),
+            Err(e) => squad_error(e),
+        },
+        Operation::SquadRunsList => {
+            if query.status.as_deref().is_some_and(|status| {
+                ![
+                    "running",
+                    "not_triggered",
+                    "workflow_executed",
+                    "failed",
+                    "interrupted",
+                    "canceled",
+                ]
+                .contains(&status)
+            }) {
+                return ApiError::invalid_request("invalid run status filter").into_response();
+            }
+            match squad::runs_list(&api, &task_id!(), query.status.as_deref()).await {
+                Ok(v) => keyed_response(
+                    v.into_iter().map(squad::RunResponse).collect(),
+                    &query.page,
+                    |v| v.0.id.as_str(),
+                ),
+                Err(e) => squad_error(e),
+            }
+        }
+        Operation::SquadRunsCancel => match RunId::parse(id) {
+            Ok(id) => sq!(squad::runs_cancel(&api, &id).await),
+            Err(_) => ApiError::not_found("resource not found").into_response(),
+        },
+        Operation::SquadEnvGet => command!(squad::env_get(&api).await),
+        Operation::SquadEnvPut => {
+            let push = match serde_json::from_slice::<
+                crate::command::commands::squad::gateway::EnvPush,
+            >(&body)
+            {
+                Ok(push) => push,
+                Err(_) => {
+                    tracing::warn!("squad: rejected a malformed daemon env push");
+                    return ApiError::invalid_request("malformed daemon env request")
+                        .into_response();
+                }
+            };
+            command!(squad::env_put(&api, push).await)
+        }
+        Operation::SquadEnvClear => command!(squad::env_clear(&api)
+            .await
+            .map(|cleared| serde_json::json!({"cleared":cleared}))),
+        _ => unreachable!("worker routes have typed worker handlers"),
+    }
+}
+
+fn parse_at(raw: &str) -> Result<chrono::DateTime<chrono::Utc>, chrono::ParseError> {
+    chrono::DateTime::parse_from_rfc3339(raw).map(|t| t.with_timezone(&chrono::Utc))
+}
+
+fn keyed_response<T: Serialize>(
+    items: Vec<T>,
+    query: &crate::data::wire::ListQuery,
+    key: impl Fn(&T) -> &str,
+) -> Response {
+    match crate::command::daemon_api::core::keyed_page(items, query, key) {
+        Ok(page) => Json(page).into_response(),
+        Err(e) => ApiError::invalid_request(e.to_string()).into_response(),
+    }
+}
+
+#[cfg(test)]
+mod wire_contract_tests {
+    use super::*;
+    fn round<T: Serialize + serde::de::DeserializeOwned>(value: serde_json::Value) {
+        let response: T = serde_json::from_value(value).unwrap();
+        let encoded = serde_json::to_value(response).unwrap();
+        let decoded: T = serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(encoded, serde_json::to_value(decoded).unwrap());
+        fn units(value: &serde_json::Value) {
+            match value {
+                serde_json::Value::Object(fields) => {
+                    for (k, v) in fields {
+                        assert!(!k.ends_with("_seconds") && !k.ends_with("_secs"), "{k}");
+                        if (k.ends_with("_ms") || k.ends_with("_bytes")) && !v.is_null() {
+                            assert!(v.is_u64(), "{k}: {v}");
+                        }
+                        if k.ends_with("_at") && !v.is_null() {
+                            let raw = v.as_str().unwrap();
+                            chrono::DateTime::parse_from_rfc3339(raw).unwrap();
+                            assert!(raw.ends_with('Z'), "{k}: {raw}");
+                        }
+                        units(v);
+                    }
+                }
+                serde_json::Value::Array(items) => {
+                    for item in items {
+                        units(item)
+                    }
+                }
+                _ => {}
+            }
+        }
+        units(&encoded);
+    }
+    #[test]
+    fn every_owned_response_round_trips_with_layer_zero_ids_and_time_units() {
+        let session = crate::data::ids::WorkerSessionId::new();
+        let command = crate::data::ids::CommandId::new();
+        let run = crate::data::ids::RunId::new();
+        let at = "2026-11-05T12:34:56.789Z";
+        round::<SessionResponse>(
+            serde_json::json!({"id":session,"workdir":"/repo","created_at":at,"closed_at":at,"status":"closed","session_type":"local","setup_status":"ready","push":false}),
+        );
+        round::<CommandResponse>(
+            serde_json::json!({"id":command,"attempt":1,"session_id":session,"subcommand":"exec prompt","args":[],"status":"done","labels":{},"started_at":at,"finished_at":at,"queued_at":at,"cancel_requested_at":at}),
+        );
+        round::<SessionClosingResponse>(
+            serde_json::json!({"session_id":session,"setup_status":"ready","status":"closing","running_command_id":command,"cancelled_count":1,"message":"closing"}),
+        );
+        round::<crate::command::daemon_api::core::StatusResponse>(
+            serde_json::json!({"status":"ok","version":"test","protocol":{"api":1},"capabilities":[],"features":{},"max_concurrent_jobs":2,"pid":1,"uptime_ms":1234,"listeners":[]}),
+        );
+        round::<crate::command::daemon_api::core::FeatureRecord>(
+            serde_json::json!({"name":"worker","state":"on","running":1,"queued":2}),
+        );
+        round::<crate::command::daemon_api::core::ReloadResponse>(
+            serde_json::json!({"applied":[],"restart_required":[]}),
+        );
+        round::<crate::command::daemon_api::core::ConfigResponse>(
+            serde_json::json!({"config":{},"sources":{}}),
+        );
+        round::<crate::command::daemon_api::squad::RunCreated>(serde_json::json!({"id":run}));
+        round::<crate::command::daemon_api::squad::RunResponse>(serde_json::json!({
+            "id":run,"task_id":crate::data::ids::TaskId::new(),"status":"running",
+            "workflow_path":null,"workflow_state_path":null,"session_id":session,
+            "started_at":at,"finished_at":at,"error":null
+        }));
+        round::<crate::command::daemon_api::worker::QueueRecord>(serde_json::json!({
+            "command_id":command,"subcommand":"exec prompt","args":[],"status":"done",
+            "queued_at":at,"started_at":at,"finished_at":at,"labels":{},"exit_code":0
+        }));
+        round::<crate::frontend::api::outputs::OutputEntry>(serde_json::json!({
+            "path":"result.json","size_bytes":512,"sha256":"fixture","modified_at":at
+        }));
+        round::<crate::command::daemon_api::worker::Workdir>(
+            serde_json::json!({"path":"/repo","kind":"allow"}),
+        );
+        round::<crate::command::daemon_api::squad::RunCanceled>(
+            serde_json::json!({"id":run,"status":"canceled"}),
+        );
+        round::<crate::command::daemon_api::squad::TaskResponse>(
+            serde_json::json!({"id":crate::data::ids::TaskId::new(),"name":"nightly","description":"fixture","repo_scope":"/repo","mount_scope":"directory","overlays":[],"interval_ms":60000,"status":"active","agent":null,"model":null,"backoff_until":null,"created_at":at,"updated_at":at,"last_run_at":null}),
+        );
+        round::<crate::command::daemon_api::core::GrantResponse>(
+            serde_json::json!({"id":crate::data::ids::GrantId::new(),"git_root":"/repo","remote_url":"https://example.com/repo","prerequisite":"ssh","grant":{"type":"ssh_dir"},"recorded_at":at}),
+        );
+        round::<crate::command::commands::squad::gateway::EnvCoverage>(
+            serde_json::json!({"salt":"fixture","persistence":"none","required":[]}),
+        );
+        round::<crate::command::commands::squad::gateway::EnvPushResponse>(
+            serde_json::json!({"accepted":[],"ignored":[],"coverage":{"salt":"fixture","persistence":"none","required":[]}}),
+        );
+    }
+    #[test]
+    fn central_capabilities_are_unique_and_cover_every_route() {
+        let c = crate::command::daemon_api::capabilities::CAPABILITIES;
+        assert_eq!(
+            c.len(),
+            c.iter().collect::<std::collections::HashSet<_>>().len()
+        );
+        for route in ROUTES {
+            if let Some(capability) = route.capability {
+                assert!(c.contains(&capability));
+            }
+        }
     }
 }

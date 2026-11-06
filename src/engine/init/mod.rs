@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::data::config::repo::RepoConfig;
+use crate::data::config::file::{repo_config_path, ConfigFile, FileKind};
 use crate::data::prompt::Prompt;
 use crate::data::session::{AgentName, Session};
 use crate::data::setup_step::{InitStep, SetupStep};
@@ -63,7 +63,7 @@ pub struct InitEngine {
     /// `unwrap_or_default`s swallowing a malformed file. It now loads once in
     /// `Preflight`, mutates this copy, and saves it — the saved file and the
     /// engine's view can no longer diverge.
-    repo_config: RepoConfig,
+    repo_config: ConfigFile,
     definition: Option<crate::engine::agent::ResolvedAgent>,
 }
 
@@ -87,7 +87,7 @@ impl InitEngine {
             summary: InitSummary::default(),
             pending_dockerfile_path: None,
             config_existed_at_start: false,
-            repo_config: RepoConfig::default(),
+            repo_config: ConfigFile::default(),
             definition: None,
         }
     }
@@ -100,28 +100,14 @@ impl InitEngine {
         &self.summary
     }
 
-    /// Save the run's repo config. A save also moves a legacy
-    /// `dynamicWorkflows` block (WI 0150 §4), so say so as soon as that write
-    /// lands: a later phase may still fail, and the move is already on disk.
+    /// Save the run's repo config.
     fn save_existing_repo_config(
         &mut self,
         git_root: &std::path::Path,
-        frontend: &mut dyn InitFrontend,
+        _frontend: &mut dyn InitFrontend,
     ) -> Result<(), EngineError> {
-        let mut adopted = self.repo_config.clone();
-        let moved = adopted.adopt_legacy_dynamic_workflows();
-        adopted.save(git_root)?;
-        self.repo_config = adopted;
-        if moved {
-            frontend.write_message(crate::data::message::UserMessage {
-                level: crate::data::message::MessageLevel::Info,
-                text: format!(
-                    "{}: {}",
-                    RepoConfig::path(git_root).display(),
-                    crate::data::config::repo::MOVED_LEGACY_DYNAMIC_WORKFLOWS_NOTICE
-                ),
-            });
-        }
+        self.repo_config
+            .save(&repo_config_path(git_root), FileKind::Repo)?;
         Ok(())
     }
 
@@ -146,14 +132,14 @@ impl InitEngine {
                 let _ = self.overlay_engine;
                 // Snapshot before creating .awman/ so we can tell whether
                 // config.json already existed when init began.
-                self.config_existed_at_start = RepoConfig::path(&git_root).exists();
+                self.config_existed_at_start = repo_config_path(&git_root).exists();
                 // One load for the whole run (F-31). A malformed file is
                 // reported here, where the user can still see which file and
                 // why, rather than being silently defaulted away five times.
                 self.repo_config = if self.config_existed_at_start {
-                    RepoConfig::load(&git_root)?
+                    ConfigFile::load(&repo_config_path(&git_root), FileKind::Repo)?
                 } else {
-                    RepoConfig::default()
+                    ConfigFile::default()
                 };
                 let awman_dir = git_root.join(".awman");
                 if let Err(e) = std::fs::create_dir_all(&awman_dir) {
@@ -221,7 +207,7 @@ impl InitEngine {
                 InitPhase::SettingUpDockerfile
             }
             InitPhase::SettingUpDockerfile => {
-                let dockerfile_path = self.repo_config.dockerfile_path_or_default(&git_root);
+                let dockerfile_path = dockerfile_path_or_default(&self.repo_config, &git_root);
                 if dockerfile_path.exists() {
                     self.summary.dockerfile = StepStatus::Done;
                     InitPhase::SettingUpAgentDockerfile
@@ -233,8 +219,9 @@ impl InitEngine {
                 use crate::engine::init::frontend::DockerfileSetupDecision;
                 let dockerfile_display = self
                     .repo_config
-                    .dockerfile
-                    .clone()
+                    .runtime
+                    .as_ref()
+                    .and_then(|r| r.dockerfile.clone())
                     .unwrap_or_else(|| "Dockerfile.dev".to_string());
                 match frontend.ask_dockerfile_setup(
                     &self.options.dockerfile_setup_prompt,
@@ -269,7 +256,12 @@ impl InitEngine {
                 }
             }
             InitPhase::SavingDockerfileConfig => {
-                self.repo_config.dockerfile = self.pending_dockerfile_path.take();
+                if let Some(dockerfile) = self.pending_dockerfile_path.take() {
+                    self.repo_config
+                        .runtime
+                        .get_or_insert_with(Default::default)
+                        .dockerfile = Some(dockerfile);
+                }
                 self.save_existing_repo_config(&git_root, frontend)?;
                 self.summary.dockerfile = StepStatus::Done;
                 InitPhase::SettingUpAgentDockerfile
@@ -310,14 +302,22 @@ impl InitEngine {
                 InitPhase::WritingConfig
             }
             InitPhase::WritingConfig => {
-                let config_path = RepoConfig::path(&git_root);
+                let config_path = repo_config_path(&git_root);
                 if !config_path.exists() {
-                    let cfg = RepoConfig {
-                        agent: Some(self.options.agent.as_str().to_string()),
-                        dockerfile: self.pending_dockerfile_path.take(),
+                    let cfg = ConfigFile {
+                        agents: Some(crate::data::config::AgentsConfig {
+                            default: Some(self.options.agent.as_str().to_string()),
+                            ..Default::default()
+                        }),
+                        runtime: self.pending_dockerfile_path.take().map(|dockerfile| {
+                            crate::data::config::RuntimeConfig {
+                                dockerfile: Some(dockerfile),
+                                ..Default::default()
+                            }
+                        }),
                         ..Default::default()
                     };
-                    cfg.save(&git_root)?;
+                    cfg.save(&config_path, FileKind::Repo)?;
                 } else {
                     frontend.write_message(crate::data::message::UserMessage {
                         level: crate::data::message::MessageLevel::Info,
@@ -353,7 +353,7 @@ impl InitEngine {
                     return Ok(InitPhase::AwaitingWorkItemsDecision);
                 }
 
-                let dockerfile_path = self.repo_config.dockerfile_path_or_default(&git_root);
+                let dockerfile_path = dockerfile_path_or_default(&self.repo_config, &git_root);
                 let tag = project_image_tag(&git_root);
                 frontend.report_step_status(&InitStep::BuildBaseImage.into(), StepStatus::Running);
                 let mut sink = |line: &str| {
@@ -527,7 +527,7 @@ impl InitEngine {
             // Issue 12: Post-audit image rebuild in init.
             InitPhase::RebuildingAfterAudit => {
                 if matches!(self.summary.audit, StepStatus::Done) {
-                    let dockerfile_path = self.repo_config.dockerfile_path_or_default(&git_root);
+                    let dockerfile_path = dockerfile_path_or_default(&self.repo_config, &git_root);
                     let paths = RepoDockerfilePaths::new(&git_root);
                     let tag = project_image_tag(&git_root);
                     frontend.report_step_status(
@@ -621,7 +621,7 @@ impl InitEngine {
                 } else {
                     let cfg = frontend.ask_work_items_setup()?;
                     if let Some(work_items) = cfg {
-                        self.repo_config.set_work_items_config(Some(work_items));
+                        self.repo_config.work_items = Some(work_items);
                         self.save_existing_repo_config(&git_root, frontend)?;
                         InitPhase::WritingWorkItemsConfig
                     } else {
@@ -657,12 +657,29 @@ impl InitEngine {
     }
 }
 
+/// `runtime.dockerfile` of a repo file resolved against `git_root`, else
+/// `<git_root>/Dockerfile.dev`.
+fn dockerfile_path_or_default(config: &ConfigFile, git_root: &std::path::Path) -> PathBuf {
+    let raw = config
+        .runtime
+        .as_ref()
+        .and_then(|r| r.dockerfile.as_deref())
+        .filter(|d| !d.is_empty())
+        .unwrap_or("Dockerfile.dev");
+    let path = std::path::Path::new(raw);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        git_root.join(path)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::data::config::repo::WorkItemsConfig;
+    use crate::data::config::work_items::WorkItemsConfig;
     use crate::data::message::{UserMessage, UserMessageSink};
     use crate::data::session::{SessionOpenOptions, StaticGitRootResolver};
     use crate::data::step_status::StepStatus;
@@ -914,7 +931,7 @@ mod tests {
         let summary = engine.run_to_completion(&mut frontend).await.unwrap();
         assert!(matches!(summary.config, StepStatus::Done));
         // Config file must exist after WritingConfig phase.
-        let config_path = crate::data::config::repo::RepoConfig::path(tmp.path());
+        let config_path = crate::data::config::repo_config_path(tmp.path());
         assert!(
             config_path.exists(),
             "WritingConfig phase must create the repo config file"
@@ -947,7 +964,7 @@ mod tests {
     async fn writing_work_items_config_persists_when_some() {
         let tmp = tempfile::tempdir().unwrap();
         let mut engine = make_engine(tmp.path());
-        let wi_cfg = crate::data::config::repo::WorkItemsConfig {
+        let wi_cfg = crate::data::config::work_items::WorkItemsConfig {
             dir: Some("my-work-items".to_string()),
             template: None,
         };
@@ -964,15 +981,15 @@ mod tests {
         let summary = engine.run_to_completion(&mut frontend).await.unwrap();
         assert!(matches!(summary.work_items_setup, StepStatus::Done));
         // Load the saved config and confirm work_items was persisted.
-        let saved = crate::data::config::repo::RepoConfig::load(tmp.path()).unwrap_or_default();
-        assert!(
-            saved.work_items.is_some(),
-            "work_items config must be persisted when user accepts"
-        );
-        assert_eq!(
-            saved.work_items.as_ref().and_then(|w| w.dir.as_deref()),
-            Some("my-work-items")
-        );
+        let saved = crate::data::config::ConfigFile::load(
+            &crate::data::config::repo_config_path(tmp.path()),
+            crate::data::config::FileKind::Repo,
+        )
+        .unwrap_or_default();
+        let Some(items) = &saved.work_items else {
+            panic!("workItems config must be persisted when user accepts");
+        };
+        assert_eq!(items.dir.as_deref(), Some("my-work-items"));
     }
 
     // ─── J.1: Conditional work-items setup ───────────────────────────────────
@@ -989,7 +1006,7 @@ mod tests {
         let mut frontend = FakeInitFrontend {
             replace_aspec: false, // aspec/ already exists — skip the prompt
             run_audit: false,
-            work_items_config: Some(crate::data::config::repo::WorkItemsConfig::default()),
+            work_items_config: Some(crate::data::config::work_items::WorkItemsConfig::default()),
             dockerfile_decision: crate::engine::init::frontend::DockerfileSetupDecision::CreateNew,
             phases: Vec::new(),
             messages: Vec::new(),
@@ -1007,14 +1024,19 @@ mod tests {
         let mut engine = make_engine(tmp.path());
 
         // Write a config that already has work_items set.
-        let existing_cfg = crate::data::config::repo::RepoConfig {
-            work_items: Some(crate::data::config::repo::WorkItemsConfig {
+        let existing_cfg = crate::data::config::ConfigFile {
+            work_items: Some(crate::data::config::work_items::WorkItemsConfig {
                 dir: Some("aspec/work-items".to_string()),
                 template: None,
             }),
             ..Default::default()
         };
-        existing_cfg.save(tmp.path()).unwrap();
+        existing_cfg
+            .save(
+                &crate::data::config::repo_config_path(tmp.path()),
+                crate::data::config::FileKind::Repo,
+            )
+            .unwrap();
 
         // Frontend would offer work_items config, but the engine must skip
         // when already configured. Because we don't pass aspec_exists=true
@@ -1031,7 +1053,7 @@ mod tests {
         let mut frontend = FakeInitFrontend {
             replace_aspec: false,
             run_audit: false,
-            work_items_config: Some(crate::data::config::repo::WorkItemsConfig::default()),
+            work_items_config: Some(crate::data::config::work_items::WorkItemsConfig::default()),
             dockerfile_decision: crate::engine::init::frontend::DockerfileSetupDecision::CreateNew,
             phases: Vec::new(),
             messages: Vec::new(),
@@ -1150,59 +1172,6 @@ mod tests {
         );
     }
 
-    /// Both saves of an existing config move a legacy `dynamicWorkflows`
-    /// block, and each run reports the move once, when the write lands.
-    #[tokio::test]
-    async fn saving_an_existing_legacy_config_reports_the_dynamic_workflows_move() {
-        let moved = |messages: &[String]| {
-            messages
-                .iter()
-                .filter(|m| m.contains("also moved `dynamicWorkflows`"))
-                .count()
-        };
-        // Dockerfile phase (`UseExisting`) and work-items phase (no aspec/).
-        let decisions = [
-            (
-                crate::engine::init::frontend::DockerfileSetupDecision::UseExisting(
-                    "docker/Dockerfile.custom".to_string(),
-                ),
-                None,
-            ),
-            (
-                crate::engine::init::frontend::DockerfileSetupDecision::Skip,
-                Some(WorkItemsConfig {
-                    dir: Some("items".to_string()),
-                    template: None,
-                }),
-            ),
-        ];
-        for (dockerfile_decision, work_items_config) in decisions {
-            let tmp = tempfile::tempdir().unwrap();
-            let path = crate::data::config::repo::RepoConfig::path(tmp.path());
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(
-                &path,
-                r#"{"agent":"claude","dynamicWorkflows":{"maxConcurrentSteps":2}}"#,
-            )
-            .unwrap();
-            let mut engine = make_engine(tmp.path());
-            let mut frontend = FakeInitFrontend {
-                replace_aspec: false,
-                run_audit: false,
-                work_items_config,
-                dockerfile_decision,
-                phases: Vec::new(),
-                messages: Vec::new(),
-            };
-            engine.run_to_completion(&mut frontend).await.unwrap();
-            assert_eq!(moved(&frontend.messages), 1, "{:?}", frontend.messages);
-            let saved: serde_json::Value =
-                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-            assert!(saved.get("dynamicWorkflows").is_none(), "{saved}");
-            assert_eq!(saved["workflows"]["dynamic"]["maxConcurrentSteps"], 2);
-        }
-    }
-
     #[tokio::test]
     async fn use_existing_path_persists_to_repo_config() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1220,14 +1189,21 @@ mod tests {
         };
         engine.run_to_completion(&mut frontend).await.unwrap();
 
-        let config = crate::data::config::repo::RepoConfig::load(tmp.path()).unwrap_or_default();
+        let config = crate::data::config::ConfigFile::load(
+            &crate::data::config::repo_config_path(tmp.path()),
+            crate::data::config::FileKind::Repo,
+        )
+        .unwrap_or_default();
         assert_eq!(
-            config.dockerfile.as_deref(),
+            config
+                .runtime
+                .as_ref()
+                .and_then(|r| r.dockerfile.as_deref()),
             Some("docker/Dockerfile.custom"),
-            "UseExisting path must be persisted to RepoConfig.dockerfile on disk"
+            "UseExisting path must be persisted to runtime.dockerfile on disk"
         );
         assert_eq!(
-            config.agent.as_deref(),
+            config.agents.as_ref().and_then(|a| a.default.as_deref()),
             Some("claude"),
             "UseExisting flow must not lose the agent field — \
              SavingDockerfileConfig and WritingConfig must coordinate so both fields persist"

@@ -87,7 +87,7 @@ workspace's `config.json` cannot define trusted prerequisite host commands.
 | `--workspace <default\|path>` | Bind the task to its durable default workspace, or to an existing custom folder/repository. If omitted, the default workspace is used. `--repo <path>` remains a legacy synonym for a custom workspace. |
 | `--overlay <spec>` | Add a `dir()`, `ssh()`, `env()`, or `skill()` overlay to every container for this task. Repeat the flag for multiple overlays; malformed syntax is rejected when the task is created. See [Overlays](08-overlays.md). |
 | `--interval <duration>` | How often the task is evaluated (default `6h`). |
-| `--agent <name>` / `--model <name>` | Override the agent/model used for this task's evaluations, taking priority over the global `squad` config (see [Configuring squad](#configuring-squad) below). |
+| `--agent <name>` / `--model <name>` | Override the agent/model used for this task's evaluations, taking priority over the global squad settings (`workflows.dynamic.*`) (see [Configuring squad](#configuring-squad) below). |
 | `--agent-models <agent>=<model>[,<model>…]` | Give this task its own pool of agents and models, written to its `config.json`. Repeat the flag for more agents. See [Choosing a task's agents and models](#choosing-a-tasks-agents-and-models). |
 | `--mount-scope <cwd\|gitroot>` | Only meaningful for a custom workspace that is a Git repository root, where both values name that same root (default `gitroot`). Captured once and never changed later. Every other workspace — the default durable workspace, a plain directory, or a subdirectory of a repository — is mounted directly, as given. |
 | `--prerequisite-identity <value>` | Set the task's commit identity policy: `host`, `deny`, or `Name <email>`. |
@@ -95,7 +95,7 @@ workspace's `config.json` cannot define trusted prerequisite host commands.
 | `--prerequisite-token <value>` | Set the GitHub token policy: `env:NAME`, `acquire` or `deny`. The daemon resolves an allowed source when a workflow needs it. |
 | `--prerequisite-unresolved <warn\|fail>` | Decide whether an unattended run continues with unresolved workflow requirements or fails before workflow execution. |
 | `--interview` | Collect the task fields through the interactive interview, including the multiline description, workspace choice, and overlays. Needs a terminal: through a pipe, each question fails with "interactive input unavailable" rather than choosing an answer for you. |
-| `-n, --non-interactive` | Never prompt: refuse anything that would need a confirmation instead of asking. Cannot be combined with `--interview`. |
+| `-n, --headless` | Never prompt: refuse anything that would need a confirmation instead of asking. Cannot be combined with `--interview`. |
 
 Task names are lowercase slugs: letters `a`–`z`, digits `0`–`9`, and
 hyphens, starting and ending with a letter or digit. A name with uppercase
@@ -140,10 +140,10 @@ awman squad edit issue-triage \
 | `--overlay <spec>` | Replace the task's overlay list. Repeat the flag for several; the given set replaces the stored one rather than adding to it. |
 | `--clear-overlays` | Remove every overlay from the task. |
 | `--agent-models <agent>=<model>[,<model>…]` | Replace the task's agent pool. Repeat the flag for more agents. |
-| `--clear-agent-models` | Remove the task's own agent pool, so it inherits the global `squad` settings again. |
+| `--clear-agent-models` | Remove the task's own agent pool, so it inherits the global squad settings again. |
 | `--prerequisite-identity <value>` / `--prerequisite-ssh <value>` / `--prerequisite-token <value>` / `--prerequisite-unresolved <warn\|fail>` | Change the task's workflow prerequisite policy. Each credential flag changes only that credential's task policy. |
 | `--interview` | Collect the fields interactively, each prefilled with the task's current value. |
-| `-n, --non-interactive` | Never prompt. Cannot be combined with `--interview`. |
+| `-n, --headless` | Never prompt. Cannot be combined with `--interview`. |
 
 **A task's name, workspace, and mount scope cannot be edited.** They are captured
 once when the task is created and define its identity, its data directory, its
@@ -215,22 +215,24 @@ inside a task's detail modal, after a `[y]es / [n]o` confirmation.
 
 ### Choosing a task's agents and models
 
-By default a task uses whatever agents and models the global `squad` block
-allows. A task can instead carry its own pool, stored in its own config file:
+By default a task uses whatever agents and models the global
+`workflows.dynamic.agentsToModels` setting allows. A task can instead carry its own pool, stored in its own config file:
 
 ```text
-~/.awman/squad/tasks/<name>/config.json
+<AWMAN_HOME>/squad/tasks/<name>/config.json
 ```
 
-That file has the same shape as every other awman config file, and only its
-`squad` block matters:
+That file has the same shape as every other awman config file, and holds
+task-scope keys only (see [Configuration](07-configuration.md#per-task-squad-settings)):
 
 ```json
 {
-  "squad": {
-    "agentsToModels": {
-      "claude": ["claude-opus-4-8", "claude-sonnet-4-6"],
-      "codex": ["gpt-5"]
+  "workflows": {
+    "dynamic": {
+      "agentsToModels": {
+        "claude": ["claude-opus-4-8", "claude-sonnet-4-6"],
+        "codex": ["gpt-5"]
+      }
     }
   }
 }
@@ -247,15 +249,15 @@ awman squad add --name issue-triage --description "…" \
 
 …or answer the questions in the interactive interview, which asks:
 
-1. **Whether to use the global squad settings** — only when a global `squad`
-   block exists. Answering yes writes no task config and the task inherits that
-   block, exactly as tasks did before per-task configs existed.
+1. **Whether to use the global squad settings** — only when the global config defines squad agents and models.
+   Answering yes writes no task config and the task inherits those
+   settings, exactly as tasks did before per-task configs existed.
 2. **Extra models for the leader agent** — one at a time, blank to finish.
 3. **Extra agents this task may use**, each followed by its own models.
 
 Answering "no more" to everything writes no file at all.
 
-Fields the task file omits are inherited from the global block, so a task can
+Keys the task file omits are inherited from the repo and global files, so a task can
 narrow its agent pool while keeping the standing `guidance` every task gets; see
 [Configuration: Per-task squad settings](07-configuration.md#per-task-squad-settings).
 
@@ -503,7 +505,7 @@ If nothing was stored to begin with, that line instead reads
 
 ### Persisting values across a restart
 
-By default (`squad.envPersistence: "keychain"` — see [Configuration: Squad
+By default (`daemon.features.squad.envPersistence` is `keychain` — see [Configuration: Squad
 daemon configuration](07-configuration.md#squad-daemon-configuration)), squad
 stores the values it holds for `env()` names in the OS keychain, so a daemon
 the OS restarts on your behalf — launchd at login, systemd after a crash —
@@ -521,7 +523,7 @@ awman-squad -a daemon-env -w` (macOS) or `secret-tool lookup service
 awman-squad account daemon-env` (Linux), with no prompt. That unprompted read
 is exactly what lets the daemon come back armed without asking you for
 anything at login. If that trade isn't one you want on a particular machine,
-set `squad.envPersistence` to `"none"` there.
+set `daemon.features.squad.envPersistence` to `none` there.
 
 Only names some task actually declares are ever requested, held, or stored.
 A daemon with no tasks requires nothing, transmits nothing, and persists
@@ -538,7 +540,7 @@ working exactly as it did before persistence existed, and every regular
 `awman squad` command still resupplies the daemon as described above — the
 only thing lost is a value surviving an OS-initiated restart. If you'd rather
 never see the fallback and never have anything persisted, set
-`squad.envPersistence` to `"none"` explicitly; an explicit `"none"` is never
+`daemon.features.squad.envPersistence` to `none` explicitly; an explicit `none` is never
 warned about.
 
 To remove a stored item, `awman clean` is the recommended route: it
@@ -922,29 +924,32 @@ guardrails to every run rather than leaving them optional:
 
 ## Configuring squad
 
-An optional `squad` block in the **global** config
-(`~/.awman/config.json`) sets which agents and models your squad may use, and
-the standing instructions every task evaluation must follow:
+Squad has no settings block of its own. In the **global** config
+(`~/.awman/config.json`), the `workflows.dynamic` keys set which agents and
+models your squad may use and the standing instructions every task evaluation
+must follow, and `daemon.features.squad` tunes the daemon:
 
 ```json
 {
-  "squad": {
-    "agentsToModels": {
-      "claude": ["claude-opus-4-8", "claude-sonnet-4-6"]
-    },
-    "maxConcurrentEvaluations": 2,
-    "defaultLeader": "claude::claude-opus-4-8",
-    "guidance": ["Keep automated changes focused."]
-  }
+  "workflows": {
+    "dynamic": {
+      "agentsToModels": {
+        "claude": ["claude-opus-4-8", "claude-sonnet-4-6"]
+      },
+      "defaultLeader": "claude::claude-opus-4-8",
+      "guidance": ["Keep automated changes focused."]
+    }
+  },
+  "daemon": { "features": { "squad": { "maxConcurrentEvaluations": 2 } } }
 }
 ```
 
 | Key | Meaning |
 |-----|---------|
-| `agentsToModels` | The agents and models squad is allowed to schedule. A task's own `--agent`/`--model` override still wins if set; this is the default pool, not a hard allowlist against per-task overrides. |
-| `maxConcurrentEvaluations` | How many task evaluations can run at once across the whole daemon. |
-| `defaultLeader` | The `agent::model` used for a task's evaluation when the task doesn't specify its own. |
-| `guidance` | Standing instructions applied to **every** task evaluation and every workflow it generates — the same mechanism as [dynamic workflow guidance](06-dynamic-workflows.md#guidance), injected as a bulleted "Developer Guidance" block in the agent's prompt. |
+| `workflows.dynamic.agentsToModels` | The agents and models squad is allowed to schedule. A task's own `--agent`/`--model` override still wins if set; this is the default pool, not a hard allowlist against per-task overrides. |
+| `daemon.features.squad.maxConcurrentEvaluations` | How many task evaluations can run at once across the whole daemon. |
+| `workflows.dynamic.defaultLeader` | The `agent::model` used for a task's evaluation when the task doesn't specify its own. |
+| `workflows.dynamic.guidance` | Standing instructions applied to **every** task evaluation and every workflow it generates — the same mechanism as [dynamic workflow guidance](06-dynamic-workflows.md#guidance), injected as a bulleted "Developer Guidance" block in the agent's prompt. |
 
 This is all global rather than per-repo, because your squad watches
 tasks across every repo you point it at. Editing this block takes
@@ -979,7 +984,8 @@ awman squad start
 
 # Currently running squad, want to use awman api instead
 awman squad stop
-awman api start --port 9876 --workdirs /path/to/repo
+awman config set daemon.features.worker.push.workDirs.allow /path/to/repo --global
+awman api start
 ```
 
 Any squad CLI command or TUI entry point that needs the daemon (bare

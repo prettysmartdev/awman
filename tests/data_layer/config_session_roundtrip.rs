@@ -1,11 +1,11 @@
 //! Layer 0 config + session cross-module integration tests.
 //!
-//! Validates that Session::open, EffectiveConfig, RepoConfig, GlobalConfig,
-//! and FlagConfig interact correctly across the module boundaries.
+//! Validates that Session::open, EffectiveConfig, ConfigFile and FlagConfig interact correctly across the module boundaries.
 
+use awman::data::config::file::{
+    global_config_path, repo_config_path, ConfigFile, FileKind, REPO_CONFIG_SUBDIR,
+};
 use awman::data::config::flags::FlagConfig;
-use awman::data::config::global::GlobalConfig;
-use awman::data::config::repo::{RepoConfig, REPO_CONFIG_SUBDIR};
 use awman::data::error::DataError;
 use awman::data::session::{AgentName, Session, SessionLogKind, SessionOpenOptions};
 use awman::data::worktree_paths::{worktree_branch_name, worktree_branch_name_for_workflow};
@@ -71,14 +71,14 @@ fn session_open_propagates_git_root_not_found_without_fallback() {
     assert!(matches!(err, DataError::GitRootNotFound { .. }));
 }
 
-// ─── RepoConfig load / save round-trip ───────────────────────────────────────
+// ─── Repo config file load / save round-trip ───────────────────────────────────────
 
 #[test]
 fn repo_config_missing_file_returns_defaults() {
     let env = IsolatedEnv::new();
     // No config file written — should return defaults.
-    let cfg = RepoConfig::load(env.git_root.path()).unwrap();
-    assert_eq!(cfg, RepoConfig::default());
+    let cfg = ConfigFile::load(&repo_config_path(env.git_root.path()), FileKind::Repo).unwrap();
+    assert_eq!(cfg, ConfigFile::default());
 }
 
 #[test]
@@ -88,13 +88,13 @@ fn repo_config_present_file_is_loaded() {
     std::fs::create_dir_all(&awman_dir).unwrap();
     std::fs::write(
         awman_dir.join("config.json"),
-        r#"{"agent":"codex","terminal_scrollback_lines":5000}"#,
+        r#"{"agents":{"default":"codex"},"tui":{"scrollbackLines":5000}}"#,
     )
     .unwrap();
 
-    let cfg = RepoConfig::load(env.git_root.path()).unwrap();
-    assert_eq!(cfg.agent.as_deref(), Some("codex"));
-    assert_eq!(cfg.terminal_scrollback_lines, Some(5000));
+    let cfg = ConfigFile::load(&repo_config_path(env.git_root.path()), FileKind::Repo).unwrap();
+    assert_eq!(cfg.agents.unwrap().default.as_deref(), Some("codex"));
+    assert_eq!(cfg.tui.unwrap().scrollback_lines, Some(5000));
 }
 
 #[test]
@@ -104,7 +104,7 @@ fn repo_config_malformed_json_returns_error() {
     std::fs::create_dir_all(&awman_dir).unwrap();
     std::fs::write(awman_dir.join("config.json"), b"{ not valid json }").unwrap();
 
-    let err = RepoConfig::load(env.git_root.path()).unwrap_err();
+    let err = ConfigFile::load(&repo_config_path(env.git_root.path()), FileKind::Repo).unwrap_err();
     assert!(matches!(err, DataError::ConfigParse { .. }));
 }
 
@@ -114,26 +114,26 @@ fn repo_config_save_and_reload_roundtrip() {
     let awman_dir = env.git_root.path().join(REPO_CONFIG_SUBDIR);
     std::fs::create_dir_all(&awman_dir).unwrap();
 
-    let cfg = RepoConfig {
-        agent: Some("maki".to_string()),
-        terminal_scrollback_lines: Some(9999),
-        ..Default::default()
-    };
+    let cfg = ConfigFile::from_value(
+        serde_json::json!({"agents": {"default": "maki"}, "tui": {"scrollbackLines": 9999}}),
+        FileKind::Repo,
+    )
+    .unwrap();
+    let path = repo_config_path(env.git_root.path());
+    cfg.save(&path, FileKind::Repo).unwrap();
 
-    cfg.save(env.git_root.path()).unwrap();
-
-    let loaded = RepoConfig::load(env.git_root.path()).unwrap();
-    assert_eq!(loaded.agent.as_deref(), Some("maki"));
-    assert_eq!(loaded.terminal_scrollback_lines, Some(9999));
+    let loaded = ConfigFile::load(&repo_config_path(env.git_root.path()), FileKind::Repo).unwrap();
+    assert_eq!(loaded, cfg);
 }
 
-// ─── GlobalConfig load / save round-trip ─────────────────────────────────────
+// ─── Global config file load / save round-trip ─────────────────────────────────────
 
 #[test]
 fn global_config_missing_file_returns_defaults() {
     let env = IsolatedEnv::new();
-    let cfg = GlobalConfig::load_with(&env.env()).unwrap();
-    assert_eq!(cfg, GlobalConfig::default());
+    let path = global_config_path(&env.env()).unwrap();
+    let cfg = ConfigFile::load(&path, FileKind::Global).unwrap();
+    assert_eq!(cfg, ConfigFile::default());
 }
 
 #[test]
@@ -142,17 +142,14 @@ fn global_config_save_and_reload_roundtrip() {
     // Ensure the home directory exists.
     std::fs::create_dir_all(env.home_dir.path()).unwrap();
 
-    let cfg = GlobalConfig {
-        default_agent: Some("opencode".to_string()),
-        terminal_scrollback_lines: Some(3000),
-        ..Default::default()
-    };
-
-    cfg.save_with(&env.env()).unwrap();
-
-    let loaded = GlobalConfig::load_with(&env.env()).unwrap();
-    assert_eq!(loaded.default_agent.as_deref(), Some("opencode"));
-    assert_eq!(loaded.terminal_scrollback_lines, Some(3000));
+    let cfg = ConfigFile::from_value(
+        serde_json::json!({"agents": {"default": "opencode"}, "tui": {"scrollbackLines": 3000}}),
+        FileKind::Global,
+    )
+    .unwrap();
+    let path = global_config_path(&env.env()).unwrap();
+    cfg.save(&path, FileKind::Global).unwrap();
+    assert_eq!(ConfigFile::load(&path, FileKind::Global).unwrap(), cfg);
 }
 
 // ─── EffectiveConfig merge precedence ────────────────────────────────────────
@@ -163,11 +160,15 @@ fn effective_config_flag_agent_wins_over_repo_and_global() {
 
     let awman_dir = env.git_root.path().join(REPO_CONFIG_SUBDIR);
     std::fs::create_dir_all(&awman_dir).unwrap();
-    std::fs::write(awman_dir.join("config.json"), r#"{"agent":"repo-agent"}"#).unwrap();
+    std::fs::write(
+        awman_dir.join("config.json"),
+        r#"{"agents":{"default":"repo-agent"}}"#,
+    )
+    .unwrap();
     std::fs::create_dir_all(env.home_dir.path()).unwrap();
     std::fs::write(
         env.home_dir.path().join("config.json"),
-        r#"{"default_agent":"global-agent"}"#,
+        r#"{"agents":{"default":"global-agent"}}"#,
     )
     .unwrap();
 
@@ -190,11 +191,15 @@ fn effective_config_repo_agent_wins_over_global() {
 
     let awman_dir = env.git_root.path().join(REPO_CONFIG_SUBDIR);
     std::fs::create_dir_all(&awman_dir).unwrap();
-    std::fs::write(awman_dir.join("config.json"), r#"{"agent":"repo-agent"}"#).unwrap();
+    std::fs::write(
+        awman_dir.join("config.json"),
+        r#"{"agents":{"default":"repo-agent"}}"#,
+    )
+    .unwrap();
     std::fs::create_dir_all(env.home_dir.path()).unwrap();
     std::fs::write(
         env.home_dir.path().join("config.json"),
-        r#"{"default_agent":"global-agent"}"#,
+        r#"{"agents":{"default":"global-agent"}}"#,
     )
     .unwrap();
 
@@ -211,7 +216,7 @@ fn effective_config_global_agent_used_when_repo_absent() {
     std::fs::create_dir_all(env.home_dir.path()).unwrap();
     std::fs::write(
         env.home_dir.path().join("config.json"),
-        r#"{"default_agent":"global-agent"}"#,
+        r#"{"agents":{"default":"global-agent"}}"#,
     )
     .unwrap();
 
@@ -230,13 +235,13 @@ fn effective_config_scrollback_repo_wins_over_global() {
     std::fs::create_dir_all(&awman_dir).unwrap();
     std::fs::write(
         awman_dir.join("config.json"),
-        r#"{"terminal_scrollback_lines":7777}"#,
+        r#"{"tui":{"scrollbackLines":7777}}"#,
     )
     .unwrap();
     std::fs::create_dir_all(env.home_dir.path()).unwrap();
     std::fs::write(
         env.home_dir.path().join("config.json"),
-        r#"{"terminal_scrollback_lines":2000}"#,
+        r#"{"tui":{"scrollbackLines":2000}}"#,
     )
     .unwrap();
 

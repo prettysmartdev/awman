@@ -17,7 +17,7 @@
 use std::time::Duration;
 
 use crate::data::config::env::DaemonEnvMap;
-use crate::data::config::repo::SquadConfig;
+use crate::data::config::squad::SquadConfig;
 use crate::data::error::DataError;
 use crate::data::fs::daemon_env::{
     call_with_cap, encode_go_keyring_payload, DaemonEnvStore, EnvPersistenceSetting,

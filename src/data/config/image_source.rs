@@ -31,9 +31,8 @@ pub enum ImageSourceSpec {
     },
     /// Export from a Docker Engine over its API. `host` accepts `unix://`,
     /// `tcp://` and `npipe://`; `None` means the platform's default socket.
-    /// `reference` defaults to the awman image tag. Spelled `docker-local`;
-    /// the earlier `docker-store` spelling is still accepted.
-    #[serde(rename = "docker-local", alias = "docker-store")]
+    /// `reference` defaults to the awman image tag. Spelled `docker-local`.
+    #[serde(rename = "docker-local")]
     DockerStore {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         host: Option<String>,
@@ -43,9 +42,8 @@ pub enum ImageSourceSpec {
         reference: Option<String>,
     },
     /// Export from the local Apple Containers image store (macOS only).
-    /// Spelled `apple-local`; the earlier `apple-store` spelling is still
-    /// accepted.
-    #[serde(rename = "apple-local", alias = "apple-store")]
+    /// Spelled `apple-local`.
+    #[serde(rename = "apple-local")]
     AppleStore {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reference: Option<String>,
@@ -278,12 +276,15 @@ mod tests {
     }
 
     #[test]
-    fn apple_local_is_the_spelling_and_apple_store_still_parses() {
-        let old: ImageSourceSpec =
-            serde_json::from_str(r#"{"type":"apple-store","reference":"a:1"}"#).unwrap();
+    fn apple_local_is_the_only_config_spelling_but_kind_records_still_parse() {
+        // Config input has no legacy aliases.
+        let err =
+            serde_json::from_str::<ImageSourceSpec>(r#"{"type":"apple-store","reference":"a:1"}"#)
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("apple-local"), "{err}");
         let new: ImageSourceSpec =
             serde_json::from_str(r#"{"type":"apple-local","reference":"a:1"}"#).unwrap();
-        assert_eq!(old, new);
         assert_eq!(
             serde_json::to_value(&new).unwrap(),
             serde_json::json!({"type": "apple-local", "reference": "a:1"})
@@ -295,12 +296,13 @@ mod tests {
     }
 
     #[test]
-    fn docker_legacy_spec_and_kind_parse_but_serialize_and_display_canonically() {
-        let old: ImageSourceSpec =
-            serde_json::from_str(r#"{"type":"docker-store","host":"unix:///var/run/docker.sock"}"#)
-                .unwrap();
-        assert_eq!(old.kind(), ImageSourceKind::DockerStore);
-        assert_eq!(serde_json::to_value(old).unwrap()["type"], "docker-local");
+    fn docker_legacy_kind_parses_but_the_config_spec_rejects_it() {
+        let err = serde_json::from_str::<ImageSourceSpec>(
+            r#"{"type":"docker-store","host":"unix:///var/run/docker.sock"}"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("docker-local"), "{err}");
         let kind: ImageSourceKind = serde_json::from_str(r#""docker-store""#).unwrap();
         assert_eq!(kind.to_string(), "docker-local");
         assert_eq!(serde_json::to_string(&kind).unwrap(), r#""docker-local""#);

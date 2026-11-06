@@ -130,7 +130,7 @@ async fn attach_to_foreign_container_streams_output_and_exit_does_not_stop_it() 
     // interactive shell — the process attach must reach directly.
     let status = Command::new(awman::engine::host_cli::program("docker"))
         .args([
-            "run",
+            "cmd_a53108f7543b75adbb34afc035d4cdf6",
             "-dit",
             "--name",
             &name,

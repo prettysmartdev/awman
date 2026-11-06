@@ -63,7 +63,6 @@ fn app_state(root: &std::path::Path) -> Arc<AppState> {
         overlay_engine,
         auth_engine,
         agent_engine,
-        config_notices: Default::default(),
         workflow_state_store: Arc::new(WorkflowStateStore::at_git_root(paths.root())),
         credential_monitor: None,
         global_config: Arc::new(Default::default()),
@@ -78,6 +77,8 @@ fn app_state(root: &std::path::Path) -> Arc<AppState> {
         Arc::clone(&setup_cancels),
     );
     Arc::new(AppState {
+        live_config: std::sync::RwLock::new(None),
+        settings_tx: None,
         lifecycle_store,
         setup_cancels,
         canceller,
@@ -111,22 +112,37 @@ async fn serve_router(state: Arc<AppState>) -> (std::net::SocketAddr, tokio::tas
 fn command_workflow_state_write_is_atomic_and_leaves_no_temp_file() {
     let tmp = tempfile::tempdir().unwrap();
     let paths = ApiPaths::from_root(tmp.path());
-    let command_dir = paths.command_dir("s", "c");
+    let command_dir = paths.command_dir(
+        "ses_03c7c0ace395d80182db07ae2c30f034",
+        "cmd_4a8a08f09d37b73795649038408b5f33",
+    );
     std::fs::create_dir_all(&command_dir).unwrap();
     let mut state = sample_state();
     state.workflow_hash = "a".repeat(512 * 1024);
     paths
-        .write_command_workflow_state("s", "c", &state)
+        .write_command_workflow_state(
+            "ses_03c7c0ace395d80182db07ae2c30f034",
+            "cmd_4a8a08f09d37b73795649038408b5f33",
+            &state,
+        )
         .unwrap();
 
     // An open reader must retain the old complete document after replacement.
     // A truncate-and-write implementation fails this deterministically.
     use std::io::Read;
-    let mut old_file = std::fs::File::open(paths.command_workflow_state_path("s", "c")).unwrap();
+    let mut old_file = std::fs::File::open(paths.command_workflow_state_path(
+        "ses_03c7c0ace395d80182db07ae2c30f034",
+        "cmd_4a8a08f09d37b73795649038408b5f33",
+    ))
+    .unwrap();
     let old_state = state.clone();
     state.workflow_hash = "b".repeat(512 * 1024);
     paths
-        .write_command_workflow_state("s", "c", &state)
+        .write_command_workflow_state(
+            "ses_03c7c0ace395d80182db07ae2c30f034",
+            "cmd_4a8a08f09d37b73795649038408b5f33",
+            &state,
+        )
         .unwrap();
     let mut old_bytes = String::new();
     old_file.read_to_string(&mut old_bytes).unwrap();
@@ -139,7 +155,10 @@ fn command_workflow_state_write_is_atomic_and_leaves_no_temp_file() {
     let reader_done = done.clone();
     let barrier = Arc::new(std::sync::Barrier::new(2));
     let reader_barrier = barrier.clone();
-    let path = paths.command_workflow_state_path("s", "c");
+    let path = paths.command_workflow_state_path(
+        "ses_03c7c0ace395d80182db07ae2c30f034",
+        "cmd_4a8a08f09d37b73795649038408b5f33",
+    );
     let reader = std::thread::spawn(move || {
         let bytes = std::fs::read(&path).unwrap();
         let parsed: WorkflowState =
@@ -160,12 +179,21 @@ fn command_workflow_state_write_is_atomic_and_leaves_no_temp_file() {
     for ch in ['b', 'c', 'd', 'e'] {
         state.workflow_hash = std::iter::repeat_n(ch, 512 * 1024).collect();
         paths
-            .write_command_workflow_state("s", "c", &state)
+            .write_command_workflow_state(
+                "ses_03c7c0ace395d80182db07ae2c30f034",
+                "cmd_4a8a08f09d37b73795649038408b5f33",
+                &state,
+            )
             .unwrap();
     }
     done.store(true, std::sync::atomic::Ordering::Release);
     assert!(reader.join().unwrap() > 0);
-    assert!(paths.command_workflow_state_path("s", "c").exists());
+    assert!(paths
+        .command_workflow_state_path(
+            "ses_03c7c0ace395d80182db07ae2c30f034",
+            "cmd_4a8a08f09d37b73795649038408b5f33"
+        )
+        .exists());
     assert!(!command_dir.join("workflow.state.json.tmp").exists());
 }
 
@@ -184,9 +212,9 @@ fn step_and_phase_status_wire_shapes_are_externally_tagged() {
         (
             StepState::Failed {
                 exit_code: 1,
-                error_message: Some("bad".into()),
+                error_message: Some("cmd_bae60998ffe4923b131e3d6e4c19993e".into()),
             },
-            serde_json::json!({"Failed":{"exit_code":1,"error_message":"bad"}}),
+            serde_json::json!({"Failed":{"exit_code":1,"error_message":"cmd_bae60998ffe4923b131e3d6e4c19993e"}}),
         ),
     ] {
         assert_eq!(serde_json::to_value(status).unwrap(), expected);
@@ -215,10 +243,10 @@ fn step_and_phase_status_wire_shapes_are_externally_tagged() {
     );
     assert_eq!(
         serde_json::to_value(PhaseStepStatus::Failed {
-            error: "bad".into()
+            error: "cmd_bae60998ffe4923b131e3d6e4c19993e".into()
         })
         .unwrap(),
-        serde_json::json!({"Failed":{"error":"bad"}})
+        serde_json::json!({"Failed":{"error":"cmd_bae60998ffe4923b131e3d6e4c19993e"}})
     );
 }
 
@@ -228,7 +256,7 @@ async fn status_advertises_workflow_state_feature_and_queued_exec_says_not_start
     let app = app_state(tmp.path());
     app.store
         .insert_session_full(NewSessionRow {
-            id: "session",
+            id: "ses_21d6f40cfb511982e4424e0e250a9557",
             workdir: "/work",
             created_at: &chrono::Utc::now().to_rfc3339(),
             setup_status: SessionSetupStatus::Ready,
@@ -237,13 +265,31 @@ async fn status_advertises_workflow_state_feature_and_queued_exec_says_not_start
         })
         .unwrap();
     app.store
-        .enqueue_command("queued-exec", "session", "exec workflow", "[]", "/l")
+        .enqueue_command(
+            "cmd_949d96fc27ab48b86a4eca1769c16e5f",
+            "ses_21d6f40cfb511982e4424e0e250a9557",
+            "exec workflow",
+            "[]",
+            "/l",
+        )
         .unwrap();
     app.store
-        .enqueue_command("queued-prompt", "session", "exec prompt", "[]", "/l")
+        .enqueue_command(
+            "cmd_4a37707dfec4abdbeb78d6d8a6dcdc87",
+            "ses_21d6f40cfb511982e4424e0e250a9557",
+            "exec prompt",
+            "[]",
+            "/l",
+        )
         .unwrap();
     app.store
-        .enqueue_command("alias", "session", "exec wf", "[]", "/l")
+        .enqueue_command(
+            "cmd_724874d1be77f450a09b305fc1534afb",
+            "ses_21d6f40cfb511982e4424e0e250a9557",
+            "exec wf",
+            "[]",
+            "/l",
+        )
         .unwrap();
     for status in [
         CommandStatus::Done,
@@ -251,24 +297,41 @@ async fn status_advertises_workflow_state_feature_and_queued_exec_says_not_start
         CommandStatus::Cancelled,
     ] {
         app.store
-            .enqueue_command(status.as_str(), "session", "exec workflow", "[]", "/l")
+            .enqueue_command(
+                &crate::test_command_id(status.as_str()),
+                "ses_21d6f40cfb511982e4424e0e250a9557",
+                "exec workflow",
+                "[]",
+                "/l",
+            )
             .unwrap();
         app.store
-            .update_command_finished(status.as_str(), status, Some(1), "now")
+            .update_command_finished(
+                &crate::test_command_id(status.as_str()),
+                status,
+                Some(1),
+                "now",
+            )
             .unwrap();
     }
     let (addr, server) = serve_router(app).await;
     let client = reqwest::Client::new();
-    for id in ["alias", "done", "error", "cancelled"] {
+    for id in [
+        "cmd_724874d1be77f450a09b305fc1534afb",
+        "done",
+        "error",
+        "cancelled",
+    ] {
+        let id = crate::test_command_id(id);
         let response = client
-            .get(format!("http://{addr}/v1/workflows/{id}"))
+            .get(format!("http://{addr}/v1/worker/commands/{id}/workflow"))
             .send()
             .await
             .unwrap();
         assert_eq!(response.status(), 404);
         assert_eq!(
             response.json::<serde_json::Value>().await.unwrap()["error"],
-            if id == "alias" {
+            if id == "cmd_724874d1be77f450a09b305fc1534afb" {
                 "workflow not started"
             } else {
                 "workflow never started"
@@ -283,13 +346,15 @@ async fn status_advertises_workflow_state_feature_and_queued_exec_says_not_start
         .json()
         .await
         .unwrap();
-    assert!(status["features"]
+    assert!(status["capabilities"]
         .as_array()
         .unwrap()
         .iter()
         .any(|f| f == "workflow_state"));
     let response = client
-        .get(format!("http://{addr}/v1/workflows/queued-exec"))
+        .get(format!(
+            "http://{addr}/v1/worker/commands/cmd_949d96fc27ab48b86a4eca1769c16e5f/workflow"
+        ))
         .send()
         .await
         .unwrap();
@@ -300,7 +365,9 @@ async fn status_advertises_workflow_state_feature_and_queued_exec_says_not_start
     );
 
     let unknown = client
-        .get(format!("http://{addr}/v1/workflows/unknown-id"))
+        .get(format!(
+            "http://{addr}/v1/worker/commands/cmd_00000000000000000000000000000000/workflow"
+        ))
         .send()
         .await
         .unwrap();
@@ -310,7 +377,9 @@ async fn status_advertises_workflow_state_feature_and_queued_exec_says_not_start
         "command not found"
     );
     let other = client
-        .get(format!("http://{addr}/v1/workflows/queued-prompt"))
+        .get(format!(
+            "http://{addr}/v1/worker/commands/cmd_4a37707dfec4abdbeb78d6d8a6dcdc87/workflow"
+        ))
         .send()
         .await
         .unwrap();
@@ -336,7 +405,7 @@ async fn remote_workflow_poller_reads_real_router_and_maps_phase_columns() {
     std::fs::create_dir_all(&worktree).unwrap();
     app.store
         .insert_session_full(NewSessionRow {
-            id: "poll-session",
+            id: "ses_8c2002ff7769cb87f8cae76370c39a68",
             workdir: worktree.to_str().unwrap(),
             created_at: &chrono::Utc::now().to_rfc3339(),
             setup_status: SessionSetupStatus::Ready,
@@ -345,7 +414,13 @@ async fn remote_workflow_poller_reads_real_router_and_maps_phase_columns() {
         })
         .unwrap();
     app.store
-        .enqueue_command("poll-command", "poll-session", "exec workflow", "[]", "/l")
+        .enqueue_command(
+            "cmd_379e29f600aef553dc6bae6276ae6e91",
+            "ses_8c2002ff7769cb87f8cae76370c39a68",
+            "exec workflow",
+            "[]",
+            "/l",
+        )
         .unwrap();
     let mut state = sample_state();
     state.setup_step_states = vec![awman::data::workflow_state::PhaseStepState {
@@ -353,18 +428,31 @@ async fn remote_workflow_poller_reads_real_router_and_maps_phase_columns() {
         status: PhaseStepStatus::Succeeded,
     }];
     state.teardown_step_states = vec![awman::data::workflow_state::PhaseStepState {
-        description: "cleanup".into(),
+        description: "ses_ecfb9f08f09baba9587e427bc8a820b1".into(),
         status: PhaseStepStatus::Pending,
     }];
-    app.paths.prepare_session_dirs("poll-session").unwrap();
-    std::fs::create_dir_all(app.paths.command_dir("poll-session", "poll-command")).unwrap();
     app.paths
-        .write_command_workflow_state("poll-session", "poll-command", &state)
+        .prepare_session_dirs("ses_8c2002ff7769cb87f8cae76370c39a68")
+        .unwrap();
+    std::fs::create_dir_all(app.paths.command_dir(
+        "ses_8c2002ff7769cb87f8cae76370c39a68",
+        "cmd_379e29f600aef553dc6bae6276ae6e91",
+    ))
+    .unwrap();
+    app.paths
+        .write_command_workflow_state(
+            "ses_8c2002ff7769cb87f8cae76370c39a68",
+            "cmd_379e29f600aef553dc6bae6276ae6e91",
+            &state,
+        )
         .unwrap();
     std::fs::remove_dir_all(&worktree).unwrap();
     let (addr, server) = serve_router(app).await;
     let client = Arc::new(RemoteClient::new(&format!("http://{addr}"), None).unwrap());
-    let source = Arc::new(RemoteApiWorkflowSource::new(client, "poll-command"));
+    let source = Arc::new(RemoteApiWorkflowSource::new(
+        client,
+        "cmd_379e29f600aef553dc6bae6276ae6e91",
+    ));
     let published = Arc::new(std::sync::Mutex::new(None));
     let published_cb = published.clone();
     let cancel = CancellationToken::new();

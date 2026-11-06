@@ -1,7 +1,7 @@
 //! An in-process squad daemon task that owns the environment it was started
 //! under.
 //!
-//! The daemon reads `AWMAN_CONFIG_HOME` (and friends) lazily while serving,
+//! The daemon reads `AWMAN_HOME` (and friends) lazily while serving,
 //! so a test must not restore the previous values until the daemon is gone.
 //! [`InProcessDaemon`] aborts the task first and restores the variables
 //! second, on an explicit [`InProcessDaemon::abort`] and on a panic alike.

@@ -22,7 +22,7 @@ As you use awman it leaves behind stopped containers (or builtin microVM session
 
 ### Builtin runtime state
 
-With `runtime` set to `builtin-experimental`, `awman clean` applies to the builtin runtime's own state like this:
+With `runtime.kind` set to `builtin`, `awman clean` applies to the builtin runtime's own state like this:
 
 - **Stopped containers** lists and removes builtin sessions that have stopped or crashed (their VM records and disks). Running and paused sessions are never listed.
 - **Dangling images** is always empty: the builtin runtime only tracks images it imported by name, and `awman clean` never runs a global image prune against the store.

@@ -176,50 +176,6 @@ fn check_only_report_offers_close_not_continue() {
 }
 
 #[test]
-fn config_migrate_preview_scrolls_and_keeps_its_choices_visible() {
-    let mut app = make_app();
-    // A long, nested preview; the field names are not the point.
-    let before = serde_json::json!({
-        "oldKey": {
-            "list": (0..30).map(|i| format!("entry {i}")).collect::<Vec<_>>(),
-            "map": {"a": "1", "b": "2"}
-        }
-    });
-    let preview = format!(
-        "/repo/.awman/config.json\n\nMove oldKey\nBefore:\n{}\nAfter:\n{}",
-        serde_json::to_string_pretty(&before).unwrap(),
-        serde_json::to_string_pretty(&before).unwrap()
-    );
-    let prompt = crate::command::prompts::config_migrate_confirm(&preview);
-    let (mut frontend, requests, responses) =
-        test_command_frontend(&["config", "migrate"], Default::default());
-    let worker = std::thread::spawn(move || {
-        use crate::command::commands::config::ConfigCommandFrontend;
-        frontend.confirm_config_migration(&prompt).unwrap()
-    });
-    let DialogRequest::Review(state) = requests
-        .recv_timeout(std::time::Duration::from_secs(3))
-        .unwrap()
-    else {
-        panic!("expected a scrolling review");
-    };
-    let _rx = setup_command_dialog(&mut app, Dialog::Review(state));
-    let rows = screen(&mut app, 100, 30);
-    let text = rows.join("\n");
-    // The dialog fits the terminal, the warning is read first and the
-    // choices are on screen however long the preview is.
-    assert!(text.contains("Teammates on awman versions"), "{text}");
-    assert!(text.contains("[y] Move it"), "{text}");
-    assert!(text.contains("[n] Cancel"), "{text}");
-    assert!(text.contains("[Esc] Cancel"), "{text}");
-    assert!(text.contains("▼ more below"), "{text}");
-    responses.send(DialogResponse::Dismissed).unwrap();
-    assert_eq!(
-        worker.join().unwrap(),
-        crate::command::commands::config::MigrateChoice::Cancel
-    );
-}
-#[test]
 fn wi0149_secret_input_masks_unicode_and_debug_and_submits_secret() {
     let mut app = make_app();
     let mut buffer = SecretBuffer::default();

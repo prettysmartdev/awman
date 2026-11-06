@@ -10,21 +10,24 @@ use std::path::Path;
 use std::process::{Child, Command};
 use std::time::Duration;
 
-use awman::data::config::env::{EnvSnapshot, AWMAN_API_ROOT, AWMAN_SQUAD_ROOT};
+use awman::data::config::env::EnvSnapshot;
 use awman::data::fs::daemon_process::{
     DaemonProcess, API_PLIST_LABEL, API_UNIT_NAME, SQUAD_PLIST_LABEL, SQUAD_UNIT_NAME,
 };
+use awman::data::fs::data_paths::AWMAN_HOME;
 use awman::data::fs::DaemonPaths;
 use awman::engine::daemon::{DaemonGuard, DaemonKind, DaemonSupervisor};
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::process_env::ProcessEnvGuard;
 
+/// An env whose `AWMAN_HOME` is the common parent of `api_root` and
+/// `squad_root` (which must be `<home>/api` and `<home>/squad`).
 fn paths_env(api_root: &Path, squad_root: &Path) -> EnvSnapshot {
-    EnvSnapshot::with_overrides([
-        (AWMAN_API_ROOT, api_root.to_string_lossy().to_string()),
-        (AWMAN_SQUAD_ROOT, squad_root.to_string_lossy().to_string()),
-    ])
+    let home = api_root.parent().expect("api root has a parent");
+    assert_eq!(api_root, home.join("api"));
+    assert_eq!(squad_root, home.join("squad"));
+    EnvSnapshot::with_overrides([(AWMAN_HOME, home.to_string_lossy().to_string())])
 }
 
 fn daemon(root: &Path, kind: DaemonKind) -> DaemonSupervisor {

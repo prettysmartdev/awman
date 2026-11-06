@@ -144,7 +144,6 @@ fn engines_with(runtime: Arc<dyn AgentRuntimeEngine>) -> Engines {
         overlay_engine: overlay_engine.clone(),
         auth_engine: Arc::new(AuthEngine::with_paths(auth_paths, api_paths.clone())),
         agent_engine: Arc::new(AgentEngine::new(overlay_engine, container_runtime)),
-        config_notices: Default::default(),
         workflow_state_store: Arc::new(WorkflowStateStore::at_git_root(api_paths.root())),
         credential_monitor: None,
         global_config: std::sync::Arc::new(Default::default()),
@@ -315,7 +314,15 @@ async fn assert_status_marks_squad_on(cli: &str, runtime: Arc<ContainerRuntime>)
     for name in [&squad_name, &session_name] {
         if !cli_ok(
             cli,
-            &["run", "-d", "--name", name, "alpine:latest", "sleep", "120"],
+            &[
+                "cmd_a53108f7543b75adbb34afc035d4cdf6",
+                "-d",
+                "--name",
+                name,
+                "alpine:latest",
+                "sleep",
+                "120",
+            ],
         ) {
             remove_container(cli, &squad_name);
             remove_container(cli, &session_name);

@@ -613,7 +613,7 @@ impl App {
         // the TUI no longer keys the injection on the command's name
         // (WI 0114 F-15).
         if let Some(gateway) = self.squad_gateway.clone() {
-            dispatch = dispatch.with_squad_gateway(gateway);
+            dispatch = dispatch.with_task_gateway(gateway);
         }
         let display = {
             let path_refs: Vec<&str> = path_owned.iter().map(String::as_str).collect();
@@ -1119,7 +1119,7 @@ impl App {
                     // value preserved and the reason displayed, so the user
                     // corrects it instead of retyping from scratch.
                     if let Some(rej) = rejected {
-                        use crate::command::commands::config::ConfigRowShape;
+                        use crate::command::commands::config::ConfigRowKind;
                         let existing = state.rows.iter().position(|r| r.field == rej.field);
                         let new_member = state.rows.iter().enumerate().find_map(|(index, row)| {
                             let member = rej.field.strip_prefix(row.shape.child_prefix()?)?;
@@ -1127,12 +1127,12 @@ impl App {
                                 return None;
                             }
                             let phase = match row.shape {
-                                ConfigRowShape::MapHeader { .. } => {
+                                ConfigRowKind::MapHeader { .. } => {
                                     crate::frontend::tui::dialogs::NewMapEntryPhase::Value {
                                         key: member.to_string(),
                                     }
                                 }
-                                ConfigRowShape::ListHeader { .. } => {
+                                ConfigRowKind::ListHeader { .. } => {
                                     crate::frontend::tui::dialogs::NewMapEntryPhase::ListEntry
                                 }
                                 _ => return None,
@@ -1836,7 +1836,7 @@ mod tests {
             global_writable: false,
             repo_writable: true,
             value_hint: None,
-            shape: crate::command::commands::config::ConfigRowShape::Scalar,
+            shape: crate::command::commands::config::ConfigRowKind::Scalar,
         }
     }
 
@@ -1905,7 +1905,7 @@ mod tests {
         deliver_config_show(
             &mut app,
             vec![crate::frontend::tui::dialogs::ConfigShowRow {
-                shape: crate::command::commands::config::ConfigRowShape::MapHeader {
+                shape: crate::command::commands::config::ConfigRowKind::MapHeader {
                     child_prefix: "demo.map.",
                 },
                 read_only: true,

@@ -12,7 +12,13 @@ impl CommandCatalogue {
     /// visibility is `TuiOnly` or `Hidden` is omitted from the CLI projection.
     pub fn build_clap_command(&self) -> Command {
         let root = self.root();
-        build_clap_for_spec(root, true)
+        let mut cmd = build_clap_for_spec(root, true);
+        for flag in self.global_flags() {
+            if flag_visible_to_cli(flag) {
+                cmd = cmd.arg(build_clap_flag(flag).global(true));
+            }
+        }
+        cmd
     }
 }
 
@@ -60,6 +66,9 @@ fn build_clap_argument(spec: &ArgumentSpec) -> Arg {
         }
         ArgumentKind::OptionalString | ArgumentKind::OptionalPath => {
             arg = arg.required(false);
+        }
+        ArgumentKind::VarArgs => {
+            arg = arg.required(!spec.optional).num_args(1..);
         }
         ArgumentKind::TrailingVarArgs => {
             arg = arg

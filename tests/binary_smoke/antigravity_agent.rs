@@ -20,13 +20,9 @@ fn awman_isolated(repo: &TempDir) -> (TempDir, Command) {
     let cfg_home = TempDir::new().expect("config TempDir::new");
     let mut cmd = Command::new(awman_bin());
     cmd.current_dir(repo.path())
-        .env("AWMAN_CONFIG_HOME", cfg_home.path())
-        // Also pin the API root so the binary doesn't notice the dev
-        // machine's real `~/.awman/api/` (sessions DB etc.). Belt and braces.
-        .env("AWMAN_API_ROOT", cfg_home.path().join("api"))
-        .env_remove("AWMAN_REMOTE_ADDR")
+        .env("AWMAN_HOME", cfg_home.path())
+        // `AWMAN_HOME` also roots `api/`, `squad/` and `attach/`.
         .env_remove("AWMAN_REMOTE_SESSION")
-        .env_remove("AWMAN_API_KEY")
         .env_remove("AWMAN_OVERLAYS");
     (cfg_home, cmd)
 }

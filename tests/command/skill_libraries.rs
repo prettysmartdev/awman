@@ -18,7 +18,7 @@ use awman::engine::overlay::OverlayEngine;
 use awman::frontend::api::command_frontend::ApiDispatchFrontend;
 use awman::frontend::cli::CliFrontend;
 
-/// `AWMAN_CONFIG_HOME` and Git's process-wide config injection are shared by
+/// `AWMAN_HOME` and Git's process-wide config injection are shared by
 /// every test in this target, so the local-remotes fixture must be serialized.
 static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -29,7 +29,7 @@ struct EnvGuard {
 impl EnvGuard {
     fn local_home_and_remotes(home: &Path, remotes: &[(&str, &Path)]) -> Self {
         let keys = [
-            "AWMAN_CONFIG_HOME",
+            "AWMAN_HOME",
             "GIT_CONFIG_COUNT",
             "GIT_CONFIG_KEY_0",
             "GIT_CONFIG_VALUE_0",
@@ -41,7 +41,7 @@ impl EnvGuard {
             .map(|key| (key, std::env::var(key).ok()))
             .collect();
 
-        std::env::set_var("AWMAN_CONFIG_HOME", home);
+        std::env::set_var("AWMAN_HOME", home);
         for (index, (github_url, local_repo)) in remotes.iter().enumerate() {
             std::env::set_var(
                 format!("GIT_CONFIG_KEY_{index}"),
@@ -384,7 +384,7 @@ fn real_git_subdir_is_persisted_and_library_and_single_skill_overlay_mounts_are_
         workdir.path().to_path_buf(),
         awman::data::session::SessionOpenOptions {
             env: Some(awman::data::config::EnvSnapshot::with_overrides([(
-                "AWMAN_CONFIG_HOME",
+                "AWMAN_HOME",
                 home.path().to_str().unwrap(),
             )])),
             ..Default::default()
@@ -475,7 +475,7 @@ fn real_git_cli_api_and_tui_dispatch_keep_pull_subdir_and_pull_all_in_parity() {
         ],
     );
     // Point the process home at a second isolated store before the API run.
-    std::env::set_var("AWMAN_CONFIG_HOME", api_home.path());
+    std::env::set_var("AWMAN_HOME", api_home.path());
     let api_initial = run_api(
         workdir.path(),
         api_home.path(),
@@ -499,16 +499,16 @@ fn real_git_cli_api_and_tui_dispatch_keep_pull_subdir_and_pull_all_in_parity() {
 
     // Seed beta in both stores, then verify `--pull-all` has the same
     // per-library JSON shape through CLI and API dispatch.
-    std::env::set_var("AWMAN_CONFIG_HOME", cli_home.path());
+    std::env::set_var("AWMAN_HOME", cli_home.path());
     run_cli(
         workdir.path(),
         cli_home.path(),
         &["new", "skill", "--pull", "owner/beta"],
     );
-    std::env::set_var("AWMAN_CONFIG_HOME", api_home.path());
+    std::env::set_var("AWMAN_HOME", api_home.path());
     run_api(workdir.path(), api_home.path(), &["--pull", "owner/beta"]);
     let api_all = run_api(workdir.path(), api_home.path(), &["--pull-all"]);
-    std::env::set_var("AWMAN_CONFIG_HOME", cli_home.path());
+    std::env::set_var("AWMAN_HOME", cli_home.path());
     let cli_all = run_cli(
         workdir.path(),
         cli_home.path(),

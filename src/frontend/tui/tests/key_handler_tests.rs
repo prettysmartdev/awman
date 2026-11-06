@@ -478,7 +478,8 @@ fn submit_command_blocked_while_running() {
 #[test]
 fn submitting_a_bad_enum_value_leaves_the_box_with_an_error() {
     let mut app = make_app();
-    app.command_input.set_text("chat --launch-mode banana");
+    app.command_input
+        .set_text("exec workflow --on-merge-failure banana");
 
     press_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
 
@@ -487,7 +488,7 @@ fn submitting_a_bad_enum_value_leaves_the_box_with_an_error() {
         .as_deref()
         .expect("a bad enum value must be reported in the command box");
     assert!(
-        error.contains("banana") && error.contains("stdio"),
+        error.contains("banana") && error.contains("keep"),
         "the hint must name the bad value and the allowed set: {error}"
     );
     assert!(
@@ -1148,7 +1149,7 @@ fn fake_task(name: &str) -> crate::data::fs::task_store::Task {
     let now = chrono::Utc::now();
     crate::data::fs::task_store::Task {
         prerequisites: None,
-        id: name.to_string(),
+        id: crate::frontend::test_ids::task_id(name),
         name: name.to_string(),
         description: "test task".into(),
         repo_scope: std::path::PathBuf::from("/tmp"),
@@ -1693,8 +1694,8 @@ fn set_squad_runs(app: &mut App, task: &str, count: usize) {
     let mut snap = state.snapshot.lock().unwrap();
     snap.runs = (0..count)
         .map(|i| Run {
-            id: format!("run-{i}"),
-            task_id: task.to_string(),
+            id: crate::frontend::test_ids::run_id(&format!("run-{i}")),
+            task_id: crate::frontend::test_ids::task_id(task),
             status: RunStatus::WorkflowExecuted,
             workflow_path: None,
             workflow_state_path: None,
@@ -1826,7 +1827,11 @@ fn squad_history_enter_opens_the_selected_runs_detail_and_esc_returns_to_the_tab
     match &app.active_dialog {
         Some(Dialog::SquadTaskHistory(state)) => {
             let detail = state.run_detail.as_ref().expect("Enter opens the detail");
-            assert_eq!(detail.run.id, "run-1", "the detail is the selected run's");
+            assert_eq!(
+                detail.run.id,
+                crate::frontend::test_ids::run_id("run-1"),
+                "the detail is the selected run's"
+            );
             assert_eq!(detail.scroll, 0);
         }
         _ => panic!("the history modal must stay up under its run detail"),

@@ -225,7 +225,7 @@ pub fn ready(
     runtime: Arc<dyn AgentRuntimeEngine>,
     agent: &str,
 ) -> ReadyEngine {
-    let home = awman::data::config::GlobalConfig::data_home_with(session.env()).unwrap();
+    let home = awman::data::fs::data_paths::data_home(session.env()).unwrap();
     let overlay = Arc::new(OverlayEngine::with_auth_resolver(
         awman::data::fs::AuthPathResolver::at_home(&home),
     ));

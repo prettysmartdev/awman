@@ -1,7 +1,7 @@
 //! Workflow prerequisites (WI 0149), Layer 2: the flow that turns the
 //! engine's prerequisite report, the resolved policy and a frontend into the
 //! run's grants; the frontend trait it asks through; the `--prerequisite-*`
-//! flags; the API/squad widening check; and `config prerequisite-grants`.
+//! flags; the API/squad widening check; remembered grants are served by `/v1/grants`.
 //!
 //! The probes themselves are `engine::workflow::prerequisites`; the policy
 //! merge is `data::config::workflows`; turning grants into mounts and env is
@@ -11,7 +11,6 @@
 mod flags;
 mod flow;
 mod frontend;
-mod grants_subcommand;
 mod task_policy;
 mod widening;
 
@@ -28,10 +27,6 @@ pub use flow::{
 pub use frontend::{
     GapChoice, IdentityChoice, IdentityPersist, PrerequisiteReportNext, SshChoice, TokenConsent,
     TokenSourceChoice, ToolChoice, WorkflowPrerequisiteFrontend,
-};
-pub use grants_subcommand::{
-    parse_selector, run_prerequisite_grants, PrerequisiteGrantRow, PrerequisiteGrantsAction,
-    PrerequisiteGrantsOutcome,
 };
 pub use task_policy::{collect_task_prerequisites, edit_task_policy, task_policy_from_outcome};
 pub use widening::{check_flag_widening, check_task_widening};

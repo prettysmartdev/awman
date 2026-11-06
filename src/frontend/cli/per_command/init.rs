@@ -5,7 +5,7 @@
 //! also the answer an empty line accepts on a TTY — comes from the CLI profile
 //! in `src/command/headless.rs`.
 
-use crate::data::config::repo::WorkItemsConfig;
+use crate::data::config::work_items::WorkItemsConfig;
 use crate::data::prompt::Prompt;
 use crate::data::step_status::StepStatus;
 use crate::engine::error::EngineError;

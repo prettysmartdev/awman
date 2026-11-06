@@ -141,7 +141,7 @@ impl WorkflowPrerequisiteFrontend for CliFrontend {
     }
 
     /// Never approved without a person: `--yes`, `--json` and
-    /// `--non-interactive` all decline.
+    /// `--headless` all decline.
     fn confirm_prerequisite_host_command(
         &mut self,
         _review: &HostSecretCommandReview,
@@ -162,7 +162,7 @@ mod wi0149_tests {
     fn wi0149_cli_prerequisite_defaults_are_the_command_prompts_defaults() {
         let matches = crate::command::dispatch::catalogue::CommandCatalogue::get()
             .build_clap_command()
-            .try_get_matches_from(["awman", "exec", "workflow", "wf.toml", "--non-interactive"])
+            .try_get_matches_from(["awman", "exec", "workflow", "wf.toml", "--headless"])
             .unwrap();
         let mut cli = CliFrontend::new(matches);
         let check = PrerequisiteCheck {

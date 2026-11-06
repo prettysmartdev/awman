@@ -6,7 +6,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::data::config::agent_definition::{is_first_party_name, validate_agent_file_stem};
 use crate::data::config::env::{Env, EnvSnapshot};
-use crate::data::config::global::GlobalConfig;
 use crate::data::error::DataError;
 
 pub const AGENTS_SUBDIR: &str = "agents";
@@ -37,7 +36,7 @@ pub struct AgentDirs {
 impl AgentDirs {
     pub fn from_env(env: &EnvSnapshot, git_root: Option<PathBuf>) -> Result<Self, DataError> {
         Ok(Self {
-            global_home: GlobalConfig::data_home_with(env)?,
+            global_home: crate::data::fs::data_paths::data_home(env)?,
             git_root,
         })
     }
@@ -422,13 +421,13 @@ fn discover_dir(dir: &Path, scope: DefinitionScope, discovery: &mut AgentDiscove
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::config::env::AWMAN_CONFIG_HOME;
+    use crate::data::fs::data_paths::AWMAN_HOME;
 
     #[test]
     fn discover_repo_before_global() {
         let tmp = tempfile::tempdir().unwrap();
         let global_home = tmp.path().join("global");
-        let env = EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, global_home.to_str().unwrap())]);
+        let env = EnvSnapshot::with_overrides([(AWMAN_HOME, global_home.to_str().unwrap())]);
         let dirs = AgentDirs::from_env(&env, Some(tmp.path().join("repo"))).unwrap();
         for scope in [DefinitionScope::Global, DefinitionScope::Repo] {
             let dir = dirs.ensure_dir(scope).unwrap();
@@ -444,10 +443,8 @@ mod tests {
     #[test]
     fn discovery_orders_entries_and_reports_invalid_and_reserved_stems() {
         let tmp = tempfile::tempdir().unwrap();
-        let env = EnvSnapshot::with_overrides([(
-            AWMAN_CONFIG_HOME,
-            tmp.path().join("home").to_str().unwrap(),
-        )]);
+        let env =
+            EnvSnapshot::with_overrides([(AWMAN_HOME, tmp.path().join("home").to_str().unwrap())]);
         let dirs = AgentDirs::from_env(&env, Some(tmp.path().join("repo"))).unwrap();
         let repo = dirs.ensure_dir(DefinitionScope::Repo).unwrap();
         let global = dirs.ensure_dir(DefinitionScope::Global).unwrap();
@@ -489,10 +486,8 @@ mod tests {
     fn discovery_skips_symlink_escape_but_allows_in_directory_symlink() {
         use std::os::unix::fs::symlink;
         let tmp = tempfile::tempdir().unwrap();
-        let env = EnvSnapshot::with_overrides([(
-            AWMAN_CONFIG_HOME,
-            tmp.path().join("home").to_str().unwrap(),
-        )]);
+        let env =
+            EnvSnapshot::with_overrides([(AWMAN_HOME, tmp.path().join("home").to_str().unwrap())]);
         let dirs = AgentDirs::from_env(&env, Some(tmp.path().join("repo"))).unwrap();
         let repo = dirs.ensure_dir(DefinitionScope::Repo).unwrap();
         let elsewhere = tmp.path().join("outside.toml");

@@ -183,26 +183,45 @@ impl CommandCanceller {
         }
 
         let now = chrono::Utc::now().to_rfc3339();
-        if record.status.is_claimable() && self.lifecycle.cancel_if_queued(command_id, &now)? {
+        if record.status.is_claimable()
+            && self.lifecycle.cancel_if_queued(
+                &crate::data::ids::CommandId::parse(command_id)
+                    .expect("validated persisted resource id"),
+                &now,
+            )?
+        {
             // A `/v1/runs` command waits in the queue while its session is
             // set up: abandon that setup too.
-            if let Some(run) = self.lifecycle.run_for_command(command_id)? {
-                self.setups.cancel(&run.session_id);
+            if let Some(run) = self.lifecycle.run_for_command(
+                &crate::data::ids::CommandId::parse(command_id)
+                    .expect("validated persisted resource id"),
+            )? {
+                self.setups.cancel(run.session_id.as_str());
             }
             self.finalize_unowned(command_id)?;
             return Ok(CancelOutcome::Cancelled(self.reread(record)?));
         }
 
         // Running, or claimed by a worker since the read above.
-        self.lifecycle.request_cancel(command_id, &now)?;
+        self.lifecycle.request_cancel(
+            &crate::data::ids::CommandId::parse(command_id)
+                .expect("validated persisted resource id"),
+            &now,
+        )?;
         let requested_at = self
             .lifecycle
-            .cancel_requested_at(command_id)?
+            .cancel_requested_at(
+                &crate::data::ids::CommandId::parse(command_id)
+                    .expect("validated persisted resource id"),
+            )?
             .unwrap_or(now.clone());
         let owned = self.commands.cancel_or(command_id, || {
             if !self.finalize_from_sidecar(command_id)? {
-                self.lifecycle
-                    .cancel_if_running(command_id, &now, &requested_at)?;
+                self.lifecycle.cancel_if_running(
+                    &crate::data::ids::CommandId::parse(command_id).expect("validated command id"),
+                    &now,
+                    &requested_at,
+                )?;
             }
             Ok::<(), CommandError>(())
         })?;
@@ -244,7 +263,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = Arc::new(SqliteSessionStore::open(tmp.path()).unwrap());
         store
-            .insert_session("session", "/work", "2026-10-28T00:00:00Z")
+            .insert_session(
+                "ses_21d6f40cfb511982e4424e0e250a9557",
+                "/work",
+                "2026-10-28T00:00:00Z",
+            )
             .unwrap();
         let lifecycle = CommandLifecycleStore::open(Arc::clone(&store)).unwrap();
         (tmp, store, lifecycle)
@@ -262,7 +285,13 @@ mod tests {
     fn queued_cancel_is_terminal_and_terminal_cancel_is_unchanged() {
         let (_tmp, store, lifecycle) = setup();
         store
-            .enqueue_command("queued", "session", "chat", "[]", "log")
+            .enqueue_command(
+                "cmd_11111111111141118111111111111111",
+                "ses_21d6f40cfb511982e4424e0e250a9557",
+                "chat",
+                "[]",
+                "log",
+            )
             .unwrap();
         let cancel = canceller(
             Arc::clone(&store),
@@ -270,7 +299,10 @@ mod tests {
             Arc::new(TokenRegistry::new()),
         );
 
-        let CancelOutcome::Cancelled(row) = cancel.cancel("queued").unwrap() else {
+        let CancelOutcome::Cancelled(row) = cancel
+            .cancel("cmd_11111111111141118111111111111111")
+            .unwrap()
+        else {
             panic!("queued command should cancel immediately");
         };
         assert_eq!(row.status.as_str(), "cancelled");
@@ -281,44 +313,69 @@ mod tests {
         assert!(store.claim_next_command("worker").unwrap().is_none());
 
         store
-            .enqueue_command("done", "session", "chat", "[]", "log")
+            .enqueue_command(
+                "cmd_6b2ded51d81a4403d8a4bd25fa1e57ee",
+                "ses_21d6f40cfb511982e4424e0e250a9557",
+                "chat",
+                "[]",
+                "log",
+            )
             .unwrap();
         store
             .complete_command(
-                "done",
+                "cmd_6b2ded51d81a4403d8a4bd25fa1e57ee",
                 CommandStatus::Done,
                 Some(0),
                 Some(r#"{"exit_code":0}"#),
             )
             .unwrap();
-        let before = store.get_command("done").unwrap().unwrap();
+        let before = store
+            .get_command("cmd_6b2ded51d81a4403d8a4bd25fa1e57ee")
+            .unwrap()
+            .unwrap();
         assert!(matches!(
-            cancel.cancel("done").unwrap(),
+            cancel
+                .cancel("cmd_6b2ded51d81a4403d8a4bd25fa1e57ee")
+                .unwrap(),
             CancelOutcome::AlreadyTerminal(_)
         ));
-        assert_eq!(store.get_command("done").unwrap().unwrap(), before);
+        assert_eq!(
+            store
+                .get_command("cmd_6b2ded51d81a4403d8a4bd25fa1e57ee")
+                .unwrap()
+                .unwrap(),
+            before
+        );
     }
 
     #[test]
     fn running_cancel_fires_owner_token_and_restart_does_not_requeue_cancelled_row() {
         let (_tmp, store, lifecycle) = setup();
         store
-            .enqueue_command("running", "session", "chat", "[]", "log")
+            .enqueue_command(
+                "cmd_75101dcdfc88455bcafc9e53e0b06689",
+                "ses_21d6f40cfb511982e4424e0e250a9557",
+                "chat",
+                "[]",
+                "log",
+            )
             .unwrap();
         let owner = Arc::new(TokenRegistry::new());
-        let token = owner.register("running");
+        let token = owner.register("cmd_75101dcdfc88455bcafc9e53e0b06689");
         let claimed = store.claim_next_command("worker").unwrap().unwrap();
         assert_eq!(claimed.status.as_str(), "running");
         let cancel = canceller(Arc::clone(&store), lifecycle.clone(), Arc::clone(&owner));
 
         assert!(matches!(
-            cancel.cancel("running").unwrap(),
+            cancel
+                .cancel("cmd_75101dcdfc88455bcafc9e53e0b06689")
+                .unwrap(),
             CancelOutcome::Stopping { .. }
         ));
         assert!(token.is_cancelled());
         assert_eq!(
             store
-                .get_command("running")
+                .get_command("cmd_75101dcdfc88455bcafc9e53e0b06689")
                 .unwrap()
                 .unwrap()
                 .status
@@ -331,11 +388,14 @@ mod tests {
         let finalized = lifecycle
             .finalize_interrupted_cancellations("2026-10-28T00:01:00Z")
             .unwrap();
-        assert_eq!(finalized, ["running"]);
+        assert_eq!(
+            finalized.iter().map(|id| id.as_str()).collect::<Vec<_>>(),
+            ["cmd_75101dcdfc88455bcafc9e53e0b06689"]
+        );
         assert!(store.recover_stale_commands(0).unwrap().is_empty());
         assert_eq!(
             store
-                .get_command("running")
+                .get_command("cmd_75101dcdfc88455bcafc9e53e0b06689")
                 .unwrap()
                 .unwrap()
                 .status
@@ -352,36 +412,64 @@ mod tests {
     fn run_linkage_retains_close_on_finish_and_setup_failure_preserves_cancel() {
         let (_tmp, store, lifecycle) = setup();
         store
-            .enqueue_command("run", "session", "exec workflow", "[]", "log")
+            .enqueue_command(
+                "cmd_a53108f7543b75adbb34afc035d4cdf6",
+                "ses_21d6f40cfb511982e4424e0e250a9557",
+                "exec workflow",
+                "[]",
+                "log",
+            )
             .unwrap();
         lifecycle
             .record_run(&crate::data::api_lifecycle_store::RunRecord {
-                session_id: "session".into(),
-                command_id: "run".into(),
+                session_id: crate::data::ids::WorkerSessionId::parse(
+                    "ses_21d6f40cfb511982e4424e0e250a9557",
+                )
+                .unwrap(),
+                command_id: crate::data::ids::CommandId::parse(
+                    "cmd_a53108f7543b75adbb34afc035d4cdf6",
+                )
+                .unwrap(),
                 close_on_finish: true,
                 created_at: "2026-10-28T00:00:00Z".into(),
             })
             .unwrap();
-        let run = lifecycle.run_for_command("run").unwrap().unwrap();
+        let run = lifecycle
+            .run_for_command(
+                &crate::data::ids::CommandId::parse("cmd_a53108f7543b75adbb34afc035d4cdf6")
+                    .unwrap(),
+            )
+            .unwrap()
+            .unwrap();
         assert!(run.close_on_finish);
         assert_eq!(lifecycle.list_runs().unwrap(), [run]);
 
         store
-            .enqueue_command("cancelled-run", "session", "exec workflow", "[]", "log")
+            .enqueue_command(
+                "cmd_e2466d34c9b9eec2fe43009eb1f34df8",
+                "ses_21d6f40cfb511982e4424e0e250a9557",
+                "exec workflow",
+                "[]",
+                "log",
+            )
             .unwrap();
         lifecycle
-            .cancel_if_queued("cancelled-run", "2026-10-28T00:00:01Z")
+            .cancel_if_queued(
+                &crate::data::ids::CommandId::parse("cmd_e2466d34c9b9eec2fe43009eb1f34df8")
+                    .unwrap(),
+                "2026-10-28T00:00:01Z",
+            )
             .unwrap();
         assert!(!lifecycle
             .fail_if_queued(
-                "cancelled-run",
+                "cmd_e2466d34c9b9eec2fe43009eb1f34df8",
                 "2026-10-28T00:00:02Z",
                 r#"{"error":"setup"}"#
             )
             .unwrap());
         assert_eq!(
             store
-                .get_command("cancelled-run")
+                .get_command("cmd_e2466d34c9b9eec2fe43009eb1f34df8")
                 .unwrap()
                 .unwrap()
                 .status

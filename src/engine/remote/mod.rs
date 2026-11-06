@@ -10,6 +10,7 @@
 pub mod client;
 pub mod events;
 pub mod http_core;
+pub mod local;
 
 pub use client::{
     CancelCommandResponse, CommandListQuery, ExecArg, ExecJobResponse, JobStatus, RemoteClient,

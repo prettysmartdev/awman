@@ -8,7 +8,6 @@
 use std::path::PathBuf;
 
 use crate::data::config::env::{Env, EnvSnapshot};
-use crate::data::config::global::GlobalConfig;
 use crate::data::error::DataError;
 
 /// Resolves and writes per-container workflow log files under `~/.awman/logs/`.
@@ -25,7 +24,7 @@ impl WorkflowLogPaths {
 
     /// Construct from a supplied env snapshot.
     pub fn from_env(env: &EnvSnapshot) -> Result<Self, DataError> {
-        let awman_home = GlobalConfig::data_home_with(env)?;
+        let awman_home = crate::data::fs::data_paths::data_home(env)?;
         Ok(Self { awman_home })
     }
 

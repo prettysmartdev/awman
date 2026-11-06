@@ -3,9 +3,10 @@
 //! Does NOT start a real server — just verifies the data-layer types used
 //! by the API server are correct.
 
-use awman::data::config::env::{EnvSnapshot, AWMAN_API_ROOT};
+use awman::data::config::env::EnvSnapshot;
 use awman::data::fs::api_db::SqliteSessionStore;
 use awman::data::fs::api_paths::ApiPaths;
+use awman::data::fs::data_paths::AWMAN_HOME;
 
 // ─── ApiPaths resolution ─────────────────────────────────────────────────
 
@@ -19,10 +20,10 @@ fn api_paths_from_root_has_correct_db_path() {
 }
 
 #[test]
-fn api_paths_from_env_honours_awman_api_root() {
-    let env = EnvSnapshot::with_overrides([(AWMAN_API_ROOT, "/custom/root")]);
+fn api_paths_from_env_honours_awman_home() {
+    let env = EnvSnapshot::with_overrides([(AWMAN_HOME, "/custom/root")]);
     let paths = ApiPaths::from_env(&env).unwrap();
-    assert_eq!(paths.root(), std::path::Path::new("/custom/root"));
+    assert_eq!(paths.root(), std::path::Path::new("/custom/root/api"));
 }
 
 #[test]
@@ -55,67 +56,77 @@ fn api_paths_tls_dir_under_root() {
 // Actual route-hit tests live in binary_smoke and are marked `real_network_*`.
 
 /// The expected route paths from `build_router`. WI 0079 moved SSE log
-/// streaming from `/v1/sessions/{id}/jobs/{job_id}/logs` to
-/// `/v1/commands/{id}/logs`, and added `GET /v1/sessions/:id/queue` and
-/// `GET /v1/commands/:id/status`. WI 0138 added `GET /v1/commands/:id`.
+/// streaming from `/v1/worker/sessions/{id}/jobs/{job_id}/logs` to
+/// `/v1/worker/commands/{id}/events`, and added `GET /v1/worker/sessions/:id/queue` and
+/// `GET /v1/worker/commands/:id/status`. WI 0138 added `GET /v1/worker/commands/:id`.
 const EXPECTED_ROUTES: &[(&str, &str)] = &[
     ("GET", "/v1/status"),
-    ("GET", "/v1/workdirs"),
-    ("GET", "/v1/sessions"),
-    ("POST", "/v1/sessions"),
-    ("GET", "/v1/sessions/:id"),
-    ("DELETE", "/v1/sessions/:id"),
-    ("GET", "/v1/sessions/:id/status"),
-    ("GET", "/v1/sessions/:id/queue"),
-    ("POST", "/v1/commands"),
-    ("GET", "/v1/commands"),
-    ("POST", "/v1/commands/:id/cancel"),
-    ("POST", "/v1/runs"),
-    ("GET", "/v1/commands/:id"),
-    ("GET", "/v1/commands/:id/status"),
-    ("GET", "/v1/commands/:id/logs"),
-    ("GET", "/v1/workflows/:command_id"),
+    ("GET", "/v1/config"),
+    ("POST", "/v1/config/reload"),
+    ("GET", "/v1/features"),
+    ("GET", "/v1/features/{feature}"),
+    ("GET", "/v1/grants"),
+    ("DELETE", "/v1/grants/{id}"),
+    ("GET", "/v1/worker/workdirs"),
+    ("GET", "/v1/worker/sessions"),
+    ("POST", "/v1/worker/sessions"),
+    ("GET", "/v1/worker/sessions/{id}"),
+    ("DELETE", "/v1/worker/sessions/{id}"),
+    ("GET", "/v1/worker/sessions/{id}/queue"),
+    ("GET", "/v1/worker/commands"),
+    ("POST", "/v1/worker/commands"),
+    ("GET", "/v1/worker/commands/{id}"),
+    ("POST", "/v1/worker/commands/{id}/cancel"),
+    ("GET", "/v1/worker/commands/{id}/events"),
+    ("GET", "/v1/worker/commands/{id}/workflow"),
+    ("GET", "/v1/worker/commands/{id}/outputs"),
+    ("GET", "/v1/worker/commands/{id}/outputs/{*path}"),
+    ("POST", "/v1/worker/runs"),
+    ("GET", "/v1/squad/tasks"),
+    ("POST", "/v1/squad/tasks"),
+    ("GET", "/v1/squad/tasks/{id}"),
+    ("PATCH", "/v1/squad/tasks/{id}"),
+    ("DELETE", "/v1/squad/tasks/{id}"),
+    ("GET", "/v1/squad/tasks/{id}/workflow"),
+    ("POST", "/v1/squad/tasks/{id}/runs"),
+    ("GET", "/v1/squad/tasks/{id}/runs"),
+    ("POST", "/v1/squad/runs/{id}/cancel"),
+    ("GET", "/v1/squad/env"),
+    ("PUT", "/v1/squad/env"),
+    ("DELETE", "/v1/squad/env"),
 ];
-
 #[test]
-fn expected_routes_table_is_non_empty() {
-    assert_eq!(EXPECTED_ROUTES.len(), 16);
-}
-
-#[test]
-fn expected_routes_all_have_method_and_path() {
-    for (method, path) in EXPECTED_ROUTES {
-        assert!(!method.is_empty());
-        assert!(path.starts_with('/'));
+fn route_table_has_exactly_the_contract_and_one_owner_per_operation() {
+    use awman::command::daemon_api::{capabilities::CAPABILITIES, Feature};
+    use awman::frontend::api::routes::ROUTES;
+    use std::collections::HashSet;
+    let actual = ROUTES
+        .iter()
+        .map(|r| (r.method, r.path))
+        .collect::<HashSet<_>>();
+    assert_eq!(actual.len(), ROUTES.len());
+    assert_eq!(actual, EXPECTED_ROUTES.iter().copied().collect());
+    let operations = ROUTES.iter().map(|r| r.op).collect::<HashSet<_>>();
+    assert_eq!(operations.len(), ROUTES.len());
+    for route in ROUTES {
+        assert!(matches!(
+            route.op.owner(),
+            Feature::Core | Feature::Worker | Feature::Squad
+        ));
+        if let Some(c) = route.capability {
+            assert!(CAPABILITIES.contains(&c));
+        }
     }
 }
-
 #[test]
-fn v1_status_route_present_in_expected_table() {
-    let has_status = EXPECTED_ROUTES
-        .iter()
-        .any(|(m, p)| *m == "GET" && *p == "/v1/status");
-    assert!(has_status);
-}
-
-#[test]
-fn per_job_logs_route_present() {
-    let has_job_logs = EXPECTED_ROUTES
-        .iter()
-        .any(|(_, p)| *p == "/v1/commands/:id/logs");
-    assert!(
-        has_job_logs,
-        "per-command structured SSE endpoint must be registered"
-    );
-}
-
-#[test]
-fn legacy_command_log_routes_are_removed() {
-    let has_legacy = EXPECTED_ROUTES.iter().any(|(_, p)| p.contains("/jobs/"));
-    assert!(
-        !has_legacy,
-        "legacy /v1/sessions/{{id}}/jobs/{{job_id}}/logs endpoints must not be present"
-    );
+fn every_client_action_is_exactly_its_resource_route() {
+    use awman::command::commands::daemon::actions::{route, ACTIONS};
+    use awman::frontend::api::routes::ROUTES;
+    for a in ACTIONS {
+        let r = ROUTES.iter().find(|r| r.op == a.op).unwrap();
+        let (method, path) = route(a.op);
+        assert_eq!((method, path.as_str()), (r.method, r.path));
+    }
 }
 
 // ─── SqliteSessionStore as API persistence layer ────────────────────────
@@ -127,9 +138,16 @@ fn api_store_open_from_paths() {
     let store = SqliteSessionStore::open_from_paths(&paths).expect("open from paths");
     // Round-trip session to confirm the store works.
     store
-        .insert_session("s1", "/wd", "2026-01-01T00:00:00Z")
+        .insert_session(
+            "ses_8ddf878039b70767c4a5bcf4f0c4f65e",
+            "/wd",
+            "2026-01-01T00:00:00Z",
+        )
         .unwrap();
-    let rec = store.get_session("s1").unwrap().unwrap();
+    let rec = store
+        .get_session("ses_8ddf878039b70767c4a5bcf4f0c4f65e")
+        .unwrap()
+        .unwrap();
     assert_eq!(rec.workdir, "/wd");
 }
 

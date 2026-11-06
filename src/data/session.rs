@@ -11,11 +11,11 @@ use std::time::{Instant, SystemTime};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::data::config::effective::EffectiveConfig;
+use crate::data::config::effective::{ConfigLayers, EffectiveConfig};
 use crate::data::config::env::EnvSnapshot;
+use crate::data::config::file::ConfigFile;
 use crate::data::config::flags::FlagConfig;
-use crate::data::config::global::GlobalConfig;
-use crate::data::config::repo::RepoConfig;
+use crate::data::config::overrides::ConfigOverrides;
 use crate::data::error::DataError;
 use crate::data::fs::SquadPaths;
 use crate::data::workflow_state::WorkflowSummary;
@@ -421,8 +421,10 @@ pub struct Session {
     /// place that decides, a `.git` probe is wrong for a worktree or a
     /// submodule, and a frontend must not be the layer asking.
     is_git_repo: bool,
-    repo_config: RepoConfig,
-    global_config: GlobalConfig,
+    /// The merged config (global → repo → env → `--set`), resolved and
+    /// validated once at open. [`Session::effective_config`] pairs it with the
+    /// current flags and env snapshot.
+    config: EffectiveConfig,
     env: EnvSnapshot,
     flags: FlagConfig,
     default_agent: Option<AgentName>,
@@ -442,6 +444,8 @@ pub struct SessionOpenOptions {
     pub flags: FlagConfig,
     pub env: Option<EnvSnapshot>,
     pub available_agents: Option<Vec<AgentName>>,
+    /// `--set key=value` overrides, already resolved against the key table.
+    pub overrides: ConfigOverrides,
 }
 
 impl Session {
@@ -537,7 +541,7 @@ impl Session {
     ///   a security control;
     /// - the repo `agent`, which decides the agent a step runs when it names
     ///   none (and so which agent `--agent-flag` targets);
-    /// - the env, flags and global config, so a relocated `AWMAN_CONFIG_HOME`
+    /// - the env, flags and global config, so a relocated `AWMAN_HOME`
     ///   is honoured exactly as the invoker honoured it.
     /// - the definition root, so uncommitted agent definitions and their
     ///   approvals follow every step into the worktree.
@@ -555,12 +559,42 @@ impl Session {
                 flags: invoker.flags.clone(),
                 env: Some(invoker.env.clone()),
                 available_agents: Some(invoker.available_agents.clone()),
+                overrides: invoker.config.layers().set.clone(),
             },
         )?;
-        session.repo_config.builtin = invoker.repo_config.builtin.clone();
+        // The invoker's repo `runtime.builtin` block and `agents.default`, and
+        // its global file and overrides, replace the checkout's.
+        let mut layers = session.config.layers().clone();
+        let invoker_layers = invoker.config.layers();
+        let invoker_builtin = invoker_layers
+            .repo
+            .runtime
+            .as_ref()
+            .and_then(|r| r.builtin.clone());
+        if invoker_builtin.is_some() || layers.repo.runtime.is_some() {
+            layers
+                .repo
+                .runtime
+                .get_or_insert_with(Default::default)
+                .builtin = invoker_builtin;
+        }
+        let invoker_agent = invoker_layers
+            .repo
+            .agents
+            .as_ref()
+            .and_then(|a| a.default.clone());
+        if invoker_agent.is_some() || layers.repo.agents.is_some() {
+            layers
+                .repo
+                .agents
+                .get_or_insert_with(Default::default)
+                .default = invoker_agent;
+        }
+        layers.global = invoker_layers.global.clone();
+        layers.env = invoker_layers.env.clone();
+        session.config =
+            EffectiveConfig::resolve(layers, session.flags.clone(), session.env.clone())?;
         session.definition_root = invoker.definition_root.clone();
-        session.repo_config.agent = invoker.repo_config.agent.clone();
-        session.global_config = invoker.global_config.clone();
         session.default_agent = invoker.default_agent.clone();
         Ok(session)
     }
@@ -585,8 +619,7 @@ impl Session {
             git_root,
             definition_root: invoker.definition_root.clone(),
             is_git_repo: true,
-            repo_config: invoker.repo_config.clone(),
-            global_config: invoker.global_config.clone(),
+            config: invoker.config.clone(),
             env: invoker.env.clone(),
             flags: invoker.flags.clone(),
             default_agent: invoker.default_agent.clone(),
@@ -607,22 +640,17 @@ impl Session {
         is_git_repo: bool,
     ) -> Result<Self, DataError> {
         let env = opts.env.unwrap_or_else(EnvSnapshot::empty);
-        let repo_config = RepoConfig::load(&git_root)?;
-        let global_config = GlobalConfig::load_with(&env)?;
+        let layers = ConfigLayers::load(&env, Some(&git_root), opts.overrides.clone())?;
+        let config = EffectiveConfig::resolve(layers, opts.flags.clone(), env.clone())?;
 
         // One agent-precedence rule, and it is `EffectiveConfig`'s
         // (flag > repo.agent > global.default_agent). This used to be
         // re-encoded here as `resolve_default_agent`, which is exactly the
         // drift Layer 0 is supposed to prevent (WI 0114 F-30).
-        let default_agent = EffectiveConfig::new(
-            opts.flags.clone(),
-            env.clone(),
-            repo_config.clone(),
-            global_config.clone(),
-        )
-        .agent()
-        .map(|name| AgentName::new(&name))
-        .transpose()?;
+        let default_agent = config
+            .agent()
+            .map(|name| AgentName::new(&name))
+            .transpose()?;
         let available_agents = opts.available_agents.unwrap_or_default();
 
         let now = SystemTime::now();
@@ -635,8 +663,7 @@ impl Session {
             definition_root: git_root.clone(),
             git_root,
             is_git_repo,
-            repo_config,
-            global_config,
+            config,
             env,
             flags: opts.flags,
             default_agent,
@@ -684,12 +711,9 @@ impl Session {
         self.is_git_repo
     }
 
-    pub fn repo_config(&self) -> &RepoConfig {
-        &self.repo_config
-    }
-
-    pub fn global_config(&self) -> &GlobalConfig {
-        &self.global_config
+    /// The merged config file (defaults applied).
+    pub fn config(&self) -> &ConfigFile {
+        self.config.config()
     }
 
     pub fn env(&self) -> &EnvSnapshot {
@@ -749,6 +773,32 @@ impl Session {
         self.flags = flags;
     }
 
+    /// Add `--set`-layer overrides (applied after any already present) and
+    /// re-resolve the merged config.
+    pub fn add_overrides(&mut self, overrides: ConfigOverrides) -> Result<(), DataError> {
+        if overrides.is_empty() {
+            return Ok(());
+        }
+        let mut layers = self.config.layers().clone();
+        layers.set.0.extend(overrides.0);
+        self.config = EffectiveConfig::resolve(layers, self.flags.clone(), self.env.clone())?;
+        Ok(())
+    }
+
+    /// Install a squad task's config file as the task layer (above global
+    /// and repo, below env and `--set`) and re-resolve. Without this a task's
+    /// restrictions, overlays, concurrency and prerequisite denials are
+    /// accepted by validation but never reach the session that runs it.
+    pub fn set_task_config(
+        &mut self,
+        task: crate::data::config::ConfigFile,
+    ) -> Result<(), DataError> {
+        let mut layers = self.config.layers().clone();
+        layers.task = Some(task);
+        self.config = EffectiveConfig::resolve(layers, self.flags.clone(), self.env.clone())?;
+        Ok(())
+    }
+
     /// Replace the captured env snapshot.
     pub fn set_env(&mut self, env: EnvSnapshot) {
         self.env = env;
@@ -762,19 +812,17 @@ impl Session {
 
     /// Return a freshly-merged `EffectiveConfig` view.
     pub fn effective_config(&self) -> EffectiveConfig {
-        EffectiveConfig::new(
-            self.flags.clone(),
-            self.env.clone(),
-            self.repo_config.clone(),
-            self.global_config.clone(),
-        )
+        self.config
+            .clone()
+            .with_flags(self.flags.clone())
+            .with_env(self.env.clone())
     }
 }
 
 /// The one way a unit test builds a `Session` (WI 0114 F-52).
 ///
 /// Twenty-three copies of a private `make_session` used to stand here, one per
-/// test module, and they had drifted: some pinned `AWMAN_CONFIG_HOME` at a
+/// test module, and they had drifted: some pinned `AWMAN_HOME` at a
 /// temp dir and some did not, so whether a test could fall through to the
 /// developer's real `~/.awman/config.json` depended on which module it lived
 /// in. These three constructors cover every shape those copies had between
@@ -793,14 +841,14 @@ impl Session {
         Self::for_tests_with_options(root, SessionOpenOptions::default())
     }
 
-    /// As [`Session::for_tests`], but with `AWMAN_CONFIG_HOME` pinned at
+    /// As [`Session::for_tests`], but with `AWMAN_HOME` pinned at
     /// `config_home` so the session cannot read the developer's real global
     /// config. Any test asserting on a config *source* must use this.
     pub(crate) fn for_tests_isolated(root: &Path, config_home: &Path) -> Self {
         Self::for_tests_with_env(
             root,
             EnvSnapshot::with_overrides([(
-                crate::data::config::env::AWMAN_CONFIG_HOME,
+                crate::data::fs::data_paths::AWMAN_HOME,
                 config_home.to_str().expect("fixture path must be UTF-8"),
             )]),
         )
@@ -827,8 +875,9 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::config::env::{EnvSnapshot, AWMAN_CONFIG_HOME};
-    use crate::data::config::repo::REPO_CONFIG_SUBDIR;
+    use crate::data::config::env::EnvSnapshot;
+    use crate::data::config::file::REPO_CONFIG_SUBDIR;
+    use crate::data::fs::data_paths::AWMAN_HOME;
 
     // ─── helpers ─────────────────────────────────────────────────────────────
 
@@ -846,10 +895,7 @@ mod tests {
         }
 
         fn env(&self) -> EnvSnapshot {
-            EnvSnapshot::with_overrides([(
-                AWMAN_CONFIG_HOME,
-                self.home_dir.path().to_str().unwrap(),
-            )])
+            EnvSnapshot::with_overrides([(AWMAN_HOME, self.home_dir.path().to_str().unwrap())])
         }
 
         fn open_session(&self) -> Session {
@@ -862,6 +908,7 @@ mod tests {
                 flags,
                 env: Some(self.env()),
                 available_agents: None,
+                overrides: Default::default(),
             };
             Session::open(self.git_root.path().to_path_buf(), &resolver, opts).unwrap()
         }
@@ -890,6 +937,38 @@ mod tests {
         .unwrap();
         assert_eq!(session.git_root(), root);
         assert!(!session.is_git_repo());
+    }
+
+    #[test]
+    fn task_config_becomes_the_task_layer_above_repo_and_below_set() {
+        use crate::data::config::{ConfigFile, FileKind};
+        let setup = IsolatedSetup::new();
+        let mut session = setup.open_session();
+        let task = ConfigFile::from_value(
+            serde_json::json!({
+                "agents": {"yolo": {"disallowedTools": ["Bash"]}},
+                "workflows": {"maxConcurrentSteps": 1}
+            }),
+            FileKind::Task,
+        )
+        .unwrap();
+        session.set_task_config(task).unwrap();
+        let config = session.effective_config();
+        assert_eq!(config.value()["workflows"]["maxConcurrentSteps"], 1);
+        assert_eq!(
+            config.value()["agents"]["yolo"]["disallowedTools"],
+            serde_json::json!(["Bash"])
+        );
+        // `--set` still wins over the task layer.
+        let set = crate::data::config::overrides::ConfigOverrides::parse_set_args(&[
+            "workflows.maxConcurrentSteps=3".to_string(),
+        ])
+        .unwrap();
+        session.add_overrides(set).unwrap();
+        assert_eq!(
+            session.effective_config().value()["workflows"]["maxConcurrentSteps"],
+            3
+        );
     }
 
     // ─── AgentName tests ─────────────────────────────────────────────────────
@@ -1059,19 +1138,18 @@ mod tests {
         std::fs::create_dir_all(&awman_dir).unwrap();
         std::fs::write(
             awman_dir.join("config.json"),
-            r#"{"agent":"codex","terminal_scrollback_lines":7777}"#,
+            r#"{"agents":{"default":"codex"},"tui":{"scrollbackLines":7777}}"#,
         )
         .unwrap();
 
         // Write global config: sets a different agent (should lose to repo) and scrollback.
         std::fs::write(
             home_tmp.path().join("config.json"),
-            r#"{"default_agent":"claude","terminal_scrollback_lines":2000}"#,
+            r#"{"agents":{"default":"claude"},"tui":{"scrollbackLines":2000}}"#,
         )
         .unwrap();
 
-        let env =
-            EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, home_tmp.path().to_str().unwrap())]);
+        let env = EnvSnapshot::with_overrides([(AWMAN_HOME, home_tmp.path().to_str().unwrap())]);
         let resolver = StaticGitRootResolver::new(git_tmp.path());
         let opts = SessionOpenOptions {
             env: Some(env),
@@ -1084,11 +1162,19 @@ mod tests {
         // EffectiveConfig reflects repo scrollback win.
         let ec = session.effective_config();
         assert_eq!(ec.scrollback_lines(), 7777);
-        // Both raw configs are accessible.
-        assert_eq!(session.repo_config().agent.as_deref(), Some("codex"));
+        // Each layer stays visible.
+        let layers = ec.layers();
         assert_eq!(
-            session.global_config().default_agent.as_deref(),
+            layers.repo.agents.as_ref().unwrap().default.as_deref(),
+            Some("codex")
+        );
+        assert_eq!(
+            layers.global.agents.as_ref().unwrap().default.as_deref(),
             Some("claude")
+        );
+        assert_eq!(
+            ec.source_of("agents.default"),
+            crate::data::config::Layer::Repo
         );
     }
 
@@ -1117,22 +1203,20 @@ mod tests {
                 std::fs::create_dir_all(&awman_dir).unwrap();
                 std::fs::write(
                     awman_dir.join("config.json"),
-                    format!(r#"{{"agent":"{a}"}}"#),
+                    format!(r#"{{"agents":{{"default":"{a}"}}}}"#),
                 )
                 .unwrap();
             }
             if let Some(a) = global_agent {
                 std::fs::write(
                     home_tmp.path().join("config.json"),
-                    format!(r#"{{"default_agent":"{a}"}}"#),
+                    format!(r#"{{"agents":{{"default":"{a}"}}}}"#),
                 )
                 .unwrap();
             }
 
-            let env = EnvSnapshot::with_overrides([(
-                AWMAN_CONFIG_HOME,
-                home_tmp.path().to_str().unwrap(),
-            )]);
+            let env =
+                EnvSnapshot::with_overrides([(AWMAN_HOME, home_tmp.path().to_str().unwrap())]);
             let resolver = StaticGitRootResolver::new(git_tmp.path());
             let opts = SessionOpenOptions {
                 env: Some(env),

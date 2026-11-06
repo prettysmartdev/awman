@@ -146,7 +146,7 @@ fn wi0149_flag_parsing_and_identity_validation_matrix() {
 }
 #[test]
 fn wi0149_remote_frontends_refuse_widening_but_accept_narrowing() {
-    for kind in [FrontendKind::Api, FrontendKind::SquadDaemon] {
+    for kind in [FrontendKind::Api, FrontendKind::Background] {
         for flags in [
             PrerequisiteFlags {
                 ssh: Some(SshFlag::All),
@@ -490,7 +490,7 @@ fn wi0149_repo_acquire_requires_exact_hash_approval_in_all_headless_frontends() 
     )]);
     for kind in [
         FrontendKind::Api,
-        FrontendKind::SquadDaemon,
+        FrontendKind::Background,
         FrontendKind::Cli,
     ] {
         let session = Session::for_tests_isolated(dir.path(), dir.path());
@@ -651,17 +651,36 @@ fn wi0149_repo_allow_and_acquire_cannot_grant_to_api_squad_or_headless_cli() {
     let key = home.join(".ssh/id_ed25519");
     std::fs::write(&key, "-----BEGIN PRIVATE KEY-----\nfixture\n").unwrap();
     std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
-    std::fs::write(repo.join(".awman/config.json"), serde_json::json!({"workflows":{"prerequisites":{"ssh":{"use":"allow","key":key},"githubToken":{"use":"allow","acquire":{"argv":[program]}}}}}).to_string()).unwrap();
+    // A repo acquire command is refused outright: `acquire.*` is global-only.
+    std::fs::write(repo.join(".awman/config.json"), serde_json::json!({"workflows":{"prerequisites":{"githubToken":{"acquire":{"argv":[program]}}}}}).to_string()).unwrap();
+    let refused = Session::open_at_git_root(
+        repo.clone(),
+        repo.clone(),
+        crate::data::session::SessionOpenOptions {
+            env: Some(crate::data::config::env::EnvSnapshot::with_overrides([(
+                "AWMAN_HOME",
+                home.to_str().unwrap(),
+            )])),
+            ..Default::default()
+        },
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        refused.contains("acquire.argv") && refused.contains("global config file"),
+        "{refused}"
+    );
+    std::fs::write(repo.join(".awman/config.json"), serde_json::json!({"workflows":{"prerequisites":{"ssh":{"use":"allow","key":key},"githubToken":{"use":"allow"}}}}).to_string()).unwrap();
     for kind in [
         FrontendKind::Api,
-        FrontendKind::SquadDaemon,
+        FrontendKind::Background,
         FrontendKind::Cli,
     ] {
         let session = Session::for_tests_with_env(
             &repo,
             crate::data::config::env::EnvSnapshot::with_overrides([
                 ("HOME", home.to_str().unwrap()),
-                ("AWMAN_CONFIG_HOME", home.to_str().unwrap()),
+                ("AWMAN_HOME", home.to_str().unwrap()),
             ]),
         );
         let mut opts = WorkflowPrerequisiteFlowOptions::for_session(

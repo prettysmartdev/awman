@@ -1,6 +1,6 @@
 //! Resumable, unambiguous command event streams.
 //!
-//! In-process tests drive the real Axum router (`GET /v1/commands/{id}/logs`)
+//! In-process tests drive the real Axum router (`GET /v1/worker/commands/{id}/events`)
 //! over loopback with a hand-rolled SSE reader. A worker is modelled with the
 //! same parts the queue worker uses (store claim, `EventBus::for_attempt`,
 //! `CommandLogWriter`), so no Docker is needed. One end-to-end test restarts a
@@ -35,7 +35,7 @@ use awman::frontend::api::routes::{build_router, AppState, AuthMode};
 
 // ─── Fixtures ────────────────────────────────────────────────────────────────
 
-const SESSION: &str = "sess";
+const SESSION: &str = "ses_f5b338d6bca36d47ee04d93d08c57861";
 
 fn make_state(root: &std::path::Path) -> Arc<AppState> {
     let paths = ApiPaths::from_root(root);
@@ -52,7 +52,6 @@ fn make_state(root: &std::path::Path) -> Arc<AppState> {
         overlay_engine: overlay.clone(),
         auth_engine: Arc::new(AuthEngine::with_paths(auth_paths, paths.clone())),
         agent_engine: Arc::new(AgentEngine::new(overlay, runtime)),
-        config_notices: Default::default(),
         workflow_state_store: Arc::new(WorkflowStateStore::at_git_root(paths.root())),
         credential_monitor: None,
         global_config: Arc::new(Default::default()),
@@ -76,6 +75,8 @@ fn make_state(root: &std::path::Path) -> Arc<AppState> {
         })
         .unwrap();
     Arc::new(AppState {
+        live_config: std::sync::RwLock::new(None),
+        settings_tx: None,
         lifecycle_store,
         setup_cancels,
         canceller,
@@ -216,8 +217,8 @@ impl Sse {
         query: &str,
         last_event_id: Option<&str>,
     ) -> Result<Sse, (u16, String)> {
-        let mut request =
-            reqwest::Client::new().get(format!("{base}/v1/commands/{command}/logs{query}"));
+        let mut request = reqwest::Client::new()
+            .get(format!("{base}/v1/worker/commands/{command}/events{query}"));
         if let Some(id) = last_event_id {
             request = request.header("Last-Event-ID", id);
         }
@@ -324,11 +325,13 @@ async fn queued_command_waiting_past_300s_keeps_the_stream_open_with_15s_keepali
     let tmp = tempfile::tempdir().unwrap();
     let state = make_state(tmp.path());
     let base = serve(Arc::clone(&state)).await;
-    enqueue(&state, "queued");
+    enqueue(&state, "cmd_84fbe0280a6e0c725f00f8847aa6be49");
 
     within_real_time(async {
         let started = tokio::time::Instant::now();
-        let mut sse = Sse::open(&base, "queued", "", None).await.unwrap();
+        let mut sse = Sse::open(&base, "cmd_84fbe0280a6e0c725f00f8847aa6be49", "", None)
+            .await
+            .unwrap();
 
         // The informational frame is outside the cursor namespace: no id.
         let waiting = sse.next().await.unwrap();
@@ -359,14 +362,20 @@ async fn queued_command_waiting_past_300s_keeps_the_stream_open_with_15s_keepali
         assert!(started.elapsed() >= Duration::from_secs(330));
 
         // The row is still queued: no Done was fabricated.
-        let row = state.store.get_command("queued").unwrap().unwrap();
+        let row = state
+            .store
+            .get_command("cmd_84fbe0280a6e0c725f00f8847aa6be49")
+            .unwrap()
+            .unwrap();
         assert_eq!(row.status.as_str(), "queued");
 
         // A worker finally claims it; the same connection sees real output
         // and exactly one terminal Done.
-        let attempt = start_attempt(&state, "queued").await;
+        let attempt = start_attempt(&state, "cmd_84fbe0280a6e0c725f00f8847aa6be49").await;
         attempt.stdout("finally running");
-        attempt.finish(&state, "queued").await;
+        attempt
+            .finish(&state, "cmd_84fbe0280a6e0c725f00f8847aa6be49")
+            .await;
         let mut rest = Vec::new();
         while let Some(frame) = sse.next().await {
             if frame.comment.is_none() {
@@ -387,11 +396,13 @@ async fn a_queued_stream_resumes_by_id_after_the_client_reconnects_past_300s() {
     let tmp = tempfile::tempdir().unwrap();
     let state = make_state(tmp.path());
     let base = serve(Arc::clone(&state)).await;
-    enqueue(&state, "waiter");
+    enqueue(&state, "cmd_f64cff138020a2060a9817272f563b3c");
 
     within_real_time(async {
         // First connection waits 20 s of keepalives, then drops.
-        let mut first = Sse::open(&base, "waiter", "", None).await.unwrap();
+        let mut first = Sse::open(&base, "cmd_f64cff138020a2060a9817272f563b3c", "", None)
+            .await
+            .unwrap();
         let started = tokio::time::Instant::now();
         while started.elapsed() < Duration::from_secs(20) {
             first.next().await.unwrap();
@@ -399,16 +410,24 @@ async fn a_queued_stream_resumes_by_id_after_the_client_reconnects_past_300s() {
         drop(first);
 
         tokio::time::sleep(Duration::from_secs(400)).await;
-        let attempt = start_attempt(&state, "waiter").await;
+        let attempt = start_attempt(&state, "cmd_f64cff138020a2060a9817272f563b3c").await;
         attempt.stdout("a");
         attempt.stdout("b");
-        attempt.finish(&state, "waiter").await;
+        attempt
+            .finish(&state, "cmd_f64cff138020a2060a9817272f563b3c")
+            .await;
 
         // A client that saw nothing resumes from nothing; one that saw `1:0`
         // gets the rest.
-        let all = stream(&base, "waiter", "", None).await;
+        let all = stream(&base, "cmd_f64cff138020a2060a9817272f563b3c", "", None).await;
         assert_eq!(ids(&all), ["1:0", "1:1", "1:2"]);
-        let tail = stream(&base, "waiter", "", Some("1:0")).await;
+        let tail = stream(
+            &base,
+            "cmd_f64cff138020a2060a9817272f563b3c",
+            "",
+            Some("1:0"),
+        )
+        .await;
         assert_eq!(ids(&tail), ["1:1", "1:2"]);
     })
     .await;
@@ -421,9 +440,9 @@ async fn ids_are_attempt_colon_sequence_and_done_has_the_next_id() {
     let tmp = tempfile::tempdir().unwrap();
     let state = make_state(tmp.path());
     let base = serve(Arc::clone(&state)).await;
-    finished_command(&state, "ids", 3).await;
+    finished_command(&state, "cmd_bf516925bb37a8544c8ee19a24e15c05", 3).await;
 
-    let frames = stream(&base, "ids", "", None).await;
+    let frames = stream(&base, "cmd_bf516925bb37a8544c8ee19a24e15c05", "", None).await;
     assert_eq!(ids(&frames), ["1:0", "1:1", "1:2", "1:3"]);
     assert_eq!(count_done(&frames), 1);
     assert!(frames.last().unwrap().is_event("done"));
@@ -442,18 +461,30 @@ async fn resuming_from_any_point_has_no_duplicates_and_no_gaps() {
     let tmp = tempfile::tempdir().unwrap();
     let state = make_state(tmp.path());
     let base = serve(Arc::clone(&state)).await;
-    finished_command(&state, "cut", 12).await;
+    finished_command(&state, "cmd_fe47aa7c733c490d36e80508d5dc4019", 12).await;
 
-    let full = stream(&base, "cut", "", None).await;
+    let full = stream(&base, "cmd_fe47aa7c733c490d36e80508d5dc4019", "", None).await;
     let full_ids = ids(&full);
     assert_eq!(full_ids.len(), 13);
 
     for (cut, seen) in full_ids.iter().enumerate() {
         let expected = &full_ids[cut + 1..];
         // Via the header.
-        let via_header = stream(&base, "cut", "", Some(seen)).await;
+        let via_header = stream(
+            &base,
+            "cmd_fe47aa7c733c490d36e80508d5dc4019",
+            "",
+            Some(seen),
+        )
+        .await;
         // Via the query parameter.
-        let via_query = stream(&base, "cut", &format!("?after={seen}"), None).await;
+        let via_query = stream(
+            &base,
+            "cmd_fe47aa7c733c490d36e80508d5dc4019",
+            &format!("?after={seen}"),
+            None,
+        )
+        .await;
         for (how, frames) in [("header", via_header), ("after", via_query)] {
             let resumed = ids(&frames);
             if cut + 1 == full_ids.len() {
@@ -477,12 +508,24 @@ async fn after_query_overrides_last_event_id() {
     let tmp = tempfile::tempdir().unwrap();
     let state = make_state(tmp.path());
     let base = serve(Arc::clone(&state)).await;
-    finished_command(&state, "prec", 5).await;
+    finished_command(&state, "cmd_e81f51b496552d5548d2739e87daf131", 5).await;
 
-    let frames = stream(&base, "prec", "?after=1:3", Some("1:0")).await;
+    let frames = stream(
+        &base,
+        "cmd_e81f51b496552d5548d2739e87daf131",
+        "?after=1:3",
+        Some("1:0"),
+    )
+    .await;
     assert_eq!(ids(&frames), ["1:4", "1:5"]);
     // A valid query also beats a malformed header.
-    let frames = stream(&base, "prec", "?after=1:3", Some("garbage")).await;
+    let frames = stream(
+        &base,
+        "cmd_e81f51b496552d5548d2739e87daf131",
+        "?after=1:3",
+        Some("garbage"),
+    )
+    .await;
     assert_eq!(ids(&frames), ["1:4", "1:5"]);
 }
 
@@ -491,14 +534,16 @@ async fn resuming_a_live_stream_across_a_disconnect_loses_nothing() {
     let tmp = tempfile::tempdir().unwrap();
     let state = make_state(tmp.path());
     let base = serve(Arc::clone(&state)).await;
-    enqueue(&state, "live");
-    let attempt = start_attempt(&state, "live").await;
+    enqueue(&state, "cmd_d0dbe915091d400bd8ee7f27f0791303");
+    let attempt = start_attempt(&state, "cmd_d0dbe915091d400bd8ee7f27f0791303").await;
     for i in 0..5 {
         attempt.stdout(&format!("l{i}"));
     }
 
     // First client reads three events, then drops.
-    let mut first = Sse::open(&base, "live", "", None).await.unwrap();
+    let mut first = Sse::open(&base, "cmd_d0dbe915091d400bd8ee7f27f0791303", "", None)
+        .await
+        .unwrap();
     let mut seen = Vec::new();
     while seen.len() < 3 {
         let frame = first.next().await.unwrap();
@@ -514,11 +559,21 @@ async fn resuming_a_live_stream_across_a_disconnect_loses_nothing() {
     let last_seen = seen.last().unwrap().clone();
     let resumed = tokio::spawn({
         let base = base.clone();
-        async move { stream(&base, "live", "", Some(&last_seen)).await }
+        async move {
+            stream(
+                &base,
+                "cmd_d0dbe915091d400bd8ee7f27f0791303",
+                "",
+                Some(&last_seen),
+            )
+            .await
+        }
     });
     tokio::time::sleep(Duration::from_millis(100)).await;
     attempt.stdout("l9");
-    attempt.finish(&state, "live").await;
+    attempt
+        .finish(&state, "cmd_d0dbe915091d400bd8ee7f27f0791303")
+        .await;
     let resumed = resumed.await.unwrap();
 
     let rebuilt: Vec<String> = seen.into_iter().chain(ids(&resumed)).collect();
@@ -534,25 +589,30 @@ async fn events_the_log_writer_had_not_flushed_at_connect_still_arrive() {
     let tmp = tempfile::tempdir().unwrap();
     let state = make_state(tmp.path());
     let base = serve(Arc::clone(&state)).await;
-    enqueue(&state, "behind");
+    enqueue(&state, "cmd_9da3be8f92c0bbfd7a7d6d6ec0b3fad3");
     let record = state.store.claim_next_command("w").unwrap().unwrap();
     let bus = Arc::new(EventBus::for_attempt(4096, record.attempt));
     let mut log_rx = bus.subscribe_log();
-    state
-        .event_buses
-        .lock()
-        .await
-        .insert("behind".to_string(), Arc::clone(&bus));
+    state.event_buses.lock().await.insert(
+        "cmd_9da3be8f92c0bbfd7a7d6d6ec0b3fad3".to_string(),
+        Arc::clone(&bus),
+    );
     for i in 0..3 {
         bus.sender().emit(EventPayload::StdoutLine(format!("l{i}")));
     }
 
     // The client replays an empty log, and only then does the writer catch up.
-    let mut client = Sse::open(&base, "behind", "", None).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    let mut writer = CommandLogWriter::open_append(&state.paths, SESSION, "behind")
+    let mut client = Sse::open(&base, "cmd_9da3be8f92c0bbfd7a7d6d6ec0b3fad3", "", None)
         .await
         .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let mut writer = CommandLogWriter::open_append(
+        &state.paths,
+        SESSION,
+        "cmd_9da3be8f92c0bbfd7a7d6d6ec0b3fad3",
+    )
+    .await
+    .unwrap();
     for _ in 0..3 {
         writer.write_event(&log_rx.recv().await.unwrap()).await;
     }
@@ -576,22 +636,33 @@ async fn a_stale_attempt_id_replays_from_the_start_of_the_current_attempt() {
     let base = serve(Arc::clone(&state)).await;
 
     // Attempt 1 crashes mid-run (no Done); the restart re-queues it.
-    enqueue(&state, "stale");
-    let first = start_attempt(&state, "stale").await;
+    enqueue(&state, "cmd_36f34fd8319cf30f8e132ef294c616af");
+    let first = start_attempt(&state, "cmd_36f34fd8319cf30f8e132ef294c616af").await;
     first.stdout("old a");
     first.stdout("old b");
     drop(first.bus.sender());
     // Let the log writer persist, then "crash".
     tokio::time::sleep(Duration::from_millis(100)).await;
     first.writer.abort();
-    state.event_buses.lock().await.remove("stale");
-    assert_eq!(state.store.recover_stale_commands(0).unwrap(), ["stale"]);
-    let second = start_attempt(&state, "stale").await;
+    state
+        .event_buses
+        .lock()
+        .await
+        .remove("cmd_36f34fd8319cf30f8e132ef294c616af");
+    assert_eq!(
+        state.store.recover_stale_commands(0).unwrap(),
+        ["cmd_36f34fd8319cf30f8e132ef294c616af"]
+    );
+    let second = start_attempt(&state, "cmd_36f34fd8319cf30f8e132ef294c616af").await;
     second.stdout("new a");
-    second.finish(&state, "stale").await;
+    second
+        .finish(&state, "cmd_36f34fd8319cf30f8e132ef294c616af")
+        .await;
 
     // The old attempt's events are no longer kept (log pruned/rotated).
-    let log = state.paths.command_events_log_path(SESSION, "stale");
+    let log = state
+        .paths
+        .command_events_log_path(SESSION, "cmd_36f34fd8319cf30f8e132ef294c616af");
     let kept: Vec<String> = std::fs::read_to_string(&log)
         .unwrap()
         .lines()
@@ -601,7 +672,7 @@ async fn a_stale_attempt_id_replays_from_the_start_of_the_current_attempt() {
     assert!(!kept.is_empty());
     std::fs::write(&log, kept.join("\n") + "\n").unwrap();
 
-    let full_current = stream(&base, "stale", "", None).await;
+    let full_current = stream(&base, "cmd_36f34fd8319cf30f8e132ef294c616af", "", None).await;
     let current_ids = ids(&full_current);
     assert!(
         current_ids.iter().all(|id| id.starts_with("2:")),
@@ -610,7 +681,7 @@ async fn a_stale_attempt_id_replays_from_the_start_of_the_current_attempt() {
 
     for stale in ["1:1", "1:99", "0:0", "7:3"] {
         for (query, header) in [("", Some(stale)), (&*format!("?after={stale}"), None)] {
-            let frames = stream(&base, "stale", query, header).await;
+            let frames = stream(&base, "cmd_36f34fd8319cf30f8e132ef294c616af", query, header).await;
             assert_eq!(ids(&frames), current_ids, "stale cursor {stale}");
             assert!(
                 frames
@@ -628,7 +699,7 @@ async fn malformed_ids_are_rejected_with_400() {
     let tmp = tempfile::tempdir().unwrap();
     let state = make_state(tmp.path());
     let base = serve(Arc::clone(&state)).await;
-    finished_command(&state, "bad", 2).await;
+    finished_command(&state, "cmd_bae60998ffe4923b131e3d6e4c19993e", 2).await;
 
     for bad in [
         "",
@@ -640,23 +711,37 @@ async fn malformed_ids_are_rejected_with_400() {
         "1:2:3",
         "1:99999999999999999999999",
     ] {
-        let by_header = Sse::open(&base, "bad", "", Some(bad)).await;
+        let by_header =
+            Sse::open(&base, "cmd_bae60998ffe4923b131e3d6e4c19993e", "", Some(bad)).await;
         // An empty header value is not "absent": it is malformed too.
         assert_eq!(by_header.err().map(|e| e.0), Some(400), "header {bad:?}");
-        let by_query = Sse::open(&base, "bad", &format!("?after={bad}"), None).await;
+        let by_query = Sse::open(
+            &base,
+            "cmd_bae60998ffe4923b131e3d6e4c19993e",
+            &format!("?after={bad}"),
+            None,
+        )
+        .await;
         assert_eq!(by_query.err().map(|e| e.0), Some(400), "after {bad:?}");
     }
     // A bad `after` is rejected even with a good header.
-    let both = Sse::open(&base, "bad", "?after=x", Some("1:0")).await;
+    let both = Sse::open(
+        &base,
+        "cmd_bae60998ffe4923b131e3d6e4c19993e",
+        "?after=x",
+        Some("1:0"),
+    )
+    .await;
     assert_eq!(both.err().map(|e| e.0), Some(400));
     // The JSON snapshot ignores resume inputs entirely.
-    let json: serde_json::Value =
-        reqwest::get(format!("{base}/v1/commands/bad/logs?format=json&after=x"))
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
+    let json: serde_json::Value = reqwest::get(format!(
+        "{base}/v1/worker/commands/cmd_bae60998ffe4923b131e3d6e4c19993e/events?format=json&after=x"
+    ))
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
     assert_eq!(json["events"].as_array().unwrap().len(), 3);
     assert_eq!(json["attempt"], 1);
 }
@@ -668,8 +753,8 @@ async fn clients_that_ignore_id_see_unchanged_event_names_and_payloads() {
     let tmp = tempfile::tempdir().unwrap();
     let state = make_state(tmp.path());
     let base = serve(Arc::clone(&state)).await;
-    enqueue(&state, "old");
-    let attempt = start_attempt(&state, "old").await;
+    enqueue(&state, "cmd_149603e6c03516362a8da23f624db945");
+    let attempt = start_attempt(&state, "cmd_149603e6c03516362a8da23f624db945").await;
     attempt.stdout("hello");
     attempt
         .bus
@@ -679,16 +764,20 @@ async fn clients_that_ignore_id_see_unchanged_event_names_and_payloads() {
         phase: "setup".into(),
         message: "ready".into(),
     });
-    attempt.finish(&state, "old").await;
+    attempt
+        .finish(&state, "cmd_149603e6c03516362a8da23f624db945")
+        .await;
 
     // Read the raw bytes the way a client without resume support does: only `event:` and
     // `data:` lines matter, `id:` lines are skipped.
-    let raw = reqwest::get(format!("{base}/v1/commands/old/logs"))
-        .await
-        .unwrap()
-        .text()
-        .await
-        .unwrap();
+    let raw = reqwest::get(format!(
+        "{base}/v1/worker/commands/cmd_149603e6c03516362a8da23f624db945/events"
+    ))
+    .await
+    .unwrap()
+    .text()
+    .await
+    .unwrap();
     let mut legacy: Vec<(String, serde_json::Value)> = Vec::new();
     let mut event = None;
     for line in raw.lines() {
@@ -719,12 +808,14 @@ async fn clients_that_ignore_id_see_unchanged_event_names_and_payloads() {
     // Every event line is followed by an id line only as an *addition*.
     assert!(raw.lines().filter(|l| l.starts_with("id:")).count() == 4);
     // The full-log JSON snapshot keeps the same typed events.
-    let json: serde_json::Value = reqwest::get(format!("{base}/v1/commands/old/logs?format=json"))
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    let json: serde_json::Value = reqwest::get(format!(
+        "{base}/v1/worker/commands/cmd_149603e6c03516362a8da23f624db945/events?format=json"
+    ))
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
     assert_eq!(json["events"].as_array().unwrap().len(), 4);
 }
 
@@ -733,11 +824,16 @@ async fn a_pre_attempt_events_log_streams_as_attempt_one() {
     let tmp = tempfile::tempdir().unwrap();
     let state = make_state(tmp.path());
     let base = serve(Arc::clone(&state)).await;
-    enqueue(&state, "legacy");
+    enqueue(&state, "cmd_228c70bfc5589c58c044e03fff0e17eb");
     state.store.claim_next_command("w").unwrap().unwrap();
     state
         .store
-        .complete_command("legacy", CommandStatus::Done, Some(0), None)
+        .complete_command(
+            "cmd_228c70bfc5589c58c044e03fff0e17eb",
+            CommandStatus::Done,
+            Some(0),
+            None,
+        )
         .unwrap();
     // Lines as an older awman wrote them: no `attempt` field.
     let legacy = [
@@ -745,14 +841,22 @@ async fn a_pre_attempt_events_log_streams_as_attempt_one() {
         r#"{"timestamp":"2026-01-01T00:00:01Z","sequence":1,"payload":{"type":"Done"}}"#,
     ];
     std::fs::write(
-        state.paths.command_events_log_path(SESSION, "legacy"),
+        state
+            .paths
+            .command_events_log_path(SESSION, "cmd_228c70bfc5589c58c044e03fff0e17eb"),
         legacy.join("\n") + "\n",
     )
     .unwrap();
 
-    let frames = stream(&base, "legacy", "", None).await;
+    let frames = stream(&base, "cmd_228c70bfc5589c58c044e03fff0e17eb", "", None).await;
     assert_eq!(ids(&frames), ["1:0", "1:1"]);
-    let resumed = stream(&base, "legacy", "", Some("1:0")).await;
+    let resumed = stream(
+        &base,
+        "cmd_228c70bfc5589c58c044e03fff0e17eb",
+        "",
+        Some("1:0"),
+    )
+    .await;
     assert_eq!(ids(&resumed), ["1:1"]);
 }
 
@@ -762,7 +866,7 @@ async fn a_pre_attempt_events_log_streams_as_attempt_one() {
 /// over the real route. The last stdout line must precede `Done` in both the
 /// stream and `events.log`.
 async fn run_to_exit(state: &Arc<AppState>, base: &str, run: usize) {
-    let id = format!("stress-{run}");
+    let id = format!("cmd_{run:032x}");
     enqueue(state, &id);
     let attempt = start_attempt(state, &id).await;
     let mut frontend = ApiDispatchFrontend::new("exec prompt", &[], attempt.bus.sender());
@@ -885,14 +989,14 @@ mod restart {
             .await;
 
         let response = reqwest::Client::new()
-            .post(format!("{}/v1/commands", server.url))
+            .post(format!("{}/v1/worker/commands", server.url))
             .header("x-awman-session", &session)
             .json(&json!({"subcommand": "exec prompt", "args": ["slow"]}))
             .send()
             .await
             .unwrap();
         let created: Value = response.json().await.unwrap();
-        let id = created["command_id"].as_str().unwrap().to_string();
+        let id = created["id"].as_str().unwrap().to_string();
 
         let pid = home.control().join("slow.pid");
         let deadline = Instant::now() + Duration::from_secs(60);
@@ -900,7 +1004,7 @@ mod restart {
             assert!(Instant::now() < deadline, "slow agent never started");
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        let before = server.get(&format!("/v1/commands/{id}/status")).await;
+        let before = server.get(&format!("/v1/worker/commands/{id}")).await;
         assert_eq!(before["attempt"], 1, "{before}");
 
         // Crash the daemon mid-run; the restart re-queues the command and the
@@ -910,7 +1014,7 @@ mod restart {
         let server = home.start().await;
         let deadline = Instant::now() + Duration::from_secs(120);
         let record = loop {
-            let record = server.get(&format!("/v1/commands/{id}/status")).await;
+            let record = server.get(&format!("/v1/worker/commands/{id}")).await;
             if record["status"] == "done" || record["status"] == "error" {
                 break record;
             }
@@ -956,7 +1060,7 @@ mod restart {
 
         // The full-log snapshot is the appended history for both attempts.
         let snapshot = server
-            .get(&format!("/v1/commands/{id}/logs?format=json"))
+            .get(&format!("/v1/worker/commands/{id}/events?format=json"))
             .await;
         assert_eq!(snapshot["attempt"], 2);
         let attempts: Vec<u64> = snapshot["events"]
@@ -977,18 +1081,21 @@ async fn delayed_persistence_repairs_attach_and_broadcast_lag_before_completion(
         let tmp = tempfile::tempdir().unwrap();
         let state = make_state(tmp.path());
         let base = serve(Arc::clone(&state)).await;
-        enqueue(&state, "gap");
+        enqueue(&state, "cmd_df9bcbd6578a1e49c06b7ec2874f9e23");
         state.store.claim_next_command("w").unwrap().unwrap();
         let bus = Arc::new(EventBus::new(4));
         let mut log_rx = bus.subscribe_log();
-        let mut writer = CommandLogWriter::open_append(&state.paths, SESSION, "gap")
-            .await
-            .unwrap();
-        state
-            .event_buses
-            .lock()
-            .await
-            .insert("gap".into(), Arc::clone(&bus));
+        let mut writer = CommandLogWriter::open_append(
+            &state.paths,
+            SESSION,
+            "cmd_df9bcbd6578a1e49c06b7ec2874f9e23",
+        )
+        .await
+        .unwrap();
+        state.event_buses.lock().await.insert(
+            "cmd_df9bcbd6578a1e49c06b7ec2874f9e23".into(),
+            Arc::clone(&bus),
+        );
         bus.sender().emit(EventPayload::StdoutLine("0".into()));
         writer.write_event(&log_rx.recv().await.unwrap()).await;
         writer.flush().await;
@@ -998,7 +1105,9 @@ async fn delayed_persistence_repairs_attach_and_broadcast_lag_before_completion(
                 bus.sender().emit(EventPayload::StdoutLine(n.to_string()));
             }
         }
-        let mut client = Sse::open(&base, "gap", "", None).await.unwrap();
+        let mut client = Sse::open(&base, "cmd_df9bcbd6578a1e49c06b7ec2874f9e23", "", None)
+            .await
+            .unwrap();
         assert_eq!(client.next().await.unwrap().id.as_deref(), Some("1:0"));
         if !attach_gap {
             // No yield: exceed the live broadcast capacity deterministically.
@@ -1042,7 +1151,7 @@ async fn delayed_persistence_repairs_attach_and_broadcast_lag_before_completion(
         assert_eq!(
             state
                 .store
-                .get_command("gap")
+                .get_command("cmd_df9bcbd6578a1e49c06b7ec2874f9e23")
                 .unwrap()
                 .unwrap()
                 .status
@@ -1053,7 +1162,12 @@ async fn delayed_persistence_repairs_attach_and_broadcast_lag_before_completion(
         writer.await.unwrap();
         state
             .store
-            .complete_command("gap", CommandStatus::Done, Some(0), None)
+            .complete_command(
+                "cmd_df9bcbd6578a1e49c06b7ec2874f9e23",
+                CommandStatus::Done,
+                Some(0),
+                None,
+            )
             .unwrap();
         let tail = client.all().await;
         assert_eq!(ids(&tail), ["1:101"]);
@@ -1066,15 +1180,16 @@ async fn unrecoverable_live_gap_closes_without_advancing_cursor_or_done() {
     let tmp = tempfile::tempdir().unwrap();
     let state = make_state(tmp.path());
     let base = serve(Arc::clone(&state)).await;
-    enqueue(&state, "missing");
+    enqueue(&state, "cmd_ea21841da70e6405af19fabc4ff8bdd9");
     state.store.claim_next_command("w").unwrap().unwrap();
     let bus = Arc::new(EventBus::new(4));
-    state
-        .event_buses
-        .lock()
+    state.event_buses.lock().await.insert(
+        "cmd_ea21841da70e6405af19fabc4ff8bdd9".into(),
+        Arc::clone(&bus),
+    );
+    let mut client = Sse::open(&base, "cmd_ea21841da70e6405af19fabc4ff8bdd9", "", None)
         .await
-        .insert("missing".into(), Arc::clone(&bus));
-    let mut client = Sse::open(&base, "missing", "", None).await.unwrap();
+        .unwrap();
     // First keepalive proves subscription is established, without real sleep.
     assert!(client.next().await.unwrap().comment.is_some());
     for n in 0..100 {
@@ -1086,7 +1201,7 @@ async fn unrecoverable_live_gap_closes_without_advancing_cursor_or_done() {
     assert_eq!(
         state
             .store
-            .get_command("missing")
+            .get_command("cmd_ea21841da70e6405af19fabc4ff8bdd9")
             .unwrap()
             .unwrap()
             .status
@@ -1100,18 +1215,30 @@ async fn inverted_legacy_records_and_ahead_terminal_cursor_keep_completion_unamb
     let tmp = tempfile::tempdir().unwrap();
     let state = make_state(tmp.path());
     let base = serve(Arc::clone(&state)).await;
-    finished_command(&state, "inverted", 3).await;
-    let mut events = state.paths.read_command_events(SESSION, "inverted");
+    finished_command(&state, "cmd_184401f335d6b8661e04dfea47b9dcd5", 3).await;
+    let mut events = state
+        .paths
+        .read_command_events(SESSION, "cmd_184401f335d6b8661e04dfea47b9dcd5");
     events.swap(0, 2);
-    let mut writer =
-        std::fs::File::create(state.paths.command_events_log_path(SESSION, "inverted")).unwrap();
+    let mut writer = std::fs::File::create(
+        state
+            .paths
+            .command_events_log_path(SESSION, "cmd_184401f335d6b8661e04dfea47b9dcd5"),
+    )
+    .unwrap();
     use std::io::Write as _;
     for event in events {
         writeln!(writer, "{}", serde_json::to_string(&event).unwrap()).unwrap();
     }
-    let frames = stream(&base, "inverted", "", None).await;
+    let frames = stream(&base, "cmd_184401f335d6b8661e04dfea47b9dcd5", "", None).await;
     assert_eq!(ids(&frames), ["1:0", "1:1", "1:2", "1:3"]);
-    let frames = stream(&base, "inverted", "", Some("1:999")).await;
+    let frames = stream(
+        &base,
+        "cmd_184401f335d6b8661e04dfea47b9dcd5",
+        "",
+        Some("1:999"),
+    )
+    .await;
     assert_eq!(ids(&frames), ["1:3"]);
     assert_eq!(count_done(&frames), 1);
 }
@@ -1120,7 +1247,7 @@ async fn inverted_legacy_records_and_ahead_terminal_cursor_keep_completion_unamb
 async fn shutdown_closes_queued_stream_without_done() {
     let tmp = tempfile::tempdir().unwrap();
     let state = make_state(tmp.path());
-    enqueue(&state, "shutdown");
+    enqueue(&state, "cmd_5924f03a95ee6f7277e5bdd1e81b8fdc");
     let shutdown = tokio_util::sync::CancellationToken::new();
     let app = build_router(state).layer(axum::Extension(shutdown.clone()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1128,7 +1255,9 @@ async fn shutdown_closes_queued_stream_without_done() {
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
-    let mut client = Sse::open(&base, "shutdown", "", None).await.unwrap();
+    let mut client = Sse::open(&base, "cmd_5924f03a95ee6f7277e5bdd1e81b8fdc", "", None)
+        .await
+        .unwrap();
     assert!(client.next().await.unwrap().is_event("status_message"));
     shutdown.cancel();
     let frames = within_real_time(client.all()).await;
@@ -1150,7 +1279,7 @@ async fn real_git_worker_drains_chatty_process_before_done_in_live_stream_and_lo
         .await;
     for run in 0..8 {
         let created: serde_json::Value = reqwest::Client::new()
-            .post(format!("{}/v1/commands", server.url))
+            .post(format!("{}/v1/worker/commands", server.url))
             .header("x-awman-session", &session)
             .json(&serde_json::json!({"subcommand": "exec prompt", "args": ["burst"]}))
             .send()
@@ -1161,12 +1290,12 @@ async fn real_git_worker_drains_chatty_process_before_done_in_live_stream_and_lo
             .json()
             .await
             .unwrap();
-        let id = created["command_id"].as_str().unwrap();
+        let id = created["id"].as_str().unwrap();
         let frames =
             tokio::time::timeout(Duration::from_secs(60), stream(&server.url, id, "", None))
                 .await
                 .unwrap();
-        let record = server.get(&format!("/v1/commands/{id}/status")).await;
+        let record = server.get(&format!("/v1/worker/commands/{id}")).await;
         assert_eq!(
             record["status"],
             "done",
@@ -1208,27 +1337,37 @@ async fn crash_after_persisted_done_keeps_history_but_only_current_done_ends_sse
     let tmp = tempfile::tempdir().unwrap();
     let state = make_state(tmp.path());
     let base = serve(Arc::clone(&state)).await;
-    enqueue(&state, "crashed-done");
-    let first = start_attempt(&state, "crashed-done").await;
-    first.stdout("old");
+    enqueue(&state, "cmd_0355b7339d8462a7b418a34ef9fe62c3");
+    let first = start_attempt(&state, "cmd_0355b7339d8462a7b418a34ef9fe62c3").await;
+    first.stdout("cmd_149603e6c03516362a8da23f624db945");
     first.bus.sender().emit(EventPayload::Done);
     first.writer.await.unwrap();
     // Crash after log flush, before terminal row publication.
-    state.event_buses.lock().await.remove("crashed-done");
+    state
+        .event_buses
+        .lock()
+        .await
+        .remove("cmd_0355b7339d8462a7b418a34ef9fe62c3");
     assert_eq!(
         state.store.recover_stale_commands(0).unwrap(),
-        ["crashed-done"]
+        ["cmd_0355b7339d8462a7b418a34ef9fe62c3"]
     );
-    let mut client = Sse::open(&base, "crashed-done", "", None).await.unwrap();
+    let mut client = Sse::open(&base, "cmd_0355b7339d8462a7b418a34ef9fe62c3", "", None)
+        .await
+        .unwrap();
     assert_eq!(client.next().await.unwrap().id.as_deref(), Some("1:0"));
     assert!(client.next().await.unwrap().is_event("status_message"));
-    let second = start_attempt(&state, "crashed-done").await;
+    let second = start_attempt(&state, "cmd_0355b7339d8462a7b418a34ef9fe62c3").await;
     second.stdout("new");
-    second.finish(&state, "crashed-done").await;
+    second
+        .finish(&state, "cmd_0355b7339d8462a7b418a34ef9fe62c3")
+        .await;
     let tail = client.all().await;
     assert_eq!(ids(&tail), ["2:0", "2:1"]);
     assert_eq!(count_done(&tail), 1);
-    let persisted = state.paths.read_command_events(SESSION, "crashed-done");
+    let persisted = state
+        .paths
+        .read_command_events(SESSION, "cmd_0355b7339d8462a7b418a34ef9fe62c3");
     assert_eq!(
         persisted
             .iter()
@@ -1236,7 +1375,13 @@ async fn crash_after_persisted_done_keeps_history_but_only_current_done_ends_sse
             .count(),
         2
     );
-    let resumed = stream(&base, "crashed-done", "", Some("1:1")).await;
+    let resumed = stream(
+        &base,
+        "cmd_0355b7339d8462a7b418a34ef9fe62c3",
+        "",
+        Some("1:1"),
+    )
+    .await;
     assert_eq!(ids(&resumed), ["2:0", "2:1"]);
 }
 
@@ -1254,7 +1399,7 @@ async fn real_git_cancelling_chatty_process_drains_and_sends_done_without_timeou
         .ready_session(serde_json::json!({"session_type": "remote", "repo_url": origin.url}))
         .await;
     let created: serde_json::Value = reqwest::Client::new()
-        .post(format!("{}/v1/commands", server.url))
+        .post(format!("{}/v1/worker/commands", server.url))
         .header("x-awman-session", &session)
         .json(&serde_json::json!({"subcommand": "exec prompt", "args": ["burst"]}))
         .send()
@@ -1265,7 +1410,7 @@ async fn real_git_cancelling_chatty_process_drains_and_sends_done_without_timeou
         .json()
         .await
         .unwrap();
-    let id = created["command_id"].as_str().unwrap();
+    let id = created["id"].as_str().unwrap();
     let mut client = Sse::open(&server.url, id, "", None).await.unwrap();
     // An output event proves this is a running cancellation, not a queued one.
     loop {
@@ -1279,7 +1424,7 @@ async fn real_git_cancelling_chatty_process_drains_and_sends_done_without_timeou
         assert!(!frame.is_event("done"));
     }
     let cancelled = reqwest::Client::new()
-        .post(format!("{}/v1/commands/{id}/cancel", server.url))
+        .post(format!("{}/v1/worker/commands/{id}/cancel", server.url))
         .send()
         .await
         .unwrap();
@@ -1288,7 +1433,7 @@ async fn real_git_cancelling_chatty_process_drains_and_sends_done_without_timeou
         .await
         .unwrap();
     assert_eq!(count_done(&tail), 1);
-    let record = server.get(&format!("/v1/commands/{id}/status")).await;
+    let record = server.get(&format!("/v1/worker/commands/{id}")).await;
     assert_eq!(record["status"], "cancelled", "{record}\n{}", server.log());
     assert!(
         !server.log().contains("output drain did not finish"),

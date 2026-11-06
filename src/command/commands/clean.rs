@@ -851,7 +851,7 @@ mod tests {
     use tempfile::TempDir;
 
     // ─── Env-var mutations ────────────────────────────────────────────────────
-    // Tests that set AWMAN_CONFIG_HOME take `ConfigHomeGuard`, the one lock
+    // Tests that set AWMAN_HOME take `ConfigHomeGuard`, the one lock
     // over that process-wide variable. A mutex private to this module would
     // serialise these tests against each other only, leaving them free to
     // repoint the config home under a `dispatch` or `overlay` test.
@@ -1121,7 +1121,7 @@ mod tests {
 
         let paths = crate::data::fs::ApiPaths::from_env(
             &crate::data::config::env::EnvSnapshot::with_overrides([(
-                crate::data::config::env::AWMAN_CONFIG_HOME,
+                crate::data::fs::data_paths::AWMAN_HOME,
                 home.path().to_str().unwrap(),
             )]),
         )

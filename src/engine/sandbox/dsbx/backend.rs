@@ -4,7 +4,7 @@
 //! lifecycle (`run`/`create`/`stop`/`rm`), listing (`sbx ls --json`),
 //! exec, and the interactive PTY-bridged launch ([`run_interactive`]).
 //!
-//! Every non-interactive `sbx` invocation goes through [`super::spawn`]; the
+//! Every headless `sbx` invocation goes through [`super::spawn`]; the
 //! interactive `sbx run` PTY session is bridged by [`super::io_bridge`] after
 //! its argv is announced on the sink.
 
@@ -413,7 +413,7 @@ fn push_workspace_positional(argv: &mut Vec<String>, options: &ResolvedSandboxOp
 }
 
 /// Agent args appended after the `--` delimiter, mirroring the argv the
-/// container path builds after the entrypoint: non-interactive
+/// container path builds after the entrypoint: headless
 /// subcommand/flag, mode flags (yolo/auto/plan), model flag, user `agentFlags`,
 /// then the seeded prompt (a bare positional would be parsed by sbx as a workspace PATH).
 /// Only `kind: agent` kits take agent args — awman owns their entrypoint,
@@ -1240,7 +1240,7 @@ mod tests {
         assert_eq!(argv, vec!["run", "awman-h-gemini"]);
     }
 
-    // ─── Agent args: model / mode flags / non-interactive (kind: agent) ────
+    // ─── Agent args: model / mode flags / headless (kind: agent) ────
 
     #[test]
     fn model_flag_appended_after_delimiter_for_agent_kits() {
@@ -1352,7 +1352,7 @@ mod tests {
 
     #[test]
     fn non_interactive_prepends_definition_flag_for_agent_kits() {
-        // cline's non-interactive shape is the `task` subcommand — it must be
+        // cline's headless shape is the `task` subcommand — it must be
         // the first agent arg, before flags and the prompt, mirroring the
         // container path's `entrypoint_for`.
         let o = opts(vec![
@@ -1366,9 +1366,9 @@ mod tests {
 
     #[test]
     fn non_interactive_adds_no_token_for_an_agent_kit_without_one() {
-        // Every first-party `kind: agent` kit declares a non-interactive
+        // Every first-party `kind: agent` kit declares a headless
         // token; this needs a test-only definition (the former maki shape).
-        // maki has no non-interactive flag → no extra token.
+        // maki has no headless flag → no extra token.
         let o = opts(vec![
             SandboxOption::AgentId("maki".into()),
             SandboxOption::Interactive(false),

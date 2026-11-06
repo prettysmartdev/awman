@@ -835,7 +835,7 @@ mod tests {
     fn run_frontend(tmp: &Path) -> UnattendedFrontend {
         UnattendedFrontend::for_run(
             "task",
-            &RunId("run-0112".into()),
+            &RunId::new(),
             tmp,
             "workflow",
             MountScopeDecision::MountGitRoot,
@@ -1162,7 +1162,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut frontend = UnattendedFrontend::for_run(
             "task",
-            &RunId("run-0114".into()),
+            &RunId::new(),
             tmp.path(),
             "leader",
             MountScopeDecision::MountCurrentDirOnly,
@@ -1270,7 +1270,7 @@ mod tests {
     #[tokio::test]
     async fn leader_and_workflow_container_output_is_written_to_each_run_log() {
         let tmp = tempfile::tempdir().unwrap();
-        let run_id = RunId("run-0106".into());
+        let run_id = RunId::new();
 
         for (label, container) in [
             ("leader", "awman-squad-task-11111111"),
@@ -1326,7 +1326,7 @@ mod wi0149_tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut frontend = UnattendedFrontend::for_run(
             "task",
-            &RunId("run-0149".into()),
+            &RunId::new(),
             tmp.path(),
             "workflow",
             MountScopeDecision::MountGitRoot,

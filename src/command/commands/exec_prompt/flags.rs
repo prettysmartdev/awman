@@ -14,7 +14,7 @@ pub struct ExecPromptCommandFlags {
     pub auto: bool,
     pub agent: Option<String>,
     pub model: Option<String>,
-    pub launch_mode: Option<crate::data::config::repo::LaunchMode>,
+    pub launch_mode: Option<crate::data::config::agents::LaunchMode>,
     pub overlay: Vec<String>,
     /// `--agent-flag` values; `None` lets config `agentFlags` apply.
     pub agent_flags: Option<Vec<String>>,
@@ -35,17 +35,14 @@ impl super::ExecPromptCommand {
         Ok(Self::new(
             ExecPromptCommandFlags {
                 prompt,
-                non_interactive: ctx.flags.bool("non-interactive"),
+                non_interactive: ctx.flags.bool("headless"),
                 plan: ctx.flags.bool("plan"),
                 allow_docker: ctx.flags.bool("allow-docker"),
                 yolo: ctx.flags.bool("yolo"),
                 auto: ctx.flags.bool("auto"),
                 agent: ctx.flags.string("agent"),
                 model: ctx.flags.string("model"),
-                launch_mode: crate::command::dispatch::parse_launch_mode(
-                    ctx.flags.string("launch-mode"),
-                    &ctx.path(),
-                )?,
+                launch_mode: None, // `--set agents.launchMode=…` (WI 0139)
                 overlay: ctx.flags.strs("overlay").to_vec(),
                 agent_flags: crate::command::dispatch::parse_agent_flags(
                     ctx.flags.strs("agent-flag"),

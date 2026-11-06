@@ -116,7 +116,7 @@ pub fn render_container_maximized(
     // vt100-ctt 0.17's `set_scrollback` clamps to the buffer length; its
     // `visible_rows()` uses `saturating_sub` for the live-rows portion
     // (the panic that vt100 0.15 had on offset > screen_rows is fixed),
-    // so we can scroll the full configured `terminal_scrollback_lines`
+    // so we can scroll the full configured `tui.scrollbackLines`
     // depth without crashing. We probe by setting the requested offset
     // and reading back the clamped value, then probe the depth via
     // `set_scrollback(usize::MAX)`. Reset to live before rendering.

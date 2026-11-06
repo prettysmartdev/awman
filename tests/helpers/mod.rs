@@ -14,8 +14,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use awman::command::dispatch::Engines;
-use awman::data::config::env::{EnvSnapshot, AWMAN_API_ROOT, AWMAN_CONFIG_HOME};
+use awman::data::config::env::EnvSnapshot;
 use awman::data::config::flags::FlagConfig;
+use awman::data::fs::data_paths::AWMAN_HOME;
 use awman::data::fs::{ApiPaths, AuthPathResolver};
 use awman::data::session::{Session, SessionOpenOptions, StaticGitRootResolver};
 use awman::data::WorkflowStateStore;
@@ -95,17 +96,10 @@ impl IsolatedEnv {
     }
 
     pub fn env(&self) -> EnvSnapshot {
-        let api_root = self.home_dir.path().join("api");
-        EnvSnapshot::with_overrides([
-            (
-                AWMAN_CONFIG_HOME.to_string(),
-                self.home_dir.path().to_str().unwrap().to_string(),
-            ),
-            (
-                AWMAN_API_ROOT.to_string(),
-                api_root.to_str().unwrap().to_string(),
-            ),
-        ])
+        EnvSnapshot::with_overrides([(
+            AWMAN_HOME.to_string(),
+            self.home_dir.path().to_str().unwrap().to_string(),
+        )])
     }
 
     pub fn api_root(&self) -> PathBuf {
@@ -122,6 +116,7 @@ impl IsolatedEnv {
             flags,
             env: Some(self.env()),
             available_agents: None,
+            overrides: Default::default(),
         };
         Session::open(self.git_root.path().to_path_buf(), &resolver, opts).expect("Session::open")
     }
@@ -168,7 +163,6 @@ pub fn engines_at(
         overlay_engine: overlay_engine.clone(),
         auth_engine: Arc::new(AuthEngine::with_paths(auth_paths, api_paths)),
         agent_engine: Arc::new(AgentEngine::new(overlay_engine, runtime)),
-        config_notices: Default::default(),
         workflow_state_store: Arc::new(WorkflowStateStore::at_git_root(git_root)),
         credential_monitor: None,
         global_config: Arc::new(Default::default()),
@@ -176,10 +170,10 @@ pub fn engines_at(
 }
 
 /// A session whose working directory and Git root are both `root`, with
-/// `AWMAN_CONFIG_HOME` pinned there too so it cannot read the developer's real
+/// `AWMAN_HOME` pinned there too so it cannot read the developer's real
 /// global config. The integration-test counterpart of `Session::for_tests`.
 pub fn session_at(root: &std::path::Path) -> Session {
-    let env = EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, root.to_str().unwrap())]);
+    let env = EnvSnapshot::with_overrides([(AWMAN_HOME, root.to_str().unwrap())]);
     let opts = SessionOpenOptions {
         env: Some(env),
         ..Default::default()

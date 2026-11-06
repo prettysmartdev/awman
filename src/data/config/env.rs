@@ -7,31 +7,39 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{OnceLock, RwLock};
 
-/// `AWMAN_CONFIG_HOME` — overrides the global config home directory.
-pub const AWMAN_CONFIG_HOME: &str = "AWMAN_CONFIG_HOME";
+use serde_json::Value;
 
-/// `AWMAN_API_ROOT` — overrides the API storage root directory.
-pub const AWMAN_API_ROOT: &str = "AWMAN_API_ROOT";
+use crate::data::config::fields::{self, KeyError, RESERVED_ENV};
+use crate::data::config::overrides::ConfigOverrides;
 
-/// `AWMAN_SQUAD_ROOT` — overrides the squad storage root directory.
-pub const AWMAN_SQUAD_ROOT: &str = "AWMAN_SQUAD_ROOT";
+/// `AWMAN_HOME` — the one root for awman's config and data (see
+/// `data::fs::data_paths`). Replaces `AWMAN_CONFIG_HOME`, `AWMAN_API_ROOT`,
+/// `AWMAN_SQUAD_ROOT` and `AWMAN_ATTACH_DIR`.
+pub use crate::data::fs::data_paths::AWMAN_HOME;
 
-/// `AWMAN_OVERLAYS` — comma-separated list of overlay specs.
+/// `AWMAN_OVERLAYS` — the env form of the `overlays` config key. It is not a
+/// hand-named variable: the key table derives exactly this name for
+/// `overlays`, and the constant only exists for the call sites that name it.
 pub const AWMAN_OVERLAYS: &str = "AWMAN_OVERLAYS";
 
-/// `AWMAN_REMOTE_ADDR` — overrides remote server address.
-pub const AWMAN_REMOTE_ADDR: &str = "AWMAN_REMOTE_ADDR";
-
-/// `AWMAN_REMOTE_SESSION` — sticky session id for remote operations.
+/// `AWMAN_REMOTE_SESSION` — sticky session id for remote operations, the env
+/// form of `--session`. A session id is not a setting, so this is not config.
 pub const AWMAN_REMOTE_SESSION: &str = "AWMAN_REMOTE_SESSION";
-
-/// `AWMAN_API_KEY` — API key for the remote API server.
-pub const AWMAN_API_KEY: &str = "AWMAN_API_KEY";
 
 /// `AWMAN_SQUAD_KEY` — bearer key the CLI and TUI authenticate to the squad
 /// daemon with. Minted on the daemon's first start and printed once as a
-/// shell-export snippet; see `awman squad start`.
+/// shell-export snippet; see `awman squad start`. Process-level until the
+/// owner-only local socket replaces it.
 pub const AWMAN_SQUAD_KEY: &str = "AWMAN_SQUAD_KEY";
+
+/// The prefix every awman variable shares. A captured `AWMAN_*` variable that
+/// is not a [`PROCESS_VARS`] entry and not in the [`AWMAN_TEST_PREFIX`]
+/// namespace is a config variable: its name is derived from the key table
+/// (`agents.stuckTimeout` → `AWMAN_AGENTS_STUCK_TIMEOUT`).
+pub const AWMAN_PREFIX: &str = "AWMAN_";
+
+/// The test-only namespace (`AWMAN_TEST_ISOLATION`, …). Never config.
+pub const AWMAN_TEST_PREFIX: &str = "AWMAN_TEST_";
 
 /// `GITHUB_TOKEN` — optional token used by the GitHub issue provider.
 pub const GITHUB_TOKEN: &str = "GITHUB_TOKEN";
@@ -39,13 +47,6 @@ pub const GITHUB_TOKEN: &str = "GITHUB_TOKEN";
 /// Trusted host Git transport overrides, preserved by remote-session push-back.
 pub const GIT_SSH_COMMAND: &str = "GIT_SSH_COMMAND";
 pub const GIT_SSH: &str = "GIT_SSH";
-
-/// `AWMAN_MAX_CONCURRENT_AGENTS` — overrides the max-concurrent-agents cap
-/// for workflow execution.
-pub const AWMAN_MAX_CONCURRENT_AGENTS: &str = "AWMAN_MAX_CONCURRENT_AGENTS";
-
-/// `AWMAN_LAUNCH_MODE` — overrides the repository launch mode.
-pub const AWMAN_LAUNCH_MODE: &str = "AWMAN_LAUNCH_MODE";
 
 /// `XDG_CONFIG_HOME` — XDG base directory for user-specific configuration.
 pub const XDG_CONFIG_HOME: &str = "XDG_CONFIG_HOME";
@@ -56,18 +57,6 @@ pub const XDG_DATA_HOME: &str = "XDG_DATA_HOME";
 /// `SHELL` — the user's login shell. Read only to tailor the shell snippet
 /// printed alongside a freshly minted squad key; never to execute anything.
 pub const SHELL: &str = "SHELL";
-
-/// `AWMAN_ATTACH_DIR` — overrides the directory attach sockets live in
-/// (`~/.awman/attach/` by default). Used by tests and relocated setups; both
-/// the serving and the attaching process must derive it the same way, which
-/// is what makes a socket discoverable across processes of the same user.
-pub const AWMAN_ATTACH_DIR: &str = "AWMAN_ATTACH_DIR";
-
-/// `AWMAN_API_VERBOSE_SETUP` — set to a falsy value (`0`, `false`, `no`,
-/// `off`) to demote the API server's per-session setup chatter from `info` to
-/// `debug`, so operators can silence it while keeping it reachable through
-/// `RUST_LOG`. Verbose is the default.
-pub const AWMAN_API_VERBOSE_SETUP: &str = "AWMAN_API_VERBOSE_SETUP";
 
 /// `PATH` — the executable search path. awman never reads it to resolve a
 /// binary itself; it is declared because an OS process manager starting a
@@ -114,10 +103,32 @@ pub const AWMAN_TEST_BUILTIN: &str = "AWMAN_TEST_BUILTIN";
 /// `engine::workflow::timing::yolo_countdown_duration`.
 pub const AWMAN_TEST_YOLO_COUNTDOWN_MS: &str = "AWMAN_TEST_YOLO_COUNTDOWN_MS";
 
-/// `AWMAN_BUILTIN_STATE_DIR` — overrides the builtin runtime's private state
-/// directory (default `<data home>/builtin`). Keep it short: control sockets
-/// live beneath it.
-pub const AWMAN_BUILTIN_STATE_DIR: &str = "AWMAN_BUILTIN_STATE_DIR";
+/// Every `AWMAN_*` name awman reads as a **process variable** rather than as
+/// config: the storage root, the session id, the squad bearer key and the
+/// test switches. None of these is ever resolved against the key table, and
+/// no derived config name may equal one (`derived_names_never_collide_with_a_process_variable`).
+/// `fields::RESERVED_ENV` is the key table's copy of this list; a test keeps
+/// the two equal.
+pub const PROCESS_VARS: &[&str] = &[
+    AWMAN_HOME,
+    AWMAN_REMOTE_SESSION,
+    AWMAN_SQUAD_KEY,
+    AWMAN_TEST_ISOLATION,
+    AWMAN_TEST_DOCKER,
+    AWMAN_TEST_APPLE_CONTAINER,
+    AWMAN_TEST_SBX,
+    AWMAN_TEST_BUILTIN,
+    AWMAN_TEST_YOLO_COUNTDOWN_MS,
+];
+
+/// Whether `name` is an `AWMAN_*` config variable (as opposed to a process
+/// variable, a test switch, or something else entirely).
+pub fn is_config_var_name(name: &str) -> bool {
+    name.starts_with(AWMAN_PREFIX)
+        && !name.starts_with(AWMAN_TEST_PREFIX)
+        && !PROCESS_VARS.contains(&name)
+        && !RESERVED_ENV.contains(&name)
+}
 
 /// `MSB_PATH` — Microsandbox's worker-binary override. awman never honours it:
 /// the builtin runtime refuses to start while it (or any other name in
@@ -209,8 +220,9 @@ pub const RUST_LOG: &str = "RUST_LOG";
 /// This is the **bootstrap class** — values the daemon needs before it can
 /// open its storage root or start listening. **[`ForwardedEnv::NAMES`] is a
 /// non-secret allowlist, and nothing that could hold a secret may ever be
-/// added to it.** [`AWMAN_API_KEY`] / [`AWMAN_SQUAD_KEY`] are deliberately
-/// absent: this list is serialized into a plist on disk and passed as
+/// added to it.** [`AWMAN_SQUAD_KEY`] is deliberately absent, and so is every
+/// config variable of a `sensitive` key (`AWMAN_REMOTE_TARGETS_<NAME>_API_KEY`):
+/// this list is serialized into a plist on disk and passed as
 /// `--setenv` arguments on a visible `systemd-run` invocation, and a bearer
 /// key belongs in none of those places. The daemon authenticates against the
 /// key *hash* it reads from the storage root, so it needs no key of its own.
@@ -230,28 +242,42 @@ pub const RUST_LOG: &str = "RUST_LOG";
 pub struct ForwardedEnv;
 
 impl ForwardedEnv {
-    /// The allowlist, in the order a job's environment is rendered.
+    /// The fixed allowlist, in the order a job's environment is rendered.
+    /// Config variables (`AWMAN_*` derived from the key table) follow it; see
+    /// [`ForwardedEnv::from_process`].
     pub const NAMES: &'static [&'static str] = &[
         PATH,
         HOME,
         RUST_LOG,
-        AWMAN_CONFIG_HOME,
-        AWMAN_API_ROOT,
-        AWMAN_SQUAD_ROOT,
+        AWMAN_HOME,
         XDG_CONFIG_HOME,
         XDG_DATA_HOME,
-        AWMAN_OVERLAYS,
-        AWMAN_MAX_CONCURRENT_AGENTS,
-        AWMAN_LAUNCH_MODE,
     ];
 
     /// The subset of [`ForwardedEnv::NAMES`] actually set in this process, in
-    /// list order.
+    /// list order, then every non-sensitive `AWMAN_*` config variable set in
+    /// this process, sorted by name — so a daemon started by launchd or
+    /// systemd resolves the same config the shell that started it would.
     pub fn from_process() -> Vec<(String, String)> {
-        Self::NAMES
+        let mut out: Vec<(String, String)> = Self::NAMES
             .iter()
             .filter_map(|name| std::env::var(name).ok().map(|v| ((*name).to_string(), v)))
-            .collect()
+            .collect();
+        let mut config: Vec<(String, String)> = awman_vars_os()
+            .into_iter()
+            .filter(|(name, _)| Self::forwards_config_var(name))
+            .collect();
+        config.sort();
+        out.extend(config);
+        out
+    }
+
+    /// Whether a config variable may ride the bootstrap class: it must be a
+    /// known, non-sensitive key. An unknown name forwards nothing (it would
+    /// be ignored anyway), and a secret never reaches a plist or an argv.
+    fn forwards_config_var(name: &str) -> bool {
+        is_config_var_name(name)
+            && fields::resolve_env(name, &|_| Vec::new()).is_some_and(|r| !r.key.sensitive)
     }
 }
 
@@ -292,39 +318,30 @@ impl EnvSnapshot {
         self.values.get(key).map(|s| s.as_str())
     }
 
-    /// `AWMAN_CONFIG_HOME` as a `PathBuf` if set.
-    pub fn config_home(&self) -> Option<PathBuf> {
-        self.get(AWMAN_CONFIG_HOME).map(PathBuf::from)
+    /// `AWMAN_HOME` as a `PathBuf`, if set and non-empty.
+    pub fn awman_home(&self) -> Option<PathBuf> {
+        self.get(AWMAN_HOME)
+            .filter(|v| !v.trim().is_empty())
+            .map(PathBuf::from)
     }
 
-    /// `AWMAN_API_ROOT` as a `PathBuf` if set.
-    pub fn api_root(&self) -> Option<PathBuf> {
-        self.get(AWMAN_API_ROOT).map(PathBuf::from)
-    }
-
-    /// `AWMAN_SQUAD_ROOT` as a `PathBuf` if set.
-    pub fn squad_root(&self) -> Option<PathBuf> {
-        self.get(AWMAN_SQUAD_ROOT).map(PathBuf::from)
-    }
-
-    /// `AWMAN_OVERLAYS` raw string if set.
-    pub fn overlays(&self) -> Option<&str> {
-        self.get(AWMAN_OVERLAYS)
-    }
-
-    /// `AWMAN_REMOTE_ADDR` if set.
-    pub fn remote_addr(&self) -> Option<&str> {
-        self.get(AWMAN_REMOTE_ADDR)
+    /// Every captured `AWMAN_*` **config** variable (see
+    /// [`is_config_var_name`]), sorted by name. Nothing here has been checked
+    /// against the key table yet; [`ConfigOverrides::from_env`] does that.
+    pub fn config_vars(&self) -> Vec<(String, String)> {
+        let mut vars: Vec<(String, String)> = self
+            .values
+            .iter()
+            .filter(|(name, _)| is_config_var_name(name))
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect();
+        vars.sort();
+        vars
     }
 
     /// `AWMAN_REMOTE_SESSION` if set.
     pub fn remote_session(&self) -> Option<&str> {
         self.get(AWMAN_REMOTE_SESSION)
-    }
-
-    /// `AWMAN_API_KEY` if set.
-    pub fn api_key(&self) -> Option<&str> {
-        self.get(AWMAN_API_KEY)
     }
 
     /// `AWMAN_SQUAD_KEY` if set and non-empty.
@@ -337,25 +354,9 @@ impl EnvSnapshot {
         self.get(GITHUB_TOKEN).filter(|v| !v.is_empty())
     }
 
-    /// `AWMAN_MAX_CONCURRENT_AGENTS` parsed as a `usize`, if set and valid.
-    pub fn max_concurrent_agents(&self) -> Option<usize> {
-        self.get(AWMAN_MAX_CONCURRENT_AGENTS)?.parse().ok()
-    }
-
     /// `SHELL` if set and non-empty.
     pub fn shell(&self) -> Option<&str> {
         self.get(SHELL).filter(|v| !v.is_empty())
-    }
-
-    /// `AWMAN_LAUNCH_MODE` parsed as a launch mode, if set to a recognized
-    /// value. Invalid environment values are ignored, matching the tolerant
-    /// behavior of other typed environment accessors.
-    pub fn launch_mode(&self) -> Option<crate::data::config::repo::LaunchMode> {
-        match self.get(AWMAN_LAUNCH_MODE)? {
-            "stdio" => Some(crate::data::config::repo::LaunchMode::Stdio),
-            "acp" => Some(crate::data::config::repo::LaunchMode::Acp),
-            _ => None,
-        }
     }
 
     /// `XDG_CONFIG_HOME` as a `PathBuf` if set and non-empty.
@@ -376,13 +377,6 @@ impl EnvSnapshot {
     /// resolves it at capture time; an empty snapshot has none.
     pub fn home_dir(&self) -> Option<PathBuf> {
         self.get(HOME).filter(|v| !v.is_empty()).map(PathBuf::from)
-    }
-
-    /// `AWMAN_ATTACH_DIR` as a `PathBuf` if set and non-empty.
-    pub fn attach_dir(&self) -> Option<PathBuf> {
-        self.get(AWMAN_ATTACH_DIR)
-            .filter(|v| !v.is_empty())
-            .map(PathBuf::from)
     }
 
     /// Whether `AWMAN_TEST_ISOLATION` is set to `1`, `true`, `yes` or `on`
@@ -427,13 +421,6 @@ impl EnvSnapshot {
             .map(std::time::Duration::from_millis)
     }
 
-    /// `AWMAN_BUILTIN_STATE_DIR`, when set and non-empty.
-    pub fn builtin_state_dir(&self) -> Option<PathBuf> {
-        self.get(AWMAN_BUILTIN_STATE_DIR)
-            .filter(|v| !v.trim().is_empty())
-            .map(PathBuf::from)
-    }
-
     /// The [`AMBIENT_MSB_OVERRIDES`] present in this snapshot, in list order.
     /// Set counts, even to an empty value: the SDK does not distinguish.
     pub fn ambient_msb_overrides(&self) -> Vec<&'static str> {
@@ -475,19 +462,79 @@ impl EnvSnapshot {
             )
         })
     }
+}
 
-    /// Whether the API server logs per-session setup lines at `info` rather
-    /// than `debug`. `true` unless `AWMAN_API_VERBOSE_SETUP` is set to one of
-    /// `0`, `false`, `no`, `off` (case- and whitespace-insensitive).
-    pub fn api_verbose_setup(&self) -> bool {
-        match self.get(AWMAN_API_VERBOSE_SETUP) {
-            Some(v) => !matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "0" | "false" | "no" | "off"
-            ),
-            None => true,
+// ── The override channel: `AWMAN_*` config variables and `--set` ──────────
+
+impl ConfigOverrides {
+    /// Parse `--set key=value` arguments (the `key=value` text of each, in
+    /// command-line order). Each key is resolved against the key table and its
+    /// value parsed by the key's type, exactly like `awman config set`: lists
+    /// are comma-separated, maps are `k=v,k2=v2`, `null` resets the key to its
+    /// default. When a key is given twice the last one wins (the pairs are
+    /// applied in order).
+    pub fn parse_set_args(args: &[String]) -> Result<Self, KeyError> {
+        let mut pairs = Vec::with_capacity(args.len());
+        for arg in args {
+            let (path, raw) = arg.split_once('=').ok_or_else(|| KeyError::Value {
+                path: arg.trim().to_string(),
+                reason: "expected --set <key>=<value>".into(),
+            })?;
+            let path = path.trim();
+            let resolved = fields::resolve(path)?;
+            let value = fields::parse_input(resolved.key, raw)?;
+            pairs.push((resolved.path, value));
         }
+        Ok(Self::new(pairs))
     }
+
+    /// The env layer: every `AWMAN_*` config variable in `env`, resolved
+    /// against the key table and parsed by the key's type.
+    ///
+    /// `known_names` answers the map names present in the merged files under a
+    /// map section (`workServers`, `remote.targets`, `agents.flags`), so a
+    /// variable such as `AWMAN_WORK_SERVERS_IN_FACT_URL` binds to an existing
+    /// `in-fact` entry; an unmatched name creates a new, lower-cased entry.
+    ///
+    /// A name that matches no key is not config: it is ignored with a
+    /// warning. That covers the hand-named variables of earlier releases,
+    /// which are simply unknown now. An empty value
+    /// counts as unset. A known name with a bad value is an error naming the
+    /// variable.
+    pub fn from_env(
+        env: &EnvSnapshot,
+        known_names: impl Fn(&str) -> Vec<String>,
+    ) -> Result<Self, KeyError> {
+        let mut pairs: Vec<(String, Value)> = Vec::new();
+        for (var, raw) in env.config_vars() {
+            if raw.trim().is_empty() {
+                continue;
+            }
+            let Some(resolved) = fields::resolve_env(&var, &known_names) else {
+                tracing::warn!("ignoring {var}: it names no config key (see `awman config show`)");
+                continue;
+            };
+            let value = fields::parse_input(resolved.key, &raw).map_err(|e| match e {
+                KeyError::Value { reason, .. } => KeyError::Value {
+                    path: format!("{} (from {var})", resolved.path),
+                    reason,
+                },
+                other => other,
+            })?;
+            pairs.push((resolved.path, value));
+        }
+        Ok(Self::new(pairs))
+    }
+}
+
+/// Every `AWMAN_*` variable of this process whose name and value are UTF-8.
+/// `std::env::vars` panics on a non-UTF-8 entry anywhere in the environment;
+/// a non-UTF-8 config value cannot be parsed anyway, so it is skipped.
+fn awman_vars_os() -> Vec<(String, String)> {
+    std::env::vars_os()
+        .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)))
+        .filter(|(name, _)| name.starts_with(AWMAN_PREFIX))
+        .collect()
 }
 
 /// Namespace for capturing process-environment snapshots.
@@ -508,41 +555,31 @@ impl Env {
     /// and the daemon would answer 401 to the very process that minted its key
     /// (WI 0114 F-47).
     ///
-    /// Only these two. Everything else in the snapshot is a property of *this*
-    /// process — its storage roots, its launch mode, its shell — which nothing
-    /// publishes at run time and which therefore keeps reading the real
-    /// environment.
-    const PUBLISHED_KEYS: &'static [&'static str] = &[AWMAN_API_KEY, AWMAN_SQUAD_KEY];
+    /// Only this one. Everything else in the snapshot is a property of *this*
+    /// process — its storage root, its config variables, its shell — which
+    /// nothing publishes at run time and which therefore keeps reading the
+    /// real environment.
+    const PUBLISHED_KEYS: &'static [&'static str] = &[AWMAN_SQUAD_KEY];
 
-    /// Capture every awman-relevant env var from the current process.
-    ///
-    /// Reads are limited to the known constants above so that the snapshot
-    /// is deterministic and minimal.
+    /// Capture every awman-relevant env var from the current process: the
+    /// fixed list below, plus every variable whose name starts with
+    /// [`AWMAN_PREFIX`], so derived config names reach the snapshot without a
+    /// key-table lookup at capture time.
     pub fn from_process() -> EnvSnapshot {
         let keys = [
-            AWMAN_CONFIG_HOME,
-            AWMAN_API_ROOT,
-            AWMAN_SQUAD_ROOT,
-            AWMAN_OVERLAYS,
-            AWMAN_REMOTE_ADDR,
+            AWMAN_HOME,
             AWMAN_REMOTE_SESSION,
-            AWMAN_API_KEY,
             AWMAN_SQUAD_KEY,
             GITHUB_TOKEN,
-            AWMAN_MAX_CONCURRENT_AGENTS,
-            AWMAN_LAUNCH_MODE,
             XDG_CONFIG_HOME,
             XDG_DATA_HOME,
             SHELL,
-            AWMAN_ATTACH_DIR,
-            AWMAN_API_VERBOSE_SETUP,
             AWMAN_TEST_ISOLATION,
             AWMAN_TEST_DOCKER,
             AWMAN_TEST_APPLE_CONTAINER,
             AWMAN_TEST_SBX,
             AWMAN_TEST_BUILTIN,
             AWMAN_TEST_YOLO_COUNTDOWN_MS,
-            AWMAN_BUILTIN_STATE_DIR,
             DOCKER_HOST,
             DOCKER_CERT_PATH,
             DOCKER_TLS_VERIFY,
@@ -552,6 +589,14 @@ impl Env {
         // consults the ambient environment (or the passwd database) for it.
         if let Some(home) = dirs::home_dir() {
             values.insert(HOME.to_string(), home.to_string_lossy().into_owned());
+        }
+        // Config variables come from the real process environment only (never
+        // the daemon overlay): a daemon client must not be able to change
+        // this process's config by pushing a payload named like one.
+        for (name, value) in awman_vars_os() {
+            if is_config_var_name(&name) {
+                values.insert(name, value);
+            }
         }
         for k in keys {
             let read = if Self::PUBLISHED_KEYS.contains(&k) {
@@ -740,7 +785,7 @@ pub(crate) static DAEMON_OVERLAY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mu
 #[cfg(test)]
 static CONFIG_HOME_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Exclusive ownership of the process-wide [`AWMAN_CONFIG_HOME`] for the
+/// Exclusive ownership of the process-wide [`AWMAN_HOME`] for the
 /// guard's lifetime, restoring the previous value on drop.
 ///
 /// The same "one binary, one process" point as [`DAEMON_OVERLAY_TEST_LOCK`]
@@ -761,7 +806,7 @@ pub(crate) struct ConfigHomeGuard {
 
 #[cfg(test)]
 impl ConfigHomeGuard {
-    /// Take the lock and point [`AWMAN_CONFIG_HOME`] at `home`.
+    /// Take the lock and point [`AWMAN_HOME`] at `home`.
     pub(crate) fn set(home: impl AsRef<std::path::Path>) -> Self {
         // Recover a poisoned lock rather than propagating the poison: a test
         // that panicked while holding it has already reported its own
@@ -770,8 +815,8 @@ impl ConfigHomeGuard {
         let _lock = CONFIG_HOME_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let previous = std::env::var_os(AWMAN_CONFIG_HOME);
-        std::env::set_var(AWMAN_CONFIG_HOME, home.as_ref());
+        let previous = std::env::var_os(AWMAN_HOME);
+        std::env::set_var(AWMAN_HOME, home.as_ref());
         Self { _lock, previous }
     }
 }
@@ -822,8 +867,8 @@ impl Drop for ConfigHomeGuard {
         // keeps a panicking test from leaking its temporary config home —
         // usually an already-deleted directory — onto the test that runs next.
         match self.previous.take() {
-            Some(value) => std::env::set_var(AWMAN_CONFIG_HOME, value),
-            None => std::env::remove_var(AWMAN_CONFIG_HOME),
+            Some(value) => std::env::set_var(AWMAN_HOME, value),
+            None => std::env::remove_var(AWMAN_HOME),
         }
     }
 }
@@ -940,8 +985,6 @@ impl std::fmt::Debug for DaemonEnvMap {
 mod tests {
     use super::*;
 
-    // ── AWMAN_ATTACH_DIR (F-37) ──────────────────────────────────────────
-
     #[test]
     fn home_dir_comes_from_the_snapshot_only() {
         assert!(EnvSnapshot::empty().home_dir().is_none());
@@ -952,69 +995,6 @@ mod tests {
             EnvSnapshot::with_overrides([(HOME, "/home/a")]).home_dir(),
             Some(PathBuf::from("/home/a"))
         );
-    }
-
-    #[test]
-    fn attach_dir_returns_none_when_absent() {
-        assert!(EnvSnapshot::empty().attach_dir().is_none());
-    }
-
-    #[test]
-    fn attach_dir_returns_none_when_empty_string() {
-        let snap = EnvSnapshot::with_overrides([(AWMAN_ATTACH_DIR, "")]);
-        assert!(
-            snap.attach_dir().is_none(),
-            "an empty value must fall back to the default directory, not resolve \
-             sockets against a relative path"
-        );
-    }
-
-    #[test]
-    fn attach_dir_returns_the_path_when_set() {
-        let snap = EnvSnapshot::with_overrides([(AWMAN_ATTACH_DIR, "/tmp/sockets")]);
-        assert_eq!(snap.attach_dir(), Some(PathBuf::from("/tmp/sockets")));
-    }
-
-    // ── AWMAN_API_VERBOSE_SETUP (F-37) ───────────────────────────────────
-    //
-    // The falsy set and the default are the contract this moved out of
-    // `api_server/session_setup.rs`; they must not drift.
-
-    #[test]
-    fn api_verbose_setup_defaults_to_true_when_absent() {
-        assert!(EnvSnapshot::empty().api_verbose_setup());
-    }
-
-    #[test]
-    fn api_verbose_setup_is_false_for_every_falsy_spelling() {
-        for raw in [
-            "0",
-            "false",
-            "no",
-            "off",
-            "FALSE",
-            "No",
-            "OFF",
-            " off ",
-            "\tfalse\n",
-        ] {
-            let snap = EnvSnapshot::with_overrides([(AWMAN_API_VERBOSE_SETUP, raw)]);
-            assert!(
-                !snap.api_verbose_setup(),
-                "{raw:?} must disable verbose setup logging"
-            );
-        }
-    }
-
-    #[test]
-    fn api_verbose_setup_is_true_for_anything_else() {
-        for raw in ["1", "true", "yes", "on", "", "anything"] {
-            let snap = EnvSnapshot::with_overrides([(AWMAN_API_VERBOSE_SETUP, raw)]);
-            assert!(
-                snap.api_verbose_setup(),
-                "{raw:?} must leave verbose setup logging on"
-            );
-        }
     }
 
     #[test]
@@ -1259,24 +1239,17 @@ mod tests {
     fn builtin_and_docker_accessors() {
         let env = EnvSnapshot::with_overrides([
             (AWMAN_TEST_BUILTIN, "yes"),
-            (AWMAN_BUILTIN_STATE_DIR, "/s"),
             (DOCKER_HOST, " tcp://h:2376 "),
             (DOCKER_CERT_PATH, "/certs"),
             (DOCKER_TLS_VERIFY, "1"),
         ]);
         assert!(env.test_builtin());
-        assert_eq!(env.builtin_state_dir(), Some(PathBuf::from("/s")));
         assert_eq!(env.docker_host().as_deref(), Some("tcp://h:2376"));
         assert_eq!(env.docker_cert_path(), Some(PathBuf::from("/certs")));
         assert!(env.docker_tls_verify());
 
-        let empty = EnvSnapshot::with_overrides([
-            (AWMAN_BUILTIN_STATE_DIR, ""),
-            (DOCKER_HOST, ""),
-            (DOCKER_TLS_VERIFY, ""),
-        ]);
+        let empty = EnvSnapshot::with_overrides([(DOCKER_HOST, ""), (DOCKER_TLS_VERIFY, "")]);
         assert!(!empty.test_builtin());
-        assert_eq!(empty.builtin_state_dir(), None);
         assert_eq!(empty.docker_host(), None);
         assert!(!empty.docker_tls_verify());
     }
@@ -1288,15 +1261,21 @@ mod tests {
     /// instead. `PATH` must be forwarded — without it launchd's minimal one
     /// leaves the daemon unable to find `docker`.
     #[test]
-    fn no_bearer_key_is_ever_forwarded_to_a_daemon_job() {
+    fn no_secret_is_ever_forwarded_to_a_daemon_job() {
         assert!(!ForwardedEnv::NAMES.contains(&AWMAN_SQUAD_KEY));
-        assert!(!ForwardedEnv::NAMES.contains(&AWMAN_API_KEY));
         assert!(ForwardedEnv::NAMES.contains(&"PATH"));
-        assert!(ForwardedEnv::NAMES.contains(&AWMAN_SQUAD_ROOT));
-        // WI 0116 §2: the payload's own overlay spec now rides the bootstrap
-        // class too, so a daemon started by systemd/launchd resolves the
-        // same overlays the shell that ran `squad start` would have.
-        assert!(ForwardedEnv::NAMES.contains(&AWMAN_OVERLAYS));
+        assert!(ForwardedEnv::NAMES.contains(&AWMAN_HOME));
+        // Config variables ride along (WI 0116 §2: overlays included), but a
+        // sensitive key never does, and an unknown name forwards nothing.
+        assert!(ForwardedEnv::forwards_config_var(AWMAN_OVERLAYS));
+        assert!(ForwardedEnv::forwards_config_var(
+            "AWMAN_AGENTS_LAUNCH_MODE"
+        ));
+        assert!(!ForwardedEnv::forwards_config_var(
+            "AWMAN_REMOTE_TARGETS_PROD_API_KEY"
+        ));
+        assert!(!ForwardedEnv::forwards_config_var("AWMAN_NOT_A_KEY"));
+        assert!(!ForwardedEnv::forwards_config_var(AWMAN_SQUAD_KEY));
     }
 
     #[test]
@@ -1345,48 +1324,368 @@ mod tests {
         assert!(test_isolation_active());
     }
 
-    /// `ForwardedEnv::from_process()` must emit only the names actually set in this
-    /// process, and in `ForwardedEnv::NAMES`'s own order — not insertion order of
-    /// whichever happen to be set, and not alphabetical.
+    /// The fixed names come first, in `ForwardedEnv::NAMES`'s own order and only
+    /// when set; known, non-sensitive config variables follow, sorted by name.
     #[test]
-    fn forwarded_env_returns_only_set_names_in_list_order() {
-        let _env = ProcessEnvGuard::acquire(&[
-            AWMAN_OVERLAYS,
-            AWMAN_MAX_CONCURRENT_AGENTS,
-            AWMAN_LAUNCH_MODE,
-        ]);
-
+    fn forwarded_env_lists_set_names_in_order_then_config_vars() {
+        const LAUNCH: &str = "AWMAN_AGENTS_LAUNCH_MODE";
+        const API_KEY: &str = "AWMAN_REMOTE_TARGETS_FWD_API_KEY";
+        let _env = ProcessEnvGuard::acquire(&[AWMAN_HOME, AWMAN_OVERLAYS, LAUNCH, API_KEY]);
+        std::env::set_var(AWMAN_HOME, "/tmp/awman-forwarded-0139");
         std::env::remove_var(AWMAN_OVERLAYS);
-        std::env::set_var(AWMAN_MAX_CONCURRENT_AGENTS, "7");
-        std::env::remove_var(AWMAN_LAUNCH_MODE);
+        std::env::set_var(LAUNCH, "acp");
+        std::env::set_var(API_KEY, "secret");
 
         let result = ForwardedEnv::from_process();
-
-        assert!(
-            !result.iter().any(|(n, _)| n == AWMAN_OVERLAYS),
-            "an unset name must not appear at all: {result:?}"
-        );
-        assert!(
-            !result.iter().any(|(n, _)| n == AWMAN_LAUNCH_MODE),
-            "an unset name must not appear at all: {result:?}"
-        );
-        assert!(
-            result
-                .iter()
-                .any(|(n, v)| n == AWMAN_MAX_CONCURRENT_AGENTS && v == "7"),
-            "a set name must appear with its value: {result:?}"
-        );
-
         let names: Vec<&str> = result.iter().map(|(n, _)| n.as_str()).collect();
-        let expected_order: Vec<&str> = ForwardedEnv::NAMES
+        assert!(!names.contains(&AWMAN_OVERLAYS), "unset: {names:?}");
+        assert!(!names.contains(&API_KEY), "sensitive: {names:?}");
+        assert!(result.iter().any(|(n, v)| n == LAUNCH && v == "acp"));
+        let fixed: Vec<&str> = names
             .iter()
             .copied()
-            .filter(|candidate| names.contains(candidate))
+            .filter(|n| ForwardedEnv::NAMES.contains(n))
             .collect();
+        let expected: Vec<&str> = ForwardedEnv::NAMES
+            .iter()
+            .copied()
+            .filter(|n| names.contains(n))
+            .collect();
+        assert_eq!(fixed, expected);
+        let first_config = names.iter().position(|n| *n == LAUNCH).unwrap();
+        assert!(names[..first_config]
+            .iter()
+            .all(|n| ForwardedEnv::NAMES.contains(n)));
+    }
+}
+
+/// The override channel: derived `AWMAN_*` names and `--set`.
+#[cfg(test)]
+mod override_tests {
+    use super::*;
+    use crate::data::config::fields::{ConfigKey, CONFIG_KEYS};
+    use serde_json::json;
+
+    /// The hand-named variables earlier releases read. They are unknown now.
+    const REMOVED: &[&str] = &[
+        "AWMAN_MAX_CONCURRENT_AGENTS",
+        "AWMAN_LAUNCH_MODE",
+        "AWMAN_REMOTE_ADDR",
+        "AWMAN_API_KEY",
+        "AWMAN_BUILTIN_STATE_DIR",
+        "AWMAN_API_VERBOSE_SETUP",
+        "AWMAN_CONFIG_HOME",
+        "AWMAN_API_ROOT",
+        "AWMAN_SQUAD_ROOT",
+        "AWMAN_ATTACH_DIR",
+    ];
+
+    fn no_names(_: &str) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn set(args: &[&str]) -> Result<ConfigOverrides, KeyError> {
+        let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        ConfigOverrides::parse_set_args(&args)
+    }
+
+    fn one(args: &[&str]) -> (String, Value) {
+        let overrides = set(args).unwrap();
+        assert_eq!(overrides.0.len(), 1, "{overrides:?}");
+        overrides.0.into_iter().next().unwrap()
+    }
+
+    /// Every derived name (map rows with a sample name too) is unique and is
+    /// neither a process variable nor in the test namespace, and the key
+    /// table's reserved list is exactly this module's process-variable list.
+    #[test]
+    fn derived_names_never_collide_with_a_process_variable() {
+        let mut reserved: Vec<&str> = RESERVED_ENV.to_vec();
+        let mut process: Vec<&str> = PROCESS_VARS.to_vec();
+        reserved.sort_unstable();
+        process.sort_unstable();
         assert_eq!(
-            names, expected_order,
-            "ForwardedEnv::from_process() must preserve ForwardedEnv::NAMES's own order"
+            reserved, process,
+            "fields::RESERVED_ENV must equal env::PROCESS_VARS"
         );
+
+        let mut seen = std::collections::HashSet::new();
+        for key in CONFIG_KEYS.iter().filter(|k| k.has_env()) {
+            let samples = if key.is_map_member() {
+                vec![key.env_name(&["prod"]), key.env_name(&["in-fact"])]
+            } else {
+                vec![key.env_pattern()]
+            };
+            for name in samples {
+                assert!(seen.insert(name.clone()), "{name} is derived twice");
+                assert!(
+                    !PROCESS_VARS.contains(&name.as_str()),
+                    "{name} is a process variable"
+                );
+                assert!(
+                    !name.starts_with(AWMAN_TEST_PREFIX),
+                    "{name} is in the test namespace"
+                );
+                assert!(is_config_var_name(&name), "{name} must read as config");
+                let resolved = fields::resolve_env(&name, &no_names)
+                    .unwrap_or_else(|| panic!("{name} must resolve"));
+                assert_eq!(
+                    resolved.key.path, key.path,
+                    "{name} resolves to the wrong row"
+                );
+            }
+        }
+        for name in PROCESS_VARS {
+            assert!(!is_config_var_name(name), "{name} is a process variable");
+            assert!(
+                fields::resolve_env(name, &no_names).is_none(),
+                "{name} resolved"
+            );
+        }
+    }
+
+    /// Names are derived mechanically: dots and camel humps become `_`, `-` in
+    /// a map name becomes `_`. `AWMAN_OVERLAYS` keeps its name because the
+    /// derivation gives exactly that.
+    #[test]
+    fn derived_names_follow_the_path() {
+        let name = |path: &str| fields::resolve(path).unwrap().key.env_pattern();
+        assert_eq!(name("overlays"), AWMAN_OVERLAYS);
+        assert_eq!(
+            name("workflows.maxConcurrentSteps"),
+            "AWMAN_WORKFLOWS_MAX_CONCURRENT_STEPS"
+        );
+        assert_eq!(name("agents.launchMode"), "AWMAN_AGENTS_LAUNCH_MODE");
+        assert_eq!(
+            name("runtime.builtin.stateDir"),
+            "AWMAN_RUNTIME_BUILTIN_STATE_DIR"
+        );
+        let key: &ConfigKey = fields::resolve("remote.targets.in-fact.apiKey")
+            .unwrap()
+            .key;
+        assert_eq!(
+            key.env_name(&["in-fact"]),
+            "AWMAN_REMOTE_TARGETS_IN_FACT_API_KEY"
+        );
+    }
+
+    #[test]
+    fn removed_hand_named_variables_are_not_config() {
+        for name in REMOVED {
+            assert!(
+                fields::resolve_env(name, &no_names).is_none(),
+                "{name} must not resolve to a config key"
+            );
+        }
+        let env = EnvSnapshot::with_overrides(REMOVED.iter().map(|n| (*n, "7")));
+        let overrides = ConfigOverrides::from_env(&env, no_names).unwrap();
+        assert!(overrides.is_empty(), "removed names applied: {overrides:?}");
+    }
+
+    #[test]
+    fn config_vars_skip_process_and_test_variables() {
+        let env = EnvSnapshot::with_overrides([
+            (AWMAN_HOME, "/h"),
+            (AWMAN_SQUAD_KEY, "k"),
+            (AWMAN_REMOTE_SESSION, "s"),
+            (AWMAN_TEST_ISOLATION, "1"),
+            ("AWMAN_TEST_SOMETHING_ADHOC", "1"),
+            ("AWMAN_TUI_SCROLLBACK_LINES", "5"),
+            ("AWMAN_AGENTS_LAUNCH_MODE", "acp"),
+            ("HOME", "/home/a"),
+        ]);
+        assert_eq!(
+            env.config_vars(),
+            vec![
+                ("AWMAN_AGENTS_LAUNCH_MODE".to_string(), "acp".to_string()),
+                ("AWMAN_TUI_SCROLLBACK_LINES".to_string(), "5".to_string()),
+            ]
+        );
+        assert_eq!(env.awman_home(), Some(PathBuf::from("/h")));
+        assert_eq!(
+            EnvSnapshot::with_overrides([(AWMAN_HOME, " ")]).awman_home(),
+            None
+        );
+    }
+
+    #[test]
+    fn env_values_are_parsed_by_the_key_type_and_bind_known_map_names() {
+        let env = EnvSnapshot::with_overrides([
+            ("AWMAN_WORKFLOWS_MAX_CONCURRENT_STEPS", "3"),
+            ("AWMAN_OVERLAYS", "ssh(), env(TOKEN)"),
+            ("AWMAN_WORK_SERVERS_IN_FACT_URL", "https://h:1"),
+            ("AWMAN_AGENTS_FLAGS_CODEX", "--a,--b"),
+            ("AWMAN_TUI_BACKEND", ""),
+        ]);
+        let known = |section: &str| match section {
+            "workServers" => vec!["in-fact".to_string()],
+            _ => Vec::new(),
+        };
+        let overrides = ConfigOverrides::from_env(&env, known).unwrap();
+        let mut pairs = overrides.0.clone();
+        pairs.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            pairs,
+            vec![
+                ("agents.flags.codex".to_string(), json!(["--a", "--b"])),
+                ("overlays".to_string(), json!(["ssh()", "env(TOKEN)"])),
+                ("workServers.in-fact.url".to_string(), json!("https://h:1")),
+                ("workflows.maxConcurrentSteps".to_string(), json!(3)),
+            ],
+            "an empty value is unset; a map name binds to the file's spelling"
+        );
+    }
+
+    #[test]
+    fn a_bad_env_value_is_an_error_naming_the_variable() {
+        let env = EnvSnapshot::with_overrides([("AWMAN_AGENTS_LAUNCH_MODE", "banana")]);
+        let err = ConfigOverrides::from_env(&env, no_names)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("AWMAN_AGENTS_LAUNCH_MODE"), "{err}");
+        assert!(err.contains("agents.launchMode"), "{err}");
+    }
+
+    // ── --set parsing, one case per value type ────────────────────────────
+
+    #[test]
+    fn set_parses_every_value_type() {
+        assert_eq!(one(&["agents.auth.refresh.enabled=false"]).1, json!(false));
+        assert_eq!(one(&["tui.scrollbackLines=500"]).1, json!(500));
+        assert_eq!(
+            one(&["runtime.baseImage=ghcr.io/x/y:1"]).1,
+            json!("ghcr.io/x/y:1")
+        );
+        assert_eq!(one(&["agents.launchMode=acp"]).1, json!("acp"));
+        assert_eq!(one(&["agents.stuckTimeout=45s"]).1, json!("45s"));
+        assert_eq!(one(&["runtime.builtin.memory=8GiB"]).1, json!("8GiB"));
+        assert_eq!(
+            one(&["agents.yolo.disallowedTools=Bash, WebFetch"]).1,
+            json!(["Bash", "WebFetch"])
+        );
+        assert_eq!(
+            one(&["runtime.builtin.network.hostPorts=8080,9090"]).1,
+            json!([8080, 9090])
+        );
+        assert_eq!(
+            one(&["workServers.prod.labels=os=linux,gpu=a100"]),
+            (
+                "workServers.prod.labels".to_string(),
+                json!({"os": "linux", "gpu": "a100"})
+            )
+        );
+        // A value may itself contain `=`: only the first one splits.
+        assert_eq!(
+            one(&["workItems.template=a=b"]).1,
+            json!("a=b"),
+            "only the first `=` separates key from value"
+        );
+        // `null` resets the key to its default.
+        assert_eq!(one(&["agents.stuckTimeout=null"]).1, Value::Null);
+    }
+
+    #[test]
+    fn set_rejects_bad_values_for_every_value_type() {
+        for arg in [
+            "agents.auth.refresh.enabled=maybe",
+            "tui.scrollbackLines=lots",
+            "tui.scrollbackLines=-1",
+            "agents.launchMode=banana",
+            "agents.stuckTimeout=soon",
+            "runtime.builtin.memory=lots",
+            "runtime.builtin.network.hostPorts=80,http",
+            "workServers.prod.labels=novalue",
+        ] {
+            let err = set(&[arg]).unwrap_err();
+            assert!(matches!(err, KeyError::Value { .. }), "{arg}: {err}");
+        }
+        let err = set(&["runtime.builtin.imageSource=x"]).unwrap_err();
+        assert!(matches!(err, KeyError::ObjectNotSettable { .. }), "{err}");
+    }
+
+    #[test]
+    fn set_rejects_unknown_keys_with_the_key_table_error() {
+        let err = set(&["maxConcurrentAgents=2"]).unwrap_err();
+        assert!(matches!(err, KeyError::Unknown { .. }), "{err}");
+        let text = err.to_string();
+        assert!(
+            text.contains("unknown config key `maxConcurrentAgents`"),
+            "{text}"
+        );
+        assert!(text.contains("workflows.maxConcurrentSteps"), "{text}");
+
+        let err = set(&["agents.nope=1"]).unwrap_err().to_string();
+        assert!(
+            err.contains("valid keys here:") && err.contains("launchMode"),
+            "{err}"
+        );
+
+        let err = set(&["agents.launchMode"]).unwrap_err().to_string();
+        assert!(err.contains("expected --set <key>=<value>"), "{err}");
+
+        let err = set(&["workServers.Bad.url=x"]).unwrap_err();
+        assert!(matches!(err, KeyError::Name { .. }), "{err}");
+    }
+
+    #[test]
+    fn set_keeps_command_line_order_so_the_last_value_wins() {
+        let overrides = set(&["tui.scrollbackLines=1", "tui.scrollbackLines=2"]).unwrap();
+        assert_eq!(overrides.0.last().unwrap().1, json!(2));
+    }
+
+    // ── Precedence: default → files → env → --set ─────────────────────────
+
+    fn effective(
+        home: &std::path::Path,
+        env: &[(&str, &str)],
+        set_args: &[&str],
+    ) -> crate::data::config::effective::EffectiveConfig {
+        use crate::data::config::effective::{ConfigLayers, EffectiveConfig};
+        let mut vars: Vec<(String, String)> =
+            vec![(AWMAN_HOME.to_string(), home.to_string_lossy().into_owned())];
+        vars.extend(env.iter().map(|(k, v)| (k.to_string(), v.to_string())));
+        let env = EnvSnapshot::with_overrides(vars);
+        let layers = ConfigLayers::load(&env, None, set(set_args).unwrap()).unwrap();
+        EffectiveConfig::resolve(layers, Default::default(), env).unwrap()
+    }
+
+    #[test]
+    fn env_beats_files_and_set_beats_env() {
+        use crate::data::config::effective::Layer;
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            home.path().join("config.json"),
+            r#"{"agents":{"stuckTimeout":"10s"},"workflows":{"maxConcurrentSteps":4}}"#,
+        )
+        .unwrap();
+        let path = "agents.stuckTimeout";
+        let secs = |ec: &crate::data::config::effective::EffectiveConfig| {
+            ec.agent_stuck_timeout().as_secs()
+        };
+
+        let ec = effective(home.path(), &[], &[]);
+        assert_eq!((secs(&ec), ec.source_of(path)), (10, Layer::Global));
+
+        let env = [("AWMAN_AGENTS_STUCK_TIMEOUT", "20s")];
+        let ec = effective(home.path(), &env, &[]);
+        assert_eq!((secs(&ec), ec.source_of(path)), (20, Layer::Env));
+
+        let ec = effective(home.path(), &env, &["agents.stuckTimeout=30s"]);
+        assert_eq!((secs(&ec), ec.source_of(path)), (30, Layer::Set));
+
+        // `--set key=null` resets to the built-in default even over env.
+        let ec = effective(home.path(), &env, &["agents.stuckTimeout=null"]);
+        assert_eq!(secs(&ec), 30, "the table default is 30s");
+
+        // A removed hand-named variable changes nothing.
+        let ec = effective(home.path(), &[("AWMAN_MAX_CONCURRENT_AGENTS", "1")], &[]);
+        assert_eq!(ec.max_concurrent_steps(), Some(4));
+        let ec = effective(
+            home.path(),
+            &[("AWMAN_WORKFLOWS_MAX_CONCURRENT_STEPS", "2")],
+            &["workflows.maxConcurrentSteps=1"],
+        );
+        assert_eq!(ec.max_concurrent_steps(), Some(1));
     }
 }
 
@@ -1408,7 +1707,6 @@ mod published_key_tests {
 
         update_daemon_overlay(|vars| {
             vars.insert(AWMAN_SQUAD_KEY.to_string(), "minted-squad-key".to_string());
-            vars.insert(AWMAN_API_KEY.to_string(), "minted-api-key".to_string());
         });
 
         let snapshot = Env::from_process();
@@ -1417,37 +1715,32 @@ mod published_key_tests {
             Some("minted-squad-key"),
             "a snapshot built after the mint must carry the published squad key"
         );
-        assert_eq!(
-            snapshot.api_key(),
-            Some("minted-api-key"),
-            "a snapshot built after the mint must carry the published API key"
-        );
 
         set_daemon_overlay(previous);
     }
 
-    /// The counterpart: nothing *but* the two published keys is resolved
-    /// through the overlay, so a daemon client cannot redirect this process's
-    /// storage root by pushing an `env(VAR)` payload named like one of awman's
-    /// own invariants.
+    /// The counterpart: nothing *but* the published key is resolved through
+    /// the overlay, so a daemon client cannot redirect this process's storage
+    /// root, or change its config, by pushing an `env(VAR)` payload named
+    /// like one of awman's own variables.
     #[test]
-    fn the_overlay_cannot_redirect_a_storage_root() {
+    fn the_overlay_cannot_redirect_a_storage_root_or_set_config() {
+        const CONFIG_VAR: &str = "AWMAN_AGENTS_LAUNCH_MODE";
         let _lock = DAEMON_OVERLAY_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let previous = daemon_overlay_snapshot();
-        let real_root = std::env::var(AWMAN_SQUAD_ROOT).ok();
+        let real_root = std::env::var(AWMAN_HOME).ok();
+        let real_config = std::env::var(CONFIG_VAR).ok();
 
         update_daemon_overlay(|vars| {
-            vars.insert(AWMAN_SQUAD_ROOT.to_string(), "/attacker/root".to_string());
+            vars.insert(AWMAN_HOME.to_string(), "/attacker/root".to_string());
+            vars.insert(CONFIG_VAR.to_string(), "acp".to_string());
         });
 
         let snapshot = Env::from_process();
-        assert_eq!(
-            snapshot.get(AWMAN_SQUAD_ROOT),
-            real_root.as_deref(),
-            "the overlay must not reach awman's own invariants"
-        );
+        assert_eq!(snapshot.get(AWMAN_HOME), real_root.as_deref());
+        assert_eq!(snapshot.get(CONFIG_VAR), real_config.as_deref());
 
         set_daemon_overlay(previous);
     }

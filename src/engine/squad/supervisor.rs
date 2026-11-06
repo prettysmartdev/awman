@@ -621,7 +621,8 @@ mod tests {
         decide_key_state, key_setup, resolve_daemon_binary, KeyDisclosure, SquadKeyState,
         SquadSupervisor,
     };
-    use crate::data::config::env::{EnvSnapshot, AWMAN_SQUAD_ROOT};
+    use crate::data::config::env::EnvSnapshot;
+    use crate::data::fs::data_paths::AWMAN_HOME;
     use crate::engine::auth::ApiKey;
 
     /// A daemon that died without clearing its endpoint sidecar must not be
@@ -647,7 +648,7 @@ mod tests {
         let previous = crate::data::config::env::daemon_overlay_snapshot();
 
         let tmp = tempfile::tempdir().unwrap();
-        let env = EnvSnapshot::with_overrides([(AWMAN_SQUAD_ROOT, tmp.path().to_str().unwrap())]);
+        let env = EnvSnapshot::with_overrides([(AWMAN_HOME, tmp.path().to_str().unwrap())]);
         let supervisor = SquadSupervisor::from_env(&env).unwrap();
 
         supervisor
@@ -710,7 +711,7 @@ mod tests {
     #[test]
     fn a_timeout_that_never_started_a_process_does_not_send_the_user_to_an_empty_log() {
         let tmp = tempfile::tempdir().unwrap();
-        let env = EnvSnapshot::with_overrides([(AWMAN_SQUAD_ROOT, tmp.path().to_str().unwrap())]);
+        let env = EnvSnapshot::with_overrides([(AWMAN_HOME, tmp.path().to_str().unwrap())]);
         let supervisor = SquadSupervisor::from_env(&env).unwrap();
 
         let never_started = supervisor.startup_timeout_message(false);
@@ -791,7 +792,7 @@ mod tests {
     #[test]
     fn the_probe_endpoint_never_mints_a_key() {
         let tmp = tempfile::tempdir().unwrap();
-        let env = EnvSnapshot::with_overrides([(AWMAN_SQUAD_ROOT, tmp.path().to_str().unwrap())]);
+        let env = EnvSnapshot::with_overrides([(AWMAN_HOME, tmp.path().to_str().unwrap())]);
         let supervisor = SquadSupervisor::from_env(&env).unwrap();
 
         assert!(
@@ -824,7 +825,7 @@ mod tests {
     #[test]
     fn endpoint_from_meta_never_mints_a_key_when_no_daemon_is_running() {
         let tmp = tempfile::tempdir().unwrap();
-        let env = EnvSnapshot::with_overrides([(AWMAN_SQUAD_ROOT, tmp.path().to_str().unwrap())]);
+        let env = EnvSnapshot::with_overrides([(AWMAN_HOME, tmp.path().to_str().unwrap())]);
         let supervisor = SquadSupervisor::from_env(&env).unwrap();
 
         assert!(
@@ -852,7 +853,7 @@ mod tests {
     #[test]
     fn a_hash_with_no_key_in_the_environment_reports_missing() {
         let tmp = tempfile::tempdir().unwrap();
-        let env = EnvSnapshot::with_overrides([(AWMAN_SQUAD_ROOT, tmp.path().to_str().unwrap())]);
+        let env = EnvSnapshot::with_overrides([(AWMAN_HOME, tmp.path().to_str().unwrap())]);
         let supervisor = SquadSupervisor::from_env(&env).unwrap();
 
         assert!(
@@ -873,7 +874,7 @@ mod tests {
 
         // The same root, with the key exported: nothing missing.
         let env = EnvSnapshot::with_overrides([
-            (AWMAN_SQUAD_ROOT, tmp.path().to_str().unwrap()),
+            (AWMAN_HOME, tmp.path().to_str().unwrap()),
             (crate::data::config::env::AWMAN_SQUAD_KEY, "a-real-key"),
         ]);
         let supervisor = SquadSupervisor::from_env(&env).unwrap();
@@ -909,7 +910,7 @@ mod tests {
 #[cfg(test)]
 mod health_tests {
     use super::*;
-    use crate::data::config::env::AWMAN_SQUAD_ROOT;
+    use crate::data::fs::data_paths::AWMAN_HOME;
     use crate::data::fs::task_store::{MountScope, RunStatus, Task, TaskStatus};
     use crate::engine::squad::SquadHealth;
     use chrono::Utc;
@@ -919,7 +920,7 @@ mod health_tests {
         let now = Utc::now();
         Task {
             prerequisites: None,
-            id: name.to_string(),
+            id: crate::data::ids::TaskId::new(),
             name: name.to_string(),
             description: "test".into(),
             repo_scope: PathBuf::from("/workspace"),
@@ -946,7 +947,7 @@ mod health_tests {
     #[test]
     fn a_daemon_that_is_not_running_is_grey_whatever_the_probe_says() {
         let tmp = tempfile::tempdir().unwrap();
-        let env = EnvSnapshot::with_overrides([(AWMAN_SQUAD_ROOT, tmp.path().to_str().unwrap())]);
+        let env = EnvSnapshot::with_overrides([(AWMAN_HOME, tmp.path().to_str().unwrap())]);
         let supervisor = SquadSupervisor::from_env(&env).unwrap();
 
         let tasks = [task("a", Some(RunStatus::Failed))];
@@ -1004,7 +1005,10 @@ mod health_tests {
         let tasks = [
             task("a", Some(RunStatus::Interrupted)),
             task("b", Some(RunStatus::NotTriggered)),
-            task("c", Some(RunStatus::WorkflowExecuted)),
+            task(
+                "cmd_4a8a08f09d37b73795649038408b5f33",
+                Some(RunStatus::WorkflowExecuted),
+            ),
             task("d", None),
         ];
         assert_eq!(
@@ -1079,7 +1083,10 @@ mod health_tests {
             "an unmet variable outranks a run in flight"
         );
         let split = [
-            task("busy", Some(RunStatus::Running)),
+            task(
+                "ses_8bc1b2f84252c3df4edd53e4aad097a7",
+                Some(RunStatus::Running),
+            ),
             task_with_unmet("deploy", None, &["AWS_PROFILE"]),
         ];
         assert_eq!(
@@ -1100,7 +1107,7 @@ mod health_tests {
         // And a daemon that is not running at all is grey, not yellow, even
         // with an uncovered variable on the last task list anyone saw.
         let tmp = tempfile::tempdir().unwrap();
-        let env = EnvSnapshot::with_overrides([(AWMAN_SQUAD_ROOT, tmp.path().to_str().unwrap())]);
+        let env = EnvSnapshot::with_overrides([(AWMAN_HOME, tmp.path().to_str().unwrap())]);
         let supervisor = SquadSupervisor::from_env(&env).unwrap();
         let tasks = [task_with_unmet("deploy", None, &["AWS_PROFILE"])];
         assert_eq!(supervisor.health(Some(&tasks)), SquadHealth::NotRunning);

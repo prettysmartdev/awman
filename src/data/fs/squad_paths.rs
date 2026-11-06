@@ -43,20 +43,11 @@ impl SquadPaths {
 
     /// Resolve from a supplied env snapshot.
     ///
-    /// Precedence: `AWMAN_SQUAD_ROOT` → `AWMAN_CONFIG_HOME/squad` →
-    /// `XDG_DATA_HOME/awman/squad` → `$HOME/.awman/squad`.
+    /// `<data home>/squad` (see [`crate::data::fs::data_paths`]).
     pub fn from_env(env: &EnvSnapshot) -> Result<Self, DataError> {
-        if let Some(root) = env.squad_root() {
-            return Ok(Self::from_root(root));
-        }
-        if let Some(home) = env.config_home() {
-            return Ok(Self::from_root(home.join(SQUAD_SUBDIR)));
-        }
-        if let Some(xdg) = env.xdg_data_home() {
-            return Ok(Self::from_root(xdg.join("awman").join(SQUAD_SUBDIR)));
-        }
-        let home = dirs::home_dir().ok_or(DataError::HomeNotFound)?;
-        Ok(Self::from_root(home.join(".awman").join(SQUAD_SUBDIR)))
+        Ok(Self::from_root(
+            crate::data::fs::data_paths::data_home(env)?.join(SQUAD_SUBDIR),
+        ))
     }
 
     /// The squad root directory.
@@ -108,7 +99,7 @@ impl SquadPaths {
             &base,
             "task directory must reside under the squad tasks root",
         )?;
-        Ok(base.join(crate::data::config::global::GLOBAL_CONFIG_FILENAME))
+        Ok(base.join(crate::data::config::file::CONFIG_FILENAME))
     }
 
     /// Directory holding per-task container image build logs.
@@ -362,21 +353,12 @@ impl SharedSquadRunLog {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::config::env::{AWMAN_CONFIG_HOME, AWMAN_SQUAD_ROOT, XDG_DATA_HOME};
+    use crate::data::config::env::XDG_DATA_HOME;
+    use crate::data::fs::data_paths::AWMAN_HOME;
 
     #[test]
-    fn squad_root_override_wins() {
-        let env = EnvSnapshot::with_overrides([
-            (AWMAN_SQUAD_ROOT, "/custom/squad"),
-            (XDG_DATA_HOME, "/xdg/data"),
-        ]);
-        let paths = SquadPaths::from_env(&env).unwrap();
-        assert_eq!(paths.root(), Path::new("/custom/squad"));
-    }
-
-    #[test]
-    fn config_home_produces_squad_subdir() {
-        let env = EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, "/cfg")]);
+    fn awman_home_produces_squad_subdir() {
+        let env = EnvSnapshot::with_overrides([(AWMAN_HOME, "/cfg"), (XDG_DATA_HOME, "/xdg")]);
         let paths = SquadPaths::from_env(&env).unwrap();
         assert_eq!(paths.root(), Path::new("/cfg/squad"));
     }

@@ -692,7 +692,7 @@ pub(crate) fn render_config_show(state: &dialogs::ConfigShowState, area: Rect, f
         ]),
         None => {
             // The row shape decides whether Ctrl+N adds a map or list entry.
-            use crate::command::commands::config::ConfigRowShape;
+            use crate::command::commands::config::ConfigRowKind;
             let selected_shape = state.rows.get(state.selected).map(|row| row.shape);
             let mut spans = vec![
                 key("  \u{2191}\u{2193}"),
@@ -705,11 +705,11 @@ pub(crate) fn render_config_show(state: &dialogs::ConfigShowState, area: Rect, f
                 Span::raw("=edit  "),
             ];
             match selected_shape {
-                Some(ConfigRowShape::MapHeader { .. } | ConfigRowShape::MapEntry) => {
+                Some(ConfigRowKind::MapHeader { .. } | ConfigRowKind::MapEntry) => {
                     spans.push(key("Ctrl+N"));
                     spans.push(Span::raw(format!("=add {scope} mapping  ")));
                 }
-                Some(ConfigRowShape::ListHeader { .. } | ConfigRowShape::ListEntry) => {
+                Some(ConfigRowKind::ListHeader { .. } | ConfigRowKind::ListEntry) => {
                     spans.push(key("Ctrl+N"));
                     spans.push(Span::raw(format!("=add {scope} entry  ")));
                 }

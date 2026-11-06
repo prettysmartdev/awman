@@ -36,7 +36,6 @@ fn make_app_state(root: &std::path::Path, auth: AuthMode) -> Arc<AppState> {
     let workflow_state_store = Arc::new(WorkflowStateStore::at_git_root(paths.root()));
 
     let engines = Engines {
-        config_notices: Default::default(),
         runtime: runtime.clone(),
         container_runtime: Some(runtime),
         sandbox_runtime: None,
@@ -63,6 +62,8 @@ fn make_app_state(root: &std::path::Path, auth: AuthMode) -> Arc<AppState> {
     );
 
     Arc::new(AppState {
+        live_config: std::sync::RwLock::new(None),
+        settings_tx: None,
         lifecycle_store,
         setup_cancels,
         canceller,
@@ -106,7 +107,7 @@ async fn real_network_api_status_endpoint_returns_ok() {
     assert_eq!(resp.status(), 200, "expected 200, got {}", resp.status());
     let body: serde_json::Value = resp.json().await.expect("json body");
     assert_eq!(body["status"], "ok");
-    assert!(body["uptime_seconds"].is_number());
+    assert!(body["uptime_ms"].is_number());
     assert!(body["pid"].is_number());
 
     server.abort();
@@ -137,12 +138,12 @@ async fn real_network_api_workdirs_endpoint_returns_200() {
         return;
     };
 
-    let url = format!("http://{addr}/v1/workdirs");
+    let url = format!("http://{addr}/v1/worker/workdirs");
     let resp = reqwest::get(&url).await.expect("workdirs response");
     assert_eq!(resp.status(), 200);
     let body: serde_json::Value = resp.json().await.expect("workdirs body");
-    assert!(body["workdirs"].is_array());
-    assert!(body["roots"].is_array());
+    assert!(body["items"].is_array());
+    assert!(body["items"].is_array());
 
     server.abort();
 }

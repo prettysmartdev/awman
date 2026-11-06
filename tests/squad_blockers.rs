@@ -23,7 +23,7 @@ use awman::command::commands::squad::gateway::{CreateTask, DaemonStatus, TaskGat
 use awman::command::commands::Command;
 use awman::command::dispatch::Engines;
 use awman::command::error::CommandError;
-use awman::data::config::env::AWMAN_SQUAD_ROOT;
+use awman::data::fs::data_paths::AWMAN_HOME;
 use awman::data::fs::task_store::{MountScope, Run, Task, TaskStatus};
 use awman::data::fs::{ApiPaths, AuthPathResolver, SquadPaths};
 use awman::data::message::{UserMessage, UserMessageSink};
@@ -42,7 +42,7 @@ use awman::engine::overlay::OverlayEngine;
 #[path = "helpers/mod.rs"]
 mod helpers;
 
-/// Process-env mutation (AWMAN_SQUAD_ROOT) is global; serialize the tests that
+/// Process-env mutation (AWMAN_HOME) is global; serialize the tests that
 /// touch it so parallel runs never see each other's root.
 static ENV_LOCK: AsyncMutex<()> = AsyncMutex::const_new(());
 
@@ -52,7 +52,7 @@ fn sample_task(name: &str) -> Task {
     let now = chrono::Utc::now();
     Task {
         prerequisites: None,
-        id: format!("id-{name}"),
+        id: awman::data::ids::TaskId::new(),
         name: name.to_string(),
         description: "desc".into(),
         repo_scope: PathBuf::from("/repo"),
@@ -274,7 +274,6 @@ fn engines_with(runtime: Arc<dyn AgentRuntimeEngine>, container: bool, root: &Pa
         overlay_engine: overlay_engine.clone(),
         auth_engine: Arc::new(AuthEngine::with_paths(auth_paths, api_paths.clone())),
         agent_engine: Arc::new(AgentEngine::new(overlay_engine, docker)),
-        config_notices: Default::default(),
         workflow_state_store: Arc::new(WorkflowStateStore::at_git_root(api_paths.root())),
         credential_monitor: None,
         global_config: std::sync::Arc::new(Default::default()),
@@ -352,10 +351,10 @@ async fn run_remove(root: &Path, name: &str, yes: bool, confirm: bool) -> SquadO
 async fn remove_with_yes_deletes_the_persistent_directory() {
     let tmp = tempfile::tempdir().unwrap();
     let _guard = ENV_LOCK.lock().await;
-    let previous = std::env::var(AWMAN_SQUAD_ROOT).ok();
-    std::env::set_var(AWMAN_SQUAD_ROOT, tmp.path());
+    let previous = std::env::var(AWMAN_HOME).ok();
+    std::env::set_var(AWMAN_HOME, tmp.path());
 
-    let dir = SquadPaths::from_root(tmp.path())
+    let dir = SquadPaths::from_root(tmp.path().join("squad"))
         .task_dir("issue-triage")
         .unwrap();
     std::fs::create_dir_all(&dir).unwrap();
@@ -363,7 +362,7 @@ async fn remove_with_yes_deletes_the_persistent_directory() {
 
     let outcome = run_remove(tmp.path(), "issue-triage", true, false).await;
 
-    restore(AWMAN_SQUAD_ROOT, previous);
+    restore(AWMAN_HOME, previous);
     assert!(!dir.exists(), "`-y` must delete the task directory");
     assert!(matches!(
         outcome,
@@ -378,10 +377,10 @@ async fn remove_with_yes_deletes_the_persistent_directory() {
 async fn remove_declined_keeps_the_persistent_directory() {
     let tmp = tempfile::tempdir().unwrap();
     let _guard = ENV_LOCK.lock().await;
-    let previous = std::env::var(AWMAN_SQUAD_ROOT).ok();
-    std::env::set_var(AWMAN_SQUAD_ROOT, tmp.path());
+    let previous = std::env::var(AWMAN_HOME).ok();
+    std::env::set_var(AWMAN_HOME, tmp.path());
 
-    let dir = SquadPaths::from_root(tmp.path())
+    let dir = SquadPaths::from_root(tmp.path().join("squad"))
         .task_dir("issue-triage")
         .unwrap();
     std::fs::create_dir_all(&dir).unwrap();
@@ -389,7 +388,7 @@ async fn remove_declined_keeps_the_persistent_directory() {
     // No `-y`, and the frontend declines: the directory survives.
     let outcome = run_remove(tmp.path(), "issue-triage", false, false).await;
 
-    restore(AWMAN_SQUAD_ROOT, previous);
+    restore(AWMAN_HOME, previous);
     assert!(dir.exists(), "declining must keep the task directory");
     assert!(matches!(
         outcome,
@@ -404,10 +403,10 @@ async fn remove_declined_keeps_the_persistent_directory() {
 async fn remove_confirmed_via_frontend_deletes_the_directory() {
     let tmp = tempfile::tempdir().unwrap();
     let _guard = ENV_LOCK.lock().await;
-    let previous = std::env::var(AWMAN_SQUAD_ROOT).ok();
-    std::env::set_var(AWMAN_SQUAD_ROOT, tmp.path());
+    let previous = std::env::var(AWMAN_HOME).ok();
+    std::env::set_var(AWMAN_HOME, tmp.path());
 
-    let dir = SquadPaths::from_root(tmp.path())
+    let dir = SquadPaths::from_root(tmp.path().join("squad"))
         .task_dir("issue-triage")
         .unwrap();
     std::fs::create_dir_all(&dir).unwrap();
@@ -415,7 +414,7 @@ async fn remove_confirmed_via_frontend_deletes_the_directory() {
     // No `-y`, but the frontend confirms: the directory is removed.
     let outcome = run_remove(tmp.path(), "issue-triage", false, true).await;
 
-    restore(AWMAN_SQUAD_ROOT, previous);
+    restore(AWMAN_HOME, previous);
     assert!(
         !dir.exists(),
         "a confirmed prompt must delete the directory"
@@ -433,13 +432,13 @@ async fn remove_confirmed_via_frontend_deletes_the_directory() {
 async fn remove_a_crafted_name_cannot_escape_the_tasks_root() {
     let tmp = tempfile::tempdir().unwrap();
     let _guard = ENV_LOCK.lock().await;
-    let previous = std::env::var(AWMAN_SQUAD_ROOT).ok();
-    std::env::set_var(AWMAN_SQUAD_ROOT, tmp.path());
+    let previous = std::env::var(AWMAN_HOME).ok();
+    std::env::set_var(AWMAN_HOME, tmp.path());
 
     // `..` is resolved by canonicalization only when the target exists, so
     // materialize both the tasks root and the escape target (mirroring
     // `SquadPaths::task_dir`'s own escape test).
-    let paths = SquadPaths::from_root(tmp.path());
+    let paths = SquadPaths::from_root(tmp.path().join("squad"));
     std::fs::create_dir_all(paths.tasks_dir()).unwrap();
     let escape = tmp.path().join("escape");
     std::fs::create_dir_all(&escape).unwrap();
@@ -457,7 +456,7 @@ async fn remove_a_crafted_name_cannot_escape_the_tasks_root() {
         .run_with_frontend(Box::new(ScriptedFrontend::with_delete(true)))
         .await;
 
-    restore(AWMAN_SQUAD_ROOT, previous);
+    restore(AWMAN_HOME, previous);
     // The directory removal refused the escape, and the escape target survives.
     assert!(
         result.is_err(),
@@ -472,10 +471,12 @@ async fn remove_a_crafted_name_cannot_escape_the_tasks_root() {
 async fn logs_without_follow_emits_the_existing_lines() {
     let tmp = tempfile::tempdir().unwrap();
     let _guard = ENV_LOCK.lock().await;
-    let previous = std::env::var(AWMAN_SQUAD_ROOT).ok();
-    std::env::set_var(AWMAN_SQUAD_ROOT, tmp.path());
+    let previous = std::env::var(AWMAN_HOME).ok();
+    std::env::set_var(AWMAN_HOME, tmp.path());
 
-    let log_path = SquadPaths::from_root(tmp.path()).daemon().log_file();
+    let log_path = SquadPaths::from_root(tmp.path().join("squad"))
+        .daemon()
+        .log_file();
     std::fs::create_dir_all(log_path.parent().unwrap()).unwrap();
     std::fs::write(&log_path, "line one\nline two\n").unwrap();
 
@@ -495,7 +496,7 @@ async fn logs_without_follow_emits_the_existing_lines() {
         .await
         .expect("logs must succeed");
 
-    restore(AWMAN_SQUAD_ROOT, previous);
+    restore(AWMAN_HOME, previous);
     let captured = messages.lock().unwrap();
     assert!(
         captured.iter().any(|m| m == "line one") && captured.iter().any(|m| m == "line two"),
@@ -511,10 +512,10 @@ async fn cli_squad_entry_points_fail_fast_under_a_sandbox_runtime() {
     let tmp = tempfile::tempdir().unwrap();
 
     let _guard = ENV_LOCK.lock().await;
-    let previous = std::env::var(AWMAN_SQUAD_ROOT).ok();
+    let previous = std::env::var(AWMAN_HOME).ok();
     // Point the squad root at a throwaway dir: if the tier check regressed and a
     // daemon child were provisioned, its key hash / pidfile would land here.
-    std::env::set_var(AWMAN_SQUAD_ROOT, tmp.path());
+    std::env::set_var(AWMAN_HOME, tmp.path());
 
     for raw in [
         vec!["awman", "squad", "list"],
@@ -542,8 +543,8 @@ async fn cli_squad_entry_points_fail_fast_under_a_sandbox_runtime() {
 
     // No entry point may have provisioned a key or claimed a pidfile: the tier
     // refusal fires before `SquadSupervisor::ensure_running`.
-    let daemon = SquadPaths::from_root(tmp.path()).daemon();
-    restore(AWMAN_SQUAD_ROOT, previous);
+    let daemon = SquadPaths::from_root(tmp.path().join("squad")).daemon();
+    restore(AWMAN_HOME, previous);
     assert!(
         !daemon.key_hash_file().exists(),
         "sandbox refusal must fire before any key is provisioned"

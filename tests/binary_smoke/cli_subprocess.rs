@@ -192,10 +192,10 @@ fn awman_remote_session_help_lists_start_and_kill() {
 #[test]
 fn skill_with_args_flag_exits_nonzero_with_descriptive_error() {
     let repo = make_git_repo();
-    // Use `chat --non-interactive` which accepts --overlay without a required positional arg.
+    // Use `chat --headless` which accepts --overlay without a required positional arg.
     let out = Command::new(awman_bin())
         .current_dir(repo.path())
-        .args(["chat", "--non-interactive", "--overlay", "skill()"])
+        .args(["chat", "--headless", "--overlay", "skill()"])
         .output()
         .expect("failed to run awman");
 
@@ -296,17 +296,46 @@ fn awman_ready_help_mentions_build_flag() {
 }
 
 #[test]
-fn awman_api_start_help_mentions_port_flag() {
+fn awman_api_start_help_lists_the_global_set_flag_and_no_port() {
     let out = run_awman(&["api", "start", "--help"]);
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
+    assert!(text.contains("--set"), "`--set` is global;\ngot:\n{text}");
     assert!(
-        text.contains("port") || text.contains("--port"),
-        "`awman api start --help` should mention --port;\ngot:\n{text}"
+        !text.contains("--port"),
+        "the listen address is config now;\ngot:\n{text}"
     );
+}
+
+/// WI 0139: removed per-setting flags are clap's ordinary unknown arguments.
+#[test]
+fn removed_flags_fail_with_the_unknown_argument_error() {
+    for args in [
+        &["chat", "--non-interactive"][..],
+        &["chat", "--launch-mode", "acp"],
+        &["exec", "workflow", "wf.toml", "--max-concurrent", "2"],
+    ] {
+        let out = run_awman(args);
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("unexpected argument"), "{args:?}: {stderr}");
+    }
+}
+
+/// WI 0139: a bad `--set` is a usage error carrying the key table's message.
+#[test]
+fn a_bad_set_exits_2_with_the_key_table_error() {
+    let out = run_awman(&["--set", "maxConcurrentAgents=2", "ready"]);
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("unknown config key `maxConcurrentAgents`"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("workflows.maxConcurrentSteps"), "{stderr}");
 }
 
 /// `exec workflow` and its alias report a failure through the same renderer as
@@ -320,13 +349,12 @@ fn exec_workflow_failure_renders_for_the_output_mode() {
         std::process::Command::new(awman_bin())
             .args(args)
             .current_dir(repo.path())
-            .env("AWMAN_CONFIG_HOME", config.path())
-            .env("AWMAN_API_ROOT", config.path().join("api"))
+            .env("AWMAN_HOME", config.path())
             .output()
             .unwrap()
     };
 
-    let plain = run(&["exec", "workflow", "missing.toml", "--non-interactive"]);
+    let plain = run(&["exec", "workflow", "missing.toml", "--headless"]);
     assert!(!plain.status.success());
     assert!(plain.stdout.is_empty(), "{plain:?}");
     assert!(!plain.stderr.is_empty(), "{plain:?}");

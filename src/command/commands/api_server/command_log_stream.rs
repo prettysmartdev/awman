@@ -617,8 +617,8 @@ mod tests {
             source
                 .paths
                 .write_command_completion(
-                    "s",
-                    "c",
+                    "ses_03c7c0ace395d80182db07ae2c30f034",
+                    "cmd_4a8a08f09d37b73795649038408b5f33",
                     &CommandCompletion {
                         attempt,
                         status,
@@ -628,7 +628,9 @@ mod tests {
                     },
                 )
                 .unwrap();
-            let projected = command_log_row(&source, "c").await.unwrap();
+            let projected = command_log_row(&source, "cmd_4a8a08f09d37b73795649038408b5f33")
+                .await
+                .unwrap();
             assert_eq!(
                 projected.status,
                 if attempt == row.attempt && status.is_terminal() {
@@ -638,16 +640,29 @@ mod tests {
                 }
             );
             assert_eq!(
-                source.store.get_command("c").unwrap().unwrap().status,
+                source
+                    .store
+                    .get_command("cmd_4a8a08f09d37b73795649038408b5f33")
+                    .unwrap()
+                    .unwrap()
+                    .status,
                 CommandStatus::Running
             );
         }
         source
             .store
-            .complete_command("c", CommandStatus::Cancelled, Some(130), None)
+            .complete_command(
+                "cmd_4a8a08f09d37b73795649038408b5f33",
+                CommandStatus::Cancelled,
+                Some(130),
+                None,
+            )
             .unwrap();
         assert_eq!(
-            command_log_row(&source, "c").await.unwrap().status,
+            command_log_row(&source, "cmd_4a8a08f09d37b73795649038408b5f33")
+                .await
+                .unwrap()
+                .status,
             CommandStatus::Cancelled,
             "an already terminal row wins over sidecar evidence"
         );
@@ -677,7 +692,7 @@ mod tests {
         let store = Arc::new(SqliteSessionStore::open(root).unwrap());
         store
             .insert_session_full(NewSessionRow {
-                id: "s",
+                id: "ses_03c7c0ace395d80182db07ae2c30f034",
                 workdir: "/work",
                 created_at: &chrono::Utc::now().to_rfc3339(),
                 setup_status: SessionSetupStatus::Ready,
@@ -686,7 +701,13 @@ mod tests {
             })
             .unwrap();
         store
-            .enqueue_command("c", "s", "exec prompt", "[]", "/unused")
+            .enqueue_command(
+                "cmd_4a8a08f09d37b73795649038408b5f33",
+                "ses_03c7c0ace395d80182db07ae2c30f034",
+                "exec prompt",
+                "[]",
+                "/unused",
+            )
             .unwrap();
         CommandLogSource {
             store,
@@ -696,7 +717,10 @@ mod tests {
     }
 
     fn write_events(source: &CommandLogSource, events: &[ExecutionEvent]) {
-        let path = source.paths.command_events_log_path("s", "c");
+        let path = source.paths.command_events_log_path(
+            "ses_03c7c0ace395d80182db07ae2c30f034",
+            "cmd_4a8a08f09d37b73795649038408b5f33",
+        );
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let lines: String = events
             .iter()
@@ -717,7 +741,11 @@ mod tests {
             Arc::clone(&source.store),
             source.paths.clone(),
             Arc::clone(&source.event_buses),
-            source.store.get_command("c").unwrap().unwrap(),
+            source
+                .store
+                .get_command("cmd_4a8a08f09d37b73795649038408b5f33")
+                .unwrap()
+                .unwrap(),
             requested,
             None,
             Duration::from_millis(10),
@@ -812,7 +840,12 @@ mod tests {
         write_events(&source, &[output(1, 0), event(1, 1, EventPayload::Done)]);
         source
             .store
-            .complete_command("c", CommandStatus::Done, Some(0), None)
+            .complete_command(
+                "cmd_4a8a08f09d37b73795649038408b5f33",
+                CommandStatus::Done,
+                Some(0),
+                None,
+            )
             .unwrap();
         let mut stream = open(&source, Some(EventCursor::new(99, 5))).await;
         assert!(matches!(
@@ -842,8 +875,14 @@ mod tests {
         let source = source(tmp.path());
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
         let mut cursor = CommandLogCursor::new(ReplayFrom::Beginning, 1);
-        let repair =
-            recover_command_log_gap(&source, "s", "c", EventCursor::new(1, 2), &mut cursor, &tx);
+        let repair = recover_command_log_gap(
+            &source,
+            "ses_03c7c0ace395d80182db07ae2c30f034",
+            "cmd_4a8a08f09d37b73795649038408b5f33",
+            EventCursor::new(1, 2),
+            &mut cursor,
+            &tx,
+        );
         let writer = async {
             tokio::time::sleep(Duration::from_millis(60)).await;
             write_events(&source, &[output(1, 0), output(1, 1), output(1, 2)]);
@@ -868,8 +907,15 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
         let mut cursor = CommandLogCursor::new(ReplayFrom::Beginning, 1);
         assert!(
-            !recover_command_log_gap(&source, "s", "c", EventCursor::new(1, 2), &mut cursor, &tx)
-                .await
+            !recover_command_log_gap(
+                &source,
+                "ses_03c7c0ace395d80182db07ae2c30f034",
+                "cmd_4a8a08f09d37b73795649038408b5f33",
+                EventCursor::new(1, 2),
+                &mut cursor,
+                &tx
+            )
+            .await
         );
         assert!(cursor.last_sent.is_none());
         assert!(cursor.done.is_none());
@@ -884,7 +930,7 @@ mod tests {
         source
             .store
             .complete_command(
-                "c",
+                "cmd_4a8a08f09d37b73795649038408b5f33",
                 CommandStatus::Error,
                 Some(1),
                 Some(r#"{"outcome":"error"}"#),
@@ -906,11 +952,10 @@ mod tests {
         let source = source(tmp.path());
         let bus = Arc::new(EventBus::new(16));
         let sender = bus.sender();
-        source
-            .event_buses
-            .lock()
-            .await
-            .insert("c".into(), Arc::clone(&bus));
+        source.event_buses.lock().await.insert(
+            "cmd_4a8a08f09d37b73795649038408b5f33".into(),
+            Arc::clone(&bus),
+        );
         let mut first = open(&source, None).await;
         let mut second = open(&source, None).await;
         assert!(matches!(
@@ -932,7 +977,7 @@ mod tests {
         ));
         assert!(!source
             .store
-            .get_command("c")
+            .get_command("cmd_4a8a08f09d37b73795649038408b5f33")
             .unwrap()
             .unwrap()
             .status
@@ -955,7 +1000,12 @@ mod tests {
         );
         source
             .store
-            .complete_command("c", CommandStatus::Cancelled, Some(130), None)
+            .complete_command(
+                "cmd_4a8a08f09d37b73795649038408b5f33",
+                CommandStatus::Cancelled,
+                Some(130),
+                None,
+            )
             .unwrap();
         assert!(matches!(
             stream.next().await.unwrap().payload,

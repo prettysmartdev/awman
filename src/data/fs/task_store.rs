@@ -10,9 +10,11 @@ use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
 
-use crate::data::config::global::GlobalConfig;
+use crate::data::config::file::ConfigFile as GlobalConfig;
 use crate::data::error::DataError;
 use crate::data::fs::config_file::write_config_file_atomically;
+pub use crate::data::ids::RunId;
+use crate::data::ids::{TaskId, WorkerSessionId};
 
 /// A persisted scheduled squad task.
 ///
@@ -53,7 +55,7 @@ use crate::data::fs::config_file::write_config_file_atomically;
 pub struct Task {
     #[serde(default)]
     pub prerequisites: Option<crate::data::config::workflows::PrerequisitePolicy>,
-    pub id: String,
+    pub id: TaskId,
     pub name: String,
     pub description: String,
     /// The task's effective root. See the type-level docs.
@@ -213,33 +215,6 @@ impl Task {
     }
 }
 
-/// Typed identifier for one evaluation run.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct RunId(pub String);
-
-impl RunId {
-    pub fn new() -> Self {
-        Self(uuid::Uuid::new_v4().to_string())
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl Default for RunId {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl std::fmt::Display for RunId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunStatus {
@@ -311,12 +286,12 @@ pub struct TaskUpdate {
 /// A persisted squad evaluation attempt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Run {
-    pub id: String,
-    pub task_id: String,
+    pub id: RunId,
+    pub task_id: TaskId,
     pub status: RunStatus,
     pub workflow_path: Option<PathBuf>,
     pub workflow_state_path: Option<PathBuf>,
-    pub session_id: Option<String>,
+    pub session_id: Option<WorkerSessionId>,
     pub started_at: DateTime<Utc>,
     pub finished_at: Option<DateTime<Utc>>,
     pub error: Option<String>,
@@ -378,8 +353,7 @@ impl TaskStore {
 
     /// Write a task's own `config.json`.
     ///
-    /// The document is a whole [`GlobalConfig`] carrying only its `squad`
-    /// block, so the file the daemon writes and the file a user may hand-edit
+    /// The document is a whole task-scope [`crate::data::config::ConfigFile`], so the file the daemon writes and the file a user may hand-edit
     /// are the same shape, parsed by the same loader.
     pub fn write_config(path: &Path, config: &GlobalConfig) -> Result<(), DataError> {
         let body = serde_json::to_string_pretty(config)
@@ -461,6 +435,7 @@ impl TaskStore {
         // The leader verdict's free-text `reason`. `NULL` for rows written
         // before this column existed and for runs that never reached a verdict.
         Self::add_column_if_missing(conn, "squad_runs", "reason", "TEXT")?;
+        crate::data::fs::schema_version::migrate_ids(conn)?;
         Ok(())
     }
 
@@ -714,8 +689,8 @@ impl TaskStore {
 
     pub fn start_run(
         &self,
-        task_id: &str,
-        session_id: Option<&str>,
+        task_id: &TaskId,
+        session_id: Option<&WorkerSessionId>,
         started_at: DateTime<Utc>,
     ) -> Result<RunId, DataError> {
         self.start_run_with_env(task_id, session_id, started_at, &[])
@@ -729,8 +704,8 @@ impl TaskStore {
     /// actually started with.
     pub fn start_run_with_env(
         &self,
-        task_id: &str,
-        session_id: Option<&str>,
+        task_id: &TaskId,
+        session_id: Option<&WorkerSessionId>,
         started_at: DateTime<Utc>,
         unmet_env: &[String],
     ) -> Result<RunId, DataError> {
@@ -836,7 +811,7 @@ impl TaskStore {
         Ok(runs)
     }
 
-    pub fn running_run_for(&self, task_id: &str) -> Result<Option<Run>, DataError> {
+    pub fn running_run_for(&self, task_id: &TaskId) -> Result<Option<Run>, DataError> {
         let conn = self.lock();
         let raw = conn
             .query_row(
@@ -866,7 +841,7 @@ impl TaskStore {
 #[derive(Debug)]
 struct RawTask {
     prerequisites: Option<String>,
-    id: String,
+    id: TaskId,
     name: String,
     description: String,
     repo_scope: String,
@@ -955,12 +930,12 @@ where
 
 #[derive(Debug)]
 struct RawRun {
-    id: String,
-    task_id: String,
+    id: RunId,
+    task_id: TaskId,
     status: String,
     workflow_path: Option<String>,
     workflow_state_path: Option<String>,
-    session_id: Option<String>,
+    session_id: Option<WorkerSessionId>,
     started_at: String,
     finished_at: Option<String>,
     error: Option<String>,
@@ -1038,7 +1013,7 @@ fn decode_names(value: Option<&str>) -> Result<Vec<String>, DataError> {
 }
 
 fn timestamp(value: DateTime<Utc>) -> String {
-    value.to_rfc3339()
+    crate::data::wire::format_timestamp(value)
 }
 fn timestamp_opt(value: Option<DateTime<Utc>>) -> Option<String> {
     value.map(timestamp)
@@ -1074,7 +1049,7 @@ mod tests {
     fn task(name: &str, now: DateTime<Utc>) -> Task {
         Task {
             prerequisites: None,
-            id: uuid::Uuid::new_v4().to_string(),
+            id: TaskId::new(),
             name: name.to_string(),
             description: "test".into(),
             repo_scope: PathBuf::from("/repo"),
@@ -1121,7 +1096,7 @@ mod tests {
             std::thread::spawn(move || {
                 let mut reads = 0usize;
                 while !done.load(Ordering::Acquire) || reads == 0 {
-                    let loaded = GlobalConfig::load_path(&path)
+                    let loaded = GlobalConfig::load(&path, crate::data::config::FileKind::Task)
                         .expect("every read parses a complete task config");
                     assert!(
                         loaded.overlays == small || loaded.overlays == large,
@@ -1233,7 +1208,7 @@ mod prerequisite_tests {
 
     fn task(name: &str, now: DateTime<Utc>) -> Task {
         serde_json::from_value(serde_json::json!({
-            "id": format!("id-{name}"), "name": name, "description": "example",
+            "id": TaskId::new().to_string(), "name": name, "description": "example",
             "repo_scope": "/repo", "mount_scope": "gitroot", "overlays": [],
             "interval_secs": 60, "status": "active", "agent": null, "model": null,
             "backoff_until": null, "created_at": now, "updated_at": now, "last_run_at": null
@@ -1253,7 +1228,10 @@ mod prerequisite_tests {
         let dir = path.parent().unwrap();
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o555)).unwrap();
         let changed = GlobalConfig {
-            default_agent: Some("claude".into()),
+            agents: Some(crate::data::config::AgentsConfig {
+                default: Some("claude".into()),
+                ..Default::default()
+            }),
             ..GlobalConfig::default()
         };
         let result = TaskStore::write_config(&path, &changed);
@@ -1278,7 +1256,7 @@ mod prerequisite_tests {
         store.migrate().unwrap();
         let now = Utc::now();
         let mut task: Task = serde_json::from_value(serde_json::json!({
-            "id": "task-id", "name": "example", "description": "example",
+            "id": "task_11111111111141118111111111111111", "name": "example", "description": "example",
             "repo_scope": "/repo", "mount_scope": "gitroot", "overlays": [],
             "interval_secs": 60, "status": "active", "agent": null, "model": null,
             "backoff_until": null, "created_at": now, "updated_at": now, "last_run_at": null

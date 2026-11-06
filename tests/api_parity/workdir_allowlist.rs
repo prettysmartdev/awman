@@ -1,5 +1,5 @@
-//! Workdir allowlist-root contract: `GET /v1/workdirs` and the 403/202
-//! decisions of `POST /v1/sessions` for directories under `--workdir-root`.
+//! Workdir allowlist-root contract: `GET /v1/worker/workdirs` and the 403/202
+//! decisions of `POST /v1/worker/sessions` for directories under `--workdir-root`.
 //!
 //! Loopback-only and not named `real_network_*`, so `make test-fast` runs them.
 //! Fixtures are real `git init` repositories in temp dirs.
@@ -37,7 +37,6 @@ fn state(root: &Path, workdirs: Vec<PathBuf>, roots: Vec<PathBuf>) -> Arc<AppSta
         overlay_engine,
         auth_engine: Arc::new(AuthEngine::with_paths(auth_paths, paths.clone())),
         agent_engine,
-        config_notices: Default::default(),
         workflow_state_store: Arc::new(WorkflowStateStore::at_git_root(paths.root())),
         credential_monitor: None,
         global_config: Arc::new(Default::default()),
@@ -52,6 +51,8 @@ fn state(root: &Path, workdirs: Vec<PathBuf>, roots: Vec<PathBuf>) -> Arc<AppSta
         Arc::clone(&setup_cancels),
     );
     Arc::new(AppState {
+        live_config: std::sync::RwLock::new(None),
+        settings_tx: None,
         lifecycle_store,
         setup_cancels,
         canceller,
@@ -95,7 +96,7 @@ fn git_init(dir: &Path) {
 
 async fn create_local(addr: std::net::SocketAddr, workdir: &Path) -> (u16, serde_json::Value) {
     let resp = reqwest::Client::new()
-        .post(format!("http://{addr}/v1/sessions"))
+        .post(format!("http://{addr}/v1/worker/sessions"))
         .json(&serde_json::json!({
             "session_type": "local",
             "workdir": workdir.display().to_string(),
@@ -120,18 +121,30 @@ async fn workdirs_endpoint_lists_both_workdirs_and_roots() {
         return;
     };
 
-    let body: serde_json::Value = reqwest::get(format!("http://{addr}/v1/workdirs"))
+    let body: serde_json::Value = reqwest::get(format!("http://{addr}/v1/worker/workdirs"))
         .await
         .unwrap()
         .json()
         .await
         .unwrap();
     assert_eq!(
-        body["workdirs"],
+        serde_json::json!(body["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|v| v["kind"] == "allow")
+            .map(|v| v["path"].clone())
+            .collect::<Vec<_>>()),
         serde_json::json!([exact.display().to_string()])
     );
     assert_eq!(
-        body["roots"],
+        serde_json::json!(body["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|v| v["kind"] == "root")
+            .map(|v| v["path"].clone())
+            .collect::<Vec<_>>()),
         serde_json::json!([root.display().to_string()])
     );
 
@@ -145,14 +158,32 @@ async fn workdirs_endpoint_roots_is_empty_array_when_none_configured() {
         eprintln!("SKIP: cannot bind 127.0.0.1");
         return;
     };
-    let body: serde_json::Value = reqwest::get(format!("http://{addr}/v1/workdirs"))
+    let body: serde_json::Value = reqwest::get(format!("http://{addr}/v1/worker/workdirs"))
         .await
         .unwrap()
         .json()
         .await
         .unwrap();
-    assert_eq!(body["workdirs"], serde_json::json!([]));
-    assert_eq!(body["roots"], serde_json::json!([]));
+    assert_eq!(
+        serde_json::json!(body["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|v| v["kind"] == "allow")
+            .map(|v| v["path"].clone())
+            .collect::<Vec<_>>()),
+        serde_json::json!([])
+    );
+    assert_eq!(
+        serde_json::json!(body["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|v| v["kind"] == "root")
+            .map(|v| v["path"].clone())
+            .collect::<Vec<_>>()),
+        serde_json::json!([])
+    );
     server.abort();
 }
 
@@ -169,8 +200,8 @@ async fn create_session_direct_child_git_root_is_accepted() {
     };
 
     let (status, body) = create_local(addr, &child).await;
-    assert_eq!(status, 202, "got {body}");
-    assert!(body["session_id"].as_str().is_some(), "got {body}");
+    assert_eq!(status, 201, "got {body}");
+    assert!(body["id"].as_str().is_some(), "got {body}");
 
     server.abort();
 }
@@ -295,7 +326,7 @@ async fn create_session_symlink_is_resolved_before_the_root_check() {
         eprintln!("SKIP: cannot bind 127.0.0.1");
         return;
     };
-    assert_eq!(create_local(addr, &ok_link).await.0, 202);
+    assert_eq!(create_local(addr, &ok_link).await.0, 201);
     let (status, body) = create_local(addr, &bad_link).await;
     assert_eq!(status, 403, "got {body}");
     server.abort();
@@ -319,7 +350,7 @@ async fn create_session_root_created_after_startup_works_without_restart() {
     let child = root.join("repo");
     git_init(&child);
     let (status, body) = create_local(addr, &child).await;
-    assert_eq!(status, 202, "got {body}");
+    assert_eq!(status, 201, "got {body}");
     server.abort();
 }
 
@@ -334,7 +365,7 @@ async fn create_session_exact_workdir_entry_behaves_as_before() {
         eprintln!("SKIP: cannot bind 127.0.0.1");
         return;
     };
-    assert_eq!(create_local(addr, &exact_path).await.0, 202);
+    assert_eq!(create_local(addr, &exact_path).await.0, 201);
     let (status, body) = create_local(addr, &stranger.path().canonicalize().unwrap()).await;
     assert_eq!(status, 403);
     assert!(

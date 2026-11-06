@@ -114,24 +114,30 @@ async fn curl_get(url: String) -> (u16, Value) {
     curl(vec![url]).await
 }
 
-async fn curl_command(base: &str, subcommand: &str, args: &[&str]) -> (u16, Value) {
-    let payload = serde_json::json!({ "subcommand": subcommand, "args": args }).to_string();
-    curl(vec![
+async fn curl_resource(method: &str, url: &str, body: Option<Value>) -> (u16, Value) {
+    let mut args = vec![
         "-X".into(),
-        "POST".into(),
+        method.into(),
         "-H".into(),
         "Content-Type: application/json".into(),
-        "-d".into(),
-        payload,
-        format!("{base}/v1/commands"),
-    ])
-    .await
+    ];
+    if let Some(body) = body {
+        args.extend(["-d".into(), body.to_string()]);
+    }
+    args.push(url.into());
+    curl(args).await
 }
 
 /// Start the daemon in-process. The returned [`InProcessDaemon`] keeps
-/// `AWMAN_CONFIG_HOME` pointed at `root` until it is aborted (or dropped by a
+/// `AWMAN_HOME` pointed at `root` until it is aborted (or dropped by a
 /// panicking test), then restores it.
 async fn start_daemon(root: &std::path::Path) -> (InProcessDaemon, String) {
+    std::fs::create_dir_all(root).unwrap();
+    std::fs::write(
+        root.join("config.json"),
+        r#"{"daemon":{"features":{"squad":{"enabled":true}}}}"#,
+    )
+    .unwrap();
     let api_paths = ApiPaths::from_root(root);
     let auth_paths = AuthPathResolver::at_home(root);
     let overlay_engine = Arc::new(OverlayEngine::with_auth_resolver(auth_paths.clone()));
@@ -144,10 +150,15 @@ async fn start_daemon(root: &std::path::Path) -> (InProcessDaemon, String) {
         overlay_engine: overlay_engine.clone(),
         auth_engine: Arc::new(AuthEngine::with_paths(auth_paths, api_paths.clone())),
         agent_engine: Arc::new(AgentEngine::new(overlay_engine, container_runtime)),
-        config_notices: Default::default(),
         workflow_state_store: Arc::new(WorkflowStateStore::at_git_root(api_paths.root())),
         credential_monitor: None,
-        global_config: std::sync::Arc::new(Default::default()),
+        global_config: std::sync::Arc::new(
+            awman::data::config::ConfigFile::load(
+                &root.join("config.json"),
+                awman::data::config::FileKind::Global,
+            )
+            .unwrap(),
+        ),
     };
     let config = SquadServeConfig {
         port: 0,
@@ -155,7 +166,7 @@ async fn start_daemon(root: &std::path::Path) -> (InProcessDaemon, String) {
     };
 
     // The stored keychain item is a single fixed `awman-squad`/`daemon-env`
-    // pair, not keyed by storage root, so an isolated `AWMAN_CONFIG_HOME` does
+    // pair, not keyed by storage root, so an isolated `AWMAN_HOME` does
     // not isolate it. Opting out with `envPersistence: "none"` is no answer
     // either: opting out *clears* the item. The daemon runs in this process,
     // so isolate the whole process (in-memory keychain, no launchd/systemd),
@@ -163,7 +174,7 @@ async fn start_daemon(root: &std::path::Path) -> (InProcessDaemon, String) {
     std::fs::create_dir_all(root).unwrap();
     std::env::set_var("AWMAN_TEST_ISOLATION", "1");
 
-    let env = EnvOverride::set(&[("AWMAN_CONFIG_HOME", root.as_os_str())]);
+    let env = EnvOverride::set(&[("AWMAN_HOME", root.as_os_str())]);
 
     // WI 0113 F-02: Layer 2 bootstraps the daemon, Layer 3 serves it. This is
     // the same seam `serve_with` was, split across the layer boundary.
@@ -200,97 +211,54 @@ async fn start_daemon(root: &std::path::Path) -> (InProcessDaemon, String) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn curl_drives_the_full_task_lifecycle_with_no_awman_frontend() {
-    if !tool_available("git", "--version") {
-        eprintln!("SKIP: git not available");
+    if !tool_available("git", "--version") || !tool_available("curl", "--version") {
         return;
     }
-    if !tool_available("curl", "--version") {
-        eprintln!("SKIP: curl not available");
-        return;
-    }
-
     let _env_guard = ENV_LOCK.lock().await;
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().join("repo");
     init_repo(&repo);
     let (handle, base) = start_daemon(tmp.path()).await;
-
-    // status — daemon is up, no tasks yet.
     let (code, status) = curl_get(format!("{base}/v1/status")).await;
     assert_eq!(code, 200);
-    assert_eq!(status["running"], true);
-    assert_eq!(status["task_count"], 0);
-
-    // add
-    let repo_str = repo.to_str().unwrap();
-    let (code, created) = curl_command(
-        &base,
-        "squad add",
-        &[
-            "--name",
-            "issue-triage",
-            "--description",
-            "watch new issues",
-            "--repo",
-            repo_str,
-            "--interval",
-            "60",
-            "--mount-scope",
-            "gitroot",
-        ],
-    )
-    .await;
-    assert_eq!(code, 200, "squad add must succeed: {created}");
+    assert_eq!(status["features"]["squad"]["detail"]["task_count"], 0);
+    let(code,created)=curl_resource("POST",&format!("{base}/v1/squad/tasks"),Some(serde_json::json!({"name":"issue-triage","description":"watch new issues","workspace":{"kind":"custom","path":repo},"mount_scope":"gitroot","interval_ms":60000}))).await;
+    assert_eq!(code, 201, "{created}");
     assert_eq!(created["name"], "issue-triage");
-    assert_eq!(created["status"], "active");
-
-    // list
-    let (code, list) = curl_command(&base, "squad list", &[]).await;
+    assert_eq!(created["interval_ms"], 60000);
+    let id = created["id"].as_str().unwrap();
+    assert!(id.starts_with("task_"));
+    let task_url = format!("{base}/v1/squad/tasks/{id}");
+    let (code, list) = curl_get(format!("{base}/v1/squad/tasks")).await;
     assert_eq!(code, 200);
-    assert_eq!(list.as_array().unwrap().len(), 1);
-
-    // show — one response shape carrying the task *and* its run history,
-    // which is what both gateway implementations deserialize.
-    let (code, shown) = curl_command(&base, "squad show", &["issue-triage"]).await;
+    assert_eq!(list["items"].as_array().unwrap().len(), 1);
+    assert!(list.get("next_cursor").is_some());
+    let (code, task) = curl_get(task_url.clone()).await;
     assert_eq!(code, 200);
-    assert_eq!(shown["task"]["name"], "issue-triage");
-    assert_eq!(
-        shown["runs"].as_array().map(Vec::len),
-        Some(0),
-        "a never-evaluated task has an empty (not absent) run history: {shown}"
-    );
-
-    // pause
-    let (code, _) = curl_command(&base, "squad pause", &["issue-triage"]).await;
+    assert_eq!(task["name"], "issue-triage");
+    let (code, runs) = curl_get(format!("{task_url}/runs")).await;
     assert_eq!(code, 200);
-    let (_, shown) = curl_command(&base, "squad show", &["issue-triage"]).await;
-    assert_eq!(shown["task"]["status"], "paused");
-
-    // resume
-    let (code, _) = curl_command(&base, "squad resume", &["issue-triage"]).await;
-    assert_eq!(code, 200);
-    let (_, shown) = curl_command(&base, "squad show", &["issue-triage"]).await;
-    assert_eq!(shown["task"]["status"], "active");
-
-    // workflow — 404 until a running evaluation persists a workflow state path.
-    let (code, _) = curl_get(format!("{base}/v1/tasks/issue-triage/workflow")).await;
+    assert!(runs["items"].is_array());
+    for (paused, state) in [(true, "paused"), (false, "active")] {
+        let (code, task) = curl_resource(
+            "PATCH",
+            &task_url,
+            Some(serde_json::json!({"paused":paused})),
+        )
+        .await;
+        assert_eq!(code, 200, "{task}");
+        assert_eq!(task["status"], state);
+    }
+    let (code, body) = curl_get(format!(
+        "{base}/v1/squad/tasks/task_00000000000000000000000000000000/workflow"
+    ))
+    .await;
     assert_eq!(code, 404);
-
-    // an unknown task is a 404, not a 500 or an empty 200.
-    let (code, _) = curl_get(format!("{base}/v1/tasks/no-such-task/workflow")).await;
-    assert_eq!(code, 404);
-
-    // status reflects the one active task.
-    let (_, status) = curl_get(format!("{base}/v1/status")).await;
-    assert_eq!(status["task_count"], 1);
-    assert_eq!(status["active_count"], 1);
-
-    // remove
-    let (code, _) = curl_command(&base, "squad remove", &["issue-triage"]).await;
-    assert_eq!(code, 200);
-    let (_, list) = curl_command(&base, "squad list", &[]).await;
-    assert_eq!(list.as_array().unwrap().len(), 0);
-
+    assert_eq!(body["code"], "task_not_found");
+    let (code, _) = curl_resource("DELETE", &task_url, None).await;
+    assert_eq!(code, 204);
+    let (_, list) = curl_get(format!("{base}/v1/squad/tasks")).await;
+    assert!(list["items"].as_array().unwrap().is_empty());
     handle.abort();
 }
 
@@ -320,22 +288,26 @@ async fn a_pre_migration_install_starts_squad_gains_its_tables_and_keeps_api_row
     let legacy = SqliteSessionStore::open(&legacy_root).unwrap();
     legacy
         .insert_session(
-            "pre-upgrade-session",
+            "ses_11e2f5784f73bd56693657eb4763c31a",
             "/pre/upgrade/repo",
             "2026-08-01T00:00:00Z",
         )
         .unwrap();
     legacy
         .insert_command(
-            "pre-upgrade-command",
-            "pre-upgrade-session",
+            "cmd_0883cc1b67be96c13068ef76216dedff",
+            "ses_11e2f5784f73bd56693657eb4763c31a",
             "status",
             "[\"--json\"]",
             "/pre/upgrade/output.log",
         )
         .unwrap();
-    let expected_session = legacy.get_session("pre-upgrade-session").unwrap();
-    let expected_command = legacy.get_command("pre-upgrade-command").unwrap();
+    let expected_session = legacy
+        .get_session("ses_11e2f5784f73bd56693657eb4763c31a")
+        .unwrap();
+    let expected_command = legacy
+        .get_command("cmd_0883cc1b67be96c13068ef76216dedff")
+        .unwrap();
     drop(legacy);
     assert!(legacy_root.join("awman.db").exists());
 
@@ -361,41 +333,29 @@ async fn a_pre_migration_install_starts_squad_gains_its_tables_and_keeps_api_row
     // ── the prior API-mode rows are intact at the new location ──
     let migrated = SqliteSessionStore::open_at(&data_db).unwrap();
     assert_eq!(
-        migrated.get_session("pre-upgrade-session").unwrap(),
+        migrated
+            .get_session("ses_11e2f5784f73bd56693657eb4763c31a")
+            .unwrap(),
         expected_session,
         "an upgrade must not lose a pre-existing session row"
     );
     assert_eq!(
-        migrated.get_command("pre-upgrade-command").unwrap(),
+        migrated
+            .get_command("cmd_0883cc1b67be96c13068ef76216dedff")
+            .unwrap(),
         expected_command,
         "an upgrade must not lose a pre-existing command row"
     );
     drop(migrated);
 
     // ── and the same file now carries squad's tables, driven over HTTP ──
-    let (code, created) = curl_command(
-        &base,
-        "squad add",
-        &[
-            "--name",
-            "post-upgrade",
-            "--description",
-            "created after the upgrade",
-            "--repo",
-            repo.to_str().unwrap(),
-            "--interval",
-            "300",
-            "--mount-scope",
-            "gitroot",
-        ],
-    )
-    .await;
+    let (code,created)=curl_resource("POST",&format!("{base}/v1/squad/tasks"),Some(serde_json::json!({"name":"post-upgrade","description":"created after the upgrade","workspace":{"kind":"custom","path":repo},"mount_scope":"gitroot","interval_ms":300000}))).await;
     assert_eq!(
-        code, 200,
+        code, 201,
         "squad add must succeed on a migrated database: {created}"
     );
-    let (_, list) = curl_command(&base, "squad list", &[]).await;
-    assert_eq!(list.as_array().unwrap().len(), 1);
+    let (_, list) = curl_get(format!("{base}/v1/squad/tasks")).await;
+    assert_eq!(list["items"].as_array().unwrap().len(), 1);
 
     // The squad rows landed in the shared database, not a second file.
     let conn = rusqlite::Connection::open(&data_db).unwrap();
@@ -552,26 +512,8 @@ async fn docker_a_squad_task_env_overlay_value_reaches_its_container() {
     let (daemon, base) = start_daemon(tmp.path()).await;
 
     // ── 1. a task that declares the variable ────────────────────────────────
-    let (code, created) = curl_command(
-        &base,
-        "squad add",
-        &[
-            "--name",
-            "env-e2e",
-            "--description",
-            "declares an env() overlay",
-            "--repo",
-            repo.to_str().unwrap(),
-            "--interval",
-            "3600",
-            "--mount-scope",
-            "gitroot",
-            "--overlay",
-            &format!("env({E2E_ENV_NAME})"),
-        ],
-    )
-    .await;
-    assert_eq!(code, 200, "squad add must succeed: {created}");
+    let (code,created)=curl_resource("POST",&format!("{base}/v1/squad/tasks"),Some(serde_json::json!({"name":"env-e2e","description":"declares an env overlay","workspace":{"kind":"custom","path":repo},"mount_scope":"gitroot","interval_ms":3600000,"overlays":[format!("env({E2E_ENV_NAME})")]}))).await;
+    assert_eq!(code, 201, "squad add must succeed: {created}");
     assert_eq!(
         created["unmet_env"],
         serde_json::json!([E2E_ENV_NAME]),

@@ -5,10 +5,8 @@ use super::*;
 
 // ── WI-0096 parallel-group engine tests ──────────────────────────────────
 
-use crate::data::config::flags::FlagConfig;
-
 /// Open a session whose effective `max_concurrent_agents` is `max`
-/// (via a flag override, the highest-precedence source).
+/// (via a `--set` override, the highest-precedence source).
 pub(super) fn make_session_with_max_concurrent(
     tmp: &tempfile::TempDir,
     max: Option<usize>,
@@ -16,10 +14,16 @@ pub(super) fn make_session_with_max_concurrent(
     Session::for_tests_with_options(
         tmp.path(),
         SessionOpenOptions {
-            flags: FlagConfig {
-                max_concurrent_agents: max,
-                ..Default::default()
-            },
+            overrides: crate::data::config::ConfigOverrides::new(
+                max.map(|n| {
+                    (
+                        "workflows.maxConcurrentSteps".to_string(),
+                        serde_json::Value::from(n),
+                    )
+                })
+                .into_iter()
+                .collect(),
+            ),
             ..Default::default()
         },
     )
@@ -209,10 +213,7 @@ fn build_parallel_engine(
 async fn run_to_completion_full_parallel_group_max_concurrent_2() {
     let tmp = tempfile::tempdir().unwrap();
     let session = make_session_with_max_concurrent(&tmp, Some(2));
-    assert_eq!(
-        session.effective_config().effective_max_concurrent_agents(),
-        Some(2)
-    );
+    assert_eq!(session.effective_config().max_concurrent_steps(), Some(2));
     let workflow = make_workflow(
         Some("wf-full-parallel"),
         Some("claude"),

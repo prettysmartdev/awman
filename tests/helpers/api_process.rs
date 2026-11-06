@@ -181,6 +181,13 @@ impl ApiHome {
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o755)).unwrap();
         let home = Self { dir };
+        let config = home.home().join(".config/awman");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(
+            config.join("config.json"),
+            r#"{"daemon":{"verboseSetup":true}}"#,
+        )
+        .unwrap();
         home.set_agent(AgentMode::Edit);
         home
     }
@@ -275,8 +282,8 @@ exit 0
             .args([
                 "api",
                 "start",
-                "--port",
-                &port.to_string(),
+                "--set",
+                &format!("daemon.network.listen=127.0.0.1:{port}"),
                 "--dangerously-skip-auth",
                 "--dangerously-skip-tls",
             ])
@@ -348,15 +355,15 @@ impl ApiServer {
         let _ = self.child.wait();
     }
 
-    /// `POST /v1/sessions`; returns the HTTP status and the JSON body.
+    /// `POST /v1/worker/sessions`; returns the HTTP status and the JSON body.
     pub async fn post_session(&self, body: Value) -> (u16, Value) {
         let response = self
             .client
-            .post(format!("{}/v1/sessions", self.url))
+            .post(format!("{}/v1/worker/sessions", self.url))
             .json(&body)
             .send()
             .await
-            .expect("POST /v1/sessions");
+            .expect("POST /v1/worker/sessions");
         let status = response.status().as_u16();
         (status, response.json().await.unwrap_or(Value::Null))
     }
@@ -364,8 +371,8 @@ impl ApiServer {
     /// Create a session that must be accepted; returns its id.
     pub async fn create_session(&self, body: Value) -> String {
         let (status, response) = self.post_session(body).await;
-        assert_eq!(status, 202, "session not accepted: {response}");
-        response["session_id"].as_str().unwrap().to_string()
+        assert_eq!(status, 201, "session not accepted: {response}");
+        response["id"].as_str().unwrap().to_string()
     }
 
     pub async fn get(&self, path: &str) -> Value {
@@ -373,24 +380,24 @@ impl ApiServer {
             .get(format!("{}{path}", self.url))
             .send()
             .await
-            .unwrap_or_else(|e| panic!("GET {path}: {e}"))
+            .unwrap_or_else(|e| panic!("GET {path}: {e}\n{}", self.log()))
             .json()
             .await
             .unwrap_or_else(|e| panic!("GET {path} body: {e}"))
     }
 
-    /// `GET /v1/sessions/{id}`.
+    /// `GET /v1/worker/sessions/{id}`.
     pub async fn session(&self, id: &str) -> Value {
-        self.get(&format!("/v1/sessions/{id}")).await
+        self.get(&format!("/v1/worker/sessions/{id}")).await
     }
 
-    /// Poll `GET /v1/sessions/{id}/status` until setup is `ready` or `failed`.
+    /// Poll `GET /v1/worker/sessions/{id}` until setup is `ready` or `failed`.
     pub async fn wait_for_setup(&self, id: &str) -> Value {
         let deadline = Instant::now() + Duration::from_secs(120);
         loop {
-            let status = self.get(&format!("/v1/sessions/{id}/status")).await;
-            if matches!(status["status"].as_str(), Some("ready" | "failed")) {
-                return status;
+            let status = self.get(&format!("/v1/worker/sessions/{id}")).await;
+            if matches!(status["setup_status"].as_str(), Some("ready" | "failed")) {
+                return status["setup"].clone();
             }
             assert!(
                 Instant::now() < deadline,
@@ -413,20 +420,20 @@ impl ApiServer {
     pub async fn run_command(&self, session: &str, subcommand: &str, args: &[&str]) -> Value {
         let response = self
             .client
-            .post(format!("{}/v1/commands", self.url))
+            .post(format!("{}/v1/worker/commands", self.url))
             .header("x-awman-session", session)
             .json(&serde_json::json!({ "subcommand": subcommand, "args": args }))
             .send()
             .await
-            .expect("POST /v1/commands");
+            .expect("POST /v1/worker/commands");
         let status = response.status().as_u16();
         let body: Value = response.json().await.unwrap();
         assert!(status < 300, "command not queued ({status}): {body}");
-        let command_id = body["command_id"].as_str().unwrap().to_string();
+        let command_id = body["id"].as_str().unwrap().to_string();
 
         let deadline = Instant::now() + Duration::from_secs(120);
         loop {
-            let record = self.get(&format!("/v1/commands/{command_id}/status")).await;
+            let record = self.get(&format!("/v1/worker/commands/{command_id}")).await;
             if matches!(
                 record["status"].as_str(),
                 Some("done" | "error" | "aborted" | "cancelled")
@@ -485,7 +492,7 @@ pub async fn events_log(command: &Value) -> String {
     }
 }
 
-/// The clone a remote session works in, as `GET /v1/sessions/{id}` reports it.
+/// The clone a remote session works in, as `GET /v1/worker/sessions/{id}` reports it.
 pub fn clone_path(session: &Value) -> PathBuf {
     Path::new(session["workdir"].as_str().expect("session workdir")).to_path_buf()
 }
