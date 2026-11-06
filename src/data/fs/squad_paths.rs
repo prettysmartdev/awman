@@ -28,12 +28,17 @@ const BUILDS_SUBDIR: &str = "builds";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SquadPaths {
     root: PathBuf,
+    data_root: PathBuf,
 }
 
 impl SquadPaths {
     /// Build `SquadPaths` rooted at an explicit directory.
     pub fn from_root(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        let root = root.into();
+        Self {
+            data_root: root.clone(),
+            root,
+        }
     }
 
     /// Resolve from the current process environment.
@@ -45,9 +50,12 @@ impl SquadPaths {
     ///
     /// `<data home>/squad` (see [`crate::data::fs::data_paths`]).
     pub fn from_env(env: &EnvSnapshot) -> Result<Self, DataError> {
-        Ok(Self::from_root(
-            crate::data::fs::data_paths::data_home(env)?.join(SQUAD_SUBDIR),
-        ))
+        Ok(Self {
+            root: crate::data::fs::data_paths::data_home(env)?.join(SQUAD_SUBDIR),
+            data_root: crate::data::fs::data_paths::DataPaths::from_env(env)?
+                .root()
+                .to_path_buf(),
+        })
     }
 
     /// The squad root directory.
@@ -55,9 +63,9 @@ impl SquadPaths {
         &self.root
     }
 
-    /// Daemon-identity paths for the squad daemon (key stem `squad_key`).
+    /// The unified daemon owns the process identity for these paths.
     pub fn daemon(&self) -> DaemonPaths {
-        DaemonPaths::new(self.root.clone(), "squad_key")
+        crate::data::fs::data_paths::DataPaths::at_root(&self.data_root).daemon()
     }
 
     /// Directory holding per-task context directories.
@@ -371,12 +379,15 @@ mod tests {
     }
 
     #[test]
-    fn daemon_uses_squad_key_stem() {
+    fn explicit_root_keeps_the_daemon_identity_local_to_the_fixture() {
         let paths = SquadPaths::from_root("/r");
-        assert_eq!(paths.daemon().key_stem(), "squad_key");
+        assert_eq!(
+            paths.daemon().api_keys_file(),
+            paths.daemon().root().join("api_keys.json")
+        );
         assert_eq!(
             paths.daemon().key_hash_file(),
-            PathBuf::from("/r/squad_key.hash")
+            PathBuf::from("/r/daemon/api_key.hash")
         );
     }
 

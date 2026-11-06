@@ -34,4 +34,4 @@ tempfile = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 tokio = { workspace = true }
-windows-sys = { version = "0.61", features = ["Win32_Security_Authorization", "Win32_Foundation"] }
+windows-sys = { version = "0.61", features = ["Win32_Security", "Win32_Security_Authorization", "Win32_Foundation", "Win32_System_Pipes", "Win32_System_Threading"] }

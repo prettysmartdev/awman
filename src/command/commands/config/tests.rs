@@ -28,8 +28,8 @@ impl ConfigCommandFrontend for Quiet {
 struct NoDaemons;
 
 impl DaemonReloader for NoDaemons {
-    fn running(&self, _: &Session) -> Vec<RunningDaemon> {
-        Vec::new()
+    fn running(&self, _: &Session) -> Option<RunningDaemon> {
+        None
     }
     fn reload(&self, _: &RunningDaemon) -> Result<ReloadReply, String> {
         unreachable!("nothing is running")
@@ -40,15 +40,11 @@ impl DaemonReloader for NoDaemons {
 struct OneDaemon;
 
 impl DaemonReloader for OneDaemon {
-    fn running(&self, _: &Session) -> Vec<RunningDaemon> {
-        vec![RunningDaemon {
-            name: "api",
-            local_endpoint: None,
-            base_url: "https://127.0.0.1:9876".into(),
-            bearer: Some("k".into()),
-            pinned_cert_pem: None,
-            reachable: true,
-        }]
+    fn running(&self, _: &Session) -> Option<RunningDaemon> {
+        Some(RunningDaemon {
+            pid: 42,
+            local_endpoint: "/tmp/awman-test/api.sock".into(),
+        })
     }
     fn reload(&self, _: &RunningDaemon) -> Result<ReloadReply, String> {
         Ok(ReloadReply::default())
@@ -379,6 +375,65 @@ async fn set_reports_live_apply() {
         .unwrap(),
     );
     assert_eq!(o.live, LiveApply::RestartRequired);
+}
+
+/// A daemon that must never be asked: invalid values stop before any reload.
+struct PanickingDaemon;
+
+impl DaemonReloader for PanickingDaemon {
+    fn running(&self, _: &Session) -> Option<RunningDaemon> {
+        panic!("an invalid value must not reach the daemon")
+    }
+    fn reload(&self, _: &RunningDaemon) -> Result<ReloadReply, String> {
+        panic!("an invalid value must not reach the daemon")
+    }
+}
+
+#[tokio::test]
+async fn invalid_daemon_values_are_refused_and_nothing_is_persisted() {
+    let fx = Fixture::new();
+    std::fs::write(fx.global_file(), r#"{"daemon":{"maxConcurrentJobs":2}}"#).unwrap();
+    let before = std::fs::read_to_string(fx.global_file()).unwrap();
+    for (key, value) in [
+        ("daemon.maxConcurrentJobs", "lots"),
+        ("daemon.network.listen", "no-port"),
+        ("daemon.network.tlsSans", "not a host!"),
+        ("daemon.features.worker.enabled", "maybe"),
+        ("api.bind", "127.0.0.1:9876"),
+    ] {
+        let result = run_with(
+            fx.session(),
+            set(key, value, ConfigTarget::Auto),
+            Arc::new(PanickingDaemon),
+        )
+        .await;
+        assert!(result.is_err(), "{key}={value} must be refused");
+        assert_eq!(
+            std::fs::read_to_string(fx.global_file()).unwrap(),
+            before,
+            "{key}={value} must not be persisted"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_feature_switch_is_applied_live() {
+    let fx = Fixture::new();
+    let o = set_outcome(
+        run_with(
+            fx.session(),
+            set(
+                "daemon.features.worker.enabled",
+                "false",
+                ConfigTarget::Auto,
+            ),
+            Arc::new(OneDaemon),
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(o.live, LiveApply::Applied);
+    assert_eq!(o.live.message(), "applied to the running daemon");
 }
 
 // ── show ────────────────────────────────────────────────────────────────────

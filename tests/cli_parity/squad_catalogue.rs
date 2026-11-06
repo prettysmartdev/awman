@@ -70,14 +70,6 @@ fn squad_is_a_top_level_command_with_its_root_flags() {
 fn every_squad_subcommand_has_the_contract_shape() {
     let expected = [
         (
-            "start",
-            vec![],
-            vec!["background", "dangerously-skip-auth", "port", "refresh-key"],
-        ),
-        ("stop", vec![], vec![]),
-        ("status", vec![], vec!["json"]),
-        ("logs", vec![], vec!["follow"]),
-        (
             "add",
             vec![],
             vec![
@@ -168,12 +160,12 @@ fn every_squad_subcommand_has_the_contract_shape() {
 }
 
 #[test]
-fn squad_start_does_not_reintroduce_the_retired_interval_flag() {
-    assert!(cat()
-        .lookup(&["squad", "start"])
-        .unwrap()
-        .find_flag("interval")
-        .is_none());
+fn squad_has_no_lifecycle_verbs() {
+    for gone in ["start", "stop", "status", "logs"] {
+        assert!(cat().lookup(&["squad", gone]).is_none(), "squad {gone}");
+    }
+    let logs = cat().lookup(&["daemon", "logs"]).unwrap();
+    assert_eq!(logs.find_flag("follow").unwrap().short, Some('f'));
 }
 
 #[test]
@@ -188,9 +180,6 @@ fn squad_flag_types_and_short_forms_are_projection_safe() {
         FlagKind::Enum(_)
     ));
     assert_eq!(add.find_flag("headless").unwrap().short, Some('n'));
-
-    let logs = cat().lookup(&["squad", "logs"]).unwrap();
-    assert_eq!(logs.find_flag("follow").unwrap().short, Some('f'));
 
     let remove = cat().lookup(&["squad", "remove"]).unwrap();
     assert_eq!(remove.find_flag("yes").unwrap().short, Some('y'));
@@ -230,8 +219,8 @@ fn squad_add_interval_defaults_to_six_hours_but_accepts_an_explicit_five_minutes
 /// this shell's own coverage relative to a daemon, which is a local question,
 /// and admitting it through the `/v1/commands` front door would make the leaf
 /// remotely reachable. Its `GatewayNeed` is `Running`, exactly like `squad
-/// list`, so it starts a daemon when none is up rather than reporting "nothing
-/// required" against a daemon that does not exist.
+/// list`, so it refuses without a running daemon rather than reporting
+/// "nothing required" against a daemon that does not exist.
 #[test]
 fn squad_env_is_local_only_and_needs_a_running_daemon() {
     use awman::command::dispatch::catalogue::GatewayNeed;

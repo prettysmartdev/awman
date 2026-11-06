@@ -2,9 +2,7 @@
 use crate::command::commands::api_server::admission::ApiAdmission;
 use crate::command::commands::api_server::event_bus::EventBus;
 use crate::command::commands::api_server::session_setup::SessionSetupBus;
-use crate::command::commands::api_server::{
-    ApiSessionLifecycle, AuthMode, CommandCanceller, TokenRegistry,
-};
+use crate::command::commands::api_server::{ApiSessionLifecycle, CommandCanceller, TokenRegistry};
 use crate::data::api_lifecycle_store::CommandLifecycleStore;
 use crate::data::fs::api_db::SqliteSessionStore;
 use crate::data::fs::api_paths::ApiPaths;
@@ -26,7 +24,6 @@ pub struct WorkerApi {
     pub workdir_roots: Vec<PathBuf>,
     pub started_at: Instant,
     pub task_handles: tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
-    pub auth_mode: AuthMode,
     pub engines: crate::command::dispatch::Engines,
     pub sessions: Arc<SessionManager>,
     pub event_buses: Arc<tokio::sync::Mutex<HashMap<String, Arc<EventBus>>>>,
@@ -115,6 +112,7 @@ pub fn sessions_queue(
 }
 pub async fn sessions_create(
     api: &WorkerApi,
+    context: crate::data::daemon_state::CommandRequestContext,
     request: crate::command::commands::api_server::admission::SessionSubmission,
     command: Option<crate::command::commands::api_server::admission::CommandSubmission>,
     close_on_finish: bool,
@@ -124,11 +122,13 @@ pub async fn sessions_create(
     crate::command::commands::api_server::admission::AdmissionError,
 > {
     api.admission()
+        .with_request_context(context)
         .admit_session(request, command, close_on_finish, journal)
         .await
 }
 pub async fn runs_create(
     api: &WorkerApi,
+    context: crate::data::daemon_state::CommandRequestContext,
     session: crate::command::commands::api_server::admission::SessionSubmission,
     command: crate::command::commands::api_server::admission::CommandSubmission,
     close_on_finish: bool,
@@ -137,7 +137,15 @@ pub async fn runs_create(
     crate::command::commands::api_server::admission::AdmittedSession,
     crate::command::commands::api_server::admission::AdmissionError,
 > {
-    sessions_create(api, session, Some(command), close_on_finish, journal).await
+    sessions_create(
+        api,
+        context,
+        session,
+        Some(command),
+        close_on_finish,
+        journal,
+    )
+    .await
 }
 pub fn commands_list(
     api: &WorkerApi,
@@ -150,6 +158,7 @@ pub fn commands_get(api: &WorkerApi, id: &CommandId) -> Result<Option<CommandRec
 }
 pub async fn commands_create(
     api: &WorkerApi,
+    context: crate::data::daemon_state::CommandRequestContext,
     id: &WorkerSessionId,
     request: crate::command::commands::api_server::admission::CommandSubmission,
     journal: Option<&crate::command::commands::api_server::admission::IdempotentAdmission>,
@@ -158,6 +167,7 @@ pub async fn commands_create(
     crate::command::commands::api_server::admission::AdmissionError,
 > {
     api.admission()
+        .with_request_context(context)
         .admit_command(id.as_str(), request, journal)
         .await
 }

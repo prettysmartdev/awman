@@ -210,12 +210,6 @@ pub enum Dialog {
     /// process; `y` builds the tab (and with it the daemon), `n`/`Esc` opens
     /// no tab at all. Never raised when a daemon is already up.
     SquadStartConfirm,
-    /// The squad daemon requires a bearer key this process does not hold: a
-    /// hash exists on disk, `AWMAN_SQUAD_KEY` is unset here, and the plaintext
-    /// key is unrecoverable. `y` mints a new key and restarts the daemon onto
-    /// it; `n`/`Esc` opens no squad tab, because one that 401s on every poll
-    /// would show nothing but that.
-    SquadKeyMissing,
     Loading {
         title: String,
     },

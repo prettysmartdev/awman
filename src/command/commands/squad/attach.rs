@@ -17,7 +17,7 @@ use crate::command::commands::remote_client::{
     RemoteWorkflowPoller, SquadTaskWorkflowSource, WorkflowStateSource,
 };
 use crate::command::commands::squad::gateway::TaskGateway;
-use crate::command::commands::squad::supervisor::SquadGatewayResolver;
+use crate::command::commands::squad::supervisor::DaemonResolver;
 use crate::command::commands::Command;
 use crate::command::dispatch::catalogue::GatewayNeed;
 use crate::command::dispatch::BuildContext;
@@ -207,10 +207,10 @@ impl SquadAttachCommand {
     ) -> Result<SquadAttachOutcome, CommandError> {
         let gateway = match self.gateway {
             Some(gateway) => gateway,
-            None => SquadGatewayResolver::from_env(&Env::from_process())?
+            None => DaemonResolver::from_env(&Env::from_process())?
                 .gateway_for(GatewayNeed::Running)
                 .await?
-                .ok_or_else(|| CommandError::Other("squad daemon not reachable".into()))?,
+                .ok_or_else(|| CommandError::Other("the awman daemon is not reachable".into()))?,
         };
         let source: Arc<dyn WorkflowStateSource> = Arc::new(SquadTaskWorkflowSource::new(
             gateway.clone(),

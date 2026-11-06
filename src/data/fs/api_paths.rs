@@ -23,9 +23,6 @@ const API_SUBDIR: &str = "api";
 /// Subdirectory holding per-session command logs.
 const SESSIONS_SUBDIR: &str = "sessions";
 
-/// Subdirectory holding TLS materials.
-const TLS_SUBDIR: &str = "tls";
-
 /// Resolves every path under the API storage root.
 ///
 /// `root` owns everything under `~/.awman/api/` (pidfile, log, `sessions/`,
@@ -74,7 +71,7 @@ impl ApiPaths {
 
     /// Daemon-identity paths for the API daemon (key stem `api_key`).
     pub fn daemon(&self) -> DaemonPaths {
-        DaemonPaths::new(self.root.clone(), "api_key")
+        self.data_paths().daemon()
     }
 
     /// The shared data paths (locating the database).
@@ -127,7 +124,7 @@ impl ApiPaths {
 
     /// TLS material directory.
     pub fn tls_dir(&self) -> PathBuf {
-        self.root.join(TLS_SUBDIR)
+        self.daemon().tls_dir()
     }
 
     /// PEM-encoded TLS certificate.
@@ -226,7 +223,8 @@ impl ApiPaths {
 
     /// Create the root directory (and parents) on disk.
     pub fn ensure_root(&self) -> Result<(), DataError> {
-        std::fs::create_dir_all(&self.root).map_err(|e| DataError::io(&self.root, e))
+        std::fs::create_dir_all(&self.root).map_err(|e| DataError::io(&self.root, e))?;
+        self.daemon().ensure_root()
     }
 
     // ── Session / command storage surface (Layer 0) ──────────────────────────

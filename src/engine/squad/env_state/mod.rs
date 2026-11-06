@@ -194,6 +194,7 @@ struct StoredEntry {
 }
 
 struct Inner {
+    store_epoch: u64,
     salt: Salt,
     /// Shared, not owned exclusively: every keychain call is handed to a
     /// detached helper thread ([`call_with_cap`]), which needs a `'static`
@@ -234,13 +235,17 @@ struct Inner {
 /// lookups, and the keychain call each push makes is issued *outside* the lock
 /// so a slow backend cannot block a status request.
 pub struct DaemonEnvState {
-    inner: Mutex<Inner>,
+    inner: std::sync::Arc<Mutex<Inner>>,
+    /// Held by the actual backend call, including calls whose timeout elapsed.
+    writes: std::sync::Arc<Mutex<()>>,
 }
 
 impl DaemonEnvState {
     pub fn new(store: Box<dyn DaemonEnvStore>, persistence: EnvPersistence, salt: Salt) -> Self {
         Self {
-            inner: Mutex::new(Inner {
+            writes: Default::default(),
+            inner: std::sync::Arc::new(Mutex::new(Inner {
+                store_epoch: 0,
                 salt,
                 store: store.into(),
                 store_before_degrade: None,
@@ -250,7 +255,7 @@ impl DaemonEnvState {
                 warned: BTreeSet::new(),
                 store_warned: false,
                 degraded: false,
-            }),
+            })),
         }
     }
 
@@ -269,6 +274,28 @@ impl DaemonEnvState {
     /// `unavailable(<reason>)`.
     pub fn persistence(&self) -> EnvPersistence {
         self.lock().persistence.clone()
+    }
+    /// Serialize backend replacement with actual writes. Queued writes carry
+    /// an epoch and cannot write through an old backend after this returns.
+    /// The overlay and coverage metadata survive the transition.
+    pub fn replace_store(&self, store: Box<dyn DaemonEnvStore>, persistence: EnvPersistence) {
+        let _writes = self.writes.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = {
+            let mut inner = self.lock();
+            let previous = inner
+                .store_before_degrade
+                .take()
+                .unwrap_or_else(|| inner.store.clone());
+            inner.store_epoch += 1;
+            inner.store = store.into();
+            inner.persistence = persistence.clone();
+            inner.degraded = false;
+            inner.store_warned = false;
+            previous
+        };
+        if persistence == EnvPersistence::None && previous.backend_name() != "none" {
+            let _ = call_with_cap(KEYCHAIN_CALL_CAP, move || previous.clear());
+        }
     }
 
     /// This daemon's coverage salt.
@@ -663,26 +690,41 @@ impl DaemonEnvState {
     /// this daemon to [`NoStore`] for the rest of its lifetime (rule 3), with no
     /// retry, and squad keeps working exactly as it does with persistence off.
     fn persist(&self, overlay: &DaemonEnvMap) {
-        let store = {
+        let (store, epoch) = {
             let guard = self.lock();
             if guard.degraded || guard.store.backend_name() == "none" {
                 return;
             }
-            std::sync::Arc::clone(&guard.store)
+            (std::sync::Arc::clone(&guard.store), guard.store_epoch)
         };
         let vars = overlay.clone();
-        match call_with_cap(KEYCHAIN_CALL_CAP, move || store.store(&vars)) {
+        let writes = self.writes.clone();
+        let inner = self.inner.clone();
+        let result = call_with_cap(KEYCHAIN_CALL_CAP, move || {
+            let _writes = writes.lock().unwrap_or_else(|e| e.into_inner());
+            {
+                let current = inner.lock().unwrap_or_else(|e| e.into_inner());
+                if current.store_epoch != epoch || current.degraded {
+                    return Ok(());
+                }
+            }
+            store.store(&vars)
+        });
+        match result {
             Some(Ok(())) => {}
-            Some(Err(error)) => self.degrade("store", &error.to_string()),
-            None => self.degrade("store", "timed out"),
+            Some(Err(error)) => self.degrade_at_epoch(Some(epoch), "store", &error.to_string()),
+            None => self.degrade_at_epoch(Some(epoch), "store", "timed out"),
         }
     }
 
     /// Rule 3, in one place: warn once, debug after, then stop trying.
     fn degrade(&self, op: &str, reason: &str) {
+        self.degrade_at_epoch(None, op, reason);
+    }
+    fn degrade_at_epoch(&self, epoch: Option<u64>, op: &str, reason: &str) {
         let reason = sanitize_store_reason(reason);
         let mut guard = self.lock();
-        if guard.degraded {
+        if guard.degraded || epoch.is_some_and(|epoch| epoch != guard.store_epoch) {
             return;
         }
         guard.degraded = true;

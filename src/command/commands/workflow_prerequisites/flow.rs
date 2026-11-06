@@ -102,7 +102,7 @@ impl WorkflowPrerequisiteFlowOptions {
         Self {
             frontend_kind,
             headless: headless_for(frontend_kind),
-            origin: if frontend_kind == FrontendKind::Background {
+            origin: if frontend_kind == FrontendKind::SQUAD_LOCAL {
                 PrerequisiteOrigin::AssumedAll
             } else {
                 origin
@@ -110,7 +110,7 @@ impl WorkflowPrerequisiteFlowOptions {
             policy: {
                 let mut session = session.clone();
                 let mut config = session.flags().clone();
-                config.squad_prerequisites = frontend_kind == FrontendKind::Background;
+                config.squad_prerequisites = frontend_kind == FrontendKind::SQUAD_LOCAL;
                 session.set_flags(config);
                 policy_for(&session, flags, squad_task)
             },
@@ -128,8 +128,16 @@ impl WorkflowPrerequisiteFlowOptions {
 /// The headless profile a frontend kind answers from.
 pub fn headless_for(kind: FrontendKind) -> HeadlessDefaults {
     match kind {
-        FrontendKind::Api => HeadlessDefaults::api(),
-        FrontendKind::Background => HeadlessDefaults::squad(
+        FrontendKind::Daemon {
+            feature:
+                crate::data::daemon_state::FeatureName::Worker
+                | crate::data::daemon_state::FeatureName::Engine,
+            ..
+        } => HeadlessDefaults::api(),
+        FrontendKind::Daemon {
+            feature: crate::data::daemon_state::FeatureName::Squad,
+            ..
+        } => HeadlessDefaults::squad(
             crate::command::commands::mount_scope::MountScopeDecision::MountGitRoot,
         ),
         FrontendKind::Cli | FrontendKind::Tui => HeadlessDefaults::cli(),
@@ -613,7 +621,7 @@ impl WorkflowPrerequisiteFlow {
             UnresolvedMode::Warn
         } else {
             self.options.headless.prerequisite_unresolved(
-                if self.options.frontend_kind == FrontendKind::Background {
+                if self.options.frontend_kind == FrontendKind::SQUAD_LOCAL {
                     PrerequisiteOrigin::AssumedAll
                 } else {
                     needs.origin

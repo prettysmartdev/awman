@@ -236,8 +236,8 @@ mod tests {
     fn reference_contains_every_top_level_command() {
         let generated = CommandCatalogue::get().markdown_reference();
         for name in &[
-            "init", "ready", "chat", "specs", "agents", "config", "exec", "api", "squad", "remote",
-            "new", "clean",
+            "init", "ready", "chat", "specs", "agents", "config", "exec", "daemon", "squad",
+            "remote", "new", "clean",
         ] {
             assert!(
                 generated.contains(&format!("`awman {name}`")),

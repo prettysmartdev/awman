@@ -1173,9 +1173,6 @@ impl TaskGateway for LocalTaskGateway {
     }
 }
 
-/// Compatibility type import for in-process callers; the HTTP gateway envelope is gone.
-pub use super::client::RemoteSquadClient as RemoteTaskGateway;
-
 fn task_custom_auth_env_names(
     env: &crate::data::config::env::EnvSnapshot,
     paths: &SquadPaths,

@@ -136,7 +136,8 @@ mod tests {
             vec!["config", "show"],
             vec!["config", "get"],
             vec!["config", "set"],
-            vec!["api", "start"],
+            vec!["daemon", "start"],
+            vec!["daemon", "api"],
             vec!["remote", "exec", "workflow"],
             vec!["new", "spec"],
         ] {

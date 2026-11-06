@@ -157,8 +157,6 @@ pub const MAP_NAME: &str = "[a-z0-9][a-z0-9_-]{0,62}";
 pub const RESERVED_ENV: &[&str] = &[
     "AWMAN_HOME",
     "AWMAN_REMOTE_SESSION",
-    // Until 0140 replaces the squad bearer key with the owner-only socket.
-    "AWMAN_SQUAD_KEY",
     "AWMAN_TEST_ISOLATION",
     "AWMAN_TEST_DOCKER",
     "AWMAN_TEST_APPLE_CONTAINER",
@@ -341,9 +339,9 @@ pub const CONFIG_KEYS: &[ConfigKey] = &[
     row(
         "runtime.builtin.vcpus",
         int(Some(1), Some(255)),
-        "2",
+        "4",
         Repo,
-        false,
+        true,
         "Whole vCPUs per builtin agent VM.",
     ),
     row(
@@ -460,7 +458,7 @@ pub const CONFIG_KEYS: &[ConfigKey] = &[
         ValueKind::String,
         "\"aspec/work-items\"",
         Repo,
-        false,
+        true,
         "Work items directory, relative to the repo root.",
     ),
     row(
@@ -549,7 +547,7 @@ pub const CONFIG_KEYS: &[ConfigKey] = &[
         StringList,
         "[]",
         Task,
-        false,
+        true,
         "Host variables a GitHub token is read from (empty = GH_TOKEN, GITHUB_TOKEN).",
     ),
     row(
@@ -689,7 +687,7 @@ pub const CONFIG_KEYS: &[ConfigKey] = &[
     row(
         "daemon.maxConcurrentJobs",
         POSITIVE,
-        "2",
+        "4",
         Global,
         true,
         "Jobs the daemon runs at once.",
@@ -731,7 +729,7 @@ pub const CONFIG_KEYS: &[ConfigKey] = &[
         Bool,
         "false",
         Global,
-        false,
+        true,
         "Serve the API on the network listener (read from 0140).",
     ),
     row(
@@ -747,7 +745,7 @@ pub const CONFIG_KEYS: &[ConfigKey] = &[
         StringList,
         "[]",
         Global,
-        false,
+        true,
         "Extra names in the listener's TLS certificate (read from 0140).",
     ),
     row(
@@ -755,7 +753,7 @@ pub const CONFIG_KEYS: &[ConfigKey] = &[
         StringList,
         "[\"worker\"]",
         Global,
-        false,
+        true,
         "Features served on the network listener (read from 0140).",
     ),
     row(
@@ -795,7 +793,7 @@ pub const CONFIG_KEYS: &[ConfigKey] = &[
         ValueKind::Enum(&["keychain", "none"]),
         "\"keychain\"",
         Global,
-        false,
+        true,
         "Where the squad daemon persists pushed task environment.",
     ),
     row(
@@ -1061,6 +1059,24 @@ pub const MOVED_KEYS: &[(&str, &str, Option<&str>)] = &[
     ),
     ("terminal_scrollback_lines", "tui.scrollbackLines", None),
     ("workers", "daemon.maxConcurrentJobs", None),
+    ("api", "daemon.features.worker.push", None),
+    (
+        "api.bind",
+        "daemon.network.listen",
+        Some("\"0.0.0.0:9876\""),
+    ),
+    ("api.tls", "daemon.network.tlsSans", None),
+    ("api.tlsSans", "daemon.network.tlsSans", None),
+    (
+        "api.key",
+        "(removed) use `awman daemon api keys.create`",
+        None,
+    ),
+    (
+        "api.apiKey",
+        "(removed) use `awman daemon api keys.create`",
+        None,
+    ),
     (
         "api.workDirs",
         "daemon.features.worker.push.workDirs.allow",
@@ -1086,6 +1102,17 @@ pub const MOVED_KEYS: &[(&str, &str, Option<&str>)] = &[
         "daemon.features.squad.maxConcurrentEvaluations",
         None,
     ),
+    ("squad", "daemon.features.squad", None),
+    (
+        "squad.port",
+        "(removed) squad is served by the daemon's local listener",
+        None,
+    ),
+    (
+        "squad.bind",
+        "(removed) squad is served by the daemon's local listener",
+        None,
+    ),
     (
         "squad.envPersistence",
         "daemon.features.squad.envPersistence",
@@ -1109,6 +1136,12 @@ pub const MOVED_KEYS: &[(&str, &str, Option<&str>)] = &[
         None,
     ),
     ("remote.defaultAPIKey", "remote.targets.<name>.apiKey", None),
+    (
+        "worker.workRoot",
+        "daemon.features.worker.pull.workRoot",
+        None,
+    ),
+    ("worker.servers", "workServers", None),
     ("remote.savedDirs", "(removed)", None),
     (
         "auto_agent_auth_accepted",
@@ -1374,6 +1407,12 @@ pub fn resolve(path: &str) -> Result<ResolvedKey, KeyError> {
     Err(KeyError::unknown(path))
 }
 
+/// Whether a concrete config key is applied by a running daemon on reload.
+/// Unknown keys return `false` (callers can use [`resolve`] for diagnostics).
+pub fn is_live(path: &str) -> bool {
+    resolve(path).is_ok_and(|resolved| resolved.key.live)
+}
+
 /// Whether `pattern` (a row path, or a prefix of one) has children, i.e. is a
 /// section or map rather than a leaf.
 fn pattern_is_branch(pattern: &str) -> bool {
@@ -1537,7 +1576,7 @@ pub fn parse_input(key: &ConfigKey, raw: &str) -> Result<Value, KeyError> {
         ValueKind::Object => {
             return Err(KeyError::ObjectNotSettable {
                 path: key.path.to_string(),
-            })
+            });
         }
     };
     validate_value(key, &value)?;
@@ -1584,6 +1623,10 @@ pub fn validate_value(key: &ConfigKey, value: &Value) -> Result<(), KeyError> {
             if !value.is_string() {
                 return Err(invalid(format!("expected a string, got {shown}")));
             }
+            if key.path == "daemon.network.listen" {
+                super::network::ListenAddr::parse(value.as_str().unwrap())
+                    .map_err(|e| invalid(e.to_string()))?;
+            }
         }
         ValueKind::Enum(values) => {
             let s = value.as_str().unwrap_or_default();
@@ -1611,11 +1654,23 @@ pub fn validate_value(key: &ConfigKey, value: &Value) -> Result<(), KeyError> {
             s.parse::<super::units::Size>().map_err(invalid)?;
         }
         ValueKind::StringList => {
-            let ok = value
-                .as_array()
-                .is_some_and(|a| a.iter().all(Value::is_string));
+            let ok = value.as_array().is_some_and(|items| {
+                items.iter().all(|item| {
+                    let Some(s) = item.as_str() else { return false };
+                    match key.path {
+                        "daemon.network.tlsSans" => super::network::TlsSan::parse(s).is_ok(),
+                        "daemon.network.features" => ["squad", "worker", "engine"].contains(&s),
+                        _ => true,
+                    }
+                })
+            });
             if !ok {
-                return Err(invalid(format!("expected a list of strings, got {shown}")));
+                let expected = match key.path {
+                    "daemon.network.tlsSans" => "a list of DNS names or IP literals",
+                    "daemon.network.features" => "a list containing only squad, worker, or engine",
+                    _ => "a list of strings",
+                };
+                return Err(invalid(format!("expected {expected}, got {shown}")));
             }
         }
         ValueKind::IntList => {
@@ -2305,5 +2360,86 @@ mod dotted_member_tests {
             doc["runtime"]["builtin"]["registries"],
             serde_json::json!({})
         );
+    }
+}
+
+#[cfg(test)]
+mod daemon_config_tests {
+    use super::*;
+
+    fn daemon_key(path: &str) -> &'static ConfigKey {
+        CONFIG_KEYS.iter().find(|key| key.path == path).unwrap()
+    }
+
+    #[test]
+    fn daemon_key_live_flags_match_reload_contract() {
+        for key in CONFIG_KEYS
+            .iter()
+            .filter(|key| key.path.starts_with("daemon.features."))
+        {
+            assert!(key.live, "{} should be live", key.path);
+            assert_eq!(key.scope, KeyScope::Global, "{}", key.path);
+        }
+        for path in [
+            "daemon.maxConcurrentJobs",
+            "daemon.terminal.remoteInput",
+            "daemon.network.enabled",
+            "daemon.network.tlsSans",
+            "daemon.network.features",
+            "daemon.features.squad.enabled",
+            "daemon.features.worker.enabled",
+            "daemon.features.engine.enabled",
+        ] {
+            assert!(is_live(path), "{path} should be live");
+            assert_eq!(daemon_key(path).scope, KeyScope::Global, "{path}");
+        }
+        assert!(!is_live("daemon.network.listen"));
+        assert_eq!(daemon_key("daemon.network.listen").scope, KeyScope::Global);
+        assert_eq!(daemon_key("daemon.maxConcurrentJobs").default, "4");
+    }
+
+    #[test]
+    fn daemon_network_values_validate_and_invalid_sans_are_not_accepted() {
+        for listen in ["127.0.0.1:9876", "[::]:9876", "[2001:db8::1]:443"] {
+            assert!(validate_value(
+                daemon_key("daemon.network.listen"),
+                &Value::String(listen.into())
+            )
+            .is_ok());
+        }
+        for listen in ["127.0.0.1", "[::]"] {
+            assert!(validate_value(
+                daemon_key("daemon.network.listen"),
+                &Value::String(listen.into())
+            )
+            .is_err());
+        }
+        let valid = serde_json::json!({"daemon": {"network": {"tlsSans": ["api.example.org", "192.0.2.1", "2001:db8::1"]}}});
+        assert!(validate_document(&valid, FileKind::Global).is_ok());
+        let invalid = serde_json::json!({"daemon": {"network": {"tlsSans": ["bad_name.example"]}}});
+        let before = invalid.clone();
+        assert!(validate_document(&invalid, FileKind::Global).is_err());
+        assert_eq!(
+            invalid, before,
+            "failed validation must not alter persisted input"
+        );
+    }
+
+    #[test]
+    fn removed_api_squad_and_workers_keys_are_unknown_with_move_hints() {
+        for (path, expected_hint) in [
+            ("api.bind", "daemon.network.listen"),
+            ("api.oldOption", "daemon.features.worker.push"),
+            ("squad.oldOption", "daemon.features.squad"),
+            ("workers", "daemon.maxConcurrentJobs"),
+        ] {
+            let err = resolve(path).unwrap_err();
+            assert!(matches!(err, KeyError::Unknown { .. }), "{path}: {err}");
+            assert!(err.to_string().contains(expected_hint), "{path}: {err}");
+        }
+        let config = serde_json::json!({"api": {"bind": "0.0.0.0:9876"}});
+        let err = validate_document(&config, FileKind::Global).unwrap_err();
+        assert!(matches!(err, KeyError::Unknown { .. }), "{err}");
+        assert!(err.to_string().contains("daemon.network.listen"), "{err}");
     }
 }

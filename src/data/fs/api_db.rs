@@ -101,6 +101,8 @@ pub enum SessionCommandAdmission {
 /// Persistable command metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandRecord {
+    pub listener: String,
+    pub trace_parent: Option<String>,
     pub id: String,
     pub session_id: String,
     pub subcommand: String,
@@ -492,7 +494,7 @@ where
 ///
 /// Opening the store creates the database and runs migrations idempotently.
 pub struct SqliteSessionStore {
-    conn: Mutex<Connection>,
+    conn: std::sync::Arc<Mutex<Connection>>,
 }
 
 impl SqliteSessionStore {
@@ -517,8 +519,11 @@ impl SqliteSessionStore {
         conn.execute_batch("PRAGMA journal_mode=WAL;")?;
         Self::migrate(&conn)?;
         Ok(Self {
-            conn: Mutex::new(conn),
+            conn: std::sync::Arc::new(Mutex::new(conn)),
         })
+    }
+    pub(crate) fn shared_connection(&self) -> std::sync::Arc<Mutex<Connection>> {
+        self.conn.clone()
     }
 
     /// Convenience constructor that opens at the path resolved from `paths`.
@@ -579,6 +584,13 @@ impl SqliteSessionStore {
         // COLUMN, so pre-0136 commands read back as attempt 1. That is the
         // backfill; no separate UPDATE is needed.
         Self::add_column_if_missing(conn, "commands", "attempt", "INTEGER NOT NULL DEFAULT 1")?;
+        Self::add_column_if_missing(
+            conn,
+            "commands",
+            "listener",
+            "TEXT NOT NULL DEFAULT 'local'",
+        )?;
+        Self::add_column_if_missing(conn, "commands", "trace_parent", "TEXT")?;
         // WI 0138: old databases may contain the retired status. Convert rows
         // in place without touching queued_at or rowid, which define claim order.
         conn.execute(
@@ -924,7 +936,7 @@ impl SqliteSessionStore {
         filter: &CommandListFilter<'_>,
     ) -> Result<Vec<CommandRecord>, DataError> {
         let mut sql = String::from(
-            "SELECT c.id,c.session_id,c.subcommand,c.args,c.status,c.exit_code,c.started_at,c.finished_at,c.log_path,c.worker_id,c.queued_at,c.result,c.attempt FROM commands c WHERE 1=1",
+            "SELECT c.id,c.session_id,c.subcommand,c.args,c.status,c.exit_code,c.started_at,c.finished_at,c.log_path,c.worker_id,c.queued_at,c.result,c.attempt,c.listener,c.trace_parent FROM commands c WHERE 1=1",
         );
         let mut args: Vec<Value> = Vec::new();
         if let Some(session) = filter.session_id {
@@ -1054,7 +1066,7 @@ impl SqliteSessionStore {
         let conn = self.lock();
         let mut stmt = conn.prepare(
             "SELECT id, session_id, subcommand, args, status, exit_code, \
-                    started_at, finished_at, log_path, worker_id, queued_at, result, attempt
+                    started_at, finished_at, log_path, worker_id, queued_at, result, attempt, listener, trace_parent
              FROM commands WHERE id = ?1",
         )?;
         let mut rows = stmt.query_map(params![id], command_record_from_row)?;
@@ -1377,9 +1389,9 @@ impl SqliteSessionStore {
         let now = chrono::Utc::now().to_rfc3339();
         let conn = self.lock();
         conn.execute(
-            "INSERT INTO commands (id, session_id, subcommand, args, status, log_path, queued_at)
-             VALUES (?1, ?2, ?3, ?4, 'queued', ?5, ?6)",
-            params![id, session_id, subcommand, args, log_path, now],
+            "INSERT INTO commands (id, session_id, subcommand, args, status, log_path, queued_at, listener, trace_parent)
+             VALUES (?1, ?2, ?3, ?4, 'queued', ?5, ?6, ?7, ?8)",
+            params![id, session_id, subcommand, args, log_path, now,"local",Option::<String>::None],
         )?;
         Ok(())
     }
@@ -1396,6 +1408,27 @@ impl SqliteSessionStore {
         log_path: &str,
         labels: &Labels,
     ) -> Result<(), DataError> {
+        self.enqueue_command_with_context(
+            id,
+            session_id,
+            subcommand,
+            args,
+            log_path,
+            labels,
+            &Default::default(),
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn enqueue_command_with_context(
+        &self,
+        id: &str,
+        session_id: &str,
+        subcommand: &str,
+        args: &str,
+        log_path: &str,
+        labels: &Labels,
+        context: &crate::data::daemon_state::CommandRequestContext,
+    ) -> Result<(), DataError> {
         let now = chrono::Utc::now().to_rfc3339();
         let mut conn = self.lock();
         let tx = conn.transaction()?;
@@ -1410,9 +1443,9 @@ impl SqliteSessionStore {
             )?;
         }
         tx.execute(
-            "INSERT INTO commands (id, session_id, subcommand, args, status, log_path, queued_at)
-             VALUES (?1, ?2, ?3, ?4, 'queued', ?5, ?6)",
-            params![id, session_id, subcommand, args, log_path, now],
+            "INSERT INTO commands (id, session_id, subcommand, args, status, log_path, queued_at, listener, trace_parent)
+             VALUES (?1, ?2, ?3, ?4, 'queued', ?5, ?6, ?7, ?8)",
+            params![id, session_id, subcommand, args, log_path, now,context.listener.as_str(),context.trace_parent],
         )?;
         tx.commit()?;
         Ok(())
@@ -1439,7 +1472,7 @@ impl SqliteSessionStore {
                  LIMIT 1
              )
              RETURNING id, session_id, subcommand, args, status, exit_code,
-                       started_at, finished_at, log_path, worker_id, queued_at, result, attempt",
+                       started_at, finished_at, log_path, worker_id, queued_at, result, attempt, listener, trace_parent",
         )?;
         let mut rows = stmt.query_map(params![worker_id, now], command_record_from_row)?;
         match rows.next() {
@@ -1497,7 +1530,7 @@ impl SqliteSessionStore {
         let conn = self.lock();
         let mut stmt = conn.prepare(
             "SELECT id, session_id, subcommand, args, status, exit_code,
-                    started_at, finished_at, log_path, worker_id, queued_at, result, attempt
+                    started_at, finished_at, log_path, worker_id, queued_at, result, attempt, listener, trace_parent
              FROM commands
              WHERE session_id = ?1
              ORDER BY queued_at DESC, rowid DESC
@@ -1540,7 +1573,7 @@ impl SqliteSessionStore {
         let conn = self.lock();
         let mut stmt = conn.prepare(
             "SELECT id, session_id, subcommand, args, status, exit_code,
-                    started_at, finished_at, log_path, worker_id, queued_at, result, attempt
+                    started_at, finished_at, log_path, worker_id, queued_at, result, attempt, listener, trace_parent
              FROM commands
              WHERE session_id = ?1 AND status = 'running'
              LIMIT 1",
@@ -1682,6 +1715,8 @@ fn session_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionR
 
 fn command_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CommandRecord> {
     Ok(CommandRecord {
+        listener: row.get(13)?,
+        trace_parent: row.get(14)?,
         id: row.get(0)?,
         session_id: row.get(1)?,
         subcommand: row.get(2)?,
@@ -3036,5 +3071,41 @@ mod tests {
         assert!(json.get("pushed").is_none() && json.get("setup_error").is_none());
         let back: CommandResult = serde_json::from_value(json).unwrap();
         assert_eq!(back, full);
+    }
+    #[test]
+    fn command_request_context_survives_claim_and_reopen() {
+        use crate::data::daemon_state::{CommandListener, CommandRequestContext};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("awman.db");
+        let store = SqliteSessionStore::open_at(&path).unwrap();
+        let session = "ses_11111111111141118111111111111111";
+        let command = "cmd_11111111111141118111111111111111";
+        store.insert_session(session, "/tmp", "now").unwrap();
+        let context = CommandRequestContext {
+            listener: CommandListener::Network,
+            trace_parent: Some("00-11111111111111111111111111111111-2222222222222222-01".into()),
+        };
+        store
+            .enqueue_command_with_context(
+                command,
+                session,
+                "exec prompt",
+                "[]",
+                "log",
+                &Labels::default(),
+                &context,
+            )
+            .unwrap();
+        let row = store.claim_next_command("worker").unwrap().unwrap();
+        assert_eq!(row.listener, "network");
+        assert_eq!(row.trace_parent, context.trace_parent);
+        drop(store);
+        let row = SqliteSessionStore::open_at(&path)
+            .unwrap()
+            .get_command(command)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.listener, "network");
+        assert_eq!(row.trace_parent, context.trace_parent);
     }
 }

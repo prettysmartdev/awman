@@ -17,7 +17,6 @@ pub(crate) mod render;
 pub(crate) mod squad;
 pub(crate) mod squad_attach;
 
-mod api_server;
 mod chat;
 mod clean;
 mod daemon;

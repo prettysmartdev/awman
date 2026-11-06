@@ -1,27 +1,31 @@
-//! Direct typed client for squad resources. Names are resolved via the task list query.
+//! `DaemonSquadClient`: squad task commands as `/v1/squad/*` resource requests
+//! over the daemon's owner-only local listener. Task names are resolved
+//! through the task list's `name` filter.
 use super::gateway::{
     CreateTask, DaemonStatus, EnvCoverage, EnvPush, EnvPushResponse, TaskGateway, UpdateTask,
 };
+use crate::command::commands::daemon::actions::Request;
+use crate::command::commands::daemon::client::DaemonClient;
 use crate::command::daemon_api::squad::TaskResponse;
 use crate::command::error::CommandError;
 use crate::data::fs::task_store::{Run, Task, TaskStatus};
 use crate::data::ids::RunId;
 use crate::data::wire::List;
 use crate::data::workflow_state::WorkflowState;
-use crate::engine::{error::EngineError, remote::HttpCore};
 use async_trait::async_trait;
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 
-pub struct RemoteSquadClient {
-    core: HttpCore,
+pub struct DaemonSquadClient {
+    daemon: DaemonClient,
 }
-impl RemoteSquadClient {
-    pub fn new(core: HttpCore) -> Self {
-        Self { core }
+
+impl DaemonSquadClient {
+    pub fn new(daemon: DaemonClient) -> Self {
+        Self { daemon }
     }
-    pub fn core(&self) -> &HttpCore {
-        &self.core
+    pub fn daemon(&self) -> &DaemonClient {
+        &self.daemon
     }
     async fn request<T: DeserializeOwned>(
         &self,
@@ -30,36 +34,13 @@ impl RemoteSquadClient {
         query: &[(&str, String)],
         body: Option<Value>,
     ) -> Result<T, CommandError> {
-        let mut url = reqwest::Url::parse(&self.core.url(path))
-            .map_err(|e| CommandError::RemoteTransport(e.to_string()))?;
-        url.query_pairs_mut()
-            .extend_pairs(query.iter().map(|(k, v)| (*k, v.as_str())));
-        let mut request = self.core.http().request(method, url);
-        if let Some(body) = body {
-            request = request.json(&body);
+        let mut request = Request::new(method.as_str(), format!("/v1/{}", path.join("/")), body);
+        for (key, value) in query {
+            request = request.with_query(key, value.clone());
         }
-        let response = request.send().await.map_err(HttpCore::map_reqwest_error)?;
-        let status = response.status().as_u16();
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(HttpCore::map_reqwest_error)?;
-        let value = if bytes.is_empty() {
-            Value::Null
-        } else {
-            serde_json::from_slice(&bytes).map_err(|e| {
-                CommandError::RemoteTransport(format!("invalid squad response: {e}"))
-            })?
-        };
-        if status >= 400 {
-            return Err(EngineError::RemoteHttpStatus {
-                status,
-                body: value.to_string(),
-            }
-            .into());
-        }
+        let value = self.daemon.call(&request).await?;
         serde_json::from_value(value)
-            .map_err(|e| CommandError::RemoteTransport(format!("invalid squad response: {e}")))
+            .map_err(|e| CommandError::Other(format!("invalid squad response: {e}")))
     }
     async fn all<T: DeserializeOwned>(
         &self,
@@ -92,7 +73,7 @@ impl RemoteSquadClient {
     }
 }
 #[async_trait]
-impl TaskGateway for RemoteSquadClient {
+impl TaskGateway for DaemonSquadClient {
     async fn create(&self, req: CreateTask) -> Result<Task, CommandError> {
         let task: TaskResponse = self
             .request(
@@ -207,14 +188,24 @@ impl TaskGateway for RemoteSquadClient {
         let status: crate::command::daemon_api::core::StatusResponse = self
             .request(reqwest::Method::GET, &["status"], &[], None)
             .await?;
-        let detail = status
+        let record = status
             .features
             .get("squad")
-            .and_then(|f| f.detail.clone())
-            .ok_or_else(|| {
-                CommandError::RemoteTransport("squad detail missing in status".into())
-            })?;
-        serde_json::from_value(detail).map_err(|e| CommandError::RemoteTransport(e.to_string()))
+            .ok_or_else(|| CommandError::Other("squad detail missing in daemon status".into()))?;
+        let detail = record.detail.clone().unwrap_or_default();
+        Ok(DaemonStatus {
+            running: record.state != crate::data::daemon_state::FeatureState::Off,
+            pid: Some(status.pid),
+            bound_addr: None,
+            task_count: detail["task_count"].as_u64().unwrap_or(0) as usize,
+            active_count: detail["active_count"].as_u64().unwrap_or(0) as usize,
+            last_tick: serde_json::from_value(detail["scheduler_last_tick_at"].clone())
+                .unwrap_or(None),
+            in_flight: record.running,
+            config_error: detail["config_error"].as_str().map(str::to_string),
+            env_persistence: serde_json::from_value(detail["env_persistence"].clone()).ok(),
+            unmet_env: serde_json::from_value(detail["unmet_env"].clone()).unwrap_or_default(),
+        })
     }
     async fn env_coverage(&self) -> Result<EnvCoverage, CommandError> {
         self.request(reqwest::Method::GET, &["squad", "env"], &[], None)
@@ -247,7 +238,7 @@ impl TaskGateway for RemoteSquadClient {
             .await;
         match response {
             Ok(v) => Ok(Some(v)),
-            Err(CommandError::RemoteHttpStatus { status: 404, .. }) => Ok(None),
+            Err(CommandError::DaemonHttpStatus { status: 404, .. }) => Ok(None),
             Err(e) => Err(e),
         }
     }

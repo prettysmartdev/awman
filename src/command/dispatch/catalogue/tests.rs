@@ -173,7 +173,8 @@ fn plan_and_yolo_are_mutually_exclusive_on_chat() {
 fn every_top_level_command_is_present() {
     let cat = CommandCatalogue::get();
     for name in [
-        "init", "ready", "chat", "specs", "agents", "config", "exec", "api", "remote", "new",
+        "init", "ready", "chat", "specs", "agents", "config", "exec", "daemon", "squad", "remote",
+        "new",
     ] {
         assert!(cat.lookup(&[name]).is_some(), "missing top-level '{name}'");
     }
@@ -437,26 +438,44 @@ const FLAG_TABLE: &[FlagCheck] = &[
         is_optional: true,
     },
     FlagCheck {
-        path: &["api", "start"],
+        path: &["daemon", "start"],
         flag: "background",
         is_bool: true,
         is_optional: true,
     },
     FlagCheck {
-        path: &["api", "start"],
-        flag: "refresh-key",
+        path: &["daemon", "stop"],
+        flag: "now",
         is_bool: true,
         is_optional: true,
     },
     FlagCheck {
-        path: &["api", "start"],
-        flag: "dangerously-skip-auth",
+        path: &["daemon", "status"],
+        flag: "json",
         is_bool: true,
         is_optional: true,
     },
     FlagCheck {
-        path: &["api", "start"],
-        flag: "dangerously-skip-tls",
+        path: &["daemon", "logs"],
+        flag: "follow",
+        is_bool: true,
+        is_optional: true,
+    },
+    FlagCheck {
+        path: &["daemon", "api"],
+        flag: "raw",
+        is_bool: false,
+        is_optional: true,
+    },
+    FlagCheck {
+        path: &["daemon", "api"],
+        flag: "data",
+        is_bool: false,
+        is_optional: true,
+    },
+    FlagCheck {
+        path: &["daemon", "api"],
+        flag: "list",
         is_bool: true,
         is_optional: true,
     },
@@ -552,10 +571,11 @@ fn all_expected_subcommands_are_present() {
         (&["config"], "unset"),
         (&["exec"], "prompt"),
         (&["exec"], "workflow"),
-        (&["api"], "start"),
-        (&["api"], "kill"),
-        (&["api"], "logs"),
-        (&["api"], "status"),
+        (&["daemon"], "start"),
+        (&["daemon"], "stop"),
+        (&["daemon"], "status"),
+        (&["daemon"], "logs"),
+        (&["daemon"], "api"),
         (&["remote"], "exec"),
         (&["remote"], "session"),
         (&["remote", "exec"], "workflow"),
@@ -649,6 +669,10 @@ fn config_and_transport_clients_can_run_without_a_local_runtime() {
             "config unset",
             "daemon",
             "daemon api",
+            "daemon logs",
+            "daemon start",
+            "daemon status",
+            "daemon stop",
             // Writes a definition file and never builds.
             "new agent",
             "remote",
@@ -703,17 +727,57 @@ fn flag_spec_conflicts_with_accessor_is_symmetric_on_chat() {
     );
 }
 
+/// WI 0140: `awman daemon` has exactly five verbs; the `api` group and the
+/// squad lifecycle verbs are gone.
 #[test]
-fn api_start_flags_are_cli_only() {
+fn daemon_has_exactly_five_verbs_and_the_old_lifecycles_are_gone() {
     let cat = CommandCatalogue::get();
-    let start = cat.lookup(&["api", "start"]).unwrap();
-    for flag in start.flags {
+    let daemon = cat.lookup(&["daemon"]).unwrap();
+    let verbs: Vec<_> = daemon.subcommands.iter().map(|spec| spec.name).collect();
+    assert_eq!(verbs, ["start", "stop", "status", "logs", "api"]);
+    for verb in &verbs {
+        let spec = cat.lookup(&["daemon", verb]).unwrap();
+        assert!(!spec.api_allowed, "daemon {verb} is local-only");
+        assert_eq!(spec.gateway_need, GatewayNeed::None, "daemon {verb}");
         assert!(
-            matches!(flag.frontends, FrontendVisibility::CliOnly),
-            "api start flag '{}' must be CliOnly, got {:?}",
-            flag.long,
-            flag.frontends
+            !spec.requires_runtime,
+            "daemon {verb} needs no container runtime"
         );
+    }
+    assert!(cat.lookup(&["api"]).is_none(), "the api group is deleted");
+    for gone in ["start", "stop", "status", "logs"] {
+        assert!(
+            cat.lookup(&["squad", gone]).is_none(),
+            "squad {gone} moved to awman daemon"
+        );
+    }
+    let clap = cat.build_clap_command();
+    for argv in [
+        &["awman", "api", "start"][..],
+        &["awman", "squad", "start"],
+        &["awman", "daemon", "set"],
+        &["awman", "config", "prerequisite-grants", "list"],
+    ] {
+        assert!(
+            clap.clone().try_get_matches_from(argv).is_err(),
+            "{argv:?} must not parse"
+        );
+    }
+    for argv in [
+        &["awman", "daemon", "start", "--background"][..],
+        &["awman", "daemon", "stop", "--now"],
+        &["awman", "daemon", "status", "--json"],
+        &["awman", "daemon", "logs", "-f"],
+        &["awman", "daemon", "api", "--list"],
+        &["awman", "daemon", "api", "keys.create", "name=ci"],
+        &["awman", "daemon", "api", "--raw", "GET", "/v1/status"],
+        &[
+            "awman", "daemon", "api", "--raw", "POST", "/v1/keys", "--data", "-",
+        ],
+    ] {
+        clap.clone()
+            .try_get_matches_from(argv)
+            .unwrap_or_else(|e| panic!("{argv:?}: {e}"));
     }
 }
 
@@ -783,8 +847,7 @@ fn removed_flag_hint_none_for_live_flags() {
     assert!(cat.removed_flag_hint(Vec::<String>::new()).is_none());
 }
 
-/// Every squad subcommand that talks to the daemon declares the need, and
-/// the three lifecycle commands declare none.
+/// Every squad subcommand talks to the daemon, so every one declares the need.
 ///
 /// This is the guard on the root cause of F-04: two frontends each carried
 /// a hand-written list of these names, and the lists had already drifted
@@ -794,7 +857,7 @@ fn removed_flag_hint_none_for_live_flags() {
 /// running gateway through Dispatch (WI 0113 Step 10).
 #[test]
 fn every_squad_subcommand_declares_whether_it_needs_a_gateway() {
-    const NO_GATEWAY: &[&str] = &["start", "stop", "logs"];
+    const NO_GATEWAY: &[&str] = &[];
     let squad = CommandCatalogue::get()
         .lookup(&["squad"])
         .expect("squad must exist");
@@ -821,16 +884,11 @@ fn every_squad_subcommand_declares_whether_it_needs_a_gateway() {
     }
 }
 
-/// `squad status` reports on a daemon rather than requiring one, so it must
-/// never start one: with nothing running it still succeeds with a "not
-/// running" summary.
+/// Bare `squad --headless` reports on the daemon rather than requiring one:
+/// with nothing running it still succeeds with a "not running" summary.
 #[test]
-fn squad_status_asks_for_a_gateway_only_if_one_is_already_running() {
+fn bare_squad_asks_for_a_gateway_only_if_one_is_already_running() {
     let catalogue = CommandCatalogue::get();
-    let status = catalogue
-        .lookup(&["squad", "status"])
-        .expect("squad status must exist");
-    assert_eq!(status.gateway_need, GatewayNeed::IfRunning);
     let bare = catalogue.lookup(&["squad"]).expect("squad must exist");
     assert_eq!(bare.gateway_need, GatewayNeed::IfRunning);
 }
@@ -991,7 +1049,7 @@ fn existing_worktree_policy_flag_is_api_allowed_and_has_all_choices() {
     assert!(
         matches!(flag.kind, FlagKind::Enum(values) if values == ["ask", "resume", "recreate", "fail"])
     );
-    assert!(cat.is_allowed_for_frontend(FrontendKind::Api, &["exec", "workflow"]));
+    assert!(cat.is_allowed_for_frontend(FrontendKind::WORKER_LOCAL, &["exec", "workflow"]));
 }
 
 #[test]
@@ -1164,7 +1222,7 @@ fn session_worktree_selectors_are_refused_for_every_remote_profile() {
                     .unwrap_or_else(|e| panic!("{path:?} {selector} on {local:?}: {e}"));
                 assert_eq!(parsed.flag_string(&selector[2..]).as_deref(), Some("value"));
             }
-            for remote in [FrontendKind::Api, FrontendKind::Background] {
+            for remote in [FrontendKind::WORKER_LOCAL, FrontendKind::SQUAD_LOCAL] {
                 let error = cat
                     .parse_raw_args_with_profile(path, &args, remote)
                     .expect_err(&format!(
@@ -1182,12 +1240,12 @@ fn worker_style_exec_prompt_request_with_selectors_is_refused() {
     let cat = CommandCatalogue::get();
     let request = argv(&["--pr", "42", "review", "this"]);
     assert!(cat
-        .parse_raw_args_with_profile(&["exec", "prompt"], &request, FrontendKind::Api)
+        .parse_raw_args_with_profile(&["exec", "prompt"], &request, FrontendKind::WORKER_LOCAL)
         .is_err());
     // The same prompt without the selector parses, so the refusal is the flag.
     let plain = argv(&["review", "this"]);
     let parsed = cat
-        .parse_raw_args_with_profile(&["exec", "prompt"], &plain, FrontendKind::Api)
+        .parse_raw_args_with_profile(&["exec", "prompt"], &plain, FrontendKind::WORKER_LOCAL)
         .unwrap();
     assert_eq!(parsed.argument("prompt").as_deref(), Some("review this"));
     assert_eq!(parsed.flag_string("pr"), None);
@@ -1347,9 +1405,10 @@ fn removed_per_setting_flags_are_unknown_flags() {
         (&["exec", "prompt"], "non-interactive"),
         (&["exec", "workflow"], "non-interactive"),
         (&["ready"], "non-interactive"),
-        (&["api", "start"], "port"),
-        (&["api", "start"], "workdirs"),
-        (&["api", "start"], "workdir-root"),
+        (&["daemon", "start"], "port"),
+        (&["daemon", "start"], "workdirs"),
+        (&["daemon", "start"], "refresh-key"),
+        (&["daemon", "start"], "dangerously-skip-auth"),
     ];
     for (path, flag) in cases {
         let spec = cat.lookup(path).unwrap();

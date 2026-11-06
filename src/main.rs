@@ -22,7 +22,10 @@ use awman::frontend::tui;
 
 fn main() -> Result<ExitCode> {
     #[cfg(windows)]
-    awman::engine::remote::local::install_owner_pipe(awman_host_shims::owner_pipe);
+    awman::engine::remote::local::install_owner_pipe(
+        awman_host_shims::owner_pipe,
+        awman_host_shims::verify_client,
+    );
     if awman_host_shims::dispatch_worker(std::env::vars_os(), std::env::args_os()) {
         return Ok(ExitCode::SUCCESS);
     }
@@ -167,7 +170,7 @@ impl LaunchMode {
 ///
 /// Without this, every `tracing::info!`/`warn!`/`error!` call in the
 /// codebase (notably the API-server startup messages in `frontend::api`)
-/// is silently dropped, which made `awman api start` look like it was
+/// is silently dropped, which made `awman daemon start` look like it was
 /// hanging until Ctrl-C. We write to stderr (so stdout stays clean for
 /// `--json` callers), default to `info`-level for awman code, and honor
 /// `RUST_LOG` for overrides. ANSI colors are auto-enabled by the `fmt`
@@ -250,7 +253,7 @@ mod tests {
             vec!["awman", "chat"],
             vec!["awman", "init"],
             vec!["awman", "exec", "workflow", "wf.toml"],
-            vec!["awman", "api", "start"],
+            vec!["awman", "daemon", "start"],
             vec!["awman", "remote", "session", "start"],
         ] {
             let m = cmd
@@ -402,6 +405,11 @@ mod set_flag_tests {
             ],
             &["awman", "config", "migrate"],
             &["awman", "config", "prerequisite-grants", "list"],
+            &["awman", "api", "start"],
+            &["awman", "squad", "start"],
+            &["awman", "squad", "status"],
+            &["awman", "squad", "logs"],
+            &["awman", "squad", "stop"],
         ] {
             let err = CommandCatalogue::get()
                 .build_clap_command()

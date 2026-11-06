@@ -6,7 +6,9 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::data::config::network::{ListenAddr, TlsSan};
 use crate::data::config::units::DurationStr;
+use crate::data::daemon_state::FeatureName;
 use crate::data::fs::daemon_env::EnvPersistenceSetting;
 
 /// How a job interacts with its user: an attachable terminal session, or
@@ -66,9 +68,9 @@ section!(DaemonTerminalConfig {
 
 section!(DaemonNetworkConfig {
     enabled: bool,
-    listen: String,
-    tls_sans: Vec<String>,
-    features: Vec<String>,
+    listen: ListenAddr,
+    tls_sans: Vec<TlsSan>,
+    features: Vec<FeatureName>,
 });
 
 section!(FeaturesConfig {
@@ -137,9 +139,9 @@ pub struct TerminalSettings {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetworkSettings {
     pub enabled: bool,
-    pub listen: String,
-    pub tls_sans: Vec<String>,
-    pub features: Vec<String>,
+    pub listen: ListenAddr,
+    pub tls_sans: Vec<TlsSan>,
+    pub features: Vec<FeatureName>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -188,7 +190,7 @@ impl DaemonSettings {
         let pull = worker.pull.clone().unwrap_or_default();
         let engine = features.engine.unwrap_or_default();
         Self {
-            max_concurrent_jobs: config.max_concurrent_jobs.unwrap_or(2),
+            max_concurrent_jobs: config.max_concurrent_jobs.unwrap_or(4),
             verbose_setup: config.verbose_setup.unwrap_or(false),
             terminal: TerminalSettings {
                 cols: terminal.cols.unwrap_or(120),
@@ -197,9 +199,13 @@ impl DaemonSettings {
             },
             network: NetworkSettings {
                 enabled: network.enabled.unwrap_or(false),
-                listen: network.listen.unwrap_or_else(|| "127.0.0.1:9876".into()),
+                listen: network.listen.unwrap_or_else(|| {
+                    ListenAddr::parse("127.0.0.1:9876").expect("default listen address is valid")
+                }),
                 tls_sans: network.tls_sans.unwrap_or_default(),
-                features: network.features.unwrap_or_else(|| vec!["worker".into()]),
+                features: network
+                    .features
+                    .unwrap_or_else(|| vec![FeatureName::Worker]),
             },
             squad: SquadSettings {
                 enabled: squad.enabled.unwrap_or(false),

@@ -22,7 +22,7 @@ use awman::engine::auth::AuthEngine;
 use awman::engine::container::ContainerRuntime;
 use awman::engine::git::GitEngine;
 use awman::engine::overlay::OverlayEngine;
-use awman::frontend::api::routes::{build_router, AppState, AuthMode, API_FEATURES};
+use awman::frontend::api::routes::{build_router, AppState, API_FEATURES};
 use axum::http::header::CONTENT_TYPE;
 
 const SESSION: &str = "ses_8650a82d8311b72b61b1d10bead4dec8";
@@ -76,7 +76,6 @@ fn state(root: &std::path::Path) -> Arc<AppState> {
         workdir_roots: vec![],
         started_at: Instant::now(),
         task_handles: tokio::sync::Mutex::new(Vec::new()),
-        auth_mode: AuthMode::Disabled,
         engines,
         sessions: Arc::new(awman::data::session_manager::SessionManager::in_memory(
             awman::data::config::env::EnvSnapshot::empty(),

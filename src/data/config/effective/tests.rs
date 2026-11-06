@@ -48,9 +48,12 @@ fn defaults_come_from_the_key_table() {
     assert_eq!(ec.max_concurrent_steps(), None);
     assert_eq!(ec.worktree_on_dirty_merge_target(), None);
     let daemon = ec.daemon();
-    assert_eq!(daemon.max_concurrent_jobs, 2);
-    assert_eq!(daemon.network.listen, "127.0.0.1:9876");
-    assert_eq!(daemon.network.features, ["worker"]);
+    assert_eq!(daemon.max_concurrent_jobs, 4);
+    assert_eq!(daemon.network.listen.to_string(), "127.0.0.1:9876");
+    assert_eq!(
+        daemon.network.features,
+        [crate::data::daemon_state::FeatureName::Worker]
+    );
     assert_eq!(ec.worker_push_interaction(), (Interaction::Headless, true));
     assert_eq!(ec.builtin_runtime().memory_mib_or_default(), 4096);
     assert_eq!(

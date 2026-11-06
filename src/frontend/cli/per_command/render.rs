@@ -9,10 +9,6 @@
 //! The whole module is pure: it never touches I/O or globals. Tests can call
 //! any renderer directly with a synthesised outcome.
 
-use crate::command::commands::api_server::{
-    ApiServerKillOutcome, ApiServerLogsOutcome, ApiServerOutcome, ApiServerStartOutcome,
-    ApiServerStatusOutcome,
-};
 use crate::command::commands::chat::ChatOutcome;
 use crate::command::commands::config::{
     ConfigGetOutcome, ConfigOutcome, ConfigSetOutcome, ConfigShowOutcome,
@@ -49,8 +45,8 @@ pub fn render(outcome: &CommandOutcome, json: bool) -> Option<String> {
         }
         CommandOutcome::ExecWorkflow(o) => render_exec_workflow(o),
         CommandOutcome::Config(o) => render_config(o, json),
-        CommandOutcome::ApiServer(o) => render_api_server(o),
-        CommandOutcome::DaemonApi(o) => Some(super::daemon::render(o, json)),
+        CommandOutcome::Daemon(o) => super::daemon::render(o, json),
+        CommandOutcome::DaemonApi(o) => Some(super::daemon::render_api(o, json)),
         CommandOutcome::Remote(o) => render_remote(o),
         CommandOutcome::New(o) => render_new(o),
         CommandOutcome::Specs(o) => render_specs(o),
@@ -234,81 +230,6 @@ fn render_config_set(o: &ConfigSetOutcome) -> String {
 }
 
 // ─── api ────────────────────────────────────────────────────────────────
-
-fn render_api_server(o: &ApiServerOutcome) -> Option<String> {
-    match o {
-        // In foreground mode the "started" message is printed at server
-        // boot (before the accept loop blocks). When that future finally
-        // returns it's because the server has *shut down* — printing
-        // "API server started …" at that point is misleading and looked
-        // like noise dumped after Ctrl-C.
-        ApiServerOutcome::Start(s) if !s.background => None,
-        ApiServerOutcome::Start(s) => Some(render_api_server_start(s)),
-        ApiServerOutcome::Kill(k) => Some(render_api_server_kill(k)),
-        ApiServerOutcome::Logs(l) => Some(render_api_server_logs(l)),
-        ApiServerOutcome::Status(s) => Some(render_api_server_status(s)),
-    }
-}
-
-fn render_api_server_start(o: &ApiServerStartOutcome) -> String {
-    let mode = if o.background {
-        "background"
-    } else {
-        "foreground"
-    };
-    let workdirs = if o.workdirs.is_empty() {
-        "<none>".to_string()
-    } else {
-        o.workdirs.join(", ")
-    };
-    let key = if o.refreshed_key {
-        " (api key refreshed)"
-    } else {
-        ""
-    };
-    format!(
-        "API server started on port {} in {mode} mode.\n  workdirs: {workdirs}{key}",
-        o.port
-    )
-}
-
-fn render_api_server_kill(o: &ApiServerKillOutcome) -> String {
-    match o.stopped_pid {
-        Some(pid) => format!("API server (PID {pid}) stopped."),
-        None => "API server is not running.".to_string(),
-    }
-}
-
-fn render_api_server_logs(o: &ApiServerLogsOutcome) -> String {
-    if o.log_path.is_empty() {
-        "No API server log found.".to_string()
-    } else {
-        format!("Tailing API server logs at {}", o.log_path)
-    }
-}
-
-fn render_api_server_status(o: &ApiServerStatusOutcome) -> String {
-    if !o.running {
-        return "API server is not running.".to_string();
-    }
-    let pid_part = o.pid.map(|p| format!(" (PID {p})")).unwrap_or_default();
-    let addr_part = o
-        .bound_addr
-        .as_deref()
-        .map(|a| format!(" at {a}"))
-        .unwrap_or_default();
-    let version_part = o
-        .version
-        .as_deref()
-        .map(|v| format!(", version {v}"))
-        .unwrap_or_default();
-    let responsive_part = if o.responsive {
-        ""
-    } else {
-        " — process alive but HTTP probe failed"
-    };
-    format!("API server is running{pid_part}{addr_part}{version_part}{responsive_part}.")
-}
 
 // ─── remote ──────────────────────────────────────────────────────────────────
 
@@ -496,46 +417,6 @@ mod tests {
         assert!(s.contains("Global:    claude"));
         assert!(s.contains("Repo:      —"));
         assert!(s.contains("Effective: claude"));
-    }
-
-    #[test]
-    fn render_api_server_status_running_with_pid() {
-        let s = render_api_server_status(&ApiServerStatusOutcome {
-            running: true,
-            pid: Some(1234),
-            bound_addr: Some("https://127.0.0.1:9876".into()),
-            version: Some("0.7.0".into()),
-            responsive: true,
-        });
-        assert!(s.contains("API server is running"));
-        assert!(s.contains("PID 1234"));
-        assert!(s.contains("at https://127.0.0.1:9876"));
-        assert!(s.contains("version 0.7.0"));
-        assert!(!s.contains("HTTP probe failed"));
-    }
-
-    #[test]
-    fn render_api_server_status_alive_but_unresponsive() {
-        let s = render_api_server_status(&ApiServerStatusOutcome {
-            running: true,
-            pid: Some(1234),
-            bound_addr: None,
-            version: None,
-            responsive: false,
-        });
-        assert!(s.contains("HTTP probe failed"));
-    }
-
-    #[test]
-    fn render_api_server_status_not_running() {
-        let s = render_api_server_status(&ApiServerStatusOutcome {
-            running: false,
-            pid: None,
-            bound_addr: None,
-            version: None,
-            responsive: false,
-        });
-        assert_eq!(s, "API server is not running.");
     }
 
     #[test]
@@ -1168,74 +1049,6 @@ mod tests {
             s.contains("3") || s.contains("exit"),
             "exit code must appear: {s}"
         );
-    }
-
-    // ── render_api_server ───────────────────────────────────────────────────────
-
-    use crate::command::commands::api_server::{
-        ApiServerKillOutcome, ApiServerLogsOutcome, ApiServerStartOutcome,
-    };
-
-    #[test]
-    fn render_api_server_start_shows_port_and_mode() {
-        let o = ApiServerStartOutcome {
-            port: 9876,
-            background: true,
-            workdirs: vec!["/repo".into()],
-            workdir_roots: vec![],
-            refreshed_key: false,
-        };
-        let s = render_api_server_start(&o);
-        assert!(s.contains("9876"), "port must appear: {s}");
-        assert!(s.contains("background"), "mode must appear: {s}");
-    }
-
-    #[test]
-    fn render_api_server_start_foreground_mode() {
-        let o = ApiServerStartOutcome {
-            port: 8080,
-            background: false,
-            workdirs: vec![],
-            workdir_roots: vec![],
-            refreshed_key: true,
-        };
-        let s = render_api_server_start(&o);
-        assert!(s.contains("foreground"), "must say foreground: {s}");
-        assert!(
-            s.contains("api key refreshed"),
-            "refreshed_key must be mentioned: {s}"
-        );
-    }
-
-    #[test]
-    fn render_api_server_kill_with_stopped_pid() {
-        let s = render_api_server_kill(&ApiServerKillOutcome {
-            stopped_pid: Some(5678),
-        });
-        assert!(s.contains("5678"), "PID must appear: {s}");
-        assert!(s.contains("stopped"), "must say stopped: {s}");
-    }
-
-    #[test]
-    fn render_api_server_kill_without_pid_says_not_running() {
-        let s = render_api_server_kill(&ApiServerKillOutcome { stopped_pid: None });
-        assert!(s.contains("not running"), "must say not running: {s}");
-    }
-
-    #[test]
-    fn render_api_server_logs_with_path() {
-        let s = render_api_server_logs(&ApiServerLogsOutcome {
-            log_path: "/tmp/awman.log".into(),
-        });
-        assert!(s.contains("/tmp/awman.log"), "log path must appear: {s}");
-    }
-
-    #[test]
-    fn render_api_server_logs_empty_path() {
-        let s = render_api_server_logs(&ApiServerLogsOutcome {
-            log_path: String::new(),
-        });
-        assert!(s.contains("No API server log"), "must say no log: {s}");
     }
 
     // ── render_remote ─────────────────────────────────────────────────────────

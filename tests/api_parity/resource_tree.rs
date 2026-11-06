@@ -43,7 +43,6 @@ async fn removed_paths_have_no_alias_and_every_failure_has_a_code() {
         "/v1/engine/actions",
         "/v1/actions",
         "/v1/commands/old/terminals",
-        "/v1/health",
         "/v1/worker/sessions/old/status",
         "/v1/worker/commands/old/status",
         "/v1/worker/commands/old/logs",
@@ -107,61 +106,61 @@ async fn list_envelopes_capabilities_prefixed_ids_and_labels() {
 #[tokio::test]
 async fn listener_policy_hides_unlisted_and_owner_routes_but_reports_disabled_features() {
     let root = tempfile::tempdir().unwrap();
-    let mut state = super::http_consistency::state(root.path());
-    let key_hash = state
-        .engines
-        .auth_engine
-        .hash_api_key(&awman::engine::auth::ApiKey::from_string("test-key"))
-        .as_str()
-        .to_string();
-    Arc::get_mut(&mut state).unwrap().auth_mode =
-        awman::engine::auth::AuthMode::Enabled { key_hash };
-    let api = Arc::new(DaemonApi::from_worker(state));
-    let router = build_router_for_listener(
-        api,
-        ListenerPolicy::Network {
-            features: vec![Feature::Squad],
-        },
-    );
-    for path in ["/v1/config", "/v1/config/reload", "/v1/grants"] {
-        let (status, body) = call(
-            &router,
-            if path.ends_with("reload") {
-                "POST"
-            } else {
-                "GET"
-            },
-            path,
-            None,
-        )
-        .await;
-        assert_eq!(status, 404);
-        assert_eq!(body["code"], "not_found");
-    }
-    let (status, body) = call(&router, "GET", "/v1/worker/sessions", None).await;
-    assert_eq!(status, 200, "{body}");
-    let (status, body) = call(&router, "GET", "/v1/squad/tasks", None).await;
-    assert_eq!(status, 503);
-    assert_eq!(body["code"], "feature_disabled");
-    let (status, _) = call(&router, "GET", "/v1/status", None).await;
-    assert_eq!(status, 200);
-    for path in ["/v1/config", "/v1/grants"] {
-        let (status, body) = call(&router, "PATCH", path, None).await;
-        assert_eq!(status, 404, "{path}: {body}");
-        assert_eq!(body["code"], "not_found");
+    let state = super::http_consistency::state(root.path());
+    let api = Arc::new(DaemonApi::for_worker_tests(state));
+    let (_, key) = api.runtime.keys().create("remote").unwrap();
+    let router = build_router_for_listener(api, ListenerPolicy::Network);
+    for auth in [None, Some("invalid"), Some(key.as_str())] {
+        for (method, path, want) in [
+            ("GET", "/v1/keys", 404),
+            ("PATCH", "/v1/features/worker", 404),
+            ("POST", "/v1/config/reload", 404),
+            ("PATCH", "/v1/config", 404),
+            ("GET", "/v1/squad/tasks", 404),
+            ("PATCH", "/v1/squad/tasks", 404),
+            (
+                "GET",
+                "/v1/status",
+                if auth == Some(key.as_str()) { 200 } else { 401 },
+            ),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let app = router.clone();
+            let task = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let mut request = reqwest::Client::new()
+                .request(method.parse().unwrap(), format!("http://{addr}{path}"));
+            if let Some(key) = auth {
+                request = request.bearer_auth(key);
+            }
+            assert_eq!(
+                request.send().await.unwrap().status(),
+                want,
+                "{method} {path}"
+            );
+            task.abort();
+        }
     }
 }
 #[tokio::test]
 async fn every_registered_route_resolves_to_its_owner_and_no_other_route_is_served() {
     let root = tempfile::tempdir().unwrap();
     let state = super::http_consistency::state(root.path());
-    let mut api = DaemonApi::from_worker(state);
-    api.features
-        .get_mut()
-        .unwrap()
-        .0
-        .insert(Feature::Worker, FeatureState::Off);
-    let router = build_router_for_listener(Arc::new(api), ListenerPolicy::Local);
+    let api = DaemonApi::for_worker_tests(state);
+    let file = awman::data::config::file::global_config_path(api.runtime.config().env()).unwrap();
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(
+        file,
+        r#"{"daemon":{"features":{"worker":{"enabled":false}}}}"#,
+    )
+    .unwrap();
+    api.runtime.reload_config().await.unwrap();
+    tokio::task::yield_now().await;
+    let router = build_router_for_listener(Arc::new(api), ListenerPolicy::Local).layer(
+        axum::Extension(awman::frontend::api::local::OwnerAuthenticated),
+    );
     for r in ROUTES.iter().filter(|r| r.op.owner() != Feature::Core) {
         let path = r.path.replace("{id}", "test").replace("{*path}", "file");
         let (status, body) = call(&router, r.method, &path, None).await;
@@ -181,22 +180,31 @@ async fn reload_validates_before_applying_and_keeps_restart_only_settings_inacti
     let env = EnvSnapshot::with_overrides([("AWMAN_HOME", home.to_str().unwrap())]);
     let file = global_config_path(&env).unwrap();
     std::fs::create_dir_all(file.parent().unwrap()).unwrap();
-    std::fs::write(&file, "{}").unwrap();
+    std::fs::write(
+        &file,
+        r#"{"daemon":{"features":{"worker":{"enabled":true}}}}"#,
+    )
+    .unwrap();
     let config = EffectiveConfig::resolve(
         ConfigLayers::load(&env, None, Default::default()).unwrap(),
         Default::default(),
         env,
     )
     .unwrap();
-    let api = Arc::new(DaemonApi::from_worker_with_config(state.clone(), config));
-    let router = build_router_for_listener(api.clone(), ListenerPolicy::Local);
+    let api = Arc::new(DaemonApi::for_worker_tests_with_config(
+        state.clone(),
+        config,
+    ));
+    let router = build_router_for_listener(api.clone(), ListenerPolicy::Local).layer(
+        axum::Extension(awman::frontend::api::local::OwnerAuthenticated),
+    );
     let allowed = root.path().join("allowed");
     std::fs::create_dir(&allowed).unwrap();
     std::fs::write(
         &file,
         serde_json::json!({"daemon":{
             "maxConcurrentJobs":3, "verboseSetup":true, "network":{"listen":"127.0.0.1:7777"},
-            "features":{"worker":{"push":{"workDirs":{"allow":[allowed]}}}}
+            "features":{"worker":{"enabled":true,"push":{"workDirs":{"allow":[allowed]}}}}
         }})
         .to_string(),
     )
@@ -216,7 +224,7 @@ async fn reload_validates_before_applying_and_keeps_restart_only_settings_inacti
         assert_eq!(live.as_ref().unwrap().daemon().max_concurrent_jobs, 3);
         assert!(live.as_ref().unwrap().daemon().verbose_setup);
         assert_eq!(
-            live.as_ref().unwrap().daemon().network.listen,
+            live.as_ref().unwrap().daemon().network.listen.to_string(),
             "127.0.0.1:9876"
         );
     }
@@ -225,14 +233,16 @@ async fn reload_validates_before_applying_and_keeps_restart_only_settings_inacti
     assert_eq!(response["items"][0]["path"], allowed.to_str().unwrap());
     std::fs::write(
         &file,
-        serde_json::json!({"daemon":{"features":{"worker":{"push":{"enabled":false}}}}})
+        serde_json::json!({"daemon":{"maxConcurrentJobs":3,"features":{"worker":{"enabled":false,"push":{"enabled":false}}}}})
             .to_string(),
     )
     .unwrap();
     let (status, response) = call(&router, "POST", "/v1/config/reload", None).await;
     assert_eq!(status, 200, "{response}");
     assert_eq!(
-        api.features.read().unwrap().state(Feature::Worker),
+        api.runtime
+            .feature_state(awman::data::daemon_state::FeatureName::Worker)
+            .state,
         FeatureState::Off
     );
     let (status, response) = call(&router, "GET", "/v1/worker/sessions", None).await;
@@ -240,13 +250,16 @@ async fn reload_validates_before_applying_and_keeps_restart_only_settings_inacti
     assert_eq!(response["code"], "feature_disabled");
     std::fs::write(
         &file,
-        serde_json::json!({"daemon":{"features":{"worker":{"push":{"enabled":true}}}}}).to_string(),
+        serde_json::json!({"daemon":{"maxConcurrentJobs":3,"features":{"worker":{"enabled":true,"push":{"enabled":true}}}}})
+            .to_string(),
     )
     .unwrap();
     let (status, response) = call(&router, "POST", "/v1/config/reload", None).await;
     assert_eq!(status, 200, "{response}");
     assert_eq!(
-        api.features.read().unwrap().state(Feature::Worker),
+        api.runtime
+            .feature_state(awman::data::daemon_state::FeatureName::Worker)
+            .state,
         FeatureState::On
     );
     let (status, response) = call(&router, "POST", "/v1/config/reload", None).await;
@@ -286,8 +299,8 @@ async fn grants_are_paged_by_resource_id_and_delete_returns_no_alias() {
     let root = tempfile::tempdir().unwrap();
     std::fs::create_dir(root.path().join("repo")).unwrap();
     let state = super::http_consistency::state(&root.path().join("api"));
-    let api = Arc::new(DaemonApi::from_worker(state));
-    api.grants
+    let api = Arc::new(DaemonApi::for_worker_tests(state));
+    api.grant_store()
         .lock()
         .unwrap()
         .remember(
@@ -306,7 +319,9 @@ async fn grants_are_paged_by_resource_id_and_delete_returns_no_alias() {
         .data_paths()
         .home()
         .to_path_buf();
-    let router = build_router_for_listener(api, ListenerPolicy::Local);
+    let router = build_router_for_listener(api, ListenerPolicy::Local).layer(axum::Extension(
+        awman::frontend::api::local::OwnerAuthenticated,
+    ));
     let (status, grants) = call(&router, "GET", "/v1/grants?limit=1", None).await;
     assert_eq!(status, 200, "{grants}");
     assert!(grants["next_cursor"].is_null());

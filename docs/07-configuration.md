@@ -166,7 +166,6 @@ These variables select where awman lives or switch behavior at the process level
 | `XDG_CONFIG_HOME`, `XDG_DATA_HOME` | When `AWMAN_HOME` is unset: config goes to `$XDG_CONFIG_HOME/awman/`, data to `$XDG_DATA_HOME/awman/` |
 | `HOME`, `SHELL`, `PATH`, `RUST_LOG` | Read as usual |
 | `AWMAN_REMOTE_SESSION` | Sticky session ID for `remote exec` commands; beaten by `--session` |
-| `AWMAN_SQUAD_KEY` | Bearer key the CLI and TUI authenticate to the squad daemon with; printed once as a shell snippet on the daemon's first start — see [Squad: Authenticating to the daemon](12-squad.md#authenticating-to-the-daemon) |
 | `GITHUB_TOKEN`, `GIT_SSH`, `GIT_SSH_COMMAND` | Read when workflow prerequisites offer a host credential |
 | `DOCKER_HOST`, `DOCKER_TLS_VERIFY`, `DOCKER_CERT_PATH` | Read by Docker, and by the builtin runtime when importing from a `docker-local` source that sets no `host` |
 | `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`, `NO_PROXY` | Honored when the builtin runtime pulls from a `registry` source |
@@ -191,7 +190,7 @@ $AWMAN_HOME/
   config.json                      global config
   data/awman.db                    sessions, commands, runs and squad tasks
   data/repos/<repo-hash>/state.json
-  api/                             API server storage: sessions, TLS material, key hash, logs
+  daemon/                          Daemon log, named API key hashes, TLS material, sessions
   squad/                           squad storage: task workspaces and config, builds, logs
   attach/                          attach sockets
   builtin/                         default runtime.builtin.stateDir
@@ -266,9 +265,9 @@ See [API and remote mode](09-api-and-remote-mode.md#awman-daemon-api).
 
 Squad evaluations resolve `workflows.prerequisites` through the same chain as everything else — global, then the repo, then the task file. A task's own decisions override only the credentials it explicitly chooses, and `--prerequisite-token acquire` keeps the trusted global acquisition command.
 
-## Squad daemon configuration
+## Squad feature configuration
 
-Squad settings are ordinary keys: the daemon's behavior lives under `daemon.features.squad.*`, and the agents, models, leader and guidance used for task evaluations are the same `workflows.dynamic.*` keys that govern [dynamic workflows](06-dynamic-workflows.md#configuring-dynamic-workflows). Task-specific workspace, interval, and overlay choices are set with `awman squad add`; see [Squad](12-squad.md). The squad daemon and API server cannot run at the same time because they share the awman database; see [API server and squad daemon](09-api-and-remote-mode.md#api-server-and-squad-daemon).
+Squad settings are ordinary keys: the daemon's behavior lives under `daemon.features.squad.*`, and the agents, models, leader and guidance used for task evaluations are the same `workflows.dynamic.*` keys that govern [dynamic workflows](06-dynamic-workflows.md#configuring-dynamic-workflows). Task-specific workspace, interval, and overlay choices are set with `awman squad add`; see [Squad](12-squad.md). Worker and squad run together as features of the same daemon; see [The daemon](16-daemon.md).
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -283,7 +282,7 @@ Squad settings are ordinary keys: the daemon's behavior lives under `daemon.feat
 
 Configuration is rejected when a concurrency value is zero; an `agentsToModels` entry has no models or contains an empty model name; `defaultLeader` is not exactly two non-empty components in `agent::model` form, has surrounding whitespace in either component, or uses an invalid agent name; or `guidance` has an empty or whitespace-only entry. A `guidance` list may contain at most 50 entries after merging, and each entry is limited to 1,000 characters. Agent names use ASCII letters, digits, `-`, and `_`, and are 1–64 characters long.
 
-`daemon.features.squad.envPersistence` describes the daemon process itself, not any one task, so it is global scope and a task file cannot override it. If the keychain is configured but unusable on this machine (no keychain backend, a missing `secret-tool`, a locked collection, or a probe that fails or times out), the daemon falls back to persisting nothing for that run rather than failing to start — `awman squad status` and `awman squad env` report the fallback and the reason as `persistence: unavailable(<reason>)`. An explicit `none` is never probed for and never produces that fallback message, because it's a deliberate choice rather than a degradation.
+`daemon.features.squad.envPersistence` describes the daemon process itself, not any one task, so it is global scope and a task file cannot override it. If the keychain is configured but unusable on this machine (no keychain backend, a missing `secret-tool`, a locked collection, or a probe that fails or times out), the daemon falls back to persisting nothing for that run rather than failing to start — `awman daemon status` and `awman squad env` report the fallback and the reason as `persistence: unavailable(<reason>)`. An explicit `none` is never probed for and never produces that fallback message, because it's a deliberate choice rather than a degradation.
 
 ### Per-task squad settings
 
@@ -594,7 +593,7 @@ This table is generated from the same key table awman validates against, so it i
 | `runtime.baseImage` | string | `null` | repo | no | no | `AWMAN_RUNTIME_BASE_IMAGE` | Base image tag for setup and teardown containers. |
 | `runtime.dockerfile` | string | `"Dockerfile.dev"` | repo | no | no | `AWMAN_RUNTIME_DOCKERFILE` | Dockerfile, relative to the repo root, that agent images are built from. |
 | `runtime.builtin.stateDir` | string | `null` | repo | no | no | `AWMAN_RUNTIME_BUILTIN_STATE_DIR` | Absolute private state directory of the builtin runtime (default <AWMAN_HOME>/builtin). |
-| `runtime.builtin.vcpus` | int 1..255 | `2` | repo | no | no | `AWMAN_RUNTIME_BUILTIN_VCPUS` | Whole vCPUs per builtin agent VM. |
+| `runtime.builtin.vcpus` | int 1..255 | `4` | repo | no | yes | `AWMAN_RUNTIME_BUILTIN_VCPUS` | Whole vCPUs per builtin agent VM. |
 | `runtime.builtin.memory` | size | `"4GiB"` | repo | no | no | `AWMAN_RUNTIME_BUILTIN_MEMORY` | Guest memory per builtin agent VM (at least 128MiB). |
 | `runtime.builtin.rootDisk` | size | `"30GiB"` | repo | no | no | `AWMAN_RUNTIME_BUILTIN_ROOT_DISK` | Writable root disk per builtin agent VM (at least 256MiB). |
 | `runtime.builtin.mountQuota` | size | `"30GiB"` | repo | no | no | `AWMAN_RUNTIME_BUILTIN_MOUNT_QUOTA` | How much a builtin guest may add to each host mount (at least 1MiB). |
@@ -608,7 +607,7 @@ This table is generated from the same key table awman validates against, so it i
 | `runtime.builtin.network.nameservers` | list<string> | `null` | repo | no | no | `AWMAN_RUNTIME_BUILTIN_NETWORK_NAMESERVERS` | DNS servers a builtin guest uses. |
 | `runtime.builtin.network.trustHostCas` | bool | `null` | repo | no | no | `AWMAN_RUNTIME_BUILTIN_NETWORK_TRUST_HOST_CAS` | Install the host's trusted CA certificates in builtin guests. |
 | `overlays` (additive) | list<string> | `[]` | task | no | no | `AWMAN_OVERLAYS` | Overlays applied to every agent container; layers add to each other. |
-| `workItems.dir` | string | `"aspec/work-items"` | repo | no | no | `AWMAN_WORK_ITEMS_DIR` | Work items directory, relative to the repo root. |
+| `workItems.dir` | string | `"aspec/work-items"` | repo | no | yes | `AWMAN_WORK_ITEMS_DIR` | Work items directory, relative to the repo root. |
 | `workItems.template` | string | `null` | repo | no | no | `AWMAN_WORK_ITEMS_TEMPLATE` | Work item template (default <dir>/0000-template.md). |
 | `workflows.maxConcurrentSteps` | int ≥ 1 | `null` | task | no | no | `AWMAN_WORKFLOWS_MAX_CONCURRENT_STEPS` | Cap on concurrently running workflow steps (null = unlimited). |
 | `workflows.prerequisites.preflight` | enum `warn\|off` | `"warn"` | task | no | no | `AWMAN_WORKFLOWS_PREREQUISITES_PREFLIGHT` | Whether workflow prerequisites are checked before a run. |
@@ -619,7 +618,7 @@ This table is generated from the same key table awman validates against, so it i
 | `workflows.prerequisites.ssh.use` | enum `ask\|allow\|deny` | `"ask"` | task | no | no | `AWMAN_WORKFLOWS_PREREQUISITES_SSH_USE` | Whether workflows may use an SSH key. |
 | `workflows.prerequisites.ssh.key` | string | `null` | task | no | no | `AWMAN_WORKFLOWS_PREREQUISITES_SSH_KEY` | SSH key under ~/.ssh offered to workflows. |
 | `workflows.prerequisites.githubToken.use` | enum `ask\|allow\|deny` | `"ask"` | task | no | no | `AWMAN_WORKFLOWS_PREREQUISITES_GITHUB_TOKEN_USE` | Whether workflows may use a GitHub token. |
-| `workflows.prerequisites.githubToken.envVars` | list<string> | `[]` | task | no | no | `AWMAN_WORKFLOWS_PREREQUISITES_GITHUB_TOKEN_ENV_VARS` | Host variables a GitHub token is read from (empty = GH_TOKEN, GITHUB_TOKEN). |
+| `workflows.prerequisites.githubToken.envVars` | list<string> | `[]` | task | no | yes | `AWMAN_WORKFLOWS_PREREQUISITES_GITHUB_TOKEN_ENV_VARS` | Host variables a GitHub token is read from (empty = GH_TOKEN, GITHUB_TOKEN). |
 | `workflows.prerequisites.githubToken.verify` | bool | `true` | task | no | no | `AWMAN_WORKFLOWS_PREREQUISITES_GITHUB_TOKEN_VERIFY` | Verify a GitHub token before a run. |
 | `workflows.prerequisites.githubToken.acquire.argv` | list<string> | `null` | global | no | no | `AWMAN_WORKFLOWS_PREREQUISITES_GITHUB_TOKEN_ACQUIRE_ARGV` | Command that prints a GitHub token. |
 | `workflows.prerequisites.githubToken.acquire.timeout` | duration | `"30s"` | global | no | no | `AWMAN_WORKFLOWS_PREREQUISITES_GITHUB_TOKEN_ACQUIRE_TIMEOUT` | How long the token command may run (at most 300s). |
@@ -636,20 +635,20 @@ This table is generated from the same key table awman validates against, so it i
 | `tui.programStatus.emit` | bool | `true` | repo | no | no | `AWMAN_TUI_PROGRAM_STATUS_EMIT` | Emit program status from the TUI (read from 0141). |
 | `tui.worker.enabled` | bool | `false` | repo | no | no | `AWMAN_TUI_WORKER_ENABLED` | Run a pull worker inside the TUI (read from 0143). |
 | `tui.integrations.*` | object | `{}` | repo | no | no | — | Per-integration TUI settings (read from 0154). |
-| `daemon.maxConcurrentJobs` | int ≥ 1 | `2` | global | no | yes | `AWMAN_DAEMON_MAX_CONCURRENT_JOBS` | Jobs the daemon runs at once. |
+| `daemon.maxConcurrentJobs` | int ≥ 1 | `4` | global | no | yes | `AWMAN_DAEMON_MAX_CONCURRENT_JOBS` | Jobs the daemon runs at once. |
 | `daemon.verboseSetup` | bool | `false` | global | no | yes | `AWMAN_DAEMON_VERBOSE_SETUP` | Log session setup in detail. |
 | `daemon.terminal.cols` | int ≥ 1 | `120` | global | no | yes | `AWMAN_DAEMON_TERMINAL_COLS` | Default daemon terminal width (read from 0141). |
 | `daemon.terminal.rows` | int ≥ 1 | `40` | global | no | yes | `AWMAN_DAEMON_TERMINAL_ROWS` | Default daemon terminal height (read from 0141). |
 | `daemon.terminal.remoteInput` | bool | `false` | global | no | yes | `AWMAN_DAEMON_TERMINAL_REMOTE_INPUT` | Accept terminal input from network clients (read from 0141). |
-| `daemon.network.enabled` | bool | `false` | global | no | no | `AWMAN_DAEMON_NETWORK_ENABLED` | Serve the API on the network listener (read from 0140). |
+| `daemon.network.enabled` | bool | `false` | global | no | yes | `AWMAN_DAEMON_NETWORK_ENABLED` | Serve the API on the network listener (read from 0140). |
 | `daemon.network.listen` | string | `"127.0.0.1:9876"` | global | no | no | `AWMAN_DAEMON_NETWORK_LISTEN` | host:port the API listener binds; changing it needs a daemon restart. |
-| `daemon.network.tlsSans` | list<string> | `[]` | global | no | no | `AWMAN_DAEMON_NETWORK_TLS_SANS` | Extra names in the listener's TLS certificate (read from 0140). |
-| `daemon.network.features` | list<string> | `["worker"]` | global | no | no | `AWMAN_DAEMON_NETWORK_FEATURES` | Features served on the network listener (read from 0140). |
+| `daemon.network.tlsSans` | list<string> | `[]` | global | no | yes | `AWMAN_DAEMON_NETWORK_TLS_SANS` | Extra names in the listener's TLS certificate (read from 0140). |
+| `daemon.network.features` | list<string> | `["worker"]` | global | no | yes | `AWMAN_DAEMON_NETWORK_FEATURES` | Features served on the network listener (read from 0140). |
 | `daemon.features.squad.enabled` | bool | `false` | global | no | yes | `AWMAN_DAEMON_FEATURES_SQUAD_ENABLED` | Run the squad scheduler. |
 | `daemon.features.squad.interaction` | enum `interactive\|headless` | `"interactive"` | global | no | yes | `AWMAN_DAEMON_FEATURES_SQUAD_INTERACTION` | How squad evaluations interact. |
 | `daemon.features.squad.maxConcurrentJobs` | int ≥ 1 | `1` | global | no | yes | `AWMAN_DAEMON_FEATURES_SQUAD_MAX_CONCURRENT_JOBS` | Squad runs at once. |
 | `daemon.features.squad.maxConcurrentEvaluations` | int ≥ 1 | `2` | global | no | yes | `AWMAN_DAEMON_FEATURES_SQUAD_MAX_CONCURRENT_EVALUATIONS` | Squad evaluations at once. |
-| `daemon.features.squad.envPersistence` | enum `keychain\|none` | `"keychain"` | global | no | no | `AWMAN_DAEMON_FEATURES_SQUAD_ENV_PERSISTENCE` | Where the squad daemon persists pushed task environment. |
+| `daemon.features.squad.envPersistence` | enum `keychain\|none` | `"keychain"` | global | no | yes | `AWMAN_DAEMON_FEATURES_SQUAD_ENV_PERSISTENCE` | Where the squad daemon persists pushed task environment. |
 | `daemon.features.worker.enabled` | bool | `false` | global | no | yes | `AWMAN_DAEMON_FEATURES_WORKER_ENABLED` | Run the worker feature. |
 | `daemon.features.worker.maxConcurrentJobs` | int ≥ 1 | `2` | global | no | yes | `AWMAN_DAEMON_FEATURES_WORKER_MAX_CONCURRENT_JOBS` | Worker jobs at once. |
 | `daemon.features.worker.push.enabled` | bool | `true` | global | no | yes | `AWMAN_DAEMON_FEATURES_WORKER_PUSH_ENABLED` | Accept jobs pushed by API clients. |
@@ -709,14 +708,6 @@ Earlier betas used a different, flatter set of key names, flags and variables. T
 | `dynamicWorkflows` | `workflows.dynamic` |
 | `workflows.prerequisites.githubToken.acquire.timeoutSecs` | `workflows.prerequisites.githubToken.acquire.timeout` (`"30s"`); `refresh` value `beforeTeardown` is now `before_teardown` |
 | `terminal_scrollback_lines` | `tui.scrollbackLines` |
-| `workers` | `daemon.maxConcurrentJobs` |
-| `api.workDirs` | `daemon.features.worker.push.workDirs.allow` |
-| `api.workDirRoots` | `daemon.features.worker.push.workDirs.roots` |
-| `api.alwaysNonInteractive` | `daemon.features.worker.push.interaction: "headless"` with `allowOverride: false` |
-| `api.port` | `daemon.network.listen` (`"127.0.0.1:9876"`) |
-| `squad.maxConcurrentEvaluations`, `squad.envPersistence` | `daemon.features.squad.maxConcurrentEvaluations`, `daemon.features.squad.envPersistence` |
-| `squad.agentsToModels`, `squad.defaultLeader`, `squad.guidance` | `workflows.dynamic.agentsToModels`, `workflows.dynamic.defaultLeader`, `workflows.dynamic.guidance` |
-| `squad.workflows.prerequisites` | `workflows.prerequisites` (resolved through the normal global → repo → task chain) |
 | `remote.defaultAddr` + `remote.defaultAPIKey` | `remote.targets.<name>.url` + `remote.targets.<name>.apiKey`, and `remote.default = <name>` |
 | `remote.savedDirs` | removed |
 | `auto_agent_auth_accepted` | not config; see [state.json](#statejson) |
@@ -730,7 +721,6 @@ Earlier betas used a different, flatter set of key names, flags and variables. T
 | `--max-concurrent <N>` | `--set workflows.maxConcurrentSteps=N` |
 | `--launch-mode <mode>` | `--set agents.launchMode=<mode>` |
 | `--remote-addr`, `--api-key` | `--remote <target>`, with the target defined under `remote.targets.<name>` |
-| `api start --port`, `--workdirs`, `--workdir-root` | `daemon.network.listen`, `daemon.features.worker.push.workDirs.allow`, `….roots` (or `--set`) |
 | `awman config migrate` | none — rename keys using the table above |
 | `awman config prerequisite-grants list\|revoke` | `awman daemon api grants.list`, `grants.delete id=…` |
 

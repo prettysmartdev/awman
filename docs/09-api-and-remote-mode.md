@@ -2,7 +2,7 @@
 
 awman can be driven over HTTP instead of from an interactive terminal. This guide covers both halves of that:
 
-- **[API mode](#api-mode)** — the *server*. `awman api start` exposes awman's sessions and subcommands over HTTP so scripts, CI pipelines, and any HTTP client can drive them. This half also covers [non-interactive (headless) operation](#non-interactive-headless-operation), which applies to plain CLI use too.
+- **[API mode](#api-mode)** — the daemon's worker feature accepts pushed sessions and commands under `/v1/worker/*`, so scripts, CI pipelines, and HTTP clients can drive them. This half also covers [non-interactive (headless) operation](#non-interactive-headless-operation), which applies to plain CLI use too.
 - **[Remote mode](#remote-mode)** — the *client*. `awman remote …` is a thin command-line client for an awman API server, with live log streaming, so you can dispatch work to a build host as if it were local.
 
 You do not need remote mode to use the API (curl works fine), and you do not need to understand the HTTP surface to use `awman remote`. Read whichever half you need.
@@ -11,18 +11,16 @@ You do not need remote mode to use the API (curl works fine), and you do not nee
 
 # API mode
 
-API mode exposes awman's session and subcommand execution over HTTP. Start a persistent server with `awman api start`, then drive sessions and subcommands from scripts, CI pipelines, or any HTTP client — no interactive terminal or TUI required.
+API mode is the push side of the daemon's worker feature. Enable the worker feature, start the daemon, then send sessions and commands under `/v1/worker/*` from scripts, CI pipelines, or HTTP clients — no interactive terminal or TUI required.
 
 A **session** in API mode is conceptually identical to a TUI tab: an isolated workspace bound to a working directory. Commands dispatched to a session (`exec prompt`, `exec workflow`, and the others listed under [Submit a command](#submit-a-command)) execute exactly as they would in a TUI tab — inside a container on the configured runtime, with the same security and isolation guarantees.
 
-API metadata, credentials, and output logs are recorded durably under
-`$AWMAN_HOME/api/` (default `~/.awman/api/`) for auditability. The shared SQLite database is stored at
+Worker sessions, commands, and output are stored under the awman home directory for auditability. The shared SQLite database is stored at
 `$AWMAN_HOME/data/awman.db`.
 
 API mode is for request-driven sessions and commands. To hand recurring work to
 a group of agents that pick it up on their own, build a [squad](12-squad.md)
-instead. The API server and the squad daemon behind your squad share the
-database and are mutually exclusive on one machine.
+instead. Worker and squad are features of one daemon and can run together.
 
 ---
 
@@ -101,23 +99,38 @@ Sessions and commands accept [labels](#labels). A label key is `<namespace>/<nam
   "status": "ok",
   "version": "0.13.0",
   "protocol": { "api": 1 },
-  "capabilities": ["error_codes", "workflow_state", "…"],
+  "capabilities": ["daemon_features", "network_listener", "api_keys", "health", "trace_propagation", "…"],
   "features": {
-    "squad":  { "name": "squad",  "state": "off", "running": 0, "queued": 0 },
-    "worker": { "name": "worker", "state": "on", "max_concurrent_jobs": 2, "running": 1, "queued": 0 }
+    "worker": {
+      "name": "worker", "state": "on", "enabled_by": "config",
+      "max_concurrent_jobs": 2, "running": 1, "queued": 0,
+      "oldest_queued_age_ms": null, "restarts": 0, "last_error": null,
+      "since_at": "2026-11-06T10:00:00Z"
+    }
   },
-  "max_concurrent_jobs": 2,
+  "max_concurrent_jobs": 4,
   "pid": 1234,
   "uptime_ms": 12345,
-  "listeners": [ { "kind": "local", "address": "127.0.0.1:9876", "tls": true }, { "kind": "ipc", "address": "…/awman-<uid>-<hash>.sock", "tls": false } ]
+  "agents": ["claude", "codex"],
+  "listeners": {
+    "local": { "transport": "unix_socket", "address": "/home/u/.awman/data/daemon/api.sock" },
+    "network": {
+      "enabled": true, "listen": "0.0.0.0:9876", "bound": "0.0.0.0:9876", "error": null,
+      "tls": { "fingerprint_sha256": "ab…", "sans": ["localhost", "127.0.0.1", "::1"] },
+      "features": ["worker"], "api_keys": 2
+    }
+  }
 }
+
 ```
 
 `capabilities` (a list of strings) is what the older `features` list used to be; `features` is now an object keyed by feature name holding each feature's state. See [Server health](#server-health).
 
 ### Features and access
 
-The daemon is organised into **features**: `core` (status, config, features, grants), `worker` (sessions, commands and runs driven by clients) and `squad` (scheduled tasks). Each route belongs to one feature, and its path says which: `/v1/worker/…`, `/v1/squad/…`. A feature has a state — `on`, `off`, `draining` (no new work accepted) or `ephemeral` — shown by `GET /v1/features`. Routes of a feature that is `off` answer `503 feature_disabled`.
+The network listener serves only features listed in `daemon.network.features` and enabled by config. Ephemeral features remain local. Removing a feature from the list takes effect on the next request, including requests on existing connections. Hidden paths return 404 for every method before key authentication.
+
+The daemon is organised into **features**: `core` (status, config, features, grants), `worker` (sessions, commands and runs driven by clients) and `squad` (scheduled tasks). Each route belongs to one feature, and its path says which: `/v1/worker/…`, `/v1/squad/…`. A feature has a state — `on`, `off`, `draining` (no new work accepted) or `ephemeral` — shown by `GET /v1/features`. On the local listener, routes of a feature that is `off` answer `503 feature_disabled`. Network concealment takes precedence and returns `404 not_found` for features that are not exposed. A recovering feature reports `degraded`; reads remain available and creates answer `503 feature_degraded`.
 
 Two access classes apply:
 
@@ -128,16 +141,18 @@ Two access classes apply:
 
 ## Quickstart — copy-pastable examples
 
-These examples assume a server on `127.0.0.1:9876` (the server always listens on loopback; see [Reaching the server from another machine](#reaching-the-server-from-another-machine)). It speaks HTTPS with a self-signed cert by default, so curl needs `-k` (or `--cacert ~/.awman/api/tls/cert.pem`). Pass `--dangerously-skip-tls` at server start if you'd rather use plain HTTP.
+These examples use the network listener at `127.0.0.1:9876` with TLS. Configure `daemon.network.*` and create a named API key as described in [The daemon](16-daemon.md).
 
 ```sh
-# 0. Start the server. The first start generates an API key and prints it
-#    ONCE in a banner; copy it now.
+# 0. Enable worker requests, allow this directory, and start the daemon.
+awman config set --global daemon.features.worker.enabled true
 awman config set --global daemon.features.worker.push.workDirs.allow "$HOME/my-project"
-awman api start --background
+awman config set --global daemon.network.enabled true
+awman config set --global daemon.network.listen 127.0.0.1:9876
+awman daemon start --background
 
-# Stash the key the banner just printed:
-KEY=<paste-key-from-banner>
+# Create a named key locally and capture it once:
+KEY=$(awman daemon api keys.create name=build-host --json | jq -r .key)
 SERVER=https://127.0.0.1:9876
 ```
 
@@ -353,7 +368,7 @@ awman chat --headless
 
 When a TTY is present and `--headless` is not passed, awman allows interactive features — full-screen agent sessions, PTY passthrough, and terminal resize (SIGWINCH) forwarding. When no TTY is detected, the agent runs in print/batch mode and awman makes no attempt to manage the terminal.
 
-The API server (`awman api start`) runs commands headless by default, regardless of the server process's stdin (`daemon.features.worker.push.interaction`): clients drive it over HTTP and receive updates through the event stream, so there is no terminal to manage.
+The worker feature runs pushed commands headless by default, regardless of the daemon process's stdin (`daemon.features.worker.push.interaction`): clients drive it over HTTP and receive updates through the event stream, so there is no terminal to manage.
 
 ### Parallel agents in interactive CLI mode
 
@@ -405,213 +420,66 @@ An agent that needs full-screen terminal control (e.g. an interactive editor) re
 
 ### Headless runs on the builtin runtime
 
-Headless, CI, and API-server runs work the same way under ``runtime.kind = "builtin"`` (macOS on Apple Silicon only), with these differences:
+Headless, CI, and API-server runs work the same way described by `<data>/daemon/server.json`runtime.kind = "builtin"`` (macOS on Apple Silicon only), with these differences:
 
 - The host must be an Apple Silicon Mac running the signed `awman-macos-arm64` binary (a macOS CI runner or VM must itself expose Hypervisor.framework). No Docker daemon is needed to run agents, but images must be available: run `awman ready` (with a configured `runtime.builtin.imageSource`) as a setup step. Unless `runtime.builtin.builder.enabled` is set with a local source, a launch whose image is missing fails with build-and-import instructions; workflow preflight and squad never build.
-- Each session's microVM lives and dies with the awman process that launched it. Under `awman api start`, that is the API server; stopping the server stops the VMs it launched.
+- Each session's microVM lives and dies with the awman process that launched it. Under `awman daemon start`, that is the daemon; stopping the server stops the VMs it launched.
 - `awman ready --json` includes an `image_source` entry when images were imported.
 
 See [Runtimes: Builtin microVM](11-runtimes.md#builtin-microvm-experimental).
 
 ---
 
-## Starting the server
+## Running the API server
 
-### Foreground
-
-```sh
-awman api start
-```
-
-The server listens on the address in `daemon.network.listen` (default `127.0.0.1:9876`) and accepts requests for the life of the process. The first start generates an API key and prints it in a banner — copy it then; it isn't shown again. Subsequent starts reuse the stored hash silently. By default the server speaks HTTPS with a self-signed cert; pass `--dangerously-skip-tls` for plain HTTP in trusted-local use. Logs go to stderr; press `Ctrl+C` to stop.
+API requests are handled by the daemon's worker feature. Enable it, configure
+its working-directory allowlist, and start the daemon:
 
 ```sh
-# Allow two working directories, then start
-awman config set --global daemon.features.worker.push.workDirs.allow "/repo-a,/repo-b"
-awman api start
-
-# Custom port (a one-off override for this run)
-awman api start --set daemon.network.listen=127.0.0.1:8080
-
-# Rotate the API key and print the new one to stdout (does not start the server)
-awman api start --refresh-key
-
-# Plain HTTP on loopback for tests/dev (WARNING: no TLS)
-awman api start --dangerously-skip-tls
-
-# Disable authentication for this run (WARNING: anyone reachable can drive the server)
-awman api start --dangerously-skip-auth
+awman config set daemon.features.worker.enabled true
+awman config set daemon.features.worker.push.workDirs.allow "$HOME/my-project"
+awman daemon start --background
+awman daemon status
 ```
 
-The port, the allowlist and the worker count are settings, not flags: `daemon.network.listen`, `daemon.features.worker.push.workDirs.allow` and `.roots`, and `daemon.maxConcurrentJobs`. Pass any of them for one run with the global `--set key=value` flag. Only working directories on the allowlist can be used to create sessions — requests with any other path are rejected with HTTP 403. See [Working directory allowlist](#working-directory-allowlist) and [Configuration](07-configuration.md).
+The daemon always provides an owner-only local listener for local clients.
+Remote HTTP access uses the daemon's separate TLS-only network listener,
+configured with `daemon.network.enabled`, `daemon.network.listen`,
+`daemon.network.features`, and `daemon.network.tlsSans`. See [The daemon](16-daemon.md)
+for setup and listener security. Local clients use the owner-only listener when no remote target is selected.
 
-**Start flags related to authentication and transport:**
-
-| Flag | Description |
-|------|-------------|
-| `--refresh-key` | Generate a new API key, write its hash to disk, and print the plaintext key, then exit without starting the server. Stop a running server first (`awman api kill`); the old key stops working when the server next starts. |
-| `--dangerously-skip-auth` | Disable authentication for this process lifetime only. The `api_key.hash` file is left untouched; the next normal start re-enables auth using the stored hash. |
-| `--dangerously-skip-tls` | Serve plain HTTP instead of HTTPS. Intended for tests and trusted-local environments only; the server logs a warning at startup. Clients must connect with `http://`. |
-
-### Reaching the server from another machine
-
-The server binds to the loopback address in `daemon.network.listen`; keep it on loopback and tunnel or proxy instead. To use it from another machine, forward the port over SSH (for example `ssh -N -L 9876:127.0.0.1:9876 build-host`) or put a reverse proxy on the server host in front of it.
-
-If `awman remote` cannot connect to a non-loopback address, its error says so and suggests the tunnel:
-
-```
-awman: remote connection refused: …; the awman API server listens on 127.0.0.1 only, so https://build-host:9876 must be an SSH tunnel (`ssh -N -L 9876:127.0.0.1:9876 <server-host>`, then use https://127.0.0.1:9876) or a reverse proxy running on the server host
-```
-
-When `awman remote` targets a loopback address, it trusts the certificate at `~/.awman/api/tls/cert.pem` on the *client* machine, so through an SSH tunnel copy the server's `cert.pem` there. For a non-loopback address (a proxy), the proxy must present a certificate the client trusts.
-
-### Background
-
-```sh
-awman api start --background
-```
-
-`--background` daemonizes the server using the OS process manager:
-
-| Platform | Mechanism |
-|----------|-----------|
-| Linux (systemd available) | `systemd-run --user` transient unit |
-| macOS (launchd) | `~/Library/LaunchAgents/io.awman.api.plist`, loaded with `launchctl` |
-| Fallback | Detached child process |
-
-The PID is stored at `$AWMAN_HOME/api/awman.pid`. Logs go to `$AWMAN_HOME/api/awman.log` (`$AWMAN_HOME` defaults to `~/.awman`).
-
-If a server is already running, `start` fails with `API server already running on PID <pid>`. If the port is taken by something else, it fails with `Port 9876 is already in use.` Choose another with `--set daemon.network.listen=127.0.0.1:<port>` (or `awman config set --global daemon.network.listen …`).
-
-### API server and squad daemon
-
-The API server and the squad daemon share the database and cannot run at the
-same time. Starting either one while the other is alive fails before the new
-process starts. The error names the other process and its PID, for example:
-
-```
-error: the squad daemon is already running (PID 41290). Run `awman squad stop` first; awman api and the squad daemon cannot run at the same time.
-```
-
-Stop the running process before starting the other one. See [Squad and
-`awman api`](12-squad.md#squad-and-awman-api) for the equivalent instructions
-from the squad user's perspective.
-
----
-
-## Server lifecycle commands
-
-### Status
-
-```sh
-awman api status
-```
-
-Prints whether the server is running, its PID and address, and whether it answers an HTTP probe:
-
-```
-API server is running (PID 81234) at https://127.0.0.1:9876.
-```
-
-When it is not running: `API server is not running.` For session and command counts, call [`GET /v1/status`](#server-health).
-
-### Logs
-
-```sh
-awman api logs
-```
-
-Prints the contents of `$AWMAN_HOME/api/awman.log`, which is written only when the server was started with `--background` (use `tail -f` on that file to follow it). If the file does not exist, awman says `Log file not found: <path>`.
-
-#### Session-setup verbosity
-
-While a session is being prepared (`cloning_repository`, `setting_up_branch`, `merging_refs`, `running_ready`), the server writes the full ready output — including container build lines, git command output, and state transitions — to the API log file. Each line is prefixed with the first 8 characters of the session id so you can grep one session out of a busy log:
-
-```sh
-grep '\[a1b2c3d4\]' ~/.awman/api/awman.log
-```
-
-Session setup runs the same `ready` image step as `awman ready`: under the builtin runtime it builds an image only when `runtime.builtin.builder.enabled` is true and the image is missing, and otherwise imports (re-acquiring an image installed from a different source than the one now configured). Each session uses the builtin settings of its own repo.
-
-To silence this verbose stream, set `daemon.verboseSetup` to `false` (for example `awman api start --set daemon.verboseSetup=false`). The lines are then emitted at `debug` level and dropped by the default `info` filter; they remain available via `RUST_LOG=debug`.
-
-### Kill
-
-```sh
-awman api kill
-```
-
-Stops the background server (see [Graceful shutdown](#graceful-shutdown)) and removes its PID file, printing `API server (PID <pid>) stopped.` When no server is running it prints `No API server is running (no PID file found).` (or notes a stale PID file it removed) and exits 1.
-
----
+Use `awman daemon stop` for a graceful drain, or `awman daemon stop --now` to
+cancel running worker and squad jobs before stopping. Read output with
+`awman daemon logs` or follow it with `awman daemon logs --follow`.
 
 ## Authentication
 
-The API server uses cryptographic API key authentication. Every HTTP request must include the API key; unauthenticated requests are rejected with HTTP 401 before reaching any handler.
+The network listener requires a named API key on every request. The local
+owner-only listener uses operating-system ownership and does not use a bearer
+key. Keys are created, listed, and revoked through `awman daemon api`; only
+creation returns plaintext key material, and that key is shown once. See [The
+daemon](16-daemon.md#local-listener-and-api-management) for key creation and
+rotation.
 
-### First start — key generation
+### Network API keys
 
-On the first start (when no `api_key.hash` file exists in `$AWMAN_HOME/api/`), awman generates a random 32-byte key (64 hex characters), stores only its SHA-256 hash on disk, and prints the key once:
-
-```
-╔═══════════════════════════════════════════════════════════════════╗
-║  awman API key (store this — it will not be shown again)          ║
-║  a3f8b2c1...64-character-hex-key...d7e9f0a1                       ║
-╚═══════════════════════════════════════════════════════════════════╝
-```
-
-**This is the only time the plaintext key appears.** Store it immediately. With `--background`, the key is printed by the starting command, before the daemon and its log file exist, so it never appears in `awman.log`. In the TUI and over the API the key is stated as plain text instead of a box.
-
-### Subsequent starts
-
-On subsequent starts (when `$AWMAN_HOME/api/api_key.hash` already exists), the server loads the stored hash silently and starts normally — no banner is printed. The same key continues to work without any client-side changes.
-
-### Rotating the key — `--refresh-key`
-
-To invalidate the current key and generate a new one:
+Create a named key through the daemon's local API client. The returned key is
+shown once; `keys.list` never returns key material:
 
 ```sh
-awman api start --refresh-key
+awman daemon api keys.create name=build-host
+awman daemon api keys.list
 ```
 
-A new key is generated, its hash replaces the file on disk, and the key is printed in the same banner. The command then exits without starting the server; it refuses to run while a server is running. Clients using the old key receive HTTP 401 from the next server start and must be updated.
-
-### Disabling authentication — `--dangerously-skip-auth`
+To rotate a key, create a replacement, update the clients, then delete the
+previous key by its `key_…` ID:
 
 ```sh
-awman api start --dangerously-skip-auth
+awman daemon api keys.delete id=key_…
 ```
 
-Skips all authentication checks for this process lifetime. The `api_key.hash` file is not modified; the next normal start re-enables authentication. Use only in isolated, trusted environments (e.g. a local loopback-only setup with strict firewall rules).
-
-### Authenticating requests
-
-Include the API key in every HTTP request using the `Authorization` header:
-
-```sh
-# Bearer token format (recommended)
-curl -s http://localhost:9876/v1/status \
-  -H "Authorization: Bearer <your-api-key>"
-
-# Bare key format (also accepted)
-curl -s http://localhost:9876/v1/status \
-  -H "Authorization: <your-api-key>"
-```
-
-When using `awman remote` subcommands, the key is resolved and injected automatically — see [API key](#api-key-authentication).
-
-**Error responses from the middleware:**
-
-| Situation | HTTP status | Response body |
-|-----------|-------------|---------------|
-| No `Authorization` header | 401 | `{"error": "API key required. Pass the key via the Authorization header (e.g. Authorization: Bearer <key>).", "code": "unauthorized"}` |
-| Wrong key | 401 | `{"error": "Invalid API key.", "code": "unauthorized"}` |
-
-The `Bearer` prefix is matched case-insensitively. Hashes are compared in constant time, and a request with no header costs the same as one with a wrong key.
-
-### Key storage
-
-The key hash is stored at `$AWMAN_HOME/api/api_key.hash` with mode `0o600` (owner read/write only on Unix). Only the SHA-256 hex digest is written — the plaintext key is never persisted anywhere.
+HTTP clients authenticate with `Authorization: Bearer <key>`. The network
+listener uses TLS only. The local owner-only listener does not need a key.
 
 ---
 
@@ -645,7 +513,7 @@ Every path is resolved to its canonical form (symlinks resolved, trailing slashe
 To see the current allowlist over HTTP:
 
 ```sh
-curl http://localhost:9876/v1/worker/workdirs
+curl https://localhost:9876/v1/worker/workdirs
 ```
 
 ```json
@@ -665,10 +533,10 @@ curl http://localhost:9876/v1/worker/workdirs
 
 ## Job Queue
 
-The API server uses a per-session FIFO queue to serialize command execution. When you submit a command via `POST /v1/worker/commands`, it is enqueued immediately and returns with a `command_id`. A pool of worker tasks processes the queue: each worker claims one queued command at a time and executes it, then claims the next one.
+The worker feature uses a per-session FIFO queue to serialize command execution. When you submit a command via `POST /v1/worker/commands`, it is enqueued immediately and returns with a `command_id`. A pool of worker tasks processes the queue: each worker claims one queued command at a time and executes it, then claims the next one.
 
 - **One command per session at a time**, in submission order, so commands in a session don't interfere with each other.
-- **Concurrency across sessions**: with N workers, up to N sessions run a command at once. Set N with `daemon.maxConcurrentJobs` (default 2; see [Server configuration](#server-configuration)).
+- **Concurrency across sessions**: the daemon shares a default capacity of four concurrent jobs across enabled features. Set the shared cap with `daemon.maxConcurrentJobs`; see [Configuration](07-configuration.md#reference-all-keys).
 - **Submission does not wait for execution**: a valid command for a ready session is enqueued with HTTP 202. `POST /v1/worker/commands` returns 409 if the session is closing or its setup is not ready; `POST /v1/worker/runs` can queue its command during setup.
 
 Track progress with `GET /v1/worker/commands/{id}`, or inspect a session's queue depth, running command and recent completions with [`GET /v1/worker/sessions/{id}/queue`](#get-session-queue-status).
@@ -679,34 +547,38 @@ Track progress with `GET /v1/worker/commands/{id}`, or inspect a session's queue
 
 All endpoints speak JSON. All requests and responses are logged at `INFO` level or above.
 
-When authentication is enabled (the default), every request must include the API key in the `Authorization` header. See [Authentication](#authentication) for details.
+Network requests must include the key in the `Authorization: Bearer <key>` header. See [Authentication](#authentication) for details.
 
 ### Base URL
 
 ```
-https://localhost:<port>/v1        # default (self-signed TLS)
-http://localhost:<port>/v1         # only if started with --dangerously-skip-tls
+https://localhost:<port>/v1        # TLS-only network listener
 ```
 
-The default TLS cert is self-signed (stored at `$AWMAN_HOME/api/tls/cert.pem`), so HTTP clients will reject it unless you tell them not to. With curl:
+The default TLS cert is self-signed (stored under `<data-home>/data/daemon/tls/`, where data home is `$AWMAN_HOME`, then `$XDG_DATA_HOME/awman`, then `~/.awman`), so HTTP clients will reject it unless you tell them not to. For local testing with curl:
 
 ```sh
 # Easiest: skip verification (acceptable for loopback)
 curl -k https://localhost:9876/v1/status -H "Authorization: Bearer $KEY"
 
 # Stricter: pin the self-signed cert as the only trusted CA
-curl --cacert ~/.awman/api/tls/cert.pem https://localhost:9876/v1/status \
+curl --cacert ~/.awman/data/daemon/tls/cert.pem https://localhost:9876/v1/status \
   -H "Authorization: Bearer $KEY"
 ```
 
-Every `curl` example in the rest of this document elides `-k`/`--cacert` for brevity; add one of the two flags above to any of them when running against the default HTTPS server.
+Substitute your data home in the certificate path when using `AWMAN_HOME` or `XDG_DATA_HOME`. Every `curl` example in the rest of this document elides `-k`/`--cacert` for brevity; add one of the two flags above to any of them when running against the default HTTPS server.
 
 ### Route tree
 
-This is the complete route table (34 method/path pairs). Request and response details for the worker routes follow in the sections below.
+This is the complete route table (39 method/path pairs). Request and response details for the worker routes follow in the sections below.
 
 | Method | Path | Feature | Access | Purpose |
 |--------|------|---------|--------|---------|
+| `GET` | `/v1/health` | core | unauthenticated | Health check |
+| `GET` | `/v1/keys` | core | owner/local | List named API keys |
+| `POST` | `/v1/keys` | core | owner/local | Create a key, shown once |
+| `DELETE` | `/v1/keys/{id}` | core | owner/local | Revoke a key |
+| `PATCH` | `/v1/features/{feature}` | core | owner/local | Enable or disable an ephemeral feature |
 | `GET` | `/v1/status` | core | feature | Daemon status, capabilities, feature states |
 | `GET` | `/v1/config` | core | owner/local | Masked effective configuration and where each value comes from |
 | `POST` | `/v1/config/reload` | core | owner/local | Validate config files and apply live settings |
@@ -744,7 +616,7 @@ This is the complete route table (34 method/path pairs). Request and response de
 
 Squad task and run bodies use `snake_case` fields; a task's interval is `interval_ms`. The scheduler currently has one-second granularity, so `interval_ms` must be a multiple of 1000. Anything not in this table — including the old unprefixed routes listed under [Upgrading from earlier betas](#upgrading-from-earlier-betas) — answers `404 not_found`.
 
-The route tree is served by the API server (worker and core routes) and the squad daemon (squad and core routes); a route for a feature the process does not run answers `503 feature_disabled`.
+The route tree is served by the daemon worker, squad, and core features; a route for a feature the process does not run answers `503 feature_disabled`.
 
 ### `awman daemon api`
 
@@ -756,7 +628,7 @@ awman daemon api --list
 awman daemon api --raw <METHOD> </v1/path> [--data <json>|@file|-] [--json]
 ```
 
-**Where it connects.** With no `--remote` and no `remote.default`, it talks to the local daemon (the API server if it is running, otherwise the squad daemon) over an owner-only local socket under `$AWMAN_HOME`; no API key is needed, and it is the only transport that reaches the owner/local routes. With `--remote <target>` or a `remote.default`, it connects over HTTPS to that [remote target](#remote-client-configuration) with the target's API key.
+**Where it connects.** With no `--remote` and no `remote.default`, it talks to the daemon over its owner-only local socket or named pipe described by `<data>/daemon/server.json`; no API key is needed, and this is the only transport that reaches owner-only routes. With `--remote <target>` or a `remote.default`, it connects over HTTPS to that [remote target](#remote-client-configuration) with the target's API key.
 
 **Output.** Without `--json` the response is printed as a small key/value summary; with `--json` the body is printed as returned.
 
@@ -839,7 +711,7 @@ There are two types of sessions:
 **Local session** — bound to a working directory on the server's filesystem:
 
 ```sh
-curl -s -X POST http://localhost:9876/v1/worker/sessions \
+curl -sk -X POST https://localhost:9876/v1/worker/sessions \
   -H 'Authorization: Bearer <api-key>' \
   -H 'Content-Type: application/json' \
   -d '{"session_type":"local","workdir":"/home/user/my-project"}'
@@ -848,13 +720,13 @@ curl -s -X POST http://localhost:9876/v1/worker/sessions \
 **Remote session** — clones a git repository on the server and operates within the clone:
 
 ```sh
-curl -s -X POST http://localhost:9876/v1/worker/sessions \
+curl -sk -X POST https://localhost:9876/v1/worker/sessions \
   -H 'Authorization: Bearer <api-key>' \
   -H 'Content-Type: application/json' \
   -d '{"session_type":"remote","repo_url":"https://github.com/org/repo","branch":"main"}'
 ```
 
-`session_type` defaults to `local`. Both types return HTTP 202 immediately with the new session ID:
+`session_type` defaults to `local`. The API body uses `session_type` as its discriminator (`local` or `remote`); the `awman remote session start` CLI exposes the same choice as `--type`. Both types return HTTP 202 immediately with the new session ID:
 
 ```json
 { "session_id": "ses_a1b2c3d4e5f67890abcdef1234567890" }
@@ -892,7 +764,7 @@ Commands share the clone's working state. Edits left by a failed command remain 
 
 If the push fails (for example the branch moved on `origin`, or the credentials are rejected), the command ends with status `error`, exit code 1 and `stage: "push"`, with git's error text included. Local commits stay in the clone; nothing is retried or forced.
 
-The push runs on the server as the user running `awman api`, using that user's git credentials (SSH keys, credential helpers). Make sure that account can push to `repo_url`. Host push-back uses isolated Git metadata with hooks and repository-configured helpers disabled; the destination comes from the session's saved URL. Each host push-back Git operation times out after two minutes.
+The push runs on the host as the user running the daemon, using that user's git credentials (SSH keys, credential helpers). Make sure that account can push to `repo_url`. Host push-back uses isolated Git metadata with hooks and repository-configured helpers disabled; the destination comes from the session's saved URL. Each host push-back Git operation times out after two minutes.
 
 **Local sessions** bind to an existing directory on the server. The directory must be in the allowlist (a `daemon.features.worker.push.workDirs.allow` entry, or a Git repository directly beneath a `daemon.features.worker.push.workDirs.roots` root). Commands run against that directory; an `exec workflow` with `--worktree` (implied by the API's default `--yolo`) runs in a worktree of it under `~/.awman/worktrees/`.
 
@@ -905,13 +777,13 @@ The server clones the repository when the session is created; the workflow's set
 **1. Create a remote session and wait for `ready`:**
 
 ```sh
-SESSION=$(curl -s -X POST http://localhost:9876/v1/worker/sessions \
+SESSION=$(curl -sk -X POST https://localhost:9876/v1/worker/sessions \
   -H 'Authorization: Bearer <api-key>' \
   -H 'Content-Type: application/json' \
   -d '{"session_type":"remote","repo_url":"https://github.com/org/my-project","branch":"main"}' \
   | jq -r .session_id)
 
-until [ "$(curl -s http://localhost:9876/v1/worker/sessions/$SESSION \
+until [ "$(curl -sk https://localhost:9876/v1/worker/sessions/$SESSION \
   -H 'Authorization: Bearer <api-key>' | jq -r .setup_status)" = ready ]; do sleep 5; done
 ```
 
@@ -960,13 +832,13 @@ API commands default to `--yolo`, which implies `--worktree`, so the run already
 **3. Submit and follow it:**
 
 ```sh
-CMD=$(curl -s -X POST http://localhost:9876/v1/worker/commands \
+CMD=$(curl -sk -X POST https://localhost:9876/v1/worker/commands \
   -H 'Authorization: Bearer <api-key>' \
   -H 'Content-Type: application/json' \
   -d '{"session_id":"'"$SESSION"'","subcommand":"exec workflow","args":["aspec/workflows/implement-feature.toml","--work-item","0053"]}' \
   | jq -r .command_id)
 
-curl -N http://localhost:9876/v1/worker/commands/$CMD/events -H 'Authorization: Bearer <api-key>'
+curl -Nsk https://localhost:9876/v1/worker/commands/$CMD/events -H 'Authorization: Bearer <api-key>'
 ```
 
 Notes:
@@ -992,11 +864,11 @@ Session-creation error responses:
 
 ```sh
 # All sessions (active and closed)
-curl -s http://localhost:9876/v1/worker/sessions \
+curl -sk https://localhost:9876/v1/worker/sessions \
   -H 'Authorization: Bearer <api-key>'
 
 # Active sessions only
-curl -s "http://localhost:9876/v1/worker/sessions?status=active" \
+curl -sk "https://localhost:9876/v1/worker/sessions?status=active" \
   -H 'Authorization: Bearer <api-key>'
 ```
 
@@ -1035,7 +907,7 @@ The same readiness fields appear on `GET /v1/worker/sessions/:id` and all JSON r
 #### Get session detail
 
 ```sh
-curl -s http://localhost:9876/v1/worker/sessions/<session-id> \
+curl -sk https://localhost:9876/v1/worker/sessions/<session-id> \
   -H 'Authorization: Bearer <api-key>'
 ```
 
@@ -1044,7 +916,7 @@ Returns the session record, including its `labels`. It also includes `setup_stat
 #### Close a session
 
 ```sh
-curl -s -X DELETE http://localhost:9876/v1/worker/sessions/<session-id> \
+curl -sk -X DELETE https://localhost:9876/v1/worker/sessions/<session-id> \
   -H 'Authorization: Bearer <api-key>'
 ```
 
@@ -1076,7 +948,7 @@ Commands are submitted to a session and execute asynchronously. Submit a command
 #### Submit a command
 
 ```sh
-curl -s -X POST http://localhost:9876/v1/worker/commands \
+curl -sk -X POST https://localhost:9876/v1/worker/commands \
   -H 'Authorization: Bearer <api-key>' \
   -H 'Content-Type: application/json' \
   -d '{"session_id":"<session-id>","subcommand":"exec prompt","args":["hello"]}'
@@ -1090,13 +962,13 @@ For `exec`, put the action in `subcommand` (`exec prompt` or `exec workflow`) an
 
 ```sh
 # exec prompt via API
-curl -s -X POST http://localhost:9876/v1/worker/commands \
+curl -sk -X POST https://localhost:9876/v1/worker/commands \
   -H 'Authorization: Bearer <api-key>' \
   -H 'Content-Type: application/json' \
   -d '{"session_id":"<session-id>","subcommand":"exec prompt","args":["Fix the failing tests"]}'
 
 # exec workflow via API
-curl -s -X POST http://localhost:9876/v1/worker/commands \
+curl -sk -X POST https://localhost:9876/v1/worker/commands \
   -H 'Authorization: Bearer <api-key>' \
   -H 'Content-Type: application/json' \
   -d '{"session_id":"<session-id>","subcommand":"exec workflow","args":["./aspec/workflows/implement-feature.toml","--work-item","0053","--prerequisite-unresolved","warn"]}'
@@ -1153,11 +1025,11 @@ See [Error responses](#error-responses) for the full list of codes.
 #### Get command status
 
 ```sh
-curl -s http://localhost:9876/v1/worker/commands/<command-id> \
+curl -sk https://localhost:9876/v1/worker/commands/<command-id> \
   -H 'Authorization: Bearer <api-key>'
 ```
 
-Returns the current status and metadata for a command.
+Returns the current status and metadata for a command, including its source `listener` and optional `trace_parent`. Worker create routes accept a W3C version 00 `traceparent` header; malformed values are ignored. A traced command stream starts with an id-less `queue_status` event carrying that trace and listener. This event leaves the resumable execution-event cursor unchanged.
 
 ```json
 {
@@ -1297,7 +1169,7 @@ Execution failures after admission are recorded in the command's `result`; poll 
 #### Get a command log snapshot
 
 ```sh
-curl -s 'http://localhost:9876/v1/worker/commands/<command-id>/events?format=json' \
+curl -sk 'https://localhost:9876/v1/worker/commands/<command-id>/events?format=json' \
   -H 'Authorization: Bearer <api-key>'
 ```
 
@@ -1326,7 +1198,7 @@ The default form of this endpoint is the live SSE stream described below.
 #### Stream command logs (live)
 
 ```sh
-curl -s http://localhost:9876/v1/worker/commands/<command-id>/events \
+curl -sk https://localhost:9876/v1/worker/commands/<command-id>/events \
   -H 'Authorization: Bearer <api-key>'
 ```
 
@@ -1364,7 +1236,7 @@ without a step name.
 **Shell example — stream and print until done:**
 
 ```sh
-curl -s http://localhost:9876/v1/worker/commands/<command-id>/events \
+curl -sk https://localhost:9876/v1/worker/commands/<command-id>/events \
   -H 'Authorization: Bearer <api-key>' \
 | while IFS= read -r line; do
     case "$line" in
@@ -1390,13 +1262,13 @@ curl -s http://localhost:9876/v1/worker/commands/<command-id>/events \
 
 ```sh
 # Resume after the last frame previously received, e.g. id: 2:17
-curl -N -H 'Authorization: Bearer <api-key>' \
+curl -Nsk -H 'Authorization: Bearer <api-key>' \
   -H 'Last-Event-ID: 2:17' \
-  'http://localhost:9876/v1/worker/commands/<command-id>/events'
+  'https://localhost:9876/v1/worker/commands/<command-id>/events'
 
 # Equivalent query form (takes precedence if the header is also present)
-curl -N -H 'Authorization: Bearer <api-key>' \
-  'http://localhost:9876/v1/worker/commands/<command-id>/events?after=2:17'
+curl -Nsk -H 'Authorization: Bearer <api-key>' \
+  'https://localhost:9876/v1/worker/commands/<command-id>/events?after=2:17'
 ```
 
 `awman remote exec --follow` uses this endpoint internally. The cURL form above is equivalent and is useful in scripts where the awman binary is unavailable on the client.
@@ -1407,7 +1279,7 @@ to that workflow step. Command-level completion events (`command_status` and
 example:
 
 ```sh
-curl -N 'http://localhost:9876/v1/worker/commands/<command-id>/events?step=implement' \
+curl -Nsk 'https://localhost:9876/v1/worker/commands/<command-id>/events?step=implement' \
   -H 'Authorization: Bearer <api-key>'
 ```
 
@@ -1475,7 +1347,7 @@ the client can show what needs attention.
 #### Get session queue status
 
 ```sh
-curl -s http://localhost:9876/v1/worker/sessions/<session-id>/queue \
+curl -sk https://localhost:9876/v1/worker/sessions/<session-id>/queue \
   -H 'Authorization: Bearer <api-key>'
 ```
 
@@ -1538,7 +1410,7 @@ This endpoint is useful for monitoring queue depth and diagnosing stalls in mult
 #### Cancel a command
 
 ```sh
-curl -s -X POST http://localhost:9876/v1/worker/commands/<command-id>/cancel \
+curl -sk -X POST https://localhost:9876/v1/worker/commands/<command-id>/cancel \
   -H 'Authorization: Bearer <api-key>'
 ```
 
@@ -1594,10 +1466,10 @@ directory, and Windows device names (`NUL`, `CON`, `COM1`, …) and names ending
 in a dot or a space are neither listed nor served.
 
 ```sh
-curl -s http://localhost:9876/v1/worker/commands/<command-id>/outputs \
+curl -sk https://localhost:9876/v1/worker/commands/<command-id>/outputs \
   -H 'Authorization: Bearer <api-key>'
 
-curl -s http://localhost:9876/v1/worker/commands/<command-id>/outputs/report.json \
+curl -sk https://localhost:9876/v1/worker/commands/<command-id>/outputs/report.json \
   -H 'Authorization: Bearer <api-key>'
 ```
 
@@ -1628,7 +1500,7 @@ are last-writer-wins; use a subdirectory named after the step.
 #### List commands
 
 ```sh
-curl -s "http://localhost:9876/v1/worker/commands?label=ci/job=nightly&status=running" \
+curl -sk "https://localhost:9876/v1/worker/commands?label=ci/job=nightly&status=running" \
   -H 'Authorization: Bearer <api-key>'
 ```
 
@@ -1703,7 +1575,7 @@ Match on `code`, not on the `error` text. Existing messages are preserved for co
 Sessions and commands carry optional string labels, set at creation and returned on every read. Use them to tag work with your own identifiers (a job name, a pull request number) and to find it again later.
 
 ```sh
-curl -s -X POST http://localhost:9876/v1/worker/sessions \
+curl -sk -X POST https://localhost:9876/v1/worker/sessions \
   -H 'Authorization: Bearer <api-key>' \
   -H 'Content-Type: application/json' \
   -d '{"session_type":"remote","repo_url":"https://github.com/org/repo","branch":"main",
@@ -1726,11 +1598,11 @@ curl -s -X POST http://localhost:9876/v1/worker/sessions \
 
 ```sh
 # Is there still a running command for this CI run?
-curl -s "http://localhost:9876/v1/worker/commands?label=ci/run=4812&status=running" \
+curl -sk "https://localhost:9876/v1/worker/commands?label=ci/run=4812&status=running" \
   -H 'Authorization: Bearer <api-key>' | jq -r '.items[0].id'
 
 # Or find the session, then its commands
-curl -s "http://localhost:9876/v1/worker/sessions?label=ci/run=4812&status=active" \
+curl -sk "https://localhost:9876/v1/worker/sessions?label=ci/run=4812&status=active" \
   -H 'Authorization: Bearer <api-key>' | jq -r '.items[0].id'
 ```
 
@@ -1743,7 +1615,7 @@ Once you have the command ID, resume with `GET /v1/worker/commands/<id>/events` 
 Network failures leave a client unsure whether a create request arrived. `POST /v1/worker/sessions`, `POST /v1/worker/commands` and `POST /v1/worker/runs` accept an optional `Idempotency-Key` header so the request can be retried safely:
 
 ```sh
-curl -s -X POST http://localhost:9876/v1/worker/runs \
+curl -sk -X POST https://localhost:9876/v1/worker/runs \
   -H 'Authorization: Bearer <api-key>' \
   -H 'Idempotency-Key: ci-4812-attempt-1' \
   -H 'Content-Type: application/json' \
@@ -1770,7 +1642,7 @@ Responses below 500 are replayed, including 4xx errors. If the daemon restarts b
 `POST /v1/worker/runs` creates a session and submits a command in a single request. It replaces the sequence create session → poll `GET /v1/worker/sessions/:id` until `ready` → `POST /v1/worker/commands` → `DELETE /v1/worker/sessions/:id`.
 
 ```sh
-curl -s -X POST http://localhost:9876/v1/worker/runs \
+curl -sk -X POST https://localhost:9876/v1/worker/runs \
   -H 'Authorization: Bearer <api-key>' \
   -H 'Content-Type: application/json' \
   -d '{
@@ -1826,11 +1698,11 @@ The legacy `error` value for a setup failure is the literal string `"setup_error
 ### Server health
 
 ```sh
-curl -s http://localhost:9876/v1/status \
+curl -sk https://localhost:9876/v1/status \
   -H 'Authorization: Bearer <api-key>'
 ```
 
-The response shape is shown under [`GET /v1/status`](#get-v1status). `features` maps each feature to its state (`on`, `off`, `draining`, `ephemeral`) with its `running` and `queued` job counts, and `max_concurrent_jobs` for the worker. `GET /v1/features` returns the same states as a list, and `GET /v1/features/worker` returns one.
+The response shape is shown under [`GET /v1/status`](#get-v1status). `features` maps each feature to its state (`on`, `off`, `draining`, `ephemeral`, or `degraded`) with its `running` and `queued` job counts, and `max_concurrent_jobs` is the shared daemon capacity. `GET /v1/features` returns the same states as a list, and `GET /v1/features/worker` returns one.
 
 The `capabilities` array lists what clients can detect without relying on the server version. `workflow_state` means the server exposes live workflow snapshots through `GET /v1/worker/commands/:id/workflow`.
 `command_cancel`, `labels`, `idempotency` and `runs` mean the server supports [command cancellation](#cancel-a-command), [labels](#labels), [idempotency keys](#idempotency-keys) and [`POST /v1/worker/runs`](#one-shot-runs).
@@ -1847,7 +1719,7 @@ finish when the last step completes. A failed step is retried once, then fails
 the command (`error`); a step with `abort_on_failure` aborts it. No interactive
 confirmation is required.
 
-When a workflow starts, the API server snapshots its `WorkflowState` to
+When a workflow starts, the worker feature snapshots its `WorkflowState` to
 `workflow.state.json` in that command's API directory. The snapshot is updated
 atomically as the state changes. For an ordinary workflow, the first snapshot
 exists before setup runs. With `--dynamic`, it exists after the leader's
@@ -1884,7 +1756,7 @@ See [Worktrees](05-workflows.md#worktrees). Worktrees live under
 #### Get workflow state
 
 ```sh
-curl -s http://localhost:9876/v1/worker/commands/<command-id>/workflow \
+curl -sk https://localhost:9876/v1/worker/commands/<command-id>/workflow \
   -H 'Authorization: Bearer <api-key>'
 ```
 
@@ -1981,16 +1853,16 @@ across retries or resumes.
 Poll this endpoint at your preferred interval to track a running workflow. The state file is updated atomically on every step transition, so polls never observe a partial or corrupted state.
 
 ```sh
-SERVER=http://localhost:9876
+SERVER=https://localhost:9876
 KEY=<your-api-key>
 
 # Poll workflow progress until this command execution stops
 while true; do
-  RESP=$(curl -s "$SERVER/v1/worker/commands/$CMD/workflow" \
+  RESP=$(curl -sk "$SERVER/v1/worker/commands/$CMD/workflow" \
     -H "Authorization: Bearer $KEY")
   PHASE=$(echo "$RESP" | jq -r '.phase // .current_phase')
   echo "Workflow phase: $PHASE"
-  COMMAND=$(curl -fsS "$SERVER/v1/worker/commands/$CMD" \
+  COMMAND=$(curl -kfsS "$SERVER/v1/worker/commands/$CMD" \
     -H "Authorization: Bearer $KEY") || break
   STATUS=$(echo "$COMMAND" | jq -r '.status')
   case "$STATUS" in
@@ -2016,7 +1888,7 @@ run a workflow. If a workflow state was previously returned and later becomes
 
 ```sh
 SERVER=https://127.0.0.1:9876
-KEY=<your-api-key>   # from the startup banner or --refresh-key
+KEY=<your-api-key>   # created locally with awman daemon api keys.create
 AUTH="Authorization: Bearer $KEY"
 
 # 1. Create a session and wait until its setup is ready
@@ -2055,15 +1927,14 @@ For a single task without a server, `awman exec prompt "…" --headless` runs lo
 
 ## Storage layout
 
-API runtime files live under `api/` in the awman home (`$AWMAN_HOME`, default `~/.awman`):
+Worker session files live under `daemon/` in the awman home (`$AWMAN_HOME`, default `~/.awman`):
 
 ```
-$AWMAN_HOME/api/
-  awman.log                        # server log (background mode only)
-  awman.pid                        # PID file for the running server
-  server.json                      # port and scheme of the running server
-  api_key.hash                     # SHA-256 hex digest of the API key (mode 0600)
-  tls/cert.pem, tls/key.pem        # self-signed TLS certificate and key
+$AWMAN_HOME/daemon/
+  awman.log                        # daemon log
+  awman.pid                        # PID file for the running daemon
+  api-keys.json                    # named key hashes; plaintext keys are never stored
+  tls/cert.pem, tls/key.pem        # network-listener TLS certificate and key
   sessions/
     <ses_id>/
       setup_state.json             # session setup progress
@@ -2079,25 +1950,22 @@ $AWMAN_HOME/api/
 ```
 
 The shared SQLite database is stored separately at
-`$AWMAN_HOME/data/awman.db`. On the first start after upgrading, awman migrates
-the database from its former API storage location automatically. It retains an
-`awman.db.pre-migration` backup of the old database; `awman clean` removes that
-backup, but never removes the live database.
+`$AWMAN_HOME/data/awman.db`.
 
 `workflow.state.json` is the snapshot served by [Get workflow state](#get-workflow-state). It is written atomically and uses the same JSON structure as the local workflow state in `$GITROOT/.awman/workflows/`.
 
-`awman.db` holds the API session and command records (and squad task and run records): the session and command fields described in this guide, plus labels. It is the authoritative record of activity; the per-command files hold raw output. Neither is deleted when a session is closed (see [Session cleanup](#session-cleanup)).
+`awman.db` holds worker session and command records (and squad task and run records): the session and command fields described in this guide, plus labels. It is the authoritative record of activity; the per-command files hold raw output. Neither is deleted when a session is closed (see [Session cleanup](#session-cleanup)).
 
 ---
 
-## Server configuration
+## Daemon configuration
 
-API server settings live in the `daemon` section of the global config (`$AWMAN_HOME/config.json`, default `~/.awman/config.json`). All fields are optional; see [Configuration](07-configuration.md) for the full reference.
+Worker and network settings live in the `daemon` section of global config (`$AWMAN_HOME/config.json`, default `~/.awman/config.json`). All fields are optional; see [Configuration](07-configuration.md#reference-all-keys) for the full reference.
 
 ```json
 {
   "daemon": {
-    "maxConcurrentJobs": 2,
+    "maxConcurrentJobs": 4,
     "verboseSetup": true,
     "network": { "listen": "127.0.0.1:9876" },
     "features": {
@@ -2118,7 +1986,7 @@ API server settings live in the `daemon` section of the global config (`$AWMAN_H
 
 | Key | Meaning |
 |-----|---------|
-| `daemon.maxConcurrentJobs` | Number of queue workers: the maximum number of sessions running a command at once (default 2). Live: `awman config set` applies it to a running daemon. |
+| `daemon.maxConcurrentJobs` | Shared maximum number of daemon jobs running at once (default 4). Live: `awman config set` applies it to a running daemon. |
 | `daemon.network.listen` | `host:port` the server binds (default `127.0.0.1:9876`). Restart required. |
 | `daemon.verboseSetup` | Log full session-setup output at `info` level (default `false`). |
 | `daemon.features.worker.push.workDirs.allow` | Exact working directories clients may use. |
@@ -2127,11 +1995,12 @@ API server settings live in the `daemon` section of the global config (`$AWMAN_H
 | `daemon.features.worker.push.allowOverride` | Whether a request's `interaction` may differ from the setting above (default `true`). |
 
 ```sh
+awman config set --global daemon.features.worker.enabled true
 awman config set --global daemon.features.worker.push.workDirs.allow "/home/user/my-project,/home/user/other-project"
 awman config set --global daemon.features.worker.push.workDirs.roots "/srv/repos"
 ```
 
-See [Working directory allowlist](#working-directory-allowlist) for what qualifies as a direct child of a root. Settings marked live apply to a running daemon with `awman daemon api config.reload` (or automatically when you change them with `awman config set`); the rest need a restart (`awman api kill && awman api start`).
+See [Working directory allowlist](#working-directory-allowlist) for what qualifies as a direct child of a root. Live settings apply automatically when you change them with `awman config set`; `daemon.network.listen` needs a restart.
 
 ---
 
@@ -2139,17 +2008,17 @@ See [Working directory allowlist](#working-directory-allowlist) for what qualifi
 
 API mode preserves all of awman's container isolation guarantees: every agent runs inside a container on the configured runtime, never directly on the host.
 
-The HTTP server enforces cryptographic API key authentication on every request by default. The plaintext key is shown once at server start and never logged or persisted; only its SHA-256 hash is stored on disk. See [Authentication](#authentication) for the full key lifecycle.
+The network listener enforces named API key authentication on every request. The plaintext key is returned once by `awman daemon api keys.create`; only its hash is stored. See [Authentication](#authentication) for the key lifecycle.
 
 The working directory allowlist is the secondary access control on the server: even a client that presents a valid API key can only create sessions in pre-approved directories.
 
-The server listens on loopback only. If you expose it through a tunnel or proxy, keep authentication and TLS on and restrict who can reach the forwarded port.
+The network listener binds to `daemon.network.listen` and uses TLS. See [The daemon](16-daemon.md#network-listener) for configuration and listener security.
 
 ---
 
 ## Session cleanup
 
-At server startup, awman automatically purges sessions that were closed more than 24 hours ago. Their rows are removed from `$AWMAN_HOME/data/awman.db` along with all associated command records. The on-disk output logs and workflow snapshots in `~/.awman/api/sessions/<uuid>/` are **not** deleted — they remain for audit purposes, but the API no longer serves a snapshot after its command row is purged. Remove these directories separately when disk retention is no longer needed.
+At server startup, awman automatically purges sessions that were closed more than 24 hours ago. Their rows are removed from `$AWMAN_HOME/data/awman.db` along with all associated command records. The on-disk output logs and workflow snapshots in `~/.awman/daemon/sessions/<session-id>/` are **not** deleted — they remain for audit purposes, but the API no longer serves a snapshot after its command row is purged. Remove these directories separately when disk retention is no longer needed.
 
 The cleanup runs once, before the server accepts connections, and logs each purged session at `INFO` level. Sessions closed within the last 24 hours are not touched.
 
@@ -2157,7 +2026,7 @@ The cleanup runs once, before the server accepts connections, and logs each purg
 
 ## Graceful shutdown
 
-On `SIGTERM` or `SIGINT`, the server finishes all in-flight HTTP responses and allows running commands up to 30 seconds to complete before force-terminating them. Both shutdown start and completion are logged. The 30-second grace period applies whether the server was stopped by `awman api kill` or by sending the signal directly.
+On `SIGTERM` or `SIGINT`, the daemon stops accepting new work and drains running commands without a time limit. `awman daemon stop` waits for that drain; `--now` cancels running work. A second shutdown signal escalates a drain to cancellation. Shutdown start and completion are logged.
 
 ---
 
@@ -2170,8 +2039,6 @@ Cases not covered in the sections above:
 | A `workDirs.allow` path does not exist at startup | Startup refused; create the directory first |
 | A `workDirs.roots` path does not exist at startup | Warning logged; the root is checked again on each request |
 | A `workDirs.roots` entry is itself inside a Git repository | Startup refused (exit 2); use `workDirs.allow` for a single repository |
-| `api_key.hash` missing at startup | Treated as a first start: a new key is generated and printed |
-| `--dangerously-skip-auth` with a hash file on disk | Auth disabled for this run only; the hash file is untouched |
 | `exec workflow` with `{{work_item_content}}` and no `--work-item` | Warning; placeholder left unexpanded; the workflow continues |
 | Bare `"subcommand": "exec"` (action in `args`) | HTTP 400 `invalid_request`; use `exec prompt` or `exec workflow` as the `subcommand` |
 | Session closed between listing it and submitting a command | HTTP 404 `session_not_found` |
@@ -2188,7 +2055,7 @@ Cases not covered in the sections above:
 
 ## Overview
 
-One machine runs `awman api start` (the _remote host_); developers or pipelines run `awman remote` (the _client_). The remote host manages all sessions and containers.
+One machine runs `awman daemon start` with the worker feature enabled (the _remote host_); developers or pipelines run `awman remote` (the _client_). The remote host manages all sessions and containers.
 
 ```
 Client                                           Remote host
@@ -2205,7 +2072,7 @@ awman remote exec workflow my.toml -f ──────────► POST /v1
 | `awman remote exec prompt <prompt>` | Send a one-shot prompt to a session |
 | `awman remote session kill <session-id>` | Close a session |
 
-The API server listens on loopback only, so a client on another machine reaches it through an SSH tunnel or a proxy; see [Reaching the server from another machine](#reaching-the-server-from-another-machine).
+The network listener is TLS-only and binds to `daemon.network.listen`; availability depends on the build. See [The daemon](16-daemon.md#network-listener).
 
 ---
 
@@ -2412,11 +2279,11 @@ A one-time reference for clients written against earlier betas. Everything in th
 | `GET /v1/workdirs` | `GET /v1/worker/workdirs` (now `{items:[{path, kind}], next_cursor}`) |
 | `GET /v1/sessions`, `POST /v1/sessions` | `GET /v1/worker/sessions`, `POST /v1/worker/sessions` |
 | `GET /v1/sessions/{id}`, `DELETE /v1/sessions/{id}` | `GET /v1/worker/sessions/{id}`, `DELETE /v1/worker/sessions/{id}` |
-| `GET /v1/sessions/{id}/status` | removed — `GET /v1/worker/sessions/{id}` carries `setup_status` and `setup_error` |
+| `GET /v1/sessions/{id}/status` | removed — use `GET /v1/worker/sessions/{id}`; session requests use `session_type` |
 | `GET /v1/sessions/{id}/queue` | `GET /v1/worker/sessions/{id}/queue` |
 | `GET /v1/commands`, `POST /v1/commands` | `GET /v1/worker/commands`, `POST /v1/worker/commands` |
 | `GET /v1/commands/{id}` | `GET /v1/worker/commands/{id}` |
-| `GET /v1/commands/{id}/status` | removed — use `GET /v1/worker/commands/{id}` |
+| `GET /v1/commands/{id}/status` | use `GET /v1/worker/commands/{id}` for command status |
 | `POST /v1/commands/{id}/cancel` | `POST /v1/worker/commands/{id}/cancel` |
 | `GET /v1/commands/{id}/logs` | `GET /v1/worker/commands/{id}/events` (same SSE stream; `?after=`, `Last-Event-ID`, `?step=` and `?format=json` unchanged) |
 | `GET /v1/workflows/{command_id}`, `GET /v1/commands/{id}/workflow` | `GET /v1/worker/commands/{id}/workflow` |
@@ -2442,9 +2309,8 @@ A one-time reference for clients written against earlier betas. Everything in th
 | Label keys such as `ci-run` | `<namespace>/<name>` such as `ci/run` for new writes; stored labels remain readable |
 | Setup failure of a `POST /v1/worker/runs` command: `error` held a message | `error` is the literal `"setup_error"`; details are in `setup_error` and the structured `failure` |
 | `step_activity` payload `{"type", "kind", "summary"}` | `{"type": "StepActivity", "data": {"kind", "summary"}}` |
-| `awman api start --port`, `--workdirs`, `--workdir-root` | `daemon.network.listen`, `daemon.features.worker.push.workDirs.allow`, `….roots` (or `--set` for one run) |
-| Global config `workers` | `daemon.maxConcurrentJobs` |
-| `api.workDirs`, `api.workDirRoots`, `api.alwaysNonInteractive` | `daemon.features.worker.push.workDirs.allow` / `.roots` / `.allowOverride` (with `.interaction`) |
+| Global worker-count setting | `daemon.maxConcurrentJobs` |
+| former worker settings | `daemon.features.worker.push.workDirs.allow` / `.roots` / `.allowOverride` (with `.interaction`) |
 | `AWMAN_API_VERBOSE_SETUP`, `AWMAN_API_ROOT` | `daemon.verboseSetup`; `AWMAN_HOME` |
 | `awman remote … --remote-addr`, `--api-key`, `AWMAN_REMOTE_ADDR`, `AWMAN_API_KEY`, `remote.defaultAddr`, `remote.defaultAPIKey` | `--remote <target>`, `remote.default`, `remote.targets.<name>.url` / `.apiKey` |
 | `awman exec … --max-concurrent` | `--set workflows.maxConcurrentSteps=N` |

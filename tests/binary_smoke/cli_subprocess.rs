@@ -75,9 +75,14 @@ fn awman_exec_help_exits_zero() {
 }
 
 #[test]
-fn awman_api_help_exits_zero() {
-    let out = run_awman(&["api", "--help"]);
+fn awman_daemon_help_lists_the_five_verbs() {
+    let out = run_awman(&["daemon", "--help"]);
     assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    for verb in ["start", "stop", "status", "logs", "api"] {
+        assert!(text.contains(verb), "{verb}:\n{text}");
+    }
+    assert!(!run_awman(&["api", "--help"]).status.success());
 }
 
 #[test]
@@ -296,8 +301,8 @@ fn awman_ready_help_mentions_build_flag() {
 }
 
 #[test]
-fn awman_api_start_help_lists_the_global_set_flag_and_no_port() {
-    let out = run_awman(&["api", "start", "--help"]);
+fn awman_daemon_start_help_lists_the_global_set_flag_and_no_port() {
+    let out = run_awman(&["daemon", "start", "--help"]);
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),

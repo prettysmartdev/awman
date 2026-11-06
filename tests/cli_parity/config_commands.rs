@@ -30,8 +30,8 @@ impl ConfigCommandFrontend for Quiet {
 
 struct NoDaemons;
 impl DaemonReloader for NoDaemons {
-    fn running(&self, _: &Session) -> Vec<RunningDaemon> {
-        Vec::new()
+    fn running(&self, _: &Session) -> Option<RunningDaemon> {
+        None
     }
     fn reload(&self, _: &RunningDaemon) -> Result<ReloadReply, String> {
         unreachable!()

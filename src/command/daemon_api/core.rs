@@ -9,6 +9,17 @@ use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FeatureRecord {
+    pub enabled_by: Option<crate::data::daemon_state::EnabledBy>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub oldest_queued_age_ms: Option<u64>,
+    pub restarts: u32,
+    pub last_error: Option<String>,
+    pub since_at: chrono::DateTime<chrono::Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idle_timeout_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idle_ms: Option<u64>,
     pub name: String,
     pub state: FeatureState,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -34,7 +45,8 @@ pub struct StatusResponse {
     pub max_concurrent_jobs: usize,
     pub pid: u32,
     pub uptime_ms: u64,
-    pub listeners: Vec<ListenerRecord>,
+    pub listeners: crate::command::daemon_runtime::ListenerStatus,
+    pub agents: Vec<String>,
 }
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReloadResponse {
@@ -48,44 +60,9 @@ pub struct ConfigResponse {
 }
 
 pub async fn feature(api: &DaemonApi, f: Feature) -> Result<FeatureRecord, CommandError> {
-    let config = api.config.lock().expect("config mutex").daemon();
-    let max = match f {
-        Feature::Squad => config.squad.max_concurrent_jobs,
-        Feature::Worker => config.worker.max_concurrent_jobs,
-        Feature::Engine => config.engine.max_concurrent_jobs,
-        Feature::Core => config.max_concurrent_jobs,
-    };
-    let mut record = FeatureRecord {
-        name: f.name().into(),
-        state: api.features.read().expect("feature set lock").state(f),
-        max_concurrent_jobs: Some(max),
-        running: 0,
-        queued: 0,
-        detail: None,
-    };
-    if f == Feature::Worker {
-        if let Some(worker) = &api.worker {
-            record.running = worker.store.count_running_commands()? as usize;
-            record.queued = worker
-                .store
-                .list_commands_filtered(&crate::data::fs::api_db::CommandListFilter {
-                    status: Some(crate::data::command_status::CommandStatus::Queued),
-                    session_id: None,
-                    labels: &[],
-                    limit: i64::MAX,
-                })?
-                .len();
-        }
-    }
-    if f == Feature::Squad {
-        if let Some(gateway) = &api.squad {
-            let mut status = gateway.status().await?;
-            status.bound_addr = api.bound_addr.lock().expect("bound address mutex").clone();
-            record.running = status.in_flight;
-            record.detail = Some(serde_json::to_value(status).expect("status serializes"));
-        }
-    }
-    Ok(record)
+    f.feature_name()
+        .map(|name| api.runtime.feature_record(name))
+        .ok_or_else(|| CommandError::Other("unknown feature".into()))
 }
 pub async fn features_list(api: &DaemonApi) -> Result<Vec<FeatureRecord>, CommandError> {
     let mut records = Vec::new();
@@ -95,41 +72,10 @@ pub async fn features_list(api: &DaemonApi) -> Result<Vec<FeatureRecord>, Comman
     Ok(records)
 }
 pub async fn status(api: &DaemonApi) -> Result<StatusResponse, CommandError> {
-    let features = features_list(api)
-        .await?
-        .into_iter()
-        .map(|v| (v.name.clone(), v))
-        .collect();
-    let address = api.bound_addr.lock().expect("bound address mutex").clone();
-    let settings = api.config.lock().expect("config mutex").daemon();
-    Ok(StatusResponse {
-        status: "ok".into(),
-        version: env!("CARGO_PKG_VERSION").into(),
-        protocol: [("api".into(), 1)].into(),
-        capabilities: super::capabilities::CAPABILITIES
-            .iter()
-            .map(|s| s.to_string())
-            .collect(),
-        features,
-        max_concurrent_jobs: settings.max_concurrent_jobs,
-        pid: std::process::id(),
-        uptime_ms: api.started_at.elapsed().as_millis() as u64,
-        listeners: {
-            let listeners = api.listener.lock().expect("listener mutex").clone();
-            if listeners.is_empty() {
-                vec![ListenerRecord {
-                    kind: "local".into(),
-                    address: address.unwrap_or(settings.network.listen),
-                    tls: false,
-                }]
-            } else {
-                listeners
-            }
-        },
-    })
+    Ok(api.runtime.status_snapshot())
 }
 pub fn config_get(api: &DaemonApi) -> ConfigResponse {
-    let config = api.config.lock().expect("config mutex");
+    let config = api.runtime.config();
     let mut paths = Vec::new();
     leaves(config.value(), "", &mut paths);
     ConfigResponse {
@@ -144,7 +90,7 @@ pub fn config_get(api: &DaemonApi) -> ConfigResponse {
     }
 }
 pub fn grants_list(api: &DaemonApi) -> Result<Vec<GrantResponse>, CommandError> {
-    let mut cached = api.grants.lock().expect("grants mutex");
+    let mut cached = api.grant_store().lock().expect("grants mutex");
     let fresh = crate::data::fs::prerequisite_grants::PrerequisiteGrantStore::load(
         api.engines.auth_engine.api_paths().data_paths().home(),
     );
@@ -172,7 +118,7 @@ pub fn grants_list(api: &DaemonApi) -> Result<Vec<GrantResponse>, CommandError> 
 }
 pub fn grants_delete(api: &DaemonApi, id: GrantId) -> Result<bool, CommandError> {
     Ok(api
-        .grants
+        .grant_store()
         .lock()
         .expect("grants mutex")
         .revoke(&GrantSelector::Id(id))?
@@ -300,4 +246,53 @@ impl TryFrom<GrantRecord> for GrantResponse {
                 .with_timezone(&chrono::Utc),
         })
     }
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HealthResponse {
+    pub status: String,
+}
+pub async fn health() -> HealthResponse {
+    HealthResponse {
+        status: "ok".into(),
+    }
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FeaturePatch {
+    pub enabled: bool,
+    #[serde(default)]
+    pub ephemeral: bool,
+    pub reason: Option<String>,
+}
+#[derive(Debug, thiserror::Error)]
+pub enum FeaturePatchError {
+    #[error("persistent changes go through awman config set")]
+    PersistentChange,
+    #[error(transparent)]
+    Change(#[from] crate::command::daemon_runtime::FeatureChangeError),
+}
+pub async fn feature_patch(
+    api: &DaemonApi,
+    f: crate::data::daemon_state::FeatureName,
+    patch: FeaturePatch,
+) -> Result<FeatureRecord, FeaturePatchError> {
+    if !patch.ephemeral {
+        return Err(FeaturePatchError::PersistentChange);
+    }
+    let runtime = &api.runtime;
+    if patch.enabled {
+        runtime.enable_ephemeral(f, patch.reason).await?;
+    } else {
+        runtime.disable_ephemeral(f).await?;
+    }
+    Ok(runtime.feature_record(f))
+}
+pub async fn jobs_cancel_feature(
+    api: &DaemonApi,
+    f: crate::data::daemon_state::FeatureName,
+) -> Result<Vec<String>, CommandError> {
+    api.runtime.cancel_feature_jobs(f).await
+}
+pub async fn config_reload(api: &DaemonApi) -> Result<ReloadResponse, CommandError> {
+    api.runtime.reload_config().await
 }

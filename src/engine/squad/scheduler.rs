@@ -135,6 +135,7 @@ impl SchedulerStatus {
 
 /// The always-on task scheduler.
 pub struct SquadScheduler {
+    executor: Option<Arc<crate::engine::daemon::executor::SharedExecutor>>,
     store: Arc<TaskStore>,
     paths: SquadPaths,
     evaluator: Arc<dyn TaskEvaluator>,
@@ -173,6 +174,7 @@ impl SquadScheduler {
         env: EnvSnapshot,
     ) -> Self {
         Self {
+            executor: None,
             store,
             paths,
             evaluator,
@@ -184,6 +186,18 @@ impl SquadScheduler {
             tick_interval: TICK_INTERVAL,
             resolved_leaders: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    pub fn with_executor(
+        mut self,
+        executor: Arc<crate::engine::daemon::executor::SharedExecutor>,
+    ) -> Self {
+        self.executor = Some(executor);
+        self
+    }
+    pub fn with_status(mut self, status: Arc<Mutex<SchedulerStatus>>) -> Self {
+        self.status = status;
+        self
     }
 
     /// Share the daemon's payload-environment state, so each run records the
@@ -221,7 +235,7 @@ impl SquadScheduler {
             // Reap any finished evaluations so the set does not grow unbounded.
             while tasks.try_join_next().is_some() {}
 
-            self.tick(&mut tasks);
+            tokio::select! { biased; _=shutdown.cancelled()=>break, _=self.tick(&mut tasks)=>{} }
 
             tokio::select! {
                 _ = shutdown.cancelled() => break,
@@ -297,7 +311,7 @@ impl SquadScheduler {
     }
 
     /// One tick: re-read config, select due tasks, dispatch each.
-    fn tick(&self, tasks: &mut JoinSet<()>) {
+    async fn tick(&self, tasks: &mut JoinSet<()>) {
         // Re-read config every tick — never cached at startup — so guidance /
         // agentsToModels / defaultLeader / maxConcurrentEvaluations edits take
         // effect on the next tick with no restart. A config that fails to load
@@ -381,6 +395,15 @@ impl SquadScheduler {
         }
 
         for task in due.into_iter().take(capacity) {
+            let permit = if let Some(executor) = &self.executor {
+                Some(
+                    executor
+                        .acquire(crate::data::daemon_state::FeatureName::Squad)
+                        .await,
+                )
+            } else {
+                None
+            };
             // The run row is opened *before* the task is spawned, so the
             // task is excluded from the very next tick's SQL selection by
             // its own `running` row. Opening it inside the task would let a
@@ -518,6 +541,7 @@ impl SquadScheduler {
             let agents_to_models = effective.agents_to_models.clone();
             let default_leader = effective.default_leader.clone();
             tasks.spawn(async move {
+                let _permit = permit;
                 evaluate_task(EvaluateArgs {
                     store,
                     evaluator,
@@ -1150,7 +1174,7 @@ mod tests {
         // in-flight count is untouched, and the tick is still counted.
         adjust_in_flight(&scheduler.status, 1);
         std::fs::write(&config, "{ not json").unwrap();
-        scheduler.tick(&mut tasks);
+        scheduler.tick(&mut tasks).await;
         assert!(!task_admitted(&scheduler), "default policy must not admit");
         {
             let status = scheduler.status.lock().unwrap();
@@ -1161,7 +1185,7 @@ mod tests {
         assert!(first.is_some(), "the named error is recorded");
 
         // The same error on a later tick is not a new report.
-        scheduler.tick(&mut tasks);
+        scheduler.tick(&mut tasks).await;
         assert_eq!(scheduler.status.lock().unwrap().config_error, first);
         assert!(!task_admitted(&scheduler));
 
@@ -1172,7 +1196,7 @@ mod tests {
             r#"{"daemon":{"features":{"squad":{"maxConcurrentEvaluations":1}}}}"#,
         )
         .unwrap();
-        scheduler.tick(&mut tasks);
+        scheduler.tick(&mut tasks).await;
         assert!(scheduler
             .status_handle()
             .lock()
@@ -1181,7 +1205,7 @@ mod tests {
             .is_none());
         assert!(!task_admitted(&scheduler), "cap of 1 is still full");
         adjust_in_flight(&scheduler.status, -1);
-        scheduler.tick(&mut tasks);
+        scheduler.tick(&mut tasks).await;
         assert!(task_admitted(&scheduler));
         while tasks.join_next().await.is_some() {}
     }
@@ -1207,7 +1231,7 @@ mod tests {
             let enforced = std::fs::read_to_string(&config).is_err();
             if enforced {
                 // Running as root the mode cannot deny access.
-                scheduler.tick(&mut tasks);
+                scheduler.tick(&mut tasks).await;
             }
             std::fs::set_permissions(denied, original).unwrap();
             if !enforced {
@@ -1223,7 +1247,7 @@ mod tests {
                 .is_some());
 
             // Restored: a valid reload clears the error with no restart.
-            scheduler.tick(&mut tasks);
+            scheduler.tick(&mut tasks).await;
             assert!(scheduler
                 .status_handle()
                 .lock()
@@ -1233,7 +1257,7 @@ mod tests {
             assert!(!task_admitted(&scheduler), "cap of 1 is still full");
         }
         adjust_in_flight(&scheduler.status, -1);
-        scheduler.tick(&mut tasks);
+        scheduler.tick(&mut tasks).await;
         assert!(task_admitted(&scheduler));
         while tasks.join_next().await.is_some() {}
     }
@@ -1244,7 +1268,7 @@ mod tests {
         let (scheduler, config) = config_scheduler(tmp.path());
         assert!(!config.exists());
         let mut tasks = JoinSet::new();
-        scheduler.tick(&mut tasks);
+        scheduler.tick(&mut tasks).await;
         assert!(task_admitted(&scheduler));
         while tasks.join_next().await.is_some() {}
     }

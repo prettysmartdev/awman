@@ -13,6 +13,7 @@ use super::event_bus::EventBus;
 /// Delivery facts needed by adapters that preserve resumable cursors and
 /// progress notices. Transient events deliberately have no resumable cursor.
 pub enum CommandLogUpdate {
+    QueueStatus(crate::data::daemon_state::CommandQueueStatus),
     Event {
         event: Box<ExecutionEvent>,
         cursor: Option<EventCursor>,
@@ -70,6 +71,20 @@ impl CommandLogStream {
         };
         let (tx, receiver) = tokio::sync::mpsc::channel(256);
         let task = tokio::spawn(async move {
+            if command.trace_parent.is_some()
+                && tx
+                    .send(CommandLogUpdate::QueueStatus(
+                        crate::data::daemon_state::CommandQueueStatus {
+                            command_id: command.id.clone(),
+                            listener: command.listener.clone(),
+                            trace_parent: command.trace_parent.clone(),
+                        },
+                    ))
+                    .await
+                    .is_err()
+            {
+                return;
+            }
             // Subscribe before reading disk and deduplicate the overlap. If the
             // writer is behind this subscription, repair the gap before forwarding.
             let command_id = command.id.clone();

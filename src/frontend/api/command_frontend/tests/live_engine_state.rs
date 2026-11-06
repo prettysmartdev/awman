@@ -17,7 +17,7 @@ use crate::engine::agent_runtime::execution::{AgentExecution, AgentExitInfo};
 use crate::engine::workflow::actions::WorkflowOutcome;
 use crate::engine::workflow::factory::{AgentExecutionFactory, WorkflowRuntimeContext};
 use crate::engine::workflow::{WorkflowEngine, WorkflowEngineDeps, WorkflowSpec};
-use crate::frontend::api::routes::{build_router, AppState, AuthMode};
+use crate::frontend::api::routes::{build_router, AppState};
 
 fn app_state(root: &std::path::Path) -> Arc<AppState> {
     let paths = ApiPaths::from_root(root);
@@ -70,7 +70,6 @@ fn app_state(root: &std::path::Path) -> Arc<AppState> {
         workdir_roots: Vec::new(),
         started_at: std::time::Instant::now(),
         task_handles: tokio::sync::Mutex::new(Vec::new()),
-        auth_mode: AuthMode::Disabled,
         engines,
         sessions: Arc::new(crate::data::session_manager::SessionManager::in_memory(
             crate::data::config::env::EnvSnapshot::empty(),

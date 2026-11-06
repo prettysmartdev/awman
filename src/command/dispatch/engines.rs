@@ -7,13 +7,12 @@ use std::sync::Arc;
 use crate::command::dispatch::catalogue::CommandCatalogue;
 use crate::command::startup::RuntimeStartupFailure;
 use crate::data::config::{ConfigFile, EffectiveConfig};
-use crate::data::fs::{ApiPaths, AuthPathResolver, SquadPaths};
+use crate::data::fs::{ApiPaths, AuthPathResolver};
 use crate::data::session::Session;
 use crate::engine::agent::AgentEngine;
 use crate::engine::agent_runtime::{self, AgentRuntimeEngine, DetectedRuntime};
-use crate::engine::auth::{AuthEngine, AuthMode, AuthOutcome};
+use crate::engine::auth::AuthEngine;
 use crate::engine::container::ContainerRuntime;
-use crate::engine::daemon::DaemonKind;
 use crate::engine::error::EngineError;
 use crate::engine::git::GitEngine;
 use crate::engine::overlay::OverlayEngine;
@@ -122,20 +121,17 @@ impl Engines {
         Self::from_detected(detected, session)
     }
 
-    /// Assemble the engines used by either standalone daemon.
-    ///
-    /// Daemons do not have a `Session`: overlays resolve credentials from the
-    /// process auth paths, auth uses the API key store, and workflow state is
-    /// rooted under that daemon's own root. Every path comes from the process
-    /// environment, so a caller has no paths to supply.
-    pub fn for_daemon(kind: DaemonKind) -> Result<Self, EngineError> {
-        let auth_paths = AuthPathResolver::from_process_env()?;
-        let api_paths = ApiPaths::from_process_env()?;
+    pub fn for_env(env: crate::data::config::env::EnvSnapshot) -> Result<Self, EngineError> {
+        let auth_paths = AuthPathResolver::at_home(
+            env.home_dir()
+                .or_else(dirs::home_dir)
+                .ok_or(crate::data::error::DataError::HomeNotFound)?,
+        );
+        let api_paths = ApiPaths::from_env(&env)?;
         // The daemon's one config read (F-31). A malformed file fails the
         // start with a message naming the file and the offending key, rather
         // than being defaulted away and leaving the daemon quietly running on
         // settings the user did not write.
-        let env = crate::data::config::env::Env::from_process();
         let global = ConfigFile::load(
             &crate::data::config::file::global_config_path(&env)?,
             crate::data::config::FileKind::Global,
@@ -178,10 +174,7 @@ impl Engines {
                 .with_lease_factory(lease_factory_for(credential_monitor.as_ref())),
         );
 
-        let workflow_root = match kind {
-            DaemonKind::Api => api_paths.root().to_path_buf(),
-            DaemonKind::Squad => SquadPaths::from_process_env()?.root().to_path_buf(),
-        };
+        let workflow_root = api_paths.data_paths().root().to_path_buf();
         Ok(Self {
             runtime,
             container_runtime,
@@ -198,6 +191,26 @@ impl Engines {
         })
     }
 
+    /// Clone handles from the one daemon core; never detect or open a runtime here.
+    pub fn from_core(
+        core: &crate::engine::daemon::core::Core,
+        global_config: Arc<ConfigFile>,
+    ) -> Self {
+        Self {
+            runtime: core.runtime().clone(),
+            container_runtime: core.container_runtime().cloned(),
+            sandbox_runtime: core.sandbox_runtime().cloned(),
+            git_engine: core.git_engine().clone(),
+            overlay_engine: core.overlay_engine().clone(),
+            auth_engine: core.auth_engine().clone(),
+            agent_engine: core.agent_engine().clone(),
+            credential_monitor: core.credential_monitor().cloned(),
+            workflow_state_store: Arc::new(crate::data::WorkflowStateStore::at_git_root(
+                core.data_paths().root().to_path_buf(),
+            )),
+            global_config,
+        }
+    }
     pub(crate) fn from_detected(
         detected: DetectedRuntime,
         session: &Session,
@@ -301,13 +314,6 @@ impl Engines {
             .as_ref()
             .map(|runtime| runtime.take_notices())
             .unwrap_or_default()
-    }
-
-    /// Verify an HTTP request's `Authorization` header value on behalf of a
-    /// daemon's Layer 3 routes. The accepted syntax, the hashing and the
-    /// constant-time comparison stay in [`AuthEngine::verify_bearer`].
-    pub fn verify_bearer(&self, mode: &AuthMode, header: Option<&str>) -> AuthOutcome {
-        self.auth_engine.verify_bearer(mode, header)
     }
 
     /// Agent-runtime detection with the documented CLI/TUI fallback policy,
@@ -437,7 +443,7 @@ mod tests {
         // under it.
         std::fs::write(tmp.path().join("config.json"), "{ \"runtime\": ").unwrap();
 
-        let result = Engines::for_daemon(DaemonKind::Squad);
+        let result = Engines::for_env(crate::data::config::env::Env::from_process());
 
         let error = result
             .err()
@@ -514,7 +520,7 @@ mod tests {
         // `ConfigHomeGuard`, not `CWD_LOCK`: the variable this serialises is
         // `AWMAN_HOME`, and the `clean` and `overlay` tests that also
         // repoint it never touched `CWD_LOCK`. Holding the wrong lock let
-        // them move the config home mid-test, so `Engines::for_daemon` read a
+        // them move the config home mid-test, so `Engines::for_env` read a
         // config it was never given and built the wrong runtime tier.
         let _guard = crate::data::config::env::ConfigHomeGuard::set(home.path());
         config
@@ -527,7 +533,7 @@ mod tests {
     }
 
     #[test]
-    fn engines_build_and_for_daemon_produce_container_tier_under_default_config() {
+    fn engines_build_and_for_env_produce_container_tier_under_default_config() {
         let root = tempfile::tempdir().expect("create test root");
         let session = session_at(root.path());
         let built = Engines::build(&session).expect("default session engines build");
@@ -535,8 +541,8 @@ mod tests {
         assert!(built.sandbox_runtime.is_none());
 
         with_daemon_global_config(ConfigFile::default(), || {
-            let daemon =
-                Engines::for_daemon(DaemonKind::Api).expect("default daemon engines build");
+            let daemon = Engines::for_env(crate::data::config::env::Env::from_process())
+                .expect("default daemon engines build");
             assert!(daemon.container_runtime.is_some());
             assert!(daemon.sandbox_runtime.is_none());
         });
@@ -545,11 +551,11 @@ mod tests {
     /// `docker-sbx-experimental` is platform-gated in `SandboxRuntime::dsbx`
     /// (linux refuses with `BackendUnsupportedOnPlatform`
     /// — see `engine::sandbox::runtime`'s own `dsbx_errors_on_*` tests, which
-    /// use the same branch-on-`cfg!` pattern). `Engines::build`/`for_daemon`
+    /// use the same branch-on-`cfg!` pattern). `Engines::build`/`for_env`
     /// only assemble a sandbox-tier bundle on the platforms where the backend
     /// actually constructs.
     #[test]
-    fn engines_build_and_for_daemon_produce_sandbox_tier_for_experimental_runtime() {
+    fn engines_build_and_for_env_produce_sandbox_tier_for_experimental_runtime() {
         let root = tempfile::tempdir().expect("create test root");
         let config = config_with_runtime(Some("sbx"));
         let home = tempfile::tempdir().expect("create config home");
@@ -581,12 +587,14 @@ mod tests {
                 Ok(_) => panic!("dsbx build must fail on this platform"),
             }
 
-            with_daemon_global_config(config, || match Engines::for_daemon(DaemonKind::Squad) {
-                Err(EngineError::BackendUnsupportedOnPlatform { backend, .. }) => {
-                    assert_eq!(backend, "docker-sbx-experimental")
+            with_daemon_global_config(config, || {
+                match Engines::for_env(crate::data::config::env::Env::from_process()) {
+                    Err(EngineError::BackendUnsupportedOnPlatform { backend, .. }) => {
+                        assert_eq!(backend, "docker-sbx-experimental")
+                    }
+                    Err(e) => panic!("expected BackendUnsupportedOnPlatform, got {e:?}"),
+                    Ok(_) => panic!("dsbx for_env must fail on this platform"),
                 }
-                Err(e) => panic!("expected BackendUnsupportedOnPlatform, got {e:?}"),
-                Ok(_) => panic!("dsbx for_daemon must fail on this platform"),
             });
             return;
         }
@@ -596,8 +604,8 @@ mod tests {
         assert!(built.sandbox_runtime.is_some());
 
         with_daemon_global_config(config, || {
-            let daemon =
-                Engines::for_daemon(DaemonKind::Squad).expect("sandbox daemon engines build");
+            let daemon = Engines::for_env(crate::data::config::env::Env::from_process())
+                .expect("sandbox daemon engines build");
             assert!(daemon.container_runtime.is_none());
             assert!(daemon.sandbox_runtime.is_some());
         });

@@ -37,17 +37,16 @@ use awman::engine::auth::AuthEngine;
 use awman::engine::container::ContainerRuntime;
 use awman::engine::git::GitEngine;
 use awman::engine::overlay::OverlayEngine;
-use awman::frontend::api::routes::{AppState, AuthMode};
+use awman::frontend::api::routes::AppState;
 
 // ─── Test helpers ─────────────────────────────────────────────────────────────
 
-fn make_app_state(root: &std::path::Path, auth: AuthMode) -> Arc<AppState> {
-    make_app_state_with_workdirs(root, auth, vec![])
+fn make_app_state(root: &std::path::Path) -> Arc<AppState> {
+    make_app_state_with_workdirs(root, vec![])
 }
 
 fn make_app_state_with_workdirs(
     root: &std::path::Path,
-    auth: AuthMode,
     workdirs: Vec<std::path::PathBuf>,
 ) -> Arc<AppState> {
     let paths = ApiPaths::from_root(root);
@@ -101,7 +100,6 @@ fn make_app_state_with_workdirs(
         workdir_roots: Vec::new(),
         started_at: Instant::now(),
         task_handles: tokio::sync::Mutex::new(Vec::new()),
-        auth_mode: auth,
         engines,
         sessions: Arc::new(awman::data::session_manager::SessionManager::in_memory(
             awman::data::config::env::EnvSnapshot::empty(),
@@ -127,10 +125,6 @@ fn catalogue_api_allowed_commands_includes_exec_and_squad_commands() {
         ("agents", "kill"),
         ("exec", "prompt"),
         ("exec", "workflow"),
-        ("squad", "start"),
-        ("squad", "stop"),
-        ("squad", "status"),
-        ("squad", "logs"),
         ("squad", "add"),
         // `squad edit` is API-allowed for the same reason `add` is —
         // the daemon re-executes it from the remote gateway.
@@ -167,7 +161,7 @@ fn catalogue_ready_not_in_api_allowed_commands() {
 #[test]
 fn catalogue_validate_for_frontend_rejects_chat_for_api() {
     let cat = CommandCatalogue::get();
-    let result = cat.validate_for_frontend(FrontendKind::Api, &["chat"]);
+    let result = cat.validate_for_frontend(FrontendKind::WORKER_LOCAL, &["chat"]);
 
     match result {
         Err(CommandError::NotAvailableForFrontend { command, frontend }) => {
@@ -175,7 +169,7 @@ fn catalogue_validate_for_frontend_rejects_chat_for_api() {
                 command.contains("chat"),
                 "error should name the blocked command; got {command:?}"
             );
-            assert_eq!(frontend, "api");
+            assert_eq!(frontend, "daemon:worker:local");
         }
         other => panic!(
             "expected Err(NotAvailableForFrontend) for 'chat' on Api frontend, got {other:?}"
@@ -186,7 +180,7 @@ fn catalogue_validate_for_frontend_rejects_chat_for_api() {
 #[test]
 fn catalogue_validate_for_frontend_rejects_ready_for_api() {
     let cat = CommandCatalogue::get();
-    let result = cat.validate_for_frontend(FrontendKind::Api, &["ready"]);
+    let result = cat.validate_for_frontend(FrontendKind::WORKER_LOCAL, &["ready"]);
     assert!(
         matches!(result, Err(CommandError::NotAvailableForFrontend { .. })),
         "\"ready\" must be rejected for Api frontend"
@@ -196,7 +190,7 @@ fn catalogue_validate_for_frontend_rejects_ready_for_api() {
 #[test]
 fn catalogue_validate_for_frontend_accepts_exec_workflow_for_api() {
     let cat = CommandCatalogue::get();
-    let result = cat.validate_for_frontend(FrontendKind::Api, &["exec", "workflow"]);
+    let result = cat.validate_for_frontend(FrontendKind::WORKER_LOCAL, &["exec", "workflow"]);
     assert!(
         result.is_ok(),
         "\"exec workflow\" must be accepted for Api frontend; got {result:?}"
@@ -206,7 +200,7 @@ fn catalogue_validate_for_frontend_accepts_exec_workflow_for_api() {
 #[test]
 fn catalogue_validate_for_frontend_accepts_exec_prompt_for_api() {
     let cat = CommandCatalogue::get();
-    let result = cat.validate_for_frontend(FrontendKind::Api, &["exec", "prompt"]);
+    let result = cat.validate_for_frontend(FrontendKind::WORKER_LOCAL, &["exec", "prompt"]);
     assert!(
         result.is_ok(),
         "\"exec prompt\" must be accepted for Api frontend; got {result:?}"
@@ -262,7 +256,7 @@ async fn post_command(
 #[tokio::test]
 async fn real_network_api_rejects_chat_with_400() {
     let tmp = tempfile::tempdir().unwrap();
-    let state = make_app_state(tmp.path(), AuthMode::Disabled);
+    let state = make_app_state(tmp.path());
     let Some((addr, server)) = spawn_router(state).await else {
         eprintln!("SKIP: cannot bind 127.0.0.1");
         return;
@@ -287,7 +281,7 @@ async fn real_network_api_rejects_chat_with_400() {
 #[tokio::test]
 async fn real_network_api_rejects_ready_with_400() {
     let tmp = tempfile::tempdir().unwrap();
-    let state = make_app_state(tmp.path(), AuthMode::Disabled);
+    let state = make_app_state(tmp.path());
     let Some((addr, server)) = spawn_router(state).await else {
         eprintln!("SKIP: cannot bind 127.0.0.1");
         return;
@@ -306,7 +300,7 @@ async fn real_network_api_rejects_ready_with_400() {
 #[tokio::test]
 async fn real_network_api_rejects_init_with_400() {
     let tmp = tempfile::tempdir().unwrap();
-    let state = make_app_state(tmp.path(), AuthMode::Disabled);
+    let state = make_app_state(tmp.path());
     let Some((addr, server)) = spawn_router(state).await else {
         eprintln!("SKIP: cannot bind 127.0.0.1");
         return;
@@ -325,7 +319,7 @@ async fn real_network_api_rejects_init_with_400() {
 #[tokio::test]
 async fn real_network_api_accepts_agents_status_and_rejects_attach() {
     let tmp = tempfile::tempdir().unwrap();
-    let state = make_app_state(tmp.path(), AuthMode::Disabled);
+    let state = make_app_state(tmp.path());
     let Some((addr, server)) = spawn_router(state).await else {
         eprintln!("SKIP: cannot bind 127.0.0.1");
         return;
@@ -349,7 +343,7 @@ async fn real_network_api_accepts_agents_status_and_rejects_attach() {
 #[tokio::test]
 async fn real_network_api_rejects_api_server_start_with_400() {
     let tmp = tempfile::tempdir().unwrap();
-    let state = make_app_state(tmp.path(), AuthMode::Disabled);
+    let state = make_app_state(tmp.path());
     let Some((addr, server)) = spawn_router(state).await else {
         eprintln!("SKIP: cannot bind 127.0.0.1");
         return;
@@ -371,7 +365,7 @@ async fn real_network_api_rejects_api_server_start_with_400() {
 #[tokio::test]
 async fn real_network_api_accepts_exec_workflow_routing_not_command_restriction_400() {
     let tmp = tempfile::tempdir().unwrap();
-    let state = make_app_state(tmp.path(), AuthMode::Disabled);
+    let state = make_app_state(tmp.path());
     let Some((addr, server)) = spawn_router(state).await else {
         eprintln!("SKIP: cannot bind 127.0.0.1");
         return;
@@ -399,7 +393,7 @@ async fn real_network_api_accepts_exec_workflow_routing_not_command_restriction_
 #[tokio::test]
 async fn real_network_api_accepts_exec_prompt_routing_not_command_restriction_400() {
     let tmp = tempfile::tempdir().unwrap();
-    let state = make_app_state(tmp.path(), AuthMode::Disabled);
+    let state = make_app_state(tmp.path());
     let Some((addr, server)) = spawn_router(state).await else {
         eprintln!("SKIP: cannot bind 127.0.0.1");
         return;
@@ -426,7 +420,7 @@ async fn real_network_api_accepts_exec_prompt_routing_not_command_restriction_40
 #[tokio::test]
 async fn real_network_api_rejection_body_lists_available_commands() {
     let tmp = tempfile::tempdir().unwrap();
-    let state = make_app_state(tmp.path(), AuthMode::Disabled);
+    let state = make_app_state(tmp.path());
     let Some((addr, server)) = spawn_router(state).await else {
         eprintln!("SKIP: cannot bind 127.0.0.1");
         return;
@@ -465,8 +459,7 @@ async fn real_network_post_sessions_returns_202_immediately() {
     let workdir = tempfile::tempdir().unwrap();
     let workdir_path = workdir.path().canonicalize().unwrap();
 
-    let state =
-        make_app_state_with_workdirs(tmp.path(), AuthMode::Disabled, vec![workdir_path.clone()]);
+    let state = make_app_state_with_workdirs(tmp.path(), vec![workdir_path.clone()]);
     let Some((addr, server)) = spawn_router(state).await else {
         eprintln!("SKIP: cannot bind 127.0.0.1");
         return;
@@ -509,7 +502,7 @@ async fn real_network_post_sessions_returns_202_immediately() {
 #[tokio::test]
 async fn real_network_session_status_unknown_id_returns_404() {
     let tmp = tempfile::tempdir().unwrap();
-    let state = make_app_state(tmp.path(), AuthMode::Disabled);
+    let state = make_app_state(tmp.path());
     let Some((addr, server)) = spawn_router(state).await else {
         eprintln!("SKIP: cannot bind 127.0.0.1");
         return;
@@ -537,8 +530,7 @@ async fn real_network_session_status_returns_valid_body_after_create() {
     let workdir = tempfile::tempdir().unwrap();
     let workdir_path = workdir.path().canonicalize().unwrap();
 
-    let state =
-        make_app_state_with_workdirs(tmp.path(), AuthMode::Disabled, vec![workdir_path.clone()]);
+    let state = make_app_state_with_workdirs(tmp.path(), vec![workdir_path.clone()]);
     let Some((addr, server)) = spawn_router(state).await else {
         eprintln!("SKIP: cannot bind 127.0.0.1");
         return;
@@ -587,8 +579,7 @@ async fn real_network_job_rejected_during_session_setup() {
     let workdir = tempfile::tempdir().unwrap();
     let workdir_path = workdir.path().canonicalize().unwrap();
 
-    let state =
-        make_app_state_with_workdirs(tmp.path(), AuthMode::Disabled, vec![workdir_path.clone()]);
+    let state = make_app_state_with_workdirs(tmp.path(), vec![workdir_path.clone()]);
     let Some((addr, server)) = spawn_router(state).await else {
         eprintln!("SKIP: cannot bind 127.0.0.1");
         return;
@@ -1204,8 +1195,7 @@ async fn real_network_exec_response_advertises_flags_applied() {
     let workdir = tempfile::tempdir().unwrap();
     let workdir_path = workdir.path().canonicalize().unwrap();
 
-    let state =
-        make_app_state_with_workdirs(tmp.path(), AuthMode::Disabled, vec![workdir_path.clone()]);
+    let state = make_app_state_with_workdirs(tmp.path(), vec![workdir_path.clone()]);
     let Some((addr, server)) = spawn_router(state.clone()).await else {
         eprintln!("SKIP: cannot bind 127.0.0.1");
         return;
@@ -1261,8 +1251,7 @@ async fn real_network_session_status_includes_current_ready_phase_field() {
     let workdir = tempfile::tempdir().unwrap();
     let workdir_path = workdir.path().canonicalize().unwrap();
 
-    let state =
-        make_app_state_with_workdirs(tmp.path(), AuthMode::Disabled, vec![workdir_path.clone()]);
+    let state = make_app_state_with_workdirs(tmp.path(), vec![workdir_path.clone()]);
     let Some((addr, server)) = spawn_router(state).await else {
         eprintln!("SKIP: cannot bind 127.0.0.1");
         return;
@@ -1404,7 +1393,7 @@ fn update_setup_status_round_trips() {
 #[tokio::test]
 async fn real_network_job_logs_404_for_unknown_job() {
     let tmp = tempfile::tempdir().unwrap();
-    let state = make_app_state(tmp.path(), AuthMode::Disabled);
+    let state = make_app_state(tmp.path());
     let Some((addr, server)) = spawn_router(state).await else {
         eprintln!("SKIP: cannot bind 127.0.0.1");
         return;

@@ -36,7 +36,7 @@ The same engine runs in several modes; pick whichever fits the task:
 - **TUI** (`awman`) — interactive multiplexer: tabs, live agent terminals, a command box with autocomplete. See [Using the TUI](02-using-the-tui.md).
 - **One-shot CLI** (`awman chat`, `awman exec prompt`, `awman exec workflow`) — single commands from your shell. See [Agent Sessions](03-agent-sessions.md).
 - **Headless** — non-interactive output for scripts and CI; awman detects the missing TTY or you force it with `-n`. See [Non-interactive operation](09-api-and-remote-mode.md#non-interactive-headless-operation).
-- **API** (`awman api start`) — an HTTP server that queues and executes prompts and workflows. See [API mode](09-api-and-remote-mode.md).
+- **Worker API** — the daemon's worker feature accepts sessions and commands over HTTP. See [API and remote mode](09-api-and-remote-mode.md) and [The daemon](16-daemon.md).
 - **Remote** (`awman remote …`) — a thin client for an awman API server on another machine. See [Remote mode](09-api-and-remote-mode.md).
 
 Permission levels apply across modes: default (agent asks), `--plan` (read-only), `--auto` (auto-approve edits), `--yolo` (fully autonomous, isolated in a Git worktree). See [Permission modes](03-agent-sessions.md#permission-modes).
@@ -90,13 +90,13 @@ Two JSON files: `<git root>/.awman/config.json` (per-repo, committed) and `~/.aw
 | `awman agents kill` (`rm`) / `attach` | Stop and remove an agent, or connect to its terminal | [03](03-agent-sessions.md) |
 | `awman config show\|get\|set\|unset` | Inspect and edit config; `--set key=value` overrides any key for one command | [07](07-configuration.md) |
 | `awman daemon api` | Call the daemon API by action name (`grants.list`, `jobs.cancel`, …) | [09](09-api-and-remote-mode.md#awman-daemon-api) |
-| `awman api start\|status\|logs\|kill` | HTTP API server | [09](09-api-and-remote-mode.md) |
+| `awman daemon start\|stop\|status\|logs\|api` | Shared daemon and local API client | [16](16-daemon.md) |
 | `awman remote …` | Client for a remote awman server | [09](09-api-and-remote-mode.md) |
 | `awman squad …` | Your squad of agents, working unattended on the tasks you give them | [12](12-squad.md) |
 | `awman clean` | Reclaim stopped containers, stale workflow data, dangling images | [13](13-cleaning-up.md) |
 
 `awman agents status` and `awman agents list` show each agent's source:
-`session` for agents started directly and `squad:<task>` for agents your squad started,
+`session` for agents started directly and `squad:<task>` for agents launched by your squad,
 such as `squad:issue-triage`. This makes background
 evaluations identifiable even if you have never configured squad.
 

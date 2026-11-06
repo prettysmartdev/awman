@@ -12,11 +12,11 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use crate::command::commands::agents::{AgentsCommand, AgentsCommandFrontend};
-use crate::command::commands::api_server::{ApiServerCommand, ApiServerCommandFrontend};
 use crate::command::commands::chat::{ChatCommand, ChatCommandFrontend};
 use crate::command::commands::clean::{CleanCommand, CleanCommandFrontend};
 use crate::command::commands::config::{ConfigCommand, ConfigCommandFrontend};
 use crate::command::commands::daemon::api::{DaemonApiCommand, DaemonApiCommandFrontend};
+use crate::command::commands::daemon::lifecycle::{DaemonCommand, DaemonCommandFrontend};
 use crate::command::commands::exec_prompt::{ExecPromptCommand, ExecPromptCommandFrontend};
 use crate::command::commands::exec_workflow::{ExecWorkflowCommand, ExecWorkflowCommandFrontend};
 use crate::command::commands::init::{InitCommand, InitCommandFrontend};
@@ -28,7 +28,7 @@ use crate::command::commands::squad::attach::{SquadAttachCommand, SquadAttachFro
 use crate::command::commands::squad::commands::{SquadCommand, SquadCommandFrontend};
 use crate::command::commands::squad::gateway::TaskGateway;
 use crate::command::commands::squad::runtime_guard::require_container_tier;
-use crate::command::commands::squad::supervisor::SquadGatewayResolver;
+use crate::command::commands::squad::supervisor::DaemonResolver;
 use crate::command::commands::Command;
 use crate::command::dispatch::catalogue::{CommandCatalogue, FrontendKind, GatewayNeed};
 use crate::command::error::CommandError;
@@ -122,7 +122,7 @@ pub trait DispatchFrontend:
     + ConfigCommandFrontend
     + ExecPromptCommandFrontend
     + ExecWorkflowCommandFrontend
-    + ApiServerCommandFrontend
+    + DaemonCommandFrontend
     + DaemonApiCommandFrontend
     + SquadCommandFrontend
     + SquadAttachFrontend
@@ -143,7 +143,7 @@ impl<T> DispatchFrontend for T where
         + ConfigCommandFrontend
         + ExecPromptCommandFrontend
         + ExecWorkflowCommandFrontend
-        + ApiServerCommandFrontend
+        + DaemonCommandFrontend
         + DaemonApiCommandFrontend
         + SquadCommandFrontend
         + SquadAttachFrontend
@@ -169,7 +169,7 @@ pub enum BuiltCommand {
     Config(ConfigCommand),
     ExecPrompt(ExecPromptCommand),
     ExecWorkflow(ExecWorkflowCommand),
-    ApiServer(ApiServerCommand),
+    Daemon(DaemonCommand),
     DaemonApi(DaemonApiCommand),
     Squad(SquadCommand),
     SquadAttach(SquadAttachCommand),
@@ -541,20 +541,9 @@ impl<F: DispatchFrontend> Dispatch<F> {
         if spec.gateway_need == GatewayNeed::None || self.squad_gateway.is_some() {
             return Ok(());
         }
-        // The live process environment, not the session's startup snapshot: a
-        // key minted earlier in this process is published into the former (see
-        // `SquadSupervisor`), and the snapshot predates it.
-        let resolver =
-            SquadGatewayResolver::from_env(&crate::data::config::env::Env::from_process())?;
-        let gateway = resolver.gateway_for(spec.gateway_need).await?;
-        // The only moment the plaintext key exists outside the daemon's hash
-        // file. A frontend that cannot show it drops it (see the trait's
-        // default), which is why this is offered before the command runs
-        // rather than folded into its output.
-        if let Some(setup) = resolver.take_key_setup() {
-            self.frontend.show_key_setup(&setup);
-        }
-        self.squad_gateway = gateway;
+        let env = self.session.read().await.env().clone();
+        let resolver = DaemonResolver::from_env(&env)?;
+        self.squad_gateway = resolver.gateway_for(spec.gateway_need).await?;
         Ok(())
     }
 
@@ -721,7 +710,7 @@ impl BuiltCommand {
             Agents => AgentsCommandFrontend,
             Config => ConfigCommandFrontend,
             ExecPrompt => ExecPromptCommandFrontend,
-            ApiServer => ApiServerCommandFrontend,
+            Daemon => DaemonCommandFrontend,
             DaemonApi => DaemonApiCommandFrontend,
             Squad => SquadCommandFrontend,
             SquadAttach => SquadAttachFrontend,
@@ -971,107 +960,6 @@ mod tests {
         Arc::new(RwLock::new(Session::for_tests(tmp.path())))
     }
 
-    #[tokio::test]
-    async fn each_command_reloads_global_and_repo_config() {
-        use crate::command::commands::config::ConfigOutcome;
-        use crate::data::config::env::EnvSnapshot;
-        use crate::data::config::overrides::ConfigOverrides;
-        use crate::data::fs::data_paths::AWMAN_HOME;
-        use crate::data::session::SessionOpenOptions;
-
-        let repo = tempfile::tempdir().unwrap();
-        let home = tempfile::tempdir().unwrap();
-        let repo_config = repo.path().join(".awman/config.json");
-        std::fs::create_dir_all(repo_config.parent().unwrap()).unwrap();
-        let global_config = home.path().join("config.json");
-        std::fs::write(
-            &global_config,
-            r#"{"agents":{"default":"codex"},"tui":{"scrollbackLines":1000}}"#,
-        )
-        .unwrap();
-        std::fs::write(&repo_config, r#"{"tui":{"scrollbackLines":2000}}"#).unwrap();
-
-        let env = EnvSnapshot::with_overrides([(AWMAN_HOME, home.path().to_str().unwrap())]);
-        let overrides =
-            ConfigOverrides::parse_set_args(&["workflows.maxConcurrentSteps=3".to_string()])
-                .unwrap();
-        let session = Arc::new(RwLock::new(
-            Session::open_at_git_root(
-                repo.path().to_path_buf(),
-                repo.path().to_path_buf(),
-                SessionOpenOptions {
-                    env: Some(env),
-                    overrides,
-                    ..Default::default()
-                },
-            )
-            .unwrap(),
-        ));
-
-        let engine_root = repo.path().to_path_buf();
-        let frontend = || {
-            let matches = CommandCatalogue::get()
-                .build_clap_command()
-                .try_get_matches_from(["awman", "config", "get", "tui.scrollbackLines"])
-                .unwrap();
-            crate::frontend::cli::CliFrontend::new(matches)
-        };
-        let get = |session: Arc<RwLock<Session>>| {
-            let engine_root = engine_root.clone();
-            async move {
-                let result = Dispatch::new(frontend(), session, Engines::for_tests(&engine_root))
-                    .run_command(&["config", "get"])
-                    .await
-                    .unwrap();
-                let CommandOutcome::Config(ConfigOutcome::Get(value)) = result else {
-                    panic!("expected config get outcome");
-                };
-                value
-            }
-        };
-
-        let first = get(session.clone()).await;
-        assert_eq!(first.global_value.as_deref(), Some("1000"));
-        assert_eq!(first.repo_value.as_deref(), Some("2000"));
-        assert_eq!(first.effective_value.as_deref(), Some("2000"));
-
-        std::fs::write(
-            &global_config,
-            r#"{"agents":{"default":"gemini"},"tui":{"scrollbackLines":3000}}"#,
-        )
-        .unwrap();
-        std::fs::write(&repo_config, r#"{"tui":{"scrollbackLines":4000}}"#).unwrap();
-        let preview = Dispatch::new(frontend(), session.clone(), Engines::for_tests(repo.path()))
-            .launch_display(&["config", "get"]);
-        assert_eq!(preview.agent_display_name, "gemini");
-        let second = get(session.clone()).await;
-        assert_eq!(second.global_value.as_deref(), Some("3000"));
-        assert_eq!(second.repo_value.as_deref(), Some("4000"));
-        assert_eq!(second.effective_value.as_deref(), Some("4000"));
-        {
-            let current = session.read().await;
-            assert_eq!(current.default_agent().unwrap().as_str(), "gemini");
-            assert_eq!(
-                current.effective_config().value()["workflows"]["maxConcurrentSteps"],
-                3
-            );
-        }
-
-        std::fs::write(&repo_config, "{ invalid json }").unwrap();
-        let error = Dispatch::new(frontend(), session.clone(), Engines::for_tests(repo.path()))
-            .run_command(&["config", "get"])
-            .await
-            .unwrap_err();
-        assert!(matches!(
-            error,
-            CommandError::Data(crate::data::error::DataError::ConfigParse { .. })
-        ));
-        assert_eq!(
-            session.read().await.effective_config().value()["tui"]["scrollbackLines"],
-            4000
-        );
-    }
-
     /// Who the caller is comes from the frontend's declared kind, once, at
     /// construction — not from a per-frontend `is_local_user_session`
     /// override (F-49).
@@ -1083,7 +971,7 @@ mod tests {
         for (kind, local) in [
             (FrontendKind::Cli, true),
             (FrontendKind::Tui, true),
-            (FrontendKind::Api, false),
+            (FrontendKind::WORKER_LOCAL, false),
         ] {
             let caller = CallerContext::new(&["squad", "add"], kind);
             assert_eq!(caller.frontend(), kind);
@@ -1176,7 +1064,7 @@ mod tests {
         match built {
             BuiltCommand::Squad(command) => assert!(matches!(
                 command.subcommand(),
-                crate::command::commands::squad::commands::SquadSubcommand::Status(_)
+                crate::command::commands::squad::commands::SquadSubcommand::Status
             )),
             _ => panic!("expected Squad"),
         }
@@ -1354,14 +1242,22 @@ mod tests {
     }
 
     #[test]
-    fn build_api_start() {
+    fn build_daemon_verbs() {
         let dispatch = Dispatch::new(
             FakeCommandFrontend::new(),
             make_session(),
             Engines::for_tests(std::path::Path::new("/tmp")),
         );
-        let built = dispatch.build_command(&["api", "start"]).unwrap();
-        assert!(matches!(built, BuiltCommand::ApiServer(_)));
+        for verb in ["start", "stop", "status", "logs"] {
+            let built = dispatch.build_command(&["daemon", verb]).unwrap();
+            assert!(matches!(built, BuiltCommand::Daemon(_)), "{verb}");
+        }
+        assert!(matches!(
+            dispatch.build_command(&["daemon", "api"]),
+            Err(_) | Ok(BuiltCommand::DaemonApi(_))
+        ));
+        assert!(dispatch.build_command(&["api", "start"]).is_err());
+        assert!(dispatch.build_command(&["squad", "start"]).is_err());
     }
 
     #[test]

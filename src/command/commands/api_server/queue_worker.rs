@@ -518,7 +518,7 @@ pub(super) fn finalize_unowned_command(
 /// rows were finalized. Every other row is still processed, but any error is
 /// returned afterwards and refuses startup: the requeue that follows would run a
 /// command that may already have finished a second time.
-pub(super) fn finalize_completed_from_sidecars(
+pub(crate) fn finalize_completed_from_sidecars(
     store: &SqliteSessionStore,
     paths: &ApiPaths,
 ) -> Result<usize, crate::data::error::DataError> {
@@ -631,6 +631,7 @@ pub trait ApiCommandFrontendFactory: Send + Sync {
 }
 
 pub struct QueueWorker<F: ApiCommandFrontendFactory> {
+    executor: Option<Arc<crate::engine::daemon::executor::SharedExecutor>>,
     worker_id: String,
     store: Arc<SqliteSessionStore>,
     engines: Engines,
@@ -720,6 +721,7 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
 
     pub fn new(worker_id: String, deps: QueueWorkerDeps<F>) -> Self {
         Self {
+            executor: None,
             worker_id,
             store: deps.store,
             engines: deps.engines,
@@ -733,12 +735,30 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
         }
     }
 
+    pub fn with_executor(
+        mut self,
+        executor: Arc<crate::engine::daemon::executor::SharedExecutor>,
+    ) -> Self {
+        self.executor = Some(executor);
+        self
+    }
+
     pub async fn run(self) {
         self.run_until(tokio_util::sync::CancellationToken::new())
             .await
     }
     pub async fn run_until(self, stop: tokio_util::sync::CancellationToken) {
         loop {
+            if stop.is_cancelled() {
+                return;
+            }
+            let permit = if let Some(executor) = &self.executor {
+                Some(
+                    tokio::select! { biased; _=stop.cancelled()=>return, permit=executor.acquire(crate::data::daemon_state::FeatureName::Worker)=>permit },
+                )
+            } else {
+                None
+            };
             if stop.is_cancelled() {
                 return;
             }
@@ -755,6 +775,8 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
                         command_id = %cmd.id,
                         session_id = %cmd.session_id,
                         subcommand = %cmd.subcommand,
+                        trace_parent = ?cmd.trace_parent,
+                        listener = %cmd.listener,
                         "Worker claimed command"
                     );
                     let command_id = cmd.id.clone();
@@ -762,9 +784,11 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
                     self.cancels.unregister(&command_id);
                 }
                 Ok(None) => {
+                    drop(permit);
                     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                 }
                 Err(e) => {
+                    drop(permit);
                     tracing::error!(
                         worker_id = %self.worker_id,
                         error = %e,
@@ -866,6 +890,8 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
                 "attempt": cmd.attempt,
                 "started_at": cmd.started_at,
                 "worker_id": self.worker_id,
+                "listener":cmd.listener,
+                "trace_parent":cmd.trace_parent,
             });
             self.write_metadata(&session_id, &command_id, &metadata);
         }
@@ -1866,8 +1892,8 @@ mod sidecar_tests {
     use crate::command::commands::api_server::cancel::{
         CancelOutcome, CommandCanceller, TokenRegistry,
     };
-    use crate::command::commands::api_server::runtime::ApiServerRuntime;
-    use crate::command::commands::api_server::ApiServeConfig;
+    use crate::command::commands::api_server::runtime::WorkerServices;
+    use crate::command::commands::api_server::WorkerConfig;
     use crate::command::error::CommandError;
     use crate::data::config::env::EnvSnapshot;
     use crate::data::execution_event::ExecutionEvent;
@@ -2028,20 +2054,18 @@ mod sidecar_tests {
         }
 
         /// A real daemon restart, through the same bootstrap `serve` runs.
-        fn restart(&self) -> Result<ApiServerRuntime, CommandError> {
+        fn restart(&self) -> Result<WorkerServices, CommandError> {
             let mut engines = Engines::for_tests(self.tmp.path());
             engines.auth_engine = Arc::new(crate::engine::auth::AuthEngine::with_paths(
                 crate::data::fs::auth_paths::AuthPathResolver::at_home(self.tmp.path()),
                 self.paths.clone(),
             ));
-            ApiServerRuntime::bootstrap(
-                ApiServeConfig {
+            WorkerServices::bootstrap(
+                WorkerConfig {
                     port: 0,
                     bind_ip: std::net::IpAddr::from([127, 0, 0, 1]),
                     workdirs: vec![],
                     workdir_roots: vec![],
-                    dangerously_skip_auth: true,
-                    tls_material: None,
                     env: crate::data::config::env::EnvSnapshot::empty(),
                 },
                 engines,

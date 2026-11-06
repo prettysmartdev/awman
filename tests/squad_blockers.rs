@@ -465,45 +465,6 @@ async fn remove_a_crafted_name_cannot_escape_the_tasks_root() {
     assert!(escape.exists(), "the escape target must never be deleted");
 }
 
-// ─── BLOCKER-5: `squad logs` (no follow) dumps the existing log locally ──────
-
-#[tokio::test]
-async fn logs_without_follow_emits_the_existing_lines() {
-    let tmp = tempfile::tempdir().unwrap();
-    let _guard = ENV_LOCK.lock().await;
-    let previous = std::env::var(AWMAN_HOME).ok();
-    std::env::set_var(AWMAN_HOME, tmp.path());
-
-    let log_path = SquadPaths::from_root(tmp.path().join("squad"))
-        .daemon()
-        .log_file();
-    std::fs::create_dir_all(log_path.parent().unwrap()).unwrap();
-    std::fs::write(&log_path, "line one\nline two\n").unwrap();
-
-    let messages = Arc::new(Mutex::new(Vec::new()));
-    let mut frontend = ScriptedFrontend::with_delete(false);
-    frontend.messages = messages.clone();
-
-    let command = SquadCommand::new(
-        SquadSubcommand::Logs(awman::command::commands::squad::daemon::SquadLogsFlags {
-            follow: false,
-        }),
-        None,
-        docker_engines(tmp.path()),
-    );
-    command
-        .run_with_frontend(Box::new(frontend))
-        .await
-        .expect("logs must succeed");
-
-    restore(AWMAN_HOME, previous);
-    let captured = messages.lock().unwrap();
-    assert!(
-        captured.iter().any(|m| m == "line one") && captured.iter().any(|m| m == "line two"),
-        "logs must emit every existing line: {captured:?}"
-    );
-}
-
 // ─── Edge-case #1: CLI CRUD, status and bare all refuse under a sandbox ─────
 
 #[tokio::test]
@@ -519,7 +480,7 @@ async fn cli_squad_entry_points_fail_fast_under_a_sandbox_runtime() {
 
     for raw in [
         vec!["awman", "squad", "list"],
-        vec!["awman", "squad", "status"],
+        vec!["awman", "squad"],
         vec!["awman", "squad", "add", "--name", "x", "--description", "y"],
         vec!["awman", "squad", "-n"],
     ] {

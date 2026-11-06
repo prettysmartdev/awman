@@ -112,13 +112,14 @@ pub const TIPS: &[&str] = &[
     "`awman squad trigger <task>` evaluates a task now, ignoring its schedule.",
     "`awman squad attach <task>` attaches to the agent running a squad task.",
     "`awman squad pause <task>` and `awman squad resume <task>` toggle a task's schedule.",
-    "`awman squad env --push` re-sends env() values to the squad daemon after rotating a token.",
-    "`awman squad logs -f` follows the squad daemon log.",
+    "`awman squad env --push` re-sends env() values to the daemon after rotating a token.",
+    "`awman daemon logs -f` follows the awman daemon log.",
     // ── API and remote ───────────────────────────────────────────────────────
-    "`awman api start --background` runs the awman HTTP API as a background service.",
-    "`awman api status` and `awman api logs` check on the background API server.",
+    "`awman daemon start --background` runs the awman daemon as a background service.",
+    "`awman daemon status` shows the daemon's features, listeners and running jobs.",
+    "`awman config set daemon.features.worker.enabled true` turns on the worker API live.",
     "`awman remote exec workflow <file> --follow` runs a workflow on a remote awman host.",
-    "Set `remote.defaultAddr` in global config so `awman remote` commands need no `--remote-addr`.",
+    "Set `remote.default` so `awman remote` commands need no `--remote <target>`.",
     "`daemon.features.worker.push.workDirs.roots` lets API sessions use any repo cloned under one.",
 ];
 

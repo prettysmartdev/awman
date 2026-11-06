@@ -1,4 +1,9 @@
 pub const CAPABILITIES: &[&str] = &[
+    "daemon_features",
+    "network_listener",
+    "api_keys",
+    "health",
+    "trace_propagation",
     "error_codes",
     "workflow_state",
     "command_cancel",

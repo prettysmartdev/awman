@@ -4,7 +4,6 @@ use crate::data::fs::daemon_env::{EnvPersistence, EnvVarState};
 use chrono::{DateTime, Utc};
 
 use crate::command::commands::squad::commands::{EnvReport, SquadOutcome};
-use crate::command::commands::squad::supervisor::SquadKeySetup;
 use crate::data::fs::task_store::Task;
 
 use crate::frontend::render_helpers::format_table;
@@ -167,7 +166,9 @@ pub(crate) fn render_squad(outcome: &SquadOutcome, json: bool) -> Option<String>
         SquadOutcome::Ok => None,
         SquadOutcome::Status(status) => {
             if !status.running {
-                return Some("squad daemon is not running.".into());
+                return Some(
+                    "the awman daemon is not running (start it with `awman daemon start`).".into(),
+                );
             }
             let pid = status
                 .pid
@@ -201,29 +202,11 @@ pub(crate) fn render_squad(outcome: &SquadOutcome, json: bool) -> Option<String>
                 .map(|error| format!("; config reload failed: {error}"))
                 .unwrap_or_default();
             Some(format!(
-                "squad daemon running (PID {pid}) at {address}; {} tasks ({} active); last tick {last_tick}{unmet}{persistence}{config}",
+                "squad on the awman daemon (PID {pid}) at {address}; {} tasks ({} active); last tick {last_tick}{unmet}{persistence}{config}",
                 status.task_count, status.active_count
             ))
         }
         SquadOutcome::Env(report) => Some(render_env_report(report)),
-        SquadOutcome::Logs { log_path } => Some(format!("Tailing squad logs at {log_path}")),
-        // `--refresh-key` returns before anything is started, so saying
-        // "started" here would contradict the key snippet just printed.
-        SquadOutcome::Started {
-            refreshed_key: true,
-            ..
-        } => Some("squad API key regenerated. Start the daemon with `awman squad start`.".into()),
-        SquadOutcome::Started {
-            port, background, ..
-        } => Some(if *background {
-            format!("squad daemon started in the background on port {port}.")
-        } else {
-            format!("squad daemon started on port {port}.")
-        }),
-        SquadOutcome::Stopped { stopped_pid } => Some(match stopped_pid {
-            Some(pid) => format!("squad daemon (PID {pid}) stopped."),
-            None => "squad daemon is not running.".into(),
-        }),
     }
 }
 
@@ -567,7 +550,7 @@ mod tests {
         down.running = false;
         assert_eq!(
             text(&SquadOutcome::Status(down)),
-            "squad daemon is not running."
+            "the awman daemon is not running (start it with `awman daemon start`)."
         );
     }
 
@@ -892,114 +875,6 @@ mod tests {
             parsed["items"][0]["unmet_env"],
             serde_json::json!(["ANTHROPIC_KEY"])
         );
-    }
-}
-
-/// Draw the one-time squad key disclosure for a terminal.
-///
-/// Moved here from `src/engine/squad/key_setup.rs` by WI 0114 F-56: the box,
-/// the paragraphs and the indenting are presentation, and an engine that
-/// composed them handed every frontend terminal art it could not restyle —
-/// the TUI draws its own frames, and the API serialised the `═` runs into
-/// JSON. Layer 1 now supplies the key, the shell and the export line; this
-/// function is the CLI's way of saying them.
-pub(crate) fn render_key_setup(setup: &SquadKeySetup) -> String {
-    let mut out = String::new();
-    out.push_str(&render_banner(&setup.key));
-    out.push_str("\n\n");
-    out.push_str(&format!(
-        "Add this to {} so the awman CLI and TUI can authenticate to squad:\n\n    {}\n\n",
-        setup.rc_file(),
-        setup.export_line
-    ));
-    out.push_str(
-        "Until you do, export it in the current shell — `awman squad` commands\n\
-         without the key are refused by the daemon with 401 Unauthorized.\n\n",
-    );
-    out.push_str(
-        "Prefer to run without a key? Stop the daemon and start it with\n    \
-         awman squad start --dangerously-skip-auth\n\
-         which mints no key and accepts unauthenticated requests. squad binds to\n\
-         loopback (127.0.0.1) only, so nothing off this machine can reach it.",
-    );
-    out
-}
-
-/// The key on its own, boxed, matching the API server's first-run banner style.
-fn render_banner(key: &str) -> String {
-    let title = "squad API key (store this — it will not be shown again)";
-    // Width follows the longer of title and key so a key of any length fits.
-    let inner = title.chars().count().max(key.chars().count()) + 4;
-    let bar = "═".repeat(inner);
-    let pad = |text: &str| {
-        let used = text.chars().count() + 2;
-        format!("  {text}{}", " ".repeat(inner.saturating_sub(used)))
-    };
-    format!("╔{bar}╗\n║{}║\n║{}║\n╚{bar}╝", pad(title), pad(key))
-}
-
-#[cfg(test)]
-mod key_setup_tests {
-    use super::*;
-    use crate::engine::squad::key_setup::ShellFlavor;
-
-    fn rendered(key: &str, shell: ShellFlavor) -> String {
-        render_key_setup(&SquadKeySetup::for_key(key, shell))
-    }
-
-    #[test]
-    fn snippet_exports_the_documented_env_var_with_the_key() {
-        let out = rendered("deadbeef", ShellFlavor::Zsh);
-        assert!(
-            out.contains("export AWMAN_SQUAD_KEY=deadbeef"),
-            "snippet must be copy-pasteable; got:\n{out}"
-        );
-        assert!(
-            out.contains("~/.zshrc"),
-            "zsh users get ~/.zshrc; got:\n{out}"
-        );
-    }
-
-    #[test]
-    fn fish_gets_set_gx_rather_than_export() {
-        let out = rendered("deadbeef", ShellFlavor::Fish);
-        assert!(
-            out.contains("set -gx AWMAN_SQUAD_KEY deadbeef"),
-            "fish has no `export`; got:\n{out}"
-        );
-        assert!(!out.contains("export AWMAN_SQUAD_KEY"), "got:\n{out}");
-        assert!(out.contains("config.fish"), "got:\n{out}");
-    }
-
-    #[test]
-    fn unknown_shell_still_yields_a_posix_export() {
-        let out = rendered("deadbeef", ShellFlavor::Unknown);
-        assert!(
-            out.contains("export AWMAN_SQUAD_KEY=deadbeef"),
-            "got:\n{out}"
-        );
-    }
-
-    #[test]
-    fn snippet_names_the_skip_auth_alternative() {
-        let out = rendered("deadbeef", ShellFlavor::Zsh);
-        assert!(
-            out.contains("--dangerously-skip-auth"),
-            "the no-auth escape hatch must be discoverable here; got:\n{out}"
-        );
-    }
-
-    #[test]
-    fn banner_boxes_a_key_longer_than_the_title() {
-        let key = "a".repeat(120);
-        let out = rendered(&key, ShellFlavor::Zsh);
-        assert!(out.contains(&key), "banner must not truncate the key");
-        // Every box line is the same display width as the top border.
-        let lines: Vec<&str> = out.lines().take(4).collect();
-        let width = lines[0].chars().count();
-        for line in &lines[1..4] {
-            assert_eq!(line.chars().count(), width, "misaligned box line: {line}");
-        }
     }
 }
 

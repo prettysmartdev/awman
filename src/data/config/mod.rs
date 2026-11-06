@@ -18,6 +18,7 @@ pub mod flags;
 pub mod image_source;
 pub mod integrations;
 pub mod leader_spec;
+pub mod network;
 pub mod overlays;
 pub mod overrides;
 pub mod remote;

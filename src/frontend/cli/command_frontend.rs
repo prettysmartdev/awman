@@ -82,34 +82,6 @@ pub struct CliFrontend {
 
 #[async_trait::async_trait]
 impl crate::command::commands::squad::commands::SquadCommandFrontend for CliFrontend {
-    /// The daemon host: the unattended frontends its evaluator drives agents
-    /// and workflows with. Answers, not decisions — the policy behind them is
-    /// Layer 2's.
-    fn squad_run_frontends(
-        &self,
-    ) -> Option<std::sync::Arc<dyn crate::command::commands::squad::evaluation::SquadRunFrontends>>
-    {
-        Some(crate::frontend::squad::unattended::UnattendedFrontends::shared())
-    }
-
-    async fn serve_squad_daemon(
-        &mut self,
-        handles: crate::command::commands::squad::daemon_runtime::SquadDaemonHandles,
-    ) -> Result<(), CommandError> {
-        crate::frontend::squad::serve(handles).await
-    }
-
-    /// stdout belongs to `--json` consumers, so the key banner goes to stderr
-    /// — the same place it has always been printed. The drawing is this
-    /// frontend's (WI 0114 F-56); Layer 2 supplies only the key, the shell
-    /// and the export line.
-    fn show_key_setup(
-        &mut self,
-        setup: &crate::command::commands::squad::supervisor::SquadKeySetup,
-    ) {
-        eprintln!("{}", super::per_command::squad::render_key_setup(setup));
-    }
-
     fn ask_task_name(&mut self) -> Result<String, CommandError> {
         require_named_input("task name (slug)?")
     }
@@ -1228,42 +1200,6 @@ mod tests {
             .argument(&["exec", "workflow"], "workflow")
             .unwrap();
         assert_eq!(v, Some("wf.toml".to_string()));
-    }
-
-    // ─── flag_u16 ─────────────────────────────────────────────────────────────
-
-    #[test]
-    fn flag_u16_reads_port_flag() {
-        let cmd = CommandCatalogue::get().build_clap_command();
-        let m = cmd
-            .try_get_matches_from(["awman", "squad", "start", "--port", "1234"])
-            .unwrap();
-        let frontend = CliFrontend::new(m);
-        let v = frontend.flag_u16(&["squad", "start"], "port").unwrap();
-        assert_eq!(v, Some(1234u16));
-    }
-
-    #[test]
-    fn flag_u16_default_value_when_absent() {
-        let cmd = CommandCatalogue::get().build_clap_command();
-        let m = cmd
-            .try_get_matches_from(["awman", "squad", "start"])
-            .unwrap();
-        let frontend = CliFrontend::new(m);
-        // Default for `--port` on `squad start` is 0 (an OS-assigned port).
-        let v = frontend.flag_u16(&["squad", "start"], "port").unwrap();
-        assert_eq!(v, Some(0u16));
-    }
-
-    #[test]
-    fn flag_u16_wrong_path_returns_none() {
-        let cmd = CommandCatalogue::get().build_clap_command();
-        let m = cmd
-            .try_get_matches_from(["awman", "agents", "status"])
-            .unwrap();
-        let frontend = CliFrontend::new(m);
-        let v = frontend.flag_u16(&["api", "start"], "port").unwrap();
-        assert_eq!(v, None);
     }
 
     // ─── argument ─────────────────────────────────────────────────────────────

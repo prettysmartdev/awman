@@ -22,7 +22,7 @@ use awman::engine::container::ContainerRuntime;
 use awman::engine::git::GitEngine;
 use awman::engine::overlay::OverlayEngine;
 use awman::frontend::api::error::ApiError;
-use awman::frontend::api::routes::{build_router, AppState, AuthMode, API_FEATURES};
+use awman::frontend::api::routes::{build_router, AppState, API_FEATURES};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 
@@ -77,7 +77,6 @@ pub(super) fn state(root: &std::path::Path) -> Arc<AppState> {
         workdir_roots: vec![],
         started_at: Instant::now(),
         task_handles: tokio::sync::Mutex::new(Vec::new()),
-        auth_mode: AuthMode::Disabled,
         engines,
         sessions: Arc::new(awman::data::session_manager::SessionManager::in_memory(
             awman::data::config::env::EnvSnapshot::empty(),
@@ -117,10 +116,28 @@ async fn server(app: Arc<AppState>) -> String {
 async fn server_with_peer(app: Arc<AppState>, peer: SocketAddr) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let router = build_router(app).layer(axum::middleware::from_fn(move |mut req: axum::http::Request<axum::body::Body>, next: axum::middleware::Next| async move {
-        req.extensions_mut().insert(axum::extract::ConnectInfo(peer));
-        next.run(req).await
-    }));
+    let api = Arc::new(awman::command::daemon_api::DaemonApi::for_worker_tests(app));
+    let (_, key) = api
+        .runtime
+        .keys()
+        .create(&format!("peer-fixture-{}", addr.port()))
+        .unwrap();
+    let bearer: axum::http::HeaderValue = format!("Bearer {}", key.as_str()).parse().unwrap();
+    let router = awman::frontend::api::routes::build_router_for_listener(
+        api,
+        awman::frontend::api::routes::ListenerPolicy::Network,
+    )
+    .layer(axum::middleware::from_fn(
+        move |mut req: axum::http::Request<axum::body::Body>, next: axum::middleware::Next| {
+            let bearer = bearer.clone();
+            async move {
+                req.headers_mut().insert("authorization", bearer);
+                req.extensions_mut()
+                    .insert(axum::extract::ConnectInfo(peer));
+                next.run(req).await
+            }
+        },
+    ));
     tokio::spawn(async move {
         axum::serve(listener, router).await.unwrap();
     });
@@ -188,9 +205,12 @@ async fn every_route_error_has_code_and_authoritative_code_status_table_is_exerc
         ("worktree_exists", 409),
         ("merge_conflict", 409),
         ("merge_target_dirty", 409),
+        ("conflict", 409),
         ("workflow_prerequisites_unresolved", 409),
         ("unknown_agent", 404),
         ("agent_untrusted", 403),
+        ("feature_degraded", 503),
+        ("ephemeral_not_allowed", 403),
     ]
     .into_iter()
     .collect::<std::collections::HashSet<_>>();
@@ -607,7 +627,7 @@ async fn command_body_and_header_session_forms_and_idempotent_replays_work() {
                 "INSERT INTO idempotency_keys(scope,key,request_hash,status,body,created_at)
             VALUES (?1,?2,?3,202,?4,?5)",
                 rusqlite::params![
-                    "/v1/worker/commands|anonymous",
+                    "/v1/worker/commands|owner",
                     "pre-upgrade",
                     old_hash,
                     r#"{"command_id":"old-command"}"#,
@@ -832,11 +852,23 @@ async fn framework_and_admission_errors_have_codes_over_http() {
     assert_eq!(json["code"], "session_closing");
 
     let auth_tmp = tempfile::tempdir().unwrap();
-    let mut authenticated = state(auth_tmp.path());
-    Arc::get_mut(&mut authenticated).unwrap().auth_mode = AuthMode::Enabled {
-        key_hash: "unused-test-hash".into(),
-    };
-    let auth_base = server(authenticated).await;
+    let authenticated = state(auth_tmp.path());
+    let api = Arc::new(awman::command::daemon_api::DaemonApi::for_worker_tests(
+        authenticated,
+    ));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let auth_base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            awman::frontend::api::routes::build_router_for_listener(
+                api,
+                awman::frontend::api::routes::ListenerPolicy::Network,
+            ),
+        )
+        .await
+        .unwrap();
+    });
     let response = client
         .get(format!("{auth_base}/v1/status"))
         .send()

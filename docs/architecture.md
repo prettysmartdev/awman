@@ -134,7 +134,7 @@ Each frontend implements the per-command frontend traits and renders outcomes. N
 4. Run `Startup` to open the `Session` and build `Engines`, and package them in a `RuntimeContext`.
 5. Route: no subcommand opens the TUI; bare `awman squad` on a terminal opens the TUI on the squad tab; anything else runs in the CLI.
 
-The API server and squad daemon start from their commands (`api start`, `squad start`), not from `main.rs`.
+The shared daemon starts from `awman daemon start`; its worker, squad, and engine features run in that process.
 
 ---
 

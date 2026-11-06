@@ -464,19 +464,6 @@ fn coercion_errors_produce_typed_errors_and_clap_rejects() {
     use crate::command::error::CommandError;
     let cat = CommandCatalogue::get();
 
-    // Non-numeric value for a u16 flag → InvalidFlagValue; clap also rejects.
-    let err = cat
-        .parse_raw_args(&["squad", "start"], &to_vec(&["--port", "not-a-number"]))
-        .unwrap_err();
-    assert!(
-        matches!(err, CommandError::InvalidFlagValue { .. }),
-        "got {err:?}"
-    );
-    assert!(cat
-        .build_clap_command()
-        .try_get_matches_from(["awman", "squad", "start", "--port", "not-a-number"])
-        .is_err());
-
     // Bad enum value → InvalidFlagValue; clap also rejects.
     let err = cat
         .parse_raw_args(
@@ -521,7 +508,7 @@ fn api_profile_applies_defaults_cli_dispatch_unaffected() {
     let argv = to_vec(&["hello", "world"]);
 
     let api = cat
-        .parse_raw_args_with_profile(&path, &argv, FrontendKind::Api)
+        .parse_raw_args_with_profile(&path, &argv, FrontendKind::WORKER_LOCAL)
         .unwrap();
     assert_eq!(
         api.flag_bool("headless"),
@@ -565,7 +552,11 @@ fn api_profile_yolo_is_overridable_non_interactive_is_forced() {
     // suppressed because a conflicting flag is present, so yolo stays unset.
     // headless stays forced regardless.
     let with_plan = cat
-        .parse_raw_args_with_profile(&path, &to_vec(&["--plan", "hi"]), FrontendKind::Api)
+        .parse_raw_args_with_profile(
+            &path,
+            &to_vec(&["--plan", "hi"]),
+            FrontendKind::WORKER_LOCAL,
+        )
         .unwrap();
     assert_eq!(with_plan.flag_bool("plan"), Some(true));
     assert_eq!(with_plan.flag_bool("headless"), Some(true));
@@ -778,15 +769,6 @@ fn every_non_trivial_default_reaches_the_built_command() {
     }
     covered.push((vec!["init"], "agent"));
 
-    match build(&["squad", "start"]) {
-        BuiltCommand::Squad(cmd) => match cmd.subcommand() {
-            SquadSubcommand::Start(flags) => assert_eq!(flags.port, 0),
-            _ => panic!("expected squad start"),
-        },
-        _ => panic!("expected Squad"),
-    }
-    covered.push((vec!["squad", "start"], "port"));
-
     match build(&["squad", "add"]) {
         BuiltCommand::Squad(cmd) => match cmd.subcommand() {
             SquadSubcommand::Add(request) => {
@@ -867,7 +849,6 @@ fn every_catalogue_command_leaf_is_buildable_by_dispatch() {
         &["agents"],
         &["specs"],
         &["exec"],
-        &["api"],
         &["daemon"],
         &["remote"],
         &["remote", "exec"],

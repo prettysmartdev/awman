@@ -314,7 +314,7 @@ pub struct Run {
 
 /// SQLite-backed task store. The squad daemon is its only constructor.
 pub struct TaskStore {
-    conn: Mutex<Connection>,
+    conn: std::sync::Arc<Mutex<Connection>>,
 }
 
 impl TaskStore {
@@ -333,8 +333,11 @@ impl TaskStore {
         let conn = Connection::open(db_file)?;
         conn.execute_batch("PRAGMA journal_mode=WAL;")?;
         Ok(Self {
-            conn: Mutex::new(conn),
+            conn: std::sync::Arc::new(Mutex::new(conn)),
         })
+    }
+    pub(crate) fn from_connection(conn: std::sync::Arc<Mutex<Connection>>) -> Self {
+        Self { conn }
     }
 
     /// Create (idempotently) a task's durable workspace directory.

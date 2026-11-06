@@ -895,7 +895,7 @@ impl LocalTaskEvaluator {
         );
         if let Some(task_policy) = &task.prerequisites {
             let options = crate::command::commands::workflow_prerequisites::WorkflowPrerequisiteFlowOptions::for_session(
-                &session, crate::command::dispatch::catalogue::FrontendKind::Background, &Default::default(), None,
+                &session, crate::command::dispatch::catalogue::FrontendKind::SQUAD_LOCAL, &Default::default(), None,
                 crate::data::workflow_prerequisites::PrerequisiteOrigin::AssumedAll, None);
             crate::command::commands::workflow_prerequisites::check_task_widening(
                 task_policy,
@@ -912,7 +912,7 @@ impl LocalTaskEvaluator {
             self.engines.clone(),
             session,
         )
-        .with_frontend_kind(crate::command::dispatch::catalogue::FrontendKind::Background)
+        .with_frontend_kind(crate::command::dispatch::catalogue::FrontendKind::SQUAD_LOCAL)
         .with_squad_identity(squad_identity)
         // Every step container also gets the durable task workspace at the
         // stable `context(workflow)` path, so a task's persistent data is
@@ -1321,7 +1321,7 @@ fn with_prerequisite_summary(
     use crate::data::workflow_prerequisites::{PrerequisiteOrigin, WorkflowPrerequisites};
     let options = WorkflowPrerequisiteFlowOptions::for_session(
         session,
-        crate::command::dispatch::catalogue::FrontendKind::Background,
+        crate::command::dispatch::catalogue::FrontendKind::SQUAD_LOCAL,
         &Default::default(),
         task.prerequisites.as_ref(),
         PrerequisiteOrigin::AssumedAll,

@@ -42,7 +42,7 @@ use awman::engine::container::ContainerRuntime;
 use awman::engine::git::GitEngine;
 use awman::engine::overlay::OverlayEngine;
 use awman::frontend::api::command_frontend::ApiDispatchFrontend;
-use awman::frontend::api::routes::{AppState, AuthMode};
+use awman::frontend::api::routes::AppState;
 
 // ─── Test helpers ─────────────────────────────────────────────────────────────
 
@@ -102,7 +102,6 @@ fn make_app_state_with_workdirs(
         workdir_roots: Vec::new(),
         started_at: Instant::now(),
         task_handles: tokio::sync::Mutex::new(Vec::new()),
-        auth_mode: AuthMode::Disabled,
         engines,
         sessions: Arc::new(awman::data::session_manager::SessionManager::in_memory(
             awman::data::config::env::EnvSnapshot::empty(),
@@ -960,9 +959,9 @@ fn parse_args_forces_non_interactive_and_yolo() {
 //  Part 4 — session worktree selectors are CLI/TUI-only
 //
 //  `--branch`, `--pr` and `--worktree` choose a host path to mount, an
-//  authority only a local frontend holds. The HTTP admission step must refuse
-//  them before any session lookup or queueing, even though the API profile
-//  forces `--yolo`.
+//  authority only the CLI/TUI holds. Daemon admission must refuse them before
+//  any session lookup or queueing, even though the worker profile forces
+//  `--yolo`. `spawn_router` serves the daemon's worker/local profile.
 // ════════════════════════════════════════════════════════════════════════════
 
 const SESSION_WORKTREE_SELECTORS: [&str; 3] = ["--branch", "--pr", "--worktree"];
@@ -995,14 +994,18 @@ async fn real_network_session_worktree_selectors_are_refused_on_commands_route()
             .await
             .unwrap();
         assert_eq!(resp.status().as_u16(), 400, "{selector} must be refused");
-        let body = resp.text().await.unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["code"], "invalid_request", "{selector}: {body}");
         // TEXT-ASSERTION (relaxable).
         assert!(
-            body.contains("not available via the api frontend"),
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains("not available via the daemon:worker:local frontend"),
             "{selector}: {body}"
         );
         assert!(
-            !body.contains("command_id"),
+            body.get("command_id").is_none(),
             "{selector} was queued: {body}"
         );
     }
@@ -1042,10 +1045,14 @@ async fn real_network_session_worktree_selectors_are_refused_on_runs_route() {
             .await
             .unwrap();
         assert_eq!(resp.status().as_u16(), 400, "{selector} must be refused");
-        let body = resp.text().await.unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["code"], "invalid_request", "{selector}: {body}");
         // TEXT-ASSERTION (relaxable).
         assert!(
-            body.contains("not available via the api frontend"),
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains("not available via the daemon:worker:local frontend"),
             "{selector}: {body}"
         );
     }

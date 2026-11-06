@@ -28,7 +28,7 @@ use awman::engine::auth::AuthEngine;
 use awman::engine::container::ContainerRuntime;
 use awman::engine::git::GitEngine;
 use awman::engine::overlay::OverlayEngine;
-use awman::frontend::api::routes::{AppState, AuthMode};
+use awman::frontend::api::routes::AppState;
 
 // ─── Test helpers ─────────────────────────────────────────────────────────────
 
@@ -90,7 +90,6 @@ fn make_app_state(root: &std::path::Path) -> Arc<AppState> {
         workdir_roots: Vec::new(),
         started_at: Instant::now(),
         task_handles: tokio::sync::Mutex::new(Vec::new()),
-        auth_mode: AuthMode::Disabled,
         engines,
         sessions: Arc::new(awman::data::session_manager::SessionManager::in_memory(
             awman::data::config::env::EnvSnapshot::empty(),
@@ -911,16 +910,16 @@ fn server_restart_recovery_resets_stale_running_commands() {
 
 // ─── Worker count config test ─────────────────────────────────────────────────
 
-/// GlobalConfig::workers() defaults to 2 when not set.
+/// GlobalConfig::workers() defaults to 4 when not set.
 #[test]
-fn global_config_workers_defaults_to_two() {
+fn global_config_workers_defaults_to_four() {
     use awman::data::config::file::ConfigFile as GlobalConfig;
     let cfg = GlobalConfig::default();
     assert_eq!(
         awman::data::config::DaemonSettings::from_merged(&cfg.daemon.clone().unwrap_or_default())
             .max_concurrent_jobs,
-        2,
-        "default worker count must be 2"
+        4,
+        "default worker count must be 4"
     );
 }
 
@@ -1806,7 +1805,6 @@ async fn real_network_local_session_creation_succeeds() {
         workdir_roots: Vec::new(),
         started_at: Instant::now(),
         task_handles: tokio::sync::Mutex::new(Vec::new()),
-        auth_mode: AuthMode::Disabled,
         engines,
         sessions: Arc::new(awman::data::session_manager::SessionManager::in_memory(
             awman::data::config::env::EnvSnapshot::empty(),
