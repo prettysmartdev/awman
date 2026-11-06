@@ -1320,7 +1320,7 @@ You can always open the control board manually via **Ctrl+W** regardless of stuc
 
 ### Parallel step groups
 
-Steps that share the same dependencies form a **parallel group** and run concurrently, each in its own container, up to the [`maxConcurrentAgents`](07-configuration.md#reference) cap (unlimited by default).
+Steps that share the same dependencies form a **parallel group** and run concurrently, each in its own container, up to the [`maxConcurrentAgents`](07-configuration.md#reference) cap (unlimited by default). An interactive final yolo group starts all its members together for review.
 
 The overview shows a parallel group in one of two ways, toggled with **Ctrl-O**:
 
@@ -1394,8 +1394,9 @@ This lets you monitor all tabs' countdown state without leaving your current wor
 
 **When the countdown expires:**
 
-- If this is not the last step — awman kills the stuck step's container and advances to the next step in a new container
-- If this is the last step — the workflow transitions to complete
+- In an earlier stage, awman kills the stuck step's container and advances to the next ready step.
+- In an interactive final parallel group, each expired countdown leaves its agent running. Once every member is ready for review, the Workflow Control Board opens; finishing there stops the agents before teardown.
+- A sequential step that is last in topological order opens the Workflow Control Board when its agent exits; it does not start a yolo countdown.
 - In the TUI, the killed container's window closes immediately, leaving the [summary bar](02-using-the-tui.md#when-the-container-exits) behind — the window only closes on actual container death, never while the container is merely stuck or while the countdown is still running
 
 In the background this happens without you switching to the tab; the tab returns to its normal colour and label as soon as it moves on to the next step.
@@ -1526,7 +1527,7 @@ This is entirely driven by your workflow file's `depends_on` graph — you don't
 
 ### Configuring `maxConcurrentAgents`
 
-`maxConcurrentAgents` caps how many containers can run at once, machine-wide or per-repo. It's a plain [config field](07-configuration.md#reference), so it follows the same precedence as everything else:
+`maxConcurrentAgents` caps how many containers can run at once, machine-wide or per-repo, except in an interactive final yolo group where all remaining agents run together for review. It's a plain [config field](07-configuration.md#reference), so it follows the same precedence as everything else:
 
 ```
 --max-concurrent  >  AWMAN_MAX_CONCURRENT_AGENTS  >  repo config  >  global config  >  unlimited
@@ -1542,7 +1543,7 @@ Left unset at every level, there is **no cap** — every step whose dependencies
 
 A `maxConcurrentAgents` of `1` disables parallelism entirely: steps run one at a time, in the same order they would without any concurrency at all. `0` is rejected — if you want to pause parallelism, unset the field or set it to `1`.
 
-> `workflows.dynamic.maxConcurrentSteps` is a different, unrelated setting: it's an advisory hint passed to the leader agent that *designs* a `--dynamic` workflow. `maxConcurrentAgents` is what the engine actually enforces at run time, for any workflow, dynamic or not.
+> `workflows.dynamic.maxConcurrentSteps` is a different, unrelated setting: it's an advisory hint passed to the leader agent that *designs* a `--dynamic` workflow. `maxConcurrentAgents` is the run-time cap for workflows, subject to the interactive final yolo review exception above.
 
 ---
 
@@ -1563,7 +1564,7 @@ If a workflow resumes from a saved state mid-group, any steps that were interrup
 Every running container is tracked independently — one noisy or slow agent never masks or delays detection on its siblings.
 
 - **Stuck detection (yolo off):** if a container produces no output for 30 seconds, that container alone is marked stuck. Its siblings keep running unaffected. The stuck container's slot stays occupied — no new step launches into it — until you switch to it and send Ctrl-C to kill it, at which point its slot frees up like any other completion.
-- **Yolo mode:** each container gets its own independent 60-second auto-advance countdown. When one container's countdown expires, only that container is killed and its step marked advanced; the rest of the group is untouched, and the next queued step (if any) starts into the freed slot. If the group has nothing left queued, the remaining containers simply keep running until they finish.
+- **Yolo mode:** each container gets its own independent 60-second countdown. In a non-final group, expiry kills that container, advances its step, and starts the next queued step if there is one. In an interactive final group, every agent stays alive after its countdown expires. The control board opens after all members have reached review readiness or exited naturally. An interactive final group starts all its members together even when `maxConcurrentAgents` is lower than the group size, so each remains available for review.
 
 **Where the countdown appears in the TUI:** a yoloing container that is *not* the focused one shows its countdown in its minimized status bar (`Yolo in Ns`, flashing purple/yellow — see [Using the TUI: Parallel containers](02-using-the-tui.md#parallel-containers)). If it's the focused container, the countdown instead opens the same modal dialog a single container shows. Pressing **Ctrl-S** to rotate focus away closes that modal — the countdown itself keeps running in the background regardless — and rotating back onto a container still counting down reopens the modal automatically.
 
@@ -1582,13 +1583,13 @@ Restart, cancel-to-previous and next act on the group as a whole, and the board 
 | Restart current step | Asks whether to restart the **whole group** or a **single agent**. Whole group: every running container is stopped and the entire group starts again from scratch, including agents that already finished. Single agent: pick any member of the group (running, finished, failed or still queued). That agent restarts in a fresh container while the others keep running. |
 | Cancel to previous step | Asks you to confirm cancelling the **entire group**. If you confirm, every running container in the group is stopped and the workflow goes back to the step or group the group depends on. That step and everything after it runs again. Not available for a group with nothing before it. |
 | Next | Asks you to confirm cancelling the **entire group**. If you confirm, every running container in the group is stopped, members that haven't finished are marked skipped, and the workflow moves on to the steps that come after the group. If nothing comes after it, the workflow finishes. |
-| Finish workflow | Disabled while any peer is still running: the workflow can't finish while part of it is still in flight. |
+| Finish workflow | Available after every member of the final yolo group reaches review readiness. Stops all live agents in that group before teardown. Otherwise disabled while peers are running. |
 | Pause | Always available — suspends the whole workflow, killing every active container in the group. |
 | Abort | Always available — same, but marks the workflow aborted rather than paused. |
 
 When an action is unavailable, the reason is shown alongside it rather than just being greyed out silently.
 
-Each parallel step gets its own control board when it completes or gets stuck; you're never blocked from acting on one step because another is still busy — you just can't finish the workflow until the whole group has drained.
+In a final yolo group, dismissing the review board leaves every agent running. Use Ctrl-S to switch among their containers, then Ctrl-W to reopen the board and finish. Earlier groups keep their usual per-step controls.
 
 **Retrying a failed step mid-group.** If a step in the group fails while its peers are still running, opening the control board (Ctrl-W) adds a red `(r)etry failed step <name>` line below the arrow options. Press **r** to relaunch that step immediately, alongside the peers that are still running. If more than one step has failed, the board offers the earliest failure first. Any failure you don't retry this way still gets its usual recovery board after the whole group finishes.
 

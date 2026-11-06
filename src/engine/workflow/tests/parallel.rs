@@ -45,6 +45,7 @@ struct ParallelTestFrontend {
     record: Arc<Mutex<ParallelRecord>>,
     /// Return value for every per-step parallel yolo tick.
     yolo_tick: YoloTickOutcome,
+    interactive: bool,
     /// Answers to the engine's follow-up questions, in order; `KeepRunning`
     /// once exhausted.
     group_answers: Mutex<VecDeque<ParallelGroupDecision>>,
@@ -63,10 +64,16 @@ impl ParallelTestFrontend {
                 engine_tx,
                 record: record.clone(),
                 yolo_tick,
+                interactive: false,
                 group_answers: Mutex::new(VecDeque::new()),
             },
             record,
         )
+    }
+
+    fn interactive(mut self) -> Self {
+        self.interactive = true;
+        self
     }
 }
 
@@ -76,6 +83,10 @@ impl crate::data::message::UserMessageSink for ParallelTestFrontend {
 }
 
 impl WorkflowFrontend for ParallelTestFrontend {
+    fn supports_interactive_recovery(&self) -> bool {
+        self.interactive
+    }
+
     fn show_workflow_control_board(
         &mut self,
         _state: &WorkflowState,
@@ -364,21 +375,27 @@ async fn parallel_group_yolo_expiry_launches_queued_step() {
             make_step("a", &[], None),
             make_step("b", &[], None),
             make_step("c", &[], None),
+            make_step("d", &["a", "b", "c"], None),
         ],
     );
 
     let (cancel_a, _c_a) = make_blocking_entry();
     let (cancel_b, completion_b) = make_blocking_entry();
     let (cancel_c, completion_c) = make_blocking_entry();
+    let (_cancel_d, completion_d) = make_blocking_entry();
     let factory = BlockingFactory::new([
         (cancel_a.clone(), _c_a),
         (cancel_b.clone(), completion_b.clone()),
         (cancel_c.clone(), completion_c.clone()),
+        (_cancel_d, completion_d.clone()),
     ]);
     let execution_count = factory.execution_count.clone();
     let engine_tx: Arc<Mutex<Option<_>>> = Arc::new(Mutex::new(None));
-    let (frontend, _record) =
-        ParallelTestFrontend::new([], engine_tx.clone(), YoloTickOutcome::AdvanceNow);
+    let (frontend, _record) = ParallelTestFrontend::new(
+        [NextAction::FinishWorkflow],
+        engine_tx.clone(),
+        YoloTickOutcome::AdvanceNow,
+    );
     let mut engine = build_parallel_engine(&session, workflow, factory, frontend);
     engine.set_yolo(true);
     let tx = {
@@ -412,66 +429,128 @@ async fn parallel_group_yolo_expiry_launches_queued_step() {
     // Complete the survivors.
     signal_completion(&completion_b, 0);
     signal_completion(&completion_c, 0);
+    wait_for_execution_count(&execution_count, 4).await;
+    signal_completion(&completion_d, 0);
     let result = engine_task.await.unwrap().unwrap();
     assert_eq!(result, WorkflowOutcome::Completed);
 }
 
-/// Yolo expiry with no queued step: the group drains — no new launch, the
-/// other slot continues, and the group finishes when it exits.
+/// Final-stage countdowns leave all containers alive. The first board may
+/// be dismissed, then Ctrl-W on another focused slot can finish the group.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn parallel_group_yolo_expiry_draining_no_new_launch() {
+async fn final_parallel_countdowns_review_then_finish_all_live_agents() {
     let tmp = tempfile::tempdir().unwrap();
-    let session = make_session_with_max_concurrent(&tmp, Some(2));
+    let session = make_session_with_max_concurrent(&tmp, Some(1));
     let workflow = make_workflow(
         Some("wf-yolo-drain"),
         Some("claude"),
-        vec![make_step("a", &[], None), make_step("b", &[], None)],
+        vec![
+            make_step("a", &[], None),
+            make_step("b", &[], None),
+            make_step("c", &[], None),
+        ],
     );
 
-    let (cancel_a, _c_a) = make_blocking_entry();
+    let (cancel_a, completion_a) = make_blocking_entry();
     let (cancel_b, completion_b) = make_blocking_entry();
+    let (cancel_c, completion_c) = make_blocking_entry();
     let factory = BlockingFactory::new([
-        (cancel_a.clone(), _c_a),
+        (cancel_a.clone(), completion_a.clone()),
         (cancel_b.clone(), completion_b.clone()),
+        (cancel_c.clone(), completion_c.clone()),
     ]);
+    let stopped = factory.stopped.clone();
     let execution_count = factory.execution_count.clone();
     let engine_tx: Arc<Mutex<Option<_>>> = Arc::new(Mutex::new(None));
-    let (frontend, _record) =
-        ParallelTestFrontend::new([], engine_tx.clone(), YoloTickOutcome::AdvanceNow);
-    let mut engine = build_parallel_engine(&session, workflow, factory, frontend);
+    let (frontend, record) = ParallelTestFrontend::new(
+        [NextAction::Dismiss, NextAction::FinishWorkflow],
+        engine_tx.clone(),
+        YoloTickOutcome::AdvanceNow,
+    );
+    let mut engine = build_parallel_engine(&session, workflow, factory, frontend.interactive());
     engine.set_yolo(true);
     let tx = engine_tx.lock().unwrap().clone().unwrap();
 
     let engine_task = tokio::spawn(async move { engine.run_to_completion().await });
 
-    wait_for_execution_count(&execution_count, 2).await;
+    // Final review launches the whole stage, including the member that would
+    // otherwise be queued by max_concurrent_agents = 1.
+    wait_for_execution_count(&execution_count, 3).await;
 
     tx.send(EngineRequest::StepStuck {
         step_name: "a".to_string(),
     })
     .unwrap();
-    wait_for_flag(&cancel_a, "yolo expiry to kill slot 'a'").await;
-    // Deliberate "nothing happens" window: a (wrong) replacement launch
-    // would follow the kill at once.
+    // The first expired final-stage countdown cannot kill its agent or
+    // present the board until every other agent is also review-ready.
     tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!cancel_a.load(Ordering::Relaxed));
+    assert!(record.lock().unwrap().available.is_empty());
+    tx.send(EngineRequest::StepStuck {
+        step_name: "b".to_string(),
+    })
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(record.lock().unwrap().available.is_empty());
+    tx.send(EngineRequest::StepStuck {
+        step_name: "c".to_string(),
+    })
+    .unwrap();
+    wait_until(&record, "final review board", |r| !r.available.is_empty()).await;
+    assert!(!cancel_a.load(Ordering::Relaxed));
+    assert!(!cancel_b.load(Ordering::Relaxed));
+    assert!(!cancel_c.load(Ordering::Relaxed));
+    assert_eq!(execution_count.load(Ordering::Relaxed), 3);
+    assert!(record.lock().unwrap().available[0].can_finish_workflow);
 
-    assert!(
-        cancel_a.load(Ordering::Relaxed),
-        "yolo expiry must kill slot 'a'"
-    );
-    assert_eq!(
-        execution_count.load(Ordering::Relaxed),
-        2,
-        "no queued step means nothing new launches (draining)"
-    );
-    assert!(
-        !cancel_b.load(Ordering::Relaxed),
-        "the surviving slot keeps running"
-    );
-
-    signal_completion(&completion_b, 0);
+    // After Dismiss, all slots remain live and the focused slot can change.
+    tx.send(EngineRequest::OpenControlBoard {
+        step_name: "b".to_string(),
+    })
+    .unwrap();
     let result = engine_task.await.unwrap().unwrap();
     assert_eq!(result, WorkflowOutcome::Completed);
+    let r = record.lock().unwrap();
+    assert_eq!(r.available.len(), 2);
+    assert_eq!(r.available[1].focused_step.as_deref(), Some("b"));
+    assert!(cancel_a.load(Ordering::Relaxed));
+    assert!(cancel_b.load(Ordering::Relaxed));
+    assert!(cancel_c.load(Ordering::Relaxed));
+    assert_eq!(stopped.lock().unwrap().len(), 3);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn final_parallel_failure_offers_recovery_without_waiting_for_live_peers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let session = make_session_with_max_concurrent(&tmp, Some(2));
+    let workflow = make_workflow(
+        Some("wf-final-failure"),
+        Some("claude"),
+        vec![make_step("a", &[], None), make_step("b", &[], None)],
+    );
+    let (cancel_a, _completion_a) = make_blocking_entry();
+    let (_cancel_b, completion_b) = make_blocking_entry();
+    let factory = BlockingFactory::new([
+        (cancel_a.clone(), _completion_a),
+        (_cancel_b, completion_b.clone()),
+    ]);
+    let engine_tx: Arc<Mutex<Option<_>>> = Arc::new(Mutex::new(None));
+    let (frontend, record) =
+        ParallelTestFrontend::new([NextAction::Pause], engine_tx, YoloTickOutcome::Continue);
+    let mut engine = build_parallel_engine(&session, workflow, factory, frontend.interactive());
+    engine.set_yolo(true);
+
+    let task = tokio::spawn(async move { engine.run_to_completion().await });
+    wait_for_launched(&record, &["a", "b"]).await;
+    signal_completion(&completion_b, 1);
+    assert_eq!(task.await.unwrap().unwrap(), WorkflowOutcome::Paused);
+    assert!(cancel_a.load(Ordering::Relaxed));
+    assert_eq!(
+        record.lock().unwrap().available[0]
+            .retry_failed_step
+            .as_deref(),
+        Some("b")
+    );
 }
 
 /// `StepStuck { step_name }` (yolo off) marks only the named slot stuck;

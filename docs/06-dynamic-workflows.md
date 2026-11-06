@@ -169,7 +169,7 @@ accordingly.
 
 This is advisory only — awman does not enforce it in the workflow scheduler. It is a hint the leader agent uses when deciding how much of the workflow to run in parallel via `depends_on`. Must be `>= 1` if set; `0` is rejected when the config is loaded, since it would deadlock any workflow.
 
-Don't confuse this with [`maxConcurrentAgents`](07-configuration.md#reference), a differently-named, differently-scoped setting: `maxConcurrentAgents` is the cap the engine actually enforces at run time, for every workflow (dynamic or not), regardless of what the leader planned. See [Parallel workflows](05-workflows.md#parallel-workflows).
+Don't confuse this with [`maxConcurrentAgents`](07-configuration.md#reference), a differently-named, differently-scoped setting: `maxConcurrentAgents` is the engine's run-time cap for workflows, with an exception for interactive final yolo groups so every remaining agent stays available for review. See [Parallel workflows](05-workflows.md#parallel-workflows).
 
 ### `defaultLeader`
 

@@ -60,7 +60,8 @@ pub struct AvailableActions {
     /// scope the Workflow Control Board to the parallel context.
     pub parallel_peer_count: usize,
     /// Live peers of the focused step still running in the same parallel group
-    /// (excludes the focused step itself). Non-zero disables back/finish.
+    /// (excludes the focused step itself). Finish remains available once the
+    /// final yolo group's review countdowns have all elapsed.
     pub parallel_peers_running: usize,
     /// True when a container is currently running (mid-step). The engine
     /// computes this from `current_execution.is_some()` in

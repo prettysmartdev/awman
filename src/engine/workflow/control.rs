@@ -675,7 +675,11 @@ impl WorkflowEngine {
                 Some("Cannot finish while other agents in this group are still running.".into());
         }
 
-        a.focused_step = self.running_step_name();
+        a.focused_step = self
+            .active_steps
+            .first()
+            .map(|slot| slot.step_name.clone())
+            .or_else(|| self.running_step_name());
         a.simple_advance = self.simple_advance(&a);
         Ok(a)
     }

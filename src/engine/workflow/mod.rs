@@ -891,13 +891,13 @@ impl WorkflowEngine {
             }
 
             // Determine the current parallel group: every step whose
-            // dependencies are already satisfied (source-file order). When more
-            // than one is ready and the concurrency cap is not pinned to 1, run
-            // them through the parallel-group path; otherwise fall back to the
-            // single-step interactive path (behaviourally identical to the
-            // pre-WI-0096 sequential engine).
+            // dependencies are already satisfied (source-file order). A cap
+            // of 1 uses the single-step path except for the interactive final
+            // yolo group, whose members must stay alive together for review.
             let ready = self.next_ready_steps()?;
-            let use_parallel = ready.len() > 1 && self.max_concurrent != Some(1);
+            let final_yolo_group = self.is_final_yolo_group(&ready);
+            let use_parallel =
+                ready.len() > 1 && (self.max_concurrent != Some(1) || final_yolo_group);
 
             if use_parallel {
                 match self.run_parallel_group(ready).await? {

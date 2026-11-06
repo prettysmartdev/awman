@@ -333,7 +333,7 @@ pub struct WorkflowControlBoardState {
     /// focused step is not part of a multi-step parallel batch.
     pub parallel_peer_count: usize,
     /// Live peers still running in the focused step's parallel group (excludes
-    /// the focused step). Non-zero disables back/finish in the WCB.
+    /// the focused step). A final yolo review can finish with peers still live.
     pub parallel_peers_running: usize,
     /// Detail lines for the failure that opened this board (exit code, signal,
     /// run duration), copied from `AvailableActions::step_failure`. Empty on an
