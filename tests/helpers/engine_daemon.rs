@@ -131,14 +131,20 @@ pub struct Daemon {
 }
 impl Daemon {
     pub async fn start(registry: Arc<IntegrationRegistry>) -> Self {
-        // Short Unix path even when make's fixture root is long.
+        // Keep Unix socket paths short even when make's fixture root is long.
+        #[cfg(unix)]
         let dir = tempfile::Builder::new()
             .prefix("ep-")
             .tempdir_in("/tmp")
             .unwrap();
+        #[cfg(not(unix))]
+        let dir = tempfile::Builder::new().prefix("ep-").tempdir().unwrap();
         let root = dir.path().to_path_buf();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
         std::fs::create_dir_all(root.join("repo")).unwrap();
         let templates = root.join("repo/aspec/work-items");
         std::fs::create_dir_all(&templates).unwrap();
@@ -229,10 +235,16 @@ impl Daemon {
             ),
         )
         .unwrap();
-        api.runtime.set_local_listener(
-            crate::command::daemon_runtime::LocalTransport::UnixSocket,
-            bound.address.clone(),
-        );
+        let transport = match bound.transport {
+            crate::data::fs::daemon_sidecar::SidecarTransportKind::UnixSocket => {
+                crate::command::daemon_runtime::LocalTransport::UnixSocket
+            }
+            crate::data::fs::daemon_sidecar::SidecarTransportKind::NamedPipe => {
+                crate::command::daemon_runtime::LocalTransport::NamedPipe
+            }
+        };
+        api.runtime
+            .set_local_listener(transport, bound.address.clone());
         crate::data::fs::daemon_sidecar::ServerSidecar::current(
             std::process::id(),
             bound.sidecar_transport(),
