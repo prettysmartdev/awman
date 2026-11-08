@@ -111,6 +111,12 @@ impl crate::command::commands::agent_setup::AgentLaunchFrontend for InstanceComm
         }
     }
 
+    fn wait_output_drained(
+        &mut self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(self.command_bytes.wait_drained())
+    }
+
     fn set_stuck_sender(
         &mut self,
         sender: std::sync::Arc<
