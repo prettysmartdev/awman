@@ -784,12 +784,51 @@ impl WorkflowEngine {
         Ok(())
     }
 
+    /// The sole unfinished member can be advanced as a successful group,
+    /// including while its yolo countdown is still running.
+    fn can_complete_parallel_group(&self, group: &[String]) -> bool {
+        let [active] = self.active_steps.as_slice() else {
+            return false;
+        };
+        group.iter().all(|name| {
+            name == &active.step_name
+                || matches!(self.state.status_of(name), Some(StepState::Succeeded))
+        })
+    }
+
+    fn complete_parallel_group(&mut self, group: &[String]) -> Result<(), EngineError> {
+        // The next stage must not launch until the last container is stopped.
+        // A cancel handle may only signal its wait task, so also use the
+        // factory's synchronous stop operation before recording success.
+        if let Some(slot) = self.active_steps.first() {
+            if let Some(handle) = &slot.cancel_handle {
+                let _ = handle.cancel();
+            }
+            self.agent_factory.stop_agent(&slot.handle)?;
+        }
+        let active = self.kill_active_parallel_steps();
+        for name in active {
+            self.state.set_status(&name, StepState::Succeeded);
+            let step = self.find_step(&name)?;
+            self.frontend
+                .report_step_status(&step, WorkflowStepStatus::Succeeded);
+        }
+        self.persist()?;
+        self.frontend.report_parallel_group_finished();
+        let progress = self.workflow_progress_info();
+        self.frontend.report_workflow_progress(&progress);
+        debug_assert!(group
+            .iter()
+            .all(|name| self.state.completed_steps.contains(name)));
+        Ok(())
+    }
+
     /// The Workflow Control Board for a board opened mid-group. On top of the
     /// focused-container scoping `compute_available_actions` applies, restart,
     /// back and next act on the whole group, so each is offered whenever it
     /// can do anything: restart and next always, back whenever the group has
-    /// a step to return to. All three depend on follow-up questions, so an
-    /// engine without their copy offers none of them.
+    /// a step to return to. Restart, back, and cancelling a group need
+    /// follow-up questions; completing its sole remaining member does not.
     fn parallel_group_board_actions(
         &self,
         group: &[String],
@@ -800,10 +839,15 @@ impl WorkflowEngine {
         a.can_finish_workflow = false;
         a.finish_workflow_unavailable_reason =
             Some("Finish after the parallel group is ready for review.".into());
+        let can_complete = self.can_complete_parallel_group(group);
+        if can_complete {
+            a.launch_next_label = Some("Next (complete current group)".into());
+        }
         if self.parallel_group_prompts.is_none() {
             a.can_restart_current_step = false;
             a.can_cancel_to_previous_step = false;
-            a.can_launch_next = false;
+            a.can_launch_next = can_complete;
+            a.acts_on_parallel_group = can_complete;
             return Ok(a);
         }
         let has_previous = !self.dependencies_of(group).is_empty();
@@ -833,8 +877,8 @@ impl WorkflowEngine {
     }
 
     /// A mid-group board chose restart, back or next — each acts on the whole
-    /// group. Ask the follow-up questions and carry out the answer; any
-    /// answer other than the expected one leaves the group running.
+    /// group. Ask the relevant follow-up questions, except when Next simply
+    /// completes the sole remaining member.
     fn resolve_parallel_group_action(
         &mut self,
         action: NextAction,
@@ -886,9 +930,14 @@ impl WorkflowEngine {
                 self.rewind_parallel_group(&reset)?;
                 Ok(ParallelRequestOutcome::Rewound)
             }
-            // Moving on cancels the whole group: whatever has not finished is
-            // skipped, and the steps after the group run.
+            // Moving on completes the last active member when its peers have
+            // succeeded. Otherwise it cancels and skips unfinished members.
             NextAction::LaunchNext => {
+                if self.can_complete_parallel_group(group) {
+                    self.msg_info("Completing the parallel group and moving on");
+                    self.complete_parallel_group(group)?;
+                    return Ok(ParallelRequestOutcome::Rewound);
+                }
                 let exit = GroupExit::Next(self.direct_dependents_of(group));
                 if self.ask_parallel_group(|p| (p.cancel_group)(group, &exit))? != D::CancelGroup {
                     return Ok(ParallelRequestOutcome::Continue);

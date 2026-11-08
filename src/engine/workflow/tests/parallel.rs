@@ -37,6 +37,7 @@ struct ParallelRecord {
     exited: Vec<(String, i32)>,
     stuck: Vec<String>,
     unstuck: Vec<String>,
+    yolo_started: Vec<String>,
     group_finished: bool,
     available: Vec<AvailableActions>,
     /// `(title, body)` of every follow-up question the engine asked.
@@ -175,6 +176,13 @@ impl WorkflowFrontend for ParallelTestFrontend {
             .lock()
             .unwrap()
             .unstuck
+            .push(step_name.to_string());
+    }
+    fn parallel_step_yolo_countdown_started(&mut self, step_name: &str) {
+        self.record
+            .lock()
+            .unwrap()
+            .yolo_started
             .push(step_name.to_string());
     }
     fn report_parallel_group_finished(&mut self) {
@@ -733,6 +741,60 @@ async fn parallel_group_wcb_retries_failed_peer_mid_group() {
     );
 }
 
+/// A retry remains in its original stage even when a later stage depends
+/// only on a sibling that already succeeded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn drained_group_retry_finishes_before_next_stage_starts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let session = make_session_with_max_concurrent(&tmp, Some(2));
+    let workflow = make_workflow(
+        Some("wf-retry-stage-barrier"),
+        Some("claude"),
+        vec![
+            make_step("a", &[], None),
+            make_step("b", &[], None),
+            make_step("c", &["b"], None),
+            make_step("d", &["b"], None),
+        ],
+    );
+    let (_, failed_a) = make_blocking_entry();
+    let (_, completed_b) = make_blocking_entry();
+    let (_, retry_a) = make_blocking_entry();
+    let (_, next_c) = make_blocking_entry();
+    let (_, next_d) = make_blocking_entry();
+    let factory = BlockingFactory::new([
+        (Arc::new(AtomicBool::new(false)), failed_a.clone()),
+        (Arc::new(AtomicBool::new(false)), completed_b.clone()),
+        (Arc::new(AtomicBool::new(false)), retry_a.clone()),
+        (Arc::new(AtomicBool::new(false)), next_c.clone()),
+        (Arc::new(AtomicBool::new(false)), next_d.clone()),
+    ]);
+    let launches = factory.execution_count.clone();
+    let engine_tx = Arc::new(Mutex::new(None));
+    let (frontend, record) = ParallelTestFrontend::new(
+        [NextAction::RestartCurrentStep, NextAction::LaunchNext],
+        engine_tx,
+        YoloTickOutcome::Continue,
+    );
+    let mut engine = build_parallel_engine(&session, workflow, factory, frontend.interactive());
+    let task = tokio::spawn(async move { engine.run_to_completion().await });
+    wait_for_launched(&record, &["a", "b"]).await;
+    signal_completion(&failed_a, 1);
+    signal_completion(&completed_b, 0);
+    wait_for_execution_count(&launches, 3).await;
+    assert_eq!(
+        record.lock().unwrap().launched,
+        vec!["a", "b"],
+        "stage B must wait while a's retry is still active"
+    );
+
+    signal_completion(&retry_a, 0);
+    wait_for_launched(&record, &["a", "b", "c", "d"]).await;
+    signal_completion(&next_c, 0);
+    signal_completion(&next_d, 0);
+    assert_eq!(task.await.unwrap().unwrap(), WorkflowOutcome::Completed);
+}
+
 // ── Restart / back / next on a running parallel group ────────────────────
 
 /// Stand-in for Layer 2's copy: each prompt's body spells out the facts the
@@ -1166,10 +1228,10 @@ async fn parallel_group_cancel_back_returns_to_previous_step() {
     );
 }
 
-/// Next, confirmed: the whole group is cancelled, its unfinished members
-/// are skipped, and the step after the group runs.
+/// With only one member still active and in its yolo countdown, Next
+/// completes that member and the group, then the following stage can run.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn parallel_group_cancel_next_skips_to_following_step() {
+async fn parallel_group_next_completes_sole_remaining_step() {
     let tmp = tempfile::tempdir().unwrap();
     let session = make_session_with_max_concurrent(&tmp, Some(2));
     let workflow = make_workflow(
@@ -1192,15 +1254,13 @@ async fn parallel_group_cancel_next_skips_to_following_step() {
         engine_tx.clone(),
         YoloTickOutcome::Continue,
     );
-    let mut engine = build_group_engine(
-        &session,
-        workflow,
-        factory,
-        frontend,
-        [ParallelGroupDecision::CancelGroup],
-    );
+    let mut engine = build_group_engine(&session, workflow, factory, frontend.interactive(), []);
+    engine.yolo = true;
     let tx = engine_tx.lock().unwrap().clone().unwrap();
-    let engine_task = tokio::spawn(async move { engine.run_to_completion().await });
+    let engine_task = tokio::spawn(async move {
+        let result = engine.run_to_completion().await;
+        (result, engine.state().status_of("b").cloned())
+    });
     wait_for_launched(&record, &["a", "b"]).await;
 
     signal_completion(&completion_a, 0);
@@ -1208,15 +1268,27 @@ async fn parallel_group_cancel_next_skips_to_following_step() {
         r.exited.contains(&("a".to_string(), 0))
     })
     .await;
+    tx.send(EngineRequest::StepStuck {
+        step_name: "b".to_string(),
+    })
+    .unwrap();
     open_board(&tx, &record, "b").await;
 
-    let _ = engine_task.await.unwrap().unwrap();
+    let (result, b_status) = engine_task.await.unwrap();
+    let result = result.unwrap();
+    assert_eq!(result, WorkflowOutcome::Completed);
+    assert!(matches!(b_status, Some(StepState::Succeeded)));
     assert!(cancel_b.load(Ordering::Relaxed), "running b was killed");
     let r = record.lock().unwrap();
-    assert_eq!(
-        r.group_prompts[0],
-        ("cancel".to_string(), "a,b|Next([\"c\"])".to_string())
+    assert!(
+        r.group_prompts.is_empty(),
+        "completing needs no cancel prompt"
     );
+    assert_eq!(
+        r.available[0].launch_next_label.as_deref(),
+        Some("Next (complete current group)")
+    );
+    assert_eq!(r.yolo_started, vec!["b"]);
     assert_eq!(r.launched, vec!["a", "b"], "the group is not rerun");
 }
 
@@ -1263,6 +1335,9 @@ async fn parallel_group_declined_confirmation_keeps_group_running() {
     assert!(!cancel_a.load(Ordering::Relaxed));
     assert!(!cancel_b.load(Ordering::Relaxed));
     assert_eq!(record.lock().unwrap().launched, vec!["a", "b"]);
+    assert!(record.lock().unwrap().available[0]
+        .launch_next_label
+        .is_none());
 
     signal_completion(&completion_a, 0);
     signal_completion(&completion_b, 0);

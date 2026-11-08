@@ -113,12 +113,16 @@ fn has_green_sidebar_corner(buf: &ratatui::buffer::Buffer) -> Option<u16> {
 }
 
 fn set_summary(app: &App, additions: u32, deletions: u32) {
+    set_summary_with_branch(app, additions, deletions, None);
+}
+
+fn set_summary_with_branch(app: &App, additions: u32, deletions: u32, branch: Option<&str>) {
     use crate::engine::git::GitDiffSummary;
     *app.active_tab().git_diff_summary.lock().unwrap() = Some(GitDiffSummary {
         files: Vec::new(),
         added: additions,
         removed: deletions,
-        branch: None,
+        branch: branch.map(str::to_string),
     });
 }
 
@@ -221,6 +225,18 @@ fn status_bar_shows_plus_minus_when_sidebar_closed_and_summary_present() {
         "status bar shows additions: had lines"
     );
     assert!(text.contains("-3"), "status bar shows deletions");
+}
+
+#[test]
+fn status_bar_shows_branch_next_to_diff_totals() {
+    let mut app = make_app();
+    set_summary_with_branch(&app, 20, 85, Some("main"));
+    let text = buffer_text(&render_app(&mut app, 100, 24));
+    assert!(text.contains("+20 -85 (main)"), "{text}");
+
+    set_summary_with_branch(&app, 1, 2, None);
+    let detached = buffer_text(&render_app(&mut app, 100, 24));
+    assert!(detached.contains("+1 -2 (HEAD)"), "{detached}");
 }
 
 #[test]
@@ -650,6 +666,15 @@ fn set_parallel_workflow(app: &App, n: usize) {
             max_concurrent: None,
         })
     });
+}
+
+#[test]
+fn workflow_hints_do_not_hide_git_branch_summary() {
+    let mut app = make_app();
+    set_parallel_workflow(&app, 2);
+    set_summary_with_branch(&app, 20, 85, Some("feature/worktree"));
+    let text = buffer_text(&render_app(&mut app, 90, 24));
+    assert!(text.contains("+20 -85 (feature/worktree)"), "{text}");
 }
 
 #[test]

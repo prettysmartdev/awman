@@ -1548,6 +1548,7 @@ A `workflows.maxConcurrentSteps` of `1` disables parallelism entirely: steps run
 ### How the engine schedules steps
 
 When a parallel group becomes ready, awman launches as many of its steps as the concurrency cap allows, in the order they appear in the workflow file. Any remaining steps in the group wait in a queue.
+The next stage starts only after every step in the current stage has succeeded or been explicitly skipped, including any failed steps you choose to retry.
 
 - **A slot frees up** whenever a running step finishes successfully. The next queued step (in file order) starts immediately into that slot.
 - **A step that fails** without `abort_on_failure` stops new steps from being queued into the group, but lets its already-running siblings keep going until they finish; you're then prompted the same way you would be for a sequential failure.
@@ -1574,13 +1575,13 @@ See [Permission modes](03-agent-sessions.md#permission-modes) for the general co
 
 Opening the control board (**Ctrl-W** in the TUI) while more than one agent is running scopes its actions to whichever container is currently **focused** — the one you'd switch to with Ctrl-S. The board makes this explicit: it names the focused step and shows how many peers are still running.
 
-Restart, cancel-to-previous and next act on the group as a whole, and the board labels them that way: **↑ Restart group / agent**, **← Back (cancel group)**, **→ Next (cancel group)**. The other actions are scoped as follows:
+Restart, cancel-to-previous and next act on the group as a whole, and the board labels them that way: **↑ Restart group / agent**, **← Back (cancel group)**, **→ Next (cancel group)**. When only one member remains active and all its peers have succeeded, Next reads **Next (complete current group)**. The other actions are scoped as follows:
 
 | Action | Behavior with active peers |
 |---|---|
 | Restart current step | Asks whether to restart the **whole group** or a **single agent**. Whole group: every running container is stopped and the entire group starts again from scratch, including agents that already finished. Single agent: pick any member of the group (running, finished, failed or still queued). That agent restarts in a fresh container while the others keep running. |
 | Cancel to previous step | Asks you to confirm cancelling the **entire group**. If you confirm, every running container in the group is stopped and the workflow goes back to the step or group the group depends on. That step and everything after it runs again. Not available for a group with nothing before it. |
-| Next | Asks you to confirm cancelling the **entire group**. If you confirm, every running container in the group is stopped, members that haven't finished are marked skipped, and the workflow moves on to the steps that come after the group. If nothing comes after it, the workflow finishes. |
+| Next | While several members are unfinished, asks you to confirm cancelling the **entire group**. If you confirm, every running container is stopped, unfinished members are marked skipped, and the workflow moves on. When only one member remains active and all peers succeeded, Next stops that member and marks it succeeded, completing the group directly. |
 | Finish workflow | Available after every member of the final yolo group reaches review readiness. Stops all live agents in that group before teardown. Otherwise disabled while peers are running. |
 | Pause | Always available — suspends the whole workflow, killing every active container in the group. |
 | Abort | Always available — same, but marks the workflow aborted rather than paused. |

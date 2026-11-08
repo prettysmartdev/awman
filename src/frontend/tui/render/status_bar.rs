@@ -189,34 +189,45 @@ pub(super) fn render_status_bar(app: &App, area: Rect, frame: &mut Frame, sideba
         spans.push(Span::styled(label, Style::default().fg(Color::DarkGray)));
     }
 
-    // When the sidebar is not visible (closed or collapsed for a narrow
-    // terminal), show the compact `+A -D` diff summary at the far right of the
-    // 1-row status bar (green `+`, red `-`).
-    if !sidebar_visible {
-        if let Some(summary) = tab.git_diff_summary.lock().ok().and_then(|g| g.clone()) {
-            let git_spans = vec![
-                Span::styled(
-                    format!("+{}", summary.added),
-                    Style::default().fg(Color::Green),
-                ),
-                Span::raw(" "),
-                Span::styled(
-                    format!("-{} ", summary.removed),
-                    Style::default().fg(Color::Red),
-                ),
-            ];
-            let left_w: usize = spans.iter().map(|s| s.content.chars().count()).sum();
-            let git_w: usize = git_spans.iter().map(|s| s.content.chars().count()).sum();
-            let total = area.width as usize;
-            if total > left_w + git_w {
-                spans.push(Span::raw(" ".repeat(total - left_w - git_w)));
-                spans.extend(git_spans);
-            }
-        }
-    }
+    // Keep the git summary at the right edge even when workflow hints fill
+    // the left side. Draw it last so the branch remains visible.
+    let git_summary = if sidebar_visible {
+        None
+    } else {
+        tab.git_diff_summary.lock().ok().and_then(|g| g.clone())
+    };
+    let git_spans = git_summary.map(|summary| {
+        vec![
+            Span::styled(
+                format!("+{}", summary.added),
+                Style::default().fg(Color::Green),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                format!("-{}", summary.removed),
+                Style::default().fg(Color::Red),
+            ),
+            Span::raw(format!(
+                " ({}) ",
+                summary.branch.as_deref().unwrap_or("HEAD")
+            )),
+        ]
+    });
 
     let bar = Paragraph::new(Line::from(spans)).style(Style::default().bg(Color::Black));
     frame.render_widget(bar, area);
+    if let Some(git_spans) = git_spans {
+        let width: usize = git_spans
+            .iter()
+            .map(|span| span.content.chars().count())
+            .sum();
+        if width <= area.width as usize {
+            let git_area = Rect::new(area.right() - width as u16, area.y, width as u16, 1);
+            let git_bar =
+                Paragraph::new(Line::from(git_spans)).style(Style::default().bg(Color::Black));
+            frame.render_widget(git_bar, git_area);
+        }
+    }
 }
 
 /// The visible one-based stage range for a horizontally scrolled overview.

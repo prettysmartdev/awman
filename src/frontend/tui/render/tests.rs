@@ -144,6 +144,23 @@ fn sidebar_title_clean_when_no_changed_files() {
 }
 
 #[test]
+fn sidebar_totals_show_current_branch() {
+    let summary = GitDiffSummary {
+        files: Vec::new(),
+        added: 20,
+        removed: 85,
+        branch: Some("main".to_string()),
+    };
+    let buf = render_to_buffer(30, 8, |area, frame| {
+        render_git_sidebar(frame, area, &Some(summary));
+    });
+    let row: String = (1..29)
+        .map(|x| buf.cell((x, 1)).unwrap().symbol())
+        .collect();
+    assert!(row.contains("+20 -85 (main)"), "{row}");
+}
+
+#[test]
 fn sidebar_title_present_even_without_git_data() {
     let buf = render_to_buffer(30, 8, |area, frame| {
         render_git_sidebar(frame, area, &None);

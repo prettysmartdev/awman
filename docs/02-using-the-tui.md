@@ -70,7 +70,7 @@ task's last run failed). See [The squad indicator](12-squad.md#the-squad-indicat
 
 ## Git Sidebar
 
-Press **Ctrl+G** to toggle the Git Sidebar — a live view of staged and unstaged changes in the current repository. The sidebar appears on the right side of the TUI and displays changed files with line change counts.
+Press **Ctrl+G** to toggle the Git Sidebar — a live view of staged and unstaged changes in the current repository. The sidebar appears on the right side of the TUI and displays changed files with line change counts. Its total additions and deletions are followed by the current branch, for example `+20 -85 (main)`.
 
 The sidebar's border always carries a title summarizing the repository state, like a condensed `git status`:
 
@@ -98,9 +98,9 @@ The sidebar's border always carries a title summarizing the repository state, li
 
 ### Opening and closing
 
-When the sidebar is **open**, press **Ctrl+G** again to close it. The execution window expands to fill the space, and a compact `+X -Y` summary appears in the bottom status bar showing the total additions and deletions across all files.
+When the sidebar is **open**, press **Ctrl+G** again to close it. The execution window expands to fill the space, and a compact `+X -Y (branch)` summary appears in the bottom status bar showing the total additions and deletions across all files and the current branch.
 
-When the sidebar is **closed**, the `+X -Y` summary is always visible on the right side of the status bar (when there are changes to display).
+When the sidebar is **closed**, the `+X -Y (branch)` summary is visible on the right side of the status bar when there is room. It uses the tab's current repository or worktree, and shows `HEAD` for a detached checkout.
 
 ### File list
 
