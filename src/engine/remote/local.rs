@@ -218,10 +218,10 @@ impl LocalClient {
         let request = request
             .body(http_body_util::Full::new(hyper::body::Bytes::from(bytes)))
             .map_err(|e| failure(e.to_string()))?;
-        sender
-            .send_request(request)
-            .await
-            .map_err(connection_failure)
+        match sender.send_request(request).await {
+            Ok(response) => Ok(response),
+            Err(error) => Err(connection_failure(&self.endpoint, error).await),
+        }
     }
 }
 
@@ -230,29 +230,20 @@ fn failure(e: String) -> EngineError {
 }
 
 /// A socket can disappear after `connect` succeeds but before HTTP receives a
-/// response. Report that race the same way as a refused connection.
-fn connection_failure(error: hyper::Error) -> EngineError {
-    use std::error::Error as _;
-    if error.is_closed() || error.is_incomplete_message() || error.is_canceled() {
-        return EngineError::Other(NO_DAEMON.into());
-    }
-    let mut source = error.source();
-    while let Some(cause) = source {
-        if let Some(io) = cause.downcast_ref::<std::io::Error>() {
-            if matches!(
-                io.kind(),
-                std::io::ErrorKind::ConnectionRefused
-                    | std::io::ErrorKind::ConnectionReset
-                    | std::io::ErrorKind::ConnectionAborted
-                    | std::io::ErrorKind::BrokenPipe
-                    | std::io::ErrorKind::NotConnected
-                    | std::io::ErrorKind::NotFound
-            ) {
-                return EngineError::Other(NO_DAEMON.into());
-            }
+/// response. Probe again to distinguish that race from a live listener which
+/// deliberately closed this connection (for example, to refuse a peer).
+async fn connection_failure(endpoint: &Path, error: hyper::Error) -> EngineError {
+    #[cfg(unix)]
+    if let Err(probe) = tokio::net::UnixStream::connect(endpoint).await {
+        if matches!(
+            probe.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+        ) {
+            return EngineError::Other(NO_DAEMON.into());
         }
-        source = cause.source();
     }
+    #[cfg(not(unix))]
+    let _ = endpoint;
     failure(error.to_string())
 }
 

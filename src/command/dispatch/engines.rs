@@ -583,10 +583,13 @@ mod tests {
             root.path().to_path_buf(),
             root.path().to_path_buf(),
             crate::data::session::SessionOpenOptions {
-                env: Some(crate::data::config::EnvSnapshot::with_overrides([(
-                    crate::data::config::AWMAN_HOME,
-                    home.path().to_str().unwrap(),
-                )])),
+                env: Some(crate::data::config::EnvSnapshot::with_overrides([
+                    (
+                        crate::data::config::AWMAN_HOME,
+                        home.path().to_str().unwrap(),
+                    ),
+                    ("HOME", root.path().to_str().unwrap()),
+                ])),
                 ..Default::default()
             },
         )

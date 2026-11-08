@@ -299,7 +299,7 @@ mod tests {
                     String::from_utf8(output.stdout).unwrap(),
                     format!(
                         "{instance}:{name}\nunix:///{instance}.sock\n{}\nunset\nprobe\n",
-                        bin.display()
+                        bin.canonicalize().unwrap().display()
                     )
                 );
                 let command = command(&snapshot, name);

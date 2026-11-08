@@ -13,7 +13,10 @@ use crate::{
         session::{Session, SessionOpenOptions, StaticGitRootResolver},
         session_manager::SessionManager,
     },
-    frontend::tui::{app::App, tabs::Tab},
+    frontend::tui::{
+        app::App,
+        tabs::{ExecutionPhase, Tab},
+    },
     support::{self, Daemon},
 };
 use std::{
@@ -94,6 +97,20 @@ async fn run(backend: Arc<dyn InstanceBackend>, session: Session) -> Vec<ratatui
         app.tick_all_tabs();
         app.poll_dialog_requests();
         if app.active_dialog.is_some() {
+            // Dialog frames and session snapshots travel on separate feeds.
+            // Wait for the command phase before comparing local and daemon
+            // rendering at this dialog boundary.
+            while !matches!(
+                app.active_tab().execution_phase,
+                ExecutionPhase::Running { .. }
+            ) {
+                assert!(
+                    Instant::now() < deadline,
+                    "session phase did not reach the dialog"
+                );
+                tokio::time::sleep(Duration::from_millis(1)).await;
+                app.tick_all_tabs();
+            }
             frames.push(frame(&mut app));
             app.active_tab()
                 .dialog_response_tx
