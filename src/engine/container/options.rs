@@ -624,7 +624,7 @@ impl ResolvedContainerOptions {
         let lookup = |name: &str| {
             r.host_env.as_ref().map_or_else(
                 || crate::data::config::env::host_var(name),
-                |env| env.get(name).map(str::to_owned),
+                |env| env.host_payload(name),
             )
         };
         dedup_credentials_by_declared_env(

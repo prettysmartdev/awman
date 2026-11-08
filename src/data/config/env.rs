@@ -295,6 +295,9 @@ pub struct EnvSnapshot {
     native: Vec<(std::ffi::OsString, std::ffi::OsString)>,
     cwd: PathBuf,
     argv: Vec<std::ffi::OsString>,
+    /// Process captures may read the daemon's in-memory task overlay for
+    /// explicitly requested host payloads. Frontend-supplied snapshots may not.
+    process_overlay: bool,
 }
 
 impl std::fmt::Debug for EnvSnapshot {
@@ -436,6 +439,19 @@ impl EnvSnapshot {
                     .flatten()
             })
             .map(|s| s.as_str())
+    }
+
+    /// Resolve a container passthrough value. A daemon process snapshot sees
+    /// a task's live overlay; an instance snapshot stays confined to the
+    /// launching frontend's environment.
+    pub fn host_payload(&self, key: &str) -> Option<String> {
+        if self.process_overlay {
+            let guard = daemon_overlay().read().unwrap_or_else(|e| e.into_inner());
+            if let Some(value) = guard.get(key) {
+                return Some(value.clone());
+            }
+        }
+        self.get(key).map(str::to_owned)
     }
 
     pub fn get_os(&self, key: &str) -> Option<&std::ffi::OsStr> {
@@ -707,6 +723,7 @@ impl Env {
             native,
             cwd: std::env::current_dir().unwrap_or_default(),
             argv: std::env::args_os().collect(),
+            process_overlay: true,
         }
     }
 
@@ -1221,6 +1238,27 @@ mod tests {
 
         std::env::remove_var(name);
         set_daemon_overlay(DaemonEnvMap::new());
+    }
+
+    #[test]
+    fn process_payload_reads_live_overlay_but_instance_payload_does_not() {
+        let _lock = DAEMON_OVERLAY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let previous = daemon_overlay_snapshot();
+        let name = "AWMAN_TEST_PROCESS_PAYLOAD_OVERLAY_0142";
+        std::env::remove_var(name);
+        let process = Env::from_process();
+        let instance = EnvSnapshot::from_instance_env(Vec::new(), PathBuf::new(), Vec::new());
+        set_daemon_overlay(DaemonEnvMap::from_pairs([(name, "overlay-secret")]));
+
+        assert_eq!(
+            process.host_payload(name).as_deref(),
+            Some("overlay-secret")
+        );
+        assert_eq!(instance.host_payload(name), None);
+
+        set_daemon_overlay(previous);
     }
 
     /// `DaemonEnvMap`'s hand-written `Debug` must print names only, under

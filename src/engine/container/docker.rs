@@ -803,7 +803,7 @@ fn resolve_env_passthrough_raw(options: &ResolvedContainerOptions) -> Vec<(Strin
                 .as_ref()
                 .map_or_else(
                     || crate::data::config::env::host_var(&envvar.0),
-                    |env| env.get(&envvar.0).map(str::to_owned),
+                    |env| env.host_payload(&envvar.0),
                 )
                 .map(|value| (envvar.0.clone(), value))
         })
@@ -1428,6 +1428,46 @@ mod tests {
         );
 
         set_daemon_overlay(DaemonEnvMap::new());
+    }
+
+    #[test]
+    fn process_snapshot_keeps_daemon_overlay_passthrough() {
+        use crate::data::config::env::{
+            daemon_overlay_snapshot, set_daemon_overlay, DaemonEnvMap, Env,
+            DAEMON_OVERLAY_TEST_LOCK,
+        };
+
+        let _guard = DAEMON_OVERLAY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let previous = daemon_overlay_snapshot();
+        let name = "AWMAN_TEST_DOCKER_PROCESS_OVERLAY_0142";
+        std::env::remove_var(name);
+        let process = Env::from_process();
+        set_daemon_overlay(DaemonEnvMap::from_pairs([(name, "overlay-secret")]));
+        let options = ResolvedContainerOptions::resolve_in(
+            [
+                ContainerOption::Image(ImageRef::new("img:latest")),
+                ContainerOption::EnvPassthrough(EnvVar(name.into())),
+            ],
+            &process,
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolve_env_passthrough(&options),
+            vec![(name.to_string(), "overlay-secret".to_string())]
+        );
+        let argv = build_run_argv(
+            &ContainerName::new("ctr"),
+            &ImageRef::new("img:latest"),
+            &options,
+        )
+        .unwrap();
+        assert!(argv.windows(2).any(|pair| pair == ["-e", name]));
+        assert!(!argv.iter().any(|arg| arg.contains("overlay-secret")));
+
+        set_daemon_overlay(previous);
     }
 
     /// A task created before `env()` validated its argument still carries
