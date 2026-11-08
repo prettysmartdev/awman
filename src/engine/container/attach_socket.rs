@@ -51,6 +51,7 @@ use std::sync::Arc;
 
 use crate::data::config::env::EnvSnapshot;
 use crate::data::session::AgentHandle;
+use crate::engine::agent_runtime::program_status::{ProgramStatusStream, ProgramStatusTracker};
 use crate::engine::error::EngineError;
 
 /// The directory attach sockets live in: `<data home>/attach/` (`$AWMAN_HOME`,
@@ -80,6 +81,10 @@ pub(crate) fn attach_socket_path(env: &EnvSnapshot, container_name: &str) -> Opt
 
 /// What the socket server needs from the owning PTY bridge.
 pub(crate) struct AttachHooks {
+    pub terminal: Option<(
+        Arc<crate::engine::terminal_hub::TerminalHub>,
+        crate::data::ids::TerminalId,
+    )>,
     /// Live PTY output. Each client subscribes; a lagging client is told that
     /// its stream is incomplete and disconnected.
     pub output: Arc<tokio::sync::broadcast::Sender<Vec<u8>>>,
@@ -194,6 +199,14 @@ mod unix_impl {
             tokio::select! {
                 accepted = listener.accept() => match accepted {
                     Ok((stream, _)) => {
+                        if let Some((hub, id)) = &hooks.terminal {
+                            // The listener may close in the backend's wait
+                            // before the execution wrapper publishes Exit.
+                            // Hub subscriptions finish on that event (or hub
+                            // shutdown), so let them drain independently.
+                            tokio::spawn(serve_hub_client(stream, hub.clone(), id.clone()));
+                            continue;
+                        }
                         let output_rx = hooks.output.subscribe();
                         let stdin = hooks.stdin.clone();
                         let resize = Arc::clone(&hooks.resize);
@@ -207,6 +220,58 @@ mod unix_impl {
                 },
                 // Reap finished sessions so the set doesn't grow unbounded.
                 Some(_) = clients.join_next(), if !clients.is_empty() => {}
+            }
+        }
+    }
+
+    /// The internal binary attach transport subscribes to the same daemon hub
+    /// and exclusive capability as WebSocket viewers.
+    pub(crate) async fn serve_hub_client(
+        stream: tokio::net::UnixStream,
+        hub: Arc<crate::engine::terminal_hub::TerminalHub>,
+        id: crate::data::ids::TerminalId,
+    ) {
+        use crate::data::terminal::TerminalFrame;
+        let Ok(mut output) = hub.subscribe(&id) else {
+            return;
+        };
+        let grant = hub.take_control(&id).ok();
+        drop(hub); // subscription and grant deliberately retain only weak references
+        let (mut reader, mut writer) = stream.into_split();
+        loop {
+            let input = read_frame(&mut reader);
+            tokio::pin!(input);
+            loop {
+                tokio::select! {
+                    frame = output.next() => {
+                        let (tag, bytes, exited) = match frame {
+                            Some(TerminalFrame::Snapshot { screen, .. } | TerminalFrame::Output { bytes: screen }) => (Tag::Output, screen, false),
+                            Some(TerminalFrame::Exit { code }) => (Tag::Exit, code.to_le_bytes().to_vec(), true),
+                            Some(_) => continue,
+                            None => return,
+                        };
+                        if write_frame_bounded(&mut writer, tag, &bytes, WRITE_TIMEOUT).await.is_err() || exited { return; }
+                    }
+                    frame = &mut input => {
+                        match frame {
+                            Ok((Tag::Stdin, bytes)) => {
+                                if let Some(grant) = &grant {
+                                    if matches!(grant.send_input(bytes), Err(crate::engine::terminal_hub::TerminalHubError::InputBackpressure)) { return; }
+                                }
+                            }
+                            Ok((Tag::Resize, bytes)) => {
+                                if let (Some(grant), Some((cols, rows))) = (&grant, parse_resize(&bytes)) {
+                                    // Exit may revoke the grant while this
+                                    // frame is in flight. Keep reading so the
+                                    // queued terminal exit code still arrives.
+                                    let _ = grant.resize(cols, rows);
+                                }
+                            }
+                            _ => return,
+                        }
+                        break;
+                    }
+                }
             }
         }
     }
@@ -303,7 +368,9 @@ mod unix_impl {
             );
             let grace_timeout = frontend.grace_timeout();
             let stuck_timeout = frontend.stuck_timeout();
+            let mut status_config = frontend.program_status_config();
             let io = frontend.take_io();
+            status_config.answer_queries = io.initial_size.is_some();
 
             let stream = std::os::unix::net::UnixStream::connect(&self.path).map_err(|e| {
                 EngineError::Container(format!(
@@ -369,7 +436,10 @@ mod unix_impl {
             // tracking the PTY bridge feeds its stuck detector from.
             let output_tail = Arc::new(OutputTail::with_default_capacity());
             let output_activity = OutputActivity::new();
-            let (exit_tx, exit_rx) = std::sync::mpsc::channel::<Result<(), EngineError>>();
+            let program_status = ProgramStatusTracker::shared();
+            let mut status_stream = ProgramStatusStream::new(program_status.clone(), status_config);
+            let query_stdin = stdin_injector.clone();
+            let (exit_tx, exit_rx) = std::sync::mpsc::channel::<Result<i32, EngineError>>();
             let cancelled = Arc::new(AtomicBool::new(false));
             let stdout_tx = io.stdout;
             let tail = Arc::clone(&output_tail);
@@ -381,6 +451,12 @@ mod unix_impl {
                 loop {
                     let payload = match read_frame(&mut read_half).await {
                         Ok((Tag::Output, payload)) => payload,
+                        Ok((Tag::Exit, payload)) if payload.len() == 4 => {
+                            outcome = Ok(i32::from_le_bytes(
+                                payload.try_into().expect("checked exit payload"),
+                            ));
+                            break;
+                        }
                         Ok((Tag::Lagged, _)) => {
                             outcome = Err(EngineError::Container(
                                 "attach output lagged; reconnect to the live agent".into(),
@@ -402,8 +478,16 @@ mod unix_impl {
                         }
                     };
                     act.touch();
-                    tail.push_bytes(&payload);
-                    let _ = stdout_tx.send(payload);
+                    let bytes = status_stream.feed(&payload, |reply| {
+                        let _ = query_stdin.send(reply.to_vec());
+                    });
+                    tail.push_bytes(&bytes);
+                    let _ = stdout_tx.send(bytes.into_owned());
+                }
+                let bytes = status_stream.finish();
+                tail.push_bytes(&bytes);
+                if !bytes.is_empty() {
+                    let _ = stdout_tx.send(bytes);
                 }
                 let _ = exit_tx.send(outcome);
             });
@@ -415,6 +499,7 @@ mod unix_impl {
                     container_start_delay: std::time::Duration::ZERO,
                     cancel_on_grace_expired: None,
                     poll_interval: crate::engine::container::io_bridge::STUCK_POLL_INTERVAL,
+                    program_status: Some(program_status.clone()),
                 },
                 &output_activity,
             );
@@ -427,12 +512,10 @@ mod unix_impl {
                 started_at,
                 cancelled,
             };
-            Ok(AgentExecution::new(
-                handle,
-                Box::new(backend),
-                stuck_tx,
-                Some(output_tail),
-            ))
+            Ok(
+                AgentExecution::new(handle, Box::new(backend), stuck_tx, Some(output_tail))
+                    .with_program_status(program_status),
+            )
         }
     }
 
@@ -450,7 +533,7 @@ mod unix_impl {
     /// local socket down — never the target container, which belongs to the
     /// serving process.
     struct SocketAttachExecution {
-        exit_rx: std::sync::mpsc::Receiver<Result<(), EngineError>>,
+        exit_rx: std::sync::mpsc::Receiver<Result<i32, EngineError>>,
         shutdown: std::os::unix::net::UnixStream,
         shutdown_for_handle: Arc<std::os::unix::net::UnixStream>,
         stdin_injector: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
@@ -465,11 +548,13 @@ mod unix_impl {
             let outcome = self.exit_rx.recv().map_err(|_| {
                 EngineError::Container("attach reader stopped without a result".into())
             })?;
-            if !self.cancelled.load(std::sync::atomic::Ordering::Acquire) {
-                outcome?;
-            }
+            let exit_code = if !self.cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                outcome?
+            } else {
+                0
+            };
             Ok(AgentExitInfo {
-                exit_code: 0,
+                exit_code,
                 signal: None,
                 started_at: self.started_at,
                 ended_at: chrono::Utc::now(),
@@ -502,6 +587,8 @@ mod unix_impl {
     }
 }
 
+#[cfg(unix)]
+pub(crate) use unix_impl::serve_hub_client;
 #[cfg(unix)]
 pub(crate) use unix_impl::spawn_attach_socket_server;
 
@@ -626,6 +713,7 @@ mod tests {
         let guard = spawn_attach_socket_server(
             &path,
             AttachHooks {
+                terminal: None,
                 output: Arc::clone(&output),
                 stdin: stdin_tx,
                 resize: Arc::new(move |cols, rows| {
@@ -766,6 +854,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn socket_attach_scans_reports_and_answers_one_query_unless_disabled() {
+        use crate::engine::agent_runtime::execution::with_program_status_config;
+        use crate::engine::agent_runtime::program_status::{
+            ProgramStatusBridgeConfig, OSC7501_QUERY_REPLY,
+        };
+        for enabled in [true, false] {
+            let mut server = start_server();
+            let captured = Captured::default();
+            let instance = with_program_status_config(
+                instance(&server.path),
+                ProgramStatusBridgeConfig {
+                    enabled,
+                    answer_queries: false,
+                },
+            );
+            let mut execution = instance
+                .run_with_frontend(Box::new(TestFrontend {
+                    captured: captured.clone(),
+                }))
+                .unwrap();
+            wait_until(|| server.output.receiver_count() > 0, "attach subscription").await;
+            server
+                .output
+                .send(b"before\x1b]7501;?\x1b\\\x1b]7501;state=working\x07after".to_vec())
+                .unwrap();
+            wait_until(
+                || captured.stdout.lock().unwrap().ends_with(b"after"),
+                "filtered attach output",
+            )
+            .await;
+            assert_eq!(
+                *captured.stdout.lock().unwrap(),
+                b"before\x1b]7501;state=working\x07after"
+            );
+            assert_eq!(execution.reports_program_status(), enabled);
+            if enabled {
+                assert_eq!(
+                    tokio::time::timeout(Duration::from_secs(3), server.stdin_rx.recv())
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    OSC7501_QUERY_REPLY
+                );
+            }
+            assert!(
+                tokio::time::timeout(Duration::from_millis(70), server.stdin_rx.recv())
+                    .await
+                    .is_err(),
+                "disabled sends nothing; enabled sends exactly one reply"
+            );
+            execution.cancel().unwrap();
+            execution.wait().await.unwrap();
+            assert!(!execution.reports_program_status());
+        }
+    }
+
+    #[tokio::test]
     async fn lagging_socket_attach_reports_incomplete_output() {
         let server = start_server();
         let captured = Captured::default();
@@ -862,6 +1007,7 @@ mod tests {
         let guard = spawn_attach_socket_server(
             &path,
             AttachHooks {
+                terminal: None,
                 output: Arc::new(output_tx),
                 stdin: stdin_tx,
                 resize: Arc::new(|_, _| {}),

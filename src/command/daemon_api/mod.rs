@@ -4,6 +4,7 @@ pub mod core;
 pub mod keys;
 pub mod operations;
 pub mod squad;
+pub mod terminals;
 pub mod worker;
 use crate::command::commands::squad::gateway::TaskGateway;
 use crate::command::daemon_runtime::DaemonRuntime;
@@ -16,6 +17,9 @@ pub struct DaemonApi {
     pub worker: Option<Arc<worker::WorkerApi>>,
     pub squad: Option<Arc<dyn TaskGateway>>,
     pub engines: Engines,
+    /// `/v1/terminals` (WI 0141): the daemon's one set of terminal operations,
+    /// shared by both listeners so the input grant is daemon-wide.
+    pub terminals: Arc<crate::command::terminals::TerminalOperations>,
 }
 impl DaemonApi {
     pub fn new(runtime: Arc<DaemonRuntime>) -> Self {
@@ -23,6 +27,7 @@ impl DaemonApi {
             worker: Some(runtime.worker().api.clone()),
             squad: Some(runtime.squad().gateway.clone()),
             engines: runtime.engines().clone(),
+            terminals: runtime.terminals(),
             runtime,
         }
     }

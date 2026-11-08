@@ -315,7 +315,7 @@ In every mode: inbound connections are refused (awman never publishes a guest po
 ### Session lifecycle
 
 - Each agent session, and each workflow setup/teardown environment, is its own microVM, removed when the session ends.
-- Ctrl-C in the launching session sends the agent an interrupt and gives it 10 seconds to exit before the VM is killed. In `awman agents attach`, Ctrl-C detaches only that client.
+- Ctrl-C in the launching session sends the agent an interrupt and gives it 10 seconds to exit before the VM is killed. In `awman attach`, Ctrl-C detaches only that client.
 - **The awman process that launched a session must keep running.** If it exits, the session's VM stops. Detaching and reattaching works while that process is alive: another client, including a newer compatible awman process, can attach to the same live session and see the same output; detaching only ends that one client's connection, and the guest keeps running. Reattaching after the launching process has exited is not supported. Checkpoint restore is not supported.
 - **A client is never left believing it saw the whole session when it didn't.** If a client reading attached output falls too far behind the live stream, awman ends that connection with an explicit failure — never a later clean exit that would make missed output look like it was delivered. Reconnect (or restart the agent) after seeing this. An attach starts at the current output; it does not replay what was written before the connection was accepted.
 - `awman agents status` lists builtin sessions. Workflows and squad find their sessions by name, as they do on Docker.

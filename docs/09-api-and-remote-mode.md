@@ -56,7 +56,8 @@ Every ID is a short prefix, an underscore and 32 lowercase hex characters, for e
 | `task_` | Squad task |
 | `run_` | Squad run |
 | `grant_` | Remembered prerequisite grant |
-| `ins_`, `tab_`, `term_`, `lease_`, `key_` | Reserved for future resources (engine instance, tab, terminal, work lease, API key) |
+| `term_` | Daemon terminal |
+| `ins_`, `tab_`, `lease_`, `key_` | Engine instance, tab, work lease, or API key identifiers |
 
 An ID that is malformed or has the wrong prefix is answered exactly like an ID that does not exist: `404 not_found`.
 
@@ -570,7 +571,7 @@ Substitute your data home in the certificate path when using `AWMAN_HOME` or `XD
 
 ### Route tree
 
-This is the complete route table (39 method/path pairs). Request and response details for the worker routes follow in the sections below.
+This is the complete route table. Request and response details for the worker routes follow in the sections below.
 
 | Method | Path | Feature | Access | Purpose |
 |--------|------|---------|--------|---------|
@@ -580,6 +581,8 @@ This is the complete route table (39 method/path pairs). Request and response de
 | `DELETE` | `/v1/keys/{id}` | core | owner/local | Revoke a key |
 | `PATCH` | `/v1/features/{feature}` | core | owner/local | Enable or disable an ephemeral feature |
 | `GET` | `/v1/status` | core | feature | Daemon status, capabilities, feature states |
+| `GET` | `/v1/terminals` | core | owner/local or feature | List visible terminal records |
+| `GET` | `/v1/terminals/{id}` | core | owner/local or feature | Read a terminal record or open its WebSocket |
 | `GET` | `/v1/config` | core | owner/local | Masked effective configuration and where each value comes from |
 | `POST` | `/v1/config/reload` | core | owner/local | Validate config files and apply live settings |
 | `GET` | `/v1/features` | core | feature | List feature states |
@@ -617,6 +620,87 @@ This is the complete route table (39 method/path pairs). Request and response de
 Squad task and run bodies use `snake_case` fields; a task's interval is `interval_ms`. The scheduler currently has one-second granularity, so `interval_ms` must be a multiple of 1000. Anything not in this table — including the old unprefixed routes listed under [Upgrading from earlier betas](#upgrading-from-earlier-betas) — answers `404 not_found`.
 
 The route tree is served by the daemon worker, squad, and core features; a route for a feature the process does not run answers `503 feature_disabled`.
+
+### Daemon terminals
+
+`GET /v1/terminals` lists terminals visible to the caller, newest first. Use
+`owner_id=cmd_…`, `run_…`, `tab_…`, `lease_…`, or `task_…` to filter by owner;
+`task_` selects its active squad run. `limit` and `cursor` use the standard
+list envelope. Finished records remain listed while their owner remains
+available. `GET /v1/terminals/{id}` returns one record. A malformed ID returns
+`404 terminal_not_found`; a well-formed terminal ID that is unknown or has
+expired returns `410 terminal_gone`.
+
+Terminal records include the owner, feature, source (phase and workflow step
+when present), agent/model, attempt, dimensions, open/exited state, and exit
+code. These routes are served, but the current daemon does not register its
+PTYs with the terminal hub, so live daemon lists may be empty and attach may
+find no terminal. The worker event stream remains available for headless
+commands.
+
+To view a terminal, upgrade `GET /v1/terminals/{id}` to WebSocket and negotiate
+the required `awman.terminal.v1` subprotocol. Frames are JSON text; byte fields
+use padded standard base64. The server sends `snapshot`, `output`, `resize`,
+`exit`, `lagged` (followed by a fresh snapshot), or `error` frames. Clients
+send `take_control`, `input`, `resize`, and `detached` frames. A read-only
+viewer never receives input control or resizes the PTY. The first viewer to
+take the input grant controls it until detach or disconnect; the terminal
+returns to its configured default size then.
+
+```json
+{"type":"snapshot","cols":120,"rows":40,"screen":"G1s/MjVs…"}
+{"type":"output","bytes":"aGk="}
+{"type":"take_control"}
+{"type":"input","bytes":"bHMNCg=="}
+{"type":"resize","cols":100,"rows":30}
+{"type":"detached","reason":"user"}
+```
+
+If another viewer holds the grant, the server sends an `error` frame with
+`code: "control_held"`. A read-only viewer may still watch output; attempted
+input or resize is refused with `input_not_allowed`. Input waiting for an
+agent that is not reading is limited to 256 KiB; beyond that an `input` frame
+is refused whole with `input_backpressure` (the holder keeps control and can
+retry). Resize requests are limited to 1000 columns by 500 rows; larger
+values are clamped.
+
+Permissions are re-checked live. Turning off `daemon.terminal.remoteInput`
+(or no longer serving the owner's feature on the network listener) releases
+a network viewer's input grant at its next `input`, `resize`, or
+`take_control`, which are then refused with `input_not_allowed`. A network
+viewer whose terminal is no longer served is disconnected with close code
+1008.
+
+Local socket access follows the local owner's permissions. Network access
+uses the same bearer-key authentication as worker command events. Network
+input requires both `daemon.terminal.remoteInput=true`, the command's
+`allow_remote_input` permission, and an `x-awman-actor` header naming the
+viewer. Local viewers may request control unless they connect read-only.
+Set `"allow_remote_input": true` when submitting a command through
+`POST /v1/worker/commands` or the command part of `POST /v1/runs` to opt in.
+It defaults to `false`, is persisted with the command, and is returned on the
+command record. Both this permission and `daemon.terminal.remoteInput` must
+allow input. A read-only WebSocket uses `?read_only=true`; it can never take control.
+
+Terminal lifecycle and viewer events are written to the owning command's
+event stream when it has one, or the squad run's `events.log`. `terminal_opened` and `terminal_closed` carry
+the terminal ID and opening details or exit code; `terminal_control` carries
+the holder and annotations (an empty holder means control was released), and
+`terminal_viewer_detached` carries the detach reason and annotations.
+Keystrokes are never logged. Agent OSC 7501 reports appear as
+`program_status` events with `state` (`idle`, `working`, `done`, `blocked`, or
+`error`) and optional `kind`, `progress`, `msg`, and `app`. A status clear has
+no event. The advertised `agent_status` capability indicates support for
+these reports.
+
+The typed `interaction` request field chooses `interactive` PTY mode or
+`headless` piped mode for pushed worker jobs. It must agree with any
+`--interactive` or `--headless` flag in `args`; disagreement returns HTTP 400
+`invalid_request`. When the request's mode differs from
+`daemon.features.worker.push.interaction`, the server returns HTTP 400
+`interaction_override_refused` unless
+`daemon.features.worker.push.allowOverride=true`. Asking for the configured
+mode is always allowed, and a refused request is not queued.
 
 ### `awman daemon api`
 
@@ -692,7 +776,6 @@ session's working directory:
 | `agents list` | Lists agents. |
 | `agents detail <id>` | Returns details for the selected agent. |
 | `agents kill <id>` | Stops and removes the agent; include `--yes` because API requests cannot answer an interactive confirmation. |
-| `agents attach <id>` | Not available through the API. |
 
 For example, set `subcommand` to `agents status` or `agents kill` and pass
 arguments such as the agent ID and `--yes` in the request's `args` array. The
@@ -987,7 +1070,15 @@ clients should be allowed to grant credentials beyond the normal policy.
 
 Invalid prerequisite syntax and unsupported `secret:NAME` return HTTP 400 at admission. Credential-widening requests return HTTP 403 unless globally authorized. Accepted responses include the secret-free resolved policy in `flags_applied.prerequisites`.
 
-Optional body field `interaction` (`"headless"` or `"interactive"`) is the typed way to choose the mode; it replaces putting a flag in `args`. When omitted, the server uses `daemon.features.worker.push.interaction` (default `headless`). A request that differs from that setting is refused unless `daemon.features.worker.push.allowOverride` is `true` (the default). `--headless` and `-n` in `args` are ignored.
+Optional body field `interaction` (`"headless"` or `"interactive"`) is the
+typed way to choose the mode. When omitted, the server uses
+`daemon.features.worker.push.interaction` (default `headless`). For
+`exec prompt` and `exec workflow`, `--headless`/`-n` and `--interactive` in
+`args` request the same choice; if a body field and flag disagree, admission
+returns HTTP 400 `invalid_request`. A request that differs from the configured
+mode is refused with HTTP 400 `interaction_override_refused` unless
+`daemon.features.worker.push.allowOverride` is `true` (the default). Refused
+requests are not enqueued.
 
 Returns immediately with a command ID — the command is **enqueued** and execution is asynchronous:
 
@@ -1248,6 +1339,11 @@ curl -sk https://localhost:9876/v1/worker/commands/<command-id>/events \
 
 **Behaviour notes:**
 
+- Agents that report OSC 7501 status produce a `program_status` SSE event with
+  the latest `state` and optional `kind`, `progress`, `msg`, and `app`. Events
+  are sent when the effective status changes; clearing a report produces no
+  status event. The event's `source` identifies its workflow step when
+  available. These events are also persisted with the command's event log.
 - The informational waiting event uses `attempt: 0` and `sequence: 0`; it is not a persisted event or a resume position.
 - Normal completion drains buffered stdout/stderr before the final workflow completion notifications and `done`. If a backend leaves an output pipe open, the server waits up to five seconds, logs a warning, and completes; trailing output may be missing in that exceptional case.
 - API stdout/stderr are published as lines. Ordinary text and stderr lines retain at most a 64 KiB prefix; if a line is longer, the excess is skipped through the next newline and the emitted line ends with ` [line truncated]`. Invalid UTF-8 is decoded lossily, and a final nonempty line without a newline is still emitted. Structured stdout frames are accepted up to 8 MiB; an oversized frame produces only a bounded activity hint, not its raw contents.
@@ -1565,6 +1661,12 @@ Match on `code`, not on the `error` text. Existing messages are preserved for co
 | `workflow_prerequisites_unresolved` | 409 | Workflow credential prerequisites could not be resolved |
 | `unknown_agent` | 404 | The requested agent is not defined |
 | `agent_untrusted` | 403 | The agent definition has not been trusted |
+| `terminal_not_found` | 404 | The terminal ID is malformed or does not name an available terminal |
+| `terminal_gone` | 410 | A well-formed terminal ID is unknown, forgotten, or expired |
+| `control_held` | 409 | Another viewer currently holds terminal input control |
+| `input_not_allowed` | 403 | Terminal input is not allowed by the listener or command settings |
+| `input_backpressure` | 429 | The agent is not reading terminal input and its input queue is full; retry later |
+| `interaction_override_refused` | 400 | The requested interaction mode differs from daemon policy and overrides are disabled |
 
 `unknown_subcommand`, `unknown_flag`, `forbidden_workdir` and the last six codes are the same values reported asynchronously in a command's `result.failure.code`, so one decoder serves both. Several of them can also be returned synchronously when a request is rejected at admission. `invalid_request`, `forbidden` and `not_found` are HTTP class codes only: a command that fails after admission reports the specific condition instead (see [Failure codes](#get-command-status)). A run whose setup actually fails uses `setup_failed`; submitting a new command to an unready session uses `session_not_ready`, because that command has not been admitted.
 

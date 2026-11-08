@@ -211,6 +211,12 @@ async fn every_route_error_has_code_and_authoritative_code_status_table_is_exerc
         ("agent_untrusted", 403),
         ("feature_degraded", 503),
         ("ephemeral_not_allowed", 403),
+        ("interaction_override_refused", 400),
+        ("terminal_not_found", 404),
+        ("terminal_gone", 410),
+        ("control_held", 409),
+        ("input_not_allowed", 403),
+        ("input_backpressure", 429),
     ]
     .into_iter()
     .collect::<std::collections::HashSet<_>>();

@@ -11,6 +11,7 @@ pub mod client;
 pub mod events;
 pub mod http_core;
 pub mod local;
+pub mod terminal_client;
 
 pub use client::{
     CancelCommandResponse, CommandListQuery, ExecArg, ExecJobResponse, JobStatus, RemoteClient,

@@ -20,6 +20,7 @@
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 
+use crate::data::program_status::ProgramState;
 use crate::frontend::tui::tabs::{
     format_duration, ContainerSlot, LastContainerSummary, Tab, TextSelection,
 };
@@ -104,6 +105,16 @@ pub fn render_container_maximized(
         None => format!(" \u{1F512} {} ({}) ", agent_name, runtime_label),
     };
     let right_title = info.map(build_stats_title_from_info).unwrap_or_default();
+    // Reported status and message go in the title line, truncated to what
+    // is left after the agent name and the stats.
+    let left_title = {
+        let used = left_title.chars().count() + right_title.chars().count();
+        let budget = (container_width as usize).saturating_sub(used + 6);
+        match slot_status_text(focused_slot, budget) {
+            Some(status) => format!("{}\u{2014} {} ", left_title, status),
+            None => left_title,
+        }
+    };
 
     let mut block = Block::default()
         .title(Line::from(left_title).alignment(Alignment::Left))
@@ -261,7 +272,9 @@ pub fn render_container_bars(tab: &Tab, area: Rect, frame: &mut Frame, skip_focu
 }
 
 fn render_one_minimized_bar(slot: &ContainerSlot, area: Rect, frame: &mut Frame) {
-    let (color, prefix) = if slot.stuck {
+    let stuck = slot.stuck && slot.program_status.is_none();
+    let reported_color = slot.program_status.as_ref().map(|s| s.state);
+    let (color, prefix) = if stuck {
         // Yellow + ⚠ prefix for stuck bars.
         (Color::Yellow, "\u{26a0} ")
     } else if slot.yolo_mode {
@@ -273,6 +286,10 @@ fn render_one_minimized_bar(slot: &ContainerSlot, area: Rect, frame: &mut Frame)
             Color::Yellow
         };
         (c, "")
+    } else if reported_color == Some(ProgramState::Blocked) {
+        (Color::Yellow, "")
+    } else if reported_color == Some(ProgramState::Error) {
+        (Color::Red, "")
     } else {
         (Color::Green, "")
     };
@@ -312,6 +329,11 @@ fn render_one_minimized_bar(slot: &ContainerSlot, area: Rect, frame: &mut Frame)
         stats_title.trim(),
         yolo_suffix
     );
+    // The agent's own status and message, when it reports one.
+    let content = match slot_status_text(slot, 60) {
+        Some(status) => format!("{content} | {status}"),
+        None => content,
+    };
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -328,6 +350,37 @@ fn render_one_minimized_bar(slot: &ContainerSlot, area: Rect, frame: &mut Frame)
 }
 
 // ─── Internals ──────────────────────────────────────────────────────────
+
+/// The agent's reported status as one line for the window title and the
+/// minimized bar: `🔒 blocked: permission — allow rm?`, or, for a working
+/// agent that has been quiet a while, `working · silent 12m`. At most
+/// `max_chars` characters; the message is sanitised and truncated first.
+/// `None` when the agent does not report (or has cleared its status).
+pub(crate) fn slot_status_text(slot: &ContainerSlot, max_chars: usize) -> Option<String> {
+    use crate::frontend::program_status_text::{display_msg, short_label, tab_glyph};
+    let status = slot.program_status.as_ref()?;
+    let head = match slot.silent_note() {
+        Some(note) => note,
+        None => {
+            let glyph = tab_glyph(status);
+            if glyph.is_empty() {
+                short_label(status)
+            } else {
+                format!("{glyph} {}", short_label(status))
+            }
+        }
+    };
+    let head_len = head.chars().count();
+    let msg_room = max_chars.saturating_sub(head_len + 3);
+    // Not enough room for a useful slice of the message: show the state only.
+    if msg_room < 8 {
+        return Some(head);
+    }
+    match status.msg.as_deref().map(|m| display_msg(m, msg_room)) {
+        Some(msg) if !msg.is_empty() => Some(format!("{head} \u{2014} {msg}")),
+        _ => Some(head),
+    }
+}
 
 /// Build the right-side stats title: `" {container} | {cpu} | {mem} | {dur} "`.
 /// Falls back to placeholder values until the first stats sample arrives.
@@ -674,6 +727,7 @@ mod tests {
         *yoloing.yolo_state.lock().unwrap() = Some(crate::frontend::tui::tabs::YoloState {
             step_name: "test".into(),
             remaining_secs: 7,
+            kind: Default::default(),
         });
         tab.container_slots.push(yoloing);
         tab.focused_slot_idx = 0;
@@ -696,6 +750,150 @@ mod tests {
         assert!(
             !text.contains("Yolo in"),
             "a non-yoloing minimized bar shows no countdown: {text}"
+        );
+    }
+
+    // ── Agent-reported status (OSC 7501) ────────────────────────────────
+
+    fn status(
+        state: ProgramState,
+        kind: Option<crate::data::program_status::BlockedKind>,
+        msg: &str,
+    ) -> crate::data::program_status::EffectiveStatus {
+        crate::data::program_status::EffectiveStatus {
+            state,
+            kind,
+            progress: None,
+            msg: Some(msg.to_string()),
+            app: None,
+            id: None,
+        }
+    }
+
+    fn render_maximized_to_text(tab: &mut Tab, width: u16, height: u16) -> String {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_container_maximized(tab, area, 0, frame);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let area = *buf.area();
+        (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" "))
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn window_title_shows_sanitised_truncated_msg() {
+        use crate::data::program_status::BlockedKind;
+        let mut tab = Tab::new(make_test_session());
+        let mut s = slot("");
+        // Bidi override and zero-width space are stripped; whitespace collapsed.
+        s.set_program_status(Some(status(
+            ProgramState::Blocked,
+            Some(BlockedKind::Permission),
+            "allow\u{202E}  rm\u{200B} -rf build",
+        )));
+        tab.container_slots.push(s);
+        let text = render_maximized_to_text(&mut tab, 120, 30);
+        assert!(
+            text.contains("blocked: permission"),
+            "title names the state and kind: {text}"
+        );
+        assert!(
+            text.contains("allow rm -rf build"),
+            "title shows the sanitised msg: {text}"
+        );
+        assert!(!text.contains('\u{202E}'), "bidi override must not render");
+
+        // A long msg is truncated with an ellipsis rather than overflowing.
+        let long = "x".repeat(400);
+        tab.container_slots[0].set_program_status(Some(status(ProgramState::Error, None, &long)));
+        let text = render_maximized_to_text(&mut tab, 120, 30);
+        let first_line = text.lines().find(|l| l.contains("error")).unwrap();
+        assert!(first_line.contains('\u{2026}'), "truncated: {first_line}");
+        assert!(!text.contains(&long));
+    }
+
+    #[test]
+    fn minimized_bar_shows_status_and_msg_and_never_the_stuck_prefix() {
+        use crate::data::program_status::BlockedKind;
+        let mut tab = Tab::new(make_test_session());
+        tab.container_slots.push(slot("build"));
+        let mut bg = slot("test");
+        bg.stuck = true; // a stale silence flag must not show for a reporting agent
+        bg.set_program_status(Some(status(
+            ProgramState::Blocked,
+            Some(BlockedKind::Question),
+            "which branch?",
+        )));
+        tab.container_slots.push(bg);
+        tab.focused_slot_idx = 0;
+        let text = render_bars_to_text(&tab, 120, PARALLEL_BAR_HEIGHT);
+        assert!(text.contains("which branch?"), "{text}");
+        assert!(text.contains("blocked: question"), "{text}");
+        assert!(
+            !text.contains('\u{26a0}'),
+            "reporting agents are never stuck: {text}"
+        );
+    }
+
+    #[test]
+    fn working_agent_quiet_for_a_while_shows_silent_note() {
+        let mut s = slot("build");
+        s.set_program_status(Some(status(ProgramState::Working, None, "compiling")));
+        assert_eq!(s.silent_note(), None, "fresh output: no note");
+        s.last_output_at = std::time::Instant::now() - std::time::Duration::from_secs(12 * 60);
+        let note = s.silent_note().expect("quiet working agent");
+        assert!(note.contains("silent 12m"), "{note}");
+        let text = slot_status_text(&s, 80).unwrap();
+        assert!(text.starts_with("working \u{b7} silent 12m"), "{text}");
+        // Information only: a done agent never gets the note.
+        s.set_program_status(Some(status(ProgramState::Done, None, "")));
+        assert_eq!(s.silent_note(), None);
+    }
+
+    /// An OSC 7501 sequence in the agent's output must render nothing in the
+    /// vt100 grid (no stray glyphs from an unrecognised OSC), and the surrounding
+    /// text must be intact.
+    #[test]
+    fn osc_7501_sequence_renders_nothing_visible() {
+        let mut parser = vt100::Parser::new(5, 40, 0);
+        parser.process(b"before\x1b]7501;state=working:msg=aGk=\x07after\r\n");
+        parser.process(b"\x1b]7501;state=done\x1b\\");
+        let contents = parser.screen().contents();
+        assert!(contents.contains("beforeafter"), "{contents:?}");
+        assert!(!contents.contains("7501"), "{contents:?}");
+        assert!(!contents.contains("working"), "{contents:?}");
+        assert!(!contents.contains('\u{1b}'), "{contents:?}");
+    }
+
+    /// The TUI renders by drawing cells into ratatui's buffer; raw agent bytes
+    /// (including OSC 7501) never reach the host terminal. Every rendered cell
+    /// is free of ESC/BEL.
+    #[test]
+    fn tui_renderer_never_forwards_raw_osc_to_the_host() {
+        let mut tab = Tab::new(make_test_session());
+        let mut s = slot("");
+        s.vt100_parser.process(
+            b"hi\x1b]7501;state=blocked:kind=permission:msg=aGk=\x07there\x1b]0;title\x07",
+        );
+        s.set_program_status(Some(status(ProgramState::Done, None, "all\u{1b}done")));
+        tab.container_slots.push(s);
+        let text = render_maximized_to_text(&mut tab, 100, 30);
+        assert!(text.contains("hithere"), "{text}");
+        assert!(
+            !text.contains('\u{1b}') && !text.contains('\u{7}'),
+            "no raw control bytes in the rendered buffer"
         );
     }
 }

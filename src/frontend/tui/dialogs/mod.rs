@@ -347,6 +347,8 @@ pub struct WorkflowControlBoardState {
 pub struct WorkflowYoloCountdownState {
     pub step_name: String,
     pub remaining_secs: u64,
+    /// Why the countdown runs; selects the wording.
+    pub kind: crate::engine::workflow::actions::CountdownKind,
 }
 
 #[derive(Debug, Clone)]

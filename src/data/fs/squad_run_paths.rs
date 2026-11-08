@@ -22,6 +22,43 @@ pub struct SquadRunPaths {
 }
 
 impl SquadRunPaths {
+    /// Append a terminal lifecycle/control event to this run's durable log.
+    /// The daemon's single owner-event writer serializes calls to this method.
+    pub fn append_event(
+        &self,
+        source: Option<crate::data::execution_event::EventSource>,
+        payload: crate::data::execution_event::EventPayload,
+    ) -> Result<(), DataError> {
+        use std::io::Write;
+        self.prepare()?;
+        let path = self.log_dir.join("events.log");
+        let previous = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(DataError::io(&path, e)),
+        };
+        let sequence = crate::data::execution_event::parse_event_log(&previous)
+            .last()
+            .map_or(0, |event| event.sequence + 1);
+        let event = crate::data::execution_event::ExecutionEvent {
+            timestamp: chrono::Utc::now(),
+            attempt: 1,
+            sequence,
+            source,
+            payload,
+        };
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|e| DataError::io(&path, e))?;
+        if !previous.is_empty() && !previous.ends_with('\n') {
+            file.write_all(b"\n").map_err(|e| DataError::io(&path, e))?;
+        }
+        let mut line = serde_json::to_vec(&event).expect("execution event serializes");
+        line.push(b'\n');
+        file.write_all(&line).map_err(|e| DataError::io(&path, e))
+    }
     /// Resolve the run's directories from the task workspace and the run id.
     ///
     /// Fails when `task_dir` has no parent — a workspace path that is not
@@ -90,5 +127,46 @@ mod tests {
         assert!(paths.log_dir().is_dir());
         paths.prepare().unwrap();
         assert!(paths.log_dir().is_dir());
+    }
+}
+
+#[cfg(test)]
+mod terminal_event_regression {
+    use super::*;
+    #[test]
+    fn run_events_have_durable_monotonic_sequence_and_attribution() {
+        use crate::data::execution_event::{
+            parse_event_log, EventPayload, EventSource, EventSourcePhase,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let paths = SquadRunPaths::new(&temp.path().join("task/workspace"), &RunId::new()).unwrap();
+        let terminal_id = crate::data::ids::TerminalId::new();
+        let source = Some(EventSource::step(EventSourcePhase::Main, "test", 0));
+        paths
+            .append_event(
+                source.clone(),
+                EventPayload::TerminalOpened {
+                    terminal_id: terminal_id.clone(),
+                    agent: "fixture".into(),
+                    model: None,
+                    cols: 80,
+                    rows: 24,
+                },
+            )
+            .unwrap();
+        paths
+            .append_event(
+                source.clone(),
+                EventPayload::TerminalClosed {
+                    terminal_id,
+                    exit_code: 7,
+                },
+            )
+            .unwrap();
+        let events =
+            parse_event_log(&std::fs::read_to_string(paths.log_dir().join("events.log")).unwrap());
+        assert_eq!(events.len(), 2);
+        assert_eq!((events[0].sequence, events[1].sequence), (0, 1));
+        assert_eq!(events[1].source, source);
     }
 }

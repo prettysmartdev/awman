@@ -118,6 +118,11 @@ pub enum Control {
 }
 pub trait ExecControl: Send + Sync {
     fn send(&self, command: Control) -> Result<(), EngineError>;
+    /// Bounded input consumed by the actual guest/socket writer. Viewer input
+    /// must never be forwarded into the ordinary unbounded control queue.
+    fn terminal_stdin(&self) -> Option<tokio::sync::mpsc::Sender<Vec<u8>>> {
+        None
+    }
 }
 pub struct ExecSession {
     pub events: tokio::sync::broadcast::Receiver<ExecEvent>,

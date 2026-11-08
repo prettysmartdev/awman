@@ -14,6 +14,7 @@
 //! [`CallerContext::leaf`](crate::command::dispatch::CallerContext::leaf).
 
 use crate::command::commands::agents::AgentsCommand;
+use crate::command::commands::attach::AttachCommand;
 use crate::command::commands::chat::ChatCommand;
 use crate::command::commands::clean::CleanCommand;
 use crate::command::commands::config::ConfigCommand;
@@ -24,7 +25,6 @@ use crate::command::commands::new::NewCommand;
 use crate::command::commands::ready::ReadyCommand;
 use crate::command::commands::remote::RemoteCommand;
 use crate::command::commands::specs::SpecsCommand;
-use crate::command::commands::squad::attach::SquadAttachCommand;
 use crate::command::commands::squad::commands::SquadCommand;
 use crate::command::dispatch::{BuildContext, BuiltCommand};
 use crate::command::error::CommandError;
@@ -53,6 +53,10 @@ pub fn ready(ctx: &BuildContext) -> Result<BuiltCommand, CommandError> {
 
 pub fn chat(ctx: &BuildContext) -> Result<BuiltCommand, CommandError> {
     Ok(BuiltCommand::Chat(ChatCommand::from_input(ctx)?))
+}
+
+pub fn attach(ctx: &BuildContext) -> Result<BuiltCommand, CommandError> {
+    Ok(BuiltCommand::Attach(AttachCommand::from_input(ctx)?))
 }
 
 pub fn specs(ctx: &BuildContext) -> Result<BuiltCommand, CommandError> {
@@ -90,9 +94,9 @@ pub fn squad(ctx: &BuildContext) -> Result<BuiltCommand, CommandError> {
 }
 
 pub fn squad_attach(ctx: &BuildContext) -> Result<BuiltCommand, CommandError> {
-    Ok(BuiltCommand::SquadAttach(SquadAttachCommand::from_input(
-        ctx,
-    )?))
+    let target = ctx.args.require("name")?;
+    let attach = AttachCommand::from_task_input(ctx, &target)?;
+    Ok(BuiltCommand::Attach(attach))
 }
 
 pub fn remote(ctx: &BuildContext) -> Result<BuiltCommand, CommandError> {

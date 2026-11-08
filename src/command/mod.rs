@@ -11,11 +11,15 @@ pub mod dispatch;
 pub mod error;
 pub mod git_summary;
 pub mod headless;
+pub mod host_output;
+pub mod interaction;
+pub mod program_status_projection;
 pub mod prompts;
 pub mod session_create;
 pub mod session_setup;
 pub mod startup;
 pub mod stats_sampler;
+pub mod terminals;
 
 pub use dispatch::catalogue::{CommandCatalogue, CommandSpec, FlagSpec, FrontendVisibility};
 pub use dispatch::{

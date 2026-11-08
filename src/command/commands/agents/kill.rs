@@ -366,6 +366,7 @@ mod tests {
             tab_number: 4,
             container_name: Some("awman-one".into()),
             is_stuck: false,
+            program_status: None,
             command_label: "chat".into(),
         }]));
         let _ = kill("awman-one", false, rt.clone())

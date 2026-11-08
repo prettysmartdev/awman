@@ -34,6 +34,8 @@ use crate::frontend::tui::user_message::{SharedStatusLog, TuiUserMessageSink};
 /// The TUI populates these channels from `App::spawn_command`; the engine's
 /// container backend drains them against a real PTY master.
 pub struct TuiCommandFrontend {
+    pub(crate) attach_exit_code: std::sync::Arc<std::sync::atomic::AtomicI32>,
+    pub(crate) attach_hangup: tokio_util::sync::CancellationToken,
     parsed: ParsedCommandBoxInput,
     pub(crate) messages: TuiUserMessageSink,
     pub(crate) pty_active: bool,
@@ -45,6 +47,8 @@ pub struct TuiCommandFrontend {
     pub(crate) container: ContainerLifecycle,
     pub(crate) yolo_state: SharedYoloState,
     pub(crate) yolo_cancel_flag: SharedYoloCancelFlag,
+    /// Why the running sequential countdown exists (dialog wording).
+    pub(crate) countdown_kind: crate::engine::workflow::actions::CountdownKind,
     /// Output sender for the current sequential launch only.
     pub(crate) stdout_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
     /// The `agents status` dashboard slot. The command writes each frame
@@ -53,6 +57,8 @@ pub struct TuiCommandFrontend {
     /// Live TUI context shared with the event loop. The event loop refreshes
     /// this on every tick; `agents status --watch` reads it each iteration.
     pub(crate) tui_context_shared: SharedTuiContext,
+    /// Active-tab suppression inputs (last user input, latest agent status).
+    pub(crate) signals: crate::frontend::tui::tabs::AgentSignals,
     /// The tab's command-cancel token: ends an `agents status --watch` loop
     /// or an `agents attach` session (new command, tab closed, Esc).
     pub(crate) command_cancel: tokio_util::sync::CancellationToken,
@@ -82,6 +88,7 @@ pub struct TuiCommandFrontend {
     /// container window; cleared when the step ends or a PTY launch takes the
     /// window over.
     pub(crate) phase_stream_open: bool,
+    pub(crate) host_output_policy: crate::data::terminal::HostOutputPolicy,
 }
 
 // `SquadCommandFrontend` for `TuiCommandFrontend` (interview dialogs) lives in
@@ -105,8 +112,42 @@ impl DialogChannels {
 }
 
 impl TuiCommandFrontend {
+    /// Active-tab suppression for an agent's `idle`/`done` report: hold back
+    /// the dialog or countdown while the user has typed or scrolled on this
+    /// tab within `agents.stuckTimeout`, so an interactive step does not
+    /// pop a dialog on every turn. The engine has already decided what a
+    /// report means; this only delays showing it. `blocked`/`error` never
+    /// come through here. Gives up early if the agent resumes (a `working`,
+    /// `blocked` or `error` report) or the command is cancelled.
+    pub(crate) fn wait_for_quiet_user(&self) {
+        while self.should_defer_for_user() {
+            if self.command_cancel.is_cancelled() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+    }
+
+    /// Whether an `idle`/`done` dialog should still wait: the user interacted
+    /// with this tab within `agents.stuckTimeout` and the agent has not moved
+    /// on to `working`, `blocked` or `error` (which are never deferred).
+    pub(crate) fn should_defer_for_user(&self) -> bool {
+        use crate::data::program_status::ProgramState;
+        let window = crate::engine::container::timing::DEFAULT_STUCK_TIMEOUT;
+        if !self.signals.user_active_within(window) {
+            return false;
+        }
+        let resumed = self
+            .signals
+            .status()
+            .is_some_and(|s| !matches!(s.state, ProgramState::Done | ProgramState::Idle));
+        !resumed
+    }
+
     pub(crate) fn squad_attach_has_explicit_target(&self) -> bool {
-        self.parsed.args.has_flag("container")
+        // squad attach now resolves the task's hub terminal; the legacy
+        // container-selection flag is no longer part of its catalogue.
+        false
     }
 
     /// Build the frontend for one command run in one tab.
@@ -126,6 +167,7 @@ impl TuiCommandFrontend {
             status_log,
             agents_dashboard,
             tui_context_shared,
+            signals,
             command_cancel,
         } = shared;
         let DialogChannels {
@@ -145,11 +187,15 @@ impl TuiCommandFrontend {
             container,
             yolo_state,
             yolo_cancel_flag,
+            countdown_kind: Default::default(),
             stdout_tx,
             agents_dashboard,
             tui_context_shared,
+            signals,
             command_cancel,
             squad_attach_session: None,
+            attach_exit_code: Default::default(),
+            attach_hangup: Default::default(),
             squad_attach_reachable: None,
             squad_attach_metadata: HashMap::new(),
             parallel_group_active: false,
@@ -158,6 +204,7 @@ impl TuiCommandFrontend {
             last_config_edit_field: None,
             phase_stream_title: None,
             phase_stream_open: false,
+            host_output_policy: crate::data::terminal::HostOutputPolicy::default(),
         }
     }
 
@@ -252,6 +299,57 @@ impl TuiCommandFrontend {
             .map_err(|_| CommandError::Aborted)
     }
 
+    /// Present a workflow board opened because of the agent's own report
+    /// (WI 0141). If the agent resumes (`working` or a clear) before the
+    /// user has touched the board, it is closed for them and answered
+    /// `Dismissed`, whether it is visible or still queued on a background
+    /// tab. Any key or scroll on the tab after it opened keeps it.
+    pub(crate) fn ask_report_dialog(
+        &self,
+        request: DialogRequest,
+    ) -> Result<DialogResponse, CommandError> {
+        // A request left over from an earlier board must not close this one.
+        self.signals.take_report_dialog_dismiss();
+        let opened = std::time::Instant::now();
+        let _ = self.dialog_tx.send(request);
+        let rx = self.dialog_rx.lock().map_err(|_| CommandError::Aborted)?;
+        let mut dismiss_requested = false;
+        // The tab learns of reports asynchronously: only a resume seen
+        // after the reported problem/done itself reached the tab counts.
+        let mut seen_report = !self.agent_resumed();
+        loop {
+            match rx.recv_timeout(std::time::Duration::from_millis(100)) {
+                Ok(response) => return Ok(response),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(CommandError::Aborted)
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            }
+            if dismiss_requested || self.command_cancel.is_cancelled() {
+                continue;
+            }
+            let resumed = self.agent_resumed();
+            if !resumed {
+                seen_report = true;
+                continue;
+            }
+            let touched = self.signals.last_user_input().is_some_and(|t| t >= opened);
+            if seen_report && !touched {
+                self.signals.request_report_dialog_dismiss();
+                dismiss_requested = true;
+            }
+        }
+    }
+
+    /// Whether the agent's latest report is `working` or a clear: a board
+    /// opened for an earlier report is stale.
+    pub(crate) fn agent_resumed(&self) -> bool {
+        use crate::data::program_status::ProgramState;
+        self.signals
+            .status()
+            .is_none_or(|s| s.state == ProgramState::Working)
+    }
+
     /// Draw a `Prompt<D>` as a `KindSelect` dialog and map the answer back.
     ///
     /// The one place the TUI turns a prompt into a modal: the title and the
@@ -331,6 +429,9 @@ impl UserMessageSink for TuiCommandFrontend {
 impl CommandFrontend for TuiCommandFrontend {
     fn kind(&self) -> crate::command::dispatch::catalogue::FrontendKind {
         crate::command::dispatch::catalogue::FrontendKind::Tui
+    }
+    fn set_host_output_policy(&mut self, policy: crate::data::terminal::HostOutputPolicy) {
+        self.host_output_policy = policy;
     }
     fn flag_bool(&self, _command_path: &[&str], flag: &str) -> Result<Option<bool>, CommandError> {
         Ok(self.parsed.args.flag_bool(flag))
@@ -426,12 +527,16 @@ mod tests {
     }
 
     #[test]
-    fn squad_attach_target_is_explicit_only_when_container_was_passed() {
+    fn squad_attach_resolves_the_task_and_refuses_the_removed_container_flag() {
         let attach = |raw: &str| {
             let parsed = parse(raw, CommandCatalogue::get()).unwrap();
             test_command_frontend(&["squad", "attach"], parsed.args).0
         };
         assert!(!attach("squad attach nightly").squad_attach_has_explicit_target());
-        assert!(attach("squad attach nightly --container c1").squad_attach_has_explicit_target());
+        assert!(parse(
+            "squad attach nightly --container c1",
+            CommandCatalogue::get()
+        )
+        .is_err());
     }
 }

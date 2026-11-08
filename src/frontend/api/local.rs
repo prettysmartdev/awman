@@ -224,6 +224,8 @@ where
         let service = hyper_util::service::TowerToHyperService::new(router);
         let _ = hyper::server::conn::http1::Builder::new()
             .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+            // `/v1/terminals/{id}` upgrades to a WebSocket (WI 0141).
+            .with_upgrades()
             .await;
     });
 }

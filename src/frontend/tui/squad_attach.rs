@@ -14,6 +14,7 @@ use crate::data::message::MessageLevel;
 use crate::data::workflow_state::WorkflowState;
 use crate::engine::agent_runtime::frontend::AgentIo;
 use crate::engine::agent_runtime::AgentInstance;
+use crate::frontend::terminal_output_filter::HostOutputFilter;
 use crate::frontend::tui::app::{App, Focus};
 use crate::frontend::tui::command_frontend::TuiCommandFrontend;
 use crate::frontend::tui::dialogs::{DialogRequest, DialogResponse};
@@ -131,6 +132,25 @@ impl SquadAttachFrontend for TuiCommandFrontend {
             .unwrap_or_else(|| ("agent".to_string(), None));
 
         let (stdout_tx, stdout_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let (agent_output_tx, mut agent_output_rx) =
+            tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let filtered_output_tx = stdout_tx.clone();
+        let policy = self.host_output_policy;
+        tokio::spawn(async move {
+            let mut filter = HostOutputFilter::new(policy);
+            while let Some(bytes) = agent_output_rx.recv().await {
+                let mut safe = Vec::new();
+                filter.feed(&bytes, &mut safe);
+                if !safe.is_empty() && filtered_output_tx.send(safe).is_err() {
+                    return;
+                }
+            }
+            let mut safe = Vec::new();
+            filter.finish(&mut safe);
+            if !safe.is_empty() {
+                let _ = filtered_output_tx.send(safe);
+            }
+        });
         let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
         let (resize_tx, resize_rx) = tokio::sync::mpsc::unbounded_channel::<(u16, u16)>();
         let initial_size = crossterm::terminal::size()
@@ -139,8 +159,8 @@ impl SquadAttachFrontend for TuiCommandFrontend {
             })
             .unwrap_or((80, 24));
         let io = AgentIo {
-            stdout: stdout_tx.clone(),
-            stderr: stdout_tx,
+            stdout: agent_output_tx.clone(),
+            stderr: agent_output_tx,
             stdin_tx: stdin_tx.clone(),
             stdin_rx,
             resize: Some(resize_rx),

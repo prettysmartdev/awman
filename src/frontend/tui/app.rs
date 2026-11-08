@@ -13,7 +13,7 @@ use crate::command::error::CommandError;
 use crate::command::git_summary::GitSummaryPoller;
 use crate::command::stats_sampler::{ContainerStatsSampler, StatsRequest, StatsTarget};
 use crate::data::config::env::Env;
-use crate::data::session::Session;
+use crate::data::session::{Session, SessionId};
 use crate::data::session_manager::SessionManager;
 use crate::frontend::tui::command_frontend::{DialogChannels, TuiCommandFrontend};
 use crate::frontend::tui::dialogs::{Dialog, DialogRequest, DialogResponse};
@@ -65,6 +65,9 @@ pub struct App {
     pub tabs: Vec<Tab>,
     pub active_tab: usize,
     pub active_dialog: Option<Dialog>,
+    /// One queued request per tab, retained until that tab is focused. This
+    /// also lets the host terminal show a background tab waiting on input.
+    pub(super) pending_dialog_requests: std::collections::HashMap<SessionId, DialogRequest>,
     pub focus: Focus,
     pub catalogue: &'static CommandCatalogue,
     pub engines: Engines,
@@ -129,6 +132,7 @@ impl App {
             tabs: vec![initial_tab],
             active_tab: 0,
             active_dialog: None,
+            pending_dialog_requests: std::collections::HashMap::new(),
             focus: Focus::CommandBox,
             catalogue,
             engines,
@@ -766,6 +770,7 @@ impl App {
                         tab_number: (i + 1) as u32,
                         container_name,
                         is_stuck: t.stuck,
+                        program_status: t.program_status(),
                         command_label,
                     }
                 })
@@ -882,6 +887,7 @@ impl App {
                     crate::frontend::tui::dialogs::WorkflowYoloCountdownState {
                         step_name: state.step_name.clone(),
                         remaining_secs: state.remaining_secs,
+                        kind: state.kind,
                     },
                 ));
             }
@@ -969,12 +975,25 @@ impl App {
     /// Check the active tab's dialog_request_rx and open the corresponding
     /// dialog in the App.
     pub fn poll_dialog_requests(&mut self) {
-        let request = {
-            let tab = &self.tabs[self.active_tab];
-            tab.dialog_request_rx
-                .as_ref()
-                .and_then(|rx| rx.try_recv().ok())
-        };
+        self.pending_dialog_requests
+            .retain(|id, _| self.tabs.iter().any(|tab| tab.session_id == *id));
+        for tab in &self.tabs {
+            if let std::collections::hash_map::Entry::Vacant(entry) =
+                self.pending_dialog_requests.entry(tab.session_id)
+            {
+                if let Some(request) = tab
+                    .dialog_request_rx
+                    .as_ref()
+                    .and_then(|rx| rx.try_recv().ok())
+                {
+                    entry.insert(request);
+                }
+            }
+        }
+        self.dismiss_stale_report_boards();
+        let request = self
+            .pending_dialog_requests
+            .remove(&self.tabs[self.active_tab].session_id);
 
         if let Some(request) = request {
             let dialog = match request {
@@ -1125,6 +1144,45 @@ impl App {
                         std::time::Instant::now() + std::time::Duration::from_secs(s.remaining_secs)
                     })
                 });
+        }
+    }
+
+    /// WI 0141: close a workflow board the agent's own report opened once
+    /// the command says the agent resumed before the user touched it (see
+    /// `TuiCommandFrontend::ask_report_dialog`). A visible board is closed;
+    /// one still queued for a background tab is dropped. Either way the
+    /// command gets `Dismissed`, and the step keeps running.
+    fn dismiss_stale_report_boards(&mut self) {
+        fn is_board(request: &DialogRequest) -> bool {
+            matches!(
+                request,
+                DialogRequest::WorkflowControlBoard(_) | DialogRequest::WorkflowStepConfirm(_)
+            )
+        }
+        for index in 0..self.tabs.len() {
+            if !self.tabs[index].shared.signals.take_report_dialog_dismiss() {
+                continue;
+            }
+            let session = self.tabs[index].session_id;
+            let visible = index == self.active_tab
+                && matches!(
+                    self.active_dialog,
+                    Some(Dialog::WorkflowControlBoard(_) | Dialog::WorkflowStepConfirm(_))
+                );
+            let queued = self
+                .pending_dialog_requests
+                .get(&session)
+                .is_some_and(is_board);
+            if visible {
+                self.active_dialog = None;
+            } else if queued {
+                self.pending_dialog_requests.remove(&session);
+            } else {
+                continue;
+            }
+            if let Some(tx) = &self.tabs[index].dialog_response_tx {
+                let _ = tx.send(DialogResponse::Dismissed);
+            }
         }
     }
 
@@ -1531,6 +1589,7 @@ mod tests {
         *tab.container_slots[1].yolo_state.lock().unwrap() = Some(YoloState {
             step_name: "test".into(),
             remaining_secs: 12,
+            kind: Default::default(),
         });
 
         app.tick_all_tabs();
@@ -1638,6 +1697,7 @@ mod tests {
         *tab.container_slots[1].yolo_state.lock().unwrap() = Some(YoloState {
             step_name: "test".into(),
             remaining_secs: 12,
+            kind: Default::default(),
         });
 
         app.tick_all_tabs();
@@ -1664,6 +1724,7 @@ mod tests {
         *tab.container_slots[0].yolo_state.lock().unwrap() = Some(YoloState {
             step_name: "test".into(),
             remaining_secs: 12,
+            kind: Default::default(),
         });
 
         app.tick_all_tabs();
@@ -1980,5 +2041,67 @@ mod tests {
         assert!(state.editing);
         assert_eq!(state.editor.text, "claude::draft-unsaved");
         assert_eq!(state.error.as_deref(), Some("could not save"));
+    }
+
+    // ── WI 0141: stale report-opened boards ──────────────────────────────
+
+    fn step_confirm() -> DialogRequest {
+        DialogRequest::WorkflowStepConfirm(
+            crate::frontend::tui::dialogs::WorkflowStepConfirmState {
+                completed_step: "plan".into(),
+                next_step: "build".into(),
+            },
+        )
+    }
+
+    /// Review finding: a board the agent's report opened is closed and
+    /// answered `Dismissed` once the command says the agent resumed.
+    #[test]
+    fn a_visible_report_board_is_dismissed_when_the_agent_resumes() {
+        let mut app = make_app();
+        let (req_tx, req_rx) = std::sync::mpsc::channel();
+        let (resp_tx, resp_rx) = std::sync::mpsc::channel();
+        app.tabs[0].dialog_request_rx = Some(req_rx);
+        app.tabs[0].dialog_response_tx = Some(resp_tx);
+        req_tx.send(step_confirm()).unwrap();
+        app.poll_dialog_requests();
+        assert!(matches!(
+            app.active_dialog,
+            Some(Dialog::WorkflowStepConfirm(_))
+        ));
+        app.poll_dialog_requests();
+        assert!(app.active_dialog.is_some(), "no request: the board stays");
+
+        app.tabs[0].shared.signals.request_report_dialog_dismiss();
+        app.poll_dialog_requests();
+        assert!(app.active_dialog.is_none());
+        assert!(matches!(resp_rx.try_recv(), Ok(DialogResponse::Dismissed)));
+    }
+
+    /// …and one not yet presented is dropped without being shown.
+    #[test]
+    fn a_queued_report_board_is_dropped_when_the_agent_resumes() {
+        let mut app = make_app();
+        let (req_tx, req_rx) = std::sync::mpsc::channel();
+        let (resp_tx, resp_rx) = std::sync::mpsc::channel();
+        app.tabs[0].dialog_request_rx = Some(req_rx);
+        app.tabs[0].dialog_response_tx = Some(resp_tx);
+        req_tx.send(step_confirm()).unwrap();
+        app.tabs[0].shared.signals.request_report_dialog_dismiss();
+        app.poll_dialog_requests();
+        assert!(app.active_dialog.is_none(), "a stale board is never shown");
+        assert!(matches!(resp_rx.try_recv(), Ok(DialogResponse::Dismissed)));
+        // Another dialog is never closed by the request.
+        req_tx
+            .send(DialogRequest::YesNo {
+                title: "t".into(),
+                body: "b".into(),
+            })
+            .unwrap();
+        app.poll_dialog_requests();
+        app.tabs[0].shared.signals.request_report_dialog_dismiss();
+        app.poll_dialog_requests();
+        assert!(matches!(app.active_dialog, Some(Dialog::YesNo { .. })));
+        assert!(resp_rx.try_recv().is_err());
     }
 }

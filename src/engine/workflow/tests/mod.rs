@@ -9,6 +9,7 @@ mod coverage_parallel;
 mod finish;
 mod parallel;
 mod phases;
+mod program_status;
 mod single;
 mod state_snapshot;
 

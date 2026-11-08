@@ -151,6 +151,23 @@ The daemon-specific settings live under `daemon.*` in global configuration.
 See [Configuration](07-configuration.md#reference-all-keys) for defaults,
 environment variable names, and all feature-specific worker and squad settings.
 
+`daemon.terminal.cols` and `daemon.terminal.rows` set the starting dimensions
+for daemon-managed interactive terminals (120×40 by default). A changed size
+applies to new terminals; an already running terminal retains its size.
+`daemon.terminal.remoteInput` defaults to `false`; network viewers can send
+input only when this setting and the command's remote-input permission are
+both enabled.
+
+The `daemon.features.squad.interaction` and
+`daemon.features.worker.push.interaction` settings select `interactive` PTY
+mode or `headless` piped mode for each feature. Their defaults are interactive
+and headless respectively. Each feature's `allowOverride` (true by default)
+controls whether a particular run can request a different mode. The settings
+are live and global; denied overrides fail before the run is queued.
+Configuration also accepts `daemon.features.worker.pull.interaction`
+(`interactive` by default), but the daemon does not currently run pulled jobs,
+so that setting has no effect yet.
+
 
 ## Live changes and shutdown
 

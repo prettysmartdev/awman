@@ -39,3 +39,22 @@ fn ready_non_interactive_implied_by_json() {
         json_flag.implies
     );
 }
+
+#[test]
+fn agents_json_state_spellings_for_reported_status() {
+    use awman::command::commands::agents::AgentState;
+    for (state, spelling) in [
+        (AgentState::Waiting, "waiting"),
+        (AgentState::Errored, "errored"),
+        (AgentState::Done, "done"),
+        (AgentState::Stuck, "stuck"),
+        (AgentState::Running, "running"),
+    ] {
+        assert_eq!(
+            serde_json::to_value(state).unwrap(),
+            serde_json::json!(spelling),
+            "`agents status --json` spells {state:?} as {spelling}"
+        );
+        assert_eq!(state.label(), spelling);
+    }
+}

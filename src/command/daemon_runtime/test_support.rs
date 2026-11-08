@@ -59,7 +59,9 @@ impl DaemonRuntime {
                 agent_engine: engines.agent_engine.clone(),
                 credential_monitor: engines.credential_monitor.clone(),
                 max_concurrent_jobs: config.daemon().max_concurrent_jobs,
-                terminal_hub: Arc::new(crate::engine::daemon::core::NoTerminalHub),
+                terminal_hub: Arc::new(crate::engine::daemon::core::TerminalHub::new(
+                    crate::engine::daemon::core::TerminalHubConfig::default(),
+                )),
             },
             api.store.clone(),
         )
@@ -119,6 +121,7 @@ impl DaemonRuntime {
             apply_worker: Box::new(|_| {}),
             changes: tokio::sync::Mutex::new(()),
             shutdown_done: AtomicBool::new(false),
+            terminals: Default::default(),
             core,
             engines,
         })

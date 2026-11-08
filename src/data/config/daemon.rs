@@ -82,6 +82,7 @@ section!(FeaturesConfig {
 section!(SquadFeatureConfig {
     enabled: bool,
     interaction: Interaction,
+    allow_override: bool,
     max_concurrent_jobs: usize,
     max_concurrent_evaluations: usize,
     env_persistence: EnvPersistenceSetting,
@@ -148,6 +149,8 @@ pub struct NetworkSettings {
 pub struct SquadSettings {
     pub enabled: bool,
     pub interaction: Interaction,
+    /// Whether a task's `exec.interaction` may differ from `interaction`.
+    pub allow_override: bool,
     pub max_concurrent_jobs: usize,
     pub max_concurrent_evaluations: usize,
     pub env_persistence: EnvPersistenceSetting,
@@ -210,6 +213,7 @@ impl DaemonSettings {
             squad: SquadSettings {
                 enabled: squad.enabled.unwrap_or(false),
                 interaction: squad.interaction.unwrap_or(Interaction::Interactive),
+                allow_override: squad.allow_override.unwrap_or(true),
                 max_concurrent_jobs: squad.max_concurrent_jobs.unwrap_or(1),
                 max_concurrent_evaluations: squad.max_concurrent_evaluations.unwrap_or(2),
                 env_persistence: squad.env_persistence.unwrap_or_default(),

@@ -105,6 +105,17 @@ pub struct AvailableActions {
     /// own ([`crate::engine::workflow::frontend::WorkflowFrontend::ask_parallel_group`]).
     /// A frontend uses it only to label those actions accordingly.
     pub acts_on_parallel_group: bool,
+    /// The focused step's agent's latest OSC 7501 report (WI 0141), when it
+    /// has one. Set on every board opened while the agent reports; a board
+    /// opened *because of* a report (non-yolo `done`/`idle`, `blocked`,
+    /// `error`) always carries it. Frontends show the state, kind and `msg`
+    /// (untrusted agent text: render it as plain text, truncated).
+    ///
+    /// A board that carries a report and that the user has not touched yet
+    /// may be dismissed by the frontend (answer [`NextAction::Dismiss`]) when
+    /// the same agent later reports `working` — the engine's call is
+    /// blocking, so closing an auto-opened board is the frontend's job.
+    pub reported_status: Option<crate::data::program_status::EffectiveStatus>,
 }
 
 /// An answer to one of the engine's follow-up questions about a running
@@ -218,6 +229,29 @@ pub enum CountdownKind {
     /// A step's container exited non-zero and no one can be asked what to do;
     /// when the countdown expires the engine retries that same step.
     FailureRetry,
+    /// The step's agent said it has finished (it reported `done`, or `idle`:
+    /// its turn ended). When the countdown expires the engine kills the
+    /// container and advances, exactly like `StuckStep` expiry; on the last
+    /// step that completes the workflow. A `working` report or the container
+    /// exiting first cancels it. Short: [`agent_done_countdown_duration`].
+    /// Reader-facing label: "Agent reported done: advancing in 8s".
+    ///
+    /// [`agent_done_countdown_duration`]: crate::engine::workflow::timing::agent_done_countdown_duration
+    AgentDone,
+    /// The step's agent is waiting for an answer (it reported `blocked` on a
+    /// permission, a question or a login) and no one is there to give it.
+    /// When the countdown expires the engine kills the container and
+    /// **fails** the step, which then takes the normal unattended failure
+    /// path (one retry, then the workflow fails). Never an advance.
+    /// Reader-facing label: "Agent is waiting for input: failing step in 42s".
+    AgentBlocked,
+    /// The step's agent reported an `error`. When the countdown expires the
+    /// engine kills the container and **fails** the step, so `on_failure`
+    /// remediation and the `FailureRetry` path apply. Any new output or a
+    /// `working` report first cancels it (the agent recovered). Never an
+    /// advance. Reader-facing label: "Agent reported an error: failing step
+    /// in 42s".
+    AgentError,
 }
 
 /// What `step_once` returned: the step that just executed plus its outcome.

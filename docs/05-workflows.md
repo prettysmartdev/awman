@@ -1272,7 +1272,7 @@ Running: plan     ┃  ● implement    ✓ review    ⚠️ docs
 |--------|---------|
 | **●** (Blue, bold) | Step is currently running |
 | **✓** (Green) | Step completed successfully |
-| **⚠️** (Yellow, bold) | Step is stuck (no output for 30 seconds) |
+| **⚠️** (Yellow, bold) | A non-reporting agent is stuck (no output for the configured timeout) |
 | **●** (Gray, dim) | Step is pending |
 | **✗** (Red, bold) | Step encountered an error |
 | **🔧** (Magenta, bold) | Step failed and remediation is in progress (on_failure agent running) |
@@ -1307,12 +1307,12 @@ When a setup or teardown step fails and has an `on_failure` block, the step stat
 
 ### Stuck steps
 
-When a step produces no output for more than 30 seconds, it is marked as stuck in the overview. Stuck steps show a warning indicator (⚠️) both in the overview box and in the tab label.
+When a step whose agent is not reporting program status produces no output for longer than the configured stuck timeout (30 seconds by default), it is marked as stuck in the overview. Stuck steps show a warning indicator (⚠️) both in the overview box and in the tab label. A reported `working` status suppresses this silence rule; quiet reporting agents may show `working · silent …` as an informational note.
 
 Stuck steps trigger automatic behavior depending on the mode:
 - In **yolo mode**: the engine starts a 60-second countdown. When it expires, the step is auto-advanced. If the user cancels (Esc) and the step re-stucks, the countdown restarts from 60 seconds with no backoff.
 - In **non-yolo mode**: the workflow control board opens automatically so you can decide what to do.
-- In either mode, new PTY output immediately clears the stuck state and cancels any active countdown.
+- For a non-reporting agent, new PTY output immediately clears the stuck state and cancels any active countdown.
 
 You can always open the control board manually via **Ctrl+W** regardless of stuck status.
 
@@ -1339,14 +1339,58 @@ When a step completes, awman shows the lightweight confirmation dialog. To see a
 
 ---
 
+## Agent-reported status
+
+Agents that report program status can guide workflow progression without
+waiting for silence detection. `working` keeps the step running indefinitely,
+even when it produces no output. `done` or `idle` starts a 10-second
+completion countdown in unattended or yolo runs; it then stops that agent and
+advances to the next step. On the last step, an unattended or yolo run
+completes without opening a final review board; this includes the agents of
+a final parallel group, each of which is stopped and advanced by its own
+countdown. While you are typing or scrolling on that agent's tab in the TUI,
+the completion countdown waits and starts in full once you stop. In attended
+non-yolo runs, awman opens the step-completion confirmation immediately and
+opens the workflow review board for the last step. If the agent reports
+`working` again before you touch a board it opened, the board closes by
+itself and the step keeps running.
+
+`blocked` and `error` reports never trigger automatic progression to the next
+step. You can still choose an explicit next-step action on the control board.
+In an attended non-yolo run, awman opens the control board with the
+reported reason. In yolo mode with a user present, `blocked` pauses for you;
+answer the question in the running agent terminal so it can report `working`,
+or use the control board to choose an action. `error` starts a 60-second
+countdown, then fails the step and opens recovery. New output from the agent
+cancels that countdown, but the error stands until the agent reports a new
+status: a step that exits after an unanswered `error` or `blocked` report is
+failed even with exit code 0, including a report made just before it exited.
+With no user present (for example a squad or headless API run), either report
+starts a 60-second countdown and then fails the step. Normal failure handling
+and retry rules apply. Each agent in a parallel group is handled from its own
+reports; one agent's status does not advance or fail a sibling.
+
+The countdown labels identify the reported status: **“Agent reported done:
+advancing in Ns,” “Agent is waiting for input: failing step in Ns,”** and
+**“Agent reported an error: failing step in Ns.”** A fail countdown's action
+means fail the step, never skip past the problem.
+
+There is an important limit: if an agent reports `working` and then hangs,
+silence detection stays suppressed for as long as that report remains
+effective. The TUI may show `working · silent …` as an informational hint,
+but it does not mark the step stuck. Agents that do not report program status
+continue to use the silence behavior below.
+
 ## Auto-advance when stuck (yolo mode)
 
-When a running workflow step produces **no output for 30 seconds**, the engine marks that step stuck. What happens next depends on the permission mode:
+When a running workflow step whose agent is **not reporting program status**
+produces no output for the configured stuck timeout (30 seconds by default),
+the engine marks that step stuck. What happens next depends on the permission mode:
 
 - **In [yolo mode](03-agent-sessions.md#--yolo):** a **60-second countdown** starts, and the workflow auto-advances when it expires.
 - **In every other mode:** the [workflow control board](#workflow-control-board-tui-only) opens automatically so you can decide what to do.
 
-Stuck detection is unified across all frontends (TUI, CLI, and API) and runs continuously inside the container engine, which tracks output activity on stdout and stderr. Any new output — even a single byte — immediately clears the stuck state. Each container is tracked independently, so one noisy agent never masks detection on its siblings.
+Stuck detection is unified across all frontends (TUI, CLI, and API) and tracks output activity on stdout and stderr. For a non-reporting agent, any new output — even a single byte — immediately clears the stuck state. Reports take precedence: `working` suppresses silence detection, while a `done`, `blocked`, or `error` report is handled as described above. Each container is tracked independently, so one noisy agent never masks detection on its siblings.
 
 **Active-tab suppression:** if you are actively pressing keys or scrolling on the currently active tab, the stuck timer is held back even while the container is silent — the timer starts only once both the container and you have been idle for 30 seconds. Background tabs are always judged on output time alone.
 
@@ -1562,8 +1606,8 @@ If a workflow resumes from a saved state mid-group, any steps that were interrup
 
 Every running container is tracked independently — one noisy or slow agent never masks or delays detection on its siblings.
 
-- **Stuck detection (yolo off):** if a container produces no output for 30 seconds, that container alone is marked stuck. Its siblings keep running unaffected. The stuck container's slot stays occupied — no new step launches into it — until you switch to it and send Ctrl-C to kill it, at which point its slot frees up like any other completion.
-- **Yolo mode:** each container gets its own independent 60-second countdown. In a non-final group, expiry kills that container, advances its step, and starts the next queued step if there is one. In an interactive final group, every agent stays alive after its countdown expires. The control board opens after all members have reached review readiness or exited naturally. An interactive final group starts all its members together even when `maxConcurrentAgents` is lower than the group size, so each remains available for review.
+- **Stuck detection (yolo off):** if a non-reporting container produces no output for the configured timeout (30 seconds by default), that container alone is marked stuck. Its siblings keep running unaffected. The stuck container's slot stays occupied — no new step launches into it — until you switch to it and send Ctrl-C to kill it, at which point its slot frees up like any other completion. A reported `working` state suppresses this silence detection.
+- **Yolo mode:** each non-reporting container gets its own independent 60-second silence countdown. For reporting agents, `done`/`idle` starts a 10-second completion countdown, while `blocked`/`error` starts a 60-second fail countdown in unattended runs; neither problem status advances to a later step. In a non-final silence group, expiry kills that container, advances its step, and starts the next queued step if there is one. In an interactive final group, every non-reporting agent stays alive after its silence countdown expires, and the control board opens after all members have reached review readiness or exited naturally; agents that reported `done` are stopped and advanced instead, and a group whose agents all did so completes without the board. An interactive final group starts all its members together even when `maxConcurrentAgents` is lower than the group size, so each remains available for review.
 
 **Where the countdown appears in the TUI:** a yoloing container that is *not* the focused one shows its countdown in its minimized status bar (`Yolo in Ns`, flashing purple/yellow — see [Using the TUI: Parallel containers](02-using-the-tui.md#parallel-containers)). If it's the focused container, the countdown instead opens the same modal dialog a single container shows. Pressing **Ctrl-S** to rotate focus away closes that modal — the countdown itself keeps running in the background regardless — and rotating back onto a container still counting down reopens the modal automatically.
 

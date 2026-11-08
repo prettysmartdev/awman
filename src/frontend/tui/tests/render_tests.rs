@@ -39,6 +39,8 @@ fn seed_agents_dashboard(app: &App, watching: bool, with_agent: bool) {
             command_label: Some("chat".into()),
             cpu_percent: Some(2.0),
             memory_mb: Some(64.0),
+            kind: None,
+            msg: None,
         }]
     } else {
         vec![]
@@ -46,6 +48,9 @@ fn seed_agents_dashboard(app: &App, watching: bool, with_agent: bool) {
     let totals = AgentTotals {
         running: agents.len(),
         stuck: 0,
+        waiting: 0,
+        errored: 0,
+        done: 0,
         stopped: 0,
         cpu_percent: Some(2.0),
         memory_mb: Some(64.0),
@@ -652,6 +657,7 @@ fn set_parallel_workflow(app: &App, n: usize) {
     };
     app.active_tab().shared.workflow.update_view(|view| {
         *view = Some(WorkflowViewState {
+            reported: Default::default(),
             steps: (0..n)
                 .map(|i| WorkflowStepView {
                     name: format!("step-{i}"),
@@ -708,6 +714,7 @@ fn set_sequential_workflow(app: &App, n: usize, failed: Option<usize>) {
     };
     app.active_tab().shared.workflow.update_view(|view| {
         *view = Some(WorkflowViewState {
+            reported: Default::default(),
             steps: (0..n)
                 .map(|i| WorkflowStepView {
                     name: format!("stage-{i}"),

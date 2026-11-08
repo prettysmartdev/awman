@@ -16,8 +16,11 @@ pub mod cli;
 pub mod daemon;
 #[cfg(test)]
 mod field_name_literals_tests;
+pub mod osc7501;
+pub mod program_status_text;
 pub mod render_helpers;
 pub mod squad;
+pub mod terminal_output_filter;
 pub mod tui;
 
 // The headless rule used to live here, as

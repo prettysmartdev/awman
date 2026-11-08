@@ -1864,6 +1864,7 @@ fn reset_isolates_every_command_owned_feed_from_late_producers() {
     *old.yolo_state.lock().unwrap() = Some(YoloState {
         step_name: "old".into(),
         remaining_secs: 3,
+        kind: Default::default(),
     });
     old.container.push(ContainerSlotEvent::GroupStarted);
     shared.reset_for_new_command();
@@ -1987,6 +1988,10 @@ fn stuck_subscription_is_bound_to_its_launch_and_retains_events_before_tick() {
     sender.send(StuckEvent::Stuck).unwrap();
     tab.drain_stuck_events();
     assert!(tab.stuck);
+    sender.send(StuckEvent::Reported(None)).unwrap();
+    tab.drain_stuck_events();
+    // A cleared status withdraws the report; it says nothing about silence.
+    assert!(tab.stuck, "clearing a status leaves the silence flag alone");
 }
 
 #[test]
@@ -2073,4 +2078,235 @@ async fn a_reported_session_worktree_moves_the_git_poll_and_a_reset_moves_it_bac
     assert!(tab.shared.workflow.snapshot().worktree_path.is_none());
     tab.refresh_git_poll();
     assert_eq!(tab.git_poll_root.as_deref(), Some(repo.as_path()));
+}
+
+// ── Agent-reported status (OSC 7501) ──────────────────────────────────────
+
+mod program_status_tabs {
+    use super::*;
+    use crate::data::program_status::{BlockedKind, EffectiveStatus, ProgramState};
+    use ratatui::style::Color;
+
+    fn status(state: ProgramState, kind: Option<BlockedKind>) -> EffectiveStatus {
+        EffectiveStatus {
+            state,
+            kind,
+            progress: None,
+            msg: None,
+            app: None,
+            id: None,
+        }
+    }
+
+    /// A running tab with one slot reporting `s`.
+    fn running_tab(s: Option<EffectiveStatus>) -> Tab {
+        let mut tab = make_tab();
+        tab.start_container("claude".into(), String::new(), 80, 24);
+        tab.execution_phase = ExecutionPhase::Running {
+            command: "chat".into(),
+        };
+        tab.container_slots[0].set_program_status(s);
+        tab
+    }
+
+    #[test]
+    fn glyph_label_and_colour_per_state() {
+        let cases = [
+            (status(ProgramState::Working, None), "\u{25D0} chat", None),
+            (
+                status(ProgramState::Blocked, Some(BlockedKind::Question)),
+                "? chat",
+                Some(Color::Yellow),
+            ),
+            (
+                status(ProgramState::Blocked, Some(BlockedKind::Permission)),
+                "\u{1F512} chat",
+                Some(Color::Yellow),
+            ),
+            (
+                status(ProgramState::Blocked, Some(BlockedKind::Auth)),
+                "\u{1F512} chat",
+                Some(Color::Yellow),
+            ),
+            (
+                status(ProgramState::Done, None),
+                "\u{2713} chat",
+                Some(Color::Green),
+            ),
+            (
+                status(ProgramState::Error, None),
+                "\u{2717} chat",
+                Some(Color::Red),
+            ),
+        ];
+        for (s, label, colour) in cases {
+            let tab = running_tab(Some(s.clone()));
+            assert_eq!(tab.tab_subcommand_label(40, true), label, "{s:?}");
+            match colour {
+                Some(c) => assert_eq!(tab_color(&tab), c, "{s:?}"),
+                // working/idle keep the default running colour
+                None => assert!(!matches!(tab_color(&tab), Color::Yellow | Color::Red)),
+            }
+        }
+    }
+
+    #[test]
+    fn working_with_progress_shows_percent() {
+        let mut s = status(ProgramState::Working, None);
+        s.progress = Some(42);
+        let tab = running_tab(Some(s));
+        assert_eq!(tab.tab_subcommand_label(40, true), "\u{25D0} 42% chat");
+    }
+
+    #[test]
+    fn reporting_agent_never_shows_the_stuck_prefix() {
+        let mut tab = running_tab(Some(status(ProgramState::Working, None)));
+        tab.stuck = true; // stale silence flag
+        let label = tab.tab_subcommand_label(40, true);
+        assert!(!label.contains('\u{26a0}'), "{label}");
+        // A non-reporting agent keeps the prefix.
+        let mut plain = running_tab(None);
+        plain.stuck = true;
+        assert!(plain.tab_subcommand_label(40, true).starts_with('\u{26a0}'));
+    }
+
+    #[test]
+    fn running_countdown_colours_win_over_reported_state() {
+        let tab = running_tab(Some(status(ProgramState::Error, None)));
+        *tab.shared.yolo_state.lock().unwrap() = Some(YoloState {
+            step_name: "s".into(),
+            remaining_secs: 4,
+            kind: Default::default(),
+        });
+        assert_eq!(tab_color(&tab), Color::Yellow);
+        tab.shared
+            .yolo_state
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .remaining_secs = 3;
+        assert_eq!(tab_color(&tab), Color::Magenta);
+    }
+
+    #[test]
+    fn reports_arrive_through_the_stuck_channel_and_clear_the_stuck_flag() {
+        use crate::engine::workflow::frontend::EngineHandles;
+        let mut tab = make_tab();
+        tab.start_container("claude".into(), "n".into(), 80, 24);
+        let (sender, _) = tokio::sync::broadcast::channel(8);
+        let sender = Arc::new(sender);
+        tab.shared
+            .container
+            .attach_engine(EngineHandles::stuck(sender.clone()));
+        tab.drain_container_slot_events();
+        sender.send(StuckEvent::Stuck).unwrap();
+        tab.drain_stuck_events();
+        assert!(tab.stuck);
+        sender
+            .send(StuckEvent::Reported(Some(status(
+                ProgramState::Blocked,
+                Some(BlockedKind::Permission),
+            ))))
+            .unwrap();
+        tab.drain_stuck_events();
+        assert!(!tab.stuck, "a report supersedes the silence flag");
+        assert_eq!(
+            tab.program_status().map(|s| s.state),
+            Some(ProgramState::Blocked)
+        );
+        assert_eq!(
+            tab.shared.signals.status().map(|s| s.state),
+            Some(ProgramState::Blocked)
+        );
+        sender.send(StuckEvent::Reported(None)).unwrap();
+        tab.drain_stuck_events();
+        assert!(tab.program_status().is_none());
+    }
+
+    #[test]
+    fn aggregate_status_prefers_a_problem_over_done() {
+        let mut tab = make_tab();
+        tab.container_slots
+            .push(ContainerSlot::new("a".into(), "claude".into(), 0));
+        tab.container_slots
+            .push(ContainerSlot::new("b".into(), "claude".into(), 0));
+        tab.container_slots[0].set_program_status(Some(status(ProgramState::Done, None)));
+        tab.container_slots[1].set_program_status(Some(status(ProgramState::Error, None)));
+        assert_eq!(tab.program_status().unwrap().state, ProgramState::Error);
+    }
+
+    #[test]
+    fn active_tab_suppression_defers_idle_and_done_only() {
+        let (frontend, _req, _resp) =
+            crate::frontend::tui::tests::test_command_frontend(&["workflow"], Default::default());
+        // No recent user input: nothing is deferred.
+        frontend
+            .signals
+            .set_status(Some(status(ProgramState::Done, None)));
+        assert!(!frontend.should_defer_for_user());
+
+        frontend.signals.touch_user();
+        for state in [ProgramState::Done, ProgramState::Idle] {
+            frontend.signals.set_status(Some(status(state, None)));
+            assert!(frontend.should_defer_for_user(), "{state:?} is deferred");
+        }
+        for (state, kind) in [
+            (ProgramState::Blocked, Some(BlockedKind::Permission)),
+            (ProgramState::Error, None),
+            (ProgramState::Working, None),
+        ] {
+            frontend.signals.set_status(Some(status(state, kind)));
+            assert!(
+                !frontend.should_defer_for_user(),
+                "{state:?} is not deferred"
+            );
+        }
+        // And a blocked report never makes the wait loop sleep.
+        let started = std::time::Instant::now();
+        frontend.wait_for_quiet_user();
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    /// Review finding: `working` dismisses an untouched report-opened board
+    /// (the command asks the App to close it and returns its `Dismissed`
+    /// answer); a board the user touched stays until they answer.
+    #[test]
+    fn working_dismisses_an_untouched_report_board_only() {
+        use crate::frontend::tui::dialogs::{DialogRequest, WorkflowStepConfirmState};
+        let request = || {
+            DialogRequest::WorkflowStepConfirm(WorkflowStepConfirmState {
+                completed_step: "plan".into(),
+                next_step: "build".into(),
+            })
+        };
+        for touched in [false, true] {
+            let (frontend, req_rx, resp_tx) = crate::frontend::tui::tests::test_command_frontend(
+                &["workflow"],
+                Default::default(),
+            );
+            let signals = frontend.signals.clone();
+            signals.set_status(Some(status(ProgramState::Blocked, None)));
+            let asked = std::thread::spawn(move || frontend.ask_report_dialog(request()));
+            req_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("board requested");
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            if touched {
+                signals.touch_user();
+            }
+            signals.set_status(Some(status(ProgramState::Working, None)));
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            assert_eq!(
+                signals.take_report_dialog_dismiss(),
+                !touched,
+                "touched={touched}"
+            );
+            resp_tx.send(DialogResponse::Dismissed).unwrap();
+            assert!(matches!(
+                asked.join().unwrap(),
+                Ok(DialogResponse::Dismissed)
+            ));
+        }
+    }
 }

@@ -3,6 +3,7 @@
 use std::time::Duration;
 
 use crate::data::message::UserMessageSink;
+use crate::data::program_status::{EffectiveStatus, ProgramState};
 use crate::data::prompt::Prompt;
 use crate::data::workflow_definition::WorkflowStep;
 use crate::data::workflow_state::{PhaseKind, WorkflowState};
@@ -26,16 +27,42 @@ impl WorkflowFrontend for TuiCommandFrontend {
         // "advance to the next step?" case, are the engine's answers (F-18).
         // The TUI used to scan `WorkflowState::step_states` for both.
         let step_name = available.focused_step_label().to_string();
+        let reported_done = available
+            .reported_status
+            .as_ref()
+            .is_some_and(|s| matches!(s.state, ProgramState::Done | ProgramState::Idle));
+        // Active-tab suppression: an idle/done report on the tab the user is
+        // typing in must not pop the confirmation over their keystrokes.
+        if reported_done {
+            let seen_done = !self.agent_resumed();
+            self.wait_for_quiet_user();
+            // The agent resumed while the board was held back: it is stale,
+            // so it is never shown (the step keeps running).
+            let working = self
+                .signals
+                .status()
+                .is_some_and(|s| s.state == ProgramState::Working);
+            if available.can_dismiss && (working || (seen_done && self.agent_resumed())) {
+                return Ok(NextAction::Dismiss);
+            }
+        }
+        let from_report = available.reported_status.is_some();
+        let ask = |request: DialogRequest| {
+            if from_report {
+                self.ask_report_dialog(request)
+            } else {
+                self.ask_dialog(request)
+            }
+        };
 
         if let Some(advance) = &available.simple_advance {
-            let response = self
-                .ask_dialog(DialogRequest::WorkflowStepConfirm(
-                    crate::frontend::tui::dialogs::WorkflowStepConfirmState {
-                        completed_step: advance.completed_step.clone(),
-                        next_step: advance.next_step.clone(),
-                    },
-                ))
-                .map_err(|e| EngineError::Other(e.to_string()))?;
+            let response = ask(DialogRequest::WorkflowStepConfirm(
+                crate::frontend::tui::dialogs::WorkflowStepConfirmState {
+                    completed_step: advance.completed_step.clone(),
+                    next_step: advance.next_step.clone(),
+                },
+            ))
+            .map_err(|e| EngineError::Other(e.to_string()))?;
             return Ok(match response {
                 DialogResponse::Char('>') => NextAction::LaunchNext,
                 DialogResponse::Char('W') => {
@@ -46,16 +73,20 @@ impl WorkflowFrontend for TuiCommandFrontend {
                         .map_err(|e| EngineError::Other(e.to_string()))?;
                     wcb_response_to_action(response2, available)
                 }
+                // Esc on a board opened by the agent's own done/idle report
+                // keeps the agent running instead of stopping it.
+                DialogResponse::Dismissed if reported_done && available.can_dismiss => {
+                    NextAction::Dismiss
+                }
                 DialogResponse::Dismissed => NextAction::Pause,
                 _ => NextAction::Pause,
             });
         }
 
-        let response = self
-            .ask_dialog(DialogRequest::WorkflowControlBoard(control_board_state(
-                &step_name, available,
-            )))
-            .map_err(|e| EngineError::Other(e.to_string()))?;
+        let response = ask(DialogRequest::WorkflowControlBoard(control_board_state(
+            &step_name, available,
+        )))
+        .map_err(|e| EngineError::Other(e.to_string()))?;
         Ok(wcb_response_to_action(response, available))
     }
 
@@ -88,13 +119,42 @@ impl WorkflowFrontend for TuiCommandFrontend {
             *guard = Some(crate::frontend::tui::tabs::YoloState {
                 step_name: step_name.to_string(),
                 remaining_secs: remaining.as_secs(),
+                kind: self.countdown_kind,
             });
         }
         Ok(YoloTickOutcome::Continue)
     }
 
-    fn yolo_countdown_started(&mut self, _step_name: &str, _kind: CountdownKind) {
-        // State is set by yolo_countdown_tick; nothing extra needed.
+    fn yolo_countdown_started(&mut self, _step_name: &str, kind: CountdownKind) {
+        // State is set by yolo_countdown_tick; remember why it runs so the
+        // dialog can say so.
+        self.countdown_kind = kind;
+    }
+
+    /// Active-tab suppression is an input to the engine, which holds an
+    /// `AgentDone` countdown back while this is true (and keeps processing
+    /// exits and reports). Never blocks.
+    fn user_interacting_with(&self, _step_name: &str) -> bool {
+        self.should_defer_for_user()
+    }
+
+    fn report_agent_status(&mut self, step_name: &str, status: Option<&EffectiveStatus>) {
+        let label = status
+            .filter(|s| matches!(s.state, ProgramState::Blocked | ProgramState::Error))
+            .map(crate::frontend::program_status_text::short_label);
+        let step = step_name.to_string();
+        self.workflow.update_view(|guard| {
+            if let Some(view) = guard.as_mut() {
+                match label {
+                    Some(label) => {
+                        view.reported.insert(step, label);
+                    }
+                    None => {
+                        view.reported.remove(&step);
+                    }
+                }
+            }
+        });
     }
 
     fn yolo_countdown_finished(&mut self, _step_name: &str) {
@@ -394,6 +454,14 @@ impl WorkflowFrontend for TuiCommandFrontend {
         });
     }
 
+    fn parallel_step_countdown_started(&mut self, step_name: &str, kind: CountdownKind) {
+        self.push_container_slot_event(ContainerSlotEvent::CountdownKind {
+            step_name: step_name.to_string(),
+            kind,
+        });
+        self.parallel_step_yolo_countdown_started(step_name);
+    }
+
     fn parallel_step_yolo_countdown_started(&mut self, step_name: &str) {
         let cancel_flag: crate::frontend::tui::tabs::SharedYoloCancelFlag =
             std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -445,6 +513,19 @@ impl TuiCommandFrontend {
 }
 
 fn control_board_state(step_name: &str, available: &AvailableActions) -> WorkflowControlBoardState {
+    // The agent's own words about why this board is open lead the detail lines.
+    let mut failure_lines: Vec<String> = available
+        .reported_status
+        .as_ref()
+        .map(|s| vec![crate::frontend::program_status_text::status_line(s)])
+        .unwrap_or_default();
+    failure_lines.extend(
+        available
+            .step_failure
+            .as_ref()
+            .map(|f| f.detail_lines.clone())
+            .unwrap_or_default(),
+    );
     WorkflowControlBoardState {
         step_name: step_name.to_string(),
         focused_step_name: step_name.to_string(),
@@ -463,11 +544,7 @@ fn control_board_state(step_name: &str, available: &AvailableActions) -> Workflo
         launch_next_label: available.launch_next_label.clone(),
         parallel_peer_count: available.parallel_peer_count,
         parallel_peers_running: available.parallel_peers_running,
-        failure_lines: available
-            .step_failure
-            .as_ref()
-            .map(|f| f.detail_lines.clone())
-            .unwrap_or_default(),
+        failure_lines,
         retry_failed_step: available.retry_failed_step.clone(),
         in_parallel_group: available.acts_on_parallel_group,
     }

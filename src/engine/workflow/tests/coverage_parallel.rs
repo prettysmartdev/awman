@@ -616,6 +616,11 @@ fn slot(name: &str, cancelled: &Arc<Mutex<Vec<String>>>) -> ActiveParallelStep {
         awman_killed: false,
         stuck: false,
         yolo_deadline: None,
+        countdown_kind: CountdownKind::StuckStep,
+        output_watch: None,
+        last_report: None,
+        reported_problem: None,
+        program_status: None,
         agent: AgentName::new("claude").unwrap(),
         model: None,
         launch_id: 0,
@@ -729,6 +734,7 @@ fn tick(h: &mut Harness, queue: &mut VecDeque<WorkflowStep>) {
             timing::YOLO_COUNTDOWN_DURATION,
             &stuck_tx,
             false,
+            &mut HashSet::new(),
             &mut HashSet::new(),
         )
         .unwrap();

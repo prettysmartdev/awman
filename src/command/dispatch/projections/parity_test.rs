@@ -177,6 +177,8 @@ fn agents_kill_prompt_is_a_shared_cli_tui_choice_contract() {
         command_label: None,
         cpu_percent: None,
         memory_mb: None,
+        kind: None,
+        msg: None,
     };
     // CLI and TUI both consume this same value, so pin its whole visible
     // contract and dismiss default here rather than maintaining two copies.
@@ -598,9 +600,15 @@ fn empty_frontend() -> FakeCommandFrontend {
 fn frontend_with_required_input(spec: &'static CommandSpec) -> FakeCommandFrontend {
     let mut frontend = FakeCommandFrontend::new();
     for argument in spec.arguments {
-        frontend
-            .args
-            .insert(argument.name.to_string(), "placeholder".to_string());
+        frontend.args.insert(
+            argument.name.to_string(),
+            if spec.name == "attach" && argument.name == "id" {
+                "term_00000000000000000000000000000001"
+            } else {
+                "placeholder"
+            }
+            .to_string(),
+        );
     }
     for flag in spec.flags {
         if flag.optional {
@@ -939,5 +947,27 @@ fn wi0149_prerequisite_flags_parse_identically_in_cli_tui_and_api() {
             ));
         }
         assert!(spec.find_flag("check-prerequisites").is_none());
+    }
+}
+
+#[test]
+fn squad_attach_accepts_task_names_and_full_ids_without_prepending_another_prefix() {
+    for target in ["nightly", "task_00000000000000000000000000000001"] {
+        let mut frontend = empty_frontend();
+        frontend.args.insert("name".into(), target.into());
+        let built = dispatch_for(frontend)
+            .build_command(&["squad", "attach"])
+            .unwrap();
+        let BuiltCommand::Attach(command) = built else {
+            panic!("squad attach must build the common terminal command")
+        };
+        if target.starts_with("task_") {
+            assert_eq!(
+                command.target(),
+                &crate::data::terminal::AttachTarget::Task(
+                    crate::data::ids::TaskId::parse(target).unwrap()
+                )
+            );
+        }
     }
 }

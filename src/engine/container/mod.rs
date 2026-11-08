@@ -20,6 +20,7 @@ mod deferred;
 pub mod display;
 mod docker;
 mod host_cli_backend;
+pub mod host_env_denylist;
 pub mod instance;
 pub mod io_bridge;
 pub mod naming;

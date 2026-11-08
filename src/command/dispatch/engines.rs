@@ -197,7 +197,13 @@ impl Engines {
         global_config: Arc<ConfigFile>,
     ) -> Self {
         Self {
-            runtime: core.runtime().clone(),
+            runtime: Arc::new(
+                crate::command::commands::api_server::owned_runtime::CommandOwnedRuntime::new(
+                    core.runtime().clone(),
+                    "",
+                )
+                .with_hub(core.terminal_hub().clone()),
+            ),
             container_runtime: core.container_runtime().cloned(),
             sandbox_runtime: core.sandbox_runtime().cloned(),
             git_engine: core.git_engine().clone(),

@@ -79,7 +79,16 @@ use crate::engine::workflow::frontend::{ContainerSource, WorkflowFrontend};
 /// The API dispatch frontend. Emits typed events to an `EventBusSender`
 /// for distribution to logfile writers and SSE clients.
 pub struct ApiDispatchFrontend {
-    interaction: Option<crate::data::config::daemon::Interaction>,
+    /// The run's resolved interaction (WI 0141), from Layer 2. `None` for a
+    /// frontend built without one (tests, admission probes): piped.
+    interaction: Option<crate::command::interaction::InteractionDecision>,
+    /// The sender of the last single-agent PTY sink handed out
+    /// (`container_frontend_for_pty`): `program_status` events of that agent
+    /// carry its container attribution.
+    pty_sink_sender: Option<EventBusSender>,
+    /// Forwards a single-agent launch.s `StuckEvent::Reported` to the bus
+    /// (`set_stuck_sender`); aborted when replaced or dropped.
+    status_forwarder: Option<AbortOnDrop>,
     frontend_kind: FrontendKind,
     /// The outcome of Layer 2 parsing (`CommandCatalogue::parse_raw_args`),
     /// captured at construction. Every `CommandFrontend` accessor reports a
@@ -189,6 +198,8 @@ impl ApiDispatchFrontend {
 
         Self {
             interaction: None,
+            pty_sink_sender: None,
+            status_forwarder: None,
             frontend_kind,
             parsed: Arc::new(parsed),
             event_bus,
@@ -219,12 +230,23 @@ impl ApiDispatchFrontend {
         }
     }
 
-    /// Mirror workflow snapshots into the command directory for API polling.
-    pub fn with_interaction(mut self, mode: crate::data::config::daemon::Interaction) -> Self {
-        self.interaction = Some(mode);
+    /// The interaction Layer 2 resolved for this run (WI 0141). It decides
+    /// what `headless` reads as and whether `take_io` asks for a PTY
+    /// (`AgentIo::initial_size = decision.pty_size`); the frontend decides
+    /// nothing about it itself.
+    pub fn with_interaction(
+        mut self,
+        decision: crate::command::interaction::InteractionDecision,
+    ) -> Self {
+        self.interaction = Some(decision);
         self
     }
 
+    fn is_interactive(&self) -> bool {
+        self.interaction.is_some_and(|d| !d.is_headless())
+    }
+
+    /// Mirror workflow snapshots into the command directory for API polling.
     pub fn with_state_writer(mut self, writer: CommandStateWriter) -> Self {
         self.state_writer = Some(writer);
         self
@@ -358,17 +380,21 @@ impl ApiDispatchFrontend {
 
 impl CommandFrontend for ApiDispatchFrontend {
     fn input_available(&self) -> bool {
-        self.interaction == Some(crate::data::config::daemon::Interaction::Interactive)
+        self.is_interactive()
     }
     fn kind(&self) -> crate::command::dispatch::catalogue::FrontendKind {
         self.frontend_kind
     }
     fn flag_bool(&self, _command_path: &[&str], flag: &str) -> Result<Option<bool>, CommandError> {
         self.parsed()?;
-        if flag == "headless"
-            && self.interaction == Some(crate::data::config::daemon::Interaction::Interactive)
-        {
-            return Ok(Some(false));
+        // The resolved decision is authoritative for both spellings, so a
+        // run never reads a mode admission did not choose.
+        if let Some(decision) = self.interaction {
+            match flag {
+                "headless" => return Ok(Some(decision.is_headless())),
+                "interactive" => return Ok(Some(!decision.is_headless())),
+                _ => {}
+            }
         }
         Ok(self.parsed()?.flag_bool(flag))
     }
@@ -458,15 +484,22 @@ impl AgentFrontend for ApiDispatchFrontend {
     }
 
     fn take_io(&mut self) -> crate::engine::agent_runtime::frontend::AgentIo {
-        // API never has interactive stdin: the engine owns the only sender
-        // and drops it after seeding the prompt (see `spawn_piped_docker`)
-        // so the container sees EOF promptly. The drains keep the lent
-        // source, so every line of this container stays attributed to it.
-        spawn_output_drains(
+        // Headless: no interactive stdin. The engine owns the only sender and
+        // drops it after seeding the prompt (see `spawn_piped_docker`) so the
+        // container sees EOF promptly. The drains keep the lent source, so
+        // every line of this container stays attributed to it.
+        let io = spawn_output_drains(
             &self.container_sender(),
             std::mem::take(&mut self.output_format),
             self.final_message_sink(),
-        )
+        );
+        // Interactive (WI 0141): the size Layer 2 read from
+        // `daemon.terminal.{cols,rows}` at spawn is what makes the runtime
+        // take `spawn_pty_bridged`. Nobody here resizes the PTY; viewers do
+        // that through the terminal hub. ACP launches never reach this
+        // `take_io` (they bind their own piped transport), so they stay
+        // piped whatever the decision says.
+        with_pty_size(io, self.interaction.and_then(|d| d.pty_size))
     }
 
     fn set_agent_output_format(&mut self, format: AgentOutputFormat) {
@@ -485,6 +518,35 @@ impl AgentFrontend for ApiDispatchFrontend {
 // Structured frames contain whole messages and tool results. Keep a larger
 // explicit bound than plain text, while bounding malformed protocol output.
 const MAX_STRUCTURED_FRAME_BYTES: usize = 8 * 1024 * 1024;
+
+/// `EffectiveStatus` → the `program_status` event payload: spec spellings
+/// (`snake_case` state and kind), absent fields omitted. The record `id` is
+/// not part of the event; step attribution rides the envelope `source`.
+pub(crate) fn program_status_event(
+    status: &crate::data::program_status::EffectiveStatus,
+) -> EventPayload {
+    EventPayload::ProgramStatus {
+        state: status.state,
+        kind: status.kind,
+        progress: status.progress,
+        msg: status.msg.clone(),
+        app: status.app.clone(),
+    }
+}
+
+/// Ask for a PTY of `size` (`Some`) or keep the piped I/O (`None`). The
+/// resize receiver has no sender here: an unattended PTY keeps its spawn
+/// size until a viewer holding input resizes it through the hub.
+fn with_pty_size(
+    mut io: crate::engine::agent_runtime::frontend::AgentIo,
+    size: Option<(u16, u16)>,
+) -> crate::engine::agent_runtime::frontend::AgentIo {
+    if let Some(size) = size {
+        io.initial_size = Some(size);
+        io.resize = Some(tokio::sync::mpsc::unbounded_channel().1);
+    }
+    io
+}
 
 /// Wire a container's stdout/stderr byte channels to the event bus
 /// (WI 0137 §4): both streams are line-buffered, stdout runs through the
@@ -636,6 +698,7 @@ impl ApiDispatchFrontend {
 // ─── HasAgentFrontend ───────────────────────────────────────────────────
 
 impl HasAgentFrontend for ApiDispatchFrontend {
+    /// Image setup, probes and other helper containers: always piped.
     fn container_frontend(&mut self) -> Box<dyn AgentFrontend> {
         Box::new(ApiContainerSink::new(
             &self.event_bus,
@@ -643,6 +706,62 @@ impl HasAgentFrontend for ApiDispatchFrontend {
             self.state_writer.clone(),
         ))
     }
+
+    /// The single-agent launch (`exec prompt`, `chat`): it carries the
+    /// interaction Layer 2 resolved, so an interactive run gets its PTY
+    /// (`AgentIo::initial_size = decision.pty_size`). ACP launches bind
+    /// their own piped transport and never call this.
+    fn container_frontend_for_pty(&mut self) -> Box<dyn AgentFrontend> {
+        let mut sink = ApiContainerSink::new(
+            &self.event_bus,
+            self.final_message_sink(),
+            self.state_writer.clone(),
+        );
+        sink.pty_size = self.interaction.and_then(|d| d.pty_size);
+        self.pty_sink_sender = Some(sink.event_bus.clone());
+        Box::new(sink)
+    }
+}
+
+/// Aborts its task when dropped.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Forward one agent's `StuckEvent::Reported` as `program_status` events,
+/// skipping an unchanged repeat, until its detector channel closes. The
+/// `Arc<Sender>` itself is not retained, so the task never keeps the channel
+/// open past the execution.
+fn spawn_status_forwarder(
+    sender: &tokio::sync::broadcast::Sender<crate::engine::agent_runtime::StuckEvent>,
+    event_bus: EventBusSender,
+) -> Option<AbortOnDrop> {
+    use crate::engine::agent_runtime::StuckEvent;
+    use tokio::sync::broadcast::error::RecvError;
+    let runtime = tokio::runtime::Handle::try_current().ok()?;
+    let mut events = sender.subscribe();
+    Some(AbortOnDrop(runtime.spawn(async move {
+        let mut last: Option<crate::data::program_status::EffectiveStatus> = None;
+        loop {
+            match events.recv().await {
+                Ok(StuckEvent::Reported(status)) => {
+                    if status == last {
+                        continue;
+                    }
+                    if let Some(status) = &status {
+                        event_bus.emit(program_status_event(status));
+                    }
+                    last = status;
+                }
+                Ok(_) | Err(RecvError::Lagged(_)) => {}
+                Err(RecvError::Closed) => break,
+            }
+        }
+    })))
 }
 
 // ─── AgentImageFrontend ─────────────────────────────────────────────────
@@ -715,6 +834,8 @@ struct ApiContainerSink {
     output_format: AgentOutputFormat,
     /// Where a translated final message goes (`exec prompt`).
     final_message: Option<FinalMessageSink>,
+    /// The interactive PTY size for the single-agent launch; `None` = piped.
+    pty_size: Option<(u16, u16)>,
 }
 
 impl ApiContainerSink {
@@ -732,6 +853,7 @@ impl ApiContainerSink {
             source,
             output_format: AgentOutputFormat::Text,
             final_message,
+            pty_size: None,
         }
     }
 }
@@ -788,6 +910,9 @@ fn emit_user_message(sender: &EventBusSender, msg: UserMessage) {
 
 #[async_trait]
 impl AgentFrontend for ApiContainerSink {
+    fn terminal_source(&self) -> Option<EventSource> {
+        self.source.lock().ok().map(|s| s.clone())
+    }
     fn report_status(&mut self, status: AgentStatus) {
         // Attribute this and every later event to the running container
         // before the status line is emitted.
@@ -806,11 +931,13 @@ impl AgentFrontend for ApiContainerSink {
     fn take_io(&mut self) -> crate::engine::agent_runtime::frontend::AgentIo {
         // Engine owns the single stdin_tx and drops it after seeding so EOF
         // arrives at the container's stdin pipe (see `spawn_piped_docker`).
-        spawn_output_drains(
+        // An interactive single-agent launch asks for its PTY here.
+        let io = spawn_output_drains(
             &self.event_bus,
             std::mem::take(&mut self.output_format),
             self.final_message.clone(),
-        )
+        );
+        with_pty_size(io, self.pty_size)
     }
 
     fn set_agent_output_format(&mut self, format: AgentOutputFormat) {
@@ -969,6 +1096,9 @@ impl WorkflowFrontend for ApiDispatchFrontend {
             let what = match self.countdown_kind {
                 CountdownKind::StuckStep => "auto-advancing",
                 CountdownKind::FailureRetry => "retrying after failure",
+                CountdownKind::AgentDone => "advancing after the agent reported done",
+                CountdownKind::AgentBlocked => "failing the step: the agent reported blocked",
+                CountdownKind::AgentError => "failing the step: the agent reported an error",
             };
             // `step_name` is a countdown label, which for an `on_failure` agent
             // is not a step: attribute it only when it names one.
@@ -988,6 +1118,28 @@ impl WorkflowFrontend for ApiDispatchFrontend {
 
     fn yolo_countdown_started(&mut self, _step_name: &str, kind: CountdownKind) {
         self.countdown_kind = kind;
+    }
+
+    /// WI 0141: the agent's effective OSC 7501 status, as a `program_status`
+    /// event attributed to its step (an `on_failure` agent or the dynamic
+    /// leader reports under a label that is not a step: root sender). The
+    /// engine already deduplicated and rate-limited it. A clear (`None`) has
+    /// no `program_status` spelling, so it emits nothing; the step's next
+    /// status event or its end supersedes the last reported state.
+    fn report_agent_status(
+        &mut self,
+        step_name: &str,
+        status: Option<&crate::data::program_status::EffectiveStatus>,
+    ) {
+        let Some(payload) = status.map(program_status_event) else {
+            return;
+        };
+        let sender = if self.step_order.iter().any(|n| n == step_name) {
+            self.step_sender(step_name)
+        } else {
+            self.event_bus.clone()
+        };
+        sender.emit(payload);
     }
 
     fn yolo_countdown_finished(&mut self, _step_name: &str) {
@@ -1536,6 +1688,36 @@ impl ReadyFrontend for ApiDispatchFrontend {
 
 impl RemoteCommandFrontend for ApiDispatchFrontend {}
 
+// Attach is excluded from API dispatch by the catalogue. Keep the adapter
+// total for DispatchFrontend, with an explicit refusal if called directly.
+#[async_trait]
+impl crate::command::commands::attach::AttachCommandFrontend for ApiDispatchFrontend {
+    fn begin_attach(
+        &mut self,
+        _terminal_id: &crate::data::ids::TerminalId,
+    ) -> tokio_util::sync::CancellationToken {
+        tokio_util::sync::CancellationToken::new()
+    }
+
+    fn hangup(&self) -> tokio_util::sync::CancellationToken {
+        tokio_util::sync::CancellationToken::new()
+    }
+
+    fn bind_terminal(
+        &mut self,
+        _stream: crate::engine::remote::terminal_client::TerminalStream,
+        _read_only: bool,
+        _policy: crate::data::terminal::HostOutputPolicy,
+    ) -> Result<tokio::task::JoinHandle<()>, CommandError> {
+        Err(CommandError::NotAvailableForFrontend {
+            command: "attach".into(),
+            frontend: "API".into(),
+        })
+    }
+
+    fn end_attach(&mut self) {}
+}
+
 impl AgentsCommandFrontend for ApiDispatchFrontend {
     fn render_overview(
         &mut self,
@@ -1615,6 +1797,25 @@ impl ChatCommandFrontend for ApiDispatchFrontend {}
 /// behind an HTTP request, so there is nothing for `set_pty_active` to gate.
 impl crate::command::commands::agent_setup::AgentLaunchFrontend for ApiDispatchFrontend {
     fn set_pty_active(&mut self, _active: bool) {}
+
+    /// WI 0141: a single-agent command's OSC 7501 reports become
+    /// `program_status` events, attributed to the launched container (the
+    /// last `container_frontend_for_pty` sink). Workflow steps report
+    /// through `WorkflowFrontend::report_agent_status` instead; setup
+    /// frontends (`agent_setup`) never call this, so their exemption stays.
+    fn set_stuck_sender(
+        &mut self,
+        sender: std::sync::Arc<
+            tokio::sync::broadcast::Sender<crate::engine::agent_runtime::StuckEvent>,
+        >,
+    ) {
+        let bus = self
+            .pty_sink_sender
+            .clone()
+            .unwrap_or_else(|| self.event_bus.clone());
+        // Replacing the forwarder aborts the previous agent's.
+        self.status_forwarder = spawn_status_forwarder(&sender, bus);
+    }
 }
 
 impl AcpFrontend for ApiDispatchFrontend {
@@ -1723,6 +1924,8 @@ mod tests {
     mod dynamic_workflow_e2e;
     #[path = "live_engine_state.rs"]
     mod live_engine_state;
+    #[path = "program_status.rs"]
+    mod program_status;
 
     use crate::command::dispatch::projections::raw_args::shared_cases::{
         assert_reads, classification, CASES, ERROR_CASES,

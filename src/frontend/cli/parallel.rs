@@ -636,6 +636,14 @@ impl WorkflowFrontend for CliParallelFrontend {
         self.deactivate_chrome();
     }
 
+    fn report_agent_status(
+        &mut self,
+        step_name: &str,
+        status: Option<&crate::data::program_status::EffectiveStatus>,
+    ) {
+        self.inner.report_agent_status(step_name, status);
+    }
+
     fn report_parallel_step_stuck(&mut self, step_name: &str) {
         self.set_stuck(step_name, true);
         if self.chrome_active {
@@ -647,6 +655,12 @@ impl WorkflowFrontend for CliParallelFrontend {
         self.set_stuck(step_name, false);
         if self.chrome_active {
             redraw_status_bar(&self.state);
+        }
+    }
+
+    fn parallel_step_countdown_started(&mut self, step_name: &str, kind: CountdownKind) {
+        if !self.chrome_active || self.is_focused(step_name) {
+            self.inner.yolo_countdown_started(step_name, kind);
         }
     }
 

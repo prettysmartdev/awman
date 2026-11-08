@@ -244,7 +244,12 @@ pub(crate) fn render_yolo_countdown(
     } else {
         "\u{1f918}"
     };
-    let title = format!("{} Yolo in {}s", emoji, state.remaining_secs);
+    let fails = crate::frontend::program_status_text::countdown_fails_step(state.kind);
+    let title = if fails {
+        format!("{} Step fails in {}s", emoji, state.remaining_secs)
+    } else {
+        format!("{} Yolo in {}s", emoji, state.remaining_secs)
+    };
     let step_w = unicode_width::UnicodeWidthStr::width(state.step_name.as_str()) as u16;
     let width = step_w
         .saturating_add(20)
@@ -252,9 +257,17 @@ pub(crate) fn render_yolo_countdown(
         .min(area.width.saturating_sub(4));
     let dialog_area = dialogs::centered_fixed(width, 9, area);
     let inner = dialogs::render_dialog_frame(&title, Color::Magenta, dialog_area, frame);
+    use crate::engine::workflow::actions::CountdownKind;
+    let line = match state.kind {
+        // The silence and retry countdowns keep their long-standing wording.
+        CountdownKind::StuckStep | CountdownKind::FailureRetry => {
+            format!("Auto-advancing in {}s", state.remaining_secs)
+        }
+        kind => crate::frontend::program_status_text::countdown_label(kind, state.remaining_secs),
+    };
     let text = format!(
-        "  Step: {}\n  Auto-advancing in {}s\n\n  [Esc] Cancel   [Ctrl-W] Control board",
-        state.step_name, state.remaining_secs
+        "  Step: {}\n  {}\n\n  [Esc] Cancel   [Ctrl-W] Control board",
+        state.step_name, line
     );
     frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), inner);
 }

@@ -814,6 +814,13 @@ impl TaskStore {
         Ok(runs)
     }
 
+    pub fn task_name_for_run(&self, id: &RunId) -> Result<Option<String>, DataError> {
+        Ok(self.lock().query_row(
+            "SELECT t.name FROM squad_tasks t JOIN squad_runs r ON r.task_id = t.id WHERE r.id = ?1",
+            [id], |row| row.get(0),
+        ).optional()?)
+    }
+
     pub fn running_run_for(&self, task_id: &TaskId) -> Result<Option<Run>, DataError> {
         let conn = self.lock();
         let raw = conn

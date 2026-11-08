@@ -43,7 +43,7 @@ pub struct DaemonBootstrap<F: ApiCommandFrontendFactory + 'static> {
     pub set: crate::data::config::overrides::ConfigOverrides,
     pub squad_run_frontends: Arc<dyn SquadRunFrontends>,
     pub push_frontend_factory: F,
-    pub terminal_hub: Arc<dyn TerminalHub>,
+    pub terminal_hub: Arc<TerminalHub>,
 }
 impl DaemonRuntime {
     pub async fn bootstrap<F: ApiCommandFrontendFactory + 'static>(
@@ -183,11 +183,15 @@ impl DaemonRuntime {
             b.push_frontend_factory,
             settings.worker.clone(),
         );
-        let evaluator = Arc::new(LocalTaskEvaluator::new(
-            engines.clone(),
-            b.env,
-            b.squad_run_frontends,
-        ));
+        // Squad reads `daemon.features.squad.interaction` and
+        // `daemon.terminal.{cols,rows}` live (WI 0141) from the same
+        // reloadable config the worker admits against.
+        let evaluator = Arc::new(
+            LocalTaskEvaluator::new(engines.clone(), b.env, b.squad_run_frontends)
+                .with_daemon_settings(super::features::worker::live_daemon_settings(
+                    worker.clone(),
+                )),
+        );
         let squad_feature =
             SquadFeature::new(&core, engines.clone(), evaluator, settings.squad.clone())?;
         let engine_feature = EngineFeature::new(settings.engine.clone());
@@ -232,7 +236,10 @@ impl DaemonRuntime {
             apply_worker: Box::new(move |s| worker_feature.apply_settings(s)),
             changes: tokio::sync::Mutex::new(()),
             shutdown_done: std::sync::atomic::AtomicBool::new(false),
+            terminals: Default::default(),
         });
+        // Before any feature starts a PTY: the lifecycle publisher subscribes here.
+        runtime.terminals();
         for (f, enabled) in [
             (FeatureName::Worker, settings.worker.enabled),
             (FeatureName::Squad, settings.squad.enabled),

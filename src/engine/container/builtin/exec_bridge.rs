@@ -1,6 +1,9 @@
 //! Binary-clean exec and launcher-hosted attach. The attach client never owns
 //! the target lifecycle. Lag/disconnect is an error, never fabricated exit 0.
 use super::{driver::*, paths::BuiltinPaths};
+use crate::engine::agent_runtime::program_status::{
+    ProgramStatusBridgeConfig, ProgramStatusStream, ProgramStatusTracker,
+};
 use crate::engine::container::attach_protocol::{
     parse_resize, read_frame, resize_payload, write_chunked_bounded, write_frame,
     write_frame_bounded, Tag, WRITE_TIMEOUT as ATTACH_WRITE_TIMEOUT,
@@ -248,10 +251,43 @@ impl ExecBridge {
                 .map_err(|_| failed())?;
             io.stdin_tx.send(b"\n".to_vec()).map_err(|_| failed())?;
         }
+        let status_config = ProgramStatusBridgeConfig {
+            answer_queries: io.initial_size.is_some(),
+            ..frontend.program_status_config()
+        };
         drop(io.stdin_tx);
         let control = session.control.clone();
+        let terminal = match (
+            io.initial_size,
+            frontend.terminal_launch(),
+            control.terminal_stdin(),
+        ) {
+            (Some((cols, rows)), Some(launch), Some(stdin)) => {
+                let resize_control = control.clone();
+                Some((
+                    launch.clone(),
+                    launch.register(
+                        cols,
+                        rows,
+                        crate::engine::terminal_hub::TerminalInput {
+                            stdin,
+                            resize: Some(Arc::new(move |cols, rows| {
+                                let _ = resize_control.send(Control::Resize(cols, rows));
+                            })),
+                        },
+                    ),
+                ))
+            }
+            _ => None,
+        };
         let server = if let Some(path) = attach_path {
-            Some(AttachServer::bind(&path, &session)?)
+            Some(AttachServer::bind(
+                &path,
+                &session,
+                terminal
+                    .as_ref()
+                    .map(|(launch, terminal)| (launch.hub.clone(), terminal.id().clone())),
+            )?)
         } else {
             None
         };
@@ -266,9 +302,14 @@ impl ExecBridge {
         });
         let input_abort = input_task.abort_handle();
         let resize_control = control.clone();
+        let resize_terminal = terminal.clone();
         let resize_task = tokio::spawn(async move {
             if let Some(mut resize) = io.resize {
                 while let Some((cols, rows)) = resize.recv().await {
+                    if let Some((launch, terminal)) = &resize_terminal {
+                        let _ = launch.hub.set_default_size(terminal.id(), cols, rows);
+                        continue;
+                    }
                     let _ = resize_control.send(Control::Resize(cols, rows));
                 }
             }
@@ -276,6 +317,7 @@ impl ExecBridge {
         let resize_abort = resize_task.abort_handle();
         let tail = Arc::new(OutputTail::with_default_capacity());
         let output_activity = OutputActivity::new();
+        let program_status = ProgramStatusTracker::shared();
         let cleanup_claimed = Arc::new(AtomicBool::new(false));
         let (stop_result, mut grace_stop) = tokio::sync::watch::channel(None);
         let stop_result = Arc::new(stop_result);
@@ -301,6 +343,7 @@ impl ExecBridge {
                 container_start_delay: Duration::ZERO,
                 cancel_on_grace_expired: cancel_grace,
                 poll_interval: crate::engine::container::io_bridge::STUCK_POLL_INTERVAL,
+                program_status: Some(program_status.clone()),
             },
             &output_activity,
         );
@@ -317,6 +360,9 @@ impl ExecBridge {
         let released = io_release.clone();
         let mut sinks = Some((io.stdout, io.stderr));
         let mut prompt_files = ObservedPromptFiles(prompt_files);
+        let mut stdout_status = ProgramStatusStream::new(program_status.clone(), status_config);
+        let mut stderr_status = ProgramStatusStream::new(program_status.clone(), status_config);
+        let query_control = control.clone();
         let event_task = tokio::spawn(async move {
             let mut events = session.events;
             let outcome = loop {
@@ -330,17 +376,29 @@ impl ExecBridge {
                 };
                 match event {
                     Ok(ExecEvent::Stdout(bytes)) => {
-                        output_tail.push_bytes(&bytes);
                         output_activity.touch();
+                        let bytes = stdout_status.feed(&bytes, |reply| {
+                            let _ = query_control.send(Control::Stdin(reply.to_vec()));
+                        });
+                        output_tail.push_bytes(&bytes);
+                        if let Some((_, terminal)) = &terminal {
+                            terminal.push_output(&bytes);
+                        }
                         if let Some((stdout, _)) = &sinks {
-                            let _ = stdout.send(bytes);
+                            let _ = stdout.send(bytes.into_owned());
                         }
                     }
                     Ok(ExecEvent::Stderr(bytes)) => {
-                        output_tail.push_bytes(&bytes);
                         output_activity.touch();
+                        let bytes = stderr_status.feed(&bytes, |reply| {
+                            let _ = query_control.send(Control::Stdin(reply.to_vec()));
+                        });
+                        output_tail.push_bytes(&bytes);
+                        if let Some((_, terminal)) = &terminal {
+                            terminal.push_output(&bytes);
+                        }
                         if let Some((_, stderr)) = &sinks {
-                            let _ = stderr.send(bytes);
+                            let _ = stderr.send(bytes.into_owned());
                         }
                     }
                     Ok(ExecEvent::Exited(code)) => {
@@ -381,6 +439,19 @@ impl ExecBridge {
                     }
                 }
             };
+            for (stream, is_stderr) in [(&mut stdout_status, false), (&mut stderr_status, true)] {
+                let bytes = stream.finish();
+                output_tail.push_bytes(&bytes);
+                if let Some((_, terminal)) = &terminal {
+                    terminal.push_output(&bytes);
+                }
+                if let Some((stdout, stderr)) = &sinks {
+                    let _ = if is_stderr { stderr } else { stdout }.send(bytes);
+                }
+            }
+            if let Some((_, terminal)) = &terminal {
+                terminal.exit(outcome.as_ref().map_or(-1, |info| info.exit_code));
+            }
             drop(sinks);
             drop(frontend_weak);
             input_task.abort();
@@ -466,7 +537,8 @@ impl ExecBridge {
             }),
             stuck,
             Some(tail),
-        ))
+        )
+        .with_program_status(program_status))
     }
 }
 
@@ -486,7 +558,14 @@ impl Drop for AttachServer {
     }
 }
 impl AttachServer {
-    fn bind(path: &Path, session: &ExecSession) -> Result<Self, EngineError> {
+    fn bind(
+        path: &Path,
+        session: &ExecSession,
+        terminal: Option<(
+            Arc<crate::engine::terminal_hub::TerminalHub>,
+            crate::data::ids::TerminalId,
+        )>,
+    ) -> Result<Self, EngineError> {
         use std::os::unix::fs::PermissionsExt;
         // Never unlink a live or unknown endpoint. The SDK refuses duplicate names;
         // an existing attach endpoint is a failed start, requiring explicit cleanup.
@@ -503,6 +582,14 @@ impl AttachServer {
         let control = session.control.clone();
         let task = tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
+                if let Some((hub, id)) = &terminal {
+                    tokio::spawn(crate::engine::container::attach_socket::serve_hub_client(
+                        stream,
+                        hub.clone(),
+                        id.clone(),
+                    ));
+                    continue;
+                }
                 let receiver = events.subscribe();
                 let control = control.clone();
                 tokio::spawn(serve_client(stream, receiver, control));
@@ -521,6 +608,8 @@ async fn serve_client(
     control: Arc<dyn ExecControl>,
 ) {
     let (mut reader, mut writer) = stream.into_split();
+    let mut stdout_scanner = crate::engine::agent_runtime::program_status::Osc7501Scanner::new();
+    let mut stderr_scanner = crate::engine::agent_runtime::program_status::Osc7501Scanner::new();
     loop {
         // A frame can arrive in fragments. Keep this future alive while
         // events are forwarded; recreating it in select! discards partially
@@ -542,6 +631,13 @@ async fn serve_client(
                         return;
                     }
                     let (tag,bytes,terminal)=match event {Ok(ExecEvent::Stdout(b))=>(Tag::Output,b,false),Ok(ExecEvent::Stderr(b))=>(Tag::Stderr,b,false),Ok(ExecEvent::Exited(c))=>(Tag::Exit,c.to_le_bytes().to_vec(),true),_=>(Tag::Failed,Vec::new(),true)};
+                    if terminal {
+                        for (tag, scanner) in [(Tag::Output, &mut stdout_scanner), (Tag::Stderr, &mut stderr_scanner)] {
+                            let pending = scanner.finish();
+                            if !pending.is_empty() && write_chunked_bounded(&mut writer, tag, &pending, ATTACH_WRITE_TIMEOUT).await.is_err() { return; }
+                        }
+                    }
+                    let bytes = match tag { Tag::Output => stdout_scanner.feed(&bytes).forward, Tag::Stderr => stderr_scanner.feed(&bytes).forward, _ => std::borrow::Cow::Borrowed(bytes.as_slice()) };
                     let error=write_chunked_bounded(&mut writer,tag,&bytes,ATTACH_WRITE_TIMEOUT).await.is_err();
                     if error||terminal{return;}
                 }
@@ -580,9 +676,10 @@ impl AgentInstance for AttachInstance {
         let stream =
             tokio::net::UnixStream::from_std(stream).map_err(|e| EngineError::io(&path, e))?;
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let control: Arc<dyn ExecControl> = Arc::new(AttachControl(tx));
+        let (terminal_stdin, terminal_input) = crate::engine::terminal_hub::input_channel();
+        let control: Arc<dyn ExecControl> = Arc::new(AttachControl(tx, terminal_stdin));
         let (broadcast, events) = tokio::sync::broadcast::channel(4096);
-        tokio::spawn(client(stream, rx, broadcast.clone()));
+        tokio::spawn(client(stream, rx, broadcast.clone(), terminal_input));
         {
             let mut frontend = frontend;
             let io = frontend.take_io();
@@ -606,8 +703,14 @@ impl AgentInstance for AttachInstance {
         }
     }
 }
-struct AttachControl(tokio::sync::mpsc::UnboundedSender<Control>);
+struct AttachControl(
+    tokio::sync::mpsc::UnboundedSender<Control>,
+    tokio::sync::mpsc::Sender<Vec<u8>>,
+);
 impl ExecControl for AttachControl {
+    fn terminal_stdin(&self) -> Option<tokio::sync::mpsc::Sender<Vec<u8>>> {
+        Some(self.1.clone())
+    }
     fn send(&self, command: Control) -> Result<(), EngineError> {
         self.0.send(command).map_err(|_| failed())
     }
@@ -616,6 +719,7 @@ async fn client(
     stream: tokio::net::UnixStream,
     mut commands: tokio::sync::mpsc::UnboundedReceiver<Control>,
     events: tokio::sync::broadcast::Sender<ExecEvent>,
+    mut terminal_input: tokio::sync::mpsc::Receiver<Vec<u8>>,
 ) {
     let (mut reader, mut writer) = stream.into_split();
     loop {
@@ -623,6 +727,9 @@ async fn client(
         tokio::pin!(frame);
         loop {
             tokio::select! {
+                Some(bytes) = terminal_input.recv() => {
+                    if write_frame(&mut writer, Tag::Stdin, &bytes).await.is_err() { let _ = events.send(ExecEvent::Failed); return; }
+                }
                 frame=&mut frame=>{
                     let (event,terminal)=match frame {Ok((Tag::Output,b))=>(ExecEvent::Stdout(b),false),Ok((Tag::Stderr,b))=>(ExecEvent::Stderr(b),false),Ok((Tag::Exit,b)) if b.len()==4=>(ExecEvent::Exited(i32::from_le_bytes(b.try_into().unwrap())),true),_=>(ExecEvent::Failed,true)};
                     let _=events.send(event);if terminal{return;} break;
@@ -751,6 +858,118 @@ mod tests {
         assert!(broadcast.send(ExecEvent::Exited(4)).is_ok());
         assert_eq!(execution.wait().await.unwrap().exit_code, 4);
     }
+
+    #[tokio::test]
+    async fn program_status_bridge_scans_both_streams_and_queries_only_on_pty() {
+        use crate::engine::agent_runtime::execution::with_program_status_frontend;
+        use crate::engine::agent_runtime::program_status::OSC7501_QUERY_REPLY;
+        use crate::engine::container::builtin::testing::{frontend, recorder, Sent};
+        for pty in [false, true] {
+            for enabled in [false, true] {
+                let (frontend, mut peer) = frontend(pty.then_some((80, 24)));
+                let mut frontend = with_program_status_frontend(
+                    frontend,
+                    ProgramStatusBridgeConfig {
+                        enabled,
+                        answer_queries: false,
+                    },
+                );
+                let io = frontend.take_io();
+                let (control, log) = recorder();
+                let (broadcast, events) = tokio::sync::broadcast::channel(16);
+                let mut execution = ExecBridge::new(ExecBridgeOptions {
+                    handle: AgentHandle {
+                        id: "status".into(),
+                        name: "status".into(),
+                        image_tag: "test".into(),
+                        started_at: chrono::Utc::now(),
+                    },
+                    session: ExecSession {
+                        events,
+                        broadcast: broadcast.clone(),
+                        control,
+                    },
+                    cleanup: None,
+                    attach_path: None,
+                    persistent_stdin: true,
+                    seeded_prompt: None,
+                    leases: Vec::new(),
+                    prompt_files: Vec::new(),
+                    io,
+                    cancel_grace: DEFAULT_CANCEL_GRACE,
+                })
+                .run(frontend)
+                .unwrap();
+                assert!(broadcast
+                    .send(ExecEvent::Stdout(b"\x1b]7501;?\x1b".to_vec()))
+                    .is_ok());
+                assert!(broadcast
+                    .send(ExecEvent::Stderr(
+                        b"\x1b]7501;id=err:state=working\x07".to_vec(),
+                    ))
+                    .is_ok());
+                assert!(broadcast
+                    .send(ExecEvent::Stdout(
+                        b"\\\x1b]7501;id=out:state=blocked\x07".to_vec(),
+                    ))
+                    .is_ok());
+                let mut stdout = Vec::new();
+                while stdout.len() < b"\x1b]7501;id=out:state=blocked\x07".len() {
+                    stdout.extend(
+                        tokio::time::timeout(Duration::from_secs(3), peer.stdout.recv())
+                            .await
+                            .unwrap()
+                            .unwrap(),
+                    );
+                }
+                assert_eq!(stdout, b"\x1b]7501;id=out:state=blocked\x07");
+                assert_eq!(
+                    tokio::time::timeout(Duration::from_secs(3), peer.stderr.recv())
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    b"\x1b]7501;id=err:state=working\x07"
+                );
+                let replies: Vec<_> = log
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|sent| match sent {
+                        Sent::Stdin(bytes) => Some(bytes.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(
+                    replies,
+                    if pty && enabled {
+                        vec![OSC7501_QUERY_REPLY.to_vec()]
+                    } else {
+                        vec![]
+                    }
+                );
+                assert_eq!(execution.reports_program_status(), enabled);
+                if enabled {
+                    assert_eq!(
+                        execution.program_status().unwrap().state,
+                        crate::data::program_status::ProgramState::Blocked
+                    );
+                    assert!(broadcast
+                        .send(ExecEvent::Stdout(
+                            b"\x1b]7501;id=out:state=clear\x07".to_vec(),
+                        ))
+                        .is_ok());
+                    peer.stdout.recv().await.unwrap();
+                    assert_eq!(
+                        execution.program_status().unwrap().state,
+                        crate::data::program_status::ProgramState::Working
+                    );
+                }
+                assert!(broadcast.send(ExecEvent::Exited(0)).is_ok());
+                execution.wait().await.unwrap();
+                assert!(!execution.reports_program_status());
+            }
+        }
+    }
     #[tokio::test]
     async fn partial_attach_frames_survive_simultaneous_output_and_input() {
         let (server, mut peer) = tokio::net::UnixStream::pair().unwrap();
@@ -779,7 +998,12 @@ mod tests {
         let (socket, mut peer) = tokio::net::UnixStream::pair().unwrap();
         let (commands, receiver) = tokio::sync::mpsc::unbounded_channel();
         let (events, mut received) = tokio::sync::broadcast::channel(16);
-        let task = tokio::spawn(client(socket, receiver, events));
+        let task = tokio::spawn(client(
+            socket,
+            receiver,
+            events,
+            crate::engine::terminal_hub::input_channel().1,
+        ));
         peer.write_all(&[Tag::Stderr as u8, 3, 0]).await.unwrap();
         tokio::time::sleep(Duration::from_millis(20)).await;
         commands.send(Control::Stdin(b"in".to_vec())).unwrap();
@@ -806,7 +1030,7 @@ mod tests {
             broadcast,
             control: Arc::new(RecordingControl(commands)),
         };
-        let server = AttachServer::bind(&path, &session).unwrap();
+        let server = AttachServer::bind(&path, &session, None).unwrap();
         let mut stream = tokio::net::UnixStream::connect(&path).await.unwrap();
         write_frame(&mut stream, Tag::Stdin, &[0, 255, 13])
             .await
@@ -1098,7 +1322,7 @@ mod tests {
             broadcast,
             control: Arc::new(RecordingControl(commands)),
         };
-        let server = AttachServer::bind(&path, &session).unwrap();
+        let server = AttachServer::bind(&path, &session, None).unwrap();
         let mut stream = tokio::net::UnixStream::connect(&path).await.unwrap();
         write_frame(&mut stream, Tag::Stdin, b"ready")
             .await

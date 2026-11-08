@@ -43,12 +43,14 @@ mod command_results;
 mod frontend_layering;
 mod http_consistency;
 mod http_core;
+mod interaction;
 mod live_server;
 mod remote_session;
 mod request_validation;
 mod resource_tree;
 mod routes;
 mod session_setup_and_event_bus;
+mod terminals;
 mod workdir_allowlist;
 mod workflow_state;
 

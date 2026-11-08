@@ -590,6 +590,21 @@ async fn run_remote_exec(
                         });
                     }
                     EventPayload::Done => {}
+                    // WI 0141: the worker's `program_status` event reaches the
+                    // sink as one status line per state change. Terminal
+                    // lifecycle events are not printed.
+                    EventPayload::ProgramStatus {
+                        state, kind, msg, ..
+                    } => {
+                        self.sink.write_message(UserMessage {
+                            level: MessageLevel::Info,
+                            text: program_status_line(state, kind, msg.as_deref()),
+                        });
+                    }
+                    EventPayload::TerminalOpened { .. }
+                    | EventPayload::TerminalClosed { .. }
+                    | EventPayload::TerminalControl { .. }
+                    | EventPayload::TerminalViewerDetached { .. } => {}
                 }
                 false
             }
@@ -995,6 +1010,37 @@ async fn run_session_kill(
         session_id,
         remote_addr: addr,
     }))
+}
+
+/// The one-line wording for a worker's `program_status` event: "Agent is
+/// waiting for permission: <msg>". `msg` is untrusted agent text: it is
+/// printed as plain characters, control and invisible characters removed.
+fn program_status_line(
+    state: crate::data::program_status::ProgramState,
+    kind: Option<crate::data::program_status::BlockedKind>,
+    msg: Option<&str>,
+) -> String {
+    use crate::data::program_status::{BlockedKind, ProgramState};
+    let head = match (state, kind) {
+        (ProgramState::Blocked, Some(BlockedKind::Permission)) => "Agent is waiting for permission",
+        (ProgramState::Blocked, Some(BlockedKind::Question)) => "Agent is waiting for an answer",
+        (ProgramState::Blocked, Some(BlockedKind::Auth)) => "Agent is waiting for you to log in",
+        (ProgramState::Blocked, None) => "Agent is waiting for input",
+        (ProgramState::Error, _) => "Agent reported an error",
+        (ProgramState::Done, _) => "Agent reported done",
+        (ProgramState::Idle, _) => "Agent is idle",
+        (ProgramState::Working, _) => "Agent is working",
+    };
+    let msg: String = crate::data::program_status::strip_invisible(msg.unwrap_or_default())
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(160)
+        .collect();
+    if msg.trim().is_empty() {
+        head.to_string()
+    } else {
+        format!("{head}: {}", msg.trim())
+    }
 }
 
 #[cfg(test)]

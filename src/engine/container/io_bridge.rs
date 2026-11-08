@@ -13,6 +13,10 @@ use std::time::{Duration, Instant};
 use crate::engine::agent_runtime::execution::StuckEvent;
 use crate::engine::agent_runtime::frontend::AgentIo;
 use crate::engine::agent_runtime::output_tail::OutputTail;
+use crate::engine::agent_runtime::program_status::{
+    ProgramStatusBridgeConfig, ProgramStatusStream, ProgramStatusTracker, ReportedGate,
+    SharedProgramStatusTracker,
+};
 use crate::engine::error::EngineError;
 
 /// A PTY bridge's writer that never types into the session when dropped.
@@ -100,6 +104,8 @@ pub(crate) type CancelFn = Arc<dyn Fn() + Send + Sync>;
 /// Per-bridge configuration. Bundled into one struct so the bridge functions
 /// don't grow an unwieldy parameter list as more knobs land.
 pub(crate) struct BridgeConfig {
+    pub terminal: Option<crate::engine::agent_runtime::execution::TerminalLaunch>,
+    pub program_status: ProgramStatusBridgeConfig,
     pub grace_timeout: Duration,
     pub stuck_timeout: Duration,
     /// Window after container launch during which the detector ignores
@@ -130,6 +136,7 @@ pub(crate) struct BridgeConfig {
 /// Bundle returned by `bridge_pty` / `bridge_piped` containing the artifacts
 /// the backend needs to store for the execution lifetime.
 pub(crate) struct BridgeResult {
+    pub program_status: SharedProgramStatusTracker,
     /// Sender for `try_inject_stdin` — the engine retains a clone.
     pub stdin_injector: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
     /// Broadcast sender for stuck events — stored in `AgentExecution`.
@@ -173,6 +180,7 @@ impl OutputActivity {
 
 /// Timing knobs and the grace-expiry callback for one [`StuckDetector`].
 pub(crate) struct StuckConfig {
+    pub program_status: Option<SharedProgramStatusTracker>,
     pub grace_timeout: Duration,
     pub stuck_timeout: Duration,
     /// See [`BridgeConfig::container_start_delay`].
@@ -221,6 +229,7 @@ impl StuckDetector {
         output: &OutputActivity,
     ) -> Arc<tokio::sync::broadcast::Sender<StuckEvent>> {
         let StuckConfig {
+            program_status,
             grace_timeout,
             stuck_timeout,
             container_start_delay,
@@ -249,6 +258,8 @@ impl StuckDetector {
             }
 
             let mut is_stuck = false;
+            let mut reported_gate = ReportedGate::new();
+            let mut generation = 0;
             let grace_start = Instant::now();
             loop {
                 tokio::time::sleep(poll_interval).await;
@@ -256,6 +267,38 @@ impl StuckDetector {
                     Some(tx) => tx,
                     None => break,
                 };
+
+                let (reporting, effective, last_report, ended, tracker_generation) = program_status
+                    .as_ref()
+                    .and_then(|tracker| tracker.lock().ok())
+                    .map(|tracker| {
+                        (
+                            tracker.reporting(),
+                            tracker.effective(),
+                            tracker.last_report_at(),
+                            tracker.is_ended(),
+                            tracker.generation(),
+                        )
+                    })
+                    .unwrap_or((false, None, None, false, 0));
+                if ended {
+                    break;
+                }
+                if generation != tracker_generation {
+                    generation = tracker_generation;
+                    reported_gate = ReportedGate::new();
+                }
+                if reporting {
+                    if is_stuck && effective.is_some() {
+                        is_stuck = false;
+                        let _ = tx.send(StuckEvent::Unstuck);
+                    }
+                    if let Some(status) = reported_gate.next(Instant::now(), effective.as_ref()) {
+                        let _ = tx.send(StuckEvent::Reported(status));
+                    }
+                } else {
+                    reported_gate = ReportedGate::new();
+                }
 
                 if !first_byte.load(Ordering::Acquire) {
                     // Grace phase — measure from end of the start-delay window.
@@ -270,12 +313,20 @@ impl StuckDetector {
                 }
 
                 // Stuck phase — measure from the most recent byte.
+                if reporting && effective.is_some() {
+                    continue;
+                }
                 let elapsed = {
                     let guard = match activity.lock() {
                         Ok(g) => g,
                         Err(_) => break,
                     };
-                    match *guard {
+                    let last = if reporting {
+                        (*guard).max(last_report)
+                    } else {
+                        *guard
+                    };
+                    match last {
                         Some(t) => t.elapsed(),
                         None => grace_start.elapsed(),
                     }
@@ -319,8 +370,20 @@ pub(crate) fn bridge_pty(
         .take_writer()
         .map_err(|e| EngineError::Container(format!("take pty writer: {e}")))?;
     let mut writer = QuietPtyWriter::new(writer, pair.master.as_ref());
+    let master_arc = Arc::new(Mutex::new(pair.master));
+    let (terminal, mut remote_input) = match &config.terminal {
+        Some(launch) => {
+            let (cols, rows) = io.initial_size.unwrap_or((120, 40));
+            let (handle, input) = launch.register_pty(cols, rows, &master_arc);
+            (Some(handle), Some(input))
+        }
+        None => (None, None),
+    };
+    let reader_terminal = terminal.clone();
+    let drain = config.terminal.as_ref().map(|launch| launch.drain.writer());
 
     let output = OutputActivity::new();
+    let program_status = ProgramStatusTracker::shared();
 
     // Reader thread: PTY → stdout channel (activity tracked).
     //
@@ -335,6 +398,14 @@ pub(crate) fn bridge_pty(
     // A writer handle, so a caller can wait for this thread to finish.
     let tail = config.output_tail.writer();
     let broadcast = config.output_broadcast.clone();
+    let mut status_stream = ProgramStatusStream::new(
+        program_status.clone(),
+        ProgramStatusBridgeConfig {
+            answer_queries: true,
+            ..config.program_status
+        },
+    );
+    let query_stdin = io.stdin_tx.clone();
     std::thread::spawn(move || {
         use std::io::Read;
         let mut buf = [0u8; 4096];
@@ -344,22 +415,37 @@ pub(crate) fn bridge_pty(
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     act.touch();
-                    tail.push_bytes(&buf[..n]);
+                    let bytes = status_stream.feed(&buf[..n], |reply| {
+                        let _ = query_stdin.send(reply.to_vec());
+                    });
+                    tail.push_bytes(&bytes);
+                    if let Some(terminal) = &reader_terminal {
+                        terminal.push_output(&bytes);
+                    }
                     if let Some(tx) = &broadcast {
                         // Copy only when someone is attached; a lagged client
                         // drops chunks. (A new client's subscription always
                         // precedes the repaint its initial resize triggers,
                         // so this gate can't starve it.)
                         if tx.receiver_count() > 0 {
-                            let _ = tx.send(buf[..n].to_vec());
+                            let _ = tx.send(bytes.to_vec());
                         }
                     }
-                    if sink_open && stdout_tx.send(buf[..n].to_vec()).is_err() {
+                    if sink_open && stdout_tx.send(bytes.to_vec()).is_err() {
                         sink_open = false;
                     }
                 }
             }
         }
+        let bytes = status_stream.finish();
+        tail.push_bytes(&bytes);
+        if let Some(terminal) = &reader_terminal {
+            terminal.push_output(&bytes);
+        }
+        if !bytes.is_empty() {
+            let _ = stdout_tx.send(bytes);
+        }
+        drop(drain);
     });
 
     // Writer task: stdin channel → PTY.
@@ -367,7 +453,11 @@ pub(crate) fn bridge_pty(
     let mut stdin_rx = io.stdin_rx;
     tokio::spawn(async move {
         use std::io::Write;
-        while let Some(bytes) = stdin_rx.recv().await {
+        loop {
+            let bytes = tokio::select! {
+                bytes = stdin_rx.recv() => match bytes { Some(bytes) => bytes, None => break },
+                bytes = crate::engine::agent_runtime::execution::next_terminal_input(&mut remote_input) => bytes,
+            };
             if writer.write_all(&bytes).is_err() {
                 break;
             }
@@ -378,12 +468,19 @@ pub(crate) fn bridge_pty(
     });
 
     // Resize task.
-    let master_arc = Arc::new(Mutex::new(pair.master));
     if let Some(mut resize_rx) = io.resize {
         let master_for_resize = Arc::clone(&master_arc);
         tokio::spawn(async move {
             use portable_pty::PtySize;
             while let Some((cols, rows)) = resize_rx.recv().await {
+                if let Some(terminal) = &terminal {
+                    // Local presentation changes only the fallback while a
+                    // remote viewer owns the PTY size.
+                    if let Some(launch) = &config.terminal {
+                        let _ = launch.hub.set_default_size(terminal.id(), cols, rows);
+                    }
+                    continue;
+                }
                 if let Ok(master) = master_for_resize.lock() {
                     let _ = master.resize(PtySize {
                         rows,
@@ -403,6 +500,7 @@ pub(crate) fn bridge_pty(
             container_start_delay: config.container_start_delay,
             cancel_on_grace_expired: config.cancel_on_grace_expired,
             poll_interval: STUCK_POLL_INTERVAL,
+            program_status: Some(program_status.clone()),
         },
         &output,
     );
@@ -413,6 +511,7 @@ pub(crate) fn bridge_pty(
             stdin_injector: stdin_tx,
             stuck_tx,
             output_tail: config.output_tail,
+            program_status,
         },
     ))
 }
@@ -431,6 +530,7 @@ pub(crate) fn bridge_piped(
     config: BridgeConfig,
 ) -> BridgeResult {
     let output = OutputActivity::new();
+    let program_status = ProgramStatusTracker::shared();
 
     // stdout reader thread.
     //
@@ -444,6 +544,13 @@ pub(crate) fn bridge_piped(
         // A writer handle, so a caller can wait for this thread to finish.
         let tail = config.output_tail.writer();
         let broadcast = config.output_broadcast.clone();
+        let mut status_stream = ProgramStatusStream::new(
+            program_status.clone(),
+            ProgramStatusBridgeConfig {
+                answer_queries: false,
+                ..config.program_status
+            },
+        );
         std::thread::spawn(move || {
             use std::io::Read;
             let mut reader = child_stdout;
@@ -454,17 +561,26 @@ pub(crate) fn bridge_piped(
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
                         act.touch();
-                        tail.push_bytes(&buf[..n]);
+                        let bytes = status_stream.feed(&buf[..n], |_| {});
+                        tail.push_bytes(&bytes);
                         if let Some(tx) = &broadcast {
                             if tx.receiver_count() > 0 {
-                                let _ = tx.send(buf[..n].to_vec());
+                                let _ = tx.send(bytes.to_vec());
                             }
                         }
-                        if sink_open && stdout_tx.send(buf[..n].to_vec()).is_err() {
+                        if sink_open && stdout_tx.send(bytes.to_vec()).is_err() {
                             sink_open = false;
                         }
                     }
                 }
+            }
+            let bytes = status_stream.finish();
+            tail.push_bytes(&bytes);
+            if let Some(tx) = &broadcast {
+                let _ = tx.send(bytes.clone());
+            }
+            if !bytes.is_empty() {
+                let _ = stdout_tx.send(bytes);
             }
         });
     }
@@ -477,6 +593,13 @@ pub(crate) fn bridge_piped(
         // A writer handle, so a caller can wait for this thread to finish.
         let tail = config.output_tail.writer();
         let broadcast = config.output_broadcast.clone();
+        let mut status_stream = ProgramStatusStream::new(
+            program_status.clone(),
+            ProgramStatusBridgeConfig {
+                answer_queries: false,
+                ..config.program_status
+            },
+        );
         std::thread::spawn(move || {
             use std::io::Read;
             let mut reader = child_stderr;
@@ -487,17 +610,26 @@ pub(crate) fn bridge_piped(
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
                         act.touch();
-                        tail.push_bytes(&buf[..n]);
+                        let bytes = status_stream.feed(&buf[..n], |_| {});
+                        tail.push_bytes(&bytes);
                         if let Some(tx) = &broadcast {
                             if tx.receiver_count() > 0 {
-                                let _ = tx.send(buf[..n].to_vec());
+                                let _ = tx.send(bytes.to_vec());
                             }
                         }
-                        if sink_open && stderr_tx.send(buf[..n].to_vec()).is_err() {
+                        if sink_open && stderr_tx.send(bytes.to_vec()).is_err() {
                             sink_open = false;
                         }
                     }
                 }
+            }
+            let bytes = status_stream.finish();
+            tail.push_bytes(&bytes);
+            if let Some(tx) = &broadcast {
+                let _ = tx.send(bytes.clone());
+            }
+            if !bytes.is_empty() {
+                let _ = stderr_tx.send(bytes);
             }
         });
     }
@@ -527,6 +659,7 @@ pub(crate) fn bridge_piped(
             container_start_delay: config.container_start_delay,
             cancel_on_grace_expired: config.cancel_on_grace_expired,
             poll_interval: STUCK_POLL_INTERVAL,
+            program_status: Some(program_status.clone()),
         },
         &output,
     );
@@ -535,14 +668,435 @@ pub(crate) fn bridge_piped(
         stdin_injector: stdin_tx,
         stuck_tx,
         output_tail: config.output_tail,
+        program_status,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::program_status::{parse_body, ParsedOsc7501, ProgramState};
+    use crate::engine::agent_runtime::program_status::{Osc7501Scanner, ScanEvent};
     use std::time::{Duration, Instant};
     use tokio::sync::mpsc;
+
+    fn apply_status(tracker: &SharedProgramStatusTracker, body: &[u8]) {
+        tracker
+            .lock()
+            .unwrap()
+            .apply(&ScanEvent::Osc(parse_body(body)), Instant::now());
+    }
+
+    fn reporting_detector(
+        output: &OutputActivity,
+        tracker: SharedProgramStatusTracker,
+    ) -> Arc<tokio::sync::broadcast::Sender<StuckEvent>> {
+        StuckDetector::spawn(
+            StuckConfig {
+                grace_timeout: Duration::from_millis(80),
+                stuck_timeout: Duration::from_millis(80),
+                container_start_delay: Duration::ZERO,
+                cancel_on_grace_expired: None,
+                poll_interval: Duration::from_millis(5),
+                program_status: Some(tracker),
+            },
+            output,
+        )
+    }
+
+    async fn next_event(rx: &mut tokio::sync::broadcast::Receiver<StuckEvent>) -> StuckEvent {
+        tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    #[test]
+    fn tracker_acceptance_clear_ris_and_execution_reset() {
+        let tracker = ProgramStatusTracker::shared();
+        apply_status(&tracker, b"?");
+        for malformed in [
+            b"state=future".as_slice(),
+            b"state=working:id=bad//id",
+            b"state=done:msg=Cg==",
+        ] {
+            assert_eq!(parse_body(malformed), ParsedOsc7501::Ignored);
+            apply_status(&tracker, malformed);
+        }
+        assert!(!tracker.lock().unwrap().reporting());
+        // An accepted clear latches even when there is nothing to remove.
+        apply_status(&tracker, b"state=clear");
+        assert!(tracker.lock().unwrap().reporting());
+        apply_status(&tracker, b"state=working");
+        tracker
+            .lock()
+            .unwrap()
+            .apply(&ScanEvent::Reset, Instant::now());
+        assert!(tracker.lock().unwrap().reporting());
+        assert!(tracker.lock().unwrap().effective().is_none());
+        tracker.lock().unwrap().reset();
+        assert!(!tracker.lock().unwrap().reporting());
+        assert!(tracker.lock().unwrap().last_report_at().is_none());
+    }
+
+    #[tokio::test]
+    async fn reporting_working_suppresses_many_silence_timeouts() {
+        let output = OutputActivity::new();
+        let tracker = ProgramStatusTracker::shared();
+        let tx = reporting_detector(&output, tracker.clone());
+        let mut rx = tx.subscribe();
+        output.touch();
+        apply_status(&tracker, b"state=working");
+        assert!(
+            matches!(next_event(&mut rx).await, StuckEvent::Reported(Some(s)) if s.state == ProgramState::Working)
+        );
+        tokio::time::sleep(Duration::from_millis(420)).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "reports supersede silence and deduplicate"
+        );
+    }
+
+    #[tokio::test]
+    async fn first_report_unstucks_exactly_once() {
+        let output = OutputActivity::new();
+        let tracker = ProgramStatusTracker::shared();
+        let tx = reporting_detector(&output, tracker.clone());
+        let mut rx = tx.subscribe();
+        output.touch();
+        assert_eq!(next_event(&mut rx).await, StuckEvent::Stuck);
+        apply_status(&tracker, b"state=working");
+        assert_eq!(next_event(&mut rx).await, StuckEvent::Unstuck);
+        assert!(matches!(
+            next_event(&mut rx).await,
+            StuckEvent::Reported(Some(_))
+        ));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn new_step_relearns_support_and_republishes_an_identical_status() {
+        let output = OutputActivity::new();
+        let tracker = ProgramStatusTracker::shared();
+        let tx = reporting_detector(&output, tracker.clone());
+        let mut rx = tx.subscribe();
+        output.touch();
+        apply_status(&tracker, b"state=working");
+        let first = next_event(&mut rx).await;
+        tracker.lock().unwrap().reset();
+        assert!(!tracker.lock().unwrap().reporting());
+        // Reset and report can both occur between two detector polls.
+        apply_status(&tracker, b"state=working");
+        assert_eq!(next_event(&mut rx).await, first);
+        tracker.lock().unwrap().end_execution();
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn clear_and_ris_resume_silence_from_reset_then_next_report_suppresses() {
+        for reset in [b"\x1b]7501;state=clear\x07".as_slice(), b"\x1bc"] {
+            let output = OutputActivity::new();
+            let tracker = ProgramStatusTracker::shared();
+            let tx = reporting_detector(&output, tracker.clone());
+            let mut rx = tx.subscribe();
+            output.touch();
+            apply_status(&tracker, b"state=working");
+            assert!(matches!(
+                next_event(&mut rx).await,
+                StuckEvent::Reported(Some(_))
+            ));
+            tokio::time::sleep(Duration::from_millis(270)).await;
+            // Deliberately do not touch output: the reset timestamp itself
+            // must restart the silence clock, even with old byte activity.
+            for event in Osc7501Scanner::new().feed(reset).events {
+                tracker.lock().unwrap().apply(&event, Instant::now());
+            }
+            assert_eq!(next_event(&mut rx).await, StuckEvent::Reported(None));
+            assert!(tokio::time::timeout(Duration::from_millis(35), rx.recv())
+                .await
+                .is_err());
+            assert_eq!(next_event(&mut rx).await, StuckEvent::Stuck);
+            apply_status(&tracker, b"state=working");
+            assert_eq!(next_event(&mut rx).await, StuckEvent::Unstuck);
+            assert!(matches!(
+                next_event(&mut rx).await,
+                StuckEvent::Reported(Some(_))
+            ));
+            tokio::time::sleep(Duration::from_millis(170)).await;
+            assert!(rx.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_or_disabled_reports_keep_silence_detection() {
+        for enabled in [true, false] {
+            let output = OutputActivity::new();
+            let tracker = ProgramStatusTracker::shared();
+            let tx = reporting_detector(&output, tracker.clone());
+            let mut rx = tx.subscribe();
+            let mut stream = ProgramStatusStream::new(
+                tracker.clone(),
+                ProgramStatusBridgeConfig {
+                    enabled,
+                    answer_queries: true,
+                },
+            );
+            let bytes = if enabled {
+                b"\x1b]7501;state=unknown\x07".as_slice()
+            } else {
+                b"\x1b]7501;state=working\x07\x1b]7501;?\x07"
+            };
+            output.touch();
+            let _ = stream.feed(bytes, |_| panic!("disabled must never reply"));
+            assert!(!tracker.lock().unwrap().reporting());
+            assert_eq!(next_event(&mut rx).await, StuckEvent::Stuck);
+            assert!(rx.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn reporting_does_not_change_silent_startup_grace() {
+        let output = OutputActivity::new();
+        let tracker = ProgramStatusTracker::shared();
+        let tx = reporting_detector(&output, tracker);
+        let mut rx = tx.subscribe();
+        assert_eq!(next_event(&mut rx).await, StuckEvent::StartupGraceExpired);
+    }
+
+    #[tokio::test]
+    async fn apple_delay_keeps_reports_and_latch() {
+        let output = OutputActivity::new();
+        let tracker = ProgramStatusTracker::shared();
+        let tx = StuckDetector::spawn(
+            StuckConfig {
+                grace_timeout: Duration::from_secs(2),
+                stuck_timeout: Duration::from_millis(30),
+                container_start_delay: Duration::from_millis(80),
+                cancel_on_grace_expired: None,
+                poll_interval: Duration::from_millis(5),
+                program_status: Some(tracker.clone()),
+            },
+            &output,
+        );
+        let mut rx = tx.subscribe();
+        output.touch();
+        apply_status(&tracker, b"state=working");
+        tokio::time::sleep(Duration::from_millis(110)).await;
+        assert!(tracker.lock().unwrap().reporting());
+        assert!(matches!(
+            next_event(&mut rx).await,
+            StuckEvent::Reported(Some(_))
+        ));
+        output.touch();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn reported_gate_deduplicates_and_debounces_transitions_and_display() {
+        let tracker = ProgramStatusTracker::shared();
+        let mut gate = ReportedGate::new();
+        let start = Instant::now();
+        apply_status(&tracker, b"state=working:progress=0");
+        let status = tracker.lock().unwrap().effective().unwrap();
+        assert_eq!(gate.next(start, Some(&status)), Some(Some(status.clone())));
+        assert_eq!(
+            gate.next(start + Duration::from_secs(3), Some(&status)),
+            None
+        );
+        apply_status(&tracker, b"state=done");
+        let done = tracker.lock().unwrap().effective().unwrap();
+        assert_eq!(
+            gate.next(start + Duration::from_millis(249), Some(&done)),
+            None
+        );
+        assert_eq!(
+            gate.next(start + Duration::from_millis(250), Some(&done)),
+            Some(Some(done))
+        );
+        apply_status(&tracker, b"state=blocked:kind=question:progress=1");
+        let blocked = tracker.lock().unwrap().effective().unwrap();
+        assert_eq!(
+            gate.next(start + Duration::from_millis(500), Some(&blocked)),
+            Some(Some(blocked))
+        );
+        apply_status(&tracker, b"state=blocked:kind=permission:progress=1");
+        let permission = tracker.lock().unwrap().effective().unwrap();
+        assert!(gate
+            .next(start + Duration::from_millis(750), Some(&permission))
+            .is_some());
+        apply_status(
+            &tracker,
+            b"state=blocked:kind=permission:progress=2:msg=aGk=",
+        );
+        let display = tracker.lock().unwrap().effective().unwrap();
+        assert_eq!(
+            gate.next(start + Duration::from_millis(1749), Some(&display)),
+            None
+        );
+        assert_eq!(
+            gate.next(start + Duration::from_millis(1750), Some(&display)),
+            Some(Some(display))
+        );
+        assert_eq!(
+            gate.next(start + Duration::from_millis(2000), None),
+            Some(None)
+        );
+        assert_eq!(gate.next(start + Duration::from_secs(4), None), None);
+    }
+
+    #[test]
+    fn bridge_streams_keep_split_sequences_independent_and_plain_output_borrowed() {
+        let tracker = ProgramStatusTracker::shared();
+        let mut stdout = ProgramStatusStream::new(tracker.clone(), Default::default());
+        let mut stderr = ProgramStatusStream::new(tracker.clone(), Default::default());
+        assert!(matches!(
+            stdout.feed(b"plain", |_| {}),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        let _ = stdout.feed(b"\x1b]7501;id=out:state=wor", |_| {});
+        let _ = stderr.feed(b"\x1b]7501;id=err:state=blocked\x07", |_| {});
+        let _ = stdout.feed(b"king\x1b\\", |_| {});
+        assert_eq!(tracker.lock().unwrap().set().len(), 2);
+        assert_eq!(
+            tracker.lock().unwrap().effective().unwrap().state,
+            ProgramState::Blocked
+        );
+    }
+
+    fn bridge_test_io() -> (
+        AgentIo,
+        mpsc::UnboundedReceiver<Vec<u8>>,
+        mpsc::UnboundedReceiver<Vec<u8>>,
+    ) {
+        let (stdout, out) = mpsc::unbounded_channel();
+        let (stderr, err) = mpsc::unbounded_channel();
+        let (stdin_tx, stdin_rx) = mpsc::unbounded_channel();
+        (
+            AgentIo {
+                stdout,
+                stderr,
+                stdin_tx,
+                stdin_rx,
+                resize: None,
+                initial_size: None,
+            },
+            out,
+            err,
+        )
+    }
+
+    fn bridge_test_config(enabled: bool) -> BridgeConfig {
+        BridgeConfig {
+            grace_timeout: Duration::from_secs(30),
+            stuck_timeout: Duration::from_secs(30),
+            container_start_delay: Duration::ZERO,
+            cancel_on_grace_expired: None,
+            output_tail: Arc::new(OutputTail::with_default_capacity()),
+            output_broadcast: None,
+            terminal: None,
+            program_status: ProgramStatusBridgeConfig {
+                enabled,
+                answer_queries: true,
+            },
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bridge_piped_queries_never_reply_and_both_streams_report() {
+        use std::process::{Command, Stdio};
+        for enabled in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let received = dir.path().join("stdin");
+            let (io, mut out, mut err) = bridge_test_io();
+            let mut child = Command::new("sh").args(["-c", r#"printf '\033]7501;?\007\033]7501;id=out:state=working\007'; printf '\033]7501;?\033\\\033]7501;id=err:state=blocked\007' >&2; cat > "$1""#, "sh"])
+                .arg(&received).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+            let bridge = bridge_piped(io, &mut child, bridge_test_config(enabled));
+            drop(bridge.stdin_injector);
+            let status = tokio::time::timeout(
+                Duration::from_secs(5),
+                tokio::task::spawn_blocking(move || child.wait()),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+            assert!(status.success());
+            let mut stdout = Vec::new();
+            while let Some(bytes) = tokio::time::timeout(Duration::from_secs(3), out.recv())
+                .await
+                .unwrap()
+            {
+                stdout.extend(bytes);
+            }
+            let mut stderr = Vec::new();
+            while let Some(bytes) = tokio::time::timeout(Duration::from_secs(3), err.recv())
+                .await
+                .unwrap()
+            {
+                stderr.extend(bytes);
+            }
+            assert_eq!(stdout, b"\x1b]7501;id=out:state=working\x07");
+            assert_eq!(stderr, b"\x1b]7501;id=err:state=blocked\x07");
+            assert!(
+                std::fs::read(received).unwrap().is_empty(),
+                "piped queries have no reply"
+            );
+            let tracker = bridge.program_status.lock().unwrap();
+            assert_eq!(tracker.reporting(), enabled);
+            assert_eq!(tracker.set().len(), if enabled { 2 } else { 0 });
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bridge_pty_query_replies_exactly_once_and_disabled_never_replies() {
+        use crate::engine::agent_runtime::program_status::OSC7501_QUERY_REPLY;
+        use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+        for enabled in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let received = dir.path().join("stdin");
+            let (mut io, mut out, _) = bridge_test_io();
+            io.initial_size = Some((80, 24));
+            let pair = native_pty_system()
+                .openpty(PtySize {
+                    rows: 24,
+                    cols: 80,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
+                .unwrap();
+            let mut command = CommandBuilder::new("sh");
+            // A timeout read after the first reply detects duplicate replies.
+            command.args(["-c", r#"stty raw -echo min 0 time 2; printf '\033]7501;?\033\\\033]7501;state=working\007'; dd bs=1 count=20 of="$1" 2>/dev/null"#, "sh"]);
+            command.arg(received.as_os_str());
+            let mut child = pair.slave.spawn_command(command).unwrap();
+            let (_master, bridge) = bridge_pty(io, pair, bridge_test_config(enabled)).unwrap();
+            let status = tokio::time::timeout(
+                Duration::from_secs(5),
+                tokio::task::spawn_blocking(move || child.wait()),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+            assert!(status.success());
+            let expected = if enabled { OSC7501_QUERY_REPLY } else { b"" };
+            assert_eq!(std::fs::read(received).unwrap(), expected);
+            let mut forwarded = Vec::new();
+            while let Some(bytes) = tokio::time::timeout(Duration::from_secs(3), out.recv())
+                .await
+                .unwrap()
+            {
+                forwarded.extend(bytes);
+            }
+            assert_eq!(forwarded, b"\x1b]7501;state=working\x07");
+            assert_eq!(bridge.program_status.lock().unwrap().reporting(), enabled);
+        }
+    }
 
     // ── Stuck detector ────────────────────────────────────────────────────────
 
@@ -559,6 +1113,7 @@ mod tests {
                 container_start_delay: Duration::ZERO,
                 cancel_on_grace_expired: None,
                 poll_interval: Duration::from_millis(10),
+                program_status: None,
             },
             &output,
         );
@@ -589,6 +1144,7 @@ mod tests {
                 container_start_delay: Duration::ZERO,
                 cancel_on_grace_expired: None,
                 poll_interval: Duration::from_millis(10),
+                program_status: None,
             },
             &output,
         );
@@ -633,6 +1189,7 @@ mod tests {
                 container_start_delay: Duration::ZERO,
                 cancel_on_grace_expired: Some(cancel),
                 poll_interval: Duration::from_millis(10),
+                program_status: None,
             },
             &output,
         );
@@ -671,6 +1228,7 @@ mod tests {
                 container_start_delay: Duration::ZERO,
                 cancel_on_grace_expired: None,
                 poll_interval: Duration::from_millis(10),
+                program_status: None,
             },
             &output,
         );
@@ -705,6 +1263,7 @@ mod tests {
                 container_start_delay: Duration::from_millis(150),
                 cancel_on_grace_expired: None,
                 poll_interval: Duration::from_millis(10),
+                program_status: None,
             },
             &output,
         );
@@ -795,6 +1354,8 @@ mod tests {
                 cancel_on_grace_expired: None,
                 output_tail: Arc::new(OutputTail::with_default_capacity()),
                 output_broadcast: None,
+                terminal: None,
+                program_status: ProgramStatusBridgeConfig::default(),
             },
         );
         // Headless flow: drop the engine's stdin handle so the writer
@@ -853,6 +1414,8 @@ mod tests {
                 cancel_on_grace_expired: None,
                 output_tail: Arc::new(OutputTail::with_default_capacity()),
                 output_broadcast: None,
+                terminal: None,
+                program_status: ProgramStatusBridgeConfig::default(),
             },
         );
         drop(bridge.stdin_injector);
@@ -909,6 +1472,8 @@ mod tests {
                 cancel_on_grace_expired: None,
                 output_tail: Arc::new(OutputTail::with_default_capacity()),
                 output_broadcast: None,
+                terminal: None,
+                program_status: ProgramStatusBridgeConfig::default(),
             },
         )
         .unwrap();
@@ -978,6 +1543,8 @@ mod tests {
                     cancel_on_grace_expired: None,
                     output_tail: Arc::new(OutputTail::with_default_capacity()),
                     output_broadcast: None,
+                    terminal: None,
+                    program_status: ProgramStatusBridgeConfig::default(),
                 },
             )
             .unwrap();
@@ -1048,6 +1615,8 @@ mod tests {
                 cancel_on_grace_expired: None,
                 output_tail: Arc::new(OutputTail::with_default_capacity()),
                 output_broadcast: None,
+                terminal: None,
+                program_status: ProgramStatusBridgeConfig::default(),
             },
         );
         // Drop the engine's stdin sender so `cat` sees EOF after the payload.
@@ -1128,6 +1697,8 @@ mod tests {
                 cancel_on_grace_expired: None,
                 output_tail: Arc::new(OutputTail::with_default_capacity()),
                 output_broadcast: None,
+                terminal: None,
+                program_status: ProgramStatusBridgeConfig::default(),
             },
         );
         drop(bridge.stdin_injector);

@@ -55,6 +55,11 @@ pub struct CliFrontend {
     pub(crate) yolo_stdin_rx: Option<std::sync::Mutex<std::sync::mpsc::Receiver<String>>>,
     /// Throttle: last time a yolo countdown message was emitted to stderr.
     pub(crate) last_sink_message_time: Option<std::time::Instant>,
+    /// One agent-status line per state change (OSC 7501), whichever path
+    /// (workflow engine report or `chat`/`exec prompt` stuck channel) sees it.
+    pub(crate) status_gate: crate::frontend::program_status_text::StatusLineGate,
+    /// Why the running countdown exists, for its wording.
+    pub(crate) countdown_kind: crate::engine::workflow::actions::CountdownKind,
     /// RAII guard that restores cooked mode when dropped. Present while a
     /// full-screen interactive container owns the terminal.
     pub(crate) raw_mode_guard: Option<RawModeGuard>,
@@ -78,6 +83,11 @@ pub struct CliFrontend {
     pub(crate) squad_attach_exit_code: Arc<AtomicI32>,
     pub(crate) agents_attach_cancel: tokio_util::sync::CancellationToken,
     pub(crate) agents_watch: Option<super::per_command::agents::WatchScreen>,
+    pub(crate) attach_cancel: Option<tokio_util::sync::CancellationToken>,
+    pub(crate) attach_hangup: tokio_util::sync::CancellationToken,
+    pub(crate) host_output_policy: crate::data::terminal::HostOutputPolicy,
+    pub(crate) acp_output_filter: Option<crate::frontend::terminal_output_filter::HostOutputFilter>,
+    pub(crate) attach_exit_code: Arc<AtomicI32>,
 }
 
 #[async_trait::async_trait]
@@ -335,7 +345,7 @@ impl Drop for RawModeGuard {
 impl CliFrontend {
     /// Whether this invocation is `agents attach`, as the catalogue names it.
     pub(crate) fn is_agent_attach(&self) -> bool {
-        CommandCatalogue::get().is_agent_attach(&command_path_from_matches(&self.matches))
+        self.command_path.as_slice() == ["attach"]
     }
 
     /// A yes/no interview step that no profile answers.
@@ -429,6 +439,8 @@ impl CliFrontend {
             headless: HeadlessDefaults::cli(),
             yolo_stdin_rx: None,
             last_sink_message_time: None,
+            status_gate: Default::default(),
+            countdown_kind: Default::default(),
             raw_mode_guard: None,
             stdin_reader_shutdown: None,
             stdin_reader_handle: None,
@@ -437,6 +449,11 @@ impl CliFrontend {
             squad_attach_exit_code: Arc::new(AtomicI32::new(0)),
             agents_watch: None,
             agents_attach_cancel: tokio_util::sync::CancellationToken::new(),
+            attach_cancel: None,
+            attach_hangup: tokio_util::sync::CancellationToken::new(),
+            host_output_policy: crate::data::terminal::HostOutputPolicy::default(),
+            acp_output_filter: None,
+            attach_exit_code: Arc::new(AtomicI32::new(0)),
         }
     }
 
@@ -538,6 +555,10 @@ impl UserMessageSink for CliFrontend {
 impl CommandFrontend for CliFrontend {
     fn kind(&self) -> crate::command::dispatch::catalogue::FrontendKind {
         crate::command::dispatch::catalogue::FrontendKind::Cli
+    }
+
+    fn set_host_output_policy(&mut self, policy: crate::data::terminal::HostOutputPolicy) {
+        self.host_output_policy = policy;
     }
 
     /// The CLI is the one frontend whose answer is not a property of its kind:

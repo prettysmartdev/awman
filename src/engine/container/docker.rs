@@ -26,6 +26,7 @@ use crate::engine::agent_runtime::execution::{
 };
 use crate::engine::container::agent_argv::AgentArgv;
 use crate::engine::container::backend::ContainerBackend;
+use crate::engine::container::host_env_denylist::{is_host_terminal_var, scrub_run_env};
 use crate::engine::container::options::{ContainerName, ImageRef, ResolvedContainerOptions};
 use crate::engine::container::process::{ContainerCli, ContainerInstance};
 use crate::engine::credential_refresh::register_container_leases;
@@ -456,6 +457,8 @@ pub(super) fn attach_bridge_config(
             crate::engine::agent_runtime::output_tail::OutputTail::with_default_capacity(),
         ),
         output_broadcast: None,
+        terminal: None,
+        program_status: Default::default(),
     }
 }
 
@@ -510,7 +513,8 @@ impl AgentInstance for AttachInstance {
         let grace_timeout = frontend.grace_timeout();
         let stuck_timeout = frontend.stuck_timeout();
         let io = frontend.take_io();
-        let bridge_cfg = attach_bridge_config(grace_timeout, stuck_timeout);
+        let mut bridge_cfg = attach_bridge_config(grace_timeout, stuck_timeout);
+        bridge_cfg.program_status = frontend.program_status_config();
 
         // `docker attach` reconnects to the container's primary process (the
         // agent launched by `docker run -it`), rather than creating a sibling
@@ -583,7 +587,8 @@ fn spawn_pty_bridged_attach(
         Box::new(backend),
         bridge.stuck_tx,
         Some(bridge.output_tail),
-    ))
+    )
+    .with_program_status(bridge.program_status))
 }
 
 /// Spawn `docker attach` with piped stdio and bridge through `AgentIo`. Mirrors
@@ -632,7 +637,8 @@ fn spawn_piped_attach(
         Box::new(backend),
         bridge.stuck_tx,
         Some(bridge.output_tail),
-    ))
+    )
+    .with_program_status(bridge.program_status))
 }
 
 /// Execution backend for an attach session. Identical to `DockerExecution`
@@ -754,7 +760,7 @@ impl ExecutionBackend for AttachExecution {
 /// included: that is bit-for-bit today's `std::env::var(..).is_ok()` gate, and
 /// changing it would silently alter CLI/TUI behaviour for a variable that is
 /// deliberately set to the empty string.
-pub(super) fn resolve_env_passthrough(options: &ResolvedContainerOptions) -> Vec<(String, String)> {
+fn resolve_env_passthrough_raw(options: &ResolvedContainerOptions) -> Vec<(String, String)> {
     let mut values: Vec<_> = options
         .env_passthrough
         .iter()
@@ -770,6 +776,72 @@ pub(super) fn resolve_env_passthrough(options: &ResolvedContainerOptions) -> Vec
         }
     }
     values
+}
+
+/// [`resolve_env_passthrough_raw`] minus host-terminal variables (WI 0141 §3).
+///
+/// `TERM` and `COLORTERM` are also removed here: the container gets them from
+/// [`terminal_env_literals`], never from the host.
+pub(super) fn resolve_env_passthrough(options: &ResolvedContainerOptions) -> Vec<(String, String)> {
+    resolve_env_passthrough_raw(options)
+        .into_iter()
+        .filter(|(name, _)| !is_screened_run_var(name))
+        .collect()
+}
+
+/// A name the run must never set from the host or an option source: a
+/// host-terminal variable, or `TERM`/`COLORTERM`, which only the normalised
+/// [`scrubbed_env_literals`] may set (WI 0141 §3).
+fn is_screened_run_var(name: &str) -> bool {
+    is_host_terminal_var(name) || name == "TERM" || name == "COLORTERM"
+}
+
+/// The agent credentials minus screened names. Credential env vars come from
+/// agent definitions and run options, so they pass the same deny-list as
+/// every other source; ordinary credential names are unaffected. Used by the
+/// argv builder and by every spawn path that sets their values.
+pub(super) fn screened_agent_credentials(
+    options: &ResolvedContainerOptions,
+) -> Vec<(String, String)> {
+    options
+        .agent_credentials
+        .iter()
+        .filter(|(name, _)| !is_screened_run_var(name))
+        .cloned()
+        .collect()
+}
+
+/// The `KEY=VALUE` literals for a run: the options' `env_literal`s plus the
+/// terminal variables, scrubbed by the one deny-list call for this backend.
+pub(super) fn scrubbed_env_literals(options: &ResolvedContainerOptions) -> Vec<(String, String)> {
+    let literals = options
+        .env_literal
+        .iter()
+        .map(|l| (l.key.clone(), l.value.clone()))
+        .collect();
+    scrub_run_env(
+        literals,
+        crate::data::config::env::host_var("COLORTERM").as_deref(),
+    )
+    .kept
+}
+
+/// The user-facing notice for host-terminal variables an overlay or the agent
+/// asked for that were not passed, or `None`. The run path writes it to the
+/// frontend; [`build_run_argv`] also logs it.
+pub fn host_terminal_env_notice(options: &ResolvedContainerOptions) -> Option<String> {
+    let mut requested = resolve_env_passthrough_raw(options);
+    requested.extend(
+        options
+            .env_literal
+            .iter()
+            .map(|l| (l.key.clone(), l.value.clone())),
+    );
+    requested.extend(options.agent_credentials.iter().cloned());
+    if let Some((env_var, _, container_path)) = &options.system_prompt_env_file {
+        requested.push((env_var.clone(), container_path.display().to_string()));
+    }
+    scrub_run_env(requested, None).notice()
 }
 
 /// Whether a passthrough name is a usable environment variable name.
@@ -878,9 +950,15 @@ pub(super) fn build_run_argv(
     // Env literals — unlike env_passthrough above, these keep the `KEY=VALUE`
     // form. Literal values are constants awman itself supplies, never a user secret, so there is nothing here
     // that argv's world-readability could expose.
-    for lit in &options.env_literal {
+    // Host-terminal variables are dropped and TERM/COLORTERM normalised here
+    // (WI 0141 §3). Every env source (passthrough, literals, credentials,
+    // the system-prompt variable) passes the same screen.
+    if let Some(notice) = host_terminal_env_notice(options) {
+        tracing::warn!("{notice}");
+    }
+    for (key, value) in scrubbed_env_literals(options) {
         args.push("-e".into());
-        args.push(format!("{}={}", lit.key, lit.value));
+        args.push(format!("{key}={value}"));
     }
     // Agent credentials are env-vars by another name. Emit the NAME ONLY
     // (`-e KEY`); the value is set on the spawned CLI child's own environment
@@ -889,9 +967,9 @@ pub(super) fn build_run_argv(
     // the argument vector, so it never appears in `ps` / `/proc/<pid>/cmdline`
     // while the client process runs. Both the docker CLI and the Apple
     // `container` CLI (which shares this argv builder) support this form.
-    for (k, _v) in &options.agent_credentials {
+    for (k, _v) in screened_agent_credentials(options) {
         args.push("-e".into());
-        args.push(k.clone());
+        args.push(k);
     }
 
     // Allow Docker socket: mount and add docker group.
@@ -944,8 +1022,12 @@ pub(super) fn build_run_argv(
             host_path.display(),
             container_path.display(),
         ));
-        args.push("-e".into());
-        args.push(format!("{}={}", env_var, container_path.display()));
+        // The variable name comes from an agent definition: screened like
+        // every other env source (WI 0141 §3).
+        if !is_screened_run_var(env_var) {
+            args.push("-e".into());
+            args.push(format!("{}={}", env_var, container_path.display()));
+        }
     }
 
     // The image is the final positional arg.
@@ -1440,6 +1522,83 @@ mod tests {
             .any(|w| w[0] == "-e" && w[1] == "MY_KEY=my_value"));
     }
 
+    /// WI 0141 §3: no deny-listed host-terminal variable reaches the argv or
+    /// the spawn environment, whether it came from host passthrough or a
+    /// literal, and the container always sees `TERM=xterm-256color`.
+    #[test]
+    fn build_run_argv_drops_host_terminal_vars_and_normalises_term() {
+        use crate::engine::container::host_env_denylist::is_host_terminal_var;
+        use crate::engine::container::options::EnvLiteral;
+        let denied = [
+            "TMUX",
+            "TMUX_PANE",
+            "REX_PANE_ID",
+            "ZELLIJ",
+            "STY",
+            "TERM_PROGRAM",
+            "KITTY_WINDOW_ID",
+            "WT_SESSION",
+        ];
+        let mut opts = vec![ContainerOption::Image(ImageRef::new("img:latest"))];
+        for n in denied {
+            std::env::set_var(n, "host");
+            opts.push(ContainerOption::EnvPassthrough(EnvVar(n.into())));
+        }
+        opts.push(ContainerOption::EnvPassthrough(EnvVar("TERM".into())));
+        opts.push(ContainerOption::EnvLiteral(EnvLiteral {
+            key: "ITERM_SESSION_ID".into(),
+            value: "x".into(),
+        }));
+        opts.push(ContainerOption::EnvLiteral(EnvLiteral {
+            key: "TERM".into(),
+            value: "xterm-kitty".into(),
+        }));
+        let resolved = resolve(opts);
+        let argv = build_run_argv(
+            &ContainerName::new("ctr"),
+            &ImageRef::new("img:latest"),
+            &resolved,
+        )
+        .unwrap();
+        for n in denied {
+            std::env::remove_var(n);
+        }
+        let names: Vec<&str> = argv
+            .windows(2)
+            .filter(|w| w[0] == "-e")
+            .map(|w| w[1].split('=').next().unwrap())
+            .collect();
+        assert!(
+            names.iter().all(|n| !is_host_terminal_var(n)),
+            "argv: {argv:?}"
+        );
+        assert!(resolve_env_passthrough(&resolved)
+            .iter()
+            .all(|(n, _)| !is_host_terminal_var(n) && n != "TERM"));
+        assert_eq!(
+            argv.iter().filter(|a| a.starts_with("TERM=")).count(),
+            1,
+            "argv: {argv:?}"
+        );
+        assert!(argv.iter().any(|a| a == "TERM=xterm-256color"));
+        assert!(!argv.iter().any(|a| a == "TERM=xterm-kitty"));
+    }
+
+    /// An overlay `env()` asking for a denied name yields a notice, no variable.
+    #[test]
+    fn overlay_requesting_tmux_yields_notice_and_no_variable() {
+        std::env::set_var("TMUX", "/tmp/tmux-1000/default,1,0");
+        let resolved = resolve(vec![
+            ContainerOption::Image(ImageRef::new("img:latest")),
+            ContainerOption::EnvPassthrough(EnvVar("TMUX".into())),
+        ]);
+        let notice = host_terminal_env_notice(&resolved);
+        let passed = resolve_env_passthrough(&resolved);
+        std::env::remove_var("TMUX");
+        assert!(notice.unwrap().contains("TMUX"));
+        assert!(passed.is_empty());
+    }
+
     #[test]
     fn build_run_argv_seeded_prompt_adds_i_flag_not_it() {
         let resolved = resolve(vec![
@@ -1855,6 +2014,55 @@ mod tests {
                     .collect(),
             },
         ])
+    }
+
+    /// Review finding: credentials and the system-prompt variable are env
+    /// sources too; a denied name or a raw `TERM` from them must not reach
+    /// the container or override the normalised `TERM`, and the user is told.
+    #[test]
+    fn all_env_sources_go_through_the_host_terminal_scrub() {
+        let mut options = credential_opts(&[
+            ("TMUX", "/tmp/host.sock"),
+            ("TERM", "xterm-kitty"),
+            ("ANTHROPIC_API_KEY", "sk"),
+        ]);
+        options.system_prompt_env_file =
+            Some(("REX_PANE".into(), "/tmp/prompt".into(), "/prompt".into()));
+        let argv = build_run_argv(
+            &ContainerName::new("review"),
+            &ImageRef::new("img:latest"),
+            &options,
+        )
+        .unwrap();
+        let envs: Vec<_> = argv
+            .windows(2)
+            .filter(|w| w[0] == "-e")
+            .map(|w| w[1].as_str())
+            .collect();
+        assert!(
+            !envs.contains(&"TMUX"),
+            "credentials bypassed scrub: {envs:?}"
+        );
+        assert!(!envs.contains(&"TERM"), "late TERM overrides: {envs:?}");
+        assert!(envs.contains(&"TERM=xterm-256color"), "{envs:?}");
+        assert!(
+            envs.contains(&"ANTHROPIC_API_KEY"),
+            "ordinary credentials kept"
+        );
+        assert!(
+            !envs.iter().any(|v| v.starts_with("REX_PANE=")),
+            "system prompt env bypassed scrub: {envs:?}"
+        );
+        let names: Vec<_> = screened_agent_credentials(&options)
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(names, ["ANTHROPIC_API_KEY"], "spawn env is screened too");
+        let notice = host_terminal_env_notice(&options).expect("notice");
+        assert!(
+            notice.contains("TMUX") && notice.contains("REX_PANE"),
+            "{notice}"
+        );
     }
 
     #[test]

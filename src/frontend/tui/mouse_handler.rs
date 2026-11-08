@@ -13,6 +13,7 @@ pub(super) fn handle_mouse_event(app: &mut App, mouse: crossterm::event::MouseEv
         | MouseEventKind::ScrollDown
         | MouseEventKind::ScrollLeft
         | MouseEventKind::ScrollRight => {
+            app.active_tab().shared.signals.touch_user();
             let is_up = matches!(mouse.kind, MouseEventKind::ScrollUp);
             let horizontal = match mouse.kind {
                 MouseEventKind::ScrollLeft => Some(false),

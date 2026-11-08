@@ -155,9 +155,16 @@ pub(crate) struct FrontendFlagDefault {
 
 /// API-profile flag defaults.
 ///
-/// `headless` is FORCED: HTTP workers have no TTY, and on Apple's
-/// `container` CLI a PTY request with piped stdin fails with `ENOTTY`, so this
-/// is a technical requirement, not a preference.
+/// `headless` is an overridable DEFAULT (WI 0141): it is
+/// `daemon.features.worker.push.interaction`'s own default, `headless`.
+/// It is no longer forced. Interaction is a per-feature setting resolved in
+/// Layer 2 (`command::interaction::resolve_interaction`); push admission
+/// always writes the resolved choice into the stored args as an explicit
+/// `--headless` or `--interactive`, so this default only fills in for a
+/// caller that parses daemon args without going through admission. An
+/// explicit `--interactive` suppresses it (the two flags conflict). Whether
+/// the agent then gets a PTY is decided by the `InteractionDecision` handed
+/// to the frontend, not by sniffing args.
 ///
 /// `yolo` is an overridable DEFAULT: it stays `true` for backward compatibility
 /// (every historical API caller ran with auto-approval), but a request payload
@@ -168,7 +175,7 @@ const API_FLAG_DEFAULTS: &[FrontendFlagDefault] = &[
     FrontendFlagDefault {
         flag: "headless",
         value: FlagDefault::Bool(true),
-        forced: true,
+        forced: false,
     },
     FrontendFlagDefault {
         flag: "yolo",
@@ -235,10 +242,17 @@ fn apply_frontend_defaults(parsed: &mut ParsedArgs, spec: &CommandSpec, frontend
         if parsed.flags.contains_key(entry.flag) {
             continue;
         }
+        // Conflicts are symmetric but may be declared on one side only
+        // (`--interactive` declares its conflict with the shared
+        // `--headless` spec), so check both directions.
         let conflict_present = flag_spec
             .conflicts_with
             .iter()
-            .any(|other| flag_is_active(&parsed.flags, other));
+            .any(|other| flag_is_active(&parsed.flags, other))
+            || spec.flags.iter().any(|other| {
+                other.conflicts_with.contains(&entry.flag)
+                    && flag_is_active(&parsed.flags, other.long)
+            });
         if conflict_present {
             continue;
         }
@@ -755,7 +769,7 @@ mod tests {
     }
 
     #[test]
-    fn api_profile_forces_non_interactive_and_defaults_yolo() {
+    fn api_profile_defaults_headless_and_yolo() {
         let p = cat()
             .parse_raw_args_with_profile(
                 &["exec", "prompt"],
@@ -773,7 +787,6 @@ mod tests {
         // catalogue) must genuinely override the overridable yolo default: the
         // fills-when-absent default is suppressed because a conflicting flag is
         // present, so yolo stays unset and dispatch sees a coherent request.
-        // headless stays forced regardless.
         let p = cat()
             .parse_raw_args_with_profile(
                 &["exec", "prompt"],
@@ -787,6 +800,40 @@ mod tests {
         assert_eq!(p.flag_bool("yolo"), None);
     }
 
+    /// WI 0141: `headless` is push's default, not a forced setting. An
+    /// explicit `--interactive` (which declares the conflict on its own side)
+    /// suppresses it, and an explicit `--headless=false` keeps its value.
+    #[test]
+    fn api_profile_headless_default_yields_to_interactive() {
+        let p = cat()
+            .parse_raw_args_with_profile(
+                &["exec", "workflow"],
+                &argv(&["--interactive", "wf.toml"]),
+                FrontendKind::WORKER_LOCAL,
+            )
+            .unwrap();
+        assert_eq!(p.flag_bool("interactive"), Some(true));
+        assert_eq!(p.flag_bool("headless"), None);
+        let p = cat()
+            .parse_raw_args_with_profile(
+                &["exec", "prompt"],
+                &argv(&["--headless=false", "hi"]),
+                FrontendKind::WORKER_LOCAL,
+            )
+            .unwrap();
+        assert_eq!(p.flag_bool("headless"), Some(false));
+    }
+
+    #[test]
+    fn interactive_and_headless_conflict_in_raw_args() {
+        let err = cat()
+            .parse_raw_args(&["exec", "prompt"], &argv(&["--interactive", "-n", "hi"]))
+            .unwrap_err();
+        assert!(
+            matches!(err, CommandError::InvalidFlagValue { .. }),
+            "{err}"
+        );
+    }
     #[test]
     fn cli_and_tui_profiles_apply_no_overrides() {
         let p = cat()
@@ -879,13 +926,25 @@ pub(crate) mod shared_cases {
             api_reads: &[Read::Bool("yolo", true), Read::Bool("headless", true)],
         },
         Case {
-            name: "explicit false beats a default but not a forced flag",
+            name: "explicit false beats a profile default",
             path: PROMPT,
             canonical: PROMPT,
             args: &["--yolo=false", "--headless=false", "hi"],
-            reads: &[Read::Bool("yolo", false)],
-            tui_reads: &[Read::Bool("headless", false)],
-            api_reads: &[Read::Bool("headless", true)],
+            reads: &[Read::Bool("yolo", false), Read::Bool("headless", false)],
+            tui_reads: &[],
+            api_reads: &[],
+        },
+        Case {
+            name: "--interactive suppresses the API's headless default (WI 0141)",
+            path: PROMPT,
+            canonical: PROMPT,
+            args: &["--interactive", "hi"],
+            reads: &[
+                Read::Bool("interactive", true),
+                Read::Bool("headless", false),
+            ],
+            tui_reads: &[],
+            api_reads: &[],
         },
         Case {
             name: "a conflicting flag suppresses the API's yolo default",

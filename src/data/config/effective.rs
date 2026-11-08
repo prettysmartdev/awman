@@ -406,6 +406,26 @@ impl EffectiveConfig {
             .unwrap_or_default()
     }
 
+    /// `agents.programStatus.enabled` (WI 0141): parse OSC 7501 reports and let
+    /// them supersede silence detection. `false` keeps silence detection only.
+    pub fn program_status_enabled(&self) -> bool {
+        self.agents()
+            .program_status
+            .and_then(|p| p.enabled)
+            .unwrap_or(true)
+    }
+
+    /// `tui.programStatus.emit` (WI 0141): emit OSC 7501 from the TUI to its
+    /// own terminal when the terminal answers the feature probe.
+    pub fn tui_program_status_emit(&self) -> bool {
+        self.merged
+            .tui
+            .as_ref()
+            .and_then(|t| t.program_status.as_ref())
+            .and_then(|p| p.emit)
+            .unwrap_or(true)
+    }
+
     /// `tui.scrollbackLines`.
     pub fn scrollback_lines(&self) -> usize {
         self.merged

@@ -2,6 +2,8 @@
 //! background yolo-countdown variant), and the workflow step suffix.
 
 use super::*;
+use crate::data::program_status::{EffectiveStatus, ProgramState};
+use crate::frontend::program_status_text::tab_glyph;
 
 impl Tab {
     /// Project name for the tab title, truncated to fit a `tab_width`-wide
@@ -72,7 +74,16 @@ impl Tab {
             format!("{}: {}", cmd, workflow_suffix)
         };
 
-        let prefix = if self.stuck { "\u{26a0}\u{fe0f} " } else { "" };
+        // A reporting agent shows its reported-state glyph; only agents that do
+        // not report can be flagged stuck (silence).
+        let prefix = match self.program_status() {
+            Some(status) => match tab_glyph(&status) {
+                glyph if glyph.is_empty() => String::new(),
+                glyph => format!("{glyph} "),
+            },
+            None if self.stuck => "\u{26a0}\u{fe0f} ".to_string(),
+            None => String::new(),
+        };
         let prefix_chars = prefix.chars().count();
         let max_chars = (tab_width as usize).saturating_sub(4);
         let cmd_max = max_chars.saturating_sub(prefix_chars);
@@ -130,5 +141,55 @@ impl Tab {
             ExecutionPhase::Done { command, .. } => command.as_str(),
             ExecutionPhase::Error { command, .. } => command.as_str(),
         }
+    }
+}
+
+/// Aggregation order across a tab's agents: a problem anywhere wins, then
+/// busy, then idle, then done (mirrors the protocol's own priority).
+fn status_priority(state: ProgramState) -> u8 {
+    match state {
+        ProgramState::Blocked => 4,
+        ProgramState::Error => 3,
+        ProgramState::Working => 2,
+        ProgramState::Idle => 1,
+        ProgramState::Done => 0,
+    }
+}
+
+/// How long a reporting agent must be silent before the UI notes it
+/// ("working · silent 12m"). Information only: no action is ever taken.
+const SILENT_NOTE_AFTER_SECS: u64 = 60;
+
+impl ContainerSlot {
+    /// Store the agent's latest reported status. A reporting agent is never
+    /// stuck: the silence flag is cleared as soon as a report arrives.
+    pub fn set_program_status(&mut self, status: Option<EffectiveStatus>) {
+        if status.is_some() {
+            self.stuck = false;
+        }
+        self.program_status = status;
+    }
+
+    /// `working · silent 12m` for a working agent that has produced no output
+    /// for a while; `None` otherwise.
+    pub fn silent_note(&self) -> Option<String> {
+        let status = self.program_status.as_ref()?;
+        if status.state != ProgramState::Working {
+            return None;
+        }
+        let silent = self.last_output_at.elapsed().as_secs();
+        (silent >= SILENT_NOTE_AFTER_SECS)
+            .then(|| format!("working \u{b7} silent {}", format_duration(silent)))
+    }
+}
+
+impl Tab {
+    /// The tab's aggregate reported status across its container slots.
+    pub fn program_status(&self) -> Option<EffectiveStatus> {
+        self.container_slots
+            .iter()
+            .filter_map(|s| s.program_status.as_ref())
+            .max_by_key(|s| status_priority(s.state))
+            .cloned()
     }
 }

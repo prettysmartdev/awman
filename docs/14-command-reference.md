@@ -15,6 +15,28 @@ Accepted by every command, anywhere before `--`, from the CLI, the TUI command b
 
 ---
 
+## `awman attach`
+
+Watch, or step into, a running agent's terminal.
+
+Opens a terminal the daemon serves. `term_…` opens that terminal; `cmd_…` opens the command's current terminal, or with --step that step's; `task_…` opens the squad task's running terminal. Ctrl-C detaches without stopping the agent.
+
+Available via: CLI, TUI
+
+Runs without a working agent runtime — reachable even when the configured runtime cannot be started on this host.
+
+| Argument | Kind | Required | Help |
+|---|---|---|---|
+| `id` | string | yes | Terminal (term_…), command (cmd_…) or squad task (task_…) id. |
+
+| Flag | Kind | Default | Implies | Conflicts | Frontends | Help |
+|---|---|---|---|---|---|---|
+| `--step` | string | — | — | — | CLI, TUI | With a command id: the step whose terminal to open. |
+| `--read-only` | bool | false | — | — | CLI, TUI | Never send input or resize; watch only. |
+| `--annotation` | string (repeatable) | [] | — | — | CLI, TUI | Integration metadata on this view, k=v (repeatable). |
+
+---
+
 ## `awman init`
 
 Initialize the current Git repo for use with awman.
@@ -157,16 +179,6 @@ Available via: CLI, TUI, API
 | `--json` | bool | false | — | — | CLI, TUI, API | Emit JSON output. |
 | `-y, --yes` | bool | false | — | — | CLI, TUI, API | Skip the confirmation prompt (for scripting). |
 
-### `awman agents attach`
-
-Attach to an agent's terminal.
-
-Available via: CLI, TUI
-
-| Argument | Kind | Required | Help |
-|---|---|---|---|
-| `id` | string | yes | Agent ID, unique ID prefix, or name. |
-
 ---
 
 ## `awman config`
@@ -278,6 +290,7 @@ Available via: CLI, TUI, API
 | `--overlay` | string (repeatable) | [] | — | — | CLI, TUI, API | Mount a host directory into the agent container. Repeatable. |
 | `--agent-flag` | string (repeatable) | [] | — | — | CLI, TUI, API | Repeatable extra argument for the agent command, replacing its agentFlags entry (pass as --agent-flag=--verbose). |
 | `--issue` | string (optional) | — | — | — | CLI, TUI, API | GitHub issue number, URL, or owner/repo#N to use as the prompt. |
+| `--interactive` | bool | false | — | `--headless` | CLI, TUI, API | Run the agent interactively in a terminal (PTY). Overrides a daemon worker's headless default where the worker allows it. |
 | `--branch` | string (optional) | — | — | `--pr`, `--worktree` | CLI, TUI | Run in a worktree for this branch. |
 | `--pr` | string (optional) | — | — | `--branch`, `--worktree` | CLI, TUI | Run in a worktree for this GitHub pull request. |
 | `--worktree` | string (optional) | — | — | `--branch`, `--pr` | CLI, TUI | Reuse an existing named or path-based Git worktree. |
@@ -300,6 +313,7 @@ Available via: CLI, TUI, API
 | `-n, --headless` | bool | false | — | — | CLI, TUI, API | Run the agent headless (print mode). |
 | `--plan` | bool | false | — | `--yolo` | CLI, TUI, API | Run the agent in plan mode (read-only). |
 | `--allow-docker` | bool | false | — | — | CLI, TUI, API | Mount the host Docker daemon socket into the agent container. |
+| `--interactive` | bool | false | — | `--headless` | CLI, TUI, API | Run the agent interactively in a terminal (PTY). Overrides a daemon worker's headless default where the worker allows it. |
 | `--worktree` | bool | false | — | — | CLI, TUI, API | Run in an isolated Git worktree under ~/.awman/worktrees/. |
 | `--yolo` | bool | false | `--worktree` | `--plan` | CLI, TUI, API | Enable fully autonomous mode. Implies --worktree. |
 | `--auto` | bool | false | `--worktree` | — | CLI, TUI, API | Enable auto permission mode. Implies --worktree. |
@@ -567,7 +581,9 @@ Available via: CLI, TUI
 
 | Flag | Kind | Default | Implies | Conflicts | Frontends | Help |
 |---|---|---|---|---|---|---|
-| `--container` | string | — | — | — | CLI, TUI | Running container ID when multiple are active. |
+| `--step` | string | — | — | — | CLI, TUI | Workflow step whose terminal to open. |
+| `--read-only` | bool | false | — | — | CLI, TUI | Never send input or resize; watch only. |
+| `--annotation` | string (repeatable) | [] | — | — | CLI, TUI | Integration metadata on this view, k=v (repeatable). |
 
 ### `awman squad env`
 
@@ -660,6 +676,7 @@ Runs without a working agent runtime — reachable even when the configured runt
 | `-n, --headless` | bool | false | — | — | CLI, TUI, API | Run the agent headless (print mode). |
 | `--plan` | bool | false | — | `--yolo` | CLI, TUI, API | Run the agent in plan mode (read-only). |
 | `--allow-docker` | bool | false | — | — | CLI, TUI, API | Mount the host Docker daemon socket into the agent container. |
+| `--interactive` | bool | false | — | `--headless` | CLI, TUI, API | Run the agent interactively in a terminal (PTY). Overrides a daemon worker's headless default where the worker allows it. |
 | `--yolo` | bool | false | `--worktree` | `--plan` | CLI, TUI, API | Enable fully autonomous mode. Implies --worktree. |
 | `--auto` | bool | false | `--worktree` | — | CLI, TUI, API | Enable auto permission mode. Implies --worktree. |
 | `--agent` | string (optional) | — | — | — | CLI, TUI, API | Agent to use. |
@@ -704,6 +721,7 @@ Runs without a working agent runtime — reachable even when the configured runt
 | `--overlay` | string (repeatable) | [] | — | — | CLI, TUI, API | Mount a host directory into the agent container. Repeatable. |
 | `--agent-flag` | string (repeatable) | [] | — | — | CLI, TUI, API | Repeatable extra argument for the agent command, replacing its agentFlags entry (pass as --agent-flag=--verbose). |
 | `--issue` | string (optional) | — | — | — | CLI, TUI, API | GitHub issue number, URL, or owner/repo#N to use as the prompt. |
+| `--interactive` | bool | false | — | `--headless` | CLI, TUI, API | Run the agent interactively in a terminal (PTY). Overrides a daemon worker's headless default where the worker allows it. |
 
 ---
 

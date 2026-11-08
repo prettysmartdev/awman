@@ -28,6 +28,8 @@ pub enum ArgKind {
     Limit,
     /// An opaque page cursor.
     Cursor,
+    /// A terminal owner: `cmd_`, `tab_`, `lease_`, `run_` or `task_` (WI 0141).
+    Owner,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -134,6 +136,24 @@ pub const ACTIONS: &[Action] = &[
         args: &[arg("id", Location::Path, ArgKind::Id("run"))],
         doc: "Cancel one squad run (id=run_…)",
     },
+    Action {
+        name: "terminals.list",
+        method: "GET",
+        path: "/v1/terminals",
+        args: &[
+            optional("owner_id", ArgKind::Owner),
+            optional("limit", ArgKind::Limit),
+            optional("cursor", ArgKind::Cursor),
+        ],
+        doc: "Agent terminals, newest first (owner_id=cmd_…|run_…|task_…|tab_…)",
+    },
+    Action {
+        name: "terminals.get",
+        method: "GET",
+        path: "/v1/terminals/{id}",
+        args: &[arg("id", Location::Path, ArgKind::Id("term"))],
+        doc: "One terminal record (id=term_…)",
+    },
 ];
 
 /// Conveniences composed from the actions above, documented so `--raw` users
@@ -218,6 +238,9 @@ fn check(action: &str, arg: &ActionArg, value: &str) -> Result<(), CommandError>
         ArgKind::Id(prefix) => id_has_prefix(value, prefix),
         ArgKind::Limit => value.parse::<u32>().is_ok_and(|n| n > 0),
         ArgKind::Cursor => !value.is_empty() && !value.contains(['/', '#']),
+        ArgKind::Owner => ["cmd", "tab", "lease", "run", "task"]
+            .iter()
+            .any(|prefix| id_has_prefix(value, prefix)),
     };
     if ok {
         return Ok(());
@@ -228,6 +251,7 @@ fn check(action: &str, arg: &ActionArg, value: &str) -> Result<(), CommandError>
         ArgKind::Id(prefix) => format!("an id {prefix}_<32 hex>"),
         ArgKind::Limit => "a positive integer".to_string(),
         ArgKind::Cursor => "a cursor from a previous next_cursor".to_string(),
+        ArgKind::Owner => "an id cmd_|tab_|lease_|run_|task_<32 hex>".to_string(),
     };
     Err(invalid(format!(
         "{action}: invalid {}={value:?} (expected {expected})",
@@ -411,6 +435,8 @@ mod tests {
             ArgKind::Id("grant") => GrantId::new().to_string(),
             ArgKind::Id("cmd") => CommandId::new().to_string(),
             ArgKind::Id("run") => RunId::new().to_string(),
+            ArgKind::Id("term") => crate::data::ids::TerminalId::new().to_string(),
+            ArgKind::Owner => CommandId::new().to_string(),
             ArgKind::Id(other) => panic!("no sample for {other}"),
             ArgKind::Limit => "5".into(),
             ArgKind::Cursor => "abc".into(),
@@ -431,7 +457,9 @@ mod tests {
                 "keys.delete",
                 "grants.list",
                 "grants.delete",
-                "jobs.cancel"
+                "jobs.cancel",
+                "terminals.list",
+                "terminals.get"
             ]
         );
     }

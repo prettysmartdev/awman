@@ -288,6 +288,7 @@ impl WorkflowEngine {
         let container_name = execution.handle().name.clone();
         let handle = execution.handle().clone();
         let output_tail = execution.output_tail();
+        let program_status = execution.program_status_tracker();
         self.active_steps = vec![ActiveParallelStep {
             step_name: step.name.clone(),
             execution: Some(execution),
@@ -298,6 +299,11 @@ impl WorkflowEngine {
             awman_killed: false,
             stuck: false,
             yolo_deadline: None,
+            countdown_kind: CountdownKind::StuckStep,
+            output_watch: None,
+            last_report: None,
+            reported_problem: None,
+            program_status,
             agent: resolved_agent.clone(),
             model: resolved_model.clone(),
             launch_id: 0,
@@ -313,6 +319,9 @@ impl WorkflowEngine {
         step_name: &str,
         exit: AgentExitInfo,
     ) -> Result<StepOutcome, EngineError> {
+        // WI 0141: the agent's final status (its tracker at exit) is
+        // settled before the exit code is read, on every finalising path.
+        self.settle_reported_status(step_name, None);
         self.last_exit_info = Some(exit.clone());
         // The step's container has actually terminated (wait() resolved) —
         // tell the frontend so it can tear down any live container UI.
@@ -322,7 +331,22 @@ impl WorkflowEngine {
         // output tail so the user can debug what went wrong.
         self.maybe_dump_step_failure(step_name, exit.exit_code);
 
-        let (status, step_state) = if exit.exit_code == 0 {
+        // WI 0141: a problem the agent reported outranks the exit code — a
+        // container awman killed after `blocked`/`error` (KILLED_EXIT_CODE,
+        // otherwise read as an engine advance) or one that exited by itself,
+        // even with 0, is Failed with the agent's reason. After `done` the
+        // exit code stands.
+        let (status, step_state) = if let Some(problem) = self.reported_problem_of(step_name) {
+            (
+                WorkflowStepStatus::Failed {
+                    exit_code: exit.exit_code,
+                },
+                StepState::Failed {
+                    exit_code: exit.exit_code,
+                    error_message: Some(program_status::reported_failure_reason(&problem)),
+                },
+            )
+        } else if exit.exit_code == 0 {
             (WorkflowStepStatus::Succeeded, StepState::Succeeded)
         } else {
             (
@@ -390,6 +414,9 @@ impl WorkflowEngine {
                 result = &mut wait_rx => {
                     let (exec_back, exit_result) = result
                         .map_err(|_| EngineError::Other("step wait task dropped unexpectedly".into()))?;
+                    // A report that was ready together with the exit is
+                    // applied before finalising (the select is biased).
+                    self.settle_reported_status(&step_name, stuck_rx.as_mut());
                     self.set_focused_execution(exec_back);
                     return Ok(InterruptibleStepResult::StepCompleted(
                         self.finalize_step(&step_name, exit_result?)?
@@ -403,6 +430,19 @@ impl WorkflowEngine {
                 }
                 Some(event) = Self::recv_stuck(&mut stuck_rx) => {
                     match event {
+                        // The agent's own OSC 7501 status (WI 0141); see
+                        // `program_status` for the state table.
+                        StuckEvent::Reported(status) => {
+                            if let Some(r) = self.handle_step_reported(
+                                &step_name,
+                                status,
+                                &cancel_handle,
+                                &mut wait_rx,
+                                &mut stuck_rx,
+                            ).await? {
+                                return Ok(r);
+                            }
+                        }
                         StuckEvent::Stuck => {
                             let result = self.handle_step_stuck(
                                 &step_name,
@@ -549,6 +589,12 @@ impl WorkflowEngine {
                     })
                 }
                 MidStepYoloResult::Cancelled | MidStepYoloResult::Recovered => Ok(None),
+                // The agent started reporting during a silence countdown: its
+                // report decides from here on.
+                MidStepYoloResult::Reported(status) => {
+                    self.handle_step_reported(step_name, status, cancel_handle, wait_rx, stuck_rx)
+                        .await
+                }
                 MidStepYoloResult::Advanced => {
                     self.msg_info(format!("Yolo auto-advancing past step '{}'", step_name,));
                     self.kill_current_container(cancel_handle);
@@ -610,6 +656,7 @@ impl WorkflowEngine {
                 MidStepYoloResult::Cancelled => MidStepYoloResult::Cancelled,
                 MidStepYoloResult::ShowControlBoard => MidStepYoloResult::ShowControlBoard,
                 MidStepYoloResult::Recovered => MidStepYoloResult::Recovered,
+                MidStepYoloResult::Reported(status) => MidStepYoloResult::Reported(status),
             },
         )
     }
@@ -669,6 +716,13 @@ impl WorkflowEngine {
                             self.frontend.yolo_countdown_finished(step_name);
                             return Ok(MidStepYoloResult::Recovered);
                         }
+                        // The agent reports its own status now, so silence
+                        // no longer decides (WI 0141). Hand the report back.
+                        Ok(StuckEvent::Reported(status)) => {
+                            self.frontend.yolo_countdown_finished(step_name);
+                            return Ok(MidStepYoloResult::Reported(status));
+                        }
+
                         Ok(StuckEvent::Stuck) => continue,
                         Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
                         // Lagged: a message was dropped because the channel
@@ -725,6 +779,10 @@ impl WorkflowEngine {
                             ));
                             self.frontend.yolo_countdown_finished(step_name);
                             return Ok(MidStepYoloResult::Recovered);
+                        }
+                        StuckEvent::Reported(status) => {
+                            self.frontend.yolo_countdown_finished(step_name);
+                            return Ok(MidStepYoloResult::Reported(status));
                         }
                         StuckEvent::Stuck => {
                             // Already counting down; ignore duplicate.

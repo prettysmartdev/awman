@@ -5,12 +5,13 @@
 //! (piped, no PTY) channels depending on `self.non_interactive`.
 
 use async_trait::async_trait;
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 
 use crate::data::message::{UserMessage, UserMessageSink};
 use crate::engine::agent_runtime::frontend::{AgentFrontend, AgentIo, AgentProgress, AgentStatus};
 
 use crate::frontend::cli::command_frontend::{CliFrontend, RawModeGuard};
+use crate::frontend::terminal_output_filter::HostOutputFilter;
 
 #[async_trait]
 impl AgentFrontend for CliFrontend {
@@ -37,19 +38,45 @@ impl CliFrontend {
         let (stderr_tx, mut stderr_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
         let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
 
+        let tty = std::io::stdout().is_terminal();
+        let policy = self.host_output_policy;
         tokio::spawn(async move {
+            let mut filter = tty.then(|| HostOutputFilter::new(policy));
             while let Some(bytes) = stdout_rx.recv().await {
+                let mut safe = Vec::new();
+                if let Some(filter) = filter.as_mut() {
+                    filter.feed(&bytes, &mut safe);
+                } else {
+                    safe = bytes;
+                }
                 let mut out = std::io::stdout().lock();
-                let _ = out.write_all(&bytes);
+                let _ = out.write_all(&safe);
                 let _ = out.flush();
+            }
+            if let Some(filter) = filter.as_mut() {
+                let mut safe = Vec::new();
+                filter.finish(&mut safe);
+                let _ = std::io::stdout().lock().write_all(&safe);
             }
         });
 
         tokio::spawn(async move {
+            let mut filter = tty.then(|| HostOutputFilter::new(policy));
             while let Some(bytes) = stderr_rx.recv().await {
+                let mut safe = Vec::new();
+                if let Some(filter) = filter.as_mut() {
+                    filter.feed(&bytes, &mut safe);
+                } else {
+                    safe = bytes;
+                }
                 let mut err = std::io::stderr().lock();
-                let _ = err.write_all(&bytes);
+                let _ = err.write_all(&safe);
                 let _ = err.flush();
+            }
+            if let Some(filter) = filter.as_mut() {
+                let mut safe = Vec::new();
+                filter.finish(&mut safe);
+                let _ = std::io::stderr().lock().write_all(&safe);
             }
         });
 
@@ -83,20 +110,46 @@ impl CliFrontend {
         let initial_size = crossterm::terminal::size().ok();
 
         // Drain stdout to host stdout (unbuffered for raw mode).
+        let tty = std::io::stdout().is_terminal();
+        let policy = self.host_output_policy;
         tokio::spawn(async move {
+            let mut filter = tty.then(|| HostOutputFilter::new(policy));
             while let Some(bytes) = stdout_rx.recv().await {
+                let mut safe = Vec::new();
+                if let Some(filter) = filter.as_mut() {
+                    filter.feed(&bytes, &mut safe);
+                } else {
+                    safe = bytes;
+                }
                 let mut out = std::io::stdout().lock();
-                let _ = out.write_all(&bytes);
+                let _ = out.write_all(&safe);
                 let _ = out.flush();
+            }
+            if let Some(filter) = filter.as_mut() {
+                let mut safe = Vec::new();
+                filter.finish(&mut safe);
+                let _ = std::io::stdout().lock().write_all(&safe);
             }
         });
 
         // Drain stderr to host stderr (unbuffered for raw mode).
         tokio::spawn(async move {
+            let mut filter = tty.then(|| HostOutputFilter::new(policy));
             while let Some(bytes) = stderr_rx.recv().await {
+                let mut safe = Vec::new();
+                if let Some(filter) = filter.as_mut() {
+                    filter.feed(&bytes, &mut safe);
+                } else {
+                    safe = bytes;
+                }
                 let mut err = std::io::stderr().lock();
-                let _ = err.write_all(&bytes);
+                let _ = err.write_all(&safe);
                 let _ = err.flush();
+            }
+            if let Some(filter) = filter.as_mut() {
+                let mut safe = Vec::new();
+                filter.finish(&mut safe);
+                let _ = std::io::stderr().lock().write_all(&safe);
             }
         });
 

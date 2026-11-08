@@ -12,6 +12,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use crate::command::commands::agents::{AgentsCommand, AgentsCommandFrontend};
+use crate::command::commands::attach::{AttachCommand, AttachCommandFrontend};
 use crate::command::commands::chat::{ChatCommand, ChatCommandFrontend};
 use crate::command::commands::clean::{CleanCommand, CleanCommandFrontend};
 use crate::command::commands::config::{ConfigCommand, ConfigCommandFrontend};
@@ -66,6 +67,10 @@ pub trait CommandFrontend: UserMessageSink + Send + Sync {
     /// (WI 0114 F-49). No default: a new frontend must say what it is.
     fn kind(&self) -> FrontendKind;
 
+    /// Policy resolved by Layer 2 for any frontend writer that presents agent
+    /// bytes on a host terminal.
+    fn set_host_output_policy(&mut self, _policy: crate::data::terminal::HostOutputPolicy) {}
+
     /// Whether there is somewhere to read an answer from right now.
     ///
     /// The frontend reports the *fact*; Layer 2 applies the rule
@@ -118,6 +123,7 @@ pub trait DispatchFrontend:
     + InitCommandFrontend
     + ReadyCommandFrontend
     + ChatCommandFrontend
+    + AttachCommandFrontend
     + AgentsCommandFrontend
     + ConfigCommandFrontend
     + ExecPromptCommandFrontend
@@ -139,6 +145,7 @@ impl<T> DispatchFrontend for T where
         + InitCommandFrontend
         + ReadyCommandFrontend
         + ChatCommandFrontend
+        + AttachCommandFrontend
         + AgentsCommandFrontend
         + ConfigCommandFrontend
         + ExecPromptCommandFrontend
@@ -161,6 +168,7 @@ impl<T> DispatchFrontend for T where
 /// There are deliberately no `Auth` or `Download` arms: neither command is in
 /// the catalogue, so neither is reachable, and WI 0114 F-35 deletes both.
 pub enum BuiltCommand {
+    Attach(AttachCommand),
     Init(InitCommand),
     Ready(ReadyCommand),
     Chat(ChatCommand),
@@ -218,11 +226,18 @@ pub struct Dispatch<F: CommandFrontend> {
 }
 
 impl<F: CommandFrontend> Dispatch<F> {
-    pub fn new(frontend: F, session: Arc<RwLock<Session>>, engines: Engines) -> Self {
+    pub fn new(mut frontend: F, session: Arc<RwLock<Session>>, engines: Engines) -> Self {
         // The credential monitor is attached to `engines.agent_engine` when
         // the bundle is assembled (F-38); a disabled `authRefresh` leaves it
         // absent, making lease registration a no-op and preserving legacy
         // env-var delivery.
+        if let Ok(session) = session.try_read() {
+            frontend.set_host_output_policy(
+                crate::command::host_output::resolve_host_output_policy(
+                    &session.effective_config(),
+                ),
+            );
+        }
         Self {
             catalogue: CommandCatalogue::get(),
             frontend,
@@ -706,6 +721,7 @@ impl BuiltCommand {
             Init => InitCommandFrontend,
             Ready => ReadyCommandFrontend,
             Chat => ChatCommandFrontend,
+            Attach => AttachCommandFrontend,
             Specs => SpecsCommandFrontend,
             Agents => AgentsCommandFrontend,
             Config => ConfigCommandFrontend,

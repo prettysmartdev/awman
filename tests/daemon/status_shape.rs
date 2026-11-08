@@ -49,3 +49,26 @@ async fn shared_cap_defaults_to_four_and_follows_config_live() {
     assert!(out.contains("applied to the running daemon"), "{out}");
     crate::support::wait_for_status(&server, "cap 3", |s| s["max_concurrent_jobs"] == 3).await;
 }
+
+/// WI 0141: `agent_status` is advertised because `program_status` events
+/// ship. `terminal` and `interactive` are advertised only once daemon PTYs
+/// register with the terminal hub, which this build does not do yet; until
+/// then `/v1/terminals` is served but always empty.
+#[tokio::test(flavor = "multi_thread")]
+async fn capabilities_advertise_only_what_works() {
+    let home = ApiHome::new();
+    let server = home.start().await;
+    let status = server.get("/v1/status").await;
+    let capabilities: Vec<&str> = status["capabilities"]
+        .as_array()
+        .expect("capabilities")
+        .iter()
+        .filter_map(|c| c.as_str())
+        .collect();
+    assert!(capabilities.contains(&"agent_status"), "{status}");
+    assert!(!capabilities.contains(&"terminal"), "{status}");
+    assert!(!capabilities.contains(&"interactive"), "{status}");
+    // The resource itself is served, empty.
+    let terminals = server.get("/v1/terminals").await;
+    assert_eq!(terminals["items"], serde_json::json!([]), "{terminals}");
+}

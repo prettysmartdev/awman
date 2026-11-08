@@ -254,6 +254,21 @@ Useful for CI pipelines, scripting, or when you want the output captured rather 
 
 Under the `docker-sbx-experimental` runtime, agents that launch through Docker's built-in sandbox templates (`claude`, `codex`, `gemini`, `copilot`, `opencode`) cannot have their non-interactive flag enabled — awman warns at launch and pipes the prompt to the interactive entrypoint instead. See [Runtimes](11-runtimes.md#known-limitations).
 
+### `--interactive`
+
+`exec prompt` and `exec workflow` accept `--interactive` to request a PTY and
+live terminal interaction. It conflicts with `--headless`. In a local CLI run
+where interactive mode is already the default, it makes no change. The remote
+`exec` commands forward this flag to the server.
+
+Daemon-managed runs have feature-specific defaults: squad runs use
+`daemon.features.squad.interaction` (`interactive` by default), and pushed
+worker jobs use `daemon.features.worker.push.interaction` (`headless` by
+default). Each feature's `allowOverride` (default `true`) controls whether an
+individual run can choose the other mode. The configuration also accepts
+`daemon.features.worker.pull.interaction`, but awman does not currently run
+pulled jobs. See [Configuration](07-configuration.md#daemon-terminal-size-and-interaction).
+
 ### `--overlay <SPEC>`
 
 Mount additional host resources into the agent container. Accepts typed overlay expressions:
@@ -647,13 +662,21 @@ awman agents status --watch     # refresh the dashboard every 2 seconds
 awman agents list               # list running agents
 awman agents detail <id>        # inspect one agent
 awman agents kill <id>          # confirm before stopping and removing
-awman agents attach <id>        # attach to an agent's terminal
+awman attach term_01J...        # attach to a terminal
+awman attach cmd_01J... --step implement
+awman attach cmd_01J... --read-only
+awman squad attach task_01J... # shortcut for awman attach task_01J...
 ```
 
 `agents status` shows a snapshot of running agents from the CLI or TUI. Add
 `--watch` to keep refreshing the dashboard; in the TUI, press **Esc** to stop
 the watch. `--json` emits a JSON snapshot and cannot be combined with
 `--watch`.
+
+When an agent reports program status, status and list views classify it as
+waiting, errored, or done, and include its reported kind/message when
+available. `idle` is shown as done. Agents without a report continue to use
+the normal running/stuck states.
 
 `agents list` accepts the aliases `ps` and `ls`. Use `--all` to include
 stopped agents that remain eligible for cleanup, `--no-trunc` to show full
@@ -679,15 +702,36 @@ unavailable, `agents status` and `agents kill` surface the runtime failure
 rather than reporting that no agent exists. Restore runtime availability and
 retry.
 
-`agents attach <id>` connects to the running agent's terminal. In the CLI,
-press **Ctrl-C** to detach; this closes only your connection and leaves the
-agent running. In the TUI the agent opens in the tab's container window, where
-keys (Ctrl-C included) go to the agent; **Ctrl-\\** leaves the view without
-touching it. Apple agents launched by older versions without launcher metadata
-must be restarted before they can be attached. The API exposes
-the `status` snapshot, `list`, `detail`, and `kill` commands; API `kill` calls
-must include `--yes`. `attach` and `status --watch` are available only in the
-CLI and TUI.
+`awman attach` connects to a daemon terminal without taking ownership of the
+agent. Give it a `term_` terminal ID, a `cmd_` command ID, or a `task_` squad
+task ID. Use the full ID. A command target selects its
+open terminal, or its most recent terminal if none remain open; use
+`--step NAME` to select a workflow step by name. A task target selects the
+active squad run. `awman squad attach <task>` is a shortcut for the same task
+target.
+
+In the CLI, press **Ctrl-C** to detach the viewer and leave the agent running. With
+`--read-only`, the viewer never requests input control or resizes the agent's
+terminal. By default, the first local viewer gets control; other viewers can
+watch but cannot type or resize until control is released. When a TTY is
+present, agent output is filtered before it reaches your host terminal: unsafe
+control strings are removed and program-status reports are sanitised and
+re-encoded. The TUI's squad task attach action opens the terminal in its
+container window.
+
+If control is refused, attach prints one notice and continues watching read-only.
+`--step` applies to command and task targets; a terminal ID already selects one
+specific terminal and cannot be combined with `--step`.
+
+Use repeatable `--annotation namespace/name=value` options to label a viewer
+subscription, for example `--annotation rex/block=blk_42`. Keys use lowercase
+letters, digits, dots, and hyphens around one `/`; values cannot contain
+control characters. Annotations appear unchanged on the viewer's
+`terminal_control` and `terminal_viewer_detached` events.
+
+The API exposes the `status` snapshot, `list`, `detail`, and `kill` commands;
+API `kill` calls must include `--yes`. `awman attach` and `status --watch` are
+available only in the CLI and TUI.
 
 Status and list output include a source marker for each agent. Ordinary user
 sessions are marked `session`; an agent your squad launched is marked

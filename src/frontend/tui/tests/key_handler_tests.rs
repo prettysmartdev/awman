@@ -616,6 +616,7 @@ fn ctrl_w_during_running_step_sends_engine_request() {
         }],
         current_step: Some("build".into()),
         max_concurrent: None,
+        reported: Default::default(),
     };
     app.active_tab_mut()
         .shared
@@ -760,6 +761,7 @@ fn scroll_down_reveals_hidden_parallel_steps() {
 
     // Seed a workflow with many parallel steps so the overview would overflow.
     let view = WorkflowViewState {
+        reported: Default::default(),
         steps: (0..6)
             .map(|i| WorkflowStepView {
                 name: format!("step-{i}"),
@@ -821,6 +823,7 @@ fn scroll_clamped_at_bounds() {
         }],
         current_step: None,
         max_concurrent: None,
+        reported: Default::default(),
     };
     app.active_tab_mut()
         .shared
@@ -854,6 +857,7 @@ fn install_horizontal_overview(app: &mut App, n: usize, current: Option<&str>) {
     let tab = app.active_tab();
     tab.shared.workflow.update_view(|view| {
         *view = Some(WorkflowViewState {
+            reported: Default::default(),
             steps: (0..n)
                 .map(|i| WorkflowStepView {
                     name: format!("stage-{i}"),
@@ -963,6 +967,7 @@ fn horizontal_offset_is_clamped_after_width_and_column_count_shrink() {
     assert_eq!(app.active_tab().workflow_overview_hscroll_offset, 8);
     app.active_tab().shared.workflow.update_view(|view| {
         *view = Some(crate::frontend::tui::tabs::WorkflowViewState {
+            reported: Default::default(),
             steps: (0..3)
                 .map(|i| crate::frontend::tui::tabs::WorkflowStepView {
                     name: format!("stage-{i}"),
@@ -1043,6 +1048,7 @@ fn ctrl_s_cycles_focused_slot_while_yolo_modal_is_open() {
     app.active_dialog = Some(Dialog::WorkflowYoloCountdown(WorkflowYoloCountdownState {
         step_name: "build".into(),
         remaining_secs: 30,
+        kind: Default::default(),
     }));
 
     press_key(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
@@ -1067,6 +1073,7 @@ fn ctrl_s_with_single_slot_leaves_yolo_modal_open() {
     app.active_dialog = Some(Dialog::WorkflowYoloCountdown(WorkflowYoloCountdownState {
         step_name: "build".into(),
         remaining_secs: 30,
+        kind: Default::default(),
     }));
 
     press_key(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
@@ -1087,6 +1094,7 @@ fn esc_on_parallel_yolo_modal_cancels_the_focused_slots_flag_only() {
     app.active_dialog = Some(Dialog::WorkflowYoloCountdown(WorkflowYoloCountdownState {
         step_name: "test".into(),
         remaining_secs: 5,
+        kind: Default::default(),
     }));
 
     press_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);

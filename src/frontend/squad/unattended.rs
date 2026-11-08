@@ -41,6 +41,7 @@ use crate::command::commands::worktree_lifecycle::{
 };
 use crate::command::error::CommandError;
 use crate::command::headless::HeadlessDefaults;
+use crate::command::interaction::InteractionDecision;
 use crate::data::fs::{RunId, SharedSquadRunLog, SquadRunLog, SquadRunLogError, SquadRunLogs};
 use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
 use crate::data::session::AgentName;
@@ -71,6 +72,7 @@ impl SquadRunFrontends for UnattendedFrontends {
         run_log_dir: &Path,
         label: &str,
         mount_scope: MountScopeDecision,
+        interaction: InteractionDecision,
     ) -> Result<Box<dyn AgentFrontend>, CommandError> {
         Ok(Box::new(UnattendedFrontend::for_run(
             task,
@@ -78,6 +80,7 @@ impl SquadRunFrontends for UnattendedFrontends {
             run_log_dir,
             label,
             mount_scope,
+            interaction,
         )?))
     }
 
@@ -87,6 +90,7 @@ impl SquadRunFrontends for UnattendedFrontends {
         run_id: &RunId,
         run_log_dir: &Path,
         mount_scope: MountScopeDecision,
+        interaction: InteractionDecision,
     ) -> Result<Box<dyn ExecWorkflowCommandFrontend>, CommandError> {
         Ok(Box::new(UnattendedFrontend::for_run(
             task,
@@ -94,6 +98,7 @@ impl SquadRunFrontends for UnattendedFrontends {
             run_log_dir,
             "workflow",
             mount_scope,
+            interaction,
         )?))
     }
 }
@@ -132,6 +137,9 @@ pub struct UnattendedFrontend {
     step_logs: HashMap<String, PathBuf>,
     /// The most recently opened container log, for the remediation separator.
     last_container_log: Option<PathBuf>,
+    /// This run's resolved interaction (WI 0141): a PTY of
+    /// `pty_size` when interactive, piped I/O when headless.
+    interaction: InteractionDecision,
 }
 
 impl UnattendedFrontend {
@@ -157,6 +165,10 @@ impl UnattendedFrontend {
             current_step: None,
             step_logs: HashMap::new(),
             last_container_log: None,
+            interaction: InteractionDecision {
+                interaction: crate::data::config::daemon::Interaction::Interactive,
+                pty_size: Some((120, 40)),
+            },
         }
     }
 
@@ -166,6 +178,7 @@ impl UnattendedFrontend {
         run_log_dir: &Path,
         label: &str,
         mount_scope: MountScopeDecision,
+        interaction: InteractionDecision,
     ) -> Result<Self, CommandError> {
         let logs = SquadRunLogs::new(run_log_dir);
         if !logs.is_prepared() {
@@ -187,6 +200,7 @@ impl UnattendedFrontend {
             current_step: None,
             step_logs: HashMap::new(),
             last_container_log: None,
+            interaction,
         })
     }
 
@@ -376,10 +390,13 @@ impl AgentFrontend for UnattendedFrontend {
 
     fn report_progress(&mut self, _progress: AgentProgress) {}
 
-    /// Every squad agent gets a PTY even when nobody is attached. This makes
-    /// its process the same interactive agent TUI a later attach reconnects
-    /// to, while the fixed 120x40 size is large enough for supported CLIs and
-    /// does not depend on a daemon-owned terminal.
+    /// An interactive squad run (`daemon.features.squad.interaction`, the
+    /// default) gives every agent a PTY even when nobody is attached, so its
+    /// process is the same interactive agent TUI a later attach reconnects
+    /// to. Its size is `daemon.terminal.{cols,rows}` as Layer 2 read it when
+    /// the run started (default 120×40); running terminals keep it. A
+    /// headless run pipes the agent: no PTY, nothing to attach to, output
+    /// still goes to the container log (WI 0141).
     fn take_io(&mut self) -> AgentIo {
         let (stdout_tx, stdout_rx) = tokio::sync::mpsc::unbounded_channel();
         let (stderr_tx, stderr_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -392,8 +409,11 @@ impl AgentFrontend for UnattendedFrontend {
             stderr: stderr_tx,
             stdin_tx,
             stdin_rx,
-            resize: Some(tokio::sync::mpsc::unbounded_channel().1),
-            initial_size: Some((120, 40)),
+            resize: self
+                .interaction
+                .pty_size
+                .map(|_| tokio::sync::mpsc::unbounded_channel().1),
+            initial_size: self.interaction.pty_size,
         }
     }
 }
@@ -508,6 +528,20 @@ impl WorkflowFrontend for UnattendedFrontend {
         available: &AvailableActions,
     ) -> Result<NextAction, EngineError> {
         Ok(self.headless.workflow_next_action(available))
+    }
+
+    fn yolo_countdown_started(
+        &mut self,
+        step_name: &str,
+        kind: crate::engine::workflow::actions::CountdownKind,
+    ) {
+        tracing::info!(
+            task = %self.task,
+            run_id = %self.run_id,
+            step = %step_name,
+            countdown = ?kind,
+            "squad workflow countdown started"
+        );
     }
 
     fn yolo_countdown_tick(
@@ -830,6 +864,14 @@ mod tests {
 
     use super::*;
 
+    /// The default squad decision: a PTY of `daemon.terminal`'s default size.
+    pub(super) fn interactive() -> InteractionDecision {
+        InteractionDecision {
+            interaction: crate::data::config::daemon::Interaction::Interactive,
+            pty_size: Some((120, 40)),
+        }
+    }
+
     // ── WI 0112 Part 5: setup/teardown step logs and failure lines ──────
 
     fn run_frontend(tmp: &Path) -> UnattendedFrontend {
@@ -839,6 +881,7 @@ mod tests {
             tmp,
             "workflow",
             MountScopeDecision::MountGitRoot,
+            super::tests::interactive(),
         )
         .unwrap()
     }
@@ -1166,6 +1209,7 @@ mod tests {
             tmp.path(),
             "leader",
             MountScopeDecision::MountCurrentDirOnly,
+            super::tests::interactive(),
         )
         .unwrap();
 
@@ -1267,6 +1311,66 @@ mod tests {
         );
     }
 
+    /// WI 0141: the PTY size is the one Layer 2 read from
+    /// `daemon.terminal.{cols,rows}`, not a frontend constant.
+    #[tokio::test]
+    async fn interactive_runs_take_their_pty_size_from_the_decision() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut frontend = UnattendedFrontend::for_run(
+            "task",
+            &RunId::new(),
+            tmp.path(),
+            "leader",
+            MountScopeDecision::MountGitRoot,
+            InteractionDecision {
+                interaction: crate::data::config::daemon::Interaction::Interactive,
+                pty_size: Some((200, 50)),
+            },
+        )
+        .unwrap();
+        let io = frontend.take_io();
+        assert_eq!(io.initial_size, Some((200, 50)));
+        assert!(io.resize.is_some());
+    }
+
+    /// WI 0141: `daemon.features.squad.interaction = headless` pipes every
+    /// agent — no PTY, no resize channel — so the runtime takes the piped
+    /// path, and output still reaches the container log.
+    #[tokio::test]
+    async fn a_headless_squad_run_is_piped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut frontend = UnattendedFrontend::for_run(
+            "task",
+            &RunId::new(),
+            tmp.path(),
+            "leader",
+            MountScopeDecision::MountGitRoot,
+            InteractionDecision {
+                interaction: crate::data::config::daemon::Interaction::Headless,
+                pty_size: None,
+            },
+        )
+        .unwrap();
+        frontend.report_status(AgentStatus::Running {
+            container_name: "awman-squad-task-33333333".into(),
+        });
+        let io = frontend.take_io();
+        assert_eq!(io.initial_size, None, "headless must not allocate a PTY");
+        assert!(io.resize.is_none());
+        io.stdout.send(b"piped output\n".to_vec()).unwrap();
+        drop(io);
+        let log_path = tmp.path().join("awman-squad-task-33333333.log");
+        let mut contents = String::new();
+        for _ in 0..40 {
+            contents = std::fs::read_to_string(&log_path).unwrap_or_default();
+            if contents.contains("piped output") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(contents.contains("piped output"), "{contents:?}");
+    }
+
     #[tokio::test]
     async fn leader_and_workflow_container_output_is_written_to_each_run_log() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1284,6 +1388,7 @@ mod tests {
                 &run_dir,
                 label,
                 MountScopeDecision::MountGitRoot,
+                super::tests::interactive(),
             )
             .unwrap();
             frontend.report_status(AgentStatus::Running {
@@ -1330,6 +1435,7 @@ mod wi0149_tests {
             tmp.path(),
             "workflow",
             MountScopeDecision::MountGitRoot,
+            super::tests::interactive(),
         )
         .unwrap();
         let report = WorkflowPrerequisiteReport {

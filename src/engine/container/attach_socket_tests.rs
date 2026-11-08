@@ -53,6 +53,7 @@ fn start(dir: tempfile::TempDir, path: PathBuf) -> Server {
     let guard = spawn_attach_socket_server(
         &path,
         AttachHooks {
+            terminal: None,
             output: Arc::clone(&output),
             stdin: stdin_tx,
             resize: Arc::new(move |cols, rows| {
@@ -396,4 +397,136 @@ fn handle_preview_reports_the_target_container() {
     assert_eq!(preview.id, "id-1");
     assert_eq!(preview.name, "name-1");
     assert_eq!(preview.image, "tag-1");
+}
+
+#[tokio::test]
+async fn binary_attach_uses_the_hub_snapshot_and_exclusive_input_capability() {
+    use crate::data::{daemon_state::FeatureName, ids::*, terminal::*};
+    use crate::engine::terminal_hub::*;
+    let hub = Arc::new(TerminalHub::new(Default::default()));
+    let (stdin, mut input) = input_channel();
+    let terminal = hub.register(
+        TerminalRegistration {
+            owner: TerminalOwnerInfo {
+                owner: TerminalOwner::Command(CommandId::new()),
+                feature: FeatureName::Worker,
+                source: None,
+                attempt: 1,
+                allow_remote_input: false,
+            },
+            agent: "fixture".into(),
+            model: None,
+            cols: 80,
+            rows: 24,
+        },
+        TerminalInput {
+            stdin,
+            resize: None,
+        },
+    );
+    terminal.push_output(b"existing screen");
+    let (socket, mut viewer) = tokio::net::UnixStream::pair().unwrap();
+    let task = tokio::spawn(serve_hub_client(socket, hub.clone(), terminal.id().clone()));
+    let (tag, screen) = within("initial snapshot", read_frame(&mut viewer))
+        .await
+        .unwrap();
+    assert_eq!(tag, Tag::Output);
+    assert!(String::from_utf8_lossy(&screen).contains("existing screen"));
+    assert!(matches!(
+        hub.take_control(terminal.id()),
+        Err(TerminalHubError::ControlHeld)
+    ));
+    write_frame(&mut viewer, Tag::Stdin, b"input")
+        .await
+        .unwrap();
+    assert_eq!(
+        within("bounded input", input.recv()).await.unwrap(),
+        b"input"
+    );
+    write_frame(&mut viewer, Tag::Resize, &resize_payload(100, 30))
+        .await
+        .unwrap();
+    terminal.exit(9);
+    let (tag, code) = within("exit frame", read_frame(&mut viewer)).await.unwrap();
+    assert_eq!((tag, code), (Tag::Exit, 9_i32.to_le_bytes().to_vec()));
+    within("attach task teardown", task).await.unwrap();
+}
+
+#[tokio::test]
+async fn the_socket_runtime_client_preserves_the_hub_exit_code_and_pending_output() {
+    let mut bytes = frame(Tag::Output, b"hello\x1b");
+    bytes.extend(frame(Tag::Exit, &7_i32.to_le_bytes()));
+    let (_dir, path) = fake_server(bytes, false);
+    let (mut execution, captured) = attach(&path, None);
+    assert_eq!(
+        within("terminal exit", execution.wait())
+            .await
+            .unwrap()
+            .exit_code,
+        7
+    );
+    let mut output = captured.stdout.lock().unwrap().take().unwrap();
+    assert_eq!(output.recv().await.unwrap(), b"hello");
+    assert_eq!(output.recv().await.unwrap(), b"\x1b");
+}
+
+#[tokio::test]
+async fn hub_clients_drain_the_terminal_exit_after_the_listener_guard_closes() {
+    use crate::data::{daemon_state::FeatureName, ids::CommandId, terminal::*};
+    use crate::engine::terminal_hub::*;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("hub.sock");
+    let hub = Arc::new(TerminalHub::new(Default::default()));
+    let (stdin, _input) = input_channel();
+    let terminal = hub.register(
+        TerminalRegistration {
+            owner: TerminalOwnerInfo {
+                owner: TerminalOwner::Command(CommandId::new()),
+                feature: FeatureName::Worker,
+                source: None,
+                attempt: 1,
+                allow_remote_input: false,
+            },
+            agent: "test".into(),
+            model: None,
+            cols: 80,
+            rows: 24,
+        },
+        TerminalInput {
+            stdin,
+            resize: None,
+        },
+    );
+    terminal.push_output(b"existing screen");
+    let (output, _) = tokio::sync::broadcast::channel(16);
+    let (unused_stdin, _unused_input) = unbounded_channel();
+    let guard = spawn_attach_socket_server(
+        &path,
+        AttachHooks {
+            terminal: Some((hub.clone(), terminal.id().clone())),
+            output: Arc::new(output),
+            stdin: unused_stdin,
+            resize: Arc::new(|_, _| {}),
+        },
+    )
+    .unwrap();
+    let (mut execution, captured) = attach(&path, None);
+    let mut output = captured.stdout.lock().unwrap().take().unwrap();
+    let screen = within("hub snapshot", output.recv()).await.unwrap();
+    assert!(String::from_utf8_lossy(&screen).contains("existing screen"));
+    drop(guard);
+    terminal.push_output(b"last bytes\x1b");
+    terminal.exit(7);
+    assert_eq!(
+        within("exit after listener teardown", execution.wait())
+            .await
+            .unwrap()
+            .exit_code,
+        7
+    );
+    let mut tail = Vec::new();
+    while let Some(bytes) = within("output EOF", output.recv()).await {
+        tail.extend(bytes);
+    }
+    assert_eq!(tail, b"last bytes\x1b");
 }

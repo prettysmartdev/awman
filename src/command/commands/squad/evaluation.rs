@@ -34,6 +34,8 @@ use crate::command::commands::workflow_preflight::{
 use crate::command::commands::{parse_overlay_list, CollectedOverlays, Command};
 use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
+use crate::command::interaction::{resolve_interaction, InteractionDecision, InteractionSlot};
+use crate::data::config::daemon::DaemonSettings;
 use crate::data::config::env::EnvSnapshot;
 use crate::data::dynamic_workflow_assets::build_squad_leader_prompt;
 use crate::data::fs::task_store::{MountScope, Task};
@@ -70,6 +72,11 @@ pub trait SquadRunFrontends: Send + Sync {
     /// `UnattendedFrontends` used to pass `MountGitRoot` from Layer 3, which
     /// meant which directory a squad *leader* mounts was decided by a frontend
     /// literal and was invisible to the headless-profile table (Q4: a decision
+    ///
+    /// `interaction` is the run's resolved interaction (WI 0141, slot
+    /// `Squad`): the frontend sets `AgentIo::initial_size =
+    /// interaction.pty_size` (a PTY of `daemon.terminal.{cols,rows}`) or pipes
+    /// the agent when it is headless, and decides nothing else about it.
     /// left in `src/frontend/squad/` is wrong).
     fn leader_frontend(
         &self,
@@ -78,6 +85,7 @@ pub trait SquadRunFrontends: Send + Sync {
         run_log_dir: &Path,
         label: &str,
         mount_scope: MountScopeDecision,
+        interaction: InteractionDecision,
     ) -> Result<Box<dyn AgentFrontend>, CommandError>;
 
     /// A frontend for executing the generated workflow. `mount_scope` is the
@@ -89,6 +97,7 @@ pub trait SquadRunFrontends: Send + Sync {
         run_id: &crate::data::fs::RunId,
         run_log_dir: &Path,
         mount_scope: MountScopeDecision,
+        interaction: InteractionDecision,
     ) -> Result<Box<dyn ExecWorkflowCommandFrontend>, CommandError>;
 }
 
@@ -311,10 +320,14 @@ pub fn resolve_leader(
 }
 
 /// Evaluates one task end to end.
+#[derive(Clone)]
 pub struct LocalTaskEvaluator {
     engines: Engines,
     env: EnvSnapshot,
     frontends: Arc<dyn SquadRunFrontends>,
+    /// The daemon's live `daemon` settings, read at the start of each run
+    /// (WI 0141). `None` reads `engines.global_config`.
+    daemon_settings: Option<Arc<dyn Fn() -> DaemonSettings + Send + Sync>>,
 }
 
 impl LocalTaskEvaluator {
@@ -323,7 +336,43 @@ impl LocalTaskEvaluator {
             engines,
             env,
             frontends,
+            daemon_settings: None,
         }
+    }
+
+    /// Read `daemon.features.squad.interaction` and
+    /// `daemon.terminal.{cols,rows}` live (the daemon passes its reloadable
+    /// config), so a change applies to the next run's spawns.
+    pub fn with_daemon_settings(
+        mut self,
+        source: Arc<dyn Fn() -> DaemonSettings + Send + Sync>,
+    ) -> Self {
+        self.daemon_settings = Some(source);
+        self
+    }
+
+    fn daemon_settings(&self) -> DaemonSettings {
+        match &self.daemon_settings {
+            Some(source) => source(),
+            None => DaemonSettings::from_merged(
+                &self
+                    .engines
+                    .global_config
+                    .daemon
+                    .clone()
+                    .unwrap_or_default(),
+            ),
+        }
+    }
+
+    /// The run's interaction (WI 0141): `daemon.features.squad.interaction`.
+    /// A task carries no `exec.interaction` of its own today, so nothing
+    /// requests an override and nothing can be refused; when one exists it
+    /// is passed as `requested` and `allowOverride` applies.
+    fn interaction(&self) -> InteractionDecision {
+        let settings = self.daemon_settings();
+        resolve_interaction(InteractionSlot::Squad, None, &settings)
+            .expect("no override is requested, so none can be refused")
     }
 
     /// Open a session rooted at the task's captured mount scope. The scope
@@ -489,6 +538,9 @@ impl LocalTaskEvaluator {
 
         let task = &request.task;
         let session = self.open_session(task)?;
+        // One decision per run: every agent this run spawns (leader, repairs,
+        // workflow steps) runs the same way, sized as configured now.
+        let interaction = self.interaction();
         let git_root = session.git_root().to_path_buf();
         let trusted_git_source = session
             .is_git_repo()
@@ -678,7 +730,7 @@ impl LocalTaskEvaluator {
                 model = ?leader.model,
                 "squad evaluation container launching"
             );
-            let run_options = self.leader_run_options(
+            let mut run_options = self.leader_run_options(
                 repair.prompt(),
                 leader.model.as_deref(),
                 &git_root,
@@ -687,6 +739,9 @@ impl LocalTaskEvaluator {
                 &request.run_log_dir,
                 &collected,
             );
+            // Headless squad runs (WI 0141) launch the leader in print mode,
+            // piped, like a pushed headless command.
+            run_options.non_interactive = interaction.is_headless();
             let exit = launcher
                 .run_leader(
                     LeaderRunSpec {
@@ -703,6 +758,7 @@ impl LocalTaskEvaluator {
                         &request.run_log_dir,
                         &label,
                         mount_scope_decision(task.mount_scope),
+                        interaction,
                     )?,
                 )
                 .await
@@ -902,22 +958,20 @@ impl LocalTaskEvaluator {
                 &options.policy,
             )?;
         }
-        let mut command = ExecWorkflowCommand::new(
-            squad_workflow_flags(
-                &generated_path,
-                uses_worktree,
-                &task.overlays,
-                task.prerequisites.clone().map(Box::new),
-            ),
-            self.engines.clone(),
-            session,
-        )
-        .with_frontend_kind(crate::command::dispatch::catalogue::FrontendKind::SQUAD_LOCAL)
-        .with_squad_identity(squad_identity)
-        // Every step container also gets the durable task workspace at the
-        // stable `context(workflow)` path, so a task's persistent data is
-        // reachable from its workflow as well as from its leader.
-        .with_task_workspace(request.task_dir.clone());
+        let mut workflow_flags = squad_workflow_flags(
+            &generated_path,
+            uses_worktree,
+            &task.overlays,
+            task.prerequisites.clone().map(Box::new),
+        );
+        workflow_flags.non_interactive = interaction.is_headless();
+        let mut command = ExecWorkflowCommand::new(workflow_flags, self.engines.clone(), session)
+            .with_frontend_kind(crate::command::dispatch::catalogue::FrontendKind::SQUAD_LOCAL)
+            .with_squad_identity(squad_identity)
+            // Every step container also gets the durable task workspace at the
+            // stable `context(workflow)` path, so a task's persistent data is
+            // reachable from its workflow as well as from its leader.
+            .with_task_workspace(request.task_dir.clone());
         if !uses_worktree {
             // No worktree means the engine's session is rooted at the task's
             // own mounted directory, which must survive every run untouched.
@@ -932,6 +986,7 @@ impl LocalTaskEvaluator {
             &request.run_id,
             &request.run_log_dir,
             mount_scope_decision(task.mount_scope),
+            interaction,
         )?;
         if task.prerequisites.is_none() {
             // A task created before workflow prerequisites existed (WI 0149):
@@ -1068,7 +1123,21 @@ impl LocalTaskEvaluator {
 #[async_trait]
 impl TaskEvaluator for LocalTaskEvaluator {
     async fn evaluate(&self, request: EvaluationRequest) -> EvaluationOutcome {
-        let outcome = match self.evaluate_inner(&request).await {
+        let mut evaluator = self.clone();
+        evaluator.engines.runtime = Arc::new(
+            crate::command::commands::api_server::owned_runtime::CommandOwnedRuntime::new(
+                self.engines.runtime.clone(),
+                "",
+            )
+            .with_owner(crate::data::terminal::TerminalOwnerInfo {
+                owner: crate::data::terminal::TerminalOwner::Run(request.run_id.clone()),
+                feature: crate::data::daemon_state::FeatureName::Squad,
+                source: None,
+                attempt: 1,
+                allow_remote_input: false,
+            }),
+        );
+        let outcome = match evaluator.evaluate_inner(&request).await {
             Ok(outcome) => outcome,
             // Never panic and never propagate: the scheduler records the error
             // and grows the task's backoff.
@@ -1359,6 +1428,7 @@ mod tests {
             _: &Path,
             _: &str,
             _: MountScopeDecision,
+            _: InteractionDecision,
         ) -> Result<Box<dyn AgentFrontend>, CommandError> {
             Ok(Box::new(
                 crate::command::commands::exec_workflow::tests::FakeExecWorkflowFrontend::with_shared_messages(self.messages.clone()),
@@ -1371,6 +1441,7 @@ mod tests {
             _: &crate::data::fs::RunId,
             _: &Path,
             _: MountScopeDecision,
+            _: InteractionDecision,
         ) -> Result<Box<dyn ExecWorkflowCommandFrontend>, CommandError> {
             Ok(Box::new(
                 crate::command::commands::exec_workflow::tests::FakeExecWorkflowFrontend::with_shared_messages(self.messages.clone()),

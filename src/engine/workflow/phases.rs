@@ -958,8 +958,18 @@ impl WorkflowEngine {
                     return Ok(KILLED_EXIT_CODE);
                 }
                 Some(event) = Self::recv_stuck(&mut stuck_rx) => {
-                    if !matches!(event, StuckEvent::Stuck) {
-                        continue;
+                    match event {
+                        StuckEvent::Stuck => {}
+                        StuckEvent::Reported(status) => {
+                            if let Some(code) = self
+                                .remediation_reported(label, status, &cancel_handle, &mut wait_rx, &mut stuck_rx)
+                                .await?
+                            {
+                                return Ok(code);
+                            }
+                            continue;
+                        }
+                        StuckEvent::Unstuck | StuckEvent::StartupGraceExpired => continue,
                     }
                     self.msg_warning(format!("'{label}' appears stuck (no output)"));
                     match self
@@ -980,8 +990,65 @@ impl WorkflowEngine {
                         MidStepYoloResult::Cancelled
                         | MidStepYoloResult::ShowControlBoard
                         | MidStepYoloResult::Recovered => continue,
+                        MidStepYoloResult::Reported(status) => {
+                            if let Some(code) = self
+                                .remediation_reported(label, status, &cancel_handle, &mut wait_rx, &mut stuck_rx)
+                                .await?
+                            {
+                                return Ok(code);
+                            }
+                        }
                     }
                 }
+            }
+        }
+    }
+
+    /// An `on_failure` agent reported its status (WI 0141; only watched under
+    /// yolo, like silence). Its exit code is ignored and the failed phase step
+    /// is retried afterwards, so every countdown's expiry just stops the agent:
+    /// `done` hands the step back sooner, and a problem the agent cannot get
+    /// past never holds the phase forever. A `blocked` agent with a user
+    /// present waits for them. Returns the exit code to finish with, or `None`
+    /// to keep waiting on the agent.
+    async fn remediation_reported(
+        &mut self,
+        label: &str,
+        status: Option<crate::data::program_status::EffectiveStatus>,
+        cancel_handle: &Option<CancelHandle>,
+        wait_rx: &mut tokio::sync::oneshot::Receiver<Result<AgentExitInfo, EngineError>>,
+        stuck_rx: &mut Option<tokio::sync::broadcast::Receiver<StuckEvent>>,
+    ) -> Result<Option<i32>, EngineError> {
+        use crate::engine::workflow::program_status::{AgentCountdownEnd, ReportedResponse};
+        let mut status = status;
+        loop {
+            self.frontend.report_agent_status(label, status.as_ref());
+            let response = self.reported_response(status.as_ref());
+            if let Some(s) = &status {
+                self.narrate_report(label, s, response);
+            }
+            let ReportedResponse::Countdown(kind) = response else {
+                // Resume / needs-you: keep waiting. (Boards are never shown
+                // during setup/teardown, and this path only runs under yolo.)
+                return Ok(None);
+            };
+            match self
+                .drive_agent_countdown(label, kind, wait_rx, stuck_rx, None)
+                .await?
+            {
+                AgentCountdownEnd::Exited(result) => return result.map(|e| Some(e.exit_code)),
+                AgentCountdownEnd::Expired => {
+                    self.msg_info(format!("Stopping '{label}' after its reported status"));
+                    if let Some(ch) = cancel_handle {
+                        let _ = ch.cancel();
+                    }
+                    self.frontend.report_container_exited(KILLED_EXIT_CODE);
+                    return Ok(Some(KILLED_EXIT_CODE));
+                }
+                AgentCountdownEnd::Cancelled
+                | AgentCountdownEnd::ShowControlBoard
+                | AgentCountdownEnd::Resumed => return Ok(None),
+                AgentCountdownEnd::Superseded(next) => status = next,
             }
         }
     }

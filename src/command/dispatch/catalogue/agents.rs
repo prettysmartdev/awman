@@ -15,13 +15,7 @@ pub(super) const AGENTS: CommandSpec = CommandSpec {
     requires_container_tier: false,
     requires_runtime: true,
     opens_tui_when_bare: false,
-    subcommands: &[
-        &AGENTS_STATUS,
-        &AGENTS_LIST,
-        &AGENTS_DETAIL,
-        &AGENTS_KILL,
-        &AGENTS_ATTACH,
-    ],
+    subcommands: &[&AGENTS_STATUS, &AGENTS_LIST, &AGENTS_DETAIL, &AGENTS_KILL],
 };
 
 pub(super) const AGENTS_STATUS: CommandSpec = CommandSpec {
@@ -131,6 +125,24 @@ pub(super) const AGENT_ID_ARGUMENT: ArgumentSpec = ArgumentSpec {
     optional: false,
 };
 
+impl CommandCatalogue {
+    /// Kept for old command-box transcripts; the `agents attach` catalogue
+    /// entry itself has been removed in favour of root `attach`.
+    pub fn is_agent_attach<S: AsRef<str>>(&self, words: &[S]) -> bool {
+        let words: Vec<_> = words.iter().map(AsRef::as_ref).collect();
+        words.first() == Some(&"agents") && words.get(1) == Some(&"attach")
+    }
+
+    /// Attach commands own Ctrl-C as a detach signal, rather than forwarding
+    /// it to the agent process.
+    pub fn is_terminal_attach<S: AsRef<str>>(&self, words: &[S]) -> bool {
+        let words: Vec<_> = words.iter().map(AsRef::as_ref).collect();
+        words.first() == Some(&"attach")
+            || (words.first() == Some(&"squad") && words.get(1) == Some(&"attach"))
+            || self.is_agent_attach(words.as_slice())
+    }
+}
+
 pub(super) const AGENTS_DETAIL: CommandSpec = CommandSpec {
     name: "detail",
     aliases: &["inspect"],
@@ -195,37 +207,3 @@ pub(super) const AGENTS_KILL: CommandSpec = CommandSpec {
     opens_tui_when_bare: false,
     subcommands: &[],
 };
-
-pub(super) const AGENTS_ATTACH: CommandSpec = CommandSpec {
-    name: "attach",
-    aliases: &[],
-    help: "Attach to an agent's terminal.",
-    long_help: None,
-    arguments: &[AGENT_ID_ARGUMENT],
-    flags: &[],
-    api_allowed: false,
-    build: crate::command::dispatch::build::agents,
-    gateway_need: GatewayNeed::None,
-    requires_container_tier: false,
-    requires_runtime: true,
-    opens_tui_when_bare: false,
-    subcommands: &[],
-};
-
-impl CommandCatalogue {
-    /// Whether a command line, split into words (trailing arguments are
-    /// fine), runs `agents attach`. Frontends ask this rather than spelling
-    /// the name: an attached terminal detaches on Ctrl-C instead of
-    /// forwarding it, and the CLI unbinds host stdio when the PTY closes.
-    pub fn is_agent_attach<S: AsRef<str>>(&self, words: &[S]) -> bool {
-        let mut words = words.iter().map(AsRef::as_ref);
-        let (Some(group), Some(leaf)) = (words.next(), words.next()) else {
-            return false;
-        };
-        self.lookup(&[group])
-            .is_some_and(|spec| spec.name == AGENTS.name)
-            && self
-                .lookup(&[group, leaf])
-                .is_some_and(|spec| spec.name == AGENTS_ATTACH.name)
-    }
-}

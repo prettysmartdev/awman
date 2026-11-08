@@ -17,6 +17,7 @@ pub type SharedStatusLog = Arc<Mutex<Vec<StatusLogEntry>>>;
 
 /// TUI implementation of `UserMessageSink`. Constructed per-command invocation
 /// and pointed at the active tab's shared status log.
+#[derive(Clone)]
 pub struct TuiUserMessageSink {
     log: SharedStatusLog,
 }

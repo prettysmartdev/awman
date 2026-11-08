@@ -118,9 +118,14 @@ pub fn dockerfile_template() -> &'static str {
 
 pub fn rendered_header(def: &AgentDefinition) -> String {
     match &def.origin {
-        AgentOrigin::Custom { scope, path, sha256 } => format!(
+        AgentOrigin::Custom {
+            scope,
+            path,
+            sha256,
+        } => format!(
             "{DOCKERFILE_HEADER_PREFIX}{}:{} — definition sha256: {sha256}\n{DOCKERFILE_HEADER_LINE_2}",
-            scope.as_str(), path.display()
+            scope.as_str(),
+            path.display()
         ),
         AgentOrigin::FirstParty => String::new(),
     }
@@ -145,13 +150,16 @@ pub fn render_dockerfile(
             return Err(EngineError::AgentDefinitionInvalid {
                 path: std::path::PathBuf::from(&def.name),
                 problems: vec!["first-party Dockerfiles must be provisioned by download".into()],
-            })
+            });
         }
         AgentImageSource::Rendered { spec } => {
             let apt = if spec.apt.is_empty() {
                 String::new()
             } else {
-                format!("RUN apt-get update && apt-get install -y --no-install-recommends {} && rm -rf /var/lib/apt/lists/*", spec.apt.join(" "))
+                format!(
+                    "RUN apt-get update && apt-get install -y --no-install-recommends {} && rm -rf /var/lib/apt/lists/*",
+                    spec.apt.join(" ")
+                )
             };
             let install = spec
                 .install
@@ -408,7 +416,9 @@ mod tests {
             ),
             ("delivery = 'none'", SystemPromptMode::Unsupported),
         ] {
-            let source = format!("schema=1\ndisplay_name='Pi'\n[run]\ncommand=['pi']\nseed_prompt={{flag='--prompt'}}\nmodel='equals'\nenv={{PI_TELEMETRY='0'}}\n[system_prompt]\n{table}\n[acp]\ncommand=['pi','--acp']\n[image]\ninstall=['install pi']\n");
+            let source = format!(
+                "schema=1\ndisplay_name='Pi'\n[run]\ncommand=['pi']\nseed_prompt={{flag='--prompt'}}\nmodel='equals'\nenv={{PI_TELEMETRY='0'}}\n[system_prompt]\n{table}\n[acp]\ncommand=['pi','--acp']\n[image]\ninstall=['install pi']\n"
+            );
             let file: AgentDefinitionFile = toml::from_str(&source).unwrap();
             assert!(file.validate().is_empty(), "{:?}", file.validate());
             let loaded = LoadedAgentDefinition {
@@ -447,8 +457,13 @@ mod tests {
                 ("equals", ModelFlagDelivery::EqArg),
                 ("unsupported", ModelFlagDelivery::Unsupported),
             ] {
-                for optional in ["", "[acp]\ncommand=['pi','--acp']\n[settings]\nhost_dir='.config/pi'\nskills_dir='skills'\n[ping]\ncommand=['/usr/bin/pi','--ping']\n"] {
-                    let source = format!("schema=1\ndisplay_name='Pi'\n[run]\ncommand=['pi']\nseed_prompt={seed}\nmodel='{model}'\n[image]\ninstall=['install pi']\n{optional}");
+                for optional in [
+                    "",
+                    "[acp]\ncommand=['pi','--acp']\n[settings]\nhost_dir='.config/pi'\nskills_dir='skills'\n[ping]\ncommand=['/usr/bin/pi','--ping']\n",
+                ] {
+                    let source = format!(
+                        "schema=1\ndisplay_name='Pi'\n[run]\ncommand=['pi']\nseed_prompt={seed}\nmodel='{model}'\n[image]\ninstall=['install pi']\n{optional}"
+                    );
                     let loaded = loaded_from_source(&source);
                     let def = convert(&loaded, "custom-name", DefinitionScope::Global);
                     assert_eq!(def.interactive_seed_delivery, expected_seed);
@@ -456,13 +471,30 @@ mod tests {
                     let has_optional = !optional.is_empty();
                     assert_eq!(def.supports_acp, has_optional);
                     assert_eq!(def.acp_entrypoint.is_some(), has_optional);
-                    assert_eq!(def.ping_argv, has_optional.then(|| vec!["/usr/bin/pi".into(), "--ping".into()]));
-                    assert_eq!(def.settings_mount, if has_optional { SettingsMount::Direct(".config/pi".into()) } else { SettingsMount::None });
-                    assert_eq!(def.skills_mount.as_deref(), has_optional.then_some("skills"));
+                    assert_eq!(
+                        def.ping_argv,
+                        has_optional.then(|| vec!["/usr/bin/pi".into(), "--ping".into()])
+                    );
+                    assert_eq!(
+                        def.settings_mount,
+                        if has_optional {
+                            SettingsMount::Direct(".config/pi".into())
+                        } else {
+                            SettingsMount::None
+                        }
+                    );
+                    assert_eq!(
+                        def.skills_mount.as_deref(),
+                        has_optional.then_some("skills")
+                    );
                     assert_eq!(def.credential_source, CredentialSource::None);
                     assert_eq!(def.sbx_kit_kind, SbxKitKind::Agent);
-                    assert!(!def.supports_stdin_injection && !def.sandbox_permission_mode_supported);
-                    assert!(def.sandbox_model_note.is_none() && def.sandbox_auth_env_vars.is_empty());
+                    assert!(
+                        !def.supports_stdin_injection && !def.sandbox_permission_mode_supported
+                    );
+                    assert!(
+                        def.sandbox_model_note.is_none() && def.sandbox_auth_env_vars.is_empty()
+                    );
                     assert!(def.deprecation_note.is_none());
                 }
             }

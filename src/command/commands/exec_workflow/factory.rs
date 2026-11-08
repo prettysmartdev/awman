@@ -83,6 +83,11 @@ fn attributed<T>(
 
 #[async_trait]
 impl AgentFrontend for AgentFrontendProxy {
+    fn terminal_source(&self) -> Option<crate::data::execution_event::EventSource> {
+        self.source
+            .as_ref()
+            .and_then(|source| source.lock().ok().map(|s| s.clone()))
+    }
     fn report_status(&mut self, status: crate::engine::agent_runtime::frontend::AgentStatus) {
         let is_running = matches!(
             &status,

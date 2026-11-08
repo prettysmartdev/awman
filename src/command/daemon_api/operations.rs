@@ -47,6 +47,8 @@ pub enum Operation {
     CoreFeaturesGet,
     CoreGrantsList,
     CoreGrantsDelete,
+    CoreTerminalsList,
+    CoreTerminalsGet,
     WorkerWorkdirs,
     WorkerSessionsList,
     WorkerSessionsCreate,
@@ -90,6 +92,9 @@ impl Operation {
             Self::CoreFeaturesGet => Feature::Core,
             Self::CoreGrantsList => Feature::Core,
             Self::CoreGrantsDelete => Feature::Core,
+            // A terminal is reached through its owner's rules, not a feature gate:
+            // Layer 2 (`command::terminals::AccessPolicy`) admits each viewer.
+            Self::CoreTerminalsList | Self::CoreTerminalsGet => Feature::Core,
             Self::WorkerWorkdirs => Feature::Worker,
             Self::WorkerSessionsList => Feature::Worker,
             Self::WorkerSessionsCreate => Feature::Worker,
@@ -133,6 +138,8 @@ impl Operation {
             Self::CoreFeaturesGet => "core.features.get",
             Self::CoreGrantsList => "core.grants.list",
             Self::CoreGrantsDelete => "core.grants.delete",
+            Self::CoreTerminalsList => "core.terminals.list",
+            Self::CoreTerminalsGet => "core.terminals.get",
             Self::WorkerWorkdirs => "worker.workdirs",
             Self::WorkerSessionsList => "worker.sessions.list",
             Self::WorkerSessionsCreate => "worker.sessions.create",

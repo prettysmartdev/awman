@@ -19,6 +19,23 @@ use crate::engine::workflow::frontend::WorkflowFrontend;
 
 use crate::frontend::cli::command_frontend::CliFrontend;
 
+impl CliFrontend {
+    /// The countdown line: the long-standing "yolo: auto-advancing" wording for
+    /// the silence and retry countdowns, the agent-report wording otherwise.
+    fn countdown_text(&self, secs: u64) -> String {
+        use crate::engine::workflow::actions::CountdownKind;
+        match self.countdown_kind {
+            CountdownKind::StuckStep | CountdownKind::FailureRetry => {
+                format!(" yolo: auto-advancing in {secs}s ")
+            }
+            kind => format!(
+                " {} ",
+                crate::frontend::program_status_text::countdown_label(kind, secs)
+            ),
+        }
+    }
+}
+
 impl WorkflowFrontend for CliFrontend {
     fn show_workflow_control_board(
         &mut self,
@@ -83,6 +100,14 @@ impl WorkflowFrontend for CliFrontend {
         Ok(action)
     }
 
+    fn yolo_countdown_started(
+        &mut self,
+        _step_name: &str,
+        kind: crate::engine::workflow::actions::CountdownKind,
+    ) {
+        self.countdown_kind = kind;
+    }
+
     fn yolo_countdown_tick(
         &mut self,
         _step_name: &str,
@@ -122,7 +147,7 @@ impl WorkflowFrontend for CliFrontend {
             // Raw mode: ANSI overlay on the last terminal line.
             if should_emit {
                 let secs = remaining.as_secs();
-                let msg = format!(" yolo: auto-advancing in {}s ", secs);
+                let msg = self.countdown_text(secs);
                 if let Ok((_, rows)) = crossterm::terminal::size() {
                     let mut out = std::io::stdout().lock();
                     let _ = write!(
@@ -148,8 +173,8 @@ impl WorkflowFrontend for CliFrontend {
         if should_emit {
             let secs = remaining.as_secs();
             eprint!(
-                "\r\x1b[2K  yolo: auto-advancing in {:2}s  [n] now  [a] abort  [p] pause",
-                secs
+                "\r\x1b[2K  {}  [n] now  [a] abort  [p] pause",
+                self.countdown_text(secs)
             );
             let _ = std::io::stderr().flush();
             self.last_sink_message_time = Some(std::time::Instant::now());
@@ -199,6 +224,25 @@ impl WorkflowFrontend for CliFrontend {
 
     fn yolo_countdown_finished(&mut self, _step_name: &str) {
         self.last_sink_message_time = None;
+    }
+
+    fn report_agent_status(
+        &mut self,
+        _step_name: &str,
+        status: Option<&crate::data::program_status::EffectiveStatus>,
+    ) {
+        if self.is_json_mode() {
+            return;
+        }
+        use crate::data::message::{MessageLevel, UserMessage, UserMessageSink as _};
+        if let Some(text) = self.status_gate.line_for(status) {
+            let level = match status.map(|s| s.state) {
+                Some(crate::data::program_status::ProgramState::Error) => MessageLevel::Error,
+                Some(crate::data::program_status::ProgramState::Blocked) => MessageLevel::Warning,
+                _ => MessageLevel::Info,
+            };
+            self.messages.write_message(UserMessage { level, text });
+        }
     }
 
     fn report_step_status(&mut self, _step: &WorkflowStep, status: WorkflowStepStatus) {
