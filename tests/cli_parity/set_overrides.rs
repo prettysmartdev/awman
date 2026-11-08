@@ -58,12 +58,17 @@ fn set_parses_by_value_type() {
             "daemon.features.squad.interaction=headless",
             json!("headless"),
         ),
+        ("tui.backend=daemon", json!("daemon")),
+        ("tui.integrations.rex.enabled=off", json!("off")),
+        ("daemon.features.engine.enabled=true", json!(true)),
     ];
     for (arg, want) in cases {
         let overrides = set(&[arg]).unwrap_or_else(|e| panic!("{arg}: {e}"));
         assert_eq!(&overrides.0[0].1, want, "{arg}");
     }
     assert!(set(&["daemon.features.squad.interaction=non-interactive"]).is_err());
+    assert!(set(&["tui.backend=other"]).is_err());
+    assert!(set(&["tui.integrations.rex.enabled=yes"]).is_err());
     assert!(matches!(
         set(&["runtime.builtin.images.x=y"]),
         Err(KeyError::ObjectNotSettable { .. })

@@ -716,7 +716,6 @@ pub(super) fn handle_new_tab_path(app: &mut App, path: &str) {
             return;
         }
     };
+    // The instance started the tab's startup command when it opened it.
     app.active_tab = idx;
-    let startup = app.catalogue.startup_command(&app.tabs[idx].session);
-    app.spawn_command(startup);
 }

@@ -77,7 +77,9 @@ install: build
 # never touch it.
 # Keep Cargo's build progress visible; only libtest's per-test output is quiet.
 test:
-	@AWMAN_TEST_TMPROOT="$(AWMAN_TEST_TMPROOT)" bash tools/isolated-test.sh -- --quiet
+	@AWMAN_TEST_BACKEND=builtin AWMAN_TEST_TMPROOT="$(AWMAN_TEST_TMPROOT)" bash tools/isolated-test.sh -- --quiet
+	@AWMAN_TEST_BACKEND=daemon AWMAN_TEST_TMPROOT="$(AWMAN_TEST_TMPROOT)" bash tools/isolated-test.sh -p awman --lib frontend::tui:: --quiet
+	@AWMAN_TEST_BACKEND=daemon AWMAN_TEST_TMPROOT="$(AWMAN_TEST_TMPROOT)" bash tools/isolated-test.sh -p awman-cli --test binary_smoke --test cli_parity -- --quiet
 
 test-fast:
 	@AWMAN_TEST_TMPROOT="$(AWMAN_TEST_TMPROOT)" bash tools/isolated-test.sh -- --quiet --skip real_git --skip real_network --skip builtin_hw

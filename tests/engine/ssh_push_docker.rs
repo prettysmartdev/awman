@@ -23,7 +23,7 @@ use std::{
 };
 
 fn docker(args: &[&str]) -> std::process::Output {
-    Command::new(awman::engine::host_cli::program("docker"))
+    awman::engine::host_cli::command(&awman::data::config::env::Env::from_process(), "docker")
         .args(args)
         .output()
         .unwrap()
@@ -204,7 +204,10 @@ fn docker_selected_key_pushes_and_setup_clone_uses_same_key_while_identity_commi
     };
     let (shell, step_env) = teardown_step_to_shell_with(&push, &options);
     let run = |shell: &str, step_env: Option<&HashMap<String, String>>, mounts: bool| {
-        let mut command = Command::new(awman::engine::host_cli::program("docker"));
+        let mut command = awman::engine::host_cli::command(
+            &awman::data::config::env::Env::from_process(),
+            "docker",
+        );
         command
             .args(["run", "--rm", "--network", &fixture.network, "-w"])
             .arg(&repo)

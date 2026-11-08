@@ -45,6 +45,8 @@ pub(super) const SQUAD: CommandSpec = CommandSpec {
     // `awman squad` on a terminal opens the squad tab; every subcommand below
     // is a one-shot.
     opens_tui_when_bare: true,
+    internal: false,
+    relay_allowed: false,
     subcommands: &[
         &SQUAD_ADD,
         &SQUAD_EDIT,
@@ -87,6 +89,8 @@ pub(super) const SQUAD_ADD: CommandSpec = CommandSpec {
     requires_container_tier: true,
     requires_runtime: true,
     opens_tui_when_bare: false,
+    internal: false,
+    relay_allowed: false,
     subcommands: &[],
 };
 
@@ -113,6 +117,8 @@ pub(super) const SQUAD_LIST: CommandSpec = CommandSpec {
     requires_container_tier: true,
     requires_runtime: true,
     opens_tui_when_bare: false,
+    internal: false,
+    relay_allowed: false,
     subcommands: &[],
 };
 
@@ -146,6 +152,8 @@ pub(super) const SQUAD_SHOW: CommandSpec = CommandSpec {
     requires_container_tier: true,
     requires_runtime: true,
     opens_tui_when_bare: false,
+    internal: false,
+    relay_allowed: false,
     subcommands: &[],
 };
 /// `squad edit` carries every field a task may change after creation. `name`,
@@ -169,6 +177,8 @@ pub(super) const SQUAD_EDIT: CommandSpec = CommandSpec {
     requires_container_tier: true,
     requires_runtime: true,
     opens_tui_when_bare: false,
+    internal: false,
+    relay_allowed: false,
     subcommands: &[],
 };
 
@@ -195,6 +205,8 @@ pub(super) const SQUAD_REMOVE: CommandSpec = CommandSpec {
     requires_container_tier: true,
     requires_runtime: true,
     opens_tui_when_bare: false,
+    internal: false,
+    relay_allowed: false,
     subcommands: &[],
 };
 pub(super) const SQUAD_PAUSE: CommandSpec = CommandSpec {
@@ -210,6 +222,8 @@ pub(super) const SQUAD_PAUSE: CommandSpec = CommandSpec {
     requires_container_tier: true,
     requires_runtime: true,
     opens_tui_when_bare: false,
+    internal: false,
+    relay_allowed: false,
     subcommands: &[],
 };
 pub(super) const SQUAD_RESUME: CommandSpec = CommandSpec {
@@ -225,6 +239,8 @@ pub(super) const SQUAD_RESUME: CommandSpec = CommandSpec {
     requires_container_tier: true,
     requires_runtime: true,
     opens_tui_when_bare: false,
+    internal: false,
+    relay_allowed: false,
     subcommands: &[],
 };
 pub(super) const SQUAD_TRIGGER: CommandSpec = CommandSpec {
@@ -245,6 +261,8 @@ pub(super) const SQUAD_TRIGGER: CommandSpec = CommandSpec {
     requires_container_tier: true,
     requires_runtime: true,
     opens_tui_when_bare: false,
+    internal: false,
+    relay_allowed: false,
     subcommands: &[],
 };
 pub(super) const SQUAD_CANCEL: CommandSpec = CommandSpec {
@@ -265,6 +283,8 @@ pub(super) const SQUAD_CANCEL: CommandSpec = CommandSpec {
     requires_container_tier: true,
     requires_runtime: true,
     opens_tui_when_bare: false,
+    internal: false,
+    relay_allowed: false,
     subcommands: &[],
 };
 pub(super) const SQUAD_ATTACH: CommandSpec = CommandSpec {
@@ -314,6 +334,8 @@ pub(super) const SQUAD_ATTACH: CommandSpec = CommandSpec {
     requires_container_tier: true,
     requires_runtime: true,
     opens_tui_when_bare: false,
+    internal: false,
+    relay_allowed: false,
     subcommands: &[],
 };
 
@@ -384,6 +406,8 @@ pub(super) const SQUAD_ENV: CommandSpec = CommandSpec {
     requires_container_tier: true,
     requires_runtime: true,
     opens_tui_when_bare: false,
+    internal: false,
+    relay_allowed: false,
     subcommands: &[],
 };
 

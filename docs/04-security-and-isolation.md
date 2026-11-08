@@ -248,6 +248,16 @@ If you configure `workflows.prerequisites.githubToken.acquire.argv`, awman may r
 
 ---
 
+## The daemon engine
+
+When the TUI runs on the [daemon engine](19-engine-and-frontends.md), nothing about containment changes: agents still run only in containers, with the same mounts and checks.
+
+- **Local only.** The engine API and the connection a TUI makes to it are served on the daemon's owner-only local socket (or named pipe) and are never exposed through the network listener, even when the engine is enabled persistently.
+- **Shell environment.** So that commands behave as they would in your own shell, the TUI sends its environment to the engine when it connects. The engine keeps it in memory for that instance only; it is never written to disk, config, the database or logs, and it is dropped when the instance ends. It is not passed wholesale to containers: containers receive only what they would receive from a builtin TUI.
+- **Secrets.** Secret dialog answers (such as a token you type) are sent only over the local socket and are redacted everywhere else.
+
+---
+
 ## Command transparency
 
 Every command awman issues to the underlying runtime is printed before it executes — in command mode to stdout, in TUI mode as the first line of the execution window.

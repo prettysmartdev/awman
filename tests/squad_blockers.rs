@@ -204,7 +204,7 @@ impl SquadCommandFrontend for ScriptedFrontend {
     ) -> Result<TaskWorkspaceChoice, CommandError> {
         Ok(self.workspace_choice)
     }
-    fn ask_task_repo(&mut self) -> Result<PathBuf, CommandError> {
+    fn ask_task_repo(&mut self, _current_dir: Option<&Path>) -> Result<PathBuf, CommandError> {
         Ok(self.repo.clone())
     }
     fn confirm_non_git_workspace(&mut self, _path: &Path) -> Result<bool, CommandError> {

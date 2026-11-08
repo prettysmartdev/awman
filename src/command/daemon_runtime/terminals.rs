@@ -98,6 +98,11 @@ impl CommandEventLog {
                             tracing::warn!(%error, run_id = %id, "terminal event log write failed");
                         }
                     }
+                    // Engine tab terminals: viewer detaches reach the
+                    // instance's host presenters (WI 0142 §4).
+                    TerminalOwner::Tab(tab) => {
+                        runtime.engine_host().terminal_event(&tab, &payload);
+                    }
                     _ => {
                         tracing::debug!(owner = %owner, event = payload.sse_event_type(), "terminal event")
                     }

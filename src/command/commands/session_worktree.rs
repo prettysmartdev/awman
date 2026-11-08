@@ -604,7 +604,7 @@ impl Resolver<'_> {
 
     fn missing_name(&self, name: &str) -> CommandError {
         let detail = (|| -> Result<String, CommandError> {
-            let paths = WorktreePaths::from_home()?;
+            let paths = WorktreePaths::from_env(self.git.env())?;
             let directories = [
                 paths.named(self.root, name),
                 paths.legacy_named(self.root, name),

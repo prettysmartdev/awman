@@ -104,7 +104,7 @@ command-line flag  >  --set  >  environment variable  >  squad task file  >  rep
 
 How values combine:
 
-- **Scalars, lists and maps replace; they don't merge.** A repo `agents.yolo.disallowedTools` list completely replaces the global one — even an empty list. To inherit the global list, omit the key from the repo file. A map such as `agents.flags` or `remote.targets` is replaced as a whole by a higher layer that sets it; to change one entry, set that entry's key (`agents.flags.codex`) — in a file, an entry the higher layer doesn't mention falls through only when the higher layer doesn't define the map at all.
+- **Scalars, lists and maps replace; they don't merge.** A repo `agents.yolo.disallowedTools` list completely replaces the global one — even an empty list. To inherit the global list, omit the key from the repo file. A map such as `agents.flags` or `remote.targets` is replaced as a whole by a higher layer that sets it; to change one entry, set that entry's key (`agents.flags.codex`) — in a file, an entry the higher layer doesn't mention falls through only when the higher layer doesn't define the map at all. The exception is `tui.integrations`: each integration's block is resolved on its own, setting by setting, so a repo that sets `tui.integrations.rex.enabled` keeps every other integration's global settings (and Rex's other global settings).
 - **Two keys are additive.** `overlays` and `workflows.dynamic.guidance` concatenate across layers (global, then repo, then task, then environment, then `--set`), with duplicates dropped, keeping the first occurrence. `AWMAN_OVERLAYS=ssh()` therefore *adds* to the overlays in your files. The table below marks them "(additive)". `workflows.dynamic.guidance` may hold at most 50 entries after merging.
 - **`null` resets.** A `null` from a higher layer (`--set agents.default=null`) puts the key back to its built-in default.
 - **Scope limits where a key may live.** Each key has a scope. A `global` key may appear only in the global file. A `repo` key may appear in the global or repo file. A `task` key may also appear in a squad task file. Credential policy (`agents.auth.*`), `runtime.*`, `tui.*`, `daemon.*`, `workServers.*` and `remote.*` are never task scope.
@@ -663,10 +663,11 @@ This table is generated from the same key table awman validates against, so it i
 | `worktree.mergeFix.onFailure` | enum `ask\|agent\|keep` | `"ask"` | repo | no | no | `AWMAN_WORKTREE_MERGE_FIX_ON_FAILURE` | What to do when merging a worktree branch fails. |
 | `worktree.mergeFix.promptTemplate` | string | `null` | repo | no | no | `AWMAN_WORKTREE_MERGE_FIX_PROMPT_TEMPLATE` | Prompt template, relative to the repo root, for the merge-fix agent. |
 | `tui.scrollbackLines` | int ≥ 0 | `10000` | repo | no | no | `AWMAN_TUI_SCROLLBACK_LINES` | Scrollback lines kept per container terminal. |
-| `tui.backend` | enum `auto\|daemon\|builtin` | `"auto"` | repo | no | no | `AWMAN_TUI_BACKEND` | Where the TUI runs commands (read from 0142). |
+| `tui.backend` | enum `auto\|daemon\|builtin` | `"auto"` | repo | no | no | `AWMAN_TUI_BACKEND` | Where the TUI runs commands: automatic selection, the daemon, or the builtin backend. |
 | `tui.programStatus.emit` | bool | `true` | repo | no | no | `AWMAN_TUI_PROGRAM_STATUS_EMIT` | Emit program status from the TUI (read from 0141). |
 | `tui.worker.enabled` | bool | `false` | repo | no | no | `AWMAN_TUI_WORKER_ENABLED` | Run a pull worker inside the TUI (read from 0143). |
-| `tui.integrations.*` | object | `{}` | repo | no | no | — | Per-integration TUI settings (read from 0154). |
+| `tui.integrations.*` | object | `{}` | repo | no | no | — | Integration-specific TUI settings keyed by integration name. |
+| `tui.integrations.*.enabled` | enum `auto\|on\|off` | `"auto"` | repo | no | no | `AWMAN_TUI_INTEGRATIONS_<NAME>_ENABLED` | Whether this TUI integration is selected automatically, enabled, or disabled. |
 | `daemon.maxConcurrentJobs` | int ≥ 1 | `4` | global | no | yes | `AWMAN_DAEMON_MAX_CONCURRENT_JOBS` | Jobs the daemon runs at once. |
 | `daemon.verboseSetup` | bool | `false` | global | no | yes | `AWMAN_DAEMON_VERBOSE_SETUP` | Log session setup in detail. |
 | `daemon.terminal.cols` | int ≥ 1 | `120` | global | no | yes | `AWMAN_DAEMON_TERMINAL_COLS` | Default daemon terminal width (read from 0141). |
@@ -693,10 +694,10 @@ This table is generated from the same key table awman validates against, so it i
 | `daemon.features.worker.pull.interaction` | enum `interactive\|headless` | `"interactive"` | global | no | yes | `AWMAN_DAEMON_FEATURES_WORKER_PULL_INTERACTION` | Default interaction of pulled jobs (read from 0143). |
 | `daemon.features.worker.pull.allowOverride` | bool | `true` | global | no | yes | `AWMAN_DAEMON_FEATURES_WORKER_PULL_ALLOW_OVERRIDE` | Let a pulled job choose its own interaction (read from 0143). |
 | `daemon.features.worker.pull.workRoot` | string | `null` | global | no | yes | `AWMAN_DAEMON_FEATURES_WORKER_PULL_WORK_ROOT` | Directory pulled jobs check out into (read from 0143). |
-| `daemon.features.engine.enabled` | bool | `false` | global | no | yes | `AWMAN_DAEMON_FEATURES_ENGINE_ENABLED` | Serve TUI engines from the daemon (read from 0142). |
-| `daemon.features.engine.allowEphemeral` | bool | `true` | global | no | yes | `AWMAN_DAEMON_FEATURES_ENGINE_ALLOW_EPHEMERAL` | Start the engine feature on demand (read from 0142). |
-| `daemon.features.engine.idleTimeout` | duration | `"15m"` | global | no | yes | `AWMAN_DAEMON_FEATURES_ENGINE_IDLE_TIMEOUT` | Idle time after which an on-demand engine stops (read from 0142). |
-| `daemon.features.engine.maxConcurrentJobs` | int ≥ 1 | `4` | global | no | yes | `AWMAN_DAEMON_FEATURES_ENGINE_MAX_CONCURRENT_JOBS` | Engine jobs at once (read from 0142). |
+| `daemon.features.engine.enabled` | bool | `false` | global | no | yes | `AWMAN_DAEMON_FEATURES_ENGINE_ENABLED` | Serve engine instances from the daemon. |
+| `daemon.features.engine.allowEphemeral` | bool | `true` | global | no | yes | `AWMAN_DAEMON_FEATURES_ENGINE_ALLOW_EPHEMERAL` | Allow the daemon to start the engine feature on demand. |
+| `daemon.features.engine.idleTimeout` | duration | `"15m"` | global | no | yes | `AWMAN_DAEMON_FEATURES_ENGINE_IDLE_TIMEOUT` | Idle time after which an unused on-demand engine stops. |
+| `daemon.features.engine.maxConcurrentJobs` | int ≥ 1 | `4` | global | no | yes | `AWMAN_DAEMON_FEATURES_ENGINE_MAX_CONCURRENT_JOBS` | Engine jobs the daemon runs at once. |
 | `workServers.*.url` | string | `null` | global | no | yes | `AWMAN_WORK_SERVERS_<NAME>_URL` | Work server URL; required for every entry (read from 0143). |
 | `workServers.*.enabled` | bool | `true` | global | no | yes | `AWMAN_WORK_SERVERS_<NAME>_ENABLED` | Claim work from this server (read from 0143). |
 | `workServers.*.claim` | enum `auto\|manual` | `"auto"` | global | no | yes | `AWMAN_WORK_SERVERS_<NAME>_CLAIM` | Whether work is claimed automatically (read from 0143). |

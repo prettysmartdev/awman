@@ -75,3 +75,13 @@ pub use worktree_paths::{worktree_branch_name, worktree_branch_name_for_workflow
 pub mod workflow_prerequisites;
 
 pub mod daemon_state;
+
+// WI 0142 — Layer 0 wire data for the daemon engine and its frontends.
+// Scaffolded by the architecture-design-contract step; filled by
+// wire-types-and-dialog-move (see /awman/context/workflow/0142-design.md §4).
+pub mod acp_protocol;
+pub mod annotations;
+pub mod dialog;
+pub mod frontend_protocol;
+pub mod instance_snapshot;
+pub mod secret;

@@ -658,7 +658,7 @@ pub const CONFIG_KEYS: &[ConfigKey] = &[
         "\"auto\"",
         Repo,
         false,
-        "Where the TUI runs commands (read from 0142).",
+        "Where the TUI runs commands: automatic selection, the daemon, or the builtin backend.",
     ),
     row(
         "tui.programStatus.emit",
@@ -682,7 +682,15 @@ pub const CONFIG_KEYS: &[ConfigKey] = &[
         "{}",
         Repo,
         false,
-        "Per-integration TUI settings (read from 0154).",
+        "Integration-specific TUI settings keyed by integration name.",
+    ),
+    row(
+        "tui.integrations.*.enabled",
+        ValueKind::Enum(&["auto", "on", "off"]),
+        "\"auto\"",
+        Repo,
+        false,
+        "Whether this TUI integration is selected automatically, enabled, or disabled.",
     ),
     // daemon
     row(
@@ -899,7 +907,7 @@ pub const CONFIG_KEYS: &[ConfigKey] = &[
         "false",
         Global,
         true,
-        "Serve TUI engines from the daemon (read from 0142).",
+        "Serve engine instances from the daemon.",
     ),
     row(
         "daemon.features.engine.allowEphemeral",
@@ -907,7 +915,7 @@ pub const CONFIG_KEYS: &[ConfigKey] = &[
         "true",
         Global,
         true,
-        "Start the engine feature on demand (read from 0142).",
+        "Allow the daemon to start the engine feature on demand.",
     ),
     row(
         "daemon.features.engine.idleTimeout",
@@ -915,7 +923,7 @@ pub const CONFIG_KEYS: &[ConfigKey] = &[
         "\"15m\"",
         Global,
         true,
-        "Idle time after which an on-demand engine stops (read from 0142).",
+        "Idle time after which an unused on-demand engine stops.",
     ),
     row(
         "daemon.features.engine.maxConcurrentJobs",
@@ -923,7 +931,7 @@ pub const CONFIG_KEYS: &[ConfigKey] = &[
         "4",
         Global,
         true,
-        "Engine jobs at once (read from 0142).",
+        "Engine jobs the daemon runs at once.",
     ),
     // workServers
     row(
@@ -1320,7 +1328,10 @@ impl ConfigKey {
     /// key) rather than [`MAP_NAME`]. Only object maps with no env form —
     /// image tags (`awman-x:latest`) and registry hosts (`ghcr.io`) — are.
     fn free_form_names(&self) -> bool {
-        self.kind == ValueKind::Object && self.path.ends_with(".*")
+        matches!(
+            self.path,
+            "runtime.builtin.images.*" | "runtime.builtin.registries.*"
+        )
     }
 }
 
@@ -1783,6 +1794,23 @@ fn walk(
                 },
                 other => other,
             })?;
+            // Integration-owned options remain opaque, but the shared
+            // `enabled` leaf must still be checked by its declared enum row.
+            if child == "tui.integrations.*" {
+                if let Some(enabled) = value.get("enabled") {
+                    let enabled_key = CONFIG_KEYS
+                        .iter()
+                        .find(|candidate| candidate.path == "tui.integrations.*.enabled")
+                        .expect("integration enabled key is in the key table");
+                    validate_value(enabled_key, enabled).map_err(|e| match e {
+                        KeyError::Value { reason, .. } => KeyError::Value {
+                            path: join(&path, "enabled"),
+                            reason,
+                        },
+                        other => other,
+                    })?;
+                }
+            }
             continue;
         }
         if !pattern_is_branch(&child) {
@@ -2356,6 +2384,14 @@ mod dotted_member_tests {
         assert_eq!(
             path_segments("runtime.builtin.registries.ghcr.io"),
             ["runtime", "builtin", "registries", "ghcr.io"]
+        );
+        assert_eq!(
+            path_segments("tui.integrations.rex.enabled"),
+            ["tui", "integrations", "rex", "enabled"]
+        );
+        assert_eq!(
+            resolve("tui.integrations.rex.enabled").unwrap().names,
+            ["rex"]
         );
         let resolved = resolve("runtime.builtin.registries.ghcr.io").unwrap();
         assert_eq!(resolved.names, ["ghcr.io"]);

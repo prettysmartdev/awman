@@ -1,7 +1,6 @@
 //! `GithubIssueSource` â GitHub implementation of `IssueSource`.
 
 use std::path::Path;
-use std::process::Command;
 
 use crate::data::config::env::Env;
 use crate::data::fs::remote_slug::RemoteSlug;
@@ -126,7 +125,9 @@ fn fetch_issue_with_dependencies(
     let (owner, repo, number) = parse_input(input, git_root, provider, git_engine)?;
 
     // Try gh CLI first
-    if let Some(issue) = try_gh_cli(&owner, &repo, number, provider) {
+    if let Some(issue) =
+        try_gh_cli_with_cmd_in(git_engine.env(), "gh", &owner, &repo, number, provider)
+    {
         return Ok(issue);
     }
 
@@ -193,9 +194,14 @@ fn fetch_issue_with_progress_using(
         ),
     });
 
-    if let Some(issue) =
-        try_gh_cli_with_cmd(integrations.gh_command, &owner, &repo, number, provider)
-    {
+    if let Some(issue) = try_gh_cli_with_cmd_in(
+        git_engine.env(),
+        integrations.gh_command,
+        &owner,
+        &repo,
+        number,
+        provider,
+    ) {
         return Ok(issue);
     }
 
@@ -329,14 +335,27 @@ fn parse_owner_repo_from_remote(remote_url: &str) -> Option<(String, String)> {
         .map(|slug| (slug.owner, slug.repo))
 }
 
-/// Try fetching via `gh issue view`.
-fn try_gh_cli(owner: &str, repo: &str, number: u32, provider: &str) -> Option<Issue> {
-    try_gh_cli_with_cmd("gh", owner, repo, number, provider)
-}
-
 /// Inner implementation for `try_gh_cli`, parameterised on the gh binary path.
 /// Exposed as `pub(crate)` so tests can inject a fake `gh` script.
+#[cfg(test)]
 pub(crate) fn try_gh_cli_with_cmd(
+    gh_cmd: &str,
+    owner: &str,
+    repo: &str,
+    number: u32,
+    provider: &str,
+) -> Option<Issue> {
+    try_gh_cli_with_cmd_in(
+        &crate::engine::host_cli::process_env(),
+        gh_cmd,
+        owner,
+        repo,
+        number,
+        provider,
+    )
+}
+fn try_gh_cli_with_cmd_in(
+    snapshot: &crate::data::config::env::EnvSnapshot,
     gh_cmd: &str,
     owner: &str,
     repo: &str,
@@ -347,7 +366,7 @@ pub(crate) fn try_gh_cli_with_cmd(
     let owner_repo = format!("{owner}/{repo}");
     let mut retries = 0;
     let output = loop {
-        let result = Command::new(gh_cmd)
+        let result = crate::engine::host_cli::command(snapshot, gh_cmd)
             .args([
                 "issue",
                 "view",

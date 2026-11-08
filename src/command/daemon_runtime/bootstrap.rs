@@ -44,6 +44,9 @@ pub struct DaemonBootstrap<F: ApiCommandFrontendFactory + 'static> {
     pub squad_run_frontends: Arc<dyn SquadRunFrontends>,
     pub push_frontend_factory: F,
     pub terminal_hub: Arc<TerminalHub>,
+    /// How engine-hosted commands word ready summaries and tables (the
+    /// TUI's, so a daemon-backed TUI reads exactly like the builtin one).
+    pub engine_presentation: Arc<dyn crate::command::instance::frontend::InstancePresentation>,
 }
 impl DaemonRuntime {
     pub async fn bootstrap<F: ApiCommandFrontendFactory + 'static>(
@@ -194,7 +197,9 @@ impl DaemonRuntime {
         );
         let squad_feature =
             SquadFeature::new(&core, engines.clone(), evaluator, settings.squad.clone())?;
-        let engine_feature = EngineFeature::new(settings.engine.clone());
+        let engine_host =
+            super::features::engine::engine_host(&core, b.engine_presentation.clone());
+        let engine_feature = EngineFeature::new(settings.engine.clone(), engine_host.clone());
         let supervisors: BTreeMap<_, _> = [
             (
                 FeatureName::Worker,
@@ -231,6 +236,7 @@ impl DaemonRuntime {
             guard,
             exit: tokio_util::sync::CancellationToken::new(),
             pid: std::process::id(),
+            engine_host,
             engine_feature,
             squad_feature,
             apply_worker: Box::new(move |s| worker_feature.apply_settings(s)),

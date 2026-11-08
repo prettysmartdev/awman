@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::io::BufRead;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::Arc;
 
 use crate::data::config::builtin_launch::BuiltinLaunchSettings;
@@ -181,7 +181,7 @@ pub(super) fn default_start_background(
         args.splice(args.len() - 3..args.len() - 3, ["-e".into(), key.clone()]);
     }
 
-    let mut command = Command::new(crate::engine::host_cli::program(cli.bin));
+    let mut command = cli.command();
     command.args(&args);
     for (k, v) in env {
         command.env(k, v);
@@ -323,7 +323,8 @@ pub(super) fn default_exec_in_background(
     args.push(container_id.to_string());
     args.extend(["sh".to_string(), "-c".to_string(), command.to_string()]);
 
-    let output = Command::new(crate::engine::host_cli::program(cli.bin))
+    let output = cli
+        .command()
         .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -369,7 +370,8 @@ pub(super) fn default_exec_in_background_streaming(
     args.push(container_id.to_string());
     args.extend(["sh".to_string(), "-c".to_string(), command.to_string()]);
 
-    let mut child = Command::new(crate::engine::host_cli::program(cli.bin))
+    let mut child = cli
+        .command()
         .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -434,12 +436,14 @@ pub(super) fn default_exec_in_background_streaming(
 }
 
 pub(super) fn default_stop_and_remove(cli: ContainerCli, container_id: &str) {
-    let _ = Command::new(crate::engine::host_cli::program(cli.bin))
+    let _ = cli
+        .command()
         .args(["stop", container_id])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
-    let _ = Command::new(crate::engine::host_cli::program(cli.bin))
+    let _ = cli
+        .command()
         .args(["rm", container_id])
         .stdout(Stdio::null())
         .stderr(Stdio::null())

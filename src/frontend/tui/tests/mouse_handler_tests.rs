@@ -728,7 +728,7 @@ fn scroll_on_acp_slot_moves_its_own_offset_not_vt100_scrollback() {
         make_mouse_event(MouseEventKind::ScrollUp, 20, 10, KeyModifiers::NONE),
     );
     assert_eq!(
-        state.lock().unwrap().scroll_offset,
+        app.active_tab().focused_slot().unwrap().acp_scroll_offset,
         3,
         "scrolling up over an ACP slot must advance the ACP window's own offset"
     );
@@ -747,7 +747,7 @@ fn scroll_on_acp_slot_moves_its_own_offset_not_vt100_scrollback() {
         );
     }
     assert_eq!(
-        state.lock().unwrap().scroll_offset,
+        app.active_tab().focused_slot().unwrap().acp_scroll_offset,
         5,
         "the offset must clamp at the history length"
     );
@@ -757,7 +757,7 @@ fn scroll_on_acp_slot_moves_its_own_offset_not_vt100_scrollback() {
         make_mouse_event(MouseEventKind::ScrollDown, 20, 10, KeyModifiers::NONE),
     );
     assert_eq!(
-        state.lock().unwrap().scroll_offset,
+        app.active_tab().focused_slot().unwrap().acp_scroll_offset,
         2,
         "scrolling down must move the ACP offset back toward the live view"
     );

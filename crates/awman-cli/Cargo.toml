@@ -104,6 +104,11 @@ path = "../../tests/daemon/main.rs"
 name = "api_parity"
 path = "../../tests/api_parity/main.rs"
 
+# WI 0142: builtin <-> daemon engine parity suite (AWMAN_TEST_BACKEND=builtin|daemon).
+[[test]]
+name = "engine_parity"
+path = "../../tests/engine_parity/main.rs"
+
 [[test]]
 name = "binary_smoke"
 path = "../../tests/binary_smoke/main.rs"

@@ -153,6 +153,7 @@ pub struct StagedCredentialFile {
 }
 
 pub struct OverlayEngine {
+    env: Option<crate::data::config::env::EnvSnapshot>,
     auth_resolver: AuthPathResolver,
     /// Source of file-form host-keychain artifacts to plant into agent
     /// settings overlays (e.g. `~/.gemini/antigravity-cli/...`). Injectable
@@ -177,6 +178,12 @@ impl std::fmt::Debug for OverlayEngine {
 }
 
 impl OverlayEngine {
+    fn snapshot(&self) -> std::borrow::Cow<'_, crate::data::config::env::EnvSnapshot> {
+        self.env
+            .as_ref()
+            .map(std::borrow::Cow::Borrowed)
+            .unwrap_or_else(|| std::borrow::Cow::Owned(crate::engine::host_cli::process_env()))
+    }
     /// Turn narrowly scoped workflow grants into container mounts and env.
     /// This is the only grant-to-container boundary.
     pub fn prerequisite_grant_overlays(
@@ -219,11 +226,7 @@ impl OverlayEngine {
                     if matches!(remote.kind, GitRemoteKind::Ssh { .. })
                         && grants.allows_ssh(&remote.redacted)
                     {
-                        let host_home = dirs::home_dir().ok_or_else(|| {
-                            EngineError::Other(
-                                "cannot resolve host home for SSH key validation".into(),
-                            )
-                        })?;
+                        let host_home = self.auth_resolver.home().to_path_buf();
                         let key = SshKeyInventory::validate_key_path(&host_home, key_path)
                             .map_err(EngineError::Data)?;
                         let key_target = PathBuf::from(home)
@@ -393,25 +396,39 @@ impl OverlayEngine {
         Ok(out)
     }
 
-    pub fn new(_session: &Session) -> Result<Self, EngineError> {
-        let auth_resolver = AuthPathResolver::from_process_env().map_err(EngineError::Data)?;
-        let credential_provider = default_credential_provider(auth_resolver.clone());
+    pub fn new(session: &Session) -> Result<Self, EngineError> {
+        let auth_resolver = AuthPathResolver::at_home(
+            session
+                .env()
+                .home_dir()
+                .ok_or(crate::data::error::DataError::HomeNotFound)?,
+        );
+        let env = session.env().clone();
+        let credential_provider = default_credential_provider(auth_resolver.clone(), env.clone());
         Ok(Self {
+            env: Some(session.env().clone()),
             auth_resolver,
-            secret_files_provider: default_secret_files_provider(),
+            secret_files_provider: default_secret_files_provider(env),
             credential_provider,
             sanitized: std::sync::Mutex::new(Vec::new()),
         })
     }
 
     pub fn with_auth_resolver(auth_resolver: AuthPathResolver) -> Self {
-        let credential_provider = default_credential_provider(auth_resolver.clone());
+        let env = crate::engine::host_cli::process_env();
+        let credential_provider = default_credential_provider(auth_resolver.clone(), env.clone());
         Self {
+            env: None,
             auth_resolver,
-            secret_files_provider: default_secret_files_provider(),
+            secret_files_provider: default_secret_files_provider(env),
             credential_provider,
             sanitized: std::sync::Mutex::new(Vec::new()),
         }
+    }
+
+    pub fn with_env(mut self, env: crate::data::config::env::EnvSnapshot) -> Self {
+        self.env = Some(env);
+        self
     }
 
     /// Replace the keychain provider. Used in tests to substitute a stub for
@@ -536,8 +553,27 @@ impl OverlayEngine {
         }
 
         let mut out: Vec<OverlaySpec> = by_key.into_values().collect();
+        for spec in &out {
+            self.validate_mount_source(&spec.host_path)?;
+        }
         out.sort_by(|a, b| a.host_path.cmp(&b.host_path));
         Ok((out, staged_credentials))
+    }
+
+    fn validate_mount_source(&self, path: &Path) -> Result<(), EngineError> {
+        let host = OverlayPathResolver::canonicalize_lossy(path);
+        let daemon = crate::data::fs::data_paths::DataPaths::from_env(&self.snapshot())
+            .map_err(EngineError::Data)?
+            .daemon()
+            .root()
+            .to_path_buf();
+        let daemon = OverlayPathResolver::canonicalize_lossy(&daemon);
+        if host.starts_with(&daemon) || daemon.starts_with(&host) {
+            return Err(EngineError::Other(
+                "daemon control paths cannot be mounted into an agent".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Resolve a single user-supplied overlay spec into its canonical form.
@@ -564,6 +600,7 @@ impl OverlayEngine {
         }
         let host_abs = OverlayPathResolver::make_absolute_with_cwd(&spec.host, cwd);
         let host_canon = OverlayPathResolver::canonicalize_lossy(&host_abs);
+        self.validate_mount_source(&host_canon)?;
         if !host_canon.exists() {
             return Err(EngineError::Other(format!(
                 "overlay host path '{}' does not exist (resolved to '{}')",
@@ -672,11 +709,11 @@ pub(crate) fn detect_home_from_dockerfile(path: &Path) -> Option<String> {
 /// process environment (which honours `AWMAN_HOME`). `None` when the
 /// agent does not resolve; the caller degrades exactly as for an unknown name.
 fn resolve_definition(
+    env: &crate::data::config::env::EnvSnapshot,
     agent: &AgentName,
     git_root: &Path,
 ) -> Option<std::sync::Arc<AgentDefinition>> {
-    let env = crate::data::config::env::Env::from_process();
-    AgentRegistry::resolve(&env, agent, Some(git_root))
+    AgentRegistry::resolve(env, agent, Some(git_root))
         .ok()
         .map(|resolved| resolved.definition())
 }

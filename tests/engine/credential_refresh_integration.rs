@@ -582,13 +582,16 @@ fn integration_spawn_choke_holds_lease_before_pty_piped_and_acp_on_docker_and_ap
 fn docker_e2e_live_container_observes_rotated_fingerprint_and_exited_stage_is_untouched() {
     if !child_env() {
         if !crate::helpers::docker_available()
-            || !Command::new(awman::engine::host_cli::program("docker"))
-                .args(["pull", "busybox:latest"])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false)
+            || !awman::engine::host_cli::command(
+                &awman::data::config::env::Env::from_process(),
+                "docker",
+            )
+            .args(["pull", "busybox:latest"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
         {
             eprintln!("SKIP: Docker/busybox unavailable");
             return;
@@ -642,11 +645,14 @@ fn docker_e2e_live_container_observes_rotated_fingerprint_and_exited_stage_is_un
         std::thread::sleep(Duration::from_millis(10));
     }
     let exited_mount = format!("{}:/root/.claude:ro", exited.path().display());
-    assert!(Command::new(awman::engine::host_cli::program("docker"))
-        .args(["run", "--rm", "-v", &exited_mount, "busybox:latest", "true"])
-        .status()
-        .unwrap()
-        .success());
+    assert!(awman::engine::host_cli::command(
+        &awman::data::config::env::Env::from_process(),
+        "docker"
+    )
+    .args(["run", "--rm", "-v", &exited_mount, "busybox:latest", "true"])
+    .status()
+    .unwrap()
+    .success());
     drop(exited_lease);
 
     let fake_agent_dir = tempfile::tempdir().unwrap();
@@ -663,23 +669,24 @@ fn docker_e2e_live_container_observes_rotated_fingerprint_and_exited_stage_is_un
     }
     let live_mount = format!("{}:/root/.claude:ro", live.path().display());
     let agent_mount = format!("{}:/agent:ro", fake_agent_dir.path().display());
-    let mut child = Command::new(awman::engine::host_cli::program("docker"))
-        .args([
-            "run",
-            "--rm",
-            "-v",
-            &live_mount,
-            "-v",
-            &agent_mount,
-            "busybox:latest",
-            "sh",
-            "/agent/fake-agent",
-            "/root/.claude/.credentials.json",
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let mut child =
+        awman::engine::host_cli::command(&awman::data::config::env::Env::from_process(), "docker")
+            .args([
+                "run",
+                "--rm",
+                "-v",
+                &live_mount,
+                "-v",
+                &agent_mount,
+                "busybox:latest",
+                "sh",
+                "/agent/fake-agent",
+                "/root/.claude/.credentials.json",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
     // Collect the fake agent's output as it arrives, so the test waits on what
     // the container has actually observed rather than on a fixed sleep. On a
     // loaded runner `docker run` can take longer to start than the 250 ms the

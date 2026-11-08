@@ -20,6 +20,8 @@ pub mod daemon;
 pub mod exec_prompt;
 pub mod exec_workflow;
 pub mod squad;
+// WI 0142: hidden `awman view` secondary-frontend entry point (filled by engine-handoff).
+pub mod view;
 pub mod workflow_preflight;
 pub mod workflow_prerequisites;
 // `HttpCore` is Layer 1 (WI 0114 F-28) — the tree's one `reqwest::Client`

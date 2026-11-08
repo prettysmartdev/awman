@@ -30,6 +30,7 @@ impl std::fmt::Debug for TerminalSubscription {
 
 fn snapshot_frame(snapshot: TerminalSnapshot) -> TerminalFrame {
     TerminalFrame::Snapshot {
+        has_output: snapshot.has_output,
         cols: snapshot.cols,
         rows: snapshot.rows,
         screen: snapshot.screen,

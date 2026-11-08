@@ -1,3 +1,4 @@
-//! Per-integration config sections: one file per integration,
-//! `integrations/<name>.rs`. Until an integration adds its file, its
-//! `tui.integrations.<name>` block is opaque JSON (see `tui.rs`).
+//! Integration-specific config sections are introduced by their owner under
+//! `integrations/<name>.rs`. The shared `enabled` switch is typed in `tui.rs`;
+//! other `tui.integrations.<name>` fields remain opaque JSON until owned by
+//! an integration.

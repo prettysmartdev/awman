@@ -41,6 +41,7 @@ pub trait LocalImageBuilder: Send + Sync {
 }
 
 pub struct HostLocalImageBuilder {
+    env: crate::data::config::env::EnvSnapshot,
     runner: Arc<dyn HostCommandRunner>,
 }
 
@@ -48,23 +49,33 @@ impl Default for HostLocalImageBuilder {
     fn default() -> Self {
         Self {
             runner: Arc::new(ProcessHostCommandRunner),
+            env: crate::engine::host_cli::process_env(),
         }
     }
 }
 
 impl HostLocalImageBuilder {
+    pub fn with_env(env: crate::data::config::env::EnvSnapshot) -> Self {
+        Self {
+            env,
+            runner: Arc::new(ProcessHostCommandRunner),
+        }
+    }
     #[cfg(test)]
     pub(crate) fn with_runner(runner: Arc<dyn HostCommandRunner>) -> Self {
-        Self { runner }
+        Self {
+            runner,
+            env: crate::engine::host_cli::process_env(),
+        }
     }
 }
 
 impl HostLocalImageBuilder {
-    fn bound_command(target: &BuildTarget) -> Command {
+    fn bound_command(&self, target: &BuildTarget) -> Command {
         match target {
-            BuildTarget::Runtime => Command::new(crate::engine::host_cli::program("docker")),
-            BuildTarget::Docker { endpoint } => Self::bound_docker_command(endpoint),
-            BuildTarget::Apple => Command::new(crate::engine::host_cli::program("container")),
+            BuildTarget::Runtime => crate::engine::host_cli::command(&self.env, "docker"),
+            BuildTarget::Docker { endpoint } => self.docker_command(endpoint),
+            BuildTarget::Apple => crate::engine::host_cli::command(&self.env, "container"),
         }
     }
 }
@@ -181,7 +192,7 @@ impl HostLocalImageBuilder {
         target: &BuildTarget,
         control: &BuildControl,
     ) -> Result<bool, EngineError> {
-        let mut command = Self::bound_command(target);
+        let mut command = self.bound_command(target);
         command.args(["info", "--format", "{{json .DriverStatus}}"]);
         let mut lines = Vec::new();
         let status = self.run_host(
@@ -224,7 +235,7 @@ impl HostLocalImageBuilder {
         platform: &OciPlatform,
         control: &BuildControl,
     ) -> Result<SourceImage, EngineError> {
-        let mut command = Self::bound_command(target);
+        let mut command = self.bound_command(target);
         command.args(["image", "inspect", "--format", "{{json .}}", reference]);
         let mut lines = Vec::new();
         let status = self.run_host(
@@ -268,7 +279,7 @@ impl HostLocalImageBuilder {
 
 impl LocalImageBuilder for HostLocalImageBuilder {
     fn probe(&self, target: &BuildTarget, control: &BuildControl) -> Result<(), EngineError> {
-        let mut command = Self::bound_command(target);
+        let mut command = self.bound_command(target);
         let what = match target {
             BuildTarget::Runtime => {
                 return Err(EngineError::Config(
@@ -394,7 +405,7 @@ impl LocalImageBuilder for HostLocalImageBuilder {
                 }
             }
             BuildTarget::Apple => {
-                let mut command = Self::bound_command(&request.target);
+                let mut command = self.bound_command(&request.target);
                 let platform = request.platform.to_string();
                 let argv = crate::engine::container::host_build::BuildArgv {
                     platform: Some(&platform),
@@ -460,8 +471,12 @@ impl LocalImageBuilder for HostLocalImageBuilder {
 }
 
 impl HostLocalImageBuilder {
+    #[cfg(test)]
     pub(crate) fn bound_docker_command(endpoint: &str) -> Command {
-        let mut command = Command::new(crate::engine::host_cli::program("docker"));
+        Self::default().docker_command(endpoint)
+    }
+    fn docker_command(&self, endpoint: &str) -> Command {
+        let mut command = crate::engine::host_cli::command(&self.env, "docker");
         command.args(["--host", endpoint]);
         for key in DOCKER_AMBIENT_ENV {
             command.env_remove(key);
@@ -502,7 +517,7 @@ impl HostLocalImageBuilder {
                 request.no_cache,
             )
         };
-        let mut command = Self::bound_docker_command(endpoint);
+        let mut command = self.docker_command(endpoint);
         command.args(argv.to_args());
         let status = self.run_host(&request.target, command, control, on_line)?;
         if !status.success() {
@@ -531,7 +546,7 @@ impl HostLocalImageBuilder {
         control: &BuildControl,
     ) -> Result<DockerBuildPath, EngineError> {
         let probe = control.bounded(PROBE_TIMEOUT);
-        let mut version = Self::bound_docker_command(endpoint);
+        let mut version = self.docker_command(endpoint);
         version.args(["buildx", "version"]);
         let target = BuildTarget::Docker {
             endpoint: endpoint.to_string(),
@@ -542,7 +557,7 @@ impl HostLocalImageBuilder {
         {
             return Ok(DockerBuildPath::Legacy);
         }
-        let mut inspect = Self::bound_docker_command(endpoint);
+        let mut inspect = self.docker_command(endpoint);
         inspect.args(["buildx", "inspect", "default"]);
         let mut lines = Vec::new();
         let status = self.run_host(&target, inspect, &probe, &mut |line| {
@@ -677,7 +692,10 @@ mod tests {
             .map(|(k, v)| (k.to_string_lossy().into_owned(), v.map(|v| v.to_owned())))
             .collect();
         for key in DOCKER_AMBIENT_ENV {
-            assert_eq!(envs.get(*key), Some(&None), "{key} must be removed");
+            assert!(
+                matches!(envs.get(*key), None | Some(None)),
+                "{key} must be removed"
+            );
         }
         assert_eq!(
             envs.get("DOCKER_HOST"),

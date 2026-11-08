@@ -34,6 +34,11 @@ use crate::frontend::render_helpers::format_table;
 /// to stderr already and produce no additional summary on stdout).
 pub fn render(outcome: &CommandOutcome, json: bool) -> Option<String> {
     match outcome {
+        CommandOutcome::Relayed(result) => result
+            .outcome
+            .as_ref()
+            .filter(|_| json)
+            .map(|value| value.to_string()),
         CommandOutcome::Attach(_) => None,
         CommandOutcome::Empty => None,
         CommandOutcome::Agents(o) => super::agents::render_agents(o, json),
@@ -184,6 +189,7 @@ fn render_config_show(o: &ConfigShowOutcome) -> String {
         .collect();
     let mut out = String::from("AWMAN CONFIG\n\n");
     out.push_str(&format_table(&headers, &rows));
+    out.push_str(&format!("\n\n{}", o.resolved_backend));
     if let Some(state) = &o.state {
         let accepted = state
             .auto_agent_auth_accepted
@@ -523,6 +529,7 @@ mod tests {
         use crate::command::commands::config::{ConfigFieldKind, ConfigFieldRow};
         let o = ConfigShowOutcome {
             state: None,
+            resolved_backend: "backend: builtin".into(),
             notes: vec![],
             rows: vec![
                 ConfigFieldRow {
@@ -572,6 +579,10 @@ mod tests {
         assert!(s.contains("agent"), "agent field row must appear");
         assert!(s.contains("claude"), "global agent value must appear");
         assert!(
+            s.contains("backend: builtin"),
+            "resolved backend line must appear"
+        );
+        assert!(
             s.contains("(read-only)"),
             "read-only fields must be marked: {s}"
         );
@@ -584,6 +595,7 @@ mod tests {
                             gemini-2.5-pro, codex-mini-latest";
         let o = ConfigShowOutcome {
             state: None,
+            resolved_backend: "backend: builtin".into(),
             notes: vec![],
             rows: vec![
                 ConfigFieldRow {
@@ -697,12 +709,13 @@ mod tests {
         use crate::command::commands::config::ConfigRowKind as Shape;
         ConfigShowOutcome {
             state: None,
+            resolved_backend: "backend: builtin".into(),
             notes: vec![],
             rows: vec![
                 shaped_row(
                     "demo.map",
                     Shape::MapHeader {
-                        child_prefix: "demo.map.",
+                        child_prefix: "demo.map.".into(),
                     },
                     Some("2 agents mapped"),
                     Some("(none)"),
@@ -728,7 +741,7 @@ mod tests {
                 shaped_row(
                     "demo.list",
                     Shape::ListHeader {
-                        child_prefix: "demo.list.",
+                        child_prefix: "demo.list.".into(),
                     },
                     Some("1 entry"),
                     Some("1 entry"),

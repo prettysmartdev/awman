@@ -10,6 +10,9 @@ use std::process::ExitCode;
 
 use anyhow::{Context, Result};
 
+use awman::command::commands::view::{
+    ViewArgs, ViewCommand, FLAG_ANNOTATION, FLAG_INSTANCE, FLAG_TAB, VIEW_COMMAND,
+};
 use awman::command::dispatch::catalogue::{CommandCatalogue, SET_FLAG};
 use awman::command::dispatch::RuntimeContext;
 use awman::command::startup::Startup;
@@ -111,12 +114,49 @@ async fn frontend_main() -> Result<ExitCode> {
         LaunchMode::Cli => None,
         LaunchMode::TuiNormal => Some(tui::InitialTab::Normal),
         LaunchMode::TuiSquad => Some(tui::InitialTab::Squad),
+        LaunchMode::TuiView => {
+            // The hidden `awman view` secondary frontend (WI 0142): Layer 2
+            // parses its flags and runs it through the TUI's entry point.
+            let args = match view_args(&matches) {
+                Ok(args) => args,
+                Err(error) => {
+                    eprintln!("awman: {error}");
+                    return Ok(ExitCode::from(2));
+                }
+            };
+            let entry = tui::ViewEntryPoint::new(ctx, messages, notices);
+            return Ok(match ViewCommand::new(args).run(&entry) {
+                Ok(code) => ExitCode::from(u8::try_from(code).unwrap_or(1)),
+                Err(error) => {
+                    eprintln!("awman: {error}");
+                    ExitCode::from(1)
+                }
+            });
+        }
     };
 
     match initial_tab {
         Some(tab) => Ok(tui::run(matches, ctx, fatal_runtime_error, tab, messages, notices).await),
         None => Ok(cli::run(matches, ctx, messages, notices).await),
     }
+}
+
+/// `awman view`'s flags, parsed by Layer 2.
+fn view_args(matches: &clap::ArgMatches) -> Result<ViewArgs, awman::command::error::CommandError> {
+    let view = matches
+        .subcommand_matches(VIEW_COMMAND)
+        .expect("TuiView is only chosen for the view subcommand");
+    let annotations: Vec<String> = view
+        .get_many::<String>(FLAG_ANNOTATION)
+        .map(|values| values.cloned().collect())
+        .unwrap_or_default();
+    ViewArgs::from_flags(
+        view.get_one::<String>(FLAG_INSTANCE)
+            .map(String::as_str)
+            .unwrap_or_default(),
+        view.get_one::<String>(FLAG_TAB).map(String::as_str),
+        &annotations,
+    )
 }
 
 /// The global `--set` values, wherever on the command line they appeared,
@@ -148,12 +188,16 @@ enum LaunchMode {
     Cli,
     TuiNormal,
     TuiSquad,
+    /// The hidden `awman view` (always a TUI, whatever stdin is).
+    TuiView,
 }
 
 impl LaunchMode {
     fn from_matches(matches: &clap::ArgMatches) -> Self {
         if matches.subcommand_name().is_none() {
             Self::TuiNormal
+        } else if matches.subcommand_name() == Some(VIEW_COMMAND) {
+            Self::TuiView
         } else if cli::is_bare_tui_invocation(matches) {
             Self::TuiSquad
         } else {
@@ -295,6 +339,7 @@ mod tests {
         assert!(!super::LaunchMode::Cli.is_tui());
         assert!(super::LaunchMode::TuiNormal.is_tui());
         assert!(super::LaunchMode::TuiSquad.is_tui());
+        assert!(super::LaunchMode::TuiView.is_tui());
     }
 
     /// Regression for the bug where a bare `awman squad` TUI launch under an
@@ -320,6 +365,35 @@ mod tests {
             "the raw parsed path must not be used directly as the CLI/TUI \
              detection proxy for this invocation"
         );
+    }
+
+    /// The hidden `view` always opens the TUI view entry point, and its flags
+    /// parse into Layer 2's typed arguments.
+    #[test]
+    fn view_routes_to_the_tui_view_entry_point() {
+        let instance = awman::data::ids::InstanceId::new();
+        let tab = awman::data::ids::TabId::new();
+        let m = CommandCatalogue::get()
+            .build_clap_command()
+            .try_get_matches_from([
+                "awman",
+                "view",
+                "--instance",
+                instance.as_str(),
+                "--tab",
+                tab.as_str(),
+                "--annotation",
+                "rex/pane=p1",
+            ])
+            .unwrap();
+        assert_eq!(
+            super::LaunchMode::from_matches(&m),
+            super::LaunchMode::TuiView
+        );
+        let args = super::view_args(&m).unwrap();
+        assert_eq!(args.instance, instance);
+        assert_eq!(args.tab, Some(tab));
+        assert_eq!(args.annotations.get("rex/pane"), Some("p1"));
     }
 
     /// Aliases also route through the CLI branch correctly.

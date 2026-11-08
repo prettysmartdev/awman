@@ -29,6 +29,10 @@ and starts the same live status view there.
 
 In both cases, terminal raw mode, alternate screen, and mouse capture are enabled on entry and restored unconditionally on exit, even if awman crashes.
 
+### Builtin or daemon engine
+
+The TUI can run its work in its own process or on the daemon's engine (see [The Engine and Frontends](19-engine-and-frontends.md)). It looks and behaves identically on either; everything in this guide applies to both.
+
 ### Status in your terminal's tab bar
 
 Terminals that support OSC 7501 can show awman's activity in their own tab bar,

@@ -183,7 +183,7 @@ fn unique_suffix() -> String {
 }
 
 fn cli_available(bin: &str, args: &[&str]) -> bool {
-    Command::new(awman::engine::host_cli::program(bin))
+    awman::engine::host_cli::command(&awman::data::config::env::Env::from_process(), bin)
         .args(args)
         .stdout(Stdio::null())
         .stderr(Stdio::null())

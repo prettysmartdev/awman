@@ -172,8 +172,11 @@ mod tests {
         )
         .unwrap();
         for variable in AMBIENT_MSB_OVERRIDES {
+            // A real snapshot always carries HOME; the engines resolve host
+            // paths from it rather than from the process.
             let env = EnvSnapshot::with_overrides([
                 (AWMAN_HOME, temp.path().to_str().unwrap()),
+                ("HOME", temp.path().to_str().unwrap()),
                 (*variable, ""),
             ]);
             let outcome = Startup::new(Vec::new())
@@ -206,7 +209,10 @@ mod tests {
             r#"{"runtime":{"kind":"builtin"}}"#,
         )
         .unwrap();
-        let env = EnvSnapshot::with_overrides([(AWMAN_HOME, temp.path().to_str().unwrap())]);
+        let env = EnvSnapshot::with_overrides([
+            (AWMAN_HOME, temp.path().to_str().unwrap()),
+            ("HOME", temp.path().to_str().unwrap()),
+        ]);
         let outcome = Startup::new(Vec::new())
             .run(temp.path().into(), env)
             .unwrap();
@@ -226,7 +232,11 @@ mod scope_tests {
     fn startup_outside_a_git_repo_does_not_mark_the_directory_as_a_repo() {
         let home = tempfile::tempdir().unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let env = EnvSnapshot::with_overrides([(AWMAN_HOME, home.path().to_str().unwrap())]);
+        // HOME as well as AWMAN_HOME: a real snapshot always carries it.
+        let env = EnvSnapshot::with_overrides([
+            (AWMAN_HOME, home.path().to_str().unwrap()),
+            ("HOME", home.path().to_str().unwrap()),
+        ]);
         let outcome = Startup::new(vec!["config".into()])
             .run(dir.path().into(), env)
             .unwrap();

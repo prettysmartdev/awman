@@ -43,6 +43,16 @@ impl DaemonRuntime {
         api: Arc<crate::command::daemon_api::worker::WorkerApi>,
         config: EffectiveConfig,
     ) -> Arc<Self> {
+        Self::for_engine_tests(api, config, None)
+    }
+
+    /// Use the real core, feature lifecycle and transports with injected
+    /// instance engines/presenters. No alternate admission or socket path.
+    pub fn for_engine_tests(
+        api: Arc<crate::command::daemon_api::worker::WorkerApi>,
+        config: EffectiveConfig,
+        host_parts: Option<crate::command::instance::host::HostParts>,
+    ) -> Arc<Self> {
         let engines = api.engines.clone();
         let paths = api.paths.data_paths();
         let core = Core::with_session_store(
@@ -73,7 +83,18 @@ impl DaemonRuntime {
             config.daemon().squad,
         )
         .unwrap();
-        let engine_feature = EngineFeature::new(config.daemon().engine);
+        let engine_host = match host_parts {
+            Some(mut parts) => {
+                parts.hub = core.terminal_hub().clone();
+                parts.executor = Some(core.executor().clone());
+                crate::command::instance::host::EngineInstanceHost::new(parts)
+            }
+            None => super::features::engine::engine_host(
+                &core,
+                Arc::new(crate::command::instance::frontend::PlainPresentation),
+            ),
+        };
+        let engine_feature = EngineFeature::new(config.daemon().engine, engine_host.clone());
         let stop = CancellationToken::new();
         let feature = Arc::new(IdleWorker(Mutex::new(stop.clone())));
         let task = tokio::spawn(async move {
@@ -116,6 +137,7 @@ impl DaemonRuntime {
             guard: DaemonGuard::new(paths.daemon()),
             exit: CancellationToken::new(),
             pid: std::process::id(),
+            engine_host,
             engine_feature,
             squad_feature,
             apply_worker: Box::new(|_| {}),

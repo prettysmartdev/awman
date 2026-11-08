@@ -68,7 +68,7 @@ impl TerminalStream {
             )
             .body(())
             .map_err(|error| failure(error.to_string()))?;
-        for (key, value) in &options.annotations {
+        for (key, value) in options.annotations.iter() {
             let (name, value) = crate::data::terminal::annotation_header(key, value);
             request.headers_mut().insert(
                 HeaderName::from_bytes(name.as_bytes())
@@ -134,7 +134,9 @@ impl TerminalStream {
 }
 
 #[cfg(unix)]
-async fn connect_local_stream(endpoint: &Path) -> Result<Box<dyn LocalStream>, EngineError> {
+pub(super) async fn connect_local_stream(
+    endpoint: &Path,
+) -> Result<Box<dyn LocalStream>, EngineError> {
     use std::os::unix::fs::{FileTypeExt, MetadataExt};
 
     let uid = nix::unistd::geteuid().as_raw();
@@ -169,7 +171,9 @@ async fn connect_local_stream(endpoint: &Path) -> Result<Box<dyn LocalStream>, E
 }
 
 #[cfg(windows)]
-async fn connect_local_stream(endpoint: &Path) -> Result<Box<dyn LocalStream>, EngineError> {
+pub(super) async fn connect_local_stream(
+    endpoint: &Path,
+) -> Result<Box<dyn LocalStream>, EngineError> {
     tokio::net::windows::named_pipe::ClientOptions::new()
         .open(endpoint)
         .map(|stream| Box::new(stream) as Box<dyn LocalStream>)
@@ -232,7 +236,7 @@ mod review_regressions {
         });
         let options = TerminalClientOptions {
             read_only: true,
-            annotations: [("rex/block".into(), "blk_1".into())].into(),
+            annotations: Annotations::try_from_pairs([("rex/block", "blk_1")]).unwrap(),
             actor: None,
         };
         let mut stream = TerminalStream::connect_local(&path, &TerminalId::new(), &options)

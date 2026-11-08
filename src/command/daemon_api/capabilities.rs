@@ -39,9 +39,9 @@ pub const CAPABILITIES: &[&str] = &[
     // WI 0141: `program_status` events (`{state, kind, progress, msg, app}`)
     // on `/v1/worker/commands/{id}/events` from agents that speak OSC 7501.
     "agent_status",
-    // Not advertised yet (WI 0141): `terminal` and `interactive`. The
-    // `/v1/terminals` resource, its `awman.terminal.v1` WebSocket and the
-    // input grant are served, but no daemon PTY registers with the terminal
-    // hub yet, so every list is empty. Add both here in the change that makes
-    // `spawn_pty_bridged` register daemon terminals.
+    // Engine slots and host processes now register real hub terminals.
+    "terminal",
+    "interactive",
+    "engine_instances",
+    "frontend_protocol",
 ];

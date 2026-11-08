@@ -456,8 +456,17 @@ impl LocalTaskGateway {
             status,
             paths,
             env_state,
+            // The daemon owns no session; its bootstrap snapshot is the
+            // process. A host that already holds one passes it via `with_env`.
             env: crate::data::config::env::Env::from_process(),
         }
+    }
+
+    /// Resolve against `env` (the daemon core's snapshot) instead of a fresh
+    /// process capture.
+    pub fn with_env(mut self, env: crate::data::config::env::EnvSnapshot) -> Self {
+        self.env = env;
+        self
     }
 
     /// Recompute `required_env` from the task store and the daemon's own

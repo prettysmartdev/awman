@@ -166,12 +166,12 @@ impl crate::command::commands::squad::commands::SquadCommandFrontend for CliFron
         }
     }
 
-    fn ask_task_repo(&mut self) -> Result<PathBuf, CommandError> {
+    fn ask_task_repo(&mut self, current_dir: Option<&Path>) -> Result<PathBuf, CommandError> {
         match super::per_command::helpers::read_line("repository directory [current dir]?") {
             Some(s) if !s.trim().is_empty() => Ok(PathBuf::from(s.trim())),
-            Some(_) => std::env::current_dir().map_err(|error| {
-                CommandError::Other(format!("cannot resolve current dir: {error}"))
-            }),
+            Some(_) => current_dir
+                .map(Path::to_path_buf)
+                .ok_or_else(|| CommandError::Other("cannot resolve current dir".into())),
             None => Err(CommandError::InteractiveInputUnavailable {
                 prompt: "repository directory".into(),
             }),
@@ -343,6 +343,15 @@ impl Drop for RawModeGuard {
 }
 
 impl CliFrontend {
+    /// Render a completion returned by `Dispatch::run_relayed` using the
+    /// builtin CLI outcome renderers and the engine's process exit code.
+    pub fn render_relay_result(
+        result: crate::data::frontend_protocol::CommandResultWire,
+        json: bool,
+    ) -> std::process::ExitCode {
+        super::per_command::relay::render_result(result, json)
+    }
+
     /// Whether this invocation is `agents attach`, as the catalogue names it.
     pub(crate) fn is_agent_attach(&self) -> bool {
         self.command_path.as_slice() == ["attach"]
@@ -502,6 +511,66 @@ impl CliFrontend {
             current = current.subcommand_matches(seg)?;
         }
         Some(current)
+    }
+}
+
+impl crate::command::dispatch::CliRelayFrontend for CliFrontend {
+    fn relay_bytes(&mut self, stream: crate::data::frontend_protocol::OutputStream, bytes: &[u8]) {
+        use std::io::Write;
+        match stream {
+            crate::data::frontend_protocol::OutputStream::Stdout => {
+                let mut out = std::io::stdout().lock();
+                let _ = out.write_all(bytes);
+                let _ = out.flush();
+            }
+            crate::data::frontend_protocol::OutputStream::Stderr => {
+                let mut out = std::io::stderr().lock();
+                let _ = out.write_all(bytes);
+                let _ = out.flush();
+            }
+        }
+    }
+    fn relay_facts(&self) -> crate::command::dispatch::CliRelayFacts {
+        use std::io::IsTerminal;
+        let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+        crate::command::dispatch::CliRelayFacts {
+            stdin_is_tty: std::io::stdin().is_terminal(),
+            stdout_is_tty: std::io::stdout().is_terminal(),
+            term_size: crate::data::frontend_protocol::TermSize { cols, rows },
+        }
+    }
+
+    fn relay_notice(&mut self, text: &str) {
+        eprintln!("{text}");
+    }
+
+    fn relay_output(
+        &mut self,
+        stream: crate::data::frontend_protocol::OutputStream,
+        message: UserMessage,
+    ) {
+        use crate::data::frontend_protocol::OutputStream;
+        use std::io::Write;
+        match stream {
+            OutputStream::Stdout => {
+                let _ = writeln!(std::io::stdout().lock(), "{}", message.text);
+            }
+            OutputStream::Stderr => self.write_message(message),
+        }
+    }
+
+    fn relay_dialog(
+        &mut self,
+        request: crate::data::dialog::DialogRequest,
+        interrupted: &tokio_util::sync::CancellationToken,
+    ) -> crate::data::dialog::DialogResponse {
+        let _input = super::per_command::helpers::RelayInputGuard::new(interrupted);
+        let response = super::per_command::relay::render_dialog(self, request, interrupted);
+        if interrupted.is_cancelled() {
+            crate::data::dialog::DialogResponse::Interrupted
+        } else {
+            response
+        }
     }
 }
 

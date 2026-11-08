@@ -108,7 +108,7 @@ fn open_report(
     else {
         panic!("expected the report review");
     };
-    setup_command_dialog(app, Dialog::Review(state))
+    setup_command_dialog(app, Dialog::Review(state.into()))
 }
 
 #[test]
@@ -299,7 +299,7 @@ fn wi0149_tui_terminal_release_restore_occurs_even_when_host_command_fails() {
         })
     });
     assert!(
-        matches!(requests.recv_timeout(std::time::Duration::from_secs(3)).unwrap(), DialogRequest::TerminalRelease { title } if title == "Host login")
+        matches!(requests.recv_timeout(std::time::Duration::from_secs(3)).unwrap(), DialogRequest::TerminalRelease { title, .. } if title == "Host login")
     );
     responses.send(DialogResponse::Yes).unwrap();
     assert!(matches!(
@@ -376,7 +376,7 @@ fn wi0149_every_tui_prerequisite_choice_uses_command_labels_keys_and_defaults() 
         |f, p| f.ask_prerequisite_identity_persist(p),
     );
     verify(
-        crate::command::prompts::prerequisite_ssh(&check, "github.com:org/repo"),
+        crate::command::prompts::prerequisite_ssh(&check, "github.com:org/repo", None),
         |f, p| f.ask_prerequisite_ssh(p),
     );
     verify(

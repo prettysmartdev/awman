@@ -63,5 +63,7 @@ pub(super) const ATTACH: CommandSpec = CommandSpec {
     requires_container_tier: false,
     requires_runtime: false,
     opens_tui_when_bare: false,
+    internal: false,
+    relay_allowed: false,
     subcommands: &[],
 };

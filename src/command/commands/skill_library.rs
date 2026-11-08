@@ -304,9 +304,6 @@ mod tests {
     use crate::data::fs::data_paths::AWMAN_HOME;
     use std::process::Command;
 
-    /// Serialises tests that toggle the process-global `GIT_CONFIG_*` env vars.
-    static GIT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     fn run_git(dir: &Path, args: &[&str]) {
         let out = Command::new("git")
             .args(args)
@@ -445,59 +442,32 @@ mod tests {
         dir
     }
 
-    /// Run `f` with a git `insteadOf` rewrite that redirects the fixed GitHub
-    /// HTTPS URL a fresh `PullTarget::Slug` builds to a local `file://` remote,
-    /// so a fresh clone never touches the network. Injected additively via
-    /// `GIT_CONFIG_COUNT` so the developer's global git config is untouched.
-    /// Puts the `GIT_CONFIG_*` trio back the way it was found, on the normal
-    /// path and while unwinding alike.
-    struct RestoreGitConfigEnv {
-        prev: [(&'static str, Option<String>); 3],
-    }
-
-    impl Drop for RestoreGitConfigEnv {
-        fn drop(&mut self) {
-            for (key, value) in &self.prev {
-                match value {
-                    Some(value) => std::env::set_var(key, value),
-                    None => std::env::remove_var(key),
-                }
-            }
-        }
-    }
-
+    /// Run `f` with a `GitEngine` whose git children see an `insteadOf`
+    /// rewrite redirecting the fixed GitHub HTTPS URL a fresh
+    /// `PullTarget::Slug` builds to a local `file://` remote, so a fresh clone
+    /// never touches the network.
+    ///
+    /// The rewrite is injected additively through `GIT_CONFIG_COUNT` in the
+    /// engine's own env snapshot — the one its git children are spawned with —
+    /// so the developer's git config and the process environment are both
+    /// untouched, and concurrent tests cannot see each other's rewrites.
     fn with_github_insteadof<F, R>(github_url: &str, local_url: &str, f: F) -> R
     where
-        F: FnOnce() -> R,
+        F: FnOnce(&GitEngine) -> R,
     {
-        let _lock = GIT_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // `GIT_CONFIG_COUNT` is restored first for the same reason it is set
-        // last: with it absent, git ignores the indexed keys entirely.
-        let prev = [
-            ("GIT_CONFIG_COUNT", std::env::var("GIT_CONFIG_COUNT").ok()),
-            ("GIT_CONFIG_KEY_0", std::env::var("GIT_CONFIG_KEY_0").ok()),
+        const INJECTED: [&str; 3] = ["GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0"];
+        let mut vars: Vec<(String, String)> = std::env::vars()
+            .filter(|(key, _)| !INJECTED.contains(&key.as_str()))
+            .collect();
+        vars.extend([
+            ("GIT_CONFIG_COUNT".into(), "1".into()),
             (
-                "GIT_CONFIG_VALUE_0",
-                std::env::var("GIT_CONFIG_VALUE_0").ok(),
+                "GIT_CONFIG_KEY_0".into(),
+                format!("url.{local_url}.insteadOf"),
             ),
-        ];
-
-        // These are process-global, and the lock only serializes the tests
-        // that inject them — every *other* test's `git` child still inherits
-        // whatever is set at the moment it is spawned. Publish the indexed
-        // pair before the count that makes git read it: while the count is
-        // unset the pair is inert, so no concurrent git can observe a count
-        // promising a key that has not been written yet, which git rejects
-        // outright with "missing config key GIT_CONFIG_KEY_0".
-        std::env::set_var("GIT_CONFIG_KEY_0", format!("url.{local_url}.insteadOf"));
-        std::env::set_var("GIT_CONFIG_VALUE_0", github_url);
-        std::env::set_var("GIT_CONFIG_COUNT", "1");
-
-        // Declared after `_lock`, so it restores the environment before the
-        // lock is released — and unwinds it even if `f` panics, which a plain
-        // sequence of `set_var` calls at the end of the function would not.
-        let _restore = RestoreGitConfigEnv { prev };
-        f()
+            ("GIT_CONFIG_VALUE_0".into(), github_url.into()),
+        ]);
+        f(&GitEngine::with_env(EnvSnapshot::with_overrides(vars)))
     }
 
     // ─── resolve_pull_target ──────────────────────────────────────────────────
@@ -557,14 +527,12 @@ mod tests {
         let upstream = Upstream::new(&[("skills/brainstorming/SKILL.md", "# brainstorming")]);
         let home = tempfile::tempdir().unwrap();
         let dirs = skill_dirs_at(home.path());
-        let git = GitEngine::new();
-
         let outcome = with_github_insteadof(
             "https://github.com/obra/superpowers.git",
             &upstream.url(),
-            || {
+            |git| {
                 pull_library(
-                    &git,
+                    git,
                     &dirs,
                     PullTarget::Slug(GithubSlug {
                         owner: "obra".to_string(),
@@ -593,14 +561,12 @@ mod tests {
         let upstream = Upstream::new(&[("custom/brainstorming/SKILL.md", "# brainstorming")]);
         let home = tempfile::tempdir().unwrap();
         let dirs = skill_dirs_at(home.path());
-        let git = GitEngine::new();
-
         let outcome = with_github_insteadof(
             "https://github.com/obra/superpowers.git",
             &upstream.url(),
-            || {
+            |git| {
                 pull_library(
-                    &git,
+                    git,
                     &dirs,
                     PullTarget::Slug(GithubSlug {
                         owner: "obra".to_string(),
@@ -903,14 +869,12 @@ mod tests {
         let upstream = Upstream::new(&[("README.md", "no skills here")]);
         let home = tempfile::tempdir().unwrap();
         let dirs = skill_dirs_at(home.path());
-        let git = GitEngine::new();
-
         let err = with_github_insteadof(
             "https://github.com/obra/superpowers.git",
             &upstream.url(),
-            || {
+            |git| {
                 pull_library(
-                    &git,
+                    git,
                     &dirs,
                     PullTarget::Slug(GithubSlug {
                         owner: "obra".to_string(),
@@ -953,14 +917,12 @@ mod tests {
         ]);
         let home = tempfile::tempdir().unwrap();
         let dirs = skill_dirs_at(home.path());
-        let git = GitEngine::new();
-
         let outcome = with_github_insteadof(
             "https://github.com/obra/superpowers.git",
             &upstream.url(),
-            || {
+            |git| {
                 pull_library(
-                    &git,
+                    git,
                     &dirs,
                     PullTarget::Slug(GithubSlug {
                         owner: "obra".to_string(),
@@ -987,14 +949,12 @@ mod tests {
         let upstream = Upstream::new(&[("skills/.keep", ""), ("README.md", "docs only")]);
         let home = tempfile::tempdir().unwrap();
         let dirs = skill_dirs_at(home.path());
-        let git = GitEngine::new();
-
         let outcome = with_github_insteadof(
             "https://github.com/obra/superpowers.git",
             &upstream.url(),
-            || {
+            |git| {
                 pull_library(
-                    &git,
+                    git,
                     &dirs,
                     PullTarget::Slug(GithubSlug {
                         owner: "obra".to_string(),

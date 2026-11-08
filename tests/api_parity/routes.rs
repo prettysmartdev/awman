@@ -60,6 +60,21 @@ fn api_paths_tls_dir_under_root() {
 /// `/v1/worker/commands/{id}/events`, and added `GET /v1/worker/sessions/:id/queue` and
 /// `GET /v1/worker/commands/:id/status`. WI 0138 added `GET /v1/worker/commands/:id`.
 const EXPECTED_ROUTES: &[(&str, &str)] = &[
+    ("GET", "/v1/engine/instances"),
+    ("POST", "/v1/engine/instances"),
+    ("GET", "/v1/engine/instances/{id}"),
+    ("DELETE", "/v1/engine/instances/{id}"),
+    ("PATCH", "/v1/engine/instances/{id}"),
+    ("GET", "/v1/engine/instances/{id}/frontend"),
+    ("GET", "/v1/engine/instances/{id}/tabs"),
+    ("GET", "/v1/engine/instances/{id}/tabs/{tab}"),
+    ("PATCH", "/v1/engine/instances/{id}/tabs/{tab}"),
+    ("GET", "/v1/engine/instances/{id}/dialogs"),
+    (
+        "POST",
+        "/v1/engine/instances/{id}/dialogs/{dialog_id}/answer",
+    ),
+    ("POST", "/v1/engine/instances/{id}/ui_requests"),
     ("GET", "/v1/health"),
     ("GET", "/v1/keys"),
     ("POST", "/v1/keys"),
@@ -119,7 +134,7 @@ fn route_table_has_exactly_the_contract_and_one_owner_per_operation() {
     for route in ROUTES {
         assert!(matches!(
             route.op.owner(),
-            Feature::Core | Feature::Worker | Feature::Squad
+            Feature::Core | Feature::Worker | Feature::Squad | Feature::Engine
         ));
         if let Some(c) = route.capability {
             assert!(CAPABILITIES.contains(&c));

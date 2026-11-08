@@ -426,6 +426,25 @@ impl EffectiveConfig {
             .unwrap_or(true)
     }
 
+    /// `tui.backend`, with the key-table default applied.
+    pub fn tui_backend(&self) -> crate::data::config::tui::TuiBackend {
+        self.merged
+            .tui
+            .as_ref()
+            .and_then(|tui| tui.backend)
+            .unwrap_or_default()
+    }
+
+    /// `tui.integrations.<name>.enabled`, resolved independently per
+    /// integration and defaulting to automatic detection.
+    pub fn integration_switch(&self, name: &str) -> crate::data::config::tui::IntegrationSwitch {
+        self.merged
+            .tui
+            .as_ref()
+            .map(|tui| tui.integration_switch(name))
+            .unwrap_or_default()
+    }
+
     /// `tui.scrollbackLines`.
     pub fn scrollback_lines(&self) -> usize {
         self.merged
@@ -962,6 +981,61 @@ fn is_map_level(pattern: &str) -> bool {
         .any(|k| k.path == star || k.path.starts_with(&format!("{star}.")))
 }
 
+/// Named maps whose entries are resolved independently rather than replaced
+/// as a whole. A repo that configures one TUI integration must not silently
+/// reset every other integration the global file configured, so each
+/// `tui.integrations.<name>` block merges by name, and inside a block each
+/// top-level setting (`enabled` and the integration's own keys) takes the
+/// highest layer that sets it.
+const PER_ENTRY_MAPS: &[&str] = &["tui.integrations"];
+
+/// Merge one layer's [`PER_ENTRY_MAPS`] map into `target`, entry by entry and
+/// within an entry setting by setting, recording provenance per setting.
+fn merge_per_entry(
+    target: &mut Value,
+    path: &str,
+    incoming: &Value,
+    layer: Layer,
+    provenance: &mut BTreeMap<String, Layer>,
+) {
+    let Some(entries) = incoming.as_object() else {
+        return;
+    };
+    for (name, entry) in entries {
+        if entry.is_null() {
+            continue;
+        }
+        let entry_path = child(path, name);
+        let Some(settings) = entry.as_object() else {
+            // Not an object: the key-table walker rejects this in a file, so
+            // keep the old whole-value behaviour rather than guess.
+            let segments: Vec<&str> = entry_path.split('.').collect();
+            set_path(target, &segments, entry.clone());
+            provenance.insert(entry_path, layer);
+            continue;
+        };
+        if settings.is_empty() {
+            // An empty block still declares the integration.
+            let segments: Vec<&str> = entry_path.split('.').collect();
+            if get_path(target, &segments).is_none() {
+                set_path(target, &segments, entry.clone());
+            }
+            continue;
+        }
+        for (setting, value) in settings {
+            if value.is_null() {
+                continue;
+            }
+            let setting_path = child(&entry_path, setting);
+            let segments: Vec<&str> = setting_path.split('.').collect();
+            set_path(target, &segments, value.clone());
+            let prefix = format!("{setting_path}.");
+            provenance.retain(|p, _| !p.starts_with(&prefix));
+            provenance.insert(setting_path, layer);
+        }
+    }
+}
+
 fn child(prefix: &str, segment: &str) -> String {
     if prefix.is_empty() {
         segment.to_string()
@@ -1058,6 +1132,8 @@ fn merge_file(
         let child_pattern = child(pattern, name);
         if let Some(key) = row_for(&child_pattern) {
             set_leaf(target, &path, key, value.clone(), layer, provenance);
+        } else if PER_ENTRY_MAPS.contains(&child_pattern.as_str()) {
+            merge_per_entry(target, &path, value, layer, provenance);
         } else if is_map_level(&child_pattern) {
             // A map keyed by user-chosen names replaces as a whole.
             let segments: Vec<&str> = path.split('.').collect();

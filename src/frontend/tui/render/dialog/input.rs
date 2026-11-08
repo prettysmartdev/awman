@@ -693,7 +693,7 @@ pub(crate) fn render_config_show(state: &dialogs::ConfigShowState, area: Rect, f
         None => {
             // The row shape decides whether Ctrl+N adds a map or list entry.
             use crate::command::commands::config::ConfigRowKind;
-            let selected_shape = state.rows.get(state.selected).map(|row| row.shape);
+            let selected_shape = state.rows.get(state.selected).map(|row| row.shape.clone());
             let mut spans = vec![
                 key("  \u{2191}\u{2193}"),
                 Span::raw("=row  "),

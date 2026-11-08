@@ -143,11 +143,19 @@ const HOST_REFRESH_REMEDIATION: &str = "run `claude` on the host / check login";
 /// function any module can reach for. `ReadyEngine` holds one;
 /// `CredentialRefreshMonitor` holds one. A new holder is a security review.
 #[derive(Debug, Clone, Default)]
-pub struct HostAgentPinger;
+pub struct HostAgentPinger {
+    env: Option<crate::data::config::env::EnvSnapshot>,
+}
+#[cfg(test)]
+#[allow(non_upper_case_globals)]
+pub const HostAgentPinger: HostAgentPinger = HostAgentPinger { env: None };
 
 impl HostAgentPinger {
     pub fn new() -> Self {
-        Self
+        Self::with_env(crate::engine::host_cli::process_env())
+    }
+    pub fn with_env(env: crate::data::config::env::EnvSnapshot) -> Self {
+        Self { env: Some(env) }
     }
 
     /// Build the fixed `(command, argv)` for the sanctioned host ping. Pure
@@ -214,7 +222,13 @@ impl HostAgentPinger {
             }
         }
 
-        let mut command = tokio::process::Command::new(&cmd);
+        let snapshot = self
+            .env
+            .clone()
+            .unwrap_or_else(crate::engine::host_cli::process_env);
+        let mut command =
+            tokio::process::Command::new(crate::engine::host_cli::program_in(&snapshot, &cmd));
+        command.env_clear().envs(snapshot.spawn_env());
         command
             .args(&args)
             .current_dir(scratch.path())
@@ -282,7 +296,10 @@ impl HostAgentPinger {
                     };
                 };
                 let Ok(def) = crate::engine::agent::AgentRegistry::resolve(
-                    &crate::data::config::env::Env::from_process(),
+                    &self
+                        .env
+                        .clone()
+                        .unwrap_or_else(crate::engine::host_cli::process_env),
                     &name,
                     None,
                 ) else {

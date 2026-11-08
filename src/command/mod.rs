@@ -34,3 +34,10 @@ pub use session_setup::{SessionSetup, SessionSetupPresenter};
 pub use startup::{Startup, StartupOutcome};
 
 pub mod daemon_runtime;
+
+// WI 0142 — instances, the builtin/daemon backends, the integration registry and the
+// builtin-vs-daemon hand-off. Scaffolded by architecture-design-contract; see
+// /awman/context/workflow/0142-design.md §3–§4 for each module's contract.
+pub mod engine_handoff;
+pub mod instance;
+pub mod integrations;

@@ -46,6 +46,8 @@ pub(super) const CLEAN: CommandSpec = CommandSpec {
     requires_container_tier: false,
     requires_runtime: true,
     opens_tui_when_bare: false,
+    internal: false,
+    relay_allowed: false,
     subcommands: &[],
 };
 
@@ -90,6 +92,8 @@ pub(super) const INIT: CommandSpec = CommandSpec {
     requires_container_tier: false,
     requires_runtime: true,
     opens_tui_when_bare: false,
+    internal: false,
+    relay_allowed: true,
     subcommands: &[],
 };
 
@@ -188,6 +192,8 @@ pub(super) const READY: CommandSpec = CommandSpec {
     requires_container_tier: false,
     requires_runtime: true,
     opens_tui_when_bare: false,
+    internal: false,
+    relay_allowed: true,
     subcommands: &[],
 };
 
@@ -206,6 +212,8 @@ pub(super) const CHAT: CommandSpec = CommandSpec {
     requires_container_tier: false,
     requires_runtime: true,
     opens_tui_when_bare: false,
+    internal: false,
+    relay_allowed: true,
     subcommands: &[],
 };
 
@@ -224,6 +232,8 @@ pub(super) const SPECS: CommandSpec = CommandSpec {
     requires_container_tier: false,
     requires_runtime: true,
     opens_tui_when_bare: false,
+    internal: false,
+    relay_allowed: false,
     subcommands: &[&SPECS_AMEND],
 };
 
@@ -268,6 +278,8 @@ pub(super) const SPECS_AMEND: CommandSpec = CommandSpec {
     requires_container_tier: false,
     requires_runtime: true,
     opens_tui_when_bare: false,
+    internal: false,
+    relay_allowed: false,
     subcommands: &[],
 };
 
@@ -347,6 +359,8 @@ pub(super) const CONFIG: CommandSpec = CommandSpec {
     // on this host: `awman config set runtime.kind …` must stay reachable.
     requires_runtime: false,
     opens_tui_when_bare: false,
+    internal: false,
+    relay_allowed: false,
     subcommands: &[&CONFIG_SHOW, &CONFIG_GET, &CONFIG_SET, &CONFIG_UNSET],
 };
 
@@ -364,6 +378,8 @@ pub(super) const CONFIG_SHOW: CommandSpec = CommandSpec {
     requires_container_tier: false,
     requires_runtime: false,
     opens_tui_when_bare: false,
+    internal: false,
+    relay_allowed: false,
     subcommands: &[],
 };
 
@@ -380,6 +396,8 @@ pub(super) const CONFIG_GET: CommandSpec = CommandSpec {
     requires_container_tier: false,
     requires_runtime: false,
     opens_tui_when_bare: false,
+    internal: false,
+    relay_allowed: false,
     subcommands: &[],
 };
 
@@ -410,6 +428,8 @@ pub(super) const CONFIG_SET: CommandSpec = CommandSpec {
     requires_container_tier: false,
     requires_runtime: false,
     opens_tui_when_bare: false,
+    internal: false,
+    relay_allowed: false,
     subcommands: &[],
 };
 
@@ -427,5 +447,7 @@ pub(super) const CONFIG_UNSET: CommandSpec = CommandSpec {
     requires_container_tier: false,
     requires_runtime: false,
     opens_tui_when_bare: false,
+    internal: false,
+    relay_allowed: false,
     subcommands: &[],
 };

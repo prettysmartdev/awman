@@ -512,6 +512,7 @@ fn covered_credential_services(
 /// backend consumes. Conflicting options are detected here.
 #[derive(Debug, Clone, Default)]
 pub struct ResolvedContainerOptions {
+    pub host_env: Option<crate::data::config::env::EnvSnapshot>,
     pub agent_identity: Option<(String, Option<String>)>,
     pub program_status: crate::engine::agent_runtime::program_status::ProgramStatusBridgeConfig,
     pub image: Option<ImageRef>,
@@ -591,7 +592,22 @@ impl ResolvedContainerOptions {
     pub fn resolve(
         options: impl IntoIterator<Item = ContainerOption>,
     ) -> Result<Self, ResolveError> {
+        Self::resolve_with_env(options, None)
+    }
+
+    pub fn resolve_in(
+        options: impl IntoIterator<Item = ContainerOption>,
+        env: &crate::data::config::env::EnvSnapshot,
+    ) -> Result<Self, ResolveError> {
+        Self::resolve_with_env(options, Some(env.clone()))
+    }
+
+    fn resolve_with_env(
+        options: impl IntoIterator<Item = ContainerOption>,
+        env: Option<crate::data::config::env::EnvSnapshot>,
+    ) -> Result<Self, ResolveError> {
         let mut r = Self {
+            host_env: env,
             yolo: YoloMode::Disabled,
             auto: AutoMode::Disabled,
             plan: PlanMode::Disabled,
@@ -605,17 +621,23 @@ impl ResolvedContainerOptions {
         // by a harness-declared env var.  Applies to ALL container runtimes.
         // Production callers pass the real host-env lookup; tests inject a
         // hermetic closure to avoid mutating process-global state.
+        let lookup = |name: &str| {
+            r.host_env.as_ref().map_or_else(
+                || crate::data::config::env::host_var(name),
+                |env| env.get(name).map(str::to_owned),
+            )
+        };
         dedup_credentials_by_declared_env(
             &mut r.agent_credentials,
             &r.env_passthrough,
             &r.env_literal,
-            &crate::data::config::env::host_var,
+            &lookup,
         );
         dedup_refreshable_by_declared_env(
             &mut r.refreshable_credentials,
             &r.env_passthrough,
             &r.env_literal,
-            &crate::data::config::env::host_var,
+            &lookup,
         )?;
         r.validate()?;
         // Render through the existing shared argv tail on every container

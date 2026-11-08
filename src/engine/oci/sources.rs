@@ -272,6 +272,7 @@ impl Resolved {
                 Some((path, bytes))
             };
             transport.credentials = registry::resolve_credentials(
+                env,
                 &reference.registry,
                 host.as_ref().and_then(|h| h.auth.as_ref()),
                 &lookup,

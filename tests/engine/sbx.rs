@@ -38,7 +38,7 @@ fn sbx_guard() -> bool {
 }
 
 fn sbx_on_path() -> bool {
-    std::process::Command::new(awman::engine::host_cli::program("sbx"))
+    awman::engine::host_cli::command(&awman::data::config::env::Env::from_process(), "sbx")
         .arg("version")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -87,13 +87,14 @@ fn is_available_true_when_sbx_on_path() {
     let result: bool = rt.is_available();
     // is_available() probes `sbx ls`, so it is true only when sbx is both
     // installed AND logged in. Assert against the same probe.
-    let logged_in = std::process::Command::new(awman::engine::host_cli::program("sbx"))
-        .arg("ls")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+    let logged_in =
+        awman::engine::host_cli::command(&awman::data::config::env::Env::from_process(), "sbx")
+            .arg("ls")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
     assert_eq!(
         result, logged_in,
         "is_available() must mirror whether `sbx ls` succeeds"
@@ -392,10 +393,11 @@ fn workflow_two_step_sbx_does_not_error_with_not_implemented() {
     let workspace = std::fs::canonicalize(tmp_root.path()).unwrap();
     let expected_name = sandbox_name_for(&workspace, "claude");
 
-    let ls_out = std::process::Command::new(awman::engine::host_cli::program("sbx"))
-        .arg("ls")
-        .output()
-        .ok();
+    let ls_out =
+        awman::engine::host_cli::command(&awman::data::config::env::Env::from_process(), "sbx")
+            .arg("ls")
+            .output()
+            .ok();
     let ls_bytes = ls_out.as_ref().map(|o| o.stdout.as_slice()).unwrap_or(&[]);
     let ls_text = String::from_utf8_lossy(ls_bytes);
     let matching: Vec<_> = ls_text
@@ -409,7 +411,7 @@ fn workflow_two_step_sbx_does_not_error_with_not_implemented() {
     );
 
     // Clean up the sandbox created by this test (best-effort).
-    let _ = std::process::Command::new(awman::engine::host_cli::program("sbx"))
+    let _ = awman::engine::host_cli::command(&awman::data::config::env::Env::from_process(), "sbx")
         .args(["rm", &expected_name])
         .status();
 }

@@ -4,6 +4,7 @@
 //! [`EffectiveConfig`].
 
 pub mod agent_definition;
+// WI 0142: config-show rows and edit requests as plain data (filled by wire-types-and-dialog-move).
 pub mod agents;
 pub mod builtin_launch;
 pub mod builtin_network;
@@ -24,6 +25,7 @@ pub mod overrides;
 pub mod remote;
 pub mod resolved_builtin;
 pub mod runtime;
+pub mod show;
 pub mod squad;
 pub mod state;
 pub mod tui;

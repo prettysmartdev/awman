@@ -23,7 +23,7 @@ use api_process::RootDaemon;
 static ENV_LOCK: Mutex<()> = Mutex::const_new(());
 
 fn tool_available(bin: &str, arg: &str) -> bool {
-    Command::new(awman::engine::host_cli::program(bin))
+    awman::engine::host_cli::command(&awman::data::config::env::Env::from_process(), bin)
         .arg(arg)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -400,7 +400,7 @@ async fn docker_a_squad_task_env_overlay_value_reaches_its_container() {
         eprintln!("SKIP: git not available");
         return;
     }
-    if !Command::new(awman::engine::host_cli::program("docker"))
+    if !awman::engine::host_cli::command(&awman::data::config::env::Env::from_process(), "docker")
         .args(["pull", "alpine:latest"])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -507,11 +507,12 @@ async fn docker_a_squad_task_env_overlay_value_reaches_its_container() {
         .expect("waiting on the container must succeed");
 
     // Best-effort cleanup; `--rm` normally handles it.
-    let _ = Command::new(awman::engine::host_cli::program("docker"))
-        .args(["rm", "-f", &name])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
+    let _ =
+        awman::engine::host_cli::command(&awman::data::config::env::Env::from_process(), "docker")
+            .args(["rm", "-f", &name])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
 
     let printed = captured.text();
     assert_eq!(exit.exit_code, 0, "the container ran: {printed}");

@@ -22,7 +22,7 @@ pub(crate) fn probe(
     tools: &[&str],
     cache: &mut PhaseToolsCache,
 ) -> PhaseToolsStatus {
-    let process_env = crate::data::config::env::Env::from_process();
+    let process_env = runtime.env();
     if process_env.test_isolation() && !process_env.test_docker() {
         return PhaseToolsStatus::Unknown {
             reason: "test isolation".into(),

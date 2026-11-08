@@ -10,7 +10,7 @@
 //! [`GitEngine::validate_branch_name`] before it reaches a ref, argv or path.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use crate::data::fs::remote_slug::RemoteSlug;
 use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
@@ -222,6 +222,7 @@ pub fn match_pull_request_remote(
 /// Reads pull-request metadata through `gh`, then the GitHub REST API.
 #[derive(Debug, Clone)]
 pub struct PullRequestClient {
+    env: crate::data::config::env::EnvSnapshot,
     gh_command: PathBuf,
     api_base_url: String,
 }
@@ -229,6 +230,7 @@ pub struct PullRequestClient {
 impl Default for PullRequestClient {
     fn default() -> Self {
         Self {
+            env: crate::engine::host_cli::process_env(),
             gh_command: PathBuf::from("gh"),
             api_base_url: "https://api.github.com".to_string(),
         }
@@ -236,11 +238,16 @@ impl Default for PullRequestClient {
 }
 
 impl PullRequestClient {
+    pub fn with_env(mut self, env: crate::data::config::env::EnvSnapshot) -> Self {
+        self.env = env;
+        self
+    }
     /// Test seam: substitute a fake `gh` and a local REST endpoint. Never
     /// reachable from user flags or repository config.
     #[allow(dead_code)] // used only by test builds of the command layer
     pub(crate) fn with_integrations(gh_command: PathBuf, api_base_url: String) -> Self {
         Self {
+            env: crate::engine::host_cli::process_env(),
             gh_command,
             api_base_url,
         }
@@ -265,7 +272,7 @@ impl PullRequestClient {
                 gh_repo_argument(pr)
             ),
         });
-        if let Some(info) = try_gh_cli_with_cmd(&self.gh_command, pr)? {
+        if let Some(info) = try_gh_cli_with_cmd_in(&self.env, &self.gh_command, pr)? {
             return Ok(info);
         }
         let base = self.api_base_url.trim_end_matches('/');
@@ -306,7 +313,8 @@ fn malformed(pr: &PullRequestRef, what: &str) -> EngineError {
 
 /// `gh pr view <N> --repo github.com/<o>/<r> --json headRefName,isCrossRepository,state`.
 /// `Ok(None)` when `gh` cannot be run or exits non-zero (fall back to REST).
-fn try_gh_cli_with_cmd(
+fn try_gh_cli_with_cmd_in(
+    snapshot: &crate::data::config::env::EnvSnapshot,
     gh_command: &Path,
     pr: &PullRequestRef,
 ) -> Result<Option<PullRequestInfo>, EngineError> {
@@ -314,7 +322,7 @@ fn try_gh_cli_with_cmd(
     let repo = gh_repo_argument(pr);
     let mut retries = 0;
     let output = loop {
-        let result = Command::new(gh_command)
+        let result = crate::engine::host_cli::command(snapshot, &gh_command.to_string_lossy())
             .args([
                 "pr",
                 "view",

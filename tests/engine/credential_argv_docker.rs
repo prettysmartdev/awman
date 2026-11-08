@@ -16,7 +16,7 @@
 //! the exact invocation form `docker.rs` produces rather than calling the
 //! `pub(super)` `build_run_argv` (which the integration crate cannot reach).
 
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, SystemTime};
 
 use awman::engine::auth::credential::{
@@ -29,7 +29,7 @@ use crate::helpers::docker_available;
 const IMAGE: &str = "busybox:latest";
 
 fn try_pull(image: &str) -> bool {
-    Command::new(awman::engine::host_cli::program("docker"))
+    awman::engine::host_cli::command(&awman::data::config::env::Env::from_process(), "docker")
         .args(["pull", image])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -42,26 +42,27 @@ fn try_pull(image: &str) -> bool {
 /// `docker.rs` does — the value goes on the child's environment, never argv —
 /// and return the raw bytes the container observed for `$KEY`.
 fn value_seen_inside_container(key: &str, value: &str) -> Vec<u8> {
-    let output = Command::new(awman::engine::host_cli::program("docker"))
-        .args([
-            "run",
-            "--rm",
-            // Name-only `-e KEY`: the exact form `build_run_argv` emits.
-            "-e",
-            key,
-            IMAGE,
-            "sh",
-            "-c",
-            // `printf %s` emits the value with no trailing newline, so the
-            // container's view of the bytes is exact — even for `=`/newline.
-            &format!("printf %s \"${key}\""),
-        ])
-        // The secret only ever lives on the client child's environment.
-        .env(key, value)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .expect("failed to run docker");
+    let output =
+        awman::engine::host_cli::command(&awman::data::config::env::Env::from_process(), "docker")
+            .args([
+                "run",
+                "--rm",
+                // Name-only `-e KEY`: the exact form `build_run_argv` emits.
+                "-e",
+                key,
+                IMAGE,
+                "sh",
+                "-c",
+                // `printf %s` emits the value with no trailing newline, so the
+                // container's view of the bytes is exact — even for `=`/newline.
+                &format!("printf %s \"${key}\""),
+            ])
+            // The secret only ever lives on the client child's environment.
+            .env(key, value)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("failed to run docker");
     assert!(
         output.status.success(),
         "docker run failed: {}",
@@ -134,13 +135,14 @@ fn docker_credential_value_absent_from_proc_cmdline_during_launch() {
 
     // A container that lingers long enough for us to inspect the launching
     // client's cmdline before it exits.
-    let mut child = Command::new(awman::engine::host_cli::program("docker"))
-        .args(["run", "--rm", "-e", key, IMAGE, "sleep", "3"])
-        .env(key, value)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("failed to spawn docker");
+    let mut child =
+        awman::engine::host_cli::command(&awman::data::config::env::Env::from_process(), "docker")
+            .args(["run", "--rm", "-e", key, IMAGE, "sleep", "3"])
+            .env(key, value)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("failed to spawn docker");
 
     let pid = child.id();
     let cmdline_path = format!("/proc/{pid}/cmdline");
@@ -226,10 +228,11 @@ fn docker_file_delivered_credential_secret_is_only_in_staged_file() {
         "the staged path is permitted only as a -v mount argument"
     );
 
-    let output = Command::new(awman::engine::host_cli::program("docker"))
-        .args(&args)
-        .output()
-        .expect("run docker");
+    let output =
+        awman::engine::host_cli::command(&awman::data::config::env::Env::from_process(), "docker")
+            .args(&args)
+            .output()
+            .expect("run docker");
     assert!(
         output.status.success(),
         "docker run failed: {}",

@@ -214,45 +214,7 @@ pub enum YoloTickOutcome {
     AdvanceNow,
 }
 
-/// Why a countdown reported through the `yolo_countdown_*` hooks is running.
-///
-/// The two share one reporting channel deliberately — an unattended frontend
-/// surfaces both the same way (WI-0115 §3) — but they mean opposite things to
-/// whoever is reading, so the frontend is told which it is rather than left to
-/// assume the common one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum CountdownKind {
-    /// A step's container has gone quiet; when the countdown expires the
-    /// engine kills it and advances to the next step.
-    #[default]
-    StuckStep,
-    /// A step's container exited non-zero and no one can be asked what to do;
-    /// when the countdown expires the engine retries that same step.
-    FailureRetry,
-    /// The step's agent said it has finished (it reported `done`, or `idle`:
-    /// its turn ended). When the countdown expires the engine kills the
-    /// container and advances, exactly like `StuckStep` expiry; on the last
-    /// step that completes the workflow. A `working` report or the container
-    /// exiting first cancels it. Short: [`agent_done_countdown_duration`].
-    /// Reader-facing label: "Agent reported done: advancing in 8s".
-    ///
-    /// [`agent_done_countdown_duration`]: crate::engine::workflow::timing::agent_done_countdown_duration
-    AgentDone,
-    /// The step's agent is waiting for an answer (it reported `blocked` on a
-    /// permission, a question or a login) and no one is there to give it.
-    /// When the countdown expires the engine kills the container and
-    /// **fails** the step, which then takes the normal unattended failure
-    /// path (one retry, then the workflow fails). Never an advance.
-    /// Reader-facing label: "Agent is waiting for input: failing step in 42s".
-    AgentBlocked,
-    /// The step's agent reported an `error`. When the countdown expires the
-    /// engine kills the container and **fails** the step, so `on_failure`
-    /// remediation and the `FailureRetry` path apply. Any new output or a
-    /// `working` report first cancels it (the agent recovered). Never an
-    /// advance. Reader-facing label: "Agent reported an error: failing step
-    /// in 42s".
-    AgentError,
-}
+pub use crate::data::workflow_state::CountdownKind;
 
 /// What `step_once` returned: the step that just executed plus its outcome.
 #[derive(Debug, Clone, PartialEq, Eq)]

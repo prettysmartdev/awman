@@ -15,14 +15,17 @@ use crate::frontend::tui::tabs::Tab;
 /// content and scrollback.
 pub(super) fn handle_container_scroll(tab: &mut Tab, is_up: bool) {
     // ACP windows scroll their rendered update list, not a vt100 scrollback.
-    if let Some(state) = tab.focused_slot().and_then(|s| s.acp_state().cloned()) {
-        if let Ok(mut s) = state.lock() {
-            let max = s.history.len();
-            if is_up {
-                s.scroll_offset = (s.scroll_offset + 3).min(max);
-            } else {
-                s.scroll_offset = s.scroll_offset.saturating_sub(3);
-            }
+    // The offset is this view's own state; the shared feed only supplies
+    // the history length it is clamped to.
+    if let Some(slot) = tab.focused_slot_mut().filter(|s| s.is_acp()) {
+        let max = slot
+            .acp_state()
+            .and_then(|state| state.lock().ok().map(|s| s.history.len()))
+            .unwrap_or(0);
+        if is_up {
+            slot.acp_scroll_offset = (slot.acp_scroll_offset + 3).min(max);
+        } else {
+            slot.acp_scroll_offset = slot.acp_scroll_offset.saturating_sub(3);
         }
         return;
     }

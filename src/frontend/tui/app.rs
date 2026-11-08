@@ -1,21 +1,25 @@
 //! Application state — the central TUI state object.
 //!
-//! `App` stores UI state only. All command execution delegates to `Dispatch`
-//! and the per-command frontend trait chain.
+//! `App` stores UI state only. Command execution and instance state (sessions,
+//! command threads, the squad gateway) go through the Layer 2 `InstanceBackend`,
+//! which builds every command through `Dispatch`
+//! and the per-command frontend trait chain (WI 0142 §5).
 
 use std::sync::Arc;
 
-use crate::command::commands::squad::supervisor::DaemonResolver;
 use crate::command::dispatch::catalogue::CommandCatalogue;
 use crate::command::dispatch::parsed_input::ParsedCommandBoxInput;
-use crate::command::dispatch::{CommandOutcome, Dispatch, Engines};
-use crate::command::error::CommandError;
-use crate::command::git_summary::GitSummaryPoller;
+use crate::command::dispatch::Engines;
+use crate::command::instance::backend::InstanceBackend;
+use crate::command::instance::local::LocalInstanceBackend;
+use crate::command::instance::{
+    CloseTabOutcome, InstanceParts, OpenTabRequest, StartupRun, SubmitRequest, SubmittedCommand,
+};
 use crate::command::stats_sampler::{ContainerStatsSampler, StatsRequest, StatsTarget};
 use crate::data::config::env::Env;
 use crate::data::session::{Session, SessionId};
 use crate::data::session_manager::SessionManager;
-use crate::frontend::tui::command_frontend::{DialogChannels, TuiCommandFrontend};
+use crate::frontend::tui::command_frontend::TuiPresentation;
 use crate::frontend::tui::dialogs::{Dialog, DialogRequest, DialogResponse};
 use crate::frontend::tui::tabs::{ExecutionPhase, Tab};
 use crate::frontend::tui::text_edit::TextEdit;
@@ -36,17 +40,12 @@ pub struct StatusBar {
     pub notice: Option<String>,
 }
 
-/// The outcome of the pre-event-loop squad tab build (`awman squad`).
-pub enum SquadTabStart {
-    Ready(Box<SquadTabBuild>),
-}
-
 /// A live squad gateway, as Layer 2 reports it.
 pub use crate::command::commands::squad::supervisor::{
     SquadStartError, SquadStartup, SquadStartupResult,
 };
 
-/// Everything [`App::build_squad_tab`] produces.
+/// Everything [`App::assemble_squad_tab`] produces.
 pub struct SquadTabBuild {
     pub tab: Tab,
     pub gateway: Arc<dyn crate::command::commands::squad::gateway::TaskGateway>,
@@ -56,11 +55,18 @@ pub struct SquadTabBuild {
 /// `DialogRequest::TerminalRelease`).
 #[derive(Debug)]
 pub enum TerminalOp {
-    Release { title: String },
+    /// `terminal_id` names the hub terminal a daemon-hosted host process
+    /// runs in; the event loop bridges the real terminal to it.
+    Release {
+        title: String,
+        terminal_id: Option<crate::data::ids::TerminalId>,
+    },
     Restore,
 }
 
-/// Central TUI state. Contains NO business logic — only UI state.
+/// Central TUI state. Contains NO business logic — only UI state. Instance
+/// state (sessions, command threads, the squad gateway) lives behind the
+/// Layer 2 [`InstanceBackend`] facade (WI 0142 §5).
 pub struct App {
     pub tabs: Vec<Tab>,
     pub active_tab: usize,
@@ -70,8 +76,8 @@ pub struct App {
     pub(super) pending_dialog_requests: std::collections::HashMap<SessionId, DialogRequest>,
     pub focus: Focus,
     pub catalogue: &'static CommandCatalogue,
-    pub engines: Engines,
-    pub session_manager: Arc<SessionManager>,
+    /// The instance this TUI presents (builtin: in-process).
+    pub backend: Arc<dyn InstanceBackend>,
     pub command_input: TextEdit,
     pub suggestion_row: Vec<String>,
     pub input_error: Option<String>,
@@ -84,11 +90,6 @@ pub struct App {
     /// event loop performs it and answers.
     pub terminal_op: Option<TerminalOp>,
     pub runtime_handle: tokio::runtime::Handle,
-    /// Gateway for the singleton squad tab, obtained from
-    /// `DaemonResolver::ensure_running()` when the tab is opened. Injected into
-    /// `Dispatch` for `squad` in-tab actions so they reach the daemon. `None`
-    /// until the squad tab exists.
-    pub squad_gateway: Option<Arc<dyn crate::command::commands::squad::gateway::TaskGateway>>,
     /// A squad daemon start that is running on the tokio runtime, waiting for
     /// the daemon to publish its endpoint. `Some` only between the user
     /// accepting the daemon-start confirmation and
@@ -105,10 +106,13 @@ pub struct App {
     /// command box, without every tab-switching path having to know.
     pub last_active_tab: usize,
     /// Squad daemon health for the bottom-row indicator (WI 0112). Written by
-    /// the app-level `SquadIndicatorPoller` started in `tui::run`; read by
+    /// the instance's `SquadIndicatorPoller` started in `tui::run`; read by
     /// the renderer. Starts `Unknown` and stays so in unit tests, which never
     /// start the poller.
     pub squad_indicator: crate::frontend::tui::squad_indicator::SharedSquadIndicator,
+    /// Window-management requests, claims and engine loss (WI 0142); the
+    /// renderer asks it how claimed windows draw.
+    pub remote_view: crate::frontend::tui::remote_tab::RemoteTabView,
 }
 
 impl App {
@@ -119,24 +123,48 @@ impl App {
         initial_tab: Tab,
         runtime_handle: tokio::runtime::Handle,
     ) -> Self {
-        let stats_sampler =
-            ContainerStatsSampler::new(engines.runtime.clone(), runtime_handle.clone());
-        // `App` accepts a pre-built tab for rendering, but the manager owns
+        let backend = Self::local_backend(catalogue, engines, session_manager, &runtime_handle);
+        Self::with_backend(backend, initial_tab, runtime_handle)
+    }
+
+    /// The builtin engine: an in-process instance over this process's
+    /// `Engines`, with the TUI's presentation hooks. Squad operations re-read
+    /// the process environment each time, as the TUI always did.
+    pub fn local_backend(
+        catalogue: &'static CommandCatalogue,
+        engines: Engines,
+        session_manager: Arc<SessionManager>,
+        runtime_handle: &tokio::runtime::Handle,
+    ) -> Arc<dyn InstanceBackend> {
+        LocalInstanceBackend::open(InstanceParts {
+            catalogue,
+            engines,
+            session_manager,
+            runtime: runtime_handle.clone(),
+            env: Arc::new(Env::from_process),
+            presentation: Arc::new(TuiPresentation),
+        })
+    }
+
+    /// Present `backend`'s instance, starting with `initial_tab`.
+    pub fn with_backend(
+        backend: Arc<dyn InstanceBackend>,
+        initial_tab: Tab,
+        runtime_handle: tokio::runtime::Handle,
+    ) -> Self {
+        let stats_sampler = backend.stats_sampler();
+        // `App` accepts a pre-built tab for rendering, but the instance owns
         // the Session object. This also covers the synthetic squad tab.
-        if session_manager.get(&initial_tab.session_id).is_none() {
-            session_manager
-                .create(initial_tab.session.clone())
-                .expect("initial tab session id must be unique");
-        }
+        backend.adopt_session(&initial_tab.session);
+        let squad_indicator = backend.squad_health();
         Self {
             tabs: vec![initial_tab],
             active_tab: 0,
             active_dialog: None,
             pending_dialog_requests: std::collections::HashMap::new(),
             focus: Focus::CommandBox,
-            catalogue,
-            engines,
-            session_manager,
+            catalogue: backend.catalogue(),
+            backend,
             command_input: TextEdit::new(false),
             suggestion_row: Vec::new(),
             input_error: None,
@@ -147,13 +175,11 @@ impl App {
             command_dialog_deadline: None,
             terminal_op: None,
             runtime_handle,
-            squad_gateway: None,
             squad_startup_rx: None,
             stats_sampler,
             last_active_tab: 0,
-            squad_indicator: Arc::new(std::sync::Mutex::new(
-                crate::engine::squad::SquadHealth::Unknown,
-            )),
+            squad_indicator,
+            remote_view: crate::frontend::tui::remote_tab::RemoteTabView::new(),
         }
     }
 
@@ -180,6 +206,9 @@ impl App {
                 .is_some_and(|tab| tab.is_squad)
         {
             self.focus = Focus::CommandBox;
+        }
+        if let Some(tab) = self.tabs.get(self.active_tab) {
+            self.backend.focus_hint(&tab.session_id);
         }
         self.last_active_tab = self.active_tab;
     }
@@ -209,10 +238,14 @@ impl App {
     }
 
     pub fn close_active_tab(&mut self) {
-        // A closing tab's dashboard watch or attach session has nowhere left
-        // to draw; end it rather than leave it polling in the background.
-        self.active_tab().shared.command_cancel.cancel();
-        if self.tabs.len() <= 1 {
+        // The instance cancels the command it runs in this tab (a dashboard
+        // watch or attach session included, which has nowhere left to draw),
+        // drops the tab from its order and, for the last tab, ends itself.
+        // The view list below is ours.
+        let outcome = self.backend.close_tab(&self.active_tab().session_id);
+        // An ended instance admits nothing more, so its last-tab policy
+        // decides the quit as much as our own view list does.
+        if outcome == CloseTabOutcome::ClosedLastTab || self.tabs.len() <= 1 {
             self.should_quit = true;
             return;
         }
@@ -247,11 +280,11 @@ impl App {
         // The runtime refusal comes first: a sandbox-class runtime cannot back
         // squad at all, so asking whether to start a daemon would be asking a
         // question whose "yes" could not be honoured.
-        if let Err(error) = DaemonResolver::admit_runtime(&self.engines) {
+        if let Err(error) = self.backend.squad_admission() {
             self.status_bar.text = error.to_string();
             return;
         }
-        match Self::squad_daemon_is_running() {
+        match self.backend.squad_daemon_is_running() {
             Ok(true) => self.build_and_install_squad_tab(),
             Ok(false) => {
                 self.active_dialog = Some(Dialog::SquadStartConfirm);
@@ -262,14 +295,6 @@ impl App {
             // whose error text is the specific one worth showing.
             Err(_) => self.build_and_install_squad_tab(),
         }
-    }
-
-    /// Whether a squad daemon is already running for this squad root. Starts
-    /// nothing and writes nothing — see [`DaemonResolver::daemon_is_running`].
-    ///
-    /// [`DaemonResolver::daemon_is_running`]: crate::command::commands::squad::supervisor::DaemonResolver::daemon_is_running
-    fn squad_daemon_is_running() -> Result<bool, crate::command::error::CommandError> {
-        DaemonResolver::from_env(&Env::from_process())?.daemon_is_running()
     }
 
     /// Start the squad tab and install it as the active tab, starting the
@@ -300,18 +325,13 @@ impl App {
         // The runtime refusal is synchronous and immediate — there is nothing
         // to wait for — so it is reported without ever showing a "Starting…"
         // modal the user would watch fail.
-        if let Err(error) = DaemonResolver::admit_runtime(&self.engines) {
+        if let Err(error) = self.backend.squad_admission() {
             self.status_bar.text = error.to_string();
             self.needs_redraw = true;
             return;
         }
 
-        let (tx, rx) = std::sync::mpsc::channel();
-        let engines = self.engines.clone();
-        self.runtime_handle.spawn(async move {
-            let _ = tx.send(Self::ensure_squad_gateway(engines).await);
-        });
-        self.squad_startup_rx = Some(rx);
+        self.squad_startup_rx = Some(self.backend.start_squad_gateway());
         self.active_dialog = Some(Dialog::Loading {
             title: "Starting the awman daemon".to_string(),
         });
@@ -345,11 +365,20 @@ impl App {
         }
         self.needs_redraw = true;
 
-        match result.and_then(|startup| Self::assemble_squad_tab(startup, &self.runtime_handle)) {
+        // `open_squad_session` registers the squad tab with the instance, as
+        // the startup squad path does.
+        let built = result.and_then(|startup| {
+            let session = self.backend.open_squad_session()?;
+            Ok(Self::assemble_squad_tab(
+                session,
+                startup.gateway,
+                &self.runtime_handle,
+            ))
+        });
+        match built {
             Ok(build) => {
-                self.squad_gateway = Some(build.gateway);
-                self.tabs.push(build.tab);
-                self.active_tab = self.tabs.len() - 1;
+                self.backend.set_squad_gateway(build.gateway);
+                self.active_tab = self.push_tab(build.tab);
             }
             Err(error) => self.report_squad_start_failure(&error),
         }
@@ -370,72 +399,16 @@ impl App {
         });
     }
 
-    /// Build the singleton squad tab: ensure the daemon is running, obtain a
-    /// gateway, construct the synthetic-session tab, and start its poller.
-    /// Shared by [`App::open_or_focus_squad_tab`] and `tui::run`'s
-    /// `InitialTab::Squad` path. On failure returns the specific error text
-    /// (naming `awman api` or the sandbox runtime), never a generic message.
-    pub(crate) fn build_squad_tab(
-        engines: &crate::command::dispatch::Engines,
+    /// Turn a squad session and gateway into the squad tab: the tab itself
+    /// and its task-list poller (a Layer 3 view over the `TaskGateway`). Pure
+    /// local work — nothing here waits on the daemon, so it is safe to run on
+    /// the event-loop thread. Shared by [`App::poll_squad_startup`] and
+    /// `tui::run`'s `InitialTab::Squad` path.
+    pub(crate) fn assemble_squad_tab(
+        session: Session,
+        gateway: Arc<dyn crate::command::commands::squad::gateway::TaskGateway>,
         runtime_handle: &tokio::runtime::Handle,
-    ) -> Result<SquadTabStart, SquadStartError> {
-        // A sandbox-class runtime cannot back squad: report the runtime error,
-        // never a generic connection failure.
-        DaemonResolver::admit_runtime(engines)?;
-
-        // `ensure_squad_gateway` is async, but the caller may be on a tokio
-        // worker thread where `Handle::block_on` would panic. Drive it on the
-        // runtime and block on the result channel instead
-        // (see /awman/context/workflow/deviations.md, D-tui-3).
-        //
-        // Blocking here is only tolerable because this path runs *before* the
-        // event loop exists (bare `awman squad`). Once the TUI is up, the
-        // daemon-start confirmation uses `build_and_install_squad_tab`, which
-        // waits on the runtime instead of freezing the screen.
-        let (tx, rx) = std::sync::mpsc::channel();
-        let owned_engines = engines.clone();
-        runtime_handle.spawn(async move {
-            let _ = tx.send(Self::ensure_squad_gateway(owned_engines).await);
-        });
-        let startup = match rx.recv() {
-            Ok(result) => result,
-            Err(_) => Err(SquadStartError::Other(
-                "squad daemon startup was interrupted".to_string(),
-            )),
-        };
-        match startup {
-            Ok(startup) => Self::assemble_squad_tab(startup, runtime_handle)
-                .map(|build| SquadTabStart::Ready(Box::new(build))),
-            Err(error) => Err(error),
-        }
-    }
-
-    /// Ensure a squad daemon is running and return a gateway to it, together
-    /// with what this process can authenticate to it with.
-    ///
-    /// This is the whole waiting half of opening the squad tab, and the only
-    /// half that is async. The caller decides how to wait for it: on the
-    /// runtime (the TUI's daemon-start confirmation) or by blocking
-    /// (`build_squad_tab`, before there is an event loop to freeze).
-    pub(crate) async fn ensure_squad_gateway(
-        engines: crate::command::dispatch::Engines,
-    ) -> SquadStartupResult {
-        DaemonResolver::open_from_env(&Env::from_process(), &engines).await
-    }
-
-    /// Turn a live startup into the squad tab: the squad-root session, the tab
-    /// itself, and its task-list poller. Pure local work — nothing here waits
-    /// on the daemon, so it is safe to run on the event-loop thread.
-    fn assemble_squad_tab(
-        startup: SquadStartup,
-        runtime_handle: &tokio::runtime::Handle,
-    ) -> Result<SquadTabBuild, SquadStartError> {
-        let session = Session::open_squad_root(&Env::from_process()).map_err(|error| {
-            SquadStartError::Other(format!("failed to open squad tab: {error}"))
-        })?;
-
-        let gateway = startup.gateway;
-
+    ) -> SquadTabBuild {
         let mut tab = Tab::new_squad(session);
         {
             // Ensure a runtime context so the poller's `tokio::spawn` works even
@@ -457,116 +430,67 @@ impl App {
                 .expect("new_squad always installs squad state")
                 .set_poll_handle(handle);
         }
-        Ok(SquadTabBuild { tab, gateway })
+        SquadTabBuild { tab, gateway }
     }
 
-    /// Spawn a parsed command as an async tokio task, wiring up all channels
-    /// between the event loop and the command thread.
+    /// Submit a parsed command into the active tab. The instance builds and
+    /// spawns it (channels, command frontend, `Dispatch`, command thread —
+    /// `EngineInstance::submit`) and cancels whatever the tab was running;
+    /// this resets the tab's view for the new command and binds the returned
+    /// feeds to it.
     pub fn spawn_command(&mut self, parsed: ParsedCommandBoxInput) {
-        let path_refs: Vec<&str> = parsed.path.iter().map(String::as_str).collect();
-        if let Err(error) =
-            Dispatch::<TuiCommandFrontend>::validate_runtime_admission(&self.engines, &path_refs)
-        {
+        if let Err(error) = self.backend.admit(&parsed.path) {
             self.status_bar.text = error.to_string();
             return;
         }
 
-        // Capture the runtime class before borrowing the tab mutably: a
-        // sandbox-class runtime (e.g. docker-sbx-experimental) labels the
-        // overlay "(sandboxed)" rather than "(containerized)".
-        let sandboxed = self.engines.is_sandboxed();
         self.clear_active_tab_for_new_command();
-        let tab = self.active_tab_mut();
-
-        // Dialog channels (std::sync::mpsc — command thread blocks on recv).
-        let (dialog_req_tx, dialog_req_rx) = std::sync::mpsc::channel::<DialogRequest>();
-        let (dialog_resp_tx, dialog_resp_rx) = std::sync::mpsc::channel::<DialogResponse>();
-
-        // Container I/O channels — tokio mpsc throughout so the engine PTY
-        // bridge can use them from async tasks. The TUI keeps a clone of the
-        // stdin sender (for user keystrokes) and the engine receives both
-        // sender and receiver for the PTY bridge plus inject_prompt.
-        let (stdout_tx, stdout_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-        let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-        let stdin_tx_for_engine = stdin_tx.clone();
-        let (resize_tx, resize_rx) = tokio::sync::mpsc::unbounded_channel::<(u16, u16)>();
-
-        // Command result channel.
-        let (result_tx, result_rx) =
-            std::sync::mpsc::channel::<Result<CommandOutcome, CommandError>>();
-
-        let initial_size = initial_pty_size(tab.git_sidebar_state);
-
-        let container_io = crate::engine::agent_runtime::frontend::AgentIo {
-            stdout: stdout_tx.clone(),
-            stderr: stdout_tx,
-            stdin_tx: stdin_tx_for_engine,
-            stdin_rx,
-            resize: Some(resize_rx),
-            initial_size: Some(initial_size),
+        let tab = self.active_tab();
+        let initial_size = initial_pty_size(terminal_size(), tab.git_sidebar_state);
+        let squad_attach =
+            tab.squad
+                .as_ref()
+                .map(|state| crate::command::instance::feeds::SharedSquadAttach {
+                    session: state.attach_session.clone(),
+                    daemon_reachable: state.daemon_reachable.clone(),
+                });
+        let request = SubmitRequest {
+            session_id: tab.session_id,
+            parsed,
+            feeds: tab.shared(),
+            pty_size: initial_size,
+            squad_attach,
         };
-
-        // Build the TUI frontend. Workflow + yolo overlays share the same
-        // `Arc<Mutex<...>>` between the engine-side frontend impl and the
-        // renderer.
-        let attach_context = tab
-            .squad
-            .as_ref()
-            .map(|state| (state.attach_session.clone(), state.daemon_reachable.clone()));
-        let frontend = TuiCommandFrontend::new(
-            parsed.clone(),
-            DialogChannels::new(dialog_req_tx, dialog_resp_rx),
-            container_io,
-            tab.shared(),
-        )
-        .with_squad_attach_context(
-            attach_context.as_ref().map(|(session, _)| session.clone()),
-            attach_context.map(|(_, reachable)| reachable),
-        );
-
-        tab.command_result_rx = Some(result_rx);
-        tab.dialog_request_rx = Some(dialog_req_rx);
-        tab.dialog_response_tx = Some(dialog_resp_tx);
-
-        let command_name = parsed.path.join(" ");
-
-        // Build the dispatch before drawing anything: what the tab shows
-        // while the command runs — the overlay's agent name, the unattended
-        // indicator — is a Layer 2 answer, read off `launch_display` rather
-        // than recomputed here from flag names.
-        let session_id = self.active_tab().session_id;
-        let session = match self.session_manager.get(&session_id) {
-            Some(session) => session,
-            None => {
-                // Test and extension callers may install a prebuilt Tab
-                // directly. Normalize that legacy construction at the
-                // ownership boundary before dispatching against it.
-                self.session_manager
-                    .create(self.active_tab().session.clone())
-                    .expect("tab session id must be unique");
-                self.session_manager
-                    .get(&session_id)
-                    .expect("registered tab session must be retrievable")
+        let submitted = match self.backend.submit(request) {
+            Ok(submitted) => submitted,
+            Err(error) => {
+                self.status_bar.text = error.to_string();
+                return;
             }
         };
-        let engines = self.engines.clone();
-        let path_owned: Vec<String> = parsed.path.clone();
-        let session_for_state = Arc::clone(&session);
-        let mut dispatch = Dispatch::new(frontend, session, engines);
-        // WI 0102: in-tab `squad` actions reach the daemon through the same
-        // gateway the CLI subcommands use. It is offered for every command;
-        // the catalogue's `gateway_need` decides which ones receive it, so
-        // the TUI no longer keys the injection on the command's name
-        // (WI 0114 F-15).
-        if let Some(gateway) = self.squad_gateway.clone() {
-            dispatch = dispatch.with_task_gateway(gateway);
-        }
-        let display = {
-            let path_refs: Vec<&str> = path_owned.iter().map(String::as_str).collect();
-            dispatch.launch_display(&path_refs)
-        };
+        let idx = self.active_tab;
+        self.bind_submitted(idx, submitted, initial_size);
+    }
 
-        let tab = self.active_tab_mut();
+    /// Bind a tab's startup run (the instance chose and started it) to the
+    /// tab view at `idx`. `pty_size` is the size the tab was opened with.
+    pub fn bind_startup(&mut self, idx: usize, startup: StartupRun, pty_size: (u16, u16)) {
+        match startup {
+            StartupRun::NotStarted => {}
+            StartupRun::Started(submitted) => self.bind_submitted(idx, submitted, pty_size),
+            StartupRun::Refused(error) => self.status_bar.text = error.to_string(),
+        }
+    }
+
+    /// Bind a submitted command's feeds to the tab view at `idx`.
+    fn bind_submitted(&mut self, idx: usize, submitted: SubmittedCommand, size: (u16, u16)) {
+        let Some(tab) = self.tabs.get_mut(idx) else {
+            return;
+        };
+        tab.command_result_rx = Some(submitted.feeds.command_result_rx);
+        tab.dialog_request_rx = Some(submitted.feeds.dialog_request_rx);
+        tab.dialog_response_tx = Some(submitted.feeds.dialog_response_tx);
+        tab.reported_pty_size = Some(size);
 
         // Install the command's container slot (the N==1 case of the unified
         // slot model), replacing any slots from the previous command. Its
@@ -574,40 +498,21 @@ impl App {
         // elapsed time before the engine reports the actual container name;
         // the parser starts at the computed overlay size so agents never lay
         // out against an 80x24 default.
+        let display = submitted.display;
         tab.start_container(
             display.agent_display_name.clone(),
             String::new(),
-            initial_size.0,
-            initial_size.1,
+            size.0,
+            size.1,
         );
         if let Some(slot) = tab.focused_slot_mut() {
-            slot.bind_io(crate::frontend::tui::tabs::ContainerSlotIo {
-                stdout_rx,
-                stdin_tx,
-                resize_tx,
-            });
+            slot.bind_io(submitted.slot_io);
             if let Some(info) = slot.container_info.as_mut() {
-                info.sandboxed = sandboxed;
+                info.sandboxed = submitted.sandboxed;
             }
         }
         tab.suppress_container_auto_open = false;
         tab.yolo_mode = display.unattended;
-
-        // Record the start on the session rather than on the tab: the tab's
-        // `execution_phase` is derived from `SessionState` each tick (Q3,
-        // WI 0114 F-22). `Dispatch::run_command` records the same start on the
-        // command thread; doing it here too, synchronously, means the tab
-        // never renders an idle frame in between. `begin_command` is
-        // idempotent for the same command, so the second write is a no-op.
-        if let Ok(mut guard) = session_for_state.try_write() {
-            guard.state_mut().begin_command(command_name, Vec::new());
-        }
-
-        self.runtime_handle.spawn(async move {
-            let path_refs: Vec<&str> = path_owned.iter().map(String::as_str).collect();
-            let result = dispatch.run_command(&path_refs).await;
-            let _ = result_tx.send(result);
-        });
     }
 
     /// Reset the active tab's per-command view state so a new command starts
@@ -629,26 +534,56 @@ impl App {
         tab.engine_tx = None;
     }
 
-    /// Open and register a directory session, then create its tab view.
+    /// The agent-window PTY size a new directory tab (git sidebar closed)
+    /// opens with on the current terminal.
+    pub fn new_tab_pty_size() -> (u16, u16) {
+        initial_pty_size(
+            terminal_size(),
+            crate::frontend::tui::git_sidebar::GitSidebarState::Closed,
+        )
+    }
+
+    /// Open a directory tab through the instance — which registers it and
+    /// starts its startup command — then create its view and bind that run.
     pub fn add_tab(
         &mut self,
         dir: std::path::PathBuf,
         opts: crate::data::session::SessionOpenOptions,
-    ) -> Result<usize, crate::data::error::DataError> {
-        let session_id = self.session_manager.open_or_create(dir, opts)?;
-        let session = self
-            .session_manager
-            .get(&session_id)
-            .expect("newly-created session must be registered")
-            .try_read()
-            .expect("newly-created session must not be locked")
-            .clone();
-        let tab = Tab::new_with_git_summary(
-            session,
-            GitSummaryPoller::new(self.engines.git_engine.clone()),
-        );
+    ) -> Result<usize, crate::command::error::CommandError> {
+        let pty_size = Self::new_tab_pty_size();
+        let opened = self.backend.open_tab(OpenTabRequest {
+            dir,
+            options: opts,
+            pty_size,
+        })?;
+        let (tab, startup) = Tab::from_opened(opened);
         self.tabs.push(tab);
-        Ok(self.tabs.len() - 1)
+        let idx = self.tabs.len() - 1;
+        self.bind_startup(idx, startup, pty_size);
+        Ok(idx)
+    }
+
+    /// Add a tab view the presenter built itself (the squad tab, test
+    /// fixtures), registering its session with the instance first.
+    pub fn push_tab(&mut self, tab: Tab) -> usize {
+        self.backend.adopt_session(&tab.session);
+        self.tabs.push(tab);
+        self.tabs.len() - 1
+    }
+
+    /// Report each tab's current agent-window PTY size to the instance when
+    /// it changed (terminal resize, git sidebar toggle). D8: the frontend
+    /// chooses the size, and the instance starts every later launch in the
+    /// tab — a workflow step, a parallel peer, an attach — at it.
+    fn report_pty_sizes(&mut self) {
+        let terminal = terminal_size();
+        for tab in &mut self.tabs {
+            let size = initial_pty_size(terminal, tab.git_sidebar_state);
+            if tab.reported_pty_size != Some(size) {
+                self.backend.resize_tab(&tab.session_id, size);
+                tab.reported_pty_size = Some(size);
+            }
+        }
     }
 
     /// Tick all tabs: drain container output, poll for command completion,
@@ -667,6 +602,10 @@ impl App {
         self.drain_stats_samples();
         self.request_stats_round();
         self.refresh_yolo_countdown_dialog();
+        self.report_pty_sizes();
+        // Last, so the window-management transitions of this tick are
+        // reported and engine events land before the next frame.
+        crate::frontend::tui::remote_tab::RemoteTabView::sync(self);
     }
 
     /// Advance every tab: adopt its session's state, drain its container and
@@ -683,13 +622,8 @@ impl App {
         // (decision Q3, WI 0114 F-22). `try_read` rather than `read`: the tick
         // is synchronous, a command thread may hold the write lock, and one
         // skipped frame is invisible at a ~16ms tick.
-        let session_manager = Arc::clone(&self.session_manager);
         for tab in self.tabs.iter_mut() {
-            let Some(managed) = session_manager.get(&tab.session_id) else {
-                continue;
-            };
-            let snapshot = managed.try_read().ok().map(|guard| guard.clone());
-            if let Some(session) = snapshot {
+            if let Some(session) = self.backend.session_snapshot(&tab.session_id) {
                 tab.refresh_from_session(&session);
             }
         }
@@ -968,7 +902,7 @@ impl App {
     /// Pick up notices from a runtime that opened after startup (a deferred
     /// builtin backend whose first open was retried by a later command).
     pub fn poll_runtime_notices(&mut self) {
-        let notices = self.engines.take_runtime_notices();
+        let notices = self.backend.take_runtime_notices();
         self.show_runtime_notices(notices);
     }
 
@@ -1021,8 +955,8 @@ impl App {
                 },
                 // The event loop owns the terminal: park the operation for it
                 // and let it answer once the screen has changed.
-                DialogRequest::TerminalRelease { title } => {
-                    self.terminal_op = Some(TerminalOp::Release { title });
+                DialogRequest::TerminalRelease { title, terminal_id } => {
+                    self.terminal_op = Some(TerminalOp::Release { title, terminal_id });
                     return;
                 }
                 DialogRequest::TerminalRestore => {
@@ -1118,7 +1052,7 @@ impl App {
                 }
                 DialogRequest::Loading { title } => Dialog::Loading { title },
                 DialogRequest::Custom { title, body, keys } => Dialog::Custom { title, body, keys },
-                DialogRequest::Review(state) => Dialog::Review(state),
+                DialogRequest::Review(state) => Dialog::Review(state.into()),
                 DialogRequest::KeySetupNotice {
                     title,
                     body,
@@ -1244,18 +1178,24 @@ pub(crate) fn stats_poll_targets(tab: &Tab) -> Vec<(String, StatsTarget)> {
 /// size cannot be read at all. One of `spawn_command`'s labelled sections,
 /// lifted out by WI 0114 F-51.
 fn initial_pty_size(
+    terminal: Option<(u16, u16)>,
     git_sidebar_state: crate::frontend::tui::git_sidebar::GitSidebarState,
 ) -> (u16, u16) {
-    match crossterm::terminal::size() {
-        Ok((cols, rows)) => {
+    match terminal {
+        Some((cols, rows)) => {
             let sidebar = crate::frontend::tui::git_sidebar::sidebar_width(cols, git_sidebar_state);
             crate::frontend::tui::event_loop::compute_container_inner_size(
                 cols.saturating_sub(sidebar),
                 rows,
             )
         }
-        Err(_) => (80u16, 24u16),
+        None => (80u16, 24u16),
     }
+}
+
+/// This process's terminal size, the input to every PTY-size decision.
+fn terminal_size() -> Option<(u16, u16)> {
+    crossterm::terminal::size().ok()
 }
 
 #[cfg(test)]
@@ -1346,7 +1286,7 @@ mod tests {
     #[test]
     fn switch_to_next_tab_wraps_around() {
         let mut app = make_app();
-        app.tabs.push(Tab::new(make_test_session()));
+        app.push_tab(Tab::new(make_test_session()));
         app.active_tab = 1;
         app.switch_to_next_tab();
         assert_eq!(app.active_tab, 0, "next tab from last must wrap to first");
@@ -1355,7 +1295,7 @@ mod tests {
     #[test]
     fn switch_to_prev_tab_wraps_around() {
         let mut app = make_app();
-        app.tabs.push(Tab::new(make_test_session()));
+        app.push_tab(Tab::new(make_test_session()));
         app.active_tab = 0;
         app.switch_to_prev_tab();
         assert_eq!(app.active_tab, 1, "prev tab from first must wrap to last");
@@ -1364,7 +1304,7 @@ mod tests {
     #[test]
     fn switch_to_next_advances_index() {
         let mut app = make_app();
-        app.tabs.push(Tab::new(make_test_session()));
+        app.push_tab(Tab::new(make_test_session()));
         app.active_tab = 0;
         app.switch_to_next_tab();
         assert_eq!(app.active_tab, 1);
@@ -1381,7 +1321,7 @@ mod tests {
     #[test]
     fn close_active_tab_with_multiple_tabs_removes_tab() {
         let mut app = make_app();
-        app.tabs.push(Tab::new(make_test_session()));
+        app.push_tab(Tab::new(make_test_session()));
         assert_eq!(app.tabs.len(), 2);
         app.close_active_tab();
         assert_eq!(app.tabs.len(), 1);
@@ -1909,7 +1849,7 @@ mod tests {
             &mut app,
             vec![crate::frontend::tui::dialogs::ConfigShowRow {
                 shape: crate::command::commands::config::ConfigRowKind::MapHeader {
-                    child_prefix: "demo.map.",
+                    child_prefix: "demo.map.".into(),
                 },
                 read_only: true,
                 ..config_show_row("demo.map")
@@ -1991,7 +1931,7 @@ mod tests {
         let mut replacement = Tab::new(make_test_session());
         replacement.start_container("claude".into(), "same-name".into(), 80, 24);
         let other = replacement.shared.command_cancel.clone();
-        app.tabs.push(replacement);
+        app.push_tab(replacement);
         app.close_active_tab();
         assert!(closing.is_cancelled());
         assert!(!other.is_cancelled());

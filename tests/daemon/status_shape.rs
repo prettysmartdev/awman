@@ -50,10 +50,8 @@ async fn shared_cap_defaults_to_four_and_follows_config_live() {
     crate::support::wait_for_status(&server, "cap 3", |s| s["max_concurrent_jobs"] == 3).await;
 }
 
-/// WI 0141: `agent_status` is advertised because `program_status` events
-/// ship. `terminal` and `interactive` are advertised only once daemon PTYs
-/// register with the terminal hub, which this build does not do yet; until
-/// then `/v1/terminals` is served but always empty.
+/// WI 0142: engine PTYs now register with the hub. The engine_parity terminal
+/// gate proves reconnect, input ownership, resize and exit on the real socket.
 #[tokio::test(flavor = "multi_thread")]
 async fn capabilities_advertise_only_what_works() {
     let home = ApiHome::new();
@@ -66,9 +64,16 @@ async fn capabilities_advertise_only_what_works() {
         .filter_map(|c| c.as_str())
         .collect();
     assert!(capabilities.contains(&"agent_status"), "{status}");
-    assert!(!capabilities.contains(&"terminal"), "{status}");
-    assert!(!capabilities.contains(&"interactive"), "{status}");
-    // The resource itself is served, empty.
+    for capability in [
+        "terminal",
+        "interactive",
+        "engine_instances",
+        "frontend_protocol",
+    ] {
+        assert!(capabilities.contains(&capability), "{status}");
+    }
+    assert_eq!(status["protocol"]["frontend"], 1);
+    // No agent has been started in this fixture, so the hub is empty.
     let terminals = server.get("/v1/terminals").await;
     assert_eq!(terminals["items"], serde_json::json!([]), "{terminals}");
 }

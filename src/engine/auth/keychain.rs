@@ -45,8 +45,15 @@ pub struct AgentSecretFile {
 /// Env-var credentials for the agent. Empty when the platform has no keychain
 /// integration, the entry is missing, or the payload fails to decode.
 pub fn agent_keychain_credentials(agent: &AgentName) -> Vec<(String, String)> {
+    agent_keychain_credentials_in(&crate::engine::host_cli::process_env(), agent)
+}
+
+pub fn agent_keychain_credentials_in(
+    snapshot: &crate::data::config::env::EnvSnapshot,
+    agent: &AgentName,
+) -> Vec<(String, String)> {
     match credential_source(agent) {
-        CredentialSource::ClaudeKeychainOauth => claude_keychain_credentials(),
+        CredentialSource::ClaudeKeychainOauth => claude_keychain_credentials_in(snapshot),
         CredentialSource::AntigravityKeychainFile | CredentialSource::None => Vec::new(),
     }
 }
@@ -65,8 +72,15 @@ fn credential_source(agent: &AgentName) -> CredentialSource {
 /// File-form credentials for the agent. Empty when the platform has no
 /// keychain integration, the entry is missing, or the payload fails to decode.
 pub fn agent_keychain_files(agent: &AgentName) -> Vec<AgentSecretFile> {
+    agent_keychain_files_in(&crate::engine::host_cli::process_env(), agent)
+}
+
+pub fn agent_keychain_files_in(
+    snapshot: &crate::data::config::env::EnvSnapshot,
+    agent: &AgentName,
+) -> Vec<AgentSecretFile> {
     match credential_source(agent) {
-        CredentialSource::AntigravityKeychainFile => antigravity_keychain_files(),
+        CredentialSource::AntigravityKeychainFile => antigravity_keychain_files_in(snapshot),
         CredentialSource::ClaudeKeychainOauth | CredentialSource::None => Vec::new(),
     }
 }
@@ -94,14 +108,16 @@ pub fn refreshable_spec_for(agent: &AgentName) -> Option<&'static RefreshableCre
 /// handles non-macOS); a missing entry or unparseable payload is logged with a
 /// typed reason so `awman ready` can surface it, rather than silently returning
 /// an empty vec.
-fn claude_keychain_credentials() -> Vec<(String, String)> {
+fn claude_keychain_credentials_in(
+    snapshot: &crate::data::config::env::EnvSnapshot,
+) -> Vec<(String, String)> {
     if !cfg!(target_os = "macos") {
         return Vec::new();
     }
     let source = HostCredentialSource::MacosKeychain {
         service: CLAUDE_KEYCHAIN_SERVICE,
     };
-    match credential::read_claude_credential(&source) {
+    match credential::read_claude_credential_in(snapshot, &source) {
         Ok(snap) => vec![(
             "CLAUDE_CODE_OAUTH_TOKEN".to_string(),
             snap.secret.expose().to_string(),
@@ -136,8 +152,10 @@ fn claude_keychain_credentials() -> Vec<(String, String)> {
 /// falls back to reading the same JSON from a fixed file at
 /// `~/.gemini/antigravity-cli/antigravity-oauth-token` (verified via strace
 /// of agy + a live login round-trip).
-fn antigravity_keychain_files() -> Vec<AgentSecretFile> {
-    let Some(raw) = read_antigravity_secret() else {
+fn antigravity_keychain_files_in(
+    snapshot: &crate::data::config::env::EnvSnapshot,
+) -> Vec<AgentSecretFile> {
+    let Some(raw) = read_antigravity_secret_in(snapshot) else {
         return Vec::new();
     };
     let Some(decoded) = decode_go_keyring_payload(&raw) else {
@@ -164,11 +182,11 @@ fn antigravity_keychain_files() -> Vec<AgentSecretFile> {
     }]
 }
 
-fn read_antigravity_secret() -> Option<String> {
+fn read_antigravity_secret_in(snapshot: &crate::data::config::env::EnvSnapshot) -> Option<String> {
     if cfg!(target_os = "macos") {
-        run_macos_keychain_lookup("gemini", Some("antigravity"))
+        run_macos_keychain_lookup_in(snapshot, "gemini", Some("antigravity"))
     } else if cfg!(target_os = "linux") {
-        run_linux_secret_lookup("gemini", "antigravity")
+        run_linux_secret_lookup_in(snapshot, "gemini", "antigravity")
     } else {
         None
     }
@@ -183,6 +201,7 @@ fn read_antigravity_secret() -> Option<String> {
 ///
 /// Every function below that would reach the OS keychain checks this first, so
 /// there is no path around it.
+#[cfg(test)]
 fn in_memory() -> bool {
     crate::data::config::env::test_isolation_active()
 }
@@ -225,11 +244,20 @@ mod memory {
 
 // ── Shared OS keychain shims ────────────────────────────────────────────────
 
+#[cfg(test)]
 pub(crate) fn run_macos_keychain_lookup(service: &str, account: Option<&str>) -> Option<String> {
-    if in_memory() {
+    run_macos_keychain_lookup_in(&crate::engine::host_cli::process_env(), service, account)
+}
+
+pub(crate) fn run_macos_keychain_lookup_in(
+    snapshot: &crate::data::config::env::EnvSnapshot,
+    service: &str,
+    account: Option<&str>,
+) -> Option<String> {
+    if cfg!(test) || snapshot.test_isolation() {
         return memory::lookup(service, account);
     }
-    let mut cmd = Command::new("security");
+    let mut cmd = crate::engine::host_cli::command(snapshot, "security");
     cmd.arg("find-generic-password").arg("-s").arg(service);
     if let Some(a) = account {
         cmd.arg("-a").arg(a);
@@ -247,11 +275,20 @@ pub(crate) fn run_macos_keychain_lookup(service: &str, account: Option<&str>) ->
     }
 }
 
+#[cfg(test)]
 fn run_linux_secret_lookup(service: &str, account: &str) -> Option<String> {
-    if in_memory() {
+    run_linux_secret_lookup_in(&crate::engine::host_cli::process_env(), service, account)
+}
+
+fn run_linux_secret_lookup_in(
+    snapshot: &crate::data::config::env::EnvSnapshot,
+    service: &str,
+    account: &str,
+) -> Option<String> {
+    if cfg!(test) || snapshot.test_isolation() {
         return memory::lookup(service, Some(account));
     }
-    let out = Command::new("secret-tool")
+    let out = crate::engine::host_cli::command(snapshot, "secret-tool")
         .args(["lookup", "service", service, "account", account])
         .output()
         .ok()?;
@@ -507,11 +544,25 @@ pub(crate) fn keychain_lookup(
     account: &str,
     cap: std::time::Duration,
 ) -> Result<Option<String>, KeychainCallError> {
-    if in_memory() {
+    keychain_lookup_in(
+        &crate::engine::host_cli::process_env(),
+        service,
+        account,
+        cap,
+    )
+}
+
+pub(crate) fn keychain_lookup_in(
+    snapshot: &crate::data::config::env::EnvSnapshot,
+    service: &str,
+    account: &str,
+    cap: std::time::Duration,
+) -> Result<Option<String>, KeychainCallError> {
+    if cfg!(test) || snapshot.test_isolation() {
         return Ok(memory::lookup(service, Some(account)));
     }
     if cfg!(target_os = "macos") {
-        let mut cmd = Command::new("security");
+        let mut cmd = crate::engine::host_cli::command(snapshot, "security");
         cmd.args(["find-generic-password", "-s", service, "-a", account, "-w"]);
         let out = run_capped(&mut cmd, None, cap)?;
         if out.status.code() == Some(MACOS_ITEM_NOT_FOUND) {
@@ -522,7 +573,7 @@ pub(crate) fn keychain_lookup(
         }
         Ok(non_empty(&out.stdout))
     } else if cfg!(target_os = "linux") {
-        let mut cmd = Command::new("secret-tool");
+        let mut cmd = crate::engine::host_cli::command(snapshot, "secret-tool");
         cmd.args(["lookup", "service", service, "account", account]);
         let out = run_capped(&mut cmd, None, cap)?;
         // `secret-tool lookup` reports a miss as a non-zero exit with nothing
@@ -550,7 +601,23 @@ pub(crate) fn keychain_store(
     envelope: &str,
     cap: std::time::Duration,
 ) -> Result<(), KeychainCallError> {
-    if in_memory() {
+    keychain_store_in(
+        &crate::engine::host_cli::process_env(),
+        service,
+        account,
+        envelope,
+        cap,
+    )
+}
+
+pub(crate) fn keychain_store_in(
+    snapshot: &crate::data::config::env::EnvSnapshot,
+    service: &str,
+    account: &str,
+    envelope: &str,
+    cap: std::time::Duration,
+) -> Result<(), KeychainCallError> {
+    if cfg!(test) || snapshot.test_isolation() {
         memory::store(service, account, envelope);
         return Ok(());
     }
@@ -558,7 +625,7 @@ pub(crate) fn keychain_store(
         let script = crate::data::fs::daemon_env::security_add_generic_password_script(
             service, account, envelope,
         );
-        let mut cmd = Command::new("security");
+        let mut cmd = crate::engine::host_cli::command(snapshot, "security");
         cmd.arg("-i");
         let out = run_capped(&mut cmd, Some(script.as_bytes()), cap)?;
         if !out.status.success() {
@@ -566,7 +633,7 @@ pub(crate) fn keychain_store(
         }
         Ok(())
     } else if cfg!(target_os = "linux") {
-        let mut cmd = Command::new("secret-tool");
+        let mut cmd = crate::engine::host_cli::command(snapshot, "secret-tool");
         cmd.args([
             "store",
             "--label=awman-squad daemon env",
@@ -591,12 +658,26 @@ pub(crate) fn keychain_clear(
     account: &str,
     cap: std::time::Duration,
 ) -> Result<(), KeychainCallError> {
-    if in_memory() {
+    keychain_clear_in(
+        &crate::engine::host_cli::process_env(),
+        service,
+        account,
+        cap,
+    )
+}
+
+pub(crate) fn keychain_clear_in(
+    snapshot: &crate::data::config::env::EnvSnapshot,
+    service: &str,
+    account: &str,
+    cap: std::time::Duration,
+) -> Result<(), KeychainCallError> {
+    if cfg!(test) || snapshot.test_isolation() {
         memory::clear(service, account);
         return Ok(());
     }
     if cfg!(target_os = "macos") {
-        let mut cmd = Command::new("security");
+        let mut cmd = crate::engine::host_cli::command(snapshot, "security");
         cmd.args(["delete-generic-password", "-s", service, "-a", account]);
         let out = run_capped(&mut cmd, None, cap)?;
         if out.status.success() || out.status.code() == Some(MACOS_ITEM_NOT_FOUND) {
@@ -604,7 +685,7 @@ pub(crate) fn keychain_clear(
         }
         Err(failed(&out))
     } else if cfg!(target_os = "linux") {
-        let mut cmd = Command::new("secret-tool");
+        let mut cmd = crate::engine::host_cli::command(snapshot, "secret-tool");
         cmd.args(["clear", "service", service, "account", account]);
         let out = run_capped(&mut cmd, None, cap)?;
         if out.status.success() || out.stderr.is_empty() {

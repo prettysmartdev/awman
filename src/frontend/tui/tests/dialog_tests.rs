@@ -94,7 +94,7 @@ fn close_tab_confirm_q_quits_entire_app() {
 #[test]
 fn close_tab_confirm_c_closes_current_tab() {
     let mut app = make_app();
-    app.tabs.push(Tab::new(make_session()));
+    app.push_tab(Tab::new(make_session()));
     app.active_dialog = Some(Dialog::CloseTabConfirm);
     // Ctrl-T closes the tab
     press_key(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
@@ -105,7 +105,7 @@ fn close_tab_confirm_c_closes_current_tab() {
 #[test]
 fn close_tab_confirm_n_cancels() {
     let mut app = make_app();
-    app.tabs.push(Tab::new(make_session()));
+    app.push_tab(Tab::new(make_session()));
     let initial_len = app.tabs.len();
     app.active_dialog = Some(Dialog::CloseTabConfirm);
     // Esc cancels the dialog

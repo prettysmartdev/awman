@@ -472,8 +472,13 @@ pub fn prerequisite_identity_persist(command: &str) -> Prompt<IdentityPersist> {
 /// exposes `config`, other keys and agent sockets named in config), then
 /// "Don't use SSH keys".
 ///
-/// `remote` is the credential-stripped remote URL.
-pub fn prerequisite_ssh(check: &PrerequisiteCheck, remote: &str) -> Prompt<SshChoice> {
+/// `remote` is the credential-stripped remote URL. `home` is the session's
+/// home directory, used only to shorten key paths to `~/...` for display.
+pub fn prerequisite_ssh(
+    check: &PrerequisiteCheck,
+    remote: &str,
+    home: Option<&Path>,
+) -> Prompt<SshChoice> {
     const RUN_KEYS: &[char] = &['1', '2', '3', '4', '5', '6', '7', '8'];
     const REMEMBER_KEYS: &[char] = &['a', 'b', 'd', 'e', 'f', 'g', 'h', 'i'];
     let steps = prerequisite_steps(check);
@@ -494,7 +499,7 @@ pub fn prerequisite_ssh(check: &PrerequisiteCheck, remote: &str) -> Prompt<SshCh
         .collect();
     let mut choices = Vec::new();
     for (i, (path, passphrase, remembered, suggested)) in keys.iter().enumerate() {
-        let display = tilde_path(path);
+        let display = tilde_path(path, home);
         let mut note = String::new();
         if **passphrase == Some(true) {
             note.push_str(" (passphrase-protected: will fail unattended)");
@@ -566,11 +571,12 @@ pub fn prerequisite_ssh(check: &PrerequisiteCheck, remote: &str) -> Prompt<SshCh
 const GRANT_SSH_KEY: &str =
     crate::engine::overlay::prerequisite_grants::GRANT_SSH_KEY_CONTAINER_NAME;
 
-/// `$HOME/.ssh/id_x` → `~/.ssh/id_x` for display. Paths outside `$HOME` are
-/// shown as they are.
-fn tilde_path(path: &str) -> String {
-    match crate::data::config::env::host_var("HOME") {
-        Some(home) if !home.is_empty() => match Path::new(path).strip_prefix(&home) {
+/// `$HOME/.ssh/id_x` → `~/.ssh/id_x` for display, where `home` is the
+/// session's home directory. Paths outside it (or with no home) are shown as
+/// they are.
+fn tilde_path(path: &str, home: Option<&Path>) -> String {
+    match home {
+        Some(home) if !home.as_os_str().is_empty() => match Path::new(path).strip_prefix(home) {
             Ok(rest) => format!("~/{}", rest.display()),
             Err(_) => path.to_string(),
         },
@@ -1011,8 +1017,8 @@ mod parity_tests {
                 &["Default Task Workspace", "mount scope: [gitroot]/cwd?"][..],
             ),
             (
-                "tui/per_command/squad.rs",
-                include_str!("../frontend/tui/per_command/squad.rs"),
+                "instance/per_command/squad.rs",
+                include_str!("instance/per_command/squad.rs"),
                 &["Task Workspace", "Mount the entire git root?"][..],
             ),
         ] {
@@ -1038,8 +1044,8 @@ mod parity_tests {
                 include_str!("../frontend/cli/command_frontend.rs"),
             ),
             (
-                "tui/per_command/squad.rs",
-                include_str!("../frontend/tui/per_command/squad.rs"),
+                "instance/per_command/squad.rs",
+                include_str!("instance/per_command/squad.rs"),
             ),
         ] {
             // The test module below the frontend asserts against the prompt's
@@ -1104,9 +1110,17 @@ mod wi0149_tests {
             },
             Remediation::MountSshDir,
         ]);
-        let ssh = prerequisite_ssh(&c, "github.com:org/repo.git");
+        let ssh = prerequisite_ssh(&c, "github.com:org/repo.git", Some(Path::new("/home/test")));
         unique(&ssh);
         assert_eq!(ssh.keys(), vec!['1', 'a', 'w', 'n']);
+        // The session's home shortens the key path; without one it is shown as is.
+        assert!(
+            ssh.labels()[0].contains("~/.ssh/id_ed25519"),
+            "{:?}",
+            ssh.labels()
+        );
+        let no_home = prerequisite_ssh(&c, "github.com:org/repo.git", None);
+        assert!(no_home.labels()[0].contains("/home/test/.ssh/id_ed25519"));
         assert!(ssh.labels()[0].contains("passphrase-protected: will fail unattended"));
         assert!(ssh.body.contains("read-only"));
         assert!(ssh.body.contains("deploy key"));

@@ -98,13 +98,13 @@ pub fn render_acp_maximized(
     };
 
     // Read the shared render state.
-    let (lines, scroll_offset, pending) = match state.lock() {
+    let scroll_offset = slot.acp_scroll_offset;
+    let (lines, pending) = match state.lock() {
         Ok(s) => (
             render_history_lines(&s.history),
-            s.scroll_offset,
             s.pending_permission.is_some(),
         ),
-        Err(_) => (Vec::new(), 0, false),
+        Err(_) => (Vec::new(), false),
     };
 
     let elapsed = slot

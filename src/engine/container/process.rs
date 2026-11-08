@@ -71,8 +71,9 @@ pub(super) fn no_post_wait() {}
 /// A backend is a `ContainerCli` plus its own `list`/`stats`/`stop` parsing.
 /// Adding a third CLI-shaped runtime should mean adding a constant here, not
 /// a third copy of [`spawn_piped`].
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(super) struct ContainerCli {
+    pub env: Option<Arc<crate::data::config::env::EnvSnapshot>>,
     /// The binary invoked for `run`, `stop` and `rm`.
     pub bin: &'static str,
     /// Ownership label stamped on every awman-spawned container so a backend's
@@ -97,7 +98,21 @@ impl std::fmt::Debug for ContainerCli {
 }
 
 impl ContainerCli {
+    pub(super) fn in_env(mut self, env: crate::data::config::env::EnvSnapshot) -> Self {
+        self.env = Some(Arc::new(env));
+        self
+    }
+    pub(super) fn snapshot(&self) -> std::borrow::Cow<'_, crate::data::config::env::EnvSnapshot> {
+        match &self.env {
+            Some(env) => std::borrow::Cow::Borrowed(env),
+            None => std::borrow::Cow::Owned(crate::engine::host_cli::process_env()),
+        }
+    }
+    pub(super) fn command(&self) -> Command {
+        crate::engine::host_cli::command(&self.snapshot(), self.bin)
+    }
     pub(super) const DOCKER: ContainerCli = ContainerCli {
+        env: None,
         bin: "docker",
         label: "awman=true",
         start_delay: Duration::ZERO,
@@ -105,6 +120,7 @@ impl ContainerCli {
     };
 
     pub(super) const APPLE: ContainerCli = ContainerCli {
+        env: None,
         bin: "container",
         label: "awman=true",
         start_delay: crate::engine::container::timing::APPLE_CONTAINER_START_DELAY,
@@ -116,6 +132,7 @@ impl ContainerCli {
 
 /// What a [`AttachHook`] is handed once the PTY bridge is wired up.
 pub(super) struct AttachHookCtx<'a> {
+    pub env: &'a crate::data::config::env::EnvSnapshot,
     pub terminal: Option<(
         Arc<crate::engine::terminal_hub::TerminalHub>,
         crate::data::ids::TerminalId,
@@ -154,9 +171,10 @@ pub(super) fn bridge_config_for(
     stuck_timeout: Duration,
 ) -> BridgeConfig {
     let container_name = name.0.clone();
-    let bin = cli.bin;
+    let cancel_cli = cli.clone();
     let cancel: CancelFn = Arc::new(move || {
-        let _ = Command::new(crate::engine::host_cli::program(bin))
+        let _ = cancel_cli
+            .command()
             .args(["stop", &container_name])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -232,7 +250,7 @@ impl AgentInstance for ContainerInstance {
         self: Box<Self>,
         mut frontend: Box<dyn crate::engine::agent_runtime::frontend::AgentFrontend>,
     ) -> Result<AgentExecution, EngineError> {
-        let cli = self.cli;
+        let cli = self.cli.clone();
         let post_bridge = self.post_bridge;
         let argv = super::docker::build_run_argv(&self.name, &self.image, &self.options)?;
         let started_at = chrono::Utc::now();
@@ -270,7 +288,8 @@ impl AgentInstance for ContainerInstance {
         }
         let io = frontend.take_io();
 
-        let mut bridge_cfg = bridge_config_for(cli, &self.name, grace_timeout, stuck_timeout);
+        let mut bridge_cfg =
+            bridge_config_for(cli.clone(), &self.name, grace_timeout, stuck_timeout);
         bridge_cfg.program_status = self.options.program_status;
         bridge_cfg.terminal = frontend.terminal_launch();
         if self.options.full_transcript {
@@ -340,7 +359,7 @@ fn piped_command(
     argv: &[String],
     options: &ResolvedContainerOptions,
 ) -> Command {
-    let mut cmd = Command::new(crate::engine::host_cli::program(cli.bin));
+    let mut cmd = cli.command();
     cmd.args(argv);
     for (k, v) in super::docker::screened_agent_credentials(options) {
         cmd.env(k, v);
@@ -391,7 +410,7 @@ pub(super) fn spawn_pty_bridged(
     req: SpawnRequest,
     post_bridge: Option<AttachHook>,
 ) -> Result<AgentExecution, EngineError> {
-    use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+    use portable_pty::{native_pty_system, PtySize};
 
     let SpawnRequest {
         io,
@@ -419,7 +438,8 @@ pub(super) fn spawn_pty_bridged(
         })
         .map_err(|e| EngineError::Container(format!("openpty: {e}")))?;
 
-    let mut cmd = CommandBuilder::new(crate::engine::host_cli::program(cli.bin));
+    let snapshot = cli.snapshot();
+    let mut cmd = crate::engine::host_cli::pty_command(&snapshot, cli.bin);
     for arg in &argv {
         cmd.arg(arg);
     }
@@ -466,6 +486,7 @@ pub(super) fn spawn_pty_bridged(
 
     let attach_socket = match (post_bridge, output_broadcast) {
         (Some(hook), Some(output_broadcast)) => hook(AttachHookCtx {
+            env: &snapshot,
             terminal: terminal_launch.and_then(|launch| {
                 let id = launch
                     .handle
@@ -520,14 +541,14 @@ pub(super) fn spawn_piped(
         bridge_cfg,
     } = req;
 
-    let mut cmd = piped_command(cli, &argv, &instance.options);
+    let mut cmd = piped_command(cli.clone(), &argv, &instance.options);
 
     // Move leases into the backend; assert one exists before spawn (INV-6).
     let leases = std::mem::take(&mut instance.leases);
     let prompt_files = std::mem::take(&mut instance.options.prompt_files);
     assert_leases_before_spawn(&instance.options, &leases);
 
-    let mut child = spawn_child(cli, &mut cmd)?;
+    let mut child = spawn_child(cli.clone(), &mut cmd)?;
 
     // Write seeded prompt into stdin channel before the writer task starts.
     if let Some(prompt) = seeded {
@@ -602,14 +623,14 @@ pub(super) fn spawn_piped_interactive(
         bridge_cfg,
     } = req;
 
-    let mut cmd = piped_command(cli, &argv, &instance.options);
+    let mut cmd = piped_command(cli.clone(), &argv, &instance.options);
 
     // Move leases into the backend; assert one exists before spawn (INV-6).
     let leases = std::mem::take(&mut instance.leases);
     let prompt_files = std::mem::take(&mut instance.options.prompt_files);
     assert_leases_before_spawn(&instance.options, &leases);
 
-    let mut child = spawn_child(cli, &mut cmd)?;
+    let mut child = spawn_child(cli.clone(), &mut cmd)?;
 
     let bridge = crate::engine::container::io_bridge::bridge_piped(io, &mut child, bridge_cfg);
 
@@ -644,13 +665,15 @@ pub(super) fn spawn_piped_interactive(
 ///
 /// The one place the stop-then-remove pair is written: `ContainerExecution`'s
 /// cancel paths and `ContainerBackend::stop` all route through it.
-pub(super) fn stop_and_remove(bin: &str, name: &str) {
-    let _ = Command::new(crate::engine::host_cli::program(bin))
+pub(super) fn stop_and_remove(cli: &ContainerCli, name: &str) {
+    let _ = cli
+        .command()
         .args(["stop", name])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
-    let _ = Command::new(crate::engine::host_cli::program(bin))
+    let _ = cli
+        .command()
         .args(["rm", name])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -787,15 +810,15 @@ impl ExecutionBackend for ContainerExecution {
     }
 
     fn cancel(&self) -> Result<(), EngineError> {
-        stop_and_remove(self.cli.bin, &self.container_name);
+        stop_and_remove(&self.cli, &self.container_name);
         Ok(())
     }
 
     fn cancel_handle(&self) -> crate::engine::agent_runtime::execution::CancelHandle {
-        let bin = self.cli.bin;
+        let cli = self.cli.clone();
         let name = self.container_name.clone();
         crate::engine::agent_runtime::execution::CancelHandle::new(move || {
-            stop_and_remove(bin, &name);
+            stop_and_remove(&cli, &name);
             Ok(())
         })
     }
@@ -871,12 +894,13 @@ mod tests {
                         log.display()
                     );
                     let cli = ContainerCli {
+                        env: None,
                         bin: fake_cli(&write_fake_cli(temp.path(), &script)).bin,
-                        ..original
+                        ..original.clone()
                     };
                     let receivers = Arc::new(Mutex::new(None));
                     let mut execution = test_instance(
-                        cli,
+                        cli.clone(),
                         vec![ContainerOption::Image(ImageRef::new("img:latest"))],
                     )
                     .run_with_frontend(Box::new(IoProbeFrontend {
@@ -954,12 +978,13 @@ mod tests {
     async fn dropped_host_terminal_variables_are_announced_before_take_io() {
         let temp = tempfile::tempdir().unwrap();
         let cli = ContainerCli {
+            env: None,
             bin: fake_cli(&write_fake_cli(temp.path(), "#!/bin/sh\nexit 0\n")).bin,
             ..ContainerCli::DOCKER
         };
         let events = Arc::new(Mutex::new(Vec::new()));
         let mut execution = test_instance(
-            cli,
+            cli.clone(),
             vec![
                 ContainerOption::Image(ImageRef::new("img:latest")),
                 ContainerOption::AgentCredentials {
@@ -989,11 +1014,12 @@ mod tests {
             log.display()
         );
         let cli = ContainerCli {
+            env: None,
             bin: fake_cli(&write_fake_cli(temp.path(), &script)).bin,
             ..ContainerCli::DOCKER
         };
         let execution = test_instance(
-            cli,
+            cli.clone(),
             vec![ContainerOption::Image(ImageRef::new("img:latest"))],
         )
         .run_with_frontend(Box::new(IoProbeFrontend {
@@ -1068,6 +1094,7 @@ mod tests {
     /// keeps `ContainerCli` a plain `Copy` constant in production.
     pub(super) fn fake_cli(path: &std::path::Path) -> ContainerCli {
         ContainerCli {
+            env: None,
             bin: Box::leak(path.to_string_lossy().into_owned().into_boxed_str()),
             label: "awman=true",
             start_delay: Duration::ZERO,
@@ -1165,7 +1192,7 @@ mod tests {
         let image = ImageRef::new("img:latest");
         let name = ContainerName::new("spawn-test");
         Box::new(ContainerInstance::new(
-            cli,
+            cli.clone(),
             image,
             name,
             resolve(opts),
@@ -1198,12 +1225,13 @@ mod tests {
                         "#!/bin/sh\nif [ \"$1\" = run ]; then sleep 0.01; fi\n"
                     };
                     let cli = ContainerCli {
+                        env: None,
                         bin: fake_cli(&write_fake_cli(&dir, script)).bin,
-                        ..original
+                        ..original.clone()
                     };
                     let mut options = vec![ContainerOption::Image(ImageRef::new("img:latest"))];
                     options.extend(prompt_files.into_iter().map(prompt_option));
-                    test_instance(cli, options)
+                    test_instance(cli.clone(), options)
                         .run_with_frontend(frontend)
                         .unwrap()
                 }),
@@ -1446,7 +1474,7 @@ mod tests {
         for _ in 0..16 {
             let (options, path) = engine_launch(&engine, &session, "the prompt");
             assert!(path.exists());
-            let mut execution = test_instance(cli, options)
+            let mut execution = test_instance(cli.clone(), options)
                 .run_with_frontend(frontend_with(None))
                 .unwrap();
             execution.wait().await.unwrap();
@@ -1533,7 +1561,7 @@ mod tests {
 
         let image = ImageRef::new("img:latest");
         let instance = test_instance(
-            cli,
+            cli.clone(),
             vec![
                 ContainerOption::Image(image),
                 ContainerOption::Interactive(true),
@@ -1547,7 +1575,7 @@ mod tests {
             Some("seeded".into()),
         );
 
-        let mut execution = spawn_piped_interactive(cli, instance, req).unwrap();
+        let mut execution = spawn_piped_interactive(cli.clone(), instance, req).unwrap();
         assert!(
             execution.try_inject_stdin(b"seeded\n").unwrap(),
             "ACP spawn must retain stdin_injector after the optional seed"
@@ -1564,13 +1592,13 @@ mod tests {
         let cli = fake_cli(&write_fake_cli(tmp.path(), "#!/bin/sh\ncat >/dev/null\n"));
 
         let image = ImageRef::new("img:latest");
-        let instance = test_instance(cli, vec![ContainerOption::Image(image)]);
+        let instance = test_instance(cli.clone(), vec![ContainerOption::Image(image)]);
         let (req, _handle) = piped_test_request(
             vec!["run".into(), "img:latest".into()],
             Some("hello".into()),
         );
 
-        let mut execution = spawn_piped(cli, instance, req).unwrap();
+        let mut execution = spawn_piped(cli.clone(), instance, req).unwrap();
         assert!(
             !execution.try_inject_stdin(b"more\n").unwrap(),
             "one-shot piped spawn must have dropped its stdin_injector"
@@ -1589,10 +1617,10 @@ mod tests {
         let cli = fake_cli(&tmp.path().join("definitely-not-installed"));
 
         let image = ImageRef::new("img:latest");
-        let instance = test_instance(cli, vec![ContainerOption::Image(image)]);
+        let instance = test_instance(cli.clone(), vec![ContainerOption::Image(image)]);
         let (req, _handle) = piped_test_request(vec!["run".into()], None);
 
-        let err = match spawn_piped(cli, instance, req) {
+        let err = match spawn_piped(cli.clone(), instance, req) {
             Ok(_) => panic!("spawn must fail when the binary does not exist"),
             Err(err) => err,
         };

@@ -43,7 +43,8 @@ fn build_clap_for_spec(spec: &'static CommandSpec, is_root: bool) -> Command {
         cmd = cmd.arg(build_clap_flag(flag));
     }
     for sub in spec.subcommands {
-        cmd = cmd.subcommand(build_clap_for_spec(sub, false));
+        // An internal entry point parses like any command but is not listed.
+        cmd = cmd.subcommand(build_clap_for_spec(sub, false).hide(sub.internal));
     }
     if !is_root && !spec.subcommands.is_empty() {
         cmd = cmd.subcommand_required(false);

@@ -77,6 +77,18 @@ async fn set_picks_scope_automatically() {
             "repo",
             repo.path().join(".awman").join("config.json"),
         ),
+        (
+            "tui.backend",
+            "daemon",
+            "repo",
+            repo.path().join(".awman").join("config.json"),
+        ),
+        (
+            "daemon.features.engine.enabled",
+            "true",
+            "global",
+            home.path().join("config.json"),
+        ),
     ] {
         let outcome = run(
             session(repo.path(), home.path()),

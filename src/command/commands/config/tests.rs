@@ -481,6 +481,14 @@ async fn show_masks_sensitive_values_and_names_the_state_file() {
         (stuck.source, stuck.type_name.as_str()),
         (Layer::Default, "duration")
     );
+    let backend = show
+        .rows
+        .iter()
+        .find(|r| r.field == "tui.backend")
+        .expect("the effective TUI backend row");
+    assert_eq!(backend.effective_value.as_deref(), Some("auto"));
+    assert_eq!(backend.source, Layer::Default);
+    assert_eq!(show.resolved_backend, "backend: builtin");
 
     let state = show.state.expect("a repository has a state section");
     assert!(state.path.ends_with("state.json"), "{}", state.path);
@@ -552,7 +560,7 @@ fn rows_follow_the_key_table_and_list_map_entries() {
     assert!(rows.iter().any(|r| r.field == "agents.flags"
         && r.shape
             == ConfigRowKind::MapHeader {
-                child_prefix: "agents.flags."
+                child_prefix: "agents.flags.".into()
             }));
     assert!(rows.iter().any(|r| r.field == "agents.flags.codex"));
     let runtime = rows.iter().find(|r| r.field == "runtime.kind").unwrap();

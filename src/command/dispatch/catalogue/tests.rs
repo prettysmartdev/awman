@@ -683,17 +683,20 @@ fn config_and_transport_clients_can_run_without_a_local_runtime() {
             "remote session",
             "remote session kill",
             "remote session start",
+            // A frontend entry point; the view's engine is the daemon's.
+            "view",
         ],
     );
 }
 
-/// `squad` is the one command with a bare TUI form.
+/// `squad` and the internal `view` entry point (WI 0142) are the commands
+/// with a TUI form.
 ///
 /// Folded out of the catalogue-level `TUI_WHEN_BARE` list into a `CommandSpec`
 /// attribute in the same pass (midpoint finding 24). The `false` half matters
 /// as much as the `true`: `awman squad list` must not open a tab.
 #[test]
-fn only_squad_opens_the_tui_when_bare() {
+fn only_squad_and_view_open_the_tui_when_bare() {
     fn walk(spec: &'static CommandSpec, path: Vec<&'static str>, out: &mut Vec<String>) {
         if spec.opens_tui_when_bare {
             out.push(path.join(" "));
@@ -711,7 +714,7 @@ fn only_squad_opens_the_tui_when_bare() {
         Vec::new(),
         &mut tui_when_bare,
     );
-    assert_eq!(tui_when_bare, vec!["squad"]);
+    assert_eq!(tui_when_bare, vec!["squad", "view"]);
 }
 
 #[test]
@@ -1495,4 +1498,112 @@ fn set_is_a_global_repeatable_flag() {
         )
         .unwrap();
     assert_eq!(parsed.flag_strings("set"), vec!["a=1", "b=2"]);
+}
+
+// ── WI 0142: relayed frontends and internal entry points ─────────────────
+
+/// Every spec declares relay support; exactly the engine commands relay, and
+/// the engine-free ones (config, the root behind `--help`/`--version`) never
+/// trigger the hand-off.
+#[test]
+fn relay_support_is_declared_and_engine_free_commands_are_local_only() {
+    fn walk(spec: &'static CommandSpec, path: Vec<&'static str>, out: &mut Vec<String>) {
+        if spec.relay_allowed {
+            out.push(path.join(" "));
+        }
+        for sub in spec.subcommands {
+            let mut child = path.clone();
+            child.push(sub.name);
+            walk(sub, child, out);
+        }
+    }
+    let cat = CommandCatalogue::get();
+    let mut relayed = Vec::new();
+    walk(cat.root(), Vec::new(), &mut relayed);
+    relayed.sort();
+    assert_eq!(
+        relayed,
+        vec![
+            "chat",
+            "exec prompt",
+            "exec workflow",
+            "init",
+            "new agent",
+            "new skill",
+            "new spec",
+            "new workflow",
+            "ready",
+        ]
+    );
+    for local in [
+        &[][..],
+        &["config"],
+        &["config", "show"],
+        &["config", "set"],
+        &["daemon", "status"],
+        &["view"],
+        &["no-such-command"],
+    ] {
+        assert!(!cat.is_relay_allowed(local), "{local:?} must stay local");
+    }
+}
+
+/// A relayed frontend answers like the frontend relaying it (D1).
+#[test]
+fn relayed_frontends_answer_like_their_origin() {
+    let cat = CommandCatalogue::get();
+    for kind in [FrontendKind::RELAYED_TUI, FrontendKind::RELAYED_CLI] {
+        assert!(kind.is_local_user());
+        assert!(kind.can_ask_a_human());
+        assert!(!kind.is_engine_local());
+    }
+    assert_eq!(FrontendKind::RELAYED_TUI.label(), "tui:daemon");
+    assert_eq!(FrontendKind::RELAYED_CLI.label(), "cli:daemon");
+    assert_eq!(FrontendKind::RELAYED_CLI.origin(), Some(RelayOrigin::Cli));
+    assert_eq!(FrontendKind::Tui.origin(), None);
+    assert_eq!(
+        FrontendKind::RELAYED_TUI.presenting(),
+        Some(FrontendKind::Tui)
+    );
+    assert_eq!(FrontendKind::WORKER_LOCAL.presenting(), None);
+
+    // The TUI's command box runs every command; a relayed CLI only the
+    // relayable ones.
+    assert!(cat.is_allowed_for_frontend(FrontendKind::RELAYED_TUI, &["config", "show"]));
+    assert!(cat.is_allowed_for_frontend(FrontendKind::RELAYED_CLI, &["chat"]));
+    assert!(!cat.is_allowed_for_frontend(FrontendKind::RELAYED_CLI, &["config", "show"]));
+    let refused = cat
+        .validate_for_frontend(FrontendKind::RELAYED_CLI, &["config", "show"])
+        .unwrap_err();
+    assert!(refused.to_string().contains("cli:daemon"), "{refused}");
+
+    // Flag visibility follows the origin: no unattended API profile.
+    assert!(cat
+        .frontend_profile(FrontendKind::RELAYED_CLI, &["exec", "prompt"])
+        .is_empty());
+}
+
+/// `view` parses through the CLI projection but is listed nowhere.
+#[test]
+fn view_is_internal_and_hidden_from_help() {
+    let cat = CommandCatalogue::get();
+    assert!(cat.is_internal(&["view"]));
+    assert!(!cat.is_internal(&["chat"]));
+    let mut clap = cat.build_clap_command();
+    let help = clap.render_long_help().to_string();
+    assert!(!help.contains("view"), "{help}");
+    let matches = cat
+        .build_clap_command()
+        .try_get_matches_from(["awman", "view", "--instance", "ins_x", "--tab", "tab_y"])
+        .unwrap();
+    let (name, sub) = matches.subcommand().unwrap();
+    assert_eq!(name, "view");
+    assert_eq!(
+        sub.get_one::<String>("instance").map(String::as_str),
+        Some("ins_x")
+    );
+    assert!(cat
+        .tui_completions("vi")
+        .iter()
+        .all(|completion| completion.completion != "view"));
 }

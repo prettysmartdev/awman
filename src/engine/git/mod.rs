@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
+#[cfg(test)]
 use std::process::Command;
 
 use crate::data::error::DataError;
@@ -40,15 +41,17 @@ fn path_from_git_bytes(bytes: &[u8]) -> PathBuf {
 
 /// Run a git command, reporting it to the frontend and streaming its output.
 fn run_git_logged(
+    snapshot: &crate::data::config::env::EnvSnapshot,
     args: &[&str],
     cwd: &Path,
     sink: &mut dyn GitFrontend,
 ) -> Result<std::process::Output, EngineError> {
-    run_git_logged_env(args, cwd, &[], sink)
+    run_git_logged_env(snapshot, args, cwd, &[], sink)
 }
 
 /// [`run_git_logged`] with extra environment variables for the child.
 fn run_git_logged_env(
+    snapshot: &crate::data::config::env::EnvSnapshot,
     args: &[&str],
     cwd: &Path,
     env: &[(&str, &str)],
@@ -60,7 +63,7 @@ fn run_git_logged_env(
     // writes the same `$ git …` line this function used to compose itself
     // (F-45), so nothing changes for a frontend that has not opted in.
     sink.command_started(&command);
-    let output = host_command::command(cwd)
+    let output = host_command::command(snapshot, cwd)
         .args(args)
         .envs(env.iter().copied())
         .current_dir(cwd)
@@ -75,6 +78,7 @@ fn run_git_logged_env(
 /// group is killed as soon as `cancel` fires. Output goes to files rather
 /// than pipes so a descendant holding them open cannot hang the wait.
 fn run_git_logged_cancellable(
+    snapshot: &crate::data::config::env::EnvSnapshot,
     args: &[&str],
     cwd: &Path,
     sink: &mut dyn GitFrontend,
@@ -87,7 +91,7 @@ fn run_git_logged_cancellable(
     let io = |e: std::io::Error| EngineError::Git(format!("invoke `{cmd_str}`: {e}"));
     let mut stdout = tempfile::tempfile().map_err(io)?;
     let mut stderr = tempfile::tempfile().map_err(io)?;
-    let mut git = host_command::command(cwd);
+    let mut git = host_command::command(snapshot, cwd);
     git.args(args)
         .current_dir(cwd)
         .stdin(std::process::Stdio::null())
@@ -316,8 +320,15 @@ pub struct NumstatEntry {
     pub removed: Option<u32>,
 }
 
-#[derive(Debug, Default, Clone)]
-pub struct GitEngine;
+#[derive(Debug, Clone)]
+pub struct GitEngine {
+    env: crate::data::config::env::EnvSnapshot,
+}
+impl Default for GitEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// The committer identity git resolves for a given directory. Either field is
 /// `None` when git cannot resolve it at any level (repo, global, system).
@@ -351,12 +362,18 @@ type GitRunner<'a> = dyn FnMut(&[&str], &Path) -> Result<std::process::Output, E
 
 impl GitEngine {
     pub fn new() -> Self {
-        Self
+        Self::with_env(crate::engine::host_cli::process_env())
+    }
+    pub fn with_env(env: crate::data::config::env::EnvSnapshot) -> Self {
+        Self { env }
+    }
+    pub fn env(&self) -> &crate::data::config::env::EnvSnapshot {
+        &self.env
     }
 
     /// Verify `git` is installed and version >= 2.5 (worktree support).
     pub fn version_check(&self) -> Result<GitVersion, EngineError> {
-        let output = Command::new("git")
+        let output = crate::engine::host_cli::command(&self.env, "git")
             .args(["--version"])
             .output()
             .map_err(|e| EngineError::Git(format!("invoke `git --version`: {e}")))?;
@@ -385,7 +402,7 @@ impl GitEngine {
     /// Resolve the git root for the given working directory via `git rev-parse
     /// --show-toplevel`.
     pub fn resolve_root(&self, working_dir: &Path) -> Result<PathBuf, EngineError> {
-        let output = host_command::discovery_command(working_dir)
+        let output = host_command::discovery_command(&self.env, working_dir)
             .args(["rev-parse", "--show-toplevel"])
             .current_dir(working_dir)
             .output()
@@ -463,7 +480,7 @@ impl GitEngine {
             }
             Ok(())
         }
-        let output = host_command::command(root)
+        let output = host_command::command(&self.env, root)
             .args([
                 "-c",
                 "core.fsmonitor=false",
@@ -501,7 +518,7 @@ impl GitEngine {
 
     /// `git status --porcelain` lines (one per uncommitted file).
     pub fn uncommitted_files(&self, path: &Path) -> Result<Vec<String>, EngineError> {
-        let output = host_command::command(path)
+        let output = host_command::command(&self.env, path)
             .args(["status", "--porcelain"])
             .current_dir(path)
             .output()
@@ -529,27 +546,29 @@ impl GitEngine {
     /// status entry as Added with zero counts, matching the sidebar's former
     /// behavior exactly.
     pub fn diff_summary(&self, root: &Path) -> Result<GitDiffSummary, EngineError> {
-        let porcelain_out = run_git_summary(&["status", "--porcelain"], root)?;
+        let porcelain_out = run_git_summary(&self.env, &["status", "--porcelain"], root)?;
         let porcelain = parse_porcelain_status(&porcelain_out);
 
         // Empty output means detached HEAD; surface it as None so callers can
         // choose their own presentation fallback.
-        let branch = run_git_summary(&["branch", "--show-current"], root)
+        let branch = run_git_summary(&self.env, &["branch", "--show-current"], root)
             .ok()
             .map(|out| out.trim().to_string())
             .filter(|name| !name.is_empty());
 
         // numstat fails when there are no commits (no HEAD). Fall back to an
         // empty list + "no commits" flag so we still render the file set.
-        let (numstat, has_commits) = match run_git_summary(&["diff", "--numstat", "HEAD"], root) {
-            Ok(out) => (parse_numstat(&out), true),
-            Err(numstat_error) => {
-                if run_git_summary(&["rev-parse", "--verify", "HEAD"], root).is_ok() {
-                    return Err(numstat_error);
+        let (numstat, has_commits) =
+            match run_git_summary(&self.env, &["diff", "--numstat", "HEAD"], root) {
+                Ok(out) => (parse_numstat(&out), true),
+                Err(numstat_error) => {
+                    if run_git_summary(&self.env, &["rev-parse", "--verify", "HEAD"], root).is_ok()
+                    {
+                        return Err(numstat_error);
+                    }
+                    (Vec::new(), false)
                 }
-                (Vec::new(), false)
-            }
-        };
+            };
 
         // No-commits fallback: treat every file as Added with 0 line counts.
         if !has_commits {
@@ -583,7 +602,7 @@ impl GitEngine {
     /// legacy unhashed path when it holds a worktree of this repository
     /// (see [`Self::pick_worktree_path`]).
     pub fn worktree_path(&self, git_root: &Path, work_item: u32) -> Result<PathBuf, EngineError> {
-        let p = WorktreePaths::from_home().map_err(EngineError::Data)?;
+        let p = WorktreePaths::from_env(self.env()).map_err(EngineError::Data)?;
         let root = canonical_or_given(git_root);
         Ok(self.pick_worktree_path(
             &root,
@@ -596,7 +615,7 @@ impl GitEngine {
     /// or the legacy unhashed path when it holds a worktree of this repository
     /// (see [`Self::pick_worktree_path`]).
     pub fn worktree_path_named(&self, git_root: &Path, name: &str) -> Result<PathBuf, EngineError> {
-        let p = WorktreePaths::from_home().map_err(EngineError::Data)?;
+        let p = WorktreePaths::from_env(self.env()).map_err(EngineError::Data)?;
         let root = canonical_or_given(git_root);
         Ok(self.pick_worktree_path(
             &root,
@@ -634,7 +653,7 @@ impl GitEngine {
     /// (`prunable`) registrations are left out; see
     /// [`Self::list_worktree_entries`] for the full records.
     pub fn list_worktrees(&self, git_root: &Path) -> Result<Vec<PathBuf>, EngineError> {
-        let output = host_command::command(git_root)
+        let output = host_command::command(&self.env, git_root)
             .args(["worktree", "list", "--porcelain", "-z"])
             .current_dir(git_root)
             .output()
@@ -666,7 +685,7 @@ impl GitEngine {
                 worktree.display()
             ))
         };
-        let common_output = host_command::command(git_root)
+        let common_output = host_command::command(&self.env, git_root)
             .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
             .current_dir(git_root)
             .output()
@@ -751,6 +770,7 @@ impl GitEngine {
         }
         {
             let out = run_git_logged(
+                &self.env,
                 &["update-ref", "--no-deref", "HEAD", "HEAD"],
                 worktree,
                 sink,
@@ -765,6 +785,7 @@ impl GitEngine {
             if let Err(error) = self.delete_branch_logged(git_root, branch, sink) {
                 {
                     let restore = run_git_logged(
+                        &self.env,
                         &["symbolic-ref", "HEAD", &format!("refs/heads/{branch}")],
                         worktree,
                         sink,
@@ -806,7 +827,7 @@ impl GitEngine {
         } else {
             vec!["worktree", "add", wt_str, "-b", branch]
         };
-        let output = host_command::command(git_root)
+        let output = host_command::command(&self.env, git_root)
             .args(&args)
             .current_dir(git_root)
             .output()
@@ -829,7 +850,7 @@ impl GitEngine {
         let wt_str = worktree_path
             .to_str()
             .ok_or_else(|| EngineError::Git("worktree path not UTF-8".into()))?;
-        let output = host_command::command(git_root)
+        let output = host_command::command(&self.env, git_root)
             .args(["worktree", "remove", "--force", wt_str])
             .current_dir(git_root)
             .output()
@@ -853,7 +874,7 @@ impl GitEngine {
         worktree_path: &Path,
     ) -> Result<(), EngineError> {
         let args = ["merge", "--squash", branch];
-        let output = host_command::command(git_root)
+        let output = host_command::command(&self.env, git_root)
             .args(args)
             .current_dir(git_root)
             .output()
@@ -869,7 +890,7 @@ impl GitEngine {
         }
         let message = squash_commit_message(branch);
         let args = ["commit", "-m", &message];
-        let output = host_command::command(git_root)
+        let output = host_command::command(&self.env, git_root)
             .args(args)
             .current_dir(git_root)
             .output()
@@ -887,7 +908,7 @@ impl GitEngine {
     }
 
     pub fn commit_all(&self, path: &Path, message: &str) -> Result<(), EngineError> {
-        let add = host_command::command(path)
+        let add = host_command::command(&self.env, path)
             .args(["add", "-A"])
             .current_dir(path)
             .output()
@@ -899,7 +920,7 @@ impl GitEngine {
                 stderr.trim()
             )));
         }
-        let commit = host_command::command(path)
+        let commit = host_command::command(&self.env, path)
             .args(["commit", "-m", message])
             .current_dir(path)
             .output()
@@ -915,7 +936,7 @@ impl GitEngine {
     }
 
     pub fn delete_branch(&self, git_root: &Path, branch: &str) -> Result<(), EngineError> {
-        let output = host_command::command(git_root)
+        let output = host_command::command(&self.env, git_root)
             .args(["branch", "-D", branch])
             .current_dir(git_root)
             .output()
@@ -951,7 +972,7 @@ impl GitEngine {
         }
         args.push(url);
         args.push(dest_str);
-        let output = Command::new("git")
+        let output = crate::engine::host_cli::command(&self.env, "git")
             .args(&args)
             .output()
             .map_err(|e| EngineError::Git(format!("invoke `git clone`: {e}")))?;
@@ -995,7 +1016,7 @@ impl GitEngine {
         subdir: &str,
     ) -> Result<SparseCloneOutcome, EngineError> {
         let outcome = self.clone_repo_sparse_inner(url, dest, subdir, &mut |args, cwd| {
-            host_command::command(cwd)
+            host_command::command(&self.env, cwd)
                 .args(args)
                 .current_dir(cwd)
                 .output()
@@ -1016,7 +1037,7 @@ impl GitEngine {
         sink: &mut dyn GitFrontend,
     ) -> Result<SparseCloneOutcome, EngineError> {
         let outcome = self.clone_repo_sparse_inner(url, dest, subdir, &mut |args, cwd| {
-            run_git_logged(args, cwd, &mut *sink)
+            run_git_logged(&self.env, args, cwd, &mut *sink)
         })?;
         if outcome == SparseCloneOutcome::FellBackToShallow {
             sink.write_message(UserMessage {
@@ -1044,7 +1065,7 @@ impl GitEngine {
         let cwd = dest
             .parent()
             .map(Path::to_path_buf)
-            .unwrap_or_else(std::env::temp_dir);
+            .unwrap_or_else(|| self.env.temp_dir());
         let (clone, sparse) = Self::sparse_clone_argv(url, dest_str, subdir);
 
         let clone_refs: Vec<&str> = clone.iter().map(String::as_str).collect();
@@ -1090,7 +1111,7 @@ impl GitEngine {
         sink: &mut dyn GitFrontend,
     ) -> Result<(), EngineError> {
         let fetch_args = ["fetch", "--depth", "1", "origin"];
-        let fetch = run_git_logged(&fetch_args, repo_dir, sink)?;
+        let fetch = run_git_logged(&self.env, &fetch_args, repo_dir, sink)?;
         if !fetch.status.success() {
             let stderr = String::from_utf8_lossy(&fetch.stderr);
             return Err(EngineError::Git(format!(
@@ -1098,7 +1119,12 @@ impl GitEngine {
                 stderr.trim()
             )));
         }
-        let reset = run_git_logged(&["reset", "--hard", "origin/HEAD"], repo_dir, sink)?;
+        let reset = run_git_logged(
+            &self.env,
+            &["reset", "--hard", "origin/HEAD"],
+            repo_dir,
+            sink,
+        )?;
         if !reset.status.success() {
             let stderr = String::from_utf8_lossy(&reset.stderr);
             return Err(EngineError::Git(format!(
@@ -1110,7 +1136,7 @@ impl GitEngine {
     }
 
     fn pull_latest_with(&self, repo_dir: &Path, fetch_args: &[&str]) -> Result<(), EngineError> {
-        let fetch = host_command::command(repo_dir)
+        let fetch = host_command::command(&self.env, repo_dir)
             .args(fetch_args)
             .current_dir(repo_dir)
             .output()
@@ -1123,7 +1149,7 @@ impl GitEngine {
                 stderr.trim()
             )));
         }
-        let reset = host_command::command(repo_dir)
+        let reset = host_command::command(&self.env, repo_dir)
             .args(["reset", "--hard", "origin/HEAD"])
             .current_dir(repo_dir)
             .output()
@@ -1149,7 +1175,7 @@ impl GitEngine {
     /// named after the rewritten URL, and switching to the stored value would
     /// silently orphan it.
     pub fn remote_effective_url(&self, repo_dir: &Path, remote: &str) -> Option<String> {
-        let output = host_command::command(repo_dir)
+        let output = host_command::command(&self.env, repo_dir)
             .args(["remote", "get-url", remote])
             .current_dir(repo_dir)
             .stdout(std::process::Stdio::piped())
@@ -1171,7 +1197,7 @@ impl GitEngine {
     /// rewrites, which would mask the stored value this is meant to inspect.
     pub fn remote_url(&self, repo_dir: &Path, remote: &str) -> Result<String, EngineError> {
         let key = format!("remote.{remote}.url");
-        let output = host_command::command(repo_dir)
+        let output = host_command::command(&self.env, repo_dir)
             .args(["config", "--get", &key])
             .current_dir(repo_dir)
             .output()
@@ -1190,7 +1216,7 @@ impl GitEngine {
     /// remote's default branch. This intentionally discards local changes in
     /// a managed library clone.
     pub fn pull_latest(&self, repo_dir: &Path) -> Result<(), EngineError> {
-        let fetch = host_command::command(repo_dir)
+        let fetch = host_command::command(&self.env, repo_dir)
             .args(["fetch", "origin"])
             .current_dir(repo_dir)
             .output()
@@ -1203,7 +1229,7 @@ impl GitEngine {
             )));
         }
 
-        let reset = host_command::command(repo_dir)
+        let reset = host_command::command(&self.env, repo_dir)
             .args(["reset", "--hard", "origin/HEAD"])
             .current_dir(repo_dir)
             .output()
@@ -1231,7 +1257,7 @@ impl GitEngine {
         // exists or (b) exactly one remote has the branch (git auto-creates
         // a tracking branch). Try this first so we don't need a separate
         // remote-branch probe.
-        let output = host_command::command(path)
+        let output = host_command::command(&self.env, path)
             .args(["checkout", branch])
             .current_dir(path)
             .output()
@@ -1242,7 +1268,7 @@ impl GitEngine {
 
         // Fall back: branch exists neither locally nor on any remote — create
         // it from the current HEAD.
-        let output = host_command::command(path)
+        let output = host_command::command(&self.env, path)
             .args(["checkout", "-b", branch])
             .current_dir(path)
             .output()
@@ -1268,7 +1294,7 @@ impl GitEngine {
     }
 
     pub fn branch_exists(&self, git_root: &Path, branch: &str) -> bool {
-        host_command::command(git_root)
+        host_command::command(&self.env, git_root)
             .args(["rev-parse", "--verify", &format!("refs/heads/{branch}")])
             .current_dir(git_root)
             .stdout(std::process::Stdio::null())
@@ -1279,7 +1305,7 @@ impl GitEngine {
     }
 
     pub fn is_detached_head(&self, git_root: &Path) -> bool {
-        !host_command::command(git_root)
+        !host_command::command(&self.env, git_root)
             .args(["symbolic-ref", "--quiet", "HEAD"])
             .current_dir(git_root)
             .stdout(std::process::Stdio::null())
@@ -1292,7 +1318,7 @@ impl GitEngine {
     /// Return the current branch name at `git_root` (the branch HEAD points
     /// to). Returns `None` if HEAD is detached or git invocation fails.
     pub fn current_branch(&self, git_root: &Path) -> Option<String> {
-        let output = host_command::command(git_root)
+        let output = host_command::command(&self.env, git_root)
             .args(["rev-parse", "--abbrev-ref", "HEAD"])
             .current_dir(git_root)
             .stderr(std::process::Stdio::null())
@@ -1329,7 +1355,7 @@ impl GitEngine {
 
     /// One `git -C <path> config <key>`, `None` when unset or empty.
     fn config_value(&self, path: &Path, key: &str) -> Result<Option<String>, EngineError> {
-        let output = host_command::command(path)
+        let output = host_command::command(&self.env, path)
             .args(["config", key])
             .current_dir(path)
             .stderr(std::process::Stdio::null())
@@ -1379,7 +1405,7 @@ impl GitEngine {
             .tempdir()
             .map_err(|e| EngineError::Git(format!("create scratch dir: {e}")))?;
         let read = |key: &str| -> Result<Option<String>, EngineError> {
-            let output = host_command::discovery_command(scratch.path())
+            let output = host_command::discovery_command(&self.env, scratch.path())
                 .args(["config", "--global", "--get", key])
                 .current_dir(scratch.path())
                 .stderr(std::process::Stdio::null())
@@ -1411,7 +1437,7 @@ impl GitEngine {
             return Err(EngineError::Git("user.email must contain '@'".to_string()));
         }
         for (key, value) in [("user.name", name), ("user.email", email)] {
-            let output = host_command::command(repo)
+            let output = host_command::command(&self.env, repo)
                 .args(["config", "--local", key, value])
                 .current_dir(repo)
                 .output()
@@ -1455,7 +1481,7 @@ impl GitEngine {
 
     /// `git rev-parse --path-format=absolute --git-common-dir`.
     pub fn git_common_dir(&self, repo: &Path) -> Result<PathBuf, EngineError> {
-        let output = host_command::command(repo)
+        let output = host_command::command(&self.env, repo)
             .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
             .current_dir(repo)
             .output()
@@ -1478,7 +1504,7 @@ impl GitEngine {
         if branch.is_empty() || branch.starts_with('-') {
             return None;
         }
-        let output = host_command::command(repo)
+        let output = host_command::command(&self.env, repo)
             .args(["rev-parse", "--abbrev-ref"])
             .arg(format!("{branch}@{{upstream}}"))
             .current_dir(repo)
@@ -1501,7 +1527,7 @@ impl GitEngine {
         remote: &str,
     ) -> Result<Option<String>, EngineError> {
         let key = format!("remote.{remote}.url");
-        let output = host_command::command(repo)
+        let output = host_command::command(&self.env, repo)
             .args(["config", "--get", &key])
             .current_dir(repo)
             .stderr(std::process::Stdio::null())
@@ -1545,7 +1571,7 @@ impl GitEngine {
         scope: &[&str],
         key: &str,
     ) -> Result<Option<String>, EngineError> {
-        let output = host_command::command(path)
+        let output = host_command::command(&self.env, path)
             .arg("config")
             .args(scope)
             .args(["--get", key])
@@ -1557,7 +1583,7 @@ impl GitEngine {
     }
     /// The commit SHA HEAD points at in `git_root`.
     pub fn head_sha(&self, git_root: &Path) -> Result<String, EngineError> {
-        let output = host_command::command(git_root)
+        let output = host_command::command(&self.env, git_root)
             .args(["rev-parse", "HEAD"])
             .current_dir(git_root)
             .output()
@@ -1584,7 +1610,7 @@ impl GitEngine {
         path: &Path,
         sink: &mut dyn GitFrontend,
     ) -> Result<Vec<String>, EngineError> {
-        let output = run_git_logged(&["status", "--porcelain"], path, sink)?;
+        let output = run_git_logged(&self.env, &["status", "--porcelain"], path, sink)?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(EngineError::Git(format!(
@@ -1606,7 +1632,7 @@ impl GitEngine {
         message: &str,
         sink: &mut dyn GitFrontend,
     ) -> Result<(), EngineError> {
-        let add = run_git_logged(&["add", "-A"], path, sink)?;
+        let add = run_git_logged(&self.env, &["add", "-A"], path, sink)?;
         if !add.status.success() {
             let stderr = String::from_utf8_lossy(&add.stderr);
             return Err(EngineError::Git(format!(
@@ -1614,7 +1640,7 @@ impl GitEngine {
                 stderr.trim()
             )));
         }
-        let commit = run_git_logged(&["commit", "-m", message], path, sink)?;
+        let commit = run_git_logged(&self.env, &["commit", "-m", message], path, sink)?;
         if !commit.status.success() {
             let stderr = String::from_utf8_lossy(&commit.stderr);
             return Err(EngineError::Git(format!(
@@ -1636,6 +1662,7 @@ impl GitEngine {
         sink: &mut dyn GitFrontend,
     ) -> Result<(), EngineError> {
         let output = run_git_logged(
+            &self.env,
             &["stash", "push", "--include-untracked", "-m", message],
             git_root,
             sink,
@@ -1667,7 +1694,7 @@ impl GitEngine {
         } else {
             vec!["worktree", "add", wt_str, "-b", branch]
         };
-        let output = run_git_logged(&args, git_root, sink)?;
+        let output = run_git_logged(&self.env, &args, git_root, sink)?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(EngineError::Git(format!(
@@ -1687,7 +1714,12 @@ impl GitEngine {
         let wt_str = worktree_path
             .to_str()
             .ok_or_else(|| EngineError::Git("worktree path not UTF-8".into()))?;
-        let output = run_git_logged(&["worktree", "remove", "--force", wt_str], git_root, sink)?;
+        let output = run_git_logged(
+            &self.env,
+            &["worktree", "remove", "--force", wt_str],
+            git_root,
+            sink,
+        )?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(EngineError::Git(format!(
@@ -1715,7 +1747,7 @@ impl GitEngine {
         if !squash {
             let message = format!("Merge {branch}");
             let args = ["merge", "-m", &message, branch];
-            let output = run_git_logged(&args, git_root, sink)?;
+            let output = run_git_logged(&self.env, &args, git_root, sink)?;
             if !output.status.success() {
                 return Err(merge_failed(
                     branch,
@@ -1728,7 +1760,7 @@ impl GitEngine {
             return Ok(());
         }
         let args = ["merge", "--squash", branch];
-        let output = run_git_logged(&args, git_root, sink)?;
+        let output = run_git_logged(&self.env, &args, git_root, sink)?;
         if !output.status.success() {
             return Err(merge_failed(
                 branch,
@@ -1747,7 +1779,7 @@ impl GitEngine {
         }
         let message = squash_commit_message(branch);
         let args = ["commit", "-m", &message];
-        let output = run_git_logged(&args, git_root, sink)?;
+        let output = run_git_logged(&self.env, &args, git_root, sink)?;
         if !output.status.success() {
             return Err(merge_failed(
                 branch,
@@ -1766,7 +1798,12 @@ impl GitEngine {
         git_root: &Path,
         sink: &mut dyn GitFrontend,
     ) -> Result<String, EngineError> {
-        let output = run_git_logged(&["rev-parse", "--verify", "HEAD"], git_root, sink)?;
+        let output = run_git_logged(
+            &self.env,
+            &["rev-parse", "--verify", "HEAD"],
+            git_root,
+            sink,
+        )?;
         if !output.status.success() {
             return Err(EngineError::Git("reading HEAD failed".into()));
         }
@@ -1779,7 +1816,7 @@ impl GitEngine {
         git_root: &Path,
         sink: &mut dyn GitFrontend,
     ) -> Result<bool, EngineError> {
-        let check = run_git_logged(&["diff", "--cached", "--quiet"], git_root, sink)?;
+        let check = run_git_logged(&self.env, &["diff", "--cached", "--quiet"], git_root, sink)?;
         Ok(!check.status.success())
     }
 
@@ -1789,7 +1826,12 @@ impl GitEngine {
         git_root: &Path,
         sink: &mut dyn GitFrontend,
     ) -> Result<Vec<String>, EngineError> {
-        let output = run_git_logged(&["diff", "--cached", "--name-only", "-z"], git_root, sink)?;
+        let output = run_git_logged(
+            &self.env,
+            &["diff", "--cached", "--name-only", "-z"],
+            git_root,
+            sink,
+        )?;
         if !output.status.success() {
             return Err(EngineError::Git("reading staged paths failed".into()));
         }
@@ -1814,6 +1856,7 @@ impl GitEngine {
         sink: &mut dyn GitFrontend,
     ) -> Result<Vec<String>, EngineError> {
         let output = run_git_logged(
+            &self.env,
             &["diff", "--name-only", "--diff-filter=U", "-z"],
             git_root,
             sink,
@@ -1846,7 +1889,7 @@ impl GitEngine {
     /// conflicted squash merge leaves no `MERGE_HEAD`; check
     /// [`Self::unmerged_paths_logged`] too.
     pub fn merge_in_progress(&self, git_root: &Path) -> bool {
-        host_command::command(git_root)
+        host_command::command(&self.env, git_root)
             .args(["rev-parse", "-q", "--verify", "MERGE_HEAD"])
             .current_dir(git_root)
             .output()
@@ -1857,6 +1900,7 @@ impl GitEngine {
     /// [`Self::merge_in_progress`], with the probe reported to `sink`.
     pub fn merge_in_progress_logged(&self, git_root: &Path, sink: &mut dyn GitFrontend) -> bool {
         run_git_logged(
+            &self.env,
             &["rev-parse", "-q", "--verify", "MERGE_HEAD"],
             git_root,
             sink,
@@ -1867,7 +1911,7 @@ impl GitEngine {
 
     /// Whether `commit` is an ancestor of (already merged into) `HEAD`.
     pub fn is_merged_into_head(&self, git_root: &Path, commit: &str) -> bool {
-        host_command::command(git_root)
+        host_command::command(&self.env, git_root)
             .args(["merge-base", "--is-ancestor", commit, "HEAD"])
             .current_dir(git_root)
             .output()
@@ -1883,6 +1927,7 @@ impl GitEngine {
         sink: &mut dyn GitFrontend,
     ) -> bool {
         run_git_logged(
+            &self.env,
             &["merge-base", "--is-ancestor", commit, "HEAD"],
             git_root,
             sink,
@@ -1904,7 +1949,7 @@ impl GitEngine {
         }
         let mut args = vec!["--literal-pathspecs", "add", "--"];
         args.extend(paths.iter().map(String::as_str));
-        let output = run_git_logged(&args, git_root, sink)?;
+        let output = run_git_logged(&self.env, &args, git_root, sink)?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(EngineError::Git(format!(
@@ -1928,7 +1973,7 @@ impl GitEngine {
             None => vec!["commit", "--no-edit"],
             Some(m) => vec!["commit", "-m", m],
         };
-        let output = run_git_logged(&args, git_root, sink)?;
+        let output = run_git_logged(&self.env, &args, git_root, sink)?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(EngineError::Git(format!(
@@ -1945,7 +1990,7 @@ impl GitEngine {
         branch: &str,
         sink: &mut dyn GitFrontend,
     ) -> Result<(), EngineError> {
-        let output = run_git_logged(&["branch", "-D", branch], git_root, sink)?;
+        let output = run_git_logged(&self.env, &["branch", "-D", branch], git_root, sink)?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(EngineError::Git(format!(
@@ -1986,8 +2031,8 @@ impl GitEngine {
         let cwd = dest
             .parent()
             .map(Path::to_path_buf)
-            .unwrap_or_else(std::env::temp_dir);
-        let output = run_git_logged_cancellable(&args, &cwd, sink, cancel)?;
+            .unwrap_or_else(|| self.env.temp_dir());
+        let output = run_git_logged_cancellable(&self.env, &args, &cwd, sink, cancel)?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(EngineError::Git(format!(
@@ -2005,7 +2050,7 @@ impl GitEngine {
         repo_dir: &Path,
         sink: &mut dyn GitFrontend,
     ) -> Result<(), EngineError> {
-        let fetch = run_git_logged(&["fetch", "origin"], repo_dir, sink)?;
+        let fetch = run_git_logged(&self.env, &["fetch", "origin"], repo_dir, sink)?;
         if !fetch.status.success() {
             let stderr = String::from_utf8_lossy(&fetch.stderr);
             return Err(EngineError::Git(format!(
@@ -2014,7 +2059,12 @@ impl GitEngine {
             )));
         }
 
-        let reset = run_git_logged(&["reset", "--hard", "origin/HEAD"], repo_dir, sink)?;
+        let reset = run_git_logged(
+            &self.env,
+            &["reset", "--hard", "origin/HEAD"],
+            repo_dir,
+            sink,
+        )?;
         if !reset.status.success() {
             let stderr = String::from_utf8_lossy(&reset.stderr);
             return Err(EngineError::Git(format!(
@@ -2036,11 +2086,11 @@ impl GitEngine {
         branch: &str,
         sink: &mut dyn GitFrontend,
     ) -> Result<&'static str, EngineError> {
-        let output = run_git_logged(&["checkout", branch], path, sink)?;
+        let output = run_git_logged(&self.env, &["checkout", branch], path, sink)?;
         if output.status.success() {
             return Ok("checked-out");
         }
-        let output = run_git_logged(&["checkout", "-b", branch], path, sink)?;
+        let output = run_git_logged(&self.env, &["checkout", "-b", branch], path, sink)?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(EngineError::Git(format!(
@@ -2092,7 +2142,7 @@ impl GitEngine {
         sink: &mut dyn GitFrontend,
     ) -> Result<&'static str, EngineError> {
         let target = format!("refs/remotes/origin/{branch}");
-        let output = run_git_logged(&["checkout", "-B", branch, &target], repo, sink)?;
+        let output = run_git_logged(&self.env, &["checkout", "-B", branch, &target], repo, sink)?;
         if !output.status.success() {
             return Err(EngineError::Git(
                 String::from_utf8_lossy(&output.stderr).trim().into(),
@@ -2103,7 +2153,7 @@ impl GitEngine {
 
     /// `git rev-parse --verify --quiet refs/remotes/<remote>/<branch>` → sha, or `None`.
     pub fn remote_ref_sha(&self, repo: &Path, remote: &str, branch: &str) -> Option<String> {
-        let output = host_command::command(repo)
+        let output = host_command::command(&self.env, repo)
             .args(["rev-parse", "--verify", "--quiet"])
             .arg(format!("refs/remotes/{remote}/{branch}^{{commit}}"))
             .current_dir(repo)
@@ -2124,7 +2174,7 @@ impl GitEngine {
         names: &[String],
     ) -> Result<Option<String>, EngineError> {
         let scratch = tempfile::tempdir().map_err(|e| EngineError::Git(e.to_string()))?;
-        let mut command = host_command::command(scratch.path());
+        let mut command = host_command::command(&self.env, scratch.path());
         command
             .args(["ls-remote", "--heads", "--tags", url])
             .current_dir(scratch.path())
@@ -2156,7 +2206,12 @@ impl GitEngine {
     ) -> Result<String, EngineError> {
         for candidate in [base_ref.to_string(), format!("origin/{base_ref}")] {
             let spec = format!("{candidate}^{{commit}}");
-            let output = run_git_logged(&["rev-parse", "--verify", "--quiet", &spec], repo, sink)?;
+            let output = run_git_logged(
+                &self.env,
+                &["rev-parse", "--verify", "--quiet", &spec],
+                repo,
+                sink,
+            )?;
             if output.status.success() {
                 return Ok(candidate);
             }
@@ -2177,6 +2232,7 @@ impl GitEngine {
         sink: &mut dyn GitFrontend,
     ) -> Result<(), EngineError> {
         let output = run_git_logged(
+            &self.env,
             &["checkout", "--no-track", "-b", branch, start_point],
             repo,
             sink,
@@ -2208,7 +2264,7 @@ impl GitEngine {
         }
         let target = format!("refs/remotes/origin/{merge_ref}");
         let args = with_overrides(identity, &["merge", "--no-ff", "--no-edit", &target]);
-        let output = run_git_logged(&args, repo, sink)?;
+        let output = run_git_logged(&self.env, &args, repo, sink)?;
         if output.status.success() {
             let stdout = String::from_utf8_lossy(&output.stdout);
             if stdout.contains("Already up to date") {
@@ -2221,7 +2277,7 @@ impl GitEngine {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         let conflicting_paths = self.unmerged_paths_logged(repo, sink).unwrap_or_default();
         // Leave the clone at the pre-merge HEAD. A failed abort is logged and ignored.
-        let _ = run_git_logged(&["merge", "--abort"], repo, sink);
+        let _ = run_git_logged(&self.env, &["merge", "--abort"], repo, sink);
         if conflicting_paths.is_empty() {
             Err(EngineError::Git(format!(
                 "git merge {target} failed: {stderr}"
@@ -2244,7 +2300,7 @@ impl GitEngine {
         identity: &CommitIdentity,
         sink: &mut dyn GitFrontend,
     ) -> Result<CommitAllOutcome, EngineError> {
-        let output = run_git_logged(&["add", "-A", "--", "."], repo, sink)?;
+        let output = run_git_logged(&self.env, &["add", "-A", "--", "."], repo, sink)?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(EngineError::Git(format!(
@@ -2256,7 +2312,7 @@ impl GitEngine {
             return Ok(CommitAllOutcome::NothingToCommit);
         }
         let args = with_overrides(identity, &["commit", "-m", message]);
-        let output = run_git_logged(&args, repo, sink)?;
+        let output = run_git_logged(&self.env, &args, repo, sink)?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(EngineError::Git(format!(
@@ -2281,7 +2337,13 @@ impl GitEngine {
     ) -> Result<String, EngineError> {
         let refspec = format!("HEAD:refs/heads/{branch}");
         let args = ["push", "-u", remote, refspec.as_str()];
-        let output = run_git_logged_env(&args, repo, &[("GIT_TERMINAL_PROMPT", "0")], sink)?;
+        let output = run_git_logged_env(
+            &self.env,
+            &args,
+            repo,
+            &[("GIT_TERMINAL_PROMPT", "0")],
+            sink,
+        )?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(EngineError::Git(format!(
@@ -2413,8 +2475,12 @@ pub fn build_summary(
 }
 
 /// Run a git command with explicit args in `root`.
-fn run_git_summary(args: &[&str], root: &Path) -> Result<String, EngineError> {
-    let output = host_command::command(root)
+fn run_git_summary(
+    snapshot: &crate::data::config::env::EnvSnapshot,
+    args: &[&str],
+    root: &Path,
+) -> Result<String, EngineError> {
+    let output = host_command::command(snapshot, root)
         .args(args)
         .current_dir(root)
         .output()

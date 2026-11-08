@@ -1840,20 +1840,8 @@ fn workflow_context_overlay_writable_uses_active_permission_override() {
 
 // ── Feature B (WI-0099): teardown failure output capture — integration ──
 //
-// `prepare_phase_failure_file` resolves the host directory via
-// `ContextDirResolver::from_process_env()`, which reads the *real* process
-// environment (there is no test-injectable `EnvSnapshot` seam on that call
-// path). These tests therefore pin `AWMAN_HOME` to a temp dir for
-// their duration, through `ConfigHomeGuard` — the one lock over that
-// process-wide variable, which also restores the previous value on drop.
-// A mutex private to this file would serialise these six tests against each
-// other only, leaving the `clean`, `dispatch` and `overlay` tests free to
-// repoint the config home mid-test: `ContextDirResolver::from_process_env`
-// would then resolve a directory this test never created, and the
-// assertions below would look for the failure file in the temp dir that is
-// still theirs.
-
-use crate::data::config::env::ConfigHomeGuard;
+// Failure artifacts resolve from the session snapshot. Each fixture below binds
+// AWMAN_HOME explicitly, so parallel instances need no process-global override.
 
 /// `(step name, resolved prompt, overlays)` recorded per `execution_for_step` call.
 type RecordedStepCall = (String, String, Option<Vec<String>>);
@@ -1918,10 +1906,8 @@ async fn setup_failure_writes_a_setup_named_failure_file_beside_teardowns() {
     let awman_home_path = awman_home.path().to_path_buf();
 
     tokio::task::spawn_blocking(move || {
-        let _env_guard = ConfigHomeGuard::set(&awman_home_path);
-
         let tmp = tempfile::tempdir().unwrap();
-        let session = make_session(&tmp);
+        let session = make_session_with_home(&tmp, &awman_home_path);
         let mut workflow = make_workflow(
             Some("wf-setup-failure-file"),
             Some("claude"),
@@ -2014,19 +2000,13 @@ async fn teardown_failure_with_active_context_workflow_overlay_writes_into_it() 
     use crate::data::fs::context_dirs::ContextDirResolver;
     use crate::data::workflow_definition::TeardownStep;
 
-    // `awman_home` stays alive in this outer frame for the whole test
-    // (including across the `.await` below) so the directory exists for
-    // the blocking closure's whole execution. The `ConfigHomeGuard` lives
-    // entirely *inside* the closure, so no `MutexGuard` is held across an
-    // await point.
+    // Keep the fixture directory alive while the snapshot travels to the worker.
     let awman_home = tempfile::tempdir().unwrap();
     let awman_home_path = awman_home.path().to_path_buf();
 
     tokio::task::spawn_blocking(move || {
-        let _env_guard = ConfigHomeGuard::set(&awman_home_path);
-
         let tmp = tempfile::tempdir().unwrap();
-        let session = make_session(&tmp);
+        let session = make_session_with_home(&tmp, &awman_home_path);
         let mut workflow = make_workflow(
             Some("wf-overlay-active"),
             Some("claude"),
@@ -2112,10 +2092,8 @@ async fn teardown_failure_with_readonly_context_workflow_overlay_uses_remediatio
     let awman_home_path = awman_home.path().to_path_buf();
 
     tokio::task::spawn_blocking(move || {
-        let _env_guard = ConfigHomeGuard::set(&awman_home_path);
-
         let tmp = tempfile::tempdir().unwrap();
-        let session = make_session(&tmp);
+        let session = make_session_with_home(&tmp, &awman_home_path);
         let mut workflow = make_workflow(
             Some("wf-overlay-readonly"),
             Some("claude"),
@@ -2197,19 +2175,13 @@ async fn teardown_failure_without_context_workflow_overlay_uses_ephemeral_mount(
     use crate::data::fs::context_dirs::ContextDirResolver;
     use crate::data::workflow_definition::TeardownStep;
 
-    // `awman_home` stays alive in this outer frame for the whole test
-    // (including across the `.await` below) so the directory exists for
-    // the blocking closure's whole execution. The `ConfigHomeGuard` lives
-    // entirely *inside* the closure, so no `MutexGuard` is held across an
-    // await point.
+    // Keep the fixture directory alive while the snapshot travels to the worker.
     let awman_home = tempfile::tempdir().unwrap();
     let awman_home_path = awman_home.path().to_path_buf();
 
     tokio::task::spawn_blocking(move || {
-        let _env_guard = ConfigHomeGuard::set(&awman_home_path);
-
         let tmp = tempfile::tempdir().unwrap();
-        let session = make_session(&tmp);
+        let session = make_session_with_home(&tmp, &awman_home_path);
         // No `context(workflow)` declared.
         let workflow = make_workflow(
             Some("wf-overlay-absent"),
@@ -2295,19 +2267,13 @@ async fn teardown_failure_retry_overwrites_file_with_latest_output() {
     use crate::data::fs::context_dirs::ContextDirResolver;
     use crate::data::workflow_definition::TeardownStep;
 
-    // `awman_home` stays alive in this outer frame for the whole test
-    // (including across the `.await` below) so the directory exists for
-    // the blocking closure's whole execution. The `ConfigHomeGuard` lives
-    // entirely *inside* the closure, so no `MutexGuard` is held across an
-    // await point.
+    // Keep the fixture directory alive while the snapshot travels to the worker.
     let awman_home = tempfile::tempdir().unwrap();
     let awman_home_path = awman_home.path().to_path_buf();
 
     tokio::task::spawn_blocking(move || {
-        let _env_guard = ConfigHomeGuard::set(&awman_home_path);
-
         let tmp = tempfile::tempdir().unwrap();
-        let session = make_session(&tmp);
+        let session = make_session_with_home(&tmp, &awman_home_path);
         let mut workflow = make_workflow(
             Some("wf-retry-overwrite"),
             Some("claude"),
@@ -2383,19 +2349,13 @@ async fn teardown_failure_write_error_degrades_gracefully() {
     use crate::data::fs::context_dirs::ContextDirResolver;
     use crate::data::workflow_definition::TeardownStep;
 
-    // `awman_home` stays alive in this outer frame for the whole test
-    // (including across the `.await` below) so the directory exists for
-    // the blocking closure's whole execution. The `ConfigHomeGuard` lives
-    // entirely *inside* the closure, so no `MutexGuard` is held across an
-    // await point.
+    // Keep the fixture directory alive while the snapshot travels to the worker.
     let awman_home = tempfile::tempdir().unwrap();
     let awman_home_path = awman_home.path().to_path_buf();
 
     tokio::task::spawn_blocking(move || {
-        let _env_guard = ConfigHomeGuard::set(&awman_home_path);
-
         let tmp = tempfile::tempdir().unwrap();
-        let session = make_session(&tmp);
+        let session = make_session_with_home(&tmp, &awman_home_path);
         let mut workflow = make_workflow(
             Some("wf-write-failure"),
             Some("claude"),

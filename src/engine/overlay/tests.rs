@@ -2,6 +2,35 @@
 //! file, unchanged).
 
 use super::*;
+
+#[test]
+fn daemon_control_directory_cannot_be_mounted() {
+    let root = tempfile::tempdir().unwrap();
+    let daemon = root.path().join("data/daemon");
+    std::fs::create_dir_all(&daemon).unwrap();
+    let env = crate::data::config::env::EnvSnapshot::with_overrides([
+        (
+            crate::data::config::env::AWMAN_HOME,
+            root.path().to_str().unwrap(),
+        ),
+        (
+            crate::data::config::env::HOME,
+            root.path().to_str().unwrap(),
+        ),
+    ]);
+    let engine =
+        OverlayEngine::with_auth_resolver(AuthPathResolver::at_home(root.path())).with_env(env);
+    let spec = DirectorySpec {
+        host: daemon.to_string_lossy().into_owned(),
+        container: "/control".into(),
+        permission: OverlayPermission::ReadOnly,
+    };
+    assert!(engine
+        .resolve_user_overlay(&spec, root.path(), None)
+        .unwrap_err()
+        .to_string()
+        .contains("daemon control"));
+}
 use crate::data::session::AgentName;
 
 /// Set `AWMAN_HOME` to `home`, run `f`, then restore the previous value.

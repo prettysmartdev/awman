@@ -283,7 +283,7 @@ fn buffer_text(buf: &ratatui::buffer::Buffer) -> String {
 
 fn push_squad_tab(app: &mut App) -> usize {
     let tab = crate::frontend::tui::tabs::Tab::new_squad(make_session());
-    app.tabs.push(tab);
+    app.push_tab(tab);
     let idx = app.tabs.len() - 1;
     app.active_tab = idx;
     idx
@@ -1844,7 +1844,7 @@ fn workflow_context_footer_tracks_the_active_tab_and_execution_lifecycle() {
 
     let mut app = make_app();
     activate_workflow_context(&mut app, "/host/context/first");
-    app.tabs.push(Tab::new(make_session()));
+    app.push_tab(Tab::new(make_session()));
     app.active_tab = 1;
     app.active_tab_mut().execution_phase = ExecutionPhase::Running {
         command: "exec workflow".into(),

@@ -35,7 +35,7 @@ use crate::engine::error::EngineError;
 const AGENT_LIST_FORMAT: &str = "{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.CreatedAt}}";
 
 // The fixture overrides only listing calls on its own thread.
-fn listing_command() -> Command {
+fn listing_command(cli: ContainerCli) -> Command {
     #[cfg(all(test, unix))]
     if let Some(path) = docker_listing_tests::CLI.with(|cli| cli.borrow().clone()) {
         // The fixture is a freshly written shell script. Concurrent test
@@ -45,13 +45,16 @@ fn listing_command() -> Command {
         command.arg(path);
         return command;
     }
-    Command::new(crate::engine::host_cli::program("docker"))
+    cli.command()
 }
 
 /// Query Docker once for each ownership route, then merge by id. The name
 /// query keeps compatibility with legacy awman containers created before
 /// the ownership label was added.
-fn list_owned_containers(stopped: bool) -> Result<Vec<AgentHandle>, EngineError> {
+fn list_owned_containers(
+    cli: ContainerCli,
+    stopped: bool,
+) -> Result<Vec<AgentHandle>, EngineError> {
     let mut handles = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for ownership_filter in ["label=awman=true", "name=awman-"] {
@@ -65,7 +68,7 @@ fn list_owned_containers(stopped: bool) -> Result<Vec<AgentHandle>, EngineError>
         }
         args.extend(["--format", AGENT_LIST_FORMAT]);
         let output = crate::engine::host_cli::checked_output(
-            listing_command()
+            listing_command(cli.clone())
                 .args(args)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null()),
@@ -111,9 +114,9 @@ fn parse_agent_listing(
         .collect()
 }
 
-fn query_agent_listing(args: &[&str]) -> Result<Vec<AgentHandle>, EngineError> {
+fn query_agent_listing(cli: ContainerCli, args: &[&str]) -> Result<Vec<AgentHandle>, EngineError> {
     let output = crate::engine::host_cli::checked_output(
-        listing_command()
+        listing_command(cli.clone())
             .args(args)
             .stdout(Stdio::piped())
             .stderr(Stdio::null()),
@@ -131,13 +134,38 @@ fn query_agent_listing(args: &[&str]) -> Result<Vec<AgentHandle>, EngineError> {
 const AWMAN_LABEL: &str = ContainerCli::DOCKER.label;
 
 #[derive(Debug, Default)]
-pub(super) struct DockerBackend;
+pub(super) struct DockerBackend {
+    env: Option<crate::data::config::env::EnvSnapshot>,
+}
+#[cfg(test)]
+#[allow(non_upper_case_globals)]
+pub(super) const DockerBackend: DockerBackend = DockerBackend { env: None };
+impl DockerBackend {
+    pub(super) fn new(env: crate::data::config::env::EnvSnapshot) -> Self {
+        Self { env: Some(env) }
+    }
+    fn cli(&self) -> ContainerCli {
+        let cli = ContainerCli::DOCKER;
+        match &self.env {
+            Some(env) => cli.in_env(env.clone()),
+            None => cli,
+        }
+    }
+}
 
 impl ContainerBackend for DockerBackend {
     fn build(
         &self,
-        options: ResolvedContainerOptions,
+        mut options: ResolvedContainerOptions,
     ) -> Result<Box<dyn AgentInstance>, EngineError> {
+        if options.host_env.is_none() {
+            options.host_env = self.env.clone();
+        }
+        let cli = options
+            .host_env
+            .as_ref()
+            .map(|env| self.cli().in_env(env.clone()))
+            .unwrap_or_else(|| self.cli());
         let image = options
             .image
             .clone()
@@ -156,26 +184,21 @@ impl ContainerBackend for DockerBackend {
         // hook is needed (`ContainerBackend::attach` below opens
         // `docker attach`). Apple, which has no such verb, passes one.
         Ok(Box::new(ContainerInstance::new(
-            ContainerCli::DOCKER,
-            image,
-            name,
-            options,
-            leases,
-            None,
+            cli, image, name, options, leases, None,
         )))
     }
 
     fn list_running(&self, _session: &Session) -> Result<Vec<AgentHandle>, EngineError> {
-        list_owned_containers(false)
+        list_owned_containers(self.cli(), false)
     }
 
     fn list_running_all(&self) -> Result<Vec<AgentHandle>, EngineError> {
-        list_owned_containers(false)
+        list_owned_containers(self.cli(), false)
     }
 
     fn list_stopped(&self) -> Result<Vec<AgentHandle>, EngineError> {
         // Keep the ownership label and the legacy name-prefix route in sync.
-        list_owned_containers(true)
+        list_owned_containers(self.cli(), true)
     }
 
     fn list_dangling_images(
@@ -183,7 +206,9 @@ impl ContainerBackend for DockerBackend {
     ) -> Result<Vec<crate::engine::container::runtime::ContainerImageInfo>, EngineError> {
         use crate::engine::container::runtime::ContainerImageInfo;
         let format = "{{.ID}}\t{{.Repository}}:{{.Tag}}\t{{.Size}}";
-        let output = Command::new(crate::engine::host_cli::program("docker"))
+        let output = self
+            .cli()
+            .command()
             .args([
                 "images",
                 "--filter",
@@ -228,7 +253,8 @@ impl ContainerBackend for DockerBackend {
 
     fn stats(&self, handle: &AgentHandle) -> Result<AgentStats, EngineError> {
         let output = crate::engine::host_cli::checked_output(
-            Command::new(crate::engine::host_cli::program("docker"))
+            self.cli()
+                .command()
                 .args([
                     "stats",
                     "--no-stream",
@@ -252,19 +278,23 @@ impl ContainerBackend for DockerBackend {
 
     fn attach(&self, handle: &AgentHandle) -> Result<Box<dyn AgentInstance>, EngineError> {
         Ok(Box::new(AttachInstance {
+            cli: self.cli(),
             handle: handle.clone(),
         }))
     }
 
     fn list_running_with_name_prefix(&self, prefix: &str) -> Result<Vec<AgentHandle>, EngineError> {
-        query_agent_listing(&[
-            "ps",
-            "--no-trunc",
-            "--filter",
-            &format!("name={prefix}"),
-            "--format",
-            AGENT_LIST_FORMAT,
-        ])
+        query_agent_listing(
+            self.cli(),
+            &[
+                "ps",
+                "--no-trunc",
+                "--filter",
+                &format!("name={prefix}"),
+                "--format",
+                AGENT_LIST_FORMAT,
+            ],
+        )
     }
 
     fn name(&self) -> &'static str {
@@ -284,33 +314,30 @@ impl ContainerBackend for DockerBackend {
     }
 
     fn is_available(&self) -> Result<(), EngineError> {
-        host_cli_backend::cli_is_available(
-            ContainerCli::DOCKER,
-            &["info", "--format", "{{.ServerVersion}}"],
-        )
+        host_cli_backend::cli_is_available(self.cli(), &["info", "--format", "{{.ServerVersion}}"])
     }
 
     fn stop(&self, handle: &AgentHandle) -> Result<(), EngineError> {
-        host_cli_backend::cli_stop_checked(ContainerCli::DOCKER, &handle.id)
+        host_cli_backend::cli_stop_checked(self.cli(), &handle.id)
     }
 
     fn remove_agent(&self, id: &str) -> Result<(), EngineError> {
-        host_cli_backend::cli_remove(ContainerCli::DOCKER, "rm", id)
+        host_cli_backend::cli_remove(self.cli(), "rm", id)
     }
 
     fn image_exists(&self, tag: &str) -> Result<bool, EngineError> {
-        host_cli_backend::cli_image_exists(ContainerCli::DOCKER, tag)
+        host_cli_backend::cli_image_exists(self.cli(), tag)
     }
 
     fn run_probe(
         &self,
         request: &crate::engine::container::backend::ProbeRequest<'_>,
     ) -> Result<String, EngineError> {
-        host_cli_backend::cli_run_probe(ContainerCli::DOCKER, request)
+        host_cli_backend::cli_run_probe(self.cli(), request)
     }
 
     fn image_id(&self, tag: &str) -> Result<Option<String>, EngineError> {
-        host_cli_backend::cli_image_id(ContainerCli::DOCKER, tag)
+        host_cli_backend::cli_image_id(self.cli(), tag)
     }
 
     fn build_image(
@@ -324,14 +351,7 @@ impl ContainerBackend for DockerBackend {
         let context = request.context.as_path();
         let no_cache = request.no_cache;
 
-        host_cli_backend::cli_build_image(
-            ContainerCli::DOCKER,
-            tag,
-            dockerfile,
-            context,
-            no_cache,
-            on_line,
-        )
+        host_cli_backend::cli_build_image(self.cli(), tag, dockerfile, context, no_cache, on_line)
     }
 
     fn import_image(
@@ -346,7 +366,7 @@ impl ContainerBackend for DockerBackend {
     }
 
     fn remove_image(&self, id: &str) -> Result<(), EngineError> {
-        host_cli_backend::cli_remove(ContainerCli::DOCKER, "rmi", id)
+        host_cli_backend::cli_remove(self.cli(), "rmi", id)
     }
 
     /// Docker and Apple Containers have no builtin launch settings; the
@@ -356,7 +376,7 @@ impl ContainerBackend for DockerBackend {
         request: &background::BackgroundLaunchRequest<'_>,
     ) -> Result<String, EngineError> {
         background::default_start_background(
-            ContainerCli::DOCKER,
+            self.cli(),
             request.name,
             request.image,
             request.workdir,
@@ -373,7 +393,7 @@ impl ContainerBackend for DockerBackend {
         working_dir: &str,
         env: Option<&HashMap<String, String>>,
     ) -> Result<ExecOutput, EngineError> {
-        background::default_exec_in_background(ContainerCli::DOCKER, id, command, working_dir, env)
+        background::default_exec_in_background(self.cli(), id, command, working_dir, env)
     }
 
     fn exec_in_background_streaming(
@@ -387,7 +407,7 @@ impl ContainerBackend for DockerBackend {
         let env = request.env;
 
         background::default_exec_in_background_streaming(
-            ContainerCli::DOCKER,
+            self.cli(),
             id,
             command,
             working_dir,
@@ -397,22 +417,23 @@ impl ContainerBackend for DockerBackend {
     }
 
     fn stop_and_remove(&self, id: &str) -> Result<(), EngineError> {
-        background::default_stop_and_remove(ContainerCli::DOCKER, id);
+        background::default_stop_and_remove(self.cli(), id);
         Ok(())
     }
 
     fn image_home_dir(&self, tag: &str) -> Result<Option<String>, EngineError> {
-        Ok(docker_image_home_dir(tag))
+        Ok(docker_image_home_dir(self.cli(), tag))
     }
 }
 
 /// Read `HOME` from `tag`'s image config via `docker image inspect`. `None` when
 /// the image is missing, the CLI is unreachable, or no `HOME` is declared.
-fn docker_image_home_dir(tag: &str) -> Option<String> {
+fn docker_image_home_dir(cli: ContainerCli, tag: &str) -> Option<String> {
     // Print one env entry per line so we can scan for `HOME=…` without
     // parsing JSON. `docker image inspect` exits 0 even when User/Env are
     // empty; the format expansion just produces nothing then.
-    let output = Command::new(crate::engine::host_cli::program("docker"))
+    let output = cli
+        .command()
         .args([
             "image",
             "inspect",
@@ -485,6 +506,7 @@ pub(super) fn kill_local_exec(pid: Option<u32>) {
 /// `docker attach` session to PID 1's existing terminal and bridges it through
 /// the same PTY/piped machinery a fresh `docker run` uses.
 struct AttachInstance {
+    cli: ContainerCli,
     handle: AgentHandle,
 }
 
@@ -529,10 +551,17 @@ impl AgentInstance for AttachInstance {
         // local client, and SIGKILL is never proxied).
         let argv = vec!["attach".to_string(), handle.id.clone()];
         if io.initial_size.is_some() {
-            return spawn_pty_bridged_attach(io, argv, started_at, handle, bridge_cfg);
+            return spawn_pty_bridged_attach(
+                self.cli.clone(),
+                io,
+                argv,
+                started_at,
+                handle,
+                bridge_cfg,
+            );
         }
 
-        spawn_piped_attach(io, argv, started_at, handle, bridge_cfg)
+        spawn_piped_attach(self.cli.clone(), io, argv, started_at, handle, bridge_cfg)
     }
 }
 
@@ -540,13 +569,14 @@ impl AgentInstance for AttachInstance {
 /// frontend's `AgentIo`. Mirrors `spawn_pty_bridged_docker` but substitutes
 /// the exec argv and produces an `AttachExecution`.
 fn spawn_pty_bridged_attach(
+    cli: ContainerCli,
     io: crate::engine::agent_runtime::frontend::AgentIo,
     argv: Vec<String>,
     started_at: chrono::DateTime<chrono::Utc>,
     handle: crate::data::session::AgentHandle,
     bridge_cfg: crate::engine::container::io_bridge::BridgeConfig,
 ) -> Result<AgentExecution, EngineError> {
-    use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+    use portable_pty::{native_pty_system, PtySize};
 
     let (cols, rows) = io.initial_size.expect("PTY path requires initial_size");
     let pty_system = native_pty_system();
@@ -559,7 +589,8 @@ fn spawn_pty_bridged_attach(
         })
         .map_err(|e| EngineError::Container(format!("openpty: {e}")))?;
 
-    let mut cmd = CommandBuilder::new(crate::engine::host_cli::program("docker"));
+    let snapshot = cli.snapshot();
+    let mut cmd = crate::engine::host_cli::pty_command(&snapshot, "docker");
     for arg in &argv {
         cmd.arg(arg);
     }
@@ -595,13 +626,14 @@ fn spawn_pty_bridged_attach(
 /// `spawn_piped_docker` but substitutes the exec argv and produces an
 /// `AttachExecution`.
 fn spawn_piped_attach(
+    cli: ContainerCli,
     io: crate::engine::agent_runtime::frontend::AgentIo,
     argv: Vec<String>,
     started_at: chrono::DateTime<chrono::Utc>,
     handle: crate::data::session::AgentHandle,
     bridge_cfg: crate::engine::container::io_bridge::BridgeConfig,
 ) -> Result<AgentExecution, EngineError> {
-    let mut cmd = Command::new(crate::engine::host_cli::program("docker"));
+    let mut cmd = cli.command();
     cmd.args(&argv);
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
@@ -766,7 +798,14 @@ fn resolve_env_passthrough_raw(options: &ResolvedContainerOptions) -> Vec<(Strin
         .iter()
         .filter(|envvar| is_env_var_name(&envvar.0))
         .filter_map(|envvar| {
-            crate::data::config::env::host_var(&envvar.0).map(|value| (envvar.0.clone(), value))
+            options
+                .host_env
+                .as_ref()
+                .map_or_else(
+                    || crate::data::config::env::host_var(&envvar.0),
+                    |env| env.get(&envvar.0).map(str::to_owned),
+                )
+                .map(|value| (envvar.0.clone(), value))
         })
         .collect();
     for (key, value) in &options.env_overrides {
@@ -821,7 +860,14 @@ pub(super) fn scrubbed_env_literals(options: &ResolvedContainerOptions) -> Vec<(
         .collect();
     scrub_run_env(
         literals,
-        crate::data::config::env::host_var("COLORTERM").as_deref(),
+        options
+            .host_env
+            .as_ref()
+            .map_or_else(
+                || crate::data::config::env::host_var("COLORTERM"),
+                |env| env.get("COLORTERM").map(str::to_owned),
+            )
+            .as_deref(),
     )
     .kept
 }
@@ -2238,15 +2284,19 @@ esac
     #[test]
     fn listing_override_is_local_to_its_thread() {
         let fake = FakeDocker::new();
-        let command = listing_command();
+        let command = listing_command(ContainerCli::DOCKER);
         assert_eq!(command.get_program(), "/bin/sh");
         assert_eq!(
             command.get_args().collect::<Vec<_>>(),
             [fake.dir.path().join("docker").as_os_str()]
         );
-        let other = std::thread::spawn(|| listing_command().get_program().to_os_string())
-            .join()
-            .unwrap();
+        let other = std::thread::spawn(|| {
+            listing_command(ContainerCli::DOCKER)
+                .get_program()
+                .to_os_string()
+        })
+        .join()
+        .unwrap();
         assert_ne!(other, "/bin/sh");
     }
 

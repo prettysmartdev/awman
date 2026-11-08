@@ -73,6 +73,13 @@ pub struct WorktreePaths {
 }
 
 impl WorktreePaths {
+    /// Resolve against the invoking instance, including when a daemon's
+    /// own process has a different HOME.
+    pub fn from_env(env: &crate::data::config::env::EnvSnapshot) -> Result<Self, DataError> {
+        Ok(Self::with_home(
+            env.home_dir().ok_or(DataError::HomeNotFound)?,
+        ))
+    }
     /// Construct using the OS home dir. Returns `HomeNotFound` when no home is
     /// resolvable.
     pub fn from_home() -> Result<Self, DataError> {

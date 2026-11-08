@@ -68,7 +68,7 @@ impl CommandCatalogue {
         };
         let mut out = Vec::new();
         for sub in current.subcommands {
-            if !flag_visible_to_tui(FrontendVisibility::All) {
+            if !flag_visible_to_tui(FrontendVisibility::All) || sub.internal {
                 continue;
             }
             if sub.name.starts_with(prefix) {

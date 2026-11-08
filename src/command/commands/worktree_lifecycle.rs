@@ -411,12 +411,13 @@ impl WorktreeLifecycle {
         let worktree_path = git_engine
             .worktree_path_named(&git_root, workflow_name)
             .map_err(CommandError::from)?;
-        let creation_path = crate::data::worktree_paths::WorktreePaths::from_home()?.for_workflow(
-            &git_root
-                .canonicalize()
-                .map_err(|e| CommandError::Other(e.to_string()))?,
-            workflow_name,
-        );
+        let creation_path = crate::data::worktree_paths::WorktreePaths::from_env(git_engine.env())?
+            .for_workflow(
+                &git_root
+                    .canonicalize()
+                    .map_err(|e| CommandError::Other(e.to_string()))?,
+                workflow_name,
+            );
         let branch = git_engine.branch_name_for_workflow(workflow_name);
         Ok(Self {
             git_engine,
@@ -435,12 +436,13 @@ impl WorktreeLifecycle {
         let worktree_path = git_engine
             .worktree_path(&git_root, work_item)
             .map_err(CommandError::from)?;
-        let creation_path = crate::data::worktree_paths::WorktreePaths::from_home()?.for_work_item(
-            &git_root
-                .canonicalize()
-                .map_err(|e| CommandError::Other(e.to_string()))?,
-            work_item,
-        );
+        let creation_path = crate::data::worktree_paths::WorktreePaths::from_env(git_engine.env())?
+            .for_work_item(
+                &git_root
+                    .canonicalize()
+                    .map_err(|e| CommandError::Other(e.to_string()))?,
+                work_item,
+            );
         let branch = git_engine.branch_name_for_work_item(work_item);
         Ok(Self {
             git_engine,

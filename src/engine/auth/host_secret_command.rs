@@ -19,7 +19,7 @@
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
@@ -171,6 +171,7 @@ pub struct HostSecretCommandReview {
 
 #[derive(Debug)]
 pub struct HostSecretCommand {
+    env: crate::data::config::env::EnvSnapshot,
     argv: Vec<String>,
     label: String,
     resolved: PathBuf,
@@ -199,6 +200,13 @@ impl HostSecretCommand {
     }
     /// Resolves argv[0] with `which` (absolute paths must exist and be a regular executable), canonicalizes, applies the refusal list.
     pub fn new(options: HostSecretCommandOptions) -> Result<Self, HostSecretCommandError> {
+        Self::new_in(options, crate::engine::host_cli::process_env())
+    }
+
+    pub fn new_in(
+        options: HostSecretCommandOptions,
+        env: crate::data::config::env::EnvSnapshot,
+    ) -> Result<Self, HostSecretCommandError> {
         let HostSecretCommandOptions {
             argv,
             label,
@@ -212,7 +220,7 @@ impl HostSecretCommand {
             .filter(|p| !p.trim().is_empty())
             .ok_or(HostSecretCommandError::EmptyArgv)?
             .clone();
-        let resolved = resolve_program(&program)?;
+        let resolved = resolve_program_in(&env, &program)?;
         let canonical = resolved
             .canonicalize()
             .map_err(|_| HostSecretCommandError::NotFound {
@@ -265,7 +273,7 @@ impl HostSecretCommand {
             .map(|s| s.to_string())
             .chain(refused_binaries.iter().cloned())
             .any(|name| {
-                resolve_program(&name)
+                resolve_program_in(&env, &name)
                     .ok()
                     .and_then(|p| p.canonicalize().ok())
                     .is_some_and(|p| {
@@ -293,6 +301,7 @@ impl HostSecretCommand {
         }
         let resolved = canonical;
         Ok(Self {
+            env,
             argv,
             label,
             resolved,
@@ -374,25 +383,53 @@ impl HostSecretCommand {
         // An interactive command that expects no token (`gh auth login`)
         // talks to the user directly on the released terminal.
         let interactive = self.stdin == HostStdin::Tty && !self.expect_secret;
-        let mut command = Command::new(&executable);
+        let mut command =
+            crate::engine::host_cli::command(&self.env, &executable.to_string_lossy());
         command
             .args(&self.argv[1..])
             .current_dir(&work)
             .env_clear()
-            .envs(minimal_host_env(self.stdin));
-        match self.stdin {
-            HostStdin::Tty => command.stdin(Stdio::inherit()),
-            HostStdin::Null => command.stdin(Stdio::null()),
-        };
-        if interactive {
-            command.stdout(Stdio::inherit()).stderr(Stdio::inherit());
-        } else {
-            command.stdout(Stdio::piped()).stderr(Stdio::piped());
-        }
+            .envs(minimal_host_env_in(&self.env, self.stdin));
+        // Under an engine instance the "terminal" is a daemon PTY the engine
+        // scoped to this thread (WI 0142): the child gets its slave as its
+        // controlling terminal instead of inheriting the daemon's stdio.
         #[cfg(unix)]
-        {
+        let host_pty = (self.stdin == HostStdin::Tty)
+            .then(crate::engine::terminal_hub::bridge::HostPty::current)
+            .flatten();
+        #[cfg(not(unix))]
+        let host_pty: Option<()> = None;
+        #[cfg(unix)]
+        if let Some(pty) = &host_pty {
+            let (stdin, stdout, stderr) =
+                pty.slave_stdio().map_err(|e| spawn_error(e.to_string()))?;
+            command.stdin(stdin);
+            if interactive {
+                command.stdout(stdout).stderr(stderr);
+            } else {
+                command.stdout(Stdio::piped()).stderr(Stdio::piped());
+            }
+            // The slave is the child's stdio (a TTY for `isatty`); it is not
+            // made the controlling terminal, so the group kill below applies
+            // unchanged. A tool that opens `/dev/tty` itself is not served.
             use std::os::unix::process::CommandExt;
             command.process_group(0);
+        }
+        if host_pty.is_none() {
+            match self.stdin {
+                HostStdin::Tty => command.stdin(Stdio::inherit()),
+                HostStdin::Null => command.stdin(Stdio::null()),
+            };
+            if interactive {
+                command.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+            } else {
+                command.stdout(Stdio::piped()).stderr(Stdio::piped());
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt;
+                command.process_group(0);
+            }
         }
         // A concurrent fork elsewhere in this process can inherit the write
         // descriptor used to stage the snapshot, so `execve` reports it busy
@@ -433,8 +470,15 @@ impl HostSecretCommand {
             child: Some(child),
         };
         #[cfg(unix)]
-        let _terminal = ForegroundGroup::claim(self.stdin, guard.group)
-            .map_err(|e| spawn_error(e.to_string()))?;
+        let _terminal = ForegroundGroup::claim(
+            if host_pty.is_some() {
+                HostStdin::Null
+            } else {
+                self.stdin
+            },
+            guard.group,
+        )
+        .map_err(|e| spawn_error(e.to_string()))?;
         #[cfg(unix)]
         let _ = nix::sys::signal::killpg(
             nix::unistd::Pid::from_raw(guard.group),
@@ -548,6 +592,18 @@ pub fn minimal_host_env(stdin: HostStdin) -> Vec<(String, String)> {
     env
 }
 
+fn minimal_host_env_in(
+    snapshot: &crate::data::config::env::EnvSnapshot,
+    stdin: HostStdin,
+) -> Vec<(String, String)> {
+    HOST_ENV_PASSTHROUGH_EXACT
+        .iter()
+        .filter(|name| **name != "TERM" || stdin == HostStdin::Tty)
+        .chain(HOST_ENV_PASSTHROUGH_KNOWN)
+        .filter_map(|name| Some((name.to_string(), snapshot.get(name)?.to_string())))
+        .collect()
+}
+
 /// Kills the child (its whole group when it has one) unless it was reaped.
 struct RunningChild {
     child: Option<Child>,
@@ -589,7 +645,10 @@ impl Drop for RunningChild {
 /// path (`./op`) or a `PATH` entry that is itself relative would resolve
 /// against the working directory, which may be the repository, so both are
 /// refused.
-fn resolve_program(program: &str) -> Result<PathBuf, HostSecretCommandError> {
+fn resolve_program_in(
+    env: &crate::data::config::env::EnvSnapshot,
+    program: &str,
+) -> Result<PathBuf, HostSecretCommandError> {
     let not_found = || HostSecretCommandError::NotFound {
         program: program.to_string(),
     };
@@ -597,7 +656,13 @@ fn resolve_program(program: &str) -> Result<PathBuf, HostSecretCommandError> {
     let resolved = if path.components().count() > 1 || path.is_absolute() {
         path.to_path_buf()
     } else {
-        which::which(program).map_err(|_| not_found())?
+        // Relative PATH components are refused for trusted host token tools.
+        let paths = env
+            .path_dirs()
+            .into_iter()
+            .filter(|p| p.is_absolute())
+            .collect();
+        crate::engine::host_cli::find_program(env, program, paths).ok_or_else(not_found)?
     };
     if !resolved.is_absolute() {
         return Err(not_found());

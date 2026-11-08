@@ -139,6 +139,7 @@ impl ReadyEngine {
                 false => ReadyImageAction::Build,
             };
         let cancel = preparer.cancel_token();
+        let host_env = session.env().clone();
         Self {
             session,
             git_engine,
@@ -149,7 +150,7 @@ impl ReadyEngine {
             phase: ReadyPhase::Preflight,
             summary,
             pre_audit_dockerfile_hash: None,
-            host_agent: Arc::new(HostAgentPinger::new()),
+            host_agent: Arc::new(HostAgentPinger::with_env(host_env)),
             definition: None,
             preparer,
             image_policy,

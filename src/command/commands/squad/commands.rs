@@ -15,7 +15,7 @@ use crate::command::commands::Command;
 use crate::command::dispatch::frontend_action::FrontendAction;
 use crate::command::dispatch::{BuildContext, Engines};
 use crate::command::error::CommandError;
-use crate::data::config::env::host_var;
+use crate::data::config::env::EnvSnapshot;
 use crate::data::config::ConfigFile;
 use crate::data::fs::daemon_env::{EnvPersistence, EnvVarState};
 use crate::data::fs::task_store::{MountScope, Task, TaskStatus, TaskWorkspace};
@@ -95,8 +95,10 @@ pub trait SquadCommandFrontend:
 
     /// The custom workspace path. Only asked when
     /// [`ask_task_workspace_choice`](Self::ask_task_workspace_choice) chose
-    /// [`TaskWorkspaceChoice::Custom`].
-    fn ask_task_repo(&mut self) -> Result<PathBuf, CommandError> {
+    /// [`TaskWorkspaceChoice::Custom`]. `current_dir` is the invoking
+    /// session's working directory, the answer when the user just presses
+    /// Enter; `None` when the session carries none.
+    fn ask_task_repo(&mut self, _current_dir: Option<&Path>) -> Result<PathBuf, CommandError> {
         Err(interview_unavailable())
     }
 
@@ -365,6 +367,11 @@ pub struct SquadCommand {
     /// a `SquadCommandFrontend::is_local_user_session` override each frontend
     /// answered for itself.
     local_user: bool,
+    /// The invoking session's environment snapshot. Its cwd is what a task
+    /// workspace is checked against for mounting a parent directory, and its
+    /// values are "this shell" in the `squad env` report. Empty unless set
+    /// with [`Self::with_env`] (`from_input` always does).
+    env: EnvSnapshot,
 }
 
 impl SquadCommand {
@@ -389,7 +396,14 @@ impl SquadCommand {
             gateway,
             engines,
             local_user,
+            env: EnvSnapshot::empty(),
         }
+    }
+
+    /// The invoking session's environment (cwd and values).
+    pub fn with_env(mut self, env: EnvSnapshot) -> Self {
+        self.env = env;
+        self
     }
 
     pub fn subcommand(&self) -> &SquadSubcommand {
@@ -451,7 +465,8 @@ impl SquadCommand {
             ctx.boxed_gateway(),
             ctx.engines.clone(),
             ctx.caller.local_user(),
-        ))
+        )
+        .with_env(ctx.session.env().clone()))
     }
 }
 
@@ -630,7 +645,11 @@ impl Command for SquadCommand {
             gateway,
             engines,
             local_user,
+            env,
         } = self;
+        // An empty cwd means the snapshot carries none (as `current_dir`
+        // failing did before): no parent-mount comparison is possible.
+        let cwd = Some(env.cwd().to_path_buf()).filter(|dir| !dir.as_os_str().is_empty());
         match sub {
             SquadSubcommand::Status => {
                 // The squad feature's summary comes from the running daemon;
@@ -673,7 +692,7 @@ impl Command for SquadCommand {
                                     frontend.as_mut(),
                                     local_user,
                                     &req.workspace,
-                                    std::env::current_dir().ok().as_deref(),
+                                    cwd.as_deref(),
                                     request.non_interactive,
                                 )?;
                                 req
@@ -682,6 +701,7 @@ impl Command for SquadCommand {
                                 frontend.as_mut(),
                                 engines.git_engine.as_ref(),
                                 &engines.global_config,
+                                cwd.as_deref(),
                             )?,
                         };
                         let mut req = req;
@@ -691,6 +711,7 @@ impl Command for SquadCommand {
                                 &engines,
                                 local_user,
                                 &req.workspace,
+                                cwd.as_deref(),
                             )?;
                         }
                         let task = gateway.create(req).await?;
@@ -727,6 +748,7 @@ impl Command for SquadCommand {
                                 &engines,
                                 local_user,
                                 &TaskWorkspace::Custom(current.repo_scope.clone()),
+                                cwd.as_deref(),
                             )? {
                                 update.prerequisites = Some(policy);
                             }
@@ -811,7 +833,7 @@ impl Command for SquadCommand {
                             sync_env(gateway.as_ref(), true).await;
                         }
                         let coverage = gateway.env_coverage().await?;
-                        Ok(SquadOutcome::Env(env_report(&coverage, cleared)))
+                        Ok(SquadOutcome::Env(env_report(&coverage, cleared, &env)))
                     }
                     _ => unreachable!("daemon commands handled above"),
                 }
@@ -838,6 +860,7 @@ fn ask_task_prerequisites(
     engines: &Engines,
     local_user: bool,
     workspace: &TaskWorkspace,
+    cwd: Option<&Path>,
 ) -> Result<Option<crate::data::config::workflows::PrerequisitePolicy>, CommandError> {
     if !local_user || !frontend.can_ask_prerequisites() {
         return Ok(None);
@@ -845,10 +868,11 @@ fn ask_task_prerequisites(
     let dir = match workspace {
         TaskWorkspace::Custom(path) if path.is_dir() => path.clone(),
         // The default workspace does not exist yet; the questions are about
-        // the host's keys and tokens, so the current directory stands in.
-        _ => match std::env::current_dir() {
-            Ok(dir) => dir,
-            Err(_) => return Ok(None),
+        // the host's keys and tokens, so the session's current directory
+        // stands in.
+        _ => match cwd {
+            Some(dir) => dir.to_path_buf(),
+            None => return Ok(None),
         },
     };
     crate::command::commands::workflow_prerequisites::collect_task_prerequisites(
@@ -863,6 +887,7 @@ fn collect_task_interview(
     frontend: &mut dyn SquadCommandFrontend,
     git_engine: &GitEngine,
     global_config: &ConfigFile,
+    cwd: Option<&Path>,
 ) -> Result<CreateTask, CommandError> {
     let name = frontend.ask_task_name()?;
     let description = frontend.ask_task_description()?;
@@ -870,7 +895,7 @@ fn collect_task_interview(
         frontend.ask_task_interval(&crate::command::prompts::squad_task_interval())?;
     let interval_secs =
         crate::command::dispatch::parse_squad_interval(&["squad", "add"], &interval_raw)?;
-    let workspace = collect_workspace_choice(frontend, git_engine)?;
+    let workspace = collect_workspace_choice(frontend, git_engine, cwd)?;
     let overlays = collect_overlays(frontend)?;
     let agent = frontend.ask_task_agent()?;
     let model = frontend.ask_task_model()?;
@@ -1069,6 +1094,7 @@ fn update_agent_or<'a>(update: &'a UpdateTask, current: &'a Task) -> Option<&'a 
 fn collect_workspace_choice(
     frontend: &mut dyn SquadCommandFrontend,
     git_engine: &GitEngine,
+    current_dir: Option<&Path>,
 ) -> Result<TaskWorkspace, CommandError> {
     if matches!(
         frontend.ask_task_workspace_choice(&crate::command::prompts::squad_task_workspace())?,
@@ -1076,9 +1102,8 @@ fn collect_workspace_choice(
     ) {
         return Ok(TaskWorkspace::Default);
     }
-    let current_dir = std::env::current_dir().ok();
     loop {
-        let path = frontend.ask_task_repo()?;
+        let path = frontend.ask_task_repo(current_dir)?;
         let canonical = match std::fs::canonicalize(&path) {
             Ok(canonical) => canonical,
             // Not "warn and offer to keep": there is nothing at this path to
@@ -1096,7 +1121,7 @@ fn collect_workspace_choice(
                 canonical.display()
             )));
         }
-        if let Some(cwd) = current_dir.as_deref() {
+        if let Some(cwd) = current_dir {
             if workspace_is_parent_of(&canonical, cwd)
                 && !frontend.confirm_parent_directory_workspace(&canonical, cwd)?
             {
@@ -1202,6 +1227,8 @@ mod workspace_choice_tests {
         paths: VecDeque<PathBuf>,
         keep_non_git: VecDeque<bool>,
         non_git_prompts: usize,
+        /// The `current_dir` each `ask_task_repo` call was handed.
+        repo_prompt_cwds: Vec<Option<PathBuf>>,
     }
 
     impl WorkspaceFrontend {
@@ -1210,6 +1237,7 @@ mod workspace_choice_tests {
                 paths: paths.into_iter().collect(),
                 keep_non_git: keep_non_git.into(),
                 non_git_prompts: 0,
+                repo_prompt_cwds: Vec::new(),
             }
         }
     }
@@ -1232,7 +1260,9 @@ mod workspace_choice_tests {
             Ok(TaskWorkspaceChoice::CustomFolderOrRepo)
         }
 
-        fn ask_task_repo(&mut self) -> Result<PathBuf, CommandError> {
+        fn ask_task_repo(&mut self, current_dir: Option<&Path>) -> Result<PathBuf, CommandError> {
+            self.repo_prompt_cwds
+                .push(current_dir.map(Path::to_path_buf));
             self.paths.pop_front().ok_or_else(|| {
                 CommandError::Other(
                     "test frontend was asked for an unexpected replacement workspace".into(),
@@ -1265,7 +1295,7 @@ mod workspace_choice_tests {
         git_init(tmp.path());
         let mut frontend = WorkspaceFrontend::custom([tmp.path().to_path_buf()], vec![]);
 
-        let workspace = collect_workspace_choice(&mut frontend, &GitEngine::new()).unwrap();
+        let workspace = collect_workspace_choice(&mut frontend, &GitEngine::new(), None).unwrap();
         assert_eq!(
             workspace,
             TaskWorkspace::Custom(tmp.path().canonicalize().unwrap())
@@ -1284,7 +1314,7 @@ mod workspace_choice_tests {
         std::fs::create_dir(tmp.path().join(".git")).unwrap();
         let mut frontend = WorkspaceFrontend::custom([tmp.path().to_path_buf()], vec![true]);
 
-        let workspace = collect_workspace_choice(&mut frontend, &GitEngine::new()).unwrap();
+        let workspace = collect_workspace_choice(&mut frontend, &GitEngine::new(), None).unwrap();
         assert_eq!(
             workspace,
             TaskWorkspace::Custom(tmp.path().canonicalize().unwrap())
@@ -1305,7 +1335,7 @@ mod workspace_choice_tests {
         let mut frontend =
             WorkspaceFrontend::custom([first.clone(), second.clone()], vec![false, true]);
 
-        let workspace = collect_workspace_choice(&mut frontend, &GitEngine::new()).unwrap();
+        let workspace = collect_workspace_choice(&mut frontend, &GitEngine::new(), None).unwrap();
         assert_eq!(
             workspace,
             TaskWorkspace::Custom(second.canonicalize().unwrap())
@@ -1316,13 +1346,27 @@ mod workspace_choice_tests {
         );
     }
 
+    /// The path prompt's "Enter = current dir" answer is the session's cwd,
+    /// handed in by the command rather than read from the process.
+    #[test]
+    fn the_session_cwd_reaches_the_repo_prompt() {
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        let elsewhere = tempfile::tempdir().unwrap();
+        let session_cwd = elsewhere.path().to_path_buf();
+        let mut frontend = WorkspaceFrontend::custom([tmp.path().to_path_buf()], vec![]);
+
+        collect_workspace_choice(&mut frontend, &GitEngine::new(), Some(&session_cwd)).unwrap();
+        assert_eq!(frontend.repo_prompt_cwds, vec![Some(session_cwd)]);
+    }
+
     #[test]
     fn nonexistent_custom_workspace_is_rejected_without_a_keep_prompt() {
         let tmp = tempfile::tempdir().unwrap();
         let missing = tmp.path().join("does-not-exist");
         let mut frontend = WorkspaceFrontend::custom([missing.clone()], vec![]);
 
-        let error = collect_workspace_choice(&mut frontend, &GitEngine::new()).unwrap_err();
+        let error = collect_workspace_choice(&mut frontend, &GitEngine::new(), None).unwrap_err();
         assert!(error.to_string().contains("does not exist"), "{error}");
         assert_eq!(frontend.non_git_prompts, 0);
     }
@@ -1563,11 +1607,11 @@ fn warn_unmet_env(frontend: &mut dyn SquadCommandFrontend, task: &Task, change: 
 
 /// Turn the daemon's coverage into §6d's report.
 ///
-/// Pure over the coverage plus this process's own environment, so the whole
+/// Pure over the coverage plus the invoking session's environment, so the whole
 /// table is decided in one place and neither frontend has to reason about
 /// digests. The only thing this shell's values are used for is the `SOURCE`
 /// column's `this shell` case — a digest comparison, never a printed value.
-fn env_report(coverage: &EnvCoverage, cleared: Option<bool>) -> EnvReport {
+fn env_report(coverage: &EnvCoverage, cleared: Option<bool>, env: &EnvSnapshot) -> EnvReport {
     let salt = Salt::from_hex(&coverage.salt);
     let rows = coverage
         .required
@@ -1585,9 +1629,10 @@ fn env_report(coverage: &EnvCoverage, cleared: Option<bool>) -> EnvReport {
             // is what the user needs to know, and the comparison never moves
             // a value anywhere — only a digest of one.
             let from_this_shell = match (&salt, &entry.digest) {
-                (Some(salt), Some(digest)) => host_var(&entry.name)
+                (Some(salt), Some(digest)) => env
+                    .get(&entry.name)
                     .filter(|value| !value.is_empty())
-                    .is_some_and(|value| &coverage_digest(salt, &entry.name, &value) == digest),
+                    .is_some_and(|value| &coverage_digest(salt, &entry.name, value) == digest),
                 _ => false,
             };
             let source = if from_this_shell {
@@ -1612,6 +1657,46 @@ fn env_report(coverage: &EnvCoverage, cleared: Option<bool>) -> EnvReport {
         persistence: Some(coverage.persistence.clone()),
         cleared,
         rows,
+    }
+}
+
+#[cfg(test)]
+mod env_report_tests {
+    use super::*;
+    use crate::engine::squad::env_state::RequiredEnvEntry;
+
+    fn coverage(salt: &Salt, value: &str) -> EnvCoverage {
+        EnvCoverage {
+            salt: salt.to_hex(),
+            persistence: EnvPersistence::default(),
+            required: vec![RequiredEnvEntry {
+                name: "WI0142_TOKEN".into(),
+                required_by: vec!["nightly".into()],
+                required_since: crate::data::wire::now(),
+                last_provided_at: None,
+                unmet_since: None,
+                source: Some(EnvSource::Pushed),
+                digest: Some(coverage_digest(salt, "WI0142_TOKEN", value)),
+            }],
+        }
+    }
+
+    /// "this shell" is decided by the invoking session's snapshot, not by
+    /// whatever the process environment holds.
+    #[test]
+    fn this_shell_comes_from_the_session_snapshot() {
+        let salt = Salt::random();
+        let coverage = coverage(&salt, "held");
+        let matching = EnvSnapshot::with_overrides([("WI0142_TOKEN", "held")]);
+        let report = env_report(&coverage, None, &matching);
+        assert_eq!(report.rows[0].source, "this shell");
+
+        let other = EnvSnapshot::with_overrides([("WI0142_TOKEN", "different")]);
+        assert_eq!(env_report(&coverage, None, &other).rows[0].source, "pushed");
+        assert_eq!(
+            env_report(&coverage, None, &EnvSnapshot::empty()).rows[0].source,
+            "pushed"
+        );
     }
 }
 

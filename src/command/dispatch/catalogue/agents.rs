@@ -15,6 +15,8 @@ pub(super) const AGENTS: CommandSpec = CommandSpec {
     requires_container_tier: false,
     requires_runtime: true,
     opens_tui_when_bare: false,
+    internal: false,
+    relay_allowed: false,
     subcommands: &[&AGENTS_STATUS, &AGENTS_LIST, &AGENTS_DETAIL, &AGENTS_KILL],
 };
 
@@ -54,6 +56,8 @@ pub(super) const AGENTS_STATUS: CommandSpec = CommandSpec {
     requires_container_tier: false,
     requires_runtime: true,
     opens_tui_when_bare: false,
+    internal: false,
+    relay_allowed: false,
     subcommands: &[],
 };
 
@@ -115,6 +119,8 @@ pub(super) const AGENTS_LIST: CommandSpec = CommandSpec {
     requires_container_tier: false,
     requires_runtime: true,
     opens_tui_when_bare: false,
+    internal: false,
+    relay_allowed: false,
     subcommands: &[],
 };
 
@@ -166,6 +172,8 @@ pub(super) const AGENTS_DETAIL: CommandSpec = CommandSpec {
     requires_container_tier: false,
     requires_runtime: true,
     opens_tui_when_bare: false,
+    internal: false,
+    relay_allowed: false,
     subcommands: &[],
 };
 
@@ -205,5 +213,7 @@ pub(super) const AGENTS_KILL: CommandSpec = CommandSpec {
     requires_container_tier: false,
     requires_runtime: true,
     opens_tui_when_bare: false,
+    internal: false,
+    relay_allowed: false,
     subcommands: &[],
 };

@@ -336,22 +336,24 @@ mod layering_tests {
     }
 
     #[test]
-    fn no_layer_zero_type_holds_a_secret_string() {
+    fn only_local_socket_dialog_contract_may_hold_a_secret_string() {
         // Built from parts so this test does not match itself.
         let needle = format!("{}{}", "Secret", "String");
         let mut files = vec![];
-        rust_files(
-            &Path::new(env!("CARGO_MANIFEST_DIR")).join("src/data"),
-            &mut files,
-        );
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/data");
+        rust_files(&root, &mut files);
+        // WI 0142 moves the redacting wrapper and its explicit local-socket
+        // dialog answer into data. Persisted prerequisite reports stay secret-free.
+        let local_socket_types = [root.join("secret.rs"), root.join("dialog.rs")];
         assert!(files.len() > 20);
         let offenders: Vec<_> = files
             .iter()
+            .filter(|file| !local_socket_types.contains(file))
             .filter(|f| std::fs::read_to_string(f).unwrap().contains(&needle))
             .collect();
         assert!(
             offenders.is_empty(),
-            "Layer 0 must not hold secrets: {offenders:?}"
+            "Layer 0 types outside the local dialog contract must not hold secrets: {offenders:?}"
         );
     }
 

@@ -487,7 +487,7 @@ fn config_show_add_mapping_prompts_render_per_phase() {
             repo_writable: false,
             value_hint: None,
             shape: crate::command::commands::config::ConfigRowKind::MapHeader {
-                child_prefix: "demo.map.",
+                child_prefix: "demo.map.".into(),
             },
         }],
         selected: 0,
@@ -543,7 +543,7 @@ fn config_show_ctrl_n_hint_only_on_map_and_list_rows() {
         (
             "demo.map",
             ConfigRowKind::MapHeader {
-                child_prefix: "demo.map.",
+                child_prefix: "demo.map.".into(),
             },
         ),
         ("demo.map.claude", ConfigRowKind::MapEntry),
@@ -785,7 +785,7 @@ fn shaped_state(edit_column: usize, selected: usize) -> dialogs::ConfigShowState
             row(
                 "demo.map",
                 Shape::MapHeader {
-                    child_prefix: "demo.map.",
+                    child_prefix: "demo.map.".into(),
                 },
                 "1 agent mapped",
                 "(none)",
@@ -803,7 +803,7 @@ fn shaped_state(edit_column: usize, selected: usize) -> dialogs::ConfigShowState
             row(
                 "demo.list",
                 Shape::ListHeader {
-                    child_prefix: "demo.list.",
+                    child_prefix: "demo.list.".into(),
                 },
                 "1 entry",
                 "1 entry",

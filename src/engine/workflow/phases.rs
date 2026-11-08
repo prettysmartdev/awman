@@ -1081,7 +1081,7 @@ impl WorkflowEngine {
     ) -> Option<PhaseFailureArtifacts> {
         use crate::data::fs::context_dirs::{validate_context_path, ContextDirResolver};
 
-        let resolver = match ContextDirResolver::from_process_env() {
+        let resolver = match ContextDirResolver::from_env(self.session.env()) {
             Ok(r) => r,
             Err(e) => {
                 self.msg_warning(format!(

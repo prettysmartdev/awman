@@ -35,6 +35,8 @@ const fn daemon_leaf(
         requires_container_tier: false,
         requires_runtime: false,
         opens_tui_when_bare: false,
+        internal: false,
+        relay_allowed: false,
     }
 }
 
@@ -61,6 +63,8 @@ pub(super) const DAEMON: CommandSpec = CommandSpec {
     requires_container_tier: false,
     requires_runtime: false,
     opens_tui_when_bare: false,
+    internal: false,
+    relay_allowed: false,
 };
 
 const DAEMON_START: CommandSpec = daemon_leaf(
@@ -171,4 +175,6 @@ const DAEMON_API: CommandSpec = CommandSpec {
     requires_container_tier: false,
     requires_runtime: false,
     opens_tui_when_bare: false,
+    internal: false,
+    relay_allowed: false,
 };

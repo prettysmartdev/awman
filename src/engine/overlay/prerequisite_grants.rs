@@ -84,38 +84,47 @@ mod tests {
         OverlayEngine::with_auth_resolver(AuthPathResolver::at_home(home.path()))
     }
 
-    /// The overlay engine validates SSH paths against `dirs::home_dir()`. Only
-    /// touch it when the test harness has isolated HOME.
-    fn isolated() -> bool {
-        crate::data::config::env::Env::from_process().test_isolation()
-    }
-
+    /// A fake SSH key inside a throwaway host home. The overlay engine
+    /// validates SSH paths against its resolver's home (not the process
+    /// HOME), so the key and the engine that mounts it share that one home.
     struct Key {
+        home: tempfile::TempDir,
         path: PathBuf,
         known_hosts: PathBuf,
         ssh_dir: PathBuf,
     }
     impl Key {
         fn new(tag: &str) -> Self {
-            let ssh_dir = dirs::home_dir().unwrap().join(".ssh");
+            let home = tempfile::tempdir().unwrap();
+            let ssh_dir = home.path().join(".ssh");
             std::fs::create_dir_all(&ssh_dir).unwrap();
-            let path = ssh_dir.join(format!("id_wi0149_{tag}_{}", std::process::id()));
+            let path = ssh_dir.join(format!("id_wi0149_{tag}"));
             std::fs::write(&path, "-----BEGIN PRIVATE KEY-----\nFAKE\n").unwrap();
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-            let known_hosts =
-                ssh_dir.join(format!("known_hosts_wi0149_{tag}_{}", std::process::id()));
+            let known_hosts = ssh_dir.join(format!("known_hosts_wi0149_{tag}"));
             std::fs::write(&known_hosts, "github.com ssh-ed25519 AAAA\n").unwrap();
             Self {
+                home,
                 path,
                 known_hosts,
                 ssh_dir,
             }
         }
-    }
-    impl Drop for Key {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.path);
-            let _ = std::fs::remove_file(&self.known_hosts);
+
+        /// An overlay engine whose host home is this key's home.
+        fn engine(&self) -> OverlayEngine {
+            OverlayEngine::with_auth_resolver(AuthPathResolver::at_home(self.home.path()))
+        }
+
+        fn overlays(
+            &self,
+            kind: PrerequisiteStepKind,
+            remote: Option<&GitRemoteUrl>,
+            grants: &PrerequisiteGrants,
+        ) -> GrantOverlays {
+            self.engine()
+                .prerequisite_grant_overlays(&target(kind, remote), grants)
+                .unwrap()
         }
     }
 
@@ -248,12 +257,9 @@ mod tests {
 
     #[test]
     fn push_gets_key_mounts_only() {
-        if !isolated() {
-            return;
-        }
         let key = Key::new("push");
         let ssh = GitRemoteUrl::parse("git@github.com:o/r.git");
-        let o = overlays(
+        let o = key.overlays(
             PrerequisiteStepKind::PushBranch,
             Some(&ssh),
             &everything(Some(&key)),
@@ -338,20 +344,19 @@ mod tests {
 
     #[test]
     fn ssh_grant_is_not_applied_to_https_remotes_and_whole_dir_is_explicit() {
-        if !isolated() {
-            return;
-        }
         let key = Key::new("https");
         let https = GitRemoteUrl::parse("https://github.com/o/r");
         let mut grants = everything(Some(&key));
         grants.token = None;
-        assert!(overlays(PrerequisiteStepKind::PushBranch, Some(&https), &grants).is_empty());
+        assert!(key
+            .overlays(PrerequisiteStepKind::PushBranch, Some(&https), &grants)
+            .is_empty());
         // Whole-dir grant: one read-only directory mount for an SSH remote, nothing else.
         let ssh = GitRemoteUrl::parse("git@github.com:o/r.git");
         grants.ssh = Some(SshGrant::WholeDir {
             ssh_dir: key.ssh_dir.clone(),
         });
-        let o = overlays(PrerequisiteStepKind::PushBranch, Some(&ssh), &grants);
+        let o = key.overlays(PrerequisiteStepKind::PushBranch, Some(&ssh), &grants);
         assert_eq!(o.overlays.len(), 1);
         assert_eq!(
             o.overlays[0].container_path,
@@ -366,9 +371,6 @@ mod tests {
 
     #[test]
     fn run_shell_and_run_script_get_nothing() {
-        if !isolated() {
-            return;
-        }
         let key = Key::new("shell");
         let ssh = GitRemoteUrl::parse("git@github.com:o/r.git");
         let https = GitRemoteUrl::parse("https://github.com/o/r");
@@ -377,7 +379,7 @@ mod tests {
             PrerequisiteStepKind::RunScript,
         ] {
             for remote in [Some(&ssh), Some(&https), None] {
-                let o = overlays(kind, remote, &everything(Some(&key)));
+                let o = key.overlays(kind, remote, &everything(Some(&key)));
                 assert!(o.is_empty(), "{kind:?} received grants: {o:?}");
                 assert_eq!(o.push_auth, PushAuth::None);
                 assert!(o.display.is_empty());
@@ -423,9 +425,9 @@ mod tests {
 
     #[test]
     fn key_path_validated_again_at_the_mount_boundary() {
-        if !isolated() {
-            return;
-        }
+        // The key fixture gives the engine a real host ~/.ssh, so each refusal
+        // below comes from path validation, not from a missing directory.
+        let key = Key::new("escape");
         let ssh = GitRemoteUrl::parse("git@github.com:o/r.git");
         let outside = tempfile::NamedTempFile::new().unwrap();
         let grants = PrerequisiteGrants {
@@ -439,7 +441,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let result = engine().prerequisite_grant_overlays(
+        let result = key.engine().prerequisite_grant_overlays(
             &target(PrerequisiteStepKind::PushBranch, Some(&ssh)),
             &grants,
         );
@@ -448,7 +450,6 @@ mod tests {
             "a key outside ~/.ssh must never be mounted"
         );
         // A symlink inside ~/.ssh pointing outside is refused as well.
-        let key = Key::new("escape");
         let link = key
             .ssh_dir
             .join(format!("id_wi0149_link_{}", std::process::id()));
@@ -464,7 +465,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let result = engine().prerequisite_grant_overlays(
+        let result = key.engine().prerequisite_grant_overlays(
             &target(PrerequisiteStepKind::PushBranch, Some(&ssh)),
             &grants,
         );

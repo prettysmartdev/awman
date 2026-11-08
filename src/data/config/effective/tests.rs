@@ -45,10 +45,24 @@ fn defaults_come_from_the_key_table() {
         }
     );
     assert_eq!(ec.runtime_selection(), Ok(RuntimeSelection::Docker));
+    assert_eq!(ec.tui_backend(), crate::data::config::tui::TuiBackend::Auto);
+    assert_eq!(
+        ec.integration_switch("rex"),
+        crate::data::config::tui::IntegrationSwitch::Auto
+    );
     assert_eq!(ec.max_concurrent_steps(), None);
     assert_eq!(ec.worktree_on_dirty_merge_target(), None);
     let daemon = ec.daemon();
     assert_eq!(daemon.max_concurrent_jobs, 4);
+    assert_eq!(
+        daemon.engine,
+        crate::data::config::daemon::EngineSettings {
+            enabled: false,
+            allow_ephemeral: true,
+            idle_timeout: Duration::from_secs(15 * 60),
+            max_concurrent_jobs: 4,
+        }
+    );
     assert_eq!(daemon.network.listen.to_string(), "127.0.0.1:9876");
     assert_eq!(
         daemon.network.features,
@@ -75,6 +89,176 @@ fn defaults_come_from_the_key_table() {
         );
         assert_eq!(ec.source_of(key.path), Layer::Default);
     }
+}
+
+#[test]
+fn engine_feature_settings_are_global_live_and_settable() {
+    use crate::data::config::fields::{is_live, resolve, KeyScope};
+
+    for (path, expected_default) in [
+        ("daemon.features.engine.enabled", json!(false)),
+        ("daemon.features.engine.allowEphemeral", json!(true)),
+        ("daemon.features.engine.idleTimeout", json!("15m")),
+        ("daemon.features.engine.maxConcurrentJobs", json!(4)),
+    ] {
+        let key = resolve(path).unwrap();
+        assert_eq!(key.key.scope, KeyScope::Global, "{path}");
+        assert!(is_live(path), "{path}");
+        assert_eq!(key.key.default_value(), expected_default, "{path}");
+    }
+    let set =
+        ConfigOverrides::parse_set_args(&["daemon.features.engine.enabled=true".into()]).unwrap();
+    let ec = EffectiveConfig::resolve(
+        ConfigLayers {
+            set,
+            ..Default::default()
+        },
+        FlagConfig::default(),
+        EnvSnapshot::empty(),
+    )
+    .unwrap();
+    assert!(ec.daemon().engine.enabled);
+    assert_eq!(ec.source_of("daemon.features.engine.enabled"), Layer::Set);
+}
+
+#[test]
+fn tui_backend_precedence_and_validation() {
+    use crate::data::config::env::AWMAN_HOME;
+    use crate::data::config::fields::{KeyScope, ValueKind, CONFIG_KEYS};
+    use crate::data::config::tui::TuiBackend;
+
+    let path = "tui.backend";
+    let key = CONFIG_KEYS.iter().find(|key| key.path == path).unwrap();
+    assert_eq!(key.scope, KeyScope::Repo);
+    assert_eq!(key.kind, ValueKind::Enum(&["auto", "daemon", "builtin"]));
+    assert_eq!(key.default, "\"auto\"");
+
+    let mk_layers = |global: Value, repo: Value, env: &[(&str, &str)], set_args: &[&str]| {
+        let vars: Vec<(String, String)> =
+            std::iter::once((AWMAN_HOME.to_owned(), "/tmp/unused-config-home".to_owned()))
+                .chain(env.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())))
+                .collect();
+        let snapshot = EnvSnapshot::with_overrides(vars);
+        let global = file(FileKind::Global, global);
+        let repo = file(FileKind::Repo, repo);
+        let env_layer = env_overrides(&snapshot, &[&global, &repo]).unwrap();
+        let set_layer = ConfigOverrides::parse_set_args(
+            &set_args.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>(),
+        )
+        .unwrap();
+        EffectiveConfig::resolve(
+            ConfigLayers {
+                global,
+                repo,
+                env: env_layer,
+                set: set_layer,
+                ..Default::default()
+            },
+            FlagConfig::default(),
+            snapshot,
+        )
+        .unwrap()
+    };
+
+    let get = |ec: &EffectiveConfig| (ec.tui_backend(), ec.source_of(path));
+    assert_eq!(
+        get(&resolve(ConfigLayers::default())),
+        (TuiBackend::Auto, Layer::Default)
+    );
+    assert_eq!(
+        get(&mk_layers(
+            json!({"tui":{"backend":"daemon"}}),
+            json!({}),
+            &[],
+            &[]
+        )),
+        (TuiBackend::Daemon, Layer::Global)
+    );
+    assert_eq!(
+        get(&mk_layers(
+            json!({"tui":{"backend":"daemon"}}),
+            json!({"tui":{"backend":"builtin"}}),
+            &[],
+            &[]
+        )),
+        (TuiBackend::Builtin, Layer::Repo)
+    );
+    assert_eq!(
+        get(&mk_layers(
+            json!({"tui":{"backend":"daemon"}}),
+            json!({"tui":{"backend":"builtin"}}),
+            &[("AWMAN_TUI_BACKEND", "auto")],
+            &[]
+        )),
+        (TuiBackend::Auto, Layer::Env)
+    );
+    assert_eq!(
+        get(&mk_layers(
+            json!({"tui":{"backend":"daemon"}}),
+            json!({"tui":{"backend":"builtin"}}),
+            &[("AWMAN_TUI_BACKEND", "auto")],
+            &["tui.backend=daemon"]
+        )),
+        (TuiBackend::Daemon, Layer::Set)
+    );
+    assert!(ConfigOverrides::parse_set_args(&["tui.backend=other".into()]).is_err());
+    assert!(ConfigOverrides::from_env(
+        &EnvSnapshot::with_overrides(vec![("AWMAN_TUI_BACKEND".to_owned(), "other".to_owned(),)]),
+        |_| Vec::new(),
+    )
+    .is_err());
+    assert!(ConfigFile::from_value(json!({"tui":{"backend":"other"}}), FileKind::Repo).is_err());
+}
+
+#[test]
+fn integration_switch_is_resolved_per_name_and_has_layer_precedence() {
+    use crate::data::config::tui::IntegrationSwitch;
+
+    let global = json!({"tui":{"integrations":{
+        "rex":{"enabled":"on", "privateSetting":true},
+        "git":{"enabled":"off"}
+    }}});
+    let repo = json!({"tui":{"integrations":{"rex":{"enabled":"off"}}}});
+    let mut layers = layers(global, repo, None);
+    assert_eq!(
+        resolve(layers.clone()).integration_switch("rex"),
+        IntegrationSwitch::Off
+    );
+    assert_eq!(
+        resolve(layers.clone()).integration_switch("git"),
+        IntegrationSwitch::Off
+    );
+    assert_eq!(
+        resolve(layers.clone()).integration_switch("missing"),
+        IntegrationSwitch::Auto
+    );
+
+    let snapshot = EnvSnapshot::with_overrides(vec![(
+        "AWMAN_TUI_INTEGRATIONS_REX_ENABLED".to_owned(),
+        "on".to_owned(),
+    )]);
+    layers.env = env_overrides(&snapshot, &[&layers.global, &layers.repo]).unwrap();
+    layers.set =
+        ConfigOverrides::parse_set_args(&["tui.integrations.rex.enabled=off".into()]).unwrap();
+    let ec = EffectiveConfig::resolve(layers.clone(), FlagConfig::default(), snapshot).unwrap();
+    assert_eq!(ec.integration_switch("rex"), IntegrationSwitch::Off);
+    assert_eq!(ec.source_of("tui.integrations.rex.enabled"), Layer::Set);
+
+    layers.set = ConfigOverrides::default();
+    let snapshot = EnvSnapshot::with_overrides(vec![(
+        "AWMAN_TUI_INTEGRATIONS_REX_ENABLED".to_owned(),
+        "on".to_owned(),
+    )]);
+    let ec = EffectiveConfig::resolve(layers, FlagConfig::default(), snapshot).unwrap();
+    assert_eq!(ec.integration_switch("rex"), IntegrationSwitch::On);
+    assert_eq!(ec.source_of("tui.integrations.rex.enabled"), Layer::Env);
+
+    assert!(ConfigOverrides::parse_set_args(&["tui.integrations.rex.enabled=yes".into()]).is_err());
+    assert!(ConfigFile::from_value(
+        json!({"tui":{"integrations":{"rex":{"enabled":"yes"}}}}),
+        FileKind::Repo,
+    )
+    .is_err());
 }
 
 #[test]

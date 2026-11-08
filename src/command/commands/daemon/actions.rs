@@ -28,6 +28,12 @@ pub enum ArgKind {
     Limit,
     /// An opaque page cursor.
     Cursor,
+    /// A key in the annotation filter.
+    Annotation,
+    /// A serialized request or response value.
+    Json,
+    /// One value from a fixed enum.
+    Enum(&'static [&'static str]),
     /// A terminal owner: `cmd_`, `tab_`, `lease_`, `run_` or `task_` (WI 0141).
     Owner,
 }
@@ -66,10 +72,34 @@ const fn optional(name: &'static str, kind: ArgKind) -> ActionArg {
         kind,
     }
 }
+const fn optional_body(name: &'static str, kind: ArgKind) -> ActionArg {
+    ActionArg {
+        name,
+        required: false,
+        where_: Location::Body,
+        kind,
+    }
+}
 
 const PAGE: &[ActionArg] = &[
     optional("limit", ArgKind::Limit),
     optional("cursor", ArgKind::Cursor),
+];
+const ANNOTATION: ActionArg = ActionArg {
+    name: "annotation",
+    required: false,
+    where_: Location::Query,
+    kind: ArgKind::Annotation,
+};
+const UI_REQUESTS: &[&str] = &[
+    "open_tab",
+    "next_tab",
+    "prev_tab",
+    "close_tab",
+    "set_container_window",
+    "open_overview",
+    "focus_workflow_window",
+    "focus_work",
 ];
 
 pub const ACTIONS: &[Action] = &[
@@ -153,6 +183,49 @@ pub const ACTIONS: &[Action] = &[
         path: "/v1/terminals/{id}",
         args: &[arg("id", Location::Path, ArgKind::Id("term"))],
         doc: "One terminal record (id=term_…)",
+    },
+    Action {
+        name: "instances.list",
+        method: "GET",
+        path: "/v1/engine/instances",
+        args: &[],
+        doc: "Engine instances (repeat annotation.<key>=<value> to filter)",
+    },
+    Action {
+        name: "instances.get",
+        method: "GET",
+        path: "/v1/engine/instances/{id}",
+        args: &[arg("id", Location::Path, ArgKind::Id("ins"))],
+        doc: "One engine instance and its tabs/frontends",
+    },
+    Action {
+        name: "dialogs.list",
+        method: "GET",
+        path: "/v1/engine/instances/{id}/dialogs",
+        args: &[arg("id", Location::Path, ArgKind::Id("ins"))],
+        doc: "Pending dialogs for an engine instance",
+    },
+    Action {
+        name: "dialogs.answer",
+        method: "POST",
+        path: "/v1/engine/instances/{id}/dialogs/{dialog_id}/answer",
+        args: &[
+            arg("id", Location::Path, ArgKind::Id("ins")),
+            arg("dialog_id", Location::Path, ArgKind::Id("dlg")),
+            arg("response", Location::Body, ArgKind::Json),
+        ],
+        doc: "Answer a pending dialog (response is a DialogResponse JSON value)",
+    },
+    Action {
+        name: "ui.request",
+        method: "POST",
+        path: "/v1/engine/instances/{id}/ui_requests",
+        args: &[
+            arg("id", Location::Path, ArgKind::Id("ins")),
+            arg("request", Location::Body, ArgKind::Enum(UI_REQUESTS)),
+            optional_body("data", ArgKind::Json),
+        ],
+        doc: "Send a UiRequest selector and optional JSON payload to an engine instance",
     },
 ];
 
@@ -238,6 +311,9 @@ fn check(action: &str, arg: &ActionArg, value: &str) -> Result<(), CommandError>
         ArgKind::Id(prefix) => id_has_prefix(value, prefix),
         ArgKind::Limit => value.parse::<u32>().is_ok_and(|n| n > 0),
         ArgKind::Cursor => !value.is_empty() && !value.contains(['/', '#']),
+        ArgKind::Annotation => crate::data::config::fields::is_valid_map_name(value),
+        ArgKind::Json => serde_json::from_str::<serde_json::Value>(value).is_ok(),
+        ArgKind::Enum(values) => values.contains(&value),
         ArgKind::Owner => ["cmd", "tab", "lease", "run", "task"]
             .iter()
             .any(|prefix| id_has_prefix(value, prefix)),
@@ -251,6 +327,9 @@ fn check(action: &str, arg: &ActionArg, value: &str) -> Result<(), CommandError>
         ArgKind::Id(prefix) => format!("an id {prefix}_<32 hex>"),
         ArgKind::Limit => "a positive integer".to_string(),
         ArgKind::Cursor => "a cursor from a previous next_cursor".to_string(),
+        ArgKind::Annotation => "a lowercase annotation name".to_string(),
+        ArgKind::Json => "valid JSON".to_string(),
+        ArgKind::Enum(values) => values.join(" | "),
         ArgKind::Owner => "an id cmd_|tab_|lease_|run_|task_<32 hex>".to_string(),
     };
     Err(invalid(format!(
@@ -313,6 +392,15 @@ pub fn plan(name: &str, kv: &[(String, String)]) -> Result<Request, CommandError
     }
     let mut request = Request::new(action.method, action.path, None);
     for (key, value) in kv {
+        if name == "instances.list" {
+            if let Some(annotation) = key.strip_prefix("annotation.") {
+                check(name, &ANNOTATION, annotation)?;
+                request
+                    .query
+                    .push(("annotation".into(), format!("{annotation}={value}")));
+                continue;
+            }
+        }
         let arg = action.args.iter().find(|a| a.name == key).ok_or_else(|| {
             invalid(format!(
                 "unknown argument {key:?} for {name}; `awman daemon api --list` shows its arguments"
@@ -325,8 +413,28 @@ pub fn plan(name: &str, kv: &[(String, String)]) -> Result<Request, CommandError
             }
             Location::Query => request.query.push((key.clone(), value.clone())),
             Location::Body => {
-                let body = request.body.get_or_insert_with(|| serde_json::json!({}));
-                body[key.as_str()] = serde_json::Value::String(value.clone());
+                let parsed: serde_json::Value = if matches!(arg.kind, ArgKind::Json) {
+                    serde_json::from_str(value).map_err(|_| {
+                        invalid(format!("{name}: invalid JSON {}={value:?}", arg.name))
+                    })?
+                } else {
+                    serde_json::Value::String(value.clone())
+                };
+                if name == "ui.request" && key == "data" {
+                    let Some(fields) = parsed.as_object() else {
+                        return Err(invalid("ui.request data must be a JSON object"));
+                    };
+                    if fields.contains_key("request") {
+                        return Err(invalid("ui.request data cannot override request="));
+                    }
+                    let body = request.body.get_or_insert_with(|| serde_json::json!({}));
+                    for (field, value) in fields {
+                        body[field] = value.clone();
+                    }
+                } else {
+                    request.body.get_or_insert_with(|| serde_json::json!({}))[key.as_str()] =
+                        parsed;
+                }
             }
         }
     }
@@ -373,6 +481,7 @@ pub fn list() -> String {
                 .map(|a| {
                     let value = match a.kind {
                         ArgKind::Id(prefix) => format!("{prefix}_…"),
+                        ArgKind::Enum(values) => format!("<{}>", values.join("|")),
                         _ => "…".into(),
                     };
                     if a.required {
@@ -436,10 +545,15 @@ mod tests {
             ArgKind::Id("cmd") => CommandId::new().to_string(),
             ArgKind::Id("run") => RunId::new().to_string(),
             ArgKind::Id("term") => crate::data::ids::TerminalId::new().to_string(),
+            ArgKind::Id("ins") => crate::data::ids::InstanceId::new().to_string(),
+            ArgKind::Id("dlg") => crate::data::ids::DialogId::new().to_string(),
             ArgKind::Owner => CommandId::new().to_string(),
             ArgKind::Id(other) => panic!("no sample for {other}"),
             ArgKind::Limit => "5".into(),
             ArgKind::Cursor => "abc".into(),
+            ArgKind::Annotation => "repo".into(),
+            ArgKind::Json => r#"{"kind":"yes"}"#.into(),
+            ArgKind::Enum(_) => "next_tab".into(),
         }
     }
 
@@ -459,7 +573,12 @@ mod tests {
                 "grants.delete",
                 "jobs.cancel",
                 "terminals.list",
-                "terminals.get"
+                "terminals.get",
+                "instances.list",
+                "instances.get",
+                "dialogs.list",
+                "dialogs.answer",
+                "ui.request"
             ]
         );
     }
@@ -482,8 +601,19 @@ mod tests {
                     Location::Path => path = path.replace(&format!("{{{}}}", arg.name), value),
                     Location::Query => query.push(format!("{}={value}", arg.name)),
                     Location::Body => {
-                        body.get_or_insert_with(|| serde_json::json!({}))[arg.name] =
+                        let parsed: serde_json::Value = if matches!(arg.kind, ArgKind::Json) {
+                            serde_json::from_str(value).unwrap()
+                        } else {
                             value.clone().into()
+                        };
+                        if action.name == "ui.request" && arg.name == "data" {
+                            for (field, value) in parsed.as_object().unwrap() {
+                                body.get_or_insert_with(|| serde_json::json!({}))[field] =
+                                    value.clone();
+                            }
+                        } else {
+                            body.get_or_insert_with(|| serde_json::json!({}))[arg.name] = parsed;
+                        }
                     }
                 }
             }
@@ -516,6 +646,61 @@ mod tests {
         assert_eq!(
             plan("keys.list", &[]).unwrap(),
             raw("GET", "/v1/keys", None).unwrap()
+        );
+    }
+
+    #[test]
+    fn engine_actions_map_to_routes_and_json_bodies() {
+        let id = crate::data::ids::InstanceId::new().to_string();
+        let did = crate::data::ids::DialogId::new().to_string();
+        let list = plan(
+            "instances.list",
+            &kv(&[("annotation.repo", "acme"), ("annotation.worktree", "one")]),
+        )
+        .unwrap();
+        assert_eq!(list.path, "/v1/engine/instances");
+        assert_eq!(
+            list.query,
+            kv(&[("annotation", "repo=acme"), ("annotation", "worktree=one")])
+        );
+        assert_eq!(
+            plan("instances.get", &kv(&[("id", &id)])).unwrap(),
+            Request::get(format!("/v1/engine/instances/{id}"))
+        );
+        assert_eq!(
+            plan("dialogs.list", &kv(&[("id", &id)])).unwrap().path,
+            format!("/v1/engine/instances/{id}/dialogs")
+        );
+        let response = r#"{"kind":"yes"}"#;
+        let answer = plan(
+            "dialogs.answer",
+            &kv(&[("id", &id), ("dialog_id", &did), ("response", response)]),
+        )
+        .unwrap();
+        assert_eq!(answer.method, "POST");
+        assert_eq!(
+            answer.path,
+            format!("/v1/engine/instances/{id}/dialogs/{did}/answer")
+        );
+        assert_eq!(
+            answer.body,
+            Some(serde_json::json!({"response": {"kind":"yes"}}))
+        );
+        let ui = plan("ui.request", &kv(&[("id", &id), ("request", "next_tab")])).unwrap();
+        assert_eq!(ui.path, format!("/v1/engine/instances/{id}/ui_requests"));
+        assert_eq!(ui.body, Some(serde_json::json!({"request":"next_tab"})));
+        let open = plan(
+            "ui.request",
+            &kv(&[
+                ("id", &id),
+                ("request", "open_tab"),
+                ("data", r#"{"dir":"/tmp"}"#),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(
+            open.body,
+            Some(serde_json::json!({"request":"open_tab", "dir":"/tmp"}))
         );
     }
 

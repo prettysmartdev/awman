@@ -37,6 +37,10 @@
 #     exit, keeping fixtures out of the shared /tmp.
 set -euo pipefail
 
+# Linking several integration harnesses alongside the large library test
+# binary exhausts small CI hosts. Explicit caller settings still win.
+export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}"
+
 tmproot="${AWMAN_TEST_TMPROOT:-/var/tmp/test-fixtures}"
 mkdir -p "$tmproot"
 # A failed `mktemp` must stop the run, not fall through with an empty TMPDIR:

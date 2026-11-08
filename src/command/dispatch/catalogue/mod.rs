@@ -119,13 +119,61 @@ pub struct ArgumentSpec {
 pub enum FrontendKind {
     Cli,
     Tui,
+    /// A CLI or TUI whose commands run in the daemon's `engine` (WI 0142
+    /// D1): the person is at the relaying frontend, so it answers like that
+    /// frontend (a local user, a human to ask, its flag visibility). Which
+    /// commands may be relayed is each spec's
+    /// [`relay_allowed`](CommandSpec::relay_allowed).
+    Relayed {
+        origin: RelayOrigin,
+    },
     Daemon {
         feature: crate::data::daemon_state::FeatureName,
         listener: crate::data::daemon_state::CommandListener,
     },
 }
 
+/// Which frontend relays a [`FrontendKind::Relayed`] command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RelayOrigin {
+    Tui,
+    Cli,
+}
+
 impl FrontendKind {
+    /// A daemon-backed TUI (its command box runs in the engine).
+    pub const RELAYED_TUI: Self = Self::Relayed {
+        origin: RelayOrigin::Tui,
+    };
+    /// A daemon-backed CLI invocation (`relay_allowed` commands only).
+    pub const RELAYED_CLI: Self = Self::Relayed {
+        origin: RelayOrigin::Cli,
+    };
+
+    /// The relaying frontend of a [`Self::Relayed`] kind.
+    pub fn origin(self) -> Option<RelayOrigin> {
+        match self {
+            FrontendKind::Relayed { origin } => Some(origin),
+            FrontendKind::Cli | FrontendKind::Tui | FrontendKind::Daemon { .. } => None,
+        }
+    }
+
+    /// The frontend a relayed kind answers like (`Cli`/`Tui` themselves
+    /// otherwise; `None` for the daemon's own frontends).
+    pub fn presenting(self) -> Option<FrontendKind> {
+        match self {
+            FrontendKind::Cli
+            | FrontendKind::Relayed {
+                origin: RelayOrigin::Cli,
+            } => Some(FrontendKind::Cli),
+            FrontendKind::Tui
+            | FrontendKind::Relayed {
+                origin: RelayOrigin::Tui,
+            } => Some(FrontendKind::Tui),
+            FrontendKind::Daemon { .. } => None,
+        }
+    }
+
     pub const WORKER_LOCAL: Self = Self::Daemon {
         feature: crate::data::daemon_state::FeatureName::Worker,
         listener: crate::data::daemon_state::CommandListener::Local,
@@ -134,6 +182,21 @@ impl FrontendKind {
         feature: crate::data::daemon_state::FeatureName::Squad,
         listener: crate::data::daemon_state::CommandListener::Local,
     };
+    /// Commands an `engine` instance runs for its frontends (WI 0142 Part A
+    /// §1). The instance runs with the launching frontend's environment, cwd
+    /// and argv, and a person is at its frontends, so it answers like the
+    /// TUI: a local user with a human to ask, the same command set and flag
+    /// visibility (parity, GA Tenet 2). Only the local listener serves it.
+    pub const ENGINE_LOCAL: Self = Self::Daemon {
+        feature: crate::data::daemon_state::FeatureName::Engine,
+        listener: crate::data::daemon_state::CommandListener::Local,
+    };
+
+    /// Whether this is an engine instance serving a local frontend
+    /// ([`Self::ENGINE_LOCAL`]).
+    pub fn is_engine_local(self) -> bool {
+        self == Self::ENGINE_LOCAL
+    }
     /// Whether this frontend is the user's own session on the host that chose
     /// the paths in a request.
     ///
@@ -144,7 +207,8 @@ impl FrontendKind {
     /// caller's.
     pub fn is_local_user(self) -> bool {
         match self {
-            FrontendKind::Cli | FrontendKind::Tui => true,
+            FrontendKind::Cli | FrontendKind::Tui | FrontendKind::Relayed { .. } => true,
+            FrontendKind::Daemon { .. } if self.is_engine_local() => true,
             FrontendKind::Daemon { .. } => false,
         }
     }
@@ -158,7 +222,8 @@ impl FrontendKind {
     /// [`CommandFrontend::input_available`](crate::command::dispatch::CommandFrontend::input_available).
     pub fn can_ask_a_human(self) -> bool {
         match self {
-            FrontendKind::Cli | FrontendKind::Tui => true,
+            FrontendKind::Cli | FrontendKind::Tui | FrontendKind::Relayed { .. } => true,
+            FrontendKind::Daemon { .. } if self.is_engine_local() => true,
             FrontendKind::Daemon { .. } => false,
         }
     }
@@ -168,6 +233,12 @@ impl FrontendKind {
         match self {
             FrontendKind::Cli => "cli",
             FrontendKind::Tui => "tui",
+            FrontendKind::Relayed {
+                origin: RelayOrigin::Tui,
+            } => "tui:daemon",
+            FrontendKind::Relayed {
+                origin: RelayOrigin::Cli,
+            } => "cli:daemon",
             FrontendKind::Daemon { feature, listener } => match (feature, listener) {
                 (
                     crate::data::daemon_state::FeatureName::Worker,
@@ -280,6 +351,19 @@ pub struct CommandSpec {
     /// `squad` must not leave a stale literal in a frontend (midpoint
     /// finding 24).
     pub opens_tui_when_bare: bool,
+
+    /// An internal entry point (`view`): parsed and runnable like any other
+    /// command, but absent from `--help`, the generated reference and TUI
+    /// hints (WI 0142 D10).
+    pub internal: bool,
+
+    /// Whether a daemon-backed CLI relays this command to the engine
+    /// (`FrontendKind::Relayed { origin: Cli }`, WI 0142 D10). Every spec
+    /// declares it; `false` means the command runs locally even when the
+    /// engine is the backend, and so never triggers the engine hand-off.
+    /// Engine-free commands (`config …`, `--help`, `--version`) are always
+    /// `false`.
+    pub relay_allowed: bool,
 }
 
 impl CommandSpec {
@@ -403,6 +487,14 @@ impl CommandCatalogue {
     pub fn is_allowed_for_frontend(&self, frontend: FrontendKind, path: &[&str]) -> bool {
         match frontend {
             FrontendKind::Cli | FrontendKind::Tui => true,
+            // The TUI's command box runs every command the builtin TUI runs;
+            // a relayed CLI only what its spec declares relayable.
+            FrontendKind::Relayed {
+                origin: RelayOrigin::Tui,
+            } => true,
+            FrontendKind::Relayed {
+                origin: RelayOrigin::Cli,
+            } => self.is_relay_allowed(path),
             FrontendKind::Daemon {
                 feature: crate::data::daemon_state::FeatureName::Worker,
                 ..
@@ -414,8 +506,25 @@ impl CommandCatalogue {
             FrontendKind::Daemon {
                 feature: crate::data::daemon_state::FeatureName::Engine,
                 ..
-            } => false,
+            } => frontend.is_engine_local(),
         }
+    }
+
+    /// Whether a daemon-backed CLI relays `path` to the engine (and so
+    /// whether the CLI runs the engine hand-off for it at all). Unknown paths
+    /// and the bare root are local-only.
+    pub fn is_relay_allowed(&self, path: &[&str]) -> bool {
+        !path.is_empty()
+            && self
+                .lookup_with_aliases(path)
+                .is_some_and(|spec| spec.relay_allowed)
+    }
+
+    /// Whether `path` is an internal entry point (hidden from help, docs
+    /// and hints).
+    pub fn is_internal(&self, path: &[&str]) -> bool {
+        self.lookup_with_aliases(path)
+            .is_some_and(|spec| spec.internal)
     }
 
     fn is_api_allowed(&self, path: &[&str]) -> bool {
@@ -555,6 +664,8 @@ const ROOT: CommandSpec = CommandSpec {
     requires_container_tier: false,
     requires_runtime: true,
     opens_tui_when_bare: false,
+    internal: false,
+    relay_allowed: false,
     flags: &[
         FlagSpec {
             long: "build",
@@ -592,7 +703,7 @@ const ROOT: CommandSpec = CommandSpec {
     ],
     subcommands: &[
         &ATTACH, &INIT, &READY, &CHAT, &SPECS, &AGENTS, &CONFIG, &EXEC, &DAEMON, &SQUAD, &REMOTE,
-        &NEW, &CLEAN,
+        &NEW, &CLEAN, &VIEW,
     ],
 };
 
@@ -671,6 +782,8 @@ mod remote;
 mod shared_flags;
 pub use shared_flags::SessionWorktreeTarget;
 mod squad;
+// WI 0142: the hidden `view` command spec.
+mod view;
 
 #[cfg(test)]
 mod tests;
@@ -684,3 +797,4 @@ use new::*;
 use remote::*;
 use shared_flags::*;
 use squad::*;
+use view::*;

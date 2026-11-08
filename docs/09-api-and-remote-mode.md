@@ -616,6 +616,21 @@ This is the complete route table. Request and response details for the worker ro
 | `GET` | `/v1/squad/env` | squad | feature | Names and digests of the persisted environment (never values) |
 | `PUT` | `/v1/squad/env` | squad | feature | Merge values into the persisted environment |
 | `DELETE` | `/v1/squad/env` | squad | feature | Clear the persisted environment |
+| `GET` | `/v1/engine/instances` | engine | owner/local | List engine instances (repeat `annotation=key=value` to filter) |
+| `POST` | `/v1/engine/instances` | engine | owner/local | Reserve an instance for a TUI to attach to |
+| `GET` | `/v1/engine/instances/{id}` | engine | owner/local | One instance with its frontends and tabs |
+| `PATCH` | `/v1/engine/instances/{id}` | engine | owner/local | Merge annotations (an empty value removes a key) |
+| `DELETE` | `/v1/engine/instances/{id}` | engine | owner/local | Quit an instance |
+| `GET` | `/v1/engine/instances/{id}/tabs` | engine | owner/local | List an instance's tabs |
+| `GET`, `PATCH` | `/v1/engine/instances/{id}/tabs/{tab}` | engine | owner/local | Read a tab, or merge its annotations |
+| `GET` | `/v1/engine/instances/{id}/dialogs` | engine | owner/local | Dialogs waiting for an answer |
+| `POST` | `/v1/engine/instances/{id}/dialogs/{dialog_id}/answer` | engine | owner/local | Answer a pending dialog (`409 dialog_answered` if someone already did) |
+| `POST` | `/v1/engine/instances/{id}/ui_requests` | engine | owner/local | Ask the instance to open or close a tab, change focus, and so on |
+| `GET` | `/v1/engine/instances/{id}/frontend` | engine | owner/local | WebSocket a TUI attaches through |
+
+### Engine routes
+
+The `/v1/engine/*` routes belong to the daemon's engine feature, which hosts [TUI instances](19-engine-and-frontends.md). They are owner/local only: on the network listener they answer `404 not_found`, and they are not reachable through `awman remote`. Remote frontends are out of scope; a TUI attaches to an engine on the same machine. From the command line, use `awman daemon api instances.list`, `instances.get`, `dialogs.list`, `dialogs.answer` and `ui.request`. Routes for an engine that is off answer `503 feature_disabled`.
 
 Squad task and run bodies use `snake_case` fields; a task's interval is `interval_ms`. The scheduler currently has one-second granularity, so `interval_ms` must be a multiple of 1000. Anything not in this table — including the old unprefixed routes listed under [Upgrading from earlier betas](#upgrading-from-earlier-betas) — answers `404 not_found`.
 

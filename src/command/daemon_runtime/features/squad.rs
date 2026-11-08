@@ -47,13 +47,16 @@ impl SquadFeature {
         let paths = SquadPaths::from_env(core.env())?;
         let env_state = Arc::new(DaemonEnvState::without_store());
         let status = Arc::new(Mutex::new(SchedulerStatus::default()));
-        let gateway = Arc::new(LocalTaskGateway::new(
-            core.task_store().clone(),
-            engines.clone(),
-            status.clone(),
-            paths.clone(),
-            env_state.clone(),
-        ));
+        let gateway = Arc::new(
+            LocalTaskGateway::new(
+                core.task_store().clone(),
+                engines.clone(),
+                status.clone(),
+                paths.clone(),
+                env_state.clone(),
+            )
+            .with_env(core.env().clone()),
+        );
         Ok(Arc::new(Self {
             shared: Arc::new(SquadShared {
                 gateway,

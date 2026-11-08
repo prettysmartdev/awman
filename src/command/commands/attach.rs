@@ -18,7 +18,7 @@ use crate::command::commands::squad::gateway::TaskGateway;
 use crate::command::commands::Command;
 use crate::command::dispatch::BuildContext;
 use crate::command::error::CommandError;
-use crate::data::config::env::Env;
+use crate::data::config::env::EnvSnapshot;
 use crate::data::fs::DataPaths;
 use crate::data::ids::{TaskId, TerminalId};
 use crate::data::message::UserMessageSink;
@@ -84,6 +84,8 @@ pub struct AttachCommand {
     host_output_policy: HostOutputPolicy,
     task_name: Option<String>,
     task_gateway: Option<Arc<dyn TaskGateway>>,
+    /// The invoking session's environment, which locates the daemon.
+    env: EnvSnapshot,
 }
 
 impl AttachCommand {
@@ -92,6 +94,7 @@ impl AttachCommand {
         step: Option<String>,
         read_only: bool,
         annotations: Annotations,
+        env: EnvSnapshot,
     ) -> Self {
         Self {
             target,
@@ -101,6 +104,7 @@ impl AttachCommand {
             host_output_policy: HostOutputPolicy::default(),
             task_name: None,
             task_gateway: None,
+            env,
         }
     }
 
@@ -138,6 +142,7 @@ impl AttachCommand {
             ctx.flags.string(FLAG_STEP),
             ctx.flags.bool(FLAG_READ_ONLY),
             annotations,
+            ctx.session.env().clone(),
         )
         .with_policy(host_output_policy))
     }
@@ -174,8 +179,7 @@ impl Command for AttachCommand {
         mut frontend: Self::Frontend,
     ) -> Result<Self::Outcome, CommandError> {
         validate_step_target(&self.target, self.step())?;
-        let env = Env::from_process();
-        let paths = DataPaths::from_env(&env)?;
+        let paths = DataPaths::from_env(&self.env)?;
         let endpoint = discover(&paths.daemon())?.ok_or(CommandError::DaemonNotRunning)?;
         let resolved_task = match (&self.task_name, &self.task_gateway) {
             (Some(name), Some(gateway)) => Some(gateway.get(name).await?.id),

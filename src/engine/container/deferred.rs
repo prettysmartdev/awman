@@ -148,6 +148,17 @@ impl ContainerBackend for DeferredBackend {
     ) -> Result<ImportedImage, EngineError> {
         self.get()?.import_image_cancellable(request, sink, cancel)
     }
+
+    fn import_image_cancellable_in(
+        &self,
+        request: &ImageImportRequest,
+        env: &crate::data::config::env::EnvSnapshot,
+        sink: &mut dyn UserMessageSink,
+        cancel: &crate::engine::oci::CancelToken,
+    ) -> Result<ImportedImage, EngineError> {
+        self.get()?
+            .import_image_cancellable_in(request, env, sink, cancel)
+    }
     fn list_dangling_images(&self) -> Result<Vec<ContainerImageInfo>, EngineError> {
         self.get()?.list_dangling_images()
     }

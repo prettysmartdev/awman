@@ -599,12 +599,12 @@ fn attaching_mid_workflow_keeps_completed_steps_in_the_existing_overview() {
 
 #[test]
 fn tui_attach_uses_existing_container_proxy_without_a_new_frontend_impl() {
-    let source = include_str!("../src/frontend/tui/squad_attach.rs");
-    assert!(source.contains("TuiContainerProxy::with_io"));
+    let source = include_str!("../src/command/instance/per_command/squad_attach.rs");
+    assert!(source.contains("InstanceContainerProxy::with_io"));
     assert!(source.contains("run_with_frontend(Box::new(proxy))"));
     assert!(
         !source.contains("impl AgentFrontend for"),
-        "attach must reuse TuiContainerProxy rather than define another AgentFrontend"
+        "attach must reuse InstanceContainerProxy rather than define another AgentFrontend"
     );
 }
 
@@ -632,7 +632,7 @@ fn neither_attach_frontend_names_a_concrete_runtime_backend() {
     // `runtime_name()` call to format the shared sandbox-refusal text is
     // permitted — it changes no attach behaviour.)
     for source in [
-        include_str!("../src/frontend/tui/squad_attach.rs"),
+        include_str!("../src/command/instance/per_command/squad_attach.rs"),
         include_str!("../src/frontend/cli/per_command/squad_attach.rs"),
         include_str!("../src/command/commands/squad/attach.rs"),
     ] {
