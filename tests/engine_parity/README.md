@@ -23,7 +23,9 @@ measurement. Every Submit runs real Dispatch, and must finish before the next
 Submit; stale output cannot satisfy a timer. Dialog response timing ends at the
 engine-side response receiver, starting before the engine publishes its request.
 The actual RemoteInstanceBackend adapter also measures 325 commands and 975
-dialog answers. No samples are discarded. The normal p95 limit is
+dialog answers. The Makefile runs these two benchmarks serially, apart from
+other test targets, so parallel fixtures do not skew the timing. No samples are
+discarded. The normal p95 limit is
 strictly below 5 ms. On an explicitly designated slow or oversubscribed CI host,
 set **`AWMAN_TEST_SLOW_HOST=1`** to retain the measurements and functional checks
 while disabling only the strict latency assertions. No hardware detection,
