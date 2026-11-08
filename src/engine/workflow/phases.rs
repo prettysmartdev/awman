@@ -285,6 +285,28 @@ impl WorkflowEngine {
                 continue;
             }
 
+            // A PR cannot be opened for a push that failed earlier in this
+            // teardown. In particular, gh reports an absent head branch as
+            // "No commits between", which otherwise looks like indexing lag.
+            if kind == PhaseKind::Teardown
+                && step.creates_pull_request()
+                && steps[..idx].iter().enumerate().any(|(push_idx, prior)| {
+                    prior.pushes_branch()
+                        && matches!(
+                            self.state.phase_step_states(kind)[push_idx].status,
+                            PhaseStepStatus::Failed { .. }
+                        )
+                })
+            {
+                self.msg_warning(format!(
+                    "skipping {desc}: an earlier push_branch step failed; fix the push before creating a pull request"
+                ));
+                self.state.phase_step_states_mut(kind)[idx].status = PhaseStepStatus::Skipped;
+                self.persist()?;
+                self.frontend.on_phase_step_skipped(kind, &desc);
+                continue;
+            }
+
             self.state.phase_step_states_mut(kind)[idx].status = PhaseStepStatus::Running;
             self.persist()?;
 
@@ -1091,12 +1113,21 @@ const PR_BRANCH_NOT_INDEXED_RETRY_DELAYS: [std::time::Duration; 4] = [
 #[cfg(test)]
 const PR_BRANCH_NOT_INDEXED_RETRY_DELAYS: [std::time::Duration; 4] = [std::time::Duration::ZERO; 4];
 
-/// `gh pr create` fails with "No commits between <base> and <head>" when
-/// GitHub has not yet indexed the commits push_branch just sent. An
-/// interactive run merges stderr into stdout, so both are checked.
+/// `gh pr create` can report "No commits between" while GitHub indexes a
+/// push. The same message also accompanies invalid or absent refs, which
+/// cannot be fixed by waiting. An interactive run merges stderr into stdout.
 fn pr_branch_not_yet_indexed(outcome: &PhaseStepOutcome) -> bool {
     const MARKER: &str = "No commits between";
-    outcome.stderr.contains(MARKER) || outcome.stdout.contains(MARKER)
+    let output = format!("{}\n{}", outcome.stderr, outcome.stdout);
+    output.contains(MARKER)
+        && ![
+            "Head sha can't be blank",
+            "Base sha can't be blank",
+            "Head ref must be a branch",
+            "Base ref must be a branch",
+        ]
+        .iter()
+        .any(|invalid_ref| output.contains(invalid_ref))
 }
 
 /// gh prints the created PR URL on stdout. This parser is used only by the

@@ -2962,6 +2962,61 @@ fn create_pull_request_does_not_retry_other_failures() {
 }
 
 #[test]
+fn create_pull_request_does_not_retry_when_head_ref_is_missing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut engine = make_minimal_engine(&tmp);
+    let mock = Arc::new(MockBackgroundContainer::with_results([(
+        String::new(),
+        "GraphQL: Head sha can't be blank, Base sha can't be blank, No commits between main and feat, Head ref must be a branch (createPullRequest)".to_string(),
+        1,
+    )]));
+    engine
+        .run_phase(
+            PhaseKind::Teardown,
+            &create_pull_request_step(),
+            &[false],
+            &[],
+            mock.factory(),
+        )
+        .unwrap();
+    assert_eq!(mock.calls().len(), 1);
+}
+
+#[test]
+fn create_pull_request_skips_after_failed_push() {
+    use crate::data::workflow_definition::TeardownStep;
+    use crate::data::workflow_state::PhaseStepStatus;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut engine = make_minimal_engine(&tmp);
+    let steps = [
+        TeardownStep::PushBranch {
+            remote: None,
+            branch: None,
+        },
+        create_pull_request_step().remove(0),
+    ];
+    let mock = Arc::new(MockBackgroundContainer::with_results([(
+        String::new(),
+        "push rejected".to_string(),
+        1,
+    )]));
+    engine
+        .run_phase(
+            PhaseKind::Teardown,
+            &steps,
+            &[false, false],
+            &[],
+            mock.factory(),
+        )
+        .unwrap();
+    assert_eq!(mock.calls().len(), 1);
+    assert!(matches!(
+        engine.state().teardown_step_states[1].status,
+        PhaseStepStatus::Skipped
+    ));
+}
+
+#[test]
 fn create_pull_request_gives_up_after_bounded_retries() {
     let tmp = tempfile::tempdir().unwrap();
     let mut engine = make_minimal_engine(&tmp);
