@@ -25,6 +25,33 @@ Guest network policy is configured through `runtime.builtin.network`; the repo m
 
 See [Runtimes](11-runtimes.md#builtin-microvm-experimental).
 
+### Terminal output and host terminal variables
+
+When agent output is attached to a host terminal, awman filters terminal
+control sequences before writing it to the host. Printable text, ordinary
+cursor and colour controls (CSI), standard escape sequences, and OSC titles,
+hyperlinks, and icon names (OSC 0, 1, 2, and 8) pass through. Other OSC
+sequences are removed, including clipboard access (OSC 52), file transfer,
+palette changes, and terminal notifications (OSC 9, 99, and 777). OSC 7501
+program-status reports are removed or parsed and re-encoded from sanitised
+fields; raw reports and terminal queries are never passed through. DCS, SOS,
+PM, and APC strings are removed in full, including Kitty graphics. tmux
+passthrough wrappers are removed and their contents are scanned again by the
+same filter. Incomplete control strings are dropped at detach. This
+filter applies to TTY attach output; the TUI's in-process terminal display is
+separate.
+
+Containers do not receive these host-terminal variables, even when an overlay
+asks to pass one through: `REX_*`, `TMUX`, `TMUX_*`, `ZELLIJ`, `ZELLIJ_*`,
+`STY`, `WINDOW`, `TERM_PROGRAM`, `TERM_PROGRAM_VERSION`, `TERM_SESSION_ID`,
+`WEZTERM_*`, `KITTY_*`, `ITERM_*`, `LC_TERMINAL*`, `ALACRITTY_*`, `GHOSTTY_*`,
+`VTE_VERSION`, `WT_SESSION`, and `WT_PROFILE_ID`. awman warns when it removes
+requested variables. Inside every container, `TERM` is `xterm-256color`;
+`COLORTERM` is `truecolor` only when the host had `COLORTERM` set. If an agent
+needs one of the blocked values, copy it into a differently named host
+variable before launching awman, then pass that new variable with an `env()`
+overlay.
+
 ### Live credential refresh
 
 Claude Code's OAuth refresh token — the credential that could mint new access tokens indefinitely — never leaves your host and is never given to a container. Instead, for each session awman writes a sanitized, awman-authored `.credentials.json` (access token, expiry, and scopes only, mode `0600`) into the staged `~/.claude` directory that's bind-mounted into the container; the host's own `~/.claude/.credentials.json` is excluded from that mount entirely.

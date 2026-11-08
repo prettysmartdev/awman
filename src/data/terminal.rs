@@ -1,0 +1,554 @@
+//! The daemon terminal contract (WI 0141): terminal records, the
+//! `awman.terminal.v1` wire frames, viewer identity and the host-output
+//! policy — every shape that crosses a process or layer boundary.
+//!
+//! Layer 1's `engine::terminal_hub` produces and consumes these; Layer 2's
+//! `command::terminals` decides who may see or drive a terminal; Layer 3
+//! (`frontend::api::terminals`, `awman attach`) moves them over WebSockets and
+//! host TTYs. Nothing here does I/O.
+
+use std::collections::BTreeMap;
+
+use base64::{engine::general_purpose::STANDARD, Engine as _};
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+use crate::data::daemon_state::{CommandListener, FeatureName};
+use crate::data::execution_event::EventSource;
+use crate::data::ids::{CommandId, IdError, LeaseId, RunId, TabId, TaskId, TerminalId};
+
+/// The WebSocket subprotocol every terminal viewer negotiates (0139 §1).
+pub const TERMINAL_SUBPROTOCOL: &str = "awman.terminal.v1";
+
+/// Header naming a network client for `terminal_control` events.
+pub const ACTOR_HEADER: &str = "x-awman-actor";
+
+/// Who a terminal belongs to. Access to a terminal follows its owner's rules.
+///
+/// `Run` is the squad owner: a squad evaluation runs inside the daemon with no
+/// `cmd_` of its own, so its terminals hang off the run (`awman attach
+/// task_…` resolves the task's active run first).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum TerminalOwner {
+    Command(CommandId),
+    Tab(TabId),
+    Lease(LeaseId),
+    Run(RunId),
+}
+
+impl TerminalOwner {
+    /// Parse a prefixed id (`cmd_`, `tab_`, `lease_`, `run_`).
+    pub fn parse(s: &str) -> Result<Self, IdError> {
+        if s.starts_with(concat!("cmd", "_")) {
+            return CommandId::parse(s).map(Self::Command);
+        }
+        if s.starts_with(concat!("tab", "_")) {
+            return TabId::parse(s).map(Self::Tab);
+        }
+        if s.starts_with(concat!("lease", "_")) {
+            return LeaseId::parse(s).map(Self::Lease);
+        }
+        if s.starts_with(concat!("run", "_")) {
+            return RunId::parse(s).map(Self::Run);
+        }
+        Err(IdError::Invalid {
+            kind: "terminal owner",
+            prefix: "cmd|tab|lease|run",
+            value: s.to_owned(),
+        })
+    }
+
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Command(id) => id.as_str(),
+            Self::Tab(id) => id.as_str(),
+            Self::Lease(id) => id.as_str(),
+            Self::Run(id) => id.as_str(),
+        }
+    }
+}
+
+impl std::fmt::Display for TerminalOwner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl Serialize for TerminalOwner {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for TerminalOwner {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        Self::parse(&s).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Whether the PTY behind a terminal is still running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalState {
+    Open,
+    Exited,
+}
+
+impl TerminalState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Exited => "exited",
+        }
+    }
+}
+
+/// What Layer 2 tells the runtime about the terminal a PTY launch should
+/// register. Carried as a resolved container/sandbox option; a launch
+/// without one (a CLI `chat`) registers no terminal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalOwnerInfo {
+    pub owner: TerminalOwner,
+    pub feature: FeatureName,
+    /// 0137's event-envelope object (phase, step, container, attempt).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<EventSource>,
+    /// The command's execution number (0136).
+    pub attempt: u32,
+    /// The per-command half of the network-input gate; the other half is
+    /// `daemon.terminal.remoteInput`.
+    pub allow_remote_input: bool,
+}
+
+/// The record `GET /v1/terminals` returns and the hub keeps.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalRecord {
+    pub id: TerminalId,
+    pub owner_id: TerminalOwner,
+    pub feature: FeatureName,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<EventSource>,
+    pub agent: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    pub attempt: u32,
+    pub cols: u16,
+    pub rows: u16,
+    pub state: TerminalState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    pub created_at: DateTime<Utc>,
+    pub allow_remote_input: bool,
+}
+
+/// The screen as ANSI that redraws it, plus its size.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalSnapshot {
+    pub cols: u16,
+    pub rows: u16,
+    pub screen: Vec<u8>,
+}
+
+/// Bytes on the JSON wire: standard base64 with padding.
+pub mod base64_bytes {
+    use super::*;
+
+    pub fn serialize<S: Serializer>(bytes: &[u8], s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&STANDARD.encode(bytes))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+        let text = String::deserialize(d)?;
+        STANDARD.decode(text).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Server → client frames of `awman.terminal.v1`. One codec serves local
+/// attaches and network viewers; the set mirrors `attach_protocol.rs`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum TerminalFrame {
+    /// A refused client operation does not close the output subscription.
+    Error {
+        code: String,
+        error: String,
+    },
+    /// Sent on connect and after `Lagged`.
+    Snapshot {
+        cols: u16,
+        rows: u16,
+        #[serde(with = "base64_bytes")]
+        screen: Vec<u8>,
+    },
+    Output {
+        #[serde(with = "base64_bytes")]
+        bytes: Vec<u8>,
+    },
+    Resize {
+        cols: u16,
+        rows: u16,
+    },
+    Exit {
+        code: i32,
+    },
+    /// This viewer missed output; a `Snapshot` follows.
+    Lagged,
+}
+
+/// Why a viewer left.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DetachReason {
+    /// A normal detach (Ctrl-C).
+    User,
+    /// The attach lost its own terminal (SIGHUP, stdout closed).
+    Hangup,
+}
+
+impl DetachReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Hangup => "hangup",
+        }
+    }
+}
+
+/// Client → server frames of `awman.terminal.v1`. `Input` and `Resize` are
+/// honoured only for the client holding the input grant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum TerminalClientFrame {
+    Input {
+        #[serde(with = "base64_bytes")]
+        bytes: Vec<u8>,
+    },
+    Resize {
+        cols: u16,
+        rows: u16,
+    },
+    /// Request the (exclusive) input grant.
+    TakeControl,
+    /// Said once before the client goes away.
+    Detached {
+        reason: DetachReason,
+    },
+}
+
+/// Generic integration metadata on a subscription (`--annotation k=v`).
+/// Keys follow 0139 §1 (`<namespace>/<name>`, lowercase `[a-z0-9.-]`).
+pub type Annotations = BTreeMap<String, String>;
+
+/// Longest annotation key and value, in bytes (0142's limits).
+pub const MAX_ANNOTATION_KEY_BYTES: usize = 63;
+pub const MAX_ANNOTATION_VALUE_BYTES: usize = 256;
+/// Most annotations one subscription may carry.
+pub const MAX_ANNOTATIONS: usize = 16;
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum AnnotationError {
+    #[error("invalid annotation key `{0}`: expected <namespace>/<name> in [a-z0-9.-]")]
+    InvalidKey(String),
+    #[error("annotation value for `{0}` is too long (max {MAX_ANNOTATION_VALUE_BYTES} bytes)")]
+    ValueTooLong(String),
+    #[error("annotation value for `{0}` contains control characters")]
+    InvalidValue(String),
+    #[error("too many annotations (max {MAX_ANNOTATIONS})")]
+    TooMany,
+}
+
+/// Validate one `k=v` annotation.
+pub fn validate_annotation(key: &str, value: &str) -> Result<(), AnnotationError> {
+    let valid_part = |part: &str| {
+        !part.is_empty()
+            && part.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'-')
+            })
+    };
+    let mut parts = key.split('/');
+    let valid_key = key.len() <= MAX_ANNOTATION_KEY_BYTES
+        && parts.next().is_some_and(valid_part)
+        && parts.next().is_some_and(valid_part)
+        && parts.next().is_none();
+    if !valid_key {
+        return Err(AnnotationError::InvalidKey(key.to_owned()));
+    }
+    if value.len() > MAX_ANNOTATION_VALUE_BYTES {
+        return Err(AnnotationError::ValueTooLong(key.to_owned()));
+    }
+    if value.chars().any(char::is_control) {
+        return Err(AnnotationError::InvalidValue(key.to_owned()));
+    }
+    Ok(())
+}
+
+/// Parse repeatable `--annotation k=v` values into a validated map.
+pub fn parse_annotations<S: AsRef<str>>(pairs: &[S]) -> Result<Annotations, AnnotationError> {
+    let mut annotations = Annotations::new();
+    for pair in pairs {
+        let pair = pair.as_ref();
+        let (key, value) = pair
+            .split_once('=')
+            .ok_or_else(|| AnnotationError::InvalidKey(pair.to_owned()))?;
+        validate_annotation(key, value)?;
+        annotations.insert(key.to_owned(), value.to_owned());
+        if annotations.len() > MAX_ANNOTATIONS {
+            return Err(AnnotationError::TooMany);
+        }
+    }
+    Ok(annotations)
+}
+
+/// Header-name prefix carrying one subscription annotation on the terminal
+/// WebSocket handshake.
+///
+/// `/` (the key's namespace separator) is not legal in an HTTP header name,
+/// so the transport spells it `~`, which no key may contain:
+/// `rex/block=blk 1` travels as `x-awman-annotation-rex~block: blk%201`.
+/// The value is percent-encoded (every byte outside visible ASCII, plus `%`)
+/// so any valid value, UTF-8 included, is a legal header value. Client and
+/// server both use [`annotation_header`] / [`annotation_from_header`]; the
+/// logical key and value in events are unchanged.
+pub const ANNOTATION_HEADER_PREFIX: &str = "x-awman-annotation-";
+
+/// The `(header name, header value)` that carry a validated annotation.
+pub fn annotation_header(key: &str, value: &str) -> (String, String) {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_graphic() && byte != b'%' {
+            encoded.push(byte as char);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    (
+        format!("{ANNOTATION_HEADER_PREFIX}{}", key.replace('/', "~")),
+        encoded,
+    )
+}
+
+/// Decode one annotation header back into its validated logical key and
+/// value. `name` is the full (lower-case) header name; `Ok(None)` when it
+/// is not an annotation header.
+pub fn annotation_from_header(
+    name: &str,
+    value: &[u8],
+) -> Result<Option<(String, String)>, AnnotationError> {
+    let Some(encoded_key) = name.strip_prefix(ANNOTATION_HEADER_PREFIX) else {
+        return Ok(None);
+    };
+    if encoded_key.contains('/') {
+        return Err(AnnotationError::InvalidKey(encoded_key.to_owned()));
+    }
+    let key = encoded_key.replace('~', "/");
+    let invalid = || AnnotationError::InvalidValue(key.clone());
+    let mut bytes = Vec::with_capacity(value.len());
+    let mut iter = value.iter();
+    while let Some(&byte) = iter.next() {
+        if byte == b'%' {
+            let hex = [
+                *iter.next().ok_or_else(invalid)?,
+                *iter.next().ok_or_else(invalid)?,
+            ];
+            let hex = std::str::from_utf8(&hex).map_err(|_| invalid())?;
+            bytes.push(u8::from_str_radix(hex, 16).map_err(|_| invalid())?);
+        } else if byte.is_ascii_graphic() {
+            bytes.push(byte);
+        } else {
+            return Err(invalid());
+        }
+    }
+    let value = String::from_utf8(bytes).map_err(|_| invalid())?;
+    validate_annotation(&key, &value)?;
+    Ok(Some((key, value)))
+}
+
+/// Who holds a terminal's input grant, as written to `terminal_control`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlHolder {
+    /// A local attach (owner socket).
+    Local,
+    /// A network client, named by its `x-awman-actor` header.
+    Actor(String),
+}
+
+impl ControlHolder {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Local => "local",
+            Self::Actor(actor) => actor,
+        }
+    }
+}
+
+/// The identity a viewer presents when it opens a terminal. Built by Layer 3
+/// from the connection (listener, headers, CLI flags); judged by Layer 2.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ViewerIdentity {
+    pub listener: CommandListener,
+    /// The `x-awman-actor` header, when a network client sent one.
+    pub actor: Option<String>,
+    pub annotations: Annotations,
+    /// `--read-only`: never requests the grant, never resizes.
+    pub read_only: bool,
+}
+
+impl ViewerIdentity {
+    pub fn local() -> Self {
+        Self {
+            listener: CommandListener::Local,
+            actor: None,
+            annotations: Annotations::new(),
+            read_only: false,
+        }
+    }
+
+    pub fn holder(&self) -> ControlHolder {
+        match (&self.listener, &self.actor) {
+            (CommandListener::Network, Some(actor)) => ControlHolder::Actor(actor.clone()),
+            (CommandListener::Network, None) => ControlHolder::Actor(String::new()),
+            (CommandListener::Local, _) => ControlHolder::Local,
+        }
+    }
+}
+
+/// What `awman attach <id>` was given. The prefix says what it is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttachTarget {
+    Terminal(TerminalId),
+    Command(CommandId),
+    Task(TaskId),
+}
+
+impl AttachTarget {
+    pub fn parse(s: &str) -> Result<Self, IdError> {
+        if s.starts_with(concat!("term", "_")) {
+            return TerminalId::parse(s).map(Self::Terminal);
+        }
+        if s.starts_with(concat!("cmd", "_")) {
+            return CommandId::parse(s).map(Self::Command);
+        }
+        if s.starts_with(concat!("task", "_")) {
+            return TaskId::parse(s).map(Self::Task);
+        }
+        Err(IdError::Invalid {
+            kind: "attach target",
+            prefix: "term|cmd|task",
+            value: s.to_owned(),
+        })
+    }
+}
+
+/// What a host-terminal writer does with OSC 7501 reports in agent output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ProgramStatusMode {
+    /// Parse, then re-encode from the sanitised record. Never forward raw.
+    #[default]
+    Reencode,
+    Strip,
+}
+
+/// How agent bytes are filtered before they reach a host TTY. Resolved by
+/// Layer 2 from config and host-integration state, applied by Layer 3's
+/// `HostOutputFilter`. The default strips desktop notifications; Rex (0154)
+/// maps `tui.integrations.rex.forwardAgentNotifications` onto
+/// `allow_notifications`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct HostOutputPolicy {
+    pub allow_notifications: bool,
+    pub program_status: ProgramStatusMode,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn owner_and_target_parse_by_prefix() {
+        let cmd = CommandId::new();
+        assert_eq!(
+            TerminalOwner::parse(cmd.as_str()).unwrap(),
+            TerminalOwner::Command(cmd.clone())
+        );
+        assert!(TerminalOwner::parse("task_00000000000000000000000000000000").is_err());
+        assert_eq!(
+            AttachTarget::parse(cmd.as_str()).unwrap(),
+            AttachTarget::Command(cmd)
+        );
+        assert!(AttachTarget::parse("nope").is_err());
+    }
+
+    #[test]
+    fn frames_round_trip_with_base64_bytes() {
+        let frame = TerminalFrame::Output {
+            bytes: vec![0x1b, b'[', 0xff],
+        };
+        let json = serde_json::to_string(&frame).unwrap();
+        assert!(json.contains("\"type\":\"output\""));
+        assert_eq!(serde_json::from_str::<TerminalFrame>(&json).unwrap(), frame);
+        let detached = TerminalClientFrame::Detached {
+            reason: DetachReason::Hangup,
+        };
+        assert_eq!(
+            serde_json::to_string(&detached).unwrap(),
+            r#"{"type":"detached","reason":"hangup"}"#
+        );
+    }
+
+    #[test]
+    fn annotations_validate_limits_and_preserve_values() {
+        let parsed = parse_annotations(&["rex/block=blk_42", "app/view=primary"]).unwrap();
+        assert_eq!(parsed.get("rex/block").map(String::as_str), Some("blk_42"));
+        assert!(matches!(
+            validate_annotation("Rex/block", "x"),
+            Err(AnnotationError::InvalidKey(_))
+        ));
+        assert!(matches!(
+            validate_annotation("rex/block", &"x".repeat(MAX_ANNOTATION_VALUE_BYTES + 1)),
+            Err(AnnotationError::ValueTooLong(_))
+        ));
+        assert!(matches!(
+            parse_annotations(&["missing-separator"]),
+            Err(AnnotationError::InvalidKey(_))
+        ));
+    }
+
+    /// Review finding: the header form of every valid annotation is a legal
+    /// HTTP header and decodes back to the same logical key and value.
+    #[test]
+    fn annotation_header_encoding_is_legal_and_round_trips() {
+        for (key, value) in [
+            ("rex/block", "blk_1"),
+            ("a.b-c/d.e", "with space, 100% & ünïcode"),
+            ("x/y", ""),
+        ] {
+            validate_annotation(key, value).unwrap();
+            let (name, encoded) = annotation_header(key, value);
+            hyper::http::HeaderName::from_bytes(name.as_bytes()).expect("legal name");
+            hyper::http::HeaderValue::from_str(&encoded).expect("legal value");
+            assert_eq!(
+                annotation_from_header(&name, encoded.as_bytes()).unwrap(),
+                Some((key.to_owned(), value.to_owned()))
+            );
+        }
+        assert_eq!(
+            annotation_from_header("x-awman-actor", b"me").unwrap(),
+            None
+        );
+        for (name, value) in [
+            ("x-awman-annotation-rex~block", b"bad%zz".as_slice()),
+            ("x-awman-annotation-rex~block", b"trunc%4"),
+            ("x-awman-annotation-rex~block", b"\xff"),
+            ("x-awman-annotation-rex~block", b"%1B"),
+            ("x-awman-annotation-rex/block", b"x"),
+            ("x-awman-annotation-rexblock", b"x"),
+        ] {
+            assert!(
+                annotation_from_header(name, value).is_err(),
+                "{name}: {value:?}"
+            );
+        }
+    }
+}

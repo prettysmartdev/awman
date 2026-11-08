@@ -6,6 +6,7 @@
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(tag = "kind", content = "payload")]
 pub enum CommandOutcome {
+    Attach(crate::command::commands::attach::AttachOutcome),
     Init(crate::command::commands::init::InitOutcome),
     Ready(crate::command::commands::ready::ReadyOutcome),
     Chat(crate::command::commands::chat::ChatOutcome),
@@ -38,6 +39,7 @@ impl CommandOutcome {
     /// showed red in the TUI.
     pub fn exit_code(&self) -> i32 {
         match self {
+            Self::Attach(outcome) => outcome.exit_code,
             Self::Chat(outcome) => outcome.exit_code.unwrap_or(0),
             Self::ExecWorkflow(outcome) => outcome.exit_code.unwrap_or(0),
             Self::ExecPrompt(outcome) => outcome.exit_code.unwrap_or(0),

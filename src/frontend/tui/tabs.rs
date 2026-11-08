@@ -9,6 +9,7 @@ use ratatui::layout::Rect;
 use crate::command::dispatch::CommandOutcome;
 use crate::command::error::CommandError;
 use crate::command::git_summary::GitSummaryPoller;
+use crate::data::program_status::EffectiveStatus;
 use crate::data::session::{InvocationStatus, Session, SessionId, SessionState};
 use crate::engine::acp::{PermissionRequest, SessionUpdate};
 use crate::engine::agent_runtime::execution::{AgentStats, StuckEvent};
@@ -144,6 +145,9 @@ pub struct WorkflowViewState {
     /// `None` means unlimited — the overview caps parallel rows at the legacy 3
     /// and renders no "queued" markers, so behavior is unchanged.
     pub max_concurrent: Option<usize>,
+    /// Each step's agent-reported status label (`blocked: permission`,
+    /// `error`, `done`), by step name. Shown under the step box.
+    pub reported: std::collections::HashMap<String, String>,
 }
 
 #[derive(Debug, Clone)]
@@ -307,6 +311,72 @@ pub type SharedYoloState = Arc<Mutex<Option<YoloState>>>;
 /// returns `Cancel` when set, then resets the flag.
 pub type SharedYoloCancelFlag = Arc<AtomicBool>;
 
+/// What the engine-facing frontend needs to know about the tab to apply
+/// active-tab suppression: when the user last typed or scrolled, and the
+/// agent's latest reported status. Frontends hold no policy; the engine acts
+/// on every report it receives, and this only lets the TUI hold back the
+/// *dialog* until the user has stopped interacting.
+#[derive(Clone, Default)]
+pub struct AgentSignals(Arc<Mutex<AgentSignalsInner>>);
+
+#[derive(Default)]
+struct AgentSignalsInner {
+    last_user_input: Option<Instant>,
+    status: Option<EffectiveStatus>,
+    /// The command asked the App to close its report-opened board: the
+    /// agent resumed (`working` / clear) before the user touched it.
+    dismiss_report_dialog: bool,
+}
+
+impl AgentSignals {
+    /// Record a key press or scroll on this tab.
+    pub fn touch_user(&self) {
+        if let Ok(mut g) = self.0.lock() {
+            g.last_user_input = Some(Instant::now());
+        }
+    }
+
+    /// Whether the user typed or scrolled within the last `window`.
+    pub fn user_active_within(&self, window: std::time::Duration) -> bool {
+        self.0
+            .lock()
+            .ok()
+            .and_then(|g| g.last_user_input)
+            .is_some_and(|t| t.elapsed() < window)
+    }
+
+    pub fn set_status(&self, status: Option<EffectiveStatus>) {
+        if let Ok(mut g) = self.0.lock() {
+            g.status = status;
+        }
+    }
+
+    pub fn status(&self) -> Option<EffectiveStatus> {
+        self.0.lock().ok().and_then(|g| g.status.clone())
+    }
+
+    /// When the user last typed or scrolled on this tab (dialog keys count).
+    pub fn last_user_input(&self) -> Option<Instant> {
+        self.0.lock().ok().and_then(|g| g.last_user_input)
+    }
+
+    /// Ask the App to close this tab's report-opened workflow board (shown
+    /// or still queued) and answer it `Dismissed`.
+    pub fn request_report_dialog_dismiss(&self) {
+        if let Ok(mut g) = self.0.lock() {
+            g.dismiss_report_dialog = true;
+        }
+    }
+
+    /// Take a pending [`Self::request_report_dialog_dismiss`].
+    pub fn take_report_dialog_dismiss(&self) -> bool {
+        self.0
+            .lock()
+            .map(|mut g| std::mem::take(&mut g.dismiss_report_dialog))
+            .unwrap_or(false)
+    }
+}
+
 /// Shared TUI context for `agents status`. The event loop refreshes this on
 /// every tick so the watch loop always sees live tab data.
 pub type SharedTuiContext = Arc<Mutex<crate::command::commands::agents::AgentsTuiContext>>;
@@ -315,6 +385,8 @@ pub type SharedTuiContext = Arc<Mutex<crate::command::commands::agents::AgentsTu
 pub struct YoloState {
     pub step_name: String,
     pub remaining_secs: u64,
+    /// Why the countdown runs; selects the dialog and tab wording.
+    pub kind: crate::engine::workflow::actions::CountdownKind,
 }
 
 /// Mouse text selection.
@@ -480,6 +552,14 @@ pub struct ContainerSlot {
     /// tracked from the raw PTY output for the same reason.
     pub agent_alternate_scroll: bool,
     pub stuck: bool,
+    /// The agent's own reported status (OSC 7501), or `None` when it does not
+    /// report or has cleared its records. Presentation only: the engine decides
+    /// what a report means.
+    pub program_status: Option<EffectiveStatus>,
+    /// When this slot last received output, for the "working · silent Nm" note.
+    pub last_output_at: Instant,
+    /// Why this slot's yolo countdown runs (parallel groups).
+    pub countdown_kind: crate::engine::workflow::actions::CountdownKind,
     pub yolo_mode: bool,
     pub yolo_state: SharedYoloState,
     pub yolo_cancel_flag: SharedYoloCancelFlag,
@@ -535,6 +615,9 @@ impl ContainerSlot {
             agent_alt_screen: false,
             agent_alternate_scroll: false,
             stuck: false,
+            program_status: None,
+            last_output_at: Instant::now(),
+            countdown_kind: Default::default(),
             yolo_mode: false,
             yolo_state: Arc::new(Mutex::new(None)),
             yolo_cancel_flag: Arc::new(AtomicBool::new(false)),
@@ -636,6 +719,11 @@ pub enum ContainerSlotEvent {
     Stuck { step_name: String },
     /// A stuck container recovered.
     Unstuck { step_name: String },
+    /// Why a parallel slot's countdown runs (drives the dialog wording).
+    CountdownKind {
+        step_name: String,
+        kind: crate::engine::workflow::actions::CountdownKind,
+    },
     /// A container's yolo countdown started. `cancel_flag` is the same
     /// `Arc` the engine-side frontend checks each tick — stashed on the slot
     /// so the TUI event loop can request cancellation (Esc on the per-slot
@@ -736,6 +824,7 @@ pub struct TabSharedState {
     pub status_log: SharedStatusLog,
     pub agents_dashboard: SharedAgentsDashboard,
     pub tui_context_shared: SharedTuiContext,
+    pub signals: AgentSignals,
     pub command_cancel: tokio_util::sync::CancellationToken,
 }
 
@@ -751,6 +840,7 @@ impl TabSharedState {
             tui_context_shared: Arc::new(Mutex::new(
                 crate::command::commands::agents::AgentsTuiContext::default(),
             )),
+            signals: AgentSignals::default(),
             command_cancel: tokio_util::sync::CancellationToken::new(),
         }
     }
@@ -763,8 +853,11 @@ impl TabSharedState {
     pub fn reset_for_new_command(&mut self) {
         self.command_cancel.cancel();
         let context = self.tui_context_shared.clone();
+        let signals = self.signals.clone();
         *self = Self::new();
         self.tui_context_shared = context;
+        signals.set_status(None);
+        self.signals = signals;
     }
 
     /// Detaching drops command-owned presentation feeds while retaining the
@@ -1106,8 +1199,16 @@ pub fn tab_color(tab: &Tab) -> ratatui::style::Color {
             };
         }
     }
-    if tab.stuck {
-        return Color::Yellow;
+    // A reporting agent is coloured by what it reported: blocked is the "needs
+    // you" yellow, error red, done green. Working and idle keep the default.
+    // Reporting agents never get the silence-based stuck colouring.
+    match tab.program_status().map(|s| s.state) {
+        Some(crate::data::program_status::ProgramState::Blocked) => return Color::Yellow,
+        Some(crate::data::program_status::ProgramState::Error) => return Color::Red,
+        Some(crate::data::program_status::ProgramState::Done) => return Color::Green,
+        Some(_) => {}
+        None if tab.stuck => return Color::Yellow,
+        None => {}
     }
     // Fixed tab kinds. Both win over execution-phase colouring and both yield
     // to the stuck / yolo indicators above, which are transient run signals.

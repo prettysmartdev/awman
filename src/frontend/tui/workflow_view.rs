@@ -405,8 +405,10 @@ pub fn render_workflow_overview(
             }
             let box_area = Rect::new(box_x, row_y, box_w, STEP_BOX_HEIGHT);
 
+            let mut reported: Option<String> = None;
             let (label, style, title) = match row {
                 ColumnRow::Step { step, queued } => {
+                    reported = state.reported.get(&step.name).cloned();
                     let is_current = state
                         .current_step
                         .as_ref()
@@ -443,6 +445,19 @@ pub fn render_workflow_overview(
                 .border_style(style);
             if let Some(title) = title {
                 block = block.title(Span::styled(title, Style::default().fg(Color::DarkGray)));
+            }
+            // The agent's reported problem (`blocked: permission`, `error`) sits on
+            // the bottom edge of the step box.
+            if let Some(text) = reported {
+                let color = if text == "error" {
+                    Color::Red
+                } else {
+                    Color::Yellow
+                };
+                block = block.title_bottom(Span::styled(
+                    format!(" {text} "),
+                    Style::default().fg(color),
+                ));
             }
             let para = Paragraph::new(label).block(block).style(style);
             frame.render_widget(para, box_area);
@@ -638,6 +653,7 @@ pub fn workflow_state_to_view_state(state: &WorkflowState) -> WorkflowViewState 
         steps,
         current_step,
         max_concurrent: None,
+        reported: Default::default(),
     }
 }
 
@@ -842,6 +858,7 @@ mod tests {
             steps,
             current_step: None,
             max_concurrent: None,
+            reported: Default::default(),
         }
     }
 

@@ -145,6 +145,7 @@ impl Fixture {
 
 fn command() -> CommandSubmission {
     CommandSubmission {
+        allow_remote_input: false,
         interaction: None,
         subcommand: "exec prompt".into(),
         args: vec!["once".into()],
@@ -661,6 +662,7 @@ async fn failed_response_storage_does_not_release_admitted_work() {
 async fn validation_precedes_writes_and_session_and_setup_rejections_are_typed() {
     let f = Fixture::new();
     let invalid = CommandSubmission {
+        allow_remote_input: false,
         interaction: None,
         args: vec!["--unknown-flag".into()],
         ..command()
@@ -827,6 +829,7 @@ async fn managed_session_admission_preserves_the_prerequisite_ceiling_and_policy
         )
         .unwrap();
     let workflow = |token: &str| CommandSubmission {
+        allow_remote_input: false,
         interaction: None,
         subcommand: "exec workflow".into(),
         args: vec![
@@ -984,4 +987,164 @@ fn gate_scopes_keys_by_principal() {
     });
     // The same key under another principal is a separate reservation.
     fresh(gate(&f, alice, Some("k"), "different body")).finish(IdempotentResult::ServerError);
+}
+
+// ─── WI 0141: per-feature interaction at submit ─────────────────────────────
+
+fn with_push(f: &mut Fixture, interaction: &str, allow_override: bool) {
+    let daemon: crate::data::config::daemon::DaemonConfig = serde_json::from_value(json!({
+        "features": {"worker": {"push": {
+            "interaction": interaction,
+            "allowOverride": allow_override,
+        }}}
+    }))
+    .unwrap();
+    f.admission.engines.global_config = Arc::new(crate::data::config::ConfigFile {
+        daemon: Some(daemon),
+        ..Default::default()
+    });
+}
+
+fn prompt(args: &[&str], interaction: Option<Interaction>) -> CommandSubmission {
+    CommandSubmission {
+        allow_remote_input: false,
+        interaction,
+        args: args.iter().map(|a| (*a).to_string()).collect(),
+        ..command()
+    }
+}
+
+use crate::data::config::daemon::Interaction;
+
+#[test]
+fn push_defaults_to_headless_and_records_it_in_the_stored_args() {
+    let f = Fixture::new();
+    let resolved = f.admission.resolve_interaction(command()).unwrap();
+    assert_eq!(resolved.interaction, Some(Interaction::Headless));
+    assert_eq!(resolved.args, vec!["--headless", "once"]);
+}
+
+#[test]
+fn pushed_interactive_is_accepted_and_recorded() {
+    let f = Fixture::new();
+    // Spelled as a flag: kept as sent.
+    let resolved = f
+        .admission
+        .resolve_interaction(prompt(&["--interactive", "once"], None))
+        .unwrap();
+    assert_eq!(resolved.interaction, Some(Interaction::Interactive));
+    assert_eq!(resolved.args, vec!["--interactive", "once"]);
+    // Spelled in the body: recorded as the flag.
+    let resolved = f
+        .admission
+        .resolve_interaction(prompt(&["once"], Some(Interaction::Interactive)))
+        .unwrap();
+    assert_eq!(resolved.args, vec!["--interactive", "once"]);
+    // `exec workflow` takes it too.
+    let resolved = f
+        .admission
+        .resolve_interaction(CommandSubmission {
+            allow_remote_input: false,
+            subcommand: "exec workflow".into(),
+            ..prompt(&["wf.toml", "--interactive"], None)
+        })
+        .unwrap();
+    assert_eq!(resolved.interaction, Some(Interaction::Interactive));
+}
+
+#[test]
+fn an_override_is_refused_when_push_disallows_it() {
+    let mut f = Fixture::new();
+    with_push(&mut f, "headless", false);
+    for submission in [
+        prompt(&["--interactive", "once"], None),
+        prompt(&["--headless=false", "once"], None),
+        prompt(&["once"], Some(Interaction::Interactive)),
+    ] {
+        match f.admission.resolve_interaction(submission) {
+            Err(AdmissionError::InteractionRefused(refused)) => {
+                assert_eq!(refused.code(), "interaction_override_refused");
+                assert_eq!(refused.key(), "daemon.features.worker.push.interaction");
+            }
+            other => panic!("expected a refusal, got {:?}", other.map(|c| c.args)),
+        }
+    }
+    // Asking for the configured mode is fine.
+    let same = f
+        .admission
+        .resolve_interaction(prompt(&["--headless", "once"], None))
+        .unwrap();
+    assert_eq!(same.interaction, Some(Interaction::Headless));
+}
+
+#[test]
+fn an_interactive_push_default_needs_no_flag() {
+    let mut f = Fixture::new();
+    with_push(&mut f, "interactive", true);
+    let resolved = f.admission.resolve_interaction(command()).unwrap();
+    assert_eq!(resolved.interaction, Some(Interaction::Interactive));
+    assert_eq!(resolved.args, vec!["--interactive", "once"]);
+}
+
+#[test]
+fn body_and_flag_must_agree_and_prompt_text_is_not_a_flag() {
+    let f = Fixture::new();
+    assert!(matches!(
+        f.admission.resolve_interaction(prompt(
+            &["--interactive", "once"],
+            Some(Interaction::Headless)
+        )),
+        Err(AdmissionError::CommandValidation(_))
+    ));
+    // `--headless` inside the greedy prompt is prompt text, not a request.
+    let resolved = f
+        .admission
+        .resolve_interaction(prompt(
+            &["explain", "--headless"],
+            Some(Interaction::Interactive),
+        ))
+        .unwrap();
+    assert_eq!(
+        resolved.args,
+        vec!["--interactive", "explain", "--headless"]
+    );
+}
+
+#[tokio::test]
+async fn remote_input_opt_in_is_durable_and_defaults_to_false() {
+    let f = Fixture::new();
+    let session = f
+        .admission
+        .admit_session(f.local(), None, false, None)
+        .await
+        .unwrap();
+    f.admission
+        .store
+        .update_setup_status(&session.session_id, SessionSetupStatus::Ready)
+        .unwrap();
+    for allowed in [false, true] {
+        let mut request = command();
+        request.allow_remote_input = allowed;
+        let admitted = f
+            .admission
+            .admit_command(&session.session_id, request, None)
+            .await
+            .unwrap();
+        let stored = f
+            .admission
+            .store
+            .get_command(&admitted.command_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.allow_remote_input, allowed);
+        let reopened = SqliteSessionStore::open(f.tmp.path()).unwrap();
+        assert_eq!(
+            reopened
+                .get_command(&admitted.command_id)
+                .unwrap()
+                .unwrap()
+                .allow_remote_input,
+            allowed
+        );
+    }
 }

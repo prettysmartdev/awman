@@ -77,6 +77,22 @@ fn unsupported(operation: &'static str) -> EngineError {
         runtime: "builtin",
     }
 }
+/// The one host-terminal scrub for this backend (WI 0141 §3), applied to the
+/// merged env (passthrough, overlays, literals, credentials). Returns the
+/// kept env and the user-facing notice for dropped names, which the launch
+/// writes to the frontend (and traces here).
+fn scrubbed_launch_env(
+    env: Vec<(String, String)>,
+    host_colorterm: Option<&str>,
+) -> (Vec<(String, String)>, Option<String>) {
+    let scrubbed = crate::engine::container::host_env_denylist::scrub_run_env(env, host_colorterm);
+    let notice = scrubbed.notice();
+    if let Some(notice) = &notice {
+        tracing::warn!("{notice}");
+    }
+    (scrubbed.kept, notice)
+}
+
 fn guest_path(path: &Path) -> Result<String, EngineError> {
     path.to_str()
         .filter(|s| s.starts_with('/'))
@@ -355,6 +371,10 @@ impl BuiltinBackend {
         if let Some((variable, _, container_path)) = &options.system_prompt_env_file {
             env.push((variable.clone(), guest_path(container_path)?));
         }
+        let (env, terminal_env_notice) = scrubbed_launch_env(
+            env,
+            crate::data::config::env::host_var("COLORTERM").as_deref(),
+        );
         let cwd = options
             .working_dir
             .map(|p| {
@@ -386,6 +406,7 @@ impl BuiltinBackend {
             },
             leases,
             prompt_files: options.prompt_files,
+            terminal_env_notice,
         })
     }
     fn identities_path(&self) -> std::path::PathBuf {
@@ -453,6 +474,7 @@ impl ContainerBackend for BuiltinBackend {
     ) -> Result<Box<dyn AgentInstance>, EngineError> {
         self.is_available()?;
         let format = options.agent_output_format;
+        let program_status = options.program_status;
         let plan = self.plan(options)?;
         let owner = plan
             .spec
@@ -460,16 +482,21 @@ impl ContainerBackend for BuiltinBackend {
             .get(naming::LABEL_OWNER)
             .ok_or_else(|| EngineError::Other("builtin launch plan has no owner label".into()))?
             .clone();
-        Ok(crate::engine::agent_runtime::execution::with_output_format(
-            Box::new(Instance {
-                driver: self.driver.clone(),
-                paths: self.paths.clone(),
-                owner,
-                plan,
-                cancel_grace: self.cancel_grace,
-            }),
-            format,
-        ))
+        Ok(
+            crate::engine::agent_runtime::execution::with_program_status_config(
+                crate::engine::agent_runtime::execution::with_output_format(
+                    Box::new(Instance {
+                        driver: self.driver.clone(),
+                        paths: self.paths.clone(),
+                        owner,
+                        plan,
+                        cancel_grace: self.cancel_grace,
+                    }),
+                    format,
+                ),
+                program_status,
+            ),
+        )
     }
     fn attach(&self, handle: &AgentHandle) -> Result<Box<dyn AgentInstance>, EngineError> {
         let summary = self.driver.get(&handle.id)?;
@@ -1012,6 +1039,31 @@ mod acquire_request_tests {
 #[cfg(test)]
 mod compat_tests {
     use super::*;
+
+    #[test]
+    fn launch_env_drops_host_terminal_vars_and_normalises_term() {
+        let pair = |n: &str| (n.to_string(), "host".to_string());
+        let (env, notice) = scrubbed_launch_env(
+            vec![
+                pair("TMUX"),
+                pair("REX_PANE"),
+                pair("TERM_PROGRAM"),
+                pair("TERM"),
+                pair("KEEP"),
+            ],
+            None,
+        );
+        assert_eq!(
+            env,
+            vec![
+                ("TERM".to_string(), "xterm-256color".to_string()),
+                pair("KEEP"),
+            ]
+        );
+        assert!(notice.is_some_and(|n| n.contains("TMUX")));
+        let (env, _) = scrubbed_launch_env(vec![pair("TERM")], Some("truecolor"));
+        assert!(env.contains(&("COLORTERM".to_string(), "truecolor".to_string())));
+    }
 
     #[test]
     fn maps_single_file_without_mounting_its_parent_and_rejects_socket() {

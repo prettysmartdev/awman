@@ -63,6 +63,16 @@ pub trait WorkflowFrontend: UserMessageSink + Send {
     /// a clock can ignore it.
     fn yolo_countdown_started(&mut self, _step_name: &str, _kind: CountdownKind) {}
 
+    /// Active-tab suppression input (WI 0141): whether the user is
+    /// interacting with `step_name`'s agent right now (typing or scrolling
+    /// on its tab), so an `AgentDone` countdown should not start yet. The
+    /// engine keeps handling exits, reports and cancellation meanwhile and
+    /// starts the full countdown once this turns false. Must not block.
+    /// Defaults to `false`.
+    fn user_interacting_with(&self, _step_name: &str) -> bool {
+        false
+    }
+
     /// Engine tells frontend: yolo countdown finished (expired, cancelled,
     /// or step recovered). Frontend dismisses dialog / resets tab style.
     fn yolo_countdown_finished(&mut self, _step_name: &str) {}
@@ -135,6 +145,19 @@ pub trait WorkflowFrontend: UserMessageSink + Send {
     /// [`KILLED_EXIT_CODE`](crate::engine::agent_runtime::execution::KILLED_EXIT_CODE)
     /// when the engine killed it without waiting for the real code.
     fn report_container_exited(&mut self, _exit_code: i32) {}
+
+    /// The step's agent reported a new OSC 7501 status (WI 0141): a change of
+    /// state or kind, already deduplicated and debounced. `None` means the
+    /// agent cleared its records. Fire-and-forget; the engine has already
+    /// decided what the report does (countdown, board, pause), so frontends
+    /// only render it — the TUI overview's `blocked: permission`, a CLI
+    /// status line. `msg` is untrusted agent text: plain text, truncated.
+    fn report_agent_status(
+        &mut self,
+        _step_name: &str,
+        _status: Option<&crate::data::program_status::EffectiveStatus>,
+    ) {
+    }
 
     // === Capabilities ===
 
@@ -278,6 +301,14 @@ pub trait WorkflowFrontend: UserMessageSink + Send {
 
     /// Per-step yolo countdown updates.
     fn parallel_step_yolo_countdown_started(&mut self, _step_name: &str) {}
+    /// A per-step countdown started, with what its expiry will do (a silence
+    /// advance, an `AgentDone` advance, or an `AgentBlocked` / `AgentError`
+    /// step failure). The engine always calls this one; the default forwards
+    /// to [`Self::parallel_step_yolo_countdown_started`], so a frontend that
+    /// does not label countdowns needs no change.
+    fn parallel_step_countdown_started(&mut self, step_name: &str, _kind: CountdownKind) {
+        self.parallel_step_yolo_countdown_started(step_name);
+    }
     fn parallel_step_yolo_countdown_tick(
         &mut self,
         _step_name: &str,
@@ -386,6 +417,10 @@ impl<F: WorkflowFrontend + ?Sized> WorkflowFrontend for std::sync::Arc<std::sync
         self.lock().unwrap().yolo_countdown_started(step_name, kind);
     }
 
+    fn user_interacting_with(&self, step_name: &str) -> bool {
+        self.lock().unwrap().user_interacting_with(step_name)
+    }
+
     fn yolo_countdown_finished(&mut self, step_name: &str) {
         self.lock().unwrap().yolo_countdown_finished(step_name);
     }
@@ -433,6 +468,14 @@ impl<F: WorkflowFrontend + ?Sized> WorkflowFrontend for std::sync::Arc<std::sync
 
     fn report_container_exited(&mut self, exit_code: i32) {
         self.lock().unwrap().report_container_exited(exit_code);
+    }
+
+    fn report_agent_status(
+        &mut self,
+        step_name: &str,
+        status: Option<&crate::data::program_status::EffectiveStatus>,
+    ) {
+        self.lock().unwrap().report_agent_status(step_name, status);
     }
 
     fn report_ci_poll(&mut self, event: &crate::data::ci_poll_event::CiPollEvent) {
@@ -548,6 +591,12 @@ impl<F: WorkflowFrontend + ?Sized> WorkflowFrontend for std::sync::Arc<std::sync
         self.lock()
             .unwrap()
             .parallel_step_yolo_countdown_started(step_name);
+    }
+
+    fn parallel_step_countdown_started(&mut self, step_name: &str, kind: CountdownKind) {
+        self.lock()
+            .unwrap()
+            .parallel_step_countdown_started(step_name, kind);
     }
 
     fn parallel_step_yolo_countdown_tick(

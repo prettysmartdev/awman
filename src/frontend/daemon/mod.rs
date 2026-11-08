@@ -9,7 +9,7 @@ use crate::command::error::CommandError;
 use crate::data::config::env::EnvSnapshot;
 use crate::data::daemon_state::StopMode;
 use crate::data::fs::daemon_sidecar::{ServerSidecar, SidecarTransportKind};
-use crate::engine::daemon::core::NoTerminalHub;
+use crate::engine::daemon::core::{TerminalHub, TerminalHubConfig};
 use crate::engine::daemon::DaemonClaim;
 use crate::frontend::api::{local, routes};
 use std::sync::Arc;
@@ -25,7 +25,7 @@ pub async fn run(
         set,
         squad_run_frontends: crate::frontend::squad::unattended::UnattendedFrontends::shared(),
         push_frontend_factory: crate::frontend::api::ApiFrontendFactory,
-        terminal_hub: Arc::new(NoTerminalHub),
+        terminal_hub: Arc::new(TerminalHub::new(TerminalHubConfig::default())),
     })
     .await?;
     serve(runtime, claim).await

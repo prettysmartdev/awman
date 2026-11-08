@@ -5,6 +5,11 @@
 //! of `exec_workflow`, so it reaches that module's private items unchanged.
 
 use super::*;
+use crate::data::program_status::EffectiveStatus;
+use crate::engine::workflow::program_status::{
+    countdown_duration, describe_status, reported_failure_reason, respond_to_report,
+    ReportedResponse,
+};
 
 // ─── Dynamic-workflow resume (WI-0115 §2) ────────────────────────────────────
 
@@ -75,7 +80,7 @@ pub(crate) fn discover_previous_dynamic_run(
                 "no saved workflow state for '{workflow_name}' at {} — there is no progress to \
                  resume from",
                 store.state_path(Some(work_item), &workflow_name).display()
-            )))
+            )));
         }
         Err(e) => return Err(Unusable(format!("reading the saved workflow state: {e}"))),
     };
@@ -240,6 +245,10 @@ pub(crate) enum LeaderDriveOutcome {
     Restart,
     /// An external cancel request stopped the leader container.
     Cancelled,
+    /// The leader reported a problem over OSC 7501 (WI 0141) and either its
+    /// `AgentBlocked`/`AgentError` countdown expired or it exited without
+    /// recovering. Never an advance; the string is the agent's reason.
+    Failed(String),
 }
 
 /// Outcome of the Workflow Control Board while it is driven from the dynamic
@@ -667,6 +676,11 @@ impl ExecWorkflowCommand {
                     return Err(CommandError::Other(
                         "dynamic workflow aborted during the leader step".into(),
                     ));
+                }
+                LeaderDriveOutcome::Failed(reason) => {
+                    return Err(CommandError::Other(format!(
+                        "dynamic workflow leader failed: {reason}"
+                    )));
                 }
                 LeaderDriveOutcome::Paused => {
                     // Clean stop at the leader step — no error, worktree left in
@@ -1211,7 +1225,85 @@ impl ExecWorkflowCommand {
             stop_leader();
             LeaderDriveOutcome::Cancelled
         };
+        // WI 0141: the leader's last reported problem (`blocked`/`error`),
+        // and a report a countdown handed back for a fresh decision.
+        let mut reported_problem: Option<EffectiveStatus> = None;
+        let mut pending_report: Option<Option<EffectiveStatus>> = None;
         let outcome = loop {
+            // The leader reports its own status: the same table a workflow
+            // step gets (`engine::workflow::program_status`). The leader
+            // always runs under yolo, so there is no board to open.
+            if let Some(status) = pending_report.take() {
+                shared
+                    .lock()
+                    .unwrap()
+                    .report_agent_status(label, status.as_ref());
+                reported_problem = status.as_ref().filter(|s| s.state.is_problem()).cloned();
+                let attended = shared.lock().unwrap().supports_interactive_recovery();
+                let response = respond_to_report(status.as_ref(), true, attended);
+                if let Some(s) = &status {
+                    narrate_leader_report(&shared, label, s, response);
+                }
+                let ReportedResponse::Countdown(kind) = response else {
+                    continue;
+                };
+                let countdown = run_leader_yolo_countdown(
+                    &shared,
+                    &mut wait_rx,
+                    &mut stuck_rx,
+                    engine_rx,
+                    &self.cancel,
+                    label,
+                    kind,
+                )
+                .await;
+                if self.cancel.is_cancelled() {
+                    break stop_for_cancel();
+                }
+                match countdown {
+                    LeaderCountdownOutcome::Advance => {
+                        stop_leader();
+                        match &reported_problem {
+                            Some(p) => {
+                                break LeaderDriveOutcome::Failed(reported_failure_reason(p))
+                            }
+                            None => break LeaderDriveOutcome::Advanced,
+                        }
+                    }
+                    LeaderCountdownOutcome::Completed(code) => {
+                        shared.lock().unwrap().report_container_exited(code);
+                        match &reported_problem {
+                            Some(p) => {
+                                break LeaderDriveOutcome::Failed(reported_failure_reason(p))
+                            }
+                            None => break LeaderDriveOutcome::Advanced,
+                        }
+                    }
+                    LeaderCountdownOutcome::Recovered => {
+                        if kind == CountdownKind::AgentError {
+                            reported_problem = None;
+                        }
+                        continue;
+                    }
+                    LeaderCountdownOutcome::Superseded(next) => {
+                        pending_report = Some(next);
+                        continue;
+                    }
+                    LeaderCountdownOutcome::Dismissed => continue,
+                    LeaderCountdownOutcome::Cancelled => break stop_for_cancel(),
+                    LeaderCountdownOutcome::Abort => {
+                        stop_leader();
+                        break LeaderDriveOutcome::Aborted;
+                    }
+                    LeaderCountdownOutcome::ShowControlBoard => {
+                        let choice = show_leader_control_board(&shared, label);
+                        match apply_leader_control_outcome(choice, &cancel, &shared) {
+                            Some(o) => break o,
+                            None => continue,
+                        }
+                    }
+                }
+            }
             tokio::select! {
                 biased;
                 code = &mut wait_rx => {
@@ -1219,7 +1311,11 @@ impl ExecWorkflowCommand {
                         .lock()
                         .unwrap()
                         .report_container_exited(code.unwrap_or(-1));
-                    break LeaderDriveOutcome::Advanced;
+                    // A problem the leader reported outranks its exit code.
+                    match &reported_problem {
+                        Some(p) => break LeaderDriveOutcome::Failed(reported_failure_reason(p)),
+                        None => break LeaderDriveOutcome::Advanced,
+                    }
                 }
                 // After `wait_rx` (the loop is biased): a leader that already
                 // exited is reported first.
@@ -1234,6 +1330,7 @@ impl ExecWorkflowCommand {
                                 engine_rx,
                                 &self.cancel,
                                 label,
+                                CountdownKind::StuckStep,
                             )
                             .await;
                             // A cancel during the countdown (or one racing its
@@ -1251,7 +1348,14 @@ impl ExecWorkflowCommand {
                                     shared.lock().unwrap().report_container_exited(code);
                                     break LeaderDriveOutcome::Advanced;
                                 }
-                                LeaderCountdownOutcome::Recovered => continue,
+                                LeaderCountdownOutcome::Recovered
+                                | LeaderCountdownOutcome::Dismissed => continue,
+                                // The leader started reporting mid-countdown:
+                                // its report decides from here on.
+                                LeaderCountdownOutcome::Superseded(next) => {
+                                    pending_report = Some(next);
+                                    continue;
+                                }
                                 LeaderCountdownOutcome::Cancelled => break stop_for_cancel(),
                                 LeaderCountdownOutcome::Abort => {
                                     stop_leader();
@@ -1268,6 +1372,10 @@ impl ExecWorkflowCommand {
                                 }
                             }
                         }
+                        Ok(StuckEvent::Reported(status)) => {
+                            pending_report = Some(status);
+                            continue;
+                        }
                         Ok(StuckEvent::Unstuck) => continue,
                         Ok(StuckEvent::StartupGraceExpired) => {
                             // The io bridge already killed the container.
@@ -1281,7 +1389,10 @@ impl ExecWorkflowCommand {
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                             let code = (&mut wait_rx).await.unwrap_or(-1);
                             shared.lock().unwrap().report_container_exited(code);
-                            break LeaderDriveOutcome::Advanced;
+                            match &reported_problem {
+                                Some(p) => break LeaderDriveOutcome::Failed(reported_failure_reason(p)),
+                                None => break LeaderDriveOutcome::Advanced,
+                            }
                         }
                     }
                 }
@@ -1377,24 +1488,73 @@ pub(crate) fn apply_leader_control_outcome(
 
 /// Result of the leader yolo countdown.
 pub(crate) enum LeaderCountdownOutcome {
-    /// Countdown expired or user advanced — kill the container and proceed.
+    /// Countdown expired or user advanced — kill the container and proceed
+    /// (or, for an `AgentBlocked`/`AgentError` countdown, fail the leader).
     Advance,
     /// The leader container exited on its own (with this exit code) during
     /// the countdown.
     Completed(i32),
-    /// The leader resumed output (`Unstuck`) — cancel the countdown.
+    /// The leader resumed output (`Unstuck`) — cancel the countdown. Only a
+    /// silence or `AgentError` countdown recovers on output.
     Recovered,
-    /// The user aborted.
+    /// The user aborted (Esc on a silence countdown).
     Abort,
+    /// The user dismissed an agent-status countdown (Esc): keep the leader
+    /// running, nothing advances.
+    Dismissed,
+    /// The leader sent an OSC 7501 report calling for a different response.
+    Superseded(Option<EffectiveStatus>),
     /// The user pressed Ctrl-W — cancel the countdown and open the WCB.
     ShowControlBoard,
     /// The command was cancelled during the countdown.
     Cancelled,
 }
 
-/// Drive the 60-second yolo countdown for the leader step, reusing the same
-/// `WorkflowFrontend::yolo_countdown_tick` pipeline as a workflow step. The
-/// right-arrow / advance action carries the "Start dynamic workflow" label via
+/// Narrate a leader report the way the workflow engine narrates a step's.
+fn narrate_leader_report(
+    shared: &SharedWorkflowFrontend,
+    label: &str,
+    status: &EffectiveStatus,
+    response: ReportedResponse,
+) {
+    let what = describe_status(status);
+    let (level, text) = match response {
+        ReportedResponse::Countdown(kind) => {
+            let secs = countdown_duration(kind).as_secs();
+            if kind == CountdownKind::AgentDone {
+                (
+                    MessageLevel::Info,
+                    format!("Leader '{label}': agent reported {what}; advancing in {secs}s"),
+                )
+            } else {
+                (
+                    MessageLevel::Warning,
+                    format!("Leader '{label}': agent reported {what}; failing in {secs}s"),
+                )
+            }
+        }
+        ReportedResponse::NeedsYou => (
+            MessageLevel::Warning,
+            format!(
+                "Leader '{label}' needs you: agent reported {what}. Answer in the container \
+                 or use the control board (Ctrl-W)"
+            ),
+        ),
+        ReportedResponse::Resume
+        | ReportedResponse::ConfirmAdvance
+        | ReportedResponse::ProblemBoard => return,
+    };
+    shared
+        .lock()
+        .unwrap()
+        .write_message(UserMessage { level, text });
+}
+
+/// Drive a leader countdown, reusing the same
+/// `WorkflowFrontend::yolo_countdown_tick` pipeline as a workflow step:
+/// 60 seconds for silence (`StuckStep`) and the agent-problem kinds, the
+/// short `AgentDone` duration after a `done` report. The right-arrow /
+/// advance action carries the "Start dynamic workflow" label via
 /// [`AvailableActions::launch_next_label`].
 pub(crate) async fn run_leader_yolo_countdown(
     shared: &SharedWorkflowFrontend,
@@ -1405,18 +1565,18 @@ pub(crate) async fn run_leader_yolo_countdown(
     engine_rx: &mut tokio::sync::mpsc::UnboundedReceiver<EngineRequest>,
     cancel: &tokio_util::sync::CancellationToken,
     step_name: &str,
+    kind: CountdownKind,
 ) -> LeaderCountdownOutcome {
     use crate::engine::agent_runtime::execution::StuckEvent;
     use crate::engine::workflow::actions::YoloTickOutcome;
-    use crate::engine::workflow::timing::yolo_countdown_duration;
 
-    let total = yolo_countdown_duration();
+    let total = countdown_duration(kind);
     let tick = Duration::from_millis(200);
     let mut remaining = total;
     shared
         .lock()
         .unwrap()
-        .yolo_countdown_started(step_name, CountdownKind::StuckStep);
+        .yolo_countdown_started(step_name, kind);
 
     let outcome = loop {
         let tick_result = shared
@@ -1426,7 +1586,10 @@ pub(crate) async fn run_leader_yolo_countdown(
         match tick_result {
             Ok(YoloTickOutcome::Continue) => {}
             Ok(YoloTickOutcome::AdvanceNow) => break LeaderCountdownOutcome::Advance,
-            Ok(YoloTickOutcome::Cancel) => break LeaderCountdownOutcome::Abort,
+            Ok(YoloTickOutcome::Cancel) if kind == CountdownKind::StuckStep => {
+                break LeaderCountdownOutcome::Abort
+            }
+            Ok(YoloTickOutcome::Cancel) => break LeaderCountdownOutcome::Dismissed,
             Err(_) => break LeaderCountdownOutcome::Advance,
         }
         if remaining.is_zero() {
@@ -1441,7 +1604,19 @@ pub(crate) async fn run_leader_yolo_countdown(
             _ = cancel.cancelled() => break LeaderCountdownOutcome::Cancelled,
             ev = stuck_rx.recv() => {
                 match ev {
-                    Ok(StuckEvent::Unstuck) => break LeaderCountdownOutcome::Recovered,
+                    Ok(StuckEvent::Reported(status)) => {
+                        let attended = shared.lock().unwrap().supports_interactive_recovery();
+                        if respond_to_report(status.as_ref(), true, attended)
+                            != ReportedResponse::Countdown(kind)
+                        {
+                            break LeaderCountdownOutcome::Superseded(status);
+                        }
+                    }
+                    Ok(StuckEvent::Unstuck)
+                        if matches!(kind, CountdownKind::StuckStep | CountdownKind::AgentError) =>
+                    {
+                        break LeaderCountdownOutcome::Recovered
+                    }
                     Ok(_) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {}

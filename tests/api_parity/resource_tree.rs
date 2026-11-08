@@ -43,6 +43,11 @@ async fn removed_paths_have_no_alias_and_every_failure_has_a_code() {
         "/v1/engine/actions",
         "/v1/actions",
         "/v1/commands/old/terminals",
+        // WI 0141: per-feature terminal routes are gone; `/v1/terminals` is core.
+        "/v1/commands/old/terminals/term_old",
+        "/v1/engine/terminals",
+        "/v1/engine/terminals/term_old",
+        "/v1/worker/commands/old/terminals",
         "/v1/worker/sessions/old/status",
         "/v1/worker/commands/old/status",
         "/v1/worker/commands/old/logs",

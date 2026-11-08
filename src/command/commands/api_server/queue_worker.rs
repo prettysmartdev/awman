@@ -622,14 +622,51 @@ pub trait ApiCommandFrontendFactory: Send + Sync {
 
     /// The worker emits `Done` after post-command stages. The returned frontend
     /// must leave that sentinel to the worker, including when dropped on error.
+    ///
+    /// `interaction` is the run's resolved interaction (WI 0141): the frontend
+    /// sets `AgentIo::initial_size = interaction.pty_size` and reports
+    /// `headless` from it, and decides nothing else about it.
     fn frontend_for(
         &self,
         cmd: &CommandRecord,
         event_bus: super::event_bus::EventBusSender,
         state_writer: CommandStateWriter,
+        interaction: crate::command::interaction::InteractionDecision,
     ) -> Self::Frontend;
 }
 
+/// The interaction a claimed push command runs with (WI 0141).
+///
+/// Admission already resolved it (refusing a disallowed override) and
+/// recorded it in the stored args; this re-reads that choice and sizes the
+/// PTY from `settings.terminal` as configured now, so a live size change
+/// applies to new terminals only. It never refuses: a setting changed after
+/// admission does not fail an accepted command. A row with no recorded
+/// choice (written before WI 0141) takes push's configured default.
+pub fn push_run_interaction(
+    cmd: &CommandRecord,
+    settings: &crate::data::config::daemon::DaemonSettings,
+) -> crate::command::interaction::InteractionDecision {
+    use crate::command::interaction::{decision_for, requested_from_flags, InteractionSlot};
+    let path: Vec<&str> = cmd.subcommand.split_whitespace().collect();
+    let requested = cmd
+        .decode_args()
+        .ok()
+        .and_then(|args| {
+            crate::command::dispatch::catalogue::CommandCatalogue::get()
+                .parse_raw_args(&path, &args)
+                .ok()
+        })
+        .and_then(|parsed| {
+            requested_from_flags(
+                parsed.flag_bool("interactive"),
+                parsed.flag_bool("headless"),
+            )
+        });
+    let interaction =
+        requested.unwrap_or_else(|| InteractionSlot::WorkerPush.configured(settings).0);
+    decision_for(interaction, settings)
+}
 pub struct QueueWorker<F: ApiCommandFrontendFactory> {
     executor: Option<Arc<crate::engine::daemon::executor::SharedExecutor>>,
     worker_id: String,
@@ -642,7 +679,15 @@ pub struct QueueWorker<F: ApiCommandFrontendFactory> {
     lifecycle: ApiSessionLifecycle,
     lifecycle_store: CommandLifecycleStore,
     cancels: Arc<TokenRegistry>,
+    /// The daemon settings as they are now (live reloads included), read when
+    /// a command starts so its PTY size is the one configured at spawn.
+    /// `None` reads `engines.global_config`.
+    daemon_settings: Option<DaemonSettingsSource>,
 }
+
+/// Reads the current `daemon` settings.
+pub type DaemonSettingsSource =
+    Arc<dyn Fn() -> crate::data::config::daemon::DaemonSettings + Send + Sync>;
 
 /// Dependencies collected by API runtime bootstrap before a queue worker is
 /// spawned. Keeping this bundle typed avoids a parallel constructor argument
@@ -691,9 +736,10 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
             let session = session.read().await.clone();
             let bus = EventBus::for_attempt(4096, cmd.attempt);
             let writer = CommandStateWriter::new(self.paths.clone(), &cmd.session_id, id.as_str());
-            let frontend = self
-                .frontend_factory
-                .frontend_for(&cmd, bus.sender(), writer);
+            let interaction = self.interaction_for(&cmd);
+            let frontend =
+                self.frontend_factory
+                    .frontend_for(&cmd, bus.sender(), writer, interaction);
             let mut engines = self.engines.clone();
             engines.runtime = Arc::new(super::owned_runtime::CommandOwnedRuntime::new(
                 Arc::clone(&engines.runtime),
@@ -732,9 +778,34 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
             lifecycle: deps.lifecycle,
             lifecycle_store: deps.lifecycle_store,
             cancels: deps.cancels,
+            daemon_settings: None,
         }
     }
 
+    /// Read the live `daemon` settings when a command starts (WI 0141).
+    pub fn with_daemon_settings(mut self, source: DaemonSettingsSource) -> Self {
+        self.daemon_settings = Some(source);
+        self
+    }
+
+    /// [`push_run_interaction`] against the live settings.
+    fn interaction_for(
+        &self,
+        cmd: &CommandRecord,
+    ) -> crate::command::interaction::InteractionDecision {
+        let settings = match &self.daemon_settings {
+            Some(source) => source(),
+            None => crate::data::config::daemon::DaemonSettings::from_merged(
+                &self
+                    .engines
+                    .global_config
+                    .daemon
+                    .clone()
+                    .unwrap_or_default(),
+            ),
+        };
+        push_run_interaction(cmd, &settings)
+    }
     pub fn with_executor(
         mut self,
         executor: Arc<crate::engine::daemon::executor::SharedExecutor>,
@@ -961,9 +1032,13 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
         // The API frontend supplies the presentation adapter through its
         // factory; Layer 2 owns everything around command execution.
         let state_writer = CommandStateWriter::new(self.paths.clone(), &session_id, &command_id);
-        let frontend =
-            self.frontend_factory
-                .frontend_for(&cmd, event_bus.sender(), state_writer.clone());
+        let interaction = self.interaction_for(&cmd);
+        let frontend = self.frontend_factory.frontend_for(
+            &cmd,
+            event_bus.sender(),
+            state_writer.clone(),
+            interaction,
+        );
 
         // Look up the Session.
         let session = match self.sessions.get_by_key(&session_id) {
@@ -1033,10 +1108,21 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
         // Every container the command launches is named after it, so a
         // restart can find and stop what a cancelled command left running.
         let mut engines = self.engines.clone();
-        engines.runtime = Arc::new(super::owned_runtime::CommandOwnedRuntime::new(
-            Arc::clone(&engines.runtime),
-            &command_id,
-        ));
+        engines.runtime = Arc::new(
+            super::owned_runtime::CommandOwnedRuntime::new(
+                Arc::clone(&engines.runtime),
+                &command_id,
+            )
+            .with_owner(crate::data::terminal::TerminalOwnerInfo {
+                owner: crate::data::terminal::TerminalOwner::Command(
+                    crate::data::ids::CommandId::parse(&command_id).expect("stored command id"),
+                ),
+                feature: crate::data::daemon_state::FeatureName::Worker,
+                source: None,
+                attempt: cmd.attempt,
+                allow_remote_input: cmd.allow_remote_input,
+            }),
+        );
         // The command's `/awman/output` directory (WI 0137 §3): the command
         // that mounts it creates (or, for `exec prompt`, clears) it.
         let dispatch = Dispatch::new(frontend, session, engines)
@@ -1521,6 +1607,13 @@ fn spawn_tracing_subscriber(
                     | EventPayload::StatusMessage { .. }
                     | EventPayload::StepActivity { .. }
                     | EventPayload::WorkflowPrerequisites { .. } => {}
+                    // WI 0141 status and terminal events are for clients, not the
+                    // daemon log (terminals-api owns any logging it wants here).
+                    EventPayload::ProgramStatus { .. }
+                    | EventPayload::TerminalOpened { .. }
+                    | EventPayload::TerminalClosed { .. }
+                    | EventPayload::TerminalControl { .. }
+                    | EventPayload::TerminalViewerDetached { .. } => {}
                 },
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                     tracing::warn!(
@@ -2710,5 +2803,57 @@ mod sidecar_tests {
             .publish(&fixture.store, &fixture.paths, &command, &bus.sender())
             .await;
         assert_eq!(fixture.row().status.as_str(), "done");
+    }
+}
+
+#[cfg(test)]
+mod interaction_tests {
+    use super::*;
+    use crate::data::config::daemon::{DaemonSettings, Interaction};
+
+    fn row(subcommand: &str, args: &[&str]) -> CommandRecord {
+        CommandRecord {
+            allow_remote_input: false,
+            listener: "local".into(),
+            trace_parent: None,
+            id: "cmd_00000000000000000000000000000001".into(),
+            session_id: "ses_00000000000000000000000000000001".into(),
+            subcommand: subcommand.into(),
+            args: serde_json::to_string(args).unwrap(),
+            status: crate::data::command_status::CommandStatus::Queued,
+            exit_code: None,
+            started_at: None,
+            finished_at: None,
+            log_path: String::new(),
+            worker_id: None,
+            queued_at: None,
+            result: None,
+            attempt: 1,
+        }
+    }
+
+    #[test]
+    fn a_claimed_command_runs_as_admitted_at_the_live_terminal_size() {
+        let mut settings = DaemonSettings::from_merged(&Default::default());
+        settings.terminal.cols = 90;
+        settings.terminal.rows = 30;
+        let interactive =
+            push_run_interaction(&row("exec prompt", &["--interactive", "hi"]), &settings);
+        assert_eq!(interactive.interaction, Interaction::Interactive);
+        assert_eq!(interactive.pty_size, Some((90, 30)));
+        // Rows written before WI 0141 carried `--headless=false`.
+        let legacy =
+            push_run_interaction(&row("exec prompt", &["--headless=false", "hi"]), &settings);
+        assert_eq!(legacy.pty_size, Some((90, 30)));
+        let headless = push_run_interaction(&row("exec prompt", &["--headless", "hi"]), &settings);
+        assert_eq!(headless.pty_size, None);
+        // No recorded choice: push's configured default, never a refusal,
+        // even when overrides have since been disabled.
+        settings.worker.push_interaction = Interaction::Interactive;
+        settings.worker.push_allow_override = false;
+        let unrecorded = push_run_interaction(&row("exec prompt", &["hi"]), &settings);
+        assert_eq!(unrecorded.interaction, Interaction::Interactive);
+        let admitted = push_run_interaction(&row("exec prompt", &["--headless", "hi"]), &settings);
+        assert_eq!(admitted.interaction, Interaction::Headless);
     }
 }

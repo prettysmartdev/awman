@@ -121,6 +121,7 @@ impl<F: ApiCommandFrontendFactory + 'static> DaemonFeature for WorkerFeature<F> 
                     },
                 )
                 .with_executor(executor.clone())
+                .with_daemon_settings(live_daemon_settings(shared.clone()))
             };
             crate::command::commands::api_server::queue_worker::finalize_completed_from_sidecars(
                 &shared.store,
@@ -298,4 +299,26 @@ impl Drop for WorkerTask {
     fn drop(&mut self) {
         self.0.abort();
     }
+}
+
+/// The worker's live `daemon` settings (WI 0141): interaction and
+/// `daemon.terminal.{cols,rows}` are read when each command starts, so a
+/// reload applies to the next spawn and running terminals keep their size.
+pub(crate) fn live_daemon_settings(
+    shared: Arc<WorkerShared>,
+) -> crate::command::commands::api_server::queue_worker::DaemonSettingsSource {
+    Arc::new(move || {
+        let live = shared.live_config.read().expect("worker config lock");
+        match live.as_ref() {
+            Some(config) => config.daemon(),
+            None => crate::data::config::daemon::DaemonSettings::from_merged(
+                &shared
+                    .engines
+                    .global_config
+                    .daemon
+                    .clone()
+                    .unwrap_or_default(),
+            ),
+        }
+    })
 }

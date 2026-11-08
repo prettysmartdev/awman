@@ -35,6 +35,7 @@ pub(crate) mod conformance;
 pub mod execution;
 pub mod frontend;
 pub mod output_tail;
+pub mod program_status;
 
 pub use background::{AgentExec, ExecOutput};
 pub use capabilities::{Capabilities, ImageAcquisition};
@@ -100,6 +101,10 @@ pub struct ReadyAgentOptions {
 /// Layer 2 programs against; paradigm-specific decisions branch on
 /// `capabilities()` or `runtime_name()`, never on concrete types.
 pub trait AgentRuntimeEngine: Send + Sync {
+    /// The daemon's shared terminal registry, carried through runtime wrappers.
+    fn terminal_hub(&self) -> Option<Arc<crate::engine::terminal_hub::TerminalHub>> {
+        None
+    }
     /// Optional ownership prefix for auxiliary containers of this launch.
     fn container_name_prefix(&self) -> Option<&str> {
         None

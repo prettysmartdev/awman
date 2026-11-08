@@ -97,6 +97,11 @@ pub const AWMAN_TEST_BUILTIN: &str = "AWMAN_TEST_BUILTIN";
 /// `engine::workflow::timing::yolo_countdown_duration`.
 pub const AWMAN_TEST_YOLO_COUNTDOWN_MS: &str = "AWMAN_TEST_YOLO_COUNTDOWN_MS";
 
+/// `AWMAN_TEST_AGENT_DONE_COUNTDOWN_MS` — under [`AWMAN_TEST_ISOLATION`], a
+/// shorter `AgentDone` countdown (WI 0141) in milliseconds; see
+/// `engine::workflow::timing::agent_done_countdown_duration`.
+pub const AWMAN_TEST_AGENT_DONE_COUNTDOWN_MS: &str = "AWMAN_TEST_AGENT_DONE_COUNTDOWN_MS";
+
 /// Every `AWMAN_*` name awman reads as a **process variable** rather than as
 /// config: the storage root, the session id, the squad bearer key and the
 /// test switches. None of these is ever resolved against the key table, and
@@ -112,6 +117,7 @@ pub const PROCESS_VARS: &[&str] = &[
     AWMAN_TEST_SBX,
     AWMAN_TEST_BUILTIN,
     AWMAN_TEST_YOLO_COUNTDOWN_MS,
+    AWMAN_TEST_AGENT_DONE_COUNTDOWN_MS,
 ];
 
 /// Whether `name` is an `AWMAN_*` config variable (as opposed to a process
@@ -403,6 +409,19 @@ impl EnvSnapshot {
             return None;
         }
         self.get(AWMAN_TEST_YOLO_COUNTDOWN_MS)?
+            .trim()
+            .parse()
+            .ok()
+            .map(std::time::Duration::from_millis)
+    }
+
+    /// The `AgentDone` countdown `AWMAN_TEST_AGENT_DONE_COUNTDOWN_MS` asks for,
+    /// under the same rules as [`Self::test_yolo_countdown`].
+    pub fn test_agent_done_countdown(&self) -> Option<std::time::Duration> {
+        if !self.test_isolation() {
+            return None;
+        }
+        self.get(AWMAN_TEST_AGENT_DONE_COUNTDOWN_MS)?
             .trim()
             .parse()
             .ok()

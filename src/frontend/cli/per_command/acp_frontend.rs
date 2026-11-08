@@ -15,16 +15,43 @@
 
 use std::io::Write;
 
+use crate::data::terminal::{HostOutputPolicy, ProgramStatusMode};
 use crate::engine::acp::protocol::{sanitize_terminal_text, ContentChunk, ToolCallLocation};
 use crate::engine::acp::{
     AcpFrontend, AvailableCommand, ContentBlock, PermissionDecision, PermissionOption,
     PermissionRequest, PlanEntry, SessionUpdate, ToolCall, ToolCallUpdate,
 };
+use crate::frontend::terminal_output_filter::{filter_all, HostOutputFilter};
 
 use crate::frontend::cli::command_frontend::CliFrontend;
 
 impl AcpFrontend for CliFrontend {
     fn render_update(&mut self, update: SessionUpdate) {
+        let stream = match &update {
+            SessionUpdate::AgentMessageChunk { chunk } => Some((chunk, false)),
+            SessionUpdate::AgentThoughtChunk { chunk } => Some((chunk, true)),
+            _ => None,
+        };
+        if let Some((
+            ContentChunk {
+                content: ContentBlock::Text { text },
+                ..
+            },
+            dim,
+        )) = stream
+        {
+            let filter = self
+                .acp_output_filter
+                .get_or_insert_with(|| HostOutputFilter::new(text_policy()));
+            let safe = stream_text(filter, text);
+            if dim {
+                print!("\x1b[2m{safe}\x1b[0m");
+            } else {
+                print!("{safe}");
+            }
+            let _ = std::io::stdout().flush();
+            return;
+        }
         match render_update_text(&update) {
             RenderedUpdate::Stream(text) => {
                 print!("{text}");
@@ -35,7 +62,7 @@ impl AcpFrontend for CliFrontend {
                 // printable) with agent-provided titles/paths/URIs; sanitising
                 // the whole line strips any control chars the agent injected
                 // without touching awman's formatting.
-                println!("{}", sanitize_terminal_text(&text));
+                println!("{}", sanitize_agent_text(&text));
             }
         }
     }
@@ -46,7 +73,7 @@ impl AcpFrontend for CliFrontend {
         }
         println!(
             "{}",
-            sanitize_terminal_text(&format_permission_request(&request))
+            sanitize_agent_text(&format_permission_request(&request))
         );
         loop {
             print!("choice: ");
@@ -69,6 +96,23 @@ impl AcpFrontend for CliFrontend {
         let _ = std::io::stdout().flush();
         read_stdin_line()
     }
+}
+
+fn sanitize_agent_text(text: &str) -> String {
+    let filtered = filter_all(text_policy(), text.as_bytes());
+    sanitize_terminal_text(&String::from_utf8_lossy(&filtered))
+}
+
+fn text_policy() -> HostOutputPolicy {
+    HostOutputPolicy {
+        program_status: ProgramStatusMode::Strip,
+        ..Default::default()
+    }
+}
+fn stream_text(filter: &mut HostOutputFilter, text: &str) -> String {
+    let mut safe = Vec::new();
+    filter.feed(text.as_bytes(), &mut safe);
+    sanitize_terminal_text(&String::from_utf8_lossy(&safe))
 }
 
 /// A single rendered update, split so the streamed-text case (message/thought
@@ -107,7 +151,7 @@ fn render_content_chunk(chunk: &ContentChunk, dim: bool) -> RenderedUpdate {
             // BEFORE wrapping with awman's own "dim" escape, so a malicious
             // agent can't smuggle escape sequences through the structured
             // renderer — but awman's intentional formatting is preserved.
-            let text = sanitize_terminal_text(text);
+            let text = sanitize_agent_text(text);
             let text = if dim {
                 format!("\x1b[2m{text}\x1b[0m")
             } else {
@@ -539,5 +583,21 @@ mod tests {
                 option_id: "allow".into()
             }
         );
+    }
+}
+
+#[cfg(test)]
+mod review_regression {
+    use super::*;
+    #[test]
+    fn streamed_controls_are_stripped_across_every_split_without_reencoded_junk() {
+        let text = "before\x1b]52;c;YQ==\x07\x1b]7501;state=working\x1b\\after";
+        for split in 0..=text.len() {
+            let mut filter = HostOutputFilter::new(text_policy());
+            let mut result = stream_text(&mut filter, &text[..split]);
+            result.push_str(&stream_text(&mut filter, &text[split..]));
+            assert_eq!(result, "beforeafter", "split {split}");
+        }
+        assert_eq!(sanitize_agent_text(text), "beforeafter");
     }
 }

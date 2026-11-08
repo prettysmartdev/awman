@@ -884,3 +884,71 @@ fn config_show_add_value_prompt_uses_the_header_prefix_in_the_global_view() {
     }));
     assert!(text.contains("demo.map.maki (global) = model-a|"), "{text}");
 }
+
+// ── Agent-reported status (OSC 7501) ──────────────────────────────────────
+
+#[test]
+fn yolo_countdown_dialog_labels_each_countdown_kind() {
+    use crate::engine::workflow::actions::CountdownKind;
+    let cases = [
+        (
+            CountdownKind::AgentDone,
+            "Agent reported done: advancing in 8s",
+        ),
+        (
+            CountdownKind::AgentError,
+            "Agent reported an error: failing step in 8s",
+        ),
+        (
+            CountdownKind::AgentBlocked,
+            "Agent is waiting for input: failing step in 8s",
+        ),
+        (CountdownKind::StuckStep, "Auto-advancing in 8s"),
+    ];
+    for (kind, expected) in cases {
+        let state = dialogs::WorkflowYoloCountdownState {
+            step_name: "build".into(),
+            remaining_secs: 8,
+            kind,
+        };
+        let buf = render_to_buffer(100, 20, |area, frame| {
+            super::dialog::render_yolo_countdown_for_tests(&state, area, frame)
+        });
+        let text = buffer_text(&buf);
+        assert!(text.contains(expected), "{kind:?}: {text}");
+    }
+}
+
+#[test]
+fn overview_shows_reported_problem_under_the_step_box() {
+    use crate::frontend::tui::tabs::{
+        StepViewStatus, WorkflowOverviewState, WorkflowStepKind, WorkflowStepView,
+        WorkflowViewState,
+    };
+    let mut state = WorkflowViewState {
+        steps: vec![WorkflowStepView {
+            name: "build".into(),
+            status: StepViewStatus::Running,
+            agent: None,
+            model: None,
+            depends_on: vec![],
+            kind: WorkflowStepKind::Agent,
+        }],
+        current_step: Some("build".into()),
+        ..Default::default()
+    };
+    state
+        .reported
+        .insert("build".into(), "blocked: permission".into());
+    let buf = render_to_buffer(60, 6, |area, frame| {
+        crate::frontend::tui::workflow_view::render_workflow_overview(
+            &state,
+            area,
+            frame,
+            0,
+            0,
+            WorkflowOverviewState::Maximized,
+        );
+    });
+    assert!(buffer_text(&buf).contains("blocked: permission"));
+}

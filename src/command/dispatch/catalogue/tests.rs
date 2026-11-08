@@ -181,11 +181,11 @@ fn every_top_level_command_is_present() {
 }
 
 #[test]
-fn agents_has_exactly_the_five_supported_leaves() {
+fn agents_has_exactly_the_four_supported_leaves() {
     let agents = CommandCatalogue::get().lookup(&["agents"]).unwrap();
     let mut leaves: Vec<_> = agents.subcommands.iter().map(|spec| spec.name).collect();
     leaves.sort_unstable();
-    assert_eq!(leaves, ["attach", "detail", "kill", "list", "status"]);
+    assert_eq!(leaves, ["detail", "kill", "list", "status"]);
 }
 
 #[test]
@@ -662,6 +662,7 @@ fn config_and_transport_clients_can_run_without_a_local_runtime() {
     assert_eq!(
         runtime_optional,
         vec![
+            "attach",
             "config",
             "config get",
             "config set",
@@ -963,7 +964,10 @@ fn exec_prompt_flags_are_the_base_set_plus_issue() {
         .map(|f| f.long)
         .collect();
     assert_eq!(&names[..base.len()], &base[..]);
-    assert_eq!(&names[base.len()..], &["issue", "branch", "pr", "worktree"]);
+    assert_eq!(
+        &names[base.len()..],
+        &["issue", "interactive", "branch", "pr", "worktree"]
+    );
 }
 
 #[test]
@@ -1014,6 +1018,7 @@ fn exec_workflow_flags_keep_their_documented_order() {
             "headless",
             "plan",
             "allow-docker",
+            "interactive",
             "worktree",
             "yolo",
             "auto",
@@ -1069,15 +1074,18 @@ fn agents_sibling_names_and_aliases_are_unique_and_root_status_is_absent() {
 }
 
 #[test]
-fn is_agent_attach_matches_only_agents_attach() {
+fn attach_catalogue_replaces_agents_attach() {
     let cat = CommandCatalogue::get();
     assert!(cat.is_agent_attach(&["agents", "attach"]));
-    assert!(cat.is_agent_attach(&["agents", "attach", "abc123"]));
+    assert!(cat.lookup(&["agents", "attach"]).is_none());
+    assert!(cat.lookup(&["attach"]).is_some());
     assert!(!cat.is_agent_attach(&["agents"]));
     assert!(!cat.is_agent_attach(&["agents", "status"]));
     assert!(!cat.is_agent_attach(&["squad", "attach"]));
     assert!(!cat.is_agent_attach(&["agents", "attachx"]));
     assert!(!cat.is_agent_attach::<&str>(&[]));
+    assert!(cat.is_terminal_attach(&["attach", "term_123"]));
+    assert!(cat.is_terminal_attach(&["squad", "attach", "task_123"]));
 }
 
 #[test]

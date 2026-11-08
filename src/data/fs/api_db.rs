@@ -101,6 +101,7 @@ pub enum SessionCommandAdmission {
 /// Persistable command metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandRecord {
+    pub allow_remote_input: bool,
     pub listener: String,
     pub trace_parent: Option<String>,
     pub id: String,
@@ -591,6 +592,12 @@ impl SqliteSessionStore {
             "TEXT NOT NULL DEFAULT 'local'",
         )?;
         Self::add_column_if_missing(conn, "commands", "trace_parent", "TEXT")?;
+        Self::add_column_if_missing(
+            conn,
+            "commands",
+            "allow_remote_input",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
         // WI 0138: old databases may contain the retired status. Convert rows
         // in place without touching queued_at or rowid, which define claim order.
         conn.execute(
@@ -936,7 +943,7 @@ impl SqliteSessionStore {
         filter: &CommandListFilter<'_>,
     ) -> Result<Vec<CommandRecord>, DataError> {
         let mut sql = String::from(
-            "SELECT c.id,c.session_id,c.subcommand,c.args,c.status,c.exit_code,c.started_at,c.finished_at,c.log_path,c.worker_id,c.queued_at,c.result,c.attempt,c.listener,c.trace_parent FROM commands c WHERE 1=1",
+            "SELECT c.id,c.session_id,c.subcommand,c.args,c.status,c.exit_code,c.started_at,c.finished_at,c.log_path,c.worker_id,c.queued_at,c.result,c.attempt,c.listener,c.trace_parent,c.allow_remote_input FROM commands c WHERE 1=1",
         );
         let mut args: Vec<Value> = Vec::new();
         if let Some(session) = filter.session_id {
@@ -1066,7 +1073,7 @@ impl SqliteSessionStore {
         let conn = self.lock();
         let mut stmt = conn.prepare(
             "SELECT id, session_id, subcommand, args, status, exit_code, \
-                    started_at, finished_at, log_path, worker_id, queued_at, result, attempt, listener, trace_parent
+                    started_at, finished_at, log_path, worker_id, queued_at, result, attempt, listener, trace_parent, allow_remote_input
              FROM commands WHERE id = ?1",
         )?;
         let mut rows = stmt.query_map(params![id], command_record_from_row)?;
@@ -1429,6 +1436,23 @@ impl SqliteSessionStore {
         labels: &Labels,
         context: &crate::data::daemon_state::CommandRequestContext,
     ) -> Result<(), DataError> {
+        self.enqueue_command_with_terminal_input(
+            id, session_id, subcommand, args, log_path, labels, context, false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn enqueue_command_with_terminal_input(
+        &self,
+        id: &str,
+        session_id: &str,
+        subcommand: &str,
+        args: &str,
+        log_path: &str,
+        labels: &Labels,
+        context: &crate::data::daemon_state::CommandRequestContext,
+        allow_remote_input: bool,
+    ) -> Result<(), DataError> {
         let now = chrono::Utc::now().to_rfc3339();
         let mut conn = self.lock();
         let tx = conn.transaction()?;
@@ -1443,9 +1467,9 @@ impl SqliteSessionStore {
             )?;
         }
         tx.execute(
-            "INSERT INTO commands (id, session_id, subcommand, args, status, log_path, queued_at, listener, trace_parent)
-             VALUES (?1, ?2, ?3, ?4, 'queued', ?5, ?6, ?7, ?8)",
-            params![id, session_id, subcommand, args, log_path, now,context.listener.as_str(),context.trace_parent],
+            "INSERT INTO commands (id, session_id, subcommand, args, status, log_path, queued_at, listener, trace_parent, allow_remote_input)
+             VALUES (?1, ?2, ?3, ?4, 'queued', ?5, ?6, ?7, ?8, ?9)",
+            params![id, session_id, subcommand, args, log_path, now,context.listener.as_str(),context.trace_parent, allow_remote_input],
         )?;
         tx.commit()?;
         Ok(())
@@ -1472,7 +1496,7 @@ impl SqliteSessionStore {
                  LIMIT 1
              )
              RETURNING id, session_id, subcommand, args, status, exit_code,
-                       started_at, finished_at, log_path, worker_id, queued_at, result, attempt, listener, trace_parent",
+                       started_at, finished_at, log_path, worker_id, queued_at, result, attempt, listener, trace_parent, allow_remote_input",
         )?;
         let mut rows = stmt.query_map(params![worker_id, now], command_record_from_row)?;
         match rows.next() {
@@ -1530,7 +1554,7 @@ impl SqliteSessionStore {
         let conn = self.lock();
         let mut stmt = conn.prepare(
             "SELECT id, session_id, subcommand, args, status, exit_code,
-                    started_at, finished_at, log_path, worker_id, queued_at, result, attempt, listener, trace_parent
+                    started_at, finished_at, log_path, worker_id, queued_at, result, attempt, listener, trace_parent, allow_remote_input
              FROM commands
              WHERE session_id = ?1
              ORDER BY queued_at DESC, rowid DESC
@@ -1573,7 +1597,7 @@ impl SqliteSessionStore {
         let conn = self.lock();
         let mut stmt = conn.prepare(
             "SELECT id, session_id, subcommand, args, status, exit_code,
-                    started_at, finished_at, log_path, worker_id, queued_at, result, attempt, listener, trace_parent
+                    started_at, finished_at, log_path, worker_id, queued_at, result, attempt, listener, trace_parent, allow_remote_input
              FROM commands
              WHERE session_id = ?1 AND status = 'running'
              LIMIT 1",
@@ -1715,6 +1739,7 @@ fn session_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionR
 
 fn command_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CommandRecord> {
     Ok(CommandRecord {
+        allow_remote_input: row.get(15)?,
         listener: row.get(13)?,
         trace_parent: row.get(14)?,
         id: row.get(0)?,

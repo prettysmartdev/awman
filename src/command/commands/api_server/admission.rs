@@ -38,6 +38,7 @@ pub struct SessionSubmission {
 
 /// Catalogue command tokens and validated label values, independent of HTTP.
 pub struct CommandSubmission {
+    pub allow_remote_input: bool,
     pub interaction: Option<crate::data::config::daemon::Interaction>,
     pub subcommand: String,
     pub args: Vec<String>,
@@ -76,6 +77,9 @@ pub enum AdmissionError {
         source: DataError,
     },
     ReservationLost,
+    /// The request chose an interaction mode the push feature does not let
+    /// it choose (`allowOverride: false`). `400 interaction_override_refused`.
+    InteractionRefused(crate::command::interaction::InteractionRefused),
 }
 
 fn storage(what: &'static str, source: DataError) -> AdmissionError {
@@ -150,10 +154,25 @@ impl ApiAdmission {
         self
     }
 
+    /// Resolve push interaction once, at submit (WI 0141).
+    ///
+    /// The request asks through the body's `interaction` or an explicit
+    /// `--interactive` / `--headless[=bool]` in `args`; the two must agree.
+    /// `command::interaction::resolve_interaction` applies
+    /// `daemon.features.worker.push.{interaction,allowOverride}` as they are
+    /// now (admission is built from the live config), and a disallowed
+    /// override is refused here with `interaction_override_refused` rather
+    /// than downgraded later. The resolved choice is recorded in the stored
+    /// args as one leading `--headless` / `--interactive` token when the
+    /// client did not spell it, so the queue worker, a restart re-queue and
+    /// the read projection all see the same decision without a schema change.
     fn resolve_interaction(
         &self,
         mut command: CommandSubmission,
     ) -> Result<CommandSubmission, AdmissionError> {
+        use crate::command::interaction::{
+            requested_from_flags, resolve_interaction, InteractionSlot,
+        };
         use crate::data::config::daemon::{DaemonSettings, Interaction};
         let settings = DaemonSettings::from_merged(
             &self
@@ -162,43 +181,53 @@ impl ApiAdmission {
                 .daemon
                 .clone()
                 .unwrap_or_default(),
-        )
-        .worker;
-        let interaction = command.interaction.unwrap_or(settings.push_interaction);
-        if command.interaction.is_some()
-            && interaction != settings.push_interaction
-            && !settings.push_allow_override
-        {
-            return Err(AdmissionError::CommandValidation(CommandError::Other(
-                "interaction override is disabled".into(),
-            )));
-        }
-        let supports = CommandCatalogue::get()
-            .lookup_with_aliases(&command.subcommand.split_whitespace().collect::<Vec<_>>())
-            .is_some_and(|s| s.find_flag("headless").is_some());
-        if supports {
-            let mut positional = false;
-            command.args.retain(|arg| {
-                if positional {
-                    return true;
-                }
-                if arg == "--" {
-                    positional = true;
-                    return true;
-                }
-                arg != "--headless" && arg != "-n" && !arg.starts_with("--headless=")
+        );
+        let catalogue = CommandCatalogue::get();
+        let path: Vec<&str> = command.subcommand.split_whitespace().collect();
+        let spec = catalogue.lookup_with_aliases(&path);
+        let supports_headless = spec.is_some_and(|s| s.find_flag("headless").is_some());
+        let supports_interactive = spec.is_some_and(|s| s.find_flag("interactive").is_some());
+        // Explicit flags only (no profile defaults). A malformed argv is
+        // reported by validation right after this, so it asks for nothing.
+        let from_args = catalogue
+            .parse_raw_args(&path, &command.args)
+            .ok()
+            .and_then(|parsed| {
+                requested_from_flags(
+                    parsed.flag_bool("interactive"),
+                    parsed.flag_bool("headless"),
+                )
             });
-            command.args.insert(
-                0,
-                if interaction == Interaction::Headless {
-                    "--headless"
-                } else {
-                    "--headless=false"
-                }
-                .into(),
-            );
+        let requested = match (command.interaction, from_args) {
+            (Some(body), Some(args)) if body != args => {
+                return Err(AdmissionError::CommandValidation(
+                    CommandError::InvalidFlagValue {
+                        command: path.iter().map(|p| (*p).to_string()).collect(),
+                        flag: if args == Interaction::Interactive {
+                            "interactive".into()
+                        } else {
+                            "headless".into()
+                        },
+                        reason: format!(
+                            "contradicts the request's \"interaction\": \"{}\"",
+                            body.as_str()
+                        ),
+                    },
+                ))
+            }
+            (body, args) => body.or(args),
+        };
+        let decision = resolve_interaction(InteractionSlot::WorkerPush, requested, &settings)
+            .map_err(AdmissionError::InteractionRefused)?;
+        if supports_headless && from_args.is_none() {
+            let token = match decision.interaction {
+                Interaction::Headless => "--headless",
+                Interaction::Interactive if supports_interactive => "--interactive",
+                Interaction::Interactive => "--headless=false",
+            };
+            command.args.insert(0, token.into());
         }
-        command.interaction = Some(interaction);
+        command.interaction = Some(decision.interaction);
         Ok(command)
     }
 
@@ -495,7 +524,7 @@ impl ApiAdmission {
 
         let log_path = self.paths.command_log_path(session_id, command_id);
 
-        if let Err(e) = self.store.enqueue_command_with_context(
+        if let Err(e) = self.store.enqueue_command_with_terminal_input(
             command_id,
             session_id,
             &body.subcommand,
@@ -503,6 +532,7 @@ impl ApiAdmission {
             &log_path.to_string_lossy(),
             &body.labels,
             &self.request_context,
+            body.allow_remote_input,
         ) {
             tracing::error!(error = %e, "Failed to enqueue command");
             return Err(storage("Failed to enqueue command", e));

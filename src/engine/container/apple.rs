@@ -592,6 +592,7 @@ fn resize_pty_forcing_winch(master: &dyn portable_pty::MasterPty, cols: u16, row
 /// container still runs; it simply cannot be attached to.
 fn serve_attach_socket(ctx: AttachHookCtx<'_>) -> Option<AttachSocketGuard> {
     let AttachHookCtx {
+        terminal,
         container_name,
         output_broadcast,
         stdin_injector,
@@ -627,6 +628,7 @@ fn serve_attach_socket(ctx: AttachHookCtx<'_>) -> Option<AttachSocketGuard> {
     crate::engine::container::attach_socket::spawn_attach_socket_server(
         &path,
         crate::engine::container::attach_socket::AttachHooks {
+            terminal,
             output: output_broadcast,
             stdin: stdin_injector,
             resize,

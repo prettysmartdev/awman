@@ -89,7 +89,7 @@ pub(super) fn test_runtime_handle() -> tokio::runtime::Handle {
         .clone()
 }
 
-fn make_app() -> App {
+pub(super) fn make_app() -> App {
     let catalogue = CommandCatalogue::get();
     let engines = Engines::for_tests(std::path::Path::new("/tmp"));
     let session_manager = Arc::new(SessionManager::in_memory(

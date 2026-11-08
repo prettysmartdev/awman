@@ -163,7 +163,7 @@ fn docker_adapter_stop_and_listing_failures_keep_their_error_classes() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("no longer running"));
     for mode in ["down", "list-fail", "partial-list-fail"] {
         f.mode(mode);
-        for leaf in ["status", "list", "detail", "kill", "attach"] {
+        for leaf in ["status", "list", "detail", "kill"] {
             let args = if matches!(leaf, "status" | "list") {
                 vec!["agents", leaf]
             } else {
@@ -204,19 +204,11 @@ fn docker_adapter_inspection_checks_lifecycle_independently_from_stats() {
 }
 
 #[test]
-fn docker_adapter_delayed_attach_failure_differs_from_normal_agent_exit() {
+fn agents_attach_is_replaced_by_root_attach() {
     let f = Fixture::new();
-    f.mode("attach-gone");
     let output = f.run(&["agents", "attach", ID]);
-    exit(&output, 4);
-    assert!(String::from_utf8_lossy(&output.stderr).contains("no longer running"));
-    f.row("running", ID, "awman-example");
-    f.mode("attach-normal-exit");
-    exit(&f.run(&["agents", "attach", ID]), 7);
-    assert!(!f
-        .calls()
-        .lines()
-        .any(|l| l.starts_with("stop ") || l.starts_with("rm ")));
+    exit(&output, 2);
+    assert!(f.calls().is_empty());
 }
 
 #[test]
@@ -447,37 +439,11 @@ fn docker_replacement_during_kill_confirmation_is_never_stopped_by_name() {
 }
 
 #[test]
-fn cli_attach_ctrl_c_detaches_live_pty_without_sending_interrupt() {
-    use std::io::Write;
+fn agents_attach_does_not_start_a_runtime_attach() {
     let f = Fixture::new();
-    f.mode("attach-hold");
-    let mut session = PtySession::new(&f, &["agents", "attach", ID]);
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !f.path().join("received").exists() {
-        assert!(Instant::now() < deadline, "attach stub must start");
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    session.writer.write_all(b"hello\n").unwrap();
-    session.writer.flush().unwrap();
-    while std::fs::read(f.path().join("received")).unwrap().is_empty() {
-        assert!(
-            Instant::now() < deadline,
-            "ordinary input must reach the live stub"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    session.writer.write_all(&[3]).unwrap();
-    session.writer.flush().unwrap();
-    assert_eq!(session.finish(), 0);
-    assert_eq!(
-        std::fs::read(f.path().join("received")).unwrap(),
-        b"hello\n"
-    );
-    assert!(f.path().join("running").exists());
-    assert!(!f
-        .calls()
-        .lines()
-        .any(|call| call.starts_with("stop ") || call.starts_with("rm ")));
+    let output = f.run(&["agents", "attach", ID]);
+    assert_ne!(output.status.code(), Some(0));
+    assert!(f.calls().is_empty());
 }
 
 #[test]

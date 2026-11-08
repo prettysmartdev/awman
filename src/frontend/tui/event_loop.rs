@@ -1,11 +1,12 @@
 //! Terminal setup/teardown, the main render→input event loop, panic
 //! recovery, and terminal-resize handling.
 
-use std::io;
-use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::io::{self, IsTerminal};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use crossterm::event::{self, Event, KeyEventKind};
+use crossterm::event::{Event, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -13,9 +14,16 @@ use crossterm::terminal::{
 use ratatui::prelude::*;
 
 use super::app::{App, TerminalOp};
-use super::dialogs::DialogResponse;
+use super::dialogs::{Dialog, DialogRequest, DialogResponse};
+use super::input_reader::InputReader;
+use super::program_status_emitter::{
+    clear_terminal_status, emission_enabled, ProgramStatusEmitter,
+};
 use super::tabs::{self, ContainerWindowState};
 use super::{git_sidebar, key_handler, mouse_handler, render, TUI_ACTIVE};
+use crate::command::program_status_projection::{
+    AwmanState, EmitInput, EmitSlot, EmitTab, ProgramStatusProjection,
+};
 
 /// Restore the terminal to a clean state. Idempotent and best-effort: each
 /// step is attempted independently so a failure in one doesn't leave later
@@ -86,6 +94,23 @@ fn log_panic_to_file(info: &std::panic::PanicHookInfo<'_>) {
     log.append(&entry);
 }
 
+fn install_panic_hook(keyboard_enhanced: bool, status_active: Arc<AtomicBool>) {
+    let original_hook = std::panic::take_hook();
+    let main_thread = std::thread::current().id();
+    std::panic::set_hook(Box::new(move |info| {
+        log_panic_to_file(info);
+        if std::thread::current().id() == main_thread {
+            TUI_ACTIVE.store(false, Ordering::Relaxed);
+            let _ = clear_terminal_status(
+                status_active.swap(false, Ordering::Relaxed),
+                &mut io::stdout(),
+            );
+            restore_terminal(keyboard_enhanced);
+            original_hook(info);
+        }
+    }));
+}
+
 /// Set up the terminal, run the main loop, and restore on exit.
 pub(super) fn run_event_loop(app: &mut App) -> io::Result<()> {
     enable_raw_mode()?;
@@ -121,29 +146,47 @@ pub(super) fn run_event_loop(app: &mut App) -> io::Result<()> {
     // the TUI keeps running and would immediately repaint over anything the
     // default hook printed, so the log file is the only readable record —
     // the terminal is left alone and the default hook is skipped.
-    let original_hook = std::panic::take_hook();
-    let main_thread = std::thread::current().id();
-    std::panic::set_hook(Box::new(move |info| {
-        log_panic_to_file(info);
-        if std::thread::current().id() == main_thread {
-            TUI_ACTIVE.store(false, Ordering::Relaxed);
-            restore_terminal(keyboard_enhanced);
-            original_hook(info);
-        }
-    }));
+    let status_active = Arc::new(AtomicBool::new(false));
+    install_panic_hook(keyboard_enhanced, status_active.clone());
 
     TUI_ACTIVE.store(true, Ordering::Relaxed);
 
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
-
-    let result = main_loop(&mut terminal, app, keyboard_enhanced);
+    let config = app
+        .tabs
+        .first()
+        .is_some_and(|tab| tab.session.effective_config().tui_program_status_emit());
+    let term = crate::data::config::env::Env::from_process()
+        .get("TERM")
+        .map(str::to_owned);
+    let enabled = emission_enabled(config, stdout.is_terminal(), term.as_deref())
+        && InputReader::supports_probe();
+    let mut emitter = ProgramStatusEmitter::new(enabled);
+    // Keep every fallible startup operation inside the teardown boundary.
+    let result = (|| {
+        let mut input = InputReader::new(enabled)?;
+        emitter = ProgramStatusEmitter::new(input.probe_enabled());
+        if emitter.start_probe(&mut stdout).is_err() {
+            emitter.disable();
+        }
+        let backend = CrosstermBackend::new(stdout);
+        let mut terminal = Terminal::new(backend)?;
+        main_loop(
+            &mut terminal,
+            app,
+            keyboard_enhanced,
+            &mut emitter,
+            &mut input,
+            &status_active,
+        )
+    })();
 
     TUI_ACTIVE.store(false, Ordering::Relaxed);
+    let clear_result = emitter.clear(&mut io::stdout());
+    status_active.store(false, Ordering::Relaxed);
     restore_terminal(keyboard_enhanced);
     let _ = std::panic::take_hook();
 
-    result
+    result.and(clear_result)
 }
 
 /// The main event loop: render → tick → poll → handle input → repeat.
@@ -151,6 +194,9 @@ fn main_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
     keyboard_enhanced: bool,
+    emitter: &mut ProgramStatusEmitter,
+    input: &mut InputReader,
+    status_active: &AtomicBool,
 ) -> io::Result<()> {
     // True while a host command owns the terminal (WI 0149): nothing is drawn
     // and no input is read until the matching restore.
@@ -164,6 +210,10 @@ fn main_loop(
         if let Some(op) = app.terminal_op.take() {
             match op {
                 TerminalOp::Release { title } => {
+                    if emitter.clear(&mut io::stdout()).is_err() {
+                        emitter.disable();
+                    }
+                    status_active.store(false, Ordering::Relaxed);
                     restore_terminal(keyboard_enhanced);
                     TUI_ACTIVE.store(false, Ordering::Relaxed);
                     println!("awman: {title}");
@@ -191,8 +241,20 @@ fn main_loop(
         app.tick_all_tabs();
         app.poll_runtime_notices();
 
-        if event::poll(Duration::from_millis(50))? {
-            match event::read()? {
+        status_active.store(emitter.active(), Ordering::Relaxed);
+        let reports = ProgramStatusProjection.reports(&emit_input(app));
+        if emitter
+            .tick(&reports, Instant::now(), &mut io::stdout())
+            .is_err()
+        {
+            emitter.disable();
+        }
+
+        if let Some(event) = input.read(emitter, Duration::from_millis(50))? {
+            // Set the panic-path latch before handing input to application
+            // code, which may panic after the feature reply was consumed.
+            status_active.store(emitter.active(), Ordering::Relaxed);
+            match event {
                 Event::Key(key_event) => {
                     if key_event.kind != KeyEventKind::Press {
                         continue;
@@ -210,6 +272,79 @@ fn main_loop(
         }
     }
     Ok(())
+}
+
+/// Snapshot presentation state; Layer 2 decides precedence and aggregation.
+fn emit_input(app: &App) -> EmitInput {
+    EmitInput {
+        tabs: app
+            .tabs
+            .iter()
+            .enumerate()
+            .map(|(index, tab)| {
+                let command = match tab.execution_phase {
+                    tabs::ExecutionPhase::Idle => None,
+                    tabs::ExecutionPhase::Running { .. } => Some(AwmanState::CommandRunning),
+                    tabs::ExecutionPhase::Done { exit_code: 0, .. } => {
+                        Some(AwmanState::CommandDone)
+                    }
+                    tabs::ExecutionPhase::Done { .. } | tabs::ExecutionPhase::Error { .. } => {
+                        Some(AwmanState::CommandFailed)
+                    }
+                };
+                let queued = match app.pending_dialog_requests.get(&tab.session_id) {
+                    Some(DialogRequest::AgentAuth(_)) => Some(AwmanState::AuthDialog),
+                    Some(
+                        DialogRequest::Loading { .. }
+                        | DialogRequest::WorkflowYoloCountdown(_)
+                        | DialogRequest::TerminalRelease { .. }
+                        | DialogRequest::TerminalRestore
+                        | DialogRequest::KeySetupNotice { .. },
+                    )
+                    | None => None,
+                    Some(_) => Some(AwmanState::DialogWaiting),
+                };
+                let dialog = if index == app.active_tab {
+                    match app.active_dialog.as_ref() {
+                        Some(Dialog::AgentAuth(_)) => Some(AwmanState::AuthDialog),
+                        Some(Dialog::Loading { .. } | Dialog::WorkflowYoloCountdown(_)) | None => {
+                            None
+                        }
+                        Some(Dialog::FatalError { .. }) => Some(AwmanState::CommandFailed),
+                        Some(_) => Some(AwmanState::DialogWaiting),
+                    }
+                } else {
+                    queued
+                };
+                let mut slots: Vec<_> = tab
+                    .container_slots
+                    .iter()
+                    .enumerate()
+                    .map(|(slot, agent)| EmitSlot {
+                        slot,
+                        status: agent.program_status.clone(),
+                        awman: if slot == tab.focused_slot_idx {
+                            dialog.or(command)
+                        } else {
+                            command
+                        },
+                    })
+                    .collect();
+                if slots.is_empty() {
+                    slots.push(EmitSlot {
+                        slot: 0,
+                        status: tab.program_status(),
+                        awman: dialog.or(command),
+                    });
+                }
+                EmitTab {
+                    index: index + 1,
+                    label: tab.project_name(u16::MAX),
+                    slots,
+                }
+            })
+            .collect(),
+    }
 }
 
 // ─── Resize ──────────────────────────────────────────────────────────────────
@@ -275,4 +410,157 @@ fn compute_container_inner_size_with_extra(
     let outer_cols = ((term_cols as u32 * 95 / 100) as u16).max(10);
     let outer_rows = ((exec_height as u32 * 95 / 100) as u16).max(5);
     (outer_cols.saturating_sub(2), outer_rows.saturating_sub(2))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data::program_status::{BlockedKind, EffectiveStatus, ProgramState, ReportState};
+    use crate::frontend::osc7501::CLEAR_ALL;
+    use crate::frontend::tui::dialogs::AgentAuthState;
+    use crate::frontend::tui::tabs::{ContainerSlot, ExecutionPhase, Tab};
+    use crate::frontend::tui::tests::make_app;
+
+    #[test]
+    fn snapshots_agents_and_awman_command_and_dialog_states() {
+        let mut app = make_app();
+        app.tabs[0].execution_phase = ExecutionPhase::Running {
+            command: "chat".into(),
+        };
+        let mut agent = ContainerSlot::new(String::new(), "claude".into(), 10);
+        agent.program_status = Some(EffectiveStatus {
+            state: ProgramState::Working,
+            kind: None,
+            progress: Some(20),
+            msg: Some("building".into()),
+            app: None,
+            id: None,
+        });
+        app.tabs[0].container_slots.push(agent);
+        let input = emit_input(&app);
+        assert_eq!(input.tabs[0].label, app.tabs[0].project_name(u16::MAX));
+        assert_eq!(
+            input.tabs[0].slots[0]
+                .status
+                .as_ref()
+                .unwrap()
+                .msg
+                .as_deref(),
+            Some("building")
+        );
+        assert_eq!(
+            input.tabs[0].slots[0].awman,
+            Some(AwmanState::CommandRunning)
+        );
+        app.active_dialog = Some(Dialog::YesNo {
+            title: "Review".into(),
+            body: "Proceed?".into(),
+        });
+        let reports = ProgramStatusProjection.reports(&emit_input(&app));
+        assert_eq!(reports[0].state, ReportState::State(ProgramState::Blocked));
+        assert_eq!(reports[0].kind, Some(BlockedKind::Question));
+        app.active_dialog = Some(Dialog::AgentAuth(AgentAuthState {
+            agent_name: "claude".into(),
+            env_vars: vec![],
+        }));
+        assert_eq!(
+            ProgramStatusProjection.reports(&emit_input(&app))[0].kind,
+            Some(BlockedKind::Auth)
+        );
+        app.active_dialog = None;
+        app.tabs[0].container_slots.clear();
+        for (phase, state) in [
+            (
+                ExecutionPhase::Done {
+                    command: "chat".into(),
+                    exit_code: 0,
+                },
+                ProgramState::Done,
+            ),
+            (
+                ExecutionPhase::Done {
+                    command: "chat".into(),
+                    exit_code: 3,
+                },
+                ProgramState::Error,
+            ),
+            (
+                ExecutionPhase::Error {
+                    command: "chat".into(),
+                    message: "failed".into(),
+                },
+                ProgramState::Error,
+            ),
+        ] {
+            app.tabs[0].execution_phase = phase;
+            assert_eq!(
+                ProgramStatusProjection.reports(&emit_input(&app))[0].state,
+                ReportState::State(state)
+            );
+        }
+    }
+
+    #[test]
+    fn background_dialogs_are_reported_and_still_delivered_on_focus() {
+        let mut app = make_app();
+        let session = app.tabs[0].session.clone();
+        let mut background = Tab::new(session);
+        // Tab::new mirrors the session id, so give the background its own
+        // session identity (normal tabs are created through SessionManager).
+        background.session_id = crate::data::session::SessionId::new();
+        let (tx, rx) = std::sync::mpsc::channel();
+        background.dialog_request_rx = Some(rx);
+        app.tabs.push(background);
+        tx.send(DialogRequest::AgentAuth(AgentAuthState {
+            agent_name: "claude".into(),
+            env_vars: vec![],
+        }))
+        .unwrap();
+        app.poll_dialog_requests();
+        assert!(app.active_dialog.is_none());
+        let reports = ProgramStatusProjection.reports(&emit_input(&app));
+        assert_eq!(reports[0].kind, Some(BlockedKind::Auth));
+        assert_eq!(reports[1].id.as_deref(), Some("tab2/0"));
+        app.active_tab = 1;
+        app.poll_dialog_requests();
+        assert!(matches!(app.active_dialog, Some(Dialog::AgentAuth(_))));
+        assert!(app.pending_dialog_requests.is_empty());
+    }
+
+    #[test]
+    fn panic_hook_writes_clear_before_restoring_terminal() {
+        // Global hooks are isolated in a subprocess; this exercises the real
+        // installed TUI hook without changing another test's panic handling.
+        const CHILD: &str = "AWMAN_TEST_TUI_STATUS_PANIC_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let active = Arc::new(AtomicBool::new(true));
+            install_panic_hook(false, active.clone());
+            assert!(std::panic::catch_unwind(|| panic!("emitter panic-path test")).is_err());
+            assert!(!active.load(Ordering::Relaxed));
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "frontend::tui::event_loop::tests::panic_hook_writes_clear_before_restoring_terminal", "--nocapture"])
+            .env(CHILD, "1")
+            .env("HOME", home.path())
+            .env("AWMAN_HOME", home.path())
+            .output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let clear = output
+            .stdout
+            .windows(CLEAR_ALL.len())
+            .position(|w| w == CLEAR_ALL)
+            .expect("panic hook emitted clear");
+        let leave = output
+            .stdout
+            .windows(8)
+            .position(|w| w == b"\x1b[?1049l")
+            .expect("restored alternate screen");
+        assert!(clear < leave);
+    }
 }

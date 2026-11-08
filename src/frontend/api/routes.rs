@@ -185,6 +185,8 @@ impl From<SessionRecord> for SessionResponse {
 #[derive(Deserialize)]
 struct CreateCommandRequest {
     #[serde(default)]
+    allow_remote_input: bool,
+    #[serde(default)]
     interaction: Option<crate::data::config::daemon::Interaction>,
     subcommand: String,
     args: Vec<String>,
@@ -198,6 +200,8 @@ struct CreateCommandRequest {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CommandResponse {
+    #[serde(default)]
+    allow_remote_input: bool,
     #[serde(default)]
     listener: String,
     #[serde(default)]
@@ -252,6 +256,7 @@ use crate::frontend::api::error::ApiError;
 impl From<CreateCommandRequest> for CommandSubmission {
     fn from(body: CreateCommandRequest) -> Self {
         Self {
+            allow_remote_input: body.allow_remote_input,
             subcommand: body.subcommand,
             args: body.args,
             labels: body.labels,
@@ -301,6 +306,14 @@ fn admission_error(error: AdmissionError, session_id: &str) -> Response {
             internal_error(what)
         }
         AdmissionError::ReservationLost => internal_error("Idempotency reservation lost"),
+        AdmissionError::InteractionRefused(refused) => ApiError::interaction_override_refused(
+            refused.to_string(),
+        )
+        .with_details(serde_json::json!({
+            "setting": refused.key(),
+            "configured": refused.configured().as_str(),
+            "requested": refused.requested().as_str(),
+        })),
         AdmissionError::Session(SessionCommandAdmission::Accepted) => {
             internal_error("Unexpected session admission outcome")
         }
@@ -385,6 +398,7 @@ fn command_response(
         .queue_position(&c)
         .map_err(|_| internal_error("Failed to read queue position"))?;
     Ok(CommandResponse {
+        allow_remote_input: c.allow_remote_input,
         listener: c.listener.clone(),
         trace_parent: c.trace_parent.clone(),
         args: crate::command::commands::api_server::runtime::stored_args_view(&c),
@@ -766,6 +780,21 @@ pub const ROUTES: &[RouteSpec] = &[
         local_only: true,
         capability: Some("grant_routes"),
     },
+    // WI 0141: one core resource for every feature's agent terminals.
+    RouteSpec {
+        method: "GET",
+        path: "/v1/terminals",
+        op: Operation::CoreTerminalsList,
+        local_only: false,
+        capability: None,
+    },
+    RouteSpec {
+        method: "GET",
+        path: "/v1/terminals/{id}",
+        op: Operation::CoreTerminalsGet,
+        local_only: false,
+        capability: None,
+    },
     RouteSpec {
         method: "GET",
         path: "/v1/worker/workdirs",
@@ -982,6 +1011,11 @@ pub fn build_router_for_listener(api: Arc<DaemonApi>, policy: ListenerPolicy) ->
             _ => unreachable!(),
         };
         let route: MethodRouter = match spec.op.owner() {
+            _ if super::terminals::route(spec.op, filter).is_some() => {
+                super::terminals::route(spec.op, filter)
+                    .expect("terminal route")
+                    .with_state(api.clone())
+            }
             Feature::Worker => match &api.worker {
                 Some(worker) => worker_route(spec.op, filter).with_state(worker.clone()),
                 None => axum::routing::on(filter, || async {
@@ -1970,7 +2004,7 @@ async fn handle_get_workflow(
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
     #[tokio::test]
@@ -2005,6 +2039,7 @@ mod tests {
                     labels: Labels::empty(),
                 },
                 Some(CommandSubmission {
+                    allow_remote_input: false,
                     interaction: None,
                     subcommand: "exec prompt".into(),
                     args: vec!["hello".into()],
@@ -2236,7 +2271,7 @@ mod tests {
     // build_router; any divergence is a regression.
     const EXPECTED_ROUTES: &[RouteSpec] = ROUTES;
 
-    fn make_test_state(tmp: &std::path::Path) -> Arc<AppState> {
+    pub(crate) fn make_test_state(tmp: &std::path::Path) -> Arc<AppState> {
         use crate::command::dispatch::Engines;
         use crate::data::fs::api_db::SqliteSessionStore;
         use crate::data::fs::api_paths::ApiPaths;
@@ -2306,7 +2341,7 @@ mod tests {
         // Guard: if someone adds a route without updating this table, the count drifts.
         assert_eq!(
             EXPECTED_ROUTES.len(),
-            39,
+            41,
             "route count mismatch — update EXPECTED_ROUTES"
         );
     }

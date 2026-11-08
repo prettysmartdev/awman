@@ -591,8 +591,8 @@ const ROOT: CommandSpec = CommandSpec {
         },
     ],
     subcommands: &[
-        &INIT, &READY, &CHAT, &SPECS, &AGENTS, &CONFIG, &EXEC, &DAEMON, &SQUAD, &REMOTE, &NEW,
-        &CLEAN,
+        &ATTACH, &INIT, &READY, &CHAT, &SPECS, &AGENTS, &CONFIG, &EXEC, &DAEMON, &SQUAD, &REMOTE,
+        &NEW, &CLEAN,
     ],
 };
 
@@ -662,6 +662,7 @@ const REMOVED_FLAGS: &[RemovedFlagSpec] = &[
 // what assembles them into the tree, so this file remains the one place the
 // catalogue's shape is visible.
 mod agents;
+mod attach;
 mod core;
 mod daemon;
 mod exec;
@@ -675,6 +676,7 @@ mod squad;
 mod tests;
 
 use agents::*;
+use attach::*;
 use core::*;
 use daemon::*;
 use exec::*;

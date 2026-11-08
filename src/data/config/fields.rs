@@ -163,6 +163,7 @@ pub const RESERVED_ENV: &[&str] = &[
     "AWMAN_TEST_SBX",
     "AWMAN_TEST_BUILTIN",
     "AWMAN_TEST_YOLO_COUNTDOWN_MS",
+    "AWMAN_TEST_AGENT_DONE_COUNTDOWN_MS",
 ];
 
 /// Whether `name` matches [`MAP_NAME`].
@@ -771,6 +772,14 @@ pub const CONFIG_KEYS: &[ConfigKey] = &[
         Global,
         true,
         "How squad evaluations interact.",
+    ),
+    row(
+        "daemon.features.squad.allowOverride",
+        Bool,
+        "true",
+        Global,
+        true,
+        "Let a squad task choose its own interaction (read from 0141).",
     ),
     row(
         "daemon.features.squad.maxConcurrentJobs",

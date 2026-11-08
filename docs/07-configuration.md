@@ -322,6 +322,38 @@ Valid agents: `claude`, `codex`, `gemini`, `opencode`, `cline`, `copilot`, `anti
 
 A repo-scope write accepts custom agents defined in the repo or globally; a `--global` write accepts only globally defined ones. Anything else is rejected at write time with the list of valid agents.
 
+### Show status in the terminal tab bar
+
+To control status in your terminal's tab bar, use `tui.programStatus.emit`
+(default `true`). It applies to terminals supporting OSC 7501 and can be set
+globally or per repository. Disable it for one run with
+`awman --set tui.programStatus.emit=false` or
+`AWMAN_TUI_PROGRAM_STATUS_EMIT=false`.
+
+`agents.programStatus.enabled` (default `true`) controls whether awman accepts
+OSC 7501 status reports from agents. When disabled, reports are ignored and
+filtered from attached terminal output. TUI emission is a separate setting:
+`tui.programStatus.emit` controls whether the TUI reports its tab status to a
+supporting host terminal.
+
+### Daemon terminal size and interaction
+
+The global `daemon.terminal.cols` and `daemon.terminal.rows` settings (defaults
+120 and 40) set the starting size for daemon-managed interactive terminals.
+Changing them affects new terminals; a running terminal keeps its current
+size. Network terminal viewers may send input only when
+`daemon.terminal.remoteInput=true` and the command also permits remote input.
+
+Daemon features choose whether unattended agents use a PTY (`interactive`) or
+piped print mode (`headless`). The defaults are `daemon.features.squad.interaction`
+=`interactive` and `daemon.features.worker.push.interaction`=`headless`. Each
+feature has an `allowOverride` setting, default `true`, that controls whether
+an individual run may request the other mode. These settings are global and
+live. A request for a disallowed override is rejected before it is queued.
+The configuration also accepts `daemon.features.worker.pull.interaction`
+(`interactive` by default), but awman does not currently run pulled jobs, so
+that setting has no effect yet.
+
 ### Adjust terminal scrollback
 
 ```sh
@@ -646,6 +678,7 @@ This table is generated from the same key table awman validates against, so it i
 | `daemon.network.features` | list<string> | `["worker"]` | global | no | yes | `AWMAN_DAEMON_NETWORK_FEATURES` | Features served on the network listener (read from 0140). |
 | `daemon.features.squad.enabled` | bool | `false` | global | no | yes | `AWMAN_DAEMON_FEATURES_SQUAD_ENABLED` | Run the squad scheduler. |
 | `daemon.features.squad.interaction` | enum `interactive\|headless` | `"interactive"` | global | no | yes | `AWMAN_DAEMON_FEATURES_SQUAD_INTERACTION` | How squad evaluations interact. |
+| `daemon.features.squad.allowOverride` | bool | `true` | global | no | yes | `AWMAN_DAEMON_FEATURES_SQUAD_ALLOW_OVERRIDE` | Let a squad task choose its own interaction (read from 0141). |
 | `daemon.features.squad.maxConcurrentJobs` | int ≥ 1 | `1` | global | no | yes | `AWMAN_DAEMON_FEATURES_SQUAD_MAX_CONCURRENT_JOBS` | Squad runs at once. |
 | `daemon.features.squad.maxConcurrentEvaluations` | int ≥ 1 | `2` | global | no | yes | `AWMAN_DAEMON_FEATURES_SQUAD_MAX_CONCURRENT_EVALUATIONS` | Squad evaluations at once. |
 | `daemon.features.squad.envPersistence` | enum `keychain\|none` | `"keychain"` | global | no | yes | `AWMAN_DAEMON_FEATURES_SQUAD_ENV_PERSISTENCE` | Where the squad daemon persists pushed task environment. |

@@ -276,6 +276,9 @@ fn render_overview(
                     let code = match overview.agents[index - 3].state {
                         AgentState::Running => "32",
                         AgentState::Stuck => "33",
+                        AgentState::Waiting => "33",
+                        AgentState::Errored => "31",
+                        AgentState::Done => "32",
                         AgentState::Stopped => "90",
                     };
                     line.replacen(
@@ -399,6 +402,8 @@ mod tests {
             command_label: None,
             cpu_percent: Some(12.3),
             memory_mb: Some(512.0),
+            kind: None,
+            msg: None,
         }
     }
 
@@ -418,6 +423,7 @@ mod tests {
                 .count(),
             cpu_percent: Some(12.3),
             memory_mb: Some(512.0),
+            ..Default::default()
         };
         AgentsOverview {
             runtime: "docker".into(),

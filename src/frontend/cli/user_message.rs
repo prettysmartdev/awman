@@ -8,13 +8,40 @@
 //! `WorktreeLifecycle::finalize`).
 
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
 
 #[derive(Debug, Default)]
 pub struct CliUserMessageQueue {
-    pty_active: bool,
+    pty_active: Arc<AtomicBool>,
     queue: Vec<UserMessage>,
+    /// Messages written through a [`CliMessageHandle`] while a PTY owned the
+    /// terminal; flushed by `replay_queued` together with `queue`.
+    deferred: Arc<Mutex<Vec<UserMessage>>>,
+}
+
+/// A cloneable writer onto the same sink and the same PTY gate, for background
+/// tasks (a status watcher) that cannot borrow the frontend. Writes go to
+/// stderr at once unless a PTY owns the terminal, in which case they wait for
+/// `replay_queued`.
+#[derive(Debug, Clone)]
+pub struct CliMessageHandle {
+    pty_active: Arc<AtomicBool>,
+    deferred: Arc<Mutex<Vec<UserMessage>>>,
+}
+
+impl CliMessageHandle {
+    pub fn write_message(&self, msg: UserMessage) {
+        if self.pty_active.load(Ordering::Relaxed) {
+            if let Ok(mut q) = self.deferred.lock() {
+                q.push(msg);
+            }
+        } else {
+            write_to_stderr(&msg);
+        }
+    }
 }
 
 impl CliUserMessageQueue {
@@ -25,18 +52,26 @@ impl CliUserMessageQueue {
     /// Toggle the PTY-active gate. While `true`, [`write_message`] queues
     /// instead of writing immediately.
     pub fn set_pty_active(&mut self, active: bool) {
-        self.pty_active = active;
+        self.pty_active.store(active, Ordering::Relaxed);
+    }
+
+    /// A handle background tasks can write through; see [`CliMessageHandle`].
+    pub fn handle(&self) -> CliMessageHandle {
+        CliMessageHandle {
+            pty_active: self.pty_active.clone(),
+            deferred: self.deferred.clone(),
+        }
     }
 
     #[cfg(test)]
     pub fn pty_active(&self) -> bool {
-        self.pty_active
+        self.pty_active.load(Ordering::Relaxed)
     }
 }
 
 impl UserMessageSink for CliUserMessageQueue {
     fn write_message(&mut self, msg: UserMessage) {
-        if self.pty_active {
+        if self.pty_active.load(Ordering::Relaxed) {
             self.queue.push(msg);
         } else {
             write_to_stderr(&msg);
@@ -45,7 +80,10 @@ impl UserMessageSink for CliUserMessageQueue {
 
     fn replay_queued(&mut self) {
         // `mem::take` is safe here because we don't hold any borrows.
-        let drained = std::mem::take(&mut self.queue);
+        let mut drained = std::mem::take(&mut self.queue);
+        if let Ok(mut late) = self.deferred.lock() {
+            drained.append(&mut late);
+        }
         for msg in drained {
             write_to_stderr(&msg);
         }

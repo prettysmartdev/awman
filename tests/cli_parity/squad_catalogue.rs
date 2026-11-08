@@ -129,7 +129,11 @@ fn every_squad_subcommand_has_the_contract_shape() {
         // nothing to configure, and it deliberately changes no stored field.
         ("trigger", vec!["name"], vec![]),
         ("cancel", vec!["name"], vec![]),
-        ("attach", vec!["name"], vec!["container"]),
+        (
+            "attach",
+            vec!["name"],
+            vec!["annotation", "read-only", "step"],
+        ),
         // WI 0116 §6d: `squad env` reports coverage, pushes, and clears the
         // stored item. No short forms, no aliases, and neither flag implies
         // the other.

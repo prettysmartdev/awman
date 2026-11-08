@@ -239,6 +239,10 @@ async fn run_api_dynamic_workflow_with_initial_dirty(
             "ses_21d6f40cfb511982e4424e0e250a9557",
             "cmd_1dccadfed7bcbb036c56a4afb97e906f",
         ),
+        crate::command::interaction::InteractionDecision {
+            interaction: crate::data::config::daemon::Interaction::Headless,
+            pty_size: None,
+        },
     );
     let session = Session::for_tests_isolated(&repo, &tmp.path().join("config-home"));
 
@@ -509,6 +513,10 @@ command = "make-conflict"
             "ses_03c7c0ace395d80182db07ae2c30f034",
             "cmd_4a8a08f09d37b73795649038408b5f33",
         ),
+        crate::command::interaction::InteractionDecision {
+            interaction: crate::data::config::daemon::Interaction::Headless,
+            pty_size: None,
+        },
     );
 
     let calls = Arc::new(Mutex::new(Vec::<(String, Option<ModelFlagForm>)>::new()));

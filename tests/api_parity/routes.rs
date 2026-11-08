@@ -72,6 +72,9 @@ const EXPECTED_ROUTES: &[(&str, &str)] = &[
     ("PATCH", "/v1/features/{feature}"),
     ("GET", "/v1/grants"),
     ("DELETE", "/v1/grants/{id}"),
+    // WI 0141: one core terminal resource; no per-feature terminal routes.
+    ("GET", "/v1/terminals"),
+    ("GET", "/v1/terminals/{id}"),
     ("GET", "/v1/worker/workdirs"),
     ("GET", "/v1/worker/sessions"),
     ("POST", "/v1/worker/sessions"),

@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{json, Map, Value};
 
+use crate::engine::container::host_env_denylist::scrub_run_env;
 use crate::engine::container::options::ModelFlagForm;
 use crate::engine::error::EngineError;
 use crate::engine::sandbox::dsbx::auth::is_credential_like;
@@ -22,9 +23,37 @@ use crate::engine::sandbox::options::ResolvedSandboxOptions;
 /// startup script fail loudly and direct the user to re-run `awman ready`.
 pub(super) const SESSION_SCHEMA_VERSION: u32 = 1;
 
+/// This process's own environment (entries that are not UTF-8 skipped): what
+/// the host `sbx run` client inherits, so the launch can scrub its terminal
+/// variables (WI 0141 §3). Like the `env_config` writer below this reads the
+/// real process environment on purpose — never the daemon overlay — because
+/// it describes exactly what a spawned child would inherit.
+pub(super) fn process_env() -> Vec<(String, String)> {
+    std::env::vars_os()
+        .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().unwrap_or_default())))
+        .collect()
+}
+
 pub(super) struct DSbxSessionConfig;
 
 impl DSbxSessionConfig {
+    /// The notice for host-terminal variables the options asked for that are
+    /// not written to `session.json`, or `None`.
+    pub(super) fn host_terminal_notice(options: &ResolvedSandboxOptions) -> Option<String> {
+        let mut requested: Vec<(String, String)> = options
+            .env_passthrough
+            .iter()
+            .map(|v| (v.0.clone(), String::new()))
+            .collect();
+        requested.extend(
+            options
+                .env_literal
+                .iter()
+                .map(|l| (l.key.clone(), String::new())),
+        );
+        scrub_run_env(requested, None).notice()
+    }
+
     /// Build the `session.json` value for the given resolved options. Pure —
     /// no filesystem access — so it is trivially testable and so the
     /// credential-exclusion invariant can be asserted directly.
@@ -92,20 +121,27 @@ impl DSbxSessionConfig {
         // from a daemon — but that is an admission check in an unrelated module,
         // and this file must not depend on it. This process's own environment is
         // the only correct source for a writer like this one.
-        let mut env_config = Map::new();
+        let mut env_pairs: Vec<(String, String)> = Vec::new();
         for envvar in &options.env_passthrough {
             if is_credential_like(&envvar.0) {
                 continue;
             }
             if let Ok(value) = std::env::var(&envvar.0) {
-                env_config.insert(envvar.0.clone(), json!(value));
+                env_pairs.push((envvar.0.clone(), value));
             }
         }
         for lit in &options.env_literal {
             if is_credential_like(&lit.key) {
                 continue;
             }
-            env_config.insert(lit.key.clone(), json!(lit.value));
+            env_pairs.push((lit.key.clone(), lit.value.clone()));
+        }
+        // The one host-terminal scrub for this backend (WI 0141 §3).
+        let mut env_config = Map::new();
+        for (key, value) in
+            scrub_run_env(env_pairs, std::env::var("COLORTERM").ok().as_deref()).kept
+        {
+            env_config.insert(key, json!(value));
         }
         root.insert("env_config".into(), Value::Object(env_config));
 
@@ -161,6 +197,38 @@ mod tests {
             DSbxSessionConfig::build_value(&resolve(vec![SandboxOption::AgentId("claude".into())]));
         assert_eq!(v["schema_version"], json!(1));
         assert_eq!(v["agent"], json!("claude"));
+    }
+
+    #[test]
+    fn host_terminal_vars_never_reach_env_config_and_term_is_normalised() {
+        let mut opts = Vec::new();
+        for key in [
+            "TMUX",
+            "REX_PANE",
+            "TERM_PROGRAM",
+            "ZELLIJ_SESSION_NAME",
+            "TERM",
+        ] {
+            opts.push(SandboxOption::EnvLiteral(EnvLiteral {
+                key: key.into(),
+                value: "xterm-rex".into(),
+            }));
+        }
+        opts.push(SandboxOption::EnvLiteral(EnvLiteral {
+            key: "KEEP_ME".into(),
+            value: "1".into(),
+        }));
+        let o = resolve(opts);
+        let v = DSbxSessionConfig::build_value(&o);
+        let env = v["env_config"].as_object().unwrap();
+        for key in ["TMUX", "REX_PANE", "TERM_PROGRAM", "ZELLIJ_SESSION_NAME"] {
+            assert!(env.get(key).is_none(), "{key} must be dropped");
+        }
+        assert_eq!(env["TERM"], json!("xterm-256color"));
+        assert_eq!(env["KEEP_ME"], json!("1"));
+        assert!(DSbxSessionConfig::host_terminal_notice(&o)
+            .unwrap()
+            .contains("TMUX"));
     }
 
     #[test]

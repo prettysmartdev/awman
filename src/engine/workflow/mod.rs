@@ -19,6 +19,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::data::config::effective::EffectiveConfig;
 use crate::data::execution_event::{EventSource, EventSourcePhase};
+use crate::data::program_status::EffectiveStatus;
 use crate::data::prompt::Prompt;
 use crate::data::session::{AgentHandle, AgentName, Session};
 use crate::data::workflow_dag::WorkflowDag;
@@ -51,6 +52,7 @@ pub mod frontend;
 pub mod poll_ci;
 pub mod prerequisite_grants;
 pub mod prerequisites;
+pub mod program_status;
 pub mod step_commands;
 pub mod timing;
 
@@ -79,6 +81,9 @@ enum MidStepYoloResult<T = StepOutcome> {
     ShowControlBoard,
     /// Container recovered (StepUnstuck received).
     Recovered,
+    /// The agent sent an OSC 7501 report during a silence countdown (WI
+    /// 0141). The countdown is over; the caller handles the report.
+    Reported(Option<EffectiveStatus>),
 }
 
 /// Result of mid-step control board interaction.
@@ -226,6 +231,25 @@ struct ActiveParallelStep {
     stuck: bool,
     /// When a per-step yolo countdown is running, the instant it expires.
     yolo_deadline: Option<Instant>,
+    /// What the running countdown (`yolo_deadline`) is for: silence
+    /// (`StuckStep`) or an OSC 7501 report (`AgentDone` / `AgentBlocked` /
+    /// `AgentError`). Meaningless while `yolo_deadline` is `None`.
+    countdown_kind: CountdownKind,
+    /// Watches for output during a parallel `AgentError` countdown.
+    output_watch: Option<program_status::OutputWatch>,
+    /// The agent's latest OSC 7501 status (WI 0141), shown on boards opened
+    /// for this step. `None` before any report or after a clear.
+    last_report: Option<EffectiveStatus>,
+    /// Set while the agent's latest report is a problem (`blocked`/`error`);
+    /// cleared by `working`, `done`, `idle` or a clear (output during an
+    /// `AgentError` countdown only cancels the countdown). A step whose container ends while this is
+    /// set is Failed with the agent's message, whatever its exit code.
+    reported_problem: Option<EffectiveStatus>,
+    /// The execution's OSC 7501 tracker, kept so the final status can be
+    /// read when the container exits even after the execution moved into
+    /// its wait future (a report queued or still debounced at exit counts).
+    program_status:
+        Option<crate::engine::agent_runtime::program_status::SharedProgramStatusTracker>,
     agent: AgentName,
     model: Option<String>,
     /// Which launch of this step the slot belongs to. The parallel path

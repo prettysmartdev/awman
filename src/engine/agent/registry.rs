@@ -178,7 +178,7 @@ impl AgentRegistry {
                     return Err(EngineError::AgentDefinitionInvalid {
                         path,
                         problems: vec![format!("{e} [scope: {}]", scope.as_str())],
-                    })
+                    });
                 }
                 Ok(_) => {}
             }
@@ -435,7 +435,14 @@ mod custom_tests {
         (temp, env, home, root)
     }
     fn source(ping: bool) -> String {
-        format!("schema=1\ndisplay_name='Pi'\n[run]\ncommand=['pi']\n{}[image]\ninstall=['install pi']\n", if ping { "[ping]\ncommand=['pi','-p']\n" } else { "" })
+        format!(
+            "schema=1\ndisplay_name='Pi'\n[run]\ncommand=['pi']\n{}[image]\ninstall=['install pi']\n",
+            if ping {
+                "[ping]\ncommand=['pi','-p']\n"
+            } else {
+                ""
+            }
+        )
     }
 
     #[test]

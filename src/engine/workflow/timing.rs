@@ -23,3 +23,19 @@ pub fn yolo_countdown_duration() -> Duration {
 /// sink for CLI and API frontends.  The TUI dialog renders every tick;
 /// CLI/API only emit once per this interval to avoid noise.
 pub const YOLO_SINK_THROTTLE_INTERVAL: Duration = Duration::from_secs(10);
+
+/// How long a step waits after its agent reports `done`/`idle` over OSC 7501
+/// before the engine kills the container and advances (WI 0141,
+/// `CountdownKind::AgentDone`). Short on purpose: the agent has said it is
+/// finished, so this is only a window for the user to object.
+pub const AGENT_DONE_COUNTDOWN_DURATION: Duration = Duration::from_secs(10);
+
+/// The `AgentDone` countdown: [`AGENT_DONE_COUNTDOWN_DURATION`], unless
+/// `AWMAN_TEST_ISOLATION` is on and `AWMAN_TEST_AGENT_DONE_COUNTDOWN_MS` names
+/// a shorter one (see `EnvSnapshot::test_agent_done_countdown`). The
+/// `AgentBlocked` and `AgentError` countdowns use [`yolo_countdown_duration`].
+pub fn agent_done_countdown_duration() -> Duration {
+    crate::data::config::env::Env::from_process()
+        .test_agent_done_countdown()
+        .unwrap_or(AGENT_DONE_COUNTDOWN_DURATION)
+}

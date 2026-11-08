@@ -17,6 +17,7 @@ use crate::engine::container::options::{
 /// variant and a single branch in `ResolvedSandboxOptions::ingest`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SandboxOption {
+    ProgramStatus(crate::engine::agent_runtime::program_status::ProgramStatusBridgeConfig),
     /// Kit selector — which agent kit/template the sandbox boots.
     AgentId(String),
     EntrypointOverride(Entrypoint),
@@ -89,6 +90,7 @@ pub enum SandboxOption {
 /// sandbox backend consumes.
 #[derive(Debug, Clone, Default)]
 pub struct ResolvedSandboxOptions {
+    pub program_status: crate::engine::agent_runtime::program_status::ProgramStatusBridgeConfig,
     /// Kit selector.
     pub agent_id: String,
     pub entrypoint_override: Option<Entrypoint>,
@@ -163,6 +165,7 @@ impl ResolvedSandboxOptions {
 
     fn ingest(&mut self, opt: SandboxOption) {
         match opt {
+            SandboxOption::ProgramStatus(config) => self.program_status = config,
             SandboxOption::AgentId(v) => self.agent_id = v,
             SandboxOption::EntrypointOverride(v) => self.entrypoint_override = Some(v),
             SandboxOption::WorkspaceDir(v) => self.workspace_dir = v,

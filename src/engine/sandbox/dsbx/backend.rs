@@ -215,6 +215,9 @@ pub(in crate::engine::sandbox) fn run_interactive(
 
     // 1. Per-launch session config (no credential values).
     DSbxSessionConfig::write_for(&options, &options.workspace_dir)?;
+    if let Some(notice) = DSbxSessionConfig::host_terminal_notice(&options) {
+        warn(&mut *frontend, notice);
+    }
 
     // 2. Surface unsupported / withheld options.
     if options.cpu_limit.is_some() {
@@ -338,6 +341,10 @@ pub(in crate::engine::sandbox) fn run_interactive(
         &format!("{SBX_BIN} {}", argv.join(" ")),
     );
 
+    frontend = crate::engine::agent_runtime::execution::with_program_status_frontend(
+        frontend,
+        options.program_status,
+    );
     let io = frontend.take_io();
     let seed = stdin_seed(&agent, &options);
     if io.initial_size.is_some() {
@@ -495,6 +502,13 @@ fn spawn_pty_bridged(
     for arg in &argv {
         cmd.arg(arg);
     }
+    let (remove, set) = agent_client_env(super::session_config::process_env());
+    for name in remove {
+        cmd.env_remove(name);
+    }
+    for (name, value) in set {
+        cmd.env(name, value);
+    }
     let child = pair
         .slave
         .spawn_command(cmd)
@@ -508,7 +522,12 @@ fn spawn_pty_bridged(
         let _ = io.stdin_tx.send(b"\r".to_vec());
     }
 
-    let (master_arc, bridge) = io_bridge::bridge_pty(io, pair)?;
+    let (master_arc, bridge) = io_bridge::bridge_pty(
+        io,
+        pair,
+        frontend.program_status_config(),
+        frontend.terminal_launch(),
+    )?;
 
     let backend = DSbxExecution {
         child: None,
@@ -523,12 +542,34 @@ fn spawn_pty_bridged(
     };
     // Sandbox-class runtimes have no container output tail; failure-log capture
     // is a container-paradigm feature.
-    Ok(AgentExecution::new(
-        handle,
-        Box::new(backend),
-        bridge.stuck_tx,
-        None,
-    ))
+    Ok(
+        AgentExecution::new(handle, Box::new(backend), bridge.stuck_tx, None)
+            .with_program_status(bridge.program_status),
+    )
+}
+
+/// WI 0141 §3: the environment of the host `sbx run` client through which
+/// the agent's session starts — the process whose terminal environment the
+/// session inherits. Host-terminal variables are removed and `TERM` (plus
+/// `COLORTERM` only when the host set it) is normalised, so the sandbox
+/// agent never sees the host's terminal identity. Returns `(remove, set)`.
+fn agent_client_env(
+    host: impl IntoIterator<Item = (String, String)>,
+) -> (Vec<String>, Vec<(String, String)>) {
+    use crate::engine::container::host_env_denylist::{
+        container_terminal_env, is_host_terminal_var,
+    };
+    let mut remove = Vec::new();
+    let mut colorterm = None;
+    for (name, value) in host {
+        if name == "COLORTERM" {
+            colorterm = Some(value);
+            remove.push(name);
+        } else if is_host_terminal_var(&name) {
+            remove.push(name);
+        }
+    }
+    (remove, container_terminal_env(colorterm.as_deref()))
 }
 
 fn spawn_piped(
@@ -544,6 +585,11 @@ fn spawn_piped(
 
     let mut cmd = Command::new(crate::engine::host_cli::program(SBX_BIN));
     cmd.args(&argv);
+    let (remove, set) = agent_client_env(super::session_config::process_env());
+    for name in remove {
+        cmd.env_remove(name);
+    }
+    cmd.envs(set);
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
@@ -566,7 +612,7 @@ fn spawn_piped(
         let _ = io.stdin_tx.send(b"\n".to_vec());
     }
 
-    let bridge = io_bridge::bridge_piped(io, &mut child);
+    let bridge = io_bridge::bridge_piped(io, &mut child, frontend.program_status_config());
     // Drop the injector so the writer task closes the child's stdin after the
     // seeded prompt drains (matches the container piped path).
     drop(bridge.stdin_injector);
@@ -582,12 +628,10 @@ fn spawn_piped(
         sink: Some(frontend),
         wait_sink: None,
     };
-    Ok(AgentExecution::new(
-        handle,
-        Box::new(backend),
-        bridge.stuck_tx,
-        None,
-    ))
+    Ok(
+        AgentExecution::new(handle, Box::new(backend), bridge.stuck_tx, None)
+            .with_program_status(bridge.program_status),
+    )
 }
 
 // ─── Execution backend ──────────────────────────────────────────────────────
@@ -1022,6 +1066,39 @@ mod tests {
             argv.last().unwrap(),
             "claude",
             "no workspace set → agent is the final arg (sbx defaults to cwd): {argv:?}"
+        );
+    }
+
+    #[test]
+    fn agent_client_env_drops_host_terminal_vars_and_normalises_term() {
+        let host = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect::<Vec<_>>()
+        };
+        let (remove, set) = agent_client_env(host(&[
+            ("TERM", "xterm-kitty"),
+            ("TMUX", "/tmp/s"),
+            ("KITTY_WINDOW_ID", "1"),
+            ("COLORTERM", "24bit"),
+            ("HOME", "/home/me"),
+        ]));
+        for name in ["TMUX", "KITTY_WINDOW_ID", "COLORTERM"] {
+            assert!(remove.contains(&name.to_string()), "{name}: {remove:?}");
+        }
+        assert!(!remove.contains(&"HOME".to_string()));
+        assert_eq!(
+            set,
+            vec![
+                ("TERM".to_string(), "xterm-256color".to_string()),
+                ("COLORTERM".to_string(), "truecolor".to_string()),
+            ]
+        );
+        let (_, set) = agent_client_env(host(&[("TERM", "screen")]));
+        assert_eq!(
+            set,
+            vec![("TERM".to_string(), "xterm-256color".to_string())]
         );
     }
 

@@ -363,8 +363,14 @@ fn summary(handle: &microsandbox::sandbox::SandboxHandle) -> Result<SandboxSumma
         stopped,
     })
 }
-struct ControlSender(tokio::sync::mpsc::UnboundedSender<Control>);
+struct ControlSender(
+    tokio::sync::mpsc::UnboundedSender<Control>,
+    tokio::sync::mpsc::Sender<Vec<u8>>,
+);
 impl ExecControl for ControlSender {
+    fn terminal_stdin(&self) -> Option<tokio::sync::mpsc::Sender<Vec<u8>>> {
+        Some(self.1.clone())
+    }
     fn send(&self, command: Control) -> Result<(), EngineError> {
         self.0
             .send(command)
@@ -538,8 +544,9 @@ impl SandboxDriver for MsbDriver {
             }
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
             let (events, receiver) = tokio::sync::broadcast::channel(4096);
-            let control = Arc::new(ControlSender(tx));
-            tokio::spawn(pump(exec, rx, events.clone(), sandbox));
+            let (terminal_stdin, terminal_input) = crate::engine::terminal_hub::input_channel();
+            let control = Arc::new(ControlSender(tx, terminal_stdin));
+            tokio::spawn(pump(exec, rx, events.clone(), sandbox, terminal_input));
             Ok(ExecSession {
                 events: receiver,
                 broadcast: events,
@@ -818,12 +825,16 @@ async fn pump(
     mut commands: tokio::sync::mpsc::UnboundedReceiver<Control>,
     events: tokio::sync::broadcast::Sender<ExecEvent>,
     _sandbox: Sandbox,
+    mut terminal_input: tokio::sync::mpsc::Receiver<Vec<u8>>,
 ) {
     use microsandbox::sandbox::exec::ExecEvent as M;
     let mut stdin = exec.take_stdin();
     let mut controls_open = true;
     loop {
         tokio::select! {
+            Some(bytes) = terminal_input.recv() => {
+                if let Some(input) = &stdin { let _ = input.write(bytes).await; }
+            }
             event=exec.recv()=> {
                 let (event,finished)=match event {
                     Some(M::Started{..})=>continue,

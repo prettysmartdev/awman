@@ -11,6 +11,7 @@
 //! reporting, or container-frontend hooks.
 
 pub(crate) mod agents;
+mod attach;
 pub(crate) mod helpers;
 pub(crate) mod render;
 

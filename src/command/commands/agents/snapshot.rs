@@ -7,6 +7,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::command::error::CommandError;
+use crate::data::program_status::{EffectiveStatus, ProgramState};
 use crate::data::session::AgentHandle;
 use crate::engine::agent_runtime::AgentRuntimeEngine;
 
@@ -27,8 +28,16 @@ const SHORT_ID_LEN: usize = 12;
 #[serde(rename_all = "lowercase")]
 pub enum AgentState {
     Running,
-    /// Running, but the owning TUI tab reports it silent for too long.
+    /// Running, but the owning TUI tab reports it silent for too long. Only
+    /// ever applied to agents that do not report their own status (OSC 7501).
     Stuck,
+    /// The agent reported `blocked` (permission, question or auth): it needs
+    /// the user.
+    Waiting,
+    /// The agent reported `error`.
+    Errored,
+    /// The agent reported `done` (or `idle`: its turn has ended).
+    Done,
     /// Stopped but still present in the runtime (`agents ls --all`).
     Stopped,
 }
@@ -39,6 +48,9 @@ impl AgentState {
         match self {
             Self::Running => "●",
             Self::Stuck => "▲",
+            Self::Waiting => "◆",
+            Self::Errored => "✗",
+            Self::Done => "✓",
             Self::Stopped => "○",
         }
     }
@@ -47,16 +59,22 @@ impl AgentState {
         match self {
             AgentState::Running => "running",
             AgentState::Stuck => "stuck",
+            AgentState::Waiting => "waiting",
+            AgentState::Errored => "errored",
+            AgentState::Done => "done",
             AgentState::Stopped => "stopped",
         }
     }
 
-    /// Display order: stuck agents need attention first.
+    /// Display order: agents that need attention first (waiting and errored
+    /// agents, then stuck ones), then the rest.
     fn sort_rank(&self) -> u8 {
         match self {
-            AgentState::Stuck => 0,
-            AgentState::Running => 1,
-            AgentState::Stopped => 2,
+            AgentState::Waiting | AgentState::Errored => 0,
+            AgentState::Stuck => 1,
+            AgentState::Running => 2,
+            AgentState::Done => 3,
+            AgentState::Stopped => 4,
         }
     }
 }
@@ -113,6 +131,13 @@ pub struct AgentSnapshot {
     /// `None` when the runtime does not measure stats or the lookup failed.
     pub cpu_percent: Option<f64>,
     pub memory_mb: Option<f64>,
+    /// The `blocked` kind (`permission`, `question`, `auth`) the agent
+    /// reported, when it is waiting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// The agent's own one-line message (already sanitised; untrusted text).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub msg: Option<String>,
 }
 
 impl AgentSnapshot {
@@ -131,6 +156,8 @@ impl AgentSnapshot {
             command_label: None,
             cpu_percent: None,
             memory_mb: None,
+            kind: None,
+            msg: None,
         }
     }
 
@@ -142,8 +169,38 @@ impl AgentSnapshot {
         };
         self.tab_number = Some(tab.tab_number);
         self.command_label = Some(tab.command_label.clone());
-        if tab.is_stuck && self.state == AgentState::Running {
-            self.state = AgentState::Stuck;
+        if self.state != AgentState::Running {
+            return;
+        }
+        match &tab.program_status {
+            // A reporting agent is judged on its report, never on silence.
+            Some(status) => self.apply_program_status(status),
+            None if tab.is_stuck => self.state = AgentState::Stuck,
+            None => {}
+        }
+    }
+
+    /// Present an agent's reported status: the state, plus the blocked kind
+    /// and the agent's message for the JSON output and the STATUS column.
+    fn apply_program_status(&mut self, status: &EffectiveStatus) {
+        self.state = match status.state {
+            ProgramState::Blocked => AgentState::Waiting,
+            ProgramState::Error => AgentState::Errored,
+            ProgramState::Done | ProgramState::Idle => AgentState::Done,
+            ProgramState::Working => AgentState::Running,
+        };
+        self.kind = match status.state {
+            ProgramState::Blocked => status.kind.map(|k| k.as_str().to_string()),
+            _ => None,
+        };
+        self.msg = status.msg.clone();
+    }
+
+    /// The STATUS column text: `running`, or e.g. `waiting (permission)`.
+    pub fn status_cell(&self) -> String {
+        match &self.kind {
+            Some(kind) => format!("{} ({kind})", self.state.label()),
+            None => self.state.label().to_string(),
         }
     }
 
@@ -195,7 +252,7 @@ impl AgentSnapshot {
             },
             self.name.clone(),
             self.image.clone(),
-            self.state.label().to_string(),
+            self.status_cell(),
             self.uptime_cell(),
             self.source_cell(),
         ]
@@ -207,6 +264,15 @@ impl AgentSnapshot {
 pub struct AgentTotals {
     pub running: usize,
     pub stuck: usize,
+    /// Agents that reported `blocked`.
+    #[serde(default)]
+    pub waiting: usize,
+    /// Agents that reported `error`.
+    #[serde(default)]
+    pub errored: usize,
+    /// Agents that reported `done`.
+    #[serde(default)]
+    pub done: usize,
     pub stopped: usize,
     /// `None` when no row reported a value.
     pub cpu_percent: Option<f64>,
@@ -220,6 +286,9 @@ impl AgentTotals {
             match agent.state {
                 AgentState::Running => totals.running += 1,
                 AgentState::Stuck => totals.stuck += 1,
+                AgentState::Waiting => totals.waiting += 1,
+                AgentState::Errored => totals.errored += 1,
+                AgentState::Done => totals.done += 1,
                 AgentState::Stopped => totals.stopped += 1,
             }
             if let Some(cpu) = agent.cpu_percent {
@@ -269,6 +338,12 @@ impl AgentsOverview {
             "available".to_string(),
             format!("{} running", self.totals.running),
         ];
+        if self.totals.waiting > 0 {
+            parts.push(format!("{} waiting", self.totals.waiting));
+        }
+        if self.totals.errored > 0 {
+            parts.push(format!("{} errored", self.totals.errored));
+        }
         if self.totals.stuck > 0 {
             parts.push(format!("{} stuck", self.totals.stuck));
         }
@@ -325,6 +400,9 @@ pub struct TuiTabSnapshot {
     pub tab_number: u32,
     pub container_name: Option<String>,
     pub is_stuck: bool,
+    /// The tab's agent-reported status (OSC 7501), when it reports one. A
+    /// reporting agent is never `Stuck`.
+    pub program_status: Option<EffectiveStatus>,
     pub command_label: String,
 }
 
@@ -469,6 +547,7 @@ mod tests {
             tab_number: 1,
             container_name: Some("awman-abc".into()),
             is_stuck: false,
+            program_status: None,
             command_label: "chat".into(),
         }]);
         assert_eq!(ctx.tabs.len(), 1);
@@ -500,6 +579,7 @@ mod tests {
             tab_number: n,
             container_name: Some(container.to_string()),
             is_stuck: stuck,
+            program_status: None,
             command_label: label.to_string(),
         }
     }
@@ -692,5 +772,154 @@ mod tests {
         assert_eq!(humanize_uptime(252), "4m12s");
         assert_eq!(humanize_uptime(2 * 3600 + 3 * 60 + 9), "2h03m");
         assert_eq!(humanize_uptime(3 * 86400 + 3600), "3d01h");
+    }
+
+    // ── Agent-reported status (OSC 7501) ────────────────────────────────
+
+    fn reported_tab(
+        n: u32,
+        container: &str,
+        state: ProgramState,
+        kind: Option<crate::data::program_status::BlockedKind>,
+        msg: &str,
+        stuck: bool,
+    ) -> TuiTabSnapshot {
+        TuiTabSnapshot {
+            tab_number: n,
+            container_name: Some(container.to_string()),
+            is_stuck: stuck,
+            program_status: Some(EffectiveStatus {
+                state,
+                kind,
+                progress: None,
+                msg: Some(msg.to_string()),
+                app: None,
+                id: None,
+            }),
+            command_label: "chat".to_string(),
+        }
+    }
+
+    #[test]
+    fn reported_states_map_to_waiting_errored_done_and_running() {
+        use crate::data::program_status::BlockedKind;
+        let runtime = FakeRuntime::new().with_running(vec![
+            handle("a1", "awman-wait", 10),
+            handle("b2", "awman-err", 10),
+            handle("c3", "awman-done", 10),
+            handle("d4", "awman-work", 10),
+            handle("e5", "awman-plain", 10),
+        ]);
+        let tui = AgentsTuiContext::new(vec![
+            reported_tab(
+                1,
+                "awman-wait",
+                ProgramState::Blocked,
+                Some(BlockedKind::Permission),
+                "allow rm?",
+                false,
+            ),
+            reported_tab(2, "awman-err", ProgramState::Error, None, "boom", false),
+            reported_tab(3, "awman-done", ProgramState::Done, None, "ok", false),
+            // A reporting agent is never Stuck, even with a stale silence flag.
+            reported_tab(4, "awman-work", ProgramState::Working, None, "", true),
+        ]);
+        let o = collect_overview(&runtime, Some(&tui), OPTS, "").unwrap();
+        let get = |n: &str| o.agents.iter().find(|a| a.name == n).unwrap();
+        assert_eq!(get("awman-wait").state, AgentState::Waiting);
+        assert_eq!(get("awman-wait").kind.as_deref(), Some("permission"));
+        assert_eq!(get("awman-wait").msg.as_deref(), Some("allow rm?"));
+        assert_eq!(get("awman-wait").status_cell(), "waiting (permission)");
+        assert_eq!(get("awman-err").state, AgentState::Errored);
+        assert_eq!(get("awman-err").kind, None);
+        assert_eq!(get("awman-done").state, AgentState::Done);
+        assert_eq!(get("awman-work").state, AgentState::Running);
+        assert_eq!(get("awman-plain").state, AgentState::Running);
+        assert_eq!(o.totals.waiting, 1);
+        assert_eq!(o.totals.errored, 1);
+        assert_eq!(o.totals.done, 1);
+        assert_eq!(o.totals.stuck, 0);
+        assert_eq!(o.totals.running, 2);
+        assert!(o.header_line().contains("1 waiting"));
+        assert!(o.header_line().contains("1 errored"));
+    }
+
+    #[test]
+    fn glyphs_and_labels_for_reported_states() {
+        assert_eq!(AgentState::Waiting.glyph(), "◆");
+        assert_eq!(AgentState::Errored.glyph(), "✗");
+        assert_eq!(AgentState::Done.glyph(), "✓");
+        assert_eq!(AgentState::Waiting.label(), "waiting");
+        assert_eq!(AgentState::Errored.label(), "errored");
+        assert_eq!(AgentState::Done.label(), "done");
+    }
+
+    #[test]
+    fn waiting_and_errored_sort_first_then_stuck_then_running() {
+        use crate::data::program_status::BlockedKind;
+        let runtime = FakeRuntime::new().with_running(vec![
+            handle("a1", "awman-run", 900),
+            handle("b2", "awman-stuck", 5),
+            handle("c3", "awman-wait", 5),
+            handle("d4", "awman-err", 50),
+            handle("e5", "awman-done", 1000),
+        ]);
+        let tui = AgentsTuiContext::new(vec![
+            tab(1, "awman-stuck", true, "chat"),
+            reported_tab(
+                2,
+                "awman-wait",
+                ProgramState::Blocked,
+                Some(BlockedKind::Question),
+                "which?",
+                false,
+            ),
+            reported_tab(3, "awman-err", ProgramState::Error, None, "x", false),
+            reported_tab(4, "awman-done", ProgramState::Idle, None, "", false),
+        ]);
+        let o = collect_overview(&runtime, Some(&tui), OPTS, "").unwrap();
+        let names: Vec<&str> = o.agents.iter().map(|a| a.name.as_str()).collect();
+        // Waiting/errored share a rank and order by uptime; then stuck,
+        // running, and finished agents last of the live ones.
+        assert_eq!(
+            names,
+            [
+                "awman-err",
+                "awman-wait",
+                "awman-stuck",
+                "awman-run",
+                "awman-done"
+            ]
+        );
+    }
+
+    #[test]
+    fn json_carries_kind_and_msg_only_when_reported() {
+        use crate::data::program_status::BlockedKind;
+        let runtime = FakeRuntime::new().with_running(vec![
+            handle("a1", "awman-wait", 10),
+            handle("b2", "awman-plain", 10),
+        ]);
+        let tui = AgentsTuiContext::new(vec![reported_tab(
+            1,
+            "awman-wait",
+            ProgramState::Blocked,
+            Some(BlockedKind::Auth),
+            "log in",
+            false,
+        )]);
+        let o = collect_overview(&runtime, Some(&tui), OPTS, "").unwrap();
+        let json = serde_json::to_value(&o).unwrap();
+        let rows = json["agents"].as_array().unwrap();
+        let wait = rows.iter().find(|r| r["name"] == "awman-wait").unwrap();
+        assert_eq!(wait["state"], "waiting");
+        assert_eq!(wait["kind"], "auth");
+        assert_eq!(wait["msg"], "log in");
+        let plain = rows.iter().find(|r| r["name"] == "awman-plain").unwrap();
+        assert_eq!(plain["state"], "running");
+        assert!(plain.get("kind").is_none() && plain.get("msg").is_none());
+        // `agents ls` shows the same text in its STATUS column.
+        let list = o.agents.iter().find(|a| a.name == "awman-wait").unwrap();
+        assert_eq!(list.list_cells(false)[3], "waiting (auth)");
     }
 }

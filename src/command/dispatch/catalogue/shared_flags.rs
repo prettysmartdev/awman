@@ -288,6 +288,26 @@ pub enum SessionWorktreeTarget {
     Existing(String),
 }
 
+/// `--interactive`: run the agent in a PTY. It is already the CLI/TUI
+/// default; it exists so a request to the daemon's worker (`POST
+/// /v1/worker/commands`) can ask for a PTY over the push default of
+/// `headless`, where `daemon.features.worker.push.allowOverride` permits (WI
+/// 0141). Declared on `exec prompt` and `exec workflow` only (and so on their
+/// `remote exec` forms). The conflict is declared on this side alone: `chat`
+/// and `ready` share `--headless`'s spec and have no `--interactive`, and the
+/// conflict is symmetric in both clap and the raw-args projection.
+pub(super) const INTERACTIVE_FLAG: [FlagSpec; 1] = [FlagSpec {
+    long: "interactive",
+    short: None,
+    help: "Run the agent interactively in a terminal (PTY). Overrides a daemon worker's \
+           headless default where the worker allows it.",
+    kind: FlagKind::Bool,
+    default: FlagDefault::Bool(false),
+    frontends: FrontendVisibility::All,
+    conflicts_with: &["headless"],
+    implies: &[],
+    optional: true,
+}];
 /// Agent-run flags for `exec prompt` — extends the common flags with
 /// `--issue` and persistent session-worktree selectors.
 /// `--issue` remains exclusive to `exec prompt`.
@@ -314,12 +334,15 @@ pub(super) const CHAT_FLAGS: [FlagSpec;
     concat_flags(&[&AGENT_RUN_FLAGS_NO_WORKTREE, &SESSION_WORKTREE_FLAGS]);
 
 pub(super) const EXEC_PROMPT_FLAGS: [FlagSpec;
-    AGENT_RUN_FLAGS_NO_WORKTREE.len() + EXEC_PROMPT_EXTRA_FLAGS.len() + SESSION_WORKTREE_FLAGS.len()] =
-    concat_flags(&[
-        &AGENT_RUN_FLAGS_NO_WORKTREE,
-        &EXEC_PROMPT_EXTRA_FLAGS,
-        &SESSION_WORKTREE_FLAGS,
-    ]);
+    AGENT_RUN_FLAGS_NO_WORKTREE.len()
+        + EXEC_PROMPT_EXTRA_FLAGS.len()
+        + INTERACTIVE_FLAG.len()
+        + SESSION_WORKTREE_FLAGS.len()] = concat_flags(&[
+    &AGENT_RUN_FLAGS_NO_WORKTREE,
+    &EXEC_PROMPT_EXTRA_FLAGS,
+    &INTERACTIVE_FLAG,
+    &SESSION_WORKTREE_FLAGS,
+]);
 
 /// `--work-item`, which `exec workflow` lists before everything else.
 pub(super) const EXEC_WORKFLOW_LEADING_FLAGS: [FlagSpec; 1] = [FlagSpec {
@@ -504,9 +527,10 @@ pub(super) const CHECK_PREREQUISITES_FLAG: [FlagSpec; 1] = [FlagSpec {
 /// base run, so the base set is spliced rather than concatenated. The order is
 /// exactly what the literal had, because it is the order `--help` and the
 /// generated command reference print.
-pub(super) const EXEC_WORKFLOW_FLAGS: [FlagSpec; 23] = concat_flags(&[
+pub(super) const EXEC_WORKFLOW_FLAGS: [FlagSpec; 24] = concat_flags(&[
     &EXEC_WORKFLOW_LEADING_FLAGS,
     AGENT_RUN_BEFORE_WORKTREE,
+    &INTERACTIVE_FLAG,
     &EXEC_WORKFLOW_WORKTREE_FLAG,
     AGENT_RUN_AFTER_WORKTREE,
     &EXEC_WORKFLOW_TRAILING_FLAGS,

@@ -138,10 +138,15 @@ pub fn custom_build_failure(def: &AgentDefinition, error: impl std::fmt::Display
     match (&def.origin, &def.image) {
         (AgentOrigin::Custom { path, .. }, AgentImageSource::Rendered { spec }) => {
             format!(
-            "{error}\nCheck [image] in {}: smoke binary '{}' must be on PATH. Install steps:\n{}",
-            path.display(), spec.binary,
-            spec.install.iter().map(|s| format!("  {s}")).collect::<Vec<_>>().join("\n")
-        )
+                "{error}\nCheck [image] in {}: smoke binary '{}' must be on PATH. Install steps:\n{}",
+                path.display(),
+                spec.binary,
+                spec.install
+                    .iter()
+                    .map(|s| format!("  {s}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
         }
         _ => error.to_string(),
     }
@@ -616,6 +621,10 @@ impl AgentEngine {
         };
 
         let mut options = vec![
+            ContainerOption::AgentIdentity {
+                agent: agent.as_str().to_owned(),
+                model: run.model.clone(),
+            },
             ContainerOption::Image(image),
             ContainerOption::Entrypoint(entrypoint),
             ContainerOption::Interactive(!run.non_interactive),
@@ -639,6 +648,13 @@ impl AgentEngine {
         {
             options.push(ContainerOption::AgentOutputFormat(def.output_format));
         }
+
+        options.push(ContainerOption::ProgramStatus(
+            crate::engine::agent_runtime::program_status::ProgramStatusBridgeConfig {
+                enabled: session.effective_config().program_status_enabled(),
+                answer_queries: false,
+            },
+        ));
 
         // Mode flags.
         if let Some(y) = run.yolo {
@@ -941,6 +957,12 @@ impl AgentEngine {
             SandboxOption::AgentId(agent.as_str().to_string()),
             SandboxOption::WorkspaceDir(session.git_root().to_path_buf()),
             SandboxOption::Interactive(!run.non_interactive),
+            SandboxOption::ProgramStatus(
+                crate::engine::agent_runtime::program_status::ProgramStatusBridgeConfig {
+                    enabled: session.effective_config().program_status_enabled(),
+                    answer_queries: false,
+                },
+            ),
         ];
 
         // Seeded prompt — recorded in session.json exactly once. For `kind: agent`

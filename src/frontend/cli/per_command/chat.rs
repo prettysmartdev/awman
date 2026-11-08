@@ -40,6 +40,45 @@ impl crate::command::commands::agent_setup::AgentLaunchFrontend for CliFrontend 
             self.unbind_container_stdio();
         }
     }
+
+    /// `chat` and `exec prompt`: print one status line per state change the
+    /// agent reports (OSC 7501), through the same stderr sink as every other
+    /// CLI message (held back while a PTY owns the terminal). Reports still
+    /// pass through to the user's own terminal unchanged.
+    fn set_stuck_sender(
+        &mut self,
+        sender: std::sync::Arc<
+            tokio::sync::broadcast::Sender<crate::engine::agent_runtime::StuckEvent>,
+        >,
+    ) {
+        if self.is_json_mode() || tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        let mut rx = sender.subscribe();
+        let sink = self.messages.handle();
+        tokio::spawn(async move {
+            use crate::data::message::{MessageLevel, UserMessage};
+            use crate::data::program_status::ProgramState;
+            use crate::engine::agent_runtime::StuckEvent;
+            let mut gate = crate::frontend::program_status_text::StatusLineGate::default();
+            loop {
+                match rx.recv().await {
+                    Ok(StuckEvent::Reported(status)) => {
+                        if let Some(text) = gate.line_for(status.as_ref()) {
+                            let level = match status.map(|s| s.state) {
+                                Some(ProgramState::Error) => MessageLevel::Error,
+                                Some(ProgramState::Blocked) => MessageLevel::Warning,
+                                _ => MessageLevel::Info,
+                            };
+                            sink.write_message(UserMessage { level, text });
+                        }
+                    }
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+    }
 }
 
 /// One `AgentImageFrontend` for the CLI: `ReadyFrontend` and `InitFrontend`

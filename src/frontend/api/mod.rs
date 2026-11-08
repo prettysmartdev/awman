@@ -5,6 +5,7 @@ pub mod error;
 pub mod local;
 pub mod outputs;
 pub mod routes;
+pub mod terminals;
 pub mod workflow_view;
 
 use crate::command::commands::api_server::queue_worker::ApiCommandFrontendFactory;
@@ -22,6 +23,7 @@ impl ApiCommandFrontendFactory for ApiFrontendFactory {
         command: &crate::data::fs::api_db::CommandRecord,
         event_bus: crate::command::commands::api_server::event_bus::EventBusSender,
         state_writer: CommandStateWriter,
+        interaction: crate::command::interaction::InteractionDecision,
     ) -> Self::Frontend {
         let args: Vec<String> = serde_json::from_str(&command.args).unwrap_or_default();
         command_frontend::ApiDispatchFrontend::for_frontend(
@@ -37,17 +39,7 @@ impl ApiCommandFrontendFactory for ApiFrontendFactory {
                 },
             },
         )
-        .with_interaction(
-            if args
-                .iter()
-                .take_while(|s| s.as_str() != "--")
-                .any(|s| s == "--headless=false")
-            {
-                crate::data::config::daemon::Interaction::Interactive
-            } else {
-                crate::data::config::daemon::Interaction::Headless
-            },
-        )
+        .with_interaction(interaction)
         .with_state_writer(state_writer)
         .deferring_done()
     }

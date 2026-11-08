@@ -25,6 +25,7 @@ fn install_overflowing_overview(app: &mut App) {
     use crate::frontend::tui::workflow_view::horizontal_layout;
     app.active_tab().shared.workflow.update_view(|view| {
         *view = Some(WorkflowViewState {
+            reported: Default::default(),
             steps: (0..14)
                 .map(|i| WorkflowStepView {
                     name: format!("stage-{i}"),

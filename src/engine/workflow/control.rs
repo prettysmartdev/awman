@@ -34,6 +34,15 @@ impl WorkflowEngine {
             detail_lines.push(format!("Container terminated by signal {sig}"));
         }
         detail_lines.push(format!("Exit code: {exit_code}"));
+        // A step failed on its agent's own report (WI 0141) carries the
+        // reason the agent gave; it explains a 0 or 137 exit code.
+        if let Some(StepState::Failed {
+            error_message: Some(reason),
+            ..
+        }) = self.state.status_of(step_name)
+        {
+            detail_lines.push(format!("Reason: {reason}"));
+        }
         if let Some(e) = &exit {
             let secs = e
                 .ended_at
@@ -323,6 +332,22 @@ impl WorkflowEngine {
         )>,
     ) -> Result<MidStepOutcome, EngineError> {
         let available = self.compute_available_actions()?;
+        self.handle_mid_step_board_with(step_name, cancel_handle, wait_rx, available)
+    }
+
+    /// [`Self::handle_mid_step_control_board`] with the board's actions
+    /// supplied by the caller — a board opened because the agent reported
+    /// `done`/`blocked`/`error` carries the report (WI 0141).
+    pub(super) fn handle_mid_step_board_with(
+        &mut self,
+        step_name: &str,
+        cancel_handle: &Option<crate::engine::agent_runtime::execution::CancelHandle>,
+        wait_rx: &mut tokio::sync::oneshot::Receiver<(
+            AgentExecution,
+            Result<AgentExitInfo, EngineError>,
+        )>,
+        available: AvailableActions,
+    ) -> Result<MidStepOutcome, EngineError> {
         let action = self
             .frontend
             .show_workflow_control_board(&self.state, &available)?;
@@ -680,6 +705,10 @@ impl WorkflowEngine {
             .first()
             .map(|slot| slot.step_name.clone())
             .or_else(|| self.running_step_name());
+        a.reported_status = self
+            .active_steps
+            .first()
+            .and_then(|s| s.last_report.clone());
         a.simple_advance = self.simple_advance(&a);
         Ok(a)
     }

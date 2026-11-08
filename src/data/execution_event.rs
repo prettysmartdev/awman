@@ -428,6 +428,51 @@ pub enum EventPayload {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         result: Option<Box<CommandResult>>,
     },
+    /// The agent's effective OSC 7501 status changed (WI 0141). Values use
+    /// the spec spellings; the step it belongs to is the envelope's `source`.
+    ProgramStatus {
+        state: crate::data::program_status::ProgramState,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<crate::data::program_status::BlockedKind>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        progress: Option<u8>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        msg: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        app: Option<String>,
+    },
+    /// A PTY-bridged container registered a hub terminal (WI 0141). Step,
+    /// phase, container and attempt come from the envelope's `source`.
+    TerminalOpened {
+        terminal_id: crate::data::ids::TerminalId,
+        agent: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        cols: u16,
+        rows: u16,
+    },
+    /// The terminal's PTY exited (WI 0141).
+    TerminalClosed {
+        terminal_id: crate::data::ids::TerminalId,
+        exit_code: i32,
+    },
+    /// The input grant on a terminal was taken or released (WI 0141).
+    /// `holder` is the client's `x-awman-actor`, or `local`. Keystrokes are
+    /// never logged.
+    TerminalControl {
+        terminal_id: crate::data::ids::TerminalId,
+        holder: String,
+        #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+        annotations: crate::data::terminal::Annotations,
+    },
+    /// A local attach subscription ended (WI 0141); published by the engine
+    /// to host presenters (0142, 0154).
+    TerminalViewerDetached {
+        terminal_id: crate::data::ids::TerminalId,
+        reason: crate::data::terminal::DetachReason,
+        #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+        annotations: crate::data::terminal::Annotations,
+    },
     Done,
 }
 
@@ -445,6 +490,11 @@ impl EventPayload {
             EventPayload::WorkflowParallelGroupFinished => "workflow_parallel_group_finished",
             EventPayload::StepActivity { .. } => "step_activity",
             EventPayload::CommandStatus { .. } => "command_status",
+            EventPayload::ProgramStatus { .. } => "program_status",
+            EventPayload::TerminalOpened { .. } => "terminal_opened",
+            EventPayload::TerminalClosed { .. } => "terminal_closed",
+            EventPayload::TerminalControl { .. } => "terminal_control",
+            EventPayload::TerminalViewerDetached { .. } => "terminal_viewer_detached",
             EventPayload::Done => "done",
         }
     }
@@ -501,6 +551,13 @@ impl EventPayload {
                     Some(format!("[status] {status}"))
                 }
             }
+            // Status and terminal lifecycle are structured signals, not agent
+            // output: `output.log` stays the agent's own lines (WI 0141).
+            EventPayload::ProgramStatus { .. }
+            | EventPayload::TerminalOpened { .. }
+            | EventPayload::TerminalClosed { .. }
+            | EventPayload::TerminalControl { .. }
+            | EventPayload::TerminalViewerDetached { .. } => None,
             EventPayload::Done => None,
         }
     }

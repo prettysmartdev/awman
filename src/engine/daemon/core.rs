@@ -8,6 +8,9 @@ use crate::data::{
         task_store::TaskStore,
     },
 };
+/// The daemon's terminal hub (WI 0141): one per process, shared by every
+/// feature's PTYs. Re-exported here because 0140 defined the `Core` slot.
+pub use crate::engine::terminal_hub::{TerminalHub, TerminalHubConfig};
 use crate::engine::{
     agent::AgentEngine, agent_runtime::AgentRuntimeEngine, auth::AuthEngine,
     container::ContainerRuntime, credential_refresh::CredentialRefreshMonitor, error::EngineError,
@@ -16,15 +19,6 @@ use crate::engine::{
 use std::sync::Arc;
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
-pub trait TerminalHub: Send + Sync {
-    fn name(&self) -> &'static str;
-}
-pub struct NoTerminalHub;
-impl TerminalHub for NoTerminalHub {
-    fn name(&self) -> &'static str {
-        "none"
-    }
-}
 pub struct CoreDeps {
     pub env: EnvSnapshot,
     pub data_paths: DataPaths,
@@ -38,7 +32,7 @@ pub struct CoreDeps {
     pub agent_engine: Arc<AgentEngine>,
     pub credential_monitor: Option<Arc<CredentialRefreshMonitor>>,
     pub max_concurrent_jobs: usize,
-    pub terminal_hub: Arc<dyn TerminalHub>,
+    pub terminal_hub: Arc<TerminalHub>,
 }
 pub struct Core {
     deps: CoreDeps,
@@ -116,7 +110,7 @@ impl Core {
     pub fn executor(&self) -> &Arc<SharedExecutor> {
         &self.executor
     }
-    pub fn terminal_hub(&self) -> &Arc<dyn TerminalHub> {
+    pub fn terminal_hub(&self) -> &Arc<TerminalHub> {
         &self.deps.terminal_hub
     }
     pub fn shutdown(&self) -> CancellationToken {
@@ -150,7 +144,7 @@ pub(crate) fn test_core(home: &std::path::Path) -> Arc<Core> {
         agent_engine: agent,
         credential_monitor: None,
         max_concurrent_jobs: 2,
-        terminal_hub: Arc::new(NoTerminalHub),
+        terminal_hub: Arc::new(TerminalHub::new(TerminalHubConfig::default())),
     })
     .unwrap()
 }

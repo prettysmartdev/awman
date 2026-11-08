@@ -29,6 +29,31 @@ and starts the same live status view there.
 
 In both cases, terminal raw mode, alternate screen, and mouse capture are enabled on entry and restored unconditionally on exit, even if awman crashes.
 
+### Status in your terminal's tab bar
+
+Terminals that support OSC 7501 can show awman's activity in their own tab bar,
+even when awman is in the background. The status covers all awman tabs: waiting
+for input takes priority, followed by errors, working, idle, and done. An
+authentication prompt appears as waiting for authentication. The terminal may
+also show individual agents and their messages. Status is cleared when awman
+exits. awman probes the terminal at startup and emits reports only when it
+receives an OSC 7501 reply before the terminal's primary-device response and
+within the probe window. If the response arrives first, no reply arrives, or
+the probe times out, emission stays off for that TUI run. Unsupported
+terminals keep working normally. Emission is also disabled when no raw input
+terminal is available.
+
+A bare Escape uses a short key-disambiguation delay. An incomplete CSI or OSC
+introducer may wait up to one second so a delayed probe reply is consumed;
+Alt+[ and Alt+] use that same window. Once a reply's identifying bytes arrive,
+fragmented replies remain filtered even after the startup probe expires.
+
+awman detects terminal support automatically. To disable this for one run, use
+`awman --set tui.programStatus.emit=false` or set
+`AWMAN_TUI_PROGRAM_STATUS_EMIT=false`. You can also save
+`tui.programStatus.emit=false` in global or repository configuration. Emission
+is disabled for `TERM=dumb` and when output is redirected.
+
 ---
 
 ## Layout
@@ -643,7 +668,26 @@ Ctrl+D          switch to the next tab
 Ctrl+C, Ctrl+T  (multiple tabs open) close the current tab
 ```
 
-The tab bar shows each tab's project name, current or last command, and an arrow (`➡`) on the active tab. The active tab's bottom border is suppressed so it visually opens into the content area.
+The tab bar shows each tab's project name, current or last command, and an arrow (`➡`) on the active tab. The active tab's bottom border is suppressed so it visually opens into the content area. When the agent reports its program status, a glyph appears before the tab label:
+
+| Glyph | Reported status | Tab colour |
+|-------|-----------------|------------|
+| `◐` | Working; includes reported progress when available, for example `◐ 42%`. | Usual tab colour |
+| `?` | Blocked on a question. | Yellow |
+| `🔒` | Blocked on permission or authentication. | Yellow |
+| `✓` | Done. | Green |
+| `✗` | Error. | Red |
+| *(none)* | Idle, or no status report. | Usual tab colour |
+
+A yolo countdown or silence warning can override these colours. A reporting
+agent does not get the `⚠️` silence prefix.
+
+The container window title and minimized status bar also show the reported
+glyph and state, followed by the blocked kind (when present) and the agent's
+message. For example, `🔒 blocked: permission — Allow this edit?`. The message
+is displayed as plain text with invisible/control characters removed and is
+shortened to fit. A quiet agent that continues to report `working` may show
+`working · silent 12m`; this is informational and does not mark the tab stuck.
 
 All tabs share one width: wide enough for the longest tab label (at least 20 columns), or, when that many tabs don't fit, the terminal width divided evenly between them (at least 12 columns each). Names that don't fit are truncated with `…` — at 20 columns that leaves 14 characters of the name.
 
@@ -759,7 +803,7 @@ bindings, and attaching to a running task.
 
 ## Stuck detection
 
-If a running container produces no output for longer than the stuck timeout (30 seconds by default; `agents.stuckTimeout` in [Configuration](07-configuration.md)), the tab turns yellow and the subcommand label gains a `⚠️` prefix (e.g. `⚠️ chat`). The warning clears automatically when you:
+If a running container produces no output for longer than the stuck timeout (30 seconds by default; `agents.stuckTimeout` in [Configuration](07-configuration.md)), the tab turns yellow and the subcommand label gains a `⚠️` prefix (e.g. `⚠️ chat`). This silence rule applies when the agent is not reporting program status. An agent that reports `working` remains judged by its reports even if its output is quiet; the TUI may show the informational `working · silent …` note, but does not mark it stuck. A `done`, `blocked`, or `error` report likewise takes precedence over silence. The warning clears automatically when you:
 
 - Switch to the yellow tab
 - Press any key while the tab is active

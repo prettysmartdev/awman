@@ -291,7 +291,21 @@ pub async fn jobs_cancel_feature(
     api: &DaemonApi,
     f: crate::data::daemon_state::FeatureName,
 ) -> Result<Vec<String>, CommandError> {
-    api.runtime.cancel_feature_jobs(f).await
+    let canceled = api.runtime.cancel_feature_jobs(f).await?;
+    let hub = api.terminals.hub();
+    let owners: std::collections::HashSet<_> = hub
+        .list(None)
+        .into_iter()
+        .filter(|record| record.feature == f)
+        .map(|record| record.owner_id)
+        .collect();
+    for owner in owners {
+        hub.forget_owner(
+            &owner,
+            crate::engine::agent_runtime::execution::KILLED_EXIT_CODE,
+        );
+    }
+    Ok(canceled)
 }
 pub async fn config_reload(api: &DaemonApi) -> Result<ReloadResponse, CommandError> {
     api.runtime.reload_config().await

@@ -538,6 +538,10 @@ impl WorkerServices {
         let mut settings = self.config.daemon();
         settings.max_concurrent_jobs = self.worker_count;
         let (tx, mut rx) = tokio::sync::watch::channel(settings);
+        // Interaction and `daemon.terminal` are read per command (WI 0141).
+        let live = tx.subscribe();
+        let daemon_settings: super::queue_worker::DaemonSettingsSource =
+            Arc::new(move || live.borrow().clone());
         let store = self.store.clone();
         let engines = self.engines.clone();
         let sessions = self.sessions.clone();
@@ -563,6 +567,7 @@ impl WorkerServices {
                         cancels: cancels.clone(),
                     },
                 )
+                .with_daemon_settings(daemon_settings.clone())
             };
             if let Err(error) = make_worker().recover_cancelled_cleanup().await {
                 tracing::error!(%error,"Cancelled cleanup recovery failed");
@@ -1018,28 +1023,31 @@ fn decode_queue_command(
 /// must not hide the rest of a session's queue from an operator.
 pub fn stored_args_view(record: &CommandRecord) -> serde_json::Value {
     match record.decode_args() {
-        Ok(args) => {
-            let mut positional = false;
-            let visible: Vec<_> = args
-                .into_iter()
-                .filter(|arg| {
-                    if positional {
-                        return true;
-                    }
-                    if arg == "--" {
-                        positional = true;
-                        return true;
-                    }
-                    arg != "--headless" && arg != "-n" && !arg.starts_with("--headless=")
-                })
-                .collect();
-            serde_json::json!(visible)
+        Ok(mut args) => {
+            // Admission records the resolved interaction (WI 0141) as one
+            // leading token when the client did not spell it; it is the
+            // server's decision, not the client's argv, so the read
+            // projection leaves it out. Anything later in argv is the
+            // client's own and is shown as sent.
+            if args
+                .first()
+                .is_some_and(|first| is_injected_interaction_token(first))
+            {
+                args.remove(0);
+            }
+            serde_json::json!(args)
         }
         Err(error) => {
             tracing::warn!(command_id = %record.id, %error, "Invalid stored command args in read projection");
             serde_json::from_str(&record.args).unwrap_or_else(|_| serde_json::json!([]))
         }
     }
+}
+
+/// The spellings admission writes for a resolved interaction, plus the
+/// `--headless=false` older rows carry.
+fn is_injected_interaction_token(arg: &str) -> bool {
+    matches!(arg, "--headless" | "--interactive") || arg.starts_with("--headless=")
 }
 
 /// The `result` JSON of a `/v1/runs` command whose session setup failed:
@@ -1267,6 +1275,7 @@ mod tests {
     #[test]
     fn stored_args_projection_omits_server_injected_interaction_flags() {
         let record = crate::data::fs::api_db::CommandRecord {
+            allow_remote_input: false,
             listener: "local".into(),
             trace_parent: None,
             id: "cmd_00000000000000000000000000000001".into(),

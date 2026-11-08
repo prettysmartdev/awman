@@ -34,6 +34,7 @@ use crate::frontend::render_helpers::format_table;
 /// to stderr already and produce no additional summary on stdout).
 pub fn render(outcome: &CommandOutcome, json: bool) -> Option<String> {
     match outcome {
+        CommandOutcome::Attach(_) => None,
         CommandOutcome::Empty => None,
         CommandOutcome::Agents(o) => super::agents::render_agents(o, json),
         CommandOutcome::Chat(o) => render_chat(o),

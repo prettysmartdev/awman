@@ -218,6 +218,8 @@ fn intercept_agents_watch_stop(
     true
 }
 pub(super) fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
+    // Active-tab suppression input: the user is interacting with this tab.
+    app.active_tab().shared.signals.touch_user();
     // A runtime notice stays in the status bar until the next key press.
     app.status_bar.notice = None;
     if keymap::is_workflow_context_copy_key(key) {
@@ -373,7 +375,7 @@ fn forward_key_to_pty(app: &mut App, key: crossterm::event::KeyEvent) {
     let attaching = matches!(&app.active_tab().execution_phase,
         crate::frontend::tui::tabs::ExecutionPhase::Running { command, .. }
             if crate::command::dispatch::catalogue::CommandCatalogue::get()
-                .is_agent_attach(&command.split_whitespace().collect::<Vec<_>>()));
+                .is_terminal_attach(&command.split_whitespace().collect::<Vec<_>>()));
     if attaching && key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)
     {
         app.active_tab().shared.command_cancel.cancel();

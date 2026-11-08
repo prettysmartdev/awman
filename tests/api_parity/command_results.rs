@@ -1090,7 +1090,10 @@ abort_on_failure = true
         assert_eq!(data["agents"], json!([]));
         assert_eq!(
             data["totals"],
-            json!({"running": 0, "stuck": 0, "stopped": 0, "cpu_percent": null, "memory_mb": null})
+            json!({
+                "running": 0, "stuck": 0, "stopped": 0, "waiting": 0, "errored": 0, "done": 0,
+                "cpu_percent": null, "memory_mb": null
+            })
         );
         let events = events_of(&record).await;
         // Kept for one release: the same JSON as a stdout line.

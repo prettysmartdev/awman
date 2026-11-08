@@ -116,6 +116,10 @@ impl ContainerCli {
 
 /// What a [`AttachHook`] is handed once the PTY bridge is wired up.
 pub(super) struct AttachHookCtx<'a> {
+    pub terminal: Option<(
+        Arc<crate::engine::terminal_hub::TerminalHub>,
+        crate::data::ids::TerminalId,
+    )>,
     /// The container's name — the key the socket path is derived from.
     pub container_name: &'a str,
     /// Live tap on the container's output. Already installed on the
@@ -167,6 +171,8 @@ pub(super) fn bridge_config_for(
             crate::engine::agent_runtime::output_tail::OutputTail::with_default_capacity(),
         ),
         output_broadcast: None,
+        terminal: None,
+        program_status: Default::default(),
     }
 }
 
@@ -254,9 +260,19 @@ impl AgentInstance for ContainerInstance {
             .startup_grace
             .unwrap_or_else(|| frontend.grace_timeout());
         let stuck_timeout = frontend.stuck_timeout();
+        // WI 0141 §3: tell the user which requested host-terminal variables
+        // were not passed (`build_run_argv` also traces it).
+        if let Some(notice) = super::docker::host_terminal_env_notice(&self.options) {
+            frontend.write_message(crate::data::message::UserMessage {
+                level: crate::data::message::MessageLevel::Warning,
+                text: notice,
+            });
+        }
         let io = frontend.take_io();
 
         let mut bridge_cfg = bridge_config_for(cli, &self.name, grace_timeout, stuck_timeout);
+        bridge_cfg.program_status = self.options.program_status;
+        bridge_cfg.terminal = frontend.terminal_launch();
         if self.options.full_transcript {
             bridge_cfg.output_tail =
                 Arc::new(crate::engine::agent_runtime::output_tail::OutputTail::unbounded());
@@ -326,7 +342,7 @@ fn piped_command(
 ) -> Command {
     let mut cmd = Command::new(crate::engine::host_cli::program(cli.bin));
     cmd.args(argv);
-    for (k, v) in &options.agent_credentials {
+    for (k, v) in super::docker::screened_agent_credentials(options) {
         cmd.env(k, v);
     }
     for (k, v) in super::docker::resolve_env_passthrough(options) {
@@ -413,7 +429,7 @@ pub(super) fn spawn_pty_bridged(
     // argument vector. The passthrough values cannot rely on ambient
     // inheritance — inside the squad daemon they live in the Layer 0 overlay,
     // not in the daemon's own process environment.
-    for (k, v) in &instance.options.agent_credentials {
+    for (k, v) in super::docker::screened_agent_credentials(&instance.options) {
         cmd.env(k, v);
     }
     for (k, v) in super::docker::resolve_env_passthrough(&instance.options) {
@@ -439,14 +455,27 @@ pub(super) fn spawn_pty_bridged(
         Arc::new(tx)
     });
     if let Some(tx) = &output_broadcast {
-        bridge_cfg.output_broadcast = Some(Arc::clone(tx));
+        if bridge_cfg.terminal.is_none() {
+            bridge_cfg.output_broadcast = Some(Arc::clone(tx));
+        }
     }
+    let terminal_launch = bridge_cfg.terminal.clone();
 
     let (master_arc, bridge) =
         crate::engine::container::io_bridge::bridge_pty(io, pair, bridge_cfg)?;
 
     let attach_socket = match (post_bridge, output_broadcast) {
         (Some(hook), Some(output_broadcast)) => hook(AttachHookCtx {
+            terminal: terminal_launch.and_then(|launch| {
+                let id = launch
+                    .handle
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .as_ref()?
+                    .id()
+                    .clone();
+                Some((launch.hub, id))
+            }),
             container_name: &instance.name.0,
             output_broadcast,
             stdin_injector: bridge.stdin_injector.clone(),
@@ -472,7 +501,8 @@ pub(super) fn spawn_pty_bridged(
         Box::new(backend),
         bridge.stuck_tx,
         Some(bridge.output_tail),
-    ))
+    )
+    .with_program_status(bridge.program_status))
 }
 
 /// Spawn `<bin> run` with piped stdio and bridge through `AgentIo`.
@@ -533,7 +563,8 @@ pub(super) fn spawn_piped(
         Box::new(backend),
         bridge.stuck_tx,
         Some(bridge.output_tail),
-    ))
+    )
+    .with_program_status(bridge.program_status))
 }
 
 /// Spawn `<bin> run -i` (no PTY) with piped stdio for an ACP session and bridge
@@ -603,7 +634,8 @@ pub(super) fn spawn_piped_interactive(
         Box::new(backend),
         bridge.stuck_tx,
         Some(bridge.output_tail),
-    ))
+    )
+    .with_program_status(bridge.program_status))
 }
 
 /// `<bin> stop <name>` then `<bin> rm <name>`, both best-effort. `stop` SIGTERMs
@@ -792,9 +824,9 @@ mod tests {
         tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
     );
 
-    struct IoProbeFrontend {
-        receivers: Arc<Mutex<Option<OutputReceivers>>>,
-        initial_size: Option<(u16, u16)>,
+    pub(super) struct IoProbeFrontend {
+        pub(super) receivers: Arc<Mutex<Option<OutputReceivers>>>,
+        pub(super) initial_size: Option<(u16, u16)>,
     }
     impl crate::data::message::UserMessageSink for IoProbeFrontend {
         fn write_message(&mut self, _: crate::data::message::UserMessage) {}
@@ -893,6 +925,60 @@ mod tests {
         }
     }
 
+    /// Records the order of `write_message` and `take_io`.
+    struct NoticeFrontend(Arc<Mutex<Vec<String>>>);
+    impl crate::data::message::UserMessageSink for NoticeFrontend {
+        fn write_message(&mut self, msg: crate::data::message::UserMessage) {
+            self.0.lock().unwrap().push(format!("msg:{}", msg.text));
+        }
+        fn replay_queued(&mut self) {}
+    }
+    #[async_trait::async_trait]
+    impl crate::engine::agent_runtime::frontend::AgentFrontend for NoticeFrontend {
+        fn report_status(&mut self, _: crate::engine::agent_runtime::frontend::AgentStatus) {}
+        fn report_progress(&mut self, _: crate::engine::agent_runtime::frontend::AgentProgress) {}
+        fn take_io(&mut self) -> AgentIo {
+            self.0.lock().unwrap().push("take_io".into());
+            IoProbeFrontend {
+                receivers: Arc::new(Mutex::new(None)),
+                initial_size: None,
+            }
+            .take_io()
+        }
+    }
+
+    /// Review finding: a requested host-terminal variable that is dropped
+    /// is explained to the user through the frontend before the agent starts.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropped_host_terminal_variables_are_announced_before_take_io() {
+        let temp = tempfile::tempdir().unwrap();
+        let cli = ContainerCli {
+            bin: fake_cli(&write_fake_cli(temp.path(), "#!/bin/sh\nexit 0\n")).bin,
+            ..ContainerCli::DOCKER
+        };
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut execution = test_instance(
+            cli,
+            vec![
+                ContainerOption::Image(ImageRef::new("img:latest")),
+                ContainerOption::AgentCredentials {
+                    env_vars: vec![("TMUX".into(), "/tmp/sock".into())],
+                },
+            ],
+        )
+        .run_with_frontend(Box::new(NoticeFrontend(events.clone())))
+        .unwrap();
+        let _ = execution.wait().await;
+        let events = events.lock().unwrap().clone();
+        let notice = events
+            .iter()
+            .position(|e| e.starts_with("msg:") && e.contains("TMUX"))
+            .expect("notice written");
+        let take_io = events.iter().position(|e| e == "take_io").unwrap();
+        assert!(notice < take_io, "{events:?}");
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn dropping_unwaited_docker_execution_preserves_reattachable_container() {
@@ -980,7 +1066,7 @@ mod tests {
     /// A stand-in CLI whose `bin` is a script on disk. `bin` is `&'static str`,
     /// so the temp path is leaked — the process is about to end anyway, and it
     /// keeps `ContainerCli` a plain `Copy` constant in production.
-    fn fake_cli(path: &std::path::Path) -> ContainerCli {
+    pub(super) fn fake_cli(path: &std::path::Path) -> ContainerCli {
         ContainerCli {
             bin: Box::leak(path.to_string_lossy().into_owned().into_boxed_str()),
             label: "awman=true",
@@ -990,7 +1076,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn write_fake_cli(dir: &std::path::Path, body: &str) -> std::path::PathBuf {
+    pub(super) fn write_fake_cli(dir: &std::path::Path, body: &str) -> std::path::PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let path = dir.join("fake-cli");
         std::fs::write(&path, body).unwrap();
@@ -1055,6 +1141,8 @@ mod tests {
                 crate::engine::agent_runtime::output_tail::OutputTail::with_default_capacity(),
             ),
             output_broadcast: None,
+            terminal: None,
+            program_status: Default::default(),
         };
         (
             SpawnRequest {
@@ -1070,7 +1158,10 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn test_instance(cli: ContainerCli, opts: Vec<ContainerOption>) -> Box<ContainerInstance> {
+    pub(super) fn test_instance(
+        cli: ContainerCli,
+        opts: Vec<ContainerOption>,
+    ) -> Box<ContainerInstance> {
         let image = ImageRef::new("img:latest");
         let name = ContainerName::new("spawn-test");
         Box::new(ContainerInstance::new(
@@ -1561,5 +1652,103 @@ mod tests {
         );
 
         set_daemon_overlay(DaemonEnvMap::new());
+    }
+}
+
+#[cfg(all(test, unix))]
+mod terminal_wiring_regression {
+    use super::*;
+    use crate::data::{
+        daemon_state::FeatureName,
+        execution_event::{EventSource, EventSourcePhase},
+        ids::*,
+        terminal::*,
+    };
+    use crate::engine::agent_runtime::execution::TerminalLaunch;
+    use crate::engine::terminal_hub::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn real_pty_registers_streams_resizes_accepts_bounded_input_and_exits() {
+        let temp = tempfile::tempdir().unwrap();
+        let script = tests::write_fake_cli(temp.path(), "#!/bin/sh\nprintf 'ready\\n'\nread reply\nprintf 'received:%s\\033' \"$reply\"\nexit 7\n");
+        let hub = Arc::new(TerminalHub::new(TerminalHubConfig::default()));
+        let owner = TerminalOwner::Command(CommandId::new());
+        let source = EventSource::step(EventSourcePhase::Main, "implement", 0).with_step_attempt(3);
+        let launch = TerminalLaunch {
+            hub: hub.clone(),
+            owner: TerminalOwnerInfo {
+                owner: owner.clone(),
+                feature: FeatureName::Worker,
+                source: Some(source.clone()),
+                attempt: 2,
+                allow_remote_input: true,
+            },
+            agent: "fixture".into(),
+            model: Some("model".into()),
+            handle: Default::default(),
+            drain: Arc::new(
+                crate::engine::agent_runtime::output_tail::OutputTail::with_default_capacity(),
+            ),
+        };
+        let instance = tests::test_instance(
+            tests::fake_cli(&script),
+            vec![super::super::options::ContainerOption::Image(
+                ImageRef::new("fixture"),
+            )],
+        );
+        let instance =
+            crate::engine::agent_runtime::execution::with_terminal_launch(instance, launch);
+        let mut execution = instance
+            .run_with_frontend(Box::new(tests::IoProbeFrontend {
+                initial_size: Some((80, 24)),
+                receivers: Arc::new(Mutex::new(None)),
+            }))
+            .unwrap();
+        let records = hub.list(Some(&owner));
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert_eq!((record.attempt, record.allow_remote_input), (2, true));
+        let mut expected_source = source;
+        expected_source.container = Some(execution.handle().name.clone());
+        assert_eq!(record.source.as_ref(), Some(&expected_source));
+        let mut subscription = hub.subscribe(&record.id).unwrap();
+        assert!(matches!(
+            subscription.next().await,
+            Some(TerminalFrame::Snapshot { .. })
+        ));
+        let grant = hub.take_control(&record.id).unwrap();
+        grant.resize(100, 30).unwrap();
+        assert_eq!(
+            (
+                hub.get(&record.id).unwrap().cols,
+                hub.get(&record.id).unwrap().rows
+            ),
+            (100, 30)
+        );
+        grant.send_input(b"hello\n".to_vec()).unwrap();
+        let info = tokio::time::timeout(Duration::from_secs(5), execution.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(info.exit_code, 7);
+        assert_eq!(hub.get(&record.id).unwrap().state, TerminalState::Exited);
+        let mut output = Vec::new();
+        while let Some(frame) = subscription.next().await {
+            match frame {
+                TerminalFrame::Output { bytes } => output.extend(bytes),
+                TerminalFrame::Exit { code } => {
+                    assert_eq!(code, 7);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert!(String::from_utf8_lossy(&output).contains("received:hello"));
+        assert_eq!(
+            output.last(),
+            Some(&0x1b),
+            "EOF must preserve the trailing ESC"
+        );
+        assert!(grant.send_input(b"late".to_vec()).is_err());
     }
 }

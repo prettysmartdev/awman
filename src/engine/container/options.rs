@@ -195,6 +195,11 @@ impl PartialEq for MountGuard {
 /// variant and a single branch in `ResolvedContainerOptions::ingest`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ContainerOption {
+    AgentIdentity {
+        agent: String,
+        model: Option<String>,
+    },
+    ProgramStatus(crate::engine::agent_runtime::program_status::ProgramStatusBridgeConfig),
     Image(ImageRef),
     Entrypoint(Entrypoint),
     Overlay(OverlaySpec),
@@ -507,6 +512,8 @@ fn covered_credential_services(
 /// backend consumes. Conflicting options are detected here.
 #[derive(Debug, Clone, Default)]
 pub struct ResolvedContainerOptions {
+    pub agent_identity: Option<(String, Option<String>)>,
+    pub program_status: crate::engine::agent_runtime::program_status::ProgramStatusBridgeConfig,
     pub image: Option<ImageRef>,
     pub entrypoint: Option<Entrypoint>,
     pub overlays: Vec<OverlaySpec>,
@@ -631,6 +638,10 @@ impl ResolvedContainerOptions {
 
     fn ingest(&mut self, opt: ContainerOption) -> Result<(), ResolveError> {
         match opt {
+            ContainerOption::AgentIdentity { agent, model } => {
+                self.agent_identity = Some((agent, model))
+            }
+            ContainerOption::ProgramStatus(config) => self.program_status = config,
             ContainerOption::Image(v) => self.image = Some(v),
             ContainerOption::Entrypoint(v) => self.entrypoint = Some(v),
             ContainerOption::Overlay(v) => self.overlays.push(v),

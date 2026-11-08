@@ -69,7 +69,7 @@ pub const TIPS: &[&str] = &[
     "`awman agents ls` (or `ps`) lists running agents; add `-a` to include stopped ones.",
     "`awman agents ls -q` prints only agent IDs, handy for scripting.",
     "`awman agents detail <id>` (or `inspect`) shows one agent in depth; an ID prefix works too.",
-    "`awman agents attach <id>` connects to an agent's terminal; detaching never stops the agent.",
+    "`awman attach <term-id>` connects to an agent's terminal; detaching never stops the agent.",
     "`awman agents rm <id>` (or `kill`) stops and removes an agent; `-y` skips the prompt.",
     "`awman clean` removes stopped agents, finished workflow data and dangling images.",
     "`awman clean --dry-run` shows what would be removed without deleting anything.",
@@ -248,7 +248,7 @@ mod tests {
             "agents status",
             "agents ls",
             "agents detail",
-            "agents attach",
+            "awman attach",
             "agents rm",
         ] {
             assert!(

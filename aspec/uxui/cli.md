@@ -245,6 +245,17 @@ belongs to rather than inventing a new code.
   never reads configuration through a path that skips a level of this
   order.
 
+Agent status reporting is controlled by `agents.programStatus.enabled`
+(default `true`). TUI host-terminal status emission is controlled separately
+by `tui.programStatus.emit` (default `true`); it can be disabled for one run
+with `awman --set tui.programStatus.emit=false`. Daemon-managed interactive
+terminals start at `daemon.terminal.cols` × `daemon.terminal.rows` (120 × 40
+by default), and retain their size after launch. Squad and pushed-worker runs
+select `interactive` or `headless` mode through their respective
+`daemon.features.*.interaction` setting. `allowOverride` controls whether a
+run can request a different mode; the default is `true`. Configuration
+accepts the pull-worker interaction setting, but no pull worker runs currently.
+
 ## Runtime and image-source configuration
 
 User-facing labels and explanations call the embedded backend the "builtin runtime"

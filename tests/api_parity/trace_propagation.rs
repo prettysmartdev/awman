@@ -64,6 +64,10 @@ async fn traceparent_and_listener_are_stored_for_network_admission() {
                 &row.session_id,
                 &row.id,
             ),
+            awman::command::interaction::InteractionDecision {
+                interaction: awman::data::config::daemon::Interaction::Headless,
+                pty_size: None,
+            },
         );
         assert_eq!(
             frontend.kind(),

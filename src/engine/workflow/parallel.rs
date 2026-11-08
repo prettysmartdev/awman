@@ -68,11 +68,18 @@ impl WorkflowEngine {
         let total = timing::yolo_countdown_duration();
         let mut failed: Vec<(String, i32)> = Vec::new();
         let mut review_ready = HashSet::new();
+        // Final-group steps an `AgentDone` countdown advanced (WI 0141): the
+        // agent said it was done, so they need no final review.
+        let mut done_advanced: HashSet<String> = HashSet::new();
         let mut final_review_shown = false;
         // Cloned so the select below borrows nothing of `self` for it.
         let cancel = self.cancel.clone();
 
-        while !self.active_steps.is_empty() || (final_yolo_group && failed.is_empty()) {
+        while !self.active_steps.is_empty()
+            || (final_yolo_group
+                && failed.is_empty()
+                && !group_names.iter().all(|n| done_advanced.contains(n)))
+        {
             // A final group stays alive after its countdowns. Once every live
             // member has reached review readiness (or exited), ask once; Esc
             // returns to the live containers, and Ctrl-W can reopen the board.
@@ -103,6 +110,7 @@ impl WorkflowEngine {
                     ParallelRequestOutcome::Rewound => return Ok(GroupOutcome::Rewound),
                     ParallelRequestOutcome::RestartStep(name) => {
                         review_ready.remove(&name);
+                        done_advanced.remove(&name);
                         self.restart_parallel_step(
                             &name, &mut waits, &mut queue, slot_cap, &stuck_tx,
                         )?;
@@ -140,12 +148,30 @@ impl WorkflowEngine {
                     if exit.exit_code != 0 && self.cancel_requested() {
                         return Ok(GroupOutcome::Ended(self.cancel_parallel_group()?));
                     }
-                    let auth_recovered = exit.exit_code != 0 && self.recover_auth_failure(&name)?;
+                    // WI 0141: the agent's reported problem outranks the exit
+                    // code (an awman kill after the countdown, or a self-exit
+                    // even with 0). It is a real failure, never an auth retry.
+                    // A report still queued or debounced at exit counts: settle
+                    // from the execution's tracker first.
+                    self.settle_reported_status(&name, None);
+                    let problem = self.reported_problem_of(&name);
+                    let auth_recovered = problem.is_none()
+                        && exit.exit_code != 0
+                        && self.recover_auth_failure(&name)?;
                     self.remove_active_step(&name);
                     review_ready.remove(&name);
+                    done_advanced.remove(&name);
                     self.last_exit_info = Some(exit.clone());
 
-                    let (status, step_state) = if exit.exit_code == 0 {
+                    let (status, step_state) = if let Some(problem) = &problem {
+                        (
+                            WorkflowStepStatus::Failed { exit_code: exit.exit_code },
+                            StepState::Failed {
+                                exit_code: exit.exit_code,
+                                error_message: Some(program_status::reported_failure_reason(problem)),
+                            },
+                        )
+                    } else if exit.exit_code == 0 {
                         (WorkflowStepStatus::Succeeded, StepState::Succeeded)
                     } else if auth_recovered {
                         (WorkflowStepStatus::Running, StepState::Pending)
@@ -215,6 +241,7 @@ impl WorkflowEngine {
                                 ParallelRequestOutcome::RestartStep(restart) => {
                                     failed.retain(|(failed_name, _)| *failed_name != restart);
                                     review_ready.remove(&restart);
+                                    done_advanced.remove(&restart);
                                     final_review_shown = false;
                                     self.restart_parallel_step(
                                         &restart,
@@ -240,7 +267,35 @@ impl WorkflowEngine {
                     return Ok(GroupOutcome::Ended(self.cancel_parallel_group()?));
                 }
                 Some((name, event)) = stuck_rx.recv() => {
-                    self.handle_parallel_stuck_event(&name, event);
+                    // A non-yolo report (`done`, `blocked`, `error`) opens the
+                    // board for that step at once; its report rides along in
+                    // `AvailableActions::reported_status`.
+                    if self.handle_parallel_stuck_event(&name, event) {
+                        let retryable = failed.first().map(|(name, _)| name.clone());
+                        match self.handle_parallel_engine_request(
+                            EngineRequest::OpenControlBoard { step_name: name },
+                            &group_names,
+                            retryable.as_deref(),
+                            final_yolo_group && final_review_shown && failed.is_empty() && queue.is_empty(),
+                        )? {
+                            ParallelRequestOutcome::Continue => {}
+                            ParallelRequestOutcome::Ended(wo) => return Ok(GroupOutcome::Ended(wo)),
+                            ParallelRequestOutcome::Rewound => return Ok(GroupOutcome::Rewound),
+                            ParallelRequestOutcome::RestartStep(name) => {
+                                failed.retain(|(n, _)| *n != name);
+                                review_ready.remove(&name);
+                                done_advanced.remove(&name);
+                                final_review_shown = false;
+                                self.restart_parallel_step(
+                                    &name,
+                                    &mut waits,
+                                    &mut queue,
+                                    slot_cap,
+                                    &stuck_tx,
+                                )?;
+                            }
+                        }
+                    }
                 }
                 Some(req) = Self::recv_engine(&mut self.engine_rx) => {
                     // The earliest failure still awaiting recovery is offered
@@ -258,6 +313,7 @@ impl WorkflowEngine {
                         ParallelRequestOutcome::RestartStep(name) => {
                             failed.retain(|(n, _)| *n != name);
                             review_ready.remove(&name);
+                            done_advanced.remove(&name);
                             final_review_shown = false;
                             self.restart_parallel_step(
                                 &name,
@@ -281,6 +337,7 @@ impl WorkflowEngine {
                         &stuck_tx,
                         final_batch,
                         &mut review_ready,
+                        &mut done_advanced,
                     )?;
                 }
             }
@@ -355,6 +412,7 @@ impl WorkflowEngine {
         let container_name = execution.handle().name.clone();
         let handle = execution.handle().clone();
         let output_tail = execution.output_tail();
+        let program_status = execution.program_status_tracker();
 
         // Publish the per-step stuck sender so the frontend can subscribe for
         // this specific container's status bar.
@@ -417,6 +475,11 @@ impl WorkflowEngine {
             awman_killed: false,
             stuck: false,
             yolo_deadline: None,
+            countdown_kind: CountdownKind::StuckStep,
+            output_watch: None,
+            last_report: None,
+            reported_problem: None,
+            program_status,
             agent: resolved_agent,
             model: resolved_model,
             launch_id,
@@ -467,11 +530,18 @@ impl WorkflowEngine {
         Ok(true)
     }
 
-    /// Handle a per-step stuck/unstuck transition inside a parallel group.
-    /// Independent per slot: a noisy sibling never masks a stuck step, and a
-    /// stuck step never blocks its siblings.
-    pub(super) fn handle_parallel_stuck_event(&mut self, name: &str, event: StuckEvent) {
+    /// Handle a per-step stuck/unstuck transition or OSC 7501 report inside a
+    /// parallel group. Independent per slot: a noisy sibling never masks a
+    /// stuck step, a stuck step never blocks its siblings, and one agent's
+    /// `done` or `error` never advances or fails another (WI 0141).
+    ///
+    /// Returns `true` when the engine should open the control board for
+    /// `name` now: a non-yolo agent reported `done`/`idle`, `blocked` or
+    /// `error` with a user present. The caller opens it, since only the group
+    /// loop can act on the answer.
+    pub(super) fn handle_parallel_stuck_event(&mut self, name: &str, event: StuckEvent) -> bool {
         match event {
+            StuckEvent::Reported(status) => return self.handle_parallel_report(name, status),
             StuckEvent::Stuck => {
                 if self.yolo {
                     let start_countdown = {
@@ -479,6 +549,7 @@ impl WorkflowEngine {
                             Some(s) if s.yolo_deadline.is_none() => {
                                 s.yolo_deadline =
                                     Some(Instant::now() + timing::yolo_countdown_duration());
+                                s.countdown_kind = CountdownKind::StuckStep;
                                 true
                             }
                             _ => false,
@@ -489,7 +560,8 @@ impl WorkflowEngine {
                             "Step '{}' appears stuck; starting yolo countdown",
                             name,
                         ));
-                        self.frontend.parallel_step_yolo_countdown_started(name);
+                        self.frontend
+                            .parallel_step_countdown_started(name, CountdownKind::StuckStep);
                     }
                 } else {
                     if let Some(s) = self.active_steps.iter_mut().find(|s| s.step_name == name) {
@@ -501,7 +573,21 @@ impl WorkflowEngine {
             }
             StuckEvent::Unstuck => {
                 if let Some(s) = self.active_steps.iter_mut().find(|s| s.step_name == name) {
-                    let had_countdown = s.yolo_deadline.take().is_some();
+                    // Output cancels a silence countdown, and an `AgentError`
+                    // one ("any output"), but never an agent's `done` or
+                    // `blocked` countdown: those end on a report.
+                    let cancels = matches!(
+                        s.countdown_kind,
+                        CountdownKind::StuckStep | CountdownKind::AgentError
+                    );
+                    let had_countdown = cancels && s.yolo_deadline.is_some();
+                    if had_countdown {
+                        s.yolo_deadline = None;
+                        s.output_watch = None;
+                        if s.countdown_kind == CountdownKind::AgentError {
+                            s.reported_problem = None;
+                        }
+                    }
                     s.stuck = false;
                     if had_countdown {
                         self.frontend.parallel_step_yolo_countdown_finished(name);
@@ -519,10 +605,97 @@ impl WorkflowEngine {
                 }
             }
         }
+        false
+    }
+
+    /// One parallel step's agent reported its status: the state table in
+    /// [`program_status`], applied to this slot only.
+    fn handle_parallel_report(
+        &mut self,
+        name: &str,
+        status: Option<crate::data::program_status::EffectiveStatus>,
+    ) -> bool {
+        use program_status::ReportedResponse;
+        if !self.active_steps.iter().any(|s| s.step_name == name) {
+            return false;
+        }
+        self.note_reported_status(name, status.as_ref());
+        let response = self.reported_response(status.as_ref());
+        if let Some(s) = &status {
+            self.narrate_report(name, s, response);
+        }
+        match response {
+            // Working / cleared, or a problem that must never be pushed past:
+            // whatever countdown was running — silence or `done` — stops.
+            ReportedResponse::Resume | ReportedResponse::NeedsYou => {
+                self.cancel_parallel_countdown(name);
+                false
+            }
+            ReportedResponse::ConfirmAdvance | ReportedResponse::ProblemBoard => {
+                self.cancel_parallel_countdown(name);
+                true
+            }
+            ReportedResponse::Countdown(kind) => {
+                let Some(slot) = self.active_steps.iter_mut().find(|s| s.step_name == name) else {
+                    return false;
+                };
+                if slot.yolo_deadline.is_some() && slot.countdown_kind == kind {
+                    return false;
+                }
+                let replaced = slot.yolo_deadline.is_some();
+                slot.yolo_deadline =
+                    Some(Instant::now() + program_status::countdown_duration(kind));
+                slot.countdown_kind = kind;
+                slot.output_watch = if kind == CountdownKind::AgentError {
+                    slot.output_tail
+                        .clone()
+                        .map(program_status::OutputWatch::new)
+                } else {
+                    None
+                };
+                if replaced {
+                    self.frontend.parallel_step_yolo_countdown_finished(name);
+                }
+                self.frontend.parallel_step_countdown_started(name, kind);
+                false
+            }
+        }
+    }
+
+    /// Stop `name`'s per-step countdown, whatever it is for.
+    fn cancel_parallel_countdown(&mut self, name: &str) {
+        if let Some(slot) = self.active_steps.iter_mut().find(|s| s.step_name == name) {
+            slot.output_watch = None;
+            if slot.yolo_deadline.take().is_some() {
+                self.frontend.parallel_step_yolo_countdown_finished(name);
+            }
+        }
+    }
+
+    /// A parallel `AgentBlocked` / `AgentError` countdown expired: kill just
+    /// that container and keep its slot. Its wait future then resolves and
+    /// the group loop finalises the step as Failed on `reported_problem`, so
+    /// the group's ordinary failure handling (abort_on_failure, recovery
+    /// board, unattended retry) applies. Siblings are untouched.
+    fn fail_parallel_step_for_report(&mut self, name: &str) {
+        self.msg_warning(format!(
+            "Step '{name}' did not recover from its reported problem; stopping its container"
+        ));
+        if let Some(slot) = self.active_steps.iter_mut().find(|s| s.step_name == name) {
+            slot.yolo_deadline = None;
+            slot.output_watch = None;
+            slot.awman_killed = true;
+            if let Some(ch) = &slot.cancel_handle {
+                let _ = ch.cancel();
+            }
+        }
+        self.frontend.parallel_step_yolo_countdown_finished(name);
     }
 
     /// Drive every in-flight per-step yolo countdown one tick. Independent per
-    /// slot — expiry kills only that container and advances the queue.
+    /// slot — expiry kills only that container. A silence or `AgentDone`
+    /// expiry advances (and frees the slot for the queue); an `AgentBlocked`
+    /// or `AgentError` expiry fails that step instead (WI 0141).
     #[allow(clippy::too_many_arguments)] // The parallel scheduler passes its coordinated phase queues together.
     pub(super) fn tick_parallel_yolo(
         &mut self,
@@ -534,58 +707,81 @@ impl WorkflowEngine {
         stuck_tx: &StuckFanIn,
         final_review: bool,
         review_ready: &mut HashSet<String>,
+        done_advanced: &mut HashSet<String>,
     ) -> Result<(), EngineError> {
         let now = Instant::now();
-        let ticking: Vec<(String, Instant)> = self
+        let ticking: Vec<(String, Instant, CountdownKind)> = self
             .active_steps
             .iter()
-            .filter_map(|s| s.yolo_deadline.map(|d| (s.step_name.clone(), d)))
+            .filter_map(|s| {
+                s.yolo_deadline
+                    .map(|d| (s.step_name.clone(), d, s.countdown_kind))
+            })
             .collect();
-        for (name, deadline) in ticking {
+        for (name, deadline, kind) in ticking {
+            // "Any output" cancels an `AgentError` countdown: the agent
+            // recovered by itself.
+            if kind == CountdownKind::AgentError && self.parallel_output_arrived(&name) {
+                // Output cancels the countdown only; the error stays recorded
+                // until a new status report (an exit without one fails).
+                self.msg_info(format!(
+                    "Step '{name}' produced output after reporting an error; cancelling countdown"
+                ));
+                self.cancel_parallel_countdown(&name);
+                continue;
+            }
+            // Active-tab suppression (WI 0141): an `AgentDone` countdown is
+            // held at its full length while the user interacts with this
+            // agent, so the countdown they see starts once they are quiet.
+            if kind == CountdownKind::AgentDone && self.frontend.user_interacting_with(&name) {
+                if let Some(slot) = self.active_steps.iter_mut().find(|s| s.step_name == name) {
+                    slot.yolo_deadline = Some(now + program_status::countdown_duration(kind));
+                }
+                continue;
+            }
             let remaining = deadline.saturating_duration_since(now);
-            match self
+            let kind_total = if kind == CountdownKind::StuckStep {
+                total
+            } else {
+                program_status::countdown_duration(kind)
+            };
+            let expire = match self
                 .frontend
-                .parallel_step_yolo_countdown_tick(&name, remaining, total)?
+                .parallel_step_yolo_countdown_tick(&name, remaining, kind_total)?
             {
                 YoloTickOutcome::Cancel => {
-                    if let Some(s) = self.active_steps.iter_mut().find(|s| s.step_name == name) {
-                        s.yolo_deadline = None;
-                    }
-                    self.frontend.parallel_step_yolo_countdown_finished(&name);
+                    self.cancel_parallel_countdown(&name);
+                    false
                 }
-                YoloTickOutcome::AdvanceNow => {
-                    if final_review {
-                        self.mark_final_parallel_step_ready(&name, review_ready);
-                    } else {
-                        self.yolo_advance_parallel(
-                            &name,
-                            waits,
-                            queue,
-                            slot_cap,
-                            launch_queued,
-                            stuck_tx,
-                        )?;
-                    }
+                YoloTickOutcome::AdvanceNow => true,
+                YoloTickOutcome::Continue => remaining.is_zero(),
+            };
+            if !expire {
+                continue;
+            }
+            if program_status::countdown_fails_step(kind) {
+                self.fail_parallel_step_for_report(&name);
+            } else if final_review && kind != CountdownKind::AgentDone {
+                // Only a silent (non-reporting) final agent is held for
+                // review; a reported `done` advances like any other step.
+                self.mark_final_parallel_step_ready(&name, review_ready);
+            } else {
+                if kind == CountdownKind::AgentDone {
+                    done_advanced.insert(name.clone());
                 }
-                YoloTickOutcome::Continue => {
-                    if remaining.is_zero() {
-                        if final_review {
-                            self.mark_final_parallel_step_ready(&name, review_ready);
-                        } else {
-                            self.yolo_advance_parallel(
-                                &name,
-                                waits,
-                                queue,
-                                slot_cap,
-                                launch_queued,
-                                stuck_tx,
-                            )?;
-                        }
-                    }
-                }
+                self.yolo_advance_parallel(&name, waits, queue, slot_cap, launch_queued, stuck_tx)?;
             }
         }
         Ok(())
+    }
+
+    /// Whether `name`'s `AgentError` countdown has seen new output.
+    fn parallel_output_arrived(&mut self, name: &str) -> bool {
+        self.active_steps
+            .iter_mut()
+            .find(|s| s.step_name == name)
+            .and_then(|s| s.output_watch.as_mut())
+            .is_some_and(program_status::OutputWatch::produced_output)
     }
 
     fn mark_final_parallel_step_ready(&mut self, name: &str, ready: &mut HashSet<String>) {

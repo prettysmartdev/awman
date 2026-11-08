@@ -58,13 +58,24 @@ impl Tab {
     /// the `stuck` flag for tab coloring.
     pub fn drain_stuck_events(&mut self) {
         for slot in &mut self.container_slots {
-            if let Some(rx) = slot.stuck_rx.as_mut() {
-                while let Ok(event) = rx.try_recv() {
-                    slot.stuck = matches!(event, StuckEvent::Stuck);
+            let Some(rx) = slot.stuck_rx.as_mut() else {
+                continue;
+            };
+            let mut events = Vec::new();
+            while let Ok(event) = rx.try_recv() {
+                events.push(event);
+            }
+            for event in events {
+                match event {
+                    StuckEvent::Reported(status) => slot.set_program_status(status),
+                    StuckEvent::Stuck => slot.stuck = true,
+                    StuckEvent::Unstuck | StuckEvent::StartupGraceExpired => slot.stuck = false,
                 }
             }
         }
         self.stuck = self.container_slots.iter().any(|slot| slot.stuck);
+        let status = self.program_status();
+        self.shared.signals.set_status(status);
 
         // WI-0096 §9: while a parallel group is active (the sequential
         // backbone is stashed in `dormant_slots`), aggregate the stuck /

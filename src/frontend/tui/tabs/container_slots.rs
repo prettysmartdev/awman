@@ -236,6 +236,11 @@ impl Tab {
                     slot.stuck = false;
                 }
             }
+            ContainerSlotEvent::CountdownKind { step_name, kind } => {
+                if let Some(slot) = self.slot_mut(&step_name) {
+                    slot.countdown_kind = kind;
+                }
+            }
             ContainerSlotEvent::YoloStarted {
                 step_name,
                 cancel_flag,
@@ -250,10 +255,12 @@ impl Tab {
                 remaining_secs,
             } => {
                 if let Some(slot) = self.slot_mut(&step_name) {
+                    let kind = slot.countdown_kind;
                     if let Ok(mut guard) = slot.yolo_state.lock() {
                         *guard = Some(YoloState {
                             step_name,
                             remaining_secs,
+                            kind,
                         });
                     }
                 }
@@ -314,6 +321,7 @@ impl Tab {
                 }
                 slot.region_scroll
                     .process(&mut slot.vt100_parser, &filtered.bytes);
+                slot.last_output_at = Instant::now();
                 received_any = true;
             }
         }

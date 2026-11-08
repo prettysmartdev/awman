@@ -3,6 +3,7 @@ pub mod bootstrap;
 pub mod features;
 pub mod network;
 mod reload;
+mod terminals;
 #[cfg(any(test, feature = "test-support"))]
 mod test_support;
 use crate::command::{
@@ -57,6 +58,8 @@ pub struct DaemonRuntime {
     apply_worker: Box<dyn Fn(crate::data::config::daemon::WorkerSettings) + Send + Sync>,
     changes: tokio::sync::Mutex<()>,
     shutdown_done: AtomicBool,
+    /// Built on first use by `terminals()` (WI 0141).
+    terminals: std::sync::OnceLock<Arc<crate::command::terminals::TerminalOperations>>,
 }
 #[derive(Debug, thiserror::Error)]
 pub enum FeatureChangeError {
@@ -500,6 +503,7 @@ mod tests {
             apply_worker: Box::new(|_| {}),
             changes: tokio::sync::Mutex::new(()),
             shutdown_done: AtomicBool::new(false),
+            terminals: Default::default(),
         });
         if enabled {
             runtime.supervisors[&FeatureName::Engine]
