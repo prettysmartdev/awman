@@ -221,12 +221,39 @@ impl LocalClient {
         sender
             .send_request(request)
             .await
-            .map_err(|e| failure(e.to_string()))
+            .map_err(connection_failure)
     }
 }
 
 fn failure(e: String) -> EngineError {
     EngineError::Other(format!("local daemon request: {e}"))
+}
+
+/// A socket can disappear after `connect` succeeds but before HTTP receives a
+/// response. Report that race the same way as a refused connection.
+fn connection_failure(error: hyper::Error) -> EngineError {
+    use std::error::Error as _;
+    if error.is_closed() || error.is_incomplete_message() || error.is_canceled() {
+        return EngineError::Other(NO_DAEMON.into());
+    }
+    let mut source = error.source();
+    while let Some(cause) = source {
+        if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+            if matches!(
+                io.kind(),
+                std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::NotConnected
+                    | std::io::ErrorKind::NotFound
+            ) {
+                return EngineError::Other(NO_DAEMON.into());
+            }
+        }
+        source = cause.source();
+    }
+    failure(error.to_string())
 }
 
 // ---------------------------------------------------------------- Unix ----

@@ -198,6 +198,24 @@ async fn local_client_refuses_cleanly_when_no_daemon_runs() {
 }
 
 #[tokio::test]
+async fn local_client_reports_no_daemon_when_peer_closes_before_replying() {
+    let home = Home::new();
+    awman::data::fs::private_files::create_private_dir(&home.root).unwrap();
+    let listener = tokio::net::UnixListener::bind(home.endpoint()).unwrap();
+    std::fs::set_permissions(home.endpoint(), std::fs::Permissions::from_mode(0o600)).unwrap();
+    let close = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        drop(stream);
+    });
+    let error = LocalClient::new(home.endpoint())
+        .send("GET", "/v1/health", None)
+        .await
+        .unwrap_err();
+    close.await.unwrap();
+    assert!(error.to_string().contains(local::NO_DAEMON), "{error}");
+}
+
+#[tokio::test]
 async fn local_client_refuses_an_open_socket_a_plain_file_or_an_open_directory() {
     let home = Home::new();
     let claim = home.claim();
