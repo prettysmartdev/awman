@@ -205,6 +205,7 @@ async fn local_client_reports_no_daemon_when_peer_closes_before_replying() {
     std::fs::set_permissions(home.endpoint(), std::fs::Permissions::from_mode(0o600)).unwrap();
     let close = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
+        drop(listener);
         drop(stream);
     });
     let error = LocalClient::new(home.endpoint())
