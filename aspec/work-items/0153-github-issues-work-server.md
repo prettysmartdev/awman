@@ -3,7 +3,7 @@
 Title: Reference work server: GitHub issues as a work queue
 Issue: issuelink
 
-Depends on: 0143 (the complete daemon, including the worker pull protocol and 0139 wire conventions).
+Depends on: 0143 (the complete daemon, including the worker pull protocol and 0139 wire conventions), 0145's push-retry slice, and 0146 (workflow context artifacts displayed by the reference server). The later credential and secret slice of 0145 does not gate this reference implementation.
 
 ## Summary:
 - 0143 defines how awman workers pull work from a work server. Add a small, working **reference implementation** in `examples/github-issues-work-server/` that turns GitHub issues into work items:
@@ -94,7 +94,7 @@ make sure only workers labelled `gpu=true` take it
   - On release: remove `awman:running`.
 - **Cancel.** Removing `queue_label` or closing the issue while a lease is running returns `cancel: true` on the next heartbeat.
 - **Viewers.** It accepts the lease terminal WebSocket (0143, `awman.terminal.v1`) and serves a minimal read-only page per running item (`/items/<id>`) with xterm.js, for maintainers who sign in through the GitHub App's separate web flow. Viewer sessions are not worker credentials. It never grants remote input.
-- **Workflow progress.** Persist 0143's `workflow_state` snapshots from the WSP event stream with their `(attempt, sequence)` ordering. The item page can show planned phases and steps, including pending ones, from the latest snapshot. Match requested work to `register.features`; do not offer a worker a capability it did not advertise. WI0165 adds optional workflow context attachments to this server later.
+- **Workflow progress.** Persist 0143's `workflow_state` snapshots from the WSP event stream with their `(attempt, sequence)` ordering. The item page can show planned phases and steps, including pending ones, from the latest snapshot. Match requested work to `register.features`; do not offer a worker a capability it did not advertise. Support 0146's optional workflow context attachments when the server displays run notes.
 
 ## Edge Case Considerations:
 - Fork PRs and untrusted issue authors: only issues opened or labelled by people with write access are queued. The `queue_label` is applied by a maintainer, and the event's actor permission is checked, so an outsider cannot put work into the queue.

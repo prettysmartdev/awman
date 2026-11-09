@@ -544,7 +544,7 @@ get correct rendering in the container, with nothing about my host terminal leak
   - `WEZTERM_*`, `KITTY_*`, `ITERM_*`, `LC_TERMINAL*`, `ALACRITTY_*`, `GHOSTTY_*`, `VTE_VERSION`, `WT_SESSION`, `WT_PROFILE_ID`.
 - It is applied at the single point where each runtime backend's container run spec gets its env: Docker, Apple `container`, builtin and sandbox, in `src/engine/container/` and `src/engine/sandbox/`.
   - It applies after overlays and agent env are merged, so even an overlay that requests one of these names gets a notice and the variable is not passed.
-  - Explicit per-session secrets (0147) are unaffected, because those names never match.
+  - Explicit per-session secrets (0145) are unaffected, because those names never match.
 - `TERM` is always `xterm-256color` inside containers, whatever the host `TERM` (`xterm-rex`, `xterm-kitty`, `tmux-256color`, …). The current pass-through (`src/engine/auth/host_secret_command.rs` passes `TERM` for host-side helpers only) is unchanged, because that is a host process. `COLORTERM=truecolor` is passed only when the host sets it.
 
 ### Edge Case Considerations:

@@ -32,6 +32,10 @@ pub struct ReadyImageResult {
     pub build: StepStatus,
     /// Acquisition from the source and install into the runtime.
     pub import: StepStatus,
+    /// Internal recovery signal for callers that can rebuild a broken local
+    /// source image. The user-facing failure remains in `import`.
+    #[serde(skip)]
+    pub import_failure: Option<ReadyImageImportFailure>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<ReadyImageWarning>,
     /// A non-default agent's image, prepared by `ready --build`. Its
@@ -51,6 +55,7 @@ impl ReadyImageResult {
             reference: None,
             build: StepStatus::Pending,
             import: StepStatus::Pending,
+            import_failure: None,
             warnings: Vec::new(),
             optional: false,
         }
@@ -65,6 +70,11 @@ impl ReadyImageResult {
     pub fn is_unfinished(&self) -> bool {
         !self.build.is_terminal() || !self.import.is_terminal()
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadyImageImportFailure {
+    AppleContentMissing,
 }
 
 /// The project base image built into one store, as a build input for the

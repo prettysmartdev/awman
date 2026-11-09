@@ -4,7 +4,7 @@
 //! and host-integration state and handed to Layer 3's `HostOutputFilter`.
 //! Today the inputs are the defaults (notifications stripped, OSC 7501
 //! re-encoded) and `agents.programStatus.enabled`: with program status
-//! turned off, agent reports are stripped instead of re-encoded. 0154 maps
+//! turned off, agent reports are stripped instead of re-encoded. 0157 maps
 //! `tui.integrations.rex.forwardAgentNotifications` onto
 //! `allow_notifications` through this function.
 

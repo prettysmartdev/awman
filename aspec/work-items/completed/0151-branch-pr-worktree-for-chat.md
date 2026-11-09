@@ -154,7 +154,7 @@ return to existing work with a new agent session, without changing anything in t
 - **Uncommitted changes in the invoking checkout:** they are not carried into the worktree. Mention this when a new branch is created.
 - **LFS or filter-based repos:** `host_command` disables content drivers, so a checkout on the host can contain LFS pointers rather than file contents. Note this in the docs.
 - **Two sessions on one worktree, or two simultaneous `--branch` launches:** the first is allowed, as with two sessions in one checkout. For the second, a failed `worktree add` re-runs the lookup once and reuses the worktree it finds.
-- **Combining flags:** `--work-item` (see 0148) works with all three on `exec prompt`, and is resolved from the invoking repo, including its `workItems.source`. `--plan`, `--yolo` and `--auto` work unchanged and do not imply any of these flags.
+- **Combining flags:** `--work-item` (see 0147) works with all three on `exec prompt`, and is resolved from the invoking repo, including its `workItems.source`. `--plan`, `--yolo` and `--auto` work unchanged and do not imply any of these flags.
 
 
 ## Test Considerations:

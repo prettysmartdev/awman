@@ -126,7 +126,10 @@ pub fn first_party(name: &str) -> Option<AgentDefinition> {
                 config_override: Some(("--config".into(), "sqlite_home".into())),
             }],
             skills_mount: Some(".codex/skills".into()),
-            ping_argv: Some(strings(&["codex", "exec"])),
+            // The host ping runs in a private empty directory, outside any
+            // Git repository. `codex exec` otherwise rejects that cwd before
+            // it can check authentication.
+            ping_argv: Some(strings(&["codex", "exec", "--skip-git-repo-check"])),
             sandbox_auth_env_vars: strings(&["OPENAI_API_KEY"]),
             ..base("codex", "Codex")
         },
@@ -606,7 +609,7 @@ mod tests {
             // The cheapest Claude model is pinned so the refresh ping never
             // uses the account default (which may be a premium model).
             ("claude", &["claude", "--model", "haiku", "--print"]),
-            ("codex", &["codex", "exec"]),
+            ("codex", &["codex", "exec", "--skip-git-repo-check"]),
             ("opencode", &["opencode", "run"]),
             ("gemini", &["gemini", "-p"]),
             ("copilot", &["copilot", "-p"]),

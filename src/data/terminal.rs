@@ -341,7 +341,7 @@ pub enum ProgramStatusMode {
 
 /// How agent bytes are filtered before they reach a host TTY. Resolved by
 /// Layer 2 from config and host-integration state, applied by Layer 3's
-/// `HostOutputFilter`. The default strips desktop notifications; Rex (0154)
+/// `HostOutputFilter`. The default strips desktop notifications; Rex (0157)
 /// maps `tui.integrations.rex.forwardAgentNotifications` onto
 /// `allow_notifications`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

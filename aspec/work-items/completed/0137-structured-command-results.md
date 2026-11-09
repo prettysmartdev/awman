@@ -208,7 +208,7 @@ Append `structured_results`, `outputs`, `event_source` and `step_activity` to `A
 - **An `on_failure` retry**: same `step_name` and `step_index`, with `step_attempt` incremented. `failed_steps` lists the step once, with its last attempt.
 - **Agents without PTY or streaming support**, or ACP agents: no `step_activity` and no `final_message`. Output lines carry `source` as usual.
 - **Very chatty agents**: `step_activity.summary` is one bounded line. Tool payloads never enter the event log.
-- **Secrets**: `final_message` and `step_activity.summary` pass through the same redaction as output lines once 0147 lands. Files in `/awman/output` are written by the agent and are not redacted. Document that.
+- **Secrets**: `final_message` and `step_activity.summary` pass through the same redaction as output lines once 0145 lands. Files in `/awman/output` are written by the agent and are not redacted. Document that.
 - **Large diffs**: the 500-entry cap and the truncation flag. Binary files report `added`/`deleted` as `null`.
 
 ## Test Considerations:

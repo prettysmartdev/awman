@@ -1,5 +1,5 @@
 //! Integration tests for `--branch`, `--pr` and `--worktree` on `chat` and
-//! `exec prompt` (work item 0153): the resolver against real local git
+//! `exec prompt` (work item 0151): the resolver against real local git
 //! repositories, and both commands' full launch paths against the holding
 //! container runtime.
 //!

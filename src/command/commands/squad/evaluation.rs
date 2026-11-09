@@ -646,7 +646,9 @@ impl LocalTaskEvaluator {
         // path. On an importing runtime (builtin) every pool agent goes through
         // provenance-checked acquisition, which for an installed image from an
         // unchanged source is a cache hit; an image from a different source is
-        // re-acquired. It never builds (`BuildPolicy::ImportOnly`).
+        // re-acquired. It starts with `BuildPolicy::ImportOnly`; a missing
+        // Apple Containers content blob can trigger one source-matched rebuild
+        // when the builtin builder is enabled.
         let mut pool_agents = vec![agent.as_str().to_string()];
         if let Some(map) = request.agents_to_models.as_ref() {
             let mut names: Vec<&String> = map.keys().collect();

@@ -436,6 +436,13 @@ pub enum EngineError {
         message: String,
     },
 
+    #[error("Apple Containers image '{reference}' is missing content required for {platform} ({detail}). Rebuild or re-pull that image in Apple Containers, then retry the import. If `builtin.builder.enabled` is true, `awman ready --build` can rebuild it")]
+    AppleImageContentMissing {
+        reference: String,
+        platform: String,
+        detail: String,
+    },
+
     #[error("image acquisition was cancelled")]
     ImageAcquisitionCancelled,
 

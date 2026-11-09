@@ -385,9 +385,6 @@ fn call(
         let code = sanitize(&code, &[]);
         let message = sanitize(&message, private);
         return Err(match code.as_str() {
-            "notFound" => {
-                EngineError::Config(format!("Apple Containers `{route}` failed: {message}"))
-            }
             "interrupted" => crate::engine::error::ImageRetryClass::Transient.failure(format!(
                 "Apple Containers `{route}` was interrupted: {message}"
             )),
@@ -676,7 +673,20 @@ pub(super) fn export(
         &[],
         &deadline_in(None),
         &[ctx.staging_dir],
-    )?;
+    )
+    .map_err(|error| match error {
+        EngineError::AppleImageStoreFailed { code, message, .. }
+            if code == "notFound"
+                && message.to_ascii_lowercase().contains("content with digest") =>
+        {
+            EngineError::AppleImageContentMissing {
+                reference: sanitize(reference, &[]),
+                platform: ctx.platform.to_string(),
+                detail: message,
+            }
+        }
+        other => other,
+    })?;
     ctx.cancel.check()?;
     ctx.deadline.check()?;
 
