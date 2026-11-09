@@ -286,14 +286,14 @@ The requirements depend on the steps and the repository's remote:
 
 #### The prerequisite report
 
-In an interactive run (the TUI, or the CLI on a terminal), the report comes first. Each check has one entry: a mark (`✗` missing, `!` needs your consent, `?` could not be checked, `✓` satisfied), its name and status, and the detail underneath. The checks that need your attention are listed first. In the TUI, long reports scroll with **↑ / ↓ / PgUp / PgDn**, and the choices stay on screen.
+In an interactive run (the TUI, or the CLI on a terminal), awman first reports which checks are running and their results, then shows the report. Each check has one entry: a mark (`✗` missing, `!` needs your consent, `?` could not be checked, `✓` satisfied), its name and status, and the detail underneath. The checks that need your attention are listed first. In the TUI, satisfied checks start collapsed into an **N/M satisfied** block; press **s** to expand or collapse them. Long reports scroll with **↑ / ↓ / PgUp / PgDn**, and the choices stay on screen. Prerequisite questions use numbered choices in display order, continuing with letters for longer lists.
 
 Under the checks, the report says what happens if you continue:
 
-- **[c] Continue to the questions**: awman asks about each item that needs attention, one at a time, and offers the fixes it can apply (mount a key, use or paste a token, enter an identity). Nothing is mounted, passed to a container or written until you pick a fix. **Esc** does the same as **c**.
-- **[a] Abort the run** (or **Ctrl-C**): stop before anything starts.
+- **Enter to configure missing prerequisites**: awman asks about each item that needs attention, one at a time, and offers the fixes it can apply (mount a key, use or paste a token, enter an identity). Nothing is mounted, passed to a container or written until you pick a fix.
+- **Esc** (or **Ctrl-C**): cancel before anything starts.
 
-If you leave items unresolved after the questions, by declining or picking "continue without", the run still starts by default. You get a warning for each item, and the steps that need it fail when they run. With `--prerequisite-unresolved fail` (or `workflows.prerequisites.unresolved: "fail"`), the run stops before any agent starts. The report says which of these applies. When every check is satisfied, the choice is **[c] Start the workflow**. With `--check-prerequisites`, the report is the whole result and the only choice is **Close**.
+If you leave items unresolved after the questions, by declining or picking "continue without", the run still starts by default. You get a warning for each item, and the steps that need it fail when they run. With `--prerequisite-unresolved fail` (or `workflows.prerequisites.unresolved: "fail"`), the run stops before any agent starts. The report says which of these applies. When every check is satisfied, **Enter** starts the workflow. With `--check-prerequisites`, the report is the whole result and the only choice is **Close**.
 
 Repo-local Git identity is preferred: it follows the repository/worktree and avoids exposing your global identity to a container. Host identity use requires an explicit choice. For SSH, a key mount is read-only; the private key itself is not copied into the workflow configuration.
 

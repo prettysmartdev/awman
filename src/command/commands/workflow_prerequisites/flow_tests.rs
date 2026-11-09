@@ -331,6 +331,19 @@ fn interactive_prepare_reviews_first_then_grants_and_injects_identity_and_token(
         .prepare(&needs(vec![identity_need(), token_need()]), &mut fe)
         .unwrap();
 
+    assert!(fe
+        .messages
+        .iter()
+        .any(|m| m == "Checking 2 workflow prerequisites…"));
+    assert!(fe
+        .messages
+        .iter()
+        .any(|m| m == "Checking prerequisite: Git identity…"));
+    assert!(fe
+        .messages
+        .iter()
+        .any(|m| m.starts_with("Prerequisite: Git identity — ")));
+
     // Review: the report is shown once, before any question, and says that
     // questions follow.
     assert_eq!(fe.shown.len(), 1);
@@ -436,6 +449,13 @@ fn a_remembered_env_token_is_granted_on_later_runs_without_asking() {
     assert_eq!(token.source, TokenGrantSource::Env(TOKEN_VAR.into()));
     assert_eq!(token.secret.expose(), TOKEN_VALUE);
     assert!(grants_file(repo.root()), "the decision is remembered");
+    assert!(
+        first.messages.iter().any(|m| m
+            .contains("Tip: this repo's prerequisite preference is stored in")
+            && m.contains("prerequisite-grants.json")),
+        "{:?}",
+        first.messages
+    );
 
     // Interactive again: nothing is asked.
     let mut second = Scripted::interactive(Script::default());

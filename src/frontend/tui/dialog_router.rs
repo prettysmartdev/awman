@@ -93,6 +93,12 @@ pub(super) fn handle_dialog_submit(app: &mut App) {
             app.command_dialog_active = false;
         }
 
+        Some(Dialog::Review(state)) if is_command && state.accepts('\n') => {
+            app.send_dialog_response(DialogResponse::Char('\n'));
+            app.active_dialog = None;
+            app.command_dialog_active = false;
+        }
+
         // A single-key Custom dialog is an acknowledgement, not a choice —
         // Enter accepts its one action. Multi-key Custom dialogs are real
         // choices and keep requiring the letter, so Enter cannot pick one of
@@ -584,7 +590,17 @@ pub(super) fn handle_dialog_char(app: &mut App, c: char) {
         // A gated choice (approve) is ignored until the whole review has
         // been on screen; the others (decline) are always accepted.
         Some(Dialog::Review(ref state)) => {
-            if state.accepts(c) {
+            if c == 's'
+                && matches!(
+                    &state.body,
+                    crate::data::dialog::ReviewBody::Prerequisites(_)
+                )
+            {
+                if let Some(Dialog::Review(state)) = app.active_dialog.as_mut() {
+                    state.satisfied_expanded = !state.satisfied_expanded;
+                    state.scroll = 0;
+                }
+            } else if state.accepts(c) {
                 app.send_dialog_response(DialogResponse::Char(c));
                 app.active_dialog = None;
                 app.command_dialog_active = false;

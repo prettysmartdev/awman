@@ -124,8 +124,9 @@ approval or automatic progression. Interactive frontends share the same command
 prompts and safe dismissal defaults; unattended frontends use policy and explicit
 inputs. Remote clients cannot widen the operator's credential ceiling without a
 global opt-in. Check-only output exits 0 only when every check is satisfied,
-otherwise 1 (including unknown checks). Summary Esc continues; summary Ctrl-C
-aborts. Invalid credential inputs, refused widening and unresolved fail policies
+otherwise 1 (including unknown checks). Summary Enter continues to the questions
+and Esc or Ctrl-C cancels. Prerequisite answers use ordered numeric keys, then
+letters for longer lists. Invalid credential inputs, refused widening and unresolved fail policies
 use exit 2; explicit abort uses 130. Per-command syntax belongs in the generated
 command reference.
 

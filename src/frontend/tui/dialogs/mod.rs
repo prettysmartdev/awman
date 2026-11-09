@@ -525,6 +525,7 @@ pub struct ReviewState {
     pub request: ReviewRequest,
     pub scroll: usize,
     pub max_scroll: std::cell::Cell<usize>,
+    pub satisfied_expanded: bool,
 }
 
 impl ReviewState {
@@ -565,6 +566,7 @@ impl From<ReviewRequest> for ReviewState {
             request,
             scroll: 0,
             max_scroll: std::cell::Cell::new(usize::MAX),
+            satisfied_expanded: false,
         }
     }
 }

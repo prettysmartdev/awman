@@ -132,7 +132,8 @@ fn prerequisites_modal_lays_out_one_entry_per_check_without_column_wrapping() {
     assert!(rows[token].contains("missing │"), "{}", rows[token]);
     assert!(row_of("No token in GH_TOKEN") == token + 1, "{text}");
     assert!(row_of("! Push over SSH (github.com)") > token);
-    assert!(row_of("✓ Git identity") > row_of("! Push over SSH"));
+    assert!(row_of("1/3 satisfied") > row_of("! Push over SSH"));
+    assert!(!text.contains("✓ Git identity"), "{text}");
     assert!(!text.contains("needed by: any teardown step"), "{text}");
     assert!(
         text.contains("• repo config mounts ~/.ssh into every step"),
@@ -142,9 +143,23 @@ fn prerequisites_modal_lays_out_one_entry_per_check_without_column_wrapping() {
     let next = row_of("one at a time");
     assert!(text.contains("does not stop the run"), "{text}");
     assert!(text.contains("dynamic workflow"), "{text}");
-    assert!(row_of("[c] Continue to the questions") > next);
-    assert!(text.contains("[a] Abort the run"));
-    assert!(text.contains("[Esc] Continue to the questions"), "{text}");
+    assert!(row_of("Enter to configure missing prerequisites") > next);
+    assert!(text.contains("[Esc] Cancel"), "{text}");
+    assert!(
+        text.contains("[s] Expand satisfied prerequisites"),
+        "{text}"
+    );
+    press_char(&mut app, 's');
+    let expanded = screen(&mut app, 120, 50).join("\n");
+    assert!(expanded.contains("✓ Git identity"), "{expanded}");
+    assert!(
+        expanded.contains("[s] Collapse satisfied prerequisites"),
+        "{expanded}"
+    );
+    press_char(&mut app, 's');
+    assert!(!screen(&mut app, 120, 50)
+        .join("\n")
+        .contains("✓ Git identity"));
 }
 
 #[test]
@@ -152,16 +167,28 @@ fn prerequisites_modal_keeps_its_choices_on_a_small_terminal_and_scrolls() {
     let mut app = make_app();
     let rx = open_report(&mut app, busy_report(), questions());
     let text = screen(&mut app, 70, 24).join("\n");
-    assert!(text.contains("[c] Continue to the questions"), "{text}");
-    assert!(text.contains("[Esc] Continue"), "{text}");
+    assert!(
+        text.contains("Enter to configure missing prerequisites"),
+        "{text}"
+    );
+    assert!(text.contains("[Esc] Cancel"), "{text}");
     assert!(text.contains("▼ more below"), "{text}");
     for _ in 0..40 {
         press_key(&mut app, KeyCode::Down, KeyModifiers::NONE);
     }
     let text = screen(&mut app, 70, 24).join("\n");
     assert!(text.contains("end of review"), "{text}");
-    press_char(&mut app, 'a');
-    assert!(matches!(rx.try_recv().unwrap(), DialogResponse::Char('a')));
+    press_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    assert!(matches!(rx.try_recv().unwrap(), DialogResponse::Char('\n')));
+}
+
+#[test]
+fn prerequisites_modal_escape_cancels() {
+    let mut app = make_app();
+    let rx = open_report(&mut app, busy_report(), questions());
+    screen(&mut app, 120, 50);
+    press_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+    assert!(matches!(rx.try_recv().unwrap(), DialogResponse::Dismissed));
 }
 
 #[test]
@@ -275,7 +302,7 @@ fn wi0149_tui_report_abort_returns_130_and_secret_request_is_typed() {
             .unwrap(),
         DialogRequest::Review { .. }
     ));
-    responses.send(DialogResponse::Char('a')).unwrap();
+    responses.send(DialogResponse::Dismissed).unwrap();
     assert!(matches!(
         requests
             .recv_timeout(std::time::Duration::from_secs(3))

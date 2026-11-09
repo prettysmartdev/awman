@@ -35,7 +35,7 @@ impl WorkflowPrerequisiteFrontend for Frontend {
         prompt: &Prompt<IdentityChoice>,
     ) -> Result<IdentityChoice, CommandError> {
         self.identity_calls += 1;
-        Ok(prompt.answer_for_key('h').unwrap())
+        Ok(prompt.answer_for_key('1').unwrap())
     }
     fn ask_prerequisite_tool(
         &mut self,

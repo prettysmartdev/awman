@@ -399,7 +399,14 @@ pub fn read_prerequisite_report(
 ) -> Result<bool, crate::command::error::CommandError> {
     use crossterm::event::{self, Event, KeyCode, KeyModifiers};
     for choice in &prompt.choices {
-        eprintln!("  [{}] {}", choice.key, choice.label);
+        if choice.key == '\n' {
+            eprintln!("  {}", choice.label);
+        } else {
+            eprintln!("  [{}] {}", choice.key, choice.label);
+        }
+    }
+    if prompt.choice_for_key('\n').is_some() {
+        eprintln!("  [Esc] Cancel");
     }
     let _raw = RawModeGuard::enable().map_err(|_| crate::command::error::CommandError::Aborted)?;
     loop {
@@ -410,9 +417,12 @@ pub fn read_prerequisite_report(
                 KeyCode::Char('c' | 'd') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     return Err(crate::command::error::CommandError::Aborted)
                 }
-                KeyCode::Enter | KeyCode::Esc => {
-                    return Ok(prompt.default_on_dismiss.unwrap_or(false))
+                KeyCode::Enter => {
+                    return Ok(prompt
+                        .answer_for_key('\n')
+                        .unwrap_or_else(|| prompt.default_on_dismiss.unwrap_or(false)))
                 }
+                KeyCode::Esc => return Ok(prompt.default_on_dismiss.unwrap_or(false)),
                 KeyCode::Char(ch) => {
                     if let Some(answer) = prompt.answer_for_key(ch) {
                         return Ok(answer);

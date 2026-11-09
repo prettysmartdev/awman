@@ -435,10 +435,22 @@ impl WorkflowPrerequisiteFlow {
             ));
             return;
         };
-        if let Err(e) = store.remember(key, grant) {
-            sink.write_message(warning(format!(
+        match store.remember(key, grant) {
+            Err(e) => sink.write_message(warning(format!(
                 "could not remember this decision ({e}); it applies to this run only"
-            )));
+            ))),
+            Ok(()) => sink.write_message(UserMessage {
+                level: MessageLevel::Info,
+                text: format!(
+                    "Tip: this repo's prerequisite preference is stored in {}",
+                    PrerequisiteGrantStore::path_for(
+                        self.data_home
+                            .as_deref()
+                            .expect("grant store has a data home")
+                    )
+                    .display()
+                ),
+            }),
         }
     }
 
@@ -562,6 +574,55 @@ impl WorkflowPrerequisiteFlow {
             .run()
     }
 
+    pub fn preflight_with_messages(
+        &self,
+        needs: &WorkflowPrerequisites,
+        can_ask: bool,
+        frontend: &mut dyn WorkflowPrerequisiteFrontend,
+    ) -> WorkflowPrerequisiteReport {
+        Self::announce_preflight(needs.needs.len(), frontend);
+        let preflight =
+            self.build_preflight(needs.clone(), PrerequisitePhase::Start, can_ask, None);
+        Self::run_preflight_with_messages(&preflight, frontend)
+    }
+
+    fn announce_preflight(count: usize, frontend: &mut dyn WorkflowPrerequisiteFrontend) {
+        frontend.write_message(UserMessage {
+            level: MessageLevel::Info,
+            text: format!("Checking {count} workflow prerequisites…"),
+        });
+    }
+
+    fn run_preflight_with_messages(
+        preflight: &PrerequisitePreflight,
+        frontend: &mut dyn WorkflowPrerequisiteFrontend,
+    ) -> WorkflowPrerequisiteReport {
+        preflight.run_with_progress(&mut |need, checks| match checks {
+            None => frontend.write_message(UserMessage {
+                level: MessageLevel::Info,
+                text: format!("Checking prerequisite: {}…", need.label()),
+            }),
+            Some(checks) => {
+                if checks.is_empty() {
+                    frontend.write_message(UserMessage {
+                        level: MessageLevel::Info,
+                        text: format!("Prerequisite: {} — not required", need.label()),
+                    });
+                }
+                for check in checks {
+                    frontend.write_message(UserMessage {
+                        level: MessageLevel::Info,
+                        text: format!(
+                            "Prerequisite: {} — {}",
+                            check.prerequisite.label(),
+                            check.status.label()
+                        ),
+                    });
+                }
+            }
+        })
+    }
+
     /// Run the whole start-of-run flow: probe, show, ask, apply policy.
     /// Returns everything the run carries, or the error that stops it before
     /// any container starts.
@@ -571,9 +632,10 @@ impl WorkflowPrerequisiteFlow {
         frontend: &mut dyn WorkflowPrerequisiteFrontend,
     ) -> Result<PreparedPrerequisites, CommandError> {
         let can_ask = frontend.can_ask_prerequisites();
+        Self::announce_preflight(needs.needs.len(), frontend);
         let preflight =
             self.build_preflight(needs.clone(), PrerequisitePhase::Start, can_ask, None);
-        let report = preflight.run();
+        let report = Self::run_preflight_with_messages(&preflight, frontend);
         let resolved_needs = preflight.resolved_prerequisites(&report);
         let redaction = RedactionSet::new();
         let outcome = self.resolve(&resolved_needs, report, &redaction, frontend)?;

@@ -194,7 +194,7 @@ $AWMAN_HOME/
   squad/                           squad storage: task workspaces and config, builds, logs
   attach/                          attach sockets
   builtin/                         default runtime.builtin.stateDir
-  prerequisite_grants.json         remembered workflow credential choices
+  prerequisite-grants.json         remembered workflow credential choices
   workflows/  skills/  worktrees/  agents/  logs/ …
 ```
 
@@ -243,7 +243,7 @@ All keys are optional. `preflight` is `warn` (the default) or `off`; `off` skips
 
 Repository config cannot grant access to host credentials. It can ask or deny, narrow globally allowed settings, provide a fixed Git identity, and suggest an SSH key. Put broad grants in the global file or choose them when prompted. `allowApiClientGrants` is global-only; when false, API callers cannot use prerequisite flags to grant credentials beyond the configured policy.
 
-Remembered SSH and token choices are stored as decisions in `<AWMAN_HOME>/prerequisite_grants.json`; the file does not contain credentials. A remembered choice applies only to its repository, remote, and credential type. Each remembered choice has a `grant_…` ID. Review or remove them with the daemon API:
+Remembered SSH and token choices are stored as decisions in the data home at `prerequisite-grants.json` (`$AWMAN_HOME/prerequisite-grants.json`, `$XDG_DATA_HOME/awman/prerequisite-grants.json`, or `~/.awman/prerequisite-grants.json`). awman shows the exact path after you choose "remember for this repo". The file does not contain credentials. A remembered choice applies only to its repository, remote, and credential type. Each remembered choice has a `grant_…` ID. Review or remove them with the daemon API:
 
 ```sh
 awman daemon api grants.list
