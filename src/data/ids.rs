@@ -109,6 +109,8 @@ typed_id!(CommandId, "cmd", "command");
 typed_id!(TaskId, "task", "squad task");
 typed_id!(RunId, "run", "squad run");
 typed_id!(GrantId, "grant", "prerequisite grant");
+typed_id!(FrontendId, "fe", "frontend");
+typed_id!(DialogId, "dlg", "dialog");
 typed_id!(InstanceId, "ins", "engine instance");
 typed_id!(TabId, "tab", "engine tab");
 typed_id!(TerminalId, "term", "terminal");
@@ -122,6 +124,8 @@ pub const ID_PREFIXES: &[(&str, &str)] = &[
     ("run", "squad run"),
     ("grant", "prerequisite grant"),
     ("ins", "engine instance"),
+    ("fe", "frontend"),
+    ("dlg", "dialog"),
     ("tab", "engine tab"),
     ("term", "terminal"),
     ("lease", "work lease"),
@@ -159,6 +163,8 @@ mod tests {
 
     #[test]
     fn every_resource_id_uses_its_declared_prefix() {
+        assert!(FrontendId::new().as_str().starts_with("fe_"));
+        assert!(DialogId::new().as_str().starts_with("dlg_"));
         assert!(WorkerSessionId::new().as_str().starts_with("ses_"));
         assert!(CommandId::new().as_str().starts_with("cmd_"));
         assert!(TaskId::new().as_str().starts_with("task_"));

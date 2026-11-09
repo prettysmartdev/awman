@@ -380,6 +380,10 @@ exit 0
             .env("FAKE_DOCKER_CONTROL", self.dir.path().join("control"))
             .envs(env.iter().copied())
             .stdin(Stdio::null());
+        if let Ok(backend) = std::env::var("AWMAN_TEST_BACKEND") {
+            assert!(matches!(backend.as_str(), "builtin" | "daemon"));
+            command.env("AWMAN_TUI_BACKEND", backend);
+        }
         command
     }
 }

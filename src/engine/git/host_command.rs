@@ -1,9 +1,10 @@
 //! Host Git must not run repository-supplied hooks, monitors or content drivers.
+use crate::data::config::env::EnvSnapshot;
 use std::path::Path;
 use std::process::Command;
 
-pub(super) fn command(cwd: &Path) -> Command {
-    let mut command = discovery_command(cwd);
+pub(super) fn command(snapshot: &EnvSnapshot, cwd: &Path) -> Command {
+    let mut command = discovery_command(snapshot, cwd);
     if cwd.join(".git").exists() {
         // The session/lifecycle owns the mount root. Writable core.worktree
         // configuration must never redirect host staging or checkout.
@@ -14,8 +15,8 @@ pub(super) fn command(cwd: &Path) -> Command {
     command
 }
 
-pub(super) fn discovery_command(cwd: &Path) -> Command {
-    let mut command = Command::new("git");
+pub(super) fn discovery_command(snapshot: &EnvSnapshot, cwd: &Path) -> Command {
+    let mut command = crate::engine::host_cli::command(snapshot, "git");
     command
         .current_dir(cwd)
         .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -42,7 +43,7 @@ pub(super) fn discovery_command(cwd: &Path) -> Command {
     // Attribute names are arbitrary. Disable every configured executable
     // content driver, including those selected by .git/info/attributes.
     // `git config` only reads settings; it does not execute their values.
-    if let Ok(output) = Command::new("git")
+    if let Ok(output) = crate::engine::host_cli::command(snapshot, "git")
         .args(["config", "--null", "--name-only", "--get-regexp", "^(filter\\..*\\.(clean|smudge|process)|diff\\..*\\.(command|textconv)|merge\\..*\\.driver)$"])
         .env("GIT_CONFIG_NOSYSTEM", "1").env("GIT_TERMINAL_PROMPT", "0")
         .stdin(std::process::Stdio::null()).current_dir(cwd).output()
@@ -75,12 +76,13 @@ pub(super) const NETWORK_TIMEOUT: std::time::Duration = std::time::Duration::fro
 /// makes SSH headless unless the user chose an SSH command through
 /// their environment or global configuration.
 pub(super) fn transport_command(
+    snapshot: &EnvSnapshot,
     cwd: &Path,
     remote: &str,
 ) -> Result<Command, crate::engine::error::EngineError> {
-    let mut command = command(cwd);
+    let mut command = command(snapshot, cwd);
     let mut user_ssh_command = false;
-    for (scope, key) in config_keys_with_scope(cwd, UNTRUSTED_TRANSPORT_KEYS)? {
+    for (scope, key) in config_keys_with_scope(snapshot, cwd, UNTRUSTED_TRANSPORT_KEYS)? {
         if !matches!(scope.as_str(), "global" | "system" | "command") {
             return Err(crate::engine::error::EngineError::Git(format!(
                 "refusing to contact remote '{remote}': repository configuration sets `{key}` ({scope} scope), which could run a program or redirect credentials on the host. Remove it from the repository's Git config (or move it to your global config) and retry."
@@ -88,9 +90,10 @@ pub(super) fn transport_command(
         }
         user_ssh_command |= key == "core.sshcommand";
     }
-    let env_ssh = crate::data::config::env::host_var_os(crate::data::config::env::GIT_SSH_COMMAND)
+    let env_ssh = snapshot
+        .get_os(crate::data::config::env::GIT_SSH_COMMAND)
         .is_some()
-        || crate::data::config::env::host_var_os(crate::data::config::env::GIT_SSH).is_some();
+        || snapshot.get_os(crate::data::config::env::GIT_SSH).is_some();
     if !env_ssh && !user_ssh_command {
         // ssh opens /dev/tty for host-key and passphrase prompts, which
         // GIT_TERMINAL_PROMPT does not cover.
@@ -108,10 +111,11 @@ pub(super) fn transport_command(
 /// `(scope, key)` for every configured key matching `pattern`. A failure to
 /// read configuration is an error, never "nothing configured".
 fn config_keys_with_scope(
+    snapshot: &EnvSnapshot,
     cwd: &Path,
     pattern: &str,
 ) -> Result<Vec<(String, String)>, crate::engine::error::EngineError> {
-    let output = Command::new("git")
+    let output = crate::engine::host_cli::command(snapshot, "git")
         .args([
             "config",
             "--show-scope",

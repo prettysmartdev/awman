@@ -53,6 +53,45 @@ pub use parsed_input::ParsedCommandBoxInput;
 pub use resolved::{BuildContext, CallerContext, ResolvedArgs, ResolvedFlags};
 pub use runtime_context::RuntimeContext;
 
+/// Presentation facts supplied by a CLI. Backend selection and the wire
+/// conversation remain in Dispatch; the adapter only renders their results.
+#[derive(Debug, Clone, Copy)]
+pub struct CliRelayFacts {
+    pub stdin_is_tty: bool,
+    pub stdout_is_tty: bool,
+    pub term_size: crate::data::frontend_protocol::TermSize,
+}
+
+/// CLI completion without losing a remote command's exit code or outcome.
+pub enum CliCompletion {
+    Local(Box<Result<CommandOutcome, CommandError>>),
+    Relayed(crate::data::frontend_protocol::CommandResultWire),
+}
+
+impl CliCompletion {
+    fn local(result: Result<CommandOutcome, CommandError>) -> Self {
+        Self::Local(Box::new(result))
+    }
+}
+
+/// The rendering half of a CLI relay. No daemon discovery, command parsing,
+/// admission or fallback policy is implemented by this trait's adapters.
+pub trait CliRelayFrontend: UserMessageSink + Send + Sync + 'static {
+    fn relay_bytes(&mut self, stream: crate::data::frontend_protocol::OutputStream, bytes: &[u8]);
+    fn relay_facts(&self) -> CliRelayFacts;
+    fn relay_notice(&mut self, text: &str);
+    fn relay_output(
+        &mut self,
+        stream: crate::data::frontend_protocol::OutputStream,
+        message: crate::data::message::UserMessage,
+    );
+    fn relay_dialog(
+        &mut self,
+        request: crate::data::dialog::DialogRequest,
+        interrupted: &tokio_util::sync::CancellationToken,
+    ) -> crate::data::dialog::DialogResponse;
+}
+
 // ─── CommandFrontend trait ──────────────────────────────────────────────────
 
 /// Frontend trait that supplies flag values to Dispatch. Extended by per-
@@ -617,6 +656,446 @@ impl<F: DispatchFrontend> Dispatch<F> {
     }
 }
 
+impl<F: DispatchFrontend + CliRelayFrontend> Dispatch<F> {
+    /// Execute a CLI invocation using the backend chosen by the hand-off.
+    /// `argv` is the invoking argv, including argv[0]. Only catalogue entries
+    /// explicitly admitting a CLI relay can discover or start a daemon.
+    pub async fn run_relayed(
+        mut self,
+        path: &[&str],
+        argv: Vec<String>,
+    ) -> Result<CliCompletion, crate::command::engine_handoff::HandoffError> {
+        use crate::command::engine_handoff::{BackendSelection, EngineHandoff};
+        use crate::command::integrations::IntegrationRegistry;
+
+        if !self.catalogue.is_relay_allowed(path) {
+            return Ok(CliCompletion::local(self.run_command(path).await));
+        }
+        {
+            let mut session = self.session.write().await;
+            if let Err(error) = session.reload_config() {
+                session.state_mut().fail_command(error.to_string());
+                return Ok(CliCompletion::local(Err(error.into())));
+            }
+        }
+        let (env, config) = {
+            let session = self.session.read().await;
+            (session.env().clone(), session.effective_config())
+        };
+        let handoff = EngineHandoff::new(
+            env.clone(),
+            config.clone(),
+            IntegrationRegistry::compiled_in(),
+            Arc::new(CliHandoffPrompter),
+        )
+        .resolve()
+        .await;
+        let handoff = match handoff {
+            Ok(handoff) => handoff,
+            Err(error) if config.tui_backend() == crate::data::config::tui::TuiBackend::Auto => {
+                self.frontend
+                    .relay_notice(&error.message.replace(['\r', '\n'], " "));
+                return Ok(CliCompletion::local(self.run_command(path).await));
+            }
+            Err(error) => return Err(error),
+        };
+        if let Some(notice) = &handoff.notice {
+            self.frontend
+                .relay_notice(&notice.replace(['\r', '\n'], " "));
+        }
+        let BackendSelection::Daemon { endpoint, .. } = handoff.selection else {
+            return Ok(CliCompletion::local(self.run_command(path).await));
+        };
+        let facts = self.frontend.relay_facts();
+        let hello = crate::data::frontend_protocol::Hello {
+            protocol: crate::data::frontend_protocol::FRONTEND_SUBPROTOCOL.into(),
+            build: env!("CARGO_PKG_VERSION").into(),
+            kind: crate::data::frontend_protocol::FrontendKindWire::Cli,
+            role: crate::data::frontend_protocol::FrontendRole::Primary,
+            annotations: handoff.annotations,
+            cwd: env.cwd().to_path_buf(),
+            argv: argv.clone(),
+            env: env.to_hello_env(),
+            term_size: facts.term_size,
+            stdin_is_tty: facts.stdin_is_tty,
+            stdout_is_tty: facts.stdout_is_tty,
+            view: None,
+            resume: None,
+        };
+        // No command has been submitted yet. A failure here can safely take
+        // auto's builtin branch. After Submit, a failure must be reported.
+        let connected = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            CliRelayConnection::open(&endpoint.address, hello),
+        )
+        .await
+        .map_err(|_| CliConnectError::from("the engine did not answer the CLI handshake"))
+        .and_then(|result| result);
+        let connection = match connected {
+            Ok(connection) => connection,
+            Err(error) => {
+                let notice = crate::command::engine_handoff::fallback_notice(&error.message);
+                if config.tui_backend() == crate::data::config::tui::TuiBackend::Auto {
+                    self.frontend
+                        .relay_notice(&notice.replace(['\r', '\n'], " "));
+                    return Ok(CliCompletion::local(self.run_command(path).await));
+                }
+                return Err(crate::command::engine_handoff::HandoffError {
+                    message: notice,
+                    exit_code: error.exit_code,
+                });
+            }
+        };
+        // Reconstruct the canonical argv from the frontend's already parsed
+        // invocation. Global flags before the subcommand, aliases and values
+        // containing spaces are handled by the catalogue, never by Layer 3.
+        let args = self
+            .relay_argv(path)
+            .map_err(|error| cli_relay_failure(error.to_string()))?;
+        connection
+            .run(self.frontend, args, facts.term_size)
+            .await
+            .map(CliCompletion::Relayed)
+            .map_err(cli_relay_failure)
+    }
+}
+
+impl<F: CommandFrontend> Dispatch<F> {
+    fn relay_argv(&self, path: &[&str]) -> Result<Vec<String>, CommandError> {
+        use crate::command::dispatch::projections::raw_args::ParsedFlag;
+        let canonical = self.catalogue.canonical_path(path);
+        let refs: Vec<&str> = canonical.to_vec();
+        let spec = self
+            .catalogue
+            .lookup(&refs)
+            .ok_or_else(|| CommandError::unknown_command(path))?;
+        let mut argv: Vec<String> = canonical.iter().map(|s| (*s).to_string()).collect();
+        let resolved = self.resolve_flags(path)?;
+        // Use the same typed extraction as command construction, preserving
+        // repeated values and not forwarding frontend default values.
+        let mut values = Vec::new();
+        for flag in spec.flags.iter().chain(self.catalogue.global_flags()) {
+            use catalogue::FlagKind;
+            let value = match flag.kind {
+                FlagKind::Bool if flag.long == "headless" => {
+                    resolved.bool(flag.long).then_some(ParsedFlag::Bool(true))
+                }
+                FlagKind::Bool => self
+                    .frontend
+                    .flag_bool(&refs, flag.long)?
+                    .filter(|v| *v)
+                    .map(ParsedFlag::Bool),
+                FlagKind::String | FlagKind::OptionalString | FlagKind::Enum(_) => self
+                    .frontend
+                    .flag_string(&refs, flag.long)?
+                    .map(ParsedFlag::Str),
+                FlagKind::VecString => {
+                    let list = self.frontend.flag_strings(&refs, flag.long)?;
+                    (!list.is_empty()).then_some(ParsedFlag::Strings(list))
+                }
+                FlagKind::Path | FlagKind::OptionalPath => self
+                    .frontend
+                    .flag_path(&refs, flag.long)?
+                    .map(ParsedFlag::Path),
+                FlagKind::U16 => self
+                    .frontend
+                    .flag_u16(&refs, flag.long)?
+                    .map(ParsedFlag::U16),
+                FlagKind::UsizeAtLeastOne => self
+                    .frontend
+                    .flag_usize(&refs, flag.long)?
+                    .map(ParsedFlag::Usize),
+            };
+            if let Some(value) = value {
+                let items = match value {
+                    ParsedFlag::Bool(_) => vec![],
+                    ParsedFlag::Strings(items) => items,
+                    ParsedFlag::Str(value) => vec![value],
+                    ParsedFlag::Path(value) => vec![value.to_string_lossy().into_owned()],
+                    ParsedFlag::U16(value) => vec![value.to_string()],
+                    ParsedFlag::Usize(value) => vec![value.to_string()],
+                };
+                if items.is_empty() {
+                    values.push(format!("--{}", flag.long));
+                } else {
+                    for value in items {
+                        values.push(format!("--{}={value}", flag.long));
+                    }
+                }
+            }
+        }
+        argv.extend(values);
+        // `--` preserves positional values that begin with a dash.
+        argv.push("--".into());
+        for argument in spec.arguments {
+            argv.extend(self.frontend.arguments(&refs, argument.name)?);
+        }
+        Ok(argv)
+    }
+}
+
+struct CliHandoffPrompter;
+
+#[async_trait::async_trait]
+impl crate::command::engine_handoff::HandoffPrompter for CliHandoffPrompter {
+    async fn confirm_daemon_restart(&self, _running_jobs: usize) -> bool {
+        // The hand-off's typed failure carries the restart advice and code 2.
+        false
+    }
+}
+
+fn cli_relay_failure(message: String) -> crate::command::engine_handoff::HandoffError {
+    crate::command::engine_handoff::HandoffError {
+        message,
+        exit_code: 1,
+    }
+}
+
+struct CliRelayConnection {
+    sender: crate::engine::remote::frontend_client::FrontendSender,
+    receiver: crate::engine::remote::frontend_client::FrontendReceiver,
+    tab_id: crate::data::ids::TabId,
+}
+
+struct CliConnectError {
+    message: String,
+    exit_code: u8,
+}
+
+impl From<String> for CliConnectError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            exit_code: 1,
+        }
+    }
+}
+
+impl From<&str> for CliConnectError {
+    fn from(message: &str) -> Self {
+        message.to_string().into()
+    }
+}
+
+enum CliRenderEvent {
+    Bytes(crate::data::frontend_protocol::OutputStream, Vec<u8>),
+    Output(
+        crate::data::frontend_protocol::OutputStream,
+        crate::data::message::UserMessage,
+    ),
+    Notice(String),
+    Dialog {
+        id: crate::data::ids::DialogId,
+        request: Box<crate::data::dialog::DialogRequest>,
+        interrupted: tokio_util::sync::CancellationToken,
+    },
+    Finish(tokio::sync::oneshot::Sender<()>),
+}
+
+fn cli_interrupt_repeat(last: &mut Option<std::time::Instant>) -> bool {
+    let now = std::time::Instant::now();
+    let repeat =
+        last.is_some_and(|last| now.duration_since(last) < std::time::Duration::from_secs(2));
+    *last = Some(now);
+    repeat
+}
+
+impl CliRelayConnection {
+    async fn open(
+        address: &std::path::Path,
+        hello: crate::data::frontend_protocol::Hello,
+    ) -> Result<Self, CliConnectError> {
+        use crate::data::frontend_protocol::{EngineFrame, FrontendFrame, SnapshotAssembler};
+        use crate::engine::remote::{frontend_client::FrontendStream, local::LocalClient};
+        let client = LocalClient::new(address.to_path_buf());
+        let response = client
+            .send(
+                "POST",
+                "/v1/engine/instances",
+                Some(&serde_json::json!({
+                    "kind": "cli", "annotations": hello.annotations,
+                })),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        if response.status >= 400 {
+            return Err(response
+                .body
+                .get("error")
+                .and_then(|s| s.as_str())
+                .unwrap_or("the engine refused a CLI instance")
+                .to_string()
+                .into());
+        }
+        let id = response
+            .body
+            .get("id")
+            .and_then(|s| s.as_str())
+            .ok_or("the engine answered without an instance id")?
+            .parse::<crate::data::ids::InstanceId>()
+            .map_err(|e| e.to_string())?;
+        let (mut sender, mut receiver) = FrontendStream::connect_local(address, &id)
+            .await
+            .map_err(|e| e.to_string())?
+            .split();
+        sender
+            .send(&FrontendFrame::Hello(hello))
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut welcomed = false;
+        let mut assembler = SnapshotAssembler::default();
+        loop {
+            let (_, frame) = receiver
+                .next()
+                .await
+                .map_err(|e| e.to_string())?
+                .ok_or("the engine closed the CLI handshake")?;
+            let snapshot = match frame {
+                EngineFrame::Welcome {
+                    protocol, build, ..
+                } => {
+                    if protocol != crate::data::frontend_protocol::FRONTEND_SUBPROTOCOL
+                        || build != env!("CARGO_PKG_VERSION")
+                    {
+                        return Err(CliConnectError {
+                            message: "the daemon version changed; restart it with `awman daemon stop`, or use `--set tui.backend=builtin`".into(),
+                            exit_code: crate::command::engine_handoff::EXIT_STALE_DAEMON,
+                        });
+                    }
+                    welcomed = true;
+                    None
+                }
+                EngineFrame::Snapshot(snapshot) if welcomed => Some(snapshot),
+                EngineFrame::SnapshotChunk { chunk, of, bytes } if welcomed => assembler
+                    .push(chunk, of, &bytes)
+                    .map_err(|e| e.to_string())?,
+                _ => return Err("the engine did not send a CLI welcome and snapshot".into()),
+            };
+            if let Some(snapshot) = snapshot {
+                let tab_id = snapshot
+                    .tabs
+                    .first()
+                    .ok_or("the engine opened no CLI tab")?
+                    .tab_id
+                    .clone();
+                return Ok(Self {
+                    sender,
+                    receiver,
+                    tab_id,
+                });
+            }
+        }
+    }
+
+    async fn run<F: CliRelayFrontend>(
+        mut self,
+        mut frontend: F,
+        args: Vec<String>,
+        pty_size: crate::data::frontend_protocol::TermSize,
+    ) -> Result<crate::data::frontend_protocol::CommandResultWire, String> {
+        use crate::data::frontend_protocol::{EngineFrame, FrontendFrame, SubmitInput};
+        use crate::data::message::UserMessage;
+        use tokio_util::sync::CancellationToken;
+        // Engine traits have synchronous input methods. Keep rendering on a
+        // separate thread so a prompt never prevents Cancel or DialogClosed
+        // from reaching the socket. Each prompt has its own interruption token.
+        let (render_tx, render_rx) = std::sync::mpsc::channel();
+        let (answer_tx, mut answer_rx) = tokio::sync::mpsc::unbounded_channel();
+        std::thread::Builder::new()
+            .name("cli-relay-render".into())
+            .spawn(move || {
+                while let Ok(event) = render_rx.recv() {
+                    match event {
+                        CliRenderEvent::Bytes(stream, bytes) => {
+                            frontend.relay_bytes(stream, &bytes)
+                        }
+                        CliRenderEvent::Output(stream, message) => {
+                            frontend.relay_output(stream, message)
+                        }
+                        CliRenderEvent::Notice(text) => frontend.relay_notice(&text),
+                        CliRenderEvent::Dialog {
+                            id,
+                            request,
+                            interrupted,
+                        } => {
+                            let response = frontend.relay_dialog(*request, &interrupted);
+                            let _ = answer_tx.send((id, response));
+                        }
+                        CliRenderEvent::Finish(done) => {
+                            frontend.replay_queued();
+                            let _ = done.send(());
+                            break;
+                        }
+                    }
+                }
+            })
+            .map_err(|e| e.to_string())?;
+        let lifetime = CancellationToken::new();
+        let _interrupt_on_drop = lifetime.clone().drop_guard();
+        let mut dialogs =
+            std::collections::HashMap::<crate::data::ids::DialogId, CancellationToken>::new();
+        self.sender
+            .send(&FrontendFrame::Submit {
+                tab_id: self.tab_id.clone(),
+                input: SubmitInput::Argv { args },
+                pty_size,
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut last_interrupt = None;
+        loop {
+            tokio::select! {
+                signal = tokio::signal::ctrl_c() => {
+                    signal.map_err(|e| e.to_string())?;
+                    let repeat = cli_interrupt_repeat(&mut last_interrupt);
+                    self.sender.send(&FrontendFrame::Cancel {tab_id: self.tab_id.clone(), repeat}).await.map_err(|e| e.to_string())?;
+                    for (dialog_id, token) in dialogs.drain() {
+                        token.cancel();
+                        self.sender.send(&FrontendFrame::DialogResponse {dialog_id, response: crate::data::dialog::DialogResponse::Interrupted}).await.map_err(|e| e.to_string())?;
+                    }
+                }
+                answer = answer_rx.recv() => {
+                    let (dialog_id, response) = answer.ok_or("the CLI renderer stopped")?;
+                    if dialogs.remove(&dialog_id).is_some() {
+                        if response == crate::data::dialog::DialogResponse::Interrupted {
+                            let repeat = cli_interrupt_repeat(&mut last_interrupt);
+                            self.sender.send(&FrontendFrame::Cancel {tab_id: self.tab_id.clone(), repeat}).await.map_err(|e| e.to_string())?;
+                        }
+                        self.sender.send(&FrontendFrame::DialogResponse {dialog_id, response}).await.map_err(|e| e.to_string())?;
+                    }
+                }
+                frame = self.receiver.next() => {
+                    let (_, frame) = frame.map_err(|e| e.to_string())?.ok_or("the daemon disconnected before the command finished")?;
+                    match frame {
+                        EngineFrame::CommandOutput {tab_id, stream, level, text} if tab_id == self.tab_id => {let _ = render_tx.send(CliRenderEvent::Output(stream, UserMessage {level, text}));}
+                        EngineFrame::CommandBytes {tab_id, stream, bytes} if tab_id == self.tab_id => {let _ = render_tx.send(CliRenderEvent::Bytes(stream, bytes));}
+                        EngineFrame::Notice {text, ..} => {let _ = render_tx.send(CliRenderEvent::Notice(text));}
+                        EngineFrame::DialogRequest {dialog_id, tab_id, request} if tab_id == self.tab_id => {
+                            let interrupted = lifetime.child_token();
+                            if request.awaits_answer() {dialogs.insert(dialog_id.clone(), interrupted.clone());}
+                            let _ = render_tx.send(CliRenderEvent::Dialog {id: dialog_id, request: Box::new(request), interrupted});
+                        }
+                        EngineFrame::DialogClosed {dialog_id, ..} => {
+                            if let Some(token) = dialogs.remove(&dialog_id) {token.cancel();}
+                        }
+                        EngineFrame::CommandFinished {tab_id, result} if tab_id == self.tab_id => {
+                            lifetime.cancel();
+                            let (done, flushed) = tokio::sync::oneshot::channel();
+                            render_tx.send(CliRenderEvent::Finish(done)).map_err(|_| "the CLI renderer stopped")?;
+                            flushed.await.map_err(|_| "the CLI renderer stopped")?;
+                            let _ = self.sender.send(&FrontendFrame::Quit).await;
+                            self.sender.close().await;
+                            return Ok(result);
+                        }
+                        EngineFrame::Detach(reason) => return Err(format!("the engine detached the CLI: {}", reason.as_str())),
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Records a failure on the session when [`Dispatch::run_command`] does not
 /// reach its own outcome write — in practice, a panic in the command.
 ///
@@ -654,9 +1133,9 @@ impl UnfinishedCommandGuard {
     /// Byte-identical to the text the TUI used to compose for this case,
     /// including the pointer at the panic log — `PanicLog` is Layer 0, so
     /// naming it here crosses nothing.
-    fn unexpected_end_message() -> String {
-        let log =
-            crate::data::fs::PanicLog::from_env(&crate::data::config::env::Env::from_process());
+    /// The panic log is located from the session's own environment.
+    fn unexpected_end_message(env: &crate::data::config::env::EnvSnapshot) -> String {
+        let log = crate::data::fs::PanicLog::from_env(env);
         match log {
             Some(log) => format!(
                 "command task ended unexpectedly (likely a panic — see {})",
@@ -673,8 +1152,9 @@ impl Drop for UnfinishedCommandGuard {
             return;
         }
         if let Ok(mut guard) = self.session.try_write() {
+            let message = Self::unexpected_end_message(guard.env());
             let state = guard.state_mut();
-            state.fail_command(Self::unexpected_end_message());
+            state.fail_command(message);
             state.set_current_workflow(None);
         }
     }
@@ -1940,5 +2420,239 @@ mod tests {
             }
             other => panic!("expected InvalidFlagValue, got {other:?}"),
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod cli_relay_tests {
+    use super::*;
+    use crate::data::dialog::{DialogRequest, DialogResponse};
+    use crate::data::frontend_protocol::*;
+    use crate::data::ids::{DialogId, InstanceId, TabId};
+    use crate::data::message::{MessageLevel, UserMessage};
+    use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+    use axum::response::IntoResponse;
+    use std::sync::Mutex;
+
+    #[test]
+    fn relay_argv_preserves_parsed_values_and_reports_effective_headless() {
+        let mut frontend = tests::FakeCommandFrontend::new().without_input();
+        frontend.strings.insert("agent".into(), "claude".into());
+        frontend.strings_vec.insert(
+            "overlay".into(),
+            vec!["dir(a b)".into(), "env(K=x y)".into()],
+        );
+        frontend
+            .strings_vec
+            .insert("set".into(), vec!["tui.backend=daemon".into()]);
+        frontend
+            .args_vec
+            .insert("prompt".into(), vec!["a prompt".into(), "--literal".into()]);
+        let dir = tempfile::tempdir().unwrap();
+        let session = Arc::new(RwLock::new(Session::for_tests(dir.path())));
+        let dispatch = Dispatch::new(frontend, session, Engines::for_tests(dir.path()));
+        let argv = dispatch.relay_argv(&["exec", "prompt"]).unwrap();
+        assert_eq!(&argv[..2], ["exec", "prompt"]);
+        assert!(argv.iter().any(|value| value == "--headless"));
+        let parsed = CommandCatalogue::get()
+            .parse_raw_args(&["exec", "prompt"], &argv[2..])
+            .unwrap();
+        assert_eq!(parsed.flag_strings("overlay"), ["dir(a b)", "env(K=x y)"]);
+        assert_eq!(parsed.flag_strings("set"), ["tui.backend=daemon"]);
+        assert_eq!(parsed.arguments("prompt"), ["a prompt", "--literal"]);
+    }
+
+    #[test]
+    fn repeat_interrupt_uses_the_double_ctrl_c_window() {
+        let mut last = None;
+        assert!(!cli_interrupt_repeat(&mut last));
+        assert!(cli_interrupt_repeat(&mut last));
+        last = Some(std::time::Instant::now() - std::time::Duration::from_secs(3));
+        assert!(!cli_interrupt_repeat(&mut last));
+    }
+
+    struct Renderer {
+        outputs: Arc<Mutex<Vec<(OutputStream, String)>>>,
+        block: bool,
+    }
+    impl UserMessageSink for Renderer {
+        fn write_message(&mut self, _: UserMessage) {}
+        fn replay_queued(&mut self) {}
+    }
+    impl CliRelayFrontend for Renderer {
+        fn relay_bytes(&mut self, stream: OutputStream, bytes: &[u8]) {
+            self.outputs
+                .lock()
+                .unwrap()
+                .push((stream, String::from_utf8_lossy(bytes).into_owned()));
+        }
+        fn relay_facts(&self) -> CliRelayFacts {
+            CliRelayFacts {
+                stdin_is_tty: false,
+                stdout_is_tty: false,
+                term_size: TermSize { cols: 80, rows: 24 },
+            }
+        }
+        fn relay_notice(&mut self, _: &str) {}
+        fn relay_output(&mut self, stream: OutputStream, message: UserMessage) {
+            self.outputs.lock().unwrap().push((stream, message.text));
+        }
+        fn relay_dialog(
+            &mut self,
+            _: DialogRequest,
+            interrupted: &tokio_util::sync::CancellationToken,
+        ) -> DialogResponse {
+            if self.block {
+                while !interrupted.is_cancelled() {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                DialogResponse::Interrupted
+            } else {
+                DialogResponse::Text("an answer".into())
+            }
+        }
+    }
+
+    async fn send(socket: &mut WebSocket, codec: &mut Codec, frame: EngineFrame) {
+        socket
+            .send(Message::Text(codec.encode(&frame).unwrap().into()))
+            .await
+            .unwrap();
+    }
+    async fn receive(socket: &mut WebSocket, codec: &mut Codec) -> FrontendFrame {
+        let Message::Text(text) = socket.recv().await.unwrap().unwrap() else {
+            panic!("expected text")
+        };
+        codec.decode(&text).unwrap().1
+    }
+    async fn conversation(mut socket: WebSocket, tab_id: TabId, closed_dialog: bool) {
+        let mut codec = Codec::new();
+        assert!(
+            matches!(receive(&mut socket, &mut codec).await, FrontendFrame::Submit {input: SubmitInput::Argv {args}, ..} if args == ["exec", "prompt", "--headless", "a prompt"])
+        );
+        for (stream, text) in [
+            (OutputStream::Stdout, "stdout\n\n"),
+            (OutputStream::Stderr, "a warning"),
+        ] {
+            send(
+                &mut socket,
+                &mut codec,
+                EngineFrame::CommandOutput {
+                    tab_id: tab_id.clone(),
+                    stream,
+                    level: MessageLevel::Warning,
+                    text: text.into(),
+                },
+            )
+            .await;
+        }
+        let dialog_id = DialogId::new();
+        send(
+            &mut socket,
+            &mut codec,
+            EngineFrame::DialogRequest {
+                dialog_id: dialog_id.clone(),
+                tab_id: tab_id.clone(),
+                request: DialogRequest::TextInput {
+                    title: "test".into(),
+                    prompt: "answer?".into(),
+                    default_text: None,
+                },
+            },
+        )
+        .await;
+        if closed_dialog {
+            send(
+                &mut socket,
+                &mut codec,
+                EngineFrame::DialogClosed {
+                    dialog_id,
+                    answered_by: AnsweredBy::Api,
+                },
+            )
+            .await;
+        } else {
+            assert!(
+                matches!(receive(&mut socket, &mut codec).await, FrontendFrame::DialogResponse {dialog_id: id, response: DialogResponse::Text(text)} if id == dialog_id && text == "an answer")
+            );
+        }
+        send(&mut socket, &mut codec, EngineFrame::CommandFinished {tab_id, result: CommandResultWire {exit_code: 17, outcome: Some(serde_json::json!({"kind": "ExecPrompt", "payload": {"agent": "fixture", "exit_code": 17}})), error: None}}).await;
+        assert_eq!(receive(&mut socket, &mut codec).await, FrontendFrame::Quit);
+    }
+
+    async fn exercise(closed_dialog: bool) {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let address = root.path().join("cli.sock");
+        let listener = tokio::net::UnixListener::bind(&address).unwrap();
+        std::fs::set_permissions(&address, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let tab_id = TabId::new();
+        let server_tab = tab_id.clone();
+        let app = axum::Router::new().route(
+            "/v1/engine/instances/{id}/frontend",
+            axum::routing::get(move |ws: WebSocketUpgrade| {
+                let tab_id = server_tab.clone();
+                async move {
+                    ws.protocols([FRONTEND_SUBPROTOCOL])
+                        .on_upgrade(move |socket| conversation(socket, tab_id, closed_dialog))
+                        .into_response()
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let (sender, receiver) =
+            crate::engine::remote::frontend_client::FrontendStream::connect_local(
+                &address,
+                &InstanceId::new(),
+            )
+            .await
+            .unwrap()
+            .split();
+        let connection = CliRelayConnection {
+            sender,
+            receiver,
+            tab_id,
+        };
+        let outputs = Arc::new(Mutex::new(Vec::new()));
+        let renderer = Renderer {
+            outputs: outputs.clone(),
+            block: closed_dialog,
+        };
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            connection.run(
+                renderer,
+                ["exec", "prompt", "--headless", "a prompt"]
+                    .map(String::from)
+                    .to_vec(),
+                TermSize { cols: 80, rows: 24 },
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(result.exit_code, 17);
+        assert!(result.outcome.is_some());
+        assert_eq!(
+            *outputs.lock().unwrap(),
+            [
+                (OutputStream::Stdout, "stdout\n\n".into()),
+                (OutputStream::Stderr, "a warning".into())
+            ]
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn cli_relay_preserves_streams_dialog_answer_and_command_result() {
+        exercise(false).await;
+    }
+
+    #[tokio::test]
+    async fn cli_relay_keeps_reading_while_a_dialog_is_open_and_discards_stale_answers() {
+        exercise(true).await;
     }
 }

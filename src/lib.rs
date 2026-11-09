@@ -16,6 +16,10 @@ pub mod data;
 pub mod engine;
 pub mod frontend;
 
+#[cfg(test)]
+#[path = "../tests/helpers/engine_daemon.rs"]
+pub(crate) mod parity_support;
+
 /// Process-global mutex for tests that must change the working directory.
 ///
 /// `std::env::set_current_dir` is process-wide; tests run in parallel and can

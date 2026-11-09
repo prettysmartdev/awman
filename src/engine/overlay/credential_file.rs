@@ -124,19 +124,23 @@ pub(crate) fn credential_fingerprint_for_file(
 /// Production binding for `AgentSecretFilesProvider`: reads file-form
 /// keychain artifacts from the host OS keychain via
 /// `engine::auth::keychain::agent_keychain_files`.
-pub(crate) fn default_secret_files_provider() -> AgentSecretFilesProvider {
-    std::sync::Arc::new(|agent: &AgentName| {
-        crate::engine::auth::keychain::agent_keychain_files(agent)
+pub(crate) fn default_secret_files_provider(
+    env: crate::data::config::env::EnvSnapshot,
+) -> AgentSecretFilesProvider {
+    std::sync::Arc::new(move |agent: &AgentName| {
+        crate::engine::auth::keychain::agent_keychain_files_in(&env, agent)
     })
 }
 
 pub(crate) fn default_credential_provider(
     auth_resolver: AuthPathResolver,
+    env: crate::data::config::env::EnvSnapshot,
 ) -> AgentCredentialFileProvider {
     std::sync::Arc::new(move |agent: &AgentName| {
         let spec = crate::engine::auth::keychain::refreshable_spec_for(agent)?;
         let source = (spec.source)(&auth_resolver);
-        let snapshot = (spec.read)(&source).ok()?;
+        let snapshot =
+            crate::engine::auth::credential::read_claude_credential_in(&env, &source).ok()?;
         Some((spec.materialize)(&snapshot))
     })
 }

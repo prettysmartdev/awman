@@ -52,9 +52,8 @@ pub const XDG_DATA_HOME: &str = "XDG_DATA_HOME";
 /// printed alongside a freshly minted squad key; never to execute anything.
 pub const SHELL: &str = "SHELL";
 
-/// `PATH` — the executable search path. awman never reads it to resolve a
-/// binary itself; it is declared because an OS process manager starting a
-/// daemon must be handed it explicitly (see [`ForwardedEnv`]).
+/// `PATH` — the executable search path. Host spawns resolve it from the
+/// invoking instance's snapshot; daemon bootstrap also forwards it explicitly.
 pub const PATH: &str = "PATH";
 
 /// `HOME` — the user's home directory. Declared for the same reason as
@@ -193,6 +192,9 @@ pub const AMBIENT_MSB_OVERRIDES: &[&str] = &[
 /// `npipe://`). Read only when a `docker-local` image source names no host.
 pub const DOCKER_HOST: &str = "DOCKER_HOST";
 
+/// `DOCKER_CONTEXT` — Docker CLI context, which takes precedence over its host.
+pub const DOCKER_CONTEXT: &str = "DOCKER_CONTEXT";
+
 /// `DOCKER_CERT_PATH` — directory holding `ca.pem`, `cert.pem`, `key.pem` for
 /// a TLS Docker Engine endpoint.
 pub const DOCKER_CERT_PATH: &str = "DOCKER_CERT_PATH";
@@ -280,22 +282,34 @@ impl ForwardedEnv {
     }
 }
 
-/// Frozen snapshot of every env var awman reads.
+/// Frozen, memory-only environment, working directory and arguments.
 ///
-/// `EnvSnapshot::from_process()` captures the current process's environment
-/// once. Tests construct snapshots directly via `EnvSnapshot::default()` or
+/// [`Env::from_process`] captures the current process once. This type has no
+/// serialization implementation. Tests construct snapshots via `Self::default()` or
 /// `EnvSnapshot::with_overrides(…)`.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Default, Clone, PartialEq, Eq)]
 pub struct EnvSnapshot {
     values: HashMap<String, String>,
+    // Native entries preserve non-UTF-8 values when the builtin frontend captures
+    // its own process. Neither this type nor these fields implement serde.
+    native: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+    cwd: PathBuf,
+    argv: Vec<std::ffi::OsString>,
+    /// Process captures may read the daemon's in-memory task overlay for
+    /// explicitly requested host payloads. Frontend-supplied snapshots may not.
+    process_overlay: bool,
+}
+
+impl std::fmt::Debug for EnvSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("EnvSnapshot { env: <redacted>, cwd: <redacted>, argv: <redacted> }")
+    }
 }
 
 impl EnvSnapshot {
     /// Construct an empty snapshot.
     pub fn empty() -> Self {
-        Self {
-            values: HashMap::new(),
-        }
+        Self::default()
     }
 
     /// Build a snapshot from a list of `(key, value)` pairs. Useful in tests.
@@ -309,12 +323,144 @@ impl EnvSnapshot {
         for (k, v) in entries {
             values.insert(k.into(), v.into());
         }
-        Self { values }
+        let mut native: Vec<(std::ffi::OsString, std::ffi::OsString)> =
+            values.iter().map(|(k, v)| (k.into(), v.into())).collect();
+        native.sort_by(|a, b| a.0.cmp(&b.0));
+        Self {
+            values,
+            native,
+            ..Self::default()
+        }
+    }
+
+    /// Instance input, held only in memory. There is deliberately no serde impl.
+    pub fn from_full_env(env: std::collections::BTreeMap<String, String>) -> Self {
+        Self::with_overrides(env)
+    }
+
+    pub fn from_instance_env(env: Vec<(String, String)>, cwd: PathBuf, argv: Vec<String>) -> Self {
+        Self::with_overrides(env).with_invocation(cwd, argv)
+    }
+
+    pub fn with_invocation(mut self, cwd: PathBuf, argv: Vec<String>) -> Self {
+        self.cwd = cwd;
+        self.argv = argv.into_iter().map(Into::into).collect();
+        self
+    }
+
+    pub fn cwd(&self) -> &std::path::Path {
+        &self.cwd
+    }
+    pub fn argv(&self) -> &[std::ffi::OsString] {
+        &self.argv
+    }
+
+    pub fn var_names(&self) -> Vec<&str> {
+        let mut names: Vec<_> = self.values.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        names
+    }
+
+    pub fn to_hello_env(&self) -> crate::data::frontend_protocol::HelloEnv {
+        crate::data::frontend_protocol::HelloEnv::from_pairs(
+            self.values.iter().map(|(k, v)| (k.clone(), v.clone())),
+        )
+    }
+    pub fn spawn_env(&self) -> impl Iterator<Item = (&std::ffi::OsStr, &std::ffi::OsStr)> {
+        self.native
+            .iter()
+            .map(|(k, v)| (k.as_os_str(), v.as_os_str()))
+    }
+    pub fn path_dirs(&self) -> Vec<PathBuf> {
+        let path = self.get_os(PATH);
+        if let Some(path) = path {
+            return std::env::split_paths(path).collect();
+        }
+        // execvp's default search when PATH is absent. An explicitly empty
+        // PATH still means cwd; neither case may consult the daemon's PATH.
+        #[cfg(unix)]
+        {
+            std::env::split_paths(if cfg!(target_os = "macos") {
+                "/usr/bin:/bin:/usr/sbin:/sbin"
+            } else {
+                "/bin:/usr/bin"
+            })
+            .collect()
+        }
+        #[cfg(not(unix))]
+        {
+            Vec::new()
+        }
+    }
+    pub fn temp_dir(&self) -> PathBuf {
+        for key in if cfg!(windows) {
+            &["TMP", "TEMP", "USERPROFILE"][..]
+        } else {
+            &["TMPDIR"][..]
+        } {
+            if let Some(path) = self.get_os(key).filter(|v| !v.is_empty()) {
+                let path = PathBuf::from(path);
+                return if path.is_relative() && !self.cwd.as_os_str().is_empty() {
+                    self.cwd.join(path)
+                } else {
+                    path
+                };
+            }
+        }
+        PathBuf::from(if cfg!(windows) {
+            r"C:\Windows\Temp"
+        } else {
+            "/tmp"
+        })
+    }
+
+    /// CLI routing identity. Context overrides host as it does in Docker's CLI.
+    pub fn runtime_endpoint(&self) -> (Option<String>, Option<String>) {
+        (
+            self.get(DOCKER_CONTEXT)
+                .filter(|v| !v.is_empty())
+                .map(str::to_owned),
+            self.docker_host(),
+        )
     }
 
     /// Return the raw value of a single var, if set.
     pub fn get(&self, key: &str) -> Option<&str> {
-        self.values.get(key).map(|s| s.as_str())
+        self.values
+            .get(key)
+            .or_else(|| {
+                cfg!(windows)
+                    .then(|| {
+                        self.values
+                            .iter()
+                            .find(|(name, _)| name.eq_ignore_ascii_case(key))
+                            .map(|(_, value)| value)
+                    })
+                    .flatten()
+            })
+            .map(|s| s.as_str())
+    }
+
+    /// Resolve a container passthrough value. A daemon process snapshot sees
+    /// a task's live overlay; an instance snapshot stays confined to the
+    /// launching frontend's environment.
+    pub fn host_payload(&self, key: &str) -> Option<String> {
+        if self.process_overlay {
+            let guard = daemon_overlay().read().unwrap_or_else(|e| e.into_inner());
+            if let Some(value) = guard.get(key) {
+                return Some(value.clone());
+            }
+        }
+        self.get(key).map(str::to_owned)
+    }
+
+    pub fn get_os(&self, key: &str) -> Option<&std::ffi::OsStr> {
+        self.native
+            .iter()
+            .find(|(name, _)| {
+                name == key || (cfg!(windows) && name.to_string_lossy().eq_ignore_ascii_case(key))
+            })
+            .map(|(_, value)| value.as_os_str())
     }
 
     /// `AWMAN_HOME` as a `PathBuf`, if set and non-empty.
@@ -434,7 +580,9 @@ impl EnvSnapshot {
         AMBIENT_MSB_OVERRIDES
             .iter()
             .copied()
-            .filter(|name| self.get(name).is_some())
+            .filter(|name| {
+                self.get(name).is_some() || self.native.iter().any(|(key, _)| key == *name)
+            })
             .collect()
     }
 
@@ -548,56 +696,35 @@ fn awman_vars_os() -> Vec<(String, String)> {
 pub struct Env;
 
 impl Env {
-    /// Capture every awman-relevant env var from the current process: the
-    /// fixed list below, plus every variable whose name starts with
-    /// [`AWMAN_PREFIX`], so derived config names reach the snapshot without a
-    /// key-table lookup at capture time.
+    /// Capture the full native process environment and invocation. Host children
+    /// can clear their environment and rebuild it without losing unknown names
+    /// or non-UTF-8 values. Config reads still use the typed accessors above.
     pub fn from_process() -> EnvSnapshot {
-        let keys = [
-            AWMAN_HOME,
-            AWMAN_REMOTE_SESSION,
-            GITHUB_TOKEN,
-            XDG_CONFIG_HOME,
-            XDG_DATA_HOME,
-            SHELL,
-            AWMAN_TEST_ISOLATION,
-            AWMAN_TEST_DOCKER,
-            AWMAN_TEST_APPLE_CONTAINER,
-            AWMAN_TEST_SBX,
-            AWMAN_TEST_BUILTIN,
-            AWMAN_TEST_YOLO_COUNTDOWN_MS,
-            DOCKER_HOST,
-            DOCKER_CERT_PATH,
-            DOCKER_TLS_VERIFY,
-        ];
-        let mut values = HashMap::new();
-        // The home directory is resolved here, once, so nothing above Layer 0
-        // consults the ambient environment (or the passwd database) for it.
-        if let Some(home) = dirs::home_dir() {
-            values.insert(HOME.to_string(), home.to_string_lossy().into_owned());
-        }
-        // Config variables come from the real process environment only (never
-        // the daemon overlay): a daemon client must not be able to change
-        // this process's config by pushing a payload named like one.
-        for (name, value) in awman_vars_os() {
-            if is_config_var_name(&name) {
-                values.insert(name, value);
+        let mut native: Vec<_> = std::env::vars_os().collect();
+        native.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut values: HashMap<String, String> = native
+            .iter()
+            .filter_map(|(k, v)| Some((k.to_str()?.to_owned(), v.to_str()?.to_owned())))
+            .collect();
+        // Typed home lookup historically also used the OS account database.
+        // Preserve that fallback without injecting a new variable into children.
+        if !values.contains_key(HOME) {
+            if let Some(home) = dirs::home_dir() {
+                values.insert(HOME.into(), home.to_string_lossy().into_owned());
             }
         }
-        for k in keys {
-            let read = std::env::var(k).ok();
-            if let Some(v) = read {
-                values.insert(k.to_string(), v);
-            }
-        }
-        // These SDK overrides are presence-sensitive, and may be non-UTF-8.
-        // Store a marker because their contents are never used by awman.
         for &name in AMBIENT_MSB_OVERRIDES {
             if host_var_os(name).is_some() {
-                values.insert(name.to_string(), String::new());
+                values.entry(name.into()).or_default();
             }
         }
-        EnvSnapshot { values }
+        EnvSnapshot {
+            values,
+            native,
+            cwd: std::env::current_dir().unwrap_or_default(),
+            argv: std::env::args_os().collect(),
+            process_overlay: true,
+        }
     }
 
     /// Capture only the source transport settings and explicitly named auth
@@ -633,6 +760,8 @@ impl Env {
         }
         for name in names {
             if let Some(value) = host_var(name) {
+                snapshot.native.retain(|(key, _)| key != name);
+                snapshot.native.push((name.into(), value.clone().into()));
                 snapshot.values.insert(name.into(), value);
             }
         }
@@ -1109,6 +1238,27 @@ mod tests {
 
         std::env::remove_var(name);
         set_daemon_overlay(DaemonEnvMap::new());
+    }
+
+    #[test]
+    fn process_payload_reads_live_overlay_but_instance_payload_does_not() {
+        let _lock = DAEMON_OVERLAY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let previous = daemon_overlay_snapshot();
+        let name = "AWMAN_TEST_PROCESS_PAYLOAD_OVERLAY_0142";
+        std::env::remove_var(name);
+        let process = Env::from_process();
+        let instance = EnvSnapshot::from_instance_env(Vec::new(), PathBuf::new(), Vec::new());
+        set_daemon_overlay(DaemonEnvMap::from_pairs([(name, "overlay-secret")]));
+
+        assert_eq!(
+            process.host_payload(name).as_deref(),
+            Some("overlay-secret")
+        );
+        assert_eq!(instance.host_payload(name), None);
+
+        set_daemon_overlay(previous);
     }
 
     /// `DaemonEnvMap`'s hand-written `Debug` must print names only, under

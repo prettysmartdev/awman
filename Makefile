@@ -77,10 +77,14 @@ install: build
 # never touch it.
 # Keep Cargo's build progress visible; only libtest's per-test output is quiet.
 test:
-	@AWMAN_TEST_TMPROOT="$(AWMAN_TEST_TMPROOT)" bash tools/isolated-test.sh -- --quiet
+	@AWMAN_TEST_BACKEND=builtin AWMAN_TEST_TMPROOT="$(AWMAN_TEST_TMPROOT)" bash tools/isolated-test.sh -- --quiet --skip latency::
+	@AWMAN_TEST_BACKEND=builtin AWMAN_TEST_TMPROOT="$(AWMAN_TEST_TMPROOT)" bash tools/isolated-test.sh -p awman-cli --test engine_parity latency:: -- --quiet --test-threads=1
+	@AWMAN_TEST_BACKEND=daemon AWMAN_TEST_TMPROOT="$(AWMAN_TEST_TMPROOT)" bash tools/isolated-test.sh -p awman --lib frontend::tui:: --quiet
+	@AWMAN_TEST_BACKEND=daemon AWMAN_TEST_TMPROOT="$(AWMAN_TEST_TMPROOT)" bash tools/isolated-test.sh -p awman-cli --test binary_smoke --test cli_parity -- --quiet
 
 test-fast:
-	@AWMAN_TEST_TMPROOT="$(AWMAN_TEST_TMPROOT)" bash tools/isolated-test.sh -- --quiet --skip real_git --skip real_network --skip builtin_hw
+	@AWMAN_TEST_TMPROOT="$(AWMAN_TEST_TMPROOT)" bash tools/isolated-test.sh -- --quiet --skip real_git --skip real_network --skip builtin_hw --skip latency::
+	@AWMAN_TEST_TMPROOT="$(AWMAN_TEST_TMPROOT)" bash tools/isolated-test.sh -p awman-cli --test engine_parity latency:: -- --quiet --test-threads=1
 
 # Only the targets that exercise the builtin runtime: every test executable links the
 # whole embedded VM stack (hundreds of MB each in debug), so building all of them
@@ -114,7 +118,8 @@ test-builtin-hw:
 	@bash tools/test-builtin-hw.sh
 
 test-full:
-	@AWMAN_TEST_DOCKER=1 AWMAN_TEST_TMPROOT="$(AWMAN_TEST_TMPROOT)" bash tools/isolated-test.sh -- --quiet
+	@AWMAN_TEST_DOCKER=1 AWMAN_TEST_TMPROOT="$(AWMAN_TEST_TMPROOT)" bash tools/isolated-test.sh -- --quiet --skip latency::
+	@AWMAN_TEST_DOCKER=1 AWMAN_TEST_TMPROOT="$(AWMAN_TEST_TMPROOT)" bash tools/isolated-test.sh -p awman-cli --test engine_parity latency:: -- --quiet --test-threads=1
 
 architecture-lint:
 	@bash tools/architecture-lint.sh

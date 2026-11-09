@@ -619,9 +619,12 @@ fn frontend_with_required_input(spec: &'static CommandSpec) -> FakeCommandFronte
                 frontend.bools.insert(flag.long.to_string(), true);
             }
             FlagKind::String | FlagKind::OptionalString => {
-                frontend
-                    .strings
-                    .insert(flag.long.to_string(), "placeholder".to_string());
+                let value = if spec.name == "view" && flag.long == "instance" {
+                    crate::data::ids::InstanceId::new().as_str().to_string()
+                } else {
+                    "placeholder".to_string()
+                };
+                frontend.strings.insert(flag.long.to_string(), value);
             }
             FlagKind::Enum(values) => {
                 frontend
@@ -885,6 +888,15 @@ fn every_catalogue_command_leaf_is_buildable_by_dispatch() {
             assert!(
                 matches!(result, Err(CommandError::UnknownCommand { .. })),
                 "{path:?} is not runnable and must refuse with UnknownCommand"
+            );
+        } else if spec.internal {
+            // A frontend entry point (`view`): its flags validate, then
+            // Dispatch refuses; the binary hands it to the TUI instead.
+            assert!(
+                matches!(&result, Err(CommandError::Other(message))
+                    if message == crate::command::commands::view::NOT_DISPATCHED),
+                "{path:?} is internal and must refuse in Dispatch: {:?}",
+                result.err()
             );
         } else {
             assert!(

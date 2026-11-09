@@ -90,6 +90,7 @@ pub enum SandboxOption {
 /// sandbox backend consumes.
 #[derive(Debug, Clone, Default)]
 pub struct ResolvedSandboxOptions {
+    pub host_env: Option<crate::data::config::env::EnvSnapshot>,
     pub program_status: crate::engine::agent_runtime::program_status::ProgramStatusBridgeConfig,
     /// Kit selector.
     pub agent_id: String,

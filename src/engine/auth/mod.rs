@@ -206,15 +206,22 @@ impl std::fmt::Debug for TlsMaterial {
 
 #[derive(Debug, Clone)]
 pub struct AuthEngine {
+    env: crate::data::config::env::EnvSnapshot,
     auth_paths: AuthPathResolver,
     api_paths: ApiPaths,
 }
 
 impl AuthEngine {
-    pub fn new(_session: &Session) -> Result<Self, EngineError> {
-        let auth_paths = AuthPathResolver::from_process_env().map_err(EngineError::Data)?;
-        let api_paths = ApiPaths::from_process_env().map_err(EngineError::Data)?;
+    pub fn new(session: &Session) -> Result<Self, EngineError> {
+        let auth_paths = AuthPathResolver::at_home(
+            session
+                .env()
+                .home_dir()
+                .ok_or(crate::data::error::DataError::HomeNotFound)?,
+        );
+        let api_paths = ApiPaths::from_env(session.env()).map_err(EngineError::Data)?;
         Ok(Self {
+            env: session.env().clone(),
             auth_paths,
             api_paths,
         })
@@ -222,6 +229,7 @@ impl AuthEngine {
 
     pub fn with_paths(auth_paths: AuthPathResolver, api_paths: ApiPaths) -> Self {
         Self {
+            env: crate::engine::host_cli::process_env(),
             auth_paths,
             api_paths,
         }
@@ -238,7 +246,7 @@ impl AuthEngine {
         &self,
         opts: github_token::GitHubTokenResolverOptions,
     ) -> github_token::GitHubTokenResolver {
-        github_token::GitHubTokenResolver::new(opts)
+        github_token::GitHubTokenResolver::new(opts).with_env_snapshot(self.env.clone())
     }
 
     /// The sole constructor of a prerequisite host command; see
@@ -248,7 +256,7 @@ impl AuthEngine {
         opts: host_secret_command::HostSecretCommandOptions,
     ) -> Result<host_secret_command::HostSecretCommand, host_secret_command::HostSecretCommandError>
     {
-        host_secret_command::HostSecretCommand::new(opts)
+        host_secret_command::HostSecretCommand::new_in(opts, self.env.clone())
     }
 
     /// Whether the host `gh` is installed and logged in to `host` (shared by
@@ -276,7 +284,7 @@ impl AuthEngine {
             .as_ref()
             .map(|p| p.exists())
             .unwrap_or(false);
-        let keychain = keychain::agent_keychain_credentials(agent);
+        let keychain = keychain::agent_keychain_credentials_in(&self.env, agent);
         // For refreshable agents, read the descriptor's source to surface
         // time-to-expiry / readability for `awman ready`. Never holds the secret
         // past this scope. Hermetic in tests: an absent host file/keychain entry
@@ -284,7 +292,7 @@ impl AuthEngine {
         let (refreshable, expires_at, read_error) = match keychain::refreshable_spec_for(agent) {
             Some(spec) => {
                 let source = (spec.source)(&self.auth_paths);
-                match (spec.read)(&source) {
+                match credential::read_claude_credential_in(&self.env, &source) {
                     Ok(snap) => (true, (spec.expiry)(&snap), None),
                     Err(err) => (true, None, Some(err)),
                 }
@@ -308,7 +316,7 @@ impl AuthEngine {
         agent: &AgentName,
     ) -> Result<AgentCredentials, EngineError> {
         Ok(AgentCredentials {
-            env_vars: keychain::agent_keychain_credentials(agent),
+            env_vars: keychain::agent_keychain_credentials_in(&self.env, agent),
             delivery: CredentialDelivery::Env,
         })
     }
@@ -330,7 +338,7 @@ impl AuthEngine {
     ) -> Result<AgentCredentials, EngineError> {
         if let Some(spec) = keychain::refreshable_spec_for(agent) {
             let source = (spec.source)(&self.auth_paths);
-            match (spec.read)(&source) {
+            match credential::read_claude_credential_in(&self.env, &source) {
                 Ok(snapshot) => {
                     return Ok(AgentCredentials {
                         env_vars: vec![(
@@ -361,7 +369,7 @@ impl AuthEngine {
         agent: &AgentName,
     ) -> Result<AgentCredentials, EngineError> {
         Ok(AgentCredentials {
-            env_vars: keychain::agent_keychain_credentials(agent),
+            env_vars: keychain::agent_keychain_credentials_in(&self.env, agent),
             delivery: CredentialDelivery::Env,
         })
     }

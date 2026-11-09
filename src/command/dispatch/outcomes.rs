@@ -6,6 +6,9 @@
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(tag = "kind", content = "payload")]
 pub enum CommandOutcome {
+    /// A completed command whose typed result lives in another engine.
+    /// Presenters retain its exit code even when they render from feed deltas.
+    Relayed(crate::data::frontend_protocol::CommandResultWire),
     Attach(crate::command::commands::attach::AttachOutcome),
     Init(crate::command::commands::init::InitOutcome),
     Ready(crate::command::commands::ready::ReadyOutcome),
@@ -39,6 +42,7 @@ impl CommandOutcome {
     /// showed red in the TUI.
     pub fn exit_code(&self) -> i32 {
         match self {
+            Self::Relayed(result) => result.exit_code,
             Self::Attach(outcome) => outcome.exit_code,
             Self::Chat(outcome) => outcome.exit_code.unwrap_or(0),
             Self::ExecWorkflow(outcome) => outcome.exit_code.unwrap_or(0),

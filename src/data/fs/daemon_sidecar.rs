@@ -65,7 +65,10 @@ impl ServerSidecar {
     pub fn current(pid: u32, transport: SidecarTransport) -> Self {
         Self {
             version: env!("CARGO_PKG_VERSION").to_string(),
-            protocol: BTreeMap::from([(PROTOCOL_API.to_string(), PROTOCOL_API_VERSION)]),
+            protocol: BTreeMap::from([
+                (PROTOCOL_API.to_string(), PROTOCOL_API_VERSION),
+                ("frontend".into(), 1),
+            ]),
             pid,
             transport,
             started_at: chrono::Utc::now(),

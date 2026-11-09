@@ -66,12 +66,37 @@ async fn run_command(matches: ArgMatches, ctx: RuntimeContext) -> ExitCode {
     // The runtime-tier guard and the squad gateway are catalogue-driven and
     // resolved by `Dispatch::run_command` (WI 0113 F-04). The CLI names no
     // squad subcommand of its own.
+    let argv = ctx
+        .session
+        .read()
+        .await
+        .env()
+        .argv()
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
     let frontend = CliFrontend::new(matches);
     let json = frontend.is_json_mode();
     let dispatch = Dispatch::new(frontend, ctx.session, ctx.engines);
-    match dispatch.run_command(&path_strs).await {
-        Ok(outcome) => render_outcome(&outcome, json),
-        Err(err) => render_error_for_mode(&err, json),
+    match dispatch.run_relayed(&path_strs, argv).await {
+        Ok(crate::command::dispatch::CliCompletion::Local(result)) => match *result {
+            Ok(outcome) => render_outcome(&outcome, json),
+            Err(err) => render_error_for_mode(&err, json),
+        },
+        Ok(crate::command::dispatch::CliCompletion::Relayed(result)) => {
+            CliFrontend::render_relay_result(result, json)
+        }
+        Err(error) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({"error":format!("awman: {}",error.message)})
+                );
+            } else {
+                eprintln!("awman: {}", error.message);
+            }
+            ExitCode::from(error.exit_code)
+        }
     }
 }
 

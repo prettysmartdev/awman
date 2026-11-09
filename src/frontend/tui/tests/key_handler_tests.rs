@@ -59,7 +59,7 @@ fn workflow_context_copy_does_not_capture_keys_without_an_active_overlay() {
 
     let mut app = make_app();
     activate_workflow_context(&mut app, "/host/context/background");
-    app.tabs.push(Tab::new(make_session()));
+    app.push_tab(Tab::new(make_session()));
     app.active_tab = 1;
     app.active_tab_mut().execution_phase = crate::frontend::tui::tabs::ExecutionPhase::Running {
         command: "chat".into(),
@@ -944,7 +944,7 @@ fn ctrl_o_and_horizontal_keys_only_change_horizontal_state_on_active_tab() {
     assert_eq!(app.active_tab().workflow_overview_hscroll_offset, 3);
     assert!(!app.active_tab().workflow_overview_hscroll_follow);
 
-    app.tabs.push(Tab::new(make_session()));
+    app.push_tab(Tab::new(make_session()));
     app.active_tab = 1;
     press_key(&mut app, KeyCode::Right, KeyModifiers::SHIFT);
     assert_eq!(app.tabs[0].workflow_overview_hscroll_offset, 3);
@@ -1128,7 +1128,7 @@ fn esc_on_parallel_yolo_modal_cancels_the_focused_slots_flag_only() {
 /// a live gateway), focus it, and return its index.
 fn push_squad_tab(app: &mut App) -> usize {
     let tab = Tab::new_squad(make_session());
-    app.tabs.push(tab);
+    app.push_tab(tab);
     let idx = app.tabs.len() - 1;
     app.active_tab = idx;
     app.focus = Focus::ExecutionWindow;

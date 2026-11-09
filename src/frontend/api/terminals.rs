@@ -29,8 +29,8 @@ use crate::command::terminals::{TerminalRefusal, TerminalSession};
 use crate::data::daemon_state::CommandListener;
 use crate::data::ids::TerminalId;
 use crate::data::terminal::{
-    annotation_from_header, Annotations, DetachReason, TerminalClientFrame, TerminalFrame,
-    ViewerIdentity, ACTOR_HEADER, MAX_ANNOTATIONS, TERMINAL_SUBPROTOCOL,
+    annotation_from_header, AnnotationError, Annotations, DetachReason, TerminalClientFrame,
+    TerminalFrame, ViewerIdentity, ACTOR_HEADER, TERMINAL_SUBPROTOCOL,
 };
 use crate::data::wire::ListQuery;
 
@@ -111,17 +111,14 @@ fn viewer_identity(
     };
     let mut annotations = Annotations::new();
     for (name, value) in headers {
-        let Some((key, value)) = annotation_from_header(name.as_str(), value.as_bytes())
-            .map_err(|e| ApiError::invalid_request(e.to_string()))?
+        let Some((key, value)) =
+            annotation_from_header(name.as_str(), value.as_bytes()).map_err(invalid_annotation)?
         else {
             continue;
         };
-        annotations.insert(key, value);
-        if annotations.len() > MAX_ANNOTATIONS {
-            return Err(ApiError::invalid_request(format!(
-                "too many annotations (max {MAX_ANNOTATIONS})"
-            )));
-        }
+        annotations
+            .insert(&key, &value)
+            .map_err(invalid_annotation)?;
     }
     Ok(ViewerIdentity {
         listener,
@@ -352,6 +349,12 @@ pub(super) async fn serve_terminal_socket(
         }
     }
     session.detach(DetachReason::Hangup);
+}
+
+fn invalid_annotation(error: AnnotationError) -> ApiError {
+    let mut mapped = ApiError::invalid_request(error.to_string());
+    mapped.code = AnnotationError::CODE;
+    mapped
 }
 
 #[cfg(test)]

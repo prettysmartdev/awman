@@ -179,7 +179,7 @@ impl Engines {
             runtime,
             container_runtime,
             sandbox_runtime,
-            git_engine: Arc::new(GitEngine::new()),
+            git_engine: Arc::new(GitEngine::with_env(daemon_config.env().clone())),
             overlay_engine,
             auth_engine: Arc::new(AuthEngine::with_paths(auth_paths, api_paths)),
             agent_engine,
@@ -246,7 +246,7 @@ impl Engines {
             runtime,
             container_runtime,
             sandbox_runtime,
-            git_engine: Arc::new(GitEngine::new()),
+            git_engine: Arc::new(GitEngine::with_env(session.env().clone())),
             overlay_engine,
             auth_engine,
             agent_engine,
@@ -477,7 +477,7 @@ mod tests {
         use crate::engine::sandbox::SandboxRuntime;
 
         let tmp = tempfile::tempdir().unwrap();
-        let session = Session::for_tests(tmp.path());
+        let session = session_with_host_home(tmp.path());
 
         let detected = DetectedRuntime::Sandbox(Arc::new(SandboxRuntime::for_tests()));
         let engines = Engines::from_detected(detected, &session).unwrap();
@@ -512,13 +512,21 @@ mod tests {
         runtime.map_or_else(ConfigFile::default, ConfigFile::with_runtime)
     }
 
-    fn session_at(root: &std::path::Path) -> Session {
-        Session::open_at_git_root(
-            root.to_path_buf(),
-            root.to_path_buf(),
-            crate::data::session::SessionOpenOptions::default(),
+    /// A session whose env snapshot carries a host `HOME`, as every real
+    /// snapshot does (`Env::from_process` fills it in). The overlay and auth
+    /// engines resolve host paths from the session's snapshot, never the
+    /// process. The home is a subdirectory, so `~/.awman/config.json` is not
+    /// the fixture's repo config file.
+    fn session_with_host_home(root: &std::path::Path) -> Session {
+        let home = root.join("host-home");
+        std::fs::create_dir_all(&home).expect("create host home");
+        Session::for_tests_with_env(
+            root,
+            crate::data::config::env::EnvSnapshot::with_overrides([(
+                "HOME",
+                home.to_str().expect("fixture path must be UTF-8"),
+            )]),
         )
-        .expect("open test session")
     }
 
     fn with_daemon_global_config<T>(config: ConfigFile, test: impl FnOnce() -> T) -> T {
@@ -541,7 +549,7 @@ mod tests {
     #[test]
     fn engines_build_and_for_env_produce_container_tier_under_default_config() {
         let root = tempfile::tempdir().expect("create test root");
-        let session = session_at(root.path());
+        let session = session_with_host_home(root.path());
         let built = Engines::build(&session).expect("default session engines build");
         assert!(built.container_runtime.is_some());
         assert!(built.sandbox_runtime.is_none());
@@ -575,10 +583,13 @@ mod tests {
             root.path().to_path_buf(),
             root.path().to_path_buf(),
             crate::data::session::SessionOpenOptions {
-                env: Some(crate::data::config::EnvSnapshot::with_overrides([(
-                    crate::data::config::AWMAN_HOME,
-                    home.path().to_str().unwrap(),
-                )])),
+                env: Some(crate::data::config::EnvSnapshot::with_overrides([
+                    (
+                        crate::data::config::AWMAN_HOME,
+                        home.path().to_str().unwrap(),
+                    ),
+                    ("HOME", root.path().to_str().unwrap()),
+                ])),
                 ..Default::default()
             },
         )

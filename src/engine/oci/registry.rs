@@ -274,6 +274,7 @@ impl std::fmt::Debug for Credentials {
 /// Read the credentials `auth` names for `registry`. `Ok(None)` is
 /// anonymous access.
 pub(super) fn resolve_credentials(
+    snapshot: &crate::data::config::env::EnvSnapshot,
     registry: &str,
     auth: Option<&RegistryAuthSource>,
     lookup_var: &dyn Fn(&str) -> Option<String>,
@@ -299,19 +300,23 @@ pub(super) fn resolve_credentials(
             }
         }
         Some(RegistryAuthSource::Keychain { service }) => {
-            let value =
-                crate::engine::auth::keychain::keychain_lookup(service, registry, KEYCHAIN_TIMEOUT)
-                    .map_err(|e| {
-                        EngineError::Auth(format!(
+            let value = crate::engine::auth::keychain::keychain_lookup_in(
+                snapshot,
+                service,
+                registry,
+                KEYCHAIN_TIMEOUT,
+            )
+            .map_err(|e| {
+                EngineError::Auth(format!(
                     "registry {registry}: keychain service `{service}` could not be read: {e}"
                 ))
-                    })?
-                    .ok_or_else(|| {
-                        EngineError::Auth(format!(
+            })?
+            .ok_or_else(|| {
+                EngineError::Auth(format!(
                     "registry {registry}: keychain service `{service}` has no item for account \
                      `{registry}`"
                 ))
-                    })?;
+            })?;
             let (username, password) = split_user_pass(&value).ok_or_else(|| {
                 EngineError::Auth(format!(
                     "registry {registry}: keychain item `{service}`/`{registry}` must hold \
@@ -1429,9 +1434,15 @@ mod tests {
             username_var: "U".into(),
             password_var: "P".into(),
         };
-        let creds = resolve_credentials("r", Some(&auth), &lookup, &|| None)
-            .unwrap()
-            .unwrap();
+        let creds = resolve_credentials(
+            &crate::data::config::env::EnvSnapshot::empty(),
+            "r",
+            Some(&auth),
+            &lookup,
+            &|| None,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(creds.username, "user");
         assert_eq!(creds.password.expose(), "hunter2");
         assert!(!format!("{creds:?}").contains("hunter2"));
@@ -1440,7 +1451,14 @@ mod tests {
             username_var: "U".into(),
             password_var: "NOPE".into(),
         };
-        let err = resolve_credentials("r", Some(&missing), &lookup, &|| None).unwrap_err();
+        let err = resolve_credentials(
+            &crate::data::config::env::EnvSnapshot::empty(),
+            "r",
+            Some(&missing),
+            &lookup,
+            &|| None,
+        )
+        .unwrap_err();
         assert!(matches!(err, EngineError::Auth(ref m) if m.contains("NOPE")));
     }
 

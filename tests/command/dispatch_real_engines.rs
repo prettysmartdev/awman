@@ -280,20 +280,6 @@ async fn chat_custom_pi_dispatches_expected_container_options() {
     use awman::frontend::api::command_frontend::ApiDispatchFrontend;
     use std::sync::Arc;
 
-    // auth.env forwards only variables that exist on the host. This unique
-    // synthetic value is never shared with a real runtime or host agent.
-    struct TokenGuard(Option<std::ffi::OsString>);
-    impl Drop for TokenGuard {
-        fn drop(&mut self) {
-            match &self.0 {
-                Some(value) => std::env::set_var("WI0130_TOKEN", value),
-                None => std::env::remove_var("WI0130_TOKEN"),
-            }
-        }
-    }
-    let _token = TokenGuard(std::env::var_os("WI0130_TOKEN"));
-    std::env::set_var("WI0130_TOKEN", "synthetic-test-token");
-
     for (mode, expected) in [
         ("--yolo", "--reckless"),
         ("--auto", "--automatic"),
@@ -307,7 +293,23 @@ async fn chat_custom_pi_dispatches_expected_container_options() {
             "FROM scratch\n",
         )
         .unwrap();
-        let session = fixture.open_session();
+        // Credentials are resolved from the invoking session's snapshot,
+        // including in a daemon. Mutating the harness process env cannot
+        // supply them to an already-open session.
+        let env = awman::data::config::env::EnvSnapshot::with_overrides([
+            ("AWMAN_HOME", fixture.home_dir.path().to_str().unwrap()),
+            ("HOME", fixture.home_dir.path().to_str().unwrap()),
+            ("WI0130_TOKEN", "synthetic-test-token"),
+        ]);
+        let session = awman::data::session::Session::open(
+            fixture.git_root.path().to_path_buf(),
+            &awman::data::session::StaticGitRootResolver::new(fixture.git_root.path()),
+            awman::data::session::SessionOpenOptions {
+                env: Some(env),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         approve(&session, "pi");
         let runtime = Arc::new(RecordingRuntime::default());
         let mut engines = fixture.engines(false);

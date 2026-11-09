@@ -20,6 +20,8 @@ tree() { # name [fixture]
     mkdir -p "$root/$d"
     echo '// placeholder' > "$root/$d/placeholder.rs"
   done
+  mkdir -p "$root/tools"
+  cp "$repo/tools/env-lint-allowlist.txt" "$root/tools/"
   if [ -n "${2:-}" ]; then cp -R "$fixtures/$2/." "$root/"; fi
   echo "$root"
 }
@@ -42,6 +44,39 @@ expect() { # description wanted-status wanted-text
 
 run_lint "$(tree empty)"
 expect "minimal tree passes" 0 "OK"
+for symbol in var var_os vars vars_os current_dir temp_dir current_exe args args_os; do
+  root=$(tree "env-$symbol")
+  printf 'fn run() { std::env::%s(); }\n' "$symbol" > "$root/src/engine/env.rs"
+  run_lint "$root"
+  expect "instance env read $symbol fails" 1 "VIOLATION [env-snapshot]"
+done
+root=$(tree env-allowed)
+printf 'fn run() { std::env::current_dir(); }\n' > "$root/src/command/deferred.rs"
+printf 'src/command/deferred.rs:std::env::current_dir # to be routed by 0142 instance host\n' > "$root/tools/env-lint-allowlist.txt"
+run_lint "$root"
+expect "explicit deferred environment read passes" 0 "OK"
+printf 'fn run() { std::env::temp_dir(); }\n' >> "$root/src/command/deferred.rs"
+run_lint "$root"
+expect "allow-list grants only its named symbol" 1 "VIOLATION [env-snapshot]"
+printf 'fn run() { std::env::var("DEFERRED"); }\n' > "$root/src/command/deferred.rs"
+printf 'src/command/deferred.rs:std::env::var # to be routed by 0142 instance host\n' > "$root/tools/env-lint-allowlist.txt"
+run_lint "$root"
+expect "allow-listed direct variable read passes" 0 "OK"
+printf 'use std::env;\nfn run() { env::current_dir(); }\n' > "$root/src/command/deferred.rs"
+run_lint "$root"
+expect "aliased environment read is also guarded" 1 "VIOLATION [env-snapshot]"
+root=$(tree env-missing-allowlist)
+rm "$root/tools/env-lint-allowlist.txt"
+run_lint "$root"
+expect "missing environment allow-list is a scanner error" 2 "allow-list missing or unreadable"
+root=$(tree env-bad-allowlist)
+printf 'src/engine/.*:.*\n' > "$root/tools/env-lint-allowlist.txt"
+run_lint "$root"
+expect "malformed environment allow-list is a scanner error" 2 "SCANNER ERROR"
+run_lint "$(tree env-fixture forbidden-env-snapshot)"
+expect "environment read fixture fails" 1 "VIOLATION [env-snapshot]"
+run_lint "$(tree env-allowed-fixture allowed-env-snapshot)"
+expect "explicit environment allow-list fixture passes" 0 "OK"
 run_lint "$(tree allowed allowed)"
 expect "allowed imports pass" 0 "OK"
 run_lint "$(tree direct forbidden-direct)"
@@ -134,7 +169,7 @@ for gate in 'not(test)' 'any(test, unix)' 'all(not(test), unix)' 'feature = "tes
   root=$(tree cfg-env)
   printf '#[cfg(%s)]\nfn run() { std::env::var("X"); }\n' "$gate" > "$root/src/command/gated.rs"
   run_lint "$root"
-  expect "env read behind cfg($gate) fails" 1 "VIOLATION [env-var]"
+  expect "env read behind cfg($gate) fails" 1 "VIOLATION [env-snapshot]"
 done
 for gate in 'test' 'all(test, unix)' 'all(unix, test)' 'all(target_os = "linux", test)'; do
   root=$(tree cfg-test)
@@ -152,7 +187,7 @@ for item in 'mod tests {}' 'mod tests;' 'fn test_only() {}'; do
   expect "engine call after inline $item fails" 1 "VIOLATION [frontend-engine-call]"
   printf '#[cfg(test)] %s\nfn production() { std::env::var("X"); GlobalConfig::load(); }\n' "$item" > "$root/src/command/inline.rs"
   run_lint "$root"
-  expect "env read after inline $item fails" 1 "VIOLATION [env-var]"
+  expect "env read after inline $item fails" 1 "VIOLATION [env-snapshot]"
   expect "config reload after inline $item fails" 1 "VIOLATION [config-load]"
 done
 

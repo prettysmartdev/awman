@@ -241,7 +241,7 @@ fn wi0149_untrusted_repo_allow_and_acquire_never_spawn_or_mount_in_cli() {
     assert!(!f.path("home/.awman/prerequisite-grants.json").exists());
 }
 #[test]
-fn wi0149_architecture_layers_and_no_secretstring_in_data() {
+fn wi0149_architecture_layers_and_secrets_confined_to_local_dialog_wire() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let out = Command::new("bash")
         .arg(root.join("tools/architecture-lint.sh"))
@@ -254,18 +254,28 @@ fn wi0149_architecture_layers_and_no_secretstring_in_data() {
             let path = entry.unwrap().path();
             if path.is_dir() {
                 scan(&path);
-            } else if path.extension().is_some_and(|e| e == "rs") {
+            } else if path.extension().is_some_and(|e| e == "rs")
+                && !matches!(
+                    path.file_name().and_then(|s| s.to_str()),
+                    Some("secret.rs" | "dialog.rs")
+                )
+            {
                 assert!(
                     !std::fs::read_to_string(&path)
                         .unwrap()
                         .contains("SecretString"),
-                    "Layer 0 secret type: {}",
+                    "SecretString outside its local-dialog data contract: {}",
                     path.display()
                 );
             }
         }
     }
     scan(&root.join("src/data"));
+    // WI 0142 D4 moves the neutral wrapper to Layer 0. It must remain
+    // redacted and have no blanket Serialize implementation (the local
+    // socket adapter is the only wire path).
+    let secret = awman::data::secret::SecretString::new("do-not-expose");
+    assert_eq!(format!("{secret:?}"), "SecretString(<redacted>)");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

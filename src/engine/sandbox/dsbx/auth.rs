@@ -88,6 +88,7 @@ pub(super) fn is_credential_like(key: &str) -> bool {
 /// Returns `true` when at least one supported auth var was read from the host
 /// and registered with `sbx secret set` — i.e. the sbx proxy now has a
 /// credential awman put there.
+#[cfg(test)]
 pub(super) fn auto_auth_env_overlays(
     agent: &str,
     sandbox: &str,
@@ -97,6 +98,27 @@ pub(super) fn auto_auth_env_overlays(
     secret_already_registered: &dyn Fn(&str) -> bool,
     sink: &mut dyn UserMessageSink,
 ) -> Result<bool, EngineError> {
+    auto_auth_env_overlays_in(
+        &crate::engine::host_cli::process_env(),
+        agent,
+        sandbox,
+        (env_passthrough, env_literal),
+        lookup_env,
+        secret_already_registered,
+        sink,
+    )
+}
+
+pub(super) fn auto_auth_env_overlays_in(
+    snapshot: &crate::data::config::env::EnvSnapshot,
+    agent: &str,
+    sandbox: &str,
+    overlays: (&[EnvVar], &[EnvLiteral]),
+    lookup_env: &dyn Fn(&str) -> Option<String>,
+    secret_already_registered: &dyn Fn(&str) -> bool,
+    sink: &mut dyn UserMessageSink,
+) -> Result<bool, EngineError> {
+    let (env_passthrough, env_literal) = overlays;
     let supported = supported_auth_env_vars(agent);
     let mut configured_services: Vec<&'static str> = Vec::new();
 
@@ -114,7 +136,7 @@ pub(super) fn auto_auth_env_overlays(
             }
             match lookup_env(key) {
                 Some(value) if !value.is_empty() => {
-                    set_secret(service, &value, sandbox, sink)?;
+                    set_secret_in(snapshot, service, &value, sandbox, sink)?;
                     configured_services.push(service);
                 }
                 _ => {
@@ -216,13 +238,15 @@ fn warn_unsupported_dropped(
 /// scoped secrets take effect immediately (running or stopped), while global
 /// ones only apply at sandbox creation — and scoped registration keeps
 /// awman's keys out of sandboxes it does not own.
-fn set_secret(
+fn set_secret_in(
+    snapshot: &crate::data::config::env::EnvSnapshot,
     service: &str,
     value: &str,
     sandbox: &str,
     sink: &mut dyn UserMessageSink,
 ) -> Result<(), EngineError> {
-    run_secret_set(
+    run_secret_set_in(
+        snapshot,
         vec![
             "secret".into(),
             "set".into(),
@@ -241,12 +265,14 @@ fn set_secret(
 /// the current sbx, so it is the primary form. When it fails with an error
 /// that looks like sbx tried to prompt interactively, retry once with
 /// `--password-stdin` appended before giving up.
-fn run_secret_set(
+fn run_secret_set_in(
+    snapshot: &crate::data::config::env::EnvSnapshot,
     args: Vec<String>,
     value: &str,
     sink: &mut dyn UserMessageSink,
 ) -> Result<(), EngineError> {
     let attempt = SbxCommand::new(args.clone())
+        .in_env(snapshot)
         .with_stdin(value.as_bytes().to_vec())
         .announce_suffix("(value piped via stdin)")
         .redact(value.to_string())
@@ -257,6 +283,7 @@ fn run_secret_set(
             let mut retry = args;
             retry.push("--password-stdin".to_string());
             SbxCommand::new(retry)
+                .in_env(snapshot)
                 .with_stdin(value.as_bytes().to_vec())
                 .announce_suffix("(value piped via stdin)")
                 .redact(value.to_string())
@@ -307,7 +334,15 @@ fn info(text: String) -> crate::data::message::UserMessage {
 /// `--service` is the Docker Sandboxes well-known service name (per
 /// [`service_for_credential`]), e.g. `anthropic` for the `claude` agent — never
 /// the agent name.
+#[cfg(test)]
 pub(super) fn secret_registered_for_service(service: &str) -> bool {
+    secret_registered_for_service_in(&crate::engine::host_cli::process_env(), service)
+}
+
+pub(super) fn secret_registered_for_service_in(
+    snapshot: &crate::data::config::env::EnvSnapshot,
+    service: &str,
+) -> bool {
     let queries = [
         vec![
             "secret".to_string(),
@@ -318,7 +353,7 @@ pub(super) fn secret_registered_for_service(service: &str) -> bool {
         vec!["secret".to_string(), "ls".to_string(), "-g".to_string()],
     ];
     for args in queries {
-        if let Ok(out) = SbxCommand::new(args).run_quiet() {
+        if let Ok(out) = SbxCommand::new(args).in_env(snapshot).run_quiet() {
             if out.success() && listing_mentions_service(&out.stdout, service) {
                 return true;
             }
@@ -357,7 +392,22 @@ fn listing_mentions_service(stdout: &str, service: &str) -> bool {
 /// ([`auto_auth_env_overlays`]) or `/login` inside the sandbox — and the
 /// missing-auth case already gets its own warning from
 /// [`auto_auth_env_overlays`], so warning here on every launch is pure noise.
+#[cfg(test)]
 pub(super) fn inject_credentials(
+    creds: &[(String, String)],
+    sandbox: &str,
+    sink: &mut dyn UserMessageSink,
+) -> Result<(), EngineError> {
+    inject_credentials_in(
+        &crate::engine::host_cli::process_env(),
+        creds,
+        sandbox,
+        sink,
+    )
+}
+
+pub(super) fn inject_credentials_in(
+    snapshot: &crate::data::config::env::EnvSnapshot,
     creds: &[(String, String)],
     sandbox: &str,
     sink: &mut dyn UserMessageSink,
@@ -373,7 +423,7 @@ pub(super) fn inject_credentials(
         }
         match service_for_credential(key) {
             Some(service) => {
-                set_secret(service, value, sandbox, sink)?;
+                set_secret_in(snapshot, service, value, sandbox, sink)?;
             }
             None => {
                 sink.write_message(crate::data::message::UserMessage {

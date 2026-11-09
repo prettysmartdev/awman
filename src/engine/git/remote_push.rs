@@ -7,13 +7,14 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use super::{CommitIdentity, GitCommand, GitEngine, GitFrontend};
-use crate::data::config::env::{host_var_os, GIT_SSH, GIT_SSH_COMMAND};
+use crate::data::config::env::{GIT_SSH, GIT_SSH_COMMAND};
 use crate::data::message::{MessageLevel, UserMessage};
 use crate::engine::error::EngineError;
 
 type Result<T> = std::result::Result<T, EngineError>;
 
 pub struct RemotePushGit {
+    env: crate::data::config::env::EnvSnapshot,
     private: tempfile::TempDir,
     repo: PathBuf,
     original: Option<(PathBuf, PathBuf)>,
@@ -50,7 +51,7 @@ impl GitEngine {
 
     pub fn capture_workflow_git_source(&self, repo: &Path) -> Result<WorkflowGitSource> {
         let common = fs::canonicalize(self.git_common_dir(repo)?).map_err(io)?;
-        let output = super::host_command::command(repo)
+        let output = super::host_command::command(self.env(), repo)
             .args(["rev-parse", "--absolute-git-dir"])
             .current_dir(repo)
             .output()
@@ -109,6 +110,7 @@ impl GitEngine {
             .tempdir_in(parent)
             .map_err(io)?;
         let git = RemotePushGit {
+            env: self.env().clone(),
             private,
             repo: repo.to_path_buf(),
             original: None,
@@ -159,7 +161,7 @@ impl GitEngine {
         copy_regular(&metadata.join("config"), &local)?;
         {
             for key in ["user.name", "user.email", "extensions.objectformat"] {
-                let output = Command::new("git")
+                let output = crate::engine::host_cli::command(&self.env, "git")
                     .args(["config", "--no-includes", "--file"])
                     .arg(&local)
                     .args(["--get", key])
@@ -249,7 +251,7 @@ impl RemotePushGit {
     fn run(&self, args: &[&str], transport: bool, sink: &mut dyn GitFrontend) -> Result<Output> {
         let display = GitCommand::new(args);
         sink.command_started(&display);
-        let mut command = Command::new("git");
+        let mut command = crate::engine::host_cli::command(&self.env, "git");
         command
             .args([
                 "-c",
@@ -286,7 +288,10 @@ impl RemotePushGit {
         }
         // The host's chosen SSH executable/options remain trusted; add BatchMode
         // when no explicit override was selected, so ssh cannot prompt either.
-        if transport && host_var_os(GIT_SSH_COMMAND).is_none() && host_var_os(GIT_SSH).is_none() {
+        if transport
+            && self.env.get_os(GIT_SSH_COMMAND).is_none()
+            && self.env.get_os(GIT_SSH).is_none()
+        {
             command.env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes");
         }
         let output = bounded_output(&mut command, std::time::Duration::from_secs(120))?;
@@ -353,7 +358,7 @@ impl RemotePushGit {
         for key in ["user.name", "user.email"] {
             let configured = self.text(&["config", "--get", key], false, sink).ok();
             if configured.as_deref().is_none_or(str::is_empty) {
-                let host = Command::new("git")
+                let host = crate::engine::host_cli::command(&self.env, "git")
                     .args(["config", "--get", key])
                     .current_dir(self.private.path())
                     .env("GIT_DIR", self.private.path())
@@ -441,7 +446,7 @@ impl RemotePushGit {
                 format!("refs/heads/{branch}"),
             ),
         ] {
-            let output = Command::new("git")
+            let output = crate::engine::host_cli::command(&self.env, "git")
                 .args(["config", "--no-includes", "--file"])
                 .arg(metadata.join("config"))
                 .args([&key, &value])

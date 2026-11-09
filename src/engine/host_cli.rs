@@ -2,7 +2,7 @@
 //! `container`, and `sbx` — resolved through test isolation.
 //!
 //! Every spawn of one of them passes its program name through [`program`].
-//! Outside test isolation that is the name itself. Under it, the real CLI is
+//! Resolution uses the instance's PATH/cwd/HOME/PATHEXT. Under test isolation the real CLI is
 //! off unless its opt-in variable is set (`AWMAN_TEST_DOCKER`,
 //! `AWMAN_TEST_APPLE_CONTAINER`, `AWMAN_TEST_SBX`): the name resolves to a path
 //! that does not exist, so awman sees exactly what it sees when the CLI is not
@@ -14,42 +14,124 @@
 
 use std::path::Path;
 
-use crate::data::config::env::{test_isolation_active, Env, EnvSnapshot};
+use crate::data::config::env::{Env, EnvSnapshot};
 
-/// The program to spawn for the CLI named `name`. See the module docs.
-///
-/// Names other than the three CLIs pass through unchanged.
-pub fn program(name: &str) -> &str {
-    let (opted_in, disabled): (fn(&EnvSnapshot) -> bool, &'static str) = match name {
-        "docker" => (
-            EnvSnapshot::test_docker,
-            "/nonexistent/awman-test-isolation/docker",
-        ),
-        "container" => (
-            EnvSnapshot::test_apple_container,
-            "/nonexistent/awman-test-isolation/container",
-        ),
-        "sbx" => (
-            EnvSnapshot::test_sbx,
-            "/nonexistent/awman-test-isolation/sbx",
-        ),
-        _ => return name,
+/// Resolve only against the instance's PATH and working directory. A missing
+/// executable stays missing even if the daemon has one on its own PATH.
+pub fn program_in(env: &EnvSnapshot, name: &str) -> std::path::PathBuf {
+    let cwd = env.cwd();
+    let found = find_program(env, name, env.path_dirs());
+    let opted_in = match name {
+        "docker" => env.test_docker(),
+        "container" => env.test_apple_container(),
+        "sbx" => env.test_sbx(),
+        _ => true,
     };
-    if !test_isolation_active() || opted_in(&Env::from_process()) || resolves_to_test_fake(name) {
-        name
-    } else {
-        disabled
+    let fake = found.as_ref().is_some_and(|p| {
+        let canonical = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+        canonical(p).starts_with(canonical(&env.temp_dir()))
+    });
+    if (cfg!(test) || env.test_isolation()) && !opted_in && !fake {
+        return Path::new("/nonexistent/awman-test-isolation").join(name);
+    }
+    found.unwrap_or_else(|| {
+        let p = Path::new(name);
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else if p.components().count() > 1 {
+            cwd.join(p)
+        } else {
+            Path::new("/nonexistent/awman-missing-program").join(p)
+        }
+    })
+}
+
+/// `which` also consults HOME and (on Windows) PATHEXT. Bind those reads as
+/// well as PATH/cwd, rather than leaving a hidden ambient-environment fallback.
+pub(crate) fn find_program(
+    env: &EnvSnapshot,
+    name: &str,
+    paths: Vec<std::path::PathBuf>,
+) -> Option<std::path::PathBuf> {
+    which::WhichConfig::new_with_sys(SnapshotSystem(env))
+        .custom_path_list(std::env::join_paths(paths).ok()?)
+        .custom_cwd(env.cwd().to_path_buf())
+        .binary_name(name.into())
+        .first_result()
+        .ok()
+}
+
+struct SnapshotSystem<'a>(&'a EnvSnapshot);
+impl which::sys::Sys for SnapshotSystem<'_> {
+    type ReadDirEntry = <which::sys::RealSys as which::sys::Sys>::ReadDirEntry;
+    type Metadata = <which::sys::RealSys as which::sys::Sys>::Metadata;
+    fn is_windows(&self) -> bool {
+        cfg!(windows)
+    }
+    fn current_dir(&self) -> std::io::Result<std::path::PathBuf> {
+        Ok(self.0.cwd().to_path_buf())
+    }
+    fn home_dir(&self) -> Option<std::path::PathBuf> {
+        self.0.home_dir()
+    }
+    fn env_split_paths(&self, paths: &std::ffi::OsStr) -> Vec<std::path::PathBuf> {
+        std::env::split_paths(paths).collect()
+    }
+    fn env_path(&self) -> Option<std::ffi::OsString> {
+        self.0.get_os("PATH").map(Into::into)
+    }
+    fn env_path_ext(&self) -> Option<std::ffi::OsString> {
+        self.0.get_os("PATHEXT").map(Into::into)
+    }
+    fn metadata(&self, path: &Path) -> std::io::Result<Self::Metadata> {
+        which::sys::RealSys.metadata(path)
+    }
+    fn symlink_metadata(&self, path: &Path) -> std::io::Result<Self::Metadata> {
+        which::sys::RealSys.symlink_metadata(path)
+    }
+    fn read_dir(
+        &self,
+        path: &Path,
+    ) -> std::io::Result<Box<dyn Iterator<Item = std::io::Result<Self::ReadDirEntry>>>> {
+        which::sys::RealSys.read_dir(path)
+    }
+    fn is_valid_executable(&self, path: &Path) -> std::io::Result<bool> {
+        which::sys::RealSys.is_valid_executable(path)
     }
 }
 
-/// Whether `name` on `PATH` is a file inside the temp directory, i.e. a fake
-/// a test wrote for itself.
-fn resolves_to_test_fake(name: &str) -> bool {
-    let Ok(found) = which::which(name) else {
-        return false;
-    };
-    let canonical = |path: &Path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    canonical(&found).starts_with(canonical(&std::env::temp_dir()))
+/// Resolve a host program for an explicit instance snapshot.
+pub fn program(env: &EnvSnapshot, name: &str) -> std::path::PathBuf {
+    program_in(env, name)
+}
+
+/// The single host command constructor. Every instance child receives an
+/// explicit environment, including PATH, and never inherits daemon variables.
+pub fn command(env: &EnvSnapshot, name: &str) -> std::process::Command {
+    let mut command = std::process::Command::new(program(env, name));
+    command.env_clear().envs(env.spawn_env());
+    if !env.cwd().as_os_str().is_empty() {
+        command.current_dir(env.cwd());
+    }
+    command
+}
+
+pub(crate) fn pty_command(env: &EnvSnapshot, name: &str) -> portable_pty::CommandBuilder {
+    let mut command = portable_pty::CommandBuilder::new(program(env, name));
+    command.env_clear();
+    for (key, value) in env.spawn_env() {
+        command.env(key, value);
+    }
+    if !env.cwd().as_os_str().is_empty() {
+        command.cwd(env.cwd());
+    }
+    command
+}
+
+/// Compatibility capture for builtin constructors. Instance hosts supply their
+/// snapshot explicitly through the corresponding `*_in` constructors.
+pub fn process_env() -> EnvSnapshot {
+    Env::from_process()
 }
 
 // Runtime CLI calls in this scope poll the cancellation token and reap their process group.
@@ -174,35 +256,90 @@ pub(crate) fn checked_output(
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     #[test]
-    fn other_programs_pass_through() {
-        assert_eq!(program("git"), "git");
-        assert_eq!(program("fake-kit"), "fake-kit");
+    fn independent_snapshots_resolve_docker_and_git_and_clear_inherited_env() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        for instance in ["one", "two"] {
+            let bin = root.path().join(instance);
+            std::fs::create_dir(&bin).unwrap();
+            for program in ["docker", "git"] {
+                let path = bin.join(program);
+                std::fs::write(&path, format!(
+                    "#!/bin/sh\nprintf '%s\\n' '{instance}:{program}' \"$DOCKER_HOST\" \"$PWD\" \"${{AWMAN_UNDECLARED-unset}}\" \"$1\"\n"
+                )).unwrap();
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            let snapshot = EnvSnapshot::from_instance_env(
+                vec![
+                    ("PATH".into(), bin.to_string_lossy().into_owned()),
+                    ("DOCKER_HOST".into(), format!("unix:///{instance}.sock")),
+                    // The fakes live in the test's temp dir; resolution judges
+                    // "a test's own fake" by the snapshot's TMPDIR.
+                    (
+                        "TMPDIR".into(),
+                        std::env::temp_dir().to_string_lossy().into_owned(),
+                    ),
+                ],
+                bin.clone(),
+                vec!["awman".into(), "chat".into()],
+            );
+            for name in ["docker", "git"] {
+                assert_eq!(program_in(&snapshot, name), bin.join(name));
+                let mut child = std::process::Command::new(program_in(&snapshot, name));
+                child
+                    .env_clear()
+                    .envs(snapshot.spawn_env())
+                    .current_dir(snapshot.cwd())
+                    .arg("probe");
+                let output = child.output().unwrap();
+                assert!(output.status.success());
+                assert_eq!(
+                    String::from_utf8(output.stdout).unwrap(),
+                    format!(
+                        "{instance}:{name}\nunix:///{instance}.sock\n{}\nunset\nprobe\n",
+                        bin.canonicalize().unwrap().display()
+                    )
+                );
+                let command = command(&snapshot, name);
+                assert_eq!(command.get_program(), bin.join(name).as_os_str());
+                // Exactly the snapshot's PATH, TMPDIR and DOCKER_HOST: nothing inherited.
+                assert_eq!(command.get_envs().count(), 3);
+            }
+        }
     }
 
-    /// Unit tests are always isolated. Unless the opt-in is set (it is not in
-    /// `make test`) or a test's fake is on `PATH`, the real CLI is replaced
-    /// with a path that does not exist.
+    #[test]
+    fn snapshot_debug_redacts_all_instance_input() {
+        let snapshot = EnvSnapshot::from_instance_env(
+            vec![("GITHUB_TOKEN".into(), "env-secret".into())],
+            "/cwd-secret".into(),
+            vec!["argv-secret".into()],
+        );
+        let debug = format!("{snapshot:?}");
+        assert!(debug.contains("redacted"));
+        for secret in ["GITHUB_TOKEN", "env-secret", "cwd-secret", "argv-secret"] {
+            assert!(!debug.contains(secret));
+        }
+    }
+
+    #[test]
+    fn absolute_program_paths_are_preserved() {
+        let env = EnvSnapshot::empty();
+        assert_eq!(
+            program(&env, "/absolute-program"),
+            Path::new("/absolute-program")
+        );
+    }
+
     #[test]
     fn real_container_clis_are_off_under_isolation() {
-        // `program` and `resolves_to_test_fake` both read PATH; a sibling
-        // test adding its fake `sbx` between the reads must not interleave.
-        let _path = crate::engine::test_path::PathGuard::acquire();
-        for (name, opted_in) in [
-            ("docker", Env::from_process().test_docker()),
-            ("container", Env::from_process().test_apple_container()),
-            ("sbx", Env::from_process().test_sbx()),
-        ] {
-            let resolved = program(name);
-            if opted_in || resolves_to_test_fake(name) {
-                assert_eq!(resolved, name);
-            } else {
-                assert!(
-                    resolved.starts_with("/nonexistent/"),
-                    "{name} must be off under test isolation, got {resolved}"
-                );
-                assert!(!Path::new(resolved).exists());
-            }
+        let env = EnvSnapshot::empty();
+        for name in ["docker", "container", "sbx"] {
+            let resolved = program(&env, name);
+            assert!(resolved.starts_with("/nonexistent/awman-test-isolation"));
+            assert!(!resolved.exists());
         }
     }
 }

@@ -20,6 +20,8 @@ pub(super) const REMOTE: CommandSpec = CommandSpec {
     requires_container_tier: false,
     requires_runtime: false,
     opens_tui_when_bare: false,
+    internal: false,
+    relay_allowed: false,
     subcommands: &[&REMOTE_SESSION, &REMOTE_EXEC],
 };
 
@@ -38,6 +40,8 @@ pub(super) const REMOTE_EXEC: CommandSpec = CommandSpec {
     requires_container_tier: false,
     requires_runtime: false,
     opens_tui_when_bare: false,
+    internal: false,
+    relay_allowed: false,
     subcommands: &[&REMOTE_EXEC_WORKFLOW, &REMOTE_EXEC_PROMPT],
 };
 
@@ -61,6 +65,8 @@ pub(super) const REMOTE_EXEC_WORKFLOW: CommandSpec = CommandSpec {
     requires_container_tier: false,
     requires_runtime: false,
     opens_tui_when_bare: false,
+    internal: false,
+    relay_allowed: false,
     subcommands: &[],
 };
 
@@ -84,6 +90,8 @@ pub(super) const REMOTE_EXEC_PROMPT: CommandSpec = CommandSpec {
     requires_container_tier: false,
     requires_runtime: false,
     opens_tui_when_bare: false,
+    internal: false,
+    relay_allowed: false,
     subcommands: &[],
 };
 
@@ -102,6 +110,8 @@ pub(super) const REMOTE_SESSION: CommandSpec = CommandSpec {
     requires_container_tier: false,
     requires_runtime: false,
     opens_tui_when_bare: false,
+    internal: false,
+    relay_allowed: false,
     subcommands: &[&REMOTE_SESSION_START, &REMOTE_SESSION_KILL],
 };
 
@@ -118,6 +128,8 @@ pub(super) const REMOTE_SESSION_START: CommandSpec = CommandSpec {
     requires_container_tier: false,
     requires_runtime: false,
     opens_tui_when_bare: false,
+    internal: false,
+    relay_allowed: false,
     subcommands: &[],
 };
 
@@ -188,6 +200,8 @@ pub(super) const REMOTE_SESSION_KILL: CommandSpec = CommandSpec {
     requires_container_tier: false,
     requires_runtime: false,
     opens_tui_when_bare: false,
+    internal: false,
+    relay_allowed: false,
     subcommands: &[],
 };
 

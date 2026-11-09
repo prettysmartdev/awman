@@ -148,6 +148,18 @@ pub fn render_status(status: &StatusResponse) -> String {
         "capacity  {running}/{} running",
         status.max_concurrent_jobs
     ));
+    if let Some(engine) = status.features.get("engine") {
+        let instances = engine
+            .detail
+            .as_ref()
+            .and_then(|detail| detail.get("instances"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        out.push(format!(
+            "engine  {}  {instances} instances",
+            state_label(engine)
+        ));
+    }
     let enabled = status
         .features
         .values()
@@ -321,7 +333,8 @@ mod tests {
         squad.oldest_queued_age_ms = Some(4100);
         let worker = record("worker", FeatureState::Draining, 1, 2);
         let mut engine = record("engine", FeatureState::Ephemeral, 0, 4);
-        engine.reason = Some("rex hand-off".into());
+        engine.reason = Some("rex".into());
+        engine.detail = Some(serde_json::json!({"instances": 3, "frontends": 4}));
         engine.idle_timeout_ms = Some(900_000);
         engine.idle_ms = Some(12_000);
         let text = render_status(&status(vec![squad, worker, engine], Some(network(None, 2))));
@@ -337,7 +350,10 @@ mod tests {
         );
         assert!(text.contains("worker  draining"), "{text}");
         assert!(text.contains("1/2 running"), "{text}");
-        assert!(text.contains("engine  ephemeral (rex hand-off)"), "{text}");
+        assert!(
+            text.contains("engine  ephemeral (rex)  3 instances"),
+            "{text}"
+        );
         assert!(text.contains("0/4 running  idles out in 14m48s"), "{text}");
         assert!(
             text.contains("local    unix socket  /h/.awman/data/daemon/api.sock"),
@@ -382,6 +398,15 @@ mod tests {
     }
 
     #[test]
+    fn engine_status_shows_off_and_zero_instances_when_disabled() {
+        let text = render_status(&status(
+            vec![record("engine", FeatureState::Off, 0, 4)],
+            None,
+        ));
+        assert!(text.contains("engine  off  0 instances"), "{text}");
+    }
+
+    #[test]
     fn not_running_text_and_json() {
         let outcome = DaemonStatusOutcome {
             running: false,
@@ -413,5 +438,18 @@ mod tests {
         );
         assert!(text.contains("key: secret"), "{text}");
         assert!(text.contains("not shown again"), "{text}");
+    }
+
+    #[test]
+    fn api_json_output_preserves_the_route_response_shape() {
+        let response = serde_json::json!({
+            "items": [{"id": "ins_00000000000000000000000000000000", "annotations": {"repo": "acme"}}],
+            "next_cursor": null
+        });
+        let output = render_api(&DaemonApiOutcome::Response(response.clone()), true);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&output).unwrap(),
+            response
+        );
     }
 }

@@ -183,7 +183,7 @@ mod wi0149_tests {
             cli.ask_prerequisite_identity_persist(&p).unwrap(),
             p.default_on_dismiss.unwrap()
         );
-        let p = crate::command::prompts::prerequisite_ssh(&check, "github.com:org/repo");
+        let p = crate::command::prompts::prerequisite_ssh(&check, "github.com:org/repo", None);
         assert_eq!(
             cli.ask_prerequisite_ssh(&p).unwrap(),
             p.default_on_dismiss.unwrap()

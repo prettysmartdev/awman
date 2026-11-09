@@ -158,13 +158,20 @@ pub(crate) fn user_owned_dockerfile_note(name: &str) -> String {
     )
 }
 
+#[cfg(test)]
 fn custom_auth_env(def: &AgentDefinition, overlays: &[String]) -> Vec<String> {
+    custom_auth_env_in(&crate::engine::host_cli::process_env(), def, overlays)
+}
+
+fn custom_auth_env_in(
+    env: &crate::data::config::env::EnvSnapshot,
+    def: &AgentDefinition,
+    overlays: &[String],
+) -> Vec<String> {
     let mut seen: std::collections::HashSet<&str> = overlays.iter().map(String::as_str).collect();
     def.auth_env
         .iter()
-        .filter(|name| {
-            crate::data::config::env::host_var_os(name).is_some() && seen.insert(name.as_str())
-        })
+        .filter(|name| env.get(name).is_some() && seen.insert(name.as_str()))
         .cloned()
         .collect()
 }
@@ -726,7 +733,7 @@ impl AgentEngine {
 
         // Env passthrough.
         let env_pass = run.env_passthrough.as_deref().unwrap_or(&[]);
-        let auth_env = custom_auth_env(&def, env_pass);
+        let auth_env = custom_auth_env_in(session.env(), &def, env_pass);
         let mut emitted = std::collections::HashSet::new();
         for name in env_pass.iter().chain(auth_env.iter()) {
             if !emitted.insert(name) {
@@ -773,7 +780,7 @@ impl AgentEngine {
             )));
         }
         let container_home = image_home.or_else(|| {
-            let home = dirs::home_dir().unwrap_or_default();
+            let home = session.env().home_dir().unwrap_or_default();
             // The definition root is the invoking checkout for session worktrees, so a
             // branch or PR cannot pick the credential mount point via its Dockerfile.
             crate::engine::overlay::detect_container_home(
@@ -913,7 +920,10 @@ impl AgentEngine {
                     env_vars: credentials.env_vars.clone(),
                 });
             }
-            Ok(ResolvedAgentOptions::sandbox(options))
+            let mut resolved =
+                crate::engine::sandbox::options::ResolvedSandboxOptions::resolve(options);
+            resolved.host_env = Some(session.env().clone());
+            Ok(ResolvedAgentOptions::Sandbox(Box::new(resolved)))
         } else {
             let mut options =
                 self.build_options_with_credentials(session, agent, run, credentials)?;
@@ -924,7 +934,12 @@ impl AgentEngine {
                     env_vars: credentials.env_vars.clone(),
                 });
             }
-            ResolvedAgentOptions::container(options)
+            Ok(ResolvedAgentOptions::Container(Box::new(
+                crate::engine::container::options::ResolvedContainerOptions::resolve_in(
+                    options,
+                    session.env(),
+                )?,
+            )))
         }
     }
 

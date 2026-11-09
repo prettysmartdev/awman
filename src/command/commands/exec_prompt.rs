@@ -585,6 +585,7 @@ impl Command for ExecPromptCommand {
                     }
                 };
                 frontend.set_pty_active(false);
+                frontend.wait_output_drained().await;
                 frontend.replay_queued();
                 exit
             };

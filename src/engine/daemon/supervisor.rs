@@ -270,7 +270,7 @@ pub(crate) fn spawn_background(
     service_manager: bool,
 ) -> Result<u32, DataError> {
     if let Some(parent) = log_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| DataError::io(parent, e))?;
+        crate::data::fs::private_files::create_private_dir(parent)?;
     }
     // Create the log ourselves so it exists with owner-only permissions before
     // launchd/systemd starts appending to it at the process umask. A daemon log
@@ -666,6 +666,32 @@ pub(crate) fn daemon_unit_env(forwarded: Vec<(String, String)>) -> Vec<(String, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn background_start_creates_a_private_daemon_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let parent = tmp.path().join("data/daemon");
+        let log = parent.join("awman.log");
+        spawn_background(
+            Path::new("/bin/sh"),
+            &["-c".into(), "exit 0".into()],
+            &log,
+            "unused",
+            "unused",
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::metadata(parent).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(log).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
 
     #[test]
     fn the_daemon_unit_is_started_with_awman_home_only() {

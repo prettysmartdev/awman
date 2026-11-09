@@ -6,6 +6,8 @@
 //! PTY sizes and frame ordering consistent. It must be short and must not call
 //! back into the hub. Bridges report output/exit through `TerminalHandle`.
 
+// WI 0142: registers engine agent channels as hub terminals (filled by engine-feature-layer1).
+pub mod bridge;
 mod mirror;
 mod registry;
 mod subscription;
@@ -648,6 +650,7 @@ mod tests {
 
     fn as_frame(snapshot: TerminalSnapshot) -> TerminalFrame {
         TerminalFrame::Snapshot {
+            has_output: snapshot.has_output,
             cols: snapshot.cols,
             rows: snapshot.rows,
             screen: snapshot.screen,
@@ -1132,6 +1135,7 @@ mod tests {
             TerminalFrame::Snapshot {
                 cols: 80,
                 rows: 24,
+                has_output: true,
                 screen: vec![0, 27, 255],
             },
             TerminalFrame::Output {

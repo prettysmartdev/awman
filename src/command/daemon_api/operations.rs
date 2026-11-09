@@ -35,6 +35,18 @@ impl FeatureSet {
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Operation {
+    EngineInstancesList,
+    EngineInstancesCreate,
+    EngineInstancesGet,
+    EngineInstancesDelete,
+    EngineInstancesPatch,
+    EngineInstancesFrontend,
+    EngineTabsList,
+    EngineTabsGet,
+    EngineTabsPatch,
+    EngineDialogsList,
+    EngineDialogsAnswer,
+    EngineUiRequests,
     CoreHealth,
     CoreFeaturesPatch,
     CoreKeysList,
@@ -80,6 +92,18 @@ pub enum Operation {
 impl Operation {
     pub fn owner(self) -> Feature {
         match self {
+            Self::EngineInstancesList
+            | Self::EngineInstancesCreate
+            | Self::EngineInstancesGet
+            | Self::EngineInstancesDelete
+            | Self::EngineInstancesPatch
+            | Self::EngineInstancesFrontend
+            | Self::EngineTabsList
+            | Self::EngineTabsGet
+            | Self::EngineTabsPatch
+            | Self::EngineDialogsList
+            | Self::EngineDialogsAnswer
+            | Self::EngineUiRequests => Feature::Engine,
             Self::CoreHealth
             | Self::CoreFeaturesPatch
             | Self::CoreKeysList
@@ -126,6 +150,18 @@ impl Operation {
     }
     pub fn name(self) -> &'static str {
         match self {
+            Self::EngineInstancesList => "engine.instances.list",
+            Self::EngineInstancesCreate => "engine.instances.create",
+            Self::EngineInstancesGet => "engine.instances.get",
+            Self::EngineInstancesDelete => "engine.instances.delete",
+            Self::EngineInstancesPatch => "engine.instances.patch",
+            Self::EngineInstancesFrontend => "engine.instances.frontend",
+            Self::EngineTabsList => "engine.tabs.list",
+            Self::EngineTabsGet => "engine.tabs.get",
+            Self::EngineTabsPatch => "engine.tabs.patch",
+            Self::EngineDialogsList => "engine.dialogs.list",
+            Self::EngineDialogsAnswer => "engine.dialogs.answer",
+            Self::EngineUiRequests => "engine.ui.requests",
             Self::CoreHealth => "core.health",
             Self::CoreFeaturesPatch => "core.features.patch",
             Self::CoreKeysList => "core.keys.list",
@@ -172,7 +208,9 @@ impl Operation {
     pub fn creates(self) -> bool {
         matches!(
             self,
-            Self::WorkerSessionsCreate
+            Self::EngineInstancesCreate
+                | Self::EngineInstancesFrontend
+                | Self::WorkerSessionsCreate
                 | Self::WorkerCommandsCreate
                 | Self::WorkerRunsCreate
                 | Self::SquadTasksCreate
@@ -196,17 +234,18 @@ impl Feature {
 }
 impl Operation {
     pub fn local_only(self) -> bool {
-        matches!(
-            self,
-            Self::CoreConfigGet
-                | Self::CoreConfigReload
-                | Self::CoreFeaturesPatch
-                | Self::CoreKeysList
-                | Self::CoreKeysCreate
-                | Self::CoreKeysDelete
-                | Self::CoreGrantsList
-                | Self::CoreGrantsDelete
-        )
+        self.owner() == Feature::Engine
+            || matches!(
+                self,
+                Self::CoreConfigGet
+                    | Self::CoreConfigReload
+                    | Self::CoreFeaturesPatch
+                    | Self::CoreKeysList
+                    | Self::CoreKeysCreate
+                    | Self::CoreKeysDelete
+                    | Self::CoreGrantsList
+                    | Self::CoreGrantsDelete
+            )
     }
     pub fn unauthenticated(self) -> bool {
         self == Self::CoreHealth

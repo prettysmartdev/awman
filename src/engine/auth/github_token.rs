@@ -160,8 +160,15 @@ impl GitHubTokenResolver {
 
     /// `which("gh")`; under test isolation only a fake inside the temp dir counts.
     pub fn gh_on_path(&self) -> Option<PathBuf> {
-        let found = which::which("gh").ok().filter(|p| p.is_absolute())?;
-        if test_isolation_active() && !inside_temp_dir(&found) {
+        let snapshot = self
+            .env
+            .clone()
+            .unwrap_or_else(crate::engine::host_cli::process_env);
+        let found = crate::engine::host_cli::program_in(&snapshot, "gh");
+        if !found.is_file() {
+            return None;
+        }
+        if test_isolation_active() && !inside_temp_dir_in(&snapshot, &found) {
             return None;
         }
         Some(found)
@@ -235,7 +242,13 @@ impl GitHubTokenResolver {
         command.stdin = HostStdin::Tty;
         command.timeout = HOST_SECRET_TIMEOUT_MAX;
         command.expect_secret = false;
-        HostSecretCommand::new(command)?.outside_repository(self.repository_root.as_deref())
+        HostSecretCommand::new_in(
+            command,
+            self.env
+                .clone()
+                .unwrap_or_else(crate::engine::host_cli::process_env),
+        )?
+        .outside_repository(self.repository_root.as_deref())
     }
 
     /// The configured `acquire` argv. Approval of a repo-scoped command is
@@ -248,14 +261,19 @@ impl GitHubTokenResolver {
     ) -> Result<HostSecretCommand, HostSecretCommandError> {
         let program = acquire.argv.first().cloned().unwrap_or_default();
         let ellipsis = if acquire.argv.len() > 1 { " …" } else { "" };
-        HostSecretCommand::new(HostSecretCommandOptions {
-            argv: acquire.argv.clone(),
-            label: format!("configured token command ({program}{ellipsis})"),
-            timeout: Duration::from_secs(acquire.timeout_secs),
-            stdin,
-            refused_binaries: refused_binaries.to_vec(),
-            expect_secret: true,
-        })?
+        HostSecretCommand::new_in(
+            HostSecretCommandOptions {
+                argv: acquire.argv.clone(),
+                label: format!("configured token command ({program}{ellipsis})"),
+                timeout: Duration::from_secs(acquire.timeout_secs),
+                stdin,
+                refused_binaries: refused_binaries.to_vec(),
+                expect_secret: true,
+            },
+            self.env
+                .clone()
+                .unwrap_or_else(crate::engine::host_cli::process_env),
+        )?
         .outside_repository(self.repository_root.as_deref())
     }
 
@@ -329,7 +347,13 @@ impl GitHubTokenResolver {
         options.stdin = stdin;
         options.timeout = timeout;
         options.expect_secret = expect_secret;
-        HostSecretCommand::new(options)?.outside_repository(self.repository_root.as_deref())
+        HostSecretCommand::new_in(
+            options,
+            self.env
+                .clone()
+                .unwrap_or_else(crate::engine::host_cli::process_env),
+        )?
+        .outside_repository(self.repository_root.as_deref())
     }
 }
 
@@ -396,9 +420,13 @@ pub(crate) fn valid_host(host: &str) -> bool {
             .is_none_or(|p| !p.is_empty() && p.len() <= 5 && p.chars().all(|c| c.is_ascii_digit()))
 }
 
+#[cfg(test)]
 fn inside_temp_dir(path: &Path) -> bool {
+    inside_temp_dir_in(&crate::engine::host_cli::process_env(), path)
+}
+fn inside_temp_dir_in(snapshot: &EnvSnapshot, path: &Path) -> bool {
     let canonical = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
-    canonical(path).starts_with(canonical(&std::env::temp_dir()))
+    canonical(path).starts_with(canonical(&snapshot.temp_dir()))
 }
 
 fn verify_url(host: &str) -> String {

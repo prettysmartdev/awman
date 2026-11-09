@@ -148,7 +148,12 @@ impl Fixture {
             "recreate",
         ]);
         let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-        assert!(out.status.success(), "dynamic run failed: {stderr}");
+        assert!(
+            out.status.success(),
+            "dynamic run failed: {stderr}\ndaemon log: {}",
+            std::fs::read_to_string(self.dir.path().join("home/.awman/data/daemon/awman.log"))
+                .unwrap_or_default()
+        );
         let prompt = std::fs::read_to_string(self.dir.path().join("control/leader-prompt.txt"))
             .unwrap_or_else(|e| panic!("no leader prompt captured ({e}): {stderr}"));
         (prompt, stderr)

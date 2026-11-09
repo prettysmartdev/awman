@@ -1,51 +1,18 @@
-//! TUI message sink — routes `UserMessage`s to the active tab's status log.
+//! The TUI's status log feed. The log and its sink are Layer 2
+//! (`command::instance::feeds`) since WI 0142: the command thread writes them
+//! and the tab draws them. Re-exported here under their established names.
 
-use std::sync::{Arc, Mutex};
+#[cfg(test)]
+use crate::data::message::{UserMessage, UserMessageSink};
 
-use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
-
-/// Status log entry stored per-tab.
-#[derive(Debug, Clone)]
-pub struct StatusLogEntry {
-    pub level: MessageLevel,
-    pub text: String,
-}
-
-/// Shared reference to a tab's status log. The command thread writes here;
-/// the render loop reads.
-pub type SharedStatusLog = Arc<Mutex<Vec<StatusLogEntry>>>;
-
-/// TUI implementation of `UserMessageSink`. Constructed per-command invocation
-/// and pointed at the active tab's shared status log.
-#[derive(Clone)]
-pub struct TuiUserMessageSink {
-    log: SharedStatusLog,
-}
-
-impl TuiUserMessageSink {
-    pub fn new(log: SharedStatusLog) -> Self {
-        Self { log }
-    }
-}
-
-impl UserMessageSink for TuiUserMessageSink {
-    fn write_message(&mut self, msg: UserMessage) {
-        if let Ok(mut log) = self.log.lock() {
-            log.push(StatusLogEntry {
-                level: msg.level,
-                text: msg.text,
-            });
-        }
-    }
-
-    fn replay_queued(&mut self) {
-        // TUI renders live — no queuing needed.
-    }
-}
+pub use crate::command::instance::feeds::{
+    SharedStatusLog, StatusLogEntry, StatusLogSink as TuiUserMessageSink,
+};
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::message::MessageLevel;
     use std::sync::{Arc, Mutex};
 
     fn make_sink() -> (TuiUserMessageSink, SharedStatusLog) {

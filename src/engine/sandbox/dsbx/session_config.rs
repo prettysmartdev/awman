@@ -23,17 +23,7 @@ use crate::engine::sandbox::options::ResolvedSandboxOptions;
 /// startup script fail loudly and direct the user to re-run `awman ready`.
 pub(super) const SESSION_SCHEMA_VERSION: u32 = 1;
 
-/// This process's own environment (entries that are not UTF-8 skipped): what
-/// the host `sbx run` client inherits, so the launch can scrub its terminal
-/// variables (WI 0141 §3). Like the `env_config` writer below this reads the
-/// real process environment on purpose — never the daemon overlay — because
-/// it describes exactly what a spawned child would inherit.
-pub(super) fn process_env() -> Vec<(String, String)> {
-    std::env::vars_os()
-        .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().unwrap_or_default())))
-        .collect()
-}
-
+/// Render only selected non-sensitive instance values, never the full snapshot.
 pub(super) struct DSbxSessionConfig;
 
 impl DSbxSessionConfig {
@@ -58,6 +48,10 @@ impl DSbxSessionConfig {
     /// no filesystem access — so it is trivially testable and so the
     /// credential-exclusion invariant can be asserted directly.
     pub(super) fn build_value(options: &ResolvedSandboxOptions) -> Value {
+        let snapshot = options
+            .host_env
+            .clone()
+            .unwrap_or_else(crate::engine::host_cli::process_env);
         let mut root = Map::new();
         root.insert("schema_version".into(), json!(SESSION_SCHEMA_VERSION));
         root.insert("agent".into(), json!(options.agent_id));
@@ -126,8 +120,8 @@ impl DSbxSessionConfig {
             if is_credential_like(&envvar.0) {
                 continue;
             }
-            if let Ok(value) = std::env::var(&envvar.0) {
-                env_pairs.push((envvar.0.clone(), value));
+            if let Some(value) = snapshot.get(&envvar.0) {
+                env_pairs.push((envvar.0.clone(), value.to_owned()));
             }
         }
         for lit in &options.env_literal {
@@ -138,9 +132,7 @@ impl DSbxSessionConfig {
         }
         // The one host-terminal scrub for this backend (WI 0141 §3).
         let mut env_config = Map::new();
-        for (key, value) in
-            scrub_run_env(env_pairs, std::env::var("COLORTERM").ok().as_deref()).kept
-        {
+        for (key, value) in scrub_run_env(env_pairs, snapshot.get("COLORTERM")).kept {
             env_config.insert(key, json!(value));
         }
         root.insert("env_config".into(), Value::Object(env_config));

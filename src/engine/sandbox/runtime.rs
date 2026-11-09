@@ -30,6 +30,7 @@ static SANDBOX_CAPABILITIES: Capabilities = Capabilities {
 };
 
 pub struct SandboxRuntime {
+    env: crate::data::config::env::EnvSnapshot,
     backend: Arc<dyn SandboxBackend>,
 }
 
@@ -52,7 +53,7 @@ impl SandboxRuntime {
         no_cache: bool,
         sink: &mut dyn crate::data::message::UserMessageSink,
     ) -> Result<(), EngineError> {
-        super::dsbx::ready_agent(agent, no_cache, sink)
+        super::dsbx::ready_agent_in(&self.env, agent, no_cache, sink)
     }
 
     /// Construct with the Docker Sandbox (`sbx`) backend.
@@ -60,6 +61,9 @@ impl SandboxRuntime {
     /// Platform guard: Docker Sandboxes are not available on Linux. Erroring
     /// here (rather than from the first backend call) gives the user an actionable platform message up front.
     pub fn dsbx() -> Result<Self, EngineError> {
+        Self::dsbx_in(crate::engine::host_cli::process_env())
+    }
+    pub fn dsbx_in(env: crate::data::config::env::EnvSnapshot) -> Result<Self, EngineError> {
         if cfg!(target_os = "linux") {
             return Err(EngineError::BackendUnsupportedOnPlatform {
                 backend: "docker-sbx-experimental".into(),
@@ -69,7 +73,8 @@ impl SandboxRuntime {
             });
         }
         Ok(Self {
-            backend: Arc::new(DSbxBackend::new()),
+            backend: Arc::new(DSbxBackend::with_env(env.clone())),
+            env,
         })
     }
 
@@ -85,6 +90,7 @@ impl SandboxRuntime {
     pub(crate) fn for_tests() -> Self {
         Self {
             backend: Arc::new(DSbxBackend::new()),
+            env: crate::engine::host_cli::process_env(),
         }
     }
 }
@@ -107,8 +113,7 @@ impl AgentRuntimeEngine for SandboxRuntime {
 
     fn is_available(&self) -> bool {
         crate::engine::host_cli::checked_output(
-            std::process::Command::new(crate::engine::host_cli::program(self.backend.cli_binary()))
-                .arg("ls"),
+            crate::engine::host_cli::command(&self.env, self.backend.cli_binary()).arg("ls"),
             self.backend.cli_binary(),
         )
         .is_ok()
@@ -116,7 +121,10 @@ impl AgentRuntimeEngine for SandboxRuntime {
 
     fn build(&self, options: ResolvedAgentOptions) -> Result<Box<dyn AgentInstance>, EngineError> {
         match options {
-            ResolvedAgentOptions::Sandbox(opts) => {
+            ResolvedAgentOptions::Sandbox(mut opts) => {
+                if opts.host_env.is_none() {
+                    opts.host_env = Some(self.env.clone());
+                }
                 opts.validate_tool_restrictions()?;
                 Ok(Box::new(SandboxAgentInstance { options: *opts }))
             }
@@ -146,6 +154,7 @@ impl AgentRuntimeEngine for SandboxRuntime {
 
     fn attach(&self, handle: &AgentHandle) -> Result<Box<dyn AgentInstance>, EngineError> {
         Ok(Box::new(SandboxAttachInstance {
+            env: self.env.clone(),
             handle: handle.clone(),
             cli_binary: self.backend.cli_binary(),
         }))
@@ -238,6 +247,7 @@ impl AgentInstance for SandboxAgentInstance {
 /// Configured-but-not-running sandbox attach handle. `run_with_frontend`
 /// opens an `sbx exec -it <name> bash` session and bridges it to the frontend.
 struct SandboxAttachInstance {
+    env: crate::data::config::env::EnvSnapshot,
     handle: AgentHandle,
     cli_binary: &'static str,
 }
@@ -286,7 +296,7 @@ impl AgentInstance for SandboxAttachInstance {
         self: Box<Self>,
         mut frontend: Box<dyn AgentFrontend>,
     ) -> Result<AgentExecution, EngineError> {
-        use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+        use portable_pty::{native_pty_system, PtySize};
 
         let started_at = chrono::Utc::now();
         let handle = self.handle.clone();
@@ -319,7 +329,7 @@ impl AgentInstance for SandboxAttachInstance {
                     pixel_height: 0,
                 })
                 .map_err(|e| EngineError::Sandbox(format!("openpty: {e}")))?;
-            let mut cmd = CommandBuilder::new(crate::engine::host_cli::program(self.cli_binary));
+            let mut cmd = crate::engine::host_cli::pty_command(&self.env, self.cli_binary);
             for arg in &argv {
                 cmd.arg(arg);
             }
@@ -346,7 +356,7 @@ impl AgentInstance for SandboxAttachInstance {
 
         // Piped path.
         let argv = sbx_attach_argv(&handle.id, &[], &["bash"]);
-        let mut cmd = std::process::Command::new(crate::engine::host_cli::program(self.cli_binary));
+        let mut cmd = crate::engine::host_cli::command(&self.env, self.cli_binary);
         cmd.args(&argv);
         cmd.stdin(std::process::Stdio::piped());
         cmd.stdout(std::process::Stdio::piped());
@@ -695,6 +705,7 @@ mod inspect_default_tests {
             started_at: chrono::Utc::now(),
         };
         let rt = SandboxRuntime {
+            env: crate::engine::host_cli::process_env(),
             backend: Arc::new(InspectableBackend(handle.clone())),
         };
         assert!(!rt.capabilities().reports_resource_stats);

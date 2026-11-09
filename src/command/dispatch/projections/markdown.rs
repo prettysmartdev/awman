@@ -35,7 +35,7 @@ impl CommandCatalogue {
             out.push_str(&render_flag_row(flag));
         }
         out.push_str("\n---\n\n");
-        for sub in self.root().subcommands {
+        for sub in self.root().subcommands.iter().filter(|sub| !sub.internal) {
             render_command(sub, &["awman"], 2, &mut out);
             out.push_str("---\n\n");
         }
@@ -106,7 +106,7 @@ fn render_command(
         out.push('\n');
     }
 
-    for sub in spec.subcommands {
+    for sub in spec.subcommands.iter().filter(|sub| !sub.internal) {
         render_command(sub, &path, depth + 1, out);
     }
 }
@@ -285,9 +285,17 @@ mod tests {
     fn catalogue_markdown_consistency_every_command_is_rendered() {
         let cat = CommandCatalogue::get();
         let generated = cat.markdown_reference();
-        for sub in cat.root().subcommands {
+        for sub in cat.root().subcommands.iter().filter(|sub| !sub.internal) {
             walk_and_check(sub, vec!["awman", sub.name], &generated);
         }
+    }
+
+    /// Internal entry points (`view`, WI 0142 D10) are not documented.
+    #[test]
+    fn internal_commands_are_absent_from_the_reference() {
+        let cat = CommandCatalogue::get();
+        assert!(cat.is_internal(&["view"]));
+        assert!(!cat.markdown_reference().contains("`awman view`"));
     }
 
     #[test]

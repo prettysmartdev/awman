@@ -91,25 +91,72 @@ impl BuiltinRuntimeSettings {
 pub const BUILTIN_RUNTIME_NAME: &str = "builtin";
 
 pub struct ContainerRuntime {
+    env: crate::data::config::env::EnvSnapshot,
     backend: Arc<dyn ContainerBackend>,
     phase_tools_cache: std::sync::Mutex<crate::data::fs::phase_tools_cache::PhaseToolsCache>,
 }
 
-fn new_phase_tools_cache() -> std::sync::Mutex<crate::data::fs::phase_tools_cache::PhaseToolsCache>
-{
-    let cache =
-        crate::data::fs::data_paths::data_home(&crate::data::config::env::Env::from_process())
-            .map(|root| crate::data::fs::phase_tools_cache::PhaseToolsCache::load(&root))
-            .unwrap_or_else(|_| crate::data::fs::phase_tools_cache::PhaseToolsCache::in_memory());
+// Endpoint buckets prevent a daemon's first Docker from becoming every
+// instance's Docker. Weak entries retain no instance environment after its
+// last handle is dropped. Even within one endpoint, different PATH, cwd or
+// credentials require distinct handles.
+type CliEndpointKey = (&'static str, Option<String>, Option<String>);
+type CliRuntimeHandles =
+    std::collections::BTreeMap<CliEndpointKey, Vec<std::sync::Weak<ContainerRuntime>>>;
+static CLI_HANDLES: std::sync::OnceLock<std::sync::Mutex<CliRuntimeHandles>> =
+    std::sync::OnceLock::new();
+
+fn new_phase_tools_cache(
+    env: &crate::data::config::env::EnvSnapshot,
+) -> std::sync::Mutex<crate::data::fs::phase_tools_cache::PhaseToolsCache> {
+    let cache = crate::data::fs::data_paths::data_home(env)
+        .map(|root| crate::data::fs::phase_tools_cache::PhaseToolsCache::load(&root))
+        .unwrap_or_else(|_| crate::data::fs::phase_tools_cache::PhaseToolsCache::in_memory());
     std::sync::Mutex::new(cache)
 }
 
 impl ContainerRuntime {
+    fn cli_handle(kind: &'static str, env: crate::data::config::env::EnvSnapshot) -> Arc<Self> {
+        let (context, host) = env.runtime_endpoint();
+        let registry = CLI_HANDLES.get_or_init(Default::default);
+        let mut handles = registry.lock().unwrap_or_else(|p| p.into_inner());
+        handles.retain(|_, entries| {
+            entries.retain(|entry| entry.strong_count() != 0);
+            !entries.is_empty()
+        });
+        let entries = handles.entry((kind, context, host)).or_default();
+        if let Some(runtime) = entries
+            .iter()
+            .filter_map(std::sync::Weak::upgrade)
+            .find(|rt| rt.env == env)
+        {
+            return runtime;
+        }
+        let runtime = Arc::new(match kind {
+            "docker" => Self::docker_in(env),
+            _ => Self::apple_in(env),
+        });
+        entries.push(Arc::downgrade(&runtime));
+        runtime
+    }
+
+    pub fn docker_handle(env: crate::data::config::env::EnvSnapshot) -> Arc<Self> {
+        Self::cli_handle("docker", env)
+    }
+    pub fn apple_handle(env: crate::data::config::env::EnvSnapshot) -> Arc<Self> {
+        Self::cli_handle("container", env)
+    }
+
     /// Construct with the Docker backend.
     pub fn docker() -> Self {
+        Self::docker_in(crate::engine::host_cli::process_env())
+    }
+
+    pub fn docker_in(env: crate::data::config::env::EnvSnapshot) -> Self {
         Self {
-            backend: Arc::new(DockerBackend),
-            phase_tools_cache: new_phase_tools_cache(),
+            backend: Arc::new(DockerBackend::new(env.clone())),
+            phase_tools_cache: new_phase_tools_cache(&env),
+            env,
         }
     }
 
@@ -117,9 +164,14 @@ impl ContainerRuntime {
     /// lives in `agent_runtime::detect`; constructing this directly on a
     /// non-mac host yields a runtime whose probes simply fail.
     pub fn apple() -> Self {
+        Self::apple_in(crate::engine::host_cli::process_env())
+    }
+
+    pub fn apple_in(env: crate::data::config::env::EnvSnapshot) -> Self {
         Self {
-            backend: Arc::new(AppleBackend),
-            phase_tools_cache: new_phase_tools_cache(),
+            backend: Arc::new(AppleBackend::new(env.clone())),
+            phase_tools_cache: new_phase_tools_cache(&env),
+            env,
         }
     }
 
@@ -142,9 +194,11 @@ impl ContainerRuntime {
             }
             Err(e) => return Err(e),
         };
+        let env = crate::engine::host_cli::process_env();
         Ok(Self {
             backend,
-            phase_tools_cache: new_phase_tools_cache(),
+            phase_tools_cache: new_phase_tools_cache(&env),
+            env,
         })
     }
 
@@ -152,10 +206,21 @@ impl ContainerRuntime {
     /// a real backend over a fake driver.
     #[cfg(test)]
     pub(super) fn with_backend(backend: Arc<dyn ContainerBackend>) -> Self {
+        let env = crate::engine::host_cli::process_env();
         Self {
             backend,
-            phase_tools_cache: new_phase_tools_cache(),
+            phase_tools_cache: new_phase_tools_cache(&env),
+            env,
         }
+    }
+
+    pub fn env(&self) -> &crate::data::config::env::EnvSnapshot {
+        &self.env
+    }
+
+    /// Runtime observations and handles may only be reused for this endpoint.
+    pub fn endpoint_key(&self) -> (Option<String>, Option<String>) {
+        self.env.runtime_endpoint()
     }
 
     /// Static name of the chosen backend (e.g. `"docker"`).
@@ -475,6 +540,17 @@ impl AgentRuntimeEngine for ContainerRuntime {
         cancel: &crate::engine::oci::CancelToken,
     ) -> Result<ImportedImage, EngineError> {
         self.backend.import_image_cancellable(request, sink, cancel)
+    }
+
+    fn import_image_in(
+        &self,
+        request: &ImageImportRequest,
+        env: &crate::data::config::env::EnvSnapshot,
+        sink: &mut dyn crate::data::message::UserMessageSink,
+        cancel: &crate::engine::oci::CancelToken,
+    ) -> Result<ImportedImage, EngineError> {
+        self.backend
+            .import_image_cancellable_in(request, env, sink, cancel)
     }
 
     fn image_identity(&self, tag: &str) -> Result<Option<ImageIdentity>, EngineError> {

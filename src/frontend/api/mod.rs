@@ -1,7 +1,10 @@
 //! API HTTP frontend — router, listener, signal handling, and serving only.
 
 pub mod command_frontend;
+// WI 0142: `/v1/engine/*` HTTP adapter and the `awman.frontend.v1` WebSocket (filled by engine-api-routes).
+pub mod engine;
 pub mod error;
+pub mod frontend_socket;
 pub mod local;
 pub mod outputs;
 pub mod routes;

@@ -16,7 +16,7 @@ mod spawn;
 #[cfg(all(test, unix))]
 pub(super) use backend::conformance_launcher;
 pub(in crate::engine::sandbox) use backend::{run_interactive, DSbxBackend};
-pub(in crate::engine::sandbox) use ready::ready_agent;
+pub(in crate::engine::sandbox) use ready::ready_agent_in;
 
 /// Fake-`sbx` PATH plumbing shared by the dsbx test modules. The mutation goes
 /// through [`crate::engine::test_path::PathGuard`], the single lock over the

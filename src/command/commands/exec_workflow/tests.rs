@@ -1390,6 +1390,17 @@ fn make_issue(source_id: &str, title: &str, body: &str) -> Issue {
     }
 }
 
+/// A snapshot whose temp directory is `dir` on every platform, so these
+/// tests never touch the process temp directory or environment.
+fn temp_env(dir: &std::path::Path) -> crate::data::config::env::EnvSnapshot {
+    let dir = dir.display().to_string();
+    crate::data::config::env::EnvSnapshot::with_overrides([
+        ("TMPDIR", dir.clone()),
+        ("TMP", dir.clone()),
+        ("TEMP", dir),
+    ])
+}
+
 #[test]
 fn issue_source_overlay_writes_temp_file_and_builds_directory_overlay() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1397,11 +1408,17 @@ fn issue_source_overlay_writes_temp_file_and_builds_directory_overlay() {
     let work_items_dir = git_root.join("aspec").join("work-items");
     let issue = make_issue("https://github.com/owner/repo/issues/84", "Test", "body");
 
-    let build = issue_source_overlay(&GithubIssueSource, &issue, git_root, &work_items_dir)
+    let temp_root = tempfile::tempdir().unwrap();
+    let env = temp_env(temp_root.path());
+    let build = issue_source_overlay(&GithubIssueSource, &issue, git_root, &work_items_dir, &env)
         .expect("overlay build must succeed");
 
     // Temp file exists and has the expected contents.
     assert!(build.temp_file.path().exists(), "temp file must exist");
+    assert!(
+        build.temp_file.path().starts_with(temp_root.path()),
+        "temp file must live in the session env's temp dir"
+    );
     let on_disk = std::fs::read_to_string(build.temp_file.path()).unwrap();
     assert_eq!(on_disk, "# Test\n\nbody");
 
@@ -1460,8 +1477,14 @@ fn issue_temp_file_filename_format_is_pid_and_slug() {
     let work_items_dir = git_root.join("aspec").join("work-items");
     let issue = make_issue("https://github.com/owner/repo/issues/7", "Some Title", "");
 
-    let build =
-        issue_source_overlay(&GithubIssueSource, &issue, git_root, &work_items_dir).unwrap();
+    let build = issue_source_overlay(
+        &GithubIssueSource,
+        &issue,
+        git_root,
+        &work_items_dir,
+        &temp_env(git_root),
+    )
+    .unwrap();
 
     let pid = std::process::id();
     let file_name = build
@@ -4018,10 +4041,12 @@ async fn interactive_setup_and_teardown_factories_use_each_sessions_policy() {
             repo.path().into(),
             &StaticGitRootResolver::new(repo.path()),
             SessionOpenOptions {
-                env: Some(EnvSnapshot::with_overrides([(
-                    AWMAN_HOME,
-                    home.path().to_str().unwrap(),
-                )])),
+                env: Some(EnvSnapshot::with_overrides([
+                    (AWMAN_HOME, home.path().to_str().unwrap()),
+                    // The overlay and auth engines resolve host paths from
+                    // the snapshot's HOME, which a real snapshot always has.
+                    ("HOME", home.path().to_str().unwrap()),
+                ])),
                 ..Default::default()
             },
         )

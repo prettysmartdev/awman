@@ -11,7 +11,7 @@
 //! [`announce`].
 
 use std::io::Write;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use crate::data::message::UserMessageSink;
 use crate::engine::error::EngineError;
@@ -35,6 +35,7 @@ impl SbxOutput {
 
 /// A described `sbx` invocation, ready to run with full sink transparency.
 pub(super) struct SbxCommand {
+    env: Option<crate::data::config::env::EnvSnapshot>,
     args: Vec<String>,
     stdin: Option<Vec<u8>>,
     /// Appended to the announcement instead of revealing piped stdin
@@ -51,11 +52,17 @@ impl SbxCommand {
         S: Into<String>,
     {
         Self {
+            env: None,
             args: args.into_iter().map(Into::into).collect(),
             stdin: None,
             announce_suffix: None,
             redactions: Vec::new(),
         }
+    }
+
+    pub fn in_env(mut self, env: &crate::data::config::env::EnvSnapshot) -> Self {
+        self.env = Some(env.clone());
+        self
     }
 
     pub fn with_stdin(mut self, bytes: Vec<u8>) -> Self {
@@ -119,7 +126,12 @@ impl SbxCommand {
     /// (`list_running`, `stats`) that have no frontend to report through, and
     /// for availability probing.
     pub fn run_quiet(&self) -> Result<SbxOutput, EngineError> {
-        let mut cmd = Command::new(crate::engine::host_cli::program(SBX_BIN));
+        let snapshot = self
+            .env
+            .as_ref()
+            .map(std::borrow::Cow::Borrowed)
+            .unwrap_or_else(|| std::borrow::Cow::Owned(crate::engine::host_cli::process_env()));
+        let mut cmd = crate::engine::host_cli::command(&snapshot, SBX_BIN);
         cmd.args(&self.args);
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());

@@ -34,46 +34,7 @@ use crate::data::session::Session;
 
 pub use live::{DaemonReloader, LiveApply, LocalDaemons, ReloadReply, RunningDaemon};
 
-/// A config row's editing behaviour, derived from its key and handed to
-/// frontends as data (the TUI's config dialog never inspects key names).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ConfigRowKind {
-    Scalar,
-    /// The header of a user-named map (`agents.flags`); members are added as
-    /// `<child_prefix><name>`.
-    MapHeader {
-        child_prefix: &'static str,
-    },
-    ListHeader {
-        child_prefix: &'static str,
-    },
-    MapEntry,
-    ListEntry,
-}
-
-impl ConfigRowKind {
-    pub fn child_prefix(self) -> Option<&'static str> {
-        match self {
-            Self::MapHeader { child_prefix } | Self::ListHeader { child_prefix } => {
-                Some(child_prefix)
-            }
-            _ => None,
-        }
-    }
-
-    pub fn is_header(self) -> bool {
-        self.child_prefix().is_some()
-    }
-
-    pub fn member_shape(self) -> Option<ConfigRowKind> {
-        match self {
-            Self::MapHeader { .. } => Some(Self::MapEntry),
-            Self::ListHeader { .. } => Some(Self::ListEntry),
-            _ => None,
-        }
-    }
-}
+pub use crate::data::config::show::{ConfigEditRequest, ConfigRowKind};
 
 /// What kind of value a row holds, for rendering and editing widgets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -172,6 +133,8 @@ pub struct ConfigShowOutcome {
     pub rows: Vec<ConfigFieldRow>,
     /// `None` outside a Git repository (state is per repository).
     pub state: Option<ConfigStateSection>,
+    /// The selected TUI backend, described with the hand-off's shared wording.
+    pub resolved_backend: String,
     pub notes: Vec<String>,
 }
 
@@ -217,39 +180,6 @@ pub struct ConfigSetOutcome {
     /// The file written.
     pub path: String,
     pub live: LiveApply,
-}
-
-/// A user edit returned from the config show dialog.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ConfigEditRequest {
-    pub field: String,
-    pub value: String,
-    pub global: bool,
-}
-
-impl ConfigEditRequest {
-    pub fn to_field(field: impl Into<String>, value: impl Into<String>, global: bool) -> Self {
-        Self {
-            field: field.into(),
-            value: value.into(),
-            global,
-        }
-    }
-
-    /// A new member, named `member`, of the map whose header has `shape`.
-    pub fn new_member(
-        shape: &ConfigRowKind,
-        member: &str,
-        value: impl Into<String>,
-        global: bool,
-    ) -> Option<Self> {
-        let prefix = shape.child_prefix()?;
-        Some(Self {
-            field: format!("{prefix}{member}"),
-            value: value.into(),
-            global,
-        })
-    }
 }
 
 /// An edit that failed validation or could not be written.
@@ -431,7 +361,7 @@ pub fn collect_config_rows(docs: &ConfigDocs<'_>) -> Vec<ConfigFieldRow> {
                 key,
                 docs,
                 ConfigRowKind::MapHeader {
-                    child_prefix: prefix,
+                    child_prefix: prefix.to_owned(),
                 },
             );
             header.global_value = None;
@@ -465,12 +395,24 @@ fn session_rows(session: &Session) -> Vec<ConfigFieldRow> {
     let (global, repo) = (layers.global.to_value(), layers.repo.to_value());
     let effective = config.masked_value();
     let source = |path: &str| config.source_of(path);
-    collect_config_rows(&ConfigDocs {
+    let mut rows = collect_config_rows(&ConfigDocs {
         global: &global,
         repo: &repo,
         effective: &effective,
         source: &source,
-    })
+    });
+    if let Some(backend) = rows.iter_mut().find(|row| row.field == "tui.backend") {
+        backend.effective_value = Some(
+            match config.tui_backend() {
+                crate::data::config::tui::TuiBackend::Auto => "auto",
+                crate::data::config::tui::TuiBackend::Daemon => "daemon",
+                crate::data::config::tui::TuiBackend::Builtin => "builtin",
+            }
+            .into(),
+        );
+        backend.source = config.source_of("tui.backend");
+    }
+    rows
 }
 
 /// The `state` section: the per-repo `state.json` and what it holds.
@@ -628,6 +570,7 @@ impl Command for ConfigCommand {
                             break ConfigOutcome::Show(ConfigShowOutcome {
                                 rows,
                                 state: state_section(&session),
+                                resolved_backend: resolved_backend(&session).await,
                                 notes: vec![RUNTIME_MATURITY_NOTE.to_string()],
                             })
                         }
@@ -701,6 +644,66 @@ impl Command for ConfigCommand {
         };
         Ok(outcome)
     }
+}
+
+/// Describe the backend that is available to this invocation. This is a
+/// read-only probe: config show never starts or enables a daemon.
+async fn resolved_backend(session: &Session) -> String {
+    use crate::command::engine_handoff::{self, BackendSelection, EngineEnable};
+    use crate::data::config::tui::TuiBackend;
+
+    let config = session.effective_config();
+    if config.tui_backend() == TuiBackend::Builtin {
+        return engine_handoff::describe(&BackendSelection::Builtin);
+    }
+    let Ok(Some(client)) = super::daemon::client::DaemonClient::discover(session.env()) else {
+        return if config.tui_backend() == TuiBackend::Daemon {
+            "backend: daemon (unavailable)".into()
+        } else {
+            engine_handoff::describe(&BackendSelection::Builtin)
+        };
+    };
+    let Ok(status) = client
+        .call_as::<crate::command::daemon_api::core::StatusResponse>(
+            &super::daemon::actions::Request::get("/v1/status"),
+        )
+        .await
+    else {
+        return "backend: daemon (unavailable)".into();
+    };
+    let Some(engine) = status.features.get("engine") else {
+        return "backend: daemon (engine off)".into();
+    };
+    use crate::command::daemon_api::FeatureState;
+    if matches!(engine.state, FeatureState::Off | FeatureState::Draining) {
+        return format!(
+            "backend: daemon (engine {})",
+            match engine.state {
+                FeatureState::Off => "off",
+                FeatureState::Draining => "draining",
+                _ => unreachable!(),
+            }
+        );
+    }
+    let Ok(paths) = crate::data::fs::DataPaths::from_env(session.env()) else {
+        return "backend: daemon (unavailable)".into();
+    };
+    let Ok(Some(endpoint)) = crate::engine::remote::local::discover(&paths.daemon()) else {
+        return "backend: daemon (unavailable)".into();
+    };
+    let persistent = engine.state != FeatureState::Ephemeral;
+    let selection = BackendSelection::Daemon {
+        pid: endpoint.pid,
+        endpoint,
+        enabled: if persistent {
+            EngineEnable::AlreadyOn
+        } else {
+            EngineEnable::Ephemeral
+        },
+        persistent,
+        integrations: Vec::new(),
+    };
+    engine_handoff::describe(&selection)
 }
 
 #[cfg(test)]

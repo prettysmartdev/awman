@@ -46,7 +46,7 @@ fn map_rows(repo: serde_json::Value) -> Vec<crate::frontend::tui::dialogs::Confi
         false,
         false,
         ConfigRowKind::MapHeader {
-            child_prefix: "demo.map.",
+            child_prefix: "demo.map.".into(),
         },
     )];
     if let Some(map) = repo["demo"]["map"].as_object() {
@@ -82,7 +82,7 @@ fn guidance_rows(repo: serde_json::Value) -> Vec<crate::frontend::tui::dialogs::
         false,
         false,
         ConfigRowKind::ListHeader {
-            child_prefix: "demo.list.",
+            child_prefix: "demo.list.".into(),
         },
     )];
     if let Some(entries) = repo["demo"]["list"].as_array() {
@@ -158,7 +158,7 @@ fn enter_on_agents_to_models_summary_row_points_at_ctrl_n() {
             false,
             false,
             ConfigRowKind::MapHeader {
-                child_prefix: "demo.map.",
+                child_prefix: "demo.map.".into(),
             },
         )]),
     );
@@ -537,7 +537,7 @@ fn enter_on_guidance_summary_row_points_at_ctrl_n() {
             false,
             false,
             ConfigRowKind::ListHeader {
-                child_prefix: "demo.list.",
+                child_prefix: "demo.list.".into(),
             },
         )]),
     );
@@ -662,7 +662,7 @@ fn ctrl_n_on_guidance_row_starts_guidance_entry_phase() {
             false,
             false,
             ConfigRowKind::ListHeader {
-                child_prefix: "demo.list.",
+                child_prefix: "demo.list.".into(),
             },
         )]),
     );
@@ -727,7 +727,7 @@ fn ctrl_n_guidance_flow_empty_value_shows_toast_and_stays_in_phase() {
             false,
             false,
             ConfigRowKind::ListHeader {
-                child_prefix: "demo.list.",
+                child_prefix: "demo.list.".into(),
             },
         )]),
     );

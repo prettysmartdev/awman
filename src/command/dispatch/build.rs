@@ -43,6 +43,17 @@ pub fn unsupported(ctx: &BuildContext) -> Result<BuiltCommand, CommandError> {
     Err(CommandError::unknown_command(&ctx.path()))
 }
 
+/// `view` (WI 0142): a frontend entry point, never run through `Dispatch`.
+/// The binary hands its flags to the TUI (`ViewCommand::run` with the TUI's
+/// `ViewEntry`); a command box or relay that names it is refused here after
+/// its flags are validated.
+pub fn view(ctx: &BuildContext) -> Result<BuiltCommand, CommandError> {
+    crate::command::commands::view::ViewArgs::from_input(ctx)?;
+    Err(CommandError::Other(
+        crate::command::commands::view::NOT_DISPATCHED.into(),
+    ))
+}
+
 pub fn init(ctx: &BuildContext) -> Result<BuiltCommand, CommandError> {
     Ok(BuiltCommand::Init(InitCommand::from_input(ctx)?))
 }

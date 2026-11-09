@@ -15,10 +15,92 @@
 
 use crate::data::step_status::StepStatus;
 
+thread_local! {
+    static RELAY_INTERRUPT: std::cell::RefCell<Option<tokio_util::sync::CancellationToken>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Scope the existing input renderers to one relayed dialog. Polling terminal
+/// input lets Dispatch interrupt a prompt while it continues reading frames.
+pub(crate) struct RelayInputGuard(Option<tokio_util::sync::CancellationToken>);
+
+impl RelayInputGuard {
+    pub(crate) fn new(token: &tokio_util::sync::CancellationToken) -> Self {
+        Self(RELAY_INTERRUPT.with(|current| current.replace(Some(token.clone()))))
+    }
+}
+
+impl Drop for RelayInputGuard {
+    fn drop(&mut self) {
+        RELAY_INTERRUPT.with(|current| current.replace(self.0.take()));
+    }
+}
+
+fn relay_interrupted() -> bool {
+    RELAY_INTERRUPT.with(|current| {
+        current
+            .borrow()
+            .as_ref()
+            .is_some_and(|token| token.is_cancelled())
+    })
+}
+
+fn interrupt_relay() {
+    RELAY_INTERRUPT.with(|current| {
+        if let Some(token) = current.borrow().as_ref() {
+            token.cancel();
+        }
+    });
+}
+
+pub(crate) fn read_input_line(buf: &mut String) -> std::io::Result<usize> {
+    use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+    if !RELAY_INTERRUPT.with(|current| current.borrow().is_some()) {
+        return std::io::stdin().read_line(buf);
+    }
+    let _raw = RawModeGuard::enable()?;
+    loop {
+        if relay_interrupted() {
+            return Err(std::io::ErrorKind::Interrupted.into());
+        }
+        if !event::poll(std::time::Duration::from_millis(25))? {
+            continue;
+        }
+        let Event::Key(key) = event::read()? else {
+            continue;
+        };
+        if key.kind == KeyEventKind::Release {
+            continue;
+        }
+        match key.code {
+            KeyCode::Enter => {
+                eprint!("\r\n");
+                buf.push('\n');
+                return Ok(buf.len());
+            }
+            KeyCode::Esc => return Err(std::io::ErrorKind::Interrupted.into()),
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                interrupt_relay();
+                return Err(std::io::ErrorKind::Interrupted.into());
+            }
+            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => return Ok(0),
+            KeyCode::Backspace if !buf.is_empty() => {
+                buf.pop();
+                eprint!("\x08 \x08");
+            }
+            KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                buf.push(ch);
+                eprint!("{ch}");
+            }
+            _ => {}
+        }
+        let _ = std::io::Write::flush(&mut std::io::stderr());
+    }
+}
+
 /// Read one line from stdin, or `None` at EOF / on a read error.
 fn read_raw_line() -> Option<String> {
     let mut buf = String::new();
-    match std::io::stdin().read_line(&mut buf) {
+    match read_input_line(&mut buf) {
         Ok(0) | Err(_) => None,
         Ok(_) => Some(buf),
     }
@@ -71,20 +153,32 @@ pub fn read_multiline(prompt: &str) -> Option<String> {
     use std::io::BufRead as _;
     eprintln!("awman: {prompt}");
     eprintln!("awman: (enter a blank line or press Ctrl+D when done)");
-    let stdin = std::io::stdin();
     let mut lines: Vec<String> = Vec::new();
     let mut read_anything = false;
-    for line in stdin.lock().lines() {
-        match line {
-            Ok(l) if l.is_empty() => {
-                read_anything = true;
+    if RELAY_INTERRUPT.with(|current| current.borrow().is_some()) {
+        while let Some(line) = read_raw_line() {
+            read_anything = true;
+            let line = line.strip_suffix('\n').unwrap_or(&line);
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            if line.is_empty() {
                 break;
             }
-            Ok(l) => {
-                read_anything = true;
-                lines.push(l);
+            lines.push(line.to_string());
+        }
+    } else {
+        let stdin = std::io::stdin();
+        for line in stdin.lock().lines() {
+            match line {
+                Ok(line) if line.is_empty() => {
+                    read_anything = true;
+                    break;
+                }
+                Ok(line) => {
+                    read_anything = true;
+                    lines.push(line);
+                }
+                Err(_) => break,
             }
-            Err(_) => break,
         }
     }
     read_anything.then(|| lines.join("\n"))
@@ -142,6 +236,12 @@ pub fn read_secret_line(
     let cancelled = {
         let _raw = RawModeGuard::enable()?;
         loop {
+            if relay_interrupted() {
+                break true;
+            }
+            if !event::poll(std::time::Duration::from_millis(25))? {
+                continue;
+            }
             let Event::Key(key) = event::read()? else {
                 continue;
             };
@@ -151,7 +251,10 @@ pub fn read_secret_line(
             match key.code {
                 KeyCode::Enter => break false,
                 KeyCode::Esc => break true,
-                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break true,
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    interrupt_relay();
+                    break true;
+                }
                 KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                     typed.push_char(c)
                 }

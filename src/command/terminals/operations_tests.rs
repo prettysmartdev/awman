@@ -98,7 +98,7 @@ fn network(actor: Option<&str>) -> ViewerIdentity {
     ViewerIdentity {
         listener: CommandListener::Network,
         actor: actor.map(str::to_owned),
-        annotations: Annotations::from([("rex/block".to_owned(), "b1".to_owned())]),
+        annotations: Annotations::try_from_pairs([("rex/block", "b1")]).unwrap(),
         read_only: false,
     }
 }
@@ -261,7 +261,7 @@ fn take_control_is_exclusive_and_logged() {
             } => {
                 assert_eq!(o, &owner);
                 assert_eq!(terminal_id, handle.id());
-                assert_eq!(annotations["rex/block"], "b1");
+                assert_eq!(annotations.get("rex/block").unwrap(), "b1");
                 assert_eq!(source.as_ref().unwrap().step_name.as_deref(), Some("build"));
                 Some(holder.clone())
             }
@@ -281,9 +281,7 @@ fn local_detach_logs_the_declared_reason_with_annotations() {
     let owner = TerminalOwner::Tab(TabId::new());
     let (handle, _rx) = register(&f.ops, owner, None, false);
     let mut viewer = ViewerIdentity::local();
-    viewer
-        .annotations
-        .insert("rex/block".into(), "blk_9".into());
+    viewer.annotations.insert("rex/block", "blk_9").unwrap();
     let mut session = f.ops.open(handle.id(), viewer.clone()).unwrap();
     session
         .handle_client_frame(TerminalClientFrame::TakeControl)
@@ -304,7 +302,7 @@ fn local_detach_logs_the_declared_reason_with_annotations() {
                 reason,
                 annotations,
                 ..
-            } => Some((*reason, annotations["rex/block"].clone())),
+            } => Some((*reason, annotations.get("rex/block").unwrap().to_owned())),
             _ => None,
         })
         .collect();

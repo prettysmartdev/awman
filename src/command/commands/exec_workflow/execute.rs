@@ -208,6 +208,7 @@ impl Command for ExecWorkflowCommand {
                         &issue,
                         &git_root_for_scope,
                         &work_items_dir,
+                        self.session.env(),
                     ) {
                         Ok(b) => b,
                         Err(e) => {

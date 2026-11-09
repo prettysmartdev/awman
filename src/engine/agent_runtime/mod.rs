@@ -301,6 +301,16 @@ pub trait AgentRuntimeEngine: Send + Sync {
         self.import_image(request, sink)
     }
 
+    fn import_image_in(
+        &self,
+        request: &ImageImportRequest,
+        _env: &crate::data::config::env::EnvSnapshot,
+        sink: &mut dyn crate::data::message::UserMessageSink,
+        cancel: &crate::engine::oci::CancelToken,
+    ) -> Result<ImportedImage, EngineError> {
+        self.import_image_cancellable(request, sink, cancel)
+    }
+
     /// Content identity (digests, platform, source) of a cached image, when
     /// the runtime records one. `Ok(None)`: no identity is recorded, which
     /// is always the case for build runtimes.
@@ -447,13 +457,13 @@ pub fn detect_effective(config: &EffectiveConfig) -> Result<DetectedRuntime, Eng
             value: unknown.0,
         })?;
     match selection {
-        RuntimeSelection::Docker => Ok(DetectedRuntime::Container(Arc::new(
-            ContainerRuntime::docker(),
-        ))),
+        RuntimeSelection::Docker => Ok(DetectedRuntime::Container(
+            ContainerRuntime::docker_handle(config.env().clone()),
+        )),
         RuntimeSelection::AppleContainers => {
             if cfg!(target_os = "macos") {
-                Ok(DetectedRuntime::Container(Arc::new(
-                    ContainerRuntime::apple(),
+                Ok(DetectedRuntime::Container(ContainerRuntime::apple_handle(
+                    config.env().clone(),
                 )))
             } else {
                 Err(EngineError::BackendUnsupportedOnPlatform {
@@ -462,9 +472,9 @@ pub fn detect_effective(config: &EffectiveConfig) -> Result<DetectedRuntime, Eng
                 })
             }
         }
-        RuntimeSelection::DockerSbxExperimental => {
-            Ok(DetectedRuntime::Sandbox(Arc::new(SandboxRuntime::dsbx()?)))
-        }
+        RuntimeSelection::DockerSbxExperimental => Ok(DetectedRuntime::Sandbox(Arc::new(
+            SandboxRuntime::dsbx_in(config.env().clone())?,
+        ))),
         RuntimeSelection::BuiltinExperimental => {
             // Process-wide settings only: a repo whose per-launch `builtin`
             // settings are invalid (e.g. a widening network block) fails its

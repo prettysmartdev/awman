@@ -274,7 +274,9 @@ impl AgentImagePreparer {
     }
     fn builder(&mut self) -> Arc<dyn LocalImageBuilder> {
         self.local_builder
-            .get_or_insert_with(|| Arc::new(HostLocalImageBuilder::default()))
+            .get_or_insert_with(|| {
+                Arc::new(HostLocalImageBuilder::with_env(self.definition_env.clone()))
+            })
             .clone()
     }
     fn plan(&mut self, tag: &str, agent: &str) -> ImagePlan {
@@ -287,12 +289,9 @@ impl AgentImagePreparer {
                     .get(tag)
                     .or(self.image_sources.default.as_ref())
                     .map(|spec| (spec.kind(), spec.reference_or(tag)));
-                // The same acquisition env the backend pulls with
-                // (`BuiltinBackend` import, `Env::for_image_acquisition`): source
-                // resolution and the pull must see one Docker endpoint, proxy and
-                // credential set, so neither reads the session snapshot alone.
-                let env = Env::for_image_acquisition(&self.image_sources.registries);
-                let resolved = ImageSourceResolver::new(&self.image_sources, &env)
+                // Resolution and acquisition use the same instance snapshot,
+                // including its endpoint, proxy and credential variables.
+                let resolved = ImageSourceResolver::new(&self.image_sources, &self.definition_env)
                     .with_builder_enabled(self.builder_enabled)
                     .resolve_for_image(
                         tag,

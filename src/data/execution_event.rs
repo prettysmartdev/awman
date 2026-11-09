@@ -462,7 +462,10 @@ pub enum EventPayload {
     TerminalControl {
         terminal_id: crate::data::ids::TerminalId,
         holder: String,
-        #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+        #[serde(
+            default,
+            skip_serializing_if = "crate::data::annotations::Annotations::is_empty"
+        )]
         annotations: crate::data::terminal::Annotations,
     },
     /// A local attach subscription ended (WI 0141); published by the engine
@@ -470,7 +473,10 @@ pub enum EventPayload {
     TerminalViewerDetached {
         terminal_id: crate::data::ids::TerminalId,
         reason: crate::data::terminal::DetachReason,
-        #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+        #[serde(
+            default,
+            skip_serializing_if = "crate::data::annotations::Annotations::is_empty"
+        )]
         annotations: crate::data::terminal::Annotations,
     },
     Done,

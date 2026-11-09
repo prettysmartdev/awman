@@ -22,7 +22,7 @@ use crate::command::commands::Command;
 use crate::command::dispatch::catalogue::GatewayNeed;
 use crate::command::dispatch::BuildContext;
 use crate::command::error::CommandError;
-use crate::data::config::env::Env;
+use crate::data::config::env::EnvSnapshot;
 use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
 use crate::data::session::AgentHandle;
 use crate::data::workflow_state::{StepState, WorkflowState};
@@ -189,6 +189,9 @@ pub struct SquadAttachCommand {
     requested_container: Option<String>,
     runtime: Arc<dyn AgentRuntimeEngine>,
     gateway: Option<Arc<dyn TaskGateway>>,
+    /// The invoking session's environment, which locates the daemon when
+    /// dispatch resolved no gateway.
+    env: EnvSnapshot,
 }
 
 impl SquadAttachCommand {
@@ -198,6 +201,7 @@ impl SquadAttachCommand {
             requested_container: ctx.flags.string("container"),
             runtime: ctx.engines.runtime.clone(),
             gateway: ctx.gateway.clone(),
+            env: ctx.session.env().clone(),
         })
     }
 
@@ -207,7 +211,7 @@ impl SquadAttachCommand {
     ) -> Result<SquadAttachOutcome, CommandError> {
         let gateway = match self.gateway {
             Some(gateway) => gateway,
-            None => DaemonResolver::from_env(&Env::from_process())?
+            None => DaemonResolver::from_env(&self.env)?
                 .gateway_for(GatewayNeed::Running)
                 .await?
                 .ok_or_else(|| CommandError::Other("the awman daemon is not reachable".into()))?,

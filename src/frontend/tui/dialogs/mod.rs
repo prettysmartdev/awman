@@ -4,6 +4,9 @@
 //! terminal, and returns a typed Layer 2 enum value when the user responds.
 //! Cancellable with Esc.
 
+pub use crate::data::config::show::{ConfigShowRejectedEdit, ConfigShowRow};
+pub use crate::data::dialog::*;
+
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
@@ -16,123 +19,6 @@ use crate::frontend::tui::text_edit::TextEdit;
 /// and the renderer's `[Ctrl+S] open squad` hint are both keyed off this one
 /// string, so the shortcut and its advertisement can never disagree.
 pub(crate) const NEW_TAB_DIALOG_TITLE: &str = "New Tab";
-
-/// A dialog request sent from the command thread to the event loop.
-#[derive(Debug)]
-pub enum DialogRequest {
-    YesNo {
-        title: String,
-        body: String,
-    },
-    YesNoCancel {
-        title: String,
-        body: String,
-    },
-    TextInput {
-        title: String,
-        prompt: String,
-        default_text: Option<String>,
-    },
-    /// A masked prompt for a secret (WI 0149). Typed characters render as
-    /// `•`; the value is never echoed, logged or kept after the answer.
-    SecretInput {
-        title: String,
-        prompt: String,
-    },
-    /// Leave the alternate screen and raw mode so a host command can use the
-    /// terminal. Answered `Yes` once the terminal is released.
-    TerminalRelease {
-        title: String,
-    },
-    /// Re-enter the alternate screen after a `TerminalRelease`. Answered
-    /// `Dismissed` once the screen is back.
-    TerminalRestore,
-    MultilineInput {
-        title: String,
-        prompt: String,
-        /// Text the editor opens holding (WI 0110). `None` opens empty. Used
-        /// by edit interviews, where an untouched box must mean "keep what
-        /// is there" rather than "erase it".
-        default_text: Option<String>,
-    },
-    ListPicker {
-        title: String,
-        items: Vec<String>,
-    },
-    KindSelect {
-        title: String,
-        options: Vec<(String, String)>,
-    },
-    WorkflowControlBoard(WorkflowControlBoardState),
-    WorkflowYoloCountdown(WorkflowYoloCountdownState),
-    WorkflowStepConfirm(WorkflowStepConfirmState),
-    AgentSetup(AgentSetupState),
-    MountScope(MountScopeState),
-    AgentAuth(AgentAuthState),
-    QuitConfirm,
-    CloseTabConfirm,
-    /// Confirmation prompt opened when the user presses Ctrl+C while a
-    /// workflow is running. `y` aborts the workflow (kills the container,
-    /// returns the current step to Pending), `n`/`Esc` keeps it running.
-    WorkflowCancelConfirm,
-    ConfigShow {
-        rows: Vec<ConfigShowRow>,
-        /// Initially selected row, so the dialog can reopen on the field the
-        /// user just edited instead of jumping back to the top.
-        selected: usize,
-        /// The previous edit, when it was rejected (invalid value or failed
-        /// write). The dialog reopens in edit mode with the input preserved
-        /// and the reason displayed.
-        rejected: Option<ConfigShowRejectedEdit>,
-    },
-    Loading {
-        title: String,
-    },
-    Custom {
-        title: String,
-        body: String,
-        keys: Vec<(char, String)>,
-    },
-    /// A keyed question whose body scrolls under a footer that is always on
-    /// screen (the note, the keys and the Esc hint). Used for the trust
-    /// reviews, where a `gated_keys` choice is accepted only once the body
-    /// has been read in full, and for every question whose body can outgrow
-    /// the terminal (workflow prerequisites, `config migrate`).
-    Review(ReviewState),
-    /// The one-shot squad key disclosure, raised as a [`Dialog::Notice`].
-    /// Sent, never awaited: a notice has no answer to give back, and the
-    /// command thread must not block on the user dismissing it.
-    KeySetupNotice {
-        title: String,
-        body: String,
-        copy_key: String,
-        copy_zshrc_snippet: String,
-    },
-}
-
-/// A dialog response returned from the event loop to the command thread.
-#[derive(Debug, Clone)]
-pub enum DialogResponse {
-    Interrupted,
-    Yes,
-    No,
-    Cancel,
-    Text(String),
-    /// The answer to a `SecretInput`. Wrapped in a `SecretString` before it
-    /// leaves the dialog; its `Debug` is redacted.
-    Secret(crate::engine::auth::credential::SecretString),
-    Index(usize),
-    Char(char),
-    Dismissed,
-    /// A config-table edit, as the command layer's own type.
-    ///
-    /// Before WI 0114 F-20 this rode `Text` as a tab-separated
-    /// `"field\tvalue\tscope"` string that `dialog_router.rs` formatted and
-    /// `per_command/config.rs` split back apart — a private wire protocol
-    /// between two files, with a silent `Ok(None)` whenever the split did not
-    /// yield three parts.
-    ConfigEdit(crate::command::commands::config::ConfigEditRequest),
-}
 
 /// The active dialog state stored in `App`.
 pub enum Dialog {
@@ -291,92 +177,6 @@ impl std::fmt::Debug for SecretBuffer {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct WorkflowControlBoardState {
-    pub step_name: String,
-    pub can_launch_next: bool,
-    pub can_continue_current: bool,
-    pub can_restart: bool,
-    pub can_go_back: bool,
-    pub can_finish: bool,
-    /// Human-readable reason explaining why "continue in current container"
-    /// is not available (e.g. "next step uses a different agent"). Rendered
-    /// in DarkGray underneath the disabled `[↓]` line so users understand
-    /// why it's greyed out.
-    pub continue_unavailable_reason: Option<String>,
-    pub cancel_to_previous_unavailable_reason: Option<String>,
-    pub finish_workflow_unavailable_reason: Option<String>,
-    /// Reason "Restart current step" is unavailable — set in a parallel group
-    /// where restart applies only to the focused container (WI-0096 §10).
-    /// Rendered in DarkGray under the dimmed Restart line.
-    pub restart_unavailable_reason: Option<String>,
-    /// True when a container is currently running (mid-step). The engine
-    /// computes this from `can_dismiss` in `AvailableActions`.
-    /// Changes rendering: Esc = dismiss (step keeps running), [p] = pause.
-    pub can_dismiss: bool,
-    /// Custom label for the right-arrow (launch-next) action, copied from
-    /// `AvailableActions.launch_next_label`. `None` renders the default
-    /// "Next: new container". The dynamic leader step sets this to
-    /// "Start dynamic workflow".
-    pub launch_next_label: Option<String>,
-    /// The step this Workflow Control Board's actions apply to (WI-0096 §10).
-    /// In a parallel group this is the currently-focused container. Defaults to
-    /// `step_name` for single-step workflows.
-    pub focused_step_name: String,
-    /// Number of steps in the focused step's parallel group. `0` means the
-    /// focused step is not part of a multi-step parallel batch.
-    pub parallel_peer_count: usize,
-    /// Live peers still running in the focused step's parallel group (excludes
-    /// the focused step). A final yolo review can finish with peers still live.
-    pub parallel_peers_running: usize,
-    /// Detail lines for the failure that opened this board (exit code, signal,
-    /// run duration), copied from `AvailableActions::step_failure`. Empty on an
-    /// ordinary between-steps board (WI-0115 §1).
-    pub failure_lines: Vec<String>,
-    /// A peer in the still-running parallel group that already failed and
-    /// can be relaunched now with `[r]`, copied from
-    /// `AvailableActions::retry_failed_step`. Rendered as a red line below the
-    /// arrow options.
-    pub retry_failed_step: Option<String>,
-    /// True when the board was opened while a parallel group is running. The
-    /// arrows then act on the whole group, and their labels say so.
-    pub in_parallel_group: bool,
-}
-
-#[derive(Debug, Clone)]
-pub struct WorkflowYoloCountdownState {
-    pub step_name: String,
-    pub remaining_secs: u64,
-    /// Why the countdown runs; selects the wording.
-    pub kind: crate::engine::workflow::actions::CountdownKind,
-}
-
-#[derive(Debug, Clone)]
-pub struct WorkflowStepConfirmState {
-    pub completed_step: String,
-    pub next_step: String,
-}
-
-#[derive(Debug, Clone)]
-pub struct AgentSetupState {
-    pub agent_name: String,
-    pub image_only: bool,
-    pub has_fallback: bool,
-    pub fallback_name: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-pub struct MountScopeState {
-    pub git_root: String,
-    pub cwd: String,
-}
-
-#[derive(Debug, Clone)]
-pub struct AgentAuthState {
-    pub agent_name: String,
-    pub env_vars: Vec<String>,
-}
-
 /// State for the squad task-detail modal (WI 0102). `name` is the identity
 /// used by `tick_all_tabs` to refresh `task` from the tab snapshot each tick.
 /// Run history is not part of this modal — see `SquadHistoryState`.
@@ -442,17 +242,6 @@ impl ConfigShowState {
     }
 }
 
-/// A rejected config edit carried in `DialogRequest::ConfigShow`: the value
-/// the user typed plus the rejection reason, so the reopened dialog restores
-/// the edit instead of discarding the input.
-#[derive(Debug, Clone)]
-pub struct ConfigShowRejectedEdit {
-    pub field: String,
-    pub value: String,
-    pub global: bool,
-    pub reason: String,
-}
-
 /// Phase of a Ctrl+N add-entry flow in the config dialog.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NewMapEntryPhase {
@@ -464,26 +253,6 @@ pub enum NewMapEntryPhase {
     /// only the entry text is needed; its index is assigned
     /// automatically by appending.
     ListEntry,
-}
-
-#[derive(Debug)]
-pub struct ConfigShowRow {
-    pub field: String,
-    pub global: String,
-    pub repo: String,
-    pub effective: String,
-    pub read_only: bool,
-    /// Whether the value may be written to the global config scope.
-    pub global_writable: bool,
-    /// Whether the value may be written to the repo config scope.
-    pub repo_writable: bool,
-    /// Short format hint shown while editing (e.g. "true or false").
-    pub value_hint: Option<String>,
-    /// The row's shape, carried through from `ConfigFieldRow` so the dialog
-    /// can find the map and list headers — and build a new member's field
-    /// name from the header's own prefix — without spelling a config path
-    /// (WI 0114 F-20).
-    pub shape: crate::command::commands::config::ConfigRowKind,
 }
 
 /// Compute a centered rect for a dialog.
@@ -753,30 +522,9 @@ mod tests {
 /// key cannot be accepted before the user has seen anything.
 #[derive(Debug)]
 pub struct ReviewState {
-    pub title: String,
-    pub body: ReviewBody,
-    /// Text pinned above the keys, so it is read at the moment of choosing
-    /// (for the prerequisite report: what continuing leads to). Empty for none.
-    pub note: String,
-    pub keys: Vec<(char, String)>,
-    pub gated_keys: Vec<char>,
-    /// What Esc answers, shown as `[Esc] <label>`; `None` shows "cancel".
-    pub dismiss_label: Option<String>,
+    pub request: ReviewRequest,
     pub scroll: usize,
     pub max_scroll: std::cell::Cell<usize>,
-}
-
-/// What a [`ReviewState`] scrolls, and how it is wrapped to the dialog.
-#[derive(Debug)]
-pub enum ReviewBody {
-    /// Every character kept, hard-wrapped at the edge: a reviewed argv must
-    /// read exactly as it will run.
-    Exact(String),
-    /// Word-wrapped text; each line keeps its own indentation, so indented
-    /// JSON in a preview still lines up.
-    Prose(String),
-    /// The workflow prerequisite report, one entry per check.
-    Prerequisites(crate::data::workflow_prerequisites::WorkflowPrerequisiteReport),
 }
 
 impl ReviewState {
@@ -786,54 +534,19 @@ impl ReviewState {
         keys: Vec<(char, String)>,
         gated_keys: Vec<char>,
     ) -> Self {
-        Self {
-            title,
-            body: ReviewBody::Exact(body),
-            note: String::new(),
-            keys,
-            gated_keys,
-            dismiss_label: None,
-            scroll: 0,
-            max_scroll: std::cell::Cell::new(usize::MAX),
-        }
+        ReviewRequest::new(title, body, keys, gated_keys).into()
     }
-
-    /// A question with no gated key: `body` scrolls, Esc answers
-    /// `default_on_dismiss` and is labelled with that choice.
     pub fn question<D: PartialEq>(prompt: &Prompt<D>, body: ReviewBody) -> Self {
-        let dismiss_label = prompt.default_on_dismiss.as_ref().and_then(|default| {
-            prompt
-                .choices
-                .iter()
-                .find(|choice| &choice.value == default)
-                .map(|choice| choice.label.clone())
-        });
-        Self {
-            dismiss_label,
-            ..Self::new(
-                prompt.title.clone(),
-                String::new(),
-                prompt
-                    .choices
-                    .iter()
-                    .map(|choice| (choice.key, choice.label.clone()))
-                    .collect(),
-                Vec::new(),
-            )
-        }
-        .with_body(body)
+        ReviewRequest::question(prompt, body).into()
     }
-
     pub fn with_body(mut self, body: ReviewBody) -> Self {
-        self.body = body;
+        self.request.body = body;
         self
     }
-
     pub fn with_note(mut self, note: String) -> Self {
-        self.note = note;
+        self.request.note = note;
         self
     }
-
     /// Whether the end of the body has been on screen.
     pub fn fully_seen(&self) -> bool {
         self.scroll >= self.max_scroll.get()
@@ -843,5 +556,26 @@ impl ReviewState {
     pub fn accepts(&self, c: char) -> bool {
         self.keys.iter().any(|(ch, _)| *ch == c)
             && (!self.gated_keys.contains(&c) || self.fully_seen())
+    }
+}
+
+impl From<ReviewRequest> for ReviewState {
+    fn from(request: ReviewRequest) -> Self {
+        Self {
+            request,
+            scroll: 0,
+            max_scroll: std::cell::Cell::new(usize::MAX),
+        }
+    }
+}
+impl std::ops::Deref for ReviewState {
+    type Target = ReviewRequest;
+    fn deref(&self) -> &Self::Target {
+        &self.request
+    }
+}
+impl std::ops::DerefMut for ReviewState {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.request
     }
 }

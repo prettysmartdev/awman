@@ -128,6 +128,8 @@ impl WorkflowPrerequisiteFlowOptions {
 /// The headless profile a frontend kind answers from.
 pub fn headless_for(kind: FrontendKind) -> HeadlessDefaults {
     match kind {
+        // An engine instance answers like the TUI it serves (WI 0142).
+        FrontendKind::Daemon { .. } if kind.is_engine_local() => HeadlessDefaults::cli(),
         FrontendKind::Daemon {
             feature:
                 crate::data::daemon_state::FeatureName::Worker
@@ -140,7 +142,10 @@ pub fn headless_for(kind: FrontendKind) -> HeadlessDefaults {
         } => HeadlessDefaults::squad(
             crate::command::commands::mount_scope::MountScopeDecision::MountGitRoot,
         ),
-        FrontendKind::Cli | FrontendKind::Tui => HeadlessDefaults::cli(),
+        // A relayed CLI or TUI answers like the frontend relaying it.
+        FrontendKind::Cli | FrontendKind::Tui | FrontendKind::Relayed { .. } => {
+            HeadlessDefaults::cli()
+        }
     }
 }
 
@@ -305,7 +310,6 @@ impl WorkflowPrerequisiteFlow {
         let home = session
             .env()
             .home_dir()
-            .or_else(dirs::home_dir)
             .unwrap_or_else(|| PathBuf::from("/"));
         Self {
             workflow_git_source: engines
@@ -1066,7 +1070,9 @@ impl WorkflowPrerequisiteFlow {
             .remote_url(remote)
             .map(|u| u.redacted)
             .unwrap_or_else(|| remote.to_string());
-        let prompt = crate::command::prompts::prerequisite_ssh(check, &remote_display);
+        let home = self.session.env().home_dir();
+        let prompt =
+            crate::command::prompts::prerequisite_ssh(check, &remote_display, home.as_deref());
         match frontend.ask_prerequisite_ssh(&prompt)? {
             SshChoice::Key { path, remember } => match self.ssh_key_grant(&path) {
                 Ok(grant) => {

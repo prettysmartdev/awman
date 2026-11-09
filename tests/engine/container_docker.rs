@@ -12,14 +12,14 @@
 //!     then verify the runtime's view of running containers stays consistent.
 
 use std::collections::HashMap;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use awman::engine::container::runtime::ContainerRuntime;
 
 use crate::helpers::docker_available;
 
 fn try_pull(image: &str) -> bool {
-    Command::new(awman::engine::host_cli::program("docker"))
+    awman::engine::host_cli::command(&awman::data::config::env::Env::from_process(), "docker")
         .args(["pull", image])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -136,17 +136,18 @@ fn docker_background_container_start_exec_kill() {
     container.kill().expect("kill must succeed");
 
     // After kill, the container must no longer appear in `docker ps -a`.
-    let ps = Command::new(awman::engine::host_cli::program("docker"))
-        .args([
-            "ps",
-            "-a",
-            "--filter",
-            &format!("id={}", &container_id[..12]),
-            "--format",
-            "{{.ID}}",
-        ])
-        .output()
-        .expect("docker ps");
+    let ps =
+        awman::engine::host_cli::command(&awman::data::config::env::Env::from_process(), "docker")
+            .args([
+                "ps",
+                "-a",
+                "--filter",
+                &format!("id={}", &container_id[..12]),
+                "--format",
+                "{{.ID}}",
+            ])
+            .output()
+            .expect("docker ps");
     let listed = String::from_utf8_lossy(&ps.stdout).trim().to_string();
     assert!(
         listed.is_empty(),
@@ -350,12 +351,13 @@ fn docker_hello_world_run_does_not_appear_in_awman_listing() {
     }
 
     let name = format!("hello-probe-{}", std::process::id());
-    let status = Command::new(awman::engine::host_cli::program("docker"))
-        .args(["run", "--rm", "--name", &name, "hello-world:latest"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .expect("docker run hello-world");
+    let status =
+        awman::engine::host_cli::command(&awman::data::config::env::Env::from_process(), "docker")
+            .args(["run", "--rm", "--name", &name, "hello-world:latest"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("docker run hello-world");
     assert!(status.success(), "docker run hello-world must succeed");
 
     let after = ContainerRuntime::docker()

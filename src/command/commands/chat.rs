@@ -434,6 +434,7 @@ impl Command for ChatCommand {
                 frontend.set_stuck_sender(execution.stuck_sender());
                 let exit = execution.wait().await;
                 frontend.set_pty_active(false);
+                frontend.wait_output_drained().await;
                 frontend.replay_queued();
                 exit
             };

@@ -28,10 +28,10 @@ impl Default for IssueSourceRouter {
 impl IssueSourceRouter {
     /// Constructs the provider router with the command/session's immutable
     /// external-system dependencies.
-    pub fn new(git_engine: Arc<GitEngine>, env: &EnvSnapshot) -> Self {
+    pub fn new(_git_engine: Arc<GitEngine>, env: &EnvSnapshot) -> Self {
         Self {
             sources: vec![Box::new(GithubIssueSource)],
-            git_engine,
+            git_engine: Arc::new(GitEngine::with_env(env.clone())),
             github_token: env.github_token().map(str::to_owned),
         }
     }

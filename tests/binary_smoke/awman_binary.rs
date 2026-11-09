@@ -57,6 +57,23 @@ fn build_shared_awman_copy() -> PathBuf {
         std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755))
             .expect("mark awman copy executable");
     }
+    #[cfg(unix)]
+    if let Ok(backend) = std::env::var("AWMAN_TEST_BACKEND") {
+        assert!(matches!(backend.as_str(), "builtin" | "daemon"));
+        // A wrapper also survives a test's env_clear(), so the matrix cannot
+        // silently exercise builtin twice. The executable itself is the same
+        // immutable build and still owns daemon discovery and startup.
+        use std::os::unix::fs::PermissionsExt;
+        let wrapper = dir.join("awman-test-backend");
+        let quoted = dest.to_string_lossy().replace('\'', "'\\''");
+        std::fs::write(
+            &wrapper,
+            format!("#!/bin/sh\nexport AWMAN_TUI_BACKEND={backend}\nexec '{quoted}' \"$@\"\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        return wrapper;
+    }
     dest
 }
 

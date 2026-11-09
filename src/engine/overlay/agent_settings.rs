@@ -28,7 +28,7 @@ impl OverlayEngine {
         git_root: &Path,
         container_home_override: Option<&str>,
     ) -> Result<Vec<OverlaySpec>, EngineError> {
-        let definition = resolve_definition(agent, git_root);
+        let definition = resolve_definition(&self.snapshot(), agent, git_root);
         self.agent_settings_overlays_with_credentials(
             agent,
             definition.as_deref(),
@@ -36,7 +36,7 @@ impl OverlayEngine {
             git_root,
             container_home_override,
             false,
-            crate::data::fs::data_paths::data_home(&crate::data::config::env::Env::from_process())
+            crate::data::fs::data_paths::data_home(&self.snapshot())
                 .ok()
                 .as_deref(),
         )

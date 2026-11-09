@@ -85,11 +85,14 @@ pub(crate) struct IssueOverlayBuild {
 /// container.
 ///
 /// Signature takes `&dyn IssueSource` and `&Issue` — no concrete provider types.
+/// The temp directory comes from the session's `env` snapshot, never the
+/// process environment.
 pub(crate) fn issue_source_overlay(
     source: &dyn crate::engine::issue::IssueSource,
     issue: &crate::engine::issue::Issue,
     git_root: &std::path::Path,
     work_items_dir: &std::path::Path,
+    env: &crate::data::config::env::EnvSnapshot,
 ) -> std::io::Result<IssueOverlayBuild> {
     let slug = source.title_slug(issue);
     let content = source.format_as_markdown(issue);
@@ -97,7 +100,7 @@ pub(crate) fn issue_source_overlay(
 
     let pid = std::process::id();
     let temp_filename = format!("awman-issue-{pid}-{slug}.md");
-    let temp_path = std::env::temp_dir().join(&temp_filename);
+    let temp_path = env.temp_dir().join(&temp_filename);
     std::fs::write(&temp_path, &content)?;
     let temp_file = IssueTempFile {
         path: temp_path.clone(),

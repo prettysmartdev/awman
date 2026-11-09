@@ -1,0 +1,19 @@
+# WI 0142: exact path:symbol exceptions; additions require an ownership reason.
+src/engine/host_cli.rs:Env::from_process # builtin process capture and legacy test-isolation resolver
+src/engine/credential_refresh/monitor.rs:std::env::temp_dir # daemon-wide credential monitor fallback
+src/engine/daemon/supervisor.rs:std::env::current_dir # daemon supervision; owned by engine-feature-layer1
+src/engine/daemon/supervisor.rs:dirs::home_dir # daemon supervision; owned by engine-feature-layer1
+src/engine/container/builtin/embedded/mod.rs:std::env::current_exe # embedded VM worker re-exec
+src/engine/squad/launcher.rs:Env::from_process # daemon-wide squad launcher
+src/engine/workflow/timing.rs:Env::from_process # daemon-wide test countdown overrides
+src/engine/agent_runtime/mod.rs:Env::from_process # legacy builtin detect constructor; instances use detect_effective
+src/engine/image_prep/mod.rs:Env::from_process # legacy builtin constructor; instances set with_definition_env
+src/engine/issue/router.rs:Env::from_process # builtin default constructor; instances use new with snapshot
+src/engine/issue/github.rs:Env::from_process # builtin IssueSource compatibility methods; instance router supplies GitEngine snapshot
+src/command/dispatch/engines.rs:dirs::home_dir # process startup: daemon Engines::for_env HOME fallback before any session exists
+src/command/commands/api_server.rs:std::env::current_dir # daemon startup: the API server process resolves its own cwd before any session exists
+src/command/commands/daemon/lifecycle.rs:std::env::current_exe # daemon spawn: respawns this binary as the daemon
+src/command/engine_handoff.rs:std::env::current_exe # the hand-off respawns this binary as the daemon (same spawn as lifecycle.rs)
+src/command/commands/squad/supervisor.rs:std::env::current_exe # daemon spawn: respawns this binary as the daemon
+src/command/commands/squad/gateway.rs:Env::from_process # LocalTaskGateway::new default for session-less hosts and tests; the daemon passes its core snapshot via with_env
+src/engine/daemon/supervisor.rs:Env::from_process # ForwardedEnv bootstrap only; daemon owner is engine-feature-layer1

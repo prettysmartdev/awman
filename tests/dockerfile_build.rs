@@ -5,7 +5,6 @@
 /// and network access, and are skipped if Docker is unavailable.
 use std::io::Write;
 use std::path::Path;
-use std::process::Command;
 
 /// The repository root: Cargo runs this test from `crates/awman-cli`, but the
 /// templates and the Docker build context live at the root.
@@ -14,7 +13,7 @@ fn repo_root() -> &'static Path {
 }
 
 fn docker_available() -> bool {
-    Command::new(awman::engine::host_cli::program("docker"))
+    awman::engine::host_cli::command(&awman::data::config::env::Env::from_process(), "docker")
         .args(["info"])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -27,18 +26,19 @@ fn docker_available() -> bool {
 /// substitute the `{{AWMAN_BASE_IMAGE}}` placeholder in agent templates.
 fn build_base_image() -> String {
     let tag = "awman-test-base:latest";
-    let status = Command::new(awman::engine::host_cli::program("docker"))
-        .args([
-            "build",
-            "-t",
-            tag,
-            "-f",
-            "templates/Dockerfile.project",
-            ".",
-        ])
-        .current_dir(repo_root())
-        .status()
-        .expect("failed to invoke docker build for project base image");
+    let status =
+        awman::engine::host_cli::command(&awman::data::config::env::Env::from_process(), "docker")
+            .args([
+                "build",
+                "-t",
+                tag,
+                "-f",
+                "templates/Dockerfile.project",
+                ".",
+            ])
+            .current_dir(repo_root())
+            .status()
+            .expect("failed to invoke docker build for project base image");
     assert!(
         status.success(),
         "docker build failed for project base template"
@@ -66,18 +66,19 @@ fn build_template(template_path: &str, tag: &str) {
         .expect("failed to write temp Dockerfile");
     let tmp_path = tmp.path().to_path_buf();
 
-    let status = Command::new(awman::engine::host_cli::program("docker"))
-        .args([
-            "build",
-            "-t",
-            tag,
-            "-f",
-            tmp_path.to_str().expect("temp path is not valid UTF-8"),
-            ".",
-        ])
-        .current_dir(repo_root())
-        .status()
-        .expect("failed to invoke docker build");
+    let status =
+        awman::engine::host_cli::command(&awman::data::config::env::Env::from_process(), "docker")
+            .args([
+                "build",
+                "-t",
+                tag,
+                "-f",
+                tmp_path.to_str().expect("temp path is not valid UTF-8"),
+                ".",
+            ])
+            .current_dir(repo_root())
+            .status()
+            .expect("failed to invoke docker build");
 
     assert!(
         status.success(),
@@ -87,11 +88,14 @@ fn build_template(template_path: &str, tag: &str) {
 
     // Clean up the test images.
     for image in &[tag, &base_tag as &str] {
-        let _ = Command::new(awman::engine::host_cli::program("docker"))
-            .args(["rmi", image])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
+        let _ = awman::engine::host_cli::command(
+            &awman::data::config::env::Env::from_process(),
+            "docker",
+        )
+        .args(["rmi", image])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
     }
 }
 

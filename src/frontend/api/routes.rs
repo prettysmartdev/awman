@@ -698,6 +698,90 @@ pub struct RouteSpec {
 pub const ROUTES: &[RouteSpec] = &[
     RouteSpec {
         method: "GET",
+        path: "/v1/engine/instances",
+        op: Operation::EngineInstancesList,
+        local_only: true,
+        capability: None,
+    },
+    RouteSpec {
+        method: "POST",
+        path: "/v1/engine/instances",
+        op: Operation::EngineInstancesCreate,
+        local_only: true,
+        capability: None,
+    },
+    RouteSpec {
+        method: "GET",
+        path: "/v1/engine/instances/{id}",
+        op: Operation::EngineInstancesGet,
+        local_only: true,
+        capability: None,
+    },
+    RouteSpec {
+        method: "DELETE",
+        path: "/v1/engine/instances/{id}",
+        op: Operation::EngineInstancesDelete,
+        local_only: true,
+        capability: None,
+    },
+    RouteSpec {
+        method: "PATCH",
+        path: "/v1/engine/instances/{id}",
+        op: Operation::EngineInstancesPatch,
+        local_only: true,
+        capability: None,
+    },
+    RouteSpec {
+        method: "GET",
+        path: "/v1/engine/instances/{id}/frontend",
+        op: Operation::EngineInstancesFrontend,
+        local_only: true,
+        capability: None,
+    },
+    RouteSpec {
+        method: "GET",
+        path: "/v1/engine/instances/{id}/tabs",
+        op: Operation::EngineTabsList,
+        local_only: true,
+        capability: None,
+    },
+    RouteSpec {
+        method: "GET",
+        path: "/v1/engine/instances/{id}/tabs/{tab}",
+        op: Operation::EngineTabsGet,
+        local_only: true,
+        capability: None,
+    },
+    RouteSpec {
+        method: "PATCH",
+        path: "/v1/engine/instances/{id}/tabs/{tab}",
+        op: Operation::EngineTabsPatch,
+        local_only: true,
+        capability: None,
+    },
+    RouteSpec {
+        method: "GET",
+        path: "/v1/engine/instances/{id}/dialogs",
+        op: Operation::EngineDialogsList,
+        local_only: true,
+        capability: None,
+    },
+    RouteSpec {
+        method: "POST",
+        path: "/v1/engine/instances/{id}/dialogs/{dialog_id}/answer",
+        op: Operation::EngineDialogsAnswer,
+        local_only: true,
+        capability: None,
+    },
+    RouteSpec {
+        method: "POST",
+        path: "/v1/engine/instances/{id}/ui_requests",
+        op: Operation::EngineUiRequests,
+        local_only: true,
+        capability: None,
+    },
+    RouteSpec {
+        method: "GET",
         path: "/v1/health",
         op: Operation::CoreHealth,
         local_only: false,
@@ -1016,6 +1100,7 @@ pub fn build_router_for_listener(api: Arc<DaemonApi>, policy: ListenerPolicy) ->
                     .expect("terminal route")
                     .with_state(api.clone())
             }
+            Feature::Engine => super::engine::route(spec.op, filter).with_state(api.clone()),
             Feature::Worker => match &api.worker {
                 Some(worker) => worker_route(spec.op, filter).with_state(worker.clone()),
                 None => axum::routing::on(filter, || async {
@@ -2341,7 +2426,7 @@ pub(super) mod tests {
         // Guard: if someone adds a route without updating this table, the count drifts.
         assert_eq!(
             EXPECTED_ROUTES.len(),
-            41,
+            53,
             "route count mismatch — update EXPECTED_ROUTES"
         );
     }

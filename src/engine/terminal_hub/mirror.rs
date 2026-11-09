@@ -66,6 +66,7 @@ impl RingBuffer {
 
 /// What the agent's screen looks like right now.
 pub struct ScreenMirror {
+    has_output: bool,
     parser: vt100::Parser,
     ring: RingBuffer,
 }
@@ -86,12 +87,14 @@ impl ScreenMirror {
         let (cols, rows) = normalize_size(cols, rows);
         Self {
             parser: vt100::Parser::new(rows, cols, scrollback_lines),
+            has_output: false,
             ring: RingBuffer::new(ring_bytes),
         }
     }
 
     /// Feed one output chunk to the parser and the ring.
     pub fn feed(&mut self, bytes: &[u8]) {
+        self.has_output |= !bytes.is_empty();
         self.parser.process(bytes);
         self.ring.push(bytes);
     }
@@ -111,6 +114,7 @@ impl ScreenMirror {
     pub fn snapshot(&self) -> TerminalSnapshot {
         let (cols, rows) = self.size();
         TerminalSnapshot {
+            has_output: self.has_output,
             cols,
             rows,
             screen: self.parser.screen().state_formatted(),

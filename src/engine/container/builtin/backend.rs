@@ -358,7 +358,10 @@ impl BuiltinBackend {
         );
         let mut env = Vec::new();
         for key in options.env_passthrough {
-            if let Some(value) = crate::data::config::env::host_var(&key.0) {
+            if let Some(value) = options.host_env.as_ref().map_or_else(
+                || crate::data::config::env::host_var(&key.0),
+                |env| env.get(&key.0).map(str::to_owned),
+            ) {
                 env.push((key.0, value));
             }
         }
@@ -373,7 +376,14 @@ impl BuiltinBackend {
         }
         let (env, terminal_env_notice) = scrubbed_launch_env(
             env,
-            crate::data::config::env::host_var("COLORTERM").as_deref(),
+            options
+                .host_env
+                .as_ref()
+                .map_or_else(
+                    || crate::data::config::env::host_var("COLORTERM"),
+                    |env| env.get("COLORTERM").map(str::to_owned),
+                )
+                .as_deref(),
         );
         let cwd = options
             .working_dir
@@ -695,6 +705,21 @@ impl ContainerBackend for BuiltinBackend {
         _sink: &mut dyn UserMessageSink,
         cancel: &crate::engine::oci::CancelToken,
     ) -> Result<ImportedImage, EngineError> {
+        self.import_image_cancellable_in(
+            request,
+            &Env::for_image_acquisition(&request.registries),
+            _sink,
+            cancel,
+        )
+    }
+
+    fn import_image_cancellable_in(
+        &self,
+        request: &ImageImportRequest,
+        env: &crate::data::config::env::EnvSnapshot,
+        _sink: &mut dyn UserMessageSink,
+        cancel: &crate::engine::oci::CancelToken,
+    ) -> Result<ImportedImage, EngineError> {
         use crate::engine::oci::ImageAcquirer;
         cancel.check()?;
         let control = crate::engine::oci::retry::OperationControl::new(
@@ -709,7 +734,7 @@ impl ContainerBackend for BuiltinBackend {
                 max_layers: 256,
                 min_free_bytes: 1024 * 1024 * 1024,
             },
-            &Env::for_image_acquisition(&request.registries),
+            env,
         )
         .with_cancel(cancel.clone())
         .with_expected_built_identity(request.expected_built_identity.clone())

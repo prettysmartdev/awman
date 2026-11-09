@@ -5,7 +5,6 @@
 //! shell script inside a temp dir; nothing reaches the network.
 
 use super::*;
-use crate::engine::test_path::PathGuard;
 use std::os::unix::fs::PermissionsExt;
 
 /// A fake `gh` that succeeds for `auth status --hostname github.com`, fails
@@ -36,14 +35,17 @@ fn resolver_for(host: &str) -> GitHubTokenResolver {
     .with_env_snapshot(EnvSnapshot::empty())
 }
 
-/// Hold the process-wide PATH lock with `dir` first on `PATH`.
-///
-/// Never replace `PATH` outright: tests that do not take the lock run in
-/// parallel and would lose `sh`, `git` and `sleep`. A host `gh` left on
-/// `PATH` is invisible anyway, since test isolation only accepts a `gh`
-/// inside the temp dir.
-fn path_with(dir: &Path) -> PathGuard {
-    PathGuard::prepending(dir)
+/// A snapshot whose PATH is `dir` and whose TMPDIR is the temp dir `tempfile`
+/// creates fixtures in (the parent of a fresh temp dir), so a fake there counts
+/// as the test's own under the test-isolation rule, which reads the instance
+/// snapshot's TMPDIR rather than the process's.
+fn resolver_in(host: &str, dir: &Path) -> GitHubTokenResolver {
+    let probe = tempfile::tempdir().unwrap();
+    let tmp = probe.path().parent().expect("a temp dir has a parent");
+    resolver_for(host).with_env_snapshot(EnvSnapshot::with_overrides([
+        ("PATH", dir.to_str().unwrap()),
+        ("TMPDIR", tmp.to_str().unwrap()),
+    ]))
 }
 
 #[test]
@@ -51,25 +53,28 @@ fn gh_status_maps_exit_codes_and_missing_gh() {
     let dir = tempfile::tempdir().unwrap();
     let gh = write_exe(dir.path(), "gh", FAKE_GH);
     let gh = gh.canonicalize().unwrap();
-    let path = path_with(dir.path());
 
-    let found = resolver_for("github.com").gh_on_path().unwrap();
+    let found = resolver_in("github.com", dir.path()).gh_on_path().unwrap();
     assert_eq!(found.canonicalize().unwrap(), gh);
     assert!(matches!(
-        resolver_for("github.com").host_gh_status(),
+        resolver_in("github.com", dir.path()).host_gh_status(),
         GhAuthStatus::LoggedIn { .. }
     ));
     assert!(matches!(
-        resolver_for("ghe.example.com").host_gh_status(),
+        resolver_in("ghe.example.com", dir.path()).host_gh_status(),
         GhAuthStatus::NotLoggedIn { .. }
     ));
-    assert!(GitHubTokenResolver::host_gh_authenticated("github.com"));
-    assert!(!GitHubTokenResolver::host_gh_authenticated(
-        "ghe.example.com"
+    assert!(matches!(
+        resolver_in("github.com", dir.path()).host_gh_status(),
+        GhAuthStatus::LoggedIn { .. }
+    ));
+    assert!(!matches!(
+        resolver_in("ghe.example.com", dir.path()).host_gh_status(),
+        GhAuthStatus::LoggedIn { .. }
     ));
 
     // Through the trait, a different host is probed with that host.
-    let r = resolver_for("github.com");
+    let r = resolver_in("github.com", dir.path());
     assert!(matches!(
         TokenProbeSource::host_gh_status(&r, "ghe.example.com"),
         GhAuthStatus::NotLoggedIn { .. }
@@ -81,13 +86,11 @@ fn gh_status_maps_exit_codes_and_missing_gh() {
 
     // An invalid host never reaches `gh` as an argument.
     assert!(matches!(
-        resolver_for("--help").host_gh_status(),
+        resolver_in("--help", dir.path()).host_gh_status(),
         GhAuthStatus::Unknown { .. }
     ));
 
     // Without the fake on PATH, no gh is found.
-    drop(path);
-    let _path = PathGuard::acquire();
     assert_eq!(
         resolver_for("github.com").host_gh_status(),
         GhAuthStatus::NotInstalled
@@ -114,10 +117,9 @@ fn gh_outside_the_temp_dir_is_invisible_under_test_isolation() {
         return;
     }
     write_exe(dir.path(), "gh", FAKE_GH);
-    let _path = path_with(dir.path());
-    assert!(resolver_for("github.com").gh_on_path().is_none());
+    assert!(resolver_in("github.com", dir.path()).gh_on_path().is_none());
     assert_eq!(
-        resolver_for("github.com").host_gh_status(),
+        resolver_in("github.com", dir.path()).host_gh_status(),
         GhAuthStatus::NotInstalled
     );
 }
@@ -126,8 +128,7 @@ fn gh_outside_the_temp_dir_is_invisible_under_test_isolation() {
 fn gh_token_and_login_commands_have_fixed_argv() {
     let dir = tempfile::tempdir().unwrap();
     write_exe(dir.path(), "gh", FAKE_GH);
-    let _path = path_with(dir.path());
-    let r = resolver_for("ghe.example.com:8443");
+    let r = resolver_in("ghe.example.com:8443", dir.path());
 
     let token = r.gh_auth_token_command(HostStdin::Null).unwrap();
     let review = token.review();

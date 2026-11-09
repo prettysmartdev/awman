@@ -26,13 +26,18 @@ fn emit(sink: &mut dyn UserMessageSink, level: MessageLevel, text: String) {
 /// No credentials are registered here: all `sbx secret set` calls are
 /// sandbox-scoped and happen at agent-launch time (`run_interactive`), so the
 /// sandbox exists to scope to and rotated keys apply per launch.
-pub(in crate::engine::sandbox) fn ready_agent(
+pub(in crate::engine::sandbox) fn ready_agent_in(
+    snapshot: &crate::data::config::env::EnvSnapshot,
     agent: &str,
     no_cache: bool,
     sink: &mut dyn UserMessageSink,
 ) -> Result<(), EngineError> {
     // 1. Is `sbx` installed?
-    if SbxCommand::new(["version"]).run_announced(sink).is_err() {
+    if SbxCommand::new(["version"])
+        .in_env(snapshot)
+        .run_announced(sink)
+        .is_err()
+    {
         return Err(EngineError::Sandbox(
             "`sbx` binary not found on PATH. Install Docker Sandboxes with \
              `brew install docker/tap/sbx`, then re-run `awman ready`."
@@ -41,7 +46,11 @@ pub(in crate::engine::sandbox) fn ready_agent(
     }
 
     // 2. Logged in? `sbx ls` fails with an auth error when not.
-    if SbxCommand::new(["ls"]).run_announced(sink).is_err() {
+    if SbxCommand::new(["ls"])
+        .in_env(snapshot)
+        .run_announced(sink)
+        .is_err()
+    {
         emit(
             sink,
             MessageLevel::Warning,
@@ -55,9 +64,12 @@ pub(in crate::engine::sandbox) fn ready_agent(
     //    re-runs the kit install against the freshly emitted kit (Phase 6).
     if no_cache {
         let suffix = format!("-{agent}");
-        for name in super::backend::list_all_sandbox_names() {
+        for name in super::backend::list_all_sandbox_names_in(snapshot) {
             if name.starts_with("awman-") && name.ends_with(&suffix) {
-                if let Err(e) = SbxCommand::new(["rm", &name]).run_announced(sink) {
+                if let Err(e) = SbxCommand::new(["rm", &name])
+                    .in_env(snapshot)
+                    .run_announced(sink)
+                {
                     emit(
                         sink,
                         MessageLevel::Warning,
@@ -69,7 +81,7 @@ pub(in crate::engine::sandbox) fn ready_agent(
     }
 
     // 4. Emit the per-agent kit (spec.yaml + startup script).
-    let paths = SandboxKitPaths::from_process_env()?;
+    let paths = SandboxKitPaths::at_home(crate::data::fs::data_paths::config_home(snapshot)?);
     let kit_dir = paths.kit_dir(agent);
     emit(
         sink,
@@ -82,7 +94,10 @@ pub(in crate::engine::sandbox) fn ready_agent(
     //    with the kit path and fails loudly (WI 0090); only an sbx build that
     //    lacks the `kit validate` subcommand is soft-skipped.
     let kit_dir_str = kit_dir.display().to_string();
-    if let Err(e) = SbxCommand::new(["kit", "validate", &kit_dir_str]).run_announced(sink) {
+    if let Err(e) = SbxCommand::new(["kit", "validate", &kit_dir_str])
+        .in_env(snapshot)
+        .run_announced(sink)
+    {
         let msg = e.to_string();
         let lower = msg.to_lowercase();
         let subcommand_missing = [

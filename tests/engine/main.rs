@@ -16,6 +16,7 @@ mod credential_argv_docker;
 mod credential_refresh_integration;
 mod custom_agents;
 mod daemon_supervisor;
+mod env_routing;
 mod git_engine;
 mod issue_e2e;
 mod issue_integration;

@@ -282,11 +282,14 @@ impl Drop for Images {
             } else {
                 vec!["image", "delete", tag]
             };
-            let _ = Command::new(awman::engine::host_cli::program(self.program))
-                .args(args)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
+            let _ = awman::engine::host_cli::command(
+                &awman::data::config::env::Env::from_process(),
+                self.program,
+            )
+            .args(args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
         }
     }
 }
@@ -295,12 +298,13 @@ fn cached_base(program: &str) -> Option<String> {
     // Deliberately never pull: the runtime harness must provide a local base.
     let base = std::env::var("AWMAN_TEST_CUSTOM_AGENT_BASE_IMAGE")
         .unwrap_or_else(|_| "debian:bookworm-slim".into());
-    let found = Command::new(awman::engine::host_cli::program(program))
-        .args(["image", "inspect", &base])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success());
+    let found =
+        awman::engine::host_cli::command(&awman::data::config::env::Env::from_process(), program)
+            .args(["image", "inspect", &base])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
     if found {
         Some(base)
     } else {
@@ -458,20 +462,21 @@ fn docker_new_agent_crush_from_example_ready_builds_and_smokes_without_network()
         rendered.contains("command -v crush"),
         "render includes runtime-user smoke check"
     );
-    let smoke = Command::new(awman::engine::host_cli::program("docker"))
-        .args([
-            "run",
-            "--rm",
-            "--network",
-            "none",
-            "--entrypoint",
-            "crush",
-            &tag,
-            "run",
-            "Hello",
-        ])
-        .output()
-        .unwrap();
+    let smoke =
+        awman::engine::host_cli::command(&awman::data::config::env::Env::from_process(), "docker")
+            .args([
+                "run",
+                "--rm",
+                "--network",
+                "none",
+                "--entrypoint",
+                "crush",
+                &tag,
+                "run",
+                "Hello",
+            ])
+            .output()
+            .unwrap();
     success(&smoke);
     assert_eq!(
         String::from_utf8_lossy(&smoke.stdout).trim(),

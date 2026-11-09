@@ -11,7 +11,7 @@ The daemon has three features:
 
 - **worker** accepts pushed commands and runs worker sessions.
 - **squad** evaluates scheduled tasks and runs squad work.
-- **engine** provides shared TUI engines.
+- **engine** hosts TUI sessions (instances) inside the daemon, so a TUI can run as a thin terminal on top of it. The TUI behaves exactly like the normal builtin TUI; see [The Engine and Frontends](19-engine-and-frontends.md).
 
 Features are configured globally. Enable or disable one while the daemon is
 running with `awman config set`; these settings apply live:
@@ -31,6 +31,29 @@ The engine feature can also start **ephemerally** when a TUI needs it, when
 shown as such in status and shuts down after its idle timeout. When the last
 ephemeral feature idles out, the daemon exits. Ephemeral features are local
 only and are never exposed through the network listener.
+
+Engine behavior is controlled by four live, global settings:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `daemon.features.engine.enabled` | `false` | Keep the engine on persistently. |
+| `daemon.features.engine.allowEphemeral` | `true` | Let a TUI start the engine on demand. |
+| `daemon.features.engine.idleTimeout` | `15m` | How long an unused ephemeral engine stays up. |
+| `daemon.features.engine.maxConcurrentJobs` | `4` | Engine jobs run at once. |
+
+A persistent engine stays up until you disable it; an ephemeral one is started on demand and stops once it has been idle for `idleTimeout`. To make it persistent:
+
+```sh
+awman config set daemon.features.engine.enabled true
+```
+
+List the TUI instances the engine is hosting:
+
+```sh
+awman daemon api instances.list
+```
+
+See [The Engine and Frontends](19-engine-and-frontends.md) for choosing between the builtin and daemon backends.
 
 ## Start, stop, status, and logs
 

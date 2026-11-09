@@ -198,9 +198,9 @@ fn main_loop(
     input: &mut InputReader,
     status_active: &AtomicBool,
 ) -> io::Result<()> {
-    // True while a host command owns the terminal (WI 0149): nothing is drawn
-    // and no input is read until the matching restore.
-    let mut released = false;
+    // `Some` while a host command owns the terminal (WI 0149): nothing is
+    // drawn and no input is read until the matching restore.
+    let mut released: Option<Released> = None;
     loop {
         if app.should_quit {
             break;
@@ -208,28 +208,28 @@ fn main_loop(
 
         app.poll_dialog_requests();
         if let Some(op) = app.terminal_op.take() {
-            match op {
-                TerminalOp::Release { title } => {
-                    if emitter.clear(&mut io::stdout()).is_err() {
-                        emitter.disable();
-                    }
-                    status_active.store(false, Ordering::Relaxed);
-                    restore_terminal(keyboard_enhanced);
-                    TUI_ACTIVE.store(false, Ordering::Relaxed);
-                    println!("awman: {title}");
-                    released = true;
-                    app.send_dialog_response(DialogResponse::Yes);
-                }
-                TerminalOp::Restore => {
-                    reenter_terminal(terminal, keyboard_enhanced)?;
-                    TUI_ACTIVE.store(true, Ordering::Relaxed);
-                    released = false;
-                    app.send_dialog_response(DialogResponse::Dismissed);
-                }
-            }
+            let mut control = CrosstermControl {
+                terminal,
+                keyboard_enhanced,
+                emitter,
+                status_active,
+            };
+            perform_terminal_op(app, op, &mut control, &mut released)?;
             continue;
         }
-        if released {
+        if released.is_some() {
+            // An engine that is gone never sends the restore: take the
+            // terminal back so its fatal dialog can be shown.
+            if app.backend.health().is_err() {
+                let mut control = CrosstermControl {
+                    terminal,
+                    keyboard_enhanced,
+                    emitter,
+                    status_active,
+                };
+                perform_terminal_op(app, TerminalOp::Restore, &mut control, &mut released)?;
+                continue;
+            }
             std::thread::sleep(Duration::from_millis(50));
             continue;
         }
@@ -272,6 +272,316 @@ fn main_loop(
         }
     }
     Ok(())
+}
+
+// ─── The start-up hand-off prompt (WI 0142) ──────────────────────────────────
+
+/// Ask a yes/no question in the TUI's own `YesNo` dialog before the TUI
+/// starts (the hand-off runs before any tab exists): take the terminal, draw
+/// the dialog alone, read `y` or `n` (Esc and Ctrl-C decline), and give the terminal
+/// back. Any terminal error answers no.
+pub(super) fn ask_yes_no_before_start(title: &str, body: &str) -> bool {
+    let dialog = Dialog::YesNo {
+        title: title.to_string(),
+        body: body.to_string(),
+    };
+    let ask = || -> io::Result<bool> {
+        let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+        loop {
+            terminal.draw(|frame| render::render_dialog_only(&dialog, frame))?;
+            if let Event::Key(key) = crossterm::event::read()? {
+                if key.kind != KeyEventKind::Press {
+                    continue;
+                }
+                if let Some(answer) = yes_no_answer(key) {
+                    return Ok(answer);
+                }
+            }
+        }
+    };
+    if enable_raw_mode().is_err() {
+        return false;
+    }
+    let answer = execute!(io::stdout(), EnterAlternateScreen)
+        .and_then(|_| ask())
+        .unwrap_or(false);
+    restore_terminal(false);
+    answer
+}
+
+/// Today's `YesNo` keys: `y` → yes, `n` → no; Esc and Ctrl-C decline too
+/// (the question stops running work, so nothing answers yes by accident).
+fn yes_no_answer(key: crossterm::event::KeyEvent) -> Option<bool> {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    match key.code {
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => Some(false),
+        KeyCode::Char('y') => Some(true),
+        KeyCode::Char('n') | KeyCode::Esc => Some(false),
+        _ => None,
+    }
+}
+
+// ─── Host commands on the real terminal (WI 0149, WI 0142) ───────────────────
+
+/// What the event loop does to the real terminal around a host command. The
+/// TUI's implementation is [`CrosstermControl`]; tests record the calls.
+pub(super) trait TerminalControl {
+    /// Hand the terminal over: clear the program status, leave raw mode, the
+    /// keyboard protocol and the alternate screen, and print the title.
+    fn release(&mut self, title: &str);
+    /// Take the terminal back after a release (and full repaint).
+    fn reenter(&mut self) -> io::Result<()>;
+    /// Raw keystrokes in and bytes out for a hub-terminal bridge. The real
+    /// terminal goes back into raw mode (no alternate screen) so the remote
+    /// PTY, not the local line discipline, echoes and edits — a secret typed
+    /// at a host prompt is never echoed locally.
+    fn bridge_ends(&mut self) -> io::Result<(Box<dyn BridgeInput>, Box<dyn io::Write + Send>)>;
+    /// Leave the bridge's raw mode again (before [`Self::reenter`]).
+    fn end_bridge(&mut self);
+}
+
+/// The terminal is released to a host command.
+pub(super) struct Released {
+    /// Set when the host command runs in an engine PTY (a hub terminal).
+    bridge: Option<HostTerminalBridge>,
+}
+
+/// Perform one terminal hand-over and answer the command thread, in today's
+/// order: release, (bridge), answer `Yes` … restore, answer `Dismissed`.
+pub(super) fn perform_terminal_op(
+    app: &mut App,
+    op: TerminalOp,
+    control: &mut dyn TerminalControl,
+    released: &mut Option<Released>,
+) -> io::Result<()> {
+    match op {
+        TerminalOp::Release { title, terminal_id } => {
+            control.release(&title);
+            // A daemon-hosted command runs its host process in an engine PTY
+            // registered on the hub: show it on this terminal.
+            let bridge = terminal_id.and_then(|terminal_id| {
+                let ends = app
+                    .backend
+                    .open_host_terminal(&terminal_id)
+                    .map_err(|error| error.to_string())
+                    .and_then(|io| {
+                        control
+                            .bridge_ends()
+                            .map(|(input, output)| (io, input, output))
+                            .map_err(|error| error.to_string())
+                    });
+                match ends {
+                    Ok((io, input, output)) => Some(HostTerminalBridge::start(io, input, output)),
+                    Err(error) => {
+                        println!("awman: cannot show the host terminal: {error}");
+                        None
+                    }
+                }
+            });
+            *released = Some(Released { bridge });
+            app.send_dialog_response(DialogResponse::Yes);
+        }
+        TerminalOp::Restore => {
+            if let Some(Released {
+                bridge: Some(bridge),
+            }) = released.take()
+            {
+                bridge.stop();
+                control.end_bridge();
+            }
+            control.reenter()?;
+            app.send_dialog_response(DialogResponse::Dismissed);
+        }
+    }
+    Ok(())
+}
+
+/// The real terminal under crossterm.
+struct CrosstermControl<'a> {
+    terminal: &'a mut Terminal<CrosstermBackend<io::Stdout>>,
+    keyboard_enhanced: bool,
+    emitter: &'a mut ProgramStatusEmitter,
+    status_active: &'a AtomicBool,
+}
+
+impl TerminalControl for CrosstermControl<'_> {
+    fn release(&mut self, title: &str) {
+        if self.emitter.clear(&mut io::stdout()).is_err() {
+            self.emitter.disable();
+        }
+        self.status_active.store(false, Ordering::Relaxed);
+        restore_terminal(self.keyboard_enhanced);
+        TUI_ACTIVE.store(false, Ordering::Relaxed);
+        println!("awman: {title}");
+    }
+
+    fn reenter(&mut self) -> io::Result<()> {
+        reenter_terminal(self.terminal, self.keyboard_enhanced)?;
+        TUI_ACTIVE.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn bridge_ends(&mut self) -> io::Result<(Box<dyn BridgeInput>, Box<dyn io::Write + Send>)> {
+        let input = StdinInput::new()?;
+        enable_raw_mode()?;
+        Ok((Box::new(input), Box::new(io::stdout())))
+    }
+
+    fn end_bridge(&mut self) {
+        let _ = disable_raw_mode();
+    }
+}
+
+/// Keystrokes for a bridge, read with a timeout so the bridge can stop.
+pub(super) trait BridgeInput: Send {
+    /// `Ok(0)` when nothing arrived within `timeout`.
+    fn read_timeout(&mut self, buf: &mut [u8], timeout: Duration) -> io::Result<usize>;
+    /// The real terminal's size now (forwarded to the hub when it changes).
+    fn size(&self) -> Option<(u16, u16)>;
+}
+
+/// Raw bytes from the process's stdin (the TUI's terminal).
+struct StdinInput;
+
+impl StdinInput {
+    #[cfg(unix)]
+    fn new() -> io::Result<Self> {
+        Ok(Self)
+    }
+
+    #[cfg(not(unix))]
+    fn new() -> io::Result<Self> {
+        // Engine PTYs exist only on Unix daemons; a Windows TUI is never
+        // handed a hub terminal for a host process.
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "host terminals are not supported on this platform",
+        ))
+    }
+}
+
+impl BridgeInput for StdinInput {
+    #[cfg(unix)]
+    fn read_timeout(&mut self, buf: &mut [u8], timeout: Duration) -> io::Result<usize> {
+        use nix::poll::{poll, PollFd, PollFlags};
+        use std::os::fd::AsFd;
+        let stdin = io::stdin();
+        let millis = u16::try_from(timeout.as_millis()).unwrap_or(u16::MAX);
+        let mut fds = [PollFd::new(stdin.as_fd(), PollFlags::POLLIN)];
+        if poll(&mut fds, millis).map_err(io::Error::from)? == 0 {
+            return Ok(0);
+        }
+        // Read the descriptor directly: std's buffered `Stdin` would keep
+        // bytes the TUI's own reader needs after the restore.
+        match nix::unistd::read(stdin.as_fd(), buf).map_err(io::Error::from)? {
+            0 => Err(io::ErrorKind::UnexpectedEof.into()),
+            n => Ok(n),
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn read_timeout(&mut self, _buf: &mut [u8], _timeout: Duration) -> io::Result<usize> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+
+    fn size(&self) -> Option<(u16, u16)> {
+        crossterm::terminal::size().ok()
+    }
+}
+
+/// The real terminal bridged to a hub terminal: keystrokes → its input,
+/// its screen and output → the terminal, the terminal's size → its resize
+/// (the engine and the hub). Stopped on `TerminalRestore`.
+pub(super) struct HostTerminalBridge {
+    stop: Arc<AtomicBool>,
+    /// `false` once stopped: output that arrives later is discarded instead
+    /// of painting over the re-entered TUI.
+    output_open: Arc<std::sync::Mutex<bool>>,
+    input: Option<std::thread::JoinHandle<()>>,
+}
+
+impl HostTerminalBridge {
+    const POLL: Duration = Duration::from_millis(50);
+
+    pub(super) fn start(
+        io: crate::command::instance::feeds::ContainerSlotIo,
+        mut input: Box<dyn BridgeInput>,
+        mut output: Box<dyn io::Write + Send>,
+    ) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let output_open = Arc::new(std::sync::Mutex::new(true));
+        let crate::command::instance::feeds::ContainerSlotIo {
+            mut stdout_rx,
+            stdin_tx,
+            resize_tx,
+        } = io;
+
+        let open = Arc::clone(&output_open);
+        let _ = std::thread::Builder::new()
+            .name("awman-host-terminal-out".into())
+            .spawn(move || {
+                while let Some(bytes) = stdout_rx.blocking_recv() {
+                    let Ok(open) = open.lock() else { return };
+                    if !*open {
+                        return;
+                    }
+                    if output
+                        .write_all(&bytes)
+                        .and_then(|_| output.flush())
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            });
+
+        let stopping = Arc::clone(&stop);
+        let input = std::thread::Builder::new()
+            .name("awman-host-terminal-in".into())
+            .spawn(move || {
+                let mut size = None;
+                let mut buf = [0u8; 8192];
+                while !stopping.load(Ordering::Relaxed) {
+                    let now = input.size();
+                    if now.is_some() && now != size {
+                        size = now;
+                        if let Some(size) = now {
+                            let _ = resize_tx.send(size);
+                        }
+                    }
+                    match input.read_timeout(&mut buf, Self::POLL) {
+                        Ok(0) => {}
+                        Ok(n) => {
+                            if stdin_tx.send(buf[..n].to_vec()).is_err() {
+                                break;
+                            }
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                        Err(_) => break,
+                    }
+                }
+                // Dropping the input and resize ends ends the subscription.
+                drop(stdin_tx);
+                drop(resize_tx);
+            })
+            .ok();
+        Self {
+            stop,
+            output_open,
+            input,
+        }
+    }
+
+    /// Stop forwarding. Returns once no more bytes can reach the terminal.
+    pub(super) fn stop(mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Ok(mut open) = self.output_open.lock() {
+            *open = false;
+        }
+        if let Some(input) = self.input.take() {
+            let _ = input.join();
+        }
+    }
 }
 
 /// Snapshot presentation state; Layer 2 decides precedence and aggregation.
@@ -510,7 +820,7 @@ mod tests {
         background.session_id = crate::data::session::SessionId::new();
         let (tx, rx) = std::sync::mpsc::channel();
         background.dialog_request_rx = Some(rx);
-        app.tabs.push(background);
+        app.push_tab(background);
         tx.send(DialogRequest::AgentAuth(AgentAuthState {
             agent_name: "claude".into(),
             env_vars: vec![],

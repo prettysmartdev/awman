@@ -26,6 +26,7 @@ pub async fn run(
         squad_run_frontends: crate::frontend::squad::unattended::UnattendedFrontends::shared(),
         push_frontend_factory: crate::frontend::api::ApiFrontendFactory,
         terminal_hub: Arc::new(TerminalHub::new(TerminalHubConfig::default())),
+        engine_presentation: Arc::new(crate::frontend::tui::command_frontend::TuiPresentation),
     })
     .await?;
     serve(runtime, claim).await

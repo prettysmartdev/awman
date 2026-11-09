@@ -54,6 +54,8 @@ pub struct DaemonRuntime {
     exit: CancellationToken,
     pid: u32,
     engine_feature: Arc<EngineFeature>,
+    /// The Layer 2 instance host behind the `engine` feature (WI 0142).
+    engine_host: Arc<crate::command::instance::host::EngineInstanceHost>,
     squad_feature: Arc<SquadFeature>,
     apply_worker: Box<dyn Fn(crate::data::config::daemon::WorkerSettings) + Send + Sync>,
     changes: tokio::sync::Mutex<()>,
@@ -73,6 +75,11 @@ pub enum FeatureChangeError {
     Engine(#[from] EngineError),
 }
 impl DaemonRuntime {
+    /// The engine instance host whose typed operations the `/v1/engine/*`
+    /// routes and the frontend WebSocket adapt (WI 0142).
+    pub fn engine_host(&self) -> &Arc<crate::command::instance::host::EngineInstanceHost> {
+        &self.engine_host
+    }
     pub fn core(&self) -> &Arc<Core> {
         &self.core
     }
@@ -234,6 +241,10 @@ impl DaemonRuntime {
             return;
         }
         self.core.shutdown().cancel();
+        // Engine frontends are told the daemon is stopping, not that the
+        // feature was disabled.
+        self.engine_feature
+            .set_stop_reason(features::engine::EngineStopReason::DaemonShutdown);
         let stop = |mode| async move {
             for supervisor in self.supervisors.values() {
                 supervisor.disable(mode).await;
@@ -355,7 +366,7 @@ impl DaemonRuntime {
             }
             .into(),
             version: env!("CARGO_PKG_VERSION").into(),
-            protocol: [("api".into(), 1)].into(),
+            protocol: [("api".into(), 1), ("frontend".into(), 1)].into(),
             capabilities: crate::command::daemon_api::capabilities::CAPABILITIES
                 .iter()
                 .map(|s| s.to_string())
@@ -461,7 +472,11 @@ mod tests {
             settings.squad.clone(),
         )
         .unwrap();
-        let engine_feature = EngineFeature::new(settings.engine.clone());
+        let engine_host = super::features::engine::engine_host(
+            &core,
+            Arc::new(crate::command::instance::frontend::PlainPresentation),
+        );
+        let engine_feature = EngineFeature::new(settings.engine.clone(), engine_host.clone());
         let supervisors = [
             (
                 FeatureName::Worker,
@@ -498,6 +513,7 @@ mod tests {
             listeners: RwLock::new(ListenerStatus::default()),
             exit: CancellationToken::new(),
             pid: std::process::id(),
+            engine_host,
             engine_feature,
             squad_feature,
             apply_worker: Box::new(|_| {}),

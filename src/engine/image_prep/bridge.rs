@@ -74,6 +74,15 @@ impl AgentImagePreparer {
 /// publishing an image. Production delegates this validation to CachingAcquirer;
 /// the preparer deliberately does not repeat the digest check.
 pub trait ImageImporter: Send + Sync {
+    fn import_in(
+        &self,
+        request: &ImageImportRequest,
+        _env: &crate::data::config::env::EnvSnapshot,
+        cancel: &CancelToken,
+        sink: &mut dyn UserMessageSink,
+    ) -> Result<ImportedImage, EngineError> {
+        self.import(request, cancel, sink)
+    }
     fn import(
         &self,
         request: &ImageImportRequest,
@@ -84,6 +93,15 @@ pub trait ImageImporter: Send + Sync {
 
 pub struct RuntimeImageImporter(pub Arc<dyn AgentRuntimeEngine>);
 impl ImageImporter for RuntimeImageImporter {
+    fn import_in(
+        &self,
+        request: &ImageImportRequest,
+        env: &crate::data::config::env::EnvSnapshot,
+        cancel: &CancelToken,
+        sink: &mut dyn UserMessageSink,
+    ) -> Result<ImportedImage, EngineError> {
+        self.0.import_image_in(request, env, sink, cancel)
+    }
     fn import(
         &self,
         request: &ImageImportRequest,
@@ -151,10 +169,11 @@ impl AgentImagePreparer {
         sink: &mut (impl UserMessageSink + ?Sized),
     ) -> Result<ImportedImage, EngineError> {
         let importer = self.image_importer.clone();
+        let env = self.definition_env.clone();
         let cancel = self.cancel.clone();
         stream(
             cancel.clone(),
-            move |tx| importer.import(&request, &cancel, &mut Messages(tx)),
+            move |tx| importer.import_in(&request, &env, &cancel, &mut Messages(tx)),
             |message| sink.write_message(message),
         )
         .await

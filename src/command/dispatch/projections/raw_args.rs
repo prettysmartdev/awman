@@ -138,6 +138,41 @@ impl ParsedArgs {
     pub fn arguments(&self, name: &str) -> Vec<String> {
         self.arguments.get(name).cloned().unwrap_or_default()
     }
+
+    /// The argv tokens (after the command path) that
+    /// [`CommandCatalogue::parse_raw_args`] parses back into `self` for
+    /// `spec`. A presenter whose engine runs elsewhere sends these
+    /// (`SubmitInput::Argv`), so the engine re-parses through the same
+    /// catalogue parser instead of trusting a parse it did not make (D3).
+    ///
+    /// Flags use the inline `--name=value` form, so a value starting with `-`
+    /// stays a value; positionals follow a `--` in the spec's order.
+    pub fn to_argv(&self, spec: &CommandSpec) -> Vec<String> {
+        let mut argv = Vec::new();
+        for (name, value) in &self.flags {
+            match value {
+                ParsedFlag::Bool(true) => argv.push(format!("--{name}")),
+                ParsedFlag::Bool(false) => argv.push(format!("--{name}=false")),
+                ParsedFlag::Str(text) => argv.push(format!("--{name}={text}")),
+                ParsedFlag::Strings(items) => {
+                    argv.extend(items.iter().map(|item| format!("--{name}={item}")))
+                }
+                ParsedFlag::Path(path) => argv.push(format!("--{name}={}", path.display())),
+                ParsedFlag::U16(n) => argv.push(format!("--{name}={n}")),
+                ParsedFlag::Usize(n) => argv.push(format!("--{name}={n}")),
+            }
+        }
+        let positionals: Vec<String> = spec
+            .arguments
+            .iter()
+            .flat_map(|argument| self.arguments(argument.name))
+            .collect();
+        if !positionals.is_empty() {
+            argv.push("--".into());
+            argv.extend(positionals);
+        }
+        argv
+    }
 }
 
 // ─── Per-frontend flag-default policy (Finding D) ────────────────────────────
@@ -191,13 +226,16 @@ const API_FLAG_DEFAULTS: &[FrontendFlagDefault] = &[
 /// body — the literal F-50 found in `api/routes.rs`.
 pub(crate) fn frontend_flag_defaults(frontend: FrontendKind) -> &'static [FrontendFlagDefault] {
     match frontend {
+        // An engine instance serves a person at a local frontend: no
+        // unattended profile (parity with the TUI).
+        FrontendKind::Daemon { .. } if frontend.is_engine_local() => &[],
         // The squad daemon runs unattended for the same reasons the API
         // server does, and applies the same profile.
         FrontendKind::Daemon { .. } => API_FLAG_DEFAULTS,
         // CLI and TUI resolve flag defaults through clap / the command layer;
         // no profile overrides apply, guaranteeing this mechanism cannot alter
         // their behavior.
-        FrontendKind::Cli | FrontendKind::Tui => &[],
+        FrontendKind::Cli | FrontendKind::Tui | FrontendKind::Relayed { .. } => &[],
     }
 }
 
@@ -304,10 +342,13 @@ impl CommandCatalogue {
             }
             let allowed = match flag.frontends {
                 FrontendVisibility::All => true,
-                FrontendVisibility::CliOnly => frontend == FrontendKind::Cli,
-                FrontendVisibility::TuiOnly => frontend == FrontendKind::Tui,
+                // A relayed frontend sees the flags of the frontend relaying it.
+                FrontendVisibility::CliOnly => frontend.presenting() == Some(FrontendKind::Cli),
+                FrontendVisibility::TuiOnly => {
+                    frontend.presenting() == Some(FrontendKind::Tui) || frontend.is_engine_local()
+                }
                 FrontendVisibility::CliAndTui => {
-                    matches!(frontend, FrontendKind::Cli | FrontendKind::Tui)
+                    frontend.presenting().is_some() || frontend.is_engine_local()
                 }
                 FrontendVisibility::Hidden => false,
             };
@@ -641,6 +682,29 @@ mod tests {
 
     fn argv(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// `to_argv` is the inverse of `parse_raw_args` for every flag kind,
+    /// including values that start with `-` and greedy trailing prompts.
+    #[test]
+    fn to_argv_round_trips_through_the_raw_parser() {
+        for (path, args) in [
+            (
+                vec!["exec", "prompt"],
+                argv(&["--yolo", "fix", "--the", "-bug"]),
+            ),
+            (
+                vec!["exec", "workflow"],
+                argv(&["build.toml", "--agent", "codex"]),
+            ),
+            (vec!["chat"], argv(&["--agent=-weird", "--plan"])),
+            (vec!["ready"], argv(&[])),
+        ] {
+            let parsed = cat().parse_raw_args(&path, &args).unwrap();
+            let spec = cat().lookup_with_aliases(&path).unwrap();
+            let again = cat().parse_raw_args(&path, &parsed.to_argv(spec)).unwrap();
+            assert_eq!(again, parsed, "{path:?} {args:?}");
+        }
     }
 
     #[test]

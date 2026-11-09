@@ -189,6 +189,16 @@ pub(super) trait ContainerBackend: Send + Sync {
         self.import_image(request, sink)
     }
 
+    fn import_image_cancellable_in(
+        &self,
+        request: &ImageImportRequest,
+        _env: &crate::data::config::env::EnvSnapshot,
+        sink: &mut dyn UserMessageSink,
+        cancel: &crate::engine::oci::CancelToken,
+    ) -> Result<ImportedImage, EngineError> {
+        self.import_image_cancellable(request, sink, cancel)
+    }
+
     /// List dangling awman images eligible for cleanup.
     fn list_dangling_images(&self) -> Result<Vec<ContainerImageInfo>, EngineError>;
 

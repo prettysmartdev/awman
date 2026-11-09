@@ -12,6 +12,7 @@ mod config_show_tests;
 mod dialog_tests;
 mod key_handler_tests;
 mod mouse_handler_tests;
+mod remote_tests;
 mod render_tests;
 
 // ─── Shared helpers ───────────────────────────────────────────────────────
@@ -90,6 +91,37 @@ pub(super) fn test_runtime_handle() -> tokio::runtime::Handle {
 }
 
 pub(super) fn make_app() -> App {
+    if test_backend() == "daemon" {
+        // The retained core owns the real Unix listener. Each App gets its
+        // own hosted instance. Run blocking connection setup off any test's
+        // current-thread Tokio runtime.
+        static DAEMON: std::sync::OnceLock<crate::parity_support::Daemon> =
+            std::sync::OnceLock::new();
+        return std::thread::spawn(|| {
+            let runtime = test_runtime_handle();
+            let daemon = DAEMON.get_or_init(|| {
+                runtime.block_on(crate::parity_support::Daemon::start(
+                    crate::command::integrations::IntegrationRegistry::compiled_in(),
+                ))
+            });
+            let session = make_session();
+            let backend = runtime.block_on(daemon.remote_at(session.working_dir()));
+            use crate::command::instance::{
+                backend::InstanceBackend, InitialTabOpened, InitialTabSpec,
+            };
+            let InitialTabOpened::Normal { tab } = backend.open_initial(InitialTabSpec::Session {
+                session,
+                fatal_startup_error: true,
+                pty_size: (80, 24),
+            }) else {
+                panic!("normal parity tab")
+            };
+            let (tab, _) = Tab::from_opened(tab);
+            App::with_backend(backend, tab, runtime)
+        })
+        .join()
+        .unwrap();
+    }
     let catalogue = CommandCatalogue::get();
     let engines = Engines::for_tests(std::path::Path::new("/tmp"));
     let session_manager = Arc::new(SessionManager::in_memory(
@@ -104,6 +136,15 @@ pub(super) fn make_app() -> App {
         tab,
         test_runtime_handle(),
     )
+}
+
+fn test_backend() -> String {
+    let backend = std::env::var("AWMAN_TEST_BACKEND").unwrap_or_else(|_| "builtin".into());
+    assert!(
+        matches!(backend.as_str(), "builtin" | "daemon"),
+        "AWMAN_TEST_BACKEND must be builtin or daemon"
+    );
+    backend
 }
 
 fn press_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {

@@ -35,11 +35,17 @@ use crate::engine::sandbox::options::ResolvedSandboxOptions;
 const APPLY_SCRIPT_VM_PATH: &str = "/home/agent/.awman/apply-session-config.sh";
 
 #[derive(Debug, Default)]
-pub(in crate::engine::sandbox) struct DSbxBackend;
+pub(in crate::engine::sandbox) struct DSbxBackend {
+    env: crate::data::config::env::EnvSnapshot,
+}
 
 impl DSbxBackend {
+    #[cfg(test)]
     pub(in crate::engine::sandbox) fn new() -> Self {
-        Self
+        Self::with_env(crate::engine::host_cli::process_env())
+    }
+    pub(in crate::engine::sandbox) fn with_env(env: crate::data::config::env::EnvSnapshot) -> Self {
+        Self { env }
     }
 }
 
@@ -47,12 +53,14 @@ impl SandboxBackend for DSbxBackend {
     fn stop(&self, handle: &AgentHandle) -> Result<(), EngineError> {
         // `sbx stop` pauses the VM and preserves its persistent volume.
         // Best-effort: a non-zero exit (already stopped) is not an error.
-        let _ = SbxCommand::new(["stop", &handle.name]).run_quiet();
+        let _ = SbxCommand::new(["stop", &handle.name])
+            .in_env(&self.env)
+            .run_quiet();
         Ok(())
     }
 
     fn list_running(&self) -> Result<Vec<AgentHandle>, EngineError> {
-        list_awman_sandboxes()
+        list_awman_sandboxes(&self.env)
     }
 
     fn stats(&self, handle: &AgentHandle) -> Result<AgentStats, EngineError> {
@@ -103,8 +111,14 @@ fn resolve_sandbox_name(opts: &ResolvedSandboxOptions) -> String {
         .unwrap_or_else(|| sandbox_name_for(&opts.workspace_dir, &opts.agent_id))
 }
 
-fn kit_dir_for(agent: &str) -> Result<PathBuf, EngineError> {
-    Ok(SandboxKitPaths::from_process_env()?.kit_dir(agent))
+fn kit_dir_for(
+    snapshot: &crate::data::config::env::EnvSnapshot,
+    agent: &str,
+) -> Result<PathBuf, EngineError> {
+    Ok(
+        SandboxKitPaths::at_home(crate::data::fs::data_paths::config_home(snapshot)?)
+            .kit_dir(agent),
+    )
 }
 
 /// The sbx kit kind for `agent`. Sandbox-class runtimes run first-party
@@ -119,8 +133,10 @@ fn kit_kind_for(agent: &str) -> SbxKitKind {
 // ─── Listing ────────────────────────────────────────────────────────────────
 
 /// All awman-owned sandbox handles from `sbx ls`.
-fn list_awman_sandboxes() -> Result<Vec<AgentHandle>, EngineError> {
-    Ok(try_list_all_sandbox_names()?
+fn list_awman_sandboxes(
+    snapshot: &crate::data::config::env::EnvSnapshot,
+) -> Result<Vec<AgentHandle>, EngineError> {
+    Ok(try_list_all_sandbox_names(snapshot)?
         .into_iter()
         .filter(|n| n.starts_with("awman-"))
         .map(|name| AgentHandle {
@@ -135,12 +151,19 @@ fn list_awman_sandboxes() -> Result<Vec<AgentHandle>, EngineError> {
 /// Every sandbox name `sbx ls` reports (awman-owned or not). Tolerant of both
 /// the `--json` mode and the plain table fallback; returns an empty list when
 /// `sbx` is unavailable or not logged in.
-pub(super) fn list_all_sandbox_names() -> Vec<String> {
-    try_list_all_sandbox_names().unwrap_or_default()
+pub(super) fn list_all_sandbox_names_in(
+    snapshot: &crate::data::config::env::EnvSnapshot,
+) -> Vec<String> {
+    try_list_all_sandbox_names(snapshot).unwrap_or_default()
 }
 
-fn try_list_all_sandbox_names() -> Result<Vec<String>, EngineError> {
-    if let Ok(out) = SbxCommand::new(["ls", "--json"]).run_quiet() {
+fn try_list_all_sandbox_names(
+    snapshot: &crate::data::config::env::EnvSnapshot,
+) -> Result<Vec<String>, EngineError> {
+    if let Ok(out) = SbxCommand::new(["ls", "--json"])
+        .in_env(snapshot)
+        .run_quiet()
+    {
         if out.success() {
             let names = parse_ls_json(&out.stdout);
             if !names.is_empty() || out.stdout.trim() == "[]" {
@@ -149,7 +172,7 @@ fn try_list_all_sandbox_names() -> Result<Vec<String>, EngineError> {
         }
     }
     crate::engine::host_cli::check_collection_cancel()?;
-    let output = SbxCommand::new(["ls"]).run_quiet()?;
+    let output = SbxCommand::new(["ls"]).in_env(snapshot).run_quiet()?;
     Ok(parse_ls_table(&output.stdout))
 }
 
@@ -191,8 +214,10 @@ fn parse_ls_table(stdout: &str) -> Vec<String> {
         .collect()
 }
 
-fn sandbox_name_exists(name: &str) -> bool {
-    list_all_sandbox_names().iter().any(|n| n == name)
+fn sandbox_name_exists(snapshot: &crate::data::config::env::EnvSnapshot, name: &str) -> bool {
+    list_all_sandbox_names_in(snapshot)
+        .iter()
+        .any(|n| n == name)
 }
 
 // ─── Interactive launch ─────────────────────────────────────────────────────
@@ -208,10 +233,14 @@ pub(in crate::engine::sandbox) fn run_interactive(
     options: ResolvedSandboxOptions,
     mut frontend: Box<dyn AgentFrontend>,
 ) -> Result<AgentExecution, EngineError> {
+    let snapshot = options
+        .host_env
+        .clone()
+        .unwrap_or_else(crate::engine::host_cli::process_env);
     options.validate_tool_restrictions()?;
     let agent = require_agent(&options)?;
     let name = resolve_sandbox_name(&options);
-    let kit_dir = kit_dir_for(&agent)?;
+    let kit_dir = kit_dir_for(&snapshot, &agent)?;
 
     // 1. Per-launch session config (no credential values).
     DSbxSessionConfig::write_for(&options, &options.workspace_dir)?;
@@ -247,10 +276,11 @@ pub(in crate::engine::sandbox) fn run_interactive(
     //    sandbox-scoped, which requires the sandbox to exist. First launch
     //    runs `sbx create --kit ...` (announced); later launches skip
     //    straight to auth.
-    let created = if sandbox_name_exists(&name) {
+    let created = if sandbox_name_exists(&snapshot, &name) {
         false
     } else {
         SbxCommand::new(create_argv(&name, &agent, &kit_dir, &options))
+            .in_env(&snapshot)
             .run_announced(&mut *frontend)?;
         true
     };
@@ -260,17 +290,17 @@ pub(in crate::engine::sandbox) fn run_interactive(
     //    (scoped secrets apply immediately; global ones only at creation —
     //    awman never sets global secrets), then keychain-resolved credentials
     //    (announced + redacted throughout).
-    let auth_result = auth::auto_auth_env_overlays(
+    let auth_result = auth::auto_auth_env_overlays_in(
+        &snapshot,
         &agent,
         &name,
-        &options.env_passthrough,
-        &options.env_literal,
-        &crate::data::config::env::host_var,
-        &auth::secret_registered_for_service,
+        (&options.env_passthrough, &options.env_literal),
+        &|name| snapshot.get(name).map(str::to_owned),
+        &|service| auth::secret_registered_for_service_in(&snapshot, service),
         &mut *frontend,
     )
     .and_then(|_overlay_registered| {
-        auth::inject_credentials(&options.agent_credentials, &name, &mut *frontend)
+        auth::inject_credentials_in(&snapshot, &options.agent_credentials, &name, &mut *frontend)
     });
     if let Err(e) = auth_result {
         // A failure after a successful create leaves the sandbox behind on
@@ -308,7 +338,7 @@ pub(in crate::engine::sandbox) fn run_interactive(
             &mut *frontend,
             &format!("{SBX_BIN} {}", argv.join(" ")),
         );
-        match SbxCommand::new(argv).run_quiet() {
+        match SbxCommand::new(argv).in_env(&snapshot).run_quiet() {
             Ok(out) if out.success() => {}
             _ => warn(
                 &mut *frontend,
@@ -347,10 +377,14 @@ pub(in crate::engine::sandbox) fn run_interactive(
     );
     let io = frontend.take_io();
     let seed = stdin_seed(&agent, &options);
+    let context = LaunchContext {
+        env: snapshot,
+        name,
+    };
     if io.initial_size.is_some() {
-        spawn_pty_bridged(name, argv, seed, started_at, handle, io, frontend)
+        spawn_pty_bridged(context, argv, seed, started_at, handle, io, frontend)
     } else {
-        spawn_piped(name, argv, seed, started_at, handle, io, frontend)
+        spawn_piped(context, argv, seed, started_at, handle, io, frontend)
     }
 }
 
@@ -476,8 +510,13 @@ fn agent_args_for(
     args
 }
 
-fn spawn_pty_bridged(
+struct LaunchContext {
+    env: crate::data::config::env::EnvSnapshot,
     name: String,
+}
+
+fn spawn_pty_bridged(
+    context: LaunchContext,
     argv: Vec<String>,
     seeded: Option<String>,
     started_at: chrono::DateTime<Utc>,
@@ -485,7 +524,11 @@ fn spawn_pty_bridged(
     io: crate::engine::agent_runtime::frontend::AgentIo,
     frontend: Box<dyn AgentFrontend>,
 ) -> Result<AgentExecution, EngineError> {
-    use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+    let LaunchContext {
+        env: snapshot,
+        name,
+    } = context;
+    use portable_pty::{native_pty_system, PtySize};
 
     let (cols, rows) = io.initial_size.expect("PTY path requires initial_size");
     let pty_system = native_pty_system();
@@ -498,11 +541,16 @@ fn spawn_pty_bridged(
         })
         .map_err(|e| EngineError::Sandbox(format!("openpty: {e}")))?;
 
-    let mut cmd = CommandBuilder::new(crate::engine::host_cli::program(SBX_BIN));
+    let mut cmd = crate::engine::host_cli::pty_command(&snapshot, SBX_BIN);
     for arg in &argv {
         cmd.arg(arg);
     }
-    let (remove, set) = agent_client_env(super::session_config::process_env());
+    let (remove, set) = agent_client_env(snapshot.spawn_env().map(|(k, v)| {
+        (
+            k.to_string_lossy().into_owned(),
+            v.to_string_lossy().into_owned(),
+        )
+    }));
     for name in remove {
         cmd.env_remove(name);
     }
@@ -530,6 +578,7 @@ fn spawn_pty_bridged(
     )?;
 
     let backend = DSbxExecution {
+        env: snapshot,
         child: None,
         pty_child: Some(child),
         pty_master: Some(master_arc),
@@ -573,7 +622,7 @@ fn agent_client_env(
 }
 
 fn spawn_piped(
-    name: String,
+    context: LaunchContext,
     argv: Vec<String>,
     seeded: Option<String>,
     started_at: chrono::DateTime<Utc>,
@@ -581,11 +630,20 @@ fn spawn_piped(
     io: crate::engine::agent_runtime::frontend::AgentIo,
     frontend: Box<dyn AgentFrontend>,
 ) -> Result<AgentExecution, EngineError> {
-    use std::process::{Command, Stdio};
+    let LaunchContext {
+        env: snapshot,
+        name,
+    } = context;
+    use std::process::Stdio;
 
-    let mut cmd = Command::new(crate::engine::host_cli::program(SBX_BIN));
+    let mut cmd = crate::engine::host_cli::command(&snapshot, SBX_BIN);
     cmd.args(&argv);
-    let (remove, set) = agent_client_env(super::session_config::process_env());
+    let (remove, set) = agent_client_env(snapshot.spawn_env().map(|(k, v)| {
+        (
+            k.to_string_lossy().into_owned(),
+            v.to_string_lossy().into_owned(),
+        )
+    }));
     for name in remove {
         cmd.env_remove(name);
     }
@@ -618,6 +676,7 @@ fn spawn_piped(
     drop(bridge.stdin_injector);
 
     let backend = DSbxExecution {
+        env: snapshot,
         child: Some(child),
         pty_child: None,
         pty_master: None,
@@ -641,6 +700,7 @@ fn spawn_piped(
 const FAILURE_TAIL_LINES: usize = 30;
 
 struct DSbxExecution {
+    env: crate::data::config::env::EnvSnapshot,
     child: Option<std::process::Child>,
     pty_child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
     pty_master: Option<io_bridge::PtyMaster>,
@@ -765,14 +825,19 @@ impl ExecutionBackend for DSbxExecution {
 
     fn cancel(&self) -> Result<(), EngineError> {
         // Cancel preserves the persistent volume — `sbx stop`, never `sbx rm`.
-        let _ = SbxCommand::new(["stop", &self.sandbox_name]).run_quiet();
+        let _ = SbxCommand::new(["stop", &self.sandbox_name])
+            .in_env(&self.env)
+            .run_quiet();
         Ok(())
     }
 
     fn cancel_handle(&self) -> crate::engine::agent_runtime::execution::CancelHandle {
         let name = self.sandbox_name.clone();
+        let snapshot = self.env.clone();
         crate::engine::agent_runtime::execution::CancelHandle::new(move || {
-            let _ = SbxCommand::new(["stop", &name]).run_quiet();
+            let _ = SbxCommand::new(["stop", &name])
+                .in_env(&snapshot)
+                .run_quiet();
             Ok(())
         })
     }
@@ -788,6 +853,88 @@ pub(crate) fn conformance_launcher() -> crate::engine::agent_runtime::conformanc
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn launch_and_cancel_keep_the_same_instance_environment() {
+        use crate::data::config::env::EnvSnapshot;
+        use crate::data::message::{UserMessage, UserMessageSink};
+        use crate::engine::agent_runtime::frontend::{AgentIo, AgentProgress};
+        use std::os::unix::fs::PermissionsExt;
+
+        struct Frontend;
+        impl UserMessageSink for Frontend {
+            fn write_message(&mut self, _: UserMessage) {}
+            fn replay_queued(&mut self) {}
+        }
+        impl AgentFrontend for Frontend {
+            fn report_status(&mut self, _: AgentStatus) {}
+            fn report_progress(&mut self, _: AgentProgress) {}
+            fn take_io(&mut self) -> AgentIo {
+                let (stdout, _) = tokio::sync::mpsc::unbounded_channel();
+                let (stderr, _) = tokio::sync::mpsc::unbounded_channel();
+                let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel();
+                AgentIo {
+                    stdout,
+                    stderr,
+                    stdin_tx,
+                    stdin_rx,
+                    resize: None,
+                    initial_size: None,
+                }
+            }
+        }
+        for name in ["one", "two"] {
+            let dir = tempfile::tempdir().unwrap();
+            let log = dir.path().join("stop.log");
+            let binary = dir.path().join("sbx");
+            std::fs::write(&binary, "#!/bin/sh\nif [ \"$1\" = stop ]; then printf '%s:%s\\n' \"$DOCKER_HOST\" \"$2\" >> \"$PROBE_FILE\"; fi\n").unwrap();
+            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let env = EnvSnapshot::from_instance_env(
+                vec![
+                    ("PATH".into(), dir.path().to_string_lossy().into_owned()),
+                    ("DOCKER_HOST".into(), name.into()),
+                    ("PROBE_FILE".into(), log.to_string_lossy().into_owned()),
+                    // The fake `sbx` is in the test's temp dir, which test
+                    // isolation recognises through the snapshot's TMPDIR.
+                    (
+                        "TMPDIR".into(),
+                        std::env::temp_dir().to_string_lossy().into_owned(),
+                    ),
+                ],
+                dir.path().to_path_buf(),
+                vec![],
+            );
+            let mut frontend = Frontend;
+            let io = frontend.take_io();
+            let now = Utc::now();
+            let mut execution = spawn_piped(
+                LaunchContext {
+                    env,
+                    name: name.into(),
+                },
+                vec!["run".into(), name.into()],
+                None,
+                now,
+                AgentHandle {
+                    id: name.into(),
+                    name: name.into(),
+                    image_tag: String::new(),
+                    started_at: now,
+                },
+                io,
+                Box::new(frontend),
+            )
+            .unwrap();
+            execution.cancel().unwrap();
+            execution.cancel_handle().unwrap().cancel().unwrap();
+            assert_eq!(
+                std::fs::read_to_string(log).unwrap(),
+                format!("{name}:{name}\n{name}:{name}\n")
+            );
+            execution.wait().await.unwrap();
+        }
+    }
     use std::sync::Arc;
 
     /// dsbx over a plain child process (its `sbx run` stands in): a prompt
@@ -808,6 +955,7 @@ mod tests {
                     running.lock().unwrap().push(pid);
                 }
                 let backend = DSbxExecution {
+                    env: crate::engine::host_cli::process_env(),
                     child: Some(child),
                     pty_child: None,
                     pty_master: None,

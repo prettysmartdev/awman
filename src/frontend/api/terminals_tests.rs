@@ -393,7 +393,10 @@ async fn snapshot_on_connect_matches_the_mirror_and_output_streams() {
 
     // A late joiner sees the current screen, not a blank one.
     let mut ws = d.connect(handle.id(), None).await;
-    let TerminalFrame::Snapshot { cols, rows, screen } = next_frame(&mut ws).await else {
+    let TerminalFrame::Snapshot {
+        cols, rows, screen, ..
+    } = next_frame(&mut ws).await
+    else {
         panic!("snapshot first")
     };
     assert_eq!((cols, rows), (40, 10));
@@ -459,7 +462,9 @@ async fn a_slow_consumer_gets_lagged_then_a_fresh_snapshot() {
     loop {
         match next_frame(&mut ws).await {
             TerminalFrame::Lagged => saw_lagged = true,
-            TerminalFrame::Snapshot { cols, rows, screen } if saw_lagged => {
+            TerminalFrame::Snapshot {
+                cols, rows, screen, ..
+            } if saw_lagged => {
                 let text = screen_text(cols, rows, &screen);
                 assert!(
                     text.contains(&format!("line {}", capacity * 4 - 1)),
@@ -723,13 +728,18 @@ fn annotation_headers_round_trip_through_a_real_header_map() {
         );
     }
     let viewer = viewer_identity(CommandListener::Local, &headers, false).unwrap();
-    assert_eq!(viewer.annotations["rex/block"], "blk_1");
-    assert_eq!(viewer.annotations["ui.app/label"], "grüße 100%");
+    assert_eq!(viewer.annotations.get("rex/block").unwrap(), "blk_1");
+    assert_eq!(
+        viewer.annotations.get("ui.app/label").unwrap(),
+        "grüße 100%"
+    );
 
     let mut bad = HeaderMap::new();
     bad.insert(
         axum::http::HeaderName::from_static("x-awman-annotation-nonamespace"),
         axum::http::HeaderValue::from_static("x"),
     );
-    assert!(viewer_identity(CommandListener::Local, &bad, false).is_err());
+    let error = viewer_identity(CommandListener::Local, &bad, false).unwrap_err();
+    assert_eq!(error.status, axum::http::StatusCode::BAD_REQUEST);
+    assert_eq!(error.code, "invalid_annotation");
 }

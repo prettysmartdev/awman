@@ -7,8 +7,6 @@
 //! (`frontend::api::terminals`, `awman attach`) moves them over WebSockets and
 //! host TTYs. Nothing here does I/O.
 
-use std::collections::BTreeMap;
-
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -145,6 +143,8 @@ pub struct TerminalRecord {
 /// The screen as ANSI that redraws it, plus its size.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TerminalSnapshot {
+    /// Whether the agent has produced any bytes, including control-only output.
+    pub has_output: bool,
     pub cols: u16,
     pub rows: u16,
     pub screen: Vec<u8>,
@@ -166,6 +166,10 @@ pub mod base64_bytes {
 
 /// Server → client frames of `awman.terminal.v1`. One codec serves local
 /// attaches and network viewers; the set mirrors `attach_protocol.rs`.
+fn snapshot_has_output_default() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TerminalFrame {
@@ -176,6 +180,8 @@ pub enum TerminalFrame {
     },
     /// Sent on connect and after `Lagged`.
     Snapshot {
+        #[serde(default = "snapshot_has_output_default")]
+        has_output: bool,
         cols: u16,
         rows: u16,
         #[serde(with = "base64_bytes")]
@@ -237,131 +243,14 @@ pub enum TerminalClientFrame {
 }
 
 /// Generic integration metadata on a subscription (`--annotation k=v`).
-/// Keys follow 0139 §1 (`<namespace>/<name>`, lowercase `[a-z0-9.-]`).
-pub type Annotations = BTreeMap<String, String>;
+pub use crate::data::annotations::{
+    annotation_from_header, annotation_header, validate_annotation, AnnotationError, Annotations,
+    ANNOTATION_HEADER_PREFIX, MAX_ANNOTATIONS, MAX_ANNOTATION_KEY_BYTES,
+    MAX_ANNOTATION_VALUE_BYTES,
+};
 
-/// Longest annotation key and value, in bytes (0142's limits).
-pub const MAX_ANNOTATION_KEY_BYTES: usize = 63;
-pub const MAX_ANNOTATION_VALUE_BYTES: usize = 256;
-/// Most annotations one subscription may carry.
-pub const MAX_ANNOTATIONS: usize = 16;
-
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum AnnotationError {
-    #[error("invalid annotation key `{0}`: expected <namespace>/<name> in [a-z0-9.-]")]
-    InvalidKey(String),
-    #[error("annotation value for `{0}` is too long (max {MAX_ANNOTATION_VALUE_BYTES} bytes)")]
-    ValueTooLong(String),
-    #[error("annotation value for `{0}` contains control characters")]
-    InvalidValue(String),
-    #[error("too many annotations (max {MAX_ANNOTATIONS})")]
-    TooMany,
-}
-
-/// Validate one `k=v` annotation.
-pub fn validate_annotation(key: &str, value: &str) -> Result<(), AnnotationError> {
-    let valid_part = |part: &str| {
-        !part.is_empty()
-            && part.bytes().all(|byte| {
-                byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'-')
-            })
-    };
-    let mut parts = key.split('/');
-    let valid_key = key.len() <= MAX_ANNOTATION_KEY_BYTES
-        && parts.next().is_some_and(valid_part)
-        && parts.next().is_some_and(valid_part)
-        && parts.next().is_none();
-    if !valid_key {
-        return Err(AnnotationError::InvalidKey(key.to_owned()));
-    }
-    if value.len() > MAX_ANNOTATION_VALUE_BYTES {
-        return Err(AnnotationError::ValueTooLong(key.to_owned()));
-    }
-    if value.chars().any(char::is_control) {
-        return Err(AnnotationError::InvalidValue(key.to_owned()));
-    }
-    Ok(())
-}
-
-/// Parse repeatable `--annotation k=v` values into a validated map.
 pub fn parse_annotations<S: AsRef<str>>(pairs: &[S]) -> Result<Annotations, AnnotationError> {
-    let mut annotations = Annotations::new();
-    for pair in pairs {
-        let pair = pair.as_ref();
-        let (key, value) = pair
-            .split_once('=')
-            .ok_or_else(|| AnnotationError::InvalidKey(pair.to_owned()))?;
-        validate_annotation(key, value)?;
-        annotations.insert(key.to_owned(), value.to_owned());
-        if annotations.len() > MAX_ANNOTATIONS {
-            return Err(AnnotationError::TooMany);
-        }
-    }
-    Ok(annotations)
-}
-
-/// Header-name prefix carrying one subscription annotation on the terminal
-/// WebSocket handshake.
-///
-/// `/` (the key's namespace separator) is not legal in an HTTP header name,
-/// so the transport spells it `~`, which no key may contain:
-/// `rex/block=blk 1` travels as `x-awman-annotation-rex~block: blk%201`.
-/// The value is percent-encoded (every byte outside visible ASCII, plus `%`)
-/// so any valid value, UTF-8 included, is a legal header value. Client and
-/// server both use [`annotation_header`] / [`annotation_from_header`]; the
-/// logical key and value in events are unchanged.
-pub const ANNOTATION_HEADER_PREFIX: &str = "x-awman-annotation-";
-
-/// The `(header name, header value)` that carry a validated annotation.
-pub fn annotation_header(key: &str, value: &str) -> (String, String) {
-    let mut encoded = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        if byte.is_ascii_graphic() && byte != b'%' {
-            encoded.push(byte as char);
-        } else {
-            encoded.push_str(&format!("%{byte:02X}"));
-        }
-    }
-    (
-        format!("{ANNOTATION_HEADER_PREFIX}{}", key.replace('/', "~")),
-        encoded,
-    )
-}
-
-/// Decode one annotation header back into its validated logical key and
-/// value. `name` is the full (lower-case) header name; `Ok(None)` when it
-/// is not an annotation header.
-pub fn annotation_from_header(
-    name: &str,
-    value: &[u8],
-) -> Result<Option<(String, String)>, AnnotationError> {
-    let Some(encoded_key) = name.strip_prefix(ANNOTATION_HEADER_PREFIX) else {
-        return Ok(None);
-    };
-    if encoded_key.contains('/') {
-        return Err(AnnotationError::InvalidKey(encoded_key.to_owned()));
-    }
-    let key = encoded_key.replace('~', "/");
-    let invalid = || AnnotationError::InvalidValue(key.clone());
-    let mut bytes = Vec::with_capacity(value.len());
-    let mut iter = value.iter();
-    while let Some(&byte) = iter.next() {
-        if byte == b'%' {
-            let hex = [
-                *iter.next().ok_or_else(invalid)?,
-                *iter.next().ok_or_else(invalid)?,
-            ];
-            let hex = std::str::from_utf8(&hex).map_err(|_| invalid())?;
-            bytes.push(u8::from_str_radix(hex, 16).map_err(|_| invalid())?);
-        } else if byte.is_ascii_graphic() {
-            bytes.push(byte);
-        } else {
-            return Err(invalid());
-        }
-    }
-    let value = String::from_utf8(bytes).map_err(|_| invalid())?;
-    validate_annotation(&key, &value)?;
-    Ok(Some((key, value)))
+    Annotations::parse_cli(pairs)
 }
 
 /// Who holds a terminal's input grant, as written to `terminal_control`.
@@ -500,7 +389,7 @@ mod tests {
     #[test]
     fn annotations_validate_limits_and_preserve_values() {
         let parsed = parse_annotations(&["rex/block=blk_42", "app/view=primary"]).unwrap();
-        assert_eq!(parsed.get("rex/block").map(String::as_str), Some("blk_42"));
+        assert_eq!(parsed.get("rex/block"), Some("blk_42"));
         assert!(matches!(
             validate_annotation("Rex/block", "x"),
             Err(AnnotationError::InvalidKey(_))

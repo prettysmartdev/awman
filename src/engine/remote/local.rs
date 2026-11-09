@@ -218,15 +218,33 @@ impl LocalClient {
         let request = request
             .body(http_body_util::Full::new(hyper::body::Bytes::from(bytes)))
             .map_err(|e| failure(e.to_string()))?;
-        sender
-            .send_request(request)
-            .await
-            .map_err(|e| failure(e.to_string()))
+        match sender.send_request(request).await {
+            Ok(response) => Ok(response),
+            Err(error) => Err(connection_failure(&self.endpoint, error).await),
+        }
     }
 }
 
 fn failure(e: String) -> EngineError {
     EngineError::Other(format!("local daemon request: {e}"))
+}
+
+/// A socket can disappear after `connect` succeeds but before HTTP receives a
+/// response. Probe again to distinguish that race from a live listener which
+/// deliberately closed this connection (for example, to refuse a peer).
+async fn connection_failure(endpoint: &Path, error: hyper::Error) -> EngineError {
+    #[cfg(unix)]
+    if let Err(probe) = tokio::net::UnixStream::connect(endpoint).await {
+        if matches!(
+            probe.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+        ) {
+            return EngineError::Other(NO_DAEMON.into());
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = endpoint;
+    failure(error.to_string())
 }
 
 // ---------------------------------------------------------------- Unix ----

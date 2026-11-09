@@ -28,7 +28,7 @@
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 
-use crate::data::workflow_state::{group_stages, WorkflowState};
+use crate::data::workflow_state::group_stages;
 use crate::frontend::tui::tabs::{
     StepViewStatus, WorkflowOverviewState, WorkflowStepKind, WorkflowStepView, WorkflowViewState,
 };
@@ -594,68 +594,9 @@ fn stage_status(col: &[&WorkflowStepView]) -> StepViewStatus {
     }
 }
 
-/// Convert a `WorkflowState` (Layer 0 data) to a `WorkflowViewState` (TUI).
-///
-/// Prepends pseudo-steps from `setup_step_states`, maps main steps from
-/// `steps` + `step_states`, and appends pseudo-steps from
-/// `teardown_step_states`.
-pub fn workflow_state_to_view_state(state: &WorkflowState) -> WorkflowViewState {
-    let mut steps: Vec<WorkflowStepView> = Vec::new();
-
-    for ps in &state.setup_step_states {
-        steps.push(WorkflowStepView {
-            name: ps.description.clone(),
-            status: StepViewStatus::of_phase_step_status(&ps.status),
-            agent: None,
-            model: None,
-            depends_on: Vec::new(),
-            kind: WorkflowStepKind::Setup,
-        });
-    }
-
-    for info in &state.steps {
-        let status = state
-            .step_states
-            .get(&info.name)
-            .map(StepViewStatus::of_step_state)
-            .unwrap_or(StepViewStatus::Pending);
-        steps.push(WorkflowStepView {
-            name: info.name.clone(),
-            status,
-            agent: info.agent.clone(),
-            model: info.model.clone(),
-            depends_on: info.depends_on.clone(),
-            kind: WorkflowStepKind::Agent,
-        });
-    }
-
-    for ps in &state.teardown_step_states {
-        steps.push(WorkflowStepView {
-            name: ps.description.clone(),
-            status: StepViewStatus::of_phase_step_status(&ps.status),
-            agent: None,
-            model: None,
-            depends_on: Vec::new(),
-            kind: WorkflowStepKind::Teardown,
-        });
-    }
-
-    let current_step = state.current_step_index.and_then(|idx| {
-        let setup_len = state.setup_step_states.len();
-        state
-            .steps
-            .get(idx)
-            .map(|s| s.name.clone())
-            .or_else(|| steps.get(idx + setup_len).map(|s| s.name.clone()))
-    });
-
-    WorkflowViewState {
-        steps,
-        current_step,
-        max_concurrent: None,
-        reported: Default::default(),
-    }
-}
+/// Pure data projection, now Layer 2 (`command::instance::feeds`) so the
+/// command thread can publish it; re-exported for the renderer and its tests.
+pub use crate::command::instance::feeds::workflow_state_to_view_state;
 
 /// Group steps into columns. Setup and teardown steps are never part of the
 /// dependency DAG — they always run first and last — so they get their own

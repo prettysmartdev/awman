@@ -25,6 +25,7 @@ A guide to using awman, the containerized multi-agent terminal multiplexer.
 | 14 | [Command Reference](14-command-reference.md) | Every command, subcommand, flag, and argument awman accepts, generated from the source of truth |
 | 15 | [Custom Agents](15-custom-agents.md) | Define your own agents in TOML: locations, reference, images, approval and trust, `awman new agent`, crush/maki migration |
 | 16 | [The Daemon](16-daemon.md) | Shared daemon features, lifecycle, local API, network listener and keys |
+| 19 | [The Engine and Frontends](19-engine-and-frontends.md) | Running the TUI on the daemon engine: `tui.backend`, instances, upgrades, fallback notices, integrations |
 | — | [Architecture (Detailed)](architecture.md) | Source layout, in-depth design decisions |
 
 ---

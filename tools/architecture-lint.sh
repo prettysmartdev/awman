@@ -501,11 +501,8 @@ fi
 # convention is enforced by the fact that nothing else may live there.
 TEST_FILE_RE='(/tests/|/tests\.rs$)'
 #
-# One production read is deliberate and allowlisted by path:
-# `src/engine/sandbox/dsbx/session_config.rs` writes the non-sensitive env map
-# into a workspace-readable `session.json`, and must read *this process's* own
-# environment rather than the daemon overlay — the file itself explains why.
-ENV_VAR_ALLOWED="$SRC/engine/sandbox/dsbx/session_config\.rs"
+# Layer 3 keeps the original variable-read guard. Layer 1 and Layer 2 use the
+# broader snapshot rule and its exact symbol allow-list below.
 
 # Production (non-test) files above Layer 0, as a NUL list.
 cp "$SCRATCH/upper.list" "$SCRATCH/prod_upper.list" || scanner_fail "cannot copy the file list prod_upper.list"
@@ -570,7 +567,7 @@ PROD_CODE_AWK="$TEST_GATE_AWK"'
 env_var_matches=$(
     awk_files "$SCRATCH/prod_upper.list" "$PROD_CODE_AWK" \
         -v 're=std::env::var|[^A-Za-z0-9_]env::var[(]|env::var_os[(]' |
-        grep_scan -Ev "^($ENV_VAR_ALLOWED):"
+        grep_scan -Ev "^$SRC/(engine|command)/"
 )
 if [ -n "$env_var_matches" ]; then
     echo ""
@@ -583,6 +580,55 @@ if [ -n "$env_var_matches" ]; then
         echo "VIOLATION [env-var]: $display:$lineno"
         record "$VIOLATION_FILE"
     done
+fi
+
+# WI 0142: instance code cannot consult the daemon's process environment.
+# Entries are path:symbol plus a required explanation, never regex exemptions.
+# Keep the old env-var rule above for Layer 3 and aliases; this rule also covers
+# cwd/temp/argv, home-directory fallbacks and ad-hoc snapshot captures in L1/L2.
+ENV_READ_ALLOWLIST="$REPO_ROOT/tools/env-lint-allowlist.txt"
+if [ ! -f "$ENV_READ_ALLOWLIST" ] || [ ! -r "$ENV_READ_ALLOWLIST" ]; then
+    scanner_fail "environment allow-list missing or unreadable: $ENV_READ_ALLOWLIST"
+else
+    env_read_matches=$(
+        awk_files "$SCRATCH/prod_upper.list" "$PROD_CODE_AWK" \
+            -v 're=(std::|[^A-Za-z_0-9])env::(var|var_os|vars|vars_os|current_dir|temp_dir|current_exe|args|args_os)[[:space:]]*[(]|dirs::home_dir|Env::from_process' |
+        awk_stdin '
+            BEGIN {
+                while ((rc = (getline entry < allowfile)) > 0) {
+                    if (entry ~ /^[[:space:]]*(#|$)/) continue
+                    if (entry !~ /^src\/(engine|command)\/[^ :]+:[A-Za-z_0-9:]+[[:space:]]+# .+/) exit 2
+                    sub(/[[:space:]]+# .*/, "", entry)
+                    allowed[entry] = 1
+                }
+                if (rc < 0) exit 2
+                close(allowfile)
+            }
+            {
+                file = $0; sub(/:[0-9]+:.*/, "", file)
+                if (file !~ /\/src\/(engine|command)\//) next
+                sub(root "/", "", file)
+                code = $0; sub(/^[^:]+:[0-9]+:/, "", code)
+                sub(/\/\/.*$/, "", code)
+                while (match(code, /(std::|[^A-Za-z_0-9])env::(var_os|vars_os|vars|var|current_dir|temp_dir|current_exe|args_os|args)[[:space:]]*[(]|dirs::home_dir|Env::from_process/)) {
+                    symbol = substr(code, RSTART, RLENGTH)
+                    sub(/^[^A-Za-z_]/, "", symbol)
+                    if (symbol ~ /^env::/) symbol = "std::" symbol
+                    sub(/[[:space:]]*[(]$/, "", symbol)
+                    if (!((file ":" symbol) in allowed)) print $0
+                    code = substr(code, RSTART + RLENGTH)
+                }
+            }
+        ' -v allowfile="$ENV_READ_ALLOWLIST" -v root="$REPO_ROOT"
+    )
+    if [ -n "$env_read_matches" ]; then
+        echo ""
+        echo "architecture-lint: process environment read on the instance path; use EnvSnapshot:"
+        echo "$env_read_matches" | while IFS= read -r line; do
+            echo "VIOLATION [env-snapshot]: ${line#"$REPO_ROOT/"}"
+            record "$VIOLATION_FILE"
+        done
+    fi
 fi
 
 # WI 0114 F-31: configuration reaches a command through its `Session` (which
