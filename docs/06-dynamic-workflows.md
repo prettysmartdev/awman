@@ -399,7 +399,8 @@ Dynamic mode always enforces `--yolo`, `--worktree`, and `--overlay context(work
 | Agent image build fails | Hard error with build output; workflow does not start; repair loop is not entered |
 | Leader modifies source files outside the context directory | Dynamic run aborts before executing the generated workflow; changed paths are reported |
 | User restarts the leader via WCB | Current leader container killed, `workflow.toml` deleted, fresh leader launched |
-| User aborts during the leader yolo countdown | Leader container killed, entire dynamic run aborts — no workflow executes |
+| Esc during the leader yolo countdown | Countdown cancelled; leader stays running for further interaction |
+| User aborts from the leader control board | Leader container killed, entire dynamic run aborts — no workflow executes |
 | User pauses during the leader step | Leader container killed; resume semantics follow the standard workflow pause/resume path |
 | A generated workflow step fails | The [step-failure control board](05-workflows.md#when-a-step-fails) opens: restart, go back, skip ahead, pause, or Ctrl+C to cancel |
 | Re-run after cancelling a failed run, worktree kept | Resume prompt offers the failed step, the one before it, and the one after it, by name |

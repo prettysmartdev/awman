@@ -1085,6 +1085,27 @@ fn ctrl_s_with_single_slot_leaves_yolo_modal_open() {
 }
 
 #[test]
+fn esc_on_single_yolo_modal_cancels_the_countdown() {
+    use crate::frontend::tui::dialogs::WorkflowYoloCountdownState;
+
+    let mut app = make_app();
+    app.active_dialog = Some(Dialog::WorkflowYoloCountdown(WorkflowYoloCountdownState {
+        step_name: "leader".into(),
+        remaining_secs: 5,
+        kind: Default::default(),
+    }));
+
+    press_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+
+    assert!(app.active_dialog.is_none());
+    assert!(app
+        .active_tab()
+        .shared
+        .yolo_cancel_flag
+        .load(std::sync::atomic::Ordering::Relaxed));
+}
+
+#[test]
 fn esc_on_parallel_yolo_modal_cancels_the_focused_slots_flag_only() {
     use crate::frontend::tui::dialogs::WorkflowYoloCountdownState;
 

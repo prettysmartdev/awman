@@ -1291,10 +1291,6 @@ impl ExecWorkflowCommand {
                     }
                     LeaderCountdownOutcome::Dismissed => continue,
                     LeaderCountdownOutcome::Cancelled => break stop_for_cancel(),
-                    LeaderCountdownOutcome::Abort => {
-                        stop_leader();
-                        break LeaderDriveOutcome::Aborted;
-                    }
                     LeaderCountdownOutcome::ShowControlBoard => {
                         let choice = show_leader_control_board(&shared, label);
                         match apply_leader_control_outcome(choice, &cancel, &shared) {
@@ -1357,10 +1353,6 @@ impl ExecWorkflowCommand {
                                     continue;
                                 }
                                 LeaderCountdownOutcome::Cancelled => break stop_for_cancel(),
-                                LeaderCountdownOutcome::Abort => {
-                                    stop_leader();
-                                    break LeaderDriveOutcome::Aborted;
-                                }
                                 // Ctrl-W during the countdown: cancel the
                                 // countdown and open the WCB in its place.
                                 LeaderCountdownOutcome::ShowControlBoard => {
@@ -1497,10 +1489,8 @@ pub(crate) enum LeaderCountdownOutcome {
     /// The leader resumed output (`Unstuck`) — cancel the countdown. Only a
     /// silence or `AgentError` countdown recovers on output.
     Recovered,
-    /// The user aborted (Esc on a silence countdown).
-    Abort,
-    /// The user dismissed an agent-status countdown (Esc): keep the leader
-    /// running, nothing advances.
+    /// The user dismissed the countdown (Esc): keep the leader running,
+    /// nothing advances.
     Dismissed,
     /// The leader sent an OSC 7501 report calling for a different response.
     Superseded(Option<EffectiveStatus>),
@@ -1586,9 +1576,6 @@ pub(crate) async fn run_leader_yolo_countdown(
         match tick_result {
             Ok(YoloTickOutcome::Continue) => {}
             Ok(YoloTickOutcome::AdvanceNow) => break LeaderCountdownOutcome::Advance,
-            Ok(YoloTickOutcome::Cancel) if kind == CountdownKind::StuckStep => {
-                break LeaderCountdownOutcome::Abort
-            }
             Ok(YoloTickOutcome::Cancel) => break LeaderCountdownOutcome::Dismissed,
             Err(_) => break LeaderCountdownOutcome::Advance,
         }

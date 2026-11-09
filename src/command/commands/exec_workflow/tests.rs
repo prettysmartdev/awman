@@ -38,6 +38,7 @@ pub(crate) struct FakeExecWorkflowFrontend {
     shared_messages: Arc<Mutex<Vec<UserMessage>>>,
     interactive_recovery: bool,
     next_action_response: NextAction,
+    yolo_tick_response: YoloTickOutcome,
     /// What `ask_workflow_resume` answers. `Fresh` keeps the historical
     /// behaviour of every test that does not care.
     resume_response: WorkflowResumeDecision,
@@ -66,6 +67,7 @@ impl FakeExecWorkflowFrontend {
             shared_messages: Arc::new(Mutex::new(Vec::new())),
             interactive_recovery: false,
             next_action_response: NextAction::LaunchNext,
+            yolo_tick_response: YoloTickOutcome::Continue,
             resume_response: WorkflowResumeDecision::Fresh,
             resume_prompts: Vec::new(),
             resume_prompt_calls: Default::default(),
@@ -143,7 +145,7 @@ impl WorkflowFrontend for FakeExecWorkflowFrontend {
         _remaining: Duration,
         _total: Duration,
     ) -> Result<YoloTickOutcome, EngineError> {
-        Ok(YoloTickOutcome::Continue)
+        Ok(self.yolo_tick_response.clone())
     }
     fn report_step_status(&mut self, _step: &WorkflowStep, _status: WorkflowStepStatus) {}
     fn report_step_output(&mut self, _step: &WorkflowStep, _output: StepOutput) {}
@@ -3151,6 +3153,37 @@ fn leader_control_board_maps_actions() {
         }),
         LeaderControlOutcome::Dismiss
     ));
+}
+
+#[tokio::test]
+async fn esc_dismisses_leader_countdown_without_consuming_its_exit() {
+    for kind in [CountdownKind::StuckStep, CountdownKind::AgentDone] {
+        let mut frontend = FakeExecWorkflowFrontend::new();
+        frontend.yolo_tick_response = YoloTickOutcome::Cancel;
+        let shared = SharedWorkflowFrontend::new(Box::new(frontend));
+        let (wait_tx, mut wait_rx) = tokio::sync::oneshot::channel();
+        let (_stuck_tx, mut stuck_rx) = tokio::sync::broadcast::channel(1);
+        let (_engine_tx, mut engine_rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancel = tokio_util::sync::CancellationToken::new();
+
+        let outcome = run_leader_yolo_countdown(
+            &shared,
+            &mut wait_rx,
+            &mut stuck_rx,
+            &mut engine_rx,
+            &cancel,
+            "leader",
+            kind,
+        )
+        .await;
+
+        assert!(matches!(outcome, LeaderCountdownOutcome::Dismissed));
+        assert!(!cancel.is_cancelled());
+        wait_tx
+            .send(0)
+            .expect("leader exit receiver must remain active");
+        assert_eq!(wait_rx.await.unwrap(), 0);
+    }
 }
 
 // ─── WI-0115 §2: workflow resume ─────────────────────────────────────
