@@ -19,6 +19,7 @@ async fn web_hello_uses_context_and_resumes_the_same_frontend() {
             env: d.hello(FrontendRole::Primary).env,
         })
         .unwrap();
+    let project_root = c.root.clone();
     let mut h = d.hello(FrontendRole::Primary);
     h.kind = FrontendKindWire::Web;
     h.cwd = Default::default();
@@ -44,7 +45,7 @@ async fn web_hello_uses_context_and_resumes_the_same_frontend() {
     assert!(d.host().tabs(&id).unwrap()[0]
         .session
         .cwd
-        .starts_with(project.path()));
+        .starts_with(&project_root));
     tx.close().await;
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     h.resume = Some(frontend_id.clone());
