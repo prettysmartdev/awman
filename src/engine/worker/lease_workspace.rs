@@ -340,7 +340,19 @@ mod tests {
         let found = orphaned_lease_dirs(root, std::slice::from_ref(&a));
         assert_eq!(found.len(), 2);
         assert!(found.iter().all(|p| p.ends_with(b.as_str())));
-        assert_eq!(remove_orphaned_lease_dirs(root, &[a]), 2);
+        // Removal takes the dead owner's lock per directory. A process another
+        // test forks at that instant briefly holds a copy of the lock's
+        // descriptor (until its exec closes it), which makes the owner look
+        // alive and that directory is left for the next pass: run passes
+        // until both are gone.
+        let (mut removed, waited) = (0, std::time::Instant::now());
+        while removed < 2 && waited.elapsed() < std::time::Duration::from_secs(10) {
+            removed += remove_orphaned_lease_dirs(root, std::slice::from_ref(&a));
+            if removed < 2 {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+        assert_eq!(removed, 2);
         assert!(keep.clone_dir().exists());
         assert!(orphaned_lease_dirs(root, &[]).len() == 2);
         assert_eq!(
