@@ -187,9 +187,10 @@ describe('TerminalView', () => {
     const links: DetectedLink[][] = [];
     const { container } = await mount(conn, { onTitleChange: t => titles.push(t), onLinkDetected: l => links.push(l) });
     feed(conn, 'untrusted_osc');
-    await waitFor(() => expect(links.length).toBeGreaterThan(0));
-    expect(titles.at(-1)).toBe('Claude <script>alert(1)</script>');
-    expect(links.at(-1)).toEqual([{ url: 'https://example.com/docs', text: 'docs', source: 'osc8' }]);
+    await waitFor(() => {
+      expect(titles.at(-1)).toBe('Claude <script>alert(1)</script>');
+      expect(links.at(-1)).toEqual([{ url: 'https://example.com/docs', text: 'docs', source: 'osc8' }]);
+    });
     expect(container.querySelector('a, script, img, iframe')).toBeNull();
     act(() => conn.exits.emit(3));
     expect(screen.getByText('The agent exited (code 3).')).toBeTruthy();
