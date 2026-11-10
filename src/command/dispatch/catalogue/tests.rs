@@ -1213,7 +1213,7 @@ fn committed_command_reference_documents_new_agent() {
     assert!(reference.contains("awman ready"));
 }
 
-// ── session worktree selectors (WI 0153) ─────────────────────────────────
+// ── session worktree selectors (WI 0151) ─────────────────────────────────
 
 fn argv(parts: &[&str]) -> Vec<String> {
     parts.iter().map(|s| s.to_string()).collect()

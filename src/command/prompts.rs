@@ -355,6 +355,22 @@ fn prerequisite_steps(check: &PrerequisiteCheck) -> String {
     check.needed_by_label()
 }
 
+/// Prerequisite questions always number answers in display order. Longer SSH
+/// key lists continue with letters after 9.
+fn prerequisite_prompt<D>(
+    title: impl Into<String>,
+    body: impl Into<String>,
+    mut choices: Vec<Choice<D>>,
+    default_on_dismiss: Option<D>,
+) -> Prompt<D> {
+    const KEYS: &str = "123456789abcdefghijklmnopqrstuvwxyz";
+    assert!(choices.len() <= KEYS.len());
+    for (choice, key) in choices.iter_mut().zip(KEYS.chars()) {
+        choice.key = key;
+    }
+    Prompt::new(title, body, choices, default_on_dismiss)
+}
+
 /// The git identity question for `commit_changes`, built from the check's
 /// remediations so only the answers that apply are offered. The persistent
 /// `.git/config` write is listed last.
@@ -405,7 +421,7 @@ pub fn prerequisite_identity(check: &PrerequisiteCheck) -> Prompt<IdentityChoice
         "Continue without (commit_changes will fail)",
         IdentityChoice::Continue,
     ));
-    Prompt::new(
+    prerequisite_prompt(
         format!(
             "{} needs a git identity inside its container",
             prerequisite_steps(check)
@@ -443,7 +459,7 @@ pub fn prerequisite_identity_email() -> TextPrompt {
 /// `.git/config` on the host. `command` is the exact command that will run.
 /// Dismiss means "don't write it", which still uses the identity for this run.
 pub fn prerequisite_identity_persist(command: &str) -> Prompt<IdentityPersist> {
-    Prompt::new(
+    prerequisite_prompt(
         "Write the identity into this repo's .git/config?",
         format!(
             "awman will run this ON YOUR HOST:\n\n  {command}\n\n\
@@ -557,7 +573,7 @@ pub fn prerequisite_ssh(
              HTTPS remote with a GitHub token.",
         );
     }
-    Prompt::new(
+    prerequisite_prompt(
         format!(
             "{steps} pushes to {remote} over SSH. Allow awman to mount an SSH key into the \
              {steps} container?"
@@ -588,7 +604,7 @@ fn tilde_path(path: &str, home: Option<&Path>) -> String {
 /// environment. The token goes only to the containers that need it.
 pub fn prerequisite_token_consent(check: &PrerequisiteCheck, var: &str) -> Prompt<TokenConsent> {
     let steps = prerequisite_steps(check);
-    Prompt::new(
+    prerequisite_prompt(
         format!("{steps} need a GitHub token. Use the token in {var} for teardown steps?"),
         format!(
             "The token is passed by name only to the containers that need it \
@@ -685,7 +701,7 @@ pub fn prerequisite_token_source(check: &PrerequisiteCheck) -> Prompt<TokenSourc
          to unauthenticated, rate-limited requests."
             .to_string(),
     );
-    Prompt::new(
+    prerequisite_prompt(
         format!("{steps} need a GitHub token. Where should it come from?"),
         body.join("\n"),
         choices,
@@ -712,7 +728,7 @@ pub fn prerequisite_missing_tool(check: &PrerequisiteCheck) -> Prompt<ToolChoice
             ));
         }
     }
-    Prompt::new(
+    prerequisite_prompt(
         format!(
             "{} is missing from the image {} runs in",
             check.prerequisite.label(),
@@ -730,7 +746,7 @@ pub fn prerequisite_missing_tool(check: &PrerequisiteCheck) -> Prompt<ToolChoice
 /// A gap no grant can fix: a missing remote, a detached HEAD, a pull request
 /// with no push before it.
 pub fn prerequisite_gap(check: &PrerequisiteCheck) -> Prompt<GapChoice> {
-    Prompt::new(
+    prerequisite_prompt(
         format!(
             "{}: {} will fail",
             check.prerequisite.label(),
@@ -750,7 +766,7 @@ pub fn prerequisite_gap(check: &PrerequisiteCheck) -> Prompt<GapChoice> {
 /// for its exact content hash. `default_on_dismiss` is `Some(Decline)`:
 /// walking away from an approval is a refusal.
 pub fn prerequisite_acquire_approval(review: &HostSecretCommandReview) -> Prompt<TrustDecision> {
-    Prompt::new(
+    prerequisite_prompt(
         "Approve this repository's GitHub token command?",
         format!(
             "⚠ awman will run this command ON YOUR HOST (not in a container):\n\n  {}\n\n\
@@ -1093,7 +1109,7 @@ mod wi0149_tests {
         ]);
         let identity = prerequisite_identity(&c);
         unique(&identity);
-        assert_eq!(identity.keys(), vec!['h', 'e', 'g', 'c']);
+        assert_eq!(identity.keys(), vec!['1', '2', '3', '4']);
         assert_eq!(identity.default_on_dismiss, Some(IdentityChoice::Continue));
         assert_eq!(identity.labels()[0], "Use host identity \"Ada <ada@x>\"");
         let persist = prerequisite_identity_persist("git config --local user.name Ada");
@@ -1112,7 +1128,7 @@ mod wi0149_tests {
         ]);
         let ssh = prerequisite_ssh(&c, "github.com:org/repo.git", Some(Path::new("/home/test")));
         unique(&ssh);
-        assert_eq!(ssh.keys(), vec!['1', 'a', 'w', 'n']);
+        assert_eq!(ssh.keys(), vec!['1', '2', '3', '4']);
         // The session's home shortens the key path; without one it is shown as is.
         assert!(
             ssh.labels()[0].contains("~/.ssh/id_ed25519"),
@@ -1127,6 +1143,7 @@ mod wi0149_tests {
         assert_eq!(ssh.default_on_dismiss, Some(SshChoice::Decline));
         let token = prerequisite_token_consent(&c, "GH_TOKEN");
         unique(&token);
+        assert_eq!(token.keys(), vec!['1', '2', '3']);
         assert_eq!(
             token.labels(),
             vec!["Yes, this run", "Yes, and remember for this repo", "No"]
@@ -1134,13 +1151,16 @@ mod wi0149_tests {
         assert_eq!(token.default_on_dismiss, Some(TokenConsent::Decline));
         let source = prerequisite_token_source(&c);
         unique(&source);
+        assert_eq!(source.keys(), vec!['1']);
         assert_eq!(source.default_on_dismiss, Some(TokenSourceChoice::Decline));
         assert_eq!(source.labels().last(), Some(&"Continue without a token"));
         let tool = prerequisite_missing_tool(&c);
         unique(&tool);
+        assert_eq!(tool.keys(), vec!['1', '2']);
         assert_eq!(tool.default_on_dismiss, Some(ToolChoice::Abort));
         let gap = prerequisite_gap(&c);
         unique(&gap);
+        assert_eq!(gap.keys(), vec!['1', '2']);
         assert_eq!(gap.default_on_dismiss, Some(GapChoice::Abort));
         let review = HostSecretCommandReview {
             label: "op".into(),
@@ -1167,8 +1187,7 @@ mod wi0149_tests {
 /// The body is not the table (each frontend draws the report its own way)
 /// but what happens next, so "Continue" is never a leap in the dark: who is
 /// asked what, and what an item left unresolved does to the run. Esc
-/// continues; Ctrl-C is an explicit abort, handled by the frontend's input
-/// transport.
+/// cancels; Enter continues to the questions.
 pub fn prerequisite_report(
     report: &crate::data::workflow_prerequisites::WorkflowPrerequisiteReport,
     next: PrerequisiteReportNext,
@@ -1197,10 +1216,7 @@ pub fn prerequisite_report(
         PrerequisiteReportNext::Decided => vec![Choice::new('c', "Continue", true)],
         PrerequisiteReportNext::Questions { .. } if attention.is_empty() => {
             body.push("Everything this workflow needs is available.".into());
-            vec![
-                Choice::new('c', "Start the workflow", true),
-                Choice::new('a', "Abort the run", false),
-            ]
+            vec![Choice::new('\n', "Start the workflow", true)]
         }
         PrerequisiteReportNext::Questions { unresolved } => {
             let count = attention.len();
@@ -1242,10 +1258,11 @@ pub fn prerequisite_report(
                      agent starts (workflows.prerequisites.unresolved is \"fail\")."
                     .to_string(),
             });
-            vec![
-                Choice::new('c', "Continue to the questions", true),
-                Choice::new('a', "Abort the run", false),
-            ]
+            vec![Choice::new(
+                '\n',
+                "Enter to configure missing prerequisites",
+                true,
+            )]
         }
     };
     let unknown = report
@@ -1266,7 +1283,7 @@ pub fn prerequisite_report(
         report.summary_line(),
         body.join("\n\n"),
         choices,
-        Some(true),
+        Some(!matches!(next, PrerequisiteReportNext::Questions { .. })),
     )
 }
 
@@ -1313,8 +1330,9 @@ mod prerequisite_report_tests {
         );
         assert_eq!(
             warn.labels(),
-            vec!["Continue to the questions", "Abort the run"]
+            vec!["Enter to configure missing prerequisites"]
         );
+        assert_eq!(warn.keys(), vec!['\n']);
         assert!(warn.body.contains("one at a time"), "{}", warn.body);
         assert!(warn.body.contains("does not stop the run"), "{}", warn.body);
         assert!(
@@ -1322,7 +1340,7 @@ mod prerequisite_report_tests {
             "{}",
             warn.body
         );
-        assert_eq!(warn.default_on_dismiss, Some(true));
+        assert_eq!(warn.default_on_dismiss, Some(false));
         let fail = prerequisite_report(
             &r,
             PrerequisiteReportNext::Questions {
@@ -1341,7 +1359,7 @@ mod prerequisite_report_tests {
                 unresolved: UnresolvedMode::Warn,
             },
         );
-        assert_eq!(start.labels(), vec!["Start the workflow", "Abort the run"]);
+        assert_eq!(start.labels(), vec!["Start the workflow"]);
         let check = prerequisite_report(
             &report(PrerequisiteStatus::Missing, PrerequisiteOrigin::AssumedAll),
             PrerequisiteReportNext::CheckOnly,

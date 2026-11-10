@@ -1,7 +1,7 @@
 //! The integration registry (WI 0142 Part A §4): the compiled-in list of
 //! integration descriptors (`name`, `detect(env, config) -> HostRequirement`,
 //! optional `setup`/`remove`/`status`, optional `HostPresenter`) and the source
-//! of hand-off policy. Rex (WI 0154) registers here; no integration-specific
+//! of hand-off policy. Rex (WI 0157) registers here; no integration-specific
 //! type appears in the protocol, the store or `src/data`.
 //!
 //! Layer 2. Presenters are Layer 3 adapters that implement the
@@ -117,7 +117,7 @@ pub struct IntegrationRegistry {
 }
 
 impl IntegrationRegistry {
-    /// Empty in 0142; 0154 adds Rex here.
+    /// Empty in 0142; 0157 adds Rex here.
     pub fn compiled_in() -> Arc<Self> {
         Self::with(Vec::new())
     }

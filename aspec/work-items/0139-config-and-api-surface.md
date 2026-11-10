@@ -117,8 +117,8 @@ keep the surface consistent without reviewing naming by hand.
   "overlays": [],                              // additive
   "workItems": {
     "dir": "aspec/work-items", "template": null,   // the work_items.* alias is removed
-    "source": null,                                // 0148: null (files) | github | <provider name>
-    "providers": { "tracker": { "baseUrl": "https://…", "tokenEnv": "TRACKER_TOKEN" } }   // 0148: global scope, keyed by name
+    "source": null,                                // 0147: null (files) | github | <provider name>
+    "providers": { "tracker": { "baseUrl": "https://…", "tokenEnv": "TRACKER_TOKEN" } }   // 0147: global scope, keyed by name
   },
   "workflows": {
     "maxConcurrentSteps": null,                // enforced cap (was maxConcurrentAgents); the leader prompt gets the same number

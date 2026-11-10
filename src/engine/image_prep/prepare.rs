@@ -340,6 +340,11 @@ impl AgentImagePreparer {
                 Ok(image_result)
             }
             Err(e) => {
+                if matches!(e, EngineError::AppleImageContentMissing { .. }) {
+                    image_result.import_failure = Some(
+                        crate::data::ready_image::ReadyImageImportFailure::AppleContentMissing,
+                    );
+                }
                 let text = e.to_string();
                 image_result.import = StepStatus::Failed(text.clone());
 

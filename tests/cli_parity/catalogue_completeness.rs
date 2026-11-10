@@ -168,7 +168,7 @@ fn daemon_start_settings_are_config_not_flags() {
     }
 }
 
-// ─── session worktree selectors (WI 0153) ────────────────────────────────────
+// ─── session worktree selectors (WI 0151) ────────────────────────────────────
 
 #[test]
 fn chat_and_exec_prompt_expose_branch_pr_and_worktree_as_optional_strings() {

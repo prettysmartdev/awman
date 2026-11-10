@@ -180,7 +180,7 @@ pub enum UiRequest {
     },
     FocusWork {
         target_id: String,
-    }, // task_… | cmd_… | lease_… (0155)
+    }, // task_… | cmd_… | lease_… (0158)
 }
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UiOutcome {

@@ -502,7 +502,9 @@ fn peer_errors_are_classified_and_sanitized() {
         "no image at /Users/x/private\u{7}".into(),
     ));
     match err {
-        EngineError::Config(m) => assert!(!m.contains('\u{7}'), "{m}"),
+        EngineError::AppleImageStoreFailed { message, .. } => {
+            assert!(!message.contains('\u{7}'), "{message}")
+        }
         other => panic!("{other:?}"),
     }
     assert!(matches!(
@@ -513,6 +515,26 @@ fn peer_errors_are_classified_and_sanitized() {
         export_error(Save::Error("interrupted", "restart".into())),
         EngineError::Network(_)
     ));
+}
+
+#[test]
+fn missing_apple_content_names_the_source_repair() {
+    let err = export_error(Save::Error(
+        "notFound",
+        format!("content with digest {}", digest('a')),
+    ));
+    match err {
+        EngineError::AppleImageContentMissing {
+            reference,
+            platform,
+            detail,
+        } => {
+            assert_eq!(reference, "awman-x-claude:latest");
+            assert_eq!(platform, "linux/arm64");
+            assert!(detail.contains(&digest('a')));
+        }
+        other => panic!("{other:?}"),
+    }
 }
 
 #[test]

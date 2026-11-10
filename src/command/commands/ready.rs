@@ -427,6 +427,7 @@ mod compat_tests {
             reference: Some("awman-repo-claude:latest".into()),
             build,
             import,
+            import_failure: None,
             warnings: Vec::new(),
             optional: false,
         }

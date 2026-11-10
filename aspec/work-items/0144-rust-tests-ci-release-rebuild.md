@@ -1,19 +1,29 @@
 # Work Item: Task
 
-Title: Rebuild awman's test, CI, and release system around fast feedback and promoted artifacts
+Title: Rewrite the entire Rust test suite and rebuild CI and releases around trustworthy evidence
 Issue: issuelink
 
 Depends on: 0143 (completed daemon block).
 
 ## Summary:
 
-- Redesign the full path from a developer edit to a published release. The current Apple Silicon prerelease takes **40+ minutes on a high-end Mac Studio** (reported during v0.13), and the v0.13 release required a day of trial and error. The goal is a simpler, measured pipeline with short feedback loops, deterministic tests, credible hardware evidence, and one release candidate per target that is tested and then promoted.
+- **Rewrite the project's Rust tests from the ground up, across the entire workspace.** Treat the existing inline unit tests, integration and end-to-end suites, test helpers, fixtures, harnesses, and test registration as material to audit, not an architecture to preserve. Specify the behavior each area must prove, design a coherent new suite, then replace or deliberately retire the old tests with traceable coverage. This is a repository-wide test redesign, not a CI/release cleanup or a speed pass over the present suite.
+- Redesign the full path from a developer edit to a published release around that new suite. The current Apple Silicon prerelease takes **40+ minutes on a high-end Mac Studio** (reported during v0.13), and the v0.13 release required a day of trial and error. The goal is trustworthy coverage and clear failure evidence, with simpler measured feedback loops and one release candidate per target that is tested and then promoted. Speed targets must not narrow the test rewrite or its behavioral coverage.
 - Reassess every test and release layer across the repository. The November 2026 release is one case study in a longer history of hangs, platform failures, false-green skips, cache problems, and process races. Replace the test topology, fixture model, job graph, and release state machine where they create serial work, hide missing coverage, or allow unrelated tests to interfere.
 - Preserve the real safety requirements: untrusted code cannot access a privileged Mac; a required hardware check cannot silently skip; the signed Apple Silicon executable must actually boot; old-to-new state compatibility must be checked; and publication must require every declared release gate.
 
 ## User Stories
 
 ### User Story 1:
+As a: maintainer
+
+I want to:
+replace the entire Rust test suite with a documented, behavior-driven test architecture that covers every shipped subsystem and supported mode
+
+So I can:
+trust that a green result means the product contracts were exercised, and extend the suite without copying brittle legacy tests.
+
+### User Story 2:
 As a: developer
 
 I want to:
@@ -22,7 +32,7 @@ get a trustworthy result for my change in minutes, with a direct link to the fai
 So I can:
 fix defects without waiting for several full builds or rerunning unrelated suites.
 
-### User Story 2:
+### User Story 3:
 As a: release operator
 
 I want to:
@@ -31,7 +41,7 @@ validate a candidate once, see which exact artifacts passed, and promote those s
 So I can:
 ship without a day of repeated prerelease runs, runner cleanup, and post-tag surprises.
 
-### User Story 3:
+### User Story 4:
 As a: maintainer
 
 I want to:
@@ -44,7 +54,7 @@ improve the critical path and prevent flakes from becoming routine.
 
 ### Repository-wide scope and failure classes
 
-This work item covers the Rust library and CLI (`src/`, `crates/`), all registered and unregistered tests (`tests/` and inline unit tests), shell checks and fixtures (`tools/`, including payload, OCI, and architecture checks), `templates/`, Cargo/toolchain/build configuration, `Makefile`, release scripts, both Actions workflows, runner setup, cache/artifact storage, branch protection, and the developer/release documentation. Inventory historical failures across the whole repository, not only the v0.13 commits; confirm each class against CI logs during phase 0.
+This work item covers the Rust library and CLI (`src/`, `crates/`), **every** registered and unregistered Rust test (`tests/`, `crates/**/tests/`, inline `#[cfg(test)]`, doctests, and feature/platform-gated tests), their shared helpers and fixtures, shell checks and fixtures (`tools/`, including payload, OCI, and architecture checks), `templates/`, Cargo/toolchain/build configuration, `Makefile`, release scripts, both Actions workflows, runner setup, cache/artifact storage, branch protection, and the developer/release documentation. Inventory historical failures across the whole repository, not only the v0.13 commits; confirm each class against CI logs during phase 0. The Rust rewrite is a first-class deliverable with its own design and acceptance evidence, independent of whether the CI and release pipeline improvements land.
 
 | Failure class | Repository evidence | Redesign requirement |
 |---|---|---|
@@ -88,13 +98,32 @@ The 40+ minute figure is a user-observed baseline, not a benchmark produced by t
 - Write a versioned gate manifest with stable identifiers, required test/scenario names or selectors, supported platforms, and `pass`/`fail`/`blocked`/`skip` semantics. Generate or validate CI job names, prerelease requirements, local commands, and documentation against it. A required gate that is missing, skipped, or inconclusive fails closed.
 - Establish initial service-level targets from the baseline. Aim for **under 10 minutes p95 for the required PR path** and **under 20 minutes p95 warm for the Apple Silicon candidate gate**, while retaining a separate cold-run target and full-suite budget. If baseline data shows these are infeasible, document the limiting cost and a staged, numeric reduction plan; do not lower coverage to manufacture a faster result.
 
-### 1. Rebuild the test architecture
+### 1. Rewrite the complete Rust test suite from the ground up
+
+The test rewrite is required even if the current tests can be made fast or green by changing CI. It covers all Rust packages, features, targets, and supported platforms, including inline unit tests and every integration/end-to-end target. Start with a **behavior and risk inventory**, not a mechanical move of the current test files. For every existing test and every public/product contract, record the subsystem, behavior or failure it protects, current owner, tier, platform/feature prerequisites, and disposition: rewrite, replace with a stronger contract/property/scenario test, merge into an equivalent test, or retire with a written reason. Track old-to-new coverage in a reviewable matrix; the count of new tests is not a proxy for coverage. Existing test names, helpers, fixtures, assertion style, and file layout are not compatibility requirements.
+
+The new suite must explicitly cover, at minimum:
+
+| Contract area | Required test design |
+|---|---|
+| Layer 0 data and configuration | Parsing, validation, defaults, precedence, migration, persistence and corruption recovery, path and identity rules, serialization compatibility, secrets/redaction, and boundary values. |
+| Layer 1 engines and transports | Git, container/sandbox/builtin runtimes, image/OCI handling, networking, authentication/credentials, process and terminal lifecycle, streams, clocks, retries, cancellation, cleanup, and resource limits; shared conformance tests for exchangeable implementations. |
+| Layer 2 commands and workflows | Catalogue completeness, authorization/admission, session and work-item behavior, state transitions, workflow planning/execution/recovery, concurrency and idempotency, failure classification, and every supported command's observable contract. |
+| Layer 3 frontends and protocol | CLI/TUI/API command parity where available, parsing and output/error shape, frontend handoff, terminal/dialog/event behavior, client disconnect/reconnect, and accessibility of failures through each presentation path. |
+| Cross-component and external boundaries | Real Git, Docker, Apple Containers, sandbox, network/registry, daemon/API, process groups, guest boot, upgrade/state compatibility, artifact verification, and supported OS/architecture combinations, with hermetic contract tests alongside bounded real-boundary proof. |
+| Security and hostile inputs | Credential and environment isolation, filesystem/mount boundaries, untrusted work items and repository content, malformed protocol messages, stale or mismatched artifacts, privilege boundaries, and failure cleanup. |
+
+- Publish a test architecture document inside this work item or `aspec/devops/` that defines suite ownership, naming, fixture APIs, test data builders, assertion/evidence conventions, tier selection, and the exact contract for each platform/feature. Design tests around externally observable behavior and stable layer contracts; internal helpers receive focused unit tests where they own decisions. Avoid duplicate tests that only restate implementation branches, but retain the distinctive cases and historical regressions they protected.
+- Replace shared test helpers and fixture construction as part of the rewrite. Provide deterministic builders for repositories, configs, image manifests, servers, daemons, clocks, credentials, guest state, and failure injection. Every fixture has an explicit owner and lifecycle. Ban hidden reliance on a developer's HOME, global Git config, host daemon, wall-clock delay, ambient network, prior test order, or writable shared target path in hermetic tiers.
+- Rebuild tests in domain slices, with each slice landing its new tests and a reviewed old-to-new coverage map before deleting its legacy tests. The full existing suite remains runnable during the transition; after the new suite proves the mapped contracts, remove the superseded test modules, dead helpers, redundant fixtures, and manual registration. No old test remains solely because it predates the rewrite, and no old test disappears solely because it is slow or flaky.
+- Give each domain a deliberate mix of example, boundary, negative, property/model, state-machine, and fault-injection tests as appropriate. Test failure outcomes and cleanup as rigorously as success paths. Include multi-step and concurrent behavior for workflows, session ownership, streams, and runtime lifecycles; retain explicit regression cases for every known escaped bug and historical failure class. Set deterministic seeds and shrink/reproduction output for generated cases.
+- Define an acceptance matrix by subsystem × mode × runtime × platform × feature, with explicit `covered`, `not applicable`, or `blocked` evidence. Required cells must have named tests and a gate; a broad aggregate test count cannot substitute for missing cells. Review public APIs, command catalogue, documented workflows, shipped templates, and release targets against the matrix. New code paths must update the matrix and test plan before this item closes.
 
 - Define tiers by purpose: (a) pure unit/contract and CLI parse checks on every edit; (b) hermetic component tests with owned fake services and deterministic clocks; (c) bounded integration tests for real Git, Docker, network, API, and process behavior on PR; (d) a small native guest smoke for candidate and selected main changes; (e) full guest, upgrade, fault, pressure, and long-running compatibility suites on a schedule and before promotion when their release contract requires them. Name/select tiers explicitly rather than by substrings in test function names.
 - Remove cross-test coupling. Each test gets its own HOME, temp root, daemon/process group, ports, images, and VM namespace or unique binary/owner identity. Make fixture creation atomic and immutable after publication; enforce cleanup for crashes and timeouts. Process-global `PATH`/env edits, inherited file descriptors, and writable binaries must not be shared across concurrent tests. Use readiness signals and virtual/deterministic clocks rather than arbitrary sleeps for protocol assertions.
 - Split or group test binaries around ownership and dependency weight so the builtin VM stack is linked only where needed. Build test executables once per target/profile, then run selected suites from those executables. Evaluate a runner such as cargo-nextest for per-test timing, partitioning, process isolation, and structured output, but retain libtest or custom harnesses where guest lifecycle and resource limits require it. Run hardware tests with an explicit VM concurrency budget; parallelize only independent scenarios.
 - Generate pinned, content-addressed OCI fixtures and previous-release binaries outside the hot path, then verify their digests and provenance when used. Rebuild them when their inputs change or for a dedicated reproducibility audit. Keep a controlled clean-build gate for supply-chain confidence, but do not make every native test pay for a fresh registry and target cache.
-- Rework the suite based on observable behavior: consolidate repeated end-to-end variants into contract/property tests plus a smaller scenario matrix; keep one real integration proof per critical boundary and one real guest proof for each released runtime contract. Remove tests that assert incidental timing or implementation order. Preserve/strengthen coverage for failures found in the v0.13 timeline, including forked locks, concurrent subprocesses, API server isolation, VM ownership, guest fixture availability, and event handoff.
+- Rework the suite based on observable behavior: consolidate repeated end-to-end variants into contract/property tests plus a purposeful scenario matrix; require real integration and guest proof for each critical boundary and released runtime contract, with additional cases where distinct risks require them. Remove tests that assert incidental timing or implementation order. Preserve/strengthen coverage for failures found in the v0.13 timeline, including forked locks, concurrent subprocesses, API server isolation, VM ownership, guest fixture availability, and event handoff.
 - Validate coverage discovery itself: a new Rust integration target, shell check, runtime, or release target must enter an explicit inventory and receive a gate decision. Test-only `return` paths and `#[ignore]` cases must produce machine-readable skip reasons; a required suite passes only when its expected scenarios actually executed. Include crash, cancellation, timeout, and resource-exhaustion behavior for daemons, subprocesses, OCI sources, and guests in the appropriate tier.
 - A failing test records seed, test ID, target, toolchain, fixture digests, logs, relevant process/VM IDs, and a one-command local reproduction. Retries may classify transient infrastructure setup/runner faults, but a product-test failure must remain visible and fail the gate. Track flaky tests with owner, issue, expiry, and rate; do not let quarantine silently turn required coverage green.
 
@@ -116,7 +145,7 @@ The 40+ minute figure is a user-observed baseline, not a benchmark produced by t
 
 ### 4. Migrate with evidence
 
-- Land instrumentation and manifest validation first. Run the new tiers in shadow mode beside the existing gates for a bounded period; compare test inventory, detected failures, and artifact hashes. Then switch branch protection and release promotion to the new summary gate. Remove legacy duplicate jobs, scripts, caches, and stale documentation after parity is demonstrated.
+- Land instrumentation and manifest validation first. Run each rewritten Rust domain slice in shadow mode beside its existing coverage for a bounded period; compare behavior/risk matrix cells, discovered defects, failure diagnostics, skip counts, and platform results before removing old tests. Run the new tiers beside existing gates; compare test inventory, detected failures, and artifact hashes. Then switch branch protection and release promotion to the new summary gate. Remove legacy duplicate jobs, scripts, caches, and stale documentation after parity is demonstrated.
 - Include a rollback path for the CI configuration and release process during cutover. Retain the ability to run the old full test command manually until the new suite demonstrates equivalent coverage; remove it from the normal critical path once the explicit gate contract is proven.
 
 ## Edge Case Considerations:
@@ -129,11 +158,14 @@ The 40+ minute figure is a user-observed baseline, not a benchmark produced by t
 
 ## Test Considerations:
 
+- **Rust rewrite acceptance:** every Rust test target and inline test group has a recorded disposition; all applicable cells in the subsystem × mode × runtime × platform × feature matrix have named passing tests or a documented, explicitly blocked release gate; all historical regression behaviors remain covered. Reviewers can trace an old test or a product contract to the new test and its gate. The suite is genuinely rewritten, including fixtures and harnesses, rather than relabeled, reordered, or left mostly intact behind new CI selectors.
+- Exercise the rewritten suite on every supported platform and feature configuration. Show test discovery counts and scenario-level results, including skips and prerequisites, for local fast, full hermetic, real-boundary, native guest, and release tiers. Deliberately introduce representative product defects in each layer and confirm the appropriate test fails; deliberately omit a required test target and confirm the manifest detects it.
+- Confirm repeatability with seeded reruns, randomized test order, concurrent load where supported, and fault injection. Check that a test failure leaves no orphan process, port, guest, image, credential, or persistent host-state change. Collect reproducible evidence for any residual flake and fix or explicitly quarantine it with an expiring owner and non-green required gate.
 - Validate the gate manifest against test discovery and workflow configuration; deliberately remove/rename a required job or test and verify the summary gate fails closed.
 - Exercise each failure class in the repository-wide table with controlled faults: unavailable service, stale/wrong fixture, cache mismatch, leaked subprocess, occupied port, slow runner, platform-specific build failure, missing test registration, skipped required hardware, and interrupted release. Verify the correct gate fails or blocks with a usable diagnostic and retained evidence.
 - Prove per-test isolation by running the previously flaky API, Docker fake, lock, subprocess, daemon, and VM-owner scenarios repeatedly under parallel load, then reproduce each from saved evidence. Avoid fixed sleeps or blanket retries as the success criterion.
 - Verify warm and cold runs, cache invalidation, cancellation, hardware unavailability, fixture drift, old-version artifact retrieval, failed candidate rerun, and interrupted promotion. Compare produced and published SHA-256 values for every target, including the signed Mac binary, and boot the published Mac bytes.
-- Report baseline and post-migration p50/p95 times, runner queue time, per-tier failure/flake rate, rebuild counts, cache hit rate, and manual interventions. Accept the migration only when required coverage is preserved, no stale evidence can satisfy a gate, and measured critical-path time materially improves against the v0.13 baseline.
+- Report baseline and post-migration p50/p95 times, runner queue time, per-tier failure/flake rate, rebuild counts, cache hit rate, and manual interventions. Accept the migration only when the full Rust rewrite and coverage matrix are complete, required coverage is preserved or strengthened, no stale evidence can satisfy a gate, and measured critical-path time materially improves against the v0.13 baseline.
 - Assert from build logs that a candidate's optimized executable is built once per target and its digest is unchanged through testing and publication; record any separate test-binary build and clean reproducibility audit explicitly. A prerelease run must not repeat the entire default suite already proved for the same commit and gate version.
 
 ## Codebase Integration:

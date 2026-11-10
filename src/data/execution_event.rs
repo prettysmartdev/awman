@@ -495,7 +495,7 @@ pub enum EventPayload {
         annotations: crate::data::terminal::Annotations,
     },
     /// A local attach subscription ended (WI 0141); published by the engine
-    /// to host presenters (0142, 0154).
+    /// to host presenters (0142, 0157).
     #[serde(alias = "terminal_viewer_detached")]
     TerminalViewerDetached {
         terminal_id: crate::data::ids::TerminalId,

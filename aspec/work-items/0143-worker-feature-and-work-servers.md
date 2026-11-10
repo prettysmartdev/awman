@@ -29,7 +29,7 @@ The 0139–0143 block is one release gate. This item closes it only when the dae
 
   A push client and a work server see the same states and the same result shape.
 - **Node affinity.** Each pulled item may carry label selectors, and the server offers it only to workers whose labels match. Labels the worker reports about itself (OS, agents, GPU) are kept apart from labels the server assigns (who owns the worker, which team it serves), so an item can be pinned to one person's machine.
-- Define the **Work Server Protocol (WSP) v1**: plain HTTPS+JSON, worker-initiated only, and generic. It follows 0139's wire rules: `snake_case` fields, `{items, next_cursor}` lists, `{error, code}` errors, `_ms` durations, `_at` timestamps and `awman/` label prefixes. infact is one implementation and the GitHub issues reference server (0145) is another. Anyone can write their own.
+- Define the **Work Server Protocol (WSP) v1**: plain HTTPS+JSON, worker-initiated only, and generic. It follows 0139's wire rules: `snake_case` fields, `{items, next_cursor}` lists, `{error, code}` errors, `_ms` durations, `_at` timestamps and `awman/` label prefixes. infact is one implementation and the GitHub issues reference server (0153) is another. Anyone can write their own.
 
 ## User Stories
 
@@ -180,7 +180,7 @@ take work without the TUI
       "dynamic": true, "leader": "claude::claude-opus-5-5",   // workflow kind
       "workflow_toml": null,                                   // or an inline workflow (file mode)
       "agent": "claude", "model": null,                        // prompt kind
-      "read_only": false,                                      // lease minimum here; 0153 generalizes
+      "read_only": false,                                      // lease minimum here; 0152 generalizes
       "overlays": [], "interaction": "interactive" | "headless" | null,
       "yolo": true,                                            // false: step dialogs wait for a person (manual picks)
       "timeout_ms": 7200000
@@ -203,16 +203,16 @@ take work without the TUI
 
 ### Running a lease
 - The worker runs each lease in a fresh clone at `<workRoot>/leases/<lease_id>/`, using 0133's remote-session machinery:
-  1. clone `repo.url` with the lease's credentials, through a one-shot credential helper, never in the URL or argv; this lease minimum ships here, before 0147 extends the helper to push sessions;
+  1. clone `repo.url` with the lease's credentials, through a one-shot credential helper, never in the URL or argv; this lease minimum ships here, before 0145 extends the helper to push sessions;
   2. check out `branch` from `base_ref` and merge `merge_refs`;
-  3. run `exec workflow --dynamic`, with the work item passed in as `body` through a private temporary inline source (no file is committed), or `exec prompt`; 0148 later exposes the generalized inline source to push clients and CLI;
+  3. run `exec workflow --dynamic`, with the work item passed in as `body` through a private temporary inline source (no file is committed), or `exec prompt`; 0147 later exposes the generalized inline source to push clients and CLI;
   4. push `push.branch` on success;
   5. post the result;
   6. delete the clone.
-- **Lease-side minimum before the gate closes.** `repo.credentials`, `body`, and `exec.read_only` are executable contracts in this item. The shared host Git transport builder used for clone, setup fetches, merge-ref and push-back `ls-remote`, and push applies the same Git configuration and lease credential helper to every operation, with no system gitconfig; WI0163 verifies and repairs push-session parity. A private owner-only temp source carries `body` into the run. `exec.read_only` mounts the workspace read-only on every runtime used for leases, with writable scratch/agent home; 0153 exposes the general CLI and push-session option. If a runtime cannot enforce it, release the lease as `ineligible` and omit `lease_read_only` when registering for that runtime. Unsupported credential, inline-body, output, or execution requirements likewise fail closed before work starts, with `release(ineligible)`; do not ignore fields. Advertise `lease_credentials`, `lease_inline_work_item`, and `lease_read_only` in status and WSP registration only after their paths work.
-- **Lease push reliability.** Retry only failures before a remote response with short bounded backoff, record each retry in the event stream, recognize an already-published `head` as success, and cancel during backoff. Bound the retry window by heartbeat and lease expiry; if the lease cannot remain valid, release or report the distinct `push_unreachable` failure, never continue on an expired epoch. Lease Git authentication failures use `failure.stage: "git_auth"` and `failure.code: "git_auth_failed"`; authentication and remote refusals are not retried. Advertise `lease_git_auth_failure` and `lease_push_retry` in status and WSP registration when they work; WI0163 applies the auth classification to pushed sessions and WI0164 extends and audits the retry policy there.
+- **Lease-side minimum before the gate closes.** `repo.credentials`, `body`, and `exec.read_only` are executable contracts in this item. The shared host Git transport builder used for clone, setup fetches, merge-ref and push-back `ls-remote`, and push applies the same Git configuration and lease credential helper to every operation, with no system gitconfig; WI0145 verifies and repairs push-session parity. A private owner-only temp source carries `body` into the run. `exec.read_only` mounts the workspace read-only on every runtime used for leases, with writable scratch/agent home; 0152 exposes the general CLI and push-session option. If a runtime cannot enforce it, release the lease as `ineligible` and omit `lease_read_only` when registering for that runtime. Unsupported credential, inline-body, output, or execution requirements likewise fail closed before work starts, with `release(ineligible)`; do not ignore fields. Advertise `lease_credentials`, `lease_inline_work_item`, and `lease_read_only` in status and WSP registration only after their paths work.
+- **Lease push reliability.** Retry only failures before a remote response with short bounded backoff, record each retry in the event stream, recognize an already-published `head` as success, and cancel during backoff. Bound the retry window by heartbeat and lease expiry; if the lease cannot remain valid, release or report the distinct `push_unreachable` failure, never continue on an expired epoch. Lease Git authentication failures use `failure.stage: "git_auth"` and `failure.code: "git_auth_failed"`; authentication and remote refusals are not retried. Advertise `lease_git_auth_failure` and `lease_push_retry` in status and WSP registration when they work; WI0145 applies the auth classification and extends and audits the retry policy for pushed sessions.
 - **Interaction.** The run gets `daemon.features.worker.pull.interaction` (0141), or the server entry's `interaction`, unless `exec.interaction` overrides it and `allowOverride` permits it.
-- **Uninitialised pulled clones.** During pull-lease workspace preparation, if a first-party agent the run needs has no `.awman/Dockerfile.<agent>`, Layer 2 invokes the existing `provision_agent_dockerfile` behavior with headless defaults inside that disposable clone, before dynamic preflight; Layer 0 performs the file write. It does not push the generated file unless the item asks to. Custom agents and local/push sessions with missing Dockerfiles fail preflight before the leader runs, naming the missing agent and `awman init --agent <name>` remedy. WI0152 makes that explicit init command available to API clients; no later item is required for pull leases to work.
+- **Uninitialised pulled clones.** During pull-lease workspace preparation, if a first-party agent the run needs has no `.awman/Dockerfile.<agent>`, Layer 2 invokes the existing `provision_agent_dockerfile` behavior with headless defaults inside that disposable clone, before dynamic preflight; Layer 0 performs the file write. It does not push the generated file unless the item asks to. Custom agents and local/push sessions with missing Dockerfiles fail preflight before the leader runs, naming the missing agent and `awman init --agent <name>` remedy. WI0148 makes that explicit init command available to API clients; no later item is required for pull leases to work.
 - **Capacity.** A worker claims while all of these have room:
   - `running < workServers.<name>.maxConcurrentJobs`;
   - the worker feature's share, `daemon.features.worker.maxConcurrentJobs`;
@@ -254,7 +254,7 @@ take work without the TUI
 - Push and pull at once under load: both draw on `daemon.features.worker.maxConcurrentJobs`. The executor alternates between pushed and pulled jobs, so a long push queue cannot stop a worker from honouring leases it has already claimed, and vice versa.
 
 ## Test Considerations:
-- **Protocol conformance suite** in a new crate, `awman-wsp`, shared by awman, the reference server (0145) and third parties. It holds the types, a mock server and a mock worker, and covers:
+- **Protocol conformance suite** in a new crate, `awman-wsp`, shared by awman, the reference server (0153) and third parties. It holds the types, a mock server and a mock worker, and covers:
   - linking and register;
   - queue filtering by affinity (`In`, `NotIn`, `Exists`, `DoesNotExist`, required plus preferred ordering);
   - claim races;

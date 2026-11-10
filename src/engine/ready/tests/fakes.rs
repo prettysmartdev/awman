@@ -218,6 +218,7 @@ pub(crate) struct FakeImportRuntime {
     /// Number of upcoming `import_image` calls that must fail (counts
     /// down), for "build succeeded, import failed" scenarios.
     pub(crate) fail_next_imports: std::sync::atomic::AtomicUsize,
+    pub(crate) fail_next_apple_content: std::sync::atomic::AtomicBool,
     /// When set, every `import_image` records how many build-lock files under
     /// this directory are held by someone else at that moment.
     pub(crate) lock_probe_dir: std::sync::Mutex<Option<std::path::PathBuf>>,
@@ -242,6 +243,7 @@ impl FakeImportRuntime {
             cancel_observed: std::sync::atomic::AtomicBool::new(false),
             digest_override: std::sync::Mutex::new(None),
             fail_next_imports: std::sync::atomic::AtomicUsize::new(0),
+            fail_next_apple_content: std::sync::atomic::AtomicBool::new(false),
             lock_probe_dir: std::sync::Mutex::new(None),
             locks_held_at_import: std::sync::Mutex::new(Vec::new()),
         }
@@ -257,6 +259,11 @@ impl FakeImportRuntime {
     pub(crate) fn fail_next_import(&self, n: usize) {
         self.fail_next_imports
             .store(n, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub(crate) fn fail_next_apple_content(&self) {
+        self.fail_next_apple_content
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -405,6 +412,16 @@ impl crate::engine::agent_runtime::AgentRuntimeEngine for FakeImportRuntime {
         _sink: &mut dyn crate::data::message::UserMessageSink,
     ) -> Result<crate::engine::agent_runtime::ImportedImage, EngineError> {
         self.imports.lock().unwrap().push(request.clone());
+        if self
+            .fail_next_apple_content
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(EngineError::AppleImageContentMissing {
+                reference: request.tag.clone(),
+                platform: request.platform.to_string(),
+                detail: "content with digest sha256:missing".into(),
+            });
+        }
         if let Some(dir) = self.lock_probe_dir.lock().unwrap().clone() {
             let held = held_lock_files(&dir);
             self.locks_held_at_import.lock().unwrap().push(held);

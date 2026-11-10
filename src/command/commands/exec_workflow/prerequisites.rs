@@ -57,7 +57,7 @@ impl ExecWorkflowCommand {
     ) -> Result<PrerequisiteStart, CommandError> {
         let flow = self.prerequisite_flow(needs.origin);
         if self.flags.prerequisites.check_only {
-            let report = flow.preflight(needs, false);
+            let report = frontend.with(|f| flow.preflight_with_messages(needs, false, f));
             frontend.with(|f| {
                 f.show_workflow_prerequisites(&report, PrerequisiteReportNext::CheckOnly)
             })?;

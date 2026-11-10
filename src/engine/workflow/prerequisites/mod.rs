@@ -149,6 +149,15 @@ impl PrerequisitePreflight {
     /// would wait for a hung injected source after its timeout had elapsed.
     /// Host-secret and container sources also enforce process-level timeouts.
     pub fn run(&self) -> WorkflowPrerequisiteReport {
+        self.run_with_progress(&mut |_, _| {})
+    }
+
+    /// Report each probe as it starts and finishes. Callers must publish only
+    /// prerequisite labels and statuses; check explanations may need redaction.
+    pub fn run_with_progress(
+        &self,
+        progress: &mut dyn FnMut(&WorkflowPrerequisite, Option<&[PrerequisiteCheck]>),
+    ) -> WorkflowPrerequisiteReport {
         let mut report = WorkflowPrerequisiteReport {
             phase: self.options.phase,
             origin: self.options.prerequisites.origin,
@@ -177,10 +186,15 @@ impl PrerequisitePreflight {
                     )
                 })
                 .collect();
+            for check in &report.checks {
+                progress(&check.prerequisite, None);
+                progress(&check.prerequisite, Some(std::slice::from_ref(check)));
+            }
             return Self::redact_report(report, &redaction);
         }
         let mut pending = Vec::new();
         for need in &self.options.prerequisites.needs {
+            progress(&need.prerequisite, None);
             let worker = self.clone();
             let need = need.clone();
             let fallback = need.clone();
@@ -198,15 +212,21 @@ impl PrerequisitePreflight {
         let budget = self.options.probe_budget.min(PROBE_BUDGET);
         for (need, started, spawned, rx) in pending {
             let remaining = budget.saturating_sub(started.elapsed());
-            match rx.recv_timeout(remaining) {
-                Ok((finished, checks)) if finished.duration_since(started) <= budget => report.checks.extend(checks),
-                _ => report.checks.push(Self::check(
-                    &need, PrerequisiteStatus::Unknown,
-                    if spawned { "probe timed out or unavailable; retry --check-prerequisites before running the workflow" }
-                    else { "probe could not start; retry --check-prerequisites" },
+            let checks = match rx.recv_timeout(remaining) {
+                Ok((finished, checks)) if finished.duration_since(started) <= budget => checks,
+                _ => vec![Self::check(
+                    &need,
+                    PrerequisiteStatus::Unknown,
+                    if spawned {
+                        "probe timed out or unavailable; retry --check-prerequisites before running the workflow"
+                    } else {
+                        "probe could not start; retry --check-prerequisites"
+                    },
                     vec![],
-                )),
-            }
+                )],
+            };
+            progress(&need.prerequisite, Some(&checks));
+            report.checks.extend(checks);
         }
         // Several SSH destinations can add the same tool check. Keep one row
         // and retain all affected steps for the consent layer.

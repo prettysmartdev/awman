@@ -1,18 +1,20 @@
-# Client gaps in awman's daemon plan (0139–0158)
+# Client gaps in awman's daemon plan (November 2026 draft)
 
 **For:** an awman agent amending awman's active work items and drafting new ones.
 **Checked against:** awman `main` at `a12db80a` ("re-work WI 139 onwards", 2026-11-05).
+
+Active work-item references below use the current numbering; the code observations remain dated to the checked commit. B1, B2 and per-session secrets are now in 0145; B3 is in 0146.
 **From:** infact. infact is an API and work-server client of awman, and it tracks `main` with no fallback for older builds.
 
 ## How to use this document
 
 - **Part A** asks for amendments to items that are already active. Each one is a gap that any push client or work server would hit, not only infact.
-- **Part B** summarises three problems that have no work item yet. Draft a work item for each in awman's own template and numbering. The summaries describe the problem, the evidence and the outcome a client needs. Implementation hints are suggestions; choose the design that fits awman.
+- **Part B** records three gaps originally proposed as separate work items. Their current homes are noted above; the summaries preserve the original client evidence and requested outcomes.
 - **Part C** lists smaller corrections.
 
 Ground rules:
 
-- **Keep awman generic.** infact is named only as the client that found each problem. Don't add fields, routes or behaviour that make sense only for infact. Every addition should be useful to any API client, work server or the GitHub reference server (0145).
+- **Keep awman generic.** infact is named only as the client that found each problem. Don't add fields, routes or behaviour that make sense only for infact. Every addition should be useful to any API client, work server or the GitHub reference server (0153).
 - **Follow 0139.** Use its naming rules, route ownership, `{items, next_cursor}` lists, `{error, code}` errors and `_ms`/`_at` fields.
 - **No compatibility layers.** Clients like infact will move to the new surface, so don't add aliases for their sake.
 - **Prefer extending existing items** when a gap fits inside one (most of Part A).
@@ -30,7 +32,7 @@ Ground rules:
 
 - every client that checks capabilities breaks;
 - the "advertise each addition" rule has nowhere to live;
-- none of the later items (0146 context, 0147 credentials, 0148 inline work items, 0151 read-only, 0152 init) names the flag a client should check.
+- none of the later items (0146 context, 0145 credentials, 0147 inline work items, 0152 read-only, 0148 init) names the flag a client should check.
 
 **Ask.**
 
@@ -40,15 +42,15 @@ Ground rules:
 - Use the same vocabulary for the WSP `register` `features` list (0143), so a work server and a push client test the same names.
 - The earlier request to advertise `remote_dynamic`, `workdir_roots` and `event_ids` is covered by whatever baseline you choose. Those three are still missing from `API_FEATURES`.
 
-### A2. Pull leases depend on items scheduled after the gate (0143 vs 0147, 0148, 0151)
+### A2. Pull leases depend on items scheduled after the gate (0143 vs 0145, 0147, 0152)
 
 **Problem.** 0143 closes the daemon gate, but its lease runner cites features that are specified in later items:
 
-- **Credentials:** the lease clones "through a one-shot credential helper, never in the URL or argv (0147)".
-- **Work item body:** `body` is passed "as the 0148 inline source, so no file is committed".
-- **Read-only:** `exec.read_only` refers to 0151.
+- **Credentials:** the lease clones "through a one-shot credential helper, never in the URL or argv (0145)".
+- **Work item body:** `body` is passed "as the 0147 inline source, so no file is committed".
+- **Read-only:** `exec.read_only` refers to 0152.
 
-All three are ordered after 0143, 0144 and 0145. As written, either the gate closes with WSP fields that do nothing, or 0143 quietly implements parts of three later items.
+All three extensions follow 0143. As written, either the gate closes with WSP fields that do nothing, or 0143 quietly implements parts of three later items.
 
 Every work server needs these:
 
@@ -58,8 +60,8 @@ Every work server needs these:
 
 **Ask.** Choose one of these and write it into the items:
 
-- **(a)** 0143 implements the lease-side minimum of each: the credential helper for lease clones and pushes, an inline work item for leases, and a read-only workspace for leases. 0147, 0148 and 0151 then extend each one to push sessions and the CLI.
-- **(b)** Move those parts of 0147, 0148 and 0151 inside the gate.
+- **(a)** 0143 implements the lease-side minimum of each: the credential helper for lease clones and pushes, an inline work item for leases, and a read-only workspace for leases. 0145, 0147 and 0152 then extend each one to push sessions and the CLI.
+- **(b)** Move those parts of 0145, 0147 and 0152 inside the gate.
 
 With either choice, a lease field that a worker cannot honour must be refused, not ignored. Use `release` with reason `ineligible`, or leave the matching capability out of `register` `features` so the server never offers the item.
 
@@ -70,7 +72,7 @@ With either choice, a lease field that a worker cannot honour must be refused, n
 - Push clients get workflow structure from `GET /v1/worker/commands/{id}/workflow`, which is backed by `workflow.state.json`: phases, planned steps, step status and `invocation_id`.
 - A work server cannot call the worker, and WSP only carries `ExecutionEvent`s.
 - So a work server cannot show a dynamic workflow's plan. It can only show steps once they start, and it cannot tell planned steps from finished ones.
-- The GitHub reference server (0145) would hit the same limit if it showed progress.
+- The GitHub reference server (0153) would hit the same limit if it showed progress.
 
 **Ask.** Put the workflow state into the event stream:
 
@@ -103,15 +105,15 @@ The server stays the owner of the context, and the worker stays stateless across
 
 **Ask.** State whether the rule applies to command labels, and what happens to existing keys that break it: refused at submit, or only warned. A clean break is fine, but write it down so clients know to move to `infact/kind`-style keys.
 
-### A6. 0147's credential helper and the git transport builder (0147)
+### A6. 0145's credential helper and the git transport builder (0145)
 
-Our draft of per-session credentials said the one-shot credential helper belongs inside one shared host-side git transport command builder. awman's 0147 dropped that sentence, because the builder came from a proposal that awman has not filed (B1).
+Our draft of per-session credentials said the one-shot credential helper belongs inside one shared host-side git transport command builder. awman's 0145 dropped that sentence, because the builder came from a proposal that awman has not filed (B1).
 
-**Ask.** Once B1 has an item, 0147, and 0143's lease clone and push, should add the helper through that one builder. Then a run's clone, setup fetches, `ls-remote` and push always present the same credential.
+**Ask.** Once B1 has an item, 0145, and 0143's lease clone and push, should add the helper through that one builder. Then a run's clone, setup fetches, `ls-remote` and push always present the same credential.
 
 ---
 
-## Part B: missing work items to draft
+## Part B: gaps originally proposed as new work items
 
 These came from real failures seen by a client. Don't copy our original drafts' wording or their exact choices; they were written from one client's point of view. The summaries below state the problem and what clients need.
 
@@ -128,9 +130,9 @@ A run whose every step succeeded then ends in `error` at stage `push` with `Auth
 
 **Outcome needed.**
 
-- Every host-side transport command in one session (clone, fetch, merge-ref `ls-remote`, push-back `ls-remote` and `push`) uses the same git configuration and the same credentials. Build them from one place, so a later per-session credential helper (0147) or lease credential (0143) is added once.
+- Every host-side transport command in one session (clone, fetch, merge-ref `ls-remote`, push-back `ls-remote` and `push`) uses the same git configuration and the same credentials. Build them from one place, so a later per-session credential helper (0145) or lease credential (0143) is added once.
 - Pick one policy and document it in `security.md` and `docs/09`. "No system gitconfig anywhere", which matches clones today, breaks nothing that works now.
-- An authentication failure during push-back has its own `failure.stage` or `code`, distinct from other push failures, and its message names the operation and remote but never a credential. 0147 already plans `git_auth` for expired per-session tokens; use one stage or code for both.
+- An authentication failure during push-back has its own `failure.stage` or `code`, distinct from other push failures, and its message names the operation and remote but never a credential. 0145 already plans `git_auth` for expired per-session tokens; use one stage or code for both.
 
 **Scope.** Push-back in push sessions today. The same builder must serve worker lease clones and pushes (0143).
 

@@ -649,8 +649,9 @@ async fn ensure_workflow_agent_images_with_default(
     Ok(())
 }
 
-/// Import-only preparation of the image a workflow or squad step needs, on a
-/// runtime that imports images (WI 0126 C1, `BuildPolicy::ImportOnly`).
+/// Import the image a workflow or squad step needs. If Apple Containers has
+/// lost image content and the matching builtin builder is enabled, rebuild
+/// once and retry before starting the step.
 async fn import_agent_image_for_step(
     runtime: std::sync::Arc<dyn crate::engine::agent_runtime::AgentRuntimeEngine>,
     git_root: &std::path::Path,
@@ -659,10 +660,8 @@ async fn import_agent_image_for_step(
     definition: crate::engine::agent::ResolvedAgent,
     sink: &mut dyn UserMessageSink,
 ) -> Result<(), CommandError> {
-    use crate::engine::image_prep::{
-        AgentImagePreparer, AgentImageRequest, BuildPolicy, ImageBuildContext, MessageSink,
-    };
-    let mut preparer = AgentImagePreparer::new(
+    use crate::engine::image_prep::{AgentImagePreparer, ImageBuildContext};
+    let preparer = AgentImagePreparer::new(
         session.effective_config().builtin_settings()?,
         runtime,
         crate::data::fs::data_paths::data_home(session.effective_config().env())?,
@@ -678,16 +677,63 @@ async fn import_agent_image_for_step(
     .with_definition_env(session.env().clone())
     .with_definition(definition);
     let tag = crate::data::image_tags::agent_image_tag(git_root, agent);
+    prepare_importing_step_with_recovery(preparer, &tag, agent, sink).await
+}
+
+async fn prepare_importing_step_with_recovery(
+    mut preparer: crate::engine::image_prep::AgentImagePreparer,
+    tag: &str,
+    agent: &str,
+    sink: &mut dyn UserMessageSink,
+) -> Result<(), CommandError> {
+    use crate::engine::image_prep::{AgentImageRequest, BuildPolicy, MessageSink};
     let result = preparer
         .prepare(
             &AgentImageRequest {
-                tag: &tag,
+                tag,
                 agent,
                 policy: BuildPolicy::ImportOnly,
             },
             &mut MessageSink(sink),
         )
         .await?;
+    if result.import_failure
+        == Some(crate::data::ready_image::ReadyImageImportFailure::AppleContentMissing)
+        && preparer.missing_image_plan(tag, agent)
+            == crate::data::ready_image::ReadyImagePlan::BuildAndImport
+    {
+        sink.write_message(UserMessage {
+            level: MessageLevel::Warning,
+            text: format!(
+                "Apple Containers is missing content for agent '{agent}'; rebuilding its image before starting the step"
+            ),
+        });
+        let repaired = preparer
+            .prepare(
+                &AgentImageRequest {
+                    tag,
+                    agent,
+                    policy: BuildPolicy::Ready {
+                        build: true,
+                        no_cache: true,
+                        refresh: false,
+                    },
+                },
+                &mut MessageSink(sink),
+            )
+            .await?;
+        if let crate::data::step_status::StepStatus::Failed(error) = repaired.build {
+            return Err(CommandError::Other(format!(
+                "failed to rebuild image for agent '{agent}': {error}"
+            )));
+        }
+        if let crate::data::step_status::StepStatus::Failed(error) = repaired.import {
+            return Err(CommandError::Other(format!(
+                "failed to import rebuilt image for agent '{agent}': {error}"
+            )));
+        }
+        return Ok(());
+    }
     match result.import {
         crate::data::step_status::StepStatus::Failed(error) => {
             Err(CommandError::Other(if result.source_kind.is_some() {
@@ -1242,6 +1288,95 @@ mod import_tests {
             images: Default::default(),
             registries: Default::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn missing_apple_content_rebuilds_once_when_builder_is_enabled() {
+        use crate::engine::oci::SourceImage;
+        use crate::engine::ready::tests::fakes::{FakeImportRuntime, FakeLocalBuilder};
+        use crate::engine::ready::tests::{builder_engine, built_identity};
+
+        let runtime = Arc::new(FakeImportRuntime::new(false));
+        runtime.fail_next_apple_content();
+        let builder = Arc::new(FakeLocalBuilder::new());
+        let (engine, _frontend, root, _, _) = builder_engine(
+            runtime.clone(),
+            false,
+            false,
+            sources(Some(ImageSourceSpec::AppleStore { reference: None })),
+            builder.clone(),
+        );
+        let tag = crate::data::image_tags::agent_image_tag(root.path(), "claude");
+        let base = crate::data::image_tags::project_image_tag(root.path());
+        let platform = crate::data::oci_identity::OciPlatform::host_linux();
+        builder.script_build(&base, Ok(built_identity('b', platform.clone())));
+        builder.script_inspect(&base, Ok(SourceImage::Unbound));
+        builder.script_build(&tag, Ok(built_identity('a', platform)));
+
+        let (_, preparer, _) = engine.into_image_test_parts();
+        prepare_importing_step_with_recovery(preparer, &tag, "claude", &mut Quiet)
+            .await
+            .unwrap();
+        assert_eq!(runtime.imports.lock().unwrap().len(), 2);
+        let builds = builder.build_calls();
+        assert_eq!(builds.len(), 2);
+        assert!(builds.iter().all(|build| build.no_cache));
+    }
+
+    #[tokio::test]
+    async fn other_apple_import_failures_do_not_trigger_a_rebuild() {
+        use crate::engine::ready::tests::builder_engine;
+        use crate::engine::ready::tests::fakes::{FakeImportRuntime, FakeLocalBuilder};
+
+        let runtime = Arc::new(FakeImportRuntime::new(false));
+        runtime.fail_next_import(1);
+        let builder = Arc::new(FakeLocalBuilder::new());
+        let (engine, _frontend, root, _, _) = builder_engine(
+            runtime.clone(),
+            false,
+            false,
+            sources(Some(ImageSourceSpec::AppleStore { reference: None })),
+            builder.clone(),
+        );
+        let tag = crate::data::image_tags::agent_image_tag(root.path(), "claude");
+        let (_, preparer, _) = engine.into_image_test_parts();
+        let error = prepare_importing_step_with_recovery(preparer, &tag, "claude", &mut Quiet)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("fake import failure"));
+        assert_eq!(runtime.imports.lock().unwrap().len(), 1);
+        assert!(builder.build_calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn missing_apple_content_without_builder_reports_repair() {
+        use crate::engine::image_prep::{AgentImagePreparer, ImageBuildContext};
+        use crate::engine::ready::tests::fakes::FakeImportRuntime;
+
+        let root = tempfile::tempdir().unwrap();
+        let runtime = Arc::new(FakeImportRuntime::new(false));
+        runtime.fail_next_apple_content();
+        let mut settings = crate::data::config::EffectiveConfig::default()
+            .builtin_settings()
+            .unwrap();
+        settings.image_source = Some(ImageSourceSpec::AppleStore { reference: None });
+        settings.builder_enabled = false;
+        let preparer = AgentImagePreparer::new(
+            settings,
+            runtime.clone(),
+            root.path().join("data"),
+            ImageBuildContext {
+                git_root: root.path().to_path_buf(),
+                project_dockerfile: root.path().join("Dockerfile.dev"),
+                default_agent: "claude".into(),
+            },
+        );
+        let tag = crate::data::image_tags::agent_image_tag(root.path(), "claude");
+        let error = prepare_importing_step_with_recovery(preparer, &tag, "claude", &mut Quiet)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("Rebuild or re-pull"), "{error}");
+        assert_eq!(runtime.imports.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

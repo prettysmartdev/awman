@@ -54,10 +54,18 @@ impl WorkflowPrerequisiteFrontend for InstanceCommandFrontend {
         next: PrerequisiteReportNext,
     ) -> Result<(), CommandError> {
         let prompt = crate::command::prompts::prerequisite_report(report, next);
-        let state = ReviewRequest::question(&prompt, ReviewBody::Prerequisites(report.clone()))
+        let mut state = ReviewRequest::question(&prompt, ReviewBody::Prerequisites(report.clone()))
             .with_note(prompt.body.clone());
+        if matches!(next, PrerequisiteReportNext::Questions { .. }) {
+            state.dismiss_label = Some("Cancel".into());
+        }
         match self.ask_dialog(DialogRequest::Review(state))? {
             DialogResponse::Interrupted => Err(CommandError::Aborted),
+            DialogResponse::Dismissed
+                if matches!(next, PrerequisiteReportNext::Questions { .. }) =>
+            {
+                Err(CommandError::Aborted)
+            }
             DialogResponse::Char(key) if prompt.answer_for_key(key) == Some(false) => {
                 Err(CommandError::Aborted)
             }
