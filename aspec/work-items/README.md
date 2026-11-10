@@ -26,7 +26,7 @@ Every item below depends on the completed 0139–0143 daemon gate. Additional de
 
 | Order | Work item | Scope |
 |---|---|---|
-| 6 | [0144 — Complete Rust test rewrite, CI and release rebuild](0144-rust-tests-ci-release-rebuild.md) | Ground-up rewrite of all Rust tests, then trustworthy CI gates and promoted release artifacts. |
+| 6 | [0144 — Replace all Rust tests, CI/CD and the release process](0144-rust-tests-ci-release-rebuild.md) | Total replacement of every Rust test, CI workflow and release script: tiered suite, one gate manifest, build-once promoted release artifacts. |
 | 7 | [0145 — Git transport, retry, credentials and secrets](0145-git-transport-retry-credentials-and-secrets.md) | Fix push-side Git transport and auth classification, add bounded push retry, then per-session credentials and per-command secrets. |
 | 8 | [0146 — Context API and workflow artifacts](0146-context-api-and-workflow-artifacts.md) | Keyed durable repo context and per-run workflow notes over the push API and WSP. |
 | 9 | [0147 — External work item sources](0147-external-work-item-sources.md) | HTTP and inline work items. |
