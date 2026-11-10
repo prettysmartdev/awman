@@ -256,7 +256,7 @@ are live and global; denied overrides fail before the run is queued.
 
 Disabling a feature applies immediately: new work is refused while accepted jobs drain. Config reload returns without waiting for those jobs. Re-enabling during a drain starts the feature again after its accepted work finishes. Invalid config or a failed feature startup preparation leaves the previous config and active features in place.
 
-`awman daemon stop` cancels and releases pulled leases with reason `shutdown`, while other accepted jobs drain without a time limit. Use `--now` to cancel running work, or send a second shutdown signal to escalate an ongoing drain.
+`awman daemon stop` stops accepting work and waits, without a time limit, for accepted jobs and pulled leases to finish. Use `--now` to release pulled leases with reason `shutdown` and cancel running work, or send a second shutdown signal to escalate an ongoing drain.
 
 Squad environment persistence is initialized when squad is first enabled. Changing `daemon.features.squad.envPersistence` preserves values in memory. Opting out waits for an active persistence write, prevents queued and future writes to the old backend, and clears its stored item on a best-effort basis.
 

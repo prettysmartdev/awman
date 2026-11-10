@@ -115,6 +115,12 @@ pub(crate) fn picker(rows: &[QueueRow]) -> Result<QueueRow, String> {
         if key.kind == KeyEventKind::Release {
             continue;
         }
+        // Raw mode turns Ctrl-C into a key press instead of a signal.
+        if key.modifiers.contains(event::KeyModifiers::CONTROL)
+            && matches!(key.code, event::KeyCode::Char('c' | 'd'))
+        {
+            return Err("picker cancelled".into());
+        }
         match state.handle(key.code, rows) {
             PickerOutcome::Continue => {}
             PickerOutcome::Cancelled => return Err("picker cancelled".into()),

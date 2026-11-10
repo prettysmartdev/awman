@@ -319,7 +319,6 @@ impl ForegroundRecorder {
                 if let Some(line) = framer.finish() {
                     process(line);
                 }
-                drop(process);
                 recorder.translated(translator.finish());
             });
         }

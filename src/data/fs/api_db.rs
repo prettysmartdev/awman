@@ -1661,6 +1661,9 @@ impl SqliteSessionStore {
         Ok(ids)
     }
 
+    /// Re-queue pushed commands a dead worker left `running`. Pulled-lease
+    /// rows (`worker_id = 'pull'`) are never re-queued: they cannot run
+    /// without their lease, and a live TUI or CLI host may still own one.
     pub fn recover_stale_commands(&self, timeout_secs: u64) -> Result<Vec<String>, DataError> {
         let cutoff = chrono::Utc::now() - chrono::Duration::seconds(timeout_secs as i64);
         let cutoff_str = cutoff.to_rfc3339();
@@ -1668,7 +1671,8 @@ impl SqliteSessionStore {
         let ids: Vec<String> = {
             let mut stmt = conn.prepare(
                 "SELECT id FROM commands
-                 WHERE status = 'running' AND started_at IS NOT NULL AND started_at < ?1",
+                 WHERE status = 'running' AND started_at IS NOT NULL AND started_at < ?1
+                   AND worker_id IS NOT 'pull'",
             )?;
             let rows = stmt
                 .query_map(params![cutoff_str], |row| row.get(0))?
@@ -1678,7 +1682,8 @@ impl SqliteSessionStore {
         conn.execute(
             "UPDATE commands SET status = 'queued', worker_id = NULL, started_at = NULL,
                  attempt = attempt + 1
-             WHERE status = 'running' AND started_at IS NOT NULL AND started_at < ?1",
+             WHERE status = 'running' AND started_at IS NOT NULL AND started_at < ?1
+                   AND worker_id IS NOT 'pull'",
             params![cutoff_str],
         )?;
         Ok(ids)
@@ -2572,6 +2577,22 @@ mod tests {
             .unwrap();
         assert_eq!(store.recover_stale_commands(1).unwrap(), ["crash"]);
         assert_eq!(store.get_command("crash").unwrap().unwrap().attempt, 3);
+    }
+
+    #[test]
+    fn recover_stale_commands_never_requeues_a_pulled_lease_row() {
+        let (_tmp, store) = make_store();
+        store
+            .insert_session("s1", "/w", "2026-01-01T00:00:00Z")
+            .unwrap();
+        store
+            .insert_running_lease_command("lease", "s1", "exec", "[]", false)
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert!(store.recover_stale_commands(0).unwrap().is_empty());
+        let row = store.get_command("lease").unwrap().unwrap();
+        assert_eq!(row.status, CommandStatus::Running);
+        assert_eq!(row.attempt, 1);
     }
 
     #[test]

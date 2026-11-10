@@ -37,7 +37,7 @@ fn lease_directory_expressions_cannot_borrow_command_mount_provenance() {
     // A separately authenticated command mount must not bless an expression
     // using the same path; rejection precedes mount deduplication.
     assert!(engine
-        .build_scoped_overlays(&session, &request, Some(&root), &[spec.clone()])
+        .build_scoped_overlays(&session, &request, Some(&root), std::slice::from_ref(&spec))
         .is_err());
     #[cfg(unix)]
     {

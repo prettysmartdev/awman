@@ -216,7 +216,7 @@ impl MockWorkServer {
                 assigned_to_me: e.item.affinity.required.iter().any(|m| {
                     m.key == "owner"
                         && m.op == crate::MatchOp::In
-                        && m.matches(&s.workers[worker].labels)
+                        && m.matches(&s.workers[worker].server_labels)
                 }),
             })
             .collect::<Vec<_>>();

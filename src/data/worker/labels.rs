@@ -109,7 +109,13 @@ impl HostFacts {
         put("runtime".into(), self.runtime_kind.as_str());
         put("host".into(), self.host.as_str());
         for agent in &self.agents_with_images {
-            put(format!("agent.{}", agent.to_ascii_lowercase()), "true");
+            // Agent names allow characters label keys do not (such as `_`).
+            // Such an agent is left unreported rather than failing every
+            // registration with an invalid key.
+            let key = format!("agent.{}", agent.to_ascii_lowercase());
+            if awman_wsp::labels::validate_key(&format!("{RESERVED_PREFIX}{key}")).is_ok() {
+                put(key, "true");
+            }
         }
         if self.interactive_allowed {
             put("interaction.interactive".into(), "true");
@@ -171,6 +177,21 @@ mod tests {
         for key in labels.keys() {
             awman_wsp::labels::validate_key(key).unwrap();
         }
+    }
+
+    #[test]
+    fn agents_whose_names_are_not_label_keys_are_not_reported() {
+        let facts = HostFacts::for_this_build(
+            "docker",
+            WorkerHostKind::Daemon,
+            vec!["my_agent".into(), "claude".into()],
+            true,
+            true,
+        );
+        let labels = facts.worker_labels(&BTreeMap::new()).unwrap();
+        let all = &labels.reported;
+        assert_eq!(all["awman/agent.claude"], "true");
+        assert!(!all.keys().any(|k| k.contains("my_agent")));
     }
 
     #[test]

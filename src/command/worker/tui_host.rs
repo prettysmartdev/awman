@@ -303,6 +303,7 @@ impl Host {
             })
             .map(|(name, _)| name)
             .collect();
+        let mut failures = Vec::new();
         for (name, config) in &settings.work_servers {
             if !config.enabled {
                 continue;
@@ -325,59 +326,76 @@ impl Host {
                 );
                 continue;
             }
-            let token = links
-                .read(name)
-                .map_err(|e| e.to_string())?
-                .ok_or_else(|| {
-                    format!("work server {name:?} has no token; run awman worker link")
-                })?;
-            let wsp = Arc::new(
-                WspSession::connect(name, url, token.refresh_token).map_err(|e| e.to_string())?,
-            );
-            let interaction = config.interaction.unwrap_or(settings.pull_interaction);
-            let labels = HostFacts::for_this_build(
-                kind,
-                WorkerHostKind::Tui,
-                agents.clone(),
-                !interaction.is_headless() || settings.pull_allow_override,
-                interaction.is_headless() || settings.pull_allow_override,
-            )
-            .worker_labels(&config.labels)
-            .map_err(|e| e.to_string())?;
-            let support = LeaseRuntimeSupport::from_capabilities(engines.runtime.capabilities());
-            let registration = wsp
-                .register(&RegisterRequest {
-                    name: format!("awman-tui-{name}"),
-                    labels: labels.merged(),
-                    capacity: config.max_concurrent_jobs,
-                    features: super::capabilities::features(
-                        support,
-                        interaction,
-                        settings.pull_allow_override,
-                        true,
-                        true,
-                        true,
-                    )
-                    .into_iter()
-                    .map(str::to_string)
-                    .collect(),
-                })
-                .await
+            // One unusable server must not take the queue away from the rest.
+            let connected: Result<Server, String> = async {
+                let token = links
+                    .read(name)
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| {
+                        format!("work server {name:?} has no token; run awman worker link")
+                    })?;
+                let wsp = Arc::new(
+                    WspSession::connect(name, url, token.refresh_token)
+                        .map_err(|e| e.to_string())?,
+                );
+                let interaction = config.interaction.unwrap_or(settings.pull_interaction);
+                let labels = HostFacts::for_this_build(
+                    kind,
+                    WorkerHostKind::Tui,
+                    agents.clone(),
+                    !interaction.is_headless() || settings.pull_allow_override,
+                    interaction.is_headless() || settings.pull_allow_override,
+                )
+                .worker_labels(&config.labels)
                 .map_err(|e| e.to_string())?;
-            let labels = labels
-                .with_server(registration.server_labels)
-                .map_err(|e| e.to_string())?
-                .merged();
-            servers.insert(
-                name.clone(),
-                Server {
+                let support =
+                    LeaseRuntimeSupport::from_capabilities(engines.runtime.capabilities());
+                let registration = wsp
+                    .register(&RegisterRequest {
+                        name: format!("awman-tui-{name}"),
+                        labels: labels.merged(),
+                        capacity: config.max_concurrent_jobs,
+                        features: super::capabilities::features(
+                            support,
+                            interaction,
+                            settings.pull_allow_override,
+                            true,
+                            true,
+                            true,
+                        )
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                    })
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let labels = labels
+                    .with_server(registration.server_labels)
+                    .map_err(|e| e.to_string())?
+                    .merged();
+                Ok(Server {
                     session: wsp,
                     labels,
                     interval: crate::engine::worker::heartbeat::heartbeat_interval(Some(
                         registration.heartbeat_ms,
                     )),
-                },
-            );
+                })
+            }
+            .await;
+            match connected {
+                Ok(server) => {
+                    servers.insert(name.clone(), server);
+                }
+                Err(error) => failures.push(format!("work server {name:?}: {error}")),
+            }
+        }
+        if servers.is_empty() && proxies.is_empty() {
+            if let Some(error) = failures.first() {
+                return Err(error.clone());
+            }
+        }
+        for error in &failures {
+            tracing::warn!(%error, "work server skipped");
         }
         Ok(Self {
             terminal_input_policy: Arc::new(std::sync::atomic::AtomicBool::new(
@@ -585,7 +603,12 @@ impl Host {
             .session
             .claim(Some(id), 0)
             .await
-            .map_err(|e| e.to_string())?;
+            // `QueueSource::pick` tells these two conflicts apart by prefix.
+            .map_err(|e| match e {
+                WorkerEngineError::Taken => "taken".to_string(),
+                WorkerEngineError::Ineligible => format!("ineligible: {e}"),
+                other => other.to_string(),
+            })?;
         let ClaimOutcome::Leased(lease) = outcome else {
             return Err("item no longer available".into());
         };
@@ -619,10 +642,12 @@ impl Host {
             &self.session,
             &self.engines,
             server_handle.session.clone(),
-            server,
-            lease,
-            plan,
-            server_handle.interval,
+            ManualClaim {
+                server,
+                lease,
+                plan,
+                interval: server_handle.interval,
+            },
             &|_, _| {},
         )
         .await?;
@@ -889,6 +914,15 @@ pub(super) struct ManualRun {
     runtime: Arc<dyn crate::engine::agent_runtime::AgentRuntimeEngine>,
     _timeout: tokio_util::task::AbortOnDropHandle<()>,
 }
+/// A manually claimed lease and how to run it.
+pub(super) struct ManualClaim<'a> {
+    pub(super) server: &'a str,
+    pub(super) lease: Lease,
+    pub(super) plan: policy::LeasePlan,
+    /// Heartbeat interval the server asked for.
+    pub(super) interval: Duration,
+}
+
 impl ManualRun {
     pub(super) fn start_terminal(&mut self, policy: Arc<dyn Fn() -> bool + Send + Sync>) {
         if self.lease.terminal {
@@ -1018,12 +1052,15 @@ impl ManualRun {
         invoker: &Session,
         engines: &Engines,
         wsp: Arc<WspSession>,
-        server: &str,
-        lease: Lease,
-        mut plan: policy::LeasePlan,
-        interval: Duration,
+        claim: ManualClaim<'_>,
         on_claim: &(dyn Fn(&LeaseRecord, Arc<Active>) + Sync),
     ) -> Result<Self, String> {
+        let ManualClaim {
+            server,
+            lease,
+            mut plan,
+            interval,
+        } = claim;
         let (control, heartbeat) = HeartbeatLoop::spawn(
             wsp.clone(),
             LeaseRef::of(&lease),
@@ -1574,7 +1611,19 @@ impl ProxyRun {
                 body: None,
             })
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| match &e {
+                crate::command::error::CommandError::DaemonHttpStatus { status: 409, body }
+                    if body.contains("\"taken\"") =>
+                {
+                    "taken".to_string()
+                }
+                crate::command::error::CommandError::DaemonHttpStatus { status: 409, body }
+                    if body.contains("\"ineligible\"") =>
+                {
+                    format!("ineligible: {e}")
+                }
+                _ => e.to_string(),
+            })?;
         let lease: crate::data::worker::wire::LeaseResource =
             serde_json::from_value(value["lease"].clone()).map_err(|e| e.to_string())?;
         let command: Vec<String> =

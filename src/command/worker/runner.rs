@@ -324,17 +324,48 @@ impl LeasePostProcess for PushStage {
     }
 }
 
+/// Closes a lease's private session when its run ends.
+struct LeaseSessionGuard {
+    store: Arc<crate::data::fs::api_db::SqliteSessionStore>,
+    sessions: Arc<crate::data::session_manager::SessionManager>,
+    key: String,
+    id: crate::data::session::SessionId,
+}
+impl Drop for LeaseSessionGuard {
+    fn drop(&mut self) {
+        if let Err(error) = self
+            .store
+            .close_session(&self.key, &Utc::now().to_rfc3339())
+        {
+            tracing::warn!(%error, session = %self.key, "could not close lease session");
+        }
+        let _ = self.sessions.remove_by_key(&self.key, self.id);
+    }
+}
+
+/// A claimed, persisted lease that is ready to run in the daemon.
+pub(super) struct ClaimedLease {
+    pub(super) lease: Lease,
+    pub(super) record: LeaseRecord,
+    pub(super) plan: policy::LeasePlan,
+    /// Held for the life of the run; proves this process owns the lease.
+    pub(super) owner: std::fs::File,
+}
+
 impl<F: ApiCommandFrontendFactory + 'static> PullController<F> {
     pub(super) fn start_lease(
         self: &Arc<Self>,
         session: Arc<WspSession>,
-        lease: Lease,
-        record: LeaseRecord,
-        plan: policy::LeasePlan,
+        claimed: ClaimedLease,
         permit: Option<WorkerPermit>,
         interval: Duration,
-        owner: std::fs::File,
     ) {
+        let ClaimedLease {
+            lease,
+            record,
+            plan,
+            owner,
+        } = claimed;
         let (control, heartbeat) = HeartbeatLoop::spawn(
             session.clone(),
             LeaseRef::of(&lease),
@@ -599,10 +630,20 @@ impl<F: ApiCommandFrontendFactory + 'static> PullController<F> {
                 cloned_path: Some(&cwd.to_string_lossy()),
             })
             .map_err(invalid)?;
+        let run_session_id = run_session.id();
         self.shared
             .sessions
             .insert_with_key(&session_key, run_session)
             .map_err(invalid)?;
+        // The session exists only for this lease. Close it on every exit path
+        // so it stops accepting commands and is not listed as active once its
+        // clone is gone; the command record and outputs stay readable.
+        let _session = LeaseSessionGuard {
+            store: self.shared.store.clone(),
+            sessions: self.shared.sessions.clone(),
+            key: session_key.clone(),
+            id: run_session_id,
+        };
         let job_id = crate::data::ids::CommandId::new().to_string();
         let spec = JobSpec {
             command: plan.command.clone(),
@@ -804,6 +845,8 @@ pub(super) fn terminal_relay(
         }))
 }
 
+/// Inline the output directory up to `max_bytes`. A file that does not fit in
+/// the remaining budget is left out; it never fails the run.
 fn collect_outputs(root: &Path, max_bytes: u64) -> Result<BTreeMap<String, String>, String> {
     use base64::Engine as _;
     use std::io::Read as _;
@@ -817,7 +860,7 @@ fn collect_outputs(root: &Path, max_bytes: u64) -> Result<BTreeMap<String, Strin
     let mut outputs = BTreeMap::new();
     for file in listing.files {
         if file.size > remaining {
-            return Err("lease outputs exceed max_bytes".into());
+            continue;
         }
         let opened = crate::data::fs::command_outputs::open_output_file(root, &file.path)
             .map_err(|_| "unsafe output path".to_string())?
@@ -829,7 +872,7 @@ fn collect_outputs(root: &Path, max_bytes: u64) -> Result<BTreeMap<String, Strin
             .read_to_end(&mut bytes)
             .map_err(|_| "could not read output".to_string())?;
         if bytes.len() as u64 > remaining {
-            return Err("lease outputs exceed max_bytes".into());
+            continue;
         }
         remaining -= bytes.len() as u64;
         outputs.insert(
@@ -1039,6 +1082,15 @@ pub(super) async fn complete_foreground(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn outputs_over_the_budget_are_left_out_without_failing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"1234").unwrap();
+        std::fs::write(dir.path().join("big.txt"), vec![b'x'; 64]).unwrap();
+        let outputs = collect_outputs(dir.path(), 8).unwrap();
+        assert_eq!(outputs.keys().collect::<Vec<_>>(), ["a.txt"]);
+        assert_eq!(collect_outputs(dir.path(), 1024).unwrap().len(), 2);
+    }
     #[tokio::test]
     async fn ordinary_cancellation_drains_events_but_fencing_aborts_the_sender() {
         for fenced in [false, true] {

@@ -249,16 +249,32 @@ impl<F: ApiCommandFrontendFactory + 'static> PullController<F> {
                     if self.running(name) > 0 {
                         continue;
                     }
-                    let Some(token) = LinkStore::new(&self.data_paths()).read(name)? else {
-                        continue;
+                    // One unusable entry must not stop the other servers (or
+                    // the feature) from working, so it is skipped, not fatal.
+                    let token = match LinkStore::new(&self.data_paths()).read(name) {
+                        Ok(Some(token)) => token,
+                        Ok(None) => continue,
+                        Err(error) => {
+                            tracing::warn!(server = %name, %error, "work server token is unreadable");
+                            continue;
+                        }
                     };
-                    Arc::new(
-                        WspSession::connect(name, url, token.refresh_token)
-                            .map_err(|e| Self::map_error(name, e))?,
-                    )
+                    match WspSession::connect(name, url, token.refresh_token) {
+                        Ok(session) => Arc::new(session),
+                        Err(error) => {
+                            tracing::warn!(server = %name, %error, "work server is unusable");
+                            continue;
+                        }
+                    }
                 }
             };
-            let labels = self.worker_labels(config.labels.clone(), config.interaction)?;
+            let labels = match self.worker_labels(config.labels.clone(), config.interaction) {
+                Ok(labels) => labels,
+                Err(error) => {
+                    tracing::warn!(server = %name, %error, "work server labels are invalid");
+                    continue;
+                }
+            };
             let mut registration_settings = settings.clone();
             registration_settings.pull_interaction =
                 config.interaction.unwrap_or(settings.pull_interaction);
@@ -285,13 +301,18 @@ impl<F: ApiCommandFrontendFactory + 'static> PullController<F> {
                     }
                 }
             }
-            let registration = session.register(&request).await;
+            // Server labels are server-controlled input: a bad set marks this
+            // server as failed instead of failing every server.
+            let registration = match session.register(&request).await {
+                Ok(registration) => labels
+                    .clone()
+                    .with_server(registration.server_labels.clone())
+                    .map(|_| registration)
+                    .map_err(|e| format!("server labels refused: {e}")),
+                Err(error) => Err(error.to_string()),
+            };
             match registration {
                 Ok(registration) => {
-                    labels
-                        .clone()
-                        .with_server(registration.server_labels.clone())
-                        .map_err(|e| WorkerError::Ineligible(e.to_string()))?;
                     let last_claim_at = self
                         .servers
                         .read()
@@ -324,15 +345,37 @@ impl<F: ApiCommandFrontendFactory + 'static> PullController<F> {
                     );
                 }
                 Err(error) => {
-                    if let Some(entry) = self.servers.write().unwrap().get_mut(name) {
-                        entry.status.state = if session.is_revoked() {
-                            "revoked"
-                        } else {
-                            "error"
-                        }
-                        .into();
-                        entry.status.error = Some(error.to_string());
-                    }
+                    let state = if session.is_revoked() {
+                        "revoked"
+                    } else {
+                        "error"
+                    };
+                    let running = self.running(name);
+                    // Also record a first failure, so `/v1/worker/servers`
+                    // shows why the server is not registered.
+                    let mut servers = self.servers.write().unwrap();
+                    let entry = servers.entry(name.clone()).or_insert_with(|| Registered {
+                        session: session.clone(),
+                        registration: request,
+                        url: url.clone(),
+                        heartbeat: crate::engine::worker::heartbeat::heartbeat_interval(None),
+                        status: ServerStatus {
+                            name: name.clone(),
+                            state: state.into(),
+                            enabled: true,
+                            claim: config.claim,
+                            max_concurrent_jobs: config.max_concurrent_jobs,
+                            running,
+                            queued_eligible: 0,
+                            labels: labels.merged(),
+                            server_labels: Default::default(),
+                            last_claim_at: None,
+                            error: None,
+                        },
+                    });
+                    entry.status.state = state.into();
+                    entry.status.error = Some(error);
+                    drop(servers);
                     if session.is_revoked() {
                         for active in self
                             .active
@@ -431,7 +474,9 @@ impl<F: ApiCommandFrontendFactory + 'static> PullController<F> {
         self: Arc<Self>,
         stop: CancellationToken,
     ) -> Result<(), crate::engine::error::EngineError> {
-        *self.claim_stop.lock().unwrap() = stop.clone();
+        // A child token: a `shutdown` release stops claiming without
+        // cancelling the whole worker feature (push included).
+        *self.claim_stop.lock().unwrap() = stop.child_token();
         self.accepting.store(true, Ordering::SeqCst);
         self.shutting_down.store(false, Ordering::SeqCst);
         let mut claims = BTreeMap::<String, tokio::task::JoinHandle<()>>::new();
@@ -470,6 +515,7 @@ impl<F: ApiCommandFrontendFactory + 'static> PullController<F> {
                     .read()
                     .unwrap()
                     .get(name)
+                    .filter(|e| e.status.state == "registered")
                     .map(|e| e.session.clone());
                 if let Some(session) = session {
                     let refresh = async {
@@ -775,10 +821,12 @@ impl<F: ApiCommandFrontendFactory + 'static> PullController<F> {
                 &invoker,
                 &self.shared.engines,
                 session,
-                name,
-                lease,
-                plan,
-                heartbeat,
+                tui_host::ManualClaim {
+                    server: name,
+                    lease,
+                    plan,
+                    interval: heartbeat,
+                },
                 &|record, active| {
                     *preparing_id.lock().unwrap() = Some(record.id.to_string());
                     self.active
@@ -892,12 +940,14 @@ impl<F: ApiCommandFrontendFactory + 'static> PullController<F> {
         }
         self.start_lease(
             session,
-            lease,
-            record.clone(),
-            plan,
+            runner::ClaimedLease {
+                lease,
+                record: record.clone(),
+                plan,
+                owner,
+            },
             permit,
             heartbeat,
-            owner,
         );
         if let Some(entry) = self.servers.write().unwrap().get_mut(name) {
             entry.status.last_claim_at = Some(Utc::now());
@@ -1014,6 +1064,7 @@ impl<F: ApiCommandFrontendFactory + 'static> PullHandle for PullHandleAdapter<F>
                 .read()
                 .unwrap()
                 .get(&name)
+                .filter(|entry| entry.status.state == "registered")
                 .map(|entry| entry.session.clone())
                 .ok_or_else(|| WorkerError::ServerNotRegistered(name.clone()))?;
             let mut next = None;

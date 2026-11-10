@@ -220,6 +220,16 @@ impl HeartbeatLoop {
                     + (expires_at - Utc::now()).to_std().unwrap_or_default();
                 let mut retry_soon = false;
                 let mut first = true;
+                // Set once the server answers `cancel: true`. The loop keeps
+                // beating after that, so the lease stays valid while the run
+                // stops and its partial result is posted.
+                let mut cancelled: Option<Option<String>> = None;
+                let stopped = |cancelled: &Option<Option<String>>| match cancelled {
+                    Some(reason) => HeartbeatEnd::Cancelled {
+                        reason: reason.clone(),
+                    },
+                    None => HeartbeatEnd::Stopped,
+                };
                 loop {
                     if tokio::time::Instant::now() >= deadline {
                         control.fence();
@@ -232,10 +242,10 @@ impl HeartbeatLoop {
                             _ = tokio::time::sleep_until(deadline) => {
                                 control.fence(); return HeartbeatEnd::LeaseLost;
                             },
-                            _ = control.stop.cancelled() => return HeartbeatEnd::Stopped,
+                            _ = control.stop.cancelled() => return stopped(&cancelled),
                             changed = status_rx.changed() => {
                                 if changed.is_err() {
-                                    return HeartbeatEnd::Stopped;
+                                    return stopped(&cancelled);
                                 }
                             }
                             _ = waiting_rx.changed() => {}
@@ -254,7 +264,7 @@ impl HeartbeatLoop {
                         _ = tokio::time::sleep_until(deadline) => {
                             control.fence(); return HeartbeatEnd::LeaseLost;
                         },
-                        _ = control.stop.cancelled() => return HeartbeatEnd::Stopped,
+                        _ = control.stop.cancelled() => return stopped(&cancelled),
                         answer = api.heartbeat(&lease, &request) => answer,
                     };
                     match answer {
@@ -272,16 +282,14 @@ impl HeartbeatLoop {
                                     .unwrap_or_default();
                             retry_soon = false;
                             let _ = expires_tx.send(response.expires_at);
-                            if response.cancel {
+                            if response.cancel && cancelled.is_none() {
                                 *control
                                     .cancel_reason
                                     .lock()
                                     .unwrap_or_else(|p| p.into_inner()) =
                                     response.cancel_reason.clone();
                                 control.cancel.cancel();
-                                return HeartbeatEnd::Cancelled {
-                                    reason: response.cancel_reason,
-                                };
+                                cancelled = Some(response.cancel_reason);
                             }
                         }
                         Err(WorkerEngineError::LeaseLost) => {
@@ -493,7 +501,12 @@ pub(crate) mod tests {
             cancel: true,
             cancel_reason: Some("operator".into()),
         }));
-        let (control, task) = spawn(api, Duration::from_secs(15));
+        let (control, task) = spawn(api.clone(), Duration::from_secs(15));
+        control.cancelled().cancelled().await;
+        // The loop keeps the lease alive until the run has reported.
+        tokio::time::sleep(Duration::from_secs(40)).await;
+        assert!(api.beats.lock().unwrap().len() >= 3, "beats continue");
+        control.stop();
         assert_eq!(
             task.await.unwrap(),
             HeartbeatEnd::Cancelled {
