@@ -1,6 +1,6 @@
 # Browser acceptance runner
 
-This isolated pnpm package pins Playwright 1.58.2, TypeScript 5.8.3 and Node
+This isolated npm package pins Playwright 1.58.2, TypeScript 5.8.3 and Node
 types. It drives the exported web app (`web/out`) and the real daemon binary; it
 does not implement or replace the web app.
 
@@ -8,13 +8,11 @@ From the repository root:
 
 ```sh
 cargo build --workspace --bins
-pnpm --dir web install --frozen-lockfile --ignore-scripts
-pnpm --dir web/edge install --frozen-lockfile --ignore-scripts
-pnpm --dir web run check                       # produces web/out
-pnpm --dir web/e2e install --frozen-lockfile --ignore-scripts
-pnpm --dir web/e2e exec playwright install --with-deps chromium firefox
-pnpm --dir web/e2e check
-pnpm --dir web/e2e test
+make web/reinstall
+npm --prefix web run check                     # produces web/out
+npm --prefix web/e2e exec -- playwright install --with-deps chromium firefox
+npm --prefix web/e2e run check
+npm --prefix web/e2e test
 ```
 
 `make test-web` runs the web and edge checks, builds the binary and then runs
@@ -34,7 +32,7 @@ Specs:
 - `transport.spec.ts` exercises browser-to-daemon fetch/CORS using a plainly
   named fixture page, not the app: default-off, stopped, the live recipe and an
   idempotent recheck; exact origin, origin replacement and the rule that browser
-  requests never fall back to API keys. `pnpm --dir web/e2e test:transport` runs
+  requests never fall back to API keys. `npm --prefix web/e2e run test:transport` runs
   only this subset.
 - `link.spec.ts` exercises the browser link flow against the real daemon:
   creation from a gesture, CLI confirmation with the displayed Origin, listener

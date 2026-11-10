@@ -3,7 +3,6 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "packageManager": "pnpm@10.34.9",
   "engines": {
     "node": ">=22.13.0"
   },
@@ -11,10 +10,10 @@
     "typecheck": "tsc --noEmit",
     "lint": "eslint src test vitest.config.ts scripts && node scripts/verify-config.mjs",
     "test": "vitest run",
-    "check": "pnpm run typecheck && pnpm run lint && pnpm run test",
+    "check": "npm run typecheck && npm run lint && npm run test",
     "verify:assets": "node scripts/verify-assets.mjs",
     "dev": "wrangler dev",
-    "deploy": "pnpm run verify:assets && wrangler deploy"
+    "deploy": "npm run verify:assets && wrangler deploy"
   },
   "devDependencies": {
     "@cloudflare/vitest-plugin": "1.6.1",

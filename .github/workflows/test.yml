@@ -112,20 +112,17 @@ jobs:
         with:
           node-version: "22"
 
-      # The web packages pin pnpm in `packageManager`; this is the version their
-      # lockfiles were produced with. Installs are frozen, so a lockfile that no
-      # longer matches its package.json fails instead of drifting.
-      - name: Install pnpm
-        run: npm install --global pnpm@10.34.9
+      - name: Install npm 11
+        run: npm install --global npm@11.17.0
 
       - name: Install pinned web dependencies
         run: |
-          pnpm --dir web install --frozen-lockfile --ignore-scripts
-          pnpm --dir web/edge install --frozen-lockfile --ignore-scripts
-          pnpm --dir web/e2e install --frozen-lockfile --ignore-scripts
+          npm --prefix web ci --ignore-scripts
+          npm --prefix web/edge ci --ignore-scripts
+          npm --prefix web/e2e ci --ignore-scripts
 
       - name: Install Playwright browsers
-        run: pnpm --dir web/e2e exec playwright install --with-deps chromium firefox
+        run: npm --prefix web/e2e exec -- playwright install --with-deps chromium firefox
 
       # typecheck, lint, unit tests, static export, CSP/privacy audits and the
       # edge asset gate for web/; the Worker's own checks; then the browser

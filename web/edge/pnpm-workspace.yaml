@@ -1,6 +1,0 @@
-# This package stays independent of the frontend and Rust release.
-packages:
-  - '.'
-onlyBuiltDependencies:
-  - esbuild
-  - workerd

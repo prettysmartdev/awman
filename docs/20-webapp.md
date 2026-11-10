@@ -50,7 +50,7 @@ running, the target also prints a URL using this machine's tailnet IPv4 address.
 To link the local origin, add it to the loopback listener's exact origin list:
 
 ```sh
-pnpm --dir web install --frozen-lockfile
+make web/reinstall
 awman config set daemon.network.listeners.loopback.allowedOrigins https://awman.prettysmart.dev,http://127.0.0.1:3000
 make web/dev
 ```

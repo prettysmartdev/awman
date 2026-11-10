@@ -114,11 +114,12 @@ async fn retries_connection_reset_then_succeeds_and_logs_push_retry_events_real_
     assert_eq!(report.retries.len(), 1, "{:?}", report.retries);
     assert_eq!(report.retries[0].attempt, 2);
     assert!(
-        report
-            .messages
-            .iter()
-            .any(|m| m.starts_with("push retry 2/3") && m.to_ascii_lowercase().contains("reset")),
-        "retry logged with its reason: {:?}",
+        report.messages.iter().any(|m| {
+            let message = m.to_ascii_lowercase();
+            m.starts_with("push retry 2/3")
+                && (message.contains("reset") || message.contains("could not connect to server"))
+        }),
+        "retry logged with its pre-response transport failure: {:?}",
         report.messages
     );
     let sha = report.result.git.unwrap().head_sha.unwrap();

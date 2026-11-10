@@ -1,23 +1,22 @@
 # awman app-shell Worker
 
-Independent pnpm package; no Rust build, Next server runtime, API adapter or
+Independent npm package; no Rust build, Next server runtime, API adapter or
 cloud-to-daemon traffic. The Next frontend must statically export to `web/out`.
 Workers Static Assets serves that directory through `ASSETS`; `run_worker_first`
 ensures every HTML response receives CSP and every qualifying document request
 passes the counter. Native HTML canonical redirects stay redirects; missing
 paths return the exported 404 page, never an API-to-SPA fallback.
 
-Use Node 22.13+ (or a compatible newer release) and the exact pnpm version in
-`package.json`:
+Use Node 22.13+ (or a compatible newer release):
 
 ```sh
-pnpm --dir web/edge install --frozen-lockfile
-pnpm --dir web/edge run check
+npm --prefix web/edge ci
+npm --prefix web/edge run check
 # After the frontend build creates web/out:
-pnpm --dir web/edge run verify:assets
-pnpm --dir web/edge exec wrangler secret put USAGE_HMAC_SECRET
-pnpm --dir web/edge exec wrangler secret put OWNER_EXPORT_SECRET
-pnpm --dir web/edge run deploy
+npm --prefix web/edge run verify:assets
+npm --prefix web/edge exec -- wrangler secret put USAGE_HMAC_SECRET
+npm --prefix web/edge exec -- wrangler secret put OWNER_EXPORT_SECRET
+npm --prefix web/edge run deploy
 ```
 
 Supply two independent random secrets with at least 32 bytes of entropy. Never

@@ -29,7 +29,5 @@ target
 .antigravitycli
 .crush
 
-# pnpm content-addressable store created by the web packages' local .npmrc
-.pnpm-store/
 # cargo target directory used by the test harness
 target-tests-results/

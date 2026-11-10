@@ -24,6 +24,5 @@ assert.equal(config.vars, undefined, 'Secrets must be supplied as secret binding
 for (const version of Object.values({ ...pkg.dependencies, ...pkg.devDependencies })) {
   assert.match(version, /^\d+\.\d+\.\d+(?:-[\w.-]+)?$/, 'Dependencies must have exact versions');
 }
-assert.match(pkg.packageManager, /^pnpm@\d+\.\d+\.\d+$/);
 const keyProblems = configKeyProblems(config);
 assert.deepEqual(keyProblems, [], keyProblems.join('\n'));

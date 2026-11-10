@@ -12,7 +12,7 @@ const config: NextConfig = {
   productionBrowserSourceMaps: false,
   devIndicators: false,
   allowedDevOrigins: process.env.WEB_DEV_TAILNET_IP ? [process.env.WEB_DEV_TAILNET_IP, '127.0.0.1'] : undefined,
-  // Lint runs as its own step of `pnpm run check`.
+  // Lint runs as its own step of `npm run check`.
   eslint: { ignoreDuringBuilds: true },
   // Deterministic build id: the service worker version is derived from the
   // content hashes of the exported files (scripts/build-sw.mjs).

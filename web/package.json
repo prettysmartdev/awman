@@ -3,7 +3,6 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "packageManager": "pnpm@10.34.9",
   "engines": {
     "node": ">=22.13.0"
   },
@@ -14,8 +13,8 @@
     "test": "vitest run",
     "build": "NEXT_TELEMETRY_DISABLED=1 next build && node scripts/externalize-inline.mjs out && node scripts/build-sw.mjs out",
     "audit": "node scripts/audit-output.mjs out && node scripts/audit-csp.mjs out",
-    "verify:edge": "pnpm --dir edge run verify:assets",
-    "check": "pnpm run typecheck && pnpm run lint && pnpm run matrix && pnpm run test && pnpm run build && pnpm run audit && pnpm run verify:edge",
+    "verify:edge": "npm --prefix edge run verify:assets",
+    "check": "npm run typecheck && npm run lint && npm run matrix && npm run test && npm run build && npm run audit && npm run verify:edge",
     "icons": "node scripts/make-icons.mjs",
     "matrix": "node acceptance/render-matrix.mjs --check"
   },
@@ -42,8 +41,5 @@
     "typescript": "5.8.3",
     "typescript-eslint": "8.72.2",
     "vitest": "4.1.0"
-  },
-  "pnpm": {
-    "onlyBuiltDependencies": []
   }
 }
