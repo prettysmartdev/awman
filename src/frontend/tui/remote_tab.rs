@@ -24,7 +24,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
-use crate::command::instance::backend::{BackendEvent, BackendLoss, UiTicket};
+use crate::command::instance::backend::{BackendEvent, BackendLoss, PresenterSlot, UiTicket};
 use crate::data::frontend_protocol::{
     ContainerWindowStateWire, DetachReasonWire, Seq, UiOutcome, UiRequest,
 };
@@ -161,18 +161,23 @@ impl RemoteTabView {
             BackendEvent::DialogClosed { tab_id, .. } => {
                 Self::drop_dialog(app, &tab_id);
             }
-            BackendEvent::ProgramStatus {
+            BackendEvent::SlotStats {
                 tab_id,
-                slot_id,
-                status,
+                slot,
+                stats,
             } => {
                 if let Some(tab) = Self::tab_index(app, &tab_id).map(|i| &mut app.tabs[i]) {
-                    if let Some(slot) = tab
+                    let info = tab
                         .container_slots
                         .iter_mut()
-                        .find(|slot| slot.launch_id == slot_id.0)
-                    {
-                        slot.program_status = status;
+                        .find(|s| match &slot {
+                            PresenterSlot::Launch(id) => s.launch_id == *id,
+                            PresenterSlot::Step(name) => &s.step_name == name,
+                        })
+                        .and_then(|s| s.container_info.as_mut());
+                    if let Some(info) = info {
+                        info.record_stats(stats);
+                        app.needs_redraw = true;
                     }
                 }
             }

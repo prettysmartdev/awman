@@ -19,6 +19,22 @@ fn render_app(app: &mut App, width: u16, height: u16) -> ratatui::buffer::Buffer
     terminal.backend().buffer().clone()
 }
 
+#[test]
+fn squad_confirmation_names_the_config_change() {
+    let mut app = make_app();
+    app.active_dialog = Some(Dialog::SquadStartConfirm {
+        enable_config: true,
+        start_daemon: true,
+    });
+    let text = buffer_text(&render_app(&mut app, 100, 30));
+    assert!(text.contains("Enable squad in the global config"), "{text}");
+    assert!(
+        text.contains("daemon.features.squad.enabled = true"),
+        "{text}"
+    );
+    assert!(text.contains("Start the awman daemon"), "{text}");
+}
+
 fn seed_agents_dashboard(app: &App, watching: bool, with_agent: bool) {
     use crate::command::commands::agents::{
         AgentSnapshot, AgentSource, AgentState, AgentTotals, AgentsOverview,

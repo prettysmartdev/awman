@@ -199,6 +199,9 @@ impl InstanceBackend for ScriptedBackend {
     fn squad_admission(&self) -> Result<(), SquadStartError> {
         self.inner.squad_admission()
     }
+    fn squad_enabled_in_config(&self) -> Result<bool, CommandError> {
+        self.inner.squad_enabled_in_config()
+    }
     fn squad_daemon_is_running(&self) -> Result<bool, CommandError> {
         self.inner.squad_daemon_is_running()
     }

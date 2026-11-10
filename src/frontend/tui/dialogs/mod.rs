@@ -95,11 +95,12 @@ pub enum Dialog {
         name: String,
         prompt: Prompt<SquadConfirmDecision>,
     },
-    /// Confirmation before starting a squad daemon that is not already running
-    /// (WI 0110). Opening the squad tab starts a long-lived background
-    /// process; `y` builds the tab (and with it the daemon), `n`/`Esc` opens
-    /// no tab at all. Never raised when a daemon is already up.
-    SquadStartConfirm,
+    /// Confirmation before enabling squad in the global config or starting
+    /// the daemon. Each flag describes the change the user is accepting.
+    SquadStartConfirm {
+        enable_config: bool,
+        start_daemon: bool,
+    },
     Loading {
         title: String,
     },

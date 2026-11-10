@@ -1477,3 +1477,145 @@ fn p95_and_invocations_are_computed_like_the_builtin_session() {
     let _ = OutputStream::Stdout;
     let _: Option<ParsedCommandBoxInput> = None;
 }
+
+/// The engine's program status for the backbone reaches the presenter on the
+/// backbone's stuck channel (as the builtin backend reports it), and engine
+/// stats arrive as a `SlotStats` event naming the presenter's own slot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn program_status_and_stats_reach_the_presenter_slot() {
+    use crate::data::instance_snapshot::AgentStatsWire;
+    use crate::data::program_status::{EffectiveStatus, ProgramState};
+    use crate::engine::agent_runtime::execution::StuckEvent;
+
+    let unit = unit();
+    let tab_id = TabId::new();
+    let backbone = slot("", None);
+    unit.welcome(instance_snapshot(vec![tab_snapshot(
+        &unit.root,
+        tab_id.clone(),
+        vec![backbone.clone()],
+    )]));
+    let InitialTabOpened::Normal { tab } = unit.backend.open_initial(session_spec(&unit.root))
+    else {
+        panic!("expected a normal initial tab");
+    };
+    let feeds = tab.feeds;
+    let mut stuck_rx = feeds
+        .container
+        .events
+        .lock()
+        .unwrap()
+        .drain(..)
+        .find_map(|event| match event {
+            ContainerSlotEvent::EngineAttached { stuck, .. } => stuck,
+            _ => None,
+        })
+        .expect("the backbone publishes a stuck channel");
+
+    let status = EffectiveStatus {
+        state: ProgramState::Blocked,
+        kind: None,
+        progress: None,
+        msg: Some("needs approval".into()),
+        app: None,
+        id: None,
+    };
+    // The attach replay restores the snapshot's (unstuck) state first.
+    while stuck_rx.try_recv().is_ok() {}
+    unit.frame(EngineFrame::ProgramStatus {
+        tab_id: tab_id.clone(),
+        slot_id: backbone.slot_id,
+        status: Some(status.clone()),
+    });
+    match stuck_rx.try_recv() {
+        Ok(StuckEvent::Reported(Some(got))) => assert_eq!(got, status),
+        other => panic!("expected the report on the stuck channel, got {other:?}"),
+    }
+
+    unit.delta(InstanceDelta::SlotStats {
+        tab_id: tab_id.clone(),
+        slot_id: backbone.slot_id,
+        stats: AgentStatsWire {
+            name: "awman-c".into(),
+            cpu_percent: 12.5,
+            memory_mb: 256.0,
+        },
+    });
+    let launch = feeds.container.launch_id();
+    let events = unit.backend.poll();
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            BackendEvent::SlotStats { tab_id: t, slot: PresenterSlot::Launch(id), stats }
+                if t == &tab_id && *id == launch && stats.memory_mb == 256.0
+        )),
+        "stats must name the presenter's backbone launch: {events:?}"
+    );
+}
+
+/// A presenter attaching mid-run shows the engine's current workflow, stuck
+/// state, agent status and dashboard at once, not after each next change.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attaching_restores_live_tab_state_from_the_snapshot() {
+    use crate::data::instance_snapshot::{AgentsDashboardWire, WorkflowViewState};
+    use crate::data::program_status::{EffectiveStatus, ProgramState};
+    use crate::engine::agent_runtime::execution::StuckEvent;
+
+    let unit = unit();
+    let tab_id = TabId::new();
+    let status = EffectiveStatus {
+        state: ProgramState::Working,
+        kind: None,
+        progress: None,
+        msg: Some("compiling".into()),
+        app: None,
+        id: None,
+    };
+    let mut backbone = slot("", None);
+    backbone.program_status = Some(status.clone());
+    let mut tab = tab_snapshot(&unit.root, tab_id.clone(), vec![backbone]);
+    let invocation = uuid::Uuid::new_v4();
+    tab.workflow = Some(WorkflowViewState::default());
+    tab.workflow_invocation_id = Some(invocation);
+    tab.context_path = Some(unit.root.join("ctx.md"));
+    tab.stuck = true;
+    tab.agents_dashboard = Some(AgentsDashboardWire {
+        overview: serde_json::json!({"not": "an overview"}),
+        watching: true,
+    });
+    unit.welcome(instance_snapshot(vec![tab]));
+
+    let InitialTabOpened::Normal { tab } = unit.backend.open_initial(session_spec(&unit.root))
+    else {
+        panic!("expected a normal initial tab");
+    };
+    let feeds = tab.feeds;
+    let presented = feeds.workflow.snapshot();
+    assert_eq!(presented.invocation_id, Some(invocation));
+    assert_eq!(presented.context_path, Some(unit.root.join("ctx.md")));
+
+    let mut stuck_rx = feeds
+        .container
+        .events
+        .lock()
+        .unwrap()
+        .drain(..)
+        .find_map(|event| match event {
+            ContainerSlotEvent::EngineAttached { stuck, .. } => stuck,
+            _ => None,
+        })
+        .expect("the backbone publishes a stuck channel");
+    let mut seen = Vec::new();
+    while let Ok(event) = stuck_rx.try_recv() {
+        seen.push(event);
+    }
+    assert!(
+        seen.iter().any(|e| matches!(e, StuckEvent::Stuck)),
+        "{seen:?}"
+    );
+    assert!(
+        seen.iter()
+            .any(|e| matches!(e, StuckEvent::Reported(Some(s)) if s == &status)),
+        "{seen:?}"
+    );
+}

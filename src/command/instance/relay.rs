@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use chrono::Utc;
 
+use crate::command::commands::agents::{AgentsTuiContext, TuiTabSnapshot};
 use crate::command::dispatch::CommandOutcome;
 use crate::command::error::CommandError;
 use crate::data::annotations::Annotations;
@@ -27,21 +28,23 @@ use crate::data::frontend_protocol::{
 };
 use crate::data::ids::{DialogId, TabId, TerminalId};
 use crate::data::instance_snapshot::{
-    ContainerWindowState, ExecutionPhase, InstanceDelta, LabelColorWire, SessionView, SlotId,
-    SlotSnapshot, StatusLine, TabLabelWire, TabSnapshot, YoloState,
+    AgentStatsWire, AgentsDashboardWire, ContainerWindowState, ExecutionPhase, InstanceDelta,
+    LabelColorWire, SessionView, SlotId, SlotSnapshot, StatusLine, StepViewStatus, TabLabelWire,
+    TabSnapshot, WorkflowViewState, YoloState,
 };
 use crate::data::message::MessageLevel;
 use crate::data::program_status::EffectiveStatus;
 use crate::data::session::{Session, SessionId};
 use crate::data::terminal::{DetachReason, TerminalOwner, TerminalOwnerInfo};
 use crate::data::workflow_state::CountdownKind;
-use crate::engine::agent_runtime::execution::StuckEvent;
+use crate::engine::agent_runtime::execution::{AgentStats, StuckEvent};
 use crate::engine::terminal_hub::bridge::BridgedTerminal;
 use crate::engine::terminal_hub::{TerminalHub, TerminalRegistration};
 use crate::engine::workflow::EngineRequest;
 
 use super::feeds::{
-    ContainerSlotEvent, ContainerSlotIo, SharedYoloCancelFlag, TabCommandFeeds, TabFeeds,
+    AgentsDashboardData, ContainerSlotEvent, ContainerSlotIo, SharedYoloCancelFlag,
+    TabCommandFeeds, TabFeeds,
 };
 use super::lifecycle::QuitReason;
 use super::SubmittedCommand;
@@ -165,6 +168,89 @@ type WorkflowProjection = (
     Option<std::path::PathBuf>,
 );
 
+/// One workflow step whose status changed between two projections.
+#[derive(Debug, PartialEq, Eq)]
+struct StepChange<'a> {
+    step: &'a str,
+    from: Option<StepViewStatus>,
+    to: StepViewStatus,
+    agent: Option<&'a str>,
+}
+
+/// The step status changes worth a daemon log line: every change into a
+/// non-pending status. Re-projecting an unchanged view yields nothing, so the
+/// log stays at one line per real transition.
+fn workflow_step_changes<'a>(
+    previous: Option<&WorkflowViewState>,
+    next: &'a WorkflowViewState,
+) -> Vec<StepChange<'a>> {
+    next.steps
+        .iter()
+        .filter_map(|step| {
+            let from = previous
+                .and_then(|p| p.steps.iter().find(|s| s.name == step.name))
+                .map(|s| s.status);
+            (from != Some(step.status) && step.status != StepViewStatus::Pending).then(|| {
+                StepChange {
+                    step: &step.name,
+                    from,
+                    to: step.status,
+                    agent: step.agent.as_deref(),
+                }
+            })
+        })
+        .collect()
+}
+
+fn step_status_label(status: StepViewStatus) -> &'static str {
+    match status {
+        StepViewStatus::Pending => "pending",
+        StepViewStatus::Running => "running",
+        StepViewStatus::Fixing => "fixing",
+        StepViewStatus::Done => "done",
+        StepViewStatus::Error => "error",
+        StepViewStatus::Cancelled => "cancelled",
+        StepViewStatus::Skipped => "skipped",
+    }
+}
+
+/// Daemon log lines for a tab's workflow: run start and step transitions.
+fn log_workflow_progress(
+    tab_id: &TabId,
+    previous: Option<&WorkflowProjection>,
+    next: &WorkflowProjection,
+) {
+    let (prev_view, prev_run) = previous
+        .map(|p| (p.0.as_ref(), p.1))
+        .unwrap_or((None, None));
+    if let Some(run) = next.1.filter(|run| Some(*run) != prev_run) {
+        tracing::info!(
+            tab = %tab_id,
+            invocation_id = %run,
+            steps = next.0.as_ref().map_or(0, |v| v.steps.len()),
+            "workflow run started"
+        );
+    }
+    let Some(view) = next.0.as_ref() else {
+        return;
+    };
+    // A new run starts its step statuses from scratch.
+    let prev_view = if next.1 == prev_run { prev_view } else { None };
+    for change in workflow_step_changes(prev_view, view) {
+        let from = change.from.map_or("new", step_status_label);
+        let to = step_status_label(change.to);
+        let agent = change.agent.unwrap_or("");
+        match change.to {
+            StepViewStatus::Error => tracing::warn!(
+                tab = %tab_id, step = change.step, from, to, "workflow step failed"
+            ),
+            _ => tracing::info!(
+                tab = %tab_id, step = change.step, from, to, agent, "workflow step"
+            ),
+        }
+    }
+}
+
 /// The last projected state, for diffing `TabCommandFeeds` into deltas.
 #[derive(Default)]
 struct Projection {
@@ -172,6 +258,17 @@ struct Projection {
     workflow: Option<WorkflowProjection>,
     yolo: Option<YoloState>,
     phase: Option<ExecutionPhase>,
+    agents_dashboard: Option<AgentsDashboardData>,
+    /// The sequential agent's stuck state, as last relayed.
+    stuck: bool,
+}
+
+/// The `agents status` table as it crosses the protocol.
+fn dashboard_wire(data: &AgentsDashboardData) -> Option<AgentsDashboardWire> {
+    Some(AgentsDashboardWire {
+        overview: serde_json::to_value(&data.overview).ok()?,
+        watching: data.watching,
+    })
 }
 
 /// One hosted tab's relay.
@@ -189,6 +286,8 @@ pub struct TabRelay {
     focused: Option<SlotId>,
     engine_requests: Option<tokio::sync::mpsc::UnboundedSender<EngineRequest>>,
     stuck: Option<tokio::sync::broadcast::Receiver<StuckEvent>>,
+    /// The sequential launch whose agent reports arrive on `stuck`.
+    stuck_launch: Option<uuid::Uuid>,
     projection: Projection,
     status_log: Vec<StatusLine>,
     phase: ExecutionPhase,
@@ -236,6 +335,7 @@ impl TabRelay {
             focused: None,
             engine_requests: None,
             stuck: None,
+            stuck_launch: None,
             projection: Projection {
                 workflow: Some((None, None, None, None)),
                 phase: Some(ExecutionPhase::of_session_state(session.state())),
@@ -245,6 +345,11 @@ impl TabRelay {
             yolo_mode: false,
             annotations: Annotations::new(),
         }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn feeds(&self) -> &TabCommandFeeds {
+        &self.feeds
     }
 
     pub fn tab_id(&self) -> &TabId {
@@ -281,6 +386,15 @@ impl TabRelay {
         self.command = None;
         self.engine_requests = None;
         self.stuck = None;
+        self.stuck_launch = None;
+        // A new command starts unstuck, as a fresh local slot does.
+        if self.projection.stuck {
+            self.projection.stuck = false;
+            events.push(self.delta(InstanceDelta::Stuck {
+                tab_id: self.tab_id.clone(),
+                stuck: false,
+            }));
+        }
         if !self.status_log.is_empty() {
             self.status_log.clear();
             events.push(self.delta(InstanceDelta::StatusLogReset {
@@ -485,7 +599,19 @@ impl TabRelay {
                     title,
                     io,
                 } => {
-                    // A new sequential launch replaces the backbone slot.
+                    // A new sequential launch replaces the backbone slot. It
+                    // keeps the agent's name, as the builtin presenter does;
+                    // the title names the step it runs.
+                    let previous = self
+                        .slots
+                        .iter()
+                        .find(|slot| matches!(slot.key, SlotKey::Sequential(_)));
+                    let agent = previous
+                        .map(|slot| slot.snapshot.agent_display_name.clone())
+                        .filter(|name| !name.is_empty())
+                        .or_else(|| title.clone())
+                        .unwrap_or_default();
+                    let in_group = previous.is_some_and(|slot| slot.snapshot.dormant);
                     let backbone: Vec<SlotKey> = self
                         .slots
                         .iter()
@@ -495,7 +621,10 @@ impl TabRelay {
                     for key in backbone {
                         events.extend(self.close_slot(&key, None));
                     }
-                    let agent = title.clone().unwrap_or_default();
+                    if !in_group {
+                        // The presenter clears the tab's stuck flag here.
+                        self.projection.stuck = false;
+                    }
                     events.extend(self.open_slot(
                         SlotKey::Sequential(launch_id),
                         SlotId(launch_id),
@@ -527,11 +656,12 @@ impl TabRelay {
                         .extend(self.close_slot(&SlotKey::Sequential(launch_id), Some(exit_code)));
                 }
                 ContainerSlotEvent::EngineAttached {
-                    launch_id: _,
+                    launch_id,
                     requests,
                     stuck,
                 } => {
                     self.engine_requests = requests;
+                    self.stuck_launch = stuck.as_ref().map(|_| launch_id);
                     self.stuck = stuck;
                 }
                 ContainerSlotEvent::AttachedExited { step_name, .. } => {
@@ -675,20 +805,118 @@ impl TabRelay {
             return;
         };
         let mut latest = None;
+        let mut reported = None;
         loop {
             match stuck.try_recv() {
                 Ok(StuckEvent::Stuck) => latest = Some(true),
-                Ok(StuckEvent::Unstuck) => latest = Some(false),
-                Ok(_) => {}
+                Ok(StuckEvent::Unstuck | StuckEvent::StartupGraceExpired) => latest = Some(false),
+                Ok(StuckEvent::Reported(status)) => reported = Some(status),
                 Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
                 Err(_) => break,
             }
         }
         if let Some(stuck) = latest {
+            self.projection.stuck = stuck;
             events.push(self.delta(InstanceDelta::Stuck {
                 tab_id: self.tab_id.clone(),
                 stuck,
             }));
+        }
+        if let Some(status) = reported {
+            events.extend(self.report_program_status(status));
+        }
+    }
+
+    /// The slots to sample this round, as `(slot id, container name)`: every
+    /// live slot whose container name is known. Unlike the local TUI there
+    /// is no first-running-container fallback — a daemon hosts many tabs'
+    /// containers, so guessing would show another tab's numbers.
+    pub fn stats_targets(&self) -> Vec<(String, String)> {
+        self.slots
+            .iter()
+            .filter(|slot| !slot.snapshot.dormant && !slot.snapshot.container_name.is_empty())
+            .map(|slot| {
+                (
+                    slot.snapshot.slot_id.0.to_string(),
+                    slot.snapshot.container_name.clone(),
+                )
+            })
+            .collect()
+    }
+
+    /// Record a sample for the slot it was taken for, if that slot still
+    /// runs the sampled container.
+    pub fn apply_stats(&mut self, slot_id: &str, stats: AgentStats) -> Option<InstanceEvent> {
+        let tab_id = self.tab_id.clone();
+        let slot = self
+            .slots
+            .iter_mut()
+            .find(|slot| slot.snapshot.slot_id.0.to_string() == slot_id)?;
+        if slot.snapshot.container_name != stats.name {
+            return None;
+        }
+        let wire = AgentStatsWire {
+            name: stats.name,
+            cpu_percent: stats.cpu_percent,
+            memory_mb: stats.memory_mb,
+        };
+        slot.snapshot.stats = Some(wire.clone());
+        Some(InstanceEvent::Delta(InstanceDelta::SlotStats {
+            tab_id,
+            slot_id: slot.snapshot.slot_id,
+            stats: wire,
+        }))
+    }
+
+    /// Forward the agent's latest self-reported status (OSC 7501) for the
+    /// sequential slot that owns the report channel. The engine-side signals
+    /// get it too: dialog deferral reads them, as the local TUI's do.
+    fn report_program_status(&mut self, status: Option<EffectiveStatus>) -> Option<InstanceEvent> {
+        self.feeds.signals.set_status(status.clone());
+        let launch_id = self.stuck_launch?;
+        // A reporting agent is never stuck; the presenter clears its flag on
+        // the report, so the relayed state does too.
+        if status.is_some() {
+            self.projection.stuck = false;
+        }
+        let slot = self.slot_mut(&SlotKey::Sequential(launch_id))?;
+        slot.snapshot.program_status = status.clone();
+        if status.is_some() {
+            slot.snapshot.stuck = false;
+        }
+        Some(InstanceEvent::ProgramStatus {
+            tab_id: self.tab_id.clone(),
+            slot_id: SlotId(launch_id),
+            status,
+        })
+    }
+
+    /// This tab's row of the `agents` TUI context (tab number, container,
+    /// stuck, status, command), from the engine's own view of the tab — the
+    /// same values a builtin TUI derives from its tab state.
+    pub fn agents_tab_snapshot(&self, tab_number: u32) -> TuiTabSnapshot {
+        let live = || self.slots.iter().filter(|slot| !slot.snapshot.dormant);
+        let container_name = self
+            .focused
+            .and_then(|id| self.slots.iter().find(|slot| slot.snapshot.slot_id == id))
+            .map(|slot| slot.snapshot.container_name.clone())
+            .filter(|name| !name.is_empty());
+        TuiTabSnapshot {
+            tab_number,
+            container_name,
+            is_stuck: self.projection.stuck || live().any(|slot| slot.snapshot.stuck),
+            program_status: EffectiveStatus::most_urgent(
+                live().filter_map(|slot| slot.snapshot.program_status.as_ref()),
+            )
+            .cloned(),
+            command_label: self.phase.command_name().to_string(),
+        }
+    }
+
+    /// Hand the instance's `agents` context to this tab's commands.
+    pub fn set_agents_context(&self, context: &AgentsTuiContext) {
+        if let Ok(mut shared) = self.feeds.tui_context_shared.lock() {
+            *shared = context.clone();
         }
     }
 
@@ -731,6 +959,7 @@ impl TabRelay {
             workflow.worktree_path,
         );
         if self.projection.workflow.as_ref() != Some(&projected) {
+            log_workflow_progress(&self.tab_id, self.projection.workflow.as_ref(), &projected);
             events.push(self.delta(InstanceDelta::Workflow {
                 tab_id: self.tab_id.clone(),
                 view: projected.0.clone(),
@@ -748,6 +977,20 @@ impl TabRelay {
                 state: yolo.clone(),
             }));
             self.projection.yolo = yolo;
+        }
+
+        let dashboard = self
+            .feeds
+            .agents_dashboard
+            .lock()
+            .ok()
+            .and_then(|d| d.clone());
+        if dashboard != self.projection.agents_dashboard {
+            events.push(self.delta(InstanceDelta::AgentsDashboard {
+                tab_id: self.tab_id.clone(),
+                data: dashboard.as_ref().and_then(dashboard_wire),
+            }));
+            self.projection.agents_dashboard = dashboard;
         }
     }
 
@@ -871,10 +1114,14 @@ impl TabRelay {
             focused_slot: self.focused,
             yolo: self.projection.yolo.clone(),
             yolo_mode: self.yolo_mode,
-            stuck: false,
+            stuck: self.projection.stuck,
             git_summary: None,
             status_log: self.status_log.clone(),
-            agents_dashboard: None,
+            agents_dashboard: self
+                .projection
+                .agents_dashboard
+                .as_ref()
+                .and_then(dashboard_wire),
             last_container_summary: None,
             annotations: self.annotations.clone(),
         }
@@ -887,5 +1134,77 @@ impl Drop for TabRelay {
         for slot in &mut self.slots {
             slot.finish(0);
         }
+    }
+}
+
+#[cfg(test)]
+mod log_tests {
+    use super::*;
+    use crate::data::instance_snapshot::{WorkflowStepKind, WorkflowStepView};
+
+    fn view(steps: &[(&str, StepViewStatus)]) -> WorkflowViewState {
+        WorkflowViewState {
+            steps: steps
+                .iter()
+                .map(|(name, status)| WorkflowStepView {
+                    name: name.to_string(),
+                    status: *status,
+                    agent: Some("claude".into()),
+                    model: None,
+                    depends_on: Vec::new(),
+                    kind: WorkflowStepKind::Agent,
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn pending_steps_and_unchanged_steps_are_not_logged() {
+        let first = view(&[
+            ("plan", StepViewStatus::Pending),
+            ("build", StepViewStatus::Pending),
+        ]);
+        assert!(workflow_step_changes(None, &first).is_empty());
+        let same = first.clone();
+        assert!(workflow_step_changes(Some(&first), &same).is_empty());
+    }
+
+    #[test]
+    fn each_real_transition_is_reported_once() {
+        let before = view(&[
+            ("plan", StepViewStatus::Running),
+            ("build", StepViewStatus::Pending),
+        ]);
+        let after = view(&[
+            ("plan", StepViewStatus::Done),
+            ("build", StepViewStatus::Running),
+        ]);
+        let changes = workflow_step_changes(Some(&before), &after);
+        assert_eq!(
+            changes,
+            vec![
+                StepChange {
+                    step: "plan",
+                    from: Some(StepViewStatus::Running),
+                    to: StepViewStatus::Done,
+                    agent: Some("claude"),
+                },
+                StepChange {
+                    step: "build",
+                    from: Some(StepViewStatus::Pending),
+                    to: StepViewStatus::Running,
+                    agent: Some("claude"),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_step_first_seen_running_has_no_previous_status() {
+        let after = view(&[("plan", StepViewStatus::Running)]);
+        let changes = workflow_step_changes(None, &after);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].from, None);
     }
 }

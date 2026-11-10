@@ -84,7 +84,7 @@ impl SharedWorkflowPresentation {
 }
 
 /// The latest `agents status` frame, rendered as a `Table` widget.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AgentsDashboardData {
     pub overview: crate::command::commands::agents::AgentsOverview,
     /// True while a `--watch` loop is refreshing this slot; drives the

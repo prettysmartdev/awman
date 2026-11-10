@@ -162,6 +162,10 @@ impl InstanceBackend for LocalInstanceBackend {
         self.instance.squad_admission()
     }
 
+    fn squad_enabled_in_config(&self) -> Result<bool, CommandError> {
+        self.instance.squad_enabled_in_config()
+    }
+
     fn squad_daemon_is_running(&self) -> Result<bool, CommandError> {
         self.instance.squad_daemon_is_running()
     }

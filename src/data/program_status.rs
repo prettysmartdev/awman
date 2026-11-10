@@ -373,6 +373,14 @@ impl EffectiveStatus {
     pub fn same_transition(&self, other: &EffectiveStatus) -> bool {
         self.state == other.state && self.kind == other.kind
     }
+
+    /// The status a tab shows for several agents: the highest
+    /// [`ProgramState::priority`] wins.
+    pub fn most_urgent<'a>(
+        statuses: impl IntoIterator<Item = &'a EffectiveStatus>,
+    ) -> Option<&'a EffectiveStatus> {
+        statuses.into_iter().max_by_key(|s| s.state.priority())
+    }
 }
 
 /// Every record one agent has reported, keyed by id (the root is `""`).

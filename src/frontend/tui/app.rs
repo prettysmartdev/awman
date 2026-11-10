@@ -269,18 +269,15 @@ impl App {
     }
 
     /// Focus the existing squad tab, or create the singleton one — asking
-    /// first when that would also start a daemon.
+    /// first when that would change config or start a daemon.
     ///
     /// On failure nothing is created: the error text — which already names
     /// a daemon conflict or unsupported runtime — is surfaced
     /// verbatim in the status bar, never a generic "could not connect".
     /// Idempotent: a second call focuses the tab created by the first.
     ///
-    /// WI 0110: opening the tab starts a long-lived background process when no
-    /// squad daemon is running, so that case raises
-    /// [`Dialog::SquadStartConfirm`] and builds nothing until the user answers
-    /// `y` ([`App::build_and_install_squad_tab`]). With a daemon already
-    /// running there is nothing to consent to and no dialog is raised.
+    /// Opening the tab enables squad in global config when necessary and
+    /// starts the daemon when necessary. The confirmation describes both.
     pub fn open_or_focus_squad_tab(&mut self) {
         if let Some(idx) = self.tabs.iter().position(|t| t.is_squad) {
             self.active_tab = idx;
@@ -294,26 +291,37 @@ impl App {
             self.status_bar.text = error.to_string();
             return;
         }
-        match self.backend.squad_daemon_is_running() {
-            Ok(true) => self.build_and_install_squad_tab(),
-            Ok(false) => {
-                self.active_dialog = Some(Dialog::SquadStartConfirm);
-                self.needs_redraw = true;
+        let enable_config = match self.backend.squad_enabled_in_config() {
+            Ok(enabled) => !enabled,
+            Err(error) => {
+                self.status_bar.text = format!("could not read squad config: {error}");
+                return;
             }
-            // Whether a daemon is running could not be determined (an
-            // unreadable squad root, say). Fall through to the ordinary build,
-            // whose error text is the specific one worth showing.
-            Err(_) => self.build_and_install_squad_tab(),
+        };
+        let start_daemon = match self.backend.squad_daemon_is_running() {
+            Ok(running) => !running,
+            // When the state is uncertain, startup may still need to spawn a
+            // daemon. Keep that possibility in the confirmation.
+            Err(_) => true,
+        };
+        if enable_config || start_daemon {
+            self.active_dialog = Some(Dialog::SquadStartConfirm {
+                enable_config,
+                start_daemon,
+            });
+            self.needs_redraw = true;
+        } else {
+            self.build_and_install_squad_tab();
         }
     }
 
-    /// Start the squad tab and install it as the active tab, starting the
-    /// daemon if it is not already running. The second half of
+    /// Start the squad tab and install it as the active tab, enabling squad
+    /// in config and starting the daemon when needed. The second half of
     /// [`App::open_or_focus_squad_tab`], separated so the daemon-start
     /// confirmation can call it on `y`.
     ///
-    /// Starting a daemon means spawning a process and then waiting — up to ten
-    /// seconds — for it to publish its endpoint. Doing that inline froze the
+    /// Starting a daemon means spawning a process and then waiting for it to
+    /// publish its endpoint. Doing that inline froze the
     /// event loop for the whole wait: the terminal could not redraw, so the
     /// confirmation the user had just answered stayed painted on screen until
     /// the wait ended, and a failure surfaced only as a status-bar line under
@@ -343,7 +351,7 @@ impl App {
 
         self.squad_startup_rx = Some(self.backend.start_squad_gateway());
         self.active_dialog = Some(Dialog::Loading {
-            title: "Starting the awman daemon".to_string(),
+            title: "Opening squad".to_string(),
         });
         self.needs_redraw = true;
     }
@@ -402,7 +410,7 @@ impl App {
         let message = error.to_string();
         self.status_bar.text = message.clone();
         self.active_dialog = Some(Dialog::Notice {
-            title: "squad daemon did not start".to_string(),
+            title: "could not open squad".to_string(),
             body: message,
             copy_key: None,
             copy_zshrc_snippet: None,
@@ -779,13 +787,8 @@ impl App {
                 .iter_mut()
                 .find(|s| s.launch_id.to_string() == sample.step_name)
                 .and_then(|s| s.container_info.as_mut());
-            if let Some(info) = info.filter(|info| {
-                info.container_name.is_empty() || info.container_name == sample.stats.name
-            }) {
-                let stats = sample.stats;
-                info.stats_history
-                    .push((stats.cpu_percent, stats.memory_mb));
-                info.latest_stats = Some(stats);
+            if let Some(info) = info {
+                info.record_stats(sample.stats);
             }
         }
     }

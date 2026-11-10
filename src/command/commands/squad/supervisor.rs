@@ -19,7 +19,9 @@ use crate::command::commands::squad::runtime_guard::require_container_tier;
 use crate::command::dispatch::catalogue::GatewayNeed;
 use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
+use crate::data::config::config_json::set_config_field;
 use crate::data::config::env::EnvSnapshot;
+use crate::data::config::file::{global_config_path, ConfigFile, FileKind};
 use crate::data::fs::DataPaths;
 use crate::engine::daemon::DaemonSupervisor;
 use crate::engine::squad::{SquadHealth, SquadSupervisor};
@@ -77,6 +79,39 @@ impl DaemonResolver {
                 .running_pid()?
                 .is_some(),
         )
+    }
+
+    /// Whether the persistent global config already enables squad. The TUI
+    /// uses this to ask before changing the user's config.
+    pub fn squad_enabled_in_config(&self) -> Result<bool, CommandError> {
+        let path = global_config_path(&self.env)?;
+        let config = ConfigFile::load(&path, FileKind::Global)?;
+        Ok(config
+            .daemon
+            .and_then(|daemon| daemon.features)
+            .and_then(|features| features.squad)
+            .and_then(|squad| squad.enabled)
+            .unwrap_or(false))
+    }
+
+    /// Persist the setting before starting a daemon, preserving every other
+    /// global field. Return whether a write was needed.
+    fn enable_squad_in_config(&self) -> Result<bool, SquadStartError> {
+        let path = global_config_path(&self.env).map_err(config_error)?;
+        let config = ConfigFile::load(&path, FileKind::Global).map_err(config_error)?;
+        let mut value = config.to_value();
+        if value["daemon"]["features"]["squad"]["enabled"] == true {
+            return Ok(false);
+        }
+        set_config_field(
+            &mut value,
+            "daemon.features.squad.enabled",
+            serde_json::Value::Bool(true),
+        );
+        ConfigFile::from_value(value, FileKind::Global)
+            .and_then(|config| config.save(&path, FileKind::Global))
+            .map_err(config_error)?;
+        Ok(true)
     }
 
     /// A squad gateway to the running daemon, after bringing its task
@@ -149,25 +184,37 @@ impl DaemonResolver {
             .map_err(|error| SquadStartError::SandboxRuntime(error.to_string()))
     }
 
-    /// Open squad for an interactive frontend that has the user's consent to
-    /// start the daemon: start it in the background (`awman daemon start
-    /// --background`) when none is running, then return a synced gateway.
+    /// Open squad after the TUI's confirmation. Persist the enabled setting,
+    /// reload a running daemon when needed, or start one in the background,
+    /// then return a synced gateway.
     pub async fn open_for_frontend(&self, engines: &Engines) -> SquadStartupResult {
         Self::admit_runtime(engines)?;
+        let config_changed = self.enable_squad_in_config()?;
         let client = match self.client().map_err(other)? {
-            Some(client) => client,
+            Some(client) => {
+                if config_changed {
+                    client
+                        .call(&Request::post("/v1/config/reload", None))
+                        .await
+                        .map_err(|error| {
+                            SquadStartError::Other(format!(
+                                "squad was enabled in config, but the running daemon could not reload it: {error}"
+                            ))
+                        })?;
+                }
+                client
+            }
             None => self.start_in_background().await?,
         };
-        // The daemon may be up with squad switched off; say so instead of
-        // building a tab whose every poll is refused.
+        // A higher-priority override may still leave squad off; say so
+        // instead of building a tab whose every poll is refused.
         let feature: serde_json::Value = client
             .call(&Request::get("/v1/features/squad"))
             .await
             .map_err(other)?;
         if feature["state"] == "off" {
             return Err(SquadStartError::Other(
-                "the squad feature is off; turn it on with \
-                 `awman config set daemon.features.squad.enabled true`"
+                "the squad feature is still off after enabling it in config; check daemon environment overrides"
                     .into(),
             ));
         }
@@ -213,6 +260,10 @@ fn other(error: impl std::fmt::Display) -> SquadStartError {
     SquadStartError::Other(format!("could not reach the awman daemon: {error}"))
 }
 
+fn config_error(error: impl std::fmt::Display) -> SquadStartError {
+    SquadStartError::Other(format!("could not enable squad in config: {error}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -223,6 +274,47 @@ mod tests {
         let env =
             EnvSnapshot::with_overrides([(AWMAN_HOME, tmp.path().to_string_lossy().to_string())]);
         (tmp, env)
+    }
+
+    #[test]
+    fn enabling_squad_persists_only_that_global_field() {
+        let (_tmp, env) = empty_home();
+        let path = global_config_path(&env).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"daemon":{"maxConcurrentJobs":7,"features":{"squad":{"enabled":false,"envPersistence":"none"}}}}"#,
+        )
+        .unwrap();
+        let resolver = DaemonResolver::from_env(&env).unwrap();
+
+        assert!(!resolver.squad_enabled_in_config().unwrap());
+        assert!(resolver.enable_squad_in_config().unwrap());
+        assert!(resolver.squad_enabled_in_config().unwrap());
+        let written = ConfigFile::load(&path, FileKind::Global)
+            .unwrap()
+            .to_value();
+        assert_eq!(written["daemon"]["features"]["squad"]["enabled"], true);
+        assert_eq!(
+            written["daemon"]["features"]["squad"]["envPersistence"],
+            "none"
+        );
+        assert_eq!(written["daemon"]["maxConcurrentJobs"], 7);
+
+        let first_write = std::fs::read(&path).unwrap();
+        assert!(!resolver.enable_squad_in_config().unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), first_write);
+    }
+
+    #[test]
+    fn malformed_config_is_not_replaced_when_enabling_squad() {
+        let (_tmp, env) = empty_home();
+        let path = global_config_path(&env).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{ invalid json").unwrap();
+        let resolver = DaemonResolver::from_env(&env).unwrap();
+        assert!(resolver.enable_squad_in_config().is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{ invalid json");
     }
 
     #[tokio::test]

@@ -2097,17 +2097,23 @@ fn the_daemon_start_confirmation_opens_no_tab_until_it_is_accepted() {
     let mut app = make_app_no_container_runtime();
     let tabs_before = app.tabs.len();
 
-    app.active_dialog = Some(Dialog::SquadStartConfirm);
+    app.active_dialog = Some(Dialog::SquadStartConfirm {
+        enable_config: true,
+        start_daemon: true,
+    });
     press_key(&mut app, KeyCode::Char('n'), KeyModifiers::NONE);
     assert!(app.active_dialog.is_none());
     assert_eq!(app.tabs.len(), tabs_before, "declining opens no tab");
     assert!(
-        app.status_bar.text.contains("not started"),
+        app.status_bar.text.contains("not opened"),
         "declining says so: {:?}",
         app.status_bar.text
     );
 
-    app.active_dialog = Some(Dialog::SquadStartConfirm);
+    app.active_dialog = Some(Dialog::SquadStartConfirm {
+        enable_config: true,
+        start_daemon: true,
+    });
     press_key(&mut app, KeyCode::Char('y'), KeyModifiers::NONE);
     assert!(app.active_dialog.is_none());
     assert!(
@@ -2193,7 +2199,10 @@ fn a_daemon_start_already_in_flight_makes_a_second_confirmation_inert() {
     // A start is outstanding: the channel a real `y` would have installed.
     let (_tx, rx) = std::sync::mpsc::channel();
     app.squad_startup_rx = Some(rx);
-    app.active_dialog = Some(Dialog::SquadStartConfirm);
+    app.active_dialog = Some(Dialog::SquadStartConfirm {
+        enable_config: true,
+        start_daemon: true,
+    });
 
     let started = std::time::Instant::now();
     press_key(&mut app, KeyCode::Char('y'), KeyModifiers::NONE);
@@ -2261,7 +2270,7 @@ fn a_failed_daemon_start_is_reported_in_a_modal() {
 
     match &app.active_dialog {
         Some(Dialog::Notice { title, body, .. }) => {
-            assert!(title.contains("did not start"), "{title:?}");
+            assert!(title.contains("could not open squad"), "{title:?}");
             assert!(body.contains("did not become ready"), "{body:?}");
         }
         other => panic!(
