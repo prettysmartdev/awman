@@ -21,12 +21,18 @@ it.each([
 });
 
 it('requires wasm-unsafe-eval (never unsafe-eval) when the export ships WebAssembly', async () => {
-  const { CONTENT_SECURITY_POLICY } = await import('../src/security');
+  const { contentSecurityPolicy } = await import('../src/security');
   const wasm = ['index.html', '_next/static/media/ghostty-vt.0000.wasm'];
-  expect(wasmPolicyProblems(wasm, CONTENT_SECURITY_POLICY)).toEqual([]);
+  expect(wasmPolicyProblems(wasm, contentSecurityPolicy('https://example.test'))).toEqual([]);
   expect(wasmPolicyProblems(wasm, "default-src 'none'; script-src 'self'")).toHaveLength(1);
   expect(wasmPolicyProblems(['index.html'], "script-src 'self'")).toEqual([]);
   expect(wasmPolicyProblems(['index.html'], "script-src 'self' 'unsafe-eval'")).toHaveLength(1);
+});
+
+it('limits connections to the loaded page host on the daemon port', async () => {
+  const { contentSecurityPolicy } = await import('../src/security');
+  expect(contentSecurityPolicy('http://100.101.102.103:3000')).toContain("connect-src 'self' http://100.101.102.103:9877 ws://100.101.102.103:9877");
+  expect(contentSecurityPolicy('https://host.tailnet.example')).toContain("connect-src 'self' https://host.tailnet.example:9877 wss://host.tailnet.example:9877");
 });
 
 it('rejects deployment config keys outside the allowlist (privacy review #4)', () => {

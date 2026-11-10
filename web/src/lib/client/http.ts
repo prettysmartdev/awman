@@ -1,16 +1,26 @@
-// The one HTTP transport to the same-machine daemon (design §5.4).
+// The one HTTP transport to the daemon on the host that served this page.
 //
 // Every request: cache 'no-store', credentials 'omit', redirect 'error',
-// mode 'cors', and `targetAddressSpace: 'loopback'` (Chrome Local Network
-// Access; unknown RequestInit members are ignored by other browsers, so the
-// hint is always sent). Bodies are JSON with `Content-Type: application/json`
+// mode 'cors', and `targetAddressSpace: 'loopback'` only for a loopback host
+// (Chrome Local Network Access). Bodies are JSON with `Content-Type: application/json`
 // and bounded to 64 KiB (design §2.8). The grant travels only in the
 // Authorization header — never in a URL, cookie or storage.
 import { DaemonError, DaemonUnreachable, ProtocolError, isAbortError } from './errors';
 import type { ApiErrorBody } from './types';
 
-export const DAEMON_HTTP = 'http://127.0.0.1:9877';
-export const DAEMON_WS = 'ws://127.0.0.1:9877';
+/** The daemon is addressed through the host that served this page. */
+export function daemonEndpoints(page: Pick<Location, 'hostname' | 'protocol'>): { http: string; ws: string; hostPort: string } {
+  const hostPort = `${page.hostname}:9877`;
+  const secure = page.protocol === 'https:';
+  return { http: `${secure ? 'https' : 'http'}://${hostPort}`, ws: `${secure ? 'wss' : 'ws'}://${hostPort}`, hostPort };
+}
+// Static rendering has no page location. It has no daemon endpoint; browser
+// modules evaluate this again with the actual loaded hostname.
+const endpoints = typeof location === 'undefined' ? null : daemonEndpoints(location);
+export const DAEMON_HTTP = endpoints?.http ?? '';
+export const DAEMON_WS = endpoints?.ws ?? '';
+export const DAEMON_HOST_PORT = endpoints?.hostPort ?? '';
+const targetIsLoopback = typeof location !== 'undefined' && ['localhost', '127.0.0.1', '[::1]'].includes(location.hostname);
 export const MAX_REQUEST_BODY_BYTES = 64 * 1024;
 /** Responses larger than this are refused (snapshots travel on the socket, not HTTP). */
 export const MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
@@ -90,6 +100,7 @@ export class HttpTransport {
   /** Raw request; resolves for any HTTP status, rejects with DaemonUnreachable on network failure. */
   async raw(path: string, options: RequestOptions = {}): Promise<Response> {
     if (!path.startsWith('/v1/')) throw new ProtocolError(`refusing non-API path ${path}`);
+    if (!this.base) throw new ProtocolError('daemon requests require a loaded browser page');
     const headers: Record<string, string> = { Accept: 'application/json', ...options.headers };
     let body: string | undefined;
     if (options.body !== undefined) {
@@ -102,7 +113,7 @@ export class HttpTransport {
     const timeout = setTimeout(() => controller.abort(new DOMException('timeout', 'TimeoutError')), options.timeoutMs ?? 10_000);
     const onAbort = () => controller.abort(options.signal?.reason);
     options.signal?.addEventListener('abort', onAbort, { once: true });
-    const init: RequestInit & { targetAddressSpace: 'loopback' } = {
+    const init: RequestInit & { targetAddressSpace?: 'loopback' } = {
       method: options.method ?? 'GET',
       headers,
       body,
@@ -112,7 +123,7 @@ export class HttpTransport {
       mode: 'cors',
       referrerPolicy: 'no-referrer',
       signal: controller.signal,
-      targetAddressSpace: 'loopback',
+      ...(targetIsLoopback ? { targetAddressSpace: 'loopback' as const } : {}),
     };
     try {
       const response = await this.fetchImpl(`${this.base}${path}`, init);

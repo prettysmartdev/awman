@@ -145,6 +145,26 @@ export function isInstanceDelta(v: unknown): v is InstanceDelta {
 
 const isAnsweredBy = (v: unknown) => isObj(v) && (v.by === 'api' || v.by === 'engine' || (v.by === 'frontend' && isStr(v.frontend_id)));
 const isCommandResult = (v: unknown) => isObj(v) && isInt(v.exit_code) && (v.error === null || (isObj(v.error) && isStr(v.error.code) && isStr(v.error.message)));
+const isQueueEntry = (v: unknown) => isObj(v) && isStr(v.id) && isStr(v.server) && isStr(v.title)
+  && nullable(isStr)(v.summary) && isStr(v.kind) && isStringMap(v.labels)
+  && isInt(v.priority) && isInt(v.age_ms) && isBool(v.for_you)
+  && nullable(isStr)(v.body) && nullable(isStr)(v.source_url);
+const isQueueReply = (v: unknown): boolean => {
+  if (!isObj(v)) return false;
+  switch (v.result) {
+    case 'snapshot': return isObj(v.value) && isArrayOf(isQueueEntry)(v.value.items)
+      && isInt(v.value.for_you) && isInt(v.value.new_since_seen)
+      && nullable(isStr)(v.value.error) && isBool(v.value.loaded);
+    case 'picked': return isObj(v.value) && isStr(v.value.lease_id) && isStr(v.value.title)
+      && isStr(v.value.server) && isStr(v.value.cwd) && isStr(v.value.command_line)
+      && isArrayOf(isStr)(v.value.argv);
+    case 'checkout_offer': return isBool(v.value);
+    case 'done': return true;
+    case 'error': return isObj(v.value) && oneOf(['ineligible', 'taken', 'failed'])(v.value.code)
+      && (v.value.code === 'taken' || isStr(v.value.error));
+    default: return false;
+  }
+};
 
 /**
  * Validates one parsed envelope (seq already checked). Snapshot frames carry
@@ -153,6 +173,7 @@ const isCommandResult = (v: unknown) => isObj(v) && isInt(v.exit_code) && (v.err
 export function isEngineFrame(v: Obj): v is Obj & EngineFrame {
   if (!oneOf(ENGINE_FRAME_TYPES)(v.type)) return false;
   switch (v.type as EngineFrame['type']) {
+    case 'worker_queue': return isInt(v.request_id) && isQueueReply(v.reply);
     case 'welcome':
       return isStr(v.frontend_id) && v.frontend_id.length > 0 && isStr(v.instance_id) && isStr(v.protocol) && isStr(v.build) && oneOf(ROLES)(v.role);
     case 'snapshot': {

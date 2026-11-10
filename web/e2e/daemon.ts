@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 const execute = promisify(execFile);
 export const root = resolve(fileURLToPath(new URL('../..', import.meta.url)));
 export const endpoint = 'http://127.0.0.1:9877';
-export const origin = 'http://localhost:3000';
+export const origin = 'http://127.0.0.1:3000';
 
 export class Daemon {
   private child?: ChildProcess;

@@ -12,7 +12,6 @@ use crate::data::config::units::DurationStr;
 use crate::data::config::work_servers::ResolvedWorkServer;
 use crate::data::daemon_state::FeatureName;
 use crate::data::fs::daemon_env::EnvPersistenceSetting;
-use std::collections::BTreeMap;
 
 /// How a job interacts with its user: an attachable terminal session, or
 /// headless (no prompts; defaults answer them).

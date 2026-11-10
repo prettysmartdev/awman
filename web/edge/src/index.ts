@@ -87,7 +87,7 @@ export default {
         await Promise.race([counting, new Promise<void>(resolve => { timer = setTimeout(resolve, COUNT_WAIT_MS); })]);
         clearTimeout(timer);
       }
-      return secureResponse(response);
+      return secureResponse(response, request.url);
     } catch {
       return fixedResponse(503, 'Service unavailable');
     }

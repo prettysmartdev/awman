@@ -39,8 +39,8 @@ Specs:
 - `link.spec.ts` exercises the browser link flow against the real daemon:
   creation from a gesture, CLI confirmation with the displayed Origin, listener
   and scope, approval and denial, one-use polling, launch-context access with the
-  grant, grant revocation through `awman daemon api browsers.delete`, and code
-  expiry on the real five-minute clock.
+  grant and grant revocation through `awman daemon api browsers.delete`.
+  Clock-controlled Rust and browser-client unit tests cover code expiry.
 - `app.spec.ts` loads the exported app from `web/out` and checks the connect
   screen's recipe states (daemon stopped, engine off, listener off) and the
   recheck and link initiation controls. It fails explicitly if `web/out` is

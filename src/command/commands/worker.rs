@@ -1,4 +1,4 @@
-//! `awman worker link`: device approval or a server-issued static token.
+//! Work-server half of `awman link`: device approval or a server-issued static token.
 //!
 //! Secret hygiene: the token lives only in [`Secret`] (redacted `Debug`, never
 //! formatted), is written solely to the owner-only link store, and is never

@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { DaemonClient } from '@/lib/client/daemonClient';
 import { DaemonError, DaemonUnreachable, GrantRevoked, ProtocolError } from '@/lib/client/errors';
 import { clearGrant, currentGrant, setGrant } from '@/lib/client/grant';
-import { HttpTransport } from '@/lib/client/http';
+import { daemonEndpoints, HttpTransport } from '@/lib/client/http';
 import { GRANT, TICKET, fakeFetch, fixture } from './helpers';
 
 const http = fixture<Record<string, unknown>>('http.json');
@@ -10,6 +10,14 @@ const http = fixture<Record<string, unknown>>('http.json');
 afterEach(() => clearGrant());
 
 describe('HttpTransport', () => {
+  it('uses the loaded page hostname for daemon HTTP and WebSocket endpoints', () => {
+    expect(daemonEndpoints({ hostname: '100.101.102.103', protocol: 'http:' })).toEqual({
+      http: 'http://100.101.102.103:9877', ws: 'ws://100.101.102.103:9877', hostPort: '100.101.102.103:9877',
+    });
+    expect(daemonEndpoints({ hostname: 'host.tailnet.example', protocol: 'https:' })).toEqual({
+      http: 'https://host.tailnet.example:9877', ws: 'wss://host.tailnet.example:9877', hostPort: 'host.tailnet.example:9877',
+    });
+  });
   it('sends every request no-store, credential-less, redirect-refusing, with the loopback hint', async () => {
     const { calls, transport } = fakeFetch(() => ({ status: 200, body: { status: 'ok' } }));
     await transport.json('/v1/health');

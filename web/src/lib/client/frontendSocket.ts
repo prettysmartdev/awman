@@ -52,6 +52,8 @@ import {
   type Hello,
   type InstanceDelta,
   type InstanceSnapshot,
+  type QueueReply,
+  type QueueRequest,
   type Seq,
   type TermSize,
   type UiOutcome,
@@ -111,6 +113,11 @@ interface PendingUi {
   resolve(outcome: UiOutcome): void;
   reject(error: Error): void;
 }
+interface PendingQueue {
+  resolve(reply: QueueReply): void;
+  reject(error: Error): void;
+  timer: unknown;
+}
 
 export class FrontendConnection {
   readonly store = new InstanceStore();
@@ -135,6 +142,8 @@ export class FrontendConnection {
   private readonly pendingSubmits = new Map<string, string>(); // tab_id → description
   private readonly pendingAnswers = new Set<string>(); // dialog_id
   private readonly pendingUi = new Map<Seq, PendingUi>();
+  private readonly pendingQueue = new Map<number, PendingQueue>();
+  private nextQueueRequestId = 0;
   private readonly socketFactory: SocketFactory;
   private readonly now: () => number;
   private readonly setTimer: (fn: () => void, ms: number) => unknown;
@@ -190,6 +199,19 @@ export class FrontendConnection {
     return new Promise((resolve, reject) => {
       const seq = this.send({ type: 'ui_request', ...request } as FrontendFrameOf<'ui_request'>);
       this.pendingUi.set(seq, { resolve, reject });
+    });
+  }
+
+  /** WI143's instance-owned queue; no worker HTTP authority is given to the browser. */
+  queueRequest(tabId: string, request: QueueRequest): Promise<QueueReply> {
+    const requestId = ++this.nextQueueRequestId;
+    this.send({ type: 'worker_queue', request_id: requestId, tab_id: tabId, request });
+    return new Promise((resolve, reject) => {
+      const timer = this.setTimer(() => {
+        this.pendingQueue.delete(requestId);
+        reject(new Error('The work queue did not answer within 120 seconds. Check its status before retrying.'));
+      }, 120_000);
+      this.pendingQueue.set(requestId, { resolve, reject, timer });
     });
   }
 
@@ -364,6 +386,15 @@ export class FrontendConnection {
         pending?.resolve(frame.outcome);
         return true;
       }
+      case 'worker_queue': {
+        const pending = this.pendingQueue.get(frame.request_id);
+        if (pending) {
+          this.clearTimer(pending.timer);
+          this.pendingQueue.delete(frame.request_id);
+          pending.resolve(frame.reply);
+        }
+        return true;
+      }
       case 'detach':
         this.store.applyFrame(frame);
         this.finish({ kind: 'detached', reason: frame.reason });
@@ -454,6 +485,11 @@ export class FrontendConnection {
     this.pendingAnswers.clear();
     for (const pending of this.pendingUi.values()) pending.reject(new NotConnectedError());
     this.pendingUi.clear();
+    for (const pending of this.pendingQueue.values()) {
+      this.clearTimer(pending.timer);
+      pending.reject(new NotConnectedError());
+    }
+    this.pendingQueue.clear();
   }
 
   private scheduleReconnect(): void {
@@ -489,6 +525,11 @@ export class FrontendConnection {
     }
     for (const pending of this.pendingUi.values()) pending.reject(new NotConnectedError());
     this.pendingUi.clear();
+    for (const pending of this.pendingQueue.values()) {
+      this.clearTimer(pending.timer);
+      pending.reject(new NotConnectedError());
+    }
+    this.pendingQueue.clear();
     if (reason.kind === 'grace_expired') this.store.markEnded('connection lost for longer than the reconnect grace');
     if (reason.kind === 'not_found') this.store.markEnded('instance not found (the daemon may have restarted)');
     if (reason.kind === 'revoked') this.store.markEnded('browser access was revoked');

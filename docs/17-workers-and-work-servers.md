@@ -12,7 +12,7 @@ Mode](09-api-and-remote-mode.md) and [The daemon](16-daemon.md).
 Link with device approval:
 
 ```sh
-awman worker link https://work.example.com --name team --label pool=laptops
+awman link https://work.example.com --name team --label pool=laptops
 ```
 
 awman displays the verification URI and code, opens the URI when possible,
@@ -21,7 +21,7 @@ token directly. Pass it as `--token TOKEN`, or use `--token -` to read it from
 stdin:
 
 ```sh
-awman worker link https://work.example.com --name team --token - < token.txt
+awman link https://work.example.com --name team --token - < token.txt
 ```
 
 Avoid a literal token argument because command arguments may be visible to
@@ -48,7 +48,7 @@ cleanup and retains the token until the daemon retires the server.
 
 If the server revokes a link, the worker stops claiming from it, cancels its
 running leases, and `awman daemon status` shows the server as `revoked`. To link again, remove the entry with
-`awman config unset workServers.<name>` and run `awman worker link` once more.
+`awman config unset workServers.<name>` and run `awman link` once more.
 
 ## Work server settings
 

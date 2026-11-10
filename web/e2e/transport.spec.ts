@@ -34,7 +34,7 @@ test('exact origin, replacement and browser requests cannot use API keys', async
     try { return (await fetch(endpoint + '/v1/health', { cache: 'no-store' })).status; }
     catch { return null; }
   }, endpoint);
-  // The production preset must reject localhost until the owner explicitly adds it.
+  // The production preset must reject this development origin until the owner adds it.
   expect(await probe()).toBeNull();
   await daemon.allowOrigin();
   await expect.poll(probe).toBe(200);
@@ -45,6 +45,6 @@ test('exact origin, replacement and browser requests cannot use API keys', async
     })).status;
   }, { endpoint, key });
   expect(status).toBe(401);
-  await daemon.set('daemon.network.listeners.loopback.allowedOrigins', 'http://127.0.0.1:3000');
+  await daemon.set('daemon.network.listeners.loopback.allowedOrigins', 'http://localhost:3000');
   await expect.poll(probe).toBeNull();
 });

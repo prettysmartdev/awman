@@ -1,8 +1,7 @@
 // Built-output audit (design §5.1, §5.7; gaps WF-1/WF-4). Fails when the
 // static export:
-//   - references any network origin other than the fixed same-machine daemon
-//     (http://127.0.0.1:9877, ws://127.0.0.1:9877) or the app's own hosted
-//     origin, outside a short list of inert strings (XML namespaces, framework
+//   - bakes in a daemon or third-party network origin instead of deriving the
+//     daemon host from the loaded page, outside a short list of inert strings (XML namespaces, framework
 //     error-documentation links, core-js URL feature tests) that are never
 //     fetched. The production CSP `connect-src` is the runtime enforcement;
 //     this is the build-time tripwire for an accidental cloud request.
@@ -16,7 +15,7 @@ import { readFile, readdir } from 'node:fs/promises';
 import { extname, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-export const ALLOWED_ORIGINS = ['http://127.0.0.1:9877', 'ws://127.0.0.1:9877', 'https://awman.prettysmart.dev'];
+export const ALLOWED_ORIGINS = ['https://awman.prettysmart.dev'];
 
 // Exact strings or prefixes that appear in framework code as data, not as
 // request targets. Prefixes end with '/'.
@@ -110,6 +109,6 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
     process.stderr.write(`audit-output: ${failures.length} problem(s)\n${[...new Set(failures)].join('\n')}\n`);
     process.exitCode = 1;
   } else {
-    process.stdout.write('audit-output: no non-loopback origins, storage APIs, session data or source maps in the export\n');
+    process.stdout.write('audit-output: no baked daemon or third-party origins, storage APIs, session data or source maps in the export\n');
   }
 }

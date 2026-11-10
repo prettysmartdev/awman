@@ -55,6 +55,17 @@ function attach(socket: FakeSocket, frontendId = 'frn_1') {
 }
 
 describe('FrontendConnection: handshake', () => {
+  it('correlates WI143 queue replies and rejects an outstanding request on disconnect', async () => {
+    const { hub, connection } = await setup();
+    attach(hub.last);
+    const pending = connection.queueRequest(TAB, { operation: 'snapshot' });
+    expect(hub.last.frames().at(-1)).toMatchObject({ type: 'worker_queue', request_id: 1, tab_id: TAB, request: { operation: 'snapshot' } });
+    hub.last.receive({ seq: 3, type: 'worker_queue', request_id: 1, reply: { result: 'snapshot', value: { items: [], for_you: 0, new_since_seen: 0, error: null, loaded: true } } });
+    await expect(pending).resolves.toMatchObject({ result: 'snapshot', value: { loaded: true } });
+    const abandoned = connection.queueRequest(TAB, { operation: 'pick', server: 'team', item_id: 'item_1' });
+    hub.last.serverClose(1006);
+    await expect(abandoned).rejects.toBeInstanceOf(NotConnectedError);
+  });
   it('opens a ticketed socket and sends a web Hello without env/cwd/argv', async () => {
     const { hub, connection } = await setup();
     const socket = hub.last;

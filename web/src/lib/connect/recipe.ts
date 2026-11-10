@@ -16,4 +16,5 @@ export const DAEMON_STATUS = 'awman daemon status';
 /** Launch-context creation, run from the project directory (design §3.4). */
 export const LAUNCH_CONTEXT_RECIPE = 'awman daemon api launch_contexts.create default=true';
 
-export const EXPECTED_ENDPOINT = '127.0.0.1:9877';
+import { DAEMON_HOST_PORT } from '../client/http';
+export const EXPECTED_ENDPOINT = DAEMON_HOST_PORT;

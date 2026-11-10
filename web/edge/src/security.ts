@@ -4,14 +4,19 @@
 // load-failure notice. This allows WASM compilation only; JavaScript eval
 // stays forbidden. Never add 'unsafe-eval'.
 export const TERMINAL_REQUIRES_WASM_UNSAFE_EVAL = true;
-export const CONTENT_SECURITY_POLICY = [
-  "default-src 'none'",
-  `script-src 'self'${TERMINAL_REQUIRES_WASM_UNSAFE_EVAL ? " 'wasm-unsafe-eval'" : ''}`,
-  "style-src 'self'", "font-src 'self'", "img-src 'self'", "manifest-src 'self'",
-  "worker-src 'self'", "connect-src 'self' http://127.0.0.1:9877 ws://127.0.0.1:9877",
-  "base-uri 'none'", "form-action 'none'", "frame-ancestors 'none'", "object-src 'none'",
-].join('; ');
-export function secureResponse(response: Response): Response {
+export function contentSecurityPolicy(pageUrl: string): string {
+  const page = new URL(pageUrl);
+  const hostPort = `${page.hostname}:9877`;
+  const secure = page.protocol === 'https:';
+  return [
+    "default-src 'none'",
+    `script-src 'self'${TERMINAL_REQUIRES_WASM_UNSAFE_EVAL ? " 'wasm-unsafe-eval'" : ''}`,
+    "style-src 'self'", "font-src 'self'", "img-src 'self'", "manifest-src 'self'",
+    "worker-src 'self'", `connect-src 'self' ${secure ? 'https' : 'http'}://${hostPort} ${secure ? 'wss' : 'ws'}://${hostPort}`,
+    "base-uri 'none'", "form-action 'none'", "frame-ancestors 'none'", "object-src 'none'",
+  ].join('; ');
+}
+export function secureResponse(response: Response, pageUrl?: string): Response {
   const headers = new Headers(response.headers);
   headers.set('Referrer-Policy', 'no-referrer');
   headers.set('Permissions-Policy', 'camera=(), microphone=(), geolocation=(), payment=(), usb=(), browsing-topics=()');
@@ -24,7 +29,8 @@ export function secureResponse(response: Response): Response {
     headers.set('Content-Security-Policy', "default-src 'none'; sandbox");
   }
   if (type === 'text/html') {
-    headers.set('Content-Security-Policy', CONTENT_SECURITY_POLICY);
+    if (!pageUrl) throw new Error('HTML response requires the loaded page URL');
+    headers.set('Content-Security-Policy', contentSecurityPolicy(pageUrl));
     headers.set('X-Frame-Options', 'DENY');
     // Each network navigation reaches the Worker. The service worker owns
     // offline shell caching explicitly; no browser HTTP-cache usage counts.

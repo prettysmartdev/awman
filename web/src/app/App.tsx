@@ -9,13 +9,13 @@ import type { Grant } from '@/lib/client/grant';
 import { WorkspacePicker } from '@/components/WorkspacePicker';
 import { Workspace } from '@/components/Workspace';
 
-function Connected({ grant, squadAvailable, reset, revoked }: { grant: Grant; squadAvailable: boolean; reset: () => void; revoked: () => void }) {
+function Connected({ grant, squadAvailable, queueAvailable, reset, revoked }: { grant: Grant; squadAvailable: boolean; queueAvailable: boolean; reset: () => void; revoked: () => void }) {
   const [client] = useState(() => new DaemonClient(grant));
   const [opened, setOpened] = useState<{ connection: FrontendConnection; context: string | null } | null>(null);
   const onOpen = useCallback((connection: FrontendConnection, context: string | null) => setOpened({ connection, context }), []);
   useEffect(() => client.onRevoked(revoked), [client, revoked]);
   if (!opened) return <WorkspacePicker client={client} onOpen={onOpen} />;
-  return <Workspace client={client} connection={opened.connection} launchContext={opened.context} squadAvailable={squadAvailable} reconnect={() => { opened.connection.close('user'); setOpened(null); reset(); }} />;
+  return <Workspace client={client} connection={opened.connection} launchContext={opened.context} squadAvailable={squadAvailable} queueAvailable={queueAvailable} reconnect={() => { opened.connection.close('user'); setOpened(null); reset(); }} />;
 }
 export default function App() {
   const { state, controller } = useConnect();
@@ -23,5 +23,5 @@ export default function App() {
   useEffect(() => registerShellWorker(setUpdate), []);
   const reset = useCallback(() => controller.reset(), [controller]);
   const revoked = useCallback(() => { setNotice('Browser access revoked. Connect browser again to continue.'); controller.reset(); }, [controller]);
-  return <>{update && <div className="update-banner" role="status"><span>Update available.</span><button onClick={() => update.apply()}>Reload to update</button></div>}{state.phase !== 'connected' ? <>{notice && <p role="alert">{notice}</p>}<ConnectScreen state={state} controller={controller} /></> : <Connected grant={state.grant} squadAvailable={state.health.listener.features.includes('squad')} reset={reset} revoked={revoked} />}</>;
+  return <>{update && <div className="update-banner" role="status"><span>Update available.</span><button onClick={() => update.apply()}>Reload to update</button></div>}{state.phase !== 'connected' ? <>{notice && <p role="alert">{notice}</p>}<ConnectScreen state={state} controller={controller} /></> : <Connected grant={state.grant} squadAvailable={state.health.listener.features.includes('squad')} queueAvailable={state.health.capabilities.includes('worker_queue')} reset={reset} revoked={revoked} />}</>;
 }

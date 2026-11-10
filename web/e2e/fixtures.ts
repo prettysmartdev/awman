@@ -2,12 +2,13 @@ import { test as base, expect } from '@playwright/test';
 import { createServer } from 'node:http';
 import { readFile, readdir } from 'node:fs/promises';
 import { extname, resolve, sep } from 'node:path';
-import { Daemon, root } from './daemon.js';
-import { CONTENT_SECURITY_POLICY } from '../edge/src/security.js';
+import { Daemon, origin, root } from './daemon.js';
+import { contentSecurityPolicy } from '../edge/src/security.js';
 
 // Production-equivalent document policy: the exact edge CSP. The strict
 // variant (no 'wasm-unsafe-eval') exists only as the negative control proving
 // the WASM fixture really exercises CSP enforcement.
+const CONTENT_SECURITY_POLICY = contentSecurityPolicy(origin);
 export const STRICT_CSP_WITHOUT_WASM = CONTENT_SECURITY_POLICY.replace(" 'wasm-unsafe-eval'", '');
 const WASM_FIXTURE_JS = `(async () => {
   try {
@@ -54,7 +55,7 @@ export const test = base.extend<{ daemon: Daemon }, { shell: void }>({
     });
     await new Promise<void>((ok, fail) => {
       server.once('error', fail);
-      server.listen(3000, 'localhost', ok);
+      server.listen(3000, '127.0.0.1', ok);
     });
     try { await use(); } finally {
       server.closeAllConnections();

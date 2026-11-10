@@ -1154,6 +1154,99 @@ async fn web_open_tab_is_confined_to_launch_context_roots() {
         );
     }
     assert_eq!(f.host.tabs(&id).unwrap().len(), count);
+    struct PreparedQueue(crate::data::worker::queue::PickRun);
+    impl crate::command::worker::queue_source::QueueSource for PreparedQueue {
+        fn prepared_run(&self, lease_id: &str) -> Option<crate::data::worker::queue::PickRun> {
+            (self.0.lease_id == lease_id).then(|| self.0.clone())
+        }
+        fn snapshot(&self) -> crate::data::worker::queue::QueueSnapshot {
+            Default::default()
+        }
+        fn generation(&self) -> u64 {
+            0
+        }
+        fn mark_seen(&self) {}
+        fn refresh(&self) {}
+        fn pick(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<crate::data::worker::queue::PickRun, crate::data::worker::queue::PickError>
+        {
+            unreachable!()
+        }
+        fn finish_lease(
+            &self,
+            _: &str,
+            _: crate::data::worker::queue::LeaseCloseChoice,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+    }
+    let lease_dir = f.root.join("prepared-lease");
+    std::fs::create_dir(&lease_dir).unwrap();
+    state
+        .state()
+        .instance
+        .as_ref()
+        .unwrap()
+        .install_queue_for_test(Arc::new(PreparedQueue(
+            crate::data::worker::queue::PickRun {
+                lease_id: "lease_1".into(),
+                title: "Fix CI".into(),
+                server: "team".into(),
+                cwd: lease_dir.clone(),
+                command_line: "exec workflow --dynamic".into(),
+                argv: vec!["exec".into(), "workflow".into(), "--dynamic".into()],
+            },
+        )));
+    assert!(f
+        .host
+        .open_tab(
+            &id,
+            Some(&primary.frontend_id),
+            lease_dir.clone(),
+            OpenTabOptions {
+                startup: crate::data::frontend_protocol::StartupSpawn::None,
+                lease_id: Some("lease_1".into()),
+                ..Default::default()
+            }
+        )
+        .is_ok());
+    for (path, lease_id, startup) in [
+        (
+            f.root.join("home"),
+            "lease_1",
+            crate::data::frontend_protocol::StartupSpawn::None,
+        ),
+        (
+            lease_dir.clone(),
+            "lease_other",
+            crate::data::frontend_protocol::StartupSpawn::None,
+        ),
+        (
+            lease_dir,
+            "lease_1",
+            crate::data::frontend_protocol::StartupSpawn::Ready,
+        ),
+    ] {
+        assert_eq!(
+            f.host
+                .open_tab(
+                    &id,
+                    Some(&primary.frontend_id),
+                    path,
+                    OpenTabOptions {
+                        startup,
+                        lease_id: Some(lease_id.into()),
+                        ..Default::default()
+                    }
+                )
+                .unwrap_err()
+                .code(),
+            "dir_outside_context"
+        );
+    }
     primary
         .handle(
             42,

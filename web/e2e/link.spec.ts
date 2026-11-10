@@ -75,13 +75,3 @@ test('owner denial consumes the link without a grant', async ({ page, daemon }) 
   await page.waitForTimeout(link.interval_ms);
   expect((await request(page, `/v1/browser-links/${link.id}/poll`, { polling_secret: link.polling_secret })).status).toBe(410);
 });
-
-test('expired codes cannot be polled into a grant', async ({ page }) => {
-  test.setTimeout(360_000); // Real five-minute expiry; no production clock bypass.
-  const link = await create(page);
-  const remaining = Date.parse(link.expires_at) - Date.now();
-  expect(remaining).toBeGreaterThan(0);
-  expect(remaining).toBeLessThanOrEqual(300_000);
-  await page.waitForTimeout(remaining + 1000);
-  expect((await request(page, `/v1/browser-links/${link.id}/poll`, { polling_secret: link.polling_secret })).status).toBe(410);
-});

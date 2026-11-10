@@ -1,6 +1,6 @@
 # webapp v0 — TUI screen/action acceptance matrix
 
-Rendered from `action-matrix.json` (schema version 1); do not edit by hand. One row per TUI screen/action. `daemon` names the engine operation (awman.frontend.v1 frame, awman.terminal.v1 frame, HTTP route, or local view state); `browser` names the control and shortcut (or why it is unavailable). `status: pending_dependency` rows describe the 0143 surface the webapp must present once 0143 lands; the parity harness skips them while their capability is absent from `GET /v1/status`.
+Rendered from `action-matrix.json` (schema version 1); do not edit by hand. One row per TUI screen/action. `daemon` names the engine operation (awman.frontend.v1 frame, awman.terminal.v1 frame, HTTP route, or local view state); `browser` names the control and shortcut (or why it is unavailable).
 
 Legend: parity `engine_trace` = identical engine-side outcome for the scripted action on TUI and web; `wire_frame` = the exact frame is asserted; `view_only` = rendered from the same snapshot; `web_only` = no TUI counterpart.
 
@@ -267,9 +267,10 @@ Legend: parity `engine_trace` = identical engine-side outcome for the scripted a
 
 | id | action | TUI key | daemon operation | browser control / shortcut | capability | feature | status | parity |
 |---|---|---|---|---|---|---|---|---|
-| `queue.panel` | Queue panel of eligible work items | Ctrl+Q | route: GET /v1/worker/queue?server=… (0143) ; requires worker pull served on the listener | unavailable: 0143 not landed; worker is not served on the loopback listener in v0 — Queue panel | `worker_pull` | worker | pending_dependency | engine_trace |
-| `queue.pick` | Pick an item | Enter then p | route: POST /v1/worker/queue/{item_id}/claim (0143) | unavailable: 0143 not landed — 'Pick' button | `worker_pull` | worker | pending_dependency | engine_trace |
-| `queue.release_on_close` | Release or cancel when closing a picked tab | Ctrl+C in the tab | route: POST /v1/worker/leases/{id}/release (0143) | unavailable: 0143 not landed — dialog | `worker_pull` | worker | pending_dependency | engine_trace |
+| `queue.panel` | Queue panel of eligible work items | Ctrl+Q | frontend_frame: WorkerQueue{Snapshot,Refresh,Seen} on the instance-owned frontend protocol | Work queue panel `Ctrl+Q` | `worker_queue` | engine | required | engine_trace |
+| `queue.pick` | Pick an item | Enter then p | frontend_frame: WorkerQueue{Pick} then OpenTab{lease_id} and Submit{Lease}; engine verifies the prepared workspace | Pick button | `worker_queue` | engine | required | engine_trace |
+| `queue.checkout_choice` | Run in checkout worktree or fresh clone | checkout prompt | frontend_frame: WorkerQueue{CheckoutOffer,Checkout} before OpenTab{lease_id} | Worktree and fresh clone buttons | `worker_queue` | engine | required | engine_trace |
+| `queue.release_on_close` | Release or cancel when closing a picked tab | Ctrl+C in the tab | frontend_frame: WorkerQueue{Finish{release\|cancel}} before CloseTab; KeepRunning leaves the tab open | Close running work item dialog | `worker_queue` | engine | required | engine_trace |
 
 ## keys
 
@@ -282,6 +283,5 @@ Legend: parity `engine_trace` = identical engine-side outcome for the scripted a
 
 | status | rows |
 |---|---|
-| pending_dependency | 3 |
-| required | 180 |
-| total | 183 |
+| required | 184 |
+| total | 184 |

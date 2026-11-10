@@ -109,7 +109,7 @@ export interface ProbeDeps {
   hasLiveGrant?: () => boolean;
 }
 
-/** GET /v1/health on the fixed loopback endpoint and classify the outcome. */
+/** GET /v1/health on the loaded page's host and classify the outcome. */
 export async function probe(signal?: AbortSignal, deps: ProbeDeps = {}): Promise<ProbeResult> {
   const missingApis = (deps.missingApis ?? missingBrowserApis)();
   if (missingApis.length) return { kind: 'unsupported', missing: missingApis };

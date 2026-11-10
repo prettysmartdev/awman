@@ -2,8 +2,8 @@
 // and bundled into out/sw.js by scripts/build-sw.mjs.
 //
 // The service worker caches ONLY the exported app shell (HTML, /_next/static,
-// icons, manifest). It never touches daemon traffic: requests to any other
-// origin — including http://127.0.0.1:9877 — are not intercepted at all, so
+// icons, manifest). It never touches daemon traffic: requests to the daemon's
+// separate port are a different origin and are not intercepted, so
 // daemon responses, snapshots, terminal bytes, grants and commands can never
 // enter Cache Storage.
 

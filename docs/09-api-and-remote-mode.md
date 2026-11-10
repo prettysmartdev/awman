@@ -13,7 +13,7 @@ You do not need remote mode to use the API (curl works fine), and you do not nee
 
 API mode is the push side of the daemon's worker feature. Enable the worker feature, start the daemon, then send sessions and commands under `/v1/worker/*` from scripts, CI pipelines, or HTTP clients — no interactive terminal or TUI required.
 
-`awman worker link` saves a connection to a separate work server; it does not
+`awman link` saves a connection to a separate work server; it does not
 turn that server into an API target or start pulling jobs. See
 [Workers and Work Servers](17-workers-and-work-servers.md).
 

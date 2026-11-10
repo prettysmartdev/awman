@@ -88,7 +88,10 @@ test-fast:
 
 # Separate from the binary gates. Missing web/edge artifacts are a hard error,
 # not an implicit skip or a transport-only acceptance pass.
-.PHONY: test-web
+.PHONY: web/dev test-web
+web/dev:
+	node tools/web-dev.mjs
+
 test-web:
 	@test -f web/package.json && test -f web/edge/package.json || { echo 'WI 0159: web/edge implementation is missing' >&2; exit 1; }
 	pnpm --dir web run check

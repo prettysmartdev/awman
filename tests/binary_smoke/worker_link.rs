@@ -11,7 +11,6 @@ fn static_worker_link_and_unlink_roundtrip() {
         .env("AWMAN_HOME", &home)
         .current_dir(&repo)
         .args([
-            "worker",
             "link",
             "https://work.example.com/base",
             "--name",
@@ -67,7 +66,6 @@ fn worker_link_reads_static_token_from_stdin() {
         .env("AWMAN_HOME", &home)
         .current_dir(temp.path())
         .args([
-            "worker",
             "link",
             "https://work.example.com",
             "--name",

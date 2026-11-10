@@ -24,7 +24,7 @@ const CLEAN_HTML =
 beforeEach(async () => {
   out = await mkdtemp(join(tmpdir(), 'awman-out-'));
   await put('index.html', CLEAN_HTML);
-  await put('_next/static/chunks/a.js', 'console.log("http://127.0.0.1:9877/v1/health");new URL(p,"http://n")');
+  await put('_next/static/chunks/a.js', 'new URL(p,"http://n")');
   await put('_next/static/css/a.css', 'body{margin:0}');
 });
 
@@ -33,7 +33,7 @@ afterEach(async () => {
 });
 
 describe('audit-output', () => {
-  it('passes a clean export that only references the loopback daemon', async () => {
+  it('passes a clean export without a baked daemon address', async () => {
     expect(await auditOutput(out)).toEqual([]);
   });
 
@@ -48,9 +48,9 @@ describe('audit-output', () => {
     expect((await auditOutput(out)).join('\n')).toMatch(/relay\.example/);
   });
 
-  it('fails on a different loopback port (no custom endpoints, D14)', async () => {
-    await put('_next/static/chunks/b.js', 'fetch("http://127.0.0.1:9999/v1/health")');
-    expect((await auditOutput(out)).join('\n')).toMatch(/9999/);
+  it('fails on a baked daemon hostname even on the usual port', async () => {
+    await put('_next/static/chunks/b.js', 'fetch("http://127.0.0.1:9877/v1/health")');
+    expect((await auditOutput(out)).join('\n')).toMatch(/127\.0\.0\.1/);
   });
 
   it('fails on persistent storage APIs', async () => {

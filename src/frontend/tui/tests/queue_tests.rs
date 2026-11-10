@@ -277,6 +277,7 @@ fn a_successful_pick_opens_a_titled_tab_that_holds_the_lease() {
         server: "acme".into(),
         cwd: dir.path().to_path_buf(),
         command_line: "exec workflow --dynamic".into(),
+        argv: vec!["exec".into(), "workflow".into(), "--dynamic".into()],
     }));
     ctrl_q(&mut app);
     press_char(&mut app, 'p');
@@ -394,6 +395,7 @@ fn picked(app: &mut App, source: &FakeSource, dir: &std::path::Path) {
         server: "acme".into(),
         cwd: dir.to_path_buf(),
         command_line: "exec workflow --dynamic".into(),
+        argv: vec!["exec".into(), "workflow".into(), "--dynamic".into()],
     }));
     ctrl_q(app);
     press_char(app, 'p');
@@ -463,6 +465,7 @@ fn a_command_line_that_does_not_parse_hands_the_lease_back_without_a_tab() {
         server: "acme".into(),
         cwd: dir.path().to_path_buf(),
         command_line: "definitely-not-a-command".into(),
+        argv: vec!["definitely-not-a-command".into()],
     }));
     ctrl_q(&mut app);
     press_char(&mut app, 'p');
@@ -522,6 +525,7 @@ fn p_from_the_body_view_picks_the_item() {
         server: "acme".into(),
         cwd: dir.path().to_path_buf(),
         command_line: "exec workflow --dynamic".into(),
+        argv: vec!["exec".into(), "workflow".into(), "--dynamic".into()],
     }));
     ctrl_q(&mut app);
     press_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);

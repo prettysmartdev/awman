@@ -27,7 +27,7 @@ function browserCell(browser) {
 const lines = [
   '# webapp v0 — TUI screen/action acceptance matrix',
   '',
-  `Rendered from \`action-matrix.json\` (schema version ${matrix.schema_version}); do not edit by hand. One row per TUI screen/action. \`daemon\` names the engine operation (awman.frontend.v1 frame, awman.terminal.v1 frame, HTTP route, or local view state); \`browser\` names the control and shortcut (or why it is unavailable). \`status: pending_dependency\` rows describe the 0143 surface the webapp must present once 0143 lands; the parity harness skips them while their capability is absent from \`GET /v1/status\`.`,
+  `Rendered from \`action-matrix.json\` (schema version ${matrix.schema_version}); do not edit by hand. One row per TUI screen/action. \`daemon\` names the engine operation (awman.frontend.v1 frame, awman.terminal.v1 frame, HTTP route, or local view state); \`browser\` names the control and shortcut (or why it is unavailable).`,
   '',
   'Legend: parity `engine_trace` = identical engine-side outcome for the scripted action on TUI and web; `wire_frame` = the exact frame is asserted; `view_only` = rendered from the same snapshot; `web_only` = no TUI counterpart.',
   '',

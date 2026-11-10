@@ -151,12 +151,41 @@ export interface OpenTabOptions {
   label?: string | null;
   annotations: Annotations;
   startup: StartupSpawn;
+  lease_id?: LeaseId | null;
 }
 
 // Rust: data::frontend_protocol::SubmitInput (tag = "source")
 export type SubmitInput =
   | { source: 'command_box'; raw: string }
-  | { source: 'argv'; args: string[] };
+  | { source: 'argv'; args: string[] }
+  | { source: 'lease'; lease_id: LeaseId; args: string[] };
+
+// Rust: data::worker::queue — instance-owned WI143 queue over awman.frontend.v1.
+export interface QueueEntry {
+  id: string; server: string; title: string; summary: string | null; kind: string;
+  labels: Record<string, string>; priority: number; age_ms: number; for_you: boolean;
+  body: string | null; source_url: string | null;
+}
+export interface QueueSnapshot {
+  items: QueueEntry[]; for_you: number; new_since_seen: number;
+  error: string | null; loaded: boolean;
+}
+export interface PickRun {
+  lease_id: LeaseId; title: string; server: string; cwd: string;
+  command_line: string; argv: string[];
+}
+export type QueueRequest =
+  | { operation: 'snapshot' | 'refresh' | 'seen' }
+  | { operation: 'pick'; server: string; item_id: string }
+  | { operation: 'checkout_offer'; lease_id: LeaseId }
+  | { operation: 'checkout'; lease_id: LeaseId; choice: 'worktree' | 'fresh_clone' }
+  | { operation: 'finish'; lease_id: LeaseId; choice: 'release' | 'cancel' | 'keep_running' };
+export type QueueReply =
+  | { result: 'snapshot'; value: QueueSnapshot }
+  | { result: 'picked'; value: PickRun }
+  | { result: 'checkout_offer'; value: boolean }
+  | { result: 'done' }
+  | { result: 'error'; value: { code: 'ineligible' | 'taken' | 'failed'; error?: string } };
 
 // Rust: data::frontend_protocol::WorkflowRequestWire (tag = "request")
 export type WorkflowRequestWire = { request: 'open_control_board'; step_name: string };
@@ -242,6 +271,7 @@ export interface Hello {
 // Rust: data::frontend_protocol::FrontendFrame (tag = "type", rename_all = snake_case)
 export type FrontendFrame =
   | ({ type: 'hello' } & Hello)
+  | { type: 'worker_queue'; request_id: number; tab_id: TabId; request: QueueRequest }
   | { type: 'open_tab'; dir: string; options: OpenTabOptions }
   | { type: 'close_tab'; tab_id: TabId }
   | { type: 'focus_tab'; tab_id: TabId }
@@ -261,6 +291,7 @@ export type FrontendFrameType = FrontendFrame['type'];
 
 // Rust: data::frontend_protocol::EngineFrame (tag = "type", rename_all = snake_case)
 export type EngineFrame =
+  | { type: 'worker_queue'; request_id: number; reply: QueueReply }
   | { type: 'command_bytes'; tab_id: TabId; stream: OutputStream; bytes: Base64 }
   | {
       type: 'welcome';
@@ -1441,6 +1472,7 @@ export interface SquadRunCanceled {
 
 export const FRONTEND_FRAME_TYPES = [
   'hello',
+  'worker_queue',
   'open_tab',
   'close_tab',
   'focus_tab',
@@ -1456,6 +1488,7 @@ export const FRONTEND_FRAME_TYPES = [
 ] as const;
 
 export const ENGINE_FRAME_TYPES = [
+  'worker_queue',
   'command_bytes',
   'welcome',
   'snapshot',

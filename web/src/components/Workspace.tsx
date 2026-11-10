@@ -2,7 +2,7 @@
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore, type KeyboardEvent as ReactKeyboardEvent } from 'react';
 import type { DaemonClient } from '@/lib/client/daemonClient';
 import type { FrontendConnection, OutboundFrame } from '@/lib/client/frontendSocket';
-import type { ContainerWindowStateWire, EffectiveStatus, LaunchContextSummary, PromptKind, UiRequest } from '@/lib/client/types';
+import type { ContainerWindowStateWire, EffectiveStatus, LaunchContextSummary, PickRun, PromptKind, UiRequest } from '@/lib/client/types';
 import { hasRunningWork } from '@/lib/client/reducers';
 import { liveCountdownDialog } from '@/lib/client/countdown';
 import type { OpenDialog } from '@/lib/client/instanceStore';
@@ -16,6 +16,7 @@ import { DialogRenderer, dialogScope, PromptButtons, usePrompt } from './Dialogs
 import { Composer } from './Composer';
 import { ContainerArea, ExecutionLog, GitPanel, SlotBar, TabBar, WorkflowPanel } from './Panels';
 import { Squad } from './Squad';
+import { QueuePanel } from './QueuePanel';
 import { Modal, actionArgs, copyText, selectedText, errorText, useObservable } from './ui';
 
 function NewTab({ client, connection, cwd, squadId, focus, dismiss }: { client: DaemonClient; connection: FrontendConnection; cwd: string; squadId?: string; focus: (id: string) => void; dismiss: () => void }) {
@@ -55,7 +56,7 @@ export function Shortcuts({ close }: { close: () => void }) {
   return <Modal title="Keyboard shortcuts" onDismiss={close}><p>Browser and OS reserved keys keep their normal behavior. Use the alternatives or visible controls.</p><div className="shortcut-list">{shortcutSheet().map((s, i) => <div key={i}><strong>{s.label}</strong><span>{s.alternates.length ? s.alternates.join(' / ') : s.keys.join(' / ') || 'Button'}{s.reserved.length ? ` · reserved: ${s.reserved.join(', ')}` : ''} · {s.group}</span></div>)}</div></Modal>;
 }
 
-export function Workspace({ client, connection, launchContext, squadAvailable, reconnect }: { client: DaemonClient; connection: FrontendConnection; launchContext: string | null; squadAvailable: boolean; reconnect: () => void }) {
+export function Workspace({ client, connection, launchContext, squadAvailable, queueAvailable = true, reconnect }: { client: DaemonClient; connection: FrontendConnection; launchContext: string | null; squadAvailable: boolean; queueAvailable?: boolean; reconnect: () => void }) {
   const view = useSyncExternalStore(connection.store.subscribe, connection.store.get, connection.store.get);
   const state = useObservable(connection.state); const role = useObservable(connection.role);
   const readOnly = role !== 'primary' || state !== 'open';
@@ -70,10 +71,12 @@ export function Workspace({ client, connection, launchContext, squadAvailable, r
   }), [connection]);
   // ProgramStatus is an authoritative event feed outside structural deltas.
   // Project it onto the rendered snapshot, discarding it on every full resync.
-  const tabs = (view.snapshot?.tabs ?? []).map(t => ({ ...t, slots: t.slots.map(slot => programStatuses.generation === view.generation && programStatuses.slots.has(slot.slot_id) ? { ...slot, program_status: programStatuses.slots.get(slot.slot_id) ?? null } : slot) })); const tab = tabs.find(t => t.tab_id === active) ?? tabs.find(t => t.tab_id === view.snapshot?.active_tab_hint) ?? tabs[0];
+  const tabs = (view.snapshot?.tabs ?? []).map(t => ({ ...t, label: t.annotations['awman.lease_title'] ? { ...t.label, text: `${t.annotations['awman.lease_title']} · ${t.annotations['awman.lease_server'] ?? 'work server'}` } : t.label, slots: t.slots.map(slot => programStatuses.generation === view.generation && programStatuses.slots.has(slot.slot_id) ? { ...slot, program_status: programStatuses.slots.get(slot.slot_id) ?? null } : slot) })); const tab = tabs.find(t => t.tab_id === active) ?? tabs.find(t => t.tab_id === view.snapshot?.active_tab_hint) ?? tabs[0];
   const [narrowPanel, setNarrowPanel] = useState<NarrowPanel>('log'); const [git, setGit] = useState(false); const [workflow, setWorkflow] = useState(false);
   const [showStatus, setShowStatus] = useState(false); const [shortcuts, setShortcuts] = useState(false); const [newTab, setNewTab] = useState(false);
   const [confirm, setConfirm] = useState<{ kind: PromptKind; tabId: string } | null>(null); const [queue, setQueue] = useState(false);
+  const [queueBadge, setQueueBadge] = useState({ newItems: 0, forYou: 0 });
+  const [leaseConfirm, setLeaseConfirm] = useState<{ tabId: string; leaseId: string; title: string } | null>(null);
   const [squadAttached, setSquadAttached] = useState(false);
   const [focused, setFocused] = useState<Record<string, string>>({}); const [windows, setWindows] = useState<Record<string, ContainerWindowStateWire>>({});
   const [dismissedNotices, setDismissedNotices] = useState<Set<string>>(new Set());
@@ -91,7 +94,19 @@ export function Workspace({ client, connection, launchContext, squadAvailable, r
     ?? tabDialogs.find(d => d.request.kind === 'workflow_yolo_countdown' && d.request.step_name === focusedSlot?.step_name)
     ?? (tab ? liveCountdownDialog(tab, focusedSlot, id => windows[id] ?? 'maximized') : null)
     ?? tabDialogs[0];
-  const modal = !!dialog || newTab || !!confirm || shortcuts || queue;
+  const modal = !!dialog || newTab || !!confirm || !!leaseConfirm || shortcuts || queue;
+  const queueTabId = tab?.tab_id;
+  useEffect(() => {
+    if (!queueAvailable || !queueTabId || state !== 'open') return;
+    let live = true;
+    const refresh = () => { void connection.queueRequest(queueTabId, { operation: 'snapshot' }).then(reply => {
+      if (live && reply.result === 'snapshot') setQueueBadge(queue ? { newItems: 0, forYou: 0 } : { newItems: reply.value.new_since_seen, forYou: reply.value.for_you });
+    }).catch(() => undefined); };
+    refresh();
+    const timer = setInterval(refresh, 5000);
+    return () => { live = false; clearInterval(timer); };
+  }, [connection, queueAvailable, queue, state, queueTabId]);
+  function openQueue() { setQueueBadge({ newItems: 0, forYou: 0 }); setQueue(true); }
   const dismissNewTab = useCallback(() => setNewTab(false), []);
   useEffect(() => () => connection.close('navigation'), [connection]);
   useEffect(() => {
@@ -147,6 +162,51 @@ export function Workspace({ client, connection, launchContext, squadAvailable, r
     if ((choice === 'abort' || choice === 'yes' || choice === 'cancel_workflow') && confirm.kind === 'workflow_cancel_confirm') send({ type: 'cancel', tab_id: confirm.tabId, repeat: false });
     setConfirm(null);
   }
+  function askCloseTab(id: string) {
+    const closing = tabs.find(t => t.tab_id === id);
+    const leaseId = closing?.annotations['awman.lease_id'];
+    if (leaseId && closing?.execution_phase.phase === 'running') {
+      setLeaseConfirm({ tabId: id, leaseId, title: closing.annotations['awman.lease_title'] ?? 'work item' });
+    } else {
+      setConfirm({ kind: tabs.length > 1 ? 'close_tab_confirm' : 'quit_confirm', tabId: id });
+    }
+  }
+  async function finishLease(choice: 'release' | 'cancel' | 'keep_running') {
+    if (!leaseConfirm) return;
+    if (choice === 'keep_running') { setLeaseConfirm(null); return; }
+    try {
+      const reply = await connection.queueRequest(leaseConfirm.tabId, { operation: 'finish', lease_id: leaseConfirm.leaseId, choice });
+      if (reply.result !== 'done') throw new Error(reply.result === 'error' ? reply.value.error ?? 'The lease could not be updated.' : 'Unexpected engine response.');
+      send({ type: 'close_tab', tab_id: leaseConfirm.tabId });
+      ui({ request: 'close_tab', tab_id: leaseConfirm.tabId });
+      setLeaseConfirm(null);
+    } catch (error) { connection.store.notice('error', errorText(error), 'client'); }
+  }
+  async function openPicked(run: PickRun) {
+    let opened: string | null = null;
+    try {
+      if (readOnly) throw new Error('Only the primary browser can pick work.');
+      if (!run.argv.length) throw new Error('This daemon did not include the picked command arguments. Update awman and try again.');
+      const marker = crypto.randomUUID();
+      opened = await new Promise<string>((resolve, reject) => {
+        const timer = setTimeout(() => { unsubscribe(); reject(new Error('The engine did not open the picked workspace.')); }, 15_000);
+        const unsubscribe = connection.onFrame(frame => {
+          if (frame.type === 'delta' && frame.delta === 'tab_opened' && frame.value.annotations['awman.queue_request'] === marker) {
+            clearTimeout(timer); unsubscribe(); resolve(frame.value.tab_id);
+          }
+        });
+        try {
+          connection.send({ type: 'open_tab', dir: run.cwd, options: { kind: 'normal', annotations: { 'awman.queue_request': marker, 'awman.lease_id': run.lease_id, 'awman.lease_title': run.title, 'awman.lease_server': run.server }, startup: 'none', lease_id: run.lease_id } });
+        } catch (error) { clearTimeout(timer); unsubscribe(); reject(error); }
+      });
+      connection.send({ type: 'submit', tab_id: opened, input: { source: 'lease', lease_id: run.lease_id, args: run.argv }, pty_size: { cols: 100, rows: 30 } });
+      select(opened);
+    } catch (error) {
+      try { if (tab) await connection.queueRequest(tab.tab_id, { operation: 'finish', lease_id: run.lease_id, choice: 'release' }); } catch { /* engine will retire the lease */ }
+      if (opened) { try { connection.send({ type: 'close_tab', tab_id: opened }); } catch { /* connection may be gone */ } }
+      throw error;
+    }
+  }
   useShortcuts(() => {
     if (dialog) return { context: 'dialog', opts: { dialog: dialogScope(dialog.request), containers: tab?.slots.length } };
     const element = document.activeElement;
@@ -154,7 +214,7 @@ export function Workspace({ client, connection, launchContext, squadAvailable, r
     return { context: context === 'terminal' ? 'terminal' : context === 'execution' ? 'execution' : context === 'composer' ? 'composer' : context === 'squadList' ? 'squadList' : 'global', opts: { textInput: isTextInput(element), containers: tab?.slots.length, watching: !!tab?.agents_dashboard?.watching, composerEmpty: element instanceof HTMLTextAreaElement && element.id === 'command' && !element.value, overviewHScroll: workflow } };
   }, (a, event) => {
     if (!tab) return false;
-    if (newTab || confirm || shortcuts || queue) { if (shortcuts && a === 'dialog.dismiss') setShortcuts(false); return false; }
+    if (newTab || confirm || leaseConfirm || shortcuts || queue) { if (shortcuts && a === 'dialog.dismiss') setShortcuts(false); return false; }
     if (dialog && dialog.request.kind !== 'workflow_yolo_countdown' && dialog.request.kind !== 'workflow_step_confirm') return false;
     if (!dialog && document.querySelector('[role="dialog"]')) return false;
     if (a === 'tab.new' && !dialog) { if (!readOnly) setNewTab(true); return; }
@@ -167,7 +227,7 @@ export function Workspace({ client, connection, launchContext, squadAvailable, r
     if (a === 'workflow.overview') { openOverview(); return; }
     if (a === 'workflow.overviewLeft' || a === 'workflow.overviewRight') { document.querySelector('[aria-label="Workflow steps"]')?.scrollBy({ left: a === 'workflow.overviewLeft' ? -240 : 240 }); return; }
     if (a === 'config.open') { submitAction('show_config'); return; }
-    if (a === 'queue.open') { setQueue(true); return; } if (a === 'shortcuts.open') { setShortcuts(true); return; }
+    if (a === 'queue.open') { openQueue(); return; } if (a === 'shortcuts.open') { setShortcuts(true); return; }
     if (a === 'selection.copy') { copy(); return; }
     if (a === 'containers.detach') { if (tab.kind === 'squad') return false; detach(); return; }
     if (a === 'container.cycle') { if (focusedSlot) { const current = windows[focusedSlot.slot_id] ?? 'maximized'; setWindow(focusedSlot.slot_id, current === 'maximized' ? 'minimized' : current === 'minimized' ? 'hidden' : 'maximized'); } return; }
@@ -180,10 +240,20 @@ export function Workspace({ client, connection, launchContext, squadAvailable, r
   if (view.ended) return <main className="connect"><section className="connect-card" role="alert"><h1>Engine disconnected</h1><p>{view.ended.reason}</p><button onClick={() => { clearResume(); reconnect(); }}>Reconnect</button></section></main>;
   if (!view.snapshot || !tab) return <main className="connect"><section className="connect-card"><h1>Opening workspace…</h1><p role="status">{state}</p><button onClick={reconnect}>Reconnect</button></section></main>;
   const entries = view.outputs.get(tab.tab_id) ?? [];
-  const tools = <div className="workspace-tools"><button className="secondary" aria-pressed={git} onClick={() => setGit(v => !v)}>Git</button><button className="secondary" aria-pressed={workflow} onClick={openOverview}>Overview</button><button className="secondary" disabled={readOnly || !tab.workflow} onClick={() => control()}>Workflow</button><button className="secondary" disabled={readOnly} onClick={() => submit(['config', 'show'])}>Config</button><button className="secondary" onClick={() => setQueue(true)}>Queue</button><button className="secondary" onClick={() => setShortcuts(true)}>Help</button><button className="secondary" onPointerDown={e => e.preventDefault()} onClick={copy}>Copy</button>{tab.kind !== 'squad' && <button className="secondary" disabled={readOnly} onClick={interrupt}>{forceCancel ? 'Force cancel' : 'Cancel'}</button>}<button className="secondary" disabled={readOnly} onClick={() => setConfirm({ kind: 'quit_confirm', tabId: tab.tab_id })}>Quit awman</button></div>;
+  const dialogUi = leaseConfirm
+    ? <Modal title="Close running work item"><p>{leaseConfirm.title}</p><p>Choose what to do with the claimed work item.</p><div className="actions"><button onClick={() => void finishLease('release')}>Release</button><button onClick={() => void finishLease('cancel')}>Cancel run</button><button className="secondary" onClick={() => void finishLease('keep_running')}>Keep running</button></div></Modal>
+    : confirm ? <LocalConfirm client={client} kind={confirm.kind} confirm={confirmChoice} dismiss={() => setConfirm(null)} />
+    : dialog ? <DialogRenderer key={`${view.generation}:${dialog.dialogId}`} dialog={dialog} client={client} connection={connection} readOnly={readOnly} onLocalDismiss={() => setDismissedNotices(ids => new Set(ids).add(dialog.dialogId))} />
+    : newTab ? <NewTab client={client} connection={connection} cwd={tab.session.cwd} squadId={tabs.find(t => t.kind === 'squad')?.tab_id} focus={select} dismiss={dismissNewTab} />
+    : shortcuts ? <Shortcuts close={() => setShortcuts(false)} />
+    : queue ? queueAvailable
+      ? <QueuePanel connection={connection} tabId={tab.tab_id} readOnly={readOnly} onPick={openPicked} onClose={() => setQueue(false)} />
+      : <Modal title="Work queue" onDismiss={() => setQueue(false)}><p>Update awman to use the work queue in the browser.</p></Modal>
+    : null;
+  const tools = <div className="workspace-tools"><button className="secondary" aria-pressed={git} onClick={() => setGit(v => !v)}>Git</button><button className="secondary" aria-pressed={workflow} onClick={openOverview}>Overview</button><button className="secondary" disabled={readOnly || !tab.workflow} onClick={() => control()}>Workflow</button><button className="secondary" disabled={readOnly} onClick={() => submit(['config', 'show'])}>Config</button><button className="secondary" onClick={openQueue}>Queue{queueBadge.newItems > 0 || queueBadge.forYou > 0 ? ` · ${queueBadge.newItems} new · ${queueBadge.forYou} for you` : ''}</button><button className="secondary" onClick={() => setShortcuts(true)}>Help</button><button className="secondary" onPointerDown={e => e.preventDefault()} onClick={copy}>Copy</button>{tab.kind !== 'squad' && <button className="secondary" disabled={readOnly} onClick={interrupt}>{forceCancel ? 'Force cancel' : 'Cancel'}</button>}<button className="secondary" disabled={readOnly} onClick={() => setConfirm({ kind: 'quit_confirm', tabId: tab.tab_id })}>Quit awman</button></div>;
   return <div onKeyDownCapture={captureKey} onPointerDownCapture={activity} onScrollCapture={activity}>
     <ShellLayout gitOpen={git || narrowPanel === 'git'} workflowOpen={workflow || narrowPanel === 'workflow'} narrowPanel={narrowPanel} onNarrowPanelChange={setNarrowPanel} slots={{
-      tabBar: <TabBar tabs={tabs} active={tab.tab_id} select={select} close={id => setConfirm({ kind: tabs.length > 1 ? 'close_tab_confirm' : 'quit_confirm', tabId: id })} newTab={() => setNewTab(true)} readOnly={readOnly} />,
+      tabBar: <TabBar tabs={tabs} active={tab.tab_id} select={select} close={askCloseTab} newTab={() => setNewTab(true)} readOnly={readOnly} />,
       status: <><div className="workspace-status"><span>{state}{role === 'secondary' ? ' · Read only' : ''}</span><span>CWD: {tab.session.cwd}</span>{tab.worktree_path && <span>Worktree: {tab.worktree_path}</span>}<span><span className={`squad-dot squad-${view.snapshot.squad_health}`} aria-hidden="true" />Squad: {view.snapshot.squad_health}</span>{tab.git_summary && <span>{tab.git_summary.branch} · {tab.git_summary.files.length} files · +{tab.git_summary.added} −{tab.git_summary.removed}</span>}{tab.context_path && <button className="secondary" onClick={() => void copyText(tab.context_path ?? '').then(() => setCopyNotice('Copied context path')).catch(() => setCopyNotice('Copy failed'))}>Copy context path</button>}</div>{tools}</>,
       activeAgent: <button className="secondary" onClick={() => setNarrowPanel('agent')}>{tab.kind === 'squad' && squadAttached ? 'Active agent · squad task' : focusedSlot ? <SlotBar slot={focusedSlot} /> : 'Active agent · none'}</button>,
       containers: tab.kind !== 'squad' && tab.slots.length ? <><ContainerArea client={client} readOnly={readOnly} tab={tab} focused={focusedSlot?.slot_id ?? null} setFocused={id => setFocused(v => ({ ...v, [tab.tab_id]: id }))} windows={windows} interactive={!modal && (narrowPanel === 'agent' || typeof matchMedia !== 'function' || !matchMedia('(max-width: 767px)').matches)} setWindow={setWindow} /><button className="secondary" onClick={detach}>Detach</button></> : undefined,
@@ -192,7 +262,7 @@ export function Workspace({ client, connection, launchContext, squadAvailable, r
       git: <GitPanel tab={tab} close={() => { setGit(false); setNarrowPanel('log'); }} />,
       workflow: <WorkflowPanel tab={tab} close={() => { setWorkflow(false); setNarrowPanel('log'); }} control={control} />,
       shortcuts: tools,
-      dialogs: confirm ? <LocalConfirm client={client} kind={confirm.kind} confirm={confirmChoice} dismiss={() => setConfirm(null)} /> : dialog ? <DialogRenderer key={`${view.generation}:${dialog.dialogId}`} dialog={dialog} client={client} connection={connection} readOnly={readOnly} onLocalDismiss={() => setDismissedNotices(ids => new Set(ids).add(dialog.dialogId))} /> : newTab ? <NewTab client={client} connection={connection} cwd={tab.session.cwd} squadId={tabs.find(t => t.kind === 'squad')?.tab_id} focus={select} dismiss={dismissNewTab} /> : shortcuts ? <Shortcuts close={() => setShortcuts(false)} /> : queue ? <Modal title="Queue panel" onDismiss={() => setQueue(false)}><p>Worker queue is unavailable on the browser listener in v0. Requires worker_pull.</p><button disabled>Pick</button><p>Release on close is unavailable until worker queue support is enabled.</p></Modal> : null,
+      dialogs: dialogUi,
       notices: <>{view.notices.slice(-5).map(n => <div className="notice" role={n.level === 'error' ? 'alert' : 'status'} key={n.id}><p>{n.text}</p><button className="secondary" onClick={() => connection.store.dismissNotice(n.id)}>Dismiss</button></div>)}{[...view.closedDialogs].slice(-1).map(([id, by]) => <p className="notice" role="status" key={id}>Answered by {by.by === 'frontend' ? by.frontend_id : by.by}</p>)}{copyNotice && <p role="status">{copyNotice}</p>}</>,
     }} />
   </div>;

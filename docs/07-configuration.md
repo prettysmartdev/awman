@@ -357,7 +357,7 @@ for supported work item fields and pull behavior.
 
 ### Work server links
 
-`awman worker link <https-url>` creates a global `workServers.<name>` entry and
+`awman link <https-url>` creates a global `workServers.<name>` entry and
 stores the server token in owner-only state outside the config file. See
 [Link a work server](17-workers-and-work-servers.md#link-a-work-server) for
 device approval and token options. Manage a link through config:

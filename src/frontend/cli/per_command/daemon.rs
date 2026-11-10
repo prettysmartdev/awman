@@ -147,7 +147,7 @@ fn worker_sides(record: &FeatureRecord) -> Vec<String> {
     }
     if let Some(pull) = &record.pull {
         if pull.servers.is_empty() {
-            lines.push("    pull  no work servers (awman worker link <url>)".into());
+            lines.push("    pull  no work servers (awman link <url>)".into());
         }
         let name_w = pull.servers.iter().map(|s| s.name.len()).max().unwrap_or(0);
         let state_w = pull

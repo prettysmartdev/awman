@@ -81,7 +81,7 @@ pub enum WorkerError {
     /// The item may still be eligible; this worker has no room for it now.
     #[error("the worker is busy: {0}")]
     Busy(String),
-    #[error("the link to work server {0:?} was revoked; run `awman config unset workServers.{0}` and then `awman worker link` again")]
+    #[error("the link to work server {0:?} was revoked; run `awman config unset workServers.{0}` and then `awman link` again")]
     LinkRevoked(String),
     #[error("work server unavailable: {0}")]
     Upstream(String),

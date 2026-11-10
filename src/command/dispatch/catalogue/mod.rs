@@ -783,8 +783,8 @@ mod shared_flags;
 pub use shared_flags::SessionWorktreeTarget;
 mod squad;
 // WI 0142: the hidden `view` command spec.
-mod queue;
 mod link;
+mod queue;
 mod view;
 
 #[cfg(test)]
@@ -802,4 +802,3 @@ use remote::*;
 use shared_flags::*;
 use squad::*;
 use view::*;
-use worker::*;

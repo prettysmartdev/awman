@@ -31,6 +31,9 @@ pub struct PickRun {
     pub server: String,
     pub cwd: PathBuf,
     pub command_line: String,
+    /// Engine-ready argv; browsers do not parse shell syntax themselves.
+    #[serde(default)]
+    pub argv: Vec<String>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "code", content = "error", rename_all = "snake_case")]

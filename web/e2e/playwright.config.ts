@@ -10,7 +10,7 @@ export default defineConfig({
   retries: 0,
   reporter: 'list',
   use: {
-    baseURL: 'http://localhost:3000',
+    baseURL: 'http://127.0.0.1:3000',
     // Pairing secrets must never be written into traces, videos or screenshots.
     trace: 'off', video: 'off', screenshot: 'off',
     serviceWorkers: 'block',

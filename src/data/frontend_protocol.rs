@@ -96,6 +96,10 @@ pub struct OpenTabOptions {
     pub label: Option<String>,
     pub annotations: Annotations,
     pub startup: StartupSpawn,
+    /// A picked lease may open its prepared workspace outside the web
+    /// launch-context roots. The engine verifies the lease and exact path.
+    #[serde(default)]
+    pub lease_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

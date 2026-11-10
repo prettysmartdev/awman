@@ -99,7 +99,7 @@ export function ConnectScreen({ state, controller }: { state: ConnectState; cont
         <details className="about">
           <summary>About this app</summary>
           <p>
-            awman runs entirely on this computer. This page talks only to the awman daemon at 127.0.0.1:9877; your sessions, commands and
+            This page connects to the awman daemon on the host that served it; your sessions, commands and
             terminals never pass through the website. It works only with a daemon on the same machine.
           </p>
           <p>{OFFLINE_NOTE}</p>

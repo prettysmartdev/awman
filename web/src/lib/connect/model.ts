@@ -52,7 +52,7 @@ const BASE: Omit<ConnectView, 'kind' | 'title'> = {
   busy: false,
 };
 
-const STATUS_HINT = `Run \`${DAEMON_STATUS}\` to see each listener's address, features and any bind error. If the loopback listener uses a different port or failed to bind, fix that first: this app only connects to ${EXPECTED_ENDPOINT}.`;
+const STATUS_HINT = `Run \`${DAEMON_STATUS}\` to see each listener's address, features and any bind error. If the listener for this host uses a different port or failed to bind, fix that first: this app connects to ${EXPECTED_ENDPOINT}.`;
 
 export function connectView(state: ConnectState): ConnectView {
   switch (state.phase) {

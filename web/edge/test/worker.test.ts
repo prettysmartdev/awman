@@ -44,11 +44,11 @@ describe('document-only counting', () => {
     expect(response.headers.get('Referrer-Policy')).toBe('no-referrer');
     expect(response.headers.get('Strict-Transport-Security')).toBe('max-age=31536000; includeSubDomains');
     const csp = response.headers.get('Content-Security-Policy')!;
-    expect(csp).toContain('http://127.0.0.1:9877 ws://127.0.0.1:9877');
+    expect(csp).toContain('https://awman.prettysmart.dev:9877 wss://awman.prettysmart.dev:9877');
     expect(csp).toContain("frame-ancestors 'none'");
     // Only WASM compilation (the terminal core) is allowed; never JS eval/inline.
     expect(csp.split('; ')).toContain("script-src 'self' 'wasm-unsafe-eval'");
-    expect(csp.replaceAll("'wasm-unsafe-eval'", '')).not.toMatch(/unsafe-inline|unsafe-eval|unsafe-hashes|https:\/\//);
+    expect(csp.replaceAll("'wasm-unsafe-eval'", '')).not.toMatch(/unsafe-inline|unsafe-eval|unsafe-hashes/);
     expect(response.headers.get('Permissions-Policy')).toContain('camera=()');
     assertRows(await exported(), 1);
     const state = await rows();

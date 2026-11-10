@@ -1255,21 +1255,49 @@ impl EngineInstanceHost {
             return Err(HostError::Draining);
         }
         let hosted = self.find(id).ok_or(HostError::NotFound)?;
-        let (instance, size, dir) = {
+        let (instance, size, web_context) = {
             let state = hosted.state();
-            let dir = if state.primary_kind == Some(FrontendKindWire::Web)
+            let web_context = if state.primary_kind == Some(FrontendKindWire::Web)
                 && options.kind != TabKindWire::Squad
             {
-                super::launch_contexts::LaunchContextRegistry::resolve_dir(
-                    &state.context_roots,
-                    state.env.as_ref().ok_or(HostError::NotFound)?.cwd(),
-                    &dir,
-                )
-                .map_err(|_| HostError::DirOutsideContext)?
+                Some((
+                    state.context_roots.clone(),
+                    state
+                        .env
+                        .as_ref()
+                        .ok_or(HostError::NotFound)?
+                        .cwd()
+                        .to_path_buf(),
+                ))
             } else {
-                dir
+                None
             };
-            (state.running()?, Self::frontend_size(&state, from), dir)
+            (
+                state.running()?,
+                Self::frontend_size(&state, from),
+                web_context,
+            )
+        };
+        let dir = if let Some((roots, cwd)) = web_context {
+            if let Some(lease_id) = options.lease_id.as_deref() {
+                // The instance's own worker prepared this path for this exact
+                // lease. A browser cannot use the lease field to name any
+                // other directory outside its launch context.
+                let prepared = instance
+                    .prepared_lease_run(lease_id)
+                    .is_some_and(|run| run.cwd == dir);
+                if !prepared
+                    || options.startup != crate::data::frontend_protocol::StartupSpawn::None
+                {
+                    return Err(HostError::DirOutsideContext);
+                }
+                dir
+            } else {
+                super::launch_contexts::LaunchContextRegistry::resolve_dir(&roots, &cwd, &dir)
+                    .map_err(|_| HostError::DirOutsideContext)?
+            }
+        } else {
+            dir
         };
         let kind = options.kind.clone();
         let opened = if kind == TabKindWire::Squad {
@@ -1960,7 +1988,19 @@ impl FrontendSession {
                 &frame,
                 FrontendFrame::Quit
                     | FrontendFrame::CloseTab { .. }
-                    | FrontendFrame::UiRequest(UiRequest::CloseTab { .. })
+                    | FrontendFrame::OpenTab { .. }
+                    | FrontendFrame::Submit { .. }
+                    | FrontendFrame::DialogResponse { .. }
+                    | FrontendFrame::Cancel { .. }
+                    | FrontendFrame::CancelCountdown { .. }
+                    | FrontendFrame::WorkflowRequest { .. }
+                    | FrontendFrame::UiRequest(_)
+                    | FrontendFrame::WorkerQueue {
+                        request: crate::data::worker::queue::QueueRequest::Pick { .. }
+                            | crate::data::worker::queue::QueueRequest::Checkout { .. }
+                            | crate::data::worker::queue::QueueRequest::Finish { .. },
+                        ..
+                    }
             )
         {
             if let Some(hosted) = host.find(id) {
@@ -1973,7 +2013,7 @@ impl FrontendSession {
                         me,
                         EngineFrame::Notice {
                             level: MessageLevel::Error,
-                            text: "only the primary frontend may close tabs or quit".into(),
+                            text: "only the primary frontend may change this instance".into(),
                         },
                     );
                     return Ok(());

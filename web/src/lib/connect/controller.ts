@@ -10,6 +10,7 @@ import { createLink, pollLink, type LinkRequest } from '../client/links';
 import { loopbackPermission, probe as defaultProbe, type LoopbackPermission, type ProbeResult } from '../client/health';
 import { LinkDenied, LinkExpired, LinkGone, isAbortError } from '../client/errors';
 import { currentGrant, type Grant } from '../client/grant';
+import { DAEMON_HTTP } from '../client/http';
 import { Subject, type Observable } from '../client/observable';
 import type { BrowserHealth } from '../client/types';
 
@@ -30,15 +31,14 @@ export interface ConnectDeps {
   permission?: () => Promise<LoopbackPermission>;
   createLink?: (signal?: AbortSignal) => Promise<LinkRequest>;
   pollLink?: (request: LinkRequest, signal: AbortSignal, onPending: () => void) => Promise<Grant>;
-  /** The page itself is served from loopback (dev / e2e): no LNA prompt applies. */
-  pageIsLoopback?: () => boolean;
+  /** A page served by the daemon's hostname needs no cross-network permission. */
+  pageSharesDaemonHost?: () => boolean;
   setTimer?: (fn: () => void, ms: number) => unknown;
   clearTimer?: (handle: unknown) => void;
 }
 
-function defaultPageIsLoopback(): boolean {
-  if (typeof location === 'undefined') return false;
-  return ['localhost', '127.0.0.1', '[::1]'].includes(location.hostname);
+function defaultPageSharesDaemonHost(): boolean {
+  return typeof location !== 'undefined' && !!DAEMON_HTTP && new URL(DAEMON_HTTP).hostname === location.hostname;
 }
 
 export class ConnectController {
@@ -56,7 +56,7 @@ export class ConnectController {
       permission: deps.permission ?? (() => loopbackPermission()),
       createLink: deps.createLink ?? (signal => createLink(undefined, signal)),
       pollLink: deps.pollLink ?? ((request, signal, onPending) => pollLink(request, signal, { onPending })),
-      pageIsLoopback: deps.pageIsLoopback ?? defaultPageIsLoopback,
+      pageSharesDaemonHost: deps.pageSharesDaemonHost ?? defaultPageSharesDaemonHost,
       setTimer: deps.setTimer ?? ((fn, ms) => setTimeout(fn, ms)),
       clearTimer: deps.clearTimer ?? (handle => clearTimeout(handle as ReturnType<typeof setTimeout>)),
     };
@@ -67,7 +67,7 @@ export class ConnectController {
     if (this.subject.get().phase !== 'idle') return;
     const permission = await this.deps.permission();
     if (this.disposed) return;
-    if (permission === 'prompt' && !this.deps.pageIsLoopback()) {
+    if (permission === 'prompt' && !this.deps.pageSharesDaemonHost()) {
       this.subject.set({ phase: 'needs_permission' });
       return;
     }

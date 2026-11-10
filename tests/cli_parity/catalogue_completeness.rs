@@ -16,7 +16,7 @@ fn all_documented_top_level_commands_present() {
     let names: Vec<&str> = cat().root().subcommands.iter().map(|s| s.name).collect();
     for expected in &[
         "init", "ready", "chat", "specs", "agents", "config", "exec", "daemon", "squad", "remote",
-        "new", "worker", "queue",
+        "new", "link", "queue",
     ] {
         assert!(
             names.contains(expected),

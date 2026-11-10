@@ -28,7 +28,7 @@ function controller(results: ProbeResult[], extra: Partial<ConnectDeps> = {}) {
   const c = new ConnectController({
     probe: async () => results[Math.min(probes++, results.length - 1)]!,
     permission: async () => 'unknown',
-    pageIsLoopback: () => false,
+    pageSharesDaemonHost: () => false,
     setTimer: (fn, ms) => timers.push({ fn, ms }),
     clearTimer: () => timers.splice(0),
     ...extra,
@@ -91,7 +91,7 @@ describe('ConnectController', () => {
   });
 
   it('skips the gesture when the page itself is on loopback (dev/e2e)', async () => {
-    const { c } = controller([{ kind: 'unreachable', detail: 'network' }], { permission: async () => 'prompt', pageIsLoopback: () => true });
+    const { c } = controller([{ kind: 'unreachable', detail: 'network' }], { permission: async () => 'prompt', pageSharesDaemonHost: () => true });
     await c.start();
     expect(c.state.get()).toMatchObject({ phase: 'probed', result: { kind: 'unreachable' } });
   });

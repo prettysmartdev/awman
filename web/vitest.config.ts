@@ -7,6 +7,7 @@ export default defineConfig({
   test: {
     include: ['test/**/*.test.ts', 'test/**/*.test.tsx'],
     environment: 'node',
+    setupFiles: ['test/setup.ts'],
     // Component tests opt into jsdom with `// @vitest-environment jsdom`.
     restoreMocks: true,
     unstubGlobals: true,

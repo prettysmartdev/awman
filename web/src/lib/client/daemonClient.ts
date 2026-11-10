@@ -1,4 +1,4 @@
-// Grant-authenticated HTTP client for the same-machine daemon (design §5.4).
+// Grant-authenticated HTTP client for the daemon on the loaded page's host.
 // Holds the grant in memory only. Any 401 browser_grant_invalid/required
 // clears the in-memory grant and fires `onRevoked` once.
 import { DaemonError, GrantRevoked } from './errors';

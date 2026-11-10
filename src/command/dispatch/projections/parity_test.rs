@@ -867,7 +867,6 @@ fn every_catalogue_command_leaf_is_buildable_by_dispatch() {
         &["remote", "exec"],
         &["remote", "session"],
         &["new"],
-        &["worker"],
     ];
 
     fn walk(
