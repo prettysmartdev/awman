@@ -609,7 +609,7 @@ async fn feature_cancel_releases_background_and_foreground_clones_before_job_cre
             tokio::spawn(
                 async move { c.claim_next_for(Some("blocked"), "team", foreground).await },
             );
-        tokio::time::timeout(Duration::from_secs(5), async {
+        let clone_started = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if server
                     .received_requests()
@@ -623,8 +623,25 @@ async fn feature_cancel_releases_background_and_foreground_clones_before_job_cre
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
-        .await
-        .expect("clone began");
+        .await;
+        if clone_started.is_err() {
+            let outcome = if claim.is_finished() {
+                format!("{:?}", claim.await)
+            } else {
+                "claim still running".into()
+            };
+            let requests: Vec<_> = server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .map(|request| request.url.path().to_owned())
+                .collect();
+            panic!(
+                "clone did not begin; {outcome}; active leases: {}; requests: {requests:?}",
+                controller.leases.active().unwrap().len()
+            );
+        }
         let records = controller.leases.active().unwrap();
         assert_eq!(records.len(), 1);
         assert!(
