@@ -380,7 +380,15 @@ enum Outbound {
 
 #[derive(Default)]
 struct State {
-    queue_waiters: HashMap<u64, std::sync::mpsc::Sender<crate::data::worker::queue::QueueReply>>,
+    /// Pending queue requests, with the tab each was made from. An entry
+    /// outlives a caller that gave up waiting, so a late answer is noticed.
+    queue_waiters: HashMap<
+        u64,
+        (
+            TabId,
+            std::sync::mpsc::Sender<crate::data::worker::queue::QueueReply>,
+        ),
+    >,
     frontend_id: FrontendId,
     tabs: Vec<RemoteTab>,
     /// Tabs the engine has that this presenter never asked for (another
@@ -1540,8 +1548,21 @@ fn handle_frame(shared: &Shared, state: &mut State, seq: Seq, frame: EngineFrame
     let _ = seq;
     match frame {
         EngineFrame::WorkerQueue { request_id, reply } => {
-            if let Some(waiter) = state.queue_waiters.remove(&request_id) {
-                let _ = waiter.send(reply);
+            if let Some((tab_id, waiter)) = state.queue_waiters.remove(&request_id) {
+                use crate::data::worker::queue::{LeaseCloseChoice, QueueReply, QueueRequest};
+                // The caller stopped waiting (a slow clone): nobody will run
+                // this lease, so hand the item back instead of holding it.
+                if let Err(std::sync::mpsc::SendError(QueueReply::Picked(run))) = waiter.send(reply)
+                {
+                    shared.send(FrontendFrame::WorkerQueue {
+                        request_id: shared.next_ticket.fetch_add(1, Ordering::Relaxed),
+                        tab_id,
+                        request: QueueRequest::Finish {
+                            lease_id: run.lease_id,
+                            choice: LeaseCloseChoice::Release,
+                        },
+                    });
+                }
             }
         }
         EngineFrame::Welcome { .. } => {}
@@ -2559,14 +2580,19 @@ impl RemoteQueue {
         use crate::data::worker::queue::{PickError, QueueReply};
         let request_id = self.shared.next_ticket.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = std::sync::mpsc::channel();
-        self.shared.lock().queue_waiters.insert(request_id, tx);
+        self.shared
+            .lock()
+            .queue_waiters
+            .insert(request_id, (self.tab_id.clone(), tx));
         self.shared.send(FrontendFrame::WorkerQueue {
             request_id,
             tab_id: self.tab_id.clone(),
             request,
         });
+        // On a timeout the waiter stays registered: the engine's eventual
+        // answer is then seen by `handle_frame`, which releases a lease that
+        // was picked for a caller no longer there.
         let result = rx.recv_timeout(Duration::from_secs(120));
-        self.shared.lock().queue_waiters.remove(&request_id);
         result.unwrap_or_else(|_| {
             QueueReply::Error(PickError::Failed("engine queue request timed out".into()))
         })

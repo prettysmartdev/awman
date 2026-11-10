@@ -36,6 +36,7 @@ pub fn error(e: WorkerError) -> Response {
         WorkerError::LeaseEnded(_) => ApiError::lease_ended(message),
         WorkerError::Taken => ApiError::taken(message),
         WorkerError::Ineligible(_) => ApiError::ineligible(message),
+        WorkerError::Busy(_) => ApiError::worker_busy(message),
         WorkerError::LinkRevoked(_) => ApiError::link_revoked(message),
         WorkerError::Upstream(_) => ApiError::upstream_unavailable(message),
         WorkerError::Invalid(_) => ApiError::invalid_request(message),

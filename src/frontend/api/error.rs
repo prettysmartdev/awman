@@ -108,6 +108,7 @@ constructors! {
     lease_ended => ("lease_ended", CONFLICT),
     taken => ("taken", CONFLICT),
     ineligible => ("ineligible", CONFLICT),
+    worker_busy => ("worker_busy", CONFLICT),
     link_revoked => ("link_revoked", CONFLICT),
     upstream_unavailable => ("upstream_unavailable", BAD_GATEWAY),
 }

@@ -226,6 +226,7 @@ async fn every_route_error_has_code_and_authoritative_code_status_table_is_exerc
         ("lease_ended", 409),
         ("taken", 409),
         ("ineligible", 409),
+        ("worker_busy", 409),
         ("link_revoked", 409),
         ("upstream_unavailable", 502),
     ]

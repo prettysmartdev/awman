@@ -240,20 +240,21 @@ struct Host {
     view: Arc<Mutex<View>>,
 }
 impl Host {
-    async fn connect(
-        session: Session,
-        engines: Engines,
-        view: Arc<Mutex<View>>,
-    ) -> Result<Self, String> {
-        let settings = session.effective_config().daemon().worker;
-        let paths =
-            crate::data::fs::DataPaths::from_env(session.env()).map_err(|e| e.to_string())?;
-        let links = LinkStore::new(&paths);
-        let mut servers = BTreeMap::new();
+    /// The running daemon, if any, and the work servers its worker feature
+    /// is pulling from.
+    async fn daemon_servers(
+        session: &Session,
+    ) -> Result<
+        (
+            Option<crate::command::commands::daemon::client::DaemonClient>,
+            Vec<ServerStatus>,
+        ),
+        String,
+    > {
         let daemon =
             crate::command::commands::daemon::client::DaemonClient::discover(session.env())
                 .map_err(|e| e.to_string())?;
-        let daemon_servers: Vec<ServerStatus> = match &daemon {
+        let servers: Vec<ServerStatus> = match &daemon {
             Some(client) => client
                 .all(&crate::command::commands::daemon::actions::Request {
                     method: "GET".into(),
@@ -275,6 +276,28 @@ impl Host {
                 .map_err(|e| e.to_string())?,
             None => vec![],
         };
+        Ok((daemon, servers))
+    }
+    /// Whether the daemon holds the registration for `name`.
+    fn daemon_owns(daemon_servers: &[ServerStatus], name: &str) -> bool {
+        daemon_servers.iter().any(|entry| {
+            entry.name == name
+                && entry.enabled
+                && entry.state != "disabled"
+                && entry.state != "retiring"
+        })
+    }
+    async fn connect(
+        session: Session,
+        engines: Engines,
+        view: Arc<Mutex<View>>,
+    ) -> Result<Self, String> {
+        let settings = session.effective_config().daemon().worker;
+        let paths =
+            crate::data::fs::DataPaths::from_env(session.env()).map_err(|e| e.to_string())?;
+        let links = LinkStore::new(&paths);
+        let mut servers = BTreeMap::new();
+        let (daemon, daemon_servers) = Self::daemon_servers(&session).await?;
         let mut proxies = BTreeMap::new();
         let runtime = engines.runtime.runtime_name();
         let kind = if runtime.contains("sbx") {
@@ -311,12 +334,7 @@ impl Host {
             let Some(url) = config.url.as_ref() else {
                 continue;
             };
-            if daemon_servers.iter().any(|entry| {
-                entry.name == *name
-                    && entry.enabled
-                    && entry.state != "disabled"
-                    && entry.state != "retiring"
-            }) {
+            if Self::daemon_owns(&daemon_servers, name) {
                 // The daemon also owns registration while connecting or
                 // recovering from an upstream error. Never create a second
                 // worker merely because its first register call is pending.
@@ -411,76 +429,96 @@ impl Host {
             view,
         })
     }
+    /// Reload the queue. One unreachable server does not hide the others:
+    /// its last known rows stay listed and its error is shown.
     async fn refresh(&self) -> Result<(), String> {
-        let mut items = Vec::new();
-        for (name, client) in &self.proxies {
-            let rows = client
-                .all(&crate::command::commands::daemon::actions::Request {
-                    method: "GET".into(),
-                    path: "/v1/worker/queue".into(),
-                    query: vec![("server".into(), name.clone())],
-                    body: None,
-                })
-                .await
-                .map_err(|e| e.to_string())?;
-            for row in rows {
-                let row: QueueRow = serde_json::from_value(row).map_err(|e| e.to_string())?;
-                items.push(QueueEntry {
-                    id: row.id,
-                    server: row.server,
-                    title: row.title,
-                    summary: row.summary,
-                    kind: if row.kind == awman_wsp::WorkKind::Prompt {
-                        "prompt"
-                    } else {
-                        "workflow"
-                    }
-                    .into(),
-                    labels: row.labels,
-                    priority: row.priority,
-                    age_ms: row.age_ms,
-                    for_you: row.for_you,
-                    body: row.body,
-                    source_url: row.source_url,
-                });
+        fn entry(row: QueueRow) -> QueueEntry {
+            QueueEntry {
+                id: row.id,
+                server: row.server,
+                title: row.title,
+                summary: row.summary,
+                kind: if row.kind == awman_wsp::WorkKind::Prompt {
+                    "prompt"
+                } else {
+                    "workflow"
+                }
+                .into(),
+                labels: row.labels,
+                priority: row.priority,
+                age_ms: row.age_ms,
+                for_you: row.for_you,
+                body: row.body,
+                source_url: row.source_url,
             }
+        }
+        let mut listed: Vec<(String, Result<Vec<QueueEntry>, String>)> = Vec::new();
+        for (name, client) in &self.proxies {
+            let rows = async {
+                client
+                    .all(&crate::command::commands::daemon::actions::Request {
+                        method: "GET".into(),
+                        path: "/v1/worker/queue".into(),
+                        query: vec![("server".into(), name.clone())],
+                        body: None,
+                    })
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .into_iter()
+                    .map(|row| {
+                        serde_json::from_value::<QueueRow>(row)
+                            .map(entry)
+                            .map_err(|e| e.to_string())
+                    })
+                    .collect::<Result<Vec<_>, String>>()
+            }
+            .await;
+            listed.push((name.clone(), rows));
         }
         for (name, server) in &self.servers {
-            let mut cursor = None;
-            loop {
-                let page = server
-                    .session
-                    .queue(500, cursor.as_deref())
-                    .await
-                    .map_err(|e| e.to_string())?;
-                for item in page.items {
-                    let row = QueueRow::from_wsp(name, item, Utc::now());
-                    items.push(QueueEntry {
-                        id: row.id,
-                        server: row.server,
-                        title: row.title,
-                        summary: row.summary,
-                        kind: if row.kind == awman_wsp::WorkKind::Prompt {
-                            "prompt"
-                        } else {
-                            "workflow"
-                        }
-                        .into(),
-                        labels: row.labels,
-                        priority: row.priority,
-                        age_ms: row.age_ms,
-                        for_you: row.for_you,
-                        body: row.body,
-                        source_url: row.source_url,
-                    });
+            let rows = async {
+                let mut found = Vec::new();
+                let mut cursor = None;
+                loop {
+                    let page = server
+                        .session
+                        .queue(500, cursor.as_deref())
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    found.extend(
+                        page.items
+                            .into_iter()
+                            .map(|item| entry(QueueRow::from_wsp(name, item, Utc::now()))),
+                    );
+                    cursor = page.next_cursor;
+                    if cursor.is_none() {
+                        break;
+                    }
                 }
-                cursor = page.next_cursor;
-                if cursor.is_none() {
-                    break;
+                Ok::<_, String>(found)
+            }
+            .await;
+            listed.push((name.clone(), rows));
+        }
+        let mut view = self.view.lock().unwrap();
+        let mut items = Vec::new();
+        let mut errors = Vec::new();
+        for (name, rows) in listed {
+            match rows {
+                Ok(rows) => items.extend(rows),
+                Err(error) => {
+                    // Keep what this server last listed.
+                    items.extend(
+                        view.snapshot
+                            .items
+                            .iter()
+                            .filter(|old| old.server == name)
+                            .cloned(),
+                    );
+                    errors.push(format!("{name}: {error}"));
                 }
             }
         }
-        let mut view = self.view.lock().unwrap();
         let added = items
             .iter()
             .filter(|item| {
@@ -491,15 +529,16 @@ impl Host {
                     .any(|old| old.id == item.id && old.server == item.server)
             })
             .count();
+        let error = (!errors.is_empty()).then(|| errors.join("; "));
         view.snapshot = QueueSnapshot {
             for_you: items.iter().filter(|i| i.for_you).count(),
             new_since_seen: view.snapshot.new_since_seen + added,
             items,
-            error: None,
+            error: error.clone(),
             loaded: true,
         };
         view.generation += 1;
-        Ok(())
+        error.map_or(Ok(()), Err)
     }
     async fn run(&mut self, mut rx: mpsc::UnboundedReceiver<Request>) {
         let mut tick = tokio::time::interval(Duration::from_secs(2));
@@ -524,7 +563,16 @@ impl Host {
                         if result.is_ok() { self.view.lock().unwrap().executing.insert(id); }
                         let _ = reply.send(result);
                     }
-                    Some(Request::Refresh) => { if let Err(e) = self.refresh_policy().await { self.view.lock().unwrap().snapshot.error = Some(e); } else if let Err(e) = self.refresh().await { self.view.lock().unwrap().snapshot.error = Some(e); } }
+                    Some(Request::Refresh) => {
+                        if let Err(e) = self.refresh_policy().await {
+                            let mut view = self.view.lock().unwrap();
+                            view.snapshot.error = Some(e);
+                            view.generation += 1;
+                        } else {
+                            // `refresh` records its own per-server errors.
+                            let _ = self.refresh().await;
+                        }
+                    }
                     Some(Request::Pick(server, id, reply)) => { let result = self.pick(&server, &id).await; let _ = reply.send(result); }
                     Some(Request::Finish(id, choice, reply)) => { let result = self.finish(&id, choice).await; self.forget_ended(&id); let _ = reply.send(result); }
                     Some(Request::Complete(id, result, reply)) => { let result = self.complete(&id, *result).await; self.forget_ended(&id); let _ = reply.send(result); }
@@ -852,10 +900,27 @@ impl Host {
             std::sync::atomic::Ordering::SeqCst,
         );
         let settings = self.session.effective_config().daemon().worker;
-        if settings.work_servers != self.settings.work_servers
+        let settings_changed = settings.work_servers != self.settings.work_servers
             || settings.pull_interaction != self.settings.pull_interaction
-            || settings.pull_allow_override != self.settings.pull_allow_override
-        {
+            || settings.pull_allow_override != self.settings.pull_allow_override;
+        // The daemon may start or stop pulling during this host's lifetime.
+        // Whoever holds a server's registration is re-checked between runs,
+        // so there is never a second worker, nor a server left to a daemon
+        // that has gone.
+        let owner_changed = !settings_changed
+            && self.runs.is_empty()
+            && self.proxy_runs.is_empty()
+            && match Self::daemon_servers(&self.session).await {
+                Ok((_, daemon_servers)) => settings
+                    .work_servers
+                    .iter()
+                    .filter(|(_, config)| config.enabled && config.url.is_some())
+                    .any(|(name, _)| {
+                        Self::daemon_owns(&daemon_servers, name) != self.proxies.contains_key(name)
+                    }),
+                Err(_) => false,
+            };
+        if settings_changed || owner_changed {
             let replacement = Self::connect(
                 self.session.clone(),
                 self.engines.clone(),
@@ -1180,12 +1245,7 @@ impl ManualRun {
                             base_ref: Some(lease.item.repo.base_ref.clone()),
                             branch: lease.item.repo.branch.clone(),
                             merge_refs: lease.item.repo.merge_refs.clone(),
-                            push_branch: lease
-                                .item
-                                .push
-                                .as_ref()
-                                .filter(|p| p.enabled)
-                                .map(|p| p.branch.clone()),
+                            push_branch: lease.item.push_branch().map(str::to_string),
                             read_only: lease.item.exec.read_only,
                             work_root: root,
                         },

@@ -2469,6 +2469,6 @@ Your **client** still holds the old strings, and the old form is not accepted: r
 
 `GET /v1/worker/servers` accepts `limit` and `cursor`, and every returned `next_cursor` can be followed. To test for leases that still need credentials, request `/v1/worker/leases?server=NAME&state=active&limit=1`; the default lease list also includes ended history.
 
-The production daemon registers linked work servers and runs automatic and manual claims on its worker share. Pull routes remain local-only. Unsupported lease execution requirements are released as ineligible; see [Workers and Work Servers](17-workers-and-work-servers.md#execution-and-lease-safety). Expiry or revocation fences execution, events, credentials, push and result reporting together.
+The production daemon registers linked work servers and runs automatic and manual claims on its worker share. Pull routes remain local-only. Unsupported lease execution requirements are released as ineligible; see [Workers and Work Servers](17-workers-and-work-servers.md#running-pulled-work). Expiry or revocation fences execution, events, credentials, push and result reporting together.
 
 SSE, `?format=json` and WSP forward the same public event projection: `emitted_at` is an RFC 3339 UTC timestamp, and `payload.type` is snake_case. Stored older logs with `timestamp` and Rust-style tags such as `StdoutLine` are read compatibly and projected on replay. Clients should accept the public spelling for new streams.

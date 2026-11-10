@@ -8,7 +8,10 @@ pub trait ConformanceAdmin: Sync {
     fn enqueue(&self, item: WorkItem) -> AdminFuture<'_>;
     /// Set fixture age explicitly, including equal timestamps for preference ties.
     fn enqueue_at(&self, item: WorkItem, at: chrono::DateTime<chrono::Utc>) -> AdminFuture<'_>;
-    /// Expire this lease, preserving its ID for the next claim (with a higher epoch).
+    /// Expire this lease so the item can be claimed again. A server that
+    /// reuses lease IDs keeps this ID for the next claim, with a higher epoch;
+    /// a server that never reuses IDs issues a new one. Either way every call
+    /// on the old lease must then answer `409 lease_lost`.
     fn expire_lease_reusing_id<'a>(&'a self, id: &'a str) -> AdminFuture<'a>;
     /// Observation hook required for servers returning empty event acknowledgements.
     /// Return the stored event count to verify deduplication without {accepted}.
@@ -350,7 +353,8 @@ async fn probe(
             let old = a.with_lease_epoch(&lease.id, lease.epoch);
             admin.expire_lease_reusing_id(&lease.id).await;
             let next = a.claim(Some(&id), 0).await?.ok_or(Error::InvalidResponse)?;
-            check(next.id == lease.id && next.epoch > lease.epoch)?;
+            // A reused ID must carry a higher epoch; a fresh ID fences by itself.
+            check(next.id != lease.id || next.epoch > lease.epoch)?;
             check(
                 old.heartbeat(&lease.id, &heartbeat())
                     .await

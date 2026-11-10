@@ -47,9 +47,10 @@ let client = Client::new(&serving.base_url, token.refresh_token)?;
 
 To test another server, implement `ConformanceAdmin` with its fixture provisioning
 and link approval APIs, then call `conformance::run(base_url, &admin)`. The admin adapter supplies explicit fixture timestamps through `enqueue_at` and
-expires a lease while retaining its ID through `expire_lease_reusing_id`; the
-next claim must increase its epoch. These hooks make age/preference ordering and
-same-ID epoch fencing deterministic. `event_count` inspects stored events and is required when the server returns an
+expires a lease through `expire_lease_reusing_id`. A server that reuses lease IDs
+keeps the ID and must increase the epoch on the next claim; a server that never
+reuses IDs issues a new one. These hooks make age/preference ordering and epoch
+fencing deterministic. `event_count` inspects stored events and is required when the server returns an
 empty acknowledgement, so deduplication is still verified. Each mutation method
 returns `conformance::AdminFuture<'_>` (a boxed async future) so the trait is object
 safe. Use an isolated queue. The runner returns individual passed/failed cases;

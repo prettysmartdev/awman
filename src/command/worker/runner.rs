@@ -188,7 +188,7 @@ impl LeasePostProcess for PushStage {
         if result.outcome != Some(CommandStatusKind::Done) {
             return result;
         }
-        let Some(push) = self.lease.item.push.as_ref().filter(|p| p.enabled) else {
+        let Some(push_branch) = self.lease.item.push_branch() else {
             return result;
         };
         self.active.control.set_state(HeartbeatState::Pushing);
@@ -260,7 +260,7 @@ impl LeasePostProcess for PushStage {
         }
         let mut operation = LeasePush::new(
             git,
-            &push.branch,
+            push_branch,
             PushRetryPolicy::for_lease(self.active.control.expires_at(), self.interval),
             self.interval,
         )
@@ -284,7 +284,7 @@ impl LeasePostProcess for PushStage {
             Ok(outcome) => {
                 result.pushed = Some(Some(crate::data::fs::api_db::PushedRef {
                     remote: "origin".into(),
-                    branch: push.branch.clone(),
+                    branch: push_branch.to_string(),
                     sha: outcome.sha().into(),
                 }))
             }
@@ -654,12 +654,7 @@ impl<F: ApiCommandFrontendFactory + 'static> PullController<F> {
                 base_ref: Some(lease.item.repo.base_ref.clone()),
                 branch: lease.item.repo.branch.clone(),
                 merge_refs: lease.item.repo.merge_refs.clone(),
-                push_branch: lease
-                    .item
-                    .push
-                    .as_ref()
-                    .filter(|p| p.enabled)
-                    .map(|p| p.branch.clone()),
+                push_branch: lease.item.push_branch().map(str::to_string),
                 read_only: lease.item.exec.read_only,
                 work_root: root,
             },

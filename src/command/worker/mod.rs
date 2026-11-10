@@ -91,6 +91,10 @@ pub struct PullController<F: ApiCommandFrontendFactory + 'static> {
     accepting: AtomicBool,
     shutting_down: AtomicBool,
     claim_stop: Mutex<CancellationToken>,
+    /// Set by a `shutdown` release: claiming pauses until this instant, so a
+    /// stopping daemon takes nothing new while a daemon that keeps running
+    /// resumes pulling.
+    drain_until: Mutex<Option<std::time::Instant>>,
     core_shutdown: CancellationToken,
     helper: crate::engine::worker::credential_helper::HelperProgram,
 }
@@ -116,6 +120,7 @@ impl<F: ApiCommandFrontendFactory + 'static> PullController<F> {
             accepting: AtomicBool::new(false),
             shutting_down: AtomicBool::new(false),
             claim_stop: Mutex::new(CancellationToken::new()),
+            drain_until: Mutex::new(None),
             core_shutdown: core.shutdown(),
             helper,
         }))
@@ -184,7 +189,15 @@ impl<F: ApiCommandFrontendFactory + 'static> PullController<F> {
         }
         roots.sort();
         roots.dedup();
-        let mut agents = std::collections::BTreeSet::new();
+        // A lease runs in its own clone, where a first-party agent's recipe is
+        // generated and its image built on demand: every one of them is
+        // runnable here, whatever the push workdirs hold. Other agents count
+        // only with an image already built.
+        let mut agents: std::collections::BTreeSet<String> =
+            crate::engine::agent::first_party::FIRST_PARTY_AGENTS
+                .iter()
+                .map(|name| name.to_string())
+                .collect();
         for root in roots {
             let Ok(session) = crate::data::session::Session::open_at_git_root(
                 root.clone(),
@@ -290,6 +303,14 @@ impl<F: ApiCommandFrontendFactory + 'static> PullController<F> {
             {
                 let mut servers = self.servers.write().unwrap();
                 if let Some(entry) = servers.get_mut(name) {
+                    // A refresh refused during a claim or heartbeat revokes
+                    // the session; show it instead of a stale `registered`.
+                    if entry.url == *url && session.is_revoked() {
+                        entry.status.state = "revoked".into();
+                        entry.status.error =
+                            Some(WorkerError::LinkRevoked(name.clone()).to_string());
+                        continue;
+                    }
                     if entry.url == *url
                         && entry.registration == request
                         && entry.status.state == "registered"
@@ -479,8 +500,10 @@ impl<F: ApiCommandFrontendFactory + 'static> PullController<F> {
         *self.claim_stop.lock().unwrap() = stop.child_token();
         self.accepting.store(true, Ordering::SeqCst);
         self.shutting_down.store(false, Ordering::SeqCst);
+        *self.drain_until.lock().unwrap() = None;
         let mut claims = BTreeMap::<String, tokio::task::JoinHandle<()>>::new();
         while !stop.is_cancelled() {
+            self.resume_after_drain(&stop);
             if let Err(error) = self.refresh_servers().await {
                 tracing::warn!(%error, "work server registration failed");
             }
@@ -591,6 +614,27 @@ impl<F: ApiCommandFrontendFactory + 'static> PullController<F> {
             }
         }
     }
+    /// How long a `shutdown` release keeps the worker from claiming.
+    const SHUTDOWN_DRAIN: Duration = Duration::from_secs(60);
+    /// Stop claiming for [`Self::SHUTDOWN_DRAIN`]: the caller is stopping the
+    /// daemon and nothing new may start meanwhile.
+    fn pause_claims(&self) {
+        self.shutting_down.store(true, Ordering::SeqCst);
+        *self.drain_until.lock().unwrap() = Some(std::time::Instant::now() + Self::SHUTDOWN_DRAIN);
+        self.claim_stop.lock().unwrap().cancel();
+    }
+    /// Resume claiming when a `shutdown` release was not followed by a stop.
+    fn resume_after_drain(&self, stop: &CancellationToken) {
+        let mut drain = self.drain_until.lock().unwrap();
+        if drain.is_some_and(|until| std::time::Instant::now() >= until)
+            && !stop.is_cancelled()
+            && !self.core_shutdown.is_cancelled()
+        {
+            *drain = None;
+            self.shutting_down.store(false, Ordering::SeqCst);
+            *self.claim_stop.lock().unwrap() = stop.child_token();
+        }
+    }
     pub fn cancel_for_shutdown(&self) {
         self.shutting_down.store(true, Ordering::SeqCst);
         for active in self.active.lock().unwrap().values() {
@@ -629,11 +673,22 @@ impl<F: ApiCommandFrontendFactory + 'static> PullController<F> {
             return Err(WorkerError::PullDisabled("pull is disabled".into()));
         }
         if self.running(name) >= config.max_concurrent_jobs {
-            return Err(WorkerError::Ineligible(
-                "work server capacity is full".into(),
-            ));
+            return Err(WorkerError::Busy("work server capacity is full".into()));
         }
-        let permit: WorkerPermit = tokio::select! { biased; _ = stop.cancelled() => return Err(WorkerError::PullDisabled("worker is draining".into())), permit = self.share.acquire(JobClass::Pull) => permit };
+        // A manual pick answers promptly when the worker has no free slot; an
+        // automatic claim waits its turn.
+        let manual_wait = async {
+            if item.is_some() {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        };
+        let permit: WorkerPermit = tokio::select! { biased;
+            _ = stop.cancelled() => return Err(WorkerError::PullDisabled("worker is draining".into())),
+            permit = self.share.acquire(JobClass::Pull) => permit,
+            _ = manual_wait => return Err(WorkerError::Busy("the worker has no free execution slot".into())),
+        };
         // Live policy must still permit the claim after waiting for capacity.
         if !self
             .settings()
@@ -667,9 +722,7 @@ impl<F: ApiCommandFrontendFactory + 'static> PullController<F> {
             .clone();
         let _gate = tokio::select! { biased; _ = stop.cancelled() => return Err(WorkerError::PullDisabled("worker is draining".into())), gate = gate.lock() => gate };
         if self.running(name) >= config.max_concurrent_jobs {
-            return Err(WorkerError::Ineligible(
-                "work server capacity is full".into(),
-            ));
+            return Err(WorkerError::Busy("work server capacity is full".into()));
         }
         let server_labels = self
             .servers
@@ -678,14 +731,16 @@ impl<F: ApiCommandFrontendFactory + 'static> PullController<F> {
             .get(name)
             .map(|entry| entry.status.server_labels.clone())
             .unwrap_or_default();
-        // Admission was possible when this poll began. An idle long-poll
-        // must not reserve an execution slot: pushed work and other servers
-        // can use it. A returned lease heartbeats while reacquiring its turn.
-        let permit = if item.is_none() {
-            drop(permit);
-            None
-        } else {
-            Some(permit)
+        // The slot is held while claiming, so a claimed item always starts
+        // at once. An idle long-poll gives the slot up as soon as pushed work
+        // is waiting for it.
+        let push_waiting = async {
+            loop {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                if item.is_none() && self.share.snapshot().waiting_push > 0 {
+                    break;
+                }
+            }
         };
         let claim = async {
             loop {
@@ -716,6 +771,7 @@ impl<F: ApiCommandFrontendFactory + 'static> PullController<F> {
         let outcome = tokio::select! { biased;
             _ = stop.cancelled() => return Err(WorkerError::PullDisabled("worker is draining".into())),
             _ = policy_changed => return Err(WorkerError::PullDisabled("work server policy changed".into())),
+            _ = push_waiting => return Ok(None),
             outcome = claim => outcome?,
         };
         let ClaimOutcome::Leased(lease) = outcome else {
@@ -740,7 +796,8 @@ impl<F: ApiCommandFrontendFactory + 'static> PullController<F> {
                             {
                                 ReleaseReason::Shutdown
                             } else {
-                                ReleaseReason::Ineligible
+                                // The owner changed policy; the item is fine.
+                                ReleaseReason::UserDeclined
                             },
                             message: Some("worker policy changed during claim".into()),
                             result: None,
@@ -754,12 +811,15 @@ impl<F: ApiCommandFrontendFactory + 'static> PullController<F> {
             ));
         }
         let latest = self.settings();
+        // Set when the refusal is this worker's own state, not the item's.
+        let mut local_change = !latest.work_servers.contains_key(name);
         let plan = latest
             .work_servers
             .get(name)
             .ok_or_else(|| "work server retired during claim".to_string())
             .and_then(|server| {
                 if self.running(name) >= server.max_concurrent_jobs {
+                    local_change = true;
                     return Err("work server capacity changed during claim".into());
                 }
                 let labels = self
@@ -794,13 +854,20 @@ impl<F: ApiCommandFrontendFactory + 'static> PullController<F> {
                         .release(
                             &LeaseRef::of(&lease),
                             &ReleaseRequest {
-                                reason: ReleaseReason::Ineligible,
+                                reason: if local_change {
+                                    ReleaseReason::UserDeclined
+                                } else {
+                                    ReleaseReason::Ineligible
+                                },
                                 message: Some(reason.clone()),
                                 result: None,
                             },
                         )
                         .await
                         .map_err(|e| Self::map_error(name, e))?;
+                }
+                if local_change {
+                    return Err(WorkerError::Busy(reason));
                 }
                 return Err(WorkerError::Ineligible(reason));
             }
@@ -915,10 +982,10 @@ impl<F: ApiCommandFrontendFactory + 'static> PullController<F> {
                 .lock()
                 .unwrap()
                 .insert(record.id.to_string(), run.active.clone());
-            self.foreground.lock().await.insert(
-                record.id.to_string(),
-                (run, permit.expect("manual claim permit")),
-            );
+            self.foreground
+                .lock()
+                .await
+                .insert(record.id.to_string(), (run, permit));
             return Ok(Some(record));
         }
         let record = LeaseRecord::claimed(name, &lease, LeaseHost::Daemon, Utc::now());
@@ -946,7 +1013,7 @@ impl<F: ApiCommandFrontendFactory + 'static> PullController<F> {
                 plan,
                 owner,
             },
-            permit,
+            Some(permit),
             heartbeat,
         );
         if let Some(entry) = self.servers.write().unwrap().get_mut(name) {
@@ -1057,35 +1124,60 @@ impl<F: ApiCommandFrontendFactory + 'static> PullHandle for PullHandleAdapter<F>
                 .collect(),
         };
         let mut rows = Vec::new();
+        // A merged listing shows what the reachable servers offer: one server
+        // being down must not hide the others. It fails only when a named
+        // server fails, or every server does.
+        let total = names.len();
+        let mut first_error = None;
+        let mut failed = 0;
         for name in names {
-            let session = self
-                .0
-                .servers
-                .read()
-                .unwrap()
-                .get(&name)
-                .filter(|entry| entry.status.state == "registered")
-                .map(|entry| entry.session.clone())
-                .ok_or_else(|| WorkerError::ServerNotRegistered(name.clone()))?;
-            let mut next = None;
-            loop {
-                let page = session
-                    .queue(500, next.as_deref())
-                    .await
-                    .map_err(|e| PullController::<F>::map_error(&name, e))?;
-                rows.extend(
-                    page.items
-                        .into_iter()
-                        .map(|item| QueueRow::from_wsp(&name, item, Utc::now())),
-                );
-                next = page.next_cursor;
-                if next.is_none() {
-                    break;
+            let listed = async {
+                let session = self
+                    .0
+                    .servers
+                    .read()
+                    .unwrap()
+                    .get(&name)
+                    .filter(|entry| entry.status.state == "registered")
+                    .map(|entry| entry.session.clone())
+                    .ok_or_else(|| WorkerError::ServerNotRegistered(name.clone()))?;
+                let mut found = Vec::new();
+                let mut next = None;
+                loop {
+                    let page = session
+                        .queue(500, next.as_deref())
+                        .await
+                        .map_err(|e| PullController::<F>::map_error(&name, e))?;
+                    found.extend(
+                        page.items
+                            .into_iter()
+                            .map(|item| QueueRow::from_wsp(&name, item, Utc::now())),
+                    );
+                    next = page.next_cursor;
+                    if next.is_none() {
+                        break;
+                    }
+                }
+                Ok::<_, WorkerError>(found)
+            }
+            .await;
+            match listed {
+                Ok(found) => {
+                    if let Some(entry) = self.0.servers.write().unwrap().get_mut(&name) {
+                        entry.status.queued_eligible = found.len();
+                    }
+                    rows.extend(found);
+                }
+                Err(error) if server.is_some() => return Err(error),
+                Err(error) => {
+                    tracing::warn!(server = %name, %error, "work server left out of the queue listing");
+                    failed += 1;
+                    first_error.get_or_insert(error);
                 }
             }
-            if let Some(entry) = self.0.servers.write().unwrap().get_mut(&name) {
-                entry.status.queued_eligible = rows.iter().filter(|r| r.server == name).count();
-            }
+        }
+        if let Some(error) = first_error.filter(|_| failed == total) {
+            return Err(error);
         }
         rows.sort_by(|a, b| {
             b.priority
@@ -1125,9 +1217,7 @@ impl<F: ApiCommandFrontendFactory + 'static> PullHandle for PullHandleAdapter<F>
         message: Option<String>,
     ) -> Result<LeaseRecord, WorkerError> {
         if reason == ReleaseReason::Shutdown {
-            self.0.shutting_down.store(true, Ordering::SeqCst);
-            self.0.accepting.store(false, Ordering::SeqCst);
-            self.0.claim_stop.lock().unwrap().cancel();
+            self.0.pause_claims();
         }
         let running_foreground = {
             let runs = self.0.foreground.lock().await;

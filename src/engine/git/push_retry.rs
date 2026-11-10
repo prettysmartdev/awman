@@ -49,8 +49,22 @@ pub enum PushGiveUp {
 impl PushRetryPolicy {
     /// The default lease policy: 4 attempts, 2 s doubling to at most 15 s,
     /// bounded by `lease_expires_at - 2 × heartbeat`.
+    ///
+    /// A server may renew leases for no longer than two heartbeats. The
+    /// margin is then half of what is left, so a live lease always has a
+    /// window to push in.
     pub fn for_lease(lease_expires_at: DateTime<Utc>, heartbeat: Duration) -> Self {
-        let margin = chrono::Duration::from_std(heartbeat * 2).unwrap_or(chrono::Duration::zero());
+        Self::for_lease_at(Utc::now(), lease_expires_at, heartbeat)
+    }
+
+    fn for_lease_at(
+        now: DateTime<Utc>,
+        lease_expires_at: DateTime<Utc>,
+        heartbeat: Duration,
+    ) -> Self {
+        let full = chrono::Duration::from_std(heartbeat * 2).unwrap_or(chrono::Duration::zero());
+        let left = (lease_expires_at - now).max(chrono::Duration::zero());
+        let margin = if left > full { full } else { left / 2 };
         Self {
             max_attempts: 4,
             base_backoff: Duration::from_secs(2),
@@ -139,6 +153,22 @@ mod tests {
             p.decide(4, GitFailureClass::Transport, now),
             PushRetryDecision::GiveUp(PushGiveUp::Unreachable)
         );
+    }
+
+    #[test]
+    fn a_lease_renewed_for_two_heartbeats_or_less_still_has_a_push_window() {
+        let now = Utc::now();
+        let heartbeat = Duration::from_secs(15);
+        let secs = chrono::Duration::seconds;
+        // TTL == 2 × heartbeat: the full margin would close the window at once.
+        let short = PushRetryPolicy::for_lease_at(now, now + secs(30), heartbeat);
+        assert_eq!(short.deadline, now + secs(15));
+        // A roomy lease keeps the two-heartbeat margin.
+        let roomy = PushRetryPolicy::for_lease_at(now, now + secs(120), heartbeat);
+        assert_eq!(roomy.deadline, now + secs(90));
+        // An expired lease has no window.
+        let expired = PushRetryPolicy::for_lease_at(now, now - secs(1), heartbeat);
+        assert!(expired.deadline <= now);
     }
 
     #[test]

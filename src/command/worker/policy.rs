@@ -89,7 +89,12 @@ pub fn plan(
     for reference in std::iter::once(&item.repo.base_ref)
         .chain(std::iter::once(&item.repo.branch))
         .chain(item.repo.merge_refs.iter())
-        .chain(item.push.iter().map(|push| &push.branch))
+        .chain(
+            item.push
+                .iter()
+                .map(|push| &push.branch)
+                .filter(|branch| !branch.is_empty()),
+        )
     {
         if reference.is_empty()
             || reference.starts_with('-')
@@ -114,9 +119,13 @@ pub fn plan(
     }
     let interaction = requested.unwrap_or(configured);
     let mut args = vec![format!("--{}", interaction.as_str())];
-    if item.exec.yolo {
-        args.push("--yolo".into());
-    }
+    // Always explicit: the daemon profile defaults an absent flag to on, so
+    // `exec.yolo: false` must be stated to be honoured.
+    args.push(if item.exec.yolo {
+        "--yolo".into()
+    } else {
+        "--yolo=false".into()
+    });
     if let Some(agent) = &item.exec.agent {
         args.extend(["--agent".into(), agent.clone()]);
     }
@@ -234,5 +243,30 @@ mod tests {
             values: vec!["another".into()],
         });
         assert!(check(&item).unwrap_err().contains("affinity"));
+    }
+    #[test]
+    fn exec_yolo_is_always_stated_so_false_survives_the_daemon_default() {
+        let settings = settings();
+        let server = crate::data::config::work_servers::WorkServerConfig::default().resolved();
+        let runtime = crate::engine::container::ContainerRuntime::docker();
+        let support = LeaseRuntimeSupport::from_capabilities(runtime.capabilities());
+        let mut item = awman_wsp::conformance::work_item("yolo");
+        item.kind = WorkKind::Prompt;
+        item.exec.dynamic = false;
+        item.exec.leader = None;
+        item.exec.workflow_toml = None;
+        for (yolo, flag) in [(true, "--yolo"), (false, "--yolo=false")] {
+            item.exec.yolo = yolo;
+            let plan = plan(
+                &item,
+                &BTreeMap::new(),
+                &server,
+                &settings,
+                &support,
+                "docker",
+            )
+            .unwrap();
+            assert!(plan.args.iter().any(|arg| arg == flag), "{:?}", plan.args);
+        }
     }
 }

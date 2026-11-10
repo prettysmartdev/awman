@@ -78,6 +78,7 @@ impl PullHandle for FakePull {
         match item_id {
             "taken" => return Err(WorkerError::Taken),
             "stale" => return Err(WorkerError::Ineligible("labels changed".into())),
+            "busy" => return Err(WorkerError::Busy("no free slot".into())),
             "gone" => return Err(WorkerError::ItemNotFound("gone".into())),
             _ => {}
         }
@@ -334,6 +335,7 @@ async fn claim_returns_a_lease_resource_with_lease_ids_and_server_lease_id() {
     for (item, want, code) in [
         ("taken", 409, "taken"),
         ("stale", 409, "ineligible"),
+        ("busy", 409, "worker_busy"),
         ("gone", 404, "item_not_found"),
     ] {
         let (status, body) = call(

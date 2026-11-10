@@ -78,7 +78,10 @@ pub enum WorkerError {
     Taken,
     #[error("the item is not eligible for this worker: {0}")]
     Ineligible(String),
-    #[error("the link to work server {0:?} was revoked; run `awman worker link` again")]
+    /// The item may still be eligible; this worker has no room for it now.
+    #[error("the worker is busy: {0}")]
+    Busy(String),
+    #[error("the link to work server {0:?} was revoked; run `awman config unset workServers.{0}` and then `awman worker link` again")]
     LinkRevoked(String),
     #[error("work server unavailable: {0}")]
     Upstream(String),
@@ -98,6 +101,7 @@ impl WorkerError {
             Self::LeaseEnded(_) => "lease_ended",
             Self::Taken => "taken",
             Self::Ineligible(_) => "ineligible",
+            Self::Busy(_) => "worker_busy",
             Self::LinkRevoked(_) => "link_revoked",
             Self::Upstream(_) => "upstream_unavailable",
             Self::Invalid(_) => "invalid_request",
@@ -108,7 +112,11 @@ impl WorkerError {
         match self {
             Self::PullDisabled(_) | Self::ServerNotRegistered(_) => 503,
             Self::UnknownServer(_) | Self::ItemNotFound(_) | Self::LeaseNotFound => 404,
-            Self::LeaseEnded(_) | Self::Taken | Self::Ineligible(_) | Self::LinkRevoked(_) => 409,
+            Self::LeaseEnded(_)
+            | Self::Taken
+            | Self::Ineligible(_)
+            | Self::Busy(_)
+            | Self::LinkRevoked(_) => 409,
             Self::Upstream(_) => 502,
             Self::Invalid(_) => 400,
             Self::Store(_) => 500,

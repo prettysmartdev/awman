@@ -115,8 +115,11 @@ pub enum WorkKind {
     Prompt,
 }
 
+/// Work items are generic: servers fill what they need and may add fields of
+/// their own, which a worker ignores. Only what a worker must act on,
+/// `exec`, repository `credentials`, `outputs` and `affinity`, is decoded
+/// strictly, so a requirement it does not know is refused rather than skipped.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct WorkItem {
     #[serde(default)]
     pub summary: Option<String>,
@@ -145,8 +148,20 @@ pub struct Source {
     pub url: String,
 }
 
+impl WorkItem {
+    /// The branch to publish to, when the item asks for a push. `push.branch`
+    /// defaults to the branch the work is done on.
+    pub fn push_branch(&self) -> Option<&str> {
+        let push = self.push.as_ref().filter(|push| push.enabled)?;
+        Some(if push.branch.is_empty() {
+            &self.repo.branch
+        } else {
+            &push.branch
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Repo {
     pub url: String,
     pub base_ref: String,
@@ -237,20 +252,28 @@ pub enum Interaction {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Push {
     pub enabled: bool,
+    /// Empty means `repo.branch`; see [`WorkItem::push_branch`].
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub branch: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Outputs {
+    #[serde(default = "Outputs::default_max_bytes")]
     pub max_bytes: u64,
 }
 
+impl Outputs {
+    /// What `"outputs": {}` allows: 1 MiB.
+    pub const fn default_max_bytes() -> u64 {
+        1024 * 1024
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Lease {
     pub id: String,
     pub epoch: u64,
@@ -417,6 +440,64 @@ pub mod features {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn lease_json(item_extra: serde_json::Value) -> serde_json::Value {
+        let mut item = serde_json::json!({
+            "id": "i1", "title": "t", "kind": "prompt", "body": "do it",
+            "repo": { "url": "https://git.example/r.git", "base_ref": "main", "branch": "wsp/i1" },
+            "exec": {}
+        });
+        item.as_object_mut()
+            .unwrap()
+            .extend(item_extra.as_object().unwrap().clone());
+        serde_json::json!({
+            "id": "l1", "epoch": 1, "expires_at": "2026-01-01T00:00:00Z", "item": item
+        })
+    }
+
+    #[test]
+    fn servers_may_add_fields_and_leave_unused_ones_out() {
+        let mut json = lease_json(serde_json::json!({
+            "created_at": "2026-01-01T00:00:00Z",
+            "push": { "enabled": false },
+            "outputs": {}
+        }));
+        json["server_note"] = "extension".into();
+        json["item"]["repo"]["provider"] = "forge".into();
+        json["item"]["push"]["note"] = "extension".into();
+        let lease: Lease = serde_json::from_value(json).unwrap();
+        assert_eq!(lease.item.push_branch(), None);
+        assert_eq!(lease.item.outputs.unwrap().max_bytes, 1024 * 1024);
+
+        // An enabled push without a branch publishes the working branch.
+        let lease: Lease = serde_json::from_value(lease_json(
+            serde_json::json!({ "push": { "enabled": true } }),
+        ))
+        .unwrap();
+        assert_eq!(lease.item.push_branch(), Some("wsp/i1"));
+        let lease: Lease = serde_json::from_value(lease_json(
+            serde_json::json!({ "push": { "enabled": true, "branch": "out" } }),
+        ))
+        .unwrap();
+        assert_eq!(lease.item.push_branch(), Some("out"));
+    }
+
+    #[test]
+    fn unknown_execution_credential_and_affinity_fields_are_refused() {
+        for (path, field) in [
+            ("exec", "sandbox"),
+            ("affinity", "anti"),
+            ("outputs", "mode"),
+        ] {
+            let mut json = lease_json(serde_json::json!({ "affinity": {}, "outputs": {} }));
+            json["item"][path][field] = true.into();
+            assert!(serde_json::from_value::<Lease>(json).is_err(), "{path}");
+        }
+        let mut json = lease_json(serde_json::json!({}));
+        json["item"]["repo"]["credentials"] =
+            serde_json::json!({ "kind": "bearer", "token": "t", "scheme": "x" });
+        assert!(serde_json::from_value::<Lease>(json).is_err());
+    }
 
     #[test]
     fn wire_shapes_use_wsp_conventions() {

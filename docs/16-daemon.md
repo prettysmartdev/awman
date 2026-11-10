@@ -113,7 +113,10 @@ awman daemon api leases.release id=lease_0123456789abcdef0123456789abcdef reason
 `leases.list` accepts `server`, `state`, `limit`, and `cursor`; use
 `state=active` for held leases. `leases.release` takes a `lease_…` ID and
 optional `reason` (`user_declined`, `ineligible`, `shutdown`, or `error`) and
-`message`. The default reason is `user_declined`. The actions map to
+`message`. The default reason is `user_declined`. A release with reason
+`shutdown` also pauses claiming for a minute, which is what
+`awman daemon stop --now` relies on; a daemon that keeps running resumes
+pulling afterwards. The actions map to
 `GET /v1/worker/leases` and `POST /v1/worker/leases/{id}/release`.
 
 ## Start, stop, status, and logs

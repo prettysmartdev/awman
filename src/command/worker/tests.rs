@@ -350,8 +350,9 @@ async fn a_server_returning_ineligible_labels_is_released_before_any_execution()
     };
     let server = protocol_mock().await;
     let mut item = awman_wsp::conformance::work_item("changed-labels");
+    // Built-in agents are always reported; only another agent can be missing.
     item.affinity.required.push(awman_wsp::Match {
-        key: "awman/agent.codex".into(),
+        key: "awman/agent.not-installed".into(),
         op: awman_wsp::MatchOp::In,
         values: vec!["true".into()],
     });
@@ -663,7 +664,7 @@ async fn feature_cancel_releases_background_and_foreground_clones_before_job_cre
 }
 
 #[tokio::test]
-async fn idle_long_poll_does_not_occupy_worker_or_host_execution_capacity() {
+async fn idle_long_poll_holds_its_slot_and_yields_it_to_waiting_pushed_work() {
     use wiremock::{
         matchers::{method, path},
         Mock, ResponseTemplate,
@@ -698,16 +699,110 @@ async fn idle_long_poll_does_not_occupy_worker_or_host_execution_capacity() {
     })
     .await
     .unwrap();
-    assert_eq!(controller.share.snapshot().running_pull, 0);
+    // The claim holds the only slot, so a claimed item would start at once.
+    assert_eq!(controller.share.snapshot().running_pull, 1);
+    // Pushed work asking for the slot gets it: the idle poll steps aside.
     let push = tokio::time::timeout(
-        Duration::from_millis(500),
+        Duration::from_secs(2),
         controller.share.acquire(JobClass::Push),
     )
     .await
-    .expect("idle pull must not reserve the only worker slot");
+    .expect("an idle pull must give the only worker slot to waiting pushed work");
     assert_eq!(push.class(), JobClass::Push);
-    controller.claim_stop.lock().unwrap().cancel();
-    assert!(claim.await.unwrap().is_err());
+    assert!(matches!(claim.await.unwrap(), Ok(None)));
+    assert_eq!(controller.share.snapshot().running_pull, 0);
+}
+
+#[tokio::test]
+async fn merged_queue_lists_reachable_servers_and_fails_only_for_a_named_one() {
+    let server = protocol_mock().await;
+    let (_home, controller) = controller(&server.uri()).await;
+    controller.refresh_servers().await.unwrap();
+    controller
+        .servers
+        .write()
+        .unwrap()
+        .get_mut("other")
+        .unwrap()
+        .status
+        .state = "error".into();
+    let handle = PullHandleAdapter(controller.clone());
+    assert!(handle.queue(None, 50, None).await.is_ok());
+    assert!(handle.queue(Some("team"), 50, None).await.is_ok());
+    assert!(matches!(
+        handle.queue(Some("other"), 50, None).await,
+        Err(WorkerError::ServerNotRegistered(_))
+    ));
+    // With no server left the listing fails.
+    controller
+        .servers
+        .write()
+        .unwrap()
+        .get_mut("team")
+        .unwrap()
+        .status
+        .state = "error".into();
+    assert!(matches!(
+        handle.queue(None, 50, None).await,
+        Err(WorkerError::ServerNotRegistered(_))
+    ));
+}
+
+#[tokio::test]
+async fn a_shutdown_release_pauses_claiming_and_a_running_daemon_resumes() {
+    let server = protocol_mock().await;
+    let (_home, controller) = controller(&server.uri()).await;
+    controller.refresh_servers().await.unwrap();
+    let stop = CancellationToken::new();
+    *controller.claim_stop.lock().unwrap() = stop.child_token();
+    controller.accepting.store(true, Ordering::SeqCst);
+    controller.pause_claims();
+    assert!(matches!(
+        controller.claim_next(Some("item"), "team").await,
+        Err(WorkerError::PullDisabled(_))
+    ));
+    // Still inside the pause: nothing resumes.
+    controller.resume_after_drain(&stop);
+    assert!(controller.claim_stop.lock().unwrap().is_cancelled());
+    // The pause ran out and the daemon is still up.
+    *controller.drain_until.lock().unwrap() = Some(std::time::Instant::now());
+    controller.resume_after_drain(&stop);
+    assert!(!controller.claim_stop.lock().unwrap().is_cancelled());
+    assert!(!controller.shutting_down.load(Ordering::SeqCst));
+    // A daemon that is stopping never resumes.
+    controller.pause_claims();
+    *controller.drain_until.lock().unwrap() = Some(std::time::Instant::now());
+    stop.cancel();
+    controller.resume_after_drain(&stop);
+    assert!(controller.claim_stop.lock().unwrap().is_cancelled());
+}
+
+#[tokio::test]
+async fn a_manual_pick_without_a_free_slot_is_busy_not_ineligible() {
+    let server = protocol_mock().await;
+    let (_home, controller) = controller(&server.uri()).await;
+    controller.refresh_servers().await.unwrap();
+    controller.accepting.store(true, Ordering::SeqCst);
+    // Pushed work holds every slot of the worker share.
+    controller
+        .share
+        .executor()
+        .set_share(crate::data::daemon_state::FeatureName::Worker, 1);
+    let _held = controller.share.acquire(JobClass::Push).await;
+    let picked = tokio::time::timeout(
+        Duration::from_secs(10),
+        controller.claim_next(Some("item"), "team"),
+    )
+    .await
+    .expect("a manual pick answers promptly");
+    assert!(matches!(picked, Err(WorkerError::Busy(_))), "{picked:?}");
+    // Nothing was claimed from the server.
+    assert!(!server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .any(|r| r.url.path() == "/v1/claims"));
 }
 
 #[tokio::test]

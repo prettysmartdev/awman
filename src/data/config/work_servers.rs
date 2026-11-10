@@ -78,7 +78,8 @@ pub fn normalize_work_server_name(url: &str) -> Result<String, String> {
             }
             name.push(byte.to_ascii_lowercase() as char);
             separator = false;
-        } else if byte == b'_' || byte == b'-' {
+        } else if (byte == b'_' || byte == b'-') && !name.is_empty() {
+            // A name starts with a letter or digit; leading ones are dropped.
             name.push(byte as char);
             separator = false;
         } else {
@@ -88,6 +89,8 @@ pub fn normalize_work_server_name(url: &str) -> Result<String, String> {
             break;
         }
     }
+    // A separator plus a character can step one past the cap.
+    name.truncate(63);
     while name.ends_with('-') || name.ends_with('_') {
         name.pop();
     }
@@ -155,5 +158,32 @@ mod tests {
         assert!(crate::data::config::fields::is_valid_map_name(
             &normalize_work_server_name("https://a-very-long-hostname.example.org").unwrap()
         ));
+    }
+
+    #[test]
+    fn long_and_underscore_led_hosts_still_normalize_to_valid_names() {
+        // 62 characters, then a separator: the name must stop at the cap.
+        let long = format!("https://{}.example.com", "a".repeat(62));
+        let name = normalize_work_server_name(&long).unwrap();
+        assert!(name.len() <= 63, "{name}");
+        assert!(crate::data::config::fields::is_valid_map_name(&name));
+        assert_eq!(
+            normalize_work_server_name("https://_work.example").unwrap(),
+            "work-example"
+        );
+    }
+
+    #[test]
+    fn an_all_digit_server_name_is_removed_as_a_key_not_an_array_index() {
+        let mut json = serde_json::json!({
+            "workServers": { "42": { "url": "https://x.example" }, "other": {} },
+            "list": ["a", "b"]
+        });
+        crate::data::config::config_json::remove_config_field(&mut json, "workServers.42");
+        assert!(json["workServers"].get("42").is_none());
+        assert!(json["workServers"].get("other").is_some());
+        // Array elements are still removed by index.
+        crate::data::config::config_json::remove_config_field(&mut json, "list.0");
+        assert_eq!(json["list"], serde_json::json!(["b"]));
     }
 }
