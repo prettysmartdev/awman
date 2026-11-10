@@ -117,6 +117,10 @@ fn unavailable(prompt: &str) -> CommandError {
 /// choices are, or what runs: the command layer builds the prompts and hands
 /// [`with_terminal_released`](Self::with_terminal_released) the closure to run.
 pub trait WorkflowPrerequisiteFrontend: UserMessageSink {
+    /// Start collecting the initial report. Event frontends may defer progress
+    /// until the structured report is published; native presenters stay live.
+    fn begin_workflow_prerequisites(&mut self) {}
+
     /// Show the prerequisite report (CLI table, TUI modal, API event, squad
     /// log). Called once: before any question when a person is there,
     /// otherwise after the headless answers were applied. A dismissal that

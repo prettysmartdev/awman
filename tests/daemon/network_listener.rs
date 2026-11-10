@@ -17,25 +17,25 @@ fn taken_port() -> (std::net::TcpListener, u16) {
 async fn a_network_listener_that_cannot_bind_leaves_the_local_listener_and_features_up() {
     let (_taken, port) = taken_port();
     let home = ApiHome::new();
-    home.write_config(json!({"daemon":{"network":{
+    home.write_config(json!({"daemon":{"network":{"listeners":{"default":{
         "enabled": true,
         "listen": format!("127.0.0.1:{port}"),
-    }}}));
+    }}}}}));
     let server = home.start().await;
 
     let status = wait_for_status(&server, "network bind failure", |s| {
-        s["listeners"]["network"]["error"].is_string()
+        s["listeners"]["network"]["default"]["error"].is_string()
     })
     .await;
     assert_eq!(status["status"], "ok", "{status}");
     assert_eq!(status["features"]["worker"]["state"], "on", "{status}");
     assert_eq!(status["listeners"]["local"]["transport"], "unix_socket");
-    let network = &status["listeners"]["network"];
+    let network = &status["listeners"]["network"]["default"];
     assert!(network["error"].is_string(), "{status}");
     assert_eq!(network["listen"], format!("127.0.0.1:{port}"), "{status}");
     // The persisted value is untouched and the CLI still reaches the daemon.
     let text = home.cli_ok(&["daemon", "status"]);
-    assert!(text.contains("network"), "{text}");
+    assert!(text.contains("default"), "{text}");
     home.cli_ok(&["daemon", "api", "features.list"]);
 }
 
@@ -46,14 +46,14 @@ async fn network_listener_serves_health_openly_and_the_rest_only_with_a_key() {
     let (taken, port) = taken_port();
     drop(taken);
     let home = ApiHome::new();
-    home.write_config(json!({"daemon":{"network":{
+    home.write_config(json!({"daemon":{"network":{"listeners":{"default":{
         "enabled": true,
         "listen": format!("127.0.0.1:{port}"),
         "features": ["worker"],
-    }}}));
+    }}}}}));
     let server = home.start().await;
     wait_for_status(&server, "network bound", |s| {
-        s["listeners"]["network"]["bound"].is_string()
+        s["listeners"]["network"]["default"]["bound"].is_string()
     })
     .await;
     let created: serde_json::Value = serde_json::from_str(&home.cli_ok(&[
@@ -122,41 +122,41 @@ async fn network_listener_serves_health_openly_and_the_rest_only_with_a_key() {
     let _ = server;
 }
 
-/// `daemon.network.enabled` toggles live; the local listener stays up. A new
+/// `daemon.network.listeners.default.enabled` toggles live; the local listener stays up. A new
 /// `listen` value applies on restart only.
 #[tokio::test(flavor = "multi_thread")]
 async fn network_enabled_toggles_live_and_listen_applies_on_restart() {
     let (taken, port) = taken_port();
     drop(taken);
     let home = ApiHome::new();
-    home.write_config(json!({"daemon":{"network":{"listen": format!("127.0.0.1:{port}")}}}));
+    home.write_config(json!({"daemon":{"network":{"listeners":{"default":{"listen": format!("127.0.0.1:{port}")}}}}}));
     let server = home.start().await;
-    assert!(server.get("/v1/status").await["listeners"]["network"].is_null());
+    assert!(server.get("/v1/status").await["listeners"]["network"]["default"].is_null());
 
     let out = home.cli_ok(&[
         "config",
         "set",
-        "daemon.network.enabled",
+        "daemon.network.listeners.default.enabled",
         "true",
         "--global",
     ]);
     assert!(out.contains("applied to the running daemon"), "{out}");
     let status = wait_for_status(&server, "network bound", |s| {
-        s["listeners"]["network"]["bound"].is_string()
+        s["listeners"]["network"]["default"]["bound"].is_string()
     })
     .await;
-    assert!(status["listeners"]["network"]["tls"]["fingerprint_sha256"].is_string());
+    assert!(status["listeners"]["network"]["default"]["tls"]["fingerprint_sha256"].is_string());
     assert_eq!(status["listeners"]["local"]["transport"], "unix_socket");
 
     home.cli_ok(&[
         "config",
         "set",
-        "daemon.network.enabled",
+        "daemon.network.listeners.default.enabled",
         "false",
         "--global",
     ]);
     wait_for_status(&server, "network closed", |s| {
-        s["listeners"]["network"].is_null()
+        s["listeners"]["network"]["default"].is_null()
     })
     .await;
     assert_eq!(server.get("/v1/status").await["status"], "ok");
@@ -165,28 +165,34 @@ async fn network_enabled_toggles_live_and_listen_applies_on_restart() {
     home.cli_ok(&[
         "config",
         "set",
-        "daemon.network.enabled",
+        "daemon.network.listeners.default.enabled",
         "true",
         "--global",
     ]);
     wait_for_status(&server, "original address rebound", |s| {
-        s["listeners"]["network"]["bound"].is_string()
+        s["listeners"]["network"]["default"]["bound"].is_string()
     })
     .await;
     let next = format!("127.0.0.1:{next_port}");
-    let output = home.cli_ok(&["config", "set", "daemon.network.listen", &next, "--global"]);
+    let output = home.cli_ok(&[
+        "config",
+        "set",
+        "daemon.network.listeners.default.listen",
+        &next,
+        "--global",
+    ]);
     assert!(output.contains("restart"), "{output}");
     assert_eq!(
-        server.get("/v1/status").await["listeners"]["network"]["listen"],
+        server.get("/v1/status").await["listeners"]["network"]["default"]["listen"],
         format!("127.0.0.1:{port}")
     );
     drop(server);
     let restarted = home.start().await;
     let status = wait_for_status(&restarted, "new address bound", |s| {
-        s["listeners"]["network"]["bound"] == next
+        s["listeners"]["network"]["default"]["bound"] == next
     })
     .await;
-    assert_eq!(status["listeners"]["network"]["listen"], next);
+    assert_eq!(status["listeners"]["network"]["default"]["listen"], next);
     assert_eq!(
         tls_client(&home)
             .get(format!("https://localhost:{next_port}/v1/health"))
@@ -222,11 +228,11 @@ async fn live_exposure_excludes_ephemeral_features_and_revocation_affects_the_ne
     let home = ApiHome::new();
     home.write_config(json!({"daemon":{
         "features":{"squad":{"envPersistence":"none"}},
-        "network":{"enabled":true,"listen":format!("127.0.0.1:{port}"),"features":["worker","squad"]}
+        "network":{"listeners":{"default":{"enabled":true,"listen":format!("127.0.0.1:{port}"),"features":["worker","squad"]}}}
     }}));
     let server = home.start().await;
     wait_for_status(&server, "network bound", |s| {
-        s["listeners"]["network"]["bound"].is_string()
+        s["listeners"]["network"]["default"]["bound"].is_string()
     })
     .await;
     let (status, created) = http(
@@ -261,14 +267,14 @@ async fn live_exposure_excludes_ephemeral_features_and_revocation_affects_the_ne
     .await;
     assert_eq!(status, 200, "{ephemeral}");
     assert_eq!(
-        server.get("/v1/status").await["listeners"]["network"]["features"],
+        server.get("/v1/status").await["listeners"]["network"]["default"]["features"],
         json!(["worker"])
     );
     for features in ["", "squad"] {
         home.cli_ok(&[
             "config",
             "set",
-            "daemon.network.features",
+            "daemon.network.listeners.default.features",
             features,
             "--global",
         ]);
@@ -340,7 +346,7 @@ async fn live_exposure_excludes_ephemeral_features_and_revocation_affects_the_ne
         401
     );
     assert_eq!(
-        server.get("/v1/status").await["listeners"]["network"]["api_keys"],
+        server.get("/v1/status").await["listeners"]["network"]["default"]["api_keys"],
         0
     );
     assert!(home.cli_ok(&["daemon", "status"]).contains("no API keys"));
@@ -361,24 +367,24 @@ async fn changing_sans_reloads_the_running_tls_listener_with_verified_names() {
     drop(taken);
     let home = ApiHome::new();
     home.write_config(
-        json!({"daemon":{"network":{"enabled":true,"listen":format!("127.0.0.1:{port}")}}}),
+        json!({"daemon":{"network":{"listeners":{"default":{"enabled":true,"listen":format!("127.0.0.1:{port}")}}}}}),
     );
     let server = home.start().await;
     let before = wait_for_status(&server, "network bound", |s| {
-        s["listeners"]["network"]["bound"].is_string()
+        s["listeners"]["network"]["default"]["bound"].is_string()
     })
     .await;
     home.cli_ok(&[
         "config",
         "set",
-        "daemon.network.tlsSans",
+        "daemon.network.listeners.default.tlsSans",
         "new.example.test",
         "--global",
     ]);
     let after = server.get("/v1/status").await;
     assert_ne!(
-        before["listeners"]["network"]["tls"]["fingerprint_sha256"],
-        after["listeners"]["network"]["tls"]["fingerprint_sha256"]
+        before["listeners"]["network"]["default"]["tls"]["fingerprint_sha256"],
+        after["listeners"]["network"]["default"]["tls"]["fingerprint_sha256"]
     );
     let cert = std::fs::read(
         home.home()

@@ -321,6 +321,7 @@ async fn local_and_daemon_instances_execute_their_picked_lease_and_publish_real_
                 stdout_is_tty: true,
                 view: None,
                 resume: None,
+                launch_context: None,
             };
             RemoteInstanceBackend::connect(RemoteOpen::primary(
                 &endpoint,

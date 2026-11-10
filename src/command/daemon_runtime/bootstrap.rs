@@ -5,7 +5,7 @@ use super::{
         squad::SquadFeature,
         worker::{WorkerFeature, WorkerShared},
     },
-    network::{ListenerStatus, NetworkControl, NetworkDesired},
+    network::{self, ListenerStatus, ListenersDesired, NetworkControl},
     DaemonRuntime,
 };
 use crate::command::{
@@ -116,32 +116,19 @@ impl DaemonRuntime {
         })?;
         let engines = Engines::from_core(&core, Arc::new(config.config().clone()));
         let keys = ApiKeyStore::open(core.daemon_paths().api_keys_file())?;
-        let tls = if settings.network.enabled {
-            Some(
-                engines
-                    .auth_engine
-                    .ensure_network_tls(
-                        core.daemon_paths(),
-                        settings
-                            .network
-                            .listen
-                            .ip()
-                            .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED.into()),
-                        &settings.network.tls_sans,
-                    )?
-                    .0,
-            )
-        } else {
-            None
-        };
-        if settings.network.features.contains(&FeatureName::Engine)
-            && !settings.network.listen.is_loopback()
-        {
-            tracing::warn!("engine is listed on a non-loopback daemon network listener");
-        }
+        let browser = crate::command::daemon_api::browser::BrowserAuth::open(
+            core.daemon_paths().browser_grants_file(),
+        )?;
+        let tls =
+            network::prepare_tls(&engines.auth_engine, core.daemon_paths(), &settings.network)?;
         let recovered = WorkerServices::from_core(
             WorkerConfig {
-                port: settings.network.listen.port(),
+                port: settings
+                    .network
+                    .listeners
+                    .get("default")
+                    .filter(|l| l.enabled)
+                    .map_or(9876, |l| l.listen.port()),
                 bind_ip: std::net::Ipv4Addr::LOCALHOST.into(),
                 workdirs: config
                     .worker_push_work_dirs()
@@ -229,11 +216,8 @@ impl DaemonRuntime {
             worker,
             event_buses,
             keys,
-            network: NetworkControl::new(NetworkDesired {
-                enabled: settings.network.enabled,
-                listen: settings.network.listen.clone(),
-                tls,
-            }),
+            browser,
+            network: NetworkControl::new(ListenersDesired::new(&settings.network, tls, None)),
             listeners: RwLock::new(ListenerStatus::default()),
             guard,
             exit: tokio_util::sync::CancellationToken::new(),
@@ -246,6 +230,7 @@ impl DaemonRuntime {
             shutdown_done: std::sync::atomic::AtomicBool::new(false),
             terminals: Default::default(),
         });
+        runtime.install_browser_revocations();
         // Before any feature starts a PTY: the lifecycle publisher subscribes here.
         runtime.terminals();
         for (f, enabled) in [

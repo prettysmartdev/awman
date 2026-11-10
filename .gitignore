@@ -28,3 +28,6 @@ target
 !.cargo/config.toml
 .antigravitycli
 .crush
+
+# cargo target directory used by the test harness
+target-tests-results/

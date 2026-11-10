@@ -204,6 +204,8 @@ pub struct CommandResponse {
     allow_remote_input: bool,
     #[serde(default)]
     listener: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    listener_name: Option<String>,
     #[serde(default)]
     trace_parent: Option<String>,
     id: crate::data::ids::CommandId,
@@ -414,6 +416,7 @@ fn command_response(
         outputs_mounted: job.outputs_mounted,
         allow_remote_input: c.allow_remote_input,
         listener: c.listener.clone(),
+        listener_name: c.listener_name.clone(),
         trace_parent: c.trace_parent.clone(),
         args: crate::command::commands::api_server::runtime::stored_args_view(&c),
         result: c
@@ -712,86 +715,128 @@ pub struct RouteSpec {
 pub const ROUTES: &[RouteSpec] = &[
     RouteSpec {
         method: "GET",
+        path: "/v1/engine/catalogue",
+        op: Operation::EngineCatalogue,
+        local_only: false,
+        capability: Some("engine_catalogue"),
+    },
+    RouteSpec {
+        method: "GET",
+        path: "/v1/engine/prompts",
+        op: Operation::EnginePrompts,
+        local_only: false,
+        capability: Some("engine_catalogue"),
+    },
+    RouteSpec {
+        method: "GET",
+        path: "/v1/engine/launch_contexts",
+        op: Operation::EngineLaunchContextsList,
+        local_only: false,
+        capability: Some("launch_contexts"),
+    },
+    RouteSpec {
+        method: "POST",
+        path: "/v1/engine/launch_contexts",
+        op: Operation::EngineLaunchContextsCreate,
+        local_only: true,
+        capability: Some("launch_contexts"),
+    },
+    RouteSpec {
+        method: "POST",
+        path: "/v1/engine/launch_contexts/{id}/refresh",
+        op: Operation::EngineLaunchContextsRefresh,
+        local_only: true,
+        capability: Some("launch_contexts"),
+    },
+    RouteSpec {
+        method: "DELETE",
+        path: "/v1/engine/launch_contexts/{id}",
+        op: Operation::EngineLaunchContextsDelete,
+        local_only: true,
+        capability: Some("launch_contexts"),
+    },
+    RouteSpec {
+        method: "GET",
         path: "/v1/engine/instances",
         op: Operation::EngineInstancesList,
-        local_only: true,
+        local_only: false,
         capability: None,
     },
     RouteSpec {
         method: "POST",
         path: "/v1/engine/instances",
         op: Operation::EngineInstancesCreate,
-        local_only: true,
+        local_only: false,
         capability: None,
     },
     RouteSpec {
         method: "GET",
         path: "/v1/engine/instances/{id}",
         op: Operation::EngineInstancesGet,
-        local_only: true,
+        local_only: false,
         capability: None,
     },
     RouteSpec {
         method: "DELETE",
         path: "/v1/engine/instances/{id}",
         op: Operation::EngineInstancesDelete,
-        local_only: true,
+        local_only: false,
         capability: None,
     },
     RouteSpec {
         method: "PATCH",
         path: "/v1/engine/instances/{id}",
         op: Operation::EngineInstancesPatch,
-        local_only: true,
+        local_only: false,
         capability: None,
     },
     RouteSpec {
         method: "GET",
         path: "/v1/engine/instances/{id}/frontend",
         op: Operation::EngineInstancesFrontend,
-        local_only: true,
+        local_only: false,
         capability: None,
     },
     RouteSpec {
         method: "GET",
         path: "/v1/engine/instances/{id}/tabs",
         op: Operation::EngineTabsList,
-        local_only: true,
+        local_only: false,
         capability: None,
     },
     RouteSpec {
         method: "GET",
         path: "/v1/engine/instances/{id}/tabs/{tab}",
         op: Operation::EngineTabsGet,
-        local_only: true,
+        local_only: false,
         capability: None,
     },
     RouteSpec {
         method: "PATCH",
         path: "/v1/engine/instances/{id}/tabs/{tab}",
         op: Operation::EngineTabsPatch,
-        local_only: true,
+        local_only: false,
         capability: None,
     },
     RouteSpec {
         method: "GET",
         path: "/v1/engine/instances/{id}/dialogs",
         op: Operation::EngineDialogsList,
-        local_only: true,
+        local_only: false,
         capability: None,
     },
     RouteSpec {
         method: "POST",
         path: "/v1/engine/instances/{id}/dialogs/{dialog_id}/answer",
         op: Operation::EngineDialogsAnswer,
-        local_only: true,
+        local_only: false,
         capability: None,
     },
     RouteSpec {
         method: "POST",
         path: "/v1/engine/instances/{id}/ui_requests",
         op: Operation::EngineUiRequests,
-        local_only: true,
+        local_only: false,
         capability: None,
     },
     RouteSpec {
@@ -1160,6 +1205,57 @@ pub const ROUTES: &[RouteSpec] = &[
         local_only: false,
         capability: None,
     },
+    // WI 0159: browser pairing (browser listeners) and grant management
+    // (owner socket).
+    RouteSpec {
+        method: "POST",
+        path: "/v1/browser-links",
+        op: Operation::BrowserLinksCreate,
+        local_only: false,
+        capability: Some("browser_links"),
+    },
+    RouteSpec {
+        method: "GET",
+        path: "/v1/browser-links",
+        op: Operation::BrowserLinksLookup,
+        local_only: true,
+        capability: Some("browser_links"),
+    },
+    RouteSpec {
+        method: "POST",
+        path: "/v1/browser-links/{id}/poll",
+        op: Operation::BrowserLinksPoll,
+        local_only: false,
+        capability: Some("browser_links"),
+    },
+    RouteSpec {
+        method: "POST",
+        path: "/v1/browser-links/{id}/decision",
+        op: Operation::BrowserLinksDecide,
+        local_only: true,
+        capability: Some("browser_links"),
+    },
+    RouteSpec {
+        method: "GET",
+        path: "/v1/browsers",
+        op: Operation::BrowsersList,
+        local_only: true,
+        capability: Some("browser_links"),
+    },
+    RouteSpec {
+        method: "DELETE",
+        path: "/v1/browsers/{id}",
+        op: Operation::BrowsersDelete,
+        local_only: true,
+        capability: Some("browser_links"),
+    },
+    RouteSpec {
+        method: "POST",
+        path: "/v1/browser-tickets",
+        op: Operation::BrowserTicketsCreate,
+        local_only: false,
+        capability: Some("browser_tickets"),
+    },
 ];
 /// Listener exposure controls owner-only paths; feature state controls whether
 /// a feature route is available and reports disabled features as 503. Network
@@ -1167,7 +1263,7 @@ pub const ROUTES: &[RouteSpec] = &[
 #[derive(Debug, Clone)]
 pub enum ListenerPolicy {
     Local,
-    Network,
+    Network { name: String },
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -1187,6 +1283,11 @@ pub fn build_router_for_listener(api: Arc<DaemonApi>, policy: ListenerPolicy) ->
             _ => unreachable!(),
         };
         let route: MethodRouter = match spec.op.owner() {
+            _ if super::browser::route(spec.op, filter).is_some() => {
+                super::browser::route(spec.op, filter)
+                    .expect("browser route")
+                    .with_state(api.clone())
+            }
             _ if super::terminals::route(spec.op, filter).is_some() => {
                 super::terminals::route(spec.op, filter)
                     .expect("terminal route")
@@ -1213,7 +1314,7 @@ pub fn build_router_for_listener(api: Arc<DaemonApi>, policy: ListenerPolicy) ->
                 let api = gate_api.clone();
                 let policy = gate_policy.clone();
                 async move {
-                    if matches!(&policy, ListenerPolicy::Network) && spec.local_only {
+                    if matches!(&policy, ListenerPolicy::Network { .. }) && spec.local_only {
                         return ApiError::not_found("resource not found").into_response();
                     }
                     let state = spec
@@ -1275,13 +1376,42 @@ pub fn build_router_for_listener(api: Arc<DaemonApi>, policy: ListenerPolicy) ->
             ApiError::method_not_allowed("method not allowed")
         })
         .layer(axum::middleware::from_fn_with_state(
-            (api, policy),
+            (api.clone(), policy.clone()),
             daemon_auth,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            (api, policy),
+            listener_gate,
         ))
         .layer(axum::middleware::from_fn(
             super::error::normalize_rejections,
         ))
-        .layer(TraceLayer::new_for_http())
+        .layer(axum::middleware::from_fn(no_store))
+        .layer(TraceLayer::new_for_http().make_span_with(
+            |request: &axum::http::Request<axum::body::Body>| {
+                // Never record the URI, headers, or raw path: rejected URL
+                // credentials must stay out of even DEBUG/TRACE diagnostics.
+                let route = request
+                    .extensions()
+                    .get::<axum::extract::MatchedPath>()
+                    .map_or("<unmatched>", |path| path.as_str());
+                tracing::debug_span!("request", method = %request.method(), route)
+            },
+        ))
+}
+
+/// Daemon HTTP data is never cacheable: every response carries
+/// `Cache-Control: no-store` unless a handler chose a policy itself.
+async fn no_store(
+    request: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> Response {
+    let mut response = next.run(request).await;
+    response
+        .headers_mut()
+        .entry(axum::http::header::CACHE_CONTROL)
+        .or_insert(axum::http::HeaderValue::from_static("no-store"));
+    response
 }
 fn worker_route(op: Operation, filter: MethodFilter) -> MethodRouter<Arc<AppState>> {
     match op {
@@ -1307,8 +1437,7 @@ fn worker_route(op: Operation, filter: MethodFilter) -> MethodRouter<Arc<AppStat
         _ => unreachable!("non-worker operation"),
     }
 }
-#[derive(Clone)]
-struct RequestPrincipal(String);
+use crate::data::daemon_state::Principal;
 async fn daemon_auth(
     State((api, policy)): State<(Arc<DaemonApi>, ListenerPolicy)>,
     mut request: axum::http::Request<axum::body::Body>,
@@ -1318,17 +1447,31 @@ async fn daemon_auth(
         .extensions()
         .get::<axum::extract::MatchedPath>()
         .map(|p| p.as_str());
+    // Axum executes GET handlers for HEAD. Classify their effective operation
+    // before every authority/authentication/visibility check as well.
+    let method = if request.method() == axum::http::Method::HEAD {
+        "GET"
+    } else {
+        request.method().as_str()
+    };
     let selected = ROUTES
         .iter()
-        .find(|s| Some(s.path) == path && s.method == request.method().as_str());
-    if matches!(policy, ListenerPolicy::Network) {
+        .find(|s| Some(s.path) == path && s.method == method);
+    if let ListenerPolicy::Network { name } = &policy {
+        if !api
+            .runtime
+            .listener_settings(name)
+            .is_some_and(|l| l.enabled)
+        {
+            return ApiError::not_found("resource not found").into_response();
+        }
         let hidden = |spec: &RouteSpec| {
             spec.op.local_only()
                 || spec
                     .op
                     .owner()
                     .feature_name()
-                    .is_some_and(|f| !api.runtime.network_serves(f))
+                    .is_some_and(|f| !api.runtime.listener_serves(name, f))
         };
         if selected
             .map(&hidden)
@@ -1340,19 +1483,27 @@ async fn daemon_auth(
     if let Some(spec) = selected {
         request.extensions_mut().insert(spec.op);
     }
+    if let ListenerPolicy::Network { name } = &policy {
+        request
+            .extensions_mut()
+            .insert(ReceivingListener(name.clone()));
+    }
     request.extensions_mut().insert(match policy {
         ListenerPolicy::Local => crate::data::daemon_state::CommandListener::Local,
-        ListenerPolicy::Network => crate::data::daemon_state::CommandListener::Network,
+        ListenerPolicy::Network { .. } => crate::data::daemon_state::CommandListener::Network,
     });
     if request
         .extensions()
         .get::<super::local::OwnerAuthenticated>()
         .is_some()
     {
-        request
-            .extensions_mut()
-            .insert(RequestPrincipal("owner".into()));
+        request.extensions_mut().insert(Principal::Owner);
         return next.run(request).await;
+    }
+    if let Some(browser) = request.extensions().get::<BrowserRequest>().cloned() {
+        // Browser requests are authenticated by grants and tickets only; they
+        // never reach API-key verification below (D1).
+        return browser_auth(&api, selected.copied(), browser, request, next).await;
     }
     if request.extensions().get::<Operation>() == Some(&Operation::CoreHealth)
         || request.uri().path() == "/v1/health"
@@ -1367,9 +1518,19 @@ async fn daemon_auth(
             .and_then(|value| value.to_str().ok());
         match runtime.keys().verify(header) {
             crate::engine::auth::api_keys::KeyVerdict::Accepted { id } => {
-                request
-                    .extensions_mut()
-                    .insert(RequestPrincipal(id.to_string()));
+                let principal = Principal::ApiKey { id: id.to_string() };
+                if let ListenerPolicy::Network { name } = &policy {
+                    if let Some(spec) = selected {
+                        if !api
+                            .runtime
+                            .listener_settings(name)
+                            .is_some_and(|l| spec.op.allowed_for(&principal, &l))
+                        {
+                            return ApiError::not_found("resource not found").into_response();
+                        }
+                    }
+                }
+                request.extensions_mut().insert(principal);
                 next.run(request).await
             }
             crate::engine::auth::api_keys::KeyVerdict::NoKeys => {
@@ -1382,6 +1543,167 @@ async fn daemon_auth(
     }
 }
 
+#[cfg(test)]
+type BrowserAuthenticatedCallback =
+    dyn Fn(&DaemonApi, &crate::command::daemon_api::browser::BrowserPrincipal) + Send + Sync;
+
+#[cfg(test)]
+#[derive(Clone)]
+pub(super) struct BrowserAuthenticatedHook(pub Arc<BrowserAuthenticatedCallback>);
+
+/// The browser branch of `daemon_auth` (WI 0159, §2.3/§2.7).
+///
+/// * health and the two pairing routes need no principal (they are still
+///   Origin/Host gated);
+/// * a WebSocket upgrade to the frontend or terminal socket authenticates
+///   with a one-use ticket offered as `awman.ticket.<t>`;
+/// * everything else needs `Authorization: Bearer awb_…` for this exact
+///   origin and listener.
+///
+/// The resulting `Principal::Browser` must pass `Operation::allowed_for`
+/// and, for instance-scoped engine routes, resource ownership (D3);
+/// refusals look like a missing route.
+async fn browser_auth(
+    api: &Arc<DaemonApi>,
+    selected: Option<RouteSpec>,
+    browser: BrowserRequest,
+    mut request: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> Response {
+    use crate::command::daemon_api::browser::{may_touch_instance, BrowserPrincipal};
+    use crate::data::browser_auth::TicketRoute;
+    use crate::engine::auth::browser_grants::GrantVerdict;
+    let Some(spec) = selected else {
+        // Unknown path or method: the fallbacks answer without data.
+        return next.run(request).await;
+    };
+    let Some(settings) = api.runtime.listener_settings(&browser.listener) else {
+        return ApiError::not_found("resource not found").into_response();
+    };
+    let ctx = super::browser::context(&browser);
+    // The principal a pairing route would act for, used only for the
+    // listener/route authority check.
+    let anonymous = Principal::Browser {
+        grant_id: String::new(),
+        origin: ctx.origin.clone(),
+        listener: ctx.listener.clone(),
+    };
+    match spec.op {
+        Operation::CoreHealth => return next.run(request).await,
+        Operation::BrowserLinksCreate | Operation::BrowserLinksPoll => {
+            if !spec.op.allowed_for(&anonymous, &settings) {
+                return ApiError::not_found("resource not found").into_response();
+            }
+            return next.run(request).await;
+        }
+        _ => {}
+    }
+    let upgrade = request
+        .headers()
+        .get(axum::http::header::UPGRADE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.eq_ignore_ascii_case("websocket"));
+    let socket_route = match spec.op {
+        Operation::EngineInstancesFrontend => Some((TicketRoute::Frontend, 4)),
+        Operation::CoreTerminalsGet => Some((TicketRoute::Terminal, 3)),
+        _ => None,
+    };
+    let ticket = match super::browser::offered_ticket(request.headers()) {
+        Ok(ticket) => ticket,
+        Err(()) => {
+            return ApiError::browser_ticket_invalid("invalid WebSocket ticket offer")
+                .into_response()
+        }
+    };
+    let principal = match (upgrade, socket_route) {
+        (true, Some((route, segment))) => {
+            let resource = request
+                .uri()
+                .path()
+                .split('/')
+                .nth(segment)
+                .unwrap_or("")
+                .to_owned();
+            let consumed = ticket.as_deref().and_then(|t| {
+                api.runtime
+                    .browser_auth()
+                    .consume_ticket(t, route, &resource, &ctx)
+            });
+            match consumed {
+                Some(principal) => principal,
+                None => {
+                    return ApiError::browser_ticket_invalid(
+                        "a valid one-use WebSocket ticket is required",
+                    )
+                    .into_response()
+                }
+            }
+        }
+        // Browsers cannot upgrade anything else, and tickets are only for
+        // upgrades.
+        (true, None) => return ApiError::not_found("resource not found").into_response(),
+        (false, _) if ticket.is_some() => {
+            return ApiError::browser_ticket_invalid("tickets are only valid for upgrades")
+                .into_response()
+        }
+        (false, _) => {
+            let header = request
+                .headers()
+                .get(axum::http::header::AUTHORIZATION)
+                .map(|v| v.to_str().unwrap_or(""));
+            match api.runtime.browser_auth().authenticate(header, &ctx) {
+                Ok(principal) => principal,
+                Err(GrantVerdict::Missing) => {
+                    return ApiError::browser_grant_required("A browser grant is required")
+                        .into_response()
+                }
+                Err(_) => {
+                    return ApiError::browser_grant_invalid(
+                        "The browser grant is invalid, expired or revoked",
+                    )
+                    .into_response()
+                }
+            }
+        }
+    };
+    #[cfg(test)]
+    if let Some(hook) = request.extensions().get::<BrowserAuthenticatedHook>() {
+        (hook.0)(api, &principal);
+    }
+    // Deletion can win after bearer/ticket validation. A browser principal
+    // without a retained cancellation token must never reach either socket.
+    let Some(watch) = api.runtime.browser_auth().watch(&principal.grant_id) else {
+        return if upgrade {
+            ApiError::browser_ticket_invalid("the browser grant has ended")
+        } else {
+            ApiError::browser_grant_invalid("the browser grant has ended")
+        }
+        .into_response();
+    };
+    if !spec.op.allowed_for(&principal.principal(), &settings) {
+        return ApiError::not_found("resource not found").into_response();
+    }
+    // Instance-scoped engine routes: only instances this browser may touch.
+    if spec.op.owner() == Feature::Engine && spec.path.starts_with("/v1/engine/instances/{id}") {
+        let visible = request
+            .uri()
+            .path()
+            .split('/')
+            .nth(4)
+            .and_then(|id| crate::data::ids::InstanceId::parse(id).ok())
+            .is_some_and(|id| may_touch_instance(api, &principal, &id));
+        if !visible {
+            return ApiError::not_found("instance not found").into_response();
+        }
+    }
+    request.extensions_mut().insert(watch);
+    request.extensions_mut().insert(principal.principal());
+    request
+        .extensions_mut()
+        .insert::<BrowserPrincipal>(principal);
+    next.run(request).await
+}
+
 // Handlers
 
 async fn handle_workdirs(
@@ -1392,20 +1714,22 @@ async fn handle_workdirs(
 }
 
 async fn handle_create_session(
-    axum::Extension(principal): axum::Extension<RequestPrincipal>,
+    axum::Extension(principal): axum::Extension<Principal>,
+    receiving: Option<axum::Extension<ReceivingListener>>,
     State(state): State<Arc<AppState>>,
     axum::Extension(listener): axum::Extension<crate::data::daemon_state::CommandListener>,
     headers: HeaderMap,
     Json(value): Json<serde_json::Value>,
 ) -> Response {
-    let context = crate::data::daemon_state::CommandRequestContext::from_header(
+    let mut context = crate::data::daemon_state::CommandRequestContext::from_header(
         listener,
         headers.get("traceparent").and_then(|v| v.to_str().ok()),
     );
+    context.listener_name = receiving.map(|r| r.0 .0);
     let st = &state;
     with_idempotency(
         &state,
-        &principal.0,
+        principal.audit_id(),
         &headers,
         "/v1/worker/sessions",
         &value.to_string(),
@@ -1421,21 +1745,23 @@ async fn handle_create_session(
 }
 
 async fn handle_create_run(
-    axum::Extension(principal): axum::Extension<RequestPrincipal>,
+    axum::Extension(principal): axum::Extension<Principal>,
+    receiving: Option<axum::Extension<ReceivingListener>>,
     State(state): State<Arc<AppState>>,
     axum::Extension(listener): axum::Extension<crate::data::daemon_state::CommandListener>,
     headers: HeaderMap,
     Json(value): Json<serde_json::Value>,
 ) -> Response {
-    let context = crate::data::daemon_state::CommandRequestContext::from_header(
+    let mut context = crate::data::daemon_state::CommandRequestContext::from_header(
         listener,
         headers.get("traceparent").and_then(|v| v.to_str().ok()),
     );
+    context.listener_name = receiving.map(|r| r.0 .0);
     let st = &state;
     let canonical = value.to_string();
     with_idempotency(
         &state,
-        &principal.0,
+        principal.audit_id(),
         &headers,
         "/v1/worker/runs",
         &canonical,
@@ -1809,16 +2135,18 @@ async fn handle_close_session(
 }
 
 async fn handle_create_command(
-    axum::Extension(principal): axum::Extension<RequestPrincipal>,
+    axum::Extension(principal): axum::Extension<Principal>,
+    receiving: Option<axum::Extension<ReceivingListener>>,
     State(state): State<Arc<AppState>>,
     axum::Extension(listener): axum::Extension<crate::data::daemon_state::CommandListener>,
     headers: HeaderMap,
     Json(value): Json<serde_json::Value>,
 ) -> Response {
-    let context = crate::data::daemon_state::CommandRequestContext::from_header(
+    let mut context = crate::data::daemon_state::CommandRequestContext::from_header(
         listener,
         headers.get("traceparent").and_then(|v| v.to_str().ok()),
     );
+    context.listener_name = receiving.map(|r| r.0 .0);
     let body: CreateCommandRequest = match serde_json::from_value(value.clone()) {
         Ok(body) => body,
         Err(error) => return bad_request(error.to_string()),
@@ -1831,7 +2159,7 @@ async fn handle_create_command(
     let (st, hd) = (&state, &headers);
     with_idempotency(
         &state,
-        &principal.0,
+        principal.audit_id(),
         &headers,
         "/v1/worker/commands",
         &canonical,
@@ -2534,8 +2862,7 @@ pub(super) mod tests {
         // Guard: if someone adds a route without updating this table, the count drifts.
         assert_eq!(
             EXPECTED_ROUTES.len(),
-            // 53 + seven pull routes + four local foreground handoff routes.
-            64,
+            77,
             "route count mismatch — update EXPECTED_ROUTES"
         );
     }
@@ -2744,7 +3071,12 @@ pub(super) mod tests {
         let api = Arc::new(DaemonApi::for_worker_tests(state));
         let (_, key) = api.runtime.keys().create("test").unwrap();
         let key = key.as_str();
-        let app = build_router_for_listener(api, ListenerPolicy::Network);
+        let app = build_router_for_listener(
+            api,
+            ListenerPolicy::Network {
+                name: "default".into(),
+            },
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -3156,7 +3488,7 @@ mod wire_contract_tests {
             serde_json::json!({"session_id":session,"setup_status":"ready","status":"closing","running_command_id":command,"cancelled_count":1,"message":"closing"}),
         );
         round::<crate::command::daemon_api::core::StatusResponse>(
-            serde_json::json!({"status":"ok","version":"test","protocol":{"api":1},"capabilities":[],"features":{},"max_concurrent_jobs":2,"pid":1,"uptime_ms":1234,"listeners":{"local":null,"network":null},"agents":[]}),
+            serde_json::json!({"status":"ok","version":"test","protocol":{"api":1},"capabilities":[],"features":{},"max_concurrent_jobs":2,"pid":1,"uptime_ms":1234,"listeners":{"local":null,"network":{}},"agents":[]}),
         );
         round::<crate::command::daemon_api::core::FeatureRecord>(
             serde_json::json!({"name":"worker","state":"on","running":1,"queued":2,"enabled_by":"config","oldest_queued_age_ms":4100,"restarts":0,"last_error":null,"since_at":"2026-11-06T10:00:00Z"}),
@@ -3212,4 +3544,227 @@ mod wire_contract_tests {
             }
         }
     }
+}
+
+/// Name of the receiving listener, preserved for worker commands and viewers.
+#[derive(Clone)]
+pub struct ReceivingListener(pub String);
+
+/// Exact browser request context established by `listener_gate`.
+/// Browser authentication consumes this in the browser-auth workflow lane.
+#[derive(Clone, Debug)]
+pub struct BrowserRequest {
+    pub origin: crate::data::config::network::BrowserOrigin,
+    pub listener: String,
+}
+
+async fn listener_gate(
+    State((api, policy)): State<(Arc<DaemonApi>, ListenerPolicy)>,
+    mut request: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> Response {
+    use crate::data::config::network::ListenerTransport;
+    let ListenerPolicy::Network { name } = policy else {
+        if super::browser::query_carries_credentials(request.uri()) {
+            return ApiError::invalid_request("credentials are never accepted in the URL")
+                .into_response();
+        }
+        return next.run(request).await;
+    };
+    let Some(settings) = api.runtime.listener_settings(&name).filter(|l| l.enabled) else {
+        return ApiError::not_found("resource not found").into_response();
+    };
+    if request
+        .uri()
+        .path()
+        .split('/')
+        .any(|segment| segment == "..")
+    {
+        return ApiError::not_found("resource not found").into_response();
+    }
+    let matched = request
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .map(|p| p.as_str());
+    let hidden = ROUTES
+        .iter()
+        .find(|s| Some(s.path) == matched)
+        .is_some_and(|spec| {
+            spec.op.local_only()
+                || spec
+                    .op
+                    .owner()
+                    .feature_name()
+                    .is_some_and(|f| !api.runtime.listener_serves(&name, f))
+        });
+    // Keep TLS feature hiding unchanged. On loopback, validate the browser
+    // origin first so an allowed origin can read the ordinary 404 response.
+    if hidden && settings.transport != ListenerTransport::LoopbackHttp {
+        return ApiError::not_found("resource not found").into_response();
+    }
+    if settings.transport == ListenerTransport::LoopbackHttp
+        && (request.headers().get_all("host").iter().count() != 1
+            || request.headers().get("host").and_then(|h| h.to_str().ok())
+                != Some(settings.listen.to_string().as_str()))
+    {
+        return ApiError::host_mismatch("Host must match the listener address").into_response();
+    }
+    let browser = request.headers().contains_key("origin")
+        || request
+            .headers()
+            .keys()
+            .any(|h| h.as_str().starts_with("sec-fetch-"));
+    if !browser {
+        if super::browser::query_carries_credentials(request.uri()) {
+            return ApiError::invalid_request("credentials are never accepted in the URL")
+                .into_response();
+        }
+        if hidden {
+            return ApiError::not_found("resource not found").into_response();
+        }
+        return next.run(request).await;
+    }
+    let origin = request
+        .headers()
+        .get("origin")
+        .and_then(|h| h.to_str().ok());
+    let allowed = settings.transport == ListenerTransport::LoopbackHttp
+        && request.headers().get_all("origin").iter().count() == 1
+        && origin.is_some_and(|o| {
+            settings
+                .allowed_origins
+                .iter()
+                .any(|allowed| allowed.as_str() == o)
+        });
+    if !allowed {
+        return ApiError::origin_not_allowed("Origin is not allowed").into_response();
+    }
+    let origin = request.headers()["origin"].clone();
+    let parsed_origin = match origin
+        .to_str()
+        .ok()
+        .and_then(|s| crate::data::config::network::BrowserOrigin::parse(s).ok())
+    {
+        Some(origin) => origin,
+        None => return ApiError::origin_not_allowed("Origin is not allowed").into_response(),
+    };
+    let private_network = request
+        .headers()
+        .get("access-control-request-private-network")
+        .is_some_and(|v| v == "true");
+    let preflight = request.method() == axum::http::Method::OPTIONS;
+    let health = request.uri().path() == "/v1/health";
+    // Origin/Host refusal remains first, without CORS. Once allowed, apply
+    // URL policy before health, preflight, hidden routes or method fallbacks.
+    let mut response = if super::browser::query_carries_credentials(request.uri()) {
+        ApiError::invalid_request("credentials are never accepted in the URL").into_response()
+    } else if preflight {
+        StatusCode::NO_CONTENT.into_response()
+    } else if hidden {
+        ApiError::not_found("resource not found").into_response()
+    } else if health {
+        let listener_status = api.runtime.listeners();
+        let record = listener_status.network.get(&name);
+        let browser_links = record.is_some_and(|r| r.browser_links);
+        let engine_state = api
+            .runtime
+            .feature_state(crate::data::daemon_state::FeatureName::Engine)
+            .state;
+        let mut protocols = serde_json::json!({"api":1,"frontend":1,"terminal":1});
+        if browser_links {
+            protocols["browser"] = serde_json::json!(1);
+        }
+        Json(serde_json::json!({
+            "status":"ok",
+            "build":env!("CARGO_PKG_VERSION"),
+            "protocols":protocols,
+            "capabilities":crate::command::daemon_api::capabilities::CAPABILITIES,
+            "listener":{"name":name,"transport":settings.transport,"features":settings.features.into_iter().filter(|f| api.runtime.listener_serves(&name,*f)).collect::<Vec<_>>()},
+            "engine":{"state":engine_state},
+            "browser_links":browser_links
+        })).into_response()
+    } else {
+        let method = request.method();
+        if [
+            axum::http::Method::POST,
+            axum::http::Method::PATCH,
+            axum::http::Method::DELETE,
+        ]
+        .contains(method)
+            && !request
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| {
+                    v.split(';')
+                        .next()
+                        .is_some_and(|media| media.trim().eq_ignore_ascii_case("application/json"))
+                })
+        {
+            ApiError::unsupported_media_type("Browser requests require application/json")
+                .into_response()
+        } else if request
+            .headers()
+            .get(axum::http::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+            .is_some_and(|n| n > crate::data::browser_auth::BROWSER_BODY_LIMIT as u64)
+        {
+            ApiError::request_too_large("Browser request bodies are limited to 64 KiB")
+                .into_response()
+        } else {
+            request.extensions_mut().insert(BrowserRequest {
+                origin: parsed_origin,
+                listener: name.clone(),
+            });
+            // Chunked bodies are bounded while they are read (413 on overflow).
+            let request = request.map(|body| {
+                axum::body::Body::new(http_body_util::Limited::new(
+                    body,
+                    crate::data::browser_auth::BROWSER_BODY_LIMIT,
+                ))
+            });
+            next.run(request).await
+        }
+    };
+    let headers = response.headers_mut();
+    headers.insert("access-control-allow-origin", origin);
+    headers.insert("vary", axum::http::HeaderValue::from_static("Origin"));
+    headers.insert(
+        "access-control-expose-headers",
+        axum::http::HeaderValue::from_static("Retry-After, ETag"),
+    );
+    headers.insert(
+        "cache-control",
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    headers.insert(
+        "x-content-type-options",
+        axum::http::HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        "referrer-policy",
+        axum::http::HeaderValue::from_static("no-referrer"),
+    );
+    if preflight {
+        headers.insert(
+            "access-control-allow-methods",
+            axum::http::HeaderValue::from_static("GET, POST, PATCH, DELETE, OPTIONS"),
+        );
+        headers.insert(
+            "access-control-allow-headers",
+            axum::http::HeaderValue::from_static("Authorization, Content-Type, If-None-Match"),
+        );
+        headers.insert(
+            "access-control-max-age",
+            axum::http::HeaderValue::from_static("600"),
+        );
+        if private_network {
+            headers.insert(
+                "access-control-allow-private-network",
+                axum::http::HeaderValue::from_static("true"),
+            );
+        }
+    }
+    response
 }

@@ -1,7 +1,7 @@
 //! `engine::auth` — `AuthEngine`. Consolidates host-side agent credential
 //! resolution and the daemon network listener's credentials: named API keys
 //! ([`api_keys::ApiKeyStore`], hashes only) and its self-signed TLS identity
-//! ([`tls`], SANs from `daemon.network.tlsSans`).
+//! ([`tls`], SANs from `daemon.network.listeners.*.tlsSans`).
 
 use std::path::PathBuf;
 use std::time::SystemTime;
@@ -16,7 +16,10 @@ use crate::data::session::{AgentName, Session};
 use crate::engine::error::EngineError;
 
 pub mod api_keys;
+pub mod browser_grants;
+pub mod browser_links;
 pub mod credential;
+pub mod device_flow;
 pub mod github_token;
 pub mod host_secret_command;
 pub mod keychain;

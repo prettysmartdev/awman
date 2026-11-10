@@ -1,0 +1,32 @@
+// @vitest-environment jsdom
+import { afterEach, expect, it, vi } from 'vitest';
+import { useSyncExternalStore } from 'react';
+import { act, cleanup, fireEvent, render, screen } from '@testing-library/react';
+import { Subject } from '@/lib/client/observable';
+import type { ConnectController, ConnectState } from '@/lib/connect/controller';
+import type { FrontendConnection } from '@/lib/client/frontendSocket';
+import type { DaemonClient } from '@/lib/client/daemonClient';
+import type { BrowserHealth } from '@/lib/client/types';
+import http from '../lib/fixtures/http.json';
+import { harness } from './helpers';
+import App from '@/app/App';
+const captured = vi.hoisted(() => ({ state: null as Subject<ConnectState> | null, controller: null as ConnectController | null, client: null as DaemonClient | null, connection: null as FrontendConnection | null, revoked: null as (() => void) | null }));
+vi.mock('@/lib/connect/useConnect', () => ({ useConnect: () => ({ state: useSyncExternalStore(cb => captured.state!.subscribe(cb), () => captured.state!.get()), controller: captured.controller }) }));
+vi.mock('@/lib/client/daemonClient', () => ({ DaemonClient: vi.fn(function () { return captured.client; }) }));
+vi.mock('@/lib/client/frontendSocket', () => ({ FrontendConnection: vi.fn(function () { return captured.connection; }) }));
+vi.mock('@/lib/pwa/serviceWorker', () => ({ registerShellWorker: () => () => undefined }));
+vi.mock('@/components/TerminalPanel', () => ({ TerminalPanel: () => <div>Hub terminal</div> }));
+afterEach(() => { cleanup(); sessionStorage.clear(); });
+it('revocation returns to connect with a notice and closes the active workspace socket', async () => {
+  const h = harness(); const health = http.health_browser as BrowserHealth;
+  captured.client = h.client; captured.connection = h.connection;
+  captured.state = new Subject<ConnectState>({ phase: 'connected', grant: { id: 'brw_test', token: 'synthetic-grant', scope: 'engine', origin: '', listener: 'loopback', expiresAt: '2099-01-01' }, health });
+  captured.controller = { reset: () => captured.state!.set({ phase: 'probed', result: { kind: 'ready_unlinked', health } }) } as ConnectController;
+  h.client.onRevoked = cb => { captured.revoked = cb; return () => { captured.revoked = null; }; };
+  render(<App />); fireEvent.click(await screen.findByRole('button', { name: 'Open workspace' }));
+  await screen.findByRole('textbox', { name: 'Command' });
+  act(() => captured.revoked?.());
+  expect(screen.getByText('Browser access revoked. Connect browser again to continue.')).toBeTruthy();
+  expect(screen.getByRole('button', { name: 'Connect browser' })).toBeTruthy();
+  expect(h.connection.close).toHaveBeenCalledWith('navigation');
+});

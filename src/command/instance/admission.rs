@@ -18,6 +18,8 @@ pub enum AttachRefusal {
     /// 404 `not_found`.
     #[error("instance not found")]
     NotFound,
+    #[error("{0}")]
+    ProtocolError(String),
     /// 409 `primary_exists`.
     #[error("instance already has a primary frontend")]
     PrimaryExists,
@@ -42,6 +44,7 @@ impl AttachRefusal {
     /// The stable error code of the `{error, code}` body.
     pub fn code(&self) -> &'static str {
         match self {
+            Self::ProtocolError(_) => "protocol_error",
             Self::NotFound | Self::UnknownTab => "not_found",
             Self::PrimaryExists => "primary_exists",
             Self::ProtocolMismatch { .. } => "protocol_mismatch",
@@ -109,6 +112,26 @@ pub fn admit(
             offered: hello.protocol.clone(),
         });
     }
+    use crate::data::frontend_protocol::{FrontendKindWire, WEB_PRIMARY_RECONNECT_GRACE};
+    if hello.kind == FrontendKindWire::Web {
+        if !hello.env.is_empty() || !hello.argv.is_empty() || !hello.cwd.as_os_str().is_empty() {
+            return Err(AttachRefusal::ProtocolError(
+                "web frontends carry no env/cwd/argv".into(),
+            ));
+        }
+        if hello.role == FrontendRole::Primary
+            && hello.resume.is_none()
+            && hello.launch_context.is_none()
+        {
+            return Err(AttachRefusal::ProtocolError(
+                "web primary requires a launch_context".into(),
+            ));
+        }
+    } else if hello.launch_context.is_some() {
+        return Err(AttachRefusal::ProtocolError(
+            "only web frontends carry launch_context".into(),
+        ));
+    }
     if draining {
         return Err(AttachRefusal::Draining);
     }
@@ -123,6 +146,9 @@ pub fn admit(
             None => {
                 let frontend_id = FrontendId::new();
                 lifecycle.attach_primary(frontend_id.clone())?;
+                if hello.kind == FrontendKindWire::Web {
+                    lifecycle.set_reconnect_grace(WEB_PRIMARY_RECONNECT_GRACE);
+                }
                 Ok(Admitted::StartingPrimary { frontend_id })
             }
         },
@@ -163,6 +189,7 @@ mod tests {
             stdout_is_tty: true,
             view: None,
             resume: None,
+            launch_context: None,
         }
     }
 
@@ -269,6 +296,76 @@ mod tests {
         assert_eq!(
             admit(&back, false, &mut lifecycle, |_| true, now),
             Ok(Admitted::ResumedPrimary { frontend_id: id })
+        );
+    }
+}
+
+#[cfg(test)]
+mod web_tests {
+    use super::*;
+    use crate::data::{
+        frontend_protocol::{FrontendKindWire, HelloEnv, WEB_PRIMARY_RECONNECT_GRACE},
+        ids::LaunchContextId,
+    };
+    #[test]
+    fn web_admission_and_reconnect_grace_preserve_native_policy() {
+        let now = Instant::now();
+        let mut h = super::tests::hello(FrontendRole::Primary);
+        h.kind = FrontendKindWire::Web;
+        let mut lifecycle = FrontendLifecycle::reserved(now);
+        assert_eq!(
+            admit(&h, false, &mut lifecycle, |_| true, now)
+                .unwrap_err()
+                .code(),
+            "protocol_error"
+        );
+        h.cwd = Default::default();
+        h.argv.clear();
+        h.launch_context = Some(LaunchContextId::new());
+        h.env = HelloEnv::from_pairs([("SECRET", "planted")]);
+        assert_eq!(
+            admit(&h, false, &mut lifecycle, |_| true, now)
+                .unwrap_err()
+                .code(),
+            "protocol_error"
+        );
+        assert!(!lifecycle.started());
+        h.env = HelloEnv::default();
+        let admitted = admit(&h, false, &mut lifecycle, |_| true, now).unwrap();
+        let id = admitted.frontend_id().clone();
+        lifecycle.disconnected(&id, now);
+        h.resume = Some(id.clone());
+        h.launch_context = None;
+        assert!(matches!(
+            admit(
+                &h,
+                false,
+                &mut lifecycle,
+                |_| true,
+                now + std::time::Duration::from_secs(59)
+            ),
+            Ok(Admitted::ResumedPrimary { .. })
+        ));
+        lifecycle.disconnected(&id, now + std::time::Duration::from_secs(59));
+        assert!(lifecycle
+            .resume_primary(
+                &id,
+                now + std::time::Duration::from_secs(59) + WEB_PRIMARY_RECONNECT_GRACE
+            )
+            .is_err());
+        let mut tui = super::tests::hello(FrontendRole::Primary);
+        tui.launch_context = Some(LaunchContextId::new());
+        assert_eq!(
+            admit(
+                &tui,
+                false,
+                &mut FrontendLifecycle::reserved(now),
+                |_| true,
+                now
+            )
+            .unwrap_err()
+            .code(),
+            "protocol_error"
         );
     }
 }

@@ -39,15 +39,27 @@ impl DaemonRuntime {
 }
 
 /// `network_features` is what the network listener actually serves:
-/// listed in `daemon.network.features` and enabled by config.
+/// listed in `daemon.network.listeners.default.features` and enabled by config.
 fn policy_for(runtime: &Weak<DaemonRuntime>) -> AccessPolicy {
     let Some(runtime) = runtime.upgrade() else {
         return AccessPolicy::default();
     };
     AccessPolicy {
-        network_features: FeatureName::ALL
-            .into_iter()
-            .filter(|f| runtime.network_serves(*f))
+        network_features: runtime
+            .config()
+            .daemon()
+            .network
+            .listeners
+            .keys()
+            .map(|name| {
+                (
+                    name.clone(),
+                    FeatureName::ALL
+                        .into_iter()
+                        .filter(|f| runtime.listener_serves(name, *f))
+                        .collect(),
+                )
+            })
             .collect(),
         remote_input: runtime.config().daemon().terminal.remote_input,
     }

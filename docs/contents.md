@@ -26,6 +26,7 @@ A guide to using awman, the containerized multi-agent terminal multiplexer.
 | 15 | [Custom Agents](15-custom-agents.md) | Define your own agents in TOML: locations, reference, images, approval and trust, `awman new agent`, crush/maki migration |
 | 16 | [The Daemon](16-daemon.md) | Shared daemon features, lifecycle, local API, network listener, keys, and worker status |
 | 17 | [Workers and Work Servers](17-workers-and-work-servers.md) | Work server links and settings, labels, queue picking, and WSP v1 for server authors |
+| 20 | [Web App](20-webapp.md) | Install, connect and approve browser access, shortcuts, offline use, privacy and troubleshooting |
 | 19 | [The Engine and Frontends](19-engine-and-frontends.md) | Running the TUI on the daemon engine: `tui.backend`, instances, upgrades, fallback notices, integrations |
 | — | [Architecture (Detailed)](architecture.md) | Source layout, in-depth design decisions |
 

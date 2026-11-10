@@ -578,6 +578,10 @@ async fn feature_cancel_releases_background_and_foreground_clones_before_job_cre
         item.repo.url = format!("{}/repo.git", server.uri());
         item.repo.credentials = None;
         item.exec.interaction = None;
+        // The fixture's default one-second command deadline can cancel a
+        // slow macOS checkout before its first Git request reaches the mock.
+        // This test controls cancellation explicitly through cancel_jobs().
+        item.exec.timeout_ms = None;
         let lease = awman_wsp::Lease {
             id: "server-cloning".into(),
             epoch: 1,
@@ -595,7 +599,7 @@ async fn feature_cancel_releases_background_and_foreground_clones_before_job_cre
             .await;
         Mock::given(method("GET"))
             .and(path("/repo.git/info/refs"))
-            .respond_with(ResponseTemplate::new(404).set_delay(Duration::from_secs(30)))
+            .respond_with(ResponseTemplate::new(404).set_delay(Duration::from_secs(90)))
             .mount(&server)
             .await;
         Mock::given(method("POST"))
@@ -609,7 +613,10 @@ async fn feature_cancel_releases_background_and_foreground_clones_before_job_cre
             tokio::spawn(
                 async move { c.claim_next_for(Some("blocked"), "team", foreground).await },
             );
-        tokio::time::timeout(Duration::from_secs(5), async {
+        // A busy macOS runner may take several seconds to schedule Git while
+        // the rest of the hermetic suite runs. Wait for the request itself;
+        // the mock keeps it pending until cancellation is exercised below.
+        let clone_started = tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 if server
                     .received_requests()
@@ -623,8 +630,25 @@ async fn feature_cancel_releases_background_and_foreground_clones_before_job_cre
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
-        .await
-        .expect("clone began");
+        .await;
+        if clone_started.is_err() {
+            let outcome = if claim.is_finished() {
+                format!("{:?}", claim.await)
+            } else {
+                "claim still running".into()
+            };
+            let requests: Vec<_> = server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .map(|request| request.url.path().to_owned())
+                .collect();
+            panic!(
+                "clone did not begin; {outcome}; active leases: {}; requests: {requests:?}",
+                controller.leases.active().unwrap().len()
+            );
+        }
         let records = controller.leases.active().unwrap();
         assert_eq!(records.len(), 1);
         assert!(

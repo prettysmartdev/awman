@@ -349,9 +349,7 @@ impl Host {
                 let token = links
                     .read(name)
                     .map_err(|e| e.to_string())?
-                    .ok_or_else(|| {
-                        format!("work server {name:?} has no token; run awman worker link")
-                    })?;
+                    .ok_or_else(|| format!("work server {name:?} has no token; run awman link"))?;
                 let wsp = Arc::new(
                     WspSession::connect(name, url, token.refresh_token)
                         .map_err(|e| e.to_string())?,
@@ -1437,6 +1435,13 @@ impl ManualRun {
                     .chain(&self.plan.args)
                     .map(String::as_str),
             ),
+            argv: self
+                .plan
+                .command
+                .iter()
+                .chain(&self.plan.args)
+                .cloned()
+                .collect(),
         }
     }
     pub(super) async fn release(
@@ -1766,6 +1771,7 @@ impl ProxyRun {
             server: server.into(),
             cwd: cwd.clone(),
             command_line: shell_words::join(command.iter().chain(&args).map(String::as_str)),
+            argv: command.iter().chain(&args).cloned().collect(),
         };
         let mut engines = engines.clone();
         let read_only = value["read_only"]

@@ -68,8 +68,8 @@ fn removed_api_and_squad_lifecycle_commands_and_keys_say_where_they_moved() {
         assert!(!output.status.success(), "{args:?}");
     }
     for (key, hint) in [
-        ("api.port", "daemon.network.listen"),
-        ("api.bind", "daemon.network.listen"),
+        ("api.port", "daemon.features.worker.push"),
+        ("api.bind", "daemon.features.worker.push"),
         ("workers", "daemon.maxConcurrentJobs"),
     ] {
         let error = home.cli_err(&["config", "set", key, "1", "--global"]);

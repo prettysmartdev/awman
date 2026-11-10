@@ -102,7 +102,10 @@ impl ConfigLayers {
 /// The map keys under `section` in `files`, de-duplicated, in order.
 pub fn map_names(files: &[&ConfigFile], section: &str) -> Vec<String> {
     let segments: Vec<&str> = section.split('.').collect();
-    let mut names: Vec<String> = Vec::new();
+    let mut names: Vec<String> = fields::builtin_member_names(section)
+        .iter()
+        .map(|n| (*n).to_string())
+        .collect();
     for file in files {
         let value = file.to_value();
         if let Some(object) = get_path(&value, &segments).and_then(Value::as_object) {
@@ -285,6 +288,15 @@ impl EffectiveConfig {
             builtin.network = None;
         }
         check.validate_semantics()?;
+        super::network::validate_network_config(
+            &merged
+                .daemon
+                .clone()
+                .unwrap_or_default()
+                .network
+                .unwrap_or_default(),
+        )
+        .map_err(DataError::Other)?;
         Ok(Self {
             layers,
             merged,
@@ -769,14 +781,11 @@ impl EffectiveConfig {
             .unwrap_or(false)
     }
 
-    /// The typed network listener address after defaults and config layers.
-    pub fn network_listen(&self) -> crate::data::config::network::ListenAddr {
-        self.daemon().network.listen
-    }
-
-    /// The daemon features exposed through the network listener.
-    pub fn network_features(&self) -> Vec<crate::data::daemon_state::FeatureName> {
-        self.daemon().network.features
+    /// Named network listeners with built-in defaults applied.
+    pub fn network_listeners(
+        &self,
+    ) -> std::collections::BTreeMap<String, crate::data::config::daemon::ListenerSettings> {
+        self.daemon().network.listeners
     }
 
     /// `daemon.features.worker.push.workDirs.allow`.
@@ -968,6 +977,22 @@ pub fn default_document() -> Value {
             None => set_path(&mut doc, &segments, key.default_value()),
         }
     }
+    for name in ["default", "loopback"] {
+        for leaf in [
+            "enabled",
+            "listen",
+            "transport",
+            "features",
+            "tlsSans",
+            "allowedOrigins",
+        ] {
+            set_path(
+                &mut doc,
+                &["daemon", "network", "listeners", name, leaf],
+                super::network::builtin_leaf(name, leaf).unwrap(),
+            );
+        }
+    }
     doc
 }
 
@@ -1131,7 +1156,12 @@ fn fill_map_defaults(doc: &mut Value, provenance: &mut BTreeMap<String, Layer>) 
                 continue;
             }
             if get_path(doc, &full[..map_segments.len() + 1]).is_some_and(Value::is_object) {
-                set_path(doc, &full, default.clone());
+                let value = if map_path == "daemon.network.listeners" {
+                    super::network::builtin_leaf(&name, leaf).unwrap_or_else(|| default.clone())
+                } else {
+                    default.clone()
+                };
+                set_path(doc, &full, value);
                 provenance.insert(full.join("."), Layer::Default);
             }
         }
@@ -1185,7 +1215,14 @@ fn set_leaf(
 ) {
     let segments: Vec<&str> = path.split('.').collect();
     if value.is_null() {
-        set_path(target, &segments, key.default_value());
+        let default = if segments.len() == 5 && segments[..3] == ["daemon", "network", "listeners"]
+        {
+            super::network::builtin_leaf(segments[3], segments[4])
+                .unwrap_or_else(|| key.default_value())
+        } else {
+            key.default_value()
+        };
+        set_path(target, &segments, default);
         provenance.remove(path);
         return;
     }

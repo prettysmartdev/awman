@@ -15,6 +15,7 @@ pub const FRONTEND_SUBPROTOCOL: &str = "awman.frontend.v1";
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 /// Payload target per `SnapshotChunk` so the envelope stays under MAX_FRAME_BYTES.
 pub const SNAPSHOT_CHUNK_BYTES: usize = 768 * 1024;
+pub const WEB_PRIMARY_RECONNECT_GRACE: Duration = Duration::from_secs(60);
 pub const PRIMARY_RECONNECT_GRACE: Duration = Duration::from_secs(2);
 pub const RECONNECT_BACKOFF_INITIAL: Duration = Duration::from_millis(50);
 pub const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(1);
@@ -25,6 +26,7 @@ pub type Seq = u64; // first frame of each direction is seq 1
 pub enum FrontendKindWire {
     Tui,
     Cli,
+    Web,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -49,17 +51,25 @@ pub struct TermSize {
 pub struct HelloEnv(BTreeMap<String, String>);
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Hello {
     pub protocol: String, // must equal FRONTEND_SUBPROTOCOL
     pub build: String,    // frontend's awman version string
     pub kind: FrontendKindWire,
     pub role: FrontendRole,
     pub annotations: Annotations,
+    #[serde(default)]
     pub cwd: PathBuf,
+    #[serde(default)]
     pub argv: Vec<String>,
+    #[serde(default)]
     pub env: HelloEnv,
+    #[serde(default)]
+    pub launch_context: Option<crate::data::ids::LaunchContextId>,
     pub term_size: TermSize,
+    #[serde(default)]
     pub stdin_is_tty: bool,
+    #[serde(default)]
     pub stdout_is_tty: bool,
     pub view: Option<ViewScope>,    // Secondary only
     pub resume: Option<FrontendId>, // reconnect within PRIMARY_RECONNECT_GRACE
@@ -86,6 +96,10 @@ pub struct OpenTabOptions {
     pub label: Option<String>,
     pub annotations: Annotations,
     pub startup: StartupSpawn,
+    /// A picked lease may open its prepared workspace outside the web
+    /// launch-context roots. The engine verifies the lease and exact path.
+    #[serde(default)]
+    pub lease_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -600,6 +614,7 @@ mod tests {
             stdout_is_tty: true,
             view: None,
             resume: None,
+            launch_context: None,
         }
     }
     pub(crate) fn snapshot() -> InstanceSnapshot {

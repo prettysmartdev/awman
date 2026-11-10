@@ -57,10 +57,23 @@ fn io(error: std::io::Error) -> EngineError {
     EngineError::Git(format!("isolating push-back metadata: {error}"))
 }
 
+fn io_at(path: &Path, error: std::io::Error) -> EngineError {
+    EngineError::Git(format!(
+        "isolating push-back metadata at {}: {error}",
+        path.display()
+    ))
+}
+
 // Reject symlinks and special files, including directory symlinks. In particular,
 // never import objects/info/alternates, config, hooks, attributes or split indexes.
 fn copy_regular(source: &Path, dest: &Path) -> Result<()> {
-    crate::data::fs::git_metadata::GitMetadataCopy::copy(source, dest).map_err(io)
+    crate::data::fs::git_metadata::GitMetadataCopy::copy(source, dest).map_err(|error| {
+        EngineError::Git(format!(
+            "isolating push-back metadata copying {} to {}: {error}",
+            source.display(),
+            dest.display()
+        ))
+    })
 }
 
 impl GitEngine {
@@ -132,7 +145,7 @@ impl GitEngine {
         let private = tempfile::Builder::new()
             .prefix("awman-push-")
             .tempdir_in(parent)
-            .map_err(io)?;
+            .map_err(|error| io_at(parent, error))?;
         let git = RemotePushGit {
             env: self.env().clone(),
             private,
@@ -141,23 +154,26 @@ impl GitEngine {
             lease: None,
         };
         let dir = git.private.path();
-        fs::create_dir_all(dir.join("objects")).map_err(io)?;
-        fs::create_dir_all(dir.join("refs")).map_err(io)?;
+        fs::create_dir_all(dir.join("objects"))
+            .map_err(|error| io_at(&dir.join("objects"), error))?;
+        fs::create_dir_all(dir.join("refs")).map_err(|error| io_at(&dir.join("refs"), error))?;
         copy_regular(&metadata.join("HEAD"), &dir.join("HEAD"))?;
         for name in ["refs", "packed-refs", "shallow"] {
             let source = metadata.join(name);
-            if source.try_exists().map_err(io)? {
+            if source.try_exists().map_err(|error| io_at(&source, error))? {
                 copy_regular(&source, &dir.join(name))?;
             }
         }
         if !fs::symlink_metadata(metadata.join("objects"))
-            .map_err(io)?
+            .map_err(|error| io_at(&metadata.join("objects"), error))?
             .is_dir()
         {
             return Err(EngineError::Git("unsafe Git objects directory".into()));
         }
-        for entry in fs::read_dir(metadata.join("objects")).map_err(io)? {
-            let entry = entry.map_err(io)?;
+        for entry in fs::read_dir(metadata.join("objects"))
+            .map_err(|error| io_at(&metadata.join("objects"), error))?
+        {
+            let entry = entry.map_err(|error| io_at(&metadata.join("objects"), error))?;
             if entry.file_name() != "info" {
                 copy_regular(&entry.path(), &dir.join("objects").join(entry.file_name()))?;
             }
@@ -167,7 +183,7 @@ impl GitEngine {
             dir.join("config"),
             "[core]\nrepositoryformatversion = 0\nbare = false\n",
         )
-        .map_err(io)?;
+        .map_err(|error| io_at(&dir.join("config"), error))?;
         let mut sink = crate::data::message::RecordingMessageSink::new();
         git.run(&["config", "remote.origin.url", url], false, &mut sink)?;
         git.run(
@@ -192,7 +208,7 @@ impl GitEngine {
                     .args(["--get", key])
                     .current_dir(dir)
                     .output()
-                    .map_err(io)?;
+                    .map_err(|error| io_at(&local, error))?;
                 if output.status.success() {
                     let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
                     if key == "extensions.objectformat" {
@@ -211,7 +227,7 @@ impl GitEngine {
                 }
             }
         }
-        fs::remove_file(&local).map_err(io)?;
+        fs::remove_file(&local).map_err(|error| io_at(&local, error))?;
         Ok(git)
     }
 }

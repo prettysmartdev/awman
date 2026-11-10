@@ -19,12 +19,17 @@ pub fn engine_host(
     presentation: Arc<dyn crate::command::instance::frontend::InstancePresentation>,
 ) -> Arc<crate::command::instance::host::EngineInstanceHost> {
     use crate::command::instance::host::{EngineInstanceHost, HostParts, StartupOpener};
-    EngineInstanceHost::new(HostParts {
+    let host = EngineInstanceHost::new(HostParts {
         hub: core.terminal_hub().clone(),
         catalogue: crate::command::dispatch::catalogue::CommandCatalogue::get(),
         registry: crate::command::integrations::IntegrationRegistry::compiled_in(),
         opener: StartupOpener::new(presentation),
         executor: Some(core.executor().clone()),
         build: env!("CARGO_PKG_VERSION").to_string(),
-    })
+    });
+    host.configure_launch_contexts(
+        core.daemon_paths().launch_contexts_file(),
+        core.env().clone(),
+    );
+    host
 }

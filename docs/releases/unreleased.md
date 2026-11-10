@@ -7,7 +7,7 @@ The worker API and squad scheduler now share one daemon, one database and one ex
 
 Local clients use an owner-authenticated socket or named pipe. The optional network listener uses TLS and named API keys, exposes only configured features, and never exposes ephemeral features. Feature switches and network exposure changes apply live.
 
-`awman worker link <server-url>` now saves a work server link using device approval or a supplied token. `workServers.*` config manages the link, and unsetting the server also removes its stored token. Linked servers are not yet used to claim or run jobs.
+`awman link <server-url>` saves a work server link using device approval or a supplied token. `workServers.*` config manages the link, and unsetting the server also removes its stored token. Linked servers supply manual queue items and automatic pull work. `awman link web-<code>` approves a browser on the daemon's engine listener.
 
 ---
 

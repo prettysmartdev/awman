@@ -1,0 +1,182 @@
+# Web App
+
+The awman web app is a browser interface to an awman daemon. The hosted app is
+at <https://awman.prettysmart.dev>. It is a static site; it does not run agents
+or proxy browser requests to your daemon. Browser requests go to port 9877 on
+the hostname used to load the page.
+
+## Install and connect
+
+Open the hosted app in a browser. The first visit requires an internet
+connection. Use the browser's **Install** or **Add to Home
+Screen** command to install it. The installed app can open its cached shell
+offline after the first online visit and service-worker installation.
+
+With the current loopback-only engine listener, connecting requires the browser
+and daemon on the same computer, plus the daemon's engine feature and built-in
+`loopback` listener enabled. In a terminal, configure those two settings and
+start the daemon in the background:
+
+```sh
+awman config set daemon.features.engine.enabled true
+awman config set daemon.network.listeners.loopback.enabled true
+awman daemon start --background
+```
+
+When loaded from <http://127.0.0.1:3000> or <http://localhost:3000>, the app
+connects to `127.0.0.1:9877`, where the built-in daemon listener binds. From
+another hostname, it uses that hostname and the page's HTTP or HTTPS scheme.
+The current engine listener
+accepts loopback only; use the local development address for a working daemon
+connection until remote engine access is available. The hosted page currently
+cannot reach a daemon through its own hostname. If your browser asks to allow
+local-network access, allow it for the app. Once connected, choose **Connect
+browser**. The app displays a short `web-<code>` code. Approve it in an
+interactive terminal on the daemon's computer:
+
+```sh
+awman link web-<code>
+```
+
+Review the requesting origin and approve the request at the CLI prompt. A
+browser grant authorizes that browser for the engine on that listener. Grants
+last twelve hours and are dropped when the daemon stops; approve the browser
+again after a daemon restart.
+
+## Run the web app locally
+
+From the repository root, install the web dependencies and start the development
+server with `make web/dev`. Open <http://127.0.0.1:3000> or
+<http://localhost:3000>. If Tailscale is
+running, the target also prints a URL using this machine's tailnet IPv4 address.
+Both local origins are allowed by the default loopback listener. If you have
+overridden `allowedOrigins`, include both local origins in its exact origin list:
+
+```sh
+make web/reinstall
+awman config set daemon.network.listeners.loopback.allowedOrigins https://awman.prettysmart.dev,http://127.0.0.1:3000,http://localhost:3000
+make web/dev
+```
+
+## Workspaces
+
+A browser has no shell of its own, so the web app opens sessions in
+**workspaces** you register from a terminal. Run this in the project directory
+you want to work in, in the shell whose `PATH` and credentials the agents should
+use:
+
+```sh
+awman daemon api launch_contexts.create default=true
+```
+
+The web app lists registered workspaces and preselects the default. Agents
+started from the browser use the registered directory and that shell's
+environment; the browser cannot supply its own environment, executable paths
+or mount roots. Manually opened tabs stay inside a registered workspace;
+the engine may also open a workspace it prepared for a claimed work item.
+If the daemon restarts, a workspace shows as **environment stale**
+until you refresh it from the same directory:
+
+```sh
+awman daemon api launch_contexts.list
+awman daemon api launch_contexts.refresh id=<workspace-id>
+awman daemon api launch_contexts.delete id=<workspace-id>
+```
+
+## Closing or reloading the browser tab
+
+A browser session is a primary frontend of its engine instance, like a TUI.
+Reloading the tab reconnects to the same instance when the reload finishes
+within 60 seconds. After that, the engine applies its normal exit policy, as if
+the TUI had been closed. When a command or workflow is still running, the
+browser asks for confirmation before the tab closes or reloads. Another tab on
+the same machine can attach to an existing browser instance as a read-only
+view, or open its own instance.
+
+The v0 web app cannot connect to a daemon on another machine. A phone or second
+computer cannot use a desktop daemon through this web app, even when both are
+on the same network.
+
+## Work queue
+
+Enable the instance worker in the project before opening a browser workspace:
+
+```sh
+awman config set tui.worker.enabled true
+```
+
+The **Queue** button and **Ctrl+Q** show eligible items from linked work servers.
+Choose an item to view its details, then **Pick** to claim it and run it in a
+new tab. When the item belongs to your checkout, choose a worktree or a fresh
+clone before the run starts. Closing a tab with an active lease offers
+**Release**, **Cancel run**, or **Keep running**. The browser sends these actions
+through its engine
+instance; the owner-only worker routes remain on the daemon socket. Link work
+servers from a terminal with `awman link <server-url>`.
+
+## Shortcuts
+
+The app follows TUI actions where browsers allow them. Browser-reserved
+shortcuts use alternatives or visible buttons: **Ctrl+T**, **Ctrl+W**, and
+**Ctrl+N** have **Alt+T**, **Alt+W**, and **Alt+N** alternatives; **Ctrl+Shift+C**
+is available as a button. When a text input has focus, the browser keeps
+**Ctrl+A** and **Ctrl+D** for editing; use **Alt+Left** and **Alt+Right** to
+switch tabs. The in-app shortcut list shows available alternatives.
+
+## Offline behaviour
+
+After the first successful online visit and service-worker installation, the
+app shell can open without the hosted site. The local daemon must still be
+reachable to use the app. The offline cache contains the static app shell; it
+does not cache daemon responses, terminal output, or credentials. A first visit
+or install requires internet access.
+
+## Usage reporting and privacy
+
+The hosted site's usage counters record successful page loads and estimate
+daily and monthly distinct IP addresses. These are estimates of IP addresses,
+not people: one person may use more than one address, and an address may be
+shared. The app does not retain raw IP addresses or per-visitor records.
+Cloudflare still processes request metadata to serve the hosted site.
+
+## Revoke browser access
+
+List active browser grants from the daemon's computer:
+
+```sh
+awman daemon api browsers.list
+```
+
+Revoke a grant using the ID shown in the list:
+
+```sh
+awman daemon api browsers.delete id=<browser-id>
+```
+
+Revocation closes that grant's active browser connections.
+
+## Troubleshooting
+
+Check the daemon and listener state:
+
+```sh
+awman daemon status
+```
+
+Status lists listener names, addresses, transports, features, allowed origins,
+browser grants, and bind errors. The `loopback` listener should be enabled at
+`127.0.0.1:9877` and serve `engine`. If it is missing or has a bind error,
+check the two settings above and whether another process is using that port.
+The hosted app origin must be in `allowedOrigins`; the built-in `loopback`
+listener includes it and both local development origins by default. If you
+overrode `allowedOrigins`, add both development origins explicitly. Origins
+must match exactly, including scheme and port:
+
+```sh
+awman config set daemon.network.listeners.loopback.allowedOrigins https://awman.prettysmart.dev,http://127.0.0.1:3000,http://localhost:3000
+```
+
+Setting `allowedOrigins` replaces the list, so keep the hosted origin
+when adding development origins. Use the browser's local-network permission
+for the hosted app when it is requested, and recheck after changing listener
+settings.

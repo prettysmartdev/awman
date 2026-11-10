@@ -54,6 +54,8 @@ pub struct HttpClientOptions {
     /// before it knows the daemon's self-signed certificate.
     /// Never set this for a target that leaves the machine.
     pub accept_invalid_certs: bool,
+    /// Keep device authorization on the explicitly selected server/transport.
+    pub refuse_redirects: bool,
 }
 
 impl HttpClientOptions {
@@ -188,6 +190,9 @@ impl HttpCore {
     /// `reqwest::blocking`.
     pub fn client(options: &HttpClientOptions) -> Result<reqwest::Client, EngineError> {
         let mut builder = reqwest::Client::builder();
+        if options.refuse_redirects {
+            builder = builder.redirect(reqwest::redirect::Policy::none());
+        }
         if let Some(connect) = options.connect_timeout {
             builder = builder.connect_timeout(connect);
         }

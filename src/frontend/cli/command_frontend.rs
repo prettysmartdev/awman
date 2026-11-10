@@ -707,6 +707,12 @@ impl CommandFrontend for CliFrontend {
 
     /// The CLI is the one frontend whose answer is not a property of its kind:
     /// it can ask a human only when stdin is a terminal.
+    fn confirm_browser_link(&mut self) -> Result<bool, CommandError> {
+        super::per_command::link::confirm()
+    }
+    fn read_link_token(&mut self) -> Result<String, CommandError> {
+        super::per_command::link::read_token()
+    }
     fn input_available(&self) -> bool {
         super::output::stdin_is_tty()
     }

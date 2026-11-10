@@ -1,0 +1,139 @@
+{
+  "about": "Titles with markup, OSC 8 (https and javascript:), OSC 52/7/9/777/1337, DCS/XTGETTCAP, Kitty APC, Sixel; only 'docs bad visible' is printable",
+  "expect": {
+    "alt_screen": false,
+    "app_cursor": false,
+    "bracketed_paste": false,
+    "cols": 40,
+    "cursor": {
+      "col": 21,
+      "row": 0,
+      "visible": true
+    },
+    "lines": [
+      "titledocs bad visible",
+      "",
+      ""
+    ],
+    "mouse_mode": "none",
+    "mouse_sgr": false,
+    "rows": 3
+  },
+  "expect_from_snapshot": {
+    "alt_screen": false,
+    "app_cursor": false,
+    "bracketed_paste": false,
+    "cursor": {
+      "col": 21,
+      "row": 0,
+      "visible": true
+    },
+    "lines": [
+      "titledocs bad visible",
+      "",
+      ""
+    ]
+  },
+  "final_snapshot": {
+    "cols": 40,
+    "has_output": true,
+    "rows": 3,
+    "screen": "G1s/MjVoG1ttG1tIG1tKdGl0bGVkb2NzIGJhZCB2aXNpYmxlGz4bWz8xbBtbPzIwMDRs",
+    "type": "snapshot"
+  },
+  "frames": [
+    {
+      "cols": 40,
+      "has_output": false,
+      "rows": 3,
+      "screen": "G1s/MjVoG1ttG1tIG1tKGz4bWz8xbBtbPzIwMDRs",
+      "type": "snapshot"
+    },
+    {
+      "bytes": "G10wO2FnZW50IAd0aQ==",
+      "type": "output"
+    },
+    {
+      "bytes": "dGxlG1wbXTI7Q2xhdQ==",
+      "type": "output"
+    },
+    {
+      "bytes": "ZGUgPHNjcmlwdD5hbA==",
+      "type": "output"
+    },
+    {
+      "bytes": "ZXJ0KDEpPC9zY3JpcA==",
+      "type": "output"
+    },
+    {
+      "bytes": "dD4HG104OztodHRwcw==",
+      "type": "output"
+    },
+    {
+      "bytes": "Oi8vZXhhbXBsZS5jbw==",
+      "type": "output"
+    },
+    {
+      "bytes": "bS9kb2NzG1xkb2NzGw==",
+      "type": "output"
+    },
+    {
+      "bytes": "XTg7OxtcIBtdODs7ag==",
+      "type": "output"
+    },
+    {
+      "bytes": "YXZhc2NyaXB0OmFsZQ==",
+      "type": "output"
+    },
+    {
+      "bytes": "cnQoMSkbXGJhZBtdOA==",
+      "type": "output"
+    },
+    {
+      "bytes": "OzsbXCAbXTUyO2M7YQ==",
+      "type": "output"
+    },
+    {
+      "bytes": "R1ZzYkc4PQcbXTc7Zg==",
+      "type": "output"
+    },
+    {
+      "bytes": "aWxlOi8vL2V0YwcbXQ==",
+      "type": "output"
+    },
+    {
+      "bytes": "OTtub3RpZnkHG103Nw==",
+      "type": "output"
+    },
+    {
+      "bytes": "Nztub3RpZnk7YTtiBw==",
+      "type": "output"
+    },
+    {
+      "bytes": "G10xMzM3O0ZpbGU9Og==",
+      "type": "output"
+    },
+    {
+      "bytes": "QUFBQQcbUCtxNTQ0ZQ==",
+      "type": "output"
+    },
+    {
+      "bytes": "G1wbX0dmPTI0O0FBQQ==",
+      "type": "output"
+    },
+    {
+      "bytes": "QRtcG1BxIzA7MjswOw==",
+      "type": "output"
+    },
+    {
+      "bytes": "MDswIzB+fhtcdmlzaQ==",
+      "type": "output"
+    },
+    {
+      "bytes": "Ymxl",
+      "type": "output"
+    }
+  ],
+  "name": "untrusted_osc",
+  "source": "vt100-ctt 0.17.1 (TerminalHub mirror parser); snapshot = Screen::state_formatted()"
+}

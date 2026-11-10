@@ -604,6 +604,8 @@ fn frontend_with_required_input(spec: &'static CommandSpec) -> FakeCommandFronte
             argument.name.to_string(),
             if spec.name == "attach" && argument.name == "id" {
                 "term_00000000000000000000000000000001"
+            } else if spec.name == "link" {
+                "https://server.example"
             } else {
                 "placeholder"
             }
@@ -865,7 +867,6 @@ fn every_catalogue_command_leaf_is_buildable_by_dispatch() {
         &["remote", "exec"],
         &["remote", "session"],
         &["new"],
-        &["worker"],
     ];
 
     fn walk(

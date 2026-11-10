@@ -804,19 +804,11 @@ Available via: CLI, TUI
 
 ---
 
-## `awman worker`
+## `awman link`
 
-Link awman to a work server.
+Link this machine to a work server, or approve a browser link requested on this machine.
 
-Available via: CLI, TUI
-
-Runs without a working agent runtime — reachable even when the configured runtime cannot be started on this host.
-
-### `awman worker link`
-
-Approve a device link or store a server-issued token.
-
-Links this machine to a work server. The refresh token is stored as owner-only state, never in config.
+Use awman link https://server.example or awman link web-XXXX-XXXX. Browser approval requires an interactive terminal.
 
 Available via: CLI, TUI
 
@@ -824,13 +816,13 @@ Runs without a working agent runtime — reachable even when the configured runt
 
 | Argument | Kind | Required | Help |
 |---|---|---|---|
-| `server-url` | string | yes | HTTPS base URL of the work server. |
+| `target` | string | yes | A work server URL, or a browser code shown by the web app (web-XXXX-XXXX). |
 
 | Flag | Kind | Default | Implies | Conflicts | Frontends | Help |
 |---|---|---|---|---|---|---|
-| `--name` | string | — | — | — | CLI, TUI, API | Config name for this server (defaults to its host name). |
-| `--label` | string (repeatable) | [] | — | — | CLI, TUI, API | Owner-configured label k=v (repeatable). |
-| `--token` | string | — | — | — | CLI, TUI, API | Static token, or - to read from stdin; omit for device flow. |
+| `--name` | string | — | — | — | CLI | Server entry name. |
+| `--label` | string (repeatable) | [] | — | — | CLI | Worker label k=v (repeatable). |
+| `--token` | string | — | — | — | CLI | Static server token; - reads stdin. |
 
 ---
 

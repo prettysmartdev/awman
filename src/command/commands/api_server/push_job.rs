@@ -120,6 +120,7 @@ mod tests {
         CommandRecord {
             allow_remote_input: false,
             listener: "local".into(),
+            listener_name: None,
             trace_parent: None,
             id: id.into(),
             session_id: "ses_1".into(),

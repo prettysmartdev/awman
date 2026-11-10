@@ -73,9 +73,12 @@ fn defaults_come_from_the_key_table() {
             max_concurrent_jobs: 4,
         }
     );
-    assert_eq!(daemon.network.listen.to_string(), "127.0.0.1:9876");
     assert_eq!(
-        daemon.network.features,
+        daemon.network.listeners["default"].listen.to_string(),
+        "127.0.0.1:9876"
+    );
+    assert_eq!(
+        daemon.network.listeners["default"].features,
         [crate::data::daemon_state::FeatureName::Worker]
     );
     assert_eq!(ec.worker_push_interaction(), (Interaction::Headless, true));
@@ -618,14 +621,14 @@ fn old_runtime_spellings_are_rejected_with_the_valid_set() {
 #[test]
 fn builtin_network_ceiling_includes_trusted_overrides_and_repo_may_only_narrow() {
     let l = layers(
-        json!({"runtime": {"builtin": {"network": {"mode": "none"}}}}),
-        json!({"runtime": {"builtin": {"network": {"mode": "public"}}}}),
+        json!({"runtime": {"builtin": {"network":{"mode": "none"}}}}),
+        json!({"runtime": {"builtin": {"network":{"mode": "public"}}}}),
         None,
     );
     assert!(resolve(l).builtin_network().is_err());
     let mut l = layers(
         json!({}),
-        json!({"runtime": {"builtin": {"network": {"mode": "public"}}}}),
+        json!({"runtime": {"builtin": {"network":{"mode": "public"}}}}),
         None,
     );
     l.set = set(&[("runtime.builtin.network.mode", json!("none"))]);

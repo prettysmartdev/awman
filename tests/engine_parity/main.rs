@@ -11,3 +11,5 @@ mod security;
 #[path = "../helpers/engine_daemon.rs"]
 mod support;
 mod terminal;
+mod web_frontend;
+mod web_matrix;

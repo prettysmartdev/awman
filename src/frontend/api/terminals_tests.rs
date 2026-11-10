@@ -19,6 +19,102 @@ use crate::frontend::api::routes::{build_router_for_listener, ListenerPolicy};
 type Ws =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
+#[tokio::test]
+async fn terminal_payloads_never_enter_debug_or_trace_logs() {
+    use tracing::instrument::WithSubscriber;
+    use tracing_subscriber::util::SubscriberInitExt;
+    // Production initializes the log -> tracing bridge. Without this,
+    // tungstenite's `log::trace!` payload diagnostics would escape the test.
+    let _log_bridge = tracing::subscriber::NoSubscriber::default().set_default();
+    #[derive(Clone, Default)]
+    struct Sink(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Sink {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Sink {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self {
+            self.clone()
+        }
+    }
+    let d = daemon(ListenerPolicy::Local, true).await;
+    for level in [tracing::Level::DEBUG, tracing::Level::TRACE] {
+        let sink = Sink::default();
+        let dispatch = tracing::Dispatch::new(
+            tracing_subscriber::fmt()
+                .with_writer(sink.clone())
+                .with_ansi(false)
+                .with_max_level(level)
+                .finish(),
+        );
+        let (handle, _input) = d.register(TerminalOwner::Command(CommandId::new()), true);
+        handle.push_output(b"TERMINAL_OUTPUT_SENTINEL");
+        let viewer = viewer_identity(CommandListener::Local, &HeaderMap::new(), false).unwrap();
+        let session = terminals_open(&d.api.terminals, handle.id(), viewer).unwrap();
+        let session = Arc::new(std::sync::Mutex::new(Some(session)));
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let done = Arc::new(std::sync::Mutex::new(Some(done_tx)));
+        let router = axum::Router::new().route(
+            "/socket",
+            axum::routing::get(move |upgrade: WebSocketUpgrade| {
+                let session = session.lock().unwrap().take().unwrap();
+                let done = done.lock().unwrap().take().unwrap();
+                let dispatch = dispatch.clone();
+                async move {
+                    upgrade.on_upgrade(move |socket| {
+                        async move {
+                            tracing::debug!("terminal capture active");
+                            serve_terminal_socket(
+                                socket,
+                                session,
+                                tokio_util::sync::CancellationToken::new(),
+                                None,
+                            )
+                            .await;
+                            let _ = done.send(());
+                        }
+                        .with_subscriber(dispatch)
+                    })
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/socket"))
+            .await
+            .unwrap();
+        let _ = next_json(&mut ws).await; // initial snapshot contains output
+        ws.send(WsMessage::Text(
+            "{\"type\":\"invalid\",\"secret\":\"TERMINAL_INPUT_SENTINEL\"}".into(),
+        ))
+        .await
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), done_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        server.abort();
+        let bytes = sink.0.lock().unwrap();
+        let log = String::from_utf8_lossy(&bytes);
+        assert!(log.contains("terminal capture active"));
+        assert!(
+            !log.contains("TERMINAL_INPUT_SENTINEL"),
+            "input leaked at {level}: {log}"
+        );
+        assert!(
+            !log.contains("VEVSTUlOQUxfT1VUUFVUX1NFTlRJTkVM"),
+            "output leaked at {level}: {log}"
+        );
+    }
+}
+
 struct Daemon {
     _tmp: tempfile::TempDir,
     api: Arc<DaemonApi>,
@@ -33,6 +129,7 @@ fn config(home: &std::path::Path, remote_input: bool) -> crate::data::config::Ef
             global: ConfigFile::from_value(
                 serde_json::json!({"daemon": {
                     "features": {"worker": {"enabled": true}},
+                    "network":{"listeners":{"default":{"enabled":true}}},
                     "terminal": {"remoteInput": remote_input},
                 }}),
                 FileKind::Global,
@@ -54,7 +151,7 @@ async fn daemon(policy: ListenerPolicy, remote_input: bool) -> Daemon {
     let state = crate::frontend::api::routes::tests::make_test_state(tmp.path());
     *state.live_config.write().unwrap() = Some(config(tmp.path(), remote_input));
     let api = Arc::new(DaemonApi::for_worker_tests(state));
-    let key = matches!(policy, ListenerPolicy::Network).then(|| {
+    let key = matches!(policy, ListenerPolicy::Network { .. }).then(|| {
         api.runtime
             .keys()
             .create("viewer")
@@ -337,7 +434,13 @@ async fn removed_per_feature_terminal_paths_are_404() {
 
 #[tokio::test]
 async fn network_listener_serves_command_terminals_but_refuses_engine_tabs() {
-    let d = daemon(ListenerPolicy::Network, false).await;
+    let d = daemon(
+        ListenerPolicy::Network {
+            name: "default".into(),
+        },
+        false,
+    )
+    .await;
     let cmd = CommandId::new();
     let (command_term, _a) = d.register(TerminalOwner::Command(cmd.clone()), false);
     let (tab_term, _b) = d.register(TerminalOwner::Tab(TabId::new()), false);
@@ -591,7 +694,13 @@ async fn local_take_control_is_exclusive_and_logged_and_input_reaches_the_pty() 
 #[tokio::test]
 async fn network_input_is_refused_unless_both_settings_allow_it() {
     // remoteInput off, allow_remote_input on.
-    let d = daemon(ListenerPolicy::Network, false).await;
+    let d = daemon(
+        ListenerPolicy::Network {
+            name: "default".into(),
+        },
+        false,
+    )
+    .await;
     let (handle, _rx) = d.register(TerminalOwner::Command(CommandId::new()), true);
     let mut ws = d.connect(handle.id(), Some("webapp")).await;
     next_frame(&mut ws).await;
@@ -599,7 +708,13 @@ async fn network_input_is_refused_unless_both_settings_allow_it() {
     assert_eq!(next_json(&mut ws).await["code"], "input_not_allowed");
 
     // remoteInput on, allow_remote_input off.
-    let d = daemon(ListenerPolicy::Network, true).await;
+    let d = daemon(
+        ListenerPolicy::Network {
+            name: "default".into(),
+        },
+        true,
+    )
+    .await;
     let (handle, _rx) = d.register(TerminalOwner::Command(CommandId::new()), false);
     let mut ws = d.connect(handle.id(), Some("webapp")).await;
     next_frame(&mut ws).await;
@@ -609,7 +724,13 @@ async fn network_input_is_refused_unless_both_settings_allow_it() {
 
 #[tokio::test]
 async fn network_grant_is_named_by_the_actor_header() {
-    let d = daemon(ListenerPolicy::Network, true).await;
+    let d = daemon(
+        ListenerPolicy::Network {
+            name: "default".into(),
+        },
+        true,
+    )
+    .await;
     let cmd = CommandId::new();
     let mut events = d.bus(&cmd).await;
     let (handle, mut stdin) = d.register(TerminalOwner::Command(cmd), true);

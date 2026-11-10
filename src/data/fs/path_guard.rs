@@ -56,7 +56,7 @@ pub fn validate_under_root(root: &Path, resolved: &Path, reason: &str) -> Result
 /// components lexically. Those components do not exist, so none of them can be
 /// a symlink and resolving them lexically cannot hide a traversal — a trailing
 /// `..` pops a directory exactly as the kernel would.
-fn canonicalize_lenient(path: &Path) -> PathBuf {
+pub(crate) fn canonicalize_lenient(path: &Path) -> PathBuf {
     // Walk up to the deepest existing ancestor, collecting what we skip past.
     let mut tail: Vec<Component<'_>> = Vec::new();
     let mut cursor = path;

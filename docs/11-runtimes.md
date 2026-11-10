@@ -118,7 +118,7 @@ macOS only lets a program start a virtual machine when its code signature carrie
 
 ### Building from source
 
-Run `make payloads` once (it fetches and checksum-verifies the embedded kernel and guest agent for your host), then `make install`. On Apple Silicon, `make build`/`make install` include the builtin runtime when the payload verifies and **ad-hoc sign the binary with the hypervisor entitlement automatically** (`tools/macos-sign.sh`). On other hosts they build the existing runtimes only.
+Run `make payloads` once (it fetches and checksum-verifies the embedded kernel and guest agent for your host), then `make install`. On Apple Silicon, `make build`/`make install` require a verified payload, include the builtin runtime, and **ad-hoc sign the binary with the hypervisor entitlement automatically** (`tools/macos-sign.sh`). `make install` builds and signs as your user, uses `sudo` only if copying to the install directory requires it, and verifies the installed signature. On other hosts they build the existing runtimes only.
 
 If you copy, strip or otherwise change the binary afterwards, sign it again:
 

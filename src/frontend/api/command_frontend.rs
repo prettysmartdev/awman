@@ -79,6 +79,9 @@ use crate::engine::workflow::frontend::{ContainerSource, WorkflowFrontend};
 /// The API dispatch frontend. Emits typed events to an `EventBusSender`
 /// for distribution to logfile writers and SSE clients.
 pub struct ApiDispatchFrontend {
+    /// Initial prerequisite progress follows its structured report on the wire.
+    prerequisite_messages: Option<Vec<UserMessage>>,
+
     /// The run's resolved interaction (WI 0141), from Layer 2. `None` for a
     /// frontend built without one (tests, admission probes): piped.
     interaction: Option<crate::command::interaction::InteractionDecision>,
@@ -206,6 +209,7 @@ impl ApiDispatchFrontend {
             CommandCatalogue::get().parse_raw_args_with_profile(&path, args, frontend_kind);
 
         Self {
+            prerequisite_messages: None,
             interaction: None,
             pty_sink_sender: None,
             status_forwarder: None,
@@ -336,8 +340,17 @@ impl ApiDispatchFrontend {
     }
 }
 
+impl ApiDispatchFrontend {
+    fn flush_prerequisite_messages(&mut self) {
+        for message in self.prerequisite_messages.take().unwrap_or_default() {
+            emit_user_message(&self.container_sender(), message);
+        }
+    }
+}
+
 impl Drop for ApiDispatchFrontend {
     fn drop(&mut self) {
+        self.flush_prerequisite_messages();
         // The engine writes container output in arbitrary byte chunks. Anything
         // not terminated by `\n` lives in the line buffers — flush it as a
         // final event so SSE clients and `events.log` see the trailing line.
@@ -367,7 +380,11 @@ impl crate::engine::git::GitFrontend for ApiDispatchFrontend {}
 
 impl UserMessageSink for ApiDispatchFrontend {
     fn write_message(&mut self, msg: UserMessage) {
-        emit_user_message(&self.container_sender(), msg);
+        if let Some(messages) = &mut self.prerequisite_messages {
+            messages.push(msg);
+        } else {
+            emit_user_message(&self.container_sender(), msg);
+        }
     }
 
     fn replay_queued(&mut self) {}
@@ -1904,6 +1921,10 @@ impl crate::command::commands::agent_trust::AgentTrustFrontend for ApiDispatchFr
 impl crate::command::commands::workflow_prerequisites::WorkflowPrerequisiteFrontend
     for ApiDispatchFrontend
 {
+    fn begin_workflow_prerequisites(&mut self) {
+        self.prerequisite_messages.get_or_insert_with(Vec::new);
+    }
+
     fn show_workflow_prerequisites(
         &mut self,
         report: &crate::data::workflow_prerequisites::WorkflowPrerequisiteReport,
@@ -1913,6 +1934,7 @@ impl crate::command::commands::workflow_prerequisites::WorkflowPrerequisiteFront
             phase: report.phase,
             report: report.clone(),
         });
+        self.flush_prerequisite_messages();
         Ok(())
     }
 
@@ -2642,5 +2664,53 @@ mod tests {
         // explicit cleanup must clear this command's ownership of the path.
         frontend.report_worktree_discarded("branch");
         assert!(writer.kept_worktree().is_none());
+    }
+}
+
+#[cfg(test)]
+mod prerequisite_order_tests {
+    use super::*;
+    use crate::command::commands::workflow_prerequisites::{
+        PrerequisiteReportNext, WorkflowPrerequisiteFrontend,
+    };
+    use crate::data::workflow_prerequisites::{
+        PrerequisiteOrigin, PrerequisitePhase, WorkflowPrerequisiteReport,
+    };
+
+    #[test]
+    fn prerequisite_report_precedes_buffered_progress_without_dropping_messages() {
+        let bus = crate::command::commands::api_server::event_bus::EventBus::new(16);
+        let mut events = bus.subscribe();
+        let mut frontend = ApiDispatchFrontend::new("exec workflow", &[], bus.sender());
+        frontend.begin_workflow_prerequisites();
+        frontend.write_message(UserMessage {
+            level: crate::data::message::MessageLevel::Info,
+            text: "checking prerequisites".into(),
+        });
+        assert!(events.try_recv().is_err());
+        let report = WorkflowPrerequisiteReport {
+            phase: PrerequisitePhase::Start,
+            origin: PrerequisiteOrigin::Static,
+            checks: vec![],
+            advisories: vec![],
+            notes: vec![],
+        };
+        frontend
+            .show_workflow_prerequisites(&report, PrerequisiteReportNext::Decided)
+            .unwrap();
+        assert!(matches!(
+            events.try_recv().unwrap().payload,
+            EventPayload::WorkflowPrerequisites { .. }
+        ));
+        assert!(
+            matches!(events.try_recv().unwrap().payload, EventPayload::StatusMessage { message, .. } if message == "checking prerequisites")
+        );
+        frontend.write_message(UserMessage {
+            level: crate::data::message::MessageLevel::Info,
+            text: "after preflight".into(),
+        });
+        assert!(
+            matches!(events.try_recv().unwrap().payload, EventPayload::StatusMessage { message, .. } if message == "after preflight")
+        );
     }
 }

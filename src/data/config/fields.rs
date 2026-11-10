@@ -735,7 +735,7 @@ pub const CONFIG_KEYS: &[ConfigKey] = &[
         "Accept terminal input from network clients.",
     ),
     row(
-        "daemon.network.enabled",
+        "daemon.network.listeners.*.enabled",
         Bool,
         "false",
         Global,
@@ -743,15 +743,15 @@ pub const CONFIG_KEYS: &[ConfigKey] = &[
         "Serve the API on the network listener.",
     ),
     row(
-        "daemon.network.listen",
+        "daemon.network.listeners.*.listen",
         ValueKind::String,
-        "\"127.0.0.1:9876\"",
+        "null",
         Global,
         false,
         "host:port the API listener binds; changing it needs a daemon restart.",
     ),
     row(
-        "daemon.network.tlsSans",
+        "daemon.network.listeners.*.tlsSans",
         StringList,
         "[]",
         Global,
@@ -759,12 +759,28 @@ pub const CONFIG_KEYS: &[ConfigKey] = &[
         "Extra names in the listener's TLS certificate.",
     ),
     row(
-        "daemon.network.features",
+        "daemon.network.listeners.*.features",
         StringList,
-        "[\"worker\"]",
+        "[]",
         Global,
         true,
         "Features served on the network listener.",
+    ),
+    row(
+        "daemon.network.listeners.*.transport",
+        ValueKind::Enum(&["tls", "loopback_http"]),
+        "\"tls\"",
+        Global,
+        true,
+        "Listener transport; plain HTTP requires a literal loopback address.",
+    ),
+    row(
+        "daemon.network.listeners.*.allowedOrigins",
+        StringList,
+        "[]",
+        Global,
+        true,
+        "Exact browser origins allowed on this listener.",
     ),
     row(
         "daemon.features.squad.enabled",
@@ -1087,13 +1103,6 @@ pub const MOVED_KEYS: &[(&str, &str, Option<&str>)] = &[
     ("workers", "daemon.maxConcurrentJobs", None),
     ("api", "daemon.features.worker.push", None),
     (
-        "api.bind",
-        "daemon.network.listen",
-        Some("\"0.0.0.0:9876\""),
-    ),
-    ("api.tls", "daemon.network.tlsSans", None),
-    ("api.tlsSans", "daemon.network.tlsSans", None),
-    (
         "api.key",
         "(removed) use `awman daemon api keys.create`",
         None,
@@ -1117,11 +1126,6 @@ pub const MOVED_KEYS: &[(&str, &str, Option<&str>)] = &[
         "api.alwaysNonInteractive",
         "daemon.features.worker.push.allowOverride",
         Some("false (with interaction: \"headless\")"),
-    ),
-    (
-        "api.port",
-        "daemon.network.listen",
-        Some("\"127.0.0.1:9876\""),
     ),
     (
         "squad.maxConcurrentEvaluations",
@@ -1664,7 +1668,7 @@ pub fn validate_value(key: &ConfigKey, value: &Value) -> Result<(), KeyError> {
             if !value.is_string() {
                 return Err(invalid(format!("expected a string, got {shown}")));
             }
-            if key.path == "daemon.network.listen" {
+            if key.path == "daemon.network.listeners.*.listen" {
                 super::network::ListenAddr::parse(value.as_str().unwrap())
                     .map_err(|e| invalid(e.to_string()))?;
             }
@@ -1699,16 +1703,24 @@ pub fn validate_value(key: &ConfigKey, value: &Value) -> Result<(), KeyError> {
                 items.iter().all(|item| {
                     let Some(s) = item.as_str() else { return false };
                     match key.path {
-                        "daemon.network.tlsSans" => super::network::TlsSan::parse(s).is_ok(),
-                        "daemon.network.features" => ["squad", "worker", "engine"].contains(&s),
+                        "daemon.network.listeners.*.tlsSans" => {
+                            super::network::TlsSan::parse(s).is_ok()
+                        }
+                        "daemon.network.listeners.*.allowedOrigins" => {
+                            super::network::BrowserOrigin::parse(s).is_ok()
+                        }
+                        "daemon.network.listeners.*.features" => {
+                            ["squad", "worker", "engine"].contains(&s)
+                        }
                         _ => true,
                     }
                 })
             });
             if !ok {
                 let expected = match key.path {
-                    "daemon.network.tlsSans" => "a list of DNS names or IP literals",
-                    "daemon.network.features" => "a list containing only squad, worker, or engine",
+                    "daemon.network.listeners.*.tlsSans" => "a list of DNS names or IP literals",
+                    "daemon.network.listeners.*.allowedOrigins" => "exact origin like https://host or http://localhost:3000; no wildcard, null, path or userinfo",
+                    "daemon.network.listeners.*.features" => "a list containing only squad, worker, or engine",
                     _ => "a list of strings",
                 };
                 return Err(invalid(format!("expected {expected}, got {shown}")));
@@ -1753,7 +1765,21 @@ pub fn validate_document(document: &Value, kind: FileKind) -> Result<(), KeyErro
             reason: format!("a config file must be a JSON object, got {document}"),
         });
     };
-    walk(object, "", "", kind)
+    walk(object, "", "", kind)?;
+    if let Some(daemon) = document.get("daemon") {
+        let config: super::daemon::DaemonConfig =
+            serde_json::from_value(daemon.clone()).map_err(|e| KeyError::Value {
+                path: "daemon".into(),
+                reason: e.to_string(),
+            })?;
+        super::network::validate_network_config(&config.network.unwrap_or_default()).map_err(
+            |reason| KeyError::Value {
+                path: "daemon.network.listeners".into(),
+                reason,
+            },
+        )?;
+    }
+    Ok(())
 }
 
 fn walk(
@@ -2473,18 +2499,24 @@ mod daemon_config_tests {
         for path in [
             "daemon.maxConcurrentJobs",
             "daemon.terminal.remoteInput",
-            "daemon.network.enabled",
-            "daemon.network.tlsSans",
-            "daemon.network.features",
+            "daemon.network.listeners.*.enabled",
+            "daemon.network.listeners.*.tlsSans",
+            "daemon.network.listeners.*.features",
             "daemon.features.squad.enabled",
             "daemon.features.worker.enabled",
             "daemon.features.engine.enabled",
         ] {
-            assert!(is_live(path), "{path} should be live");
+            assert!(
+                is_live(&path.replace('*', "default")),
+                "{path} should be live"
+            );
             assert_eq!(daemon_key(path).scope, KeyScope::Global, "{path}");
         }
-        assert!(!is_live("daemon.network.listen"));
-        assert_eq!(daemon_key("daemon.network.listen").scope, KeyScope::Global);
+        assert!(!is_live("daemon.network.listeners.*.listen"));
+        assert_eq!(
+            daemon_key("daemon.network.listeners.*.listen").scope,
+            KeyScope::Global
+        );
         assert_eq!(daemon_key("daemon.maxConcurrentJobs").default, "4");
     }
 
@@ -2524,21 +2556,21 @@ mod daemon_config_tests {
     fn daemon_network_values_validate_and_invalid_sans_are_not_accepted() {
         for listen in ["127.0.0.1:9876", "[::]:9876", "[2001:db8::1]:443"] {
             assert!(validate_value(
-                daemon_key("daemon.network.listen"),
+                daemon_key("daemon.network.listeners.*.listen"),
                 &Value::String(listen.into())
             )
             .is_ok());
         }
         for listen in ["127.0.0.1", "[::]"] {
             assert!(validate_value(
-                daemon_key("daemon.network.listen"),
+                daemon_key("daemon.network.listeners.*.listen"),
                 &Value::String(listen.into())
             )
             .is_err());
         }
-        let valid = serde_json::json!({"daemon": {"network": {"tlsSans": ["api.example.org", "192.0.2.1", "2001:db8::1"]}}});
+        let valid = serde_json::json!({"daemon": {"network":{"listeners":{"default":{"tlsSans": ["api.example.org", "192.0.2.1", "2001:db8::1"]}}}}});
         assert!(validate_document(&valid, FileKind::Global).is_ok());
-        let invalid = serde_json::json!({"daemon": {"network": {"tlsSans": ["bad_name.example"]}}});
+        let invalid = serde_json::json!({"daemon": {"network":{"listeners":{"default":{"tlsSans": ["bad_name.example"]}}}}});
         let before = invalid.clone();
         assert!(validate_document(&invalid, FileKind::Global).is_err());
         assert_eq!(
@@ -2550,7 +2582,7 @@ mod daemon_config_tests {
     #[test]
     fn removed_api_squad_and_workers_keys_are_unknown_with_move_hints() {
         for (path, expected_hint) in [
-            ("api.bind", "daemon.network.listen"),
+            ("api.bind", "daemon.features.worker.push"),
             ("api.oldOption", "daemon.features.worker.push"),
             ("squad.oldOption", "daemon.features.squad"),
             ("workers", "daemon.maxConcurrentJobs"),
@@ -2562,6 +2594,20 @@ mod daemon_config_tests {
         let config = serde_json::json!({"api": {"bind": "0.0.0.0:9876"}});
         let err = validate_document(&config, FileKind::Global).unwrap_err();
         assert!(matches!(err, KeyError::Unknown { .. }), "{err}");
-        assert!(err.to_string().contains("daemon.network.listen"), "{err}");
+        assert!(
+            err.to_string().contains("daemon.features.worker.push"),
+            "{err}"
+        );
+    }
+}
+
+/// Map members supplied by the built-in configuration even without a file.
+pub fn builtin_member_names(prefix: &str) -> &'static [&'static str] {
+    match prefix {
+        "daemon.network.listeners" => &[
+            super::network::DEFAULT_LISTENER,
+            super::network::LOOPBACK_LISTENER,
+        ],
+        _ => &[],
     }
 }

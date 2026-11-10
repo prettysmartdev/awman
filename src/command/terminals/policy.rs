@@ -15,7 +15,7 @@ pub struct AccessPolicy {
     /// The features the network listener serves: listed in
     /// `daemon.network.features` *and* enabled by config (persistently). An
     /// engine tab's terminals are local only unless `engine` is here.
-    pub network_features: Vec<FeatureName>,
+    pub network_features: std::collections::BTreeMap<String, Vec<FeatureName>>,
     /// `daemon.terminal.remoteInput`: one half of the network-input gate.
     pub remote_input: bool,
 }
@@ -35,9 +35,9 @@ impl AccessPolicy {
             return Ok(());
         }
         let served = match &record.owner_id {
-            TerminalOwner::Command(_) => self.network_serves(FeatureName::Worker),
-            TerminalOwner::Tab(_) => self.network_serves(FeatureName::Engine),
-            TerminalOwner::Run(_) => self.network_serves(FeatureName::Squad),
+            TerminalOwner::Command(_) => self.network_serves(viewer, FeatureName::Worker),
+            TerminalOwner::Tab(_) => self.network_serves(viewer, FeatureName::Engine),
+            TerminalOwner::Run(_) => self.network_serves(viewer, FeatureName::Squad),
             TerminalOwner::Lease(_) => false,
         };
         if served {
@@ -57,6 +57,16 @@ impl AccessPolicy {
         }
         match viewer.listener {
             CommandListener::Local => true,
+            // A browser viewer on a browser listener is an instance frontend,
+            // not a remote network viewer: `remoteInput` does not gate it (D13).
+            CommandListener::Network
+                if matches!(
+                    viewer.principal,
+                    crate::data::daemon_state::Principal::Browser { .. }
+                ) =>
+            {
+                true
+            }
             CommandListener::Network => {
                 self.remote_input
                     && record.allow_remote_input
@@ -65,8 +75,12 @@ impl AccessPolicy {
         }
     }
 
-    fn network_serves(&self, feature: FeatureName) -> bool {
-        self.network_features.contains(&feature)
+    fn network_serves(&self, viewer: &ViewerIdentity, feature: FeatureName) -> bool {
+        viewer
+            .listener_name
+            .as_ref()
+            .and_then(|name| self.network_features.get(name))
+            .is_some_and(|features| features.contains(&feature))
     }
 }
 
@@ -148,6 +162,8 @@ mod tests {
 
     fn network(actor: Option<&str>) -> ViewerIdentity {
         ViewerIdentity {
+            principal: crate::data::daemon_state::Principal::Owner,
+            listener_name: Some("default".into()),
             listener: CommandListener::Network,
             actor: actor.map(str::to_owned),
             annotations: Annotations::new(),
@@ -170,10 +186,36 @@ mod tests {
         }
     }
 
+    /// D13: a browser viewer is an instance frontend; `remoteInput` and the
+    /// record's `allow_remote_input` do not gate it, `read_only` still does.
+    #[test]
+    fn browser_viewers_hold_input_without_remote_input() {
+        let policy = AccessPolicy {
+            network_features: [("loopback".into(), vec![FeatureName::Engine])].into(),
+            remote_input: false,
+        };
+        let tab = record(TerminalOwner::Tab(TabId::new()), false);
+        let mut browser = network(Some("brw_00000000000000000000000000000000"));
+        browser.listener_name = Some("loopback".into());
+        browser.principal = crate::data::daemon_state::Principal::Browser {
+            grant_id: "brw_00000000000000000000000000000000".into(),
+            origin: "https://awman.prettysmart.dev".into(),
+            listener: "loopback".into(),
+        };
+        assert!(policy.admit(&tab, &browser).is_ok());
+        assert!(policy.input_allowed(&tab, &browser));
+        browser.read_only = true;
+        assert!(!policy.input_allowed(&tab, &browser));
+        // An API-key viewer on the same listener stays gated.
+        let mut key = network(Some("ci"));
+        key.listener_name = Some("loopback".into());
+        assert!(!policy.input_allowed(&tab, &key));
+    }
+
     #[test]
     fn network_admission_follows_the_owner_feature() {
         let worker_only = AccessPolicy {
-            network_features: vec![FeatureName::Worker],
+            network_features: [("default".into(), vec![FeatureName::Worker])].into(),
             remote_input: false,
         };
         let cmd = record(TerminalOwner::Command(CommandId::new()), false);
@@ -189,7 +231,11 @@ mod tests {
             Err(TerminalRefusal::NetworkRefused)
         );
         let with_engine = AccessPolicy {
-            network_features: vec![FeatureName::Worker, FeatureName::Engine],
+            network_features: [(
+                "default".into(),
+                vec![FeatureName::Worker, FeatureName::Engine],
+            )]
+            .into(),
             remote_input: false,
         };
         assert!(with_engine.admit(&tab, &network(None)).is_ok());
@@ -202,7 +248,7 @@ mod tests {
     #[test]
     fn network_input_needs_both_settings_and_an_actor() {
         let on = AccessPolicy {
-            network_features: vec![FeatureName::Worker],
+            network_features: [("default".into(), vec![FeatureName::Worker])].into(),
             remote_input: true,
         };
         let off = AccessPolicy {

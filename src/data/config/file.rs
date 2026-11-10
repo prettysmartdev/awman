@@ -254,8 +254,10 @@ mod tests {
     fn sample(key: &fields::ConfigKey) -> serde_json::Value {
         use serde_json::json;
         match key.path {
-            "daemon.network.features" => return json!(["worker"]),
-            "daemon.network.listen" => return json!("127.0.0.1:9876"),
+            "daemon.network.listeners.*.transport" => return json!("tls"),
+            "daemon.network.listeners.*.allowedOrigins" => return json!(["http://localhost:3000"]),
+            "daemon.network.listeners.*.features" => return json!(["worker"]),
+            "daemon.network.listeners.*.listen" => return json!("127.0.0.1:9876"),
             "runtime.builtin.stateDir" => return json!("/state"),
             "runtime.builtin.imageSource" | "runtime.builtin.images.*" => {
                 return json!({"type": "registry", "registry": "localhost:5000"});

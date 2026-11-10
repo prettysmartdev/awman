@@ -315,7 +315,7 @@ fn explain_unreachable(addr: Option<&str>, error: CommandError) -> CommandError 
     };
     let hint = if RemoteClient::is_loopback_addr(addr) {
         format!(
-            "is the awman daemon running on this machine at {addr} with its network listener on? Start it with `awman daemon start` and set `daemon.network.enabled true`"
+            "is the awman daemon running on this machine at {addr} with its network listener on? Start it with `awman daemon start` and set `daemon.network.listeners.default.enabled true`"
         )
     } else {
         format!(

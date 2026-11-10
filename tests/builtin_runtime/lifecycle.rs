@@ -177,7 +177,7 @@ fn builtin_hw_actual_awman_cli_synthetic_agent_exit_37() {
             "builtin": {
                 "stateDir": state.path().join("s"),
                 "imageSource": {"type": "archive", "path": archive},
-                "network": {"mode": "none"}
+                "network":{"mode": "none"}
             }
         }))
         .unwrap(),

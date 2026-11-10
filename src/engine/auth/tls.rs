@@ -2,11 +2,11 @@
 //!
 //! The network listener is TLS only. Its certificate is generated on first
 //! use under `<data>/daemon/tls/` and covers a fixed set of loopback names
-//! plus whatever the operator lists in `daemon.network.tlsSans`:
+//! plus whatever the operator lists in `daemon.network.listeners.*.tlsSans`:
 //!
 //! * always `localhost`, `127.0.0.1` and `::1`;
 //! * the listen IP, unless it is unspecified (`0.0.0.0` / `[::]`);
-//! * every `daemon.network.tlsSans` entry (DNS name or IP literal).
+//! * every `daemon.network.listeners.*.tlsSans` entry (DNS name or IP literal).
 //!
 //! `tls/sans.json` records the set a certificate was made for. When the
 //! wanted set differs, [`AuthEngine::ensure_network_tls`] makes a new key and
@@ -63,10 +63,12 @@ struct SansRecord {
 
 /// The SAN set for a listen IP and the configured extras, canonical and
 /// sorted: IPs in `IpAddr` display form, DNS names lowercase.
-pub fn network_sans(listen_ip: IpAddr, extra: &[TlsSan]) -> Vec<String> {
+pub fn network_sans(listen_ips: &[IpAddr], extra: &[TlsSan]) -> Vec<String> {
     let mut set: BTreeSet<String> = ALWAYS_SANS.iter().map(|s| s.to_string()).collect();
-    if !listen_ip.is_unspecified() {
-        set.insert(listen_ip.to_string());
+    for listen_ip in listen_ips {
+        if !listen_ip.is_unspecified() {
+            set.insert(listen_ip.to_string());
+        }
     }
     for san in extra {
         set.insert(match san {
@@ -88,10 +90,10 @@ impl AuthEngine {
     pub fn ensure_network_tls(
         &self,
         paths: &DaemonPaths,
-        listen_ip: IpAddr,
+        listen_ips: &[IpAddr],
         extra: &[TlsSan],
     ) -> Result<(TlsIdentity, bool), EngineError> {
-        let wanted = network_sans(listen_ip, extra);
+        let wanted = network_sans(listen_ips, extra);
         if let Some(identity) = self.load_network_tls(paths)? {
             if identity.sans == wanted {
                 return Ok((identity, false));
@@ -317,16 +319,16 @@ mod tests {
 
     #[test]
     fn san_set_always_has_loopback_and_skips_unspecified_listen() {
-        let any = network_sans(IpAddr::V4(Ipv4Addr::UNSPECIFIED), &[]);
+        let any = network_sans(&[IpAddr::V4(Ipv4Addr::UNSPECIFIED)], &[]);
         assert_eq!(any, vec!["127.0.0.1", "::1", "localhost"]);
-        let any6 = network_sans(IpAddr::V6(Ipv6Addr::UNSPECIFIED), &[]);
+        let any6 = network_sans(&[IpAddr::V6(Ipv6Addr::UNSPECIFIED)], &[]);
         assert_eq!(any6, any);
     }
 
     #[test]
     fn san_set_adds_listen_ip_and_extras_canonically() {
         let sans = network_sans(
-            "10.0.0.5".parse().unwrap(),
+            &["10.0.0.5".parse().unwrap()],
             &[
                 TlsSan::Dns("Awman.Internal".into()),
                 TlsSan::Ip("fd00::0001".parse().unwrap()),

@@ -47,6 +47,13 @@ pub enum Operation {
     EngineDialogsList,
     EngineDialogsAnswer,
     EngineUiRequests,
+    EngineCatalogue,
+    EnginePrompts,
+    EngineLaunchContextsList,
+    EngineLaunchContextsCreate,
+    EngineLaunchContextsRefresh,
+    EngineLaunchContextsDelete,
+
     CoreHealth,
     CoreFeaturesPatch,
     CoreKeysList,
@@ -99,6 +106,14 @@ pub enum Operation {
     SquadEnvGet,
     SquadEnvPut,
     SquadEnvClear,
+    // WI 0159: browser pairing and grants.
+    BrowserLinksCreate,
+    BrowserLinksPoll,
+    BrowserLinksLookup,
+    BrowserLinksDecide,
+    BrowsersList,
+    BrowsersDelete,
+    BrowserTicketsCreate,
 }
 impl Operation {
     pub fn owner(self) -> Feature {
@@ -114,7 +129,13 @@ impl Operation {
             | Self::EngineTabsPatch
             | Self::EngineDialogsList
             | Self::EngineDialogsAnswer
-            | Self::EngineUiRequests => Feature::Engine,
+            | Self::EngineUiRequests
+            | Self::EngineCatalogue
+            | Self::EnginePrompts
+            | Self::EngineLaunchContextsList
+            | Self::EngineLaunchContextsCreate
+            | Self::EngineLaunchContextsRefresh
+            | Self::EngineLaunchContextsDelete => Feature::Engine,
             Self::CoreHealth
             | Self::CoreFeaturesPatch
             | Self::CoreKeysList
@@ -168,6 +189,12 @@ impl Operation {
             Self::SquadEnvGet => Feature::Squad,
             Self::SquadEnvPut => Feature::Squad,
             Self::SquadEnvClear => Feature::Squad,
+            Self::BrowserLinksCreate
+            | Self::BrowserLinksPoll
+            | Self::BrowserLinksLookup
+            | Self::BrowserLinksDecide
+            | Self::BrowserTicketsCreate => Feature::Engine,
+            Self::BrowsersList | Self::BrowsersDelete => Feature::Core,
         }
     }
     pub fn name(self) -> &'static str {
@@ -183,7 +210,14 @@ impl Operation {
             Self::EngineTabsPatch => "engine.tabs.patch",
             Self::EngineDialogsList => "engine.dialogs.list",
             Self::EngineDialogsAnswer => "engine.dialogs.answer",
+            Self::EngineCatalogue => "engine.catalogue",
+            Self::EnginePrompts => "engine.prompts",
             Self::EngineUiRequests => "engine.ui.requests",
+            Self::EngineLaunchContextsList => "engine.launch_contexts.list",
+            Self::EngineLaunchContextsCreate => "engine.launch_contexts.create",
+            Self::EngineLaunchContextsRefresh => "engine.launch_contexts.refresh",
+            Self::EngineLaunchContextsDelete => "engine.launch_contexts.delete",
+
             Self::CoreHealth => "core.health",
             Self::CoreFeaturesPatch => "core.features.patch",
             Self::CoreKeysList => "core.keys.list",
@@ -236,6 +270,13 @@ impl Operation {
             Self::SquadEnvGet => "squad.env.get",
             Self::SquadEnvPut => "squad.env.put",
             Self::SquadEnvClear => "squad.env.clear",
+            Self::BrowserLinksCreate => "browser.links.create",
+            Self::BrowserLinksPoll => "browser.links.poll",
+            Self::BrowserLinksLookup => "browser.links.lookup",
+            Self::BrowserLinksDecide => "browser.links.decide",
+            Self::BrowsersList => "browsers.list",
+            Self::BrowsersDelete => "browsers.delete",
+            Self::BrowserTicketsCreate => "browser.tickets.create",
         }
     }
     pub fn creates(self) -> bool {
@@ -268,22 +309,26 @@ impl Feature {
 }
 impl Operation {
     pub fn local_only(self) -> bool {
-        self.owner() == Feature::Engine
-            || matches!(
-                self,
-                Self::CoreConfigGet
-                    | Self::CoreConfigReload
-                    | Self::CoreFeaturesPatch
-                    | Self::CoreKeysList
-                    | Self::CoreKeysCreate
-                    | Self::CoreKeysDelete
-                    | Self::CoreGrantsList
-                    | Self::CoreGrantsDelete
-            )
-            || self.pull()
+        matches!(
+            self,
+            Self::EngineLaunchContextsCreate
+                | Self::EngineLaunchContextsRefresh
+                | Self::EngineLaunchContextsDelete
+                | Self::CoreConfigGet
+                | Self::CoreConfigReload
+                | Self::CoreFeaturesPatch
+                | Self::CoreKeysList
+                | Self::CoreKeysCreate
+                | Self::CoreKeysDelete
+                | Self::CoreGrantsList
+                | Self::CoreGrantsDelete
+                | Self::BrowserLinksLookup
+                | Self::BrowserLinksDecide
+                | Self::BrowsersList
+                | Self::BrowsersDelete
+        ) || self.pull()
     }
-    /// The pull routes (WI 0143). Pull is exposed on the daemon's own API
-    /// only: they are local-only and 404 on the network listener.
+    /// The pull routes (WI 0143) remain owner-socket only.
     pub fn pull(self) -> bool {
         matches!(
             self,
@@ -300,7 +345,267 @@ impl Operation {
                 | Self::WorkerLeasesCheckout
         )
     }
+    /// Served only to browser requests on a browser listener: the pairing
+    /// routes and upgrade tickets. Never reachable with an API key or on
+    /// the owner socket.
+    pub fn browser_only(self) -> bool {
+        matches!(
+            self,
+            Self::BrowserLinksCreate | Self::BrowserLinksPoll | Self::BrowserTicketsCreate
+        )
+    }
+    /// Squad env routes carry secrets; owner and API keys only (D11).
+    pub fn is_squad_env(self) -> bool {
+        matches!(
+            self,
+            Self::SquadEnvGet | Self::SquadEnvPut | Self::SquadEnvClear
+        )
+    }
     pub fn unauthenticated(self) -> bool {
         self == Self::CoreHealth
+    }
+}
+
+impl Operation {
+    /// Listener-local authority; feature lifecycle admission is evaluated by
+    /// the runtime as well. API keys never reach browser-only routes; browser
+    /// grants reach only engine routes plus read-only status/terminal routes,
+    /// squad (minus env secrets) where served, and never worker (WI 0159).
+    pub fn allowed_for(
+        self,
+        principal: &crate::data::daemon_state::Principal,
+        settings: &crate::data::config::daemon::ListenerSettings,
+    ) -> bool {
+        match principal {
+            crate::data::daemon_state::Principal::Owner => true,
+            crate::data::daemon_state::Principal::ApiKey { .. } => {
+                settings.enabled
+                    && !self.local_only()
+                    && !self.browser_only()
+                    && self
+                        .owner()
+                        .feature_name()
+                        .is_none_or(|f| settings.features.contains(&f))
+            }
+            crate::data::daemon_state::Principal::Browser { .. } => {
+                use crate::data::daemon_state::FeatureName;
+                settings.enabled
+                    && settings.transport
+                        == crate::data::config::network::ListenerTransport::LoopbackHttp
+                    && settings.features.contains(&FeatureName::Engine)
+                    && !self.local_only()
+                    && match self.owner() {
+                        Feature::Engine => true,
+                        Feature::Core => matches!(
+                            self,
+                            Self::CoreStatus
+                                | Self::CoreTerminalsList
+                                | Self::CoreTerminalsGet
+                                | Self::CoreHealth
+                        ),
+                        Feature::Squad => {
+                            settings.features.contains(&FeatureName::Squad) && !self.is_squad_env()
+                        }
+                        Feature::Worker => false,
+                    }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data::config::network::ListenerTransport;
+    use crate::data::daemon_state::{FeatureName, Principal};
+
+    /// Every operation, so a new variant must be classified here.
+    const ALL: &[Operation] = &[
+        Operation::EngineInstancesList,
+        Operation::EngineInstancesCreate,
+        Operation::EngineInstancesGet,
+        Operation::EngineInstancesDelete,
+        Operation::EngineInstancesPatch,
+        Operation::EngineInstancesFrontend,
+        Operation::EngineTabsList,
+        Operation::EngineTabsGet,
+        Operation::EngineTabsPatch,
+        Operation::EngineDialogsList,
+        Operation::EngineDialogsAnswer,
+        Operation::EngineUiRequests,
+        Operation::EngineCatalogue,
+        Operation::EnginePrompts,
+        Operation::EngineLaunchContextsList,
+        Operation::EngineLaunchContextsCreate,
+        Operation::EngineLaunchContextsRefresh,
+        Operation::EngineLaunchContextsDelete,
+        Operation::CoreHealth,
+        Operation::CoreFeaturesPatch,
+        Operation::CoreKeysList,
+        Operation::CoreKeysCreate,
+        Operation::CoreKeysDelete,
+        Operation::CoreStatus,
+        Operation::CoreConfigGet,
+        Operation::CoreConfigReload,
+        Operation::CoreFeaturesList,
+        Operation::CoreFeaturesGet,
+        Operation::CoreGrantsList,
+        Operation::CoreGrantsDelete,
+        Operation::CoreTerminalsList,
+        Operation::CoreTerminalsGet,
+        Operation::WorkerWorkdirs,
+        Operation::WorkerSessionsList,
+        Operation::WorkerSessionsCreate,
+        Operation::WorkerSessionsGet,
+        Operation::WorkerSessionsDelete,
+        Operation::WorkerSessionsQueue,
+        Operation::WorkerCommandsList,
+        Operation::WorkerCommandsCreate,
+        Operation::WorkerCommandsGet,
+        Operation::WorkerCommandsCancel,
+        Operation::WorkerCommandsEvents,
+        Operation::WorkerCommandsWorkflow,
+        Operation::WorkerCommandsOutputs,
+        Operation::WorkerCommandsOutput,
+        Operation::WorkerRunsCreate,
+        Operation::SquadTasksList,
+        Operation::SquadTasksCreate,
+        Operation::SquadTasksGet,
+        Operation::SquadTasksUpdate,
+        Operation::SquadTasksDelete,
+        Operation::SquadTasksWorkflow,
+        Operation::SquadRunsCreate,
+        Operation::SquadRunsList,
+        Operation::SquadRunsCancel,
+        Operation::SquadEnvGet,
+        Operation::SquadEnvPut,
+        Operation::SquadEnvClear,
+        Operation::BrowserLinksCreate,
+        Operation::BrowserLinksPoll,
+        Operation::BrowserLinksLookup,
+        Operation::BrowserLinksDecide,
+        Operation::BrowsersList,
+        Operation::BrowsersDelete,
+        Operation::BrowserTicketsCreate,
+    ];
+
+    fn listener(
+        transport: ListenerTransport,
+        features: &[FeatureName],
+    ) -> crate::data::config::daemon::ListenerSettings {
+        let mut settings = crate::data::config::EffectiveConfig::resolve(
+            Default::default(),
+            Default::default(),
+            crate::data::config::env::EnvSnapshot::empty(),
+        )
+        .unwrap()
+        .daemon()
+        .network
+        .listeners
+        .remove("loopback")
+        .unwrap();
+        settings.enabled = true;
+        settings.transport = transport;
+        settings.features = features.to_vec();
+        settings
+    }
+
+    fn browser() -> Principal {
+        Principal::Browser {
+            grant_id: "brw_00000000000000000000000000000000".into(),
+            origin: "https://awman.prettysmart.dev".into(),
+            listener: "loopback".into(),
+        }
+    }
+
+    #[test]
+    fn browser_principal_authority_matrix() {
+        use FeatureName::*;
+        let feature_sets: &[&[FeatureName]] = &[
+            &[],
+            &[Engine],
+            &[Engine, Squad],
+            &[Engine, Squad, Worker],
+            &[Squad, Worker],
+        ];
+        for transport in [ListenerTransport::LoopbackHttp, ListenerTransport::Tls] {
+            for features in feature_sets {
+                let settings = listener(transport, features);
+                for op in ALL {
+                    let expected = transport == ListenerTransport::LoopbackHttp
+                        && features.contains(&Engine)
+                        && !op.local_only()
+                        && match op.owner() {
+                            Feature::Engine => true,
+                            Feature::Core => matches!(
+                                op,
+                                Operation::CoreStatus
+                                    | Operation::CoreTerminalsList
+                                    | Operation::CoreTerminalsGet
+                                    | Operation::CoreHealth
+                            ),
+                            Feature::Squad => features.contains(&Squad) && !op.is_squad_env(),
+                            Feature::Worker => false,
+                        };
+                    assert_eq!(
+                        op.allowed_for(&browser(), &settings),
+                        expected,
+                        "{} on {transport:?} {features:?}",
+                        op.name()
+                    );
+                }
+            }
+        }
+        // Spot checks that the matrix encodes the design, not just itself.
+        let settings = listener(ListenerTransport::LoopbackHttp, &[Engine, Squad, Worker]);
+        for (op, allowed) in [
+            (Operation::BrowserTicketsCreate, true),
+            (Operation::EngineInstancesFrontend, true),
+            (Operation::CoreStatus, true),
+            (Operation::SquadTasksList, true),
+            (Operation::SquadEnvGet, false),
+            (Operation::WorkerWorkdirs, false),
+            (Operation::CoreKeysList, false),
+            (Operation::CoreFeaturesList, false),
+            (Operation::BrowsersList, false),
+            (Operation::BrowserLinksDecide, false),
+        ] {
+            assert_eq!(
+                op.allowed_for(&browser(), &settings),
+                allowed,
+                "{}",
+                op.name()
+            );
+        }
+        let mut disabled = settings.clone();
+        disabled.enabled = false;
+        assert!(!Operation::CoreStatus.allowed_for(&browser(), &disabled));
+    }
+
+    #[test]
+    fn api_keys_never_reach_browser_only_or_owner_only_routes() {
+        let settings = listener(ListenerTransport::LoopbackHttp, &[FeatureName::Engine]);
+        let key = Principal::ApiKey { id: "key_x".into() };
+        for op in ALL {
+            if op.browser_only() || op.local_only() {
+                assert!(!op.allowed_for(&key, &settings), "{}", op.name());
+            }
+        }
+        assert!(Operation::EngineInstancesList.allowed_for(&key, &settings));
+    }
+
+    #[test]
+    fn browser_operations_are_named_and_owned() {
+        for op in ALL {
+            assert!(!op.name().is_empty());
+        }
+        assert!(Operation::BrowsersList.local_only());
+        assert!(Operation::BrowsersDelete.local_only());
+        assert!(Operation::BrowserLinksLookup.local_only());
+        assert!(Operation::BrowserLinksDecide.local_only());
+        assert!(!Operation::BrowserLinksCreate.local_only());
+        assert!(Operation::BrowserLinksCreate.browser_only());
+        assert_eq!(Operation::BrowsersList.owner(), Feature::Core);
+        assert_eq!(Operation::BrowserLinksCreate.owner(), Feature::Engine);
     }
 }

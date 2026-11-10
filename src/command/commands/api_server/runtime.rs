@@ -1275,6 +1275,7 @@ mod tests {
     #[test]
     fn stored_args_projection_omits_server_injected_interaction_flags() {
         let record = crate::data::fs::api_db::CommandRecord {
+            listener_name: None,
             allow_remote_input: false,
             listener: "local".into(),
             trace_parent: None,

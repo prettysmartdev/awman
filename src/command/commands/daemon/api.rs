@@ -300,6 +300,18 @@ impl crate::command::commands::Command for DaemonApiCommand {
         let value = match request {
             DaemonApiInput::List => unreachable!("handled above"),
             DaemonApiInput::Raw(request) => client.call(&request).await?,
+            DaemonApiInput::Action { name, args }
+                if matches!(
+                    name.as_str(),
+                    "launch_contexts.create" | "launch_contexts.refresh"
+                ) =>
+            {
+                let mut request = actions::plan(&name, &args)?;
+                let body = request.body.get_or_insert_with(|| serde_json::json!({}));
+                body["root"] = serde_json::to_value(self.session.env().cwd()).unwrap();
+                body["env"] = serde_json::to_value(self.session.env().to_hello_env()).unwrap();
+                client.call(&request).await?
+            }
             DaemonApiInput::Action { name, args } => run_action(&client, &name, &args).await?,
         };
         Ok(DaemonApiOutcome::Response(value))

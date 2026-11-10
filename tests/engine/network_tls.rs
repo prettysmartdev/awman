@@ -130,7 +130,7 @@ fn certificate_covers_loopback_listen_ip_and_tls_sans() {
     let paths = DaemonPaths::new(tmp.path().join("daemon"));
     let extra = [san("awman.internal"), san("10.1.2.3"), san("fd00::5")];
     let (identity, regenerated) = engine(tmp.path())
-        .ensure_network_tls(&paths, "192.168.7.9".parse().unwrap(), &extra)
+        .ensure_network_tls(&paths, &["192.168.7.9".parse().unwrap()], &extra)
         .unwrap();
     assert!(regenerated, "first call generates");
 
@@ -147,7 +147,7 @@ fn certificate_covers_loopback_listen_ip_and_tls_sans() {
     assert_eq!(parse_sans(&identity.material.cert_pem), expected);
     assert_eq!(
         identity.sans,
-        network_sans("192.168.7.9".parse().unwrap(), &extra)
+        network_sans(&["192.168.7.9".parse().unwrap()], &extra)
     );
 
     for name in [
@@ -170,7 +170,7 @@ fn unspecified_listen_address_is_not_a_san_but_loopback_always_is() {
     let tmp = tempfile::tempdir().unwrap();
     let paths = DaemonPaths::new(tmp.path().join("daemon"));
     let (identity, _) = engine(tmp.path())
-        .ensure_network_tls(&paths, "::".parse().unwrap(), &[])
+        .ensure_network_tls(&paths, &["::".parse().unwrap()], &[])
         .unwrap();
     let mut expected = vec![dns("localhost"), ip("127.0.0.1"), ip("::1")];
     expected.sort();
@@ -184,10 +184,10 @@ fn same_sans_reuse_the_certificate() {
     let auth = engine(tmp.path());
     let extra = [san("awman.internal")];
     let (first, _) = auth
-        .ensure_network_tls(&paths, unspecified(), &extra)
+        .ensure_network_tls(&paths, &[unspecified()], &extra)
         .unwrap();
     let (second, regenerated) = auth
-        .ensure_network_tls(&paths, unspecified(), &extra)
+        .ensure_network_tls(&paths, &[unspecified()], &extra)
         .unwrap();
     assert!(!regenerated);
     assert_eq!(first, second);
@@ -199,11 +199,13 @@ fn changed_sans_regenerate_and_reload() {
     let tmp = tempfile::tempdir().unwrap();
     let paths = DaemonPaths::new(tmp.path().join("daemon"));
     let auth = engine(tmp.path());
-    let (before, _) = auth.ensure_network_tls(&paths, unspecified(), &[]).unwrap();
+    let (before, _) = auth
+        .ensure_network_tls(&paths, &[unspecified()], &[])
+        .unwrap();
     assert!(!verifies_for(&before.material, "awman.internal"));
 
     let (after, regenerated) = auth
-        .ensure_network_tls(&paths, unspecified(), &[san("awman.internal")])
+        .ensure_network_tls(&paths, &[unspecified()], &[san("awman.internal")])
         .unwrap();
     assert!(regenerated);
     assert_ne!(
@@ -223,7 +225,9 @@ fn changed_sans_regenerate_and_reload() {
     );
 
     // Removing the SAN regenerates again.
-    let (_, regenerated) = auth.ensure_network_tls(&paths, unspecified(), &[]).unwrap();
+    let (_, regenerated) = auth
+        .ensure_network_tls(&paths, &[unspecified()], &[])
+        .unwrap();
     assert!(regenerated);
 }
 
@@ -232,10 +236,10 @@ fn changed_listen_ip_regenerates() {
     let tmp = tempfile::tempdir().unwrap();
     let paths = DaemonPaths::new(tmp.path().join("daemon"));
     let auth = engine(tmp.path());
-    auth.ensure_network_tls(&paths, "10.0.0.1".parse().unwrap(), &[])
+    auth.ensure_network_tls(&paths, &["10.0.0.1".parse().unwrap()], &[])
         .unwrap();
     let (identity, regenerated) = auth
-        .ensure_network_tls(&paths, "10.0.0.2".parse().unwrap(), &[])
+        .ensure_network_tls(&paths, &["10.0.0.2".parse().unwrap()], &[])
         .unwrap();
     assert!(regenerated);
     let sans = parse_sans(&identity.material.cert_pem);
@@ -249,10 +253,13 @@ fn a_missing_san_record_forces_regeneration() {
     let tmp = tempfile::tempdir().unwrap();
     let paths = DaemonPaths::new(tmp.path().join("daemon"));
     let auth = engine(tmp.path());
-    auth.ensure_network_tls(&paths, unspecified(), &[]).unwrap();
+    auth.ensure_network_tls(&paths, &[unspecified()], &[])
+        .unwrap();
     std::fs::remove_file(paths.tls_sans_file()).unwrap();
     assert_eq!(auth.load_network_tls(&paths).unwrap(), None);
-    let (_, regenerated) = auth.ensure_network_tls(&paths, unspecified(), &[]).unwrap();
+    let (_, regenerated) = auth
+        .ensure_network_tls(&paths, &[unspecified()], &[])
+        .unwrap();
     assert!(regenerated);
 }
 
@@ -261,7 +268,9 @@ fn legacy_and_expired_certificates_are_rotated() {
     let tmp = tempfile::tempdir().unwrap();
     let paths = DaemonPaths::new(tmp.path().join("daemon"));
     let auth = engine(tmp.path());
-    let (first, _) = auth.ensure_network_tls(&paths, unspecified(), &[]).unwrap();
+    let (first, _) = auth
+        .ensure_network_tls(&paths, &[unspecified()], &[])
+        .unwrap();
 
     let record_path = paths.tls_sans_file();
     let mut record: serde_json::Value =
@@ -269,7 +278,9 @@ fn legacy_and_expired_certificates_are_rotated() {
     record.as_object_mut().unwrap().remove("renew_after_unix");
     std::fs::write(&record_path, serde_json::to_vec(&record).unwrap()).unwrap();
     assert_eq!(auth.load_network_tls(&paths).unwrap(), None);
-    let (second, regenerated) = auth.ensure_network_tls(&paths, unspecified(), &[]).unwrap();
+    let (second, regenerated) = auth
+        .ensure_network_tls(&paths, &[unspecified()], &[])
+        .unwrap();
     assert!(regenerated);
     assert_ne!(
         first.material.fingerprint_sha256_hex,
@@ -281,7 +292,9 @@ fn legacy_and_expired_certificates_are_rotated() {
     record["renew_after_unix"] = serde_json::json!(0);
     std::fs::write(&record_path, serde_json::to_vec(&record).unwrap()).unwrap();
     assert_eq!(auth.load_network_tls(&paths).unwrap(), None);
-    let (third, regenerated) = auth.ensure_network_tls(&paths, unspecified(), &[]).unwrap();
+    let (third, regenerated) = auth
+        .ensure_network_tls(&paths, &[unspecified()], &[])
+        .unwrap();
     assert!(regenerated);
     assert_ne!(
         second.material.fingerprint_sha256_hex,
@@ -294,7 +307,7 @@ fn files_are_owner_only_and_key_is_redacted_in_debug() {
     let tmp = tempfile::tempdir().unwrap();
     let paths = DaemonPaths::new(tmp.path().join("daemon"));
     let (identity, _) = engine(tmp.path())
-        .ensure_network_tls(&paths, unspecified(), &[])
+        .ensure_network_tls(&paths, &[unspecified()], &[])
         .unwrap();
     #[cfg(unix)]
     {
@@ -319,4 +332,21 @@ fn files_are_owner_only_and_key_is_redacted_in_debug() {
         !debug.contains("PRIVATE KEY"),
         "Debug leaks the private key"
     );
+}
+
+#[test]
+fn certificate_sans_union_all_tls_listen_addresses_and_extras() {
+    let addresses = ["10.0.0.1".parse().unwrap(), "2001:db8::1".parse().unwrap()];
+    let sans = network_sans(&addresses, &[san("API.example.org"), san("10.0.0.1")]);
+    for expected in [
+        "10.0.0.1",
+        "2001:db8::1",
+        "api.example.org",
+        "localhost",
+        "127.0.0.1",
+        "::1",
+    ] {
+        assert!(sans.iter().any(|s| s == expected), "{sans:?}");
+    }
+    assert_eq!(sans.iter().filter(|s| *s == "10.0.0.1").count(), 1);
 }

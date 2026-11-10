@@ -84,6 +84,52 @@ jobs:
       - name: Full test suite (real Docker, real git)
         run: make test-full
 
+  web:
+    name: Web app, edge Worker and browser acceptance
+    runs-on: ubuntu-24.04
+    needs: fast
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable (toolchain pinned below)
+        with:
+          toolchain: "1.94.0"
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-web-v1-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-web-v1-
+
+      - name: Install Node.js
+        uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
+        with:
+          node-version: "22"
+
+      - name: Install npm 11
+        run: npm install --global npm@11.17.0
+
+      - name: Install pinned web dependencies
+        run: |
+          npm --prefix web ci --ignore-scripts
+          npm --prefix web/edge ci --ignore-scripts
+          npm --prefix web/e2e ci --ignore-scripts
+
+      - name: Install Playwright browsers
+        run: npm --prefix web/e2e exec -- playwright install --with-deps chromium firefox
+
+      # typecheck, lint, unit tests, static export, CSP/privacy audits and the
+      # edge asset gate for web/; the Worker's own checks; then the browser
+      # suite against a real daemon on Chromium and Firefox, desktop and narrow.
+      - name: Web gates
+        run: make test-web
+
   build-macos:
     name: Build smoke (macOS)
     runs-on: macos-latest

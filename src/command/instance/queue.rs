@@ -4,6 +4,17 @@ use crate::command::worker::queue_source::{QueueSource, SharedQueueSource};
 use crate::data::{session::Session, worker::queue::*};
 
 impl EngineInstance {
+    /// A lease already claimed by this instance may provide a prepared
+    /// workspace outside a browser launch context. This reads only the
+    /// instance's existing worker; it never starts one for a path check.
+    pub fn prepared_lease_run(&self, lease_id: &str) -> Option<PickRun> {
+        self.queue
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|source| source.prepared_run(lease_id))
+    }
+
     #[cfg(test)]
     pub(crate) fn install_queue_for_test(&self, source: SharedQueueSource) {
         *self.queue.lock().unwrap() = Some(source);

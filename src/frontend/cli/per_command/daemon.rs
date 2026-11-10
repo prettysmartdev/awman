@@ -147,7 +147,7 @@ fn worker_sides(record: &FeatureRecord) -> Vec<String> {
     }
     if let Some(pull) = &record.pull {
         if pull.servers.is_empty() {
-            lines.push("    pull  no work servers (awman worker link <url>)".into());
+            lines.push("    pull  no work servers (awman link <url>)".into());
         }
         let name_w = pull.servers.iter().map(|s| s.name.len()).max().unwrap_or(0);
         let state_w = pull
@@ -252,36 +252,53 @@ pub fn render_status(status: &StatusResponse) -> String {
         )),
         None => out.push("  local    not bound".into()),
     }
-    match &status.listeners.network {
-        None => out.push("  network  off".into()),
-        Some(network) => {
-            let features = if network.features.is_empty() {
-                "none".to_string()
-            } else {
+    if status.listeners.network.is_empty() {
+        out.push("  network  off".into());
+    }
+    for (name, network) in &status.listeners.network {
+        let features = if network.features.is_empty() {
+            "none".to_string()
+        } else {
+            network
+                .features
+                .iter()
+                .map(|f| f.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        match (&network.bound, &network.error) {
+            (_, Some(error)) => out.push(format!(
+                "  {name}  {}  error  {}: {error}",
+                network.transport, network.listen
+            )),
+            (Some(bound), None) => out.push(format!(
+                "  {name}  {}  {bound}  features: {features}  keys: {}",
+                network.transport, network.api_keys
+            )),
+            (None, None) => out.push(format!(
+                "  {name}  {}  starting  {}",
+                network.transport, network.listen
+            )),
+        }
+        if network.transport == crate::data::config::network::ListenerTransport::LoopbackHttp {
+            out.push(format!(
+                "    origins: {}  browsers: {}  links: {}",
                 network
-                    .features
+                    .allowed_origins
                     .iter()
-                    .map(|f| f.as_str())
+                    .map(ToString::to_string)
                     .collect::<Vec<_>>()
-                    .join(",")
-            };
-            match (&network.bound, &network.error) {
-                (_, Some(error)) => {
-                    out.push(format!("  network  error  {}: {error}", network.listen))
-                }
-                (Some(bound), None) => out.push(format!(
-                    "  network  tls  {bound}  features: {features}  keys: {}",
-                    network.api_keys
-                )),
-                (None, None) => out.push(format!("  network  starting  {}", network.listen)),
-            }
-            if network.api_keys == 0 {
-                out.push(
-                    "  warning: no API keys, so every network request is refused \
+                    .join(","),
+                network.browser_grants,
+                if network.browser_links { "on" } else { "off" }
+            ));
+        }
+        if network.api_keys == 0 {
+            out.push(
+                "  warning: no API keys, so every network request is refused \
                      (awman daemon api keys.create name=…)"
-                        .into(),
-                );
-            }
+                    .into(),
+            );
         }
     }
     out.join("\n")
@@ -291,7 +308,7 @@ pub fn render_status(status: &StatusResponse) -> String {
 mod tests {
     use super::*;
     use crate::command::daemon_runtime::network::{
-        ListenerStatus, LocalListenerRecord, NetworkListenerRecord,
+        ListenerRecord, ListenerStatus, LocalListenerRecord,
     };
     use crate::data::daemon_state::{EnabledBy, FeatureName};
 
@@ -316,10 +333,7 @@ mod tests {
         }
     }
 
-    fn status(
-        features: Vec<FeatureRecord>,
-        network: Option<NetworkListenerRecord>,
-    ) -> StatusResponse {
+    fn status(features: Vec<FeatureRecord>, network: Option<ListenerRecord>) -> StatusResponse {
         StatusResponse {
             status: "ok".into(),
             version: "0.9.0".into(),
@@ -334,14 +348,19 @@ mod tests {
                     transport: LocalTransport::UnixSocket,
                     address: "/h/.awman/data/daemon/api.sock".into(),
                 }),
-                network,
+                network: network.map(|n| ("default".into(), n)).into_iter().collect(),
             },
             agents: vec![],
         }
     }
 
-    fn network(error: Option<&str>, keys: usize) -> NetworkListenerRecord {
-        NetworkListenerRecord {
+    fn network(error: Option<&str>, keys: usize) -> ListenerRecord {
+        ListenerRecord {
+            name: "default".into(),
+            transport: crate::data::config::network::ListenerTransport::Tls,
+            browser_links: false,
+            allowed_origins: vec![],
+            browser_grants: 0,
             enabled: true,
             listen: "0.0.0.0:9876".into(),
             bound: error.is_none().then(|| "0.0.0.0:9876".parse().unwrap()),
@@ -395,7 +414,7 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.contains("network  tls  0.0.0.0:9876  features: worker  keys: 2"),
+            text.contains("default  tls  0.0.0.0:9876  features: worker  keys: 2"),
             "{text}"
         );
         assert!(!text.contains("warning"), "{text}");
@@ -456,7 +475,7 @@ mod tests {
         assert!(text.contains("restarts 3  last error: boom"), "{text}");
         assert!(text.contains("worker  off"), "{text}");
         assert!(
-            text.contains("network  error  0.0.0.0:9876: address in use"),
+            text.contains("default  tls  error  0.0.0.0:9876: address in use"),
             "{text}"
         );
         assert!(text.contains("warning: no API keys"), "{text}");
@@ -472,6 +491,23 @@ mod tests {
             "{none}"
         );
         assert!(none.contains("network  off"), "{none}");
+    }
+
+    #[test]
+    fn status_shows_listener_origins_grants_and_link_availability() {
+        let mut listener = network(None, 1);
+        listener.transport = crate::data::config::network::ListenerTransport::LoopbackHttp;
+        listener.browser_links = true;
+        listener.browser_grants = 2;
+        listener.allowed_origins = vec![crate::data::config::network::BrowserOrigin::parse(
+            "https://awman.prettysmart.dev",
+        )
+        .unwrap()];
+        let text = render_status(&status(vec![], Some(listener)));
+        assert!(
+            text.contains("origins: https://awman.prettysmart.dev  browsers: 2  links: on"),
+            "{text}"
+        );
     }
 
     #[test]

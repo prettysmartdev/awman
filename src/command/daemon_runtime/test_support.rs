@@ -102,7 +102,7 @@ impl DaemonRuntime {
             Ok(())
         });
         let worker_supervisor = FeatureSupervisor::with_started_task(feature, core.clone(), task);
-        Arc::new(Self {
+        let runtime = Arc::new(Self {
             pull: None,
             config: RwLock::new(config.clone()),
             initial_config: config.clone(),
@@ -128,11 +128,15 @@ impl DaemonRuntime {
             }),
             event_buses: api.event_buses.clone(),
             keys: ApiKeyStore::open(paths.daemon().api_keys_file()).unwrap(),
-            network: network::NetworkControl::new(NetworkDesired {
-                enabled: false,
-                listen: config.daemon().network.listen,
-                tls: None,
-            }),
+            browser: crate::command::daemon_api::browser::BrowserAuth::open(
+                paths.daemon().browser_grants_file(),
+            )
+            .unwrap(),
+            network: network::NetworkControl::new(ListenersDesired::new(
+                &config.daemon().network,
+                None,
+                None,
+            )),
             listeners: RwLock::new(ListenerStatus::default()),
             grants: Mutex::new(PrerequisiteGrantStore::load(paths.home())),
             guard: DaemonGuard::new(paths.daemon()),
@@ -147,6 +151,16 @@ impl DaemonRuntime {
             terminals: Default::default(),
             core,
             engines,
-        })
+        });
+        runtime.install_browser_revocations();
+        runtime
+    }
+
+    /// Turn the engine feature on as config would (tests only).
+    pub async fn enable_engine_for_tests(&self) {
+        self.supervisors[&FeatureName::Engine]
+            .enable(EnabledBy::Config, None)
+            .await
+            .expect("engine starts");
     }
 }

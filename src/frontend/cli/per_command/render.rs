@@ -41,6 +41,7 @@ pub fn render(outcome: &CommandOutcome, json: bool) -> Option<String> {
             .map(|value| value.to_string()),
         CommandOutcome::Attach(_) => None,
         CommandOutcome::Empty => None,
+        CommandOutcome::Link(s) => Some(s.clone()),
         CommandOutcome::Agents(o) => super::agents::render_agents(o, json),
         CommandOutcome::Chat(o) => render_chat(o),
         CommandOutcome::Init(o) => render_init(o),

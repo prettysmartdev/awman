@@ -147,7 +147,7 @@ mod tests {
             .collect();
         for n in [
             "init", "ready", "chat", "specs", "agents", "config", "exec", "daemon", "remote",
-            "new", "worker",
+            "new", "link", "queue",
         ] {
             assert!(
                 names.iter().any(|x| x == n),

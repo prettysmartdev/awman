@@ -125,7 +125,9 @@ async fn server_with_peer(app: Arc<AppState>, peer: SocketAddr) -> String {
     let bearer: axum::http::HeaderValue = format!("Bearer {}", key.as_str()).parse().unwrap();
     let router = awman::frontend::api::routes::build_router_for_listener(
         api,
-        awman::frontend::api::routes::ListenerPolicy::Network,
+        awman::frontend::api::routes::ListenerPolicy::Network {
+            name: "default".into(),
+        },
     )
     .layer(axum::middleware::from_fn(
         move |mut req: axum::http::Request<axum::body::Body>, next: axum::middleware::Next| {
@@ -179,6 +181,10 @@ async fn every_route_error_has_code_and_authoritative_code_status_table_is_exerc
         ("task_exists", 409),
         ("prerequisite_widening_refused", 403),
         ("unauthorized", 401),
+        ("host_mismatch", 421),
+        ("origin_not_allowed", 403),
+        ("browser_grant_required", 401),
+        ("browser_grant_invalid", 401),
         ("forbidden_workdir", 403),
         ("invalid_request", 400),
         ("forbidden", 403),
@@ -229,6 +235,10 @@ async fn every_route_error_has_code_and_authoritative_code_status_table_is_exerc
         ("worker_busy", 409),
         ("link_revoked", 409),
         ("upstream_unavailable", 502),
+        ("browser_ticket_invalid", 401),
+        ("link_gone", 410),
+        ("link_not_found", 404),
+        ("rate_limited", 429),
     ]
     .into_iter()
     .collect::<std::collections::HashSet<_>>();
@@ -881,7 +891,9 @@ async fn framework_and_admission_errors_have_codes_over_http() {
             listener,
             awman::frontend::api::routes::build_router_for_listener(
                 api,
-                awman::frontend::api::routes::ListenerPolicy::Network,
+                awman::frontend::api::routes::ListenerPolicy::Network {
+                    name: "default".into(),
+                },
             ),
         )
         .await

@@ -444,7 +444,13 @@ async fn leases_list_get_and_release_follow_the_lease_lifecycle() {
 #[tokio::test]
 async fn pull_routes_are_local_only() {
     let f = fixture(true, true);
-    let Some(addr) = serve(f.api.clone(), super::super::routes::ListenerPolicy::Network).await
+    let Some(addr) = serve(
+        f.api.clone(),
+        super::super::routes::ListenerPolicy::Network {
+            name: "default".into(),
+        },
+    )
+    .await
     else {
         return;
     };

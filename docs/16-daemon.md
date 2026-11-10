@@ -2,8 +2,8 @@
 
 The awman daemon is one long-running process for the features you enable. It
 provides an owner-only local listener for the CLI and TUI, shares execution
-capacity between features, and can serve worker requests over a network
-listener when `daemon.network.enabled` is true.
+capacity between features, and can serve selected features through named
+network listeners configured under `daemon.network.listeners`.
 
 ## Features
 
@@ -154,8 +154,8 @@ awman daemon status --json
 Status shows each feature as `on`, `off`, `ephemeral`, `draining`, or
 `degraded`. It includes running and queued counts, the oldest queued age when
 available, restart/error details for a degraded feature, engine idle-out time,
-shared capacity, and local/network listener state. If the network listener is
-enabled with no named keys, status warns that its requests will be refused.
+shared capacity, and local/network listener state. Each network listener is
+listed by name, address, transport, selected features and any bind error.
 The status command reports
 `awman daemon is not running` when no daemon is available.
 
@@ -210,30 +210,56 @@ remote`.
 
 ## Network listener
 
-The network listener is configured independently from the local listener. It
-is disabled by default and, when available, serves **TLS only**. It uses named
-API keys created through `awman daemon api keys.create`; without keys, network
-requests are refused. The network API exposes only the configured
-`daemon.network.features` and does not expose owner-only configuration or grant
-management routes.
+Each named network listener has its own address, transport, feature list,
+browser-origin allowlist and TLS certificate names. The built-in `default`
+listener is disabled and serves `worker` over TLS at `127.0.0.1:9876` when
+enabled. The built-in `loopback` listener is disabled and intended for
+same-machine browser access: it uses `loopback_http` at `127.0.0.1:9877`,
+serves `engine`, and allows the hosted web app's origin. Custom listeners start
+disabled with no features or allowed origins and need an explicit `listen`
+address. A listener exposes only the features listed for it. The feature
+choices are `worker`, `squad` and `engine`; `engine` is permitted only on a
+loopback address.
 
-Configure its address, enabled state, feature allowlist, and certificate names
-in global config:
+The `enabled`, `listen`, `transport`, `features`, `tlsSans` and `allowedOrigins`
+fields belong under `daemon.network.listeners.<name>`. `listen` is a
+`host:port` address (bracket IPv6 literals); changing it requires a daemon
+restart. The other settings reload live. Changing a bound listener's
+`transport` rebinds only that listener; its connected clients are disconnected,
+and `awman config set` reports how many. Other listeners and the local
+socket are unaffected. `transport` is `tls` or `loopback_http`. Plain HTTP is accepted only for the literal loopback addresses
+`127.0.0.1` and `[::1]`; `tlsSans` is available only with TLS. TLS certificates
+include the listener IP unless it is unspecified, plus configured `tlsSans`
+DNS names or IP addresses. TLS listeners use named API keys created through
+`awman daemon api keys.create` for ordinary network requests; without a key,
+those requests are refused. Browser links are available on the loopback engine
+listener when its `allowedOrigins` includes the requesting browser's origin.
+
+For example, enable the default worker listener with:
 
 ```sh
-awman config set daemon.network.enabled true
-awman config set daemon.network.listen 0.0.0.0:9876
-awman config set daemon.network.features worker
-awman config set daemon.network.tlsSans api.example.org
+awman config set daemon.network.listeners.default.enabled true
+awman config set daemon.network.listeners.default.listen 0.0.0.0:9876
+awman config set daemon.network.listeners.default.features worker
+awman config set daemon.network.listeners.default.tlsSans api.example.org
 ```
 
-`daemon.network.listen` is the host and port and requires a daemon restart when
-changed. `daemon.network.enabled`, `.features`, and `.tlsSans` are live
-settings. The TLS certificate always includes `localhost`, `127.0.0.1`, and
-`::1`, plus the listener IP (unless it is unspecified) and configured SANs.
-Include any DNS name clients use in `tlsSans`; changing the certificate names
-regenerates the certificate, so clients that pinned its previous fingerprint
-must pin the replacement.
+`allowedOrigins` is a list of exact browser origins, including scheme and
+port, for example `https://awman.prettysmart.dev` or
+`http://127.0.0.1:3000`. It controls which browser origins may connect; it is
+not itself authentication. Browser linking requires an allowed origin and an
+owner's approval on the local daemon. The `loopback` listener allows the hosted
+web app and both local development origins by default. If `allowedOrigins` has
+been overridden, include both local origins explicitly:
+
+```sh
+awman config set daemon.network.listeners.loopback.allowedOrigins https://awman.prettysmart.dev,http://127.0.0.1:3000,http://localhost:3000
+```
+
+Origins must match exactly.
+Review and revoke browser grants through the local daemon API with
+`awman daemon api browsers.list` and `awman daemon api browsers.delete
+id=<browser-id>`. See the [Web App guide](20-webapp.md) for setup.
 
 If the network address cannot be bound, `awman daemon status` reports the address and error. The local listener and enabled features keep running.
 

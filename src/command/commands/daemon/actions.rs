@@ -121,6 +121,37 @@ const UI_REQUESTS: &[&str] = &[
 
 pub const ACTIONS: &[Action] = &[
     Action {
+        name: "launch_contexts.list",
+        method: "GET",
+        path: "/v1/engine/launch_contexts",
+        args: &[],
+        doc: "List authorised launch contexts (no environment values)",
+    },
+    Action {
+        name: "launch_contexts.create",
+        method: "POST",
+        path: "/v1/engine/launch_contexts",
+        args: &[
+            optional_body("label", ArgKind::Name),
+            optional_body("default", ArgKind::Json),
+        ],
+        doc: "Capture this shell and directory as a launch context",
+    },
+    Action {
+        name: "launch_contexts.refresh",
+        method: "POST",
+        path: "/v1/engine/launch_contexts/{id}/refresh",
+        args: &[arg("id", Location::Path, ArgKind::Id("lc"))],
+        doc: "Refresh environment from the context root",
+    },
+    Action {
+        name: "launch_contexts.delete",
+        method: "DELETE",
+        path: "/v1/engine/launch_contexts/{id}",
+        args: &[arg("id", Location::Path, ArgKind::Id("lc"))],
+        doc: "Remove a launch context",
+    },
+    Action {
         name: "features.list",
         method: "GET",
         path: "/v1/features",
@@ -168,6 +199,20 @@ pub const ACTIONS: &[Action] = &[
         path: "/v1/grants/{id}",
         args: &[arg("id", Location::Path, ArgKind::Id("grant"))],
         doc: "Delete one prerequisite grant",
+    },
+    Action {
+        name: "browsers.list",
+        method: "GET",
+        path: "/v1/browsers",
+        args: PAGE,
+        doc: "Paired browser grants: origin, listener, expiry (never the token)",
+    },
+    Action {
+        name: "browsers.delete",
+        method: "DELETE",
+        path: "/v1/browsers/{id}",
+        args: &[arg("id", Location::Path, ArgKind::Id("brw"))],
+        doc: "Revoke a browser grant at once and close its connections (id=brw_…)",
     },
     Action {
         name: "jobs.cancel",
@@ -584,6 +629,8 @@ mod tests {
             ArgKind::Name => "ci-runner".into(),
             ArgKind::Id("key") => KeyId::new().to_string(),
             ArgKind::Id("grant") => GrantId::new().to_string(),
+            ArgKind::Id("lc") => crate::data::ids::LaunchContextId::new().to_string(),
+            ArgKind::Id("brw") => crate::data::ids::BrowserGrantId::new().to_string(),
             ArgKind::Id("cmd") => CommandId::new().to_string(),
             ArgKind::Id("run") => RunId::new().to_string(),
             ArgKind::Id("term") => crate::data::ids::TerminalId::new().to_string(),
@@ -608,6 +655,10 @@ mod tests {
         assert_eq!(
             names,
             [
+                "launch_contexts.list",
+                "launch_contexts.create",
+                "launch_contexts.refresh",
+                "launch_contexts.delete",
                 "features.list",
                 "features.get",
                 "keys.list",
@@ -615,6 +666,8 @@ mod tests {
                 "keys.delete",
                 "grants.list",
                 "grants.delete",
+                "browsers.list",
+                "browsers.delete",
                 "jobs.cancel",
                 "leases.list",
                 "leases.release",

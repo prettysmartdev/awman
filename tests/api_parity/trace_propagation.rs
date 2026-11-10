@@ -16,7 +16,12 @@ async fn traceparent_and_listener_are_stored_for_network_admission() {
     let task = tokio::spawn(
         axum::serve(
             listener,
-            build_router_for_listener(api, ListenerPolicy::Network),
+            build_router_for_listener(
+                api,
+                ListenerPolicy::Network {
+                    name: "default".into(),
+                },
+            ),
         )
         .into_future(),
     );

@@ -1,0 +1,79 @@
+{
+  "server": [
+    {
+      "type": "snapshot",
+      "has_output": true,
+      "cols": 120,
+      "rows": 36,
+      "screen": "G1tIG1syShtbMW1jbGF1ZGUbWzBtID4gZWRpdGluZyBzcmMvbGliLnJzDQo="
+    },
+    {
+      "type": "output",
+      "bytes": "aMOpbGxvIPCfmYINCg=="
+    },
+    {
+      "type": "output",
+      "bytes": "G1v/"
+    },
+    {
+      "type": "resize",
+      "cols": 100,
+      "rows": 30
+    },
+    {
+      "type": "error",
+      "code": "control_held",
+      "error": "another viewer holds terminal control"
+    },
+    {
+      "type": "error",
+      "code": "input_not_allowed",
+      "error": "input is not allowed for this viewer"
+    },
+    {
+      "type": "error",
+      "code": "input_backpressure",
+      "error": "terminal input queue is full; the agent is not reading input"
+    },
+    {
+      "type": "lagged"
+    },
+    {
+      "type": "snapshot",
+      "cols": 100,
+      "rows": 30,
+      "screen": "G1tIG1sySg=="
+    },
+    {
+      "type": "exit",
+      "code": 0
+    }
+  ],
+  "client": [
+    {
+      "type": "take_control"
+    },
+    {
+      "type": "input",
+      "bytes": "bHMgLWxhDQ=="
+    },
+    {
+      "type": "resize",
+      "cols": 100,
+      "rows": 30
+    },
+    {
+      "type": "detached",
+      "reason": "user"
+    }
+  ],
+  "decoded": {
+    "first_snapshot_screen_utf8": "\u001b[H\u001b[2J\u001b[1mclaude\u001b[0m > editing src/lib.rs\r\n",
+    "first_output_utf8": "héllo 🙂\r\n",
+    "second_output_bytes": [
+      27,
+      91,
+      255
+    ]
+  }
+}

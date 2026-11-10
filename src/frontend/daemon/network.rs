@@ -1,17 +1,19 @@
-//! TLS-only network host following Layer 2's live desired state.
+//! Independent network hosts following Layer 2's named desired state.
 use crate::command::daemon_api::DaemonApi;
-use crate::command::daemon_runtime::{DaemonRuntime, NetworkDesired};
+use crate::command::daemon_runtime::{network::ListenerDesired, DaemonRuntime};
+use crate::data::config::network::{binds_overlap, ListenerTransport};
 use crate::frontend::api::routes::{build_router_for_listener, ListenerPolicy};
-use std::sync::Arc;
-use std::time::Duration;
+use std::{collections::HashMap, sync::Arc};
 use tokio_util::sync::CancellationToken;
+mod connections;
 
 pub struct NetworkListener(tokio::task::JoinHandle<()>);
 struct Bound {
-    desired: NetworkDesired,
-    tls: axum_server::tls_rustls::RustlsConfig,
+    desired: ListenerDesired,
+    tls: Option<axum_server::tls_rustls::RustlsConfig>,
     handle: axum_server::Handle<std::net::SocketAddr>,
     streams: CancellationToken,
+    clients: Arc<std::sync::atomic::AtomicUsize>,
     task: tokio::task::JoinHandle<std::io::Result<()>>,
 }
 impl Drop for Bound {
@@ -28,84 +30,159 @@ impl Drop for NetworkListener {
 }
 impl NetworkListener {
     pub fn start(runtime: Arc<DaemonRuntime>, api: Arc<DaemonApi>) -> Self {
+        runtime.listener_host_started();
         Self(tokio::spawn(async move {
             let mut control = runtime.network_control();
-            let mut bound: Option<Bound> = None;
+            let mut bound: HashMap<String, Bound> = HashMap::new();
             loop {
                 let desired = control.borrow_and_update().clone();
-                if !desired.enabled {
-                    if let Some(mut old) = bound.take() {
+                let mut effects = Vec::new();
+                let close: Vec<_> = bound
+                    .iter()
+                    .filter(|(name, b)| {
+                        desired.listeners.get(*name).is_none_or(|l| {
+                            !l.enabled || l.bind_generation != b.desired.bind_generation
+                        })
+                    })
+                    .map(|(n, _)| n.clone())
+                    .collect();
+                for name in close {
+                    if let Some(old) = bound.remove(&name) {
+                        let disconnected = old.clients.load(std::sync::atomic::Ordering::Relaxed);
+                        let rebind = desired.listeners.get(&name).is_some_and(|l| l.enabled);
                         old.streams.cancel();
-                        old.handle.graceful_shutdown(Some(Duration::from_secs(5)));
+                        old.handle.shutdown();
+                        // Wait for release of the listening socket before rebinding its transport.
+                        let mut old = old;
                         let _ = (&mut old.task).await;
-                    }
-                    runtime.report_network_closed();
-                } else if let Some(current) = bound.as_mut() {
-                    if current.desired.tls != desired.tls {
-                        match desired.tls_server_config() {
-                            Ok(config) => {
-                                current.tls.reload_from_config(config);
-                                current.desired = desired.clone();
-                                tracing::info!("daemon network TLS certificate reloaded");
-                            }
-                            Err(error) => runtime.report_network_error(
-                                desired.listen.to_string(),
-                                error.to_string(),
-                            ),
+                        if rebind {
+                            runtime.report_listener_rebound(&name, disconnected);
+                            effects.push(crate::command::daemon_api::core::ReloadEffect::Rebound {
+                                listener: name.clone(),
+                                disconnected_clients: disconnected,
+                            });
                         }
                     }
-                } else {
+                    runtime.report_listener_closed(&name);
+                }
+                for (name, l) in &desired.listeners {
+                    if !l.enabled {
+                        continue;
+                    }
+                    if let Some(current) = bound.get_mut(name) {
+                        if current.desired.tls != l.tls {
+                            match l.tls_server_config() {
+                                Ok(config) => {
+                                    if let Some(tls) = &current.tls {
+                                        tls.reload_from_config(config);
+                                    }
+                                    current.desired = l.clone();
+                                    effects.push(crate::command::daemon_api::core::ReloadEffect::CertificateReloaded { listener: name.clone() });
+                                }
+                                Err(error) => runtime.report_listener_error(
+                                    name,
+                                    l.listen.to_string(),
+                                    error.to_string(),
+                                ),
+                            }
+                        }
+                        continue;
+                    }
                     let result = async {
-                        let config = desired.tls_server_config().map_err(|e| e.to_string())?;
-                        let addresses = tokio::net::lookup_host(desired.listen.to_string())
+                        let settings = runtime.listener_settings(name).ok_or("listener removed")?;
+                        crate::data::config::network::validate_listeners(
+                            &[(name.clone(), settings)].into(),
+                        )
+                        .map_err(|e| format!("invalid listener: {e:?}"))?;
+                        if bound
+                            .values()
+                            .any(|b| binds_overlap(&b.desired.listen, &l.listen))
+                        {
+                            return Err("overlapping listener bind".into());
+                        }
+                        let addresses = tokio::net::lookup_host(l.listen.to_string())
                             .await
                             .map_err(|e| e.to_string())?
                             .collect::<Vec<_>>();
+                        if l.transport == ListenerTransport::LoopbackHttp
+                            && addresses.iter().any(|a| !a.ip().is_loopback())
+                        {
+                            return Err("loopback_http resolved to a non-loopback address".into());
+                        }
                         let listener = std::net::TcpListener::bind(addresses.as_slice())
                             .map_err(|e| e.to_string())?;
                         listener.set_nonblocking(true).map_err(|e| e.to_string())?;
                         let addr = listener.local_addr().map_err(|e| e.to_string())?;
-                        let tls = axum_server::tls_rustls::RustlsConfig::from_config(config);
                         let handle = axum_server::Handle::new();
                         let streams = CancellationToken::new();
-                        let router =
-                            build_router_for_listener(api.clone(), ListenerPolicy::Network)
-                                .layer(axum::Extension(streams.clone()));
-                        let server = axum_server::from_tcp_rustls(listener, tls.clone())
-                            .map_err(|e| e.to_string())?
-                            .handle(handle.clone());
-                        let task = tokio::spawn(server.serve(
-                            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-                        ));
-                        runtime.report_network_bound(addr);
+                        let clients = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                        let router = build_router_for_listener(
+                            api.clone(),
+                            ListenerPolicy::Network { name: name.clone() },
+                        )
+                        .layer(axum::Extension(streams.clone()));
+                        let service =
+                            router.into_make_service_with_connect_info::<std::net::SocketAddr>();
+                        let (tls, task) = match l.transport {
+                            ListenerTransport::Tls => {
+                                let tls = axum_server::tls_rustls::RustlsConfig::from_config(
+                                    l.tls_server_config().map_err(|e| e.to_string())?,
+                                );
+                                let server = axum_server::from_tcp_rustls(listener, tls.clone())
+                                    .map_err(|e| e.to_string())?
+                                    .handle(handle.clone())
+                                    .map(|inner| connections::CountingAcceptor {
+                                        inner,
+                                        clients: clients.clone(),
+                                        closed: streams.clone(),
+                                    });
+                                (Some(tls), tokio::spawn(server.serve(service)))
+                            }
+                            ListenerTransport::LoopbackHttp => {
+                                let server = axum_server::from_tcp(listener)
+                                    .map_err(|e| e.to_string())?
+                                    .handle(handle.clone())
+                                    .map(|inner| connections::CountingAcceptor {
+                                        inner,
+                                        clients: clients.clone(),
+                                        closed: streams.clone(),
+                                    });
+                                (None, tokio::spawn(server.serve(service)))
+                            }
+                        };
+                        runtime.report_listener_bound(name, addr);
                         Ok::<_, String>(Bound {
-                            desired: desired.clone(),
+                            desired: l.clone(),
                             tls,
                             handle,
                             streams,
+                            clients,
                             task,
                         })
                     }
                     .await;
                     match result {
-                        Ok(listener) => bound = Some(listener),
-                        Err(error) => runtime.report_network_error(
-                            desired.listen.to_string(),
-                            format!("{}: {error}", desired.listen),
+                        Ok(listener) => {
+                            bound.insert(name.clone(), listener);
+                        }
+                        Err(error) => runtime.report_listener_error(
+                            name,
+                            l.listen.to_string(),
+                            format!("{}: {error}", l.listen),
                         ),
                     }
                 }
+                runtime.report_listeners_applied(desired.generation, effects);
                 tokio::select! {
                     changed = control.changed() => if changed.is_err() { break; },
-                    result = async { (&mut bound.as_mut().expect("guarded bound listener").task).await }, if bound.is_some() => {
-                        let error = match result {
-                            Ok(Ok(())) => "network listener stopped unexpectedly".into(),
-                            Ok(Err(e)) => e.to_string(),
-                            Err(e) => e.to_string(),
-                        };
-                        bound.take();
-                        runtime.report_network_error(desired.listen.to_string(), error);
-                        // Retry on the next configuration change, without a busy loop.
+                    (name, result) = async {
+                        let tasks = bound.iter_mut().map(|(n,b)| async move { (n.clone(), (&mut b.task).await) });
+                        let (result, _, _) = futures_util::future::select_all(tasks.map(Box::pin)).await;
+                        result
+                    }, if !bound.is_empty() => {
+                        bound.remove(&name);
+                        let error = match result { Ok(Ok(())) => "network listener stopped unexpectedly".into(), Ok(Err(e)) => e.to_string(), Err(e) => e.to_string() };
+                        runtime.report_listener_error(&name, desired.listeners[&name].listen.to_string(), error);
                         if control.changed().await.is_err() { break; }
                     }
                 }

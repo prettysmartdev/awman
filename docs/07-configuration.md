@@ -357,7 +357,7 @@ for supported work item fields and pull behavior.
 
 ### Work server links
 
-`awman worker link <https-url>` creates a global `workServers.<name>` entry and
+`awman link <https-url>` creates a global `workServers.<name>` entry and
 stores the server token in owner-only state outside the config file. See
 [Link a work server](17-workers-and-work-servers.md#link-a-work-server) for
 device approval and token options. Manage a link through config:
@@ -630,6 +630,20 @@ The scalar keys can be set with `awman config set`; the object-valued ones (`ima
 
 This table is generated from the same key table awman validates against, so it is always current. **Scope** says which files may hold the key (`global`: the global file only; `repo`: global or repo file; `task`: global, repo or a squad task file). **Live** says whether a running daemon applies a change without a restart. **Env** is the derived environment variable (`<NAME>` stands for a map entry's name, upper-cased, `-` as `_`); `—` means the key is not settable from the environment because it holds an object. Durations are written `500ms`, `30s`, `15m`, `2h`; sizes `512MiB`, `4GiB`.
 
+Network listener keys use the form `daemon.network.listeners.<name>.<field>`.
+The effective built-in defaults are: `default` is `127.0.0.1:9876`, TLS,
+worker feature; `loopback` is `127.0.0.1:9877`, loopback HTTP, engine feature,
+and the hosted web app origin. Both are disabled. A custom named listener
+starts disabled, with no features or allowed browser origins, and needs an
+explicit `listen` address. The feature choices are `worker`, `squad`, and
+`engine`; engine must use a loopback address. `transport` is `tls` or
+`loopback_http`; plain HTTP requires the literal address `127.0.0.1` or
+`[::1]`. `allowedOrigins` contains exact `http` or `https` origins, including
+any port, and is not itself authentication. `tlsSans` is a list of DNS names
+or IP literals used in a TLS certificate and is only valid with TLS. The
+per-field defaults in the table apply to custom listeners; built-in listeners
+have the effective defaults above.
+
 <!-- key-table:start -->
 | Key | Type | Default | Scope | Sensitive | Live | Env | Meaning |
 |---|---|---|---|---|---|---|---|
@@ -696,10 +710,12 @@ This table is generated from the same key table awman validates against, so it i
 | `daemon.terminal.cols` | int ≥ 1 | `120` | global | no | yes | `AWMAN_DAEMON_TERMINAL_COLS` | Default daemon terminal width. |
 | `daemon.terminal.rows` | int ≥ 1 | `40` | global | no | yes | `AWMAN_DAEMON_TERMINAL_ROWS` | Default daemon terminal height. |
 | `daemon.terminal.remoteInput` | bool | `false` | global | no | yes | `AWMAN_DAEMON_TERMINAL_REMOTE_INPUT` | Accept terminal input from network clients. |
-| `daemon.network.enabled` | bool | `false` | global | no | yes | `AWMAN_DAEMON_NETWORK_ENABLED` | Serve the API on the network listener. |
-| `daemon.network.listen` | string | `"127.0.0.1:9876"` | global | no | no | `AWMAN_DAEMON_NETWORK_LISTEN` | host:port the API listener binds; changing it needs a daemon restart. |
-| `daemon.network.tlsSans` | list<string> | `[]` | global | no | yes | `AWMAN_DAEMON_NETWORK_TLS_SANS` | Extra names in the listener's TLS certificate. |
-| `daemon.network.features` | list<string> | `["worker"]` | global | no | yes | `AWMAN_DAEMON_NETWORK_FEATURES` | Features served on the network listener. |
+| `daemon.network.listeners.*.enabled` | bool | `false` | global | no | yes | `AWMAN_DAEMON_NETWORK_LISTENERS_<NAME>_ENABLED` | Serve the API on the network listener. |
+| `daemon.network.listeners.*.listen` | string | `null` | global | no | no | `AWMAN_DAEMON_NETWORK_LISTENERS_<NAME>_LISTEN` | host:port the API listener binds; changing it needs a daemon restart. |
+| `daemon.network.listeners.*.tlsSans` | list<string> | `[]` | global | no | yes | `AWMAN_DAEMON_NETWORK_LISTENERS_<NAME>_TLS_SANS` | Extra names in the listener's TLS certificate. |
+| `daemon.network.listeners.*.features` | list<string> | `[]` | global | no | yes | `AWMAN_DAEMON_NETWORK_LISTENERS_<NAME>_FEATURES` | Features served on the network listener. |
+| `daemon.network.listeners.*.transport` | enum `tls\|loopback_http` | `"tls"` | global | no | yes | `AWMAN_DAEMON_NETWORK_LISTENERS_<NAME>_TRANSPORT` | Listener transport; plain HTTP requires a literal loopback address. |
+| `daemon.network.listeners.*.allowedOrigins` | list<string> | `[]` | global | no | yes | `AWMAN_DAEMON_NETWORK_LISTENERS_<NAME>_ALLOWED_ORIGINS` | Exact browser origins allowed on this listener. |
 | `daemon.features.squad.enabled` | bool | `false` | global | no | yes | `AWMAN_DAEMON_FEATURES_SQUAD_ENABLED` | Run the squad scheduler. |
 | `daemon.features.squad.interaction` | enum `interactive\|headless` | `"interactive"` | global | no | yes | `AWMAN_DAEMON_FEATURES_SQUAD_INTERACTION` | How squad evaluations interact. |
 | `daemon.features.squad.allowOverride` | bool | `true` | global | no | yes | `AWMAN_DAEMON_FEATURES_SQUAD_ALLOW_OVERRIDE` | Let a squad task choose its own interaction. |

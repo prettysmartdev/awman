@@ -42,7 +42,7 @@ case "$target" in
     *) echo "unsupported payload target: $target" >&2; exit 2 ;;
 esac
 # Cargo must not build as root (root-owned target/ and caches); run this as
-# yourself, then `sudo make install` afterwards if needed.
+# yourself, then `make install` afterwards if needed.
 [ "$(id -u)" != 0 ] || blocked "run as your own user, not root"
 # The promoted change must be exactly the candidate record, and gate 3 checks
 # out HEAD: uncommitted changes would be tested by some gates and not others.
@@ -115,7 +115,7 @@ RUNNER_TEMP=$work bash "$work/checkout/tools/native-builtin-ci.sh" "$target"
 
 step "Gate: optimized, signed artifact traced through an offline session"
 # Own target dir, like the other gates: the checkout's target/ may hold
-# root-owned files from an earlier `sudo make install`.
+# root-owned files from an earlier root build.
 release_target=$work/release-target
 CARGO_TARGET_DIR=$release_target cargo build --locked --release --features builtin-runtime --target "$target" --bin awman
 artifact=$work/awman

@@ -174,7 +174,7 @@ fn every_top_level_command_is_present() {
     let cat = CommandCatalogue::get();
     for name in [
         "init", "ready", "chat", "specs", "agents", "config", "exec", "daemon", "squad", "remote",
-        "new", "worker",
+        "new", "link", "queue",
     ] {
         assert!(cat.lookup(&[name]).is_some(), "missing top-level '{name}'");
     }
@@ -586,7 +586,6 @@ fn all_expected_subcommands_are_present() {
         (&["new"], "workflow"),
         (&["new"], "skill"),
         (&["new"], "agent"),
-        (&["worker"], "link"),
     ];
     for (parent_path, subcmd_name) in cases {
         let parent = cat
@@ -675,6 +674,7 @@ fn config_and_transport_clients_can_run_without_a_local_runtime() {
             "daemon start",
             "daemon status",
             "daemon stop",
+            "link",
             // Writes a definition file and never builds.
             "new agent",
             "queue",
@@ -688,8 +688,6 @@ fn config_and_transport_clients_can_run_without_a_local_runtime() {
             "remote session start",
             // A frontend entry point; the view's engine is the daemon's.
             "view",
-            "worker",
-            "worker link",
         ],
     );
 }

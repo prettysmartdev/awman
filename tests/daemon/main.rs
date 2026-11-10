@@ -14,6 +14,7 @@
 //! status_shape.rs           — `GET /v1/status` naming and round trip
 //! keys.rs                   — `/v1/keys` lifecycle, health
 //! lifecycle.rs              — start/stop/status/logs and moved-key hints
+//! browser_auth.rs           — browser links, grants, browsers.* and revocation
 
 #![cfg(unix)]
 
@@ -21,11 +22,14 @@
 mod api_process;
 mod support;
 
+mod browser_auth;
 mod concurrency;
 mod ephemeral_engine;
 mod feature_switching;
 mod keys;
+mod launch_contexts;
 mod lifecycle;
+mod listeners;
 mod local_listener_security;
 mod network_listener;
 mod status_shape;

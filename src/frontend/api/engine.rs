@@ -1,6 +1,7 @@
 //! Engine HTTP translation. The Layer 2 host owns every lifecycle decision.
 use super::error::ApiError;
 use crate::command::{
+    daemon_api::browser::{visible_instance, BrowserPrincipal},
     daemon_api::{engine::*, DaemonApi, Operation},
     instance::host::HostError,
 };
@@ -41,12 +42,50 @@ fn error(e: HostError) -> Response {
 async fn handle(
     State(api): State<Arc<DaemonApi>>,
     axum::Extension(op): axum::Extension<Operation>,
+    browser: Option<axum::Extension<BrowserPrincipal>>,
     params: Option<Path<HashMap<String, String>>>,
     Query(pairs): Query<Vec<(String, String)>>,
+    headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
     let host = api.runtime.engine_host();
     let params = params.map(|Path(p)| p).unwrap_or_default();
+    if op == Operation::EngineCatalogue {
+        let value = crate::command::daemon_api::web_projections::catalogue();
+        let etag = format!("\"{}\"", value["etag"].as_str().unwrap());
+        let cached = headers
+            .get(axum::http::header::IF_NONE_MATCH)
+            .and_then(|h| h.to_str().ok())
+            .is_some_and(|h| {
+                h.split(',')
+                    .any(|part| part.trim() == etag || part.trim() == "*")
+            });
+        let mut response = if cached {
+            axum::http::StatusCode::NOT_MODIFIED.into_response()
+        } else {
+            Json(value).into_response()
+        };
+        response
+            .headers_mut()
+            .insert(axum::http::header::ETAG, etag.parse().unwrap());
+        return response;
+    }
+    if op == Operation::EnginePrompts {
+        let get = |name: &str| {
+            pairs
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.as_str())
+        };
+        return match crate::command::daemon_api::web_projections::prompt(
+            get("kind").unwrap_or(""),
+            get("action"),
+            get("name").unwrap_or(""),
+        ) {
+            Some(p) => Json(p).into_response(),
+            None => ApiError::not_found("prompt not found").into_response(),
+        };
+    }
     let mut page = ListQuery::default();
     let mut filters = Vec::new();
     for (key, value) in pairs {
@@ -84,16 +123,78 @@ async fn handle(
             }
         };
     }
+    if matches!(
+        op,
+        Operation::EngineLaunchContextsList
+            | Operation::EngineLaunchContextsCreate
+            | Operation::EngineLaunchContextsRefresh
+            | Operation::EngineLaunchContextsDelete
+    ) {
+        use crate::data::ids::LaunchContextId;
+        use crate::data::launch_context::{CreateLaunchContext, RefreshLaunchContext};
+        let mut contexts = host.launch_contexts();
+        let result = match op {
+            Operation::EngineLaunchContextsList => {
+                contexts.list().map(|v| serde_json::to_value(v).unwrap())
+            }
+            Operation::EngineLaunchContextsCreate => contexts
+                .create(decode!(CreateLaunchContext))
+                .map(|v| serde_json::to_value(v).unwrap()),
+            _ => {
+                let Some(id) = params
+                    .get("id")
+                    .and_then(|s| LaunchContextId::parse(s).ok())
+                else {
+                    return ApiError::not_found("launch context not found").into_response();
+                };
+                if op == Operation::EngineLaunchContextsRefresh {
+                    contexts.refresh(&id, decode!(RefreshLaunchContext))
+                } else {
+                    contexts.delete(&id)
+                }
+                .map(|_| serde_json::json!({}))
+            }
+        };
+        return match result {
+            Ok(v) => Json(v).into_response(),
+            Err(e) => ApiError {
+                status: match e.code {
+                    "forbidden_workdir" => axum::http::StatusCode::FORBIDDEN,
+                    "not_found" => axum::http::StatusCode::NOT_FOUND,
+                    "conflict" => axum::http::StatusCode::CONFLICT,
+                    "context_store_unavailable" => axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    _ => axum::http::StatusCode::BAD_REQUEST,
+                },
+                code: e.code,
+                message: e.message,
+            }
+            .into_response(),
+        };
+    }
     if op == Operation::EngineInstancesList {
         let filter = match AnnotationFilter::parse(&filters) {
             Ok(f) => f,
             Err(e) => return ApiError::invalid_request(e.to_string()).into_response(),
         };
-        return Json(host.list(&filter, &page)).into_response();
+        let mut list = host.list(&filter, &page);
+        // Browsers see only instances they created or whose primary is a web
+        // frontend (D3).
+        if let Some(axum::Extension(browser)) = &browser {
+            list.items
+                .retain(|summary| visible_instance(&api, browser, summary));
+        }
+        return Json(list).into_response();
     }
     if op == Operation::EngineInstancesCreate {
         return match instances_create(&api, decode!(CreateInstanceRequest)) {
-            Ok(v) => (axum::http::StatusCode::CREATED, Json(v)).into_response(),
+            Ok(v) => {
+                if let Some(axum::Extension(browser)) = &browser {
+                    api.runtime
+                        .browser_auth()
+                        .record_instance(&browser.grant_id, &v.id);
+                }
+                (axum::http::StatusCode::CREATED, Json(v)).into_response()
+            }
             Err(e) => error(e),
         };
     }

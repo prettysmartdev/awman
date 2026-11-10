@@ -91,6 +91,7 @@ fn hello_for(root: &Path, role: FrontendRole) -> Hello {
         stdout_is_tty: true,
         view: None,
         resume: None,
+        launch_context: None,
     }
 }
 
