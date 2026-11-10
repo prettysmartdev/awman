@@ -22,16 +22,17 @@ all: build
 # The workspace has one distribution executable (awman-cli's awman target).
 # awman and awman-host-shims are libraries, including the private re-exec worker.
 
-# On Apple Silicon the experimental builtin runtime is included when its
-# payload verifies, and the binary is then ad-hoc signed with the hypervisor
+# On Apple Silicon the experimental builtin runtime requires a verified
+# payload, and the binary is then ad-hoc signed with the hypervisor
 # entitlement (tools/macos-sign.sh): macOS refuses to start a VM otherwise.
 # Other hosts build the existing backends only; the builtin runtime is released
 # for macOS on Apple Silicon only (WI 0124 tracks Linux).
 build:
 	@host="$$(rustc -vV | sed -n 's/^host: //p')"; \
-	if [ "$$host" = aarch64-apple-darwin ] && bash tools/msb-payloads/verify.sh "$$host" >/dev/null 2>&1; then \
+	if [ "$$host" = aarch64-apple-darwin ]; then \
+		bash tools/msb-payloads/verify.sh "$$host" || { echo 'Apple Silicon builtin payload is unavailable; run make payloads before installing' >&2; exit 1; }; \
 		cargo build --workspace --bins --release --features builtin-runtime && \
-		bash tools/macos-sign.sh $(TARGET_DIR)/release/$(BINARY); \
+		bash tools/macos-sign.sh "$(TARGET_DIR)/release/$(BINARY)"; \
 	else \
 		echo 'Builtin runtime not included for this host; building existing backends'; \
 		cargo build --workspace --bins --release; \
@@ -60,8 +61,9 @@ reproducible-build-audit:
 native-builtin-ci:
 	bash tools/native-builtin-ci.sh "$(TARGET)"
 
+# Build and sign as the current user. Only the final copy may need sudo.
 install: build
-	install -m 755 $(TARGET_DIR)/release/$(BINARY) $(INSTALL_PATH)/$(BINARY)
+	@bash tools/install.sh "$(TARGET_DIR)" "$(INSTALL_PATH)"
 
 # Every test target runs through tools/isolated-test.sh, which keeps the suite
 # off the developer's own machine: a throwaway HOME, no global git config, no

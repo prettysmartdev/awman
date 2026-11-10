@@ -16,7 +16,7 @@ Static builds use `cargo build --workspace --release --bins --target x86_64-unkn
 
 Developer Loop:
 - running `make all` should build the aspec CLI binary using the local Rust/Cargo toolchain
-- running `make install` should run `make all` and then install the aspec CLI to /usr/local/bin/
+- running `make install` should build and sign as the invoking user, then install the awman CLI to /usr/local/bin/, using sudo only for the copy if needed; the installed macOS signature is verified afterwards
 
 
 Local testing:
