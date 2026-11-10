@@ -1093,6 +1093,7 @@ async fn web_open_tab_is_confined_to_launch_context_roots() {
     let f = fixture();
     let root = f.root.join("repo");
     std::fs::create_dir(root.join("sub")).unwrap();
+    let canonical_root = std::fs::canonicalize(&root).unwrap();
     let native = f.hello(FrontendRole::Primary);
     let c = f
         .host
@@ -1114,7 +1115,7 @@ async fn web_open_tab_is_confined_to_launch_context_roots() {
     let id = f.host.create_instance(Annotations::new()).unwrap();
     let (primary, mut rx) = f.attach(&id, web.clone()).await.unwrap();
     let state = f.host.find(&id).unwrap();
-    assert_eq!(state.state().env.as_ref().unwrap().cwd(), root);
+    assert_eq!(state.state().env.as_ref().unwrap().cwd(), canonical_root);
     assert_eq!(
         state.state().env.as_ref().unwrap().get("GITHUB_TOKEN"),
         Some(SECRET)

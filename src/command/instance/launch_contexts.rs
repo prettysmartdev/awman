@@ -282,7 +282,7 @@ mod tests {
         assert_eq!(restarted.list().unwrap().items[0].env_state, "stale");
         let (env, stale) = restarted.resolve_env(&c.id).unwrap();
         assert!(stale);
-        assert_eq!(env.cwd(), root);
+        assert_eq!(env.cwd(), c.root);
         assert_eq!(env.get("PATH"), Some("daemon-path"));
         assert!(env.get("SECRET").is_none());
         assert!(restarted
@@ -302,10 +302,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("repo");
         std::fs::create_dir_all(root.join("sub")).unwrap();
-        let roots = vec![root.clone()];
+        let canonical_root = std::fs::canonicalize(&root).unwrap();
+        let roots = vec![canonical_root.clone()];
         assert_eq!(
             LaunchContextRegistry::resolve_dir(&roots, &root, Path::new("sub")).unwrap(),
-            root.join("sub")
+            canonical_root.join("sub")
         );
         assert!(LaunchContextRegistry::resolve_dir(&roots, &root, Path::new("../")).is_err());
         #[cfg(unix)]
