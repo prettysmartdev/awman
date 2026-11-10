@@ -30,6 +30,8 @@ const AUTH: &[&str] = &[
     "authentication failed",
     "could not read username",
     "could not read password",
+    // Git 2.44+ with `credential.interactive=false` and no credential.
+    "unable to get password from user",
     "permission denied (publickey",
     "http 401",
     "http 403",
@@ -110,6 +112,7 @@ mod tests {
                 "fatal: could not read Username for 'https://h': terminal prompts disabled",
                 Auth,
             ),
+            ("fatal: unable to get password from user", Auth),
             (
                 "fatal: unable to access 'https://h/r/': The requested URL returned error: 403",
                 Auth,
@@ -219,6 +222,12 @@ impl ResponseTrace {
             return GitFailureClass::Other;
         };
         let trace = trace.to_ascii_lowercase();
+        // Git's wording for a refused or missing credential differs between
+        // versions; the remote's last answer does not. A final 401 or 403 is
+        // an authentication failure whatever stderr says.
+        if matches!(last_http_status(&trace), Some(401 | 403)) {
+            return GitFailureClass::Auth;
+        }
         let response_seen = trace.contains("<= recv header") || trace.contains("<= recv data");
         if response_seen {
             return GitFailureClass::Other;
@@ -238,9 +247,39 @@ impl ResponseTrace {
     }
 }
 
+/// The status of the last HTTP response in a lower-cased curl trace.
+fn last_http_status(trace: &str) -> Option<u16> {
+    trace
+        .lines()
+        .filter_map(|line| line.split_once("<= recv header: http/"))
+        .filter_map(|(_, rest)| rest.split_whitespace().nth(1)?.parse().ok())
+        .next_back()
+}
+
 #[cfg(test)]
 mod response_evidence_tests {
     use super::*;
+    #[test]
+    fn a_final_401_or_403_is_an_auth_failure_whatever_git_printed() {
+        let mut command = std::process::Command::new("git");
+        let trace = ResponseTrace::attach(&mut command).unwrap();
+        let unknown = "fatal: unable to complete the request";
+        std::fs::write(
+            trace.0.path(),
+            "10:00:00.1 http.c:1 <= Recv header: HTTP/1.1 401 Unauthorized\n",
+        )
+        .unwrap();
+        assert_eq!(trace.classify(unknown, false), GitFailureClass::Auth);
+        std::fs::write(trace.0.path(), "<= Recv header: HTTP/2 403 \n").unwrap();
+        assert_eq!(trace.classify(unknown, false), GitFailureClass::Auth);
+        // A challenge that was then answered is not the failure.
+        std::fs::write(
+            trace.0.path(),
+            "<= Recv header: HTTP/1.1 401 Unauthorized\n<= Recv header: HTTP/1.1 200 OK\n",
+        )
+        .unwrap();
+        assert_eq!(trace.classify(unknown, false), GitFailureClass::Other);
+    }
     #[test]
     fn reset_after_response_is_never_retried_and_unknown_evidence_fails_closed() {
         let mut command = std::process::Command::new("git");
