@@ -578,6 +578,10 @@ async fn feature_cancel_releases_background_and_foreground_clones_before_job_cre
         item.repo.url = format!("{}/repo.git", server.uri());
         item.repo.credentials = None;
         item.exec.interaction = None;
+        // The fixture's default one-second command deadline can cancel a
+        // slow macOS checkout before its first Git request reaches the mock.
+        // This test controls cancellation explicitly through cancel_jobs().
+        item.exec.timeout_ms = None;
         let lease = awman_wsp::Lease {
             id: "server-cloning".into(),
             epoch: 1,

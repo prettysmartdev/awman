@@ -135,10 +135,9 @@ test-builtin:
 test-builtin-hw:
 	@bash tools/test-builtin-hw.sh
 
-# Measure the strict latency budget before Docker-heavy integration tests load the runner.
 test-full:
-	@AWMAN_TEST_DOCKER=1 AWMAN_TEST_TMPROOT="$(AWMAN_TEST_TMPROOT)" bash tools/isolated-test.sh -p awman-cli --test engine_parity latency:: -- --quiet --test-threads=1
 	@AWMAN_TEST_DOCKER=1 AWMAN_TEST_TMPROOT="$(AWMAN_TEST_TMPROOT)" bash tools/isolated-test.sh -- --quiet --skip latency::
+	@AWMAN_TEST_TMPROOT="$(AWMAN_TEST_TMPROOT)" bash tools/isolated-test.sh -p awman-cli --test engine_parity latency:: -- --quiet --test-threads=1
 
 architecture-lint:
 	@bash tools/architecture-lint.sh
