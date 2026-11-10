@@ -36,9 +36,12 @@ describe('InstanceStore', () => {
 
   it('bounds output per tab and drops output for closed tabs', () => {
     const store = storeWithSnapshot();
-    for (let i = 0; i < OUTPUT_LIMIT + 10; i++) store.applyFrame({ type: 'command_output', tab_id: TAB, stream: 'stdout', level: 'info', text: `line ${i}` });
+    const initial = Array.from({ length: OUTPUT_LIMIT }, (_, i) => `line ${i}`).join('\n');
+    store.applyFrame({ type: 'command_output', tab_id: TAB, stream: 'stdout', level: 'info', text: initial });
+    for (let i = OUTPUT_LIMIT; i < OUTPUT_LIMIT + 10; i++) store.applyFrame({ type: 'command_output', tab_id: TAB, stream: 'stdout', level: 'info', text: `line ${i}` });
     const out = store.get().outputs.get(TAB)!;
     expect(out).toHaveLength(OUTPUT_LIMIT);
+    expect(out[0]).toMatchObject({ text: 'line 10' });
     expect(out[out.length - 1]).toMatchObject({ text: `line ${OUTPUT_LIMIT + 9}` });
     store.applyDelta({ delta: 'tab_closed', value: { tab_id: TAB } });
     expect(store.get().outputs.has(TAB)).toBe(false);
