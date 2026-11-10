@@ -2,7 +2,7 @@
 // Keep Next on loopback. When Tailscale is running, a TCP relay listens only
 // on this machine's tailnet IPv4 address and forwards to the same dev server.
 import { execFileSync, spawn } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import { connect, createServer, isIP } from 'node:net';
 import { fileURLToPath } from 'node:url';
 
@@ -32,17 +32,14 @@ async function tailnetRelay(ip) {
 const ip = activeTailnetIp();
 const relay = ip ? await tailnetRelay(ip) : null;
 const webDir = fileURLToPath(new URL('../web/', import.meta.url));
-const next = fileURLToPath(new URL('../web/node_modules/next/dist/bin/next', import.meta.url));
-if (!existsSync(next)) {
-  console.error('Web dependencies are missing. Run pnpm --dir web install first.');
-  relay?.close();
-  process.exit(1);
-}
+const { packageManager } = JSON.parse(readFileSync(new URL('../web/package.json', import.meta.url), 'utf8'));
 console.log('Web app: http://127.0.0.1:3000 (local)');
 if (relay) console.log(`Web app: http://${ip}:3000 (tailnet)`);
-const env = { ...process.env, NEXT_TELEMETRY_DISABLED: '1' };
+const env = { ...process.env };
 if (relay) env.WEB_DEV_TAILNET_IP = ip;
-const child = spawn(process.execPath, [next, 'dev', '--hostname', '127.0.0.1', '--port', '3000'], { cwd: webDir, stdio: 'inherit', env });
+// npm exec installs the pinned pnpm into its cache and keeps it on PATH for
+// Next's own SWC downloader, which calls `pnpm config get registry` on demand.
+const child = spawn('npm', ['exec', '--yes', `--package=${packageManager}`, '--', 'pnpm', 'run', 'dev'], { cwd: webDir, stdio: 'inherit', env });
 const stop = signal => { child.kill(signal); relay?.close(); };
 process.on('SIGINT', () => stop('SIGINT'));
 process.on('SIGTERM', () => stop('SIGTERM'));
