@@ -707,13 +707,13 @@ have the effective defaults above.
 | `tui.integrations.*.enabled` | enum `auto\|on\|off` | `"auto"` | repo | no | no | `AWMAN_TUI_INTEGRATIONS_<NAME>_ENABLED` | Whether this TUI integration is selected automatically, enabled, or disabled. |
 | `daemon.maxConcurrentJobs` | int ≥ 1 | `4` | global | no | yes | `AWMAN_DAEMON_MAX_CONCURRENT_JOBS` | Jobs the daemon runs at once. |
 | `daemon.verboseSetup` | bool | `false` | global | no | yes | `AWMAN_DAEMON_VERBOSE_SETUP` | Log session setup in detail. |
-| `daemon.terminal.cols` | int ≥ 1 | `120` | global | no | yes | `AWMAN_DAEMON_TERMINAL_COLS` | Default daemon terminal width (read from 0141). |
-| `daemon.terminal.rows` | int ≥ 1 | `40` | global | no | yes | `AWMAN_DAEMON_TERMINAL_ROWS` | Default daemon terminal height (read from 0141). |
-| `daemon.terminal.remoteInput` | bool | `false` | global | no | yes | `AWMAN_DAEMON_TERMINAL_REMOTE_INPUT` | Accept terminal input from network clients (read from 0141). |
-| `daemon.network.listeners.*.enabled` | bool | `false` | global | no | yes | `AWMAN_DAEMON_NETWORK_LISTENERS_<NAME>_ENABLED` | Serve the API on the network listener (read from 0140). |
+| `daemon.terminal.cols` | int ≥ 1 | `120` | global | no | yes | `AWMAN_DAEMON_TERMINAL_COLS` | Default daemon terminal width. |
+| `daemon.terminal.rows` | int ≥ 1 | `40` | global | no | yes | `AWMAN_DAEMON_TERMINAL_ROWS` | Default daemon terminal height. |
+| `daemon.terminal.remoteInput` | bool | `false` | global | no | yes | `AWMAN_DAEMON_TERMINAL_REMOTE_INPUT` | Accept terminal input from network clients. |
+| `daemon.network.listeners.*.enabled` | bool | `false` | global | no | yes | `AWMAN_DAEMON_NETWORK_LISTENERS_<NAME>_ENABLED` | Serve the API on the network listener. |
 | `daemon.network.listeners.*.listen` | string | `null` | global | no | no | `AWMAN_DAEMON_NETWORK_LISTENERS_<NAME>_LISTEN` | host:port the API listener binds; changing it needs a daemon restart. |
-| `daemon.network.listeners.*.tlsSans` | list<string> | `[]` | global | no | yes | `AWMAN_DAEMON_NETWORK_LISTENERS_<NAME>_TLS_SANS` | Extra names in the listener's TLS certificate (read from 0140). |
-| `daemon.network.listeners.*.features` | list<string> | `[]` | global | no | yes | `AWMAN_DAEMON_NETWORK_LISTENERS_<NAME>_FEATURES` | Features served on the network listener (read from 0140). |
+| `daemon.network.listeners.*.tlsSans` | list<string> | `[]` | global | no | yes | `AWMAN_DAEMON_NETWORK_LISTENERS_<NAME>_TLS_SANS` | Extra names in the listener's TLS certificate. |
+| `daemon.network.listeners.*.features` | list<string> | `[]` | global | no | yes | `AWMAN_DAEMON_NETWORK_LISTENERS_<NAME>_FEATURES` | Features served on the network listener. |
 | `daemon.network.listeners.*.transport` | enum `tls\|loopback_http` | `"tls"` | global | no | yes | `AWMAN_DAEMON_NETWORK_LISTENERS_<NAME>_TRANSPORT` | Listener transport; plain HTTP requires a literal loopback address. |
 | `daemon.network.listeners.*.allowedOrigins` | list<string> | `[]` | global | no | yes | `AWMAN_DAEMON_NETWORK_LISTENERS_<NAME>_ALLOWED_ORIGINS` | Exact browser origins allowed on this listener. |
 | `daemon.features.squad.enabled` | bool | `false` | global | no | yes | `AWMAN_DAEMON_FEATURES_SQUAD_ENABLED` | Run the squad scheduler. |
