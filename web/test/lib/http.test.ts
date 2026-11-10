@@ -11,6 +11,9 @@ afterEach(() => clearGrant());
 
 describe('HttpTransport', () => {
   it('uses the loaded page hostname for daemon HTTP and WebSocket endpoints', () => {
+    expect(daemonEndpoints({ hostname: 'localhost', protocol: 'http:' })).toEqual({
+      http: 'http://127.0.0.1:9877', ws: 'ws://127.0.0.1:9877', hostPort: '127.0.0.1:9877',
+    });
     expect(daemonEndpoints({ hostname: '100.101.102.103', protocol: 'http:' })).toEqual({
       http: 'http://100.101.102.103:9877', ws: 'ws://100.101.102.103:9877', hostPort: '100.101.102.103:9877',
     });

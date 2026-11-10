@@ -375,7 +375,7 @@ async fn browser_requests_never_reach_api_key_auth_and_origin_host_authorities_s
         health.json::<Value>().await.unwrap(),
         json!({"status":"ok"})
     );
-    for origin in ["null", "https://evil.example", "http://localhost:3000"] {
+    for origin in ["null", "https://evil.example", "http://localhost:3001"] {
         let response = client
             .get(format!("{base}/v1/health"))
             .header("Origin", origin)
@@ -399,6 +399,16 @@ async fn browser_requests_never_reach_api_key_auth_and_origin_host_authorities_s
         response.headers()["access-control-allow-origin"],
         "https://awman.prettysmart.dev"
     );
+    for origin in ["http://127.0.0.1:3000", "http://localhost:3000"] {
+        let response = client
+            .get(format!("{base}/v1/health"))
+            .header("Origin", origin)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.headers()["access-control-allow-origin"], origin);
+    }
     let forged = client
         .get(format!("{base}/v1/health"))
         .header("Host", "evil.example")

@@ -15,7 +15,6 @@ test('default-off, stopped, live recipe and idempotent recheck', async ({ page, 
   expect(before.listeners.network.default?.bound ?? null).toBeNull();
   expect(before.listeners.network.loopback?.bound ?? null).toBeNull();
   expect(await probe()).toBeNull();
-  await daemon.allowOrigin();
   for (let i = 0; i < 2; i++) {
     await daemon.recipe();
     await expect.poll(probe).toBe(200);
@@ -34,9 +33,7 @@ test('exact origin, replacement and browser requests cannot use API keys', async
     try { return (await fetch(endpoint + '/v1/health', { cache: 'no-store' })).status; }
     catch { return null; }
   }, endpoint);
-  // The production preset must reject this development origin until the owner adds it.
-  expect(await probe()).toBeNull();
-  await daemon.allowOrigin();
+  // Both local development origins are present in the default listener policy.
   await expect.poll(probe).toBe(200);
   const key = JSON.parse(await daemon.cli('daemon', 'api', 'keys.create', 'name=browser-rejection', '--json')).key;
   const status = await page.evaluate(async ({ endpoint, key }) => {

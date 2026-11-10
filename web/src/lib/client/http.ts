@@ -8,9 +8,9 @@
 import { DaemonError, DaemonUnreachable, ProtocolError, isAbortError } from './errors';
 import type { ApiErrorBody } from './types';
 
-/** The daemon is addressed through the host that served this page. */
+/** Localhost pages use IPv4 because the built-in daemon listener binds 127.0.0.1. */
 export function daemonEndpoints(page: Pick<Location, 'hostname' | 'protocol'>): { http: string; ws: string; hostPort: string } {
-  const hostPort = `${page.hostname}:9877`;
+  const hostPort = `${page.hostname === 'localhost' ? '127.0.0.1' : page.hostname}:9877`;
   const secure = page.protocol === 'https:';
   return { http: `${secure ? 'https' : 'http'}://${hostPort}`, ws: `${secure ? 'wss' : 'ws'}://${hostPort}`, hostPort };
 }

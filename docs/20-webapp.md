@@ -23,9 +23,10 @@ awman config set daemon.network.listeners.loopback.enabled true
 awman daemon start --background
 ```
 
-When loaded from <http://127.0.0.1:3000>, the app connects to
-`http://127.0.0.1:9877`. When loaded from another hostname, it uses that
-hostname and the page's HTTP or HTTPS scheme. The current engine listener
+When loaded from <http://127.0.0.1:3000> or <http://localhost:3000>, the app
+connects to `127.0.0.1:9877`, where the built-in daemon listener binds. From
+another hostname, it uses that hostname and the page's HTTP or HTTPS scheme.
+The current engine listener
 accepts loopback only; use the local development address for a working daemon
 connection until remote engine access is available. The hosted page currently
 cannot reach a daemon through its own hostname. If your browser asks to allow
@@ -45,13 +46,15 @@ again after a daemon restart.
 ## Run the web app locally
 
 From the repository root, install the web dependencies and start the development
-server with `make web/dev`. Open <http://127.0.0.1:3000>. If Tailscale is
+server with `make web/dev`. Open <http://127.0.0.1:3000> or
+<http://localhost:3000>. If Tailscale is
 running, the target also prints a URL using this machine's tailnet IPv4 address.
-To link the local origin, add it to the loopback listener's exact origin list:
+Both local origins are allowed by the default loopback listener. If you have
+overridden `allowedOrigins`, include both local origins in its exact origin list:
 
 ```sh
 make web/reinstall
-awman config set daemon.network.listeners.loopback.allowedOrigins https://awman.prettysmart.dev,http://127.0.0.1:3000
+awman config set daemon.network.listeners.loopback.allowedOrigins https://awman.prettysmart.dev,http://127.0.0.1:3000,http://localhost:3000
 make web/dev
 ```
 
@@ -165,15 +168,15 @@ browser grants, and bind errors. The `loopback` listener should be enabled at
 `127.0.0.1:9877` and serve `engine`. If it is missing or has a bind error,
 check the two settings above and whether another process is using that port.
 The hosted app origin must be in `allowedOrigins`; the built-in `loopback`
-listener includes it by default. For local development, add the development
-origin explicitly. Origins must match exactly, including scheme and port:
+listener includes it and both local development origins by default. If you
+overrode `allowedOrigins`, add both development origins explicitly. Origins
+must match exactly, including scheme and port:
 
 ```sh
-awman config set daemon.network.listeners.loopback.allowedOrigins https://awman.prettysmart.dev,http://127.0.0.1:3000
+awman config set daemon.network.listeners.loopback.allowedOrigins https://awman.prettysmart.dev,http://127.0.0.1:3000,http://localhost:3000
 ```
 
-`http://localhost:3000` is a different origin and must be added separately if
-needed. Setting `allowedOrigins` replaces the list, so keep the hosted origin
+Setting `allowedOrigins` replaces the list, so keep the hosted origin
 when adding development origins. Use the browser's local-network permission
 for the hosted app when it is requested, and recheck after changing listener
 settings.

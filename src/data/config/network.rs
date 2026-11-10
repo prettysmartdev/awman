@@ -301,7 +301,14 @@ pub fn builtin_listener(name: &str) -> Option<ListenerSettings> {
             "127.0.0.1:9877",
             ListenerTransport::LoopbackHttp,
             vec![FeatureName::Engine],
-            vec![BrowserOrigin::parse(HOSTED_WEBAPP_ORIGIN).unwrap()],
+            [
+                HOSTED_WEBAPP_ORIGIN,
+                "http://127.0.0.1:3000",
+                "http://localhost:3000",
+            ]
+            .into_iter()
+            .map(|origin| BrowserOrigin::parse(origin).unwrap())
+            .collect(),
         ),
         _ => return None,
     };
@@ -486,7 +493,12 @@ mod listener_tests {
         assert!(d.allowed_origins.is_empty() && d.tls_sans.is_empty() && l.tls_sans.is_empty());
         assert_eq!(
             l.allowed_origins,
-            [BrowserOrigin::parse(HOSTED_WEBAPP_ORIGIN).unwrap()]
+            [
+                HOSTED_WEBAPP_ORIGIN,
+                "http://127.0.0.1:3000",
+                "http://localhost:3000"
+            ]
+            .map(|origin| BrowserOrigin::parse(origin).unwrap())
         );
         let file = validate(json!({"custom":{"listen":"127.0.0.1:9999"}})).unwrap();
         let resolved = resolve_listeners(&file.daemon.unwrap().network.unwrap());

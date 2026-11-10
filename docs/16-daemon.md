@@ -248,14 +248,15 @@ awman config set daemon.network.listeners.default.tlsSans api.example.org
 port, for example `https://awman.prettysmart.dev` or
 `http://127.0.0.1:3000`. It controls which browser origins may connect; it is
 not itself authentication. Browser linking requires an allowed origin and an
-owner's approval on the local daemon. The `loopback` listener's default origin
-is the hosted web app. For development, add the development origin explicitly:
+owner's approval on the local daemon. The `loopback` listener allows the hosted
+web app and both local development origins by default. If `allowedOrigins` has
+been overridden, include both local origins explicitly:
 
 ```sh
-awman config set daemon.network.listeners.loopback.allowedOrigins https://awman.prettysmart.dev,http://127.0.0.1:3000
+awman config set daemon.network.listeners.loopback.allowedOrigins https://awman.prettysmart.dev,http://127.0.0.1:3000,http://localhost:3000
 ```
 
-Use a separate entry for `http://localhost:3000`; origins must match exactly.
+Origins must match exactly.
 Review and revoke browser grants through the local daemon API with
 `awman daemon api browsers.list` and `awman daemon api browsers.delete
 id=<browser-id>`. See the [Web App guide](20-webapp.md) for setup.
