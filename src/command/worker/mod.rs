@@ -95,6 +95,9 @@ pub struct PullController<F: ApiCommandFrontendFactory + 'static> {
     /// stopping daemon takes nothing new while a daemon that keeps running
     /// resumes pulling.
     drain_until: Mutex<Option<std::time::Instant>>,
+    /// Set once the running worker has tried to register its servers, so a
+    /// listing asked for right after start waits instead of failing.
+    registered_once: AtomicBool,
     core_shutdown: CancellationToken,
     helper: crate::engine::worker::credential_helper::HelperProgram,
 }
@@ -121,6 +124,7 @@ impl<F: ApiCommandFrontendFactory + 'static> PullController<F> {
             shutting_down: AtomicBool::new(false),
             claim_stop: Mutex::new(CancellationToken::new()),
             drain_until: Mutex::new(None),
+            registered_once: AtomicBool::new(false),
             core_shutdown: core.shutdown(),
             helper,
         }))
@@ -501,12 +505,14 @@ impl<F: ApiCommandFrontendFactory + 'static> PullController<F> {
         self.accepting.store(true, Ordering::SeqCst);
         self.shutting_down.store(false, Ordering::SeqCst);
         *self.drain_until.lock().unwrap() = None;
+        self.registered_once.store(false, Ordering::SeqCst);
         let mut claims = BTreeMap::<String, tokio::task::JoinHandle<()>>::new();
         while !stop.is_cancelled() {
             self.resume_after_drain(&stop);
             if let Err(error) = self.refresh_servers().await {
                 tracing::warn!(%error, "work server registration failed");
             }
+            self.registered_once.store(true, Ordering::SeqCst);
             if let Err(error) = self.cleanup_retired() {
                 tracing::warn!(%error, "retired work server cleanup failed");
             }
@@ -1123,6 +1129,14 @@ impl<F: ApiCommandFrontendFactory + 'static> PullHandle for PullHandleAdapter<F>
                 .map(|(name, _)| name.clone())
                 .collect(),
         };
+        // Right after start the first registrations are still in flight.
+        let started = std::time::Instant::now();
+        while self.0.accepting.load(Ordering::SeqCst)
+            && !self.0.registered_once.load(Ordering::SeqCst)
+            && started.elapsed() < Duration::from_secs(10)
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         let mut rows = Vec::new();
         // A merged listing shows what the reachable servers offer: one server
         // being down must not hide the others. It fails only when a named
