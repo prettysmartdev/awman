@@ -317,7 +317,13 @@ fn validate_workspace_mounts(
             if !host.starts_with(clone)
                 && inline_file.as_deref() != Some(host.as_path())
                 && !command_mounts.iter().any(|allowed| {
-                    allowed.host_path == host
+                    // Compare resolved paths: on macOS a temporary directory is
+                    // reached through a symlink (/var -> /private/var).
+                    allowed
+                        .host_path
+                        .canonicalize()
+                        .unwrap_or_else(|_| allowed.host_path.clone())
+                        == host
                         && allowed.container_path == spec.container_path
                         && allowed.permission == spec.permission
                 })
