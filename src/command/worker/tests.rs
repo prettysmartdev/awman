@@ -599,7 +599,7 @@ async fn feature_cancel_releases_background_and_foreground_clones_before_job_cre
             .await;
         Mock::given(method("GET"))
             .and(path("/repo.git/info/refs"))
-            .respond_with(ResponseTemplate::new(404).set_delay(Duration::from_secs(30)))
+            .respond_with(ResponseTemplate::new(404).set_delay(Duration::from_secs(90)))
             .mount(&server)
             .await;
         Mock::given(method("POST"))
@@ -613,7 +613,10 @@ async fn feature_cancel_releases_background_and_foreground_clones_before_job_cre
             tokio::spawn(
                 async move { c.claim_next_for(Some("blocked"), "team", foreground).await },
             );
-        let clone_started = tokio::time::timeout(Duration::from_secs(5), async {
+        // A busy macOS runner may take several seconds to schedule Git while
+        // the rest of the hermetic suite runs. Wait for the request itself;
+        // the mock keeps it pending until cancellation is exercised below.
+        let clone_started = tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 if server
                     .received_requests()
