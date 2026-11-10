@@ -1129,9 +1129,11 @@ impl<F: ApiCommandFrontendFactory + 'static> PullHandle for PullHandleAdapter<F>
                 .map(|(name, _)| name.clone())
                 .collect(),
         };
-        // Right after start the first registrations are still in flight.
+        // Right after start the worker may not have begun, or its first
+        // registrations may still be in flight.
         let started = std::time::Instant::now();
-        while self.0.accepting.load(Ordering::SeqCst)
+        while settings.pull_enabled
+            && !names.is_empty()
             && !self.0.registered_once.load(Ordering::SeqCst)
             && started.elapsed() < Duration::from_secs(10)
         {

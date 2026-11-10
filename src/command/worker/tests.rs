@@ -718,6 +718,7 @@ async fn merged_queue_lists_reachable_servers_and_fails_only_for_a_named_one() {
     let server = protocol_mock().await;
     let (_home, controller) = controller(&server.uri()).await;
     controller.refresh_servers().await.unwrap();
+    controller.registered_once.store(true, Ordering::SeqCst);
     controller
         .servers
         .write()
