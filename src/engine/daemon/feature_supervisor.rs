@@ -136,6 +136,7 @@ impl FeatureSupervisor {
                         s.state = FeatureState::On;
                     }
                 });
+                tracing::info!(feature = %self.name(), "daemon feature now enabled by config");
             }
             return Ok(());
         }
@@ -148,6 +149,7 @@ impl FeatureSupervisor {
             Ok(task) => task,
             Err(e) => {
                 self.core.executor().set_share(self.name(), 0);
+                tracing::warn!(feature = %self.name(), error = %e, "daemon feature failed to start");
                 return Err(e);
             }
         };
@@ -162,6 +164,11 @@ impl FeatureSupervisor {
             s.since = chrono::Utc::now();
             s.last_error = None;
         });
+        tracing::info!(
+            feature = %self.name(),
+            enabled_by = enabled_by_label(by),
+            "daemon feature started"
+        );
         let stop = CancellationToken::new();
         let watcher = tokio::spawn(watch_feature(
             task,
@@ -201,6 +208,11 @@ impl FeatureSupervisor {
             s.state = FeatureState::Draining;
             s.since = chrono::Utc::now();
         });
+        tracing::info!(
+            feature = %self.name(),
+            mode = if mode == StopMode::Now { "now" } else { "drain" },
+            "daemon feature stopping"
+        );
         // Suppress restart before invoking feature drain. The watcher keeps
         // awaiting the feature task so drain cannot orphan a running task.
         run.stop.cancel();
@@ -230,6 +242,7 @@ impl FeatureSupervisor {
                 s.reason = None;
                 s.since = chrono::Utc::now();
             });
+            tracing::info!(feature = %supervisor.name(), "daemon feature stopped");
             let pending = supervisor.pending_enable.lock().unwrap().take();
             if let Some((by, reason)) = pending {
                 if let Err(error) = supervisor.enable_locked(by, reason, true).await {
@@ -264,6 +277,12 @@ impl FeatureSupervisor {
         self.state.borrow().enabled_by
     }
 }
+fn enabled_by_label(by: EnabledBy) -> &'static str {
+    match by {
+        EnabledBy::Config => "config",
+        EnabledBy::Ephemeral => "ephemeral",
+    }
+}
 async fn watch_feature(
     mut task: FeatureTask,
     feature: Arc<dyn DaemonFeature>,
@@ -280,6 +299,9 @@ async fn watch_feature(
             _=tokio::time::sleep(backoff.reset_after)=>{
                 healthy=true;
                 delay=backoff.initial;
+                if state.borrow().state == FeatureState::Degraded {
+                    tracing::info!(feature = %feature.name(), "daemon feature recovered");
+                }
                 state.send_modify(|s| { if s.state==FeatureState::Degraded { s.state=if s.enabled_by==Some(EnabledBy::Config) { FeatureState::On } else { FeatureState::Ephemeral }; s.last_error=None; s.since=chrono::Utc::now(); } });
                 task.await
             }
@@ -295,6 +317,12 @@ async fn watch_feature(
             Ok(Err(e)) => e.to_string(),
             Err(e) => e.to_string(),
         };
+        tracing::error!(
+            feature = %feature.name(),
+            %error,
+            retry_in_ms = delay.as_millis() as u64,
+            "daemon feature crashed; restarting"
+        );
         state.send_modify(|s| {
             s.state = FeatureState::Degraded;
             s.last_error = Some(error);
@@ -310,13 +338,17 @@ async fn watch_feature(
             }=>result };
             match started {
                 Ok(next) => {
+                    tracing::info!(feature = %feature.name(), "daemon feature restarted");
                     task = next;
                     break;
                 }
-                Err(e) => state.send_modify(|s| {
-                    s.last_error = Some(e.to_string());
-                    s.restarts = s.restarts.saturating_add(1);
-                }),
+                Err(e) => {
+                    tracing::warn!(feature = %feature.name(), error = %e, "daemon feature restart failed");
+                    state.send_modify(|s| {
+                        s.last_error = Some(e.to_string());
+                        s.restarts = s.restarts.saturating_add(1);
+                    })
+                }
             }
         }
     }

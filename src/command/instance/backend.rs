@@ -25,10 +25,10 @@ use crate::command::stats_sampler::ContainerStatsSampler;
 use crate::data::annotations::Annotations;
 use crate::data::frontend_protocol::{AnsweredBy, DetachReasonWire, Seq, UiOutcome, UiRequest};
 use crate::data::ids::{DialogId, FrontendId, InstanceId, TabId, TerminalId};
-use crate::data::instance_snapshot::{AnnotationTarget, FrontendSummary, SlotId};
+use crate::data::instance_snapshot::{AnnotationTarget, FrontendSummary};
 use crate::data::message::MessageLevel;
-use crate::data::program_status::EffectiveStatus;
 use crate::data::session::{Session, SessionId};
+use crate::engine::agent_runtime::execution::AgentStats;
 
 use super::feeds::ContainerSlotIo;
 use super::{
@@ -77,11 +77,22 @@ pub enum BackendEvent {
         frontend_id: FrontendId,
     },
     Detached(DetachReasonWire),
-    ProgramStatus {
+    /// The engine sampled a slot's container (the presenter has no runtime
+    /// of its own to ask).
+    SlotStats {
         tab_id: TabId,
-        slot_id: SlotId,
-        status: Option<EffectiveStatus>,
+        slot: PresenterSlot,
+        stats: AgentStats,
     },
+}
+
+/// A container slot as the presenter's own tab state names it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PresenterSlot {
+    /// The sequential backbone, by the presenter's launch id.
+    Launch(uuid::Uuid),
+    /// A parallel group step, by step name.
+    Step(String),
 }
 
 /// Why a backend can no longer serve its presenter.
@@ -178,6 +189,7 @@ pub trait InstanceBackend: Send + Sync {
         cancel: CancellationToken,
     ) -> Option<tokio::task::JoinHandle<()>>;
     fn squad_admission(&self) -> Result<(), SquadStartError>;
+    fn squad_enabled_in_config(&self) -> Result<bool, CommandError>;
     fn squad_daemon_is_running(&self) -> Result<bool, CommandError>;
     /// Start (or reach) the squad daemon; the result arrives on the channel.
     fn start_squad_gateway(&self) -> std::sync::mpsc::Receiver<SquadStartupResult>;

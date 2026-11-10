@@ -964,6 +964,11 @@ impl EngineInstance {
         DaemonResolver::admit_runtime(&self.engines)
     }
 
+    /// Whether opening squad would change the persistent global config.
+    pub fn squad_enabled_in_config(&self) -> Result<bool, CommandError> {
+        DaemonResolver::from_env(&(self.env)())?.squad_enabled_in_config()
+    }
+
     /// Whether a squad daemon is already running for this squad root.
     pub fn squad_daemon_is_running(&self) -> Result<bool, CommandError> {
         DaemonResolver::from_env(&(self.env)())?.daemon_is_running()

@@ -27,6 +27,7 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 
+use crate::command::commands::agents::AgentsTuiContext;
 use crate::command::commands::squad::indicator::EnvSource;
 use crate::command::dispatch::catalogue::{CommandCatalogue, FrontendKind};
 use crate::command::dispatch::parsed_input::ParsedCommandBoxInput;
@@ -37,6 +38,7 @@ use crate::command::integrations::{
     AnnotationWriter, HostPresenter, IntegrationRegistry, NoticeSink, PresenterEvent,
     PresenterSupervisor,
 };
+use crate::command::stats_sampler::{ContainerStatsSampler, StatsRequest, StatsTarget};
 use crate::data::annotations::{AnnotationError, AnnotationFilter, Annotations};
 use crate::data::config::daemon::EngineSettings;
 use crate::data::config::env::EnvSnapshot;
@@ -296,6 +298,15 @@ struct InstanceState {
     pending: Vec<PendingDialog>,
     answered: VecDeque<(DialogId, AnsweredBy)>,
     terminal_annotations: Vec<(TerminalId, Annotations)>,
+    /// Samples the instance's agent containers for `SlotStats`; built on
+    /// the first pump (remote presenters have no runtime of their own).
+    stats: Option<ContainerStatsSampler>,
+    /// Stops the instance's squad indicator probe (TUI instances only).
+    squad_indicator: Option<tokio_util::sync::CancellationToken>,
+    /// The squad health last broadcast, so only changes become deltas.
+    squad_health_sent: Option<SquadHealthWire>,
+    /// The `agents` TUI context last handed to the tabs.
+    agents_context: Option<AgentsTuiContext>,
     active_tab_hint: Option<TabId>,
     notices: Vec<String>,
 }
@@ -452,16 +463,6 @@ pub fn merge_annotations(
     Ok(merged)
 }
 
-fn squad_health_wire(health: crate::engine::squad::SquadHealth) -> SquadHealthWire {
-    use crate::engine::squad::SquadHealth as H;
-    match health {
-        H::Unknown => SquadHealthWire::Unknown,
-        H::Running | H::Healthy => SquadHealthWire::Running,
-        H::NotRunning | H::Failed | H::EnvUnmet => SquadHealthWire::Stopped,
-        H::Unreachable => SquadHealthWire::Unreachable,
-    }
-}
-
 impl EngineInstanceHost {
     pub fn new(parts: HostParts) -> Arc<Self> {
         let HostParts {
@@ -569,6 +570,10 @@ impl EngineInstanceHost {
                 pending: Vec::new(),
                 answered: VecDeque::new(),
                 terminal_annotations: Vec::new(),
+                stats: None,
+                squad_indicator: None,
+                squad_health_sent: None,
+                agents_context: None,
                 active_tab_hint: None,
                 notices: Vec::new(),
             }),
@@ -643,7 +648,7 @@ impl EngineInstanceHost {
         let squad_health = state
             .instance
             .as_ref()
-            .and_then(|i| i.squad_health().lock().ok().map(|h| squad_health_wire(*h)))
+            .map(|i| Self::squad_health_of(i))
             .unwrap_or(SquadHealthWire::Unknown);
         InstanceSnapshot {
             instance_id: hosted.id.clone(),
@@ -657,6 +662,55 @@ impl EngineInstanceHost {
             pending_dialogs: state.pending.clone(),
             running_jobs: state.running_jobs(),
         }
+    }
+
+    /// Give every tab of a TUI instance the `agents` context (tab numbers,
+    /// containers, stuck, status, command) that a builtin TUI computes from
+    /// its tabs. Only a change is written, so a watch loop sees fresh data
+    /// without per-pump churn.
+    fn refresh_agents_context(state: &mut InstanceState) {
+        if state.primary_kind != Some(FrontendKindWire::Tui) {
+            return;
+        }
+        let context = AgentsTuiContext::new(
+            state
+                .tabs
+                .iter()
+                .enumerate()
+                .map(|(i, relay)| relay.agents_tab_snapshot((i + 1) as u32))
+                .collect(),
+        );
+        if state.agents_context.as_ref() == Some(&context) {
+            return;
+        }
+        for relay in &state.tabs {
+            relay.set_agents_context(&context);
+        }
+        state.agents_context = Some(context);
+    }
+
+    /// What the instance's squad indicator probe last saw.
+    fn squad_health_of(instance: &EngineInstance) -> SquadHealthWire {
+        instance
+            .squad_health()
+            .lock()
+            .map(|health| SquadHealthWire::from(*health))
+            .unwrap_or(SquadHealthWire::Unknown)
+    }
+
+    /// A `SquadHealth` delta when the probe's value changed since the last
+    /// broadcast. Frontends render the squad dot from it.
+    fn squad_health_change(
+        state: &mut InstanceState,
+        instance: &EngineInstance,
+    ) -> Option<InstanceEvent> {
+        state.squad_indicator.as_ref()?;
+        let health = Self::squad_health_of(instance);
+        if state.squad_health_sent == Some(health) {
+            return None;
+        }
+        state.squad_health_sent = Some(health);
+        Some(InstanceEvent::Delta(InstanceDelta::SquadHealth(health)))
     }
 
     /// `PATCH /v1/engine/instances/{id}` (`{annotations}` only). Keys with an
@@ -1103,6 +1157,13 @@ impl EngineInstanceHost {
                 }
             }
         }
+        // A TUI shows the squad indicator; the engine probes for it, as the
+        // builtin backend's TUI does, and relays changes as deltas.
+        if hello.kind == FrontendKindWire::Tui {
+            let cancel = tokio_util::sync::CancellationToken::new();
+            instance.start_squad_indicator(cancel.clone());
+            state.squad_indicator = Some(cancel);
+        }
         state.instance = Some(instance);
         let mut outbox = Outbox::default();
         self.apply_events(hosted, &mut state, events, &mut outbox);
@@ -1171,6 +1232,7 @@ impl EngineInstanceHost {
                     .frontends
                     .retain(|f| &f.summary.frontend_id != frontend);
                 if state.frontends.len() != before {
+                    tracing::info!(instance = %id, frontend = %frontend, "engine frontend detached");
                     state.broadcast(
                         &EngineFrame::Delta(InstanceDelta::FrontendDetached {
                             frontend_id: frontend.clone(),
@@ -1315,6 +1377,7 @@ impl EngineInstanceHost {
         }
         let hosted = self.find(id).ok_or(HostError::NotFound)?;
         let parsed = parse_submit(self.catalogue, &input)?;
+        let command_path = parsed.path.clone();
         let mut state = hosted.state();
         let instance = state.running()?;
         let relay = state.tab_mut(tab_id).ok_or(HostError::UnknownTab)?;
@@ -1335,6 +1398,13 @@ impl EngineInstanceHost {
             squad_attach: None,
         })?;
         events.extend(relay.bind(submitted));
+        tracing::info!(
+            instance = %id,
+            tab = %tab_id,
+            command = %command_path.join(" "),
+            lease = matches!(input, SubmitInput::Lease { .. }),
+            "engine command started"
+        );
         let mut outbox = Outbox::default();
         self.apply_events(&hosted, &mut state, events, &mut outbox);
         let _ = from;
@@ -1412,6 +1482,9 @@ impl EngineInstanceHost {
         state.terminal_annotations.clear();
         // Memory only: the instance's environment ends with it.
         state.env = None;
+        if let Some(cancel) = state.squad_indicator.take() {
+            cancel.cancel();
+        }
         outbox.presenter_events.push(PresenterEvent::Ended);
         tracing::info!(instance = %hosted.id, reason = ?reason, "engine instance ended");
         plan
@@ -1433,12 +1506,48 @@ impl EngineInstanceHost {
                         let session = instance.session_snapshot(&relay.session_id());
                         events.extend(relay.pump(session.as_ref()));
                     }
+                    events.extend(Self::sample_stats(&mut state, &instance));
+                    events.extend(Self::squad_health_change(&mut state, &instance));
+                    Self::refresh_agents_context(&mut state);
                     self.apply_events(&hosted, &mut state, events, &mut outbox);
                 }
             }
             self.dispatch_presenter_events(&hosted.id, outbox);
         }
         self.forget_ended();
+    }
+
+    /// Route arrived container stats to their slots, and start a new round
+    /// when one is due. The sampler owns the cadence and runs each query on
+    /// the blocking pool, so a pump never waits on the runtime CLI.
+    fn sample_stats(state: &mut InstanceState, instance: &EngineInstance) -> Vec<InstanceEvent> {
+        let InstanceState { tabs, stats, .. } = state;
+        let sampler = stats.get_or_insert_with(|| instance.stats_sampler());
+        let mut events = Vec::new();
+        for sample in sampler.drain() {
+            // The key is a tab index; the slot id guards against a shift.
+            if let Some(relay) = tabs.get_mut(sample.key) {
+                events.extend(relay.apply_stats(&sample.step_name, sample.stats));
+            }
+        }
+        if sampler.due() {
+            let requests: Vec<StatsRequest> = tabs
+                .iter()
+                .enumerate()
+                .flat_map(|(key, relay)| {
+                    relay
+                        .stats_targets()
+                        .into_iter()
+                        .map(move |(slot, container)| StatsRequest {
+                            key,
+                            step_name: slot,
+                            target: StatsTarget::Named(container),
+                        })
+                })
+                .collect();
+            sampler.poll(requests);
+        }
+        events
     }
 
     /// Turn relay events into frames (assigning dialog ids) and presenter
@@ -1454,6 +1563,7 @@ impl EngineInstanceHost {
             if let Some(presenter) = presenter_event(&event) {
                 outbox.presenter_events.push(presenter);
             }
+            log_instance_event(&hosted.id, &event);
             match event {
                 InstanceEvent::CommandBytes {
                     tab_id,
@@ -1751,6 +1861,77 @@ impl EngineInstanceHost {
 }
 
 /// Parse a `Submit` in Layer 2, at the same point the builtin path does (D3).
+/// The daemon log's view of an instance event: lifecycle only. Output bytes,
+/// status lines, stats, and other per-frame churn never reach the log.
+fn log_instance_event(instance: &InstanceId, event: &InstanceEvent) {
+    match event {
+        InstanceEvent::TabOpened { tab_id } => {
+            tracing::info!(instance = %instance, tab = %tab_id, "engine tab opened")
+        }
+        InstanceEvent::TabClosed { tab_id } => {
+            tracing::info!(instance = %instance, tab = %tab_id, "engine tab closed")
+        }
+        InstanceEvent::CommandFinished { tab_id, result } => match &result.error {
+            None => tracing::info!(
+                instance = %instance,
+                tab = %tab_id,
+                exit_code = result.exit_code,
+                "engine command finished"
+            ),
+            Some(error) => tracing::warn!(
+                instance = %instance,
+                tab = %tab_id,
+                exit_code = result.exit_code,
+                code = %error.code,
+                error = %error.message,
+                "engine command failed"
+            ),
+        },
+        InstanceEvent::Delta(InstanceDelta::SlotLaunched { tab_id, slot }) => tracing::info!(
+            instance = %instance,
+            tab = %tab_id,
+            step = %slot.step_name,
+            agent = %slot.agent_display_name,
+            model = slot.model.as_deref().unwrap_or(""),
+            "agent container launched"
+        ),
+        InstanceEvent::Delta(InstanceDelta::SlotContainerName {
+            tab_id,
+            container_name,
+            ..
+        }) => tracing::debug!(
+            instance = %instance,
+            tab = %tab_id,
+            container = %container_name,
+            "agent container running"
+        ),
+        InstanceEvent::Delta(InstanceDelta::SlotExited {
+            tab_id, exit_code, ..
+        }) => tracing::info!(
+            instance = %instance,
+            tab = %tab_id,
+            exit_code = ?exit_code,
+            "agent container exited"
+        ),
+        InstanceEvent::Delta(InstanceDelta::SlotStuck { tab_id, stuck, .. }) => tracing::info!(
+            instance = %instance,
+            tab = %tab_id,
+            stuck,
+            "agent stuck state changed"
+        ),
+        InstanceEvent::Delta(InstanceDelta::GroupStarted { tab_id }) => {
+            tracing::info!(instance = %instance, tab = %tab_id, "parallel step group started")
+        }
+        InstanceEvent::Delta(InstanceDelta::GroupFinished { tab_id }) => {
+            tracing::info!(instance = %instance, tab = %tab_id, "parallel step group finished")
+        }
+        InstanceEvent::DialogRaised { tab_id, request } if request.awaits_answer() => {
+            tracing::debug!(instance = %instance, tab = %tab_id, "engine dialog awaiting an answer")
+        }
+        _ => {}
+    }
+}
+
 fn parse_submit(
     catalogue: &'static CommandCatalogue,
     input: &SubmitInput,
@@ -2165,6 +2346,13 @@ impl EngineInstanceHost {
         let mut outbox = Outbox::default();
         self.apply_events(&hosted, &mut state, events, &mut outbox);
         self.wake.clone()
+    }
+
+    /// The tab's command feeds, so a test plays the command side of them.
+    pub fn test_tab_feeds(&self, id: &InstanceId, tab_id: &TabId) -> super::feeds::TabCommandFeeds {
+        let hosted = self.find(id).expect("instance");
+        let state = hosted.state();
+        state.tab(tab_id).expect("tab").feeds().clone()
     }
 }
 

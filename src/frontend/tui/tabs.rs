@@ -119,6 +119,17 @@ pub struct ContainerInfo {
 }
 
 impl ContainerInfo {
+    /// Record one stats sample, unless it names a different container than
+    /// this slot's (a sample that raced a relaunch).
+    pub fn record_stats(&mut self, stats: AgentStats) {
+        if !self.container_name.is_empty() && self.container_name != stats.name {
+            return;
+        }
+        self.stats_history
+            .push((stats.cpu_percent, stats.memory_mb));
+        self.latest_stats = Some(stats);
+    }
+
     /// What the container window, its minimized bar and the post-exit
     /// summary call this container: the setup/teardown step it runs, or
     /// else the agent's display name.
@@ -644,16 +655,20 @@ pub fn tab_color(tab: &Tab) -> ratatui::style::Color {
             };
         }
     }
-    // A reporting agent is coloured by what it reported: blocked is the "needs
-    // you" yellow, error red, done green. Working and idle keep the default.
-    // Reporting agents never get the silence-based stuck colouring.
-    match tab.program_status().map(|s| s.state) {
-        Some(crate::data::program_status::ProgramState::Blocked) => return Color::Yellow,
-        Some(crate::data::program_status::ProgramState::Error) => return Color::Red,
-        Some(crate::data::program_status::ProgramState::Done) => return Color::Green,
-        Some(_) => {}
-        None if tab.stuck => return Color::Yellow,
-        None => {}
+    // A reporting agent is coloured by what it reported, in the TUI's usual
+    // meanings: working is the running blue, done and idle green, blocked the
+    // "needs you" yellow, error red. Reporting agents never get the
+    // silence-based stuck colouring; a silent agent keeps the colours below.
+    {
+        use crate::data::program_status::ProgramState;
+        match tab.program_status().map(|s| s.state) {
+            Some(ProgramState::Working) => return Color::Blue,
+            Some(ProgramState::Done | ProgramState::Idle) => return Color::Green,
+            Some(ProgramState::Blocked) => return Color::Yellow,
+            Some(ProgramState::Error) => return Color::Red,
+            None if tab.stuck => return Color::Yellow,
+            None => {}
+        }
     }
     // Fixed tab kinds. Both win over execution-phase colouring and both yield
     // to the stuck / yolo indicators above, which are transient run signals.

@@ -2112,42 +2112,54 @@ mod program_status_tabs {
     #[test]
     fn glyph_label_and_colour_per_state() {
         let cases = [
-            (status(ProgramState::Working, None), "\u{25D0} chat", None),
+            (
+                status(ProgramState::Working, None),
+                "\u{25D0} chat",
+                Color::Blue,
+            ),
+            (status(ProgramState::Idle, None), "chat", Color::Green),
             (
                 status(ProgramState::Blocked, Some(BlockedKind::Question)),
                 "? chat",
-                Some(Color::Yellow),
+                Color::Yellow,
             ),
             (
                 status(ProgramState::Blocked, Some(BlockedKind::Permission)),
                 "\u{1F512} chat",
-                Some(Color::Yellow),
+                Color::Yellow,
             ),
             (
                 status(ProgramState::Blocked, Some(BlockedKind::Auth)),
                 "\u{1F512} chat",
-                Some(Color::Yellow),
+                Color::Yellow,
             ),
             (
                 status(ProgramState::Done, None),
                 "\u{2713} chat",
-                Some(Color::Green),
+                Color::Green,
             ),
             (
                 status(ProgramState::Error, None),
                 "\u{2717} chat",
-                Some(Color::Red),
+                Color::Red,
             ),
         ];
         for (s, label, colour) in cases {
             let tab = running_tab(Some(s.clone()));
             assert_eq!(tab.tab_subcommand_label(40, true), label, "{s:?}");
-            match colour {
-                Some(c) => assert_eq!(tab_color(&tab), c, "{s:?}"),
-                // working/idle keep the default running colour
-                None => assert!(!matches!(tab_color(&tab), Color::Yellow | Color::Red)),
-            }
+            assert_eq!(tab_color(&tab), colour, "{s:?}");
         }
+    }
+
+    #[test]
+    fn a_working_report_is_blue_even_with_a_stale_stuck_flag() {
+        let mut tab = running_tab(Some(status(ProgramState::Working, None)));
+        tab.stuck = true;
+        assert_eq!(tab_color(&tab), Color::Blue);
+        // A silent agent that does not report keeps the stuck yellow.
+        let mut plain = running_tab(None);
+        plain.stuck = true;
+        assert_eq!(tab_color(&plain), Color::Yellow);
     }
 
     #[test]

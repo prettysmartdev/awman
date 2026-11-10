@@ -1,6 +1,7 @@
 //! Read-only squad health projection over the unified daemon.
 use crate::data::config::env::EnvSnapshot;
 use crate::data::fs::task_store::{RunStatus, Task};
+use crate::data::instance_snapshot::SquadHealthWire;
 use crate::engine::daemon::DaemonSupervisor;
 use crate::engine::error::EngineError;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -12,6 +13,32 @@ pub enum SquadHealth {
     EnvUnmet,
     Running,
     Healthy,
+}
+impl From<SquadHealth> for SquadHealthWire {
+    fn from(health: SquadHealth) -> Self {
+        match health {
+            SquadHealth::Unknown => Self::Unknown,
+            SquadHealth::NotRunning => Self::NotRunning,
+            SquadHealth::Unreachable => Self::Unreachable,
+            SquadHealth::Failed => Self::Failed,
+            SquadHealth::EnvUnmet => Self::EnvUnmet,
+            SquadHealth::Running => Self::Running,
+            SquadHealth::Healthy => Self::Healthy,
+        }
+    }
+}
+impl From<SquadHealthWire> for SquadHealth {
+    fn from(wire: SquadHealthWire) -> Self {
+        match wire {
+            SquadHealthWire::Unknown => Self::Unknown,
+            SquadHealthWire::NotRunning => Self::NotRunning,
+            SquadHealthWire::Unreachable => Self::Unreachable,
+            SquadHealthWire::Failed => Self::Failed,
+            SquadHealthWire::EnvUnmet => Self::EnvUnmet,
+            SquadHealthWire::Running => Self::Running,
+            SquadHealthWire::Healthy => Self::Healthy,
+        }
+    }
 }
 pub struct SquadSupervisor {
     process: DaemonSupervisor,

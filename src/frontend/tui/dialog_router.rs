@@ -489,19 +489,16 @@ pub(super) fn handle_dialog_char(app: &mut App, c: char) {
             }
             _ => {}
         },
-        // WI 0110: `y` accepts starting a squad daemon in the background and
-        // opening the tab; `n`/`Esc` opens no tab and starts nothing. The
-        // dialog decides nothing itself — it only collects the consent
-        // `open_or_focus_squad_tab` asked for.
-        Some(Dialog::SquadStartConfirm) => match c {
+        // `y` accepts the config change and/or daemon start described by the
+        // dialog; `n`/`Esc` leaves both untouched and opens no tab.
+        Some(Dialog::SquadStartConfirm { .. }) => match c {
             'y' | 'Y' => {
                 app.active_dialog = None;
                 app.build_and_install_squad_tab();
             }
             'n' | 'N' => {
                 app.active_dialog = None;
-                app.status_bar.text =
-                    "squad daemon not started; the squad tab was not opened.".to_string();
+                app.status_bar.text = "squad tab was not opened.".to_string();
             }
             _ => {}
         },

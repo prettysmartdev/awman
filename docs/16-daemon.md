@@ -166,6 +166,19 @@ awman daemon logs
 awman daemon logs --follow
 ```
 
+The log records lifecycle events, not agent output:
+
+- features starting, stopping, crashing, and restarting
+- engine instances, frontends attaching or detaching, and tabs opening or closing
+- commands starting and finishing (with exit code or error)
+- agent containers launching and exiting
+- workflow runs starting and step transitions
+- API sessions, queued commands, and squad runs
+
+Container output stays in each command's own logs. To see more detail, start
+the daemon with `RUST_LOG=debug`, which adds lines such as container names and
+pending dialogs.
+
 ## Local listener and API management
 
 The daemon creates an owner-only Unix socket on Unix systems or a named pipe on

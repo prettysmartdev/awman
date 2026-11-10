@@ -148,18 +148,6 @@ impl Tab {
     }
 }
 
-/// Aggregation order across a tab's agents: a problem anywhere wins, then
-/// busy, then idle, then done (mirrors the protocol's own priority).
-fn status_priority(state: ProgramState) -> u8 {
-    match state {
-        ProgramState::Blocked => 4,
-        ProgramState::Error => 3,
-        ProgramState::Working => 2,
-        ProgramState::Idle => 1,
-        ProgramState::Done => 0,
-    }
-}
-
 /// How long a reporting agent must be silent before the UI notes it
 /// ("working · silent 12m"). Information only: no action is ever taken.
 const SILENT_NOTE_AFTER_SECS: u64 = 60;
@@ -190,10 +178,11 @@ impl ContainerSlot {
 impl Tab {
     /// The tab's aggregate reported status across its container slots.
     pub fn program_status(&self) -> Option<EffectiveStatus> {
-        self.container_slots
-            .iter()
-            .filter_map(|s| s.program_status.as_ref())
-            .max_by_key(|s| status_priority(s.state))
-            .cloned()
+        EffectiveStatus::most_urgent(
+            self.container_slots
+                .iter()
+                .filter_map(|s| s.program_status.as_ref()),
+        )
+        .cloned()
     }
 }

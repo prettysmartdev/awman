@@ -83,11 +83,12 @@ use crate::data::instance_snapshot::{
     TabSnapshot,
 };
 use crate::data::message::MessageLevel;
+use crate::data::program_status::EffectiveStatus;
 use crate::data::session::{
     CommandInvocation, InvocationStatus, Session, SessionId, SessionOpenOptions,
 };
 use crate::data::terminal::{TerminalClientFrame, TerminalFrame};
-use crate::engine::agent_runtime::execution::StuckEvent;
+use crate::engine::agent_runtime::execution::{AgentStats, StuckEvent};
 use crate::engine::remote::frontend_client::{
     FrontendReceiver, FrontendSender, FrontendStream, FrontendStreamError,
 };
@@ -96,7 +97,9 @@ use crate::engine::remote::terminal_client::{TerminalClientOptions, TerminalStre
 use crate::engine::squad::supervisor::SquadHealth;
 use crate::engine::workflow::EngineRequest;
 
-use super::backend::{BackendEvent, BackendKind, BackendLoss, InstanceBackend, UiTicket};
+use super::backend::{
+    BackendEvent, BackendKind, BackendLoss, InstanceBackend, PresenterSlot, UiTicket,
+};
 use super::feeds::{
     ContainerSlotEvent, ContainerSlotIo, SharedYoloCancelFlag, TabCommandFeeds, TabFeeds,
 };
@@ -933,6 +936,11 @@ impl InstanceBackend for RemoteInstanceBackend {
             .map_err(|e| SquadStartError::Other(e.to_string()))
     }
 
+    fn squad_enabled_in_config(&self) -> Result<bool, CommandError> {
+        // The remote engine owns its config; this frontend never edits it.
+        Ok(true)
+    }
+
     fn squad_daemon_is_running(&self) -> Result<bool, CommandError> {
         self.health()
             .map(|_| true)
@@ -1643,11 +1651,11 @@ fn handle_frame(shared: &Shared, state: &mut State, seq: Seq, frame: EngineFrame
             tab_id,
             slot_id,
             status,
-        } => state.events.push_back(BackendEvent::ProgramStatus {
-            tab_id,
-            slot_id,
-            status,
-        }),
+        } => {
+            if let Some(tab) = state.tabs.iter_mut().find(|tab| tab.tab_id == tab_id) {
+                report_program_status(tab, &slot_id, status);
+            }
+        }
         EngineFrame::Notice { level, text } => {
             // An operation failure answers the frontend that asked; an open
             // waiting for its tab is the one operation answered this way.
@@ -1775,6 +1783,29 @@ fn apply_delta(shared: &Shared, state: &mut State, delta: InstanceDelta) {
         InstanceDelta::ActiveTabHint { .. }
         | InstanceDelta::DialogPending(_)
         | InstanceDelta::DialogResolved { .. } => {}
+        // The presenter has no container runtime; the engine samples stats.
+        InstanceDelta::SlotStats {
+            tab_id,
+            slot_id,
+            stats,
+        } => {
+            let slot = state
+                .tabs
+                .iter_mut()
+                .find(|tab| tab.tab_id == tab_id)
+                .and_then(|tab| presenter_slot(tab, &slot_id));
+            if let Some(slot) = slot {
+                state.events.push_back(BackendEvent::SlotStats {
+                    tab_id,
+                    slot,
+                    stats: AgentStats {
+                        name: stats.name,
+                        cpu_percent: stats.cpu_percent,
+                        memory_mb: stats.memory_mb,
+                    },
+                });
+            }
+        }
         other => {
             let Some(tab_id) = delta_tab(&other) else {
                 return;
@@ -1788,14 +1819,8 @@ fn apply_delta(shared: &Shared, state: &mut State, delta: InstanceDelta) {
 }
 
 fn set_squad_health(shared: &Shared, health: &SquadHealthWire) {
-    let value = match health {
-        SquadHealthWire::Unknown => SquadHealth::Unknown,
-        SquadHealthWire::Running => SquadHealth::Running,
-        SquadHealthWire::Stopped => SquadHealth::NotRunning,
-        SquadHealthWire::Unreachable => SquadHealth::Unreachable,
-    };
     if let Ok(mut current) = shared.squad.lock() {
-        *current = value;
+        *current = SquadHealth::from(*health);
     }
 }
 
@@ -2065,6 +2090,87 @@ fn apply_tab_delta(address: &Path, tab: &mut RemoteTab, delta: InstanceDelta) {
         | InstanceDelta::DialogPending(_)
         | InstanceDelta::DialogResolved { .. } => {}
     }
+}
+
+/// An agent's self-reported status reaches the presenter on the backbone's
+/// stuck channel, as the builtin backend reports it, so the slot's status,
+/// the tab colour and the dialog-deferral signals all follow it. The engine
+/// reports only for the backbone (as the builtin engine does).
+fn report_program_status(tab: &mut RemoteTab, slot_id: &SlotId, status: Option<EffectiveStatus>) {
+    with_slot(tab, slot_id, |run, kind| {
+        if let (SlotKind::Sequential, Some(sender)) = (kind, run.stuck.as_ref()) {
+            let _ = sender.send(StuckEvent::Reported(status));
+        }
+    });
+}
+
+/// Replay a tab snapshot's live presentation state through the delta
+/// handlers, so an attaching or reconnecting presenter shows what the engine
+/// shows now instead of waiting for each value's next change.
+fn restore_presentation(address: &Path, tab: &mut RemoteTab, snapshot: &TabSnapshot) {
+    let tab_id = &snapshot.tab_id;
+    let mut deltas = vec![
+        InstanceDelta::Workflow {
+            tab_id: tab_id.clone(),
+            view: snapshot.workflow.clone(),
+            invocation_id: snapshot.workflow_invocation_id,
+            context_path: snapshot.context_path.clone(),
+            worktree_path: snapshot.worktree_path.clone(),
+        },
+        InstanceDelta::Yolo {
+            tab_id: tab_id.clone(),
+            state: snapshot.yolo.clone(),
+        },
+        InstanceDelta::AgentsDashboard {
+            tab_id: tab_id.clone(),
+            data: snapshot.agents_dashboard.clone(),
+        },
+        InstanceDelta::Stuck {
+            tab_id: tab_id.clone(),
+            stuck: snapshot.stuck,
+        },
+    ];
+    for slot in &snapshot.slots {
+        deltas.push(InstanceDelta::SlotStuck {
+            tab_id: tab_id.clone(),
+            slot_id: slot.slot_id,
+            stuck: slot.stuck,
+        });
+        // The kind first: a countdown's ticks are labelled with it.
+        deltas.push(InstanceDelta::SlotCountdownKind {
+            tab_id: tab_id.clone(),
+            slot_id: slot.slot_id,
+            kind: slot.countdown_kind,
+        });
+        if slot.yolo.is_some() {
+            deltas.push(InstanceDelta::SlotYolo {
+                tab_id: tab_id.clone(),
+                slot_id: slot.slot_id,
+                state: slot.yolo.clone(),
+            });
+        }
+    }
+    for delta in deltas {
+        apply_tab_delta(address, tab, delta);
+    }
+    for slot in &snapshot.slots {
+        if slot.program_status.is_some() {
+            report_program_status(tab, &slot.slot_id, slot.program_status.clone());
+        }
+    }
+}
+
+/// The presenter's own name for an engine slot: the backbone by the
+/// presenter-side launch id its tab state holds, a group step by name.
+fn presenter_slot(tab: &mut RemoteTab, slot_id: &SlotId) -> Option<PresenterSlot> {
+    let mut slot = None;
+    with_slot(tab, slot_id, |run, kind| {
+        slot = Some(match kind {
+            SlotKind::Sequential => PresenterSlot::Launch(run.feeds.container.launch_id()),
+            SlotKind::Step(step_name) => PresenterSlot::Step(step_name),
+        });
+    });
+    slot
 }
 
 fn with_slot(tab: &mut RemoteTab, slot_id: &SlotId, f: impl FnOnce(&mut RemoteRun, SlotKind)) {
@@ -2352,6 +2458,7 @@ fn register_tab(
         }
         None => StartupRun::NotStarted,
     };
+    restore_presentation(&shared.address, &mut tab, snapshot);
     state.foreign_tabs.remove(&snapshot.tab_id);
     state.tabs.push(tab);
     Ok((session, feeds, startup))
@@ -2455,6 +2562,12 @@ fn resync(shared: &Shared, state: &mut State, snapshot: InstanceSnapshot) {
 
 /// Catch one known tab up with its snapshot.
 fn catch_up(address: &Path, tab: &mut RemoteTab, snapshot: &TabSnapshot) {
+    catch_up_run(address, tab, snapshot);
+    restore_presentation(address, tab, snapshot);
+}
+
+/// Phase, status log and the run's slots, from the snapshot.
+fn catch_up_run(address: &Path, tab: &mut RemoteTab, snapshot: &TabSnapshot) {
     {
         let state = tab.session.state_mut();
         state.current_command =

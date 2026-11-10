@@ -313,13 +313,20 @@ pub struct PendingDialog {
     pub request: DialogRequest,
     pub raised_at: DateTime<Utc>,
 }
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// The squad indicator's state on the wire: every `SquadHealth` the engine's
+/// probe can report, so a relaying presenter colours the dot exactly as the
+/// builtin backend would.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SquadHealthWire {
     Unknown,
-    Running,
-    Stopped,
+    #[serde(alias = "stopped")]
+    NotRunning,
     Unreachable,
+    Failed,
+    EnvUnmet,
+    Running,
+    Healthy,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InstanceSnapshot {
@@ -878,5 +885,28 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn every_squad_health_round_trips_and_the_old_stopped_spelling_still_reads() {
+        for health in [
+            SquadHealthWire::Unknown,
+            SquadHealthWire::NotRunning,
+            SquadHealthWire::Unreachable,
+            SquadHealthWire::Failed,
+            SquadHealthWire::EnvUnmet,
+            SquadHealthWire::Running,
+            SquadHealthWire::Healthy,
+        ] {
+            let json = serde_json::to_string(&health).unwrap();
+            assert_eq!(
+                serde_json::from_str::<SquadHealthWire>(&json).unwrap(),
+                health
+            );
+        }
+        assert_eq!(
+            serde_json::from_str::<SquadHealthWire>("\"stopped\"").unwrap(),
+            SquadHealthWire::NotRunning
+        );
     }
 }

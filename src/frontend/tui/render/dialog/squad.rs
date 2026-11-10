@@ -9,15 +9,30 @@ use crate::command::commands::squad::commands::SquadConfirmDecision;
 use crate::data::prompt::Prompt;
 use crate::frontend::tui::dialogs;
 
-pub(crate) fn render_start_confirm(area: Rect, frame: &mut Frame) {
-    let width = 66u16.min(area.width.saturating_sub(4).max(40));
-    let dialog_area = dialogs::centered_fixed(width, 9, area);
-    let inner =
-        dialogs::render_dialog_frame("Start squad daemon?", Color::Cyan, dialog_area, frame);
-    let text = "  The awman daemon is not running.\n\
-                \n  Start it in the background (awman daemon start --background)\n  and open the squad tab?\n\
-                \n  [y] start   [n / Esc] cancel";
-    frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), inner);
+pub(crate) fn render_start_confirm(
+    enable_config: bool,
+    start_daemon: bool,
+    area: Rect,
+    frame: &mut Frame,
+) {
+    let width = 70u16.min(area.width.saturating_sub(4).max(40));
+    let dialog_area = dialogs::centered_fixed(width, 10, area);
+    let inner = dialogs::render_dialog_frame("Open squad?", Color::Cyan, dialog_area, frame);
+    let mut lines = Vec::new();
+    if enable_config {
+        lines.push("  Enable squad in the global config");
+        lines.push("  (daemon.features.squad.enabled = true)?");
+    }
+    if start_daemon {
+        lines.push("  Start the awman daemon in the background if needed?");
+    }
+    lines.push("  Open the squad tab?");
+    lines.push("");
+    lines.push("  [y] continue   [n / Esc] cancel");
+    frame.render_widget(
+        Paragraph::new(lines.join("\n")).wrap(Wrap { trim: false }),
+        inner,
+    );
 }
 
 pub(crate) fn render_remove_confirm(name: &str, area: Rect, frame: &mut Frame) {

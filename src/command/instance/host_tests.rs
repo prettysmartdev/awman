@@ -1085,3 +1085,154 @@ async fn a_hosted_terminal_release_runs_the_host_process_in_a_hub_pty() {
     );
     assert_eq!(record.state, crate::data::terminal::TerminalState::Exited);
 }
+
+// ─── Relayed tab state ──────────────────────────────────────────────────────
+
+fn deltas(frames: &[EngineFrame]) -> Vec<&InstanceDelta> {
+    frames
+        .iter()
+        .filter_map(|f| match f {
+            EngineFrame::Delta(delta) => Some(delta),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Attach the bound command's stuck/status channel to the backbone slot, as
+/// the agent runtime does once the container is up.
+fn attach_stuck_channel(
+    feeds: &crate::command::instance::feeds::TabCommandFeeds,
+) -> tokio::sync::broadcast::Sender<crate::engine::agent_runtime::execution::StuckEvent> {
+    let (tx, rx) = tokio::sync::broadcast::channel(16);
+    feeds.container.push(
+        crate::command::instance::feeds::ContainerSlotEvent::EngineAttached {
+            launch_id: feeds.container.launch_id(),
+            requests: None,
+            stuck: Some(rx),
+        },
+    );
+    tx
+}
+
+#[tokio::test]
+async fn the_agents_dashboard_is_relayed_and_kept_in_the_snapshot() {
+    use crate::command::commands::agents::{AgentTotals, AgentsOverview};
+    use crate::command::instance::feeds::AgentsDashboardData;
+    let fx = fixture();
+    let (id, _primary, mut rx) = fx.started().await;
+    let tab = fx.first_tab(&id);
+    let _command = bind_fake_command(&fx, &id, &tab);
+    let feeds = fx.host.test_tab_feeds(&id, &tab);
+    drain(&mut rx);
+
+    *feeds.agents_dashboard.lock().unwrap() = Some(AgentsDashboardData {
+        overview: AgentsOverview {
+            runtime: "docker".into(),
+            runtime_display: "Docker".into(),
+            available: true,
+            unavailable_reason: None,
+            agents: Vec::new(),
+            totals: AgentTotals::default(),
+            collected_at: chrono::Utc::now(),
+            tip: String::new(),
+        },
+        watching: true,
+    });
+    fx.host.pump_at(Instant::now());
+    let frames = drain(&mut rx);
+    let relayed = deltas(&frames)
+        .into_iter()
+        .filter_map(|d| match d {
+            InstanceDelta::AgentsDashboard { data, .. } => Some(data.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(relayed.len(), 1, "one delta for one change");
+    assert!(relayed[0].as_ref().is_some_and(|d| d.watching));
+
+    fx.host.pump_at(Instant::now());
+    assert!(
+        !deltas(&drain(&mut rx))
+            .iter()
+            .any(|d| matches!(d, InstanceDelta::AgentsDashboard { .. })),
+        "an unchanged dashboard is not re-sent"
+    );
+    let snapshot = fx.host.tab(&id, &tab).unwrap();
+    assert!(snapshot.agents_dashboard.is_some_and(|d| d.watching));
+}
+
+#[tokio::test]
+async fn stuck_and_reported_status_reach_frames_snapshot_and_agents_context() {
+    use crate::data::program_status::{EffectiveStatus, ProgramState};
+    use crate::engine::agent_runtime::execution::StuckEvent;
+    let fx = fixture();
+    let (id, _primary, mut rx) = fx.started().await;
+    let tab = fx.first_tab(&id);
+    let _command = bind_fake_command(&fx, &id, &tab);
+    let feeds = fx.host.test_tab_feeds(&id, &tab);
+    let stuck = attach_stuck_channel(&feeds);
+    fx.host.pump_at(Instant::now());
+    drain(&mut rx);
+
+    stuck.send(StuckEvent::Stuck).unwrap();
+    fx.host.pump_at(Instant::now());
+    assert!(deltas(&drain(&mut rx))
+        .iter()
+        .any(|d| matches!(d, InstanceDelta::Stuck { stuck: true, .. })));
+    assert!(
+        fx.host.tab(&id, &tab).unwrap().stuck,
+        "a late frontend sees it"
+    );
+    let context = feeds.tui_context_shared.lock().unwrap().clone();
+    assert_eq!(context.tabs.len(), 1);
+    assert_eq!(context.tabs[0].tab_number, 1);
+    assert!(context.tabs[0].is_stuck);
+
+    let status = EffectiveStatus {
+        state: ProgramState::Blocked,
+        kind: None,
+        progress: None,
+        msg: Some("approve?".into()),
+        app: None,
+        id: None,
+    };
+    stuck
+        .send(StuckEvent::Reported(Some(status.clone())))
+        .unwrap();
+    fx.host.pump_at(Instant::now());
+    let frames = drain(&mut rx);
+    assert!(frames.iter().any(|f| matches!(
+        f,
+        EngineFrame::ProgramStatus { status: Some(s), .. } if s == &status
+    )));
+    let snapshot = fx.host.tab(&id, &tab).unwrap();
+    assert!(!snapshot.stuck, "a reporting agent is never stuck");
+    assert_eq!(snapshot.slots[0].program_status.as_ref(), Some(&status));
+    assert_eq!(feeds.signals.status(), Some(status.clone()));
+    let context = feeds.tui_context_shared.lock().unwrap().clone();
+    assert!(!context.tabs[0].is_stuck);
+    assert_eq!(context.tabs[0].program_status.as_ref(), Some(&status));
+}
+
+#[tokio::test]
+async fn a_tui_instance_relays_its_squad_health() {
+    let fx = fixture();
+    let (_id, _primary, mut rx) = fx.started().await;
+    // The probe's first tick runs at once; it finds no squad daemon here.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        fx.host.pump_at(Instant::now());
+        let frames = drain(&mut rx);
+        let health = deltas(&frames).into_iter().find_map(|d| match d {
+            InstanceDelta::SquadHealth(health) => Some(*health),
+            _ => None,
+        });
+        if let Some(health) = health.filter(|h| *h != SquadHealthWire::Unknown) {
+            assert_ne!(health, SquadHealthWire::Running);
+            assert_ne!(health, SquadHealthWire::Healthy);
+            break;
+        }
+        assert!(Instant::now() < deadline, "no squad health was relayed");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}

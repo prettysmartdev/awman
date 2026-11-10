@@ -712,15 +712,17 @@ The tab bar shows each tab's project name, current or last command, and an arrow
 
 | Glyph | Reported status | Tab colour |
 |-------|-----------------|------------|
-| `◐` | Working; includes reported progress when available, for example `◐ 42%`. | Usual tab colour |
+| `◐` | Working; includes reported progress when available, for example `◐ 42%`. | Blue |
 | `?` | Blocked on a question. | Yellow |
 | `🔒` | Blocked on permission or authentication. | Yellow |
 | `✓` | Done. | Green |
 | `✗` | Error. | Red |
-| *(none)* | Idle, or no status report. | Usual tab colour |
+| *(none)* | Idle. | Green |
+| *(none)* | No status report. | Usual tab colour |
 
-A yolo countdown or silence warning can override these colours. A reporting
-agent does not get the `⚠️` silence prefix.
+A yolo countdown overrides these colours. A reporting agent is never marked
+stuck: it does not turn yellow from silence or get the `⚠️` silence prefix.
+An agent that does not report keeps the usual colours and the silence warning.
 
 The container window title and minimized status bar also show the reported
 glyph and state, followed by the blocked kind (when present) and the agent's
