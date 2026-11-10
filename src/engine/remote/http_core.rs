@@ -50,8 +50,8 @@ pub struct HttpClientOptions {
     pub pinned_cert_pem: Option<String>,
     /// Skip certificate verification entirely.
     ///
-    /// **Loopback only.** The `api server status` probe talks to `127.0.0.1`
-    /// over the daemon's self-signed cert before it knows which cert that is.
+    /// **Loopback only.** A local certificate probe may talk to `127.0.0.1`
+    /// before it knows the daemon's self-signed certificate.
     /// Never set this for a target that leaves the machine.
     pub accept_invalid_certs: bool,
 }
@@ -180,8 +180,8 @@ impl HttpCore {
     /// The one `reqwest::Client` builder in the tree.
     ///
     /// Everything async in awman that speaks HTTP — the daemon clients here,
-    /// the per-agent Dockerfile download, the CI poller, the `api server
-    /// status` probe, the aspec tarball download — constructs its client
+    /// the per-agent Dockerfile download, the CI poller, certificate probes,
+    /// the aspec tarball download — constructs its client
     /// through this function, so the timeout, TLS and header policy has one
     /// definition (WI 0114 F-28). The synchronous issue provider
     /// (`engine::issue::github`) is the one holdout and uses

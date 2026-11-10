@@ -41,12 +41,21 @@ echo "docker $*" >> "$ctl/docker.log"
 case "$1" in
   info) echo "27.0.0"; exit 0 ;;
   image|images|inspect) echo '[{"Id":"sha256:fake"}]'; exit 0 ;;
+  ps)
+    if [ -f "$ctl/slow.name" ] && [ -f "$ctl/slow.pid" ] && kill -0 "$(cat "$ctl/slow.pid")" 2>/dev/null; then
+      name="$(cat "$ctl/slow.name")"
+      prefix=""
+      for arg in "$@"; do case "$arg" in name=*) prefix="${arg#name=}" ;; esac; done
+      case "$name" in "$prefix"*) printf 'fake-slow\t%s\tfake-image\t2026-01-01T00:00:00Z\n' "$name" ;; esac
+    fi
+    exit 0
+    ;;
   stop)
     # The slow fixtures model docker stop ending the running container and
     # closing its pipes, so a cancelled agent ends at once rather than when
     # its 30s sleep runs out.
     case "$(cat "$ctl/mode" 2>/dev/null)" in
-      slow|chatty-slow)
+      slow|chatty-slow|outputs-resume)
         [ -f "$ctl/slow.child" ] && kill "$(cat "$ctl/slow.child")" 2>/dev/null
         [ -f "$ctl/slow.pid" ] && kill "$(cat "$ctl/slow.pid")" 2>/dev/null
         ;;
@@ -68,9 +77,10 @@ case "$1" in
     ;;
   run)
     mode="$(cat "$ctl/mode" 2>/dev/null)"
-    if [ "$mode" = "structured" ]; then cat "$ctl/agent.ndjson"; exit 0; fi
-    workspace=""; leader=""; background=""; output=""
+    workspace=""; leader=""; background=""; output=""; previous=""; container_name=""
     for arg in "$@"; do
+      [ "$previous" = "--name" ] && container_name="$arg"
+      previous="$arg"
       case "$arg" in
         -d) background=yes ;;
         /*:/*)
@@ -82,6 +92,16 @@ case "$1" in
       esac
     done
     [ -n "$background" ] && { echo fake-background; exit 0; }
+    # Model the launch shim's acknowledgement through the selected output
+    # bind. Merely planning -v must not mark a failed preflight as mounted.
+    for arg in "$@"; do
+      case "$arg" in
+        /awman/output/.awman-mount-*)
+          [ -n "$output" ] && { printf 1 > "$output/${arg##*/}"; rm -f "$output/${arg##*/}"; }
+          ;;
+      esac
+    done
+    if [ "$mode" = "structured" ]; then cat "$ctl/agent.ndjson"; exit 0; fi
     if [ -n "$leader" ]; then
       # Status regressions can hold an actual evaluation long enough to poll
       # its shared executor permit, without requiring a fabricated verdict.
@@ -118,8 +138,9 @@ case "$1" in
     fi
     if [ "$mode" = "slow" ]; then
       # slow.pid is the readiness signal, so write it once both pids exist.
-      sleep 30 &
+      sleep "$(cat "$ctl/slow.seconds" 2>/dev/null || echo 30)" &
       echo "$!" > "$ctl/slow.child"
+      echo "$container_name" > "$ctl/slow.name"
       echo "$$" > "$ctl/slow.pid"
       wait "$!"
     fi

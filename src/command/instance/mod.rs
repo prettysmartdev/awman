@@ -33,6 +33,7 @@ pub mod lifecycle;
 pub mod local;
 pub mod output;
 pub mod per_command;
+mod queue;
 pub mod relay;
 pub mod remote;
 #[cfg(test)]
@@ -161,6 +162,7 @@ pub enum InitialTabOpened {
 /// One command submission for a tab: everything `App::spawn_command` used to
 /// assemble around `Dispatch`.
 pub struct SubmitRequest {
+    pub lease_id: Option<String>,
     pub session_id: SessionId,
     pub parsed: ParsedCommandBoxInput,
     /// The tab's fresh feeds (reset by the presenter for this command).
@@ -305,6 +307,7 @@ fn no_tab(session_id: &SessionId) -> CommandError {
 
 /// One awman instance (WI 0142 §2).
 pub struct EngineInstance {
+    queue: Mutex<Option<crate::command::worker::queue_source::SharedQueueSource>>,
     input_available: std::sync::atomic::AtomicBool,
     wake: Mutex<Arc<tokio::sync::Notify>>,
     #[cfg(any(test, feature = "test-support"))]
@@ -365,6 +368,7 @@ impl EngineInstance {
             None => (InstanceId::new(), FrontendKind::Tui, None, None),
         };
         Arc::new(Self {
+            queue: Default::default(),
             input_available: std::sync::atomic::AtomicBool::new(kind.can_ask_a_human()),
             wake: Mutex::new(Arc::new(tokio::sync::Notify::new())),
             #[cfg(any(test, feature = "test-support"))]
@@ -480,6 +484,7 @@ impl EngineInstance {
             StartupRun::NotStarted
         } else {
             match self.submit(SubmitRequest {
+                lease_id: None,
                 session_id: session.id(),
                 parsed: self.startup_command(&session),
                 feeds: feeds.clone(),
@@ -659,6 +664,7 @@ impl EngineInstance {
     /// its containers are not touched.
     pub fn quit(&self) -> QuitPlan {
         self.lifecycle().end();
+        self.queue.lock().unwrap().take();
         QuitPlan {
             detach_containers: false,
             exit_code: 0,
@@ -692,12 +698,28 @@ impl EngineInstance {
     /// A closed or never-opened tab, or an ended instance, admits nothing.
     pub fn submit(&self, request: SubmitRequest) -> Result<SubmittedCommand, CommandError> {
         let SubmitRequest {
+            lease_id,
             session_id,
-            parsed,
+            mut parsed,
             feeds,
             pty_size,
             squad_attach,
         } = request;
+        let lease_execution = lease_id.is_some();
+        let picked = if let Some(id) = lease_id {
+            let source =
+                self.queue.lock().unwrap().clone().ok_or_else(|| {
+                    CommandError::Other("this instance has no worker queue".into())
+                })?;
+            let run = source.prepared_run(&id).ok_or_else(|| {
+                CommandError::Other("this instance does not own the picked lease".into())
+            })?;
+            parsed =
+                crate::command::dispatch::parsed_input::parse(&run.command_line, self.catalogue)?;
+            Some((source, run))
+        } else {
+            None
+        };
         self.admit(&parsed.path)?;
         #[cfg(any(test, feature = "test-support"))]
         self.trace.record("command", serde_json::json!({"path":parsed.path,"args":parsed.args.to_argv(self.catalogue.lookup(&parsed.path.iter().map(String::as_str).collect::<Vec<_>>()).expect("parsed command"))}));
@@ -786,6 +808,9 @@ impl EngineInstance {
         let session_for_state = Arc::clone(&session);
         let mut dispatch = Dispatch::new(frontend, session, self.engines.clone())
             .with_cancellation(command_cancel.clone());
+        if let Some((source, run)) = picked {
+            dispatch = dispatch.with_picked_lease(source, run);
+        }
         // WI 0102: in-tab `squad` actions reach the daemon through the same
         // gateway the CLI subcommands use. It is offered for every command;
         // the catalogue's `gateway_need` decides which ones receive it
@@ -826,7 +851,13 @@ impl EngineInstance {
             guard.state_mut().begin_command(command_name, Vec::new());
         }
 
-        let executor = self.executor.clone();
+        // A picked lease already holds the worker admission share. Taking an
+        // additional engine permit would deadlock a host with capacity one.
+        let executor = if lease_execution || parsed.path == ["queue", "pick"] {
+            None
+        } else {
+            self.executor.clone()
+        };
         let command_runtime = self.runtime.clone();
         #[cfg(any(test, feature = "test-support"))]
         let trace = self.trace.clone();

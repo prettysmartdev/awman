@@ -1060,12 +1060,11 @@ async fn real_network_session_worktree_selectors_are_refused_on_runs_route() {
     server.abort();
 }
 
-/// PINS: the worker push routes do not exist yet. A request carrying a
-/// selector is a 404, which is **not** the admission proof (the two real
-/// routes above are); the worker routes must inherit the same refusal when
-/// they are added.
+/// PINS: the pull routes (WI 0143) are read-only `GET`s; a command body
+/// POSTed to them is refused by the router (405) and never admitted. This is
+/// **not** the admission proof (the two real routes above are).
 #[tokio::test]
-async fn real_network_worker_push_routes_are_absent_and_never_accept_selectors() {
+async fn pull_list_routes_never_accept_command_bodies_or_selectors() {
     let tmp = tempfile::tempdir().unwrap();
     let state = make_app_state(tmp.path());
     let Some((addr, server)) = spawn_router(state).await else {
@@ -1085,7 +1084,7 @@ async fn real_network_worker_push_routes_are_absent_and_never_accept_selectors()
                 .send()
                 .await
                 .unwrap();
-            assert_eq!(resp.status().as_u16(), 404, "{route} {selector}");
+            assert_eq!(resp.status().as_u16(), 405, "{route} {selector}");
         }
     }
 

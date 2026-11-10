@@ -12,6 +12,10 @@ pub(super) fn render_dialog(dialog: &dialogs::Dialog, area: Rect, frame: &mut Fr
         dialogs::Dialog::CloseTabConfirm => {
             dialogs::render_close_tab_confirm(area, frame);
         }
+        dialogs::Dialog::QueuePanel(state) => queue::render_queue_panel(state, area, frame),
+        dialogs::Dialog::LeaseCloseConfirm(state) => {
+            queue::render_lease_close_confirm(state, area, frame)
+        }
         dialogs::Dialog::WorkflowCancelConfirm => {
             dialogs::render_workflow_cancel_confirm(area, frame);
         }
@@ -127,6 +131,7 @@ pub(super) fn render_dialog(dialog: &dialogs::Dialog, area: Rect, frame: &mut Fr
 
 mod input;
 mod misc;
+mod queue;
 mod review;
 mod squad;
 mod workflow;

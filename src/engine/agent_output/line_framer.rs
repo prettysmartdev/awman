@@ -8,6 +8,8 @@
 
 /// Maximum line prefix retained by production output pumps (64 KiB).
 pub const MAX_LINE_BYTES: usize = 64 * 1024;
+/// Structured agent frames can contain tool bodies larger than a text line.
+pub const MAX_STRUCTURED_FRAME_BYTES: usize = 8 * 1024 * 1024;
 
 /// One line without its newline delimiter.
 #[derive(Debug, Clone, PartialEq, Eq)]

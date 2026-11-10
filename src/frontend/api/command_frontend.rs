@@ -1,7 +1,7 @@
 //! `ApiDispatchFrontend` — the single Layer 3 struct that implements
 //! every per-command frontend trait for API HTTP command dispatch.
 //!
-//! When a `POST /v1/commands` request arrives, the route handler constructs
+//! When a `POST /v1/worker/commands` request arrives, the route handler constructs
 //! a `ApiDispatchFrontend` pre-loaded with the parsed args/flags from
 //! the HTTP request body, then hands it to `Dispatch::run_command`. All
 //! output (UserMessages, container stdout/stderr) is written to the
@@ -184,6 +184,15 @@ impl ApiDispatchFrontend {
     /// `non-interactive=true` and defaults `yolo=true`.
     pub fn new(subcommand: &str, args: &[String], event_bus: EventBusSender) -> Self {
         Self::for_frontend(subcommand, args, event_bus, FrontendKind::WORKER_LOCAL)
+    }
+    /// Project an already catalogue-validated foreground invocation.
+    pub fn from_input(
+        input: crate::command::dispatch::ParsedCommandBoxInput,
+        events: EventBusSender,
+    ) -> Self {
+        let mut frontend = Self::new(&input.path.join(" "), &[], events);
+        frontend.parsed = Arc::new(Ok(input.args));
+        frontend
     }
 
     pub fn for_frontend(
@@ -517,7 +526,8 @@ impl AgentFrontend for ApiDispatchFrontend {
 
 // Structured frames contain whole messages and tool results. Keep a larger
 // explicit bound than plain text, while bounding malformed protocol output.
-const MAX_STRUCTURED_FRAME_BYTES: usize = 8 * 1024 * 1024;
+const MAX_STRUCTURED_FRAME_BYTES: usize =
+    crate::engine::agent_output::line_framer::MAX_STRUCTURED_FRAME_BYTES;
 
 /// `EffectiveStatus` → the `program_status` event payload: spec spellings
 /// (`snake_case` state and kind), absent fields omitted. The record `id` is
@@ -1066,9 +1076,11 @@ impl WorkflowFrontend for ApiDispatchFrontend {
                     });
                 }
             }
-            if let Err(error) = writer.write(state) {
-                tracing::warn!(%error, "failed to write command workflow state");
-            }
+            crate::command::worker::events::persist_workflow_snapshot(
+                writer,
+                &self.event_bus,
+                state,
+            );
         }
     }
 
@@ -1077,6 +1089,7 @@ impl WorkflowFrontend for ApiDispatchFrontend {
         _state: &crate::data::workflow_state::WorkflowState,
         available: &AvailableActions,
     ) -> Result<NextAction, EngineError> {
+        let _awaiting_input = self.event_bus.awaiting_input();
         Ok(self.headless.workflow_next_action(available))
     }
 

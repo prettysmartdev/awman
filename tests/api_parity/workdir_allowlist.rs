@@ -1,5 +1,5 @@
 //! Workdir allowlist-root contract: `GET /v1/worker/workdirs` and the 403/202
-//! decisions of `POST /v1/worker/sessions` for directories under `--workdir-root`.
+//! decisions of `POST /v1/worker/sessions` for configured worker workdir roots.
 //!
 //! Loopback-only and not named `real_network_*`, so `make test-fast` runs them.
 //! Fixtures are real `git init` repositories in temp dirs.

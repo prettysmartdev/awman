@@ -560,3 +560,63 @@ async fn structured_large_frames_preserve_results_and_never_echo_tool_payloads()
         }
     }
 }
+
+/// WI 0143: every persisted snapshot is also a `workflow_state` event, in
+/// order, carrying the client view `GET …/workflow` returns.
+#[tokio::test]
+async fn every_persisted_workflow_state_is_published_in_order() {
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = ApiPaths::from_root(tmp.path());
+    let (session, command) = (
+        "ses_03c7c0ace395d80182db07ae2c30f034",
+        "cmd_4a8a08f09d37b73795649038408b5f33",
+    );
+    paths.prepare_command_dir(session, command).unwrap();
+    let writer = CommandStateWriter::new(paths.clone(), session, command);
+    let bus = EventBus::new(16);
+    let mut events = bus.subscribe();
+    let mut frontend =
+        ApiDispatchFrontend::new("exec workflow", &[], bus.sender()).with_state_writer(writer);
+    let step = WorkflowStep {
+        name: "alpha".into(),
+        depends_on: vec![],
+        prompt_template: "go".into(),
+        agent: None,
+        model: None,
+        overlays: None,
+        abort_on_failure: false,
+    };
+    let mut state = WorkflowState::new("w".into(), std::slice::from_ref(&step), "h".into(), None);
+    frontend.report_workflow_state(&state);
+    state.step_states.insert(
+        "alpha".into(),
+        crate::data::workflow_state::StepState::Succeeded,
+    );
+    frontend.report_workflow_state(&state);
+
+    let mut snapshots = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        assert_eq!(event.payload.sse_event_type(), "workflow_state");
+        if let EventPayload::WorkflowState(value) = event.payload {
+            snapshots.push((event.sequence, value));
+        }
+    }
+    assert_eq!(snapshots.len(), 2);
+    assert!(snapshots[0].0 < snapshots[1].0);
+    let persisted: serde_json::Value = serde_json::from_str(
+        &paths
+            .read_command_workflow_state_raw(session, command)
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        snapshots[1].1,
+        crate::frontend::api::workflow_view::client_view(persisted)
+    );
+    assert_eq!(snapshots[1].1["steps"][0]["status"], "succeeded");
+    assert!(snapshots[0].1.get("stages").is_some());
+    // The wire tag is the spec's `workflow_state`.
+    let json = serde_json::to_value(EventPayload::WorkflowState(serde_json::json!({}))).unwrap();
+    assert_eq!(json["type"], "workflow_state");
+}

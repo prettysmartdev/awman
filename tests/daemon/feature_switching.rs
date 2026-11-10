@@ -255,3 +255,38 @@ async fn an_idle_worker_switches_off_and_serves_again_when_re_enabled() {
     .await;
     assert_eq!(code, 200, "{body}");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn push_enabled_switches_admission_alone_and_preserves_pull_status() {
+    let home = ApiHome::new();
+    let repo = Repo::new();
+    repo.allow_in(&home, json!({}));
+    let server = home.start().await;
+    let session = repo.session(&server).await;
+    let _ = set(&home, "daemon.features.worker.push.enabled", "false");
+    let (code, body) = http(
+        &server,
+        reqwest::Method::POST,
+        "/v1/worker/commands",
+        None,
+        Some(json!({"session_id":session,"subcommand":"exec prompt","args":["hello"]})),
+    )
+    .await;
+    assert_eq!(code, 503, "{body}");
+    assert_eq!(body["code"], "feature_disabled");
+    let status = server.get("/v1/status").await;
+    assert_eq!(status["features"]["worker"]["state"], "on");
+    assert!(
+        status["capabilities"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("worker_pull")),
+        "{status}"
+    );
+    let _ = set(&home, "daemon.features.worker.push.enabled", "true");
+    let id = submit(&server, &session, &["hello again"]).await;
+    assert_eq!(
+        wait_status(&server, &id, &["done", "error"]).await["status"],
+        "done"
+    );
+}

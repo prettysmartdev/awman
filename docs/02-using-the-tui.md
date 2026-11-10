@@ -95,6 +95,29 @@ indicator — a circle whose colour is the squad daemon's health (grey not
 running, green healthy, yellow unreachable, blue a task is running, red a
 task's last run failed). See [The squad indicator](12-squad.md#the-squad-indicator).
 
+## Work queue panel
+
+The TUI has a work queue panel bound to **Ctrl+Q**. Its controls are **↑ / ↓**
+and **PageUp / PageDown** to move through rows, **Enter** to view item details,
+**p** to pick an item, **r** to refresh, and **Esc** to close the panel or
+return from the details view. Queue listings can include a Markdown body
+preview; servers without previews show the summary. A picked run opens in its own tab. If you close
+a tab while its lease is active, choose whether to release the item, cancel
+the run, or leave it running. The engine instance owns the prepared lease and
+reports its final result after execution and publication.
+
+The panel is controlled by the repository setting `tui.worker.enabled`, which
+defaults to `false` and is read when the TUI starts:
+
+```sh
+awman config set tui.worker.enabled true
+```
+
+When enabled, the worker reuses a running daemon's registration or registers a
+manual worker for the instance lifetime. When a terminal uses XON/XOFF flow control, it may
+consume Ctrl+Q before awman receives it. See [Workers and Work Servers](17-workers-and-work-servers.md)
+for work server configuration and queue commands.
+
 ---
 
 ## Git Sidebar
@@ -829,6 +852,7 @@ For workflow tabs, awman goes further: the [workflow control board](05-workflows
 | **Ctrl+A** | Switch to the previous tab |
 | **Ctrl+D** | Switch to the next tab |
 | **Ctrl+G** | Toggle Git Sidebar (live view of repository changes) |
+| **Ctrl+Q** | Open the work queue panel when the TUI worker is enabled |
 | **Ctrl+Shift+C** | Copy the workflow context host directory (only while the current tab has an active workflow context overlay) |
 | **Ctrl+M** | Toggle container window between maximized, minimized, and hidden |
 | **Ctrl+O** | Minimize / maximize the Workflow Overview (independent of Ctrl+M) |

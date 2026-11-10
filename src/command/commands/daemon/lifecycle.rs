@@ -313,6 +313,14 @@ async fn stop(
         match DaemonClient::discover(env)? {
             Some(client) => {
                 let status: StatusResponse = client.call_as(&Request::get("/v1/status")).await?;
+                if status
+                    .features
+                    .get("worker")
+                    .is_some_and(|f| f.state != crate::data::daemon_state::FeatureState::Off)
+                {
+                    canceled.extend(super::api::running_jobs(&client, "worker").await?);
+                    super::api::release_held_leases_for_shutdown(&client).await?;
+                }
                 for feature in ["worker", "squad"] {
                     let on = status
                         .features
@@ -344,6 +352,8 @@ async fn stop(
             }
         }
     }
+    canceled.sort();
+    canceled.dedup();
     let pid = match supervisor.terminate_running()? {
         Termination::Terminated { pid } => pid,
         Termination::NotRunning => return Err(CommandError::DaemonNotRunning),

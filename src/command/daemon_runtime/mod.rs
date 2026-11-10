@@ -36,6 +36,7 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 pub struct DaemonRuntime {
+    pull: Option<Arc<dyn crate::command::daemon_api::worker_pull::PullHandle>>,
     core: Arc<Core>,
     engines: Engines,
     config: RwLock<EffectiveConfig>,
@@ -79,6 +80,11 @@ impl DaemonRuntime {
     /// routes and the frontend WebSocket adapt (WI 0142).
     pub fn engine_host(&self) -> &Arc<crate::command::instance::host::EngineInstanceHost> {
         &self.engine_host
+    }
+    pub fn pull_handle(
+        &self,
+    ) -> Option<Arc<dyn crate::command::daemon_api::worker_pull::PullHandle>> {
+        self.pull.clone()
     }
     pub fn core(&self) -> &Arc<Core> {
         &self.core
@@ -345,6 +351,8 @@ impl DaemonRuntime {
                     .map(|d| d.as_millis().min(u64::MAX as u128) as u64)
             },
             detail: status.detail,
+            push: None,
+            pull: None,
             restarts: state.restarts,
             last_error: state.last_error,
             since_at: state.since,
@@ -493,6 +501,7 @@ mod tests {
         ]
         .into();
         let runtime = Arc::new(DaemonRuntime {
+            pull: None,
             guard: DaemonGuard::new(core.daemon_paths().clone()),
             grants: Mutex::new(PrerequisiteGrantStore::load(dir.path())),
             event_buses: worker.event_buses.clone(),

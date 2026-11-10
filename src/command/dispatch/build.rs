@@ -29,6 +29,17 @@ use crate::command::commands::squad::commands::SquadCommand;
 use crate::command::dispatch::{BuildContext, BuiltCommand};
 use crate::command::error::CommandError;
 
+pub fn queue(ctx: &BuildContext<'_>) -> Result<BuiltCommand, CommandError> {
+    Ok(BuiltCommand::Queue(
+        crate::command::worker::pick::QueueCommand::from_input(ctx)?,
+    ))
+}
+pub fn queue_pick(ctx: &BuildContext<'_>) -> Result<BuiltCommand, CommandError> {
+    Ok(BuiltCommand::QueuePick(
+        crate::command::worker::pick::QueuePickCommand::from_input(ctx)?,
+    ))
+}
+
 /// The signature every `CommandSpec::build` holds.
 pub type CommandBuilder = fn(&BuildContext) -> Result<BuiltCommand, CommandError>;
 
@@ -80,6 +91,12 @@ pub fn agents(ctx: &BuildContext) -> Result<BuiltCommand, CommandError> {
 
 pub fn config(ctx: &BuildContext) -> Result<BuiltCommand, CommandError> {
     Ok(BuiltCommand::Config(ConfigCommand::from_input(ctx)?))
+}
+
+pub fn worker_link(ctx: &BuildContext) -> Result<BuiltCommand, CommandError> {
+    Ok(BuiltCommand::WorkerLink(
+        crate::command::commands::worker::WorkerLinkCommand::from_input(ctx)?,
+    ))
 }
 
 pub fn exec_prompt(ctx: &BuildContext) -> Result<BuiltCommand, CommandError> {

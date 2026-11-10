@@ -30,7 +30,7 @@ const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const COMPLETION_WRITE_ATTEMPTS: usize = 3;
 const COMPLETION_WRITE_RETRY_DELAY: Duration = Duration::from_millis(100);
 
-async fn wait_for_output_drains(event_bus: &EventBus, command_id: &str) {
+pub(crate) async fn wait_for_output_drains(event_bus: &EventBus, command_id: &str) {
     if !event_bus.wait_output_drained(OUTPUT_DRAIN_TIMEOUT).await {
         tracing::warn!(
             command_id = %command_id,
@@ -49,6 +49,42 @@ struct QueuedCommandResult {
     exit_code: i32,
     status: CommandStatus,
     result_json: String,
+}
+
+/// Foreground lease hosts use the same result projection as pushed and
+/// daemon-pulled commands. Post-command lease publication happens afterwards.
+pub fn foreground_result(
+    result: &Result<CommandOutcome, crate::command::error::CommandError>,
+    contributions: ResultContributions,
+) -> CommandResult {
+    let projected =
+        QueuedCommandResult::build(result, &Ok(PushBackOutcome::NotConfigured), contributions);
+    serde_json::from_str(&projected.result_json).expect("typed command result")
+}
+
+pub(crate) fn finish_result_fields(
+    value: &mut CommandResult,
+    outcome: &Result<CommandOutcome, crate::command::error::CommandError>,
+    path: &[&str],
+    git: Option<crate::data::fs::api_db::GitResult>,
+    output_dir: &std::path::Path,
+) {
+    value.git = git;
+    value.outputs = Some(crate::data::fs::command_outputs::summarize_output_dir(
+        output_dir,
+    ));
+    if crate::command::dispatch::catalogue::CommandCatalogue::get()
+        .canonical_path(path)
+        .join(" ")
+        != "exec prompt"
+    {
+        value.final_message = None;
+    }
+    if value.data.is_none() {
+        if let Ok(outcome) = outcome {
+            value.data = catalogue_json(outcome);
+        }
+    }
 }
 
 fn failure(
@@ -619,6 +655,11 @@ fn remove_applied_sidecar(paths: &ApiPaths, session_id: &str, command_id: &str) 
 /// the dispatch capability it needs, never the concrete API frontend type.
 pub trait ApiCommandFrontendFactory: Send + Sync {
     type Frontend: crate::command::dispatch::DispatchFrontend;
+    /// Hosts with an actual dialog response channel may opt in. A PTY alone
+    /// does not make unattended workflow control-board defaults interactive.
+    fn supports_workflow_dialogs(&self) -> bool {
+        false
+    }
 
     /// The worker emits `Done` after post-command stages. The returned frontend
     /// must leave that sentinel to the worker, including when dropped on error.
@@ -667,8 +708,18 @@ pub fn push_run_interaction(
         requested.unwrap_or_else(|| InteractionSlot::WorkerPush.configured(settings).0);
     decision_for(interaction, settings)
 }
+#[async_trait::async_trait]
+pub(crate) trait LeasePostProcess: Send + Sync {
+    async fn process(&self, result: CommandResult) -> CommandResult;
+}
 pub struct QueueWorker<F: ApiCommandFrontendFactory> {
-    executor: Option<Arc<crate::engine::daemon::executor::SharedExecutor>>,
+    /// The daemon's one worker share (WI 0143): pushed commands acquire
+    /// `JobClass::Push` slots, alternating with pulled leases.
+    share: Option<Arc<crate::engine::worker::executor_share::WorkerExecutorShare>>,
+    /// Job origins and `outputs_mounted` beside the command rows.
+    jobs: Option<crate::data::worker::job_store::JobStore>,
+    lease_event_bus: Option<Arc<EventBus>>,
+    lease_post_process: Option<Arc<dyn LeasePostProcess>>,
     worker_id: String,
     store: Arc<SqliteSessionStore>,
     engines: Engines,
@@ -700,7 +751,7 @@ pub struct QueueWorkerDeps<F: ApiCommandFrontendFactory> {
     pub paths: ApiPaths,
     pub frontend_factory: Arc<F>,
     pub lifecycle: ApiSessionLifecycle,
-    /// Cancel markers and `/v1/runs` linkage (WI 0135).
+    /// Cancel markers and `/v1/worker/runs` linkage (WI 0135).
     pub lifecycle_store: CommandLifecycleStore,
     /// The daemon's command-cancel tokens; this worker registers each
     /// command it claims.
@@ -766,8 +817,18 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
     }
 
     pub fn new(worker_id: String, deps: QueueWorkerDeps<F>) -> Self {
+        let jobs = match crate::data::worker::job_store::JobStore::open(deps.store.clone()) {
+            Ok(jobs) => Some(jobs),
+            Err(error) => {
+                tracing::error!(%error, "failed to open the worker job store");
+                None
+            }
+        };
         Self {
-            executor: None,
+            share: None,
+            lease_event_bus: None,
+            lease_post_process: None,
+            jobs,
             worker_id,
             store: deps.store,
             engines: deps.engines,
@@ -780,6 +841,24 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
             cancels: deps.cancels,
             daemon_settings: None,
         }
+    }
+
+    /// Execute a pull-origin row already admitted with a Pull permit. It is
+    /// inserted running, so the push pool can never steal it.
+    pub(crate) async fn execute_lease(
+        &self,
+        command: CommandRecord,
+        cancel: tokio_util::sync::CancellationToken,
+    ) {
+        self.execute_command(command, cancel).await;
+    }
+    pub(crate) fn with_lease_post_process(mut self, post: Arc<dyn LeasePostProcess>) -> Self {
+        self.lease_post_process = Some(post);
+        self
+    }
+    pub(crate) fn with_lease_events(mut self, bus: Arc<EventBus>) -> Self {
+        self.lease_event_bus = Some(bus);
+        self
     }
 
     /// Read the live `daemon` settings when a command starts (WI 0141).
@@ -810,8 +889,30 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
         mut self,
         executor: Arc<crate::engine::daemon::executor::SharedExecutor>,
     ) -> Self {
-        self.executor = Some(executor);
+        self.share = Some(super::push_job::worker_share(&executor));
         self
+    }
+
+    /// Record `cmd` as a push-origin job (unless a lease runner already gave
+    /// it a pull origin) and its `outputs_mounted` flag. Best effort: a store
+    /// failure is logged and never fails the command.
+    fn record_job(
+        &self,
+        cmd: &CommandRecord,
+        args: &[String],
+        interaction: crate::data::config::daemon::Interaction,
+    ) {
+        let Some(jobs) = &self.jobs else {
+            return;
+        };
+        let session = self.store.get_session(&cmd.session_id).ok().flatten();
+        let spec = super::push_job::push_job_spec(cmd, session.as_ref(), args, interaction);
+        if let Err(error) = super::push_job::record_push_job(jobs, cmd, &spec) {
+            tracing::warn!(command_id = %cmd.id, %error, "failed to record the push job");
+        }
+        if let Err(error) = jobs.set_outputs_mounted(&cmd.id, false) {
+            tracing::warn!(command_id = %cmd.id, %error, "failed to record outputs_mounted");
+        }
     }
 
     pub async fn run(self) {
@@ -823,9 +924,9 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
             if stop.is_cancelled() {
                 return;
             }
-            let permit = if let Some(executor) = &self.executor {
+            let permit = if let Some(share) = &self.share {
                 Some(
-                    tokio::select! { biased; _=stop.cancelled()=>return, permit=executor.acquire(crate::data::daemon_state::FeatureName::Worker)=>permit },
+                    tokio::select! { biased; _=stop.cancelled()=>return, permit=share.acquire(crate::data::worker::JobClass::Push)=>permit },
                 )
             } else {
                 None
@@ -968,7 +1069,10 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
         }
 
         // Create EventBus for this command execution.
-        let event_bus = Arc::new(EventBus::for_attempt(4096, cmd.attempt));
+        let event_bus = self
+            .lease_event_bus
+            .clone()
+            .unwrap_or_else(|| Arc::new(EventBus::for_attempt(4096, cmd.attempt)));
 
         // Spawn logfile writer task. The two log files are owned by a Layer 0
         // writer so this frontend performs no filesystem calls of its own.
@@ -1033,8 +1137,43 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
         // factory; Layer 2 owns everything around command execution.
         let state_writer = CommandStateWriter::new(self.paths.clone(), &session_id, &command_id);
         let interaction = self.interaction_for(&cmd);
+        let job_interaction = interaction.interaction;
+        // Lease prompt bodies are private session input. Materialize them only
+        // for catalogue construction, never in the durable row or metadata.
+        let mut dispatch_cmd = cmd.clone();
+        if cmd.subcommand == "exec prompt" && self.lease_event_bus.is_some() {
+            if let Some(session) = self.sessions.get_by_key(&session_id) {
+                let session = session.read().await;
+                if let Some(path) = session.inline_work_item() {
+                    let body = crate::data::fs::private_files::open_private_file(path).and_then(
+                        |mut file| {
+                            use std::io::Read;
+                            let mut body = String::new();
+                            file.read_to_string(&mut body).map_err(|e| {
+                                crate::data::error::DataError::Io {
+                                    path: path.to_path_buf(),
+                                    source: e,
+                                }
+                            })?;
+                            Ok(body)
+                        },
+                    );
+                    match body {
+                        Ok(body) => {
+                            let mut input = args.clone();
+                            input.extend(["--".into(), body]);
+                            dispatch_cmd.args =
+                                serde_json::to_string(&input).expect("string arguments");
+                        }
+                        Err(error) => {
+                            tracing::error!(%error, "could not read private lease prompt")
+                        }
+                    }
+                }
+            }
+        }
         let frontend = self.frontend_factory.frontend_for(
-            &cmd,
+            &dispatch_cmd,
             event_bus.sender(),
             state_writer.clone(),
             interaction,
@@ -1103,6 +1242,9 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
             }),
         };
 
+        // WI 0143: the command is a push-origin job of the worker's one job
+        // model, and records whether `/awman/output` is actually mounted.
+        self.record_job(&cmd, &args, job_interaction);
         // Dispatch through Layer 2.
         let path_parts: Vec<&str> = subcommand.split_whitespace().collect();
         // Every container the command launches is named after it, so a
@@ -1113,6 +1255,7 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
                 Arc::clone(&engines.runtime),
                 &command_id,
             )
+            .with_output_writer(state_writer.clone())
             .with_owner(crate::data::terminal::TerminalOwnerInfo {
                 owner: crate::data::terminal::TerminalOwner::Command(
                     crate::data::ids::CommandId::parse(&command_id).expect("stored command id"),
@@ -1252,6 +1395,14 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
             tracing::error!(command_id = %command_id, error = %error.message, "Push-back failed");
         }
 
+        if let Some(jobs) = &self.jobs {
+            if let Err(error) = jobs.set_outputs_mounted(
+                &command_id,
+                state_writer.result_contributions().outputs_mounted == Some(true),
+            ) {
+                tracing::warn!(%command_id, %error, "failed to record observed output mount");
+            }
+        }
         let mut completion =
             QueuedCommandResult::build(&result, &push_outcome, state_writer.result_contributions())
                 .with_worktree(state_writer.kept_worktree());
@@ -1293,24 +1444,13 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
             }
         };
         completion = completion.map_result(|value| {
-            value.git = git_result;
-            value.outputs = Some(crate::data::fs::command_outputs::summarize_output_dir(
+            finish_result_fields(
+                value,
+                &result,
+                &path_parts,
+                git_result,
                 &state_writer.output_dir(),
-            ));
-            // Workflow agents' messages are step output; only exec prompt has
-            // a command-level final message.
-            if crate::command::dispatch::catalogue::CommandCatalogue::get()
-                .canonical_path(&path_parts)
-                .join(" ")
-                != "exec prompt"
-            {
-                value.final_message = None;
-            }
-            if value.data.is_none() {
-                if let Ok(outcome) = &result {
-                    value.data = catalogue_json(outcome);
-                }
-            }
+            );
         });
         // Git collection and output summarization can take time; observe a
         // cancellation accepted during either before publishing the row.
@@ -1319,6 +1459,10 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
                 .expect("validated persisted resource id"),
         ) {
             completion = completion.cancelled(&requested_at);
+        }
+        if let Some(post) = &self.lease_post_process {
+            let result = read_command_result(&completion.result_json).expect("serialized result");
+            completion = QueuedCommandResult::from_result(post.process(result).await);
         }
         let exit_code = completion.exit_code;
         let status = completion.status;
@@ -1385,7 +1529,10 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
 
     /// Complete a command that failed before its log writer started.
     async fn finish_without_log(&self, cmd: &CommandRecord, completion: QueuedCommandResult) {
-        let bus = Arc::new(EventBus::for_attempt(16, cmd.attempt));
+        let bus = self
+            .lease_event_bus
+            .clone()
+            .unwrap_or_else(|| Arc::new(EventBus::for_attempt(16, cmd.attempt)));
         self.event_buses
             .lock()
             .await
@@ -1416,11 +1563,11 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
         });
     }
 
-    /// Finish closing a draining session, and close a `/v1/runs` session
+    /// Finish closing a draining session, and close a `/v1/worker/runs` session
     /// asked to `close_on_finish` once its run command (`command_id`) is
     /// terminal — `done`, `error` and `cancelled` alike. Both go through the
     /// one `ApiSessionLifecycle::close`, so a remote clone is deleted exactly
-    /// as `DELETE /v1/sessions/{id}` would.
+    /// as `DELETE /v1/worker/sessions/{id}` would.
     async fn post_execution_check(&self, session_id: &str, command_id: &str) {
         let closing = match self.store.get_session(session_id) {
             Ok(session) => session.is_some_and(|s| s.status == SessionStatus::Closing),
@@ -1606,7 +1753,8 @@ fn spawn_tracing_subscriber(
                     | EventPayload::StderrLine(_)
                     | EventPayload::StatusMessage { .. }
                     | EventPayload::StepActivity { .. }
-                    | EventPayload::WorkflowPrerequisites { .. } => {}
+                    | EventPayload::WorkflowPrerequisites { .. }
+                    | EventPayload::WorkflowState(_) => {}
                     // WI 0141 status and terminal events are for clients, not the
                     // daemon log (terminals-api owns any logging it wants here).
                     EventPayload::ProgramStatus { .. }

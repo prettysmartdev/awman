@@ -98,7 +98,7 @@ pub struct SessionSetup {
     store: Arc<SqliteSessionStore>,
     /// Where the terminal `setup_state.json` snapshot is written.
     paths: ApiPaths,
-    /// Fired to abandon the setup (a cancelled `/v1/runs` command). Never fires
+    /// Fired to abandon the setup (a cancelled `/v1/worker/runs` command). Never fires
     /// unless the caller installs one with [`SessionSetup::with_cancellation`].
     cancel: tokio_util::sync::CancellationToken,
 }

@@ -5,9 +5,11 @@
 //! by `EffectiveConfig::daemon()`.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 use crate::data::config::network::{ListenAddr, TlsSan};
 use crate::data::config::units::DurationStr;
+use crate::data::config::work_servers::ResolvedWorkServer;
 use crate::data::daemon_state::FeatureName;
 use crate::data::fs::daemon_env::EnvPersistenceSetting;
 
@@ -169,6 +171,8 @@ pub struct WorkerSettings {
     pub pull_interaction: Interaction,
     pub pull_allow_override: bool,
     pub pull_work_root: Option<String>,
+    /// Work-server entries with per-entry defaults applied.
+    pub work_servers: BTreeMap<String, ResolvedWorkServer>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -238,6 +242,7 @@ impl DaemonSettings {
                 pull_interaction: pull.interaction.unwrap_or(Interaction::Interactive),
                 pull_allow_override: pull.allow_override.unwrap_or(true),
                 pull_work_root: pull.work_root,
+                work_servers: BTreeMap::new(),
             },
             engine: EngineSettings {
                 enabled: engine.enabled.unwrap_or(false),

@@ -70,7 +70,7 @@ pub struct ExecPromptCommand {
     flags: ExecPromptCommandFlags,
     engines: Engines,
     session: Session,
-    /// Fired by an external cancel (the API's `POST /v1/commands/{id}/cancel`).
+    /// Fired by an external cancel (the API's `POST /v1/worker/commands/{id}/cancel`).
     /// Never fired for the CLI or the TUI, which never install one.
     cancel: tokio_util::sync::CancellationToken,
     /// The host directory mounted read-write at `/awman/output` (WI 0137
@@ -369,14 +369,15 @@ impl Command for ExecPromptCommand {
                     None,
                     frontend.as_mut(),
                 )?;
-            let mut directory_overlays = collected.directories;
+            let directory_overlays = collected.directories;
+            let mut command_mounts = Vec::new();
             let system_prompt = match self
                 .output_dir
                 .as_ref()
                 .filter(|_| self.engines.runtime.capabilities().arbitrary_host_mounts)
             {
                 Some(dir) => {
-                    directory_overlays.push(crate::data::fs::command_outputs::output_dir_overlay(dir));
+                    command_mounts.push(crate::data::fs::command_outputs::output_dir_overlay(dir));
                     Some(crate::engine::context_prompt::with_outputs_section(
                         system_prompt,
                         crate::engine::context_prompt::OutputsPromptRole::Prompt,
@@ -404,6 +405,7 @@ impl Command for ExecPromptCommand {
                     Some(collected.env_passthrough)
                 },
                 directory_overlays,
+                command_mounts,
                 include_all_skills: collected.include_all_skills,
                 named_skills: collected.named_skills,
                 system_prompt,
@@ -429,7 +431,7 @@ impl Command for ExecPromptCommand {
                     invoker.working_dir(),
                 )?;
                 if let Some(overlay) = worktree.git_directory_overlay(self.engines.git_engine.clone()).await? {
-                    run_opts.directory_overlays.push(overlay);
+                    run_opts.command_mounts.push(overlay);
                 }
             }
 

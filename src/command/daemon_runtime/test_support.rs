@@ -103,6 +103,7 @@ impl DaemonRuntime {
         });
         let worker_supervisor = FeatureSupervisor::with_started_task(feature, core.clone(), task);
         Arc::new(Self {
+            pull: None,
             config: RwLock::new(config.clone()),
             initial_config: config.clone(),
             supervisors: [

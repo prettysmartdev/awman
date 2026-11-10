@@ -168,6 +168,17 @@ impl ConfigFile {
                     "workServers.{name}.url is required"
                 )));
             }
+            if let Some(labels) = &server.labels {
+                for key in labels.keys() {
+                    if let Err(reason) =
+                        crate::data::config::work_servers::validate_configured_label(key)
+                    {
+                        return Err(DataError::Other(format!(
+                            "workServers.{name}.labels.{key} {reason}"
+                        )));
+                    }
+                }
+            }
         }
         if let Some(remote) = &self.remote {
             for (name, target) in remote.targets.iter().flatten() {
@@ -228,6 +239,15 @@ impl ConfigFile {
 mod tests {
     use super::*;
     use crate::data::config::fields::{ValueKind, CONFIG_KEYS};
+
+    #[test]
+    fn work_server_config_rejects_reserved_reported_labels() {
+        let config = serde_json::json!({"workServers":{"team":{"url":"https://example.com","labels":{"awman/os":"fake"}}}});
+        let error = ConfigFile::from_value(config, FileKind::Global)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("reserved awman/ namespace"), "{error}");
+    }
 
     /// A sample value for a row, used to build one document carrying every
     /// leaf.

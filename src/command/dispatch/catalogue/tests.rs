@@ -174,7 +174,7 @@ fn every_top_level_command_is_present() {
     let cat = CommandCatalogue::get();
     for name in [
         "init", "ready", "chat", "specs", "agents", "config", "exec", "daemon", "squad", "remote",
-        "new",
+        "new", "worker",
     ] {
         assert!(cat.lookup(&[name]).is_some(), "missing top-level '{name}'");
     }
@@ -586,6 +586,7 @@ fn all_expected_subcommands_are_present() {
         (&["new"], "workflow"),
         (&["new"], "skill"),
         (&["new"], "agent"),
+        (&["worker"], "link"),
     ];
     for (parent_path, subcmd_name) in cases {
         let parent = cat
@@ -676,6 +677,8 @@ fn config_and_transport_clients_can_run_without_a_local_runtime() {
             "daemon stop",
             // Writes a definition file and never builds.
             "new agent",
+            "queue",
+            "queue pick",
             "remote",
             "remote exec",
             "remote exec prompt",
@@ -685,6 +688,8 @@ fn config_and_transport_clients_can_run_without_a_local_runtime() {
             "remote session start",
             // A frontend entry point; the view's engine is the daemon's.
             "view",
+            "worker",
+            "worker link",
         ],
     );
 }
@@ -1112,7 +1117,7 @@ fn agents_docs_describe_current_scope_and_detach_controls() {
     );
     let api = include_str!("../../../../docs/09-api-and-remote-mode.md");
     assert!(api.contains("across the configured runtime, independent of the selected"));
-    assert!(api.contains("one \x60StdoutLine\x60 event"));
+    assert!(api.contains("one \x60stdout_line\x60 event"));
     let architecture = include_str!("../../../../docs/architecture.md");
     assert!(!architecture.contains("status.rs           StatusCommand"));
     assert!(architecture.contains("`agents/`"));
@@ -1606,4 +1611,36 @@ fn view_is_internal_and_hidden_from_help() {
         .tui_completions("vi")
         .iter()
         .all(|completion| completion.completion != "view"));
+}
+
+/// `implies` and `conflicts_with` name flags by long name. A target the spec
+/// does not declare is silently ignored at resolution time, so a typo (or a
+/// flag that was never added) is caught here instead.
+#[test]
+fn every_implies_and_conflicts_target_is_a_flag_on_the_same_spec() {
+    for (path, spec) in all_specs() {
+        for flag in spec.flags {
+            for target in flag.implies.iter().chain(flag.conflicts_with) {
+                assert!(
+                    spec.find_flag(target).is_some(),
+                    "`{}` --{} names `--{target}`, which that command does not declare",
+                    path.join(" "),
+                    flag.long,
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn queue_commands_declare_no_implied_headless_flag() {
+    let cat = CommandCatalogue::get();
+    for path in [&["queue"][..], &["queue", "pick"][..]] {
+        let spec = cat.lookup(path).unwrap();
+        assert!(spec.find_flag("headless").is_none(), "{path:?}");
+        assert!(
+            spec.find_flag("json").unwrap().implies.is_empty(),
+            "{path:?}"
+        );
+    }
 }

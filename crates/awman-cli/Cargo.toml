@@ -39,6 +39,7 @@ microsandbox = { workspace = true, optional = true }
 sqlx = { workspace = true, optional = true }
 
 [dev-dependencies]
+awman-wsp = { workspace = true, features = ["mock"] }
 awman = { workspace = true, features = ["test-support"] }
 tokio = { workspace = true, features = ["test-util"] }
 reqwest = { workspace = true }
@@ -201,3 +202,11 @@ path = "../../tests/dockerfile_build.rs"
 [[test]]
 name = "workflow_prerequisites"
 path = "tests/workflow_prerequisites.rs"
+
+[[test]]
+name = "worker_helper"
+path = "../../tests/worker_helper.rs"
+
+[[test]]
+name = "worker_daemon"
+path = "../../tests/worker_daemon.rs"

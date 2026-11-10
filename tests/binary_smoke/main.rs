@@ -51,3 +51,4 @@ mod overlay_cli;
 #[cfg(unix)]
 mod session_worktree;
 mod skill_libraries;
+mod worker_link;

@@ -63,11 +63,13 @@ pub struct CommandOwnedRuntime {
     launches: AtomicU64,
     hub: Option<Arc<crate::engine::terminal_hub::TerminalHub>>,
     owner: Option<crate::data::terminal::TerminalOwnerInfo>,
+    output_writer: Option<crate::data::fs::api_command_log::CommandStateWriter>,
 }
 
 impl CommandOwnedRuntime {
     pub fn new(inner: Arc<dyn AgentRuntimeEngine>, command_id: &str) -> Self {
         Self {
+            output_writer: None,
             hub: inner.terminal_hub(),
             owner: crate::data::ids::CommandId::parse(command_id)
                 .ok()
@@ -90,6 +92,15 @@ impl CommandOwnedRuntime {
     }
     pub fn with_owner(mut self, owner: crate::data::terminal::TerminalOwnerInfo) -> Self {
         self.owner = Some(owner);
+        self
+    }
+
+    pub fn with_output_writer(
+        mut self,
+        writer: crate::data::fs::api_command_log::CommandStateWriter,
+    ) -> Self {
+        writer.record_outputs_mounted(false);
+        self.output_writer = Some(writer);
         self
     }
 }
@@ -169,6 +180,35 @@ impl AgentRuntimeEngine for CommandOwnedRuntime {
             }
             other => other,
         };
+        let mut options = options;
+        if let (Some(writer), ResolvedAgentOptions::Container(options)) =
+            (&self.output_writer, &mut options)
+        {
+            let expected = writer.output_dir();
+            let mounted = options.overlays.iter().any(|overlay| {
+                overlay.container_path
+                    == std::path::Path::new(crate::data::fs::command_outputs::OUTPUT_MOUNT_PATH)
+                    && expected.canonicalize().ok().is_some_and(|expected| {
+                        overlay.host_path.canonicalize().ok().as_ref() == Some(&expected)
+                    })
+                    && overlay.permission
+                        == crate::engine::container::options::OverlayPermission::ReadWrite
+            });
+            if mounted {
+                if let Some(entrypoint) = &mut options.entrypoint {
+                    let receipt = writer.output_mount_receipt()?;
+                    let mut argv = vec![
+                        "/bin/sh".into(),
+                        "-c".into(),
+                        "printf 1 > \"$1\" && rm -f -- \"$1\"; shift; exec \"$@\"".into(),
+                        "awman-output-mount".into(),
+                        receipt.to_string_lossy().into_owned(),
+                    ];
+                    argv.append(&mut entrypoint.0);
+                    entrypoint.0 = argv;
+                }
+            }
+        }
         let instance = self.inner.build(options)?;
         Ok(match (&self.hub, &self.owner) {
             (Some(hub), Some(owner)) => crate::engine::agent_runtime::execution::with_terminal_launch(instance,

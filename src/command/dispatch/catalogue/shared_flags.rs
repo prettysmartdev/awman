@@ -117,6 +117,22 @@ pub(super) const fn build_remote_flags<const N: usize>(
     while j < base.len() {
         if !const_str_in_list(base[j].long, excluded) {
             out[idx] = base[j];
+            // Local implications are applied by the receiving exec command.
+            let mut k = 0;
+            let mut excluded_count = 0;
+            while k < base[j].implies.len() {
+                if const_str_in_list(base[j].implies[k], excluded) {
+                    excluded_count += 1;
+                }
+                k += 1;
+            }
+            if excluded_count > 0 {
+                assert!(
+                    excluded_count == base[j].implies.len(),
+                    "mixed remote implications need an explicit projection"
+                );
+                out[idx].implies = &[];
+            }
             idx += 1;
         }
         j += 1;

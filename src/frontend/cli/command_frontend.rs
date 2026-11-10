@@ -35,6 +35,8 @@ use crate::command::headless::HeadlessDefaults;
 /// Single CLI frontend struct. Implements every per-command frontend trait
 /// in `src/frontend/cli/per_command/`.
 pub struct CliFrontend {
+    pub(crate) worker_json: bool,
+    pub(crate) worker_events: Option<crate::command::worker::events::ForegroundRecorder>,
     pub(crate) matches: ArgMatches,
     /// Cached canonical command path (resolved via `command_path_from_matches`).
     pub(crate) command_path: Vec<String>,
@@ -443,6 +445,8 @@ impl CliFrontend {
         Self {
             matches,
             command_path,
+            worker_events: None,
+            worker_json: false,
             messages: CliUserMessageQueue::new(),
             non_interactive,
             headless: HeadlessDefaults::cli(),
@@ -498,6 +502,9 @@ impl CliFrontend {
     /// command. Used by per-command frontends to suppress human-readable
     /// output (e.g. the ready summary box) when structured JSON is requested.
     pub(crate) fn is_json_mode(&self) -> bool {
+        if self.worker_json {
+            return true;
+        }
         let path_strs: Vec<&str> = self.command_path.iter().map(|s| s.as_str()).collect();
         self.matches_for(&path_strs)
             .and_then(|m| m.try_get_one::<bool>("json").ok().flatten().copied())
@@ -622,6 +629,74 @@ impl UserMessageSink for CliFrontend {
 // ─── CommandFrontend ───────────────────────────────────────────────────────
 
 impl CommandFrontend for CliFrontend {
+    fn pick_queue_item(
+        &mut self,
+        items: &[crate::command::daemon_api::worker_pull::QueueRow],
+    ) -> Result<Option<String>, CommandError> {
+        super::per_command::queue::picker(items)
+            .map(|row| Some(row.id))
+            .map_err(CommandError::Other)
+    }
+    fn confirm_queue_checkout(
+        &mut self,
+        prompt: &crate::data::prompt::Prompt<crate::command::worker::queue_source::CheckoutChoice>,
+    ) -> crate::command::worker::queue_source::CheckoutChoice {
+        use crate::command::worker::queue_source::CheckoutChoice;
+        if self.non_interactive {
+            return CheckoutChoice::FreshClone;
+        }
+        eprintln!("{}\n{}", prompt.title, prompt.body);
+        for choice in &prompt.choices {
+            eprintln!("[{}] {}", choice.key, choice.label);
+        }
+        let mut answer = String::new();
+        if std::io::stdin().read_line(&mut answer).is_err() {
+            return CheckoutChoice::FreshClone;
+        }
+        answer
+            .trim()
+            .chars()
+            .next()
+            .and_then(|key| prompt.answer_for_key(key))
+            .unwrap_or(CheckoutChoice::FreshClone)
+    }
+    fn bind_worker_run(
+        &mut self,
+        input: crate::command::dispatch::ParsedCommandBoxInput,
+        events: crate::command::commands::api_server::event_bus::EventBusSender,
+        writer: crate::data::fs::api_command_log::CommandStateWriter,
+    ) -> Result<(), CommandError> {
+        self.worker_json = self.is_json_mode();
+        if self.worker_json {
+            self.non_interactive = true;
+        }
+        let catalogue = crate::command::dispatch::catalogue::CommandCatalogue::get();
+        let path: Vec<_> = input.path.iter().map(String::as_str).collect();
+        let spec = catalogue
+            .lookup(&path)
+            .ok_or_else(|| CommandError::unknown_command(&path))?;
+        let args = std::iter::once("awman".to_string())
+            .chain(input.path.clone())
+            .chain(input.args.to_argv(spec));
+        self.matches = catalogue
+            .build_clap_command()
+            .try_get_matches_from(args)
+            .map_err(|e| CommandError::Other(e.to_string()))?;
+        self.command_path = input.path;
+        self.worker_events = Some(crate::command::worker::events::ForegroundRecorder::new(
+            events,
+            writer,
+            self.command_path == ["exec", "prompt"],
+        ));
+        Ok(())
+    }
+    fn read_stdin_secret(&mut self) -> Result<String, CommandError> {
+        let mut token = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut token).map_err(|error| {
+            CommandError::Other(format!("cannot read token from stdin: {error}"))
+        })?;
+        Ok(token.trim_end_matches(['\r', '\n']).to_string())
+    }
     fn kind(&self) -> crate::command::dispatch::catalogue::FrontendKind {
         crate::command::dispatch::catalogue::FrontendKind::Cli
     }

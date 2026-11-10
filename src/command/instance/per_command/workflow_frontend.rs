@@ -18,6 +18,24 @@ use crate::engine::workflow::actions::{
 use crate::engine::workflow::frontend::WorkflowFrontend;
 
 impl WorkflowFrontend for InstanceCommandFrontend {
+    fn set_container_source(
+        &mut self,
+        source: Option<crate::engine::workflow::frontend::ContainerSource>,
+    ) {
+        if let Some(recorder) = &self.worker_events {
+            recorder.container_source(source);
+        }
+    }
+    fn report_pull_request_created(&mut self, url: &str) {
+        if let Some(recorder) = &self.worker_events {
+            recorder.writer.record_pull_request(url);
+        }
+    }
+    fn report_workflow_state(&mut self, state: &WorkflowState) {
+        if let Some(recorder) = &self.worker_events {
+            recorder.state(state);
+        }
+    }
     fn show_workflow_control_board(
         &mut self,
         _state: &WorkflowState,
@@ -199,6 +217,9 @@ impl WorkflowFrontend for InstanceCommandFrontend {
     fn report_step_output(&mut self, _step: &WorkflowStep, _output: StepOutput) {}
 
     fn report_workflow_completed(&mut self, outcome: &WorkflowOutcome) {
+        if let Some(recorder) = &self.worker_events {
+            recorder.completed(outcome);
+        }
         if let Ok(mut g) = self.yolo_state.lock() {
             *g = None;
         }

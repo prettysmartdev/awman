@@ -278,6 +278,12 @@ impl UserMessageSink for CliParallelFrontend {
 }
 
 impl AgentFrontend for CliParallelFrontend {
+    fn set_agent_output_format(
+        &mut self,
+        format: crate::data::agent_output_format::AgentOutputFormat,
+    ) {
+        self.inner.set_agent_output_format(format);
+    }
     fn report_status(&mut self, status: AgentStatus) {
         self.inner.report_status(status);
     }
@@ -478,6 +484,12 @@ impl ExecWorkflowCommandFrontend for CliParallelFrontend {
 }
 
 impl WorkflowFrontend for CliParallelFrontend {
+    fn set_container_source(
+        &mut self,
+        source: Option<crate::engine::workflow::frontend::ContainerSource>,
+    ) {
+        self.inner.set_container_source(source);
+    }
     // === Single-container methods: delegate to the existing CLI workflow
     // frontend unchanged. ===
 

@@ -342,7 +342,7 @@ pub(super) const SQUAD_ATTACH: CommandSpec = CommandSpec {
 /// `squad env` — the one home for the daemon's env coverage (WI 0116 §6d).
 ///
 /// `api_allowed: false` is deliberate and is a security property, not an
-/// oversight: an API-allowed leaf can be driven through the `/v1/commands`
+/// oversight: an API-allowed leaf can be driven through the `/v1/worker/commands`
 /// `{subcommand, args}` envelope, where CLI-arg-shaped strings drift into
 /// tracing spans and error text. Payload values must never travel that way, so
 /// the whole leaf stays off the API front door. The daemon's own typed

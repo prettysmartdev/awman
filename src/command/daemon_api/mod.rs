@@ -8,6 +8,9 @@ pub mod operations;
 pub mod squad;
 pub mod terminals;
 pub mod worker;
+// WI 0143: `/v1/worker/{servers,queue,leases}` over the Layer 2 pull worker.
+pub mod worker_pull;
+pub mod workflow_view;
 use crate::command::commands::squad::gateway::TaskGateway;
 use crate::command::daemon_runtime::DaemonRuntime;
 use crate::command::dispatch::Engines;
@@ -22,6 +25,10 @@ pub struct DaemonApi {
     /// `/v1/terminals` (WI 0141): the daemon's one set of terminal operations,
     /// shared by both listeners so the input grant is daemon-wide.
     pub terminals: Arc<crate::command::terminals::TerminalOperations>,
+    /// The pull worker (WI 0143), when this daemon runs one. Without it the
+    /// pull routes answer from config and the lease store and refuse
+    /// queue/claim/release with `503 pull_disabled`.
+    pub pull: Option<Arc<dyn worker_pull::PullHandle>>,
 }
 impl DaemonApi {
     pub fn new(runtime: Arc<DaemonRuntime>) -> Self {
@@ -30,8 +37,15 @@ impl DaemonApi {
             squad: Some(runtime.squad().gateway.clone()),
             engines: runtime.engines().clone(),
             terminals: runtime.terminals(),
+            pull: runtime.pull_handle(),
             runtime,
         }
+    }
+    /// Bind the pull routes to the daemon's pull worker.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_pull(mut self, pull: Arc<dyn worker_pull::PullHandle>) -> Self {
+        self.pull = Some(pull);
+        self
     }
     pub fn grant_store(
         &self,

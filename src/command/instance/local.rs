@@ -47,6 +47,12 @@ impl LocalInstanceBackend {
 }
 
 impl InstanceBackend for LocalInstanceBackend {
+    fn queue_source(
+        &self,
+        session: &Session,
+    ) -> Result<Option<crate::command::worker::queue_source::SharedQueueSource>, String> {
+        self.instance.queue_source(session)
+    }
     fn kind(&self) -> BackendKind {
         BackendKind::Builtin
     }

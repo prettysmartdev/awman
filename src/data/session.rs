@@ -409,6 +409,7 @@ impl SessionType {
 #[derive(Debug, Clone)]
 pub struct Session {
     id: SessionId,
+    inline_work_item: Option<PathBuf>,
     session_type: SessionType,
     git_root: PathBuf,
     definition_root: PathBuf,
@@ -613,6 +614,7 @@ impl Session {
         let now = SystemTime::now();
         Ok(Self {
             id: SessionId::new(),
+            inline_work_item: invoker.inline_work_item.clone(),
             session_type: SessionType::Local {
                 workdir: working_dir,
             },
@@ -657,6 +659,7 @@ impl Session {
 
         Ok(Self {
             id: SessionId::new(),
+            inline_work_item: None,
             session_type: SessionType::Local {
                 workdir: working_dir,
             },
@@ -673,6 +676,13 @@ impl Session {
             last_active_at: now,
             created_at_instant: Instant::now(),
         })
+    }
+
+    pub fn set_inline_work_item(&mut self, path: PathBuf) {
+        self.inline_work_item = Some(path);
+    }
+    pub fn inline_work_item(&self) -> Option<&Path> {
+        self.inline_work_item.as_deref()
     }
 
     pub fn id(&self) -> SessionId {

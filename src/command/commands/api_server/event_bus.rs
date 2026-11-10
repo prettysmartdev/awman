@@ -1,10 +1,10 @@
-//! `EventBus` — broadcast channel for execution events within the API server.
+//! `EventBus` — ordered publication for worker command execution events.
 //!
 //! Created once per command/job execution. The API frontend's trait
 //! implementations emit events through the sender. SSE connections subscribe
 //! to the broadcast channel; the sole logfile writer uses a reliable queue.
 //!
-//! This is a Layer 3 type — the engine layer has no knowledge of it.
+//! Layer 2 owns publication; HTTP and foreground frontends use its senders.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -20,6 +20,7 @@ pub struct EventBus {
     attempt: u32,
     drains: TaskTracker,
     drain_shutdown: tokio_util::sync::CancellationToken,
+    awaiting_input: Option<crate::engine::worker::heartbeat::AwaitingInputSignal>,
 }
 
 #[derive(Default)]
@@ -27,6 +28,7 @@ struct Publication {
     next_sequence: u64,
     finished: bool,
     log: Option<mpsc::UnboundedSender<ExecutionEvent>>,
+    followers: Vec<mpsc::UnboundedSender<ExecutionEvent>>,
 }
 
 impl EventBus {
@@ -45,11 +47,19 @@ impl EventBus {
             attempt,
             drains: TaskTracker::new(),
             drain_shutdown: Default::default(),
+            awaiting_input: None,
         }
     }
 
     pub fn attempt(&self) -> u32 {
         self.attempt
+    }
+    pub fn with_awaiting_input(
+        mut self,
+        signal: crate::engine::worker::heartbeat::AwaitingInputSignal,
+    ) -> Self {
+        self.awaiting_input = Some(signal);
+        self
     }
 
     pub fn sender(&self) -> EventBusSender {
@@ -59,6 +69,7 @@ impl EventBus {
             attempt: self.attempt,
             drains: self.drains.clone(),
             drain_shutdown: self.drain_shutdown.clone(),
+            awaiting_input: self.awaiting_input.clone(),
             source: None,
         }
     }
@@ -86,6 +97,17 @@ impl EventBus {
         rx
     }
 
+    /// Lossless lease forwarding, registered before command publication.
+    pub fn subscribe_ordered(&self) -> mpsc::UnboundedReceiver<ExecutionEvent> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.publication
+            .lock()
+            .expect("publication lock")
+            .followers
+            .push(tx);
+        rx
+    }
+
     pub fn subscribe(&self) -> broadcast::Receiver<ExecutionEvent> {
         self.tx.subscribe()
     }
@@ -106,6 +128,7 @@ pub struct EventBusSender {
     attempt: u32,
     drains: TaskTracker,
     drain_shutdown: tokio_util::sync::CancellationToken,
+    awaiting_input: Option<crate::engine::worker::heartbeat::AwaitingInputSignal>,
     /// Stamped on every event this sender emits (WI 0137 §5). `None` on the
     /// bus's root sender; set by [`EventBusSender::with_source`] or
     /// [`EventBusSender::with_shared_source`].
@@ -130,6 +153,10 @@ impl SourceStamp {
 }
 
 impl EventBusSender {
+    /// Hold this guard for the duration of a frontend dialog.
+    pub fn awaiting_input(&self) -> Option<crate::engine::worker::heartbeat::AwaitingInputGuard> {
+        self.awaiting_input.as_ref().map(|signal| signal.hold())
+    }
     pub fn output_shutdown(&self) -> tokio_util::sync::CancellationToken {
         self.drain_shutdown.clone()
     }
@@ -205,6 +232,9 @@ impl EventBusSender {
         if let Some(log) = &publication.log {
             let _ = log.send(event.clone());
         }
+        publication
+            .followers
+            .retain(|tx| tx.send(event.clone()).is_ok());
         let _ = self.tx.send(event);
     }
 }

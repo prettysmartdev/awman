@@ -608,6 +608,7 @@ async fn mapping_submit_is_acknowledged_by_the_runs_slot_or_refused() {
         let feeds = tab.feeds.clone();
         std::thread::spawn(move || {
             backend.submit(SubmitRequest {
+                lease_id: None,
                 session_id,
                 parsed,
                 feeds,
@@ -668,6 +669,7 @@ async fn mapping_submit_is_acknowledged_by_the_runs_slot_or_refused() {
         let feeds = tab.feeds.clone();
         std::thread::spawn(move || {
             backend.submit(SubmitRequest {
+                lease_id: None,
                 session_id,
                 parsed,
                 feeds,

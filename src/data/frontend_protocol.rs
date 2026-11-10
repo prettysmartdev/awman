@@ -91,6 +91,7 @@ pub struct OpenTabOptions {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "source", rename_all = "snake_case")]
 pub enum SubmitInput {
+    Lease { lease_id: String, args: Vec<String> },
     CommandBox { raw: String },
     Argv { args: Vec<String> },
 } // D3
@@ -103,6 +104,11 @@ pub enum WorkflowRequestWire {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum FrontendFrame {
+    WorkerQueue {
+        request_id: u64,
+        tab_id: TabId,
+        request: crate::data::worker::queue::QueueRequest,
+    },
     Hello(Hello),
     OpenTab {
         dir: PathBuf,
@@ -224,6 +230,10 @@ pub enum DetachReasonWire {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum EngineFrame {
+    WorkerQueue {
+        request_id: u64,
+        reply: crate::data::worker::queue::QueueReply,
+    },
     CommandBytes {
         tab_id: TabId,
         stream: OutputStream,

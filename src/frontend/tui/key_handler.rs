@@ -25,6 +25,7 @@ fn command_box_locked(app: &App) -> bool {
 /// Determine focus context and dispatch the key event through the keymap.
 mod dialog;
 mod edit;
+pub(super) mod queue;
 mod scroll;
 mod squad;
 mod tab;
@@ -73,6 +74,15 @@ pub(super) fn focus_context(app: &App) -> FocusContext {
 /// keymap because they depend on *which* dialog is open, which the keymap's
 /// `FocusContext::Dialog` does not distinguish.
 fn intercept_dialog_keys(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
+    // The work-queue panel and the lease close prompt own every key.
+    if matches!(app.active_dialog, Some(Dialog::QueuePanel(_))) {
+        queue::handle_panel_key(app, key);
+        return true;
+    }
+    if matches!(app.active_dialog, Some(Dialog::LeaseCloseConfirm(_))) {
+        queue::handle_close_key(app, key);
+        return true;
+    }
     // WorkflowControlBoard intercepts arrow keys and Ctrl+Enter before the
     // generic keymap so they map to workflow navigation rather than scroll/cursor.
     if matches!(app.active_dialog, Some(Dialog::WorkflowControlBoard(_)))
@@ -254,6 +264,8 @@ pub(super) fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
         | Action::FocusCommandBox
         | Action::ToggleStatusLog
         | Action::DetachContainers => tab::handle(app, action),
+
+        Action::OpenQueuePanel => queue::open_panel(app),
 
         Action::ScrollUp
         | Action::ScrollDown

@@ -28,6 +28,12 @@ pub struct FeatureRecord {
     pub queued: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<serde_json::Value>,
+    /// `worker` only (WI 0143): pushed jobs running and queued.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub push: Option<super::worker::PushStatus>,
+    /// `worker` only (WI 0143): one entry per `workServers` entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pull: Option<super::worker_pull::PullStatus>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListenerRecord {
@@ -61,8 +67,22 @@ pub struct ConfigResponse {
 
 pub async fn feature(api: &DaemonApi, f: Feature) -> Result<FeatureRecord, CommandError> {
     f.feature_name()
-        .map(|name| api.runtime.feature_record(name))
+        .map(|name| with_worker_sides(api, api.runtime.feature_record(name)))
         .ok_or_else(|| CommandError::Other("unknown feature".into()))
+}
+/// Add `push` and `pull` to the `worker` record (WI 0143). The per-feature
+/// fields keep 0140's meaning; these split them by arrival path.
+pub fn with_worker_sides(api: &DaemonApi, mut record: FeatureRecord) -> FeatureRecord {
+    if record.name != Feature::Worker.name() {
+        return record;
+    }
+    let off = record.state == FeatureState::Off;
+    record.push = Some(match (&api.worker, off) {
+        (Some(worker), false) => super::worker::push_status(worker).unwrap_or_default(),
+        _ => Default::default(),
+    });
+    record.pull = Some(super::worker_pull::pull_status(api));
+    record
 }
 pub async fn features_list(api: &DaemonApi) -> Result<Vec<FeatureRecord>, CommandError> {
     let mut records = Vec::new();
@@ -72,7 +92,32 @@ pub async fn features_list(api: &DaemonApi) -> Result<Vec<FeatureRecord>, Comman
     Ok(records)
 }
 pub async fn status(api: &DaemonApi) -> Result<StatusResponse, CommandError> {
-    Ok(api.runtime.status_snapshot())
+    let mut status = api.runtime.status_snapshot();
+    if let Some(worker) = status.features.remove(Feature::Worker.name()) {
+        status
+            .features
+            .insert(worker.name.clone(), with_worker_sides(api, worker));
+    }
+    let mounts_outputs = api.engines.runtime.capabilities().mounts_outputs(true);
+    status.capabilities =
+        super::capabilities::advertised(mounts_outputs, &super::worker_pull::capabilities(api));
+    let worker = api.runtime.config().daemon().worker;
+    if worker.pull_enabled
+        && worker.pull_interaction.is_headless()
+        && !worker.pull_allow_override
+        && !worker.work_servers.values().any(|server| {
+            server.enabled && server.interaction.is_some_and(|mode| !mode.is_headless())
+        })
+        && status
+            .features
+            .get("engine")
+            .is_none_or(|record| record.state != FeatureState::On)
+    {
+        status
+            .capabilities
+            .retain(|capability| capability != "interactive" && capability != "terminal");
+    }
+    Ok(status)
 }
 pub fn config_get(api: &DaemonApi) -> ConfigResponse {
     let config = api.runtime.config();
@@ -171,6 +216,55 @@ pub fn changed_paths(
     after: &serde_json::Value,
     pattern: &str,
 ) -> Vec<String> {
+    // All work-server rows are live. A removed entry must replace the map as
+    // a unit: writing null to its individual URL leaf leaves a ghost entry
+    // which fails config validation and keeps the old claim policy running.
+    if pattern.starts_with("workServers.")
+        && before
+            .get("workServers")
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|entries| {
+                entries.keys().any(|name| {
+                    after
+                        .get("workServers")
+                        .and_then(|map| map.get(name))
+                        .is_none()
+                })
+            })
+    {
+        return if pattern == "workServers.*.url" {
+            vec!["workServers".into()]
+        } else {
+            Vec::new()
+        };
+    }
+    // Label keys may themselves contain dots. Replace each changed label map
+    // rather than interpreting a label's spelling as a dotted config path.
+    if pattern == "workServers.*.labels" {
+        let names = before
+            .get("workServers")
+            .and_then(serde_json::Value::as_object)
+            .into_iter()
+            .flat_map(|map| map.keys())
+            .chain(
+                after
+                    .get("workServers")
+                    .and_then(serde_json::Value::as_object)
+                    .into_iter()
+                    .flat_map(|map| map.keys()),
+            );
+        let names: std::collections::BTreeSet<_> = names.collect();
+        return names
+            .into_iter()
+            .filter_map(|name| {
+                let path = format!("workServers.{name}.labels");
+                (at(before, &path) != at(after, &path)).then_some(path)
+            })
+            .collect();
+    }
+    if pattern == "workServers.*.labels.*" {
+        return Vec::new();
+    }
     let mut paths = Vec::new();
     leaves(before, "", &mut paths);
     leaves(after, "", &mut paths);
@@ -291,6 +385,11 @@ pub async fn jobs_cancel_feature(
     api: &DaemonApi,
     f: crate::data::daemon_state::FeatureName,
 ) -> Result<Vec<String>, CommandError> {
+    if f == crate::data::daemon_state::FeatureName::Worker {
+        if let Some(pull) = &api.pull {
+            pull.cancel_jobs();
+        }
+    }
     let canceled = api.runtime.cancel_feature_jobs(f).await?;
     let hub = api.terminals.hub();
     let owners: std::collections::HashSet<_> = hub
@@ -309,4 +408,59 @@ pub async fn jobs_cancel_feature(
 }
 pub async fn config_reload(api: &DaemonApi) -> Result<ReloadResponse, CommandError> {
     api.runtime.reload_config().await
+}
+
+#[cfg(test)]
+mod worker_reload_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn removing_a_work_server_replaces_the_map_without_ghost_leaves() {
+        let before = json!({"workServers": {
+            "removed": {"url": "https://old.example", "claim": "auto", "labels": {"team": "a"}},
+            "kept": {"url": "https://kept.example"}
+        }});
+        let after =
+            json!({"workServers": {"kept": {"url": "https://kept.example", "claim": "auto"}}});
+        let paths: Vec<_> = crate::data::config::fields::CONFIG_KEYS
+            .iter()
+            .filter(|key| key.path.starts_with("workServers."))
+            .flat_map(|key| changed_paths(&before, &after, key.path))
+            .collect();
+        assert_eq!(paths, ["workServers"]);
+        let mut applied = before;
+        for path in paths {
+            crate::data::config::config_json::set_config_field(
+                &mut applied,
+                &path,
+                at(&after, &path).unwrap().clone(),
+            );
+        }
+        assert_eq!(applied, after);
+        assert_eq!(
+            changed_paths(&applied, &json!({}), "workServers.*.url"),
+            ["workServers"]
+        );
+    }
+
+    #[test]
+    fn live_worker_labels_preserve_dots_and_removals_as_map_keys() {
+        let before = json!({"workServers":{"team":{"url":"https://example.com","labels":{"team.example/owner":"old", "gone":"yes"}}}});
+        let after = json!({"workServers":{"team":{"url":"https://example.com","labels":{"team.example/owner":"new"}}}});
+        assert_eq!(
+            changed_paths(&before, &after, "workServers.*.labels"),
+            ["workServers.team.labels"]
+        );
+        assert!(changed_paths(&before, &after, "workServers.*.labels.*").is_empty());
+        let mut applied = before;
+        for path in changed_paths(&applied, &after, "workServers.*.labels") {
+            crate::data::config::config_json::set_config_field(
+                &mut applied,
+                &path,
+                at(&after, &path).unwrap().clone(),
+            );
+        }
+        assert_eq!(applied, after);
+    }
 }

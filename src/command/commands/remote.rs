@@ -604,7 +604,9 @@ async fn run_remote_exec(
                     EventPayload::TerminalOpened { .. }
                     | EventPayload::TerminalClosed { .. }
                     | EventPayload::TerminalControl { .. }
-                    | EventPayload::TerminalViewerDetached { .. } => {}
+                    | EventPayload::TerminalViewerDetached { .. }
+                    // WI 0143: snapshots are for Workflow Overview clients.
+                    | EventPayload::WorkflowState(_) => {}
                 }
                 false
             }

@@ -62,6 +62,10 @@ pub enum Dialog {
     AgentSetup(AgentSetupState),
     MountScope(MountScopeState),
     AgentAuth(AgentAuthState),
+    /// The `Ctrl-Q` work-queue panel and its item body view (WI 0143).
+    QueuePanel(crate::frontend::tui::queue::QueuePanelState),
+    /// Release or cancel the lease of a work-item tab being closed mid-run.
+    LeaseCloseConfirm(crate::frontend::tui::queue::LeaseCloseState),
     QuitConfirm,
     CloseTabConfirm,
     WorkflowCancelConfirm,

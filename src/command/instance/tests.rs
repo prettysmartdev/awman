@@ -71,6 +71,7 @@ fn submit_startup(
     feeds: TabCommandFeeds,
 ) -> Result<SubmittedCommand, CommandError> {
     backend.submit(SubmitRequest {
+        lease_id: None,
         session_id: session.id(),
         parsed: backend.instance().startup_command(session),
         feeds,

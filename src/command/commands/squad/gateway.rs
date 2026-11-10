@@ -285,7 +285,7 @@ impl std::fmt::Debug for EnvCoverage {
 ///
 /// `Debug` is derived and still safe — [`DaemonEnvMap`]'s own `Debug` prints
 /// names only — which is the point of the type. This body deliberately does not
-/// travel through the `{subcommand, args}` envelope of `/v1/commands`:
+/// travel through the `{subcommand, args}` envelope of `/v1/worker/commands`:
 /// CLI-arg-shaped strings drift into tracing spans and error text, a typed body
 /// with a redacting `Debug` does not.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

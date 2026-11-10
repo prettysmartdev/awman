@@ -350,9 +350,32 @@ piped print mode (`headless`). The defaults are `daemon.features.squad.interacti
 feature has an `allowOverride` setting, default `true`, that controls whether
 an individual run may request the other mode. These settings are global and
 live. A request for a disallowed override is rejected before it is queued.
-The configuration also accepts `daemon.features.worker.pull.interaction`
-(`interactive` by default), but awman does not currently run pulled jobs, so
-that setting has no effect yet.
+`daemon.features.worker.pull.interaction` (`interactive` by default) controls
+pulled work; `workServers.<name>.interaction` can override it for one linked
+server. These settings are live. See [Workers and Work Servers](17-workers-and-work-servers.md)
+for supported work item fields and pull behavior.
+
+### Work server links
+
+`awman worker link <https-url>` creates a global `workServers.<name>` entry and
+stores the server token in owner-only state outside the config file. See
+[Link a work server](17-workers-and-work-servers.md#link-a-work-server) for
+device approval and token options. Manage a link through config:
+
+```sh
+awman config get workServers
+awman config set workServers.team.labels.pool laptops
+awman config unset workServers.team
+```
+
+Unsetting the whole `workServers.<name>` entry removes its stored token after
+any active leases from that server finish.
+Owner-configured label keys must be lowercase, may have one namespace, and
+cannot start with `awman/`. Enabled linked servers register with the daemon's
+pull worker. `claim` selects automatic claiming or manual picking, and
+`maxConcurrentJobs` limits leases from that server. These settings and
+`daemon.features.worker.pull.*` apply live. `tui.worker.enabled` controls the
+TUI queue panel and its instance-owned manual worker.
 
 ### Adjust terminal scrollback
 
@@ -620,7 +643,7 @@ This table is generated from the same key table awman validates against, so it i
 | `agents.auth.refresh.enabled` | bool | `true` | repo | no | no | `AWMAN_AGENTS_AUTH_REFRESH_ENABLED` | Refresh agent credentials while an agent runs. |
 | `agents.auth.refresh.threshold` | duration | `"20m"` | repo | no | no | `AWMAN_AGENTS_AUTH_REFRESH_THRESHOLD` | Refresh a credential when it expires sooner than this. |
 | `agents.auth.refresh.tick` | duration | `"60s"` | repo | no | no | `AWMAN_AGENTS_AUTH_REFRESH_TICK` | How often credential expiry is checked. |
-| `agents.programStatus.enabled` | bool | `true` | repo | no | no | `AWMAN_AGENTS_PROGRAM_STATUS_ENABLED` | Collect program status from agents (read from 0141). |
+| `agents.programStatus.enabled` | bool | `true` | repo | no | no | `AWMAN_AGENTS_PROGRAM_STATUS_ENABLED` | Collect program status from agents. |
 | `runtime.kind` | enum `docker\|apple\|sbx\|builtin` | `"docker"` | global | no | no | `AWMAN_RUNTIME_KIND` | Container runtime agents run in; sbx and builtin are experimental. |
 | `runtime.baseImage` | string | `null` | repo | no | no | `AWMAN_RUNTIME_BASE_IMAGE` | Base image tag for setup and teardown containers. |
 | `runtime.dockerfile` | string | `"Dockerfile.dev"` | repo | no | no | `AWMAN_RUNTIME_DOCKERFILE` | Dockerfile, relative to the repo root, that agent images are built from. |
@@ -664,22 +687,22 @@ This table is generated from the same key table awman validates against, so it i
 | `worktree.mergeFix.promptTemplate` | string | `null` | repo | no | no | `AWMAN_WORKTREE_MERGE_FIX_PROMPT_TEMPLATE` | Prompt template, relative to the repo root, for the merge-fix agent. |
 | `tui.scrollbackLines` | int ≥ 0 | `10000` | repo | no | no | `AWMAN_TUI_SCROLLBACK_LINES` | Scrollback lines kept per container terminal. |
 | `tui.backend` | enum `auto\|daemon\|builtin` | `"auto"` | repo | no | no | `AWMAN_TUI_BACKEND` | Where the TUI runs commands: automatic selection, the daemon, or the builtin backend. |
-| `tui.programStatus.emit` | bool | `true` | repo | no | no | `AWMAN_TUI_PROGRAM_STATUS_EMIT` | Emit program status from the TUI (read from 0141). |
-| `tui.worker.enabled` | bool | `false` | repo | no | no | `AWMAN_TUI_WORKER_ENABLED` | Run a pull worker inside the TUI (read from 0143). |
+| `tui.programStatus.emit` | bool | `true` | repo | no | no | `AWMAN_TUI_PROGRAM_STATUS_EMIT` | Emit program status from the TUI. |
+| `tui.worker.enabled` | bool | `false` | repo | no | no | `AWMAN_TUI_WORKER_ENABLED` | Enable the TUI work queue panel (Ctrl+Q) and an instance-owned manual worker. |
 | `tui.integrations.*` | object | `{}` | repo | no | no | — | Integration-specific TUI settings keyed by integration name. |
 | `tui.integrations.*.enabled` | enum `auto\|on\|off` | `"auto"` | repo | no | no | `AWMAN_TUI_INTEGRATIONS_<NAME>_ENABLED` | Whether this TUI integration is selected automatically, enabled, or disabled. |
 | `daemon.maxConcurrentJobs` | int ≥ 1 | `4` | global | no | yes | `AWMAN_DAEMON_MAX_CONCURRENT_JOBS` | Jobs the daemon runs at once. |
 | `daemon.verboseSetup` | bool | `false` | global | no | yes | `AWMAN_DAEMON_VERBOSE_SETUP` | Log session setup in detail. |
-| `daemon.terminal.cols` | int ≥ 1 | `120` | global | no | yes | `AWMAN_DAEMON_TERMINAL_COLS` | Default daemon terminal width (read from 0141). |
-| `daemon.terminal.rows` | int ≥ 1 | `40` | global | no | yes | `AWMAN_DAEMON_TERMINAL_ROWS` | Default daemon terminal height (read from 0141). |
-| `daemon.terminal.remoteInput` | bool | `false` | global | no | yes | `AWMAN_DAEMON_TERMINAL_REMOTE_INPUT` | Accept terminal input from network clients (read from 0141). |
-| `daemon.network.enabled` | bool | `false` | global | no | yes | `AWMAN_DAEMON_NETWORK_ENABLED` | Serve the API on the network listener (read from 0140). |
+| `daemon.terminal.cols` | int ≥ 1 | `120` | global | no | yes | `AWMAN_DAEMON_TERMINAL_COLS` | Default daemon terminal width. |
+| `daemon.terminal.rows` | int ≥ 1 | `40` | global | no | yes | `AWMAN_DAEMON_TERMINAL_ROWS` | Default daemon terminal height. |
+| `daemon.terminal.remoteInput` | bool | `false` | global | no | yes | `AWMAN_DAEMON_TERMINAL_REMOTE_INPUT` | Accept terminal input from network clients. |
+| `daemon.network.enabled` | bool | `false` | global | no | yes | `AWMAN_DAEMON_NETWORK_ENABLED` | Serve the API on the network listener. |
 | `daemon.network.listen` | string | `"127.0.0.1:9876"` | global | no | no | `AWMAN_DAEMON_NETWORK_LISTEN` | host:port the API listener binds; changing it needs a daemon restart. |
-| `daemon.network.tlsSans` | list<string> | `[]` | global | no | yes | `AWMAN_DAEMON_NETWORK_TLS_SANS` | Extra names in the listener's TLS certificate (read from 0140). |
-| `daemon.network.features` | list<string> | `["worker"]` | global | no | yes | `AWMAN_DAEMON_NETWORK_FEATURES` | Features served on the network listener (read from 0140). |
+| `daemon.network.tlsSans` | list<string> | `[]` | global | no | yes | `AWMAN_DAEMON_NETWORK_TLS_SANS` | Extra names in the listener's TLS certificate. |
+| `daemon.network.features` | list<string> | `["worker"]` | global | no | yes | `AWMAN_DAEMON_NETWORK_FEATURES` | Features served on the network listener. |
 | `daemon.features.squad.enabled` | bool | `false` | global | no | yes | `AWMAN_DAEMON_FEATURES_SQUAD_ENABLED` | Run the squad scheduler. |
 | `daemon.features.squad.interaction` | enum `interactive\|headless` | `"interactive"` | global | no | yes | `AWMAN_DAEMON_FEATURES_SQUAD_INTERACTION` | How squad evaluations interact. |
-| `daemon.features.squad.allowOverride` | bool | `true` | global | no | yes | `AWMAN_DAEMON_FEATURES_SQUAD_ALLOW_OVERRIDE` | Let a squad task choose its own interaction (read from 0141). |
+| `daemon.features.squad.allowOverride` | bool | `true` | global | no | yes | `AWMAN_DAEMON_FEATURES_SQUAD_ALLOW_OVERRIDE` | Let a squad task choose its own interaction. |
 | `daemon.features.squad.maxConcurrentJobs` | int ≥ 1 | `1` | global | no | yes | `AWMAN_DAEMON_FEATURES_SQUAD_MAX_CONCURRENT_JOBS` | Squad runs at once. |
 | `daemon.features.squad.maxConcurrentEvaluations` | int ≥ 1 | `2` | global | no | yes | `AWMAN_DAEMON_FEATURES_SQUAD_MAX_CONCURRENT_EVALUATIONS` | Squad evaluations at once. |
 | `daemon.features.squad.envPersistence` | enum `keychain\|none` | `"keychain"` | global | no | yes | `AWMAN_DAEMON_FEATURES_SQUAD_ENV_PERSISTENCE` | Where the squad daemon persists pushed task environment. |
@@ -690,20 +713,21 @@ This table is generated from the same key table awman validates against, so it i
 | `daemon.features.worker.push.allowOverride` | bool | `true` | global | no | yes | `AWMAN_DAEMON_FEATURES_WORKER_PUSH_ALLOW_OVERRIDE` | Let a pushed job choose its own interaction. |
 | `daemon.features.worker.push.workDirs.allow` | list<string> | `[]` | global | no | yes | `AWMAN_DAEMON_FEATURES_WORKER_PUSH_WORK_DIRS_ALLOW` | Directories pushed jobs may run in. |
 | `daemon.features.worker.push.workDirs.roots` | list<string> | `[]` | global | no | yes | `AWMAN_DAEMON_FEATURES_WORKER_PUSH_WORK_DIRS_ROOTS` | Directories whose children pushed jobs may run in. |
-| `daemon.features.worker.pull.enabled` | bool | `true` | global | no | yes | `AWMAN_DAEMON_FEATURES_WORKER_PULL_ENABLED` | Claim jobs from work servers (read from 0143). |
-| `daemon.features.worker.pull.interaction` | enum `interactive\|headless` | `"interactive"` | global | no | yes | `AWMAN_DAEMON_FEATURES_WORKER_PULL_INTERACTION` | Default interaction of pulled jobs (read from 0143). |
-| `daemon.features.worker.pull.allowOverride` | bool | `true` | global | no | yes | `AWMAN_DAEMON_FEATURES_WORKER_PULL_ALLOW_OVERRIDE` | Let a pulled job choose its own interaction (read from 0143). |
-| `daemon.features.worker.pull.workRoot` | string | `null` | global | no | yes | `AWMAN_DAEMON_FEATURES_WORKER_PULL_WORK_ROOT` | Directory pulled jobs check out into (read from 0143). |
+| `daemon.features.worker.pull.enabled` | bool | `true` | global | no | yes | `AWMAN_DAEMON_FEATURES_WORKER_PULL_ENABLED` | Register enabled work servers and claim eligible work items. |
+| `daemon.features.worker.pull.interaction` | enum `interactive\|headless` | `"interactive"` | global | no | yes | `AWMAN_DAEMON_FEATURES_WORKER_PULL_INTERACTION` | Default interaction for pulled jobs. |
+| `daemon.features.worker.pull.allowOverride` | bool | `true` | global | no | yes | `AWMAN_DAEMON_FEATURES_WORKER_PULL_ALLOW_OVERRIDE` | Allow work items and server entries to override pull interaction. |
+| `daemon.features.worker.pull.workRoot` | string | `null` | global | no | yes | `AWMAN_DAEMON_FEATURES_WORKER_PULL_WORK_ROOT` | Root for pulled-job checkouts; null uses <data>/worker. |
 | `daemon.features.engine.enabled` | bool | `false` | global | no | yes | `AWMAN_DAEMON_FEATURES_ENGINE_ENABLED` | Serve engine instances from the daemon. |
 | `daemon.features.engine.allowEphemeral` | bool | `true` | global | no | yes | `AWMAN_DAEMON_FEATURES_ENGINE_ALLOW_EPHEMERAL` | Allow the daemon to start the engine feature on demand. |
 | `daemon.features.engine.idleTimeout` | duration | `"15m"` | global | no | yes | `AWMAN_DAEMON_FEATURES_ENGINE_IDLE_TIMEOUT` | Idle time after which an unused on-demand engine stops. |
 | `daemon.features.engine.maxConcurrentJobs` | int ≥ 1 | `4` | global | no | yes | `AWMAN_DAEMON_FEATURES_ENGINE_MAX_CONCURRENT_JOBS` | Engine jobs the daemon runs at once. |
-| `workServers.*.url` | string | `null` | global | no | yes | `AWMAN_WORK_SERVERS_<NAME>_URL` | Work server URL; required for every entry (read from 0143). |
-| `workServers.*.enabled` | bool | `true` | global | no | yes | `AWMAN_WORK_SERVERS_<NAME>_ENABLED` | Claim work from this server (read from 0143). |
-| `workServers.*.claim` | enum `auto\|manual` | `"auto"` | global | no | yes | `AWMAN_WORK_SERVERS_<NAME>_CLAIM` | Whether work is claimed automatically (read from 0143). |
-| `workServers.*.maxConcurrentJobs` | int ≥ 1 | `1` | global | no | yes | `AWMAN_WORK_SERVERS_<NAME>_MAX_CONCURRENT_JOBS` | Jobs from this server at once (read from 0143). |
-| `workServers.*.interaction` | enum `interactive\|headless` | `null` | global | no | yes | `AWMAN_WORK_SERVERS_<NAME>_INTERACTION` | Interaction override for this server's jobs (read from 0143). |
-| `workServers.*.labels` | map<string,string> | `{}` | global | no | yes | `AWMAN_WORK_SERVERS_<NAME>_LABELS` | Labels this worker advertises to the server (read from 0143). |
+| `workServers.*.url` | string | `null` | global | no | yes | `AWMAN_WORK_SERVERS_<NAME>_URL` | Base URL of a linked work server; required for every entry. |
+| `workServers.*.enabled` | bool | `true` | global | no | yes | `AWMAN_WORK_SERVERS_<NAME>_ENABLED` | Whether this work server is enabled. |
+| `workServers.*.claim` | enum `auto\|manual` | `"auto"` | global | no | yes | `AWMAN_WORK_SERVERS_<NAME>_CLAIM` | Claim automatically or wait for a person to pick work items. |
+| `workServers.*.maxConcurrentJobs` | int ≥ 1 | `1` | global | no | yes | `AWMAN_WORK_SERVERS_<NAME>_MAX_CONCURRENT_JOBS` | Maximum concurrent jobs claimed from this server. |
+| `workServers.*.interaction` | enum `interactive\|headless` | `null` | global | no | yes | `AWMAN_WORK_SERVERS_<NAME>_INTERACTION` | Optional interaction override for this server's jobs. |
+| `workServers.*.labels` | map<string,string> | `{}` | global | no | yes | `AWMAN_WORK_SERVERS_<NAME>_LABELS` | Owner-configured worker labels for this server. |
+| `workServers.*.labels.*` | string | `null` | global | no | yes | — | One owner-configured worker label; awman/ is reserved. |
 | `remote.default` | string | `null` | global | no | no | `AWMAN_REMOTE_DEFAULT` | Target used when --remote names none. |
 | `remote.targets.*.url` | string | `null` | global | no | no | `AWMAN_REMOTE_TARGETS_<NAME>_URL` | Target API URL (https://host:port); required for every entry. |
 | `remote.targets.*.apiKey` | string | `null` | global | yes | no | `AWMAN_REMOTE_TARGETS_<NAME>_API_KEY` | Bearer API key for the target. |

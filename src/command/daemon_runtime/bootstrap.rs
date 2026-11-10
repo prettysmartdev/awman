@@ -215,7 +215,9 @@ impl DaemonRuntime {
             ),
         ]
         .into();
+        let pull = Some(worker_feature.pull_handle(&core)?);
         let runtime = Arc::new(Self {
+            pull,
             grants: Mutex::new(PrerequisiteGrantStore::load(core.data_paths().home())),
             core,
             engines,

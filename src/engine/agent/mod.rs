@@ -7,7 +7,7 @@
 //! custom definition. Option builders resolve once and pass the definition
 //! down.
 
-use std::sync::Arc;
+use std::{path::Path, sync::Arc};
 
 use crate::data::config::agents::LaunchMode;
 use crate::data::config::builtin_launch::BuiltinLaunchSettings;
@@ -209,6 +209,9 @@ pub struct AgentRunOptions {
     pub env_passthrough: Option<Vec<String>>,
     /// User-supplied directory overlays.
     pub directory_overlays: Vec<DirectorySpec>,
+    /// Host-authored outputs and verified Git sidecars, never parsed from
+    /// repository/config/workflow overlay expressions.
+    pub command_mounts: Vec<DirectorySpec>,
     /// When true, mount all skill directories.
     pub include_all_skills: bool,
     /// Named skills to mount (when `include_all_skills` is false).
@@ -273,6 +276,89 @@ fn with_yolo_disallowed_tools<'a>(
     Ok(Cow::Owned(merged))
 }
 
+/// Writable scratch directory of a read-only workspace launch.
+pub const READ_ONLY_SCRATCH_PATH: &str = "/awman/scratch";
+/// Environment variable naming [`READ_ONLY_SCRATCH_PATH`] inside the container.
+pub const READ_ONLY_SCRATCH_ENV: &str = "AWMAN_SCRATCH";
+
+fn read_only_unsupported(runtime: &str) -> EngineError {
+    EngineError::Config(format!(
+        "the {runtime} runtime cannot mount the workspace read-only; this run requires a read-only workspace"
+    ))
+}
+
+/// Runs after all overlays are assembled and before any runtime sees them.
+fn validate_workspace_mounts(
+    options: &mut [ContainerOption],
+    workspace: &Path,
+    read_only: bool,
+    lease_scope: Option<&Path>,
+    inline_file: Option<&Path>,
+    command_mounts: &[crate::engine::container::options::OverlaySpec],
+) -> Result<(), EngineError> {
+    use crate::engine::container::options::OverlayPermission;
+    let workspace = workspace
+        .canonicalize()
+        .map_err(|e| EngineError::io(workspace, e))?;
+    let inline_file = inline_file.and_then(|path| path.canonicalize().ok());
+    let lease_root = lease_scope
+        .map(|scope| scope.canonicalize())
+        .transpose()
+        .map_err(|e| EngineError::Config(format!("lease workspace: {e}")))?;
+    for option in options {
+        let ContainerOption::Overlay(spec) = option else {
+            continue;
+        };
+        let host = spec
+            .host_path
+            .canonicalize()
+            .map_err(|e| EngineError::io(&spec.host_path, e))?;
+        if let Some(clone) = &lease_root {
+            if !host.starts_with(clone)
+                && inline_file.as_deref() != Some(host.as_path())
+                && !command_mounts.iter().any(|allowed| {
+                    allowed.host_path == host
+                        && allowed.container_path == spec.container_path
+                        && allowed.permission == spec.permission
+                })
+            {
+                return Err(EngineError::Config(
+                    "overlay exposes a path outside the lease workspace".into(),
+                ));
+            }
+        }
+        let guest = &spec.container_path;
+        if guest.components().any(|part| {
+            matches!(
+                part,
+                std::path::Component::ParentDir | std::path::Component::CurDir
+            )
+        }) {
+            return Err(EngineError::Config(
+                "overlay guest path must be normalized".into(),
+            ));
+        }
+        let guest_workspace = Path::new("/workspace");
+        if guest_workspace.starts_with(guest) && (guest != guest_workspace || host != workspace) {
+            return Err(EngineError::Config(
+                "overlay overlaps the workspace mount".into(),
+            ));
+        }
+        if read_only
+            && (host.starts_with(&workspace)
+                || workspace.starts_with(&host)
+                || guest.starts_with(guest_workspace))
+        {
+            spec.permission = OverlayPermission::ReadOnly;
+        }
+        if inline_file.as_deref() == Some(host.as_path()) {
+            spec.permission = OverlayPermission::ReadOnly;
+        }
+        spec.host_path = host;
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 pub struct AgentEngine {
     overlay_engine: Arc<OverlayEngine>,
@@ -281,6 +367,11 @@ pub struct AgentEngine {
     /// builds options for (F-38). `None` — the default — disables leases, the
     /// same behaviour the absent process-global monitor used to produce.
     lease_factory: Option<crate::engine::credential_refresh::LeaseFactoryHandle>,
+    /// Mount the session workspace read-only (pulled leases with
+    /// `exec.read_only`), with a writable scratch directory at
+    /// [`READ_ONLY_SCRATCH_PATH`]. The agent home stays writable.
+    read_only_workspace: bool,
+    lease_workspace_scope: Option<std::path::PathBuf>,
     /// A recording builder for daemon-free launch tests; production builds
     /// with the host builder.
     #[cfg(test)]
@@ -293,9 +384,65 @@ impl AgentEngine {
             overlay_engine,
             runtime,
             lease_factory: None,
+            read_only_workspace: false,
+            lease_workspace_scope: None,
             #[cfg(test)]
             local_builder: None,
         }
+    }
+
+    /// Mount `/workspace` read-only for every launch this engine prepares.
+    /// A runtime that cannot enforce it (see
+    /// [`crate::engine::agent_runtime::Capabilities::read_only_workspace`])
+    /// refuses the launch rather than mounting the workspace writable.
+    pub fn with_read_only_workspace(mut self, read_only: bool) -> Self {
+        self.read_only_workspace = read_only;
+        self
+    }
+
+    /// Scope every final host bind to this lease's clone. Private and sibling
+    /// lease state may never be exposed through an extra overlay.
+    pub fn with_lease_workspace_scope(mut self, clone: std::path::PathBuf) -> Self {
+        self.lease_workspace_scope = Some(clone);
+        self
+    }
+
+    pub fn is_lease_workspace(&self) -> bool {
+        self.lease_workspace_scope.is_some()
+    }
+    pub fn read_only_workspace(&self) -> bool {
+        self.read_only_workspace
+    }
+
+    /// The `/workspace` mount, plus the writable scratch directory when the
+    /// workspace is read-only.
+    fn workspace_mounts(&self, session: &Session) -> Result<Vec<ContainerOption>, EngineError> {
+        use crate::engine::container::options::{MountGuard, OverlayPermission, OverlaySpec};
+        let permission = if self.read_only_workspace {
+            if !self.runtime.capabilities().read_only_workspace() {
+                return Err(read_only_unsupported(self.runtime.display_name()));
+            }
+            OverlayPermission::ReadOnly
+        } else {
+            OverlayPermission::ReadWrite
+        };
+        let mut mounts = vec![ContainerOption::Overlay(OverlaySpec {
+            host_path: session.git_root().to_path_buf(),
+            container_path: std::path::PathBuf::from("/workspace"),
+            permission,
+        })];
+        if self.read_only_workspace {
+            let scratch = tempfile::Builder::new()
+                .prefix("awman-scratch-")
+                .tempdir()
+                .map_err(|e| EngineError::Other(format!("create scratch directory: {e}")))?;
+            mounts.push(ContainerOption::TemporaryDirectoryMount {
+                container_path: std::path::PathBuf::from(READ_ONLY_SCRATCH_PATH),
+                env_var: Some(READ_ONLY_SCRATCH_ENV.to_string()),
+                guard: MountGuard::new_dir(scratch),
+            });
+        }
+        Ok(mounts)
     }
 
     /// Attach the credential-refresh lease factory this engine's launches
@@ -601,6 +748,11 @@ impl AgentEngine {
         // A `--yolo` launch carries the configured `yoloDisallowedTools`.
         let yolo_run = with_yolo_disallowed_tools(session, &def, run, RunParadigm::Container)?;
         let run: &AgentRunOptions = &yolo_run;
+        if self.lease_workspace_scope.is_some() && run.allow_docker {
+            return Err(EngineError::Config(
+                "leases cannot expose the host Docker socket".into(),
+            ));
+        }
         // Plan-mode support, ACP support and the plan/yolo conflict are all
         // definition facts, checked identically on both paradigms.
         def.validate_run(run, RunParadigm::Container)?;
@@ -753,13 +905,7 @@ impl AgentEngine {
         }
 
         // Mount the project source into the container's working directory.
-        options.push(ContainerOption::Overlay(
-            crate::engine::container::options::OverlaySpec {
-                host_path: session.git_root().to_path_buf(),
-                container_path: std::path::PathBuf::from("/workspace"),
-                permission: crate::engine::container::options::OverlayPermission::ReadWrite,
-            },
-        ));
+        options.extend(self.workspace_mounts(session)?);
 
         // Overlays — agent settings + user-supplied dirs + skills.
         // Prefer the running image's baked-in `$HOME` (the actual runtime
@@ -833,18 +979,16 @@ impl AgentEngine {
             materialize_credentials: false,
             definition: Some(def.definition()),
         };
-        let (overlays, staged_credentials) =
-            if matches!(&credentials.delivery, CredentialDelivery::File(_)) {
-                let mut request = request;
-                request.materialize_credentials = true;
-                self.overlay_engine
-                    .build_overlays_with_credentials(session, &request)?
-            } else {
-                (
-                    self.overlay_engine.build_overlays(session, &request)?,
-                    Vec::new(),
-                )
-            };
+        let mut request = request;
+        request.materialize_credentials =
+            matches!(&credentials.delivery, CredentialDelivery::File(_));
+        let (overlays, staged_credentials) = self.overlay_engine.build_scoped_overlays(
+            session,
+            &request,
+            self.lease_workspace_scope.as_deref(),
+            &run.command_mounts,
+        )?;
+        let sanctioned_mounts = overlays.clone();
         for spec in overlays {
             options.push(ContainerOption::Overlay(spec));
         }
@@ -881,11 +1025,30 @@ impl AgentEngine {
             )?;
         }
 
+        if let Some(body) = session.inline_work_item() {
+            options.push(ContainerOption::Overlay(
+                crate::engine::container::options::OverlaySpec {
+                    host_path: body.to_path_buf(),
+                    container_path: "/awman/work-item.md".into(),
+                    permission: crate::engine::container::options::OverlayPermission::ReadOnly,
+                },
+            ));
+        }
         // Default working dir for the agent container.
         options.push(ContainerOption::WorkingDir(std::path::PathBuf::from(
             "/workspace",
         )));
 
+        if self.read_only_workspace || self.lease_workspace_scope.is_some() {
+            validate_workspace_mounts(
+                &mut options,
+                session.git_root(),
+                self.read_only_workspace,
+                self.lease_workspace_scope.as_deref(),
+                session.inline_work_item(),
+                &sanctioned_mounts,
+            )?;
+        }
         Ok(options)
     }
 
@@ -955,6 +1118,9 @@ impl AgentEngine {
         agent: &AgentName,
         run: &AgentRunOptions,
     ) -> Result<Vec<SandboxOption>, EngineError> {
+        if self.read_only_workspace {
+            return Err(read_only_unsupported(self.runtime.display_name()));
+        }
         let def = self.resolve_definition(session, agent)?;
 
         // Parity validation with the container path so a sandbox-configured
@@ -1119,7 +1285,7 @@ impl AgentEngine {
         // Host-directory mounts cannot be honored: the VM sees only the
         // virtiofs-mounted workspace. Record each requested-but-unmountable
         // feature as a note; `run_interactive` surfaces them as warnings.
-        for dir in &run.directory_overlays {
+        for dir in run.directory_overlays.iter().chain(&run.command_mounts) {
             options.push(SandboxOption::UnsupportedNote(format!(
                 "directory overlay '{}' cannot be mounted into the sandbox VM \
                  (only the workspace is visible); continuing without it",
@@ -4317,5 +4483,201 @@ mod tests {
                 .iter()
                 .any(|(step, _)| step == "Building image"));
         }
+    }
+}
+
+#[cfg(test)]
+mod read_only_workspace_tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::data::session::{SessionOpenOptions, StaticGitRootResolver};
+    use crate::engine::container::options::{ContainerOption, OverlayPermission};
+    use crate::engine::overlay::OverlayEngine;
+
+    fn engine(home: &std::path::Path, root: &std::path::Path) -> (AgentEngine, Session) {
+        let resolver = StaticGitRootResolver::new(root);
+        let session =
+            Session::open(root.to_path_buf(), &resolver, SessionOpenOptions::default()).unwrap();
+        let overlay = OverlayEngine::with_auth_resolver(
+            crate::data::fs::auth_paths::AuthPathResolver::at_home(home),
+        );
+        let runtime = crate::engine::container::ContainerRuntime::docker();
+        (
+            AgentEngine::new(Arc::new(overlay), Arc::new(runtime)),
+            session,
+        )
+    }
+
+    fn workspace_permission(opts: &[ContainerOption]) -> OverlayPermission {
+        opts.iter()
+            .find_map(|o| match o {
+                ContainerOption::Overlay(spec)
+                    if spec.container_path == std::path::Path::new("/workspace") =>
+                {
+                    Some(spec.permission)
+                }
+                _ => None,
+            })
+            .expect("workspace mount")
+    }
+
+    #[test]
+    fn read_only_workspace_mounts_ro_with_writable_scratch() {
+        let (home, root) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (engine, session) = engine(home.path(), root.path());
+        let agent = AgentName::new("claude").unwrap();
+        let rw = engine
+            .build_options(&session, &agent, &AgentRunOptions::default())
+            .unwrap();
+        assert_eq!(workspace_permission(&rw), OverlayPermission::ReadWrite);
+        assert!(!rw.iter().any(|o| matches!(o, ContainerOption::TemporaryDirectoryMount { container_path, .. } if container_path == std::path::Path::new(READ_ONLY_SCRATCH_PATH))));
+        let engine = engine.with_read_only_workspace(true);
+        assert!(engine.read_only_workspace());
+        let ro = engine
+            .build_options(&session, &agent, &AgentRunOptions::default())
+            .unwrap();
+        assert_eq!(workspace_permission(&ro), OverlayPermission::ReadOnly);
+        assert!(ro.iter().any(|o| matches!(o,
+            ContainerOption::TemporaryDirectoryMount { container_path, env_var, .. }
+                if container_path == std::path::Path::new(READ_ONLY_SCRATCH_PATH)
+                    && env_var.as_deref() == Some(READ_ONLY_SCRATCH_ENV))));
+    }
+
+    #[test]
+    fn read_only_workspace_is_refused_on_the_sandbox_paradigm() {
+        let (home, root) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (engine, session) = engine(home.path(), root.path());
+        let agent = AgentName::new("claude").unwrap();
+        assert!(engine
+            .build_sandbox_options(&session, &agent, &AgentRunOptions::default())
+            .is_ok());
+        let err = engine
+            .with_read_only_workspace(true)
+            .build_sandbox_options(&session, &agent, &AgentRunOptions::default())
+            .unwrap_err();
+        assert!(err.to_string().contains("read-only"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod lease_mount_review_tests {
+    use super::*;
+    use crate::engine::container::options::{OverlayPermission, OverlaySpec};
+    fn mount(host: &Path, guest: &str) -> ContainerOption {
+        ContainerOption::Overlay(OverlaySpec {
+            host_path: host.to_path_buf(),
+            container_path: guest.into(),
+            permission: OverlayPermission::ReadWrite,
+        })
+    }
+    #[test]
+    fn read_only_aliases_and_descendants_are_read_only_for_every_runtime() {
+        let tmp = tempfile::tempdir().unwrap();
+        let clone = tmp.path().join("worker/leases/lease_test");
+        std::fs::create_dir_all(clone.join("src")).unwrap();
+        let mut options = vec![
+            mount(&clone, "/workspace"),
+            mount(&clone.join("src"), "/editable"),
+        ];
+        validate_workspace_mounts(&mut options, &clone, true, Some(&clone), None, &[]).unwrap();
+        assert!(options.iter().all(|option| matches!(option, ContainerOption::Overlay(spec) if spec.permission == OverlayPermission::ReadOnly)));
+        #[cfg(unix)]
+        {
+            let alias = tmp.path().join("alias");
+            std::os::unix::fs::symlink(&clone, &alias).unwrap();
+            let mut options = vec![mount(&alias, "/editable")];
+            validate_workspace_mounts(&mut options, &clone, true, Some(&clone), None, &[]).unwrap();
+            assert!(
+                matches!(&options[0], ContainerOption::Overlay(spec) if spec.permission == OverlayPermission::ReadOnly)
+            );
+        }
+    }
+    #[test]
+    fn lease_scope_rejects_parent_private_sibling_and_guest_shadowing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("worker");
+        let clone = root.join("leases/lease_test");
+        for dir in [
+            &clone,
+            &root.join("private"),
+            &root.join("leases/lease_other"),
+        ] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        for host in [
+            &root,
+            &root.join("private"),
+            &root.join("leases/lease_other"),
+        ] {
+            assert!(validate_workspace_mounts(
+                &mut [mount(host, "/editable")],
+                &clone,
+                false,
+                Some(&clone),
+                None,
+                &[]
+            )
+            .is_err());
+        }
+        assert!(validate_workspace_mounts(
+            &mut [mount(&clone, "/")],
+            &clone,
+            true,
+            Some(&clone),
+            None,
+            &[]
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn lease_scope_refuses_external_host_paths_and_symlink_escapes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let clone = tmp.path().join("worker/leases/lease_test");
+        let private = tmp.path().join("home/.ssh");
+        std::fs::create_dir_all(&clone).unwrap();
+        std::fs::create_dir_all(&private).unwrap();
+        for readonly in [false, true] {
+            assert!(validate_workspace_mounts(
+                &mut [mount(&private, "/keys")],
+                &clone,
+                readonly,
+                Some(&clone),
+                None,
+                &[]
+            )
+            .is_err());
+            #[cfg(unix)]
+            {
+                let alias = clone.join(if readonly { "ro" } else { "rw" });
+                std::os::unix::fs::symlink(&private, &alias).unwrap();
+                assert!(validate_workspace_mounts(
+                    &mut [mount(&alias, "/keys")],
+                    &clone,
+                    readonly,
+                    Some(&clone),
+                    None,
+                    &[]
+                )
+                .is_err());
+            }
+        }
+        let output = tmp.path().join("output");
+        std::fs::create_dir_all(&output).unwrap();
+        let trusted = OverlaySpec {
+            host_path: output.clone(),
+            container_path: "/awman/output".into(),
+            permission: OverlayPermission::ReadWrite,
+        };
+        validate_workspace_mounts(
+            &mut [mount(&output, "/awman/output")],
+            &clone,
+            true,
+            Some(&clone),
+            None,
+            &[trusted],
+        )
+        .unwrap();
     }
 }

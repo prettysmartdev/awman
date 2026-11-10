@@ -4,7 +4,7 @@
 //! over loopback with a hand-rolled SSE reader. A worker is modelled with the
 //! same parts the queue worker uses (store claim, `EventBus::for_attempt`,
 //! `CommandLogWriter`), so no Docker is needed. One end-to-end test restarts a
-//! real `awman api start` process (fake `docker` on `PATH`) to see a genuine
+//! real `awman daemon start` process (fake `docker` on `PATH`) to see a genuine
 //! re-queue.
 //!
 //! Long waits use tokio's paused clock, never real 300 s sleeps.
@@ -795,14 +795,14 @@ async fn clients_that_ignore_id_see_unchanged_event_names_and_payloads() {
         ["stdout_line", "stderr_line", "status_message", "done"]
     );
     let (_, stdout) = &legacy[0];
-    assert_eq!(stdout["payload"]["type"], "StdoutLine");
+    assert_eq!(stdout["payload"]["type"], "stdout_line");
     assert_eq!(stdout["payload"]["data"], "hello");
-    assert!(stdout["timestamp"].is_string());
+    assert!(stdout["emitted_at"].is_string());
     assert_eq!(stdout["sequence"], 0);
     let (_, status) = &legacy[2];
     assert_eq!(status["payload"]["data"]["phase"], "setup");
     assert_eq!(status["payload"]["data"]["message"], "ready");
-    assert_eq!(legacy[3].1["payload"]["type"], "Done");
+    assert_eq!(legacy[3].1["payload"]["type"], "done");
 
     // Every event line is followed by an id line only as an *addition*.
     assert!(raw.lines().filter(|l| l.starts_with("id:")).count() == 4);

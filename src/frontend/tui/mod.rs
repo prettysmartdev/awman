@@ -52,6 +52,7 @@ pub mod program_status_emitter;
 pub mod pty;
 mod region_scroll;
 // WI 0142: window-management requests, claims and engine loss over the backend.
+pub mod queue;
 pub mod remote_tab;
 pub mod render;
 pub mod squad_attach;
@@ -178,6 +179,9 @@ async fn run_tui(
         Chosen::Remote(backend) => backend,
     };
 
+    // The selected engine instance owns the worker and all picked leases.
+    let queue_session = session.clone();
+
     // Open the first tab through the instance. The instance decides and
     // starts the startup command (`ready` / `agents status --watch`) — only
     // for a directory-bound tab, never for the squad tab, and never when
@@ -211,6 +215,10 @@ async fn run_tui(
     };
 
     app.show_runtime_notices(notices);
+    match app.backend.queue_source(&queue_session) {
+        Ok(source) => app.queue = source,
+        Err(message) => app.status_bar.text = message,
+    }
     app.bind_startup(0, startup, App::new_tab_pty_size());
 
     if let Some(failure) = fatal_runtime_error {

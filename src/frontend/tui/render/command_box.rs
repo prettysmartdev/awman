@@ -152,7 +152,24 @@ pub(super) fn render_suggestion_row(app: &App, area: Rect, frame: &mut Frame) {
     // WI 0112: the squad indicator is pinned to the far right of this row on
     // every tab, in both of the row's modes. Whatever else the row shows is
     // fitted into what the indicator leaves, never the other way round.
-    let indicator = squad_indicator_spans(app, area.width);
+    let mut indicator = squad_indicator_spans(app, area.width);
+    // WI 0143: new / for-you work items sit just left of the squad indicator.
+    if let Some(text) = app.queue_badge.text() {
+        let badge = format!(" {text} ");
+        if (badge.chars().count() as u16) + 12 < area.width {
+            indicator.insert(
+                0,
+                Span::styled(
+                    badge,
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            );
+            indicator.insert(1, Span::raw(" "));
+        }
+    }
     let indicator_w: u16 = indicator
         .iter()
         .map(|s| unicode_width::UnicodeWidthStr::width(s.content.as_ref()) as u16)

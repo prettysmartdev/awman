@@ -16,12 +16,34 @@ fn all_documented_top_level_commands_present() {
     let names: Vec<&str> = cat().root().subcommands.iter().map(|s| s.name).collect();
     for expected in &[
         "init", "ready", "chat", "specs", "agents", "config", "exec", "daemon", "squad", "remote",
-        "new",
+        "new", "worker", "queue",
     ] {
         assert!(
             names.contains(expected),
             "missing top-level command {expected:?}; found: {names:?}"
         );
+    }
+}
+
+#[test]
+fn queue_surface_is_cli_only_and_has_no_release_subcommand() {
+    let queue = cat().lookup(&["queue"]).unwrap();
+    assert!(!queue.api_allowed);
+    assert!(queue.subcommands.iter().any(|sub| sub.name == "pick"));
+    assert!(!queue.subcommands.iter().any(|sub| sub.name == "release"));
+    let pick = cat().lookup(&["queue", "pick"]).unwrap();
+    assert!(!pick.api_allowed);
+    assert!(pick
+        .arguments
+        .iter()
+        .any(|arg| arg.name == "item-id" && arg.optional));
+    for spec in [queue, pick] {
+        for flag in spec.flags {
+            assert_eq!(
+                flag.frontends,
+                awman::command::dispatch::catalogue::FrontendVisibility::CliOnly
+            );
+        }
     }
 }
 
@@ -74,8 +96,6 @@ fn chat_has_non_interactive_short_flag() {
     // Short flag is `-n`.
     assert_eq!(flag.unwrap().short, Some('n'));
 }
-
-// ─── api start ──────────────────────────────────────────────────────────
 
 // ─── remote exec ─────────────────────────────────────────────────────────────
 

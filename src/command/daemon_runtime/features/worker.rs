@@ -23,22 +23,6 @@ impl std::ops::Deref for WorkerShared {
     }
 }
 impl WorkerShared {
-    pub fn workdirs(&self) -> (Vec<std::path::PathBuf>, Vec<std::path::PathBuf>) {
-        let config = self.live_config.read().unwrap();
-        match config.as_ref() {
-            Some(c) => (
-                c.worker_push_work_dirs()
-                    .into_iter()
-                    .map(Into::into)
-                    .collect(),
-                c.worker_push_work_dir_roots()
-                    .into_iter()
-                    .map(Into::into)
-                    .collect(),
-            ),
-            None => (self.api.workdirs.clone(), self.api.workdir_roots.clone()),
-        }
-    }
     pub fn cancel_all(&self) -> Result<Vec<String>, crate::command::error::CommandError> {
         let mut ids = Vec::new();
         for status in [
@@ -62,6 +46,7 @@ impl WorkerShared {
     }
 }
 pub struct WorkerFeature<F: ApiCommandFrontendFactory + 'static> {
+    pull: std::sync::OnceLock<Arc<crate::command::worker::PullController<F>>>,
     shared: Arc<WorkerShared>,
     factory: Arc<F>,
     settings_tx: watch::Sender<WorkerSettings>,
@@ -74,6 +59,7 @@ impl<F: ApiCommandFrontendFactory + 'static> WorkerFeature<F> {
     pub fn new(shared: Arc<WorkerShared>, factory: F, settings: WorkerSettings) -> Arc<Self> {
         let (settings_tx, _) = watch::channel(settings);
         Arc::new(Self {
+            pull: Default::default(),
             shared,
             factory: Arc::new(factory),
             settings_tx,
@@ -82,6 +68,25 @@ impl<F: ApiCommandFrontendFactory + 'static> WorkerFeature<F> {
             pool_abort: Mutex::new(None),
             aborts: Arc::new(Mutex::new(Vec::new())),
         })
+    }
+    pub fn pull_handle(
+        &self,
+        core: &Core,
+    ) -> Result<Arc<dyn crate::command::daemon_api::worker_pull::PullHandle>, EngineError> {
+        let controller = if let Some(controller) = self.pull.get() {
+            controller.clone()
+        } else {
+            let controller = crate::command::worker::PullController::new(
+                self.shared.clone(),
+                self.factory.clone(),
+                core,
+            )?;
+            let _ = self.pull.set(controller.clone());
+            controller
+        };
+        Ok(Arc::new(crate::command::worker::PullHandleAdapter(
+            controller,
+        )))
     }
     pub fn apply_settings(&self, s: WorkerSettings) {
         self.settings_tx.send_replace(s);
@@ -93,6 +98,8 @@ impl<F: ApiCommandFrontendFactory + 'static> DaemonFeature for WorkerFeature<F> 
         FeatureName::Worker
     }
     async fn start(&self, core: &Core) -> Result<FeatureTask, EngineError> {
+        self.pull_handle(core)?;
+        let pull = self.pull.get().expect("pull initialized").clone();
         let stop = CancellationToken::new();
         *self.stop.lock().unwrap() = Some(stop.clone());
         let done = CancellationToken::new();
@@ -105,6 +112,7 @@ impl<F: ApiCommandFrontendFactory + 'static> DaemonFeature for WorkerFeature<F> 
         let aborts = self.aborts.clone();
         let task = tokio::spawn(async move {
             let _done = done_guard;
+            let _stop_children = stop.clone().drop_guard();
             let make = || {
                 QueueWorker::new(
                     format!("worker-{}", uuid::Uuid::new_v4()),
@@ -123,6 +131,12 @@ impl<F: ApiCommandFrontendFactory + 'static> DaemonFeature for WorkerFeature<F> 
                 .with_executor(executor.clone())
                 .with_daemon_settings(live_daemon_settings(shared.clone()))
             };
+            pull.recover()
+                .await
+                .map_err(|error| EngineError::Other(error.to_string()))?;
+            let pull_task = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(
+                pull.run_until(stop.clone()),
+            ));
             crate::command::commands::api_server::queue_worker::finalize_completed_from_sidecars(
                 &shared.store,
                 &shared.paths,
@@ -145,6 +159,22 @@ impl<F: ApiCommandFrontendFactory + 'static> DaemonFeature for WorkerFeature<F> 
             loop {
                 if stop.is_cancelled() {
                     break;
+                }
+                if pull_task.as_ref().is_finished() {
+                    let result = pull_task.await;
+                    for (token, _) in &workers {
+                        token.cancel();
+                    }
+                    for (_, job) in workers {
+                        let _ = job.await;
+                    }
+                    return match result {
+                        Ok(Err(error)) => Err(error),
+                        Err(error) => Err(EngineError::Other(error.to_string())),
+                        Ok(Ok(())) => {
+                            Err(EngineError::Other("pull worker exited unexpectedly".into()))
+                        }
+                    };
                 }
                 aborts.lock().unwrap().retain(|task| !task.is_finished());
                 // Worker panics are feature crashes, never silently lost capacity.
@@ -200,6 +230,9 @@ impl<F: ApiCommandFrontendFactory + 'static> DaemonFeature for WorkerFeature<F> 
             for (_, job) in workers {
                 job.await.map_err(|e| EngineError::Other(e.to_string()))?;
             }
+            pull_task
+                .await
+                .map_err(|error| EngineError::Other(error.to_string()))??;
             Ok(())
         });
         *self.pool_abort.lock().unwrap() = Some(task.abort_handle());
@@ -218,6 +251,9 @@ impl<F: ApiCommandFrontendFactory + 'static> DaemonFeature for WorkerFeature<F> 
         if let Some(stop) = self.stop.lock().unwrap().take() {
             stop.cancel();
         }
+        if let Some(pull) = self.pull.get() {
+            pull.cancel_for_shutdown();
+        }
         self.shared.setup_cancels.cancel_all();
         if let Err(e) = self.shared.cancel_all() {
             tracing::error!(%e,"failed to cancel worker jobs");
@@ -232,6 +268,9 @@ impl<F: ApiCommandFrontendFactory + 'static> DaemonFeature for WorkerFeature<F> 
                 tracing::error!(%error,%id,"failed to stop cancelled command containers");
             }
             self.shared.command_cancels.unregister(&id);
+        }
+        if let Some(pull) = self.pull.get() {
+            pull.stop_now().await;
         }
         for task in self.aborts.lock().unwrap().drain(..) {
             task.abort();

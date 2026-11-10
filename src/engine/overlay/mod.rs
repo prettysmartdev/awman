@@ -475,16 +475,46 @@ impl OverlayEngine {
         session: &Session,
         request: &OverlayRequest,
     ) -> Result<(Vec<OverlaySpec>, Vec<StagedCredentialFile>), EngineError> {
+        self.build_scoped_overlays(session, request, None, &[])
+    }
+
+    /// Directory expressions are untrusted; the separately supplied mounts
+    /// are authored by the command (outputs and verified worktree metadata).
+    pub fn build_scoped_overlays(
+        &self,
+        session: &Session,
+        request: &OverlayRequest,
+        lease_scope: Option<&Path>,
+        command_mounts: &[DirectorySpec],
+    ) -> Result<(Vec<OverlaySpec>, Vec<StagedCredentialFile>), EngineError> {
+        let lease_scope = lease_scope
+            .map(std::fs::canonicalize)
+            .transpose()
+            .map_err(|e| EngineError::Config(format!("lease mount scope: {e}")))?;
         let mut by_key: HashMap<String, OverlaySpec> = HashMap::new();
         let mut staged_credentials = Vec::new();
 
         // 1. User-supplied directory overlays.
-        for spec in &request.directories {
+        for (spec, command_authored) in request
+            .directories
+            .iter()
+            .map(|s| (s, false))
+            .chain(command_mounts.iter().map(|s| (s, true)))
+        {
             let resolved = self.resolve_user_overlay(
                 spec,
                 session.working_dir(),
                 request.container_home.as_deref(),
             )?;
+            if !command_authored
+                && lease_scope
+                    .as_ref()
+                    .is_some_and(|root| !resolved.host_path.starts_with(root))
+            {
+                return Err(EngineError::Config(
+                    "lease directory overlay must stay within its workspace".into(),
+                ));
+            }
             let key = OverlayPathResolver::conflict_key(&resolved.host_path);
             insert_or_merge(&mut by_key, key, resolved);
         }
@@ -553,8 +583,19 @@ impl OverlayEngine {
         }
 
         let mut out: Vec<OverlaySpec> = by_key.into_values().collect();
-        for spec in &out {
+        for spec in &mut out {
             self.validate_mount_source(&spec.host_path)?;
+            if lease_scope.is_some() {
+                spec.host_path = std::fs::canonicalize(&spec.host_path)
+                    .map_err(|e| EngineError::io(&spec.host_path, e))?;
+                let metadata = std::fs::metadata(&spec.host_path)
+                    .map_err(|e| EngineError::io(&spec.host_path, e))?;
+                if !metadata.is_file() && !metadata.is_dir() {
+                    return Err(EngineError::Config(
+                        "lease mounts must be regular files or directories".into(),
+                    ));
+                }
+            }
         }
         out.sort_by(|a, b| a.host_path.cmp(&b.host_path));
         Ok((out, staged_credentials))

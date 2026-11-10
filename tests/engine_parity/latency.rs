@@ -147,6 +147,7 @@ async fn remote_backend_channel_adapter_obeys_the_same_latency_budget() {
         for _ in 0..325 {
             let command = remote
                 .submit(SubmitRequest {
+                    lease_id: None,
                     session_id,
                     parsed: crate::command::dispatch::parsed_input::parse(
                         "new spec",

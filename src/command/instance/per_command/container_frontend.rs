@@ -17,7 +17,20 @@ use crate::engine::agent_runtime::frontend::{AgentFrontend, AgentIo, AgentProgre
 
 #[async_trait]
 impl AgentFrontend for InstanceCommandFrontend {
+    fn set_agent_output_format(
+        &mut self,
+        format: crate::data::agent_output_format::AgentOutputFormat,
+    ) {
+        if let Some(recorder) = &self.worker_events {
+            recorder.output_format(format);
+        }
+    }
     fn report_status(&mut self, status: AgentStatus) {
+        if matches!(status, AgentStatus::Running { .. }) {
+            if let Some(recorder) = &self.worker_events {
+                recorder.writer.record_container_started();
+            }
+        }
         if self.is_cli() {
             return;
         }
@@ -39,7 +52,11 @@ impl AgentFrontend for InstanceCommandFrontend {
 
     fn take_io(&mut self) -> AgentIo {
         if self.is_headless_cli() {
-            return self.command_bytes.pipe(self.wake.clone());
+            let io = self.command_bytes.pipe(self.wake.clone());
+            return match &self.worker_events {
+                Some(recorder) => recorder.io(io),
+                None => io,
+            };
         }
         // The slot is normally refilled by `report_step_interactive_launch`
         // before each container launch. Launch paths that skip that hook
@@ -48,9 +65,14 @@ impl AgentFrontend for InstanceCommandFrontend {
         if self.container_io.is_none() {
             self.recreate_container_io();
         }
-        self.container_io
+        let io = self
+            .container_io
             .take()
-            .expect("recreate_container_io always fills the slot")
+            .expect("recreate_container_io always fills the slot");
+        match &self.worker_events {
+            Some(recorder) => recorder.io(io),
+            None => io,
+        }
     }
 }
 

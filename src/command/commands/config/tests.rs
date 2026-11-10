@@ -2,6 +2,14 @@ use std::path::Path;
 use std::sync::Arc;
 
 use super::*;
+
+#[test]
+fn unlink_detection_only_matches_whole_work_server_entries() {
+    assert_eq!(unlinked_work_server("workServers.team"), Some("team"));
+    assert_eq!(unlinked_work_server("workServers.team.labels"), None);
+    assert_eq!(unlinked_work_server("workServers"), None);
+    assert_eq!(unlinked_work_server("remote.targets.team"), None);
+}
 use crate::data::config::env::EnvSnapshot;
 use crate::data::fs::data_paths::AWMAN_HOME;
 use crate::data::session::SessionOpenOptions;
@@ -321,10 +329,45 @@ async fn unset_removes_a_leaf_or_a_whole_map_entry() {
     )
     .await
     .unwrap();
+    run(
+        fx.session(),
+        set(
+            "workServers.in-fact.labels.pool",
+            "laptops",
+            ConfigTarget::Auto,
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        read(&fx.global_file())["workServers"]["in-fact"]["labels"]["pool"],
+        "laptops"
+    );
+    assert!(run(
+        fx.session(),
+        set(
+            "workServers.in-fact.labels.awman/os",
+            "fake",
+            ConfigTarget::Auto
+        ),
+    )
+    .await
+    .is_err());
     assert_eq!(
         read(&fx.global_file())["workServers"]["in-fact"]["claim"],
         "manual"
     );
+    let store = crate::data::worker::link_store::LinkStore::new(
+        &crate::data::fs::DataPaths::from_env(&fx.env()).unwrap(),
+    );
+    store
+        .write(
+            "in-fact",
+            &awman_wsp::LinkToken {
+                refresh_token: "private".into(),
+            },
+        )
+        .unwrap();
     run(
         fx.session(),
         unset("workServers.in-fact", ConfigTarget::Auto),
@@ -333,6 +376,7 @@ async fn unset_removes_a_leaf_or_a_whole_map_entry() {
     .unwrap();
     let doc = read(&fx.global_file());
     assert!(doc.pointer("/workServers/in-fact").is_none(), "{doc}");
+    assert!(store.read("in-fact").unwrap().is_none());
 }
 
 // ── live apply ──────────────────────────────────────────────────────────────
@@ -565,4 +609,126 @@ fn rows_follow_the_key_table_and_list_map_entries() {
     assert!(rows.iter().any(|r| r.field == "agents.flags.codex"));
     let runtime = rows.iter().find(|r| r.field == "runtime.kind").unwrap();
     assert!(runtime.global_writable && !runtime.repo_writable);
+}
+
+// ── unlinking a work server: token deletion and its deferral ────────────────
+
+/// A daemon that reloads fine and reports a fixed lease count for any server.
+struct LeaseDaemon(Result<usize, String>);
+
+impl DaemonReloader for LeaseDaemon {
+    fn running(&self, _: &Session) -> Option<RunningDaemon> {
+        Some(RunningDaemon {
+            pid: 42,
+            local_endpoint: "/tmp/awman-test/api.sock".into(),
+        })
+    }
+    fn reload(&self, _: &RunningDaemon) -> Result<ReloadReply, String> {
+        Ok(ReloadReply::default())
+    }
+    fn running_leases(&self, _: &RunningDaemon, _: &str) -> Result<usize, String> {
+        self.0.clone()
+    }
+}
+
+async fn linked_fixture(name: &str) -> (Fixture, crate::data::worker::link_store::LinkStore) {
+    let fx = Fixture::new();
+    run(
+        fx.session(),
+        set(
+            &format!("workServers.{name}.url"),
+            "https://h:1",
+            ConfigTarget::Auto,
+        ),
+    )
+    .await
+    .unwrap();
+    let store = crate::data::worker::link_store::LinkStore::new(
+        &crate::data::fs::DataPaths::from_env(&fx.env()).unwrap(),
+    );
+    store
+        .write(
+            name,
+            &awman_wsp::LinkToken {
+                refresh_token: "private".into(),
+            },
+        )
+        .unwrap();
+    (fx, store)
+}
+
+#[tokio::test]
+async fn unset_with_an_idle_daemon_deletes_the_token_now() {
+    let (fx, store) = linked_fixture("infact").await;
+    run_with(
+        fx.session(),
+        unset("workServers.infact", ConfigTarget::Auto),
+        Arc::new(LeaseDaemon(Ok(0))),
+    )
+    .await
+    .unwrap();
+    assert!(read(&fx.global_file())
+        .pointer("/workServers/infact")
+        .is_none());
+    assert!(store.read("infact").unwrap().is_none());
+}
+
+#[tokio::test]
+async fn unset_while_leases_run_keeps_the_token_until_the_daemon_finishes() {
+    let (fx, store) = linked_fixture("infact").await;
+    run_with(
+        fx.session(),
+        unset("workServers.infact", ConfigTarget::Auto),
+        Arc::new(LeaseDaemon(Ok(2))),
+    )
+    .await
+    .unwrap();
+    // The entry is gone at once (the daemon stops claiming) ...
+    assert!(read(&fx.global_file())
+        .pointer("/workServers/infact")
+        .is_none());
+    // ... but the token must outlive the running leases.
+    assert!(store.read("infact").unwrap().is_some());
+    // The daemon's hook deletes it after the last lease.
+    assert!(work_server_unlink::finish_deferred_unlink(&fx.session(), "infact").unwrap());
+    assert!(store.read("infact").unwrap().is_none());
+}
+
+#[tokio::test]
+async fn unset_keeps_the_token_when_the_daemon_cannot_report_leases() {
+    let (fx, store) = linked_fixture("infact").await;
+    run_with(
+        fx.session(),
+        unset("workServers.infact", ConfigTarget::Auto),
+        Arc::new(LeaseDaemon(Err("HTTP 500".into()))),
+    )
+    .await
+    .unwrap();
+    assert!(store.read("infact").unwrap().is_some());
+}
+
+#[tokio::test]
+async fn finishing_a_deferred_unlink_spares_a_relinked_server() {
+    let (fx, store) = linked_fixture("infact").await;
+    // The entry still exists (relinked during the drain): nothing is deleted.
+    assert!(!work_server_unlink::finish_deferred_unlink(&fx.session(), "infact").unwrap());
+    assert!(store.read("infact").unwrap().is_some());
+}
+
+#[tokio::test]
+async fn unsetting_a_label_or_key_never_touches_the_token() {
+    let (fx, store) = linked_fixture("infact").await;
+    run(
+        fx.session(),
+        set("workServers.infact.claim", "manual", ConfigTarget::Auto),
+    )
+    .await
+    .unwrap();
+    run(
+        fx.session(),
+        unset("workServers.infact.claim", ConfigTarget::Auto),
+    )
+    .await
+    .unwrap();
+    assert!(store.read("infact").unwrap().is_some());
 }

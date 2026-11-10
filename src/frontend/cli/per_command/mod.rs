@@ -13,6 +13,7 @@
 pub(crate) mod agents;
 mod attach;
 pub(crate) mod helpers;
+pub(crate) mod queue;
 pub(crate) mod render;
 
 pub(crate) mod squad;
