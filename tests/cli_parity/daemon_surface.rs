@@ -201,7 +201,10 @@ fn daemon_start_refuses_without_an_enabled_feature() {
 #[test]
 fn config_set_without_a_daemon_persists_for_the_next_start() {
     let home = tempfile::tempdir().unwrap();
-    for key in ["daemon.maxConcurrentJobs", "daemon.network.listen"] {
+    for key in [
+        "daemon.maxConcurrentJobs",
+        "daemon.network.listeners.default.listen",
+    ] {
         let value = if key.ends_with("listen") {
             "127.0.0.1:9988"
         } else {
@@ -213,7 +216,13 @@ fn config_set_without_a_daemon_persists_for_the_next_start() {
     let config = std::fs::read_to_string(home.path().join("awman/config.json")).unwrap();
     let error = failure(cli(
         home.path(),
-        &["config", "set", "daemon.network.listen", "nope", "--global"],
+        &[
+            "config",
+            "set",
+            "daemon.network.listeners.default.listen",
+            "nope",
+            "--global",
+        ],
     ));
     assert!(!error.is_empty());
     assert_eq!(
@@ -283,8 +292,7 @@ async fn remote_set_is_sent_with_invocation_argv() {
 }
 
 #[cfg(unix)]
-#[path = "../helpers/api_process.rs"]
-mod api_process;
+use super::api_process;
 
 /// One foreground daemon (engine feature only, so no container work), driven
 /// through every CLI verb over its owner-only local socket.
@@ -490,7 +498,7 @@ async fn the_cli_drives_a_running_daemon_over_its_local_socket() {
     let out = success(run(&[
         "config",
         "set",
-        "daemon.network.listen",
+        "daemon.network.listeners.default.listen",
         "127.0.0.1:9911",
         "--global",
     ]));

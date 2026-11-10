@@ -109,6 +109,10 @@ impl FrontendLifecycle {
         }
     }
 
+    pub fn set_reconnect_grace(&mut self, grace: Duration) {
+        self.grace = grace;
+    }
+
     pub fn ended(&self) -> Option<QuitReason> {
         self.ended
     }

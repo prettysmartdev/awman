@@ -1,6 +1,7 @@
 pub const CAPABILITIES: &[&str] = &[
     "daemon_features",
     "network_listener",
+    "named_listeners",
     "api_keys",
     "health",
     "trace_propagation",
@@ -53,6 +54,14 @@ pub const CAPABILITIES: &[&str] = &[
     "workflow_state_events",
     // WI 0143: `outputs_mounted` on every command record that launched.
     "outputs_mount_state",
+    // WI 0159: `/v1/browser-links*` pairing and `/v1/browsers*` grant
+    // management (browser listeners / owner socket).
+    "browser_links",
+    // WI 0159: `/v1/browser-tickets` and ticketed WebSocket upgrades.
+    "browser_tickets",
+    "launch_contexts",
+    "engine_catalogue",
+    "web_frontend",
 ];
 
 /// WI 0143: capabilities of the pull worker, in their fixed order. Each is

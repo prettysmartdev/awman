@@ -16,6 +16,7 @@ use crate::data::session::Session;
 pub enum LiveApply {
     /// The running daemon re-read the file and applied the key.
     Applied,
+    AppliedWithEffects(Vec<crate::command::daemon_api::core::ReloadEffect>),
     /// No daemon is running: the next start reads the new value.
     NextStart,
     /// A daemon is running but the key is not live (or the daemon said so).
@@ -29,6 +30,7 @@ impl LiveApply {
     pub fn message(&self) -> String {
         match self {
             Self::Applied => "applied to the running daemon".into(),
+            Self::AppliedWithEffects(effects) => format!("applied to the running daemon; {}", effects.iter().map(|e| match e { crate::command::daemon_api::core::ReloadEffect::Rebound { listener, disconnected_clients } => format!("listener {listener} rebound; {disconnected_clients} clients disconnected"), crate::command::daemon_api::core::ReloadEffect::CertificateReloaded { listener } => format!("listener {listener} certificate reloaded") }).collect::<Vec<_>>().join("; ")),
             Self::NextStart => "takes effect on next start".into(),
             Self::RestartRequired => {
                 "restart the daemon to apply (awman daemon stop && awman daemon start)".into()
@@ -54,6 +56,8 @@ pub struct ReloadReply {
     pub applied: Vec<String>,
     #[serde(default)]
     pub restart_required: Vec<String>,
+    #[serde(default)]
+    pub effects: Vec<crate::command::daemon_api::core::ReloadEffect>,
 }
 
 /// The seam `config set` talks to the daemon through; tests substitute it.
@@ -85,6 +89,7 @@ pub fn apply(
         Ok(reply) if reply.restart_required.iter().any(|p| covers(p, path)) => {
             LiveApply::RestartRequired
         }
+        Ok(reply) if !reply.effects.is_empty() => LiveApply::AppliedWithEffects(reply.effects),
         Ok(_) => LiveApply::Applied,
         Err(reason) => LiveApply::Failed(reason),
     }
@@ -255,8 +260,8 @@ mod tests {
         for path in [
             "daemon.maxConcurrentJobs",
             "daemon.features.worker.enabled",
-            "daemon.network.enabled",
-            "daemon.network.tlsSans",
+            "daemon.network.listeners.default.enabled",
+            "daemon.network.listeners.default.tlsSans",
         ] {
             let f = fake(Some(daemon()), Ok(ReloadReply::default()));
             let live = key(path);
@@ -277,7 +282,7 @@ mod tests {
     #[test]
     fn a_non_live_key_needs_a_restart_without_asking_the_daemon() {
         let f = fake(Some(daemon()), Ok(ReloadReply::default()));
-        let k = key("daemon.network.listen");
+        let k = key("daemon.network.listeners.default.listen");
         assert!(!k.live);
         assert_eq!(apply(&f, &session(), k, k.path), LiveApply::RestartRequired);
         assert_eq!(*f.calls.lock().unwrap(), 0);
@@ -290,6 +295,7 @@ mod tests {
     #[test]
     fn the_daemon_can_report_a_restart_is_required() {
         let reply = ReloadReply {
+            effects: vec![],
             applied: vec![],
             restart_required: vec!["daemon.maxConcurrentJobs".into()],
         };

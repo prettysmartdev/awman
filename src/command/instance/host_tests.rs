@@ -177,6 +177,7 @@ impl Fixture {
             stdout_is_tty: true,
             view: None,
             resume: None,
+            launch_context: None,
         }
     }
 
@@ -1084,4 +1085,96 @@ async fn a_hosted_terminal_release_runs_the_host_process_in_a_hub_pty() {
         crate::data::terminal::TerminalOwner::Tab(tab)
     );
     assert_eq!(record.state, crate::data::terminal::TerminalState::Exited);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn web_open_tab_is_confined_to_launch_context_roots() {
+    use crate::data::launch_context::CreateLaunchContext;
+    let f = fixture();
+    let root = f.root.join("repo");
+    std::fs::create_dir(root.join("sub")).unwrap();
+    let native = f.hello(FrontendRole::Primary);
+    let c = f
+        .host
+        .launch_contexts()
+        .create(CreateLaunchContext {
+            root: root.clone(),
+            label: None,
+            default: true,
+            env: native.env,
+        })
+        .unwrap();
+    let mut web = f.hello(FrontendRole::Primary);
+    web.kind = FrontendKindWire::Web;
+    web.env = Default::default();
+    web.cwd = Default::default();
+    web.argv.clear();
+    web.launch_context = Some(c.id);
+    web.stdin_is_tty = false;
+    let id = f.host.create_instance(Annotations::new()).unwrap();
+    let (primary, mut rx) = f.attach(&id, web.clone()).await.unwrap();
+    let state = f.host.find(&id).unwrap();
+    assert_eq!(state.state().env.as_ref().unwrap().cwd(), root);
+    assert_eq!(
+        state.state().env.as_ref().unwrap().get("GITHUB_TOKEN"),
+        Some(SECRET)
+    );
+    assert!(!format!("{:?}", drain(&mut rx)).contains(SECRET));
+    assert!(f
+        .host
+        .open_tab(
+            &id,
+            Some(&primary.frontend_id),
+            root.join("sub"),
+            OpenTabOptions {
+                startup: crate::data::frontend_protocol::StartupSpawn::None,
+                ..Default::default()
+            }
+        )
+        .is_ok());
+    let count = f.host.tabs(&id).unwrap().len();
+    for path in [root.join(".."), f.root.join("home")] {
+        assert_eq!(
+            f.host
+                .open_tab(&id, Some(&primary.frontend_id), path, Default::default())
+                .unwrap_err()
+                .code(),
+            "dir_outside_context"
+        );
+    }
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(f.root.join("home"), root.join("escape")).unwrap();
+        assert_eq!(
+            f.host
+                .open_tab(&id, None, root.join("escape"), Default::default())
+                .unwrap_err()
+                .code(),
+            "dir_outside_context"
+        );
+    }
+    assert_eq!(f.host.tabs(&id).unwrap().len(), count);
+    primary
+        .handle(
+            42,
+            FrontendFrame::OpenTab {
+                dir: root.join(".."),
+                options: Default::default(),
+            },
+        )
+        .await
+        .unwrap();
+    let frames = drain(&mut rx);
+    assert!(frames.iter().any(|f| matches!(
+        f,
+        EngineFrame::Notice {
+            level: MessageLevel::Error,
+            ..
+        }
+    )));
+    assert!(frames.iter().any(|f|matches!(f,EngineFrame::UiAck {request_seq:42,outcome} if outcome.detail.as_ref().is_some_and(|s|s.contains("dir_outside_context")))));
+    primary.disconnected();
+    web.resume = state.state().lifecycle.reconnecting().cloned();
+    let (resumed, _rx) = f.attach(&id, web).await.unwrap();
+    drop(resumed);
 }

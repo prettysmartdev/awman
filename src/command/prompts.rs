@@ -208,6 +208,35 @@ pub fn squad_task_confirm(
     ))
 }
 
+/// Browser confirmation projection. Native resume remains an immediate
+/// action; native callers keep using `squad_task_confirm` above.
+pub fn squad_task_confirmation_view(
+    action: FrontendAction,
+    name: &str,
+) -> Option<Prompt<SquadConfirmDecision>> {
+    if let Some(prompt) = squad_task_confirm(action, name) {
+        return Some(prompt);
+    }
+    let (title, body, verb) = match action {
+        FrontendAction::ResumeSquadTask => {
+            ("Resume task", format!("Resume task \"{name}\"?"), "resume")
+        }
+        FrontendAction::RemoveSquadTask => {
+            ("Delete task", format!("Delete task \"{name}\"?"), "delete")
+        }
+        _ => return None,
+    };
+    Some(Prompt::new(
+        title,
+        body,
+        vec![
+            Choice::new('y', verb, SquadConfirmDecision::Dispatch),
+            Choice::new('n', "back", SquadConfirmDecision::Dismiss),
+        ],
+        Some(SquadConfirmDecision::Dismiss),
+    ))
+}
+
 /// The approval asked before awman builds or launches a custom agent
 /// definition that needs one (any repo definition; a global one with
 /// `[ping]`).
@@ -1385,4 +1414,16 @@ mod prerequisite_report_tests {
             prompt.body
         );
     }
+}
+
+/// Presenter confirmations. The daemon and TUI consume the same copy.
+pub fn frontend_prompt(kind: &str) -> Option<Prompt<String>> {
+    let (title, body, choices): (&str, &str, Vec<Choice<String>>) = match kind {
+        "quit_confirm" => ("Quit awman?", "  Press Ctrl-C again to quit awman\n\n  [Esc] cancel", vec![Choice::new('y',"quit","quit".into()),Choice::new('n',"cancel","dismiss".into())]),
+        "close_tab_confirm" => ("Close tab?", "  Press Ctrl-C again to quit awman\n  Press Ctrl-T to close this tab\n\n  [Esc] cancel", vec![Choice::new('y',"close tab","close_tab".into()),Choice::new('n',"cancel","dismiss".into())]),
+        "workflow_cancel_confirm" => ("Cancel Workflow Execution", "  Cancel workflow execution?\n\n  The running container will be killed and the\n  current step returned to Pending for resumption.\n\n  [y] cancel execution   [n / Esc] keep running", vec![Choice::new('y',"cancel execution","cancel".into()),Choice::new('n',"keep running","dismiss".into())]),
+        "new_tab" => ("New tab", "Select an authorised launch context and a directory beneath its root.", vec![Choice::new('y',"open tab","open_tab".into()),Choice::new('n',"cancel","dismiss".into())]),
+        _ => return None,
+    };
+    Some(Prompt::new(title, body, choices, Some("dismiss".into())))
 }

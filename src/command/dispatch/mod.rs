@@ -6,6 +6,7 @@
 //! (mutually-exclusive flags, type errors, implications), and returns a typed
 //! [`BuiltCommand`] enum containing the constructed `*Command` struct.
 
+use crate::command::commands::link::{LinkCommand, LinkFrontend};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -145,6 +146,14 @@ pub trait CommandFrontend: UserMessageSink + Send + Sync {
     ///
     /// Before WI 0114 F-50 the rule itself lived in Layer 3, in
     /// `frontend::effective_non_interactive`, and each frontend re-applied it.
+    fn confirm_browser_link(&mut self) -> Result<bool, CommandError> {
+        Ok(false)
+    }
+
+    fn read_link_token(&mut self) -> Result<String, CommandError> {
+        Err(CommandError::Other("token input unavailable".into()))
+    }
+
     fn input_available(&self) -> bool {
         self.kind().can_ask_a_human()
     }
@@ -200,6 +209,7 @@ pub trait DispatchFrontend:
     + ExecWorkflowCommandFrontend
     + DaemonCommandFrontend
     + DaemonApiCommandFrontend
+    + LinkFrontend
     + SquadCommandFrontend
     + SquadAttachFrontend
     + RemoteCommandFrontend
@@ -222,6 +232,7 @@ impl<T> DispatchFrontend for T where
         + ExecWorkflowCommandFrontend
         + DaemonCommandFrontend
         + DaemonApiCommandFrontend
+        + LinkFrontend
         + SquadCommandFrontend
         + SquadAttachFrontend
         + RemoteCommandFrontend
@@ -252,6 +263,7 @@ pub enum BuiltCommand {
     ExecWorkflow(ExecWorkflowCommand),
     Daemon(DaemonCommand),
     DaemonApi(DaemonApiCommand),
+    Link(LinkCommand),
     Squad(SquadCommand),
     SquadAttach(SquadAttachCommand),
     Remote(RemoteCommand),
@@ -782,6 +794,7 @@ impl<F: DispatchFrontend + CliRelayFrontend> Dispatch<F> {
             stdout_is_tty: facts.stdout_is_tty,
             view: None,
             resume: None,
+            launch_context: None,
         };
         // No command has been submitted yet. A failure here can safely take
         // auto's builtin branch. After Submit, a failure must be reported.
@@ -1274,6 +1287,7 @@ impl BuiltCommand {
             ExecPrompt => ExecPromptCommandFrontend,
             Daemon => DaemonCommandFrontend,
             DaemonApi => DaemonApiCommandFrontend,
+            Link => LinkFrontend,
             Squad => SquadCommandFrontend,
             SquadAttach => SquadAttachFrontend,
             Remote => RemoteCommandFrontend,

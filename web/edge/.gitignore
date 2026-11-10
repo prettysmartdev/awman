@@ -1,0 +1,7 @@
+node_modules/
+.wrangler/
+.toolchain/
+.pnpm-store/
+.artifacts/
+.dev.vars
+.dev.vars.*

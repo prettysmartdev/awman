@@ -104,6 +104,7 @@ macro_rules! typed_id {
     };
 }
 
+typed_id!(LaunchContextId, "lc", "launch context");
 typed_id!(WorkerSessionId, "ses", "worker session");
 typed_id!(CommandId, "cmd", "command");
 typed_id!(TaskId, "task", "squad task");
@@ -116,6 +117,8 @@ typed_id!(TabId, "tab", "engine tab");
 typed_id!(TerminalId, "term", "terminal");
 typed_id!(LeaseId, "lease", "work lease");
 typed_id!(KeyId, "key", "API key");
+typed_id!(BrowserLinkId, "blk", "browser link");
+typed_id!(BrowserGrantId, "brw", "browser grant");
 
 pub const ID_PREFIXES: &[(&str, &str)] = &[
     ("ses", "worker session"),
@@ -130,6 +133,11 @@ pub const ID_PREFIXES: &[(&str, &str)] = &[
     ("term", "terminal"),
     ("lease", "work lease"),
     ("key", "API key"),
+    ("blk", "browser link"),
+    ("brw", "browser grant"),
+    // Upgrade tickets are opaque `awt_<43 base64url>` secrets, not typed ids;
+    // the prefix is reserved so no resource id can collide with it.
+    ("awt", "browser upgrade ticket"),
 ];
 
 #[cfg(test)]
@@ -175,5 +183,7 @@ mod tests {
         assert!(TerminalId::new().as_str().starts_with("term_"));
         assert!(LeaseId::new().as_str().starts_with("lease_"));
         assert!(KeyId::new().as_str().starts_with("key_"));
+        assert!(BrowserLinkId::new().as_str().starts_with("blk_"));
+        assert!(BrowserGrantId::new().as_str().starts_with("brw_"));
     }
 }

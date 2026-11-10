@@ -409,7 +409,7 @@ async fn set_reports_live_apply() {
         run_with(
             fx.session(),
             set(
-                "daemon.network.listen",
+                "daemon.network.listeners.default.listen",
                 "127.0.0.1:9999",
                 ConfigTarget::Auto,
             ),
@@ -440,8 +440,8 @@ async fn invalid_daemon_values_are_refused_and_nothing_is_persisted() {
     let before = std::fs::read_to_string(fx.global_file()).unwrap();
     for (key, value) in [
         ("daemon.maxConcurrentJobs", "lots"),
-        ("daemon.network.listen", "no-port"),
-        ("daemon.network.tlsSans", "not a host!"),
+        ("daemon.network.listeners.default.listen", "no-port"),
+        ("daemon.network.listeners.default.tlsSans", "not a host!"),
         ("daemon.features.worker.enabled", "maybe"),
         ("api.bind", "127.0.0.1:9876"),
     ] {

@@ -24,7 +24,7 @@ async fn status_has_per_feature_objects_and_ms_suffixed_durations() {
     assert_eq!(status["features"]["squad"]["state"], "off");
     assert_eq!(status["features"]["engine"]["state"], "off");
     assert_eq!(status["listeners"]["local"]["transport"], "unix_socket");
-    assert!(status["listeners"]["network"].is_null());
+    assert!(status["listeners"]["network"]["default"].is_null());
 
     // 0139 naming: durations are `_ms`, timestamps `_at`; no `_secs` anywhere.
     let text = status.to_string();

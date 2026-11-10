@@ -1,0 +1,28 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "awman-web",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-03-10",
+  "workers_dev": false,
+  "preview_urls": false,
+  "routes": [{ "pattern": "awman.prettysmart.dev", "custom_domain": true }],
+  "assets": {
+    "directory": "../out",
+    "binding": "ASSETS",
+    "run_worker_first": true,
+    "html_handling": "auto-trailing-slash",
+    "not_found_handling": "404-page"
+  },
+  "durable_objects": {
+    "bindings": [{ "name": "USAGE", "class_name": "UsageCounter" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["UsageCounter"] }],
+  "observability": {
+    "enabled": false,
+    "logs": { "enabled": false, "invocation_logs": false },
+    "traces": { "enabled": false }
+  },
+  "send_metrics": false,
+  "logpush": false,
+  "upload_source_maps": false
+}

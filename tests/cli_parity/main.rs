@@ -13,5 +13,10 @@ mod catalogue_completeness;
 mod config_commands;
 mod daemon_surface;
 mod json_outputs;
+mod link;
 mod set_overrides;
 mod squad_catalogue;
+
+#[cfg(unix)]
+#[path = "../helpers/api_process.rs"]
+mod api_process;

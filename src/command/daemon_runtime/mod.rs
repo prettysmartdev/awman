@@ -25,7 +25,7 @@ use features::{
     squad::{SquadFeature, SquadShared},
     worker::WorkerShared,
 };
-pub use network::{ListenerStatus, LocalTransport, NetworkDesired};
+pub use network::{ListenerStatus, ListenersDesired, LocalTransport};
 use std::{
     collections::{BTreeMap, HashMap},
     sync::{
@@ -48,6 +48,8 @@ pub struct DaemonRuntime {
     worker: Arc<WorkerShared>,
     event_buses: Arc<tokio::sync::Mutex<HashMap<String, Arc<EventBus>>>>,
     keys: Arc<ApiKeyStore>,
+    /// Browser grants, pending links and upgrade tickets (WI 0159).
+    browser: Arc<crate::command::daemon_api::browser::BrowserAuth>,
     network: network::NetworkControl,
     listeners: RwLock<ListenerStatus>,
     grants: Mutex<PrerequisiteGrantStore>,
@@ -100,6 +102,16 @@ impl DaemonRuntime {
     }
     pub fn keys(&self) -> &Arc<ApiKeyStore> {
         &self.keys
+    }
+    /// The browser authority: grants, links, tickets (WI 0159).
+    pub fn browser_auth(&self) -> &crate::command::daemon_api::browser::BrowserAuth {
+        &self.browser
+    }
+    /// Route reload revocations (origin removed, listener closed, engine
+    /// no longer served) to the browser authority. Called by every constructor.
+    fn install_browser_revocations(&self) {
+        self.network
+            .set_browser_revocation_sink(self.browser.clone());
     }
     pub fn worker(&self) -> &Arc<WorkerShared> {
         &self.worker
@@ -172,8 +184,15 @@ impl DaemonRuntime {
         }
         Ok(self.feature_state(f))
     }
-    pub fn network_serves(&self, f: FeatureName) -> bool {
-        self.config().daemon().network.features.contains(&f)
+    pub fn listener_settings(
+        &self,
+        name: &str,
+    ) -> Option<crate::data::config::daemon::ListenerSettings> {
+        self.config().daemon().network.listeners.remove(name)
+    }
+    pub fn listener_serves(&self, name: &str, f: FeatureName) -> bool {
+        self.listener_settings(name)
+            .is_some_and(|l| l.enabled && l.features.contains(&f))
             && self.feature_state(f).enabled_by == Some(EnabledBy::Config)
     }
     pub fn any_feature_enabled(&self) -> bool {
@@ -183,61 +202,116 @@ impl DaemonRuntime {
     }
     pub fn listeners(&self) -> ListenerStatus {
         let mut status = self.listeners.read().unwrap().clone();
-        let desired = self.network.tx.borrow().clone();
-        status.network = if desired.enabled {
-            let (bound, error) = status
-                .network
-                .map(|n| (n.bound, n.error))
-                .unwrap_or_default();
-            Some(self.network_record(desired.listen.to_string(), bound, error))
-        } else {
-            None
-        };
+        for (name, desired) in &self.network.tx.borrow().listeners {
+            let old = status.network.remove(name);
+            if desired.enabled || old.as_ref().is_some_and(|r| r.bound.is_some()) {
+                if let Some(record) = self.network_record(
+                    name,
+                    desired.listen.to_string(),
+                    old.as_ref().and_then(|r| r.bound),
+                    old.and_then(|r| r.error),
+                ) {
+                    status.network.insert(name.clone(), record);
+                }
+            }
+        }
         status
     }
     pub fn set_local_listener(&self, transport: LocalTransport, address: String) {
         self.listeners.write().unwrap().local =
             Some(network::LocalListenerRecord { transport, address });
     }
-    pub fn network_control(&self) -> tokio::sync::watch::Receiver<NetworkDesired> {
+    pub fn network_control(&self) -> tokio::sync::watch::Receiver<ListenersDesired> {
         self.network.subscribe()
+    }
+    pub fn set_browser_revocation_sink(&self, sink: Arc<dyn network::BrowserRevocationSink>) {
+        self.network.set_browser_revocation_sink(sink);
     }
     fn network_record(
         &self,
+        name: &str,
         listen: String,
         bound: Option<std::net::SocketAddr>,
         error: Option<String>,
-    ) -> network::NetworkListenerRecord {
-        let desired = self.network.tx.borrow();
-        network::NetworkListenerRecord {
+    ) -> Option<network::ListenerRecord> {
+        let all = self.network.tx.borrow();
+        let desired = all.listeners.get(name)?;
+        let features: Vec<_> = FeatureName::ALL
+            .into_iter()
+            .filter(|f| self.listener_serves(name, *f))
+            .collect();
+        Some(network::ListenerRecord {
+            name: name.into(),
             enabled: desired.enabled,
             listen,
             bound,
             error,
+            transport: desired.transport,
             tls: desired.tls.as_ref().map(|identity| network::TlsStatus {
                 fingerprint_sha256: identity.material.fingerprint_sha256_hex.clone(),
                 sans: identity.sans.clone(),
             }),
-            features: FeatureName::ALL
-                .into_iter()
-                .filter(|f| self.network_serves(*f))
-                .collect(),
+            browser_links: desired.transport
+                == crate::data::config::network::ListenerTransport::LoopbackHttp
+                && features.contains(&FeatureName::Engine),
+            allowed_origins: self
+                .listener_settings(name)
+                .map(|l| l.allowed_origins)
+                .unwrap_or_default(),
+            browser_grants: self.browser.count_for_listener(name),
+            features,
             api_keys: self.keys.count(),
-        }
+        })
     }
-    pub fn report_network_bound(&self, bound: std::net::SocketAddr) {
-        self.listeners.write().unwrap().network = Some(self.network_record(
-            self.network.tx.borrow().listen.to_string(),
-            Some(bound),
-            None,
-        ));
+    pub fn report_listener_bound(&self, name: &str, bound: std::net::SocketAddr) {
+        let Some(listen) = self
+            .network
+            .tx
+            .borrow()
+            .listeners
+            .get(name)
+            .map(|l| l.listen.to_string())
+        else {
+            return;
+        };
+        let Some(record) = self.network_record(name, listen, Some(bound), None) else {
+            return;
+        };
+        self.listeners
+            .write()
+            .unwrap()
+            .network
+            .insert(name.into(), record);
     }
-    pub fn report_network_error(&self, listen: String, error: String) {
-        self.listeners.write().unwrap().network =
-            Some(self.network_record(listen, None, Some(error)));
+    pub fn report_listener_error(&self, name: &str, listen: String, error: String) {
+        let Some(record) = self.network_record(name, listen, None, Some(error)) else {
+            return;
+        };
+        self.listeners
+            .write()
+            .unwrap()
+            .network
+            .insert(name.into(), record);
     }
-    pub fn report_network_closed(&self) {
-        self.listeners.write().unwrap().network = None;
+    pub fn report_listener_closed(&self, name: &str) {
+        self.listeners.write().unwrap().network.remove(name);
+    }
+    pub fn report_listener_rebound(&self, name: &str, disconnected: usize) {
+        tracing::info!(
+            listener = name,
+            disconnected_clients = disconnected,
+            "listener rebound"
+        );
+    }
+    pub fn listener_host_started(&self) {
+        self.network.hosting.store(true, Ordering::Release);
+    }
+    pub fn report_listeners_applied(
+        &self,
+        generation: u64,
+        effects: Vec<crate::command::daemon_api::core::ReloadEffect>,
+    ) {
+        self.network.applied.send_replace((generation, effects));
     }
     pub fn exit_signal(&self) -> CancellationToken {
         self.exit.clone()
@@ -247,6 +321,10 @@ impl DaemonRuntime {
             return;
         }
         self.core.shutdown().cancel();
+        // Every browser grant ends with the daemon; live browser sockets close
+        // with 1008 "daemon stopping".
+        self.browser
+            .revoke_all(crate::data::browser_auth::GrantRevocationReason::DaemonStopping);
         // Engine frontends are told the daemon is stopping, not that the
         // feature was disabled.
         self.engine_feature
@@ -260,7 +338,9 @@ impl DaemonRuntime {
         };
         stop(mode).await;
         let mut desired = self.network.tx.borrow().clone();
-        desired.enabled = false;
+        for l in desired.listeners.values_mut() {
+            l.enabled = false;
+        }
         self.network.tx.send_replace(desired);
         // Only the owner removes endpoint metadata; a successor's identity survives.
         if self
@@ -431,7 +511,7 @@ mod tests {
         }
     }
     fn config(core: &Core, enabled: bool, allow: bool) -> EffectiveConfig {
-        EffectiveConfig::resolve(ConfigLayers { global:ConfigFile::from_value(serde_json::json!({"daemon":{"features":{"engine":{"enabled":enabled,"allowEphemeral":allow,"idleTimeout":"1ms"},"squad":{"envPersistence":"none"}},"network":{"features":["engine"]}}}),FileKind::Global).unwrap(),..Default::default() },Default::default(),core.env().clone()).unwrap()
+        EffectiveConfig::resolve(ConfigLayers { global:ConfigFile::from_value(serde_json::json!({"daemon":{"features":{"engine":{"enabled":enabled,"allowEphemeral":allow,"idleTimeout":"1ms"},"squad":{"envPersistence":"none"}},"network":{"listeners":{"default":{"enabled":true,"features":["engine"]}}}}}),FileKind::Global).unwrap(),..Default::default() },Default::default(),core.env().clone()).unwrap()
     }
     async fn fixture(enabled: bool, allow: bool) -> (tempfile::TempDir, Arc<DaemonRuntime>) {
         let dir = tempfile::tempdir().unwrap();
@@ -506,6 +586,10 @@ mod tests {
             grants: Mutex::new(PrerequisiteGrantStore::load(dir.path())),
             event_buses: worker.event_buses.clone(),
             keys: ApiKeyStore::open(core.daemon_paths().api_keys_file()).unwrap(),
+            browser: crate::command::daemon_api::browser::BrowserAuth::open(
+                core.daemon_paths().browser_grants_file(),
+            )
+            .unwrap(),
             core,
             engines,
             config: RwLock::new(config.clone()),
@@ -514,11 +598,11 @@ mod tests {
             preparing: RwLock::new(BTreeMap::new()),
             squad: squad_feature.shared().clone(),
             worker,
-            network: network::NetworkControl::new(NetworkDesired {
-                enabled: false,
-                listen: settings.network.listen,
-                tls: None,
-            }),
+            network: network::NetworkControl::new(ListenersDesired::new(
+                &settings.network,
+                None,
+                None,
+            )),
             listeners: RwLock::new(ListenerStatus::default()),
             exit: CancellationToken::new(),
             pid: std::process::id(),
@@ -530,6 +614,7 @@ mod tests {
             shutdown_done: AtomicBool::new(false),
             terminals: Default::default(),
         });
+        runtime.install_browser_revocations();
         if enabled {
             runtime.supervisors[&FeatureName::Engine]
                 .enable(EnabledBy::Config, None)
@@ -548,7 +633,7 @@ mod tests {
             r.feature_state(FeatureName::Engine).state,
             FeatureState::Ephemeral
         );
-        assert!(!r.network_serves(FeatureName::Engine));
+        assert!(!r.listener_serves("default", FeatureName::Engine));
         DaemonRuntime::spawn_idle_watch(&r, Duration::from_millis(2));
         tokio::time::timeout(Duration::from_secs(1), r.exit_signal().cancelled())
             .await
@@ -577,7 +662,7 @@ mod tests {
             r.disable_ephemeral(FeatureName::Engine).await,
             Err(FeatureChangeError::EnabledByConfig(_))
         ));
-        assert!(r.network_serves(FeatureName::Engine));
+        assert!(r.listener_serves("default", FeatureName::Engine));
         r.apply_config_locked(config(&r.core, false, true))
             .await
             .unwrap();
@@ -669,7 +754,8 @@ mod tests {
                 .insert(name, supervisor);
         }
         let mut value = r.config().value().clone();
-        value["daemon"]["network"]["features"] = serde_json::json!(["worker"]);
+        value["daemon"]["network"]["listeners"]["default"]["features"] =
+            serde_json::json!(["worker"]);
         let resolve = |value| {
             EffectiveConfig::resolve(
                 ConfigLayers {
@@ -697,7 +783,7 @@ mod tests {
             r.feature_state(FeatureName::Worker).state,
             FeatureState::Off
         );
-        assert!(!r.network_serves(FeatureName::Worker));
+        assert!(!r.listener_serves("default", FeatureName::Worker));
         assert_eq!(
             r.core.executor().snapshot().per_feature[&FeatureName::Worker].share,
             0
@@ -719,7 +805,7 @@ mod tests {
         db.execute_batch("BEGIN IMMEDIATE").unwrap();
         let mut value = r.config().value().clone();
         value["daemon"]["maxConcurrentJobs"] = serde_json::json!(9);
-        value["daemon"]["network"]["enabled"] = serde_json::json!(true);
+        value["daemon"]["network"]["listeners"]["default"]["enabled"] = serde_json::json!(true);
         value["daemon"]["features"]["squad"]["enabled"] = serde_json::json!(true);
         value["daemon"]["features"]["engine"]["enabled"] = serde_json::json!(false);
         let candidate = EffectiveConfig::resolve(

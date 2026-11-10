@@ -402,6 +402,7 @@ impl CommandError {
     pub fn exit_code(&self) -> u8 {
         match self {
         CommandError::Aborted => 130,
+        CommandError::DaemonHttpStatus { status: 404, .. } => 4,
 
         // Exit 2 — invalid usage / parse / flag conflict
         CommandError::UnknownCommand { .. }

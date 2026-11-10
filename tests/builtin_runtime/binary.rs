@@ -260,7 +260,12 @@ fn builtin_worker_route_is_hidden_from_humans() {
         .output()
         .unwrap();
     let help = text(&help);
-    assert!(!help.contains("machine") && !help.contains("__awman-builtin-info"));
+    // Ordinary help text may describe linking "this machine". Check the
+    // command column, rather than banning that English word everywhere.
+    assert!(!help
+        .lines()
+        .any(|line| line.split_whitespace().next() == Some("machine")));
+    assert!(!help.contains("__awman-builtin-info"));
 }
 
 #[test]

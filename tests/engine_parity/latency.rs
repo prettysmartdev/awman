@@ -203,3 +203,101 @@ async fn remote_backend_channel_adapter_obeys_the_same_latency_budget() {
         }
     }
 }
+
+/// Baseline for the delivered owner-socket terminal path. This measures the
+/// real hub/codec/router with synthetic output; it is not browser rendering or
+/// an agent PTY benchmark. Browser baselines must be measured separately.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn terminal_frame_throughput_and_reconnect_baseline() {
+    use crate::{
+        data::{daemon_state::FeatureName, terminal::*},
+        engine::{
+            remote::terminal_client::{TerminalClientOptions, TerminalStream},
+            terminal_hub::{input_channel, TerminalInput, TerminalRegistration},
+        },
+    };
+    async fn next(wire: &mut TerminalStream) -> TerminalFrame {
+        tokio::time::timeout(Duration::from_secs(5), wire.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+    }
+    fn p95(samples: &mut [Duration]) -> f64 {
+        samples.sort();
+        samples[(samples.len() * 95).div_ceil(100) - 1].as_secs_f64() * 1000.0
+    }
+    let d = Daemon::start(IntegrationRegistry::compiled_in()).await;
+    let id = d.host().create_instance(Annotations::new()).unwrap();
+    let (_tx, _rx) = attach(&d, &id, d.hello(FrontendRole::Primary)).await;
+    let tab = d.host().tabs(&id).unwrap()[0].tab_id.clone();
+    let (stdin, _input) = input_channel();
+    let terminal = d.api.terminals.hub().register(
+        TerminalRegistration {
+            owner: TerminalOwnerInfo {
+                owner: TerminalOwner::Tab(tab),
+                feature: FeatureName::Engine,
+                source: None,
+                attempt: 1,
+                allow_remote_input: false,
+            },
+            agent: "acceptance-fixture".into(),
+            model: None,
+            cols: 80,
+            rows: 24,
+        },
+        TerminalInput {
+            stdin,
+            resize: None,
+        },
+    );
+    let options = TerminalClientOptions::default();
+    let mut wire = TerminalStream::connect_local(&d.socket, terminal.id(), &options)
+        .await
+        .unwrap();
+    assert!(matches!(
+        next(&mut wire).await,
+        TerminalFrame::Snapshot { .. }
+    ));
+    let bytes = vec![b'x'; 4096];
+    let mut frames = Vec::new();
+    let mut total = Duration::ZERO;
+    for i in 0..325 {
+        let start = Instant::now();
+        terminal.push_output(&bytes);
+        let TerminalFrame::Output { bytes: received } = next(&mut wire).await else {
+            panic!("terminal output")
+        };
+        assert_eq!(received, bytes);
+        if i >= 25 {
+            let elapsed = start.elapsed();
+            total += elapsed;
+            frames.push(elapsed);
+        }
+    }
+    wire.close().await.unwrap();
+    let mut reconnect = Vec::new();
+    for i in 0..125 {
+        let start = Instant::now();
+        let mut wire = TerminalStream::connect_local(&d.socket, terminal.id(), &options)
+            .await
+            .unwrap();
+        assert!(matches!(
+            next(&mut wire).await,
+            TerminalFrame::Snapshot { .. }
+        ));
+        if i >= 25 {
+            reconnect.push(start.elapsed());
+        }
+        wire.close().await.unwrap();
+    }
+    let result = serde_json::json!({
+        "transport": "owner_unix_socket", "source": "synthetic_terminal_hub",
+        "frame_samples": frames.len(), "frame_bytes": bytes.len(),
+        "frame_p95_ms": p95(&mut frames),
+        "throughput_mib_s": (300.0 * bytes.len() as f64 / 1048576.0) / total.as_secs_f64(),
+        "reconnect_samples": reconnect.len(), "reconnect_snapshot_p95_ms": p95(&mut reconnect),
+    });
+    eprintln!("terminal acceptance baseline: {result}");
+    crate::support::save_artifact("terminal-baseline", result);
+}

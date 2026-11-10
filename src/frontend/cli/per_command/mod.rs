@@ -38,3 +38,5 @@ mod mount_scope;
 mod workflow_frontend_marker;
 pub(crate) mod workflow_prerequisites;
 mod worktree_lifecycle_marker;
+
+pub mod link;

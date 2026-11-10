@@ -81,11 +81,11 @@ fn shipped_cli_bytes_and_exit_codes_match_both_engines() {
         .unwrap();
     let binary = dir.path().join("awman-parity");
     crate::support::copy_test_executable(&binary);
-    let output = std::process::Command::new(binary)
-        .args(["--exact", "cli_bytes::relay_child", "--nocapture"])
-        .env("AWMAN_PARITY_CLI_CHILD", "1")
-        .output()
-        .unwrap();
+    let output = crate::support::output_test_executable(
+        std::process::Command::new(binary)
+            .args(["--exact", "cli_bytes::relay_child", "--nocapture"])
+            .env("AWMAN_PARITY_CLI_CHILD", "1"),
+    );
     assert!(
         output.status.success(),
         "{}\n{}",

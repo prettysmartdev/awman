@@ -2961,6 +2961,7 @@ mod interaction_tests {
 
     fn row(subcommand: &str, args: &[&str]) -> CommandRecord {
         CommandRecord {
+            listener_name: None,
             allow_remote_input: false,
             listener: "local".into(),
             trace_parent: None,

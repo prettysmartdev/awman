@@ -41,10 +41,18 @@ use std::{path::Path, time::Duration};
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn engine_routes_are_hidden_on_network_even_when_ephemerally_enabled() {
     let d = Daemon::start(IntegrationRegistry::compiled_in()).await;
-    assert!(!d.api.runtime.network_serves(FeatureName::Engine));
+    assert!(!d
+        .api
+        .runtime
+        .listener_serves("default", FeatureName::Engine));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let app = build_router_for_listener(d.api.clone(), ListenerPolicy::Network);
+    let app = build_router_for_listener(
+        d.api.clone(),
+        ListenerPolicy::Network {
+            name: "default".into(),
+        },
+    );
     let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let client = reqwest::Client::new();
     let id = d.host().create_instance(Annotations::new()).unwrap();
@@ -53,7 +61,9 @@ async fn engine_routes_are_hidden_on_network_even_when_ephemerally_enabled() {
         .iter()
         .filter(|s| s.op.owner() == crate::command::daemon_api::Feature::Engine)
     {
-        assert!(spec.local_only && spec.op.local_only());
+        // Owner-only engine routes (browser-link lookup/decision) are hidden
+        // on the network as well; the table and the operation must agree.
+        assert_eq!(spec.local_only, spec.op.local_only());
         let path = spec
             .path
             .replace("{id}", id.as_str())
@@ -129,11 +139,11 @@ async fn hello_env_is_absent_from_frames_store_debug_and_crash_output() {
     let crash_dir = tempfile::tempdir().unwrap();
     let crash_binary = crash_dir.path().join("awman-crash-probe");
     crate::support::copy_test_executable(&crash_binary);
-    let output = std::process::Command::new(crash_binary)
-        .args(["--exact", "security::redacted_crash_child", "--nocapture"])
-        .env("AWMAN_PARITY_CRASH_CHILD", "1")
-        .output()
-        .unwrap();
+    let output = crate::support::output_test_executable(
+        std::process::Command::new(crash_binary)
+            .args(["--exact", "security::redacted_crash_child", "--nocapture"])
+            .env("AWMAN_PARITY_CRASH_CHILD", "1"),
+    );
     assert!(!output.status.success());
     for bytes in [&output.stdout, &output.stderr] {
         assert!(

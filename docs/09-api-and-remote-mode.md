@@ -128,9 +128,11 @@ Sessions and commands accept [labels](#labels). A label key is `<namespace>/<nam
   "listeners": {
     "local": { "transport": "unix_socket", "address": "/home/u/.awman/data/daemon/api.sock" },
     "network": {
-      "enabled": true, "listen": "0.0.0.0:9876", "bound": "0.0.0.0:9876", "error": null,
-      "tls": { "fingerprint_sha256": "ab…", "sans": ["localhost", "127.0.0.1", "::1"] },
-      "features": ["worker"], "api_keys": 2
+      "default": {
+        "enabled": true, "listen": "0.0.0.0:9876", "bound": "0.0.0.0:9876", "error": null,
+        "transport": "tls", "features": ["worker"], "api_keys": 2,
+        "browser_links": false, "browser_grants": 0, "allowed_origins": []
+      }
     }
   }
 }
@@ -139,9 +141,18 @@ Sessions and commands accept [labels](#labels). A label key is `<namespace>/<nam
 
 `capabilities` (a list of strings) is what the older `features` list used to be; `features` is now an object keyed by feature name holding each feature's state. See [Server health](#server-health).
 
+The `listeners.network` object is keyed by listener name. Browser linking is
+available through the built-in loopback listener when it serves the engine and
+allows the requesting origin. Other listener configurations may report
+`browser_links: false`.
+
 ### Features and access
 
-The network listener serves only features listed in `daemon.network.features` and enabled by config. Ephemeral features remain local. Removing a feature from the list takes effect on the next request, including requests on existing connections. Hidden paths return 404 for every method before key authentication.
+Each network listener serves only the features listed in its
+`daemon.network.listeners.<name>.features` setting and enabled by config.
+Ephemeral features remain local. Removing a feature from a listener takes
+effect on the next request, including requests on existing connections.
+Hidden paths return 404 for every method before key authentication.
 
 The daemon is organised into **features**: `core` (status, config, features, grants), `worker` (sessions, commands and runs driven by clients) and `squad` (scheduled tasks). Each route belongs to one feature, and its path says which: `/v1/worker/…`, `/v1/squad/…`. A feature has a state — `on`, `off`, `draining` (no new work accepted) or `ephemeral` — shown by `GET /v1/features`. On the local listener, routes of a feature that is `off` answer `503 feature_disabled`. Network concealment takes precedence and returns `404 not_found` for features that are not exposed. A recovering feature reports `degraded`; reads remain available and creates answer `503 feature_degraded`.
 
@@ -154,14 +165,16 @@ Two access classes apply:
 
 ## Quickstart — copy-pastable examples
 
-These examples use the network listener at `127.0.0.1:9876` with TLS. Configure `daemon.network.*` and create a named API key as described in [The daemon](16-daemon.md).
+These examples use the `default` listener at `127.0.0.1:9876` with TLS.
+Configure `daemon.network.listeners.default` and create a named API key as
+described in [The daemon](16-daemon.md).
 
 ```sh
 # 0. Enable worker requests, allow this directory, and start the daemon.
 awman config set --global daemon.features.worker.enabled true
 awman config set --global daemon.features.worker.push.workDirs.allow "$HOME/my-project"
-awman config set --global daemon.network.enabled true
-awman config set --global daemon.network.listen 127.0.0.1:9876
+awman config set --global daemon.network.listeners.default.enabled true
+awman config set --global daemon.network.listeners.default.listen 127.0.0.1:9876
 awman daemon start --background
 
 # Create a named key locally and capture it once:
@@ -456,10 +469,10 @@ awman daemon status
 ```
 
 The daemon always provides an owner-only local listener for local clients.
-Remote HTTP access uses the daemon's separate TLS-only network listener,
-configured with `daemon.network.enabled`, `daemon.network.listen`,
-`daemon.network.features`, and `daemon.network.tlsSans`. See [The daemon](16-daemon.md)
-for setup and listener security. Local clients use the owner-only listener when no remote target is selected.
+Remote HTTP access uses a named TLS network listener configured under
+`daemon.network.listeners.<name>`. See [The daemon](16-daemon.md) for listener
+setup and security. Local clients use the owner-only listener when no remote
+target is selected.
 
 Use `awman daemon stop` for a graceful drain, or `awman daemon stop --now` to
 cancel running worker and squad jobs before stopping. Read output with
@@ -491,8 +504,10 @@ previous key by its `key_…` ID:
 awman daemon api keys.delete id=key_…
 ```
 
-HTTP clients authenticate with `Authorization: Bearer <key>`. The network
-listener uses TLS only. The local owner-only listener does not need a key.
+HTTP clients authenticate with `Authorization: Bearer <key>`. Ordinary network
+API requests require a named API key. Browser access uses owner-approved grants
+on an eligible loopback engine listener. The local owner-only listener does
+not need a key.
 
 ---
 
@@ -650,10 +665,23 @@ This is the complete route table. Request and response details for the worker pu
 | `POST` | `/v1/engine/instances/{id}/dialogs/{dialog_id}/answer` | engine | owner/local | Answer a pending dialog (`409 dialog_answered` if someone already did) |
 | `POST` | `/v1/engine/instances/{id}/ui_requests` | engine | owner/local | Ask the instance to open or close a tab, change focus, and so on |
 | `GET` | `/v1/engine/instances/{id}/frontend` | engine | owner/local | WebSocket a TUI attaches through |
+| `GET` | `/v1/engine/catalogue` | engine | owner/local or browser grant | Command catalogue projection (`ETag`/`If-None-Match`) |
+| `GET` | `/v1/engine/prompts` | engine | owner/local or browser grant | Confirmation prompt wording for `?kind=…` |
+| `GET` | `/v1/engine/launch_contexts` | engine | owner/local or browser grant | Registered workspaces (never environment values) |
+| `POST` | `/v1/engine/launch_contexts` | engine | owner/local | Register the calling shell's directory and environment |
+| `POST` | `/v1/engine/launch_contexts/{id}/refresh` | engine | owner/local | Refresh a workspace from its root |
+| `DELETE` | `/v1/engine/launch_contexts/{id}` | engine | owner/local | Remove a workspace |
+| `POST` | `/v1/browser-links` | engine | allowed browser origin, loopback listener | Request a `web-` link code |
+| `POST` | `/v1/browser-links/{id}/poll` | engine | allowed browser origin + polling secret | Poll a pending link; approval returns the grant |
+| `GET` | `/v1/browser-links?code=web-…` | engine | owner/local | Look up a pending link (`awman link web-<code>`) |
+| `POST` | `/v1/browser-links/{id}/decision` | engine | owner/local | Approve or deny a pending link |
+| `GET` | `/v1/browsers` | core | owner/local | List browser grants (`awman daemon api browsers.list`) |
+| `DELETE` | `/v1/browsers/{id}` | core | owner/local | Revoke a grant and close its connections (`browsers.delete`) |
+| `POST` | `/v1/browser-tickets` | engine | browser grant | One-use WebSocket upgrade ticket |
 
 ### Engine routes
 
-The `/v1/engine/*` routes belong to the daemon's engine feature, which hosts [TUI instances](19-engine-and-frontends.md). They are owner/local only: on the network listener they answer `404 not_found`, and they are not reachable through `awman remote`. Remote frontends are out of scope; a TUI attaches to an engine on the same machine. From the command line, use `awman daemon api instances.list`, `instances.get`, `dialogs.list`, `dialogs.answer` and `ui.request`. Routes for an engine that is off answer `503 feature_disabled`.
+The `/v1/engine/*` routes belong to the daemon's engine feature, which hosts [TUI instances](19-engine-and-frontends.md). The TUI attaches through the owner-only local socket or named pipe. The engine feature can be selected on a named network listener only when it binds to loopback. The hosted web frontend uses the loopback listener after the owner approves a browser link with `awman link web-<code>`. These routes are not reachable through `awman remote`. From the command line, use `awman daemon api instances.list`, `instances.get`, `dialogs.list`, `dialogs.answer` and `ui.request`. Routes for an engine that is off answer `503 feature_disabled`.
 
 Squad task and run bodies use `snake_case` fields; a task's interval is `interval_ms`. The scheduler currently has one-second granularity, so `interval_ms` must be a multiple of 1000. Anything not in this table — including the old unprefixed routes listed under [Upgrading from earlier betas](#upgrading-from-earlier-betas) — answers `404 not_found`.
 
@@ -1674,6 +1702,14 @@ Match on `code`, not on the `error` text. Existing messages are preserved for co
 | `output_not_found` | 404 | The output file is unavailable |
 | `output_too_large` | 413 | The output exceeds the download limit |
 | `unsupported_media_type` | 415 | The request content type is unsupported |
+| `origin_not_allowed` | 403 | A browser `Origin` that is not in the receiving listener's `allowedOrigins` (no CORS headers are sent) |
+| `host_mismatch` | 421 | A plain-HTTP loopback request whose `Host` is not exactly the listener's configured address |
+| `browser_grant_required` | 401 | A browser request without an approved grant |
+| `browser_grant_invalid` | 401 | The grant is unknown, expired, revoked, or bound to another origin or listener |
+| `browser_ticket_invalid` | 401 | A WebSocket upgrade without a valid one-use ticket, or a ticket on a non-upgrade request |
+| `link_gone` | 410 | A browser link that is unknown, consumed or expired, or a poll with the wrong secret |
+| `link_not_found` | 404 | `awman link web-<code>` named an unknown, expired or already decided code |
+| `rate_limited` | 429 | Too many link creations, poll failures or lookups; see `Retry-After` |
 | `feature_disabled` | 503 | The route belongs to a [feature](#api-conventions) this daemon is not running |
 | `config_invalid` | 422 | `POST /v1/config/reload` found a config file that fails validation; the body also carries `errors: [string]` |
 | `task_not_found` / `run_not_found` / `grant_not_found` | 404 | No squad task, squad run or grant with that ID |
@@ -2106,7 +2142,16 @@ Worker and network settings live in the `daemon` section of global config (`$AWM
   "daemon": {
     "maxConcurrentJobs": 4,
     "verboseSetup": true,
-    "network": { "listen": "127.0.0.1:9876" },
+    "network": {
+      "listeners": {
+        "default": {
+          "enabled": true,
+          "listen": "127.0.0.1:9876",
+          "transport": "tls",
+          "features": ["worker"]
+        }
+      }
+    },
     "features": {
       "worker": {
         "push": {
@@ -2126,7 +2171,7 @@ Worker and network settings live in the `daemon` section of global config (`$AWM
 | Key | Meaning |
 |-----|---------|
 | `daemon.maxConcurrentJobs` | Shared maximum number of daemon jobs running at once (default 4). Live: `awman config set` applies it to a running daemon. |
-| `daemon.network.listen` | `host:port` the server binds (default `127.0.0.1:9876`). Restart required. |
+| `daemon.network.listeners.<name>.listen` | `host:port` the named listener binds. Restart required. |
 | `daemon.verboseSetup` | Log full session-setup output at `info` level (default `false`). |
 | `daemon.features.worker.push.workDirs.allow` | Exact working directories clients may use. |
 | `daemon.features.worker.push.workDirs.roots` | Directories whose direct-child Git repositories clients may use. |
@@ -2139,7 +2184,7 @@ awman config set --global daemon.features.worker.push.workDirs.allow "/home/user
 awman config set --global daemon.features.worker.push.workDirs.roots "/srv/repos"
 ```
 
-See [Working directory allowlist](#working-directory-allowlist) for what qualifies as a direct child of a root. Live settings apply automatically when you change them with `awman config set`; `daemon.network.listen` needs a restart.
+See [Working directory allowlist](#working-directory-allowlist) for what qualifies as a direct child of a root. Live settings apply automatically when you change them with `awman config set`; changing a named listener's `listen` address needs a restart.
 
 ---
 
@@ -2151,7 +2196,7 @@ The network listener enforces named API key authentication on every request. The
 
 The working directory allowlist is the secondary access control on the server: even a client that presents a valid API key can only create sessions in pre-approved directories.
 
-The network listener binds to `daemon.network.listen` and uses TLS. See [The daemon](16-daemon.md#network-listener) for configuration and listener security.
+The network listener binds to `daemon.network.listeners.<name>.listen` and uses TLS. See [The daemon](16-daemon.md#network-listener) for configuration and listener security.
 
 ---
 
@@ -2211,7 +2256,7 @@ awman remote exec workflow my.toml -f ──────────► POST /v1
 | `awman remote exec prompt <prompt>` | Send a one-shot prompt to a session |
 | `awman remote session kill <session-id>` | Close a session |
 
-The network listener is TLS-only and binds to `daemon.network.listen`; availability depends on the build. See [The daemon](16-daemon.md#network-listener).
+The network listener uses TLS and binds to `daemon.network.listeners.<name>.listen`. See [The daemon](16-daemon.md#network-listener).
 
 ---
 

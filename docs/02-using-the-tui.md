@@ -7,6 +7,12 @@ awman has two execution modes:
 
 This guide covers TUI mode.
 
+awman's browser frontend connects to a daemon on the same machine. Its controls
+and shortcuts follow the TUI where the browser permits them; browser-reserved
+keys such as **Ctrl+T** and **Ctrl+W** use **Alt+T** and **Alt+W** alternatives,
+and some actions use visible buttons. Text inputs keep their normal editing
+keys. See the [Web App guide](20-webapp.md#shortcuts) for details.
+
 ---
 
 ## Startup

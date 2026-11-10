@@ -385,6 +385,7 @@ fn hello(
         stdout_is_tty: std::io::stdout().is_terminal(),
         view,
         resume: None,
+        launch_context: None,
     }
 }
 

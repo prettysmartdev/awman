@@ -350,10 +350,11 @@ pub fn render_yes_no(title: &str, body: &str, area: Rect, frame: &mut Frame) {
 
 /// Render the quit confirmation dialog (single tab).
 pub fn render_quit_confirm(area: Rect, frame: &mut Frame) {
+    let prompt = crate::command::prompts::frontend_prompt("quit_confirm").unwrap();
     let width = 56u16.min(area.width.saturating_sub(4).max(40));
     let dialog_area = centered_fixed(width, 8, area);
-    let inner = render_dialog_frame("Quit awman?", Color::Yellow, dialog_area, frame);
-    let text = "  Press Ctrl-C again to quit awman\n\n  [Esc] cancel";
+    let inner = render_dialog_frame(&prompt.title, Color::Yellow, dialog_area, frame);
+    let text = prompt.body;
     frame.render_widget(
         Paragraph::new(text)
             .wrap(ratatui::widgets::Wrap { trim: false })
@@ -364,11 +365,11 @@ pub fn render_quit_confirm(area: Rect, frame: &mut Frame) {
 
 /// Render the close-tab confirmation dialog (multiple tabs).
 pub fn render_close_tab_confirm(area: Rect, frame: &mut Frame) {
+    let prompt = crate::command::prompts::frontend_prompt("close_tab_confirm").unwrap();
     let width = 60u16.min(area.width.saturating_sub(4).max(40));
     let dialog_area = centered_fixed(width, 9, area);
-    let inner = render_dialog_frame("Close tab?", Color::Yellow, dialog_area, frame);
-    let text =
-        "  Press Ctrl-C again to quit awman\n  Press Ctrl-T to close this tab\n\n  [Esc] cancel";
+    let inner = render_dialog_frame(&prompt.title, Color::Yellow, dialog_area, frame);
+    let text = prompt.body;
     frame.render_widget(
         Paragraph::new(text).wrap(ratatui::widgets::Wrap { trim: false }),
         inner,
@@ -378,15 +379,11 @@ pub fn render_close_tab_confirm(area: Rect, frame: &mut Frame) {
 /// Render the workflow-cancel confirmation dialog (Ctrl+C while a workflow
 /// is running).
 pub fn render_workflow_cancel_confirm(area: Rect, frame: &mut Frame) {
+    let prompt = crate::command::prompts::frontend_prompt("workflow_cancel_confirm").unwrap();
     let width = 64u16.min(area.width.saturating_sub(4).max(40));
     let dialog_area = centered_fixed(width, 11, area);
-    let inner = render_dialog_frame(
-        "Cancel Workflow Execution",
-        Color::Yellow,
-        dialog_area,
-        frame,
-    );
-    let text = "  Cancel workflow execution?\n\n  The running container will be killed and the\n  current step returned to Pending for resumption.\n\n  [y] cancel execution   [n / Esc] keep running";
+    let inner = render_dialog_frame(&prompt.title, Color::Yellow, dialog_area, frame);
+    let text = prompt.body;
     frame.render_widget(
         Paragraph::new(text).wrap(ratatui::widgets::Wrap { trim: false }),
         inner,

@@ -38,6 +38,7 @@ Every item below depends on the completed 0139–0143 daemon gate. Additional de
 | 15 | [0156 — Rex action pack](integrations/0156-rex-action-pack.md) | Palette actions over the finalized daemon API. |
 | 16 | [0157 — OpenCode and Cursor builtins](0157-opencode-v2-support.md) | OpenCode 1.x/2.x and Cursor; retire builtin Gemini. |
 | 17 | [0158 — Builtin runtime setup and errors](0158-builtin-ready-setup-and-errors.md) | Image-source setup and clear `ready`/Docker errors. |
-| 18 | [0159 — Webapp v0](webapp/0159-webapp-v0.md) | Same-machine browser frontend; named daemon listeners keep engine on loopback and worker access separate. |
+| 18 | [0159 — Webapp v0](0159-webapp-v0.md) | Same-machine browser frontend; named daemon listeners keep engine on loopback and worker access separate. |
+| 19 | [0160 — Webapp v0 acceptance follow-ups](0160-webapp-v0-acceptance-followups.md) | Engine-trace parity harness, deployed-origin browser checks, live PTY, offline/update e2e, web baselines and the items 0159's final audit deferred. |
 
 Other open work items [0120](0120-upstream-embedded-kernel-support.md), [0124](0124-builtin-linux-and-docker-gates.md) and [0129](0129-codebase-simplicity-and-rust-quality-review.md) retain their numbers and link to the new daemon items where relevant.

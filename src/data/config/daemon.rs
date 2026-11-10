@@ -7,11 +7,12 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-use crate::data::config::network::{ListenAddr, TlsSan};
+use crate::data::config::network::{BrowserOrigin, ListenAddr, ListenerTransport, TlsSan};
 use crate::data::config::units::DurationStr;
 use crate::data::config::work_servers::ResolvedWorkServer;
 use crate::data::daemon_state::FeatureName;
 use crate::data::fs::daemon_env::EnvPersistenceSetting;
+use std::collections::BTreeMap;
 
 /// How a job interacts with its user: an attachable terminal session, or
 /// headless (no prompts; defaults answer them).
@@ -68,12 +69,8 @@ section!(DaemonTerminalConfig {
     remote_input: bool
 });
 
-section!(DaemonNetworkConfig {
-    enabled: bool,
-    listen: ListenAddr,
-    tls_sans: Vec<TlsSan>,
-    features: Vec<FeatureName>,
-});
+section!(DaemonNetworkConfig { listeners: BTreeMap<String, ListenerConfig>, });
+section!(ListenerConfig { enabled: bool, listen: ListenAddr, transport: ListenerTransport, features: Vec<FeatureName>, tls_sans: Vec<TlsSan>, allowed_origins: Vec<BrowserOrigin>, });
 
 section!(FeaturesConfig {
     squad: SquadFeatureConfig,
@@ -141,10 +138,18 @@ pub struct TerminalSettings {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetworkSettings {
+    pub listeners: BTreeMap<String, ListenerSettings>,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListenerSettings {
+    pub name: String,
     pub enabled: bool,
     pub listen: ListenAddr,
-    pub tls_sans: Vec<TlsSan>,
+    pub transport: ListenerTransport,
     pub features: Vec<FeatureName>,
+    pub tls_sans: Vec<TlsSan>,
+    pub allowed_origins: Vec<BrowserOrigin>,
+    pub builtin: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -205,14 +210,7 @@ impl DaemonSettings {
                 remote_input: terminal.remote_input.unwrap_or(false),
             },
             network: NetworkSettings {
-                enabled: network.enabled.unwrap_or(false),
-                listen: network.listen.unwrap_or_else(|| {
-                    ListenAddr::parse("127.0.0.1:9876").expect("default listen address is valid")
-                }),
-                tls_sans: network.tls_sans.unwrap_or_default(),
-                features: network
-                    .features
-                    .unwrap_or_else(|| vec![FeatureName::Worker]),
+                listeners: super::network::resolve_listeners(&network),
             },
             squad: SquadSettings {
                 enabled: squad.enabled.unwrap_or(false),

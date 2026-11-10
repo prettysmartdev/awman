@@ -56,6 +56,8 @@ pub struct StatusResponse {
 }
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReloadResponse {
+    #[serde(default)]
+    pub effects: Vec<ReloadEffect>,
     pub applied: Vec<String>,
     pub restart_required: Vec<String>,
 }
@@ -463,4 +465,16 @@ mod worker_reload_tests {
         }
         assert_eq!(applied, after);
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "effect", rename_all = "snake_case")]
+pub enum ReloadEffect {
+    Rebound {
+        listener: String,
+        disconnected_clients: usize,
+    },
+    CertificateReloaded {
+        listener: String,
+    },
 }

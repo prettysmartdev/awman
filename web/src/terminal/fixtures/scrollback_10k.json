@@ -1,0 +1,98 @@
+{
+  "about": "10 000 lines of output through a 80x24 screen (bounded history)",
+  "expect": {
+    "alt_screen": false,
+    "app_cursor": false,
+    "bracketed_paste": false,
+    "cols": 80,
+    "cursor": {
+      "col": 0,
+      "row": 23,
+      "visible": true
+    },
+    "lines": [
+      "line 09977 xxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "line 09978 xxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "line 09979 xxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "line 09980 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "line 09981 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "line 09982 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "line 09983 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "line 09984 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "line 09985 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "line 09986 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "line 09987 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "line 09988 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "line 09989 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "line 09990 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "line 09991 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "line 09992 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "line 09993 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "line 09994 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "line 09995 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "line 09996 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "line 09997 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "line 09998 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "line 09999 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      ""
+    ],
+    "mouse_mode": "none",
+    "mouse_sgr": false,
+    "rows": 24
+  },
+  "expect_from_snapshot": {
+    "alt_screen": false,
+    "app_cursor": false,
+    "bracketed_paste": false,
+    "cursor": {
+      "col": 0,
+      "row": 23,
+      "visible": true
+    },
+    "lines": [
+      "line 09977 xxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "line 09978 xxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "line 09979 xxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "line 09980 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "line 09981 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "line 09982 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "line 09983 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "line 09984 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "line 09985 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "line 09986 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "line 09987 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "line 09988 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "line 09989 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "line 09990 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "line 09991 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "line 09992 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "line 09993 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "line 09994 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "line 09995 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "line 09996 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "line 09997 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "line 09998 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "line 09999 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      ""
+    ]
+  },
+  "final_snapshot": {
+    "cols": 80,
+    "has_output": true,
+    "rows": 24,
+    "screen": "G1s/MjVoG1ttG1tIG1tKbGluZSAwOTk3NyAbWzJteHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4DQobW21saW5lIDA5OTc4IBtbMm14eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4DQobW21saW5lIDA5OTc5IBtbMm14eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eA0KG1ttbGluZSAwOTk4MCAbWzJteHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4DQobW21saW5lIDA5OTgxIBtbMm14eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4DQobW21saW5lIDA5OTgyIBtbMm14eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eA0KG1ttbGluZSAwOTk4MyAbWzJteHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4DQobW21saW5lIDA5OTg0IBtbMm14eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4DQobW21saW5lIDA5OTg1IBtbMm14eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eA0KG1ttbGluZSAwOTk4NiAbWzJteHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4DQobW21saW5lIDA5OTg3IBtbMm14eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4DQobW21saW5lIDA5OTg4IBtbMm14eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eA0KG1ttbGluZSAwOTk4OSAbWzJteHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4DQobW21saW5lIDA5OTkwIBtbMm14eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4DQobW21saW5lIDA5OTkxIBtbMm14eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eA0KG1ttbGluZSAwOTk5MiAbWzJteHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4DQobW21saW5lIDA5OTkzIBtbMm14eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4DQobW21saW5lIDA5OTk0IBtbMm14eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eA0KG1ttbGluZSAwOTk5NSAbWzJteHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4DQobW21saW5lIDA5OTk2IBtbMm14eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4DQobW21saW5lIDA5OTk3IBtbMm14eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eA0KG1ttbGluZSAwOTk5OCAbWzJteHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4DQobW21saW5lIDA5OTk5IBtbMm14eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4DQobW20bPhtbPzFsG1s/MjAwNGw=",
+    "type": "snapshot"
+  },
+  "frames": [
+    {
+      "cols": 80,
+      "has_output": false,
+      "rows": 24,
+      "screen": "G1s/MjVoG1ttG1tIG1tKGz4bWz8xbBtbPzIwMDRs",
+      "type": "snapshot"
+    }
+  ],
+  "generated_output": "numbered_lines_10k",
+  "name": "scrollback_10k",
+  "source": "vt100-ctt 0.17.1 (TerminalHub mirror parser); snapshot = Screen::state_formatted()"
+}

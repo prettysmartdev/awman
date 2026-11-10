@@ -587,6 +587,7 @@ impl WorkflowPrerequisiteFlow {
     }
 
     fn announce_preflight(count: usize, frontend: &mut dyn WorkflowPrerequisiteFrontend) {
+        frontend.begin_workflow_prerequisites();
         frontend.write_message(UserMessage {
             level: MessageLevel::Info,
             text: format!("Checking {count} workflow prerequisites…"),

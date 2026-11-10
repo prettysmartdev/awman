@@ -50,6 +50,15 @@ macro_rules! constructors {
 }
 
 constructors! {
+    host_mismatch => ("host_mismatch", MISDIRECTED_REQUEST),
+    origin_not_allowed => ("origin_not_allowed", FORBIDDEN),
+    browser_grant_required => ("browser_grant_required", UNAUTHORIZED),
+    browser_grant_invalid => ("browser_grant_invalid", UNAUTHORIZED),
+    // WI 0159 browser pairing.
+    browser_ticket_invalid => ("browser_ticket_invalid", UNAUTHORIZED),
+    link_gone => ("link_gone", GONE),
+    link_not_found => ("link_not_found", NOT_FOUND),
+    rate_limited => ("rate_limited", TOO_MANY_REQUESTS),
     unauthorized => ("unauthorized", UNAUTHORIZED),
     forbidden_workdir => (failure_codes::FORBIDDEN_WORKDIR, FORBIDDEN),
     invalid_request => (failure_codes::INVALID_REQUEST, BAD_REQUEST),

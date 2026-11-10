@@ -96,6 +96,8 @@ fn register(
 
 fn network(actor: Option<&str>) -> ViewerIdentity {
     ViewerIdentity {
+        principal: crate::data::daemon_state::Principal::Owner,
+        listener_name: Some("default".into()),
         listener: CommandListener::Network,
         actor: actor.map(str::to_owned),
         annotations: Annotations::try_from_pairs([("rex/block", "b1")]).unwrap(),
@@ -121,7 +123,8 @@ fn list_filters_by_owner_and_hides_unserved_terminals_from_the_network() {
     assert_eq!(&mine.items[0].id, a.id());
     assert!(mine.items[0].id.as_str().starts_with("term_"));
 
-    f.policy.lock().unwrap().network_features = vec![FeatureName::Worker];
+    f.policy.lock().unwrap().network_features =
+        [("default".into(), vec![FeatureName::Worker])].into();
     let net = f
         .ops
         .list(None, &ListQuery::default(), &network(None))
@@ -183,7 +186,8 @@ fn resolve_target_picks_the_open_terminal_and_honours_step() {
 #[test]
 fn input_is_refused_without_both_settings() {
     let f = fixture();
-    f.policy.lock().unwrap().network_features = vec![FeatureName::Worker];
+    f.policy.lock().unwrap().network_features =
+        [("default".into(), vec![FeatureName::Worker])].into();
     let owner = TerminalOwner::Command(CommandId::new());
     let (handle, _rx) = register(&f.ops, owner.clone(), None, true);
     let mut session = f.ops.open(handle.id(), network(Some("webapp"))).unwrap();
@@ -213,7 +217,7 @@ fn take_control_is_exclusive_and_logged() {
     let f = fixture();
     {
         let mut p = f.policy.lock().unwrap();
-        p.network_features = vec![FeatureName::Worker];
+        p.network_features = [("default".into(), vec![FeatureName::Worker])].into();
         p.remote_input = true;
     }
     let owner = TerminalOwner::Command(CommandId::new());
@@ -382,7 +386,7 @@ fn revoked_remote_input_stops_an_existing_holder() {
     let f = fixture();
     {
         let mut policy = f.policy.lock().unwrap();
-        policy.network_features = vec![FeatureName::Worker];
+        policy.network_features = [("default".into(), vec![FeatureName::Worker])].into();
         policy.remote_input = true;
     }
     let owner = TerminalOwner::Command(CommandId::new());
@@ -436,7 +440,8 @@ fn revoked_remote_input_stops_an_existing_holder() {
 #[tokio::test]
 async fn network_output_stops_when_the_feature_is_no_longer_served() {
     let f = fixture();
-    f.policy.lock().unwrap().network_features = vec![FeatureName::Worker];
+    f.policy.lock().unwrap().network_features =
+        [("default".into(), vec![FeatureName::Worker])].into();
     let owner = TerminalOwner::Command(CommandId::new());
     let (handle, _rx) = register(&f.ops, owner, None, false);
     let mut session = f.ops.open(handle.id(), network(Some("review"))).unwrap();

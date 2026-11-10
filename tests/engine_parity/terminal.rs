@@ -110,6 +110,8 @@ async fn hub_reconnect_snapshot_resize_input_owner_filter_and_exit_match_builtin
         .open(
             remote.id(),
             ViewerIdentity {
+                principal: awman::data::daemon_state::Principal::Owner,
+                listener_name: Some("default".into()),
                 listener: crate::data::daemon_state::CommandListener::Local,
                 actor: None,
                 annotations: Default::default(),

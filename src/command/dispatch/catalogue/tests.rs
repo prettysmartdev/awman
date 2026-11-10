@@ -675,6 +675,7 @@ fn config_and_transport_clients_can_run_without_a_local_runtime() {
             "daemon start",
             "daemon status",
             "daemon stop",
+            "link",
             // Writes a definition file and never builds.
             "new agent",
             "queue",

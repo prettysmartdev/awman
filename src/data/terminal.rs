@@ -276,6 +276,8 @@ impl ControlHolder {
 /// from the connection (listener, headers, CLI flags); judged by Layer 2.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ViewerIdentity {
+    pub principal: crate::data::daemon_state::Principal,
+    pub listener_name: Option<String>,
     pub listener: CommandListener,
     /// The `x-awman-actor` header, when a network client sent one.
     pub actor: Option<String>,
@@ -288,6 +290,8 @@ impl ViewerIdentity {
     pub fn local() -> Self {
         Self {
             listener: CommandListener::Local,
+            principal: crate::data::daemon_state::Principal::Owner,
+            listener_name: None,
             actor: None,
             annotations: Annotations::new(),
             read_only: false,

@@ -21,6 +21,7 @@
 //! put in an event, a frame or the store.
 
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
@@ -92,6 +93,8 @@ pub enum HostError {
     /// 404 `not_found`.
     #[error("dialog not found")]
     UnknownDialog,
+    #[error("directory is outside the launch contexts")]
+    DirOutsideContext,
     /// 400 `invalid_annotation`.
     #[error(transparent)]
     InvalidAnnotation(#[from] AnnotationError),
@@ -108,6 +111,7 @@ impl HostError {
             Self::NotFound | Self::UnknownTab | Self::UnknownDialog => "not_found",
             Self::InvalidAnnotation(_) => AnnotationError::CODE,
             Self::Draining => "feature_disabled",
+            Self::DirOutsideContext => "dir_outside_context",
             Self::Command(error) => error.code(),
         }
     }
@@ -233,7 +237,7 @@ impl InstanceOpener for StartupOpener {
             HostedOptions {
                 id,
                 kind: match kind {
-                    FrontendKindWire::Tui => FrontendKind::RELAYED_TUI,
+                    FrontendKindWire::Tui | FrontendKindWire::Web => FrontendKind::RELAYED_TUI,
                     FrontendKindWire::Cli => FrontendKind::RELAYED_CLI,
                 },
                 hub: Some(hub),
@@ -290,6 +294,7 @@ struct InstanceState {
     /// The primary's environment, cwd and argv: memory only, dropped at end.
     env: Option<EnvSnapshot>,
     annotations: Annotations,
+    context_roots: Vec<PathBuf>,
     primary_kind: Option<FrontendKindWire>,
     frontends: Vec<FrontendRecord>,
     tabs: Vec<TabRelay>,
@@ -391,6 +396,7 @@ pub struct EngineInstanceHost {
     share: AtomicUsize,
     settings: Mutex<Option<EngineSettings>>,
     pump_started: AtomicBool,
+    launch_contexts: Mutex<super::launch_contexts::LaunchContextRegistry>,
 }
 
 /// The presenters' view of the host's annotation store (namespace already
@@ -496,8 +502,19 @@ impl EngineInstanceHost {
                 share: AtomicUsize::new(0),
                 settings: Mutex::new(None),
                 pump_started: AtomicBool::new(false),
+                launch_contexts: Mutex::new(Default::default()),
             }
         })
+    }
+
+    pub fn configure_launch_contexts(&self, path: PathBuf, env: EnvSnapshot) {
+        *self.launch_contexts.lock().unwrap() =
+            super::launch_contexts::LaunchContextRegistry::open(path, env);
+    }
+    pub fn launch_contexts(&self) -> MutexGuard<'_, super::launch_contexts::LaunchContextRegistry> {
+        self.launch_contexts
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
     }
 
     fn list_instances(&self) -> Vec<Arc<HostedInstance>> {
@@ -563,6 +580,7 @@ impl EngineInstanceHost {
                 instance: None,
                 env: None,
                 annotations,
+                context_roots: vec![],
                 primary_kind: None,
                 frontends: Vec::new(),
                 tabs: Vec::new(),
@@ -925,6 +943,15 @@ impl EngineInstanceHost {
             let mut state = hosted.state();
             let draining = self.draining.load(Ordering::SeqCst);
             let tab_ids: Vec<TabId> = state.tabs.iter().map(|t| t.tab_id().clone()).collect();
+            if (hello.resume.is_some() && state.primary_kind != Some(hello.kind))
+                || (hello.kind == FrontendKindWire::Web
+                    && hello.role == FrontendRole::Secondary
+                    && state.primary_kind != Some(FrontendKindWire::Web))
+            {
+                return Err(AttachRefusal::ProtocolError(
+                    "frontend kind does not match the instance".into(),
+                ));
+            }
             admit(
                 &hello,
                 draining,
@@ -1049,14 +1076,30 @@ impl EngineInstanceHost {
         hosted: &Arc<HostedInstance>,
         hello: &Hello,
     ) -> Result<Outbox, CommandError> {
-        let env = EnvSnapshot::from_instance_env(
-            hello.env.clone().into_inner().into_iter().collect(),
-            hello.cwd.clone(),
-            hello.argv.clone(),
-        );
+        let (env, stale, roots) = if hello.kind == FrontendKindWire::Web {
+            let contexts = self.launch_contexts();
+            let id = hello
+                .launch_context
+                .as_ref()
+                .ok_or_else(|| CommandError::Other("missing launch_context".into()))?;
+            let (env, stale) = contexts
+                .resolve_env(id)
+                .map_err(|e| CommandError::Other(e.to_string()))?;
+            (env, stale, contexts.roots())
+        } else {
+            (
+                EnvSnapshot::from_instance_env(
+                    hello.env.clone().into_inner().into_iter().collect(),
+                    hello.cwd.clone(),
+                    hello.argv.clone(),
+                ),
+                false,
+                vec![],
+            )
+        };
         let request = OpenInstanceRequest {
             kind: hello.kind,
-            input_available: hello.stdin_is_tty,
+            input_available: hello.kind == FrontendKindWire::Web || hello.stdin_is_tty,
             id: hosted.id.clone(),
             env: env.clone(),
             term_size: hello.term_size,
@@ -1080,7 +1123,11 @@ impl EngineInstanceHost {
         let size = (hello.term_size.cols, hello.term_size.rows);
         let mut state = hosted.state();
         state.env = Some(env);
+        state.context_roots = roots;
         state.notices = notices;
+        if stale {
+            state.notices.push(format!("Environment stale; run awman daemon api launch_contexts.refresh id={} from the context root to refresh shell PATH and credentials.", hello.launch_context.as_ref().expect("web context resolved")));
+        }
         let mut events = Vec::new();
         match initial {
             InitialTabOpened::Normal { tab } => {
@@ -1208,9 +1255,21 @@ impl EngineInstanceHost {
             return Err(HostError::Draining);
         }
         let hosted = self.find(id).ok_or(HostError::NotFound)?;
-        let (instance, size) = {
+        let (instance, size, dir) = {
             let state = hosted.state();
-            (state.running()?, Self::frontend_size(&state, from))
+            let dir = if state.primary_kind == Some(FrontendKindWire::Web)
+                && options.kind != TabKindWire::Squad
+            {
+                super::launch_contexts::LaunchContextRegistry::resolve_dir(
+                    &state.context_roots,
+                    state.env.as_ref().ok_or(HostError::NotFound)?.cwd(),
+                    &dir,
+                )
+                .map_err(|_| HostError::DirOutsideContext)?
+            } else {
+                dir
+            };
+            (state.running()?, Self::frontend_size(&state, from), dir)
         };
         let kind = options.kind.clone();
         let opened = if kind == TabKindWire::Squad {
@@ -1894,6 +1953,33 @@ impl FrontendSession {
         };
         let id = &self.instance_id;
         let me = &self.frontend_id;
+        // A web secondary inherits the instance but cannot perform the
+        // primary's close/quit actions. Native frontend behavior is unchanged.
+        if self.role == FrontendRole::Secondary
+            && matches!(
+                &frame,
+                FrontendFrame::Quit
+                    | FrontendFrame::CloseTab { .. }
+                    | FrontendFrame::UiRequest(UiRequest::CloseTab { .. })
+            )
+        {
+            if let Some(hosted) = host.find(id) {
+                let state = hosted.state();
+                if state
+                    .frontend(me)
+                    .is_some_and(|f| f.summary.kind == FrontendKindWire::Web)
+                {
+                    state.send_to(
+                        me,
+                        EngineFrame::Notice {
+                            level: MessageLevel::Error,
+                            text: "only the primary frontend may close tabs or quit".into(),
+                        },
+                    );
+                    return Ok(());
+                }
+            }
+        }
         match frame {
             FrontendFrame::WorkerQueue {
                 request_id,
@@ -1932,7 +2018,24 @@ impl FrontendSession {
             }
             FrontendFrame::OpenTab { dir, options } => {
                 if let Err(error) = host.open_tab(id, Some(me), dir, options) {
+                    let detail = serde_json::to_string(&ErrorWire {
+                        code: error.code().into(),
+                        message: error.to_string(),
+                    })
+                    .unwrap();
                     self.reply_error(&host, None, error);
+                    if let Some(hosted) = host.find(id) {
+                        hosted.state().send_to(
+                            me,
+                            EngineFrame::UiAck {
+                                request_seq: seq,
+                                outcome: UiOutcome {
+                                    detail: Some(detail),
+                                    ..Default::default()
+                                },
+                            },
+                        );
+                    }
                 }
             }
             FrontendFrame::CloseTab { tab_id } => {
@@ -2023,10 +2126,21 @@ impl FrontendSession {
                 }
             }
             FrontendFrame::UiRequest(request) => {
-                let outcome = host
-                    .ui_request(id, Some(me.clone()), request)
-                    .await
-                    .unwrap_or_default();
+                let outcome = match host.ui_request(id, Some(me.clone()), request).await {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        let detail = serde_json::to_string(&ErrorWire {
+                            code: error.code().into(),
+                            message: error.to_string(),
+                        })
+                        .unwrap();
+                        self.reply_error(&host, None, error);
+                        UiOutcome {
+                            detail: Some(detail),
+                            ..Default::default()
+                        }
+                    }
+                };
                 if let Some(hosted) = host.find(id) {
                     hosted.state().send_to(
                         me,

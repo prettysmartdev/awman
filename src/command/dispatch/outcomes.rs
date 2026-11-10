@@ -29,6 +29,7 @@ pub enum CommandOutcome {
     Specs(crate::command::commands::specs::SpecsOutcome),
     Clean(crate::command::commands::clean::CleanOutcome),
     /// Trivial wrapper used by no-op leaf commands during the refactor.
+    Link(String),
     Empty,
 }
 

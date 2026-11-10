@@ -200,7 +200,9 @@ async fn spawn_network(
 ) -> Option<(std::net::SocketAddr, tokio::task::JoinHandle<()>)> {
     let app = awman::frontend::api::routes::build_router_for_listener(
         api,
-        awman::frontend::api::routes::ListenerPolicy::Network,
+        awman::frontend::api::routes::ListenerPolicy::Network {
+            name: "default".into(),
+        },
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.ok()?;
     let addr = listener.local_addr().unwrap();

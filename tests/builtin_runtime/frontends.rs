@@ -116,7 +116,7 @@ impl Project {
                 "builtin": {
                     "stateDir": state.path().join("s"),
                     "imageSource": {"type": "archive", "path": archive},
-                    "network": {"mode": "none"}
+                    "network":{"mode": "none"}
                 }
             }))
             .unwrap(),

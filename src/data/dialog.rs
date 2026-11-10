@@ -109,7 +109,7 @@ pub enum DialogResponse {
     Text(String),
     /// The answer to a `SecretInput`. Wrapped in a `SecretString` before it
     /// leaves the dialog; its `Debug` is redacted.
-    #[serde(with = "crate::data::secret::local_socket_wire")]
+    #[serde(with = "crate::data::secret::frontend_wire")]
     Secret(crate::data::secret::SecretString),
     Index(usize),
     Char(char),

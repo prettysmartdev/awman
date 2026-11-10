@@ -95,7 +95,7 @@ impl InstanceOpener for Opener {
             HostedOptions {
                 id: request.id,
                 kind: match request.kind {
-                    FrontendKindWire::Tui => {
+                    FrontendKindWire::Tui | FrontendKindWire::Web => {
                         crate::command::dispatch::catalogue::FrontendKind::RELAYED_TUI
                     }
                     FrontendKindWire::Cli => {
@@ -288,6 +288,7 @@ impl Daemon {
             stdout_is_tty: true,
             view: None,
             resume: None,
+            launch_context: None,
         }
     }
     pub async fn remote(&self) -> Arc<crate::command::instance::remote::RemoteInstanceBackend> {
@@ -342,6 +343,23 @@ pub fn copy_test_executable(destination: &Path) {
                 std::thread::sleep(std::time::Duration::from_millis(10))
             }
             Err(e) => panic!("copy executing harness: {e}"),
+        }
+    }
+}
+
+/// A concurrent fork can retain the copy's writer until it execs. Retry only
+/// ETXTBSY: the target program has not run when exec refuses the busy inode.
+pub fn output_test_executable(command: &mut std::process::Command) -> std::process::Output {
+    let deadline = Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        match command.output() {
+            Err(error)
+                if error.kind() == std::io::ErrorKind::ExecutableFileBusy
+                    && Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            result => return result.expect("run copied test executable"),
         }
     }
 }

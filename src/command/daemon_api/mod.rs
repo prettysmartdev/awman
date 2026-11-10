@@ -1,4 +1,5 @@
 //! Resource operations shared by the daemon transports and clients.
+pub mod browser;
 pub mod capabilities;
 pub mod core;
 // WI 0142: typed `/v1/engine/*` operations (filled by engine-api-routes).
@@ -69,6 +70,11 @@ impl DaemonApi {
                                 "daemon.features.worker.enabled",
                                 serde_json::json!(true),
                             );
+                            crate::data::config::config_json::set_config_field(
+                                &mut doc,
+                                "daemon.network.listeners.default.enabled",
+                                serde_json::json!(true),
+                            );
                             crate::data::config::ConfigFile::from_value(
                                 doc,
                                 crate::data::config::FileKind::Global,
@@ -101,3 +107,5 @@ impl From<Arc<worker::WorkerApi>> for DaemonApi {
         Self::for_worker_tests(value)
     }
 }
+
+pub mod web_projections;

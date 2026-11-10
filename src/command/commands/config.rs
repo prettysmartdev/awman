@@ -327,7 +327,10 @@ fn row(
 
 /// The names bound at a map path in any of `docs`.
 fn names_at(docs: &[&serde_json::Value], map_path: &str) -> Vec<String> {
-    let mut names = Vec::new();
+    let mut names: Vec<String> = crate::data::config::fields::builtin_member_names(map_path)
+        .iter()
+        .map(|n| (*n).to_string())
+        .collect();
     for doc in docs {
         let node = map_path.split('.').try_fold(*doc, |v, part| v.get(part));
         for name in node

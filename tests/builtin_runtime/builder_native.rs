@@ -345,7 +345,7 @@ impl Scenario {
                     "stateDir": state.path().join("s"),
                     "builder": {"enabled": true},
                     "imageSource": source,
-                    "network": {"mode": "none"}
+                    "network":{"mode": "none"}
                 }
             }))
             .unwrap(),

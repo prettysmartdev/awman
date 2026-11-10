@@ -108,6 +108,14 @@ impl DaemonPaths {
     pub fn api_keys_file(&self) -> PathBuf {
         self.root.join("api_keys.json")
     }
+    /// Browser grant metadata (hashes only), owner-private like the keys.
+    pub fn launch_contexts_file(&self) -> PathBuf {
+        self.root.join("launch_contexts.json")
+    }
+
+    pub fn browser_grants_file(&self) -> PathBuf {
+        self.root.join("browser_grants.json")
+    }
     pub fn tls_dir(&self) -> PathBuf {
         self.root.join("tls")
     }

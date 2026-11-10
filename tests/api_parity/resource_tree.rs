@@ -114,7 +114,12 @@ async fn listener_policy_hides_unlisted_and_owner_routes_but_reports_disabled_fe
     let state = super::http_consistency::state(root.path());
     let api = Arc::new(DaemonApi::for_worker_tests(state));
     let (_, key) = api.runtime.keys().create("remote").unwrap();
-    let router = build_router_for_listener(api, ListenerPolicy::Network);
+    let router = build_router_for_listener(
+        api,
+        ListenerPolicy::Network {
+            name: "default".into(),
+        },
+    );
     for auth in [None, Some("invalid"), Some(key.as_str())] {
         for (method, path, want) in [
             ("GET", "/v1/keys", 404),
@@ -208,7 +213,7 @@ async fn reload_validates_before_applying_and_keeps_restart_only_settings_inacti
     std::fs::write(
         &file,
         serde_json::json!({"daemon":{
-            "maxConcurrentJobs":3, "verboseSetup":true, "network":{"listen":"127.0.0.1:7777"},
+            "maxConcurrentJobs":3, "verboseSetup":true, "network":{"listeners":{"default":{"listen":"127.0.0.1:7777"}}},
             "features":{"worker":{"enabled":true,"push":{"workDirs":{"allow":[allowed]}}}}
         }})
         .to_string(),
@@ -223,13 +228,17 @@ async fn reload_validates_before_applying_and_keeps_restart_only_settings_inacti
     assert!(response["restart_required"]
         .as_array()
         .unwrap()
-        .contains(&serde_json::json!("daemon.network.listen")));
+        .contains(&serde_json::json!(
+            "daemon.network.listeners.default.listen"
+        )));
     {
         let live = state.live_config.read().unwrap();
         assert_eq!(live.as_ref().unwrap().daemon().max_concurrent_jobs, 3);
         assert!(live.as_ref().unwrap().daemon().verbose_setup);
         assert_eq!(
-            live.as_ref().unwrap().daemon().network.listen.to_string(),
+            live.as_ref().unwrap().daemon().network.listeners["default"]
+                .listen
+                .to_string(),
             "127.0.0.1:9876"
         );
     }

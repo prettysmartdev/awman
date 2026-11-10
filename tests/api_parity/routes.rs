@@ -60,6 +60,12 @@ fn api_paths_tls_dir_under_root() {
 /// `/v1/worker/commands/{id}/events`, and added `GET /v1/worker/sessions/:id/queue` and
 /// `GET /v1/worker/commands/:id/status`. WI 0138 added `GET /v1/worker/commands/:id`.
 const EXPECTED_ROUTES: &[(&str, &str)] = &[
+    ("GET", "/v1/engine/launch_contexts"),
+    ("POST", "/v1/engine/launch_contexts"),
+    ("POST", "/v1/engine/launch_contexts/{id}/refresh"),
+    ("DELETE", "/v1/engine/launch_contexts/{id}"),
+    ("GET", "/v1/engine/catalogue"),
+    ("GET", "/v1/engine/prompts"),
     ("GET", "/v1/engine/instances"),
     ("POST", "/v1/engine/instances"),
     ("GET", "/v1/engine/instances/{id}"),
@@ -129,6 +135,14 @@ const EXPECTED_ROUTES: &[(&str, &str)] = &[
     ("GET", "/v1/squad/env"),
     ("PUT", "/v1/squad/env"),
     ("DELETE", "/v1/squad/env"),
+    // WI 0159 browser pairing.
+    ("POST", "/v1/browser-links"),
+    ("GET", "/v1/browser-links"),
+    ("POST", "/v1/browser-links/{id}/poll"),
+    ("POST", "/v1/browser-links/{id}/decision"),
+    ("GET", "/v1/browsers"),
+    ("DELETE", "/v1/browsers/{id}"),
+    ("POST", "/v1/browser-tickets"),
 ];
 #[test]
 fn route_table_has_exactly_the_contract_and_one_owner_per_operation() {

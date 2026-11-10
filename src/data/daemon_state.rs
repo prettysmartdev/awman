@@ -98,6 +98,7 @@ impl CommandListener {
 }
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CommandRequestContext {
+    pub listener_name: Option<String>,
     pub listener: CommandListener,
     pub trace_parent: Option<String>,
 }
@@ -126,7 +127,31 @@ impl CommandRequestContext {
         };
         Self {
             listener,
+            listener_name: None,
             trace_parent: header.filter(valid).map(str::to_string),
+        }
+    }
+}
+
+/// Authentication identity; browser grants and API keys are separate authorities.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Principal {
+    Owner,
+    ApiKey {
+        id: String,
+    },
+    Browser {
+        grant_id: String,
+        origin: String,
+        listener: String,
+    },
+}
+impl Principal {
+    pub fn audit_id(&self) -> &str {
+        match self {
+            Self::Owner => "owner",
+            Self::ApiKey { id } => id,
+            Self::Browser { grant_id, .. } => grant_id,
         }
     }
 }

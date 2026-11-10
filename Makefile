@@ -86,6 +86,18 @@ test-fast:
 	@AWMAN_TEST_TMPROOT="$(AWMAN_TEST_TMPROOT)" bash tools/isolated-test.sh -- --quiet --skip real_git --skip real_network --skip builtin_hw --skip latency::
 	@AWMAN_TEST_TMPROOT="$(AWMAN_TEST_TMPROOT)" bash tools/isolated-test.sh -p awman-cli --test engine_parity latency:: -- --quiet --test-threads=1
 
+# Separate from the binary gates. Missing web/edge artifacts are a hard error,
+# not an implicit skip or a transport-only acceptance pass.
+.PHONY: test-web
+test-web:
+	@test -f web/package.json && test -f web/edge/package.json || { echo 'WI 0159: web/edge implementation is missing' >&2; exit 1; }
+	pnpm --dir web run check
+	pnpm --dir web/edge run check
+	cargo build --workspace --bins
+	pnpm --dir web/e2e install --frozen-lockfile --ignore-scripts
+	pnpm --dir web/e2e run check
+	pnpm --dir web/e2e test
+
 # Only the targets that exercise the builtin runtime: every test executable links the
 # whole embedded VM stack (hundreds of MB each in debug), so building all of them
 # with the feature is needlessly slow and can exhaust memory or disk on CI runners.

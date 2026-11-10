@@ -6,6 +6,25 @@ awman is built around a simple principle: agents never run on your host machine.
 
 ## The containment model
 
+The browser frontend is intended for same-machine access through the daemon's
+loopback listener. The v0 web app cannot connect to a daemon on another
+machine. Browser origins are configured per listener with
+`daemon.network.listeners.<name>.allowedOrigins`; this is an origin allowlist,
+not itself authentication. A browser must also be approved with `awman link
+web-<code>`; the resulting grant can be listed or revoked through the local
+daemon API. See the [Web App guide](20-webapp.md) for setup and usage
+reporting.
+
+The owner decides how much the loopback listener exposes. Browser grants are
+scoped to the engine on that one listener; they can never create API keys,
+change configuration or reach worker routes, and the browser cannot supply its
+own shell environment, executable paths or mount roots. If you suspect a browser
+or the hosted site has been compromised, revoke its grants with
+`awman daemon api browsers.delete id=<browser-id>`, then disable the listener
+(`awman config set daemon.network.listeners.loopback.enabled false`) or remove
+`engine` from its `features`. Both changes apply live and close that listener's
+browser connections.
+
 By default, an agent environment:
 
 - Sees only your current Git repository (mounted via bind mount or virtiofs)
@@ -252,7 +271,11 @@ If you configure `workflows.prerequisites.githubToken.acquire.argv`, awman may r
 
 When the TUI runs on the [daemon engine](19-engine-and-frontends.md), nothing about containment changes: agents still run only in containers, with the same mounts and checks.
 
-- **Local only.** The engine API and the connection a TUI makes to it are served on the daemon's owner-only local socket (or named pipe) and are never exposed through the network listener, even when the engine is enabled persistently.
+- **Same-machine browser access.** The TUI engine uses the owner-only local
+  socket or named pipe. Browser access is designed for a separate loopback
+  listener and cannot connect to a daemon on another machine. Browser grants
+  are approved by the owner on the daemon's local CLI and can be revoked
+  through the local daemon API; see the [Web App guide](20-webapp.md).
 - **Shell environment.** So that commands behave as they would in your own shell, the TUI sends its environment to the engine when it connects. The engine keeps it in memory for that instance only; it is never written to disk, config, the database or logs, and it is dropped when the instance ends. It is not passed wholesale to containers: containers receive only what they would receive from a builtin TUI.
 - **Secrets.** Secret dialog answers (such as a token you type) are sent only over the local socket and are redacted everywhere else.
 

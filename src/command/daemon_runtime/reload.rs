@@ -43,6 +43,16 @@ impl DaemonRuntime {
             );
             if key.live {
                 for path in changed {
+                    let parts: Vec<_> = path.split('.').collect();
+                    if parts.len() == 5
+                        && parts[..3] == ["daemon", "network", "listeners"]
+                        && current.value()["daemon"]["network"]["listeners"]
+                            .get(parts[3])
+                            .is_none()
+                    {
+                        response.restart_required.push(path);
+                        continue;
+                    }
                     crate::data::config::config_json::set_config_field(
                         &mut live,
                         &path,
@@ -64,7 +74,23 @@ impl DaemonRuntime {
             FlagConfig::default(),
             env,
         )?;
+        let mut acknowledgement = self.network.applied.subscribe();
         self.apply_config_locked(live).await?;
+        if self.network.hosting.load(Ordering::Acquire) {
+            let generation = self.network.tx.borrow().generation;
+            let applied = async {
+                loop {
+                    let (seen, effects) = acknowledgement.borrow_and_update().clone();
+                    if seen >= generation {
+                        return Ok::<_, tokio::sync::watch::error::RecvError>(effects);
+                    }
+                    acknowledgement.changed().await?;
+                }
+            };
+            if let Ok(Ok(effects)) = tokio::time::timeout(Duration::from_secs(5), applied).await {
+                response.effects = effects;
+            }
+        }
         Ok(response)
     }
     pub(crate) async fn apply_config_locked(
@@ -72,6 +98,8 @@ impl DaemonRuntime {
         live: EffectiveConfig,
     ) -> Result<(), CommandError> {
         let settings = live.daemon();
+        crate::data::config::network::validate_listeners(&settings.network.listeners)
+            .map_err(|e| CommandError::Other(format!("invalid listeners: {e:?}")))?;
         if settings.squad.enabled || settings.worker.enabled {
             crate::command::commands::squad::runtime_guard::require_container_tier(&self.engines)?;
         }
@@ -114,23 +142,11 @@ impl DaemonRuntime {
         // Certificate writes follow feature preparation/start staging, so a
         // database refusal cannot replace the certificate on disk underneath
         // the listener that continues using the previous configuration.
-        let prepared_tls: Result<_, CommandError> = if settings.network.enabled {
-            self.engines
-                .auth_engine
-                .ensure_network_tls(
-                    self.daemon_paths(),
-                    settings
-                        .network
-                        .listen
-                        .ip()
-                        .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED.into()),
-                    &settings.network.tls_sans,
-                )
-                .map(|(identity, _)| Some(identity))
-                .map_err(Into::into)
-        } else {
-            Ok(None)
-        };
+        let prepared_tls = network::prepare_tls(
+            &self.engines.auth_engine,
+            self.daemon_paths(),
+            &settings.network,
+        );
         let tls = match prepared_tls {
             Ok(tls) => tls,
             Err(error) => {
@@ -138,16 +154,20 @@ impl DaemonRuntime {
                 return Err(error);
             }
         };
+        let previous_network = self.config().daemon().network;
+        self.network
+            .revoke_browser_grants(network::browser_revocations_between(
+                &previous_network,
+                &settings.network,
+            ));
         self.squad_feature
             .apply_settings(settings.squad.clone())
             .await;
         *self.worker.live_config.write().unwrap() = Some(live.clone());
         *self.config.write().unwrap() = live;
-        self.network.tx.send_replace(NetworkDesired {
-            enabled: settings.network.enabled,
-            listen: settings.network.listen.clone(),
-            tls,
-        });
+        let desired =
+            ListenersDesired::new(&settings.network, tls, Some(&self.network.tx.borrow()));
+        self.network.tx.send_replace(desired);
         self.preparing.write().unwrap().clear();
         self.core.executor().set_cap(settings.max_concurrent_jobs);
         (self.apply_worker)(settings.worker.clone());

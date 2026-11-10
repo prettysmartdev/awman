@@ -22,7 +22,9 @@ use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{MethodFilter, MethodRouter};
 use axum::Json;
+use tracing::instrument::WithSubscriber;
 
+use crate::command::daemon_api::browser::{may_view_terminal, BrowserPrincipal};
 use crate::command::daemon_api::terminals::{terminals_get, terminals_list, terminals_open};
 use crate::command::daemon_api::{DaemonApi, Operation};
 use crate::command::terminals::{TerminalRefusal, TerminalSession};
@@ -33,6 +35,7 @@ use crate::data::terminal::{
     TerminalFrame, ViewerIdentity, ACTOR_HEADER, TERMINAL_SUBPROTOCOL,
 };
 use crate::data::wire::ListQuery;
+use crate::engine::auth::browser_grants::GrantWatch;
 
 use super::error::ApiError;
 
@@ -121,6 +124,8 @@ fn viewer_identity(
             .map_err(invalid_annotation)?;
     }
     Ok(ViewerIdentity {
+        principal: crate::data::daemon_state::Principal::Owner,
+        listener_name: None,
         listener,
         // Local attaches are `local`; the header names network clients only.
         actor: (listener == CommandListener::Network)
@@ -129,6 +134,24 @@ fn viewer_identity(
         annotations,
         read_only,
     })
+}
+
+/// Resolves when a browser grant ends; never for other viewers.
+async fn grant_ended(grant: Option<&GrantWatch>) -> &'static str {
+    match grant {
+        Some(grant) => grant.ended().await.close_reason(),
+        None => std::future::pending().await,
+    }
+}
+
+/// Set the authenticated principal. A browser viewer is an instance
+/// frontend named by its grant (D13): `x-awman-actor` is ignored and the
+/// input holder is `Actor(<grant id>)`.
+fn browser_viewer(viewer: &mut ViewerIdentity, principal: crate::data::daemon_state::Principal) {
+    if let Some(browser) = BrowserPrincipal::from_principal(&principal) {
+        viewer.actor = Some(browser.grant_id.to_string());
+    }
+    viewer.principal = principal;
 }
 
 fn listener_of(listener: Option<axum::Extension<CommandListener>>) -> CommandListener {
@@ -146,7 +169,11 @@ fn flag(value: &str) -> Result<bool, ApiError> {
 /// `GET /v1/terminals?owner_id=…&limit=&cursor=` → `{items, next_cursor}`.
 async fn handle_list(
     State(api): State<Arc<DaemonApi>>,
-    listener: Option<axum::Extension<CommandListener>>,
+    (listener, receiving, principal): (
+        Option<axum::Extension<CommandListener>>,
+        Option<axum::Extension<super::routes::ReceivingListener>>,
+        axum::Extension<crate::data::daemon_state::Principal>,
+    ),
     headers: HeaderMap,
     Query(pairs): Query<Vec<(String, String)>>,
 ) -> Response {
@@ -165,12 +192,21 @@ async fn handle_list(
             _ => {}
         }
     }
-    let viewer = match viewer_identity(listener_of(listener), &headers, false) {
+    let mut viewer = match viewer_identity(listener_of(listener), &headers, false) {
         Ok(viewer) => viewer,
         Err(error) => return error.into_response(),
     };
+    viewer.listener_name = receiving.map(|r| r.0 .0);
+    browser_viewer(&mut viewer, principal.0);
     match terminals_list(&api.terminals, owner_id.as_deref(), &page, &viewer) {
-        Ok(list) => Json(list).into_response(),
+        Ok(mut list) => {
+            // A browser sees only terminals of resources its grant may use.
+            if let Some(browser) = BrowserPrincipal::from_principal(&viewer.principal) {
+                list.items
+                    .retain(|record| may_view_terminal(&api, &browser, record));
+            }
+            Json(list).into_response()
+        }
         Err(refusal) => refusal_error(&refusal).into_response(),
     }
 }
@@ -180,8 +216,15 @@ async fn handle_list(
 /// upgrade, so a refused viewer gets an ordinary HTTP error.
 async fn handle_get(
     State(api): State<Arc<DaemonApi>>,
-    listener: Option<axum::Extension<CommandListener>>,
-    shutdown: Option<axum::Extension<tokio_util::sync::CancellationToken>>,
+    (listener, receiving, principal): (
+        Option<axum::Extension<CommandListener>>,
+        Option<axum::Extension<super::routes::ReceivingListener>>,
+        axum::Extension<crate::data::daemon_state::Principal>,
+    ),
+    (shutdown, grant): (
+        Option<axum::Extension<tokio_util::sync::CancellationToken>>,
+        Option<axum::Extension<GrantWatch>>,
+    ),
     headers: HeaderMap,
     AxumPath(id): AxumPath<String>,
     Query(pairs): Query<Vec<(String, String)>>,
@@ -206,10 +249,28 @@ async fn handle_get(
             }
         }
     }
-    let viewer = match viewer_identity(listener_of(listener), &headers, read_only) {
+    let mut viewer = match viewer_identity(listener_of(listener), &headers, read_only) {
         Ok(viewer) => viewer,
         Err(error) => return error.into_response(),
     };
+    viewer.listener_name = receiving.map(|r| r.0 .0);
+    browser_viewer(&mut viewer, principal.0);
+    // Browsers: ownership is checked on every read and again at upgrade
+    // (the ticket was checked when it was issued).
+    if let Some(browser) = BrowserPrincipal::from_principal(&viewer.principal) {
+        if upgrade.is_some() && grant.is_none() {
+            return ApiError::browser_ticket_invalid("the browser grant has ended").into_response();
+        }
+        let visible = api
+            .terminals
+            .hub()
+            .get(&id)
+            .ok()
+            .is_some_and(|record| may_view_terminal(&api, &browser, &record));
+        if !visible {
+            return ApiError::terminal_not_found("terminal not found").into_response();
+        }
+    }
     let Some(upgrade) = upgrade else {
         return match terminals_get(&api.terminals, &id, &viewer) {
             Ok(record) => Json(record).into_response(),
@@ -227,11 +288,13 @@ async fn handle_get(
         Err(refusal) => return refusal_error(&refusal).into_response(),
     };
     let shutdown = shutdown.map(|s| s.0).unwrap_or_default();
+    let grant = grant.map(|g| g.0);
+    // Only the real subprotocol is selected; a ticket offer is never echoed.
     upgrade
         .protocols([TERMINAL_SUBPROTOCOL])
         .max_message_size(MAX_CLIENT_MESSAGE_BYTES)
         .max_frame_size(MAX_CLIENT_MESSAGE_BYTES)
-        .on_upgrade(move |socket| serve_terminal_socket(socket, session, shutdown))
+        .on_upgrade(move |socket| serve_terminal_socket(socket, session, shutdown, grant))
 }
 
 fn offers_subprotocol(headers: &HeaderMap) -> bool {
@@ -267,6 +330,7 @@ async fn close(socket: &mut WebSocket, code: u16, reason: &'static str) {
             code,
             reason: reason.into(),
         })))
+        .with_subscriber(tracing::subscriber::NoSubscriber::default())
         .await;
 }
 
@@ -305,6 +369,7 @@ pub(super) async fn serve_terminal_socket(
     mut socket: WebSocket,
     mut session: TerminalSession,
     shutdown: tokio_util::sync::CancellationToken,
+    grant: Option<GrantWatch>,
 ) {
     loop {
         tokio::select! {
@@ -319,16 +384,16 @@ pub(super) async fn serve_terminal_socket(
                     close(&mut socket, 1000, "terminal exited").await;
                     break;
                 };
-                if socket.send(frame_message(&frame)).await.is_err() {
+                if socket.send(frame_message(&frame)).with_subscriber(tracing::subscriber::NoSubscriber::default()).await.is_err() {
                     break;
                 }
             }
-            message = socket.recv() => {
+            message = socket.recv().with_subscriber(tracing::subscriber::NoSubscriber::default()) => {
                 let Some(Ok(message)) = message else { break };
                 match client_step(&mut session, message) {
                     ClientStep::Continue => {}
                     ClientStep::Reply(reply) => {
-                        if socket.send(reply).await.is_err() {
+                        if socket.send(reply).with_subscriber(tracing::subscriber::NoSubscriber::default()).await.is_err() {
                             break;
                         }
                     }
@@ -344,6 +409,10 @@ pub(super) async fn serve_terminal_socket(
             }
             _ = shutdown.cancelled() => {
                 close(&mut socket, 1001, "listener stopping").await;
+                break;
+            }
+            reason = grant_ended(grant.as_ref()) => {
+                close(&mut socket, 1008, reason).await;
                 break;
             }
         }

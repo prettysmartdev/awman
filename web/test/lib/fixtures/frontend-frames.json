@@ -1,0 +1,143 @@
+[
+  {
+    "seq": 1,
+    "type": "hello",
+    "protocol": "awman.frontend.v1",
+    "build": "web-0.1.0",
+    "kind": "web",
+    "role": "primary",
+    "annotations": {},
+    "cwd": "",
+    "argv": [],
+    "env": {},
+    "term_size": {
+      "cols": 120,
+      "rows": 36
+    },
+    "stdin_is_tty": true,
+    "stdout_is_tty": true,
+    "view": null,
+    "resume": null,
+    "launch_context": "lc_0a1b2c3d4e5f60718293a4b5c6d7e8f9"
+  },
+  {
+    "seq": 2,
+    "type": "open_tab",
+    "dir": "/Users/me/src/awman/web",
+    "options": {
+      "kind": "normal",
+      "label": null,
+      "annotations": {},
+      "startup": "ready"
+    }
+  },
+  {
+    "seq": 3,
+    "type": "focus_tab",
+    "tab_id": "tab_a1b2c3d4e5f60718293a4b5c6d7e8f90"
+  },
+  {
+    "seq": 4,
+    "type": "ui_request",
+    "request": "next_tab"
+  },
+  {
+    "seq": 5,
+    "type": "submit",
+    "tab_id": "tab_a1b2c3d4e5f60718293a4b5c6d7e8f90",
+    "input": {
+      "source": "command_box",
+      "raw": "exec workflow implement-work-item"
+    },
+    "pty_size": {
+      "cols": 120,
+      "rows": 36
+    }
+  },
+  {
+    "seq": 6,
+    "type": "submit",
+    "tab_id": "tab_a1b2c3d4e5f60718293a4b5c6d7e8f90",
+    "input": {
+      "source": "argv",
+      "args": [
+        "config",
+        "show"
+      ]
+    },
+    "pty_size": {
+      "cols": 120,
+      "rows": 36
+    }
+  },
+  {
+    "seq": 7,
+    "type": "dialog_response",
+    "dialog_id": "dlg_6a7b8c9d0e1f20314253647586970a1b",
+    "response": {
+      "kind": "char",
+      "value": "c"
+    }
+  },
+  {
+    "seq": 8,
+    "type": "cancel",
+    "tab_id": "tab_a1b2c3d4e5f60718293a4b5c6d7e8f90",
+    "repeat": false
+  },
+  {
+    "seq": 9,
+    "type": "cancel_countdown",
+    "tab_id": "tab_a1b2c3d4e5f60718293a4b5c6d7e8f90",
+    "step_name": "implement"
+  },
+  {
+    "seq": 10,
+    "type": "workflow_request",
+    "tab_id": "tab_a1b2c3d4e5f60718293a4b5c6d7e8f90",
+    "request": {
+      "request": "open_control_board",
+      "step_name": "implement"
+    }
+  },
+  {
+    "seq": 11,
+    "type": "activity",
+    "tab_id": "tab_a1b2c3d4e5f60718293a4b5c6d7e8f90"
+  },
+  {
+    "seq": 12,
+    "type": "resize",
+    "cols": 100,
+    "rows": 30
+  },
+  {
+    "seq": 13,
+    "type": "ui_request",
+    "request": "set_container_window",
+    "tab_id": "tab_a1b2c3d4e5f60718293a4b5c6d7e8f90",
+    "slot_id": "7d0f5e2c-3b1a-4c9d-8e6f-2a1b3c4d5e6f",
+    "state": "maximized"
+  },
+  {
+    "seq": 14,
+    "type": "ui_request",
+    "request": "open_tab",
+    "dir": "/Users/me/src/awman"
+  },
+  {
+    "seq": 15,
+    "type": "ui_request",
+    "request": "focus_work",
+    "target_id": "task_0123456789abcdef0123456789abcdef"
+  },
+  {
+    "seq": 16,
+    "type": "close_tab",
+    "tab_id": "tab_0f9e8d7c6b5a49382716051f2e3d4c5b"
+  },
+  {
+    "seq": 17,
+    "type": "quit"
+  }
+]

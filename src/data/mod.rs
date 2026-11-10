@@ -7,6 +7,7 @@
 
 pub mod agent_output_format;
 pub mod api_lifecycle_store;
+pub mod browser_auth;
 pub mod builtin_runtime;
 #[cfg(unix)]
 pub mod builtin_state;
@@ -86,3 +87,5 @@ pub mod dialog;
 pub mod frontend_protocol;
 pub mod instance_snapshot;
 pub mod secret;
+
+pub mod launch_context;

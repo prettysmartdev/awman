@@ -144,3 +144,9 @@ pub fn daemon_api(ctx: &BuildContext) -> Result<BuiltCommand, CommandError> {
         crate::command::commands::daemon::api::DaemonApiCommand::from_input(ctx)?,
     ))
 }
+
+pub fn link(ctx: &BuildContext) -> Result<BuiltCommand, CommandError> {
+    Ok(BuiltCommand::Link(
+        crate::command::commands::link::LinkCommand::from_input(ctx)?,
+    ))
+}

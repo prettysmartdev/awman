@@ -1,4 +1,4 @@
-//! Secret data with an explicit local-socket-only serde adapter.
+//! Secret data with an explicit authenticated frontend serde adapter.
 
 /// Wrapper that keeps a credential value out of logs, `Debug` output and
 /// serialized payloads. Deliberately implements neither `Display` nor
@@ -65,8 +65,8 @@ impl std::fmt::Debug for SecretString {
     }
 }
 
-/// The sole serialization path for local dialog answers.
-pub mod local_socket_wire {
+/// The sole serialization path for authenticated frontend dialog answers.
+pub mod frontend_wire {
     use super::SecretString;
     use serde::{Deserialize, Deserializer, Serializer};
     pub fn serialize<S: Serializer>(
