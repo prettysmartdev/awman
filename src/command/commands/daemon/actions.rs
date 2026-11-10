@@ -34,6 +34,8 @@ pub enum ArgKind {
     Json,
     /// One value from a fixed enum.
     Enum(&'static [&'static str]),
+    /// Free text, sent as a JSON string.
+    Text,
     /// A terminal owner: `cmd_`, `tab_`, `lease_`, `run_` or `task_` (WI 0141).
     Owner,
 }
@@ -91,6 +93,21 @@ const ANNOTATION: ActionArg = ActionArg {
     where_: Location::Query,
     kind: ArgKind::Annotation,
 };
+/// `?state=` of `GET /v1/worker/leases` (WI 0143).
+const LEASE_STATES: &[&str] = &[
+    "active",
+    "claimed",
+    "preparing",
+    "running",
+    "awaiting_input",
+    "pushing",
+    "reporting",
+    "done",
+    "released",
+    "lost",
+];
+/// WSP release reasons (WI 0143).
+const RELEASE_REASONS: &[&str] = &["user_declined", "ineligible", "shutdown", "error"];
 const UI_REQUESTS: &[&str] = &[
     "open_tab",
     "next_tab",
@@ -165,6 +182,29 @@ pub const ACTIONS: &[Action] = &[
         path: "/v1/squad/runs/{id}/cancel",
         args: &[arg("id", Location::Path, ArgKind::Id("run"))],
         doc: "Cancel one squad run (id=run_…)",
+    },
+    Action {
+        name: "leases.list",
+        method: "GET",
+        path: "/v1/worker/leases",
+        args: &[
+            optional("server", ArgKind::Name),
+            optional("state", ArgKind::Enum(LEASE_STATES)),
+            optional("limit", ArgKind::Limit),
+            optional("cursor", ArgKind::Cursor),
+        ],
+        doc: "Worker leases, newest claim first (state=active for held ones)",
+    },
+    Action {
+        name: "leases.release",
+        method: "POST",
+        path: "/v1/worker/leases/{id}/release",
+        args: &[
+            arg("id", Location::Path, ArgKind::Id("lease")),
+            optional_body("reason", ArgKind::Enum(RELEASE_REASONS)),
+            optional_body("message", ArgKind::Text),
+        ],
+        doc: "Give a lease back to its work server (id=lease_…; reason defaults to user_declined)",
     },
     Action {
         name: "terminals.list",
@@ -242,7 +282,7 @@ pub const COMPOSITIONS: &[Composition] = &[
     Composition {
         name: "jobs.cancel feature=<worker|squad>",
         steps: &[
-            "worker: GET /v1/worker/commands?status=running, then jobs.cancel id=<each>",
+            "worker: GET /v1/worker/commands?status=running, then jobs.cancel id=<each> (pushed and pulled jobs); then GET /v1/worker/leases?state=active and leases.release id=<each> reason=error for leases whose job was not cancelled",
             "squad: GET /v1/squad/tasks, GET /v1/squad/tasks/{id}/runs?status=running, then jobs.cancel id=<each>",
         ],
         doc: "Cancel every running job of a feature, following every next_cursor",
@@ -314,6 +354,7 @@ fn check(action: &str, arg: &ActionArg, value: &str) -> Result<(), CommandError>
         ArgKind::Annotation => crate::data::config::fields::is_valid_map_name(value),
         ArgKind::Json => serde_json::from_str::<serde_json::Value>(value).is_ok(),
         ArgKind::Enum(values) => values.contains(&value),
+        ArgKind::Text => !value.is_empty(),
         ArgKind::Owner => ["cmd", "tab", "lease", "run", "task"]
             .iter()
             .any(|prefix| id_has_prefix(value, prefix)),
@@ -330,6 +371,7 @@ fn check(action: &str, arg: &ActionArg, value: &str) -> Result<(), CommandError>
         ArgKind::Annotation => "a lowercase annotation name".to_string(),
         ArgKind::Json => "valid JSON".to_string(),
         ArgKind::Enum(values) => values.join(" | "),
+        ArgKind::Text => "non-empty text".to_string(),
         ArgKind::Owner => "an id cmd_|tab_|lease_|run_|task_<32 hex>".to_string(),
     };
     Err(invalid(format!(
@@ -547,13 +589,15 @@ mod tests {
             ArgKind::Id("term") => crate::data::ids::TerminalId::new().to_string(),
             ArgKind::Id("ins") => crate::data::ids::InstanceId::new().to_string(),
             ArgKind::Id("dlg") => crate::data::ids::DialogId::new().to_string(),
+            ArgKind::Id("lease") => crate::data::ids::LeaseId::new().to_string(),
             ArgKind::Owner => CommandId::new().to_string(),
             ArgKind::Id(other) => panic!("no sample for {other}"),
             ArgKind::Limit => "5".into(),
             ArgKind::Cursor => "abc".into(),
             ArgKind::Annotation => "repo".into(),
             ArgKind::Json => r#"{"kind":"yes"}"#.into(),
-            ArgKind::Enum(_) => "next_tab".into(),
+            ArgKind::Enum(values) => values[0].into(),
+            ArgKind::Text => "stopped by hand".into(),
         }
     }
 
@@ -572,6 +616,8 @@ mod tests {
                 "grants.list",
                 "grants.delete",
                 "jobs.cancel",
+                "leases.list",
+                "leases.release",
                 "terminals.list",
                 "terminals.get",
                 "instances.list",
@@ -723,6 +769,55 @@ mod tests {
                 "{error}"
             );
         }
+    }
+
+    #[test]
+    fn leases_actions_match_their_raw_equivalents() {
+        let id = crate::data::ids::LeaseId::new().to_string();
+        let planned = plan("leases.release", &kv(&[("id", &id)])).unwrap();
+        let raw_form = raw("POST", &format!("/v1/worker/leases/{id}/release"), None).unwrap();
+        assert_eq!(planned, raw_form);
+        assert_eq!(
+            serde_json::to_vec(&planned).unwrap(),
+            serde_json::to_vec(&raw_form).unwrap()
+        );
+        let planned = plan(
+            "leases.release",
+            &kv(&[("id", &id), ("reason", "error"), ("message", "stopped")]),
+        )
+        .unwrap();
+        assert_eq!(
+            planned,
+            raw(
+                "POST",
+                &format!("/v1/worker/leases/{id}/release"),
+                Some(serde_json::json!({"reason": "error", "message": "stopped"}))
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            plan(
+                "leases.list",
+                &kv(&[("server", "team"), ("state", "active")])
+            )
+            .unwrap(),
+            raw("GET", "/v1/worker/leases?server=team&state=active", None).unwrap()
+        );
+        for (args, needle) in [
+            (kv(&[]), "leases.release requires id="),
+            (
+                kv(&[("id", "cmd_00000000000000000000000000000000")]),
+                "invalid id=",
+            ),
+            (kv(&[("id", &id), ("reason", "bored")]), "invalid reason="),
+        ] {
+            let error = plan("leases.release", &args).unwrap_err().to_string();
+            assert!(error.contains(needle), "{error}");
+        }
+        let error = plan("leases.list", &kv(&[("state", "napping")]))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("invalid state="), "{error}");
     }
 
     #[test]

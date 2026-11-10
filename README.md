@@ -176,7 +176,7 @@ Don't want to write the file at all? `awman exec workflow --dynamic --work-item 
 Workflows still need you to start them. Your **squad** is a group of agents that work on your behalf while you're doing something else. You give the squad tasks — "when a new issue is opened, triage it and post a plan", "if any open PR has failing tests, fix them" — and it watches for each one and runs a workflow when it fires.
 
 ```sh
-awman squad start --background
+awman daemon start --background
 awman squad add --name issue-triage \
   --description "When a new issue is opened, analyze it and post a plan as a comment." \
   --interval 30m --overlay "env(GITHUB_TOKEN)"
@@ -202,14 +202,16 @@ With `exec workflow`, `--yolo` automatically runs in an isolated Git worktree �
 
 ### Run agents on other machines
 
-`awman api start` exposes awman over HTTP, so heavy workflows can run on a build server or a fleet of agent-runner boxes instead of your laptop.
+The awman daemon's worker feature exposes awman over HTTP, so heavy workflows can run on a build server or a fleet of agent-runner boxes instead of your laptop.
 
 ```sh
-# On the remote machine (prints an API key on first run)
-awman api start --port 9090 --workdirs /workspace/myproject
+# On the remote machine
+awman config set daemon.features.worker.enabled true
+awman daemon start --background
+awman daemon api keys.create name=laptop     # shows the API key once
 ```
 
-The server listens on loopback only, so reach it through an SSH tunnel (or a reverse proxy) and copy the server's `~/.awman/api/tls/cert.pem` to the same path on your laptop:
+The network listener is loopback-only by default, so reach it through an SSH tunnel (or a reverse proxy) and copy the daemon's `~/.awman/data/daemon/tls/cert.pem` to your laptop:
 
 ```sh
 # From your laptop
@@ -220,7 +222,7 @@ awman remote session start --workdir /workspace/myproject
 awman remote exec workflow aspec/workflows/implement-pr.toml --work-item 0027 --session <id> --follow
 ```
 
-Remote commands run in containers with the same isolation as local ones, and every input, output, and log is kept on the server under `~/.awman/api/` for auditing. The HTTP API is available directly to any client too. See [API & Remote Mode](docs/09-api-and-remote-mode.md).
+Remote commands run in containers with the same isolation as local ones, and every input, output, and log is kept on the server under `~/.awman/data/` for auditing. The HTTP API is available directly to any client too. See [API & Remote Mode](docs/09-api-and-remote-mode.md).
 
 ### Curate your skills library
 
@@ -286,16 +288,17 @@ awman config show | get <key> | set <key> <value>   # view and edit config
 awman config migrate                   # move deprecated config keys to their current place
 awman config prerequisite-grants list | revoke <index|all>   # review remembered workflow credential choices
 awman squad                            # open your squad's TUI tab
-awman squad start [--background]       # put your squad on duty (starts the squad daemon)
+awman daemon start [--background]     # start the daemon (squad, worker and engine features)
 awman squad add --name <name> --description <text> [--interval <dur>]   # create a new task for your squad to tackle
 awman squad trigger <name>             # have your squad tackle a task now, ignoring its schedule
 awman squad cancel <name>              # stop the run a task has in progress
 awman squad attach <name>              # attach to a task's running container
 awman squad env [--push | --clear]     # report which env() values your squad's daemon holds
 awman squad list | show <name> | edit <name> | pause <name> | resume <name> | remove <name>
-awman squad stop | status | logs       # squad daemon lifecycle
-awman api start [--port <n>]           # start the HTTP API server (generates API key on first run)
-awman api status | logs | kill         # check, tail or stop the API server
+awman daemon stop | status | logs      # daemon lifecycle
+awman daemon api <action> [k=v ...]    # call the daemon API over the local socket
+awman worker link <url> [--name <n>]   # link a work server so this machine can pull jobs
+awman queue [pick [<id>]]              # list or pick from a linked work server queue
 awman remote session start --workdir <dir>     # create a session on a remote server
 awman remote session kill <id>                  # close a remote session
 awman remote exec workflow <path> [--follow]   # run a workflow on a remote API server

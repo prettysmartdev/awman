@@ -60,6 +60,12 @@ pub struct ReloadReply {
 pub trait DaemonReloader: Send + Sync {
     fn running(&self, session: &Session) -> Option<RunningDaemon>;
     fn reload(&self, daemon: &RunningDaemon) -> Result<ReloadReply, String>;
+    /// How many leases the daemon still runs for work server `server`.
+    /// `awman config unset workServers.<name>` defers deleting the token
+    /// file while this is nonzero. The default says none.
+    fn running_leases(&self, _daemon: &RunningDaemon, _server: &str) -> Result<usize, String> {
+        Ok(0)
+    }
 }
 
 /// Decide the live-apply outcome for `key` (written at concrete `path`).
@@ -128,6 +134,50 @@ impl DaemonReloader for LocalDaemons {
                 .map_err(|_| "reload request panicked".to_string())?
         })
     }
+
+    fn running_leases(&self, daemon: &RunningDaemon, server: &str) -> Result<usize, String> {
+        let daemon = daemon.clone();
+        let server = server.to_string();
+        std::thread::scope(|scope| {
+            scope
+                .spawn(move || {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|e| e.to_string())?;
+                    runtime.block_on(get_running_leases(&daemon, &server))
+                })
+                .join()
+                .map_err(|_| "lease request panicked".to_string())?
+        })
+    }
+}
+
+/// `GET /v1/worker/leases?server=<name>` on the daemon's local listener.
+/// A daemon without the worker routes (404) runs no leases.
+async fn get_running_leases(daemon: &RunningDaemon, server: &str) -> Result<usize, String> {
+    let client = crate::engine::remote::local::LocalClient::new(daemon.local_endpoint.clone());
+    let path = format!("/v1/worker/leases?server={server}&state=active&limit=1");
+    let response = client
+        .send("GET", &path, None)
+        .await
+        .map_err(|e| e.to_string())?;
+    if response.status == 404 {
+        return Ok(0);
+    }
+    if response.status >= 400 {
+        return Err(format!(
+            "HTTP {}: {}",
+            response.status,
+            crate::command::commands::daemon::client::body_text(&response.body)
+        ));
+    }
+    response
+        .body
+        .get("items")
+        .and_then(|items| items.as_array())
+        .map(Vec::len)
+        .ok_or_else(|| "unexpected lease listing".to_string())
 }
 
 async fn post_reload(daemon: &RunningDaemon) -> Result<ReloadReply, String> {

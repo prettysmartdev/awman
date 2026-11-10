@@ -237,6 +237,10 @@ pub(crate) async fn execute_prepared_with_outputs(
     cancel: &tokio_util::sync::CancellationToken,
     output_dir: Option<&Path>,
 ) -> Result<ExecWorkflowOutcome, CommandError> {
+    if engines.agent_engine.is_lease_workspace() {
+        crate::command::worker::policy::validate_workflow(&prepared.workflow)
+            .map_err(CommandError::Other)?;
+    }
     if let Some(dir) = output_dir {
         crate::data::fs::command_outputs::prepare_output_dir(dir, false).map_err(|e| {
             CommandError::Other(format!(

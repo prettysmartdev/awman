@@ -9,7 +9,9 @@ listener when `daemon.network.enabled` is true.
 
 The daemon has three features:
 
-- **worker** accepts pushed commands and runs worker sessions.
+- **worker** runs pushed commands and pulled work-server leases. Linked servers
+  register with WSP; automatic claims and manual picks share worker capacity.
+  Pull management routes are available only on the local listener.
 - **squad** evaluates scheduled tasks and runs squad work.
 - **engine** hosts TUI sessions (instances) inside the daemon, so a TUI can run as a thin terminal on top of it. The TUI behaves exactly like the normal builtin TUI; see [The Engine and Frontends](19-engine-and-frontends.md).
 
@@ -55,6 +57,68 @@ awman daemon api instances.list
 
 See [The Engine and Frontends](19-engine-and-frontends.md) for choosing between the builtin and daemon backends.
 
+## Worker push and pull
+
+The worker feature has two directions. **Push** accepts sessions, commands, and
+one-shot runs from clients such as scripts or `awman remote`, using the
+`/v1/worker/*` API. **Pull** lets a worker connect to a work server and claim
+its queued jobs. The daemon registers linked servers, claims when capacity is
+available, and runs accepted leases through the same command dispatcher as push.
+Queue and claim return `503 pull_disabled` while pull is disabled or draining.
+Network API access exposes worker push only; pull routes are local-only.
+
+Link a server and manage its configuration with the commands described in
+[Workers and Work Servers](17-workers-and-work-servers.md#link-a-work-server).
+That guide also documents the `workServers.*` settings, labels, claim modes,
+and WSP v1 for server authors.
+
+### Worker status
+
+`GET /v1/status` reports the worker feature's usual `state`, `running`, and
+`queued` fields, plus push and pull summaries when worker is enabled. The shape
+is:
+
+```json
+"worker": {
+  "push": { "running": 1, "queued": 2 },
+  "pull": {
+    "servers": [
+      { "name": "team", "state": "registered", "running": 1, "queued_eligible": 2 }
+    ]
+  }
+}
+```
+
+These are the `push` and `pull` fields inside `features.worker`; the worker
+feature record also includes its `name`, `state`, `enabled_by`,
+`max_concurrent_jobs`, `running`, `queued`, `oldest_queued_age_ms`,
+`restarts`, `last_error`, and `since_at` fields. Each pull server summary has
+`name`, `state`, `running`, and `queued_eligible`. Server state can be
+`registered`, `registering`, `disconnected`, `revoked`, `error`, `retiring`,
+or `disabled`. `awman daemon status` prints push running/queued counts and one
+line per pull server.
+
+### Lease management
+
+The local daemon API can list recorded leases and release an active lease. These
+are local management actions, even when the daemon's network listener exposes
+worker push:
+
+```sh
+awman daemon api leases.list
+awman daemon api leases.list server=team state=active
+awman daemon api leases.release id=lease_0123456789abcdef0123456789abcdef reason=user_declined
+```
+
+`leases.list` accepts `server`, `state`, `limit`, and `cursor`; use
+`state=active` for held leases. `leases.release` takes a `lease_…` ID and
+optional `reason` (`user_declined`, `ineligible`, `shutdown`, or `error`) and
+`message`. The default reason is `user_declined`. A release with reason
+`shutdown` also pauses claiming for a minute, which is what
+`awman daemon stop --now` relies on; a daemon that keeps running resumes
+pulling afterwards. The actions map to
+`GET /v1/worker/leases` and `POST /v1/worker/leases/{id}/release`.
+
 ## Start, stop, status, and logs
 
 Start in the foreground (Ctrl-C stops it):
@@ -70,8 +134,9 @@ available:
 awman daemon start --background
 ```
 
-Stop gracefully; running work drains before exit. Use `--now` to cancel running
-worker and squad jobs first:
+Stop gracefully; running work drains before exit. The daemon waits for active
+pulled leases to finish. Use `--now` to release pull leases with reason
+`shutdown` before cancelling remaining worker and squad commands:
 
 ```sh
 awman daemon stop
@@ -187,16 +252,14 @@ mode or `headless` piped mode for each feature. Their defaults are interactive
 and headless respectively. Each feature's `allowOverride` (true by default)
 controls whether a particular run can request a different mode. The settings
 are live and global; denied overrides fail before the run is queued.
-Configuration also accepts `daemon.features.worker.pull.interaction`
-(`interactive` by default), but the daemon does not currently run pulled jobs,
-so that setting has no effect yet.
+`daemon.features.worker.pull.interaction` controls pulled jobs (`interactive` by default), with per-server defaults in `workServers.<name>.interaction`. Refused overrides are released as ineligible before cloning. Linked manual servers register for queue listing; automatic servers claim when shared execution capacity is available. See [Workers and Work Servers](17-workers-and-work-servers.md) for supported execution fields.
 
 
 ## Live changes and shutdown
 
 Disabling a feature applies immediately: new work is refused while accepted jobs drain. Config reload returns without waiting for those jobs. Re-enabling during a drain starts the feature again after its accepted work finishes. Invalid config or a failed feature startup preparation leaves the previous config and active features in place.
 
-`awman daemon stop` drains without a time limit. Use `--now` to cancel running work, or send a second shutdown signal to escalate an ongoing drain.
+`awman daemon stop` stops accepting work and waits, without a time limit, for accepted jobs and pulled leases to finish. Use `--now` to release pulled leases with reason `shutdown` and cancel running work, or send a second shutdown signal to escalate an ongoing drain.
 
 Squad environment persistence is initialized when squad is first enabled. Changing `daemon.features.squad.envPersistence` preserves values in memory. Opting out waits for an active persistence write, prevents queued and future writes to the old backend, and clears its stored item on a best-effort basis.
 

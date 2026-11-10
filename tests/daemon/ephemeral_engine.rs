@@ -87,7 +87,12 @@ async fn the_daemon_exits_when_the_last_ephemeral_feature_idles_out() {
         "--global",
     ]);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    while home.cli_ok(&["daemon", "status"]).contains("pid") {
+    // `daemon status` fails once the daemon is gone, which is the success case.
+    loop {
+        let status = home.cli(&["daemon", "status"]);
+        if !status.status.success() || !String::from_utf8_lossy(&status.stdout).contains("pid") {
+            break;
+        }
         assert!(std::time::Instant::now() < deadline, "daemon never exited");
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }

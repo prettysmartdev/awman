@@ -144,6 +144,8 @@ take work without the TUI
 - **Requests.** All calls are from the worker to the server, under the server's base URL, with `Authorization: Bearer <access token>`.
   - Access tokens come from `POST /v1/token {refresh_token}` and are short-lived.
   - Every request carries `x-wsp-version: 1`.
+  - Every lease-scoped request (`/v1/leases/{id}/…`, including the terminal WebSocket handshake) also carries `x-wsp-epoch: <epoch>`, the epoch from the claim that issued the lease. The server checks it against the lease's current epoch and answers `409 lease_lost` when it is missing, malformed or stale.
+  - The link calls and `POST /v1/token` are unauthenticated; the tokens they carry are the credential.
 - **Conventions:** 0139 §1's wire conventions.
   - Errors are `{error, code}`, the same shape and code style as awman's own API.
   - Lists are `{items, next_cursor}` with `?limit=&cursor=`.
@@ -152,18 +154,18 @@ take work without the TUI
 
 | Call | Purpose |
 |---|---|
-| `POST /v1/link`, `POST /v1/link/{id}/token`, `POST /v1/token` | Device-flow linking and token refresh. |
+| `POST /v1/link`, `POST /v1/link/{id}/token`, `POST /v1/token` | Device-flow linking and token refresh. `POST /v1/link` returns `{user_code, verification_uri, link_id, interval_ms}`. While approval is pending, the poll returns `202` (or `204`), optionally with `{interval_ms}` to slow the worker down; once approved it returns `200 {refresh_token}`; a refused link is `403 access_denied` and an expired one `410 expired`. `POST /v1/token {refresh_token}` returns `{access_token, expires_at?}`; `401` or `403` means the link was revoked. |
 | `POST /v1/workers/register` | `{name, labels, capacity, features}`, sent on start and when labels change. Returns `{worker_id, server_labels, heartbeat_ms, poll_ms}`. `features` is a subset of status `capabilities` using the same names, including `terminal`, `interactive`, `prompt`, `workflow_dynamic`, `workflow_file`, `outputs`, `outputs_mount_state`, `workflow_state_events`, `lease_credentials`, `lease_inline_work_item`, `lease_read_only`, `lease_git_auth_failure`, and `lease_push_retry` only when the worker can honor them for eligible runtimes. Re-check each claimed item against its actual runtime. |
 | `GET /v1/queue?limit=50&cursor=…` | Items **eligible for this worker**, in the server's order (priority, then age, then preferred weight). Returns `{items: [{id, title, summary, kind, labels, priority, enqueued_at, assigned_to_me}], next_cursor}`. Used by the picker. |
-| `POST /v1/claims` | `{item_id?}`: with `item_id`, claim that item (manual pick); without it, the next eligible item. Supports long-polling with `?wait_ms=30000`. Returns `201 {lease}`, `204` if nothing is eligible, or `409 taken`. |
+| `POST /v1/claims` | `{item_id?}`: with `item_id`, claim that item (manual pick); without it, the next eligible item. Supports long-polling with `?wait_ms=30000`. Returns `201 {lease}`, `204` if nothing is eligible, `409 taken`, or, for a named item this worker may not have, `409 ineligible`. |
 | `POST /v1/leases/{id}/heartbeat` | `{state: "preparing"\|"running"\|"awaiting_input"\|"pushing", step?, progress?}` → `{expires_at, cancel: bool, cancel_reason?}`. `awaiting_input` means a step dialog or stuck agent is waiting for a person. Missing heartbeats past `expires_at` make the server re-queue the item. |
-| `POST /v1/leases/{id}/events` | `{events: [ExecutionEvent…]}`, using awman's own event JSON (including 0137's `source` attribution and `step_activity`, 0141's terminal events, and `workflow_state` snapshots), each with its `sequence` and `attempt`. Idempotent by `(attempt, sequence)`. |
+| `POST /v1/leases/{id}/events` | `{events: [ExecutionEvent…]}`, using awman's own event JSON (including 0137's `source` attribution and `step_activity`, 0141's terminal events, and `workflow_state` snapshots), each with its `sequence` and `attempt`. Idempotent by `(attempt, sequence)`. The response body is empty or `{accepted: <count of newly stored events>}`. |
 | `GET /v1/leases/{id}/terminal` (WebSocket, `awman.terminal.v1`) | The worker opens this only if the lease has `terminal: true`. It multiplexes 0141's terminal frames for every terminal of the run, each tagged with `terminal_id`. The server fans them out to its own viewers. `input` frames flow back only when the lease grants `remote_input` **and** `daemon.terminal.remoteInput` allows it. |
 | `POST /v1/leases/{id}/result` | The final result (below). Ends the lease. |
-| `POST /v1/leases/{id}/release` | `{reason: "user_declined"\|"ineligible"\|"shutdown"\|"error", message?}` hands the item back unrun, or abandons it mid-run with the partial result attached. |
-| `POST /v1/leases/{id}/credentials` | Fresh repo credentials for a long run (see Edge Cases). |
+| `POST /v1/leases/{id}/release` | `{reason: "user_declined"\|"ineligible"\|"shutdown"\|"error", message?}` hands the item back unrun, or abandons it mid-run with the partial result attached as `result` (the Result shape below). |
+| `POST /v1/leases/{id}/credentials` | Fresh repo credentials for a long run (see Edge Cases). Returns a `credentials` object, the same shape as `repo.credentials`. |
 
-- **Fencing.** Each lease has an `epoch`. Once a lease expired and was re-issued, calls on the old lease get `409 lease_lost`, and the worker must stop that run (cancel its containers) and discard its result.
+- **Fencing.** Each lease has an `epoch`, sent back on every lease call as `x-wsp-epoch`. Once a lease expired and was re-issued, calls on the old lease get `409 lease_lost`, and the worker must stop that run (cancel its containers) and discard its result. A server may give the re-issued lease a new ID, or reuse the ID with a higher epoch; both fence the old holder. Calls on a lease that has ended (result posted or released) also get `409 lease_lost`.
 - **Lease** = `{id, epoch, expires_at, item: WorkItem, terminal: bool, remote_input: bool}`.
 - **`WorkItem`** (generic; servers fill what they need):
   ```json
@@ -191,6 +193,7 @@ take work without the TUI
     "affinity": { "required": [], "preferred": [] }
   }
   ```
+- **Decoding.** Work items are generic, so a worker ignores fields it does not know on the lease, the work item, `repo` and `push`; servers may carry their own data there. `exec`, `repo.credentials`, `outputs` and `affinity` are what a worker must act on, and are decoded strictly: an unknown field in any of them fails closed with `release(ineligible)`. Required fields are `id`, `title`, `kind`, `body`, `repo.{url, base_ref, branch}` and `exec`. `push.branch` defaults to `repo.branch`; `outputs.max_bytes` defaults to 1048576; `terminal` and `remote_input` default to `false`.
 - **Result** = `{result: CommandResult, outputs?: {path: base64}, outputs_mounted: bool, duration_ms}`.
   - `result` is 0137's `CommandResult`, embedded unchanged (`outcome`, `failure{stage, code, message}`, `failed_steps`, `git`, `pushed`, `pull_request`, `final_message`), so push clients and work servers decode one shape.
   - `outputs` inlines the 0137 outputs directory up to `outputs.max_bytes`.
@@ -218,7 +221,7 @@ take work without the TUI
   - the worker feature's share, `daemon.features.worker.maxConcurrentJobs`;
   - the host-wide `daemon.maxConcurrentJobs` (0140).
 
-  Pushed and pulled jobs draw on the same share. `auto` claims long-poll, so a new item starts within a second of being queued. Items start in the order the server hands them out, which is the queue order; the worker never reorders.
+  Pushed and pulled jobs draw on the same share. An `auto` claim holds its execution slot while it long-polls, so a claimed item always starts at once and its `timeout_ms` never runs while it waits for room; an idle long-poll gives the slot up as soon as a pushed job is waiting for it. `auto` claims long-poll, so a new item starts within a second of being queued. Items start in the order the server hands them out, which is the queue order; the worker never reorders.
 - **Heartbeats** every `heartbeat_ms` (the server's value; 15 s if absent). A `cancel: true` answer cancels the run (0135 semantics), and the worker posts the partial result as `cancelled`.
 
 ### TUI and CLI
@@ -248,6 +251,9 @@ take work without the TUI
 - Clone credentials expire during a long run: push uses credentials from a fresh `POST /v1/leases/{id}/credentials` call, which servers must support when they issue expiring credentials.
 - A lease field or required capability that the chosen runtime cannot honor is rejected before execution with `release(ineligible)`; the corresponding feature is omitted at registration when it cannot be offered at all.
 - Manual pick of an item that is no longer eligible (its labels changed): `409 ineligible`, and the TUI refreshes the list.
+- Manual pick when the worker has no room (the server's `maxConcurrentJobs` or the worker share is full): `409 worker_busy`, answered promptly. The item stays eligible. Likewise, a lease handed back because the worker's own policy or capacity changed during the claim is released as `user_declined`, not `ineligible`, so the server does not exclude the worker for that item.
+- One of several work servers is unreachable or revoked: `awman queue` and the queue panel list the others' items; only a listing for that server by name, or every server failing, is an error.
+- `leases.release reason=shutdown` pauses claiming for a minute, so `awman daemon stop --now` takes nothing new between releasing leases and stopping. A daemon that keeps running resumes pulling afterwards.
 - Daemon shutdown with leases running: release them with `shutdown` and the partial state, unless `awman daemon stop` waits for them (the default waits, and `--now` releases).
 - `awman config set daemon.features.worker.enabled false` while jobs run: push submissions get `503 feature_disabled` and pull stops claiming. Running jobs of both kinds finish. `awman daemon api jobs.cancel feature=worker` cancels them, and pulled ones are released with their partial result.
 - `awman config unset workServers.<name>` while that server has running leases: claiming stops at once. Running leases finish and report, then the token file is deleted.

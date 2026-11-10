@@ -172,7 +172,7 @@ pub struct WorkerServices {
     pub worker_count: usize,
     pub bind_ip: std::net::IpAddr,
     pub port: u16,
-    /// Cancel markers and `/v1/runs` linkage (WI 0135).
+    /// Cancel markers and `/v1/worker/runs` linkage (WI 0135).
     pub lifecycle_store: CommandLifecycleStore,
     /// Tokens of running commands, keyed by command id; registered by the
     /// worker that claimed each one.
@@ -230,7 +230,7 @@ impl WorkerServices {
             Some(core) => core.session_store().clone(),
             None => Arc::new(SqliteSessionStore::open_at(&db_path).map_err(CommandError::Data)?),
         };
-        // The WI 0135 lifecycle tables (cancel markers, `/v1/runs` linkage)
+        // The WI 0135 lifecycle tables (cancel markers, `/v1/worker/runs` linkage)
         // must exist before any recovery below reads them.
         let lifecycle_store =
             CommandLifecycleStore::open(Arc::clone(&store)).map_err(CommandError::Data)?;
@@ -329,7 +329,7 @@ impl WorkerServices {
                 if let Err(error) = paths.save_setup_state(&rec.id, &setup_state) {
                     tracing::warn!(session_id = %rec.id, %error, "Failed to save interrupted setup state");
                 }
-                // A `/v1/runs` command queued behind this setup can never run.
+                // A `/v1/worker/runs` command queued behind this setup can never run.
                 if let Ok(Some(run)) =
                     lifecycle_store.run_for_session(&crate::data::ids::WorkerSessionId::parse(&rec.id).expect("validated persisted resource id")).inspect_err(|error| {
                         tracing::error!(session_id = %rec.id, %error, "Failed to read run of interrupted setup")
@@ -1050,7 +1050,7 @@ fn is_injected_interaction_token(arg: &str) -> bool {
     matches!(arg, "--headless" | "--interactive") || arg.starts_with("--headless=")
 }
 
-/// The `result` JSON of a `/v1/runs` command whose session setup failed:
+/// The `result` JSON of a `/v1/worker/runs` command whose session setup failed:
 /// `error` is the literal `"setup_error"`; the setup's own `{stage, message}`
 /// (or `null`) rides in `setup_error`. Written with exit code 1.
 pub fn run_setup_error_result(setup_error: Option<&serde_json::Value>) -> String {
@@ -1077,7 +1077,7 @@ pub fn run_setup_error_result(setup_error: Option<&serde_json::Value>) -> String
     .expect("command result is serializable")
 }
 
-/// Bootstrap: finish every `/v1/runs` lifecycle hook a crash interrupted,
+/// Bootstrap: finish every `/v1/worker/runs` lifecycle hook a crash interrupted,
 /// whatever state its setup reached. A run whose setup failed cannot start,
 /// so a still-queued command becomes `error` (a cancelled one stays
 /// cancelled); a run asking to `close_on_finish` whose command is terminal is

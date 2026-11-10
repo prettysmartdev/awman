@@ -13,6 +13,18 @@ You do not need remote mode to use the API (curl works fine), and you do not nee
 
 API mode is the push side of the daemon's worker feature. Enable the worker feature, start the daemon, then send sessions and commands under `/v1/worker/*` from scripts, CI pipelines, or HTTP clients — no interactive terminal or TUI required.
 
+`awman worker link` saves a connection to a separate work server; it does not
+turn that server into an API target or start pulling jobs. See
+[Workers and Work Servers](17-workers-and-work-servers.md).
+
+The API and `awman remote` operate on the **push** side of the worker feature:
+clients submit work to an awman daemon under `/v1/worker/*`. Work-server pull
+routes also use `/v1/worker/*`, but they are local-listener routes and are not
+exposed through the network API. The daemon registers linked servers and runs
+pulled leases; `503 pull_disabled` means pull is disabled or draining. See
+[Workers and Work Servers](17-workers-and-work-servers.md) for the work-server
+protocol and configuration.
+
 A **session** in API mode is conceptually identical to a TUI tab: an isolated workspace bound to a working directory. Commands dispatched to a session (`exec prompt`, `exec workflow`, and the others listed under [Submit a command](#submit-a-command)) execute exactly as they would in a TUI tab — inside a container on the configured runtime, with the same security and isolation guarantees.
 
 Worker sessions, commands, and output are stored under the awman home directory for auditability. The shared SQLite database is stored at
@@ -571,7 +583,7 @@ Substitute your data home in the certificate path when using `AWMAN_HOME` or `XD
 
 ### Route tree
 
-This is the complete route table. Request and response details for the worker routes follow in the sections below.
+This is the complete route table. Request and response details for the worker push routes follow in the sections below. The pull management routes are local-only and are not exposed on the network listener.
 
 | Method | Path | Feature | Access | Purpose |
 |--------|------|---------|--------|---------|
@@ -604,6 +616,17 @@ This is the complete route table. Request and response details for the worker ro
 | `GET` | `/v1/worker/commands/{id}/outputs` | worker | feature | List files the agent wrote under `/awman/output` |
 | `GET` | `/v1/worker/commands/{id}/outputs/{*path}` | worker | feature | Download one output file |
 | `POST` | `/v1/worker/runs` | worker | feature | Create a session and run a command in one request |
+| `GET` | `/v1/worker/servers` | worker | owner/local | List configured work server status |
+| `GET` | `/v1/worker/servers/{name}` | worker | owner/local | Read one configured work server status |
+| `GET` | `/v1/worker/queue` | worker | owner/local | List eligible work server items; `limit` and `cursor` page the response |
+| `POST` | `/v1/worker/queue/{item_id}/claim` | worker | owner/local | Claim an item and run it in the daemon |
+| `POST` | `/v1/worker/leases/{id}/checkout` | worker | owner/local | Prepare a matching-origin checkout worktree for a foreground pick |
+| `POST` | `/v1/worker/leases/{id}/events` | worker | owner/local | Forward foreground lease events |
+| `POST` | `/v1/worker/leases/{id}/terminal` | worker | owner/local | Exchange foreground terminal frames with the lease holder |
+| `POST` | `/v1/worker/leases/{id}/result` | worker | owner/local | Report the foreground lease result |
+| `GET` | `/v1/worker/leases` | worker | owner/local | List recorded worker leases |
+| `GET` | `/v1/worker/leases/{id}` | worker | owner/local | Read one recorded worker lease |
+| `POST` | `/v1/worker/leases/{id}/release` | worker | owner/local | Release an active work server lease |
 | `GET` | `/v1/squad/tasks` | squad | feature | List tasks (`?name=` filter) |
 | `POST` | `/v1/squad/tasks` | squad | feature | Create a task |
 | `GET` | `/v1/squad/tasks/{id}` | squad | feature | Task detail |
@@ -692,7 +715,7 @@ input requires both `daemon.terminal.remoteInput=true`, the command's
 `allow_remote_input` permission, and an `x-awman-actor` header naming the
 viewer. Local viewers may request control unless they connect read-only.
 Set `"allow_remote_input": true` when submitting a command through
-`POST /v1/worker/commands` or the command part of `POST /v1/runs` to opt in.
+`POST /v1/worker/commands` or the command part of `POST /v1/worker/runs` to opt in.
 It defaults to `false`, is persisted with the command, and is returned on the
 command record. Both this permission and `daemon.terminal.remoteInput` must
 allow input. A read-only WebSocket uses `?read_only=true`; it can never take control.
@@ -795,7 +818,7 @@ session's working directory:
 For example, set `subcommand` to `agents status` or `agents kill` and pass
 arguments such as the agent ID and `--yes` in the request's `args` array. The
 result is the same JSON payload as the CLI's `--json` output, emitted as
-one `StdoutLine` event and stored in the command's `result.data`. The same
+one `stdout_line` event and stored in the command's `result.data`. The same
 commands are documented in [Monitoring running agents](03-agent-sessions.md#monitoring-running-agents).
 
 ---
@@ -1290,10 +1313,10 @@ completed command it contains the retained events from every attempt.
   "attempt": 1,
   "events": [
     {
-      "timestamp": "…",
+      "emitted_at": "…",
       "attempt": 1,
       "sequence": 0,
-      "payload": { "type": "StdoutLine", "data": "…" }
+      "payload": { "type": "stdout_line", "data": "…" }
     }
   ]
 }
@@ -1315,15 +1338,15 @@ Opens a persistent HTTP response using [Server-Sent Events (SSE)](https://develo
 ```
 id: 1:0
 event: stdout_line
-data: {"timestamp":"…","attempt":1,"sequence":0,"payload":{"type":"StdoutLine","data":"<line of output>"}}
+data: {"emitted_at":"…","attempt":1,"sequence":0,"payload":{"type":"stdout_line","data":"<line of output>"}}
 
 id: 1:1
 event: stderr_line
-data: {"timestamp":"…","attempt":1,"sequence":1,"payload":{"type":"StderrLine","data":"<line of output>"}}
+data: {"emitted_at":"…","attempt":1,"sequence":1,"payload":{"type":"stderr_line","data":"<line of output>"}}
 
 id: 1:2
 event: done
-data: {"timestamp":"…","attempt":1,"sequence":2,"payload":{"type":"Done"}}
+data: {"emitted_at":"…","attempt":1,"sequence":2,"payload":{"type":"done"}}
 
 ```
 
@@ -1401,7 +1424,7 @@ curl -Nsk 'https://localhost:9876/v1/worker/commands/<command-id>/events?step=im
 `command_status`, `step_activity`, `done`) and a JSON `data:` payload, so a client that wants
 structured data instead of log lines can read the `event:` field and parse
 accordingly. Add `?format=json` to the same URL to fetch the event-log snapshot
-described above. It includes all retained attempts and their historical `Done`
+described above. It includes all retained attempts and their historical `done`
 records, including a marker written immediately before a crash and re-queue.
 Interpret those records by `attempt`; only the SSE `done` notification certifies
 that the current command is terminal. Resume inputs do not filter this snapshot.
@@ -1877,8 +1900,7 @@ curl -sk https://localhost:9876/v1/worker/commands/<command-id>/workflow \
   -H 'Authorization: Bearer <api-key>'
 ```
 
-Returns the current workflow view for the given command. The older path
-`GET /v1/workflows/{command_id}` is still served and returns the same body. The response retains
+Returns the current workflow view for the given command. The response retains
 the persisted `WorkflowState` fields and adds client-ready fields at read time;
 it does not change the local workflow state file.
 
@@ -2032,7 +2054,7 @@ done
 
 # 4. Print the captured output from the JSON event snapshot
 curl -sk "$SERVER/v1/worker/commands/$CMD/events?format=json" -H "$AUTH" \
-  | jq -r '.events[] | select(.payload.type == "StdoutLine" or .payload.type == "StderrLine") | .payload.data'
+  | jq -r '.events[] | select(.payload.type == "stdout_line" or .payload.type == "stderr_line") | .payload.data'
 
 # 5. Close the session
 curl -sk -X DELETE "$SERVER/v1/worker/sessions/$SESSION" -H "$AUTH"
@@ -2441,3 +2463,12 @@ Your **client** still holds the old strings, and the old form is not accepted: r
 ---
 
 [← Overlays](08-overlays.md) · [Next: GitHub Integration →](10-github-integration.md)
+
+
+### Worker lease and event conventions
+
+`GET /v1/worker/servers` accepts `limit` and `cursor`, and every returned `next_cursor` can be followed. To test for leases that still need credentials, request `/v1/worker/leases?server=NAME&state=active&limit=1`; the default lease list also includes ended history.
+
+The production daemon registers linked work servers and runs automatic and manual claims on its worker share. Pull routes remain local-only. Unsupported lease execution requirements are released as ineligible; see [Workers and Work Servers](17-workers-and-work-servers.md#running-pulled-work). Expiry or revocation fences execution, events, credentials, push and result reporting together.
+
+SSE, `?format=json` and WSP forward the same public event projection: `emitted_at` is an RFC 3339 UTC timestamp, and `payload.type` is snake_case. Stored older logs with `timestamp` and Rust-style tags such as `StdoutLine` are read compatibly and projected on replay. Clients should accept the public spelling for new streams.

@@ -10,6 +10,8 @@ pub mod outputs;
 pub mod routes;
 pub mod terminals;
 pub mod workflow_view;
+// WI 0143: `/v1/worker/{servers,queue,leases}` bindings.
+pub mod worker_pull;
 
 use crate::command::commands::api_server::queue_worker::ApiCommandFrontendFactory;
 use crate::data::fs::api_command_log::CommandStateWriter;

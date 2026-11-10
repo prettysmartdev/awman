@@ -13,6 +13,17 @@ use crate::frontend::cli::command_frontend::CliFrontend;
 
 impl HasAgentFrontend for CliFrontend {
     fn container_frontend(&mut self) -> Box<dyn AgentFrontend> {
+        if self.worker_events.is_some() {
+            let io = self.take_non_interactive_io();
+            return crate::command::worker::events::recording_frontend(
+                Box::new(
+                    super::container_frontend_marker::CliInteractiveContainerProxy {
+                        container_io: Some(io),
+                    },
+                ),
+                self.worker_events.clone(),
+            );
+        }
         Box::new(super::container_frontend_marker::CliContainerProxy)
     }
 
@@ -21,10 +32,13 @@ impl HasAgentFrontend for CliFrontend {
             return self.container_frontend();
         }
         let io = self.take_interactive_io();
-        Box::new(
-            super::container_frontend_marker::CliInteractiveContainerProxy {
-                container_io: Some(io),
-            },
+        crate::command::worker::events::recording_frontend(
+            Box::new(
+                super::container_frontend_marker::CliInteractiveContainerProxy {
+                    container_io: Some(io),
+                },
+            ),
+            self.worker_events.clone(),
         )
     }
 }

@@ -1,4 +1,4 @@
-//! `GET /v1/commands/{id}/outputs` and `GET /v1/commands/{id}/outputs/{path}`
+//! `GET /v1/worker/commands/{id}/outputs` and `GET /v1/worker/commands/{id}/outputs/{path}`
 //! (WI 0137 §3): list and serve the files an agent left in the command's
 //! `/awman/output` directory.
 //!
@@ -31,7 +31,7 @@ use crate::data::fs::command_outputs::{
 use crate::frontend::api::error::ApiError;
 use crate::frontend::api::routes::AppState;
 
-/// `GET /v1/commands/{id}/outputs`.
+/// `GET /v1/worker/commands/{id}/outputs`.
 pub async fn handle_list_outputs(
     State(state): State<Arc<AppState>>,
     AxumPath(command_id): AxumPath<String>,
@@ -104,7 +104,7 @@ enum Fetched {
     File(Vec<u8>),
 }
 
-/// `GET /v1/commands/{id}/outputs/{*path}`.
+/// `GET /v1/worker/commands/{id}/outputs/{*path}`.
 pub async fn handle_get_output(
     State(state): State<Arc<AppState>>,
     AxumPath((command_id, path)): AxumPath<(String, String)>,

@@ -17,3 +17,5 @@ src/command/engine_handoff.rs:std::env::current_exe # the hand-off respawns this
 src/command/commands/squad/supervisor.rs:std::env::current_exe # daemon spawn: respawns this binary as the daemon
 src/command/commands/squad/gateway.rs:Env::from_process # LocalTaskGateway::new default for session-less hosts and tests; the daemon passes its core snapshot via with_env
 src/engine/daemon/supervisor.rs:Env::from_process # ForwardedEnv bootstrap only; daemon owner is engine-feature-layer1
+
+src/command/worker/mod.rs:std::env::current_exe # private Git helper re-exec for production lease transport

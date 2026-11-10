@@ -23,6 +23,9 @@ pub enum Action {
     /// its columns overflow the available width.
     ScrollWorkflowOverviewRight,
     OpenConfigShow,
+    /// Ctrl-Q — open the work-queue panel (WI 0143). Terminals that use
+    /// Ctrl-Q for XON flow control may swallow it.
+    OpenQueuePanel,
     WorkflowControl,
     ToggleGitSidebar,
 
@@ -154,6 +157,9 @@ pub fn map_key(key: KeyEvent, ctx: FocusContext, overview_hscroll_active: bool) 
             KeyCode::Char('o') if ctx != FocusContext::Dialog => {
                 return Action::ToggleWorkflowOverview;
             }
+            // Ctrl-Q (XON, 0x11) is intercepted in every context but a dialog,
+            // before the ContainerMaximized ForwardToPty path, like Ctrl-G.
+            KeyCode::Char('q') if ctx != FocusContext::Dialog => return Action::OpenQueuePanel,
             KeyCode::Char('w') => return Action::WorkflowControl,
             // Ctrl-G (BEL, 0x07) is rarely used by terminal programs, so we
             // intercept it here — before the ContainerMaximized ForwardToPty

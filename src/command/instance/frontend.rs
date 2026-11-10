@@ -47,6 +47,7 @@ use crate::engine::agent_runtime::frontend::AgentIo;
 /// The TUI populates these channels from `App::spawn_command`; the engine's
 /// container backend drains them against a real PTY master.
 pub struct InstanceCommandFrontend {
+    pub(crate) worker_events: Option<crate::command::worker::events::ForegroundRecorder>,
     pub(crate) command_bytes: super::output::CommandBytes,
     input_available: bool,
     pub(crate) wake: Option<Arc<tokio::sync::Notify>>,
@@ -234,6 +235,7 @@ impl InstanceCommandFrontend {
             pty_active: false,
             dialog_tx,
             dialog_rx: Mutex::new(dialog_rx),
+            worker_events: None,
             container_io: Some(container_io),
             status_log,
             workflow,
@@ -647,6 +649,43 @@ impl UserMessageSink for InstanceCommandFrontend {
 // ─── CommandFrontend ──────────────────────────────────────────────────────
 
 impl CommandFrontend for InstanceCommandFrontend {
+    fn pick_queue_item(
+        &mut self,
+        items: &[crate::command::daemon_api::worker_pull::QueueRow],
+    ) -> Result<Option<String>, CommandError> {
+        let answer = self.ask_dialog(DialogRequest::KindSelect {
+            title: "Pick a work item".into(),
+            options: items
+                .iter()
+                .map(|row| (row.id.clone(), format!("{} · {}", row.title, row.server)))
+                .collect(),
+        })?;
+        Ok(match answer {
+            DialogResponse::Index(index) => items.get(index).map(|row| row.id.clone()),
+            _ => None,
+        })
+    }
+    fn confirm_queue_checkout(
+        &mut self,
+        prompt: &crate::data::prompt::Prompt<crate::command::worker::queue_source::CheckoutChoice>,
+    ) -> crate::command::worker::queue_source::CheckoutChoice {
+        self.pick_from_keyed_prompt(prompt)
+            .unwrap_or(crate::command::worker::queue_source::CheckoutChoice::FreshClone)
+    }
+    fn bind_worker_run(
+        &mut self,
+        input: ParsedCommandBoxInput,
+        events: crate::command::commands::api_server::event_bus::EventBusSender,
+        writer: crate::data::fs::api_command_log::CommandStateWriter,
+    ) -> Result<(), CommandError> {
+        self.parsed = input;
+        self.worker_events = Some(crate::command::worker::events::ForegroundRecorder::new(
+            events,
+            writer,
+            self.parsed.path == ["exec", "prompt"],
+        ));
+        Ok(())
+    }
     fn input_available(&self) -> bool {
         self.input_available
     }

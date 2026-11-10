@@ -1146,6 +1146,15 @@ impl AgentInstance for TerminalInstance {
         self: Box<Self>,
         frontend: Box<dyn AgentFrontend>,
     ) -> Result<AgentExecution, EngineError> {
+        // Nested command runtimes must share one launch handle. Otherwise the
+        // outer wait closes a handle that was never registered, losing exit
+        // frames and the outer lease's input grant.
+        if frontend
+            .terminal_launch()
+            .is_some_and(|launch| launch.owner.owner == self.launch.owner.owner)
+        {
+            return self.instance.run_with_frontend(frontend);
+        }
         let config = frontend.program_status_config();
         let mut launch = self.launch;
         let mut source = frontend

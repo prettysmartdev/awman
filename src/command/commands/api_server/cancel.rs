@@ -5,7 +5,7 @@
 //! |------------------------------|------------------------------------------------|--------------------|
 //! | none                         | nothing                                        | `NotFound`         |
 //! | `done`/`error`/`cancelled`   | nothing                                        | `AlreadyTerminal`  |
-//! | `queued`/`pending`           | row → `cancelled`; a `/v1/runs` setup is told to stop | `Cancelled` |
+//! | `queued`/`pending`           | row → `cancelled`; a `/v1/worker/runs` setup is told to stop | `Cancelled` |
 //! | `running`                    | marker recorded, the owning worker's token fired | `Stopping`       |
 //! | `running`, no owner          | (only between a crash and the next bootstrap) row → `cancelled` | `Cancelled` |
 //! | `running`, no owner, sidecar | row → the recorded completion; an unreadable sidecar is an error | `AlreadyTerminal` |
@@ -200,7 +200,7 @@ impl CommandCanceller {
                 &now,
             )?
         {
-            // A `/v1/runs` command waits in the queue while its session is
+            // A `/v1/worker/runs` command waits in the queue while its session is
             // set up: abandon that setup too.
             if let Some(run) = self.lifecycle.run_for_command(
                 &crate::data::ids::CommandId::parse(command_id)

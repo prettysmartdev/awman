@@ -369,6 +369,12 @@ pub struct Tab {
     /// that nothing outside the initialiser and two tests ever set, so the
     /// magenta remote tab colour could not appear (WI 0114 F-22).
     pub is_squad: bool,
+    /// The work-queue lease this tab runs (WI 0143), set when a picked item
+    /// opens it. Closing the tab mid-run asks what to do with the lease.
+    pub lease: Option<crate::frontend::tui::queue::TabLease>,
+    /// Replaces the directory name in the tab bar (picked items show
+    /// "title · server").
+    pub label_override: Option<String>,
     /// Squad sub-view state (selection, polled tasks, daemon reachability).
     /// `Some` exactly when `is_squad`.
     pub squad: Option<SquadTabState>,
@@ -575,6 +581,8 @@ impl Tab {
             last_workflow_invocation_id: None,
             mouse_selection: None,
             is_squad: false,
+            lease: None,
+            label_override: None,
             squad: None,
             output_lines: Vec::new(),
             stuck: false,

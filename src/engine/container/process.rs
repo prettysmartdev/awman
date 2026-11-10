@@ -1724,6 +1724,14 @@ mod terminal_wiring_regression {
                 ImageRef::new("fixture"),
             )],
         );
+        // Output/lease wrappers can nest command runtimes. The outer owner
+        // grant and launch handle must survive the inner runtime wrapper.
+        let mut inner = launch.clone();
+        inner.handle = Default::default();
+        inner.owner.allow_remote_input = false;
+        inner.owner.attempt = 1;
+        let instance =
+            crate::engine::agent_runtime::execution::with_terminal_launch(instance, inner);
         let instance =
             crate::engine::agent_runtime::execution::with_terminal_launch(instance, launch);
         let mut execution = instance

@@ -374,7 +374,7 @@ impl CommandCatalogue {
     /// `(flag name, value)` pairs — the profile's own account of itself.
     ///
     /// A frontend that reports its profile to a client reads it here rather
-    /// than restating it: `api/routes.rs` used to answer `POST /v1/commands`
+    /// than restating it: `api/routes.rs` used to answer `POST /v1/worker/commands`
     /// with a hand-written `{"yolo": true, "non_interactive": true}` that no
     /// test tied to `API_FLAG_DEFAULTS` (WI 0114 F-50). Flags the command
     /// does not declare are left out, so the report matches what was applied.

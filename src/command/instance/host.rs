@@ -1324,6 +1324,10 @@ impl EngineInstanceHost {
         relay.set_pty_size(size);
         let (feeds, mut events) = relay.reset_for_submit();
         let submitted = instance.submit(SubmitRequest {
+            lease_id: match &input {
+                SubmitInput::Lease { lease_id, .. } => Some(lease_id.clone()),
+                _ => None,
+            },
             session_id: relay.session_id(),
             parsed,
             feeds,
@@ -1757,7 +1761,7 @@ fn parse_submit(
                 raw.trim(),
             )
         }
-        SubmitInput::Argv { args } => {
+        SubmitInput::Argv { args } | SubmitInput::Lease { args, .. } => {
             // The longest catalogue path that prefixes the argv.
             let words: Vec<&str> = args
                 .iter()
@@ -1891,6 +1895,38 @@ impl FrontendSession {
         let id = &self.instance_id;
         let me = &self.frontend_id;
         match frame {
+            FrontendFrame::WorkerQueue {
+                request_id,
+                tab_id,
+                request,
+            } => {
+                use crate::data::worker::queue::{PickError, QueueReply};
+                let context = host.find(id).and_then(|hosted| {
+                    let state = hosted.state();
+                    let instance = state.instance.clone()?;
+                    let session_id = state.tab(&tab_id)?.session_id();
+                    let session = instance
+                        .session_manager
+                        .get(&session_id)?
+                        .try_read()
+                        .ok()?
+                        .clone();
+                    Some((instance, session))
+                });
+                let reply = match context {
+                    Some((instance, session)) => tokio::task::spawn_blocking(move || {
+                        instance.queue_request(&session, request)
+                    })
+                    .await
+                    .unwrap_or_else(|e| QueueReply::Error(PickError::Failed(e.to_string()))),
+                    None => QueueReply::Error(PickError::Failed("no such instance tab".into())),
+                };
+                if let Some(hosted) = host.find(id) {
+                    hosted
+                        .state()
+                        .send_to(me, EngineFrame::WorkerQueue { request_id, reply });
+                }
+            }
             FrontendFrame::Hello(_) => {
                 return Err(ProtocolError::Malformed("duplicate hello".into()));
             }

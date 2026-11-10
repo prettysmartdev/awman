@@ -99,6 +99,18 @@ constructors! {
     control_held => ("control_held", CONFLICT),
     input_not_allowed => ("input_not_allowed", FORBIDDEN),
     input_backpressure => ("input_backpressure", TOO_MANY_REQUESTS),
+    // WI 0143 pull routes (`/v1/worker/{servers,queue,leases}`).
+    pull_disabled => ("pull_disabled", SERVICE_UNAVAILABLE),
+    server_not_found => ("server_not_found", NOT_FOUND),
+    server_not_registered => ("server_not_registered", SERVICE_UNAVAILABLE),
+    item_not_found => ("item_not_found", NOT_FOUND),
+    lease_not_found => ("lease_not_found", NOT_FOUND),
+    lease_ended => ("lease_ended", CONFLICT),
+    taken => ("taken", CONFLICT),
+    ineligible => ("ineligible", CONFLICT),
+    worker_busy => ("worker_busy", CONFLICT),
+    link_revoked => ("link_revoked", CONFLICT),
+    upstream_unavailable => ("upstream_unavailable", BAD_GATEWAY),
 }
 
 impl ApiError {

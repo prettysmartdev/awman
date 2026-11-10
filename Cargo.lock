@@ -503,6 +503,8 @@ dependencies = [
  "anyhow",
  "arboard",
  "async-trait",
+ "awman",
+ "awman-wsp",
  "axum",
  "axum-server",
  "base64 0.23.1",
@@ -565,6 +567,7 @@ dependencies = [
  "async-trait",
  "awman",
  "awman-host-shims",
+ "awman-wsp",
  "axum",
  "axum-server",
  "base64 0.23.1",
@@ -615,6 +618,25 @@ dependencies = [
  "tokio",
  "toml",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "awman-wsp"
+version = "0.13.0"
+dependencies = [
+ "awman-wsp",
+ "axum",
+ "base64 0.23.1",
+ "chrono",
+ "futures-util",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-tungstenite",
+ "uuid",
+ "wiremock",
 ]
 
 [[package]]
@@ -6390,7 +6412,11 @@ checksum = "8f72a05e828585856dacd553fba484c242c46e391fb0e58917c942ee9202915c"
 dependencies = [
  "futures-util",
  "log",
+ "rustls",
+ "rustls-native-certs",
+ "rustls-pki-types",
  "tokio",
+ "tokio-rustls",
  "tungstenite",
 ]
 
@@ -6616,6 +6642,8 @@ dependencies = [
  "httparse",
  "log",
  "rand 0.9.5",
+ "rustls",
+ "rustls-pki-types",
  "sha1 0.10.7",
  "thiserror 2.0.21",
 ]

@@ -128,7 +128,7 @@ pub enum CommandError {
     #[error("API workdir not found: {path}")]
     ApiWorkdirNotFound { path: PathBuf },
 
-    #[error("API workdir root '{root}' is inside a git repository ({git_root}); list it with --workdirs instead, or choose a directory that only contains repositories")]
+    #[error("worker workdir root '{root}' is inside a git repository ({git_root}); list it in daemon.features.worker.push.workDirs.allow instead, or choose a directory that only contains repositories")]
     ApiWorkdirRootInvalid { root: PathBuf, git_root: PathBuf },
 
     // ── Daemon ────────────────────────────────────────────────────────────
@@ -516,7 +516,7 @@ pub mod failure_codes {
 /// post-command stages the queue worker names itself (`step`, `teardown`,
 /// `push`, `setup`) use the same spellings.
 pub mod failure_stages {
-    /// `/v1/runs` session setup, before the command ran.
+    /// `/v1/worker/runs` session setup, before the command ran.
     pub const SETUP: &str = "setup";
     /// After admission, before any container started: argument resolution,
     /// agent lookup, an existing worktree, a missing resource.

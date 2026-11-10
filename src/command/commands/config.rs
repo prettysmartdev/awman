@@ -14,6 +14,7 @@
 //!   written, and tell a running daemon to reload when the key is live.
 
 mod live;
+pub mod work_server_unlink;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -348,6 +349,11 @@ fn names_at(docs: &[&serde_json::Value], map_path: &str) -> Vec<String> {
 pub fn collect_config_rows(docs: &ConfigDocs<'_>) -> Vec<ConfigFieldRow> {
     let mut rows = Vec::new();
     for key in CONFIG_KEYS {
+        // The enclosing StringMap row displays these values. The leaf row
+        // gives `config set workServers.x.labels.pool value` a scalar type.
+        if key.path == "workServers.*.labels.*" {
+            continue;
+        }
         let Some(star) = key.path.find('*') else {
             rows.push(row(key.path.to_string(), key, docs, ConfigRowKind::Scalar));
             continue;
@@ -520,6 +526,14 @@ fn write_key(
     Ok((kind, file, key))
 }
 
+fn unlinked_work_server(path: &str) -> Option<&str> {
+    let mut parts = path.split('.');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some("workServers"), Some(name), None) if !name.is_empty() => Some(name),
+        _ => None,
+    }
+}
+
 fn reopen(session: &Session) -> Result<Session, CommandError> {
     let opts = crate::data::session::SessionOpenOptions {
         env: Some(session.env().clone()),
@@ -633,6 +647,18 @@ impl Command for ConfigCommand {
             ConfigSubcommand::Unset(f) => {
                 let (kind, file, key) = write_key(&session, &f.field, None, &f.target)?;
                 let live = live::apply(reloader.as_ref(), &session, key, &f.field);
+                if let Some(name) = unlinked_work_server(&f.field) {
+                    // The daemon has reloaded (it stopped claiming for this
+                    // server); the token goes now, or after the last lease.
+                    let disposition =
+                        work_server_unlink::dispose_token(reloader.as_ref(), &session, name)?;
+                    if let Some(text) = work_server_unlink::deferred_message(name, &disposition) {
+                        frontend.write_message(UserMessage {
+                            level: MessageLevel::Info,
+                            text,
+                        });
+                    }
+                }
                 ConfigOutcome::Unset(ConfigSetOutcome {
                     value: None,
                     field: f.field,

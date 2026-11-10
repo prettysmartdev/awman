@@ -217,6 +217,18 @@ async fn every_route_error_has_code_and_authoritative_code_status_table_is_exerc
         ("control_held", 409),
         ("input_not_allowed", 403),
         ("input_backpressure", 429),
+        // WI 0143 pull routes (exercised over HTTP in frontend::api::worker_pull).
+        ("pull_disabled", 503),
+        ("server_not_found", 404),
+        ("server_not_registered", 503),
+        ("item_not_found", 404),
+        ("lease_not_found", 404),
+        ("lease_ended", 409),
+        ("taken", 409),
+        ("ineligible", 409),
+        ("worker_busy", 409),
+        ("link_revoked", 409),
+        ("upstream_unavailable", 502),
     ]
     .into_iter()
     .collect::<std::collections::HashSet<_>>();

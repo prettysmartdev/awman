@@ -95,6 +95,12 @@ pub enum BackendLoss {
 
 /// The facade a presenting frontend holds.
 pub trait InstanceBackend: Send + Sync {
+    fn queue_source(
+        &self,
+        _session: &Session,
+    ) -> Result<Option<crate::command::worker::queue_source::SharedQueueSource>, String> {
+        Ok(None)
+    }
     fn kind(&self) -> BackendKind;
     fn instance_id(&self) -> InstanceId;
     /// The catalogue the instance dispatches against (hints read it too).

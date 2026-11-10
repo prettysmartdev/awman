@@ -77,3 +77,88 @@ async fn capabilities_advertise_only_what_works() {
     let terminals = server.get("/v1/terminals").await;
     assert_eq!(terminals["items"], serde_json::json!([]), "{terminals}");
 }
+
+/// WI 0143: `worker` keeps 0140's per-feature fields and adds `push` and
+/// `pull`; with the feature on, the pull controller advertises its capabilities,
+/// and the pull routes answer on the local listener.
+#[tokio::test(flavor = "multi_thread")]
+async fn worker_status_has_push_and_pull_sides_and_pull_routes_answer() {
+    let home = ApiHome::new();
+    let server = home.start().await;
+    let status = server.get("/v1/status").await;
+    let worker = &status["features"]["worker"];
+    assert_eq!(
+        worker["push"],
+        serde_json::json!({"running": 0, "queued": 0}),
+        "{worker}"
+    );
+    assert_eq!(
+        worker["pull"],
+        serde_json::json!({"servers": []}),
+        "{worker}"
+    );
+    assert!(
+        status["features"]["squad"].get("pull").is_none(),
+        "{status}"
+    );
+    let capabilities = status["capabilities"].as_array().unwrap();
+    for capability in [
+        "workflow_dynamic",
+        "workflow_file",
+        "prompt",
+        "workflow_state_events",
+        "outputs_mount_state",
+    ] {
+        assert!(
+            capabilities.contains(&serde_json::json!(capability)),
+            "{status}"
+        );
+    }
+    // The enabled worker feature runs the pull controller, which advertises its
+    // capabilities (`lease_read_only` depends on the runtime) even with no server.
+    for capability in [
+        "worker_pull",
+        "lease_credentials",
+        "lease_inline_work_item",
+        "lease_git_auth_failure",
+        "lease_push_retry",
+    ] {
+        assert!(
+            capabilities.contains(&serde_json::json!(capability)),
+            "{status}"
+        );
+    }
+    assert_eq!(
+        server.get("/v1/worker/servers").await,
+        serde_json::json!({"items": [], "next_cursor": null})
+    );
+    assert_eq!(
+        server.get("/v1/worker/leases").await,
+        serde_json::json!({"items": [], "next_cursor": null})
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn disabled_worker_omits_pull_capabilities_even_when_the_handle_exists() {
+    let home = ApiHome::new();
+    home.write_config_exact(serde_json::json!({"daemon":{"features":{"worker":{"enabled":false},"squad":{"enabled":true,"envPersistence":"none"}}}}));
+    let server = home.start().await;
+    let status = server.get("/v1/status").await;
+    assert_eq!(status["features"]["worker"]["state"], "off");
+    for cap in [
+        "worker_pull",
+        "lease_credentials",
+        "lease_inline_work_item",
+        "lease_read_only",
+        "lease_git_auth_failure",
+        "lease_push_retry",
+    ] {
+        assert!(
+            !status["capabilities"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!(cap)),
+            "{status}"
+        );
+    }
+}

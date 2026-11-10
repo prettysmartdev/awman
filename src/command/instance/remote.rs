@@ -380,6 +380,15 @@ enum Outbound {
 
 #[derive(Default)]
 struct State {
+    /// Pending queue requests, with the tab each was made from. An entry
+    /// outlives a caller that gave up waiting, so a late answer is noticed.
+    queue_waiters: HashMap<
+        u64,
+        (
+            TabId,
+            std::sync::mpsc::Sender<crate::data::worker::queue::QueueReply>,
+        ),
+    >,
     frontend_id: FrontendId,
     tabs: Vec<RemoteTab>,
     /// Tabs the engine has that this presenter never asked for (another
@@ -552,6 +561,38 @@ impl Drop for RemoteRun {
 // ─── The trait ──────────────────────────────────────────────────────────────
 
 impl InstanceBackend for RemoteInstanceBackend {
+    fn queue_source(
+        &self,
+        session: &Session,
+    ) -> Result<Option<crate::command::worker::queue_source::SharedQueueSource>, String> {
+        if !session.effective_config().tui_worker_enabled() {
+            return Ok(None);
+        }
+        let tab_id = self
+            .tab_id(&session.id())
+            .ok_or("queue requires an open tab")?;
+        let source = Arc::new(RemoteQueue {
+            shared: self.shared.clone(),
+            tab_id,
+            generation: AtomicU64::new(0),
+            snapshot: Default::default(),
+        });
+        let weak = Arc::downgrade(&source);
+        std::thread::Builder::new()
+            .name("awman-queue-view".into())
+            .spawn(move || {
+                while let Some(source) = weak.upgrade() {
+                    if source.shared.stop.is_cancelled() {
+                        break;
+                    }
+                    source.update_snapshot();
+                    drop(source);
+                    std::thread::sleep(Duration::from_millis(500));
+                }
+            })
+            .map_err(|e| e.to_string())?;
+        Ok(Some(source))
+    }
     fn kind(&self) -> BackendKind {
         BackendKind::Daemon {
             instance_id: self.shared.instance_id.clone(),
@@ -772,7 +813,10 @@ impl InstanceBackend for RemoteInstanceBackend {
         };
         self.shared.send(FrontendFrame::Submit {
             tab_id,
-            input: SubmitInput::Argv { args },
+            input: match request.lease_id {
+                Some(lease_id) => SubmitInput::Lease { lease_id, args },
+                None => SubmitInput::Argv { args },
+            },
             pty_size,
         });
         let ack = self.wait(rx, "submit")?;
@@ -1503,6 +1547,24 @@ fn collect_inputs(shared: &Shared) -> Vec<Outbound> {
 fn handle_frame(shared: &Shared, state: &mut State, seq: Seq, frame: EngineFrame) {
     let _ = seq;
     match frame {
+        EngineFrame::WorkerQueue { request_id, reply } => {
+            if let Some((tab_id, waiter)) = state.queue_waiters.remove(&request_id) {
+                use crate::data::worker::queue::{LeaseCloseChoice, QueueReply, QueueRequest};
+                // The caller stopped waiting (a slow clone): nobody will run
+                // this lease, so hand the item back instead of holding it.
+                if let Err(std::sync::mpsc::SendError(QueueReply::Picked(run))) = waiter.send(reply)
+                {
+                    shared.send(FrontendFrame::WorkerQueue {
+                        request_id: shared.next_ticket.fetch_add(1, Ordering::Relaxed),
+                        tab_id,
+                        request: QueueRequest::Finish {
+                            lease_id: run.lease_id,
+                            choice: LeaseCloseChoice::Release,
+                        },
+                    });
+                }
+            }
+        }
         EngineFrame::Welcome { .. } => {}
         EngineFrame::Snapshot(snapshot) => resync(shared, state, snapshot),
         EngineFrame::SnapshotChunk { chunk, of, bytes } => {
@@ -2456,6 +2518,7 @@ fn catch_up(address: &Path, tab: &mut RemoteTab, snapshot: &TabSnapshot) {
 
 fn frame_name(frame: &EngineFrame) -> &'static str {
     match frame {
+        EngineFrame::WorkerQueue { .. } => "worker_queue",
         EngineFrame::Welcome { .. } => "welcome",
         EngineFrame::Snapshot(_) => "snapshot",
         EngineFrame::SnapshotChunk { .. } => "snapshot_chunk",
@@ -2485,3 +2548,96 @@ fn p95(samples: &[Duration]) -> Option<Duration> {
 #[cfg(test)]
 #[path = "remote_tests.rs"]
 mod tests;
+
+/// Presentation proxy for the worker owned by the connected engine instance.
+struct RemoteQueue {
+    shared: Arc<Shared>,
+    tab_id: TabId,
+    generation: AtomicU64,
+    snapshot: Mutex<crate::data::worker::queue::QueueSnapshot>,
+}
+impl RemoteQueue {
+    fn update_snapshot(&self) {
+        use crate::data::worker::queue::*;
+        let snapshot = match self.call(QueueRequest::Snapshot) {
+            QueueReply::Snapshot(snapshot) => snapshot,
+            other => QueueSnapshot {
+                error: Some(format!("queue unavailable: {other:?}")),
+                loaded: true,
+                ..Default::default()
+            },
+        };
+        let mut current = self.snapshot.lock().unwrap();
+        if *current != snapshot {
+            *current = snapshot;
+            self.generation.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    fn call(
+        &self,
+        request: crate::data::worker::queue::QueueRequest,
+    ) -> crate::data::worker::queue::QueueReply {
+        use crate::data::worker::queue::{PickError, QueueReply};
+        let request_id = self.shared.next_ticket.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.shared
+            .lock()
+            .queue_waiters
+            .insert(request_id, (self.tab_id.clone(), tx));
+        self.shared.send(FrontendFrame::WorkerQueue {
+            request_id,
+            tab_id: self.tab_id.clone(),
+            request,
+        });
+        // On a timeout the waiter stays registered: the engine's eventual
+        // answer is then seen by `handle_frame`, which releases a lease that
+        // was picked for a caller no longer there.
+        let result = rx.recv_timeout(Duration::from_secs(120));
+        result.unwrap_or_else(|_| {
+            QueueReply::Error(PickError::Failed("engine queue request timed out".into()))
+        })
+    }
+}
+impl crate::command::worker::queue_source::QueueSource for RemoteQueue {
+    fn snapshot(&self) -> crate::data::worker::queue::QueueSnapshot {
+        self.snapshot.lock().unwrap().clone()
+    }
+    fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Relaxed)
+    }
+    fn mark_seen(&self) {
+        let _ = self.call(crate::data::worker::queue::QueueRequest::Seen);
+    }
+    fn refresh(&self) {
+        let _ = self.call(crate::data::worker::queue::QueueRequest::Refresh);
+    }
+    fn pick(
+        &self,
+        server: &str,
+        item_id: &str,
+    ) -> Result<crate::data::worker::queue::PickRun, crate::data::worker::queue::PickError> {
+        use crate::data::worker::queue::*;
+        match self.call(QueueRequest::Pick {
+            server: server.into(),
+            item_id: item_id.into(),
+        }) {
+            QueueReply::Picked(run) => Ok(run),
+            QueueReply::Error(error) => Err(error),
+            _ => Err(PickError::Failed("invalid engine queue response".into())),
+        }
+    }
+    fn finish_lease(
+        &self,
+        lease_id: &str,
+        choice: crate::data::worker::queue::LeaseCloseChoice,
+    ) -> Result<(), String> {
+        use crate::data::worker::queue::*;
+        match self.call(QueueRequest::Finish {
+            lease_id: lease_id.into(),
+            choice,
+        }) {
+            QueueReply::Done => Ok(()),
+            other => Err(format!("finish lease: {other:?}")),
+        }
+    }
+}

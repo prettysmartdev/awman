@@ -221,7 +221,7 @@ fn squad_add_interval_defaults_to_six_hours_but_accepts_an_explicit_five_minutes
 
 /// WI 0116 §6d. `squad env` is deliberately **not** API-allowed: it reports on
 /// this shell's own coverage relative to a daemon, which is a local question,
-/// and admitting it through the `/v1/commands` front door would make the leaf
+/// and admitting it through the `/v1/worker/commands` front door would make the leaf
 /// remotely reachable. Its `GatewayNeed` is `Running`, exactly like `squad
 /// list`, so it refuses without a running daemon rather than reporting
 /// "nothing required" against a daemon that does not exist.

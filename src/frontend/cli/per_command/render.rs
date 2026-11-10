@@ -51,6 +51,35 @@ pub fn render(outcome: &CommandOutcome, json: bool) -> Option<String> {
         }
         CommandOutcome::ExecWorkflow(o) => render_exec_workflow(o),
         CommandOutcome::Config(o) => render_config(o, json),
+        CommandOutcome::WorkerLink(o) => Some(if json {
+            to_json(o)
+        } else {
+            format!("Linked {} at {}", o.name, o.url)
+        }),
+        CommandOutcome::Queue(o) => Some(if json {
+            to_json(o)
+        } else if o.items.is_empty() {
+            "No eligible work items.".into()
+        } else {
+            o.items
+                .iter()
+                .map(|row| {
+                    format!(
+                        "{}  {}  [{}]  priority {}",
+                        row.id, row.title, row.server, row.priority
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }),
+        CommandOutcome::QueuePick(o) => Some(if json {
+            to_json(o)
+        } else {
+            format!(
+                "Work item finished with exit code {}.",
+                o.exit_code.unwrap_or(1)
+            )
+        }),
         CommandOutcome::Daemon(o) => super::daemon::render(o, json),
         CommandOutcome::DaemonApi(o) => Some(super::daemon::render_api(o, json)),
         CommandOutcome::Remote(o) => render_remote(o),

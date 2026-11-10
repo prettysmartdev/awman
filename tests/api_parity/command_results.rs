@@ -2,7 +2,7 @@
 //!
 //! * `CommandError::code()` / `stage()` — pure table tests over every variant.
 //! * `GitEngine::command_result` — real `git` in a temp repo, no server.
-//! * Everything else drives the shipped `awman api start` binary with the fake
+//! * Everything else drives the shipped `awman daemon start` binary with the fake
 //!   `docker` of `helpers/api_process.rs` (no container runtime, no network
 //!   beyond loopback). Tests that need `git` carry `real_git`; the ones that
 //!   need only loopback HTTP carry `real_network`, so `make test-fast` skips
@@ -701,7 +701,7 @@ mod checkout_facts {
 
 #[cfg(unix)]
 mod server {
-    //! The shipped `awman api start` with a fake `docker`: one test per way a
+    //! The shipped `awman daemon start` with a fake `docker`: one test per way a
     //! command can end, each checking the row, the event stream and the result.
 
     use std::path::{Path, PathBuf};

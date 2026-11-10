@@ -41,3 +41,7 @@ pub mod daemon_runtime;
 pub mod engine_handoff;
 pub mod instance;
 pub mod integrations;
+
+pub mod git_credential_helper;
+
+pub mod worker;

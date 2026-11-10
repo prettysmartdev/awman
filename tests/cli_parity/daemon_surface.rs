@@ -56,6 +56,15 @@ fn removed_flags_are_clap_unknown_arguments() {
         assert!(!error.contains("has been removed"), "{error}");
     }
 }
+
+#[test]
+fn queue_pick_without_id_and_without_a_tty_requests_an_id() {
+    let home = tempfile::tempdir().unwrap();
+    let output = cli(home.path(), &["queue", "pick"]);
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("item-id"), "{stderr}");
+}
 #[test]
 fn set_reaches_effective_config_for_only_one_invocation() {
     let home = tempfile::tempdir().unwrap();
@@ -499,4 +508,131 @@ async fn the_cli_drives_a_running_daemon_over_its_local_socket() {
         success(run(&["daemon", "status"])).trim(),
         "awman daemon is not running"
     );
+}
+
+/// A running daemon whose worker feature pulls from one mock work server in
+/// `manual` mode, with one eligible item queued.
+#[cfg(unix)]
+struct QueueFixture {
+    home: api_process::ApiHome,
+    _serving: awman_wsp::mock::ServingMock,
+    _mock: std::sync::Arc<awman_wsp::mock::MockWorkServer>,
+    _server: api_process::ApiServer,
+    _work: tempfile::TempDir,
+}
+
+#[cfg(unix)]
+async fn queue_fixture(item_ids: &[&str]) -> QueueFixture {
+    let mock = std::sync::Arc::new(awman_wsp::mock::MockWorkServer::new());
+    let serving = mock.clone().serve().await.unwrap();
+    let link = mock.link();
+    mock.approve_link(&link.link_id, Default::default());
+    let token = awman_wsp::Client::new(&serving.base_url, String::new())
+        .unwrap()
+        .poll_link(&link.link_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let home = api_process::ApiHome::new();
+    home.write_config(json!({
+        "daemon": {"features": {"worker": {"pull": {
+            "enabled": true, "interaction": "headless", "workRoot": work.path()
+        }}}},
+        "workServers": {"team": {"url": serving.base_url, "claim": "manual", "maxConcurrentJobs": 1}}
+    }));
+    let env = awman::data::config::env::EnvSnapshot::with_overrides([
+        ("HOME", home.home().to_str().unwrap().to_string()),
+        (
+            "XDG_CONFIG_HOME",
+            home.home().join(".config").to_string_lossy().into_owned(),
+        ),
+        (
+            "XDG_DATA_HOME",
+            home.home()
+                .join(".local/share")
+                .to_string_lossy()
+                .into_owned(),
+        ),
+    ]);
+    awman::data::worker::link_store::LinkStore::new(
+        &awman::data::fs::DataPaths::from_env(&env).unwrap(),
+    )
+    .write("team", &token)
+    .unwrap();
+    let server = home.start().await;
+    for id in item_ids {
+        let mut item = awman_wsp::conformance::work_item(id);
+        item.exec.agent = Some("claude".into());
+        mock.enqueue(item, chrono::Utc::now()).unwrap();
+    }
+    QueueFixture {
+        home,
+        _serving: serving,
+        _mock: mock,
+        _server: server,
+        _work: work,
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn queue_json_lists_items_envelope() {
+    let f = queue_fixture(&["first", "second"]).await;
+    let out: Value = serde_json::from_str(&f.home.cli_ok(&["queue", "--json"])).unwrap();
+    let items = out["items"].as_array().expect("an items array");
+    let mut ids: Vec<&str> = items.iter().map(|i| i["id"].as_str().unwrap()).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, ["first", "second"], "{out}");
+    for item in items {
+        assert_eq!(item["server"], "team");
+        for field in ["title", "kind", "labels", "priority", "age_ms", "for_you"] {
+            assert!(item.get(field).is_some(), "missing {field}: {item}");
+        }
+    }
+    let filtered: Value =
+        serde_json::from_str(&f.home.cli_ok(&["queue", "--server", "team", "--json"])).unwrap();
+    assert_eq!(filtered["items"].as_array().unwrap().len(), 2);
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn queue_lists_human_readable_rows_and_the_empty_state() {
+    let f = queue_fixture(&["only"]).await;
+    let text = f.home.cli_ok(&["queue"]);
+    assert!(text.contains("only") && text.contains("[team]"), "{text}");
+    let none = queue_fixture(&[]).await;
+    assert!(none
+        .home
+        .cli_ok(&["queue"])
+        .contains("No eligible work items."));
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn queue_pick_json_never_prompts_without_an_id_even_with_a_daemon() {
+    let f = queue_fixture(&["only"]).await;
+    let output = f.home.cli(&["queue", "pick", "--json"]);
+    assert_eq!(output.status.code(), Some(2));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let error: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert!(
+        error["error"].as_str().unwrap().contains("item-id"),
+        "{stdout}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn queue_without_a_daemon_or_links_is_an_empty_manual_queue() {
+    let home = tempfile::tempdir().unwrap();
+    let output = cli(home.path(), &["queue", "--json"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let page: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(page["items"], serde_json::json!([]));
+    assert!(page["next_cursor"].is_null());
 }

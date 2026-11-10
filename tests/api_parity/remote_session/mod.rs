@@ -10,7 +10,7 @@
 //!             against that origin, and the `push_branch` step's real git
 //!             semantics.
 //!
-//! The setup and push tests run the real `awman api start` binary with a fake
+//! The setup and push tests run the real `awman daemon start` binary with a fake
 //! `docker` (see `helpers/api_process.rs`), so no container runtime is used.
 //! They carry `real_git` in their names so `make test-fast` skips them; the
 //! one that needs only loopback HTTP carries `real_network`.

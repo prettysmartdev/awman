@@ -740,6 +740,7 @@ pub(super) fn handle_dialog_char(app: &mut App, c: char) {
         // via `handle_dialog_scroll`, Enter opens a run's detail and Esc
         // leaves it. Per-task actions stay in
         // the detail modal, so no char key is silently overloaded here.
+        Some(Dialog::QueuePanel(_)) | Some(Dialog::LeaseCloseConfirm(_)) => {}
         Some(Dialog::SquadTaskHistory(_))
         | Some(Dialog::Loading { .. })
         | Some(Dialog::ListPicker { .. })

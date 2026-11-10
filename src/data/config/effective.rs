@@ -45,6 +45,7 @@ use crate::data::config::state::RepoState;
 use crate::data::config::work_items::{
     WorkItemsConfig, DEFAULT_WORK_ITEMS_DIR, DEFAULT_WORK_ITEM_TEMPLATE,
 };
+use crate::data::config::work_servers::ResolvedWorkServer;
 use crate::data::config::workflows::GUIDANCE_MAX_ENTRIES;
 use crate::data::config::worktree::{OnDirtyMergeTarget, OnMergeFailure};
 use crate::data::error::DataError;
@@ -740,7 +741,32 @@ impl EffectiveConfig {
 
     /// Every `daemon` leaf with defaults applied.
     pub fn daemon(&self) -> DaemonSettings {
-        DaemonSettings::from_merged(&self.merged.daemon.clone().unwrap_or_default())
+        let mut settings =
+            DaemonSettings::from_merged(&self.merged.daemon.clone().unwrap_or_default());
+        settings.worker.work_servers = self.work_servers();
+        settings
+    }
+
+    /// Work servers present in the effective config, with built-in defaults
+    /// applied to `enabled`, `claim` and `maxConcurrentJobs`.
+    pub fn work_servers(&self) -> BTreeMap<String, ResolvedWorkServer> {
+        self.merged
+            .work_servers
+            .as_ref()
+            .into_iter()
+            .flat_map(|servers| servers.iter())
+            .map(|(name, config)| (name.clone(), config.resolved()))
+            .collect()
+    }
+
+    /// Whether this TUI invocation is configured to host a worker.
+    pub fn tui_worker_enabled(&self) -> bool {
+        self.merged
+            .tui
+            .as_ref()
+            .and_then(|tui| tui.worker.as_ref())
+            .and_then(|worker| worker.enabled)
+            .unwrap_or(false)
     }
 
     /// The typed network listener address after defaults and config layers.

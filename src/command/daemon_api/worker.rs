@@ -31,6 +31,25 @@ pub struct WorkerApi {
 }
 
 impl WorkerApi {
+    pub fn push_enabled(&self) -> bool {
+        self.live_config
+            .read()
+            .expect("worker config lock")
+            .as_ref()
+            .map(|config| config.daemon().worker.push_enabled)
+            .unwrap_or_else(|| {
+                crate::data::config::daemon::DaemonSettings::from_merged(
+                    &self
+                        .engines
+                        .global_config
+                        .daemon
+                        .clone()
+                        .unwrap_or_default(),
+                )
+                .worker
+                .push_enabled
+            })
+    }
     pub fn admission(&self) -> ApiAdmission {
         let live = self.live_config.read().expect("worker config lock").clone();
         let mut engines = self.engines.clone();
@@ -121,6 +140,11 @@ pub async fn sessions_create(
     crate::command::commands::api_server::admission::AdmittedSession,
     crate::command::commands::api_server::admission::AdmissionError,
 > {
+    if !api.push_enabled() {
+        return Err(
+            crate::command::commands::api_server::admission::AdmissionError::FeatureDisabled,
+        );
+    }
     api.admission()
         .with_request_context(context)
         .admit_session(request, command, close_on_finish, journal)
@@ -166,6 +190,11 @@ pub async fn commands_create(
     crate::command::commands::api_server::admission::AdmittedCommand,
     crate::command::commands::api_server::admission::AdmissionError,
 > {
+    if !api.push_enabled() {
+        return Err(
+            crate::command::commands::api_server::admission::AdmissionError::FeatureDisabled,
+        );
+    }
     api.admission()
         .with_request_context(context)
         .admit_command(id.as_str(), request, journal)
@@ -322,4 +351,55 @@ pub fn stored_labels<'de, D: serde::Deserializer<'de>>(
     use serde::Deserialize;
     std::collections::BTreeMap::<String, String>::deserialize(d)
         .map(crate::data::fs::api_labels::Labels::from_stored)
+}
+
+/// A command's place in the worker's one job model (WI 0143).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CommandJob {
+    pub origin: Option<crate::data::worker::JobOrigin>,
+    pub outputs_mounted: Option<bool>,
+}
+/// The job side tables beside the command rows (created on first use).
+pub fn job_store(api: &WorkerApi) -> Result<crate::data::worker::job_store::JobStore, DataError> {
+    crate::data::worker::job_store::JobStore::open(api.store.clone())
+}
+pub fn commands_job(api: &WorkerApi, id: &str) -> Result<CommandJob, DataError> {
+    let jobs = job_store(api)?;
+    Ok(CommandJob {
+        origin: jobs.get(id)?.map(|(origin, _)| origin),
+        outputs_mounted: jobs.outputs_mounted(id)?,
+    })
+}
+/// Pushed jobs now running and queued (`/v1/status` `worker.push`). A row
+/// with no recorded origin has not been taken by a lease runner, so it is a
+/// pushed command.
+pub fn push_status(api: &WorkerApi) -> Result<PushStatus, DataError> {
+    let jobs = job_store(api)?;
+    let pulled: std::collections::HashSet<String> = jobs
+        .command_ids(crate::data::worker::JobClass::Pull)?
+        .into_iter()
+        .collect();
+    let count = |status| -> Result<usize, DataError> {
+        Ok(api
+            .store
+            .list_commands_filtered(&CommandListFilter {
+                status: Some(status),
+                session_id: None,
+                labels: &[],
+                limit: i64::MAX,
+            })?
+            .iter()
+            .filter(|row| !pulled.contains(&row.id))
+            .count())
+    };
+    Ok(PushStatus {
+        running: count(crate::data::command_status::CommandStatus::Running)?,
+        queued: count(crate::data::command_status::CommandStatus::Queued)?,
+    })
+}
+/// `worker.push` in `/v1/status`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PushStatus {
+    pub running: usize,
+    pub queued: usize,
 }

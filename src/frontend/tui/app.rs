@@ -113,6 +113,13 @@ pub struct App {
     /// Window-management requests, claims and engine loss (WI 0142); the
     /// renderer asks it how claimed windows draw.
     pub remote_view: crate::frontend::tui::remote_tab::RemoteTabView,
+    /// The Layer 2 worker controller's queue view; `None` when the TUI's
+    /// worker is off (WI 0143).
+    pub queue: Option<crate::frontend::tui::queue::SharedQueueSource>,
+    /// Status-bar badge for new / for-you work items.
+    pub queue_badge: crate::frontend::tui::queue::QueueBadge,
+    /// Last snapshot generation the badge and open panel reflect.
+    pub(super) queue_generation: u64,
 }
 
 impl App {
@@ -180,6 +187,9 @@ impl App {
             last_active_tab: 0,
             squad_indicator,
             remote_view: crate::frontend::tui::remote_tab::RemoteTabView::new(),
+            queue: None,
+            queue_badge: Default::default(),
+            queue_generation: u64::MAX,
         }
     }
 
@@ -262,7 +272,7 @@ impl App {
     /// first when that would also start a daemon.
     ///
     /// On failure nothing is created: the error text — which already names
-    /// `awman api` (daemon conflict) or the sandbox runtime — is surfaced
+    /// a daemon conflict or unsupported runtime — is surfaced
     /// verbatim in the status bar, never a generic "could not connect".
     /// Idempotent: a second call focuses the tab created by the first.
     ///
@@ -439,6 +449,14 @@ impl App {
     /// this resets the tab's view for the new command and binds the returned
     /// feeds to it.
     pub fn spawn_command(&mut self, parsed: ParsedCommandBoxInput) {
+        self.spawn_command_with_lease(parsed, None);
+    }
+
+    pub(crate) fn spawn_command_with_lease(
+        &mut self,
+        parsed: ParsedCommandBoxInput,
+        lease_id: Option<String>,
+    ) {
         if let Err(error) = self.backend.admit(&parsed.path) {
             self.status_bar.text = error.to_string();
             return;
@@ -455,6 +473,7 @@ impl App {
                     daemon_reachable: state.daemon_reachable.clone(),
                 });
         let request = SubmitRequest {
+            lease_id,
             session_id: tab.session_id,
             parsed,
             feeds: tab.shared(),
@@ -605,7 +624,33 @@ impl App {
         self.report_pty_sizes();
         // Last, so the window-management transitions of this tick are
         // reported and engine events land before the next frame.
+        self.tick_queue();
         crate::frontend::tui::remote_tab::RemoteTabView::sync(self);
+    }
+
+    /// Mirror the worker controller's queue into the badge (and the open
+    /// panel) whenever its generation changes (WI 0143).
+    fn tick_queue(&mut self) {
+        let Some(source) = self.queue.clone() else {
+            return;
+        };
+        let generation = source.generation();
+        if generation == self.queue_generation {
+            return;
+        }
+        self.queue_generation = generation;
+        let snapshot = source.snapshot();
+        if let Some(Dialog::QueuePanel(state)) = &mut self.active_dialog {
+            state.apply(snapshot);
+            source.mark_seen();
+            self.queue_badge = Default::default();
+        } else {
+            self.queue_badge = crate::frontend::tui::queue::QueueBadge {
+                for_you: snapshot.for_you,
+                new: snapshot.new_since_seen,
+            };
+        }
+        self.needs_redraw = true;
     }
 
     /// Advance every tab: adopt its session's state, drain its container and

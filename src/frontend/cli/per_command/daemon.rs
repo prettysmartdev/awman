@@ -136,6 +136,36 @@ fn state_label(record: &FeatureRecord) -> String {
 }
 
 /// The `awman daemon status` text form.
+/// The `worker` record's push and pull lines (WI 0143).
+fn worker_sides(record: &FeatureRecord) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(push) = &record.push {
+        lines.push(format!(
+            "    push  {} running  {} queued",
+            push.running, push.queued
+        ));
+    }
+    if let Some(pull) = &record.pull {
+        if pull.servers.is_empty() {
+            lines.push("    pull  no work servers (awman worker link <url>)".into());
+        }
+        let name_w = pull.servers.iter().map(|s| s.name.len()).max().unwrap_or(0);
+        let state_w = pull
+            .servers
+            .iter()
+            .map(|s| s.state.len())
+            .max()
+            .unwrap_or(0);
+        for server in &pull.servers {
+            lines.push(format!(
+                "    pull  {:<name_w$}  {:<state_w$}  {} running  {} eligible",
+                server.name, server.state, server.running, server.queued_eligible
+            ));
+        }
+    }
+    lines
+}
+
 pub fn render_status(status: &StatusResponse) -> String {
     let mut out = vec![format!(
         "awman daemon  pid {}  up {}  version {}",
@@ -205,6 +235,9 @@ pub fn render_status(status: &StatusResponse) -> String {
                 }
             }
             out.push(line.trim_end().to_string());
+            if record.state != FeatureState::Off {
+                out.extend(worker_sides(record));
+            }
         }
     }
     out.push("listeners".into());
@@ -278,6 +311,8 @@ mod tests {
             running,
             queued: 0,
             detail: None,
+            push: None,
+            pull: None,
         }
     }
 
@@ -364,6 +399,48 @@ mod tests {
             "{text}"
         );
         assert!(!text.contains("warning"), "{text}");
+    }
+
+    #[test]
+    fn status_shows_worker_push_and_pull_per_server() {
+        use crate::command::daemon_api::worker_pull::{PullStatus, ServerSummary};
+        let mut worker = record("worker", FeatureState::On, 3, 4);
+        worker.push = Some(crate::command::daemon_api::worker::PushStatus {
+            running: 2,
+            queued: 5,
+        });
+        worker.pull = Some(PullStatus {
+            servers: vec![
+                ServerSummary {
+                    name: "team".into(),
+                    state: "registered".into(),
+                    running: 1,
+                    queued_eligible: 7,
+                },
+                ServerSummary {
+                    name: "ci".into(),
+                    state: "disconnected".into(),
+                    running: 0,
+                    queued_eligible: 0,
+                },
+            ],
+        });
+        let text = render_status(&status(vec![worker], None));
+        assert!(text.contains("    push  2 running  5 queued"), "{text}");
+        assert!(
+            text.contains("    pull  team  registered    1 running  7 eligible"),
+            "{text}"
+        );
+        assert!(
+            text.contains("    pull  ci    disconnected  0 running  0 eligible"),
+            "{text}"
+        );
+        let mut empty = record("worker", FeatureState::On, 0, 4);
+        empty.pull = Some(PullStatus::default());
+        let text = render_status(&status(vec![empty], None));
+        assert!(text.contains("pull  no work servers"), "{text}");
+        let off = record("worker", FeatureState::Off, 0, 4);
+        assert!(!render_status(&status(vec![off], None)).contains("push"));
     }
 
     #[test]

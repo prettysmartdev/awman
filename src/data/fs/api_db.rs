@@ -298,11 +298,11 @@ pub struct CommandResult {
     /// Kept, deprecated: use `failure.stage`. Filled exactly as before WI
     /// 0137 (additive versioning): `"workflow_prerequisites"` for an
     /// unresolved prerequisite, `"push"` for a push-back failure, `"setup"`
-    /// for a `/v1/runs` setup failure, and absent otherwise (and on cancel).
+    /// for a `/v1/worker/runs` setup failure, and absent otherwise (and on cancel).
     /// Where it is present it equals `failure.stage`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stage: Option<String>,
-    /// Kept, deprecated: a `/v1/runs` setup failure's own `{stage, message}`
+    /// Kept, deprecated: a `/v1/worker/runs` setup failure's own `{stage, message}`
     /// (WI 0135). Setup failures also carry `failure.stage = "setup"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub setup_error: Option<serde_json::Value>,
@@ -340,10 +340,29 @@ pub struct CommandFailure {
     pub step: Option<String>,
 }
 
+/// `CommandFailure::stage` values (the stages listed on [`CommandFailure::stage`]
+/// plus WI 0143's lease Git authentication stage).
+pub mod failure_stages {
+    pub const SETUP: &str = "setup";
+    pub const PREFLIGHT: &str = "preflight";
+    pub const STEP: &str = "step";
+    pub const TEARDOWN: &str = "teardown";
+    pub const MERGE: &str = "merge";
+    pub const PUSH: &str = "push";
+    /// Lease Git authentication (clone, fetch, ls-remote or push).
+    pub const GIT_AUTH: &str = "git_auth";
+}
+
 /// `CommandFailure::code` values that no `CommandError` variant produces:
 /// they describe engine outcomes and post-command stages, and the queue
 /// worker assigns them.
 pub mod failure_codes {
+    /// A lease Git operation was refused for its credentials (WI 0143).
+    /// Stage [`super::failure_stages::GIT_AUTH`]. Never retried.
+    pub const GIT_AUTH_FAILED: &str = "git_auth_failed";
+    /// A lease push got no response from the remote within the lease window
+    /// (bounded retries exhausted). Stage [`super::failure_stages::PUSH`].
+    pub const PUSH_UNREACHABLE: &str = "push_unreachable";
     /// A main-phase step failed (`WorkflowOutcome::Failed`).
     pub const STEP_FAILED: &str = "step_failed";
     /// A non-execution command returned a nonzero exit status.
@@ -352,9 +371,9 @@ pub mod failure_codes {
     pub const TEARDOWN_FAILED: &str = "teardown_failed";
     /// Remote-session push-back failed.
     pub const PUSH_FAILED: &str = "push_failed";
-    /// `/v1/runs` session setup failed before the command ran.
+    /// `/v1/worker/runs` session setup failed before the command ran.
     pub const SETUP_FAILED: &str = "setup_failed";
-    /// Stopped by `POST /v1/commands/{id}/cancel`.
+    /// Stopped by `POST /v1/worker/commands/{id}/cancel`.
     pub const CANCELLED: &str = "cancelled";
     /// The workflow was aborted (`WorkflowOutcome::Aborted`).
     pub const ABORTED: &str = "aborted";
@@ -785,7 +804,7 @@ impl SqliteSessionStore {
 
     /// Classify whether a session may accept a newly-submitted command, based
     /// on its lifecycle state. This is the state-transition guard that used to
-    /// live inline in the API `POST /v1/commands` handler; it belongs on the
+    /// live inline in the API `POST /v1/worker/commands` handler; it belongs on the
     /// store that owns the `status` column so every frontend enforces it
     /// identically. Frontends map the typed outcome to a transport status.
     pub fn command_admission(
@@ -1065,6 +1084,23 @@ impl SqliteSessionStore {
             "INSERT INTO commands (id, session_id, subcommand, args, status, log_path)
              VALUES (?1, ?2, ?3, ?4, 'queued', ?5)",
             params![id, session_id, subcommand, args, log_path],
+        )?;
+        Ok(())
+    }
+
+    /// A pulled lease owns its executor permit before this row exists.
+    /// Insert as running atomically; it never enters the push queue.
+    pub fn insert_running_lease_command(
+        &self,
+        id: &str,
+        session: &str,
+        command: &str,
+        args: &str,
+        allow_remote_input: bool,
+    ) -> Result<(), DataError> {
+        self.lock().execute(
+            "INSERT INTO commands (id, session_id, subcommand, args, status, log_path, started_at, worker_id, allow_remote_input) VALUES (?1, ?2, ?3, ?4, 'running', '', ?5, 'pull', ?6)",
+            params![id, session, command, args, chrono::Utc::now().to_rfc3339(), allow_remote_input],
         )?;
         Ok(())
     }
@@ -1625,6 +1661,9 @@ impl SqliteSessionStore {
         Ok(ids)
     }
 
+    /// Re-queue pushed commands a dead worker left `running`. Pulled-lease
+    /// rows (`worker_id = 'pull'`) are never re-queued: they cannot run
+    /// without their lease, and a live TUI or CLI host may still own one.
     pub fn recover_stale_commands(&self, timeout_secs: u64) -> Result<Vec<String>, DataError> {
         let cutoff = chrono::Utc::now() - chrono::Duration::seconds(timeout_secs as i64);
         let cutoff_str = cutoff.to_rfc3339();
@@ -1632,7 +1671,8 @@ impl SqliteSessionStore {
         let ids: Vec<String> = {
             let mut stmt = conn.prepare(
                 "SELECT id FROM commands
-                 WHERE status = 'running' AND started_at IS NOT NULL AND started_at < ?1",
+                 WHERE status = 'running' AND started_at IS NOT NULL AND started_at < ?1
+                   AND worker_id IS NOT 'pull'",
             )?;
             let rows = stmt
                 .query_map(params![cutoff_str], |row| row.get(0))?
@@ -1642,7 +1682,8 @@ impl SqliteSessionStore {
         conn.execute(
             "UPDATE commands SET status = 'queued', worker_id = NULL, started_at = NULL,
                  attempt = attempt + 1
-             WHERE status = 'running' AND started_at IS NOT NULL AND started_at < ?1",
+             WHERE status = 'running' AND started_at IS NOT NULL AND started_at < ?1
+                   AND worker_id IS NOT 'pull'",
             params![cutoff_str],
         )?;
         Ok(ids)
@@ -2026,15 +2067,15 @@ mod tests {
     fn idempotency_replays_until_24_hour_expiry_and_is_scope_isolated() {
         let (_tmp, store) = make_store();
         let commands = IdempotencyScope {
-            route: "/v1/commands",
+            route: "/v1/worker/commands",
             principal: "key-a",
         };
         let other_principal = IdempotencyScope {
-            route: "/v1/commands",
+            route: "/v1/worker/commands",
             principal: "key-b",
         };
         let other_route = IdempotencyScope {
-            route: "/v1/runs",
+            route: "/v1/worker/runs",
             principal: "key-a",
         };
         let owner = IdempotencyOwner {
@@ -2092,7 +2133,7 @@ mod tests {
     fn idempotency_replays_mismatches_expires_and_releases() {
         let (_tmp, store) = make_store();
         let scope = IdempotencyScope {
-            route: "/v1/commands",
+            route: "/v1/worker/commands",
             principal: "local",
         };
         let a = IdempotencyOwner {
@@ -2536,6 +2577,22 @@ mod tests {
             .unwrap();
         assert_eq!(store.recover_stale_commands(1).unwrap(), ["crash"]);
         assert_eq!(store.get_command("crash").unwrap().unwrap().attempt, 3);
+    }
+
+    #[test]
+    fn recover_stale_commands_never_requeues_a_pulled_lease_row() {
+        let (_tmp, store) = make_store();
+        store
+            .insert_session("s1", "/w", "2026-01-01T00:00:00Z")
+            .unwrap();
+        store
+            .insert_running_lease_command("lease", "s1", "exec", "[]", false)
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert!(store.recover_stale_commands(0).unwrap().is_empty());
+        let row = store.get_command("lease").unwrap().unwrap();
+        assert_eq!(row.status, CommandStatus::Running);
+        assert_eq!(row.attempt, 1);
     }
 
     #[test]

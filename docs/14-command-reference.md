@@ -677,8 +677,8 @@ Runs without a working agent runtime — reachable even when the configured runt
 | `--plan` | bool | false | — | `--yolo` | CLI, TUI, API | Run the agent in plan mode (read-only). |
 | `--allow-docker` | bool | false | — | — | CLI, TUI, API | Mount the host Docker daemon socket into the agent container. |
 | `--interactive` | bool | false | — | `--headless` | CLI, TUI, API | Run the agent interactively in a terminal (PTY). Overrides a daemon worker's headless default where the worker allows it. |
-| `--yolo` | bool | false | `--worktree` | `--plan` | CLI, TUI, API | Enable fully autonomous mode. Implies --worktree. |
-| `--auto` | bool | false | `--worktree` | — | CLI, TUI, API | Enable auto permission mode. Implies --worktree. |
+| `--yolo` | bool | false | — | `--plan` | CLI, TUI, API | Enable fully autonomous mode. Implies --worktree. |
+| `--auto` | bool | false | — | — | CLI, TUI, API | Enable auto permission mode. Implies --worktree. |
 | `--agent` | string (optional) | — | — | — | CLI, TUI, API | Agent to use. |
 | `--model` | string (optional) | — | — | — | CLI, TUI, API | Override the model used by the launched agent. |
 | `--overlay` | string (repeatable) | [] | — | — | CLI, TUI, API | Mount a host directory into the agent container. Repeatable. |
@@ -801,6 +801,68 @@ Available via: CLI, TUI
 |---|---|---|---|---|---|---|
 | `-y, --yes` | bool | false | — | — | CLI, TUI, API | Skip the confirmation prompt (for scripting). |
 | `--dry-run` | bool | false | — | — | CLI, TUI, API | List what would be removed without deleting anything. |
+
+---
+
+## `awman worker`
+
+Link awman to a work server.
+
+Available via: CLI, TUI
+
+Runs without a working agent runtime — reachable even when the configured runtime cannot be started on this host.
+
+### `awman worker link`
+
+Approve a device link or store a server-issued token.
+
+Links this machine to a work server. The refresh token is stored as owner-only state, never in config.
+
+Available via: CLI, TUI
+
+Runs without a working agent runtime — reachable even when the configured runtime cannot be started on this host.
+
+| Argument | Kind | Required | Help |
+|---|---|---|---|
+| `server-url` | string | yes | HTTPS base URL of the work server. |
+
+| Flag | Kind | Default | Implies | Conflicts | Frontends | Help |
+|---|---|---|---|---|---|---|
+| `--name` | string | — | — | — | CLI, TUI, API | Config name for this server (defaults to its host name). |
+| `--label` | string (repeatable) | [] | — | — | CLI, TUI, API | Owner-configured label k=v (repeatable). |
+| `--token` | string | — | — | — | CLI, TUI, API | Static token, or - to read from stdin; omit for device flow. |
+
+---
+
+## `awman queue`
+
+List eligible work items or pick one to run.
+
+Available via: CLI, TUI
+
+Runs without a working agent runtime — reachable even when the configured runtime cannot be started on this host.
+
+| Flag | Kind | Default | Implies | Conflicts | Frontends | Help |
+|---|---|---|---|---|---|---|
+| `--server` | string | — | — | — | CLI | Limit the queue to this linked work server. |
+| `--json` | bool | false | — | — | CLI | Print queue items as JSON and disable prompts. |
+
+### `awman queue pick`
+
+Claim and run an eligible work item.
+
+Available via: CLI, TUI
+
+Runs without a working agent runtime — reachable even when the configured runtime cannot be started on this host.
+
+| Argument | Kind | Required | Help |
+|---|---|---|---|
+| `item-id` | string | no | Work item ID to claim. |
+
+| Flag | Kind | Default | Implies | Conflicts | Frontends | Help |
+|---|---|---|---|---|---|---|
+| `--server` | string | — | — | — | CLI | Limit the picker to this linked work server. |
+| `--json` | bool | false | — | — | CLI | Print the completed command result as JSON and disable prompts. |
 
 ---
 

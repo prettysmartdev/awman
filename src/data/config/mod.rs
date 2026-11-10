@@ -67,7 +67,9 @@ pub use squad::SquadConfig;
 pub use state::RepoState;
 pub use tui::TuiConfig;
 pub use work_items::WorkItemsConfig;
-pub use work_servers::WorkServerConfig;
+pub use work_servers::{
+    normalize_work_server_name, ClaimMode, ResolvedWorkServer, WorkServerConfig,
+};
 pub use workflows::{DynamicConfig, WorkflowsConfig};
 pub use worktree::{MergeFixConfig, OnDirtyMergeTarget, OnMergeFailure, WorktreeConfig};
 

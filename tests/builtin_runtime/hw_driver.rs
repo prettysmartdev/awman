@@ -19,6 +19,10 @@
 
 #![deny(unsafe_code)]
 
+#[cfg(awman_builtin)]
+#[path = "../worker_native/probe.rs"]
+mod worker_mount_probe;
+
 #[cfg(not(awman_builtin))]
 fn main() -> std::process::ExitCode {
     if awman_host_shims::dispatch_worker(std::env::vars_os(), std::env::args_os()) {
@@ -391,6 +395,11 @@ mod driver {
                     return ExitCode::from(1);
                 }
             }
+        }
+        if args.scenario == "worker-mount" {
+            crate::worker_mount_probe::run(std::sync::Arc::new(runtime), "builtin", &args.tag)
+                .await;
+            return ExitCode::SUCCESS;
         }
         match scenario(&runtime, &args).await {
             Ok(()) => ExitCode::SUCCESS,

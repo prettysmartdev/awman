@@ -161,6 +161,11 @@ pub(super) fn render_status_bar(app: &App, area: Rect, frame: &mut Frame, sideba
                 ),
             ]
         }
+        // Idle: the git-sidebar hint, plus the queue hint when the worker is on.
+        _ if app.queue.is_some() => vec![Span::styled(
+            " \u{00b7} ctrl-g git  \u{00b7}  ctrl-q queue ",
+            Style::default().fg(Color::DarkGray),
+        )],
         // Idle: just the git-sidebar hint.
         _ => vec![Span::styled(
             " \u{00b7} ctrl-g git ",

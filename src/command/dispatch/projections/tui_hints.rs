@@ -193,21 +193,19 @@ mod tests {
     #[test]
     fn completions_do_not_include_cli_only_flags() {
         let cat = CommandCatalogue::get();
-        // api start's CliOnly flags must not appear in TUI completions.
-        let comps = cat.tui_completions("api start ");
+        assert!(cat.lookup(&["queue"]).is_some());
+        let comps = cat.tui_completions("queue ");
         let flag_completions: Vec<&str> = comps.iter().map(|c| c.completion.as_str()).collect();
-        for cli_only_flag in &[
-            "--port",
-            "--workdirs",
-            "--background",
-            "--refresh-key",
-            "--dangerously-skip-tls",
-        ] {
+        for cli_only_flag in &["--server", "--json"] {
             assert!(
                 !flag_completions.contains(cli_only_flag),
                 "CLI-only flag '{cli_only_flag}' must not appear in TUI completions; got: {flag_completions:?}"
             );
         }
+        assert!(
+            flag_completions.iter().any(|value| value.contains("pick")),
+            "live queue completion must include its action"
+        );
     }
 
     #[test]

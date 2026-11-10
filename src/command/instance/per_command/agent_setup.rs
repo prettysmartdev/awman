@@ -48,13 +48,19 @@ impl AgentSetupFrontend for InstanceCommandFrontend {
 impl HasAgentFrontend for InstanceCommandFrontend {
     fn container_frontend(&mut self) -> Box<dyn AgentFrontend> {
         if self.is_cli() {
-            return Box::new(super::InstanceContainerProxy::with_io(
-                self.status_log.clone(),
-                self.command_bytes.pipe(self.wake.clone()),
-                None,
-            ));
+            return crate::command::worker::events::recording_frontend(
+                Box::new(super::InstanceContainerProxy::with_io(
+                    self.status_log.clone(),
+                    self.command_bytes.pipe(self.wake.clone()),
+                    None,
+                )),
+                self.worker_events.clone(),
+            );
         }
-        Box::new(super::InstanceContainerProxy::new(self.status_log.clone()))
+        crate::command::worker::events::recording_frontend(
+            Box::new(super::InstanceContainerProxy::new(self.status_log.clone())),
+            self.worker_events.clone(),
+        )
     }
 
     fn container_frontend_for_pty(&mut self) -> Box<dyn AgentFrontend> {
@@ -65,14 +71,15 @@ impl HasAgentFrontend for InstanceCommandFrontend {
         // master is wired directly to the TUI's vt100 parser. After this the
         // engine drives all stdout/stdin/resize traffic; the InstanceCommandFrontend
         // continues to be used for status messages and dialog prompts.
-        match self.container_io.take() {
+        let inner: Box<dyn AgentFrontend> = match self.container_io.take() {
             Some(io) => Box::new(super::InstanceContainerProxy::with_io(
                 self.status_log.clone(),
                 io,
                 (!self.parallel_group_active).then(|| self.container.clone()),
             )),
             None => Box::new(super::InstanceContainerProxy::new(self.status_log.clone())),
-        }
+        };
+        crate::command::worker::events::recording_frontend(inner, self.worker_events.clone())
     }
 }
 

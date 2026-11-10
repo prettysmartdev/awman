@@ -76,6 +76,17 @@ pub enum Operation {
     WorkerCommandsOutputs,
     WorkerCommandsOutput,
     WorkerRunsCreate,
+    WorkerServersList,
+    WorkerServersGet,
+    WorkerQueueList,
+    WorkerQueueClaim,
+    WorkerLeasesList,
+    WorkerLeasesGet,
+    WorkerLeasesRelease,
+    WorkerLeasesEvents,
+    WorkerLeasesTerminal,
+    WorkerLeasesResult,
+    WorkerLeasesCheckout,
     SquadTasksList,
     SquadTasksCreate,
     SquadTasksGet,
@@ -134,6 +145,17 @@ impl Operation {
             Self::WorkerCommandsOutputs => Feature::Worker,
             Self::WorkerCommandsOutput => Feature::Worker,
             Self::WorkerRunsCreate => Feature::Worker,
+            Self::WorkerServersList
+            | Self::WorkerServersGet
+            | Self::WorkerQueueList
+            | Self::WorkerQueueClaim
+            | Self::WorkerLeasesList
+            | Self::WorkerLeasesGet
+            | Self::WorkerLeasesRelease
+            | Self::WorkerLeasesEvents
+            | Self::WorkerLeasesTerminal
+            | Self::WorkerLeasesResult
+            | Self::WorkerLeasesCheckout => Feature::Worker,
             Self::SquadTasksList => Feature::Squad,
             Self::SquadTasksCreate => Feature::Squad,
             Self::SquadTasksGet => Feature::Squad,
@@ -191,6 +213,17 @@ impl Operation {
             Self::WorkerCommandsOutputs => "worker.commands.outputs",
             Self::WorkerCommandsOutput => "worker.commands.output",
             Self::WorkerRunsCreate => "worker.runs.create",
+            Self::WorkerServersList => "worker.servers.list",
+            Self::WorkerServersGet => "worker.servers.get",
+            Self::WorkerQueueList => "worker.queue.list",
+            Self::WorkerQueueClaim => "worker.queue.claim",
+            Self::WorkerLeasesList => "worker.leases.list",
+            Self::WorkerLeasesGet => "worker.leases.get",
+            Self::WorkerLeasesRelease => "worker.leases.release",
+            Self::WorkerLeasesEvents => "worker.leases.events",
+            Self::WorkerLeasesTerminal => "worker.leases.terminal",
+            Self::WorkerLeasesResult => "worker.leases.result",
+            Self::WorkerLeasesCheckout => "worker.leases.checkout",
             Self::SquadTasksList => "squad.tasks.list",
             Self::SquadTasksCreate => "squad.tasks.create",
             Self::SquadTasksGet => "squad.tasks.get",
@@ -213,6 +246,7 @@ impl Operation {
                 | Self::WorkerSessionsCreate
                 | Self::WorkerCommandsCreate
                 | Self::WorkerRunsCreate
+                | Self::WorkerQueueClaim
                 | Self::SquadTasksCreate
                 | Self::SquadRunsCreate
         )
@@ -246,6 +280,25 @@ impl Operation {
                     | Self::CoreGrantsList
                     | Self::CoreGrantsDelete
             )
+            || self.pull()
+    }
+    /// The pull routes (WI 0143). Pull is exposed on the daemon's own API
+    /// only: they are local-only and 404 on the network listener.
+    pub fn pull(self) -> bool {
+        matches!(
+            self,
+            Self::WorkerServersList
+                | Self::WorkerServersGet
+                | Self::WorkerQueueList
+                | Self::WorkerQueueClaim
+                | Self::WorkerLeasesList
+                | Self::WorkerLeasesGet
+                | Self::WorkerLeasesRelease
+                | Self::WorkerLeasesEvents
+                | Self::WorkerLeasesTerminal
+                | Self::WorkerLeasesResult
+                | Self::WorkerLeasesCheckout
+        )
     }
     pub fn unauthenticated(self) -> bool {
         self == Self::CoreHealth

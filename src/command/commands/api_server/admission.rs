@@ -63,6 +63,7 @@ pub struct AdmittedCommand {
 /// Typed decisions let a host map errors without inspecting their messages.
 #[derive(Debug)]
 pub enum AdmissionError {
+    FeatureDisabled,
     SessionCreation(CommandError),
     CommandValidation(CommandError),
     CommandAdmission(CommandError),

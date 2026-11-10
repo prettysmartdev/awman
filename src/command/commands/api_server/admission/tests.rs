@@ -339,7 +339,7 @@ async fn run_crash_order_records_barrier_then_session_fields_and_labels_then_lin
         END;
     "#,
     );
-    let journal = f.journal("/v1/runs", "cmd_a53108f7543b75adbb34afc035d4cdf6");
+    let journal = f.journal("/v1/worker/runs", "cmd_a53108f7543b75adbb34afc035d4cdf6");
     assert_eq!(journal.begin("canonical").unwrap(), IdempotencyBegin::Fresh);
     let mut submission = f.local();
     submission.request = SessionCreateRequest {
@@ -380,7 +380,7 @@ async fn run_crash_order_records_barrier_then_session_fields_and_labels_then_lin
     // handler after the last write, and must still replay the exact bytes.
     drop(journal);
     assert_replay(
-        &f.journal("/v1/runs", "cmd_a53108f7543b75adbb34afc035d4cdf6"),
+        &f.journal("/v1/worker/runs", "cmd_a53108f7543b75adbb34afc035d4cdf6"),
         &admitted.response_body,
     );
     assert_eq!(
@@ -406,7 +406,10 @@ async fn fully_recorded_session_replays_without_setup() {
         END;
     "#,
     );
-    let journal = f.journal("/v1/sessions", "ses_21d6f40cfb511982e4424e0e250a9557");
+    let journal = f.journal(
+        "/v1/worker/sessions",
+        "ses_21d6f40cfb511982e4424e0e250a9557",
+    );
     assert_eq!(journal.begin("canonical").unwrap(), IdempotencyBegin::Fresh);
     let admitted = f
         .admission
@@ -416,7 +419,10 @@ async fn fully_recorded_session_replays_without_setup() {
     assert!(admitted.run.is_none());
     drop(journal);
     assert_replay(
-        &f.journal("/v1/sessions", "ses_21d6f40cfb511982e4424e0e250a9557"),
+        &f.journal(
+            "/v1/worker/sessions",
+            "ses_21d6f40cfb511982e4424e0e250a9557",
+        ),
         &admitted.response_body,
     );
     assert_eq!(f.only_session().status, SessionStatus::Active);
@@ -444,7 +450,10 @@ async fn command_admission_records_intent_before_the_row_and_preserves_flags_and
         END;
     "#,
     );
-    let journal = f.journal("/v1/commands", "cmd_1dccadfed7bcbb036c56a4afb97e906f");
+    let journal = f.journal(
+        "/v1/worker/commands",
+        "cmd_1dccadfed7bcbb036c56a4afb97e906f",
+    );
     assert_eq!(journal.begin("canonical").unwrap(), IdempotencyBegin::Fresh);
     let mut submission = command();
     submission.labels = serde_json::from_value(json!({"test/job": "check"})).unwrap();
@@ -467,7 +476,10 @@ async fn command_admission_records_intent_before_the_row_and_preserves_flags_and
     );
     drop(journal);
     assert_replay(
-        &f.journal("/v1/commands", "cmd_1dccadfed7bcbb036c56a4afb97e906f"),
+        &f.journal(
+            "/v1/worker/commands",
+            "cmd_1dccadfed7bcbb036c56a4afb97e906f",
+        ),
         &command.response_body,
     );
 }
@@ -481,7 +493,7 @@ async fn failed_labels_run_link_and_enqueue_close_the_session_without_admitting_
     ] {
         let f = Fixture::new();
         f.sql(&format!("CREATE TRIGGER fail_write BEFORE INSERT ON {table} BEGIN SELECT RAISE(ABORT, 'injected failure'); END;"));
-        let journal = f.journal("/v1/runs", "failed");
+        let journal = f.journal("/v1/worker/runs", "failed");
         assert_eq!(journal.begin("canonical").unwrap(), IdempotencyBegin::Fresh);
         let error = f
             .admission
@@ -511,7 +523,9 @@ async fn failed_labels_run_link_and_enqueue_close_the_session_without_admitting_
         );
         drop(journal);
         assert_eq!(
-            f.journal("/v1/runs", "failed").begin("canonical").unwrap(),
+            f.journal("/v1/worker/runs", "failed")
+                .begin("canonical")
+                .unwrap(),
             IdempotencyBegin::Fresh
         );
     }
@@ -521,7 +535,7 @@ async fn failed_labels_run_link_and_enqueue_close_the_session_without_admitting_
 async fn failed_session_labels_can_be_released_after_compensation() {
     let f = Fixture::new();
     f.sql("CREATE TRIGGER fail_labels BEFORE INSERT ON labels BEGIN SELECT RAISE(ABORT, 'injected'); END;");
-    let journal = f.journal("/v1/sessions", "failed");
+    let journal = f.journal("/v1/worker/sessions", "failed");
     assert_eq!(journal.begin("canonical").unwrap(), IdempotencyBegin::Fresh);
     assert!(f
         .admission
@@ -532,7 +546,7 @@ async fn failed_session_labels_can_be_released_after_compensation() {
     journal.release().unwrap();
     drop(journal);
     assert_eq!(
-        f.journal("/v1/sessions", "failed")
+        f.journal("/v1/worker/sessions", "failed")
             .begin("canonical")
             .unwrap(),
         IdempotencyBegin::Fresh
@@ -543,7 +557,7 @@ async fn failed_session_labels_can_be_released_after_compensation() {
 async fn dropped_future_releases_intent_without_a_resource_and_preserves_admitted_resource() {
     for admit in [false, true] {
         let f = Fixture::new();
-        let journal = f.journal("/v1/sessions", "drop");
+        let journal = f.journal("/v1/worker/sessions", "drop");
         assert_eq!(journal.begin("canonical").unwrap(), IdempotencyBegin::Fresh);
         let body = if admit {
             f.admission
@@ -566,7 +580,7 @@ async fn dropped_future_releases_intent_without_a_resource_and_preserves_admitte
         rx.await.unwrap();
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
-        let retry = f.journal("/v1/sessions", "drop");
+        let retry = f.journal("/v1/worker/sessions", "drop");
         if admit {
             assert_replay(&retry, &body);
         } else {
@@ -578,16 +592,18 @@ async fn dropped_future_releases_intent_without_a_resource_and_preserves_admitte
 #[test]
 fn panic_and_non_owner_drops_release_only_their_own_reservation() {
     let f = Fixture::new();
-    let owner = f.journal("/v1/commands", "key");
+    let owner = f.journal("/v1/worker/commands", "key");
     assert_eq!(owner.begin("canonical").unwrap(), IdempotencyBegin::Fresh);
-    let contender = f.journal("/v1/commands", "key");
+    let contender = f.journal("/v1/worker/commands", "key");
     assert_eq!(
         contender.begin("canonical").unwrap(),
         IdempotencyBegin::InFlight
     );
     drop(contender);
     assert_eq!(
-        f.journal("/v1/commands", "key").begin("canonical").unwrap(),
+        f.journal("/v1/worker/commands", "key")
+            .begin("canonical")
+            .unwrap(),
         IdempotencyBegin::InFlight
     );
     assert!(
@@ -598,7 +614,9 @@ fn panic_and_non_owner_drops_release_only_their_own_reservation() {
         .is_err()
     );
     assert_eq!(
-        f.journal("/v1/commands", "key").begin("canonical").unwrap(),
+        f.journal("/v1/worker/commands", "key")
+            .begin("canonical")
+            .unwrap(),
         IdempotencyBegin::Fresh
     );
 }
@@ -607,7 +625,7 @@ fn panic_and_non_owner_drops_release_only_their_own_reservation() {
 async fn crash_recovery_uses_the_recorded_resource_without_a_completed_response() {
     for admit in [false, true] {
         let f = Fixture::new();
-        let journal = f.journal("/v1/sessions", "crash");
+        let journal = f.journal("/v1/worker/sessions", "crash");
         assert_eq!(journal.begin("canonical").unwrap(), IdempotencyBegin::Fresh);
         let body = if admit {
             f.admission
@@ -626,7 +644,7 @@ async fn crash_recovery_uses_the_recorded_resource_without_a_completed_response(
         journal.active.store(false, Ordering::Relaxed);
         drop(journal);
         f.sql("UPDATE idempotency_keys SET owner_instance='exited-daemon'");
-        let retry = f.journal("/v1/sessions", "crash");
+        let retry = f.journal("/v1/worker/sessions", "crash");
         if admit {
             assert_replay(&retry, &body);
             assert_eq!(f.admission.store.list_sessions().unwrap().len(), 1);
@@ -640,7 +658,7 @@ async fn crash_recovery_uses_the_recorded_resource_without_a_completed_response(
 #[tokio::test]
 async fn failed_response_storage_does_not_release_admitted_work() {
     let f = Fixture::new();
-    let journal = f.journal("/v1/sessions", "response-failure");
+    let journal = f.journal("/v1/worker/sessions", "response-failure");
     assert_eq!(journal.begin("canonical").unwrap(), IdempotencyBegin::Fresh);
     let admitted = f
         .admission
@@ -652,7 +670,7 @@ async fn failed_response_storage_does_not_release_admitted_work() {
     drop(journal);
     f.sql("DROP TRIGGER fail_complete");
     assert_replay(
-        &f.journal("/v1/sessions", "response-failure"),
+        &f.journal("/v1/worker/sessions", "response-failure"),
         &admitted.response_body,
     );
     assert_eq!(f.admission.store.list_sessions().unwrap().len(), 1);
@@ -737,7 +755,7 @@ async fn failed_command_enqueue_releases_the_key_and_keeps_the_existing_session_
         .update_setup_status(&session.session_id, SessionSetupStatus::Ready)
         .unwrap();
     f.sql("CREATE TRIGGER fail_command BEFORE INSERT ON commands BEGIN SELECT RAISE(ABORT, 'injected'); END;");
-    let journal = f.journal("/v1/commands", "failed-command");
+    let journal = f.journal("/v1/worker/commands", "failed-command");
     assert_eq!(journal.begin("canonical").unwrap(), IdempotencyBegin::Fresh);
     assert!(matches!(
         f.admission
@@ -757,7 +775,7 @@ async fn failed_command_enqueue_releases_the_key_and_keeps_the_existing_session_
         .unwrap()
         .is_empty());
     assert_eq!(
-        f.journal("/v1/commands", "failed-command")
+        f.journal("/v1/worker/commands", "failed-command")
             .begin("canonical")
             .unwrap(),
         IdempotencyBegin::Fresh
@@ -767,7 +785,7 @@ async fn failed_command_enqueue_releases_the_key_and_keeps_the_existing_session_
 #[tokio::test]
 async fn lost_reservation_prevents_resource_creation_and_stale_drop_keeps_the_new_owner() {
     let f = Fixture::new();
-    let journal = f.journal("/v1/sessions", "lost");
+    let journal = f.journal("/v1/worker/sessions", "lost");
     assert_eq!(journal.begin("canonical").unwrap(), IdempotencyBegin::Fresh);
     f.sql("UPDATE idempotency_keys SET owner_request='another-live-request'");
     assert!(matches!(
@@ -779,7 +797,7 @@ async fn lost_reservation_prevents_resource_creation_and_stale_drop_keeps_the_ne
     assert!(f.admission.store.list_sessions().unwrap().is_empty());
     drop(journal);
     assert_eq!(
-        f.journal("/v1/sessions", "lost")
+        f.journal("/v1/worker/sessions", "lost")
             .begin("canonical")
             .unwrap(),
         IdempotencyBegin::InFlight
@@ -789,12 +807,12 @@ async fn lost_reservation_prevents_resource_creation_and_stale_drop_keeps_the_ne
 #[test]
 fn completed_rejections_replay_and_cannot_be_released_or_reused_for_a_different_body() {
     let f = Fixture::new();
-    let journal = f.journal("/v1/commands", "rejected");
+    let journal = f.journal("/v1/worker/commands", "rejected");
     assert_eq!(journal.begin("canonical").unwrap(), IdempotencyBegin::Fresh);
     assert!(journal.complete(400, "rejected body").unwrap());
     journal.release().unwrap();
     drop(journal);
-    let retry = f.journal("/v1/commands", "rejected");
+    let retry = f.journal("/v1/worker/commands", "rejected");
     assert_eq!(
         retry.begin("canonical").unwrap(),
         IdempotencyBegin::Replay {

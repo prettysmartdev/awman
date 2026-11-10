@@ -41,7 +41,7 @@ use crate::data::fs::api_db::OutputsSummary;
 /// Where the outputs directory is mounted inside an agent container.
 pub const OUTPUT_MOUNT_PATH: &str = "/awman/output";
 
-/// Largest file `GET /v1/commands/{id}/outputs/{path}` serves. A bigger file
+/// Largest file `GET /v1/worker/commands/{id}/outputs/{path}` serves. A bigger file
 /// is still listed; fetching it returns 413.
 pub const MAX_SERVED_OUTPUT_BYTES: u64 = 16 * 1024 * 1024;
 
@@ -58,7 +58,7 @@ pub struct OutputFile {
     pub modified_at: Option<String>,
 }
 
-/// The body of `GET /v1/commands/{id}/outputs`.
+/// The body of `GET /v1/worker/commands/{id}/outputs`.
 #[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize)]
 pub struct OutputListing {
     /// Sorted by `path`.

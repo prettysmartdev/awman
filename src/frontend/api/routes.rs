@@ -238,6 +238,13 @@ pub struct CommandResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default, with = "crate::data::wire::opt_timestamp")]
     cancel_requested_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// WI 0143: where the job came from (`{kind: push|pull, …}`), once the
+    /// worker has taken it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    origin: Option<crate::data::worker::JobOrigin>,
+    /// WI 0143: whether `/awman/output` was actually mounted, once known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    outputs_mounted: Option<bool>,
 }
 
 /// Capabilities a client can detect without parsing the version. Append only.
@@ -267,6 +274,9 @@ impl From<CreateCommandRequest> for CommandSubmission {
 
 fn admission_error(error: AdmissionError, session_id: &str) -> Response {
     match error {
+        AdmissionError::FeatureDisabled => {
+            ApiError::feature_disabled("worker push is disabled").into_response()
+        }
         AdmissionError::SessionCreation(e) => ApiError::session_creation(&e).into_response(),
         AdmissionError::CommandValidation(e) => ApiError::command_validation(&e).into_response(),
         AdmissionError::CommandAdmission(e) => ApiError::command_admission(&e).into_response(),
@@ -397,7 +407,11 @@ fn command_response(
         .lifecycle()
         .queue_position(&c)
         .map_err(|_| internal_error("Failed to read queue position"))?;
+    let job = worker::commands_job(state, &c.id)
+        .map_err(|_| internal_error("Failed to read the job record"))?;
     Ok(CommandResponse {
+        origin: job.origin,
+        outputs_mounted: job.outputs_mounted,
         allow_remote_input: c.allow_remote_input,
         listener: c.listener.clone(),
         trace_parent: c.trace_parent.clone(),
@@ -984,6 +998,84 @@ pub const ROUTES: &[RouteSpec] = &[
         local_only: false,
         capability: None,
     },
+    // WI 0143 pull routes: the daemon's own API only (local listener).
+    RouteSpec {
+        method: "POST",
+        path: "/v1/worker/leases/{id}/terminal",
+        op: Operation::WorkerLeasesTerminal,
+        local_only: true,
+        capability: None,
+    },
+    RouteSpec {
+        method: "POST",
+        path: "/v1/worker/leases/{id}/checkout",
+        op: Operation::WorkerLeasesCheckout,
+        local_only: true,
+        capability: None,
+    },
+    RouteSpec {
+        method: "POST",
+        path: "/v1/worker/leases/{id}/events",
+        op: Operation::WorkerLeasesEvents,
+        local_only: true,
+        capability: None,
+    },
+    RouteSpec {
+        method: "POST",
+        path: "/v1/worker/leases/{id}/result",
+        op: Operation::WorkerLeasesResult,
+        local_only: true,
+        capability: None,
+    },
+    RouteSpec {
+        method: "GET",
+        path: "/v1/worker/servers",
+        op: Operation::WorkerServersList,
+        local_only: true,
+        capability: None,
+    },
+    RouteSpec {
+        method: "GET",
+        path: "/v1/worker/servers/{name}",
+        op: Operation::WorkerServersGet,
+        local_only: true,
+        capability: None,
+    },
+    RouteSpec {
+        method: "GET",
+        path: "/v1/worker/queue",
+        op: Operation::WorkerQueueList,
+        local_only: true,
+        capability: None,
+    },
+    RouteSpec {
+        method: "POST",
+        path: "/v1/worker/queue/{item_id}/claim",
+        op: Operation::WorkerQueueClaim,
+        local_only: true,
+        capability: None,
+    },
+    RouteSpec {
+        method: "GET",
+        path: "/v1/worker/leases",
+        op: Operation::WorkerLeasesList,
+        local_only: true,
+        capability: None,
+    },
+    RouteSpec {
+        method: "GET",
+        path: "/v1/worker/leases/{id}",
+        op: Operation::WorkerLeasesGet,
+        local_only: true,
+        capability: None,
+    },
+    RouteSpec {
+        method: "POST",
+        path: "/v1/worker/leases/{id}/release",
+        op: Operation::WorkerLeasesRelease,
+        local_only: true,
+        capability: None,
+    },
     RouteSpec {
         method: "GET",
         path: "/v1/squad/tasks",
@@ -1101,6 +1193,9 @@ pub fn build_router_for_listener(api: Arc<DaemonApi>, policy: ListenerPolicy) ->
                     .with_state(api.clone())
             }
             Feature::Engine => super::engine::route(spec.op, filter).with_state(api.clone()),
+            Feature::Worker if spec.op.pull() => {
+                super::worker_pull::route(spec.op, filter).with_state(api.clone())
+            }
             Feature::Worker => match &api.worker {
                 Some(worker) => worker_route(spec.op, filter).with_state(worker.clone()),
                 None => axum::routing::on(filter, || async {
@@ -1139,6 +1234,17 @@ pub fn build_router_for_listener(api: Arc<DaemonApi>, policy: ListenerPolicy) ->
                         ))
                         .into_response();
                     }
+                    if spec.op.owner() == Feature::Worker
+                        && !spec.op.pull()
+                        && spec.op.creates()
+                        && api
+                            .worker
+                            .as_ref()
+                            .is_some_and(|worker| !worker.push_enabled())
+                    {
+                        return ApiError::feature_disabled("worker push is disabled")
+                            .into_response();
+                    }
                     // Worker IDs are validated even though the legacy store uses string keys.
                     if spec.op.owner() == Feature::Worker {
                         let parts: Vec<_> = request.uri().path().split('/').collect();
@@ -1148,6 +1254,7 @@ pub fn build_router_for_listener(api: Arc<DaemonApi>, policy: ListenerPolicy) ->
                                     crate::data::ids::WorkerSessionId::parse(id).is_ok()
                                 }
                                 Some(&"commands") => crate::data::ids::CommandId::parse(id).is_ok(),
+                                Some(&"leases") => crate::data::ids::LeaseId::parse(id).is_ok(),
                                 _ => true,
                             };
                             if !valid {
@@ -1876,7 +1983,7 @@ async fn handle_stream_command_logs(
             "session_id": session_id,
             "command_id": command_id,
             "attempt": command.attempt,
-            "events": events,
+            "events": events.iter().map(ExecutionEvent::public_value).collect::<Vec<_>>(),
         }))
         .into_response();
     }
@@ -1949,7 +2056,7 @@ async fn handle_stream_command_logs(
 
 /// Encode an ExecutionEvent with a cursor safe for axum's SSE id validation.
 fn execution_event_to_sse(event: &ExecutionEvent, cursor: Option<EventCursor>) -> Event {
-    let data = serde_json::to_string(event).unwrap_or_else(|_| "{}".into());
+    let data = serde_json::to_string(&event.public_value()).unwrap_or_else(|_| "{}".into());
     let frame = match cursor {
         Some(cursor) => Event::default().id(cursor.to_string()),
         None => Event::default(),
@@ -2298,7 +2405,8 @@ pub(super) mod tests {
                 .await
                 .unwrap();
             let expected = format!(
-                "{id}event: stdout_line\ndata: {{\"timestamp\":\"2026-10-30T12:00:00Z\",\"attempt\":2,\"sequence\":7,\"payload\":{{\"type\":\"StdoutLine\",\"data\":\"hello\\nworld\"}}}}\n\n"
+                "{id}event: stdout_line\ndata: {}\n\n",
+                serde_json::to_string(&event.public_value()).unwrap()
             );
             assert_eq!(bytes.as_ref(), expected.as_bytes());
         }
@@ -2426,7 +2534,8 @@ pub(super) mod tests {
         // Guard: if someone adds a route without updating this table, the count drifts.
         assert_eq!(
             EXPECTED_ROUTES.len(),
-            53,
+            // 53 + seven pull routes + four local foreground handoff routes.
+            64,
             "route count mismatch — update EXPECTED_ROUTES"
         );
     }

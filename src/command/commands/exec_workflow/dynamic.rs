@@ -519,7 +519,11 @@ impl ExecWorkflowCommand {
         let wi_relative = wi_file
             .strip_prefix(&git_root_for_scope)
             .unwrap_or(&wi_file);
-        let leader_work_item_path = std::path::Path::new("/workspace").join(wi_relative);
+        let leader_work_item_path = if base_session.inline_work_item().is_some() {
+            std::path::PathBuf::from("/awman/work-item.md")
+        } else {
+            std::path::Path::new("/workspace").join(wi_relative)
+        };
 
         // ── Resolve the context(workflow) overlay for the leader. ───────────
         let (leader_context_overlays, leader_system_prompt) =
@@ -1082,7 +1086,7 @@ impl ExecWorkflowCommand {
 
         // The leader shares the command's outputs directory with the steps it
         // designs (WI 0137 §3); it is created here, never cleared.
-        let mut directory_overlays = Vec::new();
+        let mut command_mounts = Vec::new();
         let system_prompt = match self
             .output_dir
             .as_ref()
@@ -1095,7 +1099,7 @@ impl ExecWorkflowCommand {
                         dir.display()
                     ))
                 })?;
-                directory_overlays.push(crate::data::fs::command_outputs::output_dir_overlay(dir));
+                command_mounts.push(crate::data::fs::command_outputs::output_dir_overlay(dir));
                 Some(crate::engine::context_prompt::with_outputs_section(
                     system_prompt,
                     crate::engine::context_prompt::OutputsPromptRole::Leader,
@@ -1115,7 +1119,7 @@ impl ExecWorkflowCommand {
                 image_git_root,
                 agent.as_str(),
             )),
-            directory_overlays,
+            command_mounts,
             system_prompt,
             context_overlays,
             // From the invoking session, not the worktree `session` (see

@@ -15,6 +15,9 @@ pub enum CommandOutcome {
     Chat(crate::command::commands::chat::ChatOutcome),
     Agents(crate::command::commands::agents::AgentsOutcome),
     Config(crate::command::commands::config::ConfigOutcome),
+    WorkerLink(crate::command::commands::worker::WorkerLinkOutcome),
+    Queue(crate::data::wire::List<crate::command::daemon_api::worker_pull::QueueRow>),
+    QueuePick(crate::data::fs::api_db::CommandResult),
     ExecPrompt(crate::command::commands::exec_prompt::ExecPromptOutcome),
     ExecWorkflow(crate::command::commands::exec_workflow::ExecWorkflowOutcome),
     DaemonApi(crate::command::commands::daemon::api::DaemonApiOutcome),
@@ -47,6 +50,7 @@ impl CommandOutcome {
             Self::Chat(outcome) => outcome.exit_code.unwrap_or(0),
             Self::ExecWorkflow(outcome) => outcome.exit_code.unwrap_or(0),
             Self::ExecPrompt(outcome) => outcome.exit_code.unwrap_or(0),
+            Self::QueuePick(outcome) => outcome.exit_code.unwrap_or(1),
             Self::SquadAttach(outcome) => outcome.exit_code,
             Self::Agents(outcome) => outcome.exit_code(),
             // `remote exec --follow` reports the remote command's result.

@@ -1,5 +1,5 @@
 //! Command-lifecycle tables of the API database: cancel requests and
-//! `/v1/runs` linkage (WI 0135).
+//! `/v1/worker/runs` linkage (WI 0135).
 //!
 //! They sit beside `SqliteSessionStore`'s own tables and reach the database
 //! only through its public `with_conn`, so `SqliteSessionStore::migrate` does
@@ -16,7 +16,7 @@ use crate::data::error::DataError;
 use crate::data::fs::api_db::SqliteSessionStore;
 use crate::data::ids::{CommandId, WorkerSessionId};
 
-/// A `/v1/runs` command and the session created for it.
+/// A `/v1/worker/runs` command and the session created for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunRecord {
     pub session_id: WorkerSessionId,
@@ -165,7 +165,7 @@ impl CommandLifecycleStore {
     }
 
     /// Mark a still-queued command `error` (exit 1) with `result_json`. Used
-    /// when a `/v1/runs` setup fails; a command that was already cancelled
+    /// when a `/v1/worker/runs` setup fails; a command that was already cancelled
     /// keeps `cancelled`.
     pub fn fail_if_queued(
         &self,

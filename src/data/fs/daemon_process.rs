@@ -36,10 +36,8 @@ pub struct ServerMeta {
     pub port: u16,
     pub bind_ip: String,
     pub scheme: String,
-    /// True when the daemon was started with `--dangerously-skip-auth` and is
-    /// therefore serving unauthenticated. Clients read this to avoid minting a
-    /// bearer key (and writing a key hash) the running daemon will never check.
-    /// Absent in sidecars written by older versions, which always required auth.
+    /// Legacy sidecar migration field. Current daemon startup does not permit
+    /// unauthenticated network listeners; the removed skip-auth flag is rejected.
     #[serde(default)]
     pub auth_disabled: bool,
 }

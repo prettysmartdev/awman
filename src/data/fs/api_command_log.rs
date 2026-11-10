@@ -33,6 +33,7 @@ use crate::data::workflow_state::WorkflowState;
 pub struct CommandStateWriter {
     worktree: std::sync::Arc<std::sync::Mutex<Option<std::path::PathBuf>>>,
     contributions: std::sync::Arc<std::sync::Mutex<ResultContributions>>,
+    mount_receipts: std::sync::Arc<std::sync::Mutex<Vec<tempfile::NamedTempFile>>>,
     paths: ApiPaths,
     session_id: String,
     command_id: String,
@@ -58,9 +59,41 @@ pub struct ResultContributions {
     /// Failed main, setup and teardown steps, each listed once (the last
     /// record for a phase/index wins, so a retried step keeps its last attempt).
     pub failed_steps: Vec<FailedStep>,
+    /// Whether `/awman/output` was actually mounted for this command
+    /// (`None` until the command reaches its launch decision). An empty
+    /// output directory and a missing mount are therefore distinguishable.
+    pub outputs_mounted: Option<bool>,
 }
 
 impl CommandStateWriter {
+    /// Record whether `/awman/output` was mounted (see
+    /// `Capabilities::mounts_outputs`). A later call replaces an earlier one.
+    pub fn record_outputs_mounted(&self, mounted: bool) {
+        self.contributions().outputs_mounted = Some(mounted);
+    }
+
+    /// Allocate an empty receipt in the actual output directory. Only a
+    /// guest that sees that bind can acknowledge it; holding the open inode
+    /// lets the guest unlink the name before starting the agent.
+    pub fn output_mount_receipt(&self) -> Result<std::path::PathBuf, DataError> {
+        let receipt = tempfile::Builder::new()
+            .prefix(".awman-mount-")
+            .tempfile_in(self.output_dir())
+            .map_err(|e| DataError::Other(format!("output mount receipt: {e}")))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            receipt
+                .as_file()
+                .set_permissions(std::fs::Permissions::from_mode(0o666))
+                .map_err(|e| DataError::Other(e.to_string()))?;
+        }
+        let guest = std::path::Path::new(crate::data::fs::command_outputs::OUTPUT_MOUNT_PATH)
+            .join(receipt.path().file_name().expect("temporary file name"));
+        self.mount_receipts.lock().unwrap().push(receipt);
+        Ok(guest)
+    }
+
     pub fn record_container_started(&self) {
         self.contributions().container_started = true;
     }
@@ -90,10 +123,15 @@ impl CommandStateWriter {
         Self {
             worktree: Default::default(),
             contributions: Default::default(),
+            mount_receipts: Default::default(),
             paths,
             session_id: session_id.into(),
             command_id: command_id.into(),
         }
+    }
+
+    pub fn command_id(&self) -> &str {
+        &self.command_id
     }
 
     /// The command's `/awman/output` host directory (WI 0137 §3).
@@ -148,7 +186,17 @@ impl CommandStateWriter {
 
     /// A snapshot of everything recorded so far.
     pub fn result_contributions(&self) -> ResultContributions {
-        self.contributions().clone()
+        let mut result = self.contributions().clone();
+        if self
+            .mount_receipts
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|receipt| receipt.as_file().metadata().is_ok_and(|m| m.len() > 0))
+        {
+            result.outputs_mounted = Some(true);
+        }
+        result
     }
 
     fn contributions(&self) -> std::sync::MutexGuard<'_, ResultContributions> {
@@ -440,5 +488,57 @@ mod append_tests {
     async fn a_missing_log_reads_as_empty() {
         let (_tmp, paths) = setup();
         assert!(paths.read_command_events("s", "c").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod outputs_mounted_tests {
+    use super::*;
+
+    #[test]
+    fn receipt_requires_a_guest_write_and_survives_unlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let writer = CommandStateWriter::new(ApiPaths::at_root(tmp.path()), "s", "c");
+        std::fs::create_dir_all(writer.output_dir()).unwrap();
+        writer.record_outputs_mounted(false);
+        let guest = writer.output_mount_receipt().unwrap();
+        let host = writer.output_dir().join(guest.file_name().unwrap());
+        assert_eq!(
+            writer.result_contributions().outputs_mounted,
+            Some(false),
+            "planning a mount is not observing one"
+        );
+        std::fs::write(&host, b"1").unwrap();
+        std::fs::remove_file(&host).unwrap();
+        assert_eq!(writer.result_contributions().outputs_mounted, Some(true));
+        assert_eq!(
+            std::fs::read_dir(writer.output_dir()).unwrap().count(),
+            0,
+            "receipt is not an agent output"
+        );
+    }
+
+    #[test]
+    fn replacing_a_receipt_name_does_not_acknowledge_the_held_inode() {
+        let tmp = tempfile::tempdir().unwrap();
+        let writer = CommandStateWriter::new(ApiPaths::at_root(tmp.path()), "s", "c");
+        std::fs::create_dir_all(writer.output_dir()).unwrap();
+        writer.record_outputs_mounted(false);
+        let guest = writer.output_mount_receipt().unwrap();
+        let host = writer.output_dir().join(guest.file_name().unwrap());
+        std::fs::remove_file(&host).unwrap();
+        std::fs::write(&host, b"1").unwrap();
+        assert_eq!(writer.result_contributions().outputs_mounted, Some(false));
+    }
+
+    #[test]
+    fn outputs_mounted_is_absent_until_recorded_and_last_write_wins() {
+        let tmp = tempfile::tempdir().unwrap();
+        let writer = CommandStateWriter::new(ApiPaths::at_root(tmp.path()), "ses_1", "cmd_1");
+        assert_eq!(writer.result_contributions().outputs_mounted, None);
+        writer.record_outputs_mounted(false);
+        assert_eq!(writer.result_contributions().outputs_mounted, Some(false));
+        writer.record_outputs_mounted(true);
+        assert_eq!(writer.result_contributions().outputs_mounted, Some(true));
     }
 }

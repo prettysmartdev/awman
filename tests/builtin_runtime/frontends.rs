@@ -249,7 +249,7 @@ command = "test -f setup.out && wc -l < steps.out | tr -d ' ' > teardown.out"
     )
     .unwrap();
     let run = run_bounded(
-        p.cmd(&["exec", "workflow", "wf.toml", "--non-interactive"]),
+        p.cmd(&["exec", "workflow", "wf.toml", "--headless"]),
         Duration::from_secs(600),
     );
     assert!(run.status.success(), "workflow failed: {}", text(&run));
@@ -280,7 +280,7 @@ prompt = "must not run write=/workspace/never.out"
     )
     .unwrap();
     let failed = run_bounded(
-        p.cmd(&["exec", "workflow", "fail.toml", "--non-interactive"]),
+        p.cmd(&["exec", "workflow", "fail.toml", "--headless"]),
         Duration::from_secs(600),
     );
     assert!(
@@ -421,7 +421,7 @@ fn builtin_hw_actual_awman_boots_after_upgrading_a_072_state_directory() {
         project.cmd(&[
             "exec",
             "prompt",
-            "--non-interactive",
+            "--headless",
             "--agent",
             "claude",
             "before upgrade exit=0",
@@ -480,7 +480,7 @@ fn builtin_hw_actual_awman_boots_after_upgrading_a_072_state_directory() {
         project.cmd(&[
             "exec",
             "prompt",
-            "--non-interactive",
+            "--headless",
             "--agent",
             "claude",
             "after upgrade exit=0",
@@ -518,7 +518,7 @@ fn builtin_hw_actual_awman_owner_crash_then_clean_recovers() {
         .cmd(&[
             "exec",
             "prompt",
-            "--non-interactive",
+            "--headless",
             "--agent",
             "claude",
             "long sleep=60",
@@ -548,7 +548,7 @@ fn builtin_hw_actual_awman_owner_crash_then_clean_recovers() {
         p.cmd(&[
             "exec",
             "prompt",
-            "--non-interactive",
+            "--headless",
             "--agent",
             "claude",
             "after exit=0",
@@ -578,25 +578,30 @@ fn builtin_hw_actual_awman_api_dispatches_into_a_guest() {
         return;
     };
     let p = Project::new(&binary, &archive, "awman-api.");
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
     let repo = p.repo.canonicalize().unwrap();
-    // Loopback-only, plain HTTP and no key: API authentication has its own
-    // suites; this scenario is about the runtime behind the API.
+    let config_path = p.home.join(".awman/config.json");
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+    config["daemon"] = serde_json::json!({"features":{"worker":{"enabled":true,"push":{"enabled":true,"workDirs":{"allow":[repo]}}}}});
+    std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+    let command = p.cmd(&[]);
+    let env = awman::data::config::env::EnvSnapshot::with_overrides(command.get_envs().filter_map(
+        |(k, v)| {
+            v.map(|v| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.to_string_lossy().into_owned(),
+                )
+            })
+        },
+    ));
+    let socket = awman::data::fs::DataPaths::from_env(&env)
+        .unwrap()
+        .daemon()
+        .local_endpoint();
+    // The owner-only local API exercises the same worker routes as the network listener.
     let mut server = p
-        .cmd(&[
-            "api",
-            "start",
-            "--port",
-            &port.to_string(),
-            "--workdirs",
-            &repo.to_string_lossy(),
-            "--dangerously-skip-tls",
-            "--dangerously-skip-auth",
-        ])
+        .cmd(&["daemon", "start"])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
@@ -609,17 +614,20 @@ fn builtin_hw_actual_awman_api_dispatches_into_a_guest() {
         }
     }
     let _server = Kill(&mut server);
-    let base = format!("http://127.0.0.1:{port}");
-    let http = reqwest::blocking::Client::new();
+    let base = "http://localhost";
+    let http = reqwest::blocking::Client::builder()
+        .unix_socket(socket)
+        .build()
+        .unwrap();
     let deadline = Instant::now() + Duration::from_secs(60);
     let session = loop {
         let response = http
-            .post(format!("{base}/v1/sessions"))
-            .json(&serde_json::json!({"type": "local", "workdir": repo}))
+            .post(format!("{base}/v1/worker/sessions"))
+            .json(&serde_json::json!({"session_type": "local", "workdir": repo}))
             .send();
         if let Ok(r) = response {
             let body: serde_json::Value = r.json().unwrap_or_default();
-            if let Some(id) = body["session_id"].as_str() {
+            if let Some(id) = body["id"].as_str() {
                 break id.to_string();
             }
             panic!("session creation failed: {body}");
@@ -631,12 +639,12 @@ fn builtin_hw_actual_awman_api_dispatches_into_a_guest() {
     let deadline = Instant::now() + Duration::from_secs(120);
     loop {
         let body: serde_json::Value = http
-            .get(format!("{base}/v1/sessions/{session}/status"))
+            .get(format!("{base}/v1/worker/sessions/{session}"))
             .send()
             .unwrap()
             .json()
             .unwrap_or_default();
-        let setup = body["status"].as_str().unwrap_or("").to_string();
+        let setup = body["setup_status"].as_str().unwrap_or("").to_string();
         if setup == "ready" {
             break;
         }
@@ -651,24 +659,24 @@ fn builtin_hw_actual_awman_api_dispatches_into_a_guest() {
         std::thread::sleep(Duration::from_millis(250));
     }
     let command: serde_json::Value = http
-        .post(format!("{base}/v1/commands"))
+        .post(format!("{base}/v1/worker/commands"))
         .header("x-awman-session", &session)
         .json(&serde_json::json!({
             "subcommand": "exec prompt",
-            "args": ["api prompt exit=0", "--non-interactive", "--agent", "claude"]
+            "args": ["api prompt exit=0", "--headless", "--agent", "claude"]
         }))
         .send()
         .unwrap()
         .json()
         .unwrap();
-    let id = command["command_id"]
+    let id = command["id"]
         .as_str()
         .unwrap_or_else(|| panic!("no command id: {command}"))
         .to_string();
     let deadline = Instant::now() + Duration::from_secs(300);
     let status = loop {
         let body: serde_json::Value = http
-            .get(format!("{base}/v1/commands/{id}/status"))
+            .get(format!("{base}/v1/worker/commands/{id}"))
             .send()
             .unwrap()
             .json()
@@ -681,7 +689,7 @@ fn builtin_hw_actual_awman_api_dispatches_into_a_guest() {
         std::thread::sleep(Duration::from_millis(500));
     };
     let logs = http
-        .get(format!("{base}/v1/commands/{id}/logs"))
+        .get(format!("{base}/v1/worker/commands/{id}/events"))
         .send()
         .unwrap()
         .text()
@@ -705,10 +713,14 @@ fn builtin_hw_actual_awman_squad_dispatches_a_leader_into_a_guest() {
         return;
     };
     let p = Project::new(&binary, &archive, "awman-squad.");
-    // Foreground and loopback-only without a key: the daemon stays a child
-    // of this test (no launchd job); squad authentication has its own suites.
+    let config_path = p.home.join(".awman/config.json");
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+    config["daemon"] = serde_json::json!({"features":{"squad":{"enabled":true}}});
+    std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+    // The owner-only daemon stays a child of this test (no service install).
     let mut daemon = p
-        .cmd(&["squad", "start", "--dangerously-skip-auth"])
+        .cmd(&["daemon", "start"])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
@@ -721,8 +733,7 @@ fn builtin_hw_actual_awman_squad_dispatches_a_leader_into_a_guest() {
         }
     }
     let _daemon = Kill(&mut daemon);
-    // `squad status` succeeds as soon as the pidfile is claimed, before the
-    // daemon publishes its endpoint; `squad list` needs a real round trip.
+    // `squad list` needs a real round trip to the unified daemon.
     let deadline = Instant::now() + Duration::from_secs(60);
     while !run_bounded(p.cmd(&["squad", "list"]), Duration::from_secs(30))
         .status
@@ -743,7 +754,7 @@ fn builtin_hw_actual_awman_squad_dispatches_a_leader_into_a_guest() {
             "6h",
             "--overlay",
             &p.agent_overlay,
-            "--non-interactive",
+            "--headless",
         ]),
         Duration::from_secs(120),
     );
@@ -803,7 +814,7 @@ fn builtin_hw_actual_awman_binary_replacement() {
         .cmd(&[
             "exec",
             "prompt",
-            "--non-interactive",
+            "--headless",
             "--agent",
             "claude",
             "slow sleep=15 exit=4",
@@ -860,7 +871,7 @@ fn builtin_hw_actual_awman_registry_pulled_image_runs_offline() {
         p.cmd(&[
             "exec",
             "prompt",
-            "--non-interactive",
+            "--headless",
             "--agent",
             "claude",
             "from registry exit=0",

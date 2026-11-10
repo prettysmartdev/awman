@@ -17,10 +17,13 @@ use crate::data::worktree_paths::{
 };
 use crate::engine::error::{EngineError, MergeFailedDetail};
 
+pub mod auth_classify;
 mod command_result;
 pub mod frontend;
 mod host_command;
+pub mod lease_transport;
 pub mod pull_request;
+pub mod push_retry;
 pub mod remote_push;
 mod session_worktree;
 

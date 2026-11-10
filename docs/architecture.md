@@ -106,7 +106,7 @@ All business logic. Commands call engines, read and write Layer 0, and talk to t
 - **`Command` trait** (`commands/command_trait.rs`) — `run_with_frontend(self, frontend) -> Result<Outcome, CommandError>`. Each command (`commands/`: `chat`, `exec_prompt`, `exec_workflow/`, `init`, `ready`, `config`, `new/`, `specs`, `agents/`, `squad/`, `remote`, `api_server`, `clean`) declares its own frontend trait and typed outcome. Shared steps that ask the user — `worktree_lifecycle`, `mount_scope`, `agent_setup`, `agent_auth`, `agent_trust`, `workflow_prerequisites` — have their own frontend traits. `launch_policy.rs` decides how an agent is launched (which agent, stdio or ACP, context directories).
 - **Answers and copy** — `headless.rs` (`HeadlessDefaults`: what a question is answered with when nobody is there to ask, per frontend) and `prompts.rs` (the text of every prompt).
 - **Startup and sessions** — `startup.rs` (`Startup`: migrations, config load, Git root, `Session`, engines), `session_create.rs` and `session_setup.rs` (API session validation and setup).
-- **Daemon bootstrap** — `ApiServerRuntime` (`commands/api_server/runtime.rs`) and `SquadDaemonHandles` (`commands/squad/daemon_runtime.rs`) prepare the daemons before a frontend serves them.
+- **Daemon bootstrap** — `command/daemon_runtime` owns one daemon process, database and executor for squad, worker push/pull and the singleton engine. Frontends serve the shared local and network routes.
 - **`CommandError`** (`error.rs`) wraps `EngineError` and `DataError`.
 
 ---

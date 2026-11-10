@@ -131,6 +131,11 @@ fn open_private(path: &Path, create: bool, write: bool) -> Result<Option<File>, 
     Ok(Some(file))
 }
 
+/// Open an existing owner-only regular file without following links.
+pub fn open_private_file(path: &Path) -> Result<File, DataError> {
+    open_private(path, false, false)?.ok_or_else(|| refused(path, "private file is absent"))
+}
+
 /// Open the private lock or lease file at `path` (read-write), creating it
 /// owner-only when `create` is set. `Ok(None)` when it is absent and not
 /// created. A symlink, hard link, foreign or group/world-accessible file is

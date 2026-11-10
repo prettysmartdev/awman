@@ -30,6 +30,7 @@ use crate::command::commands::squad::commands::{SquadCommand, SquadCommandFronte
 use crate::command::commands::squad::gateway::TaskGateway;
 use crate::command::commands::squad::runtime_guard::require_container_tier;
 use crate::command::commands::squad::supervisor::DaemonResolver;
+use crate::command::commands::worker::WorkerLinkCommand;
 use crate::command::commands::Command;
 use crate::command::dispatch::catalogue::{CommandCatalogue, FrontendKind, GatewayNeed};
 use crate::command::error::CommandError;
@@ -98,6 +99,30 @@ pub trait CliRelayFrontend: UserMessageSink + Send + Sync + 'static {
 /// command frontend traits (e.g. [`crate::command::commands::exec_workflow::ExecWorkflowCommandFrontend`])
 /// for command-specific Q&A and reporting.
 pub trait CommandFrontend: UserMessageSink + Send + Sync {
+    fn pick_queue_item(
+        &mut self,
+        _items: &[crate::command::daemon_api::worker_pull::QueueRow],
+    ) -> Result<Option<String>, CommandError> {
+        Err(CommandError::Other(
+            "this frontend has no queue picker".into(),
+        ))
+    }
+    fn confirm_queue_checkout(
+        &mut self,
+        _prompt: &crate::data::prompt::Prompt<crate::command::worker::queue_source::CheckoutChoice>,
+    ) -> crate::command::worker::queue_source::CheckoutChoice {
+        crate::command::worker::queue_source::CheckoutChoice::FreshClone
+    }
+    fn bind_worker_run(
+        &mut self,
+        _input: ParsedCommandBoxInput,
+        _events: crate::command::commands::api_server::event_bus::EventBusSender,
+        _writer: crate::data::fs::api_command_log::CommandStateWriter,
+    ) -> Result<(), CommandError> {
+        Err(CommandError::Other(
+            "this frontend cannot host a worker run".into(),
+        ))
+    }
     /// Which frontend this is.
     ///
     /// The one fact about itself a frontend declares. Everything that used to
@@ -122,6 +147,12 @@ pub trait CommandFrontend: UserMessageSink + Send + Sync {
     /// `frontend::effective_non_interactive`, and each frontend re-applied it.
     fn input_available(&self) -> bool {
         self.kind().can_ask_a_human()
+    }
+
+    /// Read one secret from stdin for a command that explicitly requested
+    /// `--token -`. Only the local CLI implements this input channel.
+    fn read_stdin_secret(&mut self) -> Result<String, CommandError> {
+        Err(CommandError::Other("--token - requires CLI stdin".into()))
     }
 
     fn flag_bool(&self, command_path: &[&str], flag: &str) -> Result<Option<bool>, CommandError>;
@@ -214,6 +245,9 @@ pub enum BuiltCommand {
     Specs(SpecsCommand),
     Agents(AgentsCommand),
     Config(ConfigCommand),
+    WorkerLink(WorkerLinkCommand),
+    Queue(crate::command::worker::pick::QueueCommand),
+    QueuePick(crate::command::worker::pick::QueuePickCommand),
     ExecPrompt(ExecPromptCommand),
     ExecWorkflow(ExecWorkflowCommand),
     Daemon(DaemonCommand),
@@ -262,6 +296,10 @@ pub struct Dispatch<F: CommandFrontend> {
     cancel: tokio_util::sync::CancellationToken,
     /// Handed to the built command through `BuildContext::output_dir`.
     output_dir: Option<std::path::PathBuf>,
+    picked_lease: Option<(
+        crate::command::worker::queue_source::SharedQueueSource,
+        crate::data::worker::queue::PickRun,
+    )>,
 }
 
 impl<F: CommandFrontend> Dispatch<F> {
@@ -285,6 +323,7 @@ impl<F: CommandFrontend> Dispatch<F> {
             squad_gateway: None,
             cancel: tokio_util::sync::CancellationToken::new(),
             output_dir: None,
+            picked_lease: None,
         }
     }
 
@@ -293,6 +332,15 @@ impl<F: CommandFrontend> Dispatch<F> {
     /// call this, so their commands see a token that never fires.
     pub fn with_cancellation(mut self, token: tokio_util::sync::CancellationToken) -> Self {
         self.cancel = token;
+        self
+    }
+
+    pub fn with_picked_lease(
+        mut self,
+        source: crate::command::worker::queue_source::SharedQueueSource,
+        run: crate::data::worker::queue::PickRun,
+    ) -> Self {
+        self.picked_lease = Some((source, run));
         self
     }
 
@@ -620,7 +668,20 @@ impl<F: DispatchFrontend> Dispatch<F> {
         }
         self.admit(path).await?;
         let session = Arc::clone(&self.session);
-        let built = self.build_command(path)?;
+        let built = if let Some((source, run)) = self.picked_lease.take() {
+            BuiltCommand::QueuePick(
+                crate::command::worker::pick::QueuePickCommand::new(
+                    session.read().await.clone(),
+                    self.engines.clone(),
+                    None,
+                    None,
+                    false,
+                )
+                .prepared(source, run, self.cancel.clone()),
+            )
+        } else {
+            self.build_command(path)?
+        };
 
         // Decision Q3: `SessionState` is the ruling record of what a session
         // is doing, and Layer 2 is what writes it. Every frontend that runs a
@@ -1169,6 +1230,10 @@ impl Drop for UnfinishedCommandGuard {
 macro_rules! run_built_command {
     ($built:expr, $frontend:expr, { $($variant:ident => $frontend_trait:path),* $(,)? }) => {
         match $built {
+            BuiltCommand::Queue(command) => command.list().await.map(CommandOutcome::Queue),
+            BuiltCommand::QueuePick(command) => Box::pin(command.run_with_frontend(
+                crate::command::worker::pick::DispatchQueueFrontend::new($frontend)
+            )).await.map(CommandOutcome::QueuePick),
             BuiltCommand::ExecWorkflow(command) => command
                 .run_with_frontend($frontend.into_exec_workflow_frontend())
                 .await
@@ -1205,6 +1270,7 @@ impl BuiltCommand {
             Specs => SpecsCommandFrontend,
             Agents => AgentsCommandFrontend,
             Config => ConfigCommandFrontend,
+            WorkerLink => CommandFrontend,
             ExecPrompt => ExecPromptCommandFrontend,
             Daemon => DaemonCommandFrontend,
             DaemonApi => DaemonApiCommandFrontend,

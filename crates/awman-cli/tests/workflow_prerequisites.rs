@@ -329,12 +329,24 @@ async fn wi0149_api_prerequisite_event_precedes_steps_and_failure_has_stage() {
         }
     }
     let typed = awman::data::execution_event::parse_event_log(&events);
+    // The checks announce their progress as info status messages; nothing
+    // else may come before the report.
+    let report_index = typed
+        .iter()
+        .position(|e| {
+            matches!(
+                e.payload,
+                awman::data::execution_event::EventPayload::WorkflowPrerequisites { .. }
+            )
+        })
+        .expect("typed prerequisite event");
     assert!(
-        matches!(
-            typed.first().map(|e| &e.payload),
-            Some(awman::data::execution_event::EventPayload::WorkflowPrerequisites { .. })
-        ),
-        "prerequisite event must be first: {events}"
+        typed[..report_index].iter().all(|e| matches!(
+            &e.payload,
+            awman::data::execution_event::EventPayload::StatusMessage { phase, .. }
+                if phase == "info"
+        )),
+        "only prerequisite progress may precede the report: {events}"
     );
     let report = typed
         .iter()

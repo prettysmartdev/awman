@@ -28,6 +28,9 @@ pub(crate) fn find_work_item_file(
     git_root: &std::path::Path,
     number: u32,
 ) -> Option<std::path::PathBuf> {
+    if let Some(path) = session.inline_work_item() {
+        return Some(path.to_path_buf());
+    }
     // The session's own repo config, not a fresh load (F-31): the session
     // already merged it, and a second read here could answer from a file the
     // command was not built against.

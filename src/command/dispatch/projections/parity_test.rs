@@ -854,7 +854,7 @@ fn every_non_trivial_default_reaches_the_built_command() {
 /// caught F-01 when `squad attach` existed in the catalogue but not Dispatch.
 #[test]
 fn every_catalogue_command_leaf_is_buildable_by_dispatch() {
-    /// Grouping parents. Every leaf command is buildable by Dispatch.
+    /// Grouping parents without their own action.
     const NOT_RUNNABLE: &[&[&str]] = &[
         &[],
         &["agents"],
@@ -865,6 +865,7 @@ fn every_catalogue_command_leaf_is_buildable_by_dispatch() {
         &["remote", "exec"],
         &["remote", "session"],
         &["new"],
+        &["worker"],
     ];
 
     fn walk(

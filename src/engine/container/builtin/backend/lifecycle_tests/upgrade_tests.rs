@@ -240,7 +240,21 @@ fn held_lifecycle_or_import_lock_blocks_upgrade_without_changes_and_exits_one() 
         }
         drop(held);
         // The lifecycle lock file remains; an abandoned file is not live.
-        assert!(paths.upgrade_catalog(&*rig.driver).unwrap().is_some());
+        // A process another test forks at this moment briefly holds a copy of
+        // the lock's descriptor (until its exec closes it), so the lock can
+        // outlive `held` by an instant: wait for it to be free.
+        let waited = std::time::Instant::now();
+        let upgraded = loop {
+            match paths.upgrade_catalog(&*rig.driver) {
+                Err(EngineError::BuiltinCatalogUpgradeBlocked { .. })
+                    if waited.elapsed() < std::time::Duration::from_secs(10) =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                other => break other,
+            }
+        };
+        assert!(upgraded.unwrap().is_some());
         assert_eq!(paths.prepare_catalog().unwrap(), CatalogState::Ready);
     }
 }

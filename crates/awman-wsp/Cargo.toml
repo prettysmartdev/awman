@@ -1,0 +1,32 @@
+[package]
+name = "awman-wsp"
+version = "0.13.0"
+edition = "2021"
+rust-version = "1.94.0"
+description = "Work Server Protocol v1 types and client for awman"
+
+[features]
+default = []
+mock = ["dep:axum", "dep:uuid"]
+terminal = ["dep:tokio-tungstenite", "dep:futures-util"]
+
+[dependencies]
+base64 = "0.23"
+uuid = { version = "1", features = ["v4", "serde"], optional = true }
+axum = { version = "0.8", features = ["ws"], optional = true }
+futures-util = { version = "0.3", optional = true }
+tokio-tungstenite = { version = "0.29", optional = true, features = ["rustls-tls-native-roots"] }
+chrono = { version = "0.4", features = ["serde"] }
+reqwest = { version = "0.13", features = ["rustls", "json"], default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+
+[dev-dependencies]
+awman-wsp = { path = ".", features = ["mock", "terminal"] }
+tokio = { version = "1", features = ["full"] }
+wiremock = "0.6"
+[[test]]
+name = "conformance"
+required-features = ["mock"]

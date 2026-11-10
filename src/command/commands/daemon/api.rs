@@ -66,10 +66,81 @@ pub async fn run_action(
                     .call(&actions::plan("jobs.cancel", &[("id".into(), id.clone())])?)
                     .await?;
             }
+            if feature == "worker" {
+                // WI 0143: a pulled job ends with its lease (the runner releases
+                // it with the partial result); a lease with no cancelled job is
+                // given back here.
+                let released = release_held_leases(client, &ids).await?;
+                return Ok(serde_json::json!({ "canceled": ids, "released": released }));
+            }
             return Ok(serde_json::json!({ "canceled": ids }));
         }
     }
     client.call(&actions::plan(name, kv)?).await
+}
+
+/// Release every active lease whose job is not in `cancelled`, with
+/// `reason=error`. A lease that ended meanwhile (`409 lease_ended`) is
+/// skipped; a daemon without the lease routes has none to release.
+pub async fn release_held_leases(
+    client: &DaemonClient,
+    cancelled: &[String],
+) -> Result<Vec<String>, CommandError> {
+    release_held_leases_with_reason(client, cancelled, "error").await
+}
+pub async fn release_held_leases_for_shutdown(
+    client: &DaemonClient,
+) -> Result<Vec<String>, CommandError> {
+    let mut released = Vec::new();
+    loop {
+        let batch = release_held_leases_with_reason(client, &[], "shutdown").await?;
+        if batch.is_empty() {
+            return Ok(released);
+        }
+        released.extend(batch);
+    }
+}
+async fn release_held_leases_with_reason(
+    client: &DaemonClient,
+    cancelled: &[String],
+    reason: &str,
+) -> Result<Vec<String>, CommandError> {
+    let leases = match client
+        .all(&actions::plan(
+            "leases.list",
+            &[("state".into(), "active".into())],
+        )?)
+        .await
+    {
+        Ok(leases) => leases,
+        Err(CommandError::DaemonHttpStatus { status: 404, .. }) => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let mut released = Vec::new();
+    for lease in leases {
+        let Some(id) = lease["id"].as_str() else {
+            continue;
+        };
+        if lease["job_id"]
+            .as_str()
+            .is_some_and(|job| cancelled.iter().any(|c| c == job))
+        {
+            continue;
+        }
+        let request = actions::plan(
+            "leases.release",
+            &[("id".into(), id.into()), ("reason".into(), reason.into())],
+        )?;
+        match client.call(&request).await {
+            Ok(_) => released.push(id.to_string()),
+            Err(CommandError::DaemonHttpStatus {
+                status: 409,
+                ref body,
+            }) if body.contains("lease_ended") => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(released)
 }
 
 /// The IDs of every running job of `feature` (`worker` commands, `squad` runs).

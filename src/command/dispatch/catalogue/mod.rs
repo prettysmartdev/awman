@@ -703,7 +703,7 @@ const ROOT: CommandSpec = CommandSpec {
     ],
     subcommands: &[
         &ATTACH, &INIT, &READY, &CHAT, &SPECS, &AGENTS, &CONFIG, &EXEC, &DAEMON, &SQUAD, &REMOTE,
-        &NEW, &CLEAN, &VIEW,
+        &NEW, &CLEAN, &VIEW, &WORKER, &QUEUE,
     ],
 };
 
@@ -783,7 +783,9 @@ mod shared_flags;
 pub use shared_flags::SessionWorktreeTarget;
 mod squad;
 // WI 0142: the hidden `view` command spec.
+mod queue;
 mod view;
+mod worker;
 
 #[cfg(test)]
 mod tests;
@@ -794,7 +796,9 @@ use core::*;
 use daemon::*;
 use exec::*;
 use new::*;
+use queue::*;
 use remote::*;
 use shared_flags::*;
 use squad::*;
 use view::*;
+use worker::*;

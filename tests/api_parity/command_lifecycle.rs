@@ -1,7 +1,7 @@
 //! Command lifecycle over the API: cancel, labels, `Idempotency-Key`
 //! replay and `POST /v1/worker/runs`.
 //!
-//! Runs the real `awman api start` binary with the fake `docker` of
+//! Runs the real `awman daemon start` binary with the fake `docker` of
 //! `helpers/api_process.rs`. Tests that need a `git daemon` origin carry
 //! `real_git`; the ones that only need loopback HTTP carry `real_network`.
 

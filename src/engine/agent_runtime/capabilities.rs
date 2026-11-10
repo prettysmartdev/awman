@@ -63,6 +63,25 @@ impl Capabilities {
     pub fn squad_supported(&self) -> bool {
         self.arbitrary_host_mounts
     }
+
+    /// Whether the runtime can mount the session workspace read-only while
+    /// keeping a scratch directory and the agent home writable. Every
+    /// container-tier driver (Docker, Apple, builtin) honours a read-only
+    /// bind mount; the sandbox tier shares its workspace directory
+    /// read-write and cannot. Read by `AgentEngine` (which refuses a
+    /// read-only launch it cannot enforce) and by the worker's lease
+    /// eligibility check and WSP registration (`lease_read_only`).
+    pub fn read_only_workspace(&self) -> bool {
+        self.arbitrary_host_mounts
+    }
+
+    /// Whether a requested `/awman/output` directory is actually mounted on
+    /// this runtime (`outputs_mounted` of a command result and WSP lease
+    /// result). `requested` is whether the command was given an output
+    /// directory at all.
+    pub fn mounts_outputs(&self, requested: bool) -> bool {
+        requested && self.arbitrary_host_mounts
+    }
 }
 /// How a runtime obtains the image an agent runs from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,6 +154,27 @@ mod tests {
             Err(_) => {
                 // Unsupported platform — platform guard test covers this branch.
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod lease_capability_tests {
+    use crate::engine::agent_runtime::AgentRuntimeEngine;
+    use crate::engine::container::ContainerRuntime;
+
+    #[test]
+    fn container_tier_supports_read_only_workspace_and_outputs_mount() {
+        for rt in [ContainerRuntime::docker(), ContainerRuntime::apple()] {
+            let caps = rt.capabilities();
+            assert!(caps.read_only_workspace());
+            assert!(caps.mounts_outputs(true));
+            assert!(!caps.mounts_outputs(false));
+        }
+        if let Ok(rt) = crate::engine::sandbox::SandboxRuntime::dsbx() {
+            let caps = rt.capabilities();
+            assert!(!caps.read_only_workspace());
+            assert!(!caps.mounts_outputs(true));
         }
     }
 }

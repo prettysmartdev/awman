@@ -30,6 +30,7 @@ pub mod remote;
 pub mod sandbox;
 pub mod squad;
 pub mod terminal_hub;
+pub mod worker;
 pub mod workflow;
 
 pub use error::EngineError;

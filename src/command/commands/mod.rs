@@ -45,6 +45,7 @@ pub mod remote_client;
 pub(crate) mod session_worktree;
 pub mod skill_library;
 pub mod specs;
+pub mod worker;
 pub mod worktree_lifecycle;
 pub(crate) mod worktree_overlay;
 

@@ -59,7 +59,7 @@ pub fn remove_config_field(json: &mut serde_json::Value, field: &str) {
     // Trailing numeric segment: remove the element from the parent array.
     if let Ok(index) = last.parse::<usize>() {
         if parts.len() >= 2 {
-            let mut current = json;
+            let mut current = &mut *json;
             for part in &parts[..parts.len() - 1] {
                 match current.get_mut(*part) {
                     Some(v) => current = v,
@@ -70,8 +70,10 @@ pub fn remove_config_field(json: &mut serde_json::Value, field: &str) {
                 if index < arr.len() {
                     arr.remove(index);
                 }
+                return;
             }
-            return;
+            // Not an array: an all-digit map key (such as a work server
+            // named `42`) is removed like any other key, below.
         }
     }
     let mut current = json;

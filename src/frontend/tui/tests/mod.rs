@@ -12,6 +12,7 @@ mod config_show_tests;
 mod dialog_tests;
 mod key_handler_tests;
 mod mouse_handler_tests;
+mod queue_tests;
 mod remote_tests;
 mod render_tests;
 

@@ -171,7 +171,7 @@ pub struct ExecJobResponse {
     pub flags_applied: serde_json::Value,
 }
 
-/// Response body for `GET /v1/worker/sessions/{id}/status`. Wraps a `SessionSetupState`
+/// Projection of `GET /v1/worker/sessions/{id}` (its `setup`, `setup_status`, `setup_error`) as a `SessionSetupState`
 /// with the session id echoed back.
 #[derive(Debug, Clone, Deserialize)]
 pub struct SessionSetupStatusResponse {
@@ -225,7 +225,7 @@ impl RemoteClient {
 
     /// `POST /v1/worker/sessions` — request session creation. Returns the new session
     /// id; setup runs asynchronously and the session is not ready for jobs
-    /// until its `/status` endpoint returns `"ready"`.
+    /// until `GET /v1/worker/sessions/{id}` reports `setup_status: "ready"`.
     pub async fn start_session(
         &self,
         req: &StartSessionRequest,
@@ -265,7 +265,7 @@ impl RemoteClient {
         Ok(())
     }
 
-    /// `GET /v1/worker/sessions/{id}/status` — fetch the deserialized setup state.
+    /// `GET /v1/worker/sessions/{id}` — fetch the deserialized setup state.
     pub async fn get_session(
         &self,
         session_id: &str,
@@ -421,12 +421,12 @@ impl RemoteClient {
         Ok(RemoteResponse { status, body })
     }
 
-    /// `GET /v1/worker/commands/{id}/status` — fetch a job's metadata.
+    /// `GET /v1/worker/commands/{id}` — fetch a job's record.
     pub async fn get_command(&self, command_id: &str) -> Result<RemoteResponse, EngineError> {
         self.get(&["worker", "commands", command_id]).await
     }
 
-    /// `GET /v1/worker/commands/{id}/status` — fetch the typed job status used by
+    /// `GET /v1/worker/commands/{id}` — the typed job status used by
     /// remote workflow polling.
     pub async fn job_status(&self, id: &str) -> Result<JobStatus, EngineError> {
         let response = self.get_command(id).await?;

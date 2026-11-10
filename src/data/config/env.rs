@@ -39,6 +39,8 @@ pub const AWMAN_TEST_PREFIX: &str = "AWMAN_TEST_";
 pub const GITHUB_TOKEN: &str = "GITHUB_TOKEN";
 
 /// Trusted host Git transport overrides, preserved by remote-session push-back.
+pub const AWMAN_LEASE_CREDENTIAL_FILE: &str = "AWMAN_LEASE_CREDENTIAL_FILE";
+
 pub const GIT_SSH_COMMAND: &str = "GIT_SSH_COMMAND";
 pub const GIT_SSH: &str = "GIT_SSH";
 
@@ -110,6 +112,7 @@ pub const AWMAN_TEST_AGENT_DONE_COUNTDOWN_MS: &str = "AWMAN_TEST_AGENT_DONE_COUN
 pub const PROCESS_VARS: &[&str] = &[
     AWMAN_HOME,
     AWMAN_REMOTE_SESSION,
+    AWMAN_LEASE_CREDENTIAL_FILE,
     AWMAN_TEST_ISOLATION,
     AWMAN_TEST_DOCKER,
     AWMAN_TEST_APPLE_CONTAINER,
@@ -365,6 +368,52 @@ impl EnvSnapshot {
         crate::data::frontend_protocol::HelloEnv::from_pairs(
             self.values.iter().map(|(k, v)| (k.clone(), v.clone())),
         )
+    }
+    /// Environment for lease Git, including config probes. Never inherit Git
+    /// configuration, tracing, repository selection, askpass or SSH commands.
+    /// SSH may use the owner's agent and normal ~/.ssh/config in batch mode.
+    pub fn for_lease_git(&self) -> Self {
+        const ALLOWED: &[&str] = &[
+            "PATH",
+            "HOME",
+            "USER",
+            "LOGNAME",
+            "TMPDIR",
+            "TMP",
+            "TEMP",
+            "SystemRoot",
+            "PATHEXT",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "NO_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+            "no_proxy",
+            "SSL_CERT_FILE",
+            "SSL_CERT_DIR",
+            "SSH_AUTH_SOCK",
+        ];
+        let mut clean = self.clone();
+        clean
+            .native
+            .retain(|(key, _)| key.to_str().is_some_and(|key| ALLOWED.contains(&key)));
+        clean
+            .values
+            .retain(|key, _| ALLOWED.contains(&key.as_str()));
+        for (key, value) in [
+            ("GIT_CONFIG_GLOBAL", "/dev/null"),
+            ("GIT_CONFIG_NOSYSTEM", "1"),
+        ] {
+            clean.values.insert(key.into(), value.into());
+            clean.native.push((key.into(), value.into()));
+        }
+        clean.process_overlay = false;
+        clean
+    }
+    pub fn lease_credential_file(&self) -> Option<PathBuf> {
+        self.get_os(AWMAN_LEASE_CREDENTIAL_FILE).map(PathBuf::from)
     }
     pub fn spawn_env(&self) -> impl Iterator<Item = (&std::ffi::OsStr, &std::ffi::OsStr)> {
         self.native

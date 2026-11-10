@@ -16,6 +16,7 @@ pub const FIRST_ATTEMPT: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionEvent {
+    #[serde(alias = "emitted_at")]
     pub timestamp: DateTime<Utc>,
     /// Which execution of the command produced this event (1-based). Lines
     /// written before WI 0136 have no field and read back as attempt 1.
@@ -36,6 +37,19 @@ fn first_attempt() -> u32 {
 }
 
 impl ExecutionEvent {
+    /// Shared SSE/WSP projection. Stored logs retain their legacy shape.
+    pub fn public_value(&self) -> serde_json::Value {
+        let mut value = serde_json::to_value(self).expect("execution events serialize");
+        let object = value.as_object_mut().expect("event object");
+        object.remove("timestamp");
+        object.insert(
+            "emitted_at".into(),
+            crate::data::wire::format_timestamp(self.timestamp).into(),
+        );
+        object.get_mut("payload").expect("payload")["type"] = self.payload.sse_event_type().into();
+        value
+    }
+
     /// This event's position in the command's stream.
     pub fn cursor(&self) -> EventCursor {
         EventCursor::new(self.attempt, self.sequence)
@@ -321,7 +335,7 @@ pub enum CommandStatusKind {
     Aborted,
     /// Ended with an error; `error` carries the reason.
     Error,
-    /// Stopped by an external cancel request (`POST /v1/commands/{id}/cancel`).
+    /// Stopped by an external cancel request (`POST /v1/worker/commands/{id}/cancel`).
     Cancelled,
 }
 
@@ -373,28 +387,32 @@ impl std::fmt::Display for PhaseStatusKind {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
 pub enum EventPayload {
+    #[serde(alias = "workflow_prerequisites")]
     WorkflowPrerequisites {
         phase: PrerequisitePhase,
         report: WorkflowPrerequisiteReport,
     },
+    #[serde(alias = "stdout_line")]
     StdoutLine(String),
+    #[serde(alias = "stderr_line")]
     StderrLine(String),
-    StatusMessage {
-        phase: String,
-        message: String,
-    },
+    #[serde(alias = "status_message")]
+    StatusMessage { phase: String, message: String },
+    #[serde(alias = "workflow_step_transition")]
     WorkflowStepTransition {
         step_name: String,
         step_index: usize,
         from_status: StepStatusKind,
         to_status: StepStatusKind,
     },
+    #[serde(alias = "workflow_phase_transition")]
     WorkflowPhaseTransition {
         phase: String,
         step_desc: String,
         status: PhaseStatusKind,
     },
     /// One container in a parallel group (WI-0096) has started running.
+    #[serde(alias = "workflow_parallel_step_launched")]
     WorkflowParallelStepLaunched {
         step_name: String,
         step_index: usize,
@@ -402,16 +420,19 @@ pub enum EventPayload {
         model: Option<String>,
     },
     /// One container in a parallel group (WI-0096) has exited.
+    #[serde(alias = "workflow_parallel_step_exited")]
     WorkflowParallelStepExited {
         step_name: String,
         step_index: usize,
         exit_code: i32,
     },
     /// A parallel group (WI-0096) has fully drained; all its steps completed.
+    #[serde(alias = "workflow_parallel_group_finished")]
     WorkflowParallelGroupFinished,
     /// A structured-output agent did something (WI 0137 §4). `summary` is one
     /// line of at most [`STEP_ACTIVITY_SUMMARY_MAX_CHARS`] characters. The
     /// step it belongs to is the envelope's `source`.
+    #[serde(alias = "step_activity")]
     StepActivity {
         kind: StepActivityKind,
         summary: String,
@@ -419,8 +440,9 @@ pub enum EventPayload {
     /// How the command ended. Emitted exactly once per command by the queue
     /// worker, after the terminal row is written and before `Done`
     /// (WI 0137 §2). `result` is the same object `GET
-    /// /v1/commands/{id}/status` returns; `status`, `exit_code` and `error`
+    /// /v1/worker/commands/{id}` returns; `status`, `exit_code` and `error`
     /// are kept for clients that predate it.
+    #[serde(alias = "command_status")]
     CommandStatus {
         status: CommandStatusKind,
         exit_code: Option<i32>,
@@ -430,6 +452,7 @@ pub enum EventPayload {
     },
     /// The agent's effective OSC 7501 status changed (WI 0141). Values use
     /// the spec spellings; the step it belongs to is the envelope's `source`.
+    #[serde(alias = "program_status")]
     ProgramStatus {
         state: crate::data::program_status::ProgramState,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -443,6 +466,7 @@ pub enum EventPayload {
     },
     /// A PTY-bridged container registered a hub terminal (WI 0141). Step,
     /// phase, container and attempt come from the envelope's `source`.
+    #[serde(alias = "terminal_opened")]
     TerminalOpened {
         terminal_id: crate::data::ids::TerminalId,
         agent: String,
@@ -452,6 +476,7 @@ pub enum EventPayload {
         rows: u16,
     },
     /// The terminal's PTY exited (WI 0141).
+    #[serde(alias = "terminal_closed")]
     TerminalClosed {
         terminal_id: crate::data::ids::TerminalId,
         exit_code: i32,
@@ -459,6 +484,7 @@ pub enum EventPayload {
     /// The input grant on a terminal was taken or released (WI 0141).
     /// `holder` is the client's `x-awman-actor`, or `local`. Keystrokes are
     /// never logged.
+    #[serde(alias = "terminal_control")]
     TerminalControl {
         terminal_id: crate::data::ids::TerminalId,
         holder: String,
@@ -470,6 +496,7 @@ pub enum EventPayload {
     },
     /// A local attach subscription ended (WI 0141); published by the engine
     /// to host presenters (0142, 0157).
+    #[serde(alias = "terminal_viewer_detached")]
     TerminalViewerDetached {
         terminal_id: crate::data::ids::TerminalId,
         reason: crate::data::terminal::DetachReason,
@@ -479,6 +506,14 @@ pub enum EventPayload {
         )]
         annotations: crate::data::terminal::Annotations,
     },
+    /// The complete `GET /v1/worker/commands/{id}/workflow` snapshot,
+    /// published every time `workflow.state.json` is persisted (WI 0143),
+    /// including the initial and final snapshots. Same ordered log as push
+    /// SSE and WSP event delivery.
+    #[serde(rename = "workflow_state")]
+    #[serde(alias = "workflow_state")]
+    WorkflowState(serde_json::Value),
+    #[serde(alias = "done")]
     Done,
 }
 
@@ -501,6 +536,7 @@ impl EventPayload {
             EventPayload::TerminalClosed { .. } => "terminal_closed",
             EventPayload::TerminalControl { .. } => "terminal_control",
             EventPayload::TerminalViewerDetached { .. } => "terminal_viewer_detached",
+            EventPayload::WorkflowState(_) => "workflow_state",
             EventPayload::Done => "done",
         }
     }
@@ -564,6 +600,8 @@ impl EventPayload {
             | EventPayload::TerminalClosed { .. }
             | EventPayload::TerminalControl { .. }
             | EventPayload::TerminalViewerDetached { .. } => None,
+            // A structured snapshot, not a log line.
+            EventPayload::WorkflowState(_) => None,
             EventPayload::Done => None,
         }
     }
@@ -929,5 +967,40 @@ mod prerequisite_event_tests {
         assert!(!text.contains("ghp_"));
         let back: EventPayload = serde_json::from_value(json).unwrap();
         assert_eq!(back.sse_event_type(), "workflow_prerequisites");
+    }
+}
+
+#[cfg(test)]
+mod public_wire_tests {
+    use super::*;
+    #[test]
+    fn actual_status_initial_and_final_events_share_the_public_vocabulary() {
+        for payload in [
+            EventPayload::WorkflowState(serde_json::json!({"state":"initial"})),
+            EventPayload::StatusMessage {
+                phase: "push".into(),
+                message: "retry".into(),
+            },
+            EventPayload::Done,
+        ] {
+            let event = ExecutionEvent {
+                timestamp: Utc::now(),
+                attempt: 1,
+                sequence: 0,
+                source: None,
+                payload,
+            };
+            let value = event.public_value();
+            assert!(value.get("timestamp").is_none());
+            assert!(value["emitted_at"].as_str().unwrap().ends_with('Z'));
+            assert_eq!(value["payload"]["type"], event.payload.sse_event_type());
+            let decoded: ExecutionEvent = serde_json::from_value(value).unwrap();
+            assert_eq!(
+                decoded.payload.sse_event_type(),
+                event.payload.sse_event_type()
+            );
+            let old = serde_json::to_value(event).unwrap();
+            assert!(serde_json::from_value::<ExecutionEvent>(old).is_ok());
+        }
     }
 }

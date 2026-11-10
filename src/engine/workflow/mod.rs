@@ -372,7 +372,7 @@ pub struct WorkflowEngine {
     /// mirror visible to anyone else.
     session_mirror: Option<Arc<tokio::sync::RwLock<Session>>>,
     /// Fired by an external cancel request (the API's
-    /// `POST /v1/commands/{id}/cancel`). Never fired unless a caller installs
+    /// `POST /v1/worker/commands/{id}/cancel`). Never fired unless a caller installs
     /// one with [`WorkflowEngine::set_cancellation`].
     cancel: CancellationToken,
 }

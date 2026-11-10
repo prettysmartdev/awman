@@ -4,6 +4,56 @@
 use super::*;
 
 #[test]
+fn lease_directory_expressions_cannot_borrow_command_mount_provenance() {
+    use crate::data::session::{Session, SessionOpenOptions};
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("clone");
+    let external = temp.path().join("host-secrets");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::create_dir(&external).unwrap();
+    let session =
+        Session::open_at_git_root(root.clone(), root.clone(), SessionOpenOptions::default())
+            .unwrap();
+    let engine = make_engine(temp.path());
+    let spec = DirectorySpec {
+        host: external.to_string_lossy().into_owned(),
+        container: "/borrowed".into(),
+        permission: OverlayPermission::ReadWrite,
+    };
+    let mut request = OverlayRequest {
+        directories: vec![spec.clone()],
+        include_all_skills: false,
+        named_skills: vec![],
+        agent: None,
+        yolo: false,
+        container_home: None,
+        context_overlays: vec![],
+        materialize_credentials: false,
+        definition: None,
+    };
+    assert!(engine
+        .build_scoped_overlays(&session, &request, Some(&root), &[])
+        .is_err());
+    // A separately authenticated command mount must not bless an expression
+    // using the same path; rejection precedes mount deduplication.
+    assert!(engine
+        .build_scoped_overlays(&session, &request, Some(&root), std::slice::from_ref(&spec))
+        .is_err());
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&external, root.join("alias")).unwrap();
+        request.directories[0].host = root.join("alias").to_string_lossy().into_owned();
+        assert!(engine
+            .build_scoped_overlays(&session, &request, Some(&root), &[])
+            .is_err());
+    }
+    request.directories.clear();
+    assert!(engine
+        .build_scoped_overlays(&session, &request, Some(&root), &[spec])
+        .is_ok());
+}
+
+#[test]
 fn daemon_control_directory_cannot_be_mounted() {
     let root = tempfile::tempdir().unwrap();
     let daemon = root.path().join("data/daemon");

@@ -157,6 +157,7 @@ pub const MAP_NAME: &str = "[a-z0-9][a-z0-9_-]{0,62}";
 pub const RESERVED_ENV: &[&str] = &[
     "AWMAN_HOME",
     "AWMAN_REMOTE_SESSION",
+    "AWMAN_LEASE_CREDENTIAL_FILE",
     "AWMAN_TEST_ISOLATION",
     "AWMAN_TEST_DOCKER",
     "AWMAN_TEST_APPLE_CONTAINER",
@@ -302,7 +303,7 @@ pub const CONFIG_KEYS: &[ConfigKey] = &[
         "true",
         Repo,
         false,
-        "Collect program status from agents (read from 0141).",
+        "Collect program status from agents.",
     ),
     // runtime
     row(
@@ -666,7 +667,7 @@ pub const CONFIG_KEYS: &[ConfigKey] = &[
         "true",
         Repo,
         false,
-        "Emit program status from the TUI (read from 0141).",
+        "Emit program status from the TUI.",
     ),
     row(
         "tui.worker.enabled",
@@ -674,7 +675,7 @@ pub const CONFIG_KEYS: &[ConfigKey] = &[
         "false",
         Repo,
         false,
-        "Run a pull worker inside the TUI (read from 0143).",
+        "Enable the TUI work queue panel (Ctrl+Q) and an instance-owned manual worker.",
     ),
     row(
         "tui.integrations.*",
@@ -715,7 +716,7 @@ pub const CONFIG_KEYS: &[ConfigKey] = &[
         "120",
         Global,
         true,
-        "Default daemon terminal width (read from 0141).",
+        "Default daemon terminal width.",
     ),
     row(
         "daemon.terminal.rows",
@@ -723,7 +724,7 @@ pub const CONFIG_KEYS: &[ConfigKey] = &[
         "40",
         Global,
         true,
-        "Default daemon terminal height (read from 0141).",
+        "Default daemon terminal height.",
     ),
     row(
         "daemon.terminal.remoteInput",
@@ -731,7 +732,7 @@ pub const CONFIG_KEYS: &[ConfigKey] = &[
         "false",
         Global,
         true,
-        "Accept terminal input from network clients (read from 0141).",
+        "Accept terminal input from network clients.",
     ),
     row(
         "daemon.network.enabled",
@@ -739,7 +740,7 @@ pub const CONFIG_KEYS: &[ConfigKey] = &[
         "false",
         Global,
         true,
-        "Serve the API on the network listener (read from 0140).",
+        "Serve the API on the network listener.",
     ),
     row(
         "daemon.network.listen",
@@ -755,7 +756,7 @@ pub const CONFIG_KEYS: &[ConfigKey] = &[
         "[]",
         Global,
         true,
-        "Extra names in the listener's TLS certificate (read from 0140).",
+        "Extra names in the listener's TLS certificate.",
     ),
     row(
         "daemon.network.features",
@@ -763,7 +764,7 @@ pub const CONFIG_KEYS: &[ConfigKey] = &[
         "[\"worker\"]",
         Global,
         true,
-        "Features served on the network listener (read from 0140).",
+        "Features served on the network listener.",
     ),
     row(
         "daemon.features.squad.enabled",
@@ -787,7 +788,7 @@ pub const CONFIG_KEYS: &[ConfigKey] = &[
         "true",
         Global,
         true,
-        "Let a squad task choose its own interaction (read from 0141).",
+        "Let a squad task choose its own interaction.",
     ),
     row(
         "daemon.features.squad.maxConcurrentJobs",
@@ -875,7 +876,7 @@ pub const CONFIG_KEYS: &[ConfigKey] = &[
         "true",
         Global,
         true,
-        "Claim jobs from work servers (read from 0143).",
+        "Register enabled work servers and claim eligible work items.",
     ),
     row(
         "daemon.features.worker.pull.interaction",
@@ -883,7 +884,7 @@ pub const CONFIG_KEYS: &[ConfigKey] = &[
         "\"interactive\"",
         Global,
         true,
-        "Default interaction of pulled jobs (read from 0143).",
+        "Default interaction for pulled jobs.",
     ),
     row(
         "daemon.features.worker.pull.allowOverride",
@@ -891,7 +892,7 @@ pub const CONFIG_KEYS: &[ConfigKey] = &[
         "true",
         Global,
         true,
-        "Let a pulled job choose its own interaction (read from 0143).",
+        "Allow work items and server entries to override pull interaction.",
     ),
     row(
         "daemon.features.worker.pull.workRoot",
@@ -899,7 +900,7 @@ pub const CONFIG_KEYS: &[ConfigKey] = &[
         "null",
         Global,
         true,
-        "Directory pulled jobs check out into (read from 0143).",
+        "Root for pulled-job checkouts; null uses <data>/worker.",
     ),
     row(
         "daemon.features.engine.enabled",
@@ -940,7 +941,7 @@ pub const CONFIG_KEYS: &[ConfigKey] = &[
         "null",
         Global,
         true,
-        "Work server URL; required for every entry (read from 0143).",
+        "Base URL of a linked work server; required for every entry.",
     ),
     row(
         "workServers.*.enabled",
@@ -948,7 +949,7 @@ pub const CONFIG_KEYS: &[ConfigKey] = &[
         "true",
         Global,
         true,
-        "Claim work from this server (read from 0143).",
+        "Whether this work server is enabled.",
     ),
     row(
         "workServers.*.claim",
@@ -956,7 +957,7 @@ pub const CONFIG_KEYS: &[ConfigKey] = &[
         "\"auto\"",
         Global,
         true,
-        "Whether work is claimed automatically (read from 0143).",
+        "Claim automatically or wait for a person to pick work items.",
     ),
     row(
         "workServers.*.maxConcurrentJobs",
@@ -964,7 +965,7 @@ pub const CONFIG_KEYS: &[ConfigKey] = &[
         "1",
         Global,
         true,
-        "Jobs from this server at once (read from 0143).",
+        "Maximum concurrent jobs claimed from this server.",
     ),
     row(
         "workServers.*.interaction",
@@ -972,7 +973,7 @@ pub const CONFIG_KEYS: &[ConfigKey] = &[
         "null",
         Global,
         true,
-        "Interaction override for this server's jobs (read from 0143).",
+        "Optional interaction override for this server's jobs.",
     ),
     row(
         "workServers.*.labels",
@@ -980,7 +981,15 @@ pub const CONFIG_KEYS: &[ConfigKey] = &[
         "{}",
         Global,
         true,
-        "Labels this worker advertises to the server (read from 0143).",
+        "Owner-configured worker labels for this server.",
+    ),
+    row(
+        "workServers.*.labels.*",
+        ValueKind::String,
+        "null",
+        Global,
+        true,
+        "One owner-configured worker label; awman/ is reserved.",
     ),
     // remote
     row(
@@ -1282,7 +1291,7 @@ impl ConfigKey {
 
     /// Whether the key has an environment-variable form (objects do not).
     pub fn has_env(&self) -> bool {
-        self.kind != ValueKind::Object
+        self.kind != ValueKind::Object && self.path != "workServers.*.labels.*"
     }
 
     /// `AWMAN_` + SCREAMING_SNAKE(path), `*` kept as a placeholder:
@@ -1325,12 +1334,13 @@ impl ConfigKey {
     }
 
     /// Whether `*` segments of this row are free-form (any non-empty JSON
-    /// key) rather than [`MAP_NAME`]. Only object maps with no env form —
-    /// image tags (`awman-x:latest`) and registry hosts (`ghcr.io`) — are.
+    /// key) rather than [`MAP_NAME`]. This is used for image tags
+    /// (`awman-x:latest`), registry hosts (`ghcr.io`) and the namespaced key
+    /// under `workServers.*.labels` (which has no per-key env form).
     fn free_form_names(&self) -> bool {
         matches!(
             self.path,
-            "runtime.builtin.images.*" | "runtime.builtin.registries.*"
+            "runtime.builtin.images.*" | "runtime.builtin.registries.*" | "workServers.*.labels.*"
         )
     }
 }
@@ -1409,7 +1419,18 @@ pub fn resolve(path: &str) -> Result<ResolvedKey, KeyError> {
     let segments: Vec<&str> = owned.iter().map(String::as_str).collect();
     for key in CONFIG_KEYS {
         if let Some(names) = match_pattern(key.path, &segments) {
-            if !key.free_form_names() {
+            if key.path == "workServers.*.labels.*" {
+                if !is_valid_map_name(&names[0]) || names[1].is_empty() {
+                    return Err(KeyError::Name {
+                        path: path.to_string(),
+                        name: names
+                            .iter()
+                            .find(|n| !is_valid_map_name(n))
+                            .cloned()
+                            .unwrap_or_default(),
+                    });
+                }
+            } else if !key.free_form_names() {
                 if let Some(bad) = names.iter().find(|n| !is_valid_map_name(n)) {
                     return Err(KeyError::Name {
                         path: path.to_string(),
@@ -1794,6 +1815,15 @@ fn walk(
                 },
                 other => other,
             })?;
+            if child == "workServers.*.labels.*" {
+                let label = path.rsplit('.').next().unwrap_or_default();
+                super::work_servers::validate_configured_label(label).map_err(|reason| {
+                    KeyError::Value {
+                        path: path.clone(),
+                        reason,
+                    }
+                })?;
+            }
             // Integration-owned options remain opaque, but the shared
             // `enabled` leaf must still be checked by its declared enum row.
             if child == "tui.integrations.*" {
@@ -2320,6 +2350,11 @@ mod tests {
             validate_document(&bad, FileKind::Global),
             Err(KeyError::Name { .. })
         ));
+        let bad_server = serde_json::json!({"workServers": {"Bad Name": {"url": "https://x"}}});
+        assert!(matches!(
+            validate_document(&bad_server, FileKind::Global),
+            Err(KeyError::Name { .. })
+        ));
         let dup =
             serde_json::json!({"workServers": {"in-fact": {"url": "u"}, "in_fact": {"url": "u"}}});
         let err = validate_document(&dup, FileKind::Global).unwrap_err();
@@ -2405,6 +2440,16 @@ mod dotted_member_tests {
             doc["runtime"]["builtin"]["registries"],
             serde_json::json!({})
         );
+
+        let label = resolve("workServers.prod.labels.team.example/owner").unwrap();
+        assert_eq!(label.names, ["prod", "team.example/owner"]);
+        let labels = serde_json::json!({"workServers": {"prod": {"url": "https://example.com", "labels": {"team.example/owner": "build"}}}});
+        assert!(validate_document(&labels, FileKind::Global).is_ok());
+        assert!(
+            super::super::work_servers::validate_configured_label("awman/os")
+                .unwrap_err()
+                .contains("reserved awman/ namespace")
+        );
     }
 }
 
@@ -2441,6 +2486,38 @@ mod daemon_config_tests {
         assert!(!is_live("daemon.network.listen"));
         assert_eq!(daemon_key("daemon.network.listen").scope, KeyScope::Global);
         assert_eq!(daemon_key("daemon.maxConcurrentJobs").default, "4");
+    }
+
+    #[test]
+    fn worker_config_rows_match_scope_live_and_defaults() {
+        let worker_rows = CONFIG_KEYS
+            .iter()
+            .filter(|key| key.path.starts_with("daemon.features.worker."));
+        for key in worker_rows {
+            assert_eq!(key.scope, KeyScope::Global, "{}", key.path);
+            assert!(key.live, "{} should apply live", key.path);
+        }
+        for key in CONFIG_KEYS
+            .iter()
+            .filter(|key| key.path.starts_with("workServers.*."))
+        {
+            assert_eq!(key.scope, KeyScope::Global, "{}", key.path);
+            assert!(key.live, "{} should apply live", key.path);
+        }
+        assert_eq!(
+            daemon_key("daemon.features.worker.push.interaction").default,
+            "\"headless\""
+        );
+        assert_eq!(
+            daemon_key("daemon.features.worker.pull.interaction").default,
+            "\"interactive\""
+        );
+        assert_eq!(
+            daemon_key("daemon.features.worker.pull.workRoot").default,
+            "null"
+        );
+        assert_eq!(daemon_key("tui.worker.enabled").default, "false");
+        assert!(parse_input(daemon_key("tui.worker.enabled"), "true").is_ok());
     }
 
     #[test]

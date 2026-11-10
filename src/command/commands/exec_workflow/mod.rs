@@ -357,7 +357,7 @@ pub struct ExecWorkflowCommand {
     /// daemon's and has no viewer, and for tests built with
     /// [`ExecWorkflowCommand::new`].
     managed_session: Option<Arc<tokio::sync::RwLock<Session>>>,
-    /// Fired by an external cancel (the API's `POST /v1/commands/{id}/cancel`).
+    /// Fired by an external cancel (the API's `POST /v1/worker/commands/{id}/cancel`).
     /// Never fired for the CLI, the TUI or squad, which never install one.
     cancel: tokio_util::sync::CancellationToken,
     /// Which frontend runs this command: picks the headless profile the

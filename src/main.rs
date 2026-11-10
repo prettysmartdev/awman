@@ -24,6 +24,17 @@ use awman::frontend::cli;
 use awman::frontend::tui;
 
 fn main() -> Result<ExitCode> {
+    if let Some(success) = awman::command::git_credential_helper::dispatch(
+        &Env::from_process(),
+        &mut std::io::stdin().lock(),
+        &mut std::io::stdout().lock(),
+    ) {
+        return Ok(if success {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        });
+    }
     #[cfg(windows)]
     awman::engine::remote::local::install_owner_pipe(
         awman_host_shims::owner_pipe,

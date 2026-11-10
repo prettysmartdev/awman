@@ -13,6 +13,10 @@ impl Tab {
     /// more of a long project name instead of clipping at a fixed length;
     /// pass `u16::MAX` to measure the untruncated name.
     pub fn project_name(&self, tab_width: u16) -> String {
+        if let Some(label) = &self.label_override {
+            let max = (tab_width as usize).saturating_sub(6).max(1);
+            return truncate_with_ellipsis(label, max);
+        }
         let name = if self.is_squad {
             // Fixed label: `AWMAN_SQUAD_ROOT` may point at a directory whose
             // basename has nothing to do with squad.

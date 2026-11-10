@@ -54,6 +54,16 @@ fn defaults_come_from_the_key_table() {
     assert_eq!(ec.worktree_on_dirty_merge_target(), None);
     let daemon = ec.daemon();
     assert_eq!(daemon.max_concurrent_jobs, 4);
+    assert!(!daemon.worker.enabled);
+    assert_eq!(daemon.worker.max_concurrent_jobs, 2);
+    assert!(daemon.worker.push_enabled);
+    assert_eq!(daemon.worker.push_interaction, Interaction::Headless);
+    assert!(daemon.worker.push_allow_override);
+    assert!(daemon.worker.pull_enabled);
+    assert_eq!(daemon.worker.pull_interaction, Interaction::Interactive);
+    assert!(daemon.worker.pull_allow_override);
+    assert_eq!(daemon.worker.pull_work_root, None);
+    assert!(daemon.worker.work_servers.is_empty());
     assert_eq!(
         daemon.engine,
         crate::data::config::daemon::EngineSettings {
@@ -730,9 +740,31 @@ fn existing_map_entries_get_leaf_defaults_with_default_provenance() {
     assert_eq!(v["workServers"]["prod"]["enabled"], json!(true));
     assert_eq!(v["workServers"]["prod"]["claim"], json!("auto"));
     assert_eq!(v["workServers"]["prod"]["maxConcurrentJobs"], json!(1));
+    assert!(cfg.work_servers()["prod"].enabled);
+    assert_eq!(cfg.work_servers()["prod"].max_concurrent_jobs, 1);
+    assert_eq!(
+        cfg.daemon().worker.work_servers["prod"].claim,
+        crate::data::config::work_servers::ClaimMode::Auto
+    );
     assert_eq!(cfg.source_of("workServers.prod.enabled"), Layer::Default);
     assert_eq!(cfg.source_of("workServers.prod.url"), Layer::Global);
     // A wildcard row never invents an entry.
     let empty = resolve(layers(json!({}), json!({}), None));
     assert_eq!(empty.value()["workServers"], json!({}));
+}
+
+#[test]
+fn tui_worker_setting_defaults_false_and_resolves_overrides() {
+    let empty = resolve(layers(json!({}), json!({}), None));
+    assert!(!empty.tui_worker_enabled());
+    let enabled = EffectiveConfig::resolve(
+        ConfigLayers {
+            set: set(&[("tui.worker.enabled", json!(true))]),
+            ..layers(json!({}), json!({}), None)
+        },
+        FlagConfig::default(),
+        EnvSnapshot::empty(),
+    )
+    .unwrap();
+    assert!(enabled.tui_worker_enabled());
 }
