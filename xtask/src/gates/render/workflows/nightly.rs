@@ -1,0 +1,368 @@
+//! Renders `.github/workflows/nightly.yml`: everything too slow, too random or
+//! too hardware-bound for the PR path (design 11.4). The full gate is `ci.yml`
+//! called with `gate: nightly`, so nightly runs the same build and test jobs.
+
+use super::pieces::*;
+use crate::manifest::Manifest;
+use anyhow::Result;
+
+fn tpl(text: &str, pairs: &[(&str, &str)]) -> String {
+    let mut out = text.to_owned();
+    for (k, v) in pairs {
+        out = out.replace(&format!("@@{k}@@"), v);
+    }
+    assert!(!out.contains("@@"), "unreplaced placeholder in template");
+    out
+}
+
+const TOP: &str = r####"on:
+  schedule:
+    - cron: "23 3 * * *"
+  workflow_dispatch:
+
+# Read-only by default. Write scopes are granted per job, and only to jobs that
+# cannot be reached from a pull request.
+permissions:
+  contents: read
+
+# Nightly never cancels a run in progress: a half-finished hunt is no evidence.
+concurrency:
+  group: nightly-${{ github.workflow }}-${{ github.run_id }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+"####;
+
+const HEAD: &str = r####"  plan:
+    name: Plan
+    runs-on: @@RUNS_ON@@
+    timeout-minutes: 10
+    outputs:
+      cargo_version_tag: ${{ steps.version.outputs.tag }}
+    steps:
+@@CHECKOUT@@
+@@RUST@@
+      - name: Release version of this commit (v<Cargo.toml version>)
+        id: version
+        run: |
+          version="$(cargo metadata --no-deps --format-version 1 --locked | jq -r '.packages[] | select(.name == "awman") | .version')"
+          test -n "$version"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+
+  full:
+    name: Full gate (every tier on every platform)
+    uses: ./.github/workflows/ci.yml
+    with:
+      gate: nightly
+    permissions:
+      contents: read
+      actions: read
+
+  flake-hunt:
+    name: Flake hunt (shuffled, repeated, under CPU contention)
+    runs-on: @@RUNS_ON@@
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      issues: write
+    env:
+      RUNS: "5"
+    steps:
+@@CHECKOUT@@
+@@RUST@@
+      - name: Install the pinned test runner and a CPU stressor
+        run: |
+          cargo xtask test install-runner
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends stress-ng
+      - name: Build the archive once
+        run: cargo xtask test archive --build linux-x64-default --out archive
+      - name: Repeat the tiers with a recorded shuffle seed under contention
+        run: |
+          stress-ng --cpu "$(nproc)" --cpu-load 90 --timeout 55m --quiet &
+          stress_pid=$!
+          status=0
+          mkdir -p flake
+          for run in $(seq 1 "$RUNS"); do
+            seed="$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')"
+            echo "run $run seed $seed" | tee -a flake/seeds.txt
+            cargo xtask test run --tier unit --tier component --tier boundary \
+              --build linux-x64-default --archive archive/test-archive-linux-x64-default.tar.zst \
+              --shuffle-seed "$seed" --evidence-dir "flake/run$run" || status=1
+          done
+          kill "$stress_pid" 2>/dev/null || true
+          exit "$status"
+      - name: Report intermittent failures
+        id: report
+        if: ${{ always() }}
+        run: cargo xtask ci flake-report --in flake --out flake/report.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Open an issue with the failure record
+        if: ${{ failure() && steps.report.outcome == 'failure' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh issue create --repo "$GITHUB_REPOSITORY" \
+            --title "Nightly flake hunt: intermittent test failure ($(date -u +%F))" \
+            --label flaky-test \
+            --body-file flake/report.md
+      - name: Upload the flake evidence and failure records
+        if: ${{ always() }}
+        uses: @@UPLOAD@@
+        with:
+          name: flake-hunt-${{ github.sha }}
+          path: flake
+          if-no-files-found: warn
+          retention-days: 30
+
+  seeded-defects:
+    name: Seeded defects (each must turn its cell red)
+    runs-on: @@RUNS_ON@@
+    timeout-minutes: 45
+    steps:
+@@CHECKOUT@@
+@@RUST@@
+      - name: Install the pinned test runner
+        run: cargo xtask test install-runner
+      - name: Pipeline faults (missing target, renamed job, skipped hardware)
+        run: cargo xtask ci seeded-defects pipeline
+      - name: Source defects (ci/seeded-defects/<layer>/*.patch)
+        run: cargo xtask ci seeded-defects source --dir ci/seeded-defects --report seeded-defects.md
+      - name: Report
+        if: ${{ always() }}
+        run: cat seeded-defects.md >> "$GITHUB_STEP_SUMMARY" || true
+
+  mutation:
+    name: Mutation testing (Layer 0 and Layer 2, sampled)
+    runs-on: @@RUNS_ON@@
+    timeout-minutes: 60
+    steps:
+@@CHECKOUT@@
+@@RUST@@
+      - name: Install the pinned test runner and cargo-mutants
+        run: |
+          cargo xtask test install-runner
+          cargo xtask ci install-tool cargo-mutants
+          echo "$PWD/target/xtask-tools" >> "$GITHUB_PATH"
+      - name: Mutate a sample (shard chosen by the date, so the whole tree cycles)
+        run: |
+          shards=40
+          shard=$(( $(date -u +%j | sed 's/^0*//') % shards ))
+          echo "mutation shard $shard of $shards" | tee -a "$GITHUB_STEP_SUMMARY"
+          status=0
+          cargo mutants --package awman --test-tool nextest \
+            --file 'src/data/**/*.rs' --file 'src/command/**/*.rs' \
+            --shard "$shard/$shards" --jobs 2 --minimum-test-timeout 60 --output mutants || status=$?
+          # Exit 2 means some mutants survived: that is the finding, not a failure to run.
+          if [ "$status" -ne 0 ] && [ "$status" -ne 2 ]; then exit "$status"; fi
+      - name: Surviving mutants
+        if: ${{ always() }}
+        run: |
+          if [ -f mutants/mutants.out/missed.txt ]; then
+            { echo '### Surviving mutants'; echo; echo '```'; head -n 200 mutants/mutants.out/missed.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Upload mutation results
+        if: ${{ always() }}
+        uses: @@UPLOAD@@
+        with:
+          name: mutation-${{ github.sha }}
+          path: mutants
+          if-no-files-found: warn
+          retention-days: 30
+
+  coverage:
+    name: Coverage per layer (diagnostic)
+    runs-on: @@RUNS_ON@@
+    timeout-minutes: 45
+    steps:
+@@CHECKOUT@@
+@@RUST@@
+      - name: Install tools
+        run: |
+          rustup component add llvm-tools-preview
+          cargo xtask test install-runner
+          cargo xtask ci install-tool cargo-llvm-cov
+          echo "$PWD/target/xtask-tools" >> "$GITHUB_PATH"
+      - name: Measure
+        run: cargo llvm-cov nextest --workspace --locked --no-report
+      - name: Report per layer
+        run: |
+          layers="data engine command frontend"
+          for layer in $layers; do
+            others=""
+            for other in $layers; do
+              if [ "$other" != "$layer" ]; then others="$others|src/$other/"; fi
+            done
+            echo "### Layer: $layer" >> "$GITHUB_STEP_SUMMARY"
+            cargo llvm-cov report --summary-only --ignore-filename-regex "(${others#|}|tests/|xtask/|crates/)" | tail -n 3 >> "$GITHUB_STEP_SUMMARY"
+          done
+          cargo llvm-cov report --lcov --output-path lcov.info
+      - name: Upload coverage
+        uses: @@UPLOAD@@
+        with:
+          name: coverage-${{ github.sha }}
+          path: lcov.info
+          retention-days: 30
+
+  repro-build:
+    name: Clean-room reproducibility build (non-blocking)
+    runs-on: @@RUNS_ON@@
+    timeout-minutes: 45
+    steps:
+@@CHECKOUT@@
+@@RUST@@
+      - name: Two clean-room unsigned builds with separate target directories
+        run: |
+          export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct 2>/dev/null || echo 0)"
+          for n in 1 2; do
+            CARGO_TARGET_DIR="$RUNNER_TEMP/repro-$n" \
+              RUSTFLAGS="--remap-path-prefix=$PWD=/build --remap-path-prefix=$RUNNER_TEMP/repro-$n=/target" \
+              cargo build -p awman-cli --bin awman --release --locked
+          done
+          mkdir -p repro
+          sha256sum "$RUNNER_TEMP/repro-1/release/awman" "$RUNNER_TEMP/repro-2/release/awman" | tee repro/digests.txt
+          a="$(sha256sum "$RUNNER_TEMP/repro-1/release/awman" | cut -d' ' -f1)"
+          b="$(sha256sum "$RUNNER_TEMP/repro-2/release/awman" | cut -d' ' -f1)"
+          if [ "$a" != "$b" ]; then
+            echo "::warning title=Not reproducible::two clean-room builds of this commit differ"
+            exit 1
+          fi
+      - name: Upload digests
+        if: ${{ always() }}
+        uses: @@UPLOAD@@
+        with:
+          name: repro-${{ github.sha }}
+          path: repro
+          if-no-files-found: warn
+          retention-days: 30
+
+  audit:
+    name: Dependency audit (advisories)
+    runs-on: @@RUNS_ON@@
+    timeout-minutes: 20
+    steps:
+@@CHECKOUT@@
+@@RUST@@
+      - name: Install cargo-deny
+        run: |
+          cargo xtask ci install-tool cargo-deny
+          echo "$PWD/target/xtask-tools/bin" >> "$GITHUB_PATH"
+      - name: Check advisories against the current database
+        run: cargo deny check advisories
+
+  rehearsal:
+    name: Release candidate and promote dry-run rehearsal
+    needs: plan
+    if: ${{ github.ref == 'refs/heads/main' && vars.AWMAN_RELEASE_REHEARSAL == 'enabled' }}
+    uses: ./.github/workflows/candidate.yml
+    with:
+      version: ${{ needs.plan.outputs.cargo_version_tag }}
+      commit: ${{ github.sha }}
+      dry_run: true
+      promote: true
+      operator_record: '{"source":"nightly-rehearsal"}'
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+      actions: read
+
+  ci-trends:
+    name: Timing trends (p50/p95, queue time, flake rate, cache hit rate)
+    needs: full
+    if: ${{ !cancelled() }}
+    runs-on: @@RUNS_ON@@
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+@@CHECKOUT@@
+@@RUST@@
+      - name: Collect the last 30 days of timing artifacts
+        run: |
+          mkdir -p trends/raw
+          since="$(date -u -d '30 days ago' +%FT%TZ)"
+          gh api --paginate "repos/$GITHUB_REPOSITORY/actions/artifacts?per_page=100" \
+            --jq ".artifacts[] | select((.name | startswith(\"timing-\")) and .expired == false and .created_at >= \"$since\") | [.id, .name] | @tsv" |
+          while IFS=$'\t' read -r id name; do
+            gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$id/zip" > "trends/raw/$id.zip"
+            unzip -q -o "trends/raw/$id.zip" -d "trends/raw/$id" || true
+          done
+          find trends/raw -name history.jsonl -exec cat {} + > trends/history.jsonl || true
+          test -s trends/history.jsonl || echo "no timing history yet" >&2
+      - name: Report and publish ci-trends
+        run: |
+          if [ -s trends/history.jsonl ]; then
+            cargo xtask evidence history report --store trends/history.jsonl | tee trends/report.txt >> "$GITHUB_STEP_SUMMARY"
+            cargo xtask ci timings --store trends/history.jsonl --out trends/timings.json
+          else
+            echo '{"suite_durations_ms":{},"main_durations_ms":[]}' > trends/timings.json
+          fi
+      - name: Upload ci-trends
+        uses: @@UPLOAD@@
+        with:
+          name: ci-trends
+          path: trends
+          if-no-files-found: error
+          retention-days: 90
+
+  nightly:
+    name: Nightly verdict
+    needs: [plan, full, flake-hunt, seeded-defects, mutation, coverage, repro-build, audit, rehearsal, ci-trends]
+    if: ${{ always() }}
+    runs-on: @@RUNS_ON@@
+    timeout-minutes: 10
+    steps:
+      - name: Verdict (fails closed; a skipped rehearsal is blocked, not green)
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          blocking="plan full flake-hunt seeded-defects audit rehearsal"
+          diagnostic="mutation coverage repro-build ci-trends"
+          status=0
+          for job in $blocking; do
+            result="$(printf '%s' "$NEEDS" | jq -r --arg j "$job" '.[$j].result')"
+            if [ "$result" != success ]; then
+              echo "FAIL: $job: $result" | tee -a "$GITHUB_STEP_SUMMARY" >&2
+              status=1
+            fi
+          done
+          for job in $diagnostic; do
+            result="$(printf '%s' "$NEEDS" | jq -r --arg j "$job" '.[$j].result')"
+            if [ "$result" != success ]; then
+              echo "warning: $job: $result (diagnostic, does not fail the verdict)" | tee -a "$GITHUB_STEP_SUMMARY"
+            fi
+          done
+          exit "$status"
+"####;
+
+pub fn render(m: &Manifest) -> Result<String> {
+    let linux = &m.platforms["linux-x64"];
+    let mut out = header("Nightly");
+    out.push('\n');
+    out.push_str(TOP);
+    out.push_str(&tpl(
+        HEAD,
+        &[
+            ("RUNS_ON", &runs_on(&linux.runs_on)),
+            (
+                "CHECKOUT",
+                &indent(&checkout_ref(false, "${{ github.sha }}"), 6),
+            ),
+            ("RUST", &indent(&rust(&linux.toolchain, &[]), 6)),
+            ("UPLOAD", UPLOAD),
+        ],
+    ));
+    Ok(out)
+}

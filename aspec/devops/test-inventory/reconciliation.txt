@@ -1,0 +1,15 @@
+aspec/devops/test-inventory/cargo-metadata.csv: 4 rows
+aspec/devops/test-inventory/cargo-registrations.csv: 43 rows
+aspec/devops/test-inventory/cargo-targets.csv: 54 rows
+aspec/devops/test-inventory/doctests.csv: 10 rows
+aspec/devops/test-inventory/documentation.csv: 2 rows
+aspec/devops/test-inventory/inline-test-modules.csv: 702 rows
+aspec/devops/test-inventory/ledger-crosswalk.csv: 15 rows
+aspec/devops/test-inventory/make-targets.csv: 22 rows
+aspec/devops/test-inventory/rust-tests.csv: 6713 rows
+aspec/devops/test-inventory/script-callers.csv: 172 rows
+aspec/devops/test-inventory/scripts.csv: 172 rows
+aspec/devops/test-inventory/test-environment.csv: 580 rows
+aspec/devops/test-inventory/test-files.csv: 183 rows
+aspec/devops/test-inventory/workflows.csv: 13 rows
+plain_attributes=6316 parameterized_attributes=397 total=6713 added=0 targets=54 files=183

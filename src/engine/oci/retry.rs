@@ -25,7 +25,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::engine::error::{EngineError, ImageRetryClass};
 
@@ -235,25 +235,40 @@ pub(crate) fn finish(err: EngineError) -> EngineError {
     }
 }
 
-/// Deadline bookkeeping for one acquisition.
+/// The monotonic clock deadlines read unless a caller injects another.
+static SYSTEM_CLOCK: crate::data::clock::SystemClock = crate::data::clock::SystemClock;
+
+/// Deadline bookkeeping for one acquisition, on an injectable monotonic
+/// clock (the system clock in production, a `ManualClock` in tests).
 #[derive(Debug, Clone, Copy)]
 pub struct Deadline {
-    started: Instant,
+    clock: &'static dyn crate::data::clock::Clock,
+    started: Duration,
     budget: Duration,
 }
 
 impl Deadline {
     pub fn start(budget: Duration) -> Self {
+        Self::start_on(budget, &SYSTEM_CLOCK)
+    }
+
+    /// A deadline measured on `clock` (virtual time in tests).
+    pub fn start_on(budget: Duration, clock: &'static dyn crate::data::clock::Clock) -> Self {
         Self {
-            started: Instant::now(),
+            clock,
+            started: clock.monotonic(),
             budget,
         }
+    }
+
+    fn elapsed(&self) -> Duration {
+        self.clock.monotonic().saturating_sub(self.started)
     }
 
     /// Time left, `None` when the budget is exhausted.
     pub fn remaining(&self) -> Option<Duration> {
         self.budget
-            .checked_sub(self.started.elapsed())
+            .checked_sub(self.elapsed())
             .filter(|left| !left.is_zero())
     }
 
@@ -433,16 +448,25 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
+    /// A virtual monotonic clock for one test (leaked: deadlines borrow
+    /// their clock for `'static`, as the production system clock is).
+    fn manual_clock() -> &'static crate::data::clock::ManualClock {
+        Box::leak(Box::new(crate::data::clock::ManualClock::new(
+            chrono::DateTime::<chrono::Utc>::UNIX_EPOCH,
+        )))
+    }
+
     #[test]
     fn late_success_and_cancelled_success_are_rejected() {
+        let clock = manual_clock();
         let budget = Duration::from_millis(10);
         let err = run_bounded(
             RetryPolicy::NONE,
-            Deadline::start(budget),
+            Deadline::start_on(budget, clock),
             &CancelToken::new(),
             &*no_sleep(),
             |_| {
-                std::thread::sleep(Duration::from_millis(30));
+                clock.advance(Duration::from_millis(30));
                 Ok(37)
             },
         )
@@ -465,19 +489,22 @@ mod tests {
 
     #[test]
     fn controlled_reader_rejects_bytes_returned_after_expiry() {
-        struct Slow;
+        struct Slow(&'static crate::data::clock::ManualClock);
         impl std::io::Read for Slow {
             fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
-                std::thread::sleep(Duration::from_millis(30));
+                // The read itself takes (virtual) time past the deadline.
+                self.0.advance(Duration::from_millis(30));
                 bytes[0] = 42;
                 Ok(1)
             }
         }
+        let clock = manual_clock();
         let control = OperationControl::new(
             CancelToken::new(),
-            Deadline::start(Duration::from_millis(10)),
+            Deadline::start_on(Duration::from_millis(10), clock),
         );
-        let err = std::io::copy(&mut control.reader(Slow), &mut std::io::sink()).unwrap_err();
+        let err =
+            std::io::copy(&mut control.reader(Slow(clock)), &mut std::io::sink()).unwrap_err();
         assert!(err.to_string().contains("deadline"), "{err}");
     }
 
@@ -601,20 +628,21 @@ mod tests {
             assert_eq!(calls, 1);
             assert!(is_cancelled(&err));
 
+            let clock = manual_clock();
             let mut calls = 0;
             let err = run_bounded(
                 RetryPolicy::DEFAULT,
-                Deadline::start(Duration::from_millis(1)),
+                Deadline::start_on(Duration::from_millis(1), clock),
                 &CancelToken::new(),
                 &|_| {},
                 |_| {
                     calls += 1;
-                    std::thread::sleep(Duration::from_millis(10));
+                    clock.advance(Duration::from_millis(10));
                     Err::<(), _>(class.failure("source failure".into()))
                 },
             )
             .unwrap_err();
-            assert!(calls <= 1);
+            assert_eq!(calls, 1);
             assert!(matches!(err, EngineError::Network(ref text) if text.contains("deadline")));
         }
     }
@@ -718,29 +746,39 @@ mod tests {
         assert_eq!(*calls.lock().unwrap(), 1);
     }
 
+    /// A 3 s backoff is slept in ≤ 20 ms slices with a cancellation check
+    /// before each; a cancel arriving mid-backoff stops it at the next slice.
+    /// The sleeper advances virtual time and cancels after the second slice.
     #[test]
     fn cancellation_interrupts_a_long_production_backoff() {
+        let clock = manual_clock();
         let token = CancelToken::new();
-        let signal = token.clone();
-        let canceller = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(30));
-            signal.cancel();
-        });
-        let started = Instant::now();
+        let slices = Mutex::new(Vec::new());
+        let sleep = |slice: Duration| {
+            clock.advance(slice);
+            let mut slices = slices.lock().unwrap();
+            slices.push(slice);
+            if slices.len() == 2 {
+                token.cancel();
+            }
+        };
         let error = run_bounded(
             RetryPolicy {
                 initial_backoff: Duration::from_secs(3),
                 ..RetryPolicy::DEFAULT
             },
-            Deadline::start(Duration::from_secs(10)),
+            Deadline::start_on(Duration::from_secs(10), clock),
             &token,
-            &std::thread::sleep,
+            &sleep,
             |_| Err::<(), _>(ImageRetryClass::Transient.failure("disconnected".into())),
         )
         .unwrap_err();
         assert!(is_cancelled(&error));
-        assert!(started.elapsed() < Duration::from_millis(500));
-        canceller.join().unwrap();
+        assert_eq!(
+            *slices.lock().unwrap(),
+            vec![Duration::from_millis(20); 2],
+            "the backoff stops at the first slice after the cancel"
+        );
     }
 
     #[test]
@@ -766,6 +804,23 @@ mod tests {
         let expired = Deadline::start(Duration::ZERO);
         assert!(expired.expired());
         assert_eq!(expired.request_timeout(None), Duration::from_millis(1));
+    }
+
+    #[test]
+    fn deadlines_count_only_time_on_their_own_clock() {
+        let clock = manual_clock();
+        let deadline = Deadline::start_on(Duration::from_secs(5), clock);
+        assert_eq!(deadline.remaining(), Some(Duration::from_secs(5)));
+        assert_eq!(
+            deadline.request_timeout(Some(Duration::from_secs(2))),
+            Duration::from_secs(2)
+        );
+        clock.advance(Duration::from_secs(4));
+        assert_eq!(deadline.remaining(), Some(Duration::from_secs(1)));
+        assert_eq!(deadline.request_timeout(None), Duration::from_secs(1));
+        clock.advance(Duration::from_secs(1));
+        assert!(deadline.expired());
+        assert!(deadline.check().is_err());
     }
 
     #[test]

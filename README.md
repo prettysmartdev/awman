@@ -51,7 +51,7 @@ To pin to a specific version: `mise use -g github:prettysmartdev/awman@0.13.0`
 | macOS (Apple Silicon) | `awman-macos-arm64` |
 | Windows (x86_64) | `awman-windows-amd64.exe` |
 
-The Apple Silicon asset includes the experimental builtin microVM runtime and is ad-hoc signed (not notarized). If you download it with a browser, macOS quarantines it: verify its SHA-256 against the release page, then run `xattr -d com.apple.quarantine awman-macos-arm64`. The installer and `mise` do not quarantine it. See [Runtimes: The macOS binary, Gatekeeper and permissions](docs/11-runtimes.md#the-macos-binary-gatekeeper-and-permissions).
+The Apple Silicon asset includes the experimental builtin microVM runtime and is ad-hoc signed (not notarized). If you download it with a browser, macOS quarantines it: verify it against the release's `SHA256SUMS` (and, where present, with `gh attestation verify`), then run `xattr -d com.apple.quarantine awman-macos-arm64`. The installer and `mise` do not quarantine it. See [Runtimes: The macOS binary, Gatekeeper and permissions](docs/11-runtimes.md#the-macos-binary-gatekeeper-and-permissions).
 
 **From source** — requires Rust 1.94+ and make. On Apple Silicon, run
 `make payloads` once before installing to fetch the verified builtin runtime payload:

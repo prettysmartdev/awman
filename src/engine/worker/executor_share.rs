@@ -252,7 +252,7 @@ mod tests {
             .unwrap()
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn alternates_between_push_and_pull_classes_under_contention() {
         let share = share(1);
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -289,7 +289,7 @@ mod tests {
         assert_eq!(share.snapshot(), WorkerShareSnapshot::default());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn single_class_is_never_starved() {
         let share = share(2);
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -305,7 +305,7 @@ mod tests {
         drop((b, c));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn permits_release_on_drop() {
         let share = share(1);
         let permit = share.acquire(JobClass::Push).await;

@@ -642,12 +642,10 @@ async fn builder_unavailable_keeps_its_build_leases_through_the_import() {
         held[0] >= 1,
         "the build leases must be held during the import"
     );
-    // flock is shared with any process a parallel test forks while the lease is
-    // open, until that child's exec closes its copy. A leaked lease never clears.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while held_lock_files(locks.root()) > 0 && std::time::Instant::now() < deadline {
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
+    // Released as soon as the phases return. Unit tests spawn no processes,
+    // so no forked child can hold an inherited copy of the lock (the
+    // e6a2d429/e6322996/f5b724fc class is covered where processes exist:
+    // close-on-exec in the support supervisor and data::image_build_lock).
     assert_eq!(held_lock_files(locks.root()), 0, "and released afterwards");
 }
 
@@ -1011,7 +1009,7 @@ async fn failed_prevalidation_closes_the_cached_image_progress_row() {
 async fn waiting_for_another_processs_build_lease_is_reported() {
     let runtime = Arc::new(FakeImportRuntime::new(true));
     let local_builder = Arc::new(FakeLocalBuilder::new());
-    let (mut engine, mut frontend, _tmp, locks, _receipts) = builder_engine(
+    let (mut engine, _frontend, _tmp, locks, _receipts) = builder_engine(
         runtime.clone(),
         false,
         false,
@@ -1027,12 +1025,34 @@ async fn waiting_for_another_processs_build_lease_is_reported() {
     let store = source.store_key.clone().expect("a local store");
     let reference = AgentImagePreparer::normalize_build_reference(&source.reference);
 
-    // "Another process": a lease held for a moment on another thread.
+    // "Another process": a lease held on another thread until the waiting
+    // message is reported (an event, not a delay).
+    struct Signalling {
+        seen: Vec<String>,
+        waiting: std::sync::mpsc::Sender<()>,
+    }
+    impl crate::data::message::UserMessageSink for Signalling {
+        fn write_message(&mut self, message: crate::data::message::UserMessage) {
+            if message.text.contains("Waiting for another awman process") {
+                let _ = self.waiting.send(());
+            }
+            self.seen.push(message.text);
+        }
+        fn replay_queued(&mut self) {}
+    }
     let held = locks.lock(&store, &reference, || Ok(())).unwrap();
+    let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
     let release = std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(300));
+        let reported = waiting_rx
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .is_ok();
         drop(held);
+        reported
     });
+    let mut sink = Signalling {
+        seen: Vec::new(),
+        waiting: waiting_tx,
+    };
     let _ = engine
         .preparer
         .prepare(
@@ -1041,16 +1061,12 @@ async fn waiting_for_another_processs_build_lease_is_reported() {
                 agent: "claude",
                 policy: BuildPolicy::CheckOnly,
             },
-            &mut frontend,
+            &mut crate::engine::image_prep::MessageSink(&mut sink),
         )
         .await;
-    release.join().unwrap();
     assert!(
-        frontend
-            .messages
-            .iter()
-            .any(|m| m.text.contains("Waiting for another awman process")),
-        "{:?}",
-        frontend.messages
+        release.join().unwrap(),
+        "the wait was never reported: {:?}",
+        sink.seen
     );
 }

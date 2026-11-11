@@ -427,7 +427,7 @@ mod tests {
         .await
         .unwrap();
     }
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn panic_restarts_degraded_and_other_feature_keeps_running() {
         let dir = tempfile::tempdir().unwrap();
         let core = super::super::core::test_core(dir.path());
@@ -452,7 +452,7 @@ mod tests {
         a.disable(StopMode::Now).await;
         b.disable(StopMode::Now).await;
     }
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn drain_waits_for_in_flight_and_stop_now_cancels_it() {
         let dir = tempfile::tempdir().unwrap();
         let core = super::super::core::test_core(dir.path());
@@ -480,7 +480,7 @@ mod tests {
         state_is(&supervisor, FeatureState::Off).await;
         assert_eq!(supervisor.state().state, FeatureState::Off);
     }
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn disabling_during_backoff_prevents_restart() {
         let dir = tempfile::tempdir().unwrap();
         let core = super::super::core::test_core(dir.path());
@@ -497,12 +497,12 @@ mod tests {
         supervisor.enable(EnabledBy::Ephemeral, None).await.unwrap();
         state_is(&supervisor, FeatureState::Degraded).await;
         supervisor.disable(StopMode::Now).await;
-        tokio::time::sleep(Duration::from_millis(120)).await;
+        tokio::time::advance(Duration::from_millis(120)).await;
         assert_eq!(feature.starts.load(Ordering::SeqCst), 1);
         state_is(&supervisor, FeatureState::Off).await;
         assert_eq!(supervisor.state().state, FeatureState::Off);
     }
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn timed_out_drain_can_be_escalated_without_losing_the_task() {
         let dir = tempfile::tempdir().unwrap();
         let core = super::super::core::test_core(dir.path());
@@ -522,7 +522,7 @@ mod tests {
         state_is(&supervisor, FeatureState::Off).await;
         assert_eq!(supervisor.state().state, FeatureState::Off);
     }
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn reenable_during_owned_drain_starts_again_after_caller_is_gone() {
         let dir = tempfile::tempdir().unwrap();
         let core = super::super::core::test_core(dir.path());

@@ -156,6 +156,10 @@ mod tests {
         spec: &'static CommandSpec,
         path: Vec<String>,
     ) {
+        assert_eq!(
+            spec.name,
+            path.last().map(String::as_str).unwrap_or("awman")
+        );
         if !path.is_empty() {
             let path_strs: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
             assert!(

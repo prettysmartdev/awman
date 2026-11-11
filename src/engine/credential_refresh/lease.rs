@@ -380,11 +380,10 @@ mod tests {
         let waiter = std::thread::spawn(move || {
             tx.send(shared.wait_until_active()).unwrap();
         });
-        // Give the waiter a chance to actually park; harmless if it hasn't —
-        // `register`'s notify only needs to reach an already-parked waiter,
-        // and the mutex ordering between wait/notify makes this race-free
-        // (see `RegistryShared::wait_until_active`'s doc comment).
-        std::thread::sleep(Duration::from_millis(50));
+        // No delay: whether the waiter has parked yet or not, the mutex
+        // ordering between wait/notify makes the wake-up race-free (see
+        // `RegistryShared::wait_until_active`'s doc comment), so the outcome
+        // is the same for either interleaving.
         let lease = reg.register(&delivery("claude"), "awman-restart");
         let active = rx
             .recv_timeout(Duration::from_secs(5))
@@ -402,7 +401,7 @@ mod tests {
         let waiter = std::thread::spawn(move || {
             tx.send(shared.wait_until_active()).unwrap();
         });
-        std::thread::sleep(Duration::from_millis(50));
+        // Either interleaving (parked before or after shutdown) must wake.
         reg.request_shutdown();
         let active = rx
             .recv_timeout(Duration::from_secs(5))

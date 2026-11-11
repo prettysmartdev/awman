@@ -94,17 +94,18 @@ fn probe() -> (Box<dyn AgentFrontend>, Arc<AtomicBool>, SharedReceivers) {
 
 /// Both output streams end: every sender the runtime held is gone.
 async fn assert_io_released(name: &str, receivers: &Mutex<Option<OutputReceivers>>) {
-    let Some((mut stdout, mut stderr)) = receivers.lock().unwrap().take() else {
-        // This runtime never asked the frontend for I/O.
-        return;
-    };
-    for (stream, rx) in [("stdout", &mut stdout), ("stderr", &mut stderr)] {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-        loop {
-            match tokio::time::timeout_at(deadline, rx.recv()).await {
-                Ok(None) => break,
-                Ok(Some(_)) => continue,
-                Err(_) => panic!("{name}: the {stream} sink is still held"),
+    // Check every acquired stream; a runtime that never requested I/O has none.
+    // The caller separately asserts that the frontend itself was released.
+    let acquired = receivers.lock().unwrap().take();
+    for (mut stdout, mut stderr) in acquired.into_iter() {
+        for (stream, rx) in [("stdout", &mut stdout), ("stderr", &mut stderr)] {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                match tokio::time::timeout_at(deadline, rx.recv()).await {
+                    Ok(None) => break,
+                    Ok(Some(_)) => continue,
+                    Err(_) => panic!("{name}: the {stream} sink is still held"),
+                }
             }
         }
     }

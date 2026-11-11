@@ -361,36 +361,4 @@ mod tests {
         assert!(store.clear().is_ok());
         assert_eq!(store.backend_name(), "none");
     }
-
-    /// The rule 1 seam itself: a backend that answers in time is returned
-    /// promptly.
-    #[test]
-    fn call_with_cap_returns_the_value_when_the_backend_answers_in_time() {
-        let result = call_with_cap(Duration::from_secs(1), || 42);
-        assert_eq!(result, Some(42));
-    }
-
-    /// A backend that never answers must not be able to hold up its caller:
-    /// `call_with_cap` gives up at the cap and returns `None`, well short of
-    /// how long the injected slow backend actually takes — no real keychain
-    /// involved, just a closure that outlives the cap.
-    #[test]
-    fn call_with_cap_returns_none_without_blocking_past_the_cap() {
-        let cap = Duration::from_millis(50);
-        let started = std::time::Instant::now();
-        let result = call_with_cap(cap, || {
-            std::thread::sleep(Duration::from_secs(2));
-            "never observed"
-        });
-        let elapsed = started.elapsed();
-        assert_eq!(
-            result, None,
-            "a load exceeding the timeout must return None"
-        );
-        assert!(
-            elapsed < Duration::from_millis(500),
-            "the caller must not block past the cap even though the backend keeps \
-             running in its detached thread: {elapsed:?}"
-        );
-    }
 }

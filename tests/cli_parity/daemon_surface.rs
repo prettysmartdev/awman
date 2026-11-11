@@ -5,7 +5,7 @@ use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
 fn cli(home: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_awman"))
+    Command::new(awman_test_support::cargo_bin!("awman"))
         .args(args)
         .current_dir(home)
         .env_clear()
@@ -316,7 +316,7 @@ async fn the_cli_drives_a_running_daemon_over_its_local_socket() {
         std::env::var("PATH").unwrap_or_default()
     );
     let run = |args: &[&str]| -> Output {
-        Command::new(env!("CARGO_BIN_EXE_awman"))
+        Command::new(awman_test_support::cargo_bin!("awman"))
             .args(args)
             .current_dir(&home)
             .env_clear()
@@ -331,7 +331,7 @@ async fn the_cli_drives_a_running_daemon_over_its_local_socket() {
     };
     let log_path = home.join("daemon.log");
     let log = std::fs::File::create(&log_path).unwrap();
-    let child = Command::new(env!("CARGO_BIN_EXE_awman"))
+    let child = Command::new(awman_test_support::cargo_bin!("awman"))
         .args(["daemon", "start"])
         .current_dir(&home)
         .env_clear()
@@ -453,7 +453,7 @@ async fn the_cli_drives_a_running_daemon_over_its_local_socket() {
         error.contains("404") && error.contains("not_found"),
         "{error}"
     );
-    let mut pipe = Command::new(env!("CARGO_BIN_EXE_awman"))
+    let mut pipe = Command::new(awman_test_support::cargo_bin!("awman"))
         .args([
             "daemon", "api", "--raw", "POST", "/v1/keys", "--data", "-", "--json",
         ])

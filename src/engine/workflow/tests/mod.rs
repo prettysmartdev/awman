@@ -6,6 +6,7 @@
 //! container the phase tests use.
 
 mod coverage_parallel;
+mod definition;
 mod finish;
 mod parallel;
 mod phases;
@@ -408,24 +409,28 @@ fn signal_completion(c: &CompletionArc, code: i32) {
 /// 150 ms), so poll with a generous deadline instead. The assertion is
 /// unchanged; only the wait is bounded rather than fixed.
 async fn wait_for_execution_count(count: &AtomicUsize, expected: usize) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while count.load(Ordering::Relaxed) < expected && tokio::time::Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    eventually(&format!("{expected} launch(es)"), || {
+        count.load(Ordering::Relaxed) >= expected
+    })
+    .await;
     assert_eq!(count.load(Ordering::Relaxed), expected);
+}
+
+/// Wait (bounded, no fixed sleep) until `cond` holds for in-memory engine
+/// state that the test fakes update. Uses the support crate's sanctioned
+/// polling helper; on expiry it panics naming `what`.
+pub(super) async fn eventually(what: &str, mut cond: impl FnMut() -> bool) {
+    awman_test_support::wait_for_async(what, Duration::from_secs(10), || {
+        let ready = cond().then_some(());
+        async move { ready }
+    })
+    .await
 }
 
 /// Wait until `flag` is set (a container cancel, a frontend callback), with
 /// the same generous deadline as [`wait_for_execution_count`].
 async fn wait_for_flag(flag: &AtomicBool, what: &str) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while !flag.load(Ordering::Relaxed) {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "timed out waiting for {what}"
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    eventually(what, || flag.load(Ordering::Relaxed)).await;
 }
 
 struct BlockingFactory {
@@ -619,14 +624,10 @@ type BoardLog = Arc<Mutex<Vec<AvailableActions>>>;
 
 /// Wait until the frontend has been shown at least `count` control boards.
 async fn wait_for_boards(boards: &BoardLog, count: usize) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while boards.lock().unwrap().len() < count {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "timed out waiting for control board #{count}"
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    eventually(&format!("control board #{count}"), || {
+        boards.lock().unwrap().len() >= count
+    })
+    .await;
 }
 
 // ── MockBackgroundContainer ───────────────────────────────────────────────

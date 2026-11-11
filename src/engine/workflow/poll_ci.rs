@@ -1,4 +1,4 @@
-//! CI status polling via `gh` CLI o        let normalized = serde_json::Value::Array(runs.iter().map(normalize_api_run).collect()); GitHub REST API fallback.
+//! CI status polling via `gh` CLI or GitHub REST API fallback.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -423,6 +423,9 @@ pub struct CiPoller {
     /// What the last failed status check learned about the failure, for the
     /// on_failure agent and its fix commit.
     failure: std::sync::Mutex<Option<CiFailure>>,
+    /// The instance environment host `gh` is resolved through. `None` keeps
+    /// the resolver's own default (the process snapshot).
+    env: Option<crate::data::config::env::EnvSnapshot>,
 }
 
 impl CiPoller {
@@ -434,7 +437,14 @@ impl CiPoller {
             refused_binaries: vec![],
             redaction: RedactionSet::new(),
             failure: std::sync::Mutex::new(None),
+            env: None,
         }
+    }
+    /// Resolve host `gh` through `env` (the instance snapshot) instead of
+    /// the process environment.
+    pub fn with_env(mut self, env: crate::data::config::env::EnvSnapshot) -> Self {
+        self.env = Some(env);
+        self
     }
     pub fn with_destination(mut self, destination: Option<String>) -> Self {
         self.destination = destination;
@@ -488,9 +498,12 @@ impl CiPoller {
         })?;
         let head_sha = self.git.head_sha(git_root)?;
 
-        let resolver = GitHubTokenResolver::new(GitHubTokenResolverOptions::default())
+        let mut resolver = GitHubTokenResolver::new(GitHubTokenResolverOptions::default())
             .with_refused_binaries(self.refused_binaries.clone())
             .with_repository_root(git_root.to_path_buf());
+        if let Some(env) = &self.env {
+            resolver = resolver.with_env_snapshot(env.clone());
+        }
         let host_token = if self.token.is_none()
             && matches!(resolver.host_gh_status(), GhAuthStatus::LoggedIn { .. })
         {
@@ -642,8 +655,6 @@ fn poll_with(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    use crate::engine::test_path::PathGuard;
 
     #[test]
     fn parse_github_ssh_url() {
@@ -994,18 +1005,21 @@ mod tests {
 
     // ── run_poll_ci_loop behaviour (no external git required) ─────────────────
 
-    /// `run_poll_ci_loop` must emit the attempt banner BEFORE calling
-    /// `fetch_ci_status`.  We verify this using a path that is not a git
-    /// repository so `detect_branch` fails immediately, but the message
-    /// callback has already been invoked once.
+    /// The poll loop must emit the attempt banner BEFORE fetching the status:
+    /// a fetch that fails at once (as it does outside a git repository) still
+    /// leaves exactly one attempt event. (The real non-repository failure
+    /// through `git` is covered by the component test
+    /// `engine::workflow::poll_ci_outside_a_repository_fails_after_the_attempt_banner`.)
     #[test]
     fn run_poll_ci_loop_emits_attempt_message_before_fetch_fails() {
-        let tmp = tempfile::tempdir().unwrap(); // NOT a git repo
         let mut events: Vec<CiPollEvent> = Vec::new();
 
-        let result = test_poller(None).poll(tmp.path(), 0, 5, |event| {
-            events.push(event);
-        });
+        let result = poll_with(
+            || Err(EngineError::Other("not a git repository".into())),
+            0,
+            5,
+            |event| events.push(event),
+        );
 
         assert!(result.is_err(), "must fail on a non-git directory");
         // The attempt banner is emitted before fetch_ci_status is called.
@@ -1122,151 +1136,6 @@ mod tests {
         );
     }
 
-    /// When gh is unavailable and GITHUB_TOKEN is absent, `fetch_ci_status`
-    /// must return an error mentioning both missing authentication paths.
-    #[test]
-    fn real_git_missing_github_token_and_no_gh_returns_descriptive_error() {
-        // Serialise against every sibling that mutates PATH to install a fake
-        // `gh` — without this we can observe their PATH and find a "gh" we
-        // shouldn't have. The guard is the process-wide one, so this also
-        // covers the dsbx fake-`sbx` tests, not just this module's.
-        let _path = PathGuard::acquire();
-
-        if !std::process::Command::new("git")
-            .arg("--version")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-        {
-            eprintln!("SKIP: git not available");
-            return;
-        }
-
-        // Only meaningful when gh is NOT available/authenticated.
-        if std::process::Command::new("gh")
-            .args(["auth", "status"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-        {
-            eprintln!("SKIP: gh is authenticated; test requires gh to be unavailable");
-            return;
-        }
-
-        // Only meaningful when GITHUB_TOKEN is absent or empty.
-        if std::env::var("GITHUB_TOKEN")
-            .map(|t| !t.is_empty())
-            .unwrap_or(false)
-        {
-            eprintln!("SKIP: GITHUB_TOKEN is set; test requires it to be absent");
-            return;
-        }
-
-        let repo = tempfile::tempdir().unwrap();
-        init_test_git_repo(repo.path());
-
-        let err = test_poller(None).fetch_status(repo.path()).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("GITHUB_TOKEN"),
-            "error must mention GITHUB_TOKEN: {msg}"
-        );
-        assert!(msg.contains("gh"), "error must mention gh CLI: {msg}");
-    }
-
-    /// A poller over a real `GitEngine` with an explicit token, so these
-    /// tests never depend on the ambient environment.
-    fn test_poller(token: Option<&str>) -> CiPoller {
-        CiPoller::new(Arc::new(GitEngine::new()), token.map(SecretString::new))
-    }
-
-    // ── Helpers for real-git tests ────────────────────────────────────────────
-
-    fn init_test_git_repo(dir: &std::path::Path) {
-        let run = |args: &[&str]| {
-            let status = std::process::Command::new("git")
-                .args(args)
-                .current_dir(dir)
-                .env("GIT_AUTHOR_NAME", "test")
-                .env("GIT_AUTHOR_EMAIL", "test@example.com")
-                .env("GIT_COMMITTER_NAME", "test")
-                .env("GIT_COMMITTER_EMAIL", "test@example.com")
-                .status()
-                .expect("git invocation");
-            assert!(status.success(), "git {args:?} failed");
-        };
-        run(&["init", "--initial-branch=main"]);
-        run(&["config", "user.email", "test@example.com"]);
-        run(&["config", "user.name", "Test"]);
-        run(&["config", "commit.gpgsign", "false"]);
-        std::fs::write(dir.join("f.txt"), "x").unwrap();
-        run(&["add", "f.txt"]);
-        run(&["commit", "-m", "init"]);
-        // fetch_status requires an `origin` remote, and a github.com host
-        // when polling without an explicit token grant.
-        run(&[
-            "remote",
-            "add",
-            "origin",
-            "https://github.com/example/repo.git",
-        ]);
-    }
-}
-
-#[cfg(test)]
-mod destination_review_tests {
-    use super::*;
-    #[test]
-    fn changed_destination_is_rejected_before_gh_or_token_network_use() {
-        let root = tempfile::tempdir().unwrap();
-        for args in [
-            &["init", "-q"][..],
-            &["remote", "add", "origin", "https://evil.test/o/r"][..],
-        ] {
-            assert!(std::process::Command::new("git")
-                .args(args)
-                .current_dir(root.path())
-                .output()
-                .unwrap()
-                .status
-                .success());
-        }
-        let poller = CiPoller::new(
-            Arc::new(GitEngine::new()),
-            Some(SecretString::new("fixture_secret")),
-        )
-        .with_destination(Some("https://github.com/o/r".into()));
-        let error = poller.fetch_status(root.path()).unwrap_err().to_string();
-        assert!(error.contains("destination changed"));
-        assert!(!error.contains("fixture_secret"));
-    }
-
-    #[test]
-    fn an_unchanged_ssh_destination_matches_its_approved_redaction() {
-        for url in ["git@example.test:o/r.git", "ssh://git@example.test/o/r.git"] {
-            let root = tempfile::tempdir().unwrap();
-            for args in [&["init", "-q"][..], &["remote", "add", "origin", url][..]] {
-                assert!(std::process::Command::new("git")
-                    .args(args)
-                    .current_dir(root.path())
-                    .output()
-                    .unwrap()
-                    .status
-                    .success());
-            }
-            // The prerequisite flow approves `GitRemoteUrl::parse(..).redacted`.
-            let approved = crate::data::workflow_prerequisites::GitRemoteUrl::parse(url).redacted;
-            let poller =
-                CiPoller::new(Arc::new(GitEngine::new()), None).with_destination(Some(approved));
-            // Past the destination check, a non-github.com host without a token
-            // stops before any network use.
-            let error = poller.fetch_status(root.path()).unwrap_err().to_string();
-            assert!(!error.contains("destination changed"), "{url}: {error}");
-            assert!(error.contains("explicit token grant"), "{url}: {error}");
-        }
-    }
+    // The real-`git` cases (missing token and gh, destination review) are
+    // component tests: `tests/component/engine/workflow.rs` `poll_ci_*`.
 }

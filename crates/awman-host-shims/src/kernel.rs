@@ -311,16 +311,16 @@ mod callback_tests {
     fn in_fresh_process(test: &str, child: &str, body: impl FnOnce()) {
         if std::env::var_os(child).is_some() {
             body();
-            return;
+        } else {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", test, "--nocapture"])
+                .env_clear()
+                .env(child, "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
         }
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", test, "--nocapture"])
-            .env_clear()
-            .env(child, "1")
-            .output()
-            .unwrap();
-        assert!(output.status.success(), "{output:?}");
-        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
     }
 
     #[test]

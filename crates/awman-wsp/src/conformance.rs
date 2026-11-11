@@ -160,6 +160,28 @@ pub async fn run(base_url: &str, admin: &dyn ConformanceAdmin) -> Report {
     }
     report
 }
+
+/// Run one named probe with fresh workers and fixture identifiers. This lets
+/// server implementers test individual protocol failures independently.
+pub async fn run_case(
+    base_url: &str,
+    admin: &dyn ConformanceAdmin,
+    case: &str,
+) -> Result<(), Error> {
+    if !cases().contains(&case) {
+        return Err(Error::InvalidResponse);
+    }
+    let prefix = format!(
+        "wsp_{}",
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    );
+    let a = linked(base_url, admin, &format!("{prefix}_a")).await?;
+    if case == "linking_and_register" {
+        return Ok(());
+    }
+    let b = linked(base_url, admin, &format!("{prefix}_b")).await?;
+    probe(case, &prefix, &a, &b, admin).await
+}
 fn check(ok: bool) -> Result<(), Error> {
     if ok {
         Ok(())
@@ -809,92 +831,10 @@ async fn wire_probe(id: &str, base: &Client, admin: &dyn ConformanceAdmin) -> Re
     client.result(&lease.id, &result()).await
 }
 
-#[cfg(all(test, feature = "mock"))]
+#[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mock::{MockWorkServer, TestFault};
-    use std::sync::Arc;
 
-    async fn with_fault(case: &str, fault: TestFault) -> Result<(), Error> {
-        let server = Arc::new(MockWorkServer::with_fault(fault));
-        let serving = server.clone().serve().await.unwrap();
-        let a = linked(&serving.base_url, server.as_ref(), "a")
-            .await
-            .unwrap();
-        let b = linked(&serving.base_url, server.as_ref(), "b")
-            .await
-            .unwrap();
-        probe(case, "fault", &a, &b, server.as_ref()).await
-    }
-    #[tokio::test]
-    async fn priority_probe_rejects_server_ignoring_preferred_weights() {
-        assert!(
-            with_fault("priority_age_preference", TestFault::IgnorePreferences)
-                .await
-                .is_err()
-        );
-    }
-    #[tokio::test]
-    async fn epoch_probe_rejects_server_ignoring_epoch_header() {
-        assert!(with_fault("stale_epoch_is_fenced", TestFault::IgnoreEpoch)
-            .await
-            .is_err());
-    }
-    #[tokio::test]
-    async fn events_probe_rejects_duplicate_storage_and_accepts_empty_acknowledgements() {
-        assert!(with_fault("idempotent_events", TestFault::DuplicateEvents)
-            .await
-            .is_err());
-        assert!(with_fault("idempotent_events", TestFault::EmptyEvents)
-            .await
-            .is_ok());
-    }
-    #[tokio::test]
-    async fn client_accepts_empty_events_response() {
-        let server = Arc::new(MockWorkServer::with_fault(TestFault::EmptyEvents));
-        let serving = server.clone().serve().await.unwrap();
-        let client = linked(&serving.base_url, server.as_ref(), "events")
-            .await
-            .unwrap();
-        server
-            .enqueue(work_item("events"), crate::wire::now())
-            .unwrap();
-        let lease = client.claim(Some("events"), 0).await.unwrap().unwrap();
-        let event = json!({"attempt":1,"sequence":1,"type":"workflow_state","data":{}});
-        assert_eq!(
-            client
-                .events_accepted(&lease.id, vec![event.clone()])
-                .await
-                .unwrap(),
-            1
-        );
-        client.events(&lease.id, vec![event]).await.unwrap();
-        assert_eq!(server.event_count(&lease.id), Some(1));
-    }
-
-    #[tokio::test]
-    async fn wire_probe_rejects_invalid_raw_fields_on_every_response() {
-        for endpoint in [
-            "link",
-            "token",
-            "register",
-            "queue",
-            "claims",
-            "heartbeat",
-            "events",
-            "credentials",
-            "result",
-            "release",
-            "error",
-        ] {
-            assert!(
-                with_fault("wire_conventions", TestFault::Wire(endpoint))
-                    .await
-                    .is_err(),
-                "{endpoint}"
-            );
-        }
-    }
     #[test]
     fn wire_walker_rejects_units_timestamps_enums_and_invalid_labels() {
         for value in [

@@ -51,8 +51,6 @@ pub mod format;
 pub mod registry;
 pub mod resolve;
 pub mod retry;
-#[cfg(test)]
-mod retry_fixtures;
 pub mod sources;
 mod transport;
 pub mod verify;
@@ -235,6 +233,7 @@ pub struct CachingAcquirer {
     retry: RetryPolicy,
     cancel: CancelToken,
     sleep: Arc<retry::Sleeper<'static>>,
+    clock: Option<&'static dyn crate::data::clock::Clock>,
     apple: Option<Arc<dyn apple_store::XpcTransport>>,
     expected_built_identity: Option<crate::data::oci_identity::BuiltImageIdentity>,
     export_selector: Option<String>,
@@ -255,6 +254,7 @@ impl CachingAcquirer {
             retry: RetryPolicy::DEFAULT,
             cancel: CancelToken::new(),
             sleep: Arc::new(std::thread::sleep),
+            clock: None,
             apple: apple_store::installed_transport(),
             expected_built_identity: None,
             export_selector: None,
@@ -321,6 +321,13 @@ impl CachingAcquirer {
         self
     }
 
+    /// Measure acquisition deadlines on `clock` instead of the system clock
+    /// (virtual time in tests).
+    pub fn with_clock(mut self, clock: &'static dyn crate::data::clock::Clock) -> Self {
+        self.clock = Some(clock);
+        self
+    }
+
     /// Replace the Apple Containers transport (tests; `None` removes it).
     pub fn with_apple_transport(
         mut self,
@@ -342,7 +349,10 @@ impl ImageAcquirer for CachingAcquirer {
         request: &AcquireRequest,
         progress: &mut dyn FnMut(AcquireProgress),
     ) -> Result<LeasedImage, EngineError> {
-        let deadline = retry::Deadline::start(self.retry.deadline);
+        let deadline = match self.clock {
+            Some(clock) => retry::Deadline::start_on(self.retry.deadline, clock),
+            None => retry::Deadline::start(self.retry.deadline),
+        };
         let control = retry::OperationControl::new(self.cancel.clone(), deadline);
         control.check()?;
         if self.expected_built_identity.is_some() && request.policy != AcquirePolicy::Refresh {
@@ -558,14 +568,20 @@ mod tests {
         let state = tempfile::tempdir().unwrap();
         let src = state.path().join("export.tar");
         std::fs::write(&src, oci_archive(&arm64(), &[layer()]).0).unwrap();
-        let acq = acquirer(state.path(), None).with_retry(RetryPolicy {
-            deadline: std::time::Duration::from_millis(100),
-            ..RetryPolicy::NONE
-        });
+        let clock: &'static crate::data::clock::ManualClock = Box::leak(Box::new(
+            crate::data::clock::ManualClock::new(chrono::DateTime::<chrono::Utc>::UNIX_EPOCH),
+        ));
+        let acq = acquirer(state.path(), None)
+            .with_retry(RetryPolicy {
+                deadline: std::time::Duration::from_millis(100),
+                ..RetryPolicy::NONE
+            })
+            .with_clock(clock);
         let err = acq
             .acquire(&request(&src, AcquirePolicy::IfMissing), &mut |event| {
+                // Validation progress takes (virtual) time past the deadline.
                 if matches!(event, AcquireProgress::Verifying { .. }) {
-                    std::thread::sleep(std::time::Duration::from_millis(150));
+                    clock.advance(std::time::Duration::from_millis(150));
                 }
             })
             .unwrap_err();
@@ -876,304 +892,7 @@ mod tests {
             }
         }
 
-        // ── Hermetic exports against a fake Engine on a Unix socket ────────────
-
-        #[cfg(unix)]
-        mod fake_daemon {
-            use std::collections::BTreeMap;
-            use std::io::{BufRead, BufReader, Write};
-            use std::os::unix::net::UnixListener;
-            use std::path::{Path, PathBuf};
-            use std::sync::{Arc, Mutex};
-
-            use crate::data::config::env::EnvSnapshot;
-            use crate::data::config::image_source::{ImageSourceKind, ImageSourceSpec};
-            use crate::engine::error::EngineError;
-            use crate::engine::oci::archive::tests::{
-                arm64, docker_save_archive, layer_tar, limits, L,
-            };
-            use crate::engine::oci::verify::tests::FixedDisk;
-            use crate::engine::oci::{
-                AcquirePolicy, AcquireRequest, ArchiveFormat, CachingAcquirer, ImageAcquirer,
-            };
-
-            /// `(status, body, truncate_to)` for a request path.
-            type Handler = dyn Fn(&str) -> (u16, Vec<u8>, Option<usize>) + Send + Sync;
-
-            /// A minimal HTTP/1.1 Engine on `sock`. Records every request path.
-            fn spawn(sock: &Path, handler: Arc<Handler>) -> Arc<Mutex<Vec<String>>> {
-                let listener = UnixListener::bind(sock).unwrap();
-                let seen = Arc::new(Mutex::new(Vec::new()));
-                let log = seen.clone();
-                std::thread::spawn(move || {
-                    for stream in listener.incoming() {
-                        let Ok(stream) = stream else { break };
-                        let handler = handler.clone();
-                        let log = log.clone();
-                        std::thread::spawn(move || {
-                            let mut reader = BufReader::new(stream.try_clone().unwrap());
-                            let mut out = stream;
-                            loop {
-                                let mut line = String::new();
-                                if reader.read_line(&mut line).unwrap_or(0) == 0 {
-                                    return;
-                                }
-                                let path = line.split_whitespace().nth(1).unwrap_or("").to_string();
-                                loop {
-                                    let mut h = String::new();
-                                    if reader.read_line(&mut h).unwrap_or(0) == 0 || h == "\r\n" {
-                                        break;
-                                    }
-                                }
-                                log.lock().unwrap().push(path.clone());
-                                let (status, body, truncate) = handler(&path);
-                                let head = format!(
-                                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n\
-                                 Content-Length: {}\r\n\r\n",
-                                    body.len()
-                                );
-                                let _ = out.write_all(head.as_bytes());
-                                match truncate {
-                                    Some(n) => {
-                                        let _ = out.write_all(&body[..n]);
-                                        return;
-                                    }
-                                    None => {
-                                        let _ = out.write_all(&body);
-                                    }
-                                }
-                            }
-                        });
-                    }
-                });
-                seen
-            }
-
-            fn standard(
-                api: &'static str,
-                os_arch: (&'static str, &'static str),
-                archive: Vec<u8>,
-                truncate: bool,
-            ) -> Arc<Handler> {
-                Arc::new(move |path: &str| {
-                    let p = path.split('?').next().unwrap_or("");
-                    match p {
-                        "/_ping" => (200, b"OK".to_vec(), None),
-                        "/version" => (
-                            200,
-                            format!(r#"{{"ApiVersion":"{api}"}}"#).into_bytes(),
-                            None,
-                        ),
-                        _ if p.ends_with("/images/awman-x-claude:latest/json") => (
-                            200,
-                            format!(
-                                r#"{{"Os":"{}","Architecture":"{}","Size":1000}}"#,
-                                os_arch.0, os_arch.1
-                            )
-                            .into_bytes(),
-                            None,
-                        ),
-                        _ if p.ends_with("/images/awman-x-claude:latest/get") => {
-                            let n = archive.len() / 2;
-                            (200, archive.clone(), truncate.then_some(n))
-                        }
-                        _ => (404, br#"{"message":"No such image"}"#.to_vec(), None),
-                    }
-                })
-            }
-
-            fn request(sock: &Path, policy: AcquirePolicy) -> AcquireRequest {
-                AcquireRequest {
-                    tag: "awman-x-claude:latest".into(),
-                    source: ImageSourceSpec::DockerStore {
-                        host: Some(format!("unix://{}", sock.display())),
-                        tls: None,
-                        reference: None,
-                    },
-                    platform: arm64(),
-                    policy,
-                    registries: BTreeMap::new(),
-                }
-            }
-
-            fn acquire(
-                state: &Path,
-                req: &AcquireRequest,
-            ) -> Result<crate::engine::oci::LeasedImage, EngineError> {
-                CachingAcquirer::new(
-                    state,
-                    limits(),
-                    EnvSnapshot::empty(),
-                    Arc::new(FixedDisk(None)),
-                )
-                .acquire(req, &mut |_| {})
-            }
-
-            fn archive() -> Vec<u8> {
-                docker_save_archive(&arm64(), &[layer_tar(&[L::File("bin/agent", b"x", 0o755)])])
-            }
-
-            fn setup() -> (tempfile::TempDir, PathBuf) {
-                let dir = tempfile::tempdir().unwrap();
-                let sock = dir.path().join("d.sock");
-                (dir, sock)
-            }
-
-            #[test]
-            fn export_is_validated_cached_and_reused_without_the_daemon() {
-                let (dir, sock) = setup();
-                let seen = spawn(
-                    &sock,
-                    standard("1.45", ("linux", "arm64"), archive(), false),
-                );
-                let got = acquire(dir.path(), &request(&sock, AcquirePolicy::IfMissing)).unwrap();
-                assert_eq!(got.identity.source, ImageSourceKind::DockerStore);
-                assert_eq!(got.archive_format, ArchiveFormat::DockerSave);
-                assert_eq!(got.identity.reference, "awman-x-claude:latest");
-                let paths = seen.lock().unwrap().clone();
-                assert!(
-                    paths.contains(&"/v1.41/images/awman-x-claude:latest/get".to_string()),
-                    "{paths:?}"
-                );
-
-                // The daemon disappears; running the cached image does not care.
-                std::fs::remove_file(&sock).unwrap();
-                let cached =
-                    acquire(dir.path(), &request(&sock, AcquirePolicy::CachedOnly)).unwrap();
-                assert_eq!(cached, got);
-            }
-
-            #[test]
-            fn legacy_docker_cache_key_is_found_without_source_contact() {
-                use crate::data::fs::hash::sha256_hex;
-                use crate::data::oci_source_key::OciSourceKey;
-                use crate::engine::oci::cache::OciCache;
-
-                let (dir, sock) = setup();
-                let seen = spawn(
-                    &sock,
-                    standard("1.45", ("linux", "arm64"), archive(), false),
-                );
-                let first = acquire(dir.path(), &request(&sock, AcquirePolicy::IfMissing)).unwrap();
-                let count_before = seen.lock().unwrap().len();
-                let key = OciSourceKey {
-                    kind: ImageSourceKind::DockerStore,
-                    locator: format!("unix://{}", sock.display()),
-                    reference: "awman-x-claude:latest".into(),
-                    platform: arm64(),
-                };
-                let cache = OciCache::open(dir.path()).unwrap();
-                let refs = cache.root().join("refs");
-                let canonical = refs.join(format!("{}.json", sha256_hex(key.canonical_key())));
-                let legacy_key = format!(
-                    "v1\ndocker-store\n{}\n{}\n{}",
-                    key.locator, key.reference, key.platform
-                );
-                let legacy = refs.join(format!("{}.json", sha256_hex(&legacy_key)));
-                let mut record: serde_json::Value =
-                    serde_json::from_slice(&std::fs::read(&canonical).unwrap()).unwrap();
-                record["key"] = legacy_key.into();
-                std::fs::write(&canonical, serde_json::to_vec(&record).unwrap()).unwrap();
-                std::fs::rename(canonical, legacy).unwrap();
-                let hit = acquire(dir.path(), &request(&sock, AcquirePolicy::IfMissing)).unwrap();
-                assert_eq!(hit.identity, first.identity);
-                assert_eq!(seen.lock().unwrap().len(), count_before);
-            }
-
-            #[test]
-            fn new_engines_are_asked_for_the_native_platform() {
-                let (dir, sock) = setup();
-                let seen = spawn(
-                    &sock,
-                    standard("1.49", ("linux", "arm64"), archive(), false),
-                );
-                acquire(dir.path(), &request(&sock, AcquirePolicy::IfMissing)).unwrap();
-                let paths = seen.lock().unwrap().clone();
-                let get = paths.iter().find(|p| p.contains("/get")).unwrap();
-                assert!(
-                    get.starts_with("/v1.48/images/awman-x-claude:latest/get?platform="),
-                    "{get}"
-                );
-                assert!(get.contains("arm64"), "{get}");
-            }
-
-            #[test]
-            fn a_default_variant_mismatch_still_exports_the_native_platform() {
-                // The unqualified inspect reports amd64, but a 1.48+ engine
-                // exports the requested arm64 variant, which validates.
-                let (dir, sock) = setup();
-                let seen = spawn(
-                    &sock,
-                    standard("1.49", ("linux", "amd64"), archive(), false),
-                );
-                acquire(dir.path(), &request(&sock, AcquirePolicy::IfMissing)).unwrap();
-                assert!(seen.lock().unwrap().iter().any(|p| p.contains("/get")));
-            }
-
-            #[test]
-            fn wrong_platform_is_refused_before_export() {
-                let (dir, sock) = setup();
-                let seen = spawn(
-                    &sock,
-                    standard("1.45", ("linux", "amd64"), archive(), false),
-                );
-                let err =
-                    acquire(dir.path(), &request(&sock, AcquirePolicy::IfMissing)).unwrap_err();
-                assert!(
-                    matches!(err, EngineError::ImagePlatformMismatch { .. }),
-                    "{err:?}"
-                );
-                assert!(!seen.lock().unwrap().iter().any(|p| p.contains("/get")));
-            }
-
-            #[test]
-            fn missing_image_names_the_engine() {
-                let (dir, sock) = setup();
-                spawn(
-                    &sock,
-                    standard("1.45", ("linux", "arm64"), archive(), false),
-                );
-                let mut req = request(&sock, AcquirePolicy::IfMissing);
-                req.source = ImageSourceSpec::DockerStore {
-                    host: Some(format!("unix://{}", sock.display())),
-                    tls: None,
-                    reference: Some("nope:1".into()),
-                };
-                let err = acquire(dir.path(), &req).unwrap_err();
-                let text = err.to_string();
-                assert!(
-                    text.contains("nope:1") && text.contains("unix://"),
-                    "{text}"
-                );
-            }
-
-            #[test]
-            fn truncated_export_leaves_no_cache_state() {
-                let (dir, sock) = setup();
-                spawn(&sock, standard("1.45", ("linux", "arm64"), archive(), true));
-                let err =
-                    acquire(dir.path(), &request(&sock, AcquirePolicy::IfMissing)).unwrap_err();
-                assert!(
-                    matches!(
-                        err,
-                        EngineError::Network(_) | EngineError::ImageArchiveRejected { .. }
-                    ),
-                    "{err:?}"
-                );
-                let images = dir.path().join("oci-cache/images");
-                assert_eq!(std::fs::read_dir(images).unwrap().count(), 0);
-            }
-
-            #[test]
-            fn unreachable_engine_is_a_network_error() {
-                let (dir, sock) = setup();
-                let err =
-                    acquire(dir.path(), &request(&sock, AcquirePolicy::IfMissing)).unwrap_err();
-                assert!(
-                    matches!(err, EngineError::Network(ref m) if m.contains("not reachable")),
-                    "{err:?}"
-                );
-            }
-        }
+        // Exports against a fake Engine on a Unix socket are component tests
+        // (tests/component/engine/oci.rs, `oci_doubles::EngineDouble`).
     }
 }

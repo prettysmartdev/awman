@@ -135,6 +135,7 @@ impl SchedulerStatus {
 
 /// The always-on task scheduler.
 pub struct SquadScheduler {
+    clock: crate::data::clock::SharedClock,
     executor: Option<Arc<crate::engine::daemon::executor::SharedExecutor>>,
     store: Arc<TaskStore>,
     paths: SquadPaths,
@@ -174,6 +175,7 @@ impl SquadScheduler {
         env: EnvSnapshot,
     ) -> Self {
         Self {
+            clock: crate::data::clock::system_clock(),
             executor: None,
             store,
             paths,
@@ -185,6 +187,22 @@ impl SquadScheduler {
             env_state: None,
             tick_interval: TICK_INTERVAL,
             resolved_leaders: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Use the same clock for selection, completion and retry eligibility.
+    pub fn with_clock(mut self, clock: crate::data::clock::SharedClock) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    /// Evaluate one due-work snapshot and drain its evaluations. Embedders
+    /// can drive scheduling from their own wake source without a timer loop.
+    pub async fn evaluate_due(&self) {
+        let mut tasks = JoinSet::new();
+        self.tick(&mut tasks).await;
+        while let Some(result) = tasks.join_next().await {
+            result.expect("squad evaluation panicked");
         }
     }
 
@@ -321,7 +339,7 @@ impl SquadScheduler {
 
         self.log_running_agents();
 
-        let now = Utc::now();
+        let now = self.clock.now_utc();
         {
             // The tick count and timestamp are still recorded — `squad status`
             // reports both — but the tick itself is deliberately not logged.
@@ -408,7 +426,7 @@ impl SquadScheduler {
             // task is excluded from the very next tick's SQL selection by
             // its own `running` row. Opening it inside the task would let a
             // queued evaluation be selected a second time.
-            let started_at = Utc::now();
+            let started_at = self.clock.now_utc();
             let task_dir = match self.paths.task_dir(&task.name) {
                 Ok(dir) => dir,
                 Err(error) => {
@@ -468,9 +486,12 @@ impl SquadScheduler {
                         error: Some(format!("preparing per-container log directory: {error}")),
                         ..Default::default()
                     };
-                    let _ = self
-                        .store
-                        .finish_run(&run_id, RunStatus::Failed, &detail, Utc::now());
+                    let _ = self.store.finish_run(
+                        &run_id,
+                        RunStatus::Failed,
+                        &detail,
+                        self.clock.now_utc(),
+                    );
                     tracing::warn!(
                         task = %task.name,
                         run_id = %run_id,
@@ -500,9 +521,12 @@ impl SquadScheduler {
                         error: Some(format!("reading the task's config.json: {error}")),
                         ..Default::default()
                     };
-                    let _ = self
-                        .store
-                        .finish_run(&run_id, RunStatus::Failed, &detail, Utc::now());
+                    let _ = self.store.finish_run(
+                        &run_id,
+                        RunStatus::Failed,
+                        &detail,
+                        self.clock.now_utc(),
+                    );
                     tracing::warn!(
                         task = %task.name,
                         run_id = %run_id,
@@ -540,9 +564,11 @@ impl SquadScheduler {
             let guidance = effective.guidance.clone();
             let agents_to_models = effective.agents_to_models.clone();
             let default_leader = effective.default_leader.clone();
+            let clock = self.clock.clone();
             tasks.spawn(async move {
                 let _permit = permit;
                 evaluate_task(EvaluateArgs {
+                    clock,
                     store,
                     evaluator,
                     status,
@@ -666,6 +692,7 @@ pub struct RunningAgentSummary {
 
 /// Bundled arguments for one task's evaluation task.
 struct EvaluateArgs {
+    clock: crate::data::clock::SharedClock,
     store: Arc<TaskStore>,
     evaluator: Arc<dyn TaskEvaluator>,
     status: Arc<Mutex<SchedulerStatus>>,
@@ -691,6 +718,7 @@ struct EvaluateArgs {
 /// tick must never take down the daemon.
 async fn evaluate_task(args: EvaluateArgs) {
     let EvaluateArgs {
+        clock,
         store,
         evaluator,
         status,
@@ -738,12 +766,20 @@ async fn evaluate_task(args: EvaluateArgs) {
         outcome = evaluation => Some(outcome),
     };
     let Some(outcome) = outcome else {
-        finish_canceled_run(&store, &task, &run_id, &run_log_dir, runtime).await;
+        finish_canceled_run(
+            &store,
+            &task,
+            &run_id,
+            &run_log_dir,
+            runtime,
+            clock.now_utc(),
+        )
+        .await;
         return;
     };
 
     let (run_status, detail, failed) = classify(&outcome, &run_log_dir);
-    let finished_at = Utc::now();
+    let finished_at = clock.now_utc();
     if failed {
         // WI 0112 Part 5: a failed run is an error line that says why and
         // where to look, even when the failure happened before any step ran
@@ -911,6 +947,7 @@ async fn finish_canceled_run(
     run_id: &RunId,
     run_log_dir: &std::path::Path,
     runtime: Option<Arc<dyn AgentRuntimeEngine>>,
+    now: DateTime<Utc>,
 ) {
     tracing::info!(
         task = %task.name,
@@ -929,7 +966,7 @@ async fn finish_canceled_run(
                 .and_then(|verdict| verdict.reason),
             ..Default::default()
         },
-        Utc::now(),
+        now,
     ) {
         tracing::warn!(
             "squad: failed to record canceled run for {:?}: {error}",
@@ -1234,9 +1271,10 @@ mod tests {
                 scheduler.tick(&mut tasks).await;
             }
             std::fs::set_permissions(denied, original).unwrap();
-            if !enforced {
-                return;
-            }
+            assert!(
+                enforced,
+                "BLOCKED[permissions]: host privileges bypass the access denial"
+            );
             assert!(!task_admitted(&scheduler), "default policy must not admit");
             assert_eq!(scheduler.status.lock().unwrap().in_flight, 1);
             assert!(scheduler

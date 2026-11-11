@@ -187,16 +187,19 @@ const OUTPUT_SETTLE: Duration = Duration::from_secs(1);
 pub(super) struct OutputWatch {
     tail: Arc<OutputTail>,
     baseline: String,
-    started: Instant,
+    clock: crate::data::clock::SharedClock,
+    started: Duration,
 }
 
 impl OutputWatch {
-    pub(super) fn new(tail: Arc<OutputTail>) -> Self {
+    pub(super) fn new(tail: Arc<OutputTail>, clock: crate::data::clock::SharedClock) -> Self {
         let baseline = tail.snapshot_text();
+        let started = clock.monotonic();
         Self {
             tail,
             baseline,
-            started: Instant::now(),
+            clock,
+            started,
         }
     }
 
@@ -207,7 +210,7 @@ impl OutputWatch {
         if now == self.baseline {
             return false;
         }
-        if self.started.elapsed() < OUTPUT_SETTLE {
+        if self.clock.monotonic().saturating_sub(self.started) < OUTPUT_SETTLE {
             self.baseline = now;
             return false;
         }
@@ -552,7 +555,7 @@ impl WorkflowEngine {
         let mut output = (kind == CountdownKind::AgentError)
             .then_some(output_tail)
             .flatten()
-            .map(OutputWatch::new);
+            .map(|tail| OutputWatch::new(tail, Arc::clone(&self.clock)));
         // Active-tab suppression (WI 0141): while the user is typing or
         // scrolling on this agent's tab, an `AgentDone` countdown does not
         // start; the loop below still handles exits, reports and cancel.
@@ -856,11 +859,12 @@ mod policy_tests {
     fn output_watch_ignores_the_settle_window_then_sees_new_output() {
         let tail = Arc::new(OutputTail::with_default_capacity());
         tail.push_bytes(b"before\n");
-        let mut watch = OutputWatch::new(tail.clone());
+        let clock = crate::data::clock::ManualClock::new(chrono::Utc::now());
+        let mut watch = OutputWatch::new(tail.clone(), Arc::new(clock.clone()));
         assert!(!watch.produced_output());
         tail.push_bytes(b"error text right after the report\n");
         assert!(!watch.produced_output(), "settle window moves the baseline");
-        watch.started -= OUTPUT_SETTLE;
+        clock.advance(OUTPUT_SETTLE);
         assert!(!watch.produced_output());
         tail.push_bytes(b"recovered\n");
         assert!(watch.produced_output());

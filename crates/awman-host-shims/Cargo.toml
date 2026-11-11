@@ -31,6 +31,8 @@ toml = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# WI 0144 test infrastructure.
+awman-test-support = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 tokio = { workspace = true }

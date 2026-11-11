@@ -7,6 +7,9 @@
 pub mod github;
 pub mod router;
 
+#[cfg(test)]
+mod naming_tests;
+
 use std::path::Path;
 
 use crate::data::message::UserMessageSink;

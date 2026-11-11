@@ -173,7 +173,7 @@ fn awman_ready_sbx_runtime_succeeds() {
     let config_content = r#"{"runtime":{"kind":"sbx"},"agents":{"default":"claude"}}"#;
     std::fs::write(tmp_config.path().join("config.json"), config_content).unwrap();
 
-    let status = std::process::Command::new(env!("CARGO_BIN_EXE_awman"))
+    let status = std::process::Command::new(awman_test_support::cargo_bin!("awman"))
         .args(["ready"])
         .env("AWMAN_HOME", tmp_config.path())
         .status()
@@ -272,7 +272,7 @@ fn exec_prompt_non_interactive_sbx_does_not_return_not_implemented() {
     let config_content = r#"{"runtime":{"kind":"sbx"},"agents":{"default":"claude"}}"#;
     std::fs::write(tmp_config.path().join("config.json"), config_content).unwrap();
 
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_awman"))
+    let output = std::process::Command::new(awman_test_support::cargo_bin!("awman"))
         .args([
             "exec",
             "prompt",
@@ -359,7 +359,7 @@ fn workflow_two_step_sbx_does_not_error_with_not_implemented() {
     let workflow_path = tmp_root.path().join("test_workflow.yml");
     std::fs::write(&workflow_path, workflow_yaml).unwrap();
 
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_awman"))
+    let output = std::process::Command::new(awman_test_support::cargo_bin!("awman"))
         .args(["exec", "workflow", workflow_path.to_str().unwrap()])
         .current_dir(tmp_root.path())
         .env("AWMAN_HOME", tmp_config.path())
@@ -449,7 +449,7 @@ fn runtime_switching_docker_sbx_docker_real_launch_paths() {
         let config =
             format!(r#"{{"runtime":{{"kind":"{runtime}"}},"agents":{{"default":"claude"}}}}"#);
         std::fs::write(tmp_config.path().join("config.json"), config).unwrap();
-        let output = std::process::Command::new(env!("CARGO_BIN_EXE_awman"))
+        let output = std::process::Command::new(awman_test_support::cargo_bin!("awman"))
             .args([
                 "exec",
                 "prompt",

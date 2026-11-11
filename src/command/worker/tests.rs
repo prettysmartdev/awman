@@ -607,6 +607,17 @@ async fn feature_cancel_releases_background_and_foreground_clones_before_job_cre
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
             .mount(&server)
             .await;
+        // This scenario tests owner cancellation, not lease loss. Heartbeats
+        // start immediately, so a missing mock races clone readiness with a
+        // 404 lease-loss response and can end the lease before this assertion.
+        Mock::given(method("POST"))
+            .and(path("/v1/leases/server-cloning/heartbeat"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "expires_at": (Utc::now() + chrono::Duration::minutes(5)).to_rfc3339(),
+                "cancel": false
+            })))
+            .mount(&server)
+            .await;
         controller.refresh_servers().await.unwrap();
         let c = controller.clone();
         let claim =
@@ -649,7 +660,19 @@ async fn feature_cancel_releases_background_and_foreground_clones_before_job_cre
                 controller.leases.active().unwrap().len()
             );
         }
-        let records = controller.leases.active().unwrap();
+        // The lightweight controller fixture uses an in-memory Core. Manual
+        // foreground preparation opens the session's real database, as the
+        // TUI does, so inspect that owned store for the foreground half.
+        let leases = if foreground {
+            LeaseStore::open(Arc::new(
+                crate::data::fs::SqliteSessionStore::open_at(&controller.data_paths().db_path())
+                    .unwrap(),
+            ))
+            .unwrap()
+        } else {
+            controller.leases.clone()
+        };
+        let records = leases.active().unwrap();
         assert_eq!(records.len(), 1);
         assert!(
             records[0].job_id.is_none(),
@@ -658,8 +681,7 @@ async fn feature_cancel_releases_background_and_foreground_clones_before_job_cre
         PullHandleAdapter(controller.clone()).cancel_jobs();
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                if controller
-                    .leases
+                if leases
                     .get(&records[0].id)
                     .unwrap()
                     .unwrap()

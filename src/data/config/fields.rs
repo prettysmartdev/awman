@@ -1719,8 +1719,12 @@ pub fn validate_value(key: &ConfigKey, value: &Value) -> Result<(), KeyError> {
             if !ok {
                 let expected = match key.path {
                     "daemon.network.listeners.*.tlsSans" => "a list of DNS names or IP literals",
-                    "daemon.network.listeners.*.allowedOrigins" => "exact origin like https://host or http://localhost:3000; no wildcard, null, path or userinfo",
-                    "daemon.network.listeners.*.features" => "a list containing only squad, worker, or engine",
+                    "daemon.network.listeners.*.allowedOrigins" => {
+                        "exact origin like https://host or http://localhost:3000; no wildcard, null, path or userinfo"
+                    }
+                    "daemon.network.listeners.*.features" => {
+                        "a list containing only squad, worker, or engine"
+                    }
                     _ => "a list of strings",
                 };
                 return Err(invalid(format!("expected {expected}, got {shown}")));

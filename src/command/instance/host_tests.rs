@@ -856,8 +856,8 @@ async fn annotations_filter_listing_and_end_with_the_instance() {
     assert_eq!(patched.get("rex/block"), Some("b2"));
     assert!(fx.host.list(&filter, &page).items.is_empty());
 
-    fx.host.delete(&tagged).ok();
-    fx.host.quit_instance(&tagged, QuitReason::Api).ok();
+    let _deleted = fx.host.delete(&tagged);
+    let _quit = fx.host.quit_instance(&tagged, QuitReason::Api);
     let filter = AnnotationFilter::parse(&["rex/block=b2"]).unwrap();
     assert!(fx.host.list(&filter, &page).items.is_empty());
 }

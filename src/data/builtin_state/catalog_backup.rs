@@ -108,7 +108,7 @@ fn fault_point(point: &str, path: &Path) -> Result<(), DataError> {
         });
         match fault {
             Some(Fault::Fail) => {
-                return Err(io_err(path, std::io::Error::from_raw_os_error(libc::EIO)))
+                return Err(io_err(path, std::io::Error::from_raw_os_error(libc::EIO)));
             }
             Some(Fault::Crash) => panic!("simulated crash at {point}"),
             Some(Fault::Run(mut run)) => run(),
@@ -261,13 +261,13 @@ fn copy_tree(
                 return Err(DataError::BuiltinState(format!(
                     "builtin catalog contains a symlink: {}",
                     from.display()
-                )))
+                )));
             }
             Kind::Other => {
                 return Err(DataError::BuiltinState(format!(
                     "builtin catalog contains an unsupported filesystem entry: {}",
                     from.display()
-                )))
+                )));
             }
         }
     }
@@ -311,7 +311,7 @@ fn tree_sizes(
                 return Err(DataError::BuiltinState(format!(
                     "builtin catalog contains an unsupported filesystem entry: {}",
                     child.display()
-                )))
+                )));
             }
         }
     }

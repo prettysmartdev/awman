@@ -225,7 +225,7 @@ mod tests {
     /// run it after a catalogue change makes
     /// `markdown_reference_matches_committed_docs` fail.
     #[test]
-    #[ignore = "regenerates docs/14-command-reference.md from the catalogue; run explicitly"]
+    #[ignore = "not-applicable: explicit regeneration tool; command catalogue golden is the required check"]
     fn regenerate_command_reference() {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/docs/14-command-reference.md");
         std::fs::write(path, CommandCatalogue::get().markdown_reference())

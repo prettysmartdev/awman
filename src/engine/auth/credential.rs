@@ -551,6 +551,47 @@ mod tests {
         assert_eq!(snap.secret.expose(), "sk-ant-oat-ACCESS");
     }
 
+    /// Guards: 32a8e59a macOS credential-source isolation — a binding to a
+    /// private home must read only that home's file on every platform, never
+    /// the developer's Keychain or real `~/.claude`.
+    #[test]
+    fn a_file_binding_reads_only_the_bound_home_on_every_platform() {
+        let home = tempfile::tempdir().unwrap();
+        let resolver = AuthPathResolver::at_home(home.path());
+        let file = home.path().join(".claude/.credentials.json");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, SAMPLE).unwrap();
+
+        let binding = CredentialBinding::to_file(resolver.clone(), &file);
+        let source = binding.source_for(claude_spec());
+        assert_eq!(
+            source,
+            HostCredentialSource::HostFile { path: file.clone() }
+        );
+        assert_eq!(binding.resolver().home(), home.path());
+        let snap =
+            read_claude_credential_in(&crate::data::config::env::EnvSnapshot::empty(), &source)
+                .expect("read the bound file");
+        assert_eq!(snap.secret.expose(), "sk-ant-oat-ACCESS");
+
+        // The platform default stays inside the bound home off macOS and is
+        // the (in-memory under test) Keychain on macOS; never another home.
+        match CredentialBinding::platform_default(resolver).source_for(claude_spec()) {
+            HostCredentialSource::HostFile { path } => {
+                if cfg!(target_os = "macos") {
+                    panic!("macOS must default to the Keychain, got a file source");
+                }
+                assert_eq!(path, file);
+            }
+            HostCredentialSource::MacosKeychain { service } => {
+                if !cfg!(target_os = "macos") {
+                    panic!("only macOS may default to the Keychain");
+                }
+                assert_eq!(service, CLAUDE_KEYCHAIN_SERVICE);
+            }
+        }
+    }
+
     #[test]
     fn claude_is_auth_failure_matches_signatures() {
         assert!(claude_is_auth_failure("HTTP 401 Unauthorized"));

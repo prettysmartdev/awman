@@ -83,17 +83,14 @@ fn daemon_control_directory_cannot_be_mounted() {
 }
 use crate::data::session::AgentName;
 
-/// Set `AWMAN_HOME` to `home`, run `f`, then restore the previous value.
-///
-/// The lock and the restore both belong to `ConfigHomeGuard`: a mutex private
-/// to this file would serialise these tests against each other only, and the
-/// `dispatch` and `clean` tests mutate the very same process-wide variable.
-fn with_awman_config_home<F, R>(home: &Path, f: F) -> R
-where
-    F: FnOnce() -> R,
-{
-    let _g = crate::data::config::env::ConfigHomeGuard::set(home);
-    f()
+/// The environment every test engine resolves: only `AWMAN_HOME`, pointing at
+/// the test's private home, so global skills and config come from there and
+/// never from the process environment.
+fn home_env(home: &Path) -> crate::data::config::env::EnvSnapshot {
+    crate::data::config::env::EnvSnapshot::with_overrides([(
+        "AWMAN_HOME",
+        home.to_string_lossy().to_string(),
+    )])
 }
 
 fn make_engine(home: &Path) -> OverlayEngine {
@@ -103,6 +100,7 @@ fn make_engine(home: &Path) -> OverlayEngine {
     // that want to exercise the file-seed path inject their own provider
     // via `OverlayEngine::with_secret_files_provider`.
     OverlayEngine::with_auth_resolver(AuthPathResolver::at_home(home))
+        .with_env(home_env(home))
         .with_secret_files_provider(std::sync::Arc::new(|_| Vec::new()))
 }
 
@@ -112,6 +110,7 @@ fn make_engine_with_secrets(
     files: Vec<crate::engine::auth::keychain::AgentSecretFile>,
 ) -> OverlayEngine {
     OverlayEngine::with_auth_resolver(AuthPathResolver::at_home(home))
+        .with_env(home_env(home))
         .with_secret_files_provider(std::sync::Arc::new(move |_| files.clone()))
 }
 
@@ -278,11 +277,11 @@ fn skill_overlays_returns_single_ro_spec_for_claude() {
     let engine = make_engine(tmp.path());
     let agent = AgentName::new("claude").unwrap();
 
-    let specs = with_awman_config_home(tmp.path(), || {
+    let specs = {
         engine
             .skill_overlays(&agent, true, &[], &None, Path::new("/"))
             .unwrap()
-    });
+    };
 
     assert_eq!(specs.len(), 1, "expected 1 OverlaySpec; got {specs:?}");
     assert_eq!(
@@ -310,11 +309,11 @@ fn skill_overlays_returns_single_ro_spec_for_codex() {
     let engine = make_engine(tmp.path());
     let agent = AgentName::new("codex").unwrap();
 
-    let specs = with_awman_config_home(tmp.path(), || {
+    let specs = {
         engine
             .skill_overlays(&agent, true, &[], &None, Path::new("/"))
             .unwrap()
-    });
+    };
 
     assert_eq!(specs.len(), 1);
     assert_eq!(specs[0].host_path, skills_canon);
@@ -335,11 +334,11 @@ fn skill_overlays_returns_single_ro_spec_for_gemini() {
     let engine = make_engine(tmp.path());
     let agent = AgentName::new("gemini").unwrap();
 
-    let specs = with_awman_config_home(tmp.path(), || {
+    let specs = {
         engine
             .skill_overlays(&agent, true, &[], &None, Path::new("/"))
             .unwrap()
-    });
+    };
 
     assert_eq!(specs.len(), 1);
     assert_eq!(specs[0].host_path, skills_canon);
@@ -360,11 +359,11 @@ fn skill_overlays_returns_single_ro_spec_for_antigravity() {
     let engine = make_engine(tmp.path());
     let agent = AgentName::new("antigravity").unwrap();
 
-    let specs = with_awman_config_home(tmp.path(), || {
+    let specs = {
         engine
             .skill_overlays(&agent, true, &[], &None, Path::new("/"))
             .unwrap()
-    });
+    };
 
     assert_eq!(specs.len(), 1);
     assert_eq!(specs[0].host_path, skills_canon);
@@ -385,11 +384,11 @@ fn skill_overlays_returns_single_ro_spec_for_opencode() {
     let engine = make_engine(tmp.path());
     let agent = AgentName::new("opencode").unwrap();
 
-    let specs = with_awman_config_home(tmp.path(), || {
+    let specs = {
         engine
             .skill_overlays(&agent, true, &[], &None, Path::new("/"))
             .unwrap()
-    });
+    };
 
     assert_eq!(specs.len(), 1);
     assert_eq!(specs[0].host_path, skills_canon);
@@ -410,11 +409,11 @@ fn skill_overlays_returns_single_ro_spec_for_copilot() {
     let engine = make_engine(tmp.path());
     let agent = AgentName::new("copilot").unwrap();
 
-    let specs = with_awman_config_home(tmp.path(), || {
+    let specs = {
         engine
             .skill_overlays(&agent, true, &[], &None, Path::new("/"))
             .unwrap()
-    });
+    };
 
     assert_eq!(specs.len(), 1);
     assert_eq!(specs[0].host_path, skills_canon);
@@ -435,7 +434,7 @@ fn skill_overlays_returns_single_ro_spec_for_crush() {
     let engine = make_engine(tmp.path());
     let def = crate::engine::agent::custom::crush_fixture();
 
-    let specs = with_awman_config_home(tmp.path(), || {
+    let specs = {
         engine
             .skill_overlays_for(
                 Some(&def),
@@ -446,7 +445,7 @@ fn skill_overlays_returns_single_ro_spec_for_crush() {
                 Path::new("/"),
             )
             .unwrap()
-    });
+    };
 
     assert_eq!(specs.len(), 1);
     assert_eq!(specs[0].host_path, skills_canon);
@@ -467,7 +466,7 @@ fn custom_agent_without_skills_directory_gets_no_skills_overlay() {
     let engine = make_engine(tmp.path());
     let mut def = crate::engine::agent::custom::crush_fixture();
     def.skills_mount = None;
-    let specs = with_awman_config_home(tmp.path(), || {
+    let specs = {
         engine
             .skill_overlays_for(
                 Some(&def),
@@ -478,7 +477,7 @@ fn custom_agent_without_skills_directory_gets_no_skills_overlay() {
                 tmp.path(),
             )
             .unwrap()
-    });
+    };
     assert!(specs.is_empty());
 }
 
@@ -514,11 +513,11 @@ fn skill_overlays_returns_single_ro_spec_for_cline() {
     let engine = make_engine(tmp.path());
     let agent = AgentName::new("cline").unwrap();
 
-    let specs = with_awman_config_home(tmp.path(), || {
+    let specs = {
         engine
             .skill_overlays(&agent, true, &[], &None, Path::new("/"))
             .unwrap()
-    });
+    };
 
     assert_eq!(specs.len(), 1);
     assert_eq!(specs[0].host_path, skills_canon);
@@ -540,11 +539,11 @@ fn skill_overlays_returns_empty_when_skills_dir_does_not_exist() {
     let engine = make_engine(tmp.path());
     let agent = AgentName::new("claude").unwrap();
 
-    let specs = with_awman_config_home(tmp.path(), || {
+    let specs = {
         engine
             .skill_overlays(&agent, true, &[], &None, Path::new("/"))
             .unwrap()
-    });
+    };
 
     assert!(
         specs.is_empty(),
@@ -558,11 +557,11 @@ fn skill_overlays_returns_empty_for_an_undefined_agent_no_error() {
     let engine = make_engine(tmp.path());
     let agent = AgentName::new("not-defined").unwrap();
 
-    let specs = with_awman_config_home(tmp.path(), || {
+    let specs = {
         engine
             .skill_overlays(&agent, true, &[], &None, Path::new("/"))
             .unwrap()
-    });
+    };
 
     assert!(
         specs.is_empty(),
@@ -577,11 +576,11 @@ fn skill_overlays_uses_container_home_override_when_set() {
     let agent = AgentName::new("claude").unwrap();
     let override_home = Some("/home/appuser".to_string());
 
-    let specs = with_awman_config_home(tmp.path(), || {
+    let specs = {
         engine
             .skill_overlays(&agent, true, &[], &override_home, Path::new("/"))
             .unwrap()
-    });
+    };
 
     assert_eq!(specs.len(), 1);
     assert!(
@@ -600,11 +599,11 @@ fn skill_overlays_defaults_to_root_when_no_dockerfile_present() {
     let engine = make_engine(tmp.path());
     let agent = AgentName::new("claude").unwrap();
 
-    let specs = with_awman_config_home(tmp.path(), || {
+    let specs = {
         engine
             .skill_overlays(&agent, true, &[], &None, tmp.path())
             .unwrap()
-    });
+    };
 
     assert_eq!(specs.len(), 1);
     assert!(
@@ -1100,11 +1099,11 @@ fn skill_overlays_named_only_emits_that_skill() {
     let engine = make_engine(tmp.path());
     let agent = AgentName::new("claude").unwrap();
 
-    let specs = with_awman_config_home(tmp.path(), || {
+    let specs = {
         engine
             .skill_overlays(&agent, false, &["lint".to_string()], &None, Path::new("/"))
             .unwrap()
-    });
+    };
 
     assert_eq!(
         specs.len(),
@@ -1130,7 +1129,7 @@ fn skill_overlays_nonexistent_named_skill_returns_engine_error() {
     let engine = make_engine(tmp.path());
     let agent = AgentName::new("claude").unwrap();
 
-    let result = with_awman_config_home(tmp.path(), || {
+    let result = {
         engine.skill_overlays(
             &agent,
             false,
@@ -1138,7 +1137,7 @@ fn skill_overlays_nonexistent_named_skill_returns_engine_error() {
             &None,
             Path::new("/"),
         )
-    });
+    };
 
     assert!(
         result.is_err(),
@@ -1187,7 +1186,7 @@ fn skill_named_plain_skill_wins_over_same_named_library() {
 
     let engine = make_engine(tmp.path());
     let agent = AgentName::new("claude").unwrap();
-    let specs = with_awman_config_home(tmp.path(), || {
+    let specs = {
         engine
             .skill_overlays(
                 &agent,
@@ -1197,7 +1196,7 @@ fn skill_named_plain_skill_wins_over_same_named_library() {
                 Path::new("/"),
             )
             .unwrap()
-    });
+    };
 
     assert_eq!(specs.len(), 1);
     assert_eq!(
@@ -1219,7 +1218,7 @@ fn skill_named_whole_library_mounts_subdir_at_library_container_path() {
 
     let engine = make_engine(tmp.path());
     let agent = AgentName::new("claude").unwrap();
-    let specs = with_awman_config_home(tmp.path(), || {
+    let specs = {
         engine
             .skill_overlays(
                 &agent,
@@ -1229,7 +1228,7 @@ fn skill_named_whole_library_mounts_subdir_at_library_container_path() {
                 Path::new("/"),
             )
             .unwrap()
-    });
+    };
 
     assert_eq!(specs.len(), 1);
     let expected_host = std::fs::canonicalize(
@@ -1261,7 +1260,7 @@ fn skill_named_single_library_skill_mounts_that_skill_dir() {
 
     let engine = make_engine(tmp.path());
     let agent = AgentName::new("claude").unwrap();
-    let specs = with_awman_config_home(tmp.path(), || {
+    let specs = {
         engine
             .skill_overlays(
                 &agent,
@@ -1271,7 +1270,7 @@ fn skill_named_single_library_skill_mounts_that_skill_dir() {
                 Path::new("/"),
             )
             .unwrap()
-    });
+    };
 
     assert_eq!(specs.len(), 1);
     let expected_host = std::fs::canonicalize(
@@ -1304,7 +1303,7 @@ fn skill_named_library_present_but_skill_missing_gives_distinct_error() {
 
     let engine = make_engine(tmp.path());
     let agent = AgentName::new("claude").unwrap();
-    let result = with_awman_config_home(tmp.path(), || {
+    let result = {
         engine.skill_overlays(
             &agent,
             false,
@@ -1312,7 +1311,7 @@ fn skill_named_library_present_but_skill_missing_gives_distinct_error() {
             &None,
             Path::new("/"),
         )
-    });
+    };
 
     let msg = result
         .expect_err("a missing skill in a present library must error")
@@ -1345,7 +1344,7 @@ fn skill_named_library_dir_without_skill_md_is_rejected() {
 
     let engine = make_engine(tmp.path());
     let agent = AgentName::new("claude").unwrap();
-    let result = with_awman_config_home(tmp.path(), || {
+    let result = {
         engine.skill_overlays(
             &agent,
             false,
@@ -1353,7 +1352,7 @@ fn skill_named_library_dir_without_skill_md_is_rejected() {
             &None,
             Path::new("/"),
         )
-    });
+    };
 
     let msg = result
         .expect_err("a directory without SKILL.md is not a skill")
@@ -1375,9 +1374,8 @@ fn skill_named_traversal_segments_are_rejected_by_the_engine() {
     let engine = make_engine(tmp.path());
     let agent = AgentName::new("claude").unwrap();
     for bad in ["superpowers/..", "superpowers/", "..", "../superpowers"] {
-        let result = with_awman_config_home(tmp.path(), || {
-            engine.skill_overlays(&agent, false, &[bad.to_string()], &None, Path::new("/"))
-        });
+        let result =
+            { engine.skill_overlays(&agent, false, &[bad.to_string()], &None, Path::new("/")) };
         let msg = match result {
             Ok(specs) => panic!("'{bad}' must be rejected, but produced specs: {specs:?}"),
             Err(e) => e.to_string(),
@@ -1395,9 +1393,8 @@ fn skill_named_neither_plain_nor_library_names_both_locations() {
     // Neither a plain skill nor a library called 'ghost' exists.
     let engine = make_engine(tmp.path());
     let agent = AgentName::new("claude").unwrap();
-    let result = with_awman_config_home(tmp.path(), || {
-        engine.skill_overlays(&agent, false, &["ghost".to_string()], &None, Path::new("/"))
-    });
+    let result =
+        engine.skill_overlays(&agent, false, &["ghost".to_string()], &None, Path::new("/"));
 
     let msg = result
         .expect_err("an unresolvable name must error")
@@ -1422,20 +1419,20 @@ fn skill_star_is_identical_with_and_without_populated_library() {
     let engine = make_engine(tmp.path());
     let agent = AgentName::new("claude").unwrap();
 
-    let before = with_awman_config_home(tmp.path(), || {
+    let before = {
         engine
             .skill_overlays(&agent, true, &[], &None, Path::new("/"))
             .unwrap()
-    });
+    };
 
     // Populate `.library/` — skill(*) must be entirely unaffected by it.
     seed_library(tmp.path(), "superpowers", "skills", &["brainstorming"]);
 
-    let after = with_awman_config_home(tmp.path(), || {
+    let after = {
         engine
             .skill_overlays(&agent, true, &[], &None, Path::new("/"))
             .unwrap()
-    });
+    };
 
     assert_eq!(
         before, after,
@@ -1673,6 +1670,7 @@ fn build_overlays_context_overlay_collides_with_user_dir_most_restrictive_wins()
 /// host credential file or keychain.
 fn make_engine_with_credential(home: &Path, file: Option<CredentialFile>) -> OverlayEngine {
     OverlayEngine::with_auth_resolver(AuthPathResolver::at_home(home))
+        .with_env(home_env(home))
         .with_secret_files_provider(std::sync::Arc::new(|_| Vec::new()))
         .with_credential_provider(std::sync::Arc::new(move |_| file.clone()))
 }

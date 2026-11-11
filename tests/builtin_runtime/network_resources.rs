@@ -44,7 +44,7 @@ fn denied_name() -> String {
 }
 
 pub fn net_driver_path() -> PathBuf {
-    Path::new(env!("CARGO_BIN_EXE_awman"))
+    Path::new(awman_test_support::cargo_bin!("awman"))
         .parent()
         .expect("target dir")
         .join("examples")

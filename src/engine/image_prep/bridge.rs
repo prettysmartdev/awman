@@ -309,9 +309,10 @@ mod build_tests {
                 Some(BuildBehavior::Immediate(result)) => result,
                 Some(BuildBehavior::BlockUntilCancelled { started }) => {
                     let _ = started.send(());
+                    // Spin (no sleep) until the scripted cancellation is seen.
                     loop {
                         control.check()?;
-                        std::thread::sleep(std::time::Duration::from_millis(5));
+                        std::thread::yield_now();
                     }
                 }
                 None => Ok(identity('a')),
@@ -459,14 +460,8 @@ mod build_tests {
         handle.abort();
         let _ = handle.await;
 
-        // Give the detached blocking thread a moment to observe the
-        // cancellation and exit its poll loop.
-        for _ in 0..200 {
-            if cancel.is_cancelled() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
+        // The join resolves only after the aborted future was dropped, and
+        // dropping it is what cancels the token (`CancelOnDrop`): no waiting.
         assert!(
             cancel.is_cancelled(),
             "aborting the run future must cancel the build's token"
@@ -574,9 +569,10 @@ mod import_tests {
                 Some(Behavior::Immediate(result)) => *result,
                 Some(Behavior::BlockUntilCancelled { started }) => {
                     let _ = started.send(());
+                    // Spin (no sleep) until the scripted cancellation is seen.
                     loop {
                         cancel.check()?;
-                        std::thread::sleep(std::time::Duration::from_millis(5));
+                        std::thread::yield_now();
                     }
                 }
                 None => Ok(imported("awman-repo-claude:latest")),
@@ -666,12 +662,8 @@ mod import_tests {
         handle.abort();
         let _ = handle.await;
 
-        for _ in 0..200 {
-            if cancel.is_cancelled() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
+        // Dropping the aborted future cancels the token before the join
+        // resolves (`CancelOnDrop`): no waiting.
         assert!(
             cancel.is_cancelled(),
             "aborting the run future must cancel the import's token"

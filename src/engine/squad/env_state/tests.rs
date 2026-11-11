@@ -2,27 +2,14 @@
 //! module file, unchanged).
 
 use super::*;
-use crate::data::config::env::set_daemon_overlay;
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::data::fs::task_store::{MountScope, TaskStatus};
 
-/// The overlay is one process-wide static, shared by every `#[cfg(test)]`
-/// module in the crate within the same `cargo test` binary — not just the
-/// tests in this file — so all of them serialise on the one lock in
-/// `data::config::env` rather than each other's private copy.
-fn guard() -> std::sync::MutexGuard<'static, ()> {
-    let guard = crate::data::config::env::DAEMON_OVERLAY_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    set_daemon_overlay(DaemonEnvMap::new());
-    guard
-}
-
 fn state() -> DaemonEnvState {
-    DaemonEnvState::new(Box::new(NoStore), EnvPersistence::None, Salt::random())
+    DaemonEnvState::with_payload(Box::new(NoStore), EnvPersistence::None, Salt::random())
 }
 
 /// Entries are sorted by name, so every assertion looks its subject up
@@ -116,7 +103,6 @@ fn a_salt_round_trips_through_its_hex_form() {
 /// not be able to wipe what a better-equipped client pushed.
 #[test]
 fn an_all_absent_push_is_a_no_op_on_the_overlay() {
-    let _lock = guard();
     let state = state();
     let now = Utc::now();
     state.set_required(required(&[("TOKEN", &["nightly"])]), now);
@@ -143,7 +129,6 @@ fn an_all_absent_push_is_a_no_op_on_the_overlay() {
 /// Invariant 2: an empty value is the same answer as "I don't have it".
 #[test]
 fn an_empty_value_counts_as_absent_and_never_replaces_a_held_one() {
-    let _lock = guard();
     let state = state();
     let now = Utc::now();
     state.set_required(required(&[("TOKEN", &["nightly"])]), now);
@@ -160,7 +145,6 @@ fn an_empty_value_counts_as_absent_and_never_replaces_a_held_one() {
 /// name the daemon never asked for is refused rather than accumulated.
 #[test]
 fn a_provision_replaces_and_an_unrequired_name_is_ignored() {
-    let _lock = guard();
     let state = state();
     let now = Utc::now();
     state.set_required(required(&[("TOKEN", &["nightly"])]), now);
@@ -186,7 +170,6 @@ fn a_provision_replaces_and_an_unrequired_name_is_ignored() {
 /// is also what garbage-collects the stored item's contents.
 #[test]
 fn a_value_is_dropped_only_when_its_name_leaves_the_required_set() {
-    let _lock = guard();
     let state = state();
     let now = Utc::now();
     state.set_required(
@@ -211,7 +194,6 @@ fn a_value_is_dropped_only_when_its_name_leaves_the_required_set() {
 /// uncovered, so a typo'd name reads as long-unmet rather than newly-unmet.
 #[test]
 fn unmet_since_is_stamped_at_first_requirement_not_at_first_push() {
-    let _lock = guard();
     let state = state();
     let first = Utc::now();
     state.set_required(required(&[("GTIHUB_TOKEN", &["nightly"])]), first);
@@ -245,7 +227,6 @@ fn unmet_since_is_stamped_at_first_requirement_not_at_first_push() {
 /// the one name WI 0116's own examples are written around.
 #[test]
 fn no_name_joins_the_required_set_unless_something_declares_it() {
-    let _lock = guard();
     let state = state();
     state.set_required(BTreeMap::new(), Utc::now());
 
@@ -261,7 +242,6 @@ fn no_name_joins_the_required_set_unless_something_declares_it() {
 /// every surface that reads one.
 #[test]
 fn a_task_declared_github_token_is_unmet_like_any_other_name() {
-    let _lock = guard();
     let state = state();
     let now = Utc::now();
     state.set_required(required(&[("GITHUB_TOKEN", &["nightly"])]), now);
@@ -293,7 +273,6 @@ fn a_task_declared_github_token_is_unmet_like_any_other_name() {
 /// from live coverage, and a global-source name counts for every task.
 #[test]
 fn unmet_for_task_covers_its_own_names_and_the_global_ones() {
-    let _lock = guard();
     let state = state();
     let now = Utc::now();
     state.set_required(
@@ -332,7 +311,6 @@ fn unmet_for_task_covers_its_own_names_and_the_global_ones() {
 /// classified as "fresh" once.
 #[test]
 fn a_name_is_only_warned_about_once_per_daemon_lifetime() {
-    let _lock = guard();
     let state = Arc::new(state());
     state.set_required(required(&[("TOKEN", &["nightly"])]), Utc::now());
 
@@ -352,8 +330,6 @@ fn a_name_is_only_warned_about_once_per_daemon_lifetime() {
 /// fatal, and is reported through `persistence` rather than a log alone.
 #[test]
 fn a_store_failure_degrades_this_daemon_and_is_never_retried() {
-    let _lock = guard();
-
     struct FailingStore;
     impl DaemonEnvStore for FailingStore {
         fn backend_name(&self) -> &'static str {
@@ -373,7 +349,7 @@ fn a_store_failure_degrades_this_daemon_and_is_never_retried() {
     // The degrade path is exercised through `degrade` directly: `persist`
     // rebuilds a real `KeychainStore` for the detached call, which no unit
     // test may spawn.
-    let state = DaemonEnvState::new(
+    let state = DaemonEnvState::with_payload(
         Box::new(FailingStore),
         EnvPersistence::Keychain,
         Salt::random(),
@@ -413,8 +389,6 @@ fn a_store_failure_degrades_this_daemon_and_is_never_retried() {
 /// touched again after the first failure.
 #[test]
 fn a_probed_available_store_that_fails_mid_session_is_never_retried() {
-    let _lock = guard();
-
     struct CountingFailingStore(Arc<std::sync::atomic::AtomicUsize>);
     impl DaemonEnvStore for CountingFailingStore {
         fn backend_name(&self) -> &'static str {
@@ -433,7 +407,7 @@ fn a_probed_available_store_that_fails_mid_session_is_never_retried() {
     }
 
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let state = DaemonEnvState::new(
+    let state = DaemonEnvState::with_payload(
         Box::new(CountingFailingStore(calls.clone())),
         EnvPersistence::Keychain,
         Salt::random(),
@@ -473,8 +447,6 @@ fn a_probed_available_store_that_fails_mid_session_is_never_retried() {
 /// lifetime.
 #[test]
 fn load_from_store_merges_into_the_overlay_so_a_store_only_name_is_not_unmet() {
-    let _lock = guard();
-
     struct PreloadedStore;
     impl DaemonEnvStore for PreloadedStore {
         fn backend_name(&self) -> &'static str {
@@ -491,7 +463,7 @@ fn load_from_store_merges_into_the_overlay_so_a_store_only_name_is_not_unmet() {
         }
     }
 
-    let state = DaemonEnvState::new(
+    let state = DaemonEnvState::with_payload(
         Box::new(PreloadedStore),
         EnvPersistence::Keychain,
         Salt::random(),
@@ -533,7 +505,6 @@ fn load_from_store_merges_into_the_overlay_so_a_store_only_name_is_not_unmet() {
 /// re-pushed the lost one and its containers started without it.
 #[test]
 fn two_concurrent_pushes_for_different_names_both_survive() {
-    let _lock = guard();
     let state = Arc::new(state());
     let now = Utc::now();
     state.set_required(
@@ -543,7 +514,7 @@ fn two_concurrent_pushes_for_different_names_both_survive() {
 
     // Enough rounds that a snapshot-mutate-replace loses at least one.
     for round in 0..64 {
-        crate::data::config::env::set_daemon_overlay(DaemonEnvMap::new());
+        state.update_payload(|p| p.clear());
         let a = Arc::clone(&state);
         let b = Arc::clone(&state);
         let one = std::thread::spawn(move || {
@@ -570,13 +541,12 @@ fn two_concurrent_pushes_for_different_names_both_survive() {
 /// indicator poller. `set_required` must not roll a just-accepted push back.
 #[test]
 fn a_push_racing_the_coverage_refresh_is_never_rolled_back() {
-    let _lock = guard();
     let state = Arc::new(state());
     let now = Utc::now();
     let wanted = required(&[("TOKEN", &["nightly"]), ("OTHER", &["deploy"])]);
 
     for round in 0..64 {
-        crate::data::config::env::set_daemon_overlay(DaemonEnvMap::new());
+        state.update_payload(|p| p.clear());
         state.set_required(wanted.clone(), now);
         let pusher = Arc::clone(&state);
         let refresher = Arc::clone(&state);
@@ -607,8 +577,6 @@ fn a_push_racing_the_coverage_refresh_is_never_rolled_back() {
 /// that just left `entries`.
 #[test]
 fn a_keychain_loaded_name_no_task_declares_is_collected_and_rewritten_out() {
-    let _lock = guard();
-
     struct RecordingStore(Arc<Mutex<Vec<DaemonEnvMap>>>);
     impl DaemonEnvStore for RecordingStore {
         fn backend_name(&self) -> &'static str {
@@ -633,7 +601,7 @@ fn a_keychain_loaded_name_no_task_declares_is_collected_and_rewritten_out() {
     }
 
     let written: Arc<Mutex<Vec<DaemonEnvMap>>> = Arc::new(Mutex::new(Vec::new()));
-    let state = DaemonEnvState::new(
+    let state = DaemonEnvState::with_payload(
         Box::new(RecordingStore(Arc::clone(&written))),
         EnvPersistence::Keychain,
         Salt::random(),
@@ -664,7 +632,6 @@ fn a_keychain_loaded_name_no_task_declares_is_collected_and_rewritten_out() {
 /// either, which is what `EnvPushResponse.ignored` documents.
 #[test]
 fn an_empty_value_for_an_unrequired_name_is_reported_in_neither_list() {
-    let _lock = guard();
     let state = state();
     let now = Utc::now();
     state.set_required(required(&[("TOKEN", &["nightly"])]), now);
@@ -718,8 +685,6 @@ fn a_store_failure_reason_is_bounded_and_drops_anything_carrying_the_payload_env
 /// over a real secret.
 #[test]
 fn a_degraded_daemon_can_still_clear_the_item_it_wrote_before_degrading() {
-    let _lock = guard();
-
     struct FailsToWriteButClears {
         clears: Arc<std::sync::atomic::AtomicUsize>,
     }
@@ -741,7 +706,7 @@ fn a_degraded_daemon_can_still_clear_the_item_it_wrote_before_degrading() {
     }
 
     let clears = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let state = DaemonEnvState::new(
+    let state = DaemonEnvState::with_payload(
         Box::new(FailsToWriteButClears {
             clears: Arc::clone(&clears),
         }),
@@ -772,7 +737,6 @@ fn a_degraded_daemon_can_still_clear_the_item_it_wrote_before_degrading() {
 /// to ask, and says so without touching the OS.
 #[test]
 fn a_daemon_with_no_backend_reports_nothing_to_clear() {
-    let _lock = guard();
     let state = state();
     assert!(!state.clear_store().expect("a clear must not fail"));
 }
@@ -784,8 +748,6 @@ fn a_daemon_with_no_backend_reports_nothing_to_clear() {
 /// what could push daemon start past the supervisor's ten-second wait.
 #[test]
 fn a_probed_payload_is_merged_without_asking_the_store_again() {
-    let _lock = guard();
-
     struct CountingStore(Arc<std::sync::atomic::AtomicUsize>);
     impl DaemonEnvStore for CountingStore {
         fn backend_name(&self) -> &'static str {
@@ -804,7 +766,7 @@ fn a_probed_payload_is_merged_without_asking_the_store_again() {
     }
 
     let loads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let state = DaemonEnvState::new(
+    let state = DaemonEnvState::with_payload(
         Box::new(CountingStore(Arc::clone(&loads))),
         EnvPersistence::Keychain,
         Salt::random(),
@@ -837,8 +799,6 @@ fn a_probed_payload_is_merged_without_asking_the_store_again() {
 /// opted-out or timed-out daemon takes.
 #[test]
 fn no_probed_payload_still_reads_the_store() {
-    let _lock = guard();
-
     struct CountingStore(Arc<std::sync::atomic::AtomicUsize>);
     impl DaemonEnvStore for CountingStore {
         fn backend_name(&self) -> &'static str {
@@ -860,7 +820,7 @@ fn no_probed_payload_still_reads_the_store() {
     }
 
     let loads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let state = DaemonEnvState::new(
+    let state = DaemonEnvState::with_payload(
         Box::new(CountingStore(Arc::clone(&loads))),
         EnvPersistence::Keychain,
         Salt::random(),
@@ -893,11 +853,10 @@ fn live_backend_switch_preserves_overlay_and_opt_out_stops_writes() {
             Ok(())
         }
     }
-    let _lock = guard();
     let state = state();
     let calls = Arc::new(AtomicUsize::new(0));
     let overlay = DaemonEnvMap::from_pairs([("TOKEN", "held-in-memory")]);
-    set_daemon_overlay(overlay.clone());
+    state.update_payload(|p| p.extend(overlay.clone().into_inner()));
     state.replace_store(Box::new(Recording(calls.clone())), EnvPersistence::Keychain);
     state.persist(&overlay);
     assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -906,7 +865,7 @@ fn live_backend_switch_preserves_overlay_and_opt_out_stops_writes() {
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert_eq!(state.persistence(), EnvPersistence::None);
     assert_eq!(
-        daemon_overlay_snapshot().get("TOKEN"),
+        state.payload_snapshot().get("TOKEN"),
         Some("held-in-memory")
     );
     state.replace_store(Box::new(Recording(calls.clone())), EnvPersistence::Keychain);
@@ -946,7 +905,7 @@ fn opt_out_waits_for_an_actual_in_progress_write() {
     let (started, rx) = std::sync::mpsc::sync_channel(1);
     let release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
     let calls = Arc::new(AtomicUsize::new(0));
-    let state = Arc::new(DaemonEnvState::new(
+    let state = Arc::new(DaemonEnvState::with_payload(
         Box::new(Blocked {
             started,
             release: release.clone(),
@@ -975,4 +934,60 @@ fn opt_out_waits_for_an_actual_in_progress_write() {
     completed.recv().unwrap();
     state.persist(&DaemonEnvMap::from_pairs([("TOKEN", "new-value")]));
     assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn environment_coverage_state_model_required_push_empty_remove_and_redeclare() {
+    // Exhaust every five-step history over declare/remove/supply/empty push.
+    for seed in 0..1024 {
+        let state = state();
+        let now = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let (mut required_now, mut supplied) = (false, false);
+        let mut history = seed;
+        for step in 0..5 {
+            match history % 4 {
+                0 => {
+                    required_now = true;
+                    state.set_required(required(&[("TOKEN", &["task"])]), now);
+                }
+                1 => {
+                    required_now = false;
+                    supplied = false;
+                    state.set_required(BTreeMap::new(), now);
+                }
+                2 => {
+                    state.apply_push(DaemonEnvMap::from_pairs([("TOKEN", "value")]), &[], now);
+                    if required_now {
+                        supplied = true;
+                    }
+                }
+                3 => {
+                    state.apply_push(
+                        DaemonEnvMap::from_pairs([("TOKEN", "")]),
+                        &["TOKEN".into()],
+                        now,
+                    );
+                }
+                _ => unreachable!(),
+            }
+            history /= 4;
+            assert_eq!(
+                state.entries().len(),
+                usize::from(required_now),
+                "seed {seed}, step {step}"
+            );
+            assert_eq!(
+                state.is_covered("TOKEN"),
+                supplied,
+                "seed {seed}, step {step}"
+            );
+            if required_now {
+                let entry = entry_for(&state, "TOKEN");
+                assert_eq!(entry.digest.is_some(), supplied, "seed {seed}, step {step}");
+                assert_eq!(entry.unmet_since.is_none(), supplied);
+            }
+        }
+    }
 }

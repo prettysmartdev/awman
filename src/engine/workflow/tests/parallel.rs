@@ -38,6 +38,8 @@ struct ParallelRecord {
     stuck: Vec<String>,
     unstuck: Vec<String>,
     yolo_started: Vec<String>,
+    /// Step name of every per-step parallel yolo tick, in order.
+    yolo_ticks: Vec<String>,
     group_finished: bool,
     available: Vec<AvailableActions>,
     /// `(title, body)` of every follow-up question the engine asked.
@@ -190,10 +192,15 @@ impl WorkflowFrontend for ParallelTestFrontend {
     }
     fn parallel_step_yolo_countdown_tick(
         &mut self,
-        _: &str,
+        step_name: &str,
         _: Duration,
         _: Duration,
     ) -> Result<YoloTickOutcome, EngineError> {
+        self.record
+            .lock()
+            .unwrap()
+            .yolo_ticks
+            .push(step_name.to_string());
         Ok(self.yolo_tick.clone())
     }
 }
@@ -257,23 +264,14 @@ async fn wait_until(
     what: &str,
     done: impl Fn(&ParallelRecord) -> bool,
 ) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while !done(&record.lock().unwrap()) {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "timed out waiting for {what}"
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    eventually(what, || done(&record.lock().unwrap())).await;
 }
 
 async fn wait_for_launched(record: &Arc<Mutex<ParallelRecord>>, expected: &[&str]) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while record.lock().unwrap().launched.len() < expected.len()
-        && tokio::time::Instant::now() < deadline
-    {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    eventually(&format!("launches {expected:?}"), || {
+        record.lock().unwrap().launched.len() >= expected.len()
+    })
+    .await;
     assert_eq!(record.lock().unwrap().launched, expected);
 }
 
@@ -305,22 +303,19 @@ async fn parallel_group_launches_respect_max_concurrent_cap() {
 
     let engine_task = tokio::spawn(async move { engine.run_to_completion().await });
 
-    // Only 2 of the 4 steps start initially. Each fixed sleep gives an
-    // over-launch time to show up; the wait then tolerates a slow runner
-    // while still asserting the exact count.
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // Only 2 of the 4 steps start initially. The engine fills free slots in
+    // one scheduling pass, so an over-launch would be counted together with
+    // the two expected launches; the wait asserts the exact count.
     wait_for_execution_count(&execution_count, 2).await;
     wait_for_launched(&record, &["a", "b"]).await;
 
     // Finishing the 1st frees a slot; the 3rd (c) launches.
     signal_completion(&entries[0].1, 0);
-    tokio::time::sleep(Duration::from_millis(200)).await;
     wait_for_execution_count(&execution_count, 3).await;
     wait_for_launched(&record, &["a", "b", "c"]).await;
 
     // Finishing the 2nd frees the last slot; the 4th (d) launches.
     signal_completion(&entries[1].1, 0);
-    tokio::time::sleep(Duration::from_millis(200)).await;
     wait_for_execution_count(&execution_count, 4).await;
     wait_for_launched(&record, &["a", "b", "c", "d"]).await;
 
@@ -491,15 +486,22 @@ async fn final_parallel_countdowns_review_then_finish_all_live_agents() {
     })
     .unwrap();
     // The first expired final-stage countdown cannot kill its agent or
-    // present the board until every other agent is also review-ready.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // present the board until every other agent is also review-ready. A
+    // tick records the explicit AdvanceNow answer; other agents remain live.
+    wait_until(&record, "first expired tick for a", |r| {
+        r.yolo_ticks.iter().any(|s| s == "a")
+    })
+    .await;
     assert!(!cancel_a.load(Ordering::Relaxed));
     assert!(record.lock().unwrap().available.is_empty());
     tx.send(EngineRequest::StepStuck {
         step_name: "b".to_string(),
     })
     .unwrap();
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    wait_until(&record, "first expired tick for b", |r| {
+        r.yolo_ticks.iter().any(|s| s == "b")
+    })
+    .await;
     assert!(record.lock().unwrap().available.is_empty());
     tx.send(EngineRequest::StepStuck {
         step_name: "c".to_string(),
@@ -581,8 +583,11 @@ async fn parallel_step_stuck_routes_to_named_slot_only() {
         (Arc::new(AtomicBool::new(false)), completion_b.clone()),
     ]);
     let engine_tx: Arc<Mutex<Option<_>>> = Arc::new(Mutex::new(None));
-    let (frontend, record) =
-        ParallelTestFrontend::new([], engine_tx.clone(), YoloTickOutcome::Continue);
+    let (frontend, record) = ParallelTestFrontend::new(
+        [NextAction::Dismiss],
+        engine_tx.clone(),
+        YoloTickOutcome::Continue,
+    );
     let mut engine = build_parallel_engine(&session, workflow, factory, frontend);
     // Not yolo mode.
     let tx = engine_tx.lock().unwrap().clone().unwrap();
@@ -595,9 +600,13 @@ async fn parallel_step_stuck_routes_to_named_slot_only() {
     })
     .unwrap();
     wait_until(&record, "b to be reported stuck", |r| !r.stuck.is_empty()).await;
-    // Deliberate "nothing happens" window: give a misrouted stuck report
-    // for 'a' time to show up.
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // Barrier, not a delay: requests are handled in order, so once a board
+    // (answered Dismiss) opens, a misrouted stuck report for 'a' would be in.
+    tx.send(EngineRequest::OpenControlBoard {
+        step_name: "a".to_string(),
+    })
+    .unwrap();
+    wait_until(&record, "the barrier board", |r| !r.available.is_empty()).await;
 
     {
         let rec = record.lock().unwrap();
@@ -1316,7 +1325,11 @@ async fn parallel_group_declined_confirmation_keeps_group_running() {
     ]);
     let engine_tx: Arc<Mutex<Option<_>>> = Arc::new(Mutex::new(None));
     let (frontend, record) = ParallelTestFrontend::new(
-        [NextAction::LaunchNext, NextAction::RestartCurrentStep],
+        [
+            NextAction::LaunchNext,
+            NextAction::RestartCurrentStep,
+            NextAction::Dismiss,
+        ],
         engine_tx.clone(),
         YoloTickOutcome::Continue,
     );
@@ -1334,9 +1347,10 @@ async fn parallel_group_declined_confirmation_keeps_group_running() {
     open_board(&tx, &record, "a").await; // next → declined
     open_board(&tx, &record, "a").await; // restart → scope question dismissed
 
-    // Deliberate "nothing happens" window: a (wrong) kill or relaunch would
-    // follow the answers at once.
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // Barrier, not a delay: a third board (answered Dismiss) is shown only
+    // after the engine finished acting on the earlier answers; a (wrong)
+    // kill or relaunch would have followed them at once.
+    open_board(&tx, &record, "a").await;
     assert!(!cancel_a.load(Ordering::Relaxed));
     assert!(!cancel_b.load(Ordering::Relaxed));
     assert_eq!(record.lock().unwrap().launched, vec!["a", "b"]);

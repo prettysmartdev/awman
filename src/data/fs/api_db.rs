@@ -2591,7 +2591,6 @@ mod tests {
         store
             .insert_running_lease_command("lease", "s1", "exec", "[]", false)
             .unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(5));
         assert!(store.recover_stale_commands(0).unwrap().is_empty());
         let row = store.get_command("lease").unwrap().unwrap();
         assert_eq!(row.status, CommandStatus::Running);

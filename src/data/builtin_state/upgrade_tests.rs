@@ -141,11 +141,12 @@ fn backup_catalog_refuses_existing_targets_and_names_them() {
         if kind == "file" {
             assert_eq!(std::fs::read(&target).unwrap(), b"keep me");
         }
-        assert!(!std::fs::read_dir(&state.home).unwrap().any(|e| e
-            .unwrap()
-            .file_name()
-            .to_string_lossy()
-            .contains(".partial-")));
+        assert!(!std::fs::read_dir(&state.home).unwrap().any(|e| {
+            e.unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".partial-")
+        }));
     }
 }
 
@@ -206,44 +207,6 @@ fn backup_catalog_removes_partial_copy_when_nested_entry_is_refused() {
         assert!(bad.symlink_metadata().is_ok());
         assert_no_backup(&state);
     }
-}
-
-#[test]
-fn replace_runtime_marker_write_failure_preserves_old_marker() {
-    const CHILD: &str = "AWMAN_TEST_MARKER_WRITE_FAILURE";
-    if let Some(home) = std::env::var_os(CHILD) {
-        let state = BuiltinState::at(home);
-        assert!(matches!(
-            state.replace_runtime_marker(WORKER_PROTOCOL),
-            Err(DataError::Io { .. })
-        ));
-        return;
-    }
-    let (_temp, state) = state();
-    let marker = state.home.join(RUNTIME_VERSION_FILE);
-    std::fs::write(&marker, b"old protocol").unwrap();
-    let inode = std::fs::metadata(&marker).unwrap().ino();
-    // Apply the fault only in the child. A zero file-size limit forces a
-    // staged write failure even as root; ignoring SIGXFSZ exposes the error.
-    let output = std::process::Command::new("bash")
-        .args(["-c", "trap '' XFSZ; ulimit -f 0; exec \"$@\"", "marker-write-failure"])
-        .arg(std::env::current_exe().unwrap())
-        .args(["--exact", "data::builtin_state::upgrade_tests::replace_runtime_marker_write_failure_preserves_old_marker", "--nocapture"])
-        .env(CHILD, &state.home)
-        .output().unwrap();
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        output.status.success() && stdout.contains("1 passed"),
-        "the child must run exactly this test: {stdout}{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert_eq!(std::fs::read(&marker).unwrap(), b"old protocol");
-    assert_eq!(std::fs::metadata(&marker).unwrap().ino(), inode);
-    assert_eq!(
-        std::fs::read_dir(&state.home).unwrap().count(),
-        STATE_SUBDIRS.len() + 1,
-        "failed staging file was removed"
-    );
 }
 
 #[test]
@@ -412,17 +375,7 @@ fn held_locks_ignores_stale_files_symlinks_and_directories() {
     symlink(&held_path, locks.join("symlink.lock")).unwrap();
     assert_eq!(state.held_locks("run/locks").unwrap(), vec![held_path]);
     drop(held);
-    // A child forked by a parallel test while `held` was open shares its
-    // flock until that child's exec closes the copy, so a released lock can
-    // read as held briefly. A leaked lock never clears.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while !state.held_locks("run/locks").unwrap().is_empty() {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "a released lock must not stay held"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
+    assert!(state.held_locks("run/locks").unwrap().is_empty());
 }
 
 fn ledger_catalog(state: &BuiltinState) {
@@ -651,49 +604,6 @@ fn paths_substituted_during_a_backup_are_refused_not_followed() {
 }
 
 #[test]
-fn backup_on_a_full_disk_removes_the_partial_copy() {
-    const CHILD: &str = "AWMAN_TEST_BACKUP_DISK_FULL";
-    if let Some(home) = std::env::var_os(CHILD) {
-        let state = BuiltinState::at(home);
-        assert!(matches!(
-            state.backup_catalog("old", "msb.db", "seaql_migrations"),
-            Err(DataError::Io { .. })
-        ));
-        return;
-    }
-    let (_temp, state) = state();
-    let big = vec![7u8; 256 * 1024];
-    std::fs::write(state.home.join("db/catalog"), &big).unwrap();
-    // A file-size limit in the child makes the copy fail with EFBIG, as a
-    // full disk would, without filling the real disk.
-    let output = std::process::Command::new("bash")
-        .args([
-            "-c",
-            "trap '' XFSZ; ulimit -f 64; exec \"$@\"",
-            "backup-disk-full",
-        ])
-        .arg(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "data::builtin_state::upgrade_tests::backup_on_a_full_disk_removes_the_partial_copy",
-            "--nocapture",
-        ])
-        .env(CHILD, &state.home)
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
-    assert_no_backup(&state);
-    assert!(hidden_leftovers(&state).is_empty());
-    assert_eq!(std::fs::read(state.home.join("db/catalog")).unwrap(), big);
-}
-
-#[test]
 fn retired_sandbox_files_move_aside_and_back() {
     let (_temp, state) = state();
     let sandboxes = state.home.join("sandboxes");
@@ -735,12 +645,12 @@ fn existing_image_leases_are_taken_exclusively_or_reported_busy() {
         Err(DataError::BuiltinStateBusy { .. })
     ));
     drop(launch);
-    let held = after_forked_copies_close(|| state.lock_image_leases()).unwrap();
+    let held = state.lock_image_leases().unwrap();
     assert_eq!(held.len(), 1);
     assert!(matches!(
         state.image_lease("image:tag", false),
         Err(DataError::BuiltinStateBusy { .. })
     ));
     drop(held);
-    assert!(after_forked_copies_close(|| state.image_lease("image:tag", false)).is_ok());
+    assert!(state.image_lease("image:tag", false).is_ok());
 }

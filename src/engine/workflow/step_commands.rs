@@ -31,7 +31,10 @@ pub struct StepCommandOptions {
 
 /// Transport runs with controlled metadata supplied by OverlayEngine. Never
 /// consult hooks, SSH config, helpers or URL rewrites from the checkout.
-fn transport_git(opts: &StepCommandOptions) -> String {
+///
+/// Public so the component tier can run the exact transport prefix through
+/// a real `git` (the credential-helper destination check).
+pub fn transport_git(opts: &StepCommandOptions) -> String {
     if opts.push_auth == PushAuth::None && opts.remote_url.is_none() {
         return "git".into();
     }
@@ -863,60 +866,8 @@ mod tests {
         assert!(push.for_ci_fix(&["test".to_string()]).is_none());
     }
 
-    /// Runs the real commit command in a scratch repo: ignored files stay out,
-    /// while explicitly staged ignored files follow normal Git behavior.
-    #[test]
-    fn commit_changes_commits_everything_and_tolerates_a_clean_tree() {
-        use std::process::Command;
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path();
-        let sh = |cmd: &str| {
-            Command::new("sh")
-                .args(["-c", cmd])
-                .current_dir(dir)
-                .env("GIT_AUTHOR_NAME", "t")
-                .env("GIT_AUTHOR_EMAIL", "t@t")
-                .env("GIT_COMMITTER_NAME", "t")
-                .env("GIT_COMMITTER_EMAIL", "t@t")
-                .output()
-                .unwrap()
-        };
-        assert!(sh(
-            "git init -q && echo a > a && printf '.awman/workflows\\n' > .gitignore \
-                && git add a .gitignore && git commit -qm init"
-        )
-        .status
-        .success());
-        sh("echo b > a && echo new > new && mkdir -p .awman/workflows \
-            && echo {} > .awman/workflows/state.json");
-
-        let step = TeardownStep::CommitChanges {
-            message: "work".to_string(),
-            add_all: true,
-        };
-        let (cmd, _) = teardown_step_to_shell(&step);
-        assert!(sh(&cmd).status.success());
-        let committed = sh("git show --name-only --format= HEAD");
-        let committed = String::from_utf8_lossy(&committed.stdout);
-        assert_eq!(committed.lines().collect::<Vec<_>>(), ["a", "new"]);
-
-        assert!(sh("git add -f .awman/workflows/state.json")
-            .status
-            .success());
-        assert!(sh(&cmd).status.success());
-        let committed = sh("git show --name-only --format= HEAD");
-        assert_eq!(
-            String::from_utf8_lossy(&committed.stdout).trim(),
-            ".awman/workflows/state.json"
-        );
-
-        let again = sh(&cmd);
-        assert!(
-            again.status.success(),
-            "a clean tree must not fail the step"
-        );
-        assert!(String::from_utf8_lossy(&again.stdout).contains("nothing to commit"));
-    }
+    // Running the commit command against a real repository is the component
+    // test `engine::workflow::commit_changes_commits_everything_and_tolerates_a_clean_tree`.
 
     #[test]
     fn create_pr_full() {
@@ -1433,10 +1384,10 @@ mod push_auth_tests {
 #[cfg(test)]
 mod review_transport_tests {
     use super::*;
-    use std::io::Write;
-    use std::process::{Command, Stdio};
+    // The helper's behaviour under a real `git credential fill` is the
+    // component test `engine::workflow::https_transport_helper_answers_only_the_approved_destination`.
     #[test]
-    fn https_helper_obeys_git_protocol_and_restricts_destination() {
+    fn https_transport_never_carries_the_token_value() {
         let opts = StepCommandOptions {
             push_auth: PushAuth::HttpsToken {
                 env_var: "AWMAN_GIT_TOKEN".into(),
@@ -1444,43 +1395,9 @@ mod review_transport_tests {
             remote_url: Some("https://github.com/o/r.git".into()),
         };
         let args = shell_words::split(&transport_git(&opts)).unwrap();
-        for (host, path, allowed) in [
-            ("github.com", "o/r.git", true),
-            ("evil.test", "o/r.git", false),
-            ("github.com", "other/repo", false),
-        ] {
-            let dir = tempfile::tempdir().unwrap();
-            let mut child = Command::new("git")
-                .args(&args[1..])
-                .args(["credential", "fill"])
-                .current_dir(dir.path())
-                .env("GIT_CONFIG_NOSYSTEM", "1")
-                .env("GIT_CONFIG_GLOBAL", "/dev/null")
-                .env("GIT_TERMINAL_PROMPT", "0")
-                .env("AWMAN_GIT_TOKEN", "fixture_secret")
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .unwrap();
-            writeln!(
-                child.stdin.take().unwrap(),
-                "protocol=https\nhost={host}\npath={path}\n"
-            )
-            .unwrap();
-            let output = child.wait_with_output().unwrap();
-            assert_eq!(
-                output.status.success(),
-                allowed,
-                "{}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            assert_eq!(
-                String::from_utf8_lossy(&output.stdout).contains("password=fixture_secret"),
-                allowed
-            );
-            assert!(!args.iter().any(|a| a.contains("fixture_secret")));
-        }
+        assert_eq!(args[0], "git");
+        assert!(args.iter().any(|a| a.contains("password=$AWMAN_GIT_TOKEN")));
+        assert!(!args.iter().any(|a| a.contains("fixture_secret")));
     }
     #[test]
     fn setup_uses_selected_transport_and_pinned_destination() {

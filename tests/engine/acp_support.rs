@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 fn awman_bin() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_awman"))
+    PathBuf::from(awman_test_support::cargo_bin!("awman"))
 }
 
 struct FakeDocker {

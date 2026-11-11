@@ -45,6 +45,7 @@ pub fn dispatch_worker(
                 serde_json::json!({
                     "msb_version": awman::data::builtin_runtime::MSB_VERSION,
                     "worker_protocol": awman::data::builtin_runtime::WORKER_PROTOCOL,
+                    "upgradable_from": awman::data::builtin_runtime::UPGRADABLE_FROM,
                     "target_os": std::env::consts::OS, "target_arch": std::env::consts::ARCH,
                     "libkrun_commit": awman::data::builtin_runtime::LIBKRUN_COMMIT,
                     "kernel_sha256": kernel::KERNEL_SHA256,

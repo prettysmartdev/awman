@@ -29,7 +29,7 @@ fn startup_overrides_use_the_json_frontend_and_hide_values() {
             std::ffi::OsString::from("private-override-value"),
             std::ffi::OsString::from_vec(vec![0xff]),
         ] {
-            let output = std::process::Command::new(env!("CARGO_BIN_EXE_awman"))
+            let output = std::process::Command::new(awman_test_support::cargo_bin!("awman"))
                 .args(["ready", "--json"])
                 .current_dir(tmp.path())
                 .env("AWMAN_HOME", &config)

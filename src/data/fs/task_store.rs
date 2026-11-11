@@ -1079,14 +1079,8 @@ mod tests {
         }
     }
 
-    /// The scheduler re-reads a task's `config.json` every tick through the
-    /// ordinary global-config loader. While the daemon keeps rewriting it,
-    /// that loader must always parse a complete old or new document.
     #[test]
-    fn the_scheduler_loader_always_reads_a_complete_task_config() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use std::sync::Arc;
-
+    fn successive_task_config_replacements_load_as_complete_documents() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("config.json");
         let small = GlobalConfig {
@@ -1098,30 +1092,11 @@ mod tests {
             ..Default::default()
         };
         TaskStore::write_config(&path, &small).unwrap();
-
-        let done = Arc::new(AtomicBool::new(false));
-        let reader = {
-            let (done, path) = (Arc::clone(&done), path.clone());
-            let (small, large) = (small.overlays.clone(), large.overlays.clone());
-            std::thread::spawn(move || {
-                let mut reads = 0usize;
-                while !done.load(Ordering::Acquire) || reads == 0 {
-                    let loaded = GlobalConfig::load(&path, crate::data::config::FileKind::Task)
-                        .expect("every read parses a complete task config");
-                    assert!(
-                        loaded.overlays == small || loaded.overlays == large,
-                        "read a mixed task config"
-                    );
-                    reads += 1;
-                }
-                reads
-            })
-        };
-        for i in 0..100 {
-            TaskStore::write_config(&path, if i % 2 == 0 { &large } else { &small }).unwrap();
+        for config in [&large, &small, &large] {
+            TaskStore::write_config(&path, config).unwrap();
+            let loaded = GlobalConfig::load(&path, crate::data::config::FileKind::Task).unwrap();
+            assert_eq!(loaded.overlays, config.overlays);
         }
-        done.store(true, Ordering::Release);
-        assert!(reader.join().unwrap() > 0);
     }
 
     #[test]

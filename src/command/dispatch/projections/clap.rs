@@ -210,9 +210,16 @@ mod tests {
         cmd: &clap::Command,
         path: Vec<String>,
     ) {
+        assert_eq!(
+            cmd.get_name(),
+            path.last().map(String::as_str).unwrap_or("awman")
+        );
         if !path.is_empty() {
             let path_strs: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
-            if let Some(spec) = cat.lookup(&path_strs) {
+            {
+                let spec = cat
+                    .lookup(&path_strs)
+                    .expect("every projected command has a catalogue entry");
                 for arg in cmd.get_arguments() {
                     let id = arg.get_id().as_str();
                     if matches!(id, "help" | "version") {

@@ -1,0 +1,235 @@
+path_or_target	verdict	reason
+target:dockerfile_build (tests/dockerfile_build.rs)	pending-cutover	Retained pending semantic parity and native shadow evidence. 3/3 superseded by boundary templates::the_{claude,codex,opencode}_template_builds (verified present); gate: boundary Docker-runner evidence; remove [[test]] in crates/awman-cli/Cargo.toml together with file
+target:squad_sandbox_refusal (tests/squad_sandbox_refusal.rs)	pending-cutover	Retained pending semantic parity and native shadow evidence. 2/2 superseded by component squad::refusal::sandbox_refusal_precedes_task_allocation_and_every_runtime_call (verified present); gate: daemon-slice P2 shadow/P9 evidence; remove [[test]] in crates/awman-cli/Cargo.toml together with file
+target:engine_tests (tests/engine/main.rs)	retain	85/190 superseded; 105 blocked/pending/retained/unmapped
+target:data_layer (tests/data_layer/main.rs)	retain	24/88 superseded; builtin_network, docs_links, task_store partly retained; config_session_roundtrip, daemon_primitives, squad_paths file-level claims without named tests
+target:command_tests (tests/command/main.rs)	retain	19/39 superseded; layer-2 blocked rest and says do not unregister
+target:daemon_e2e (tests/daemon/main.rs)	retain	5/51 superseded; rest merged with retain-case notes
+target:oci_import (tests/oci_import/main.rs)	retain	4/48 superseded; rest layer-1 pending or boundary retained
+target:builtin_runtime (tests/builtin_runtime/main.rs)	retain	release.yml frozen fallback closure (P4); 3/103 superseded; guest slice: no target closed
+target:api_parity (tests/api_parity/main.rs)	retain	0/329; layer-3 wrote no map
+target:cli_parity (tests/cli_parity/main.rs)	retain	0/52; layer-3 wrote no map
+target:binary_smoke (tests/binary_smoke/main.rs)	retain	0/104; layer-3 no map; awman_binary.rs in release closure
+target:engine_parity (tests/engine_parity/main.rs)	retain	0/17; layer-1 blocked; latency boundary retained
+target:workflow_prerequisites (crates/awman-cli/tests/workflow_prerequisites.rs)	retain	0/15; layer-2 blocked
+target:worker_daemon (tests/worker_daemon.rs)	retain	0/36; daemon merged retain-case
+target:worker_helper (tests/worker_helper.rs)	retain	0/1; daemon merged retain-case
+target:squad_env_sync (tests/squad_env_sync.rs)	retain	4/5 superseded; without_a_daemon_running_refuses_and_if_running_answers_none retained
+target:squad_naming (tests/squad_naming.rs)	retain	0/6; coverage pending
+target:squad_runtime_discovery (tests/squad_runtime_discovery.rs)	retain	0/5; coverage pending
+target:squad_attach (tests/squad_attach.rs)	retain	0/1; coverage pending
+target:squad_status_marker (tests/squad_status_marker.rs)	retain	0/4; coverage pending
+target:squad_scheduler (tests/squad_scheduler.rs)	retain	0/7; merged retain-case
+target:squad_repair_loop (tests/squad_repair_loop.rs)	retain	0/3; merged retain-case
+target:squad_daemon_http (tests/squad_daemon_http.rs)	retain	0/19; coverage pending
+target:squad_daemon_e2e (tests/squad_daemon_e2e.rs)	retain	0/3; coverage pending
+target:squad_tui_tab (tests/squad_tui_tab.rs)	retain	0/13; coverage pending
+target:squad_attach_frontends (tests/squad_attach_frontends.rs)	retain	0/11; coverage pending
+target:squad_blockers (tests/squad_blockers.rs)	retain	0/6; coverage pending
+target:squad_env_cli (tests/squad_env_cli.rs)	retain	0/3; merged retain-case
+target:squad_env_daemon (tests/squad_env_daemon.rs)	retain	0/7; merged retain-case
+target:worker_lease_git (tests/worker_lease_git.rs)	retain	0/4; merged retain-case
+target:worker_push_retry (tests/worker_push_retry.rs)	retain	0/5; merged retain-case
+target:worker_native (tests/worker_native.rs)	retain	0/1; guest slice keep until transferred
+target:worker_pull_auto (tests/worker_pull_auto.rs)	retain	0/6; merged retain-case
+target:worker_events (tests/worker_events.rs)	retain	0/1; merged retain-case
+target:worker_lease_run (tests/worker_lease_run.rs)	retain	0/3; merged retain-case
+target:worker_security (tests/worker_security.rs)	retain	0/2; merged retain-case
+target:worker_mixed (tests/worker_mixed.rs)	retain	0/1; merged retain-case
+target:awman-wsp/client (crates/awman-wsp/tests/client.rs)	retain	0/4; do not retire this case
+target:awman-wsp/conformance (crates/awman-wsp/tests/conformance.rs)	retain	0/20; do not retire this case
+target:awman-wsp/wire_conventions (crates/awman-wsp/tests/wire_conventions.rs)	retain	0/9; do not retire this case
+target:awman-wsp/wire_sync (crates/awman-wsp/tests/wire_sync.rs)	retain	0/1; do not retire this case
+example:builtin_hw_driver (tests/builtin_runtime/hw_driver.rs)	retain	used at runtime by builtin_runtime/hardware.rs; guest slice: remove with legacy call sites together
+example:builtin_net_driver (tests/builtin_runtime/network_resources/driver.rs)	retain	used at runtime by builtin_runtime/network_resources.rs
+tests/engine/container_docker.rs	pending-cutover	Retained pending semantic parity and native shadow evidence. file inside retained engine_tests: 11/11 superseded (boundary docker::*, conformance::real_docker_cli_conforms); remove mod line; gate: boundary evidence
+tests/engine/git_engine.rs	pending-cutover	Retained pending semantic parity and native shadow evidence. file inside retained engine_tests: 17/17 -> tests/component/engine/git.rs (verified present); gate: layer-1 code never compiled
+tests/engine/session_worktree.rs	pending-cutover	Retained pending semantic parity and native shadow evidence. file inside retained engine_tests: 11/11 -> git.rs session_* + hooks_do_not_run...; gate: layer-1 never compiled
+tests/engine/stuck_event_wiring.rs	pending-cutover	Retained pending semantic parity and native shadow evidence. file inside retained engine_tests: 3/3 retired (tokio semantics only)
+tests/engine/workflow_end_to_end.rs	pending-cutover	Retained pending semantic parity and native shadow evidence. file inside retained engine_tests: 23/23 -> src/engine/workflow/tests/definition.rs (wildcard; 8 tests); gate: layer-1 never compiled
+tests/engine/workflow_on_failure.rs	pending-cutover	Retained pending semantic parity and native shadow evidence. file inside retained engine_tests: 8/8 -> phases.rs + component engine::workflow::poll_ci_outside_a_repository_fails_after_the_attempt_banner; gate: layer-1 never compiled
+tests/engine/issue_integration.rs	pending-cutover	Retained pending semantic parity and native shadow evidence. file inside retained engine_tests: 6/6 -> src/engine/issue/naming_tests.rs (wildcard; 3 tests) + 1 retired; gate: layer-1 never compiled
+tests/data_layer/db_migration.rs	pending-cutover	Retained pending semantic parity and native shadow evidence. file inside retained data_layer: 8/8 -> persistence.rs::interrupted_database_migration_recovers_from_legacy_source_and_preserves_backup; N:1, spot-check
+tests/data_layer/home_layout.rs	pending-cutover	Retained pending semantic parity and native shadow evidence. file inside retained data_layer: 2/2 -> config.rs::explicit_home_and_xdg_roots_resolve_independently_without_process_environment
+tests/data_layer/key_table_docs_golden.rs	pending-cutover	Retained pending semantic parity and native shadow evidence. file inside retained data_layer: 1/1 -> config.rs every_key_default_is_valid... / every_key_has_a_deterministic_default...; golden docs comparison not asserted by replacement, reviewer judgement
+tests/data_layer/sqlite_upgrade_compat.rs	pending-cutover	Retained pending semantic parity and native shadow evidence. file inside retained data_layer: 13/13 -> persistence.rs::schema_one_database_keeps_session_and_command_rows_readable; N:1, spot-check
+tests/engine/credential_argv_docker.rs	retain	4/5; docker_file_delivered_credential_secret_is_only_in_staged_file retained
+tests/engine/sbx.rs	retain	2/10; 4 boundary-retained, 4 unmapped (not mine)
+tests/oci_import/real_stores.rs	retain	4/8; tls/mtls/ca-proxy/native-keychain retained (blocked capabilities)
+tests/command/dispatch_real_engines.rs	retain	19/34; 15 blocked
+tests/daemon/browser_auth.rs	retain	2/3; grants_are_refused_on_non_loopback_listeners retained
+tests/daemon/feature_switching.rs	retain	3/8; 5 merged retain-case
+tests/builtin_runtime/hardware.rs	retain	3/12; release closure
+tests/helpers/mod.rs	retain	used by api_parity, binary_smoke, cli_parity, command_tests, data_layer, engine_tests, squad_blockers, squad_status_marker, squad_tui_tab
+tests/helpers/custom_agents.rs	retain	via helpers/mod.rs and directly by builtin_runtime (release closure)
+tests/helpers/api_process.rs	retain	api_parity, binary_smoke, cli_parity, daemon_e2e, engine_parity, squad_daemon_e2e, squad_daemon_http, squad_env_cli, squad_env_sync, worker_daemon, workflow_prerequisites
+tests/helpers/smart_http.rs	retain	worker_daemon, worker_events, worker_helper, worker_lease_git, worker_lease_run, worker_mixed, worker_pull_auto, worker_push_retry, worker_security
+tests/helpers/wsp_lease.rs	retain	worker_events, worker_lease_git, worker_lease_run, worker_mixed, worker_pull_auto, worker_push_retry, worker_security
+tests/helpers/push_api.rs	retain	worker_events, worker_mixed
+tests/helpers/git_daemon.rs	retain	api_parity
+tests/helpers/engine_daemon.rs	retain	engine_parity
+tests/fixtures/workflow_overview/14_sequential.toml	retain	include_str! in squad_attach_frontends
+tests/fixtures/workflow_state/v1.json	retain	only legacy user is tests/engine/workflow_end_to_end.rs; deletable after that file goes and a src/ grep finds no reference
+tests/builtin_runtime/fixtures/msb-catalog-0.7.2.db	retain	builtin_runtime sqlite.rs runtime fixture
+tests/oci_import/support.rs	retain	oci_import + builtin_runtime/acquisition.rs (release closure)
+tests/binary_smoke/awman_binary.rs	retain	binary_smoke + builtin_runtime/main.rs (release closure)
+tests/daemon/support.rs	retain	daemon_e2e module
+tests/worker_native/probe.rs	retain	worker_native + example builtin_hw_driver
+tests/oci_import/corpus/	retain	oci_import corpus.rs (real_corpus_* retained); contents not enumerated (tool outage)
+tests/engine_parity/README.md	retain	documentation of retained engine_parity
+tools/isolated-test.sh	retain	invoked by frozen release.yml (builtin_runtime) until P4
+tools/msb-payloads/fetch.sh	retain	invoked by release.yml
+tools/msb-payloads/verify.sh	retain	invoked by release.yml and fetch.sh
+tools/measure-release-artifact.sh	retain	invoked by release.yml
+tools/macos-sign.sh	retain	invoked by release.yml
+tools/release-artifact-check.sh	retain	invoked by release.yml
+tools/release-upgrade-policy.sh	retain	invoked by release-artifact-check.sh
+crates/awman-cli/tests/workflow_prerequisites.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+crates/awman-wsp/tests/client.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+crates/awman-wsp/tests/conformance.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+crates/awman-wsp/tests/wire_conventions.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+crates/awman-wsp/tests/wire_sync.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/api_parity/auth_modes.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/api_parity/command_lifecycle.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/api_parity/command_log_stream.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/api_parity/command_outputs.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/api_parity/command_queue.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/api_parity/command_results.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/api_parity/frontend_layering.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/api_parity/http_consistency.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/api_parity/http_core.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/api_parity/interaction.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/api_parity/live_server.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/api_parity/main.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/api_parity/remote_session/mod.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/api_parity/remote_session/push.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/api_parity/remote_session/setup.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/api_parity/remote_session/units.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/api_parity/request_validation.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/api_parity/resource_tree.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/api_parity/routes.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/api_parity/session_setup_and_event_bus.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/api_parity/terminals.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/api_parity/trace_propagation.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/api_parity/workdir_allowlist.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/api_parity/workflow_state.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/binary_smoke/agents_docker.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/binary_smoke/agents_review.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/binary_smoke/antigravity_agent.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/binary_smoke/build_cfg.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/binary_smoke/clean_command.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/binary_smoke/cli_subprocess.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/binary_smoke/custom_agents.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/binary_smoke/dynamic_workflow_config.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/binary_smoke/fatal_cli_errors.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/binary_smoke/headless_no_tty.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/binary_smoke/main.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/binary_smoke/overlay_cli.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/binary_smoke/session_worktree.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/binary_smoke/skill_libraries.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/binary_smoke/worker_link.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/builtin_runtime/acquisition.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/builtin_runtime/apple_store.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/builtin_runtime/binary.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/builtin_runtime/builder_native.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/builtin_runtime/custom_agents.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/builtin_runtime/fixture_inventory.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/builtin_runtime/frontends.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/builtin_runtime/gate.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/builtin_runtime/gates.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/builtin_runtime/guest_compat.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/builtin_runtime/hw_driver.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/builtin_runtime/lifecycle.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/builtin_runtime/main.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/builtin_runtime/measure.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/builtin_runtime/network_resources.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/builtin_runtime/network_resources/driver.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/builtin_runtime/release_policy.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/builtin_runtime/runtime_refusal.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/builtin_runtime/sqlite.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/builtin_runtime/state_dir.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/cli_parity/catalogue_completeness.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/cli_parity/config_commands.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/cli_parity/daemon_surface.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/cli_parity/json_outputs.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/cli_parity/link.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/cli_parity/main.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/cli_parity/set_overrides.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/cli_parity/squad_catalogue.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/command/main.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/command/skill_libraries.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/daemon/concurrency.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/daemon/ephemeral_engine.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/daemon/keys.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/daemon/launch_contexts.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/daemon/lifecycle.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/daemon/listeners.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/daemon/local_listener_security.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/daemon/main.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/daemon/network_listener.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/daemon/status_shape.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/data_layer/builtin_network.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/data_layer/config_session_roundtrip.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/data_layer/daemon_primitives.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/data_layer/docs_links.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/data_layer/main.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/data_layer/squad_paths.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/data_layer/task_store.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/dockerfile_build.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/engine/acp_support.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/engine/api_keys.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/engine/container_io.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/engine/context_overlay.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/engine/credential_refresh_integration.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/engine/custom_agents.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/engine/daemon_supervisor.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/engine/env_routing.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/engine/issue_e2e.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/engine/local_listener.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/engine/main.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/engine/network_tls.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/engine/overlay_engine.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/engine/process_env.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/engine/ssh_push_docker.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/engine/yolo_disallowed_tools.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/engine_parity/cli_bytes.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/engine_parity/latency.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/engine_parity/main.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/engine_parity/multi_frontend.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/engine_parity/outcomes.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/engine_parity/security.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/engine_parity/terminal.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/engine_parity/web_frontend.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/engine_parity/web_matrix.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/oci_import/cache_invariants.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/oci_import/cancellation.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/oci_import/corpus.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/oci_import/corpus/build-corpus.sh	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/oci_import/docker_store.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/oci_import/main.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/oci_import/registry_store.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/squad_attach.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/squad_attach_frontends.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/squad_blockers.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/squad_daemon_e2e.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/squad_daemon_http.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/squad_env_cli.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/squad_env_daemon.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/squad_env_sync.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/squad_naming.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/squad_repair_loop.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/squad_runtime_discovery.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/squad_sandbox_refusal.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/squad_scheduler.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/squad_status_marker.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/squad_tui_tab.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/worker_daemon.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/worker_events.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/worker_helper.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/worker_lease_git.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/worker_lease_run.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/worker_mixed.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/worker_native.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/worker_pull_auto.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/worker_push_retry.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.
+tests/worker_security.rs	blocked	Owner: WI 0144 slice maintainer. Retained baseline file; exact semantic successor and platform/shadow evidence have not been established.

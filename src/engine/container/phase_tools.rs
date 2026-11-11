@@ -96,11 +96,11 @@ mod tests {
 
     #[test]
     fn probe_returns_unknown_under_isolation_without_docker_opt_in() {
-        let env = crate::data::config::env::Env::from_process();
-        if !env.test_isolation() || env.test_docker() {
-            return; // only meaningful under tools/isolated-test.sh without AWMAN_TEST_DOCKER
-        }
-        let runtime = ContainerRuntime::docker();
+        // An instance snapshot under isolation without the docker opt-in.
+        let env =
+            crate::data::config::env::EnvSnapshot::with_overrides([("AWMAN_TEST_ISOLATION", "1")]);
+        assert!(env.test_isolation() && !env.test_docker());
+        let runtime = ContainerRuntime::docker_in(env);
         let mut cache = PhaseToolsCache::in_memory();
         let status = probe(&runtime, "any:image", &["git", "gh"], &mut cache);
         assert_eq!(

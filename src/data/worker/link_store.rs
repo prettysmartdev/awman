@@ -56,7 +56,7 @@ impl LinkStore {
                 return Err(DataError::Io {
                     path: self.dir.clone(),
                     source: error,
-                })
+                });
             }
         };
         let mut names = Vec::new();

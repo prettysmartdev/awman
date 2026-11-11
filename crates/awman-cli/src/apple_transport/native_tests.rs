@@ -14,7 +14,7 @@ fn wait(secs: u64) -> (Instant, fn() -> bool) {
 #[test]
 fn apple_native_ping_reports_a_supported_release() {
     if !native_enabled() {
-        return;
+        panic!("BLOCKED[apple-containers]: native Apple service and fixture grants are required");
     }
     let (deadline, stop) = wait(60);
     let reply = NativeXpc
@@ -36,13 +36,14 @@ fn apple_native_ping_reports_a_supported_release() {
         )
         .expect("the Apple Containers API server must answer");
     let release = check_release(&reply).expect("installed release must be supported");
+    assert_eq!(release.build, "release");
     eprintln!("apple container release {release:?}");
 }
 
 #[test]
 fn apple_native_list_returns_image_descriptions() {
     if !native_enabled() {
-        return;
+        panic!("BLOCKED[apple-containers]: native Apple service and fixture grants are required");
     }
     let (deadline, stop) = wait(60);
     let reply = NativeXpc
@@ -69,7 +70,7 @@ fn apple_native_list_returns_image_descriptions() {
 #[test]
 fn apple_native_stop_cancels_an_outstanding_request() {
     if !native_enabled() {
-        return;
+        panic!("BLOCKED[apple-containers]: native Apple service and fixture grants are required");
     }
     let stop = || true;
     let err = NativeXpc.send(
@@ -94,7 +95,7 @@ fn apple_native_stop_cancels_an_outstanding_request() {
 #[test]
 fn apple_native_export_round_trip() {
     if !native_enabled() {
-        return;
+        panic!("BLOCKED[apple-containers]: native Apple service and fixture grants are required");
     }
     use awman::data::config::env::EnvSnapshot;
     use awman::data::config::image_source::{ImageSourceKind, ImageSourceSpec};
@@ -187,7 +188,7 @@ fn staging_entries(state: &std::path::Path) -> Vec<std::path::PathBuf> {
 #[test]
 fn apple_native_cancelled_export_leaves_nothing() {
     if !native_enabled() {
-        return;
+        panic!("BLOCKED[apple-containers]: native Apple service and fixture grants are required");
     }
     use awman::engine::oci::{AcquirePolicy, ImageAcquirer};
     let state = tempfile::tempdir().unwrap();
@@ -238,7 +239,7 @@ fn apple_native_cancelled_export_leaves_nothing() {
 #[test]
 fn apple_native_concurrent_imports_share_one_commit() {
     if !native_enabled() {
-        return;
+        panic!("BLOCKED[apple-containers]: native Apple service and fixture grants are required");
     }
     use awman::engine::oci::{AcquirePolicy, ImageAcquirer};
     let state = tempfile::tempdir().unwrap();
@@ -265,7 +266,7 @@ fn apple_native_concurrent_imports_share_one_commit() {
 #[test]
 fn apple_native_helper_crash_is_retried() {
     if !native_enabled() || std::env::var("AWMAN_TEST_APPLE_KILL_HELPER").as_deref() != Ok("1") {
-        return;
+        panic!("BLOCKED[apple-containers]: native Apple service and fixture grants are required");
     }
     use awman::engine::oci::{AcquirePolicy, ImageAcquirer, RetryPolicy};
     use std::sync::{Arc, Mutex};

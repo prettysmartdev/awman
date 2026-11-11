@@ -266,12 +266,7 @@ async fn parallel_peers_running_control_board_answers_launch_next() {
         step_name: "a".into(),
     })
     .unwrap();
-    for _ in 0..100 {
-        if !boards.lock().unwrap().is_empty() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    eventually("the board to open", || !boards.lock().unwrap().is_empty()).await;
     let board = boards
         .lock()
         .unwrap()

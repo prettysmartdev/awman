@@ -350,7 +350,7 @@ fn decode_hex(input: &str) -> Option<Vec<u8>> {
 
 /// Why a capped keychain call did not produce an answer.
 #[derive(Debug)]
-pub(crate) enum KeychainCallError {
+pub enum KeychainCallError {
     /// The backend's binary is not installed.
     BinaryMissing(String),
     /// The child did not exit within the cap and was killed.
@@ -394,7 +394,10 @@ impl std::fmt::Display for KeychainCallError {
 /// that waits for the exit first deadlocks until the cap kills a backend that
 /// was working: the read that reports the item comes back `Timeout`, the daemon
 /// degrades, and env persistence is silently lost.
-pub(crate) fn run_capped(
+///
+/// Public so the bounded-call contract is tested against real child processes
+/// (component tier); production callers stay inside this module.
+pub fn run_capped(
     cmd: &mut Command,
     stdin: Option<&[u8]>,
     cap: std::time::Duration,
@@ -883,89 +886,6 @@ mod tests {
         }
     }
 
-    /// Remediation of review-security F4 / review-adversarial F8.
-    ///
-    /// The cap has to cover the stdin write, not only the wait. A child that
-    /// never drains its stdin blocks `write_all` as soon as the kernel pipe
-    /// buffer fills (64 KiB on Linux), and with the deadline established after
-    /// the write the kill-at-expiry path was unreachable: the call blocked
-    /// forever, `call_with_cap` detached its thread, and the thread and the
-    /// child both leaked for the life of the daemon.
-    #[test]
-    #[cfg(unix)]
-    fn run_capped_times_out_on_a_child_that_never_reads_its_stdin() {
-        // Far larger than any pipe buffer, so `write_all` is guaranteed to
-        // block on a child that reads nothing.
-        let payload = vec![b'x'; 512 * 1024];
-        let cap = std::time::Duration::from_millis(300);
-
-        let mut cmd = Command::new("/bin/sh");
-        cmd.args(["-c", "sleep 30"]);
-
-        let started = std::time::Instant::now();
-        let outcome = run_capped(&mut cmd, Some(&payload), cap);
-        let elapsed = started.elapsed();
-
-        assert!(
-            matches!(outcome, Err(KeychainCallError::Timeout)),
-            "a child that never drains stdin must time out, not block: {outcome:?}"
-        );
-        assert!(
-            elapsed < cap * 10,
-            "the cap must bound the whole call including the write; took {elapsed:?}"
-        );
-    }
-
-    /// The other half of the same rule: the cap has to cover the child's
-    /// *output* too. `security find-generic-password -w` prints the whole
-    /// stored payload on stdout, and the daemon's payload is every value it
-    /// holds — nothing bounds it to a pipe buffer. A child whose output
-    /// exceeds that buffer cannot exit until someone drains it, so a reader
-    /// that only starts once `try_wait` reports an exit can never start: the
-    /// call spends the whole cap deadlocked and then reports `Timeout`, and a
-    /// daemon that reads its own item back degrades and loses persistence.
-    #[test]
-    #[cfg(unix)]
-    fn run_capped_reads_back_a_payload_larger_than_a_pipe_buffer() {
-        // 256 KiB of output: four times a Linux pipe buffer, and a plausible
-        // size for a stored map holding one PEM key or service-account blob.
-        let want = 256 * 1024;
-        let mut cmd = Command::new("/bin/sh");
-        cmd.args(["-c", &format!("head -c {want} /dev/zero")]);
-
-        let started = std::time::Instant::now();
-        let out = run_capped(&mut cmd, None, std::time::Duration::from_secs(5))
-            .expect("a child that writes more than a pipe buffer must not time out");
-        assert!(out.status.success());
-        assert_eq!(
-            out.stdout.len(),
-            want,
-            "every byte the backend printed must be read back"
-        );
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(2),
-            "the read must not wait out the cap; took {:?}",
-            started.elapsed()
-        );
-    }
-
-    /// The ordinary path still round-trips a payload larger than a pipe buffer
-    /// through a child that *does* read it, so the writer-thread change did not
-    /// turn a working call into a truncated one.
-    #[test]
-    #[cfg(unix)]
-    fn run_capped_feeds_a_draining_child_a_payload_larger_than_a_pipe_buffer() {
-        let payload = vec![b'x'; 256 * 1024];
-        let mut cmd = Command::new("/bin/sh");
-        cmd.args(["-c", "wc -c"]);
-
-        let out = run_capped(&mut cmd, Some(&payload), std::time::Duration::from_secs(5))
-            .expect("a draining child must succeed");
-        assert!(out.status.success());
-        assert_eq!(
-            String::from_utf8_lossy(&out.stdout).trim(),
-            payload.len().to_string(),
-            "every byte must reach the child"
-        );
-    }
+    // `run_capped` against real children (stdin never drained, output larger
+    // than a pipe buffer, a draining child): tests/component/engine/auth.rs.
 }

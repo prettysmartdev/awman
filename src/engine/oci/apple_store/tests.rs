@@ -42,6 +42,8 @@ struct Fake {
     calls: Mutex<Vec<(String, String)>>,
     /// The last save request's fields.
     saved: Mutex<BTreeMap<String, XpcValue>>,
+    /// Told once when a `Hang` save starts waiting (an event to act on).
+    hanging: Mutex<Option<std::sync::mpsc::Sender<()>>>,
 }
 
 impl Fake {
@@ -55,6 +57,7 @@ impl Fake {
             save,
             calls: Mutex::new(Vec::new()),
             saved: Mutex::new(BTreeMap::new()),
+            hanging: Mutex::new(None),
         }
     }
 
@@ -129,15 +132,22 @@ impl XpcTransport for Fake {
                         );
                     }
                     Save::Fail(f) => return Err(f.clone()),
-                    Save::Hang => loop {
-                        if (wait.stop)() {
-                            return Err(XpcFailure::Stopped);
+                    Save::Hang => {
+                        if let Some(hanging) = self.hanging.lock().unwrap().take() {
+                            let _ = hanging.send(());
                         }
-                        if Instant::now() >= wait.deadline {
-                            return Err(XpcFailure::TimedOut);
+                        // Spin (no sleep) until the caller stops or the
+                        // export's own deadline passes.
+                        loop {
+                            if (wait.stop)() {
+                                return Err(XpcFailure::Stopped);
+                            }
+                            if Instant::now() >= wait.deadline {
+                                return Err(XpcFailure::TimedOut);
+                            }
+                            std::thread::yield_now();
                         }
-                        std::thread::sleep(Duration::from_millis(5));
-                    },
+                    }
                 }
             }
             other => panic!("unexpected request {other:?}"),
@@ -648,10 +658,13 @@ fn cancellation_reaches_an_outstanding_export() {
         serde_json::json!([entry("awman-x-claude:latest", &digest('a'), INDEX)]),
         Save::Hang,
     ));
+    let (hanging_tx, hanging_rx) = std::sync::mpsc::channel();
+    *fake.hanging.lock().unwrap() = Some(hanging_tx);
     let acq = acquirer(state.path(), fake);
     let token = acq.cancel_token();
+    // Cancel once the export is outstanding (an event, not a delay).
     let canceller = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(50));
+        let _ = hanging_rx.recv_timeout(Duration::from_secs(20));
         token.cancel();
     });
     let err = acq.acquire(&request(), &mut |_| {}).unwrap_err();

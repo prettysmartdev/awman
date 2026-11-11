@@ -996,10 +996,13 @@ fn horizontal_offset_is_clamped_after_width_and_column_count_shrink() {
 
 #[test]
 fn panic_log_path_lives_under_awman_home() {
-    // Skip on hosts with no resolvable home dir (the hook no-ops there).
-    if let Some(log) = crate::frontend::tui::event_loop::panic_log() {
+    {
+        let log = crate::frontend::tui::event_loop::panic_log()
+            .expect("private HOME resolves a panic log");
         assert!(
-            log.path().ends_with(".awman/panic.log"),
+            log.path()
+                .file_name()
+                .is_some_and(|name| name == "panic.log"),
             "panic log must live in the awman data dir: {}",
             log.path().display()
         );

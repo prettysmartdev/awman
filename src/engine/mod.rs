@@ -14,6 +14,7 @@ pub mod agent_output;
 pub mod agent_runtime;
 pub mod aspec;
 pub mod auth;
+pub mod conformance;
 pub mod container;
 pub mod context_prompt;
 pub mod credential_refresh;

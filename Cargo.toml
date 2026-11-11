@@ -1,5 +1,8 @@
 [workspace]
-members = [".", "crates/awman-cli", "crates/awman-host-shims", "crates/awman-wsp"]
+# `crates/awman-test-support` (dev-only test infrastructure) and `xtask`
+# (gate manifest, evidence and release tooling; run with `cargo xtask`) are
+# members but not default members: neither is part of the shipped binary.
+members = [".", "crates/awman-cli", "crates/awman-host-shims", "crates/awman-wsp", "crates/awman-test-support", "xtask"]
 default-members = [".", "crates/awman-cli", "crates/awman-host-shims", "crates/awman-wsp"]
 resolver = "2"
 
@@ -23,6 +26,8 @@ version = "0.13.0"
 awman = { path = "." }
 awman-host-shims = { path = "crates/awman-host-shims" }
 awman-wsp = { path = "crates/awman-wsp" }
+# Dev-only test infrastructure: a `[dev-dependencies]` entry wherever it is used.
+awman-test-support = { path = "crates/awman-test-support" }
 
 anyhow = "1"
 tracing = "0.1"
@@ -79,6 +84,15 @@ hyper-rustls = { version = "0.27", default-features = false, features = ["http1"
 nix = "0.31"
 libc = "0.2"
 wiremock = "0.6"
+# Test and tooling crates (WI 0144), pinned exactly so an upgrade is a reviewed
+# commit. Used only by dev-dependencies, `awman-test-support` and `xtask`.
+proptest = "=1.12.0"
+insta = "=1.49.0"
+roxmltree = "=0.21.2"
+syn = { version = "2", features = ["full", "visit"] }
+windows-sys = "0.61"
+# Safe signal handling for the release operator (xtask; design 16.6).
+signal-hook = "0.3"
 
 # Built-in runtime SDK pins. These exact versions must match `MSB_VERSION` in
 # `src/data/builtin_runtime.rs` and the vendored crates under `third_party/`;
@@ -191,6 +205,11 @@ awman = { path = ".", features = ["test-support"] }
 tokio ={ workspace = true, features = ["test-util"] }
 reqwest = { workspace = true }
 wiremock = { workspace = true }
+# WI 0144: the support crate never depends on `awman`, so inline unit tests can
+# use it without a second copy of the library's types.
+awman-test-support = { workspace = true }
+proptest = { workspace = true }
+insta = { workspace = true }
 
 # ── WI 0143 worker end-to-end tests ──────────────────────────────────────────
 # Registered on the library package (autotests = false above) so they link the

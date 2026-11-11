@@ -743,9 +743,13 @@ mod tests {
             session,
         );
         let result = cmd.run_with_frontend(Box::new(FakeSpecsFrontend)).await;
-        if let Err(crate::command::error::CommandError::WorkItemNotFound { .. }) = &result {
-            panic!("file lookup must succeed for an existing work item: {result:?}");
-        }
+        assert!(
+            !matches!(
+                &result,
+                Err(crate::command::error::CommandError::WorkItemNotFound { .. })
+            ),
+            "file lookup must succeed for an existing work item: {result:?}"
+        );
     }
 
     #[tokio::test]

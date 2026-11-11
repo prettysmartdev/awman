@@ -1122,7 +1122,11 @@ async fn open_control_board_mid_step_does_not_cancel_container() {
         &session,
         workflow,
         factory,
-        [NextAction::Dismiss, NextAction::LaunchNext],
+        [
+            NextAction::Dismiss,
+            NextAction::Dismiss,
+            NextAction::LaunchNext,
+        ],
         engine_tx.clone(),
     );
 
@@ -1140,9 +1144,14 @@ async fn open_control_board_mid_step_does_not_cancel_container() {
     })
     .unwrap();
     wait_for_boards(&boards, 1).await;
-    // Deliberate "nothing happens" window: a (wrong) cancel would follow
-    // the Dismiss at once.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Barrier, not a delay: requests are handled in order, so once the
+    // second board (answered Dismiss) has been shown the engine has finished
+    // acting on the first answer. A (wrong) cancel would be visible by now.
+    tx.send(EngineRequest::OpenControlBoard {
+        step_name: String::new(),
+    })
+    .unwrap();
+    wait_for_boards(&boards, 2).await;
 
     assert!(
         !cancel_flag.load(Ordering::Relaxed),
@@ -1181,7 +1190,11 @@ async fn mid_step_dismiss_resumes_waiting_on_step() {
         &session,
         workflow,
         factory,
-        [NextAction::Dismiss, NextAction::LaunchNext],
+        [
+            NextAction::Dismiss,
+            NextAction::Dismiss,
+            NextAction::LaunchNext,
+        ],
         engine_tx.clone(),
     );
     let tx = engine_tx.lock().unwrap().clone().unwrap();
@@ -1194,9 +1207,14 @@ async fn mid_step_dismiss_resumes_waiting_on_step() {
     })
     .unwrap();
     wait_for_boards(&boards, 1).await;
-    // Deliberate "nothing happens" window: a (wrong) cancel would follow
-    // the Dismiss at once.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Barrier, not a delay: requests are handled in order, so once the
+    // second board (answered Dismiss) has been shown the engine has finished
+    // acting on the first answer. A (wrong) cancel would be visible by now.
+    tx.send(EngineRequest::OpenControlBoard {
+        step_name: String::new(),
+    })
+    .unwrap();
+    wait_for_boards(&boards, 2).await;
 
     assert!(!cancel_flag.load(Ordering::Relaxed));
 
@@ -1426,7 +1444,11 @@ async fn step_stuck_in_non_yolo_mode_shows_wcb() {
         &session,
         workflow,
         factory,
-        [NextAction::Dismiss, NextAction::LaunchNext],
+        [
+            NextAction::Dismiss,
+            NextAction::Dismiss,
+            NextAction::LaunchNext,
+        ],
         engine_tx.clone(),
     );
     // Not yolo mode.
@@ -1441,9 +1463,14 @@ async fn step_stuck_in_non_yolo_mode_shows_wcb() {
     })
     .unwrap();
     wait_for_boards(&boards, 1).await;
-    // Deliberate "nothing happens" window: a (wrong) cancel would follow
-    // the Dismiss at once.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Barrier, not a delay: requests are handled in order, so once the
+    // second board (answered Dismiss) has been shown the engine has finished
+    // acting on the first answer. A (wrong) cancel would be visible by now.
+    tx.send(EngineRequest::OpenControlBoard {
+        step_name: String::new(),
+    })
+    .unwrap();
+    wait_for_boards(&boards, 2).await;
 
     // Step still running (Dismiss was chosen).
     assert!(!cancel_flag.load(Ordering::Relaxed));
@@ -1479,6 +1506,7 @@ async fn step_unstuck_during_yolo_countdown_keeps_step_running() {
         engine_tx: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<EngineRequest>>>>,
         step_statuses: Mutex<Vec<(String, WorkflowStepStatus)>>,
         ticks: Arc<AtomicUsize>,
+        countdown_finished: Arc<AtomicBool>,
     }
     impl crate::data::message::UserMessageSink for UnstuckTestFrontend {
         fn write_message(&mut self, _: crate::data::message::UserMessage) {}
@@ -1506,6 +1534,9 @@ async fn step_unstuck_during_yolo_countdown_keeps_step_running() {
             self.ticks.fetch_add(1, Ordering::Relaxed);
             Ok(YoloTickOutcome::Continue)
         }
+        fn yolo_countdown_finished(&mut self, _: &str) {
+            self.countdown_finished.store(true, Ordering::Relaxed);
+        }
         fn confirm_resume(&mut self, _: &ResumeMismatch) -> Result<bool, EngineError> {
             Ok(true)
         }
@@ -1523,11 +1554,13 @@ async fn step_unstuck_during_yolo_countdown_keeps_step_running() {
         }
     }
     let ticks = Arc::new(AtomicUsize::new(0));
+    let countdown_finished = Arc::new(AtomicBool::new(false));
     let frontend = UnstuckTestFrontend {
         actions: Mutex::new(VecDeque::from([NextAction::FinishWorkflow])),
         engine_tx: engine_tx.clone(),
         step_statuses: Mutex::new(Vec::new()),
         ticks: ticks.clone(),
+        countdown_finished: countdown_finished.clone(),
     };
 
     let factory = BlockingFactory::new([
@@ -1557,24 +1590,25 @@ async fn step_unstuck_during_yolo_countdown_keeps_step_running() {
         step_name: String::new(),
     })
     .unwrap();
-    // Let the countdown run a tick or two without expiring.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while ticks.load(Ordering::Relaxed) < 2 {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the countdown never ticked"
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    // The countdown is running once it has ticked.
+    eventually("the countdown to tick", || {
+        ticks.load(Ordering::Relaxed) >= 1
+    })
+    .await;
     // Container produced output again — recovery signal.
     tx.send(EngineRequest::StepUnstuck {
         step_name: String::new(),
     })
     .unwrap();
-    // Deliberate "nothing happens" window: if the engine were mistakenly
-    // advancing the step on Unstuck, step "b" would launch in it. Cancel-flag-a
-    // must still be false (step "a" still running, NOT cancelled by Advanced).
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Event, not a delay: the engine reports the countdown finished once it
+    // has handled StepUnstuck. A (wrong) advance would have cancelled 'a' or
+    // launched 'b' in that same handling.
+    wait_for_flag(&countdown_finished, "the countdown to be reported finished").await;
+    assert_eq!(
+        execution_count.load(Ordering::Relaxed),
+        1,
+        "'b' must not launch"
+    );
     assert!(
         !cancel_flag_a.load(Ordering::Relaxed),
         "StepUnstuck during countdown must NOT cancel step 'a' — it must keep running"
@@ -1603,11 +1637,11 @@ async fn step_unstuck_outside_countdown_is_ignored() {
     let engine_tx: Arc<Mutex<Option<_>>> = Arc::new(Mutex::new(None));
     let factory = BlockingFactory::new([(Arc::new(AtomicBool::new(false)), completion.clone())]);
     let execution_count = factory.execution_count.clone();
-    let (mut engine, _container_exits, _boards) = make_capturing_engine(
+    let (mut engine, _container_exits, boards) = make_capturing_engine(
         &session,
         workflow,
         factory,
-        [NextAction::LaunchNext],
+        [NextAction::Dismiss, NextAction::LaunchNext],
         engine_tx.clone(),
     );
 
@@ -1621,9 +1655,18 @@ async fn step_unstuck_outside_countdown_is_ignored() {
         step_name: String::new(),
     })
     .unwrap();
-    // Deliberate "nothing happens" window: let the engine see the stray
-    // StepUnstuck while "a" is still running.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Barrier, not a delay: requests are handled in order, so once the board
+    // (answered Dismiss) has been shown the stray StepUnstuck was handled.
+    tx.send(EngineRequest::OpenControlBoard {
+        step_name: String::new(),
+    })
+    .unwrap();
+    wait_for_boards(&boards, 1).await;
+    assert_eq!(
+        execution_count.load(Ordering::Relaxed),
+        1,
+        "'b' must not launch"
+    );
 
     signal_completion(&completion, 0);
     let result = engine_task.await.unwrap().unwrap();

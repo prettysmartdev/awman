@@ -342,6 +342,19 @@ mod tests {
             .expect("open")
     }
 
+    // Channel ordering is the acknowledgement: this reply follows every input
+    // already sent, so absence assertions never depend on a guessed delay.
+    async fn input_barrier(server: &mut Server) {
+        server
+            .input
+            .send(LeaseTerminalFrame {
+                terminal_id: "barrier".into(),
+                frame: WireFrame::TakeControl,
+            })
+            .unwrap();
+        assert_eq!(next_frame(server).await.terminal_id, "barrier");
+    }
+
     fn start(
         hub: &Arc<TerminalHub>,
         owner: &TerminalOwner,
@@ -371,7 +384,6 @@ mod tests {
         let snap = next_frame(&mut server).await;
         assert_eq!(snap.terminal_id, first.id().to_string());
         assert!(matches!(snap.frame, WireFrame::Snapshot { .. }));
-        tokio::time::sleep(Duration::from_millis(20)).await;
         let (second, _rx2) = register(&hub, &owner);
         let snap = next_frame(&mut server).await;
         assert_eq!(snap.terminal_id, second.id().to_string());
@@ -416,7 +428,7 @@ mod tests {
                 error: "remote input is not allowed for this lease".into()
             }
         );
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        input_barrier(&mut server).await;
         assert!(
             server.frames.try_recv().is_err(),
             "refusal is answered once per terminal"
@@ -495,7 +507,7 @@ mod tests {
                 refused,
                 "lease={lease_allows} worker={worker}"
             );
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            input_barrier(&mut server).await;
             assert!(
                 stdin.try_recv().is_err(),
                 "lease={lease_allows} worker={worker}"

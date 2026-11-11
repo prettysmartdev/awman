@@ -28,7 +28,7 @@ pub(crate) const TAG: &str = "awman-hw/fixture:latest";
 
 pub fn driver_path() -> PathBuf {
     // Cargo puts examples next to the binaries: target/<profile>/examples/.
-    Path::new(env!("CARGO_BIN_EXE_awman"))
+    Path::new(awman_test_support::cargo_bin!("awman"))
         .parent()
         .expect("target dir")
         .join("examples")

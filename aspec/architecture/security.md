@@ -132,3 +132,22 @@ untrusted diagnostics, and the process group is cleaned up on every exit. Tokens
 stay in secret-typed launch overrides until the runtime child environment is
 constructed; runs holding token grants use filtered phase streams, including
 CLI/TUI, so raw terminal or attach output cannot precede redaction.
+
+### WI 0144 test and release execution boundaries
+
+Temporary release runners register only into an organization group whose
+server-reported workflow allowlist matches the selected protected-main release
+path. Labels serve scheduling only. Repository allocation, branch/environment
+protection, tag rulesets, account isolation, and native teardown remain explicit
+administrator/hardware cutover obligations; source checks cannot certify them.
+
+The test supervisor rejects registered host keychain/clipboard/agent names before
+checking ordinary executable allowlists, and still examines registered
+interpreter arguments. Only explicit FakeCli installations receive the separate
+fake provenance exception. This is a test discipline guard, not a transitive
+execution sandbox: a permitted native executable can start other executables.
+Linux session creation is constrained and escaped children retaining private
+root environment values are detected, killed with PID creation-time checks and
+reported as leaks. A hostile program that erases ownership data requires a
+kernel containment boundary. macOS and Windows containment/kill recovery must be
+validated on native runners before release cutover.

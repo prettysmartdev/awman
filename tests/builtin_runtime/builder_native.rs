@@ -114,7 +114,7 @@ fn builtin_gate(test: &str) -> Option<PathBuf> {
     }
     let binary = std::env::var_os("AWMAN_TEST_BUILTIN_ARTIFACT")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_awman")));
+        .unwrap_or_else(|| PathBuf::from(awman_test_support::cargo_bin!("awman")));
     if !binary.is_file() {
         return blocked(
             test,

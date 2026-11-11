@@ -6,14 +6,13 @@
 //! grants turned into container env/mounts by the overlay engine).
 //!
 //! Hermetic: the repository and home are temp dirs, the token variables are
-//! test-only names held under `ProcessEnvGuard`, test isolation keeps the
+//! test-only names carried in each session snapshot; test isolation keeps the
 //! container runtime, `gh` and GitHub verification out of reach, and nothing
 //! sleeps.
 
 use super::*;
 use crate::command::dispatch::{catalogue::FrontendKind, Engines};
 use crate::command::error::CommandError;
-use crate::data::config::env::ProcessEnvGuard;
 use crate::data::config::flags::*;
 use crate::data::config::workflows::*;
 use crate::data::message::{UserMessage, UserMessageSink};
@@ -184,7 +183,37 @@ fn flow_at(
     flags: PrerequisiteFlags,
     policy: PrerequisitePolicy,
 ) -> WorkflowPrerequisiteFlow {
-    let session = Session::for_tests_isolated(root, root);
+    flow_at_env(root, kind, flags, policy, None)
+}
+
+fn flow_at_with_token(
+    root: &Path,
+    kind: FrontendKind,
+    flags: PrerequisiteFlags,
+    policy: PrerequisitePolicy,
+) -> WorkflowPrerequisiteFlow {
+    flow_at_env(root, kind, flags, policy, Some(TOKEN_VALUE))
+}
+
+fn flow_at_env(
+    root: &Path,
+    kind: FrontendKind,
+    flags: PrerequisiteFlags,
+    policy: PrerequisitePolicy,
+    token: Option<&str>,
+) -> WorkflowPrerequisiteFlow {
+    let mut values = vec![
+        ("HOME", root.to_str().unwrap()),
+        ("AWMAN_HOME", root.to_str().unwrap()),
+        ("AWMAN_TEST_ISOLATION", "1"),
+    ];
+    if let Some(token) = token {
+        values.push((TOKEN_VAR, token));
+    }
+    let session = Session::for_tests_with_env(
+        root,
+        crate::data::config::env::EnvSnapshot::with_overrides(values),
+    );
     let mut options = WorkflowPrerequisiteFlowOptions::for_session(
         &session,
         kind,
@@ -231,10 +260,6 @@ fn identity_need() -> PrerequisiteNeed {
         WorkflowPrerequisite::GitIdentity,
         PrerequisiteStepKind::CommitChanges,
     )
-}
-
-fn token_env() -> ProcessEnvGuard {
-    ProcessEnvGuard::acquire(&[TOKEN_VAR])
 }
 
 fn status_of(report: &WorkflowPrerequisiteReport, p: &WorkflowPrerequisite) -> PrerequisiteStatus {
@@ -307,7 +332,6 @@ fn walk(dir: &Path) -> Vec<PathBuf> {
 
 #[test]
 fn interactive_prepare_reviews_first_then_grants_and_injects_identity_and_token() {
-    let _env = token_env();
     std::env::remove_var(TOKEN_VAR);
     let repo = Repo::new(Some("https://github.com/o/r.git"));
     let flow = flow_at(
@@ -425,11 +449,9 @@ fn interactive_prepare_reviews_first_then_grants_and_injects_identity_and_token(
 
 #[test]
 fn a_remembered_env_token_is_granted_on_later_runs_without_asking() {
-    let _env = token_env();
-    std::env::set_var(TOKEN_VAR, TOKEN_VALUE);
     let repo = Repo::new(Some("https://github.com/o/r.git"));
     let run = |fe: &mut Scripted, policy: PrerequisitePolicy| {
-        flow_at(
+        flow_at_with_token(
             repo.root(),
             FrontendKind::Cli,
             PrerequisiteFlags::default(),
@@ -483,14 +505,12 @@ fn a_remembered_env_token_is_granted_on_later_runs_without_asking() {
 
 #[test]
 fn consent_for_this_run_only_is_not_remembered() {
-    let _env = token_env();
-    std::env::set_var(TOKEN_VAR, TOKEN_VALUE);
     let repo = Repo::new(Some("https://github.com/o/r.git"));
     let mut fe = Scripted::interactive(Script {
         token_consent: [TokenConsent::ThisRun].into(),
         ..Default::default()
     });
-    let prepared = flow_at(
+    let prepared = flow_at_with_token(
         repo.root(),
         FrontendKind::Cli,
         PrerequisiteFlags::default(),
@@ -504,15 +524,13 @@ fn consent_for_this_run_only_is_not_remembered() {
 
 #[test]
 fn declining_env_consent_falls_through_to_the_source_question() {
-    let _env = token_env();
-    std::env::set_var(TOKEN_VAR, TOKEN_VALUE);
     let repo = Repo::new(Some("https://github.com/o/r.git"));
     let mut fe = Scripted::interactive(Script {
         token_consent: [TokenConsent::Decline].into(),
         token_source: [TokenSourceChoice::Decline].into(),
         ..Default::default()
     });
-    let prepared = flow_at(
+    let prepared = flow_at_with_token(
         repo.root(),
         FrontendKind::Cli,
         PrerequisiteFlags::default(),
@@ -537,7 +555,6 @@ fn declining_env_consent_falls_through_to_the_source_question() {
 
 #[test]
 fn headless_prepare_never_asks_and_shows_the_decided_report() {
-    let _env = token_env();
     std::env::remove_var(TOKEN_VAR);
     let repo = Repo::new(Some("https://github.com/o/r.git"));
     let mut fe = Scripted::default();
@@ -585,7 +602,6 @@ fn headless_prepare_never_asks_and_shows_the_decided_report() {
 
 #[test]
 fn stopping_at_the_review_asks_nothing() {
-    let _env = token_env();
     std::env::remove_var(TOKEN_VAR);
     let repo = Repo::new(Some("https://github.com/o/r.git"));
     let mut fe = Scripted::interactive(Script::default());
@@ -605,8 +621,6 @@ fn stopping_at_the_review_asks_nothing() {
 
 #[test]
 fn token_flags_decide_without_asking_even_on_a_tty() {
-    let _env = token_env();
-    std::env::set_var(TOKEN_VAR, TOKEN_VALUE);
     let repo = Repo::new(Some("https://github.com/o/r.git"));
     let token = WorkflowPrerequisite::GitHubToken {
         host: "github.com".into(),
@@ -617,7 +631,7 @@ fn token_flags_decide_without_asking_even_on_a_tty() {
             token: Some(flag),
             ..Default::default()
         };
-        let prepared = flow_at(repo.root(), FrontendKind::Cli, flags, base_policy())
+        let prepared = flow_at_with_token(repo.root(), FrontendKind::Cli, flags, base_policy())
             .prepare(&needs(vec![token_need()]), &mut fe)
             .unwrap();
         assert!(fe.asked.is_empty(), "{:?}", fe.asked);
@@ -654,7 +668,6 @@ fn token_flags_decide_without_asking_even_on_a_tty() {
 
 #[test]
 fn invalid_pasted_tokens_are_retried_then_declined() {
-    let _env = token_env();
     std::env::remove_var(TOKEN_VAR);
     let repo = Repo::new(Some("https://github.com/o/r.git"));
     let mut fe = Scripted::interactive(Script {
@@ -706,7 +719,6 @@ fn invalid_pasted_tokens_are_retried_then_declined() {
 
 #[test]
 fn an_invalid_entered_identity_is_declined_with_a_warning() {
-    let _env = token_env();
     let repo = Repo::new(Some("https://github.com/o/r.git"));
     let mut fe = Scripted::interactive(Script {
         identity: [IdentityChoice::Enter].into(),
@@ -748,7 +760,6 @@ fn an_invalid_entered_identity_is_declined_with_a_warning() {
 
 #[test]
 fn a_missing_remote_is_a_gap_the_person_may_abort_on() {
-    let _env = token_env();
     let repo = Repo::new(None);
     let remote_need = || {
         needs(vec![need(
@@ -793,7 +804,6 @@ fn a_missing_remote_is_a_gap_the_person_may_abort_on() {
 
 #[test]
 fn one_declined_token_covers_the_https_push_check_too() {
-    let _env = token_env();
     std::env::remove_var(TOKEN_VAR);
     let repo = Repo::new(Some("https://github.com/o/r.git"));
     let mut flow = flow_at(

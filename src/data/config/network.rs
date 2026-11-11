@@ -207,7 +207,9 @@ impl fmt::Display for ListenerTransport {
 #[serde(try_from = "String", into = "String")]
 pub struct BrowserOrigin(String);
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("invalid origin {0:?}; exact origin like https://host or http://localhost:3000; no wildcard, null, path or userinfo")]
+#[error(
+    "invalid origin {0:?}; exact origin like https://host or http://localhost:3000; no wildcard, null, path or userinfo"
+)]
 pub struct BrowserOriginError(String);
 impl BrowserOrigin {
     pub fn parse(input: &str) -> Result<Self, BrowserOriginError> {

@@ -801,8 +801,13 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn failed_squad_preparation_leaves_config_capacity_and_other_features_unchanged() {
         let (_dir, r) = fixture(true, true).await;
-        let db = rusqlite::Connection::open(r.core.data_paths().db_path()).unwrap();
-        db.execute_batch("BEGIN IMMEDIATE").unwrap();
+        // test_core uses an in-memory shared connection. Refuse the real squad
+        // preparation query, rather than locking an unrelated on-disk database.
+        let db = r.core.session_store().shared_connection();
+        db.lock()
+            .unwrap()
+            .execute_batch("ALTER TABLE squad_runs RENAME TO refused_squad_runs")
+            .unwrap();
         let mut value = r.config().value().clone();
         value["daemon"]["maxConcurrentJobs"] = serde_json::json!(9);
         value["daemon"]["network"]["listeners"]["default"]["enabled"] = serde_json::json!(true);
@@ -823,7 +828,10 @@ mod tests {
         assert_eq!(r.core.executor().snapshot().cap, 4);
         assert_eq!(r.feature_state(FeatureName::Engine).state, FeatureState::On);
         assert_eq!(r.feature_state(FeatureName::Squad).state, FeatureState::Off);
-        db.execute_batch("ROLLBACK").unwrap();
+        db.lock()
+            .unwrap()
+            .execute_batch("ALTER TABLE refused_squad_runs RENAME TO squad_runs")
+            .unwrap();
         r.shutdown(StopMode::Now).await;
     }
     #[tokio::test]

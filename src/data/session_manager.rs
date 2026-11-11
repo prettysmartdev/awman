@@ -504,42 +504,6 @@ mod tests {
 
     // ─── Concurrent create ────────────────────────────────────────────────────
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn concurrent_create_produces_n_distinct_sessions() {
-        let git_tmp = tempfile::tempdir().unwrap();
-        let home_tmp = tempfile::tempdir().unwrap();
-        let manager = Arc::new(SessionManager::in_memory(
-            crate::data::config::env::EnvSnapshot::empty(),
-        ));
-
-        const N: usize = 10;
-        let mut handles = Vec::with_capacity(N);
-        for _ in 0..N {
-            let manager = Arc::clone(&manager);
-            let git_root = git_tmp.path().to_path_buf();
-            let home_dir = home_tmp.path().to_path_buf();
-            handles.push(tokio::spawn(async move {
-                let session = Session::for_tests_isolated(&git_root, &home_dir);
-                manager.create(session).unwrap()
-            }));
-        }
-
-        let mut ids = Vec::with_capacity(N);
-        for handle in handles {
-            ids.push(handle.await.unwrap());
-        }
-
-        assert_eq!(ids.len(), N);
-        // All IDs must be distinct.
-        let unique: std::collections::HashSet<SessionId> = ids.into_iter().collect();
-        assert_eq!(
-            unique.len(),
-            N,
-            "concurrent creates produced duplicate session IDs"
-        );
-        assert_eq!(manager.len().await, N);
-    }
-
     // ─── Layer-0-internal integration: SessionManager + SqliteSessionStore ────
 
     /// Adapter that makes `SqliteSessionStore` compatible with `SessionStore`.

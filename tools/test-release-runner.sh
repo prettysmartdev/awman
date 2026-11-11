@@ -18,6 +18,7 @@ export AWMAN_RELEASE_RUNNER_HOME="$scratch/home"
 export AWMAN_RELEASE_OPT_DIR="$opt"
 export AWMAN_RELEASE_RUNNER_WORK="$scratch/work"
 export AWMAN_RELEASE_RUNNER_ONLINE_TIMEOUT=10
+export AWMAN_RELEASE_RUNNER_GROUP_ID=7
 # Prebuilt guest archives, so provisioning needs no container engine.
 echo base > "$scratch/fixtures/base.tar"
 echo fixture-v1 > "$scratch/fixtures/fixture-oci.tar"
@@ -67,6 +68,7 @@ case "$args" in
         printf '%s\n' "- actions-runner-osx-arm64-9.9.9.tar.gz <!-- BEGIN SHA osx-arm64 -->${sha}<!-- END SHA osx-arm64 -->"
       fi
     fi ;;
+  "api orgs/o/actions/runner-groups/7 --jq "*) echo release-trusted ;;
   *registration-token*) echo regtok ;;
   *remove-token*) echo rmtok ;;
   "api repos/o/r/actions/runners --paginate -q "*'index("hypervisor")'*)
@@ -175,7 +177,7 @@ check "verify-archive does not register a runner" bash -c '! grep -q registratio
 reset
 check "up registers and starts the runner" bash -c 'bash "$0" up o/r v1.2.3 >/dev/null' "$script"
 check "registers with the hypervisor label, a release name and the repo URL" \
-  logged "config.sh --unattended --url https://github.com/o/r --name awman-release-v1.2.3-mac --labels hypervisor --work $AWMAN_RELEASE_RUNNER_WORK --replace --disableupdate token=regtok"
+  logged "config.sh --unattended --url https://github.com/o --runnergroup release-trusted --name awman-release-v1.2.3-mac --labels hypervisor --work $AWMAN_RELEASE_RUNNER_WORK --replace --disableupdate token=regtok"
 check "the registration token is never a command-line argument" bash -c '! grep -q -- --token "$0"' "$log"
 check "the work directory it creates is private" \
   bash -c '[ "$(ls -ld "$0" | cut -c1-10)" = drwx------ ]' "$AWMAN_RELEASE_RUNNER_WORK"

@@ -1282,13 +1282,13 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         set_daemon_overlay(DaemonEnvMap::new());
 
-        let prev = std::env::var("ANTHROPIC_API_KEY").ok();
-        std::env::remove_var("ANTHROPIC_API_KEY");
-
         let mut overlay = DaemonEnvMap::new();
         overlay.insert("ANTHROPIC_API_KEY", "sk-from-overlay");
         set_daemon_overlay(overlay);
 
+        // No snapshot: the production `host_var` lookup, which consults the
+        // overlay before the process environment, so the process value (if
+        // any) cannot decide the outcome. No process variable is touched.
         let resolved = ResolvedContainerOptions::resolve([
             ContainerOption::EnvPassthrough(EnvVar("ANTHROPIC_API_KEY".into())),
             ContainerOption::AgentCredentials {
@@ -1305,10 +1305,6 @@ mod tests {
         );
 
         set_daemon_overlay(DaemonEnvMap::new());
-        match prev {
-            Some(v) => std::env::set_var("ANTHROPIC_API_KEY", v),
-            None => std::env::remove_var("ANTHROPIC_API_KEY"),
-        }
     }
 
     // ─── WI-0107: refreshable (file) dedup — INV-9 + MEDIUM-8 fail-closed ─────

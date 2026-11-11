@@ -16,7 +16,7 @@ mod api_process;
 use api_process::RootDaemon;
 
 fn awman_binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_awman"))
+    PathBuf::from(awman_test_support::cargo_bin!("awman"))
 }
 
 /// One `awman` invocation against the isolated root, with `extra` added to its

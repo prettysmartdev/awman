@@ -1209,8 +1209,16 @@ mod tests {
     };
     use std::path::PathBuf;
 
+    /// Resolve against an empty instance snapshot: nothing from the test
+    /// process environment can leak into the result.
     fn resolve(opts: Vec<ContainerOption>) -> ResolvedContainerOptions {
-        ResolvedContainerOptions::resolve(opts).unwrap()
+        resolve_with(opts, &[])
+    }
+
+    /// Resolve against an instance snapshot holding exactly `env`.
+    fn resolve_with(opts: Vec<ContainerOption>, env: &[(&str, &str)]) -> ResolvedContainerOptions {
+        let snapshot = crate::data::config::env::EnvSnapshot::with_overrides(env.iter().copied());
+        ResolvedContainerOptions::resolve_in(opts, &snapshot).unwrap()
     }
 
     #[test]
@@ -1340,16 +1348,18 @@ mod tests {
     fn build_run_argv_env_passthrough_only_when_set() {
         use crate::engine::container::options::EnvLiteral;
 
-        std::env::set_var("AWMAN_TEST_ENV_DOCKER", "v1");
-        let resolved = resolve(vec![
-            ContainerOption::Image(ImageRef::new("img:latest")),
-            ContainerOption::EnvPassthrough(EnvVar("AWMAN_TEST_ENV_DOCKER".into())),
-            ContainerOption::EnvPassthrough(EnvVar("AWMAN_TEST_NEVER_SET_DOCKER".into())),
-            ContainerOption::EnvLiteral(EnvLiteral {
-                key: "MY_KEY".into(),
-                value: "my_value".into(),
-            }),
-        ]);
+        let resolved = resolve_with(
+            vec![
+                ContainerOption::Image(ImageRef::new("img:latest")),
+                ContainerOption::EnvPassthrough(EnvVar("AWMAN_PROBE_ENV_DOCKER".into())),
+                ContainerOption::EnvPassthrough(EnvVar("AWMAN_PROBE_NEVER_SET_DOCKER".into())),
+                ContainerOption::EnvLiteral(EnvLiteral {
+                    key: "MY_KEY".into(),
+                    value: "my_value".into(),
+                }),
+            ],
+            &[("AWMAN_PROBE_ENV_DOCKER", "v1")],
+        );
         let argv = build_run_argv(
             &ContainerName::new("ctr"),
             &ImageRef::new("img:latest"),
@@ -1358,17 +1368,17 @@ mod tests {
         .unwrap();
         assert!(
             argv.windows(2)
-                .any(|w| w[0] == "-e" && w[1] == "AWMAN_TEST_ENV_DOCKER"),
-            "passthrough must be emitted as name-only `-e AWMAN_TEST_ENV_DOCKER`; argv: {argv:?}"
+                .any(|w| w[0] == "-e" && w[1] == "AWMAN_PROBE_ENV_DOCKER"),
+            "passthrough must be emitted as name-only `-e AWMAN_PROBE_ENV_DOCKER`; argv: {argv:?}"
         );
         assert!(
-            !argv.iter().any(|a| a == "AWMAN_TEST_ENV_DOCKER=v1"),
+            !argv.iter().any(|a| a == "AWMAN_PROBE_ENV_DOCKER=v1"),
             "the passthrough value must never ride argv as NAME=VALUE; argv: {argv:?}"
         );
         assert!(
             !argv
                 .iter()
-                .any(|a| a.contains("AWMAN_TEST_NEVER_SET_DOCKER")),
+                .any(|a| a.contains("AWMAN_PROBE_NEVER_SET_DOCKER")),
             "an unset passthrough name must emit nothing at all; argv: {argv:?}"
         );
         assert!(
@@ -1376,7 +1386,6 @@ mod tests {
                 .any(|w| w[0] == "-e" && w[1] == "MY_KEY=my_value"),
             "a literal must still be emitted as -e KEY=VALUE, unlike passthrough; argv: {argv:?}"
         );
-        std::env::remove_var("AWMAN_TEST_ENV_DOCKER");
     }
 
     /// WI 0116 §1/D1 — the regression this work item exists to end.
@@ -1398,14 +1407,14 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         // Unique name, and explicitly *not* in the process environment: this is
         // the daemon's situation exactly.
-        let name = "AWMAN_TEST_DOCKER_OVERLAY_ONLY";
-        std::env::remove_var(name);
+        let name = "AWMAN_PROBE_DOCKER_OVERLAY_ONLY";
         set_daemon_overlay(DaemonEnvMap::from_pairs([(name, "overlay-secret")]));
 
-        let resolved = resolve(vec![
+        let resolved = ResolvedContainerOptions::resolve(vec![
             ContainerOption::Image(ImageRef::new("img:latest")),
             ContainerOption::EnvPassthrough(EnvVar(name.into())),
-        ]);
+        ])
+        .unwrap();
         let argv = build_run_argv(
             &ContainerName::new("ctr"),
             &ImageRef::new("img:latest"),
@@ -1441,8 +1450,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let previous = daemon_overlay_snapshot();
-        let name = "AWMAN_TEST_DOCKER_PROCESS_OVERLAY_0142";
-        std::env::remove_var(name);
+        let name = "AWMAN_PROBE_DOCKER_PROCESS_OVERLAY_0142";
         let process = Env::from_process();
         set_daemon_overlay(DaemonEnvMap::from_pairs([(name, "overlay-secret")]));
         let options = ResolvedContainerOptions::resolve_in(
@@ -1485,12 +1493,13 @@ mod tests {
         // The overlay, not the process environment: the OS itself refuses to
         // set a variable whose name contains `=`, which is part of why such a
         // name must never become a `Command::env` key.
-        let bad = "AWMAN_TEST_DOCKER=INVALID";
+        let bad = "AWMAN_PROBE=INVALID";
         set_daemon_overlay(DaemonEnvMap::from_pairs([(bad, "v")]));
-        let resolved = resolve(vec![
+        let resolved = ResolvedContainerOptions::resolve(vec![
             ContainerOption::Image(ImageRef::new("img:latest")),
             ContainerOption::EnvPassthrough(EnvVar(bad.into())),
-        ]);
+        ])
+        .unwrap();
         assert!(
             resolve_env_passthrough(&resolved).is_empty(),
             "a malformed key must never reach Command::env"
@@ -1510,17 +1519,18 @@ mod tests {
     /// value as absent.
     #[test]
     fn resolve_env_passthrough_keeps_a_variable_set_to_the_empty_string() {
-        let name = "AWMAN_TEST_DOCKER_EMPTY_PASSTHROUGH";
-        std::env::set_var(name, "");
-        let resolved = resolve(vec![
-            ContainerOption::Image(ImageRef::new("img:latest")),
-            ContainerOption::EnvPassthrough(EnvVar(name.into())),
-        ]);
+        let name = "AWMAN_PROBE_DOCKER_EMPTY_PASSTHROUGH";
+        let resolved = resolve_with(
+            vec![
+                ContainerOption::Image(ImageRef::new("img:latest")),
+                ContainerOption::EnvPassthrough(EnvVar(name.into())),
+            ],
+            &[(name, "")],
+        );
         assert_eq!(
             resolve_env_passthrough(&resolved),
             vec![(name.to_string(), String::new())]
         );
-        std::env::remove_var(name);
     }
 
     #[test]
@@ -1627,7 +1637,6 @@ mod tests {
         ];
         let mut opts = vec![ContainerOption::Image(ImageRef::new("img:latest"))];
         for n in denied {
-            std::env::set_var(n, "host");
             opts.push(ContainerOption::EnvPassthrough(EnvVar(n.into())));
         }
         opts.push(ContainerOption::EnvPassthrough(EnvVar("TERM".into())));
@@ -1639,16 +1648,14 @@ mod tests {
             key: "TERM".into(),
             value: "xterm-kitty".into(),
         }));
-        let resolved = resolve(opts);
+        let host: Vec<(&str, &str)> = denied.iter().map(|n| (*n, "host")).collect();
+        let resolved = resolve_with(opts, &host);
         let argv = build_run_argv(
             &ContainerName::new("ctr"),
             &ImageRef::new("img:latest"),
             &resolved,
         )
         .unwrap();
-        for n in denied {
-            std::env::remove_var(n);
-        }
         let names: Vec<&str> = argv
             .windows(2)
             .filter(|w| w[0] == "-e")
@@ -1673,14 +1680,15 @@ mod tests {
     /// An overlay `env()` asking for a denied name yields a notice, no variable.
     #[test]
     fn overlay_requesting_tmux_yields_notice_and_no_variable() {
-        std::env::set_var("TMUX", "/tmp/tmux-1000/default,1,0");
-        let resolved = resolve(vec![
-            ContainerOption::Image(ImageRef::new("img:latest")),
-            ContainerOption::EnvPassthrough(EnvVar("TMUX".into())),
-        ]);
+        let resolved = resolve_with(
+            vec![
+                ContainerOption::Image(ImageRef::new("img:latest")),
+                ContainerOption::EnvPassthrough(EnvVar("TMUX".into())),
+            ],
+            &[("TMUX", "/tmp/tmux-1000/default,1,0")],
+        );
         let notice = host_terminal_env_notice(&resolved);
         let passed = resolve_env_passthrough(&resolved);
-        std::env::remove_var("TMUX");
         assert!(notice.unwrap().contains("TMUX"));
         assert!(passed.is_empty());
     }

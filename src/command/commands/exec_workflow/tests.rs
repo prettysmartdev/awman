@@ -3895,10 +3895,7 @@ async fn workflow_steps_get_their_own_agents_configured_flags() {
 async fn worktree_workflow_steps_still_get_configured_flags() {
     // Worktrees are created under the process `$HOME/.awman/worktrees`, which
     // only `make test` (AWMAN_TEST_ISOLATION, throwaway HOME) makes safe.
-    if !crate::data::config::env::Env::from_process().test_isolation() {
-        eprintln!("skipped: creates a worktree under $HOME; run via `make test`");
-        return;
-    }
+    // The workflow helper supplies a private session environment.
     let tmp = tempfile::tempdir().unwrap();
     let launches = run_recorded_workflow(tmp.path(), CODEX_STEP, true, None).await;
     assert_eq!(

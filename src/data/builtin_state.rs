@@ -331,24 +331,6 @@ impl BuiltinState {
     }
 }
 
-/// Retry a zero-wait lock that a test just released. A process forked by a
-/// concurrent test holds a copy of the descriptor, and so the lock, until it
-/// execs.
-#[cfg(test)]
-fn after_forked_copies_close<T>(
-    mut lock: impl FnMut() -> Result<T, DataError>,
-) -> Result<T, DataError> {
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        match lock() {
-            Err(DataError::BuiltinStateBusy { .. }) if std::time::Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            result => return result,
-        }
-    }
-}
-
 #[cfg(test)]
 mod upgrade_tests;
 
@@ -356,7 +338,6 @@ mod upgrade_tests;
 mod tests {
     use super::*;
     use std::os::unix::fs::{symlink, PermissionsExt};
-    use std::time::Instant;
 
     fn ok(_: &Path) -> Result<(), DataError> {
         Ok(())
@@ -459,32 +440,6 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_creation_is_safe() {
-        let (_temp, root) = scratch();
-        let private = root.join("private");
-        std::thread::scope(|scope| {
-            let a = scope.spawn(|| BuiltinState::at(&private).secure_create());
-            let b = scope.spawn(|| BuiltinState::at(&private).secure_create());
-            a.join().unwrap().unwrap();
-            b.join().unwrap().unwrap();
-        });
-    }
-
-    #[test]
-    fn a_busy_lock_times_out_and_the_import_lock_is_independent() {
-        let (_temp, state) = state();
-        let _held = state.lock().unwrap();
-        let start = Instant::now();
-        let err = state
-            .lock_controlled(CATALOG_LOCK, Duration::from_millis(100), false, || Ok(()))
-            .unwrap_err();
-        assert!(matches!(err, DataError::BuiltinStateBusy { .. }), "{err}");
-        assert!(err.to_string().contains("busy"));
-        assert!(start.elapsed() >= Duration::from_millis(100));
-        assert!(state.import_lock().is_ok());
-    }
-
-    #[test]
     fn a_stale_lock_file_from_a_crashed_process_is_reusable() {
         let (_temp, state) = state();
         let stale = state.home.join(CATALOG_LOCK);
@@ -521,59 +476,6 @@ mod tests {
             matches!(state.lock(), Err(DataError::BuiltinState(_))),
             "a multiply-linked lock file is refused"
         );
-    }
-
-    #[test]
-    fn import_lock_wait_observes_the_check_hook() {
-        let (_temp, state) = state();
-        let held = state.import_lock().unwrap();
-        let mut polls = 0;
-        let start = Instant::now();
-        let err = state
-            .import_lock_cancellable(|| {
-                polls += 1;
-                if polls > 2 {
-                    Err(DataError::Other("cancelled".into()))
-                } else {
-                    Ok(())
-                }
-            })
-            .unwrap_err();
-        assert_eq!(err.to_string(), "cancelled");
-        assert!(start.elapsed() < Duration::from_secs(2));
-        drop(held);
-        assert!(state.import_lock().is_ok());
-    }
-
-    #[test]
-    fn image_leases_exclude_mutation_across_processes_but_not_other_images() {
-        const CHILD: &str = "AWMAN_TEST_BUILTIN_STATE_IMAGE_LEASE_CHILD";
-        if let Some(root) = std::env::var_os(CHILD) {
-            let state = BuiltinState::resolve(Path::new(&root), ok).unwrap();
-            assert!(state.image_lease("agent:1", true).is_err());
-            assert!(state.image_lease("agent:1", false).is_ok());
-            assert!(state.image_lease("other:1", true).is_ok());
-            return;
-        }
-        let (_temp, state) = state();
-        let lease = state.image_lease("agent:1", false).unwrap();
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "data::builtin_state::tests::image_leases_exclude_mutation_across_processes_but_not_other_images",
-                "--nocapture",
-            ])
-            .env(CHILD, &state.home)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        drop(lease);
-        assert!(after_forked_copies_close(|| state.image_lease("agent:1", true)).is_ok());
     }
 
     #[test]

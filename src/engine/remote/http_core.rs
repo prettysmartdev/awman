@@ -371,7 +371,7 @@ mod tests {
     fn test_isolation_allows_loopback_only() {
         for url in [
             "http://localhost:9876/v1/status",
-            "http://127.0.0.1:1/x",
+            "http://127.0.0.1/x",
             "http://[::1]:8080/",
         ] {
             assert!(

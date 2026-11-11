@@ -462,8 +462,8 @@ impl RemoteClient {
     }
     // ─── Generic low-level helpers (crate-private) ───────────────────────────
 
-    #[cfg(test)]
-    pub(crate) async fn send_command(
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn send_command(
         &self,
         path: &[&str],
         flags: &[(&str, serde_json::Value)],
@@ -577,84 +577,6 @@ mod tests {
         );
     }
 
-    // ─── send_command tests (mock HTTP server) ────────────────────────────────
-
-    #[tokio::test]
-    async fn send_command_200_response_returns_parsed_remote_response() {
-        use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
-
-        let server = MockServer::start().await;
-        Mock::given(matchers::method("POST"))
-            .and(matchers::path("/v1/agents/status"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
-            .mount(&server)
-            .await;
-
-        let client = RemoteClient::new(&server.uri(), None).unwrap();
-        let result = client.send_command(&["agents", "status"], &[]).await;
-        assert!(result.is_ok(), "200 must return Ok: {result:?}");
-        let response = result.unwrap();
-        assert_eq!(response.status, 200);
-    }
-
-    #[tokio::test]
-    async fn send_command_400_response_maps_to_remote_http_status_error() {
-        use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
-
-        let server = MockServer::start().await;
-        Mock::given(matchers::method("POST"))
-            .and(matchers::path("/v1/exec/workflow"))
-            .respond_with(
-                ResponseTemplate::new(400)
-                    .set_body_json(serde_json::json!({"error": "bad request"})),
-            )
-            .mount(&server)
-            .await;
-
-        let client = RemoteClient::new(&server.uri(), None).unwrap();
-        let result = client.send_command(&["exec", "workflow"], &[]).await;
-        assert!(
-            matches!(
-                result,
-                Err(EngineError::RemoteHttpStatus { status: 400, .. })
-            ),
-            "400 must map to RemoteHttpStatus, got: {result:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn send_command_500_response_maps_to_remote_http_status_error() {
-        use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
-
-        let server = MockServer::start().await;
-        Mock::given(matchers::method("POST"))
-            .and(matchers::path("/v1/agents/status"))
-            .respond_with(
-                ResponseTemplate::new(500)
-                    .set_body_json(serde_json::json!({"error": "internal server error"})),
-            )
-            .mount(&server)
-            .await;
-
-        let client = RemoteClient::new(&server.uri(), None).unwrap();
-        let result = client.send_command(&["agents", "status"], &[]).await;
-        assert!(
-            matches!(
-                result,
-                Err(EngineError::RemoteHttpStatus { status: 500, .. })
-            ),
-            "500 must map to RemoteHttpStatus, got: {result:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn map_reqwest_error_connection_refused_maps_to_remote_connection_refused() {
-        // Port 1 is reserved and should never have anything listening.
-        let client = RemoteClient::new("http://127.0.0.1:1", None).unwrap();
-        let result = client.send_command(&["agents", "status"], &[]).await;
-        assert!(
-            matches!(result, Err(EngineError::RemoteConnectionRefused(_))),
-            "connection refused must map to RemoteConnectionRefused, got: {result:?}"
-        );
-    }
+    // `send_command` against a loopback server (status mapping, refused
+    // connection): tests/component/engine/remote.rs.
 }

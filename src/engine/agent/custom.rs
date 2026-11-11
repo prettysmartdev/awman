@@ -584,21 +584,16 @@ mod tests {
     #[test]
     fn crush_dockerfile_matches_its_golden_snapshot() {
         let output = render_dockerfile(&crush_fixture(), "project:latest").unwrap();
-        if std::env::var_os("AWMAN_WRITE_GOLDEN").is_some() {
-            std::fs::write(
-                concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/src/engine/agent/testdata/crush.Dockerfile.golden"
-                ),
-                &output.content,
-            )
-            .unwrap();
-        }
         // An independent, reviewed copy: instruction order and the whole
-        // hardened suffix are pinned, not just fragments.
-        assert_eq!(
-            output.content,
-            include_str!("testdata/crush.Dockerfile.golden")
+        // hardened suffix are pinned, not just fragments. The one update path
+        // is `cargo xtask test update-golden` (INSTA_UPDATE=always), read by
+        // the support crate, never by this test.
+        awman_test_support::golden::assert_golden(
+            std::path::Path::new(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/engine/agent/testdata/crush.Dockerfile.golden"
+            )),
+            &output.content,
         );
     }
 

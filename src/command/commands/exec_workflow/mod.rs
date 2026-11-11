@@ -548,6 +548,9 @@ pub(crate) use shared_frontend::SharedWorkflowFrontend;
 #[cfg(test)]
 pub(crate) mod tests;
 
+#[cfg(test)]
+mod contract_tests;
+
 // The child modules' items are `pub(super)`; re-exporting them here is what
 // lets each one say `use super::*;` and see the others, exactly as they all
 // saw each other when this was one file.

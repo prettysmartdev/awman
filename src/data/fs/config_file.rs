@@ -32,13 +32,13 @@ pub fn refuse_symlinks_below(root: &Path, path: &Path) -> Result<(), DataError> 
         current.push(component);
         match std::fs::symlink_metadata(&current) {
             Ok(metadata) if metadata.file_type().is_symlink() => {
-                return Err(symlink_refusal(&current))
+                return Err(symlink_refusal(&current));
             }
             Ok(metadata) if current == path && !metadata.is_file() => {
                 return Err(DataError::Other(format!(
                     "{} is not a regular file; refusing to use it as config",
                     path.display()
-                )))
+                )));
             }
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,

@@ -1289,19 +1289,17 @@ abort_on_failure = true
         assert_eq!(status["status"], "aborted");
     }
 
-    /// Exercise the real countdown and automatic retry in the normal suite.
-    /// The server runs under test isolation, so the test-only
-    /// `AWMAN_TEST_YOLO_COUNTDOWN_MS` shortens the 60 s countdown; the retry
-    /// path it drives is otherwise the production one.
+    /// Retained legacy end-to-end proof of the real 60 s automatic retry.
+    /// Countdown environment overrides were removed from the shipped binary.
+    /// The helper's 120 s terminal deadline bounds this deliberate real-time
+    /// case until the virtual-clock replacement has semantic shadow evidence.
     #[tokio::test(flavor = "multi_thread")]
     async fn real_git_a_retried_main_step_is_listed_once_with_its_last_attempt() {
         crate::real_git_skip!();
         let home = ApiHome::new();
         home.set_agent(AgentMode::Fail);
         let repo = LocalRepo::new(&home, &[("wf.toml", ONE_STEP)]);
-        let server = home
-            .start_with_env(&[("AWMAN_TEST_YOLO_COUNTDOWN_MS", "500")])
-            .await;
+        let server = home.start().await;
         let id = repo.session(&server).await;
 
         let record = server.run_command(&id, "exec workflow", &["wf.toml"]).await;

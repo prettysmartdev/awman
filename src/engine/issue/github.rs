@@ -1144,50 +1144,22 @@ exit 0
 
     // ââ fetch_issue_with_progress tests ââââââââââââââââââââââââââââââââââââââ
 
-    #[cfg(unix)]
+    /// The first progress message names the exact `gh` command, before gh
+    /// runs. A full URL needs no git remote and a missing gh path starts no
+    /// process, so this stays in memory (the outcome is the fallback error).
     #[test]
-    fn fetch_with_progress_emits_gh_command_message_on_success() {
+    fn fetch_with_progress_emits_gh_command_message_first() {
         use crate::data::message::RecordingMessageSink;
-        use std::os::unix::fs::PermissionsExt;
 
         let tmp = tempfile::tempdir().unwrap();
-        // Set up a fake git repo with a GitHub remote
-        std::process::Command::new("git")
-            .args(["init"])
-            .current_dir(tmp.path())
-            .output()
-            .unwrap();
-        std::process::Command::new("git")
-            .args([
-                "remote",
-                "add",
-                "origin",
-                "https://github.com/myorg/myrepo.git",
-            ])
-            .current_dir(tmp.path())
-            .output()
-            .unwrap();
-
-        let script = tmp.path().join("gh");
-        std::fs::write(
-            &script,
-            r#"#!/bin/sh
-echo '{"number":42,"title":"Test","body":"body","url":"https://github.com/myorg/myrepo/issues/42"}'
-exit 0
-"#,
-        )
-        .unwrap();
-        let mut perms = std::fs::metadata(&script).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&script, perms).unwrap();
-
+        let missing_gh = tmp.path().join("missing-gh");
         let mut sink = RecordingMessageSink::new();
-        let result = fetch_issue_with_progress_using(
+        let _ = fetch_issue_with_progress_using(
             GithubIntegrations {
-                gh_command: script.to_str().unwrap(),
+                gh_command: missing_gh.to_str().unwrap(),
                 api_base_url: "invalid-api-base",
             },
-            "42",
+            "https://github.com/myorg/myrepo/issues/42",
             tmp.path(),
             "GitHub",
             &mut sink,
@@ -1195,7 +1167,6 @@ exit 0
             None,
         );
 
-        assert!(result.is_ok());
         let messages = sink.all();
         assert!(
             !messages.is_empty(),

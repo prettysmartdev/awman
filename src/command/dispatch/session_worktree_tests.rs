@@ -1418,7 +1418,14 @@ async fn a_worktree_dockerfile_cannot_choose_the_credential_mount_home() {
     git(&fx.root, &["add", ".awman/Dockerfile.claude"]);
     git(&fx.root, &["commit", "-qm", "pick a home"]);
     git(&fx.root, &["checkout", "-q", "main"]);
-    std::fs::remove_dir_all(fx.root.join(".awman")).ok();
+    // Git removes a now-empty tracked directory on checkout; other Git
+    // versions may leave it behind. Either state must exercise the same
+    // worktree-only Dockerfile below.
+    let overlay = fx.root.join(".awman");
+    if overlay.exists() {
+        std::fs::remove_dir_all(&overlay).expect("remove committed fixture overlay");
+    }
+    assert!(!overlay.exists());
     let target = SessionWorktreeTarget::Branch("feat/home".into());
     let run = launch(&fx, Which::Chat, Some(target), None).await;
     run.result.as_ref().unwrap();

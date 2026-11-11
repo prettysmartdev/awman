@@ -4,7 +4,7 @@ use std::{
     process::{Command, Output, Stdio},
 };
 fn cli(home: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_awman"))
+    Command::new(awman_test_support::cargo_bin!("awman"))
         .args(args)
         .current_dir(home)
         .env_clear()

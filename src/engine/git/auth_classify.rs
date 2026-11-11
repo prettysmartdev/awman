@@ -261,7 +261,11 @@ mod response_evidence_tests {
     use super::*;
     #[test]
     fn a_final_401_or_403_is_an_auth_failure_whatever_git_printed() {
-        let mut command = std::process::Command::new("git");
+        // Constructed through the production spawner; never spawned here.
+        let mut command = crate::engine::host_cli::command(
+            &crate::data::config::env::EnvSnapshot::empty(),
+            "git",
+        );
         let trace = ResponseTrace::attach(&mut command).unwrap();
         let unknown = "fatal: unable to complete the request";
         std::fs::write(
@@ -282,11 +286,15 @@ mod response_evidence_tests {
     }
     #[test]
     fn reset_after_response_is_never_retried_and_unknown_evidence_fails_closed() {
-        let mut command = std::process::Command::new("git");
+        // Constructed through the production spawner; never spawned here.
+        let mut command = crate::engine::host_cli::command(
+            &crate::data::config::env::EnvSnapshot::empty(),
+            "git",
+        );
         let trace = ResponseTrace::attach(&mut command).unwrap();
         let reset = "RPC failed; curl 56 Recv failure: Connection reset by peer";
         assert_eq!(trace.classify(reset, false), GitFailureClass::Other);
-        std::fs::write(trace.0.path(), "== Info: Trying 127.0.0.1:8080\n").unwrap();
+        std::fs::write(trace.0.path(), "== Info: Trying 192.0.2.1:8080\n").unwrap();
         assert_eq!(trace.classify(reset, false), GitFailureClass::Transport);
         std::fs::write(
             trace.0.path(),

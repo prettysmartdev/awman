@@ -126,10 +126,14 @@ mod tests {
 
     #[test]
     fn names_are_unique_across_calls() {
+        // The name is pid + wall-clock nanos: it changes as soon as the clock
+        // does. Spin (bounded, no sleeping) until the next distinct name.
         let a = generate_container_name();
-        std::thread::sleep(std::time::Duration::from_nanos(2));
-        let b = generate_container_name();
-        assert_ne!(a, b);
+        let b = (0..10_000_000)
+            .map(|_| generate_container_name())
+            .find(|b| *b != a)
+            .expect("container name never changed while the clock advanced");
+        assert_eq!(a.rsplit_once('-').unwrap().0, b.rsplit_once('-').unwrap().0);
     }
 
     // ─── squad naming ────────────────────────────────────────────────────────

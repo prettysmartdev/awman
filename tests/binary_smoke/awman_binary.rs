@@ -24,7 +24,7 @@ fn build_shared_awman_copy() -> PathBuf {
         .keep();
     let dest = dir.join("awman");
 
-    let top_level = PathBuf::from(env!("CARGO_BIN_EXE_awman"));
+    let top_level = PathBuf::from(awman_test_support::cargo_bin!("awman"));
     let deadline = Instant::now() + Duration::from_secs(120);
     let mut backoff = Duration::from_millis(25);
     let mut last_copy_err = None;
@@ -78,7 +78,7 @@ fn build_shared_awman_copy() -> PathBuf {
 }
 
 fn resolve_awman_source() -> Option<PathBuf> {
-    let top_level = PathBuf::from(env!("CARGO_BIN_EXE_awman"));
+    let top_level = PathBuf::from(awman_test_support::cargo_bin!("awman"));
     if !matches!(top_level.try_exists(), Ok(false)) {
         return Some(top_level);
     }

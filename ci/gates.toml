@@ -1,0 +1,1491 @@
+# WI 0144 target contract. Pending fixture pins are deliberately red, never fake hashes.
+schema = 1
+quarantine = []
+override = []
+
+[tools.nextest]
+version = "0.9.150"
+source = "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.150"
+sha256 = { aarch64-unknown-linux-gnu = "9164568e9840c6509177086828ac7d3178c2d8feb0658b4d2bff62fa620e98c8", x86_64-unknown-linux-gnu = "b0959bc64232974224cf9fb22c915845398c0e8668fa7831eb5b43fb1eef781f", universal-apple-darwin = "82a759b4d218d38359424196ab244c470e8f7c7d149c814fbbeef4d67c3c301a", x86_64-pc-windows-msvc = "b7a8bf567140b8b366716f2dea27b32e088dc12f53597315f976d0dbf7c6ade8" }
+
+# shellcheck publishes no checksum file: these are the SHA-256 of the release
+# assets as downloaded on 2026-11-11 (maintainer cross-check recorded in the ledger).
+[tools.shellcheck]
+version = "0.11.0"
+source = "https://github.com/koalaman/shellcheck"
+sha256 = { x86_64-unknown-linux-gnu = "8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198", aarch64-unknown-linux-gnu = "12b331c1d2db6b9eb13cfca64306b1b157a86eb69db83023e261eaa7e7c14588", aarch64-apple-darwin = "56affdd8de5527894dca6dc3d7e0a99a873b0f004d7aabc30ae407d3f48b0a79", x86_64-apple-darwin = "3c89db4edcab7cf1c27bff178882e0f6f27f7afdf54e859fa041fca10febe4c6" }
+
+# From the published actionlint_1.7.7_checksums.txt.
+[tools.actionlint]
+version = "1.7.7"
+source = "https://github.com/rhysd/actionlint"
+sha256 = { x86_64-unknown-linux-gnu = "023070a287cd8cccd71515fedc843f1985bf96c436b7effaecce67290e7e0757", aarch64-unknown-linux-gnu = "401942f9c24ed71e4fe71b76c7d638f66d8633575c4016efd2977ce7c28317d0", aarch64-apple-darwin = "2693315b9093aeacb4ebd91a993fea54fc215057bf0da2659056b4bc033873db", x86_64-apple-darwin = "28e5de5a05fc558474f638323d736d822fff183d2d492f0aecb2b73cc44584f5" }
+
+# crates.io tools: `cargo install --locked --version <pin>`; the registry
+# index checksum verifies the crate, so there is no per-platform digest.
+[tools.cargo-deny]
+version = "0.19.0"
+source = "https://crates.io/crates/cargo-deny"
+sha256 = {  }
+
+[tools.cargo-llvm-cov]
+version = "0.6.21"
+source = "https://crates.io/crates/cargo-llvm-cov"
+sha256 = {  }
+
+[tools.cargo-mutants]
+version = "25.3.1"
+source = "https://crates.io/crates/cargo-mutants"
+sha256 = {  }
+
+[capabilities.tempdir]
+description = "private temporary directory"
+
+[capabilities.loopback]
+description = "private loopback TCP and Unix sockets"
+
+[capabilities.subprocess]
+description = "owned child processes"
+
+[capabilities.awman-binary]
+description = "immutable debug awman"
+
+[capabilities.fake-cli]
+description = "owned fake command executable"
+
+[capabilities.local-git]
+description = "Git in private repositories"
+
+[capabilities.docker]
+description = "private Docker Engine"
+
+[capabilities.local-registry]
+description = "loopback registry"
+
+[capabilities.git-transports]
+description = "loopback SSH and HTTP Git"
+
+[capabilities.apple-containers]
+description = "private Apple Containers service"
+
+[capabilities.docker-sbx]
+description = "Docker sandbox CLI"
+
+[capabilities.hypervisor]
+description = "HVF or KVM"
+
+[capabilities.builtin-payload]
+description = "verified builtin payload"
+
+[capabilities.guest-fixtures]
+description = "pinned guest OCI archive"
+
+[capabilities.previous-release]
+description = "pinned previous release"
+
+[capabilities.release-artifact]
+description = "known digest release executable"
+
+[capabilities.offline]
+description = "enforced offline network"
+
+[capabilities.public-network]
+description = "public registry access"
+
+[capabilities.registry-credentials]
+description = "private registry credentials"
+
+[tiers.unit]
+budget_seconds = 1
+guarantees = ["tempdir"]
+
+[tiers.component]
+budget_seconds = 20
+guarantees = ["tempdir", "loopback", "subprocess", "awman-binary", "fake-cli", "local-git"]
+
+[tiers.boundary]
+budget_seconds = 120
+guarantees = ["tempdir", "loopback", "subprocess", "awman-binary", "fake-cli", "local-git"]
+allowed_capabilities = ["docker", "local-registry", "git-transports", "apple-containers", "docker-sbx"]
+
+[tiers.guest]
+budget_seconds = 300
+guarantees = ["tempdir", "loopback", "subprocess", "awman-binary", "hypervisor", "builtin-payload", "guest-fixtures", "previous-release"]
+allowed_capabilities = ["docker", "apple-containers"]
+
+[tiers.artifact]
+budget_seconds = 300
+guarantees = ["tempdir", "loopback", "subprocess", "release-artifact"]
+allowed_capabilities = ["hypervisor", "guest-fixtures", "previous-release", "offline"]
+
+[tiers.soak]
+guarantees = ["tempdir", "loopback", "subprocess", "awman-binary"]
+allowed_capabilities = ["docker", "hypervisor", "guest-fixtures", "public-network", "registry-credentials"]
+
+[features.default]
+cargo_args = []
+
+[features.builtin]
+cargo_args = ["--features", "builtin-runtime,guest-drivers"]
+
+[platforms.linux-x64]
+toolchain = "1.94.0"
+trust = "hosted"
+runs_on = ["ubuntu-24.04"]
+triple = "x86_64-unknown-linux-gnu"
+image = "20261101.360"
+provides = ["tempdir", "loopback", "subprocess", "awman-binary", "fake-cli", "local-git", "docker", "local-registry", "git-transports", "release-artifact", "public-network"]
+
+[platforms.linux-arm64]
+toolchain = "1.94.0"
+trust = "hosted"
+runs_on = ["ubuntu-24.04-arm"]
+triple = "aarch64-unknown-linux-gnu"
+image = "20261101.172"
+provides = ["tempdir", "loopback", "subprocess", "awman-binary", "fake-cli", "local-git", "builtin-payload", "release-artifact"]
+
+[platforms.macos-arm64]
+toolchain = "1.94.0"
+trust = "hosted"
+runs_on = ["macos-15"]
+triple = "aarch64-apple-darwin"
+image = "20261104.0514"
+provides = ["tempdir", "loopback", "subprocess", "awman-binary", "fake-cli", "local-git", "release-artifact"]
+
+[platforms.windows-x64]
+toolchain = "1.94.0"
+trust = "hosted"
+runs_on = ["windows-2025"]
+triple = "x86_64-pc-windows-msvc"
+image = "20261101.318"
+provides = ["tempdir", "loopback", "subprocess", "awman-binary", "fake-cli", "local-git", "release-artifact"]
+
+[platforms.macos-arm64-ci-guest]
+toolchain = "1.94.0"
+trust = "ci-guest"
+runs_on = ["self-hosted", "macOS", "ARM64", "awman-ci-guest"]
+triple = "aarch64-apple-darwin"
+image = "pending-provisioned-image-digest"
+provides = ["tempdir", "loopback", "subprocess", "awman-binary", "fake-cli", "local-git", "hypervisor", "builtin-payload", "guest-fixtures", "previous-release", "apple-containers", "release-artifact", "offline"]
+max_vms = 2
+
+[platforms.macos-arm64-release]
+toolchain = "1.94.0"
+trust = "release"
+runs_on = ["self-hosted", "macOS", "ARM64", "awman-release"]
+triple = "aarch64-apple-darwin"
+image = "pending-provisioned-image-digest"
+provides = ["tempdir", "loopback", "subprocess", "awman-binary", "fake-cli", "local-git", "hypervisor", "builtin-payload", "guest-fixtures", "previous-release", "apple-containers", "release-artifact", "offline"]
+max_vms = 2
+
+[builds.linux-x64-default]
+platform = "linux-x64"
+features = "default"
+profile = "test"
+packages = ["awman", "awman-cli", "awman-host-shims", "awman-wsp", "awman-test-support", "xtask"]
+
+[builds.macos-arm64-default]
+platform = "macos-arm64"
+features = "default"
+profile = "test"
+packages = ["awman", "awman-cli", "awman-host-shims", "awman-wsp", "awman-test-support", "xtask"]
+
+[builds.windows-x64-default]
+platform = "windows-x64"
+features = "default"
+profile = "test"
+packages = ["awman", "awman-cli", "awman-host-shims", "awman-wsp", "awman-test-support", "xtask"]
+
+[builds.linux-arm64-builtin]
+platform = "linux-arm64"
+features = "builtin"
+profile = "test"
+packages = ["awman", "awman-cli", "awman-host-shims", "awman-wsp", "awman-test-support", "xtask"]
+
+[builds.macos-arm64-ci-guest-builtin]
+platform = "macos-arm64-ci-guest"
+features = "builtin"
+profile = "test"
+packages = ["awman", "awman-cli", "awman-host-shims", "awman-wsp", "awman-test-support", "xtask"]
+
+[builds.macos-arm64-release-builtin]
+platform = "macos-arm64-release"
+features = "builtin"
+profile = "test"
+packages = ["awman", "awman-cli", "awman-host-shims", "awman-wsp", "awman-test-support", "xtask"]
+
+[builds.linux-x64-musl-static]
+platform = "linux-x64"
+features = "default"
+profile = "release"
+packages = ["awman-cli"]
+target = "x86_64-unknown-linux-musl"
+kind = "build-smoke"
+
+[builds.linux-x64-release]
+platform = "linux-x64"
+features = "default"
+profile = "release"
+packages = ["awman-cli"]
+kind = "release"
+asset = "awman-linux-amd64"
+
+[builds.linux-arm64-release]
+platform = "linux-arm64"
+features = "default"
+profile = "release"
+packages = ["awman-cli"]
+kind = "release"
+asset = "awman-linux-arm64"
+
+[builds.macos-arm64-release-release]
+platform = "macos-arm64-release"
+features = "builtin"
+profile = "release"
+packages = ["awman-cli"]
+kind = "release"
+asset = "awman-macos-arm64"
+
+[builds.windows-x64-release]
+platform = "windows-x64"
+features = "default"
+profile = "release"
+packages = ["awman-cli"]
+kind = "release"
+asset = "awman-windows-amd64.exe"
+
+[suites.unit-awman]
+tier = "unit"
+kind = "nextest"
+package = "awman"
+target = "lib"
+contracts = ["unit-awman"]
+requires = []
+paths = []
+always = true
+filter = "test(/^data::(program_status|command_status|session_status|image_tags|oci_identity|oci_source_key|ready_summary|network|prompt|setup_step)::/)"
+
+[suites.component-inline-awman]
+tier = "component"
+kind = "nextest"
+package = "awman"
+target = "lib"
+contracts = ["component-inline-awman"]
+requires = []
+paths = []
+always = true
+filter = "not (test(/^data::(program_status|command_status|session_status|image_tags|oci_identity|oci_source_key|ready_summary|network|prompt|setup_step)::/))"
+
+[suites.unit-cli]
+filter = "not test(/^apple_transport::native_tests::/)"
+tier = "unit"
+kind = "nextest"
+package = "awman-cli"
+target = "lib"
+contracts = ["unit-cli"]
+requires = []
+paths = []
+always = true
+
+[suites.unit-cli-bin]
+tier = "unit"
+kind = "nextest"
+package = "awman-cli"
+target = "bin:awman"
+contracts = ["unit-cli-bin"]
+requires = []
+paths = []
+always = true
+
+[suites.unit-host-shims]
+tier = "unit"
+kind = "nextest"
+package = "awman-host-shims"
+target = "lib"
+contracts = ["unit-host-shims"]
+requires = []
+paths = []
+always = true
+
+[suites.unit-wsp]
+tier = "unit"
+kind = "nextest"
+package = "awman-wsp"
+target = "lib"
+contracts = ["unit-wsp"]
+requires = []
+paths = []
+always = true
+
+[suites.unit-test-support]
+tier = "unit"
+kind = "nextest"
+package = "awman-test-support"
+target = "lib"
+contracts = ["unit-test-support"]
+requires = []
+paths = []
+always = true
+
+[suites.unit-xtask]
+tier = "component"
+kind = "nextest"
+package = "xtask"
+target = "bin:xtask"
+contracts = ["unit-xtask"]
+requires = []
+paths = []
+always = true
+
+[suites.unit-awman-builtin]
+tier = "component"
+kind = "nextest"
+package = "awman"
+target = "lib"
+contracts = ["unit-awman-builtin"]
+requires = []
+paths = []
+always = true
+
+[suites.unit-host-shims-builtin]
+tier = "component"
+kind = "nextest"
+package = "awman-host-shims"
+target = "lib"
+contracts = ["unit-host-shims-builtin"]
+requires = []
+paths = []
+always = true
+
+[suites.component-data]
+tier = "component"
+kind = "nextest"
+package = "awman-cli"
+target = "test:component"
+contracts = ["component-data"]
+requires = []
+paths = ["tests/component/data/**", "src/data/**"]
+filter = "test(/^data::/)"
+
+[suites.component-engine]
+tier = "component"
+kind = "nextest"
+package = "awman-cli"
+target = "test:component"
+contracts = ["component-engine"]
+requires = []
+paths = ["tests/component/engine/**", "src/engine/**"]
+filter = "test(/^engine::/)"
+
+[suites.component-command]
+tier = "component"
+kind = "nextest"
+package = "awman-cli"
+target = "test:component"
+contracts = ["component-command"]
+requires = []
+paths = ["tests/component/command/**", "src/command/**"]
+filter = "test(/^command::/) - test(/^command::builtin::/) - test(/^command::daemon::/) - test(/^command::differential::/) - test(/^command::models::/)"
+
+[suites.component-command-builtin]
+tier = "component"
+kind = "nextest"
+package = "awman-cli"
+target = "test:component"
+contracts = ["component-command-builtin"]
+requires = []
+paths = ["tests/component/command/**", "src/command/**"]
+filter = "test(/^command::builtin::/)"
+backend = "builtin"
+always = true
+
+[suites.component-command-daemon]
+tier = "component"
+kind = "nextest"
+package = "awman-cli"
+target = "test:component"
+contracts = ["component-command-daemon"]
+requires = []
+paths = ["tests/component/command/**", "src/command/**"]
+filter = "test(/^command::daemon::/)"
+backend = "daemon"
+always = true
+
+[suites.component-command-differential]
+tier = "component"
+kind = "nextest"
+package = "awman-cli"
+target = "test:component"
+contracts = ["component-command-differential"]
+requires = []
+paths = ["tests/component/command/**", "src/command/**"]
+filter = "test(/^command::differential::/)"
+always = true
+
+[suites.component-frontend]
+tier = "component"
+kind = "nextest"
+package = "awman-cli"
+target = "test:component"
+contracts = ["component-frontend"]
+requires = []
+paths = ["tests/component/frontend/**", "src/frontend/**"]
+filter = "test(/^frontend::/)"
+
+[suites.component-daemon]
+tier = "component"
+kind = "nextest"
+package = "awman-cli"
+target = "test:component"
+contracts = ["component-daemon"]
+requires = []
+paths = ["tests/component/daemon/**", "src/engine/daemon/**", "src/command/daemon/**", "src/frontend/daemon/**"]
+filter = "test(/^daemon::/)"
+
+[suites.component-squad]
+tier = "component"
+kind = "nextest"
+package = "awman-cli"
+target = "test:component"
+contracts = ["component-squad"]
+requires = []
+paths = ["tests/component/squad/**", "src/engine/squad/**", "src/command/squad/**", "src/frontend/squad/**"]
+filter = "test(/^squad::/)"
+
+[suites.component-worker]
+tier = "component"
+kind = "nextest"
+package = "awman-cli"
+target = "test:component"
+contracts = ["component-worker"]
+requires = []
+paths = ["tests/component/worker/**", "src/engine/worker/**", "src/command/worker/**", "src/frontend/worker/**"]
+filter = "test(/^worker::/)"
+
+[suites.component-security]
+tier = "component"
+kind = "nextest"
+package = "awman-cli"
+target = "test:component"
+contracts = ["component-security"]
+requires = []
+paths = ["tests/component/security/**", "src/command/**"]
+filter = "test(/^security::/)"
+
+[suites.component-tools]
+tier = "component"
+kind = "nextest"
+package = "awman-cli"
+target = "test:component"
+contracts = ["component-tools"]
+requires = []
+paths = ["tests/component/tools/**", "tools/**"]
+filter = "test(/^tools::/)"
+
+[suites.component-parity-builtin]
+tier = "component"
+kind = "nextest"
+package = "awman-cli"
+target = "test:component"
+contracts = ["component-parity-builtin"]
+requires = []
+paths = []
+filter = "test(/^parity::builtin::/)"
+always = true
+backend = "builtin"
+
+[suites.component-parity-daemon]
+tier = "component"
+kind = "nextest"
+package = "awman-cli"
+target = "test:component"
+contracts = ["component-parity-daemon"]
+requires = []
+paths = []
+filter = "test(/^parity::daemon::/)"
+always = true
+backend = "daemon"
+
+[suites.component-parity-differential]
+tier = "component"
+kind = "nextest"
+package = "awman-cli"
+target = "test:component"
+contracts = ["component-parity-differential"]
+requires = []
+paths = []
+filter = "test(/^parity::differential::/)"
+always = true
+
+[suites.boundary-docker]
+tier = "boundary"
+kind = "nextest"
+package = "awman-cli"
+target = "test:boundary"
+contracts = ["boundary-docker"]
+requires = ["docker"]
+paths = ["src/engine/**", "tests/boundary/**"]
+filter = "test(/^docker::/)"
+group = "docker"
+
+[suites.boundary-registry]
+tier = "boundary"
+kind = "nextest"
+package = "awman-cli"
+target = "test:boundary"
+contracts = ["boundary-registry"]
+requires = ["local-registry"]
+paths = ["src/engine/**", "tests/boundary/**"]
+filter = "test(/^registry::/)"
+group = "docker"
+
+[suites.boundary-git]
+tier = "boundary"
+kind = "nextest"
+package = "awman-cli"
+target = "test:boundary"
+contracts = ["boundary-git"]
+requires = ["git-transports"]
+paths = ["src/engine/**", "tests/boundary/**"]
+filter = "test(/^git::/)"
+group = "docker"
+
+[suites.boundary-apple]
+tier = "boundary"
+kind = "nextest"
+package = "awman-cli"
+target = "test:boundary"
+contracts = ["boundary-apple"]
+requires = ["apple-containers"]
+paths = ["src/engine/**", "tests/boundary/**"]
+filter = "test(/^apple::/)"
+group = "apple"
+
+[suites.boundary-sbx]
+tier = "boundary"
+kind = "nextest"
+package = "awman-cli"
+target = "test:boundary"
+contracts = ["boundary-sbx"]
+requires = ["docker-sbx"]
+paths = ["src/engine/**", "tests/boundary/**"]
+filter = "test(/^sbx::/)"
+group = "docker"
+
+[suites.boundary-conformance]
+tier = "boundary"
+kind = "nextest"
+package = "awman-cli"
+target = "test:boundary"
+contracts = ["boundary-conformance"]
+requires = ["docker"]
+paths = ["src/engine/**", "tests/boundary/**"]
+filter = "test(/^conformance::/)"
+group = "docker"
+budget_seconds = 300
+
+[suites.boundary-templates]
+tier = "boundary"
+kind = "nextest"
+package = "awman-cli"
+target = "test:boundary"
+contracts = ["boundary-templates"]
+requires = ["docker"]
+paths = ["src/engine/**", "tests/boundary/**"]
+filter = "test(/^templates::/)"
+group = "docker"
+budget_seconds = 900
+
+[suites.guest-boot]
+tier = "guest"
+kind = "nextest"
+package = "awman-cli"
+target = "test:guest"
+contracts = ["guest-boot"]
+requires = []
+paths = ["src/engine/**", "tests/guest/**"]
+filter = "test(/^boot::/)"
+group = "vm"
+
+[suites.guest-exec]
+tier = "guest"
+kind = "nextest"
+package = "awman-cli"
+target = "test:guest"
+contracts = ["guest-exec"]
+requires = []
+paths = ["src/engine/**", "tests/guest/**"]
+filter = "test(/^exec::/)"
+group = "vm"
+
+[suites.guest-import]
+tier = "guest"
+kind = "nextest"
+package = "awman-cli"
+target = "test:guest"
+contracts = ["guest-import"]
+requires = []
+paths = ["src/engine/**", "tests/guest/**"]
+filter = "test(/^import::/)"
+group = "vm"
+
+[suites.guest-network]
+tier = "guest"
+kind = "nextest"
+package = "awman-cli"
+target = "test:guest"
+contracts = ["guest-network"]
+requires = []
+paths = ["src/engine/**", "tests/guest/**"]
+filter = "test(/^network::/)"
+group = "vm"
+
+[suites.guest-upgrade]
+tier = "guest"
+kind = "nextest"
+package = "awman-cli"
+target = "test:guest"
+contracts = ["guest-upgrade"]
+requires = []
+paths = ["src/engine/**", "tests/guest/**"]
+filter = "test(/^upgrade::/)"
+group = "vm"
+
+[suites.guest-builder]
+tier = "guest"
+kind = "nextest"
+package = "awman-cli"
+target = "test:guest"
+contracts = ["guest-builder"]
+requires = []
+paths = ["src/engine/**", "tests/guest/**"]
+filter = "test(/^builder::/)"
+group = "vm"
+
+[suites.guest-strategy]
+tier = "guest"
+kind = "nextest"
+package = "awman-cli"
+target = "test:guest"
+contracts = ["guest-strategy"]
+requires = []
+paths = ["src/engine/**", "tests/guest/**"]
+filter = "test(/^strategy::/)"
+group = "vm"
+
+[suites.artifact-entrypoints]
+tier = "artifact"
+kind = "nextest"
+package = "awman-cli"
+target = "test:artifact"
+contracts = ["artifact-entrypoints"]
+requires = []
+paths = ["src/**", "tests/artifact/**"]
+filter = "test(/^entrypoints::/)"
+
+[suites.artifact-deps-scan]
+tier = "artifact"
+kind = "nextest"
+package = "awman-cli"
+target = "test:artifact"
+contracts = ["artifact-deps-scan"]
+requires = []
+paths = ["src/**", "tests/artifact/**"]
+filter = "test(/^deps_scan::/)"
+
+[suites.artifact-signed-boot]
+tier = "artifact"
+kind = "nextest"
+package = "awman-cli"
+target = "test:artifact"
+contracts = ["artifact-signed-boot"]
+requires = ["hypervisor", "guest-fixtures", "previous-release", "offline"]
+paths = ["src/**", "tests/artifact/**"]
+filter = "test(/^signed_boot::/)"
+group = "vm"
+
+[suites.artifact-upgrade-policy]
+tier = "artifact"
+kind = "nextest"
+package = "awman-cli"
+target = "test:artifact"
+contracts = ["artifact-upgrade-policy"]
+requires = []
+paths = ["src/**", "tests/artifact/**"]
+filter = "test(/^upgrade_policy::/)"
+
+[suites.artifact-smoke]
+tier = "artifact"
+kind = "nextest"
+package = "awman-cli"
+target = "test:artifact"
+contracts = ["artifact-smoke"]
+requires = []
+paths = ["src/**", "tests/artifact/**"]
+filter = "test(/^smoke::/)"
+
+[suites.artifact-switches]
+tier = "artifact"
+kind = "nextest"
+package = "awman-cli"
+target = "test:artifact"
+contracts = ["artifact-switches"]
+requires = []
+paths = ["src/**", "tests/artifact/**"]
+filter = "test(/^switches::/)"
+
+[suites.artifact-measure]
+tier = "artifact"
+kind = "nextest"
+package = "awman-cli"
+target = "test:artifact"
+contracts = ["artifact-measure"]
+requires = []
+paths = ["src/**", "tests/artifact/**"]
+filter = "test(/^measure::/)"
+
+[suites.soak-latency]
+tier = "soak"
+kind = "nextest"
+package = "awman-cli"
+target = "test:boundary"
+contracts = ["soak-latency"]
+requires = ["docker"]
+paths = []
+filter = "test(/^soak::latency::/)"
+budget_seconds = 600
+serial = true
+
+[suites.soak-public-registry]
+tier = "soak"
+kind = "nextest"
+package = "awman-cli"
+target = "test:boundary"
+contracts = ["soak-public-registry"]
+requires = ["public-network"]
+paths = []
+filter = "test(/^soak::public_registry::/)"
+budget_seconds = 600
+serial = true
+
+[suites.soak-private-registry]
+tier = "soak"
+kind = "nextest"
+package = "awman-cli"
+target = "test:boundary"
+contracts = ["soak-private-registry"]
+requires = ["public-network", "registry-credentials"]
+paths = []
+filter = "test(/^soak::private_registry::/)"
+budget_seconds = 600
+serial = true
+
+[suites.soak-fuzz]
+tier = "soak"
+kind = "nextest"
+package = "awman-cli"
+target = "test:boundary"
+contracts = ["soak-fuzz"]
+requires = []
+paths = []
+filter = "test(/^soak::fuzz::/)"
+budget_seconds = 600
+serial = true
+
+[suites.soak-guest]
+tier = "soak"
+kind = "nextest"
+package = "awman-cli"
+target = "test:guest"
+contracts = ["soak-guest"]
+requires = ["hypervisor", "guest-fixtures"]
+paths = []
+filter = "test(/^soak::guest::/)"
+budget_seconds = 600
+serial = true
+
+[suites.xtask-release-contract]
+tier = "component"
+kind = "nextest"
+package = "xtask"
+target = "test:release_contract"
+contracts = ["xtask-release-contract"]
+requires = []
+paths = ["xtask/**"]
+
+[suites.xtask-pipeline]
+tier = "component"
+kind = "nextest"
+package = "xtask"
+target = "test:pipeline"
+contracts = ["xtask-pipeline"]
+requires = []
+paths = ["xtask/**"]
+
+[suites.xtask-ci]
+tier = "component"
+kind = "nextest"
+package = "xtask"
+target = "test:ci"
+contracts = ["xtask-ci"]
+requires = []
+paths = ["xtask/**"]
+
+[suites.xtask-gates]
+tier = "component"
+kind = "nextest"
+package = "xtask"
+target = "test:gates"
+contracts = ["xtask-gates"]
+requires = []
+paths = ["xtask/**"]
+
+[suites.component-test-support]
+tier = "component"
+kind = "nextest"
+package = "awman-test-support"
+target = "test:component"
+contracts = ["component-test-support"]
+requires = []
+paths = ["crates/awman-test-support/**"]
+
+[suites.lint-fmt]
+tier = "unit"
+kind = "command"
+contracts = ["lint-fmt"]
+requires = []
+paths = []
+command = ["cargo", "fmt", "--all", "--check"]
+always = true
+
+[suites.lint-clippy]
+tier = "unit"
+kind = "command"
+contracts = ["lint-clippy"]
+requires = []
+paths = []
+command = ["cargo", "clippy", "--workspace", "--all-targets", "--locked", "--", "-D", "warnings"]
+always = true
+
+[suites.lint-architecture]
+tier = "unit"
+kind = "command"
+contracts = ["lint-architecture"]
+requires = []
+paths = []
+command = ["make", "architecture-rules"]
+always = true
+
+[suites.lint-hygiene]
+tier = "unit"
+kind = "command"
+contracts = ["lint-hygiene"]
+requires = []
+paths = []
+command = ["cargo", "xtask", "lint", "hygiene"]
+always = true
+
+[suites.lint-shell]
+tier = "unit"
+kind = "command"
+contracts = ["lint-shell"]
+requires = []
+paths = []
+command = ["cargo", "xtask", "lint", "shell"]
+always = true
+
+[suites.lint-workflows]
+tier = "unit"
+kind = "command"
+contracts = ["lint-workflows"]
+requires = []
+paths = []
+command = ["cargo", "xtask", "lint", "workflows"]
+always = true
+
+[suites.lint-deny]
+tier = "unit"
+kind = "command"
+contracts = ["lint-deny"]
+requires = []
+paths = []
+command = ["cargo", "deny", "check"]
+always = true
+
+[suites.lint-notice]
+tier = "unit"
+kind = "command"
+contracts = ["lint-notice"]
+requires = []
+paths = []
+command = ["cargo", "xtask", "lint", "notice"]
+always = true
+
+[suites.doctests]
+tier = "unit"
+kind = "doctest"
+contracts = ["doctests"]
+requires = []
+paths = []
+packages = ["awman", "awman-wsp"]
+always = true
+
+[suites.web]
+tier = "component"
+kind = "command"
+contracts = ["web"]
+requires = []
+paths = ["web/**"]
+command = ["make", "test-web"]
+
+[gates.pr]
+budget_minutes = 10
+required_check = "gate"
+build_smokes = ["linux-x64-musl-static"]
+
+[[gates.pr.cells]]
+suites = ["component-inline-awman", "component-command-models", "unit-awman", "unit-cli", "unit-cli-bin", "unit-host-shims", "unit-wsp", "unit-test-support", "unit-xtask", "component-data", "component-engine", "component-command", "component-command-builtin", "component-command-daemon", "component-command-differential", "component-frontend", "component-daemon", "component-squad", "component-worker", "component-security", "component-tools", "component-parity-builtin", "component-parity-daemon", "component-parity-differential"]
+builds = ["linux-x64-default", "macos-arm64-default", "windows-x64-default"]
+
+[[gates.pr.cells]]
+suites = ["boundary-docker", "boundary-registry", "boundary-git", "boundary-conformance", "boundary-templates"]
+builds = ["linux-x64-default"]
+
+[[gates.pr.cells]]
+suites = ["unit-awman-builtin", "unit-host-shims-builtin"]
+builds = ["linux-arm64-builtin"]
+
+[[gates.pr.cells]]
+suites = ["lint-fmt", "lint-clippy", "lint-architecture", "lint-hygiene", "lint-shell", "lint-workflows", "lint-deny", "lint-notice", "doctests", "web"]
+builds = ["linux-x64-default"]
+
+[[gates.pr.cells]]
+suites = ["xtask-release-contract"]
+builds = ["linux-x64-default", "macos-arm64-default"]
+
+[[gates.pr.cells]]
+suites = ["xtask-pipeline", "xtask-ci", "xtask-gates", "component-test-support"]
+builds = ["linux-x64-default", "macos-arm64-default", "windows-x64-default"]
+
+[gates.main]
+includes = ["pr"]
+budget_minutes = 20
+
+[[gates.main.cells]]
+suites = ["guest-boot", "guest-exec", "guest-import", "guest-network", "guest-upgrade", "guest-builder", "guest-strategy"]
+builds = ["macos-arm64-ci-guest-builtin"]
+
+[[gates.main.cells]]
+suites = ["unit-awman-builtin", "unit-host-shims-builtin"]
+builds = ["macos-arm64-ci-guest-builtin"]
+
+[gates.nightly]
+includes = ["main"]
+budget_minutes = 60
+modes = ["flake-hunt", "seeded-defects", "mutation", "coverage", "repro-build", "rehearsal"]
+
+[[gates.nightly.cells]]
+suites = ["boundary-sbx"]
+builds = ["macos-arm64-default"]
+platform = "macos-arm64-sbx"
+
+[[gates.nightly.cells]]
+suites = ["boundary-apple", "boundary-cli-native"]
+builds = ["macos-arm64-ci-guest-builtin"]
+
+[[gates.nightly.cells]]
+suites = ["soak-latency", "soak-public-registry", "soak-fuzz"]
+builds = ["linux-x64-default"]
+
+[[gates.nightly.cells]]
+suites = ["soak-private-registry"]
+builds = ["linux-x64-default"]
+platform = "linux-x64-private-registry"
+
+[[gates.nightly.cells]]
+suites = ["soak-guest"]
+builds = ["macos-arm64-ci-guest-builtin"]
+
+[gates.candidate]
+includes = ["main"]
+budget_minutes = 20
+
+[[gates.candidate.cells]]
+suites = ["artifact-entrypoints", "artifact-deps-scan", "artifact-upgrade-policy", "artifact-smoke", "artifact-switches", "artifact-measure"]
+builds = ["linux-x64-release", "linux-arm64-release", "macos-arm64-release-release", "windows-x64-release"]
+
+[[gates.candidate.cells]]
+suites = ["artifact-signed-boot"]
+builds = ["macos-arm64-release-release"]
+
+[[gates.candidate.cells]]
+suites = ["guest-boot", "guest-exec", "guest-import", "guest-network", "guest-upgrade", "guest-builder", "guest-strategy"]
+builds = ["macos-arm64-release-builtin"]
+
+[gates.promote]
+requires_gate = "candidate"
+budget_minutes = 20
+
+[[release_critical]]
+id = "guest.actual-awman-boot"
+suite = "guest-boot"
+tests = ["awman-cli::guest boot::actual_awman_boots_a_guest"]
+gates = ["main", "candidate"]
+not_overridable = true
+
+[[release_critical]]
+id = "guest.upgrade-from-previous-release"
+suite = "guest-upgrade"
+tests = ["awman-cli::guest upgrade::previous_release_state_upgrades_and_boots"]
+gates = ["main", "candidate"]
+not_overridable = true
+
+[[release_critical]]
+id = "guest.strategy-matrix"
+suite = "guest-strategy"
+# Each case checks the shipped descriptor's settings/prompt/overlay behavior and
+# proves that its synthetic agent ran inside a guest, with no host execution.
+tests = ["awman-cli::guest strategy::claude_named_skills","awman-cli::guest strategy::claude_all_skills","awman-cli::guest strategy::codex_named_skills","awman-cli::guest strategy::codex_all_skills","awman-cli::guest strategy::opencode_named_skills","awman-cli::guest strategy::opencode_all_skills","awman-cli::guest strategy::gemini_named_skills","awman-cli::guest strategy::gemini_all_skills","awman-cli::guest strategy::copilot_named_skills","awman-cli::guest strategy::copilot_all_skills","awman-cli::guest strategy::cline_named_skills","awman-cli::guest strategy::cline_all_skills","awman-cli::guest strategy::antigravity_named_skills","awman-cli::guest strategy::antigravity_all_skills"]
+gates = ["main", "candidate"]
+not_overridable = true
+
+[[release_critical]]
+id = "artifact.signed-offline-session"
+suite = "artifact-signed-boot"
+tests = ["awman-cli::artifact signed_boot::signed_artifact_runs_an_offline_session", "awman-cli::artifact signed_boot::signed_artifact_upgrades_previous_state_offline"]
+gates = ["candidate"]
+not_overridable = true
+
+[fixtures.guest-oci-base]
+file = "guest-oci-base.tar"
+tiers = ["guest", "artifact"]
+build = "guest-oci-base"
+pending = "P7: slice-guest-and-artifact-tiers publishes immutable archive and digest"
+
+[fixtures.msb-payload-aarch64-apple-darwin]
+verified_record = "third_party/msb-payloads/aarch64-apple-darwin"
+tiers = ["guest"]
+
+[previous_release.aarch64-apple-darwin]
+version = "v0.13.0"
+asset = "awman-macos-arm64"
+pending = "P7: authenticated published asset digest required"
+
+[[shipped_switch]]
+name = "AWMAN_TEST_ISOLATION"
+effect = "private host adapters; no service manager; loopback network; runtime CLIs disabled"
+reduces_only = true
+proof = "awman-cli::artifact switches::test_isolation_only_reduces_access"
+
+[[shipped_switch]]
+name = "AWMAN_TEST_DOCKER"
+effect = "under isolation only: allow the named real runtime; private stores and host adapter isolation persist"
+reduces_only = true
+proof = "awman-cli::artifact switches::runtime_opt_ins_have_no_effect_without_isolation"
+
+[[shipped_switch]]
+name = "AWMAN_TEST_APPLE_CONTAINER"
+effect = "under isolation only: allow the named real runtime; private stores and host adapter isolation persist"
+reduces_only = true
+proof = "awman-cli::artifact switches::runtime_opt_ins_have_no_effect_without_isolation"
+
+[[shipped_switch]]
+name = "AWMAN_TEST_SBX"
+effect = "under isolation only: allow the named real runtime; private stores and host adapter isolation persist"
+reduces_only = true
+proof = "awman-cli::artifact switches::runtime_opt_ins_have_no_effect_without_isolation"
+
+[[shipped_switch]]
+name = "AWMAN_TEST_BUILTIN"
+effect = "under isolation only: allow the named real runtime; private stores and host adapter isolation persist"
+reduces_only = true
+proof = "awman-cli::artifact switches::runtime_opt_ins_have_no_effect_without_isolation"
+
+[test_env]
+tier = "AWMAN_TEST_TIER"
+fixtures = "AWMAN_TEST_FIXTURES"
+artifact = "AWMAN_TEST_ARTIFACT"
+artifact_sha256 = "AWMAN_TEST_ARTIFACT_SHA256"
+run_config = "AWMAN_TEST_RUN_CONFIG"
+tmproot = "AWMAN_TEST_TMPROOT"
+evidence = "AWMAN_TEST_EVIDENCE_DIR"
+host_resources = "AWMAN_TEST_HOST_RESOURCES"
+
+# Lexically present but never read from a shipped process: namespace identifiers,
+# compile-time support metadata, reserved inert countdown spellings and cfg(test)
+# child protocols. Runtime controls above remain separate from shipped_switch.
+reserved_namespace_literal = "AWMAN_TEST_"
+reserved_namespace_identifier = "AWMAN_TEST_PREFIX"
+reserved_agent_countdown = "AWMAN_TEST_AGENT_DONE_COUNTDOWN_MS"
+reserved_yolo_countdown = "AWMAN_TEST_YOLO_COUNTDOWN_MS"
+test_apple_image = "AWMAN_TEST_APPLE_IMAGE"
+test_apple_keep_archive = "AWMAN_TEST_APPLE_KEEP_ARCHIVE"
+test_apple_kill_helper = "AWMAN_TEST_APPLE_KILL_HELPER"
+test_catalog = "AWMAN_TEST_CATALOG_072"
+test_embedded_child = "AWMAN_TEST_EMBEDDED_RESOLUTION_CHILD"
+test_process_overlay = "AWMAN_TEST_PROCESS_OVERLAY_ONLY"
+test_sbx_overlay = "AWMAN_TEST_SBX_OVERLAY_ONLY"
+build_target_metadata = "AWMAN_TEST_SUPPORT_TARGET"
+build_toolchain_metadata = "AWMAN_TEST_SUPPORT_TOOLCHAIN"
+test_panic_child = "AWMAN_TEST_TUI_STATUS_PANIC_CHILD"
+test_unknown_key = "AWMAN_TEST_UNPUBLISHED"
+
+[selection]
+full_run = ["src/**", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".cargo/**", "build.rs", "crates/*/build.rs", "ci/**", ".github/**", ".config/**", "xtask/**", "crates/awman-test-support/**", "tests/*/support/**", "Makefile", "tools/**", "third_party/**"]
+
+[discovery]
+allow = [{ path = "crates/awman-host-shims/src/kernel.rs", reason = "generated-constants-only: build.rs:138 emits msb_kernel.rs (AlignedKernel, KERNEL and placement/digest constants); no functions or tests" }, { path = "build.rs", reason = "build script" }, { path = "third_party/**", reason = "vendored crates" }]
+
+[groups.vm]
+max_threads_from = "platform.max_vms"
+
+[groups.docker]
+max_threads = 4
+
+[groups.apple]
+max_threads = 1
+
+[release]
+assets = ["awman-linux-amd64", "awman-linux-arm64", "awman-macos-arm64", "awman-windows-amd64.exe"]
+checksums = "SHA256SUMS"
+evidence_valid_days = 14
+candidate_retention_days = 90
+operator_path = "legacy"
+environment = "release"
+ci_guest_labels = ["self-hosted", "macOS", "ARM64", "awman-ci-guest"]
+release_labels = ["self-hosted", "macOS", "ARM64", "awman-release"]
+
+[[legacy_fallback]]
+path = ".github/workflows/release.yml"
+remove_when = "P4"
+
+# Status shim for the legacy required check names (design 13.1); deleted with P2.
+[[legacy_fallback]]
+path = ".github/workflows/test.yml"
+remove_when = "P2"
+
+# The frozen release.yml closure (design 16.9): release.yml runs
+# `tools/isolated-test.sh … --test builtin_runtime`.
+[[legacy_fallback]]
+path = "tools/isolated-test.sh"
+remove_when = "P4"
+
+[[legacy_fallback]]
+path = "tests/builtin_runtime/"
+remove_when = "P4"
+
+[[legacy_fallback]]
+path = "tests/helpers/"
+remove_when = "P4"
+
+# Legacy integration targets without a verified in-branch replacement for every
+# test (handoff/integrate-and-retire-legacy/target-verdicts.md). Each is
+# deleted, not migrated, when its owner's replacement has shadow evidence
+# (design 16.9). They run through `make legacy-test` meanwhile.
+[[legacy_fallback]]
+path = "tests/api_parity/"
+remove_when = "shadow:slice-layer3-frontends"
+
+[[legacy_fallback]]
+path = "tests/cli_parity/"
+remove_when = "shadow:slice-layer3-frontends"
+
+[[legacy_fallback]]
+path = "tests/binary_smoke/"
+remove_when = "shadow:slice-layer3-frontends"
+
+[[legacy_fallback]]
+path = "tests/engine/"
+remove_when = "shadow:slice-layer1-engine"
+
+[[legacy_fallback]]
+path = "tests/engine_parity/"
+remove_when = "shadow:slice-layer1-engine"
+
+[[legacy_fallback]]
+path = "tests/oci_import/"
+remove_when = "shadow:slice-layer1-engine"
+
+[[legacy_fallback]]
+path = "tests/data_layer/"
+remove_when = "shadow:slice-layer0-data"
+
+[[legacy_fallback]]
+path = "tests/command/"
+remove_when = "shadow:slice-layer2-commands"
+
+[[legacy_fallback]]
+path = "crates/awman-cli/tests/"
+remove_when = "shadow:slice-layer2-commands"
+
+[[legacy_fallback]]
+path = "tests/daemon/"
+remove_when = "shadow:slice-daemon-squad-worker"
+
+[[legacy_fallback]]
+path = "crates/awman-wsp/tests/"
+remove_when = "shadow:slice-daemon-squad-worker"
+
+[[legacy_fallback]]
+path = "tests/worker_native/"
+remove_when = "shadow:slice-guest-and-artifact-tiers"
+
+[[legacy_fallback]]
+path = "tests/fixtures/"
+remove_when = "shadow:slice-daemon-squad-worker"
+
+[[legacy_fallback]]
+path = "tests/dockerfile_build.rs"
+remove_when = "shadow:slice-boundary-tier"
+
+[[legacy_fallback]]
+path = "tests/squad_attach.rs"
+remove_when = "shadow:slice-daemon-squad-worker"
+
+[[legacy_fallback]]
+path = "tests/squad_attach_frontends.rs"
+remove_when = "shadow:slice-daemon-squad-worker"
+
+[[legacy_fallback]]
+path = "tests/squad_blockers.rs"
+remove_when = "shadow:slice-daemon-squad-worker"
+
+[[legacy_fallback]]
+path = "tests/squad_daemon_e2e.rs"
+remove_when = "shadow:slice-daemon-squad-worker"
+
+[[legacy_fallback]]
+path = "tests/squad_daemon_http.rs"
+remove_when = "shadow:slice-daemon-squad-worker"
+
+[[legacy_fallback]]
+path = "tests/squad_env_cli.rs"
+remove_when = "shadow:slice-daemon-squad-worker"
+
+[[legacy_fallback]]
+path = "tests/squad_env_daemon.rs"
+remove_when = "shadow:slice-daemon-squad-worker"
+
+[[legacy_fallback]]
+path = "tests/squad_env_sync.rs"
+remove_when = "shadow:slice-daemon-squad-worker"
+
+[[legacy_fallback]]
+path = "tests/squad_naming.rs"
+remove_when = "shadow:slice-daemon-squad-worker"
+
+[[legacy_fallback]]
+path = "tests/squad_repair_loop.rs"
+remove_when = "shadow:slice-daemon-squad-worker"
+
+[[legacy_fallback]]
+path = "tests/squad_runtime_discovery.rs"
+remove_when = "shadow:slice-daemon-squad-worker"
+
+[[legacy_fallback]]
+path = "tests/squad_sandbox_refusal.rs"
+remove_when = "shadow:slice-daemon-squad-worker"
+
+[[legacy_fallback]]
+path = "tests/squad_scheduler.rs"
+remove_when = "shadow:slice-daemon-squad-worker"
+
+[[legacy_fallback]]
+path = "tests/squad_status_marker.rs"
+remove_when = "shadow:slice-daemon-squad-worker"
+
+[[legacy_fallback]]
+path = "tests/squad_tui_tab.rs"
+remove_when = "shadow:slice-layer3-frontends"
+
+[[legacy_fallback]]
+path = "tests/worker_daemon.rs"
+remove_when = "shadow:slice-daemon-squad-worker"
+
+[[legacy_fallback]]
+path = "tests/worker_events.rs"
+remove_when = "shadow:slice-daemon-squad-worker"
+
+[[legacy_fallback]]
+path = "tests/worker_helper.rs"
+remove_when = "shadow:slice-daemon-squad-worker"
+
+[[legacy_fallback]]
+path = "tests/worker_lease_git.rs"
+remove_when = "shadow:slice-daemon-squad-worker"
+
+[[legacy_fallback]]
+path = "tests/worker_lease_run.rs"
+remove_when = "shadow:slice-daemon-squad-worker"
+
+[[legacy_fallback]]
+path = "tests/worker_mixed.rs"
+remove_when = "shadow:slice-daemon-squad-worker"
+
+[[legacy_fallback]]
+path = "tests/worker_native.rs"
+remove_when = "shadow:slice-guest-and-artifact-tiers"
+
+[[legacy_fallback]]
+path = "tests/worker_pull_auto.rs"
+remove_when = "shadow:slice-daemon-squad-worker"
+
+[[legacy_fallback]]
+path = "tests/worker_push_retry.rs"
+remove_when = "shadow:slice-daemon-squad-worker"
+
+[[legacy_fallback]]
+path = "tests/worker_security.rs"
+remove_when = "shadow:slice-daemon-squad-worker"
+
+[workflows.".github/workflows/ci.yml"]
+jobs = ["plan", "lint", "build", "test", "gate"]
+commands = ["gates check", "gates plan", "test archive", "test run", "evidence aggregate"]
+timeout_minutes = 60
+
+[workflows.".github/workflows/nightly.yml"]
+jobs = ["nightly"]
+commands = []
+timeout_minutes = 60
+
+[workflows.".github/workflows/candidate.yml"]
+jobs = ["preflight", "runner-preflight", "build", "assemble", "main-gate", "artifact", "guest", "repro", "gate", "promote"]
+commands = ["release candidate"]
+timeout_minutes = 60
+
+[workflows.".github/workflows/fixtures.yml"]
+jobs = ["build", "publish"]
+commands = ["fixtures build", "fixtures publish-plan"]
+timeout_minutes = 60
+
+# Nightly sbx requires a separately provisioned engine; removing it blocks this cell.
+[platforms.macos-arm64-sbx]
+runs_on = ["self-hosted", "macOS", "ARM64", "awman-ci-sbx"]
+triple = "aarch64-apple-darwin"
+toolchain = "1.94.0"
+image = "pending-provisioned-image-digest"
+trust = "ci-guest"
+provides = ["tempdir", "loopback", "subprocess", "awman-binary", "fake-cli", "local-git", "docker-sbx"]
+
+# Nightly private-registry soak needs separately provisioned credentials; without
+# them the cell reports BLOCKED. Removing the capability blocks this cell.
+[platforms.linux-x64-private-registry]
+runs_on = ["ubuntu-24.04"]
+triple = "x86_64-unknown-linux-gnu"
+toolchain = "1.94.0"
+image = "20261101.360"
+trust = "hosted"
+provides = ["tempdir", "loopback", "subprocess", "awman-binary", "fake-cli", "local-git", "public-network", "registry-credentials"]
+
+[workflows.".github/workflows/promote.yml"]
+jobs = ["verify-inputs", "publish", "verify"]
+commands = ["release promote", "release verify"]
+timeout_minutes = 60
+
+
+
+[suites.component-command-models]
+tier = "component"
+kind = "nextest"
+package = "awman-cli"
+target = "test:component"
+contracts = ["component-command-models"]
+requires = []
+paths = ["src/command/**", "tests/component/command/models.rs"]
+filter = "test(/^command::models::/)"
+budget_seconds = 120
+
+[suites.boundary-cli-native]
+tier = "boundary"
+kind = "nextest"
+package = "awman-cli"
+target = "lib"
+contracts = ["boundary-cli-native"]
+requires = ["apple-containers"]
+paths = ["crates/awman-cli/src/apple_transport/**"]
+filter = "test(/^apple_transport::native_tests::/)"
+budget_seconds = 120
+
+[[legacy_fallback]]
+path = "scripts/release.sh"
+remove_when = "P4"
+
+[[legacy_fallback]]
+path = "tools/release-runner.sh"
+remove_when = "P5"
+
+[[legacy_fallback]]
+path = "tools/test-release-runner.sh"
+remove_when = "P5"
+
+[[legacy_fallback]]
+path = "tools/measure-release-artifact.sh"
+remove_when = "P4"
+
+[[legacy_fallback]]
+path = "tools/release-offline-session.sh"
+remove_when = "P4"
+
+[[legacy_fallback]]
+path = "tools/release-artifact-check.sh"
+remove_when = "P4"
+
+[[legacy_fallback]]
+path = "tools/release-upgrade-policy.sh"
+remove_when = "P4"
+
+[[legacy_fallback]]
+path = "tools/test-build-previous-builtin-awman.sh"
+remove_when = "P4"
+
+[[legacy_fallback]]
+path = "tools/test-builtin-network.sh"
+remove_when = "P4"
+
+[[legacy_fallback]]
+path = "tools/prerelease-ci-gate.sh"
+remove_when = "P4"
+
+[[legacy_fallback]]
+path = "tools/test-release-provider-metadata.sh"
+remove_when = "P4"
+
+[[legacy_fallback]]
+path = "tools/test-builtin-hw.sh"
+remove_when = "P4"
+
+[[legacy_fallback]]
+path = "tools/test-msb-catalog-compat.sh"
+remove_when = "P4"
+
+[[legacy_fallback]]
+path = "tools/apple-silicon-prerelease.sh"
+remove_when = "P4"
+
+[[legacy_fallback]]
+path = "tools/test-msb-isolated-builder.sh"
+remove_when = "P4"
+
+[[legacy_fallback]]
+path = "tools/test-kernel-callback-smoke.sh"
+remove_when = "P4"
+
+[[legacy_fallback]]
+path = "tools/test-msb-protocol-compat.sh"
+remove_when = "P4"
+
+[[legacy_fallback]]
+path = "tools/test-release-upgrade-policy.sh"
+remove_when = "P4"
+
+[[legacy_fallback]]
+path = "tools/test-static-krunfw.sh"
+remove_when = "P4"
+
+[[legacy_fallback]]
+path = "tools/test-prerelease-ci-gate.sh"
+remove_when = "P4"
+
+[[legacy_fallback]]
+path = "tools/test-review-build-inputs.sh"
+remove_when = "P4"

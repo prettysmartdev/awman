@@ -297,8 +297,9 @@ mod tests {
     fn waiting_for_writers_returns_once_the_last_writer_is_dropped() {
         let tail = Arc::new(OutputTail::unbounded());
         let writer = tail.writer();
+        // Whether the writer finishes before or after the wait starts, the
+        // wait ends only once the last writer is gone and its bytes are in.
         let handle = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(50));
             writer.push_bytes(b"late\n");
         });
         assert!(tail.wait_for_writers(Duration::from_secs(5)));

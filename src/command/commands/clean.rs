@@ -436,7 +436,7 @@ impl CleanCommand {
         // matches a terminal workflow discovered above, or it carries a
         // `completed` marker file. Directories we cannot prove complete are
         // left untouched (conservative).
-        match crate::data::fs::ContextDirResolver::from_process_env() {
+        match crate::data::fs::ContextDirResolver::from_env(self.session.env()) {
             Ok(resolver) => {
                 let ctx_root = resolver.workflow_dir(uuid::Uuid::nil());
                 if let Some(ctx_root) = ctx_root.parent() {
@@ -507,7 +507,7 @@ impl CleanCommand {
         // a one-release safety net that awman never reads. Only those three
         // exact filenames are candidates, and the live shared database is
         // explicitly excluded so this rule can never touch it.
-        discover_pre_migration_backups(sink, summary);
+        discover_pre_migration_backups(self.session.env(), sink, summary);
     }
 
     /// Category 6: the squad daemon's stored environment.
@@ -774,8 +774,12 @@ fn remove_path(path: &Path) -> std::io::Result<()> {
 /// legacy API root. The live shared database is never a candidate: it lives
 /// under `DataPaths::db_path()` and carries no `.pre-migration` suffix, and the
 /// explicit inequality check below makes that guarantee unconditional.
-fn discover_pre_migration_backups(sink: &mut dyn CleanCommandFrontend, summary: &mut CleanSummary) {
-    let api_paths = match crate::data::fs::ApiPaths::from_process_env() {
+fn discover_pre_migration_backups(
+    env: &crate::data::config::env::EnvSnapshot,
+    sink: &mut dyn CleanCommandFrontend,
+    summary: &mut CleanSummary,
+) {
+    let api_paths = match crate::data::fs::ApiPaths::from_env(env) {
         Ok(paths) => paths,
         Err(e) => {
             emit(
@@ -850,13 +854,6 @@ mod tests {
     use std::path::PathBuf;
     use tempfile::TempDir;
 
-    // ─── Env-var mutations ────────────────────────────────────────────────────
-    // Tests that set AWMAN_HOME take `ConfigHomeGuard`, the one lock
-    // over that process-wide variable. A mutex private to this module would
-    // serialise these tests against each other only, leaving them free to
-    // repoint the config home under a `dispatch` or `overlay` test.
-    use crate::data::config::env::ConfigHomeGuard;
-
     // ─── Minimal test frontend ────────────────────────────────────────────────
 
     struct TestFrontend {
@@ -919,10 +916,26 @@ mod tests {
     }
 
     fn make_cmd(tmp: &TempDir, dry_run: bool, yes: bool) -> CleanCommand {
+        make_cmd_at_home(tmp, &tmp.path().join("isolated-home"), dry_run, yes)
+    }
+
+    fn make_cmd_at_home(
+        tmp: &TempDir,
+        home: &std::path::Path,
+        dry_run: bool,
+        yes: bool,
+    ) -> CleanCommand {
+        std::fs::create_dir_all(home).unwrap();
         CleanCommand::new(
             CleanFlags { yes, dry_run },
             make_engines_no_docker(tmp.path()),
-            Session::for_tests(tmp.path()),
+            Session::for_tests_with_env(
+                tmp.path(),
+                crate::data::config::env::EnvSnapshot::with_overrides([
+                    ("AWMAN_HOME", home.to_str().unwrap()),
+                    ("HOME", home.to_str().unwrap()),
+                ]),
+            ),
         )
     }
 
@@ -1195,9 +1208,8 @@ mod tests {
         write_workflow_state(&wf_dir, "abcd1234-test.json", true);
 
         let home = TempDir::new().unwrap();
-        let _env = ConfigHomeGuard::set(home.path());
 
-        let cmd = make_cmd(&tmp, true, false);
+        let cmd = make_cmd_at_home(&tmp, home.path(), true, false);
         let mut fe = TestFrontend::no();
         let summary = cmd.discover(&mut fe);
 
@@ -1218,9 +1230,8 @@ mod tests {
         write_workflow_state(&workflow_dir, "state.json", true);
 
         let home = TempDir::new().unwrap();
-        let _env = ConfigHomeGuard::set(home.path());
 
-        let cmd = make_cmd(&tmp, true, false);
+        let cmd = make_cmd_at_home(&tmp, home.path(), true, false);
         let mut fe = TestFrontend::no();
         let summary = cmd.discover(&mut fe);
 
@@ -1241,9 +1252,8 @@ mod tests {
         std::fs::create_dir_all(&workflow_dir).unwrap();
 
         let home = TempDir::new().unwrap();
-        let _env = ConfigHomeGuard::set(home.path());
 
-        let cmd = make_cmd(&tmp, true, false);
+        let cmd = make_cmd_at_home(&tmp, home.path(), true, false);
         let mut fe = TestFrontend::no();
         let summary = cmd.discover(&mut fe);
 
@@ -1270,9 +1280,8 @@ mod tests {
         );
 
         let home = TempDir::new().unwrap();
-        let _env = ConfigHomeGuard::set(home.path());
 
-        let cmd = make_cmd(&tmp, true, false);
+        let cmd = make_cmd_at_home(&tmp, home.path(), true, false);
         let mut fe = TestFrontend::no();
         let summary = cmd.discover(&mut fe);
 
@@ -1313,9 +1322,8 @@ mod tests {
         std::fs::write(&path, serde_json::to_string(&state).unwrap()).unwrap();
 
         let home = TempDir::new().unwrap();
-        let _env = ConfigHomeGuard::set(home.path());
 
-        let cmd = make_cmd(&tmp, true, false);
+        let cmd = make_cmd_at_home(&tmp, home.path(), true, false);
         let mut fe = TestFrontend::no();
         let summary = cmd.discover(&mut fe);
 
@@ -1337,9 +1345,8 @@ mod tests {
         std::fs::write(wf_dir.join("bad.json"), b"{invalid}").unwrap();
 
         let home = TempDir::new().unwrap();
-        let _env = ConfigHomeGuard::set(home.path());
 
-        let cmd = make_cmd(&tmp, true, false);
+        let cmd = make_cmd_at_home(&tmp, home.path(), true, false);
         let mut fe = TestFrontend::no();
         let summary = cmd.discover(&mut fe);
 
@@ -1361,9 +1368,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
 
         let home = TempDir::new().unwrap();
-        let _env = ConfigHomeGuard::set(home.path());
 
-        let cmd = make_cmd(&tmp, true, false);
+        let cmd = make_cmd_at_home(&tmp, home.path(), true, false);
         let mut fe = TestFrontend::no();
         let summary = cmd.discover(&mut fe);
 
@@ -1385,7 +1391,6 @@ mod tests {
         let tmp = TempDir::new().unwrap();
 
         let home = TempDir::new().unwrap();
-        let _env = ConfigHomeGuard::set(home.path());
 
         // Create a context dir with a `completed` marker file
         let ctx_root = home.path().join("context").join("workflows");
@@ -1393,7 +1398,7 @@ mod tests {
         std::fs::create_dir_all(&ctx_dir).unwrap();
         std::fs::write(ctx_dir.join("completed"), b"").unwrap();
 
-        let cmd = make_cmd(&tmp, true, false);
+        let cmd = make_cmd_at_home(&tmp, home.path(), true, false);
         let mut fe = TestFrontend::no();
         let summary = cmd.discover(&mut fe);
 
@@ -1411,7 +1416,6 @@ mod tests {
         let wf_dir = tmp.path().join(".awman").join("workflows");
 
         let home = TempDir::new().unwrap();
-        let _env = ConfigHomeGuard::set(home.path());
 
         // Write a completed workflow; capture its invocation_id
         let step = crate::data::workflow_definition::WorkflowStep {
@@ -1443,7 +1447,7 @@ mod tests {
         let ctx_dir = ctx_root.join(uuid.to_string());
         std::fs::create_dir_all(&ctx_dir).unwrap();
 
-        let cmd = make_cmd(&tmp, true, false);
+        let cmd = make_cmd_at_home(&tmp, home.path(), true, false);
         let mut fe = TestFrontend::no();
         let summary = cmd.discover(&mut fe);
 
@@ -1464,14 +1468,13 @@ mod tests {
         let tmp = TempDir::new().unwrap();
 
         let home = TempDir::new().unwrap();
-        let _env = ConfigHomeGuard::set(home.path());
 
         // Context dir with no marker and no terminal workflow match
         let ctx_root = home.path().join("context").join("workflows");
         let ctx_dir = ctx_root.join("00000000-0000-0000-0000-000000000001");
         std::fs::create_dir_all(&ctx_dir).unwrap();
 
-        let cmd = make_cmd(&tmp, true, false);
+        let cmd = make_cmd_at_home(&tmp, home.path(), true, false);
         let mut fe = TestFrontend::no();
         let summary = cmd.discover(&mut fe);
 
@@ -1488,7 +1491,6 @@ mod tests {
         let tmp = TempDir::new().unwrap();
 
         let home = TempDir::new().unwrap();
-        let _env = ConfigHomeGuard::set(home.path());
 
         let outside = TempDir::new().unwrap();
         std::fs::write(outside.path().join("completed"), b"").unwrap();
@@ -1497,7 +1499,7 @@ mod tests {
         let symlink_path = ctx_root.join("00000000-0000-0000-0000-000000000001");
         std::os::unix::fs::symlink(outside.path(), &symlink_path).unwrap();
 
-        let cmd = make_cmd(&tmp, true, false);
+        let cmd = make_cmd_at_home(&tmp, home.path(), true, false);
         let mut fe = TestFrontend::no();
         let summary = cmd.discover(&mut fe);
 
@@ -1642,9 +1644,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
 
         let home = TempDir::new().unwrap();
-        let _env = ConfigHomeGuard::set(home.path());
 
-        let cmd = make_cmd(&tmp, false, false);
+        let cmd = make_cmd_at_home(&tmp, home.path(), false, false);
         let fe = Box::new(TestFrontend::no());
         let rt = tokio::runtime::Runtime::new().unwrap();
         let result = rt.block_on(cmd.run_with_frontend(fe));
@@ -1660,7 +1661,6 @@ mod tests {
         let tmp = TempDir::new().unwrap();
 
         let home = TempDir::new().unwrap();
-        let _env = ConfigHomeGuard::set(home.path());
 
         // Use a frontend that would panic if confirm is called
         struct NoConfirmFrontend {
@@ -1678,7 +1678,7 @@ mod tests {
             }
         }
 
-        let cmd = make_cmd(&tmp, false, false);
+        let cmd = make_cmd_at_home(&tmp, home.path(), false, false);
         let fe = Box::new(NoConfirmFrontend { messages: vec![] });
         let rt = tokio::runtime::Runtime::new().unwrap();
         let outcome = rt.block_on(cmd.run_with_frontend(fe)).unwrap();
@@ -1692,9 +1692,8 @@ mod tests {
         write_workflow_state(&wf_dir, "done.json", true);
 
         let home = TempDir::new().unwrap();
-        let _env = ConfigHomeGuard::set(home.path());
 
-        let cmd = make_cmd(&tmp, true /* dry_run */, false);
+        let cmd = make_cmd_at_home(&tmp, home.path(), true /* dry_run */, false);
         let fe = Box::new(TestFrontend::yes());
         let rt = tokio::runtime::Runtime::new().unwrap();
         let outcome = rt.block_on(cmd.run_with_frontend(fe)).unwrap();
@@ -1715,9 +1714,8 @@ mod tests {
         write_workflow_state(&wf_dir, "done.json", true);
 
         let home = TempDir::new().unwrap();
-        let _env = ConfigHomeGuard::set(home.path());
 
-        let cmd = make_cmd(&tmp, false, false);
+        let cmd = make_cmd_at_home(&tmp, home.path(), false, false);
         let fe = Box::new(TestFrontend::no());
         let rt = tokio::runtime::Runtime::new().unwrap();
         let outcome = rt.block_on(cmd.run_with_frontend(fe)).unwrap();
@@ -1739,9 +1737,8 @@ mod tests {
         assert!(file_path.exists());
 
         let home = TempDir::new().unwrap();
-        let _env = ConfigHomeGuard::set(home.path());
 
-        let cmd = make_cmd(&tmp, false, false);
+        let cmd = make_cmd_at_home(&tmp, home.path(), false, false);
         let fe = Box::new(TestFrontend::yes());
         let rt = tokio::runtime::Runtime::new().unwrap();
         let outcome = rt.block_on(cmd.run_with_frontend(fe)).unwrap();
@@ -1769,9 +1766,8 @@ mod tests {
         let file_path = wf_dir.join("done.json");
 
         let home = TempDir::new().unwrap();
-        let _env = ConfigHomeGuard::set(home.path());
 
-        let cmd = make_cmd(&tmp, false, true);
+        let cmd = make_cmd_at_home(&tmp, home.path(), false, true);
         let fe = Box::new(TestFrontend::no());
         let rt = tokio::runtime::Runtime::new().unwrap();
         let outcome = rt.block_on(cmd.run_with_frontend(fe)).unwrap();
@@ -1790,9 +1786,8 @@ mod tests {
             write_workflow_state(&wf_dir, "done.json", true);
 
             let home = TempDir::new().unwrap();
-            let _env = ConfigHomeGuard::set(home.path());
 
-            let cmd = make_cmd(&tmp, false, yes);
+            let cmd = make_cmd_at_home(&tmp, home.path(), false, yes);
             let fe = TestFrontend::yes();
             let shown = std::sync::Arc::new(std::sync::Mutex::new(false));
             let asked = std::sync::Arc::new(std::sync::Mutex::new(false));
@@ -1846,9 +1841,8 @@ mod tests {
         write_workflow_state(&wf_dir, "pending.json", false);
 
         let home = TempDir::new().unwrap();
-        let _env = ConfigHomeGuard::set(home.path());
 
-        let cmd = make_cmd(&tmp, false, false);
+        let cmd = make_cmd_at_home(&tmp, home.path(), false, false);
         let fe = Box::new(TestFrontend::yes());
         let rt = tokio::runtime::Runtime::new().unwrap();
         let outcome = rt.block_on(cmd.run_with_frontend(fe)).unwrap();
@@ -1877,14 +1871,13 @@ mod tests {
         std::fs::remove_file(&missing_file).unwrap();
 
         let home = TempDir::new().unwrap();
-        let _env = ConfigHomeGuard::set(home.path());
 
         // We need discover to have seen missing.json, then delete to fail.
         // But discover reads the dir at runtime — missing.json is gone.
         // Use delete() directly via test helper approach: construct summary manually.
         // Since we can't call discover() from outside and the file is gone,
         // use delete() directly instead.
-        let cmd = make_cmd(&tmp, false, true);
+        let cmd = make_cmd_at_home(&tmp, home.path(), false, true);
         let summary = CleanSummary {
             repo_workflows: vec![
                 CleanPath {
@@ -1916,7 +1909,6 @@ mod tests {
         std::fs::create_dir_all(&wf_dir).unwrap();
 
         let home = TempDir::new().unwrap();
-        let _env = ConfigHomeGuard::set(home.path());
 
         // Write a completed workflow file, then get a summary with an extra
         // non-existent path to force a partial failure.
@@ -1946,7 +1938,7 @@ mod tests {
             }
         }
 
-        let cmd = make_cmd(&tmp, false, false);
+        let cmd = make_cmd_at_home(&tmp, home.path(), false, false);
         let fe = Box::new(ErrFrontend { messages: vec![] });
         let rt = tokio::runtime::Runtime::new().unwrap();
         let result = rt.block_on(cmd.run_with_frontend(fe));

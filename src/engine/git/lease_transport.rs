@@ -731,7 +731,6 @@ impl GitEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::message::RecordingMessageSink;
 
     const SECRET: &str = "tok-LEASE-SECRET-42";
 
@@ -743,22 +742,6 @@ mod tests {
             expires_at: None,
         }))
         .unwrap()
-    }
-
-    fn helper_script(dir: &Path) -> HelperProgram {
-        // Speaks the same file protocol as the awman subcommand.
-        let script = dir.join("helper.sh");
-        std::fs::write(
-            &script,
-            "#!/bin/sh\n[ \"$2\" = get ] || exit 0\ncat >/dev/null\ngrep -q \"^nonce=$1\\$\" \"$AWMAN_LEASE_CREDENTIAL_FILE\" || exit 0\ngrep -E '^(username|password)=' \"$AWMAN_LEASE_CREDENTIAL_FILE\"\n",
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
-        }
-        HelperProgram::custom(script, vec![])
     }
 
     fn install(parent: &Path, program: HelperProgram) -> LeaseCredentialHelper {
@@ -969,7 +952,7 @@ mod tests {
         }
         for url in [
             "https://git.example/r.git",
-            "http://127.0.0.1:8080/r.git",
+            "http://127.0.0.1/r.git",
             "ssh://git@git.example/r.git",
             "git@git.example:team/r.git",
         ] {
@@ -1004,7 +987,8 @@ mod tests {
             HelperProgram::awman("/bin/awman".into()),
         ));
         let transport = LeaseTransport::with_helper(helper, LeaseUrlPolicy::default());
-        let engine = GitEngine::new();
+        // Built, never spawned: the snapshot names no programs.
+        let engine = GitEngine::with_env(crate::data::config::env::EnvSnapshot::empty());
         let command =
             lease_transport_command(engine.env(), tmp.path(), "origin", &transport).unwrap();
         assert_eq!(
@@ -1048,231 +1032,26 @@ mod tests {
                 .display()
                 .contains(SECRET)
         );
-        // Push-back `ls-remote` and push are built by the same builder: the
-        // same isolation, helper and pinned pack programs as clone/fetch.
-        let clone = tmp.path().join("clone");
-        std::fs::create_dir(&clone).unwrap();
-        git(&clone, &["init", "-q", "-b", "main"]);
-        let push = engine
-            .isolate_remote_push(&clone, "https://git.example/team/app.git")
-            .unwrap()
-            .with_lease_transport(transport.clone());
-        let push_command = push.command(true).unwrap();
-        let push_args = args_of(&push_command);
-        for key in [
-            "GIT_CONFIG_GLOBAL",
-            "GIT_CONFIG_NOSYSTEM",
-            "GIT_TERMINAL_PROMPT",
-        ] {
-            assert_eq!(env_of(&push_command, key), env_of(&command, key), "{key}");
-        }
-        assert!(env_of(&push_command, LEASE_CREDENTIAL_FILE_ENV).is_some());
-        assert!(env_of(&push_command, "GIT_SSH_COMMAND").is_none());
-        for pinned in [
-            "credential.useHttpPath=true",
-            "credential.helper=",
-            "protocol.file.allow=never",
-            "remote.origin.uploadpack=git-upload-pack",
-            "remote.origin.receivepack=git-receive-pack",
-            "core.hooksPath=/dev/null",
-            "push.followTags=false",
-        ] {
-            assert!(
-                push_args.iter().any(|a| a == pinned),
-                "{pinned}: {push_args:?}"
-            );
-        }
-        assert!(
-            push_args.iter().all(|a| !a.contains(SECRET)),
-            "{push_args:?}"
-        );
-        let ours = |args: &[String]| {
-            args.iter()
-                .find(|a| a.starts_with("credential.helper=!"))
-                .cloned()
-        };
-        assert_eq!(ours(&push_args), ours(&args));
+        // The push-back builder (which needs a real clone) is checked against
+        // this one in the component tier: engine::git::lease_push_back_*.
     }
 
     #[test]
-    fn real_git_invokes_lease_helper_with_global_config_isolated() {
+    fn production_policy_refuses_a_local_path_before_git_runs() {
         let tmp = tempfile::tempdir().unwrap();
-        let helper = Arc::new(install(&tmp.path().join("c"), helper_script(tmp.path())));
-        let transport = LeaseTransport::with_helper(helper, LeaseUrlPolicy::default());
-        let engine = GitEngine::new();
-        let mut command =
-            lease_transport_command(engine.env(), tmp.path(), "origin", &transport).unwrap();
-        command
-            .args(["credential", "fill"])
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-        let mut child = command.spawn().unwrap();
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(b"protocol=https\nhost=git.example\npath=team/app.git\n\n")
-            .unwrap();
-        let output = child.wait_with_output().unwrap();
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(stdout.contains(&format!("password={SECRET}")), "{stdout}");
-        assert!(stdout.contains("username=x-access-token"));
-    }
-
-    fn git(dir: &Path, args: &[&str]) -> String {
-        let out = std::process::Command::new("git")
-            .args(args)
-            .current_dir(dir)
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_AUTHOR_NAME", "t")
-            .env("GIT_AUTHOR_EMAIL", "t@e")
-            .env("GIT_COMMITTER_NAME", "t")
-            .env("GIT_COMMITTER_EMAIL", "t@e")
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "git {args:?}: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        String::from_utf8_lossy(&out.stdout).trim().to_string()
-    }
-
-    fn bare_repo(root: &Path) -> PathBuf {
-        let bare = root.join("origin.git");
-        std::fs::create_dir_all(&bare).unwrap();
-        git(&bare, &["init", "--bare", "-q", "-b", "main"]);
-        let seed = root.join("seed");
-        std::fs::create_dir_all(&seed).unwrap();
-        git(&seed, &["init", "-q", "-b", "main"]);
-        std::fs::write(seed.join("a.txt"), "a").unwrap();
-        git(&seed, &["add", "."]);
-        git(&seed, &["commit", "-qm", "seed"]);
-        git(&seed, &["checkout", "-qb", "feature"]);
-        std::fs::write(seed.join("b.txt"), "b").unwrap();
-        git(&seed, &["add", "."]);
-        git(&seed, &["commit", "-qm", "feature"]);
-        git(
-            &seed,
-            &["push", "-q", bare.to_str().unwrap(), "main", "feature"],
-        );
-        bare
-    }
-
-    #[test]
-    fn real_git_lease_clone_fetch_ls_remote_and_push_leave_no_secret_in_git_config() {
-        let tmp = tempfile::tempdir().unwrap();
-        let bare = bare_repo(tmp.path());
-        let url = bare.to_str().unwrap().to_string();
-        let policy = LeaseUrlPolicy { allow_local: true };
-        // A local remote never asks for credentials; the helper is still
-        // installed on every operation (its scope is the configured HTTPS host).
-        let helper = Arc::new(
-            LeaseCredentialHelper::install(
-                &tmp.path().join("creds"),
-                "https://git.example/team/app.git",
-                &bearer(),
-                helper_script(tmp.path()),
-                policy,
-            )
-            .unwrap(),
-        );
-        let transport = LeaseTransport::with_helper(helper, policy);
-        let engine = GitEngine::new();
-        let mut sink = RecordingMessageSink::new();
-        let cancel = CancellationToken::new();
-        let clone = tmp.path().join("work").join("leases").join("lease_x");
-        engine
-            .clone_with_lease_transport(&url, Some("main"), &clone, &transport, &mut sink, &cancel)
-            .unwrap();
-        engine
-            .fetch_with_lease_transport(
-                &clone,
-                &["+refs/heads/feature:refs/remotes/origin/feature".into()],
-                &transport,
-                &mut sink,
-                &cancel,
-            )
-            .unwrap();
-        let heads = engine
-            .ls_remote_with_lease_transport(&url, &transport, &mut sink, &cancel)
-            .unwrap();
-        assert!(heads.contains_key("refs/heads/feature"));
-        std::fs::write(clone.join("c.txt"), "c").unwrap();
-        let push = engine
-            .isolate_remote_push(&clone, &url)
-            .unwrap()
-            .with_lease_transport(transport.clone());
-        push.commit_leftovers("lease work", &mut sink).unwrap();
-        let head = push.push("wsp/lease", &mut sink).unwrap();
-        assert_eq!(
-            push.origin_sha("wsp/lease", &mut sink).unwrap().as_deref(),
-            Some(head.as_str())
-        );
-        assert_eq!(git(&bare, &["rev-parse", "refs/heads/wsp/lease"]), head);
-        let config = std::fs::read_to_string(clone.join(".git/config")).unwrap();
-        assert!(
-            !config.contains(SECRET) && !config.contains("credential"),
-            "{config}"
-        );
-        let log = format!("{:?}", sink);
-        assert!(!log.contains(SECRET));
-    }
-
-    #[test]
-    fn real_git_lease_failure_is_classified_and_cancellation_kills_git() {
-        let tmp = tempfile::tempdir().unwrap();
-        let engine = GitEngine::new();
-        let mut sink = RecordingMessageSink::new();
-        let policy = LeaseUrlPolicy { allow_local: true };
-        let transport = LeaseTransport::anonymous(policy);
+        let engine = GitEngine::with_env(crate::data::config::env::EnvSnapshot::empty());
         let missing = tmp.path().join("missing.git");
-        let err = engine
-            .ls_remote_with_lease_transport(
-                missing.to_str().unwrap(),
-                &transport,
-                &mut sink,
-                &CancellationToken::new(),
-            )
-            .unwrap_err();
-        assert!(
-            matches!(
-                err,
-                EngineError::Git(_)
-                    | EngineError::GitTransport { .. }
-                    | EngineError::GitRejected { .. }
-            ),
-            "{err:?}"
-        );
-        let cancel = CancellationToken::new();
-        cancel.cancel();
-        let err = engine
-            .ls_remote_with_lease_transport(
-                missing.to_str().unwrap(),
-                &transport,
-                &mut sink,
-                &cancel,
-            )
-            .unwrap_err();
-        assert!(err.to_string().contains("cancelled"), "{err}");
-        // Refused before Git runs: a local path under the production policy.
         assert!(engine
             .clone_with_lease_transport(
                 missing.to_str().unwrap(),
                 None,
                 &tmp.path().join("d"),
                 &LeaseTransport::anonymous(LeaseUrlPolicy::default()),
-                &mut sink,
+                &mut crate::data::message::RecordingMessageSink::new(),
                 &CancellationToken::new()
             )
             .is_err());
+        assert!(!tmp.path().join("d").exists());
     }
 }
 
@@ -1306,13 +1085,23 @@ mod hostile_environment_tests {
         {
             assert!(clean.get_os(key).is_none(), "{key}");
         }
-        let mut command =
+        // Built, not run (the run is engine::git::lease_git_discards_ambient_*
+        // in the component tier): no hostile variable reaches the child.
+        let command =
             lease_transport_command(&snapshot, root.path(), "origin", &LeaseTransport::default())
                 .unwrap();
-        command.args(["config", "--get-regexp", "^url\\."]);
-        let output = command.output().unwrap();
-        assert_eq!(output.status.code(), Some(1));
-        assert!(output.stdout.is_empty() && output.stderr.is_empty());
+        let hostile: Vec<&str> = snapshot
+            .var_names()
+            .into_iter()
+            .filter(|name| *name != "PATH")
+            .collect();
+        let leaked: Vec<_> = command
+            .get_envs()
+            .filter(|(key, value)| {
+                value.is_some() && hostile.iter().any(|h| std::ffi::OsStr::new(h) == *key)
+            })
+            .collect();
+        assert!(leaked.is_empty(), "reaches lease git: {leaked:?}");
     }
     #[test]
     fn remote_diagnostics_redact_plain_and_basic_encoded_repository_secrets() {

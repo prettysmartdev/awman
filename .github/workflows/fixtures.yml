@@ -1,0 +1,84 @@
+name: Fixtures
+on:
+  workflow_dispatch:
+    inputs:
+      base_url:
+        description: HTTPS URL of a reviewed arm64 Docker-save base archive
+        required: true
+        type: string
+      base_sha256:
+        description: Verified SHA-256 of the base archive
+        required: true
+        type: string
+      tag:
+        description: New immutable fixtures-* release tag
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: fixtures-${{ github.run_id }}
+  cancel-in-progress: false
+jobs:
+  build:
+    if: ${{ github.ref == 'refs/heads/main' }}
+    environment: fixtures
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: '1.94.0'
+      - name: Resolve the fixture publication plan
+        run: cargo xtask fixtures publish-plan > fixture-plan.json
+      - name: Build the reviewed immutable guest fixture
+        env:
+          BASE_URL: ${{ inputs.base_url }}
+          BASE_SHA256: ${{ inputs.base_sha256 }}
+        run: |
+          [[ "$BASE_URL" == https://* ]] || exit 1
+          [[ "$BASE_SHA256" =~ ^[0-9a-f]{64}$ ]] || exit 1
+          curl --fail --location --proto '=https' --proto-redir '=https' --output base.tar "$BASE_URL"
+          mkdir -p out
+          cargo xtask fixtures build guest-oci-base --base base.tar --sha256 "$BASE_SHA256" --out built
+          cp built/fixture-oci.tar out/guest-oci-base.tar
+          (cd out && sha256sum guest-oci-base.tar > SHA256SUMS)
+          cp fixture-plan.json out/
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fixture-${{ github.run_id }}
+          path: out/
+          if-no-files-found: error
+          retention-days: 90
+  publish:
+    needs: build
+    if: ${{ github.ref == 'refs/heads/main' }}
+    environment: fixtures
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: fixture-${{ github.run_id }}
+          path: out
+      - name: Publish once and retain the exact digest for the manifest review
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ inputs.tag }}
+          COMMIT: ${{ github.sha }}
+        run: |
+          [[ "$TAG" =~ ^fixtures-[a-zA-Z0-9._-]+$ ]] || exit 1
+          (cd out && sha256sum -c SHA256SUMS)
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo 'Refusing to replace an existing fixture release' >&2
+            exit 1
+          fi
+          gh release create "$TAG" --target "$COMMIT" --title "$TAG" --notes-file out/SHA256SUMS out/*
+          cat out/SHA256SUMS >> "$GITHUB_STEP_SUMMARY"
+          echo 'P7 remains open until the downloaded public bytes and all previous-release assets are verified and committed in ci/gates.toml.' >> "$GITHUB_STEP_SUMMARY"

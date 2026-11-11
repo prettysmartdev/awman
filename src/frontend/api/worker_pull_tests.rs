@@ -222,7 +222,7 @@ fn assert_error(status: u16, body: &serde_json::Value, want_status: u16, code: &
 async fn servers_routes_report_connection_state_per_work_server() {
     let f = fixture(true, true);
     let Some(addr) = serve(f.api.clone(), super::super::routes::ListenerPolicy::Local).await else {
-        return;
+        panic!("BLOCKED[loopback]: worker-pull fixture could not bind");
     };
     let (status, body) = call(addr, "GET", "/v1/worker/servers", None).await;
     assert_eq!(status, 200, "{body}");
@@ -246,7 +246,7 @@ async fn servers_routes_report_connection_state_per_work_server() {
 async fn servers_without_a_pull_worker_come_from_config() {
     let f = fixture(false, true);
     let Some(addr) = serve(f.api.clone(), super::super::routes::ListenerPolicy::Local).await else {
-        return;
+        panic!("BLOCKED[loopback]: worker-pull fixture could not bind");
     };
     let (status, body) = call(addr, "GET", "/v1/worker/servers/team", None).await;
     assert_eq!(status, 200, "{body}");
@@ -256,7 +256,7 @@ async fn servers_without_a_pull_worker_come_from_config() {
     let off = fixture(false, false);
     let Some(addr) = serve(off.api.clone(), super::super::routes::ListenerPolicy::Local).await
     else {
-        return;
+        panic!("BLOCKED[loopback]: worker-pull fixture could not bind");
     };
     let (_, body) = call(addr, "GET", "/v1/worker/servers/team", None).await;
     assert_eq!(body["state"], "disabled");
@@ -266,7 +266,7 @@ async fn servers_without_a_pull_worker_come_from_config() {
 async fn queue_lists_eligible_items_as_items_and_next_cursor() {
     let f = fixture(true, true);
     let Some(addr) = serve(f.api.clone(), super::super::routes::ListenerPolicy::Local).await else {
-        return;
+        panic!("BLOCKED[loopback]: worker-pull fixture could not bind");
     };
     let (status, body) = call(addr, "GET", "/v1/worker/queue?server=team&limit=1", None).await;
     assert_eq!(status, 200, "{body}");
@@ -297,7 +297,7 @@ async fn queue_and_claim_are_refused_while_pull_is_off_or_not_running() {
         let f = fixture(with_pull, enabled);
         let Some(addr) = serve(f.api.clone(), super::super::routes::ListenerPolicy::Local).await
         else {
-            return;
+            panic!("BLOCKED[loopback]: worker-pull fixture could not bind");
         };
         let (status, body) = call(addr, "GET", "/v1/worker/queue", None).await;
         assert_error(status, &body, 503, "pull_disabled");
@@ -314,7 +314,7 @@ async fn queue_and_claim_are_refused_while_pull_is_off_or_not_running() {
 async fn claim_returns_a_lease_resource_with_lease_ids_and_server_lease_id() {
     let f = fixture(true, true);
     let Some(addr) = serve(f.api.clone(), super::super::routes::ListenerPolicy::Local).await else {
-        return;
+        panic!("BLOCKED[loopback]: worker-pull fixture could not bind");
     };
     let (status, body) = call(addr, "POST", "/v1/worker/queue/01J/claim?server=team", None).await;
     assert_eq!(status, 201, "{body}");
@@ -353,7 +353,7 @@ async fn claim_returns_a_lease_resource_with_lease_ids_and_server_lease_id() {
 async fn leases_list_get_and_release_follow_the_lease_lifecycle() {
     let f = fixture(true, true);
     let Some(addr) = serve(f.api.clone(), super::super::routes::ListenerPolicy::Local).await else {
-        return;
+        panic!("BLOCKED[loopback]: worker-pull fixture could not bind");
     };
     let mut ids = Vec::new();
     for item in ["one", "two", "three"] {
@@ -452,7 +452,7 @@ async fn pull_routes_are_local_only() {
     )
     .await
     else {
-        return;
+        panic!("BLOCKED[loopback]: worker-pull fixture could not bind");
     };
     for (method, path) in [
         ("GET", "/v1/worker/servers"),
@@ -479,7 +479,7 @@ async fn pull_routes_are_local_only() {
 async fn status_reports_worker_push_and_pull_and_pull_capabilities_only_when_running() {
     let f = fixture(true, true);
     let Some(addr) = serve(f.api.clone(), super::super::routes::ListenerPolicy::Local).await else {
-        return;
+        panic!("BLOCKED[loopback]: worker-pull fixture could not bind");
     };
     call(addr, "POST", "/v1/worker/queue/x/claim", None).await;
     let (status, body) = call(addr, "GET", "/v1/status", None).await;
@@ -535,7 +535,7 @@ async fn status_reports_worker_push_and_pull_and_pull_capabilities_only_when_run
     )
     .await
     else {
-        return;
+        panic!("BLOCKED[loopback]: worker-pull fixture could not bind");
     };
     let (_, body) = call(addr, "GET", "/v1/status", None).await;
     let caps = body["capabilities"].as_array().unwrap();
@@ -604,7 +604,7 @@ async fn push_status_counts_pushed_commands_and_not_pulled_ones() {
     assert_eq!(push.running, 0);
 
     let Some(addr) = serve(f.api.clone(), super::super::routes::ListenerPolicy::Local).await else {
-        return;
+        panic!("BLOCKED[loopback]: worker-pull fixture could not bind");
     };
     let (status, pushed) = call(
         addr,

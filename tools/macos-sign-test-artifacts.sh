@@ -12,7 +12,7 @@ root=$(cd "$(dirname "$0")/.." && pwd -P)
 # Cargo links into deps/ (and examples/<name>-<hash>) and re-copies the result
 # to the uplifted path on every build, so both copies are signed: signing only
 # the uplifted file is undone by the next cargo invocation.
-for binary in "$dir/awman" "$dir"/deps/awman-* \
+for binary in "$dir/awman-guest-driver" "$dir/awman-guest-net-driver" "$dir/awman" "$dir"/deps/awman-* \
               "$dir"/examples/builtin_*_driver "$dir"/examples/builtin_*_driver-*; do
     [ -f "$binary" ] && [ -x "$binary" ] || continue
     case "$binary" in *.d|*.rlib|*.rmeta|*.o|*.dSYM) continue ;; esac

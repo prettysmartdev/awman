@@ -13,7 +13,7 @@ pub(super) async fn run(
 ) -> Result<NewOutcome, CommandError> {
     Ok({
         if f.pull_all {
-            let skill_dirs = match SkillDirs::from_process_env(None) {
+            let skill_dirs = match SkillDirs::from_env(command.session.env(), None) {
                 Ok(dirs) => dirs,
                 Err(error) => {
                     frontend.write_message(UserMessage {
@@ -86,7 +86,7 @@ pub(super) async fn run(
                 libraries,
             })
         } else if let Some(target) = &f.pull {
-            let skill_dirs = match SkillDirs::from_process_env(None) {
+            let skill_dirs = match SkillDirs::from_env(command.session.env(), None) {
                 Ok(dirs) => dirs,
                 Err(error) => {
                     frontend.write_message(UserMessage {
@@ -142,7 +142,7 @@ pub(super) async fn run(
                 None
             };
             let git_root = session.as_ref().map(|s| s.git_root().to_path_buf());
-            let skill_dirs = match SkillDirs::from_process_env(git_root) {
+            let skill_dirs = match SkillDirs::from_env(command.session.env(), git_root) {
                 Ok(d) => d,
                 Err(e) => {
                     frontend.write_message(UserMessage {

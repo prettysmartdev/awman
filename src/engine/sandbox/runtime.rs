@@ -604,7 +604,13 @@ mod tests {
     fn sandbox_runtime_via_trait_rejects_container_options() {
         let rt = match SandboxRuntime::dsbx() {
             Ok(rt) => rt,
-            Err(_) => return, // unsupported platform — platform guard test covers this
+            Err(error) => {
+                assert!(matches!(
+                    error,
+                    EngineError::BackendUnsupportedOnPlatform { .. }
+                ));
+                return;
+            }
         };
         let opts = ResolvedAgentOptions::Container(Box::new(
             ResolvedContainerOptions::resolve([]).unwrap(),
@@ -632,6 +638,11 @@ mod tests {
                 "display_name should mention experimental, got: {}",
                 rt.display_name()
             );
+        } else {
+            assert!(matches!(
+                SandboxRuntime::dsbx(),
+                Err(EngineError::BackendUnsupportedOnPlatform { .. })
+            ));
         }
     }
 }

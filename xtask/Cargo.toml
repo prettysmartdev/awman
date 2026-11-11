@@ -1,0 +1,75 @@
+[package]
+name = "xtask"
+# Fixed, not the workspace version: a release version bump must change only
+# awman's own Cargo.lock entries.
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.94.0"
+publish = false
+description = "awman build, test-gate and release tooling (run with `cargo xtask`); never shipped"
+# Two binaries: `cargo xtask` runs this one.
+default-run = "xtask"
+# Integration targets are registered explicitly (design 5.3).
+autotests = false
+
+[[bin]]
+name = "xtask"
+path = "src/main.rs"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+# The dependency set is declared up front so that the steps filling in the
+# modules do not need to change this file or add new crates to Cargo.lock.
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+toml = { workspace = true }
+sha2 = { workspace = true }
+chrono = { workspace = true }
+# Module-tree walk for test discovery and the test-hygiene lint.
+syn = { workspace = true }
+# JUnit reports written by cargo-nextest.
+roxmltree = { workspace = true }
+tempfile = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true, features = ["signal", "process", "fs", "user"] }
+libc = { workspace = true }
+signal-hook = { workspace = true }
+
+[dev-dependencies]
+awman-test-support = { workspace = true }
+tempfile = { workspace = true }
+portable-pty = { workspace = true }
+
+# The fake command-line tool the release contract tests install as `git`, `gh`,
+# `cargo`, `awman`, … (std-only source shared with awman-cli's tests).
+[[bin]]
+name = "xtask-fake-cli"
+path = "../crates/awman-test-support/fake-cli/main.rs"
+test = false
+doc = false
+
+# ── Integration targets (WI 0144 design 5.2) ─────────────────────────────────
+# Registered once by the foundation step so their owners never edit this file.
+# gates: build-xtask-and-manifest · release_contract: release-operator-contract
+# pipeline: candidate-promote-pipeline · ci: ci-workflows
+[[test]]
+name = "gates"
+path = "tests/gates/main.rs"
+
+[[test]]
+name = "release_contract"
+path = "tests/release_contract/main.rs"
+
+[[test]]
+name = "pipeline"
+path = "tests/pipeline/main.rs"
+
+[[test]]
+name = "ci"
+path = "tests/ci/main.rs"

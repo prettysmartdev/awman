@@ -23,6 +23,9 @@ set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd -P)
 RUNNER_HOME="${AWMAN_RELEASE_RUNNER_HOME:-$HOME/.awman/release-runner}"
+mkdir -p "$RUNNER_HOME"
+RUNNER_HOME=$(cd "$RUNNER_HOME" && pwd -P)
+export AWMAN_RELEASE_RUNNER_HOME="$RUNNER_HOME"
 OPT_DIR="${AWMAN_RELEASE_OPT_DIR:-/opt/awman}"
 # The job's state directories hold Unix sockets, whose paths macOS caps at
 # 103 bytes, so jobs run under a short work directory rather than RUNNER_HOME.
@@ -167,8 +170,20 @@ runner_id() { # repo name
   gh api "repos/$1/actions/runners" --paginate -q ".runners[] | select(.name == \"$2\") | .id"
 }
 
+# Labels route jobs; only the service-enforced group authorizes them.
+release_group() {
+  local repo=$1 org=${1%%/*} group_id=${AWMAN_RELEASE_RUNNER_GROUP_ID:-} group
+  case "$repo" in *[!a-zA-Z0-9_./-]*|*..*) die "invalid repository" ;; esac
+  case "$group_id" in ''|*[!0-9]*) die "AWMAN_RELEASE_RUNNER_GROUP_ID must name a workflow-restricted organization runner group (P1)" ;; esac
+  group=$(gh api "orgs/$org/actions/runner-groups/$group_id" --jq ". | select(.restricted_to_workflows == true) | select((.selected_workflows | sort) == ([\"$repo/.github/workflows/release.yml@refs/heads/main\"] | sort)) | .name") || die "cannot verify release runner group policy"
+  [ -n "$group" ] || die "legacy runner group must restrict execution to release.yml on protected main"
+  printf '%s\n' "$group"
+}
+
 cmd_up() {
   local repo=$1 tag=$2 archive name token pid deadline status
+  local group
+  group=$(release_group "$repo") || return 1
   [ -f "$STATE" ] && cmd_down
   archive=$(fetch_runner)
   rm -rf "$RUN_DIR"
@@ -185,10 +200,10 @@ cmd_up() {
     die "$WORK_DIR is not a directory owned by $(id -un)"
   tar -xzf "$archive" -C "$RUN_DIR"
   name="awman-release-$tag-$(hostname -s)"
-  token=$(gh api -X POST "repos/$repo/actions/runners/registration-token" -q .token)
+  token=$(gh api -X POST "orgs/${repo%%/*}/actions/runners/registration-token" -q .token)
   # The runner reads ACTIONS_RUNNER_INPUT_<ARG> as <ARG>, which keeps the
   # token out of the process list (an argument is visible to every user).
-  (cd "$RUN_DIR" && ACTIONS_RUNNER_INPUT_TOKEN="$token" ./config.sh --unattended --url "https://github.com/$repo" \
+  (cd "$RUN_DIR" && ACTIONS_RUNNER_INPUT_TOKEN="$token" ./config.sh --unattended --url "https://github.com/${repo%%/*}" --runnergroup "$group" \
     --name "$name" --labels "$LABEL" --work "$WORK_DIR" --replace --disableupdate) > "$RUNNER_HOME/config.log" 2>&1 ||
     { cat "$RUNNER_HOME/config.log" >&2; die "runner registration failed"; }
   printf 'repo=%s\nname=%s\n' "$repo" "$name" > "$STATE"
@@ -239,7 +254,7 @@ cmd_down() {
   elif [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
     echo "release-runner: pid $pid is no longer the runner; not signalling it" >&2
   fi
-  token=$(gh api -X POST "repos/$repo/actions/runners/remove-token" -q .token 2>/dev/null || true)
+  token=$(gh api -X POST "orgs/${repo%%/*}/actions/runners/remove-token" -q .token 2>/dev/null || true)
   if [ -z "$token" ] || ! (cd "$RUN_DIR" && ACTIONS_RUNNER_INPUT_TOKEN="$token" ./config.sh remove) >/dev/null 2>&1; then
     id=$(runner_id "$repo" "$name" 2>/dev/null || true)
     [ -z "$id" ] || gh api -X DELETE "repos/$repo/actions/runners/$id" >/dev/null 2>&1 ||

@@ -236,6 +236,7 @@ struct Inner {
 /// so a slow backend cannot block a status request.
 pub struct DaemonEnvState {
     inner: std::sync::Arc<Mutex<Inner>>,
+    payload: Option<Mutex<std::collections::HashMap<String, String>>>,
     /// Held by the actual backend call, including calls whose timeout elapsed.
     writes: std::sync::Arc<Mutex<()>>,
 }
@@ -243,6 +244,7 @@ pub struct DaemonEnvState {
 impl DaemonEnvState {
     pub fn new(store: Box<dyn DaemonEnvStore>, persistence: EnvPersistence, salt: Salt) -> Self {
         Self {
+            payload: None,
             writes: Default::default(),
             inner: std::sync::Arc::new(Mutex::new(Inner {
                 store_epoch: 0,
@@ -256,6 +258,45 @@ impl DaemonEnvState {
                 store_warned: false,
                 degraded: false,
             })),
+        }
+    }
+
+    /// Construct with instance-owned payload storage. Embedded daemons can
+    /// maintain independent coverage without changing the process overlay.
+    pub fn with_payload(
+        store: Box<dyn DaemonEnvStore>,
+        persistence: EnvPersistence,
+        salt: Salt,
+    ) -> Self {
+        let mut state = Self::new(store, persistence, salt);
+        state.payload = Some(Mutex::new(Default::default()));
+        state
+    }
+
+    pub fn payload_snapshot(&self) -> DaemonEnvMap {
+        match &self.payload {
+            Some(payload) => DaemonEnvMap::from_pairs(
+                payload
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone())),
+            ),
+            None => daemon_overlay_snapshot(),
+        }
+    }
+
+    fn update_payload(
+        &self,
+        f: impl FnOnce(&mut std::collections::HashMap<String, String>),
+    ) -> DaemonEnvMap {
+        match &self.payload {
+            Some(payload) => {
+                let mut payload = payload.lock().unwrap();
+                f(&mut payload);
+                DaemonEnvMap::from_pairs(payload.iter().map(|(k, v)| (k.clone(), v.clone())))
+            }
+            None => update_daemon_overlay(f),
         }
     }
 
@@ -362,7 +403,7 @@ impl DaemonEnvState {
         // bootstrap read cannot be clobbered by a whole-map replace, and record
         // which names actually landed so `sources` matches the overlay exactly.
         let mut merged: Vec<String> = Vec::new();
-        update_daemon_overlay(|overlay| {
+        self.update_payload(|overlay| {
             for (name, value) in loaded.iter() {
                 if value.is_empty() || overlay.contains_key(name) {
                     continue;
@@ -400,7 +441,7 @@ impl DaemonEnvState {
         }
 
         let wanted_names: BTreeSet<String> = wanted.keys().cloned().collect();
-        let overlay = daemon_overlay_snapshot();
+        let overlay = self.payload_snapshot();
         let mut removed: Vec<String> = Vec::new();
         {
             let mut guard = self.lock();
@@ -455,7 +496,7 @@ impl DaemonEnvState {
         // concurrently is either kept (its name is required) or dropped
         // deliberately, never lost to a stale whole-map replace.
         let mut dropped: Vec<String> = Vec::new();
-        let overlay = update_daemon_overlay(|overlay| {
+        let overlay = self.update_payload(|overlay| {
             overlay.retain(|name, _| {
                 if wanted_names.contains(name) {
                     true
@@ -542,7 +583,7 @@ impl DaemonEnvState {
         // Insert under the overlay's write lock. A snapshot-mutate-replace here
         // would silently drop a value another push (or the coverage refresh)
         // installed in between, after this one had already answered `accepted`.
-        let overlay = update_daemon_overlay(|overlay| {
+        let overlay = self.update_payload(|overlay| {
             for (name, value) in landing {
                 overlay.insert(name, value);
             }
@@ -557,7 +598,7 @@ impl DaemonEnvState {
     /// coverage response can never report a digest for a value the daemon no
     /// longer holds.
     pub fn entries(&self) -> Vec<RequiredEnvEntry> {
-        let overlay = daemon_overlay_snapshot();
+        let overlay = self.payload_snapshot();
         let guard = self.lock();
         guard
             .entries
@@ -580,7 +621,7 @@ impl DaemonEnvState {
     /// Required names the daemon has no usable value for, sorted. This is the
     /// count `squad status` reports and the list `squad env` shows.
     pub fn unmet_names(&self) -> Vec<String> {
-        let overlay = daemon_overlay_snapshot();
+        let overlay = self.payload_snapshot();
         let guard = self.lock();
         guard
             .entries
@@ -597,7 +638,7 @@ impl DaemonEnvState {
     /// whatever the daemon effectively has. Derived, never stored — exactly as
     /// `Task::last_run_status` is.
     pub fn unmet_for_task(&self, task: &Task) -> Vec<String> {
-        let overlay = daemon_overlay_snapshot();
+        let overlay = self.payload_snapshot();
         let guard = self.lock();
         let mut names: BTreeSet<String> = env_overlay_names(&task.overlays).into_iter().collect();
         for (name, stored) in &guard.entries {
@@ -681,7 +722,7 @@ impl DaemonEnvState {
     /// Whether the daemon effectively has a usable value for `name` — the live
     /// overlay, into which anything the store held was merged at startup.
     pub fn is_covered(&self, name: &str) -> bool {
-        is_set_and_non_empty(&daemon_overlay_snapshot(), name)
+        is_set_and_non_empty(&self.payload_snapshot(), name)
     }
 
     /// Write the whole overlay through to the store, best-effort.

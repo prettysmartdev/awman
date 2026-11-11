@@ -50,7 +50,10 @@ impl Core {
         let session_store = Arc::new(SqliteSessionStore::open_at(&deps.data_paths.db_path())?);
         Self::with_session_store(deps, session_store)
     }
-    pub(crate) fn with_session_store(
+    /// Assemble a core around an existing store. Embedded callers can share
+    /// a database connection, including an in-memory store, without opening
+    /// a second database or running filesystem migration discovery.
+    pub fn with_session_store(
         deps: CoreDeps,
         session_store: Arc<SqliteSessionStore>,
     ) -> Result<Arc<Self>, EngineError> {
@@ -128,24 +131,27 @@ pub(crate) fn test_core(home: &std::path::Path) -> Arc<Core> {
     let auth_paths = crate::data::fs::AuthPathResolver::at_home(home);
     let overlay = Arc::new(OverlayEngine::with_auth_resolver(auth_paths.clone()));
     let agent = Arc::new(AgentEngine::new(overlay.clone(), runtime.clone()));
-    Core::open(CoreDeps {
-        data_paths: DataPaths::from_env(&env).unwrap(),
-        daemon_paths: DataPaths::from_env(&env).unwrap().daemon(),
-        env: env.clone(),
-        runtime: runtime.clone(),
-        container_runtime: Some(runtime),
-        sandbox_runtime: None,
-        auth_engine: Arc::new(AuthEngine::with_paths(
-            auth_paths,
-            crate::data::fs::ApiPaths::from_env(&env).unwrap(),
-        )),
-        overlay_engine: overlay,
-        git_engine: Arc::new(GitEngine::new()),
-        agent_engine: agent,
-        credential_monitor: None,
-        max_concurrent_jobs: 2,
-        terminal_hub: Arc::new(TerminalHub::new(TerminalHubConfig::default())),
-    })
+    Core::with_session_store(
+        CoreDeps {
+            data_paths: DataPaths::from_env(&env).unwrap(),
+            daemon_paths: DataPaths::from_env(&env).unwrap().daemon(),
+            env: env.clone(),
+            runtime: runtime.clone(),
+            container_runtime: Some(runtime),
+            sandbox_runtime: None,
+            auth_engine: Arc::new(AuthEngine::with_paths(
+                auth_paths,
+                crate::data::fs::ApiPaths::from_env(&env).unwrap(),
+            )),
+            overlay_engine: overlay,
+            git_engine: Arc::new(GitEngine::with_env(env.clone())),
+            agent_engine: agent,
+            credential_monitor: None,
+            max_concurrent_jobs: 2,
+            terminal_hub: Arc::new(TerminalHub::new(TerminalHubConfig::default())),
+        },
+        Arc::new(SqliteSessionStore::open_at(std::path::Path::new(":memory:")).unwrap()),
+    )
     .unwrap()
 }
 #[cfg(test)]

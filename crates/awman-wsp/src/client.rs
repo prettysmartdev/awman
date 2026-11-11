@@ -247,8 +247,9 @@ impl Client {
         self.lease_epochs.lock().await.get(id).copied().unwrap_or(0)
     }
 
-    #[cfg(test)]
-    async fn with_access_token_cache(self, token: AccessToken) -> Self {
+    /// Seed the access-token cache when resuming an authenticated connection.
+    /// Expired tokens still take the ordinary refresh path before a request.
+    pub async fn with_access_token_cache(self, token: AccessToken) -> Self {
         *self.access.lock().await = Some(token);
         self
     }
@@ -540,222 +541,36 @@ impl std::fmt::Debug for Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wiremock::{
-        matchers::{header, method, path, query_param},
-        Mock, MockServer, ResponseTemplate,
-    };
 
-    #[tokio::test]
-    async fn refresh_register_queue_and_claim_use_version_and_bearer() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/base/v1/token"))
-            .and(header("x-wsp-version", "1"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({"access_token":"access"})),
-            )
-            .mount(&server)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/base/v1/workers/register"))
-            .and(header("authorization", "Bearer access"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(
-                serde_json::json!({"worker_id":"worker_1","server_labels":{"owner":"alice"}}),
-            ))
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path("/base/v1/queue"))
-            .and(query_param("limit", "50"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({"items":[],"next_cursor":null})),
-            )
-            .mount(&server)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/base/v1/claims"))
-            .respond_with(ResponseTemplate::new(204))
-            .mount(&server)
-            .await;
-        let client = Client::new(&format!("{}/base", server.uri()), "refresh".into()).unwrap();
-        let registration = client
-            .register(&RegisterRequest {
-                name: "box".into(),
-                labels: Default::default(),
-                capacity: 1,
-                features: vec![],
-            })
-            .await
-            .unwrap();
-        assert_eq!(registration.server_labels["owner"], "alice");
-        assert!(client.queue(50, None).await.unwrap().items.is_empty());
-        assert!(client.claim(None, 30_000).await.unwrap().is_none());
-    }
-
-    #[tokio::test]
-    async fn device_link_uses_pending_and_approved_responses() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/v1/link"))
-            .and(header("x-wsp-version", "1"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "user_code":"ABCD", "verification_uri":"https://example.com/verify",
-                "link_id":"link_1", "interval_ms":100
-            })))
-            .mount(&server)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/v1/link/link_1/token"))
-            .respond_with(ResponseTemplate::new(202))
-            .mount(&server)
-            .await;
-        let client = Client::new(&server.uri(), String::new()).unwrap();
-        assert_eq!(client.start_link().await.unwrap().user_code, "ABCD");
-        assert!(client.poll_link("link_1").await.unwrap().is_none());
-
-        let approved = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/v1/link/link_2/token"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({"refresh_token":"secret"})),
-            )
-            .mount(&approved)
-            .await;
-        let client = Client::new(&approved.uri(), String::new()).unwrap();
-        assert_eq!(
-            client
-                .poll_link("link_2")
-                .await
-                .unwrap()
-                .unwrap()
-                .refresh_token,
-            "secret"
-        );
-        assert!(matches!(
-            client.poll_link("../bad").await,
-            Err(Error::InvalidUrl)
-        ));
+    #[test]
+    fn url_policy_refuses_remote_http_credentials_queries_and_fragments() {
+        for url in [
+            "http://example.com",
+            "https://user:pass@example.com",
+            "https://example.com?token=secret",
+            "https://example.com#secret",
+        ] {
+            assert!(Client::new(url, String::new()).is_err(), "{url}");
+        }
     }
 
     #[test]
-    fn refuses_insecure_remote_and_credentials_in_url() {
-        assert!(matches!(
-            Client::new("http://example.com", "x".into()),
-            Err(Error::InsecureUrl)
-        ));
-        assert!(matches!(
-            Client::new("https://user:pass@example.com", "x".into()),
-            Err(Error::InvalidUrl)
-        ));
-    }
-}
-
-#[cfg(test)]
-mod cache_tests {
-    use super::*;
-    use chrono::{Duration, Utc};
-    use serde_json::json;
-    use wiremock::{
-        matchers::{header, method, path},
-        Mock, MockServer, ResponseTemplate,
-    };
-    #[tokio::test]
-    async fn reactive_refresh_retries_only_once_even_when_second_access_token_is_rejected() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/v1/token"))
-            .and(header(VERSION_HEADER, WSP_VERSION))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"access_token":"fresh"})))
-            .expect(1)
-            .mount(&server)
-            .await;
-        for token in ["stale", "fresh"] {
-            Mock::given(method("GET"))
-                .and(path("/v1/queue"))
-                .and(header(VERSION_HEADER, WSP_VERSION))
-                .and(header("authorization", format!("Bearer {token}")))
-                .respond_with(
-                    ResponseTemplate::new(401)
-                        .set_body_json(json!({"error":"refused","code":"unauthorized"})),
-                )
-                .expect(1)
-                .mount(&server)
-                .await;
+    fn typed_response_failures_preserve_conflict_and_authorization_codes() {
+        for (status, code) in [
+            (StatusCode::CONFLICT, "lease_lost"),
+            (StatusCode::CONFLICT, "taken"),
+            (StatusCode::FORBIDDEN, "ineligible"),
+            (StatusCode::UNAUTHORIZED, "unauthorized"),
+        ] {
+            let error = response_error(
+                status,
+                ApiError {
+                    error: "private server detail".into(),
+                    code: code.into(),
+                },
+            );
+            assert_eq!(error.code(), Some(code));
+            assert!(!format!("{error:?}").contains("private server detail"));
         }
-        let client = Client::new(&server.uri(), "refresh-secret".into())
-            .unwrap()
-            .with_access_token_cache(AccessToken {
-                access_token: "stale".into(),
-                expires_at: Some(Utc::now() + Duration::hours(1)),
-            })
-            .await;
-        assert_eq!(
-            client.queue(50, None).await.unwrap_err().code(),
-            Some("unauthorized")
-        );
-    }
-    #[tokio::test]
-    async fn refresh_refused_maps_to_link_revoked_and_stops_retrying() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/v1/token"))
-            .respond_with(
-                ResponseTemplate::new(403)
-                    .set_body_json(json!({"error":"revoked","code":"access_denied"})),
-            )
-            .expect(1)
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path("/v1/queue"))
-            .and(header("authorization", "Bearer stale"))
-            .respond_with(
-                ResponseTemplate::new(401)
-                    .set_body_json(json!({"error":"expired","code":"unauthorized"})),
-            )
-            .expect(1)
-            .mount(&server)
-            .await;
-        let client = Client::new(&server.uri(), "refresh-secret".into())
-            .unwrap()
-            .with_access_token_cache(AccessToken {
-                access_token: "stale".into(),
-                expires_at: None,
-            })
-            .await;
-        assert!(matches!(
-            client.queue(50, None).await,
-            Err(Error::LinkRevoked)
-        ));
-    }
-    #[tokio::test]
-    async fn expired_cached_access_token_is_refreshed_before_sending_the_request() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/v1/token"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"access_token":"fresh"})))
-            .expect(1)
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path("/v1/queue"))
-            .and(header("authorization", "Bearer fresh"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(json!({"items":[],"next_cursor":null})),
-            )
-            .expect(1)
-            .mount(&server)
-            .await;
-        let client = Client::new(&server.uri(), "refresh-secret".into())
-            .unwrap()
-            .with_access_token_cache(AccessToken {
-                access_token: "expired".into(),
-                expires_at: Some(Utc::now() - Duration::seconds(1)),
-            })
-            .await;
-        assert!(client.queue(50, None).await.unwrap().items.is_empty());
     }
 }

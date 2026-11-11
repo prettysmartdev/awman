@@ -390,6 +390,9 @@ fi
 # boot gate passes. Creating it here would publish a release with no assets.
 
 step "Release workflow"
+# Explicitly activated fallback; a promotion App tag never launches this publisher.
+gh workflow run release.yml --repo "$REPO" --ref main -f "legacy_tag=$VERSION" ||
+  die "Could not dispatch the explicitly enabled legacy publisher"
 
 if ! $USE_LOCAL_RUNNER; then
   ok "Tag pushed; the Release workflow will publish $VERSION after the build gates pass"
@@ -403,8 +406,8 @@ fi
 # A tag push's run reports the tag as its head branch.
 RUN_ID=""
 for _ in $(seq 1 60); do
-  RUN_ID=$(gh run list --repo "$REPO" --workflow release.yml --event push --limit 20 \
-    --json databaseId,headBranch -q ".[] | select(.headBranch == \"$VERSION\") | .databaseId" | head -n1)
+  RUN_ID=$(gh run list --repo "$REPO" --workflow release.yml --event workflow_dispatch --limit 20 \
+    --json databaseId,displayTitle -q ".[] | select(.displayTitle == \"Legacy $VERSION\") | .databaseId" | head -n1)
   [ -n "$RUN_ID" ] && break
   sleep 5
 done

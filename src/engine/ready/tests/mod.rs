@@ -467,16 +467,17 @@ async fn ready_import_timeout_cancels_worker_on_a_current_thread_runtime() {
         result.is_err(),
         "blocking import must not prevent the async timeout"
     );
-    tokio::time::timeout(std::time::Duration::from_secs(1), async {
-        while !runtime
-            .cancel_observed
-            .load(std::sync::atomic::Ordering::SeqCst)
-        {
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .expect("dropped ready future must cancel its production worker");
+    awman_test_support::wait_for_async(
+        "the dropped ready future to cancel its production worker",
+        std::time::Duration::from_secs(10),
+        || {
+            let seen = runtime
+                .cancel_observed
+                .load(std::sync::atomic::Ordering::SeqCst);
+            async move { seen.then_some(()) }
+        },
+    )
+    .await;
     assert_eq!(runtime.imports.lock().unwrap().len(), 1);
 }
 
@@ -487,8 +488,18 @@ async fn ready_caller_token_cancels_an_in_flight_import() {
     let runtime = Arc::new(fake);
     let (mut engine, mut frontend, tmp) = import_engine(runtime.clone(), true, archive_sources());
     let cancel = engine.cancel_token();
+    // Cancel once the import is in flight (an event, not a delay).
+    let in_flight = runtime.clone();
     let signal = tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        awman_test_support::wait_for_async(
+            "the import to be in flight",
+            std::time::Duration::from_secs(10),
+            || {
+                let started = !in_flight.imports.lock().unwrap().is_empty();
+                async move { started.then_some(()) }
+            },
+        )
+        .await;
         cancel.cancel();
     });
     engine

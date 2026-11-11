@@ -393,10 +393,13 @@ impl crate::engine::agent_runtime::AgentRuntimeEngine for FakeImportRuntime {
     ) -> Result<crate::engine::agent_runtime::ImportedImage, EngineError> {
         if self.wait_for_cancel {
             self.imports.lock().unwrap().push(request.clone());
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-            while !cancel.is_cancelled() && std::time::Instant::now() < deadline {
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
+            // The fake holds the import until its caller cancels (bounded wait
+            // through the support crate's sanctioned polling helper).
+            awman_test_support::wait_for(
+                "the ready caller to cancel the import",
+                std::time::Duration::from_secs(10),
+                || cancel.is_cancelled().then_some(()),
+            );
             self.cancel_observed
                 .store(cancel.is_cancelled(), std::sync::atomic::Ordering::SeqCst);
             cancel.check()?;

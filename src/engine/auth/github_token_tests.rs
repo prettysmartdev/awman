@@ -112,10 +112,10 @@ fn gh_outside_the_temp_dir_is_invisible_under_test_isolation() {
     let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target");
     std::fs::create_dir_all(&base).unwrap();
     let dir = tempfile::tempdir_in(&base).unwrap();
-    if inside_temp_dir(dir.path()) {
-        eprintln!("SKIP: build tree lies inside the temp dir");
-        return;
-    }
+    assert!(
+        !inside_temp_dir(dir.path()),
+        "test needs a build directory outside the runtime temp root"
+    );
     write_exe(dir.path(), "gh", FAKE_GH);
     assert!(resolver_in("github.com", dir.path()).gh_on_path().is_none());
     assert_eq!(

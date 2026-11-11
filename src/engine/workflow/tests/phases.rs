@@ -3,6 +3,7 @@
 
 use super::super::*;
 use super::*;
+use crate::data::PhaseStepStatus;
 
 // ── run_phase unit tests ─────────────────────────────────────────────────
 
@@ -2505,6 +2506,7 @@ fn run_stuck_on_failure_agent(
 
     let (cancel_flag, completion) = make_blocking_entry();
     let factory = BlockingFactory::new([(cancel_flag.clone(), completion.clone())]);
+    let launched = factory.execution_count.clone();
     let stuck_sender = Arc::new(Mutex::new(None));
     let countdowns = Arc::new(Mutex::new(Vec::new()));
     let frontend = OnFailureYoloFrontend {
@@ -2531,26 +2533,28 @@ fn run_stuck_on_failure_agent(
         let completion = completion.clone();
         std::thread::spawn(move || {
             let mut sent_stuck = false;
+            awman_test_support::wait_for(
+                "the on_failure agent to launch",
+                Duration::from_secs(10),
+                || (launched.load(Ordering::Relaxed) >= 1).then_some(()),
+            );
             if yolo {
-                let deadline = std::time::Instant::now() + Duration::from_secs(5);
-                while std::time::Instant::now() < deadline {
-                    if let Some(tx) = stuck_sender.lock().unwrap().as_ref() {
-                        sent_stuck = tx.send(StuckEvent::Stuck).is_ok();
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                // Keep the agent running until the engine observes the event.
-                // A fixed delay can let the completion branch win its select.
-                while sent_stuck
-                    && countdowns.lock().unwrap().is_empty()
-                    && std::time::Instant::now() < deadline
-                {
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-            } else {
-                std::thread::sleep(Duration::from_millis(300));
+                let tx = awman_test_support::wait_for(
+                    "the stuck channel to be published",
+                    Duration::from_secs(10),
+                    || stuck_sender.lock().unwrap().clone(),
+                );
+                sent_stuck = tx.send(StuckEvent::Stuck).is_ok();
+                // Keep the agent running until the engine observes the event:
+                // completing earlier could let the completion branch win.
+                awman_test_support::wait_for(
+                    "the countdown to start",
+                    Duration::from_secs(10),
+                    || (!countdowns.lock().unwrap().is_empty()).then_some(()),
+                );
             }
+            // Without yolo the engine never publishes the stuck channel, so no
+            // countdown can start; completing once the agent runs is enough.
             signal_completion(&completion, 0);
             sent_stuck
         })
@@ -3105,6 +3109,238 @@ async fn poll_ci_remediation_without_a_push_step_warns() {
             msgs.iter()
                 .any(|m| m.text.contains("no push_branch step precedes it")),
             "{msgs:?}"
+        );
+    })
+    .await
+    .unwrap();
+}
+
+// ── on_failure remediation contracts (re-derived from the legacy
+//    tests/engine/workflow_on_failure.rs; in memory, no container) ────────
+
+fn capturing_engine(
+    tmp: &tempfile::TempDir,
+) -> (
+    WorkflowEngine,
+    Arc<Mutex<Vec<crate::data::message::UserMessage>>>,
+) {
+    let session = make_session(tmp);
+    let workflow = make_workflow(Some("wf"), Some("claude"), vec![make_step("a", &[], None)]);
+    let (frontend, msgs) = MessageCapturingFrontend::new();
+    let engine = make_engine_capturing(
+        &session,
+        workflow,
+        FakeAgentExecutionFactory::always_success(),
+        frontend,
+    );
+    (engine, msgs)
+}
+
+/// A setup step that fails once is remediated and retried: it ends
+/// Succeeded after exactly two execs, and the run narrates the remediation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn setup_step_failing_once_is_remediated_and_retried() {
+    use crate::data::workflow_definition::SetupStep;
+    tokio::task::spawn_blocking(|| {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut engine, msgs) = capturing_engine(&tmp);
+        let steps = vec![SetupStep::RunShell {
+            command: "cargo test".into(),
+            env: None,
+        }];
+        let mock = Arc::new(MockBackgroundContainer::with_results([
+            ("".into(), "test failed".into(), 1),
+            ("".into(), "".into(), 0),
+        ]));
+        engine
+            .run_phase(
+                PhaseKind::Setup,
+                &steps,
+                &[false],
+                &[Some(remediation_config(2))],
+                mock.factory(),
+            )
+            .unwrap();
+        assert_eq!(
+            engine.state().setup_step_states[0].status,
+            PhaseStepStatus::Succeeded
+        );
+        assert_eq!(mock.calls().len(), 2, "initial attempt + one retry");
+        let texts: Vec<String> = msgs
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|m| m.text.clone())
+            .collect();
+        assert!(texts.iter().any(|t| t.contains("succeeded")), "{texts:?}");
+    })
+    .await
+    .unwrap();
+}
+
+/// A setup step that keeps failing ends Failed after the initial attempt
+/// plus `max_attempts` retries, with a warning that remediation was exhausted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn setup_step_exhausting_remediation_fails_with_a_warning() {
+    use crate::data::workflow_definition::SetupStep;
+    tokio::task::spawn_blocking(|| {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut engine, msgs) = capturing_engine(&tmp);
+        let steps = vec![SetupStep::RunShell {
+            command: "cargo test".into(),
+            env: None,
+        }];
+        let mock = Arc::new(MockBackgroundContainer::with_results([
+            ("".into(), "err".into(), 1),
+            ("".into(), "err".into(), 1),
+            ("".into(), "err".into(), 1),
+        ]));
+        engine
+            .run_phase(
+                PhaseKind::Setup,
+                &steps,
+                &[false],
+                &[Some(remediation_config(2))],
+                mock.factory(),
+            )
+            .unwrap();
+        assert!(matches!(
+            engine.state().setup_step_states[0].status,
+            PhaseStepStatus::Failed { .. }
+        ));
+        assert_eq!(mock.calls().len(), 3);
+        assert!(msgs
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|m| m.level == crate::data::message::MessageLevel::Warning
+                && m.text.contains("exhausted")));
+    })
+    .await
+    .unwrap();
+}
+
+/// Teardown is best effort: a step that exhausts remediation is Failed and
+/// marks the phase `any_failed`, yet the following step still runs; a step
+/// whose retry succeeds leaves the phase clean.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn teardown_remediation_is_best_effort_for_the_remaining_steps() {
+    use crate::data::workflow_definition::TeardownStep;
+    tokio::task::spawn_blocking(|| {
+        let steps = vec![
+            TeardownStep::RunShell {
+                command: "first".into(),
+                env: None,
+            },
+            TeardownStep::RunShell {
+                command: "second".into(),
+                env: None,
+            },
+        ];
+        for (results, first_ok) in [
+            (
+                vec![
+                    ("".to_string(), "err".to_string(), 1),
+                    ("".into(), "".into(), 0),
+                    ("".into(), "".into(), 0),
+                ],
+                true,
+            ),
+            (
+                vec![
+                    ("".to_string(), "err".to_string(), 1),
+                    ("".into(), "err".into(), 1),
+                    ("".into(), "".into(), 0),
+                ],
+                false,
+            ),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (mut engine, _msgs) = capturing_engine(&tmp);
+            let mock = Arc::new(MockBackgroundContainer::with_results(results));
+            let outcome = engine
+                .run_phase(
+                    PhaseKind::Teardown,
+                    &steps,
+                    &[false, false],
+                    &[Some(remediation_config(1)), None],
+                    mock.factory(),
+                )
+                .unwrap();
+            assert!(!outcome.aborted);
+            assert_eq!(outcome.any_failed, !first_ok);
+            let states = &engine.state().teardown_step_states;
+            assert_eq!(
+                states[0].status == PhaseStepStatus::Succeeded,
+                first_ok,
+                "{:?}",
+                states[0].status
+            );
+            assert_eq!(states[1].status, PhaseStepStatus::Succeeded);
+        }
+    })
+    .await
+    .unwrap();
+}
+
+/// A workflow parsed from TOML carries its setup `on_failure` config into
+/// the engine: two failures, then success on the second retry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn toml_on_failure_config_drives_the_setup_retries() {
+    use crate::data::workflow_definition::{RemediationConfig, SetupStep, WorkflowFormat};
+    let toml = r#"
+title = "on-failure-workflow"
+agent = "claude"
+
+[[setup]]
+type = "run_shell"
+command = "cargo build"
+
+[setup.on_failure]
+prompt = "The build failed. Fix compilation errors."
+max_attempts = 2
+
+[[steps]]
+name = "implement"
+prompt = "Implement the feature"
+"#;
+    let wf = Workflow::parse(toml, WorkflowFormat::Toml).unwrap();
+    let rem = wf.setup[0].on_failure.clone().expect("on_failure parsed");
+    assert_eq!(rem.max_attempts, 2);
+    assert_eq!(rem.prompt, "The build failed. Fix compilation errors.");
+    assert!(rem.agent.is_none());
+
+    tokio::task::spawn_blocking(move || {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = make_session(&tmp);
+        let (frontend, _msgs) = MessageCapturingFrontend::new();
+        let mut engine = make_engine_capturing(
+            &session,
+            wf.clone(),
+            FakeAgentExecutionFactory::always_success(),
+            frontend,
+        );
+        let steps: Vec<SetupStep> = wf.setup.iter().map(|e| e.step.clone()).collect();
+        let aborts: Vec<bool> = wf.setup.iter().map(|e| e.abort_on_failure).collect();
+        let on_failure: Vec<Option<RemediationConfig>> =
+            wf.setup.iter().map(|e| e.on_failure.clone()).collect();
+        let mock = Arc::new(MockBackgroundContainer::with_results([
+            ("".into(), "build error".into(), 1),
+            ("".into(), "build error".into(), 1),
+            ("".into(), "".into(), 0),
+        ]));
+        engine
+            .run_phase(
+                PhaseKind::Setup,
+                &steps,
+                &aborts,
+                &on_failure,
+                mock.factory(),
+            )
+            .unwrap();
+        assert_eq!(
+            engine.state().setup_step_states[0].status,
+            PhaseStepStatus::Succeeded
         );
     })
     .await

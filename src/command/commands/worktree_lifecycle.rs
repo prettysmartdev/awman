@@ -2208,7 +2208,7 @@ mod tests {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
-            .ok();
+            .expect("start git merge cleanup");
     }
 
     /// A conflicted merge with `on_merge_failure = Agent`: `finalize` hands
@@ -2513,7 +2513,7 @@ mod tests {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
-            .ok();
+            .expect("start git merge cleanup");
     }
 
     #[tokio::test]
@@ -2705,7 +2705,7 @@ mod tests {
             .args(["merge", "--abort"])
             .current_dir(&git_root)
             .status()
-            .ok();
+            .expect("start git merge cleanup");
     }
     #[tokio::test]
     async fn squash_repair_discarded_or_unstaged_result_keeps_branch_and_worktree() {

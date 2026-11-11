@@ -2560,7 +2560,7 @@ mod sidecar_tests {
         );
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
         if std::fs::read(&path).is_ok() {
-            return; // Running as root: the mode cannot deny access.
+            panic!("BLOCKED[permissions]: host privileges bypass the access denial");
         }
         assert!(fixture.restart().is_err());
         assert_eq!(fixture.row().status.as_str(), "running");

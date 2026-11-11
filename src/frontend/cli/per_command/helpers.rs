@@ -305,11 +305,9 @@ mod wi0149_tests {
 
     // Re-exec a single test inside a disposable PTY. This exercises crossterm's
     // real raw-mode/echo handling without replacing production input code.
-    #[test]
     fn wi0149_cli_masked_read_child() {
-        let Ok(case) = std::env::var("AWMAN_WI0149_SECRET_CHILD") else {
-            return;
-        };
+        let case =
+            std::env::var("AWMAN_WI0149_SECRET_CHILD").expect("parent supplies the child protocol");
         let before = crossterm::terminal::is_raw_mode_enabled().unwrap();
         let value = read_secret_line("WI0149 private input").unwrap();
         match case.as_str() {
@@ -321,74 +319,78 @@ mod wi0149_tests {
     }
     #[test]
     fn wi0149_cli_masked_read_never_echoes_and_restores_terminal() {
-        use portable_pty::{native_pty_system, CommandBuilder, PtySize};
-        for (case, input) in [
-            ("submit", "private_fake_0149Z\u{7f}X\r"),
-            ("escape", "private_fake_0149\u{1b}"),
-            ("interrupt", "private_fake_0149\u{3}"),
-            ("empty", "\r"),
-        ] {
-            let pair = native_pty_system()
-                .openpty(PtySize {
-                    rows: 24,
-                    cols: 100,
-                    pixel_width: 0,
-                    pixel_height: 0,
-                })
-                .unwrap();
-            let mut cmd = CommandBuilder::new(std::env::current_exe().unwrap());
-            cmd.args([
+        if std::env::var_os("AWMAN_WI0149_SECRET_CHILD").is_some() {
+            wi0149_cli_masked_read_child();
+        } else {
+            use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+            for (case, input) in [
+                ("submit", "private_fake_0149Z\u{7f}X\r"),
+                ("escape", "private_fake_0149\u{1b}"),
+                ("interrupt", "private_fake_0149\u{3}"),
+                ("empty", "\r"),
+            ] {
+                let pair = native_pty_system()
+                    .openpty(PtySize {
+                        rows: 24,
+                        cols: 100,
+                        pixel_width: 0,
+                        pixel_height: 0,
+                    })
+                    .unwrap();
+                let mut cmd = CommandBuilder::new(std::env::current_exe().unwrap());
+                cmd.args([
                 "--exact",
-                "frontend::cli::per_command::helpers::wi0149_tests::wi0149_cli_masked_read_child",
+                "frontend::cli::per_command::helpers::wi0149_tests::wi0149_cli_masked_read_never_echoes_and_restores_terminal",
                 "--nocapture",
             ]);
-            cmd.env("AWMAN_WI0149_SECRET_CHILD", case);
-            let mut child = pair.slave.spawn_command(cmd).unwrap();
-            drop(pair.slave);
-            let mut reader = pair.master.try_clone_reader().unwrap();
-            let (tx, rx) = std::sync::mpsc::channel();
-            std::thread::spawn(move || {
-                let mut buf = [0; 512];
-                while let Ok(n) = reader.read(&mut buf) {
-                    if n == 0 {
-                        break;
+                cmd.env("AWMAN_WI0149_SECRET_CHILD", case);
+                let mut child = pair.slave.spawn_command(cmd).unwrap();
+                drop(pair.slave);
+                let mut reader = pair.master.try_clone_reader().unwrap();
+                let (tx, rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let mut buf = [0; 512];
+                    while let Ok(n) = reader.read(&mut buf) {
+                        if n == 0 {
+                            break;
+                        }
+                        if tx
+                            .send(String::from_utf8_lossy(&buf[..n]).into_owned())
+                            .is_err()
+                        {
+                            break;
+                        }
                     }
-                    if tx
-                        .send(String::from_utf8_lossy(&buf[..n]).into_owned())
-                        .is_err()
-                    {
-                        break;
-                    }
+                });
+                let mut output = String::new();
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while !output.contains("input hidden") {
+                    output.push_str(
+                        &rx.recv_timeout(Duration::from_secs(3))
+                            .expect("child must request secret input"),
+                    );
+                    assert!(Instant::now() < deadline);
                 }
-            });
-            let mut output = String::new();
-            let deadline = Instant::now() + Duration::from_secs(10);
-            while !output.contains("input hidden") {
-                output.push_str(
-                    &rx.recv_timeout(Duration::from_secs(3))
-                        .expect("child must request secret input"),
+                std::thread::sleep(Duration::from_millis(75));
+                let mut writer = pair.master.take_writer().unwrap();
+                writer.write_all(input.as_bytes()).unwrap();
+                writer.flush().unwrap();
+                while !output.contains("MASKED_READ_OK") {
+                    match rx.recv_timeout(Duration::from_secs(3)) {
+                        Ok(chunk) => output.push_str(&chunk),
+                        Err(_) => {
+                            child.kill().unwrap();
+                            panic!("masked read stalled: {output}");
+                        }
+                    }
+                    assert!(Instant::now() < deadline);
+                }
+                assert!(
+                    !output.contains("private_fake_0149"),
+                    "secret echoed: {output}"
                 );
-                assert!(Instant::now() < deadline);
+                assert!(child.wait().unwrap().success(), "{output}");
             }
-            std::thread::sleep(Duration::from_millis(75));
-            let mut writer = pair.master.take_writer().unwrap();
-            writer.write_all(input.as_bytes()).unwrap();
-            writer.flush().unwrap();
-            while !output.contains("MASKED_READ_OK") {
-                match rx.recv_timeout(Duration::from_secs(3)) {
-                    Ok(chunk) => output.push_str(&chunk),
-                    Err(_) => {
-                        child.kill().unwrap();
-                        panic!("masked read stalled: {output}");
-                    }
-                }
-                assert!(Instant::now() < deadline);
-            }
-            assert!(
-                !output.contains("private_fake_0149"),
-                "secret echoed: {output}"
-            );
-            assert!(child.wait().unwrap().success(), "{output}");
         }
     }
 }

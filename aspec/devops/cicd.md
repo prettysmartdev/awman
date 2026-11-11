@@ -1,202 +1,266 @@
 # Continuous Integration and Deployment
 
+WI 0144 remains an incomplete shadow migration. Static checks passing do not
+certify a working production evidence chain or complete legacy replacement;
+see [replacement-ledger.md](replacement-ledger.md) for code blockers and cutover.
+
 Platform: GitHub Actions
 
-## Pipelines
+What CI runs is defined once, in `ci/gates.toml` (the **gate manifest**). The CI
+workflows `ci.yml` and `nightly.yml` are **generated** from it by
+`cargo xtask gates render`; `cargo xtask gates check` (the first step of every
+`ci.yml` run, and the `xtask-gates` suite) fails on any difference between the
+manifest, the generated files, the Makefile contract and this document's
+contract block. Change the manifest, re-render, never edit a generated workflow
+by hand. How tests are written and organised is in [testing.md](testing.md);
+the release procedure is in [release.md](release.md).
 
-### `Tests` (`.github/workflows/test.yml`)
+<!-- gates:begin contract -->
+Generated from `ci/gates.toml` (schema 1).
 
-The workflow runs on every pull request and on pushes to `main` only. A
-branch push is tested through its pull request, which checks the merge with
-`main`; a branch without a PR gets CI by opening one (a draft is fine) or by
-`gh workflow run test.yml --ref <branch>`. Pushing to every branch would run
-the suite twice per PR update.
+| Gate | Budget (minutes) | Required status |
+| --- | --- | --- |
+| candidate | 20 | gate |
+| main | 20 | gate |
+| nightly | 60 | gate |
+| pr | 10 | gate |
+| promote | 20 | gate |
 
-The first three jobs run on every such event; the rest are opt-in
-(`workflow_dispatch`/`schedule`, or — for the two unsupported-target jobs —
-also `pull_request`) because they need native hardware this repo's hosted
-runners don't have:
+| Tier | Per-test deadline (seconds) | Guarantees |
+| --- | --- | --- |
+| artifact | 300 | tempdir, loopback, subprocess, release-artifact |
+| boundary | 120 | tempdir, loopback, subprocess, awman-binary, fake-cli, local-git |
+| component | 20 | tempdir, loopback, subprocess, awman-binary, fake-cli, local-git |
+| guest | 300 | tempdir, loopback, subprocess, awman-binary, hypervisor, builtin-payload, guest-fixtures, previous-release |
+| soak | suite-specific | tempdir, loopback, subprocess, awman-binary |
+| unit | 1 | tempdir |
 
-| Job | Runner | What it runs |
+Unit, lint, doctest and parity suites always run. Unknown/shared paths select the full PR set. Main and merge-group run the full set. Required skips, missing evidence and expired quarantine fail the gate.
+<!-- gates:end contract -->
+
+## Gates
+
+A gate is a named set of suites on named build cells. A suite is a set of tests
+of one tier; a build cell is one compilation (platform × feature set × profile)
+whose test archive is reused by every job that needs it, so nothing is compiled
+twice.
+
+| Gate | Runs on | Contents |
 |---|---|---|
-| `fast` | `ubuntu-26.04` | `make architecture-lint`, the release-runner shell test, `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `make test-fast`. Hermetic — no Docker, no real git, no real network. Should finish in under two minutes warm. |
-| `full-linux-docker` | `ubuntu-26.04` | `make test-full` against the runner's Docker daemon (`test-full` sets `AWMAN_TEST_DOCKER=1`; without it the Docker tests see Docker as not installed). Includes the `docker_*`, `real_git_*`, and `real_network_*` integration tests. Depends on `fast`. |
-| `build-macos` | `macos-latest` | The release-runner shell test, `cargo build --release` and `make test-fast`. Smoke-tests cross-platform compilation and the release-runner script with BSD host tools; does not run Docker tests (macOS hosted runners lack Docker). Depends on `fast`. |
-| `builtin-build` | Linux ARM64 (`ubuntu-24.04-arm`, hosted) | Fetches and verifies the payload, builds the `builtin-runtime` feature, inspects dynamic dependencies, and runs `make test-builtin` — on a hosted runner with no KVM, so `builtin_hw_*` tests SKIP. A build/hermetic gate, not proof of guest execution. Runs on every PR and push to `main` (the only builtin job that does). |
-| `builtin-hardware` | self-hosted `macOS/ARM64/hypervisor` (the released platform; WI 0124 re-adds `linux/arm64/kvm` and `linux/x64/kvm`) | Opt-in real-guest matrix (`AWMAN_TEST_BUILTIN=1 AWMAN_TEST_BUILTIN_REQUIRE_HW=1`): checks hardware prerequisites first and **fails** (never skips) if they're missing, builds a disposable fixture image, then runs `make test-builtin` for real — same-executable worker boot, image import, execution. `make test-builtin` builds the guest drivers explicitly and ad-hoc signs awman and the drivers with the hypervisor entitlement (`tools/macos-sign-test-artifacts.sh`) between building and running. It also builds the previous-protocol awman from git history for the old-to-new upgrade test (`tools/build-previous-builtin-awman.sh`), so the job checks out full history (`fetch-depth: 0`). Only on `workflow_dispatch` or the nightly `schedule`. |
-| `native-typed-provider` | same self-hosted macOS runner | Clean-checkout gate: `tools/native-builtin-ci.sh <triple>` builds and boots the typed provider from a fresh isolated `CARGO_HOME`/target dir (with the previous-protocol awman for the upgrade test, so this job also uses `fetch-depth: 0`). Uploads native-payload evidence as an artifact. Only on `workflow_dispatch` or `schedule`. |
-| `existing-backend-unsupported-targets` | Windows x86_64 (hosted) | Builds the default backends with the `builtin-runtime` feature **disabled** and asserts the precise refusal a `builtin-experimental` selection reports there (the runtime is released for Apple Silicon only). Runs on `pull_request` too (no native prerequisite beyond the target toolchain). |
+| `pr` | pull requests and merge groups | every lint (fmt, clippy, architecture, hygiene, shell, workflows, deny, notice), doctests, the web app, the `unit` and `component` tiers on Linux x86_64, macOS arm64 and Windows x86_64, the `boundary` tier on Linux with Docker, the builtin-feature unit tests on Linux arm64, the xtask, release-contract, pipeline and CI-helper suites, and a static musl build smoke |
+| `main` | pushes to `main` | everything in `pr`, plus the `guest` tier on the CI Mac (hardware) |
+| `nightly` | 03:23 UTC schedule | everything in `main`, plus the Apple Containers and `sbx` boundary suites, the soak suites, and the nightly modes below |
+| `candidate` | release candidate validation | everything in `main`, plus the `artifact` tier against each exact release executable, the signed offline boot of the macOS asset, and the `guest` tier on the release Mac |
+| `promote` | release promotion | requires a passed `candidate` gate; see [release.md](release.md) |
 
-Workspace builds select the root library, `awman-cli`, and `awman-host-shims`;
-only `awman-cli` has a binary target, named `awman`. Workspace tests include
-the relocated worker and native transport unit tests. The
-`static-workspace-build` job builds and smoke-tests the single
-`x86_64-unknown-linux-musl` release executable with and without the builtin feature.
-The builtin and unsupported-target matrices use the same workspace. The musl
-feature build reports builtin as unsupported and excludes the GNU-only SDK dependencies.
+**Selection.** On a pull request only the suites whose declared `paths` changed
+are selected, with the exceptions printed in the manifest's `[selection]` table
+(`Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.cargo/`, `ci/`,
+`.github/`, `.config/`, `xtask/`, `crates/awman-test-support/`, `Makefile`,
+`tools/`, `third_party/` and anything unknown) which select the full `pr` set.
+Unit, lint, doctest and parity suites are always selected. Merge-group and
+`main` runs always run the full set. A plan that fails, a missing base commit or
+a truncated diff is non-green, never an empty selection.
 
-Cargo's registry, git cache, and `target/` are cached per-OS to keep warm runs fast.
+**Evidence.** Each test job writes `evidence.json` (one outcome per expected
+test id, not a total), JUnit and failure records. The `gate` job reconstructs
+the expected set from the manifest and the commit itself, checks that shard
+sets are disjoint and complete, requires every expected job to have succeeded
+and every cell to have evidence, and only then reports success. A missing job,
+renamed job, empty suite, unexpected skip, duplicate or unknown test id, expired
+quarantine or override, or a job that produced no evidence fails the gate.
+Capability loss is `blocked`, which also fails the gate; nothing is ever
+reported as passed because it was skipped.
 
-Every action in `test.yml` and `release.yml` is pinned to a full commit SHA, with the release it was resolved from as a trailing comment (`# v7.0.1`); `dtolnay/rust-toolchain` is pinned to its `stable` branch head and always given an explicit `toolchain:`. Update a pin by resolving the new tag with `git ls-remote` (the peeled `^{}` commit for an annotated tag).
+## Workflows
 
-The hardware-gated jobs are separate from `fast` and `full-linux-docker`; those
-never boot a guest. Each native job first checks host architecture, verified
-payload hashes, and KVM or Apple Hypervisor.framework support (Linux: fails the job if
-`/dev/kvm` isn't read/write accessible; macOS: fails if not Apple Silicon with
-Hypervisor.framework support) — a missing
-prerequisite or unavailable runner is reported as **BLOCKED**, with the reason
-recorded, and cannot be reported as a successful execution test. Required
-hardware coverage is Apple Silicon macOS and both Linux architectures (ARM64
-and x86_64), not cross-builds on another host; only Linux ARM64 currently has
-a verified payload record, so the x86_64 and Apple Silicon entries in these
-matrices still fail at the payload-verification step until that hardware
-records genuine extraction/verification evidence.
+| Workflow | Trigger | Purpose |
+|---|---|---|
+| `ci.yml` (generated) | pull request, merge group, push to `main`, `workflow_call`, `workflow_dispatch` | the `pr` and `main` gates, and the base of `nightly` and `candidate` |
+| `nightly.yml` (generated) | daily schedule, `workflow_dispatch` | the `nightly` gate and its modes |
+| `candidate.yml` | `workflow_dispatch` or `workflow_call` from `main` only | build once, validate those exact bytes, hand off to promotion |
+| `promote.yml` | called by `candidate.yml` | tag, publish the validated draft, verify the published bytes |
+| `test.yml` | pull request, push to `main` | status shim keeping the legacy required check names alive until the required check is `gate` |
+| `release.yml` | `v[0-9]+.[0-9]+.[0-9]+` tag push | the legacy tag-driven release, kept as the fallback until the pipeline is activated (see [release.md](release.md)) |
 
-Changes to SQLx, rusqlite, or native SQLite rerun the SQLite resolution gate
-(`native-typed-provider`) on supported native targets: one bundled
-`libsqlite3-sys`, combined link, awman store tests, msb migrations,
-cross-driver transactions, and old/new catalog round trips. Missing fixtures
-or target hardware block the relevant subcheck. Builtin artifacts also receive
-minimal-PATH/offline execution checks, dynamic dependency inspection, and
-helper-extraction scans; no runtime step may depend on developer spike scripts
-or temporary files.
+### `ci.yml` job graph
 
-### `Release` (`.github/workflows/release.yml`)
+`plan` → `lint`, `build-*`, `test-*`, `boundary-linux-docker`, `static-musl`,
+`web` → `gate`.
 
-Triggered on tag pushes matching `v[0-9]+.[0-9]+.[0-9]+`.
+- `plan` checks out the commit, runs `cargo xtask gates check`, resolves the
+  gate from the event, selects suites from the changed paths and emits the build
+  matrix and shards. It also decides whether hardware cells may run (see
+  *Runners and trust*).
+- `build-<build>` compiles one build cell, writes a nextest archive, the
+  expected-test list and the digests of both. `build-linux-x64-default`,
+  `build-macos-arm64-default`, `build-windows-x64-default`,
+  `build-linux-arm64-builtin`, `build-macos-arm64-ci-guest-builtin`.
+- `test-<tier>-<platform>` downloads the archive, verifies its SHA-256 against
+  both the job output and `archive/digests.json`, then runs the shard's suites
+  with the pinned nextest. Jobs need only `plan` and their own build.
+- `lint` runs fmt, clippy, architecture lint, hygiene, shell lint, workflow lint,
+  `cargo deny`, the third-party notice check and doctests.
+- `hardware-blocked` is a hosted job that fails visibly when `main` or `nightly`
+  selects hardware cells but the CI guest runner is not admitted. A green `main`
+  therefore always means the guest tier ran.
+- `gate` (job and status name `gate`) aggregates evidence and writes the step
+  summary: tier × platform matrix of passed/failed/blocked/skipped/not-selected,
+  slowest tests, quarantine and override state, cache statistics and the
+  `reproduce` line of every failure.
 
-- `build` builds the ordinary (non-builtin) release binary for each ordinary
-  target (Linux x86_64, Linux arm64, Windows x86_64) and records
-  size/startup/RSS measurements and a dependency/`.msbver`/helper-extraction
-  scan of the optimized artifact.
-- `release-macos-builtin` builds the Apple Silicon asset **with** the
-  experimental builtin runtime from a verified native payload, on isolated
-  Cargo/target directories, then **ad-hoc signs** it with exactly the
-  entitlements in `packaging/macos/awman.entitlements`
-  (`com.apple.security.hypervisor`) via `tools/macos-sign.sh`, which fails if
-  the embedded entitlements differ from that file. There is no Developer ID,
-  notarization, signing secret or distribution account. It records the
-  SHA-256 of the unsigned build (for reproducibility) and of the signed asset,
-  then traces and boots the exact **signed** artifact (not a stand-in driver)
-  under an offline session wrapper (`tools/release-offline-session.sh` is the
-  reference implementation) before uploading it. Linux release assets ship
-  without the builtin runtime until WI 0124.
-- `release` assembles the GitHub Release from all uploaded artifacts plus the
-  matching `docs/releases/<tag>.md` body, and **depends on the builtin gate
-  succeeding** — a release cannot publish while the signed Apple Silicon
-  artifact fails its native boot gate.
+### `nightly.yml`
 
-### Release runner (`make release`)
+`full` (the `nightly` gate through `ci.yml`), plus:
 
-Before tagging, run `make apple-silicon-prerelease` on the bare-metal Apple
-Silicon Mac that will serve the release. It requires a clean `main` checkout
-matching `origin/main`, release notes for the version in `Cargo.toml`, success
-for every required non-macOS job in that commit's `Tests` push run, and a `gh`
-login with repository runner-admin access. It does not wait for the hosted
-`build-macos` job: `make pre-push` and a `cargo build --workspace --release`
-smoke run its macOS checks on the release Mac, so hosted arm64 runner capacity
-cannot block the prerelease gate. It then provisions and
-checks the release runner's cached guest fixture and `/opt/awman` wrappers,
-verifies the runner archive checksum without registering it, exercises the real
-guest hardware and clean native provider suites plus SQLite compatibility,
-then builds, signs, boots, and measures the exact optimized Mac release binary.
-The real guest suite needs Apple Containers installed, and the command starts
-its service if needed. The heavy checks run in a temporary detached worktree
-so payload extraction cannot dirty the release checkout; the worktree is
-removed on exit and evidence remains under the printed
-`/tmp/awman-prerelease.*` directory. This command does not register a runner,
-create or push a tag, or publish a release. Linux and Windows release assets
-are still built by the tagged `Release` workflow.
+- `flake-hunt`: every tier five times with recorded shuffle seeds under CPU
+  contention; any intermittent failure opens a `flaky-test` issue with its
+  failure record.
+- `seeded-defects`: applies known defects from `ci/seeded-defects/` and the
+  pipeline faults (missing target, renamed job, skipped hardware) and asserts
+  the right cell turns red. The patch directory is not yet populated, and the job fails closed while it is empty.
+- `mutation`: `cargo-mutants` on `src/data` and `src/command`, sampled.
+- `coverage`: `cargo-llvm-cov` per layer; diagnostic.
+- `repro-build`: a clean-room unsigned build compared with the latest
+  candidate's unsigned digests; non-blocking.
+- `audit`: `cargo deny check advisories`.
+- `rehearsal`: `candidate.yml` with `dry_run: true`, a full dry run of the
+  release pipeline that publishes nothing (see [release.md](release.md)).
+- `ci-trends`: p50/p95 per gate, queue time, flake rate and cache hit rate
+  from the last 30 days of `timing-*` artifacts.
 
-No hosted macOS runner can boot a guest (every hosted Mac is itself a VM, and
-macOS guests cannot nest Hypervisor.framework), so `release-macos-builtin`
-needs a bare-metal Apple Silicon Mac. `make release VERSION=vX.Y.Z` provides
-one on demand through `tools/release-runner.sh`:
+### `test.yml` (status shim)
 
-- **When.** `RELEASE_RUNNER=auto` (default) uses an online runner with the
-  `hypervisor` label if one exists, and otherwise registers the Mac running the
-  script, provided it is Apple Silicon with `kern.hv_support=1`.
-  `RELEASE_RUNNER=local` requires this Mac; `RELEASE_RUNNER=none` never
-  registers one.
-- **Provisioning, on every release.** `release-runner.sh provision` installs
-  or refreshes what the job expects in `/opt/awman` (creating it with `sudo`
-  the first time and handing it to the invoking user, so later runs need no
-  sudo): a copy of `tools/release-offline-session.sh`, the guest fixture
-  (`fixture-oci.tar`, built and cached in `~/.awman/release-runner/fixtures`
-  by `tools/builtin-hw-fixtures.sh`; the first build needs Docker or Apple
-  Containers running), and the two wrappers the job calls,
-  `release-offline-session.sh` and `release-workload.sh`. The job runs them with
-  a cleared environment, so each wrapper is a fixed command line with the
-  fixture path baked in. Only changed files are rewritten. A file there that
-  provisioning did not write is kept as `<name>.bak`. The workload wrapper
-  runs the same offline session, which records guest RSS, rather than a
-  heavier git/build workload.
-- **Short work directory.** Jobs run under `/tmp/awr` rather than the runner's
-  install directory, because the job's builtin state directories hold Unix
-  sockets and macOS caps socket paths at 103 bytes. `up` creates it private
-  (mode 0700) and refuses a path that is a symlink or someone else's
-  directory; only a directory it created is deleted afterwards.
-- **Before the tag is pushed.** The script downloads the latest
-  `actions/runner` osx-arm64 archive into `~/.awman/release-runner/cache`,
-  refuses it unless its SHA-256 matches the checksum in that runner release's
-  notes, registers it with a repository registration token (passed in the
-  environment, never on a command line; labels
-  `self-hosted, macOS, ARM64, hypervisor`, name `awman-release-<tag>-<host>`),
-  starts it under `caffeinate`, and waits for it to come online. `Tests` runs,
-  queued or in progress, with a `hypervisor` job still waiting for a runner
-  would take it first, so they are listed and offered for cancellation. A
-  `Tests` self-hosted job that reaches the release runner later (the nightly
-  cron, say) fails its first step on any `awman-release-*` runner, freeing it
-  in seconds. A runner that cannot register stops the release before
-  anything is pushed.
-- **During.** The script waits for the tag's `Release` run, re-running its
-  failed jobs if the run already finished unsuccessfully, and follows it with
-  `gh run watch` until every job has finished.
-- **After.** An `EXIT` trap stops the runner's process group (SIGINT, then
-  SIGKILL) and deregisters it, whether the run succeeded, failed or the script
-  was interrupted; a second Ctrl-C does not interrupt that teardown. The group
-  is signalled only while it still holds the runner's processes, so a saved
-  pid reused after a reboot is never signalled. Re-running the script picks up
-  where it stopped.
+Four jobs keep the legacy required check names until the required check is
+switched to `gate`: `fast` (`make check`, `make test`, `make legacy-test`),
+`full-linux-docker` (`make test-boundary` with the runner's Docker, and
+`make legacy-test LEGACY_DOCKER=1`), `web` (`make test-web`) and `build-macos`
+(`make architecture-lint` and a release build). They call the same Make targets
+as a developer and contain no logic of their own. The file and its
+`[[legacy_fallback]]` row are deleted at cutover.
 
-The runner executes jobs as the invoking user on that Mac, and accepts any
-job whose labels it matches while it is online. The committed self-hosted
-jobs in `test.yml` run only on `workflow_dispatch` and `schedule`, but a pull
-request runs the workflow file from its own branch, so a fork PR could target
-these labels. For a public repository, set **Settings → Actions → General → fork
-pull request workflows** to require approval for every outside contributor
-(the strictest option), and don't approve fork workflow runs during a release. Registration and removal need repository
-admin rights for the `gh` login (so does listing runners for `RELEASE_RUNNER=auto`;
-without it the script says so and suggests `RELEASE_RUNNER=none`).
+## Pinned inputs
+
+- Toolchain: `rust-toolchain.toml` (1.94.0), repeated per platform in the manifest.
+- Runner images: every platform records the hosted image version it was
+  validated on in `ci/gates.toml`.
+- Test runner and lint tools (`cargo-nextest`, `actionlint`, `shellcheck`,
+  `cargo-deny`, `cargo-llvm-cov`, `cargo-mutants`) are pinned with versions, and
+  where a release archive exists with per-platform SHA-256 digests, in the
+  manifest's `[tools.*]` tables; `cargo xtask ci install-tool` verifies the digest
+  before use. The versions are listed in [localdev.md](localdev.md).
+- Every action in every workflow is pinned to a full commit SHA with its release
+  as a trailing comment (`# v7.0.1`); `dtolnay/rust-toolchain` is pinned to the
+  `stable` branch head and always given an explicit `toolchain:`. The workflow lint
+  rejects a tag or branch reference. Update a pin by resolving the new tag to its
+  commit and editing the manifest or renderer, not the YAML.
+- Caches (`actions/cache`) are restored by an exact key built from the schema,
+  build cell, platform image, triple, toolchain, profile, features, packages,
+  nextest pin, manifest version, `Cargo.lock`, `rust-toolchain.toml` and
+  `.cargo/config.toml`, with no restore-key fallback, and saved only on pushes to
+  `main`. Release builds use no cache at all.
+
+## Runners and trust
+
+| Label set | Used by | Registered by |
+|---|---|---|
+| hosted `ubuntu-24.04`, `ubuntu-24.04-arm`, `macos-15`, `windows-2025` | every hosted cell | GitHub |
+| `self-hosted, macOS, ARM64, awman-ci-guest` | the `guest` and Apple boundary cells of `main` and `nightly` | a long-lived CI Mac |
+| `self-hosted, macOS, ARM64, awman-release` | `candidate.yml` and the verify job of `promote.yml` | `make release`, for one release, or an already-online release runner |
+| `self-hosted, macOS, ARM64, hypervisor` | legacy `release.yml` only | the legacy runner script |
+
+The label sets are disjoint, so a CI job cannot take the release runner.
+
+- Hosted VMs cannot boot a guest (macOS guests cannot nest Hypervisor.framework),
+  so every guest cell needs bare-metal Apple Silicon.
+- Self-hosted jobs run only when the plan admits hardware: the gate is not `pr`,
+  the event is a push, schedule or dispatch, the ref is `refs/heads/main`, the
+  `ref` input is empty or equal to the triggering commit, and the repository
+  variable `AWMAN_CI_GUEST_RUNNER` is `enabled`. Each job repeats the event and
+  ref test. A pull request edits its own workflow file, so this is defence in
+  depth; the real boundary is the runner group, which must be restricted to this
+  repository and the workflow paths `ci.yml` and `nightly.yml` at
+  `refs/heads/main`.
+- Every self-hosted job starts with `cargo xtask ci runner-preflight` (disk,
+  `kern.hv_support`, toolchain, fixture digests, Apple Containers) and exits
+  `BLOCKED` with the reason before any expensive step. It ends with
+  `cargo xtask ci sweep`, which fails the job if processes, VMs, images or temp
+  roots of the run remain.
+- Require approval for fork pull-request workflows from all outside
+  contributors, and do not send secrets or write tokens to fork pull requests.
+- Top-level `permissions: contents: read`; write scopes are granted per job and
+  never to a job reachable from a pull request. No `ci.yml` job can write.
+
+## Required checks and repository settings
+
+The required status for `main` is the single check `gate` from `ci.yml`, with
+the merge queue enabled; `ci.yml` triggers on `merge_group`. `main` may not be
+force-pushed or deleted, and creation, update and deletion of `v*` tags is
+restricted to the release promotion identity. The expected values are recorded in
+`ci/branch-protection.expected.json`. Until the cutover switches the required
+check from the four legacy `test.yml` contexts to `gate`, both run.
+
+`gates check` cannot read repository settings. Settings that must be applied by
+a maintainer and confirmed against the repository:
+
+1. Branch protection / ruleset for `main` as above.
+2. Runner groups for `awman-ci-guest` and `awman-release`, with
+   `AWMAN_CI_GUEST_RUNNER=enabled` once the CI Mac is registered.
+3. A `release` environment limited to the `main` branch, the release GitHub App
+   (`AWMAN_RELEASE_APP_CLIENT_ID`, `AWMAN_RELEASE_APP_PRIVATE_KEY`) used to create
+   the tag and publish, and `AWMAN_RELEASE_REHEARSAL=enabled` to turn on the
+   nightly rehearsal.
+4. Default `GITHUB_TOKEN` read-only; allow only pinned actions; keep `timing-*`
+   artifacts for at least 90 days; create the `flaky-test` issue label.
 
 ## Versioning
 
 - Semantic versioning. Major version bumps reserved for incompatible CLI or on-disk format changes.
-- The `Cargo.toml` `version` is the source of truth. The release workflow assumes the tag matches it (`v<Cargo version>`).
-- Release tags are plain `vX.Y.Z`. Pre-release suffixes (`v1.2.3-rc1`) are not supported: `release.yml` runs only on `v[0-9]+.[0-9]+.[0-9]+` tags, and `scripts/release.sh` refuses any other version.
-- `docs/releases/v<version>.md` MUST exist before the tag is pushed. The release workflow inlines it as the GitHub Release body.
+- The `Cargo.toml` `version` is the source of truth. The release tag is `v<Cargo version>`.
+- Release tags are plain `vX.Y.Z`. Pre-release suffixes (`v1.2.3-rc1`) are not supported: both `release.yml` and the release operator refuse any other version.
+- `docs/releases/v<version>.md` MUST exist before a release starts. The release workflow publishes it as the GitHub Release body.
 
 ## Publishing
 
-- Binaries: GitHub Releases.
+- Binaries: GitHub Releases. Each release has four executables
+  (`awman-linux-amd64`, `awman-linux-arm64`, `awman-macos-arm64`,
+  `awman-windows-amd64.exe`) and `SHA256SUMS`. Every executable carries a GitHub
+  build provenance attestation; users verify it as described in
+  `docs/11-runtimes.md`.
+- A release is built once, validated as those exact bytes, and published by
+  turning the validated draft into a release. A published tag and published assets
+  are never moved or replaced. The whole procedure, recovery and rollback are in
+  [release.md](release.md).
 - Source: pushed to `main` after PR review.
-- No crate is published to crates.io today.
+- No crate is published to crates.io.
 
 ## Required gates before merge
 
-- `Tests / fast` passes (lint + fmt + clippy + hermetic test run).
-- `Tests / full-linux-docker` passes (real Docker + real git + real network tests).
-- `Tests / build-macos` passes (cross-OS build smoke).
-- `make architecture-lint` clean (enforced inside the `fast` job).
-
-`Tests / builtin-build` and `Tests / existing-backend-unsupported-targets` also run on every pull request (see the job table above), but as build/hermetic and unsupported-target-refusal checks, not guest-execution proof — treat a green run there the same way, as a build gate.
+- The `gate` check from `ci.yml` passes (and, until cutover, the legacy
+  `test.yml` checks). It covers lint, hygiene, `unit` and `component` on Linux,
+  macOS and Windows, the Docker `boundary` tier and the static build smoke.
+- `make architecture-lint` is clean (enforced by the `lint` job).
 
 ## Local pre-push parity
 
-Run `make pre-push` before pushing. It runs the same pre-merge gate as the `fast` CI job: architecture-lint, the release-runner shell test, fmt check, clippy with deny-warnings, and `cargo test`. The `full-linux-docker` and `build-macos` jobs only run in CI.
+Run `make pre-push` before pushing: `make check` (every lint plus the unit tier of
+the crates you changed) and `make test` (the `unit` and `component` tiers for
+your host, both backends, with the same pinned runner and profile CI uses). The
+`boundary`, `guest` and `artifact` tiers need named host resources; see
+[localdev.md](localdev.md). A CI failure is reproduced from its failure record,
+see [testing.md](testing.md#reproducing-a-ci-failure).
 
-## Known limitations / future work
+## Known limitations and open work
 
-- The `full-linux-docker` job does not currently build inside an isolated Docker network — it runs against the host runner's daemon.
-- The Windows build is exercised only at release time, not on every PR. A Windows PR job is tracked as a future improvement.
-- Coverage reporting is not yet wired up; see `aspec/work-items/0076-deferred-parity-and-e2e-tests.md` for the planned coverage delta.
+- The generated workflows and the release pipeline have not yet run on GitHub.
+  Hardware cells depend on the CI guest Mac, and the pinned guest fixture and
+  previous-release digests are still `pending` in `ci/gates.toml`; until they are
+  published, the guest and artifact tiers report `BLOCKED` rather than pass. The
+  acceptance matrix ([acceptance-matrix.md](acceptance-matrix.md)) lists every
+  cell that is still blocked and its owner.
+- Some older integration targets remain until their replacements have shadow
+  evidence; they run through `make legacy-test` and are listed with their removal
+  conditions as `[[legacy_fallback]]` rows ([replacement-ledger.md](replacement-ledger.md)).
+- Coverage and mutation results are diagnostic; they do not block a gate.
+- `cargo deny check advisories` runs nightly and is expected to report current
+  advisories in the dependency tree until the lockfile is updated.

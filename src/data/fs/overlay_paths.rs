@@ -20,7 +20,8 @@ impl OverlayPathResolver {
             return dirs::home_dir().unwrap_or_else(|| PathBuf::from("~"));
         }
         if let Some(rest) = path.strip_prefix("~/") {
-            if let Some(home) = dirs::home_dir() {
+            {
+                let home = dirs::home_dir().expect("private HOME is required");
                 return home.join(rest);
             }
         }
@@ -192,7 +193,8 @@ mod tests {
     #[test]
     fn expand_tilde_home_only() {
         // When dirs::home_dir() succeeds, "~" should expand to it.
-        if let Some(home) = dirs::home_dir() {
+        {
+            let home = dirs::home_dir().expect("private HOME is required");
             let result = OverlayPathResolver::expand_tilde("~");
             assert_eq!(result, home);
         }
@@ -200,7 +202,8 @@ mod tests {
 
     #[test]
     fn expand_tilde_with_trailing_path() {
-        if let Some(home) = dirs::home_dir() {
+        {
+            let home = dirs::home_dir().expect("private HOME is required");
             let result = OverlayPathResolver::expand_tilde("~/docs/notes");
             assert_eq!(result, home.join("docs/notes"));
         }

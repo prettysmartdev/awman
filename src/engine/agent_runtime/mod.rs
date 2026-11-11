@@ -491,7 +491,6 @@ pub fn detect_effective(config: &EffectiveConfig) -> Result<DetectedRuntime, Eng
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::container::options::{ContainerOption, ImageRef};
 
     fn docker_cfg() -> ConfigFile {
         ConfigFile::with_runtime("docker")
@@ -715,70 +714,5 @@ mod tests {
             Err(e) => panic!("expected OptionVariantMismatch, got: {e:?}"),
             Ok(_) => panic!("expected error, got Ok"),
         }
-    }
-
-    // ─── Docker integration (env-gated) ───────────────────────────────────────
-
-    /// End-to-end test: runs a real Docker container through
-    /// `Box<dyn AgentRuntimeEngine>` and asserts the exit code matches the
-    /// pre-refactor path.
-    ///
-    /// Gate: set `AWMAN_DOCKER_INTEGRATION=1` and ensure `docker` is on PATH
-    /// and the daemon is reachable. Skipped silently otherwise.
-    #[tokio::test]
-    async fn docker_integration_runs_container_through_trait() {
-        // Skip if the gate env var is absent.
-        if std::env::var("AWMAN_DOCKER_INTEGRATION").as_deref() != Ok("1") {
-            return;
-        }
-
-        use crate::data::message::{UserMessage, UserMessageSink};
-        use crate::engine::agent_runtime::frontend::{
-            AgentFrontend, AgentIo, AgentProgress, AgentStatus,
-        };
-        use crate::engine::container::ContainerRuntime;
-
-        // Minimal no-op frontend for test purposes.
-        struct NullFrontend;
-        impl UserMessageSink for NullFrontend {
-            fn write_message(&mut self, _msg: UserMessage) {}
-            fn replay_queued(&mut self) {}
-        }
-        #[async_trait::async_trait]
-        impl AgentFrontend for NullFrontend {
-            fn report_status(&mut self, _: AgentStatus) {}
-            fn report_progress(&mut self, _: AgentProgress) {}
-            fn take_io(&mut self) -> AgentIo {
-                let (stdout, _) = tokio::sync::mpsc::unbounded_channel();
-                let (stderr, _) = tokio::sync::mpsc::unbounded_channel();
-                let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel();
-                AgentIo {
-                    stdout,
-                    stderr,
-                    stdin_tx,
-                    stdin_rx,
-                    resize: None,
-                    initial_size: None,
-                }
-            }
-        }
-
-        // Build through the trait surface (Box<dyn AgentRuntimeEngine>).
-        let engine: Arc<dyn AgentRuntimeEngine> = Arc::new(ContainerRuntime::docker());
-        let opts = ResolvedAgentOptions::container([
-            ContainerOption::Image(ImageRef::new("busybox:latest")),
-            ContainerOption::Entrypoint(crate::engine::container::options::Entrypoint::new([
-                "true",
-            ])),
-        ])
-        .expect("resolve container options");
-
-        let instance = engine.build(opts).expect("build agent instance");
-        let mut execution = instance
-            .run_with_frontend(Box::new(NullFrontend))
-            .expect("run_with_frontend");
-
-        let exit_info = execution.wait().await.expect("wait for container");
-        assert_eq!(exit_info.exit_code, 0, "expected clean exit from `true`");
     }
 }

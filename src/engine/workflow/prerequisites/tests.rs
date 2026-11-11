@@ -25,7 +25,31 @@ struct FakeGit {
     detached: bool,
     branch: Option<String>,
     upstream: Option<String>,
-    delay: Duration,
+    /// When set, the identity and branch probes block until the gate is
+    /// released: a stalled probe as an event, not a sleep.
+    stall: Option<StallGate>,
+    /// Number of identity/branch probes started.
+    probes: Arc<AtomicUsize>,
+}
+
+/// A gate stalled probes wait on; the test releases it after its asserts so
+/// no probe thread outlives the test.
+#[derive(Clone, Default)]
+struct StallGate(Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+
+impl StallGate {
+    fn wait(&self) {
+        let (lock, cvar) = &*self.0;
+        let mut released = lock.lock().unwrap();
+        while !*released {
+            released = cvar.wait(released).unwrap();
+        }
+    }
+    fn release(&self) {
+        let (lock, cvar) = &*self.0;
+        *lock.lock().unwrap() = true;
+        cvar.notify_all();
+    }
 }
 
 impl Default for FakeGit {
@@ -37,14 +61,24 @@ impl Default for FakeGit {
             detached: false,
             branch: Some("feature".into()),
             upstream: None,
-            delay: Duration::ZERO,
+            stall: None,
+            probes: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
+impl FakeGit {
+    fn probe(&self) {
+        self.probes.fetch_add(1, Ordering::SeqCst);
+        if let Some(gate) = &self.stall {
+            gate.wait();
         }
     }
 }
 
 impl GitProbeSource for FakeGit {
     fn local_identity(&self, _: &Path) -> Result<GitIdentity, EngineError> {
-        std::thread::sleep(self.delay);
+        self.probe();
         Ok(self.local.clone())
     }
     fn host_identity(&self) -> Result<GitIdentity, EngineError> {
@@ -57,7 +91,7 @@ impl GitProbeSource for FakeGit {
         self.detached
     }
     fn current_branch(&self, _: &Path) -> Option<String> {
-        std::thread::sleep(self.delay);
+        self.probe();
         self.branch.clone()
     }
     fn branch_upstream(&self, _: &Path, _: &str) -> Option<String> {
@@ -852,7 +886,9 @@ fn detached_head_is_missing_but_a_worktree_is_always_attached() {
 #[test]
 fn preflight_off_makes_every_prerequisite_unknown_and_probes_nothing() {
     let mut f = Fixture::default();
-    f.git.delay = Duration::from_secs(5);
+    let gate = StallGate::default();
+    f.git.stall = Some(gate.clone());
+    let probes = f.git.probes.clone();
     f.tokens = FakeTokens::new(Some(("GH_TOKEN", TOKEN)));
     let tokens = f.tokens.clone();
     let mut o = options(vec![
@@ -862,9 +898,10 @@ fn preflight_off_makes_every_prerequisite_unknown_and_probes_nothing() {
         WorkflowPrerequisite::PushedBranch,
     ]);
     o.policy.preflight = PreflightMode::Off;
-    let started = Instant::now();
+    // Every probe would block forever; returning at all proves none ran.
     let report = f.preflight(o).run();
-    assert!(started.elapsed() < Duration::from_secs(1));
+    gate.release();
+    assert_eq!(probes.load(Ordering::SeqCst), 0, "no probe started");
     assert_eq!(report.checks.len(), 4);
     assert!(report
         .checks
@@ -879,24 +916,19 @@ fn preflight_off_makes_every_prerequisite_unknown_and_probes_nothing() {
 
 #[test]
 fn probe_timeout_yields_unknown_without_stalling_the_run() {
-    // The probe outlives the budget by orders of magnitude, so the bound
-    // below separates "returned at the budget" from "waited for the probe"
-    // however loaded the runner is.
-    let probe = Duration::from_secs(10);
+    // The probe is stalled until the test releases it, after the run: the
+    // run returning at all proves it did not wait for the probe (no
+    // wall-clock assertion).
+    let gate = StallGate::default();
     let mut f = Fixture::default();
-    f.git.delay = probe;
+    f.git.stall = Some(gate.clone());
     let mut o = options(vec![
         WorkflowPrerequisite::GitIdentity,
         WorkflowPrerequisite::NotDetachedHead,
     ]);
     o.probe_budget = Duration::from_millis(30);
-    let started = Instant::now();
     let report = f.preflight(o).run();
-    assert!(
-        started.elapsed() < probe / 2,
-        "the run must not wait for a stalled probe: {:?}",
-        started.elapsed()
-    );
+    gate.release();
     assert_eq!(report.checks.len(), 2);
     assert!(report
         .checks
@@ -907,13 +939,12 @@ fn probe_timeout_yields_unknown_without_stalling_the_run() {
 
 #[test]
 fn concurrent_probes_respect_one_budget_not_the_sum() {
-    // Every delayed probe stalls far past the budget. Probes waited on one
-    // after another would take at least one full stall each; run
-    // concurrently under one budget, the whole run ends long before a
-    // single stall does, however loaded the runner is.
-    let probe = Duration::from_secs(10);
+    // Every probe stalls until released after the run. Probes waited on one
+    // after another could never finish; run concurrently under one budget,
+    // the run returns with every stalled check timed out.
+    let gate = StallGate::default();
     let mut f = Fixture::default();
-    f.git.delay = probe;
+    f.git.stall = Some(gate.clone());
     let mut o = options(vec![
         WorkflowPrerequisite::GitIdentity,
         WorkflowPrerequisite::NotDetachedHead,
@@ -921,13 +952,8 @@ fn concurrent_probes_respect_one_budget_not_the_sum() {
         WorkflowPrerequisite::GitIdentity,
     ]);
     o.probe_budget = Duration::from_millis(50);
-    let started = Instant::now();
     let report = f.preflight(o).run();
-    assert!(
-        started.elapsed() < probe / 2,
-        "concurrent probes must share one budget: {:?}",
-        started.elapsed()
-    );
+    gate.release();
     assert!(!report.checks.is_empty());
     let identity = report
         .checks

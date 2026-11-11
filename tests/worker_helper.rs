@@ -30,7 +30,7 @@ async fn production_helper_authenticates_clone_fetch_ls_remote_and_push_real_git
             &root.path().join("private"),
             &repo.url,
             &credentials,
-            HelperProgram::awman(env!("CARGO_BIN_EXE_awman").into()),
+            HelperProgram::awman(awman_test_support::cargo_bin!("awman").into()),
             LeaseUrlPolicy::default(),
         )
         .unwrap(),
@@ -50,7 +50,7 @@ async fn production_helper_authenticates_clone_fetch_ls_remote_and_push_real_git
         .map(|(authority, _)| authority.to_string())
         .unwrap();
     let ask = |nonce: &str, request: String| {
-        let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_awman"))
+        let mut child = std::process::Command::new(awman_test_support::cargo_bin!("awman"))
             .args(["__git-credential-helper", nonce, "get"])
             .env("AWMAN_LEASE_CREDENTIAL_FILE", helper.file())
             .stdin(std::process::Stdio::piped())

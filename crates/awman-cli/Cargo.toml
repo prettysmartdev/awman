@@ -19,9 +19,42 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(awman_builtin)'] }
 name = "awman"
 path = "../../src/main.rs"
 
+# WI 0144 test helpers. Release and install builds select `--bin awman`
+# explicitly; these are never packaged.
+[[bin]]
+name = "awman-fake-cli"
+path = "../awman-test-support/fake-cli/main.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "awman-guest-driver"
+path = "../../tests/drivers/guest_driver.rs"
+required-features = ["guest-drivers"]
+test = false
+doc = false
+
+[[bin]]
+name = "awman-guest-net-driver"
+path = "../../tests/drivers/guest_net_driver.rs"
+required-features = ["guest-drivers"]
+test = false
+doc = false
+
+# `make docs-reference`: regenerates docs/14-command-reference.md from the
+# command catalogue. A developer tool, never packaged.
+[[bin]]
+name = "awman-command-reference"
+path = "../../src/command/dispatch/projections/render_reference.rs"
+test = false
+doc = false
+
 [features]
 default = []
 builtin-runtime = ["awman/builtin-runtime", "awman-host-shims/builtin-runtime", "dep:microsandbox", "dep:sqlx"]
+# Builds the guest tier and its driver executables (WI 0144 design 8.1).
+# Never enabled by a release build.
+guest-drivers = ["builtin-runtime"]
 
 [dependencies]
 awman = { workspace = true }
@@ -69,6 +102,10 @@ async-trait = { workspace = true }
 futures-util = { workspace = true }
 nix = { workspace = true, features = ["signal", "process", "fs", "poll", "user"] }
 libc = { workspace = true }
+# WI 0144 test infrastructure (the support crate never depends on awman).
+awman-test-support = { workspace = true }
+proptest = { workspace = true }
+insta = { workspace = true }
 
 # ── Registered integration tests ─────────────────────────────────────────────
 # Automatic discovery is disabled above; maintain the target list explicitly.
@@ -210,3 +247,23 @@ path = "../../tests/worker_helper.rs"
 [[test]]
 name = "worker_daemon"
 path = "../../tests/worker_daemon.rs"
+
+# ── WI 0144 tier binaries (design 8.1) ───────────────────────────────────────
+# Final module lists live in each main.rs; slices add files only in their
+# own domain directories. Legacy targets above stay until integration.
+[[test]]
+name = "component"
+path = "../../tests/component/main.rs"
+
+[[test]]
+name = "boundary"
+path = "../../tests/boundary/main.rs"
+
+[[test]]
+name = "guest"
+path = "../../tests/guest/main.rs"
+required-features = ["guest-drivers"]
+
+[[test]]
+name = "artifact"
+path = "../../tests/artifact/main.rs"

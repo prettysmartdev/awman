@@ -383,7 +383,7 @@ exit 0
             self.dir.path().join("bin").display(),
             std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into())
         );
-        let mut command = Command::new(env!("CARGO_BIN_EXE_awman"));
+        let mut command = Command::new(awman_test_support::cargo_bin!("awman"));
         command
             .args(args)
             .current_dir(&home)

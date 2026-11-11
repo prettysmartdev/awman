@@ -226,6 +226,10 @@ struct Run {
     launches: Launches,
     log: Arc<Mutex<Log>>,
     tick: Arc<Mutex<YoloTickOutcome>>,
+    /// The engine's monotonic clock (output-settle window).
+    clock: crate::data::clock::ManualClock,
+    /// The last status reported per launch, re-sent by [`Run::settled`].
+    last: Mutex<std::collections::HashMap<usize, Option<EffectiveStatus>>>,
     _tmp: tempfile::TempDir,
 }
 
@@ -253,12 +257,14 @@ fn start(
     let (factory, launches) = StatusFactory::new(instant);
     let log = front.log.clone();
     let tick = front.tick.clone();
-    let mut engine = make_engine_dyn(
+    let engine = make_engine_dyn(
         &session,
         make_workflow(Some("wf-status"), Some("claude"), steps),
         Box::new(factory),
         Box::new(front),
     );
+    let clock = crate::data::clock::ManualClock::new(chrono::Utc::now());
+    let mut engine = engine.with_clock(Arc::new(clock.clone()));
     engine.set_yolo(yolo);
     engine.max_concurrent = max_concurrent;
     let task = tokio::spawn(async move {
@@ -270,6 +276,8 @@ fn start(
         launches,
         log,
         tick,
+        clock,
+        last: Mutex::new(Default::default()),
         _tmp: tmp,
     }
 }
@@ -291,15 +299,8 @@ fn make_engine_dyn(
     .unwrap()
 }
 
-async fn until(what: &str, mut cond: impl FnMut() -> bool) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while !cond() {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "timed out waiting for {what}"
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+async fn until(what: &str, cond: impl FnMut() -> bool) {
+    eventually(what, cond).await;
 }
 
 impl Run {
@@ -360,7 +361,36 @@ impl Run {
 
     async fn report(&self, n: usize, status: Option<EffectiveStatus>) {
         let tx = self.launched(n).await;
+        self.last.lock().unwrap().insert(n, status.clone());
         tx.send(StuckEvent::Reported(status)).unwrap();
+    }
+
+    /// Wait for the last report's payload. Identical countdown reports are
+    /// deliberately deduplicated by production, so resending one is not an ack.
+    async fn settled(&self, n: usize) {
+        let missing = !self.last.lock().unwrap().contains_key(&n);
+        if missing {
+            self.report(n, None).await;
+        }
+        let step = self.launch_step(n);
+        let expected = self.last.lock().unwrap().get(&n).cloned().flatten();
+        let state = expected.as_ref().map(|s| s.state);
+        let payload = (
+            expected.as_ref().and_then(|s| s.kind),
+            expected.as_ref().and_then(|s| s.msg.clone()),
+        );
+        until("last status payload", || {
+            let log = self.log.lock().unwrap();
+            log.agent_status
+                .iter()
+                .zip(&log.agent_payloads)
+                .rev()
+                .find(|((name, _), _)| *name == step)
+                .is_some_and(|((_, observed), observed_payload)| {
+                    *observed == state && *observed_payload == payload
+                })
+        })
+        .await;
     }
 
     fn countdowns(&self) -> Vec<(String, CountdownKind)> {
@@ -439,11 +469,6 @@ fn failed_reason(engine: &WorkflowEngine, step: &str) -> Option<String> {
     }
 }
 
-/// A short pause in which nothing may happen.
-async fn quiet_window() {
-    tokio::time::sleep(Duration::from_millis(150)).await;
-}
-
 // ── Yolo ─────────────────────────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -504,7 +529,7 @@ async fn yolo_working_never_starts_a_countdown() {
     let front = StatusFront::new(true, YoloTickOutcome::AdvanceNow, &[]);
     let run = start(chain(&["only"]), &[], true, front, None);
     run.report(0, status(ProgramState::Working)).await;
-    quiet_window().await;
+    run.settled(0).await;
     assert!(run.countdowns().is_empty(), "working is busy, not stuck");
     assert!(!run.cancelled(0));
     run.complete(0, 0);
@@ -577,7 +602,7 @@ async fn yolo_error_then_working_cancels_the_countdown_and_the_step_continues() 
     run.wait_finished(1).await;
     // Expiry would now fail the step; there is no countdown left to expire.
     *run.tick.lock().unwrap() = YoloTickOutcome::AdvanceNow;
-    quiet_window().await;
+    run.settled(0).await;
     assert!(!run.cancelled(0), "the recovered agent keeps running");
     run.complete(0, 0);
     let (engine, outcome, _) = run.finish().await;
@@ -595,8 +620,9 @@ async fn yolo_error_then_output_cancels_the_countdown() {
     let run = start(chain(&["only"]), &[], true, front, None);
     run.report(0, status(ProgramState::Error)).await;
     run.wait_countdowns(1).await;
-    // Past the settle window, fresh output means the agent recovered.
-    tokio::time::sleep(Duration::from_millis(1100)).await;
+    // Past the settle window (virtual time), fresh output means the agent
+    // recovered.
+    run.clock.advance(Duration::from_millis(1100));
     run.launches.lock().unwrap()[0]
         .tail
         .push_bytes(b"retrying...\n");
@@ -628,7 +654,7 @@ async fn yolo_blocked_with_a_user_pauses_without_a_countdown() {
         ),
     )
     .await;
-    quiet_window().await;
+    run.settled(0).await;
     assert!(run.countdowns().is_empty(), "blocked never auto-advances");
     assert!(run.boards().is_empty());
     assert!(!run.cancelled(0));
@@ -907,7 +933,7 @@ async fn parallel_done_advances_only_its_own_step() {
     let y = 1 - x;
     run.report(x, status(ProgramState::Done)).await;
     until("x killed", || run.cancelled(x)).await;
-    quiet_window().await;
+    run.settled(y).await;
     assert!(!run.cancelled(y), "the sibling keeps running");
     assert_eq!(
         run.log.lock().unwrap().parallel_countdowns,
@@ -942,7 +968,7 @@ async fn parallel_error_fails_only_its_own_step() {
     run.report(x, with_msg(ProgramState::Error, None, "lint failed"))
         .await;
     until("x killed", || run.cancelled(x)).await;
-    quiet_window().await;
+    run.settled(y).await;
     assert!(!run.cancelled(y), "one agent's error never fails a sibling");
     run.complete(y, 0);
     let (engine, outcome, _) = run.finish().await;
@@ -1075,7 +1101,7 @@ async fn output_cancels_the_error_timer_but_does_not_clear_the_error() {
     run.report(0, with_msg(ProgramState::Error, None, "failed tests"))
         .await;
     run.wait_countdowns(1).await;
-    tokio::time::sleep(Duration::from_millis(1100)).await;
+    run.clock.advance(Duration::from_millis(1100));
     run.launches.lock().unwrap()[0]
         .tail
         .push_bytes(b"writing diagnostics...\n");
@@ -1140,9 +1166,13 @@ async fn same_countdown_kind_still_updates_the_status_payload() {
         ),
     )
     .await;
-    quiet_window().await;
+    run.settled(0).await;
     let after = run.log.lock().unwrap().agent_status.len();
-    assert_eq!(after, before + 1, "the new blocked kind/msg was published");
+    assert_eq!(
+        after,
+        before + 1,
+        "the new blocked kind/msg was published once"
+    );
     assert_eq!(
         run.log.lock().unwrap().agent_payloads.last().cloned(),
         Some((Some(BlockedKind::Auth), Some("login required".to_string())))
@@ -1160,7 +1190,7 @@ async fn suppressed_done_countdown_still_handles_the_exit() {
     front.interacting.store(true, Ordering::SeqCst);
     let run = start(chain(&["only"]), &[], true, front, None);
     run.report(0, status(ProgramState::Done)).await;
-    quiet_window().await;
+    run.settled(0).await;
     assert!(
         run.countdowns().is_empty(),
         "no countdown while the user types"
@@ -1182,7 +1212,7 @@ async fn done_countdown_starts_after_the_user_goes_quiet() {
     interacting.store(true, Ordering::SeqCst);
     let run = start(chain(&["only"]), &[], true, front, None);
     run.report(0, status(ProgramState::Done)).await;
-    quiet_window().await;
+    run.settled(0).await;
     assert!(run.countdowns().is_empty());
     assert!(
         !run.cancelled(0),

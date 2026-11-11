@@ -444,12 +444,15 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
-        let _env = crate::data::config::env::ConfigHomeGuard::set(tmp.path());
+        let env = crate::data::config::env::EnvSnapshot::with_overrides([
+            ("AWMAN_HOME", tmp.path().to_str().unwrap()),
+            ("HOME", tmp.path().to_str().unwrap()),
+        ]);
         // `AWMAN_HOME` *is* the config home, so the file sits directly
         // under it.
         std::fs::write(tmp.path().join("config.json"), "{ \"runtime\": ").unwrap();
 
-        let result = Engines::for_env(crate::data::config::env::Env::from_process());
+        let result = Engines::for_env(env);
 
         let error = result
             .err()
@@ -529,21 +532,22 @@ mod tests {
         )
     }
 
-    fn with_daemon_global_config<T>(config: ConfigFile, test: impl FnOnce() -> T) -> T {
+    fn with_daemon_global_config<T>(
+        config: ConfigFile,
+        test: impl FnOnce(crate::data::config::env::EnvSnapshot) -> T,
+    ) -> T {
         let home = tempfile::tempdir().expect("create global config home");
-        // `ConfigHomeGuard`, not `CWD_LOCK`: the variable this serialises is
-        // `AWMAN_HOME`, and the `clean` and `overlay` tests that also
-        // repoint it never touched `CWD_LOCK`. Holding the wrong lock let
-        // them move the config home mid-test, so `Engines::for_env` read a
-        // config it was never given and built the wrong runtime tier.
-        let _guard = crate::data::config::env::ConfigHomeGuard::set(home.path());
+        let env = crate::data::config::env::EnvSnapshot::with_overrides([
+            ("AWMAN_HOME", home.path().to_str().unwrap()),
+            ("HOME", home.path().to_str().unwrap()),
+        ]);
         config
             .save(
                 &home.path().join("config.json"),
                 crate::data::config::FileKind::Global,
             )
             .expect("save global config");
-        test()
+        test(env)
     }
 
     #[test]
@@ -554,9 +558,8 @@ mod tests {
         assert!(built.container_runtime.is_some());
         assert!(built.sandbox_runtime.is_none());
 
-        with_daemon_global_config(ConfigFile::default(), || {
-            let daemon = Engines::for_env(crate::data::config::env::Env::from_process())
-                .expect("default daemon engines build");
+        with_daemon_global_config(ConfigFile::default(), |env| {
+            let daemon = Engines::for_env(env).expect("default daemon engines build");
             assert!(daemon.container_runtime.is_some());
             assert!(daemon.sandbox_runtime.is_none());
         });
@@ -604,28 +607,24 @@ mod tests {
                 Ok(_) => panic!("dsbx build must fail on this platform"),
             }
 
-            with_daemon_global_config(config, || {
-                match Engines::for_env(crate::data::config::env::Env::from_process()) {
-                    Err(EngineError::BackendUnsupportedOnPlatform { backend, .. }) => {
-                        assert_eq!(backend, "docker-sbx-experimental")
-                    }
-                    Err(e) => panic!("expected BackendUnsupportedOnPlatform, got {e:?}"),
-                    Ok(_) => panic!("dsbx for_env must fail on this platform"),
+            with_daemon_global_config(config, |env| match Engines::for_env(env) {
+                Err(EngineError::BackendUnsupportedOnPlatform { backend, .. }) => {
+                    assert_eq!(backend, "docker-sbx-experimental")
                 }
+                Err(e) => panic!("expected BackendUnsupportedOnPlatform, got {e:?}"),
+                Ok(_) => panic!("dsbx for_env must fail on this platform"),
             });
-            return;
+        } else {
+            let built = Engines::build(&session).expect("sandbox session engines build");
+            assert!(built.container_runtime.is_none());
+            assert!(built.sandbox_runtime.is_some());
+
+            with_daemon_global_config(config, |env| {
+                let daemon = Engines::for_env(env).expect("sandbox daemon engines build");
+                assert!(daemon.container_runtime.is_none());
+                assert!(daemon.sandbox_runtime.is_some());
+            });
         }
-
-        let built = Engines::build(&session).expect("sandbox session engines build");
-        assert!(built.container_runtime.is_none());
-        assert!(built.sandbox_runtime.is_some());
-
-        with_daemon_global_config(config, || {
-            let daemon = Engines::for_env(crate::data::config::env::Env::from_process())
-                .expect("sandbox daemon engines build");
-            assert!(daemon.container_runtime.is_none());
-            assert!(daemon.sandbox_runtime.is_some());
-        });
     }
 
     #[test]

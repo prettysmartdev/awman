@@ -51,7 +51,7 @@ impl Fixture {
         self.dir.path().join(rel)
     }
     fn command(&self) -> Command {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_awman"));
+        let mut cmd = Command::new(awman_test_support::cargo_bin!("awman"));
         cmd.current_dir(self.path("repo"))
             .env_clear()
             .env(

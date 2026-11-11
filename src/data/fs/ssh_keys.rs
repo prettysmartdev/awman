@@ -499,7 +499,7 @@ mod header_tests {
         // Root ignores mode bits; only assert when the permission is enforced.
         if std::fs::File::open(&key).is_ok() {
             std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
-            return;
+            panic!("BLOCKED[permissions]: host privileges bypass the access denial");
         }
         let inventory = SshKeyInventory::scan(home.path());
         assert!(inventory.keys.is_empty());
