@@ -12,7 +12,18 @@ else
     native_path() { printf '%s\n' "$1"; }
 fi
 canary_dir=$(mktemp -d "$temp_root/awman-canary.XXXXXX")
-trap 'rm -rf -- "$canary_dir"' EXIT
+test_root=
+if [ "${RUNNER_OS:-}" = macOS ] && [ -z "${AWMAN_TEST_TMPROOT:-}" ]; then
+    # macOS's /var/folders TMPDIR leaves too little room for Unix sockets.
+    test_root=$(mktemp -d /tmp/awman-test.XXXXXX)
+    AWMAN_TEST_TMPROOT=$test_root
+    export AWMAN_TEST_TMPROOT
+fi
+cleanup() {
+    rm -rf -- "$canary_dir"
+    if [ -n "$test_root" ]; then rm -rf -- "$test_root"; fi
+}
+trap cleanup EXIT
 CARGO_HOME=${CARGO_HOME:-$(native_path "$original_home/.cargo")}
 RUSTUP_HOME=${RUSTUP_HOME:-$(native_path "$original_home/.rustup")}
 HOME=$(native_path "$canary_dir")

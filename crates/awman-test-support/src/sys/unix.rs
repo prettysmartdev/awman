@@ -108,7 +108,44 @@ impl Group {
     /// reaped and before the group was observed empty (identity is not
     /// reused while any member lives).
     pub(crate) fn has_members(&self) -> bool {
-        killpg(Pid::from_raw(self.pgid), None).is_ok()
+        if killpg(Pid::from_raw(self.pgid), None).is_err() {
+            return false;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            // killpg also finds zombies. A finished Git child can briefly
+            // leave one awaiting reaping, but it owns no live resource.
+            let Ok(entries) = std::fs::read_dir("/proc") else {
+                return true;
+            };
+            for entry in entries.flatten() {
+                let Some(pid) = entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|s| s.parse::<u32>().ok())
+                else {
+                    continue;
+                };
+                let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+                    continue;
+                };
+                let Some((_, fields)) = stat.rsplit_once(") ") else {
+                    continue;
+                };
+                let mut fields = fields.split_whitespace();
+                let state = fields.next();
+                let _parent = fields.next();
+                let group = fields.next().and_then(|s| s.parse::<i32>().ok());
+                if group == Some(self.pgid) && state != Some("Z") {
+                    return true;
+                }
+            }
+            false
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            true
+        }
     }
 }
 

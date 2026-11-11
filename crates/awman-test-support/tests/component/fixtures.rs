@@ -38,8 +38,8 @@ fn git_runs_with_the_sandbox_identity_and_config() {
     let sandbox = sandbox("fixtures::git_runs_with_the_sandbox_identity_and_config");
     let repo = RepoBuilder::new(&sandbox, "app").file("a", "a").init();
     assert_eq!(
-        repo.git(&["log", "-1", "--format=%an <%ae> %aI"]),
-        "awman test <test@awman.invalid> 2026-01-01T00:00:00+00:00"
+        repo.git(&["log", "-1", "--format=%an <%ae> %at"]),
+        "awman test <test@awman.invalid> 1767225600"
     );
     let origin = repo.git(&["config", "--show-origin", "--get", "core.hooksPath"]);
     assert!(

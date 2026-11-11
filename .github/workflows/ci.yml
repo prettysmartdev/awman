@@ -263,7 +263,14 @@ jobs:
       - name: Install the pinned test runner
         run: cargo xtask test install-runner
       - name: Build the nextest archive and the debug binary
-        run: cargo xtask test archive --build linux-arm64-builtin --out archive
+        run: |
+          if [ "$RUNNER_OS" = Windows ]; then
+            # Nextest recompiles xtask; Windows cannot replace a running exe.
+            cp target/debug/xtask.exe target/xtask-archive.exe
+            target/xtask-archive.exe test archive --build linux-arm64-builtin --out archive
+          else
+            cargo xtask test archive --build linux-arm64-builtin --out archive
+          fi
       - name: Record digests
         id: digests
         run: |
@@ -338,7 +345,14 @@ jobs:
       - name: Install the pinned test runner
         run: cargo xtask test install-runner
       - name: Build the nextest archive and the debug binary
-        run: cargo xtask test archive --build linux-x64-default --out archive
+        run: |
+          if [ "$RUNNER_OS" = Windows ]; then
+            # Nextest recompiles xtask; Windows cannot replace a running exe.
+            cp target/debug/xtask.exe target/xtask-archive.exe
+            target/xtask-archive.exe test archive --build linux-x64-default --out archive
+          else
+            cargo xtask test archive --build linux-x64-default --out archive
+          fi
       - name: Record digests
         id: digests
         run: |
@@ -482,7 +496,14 @@ jobs:
       - name: Install the pinned test runner
         run: cargo xtask test install-runner
       - name: Build the nextest archive and the debug binary
-        run: cargo xtask test archive --build macos-arm64-ci-guest-builtin --out archive
+        run: |
+          if [ "$RUNNER_OS" = Windows ]; then
+            # Nextest recompiles xtask; Windows cannot replace a running exe.
+            cp target/debug/xtask.exe target/xtask-archive.exe
+            target/xtask-archive.exe test archive --build macos-arm64-ci-guest-builtin --out archive
+          else
+            cargo xtask test archive --build macos-arm64-ci-guest-builtin --out archive
+          fi
       - name: Record digests
         id: digests
         run: |
@@ -560,7 +581,14 @@ jobs:
       - name: Install the pinned test runner
         run: cargo xtask test install-runner
       - name: Build the nextest archive and the debug binary
-        run: cargo xtask test archive --build macos-arm64-default --out archive
+        run: |
+          if [ "$RUNNER_OS" = Windows ]; then
+            # Nextest recompiles xtask; Windows cannot replace a running exe.
+            cp target/debug/xtask.exe target/xtask-archive.exe
+            target/xtask-archive.exe test archive --build macos-arm64-default --out archive
+          else
+            cargo xtask test archive --build macos-arm64-default --out archive
+          fi
       - name: Record digests
         id: digests
         run: |
@@ -635,7 +663,14 @@ jobs:
       - name: Install the pinned test runner
         run: cargo xtask test install-runner
       - name: Build the nextest archive and the debug binary
-        run: cargo xtask test archive --build windows-x64-default --out archive
+        run: |
+          if [ "$RUNNER_OS" = Windows ]; then
+            # Nextest recompiles xtask; Windows cannot replace a running exe.
+            cp target/debug/xtask.exe target/xtask-archive.exe
+            target/xtask-archive.exe test archive --build windows-x64-default --out archive
+          else
+            cargo xtask test archive --build windows-x64-default --out archive
+          fi
       - name: Record digests
         id: digests
         run: |

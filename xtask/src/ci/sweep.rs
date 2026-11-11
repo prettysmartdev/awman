@@ -42,7 +42,7 @@ pub fn run(args: &[String]) -> Result<ExitCode> {
         // Unix socket paths inside the run need room for both the run and
         // per-test directories. The marker below still checks the full lease.
         let digest = crate::evidence::digest::input_digest(&lease)?;
-        let root = base.join(format!("awman-{}", &digest[..16]));
+        let root = base.join(format!("a-{}", &digest[..12]));
         std::fs::create_dir_all(&root)?;
         let marker = root.join(".awman-owner");
         use std::io::Write;
