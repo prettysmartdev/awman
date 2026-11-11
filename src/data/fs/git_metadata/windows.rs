@@ -3,13 +3,77 @@
 //! https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilew
 use std::fs::{self, File, OpenOptions};
 use std::io;
+use std::os::windows::ffi::OsStrExt;
 use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+use std::os::windows::io::AsRawHandle;
 use std::path::{Component, Path, PathBuf, Prefix};
+use windows_sys::Wdk::Storage::FileSystem::{
+    FileRenameInformation, NtSetInformationFile, FILE_RENAME_INFORMATION,
+};
+use windows_sys::Win32::Foundation::{RtlNtStatusToDosError, GENERIC_READ, GENERIC_WRITE};
+use windows_sys::Win32::Storage::FileSystem::DELETE;
+use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
 const OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 const BACKUP_SEMANTICS: u32 = 0x0200_0000;
 const REPARSE_POINT: u32 = 0x0000_0400;
 const SHARE_READ: u32 = 1;
+
+// Close the non-delete-sharing file before removing its temporary name on an
+// error. NamedTempFile normally drops its path first (its files share delete).
+struct PendingFile {
+    file: File,
+    path: tempfile::TempPath,
+}
+
+fn context(operation: &str, path: &Path, error: io::Error) -> io::Error {
+    io::Error::new(
+        error.kind(),
+        format!("{operation} {}: {error}", path.display()),
+    )
+}
+
+/// Rename within the temporary file's already-pinned parent. A leaf name with
+/// a null RootDirectory requests an in-place NT rename, avoiding the writable
+/// parent reopen performed by pathname-based MoveFileEx/persist. Keep denying
+/// write/delete sharing on the ancestors: allowing write sharing would allow
+/// an empty directory to be changed into a junction before publication.
+/// https://learn.microsoft.com/windows-hardware/drivers/ddi/ntifs/ns-ntifs-_file_rename_information
+fn publish(file: &File, destination: &Path) -> io::Result<()> {
+    let name: Vec<u16> = destination.file_name().unwrap().encode_wide().collect();
+    let size = std::mem::size_of::<FILE_RENAME_INFORMATION>() + name.len() * 2;
+    // usize storage provides the alignment required by the HANDLE field, and
+    // includes trailing space for the variable-length UTF-16 filename.
+    let mut storage = vec![0usize; size.div_ceil(std::mem::size_of::<usize>())];
+    let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
+    let mut status_block = IO_STATUS_BLOCK::default();
+    // SAFETY: info is aligned, zeroed and large enough for the header and name;
+    // file is a synchronous handle opened with DELETE access, and all borrowed
+    // buffers and the handle remain live for the synchronous NT call.
+    let status = unsafe {
+        (*info).Anonymous.ReplaceIfExists = true;
+        (*info).FileNameLength = (name.len() * 2) as u32;
+        std::ptr::copy_nonoverlapping(
+            name.as_ptr(),
+            std::ptr::addr_of_mut!((*info).FileName).cast::<u16>(),
+            name.len(),
+        );
+        NtSetInformationFile(
+            file.as_raw_handle(),
+            &mut status_block,
+            info.cast(),
+            size as u32,
+            FileRenameInformation,
+        )
+    };
+    if status < 0 {
+        // SAFETY: this pure conversion accepts every NTSTATUS value.
+        return Err(io::Error::from_raw_os_error(
+            unsafe { RtlNtStatusToDosError(status) } as i32,
+        ));
+    }
+    Ok(())
+}
 
 fn pinned(path: &Path) -> io::Result<File> {
     let file = OpenOptions::new()
@@ -18,7 +82,8 @@ fn pinned(path: &Path) -> io::Result<File> {
         // be renamed, or be replaced while a descendant is opened by pathname.
         .share_mode(SHARE_READ)
         .custom_flags(OPEN_REPARSE_POINT | BACKUP_SEMANTICS)
-        .open(path)?;
+        .open(path)
+        .map_err(|e| context("pin metadata", path, e))?;
     if file.metadata()?.file_attributes() & REPARSE_POINT != 0 {
         return Err(io::Error::other("Git metadata traverses a reparse point"));
     }
@@ -56,7 +121,7 @@ fn parents(path: &Path, create: bool) -> io::Result<(PathBuf, Vec<File>)> {
                 match fs::create_dir(&current) {
                     Ok(()) => {}
                     Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
-                    Err(e) => return Err(e),
+                    Err(e) => return Err(context("create metadata ancestor", &current, e)),
                 }
                 pinned(&current)?
             }
@@ -85,13 +150,13 @@ pub(super) fn copy(source: &Path, destination: &Path) -> io::Result<()> {
         match fs::create_dir(&destination) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(e) => return Err(e),
+            Err(e) => return Err(context("create metadata directory", &destination, e)),
         }
         let output = pinned(&destination)?;
         if !output.metadata()?.is_dir() {
             return Err(io::Error::other("metadata destination is not a directory"));
         }
-        for entry in fs::read_dir(&source)? {
+        for entry in fs::read_dir(&source).map_err(|e| context("list metadata", &source, e))? {
             let entry = entry?;
             copy(&entry.path(), &destination.join(entry.file_name()))?;
         }
@@ -106,10 +171,30 @@ pub(super) fn copy(source: &Path, destination: &Path) -> io::Result<()> {
         }
         // Replace the directory entry rather than truncating an existing inode:
         // even a concurrently substituted hard link cannot modify another file.
-        let mut output = tempfile::NamedTempFile::new_in(destination.parent().unwrap())?;
-        io::copy(&mut input, output.as_file_mut())?;
-        output.as_file().sync_all()?;
-        output.persist(&destination).map_err(|e| e.error)?;
+        let temporary = tempfile::Builder::new()
+            .make_in(destination.parent().unwrap(), |path| {
+                OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create_new(true)
+                    .access_mode(GENERIC_READ | GENERIC_WRITE | DELETE)
+                    // Only our handle may write or rename this new entry.
+                    .share_mode(SHARE_READ)
+                    .open(path)
+            })
+            .map_err(|e| context("create metadata temporary file", &destination, e))?;
+        let (file, path) = temporary.into_parts();
+        let mut output = PendingFile { file, path };
+        io::copy(&mut input, &mut output.file)
+            .map_err(|e| context("copy metadata bytes", &destination, e))?;
+        output
+            .file
+            .sync_all()
+            .map_err(|e| context("sync metadata", &destination, e))?;
+        publish(&output.file, &destination)
+            .map_err(|e| context("publish metadata", &destination, e))?;
+        // The handle now names destination; the temporary pathname is gone.
+        output.path.disable_cleanup(true);
     } else {
         return Err(io::Error::other("unsafe Git metadata"));
     }

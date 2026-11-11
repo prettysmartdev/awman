@@ -271,7 +271,10 @@ pub(crate) fn system_path_dirs() -> &'static [PathBuf] {
                     // Git for Windows ships the shell and POSIX tools in its
                     // installation, outside cmd/. Never inherit the host PATH.
                     if let Some(install) = dir.parent() {
-                        for relative in ["bin", "usr/bin"] {
+                        // bin/bash.exe is a wrapper that prepends Git's tools
+                        // to PATH, overriding our private fakes. Invoke the
+                        // actual shell in usr/bin so sandbox/bin stays first.
+                        for relative in ["usr/bin", "bin"] {
                             let tools = install.join(relative);
                             if tools.is_dir() {
                                 dirs.push(tools);

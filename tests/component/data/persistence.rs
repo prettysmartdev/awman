@@ -247,7 +247,7 @@ fn migration_preserves_real_sqlite_session_and_command_rows() {
 #[test]
 fn git_metadata_copy_pins_ancestors_and_never_writes_through_links() {
     use awman::data::fs::git_metadata::GitMetadataCopy;
-    use std::os::windows::fs::symlink_dir;
+    use std::os::windows::fs::{symlink_dir, OpenOptionsExt};
     let s = support::sandbox(
         "data::persistence::git_metadata_copy_pins_ancestors_and_never_writes_through_links",
     );
@@ -255,11 +255,28 @@ fn git_metadata_copy_pins_ancestors_and_never_writes_through_links() {
     let destination = s.work().join("destination");
     std::fs::create_dir(&source).unwrap();
     std::fs::write(source.join("HEAD"), "ref: refs/heads/topic\n").unwrap();
+    std::fs::create_dir_all(source.join("refs/heads")).unwrap();
+    std::fs::write(source.join("refs/heads/topic"), "first\n").unwrap();
     GitMetadataCopy::copy(&source, &destination).unwrap();
     assert_eq!(
         std::fs::read(destination.join("HEAD")).unwrap(),
         std::fs::read(source.join("HEAD")).unwrap()
     );
+    std::fs::write(source.join("refs/heads/topic"), "second\n").unwrap();
+    GitMetadataCopy::copy(&source, &destination).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(destination.join("refs/heads/topic")).unwrap(),
+        "second\n"
+    );
+    let locked = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(1)
+        .open(destination.join("HEAD"))
+        .unwrap();
+    assert!(GitMetadataCopy::copy(&source.join("HEAD"), &destination.join("HEAD")).is_err());
+    // Failed publication must close the private file before cleaning its name.
+    assert_eq!(std::fs::read_dir(&destination).unwrap().count(), 2);
+    drop(locked);
     let external = s.work().join("external");
     std::fs::write(&external, "must stay unchanged").unwrap();
     std::fs::remove_file(destination.join("HEAD")).unwrap();

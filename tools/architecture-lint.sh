@@ -27,6 +27,12 @@
 set -uo pipefail
 
 REPO_ROOT="${ARCH_LINT_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
+# Resolve caller-provided Windows paths to the shell's spelling before passing
+# them to awk (-v interprets Windows backslashes as escape sequences).
+REPO_ROOT=$(cd "$REPO_ROOT" && pwd -P) || {
+    echo "architecture-lint: SCANNER ERROR: cannot resolve source root" >&2
+    exit 2
+}
 SRC="$REPO_ROOT/src"
 SHIMS="$REPO_ROOT/crates/awman-host-shims/src"
 SCRATCH=$(mktemp -d "${TMPDIR:-/tmp}/architecture-lint.XXXXXX") || {

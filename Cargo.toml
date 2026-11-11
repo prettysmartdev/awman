@@ -196,6 +196,9 @@ microsandbox-types = { path = "third_party/microsandbox-types-0.7.8" }
 nix = { workspace = true, features = ["signal", "process", "term", "fs", "dir", "poll", "user"] }
 libc = { workspace = true }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Wdk_Storage_FileSystem", "Win32_Storage_FileSystem", "Win32_System_IO"] }
+
 [dev-dependencies]
 awman-wsp = { workspace = true, features = ["mock"] }
 tokio ={ workspace = true, features = ["test-util"] }

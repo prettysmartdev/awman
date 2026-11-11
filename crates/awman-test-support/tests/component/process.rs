@@ -323,6 +323,19 @@ fn agents_are_refused_directly_and_through_interpreters() {
 }
 
 #[test]
+fn shells_preserve_private_fake_precedence() {
+    let sandbox = sandbox("process::shells_preserve_private_fake_precedence");
+    let uname = sandbox.install_fake(fake_cli_exe(), "uname");
+    uname.on(&["-s"]).stdout("sandbox-kernel\n");
+    for shell in ["sh", "bash"] {
+        let out = sandbox.command(shell).args(["-c", "uname -s"]).run();
+        out.assert_success();
+        assert_eq!(out.stdout_text().trim(), "sandbox-kernel", "{shell}");
+    }
+    assert_eq!(uname.calls().len(), 2);
+}
+
+#[test]
 fn system_tools_run_with_the_sandbox_environment() {
     let sandbox = sandbox("process::system_tools_run_with_the_sandbox_environment");
     let script = if cfg!(windows) {

@@ -558,6 +558,7 @@ dependencies = [
  "uuid",
  "vt100-ctt",
  "which",
+ "windows-sys 0.61.2",
  "wiremock",
 ]
 
