@@ -1534,6 +1534,12 @@ fn narrate_leader_report(
                  or use the control board (Ctrl-W)"
             ),
         ),
+        ReportedResponse::AwaitRepair => (
+            MessageLevel::Warning,
+            format!(
+                "Leader '{label}': agent reported {what}; waiting for repair or a control-board action (Ctrl-W)"
+            ),
+        ),
         ReportedResponse::Resume
         | ReportedResponse::ConfirmAdvance
         | ReportedResponse::ProblemBoard => return,

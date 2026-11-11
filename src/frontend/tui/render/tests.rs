@@ -969,3 +969,39 @@ fn overview_shows_reported_problem_under_the_step_box() {
     });
     assert!(buffer_text(&buf).contains("blocked: permission"));
 }
+
+#[test]
+fn running_step_with_reported_error_is_red_in_the_overview() {
+    use crate::frontend::tui::tabs::{
+        StepViewStatus, WorkflowOverviewState, WorkflowStepKind, WorkflowStepView,
+        WorkflowViewState,
+    };
+    let mut state = WorkflowViewState {
+        steps: vec![WorkflowStepView {
+            name: "build".into(),
+            status: StepViewStatus::Running,
+            agent: None,
+            model: None,
+            depends_on: vec![],
+            kind: WorkflowStepKind::Agent,
+        }],
+        current_step: Some("build".into()),
+        ..Default::default()
+    };
+    state.reported.insert("build".into(), "error".into());
+    let buf = render_to_buffer(60, 6, |area, frame| {
+        crate::frontend::tui::workflow_view::render_workflow_overview(
+            &state,
+            area,
+            frame,
+            0,
+            0,
+            WorkflowOverviewState::Maximized,
+        );
+    });
+    let area = *buf.area();
+    assert!((0..area.height).any(|y| (0..area.width).any(|x| {
+        let cell = buf.cell((x, y)).unwrap();
+        cell.symbol() == "\u{25cf}" && cell.fg == Color::Red
+    })));
+}

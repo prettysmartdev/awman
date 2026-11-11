@@ -1302,6 +1302,45 @@ fn attach_stuck_channel(
 }
 
 #[tokio::test]
+async fn workflow_request_survives_later_stuck_channel_attachment() {
+    use crate::command::instance::feeds::ContainerSlotEvent;
+    use crate::data::frontend_protocol::WorkflowRequestWire;
+    use crate::engine::workflow::EngineRequest;
+
+    let fx = fixture();
+    let (id, primary, _rx) = fx.started().await;
+    let tab = fx.first_tab(&id);
+    let _command = bind_fake_command(&fx, &id, &tab);
+    let feeds = fx.host.test_tab_feeds(&id, &tab);
+    let (requests, mut received) = tokio::sync::mpsc::unbounded_channel();
+    feeds.container.push(ContainerSlotEvent::EngineAttached {
+        launch_id: feeds.container.launch_id(),
+        requests: Some(requests),
+        stuck: None,
+    });
+    fx.host.pump_at(Instant::now());
+    let _stuck = attach_stuck_channel(&feeds);
+    fx.host.pump_at(Instant::now());
+
+    primary
+        .handle(
+            1,
+            FrontendFrame::WorkflowRequest {
+                tab_id: tab,
+                request: WorkflowRequestWire::OpenControlBoard {
+                    step_name: "build".into(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        received.try_recv(),
+        Ok(EngineRequest::OpenControlBoard { step_name }) if step_name == "build"
+    ));
+}
+
+#[tokio::test]
 async fn the_agents_dashboard_is_relayed_and_kept_in_the_snapshot() {
     use crate::command::commands::agents::{AgentTotals, AgentsOverview};
     use crate::command::instance::feeds::AgentsDashboardData;

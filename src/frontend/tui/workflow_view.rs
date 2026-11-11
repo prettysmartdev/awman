@@ -406,7 +406,7 @@ pub fn render_workflow_overview(
             let box_area = Rect::new(box_x, row_y, box_w, STEP_BOX_HEIGHT);
 
             let mut reported: Option<String> = None;
-            let (label, style, title) = match row {
+            let (label, mut style, title) = match row {
                 ColumnRow::Step { step, queued } => {
                     reported = state.reported.get(&step.name).cloned();
                     let is_current = state
@@ -430,14 +430,26 @@ pub fn render_workflow_overview(
                 }
                 ColumnRow::Stage { count, status } => {
                     let name = format!("{count} steps\u{2026}");
+                    let status = if col_steps
+                        .iter()
+                        .any(|step| state.reported.get(&step.name).is_some_and(|s| s == "error"))
+                    {
+                        StepViewStatus::Error
+                    } else {
+                        *status
+                    };
                     // A stage summary stands for several steps that may run
                     // under different agents/models, so it carries no single
                     // agent/model label — press Ctrl-O to see them. A setup/
                     // teardown column keeps its phase label even collapsed.
-                    let (label, style) = step_box_label_and_style(&name, *status, false, box_w);
+                    let (label, style) = step_box_label_and_style(&name, status, false, box_w);
                     (label, style, column_title.clone())
                 }
             };
+
+            if reported.as_deref() == Some("error") {
+                style = style.fg(Color::Red);
+            }
 
             let mut block = Block::default()
                 .borders(Borders::ALL)

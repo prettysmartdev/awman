@@ -165,6 +165,12 @@ impl WorkflowFrontend for InstanceCommandFrontend {
     }
 
     fn report_agent_status(&mut self, step_name: &str, status: Option<&EffectiveStatus>) {
+        if self.parallel_group_active {
+            self.push_container_slot_event(ContainerSlotEvent::Reported {
+                step_name: step_name.to_string(),
+                status: status.cloned(),
+            });
+        }
         let label = status
             .filter(|s| matches!(s.state, ProgramState::Blocked | ProgramState::Error))
             .map(|s| self.presentation.status_short_label(s));
@@ -1417,6 +1423,35 @@ mod tests {
             frontend.container.events.lock().unwrap().is_empty(),
             "a parallel step's stuck channel must not land in the tab-level slot"
         );
+    }
+
+    #[test]
+    fn parallel_error_report_reaches_its_container_slot() {
+        use crate::command::instance::feeds::ContainerSlotEvent;
+        use crate::data::program_status::{EffectiveStatus, ProgramState};
+        use crate::engine::workflow::frontend::WorkflowFrontend;
+
+        let (mut frontend, _req_rx, _resp_tx) = make_frontend();
+        frontend.parallel_group_active = true;
+        let status = EffectiveStatus {
+            state: ProgramState::Error,
+            kind: None,
+            progress: None,
+            msg: Some("tests failed".into()),
+            app: None,
+            id: None,
+        };
+        frontend.report_agent_status("build", Some(&status));
+        assert!(frontend
+            .container
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| {
+                matches!(event, ContainerSlotEvent::Reported { step_name, status: Some(got) }
+                if step_name == "build" && got == &status)
+            }));
     }
 
     // take_io self-heals when the slot is empty. Launch paths that skip

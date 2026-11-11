@@ -517,19 +517,20 @@ async fn yolo_working_never_starts_a_countdown() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn yolo_error_fails_the_step_after_its_countdown_and_never_advances() {
+async fn yolo_error_keeps_the_container_alive_until_it_exits() {
     // Attended: the failure goes to the recovery board, which pauses.
     let front = StatusFront::new(true, YoloTickOutcome::AdvanceNow, &[NextAction::Pause]);
     let run = start(chain(&["a", "b"]), &[], true, front, None);
     run.report(0, with_msg(ProgramState::Error, None, "tests failed"))
         .await;
+    quiet_window().await;
+    assert!(!run.cancelled(0), "a live agent can repair its error");
+    assert!(run.countdowns().is_empty());
+    run.complete(0, 0);
     let (engine, outcome, log) = run.finish().await;
     let log = log.lock().unwrap();
     assert_eq!(outcome, WorkflowOutcome::Paused);
-    assert_eq!(
-        log.countdowns,
-        [("a".to_string(), CountdownKind::AgentError)]
-    );
+    assert!(log.countdowns.is_empty());
     assert_eq!(
         failed_reason(&engine, "a").as_deref(),
         Some("agent reported error: tests failed")
@@ -552,30 +553,30 @@ async fn yolo_error_without_a_user_takes_the_failure_retry_path() {
     let front = StatusFront::new(false, YoloTickOutcome::AdvanceNow, &[]);
     let run = start(chain(&["a"]), &[], true, front, None);
     run.report(0, status(ProgramState::Error)).await;
-    // The automatic retry relaunches the step; this time it finishes.
+    quiet_window().await;
+    assert!(!run.cancelled(0));
+    run.complete(0, 0);
+    // A self-exit after the error fails the first attempt and triggers retry.
     run.launched(1).await;
     run.complete(1, 0);
     let (engine, outcome, log) = run.finish().await;
     assert_eq!(outcome, WorkflowOutcome::Completed);
     assert_eq!(
         log.lock().unwrap().countdowns,
-        [
-            ("a".to_string(), CountdownKind::AgentError),
-            ("a".to_string(), CountdownKind::FailureRetry),
-        ]
+        [("a".to_string(), CountdownKind::FailureRetry)]
     );
     assert_eq!(engine.state().step_attempt("a"), Some(2));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn yolo_error_then_working_cancels_the_countdown_and_the_step_continues() {
+async fn yolo_error_then_working_clears_the_error_and_the_step_continues() {
     let front = StatusFront::new(true, YoloTickOutcome::Continue, &[]);
     let run = start(chain(&["only"]), &[], true, front, None);
     run.report(0, status(ProgramState::Error)).await;
-    run.wait_countdowns(1).await;
+    quiet_window().await;
+    assert!(run.countdowns().is_empty());
     run.report(0, status(ProgramState::Working)).await;
-    run.wait_finished(1).await;
-    // Expiry would now fail the step; there is no countdown left to expire.
+    quiet_window().await;
     *run.tick.lock().unwrap() = YoloTickOutcome::AdvanceNow;
     quiet_window().await;
     assert!(!run.cancelled(0), "the recovered agent keeps running");
@@ -590,25 +591,19 @@ async fn yolo_error_then_working_cancels_the_countdown_and_the_step_continues() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn yolo_error_then_output_cancels_the_countdown() {
+async fn yolo_error_then_output_keeps_running_but_preserves_the_error() {
     let front = StatusFront::new(true, YoloTickOutcome::Continue, &[NextAction::Pause]);
     let run = start(chain(&["only"]), &[], true, front, None);
     run.report(0, status(ProgramState::Error)).await;
-    run.wait_countdowns(1).await;
-    // Past the settle window, fresh output means the agent recovered.
-    tokio::time::sleep(Duration::from_millis(1100)).await;
+    quiet_window().await;
     run.launches.lock().unwrap()[0]
         .tail
         .push_bytes(b"retrying...\n");
-    run.wait_finished(1).await;
-    assert!(
-        !run.cancelled(0),
-        "output cancelled the countdown, not the agent"
-    );
+    quiet_window().await;
+    assert!(!run.cancelled(0), "output must not kill the agent");
     run.complete(0, 0);
     let (engine, _, _) = run.finish().await;
-    // Output cancels the countdown (the agent was not killed) but is not
-    // a status report: the error stands, so exit 0 still fails the step.
+    // Output is not a status report: the error stands, so exit 0 still fails.
     assert!(matches!(
         engine.state().status_of("only"),
         Some(StepState::Failed { .. })
@@ -820,16 +815,19 @@ async fn an_exit_after_done_keeps_its_exit_code() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_killed_container_with_a_reported_problem_is_failed_not_advanced() {
-    // Unattended error: the countdown kills the container (exit -1 from the
-    // fake backend, KILLED_EXIT_CODE on a real runtime). The kill must read
-    // as a failure, never as the engine's own advance.
+async fn an_unattended_error_waits_for_self_exit_and_never_advances() {
     let front = StatusFront::new(false, YoloTickOutcome::AdvanceNow, &[]);
     let run = start(chain(&["a", "b"]), &[], true, front, None);
     run.report(0, with_msg(ProgramState::Error, None, "boom"))
         .await;
+    quiet_window().await;
+    assert!(!run.cancelled(0));
+    assert!(run.countdowns().is_empty());
+    run.complete(0, 0);
+    run.launched(1).await;
     run.report(1, with_msg(ProgramState::Error, None, "boom"))
         .await;
+    run.complete(1, 0);
     let (engine, outcome, _) = run.finish().await;
     assert!(matches!(outcome, WorkflowOutcome::Failed { .. }));
     assert!(matches!(
@@ -941,9 +939,14 @@ async fn parallel_error_fails_only_its_own_step() {
     let y = 1 - x;
     run.report(x, with_msg(ProgramState::Error, None, "lint failed"))
         .await;
-    until("x killed", || run.cancelled(x)).await;
     quiet_window().await;
+    assert!(
+        !run.cancelled(x),
+        "the errored agent stays available for repair"
+    );
+    assert!(run.log.lock().unwrap().parallel_countdowns.is_empty());
     assert!(!run.cancelled(y), "one agent's error never fails a sibling");
+    run.complete(x, 0);
     run.complete(y, 0);
     let (engine, outcome, _) = run.finish().await;
     assert_eq!(outcome, WorkflowOutcome::Paused);
@@ -1066,20 +1069,20 @@ fn run_step_named(engine: &WorkflowEngine, name: &str) -> Option<StepState> {
     engine.state().status_of(name).cloned()
 }
 
-/// Review finding: output during an `AgentError` countdown cancels the
-/// countdown but is not a status report; exit 0 afterwards still fails.
+/// Output after an error is not a status report; exit 0 still fails.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn output_cancels_the_error_timer_but_does_not_clear_the_error() {
+async fn output_after_error_does_not_clear_the_error() {
     let front = StatusFront::new(true, YoloTickOutcome::Continue, &[NextAction::Pause]);
     let run = start(chain(&["only"]), &[], true, front, None);
     run.report(0, with_msg(ProgramState::Error, None, "failed tests"))
         .await;
-    run.wait_countdowns(1).await;
-    tokio::time::sleep(Duration::from_millis(1100)).await;
+    quiet_window().await;
     run.launches.lock().unwrap()[0]
         .tail
         .push_bytes(b"writing diagnostics...\n");
-    run.wait_finished(1).await;
+    quiet_window().await;
+    assert!(run.countdowns().is_empty());
+    assert!(!run.cancelled(0));
     run.complete(0, 0);
     let (engine, _, _) = run.finish().await;
     assert!(matches!(

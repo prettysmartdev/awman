@@ -346,14 +346,26 @@ async fn mapping_snapshot_and_frames_reach_the_presenter_channels() {
         .unwrap()
         .drain(..)
         .collect::<Vec<_>>();
-    assert!(matches!(
-        attached.as_slice(),
-        [ContainerSlotEvent::EngineAttached {
-            requests: Some(_),
-            stuck: Some(_),
+    let [ContainerSlotEvent::EngineAttached {
+        requests: Some(requests),
+        stuck: Some(_),
+        ..
+    }] = attached.as_slice()
+    else {
+        panic!("the backbone must attach workflow channels");
+    };
+    requests
+        .send(EngineRequest::OpenControlBoard {
+            step_name: "build".into(),
+        })
+        .unwrap();
+    assert!(unit.sent().iter().any(|frame| matches!(
+        frame,
+        FrontendFrame::WorkflowRequest {
+            request: WorkflowRequestWire::OpenControlBoard { step_name },
             ..
-        }]
-    ));
+        } if step_name == "build"
+    )));
 
     // Status lines and the session phase.
     unit.delta(InstanceDelta::StatusLine {
@@ -514,6 +526,29 @@ async fn mapping_snapshot_and_frames_reach_the_presenter_channels() {
             "yolo_tick"
         ]
     );
+    let error = crate::data::program_status::EffectiveStatus {
+        state: crate::data::program_status::ProgramState::Error,
+        kind: None,
+        progress: None,
+        msg: Some("tests failed".into()),
+        app: None,
+        id: None,
+    };
+    unit.frame(EngineFrame::ProgramStatus {
+        tab_id: tab_id.clone(),
+        slot_id: step.slot_id,
+        status: Some(error.clone()),
+    });
+    assert!(feeds
+        .container
+        .events
+        .lock()
+        .unwrap()
+        .drain(..)
+        .any(|event| {
+            matches!(event, ContainerSlotEvent::Reported { step_name, status: Some(got) }
+            if step_name == "test" && got == error)
+        }));
     // Esc on the step's countdown is that step's CancelCountdown.
     flag.unwrap().store(true, Ordering::SeqCst);
     assert!(unit.sent().iter().any(|frame| matches!(

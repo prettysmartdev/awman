@@ -2097,9 +2097,16 @@ fn apply_tab_delta(address: &Path, tab: &mut RemoteTab, delta: InstanceDelta) {
 /// the tab colour and the dialog-deferral signals all follow it. The engine
 /// reports only for the backbone (as the builtin engine does).
 fn report_program_status(tab: &mut RemoteTab, slot_id: &SlotId, status: Option<EffectiveStatus>) {
-    with_slot(tab, slot_id, |run, kind| {
-        if let (SlotKind::Sequential, Some(sender)) = (kind, run.stuck.as_ref()) {
-            let _ = sender.send(StuckEvent::Reported(status));
+    with_slot(tab, slot_id, |run, kind| match kind {
+        SlotKind::Sequential => {
+            if let Some(sender) = run.stuck.as_ref() {
+                let _ = sender.send(StuckEvent::Reported(status));
+            }
+        }
+        SlotKind::Step(step_name) => {
+            run.feeds
+                .container
+                .push(ContainerSlotEvent::Reported { step_name, status });
         }
     });
 }

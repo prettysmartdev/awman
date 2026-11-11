@@ -317,6 +317,11 @@ pub enum ContainerSlotEvent {
     },
     /// A container exited — evict its slot with no grey summary bar.
     Exited { step_name: String },
+    /// A parallel agent's reported status for its own container strip.
+    Reported {
+        step_name: String,
+        status: Option<crate::data::program_status::EffectiveStatus>,
+    },
     /// A container's stuck timer fired (yolo off).
     Stuck { step_name: String },
     /// A stuck container recovered.

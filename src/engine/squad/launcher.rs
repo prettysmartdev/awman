@@ -215,10 +215,11 @@ impl SquadAgentLauncher {
     /// workflow engine's "no user" column
     /// ([`respond_to_report`](crate::engine::workflow::program_status::respond_to_report)):
     /// `done`/`idle` starts the short `AgentDone` countdown whose expiry is a
-    /// normal auto-advance; `blocked` and `error` start `AgentBlocked` /
-    /// `AgentError` countdowns whose expiry kills the agent as a **failure**
+    /// normal auto-advance; `blocked` starts an `AgentBlocked` countdown
+    /// whose expiry kills the agent as a **failure**
     /// (`killed_by_countdown == false`, [`UnattendedExit::reported_problem`]
-    /// set); `working` cancels whichever is running.
+    /// set). An `error` report stays live until the agent exits or reports
+    /// recovery; `working` cancels whichever countdown is running.
     ///
     /// Logging is lifecycle-only: countdown started / cancelled / auto-advanced.
     /// No per-tick messages ever reach the daemon log.
@@ -1124,20 +1125,33 @@ mod status_tests {
     }
 
     #[tokio::test]
-    async fn blocked_and_error_fail_after_their_countdown() {
-        for state in [ProgramState::Blocked, ProgramState::Error] {
-            let a = agent(30, 60_000).await;
-            a.events.send(report(state)).unwrap();
-            let killed = a.killed.clone();
-            let exit = finish(a).await;
-            assert!(killed.load(Ordering::SeqCst), "{state:?}");
-            assert!(
-                !exit.killed_by_countdown,
-                "{state:?}: a problem kill is a failure, never an advance"
-            );
-            assert_eq!(exit.exit.exit_code, KILLED_EXIT_CODE);
-            assert_eq!(exit.reported_problem.map(|p| p.state), Some(state));
-        }
+    async fn blocked_fails_after_its_countdown() {
+        let a = agent(30, 60_000).await;
+        a.events.send(report(ProgramState::Blocked)).unwrap();
+        let killed = a.killed.clone();
+        let exit = finish(a).await;
+        assert!(killed.load(Ordering::SeqCst));
+        assert!(!exit.killed_by_countdown);
+        assert_eq!(exit.exit.exit_code, KILLED_EXIT_CODE);
+        assert_eq!(
+            exit.reported_problem.map(|p| p.state),
+            Some(ProgramState::Blocked)
+        );
+    }
+
+    #[tokio::test]
+    async fn error_report_does_not_kill_a_live_agent() {
+        let a = agent(30, 60_000).await;
+        a.events.send(report(ProgramState::Error)).unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(!a.killed.load(Ordering::SeqCst));
+        a.exit.send(0).unwrap();
+        let exit = finish(a).await;
+        assert_eq!(exit.exit.exit_code, 1);
+        assert_eq!(
+            exit.reported_problem.map(|p| p.state),
+            Some(ProgramState::Error)
+        );
     }
 
     #[tokio::test]
@@ -1232,10 +1246,9 @@ mod status_tests {
         assert_eq!(problem.msg.as_deref(), Some("login required"));
     }
 
-    /// Review finding: output cancels an `AgentError` countdown but does
-    /// not clear the error; exit 0 without a new report still fails.
+    /// Output after an error does not clear the report; exit 0 still fails.
     #[tokio::test]
-    async fn output_after_error_cancels_the_countdown_but_keeps_the_error() {
+    async fn output_after_error_keeps_the_error() {
         let a = agent(200, 60_000).await;
         a.events.send(report(ProgramState::Error)).unwrap();
         tokio::time::sleep(Duration::from_millis(30)).await;
@@ -1243,7 +1256,7 @@ mod status_tests {
         tokio::time::sleep(Duration::from_millis(400)).await;
         assert!(
             !a.killed.load(Ordering::SeqCst),
-            "the countdown was cancelled"
+            "an error report does not start a kill countdown"
         );
         a.exit.send(0).unwrap();
         let exit = finish(a).await;

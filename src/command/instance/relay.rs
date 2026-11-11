@@ -660,9 +660,16 @@ impl TabRelay {
                     requests,
                     stuck,
                 } => {
-                    self.engine_requests = requests;
-                    self.stuck_launch = stuck.as_ref().map(|_| launch_id);
-                    self.stuck = stuck;
+                    // The workflow request sender arrives before the step's
+                    // stuck receiver. A later stuck-only handover must not
+                    // erase the sender used for Ctrl-W in daemon mode.
+                    if let Some(requests) = requests {
+                        self.engine_requests = Some(requests);
+                    }
+                    if let Some(stuck) = stuck {
+                        self.stuck_launch = Some(launch_id);
+                        self.stuck = Some(stuck);
+                    }
                 }
                 ContainerSlotEvent::AttachedExited { step_name, .. } => {
                     events.extend(self.close_slot(&SlotKey::Step(step_name), None));
@@ -716,6 +723,19 @@ impl TabRelay {
                 }
                 ContainerSlotEvent::Unstuck { step_name } => {
                     events.extend(self.set_slot_stuck(&step_name, false));
+                }
+                ContainerSlotEvent::Reported { step_name, status } => {
+                    if let Some(slot) = self.slot_mut(&SlotKey::Step(step_name)) {
+                        slot.snapshot.program_status = status.clone();
+                        if status.is_some() {
+                            slot.snapshot.stuck = false;
+                        }
+                        events.push(InstanceEvent::ProgramStatus {
+                            tab_id: tab_id.clone(),
+                            slot_id: slot.snapshot.slot_id,
+                            status,
+                        });
+                    }
                 }
                 ContainerSlotEvent::CountdownKind { step_name, kind } => {
                     if let Some(slot) = self.slot_mut(&SlotKey::Step(step_name)) {
@@ -786,6 +806,15 @@ impl TabRelay {
                 }
             }
         }
+        self.feeds.signals.set_status(
+            EffectiveStatus::most_urgent(
+                self.slots
+                    .iter()
+                    .filter(|slot| !slot.snapshot.dormant)
+                    .filter_map(|slot| slot.snapshot.program_status.as_ref()),
+            )
+            .cloned(),
+        );
     }
 
     fn set_slot_stuck(&mut self, step_name: &str, stuck: bool) -> Option<InstanceEvent> {

@@ -2249,6 +2249,30 @@ mod program_status_tabs {
     }
 
     #[test]
+    fn parallel_report_event_colours_the_running_slot_red() {
+        let mut tab = make_tab();
+        tab.execution_phase = ExecutionPhase::Running {
+            command: "workflow".into(),
+        };
+        tab.container_slots
+            .push(ContainerSlot::new("build".into(), "claude".into(), 0));
+        tab.shared.container.push(ContainerSlotEvent::Reported {
+            step_name: "build".into(),
+            status: Some(status(ProgramState::Error, None)),
+        });
+        tab.drain_container_slot_events();
+        assert_eq!(
+            tab.container_slots[0]
+                .program_status
+                .as_ref()
+                .unwrap()
+                .state,
+            ProgramState::Error
+        );
+        assert_eq!(tab_color(&tab), Color::Red);
+    }
+
+    #[test]
     fn active_tab_suppression_defers_idle_and_done_only() {
         let (frontend, _req, _resp) =
             crate::frontend::tui::tests::test_command_frontend(&["workflow"], Default::default());

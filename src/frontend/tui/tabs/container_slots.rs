@@ -226,6 +226,11 @@ impl Tab {
                 }
             }
             ContainerSlotEvent::Exited { step_name } => self.evict_slot(&step_name),
+            ContainerSlotEvent::Reported { step_name, status } => {
+                if let Some(slot) = self.slot_mut(&step_name) {
+                    slot.set_program_status(status);
+                }
+            }
             ContainerSlotEvent::Stuck { step_name } => {
                 if let Some(slot) = self.slot_mut(&step_name) {
                     slot.stuck = true;

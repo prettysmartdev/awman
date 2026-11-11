@@ -627,7 +627,9 @@ impl WorkflowEngine {
         match response {
             // Working / cleared, or a problem that must never be pushed past:
             // whatever countdown was running — silence or `done` — stops.
-            ReportedResponse::Resume | ReportedResponse::NeedsYou => {
+            ReportedResponse::Resume
+            | ReportedResponse::AwaitRepair
+            | ReportedResponse::NeedsYou => {
                 self.cancel_parallel_countdown(name);
                 false
             }
@@ -672,7 +674,7 @@ impl WorkflowEngine {
         }
     }
 
-    /// A parallel `AgentBlocked` / `AgentError` countdown expired: kill just
+    /// A parallel agent-problem countdown expired: kill just
     /// that container and keep its slot. Its wait future then resolves and
     /// the group loop finalises the step as Failed on `reported_problem`, so
     /// the group's ordinary failure handling (abort_on_failure, recovery
@@ -695,7 +697,7 @@ impl WorkflowEngine {
     /// Drive every in-flight per-step yolo countdown one tick. Independent per
     /// slot — expiry kills only that container. A silence or `AgentDone`
     /// expiry advances (and frees the slot for the queue); an `AgentBlocked`
-    /// or `AgentError` expiry fails that step instead (WI 0141).
+    /// expiry fails that step instead (WI 0141).
     #[allow(clippy::too_many_arguments)] // The parallel scheduler passes its coordinated phase queues together.
     pub(super) fn tick_parallel_yolo(
         &mut self,
