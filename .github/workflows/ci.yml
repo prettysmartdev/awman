@@ -1917,6 +1917,7 @@ jobs:
     env:
       GATE: ${{ needs.plan.outputs.gate }}
       GH_TOKEN: ${{ github.token }}
+      GATE_MODE: ${{ inputs.mode }}
     steps:
       - name: Check out the commit under test
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
