@@ -18,7 +18,9 @@ use crate::data::daemon_state::FeatureName;
 use crate::data::fs::DataPaths;
 use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
 use crate::data::session::Session;
-use crate::engine::daemon::{DaemonSupervisor, Termination};
+use crate::engine::daemon::DaemonSupervisor;
+#[cfg(not(windows))]
+use crate::engine::daemon::Termination;
 use async_trait::async_trait;
 use serde::Serialize;
 use std::time::Duration;
@@ -354,6 +356,18 @@ async fn stop(
     }
     canceled.sort();
     canceled.dedup();
+    #[cfg(windows)]
+    let pid = {
+        let client = DaemonClient::discover(env)?.ok_or(CommandError::DaemonNotRunning)?;
+        let result = client
+            .call(&Request::new("POST", "/v1/shutdown", None))
+            .await?;
+        result["pid"]
+            .as_u64()
+            .and_then(|pid| u32::try_from(pid).ok())
+            .ok_or_else(|| CommandError::Other("invalid daemon shutdown response".into()))?
+    };
+    #[cfg(not(windows))]
     let pid = match supervisor.terminate_running()? {
         Termination::Terminated { pid } => pid,
         Termination::NotRunning => return Err(CommandError::DaemonNotRunning),

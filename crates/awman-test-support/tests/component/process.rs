@@ -325,7 +325,12 @@ fn agents_are_refused_directly_and_through_interpreters() {
 #[test]
 fn system_tools_run_with_the_sandbox_environment() {
     let sandbox = sandbox("process::system_tools_run_with_the_sandbox_environment");
-    let out = sandbox.command("sh").args(["-c", "echo $HOME"]).run();
+    let script = if cfg!(windows) {
+        "cygpath -w \"$HOME\""
+    } else {
+        "printf '%s\\n' \"$HOME\""
+    };
+    let out = sandbox.command("sh").args(["-c", script]).run();
     out.assert_success();
     assert_eq!(out.stdout_text().trim(), sandbox.home().to_string_lossy());
 }

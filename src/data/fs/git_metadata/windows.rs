@@ -47,17 +47,21 @@ fn parents(path: &Path, create: bool) -> io::Result<(PathBuf, Vec<File>)> {
                     return Err(io::Error::other("metadata stream path refused"));
                 }
                 current.push(name);
-                if create {
-                    match fs::create_dir(&current) {
-                        Ok(()) => {}
-                        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
-                        Err(e) => return Err(e),
-                    }
-                }
             }
             _ => return Err(io::Error::other("non-normal metadata path")),
         }
-        let handle = pinned(&current)?;
+        let handle = match pinned(&current) {
+            Ok(handle) => handle,
+            Err(e) if create && e.kind() == io::ErrorKind::NotFound => {
+                match fs::create_dir(&current) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+                    Err(e) => return Err(e),
+                }
+                pinned(&current)?
+            }
+            Err(e) => return Err(e),
+        };
         if !handle.metadata()?.is_dir() {
             return Err(io::Error::other("metadata ancestor is not a directory"));
         }

@@ -874,6 +874,13 @@ pub const ROUTES: &[RouteSpec] = &[
         capability: Some("feature_states"),
     },
     RouteSpec {
+        method: "POST",
+        path: "/v1/shutdown",
+        op: Operation::CoreShutdown,
+        local_only: true,
+        capability: None,
+    },
+    RouteSpec {
         method: "GET",
         path: "/v1/config",
         op: Operation::CoreConfigGet,
@@ -2598,6 +2605,9 @@ async fn resource_handler(
     }
     match op {
         Operation::CoreStatus => command!(core::status(&api).await),
+        Operation::CoreShutdown => {
+            Json(serde_json::json!({"pid": core::request_shutdown(&api)})).into_response()
+        }
         Operation::CoreConfigGet => Json(core::config_get(&api)).into_response(),
         Operation::CoreHealth => Json(core::health().await).into_response(),
         Operation::CoreKeysList => match crate::command::daemon_api::keys::keys_list(&api) {

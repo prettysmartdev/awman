@@ -93,6 +93,12 @@ pub async fn features_list(api: &DaemonApi) -> Result<Vec<FeatureRecord>, Comman
     }
     Ok(records)
 }
+/// Only the owner transport exposes this operation. The host drains features
+/// and flushes active local responses before exiting.
+pub fn request_shutdown(api: &DaemonApi) -> u32 {
+    api.runtime.exit_signal().cancel();
+    std::process::id()
+}
 pub async fn status(api: &DaemonApi) -> Result<StatusResponse, CommandError> {
     let mut status = api.runtime.status_snapshot();
     if let Some(worker) = status.features.remove(Feature::Worker.name()) {

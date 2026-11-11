@@ -21,6 +21,14 @@ async fn network_auth_is_required_keys_are_owner_only_and_revocation_is_immediat
         serde_json::from_value(status.clone()).unwrap();
     assert_eq!(serde_json::to_value(typed).unwrap(), status);
     assert_eq!(server.get("/v1/keys", Some(&created.key)).await.0, 404);
+    assert_eq!(
+        server
+            .request("POST", "/v1/shutdown", Some(&created.key), None, None)
+            .await
+            .0,
+        404
+    );
+    assert!(!server.api.runtime.exit_signal().is_cancelled());
     let list = serde_json::to_string(&keys::keys_list(&server.api).unwrap()).unwrap();
     assert!(list.contains(created.id.as_str()));
     assert!(!list.contains(&created.key));

@@ -100,6 +100,21 @@ async fn reload_switches_admission_without_restarting_and_invalid_changes_are_at
 }
 
 #[tokio::test]
+async fn owner_shutdown_flushes_its_response_and_exits_cleanly() {
+    let s =
+        support::sandbox("daemon::reload::owner_shutdown_flushes_its_response_and_exits_cleanly");
+    let backend = Backend::start(BackendKind::Daemon, &s).await;
+    let response = backend
+        .client()
+        .call(&Request::new("POST", "/v1/shutdown", None))
+        .await
+        .unwrap();
+    assert_eq!(response["pid"].as_u64(), backend.pid().map(u64::from));
+    backend.wait_stopped();
+    s.finish();
+}
+
+#[tokio::test]
 async fn daemon_status_and_stop_keep_their_cli_and_json_contracts() {
     let s = support::sandbox(
         "daemon::reload::daemon_status_and_stop_keep_their_cli_and_json_contracts",

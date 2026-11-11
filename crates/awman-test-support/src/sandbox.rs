@@ -254,11 +254,7 @@ pub(crate) fn system_path_dirs() -> &'static [PathBuf] {
     static DIRS: OnceLock<Vec<PathBuf>> = OnceLock::new();
     DIRS.get_or_init(|| {
         let mut dirs = Vec::new();
-        if cfg!(windows) {
-            if let Some(root) = &crate::runtime_env::get().system_root {
-                dirs.push(root.join("System32"));
-            }
-        } else {
+        if !cfg!(windows) {
             dirs.push(PathBuf::from("/usr/bin"));
             dirs.push(PathBuf::from("/bin"));
             // BSD installs administrative filesystem tools such as chown here.
@@ -283,6 +279,12 @@ pub(crate) fn system_path_dirs() -> &'static [PathBuf] {
                         }
                     }
                 }
+            }
+        }
+        // Git Bash must precede System32's unrelated WSL bash.exe launcher.
+        if cfg!(windows) {
+            if let Some(root) = &crate::runtime_env::get().system_root {
+                dirs.push(root.join("System32"));
             }
         }
         dirs

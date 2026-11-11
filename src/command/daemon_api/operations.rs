@@ -60,6 +60,7 @@ pub enum Operation {
     CoreKeysCreate,
     CoreKeysDelete,
     CoreStatus,
+    CoreShutdown,
     CoreConfigGet,
     CoreConfigReload,
     CoreFeaturesList,
@@ -142,6 +143,7 @@ impl Operation {
             | Self::CoreKeysCreate
             | Self::CoreKeysDelete => Feature::Core,
             Self::CoreStatus => Feature::Core,
+            Self::CoreShutdown => Feature::Core,
             Self::CoreConfigGet => Feature::Core,
             Self::CoreConfigReload => Feature::Core,
             Self::CoreFeaturesList => Feature::Core,
@@ -224,6 +226,7 @@ impl Operation {
             Self::CoreKeysCreate => "core.keys.create",
             Self::CoreKeysDelete => "core.keys.delete",
             Self::CoreStatus => "core.status",
+            Self::CoreShutdown => "core.shutdown",
             Self::CoreConfigGet => "core.config.get",
             Self::CoreConfigReload => "core.config.reload",
             Self::CoreFeaturesList => "core.features.list",
@@ -316,6 +319,7 @@ impl Operation {
                 | Self::EngineLaunchContextsDelete
                 | Self::CoreConfigGet
                 | Self::CoreConfigReload
+                | Self::CoreShutdown
                 | Self::CoreFeaturesPatch
                 | Self::CoreKeysList
                 | Self::CoreKeysCreate

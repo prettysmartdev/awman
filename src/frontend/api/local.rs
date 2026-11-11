@@ -44,15 +44,30 @@ impl LocalBind {
 /// socket file (only if it is still the one this listener bound).
 pub struct LocalListener {
     task: tokio::task::JoinHandle<()>,
+    connections: tokio_util::task::TaskTracker,
+    stop: tokio_util::sync::CancellationToken,
     #[cfg(unix)]
     endpoint: PathBuf,
     #[cfg(unix)]
     identity: (u64, u64),
 }
 
+impl LocalListener {
+    /// Stop admission, flush active responses and close keep-alive connections.
+    pub async fn shutdown(&self) {
+        self.task.abort();
+        self.stop.cancel();
+        self.connections.close();
+        // A peer that stops reading cannot hold daemon shutdown indefinitely.
+        let _ =
+            tokio::time::timeout(std::time::Duration::from_secs(10), self.connections.wait()).await;
+    }
+}
+
 impl Drop for LocalListener {
     fn drop(&mut self) {
         self.task.abort();
+        self.stop.cancel();
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
@@ -140,6 +155,10 @@ fn bind(
         .map_err(|e| fail("chmod 0600", &e))?;
     let meta = std::fs::symlink_metadata(endpoint).map_err(|e| fail("stat", &e))?;
     let identity = (meta.dev(), meta.ino());
+    let connections = tokio_util::task::TaskTracker::new();
+    let stop = tokio_util::sync::CancellationToken::new();
+    let tasks = connections.clone();
+    let connection_stop = stop.clone();
     let task = tokio::spawn(async move {
         loop {
             let stream = match listener.accept().await {
@@ -154,11 +173,13 @@ fn bind(
                 tracing::warn!(?peer, "refused a local connection from another user");
                 continue;
             }
-            serve_connection(stream, router.clone());
+            serve_connection(stream, router.clone(), &tasks, connection_stop.clone());
         }
     });
     let listener = LocalListener {
         task,
+        connections,
+        stop,
         endpoint: endpoint.to_path_buf(),
         identity,
     };
@@ -188,6 +209,10 @@ fn bind(
         ))
     })?;
     let name = endpoint.to_path_buf();
+    let connections = tokio_util::task::TaskTracker::new();
+    let stop = tokio_util::sync::CancellationToken::new();
+    let tasks = connections.clone();
+    let connection_stop = stop.clone();
     let task = tokio::spawn(async move {
         loop {
             if listener.connect().await.is_err() {
@@ -201,7 +226,7 @@ fn bind(
                 }
             };
             if verify_pipe_client(&listener) {
-                serve_connection(listener, router.clone());
+                serve_connection(listener, router.clone(), &tasks, connection_stop.clone());
             } else {
                 tracing::warn!("refused a named pipe connection from another user");
                 let _ = listener.disconnect();
@@ -213,19 +238,37 @@ fn bind(
         transport: LocalTransport::NamedPipe,
         address: endpoint.display().to_string(),
     };
-    Ok((LocalListener { task }, bound))
+    Ok((
+        LocalListener {
+            task,
+            connections,
+            stop,
+        },
+        bound,
+    ))
 }
 
-fn serve_connection<S>(stream: S, router: Router)
-where
+fn serve_connection<S>(
+    stream: S,
+    router: Router,
+    tasks: &tokio_util::task::TaskTracker,
+    stop: tokio_util::sync::CancellationToken,
+) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    tokio::spawn(async move {
+    tasks.spawn(async move {
         let service = hyper_util::service::TowerToHyperService::new(router);
-        let _ = hyper::server::conn::http1::Builder::new()
+        let connection = hyper::server::conn::http1::Builder::new()
             .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
             // `/v1/terminals/{id}` upgrades to a WebSocket (WI 0141).
-            .with_upgrades()
-            .await;
+            .with_upgrades();
+        tokio::pin!(connection);
+        tokio::select! {
+            _ = &mut connection => {}
+            _ = stop.cancelled() => {
+                connection.as_mut().graceful_shutdown();
+                let _ = connection.await;
+            }
+        }
     });
 }
