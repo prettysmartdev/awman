@@ -212,37 +212,3 @@ impl ResolvedSandboxOptions {
         }
     }
 }
-
-#[cfg(test)]
-mod restriction_tests {
-    use super::*;
-    use crate::engine::agent_runtime::{AgentRuntimeEngine, ResolvedAgentOptions};
-    use crate::engine::error::EngineError;
-    use crate::engine::sandbox::SandboxRuntime;
-
-    #[test]
-    fn direct_sandbox_options_cannot_bypass_tool_validation() {
-        for agent in crate::engine::agent::first_party::FIRST_PARTY_AGENTS {
-            for allowed in [true, false] {
-                let options = ResolvedSandboxOptions::resolve([
-                    SandboxOption::AgentId((*agent).into()),
-                    if allowed {
-                        SandboxOption::AllowedTools(vec!["Read".into()])
-                    } else {
-                        SandboxOption::DisallowedTools(vec!["Bash".into()])
-                    },
-                ]);
-                let result = SandboxRuntime::for_tests()
-                    .build(ResolvedAgentOptions::Sandbox(Box::new(options)));
-                if *agent == "claude" {
-                    assert!(result.is_ok());
-                } else {
-                    assert!(
-                        matches!(result, Err(EngineError::ToolRestrictionFlagMissing { .. })),
-                        "{agent}"
-                    );
-                }
-            }
-        }
-    }
-}

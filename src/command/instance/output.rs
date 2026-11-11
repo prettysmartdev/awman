@@ -13,8 +13,6 @@ pub enum OutputEvent {
 }
 #[derive(Default)]
 struct State {
-    #[cfg(any(test, feature = "test-support"))]
-    trace: Option<Arc<super::trace::OutcomeTrace>>,
     pending: Vec<OutputEvent>,
     tail: Vec<OutputEvent>,
     drains: usize,
@@ -27,10 +25,6 @@ pub struct CommandBytes {
     enabled: Arc<AtomicBool>,
 }
 impl CommandBytes {
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn set_trace(&self, trace: Arc<super::trace::OutcomeTrace>) {
-        self.state.lock().unwrap().trace = Some(trace);
-    }
     pub fn enable(&self) {
         self.enabled.store(true, Ordering::Relaxed);
     }
@@ -81,16 +75,6 @@ impl CommandBytes {
             self.state.lock().unwrap().drains += 1;
             tokio::spawn(async move {
                 while let Some(bytes) = rx.recv().await {
-                    #[cfg(any(test, feature = "test-support"))]
-                    if let Some(trace) = &output.state.lock().unwrap().trace {
-                        trace.record(
-                            match stream {
-                                OutputStream::Stdout => "stdout",
-                                OutputStream::Stderr => "stderr",
-                            },
-                            &bytes,
-                        );
-                    }
                     output
                         .state
                         .lock()

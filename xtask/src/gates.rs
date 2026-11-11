@@ -150,13 +150,14 @@ pub fn run(args: &[String]) -> anyhow::Result<ExitCode> {
             } else {
                 Vec::new()
             };
+            let diff_complete = base.is_some();
             let mut request = plan::Request {
                 repository_id,
                 event,
                 head_sha: head.unwrap_or_else(|| "local".into()),
                 base_sha: base,
                 paths,
-                diff_complete: true,
+                diff_complete,
                 admitted_platforms: Default::default(),
                 suite_durations_ms: Default::default(),
                 suite_test_counts: Default::default(),

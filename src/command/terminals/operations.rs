@@ -553,7 +553,3 @@ impl Drop for TerminalSession {
         self.finish(reason);
     }
 }
-
-#[cfg(test)]
-#[path = "operations_tests.rs"]
-mod tests;

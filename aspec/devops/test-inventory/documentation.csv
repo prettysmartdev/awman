@@ -1,3 +1,0 @@
-item,location,covered_scope,current_caller,ledger_row,disposition,suggested_target_tier
-aspec/devops/cicd.md,aspec/devops/cicd.md,testing/CI gates and release documentation,developer reference,section 9 docs row,pending,component
-aspec/devops/localdev.md,aspec/devops/localdev.md,testing sections and local test commands,developer reference,section 9 docs row,pending,component

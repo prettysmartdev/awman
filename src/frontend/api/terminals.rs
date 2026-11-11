@@ -425,7 +425,3 @@ fn invalid_annotation(error: AnnotationError) -> ApiError {
     mapped.code = AnnotationError::CODE;
     mapped
 }
-
-#[cfg(test)]
-#[path = "terminals_tests.rs"]
-mod tests;

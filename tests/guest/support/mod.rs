@@ -137,7 +137,7 @@ pub fn scenario(s: &TestSandbox, scenario: &str) -> String {
             .arg(state(s))
             .arg("--archive")
             .arg(archive)
-            .args(["--tag", "awman-hw/fixture:latest", "--work"])
+            .args(["--tag", "awman-test/guest:fixture", "--work"])
             .arg(s.work())
             .arg("--scripts")
             .arg(scripts)
@@ -239,11 +239,11 @@ fn script_source(script: &str) -> &'static str {
     match script {
         "guest-checks.sh" => include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../tools/oci-runtime-spike/guest-checks.sh"
+            "/../../tests/guest/support/mount-contract.sh"
         )),
         "image-checks.sh" => include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../tools/oci-runtime-spike/image-checks.sh"
+            "/../../tests/guest/support/image-contract.sh"
         )),
         other => panic!("unknown guest contract {other}"),
     }

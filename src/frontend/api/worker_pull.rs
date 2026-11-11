@@ -235,7 +235,3 @@ async fn handle(
     };
     result.unwrap_or_else(error)
 }
-
-#[cfg(test)]
-#[path = "worker_pull_tests.rs"]
-mod tests;

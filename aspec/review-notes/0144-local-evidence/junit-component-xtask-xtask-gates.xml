@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="nextest-run" tests="2" skipped="0" failures="0" errors="0" uuid="01e5d456-c1a5-4fa9-ac42-02e932021c9b" timestamp="2026-11-11T21:21:04.026+00:00" time="0.027">
+    <testsuite name="xtask::gates" tests="2" skipped="0" errors="0" failures="0">
+        <testcase name="missing_required_evidence_is_red" classname="xtask::gates" timestamp="2026-11-11T21:21:04.027+00:00" time="0.025"/>
+        <testcase name="frozen_dispatch_exposes_gate_help" classname="xtask::gates" timestamp="2026-11-11T21:21:04.027+00:00" time="0.025"/>
+    </testsuite>
+</testsuites>

@@ -25,8 +25,6 @@ mod sidebar;
 mod squad;
 mod status_bar;
 mod tab_bar;
-#[cfg(test)]
-mod tests;
 
 /// Rows the tab bar occupies at the top of the frame.
 const TAB_BAR_HEIGHT: u16 = 3;

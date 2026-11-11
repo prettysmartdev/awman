@@ -265,7 +265,11 @@ fn rendered_outputs_are_deterministic_and_zero_retry() {
 }
 #[test]
 fn pending_pins_are_clear_and_real_nextest_hashes_valid() {
-    let m = manifest();
+    let mut m = manifest();
+    m.previous_release
+        .get_mut("aarch64-apple-darwin")
+        .unwrap()
+        .sha256 = None;
     let errors = manifest::validate::pins(&m);
     assert!(errors.iter().any(|s| s.contains("previous release")));
     assert!(!errors.iter().any(|s| s.contains("tool nextest:")));
@@ -437,13 +441,11 @@ fn scenario_test_removal_changes_the_independent_contract() {
 }
 
 #[test]
-fn legacy_publisher_is_dispatch_only_and_guarded_by_explicit_activation() {
-    let workflow = std::fs::read_to_string(root().join(".github/workflows/release.yml")).unwrap();
-    assert!(!workflow.contains("  push:"));
-    assert!(workflow.contains("workflow_dispatch:"));
-    assert!(workflow.contains("AWMAN_LEGACY_RELEASE_ENABLED"));
-    assert!(workflow.contains("github.ref == 'refs/heads/main'"));
-    assert!(workflow.contains("git merge-base --is-ancestor HEAD origin/main"));
+fn only_the_candidate_pipeline_can_publish() {
+    assert!(!root().join(".github/workflows/release.yml").exists());
+    assert_eq!(manifest().release.operator_path, "pipeline");
+    let workflow = std::fs::read_to_string(root().join(".github/workflows/promote.yml")).unwrap();
+    assert!(workflow.contains("release promote"));
 }
 
 #[test]

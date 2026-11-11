@@ -72,36 +72,3 @@ impl BuildRequest {
         Ok(())
     }
 }
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn runtime_request_keeps_cli_defaults_and_paths() {
-        let request = BuildRequest::runtime(
-            "image:tag",
-            Path::new("/Dockerfile"),
-            Path::new("/context"),
-            true,
-        );
-        assert_eq!(request.target, BuildTarget::Runtime);
-        assert_eq!(request.reference, "image:tag");
-        assert_eq!(request.dockerfile, Path::new("/Dockerfile"));
-        assert_eq!(request.context, Path::new("/context"));
-        assert!(request.no_cache);
-        assert!(request.build_args.is_empty());
-    }
-
-    #[test]
-    fn runtime_backends_refuse_what_they_cannot_honour() {
-        let runtime = BuildRequest::runtime("i:t", Path::new("/D"), Path::new("/c"), false);
-        assert!(runtime.require_runtime_build().is_ok());
-        let mut bound = runtime.clone();
-        bound.target = BuildTarget::Docker {
-            endpoint: "unix:///d.sock".into(),
-        };
-        assert!(bound.require_runtime_build().is_err());
-        let mut with_args = runtime;
-        with_args.build_args.push(("A".into(), "1".into()));
-        assert!(with_args.require_runtime_build().is_err());
-    }
-}

@@ -38,8 +38,6 @@ mod git_poll;
 mod labels;
 mod overlay_lifecycle;
 pub mod squad_state;
-#[cfg(test)]
-pub(crate) mod tests;
 
 use squad_state::SquadTabState;
 

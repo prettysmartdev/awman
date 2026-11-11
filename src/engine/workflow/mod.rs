@@ -1267,4 +1267,4 @@ pub fn workflow_name_for(workflow: &Workflow) -> String {
 }
 
 #[cfg(test)]
-mod tests;
+mod contracts;

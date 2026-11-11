@@ -345,20 +345,3 @@ pub fn env_overlay_names(specs: &[String]) -> Vec<String> {
     }
     names
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The fallback backend does nothing and says so — `store`/`clear` are
-    /// `Ok(())`, `load` is cleanly `Ok(None)`, never an error.
-    #[test]
-    fn no_store_round_trips_as_none() {
-        let store = NoStore;
-        let vars = DaemonEnvMap::from_pairs([("TOKEN", "v1")]);
-        assert!(store.store(&vars).is_ok());
-        assert_eq!(store.load().unwrap(), None);
-        assert!(store.clear().is_ok());
-        assert_eq!(store.backend_name(), "none");
-    }
-}

@@ -237,7 +237,3 @@ pub(super) fn query_carries_credentials(uri: &axum::http::Uri) -> bool {
         })
     })
 }
-
-#[cfg(test)]
-#[path = "browser_tests.rs"]
-mod tests;

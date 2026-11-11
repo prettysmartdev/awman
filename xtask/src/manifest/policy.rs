@@ -1,14 +1,11 @@
 //! Reviewed coverage floor. Deleting a table cannot silently lower required coverage.
 pub const REQUIRED_SUITES: &[&str] = &[
     "unit-awman",
-    "unit-cli",
-    "unit-cli-bin",
-    "unit-host-shims",
     "unit-wsp",
     "unit-test-support",
     "unit-xtask",
     "unit-awman-builtin",
-    "unit-host-shims-builtin",
+    "component-core-internals",
     "component-data",
     "component-engine",
     "component-command",

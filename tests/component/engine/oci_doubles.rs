@@ -343,6 +343,7 @@ pub struct EngineDouble {
 
 #[cfg(unix)]
 impl EngineDouble {
+    /// hygiene-allow(H4): Socket path is leased by TestSandbox Ports; EngineDouble drop wakes and joins the listener thread.
     pub fn start(sandbox: &TestSandbox, name: &str, handler: Arc<EngineHandler>) -> EngineDouble {
         let socket = sandbox.ports().unix_socket(name);
         let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();

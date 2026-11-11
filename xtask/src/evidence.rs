@@ -1,5 +1,6 @@
 //! Evidence APIs are shared with the CI controller and release pipeline.
 #![allow(dead_code)]
+pub mod actions;
 pub mod aggregate;
 pub mod digest;
 pub mod emit;
@@ -115,7 +116,7 @@ pub fn run(args: &[String]) -> anyhow::Result<ExitCode> {
         Command::Aggregate {
             gate,
             plan,
-            input,
+            input: _,
             out,
             summary,
         } => {
@@ -123,28 +124,47 @@ pub fn run(args: &[String]) -> anyhow::Result<ExitCode> {
             let p: crate::gates::plan::Plan = serde_json::from_slice(&std::fs::read(plan)?)?;
             anyhow::ensure!(p.gate == gate, "aggregate gate/plan mismatch");
             manifest_check(&m)?;
-            // Authentication has no local JSON escape hatch. The CI controller must
-            // call aggregate() with service-verified metadata, not trust the artifacts.
-            let mut errors=vec!["blocked: authenticated controller transport is required; local/downloaded JSON cannot authenticate a CI producer".to_string()];
-            let records = emit::read_directory(&input)?;
-            for c in p.cells.iter().filter(|c| c.selected) {
-                if !records.iter().any(|r| r.cell == c.cell.id) {
-                    errors.push(format!("missing required suite {}", c.cell.id));
-                }
-            }
             std::fs::create_dir_all(&out)?;
-            let report = serde_json::json!({"schema":1,"kind":"gate","gate":gate,"verdict":"blocked","errors":errors,"generated_at":chrono::Utc::now()});
+            // Re-download and digest-check artifacts through the service. The
+            // caller's --in directory is diagnostic material, never provenance.
+            let report = match actions::aggregate(&crate::gates::root(), &m, &p) {
+                Ok(report) => report,
+                Err(error) => {
+                    let report = serde_json::json!({"schema":1,"kind":"gate","gate":gate,"verdict":"blocked","errors":[format!("{error:#}")]});
+                    std::fs::write(
+                        out.join("gate-evidence.json"),
+                        serde_json::to_vec_pretty(&report)?,
+                    )?;
+                    if let Some(path) = summary {
+                        std::fs::write(path, format!("{error:#}"))?;
+                    }
+                    eprintln!("{error:#}");
+                    return Ok(ExitCode::from(1));
+                }
+            };
             std::fs::write(
                 out.join("gate-evidence.json"),
                 serde_json::to_vec_pretty(&report)?,
             )?;
             if let Some(path) = summary {
-                std::fs::write(path, errors.join("\n"))?;
+                std::fs::write(
+                    path,
+                    format!(
+                        "Verdict: {:?}\n{}\nMissing: {}",
+                        report.verdict,
+                        report.errors.join("\n"),
+                        report.missing.join(", ")
+                    ),
+                )?;
             }
-            for e in errors {
+            for e in &report.errors {
                 eprintln!("{e}");
             }
-            Ok(ExitCode::from(1))
+            Ok(if report.verdict == schema::Outcome::Passed {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(1)
+            })
         }
         Command::History { command } => match command {
             History::Append { store, evidence } => {

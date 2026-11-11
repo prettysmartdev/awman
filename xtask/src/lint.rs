@@ -1,5 +1,6 @@
 //! Source hygiene and manifest-backed lint dispatch.
 pub mod hygiene;
+pub mod resources;
 use std::{path::PathBuf, process::ExitCode};
 pub fn run(args: &[String]) -> anyhow::Result<ExitCode> {
     match args.first().map(String::as_str) {
@@ -19,7 +20,7 @@ pub fn run(args: &[String]) -> anyhow::Result<ExitCode> {
                 .findings
                 .iter()
                 .filter(|f| {
-                    f.contains("H5")
+                    (f.contains("H5") || f.contains("; use the owned test foundation"))
                         && (path == root || f.contains(&path.to_string_lossy().to_string()))
                 })
                 .collect();

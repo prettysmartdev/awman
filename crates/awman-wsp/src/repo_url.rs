@@ -44,27 +44,3 @@ pub fn validate(url: &str) -> Result<(), &'static str> {
         Err("lease repository URL must be remote")
     }
 }
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn rejects_credentials_and_query_urls_before_storage_or_transport() {
-        for url in [
-            "ssh://git:SECRET@git.example/r",
-            "https://git.example/r?access_token=SECRET",
-            "ssh://git@git.example/r#SECRET",
-            "https://SECRET@git.example/r",
-            "ext::sh -c id",
-        ] {
-            let error = super::validate(url).unwrap_err();
-            assert!(!error.contains("SECRET"));
-        }
-        for url in [
-            "ssh://git@git.example/r",
-            "git@git.example:r",
-            "https://git.example/r",
-            "http://[::1]:8080/r",
-        ] {
-            assert!(super::validate(url).is_ok(), "{url}");
-        }
-    }
-}

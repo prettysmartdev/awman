@@ -261,6 +261,10 @@ pub(crate) fn system_path_dirs() -> &'static [PathBuf] {
         } else {
             dirs.push(PathBuf::from("/usr/bin"));
             dirs.push(PathBuf::from("/bin"));
+            // BSD installs administrative filesystem tools such as chown here.
+            // These are fixed system locations, never the operator's PATH.
+            dirs.push(PathBuf::from("/usr/sbin"));
+            dirs.push(PathBuf::from("/sbin"));
         }
         if let Some(git) = capability::find_git() {
             if let Some(dir) = git.parent() {

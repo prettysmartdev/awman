@@ -75,46 +75,8 @@ fn open_dir_at(parent: &File, name: &OsStr, path: &Path, what: &str) -> Result<F
         })
 }
 
-/// Test seam: what an injected fault does when its point is reached.
-#[cfg(test)]
-pub(crate) enum Fault {
-    /// Fail with EIO, as a failing disk would.
-    Fail,
-    /// Panic, which models a crash: no cleanup runs while unwinding.
-    Crash,
-    /// Run a closure (to change the filesystem at that moment), then go on.
-    Run(Box<dyn FnMut()>),
-}
-
-#[cfg(test)]
-thread_local! {
-    static FAULTS: std::cell::RefCell<Vec<(String, Fault)>> = const { std::cell::RefCell::new(Vec::new()) };
-}
-
-/// Test seam: fire `fault` the next time `point` is reached on this thread.
-#[cfg(test)]
-pub(crate) fn inject_fault(point: &str, fault: Fault) {
-    FAULTS.with(|faults| faults.borrow_mut().push((point.into(), fault)));
-}
-
 /// A named point where tests inject faults; a no-op otherwise.
 fn fault_point(point: &str, path: &Path) -> Result<(), DataError> {
-    #[cfg(test)]
-    {
-        let fault = FAULTS.with(|faults| {
-            let mut faults = faults.borrow_mut();
-            let index = faults.iter().position(|(name, _)| name == point)?;
-            Some(faults.remove(index).1)
-        });
-        match fault {
-            Some(Fault::Fail) => {
-                return Err(io_err(path, std::io::Error::from_raw_os_error(libc::EIO)));
-            }
-            Some(Fault::Crash) => panic!("simulated crash at {point}"),
-            Some(Fault::Run(mut run)) => run(),
-            None => {}
-        }
-    }
     let _ = (point, path);
     Ok(())
 }

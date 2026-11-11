@@ -30,8 +30,3 @@ pub use frontend::{
 };
 pub use task_policy::{collect_task_prerequisites, edit_task_policy, task_policy_from_outcome};
 pub use widening::{check_flag_widening, check_task_widening};
-
-#[cfg(test)]
-mod flow_tests;
-#[cfg(test)]
-mod tests;

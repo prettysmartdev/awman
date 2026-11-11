@@ -96,7 +96,10 @@ fn wanted(m: &Manifest, tier: Option<&str>, store: &Path) -> Vec<Wanted> {
                 id: format!("previous-release {triple}"),
                 path: store.join("previous-release").join(triple).join(&p.asset),
                 sha256: p.sha256.clone(),
-                source: None,
+                source: Some(format!(
+                    "https://github.com/prettysmartdev/awman/releases/download/{}/{}",
+                    p.version, p.asset
+                )),
                 pending: p.pending.clone(),
             });
         }

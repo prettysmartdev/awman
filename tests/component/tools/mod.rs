@@ -1,4 +1,5 @@
-//! Surviving macOS signing wrapper contracts run on GNU and BSD userlands.
+//! Shipping-tool contracts run with private state on GNU and BSD userlands.
+mod architecture;
 use crate::support;
 fn root() -> std::path::PathBuf {
     std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."))

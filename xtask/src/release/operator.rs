@@ -1,5 +1,4 @@
 //! The operator shell preserves the terminal contract; Rust owns state/evidence.
-//! The legacy path stays available until the manifest's reviewed P4 switch.
 mod record;
 
 use std::process::{Command, ExitCode};
@@ -8,13 +7,7 @@ pub fn run(args: &[String]) -> anyhow::Result<ExitCode> {
     if args.first().is_some_and(|a| a.starts_with("--internal-")) {
         return internal(args);
     }
-    let manifest = crate::manifest::load(std::path::Path::new("."))?;
-    let script = match manifest.release.operator_path.as_str() {
-        "legacy" => "scripts/release.sh",
-        "pipeline" => "xtask/src/release/operator/flow.sh",
-        other => anyhow::bail!("unknown release operator path {other}"),
-    };
-    exec_shell(script, args)
+    exec_shell("xtask/src/release/operator/flow.sh", args)
 }
 
 pub(super) fn exec_shell(script: &str, args: &[String]) -> anyhow::Result<ExitCode> {

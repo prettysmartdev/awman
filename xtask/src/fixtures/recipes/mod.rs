@@ -1,4 +1,5 @@
 //! Explicit preparation jobs. Test execution never calls these recipes.
+mod guest_image;
 use anyhow::{bail, Context, Result};
 use std::{
     collections::BTreeMap,
@@ -94,14 +95,7 @@ fn guest(opts: &BTreeMap<String, String>) -> Result<()> {
     let base = PathBuf::from(value(opts, "--base")?);
     verify(&base, value(opts, "--sha256")?)?;
     let out = PathBuf::from(value(opts, "--out")?);
-    let root = crate::gates::root();
-    let mut cmd = Command::new("cargo");
-    cmd.args(["run", "--locked", "--release", "--manifest-path"])
-        .arg(root.join("tools/oci-runtime-spike/fixture/Cargo.toml"))
-        .arg("--")
-        .arg(base)
-        .arg(&out);
-    checked(cmd)?;
+    guest_image::build(&base, &out)?;
     let archive = out.join("fixture-oci.tar");
     let hash = crate::evidence::digest::sha256_file(&archive)?;
     println!("fixture guest-oci-base: {} sha256={hash}; publish these immutable bytes then commit the pin",archive.display());

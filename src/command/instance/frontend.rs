@@ -51,8 +51,7 @@ pub struct InstanceCommandFrontend {
     pub(crate) command_bytes: super::output::CommandBytes,
     input_available: bool,
     pub(crate) wake: Option<Arc<tokio::sync::Notify>>,
-    #[cfg(any(test, feature = "test-support"))]
-    trace: Option<Arc<super::trace::OutcomeTrace>>,
+
     pub(crate) attach_exit_code: std::sync::Arc<std::sync::atomic::AtomicI32>,
     pub(crate) attach_hangup: tokio_util::sync::CancellationToken,
     parsed: ParsedCommandBoxInput,
@@ -228,8 +227,7 @@ impl InstanceCommandFrontend {
             command_bytes,
             input_available: true,
             wake: None,
-            #[cfg(any(test, feature = "test-support"))]
-            trace: None,
+
             parsed,
             messages: StatusLogSink::new(status_log.clone()),
             pty_active: false,
@@ -341,10 +339,6 @@ impl InstanceCommandFrontend {
         &self,
         request: DialogRequest,
     ) -> Result<DialogResponse, CommandError> {
-        #[cfg(any(test, feature = "test-support"))]
-        if let Some(trace) = &self.trace {
-            trace.record("dialog", &request);
-        }
         let _ = self.dialog_tx.send(request);
         if let Some(wake) = &self.wake {
             wake.notify_one();
@@ -368,10 +362,7 @@ impl InstanceCommandFrontend {
         // A request left over from an earlier board must not close this one.
         self.signals.take_report_dialog_dismiss();
         let opened = std::time::Instant::now();
-        #[cfg(any(test, feature = "test-support"))]
-        if let Some(trace) = &self.trace {
-            trace.record("dialog", &request);
-        }
+
         let _ = self.dialog_tx.send(request);
         if let Some(wake) = &self.wake {
             wake.notify_one();
@@ -501,13 +492,7 @@ impl InstanceCommandFrontend {
         self.wake = Some(wake);
         self
     }
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn with_trace(mut self, trace: Arc<super::trace::OutcomeTrace>) -> Self {
-        self.messages = self.messages.with_trace(trace.clone());
-        self.command_bytes.set_trace(trace.clone());
-        self.trace = Some(trace);
-        self
-    }
+
     /// The frontend kind Dispatch applies policy for (default `Tui`).
     pub fn with_kind(mut self, kind: FrontendKind) -> Self {
         self.kind = kind;
@@ -749,56 +734,5 @@ impl CommandFrontend for InstanceCommandFrontend {
 
     fn arguments(&self, _command_path: &[&str], name: &str) -> Result<Vec<String>, CommandError> {
         Ok(self.parsed.args.arguments(name))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::command::dispatch::catalogue::CommandCatalogue;
-    use crate::command::dispatch::parsed_input::parse;
-    use crate::command::dispatch::projections::raw_args::shared_cases::{
-        assert_reads, classification, CASES, ERROR_CASES,
-    };
-    use crate::command::instance::test_support::test_command_frontend;
-
-    fn command_line(path: &[&str], args: &[&str]) -> String {
-        shell_words::join(path.iter().chain(args))
-    }
-
-    #[test]
-    fn typed_input_reaches_every_accessor_unchanged() {
-        for case in CASES {
-            let raw = command_line(case.path, case.args);
-            let parsed = parse(&raw, CommandCatalogue::get())
-                .unwrap_or_else(|e| panic!("{}: {e}", case.name));
-            assert_eq!(parsed.path, case.canonical, "{}", case.name);
-            let (frontend, _requests, _responses) =
-                test_command_frontend(case.canonical, parsed.args);
-            assert_reads(&frontend, case, case.reads);
-            assert_reads(&frontend, case, case.tui_reads);
-        }
-    }
-
-    #[test]
-    fn the_box_rejects_shared_error_cases_with_their_classification() {
-        for (path, args, want) in ERROR_CASES {
-            let raw = command_line(path, args);
-            let error = parse(&raw, CommandCatalogue::get()).expect_err(&raw);
-            assert_eq!(classification(&error), *want, "{raw}");
-        }
-    }
-
-    #[test]
-    fn squad_attach_resolves_the_task_and_refuses_the_removed_container_flag() {
-        let attach = |raw: &str| {
-            let parsed = parse(raw, CommandCatalogue::get()).unwrap();
-            test_command_frontend(&["squad", "attach"], parsed.args).0
-        };
-        assert!(!attach("squad attach nightly").squad_attach_has_explicit_target());
-        assert!(parse(
-            "squad attach nightly --container c1",
-            CommandCatalogue::get()
-        )
-        .is_err());
     }
 }

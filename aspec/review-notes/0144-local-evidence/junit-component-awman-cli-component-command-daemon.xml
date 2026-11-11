@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="nextest-run" tests="3" skipped="0" failures="0" errors="0" uuid="5502af41-ec2a-4c74-b6f8-ab6489599315" timestamp="2026-11-11T21:20:54.383+00:00" time="1.430">
+    <testsuite name="awman-cli::component" tests="3" skipped="0" errors="0" failures="0">
+        <testcase name="command::daemon::workflow_preflight_is_read_only_and_missing_work_is_typed" classname="awman-cli::component" timestamp="2026-11-11T21:20:54.387+00:00" time="1.053"/>
+        <testcase name="command::daemon::config_edits_are_durable_and_invalid_values_are_atomic" classname="awman-cli::component" timestamp="2026-11-11T21:20:54.387+00:00" time="1.075"/>
+        <testcase name="command::daemon::catalogue_explains_each_command_before_execution" classname="awman-cli::component" timestamp="2026-11-11T21:20:54.386+00:00" time="1.427"/>
+    </testsuite>
+</testsuites>

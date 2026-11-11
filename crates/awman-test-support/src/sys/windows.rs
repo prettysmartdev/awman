@@ -169,3 +169,9 @@ impl Drop for Group {
 pub(crate) fn is_text_file_busy(err: &std::io::Error) -> bool {
     err.raw_os_error() == Some(32)
 }
+
+/// Job objects contain every supervised descendant before it starts; the
+/// group's accounting probe above is the Windows escape check.
+pub(crate) fn escaped_processes(_root: &std::path::Path) -> Vec<crate::Leak> {
+    Vec::new()
+}

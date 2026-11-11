@@ -1,8 +1,6 @@
 # Testing
 
-WI 0144 remains an incomplete shadow migration. Static checks passing do not
-certify a working production evidence chain or complete legacy replacement;
-see [replacement-ledger.md](replacement-ledger.md) for code blockers and cutover.
+The manifest test system is the only supported path. See [replacement-ledger.md](replacement-ledger.md) for coverage decisions and evidence. Native Apple Silicon acceptance remains open until the maintainer's packet is independently reviewed.
 
 How awman's tests are organised, isolated, selected and run. The contract itself
 (suites, tiers, capabilities, gates, quarantine) lives in `ci/gates.toml`; this
@@ -39,7 +37,7 @@ capability and either gets it or the run is `blocked`.
 
 | Tier | Binary / location | What it is for | Real engines, guests or network |
 |---|---|---|---|
-| `unit` | inline `#[cfg(test)]` modules and doctests in every crate | pure functions and data; files in a private temp directory only | never: no sockets, no processes |
+| `unit` | pure contract modules and doctests | pure functions and data; files in a private temp directory only | never: no sockets, no processes |
 | `component` | `tests/component/` (package `awman-cli`, target `component`) | commands, engine, daemon, squad, worker and frontends against fakes; runs both the builtin and the daemon backend | never |
 | `boundary` | `tests/boundary/` (target `boundary`) | the real Docker Engine, registry, Git transports, Apple Containers and `sbx`, to prove the fakes tell the truth | only those named in `AWMAN_TEST_HOST_RESOURCES` |
 | `guest` | `tests/guest/` (target `guest`, feature `guest-drivers`) | real builtin microVM guests: boot, exec, import, network, upgrade, builder, strategy | hypervisor, verified payload, pinned fixtures |
@@ -153,7 +151,7 @@ per-test budget. `Ready` is `Immediately`, `StdoutLine(prefix)`,
 drains terminal output to EOF within that limit. Reading `output_so_far` after
 wait includes the final transcript bytes; a descendant holding the terminal open
 fails the wait instead of producing a truncated successful transcript. Windows
-ConPTY completion/containment still needs P9 evidence.
+ConPTY execution is validated by the hosted Windows component gate.
 
 Program names resolve through the sandbox `PATH` only. These are refused with a
 `REFUSED:` panic: agent executables (`claude`, `codex`, `gemini`, `opencode`, …,
@@ -177,7 +175,7 @@ A survivor, an address still accepting connections, or a socket file left in
   `wait_for_async(what, limit, || async { Option<T> })` poll a condition with a
   deadline. Prefer `Ready`, `wait_for_stdout` and
   `FakeCli::wait_until_held/wait_for_calls`.
-- No other sleeping. `sleep` in test code violates the target H3 policy; implementing enforcement is B3.
+- No other sleeping. direct `sleep` calls in test code are rejected by H3.
 
 ### Fakes and conformance
 
@@ -262,11 +260,7 @@ requires.
 9. **Real resources are named by the caller**, never assumed
    (`AWMAN_TEST_HOST_RESOURCES`).
 
-`cargo xtask lint hygiene` currently enforces structural H5 in test bodies,
-file-local helper calls and explicitly named cross-module assertion helpers.
-`make architecture-lint` and the `lint-hygiene` suite invoke that check. The table
-below is the required migration contract; H1–H4 and H6–H10 are not yet implemented
-(B3 in replacement-ledger.md). A green command does not certify those rules.
+`cargo xtask lint hygiene` checks direct Rust resource calls (H1–H4, H7, H9 and H10) and structural assertion control flow (H5). The support crate implements the reviewed low-level primitives. H6/H8 tier placement, fixed-port intent and macro/alias indirection also require code review; syntax checks are not a proof of isolation or semantic coverage. The manifest capability boundary enforces resource grants at execution time.
 
 | Rule | Forbids |
 |---|---|
@@ -275,15 +269,15 @@ below is the required migration contract; H1–H4 and H6–H10 are not yet imple
 | H3 | `sleep` in test code |
 | H4 | fixed ports and unowned listeners |
 | H5 | tests that can pass without asserting: early return before the first assertion, return after a skip message, assertions only under an `if`/`if let Ok/Some` with no failing alternative, an error discarded with `.ok()`, `#[ignore]` without a `not-applicable:` reason |
-| H6 | sockets, processes, `TestSandbox::command` or `require::<…>` in inline unit tests |
+| H6 | sockets, processes, `TestSandbox::command` or `require::<…>` in tests assigned to the unit tier |
 | H7 | reading the environment in test code outside `runtime_env`; unreviewed `AWMAN_TEST_*` names |
 | H8 | `ManualClock` outside test code; paused Tokio time outside the unit tier |
 | H9 | `use awman` in `tests/artifact/`; new users of `tests/helpers` or the `test-support` feature |
 | H10 | passing an agent command directly to `TestSandbox::command` |
 
-An exception is a comment on the line above:
-`// hygiene-allow(H<n>): <reason>`. Exceptions are counted in the lint output.
-There is no shared allow-list.
+A reviewed direct-resource exception is a function doc comment:
+`/// hygiene-allow(H<n>): <concrete ownership or inspection reason>`.
+This is used for the runner sweep fault injection and the leased Unix listener double. Build metadata (`CARGO_MANIFEST_DIR`) may be read to locate committed tools. Do not suppress a real ownership defect.
 
 ## Naming
 
@@ -405,78 +399,84 @@ expires = "2026-12-31"
 
 ## Acceptance matrix
 
-`ci/acceptance-matrix.toml` has one row per subsystem × mode × backend × runtime
-× platform × feature cell: `covered` (with the exact test ids and the gate that
-certifies them), `not-applicable` (with a reason) or `blocked` (with owner and
-release impact). `cargo xtask matrix render` writes
-[acceptance-matrix.md](acceptance-matrix.md) and `cargo xtask matrix check` fails
-if a named test does not exist or a required row is missing. `covered` names
-tests; it is not a claim that they passed on that platform, which is what the
-gate's evidence shows.
+`ci/acceptance-matrix.toml` records important behavior anchors with named tests and gates. Platform, feature, runtime and complete suite selection come from `ci/gates.toml`; do not duplicate that Cartesian product by hand or demand one test per catalogue permutation. `cargo xtask matrix check` rejects missing behavior slices and nonexistent named tests. `covered` means executable coverage exists, not that it passed on a platform. Only actual run evidence establishes execution, and the native item remains open until its packet is reviewed.
 
-## Legacy targets
+## Execution and evidence
 
-Until their replacements have shadow evidence, a number of older integration
-targets remain, each listed as a `[[legacy_fallback]]` row in `ci/gates.toml`
-with its removal condition (see [replacement-ledger.md](replacement-ledger.md)).
-`make legacy-test` runs them through `tools/isolated-test.sh`. New tests never go
-in these targets and never use `tests/helpers`.
+Every selected suite must contain tests. The runner captures compiled inventory, executes with zero retries, clears stale JUnit, and records source hashes and actual results. Missing tests, required skips and changed inputs fail validation. Component contracts in private library modules are selected explicitly by the manifest; placement alone never grants unit-tier privileges.
 
-## WI 0144 review status and current runner behavior
+Tests own their private HOME, Git configuration, processes and sockets through TestSandbox. The runner also watches the real awman and Git configuration paths for changes. Unrelated editor caches are outside that canary. This is test resource ownership, not a sandbox for hostile native code; never run an untrusted PR on a privileged host.
 
-The successor is still in shadow operation. `gates check` verifies the static
-contract; it does not certify a passing GitHub run. The CLI evidence aggregator
-still refuses unauthenticated transport, and producer emission/controller
-integration must be completed before requiring `gate`. The legacy coverage stays
-registered while semantic replacement and platform evidence are missing.
+`--shuffle-seed` changes suite invocation order. It does not randomize tests inside a nextest invocation. Record repeats, time and failures accurately; a single clean run is not p95 or a long-term flake-rate measurement.
 
-`test run` executes each selected suite separately with nextest's
-`--no-tests fail`. A nonempty neighboring suite cannot hide an empty filter.
-Resource-using retained inline awman tests run in the component tier; the unit
-budget remains one second. The generated model suite has its own 120-second
-budget for its 64 persisted state-machine traces.
+The Actions controller authenticates service run, attempt, job roles and artifact digests, downloads evidence independently, and compares selected compiled tests with passing JUnit. Local packets are operator evidence and cannot authorize CI publication. The native handoff below is separate from release environment and runner-group admission.
 
-The runner gives retained inline harnesses a private HOME, AWMAN_HOME, XDG and
-temp root, retains the Cargo/Rustup installation locations, checks a before/after
-HOME canary, and removes its owned temporary tree. The canary reports changed
-paths; unrelated applications writing that HOME concurrently can also make it
-fail. Use a dedicated canary HOME when testing the runner itself. Direct
-`cargo test` still includes retained inline tests that have not all migrated to
-`TestSandbox`; the run-level protection is provided by `cargo xtask test run`.
+## Apple Silicon acceptance packet
 
-`--shuffle-seed` records and permutes suite invocation order. Nextest runs each
-test in its own process; it does not shuffle the tests within an invocation.
-The stable libtest fallback also does not shuffle individual tests. These seeds
-must not be reported as proof of randomized intra-suite ordering.
+On a native Apple Silicon Mac, from a clean checkout of the revision being
+reviewed, run:
 
-Self-hosted jobs initialize a private attempt lease with `ci sweep --init`.
-`sweep` refuses a missing or mismatched lease, scans only that attempt's roots,
-and never deletes ambient Docker containers by name or processes by workspace
-substring. Docker/VM containment and reclamation after a killed job still need
-native admission/rehearsal evidence. Linux fallback cleanup recognizes inherited
-private roots and validates PID creation time; a hostile descendant that erases
-its environment requires an enforced cgroup. Linux supervised commands refuse
-`setsid`; this restriction and environment checks are not an OS security sandbox.
-macOS containment remains pending P3/P9. Labels and cleared environments are not
-host isolation.
+```sh
+make validate-native
+```
 
-The structural hygiene implementation currently covers H5 with branch and
-polling-helper handling. H1–H4 and H6–H10 are still implementation obligations;
-the support crate's narrower clippy configuration does not enforce those rules
-across the whole workspace. Do not use a passing hygiene command to claim that
-all ten rules or all historical replacements are complete.
+Prerequisites: the repository's pinned Rust toolchain, Xcode command-line tools,
+Docker running with a local Unix-socket context, Apple Containers with its
+service running, and the `sbx` CLI installed and usable. Run as your normal user,
+with no other validation process using this checkout. Preparation needs internet
+access and enough disk for debug/release builds, payloads and guest images. This
+command explicitly grants the test runner access to those named local runtimes
+and the hypervisor. It never runs an agent on the host.
 
+The target installs the pinned test runner, fetches and verifies the builtin
+payload and published previous executable, prepares a digest-recorded guest
+fixture, compiles the native suites, captures their expected tests, signs the
+guest executables and release candidate, and runs the guest and artifact tiers
+plus the declared native boundaries. The signed candidate is copied into the
+packet and must retain the same digest throughout execution. The offline artifact
+tests enforce their own network denial. Image preparation is a separate online
+phase; a locally prepared fixture pin is recorded in `run-config.toml` and does
+not change the repository's fixture policy.
 
-Workflow lint parses all seven YAML workflows, including retained fallbacks. It
-checks reviewed write scopes, forbids pull_request_target, requires protected-main
-and environment/admission guards on hardware routing, and rejects dependency
-edges that consume neither artifacts, outputs nor verdicts unless they have a
-named ordering rationale. Artifact names distinguish called gates. CI runs each
-lint suite once; the retained Tests status shim is removed only at P2.
+Successful and failed runs both print a `target/native-validation/*.tar.gz`
+path and its SHA-256. Send that archive, the printed digest, and confirmation
+that you ran it on your Mac. Logs, exact source/input hashes, independently
+listed tests, JUnit, command exit codes and timings, fixture provenance and bytes, signing
+checks and the tested executable are included. Do not send your environment,
+credentials, Docker configuration or home directory. A failed packet is useful
+for diagnosis but cannot close acceptance. A target that cannot start because
+Cargo or Make is missing cannot produce a packet; send its console error.
 
-The documentation check also reads current aspec/devops and docs Markdown outside
-the generated block: executable Make references and explicitly named jobs/suites
-must exist. Versioned release notes preserve historical command names. The driver
-clears ambient credentials and daemon overrides while retaining the pinned tool
-PATH and declared build/test inputs. These protections do not migrate every
-retained inline test or complete the missing hygiene rules.
+### Instructions for the agent receiving the packet
+
+1. Treat the archive as untrusted input: inspect its member names and reject
+   absolute paths, `..`, links, device files or unexpectedly large expansions
+   before extracting it into a fresh directory. Check the archive SHA-256
+   against the separately supplied digest.
+2. Read `evidence/packet.json`, then check out its **exact commit** in a clean
+   worktree. Do not execute binaries or scripts from the received archive.
+   Review the committed native-validation implementation, selected manifest
+   suites, fixture recipe, and actual test assertions independently.
+3. From that checkout run
+   `cargo xtask native-validation verify /absolute/path/to/evidence`.
+   This checks the source inputs, every packet file digest, the candidate
+   digest, complete native suite selection, successful command records, and
+   equality between the independently enumerated tests and passing JUnit.
+   Missing, duplicated, skipped, blocked, failed or substituted results must
+   fail verification. Check the fixture provenance and exact allowed run-local
+   manifest change as well.
+4. Review host/version and hypervisor logs, payload verification, previous
+   release digest, signing/entitlement output, and actual guest/upgrade/offline
+   results. Confirm the operator's provenance statement. If the source has
+   since changed in a way affecting these contracts or inputs, request a new
+   run; do not transfer evidence to a different revision.
+5. Record the packet's digest, commit, native platform, tested binary and
+   fixture digests, suite/test counts, timings, and reviewer conclusion in the
+   work item. Close its final native item only when the important execution,
+   recovery, upgrade and signed-artifact paths passed. Failed or incomplete
+   evidence leaves the item open and receives a concrete diagnosis.
+
+A single run measures execution time; it does **not** establish p95 latency or
+long-term flake rate. This is operator-supplied acceptance evidence, not an
+Actions-authenticated attestation. It cannot authorize release publication or
+satisfy the release controller's separate provenance requirements.

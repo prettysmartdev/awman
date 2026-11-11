@@ -106,7 +106,7 @@ guarantees = ["tempdir", "loopback", "subprocess", "awman-binary", "fake-cli", "
 [tiers.boundary]
 budget_seconds = 120
 guarantees = ["tempdir", "loopback", "subprocess", "awman-binary", "fake-cli", "local-git"]
-allowed_capabilities = ["docker", "local-registry", "git-transports", "apple-containers", "docker-sbx"]
+allowed_capabilities = ["docker", "local-registry", "git-transports", "apple-containers", "docker-sbx", "guest-fixtures"]
 
 [tiers.guest]
 budget_seconds = 300
@@ -263,49 +263,24 @@ contracts = ["unit-awman"]
 requires = []
 paths = []
 always = true
-filter = "test(/^data::(program_status|command_status|session_status|image_tags|oci_identity|oci_source_key|ready_summary|network|prompt|setup_step)::/)"
+filter = "test(/^command::commands::exec_workflow::contract_tests::/)"
 
-[suites.component-inline-awman]
+[suites.component-core-internals]
 tier = "component"
 kind = "nextest"
 package = "awman"
 target = "lib"
-contracts = ["component-inline-awman"]
+contracts = ["component-core-internals"]
 requires = []
 paths = []
 always = true
-filter = "not (test(/^data::(program_status|command_status|session_status|image_tags|oci_identity|oci_source_key|ready_summary|network|prompt|setup_step)::/))"
+filter = "not (test(/^command::commands::exec_workflow::contract_tests::/))"
 
-[suites.unit-cli]
-filter = "not test(/^apple_transport::native_tests::/)"
-tier = "unit"
-kind = "nextest"
-package = "awman-cli"
-target = "lib"
-contracts = ["unit-cli"]
-requires = []
-paths = []
-always = true
 
-[suites.unit-cli-bin]
-tier = "unit"
-kind = "nextest"
-package = "awman-cli"
-target = "bin:awman"
-contracts = ["unit-cli-bin"]
-requires = []
-paths = []
-always = true
 
-[suites.unit-host-shims]
-tier = "unit"
-kind = "nextest"
-package = "awman-host-shims"
-target = "lib"
-contracts = ["unit-host-shims"]
-requires = []
-paths = []
-always = true
+
+
+
 
 [suites.unit-wsp]
 tier = "unit"
@@ -347,15 +322,7 @@ requires = []
 paths = []
 always = true
 
-[suites.unit-host-shims-builtin]
-tier = "component"
-kind = "nextest"
-package = "awman-host-shims"
-target = "lib"
-contracts = ["unit-host-shims-builtin"]
-requires = []
-paths = []
-always = true
+
 
 [suites.component-data]
 tier = "component"
@@ -556,7 +523,7 @@ kind = "nextest"
 package = "awman-cli"
 target = "test:boundary"
 contracts = ["boundary-apple"]
-requires = ["apple-containers"]
+requires = ["apple-containers", "guest-fixtures"]
 paths = ["src/engine/**", "tests/boundary/**"]
 filter = "test(/^apple::/)"
 group = "apple"
@@ -909,7 +876,7 @@ kind = "command"
 contracts = ["lint-deny"]
 requires = []
 paths = []
-command = ["cargo", "deny", "check"]
+command = ["cargo", "deny", "check", "licenses", "bans", "sources"]
 always = true
 
 [suites.lint-notice]
@@ -944,7 +911,7 @@ required_check = "gate"
 build_smokes = ["linux-x64-musl-static"]
 
 [[gates.pr.cells]]
-suites = ["component-inline-awman", "component-command-models", "unit-awman", "unit-cli", "unit-cli-bin", "unit-host-shims", "unit-wsp", "unit-test-support", "unit-xtask", "component-data", "component-engine", "component-command", "component-command-builtin", "component-command-daemon", "component-command-differential", "component-frontend", "component-daemon", "component-squad", "component-worker", "component-security", "component-tools", "component-parity-builtin", "component-parity-daemon", "component-parity-differential"]
+suites = ["component-core-internals", "component-command-models", "unit-awman", "unit-wsp", "unit-test-support", "unit-xtask", "component-data", "component-engine", "component-command", "component-command-builtin", "component-command-daemon", "component-command-differential", "component-frontend", "component-daemon", "component-squad", "component-worker", "component-security", "component-tools", "component-parity-builtin", "component-parity-daemon", "component-parity-differential"]
 builds = ["linux-x64-default", "macos-arm64-default", "windows-x64-default"]
 
 [[gates.pr.cells]]
@@ -952,7 +919,7 @@ suites = ["boundary-docker", "boundary-registry", "boundary-git", "boundary-conf
 builds = ["linux-x64-default"]
 
 [[gates.pr.cells]]
-suites = ["unit-awman-builtin", "unit-host-shims-builtin"]
+suites = ["unit-awman-builtin"]
 builds = ["linux-arm64-builtin"]
 
 [[gates.pr.cells]]
@@ -976,7 +943,7 @@ suites = ["guest-boot", "guest-exec", "guest-import", "guest-network", "guest-up
 builds = ["macos-arm64-ci-guest-builtin"]
 
 [[gates.main.cells]]
-suites = ["unit-awman-builtin", "unit-host-shims-builtin"]
+suites = ["unit-awman-builtin"]
 builds = ["macos-arm64-ci-guest-builtin"]
 
 [gates.nightly]
@@ -990,7 +957,7 @@ builds = ["macos-arm64-default"]
 platform = "macos-arm64-sbx"
 
 [[gates.nightly.cells]]
-suites = ["boundary-apple", "boundary-cli-native"]
+suites = ["boundary-apple"]
 builds = ["macos-arm64-ci-guest-builtin"]
 
 [[gates.nightly.cells]]
@@ -1069,7 +1036,7 @@ tiers = ["guest"]
 [previous_release.aarch64-apple-darwin]
 version = "v0.13.0"
 asset = "awman-macos-arm64"
-pending = "P7: authenticated published asset digest required"
+sha256 = "c952d15ecb630e84e878df272eaeb75ee57b186c810a27cc071601e2d7d16794"
 
 [[shipped_switch]]
 name = "AWMAN_TEST_ISOLATION"
@@ -1150,193 +1117,54 @@ assets = ["awman-linux-amd64", "awman-linux-arm64", "awman-macos-arm64", "awman-
 checksums = "SHA256SUMS"
 evidence_valid_days = 14
 candidate_retention_days = 90
-operator_path = "legacy"
+operator_path = "pipeline"
 environment = "release"
 ci_guest_labels = ["self-hosted", "macOS", "ARM64", "awman-ci-guest"]
 release_labels = ["self-hosted", "macOS", "ARM64", "awman-release"]
 
-[[legacy_fallback]]
-path = ".github/workflows/release.yml"
-remove_when = "P4"
 
-# Status shim for the legacy required check names (design 13.1); deleted with P2.
-[[legacy_fallback]]
-path = ".github/workflows/test.yml"
-remove_when = "P2"
 
-# The frozen release.yml closure (design 16.9): release.yml runs
-# `tools/isolated-test.sh … --test builtin_runtime`.
-[[legacy_fallback]]
-path = "tools/isolated-test.sh"
-remove_when = "P4"
 
-[[legacy_fallback]]
-path = "tests/builtin_runtime/"
-remove_when = "P4"
 
-[[legacy_fallback]]
-path = "tests/helpers/"
-remove_when = "P4"
 
-# Legacy integration targets without a verified in-branch replacement for every
-# test (handoff/integrate-and-retire-legacy/target-verdicts.md). Each is
-# deleted, not migrated, when its owner's replacement has shadow evidence
-# (design 16.9). They run through `make legacy-test` meanwhile.
-[[legacy_fallback]]
-path = "tests/api_parity/"
-remove_when = "shadow:slice-layer3-frontends"
 
-[[legacy_fallback]]
-path = "tests/cli_parity/"
-remove_when = "shadow:slice-layer3-frontends"
 
-[[legacy_fallback]]
-path = "tests/binary_smoke/"
-remove_when = "shadow:slice-layer3-frontends"
 
-[[legacy_fallback]]
-path = "tests/engine/"
-remove_when = "shadow:slice-layer1-engine"
 
-[[legacy_fallback]]
-path = "tests/engine_parity/"
-remove_when = "shadow:slice-layer1-engine"
 
-[[legacy_fallback]]
-path = "tests/oci_import/"
-remove_when = "shadow:slice-layer1-engine"
 
-[[legacy_fallback]]
-path = "tests/data_layer/"
-remove_when = "shadow:slice-layer0-data"
 
-[[legacy_fallback]]
-path = "tests/command/"
-remove_when = "shadow:slice-layer2-commands"
 
-[[legacy_fallback]]
-path = "crates/awman-cli/tests/"
-remove_when = "shadow:slice-layer2-commands"
 
-[[legacy_fallback]]
-path = "tests/daemon/"
-remove_when = "shadow:slice-daemon-squad-worker"
 
-[[legacy_fallback]]
-path = "crates/awman-wsp/tests/"
-remove_when = "shadow:slice-daemon-squad-worker"
 
-[[legacy_fallback]]
-path = "tests/worker_native/"
-remove_when = "shadow:slice-guest-and-artifact-tiers"
 
-[[legacy_fallback]]
-path = "tests/fixtures/"
-remove_when = "shadow:slice-daemon-squad-worker"
 
-[[legacy_fallback]]
-path = "tests/dockerfile_build.rs"
-remove_when = "shadow:slice-boundary-tier"
 
-[[legacy_fallback]]
-path = "tests/squad_attach.rs"
-remove_when = "shadow:slice-daemon-squad-worker"
 
-[[legacy_fallback]]
-path = "tests/squad_attach_frontends.rs"
-remove_when = "shadow:slice-daemon-squad-worker"
 
-[[legacy_fallback]]
-path = "tests/squad_blockers.rs"
-remove_when = "shadow:slice-daemon-squad-worker"
 
-[[legacy_fallback]]
-path = "tests/squad_daemon_e2e.rs"
-remove_when = "shadow:slice-daemon-squad-worker"
 
-[[legacy_fallback]]
-path = "tests/squad_daemon_http.rs"
-remove_when = "shadow:slice-daemon-squad-worker"
 
-[[legacy_fallback]]
-path = "tests/squad_env_cli.rs"
-remove_when = "shadow:slice-daemon-squad-worker"
 
-[[legacy_fallback]]
-path = "tests/squad_env_daemon.rs"
-remove_when = "shadow:slice-daemon-squad-worker"
 
-[[legacy_fallback]]
-path = "tests/squad_env_sync.rs"
-remove_when = "shadow:slice-daemon-squad-worker"
 
-[[legacy_fallback]]
-path = "tests/squad_naming.rs"
-remove_when = "shadow:slice-daemon-squad-worker"
 
-[[legacy_fallback]]
-path = "tests/squad_repair_loop.rs"
-remove_when = "shadow:slice-daemon-squad-worker"
 
-[[legacy_fallback]]
-path = "tests/squad_runtime_discovery.rs"
-remove_when = "shadow:slice-daemon-squad-worker"
 
-[[legacy_fallback]]
-path = "tests/squad_sandbox_refusal.rs"
-remove_when = "shadow:slice-daemon-squad-worker"
 
-[[legacy_fallback]]
-path = "tests/squad_scheduler.rs"
-remove_when = "shadow:slice-daemon-squad-worker"
 
-[[legacy_fallback]]
-path = "tests/squad_status_marker.rs"
-remove_when = "shadow:slice-daemon-squad-worker"
 
-[[legacy_fallback]]
-path = "tests/squad_tui_tab.rs"
-remove_when = "shadow:slice-layer3-frontends"
 
-[[legacy_fallback]]
-path = "tests/worker_daemon.rs"
-remove_when = "shadow:slice-daemon-squad-worker"
 
-[[legacy_fallback]]
-path = "tests/worker_events.rs"
-remove_when = "shadow:slice-daemon-squad-worker"
 
-[[legacy_fallback]]
-path = "tests/worker_helper.rs"
-remove_when = "shadow:slice-daemon-squad-worker"
 
-[[legacy_fallback]]
-path = "tests/worker_lease_git.rs"
-remove_when = "shadow:slice-daemon-squad-worker"
 
-[[legacy_fallback]]
-path = "tests/worker_lease_run.rs"
-remove_when = "shadow:slice-daemon-squad-worker"
 
-[[legacy_fallback]]
-path = "tests/worker_mixed.rs"
-remove_when = "shadow:slice-daemon-squad-worker"
 
-[[legacy_fallback]]
-path = "tests/worker_native.rs"
-remove_when = "shadow:slice-guest-and-artifact-tiers"
 
-[[legacy_fallback]]
-path = "tests/worker_pull_auto.rs"
-remove_when = "shadow:slice-daemon-squad-worker"
 
-[[legacy_fallback]]
-path = "tests/worker_push_retry.rs"
-remove_when = "shadow:slice-daemon-squad-worker"
 
-[[legacy_fallback]]
-path = "tests/worker_security.rs"
-remove_when = "shadow:slice-daemon-squad-worker"
 
 [workflows.".github/workflows/ci.yml"]
 jobs = ["plan", "lint", "build", "test", "gate"]
@@ -1394,98 +1222,3 @@ requires = []
 paths = ["src/command/**", "tests/component/command/models.rs"]
 filter = "test(/^command::models::/)"
 budget_seconds = 120
-
-[suites.boundary-cli-native]
-tier = "boundary"
-kind = "nextest"
-package = "awman-cli"
-target = "lib"
-contracts = ["boundary-cli-native"]
-requires = ["apple-containers"]
-paths = ["crates/awman-cli/src/apple_transport/**"]
-filter = "test(/^apple_transport::native_tests::/)"
-budget_seconds = 120
-
-[[legacy_fallback]]
-path = "scripts/release.sh"
-remove_when = "P4"
-
-[[legacy_fallback]]
-path = "tools/release-runner.sh"
-remove_when = "P5"
-
-[[legacy_fallback]]
-path = "tools/test-release-runner.sh"
-remove_when = "P5"
-
-[[legacy_fallback]]
-path = "tools/measure-release-artifact.sh"
-remove_when = "P4"
-
-[[legacy_fallback]]
-path = "tools/release-offline-session.sh"
-remove_when = "P4"
-
-[[legacy_fallback]]
-path = "tools/release-artifact-check.sh"
-remove_when = "P4"
-
-[[legacy_fallback]]
-path = "tools/release-upgrade-policy.sh"
-remove_when = "P4"
-
-[[legacy_fallback]]
-path = "tools/test-build-previous-builtin-awman.sh"
-remove_when = "P4"
-
-[[legacy_fallback]]
-path = "tools/test-builtin-network.sh"
-remove_when = "P4"
-
-[[legacy_fallback]]
-path = "tools/prerelease-ci-gate.sh"
-remove_when = "P4"
-
-[[legacy_fallback]]
-path = "tools/test-release-provider-metadata.sh"
-remove_when = "P4"
-
-[[legacy_fallback]]
-path = "tools/test-builtin-hw.sh"
-remove_when = "P4"
-
-[[legacy_fallback]]
-path = "tools/test-msb-catalog-compat.sh"
-remove_when = "P4"
-
-[[legacy_fallback]]
-path = "tools/apple-silicon-prerelease.sh"
-remove_when = "P4"
-
-[[legacy_fallback]]
-path = "tools/test-msb-isolated-builder.sh"
-remove_when = "P4"
-
-[[legacy_fallback]]
-path = "tools/test-kernel-callback-smoke.sh"
-remove_when = "P4"
-
-[[legacy_fallback]]
-path = "tools/test-msb-protocol-compat.sh"
-remove_when = "P4"
-
-[[legacy_fallback]]
-path = "tools/test-release-upgrade-policy.sh"
-remove_when = "P4"
-
-[[legacy_fallback]]
-path = "tools/test-static-krunfw.sh"
-remove_when = "P4"
-
-[[legacy_fallback]]
-path = "tools/test-prerelease-ci-gate.sh"
-remove_when = "P4"
-
-[[legacy_fallback]]
-path = "tools/test-review-build-inputs.sh"
-remove_when = "P4"

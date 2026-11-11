@@ -1288,6 +1288,3 @@ pub fn mask(secret: &str) -> String {
     let tail: String = chars[chars.len() - 4..].iter().collect();
     format!("••••{tail}")
 }
-
-#[cfg(test)]
-mod tests;

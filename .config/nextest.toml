@@ -60,11 +60,6 @@ filter = "package(=awman-cli) & binary(=boundary) & (test(/^apple::/))"
 slow-timeout = { period = "1s", terminate-after = 120 }
 test-group = "apple"
 
-# boundary-cli-native
-[[profile.default.overrides]]
-filter = "package(=awman-cli) & kind(lib) & (test(/^apple_transport::native_tests::/))"
-slow-timeout = { period = "1s", terminate-after = 120 }
-
 # boundary-conformance
 [[profile.default.overrides]]
 filter = "package(=awman-cli) & binary(=boundary) & (test(/^conformance::/))"
@@ -126,6 +121,11 @@ slow-timeout = { period = "1s", terminate-after = 20 }
 filter = "package(=awman-cli) & binary(=component) & (test(/^command::models::/))"
 slow-timeout = { period = "1s", terminate-after = 120 }
 
+# component-core-internals
+[[profile.default.overrides]]
+filter = "package(=awman) & kind(lib) & (not (test(/^command::commands::exec_workflow::contract_tests::/)))"
+slow-timeout = { period = "1s", terminate-after = 20 }
+
 # component-daemon
 [[profile.default.overrides]]
 filter = "package(=awman-cli) & binary(=component) & (test(/^daemon::/))"
@@ -144,11 +144,6 @@ slow-timeout = { period = "1s", terminate-after = 20 }
 # component-frontend
 [[profile.default.overrides]]
 filter = "package(=awman-cli) & binary(=component) & (test(/^frontend::/))"
-slow-timeout = { period = "1s", terminate-after = 20 }
-
-# component-inline-awman
-[[profile.default.overrides]]
-filter = "package(=awman) & kind(lib) & (not (test(/^data::(program_status|command_status|session_status|image_tags|oci_identity|oci_source_key|ready_summary|network|prompt|setup_step)::/)))"
 slow-timeout = { period = "1s", terminate-after = 20 }
 
 # component-parity-builtin
@@ -265,32 +260,12 @@ threads-required = "num-test-threads"
 
 # unit-awman
 [[profile.default.overrides]]
-filter = "package(=awman) & kind(lib) & (test(/^data::(program_status|command_status|session_status|image_tags|oci_identity|oci_source_key|ready_summary|network|prompt|setup_step)::/))"
+filter = "package(=awman) & kind(lib) & (test(/^command::commands::exec_workflow::contract_tests::/))"
 slow-timeout = { period = "1s", terminate-after = 1 }
 
 # unit-awman-builtin
 [[profile.default.overrides]]
 filter = "package(=awman) & kind(lib)"
-slow-timeout = { period = "1s", terminate-after = 20 }
-
-# unit-cli
-[[profile.default.overrides]]
-filter = "package(=awman-cli) & kind(lib) & (not test(/^apple_transport::native_tests::/))"
-slow-timeout = { period = "1s", terminate-after = 1 }
-
-# unit-cli-bin
-[[profile.default.overrides]]
-filter = "package(=awman-cli) & binary(=awman)"
-slow-timeout = { period = "1s", terminate-after = 1 }
-
-# unit-host-shims
-[[profile.default.overrides]]
-filter = "package(=awman-host-shims) & kind(lib)"
-slow-timeout = { period = "1s", terminate-after = 1 }
-
-# unit-host-shims-builtin
-[[profile.default.overrides]]
-filter = "package(=awman-host-shims) & kind(lib)"
 slow-timeout = { period = "1s", terminate-after = 20 }
 
 # unit-test-support

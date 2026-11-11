@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="nextest-run" tests="23" skipped="0" failures="0" errors="0" uuid="b2a86679-db82-4ca3-bc72-4b4d9553eb28" timestamp="2026-11-11T21:20:58.657+00:00" time="1.138">
+    <testsuite name="awman-cli::component" tests="23" skipped="0" errors="0" failures="0">
+        <testcase name="data::config::every_key_obeys_the_declared_global_repo_and_task_scope_order" classname="awman-cli::component" timestamp="2026-11-11T21:20:58.660+00:00" time="0.023"/>
+        <testcase name="data::config::every_key_has_a_deterministic_default_and_key_table_validation_contract" classname="awman-cli::component" timestamp="2026-11-11T21:20:58.660+00:00" time="0.023"/>
+        <testcase name="data::config::configuration_reference_key_table_matches_the_schema" classname="awman-cli::component" timestamp="2026-11-11T21:20:58.660+00:00" time="0.023"/>
+        <testcase name="data::config::every_key_default_is_valid_and_round_trips_through_file_validation" classname="awman-cli::component" timestamp="2026-11-11T21:20:58.660+00:00" time="0.024"/>
+        <testcase name="data::config::explicit_home_and_xdg_roots_resolve_independently_without_process_environment" classname="awman-cli::component" timestamp="2026-11-11T21:20:58.684+00:00" time="0.024"/>
+        <testcase name="data::config::integer_key_boundaries_and_wrong_shapes_are_rejected_by_the_schema" classname="awman-cli::component" timestamp="2026-11-11T21:20:58.684+00:00" time="0.024"/>
+        <testcase name="data::config::global_repo_environment_set_and_flag_layers_follow_declared_precedence" classname="awman-cli::component" timestamp="2026-11-11T21:20:58.684+00:00" time="0.025"/>
+        <testcase name="data::config::invalid_config_is_rejected_before_save_and_sensitive_values_are_masked" classname="awman-cli::component" timestamp="2026-11-11T21:20:58.684+00:00" time="0.025"/>
+        <testcase name="data::config::unified_home_roots_every_store_and_removed_overrides_are_inert" classname="awman-cli::component" timestamp="2026-11-11T21:20:58.709+00:00" time="0.024"/>
+        <testcase name="data::config::older_config_documents_keep_their_wire_values_when_rewritten" classname="awman-cli::component" timestamp="2026-11-11T21:20:58.709+00:00" time="0.024"/>
+        <testcase name="data::config_properties::config_parse_serialize_round_trip_preserves_valid_agent_and_scrollback" classname="awman-cli::component" timestamp="2026-11-11T21:20:58.709+00:00" time="0.041"/>
+        <testcase name="data::persistence::bounded_keychain_helper_returns_a_ready_result" classname="awman-cli::component" timestamp="2026-11-11T21:20:58.734+00:00" time="0.028"/>
+        <testcase name="data::persistence::concurrent_builtin_state_resolution_returns_one_private_root" classname="awman-cli::component" timestamp="2026-11-11T21:20:58.764+00:00" time="0.024"/>
+        <testcase name="data::persistence::builtin_image_leases_isolate_mutation_per_image" classname="awman-cli::component" timestamp="2026-11-11T21:20:58.753+00:00" time="0.036"/>
+        <testcase name="data::config_properties::additive_guidance_merge_is_ordered_and_deduplicates_trimmed_values" classname="awman-cli::component" timestamp="2026-11-11T21:20:58.709+00:00" time="0.135"/>
+        <testcase name="data::persistence::corrupt_database_is_reported_without_overwriting_the_original_bytes" classname="awman-cli::component" timestamp="2026-11-11T21:20:58.846+00:00" time="0.021"/>
+        <testcase name="data::persistence::interrupted_database_migration_recovers_from_legacy_source_and_preserves_backup" classname="awman-cli::component" timestamp="2026-11-11T21:20:58.868+00:00" time="0.020"/>
+        <testcase name="data::persistence::config_save_reload_and_corruption_recovery_are_confined_to_sandbox" classname="awman-cli::component" timestamp="2026-11-11T21:20:58.789+00:00" time="0.100"/>
+        <testcase name="data::persistence::repo_config_save_refuses_a_symlinked_leaf_without_touching_its_target" classname="awman-cli::component" timestamp="2026-11-11T21:20:58.889+00:00" time="0.027"/>
+        <testcase name="data::config_properties::identical_layers_are_idempotent_and_later_set_override_wins" classname="awman-cli::component" timestamp="2026-11-11T21:20:58.734+00:00" time="0.290"/>
+        <testcase name="data::persistence::migration_preserves_real_sqlite_session_and_command_rows" classname="awman-cli::component" timestamp="2026-11-11T21:20:58.889+00:00" time="0.632"/>
+        <testcase name="data::persistence::schema_one_database_keeps_session_and_command_rows_readable" classname="awman-cli::component" timestamp="2026-11-11T21:20:58.919+00:00" time="0.778"/>
+        <testcase name="data::persistence::concurrent_workflow_checkpoint_reads_never_observe_partial_json" classname="awman-cli::component" timestamp="2026-11-11T21:20:58.789+00:00" time="1.006"/>
+    </testsuite>
+</testsuites>

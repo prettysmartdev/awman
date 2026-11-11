@@ -79,25 +79,3 @@ impl SquadSupervisor {
         }
     }
 }
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn health_is_read_only_and_distinguishes_empty_from_unreachable() {
-        assert_eq!(
-            SquadSupervisor::health_of_running(None),
-            SquadHealth::Unreachable
-        );
-        assert_eq!(
-            SquadSupervisor::health_of_running(Some(&[])),
-            SquadHealth::Healthy
-        );
-        let root = tempfile::tempdir().unwrap();
-        let env = EnvSnapshot::with_overrides([("AWMAN_HOME", root.path().to_str().unwrap())]);
-        assert_eq!(
-            SquadSupervisor::from_env(&env).unwrap().health(None),
-            SquadHealth::NotRunning
-        );
-        assert!(!root.path().join("data/daemon").exists());
-    }
-}

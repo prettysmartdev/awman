@@ -831,6 +831,3 @@ fn sanitize_store_reason(reason: &str) -> String {
 fn is_set_and_non_empty(overlay: &DaemonEnvMap, name: &str) -> bool {
     overlay.get(name).is_some_and(|value| !value.is_empty())
 }
-
-#[cfg(test)]
-mod tests;

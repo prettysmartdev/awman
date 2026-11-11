@@ -2658,10 +2658,6 @@ fn p95(samples: &[Duration]) -> Option<Duration> {
     sorted.get(index.saturating_sub(1)).copied()
 }
 
-#[cfg(test)]
-#[path = "remote_tests.rs"]
-mod tests;
-
 /// Presentation proxy for the worker owned by the connected engine instance.
 struct RemoteQueue {
     shared: Arc<Shared>,

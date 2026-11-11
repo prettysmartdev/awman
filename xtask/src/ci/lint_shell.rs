@@ -11,15 +11,8 @@ use std::{
 };
 
 /// Path components that are never linted: build output, VCS data, node
-/// dependencies, vendored upstream trees and the architecture-lint fixtures
-/// (deliberately violating inputs of `tools/test-architecture-lint.sh`).
-const SKIP_COMPONENTS: [&str; 5] = [
-    "target",
-    ".git",
-    "node_modules",
-    "third_party",
-    "test-fixtures",
-];
+/// dependencies, vendored upstream trees and vendored upstream trees.
+const SKIP_COMPONENTS: [&str; 4] = ["target", ".git", "node_modules", "third_party"];
 
 pub fn skipped(path: &Path) -> bool {
     path.components()
@@ -177,11 +170,9 @@ mod tests {
     }
 
     #[test]
-    fn vendored_and_fixture_trees_are_skipped() {
+    fn vendored_trees_are_skipped_but_test_scripts_are_linted() {
         assert!(skipped(Path::new("third_party/x/build.sh")));
-        assert!(skipped(Path::new(
-            "tools/test-fixtures/architecture-lint/bad.sh"
-        )));
+        assert!(!skipped(Path::new("tests/guest/support/mount-contract.sh")));
         assert!(skipped(Path::new("web/node_modules/y/z.sh")));
         assert!(!skipped(Path::new("tools/install.sh")));
     }

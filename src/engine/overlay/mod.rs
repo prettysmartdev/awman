@@ -863,8 +863,5 @@ mod credential_file;
 pub mod prerequisite_grants;
 mod skills;
 
-#[cfg(test)]
-mod tests;
-
 pub(crate) use claude::*;
 pub(crate) use credential_file::*;

@@ -96,6 +96,9 @@ fn a_run_naming_no_host_resources_is_blocked_not_passed_or_skipped() {
     ] {
         let out = sandbox
             .command(&exe)
+            // Reuse the run-owned parent, rather than recursively nesting the
+            // child's socket directory under this test's already long root.
+            .env("AWMAN_TEST_TMPROOT", sandbox.root().parent().unwrap())
             .args(["--exact", test, "--test-threads=1", "--nocapture"])
             .label("boundary tests without host resources")
             .run();

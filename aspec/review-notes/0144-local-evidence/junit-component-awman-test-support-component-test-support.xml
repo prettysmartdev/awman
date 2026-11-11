@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="nextest-run" tests="61" skipped="0" failures="0" errors="0" uuid="1f4d2260-39ee-4a5e-aa68-32099c2bd9f6" timestamp="2026-11-11T21:21:33.512+00:00" time="3.392">
+    <testsuite name="awman-test-support::component" tests="61" skipped="0" errors="0" failures="0">
+        <testcase name="canary::sandboxes_live_under_the_test_temp_root" classname="awman-test-support::component" timestamp="2026-11-11T21:21:33.514+00:00" time="0.021"/>
+        <testcase name="capability::a_capability_outside_the_tier_is_misplaced" classname="awman-test-support::component" timestamp="2026-11-11T21:21:33.514+00:00" time="0.021"/>
+        <testcase name="capability::a_guaranteed_but_absent_capability_blocks" classname="awman-test-support::component" timestamp="2026-11-11T21:21:33.514+00:00" time="0.022"/>
+        <testcase name="capability::boundary_sandboxes_state_their_tier" classname="awman-test-support::component" timestamp="2026-11-11T21:21:33.536+00:00" time="0.014"/>
+        <testcase name="capability::granting_adds_the_capability_environment" classname="awman-test-support::component" timestamp="2026-11-11T21:21:33.536+00:00" time="0.018"/>
+        <testcase name="capability::guaranteed_capabilities_are_granted" classname="awman-test-support::component" timestamp="2026-11-11T21:21:33.536+00:00" time="0.021"/>
+        <testcase name="evidence::on_finish_probes_report_leaks" classname="awman-test-support::component" timestamp="2026-11-11T21:21:33.557+00:00" time="0.015"/>
+        <testcase name="evidence::a_panicking_test_writes_a_failure_record_and_keeps_the_sandbox" classname="awman-test-support::component" timestamp="2026-11-11T21:21:33.551+00:00" time="0.031"/>
+        <testcase name="evidence::a_passing_test_leaves_nothing_behind" classname="awman-test-support::component" timestamp="2026-11-11T21:21:33.556+00:00" time="0.028"/>
+        <testcase name="fake_cli::hold_blocks_until_released" classname="awman-test-support::component" timestamp="2026-11-11T21:21:33.583+00:00" time="0.050"/>
+        <testcase name="fake_cli::the_longest_matching_prefix_wins" classname="awman-test-support::component" timestamp="2026-11-11T21:21:33.587+00:00" time="0.054"/>
+        <testcase name="example::a_held_tool_is_observed_released_and_reaped" classname="awman-test-support::component" timestamp="2026-11-11T21:21:33.573+00:00" time="0.075"/>
+        <testcase name="fake_cli::the_protocol_version_is_checked" classname="awman-test-support::component" timestamp="2026-11-11T21:21:33.642+00:00" time="0.025"/>
+        <testcase name="fake_cli::the_persona_comes_from_the_installed_name_not_the_environment" classname="awman-test-support::component" timestamp="2026-11-11T21:21:33.634+00:00" time="0.037"/>
+        <testcase name="fake_cli::touch_creates_files" classname="awman-test-support::component" timestamp="2026-11-11T21:21:33.649+00:00" time="0.029"/>
+        <testcase name="fake_cli::unmatched_invocations_exit_127_and_are_recorded" classname="awman-test-support::component" timestamp="2026-11-11T21:21:33.669+00:00" time="0.033"/>
+        <testcase name="fake_cli::values_with_newlines_tabs_and_percent_round_trip" classname="awman-test-support::component" timestamp="2026-11-11T21:21:33.673+00:00" time="0.031"/>
+        <testcase name="fake_cli::without_a_scenario_the_fake_exits_127" classname="awman-test-support::component" timestamp="2026-11-11T21:21:33.680+00:00" time="0.029"/>
+        <testcase name="fakes::a_fake_docker_without_rules_does_not_conform" classname="awman-test-support::component" timestamp="2026-11-11T21:21:33.703+00:00" time="0.081"/>
+        <testcase name="fakes::fake_docker_cli_conforms_with_the_baseline_rules" classname="awman-test-support::component" timestamp="2026-11-11T21:21:33.706+00:00" time="0.084"/>
+        <testcase name="fakes::fake_registry_conforms" classname="awman-test-support::component" timestamp="2026-11-11T21:21:33.786+00:00" time="0.021"/>
+        <testcase name="fakes::fake_registry_serves_inserted_images" classname="awman-test-support::component" timestamp="2026-11-11T21:21:33.792+00:00" time="0.017"/>
+        <testcase name="canary::children_never_see_or_change_the_real_home_or_git_config" classname="awman-test-support::component" timestamp="2026-11-11T21:21:33.514+00:00" time="0.446"/>
+        <testcase name="fixtures::branches_worktrees_and_bare_remotes" classname="awman-test-support::component" timestamp="2026-11-11T21:21:33.810+00:00" time="0.251"/>
+        <testcase name="fixtures::git_runs_with_the_sandbox_identity_and_config" classname="awman-test-support::component" timestamp="2026-11-11T21:21:33.962+00:00" time="0.103"/>
+        <testcase name="fixtures::text_fixtures_land_in_the_repository" classname="awman-test-support::component" timestamp="2026-11-11T21:21:34.064+00:00" time="0.031"/>
+        <testcase name="fakes::fake_git_http_serves_clone_and_push" classname="awman-test-support::component" timestamp="2026-11-11T21:21:33.711+00:00" time="0.529"/>
+        <testcase name="ports::listeners_are_loopback_port_zero_and_tracked" classname="awman-test-support::component" timestamp="2026-11-11T21:21:34.242+00:00" time="0.021"/>
+        <testcase name="ports::socket_names_must_be_plain" classname="awman-test-support::component" timestamp="2026-11-11T21:21:34.265+00:00" time="0.018"/>
+        <testcase name="fixtures::repositories_have_deterministic_commit_ids" classname="awman-test-support::component" timestamp="2026-11-11T21:21:34.062+00:00" time="0.222"/>
+        <testcase name="ports::tcp_readiness_waits_for_accepting" classname="awman-test-support::component" timestamp="2026-11-11T21:21:34.284+00:00" time="0.042"/>
+        <testcase name="ports::unix_sockets_live_in_the_short_dir_and_must_be_removed" classname="awman-test-support::component" timestamp="2026-11-11T21:21:34.327+00:00" time="0.018"/>
+        <testcase name="process::agents_are_refused_directly_and_through_interpreters" classname="awman-test-support::component" timestamp="2026-11-11T21:21:34.346+00:00" time="0.057"/>
+        <testcase name="process::child_environment_is_exactly_the_sandbox_map" classname="awman-test-support::component" timestamp="2026-11-11T21:21:34.404+00:00" time="0.056"/>
+        <testcase name="process::children_inherit_only_stdio" classname="awman-test-support::component" timestamp="2026-11-11T21:21:34.462+00:00" time="0.022"/>
+        <testcase name="fakes::fake_work_server_conforms" classname="awman-test-support::component" timestamp="2026-11-11T21:21:33.810+00:00" time="0.821"/>
+        <testcase name="process::dropping_a_child_kills_its_tree" classname="awman-test-support::component" timestamp="2026-11-11T21:21:34.632+00:00" time="0.061"/>
+        <testcase name="process::env_remove_and_current_dir_apply" classname="awman-test-support::component" timestamp="2026-11-11T21:21:34.695+00:00" time="0.030"/>
+        <testcase name="process::file_readiness_detects_early_exit" classname="awman-test-support::component" timestamp="2026-11-11T21:21:34.726+00:00" time="0.046"/>
+        <testcase name="process::interrupt_and_terminate_reach_the_child" classname="awman-test-support::component" timestamp="2026-11-11T21:21:34.774+00:00" time="0.045"/>
+        <testcase name="process::large_output_is_bounded_and_marked" classname="awman-test-support::component" timestamp="2026-11-11T21:21:34.819+00:00" time="0.034"/>
+        <testcase name="process::deadline_kills_the_whole_tree" classname="awman-test-support::component" timestamp="2026-11-11T21:21:34.485+00:00" time="0.591"/>
+        <testcase name="ports::a_listener_still_open_at_the_end_is_a_leak" classname="awman-test-support::component" timestamp="2026-11-11T21:21:34.097+00:00" time="1.017"/>
+        <testcase name="process::many_concurrent_installs_and_spawns_never_hit_text_file_busy" classname="awman-test-support::component" timestamp="2026-11-11T21:21:35.078+00:00" time="0.058"/>
+        <testcase name="process::output_is_drained_to_proc_files" classname="awman-test-support::component" timestamp="2026-11-11T21:21:35.115+00:00" time="0.035"/>
+        <testcase name="process::piped_stdin_reaches_the_child" classname="awman-test-support::component" timestamp="2026-11-11T21:21:35.137+00:00" time="0.032"/>
+        <testcase name="process::programs_must_be_on_the_sandbox_path" classname="awman-test-support::component" timestamp="2026-11-11T21:21:35.151+00:00" time="0.019"/>
+        <testcase name="process::readiness_failure_panics_with_the_output" classname="awman-test-support::component" timestamp="2026-11-11T21:21:35.170+00:00" time="0.024"/>
+        <testcase name="process::spawn_waits_for_a_ready_line" classname="awman-test-support::component" timestamp="2026-11-11T21:21:35.170+00:00" time="0.043"/>
+        <testcase name="process::stdin_is_null_by_default_and_bytes_are_delivered" classname="awman-test-support::component" timestamp="2026-11-11T21:21:35.195+00:00" time="0.035"/>
+        <testcase name="process::system_tools_run_with_the_sandbox_environment" classname="awman-test-support::component" timestamp="2026-11-11T21:21:35.214+00:00" time="0.022"/>
+        <testcase name="process::unregistered_executables_inside_the_sandbox_are_refused" classname="awman-test-support::component" timestamp="2026-11-11T21:21:35.232+00:00" time="0.018"/>
+        <testcase name="pty::pty_child_sees_a_terminal_and_receives_input" classname="awman-test-support::component" timestamp="2026-11-11T21:21:35.251+00:00" time="0.017"/>
+        <testcase name="ports::tracked_child_addresses_are_checked_too" classname="awman-test-support::component" timestamp="2026-11-11T21:21:34.287+00:00" time="1.018"/>
+        <testcase name="process::wait_expiry_kills_and_panics" classname="awman-test-support::component" timestamp="2026-11-11T21:21:35.238+00:00" time="0.232"/>
+        <testcase name="security::descendants_cannot_create_new_sessions" classname="awman-test-support::component" timestamp="2026-11-11T21:21:35.471+00:00" time="0.025"/>
+        <testcase name="security::generic_registration_cannot_authorize_host_keychain_or_agent_names" classname="awman-test-support::component" timestamp="2026-11-11T21:21:35.498+00:00" time="0.021"/>
+        <testcase name="security::registered_interpreters_still_check_their_arguments" classname="awman-test-support::component" timestamp="2026-11-11T21:21:35.520+00:00" time="0.016"/>
+        <testcase name="pty::pty_deadline_kills_the_child" classname="awman-test-support::component" timestamp="2026-11-11T21:21:35.269+00:00" time="0.380"/>
+        <testcase name="pty::wait_drains_final_output_before_returning_the_exit_status" classname="awman-test-support::component" timestamp="2026-11-11T21:21:35.306+00:00" time="1.044"/>
+        <testcase name="process::leader_exit_with_running_descendants_is_a_leak" classname="awman-test-support::component" timestamp="2026-11-11T21:21:34.854+00:00" time="2.049"/>
+    </testsuite>
+</testsuites>

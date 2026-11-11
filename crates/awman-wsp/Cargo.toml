@@ -29,6 +29,3 @@ awman-wsp = { path = ".", features = ["mock", "terminal"] }
 awman-test-support = { path = "../awman-test-support" }
 tokio = { version = "1", features = ["full"] }
 wiremock = "0.6"
-[[test]]
-name = "conformance"
-required-features = ["mock"]

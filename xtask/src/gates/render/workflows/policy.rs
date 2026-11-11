@@ -30,7 +30,6 @@ fn allowed_write(path: &str, job: &str, scope: &str) -> bool {
             "id-token" | "attestations"
         ) | ("promote.yml", "verify-inputs" | "receipt", "contents")
             | ("fixtures.yml", "publish", "contents")
-            | ("release.yml", "release", "contents")
             | ("nightly.yml", "flake-hunt", "issues")
             | (
                 "nightly.yml",
@@ -62,9 +61,6 @@ fn ordering_reason(path: &str, job: &str, need: &str) -> Option<&'static str> {
     match (path.rsplit('/').next().unwrap_or(path), job, need) {
         // These are admission edges. Their jobs build from the checked-out commit,
         // not a preceding job's compiler output.
-        ("release.yml", "build" | "release-macos-builtin", "preflight") => {
-            Some("legacy activation/ancestry admission")
-        }
         ("candidate.yml", "runner-preflight", "preflight") => {
             Some("candidate trigger/source admission")
         }

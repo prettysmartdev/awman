@@ -1,6 +1,6 @@
 //! `engine::remote` — `RemoteClient` against a loopback mock server on a
 //! sandbox-owned listener: HTTP status mapping and a refused connection.
-//! Re-derived from the socket-bound inline tests of `remote::client`.
+//! Exercises the public command-status API and its transport error contract.
 
 use crate::support;
 use awman::engine::error::EngineError;
@@ -16,7 +16,7 @@ async fn mock_server(sandbox: &TestSandbox) -> MockServer {
 }
 
 async fn respond(server: &MockServer, path: &str, status: u16, body: serde_json::Value) {
-    Mock::given(matchers::method("POST"))
+    Mock::given(matchers::method("GET"))
         .and(matchers::path(path))
         .respond_with(ResponseTemplate::new(status).set_body_json(body))
         .mount(server)
@@ -30,16 +30,13 @@ async fn send_command_returns_the_parsed_response_on_200() {
     let server = mock_server(&sandbox).await;
     respond(
         &server,
-        "/v1/agents/status",
+        "/v1/worker/commands/current",
         200,
         serde_json::json!({"ok": true}),
     )
     .await;
     let client = RemoteClient::new(&server.uri(), None).unwrap();
-    let response = client
-        .send_command(&["agents", "status"], &[])
-        .await
-        .unwrap();
+    let response = client.get_command("current").await.unwrap();
     assert_eq!(response.status, 200);
     drop(server);
     sandbox.finish();
@@ -52,25 +49,25 @@ async fn send_command_maps_4xx_and_5xx_to_remote_http_status() {
     let server = mock_server(&sandbox).await;
     respond(
         &server,
-        "/v1/exec/workflow",
+        "/v1/worker/commands/rejected",
         400,
         serde_json::json!({"error": "bad request"}),
     )
     .await;
     respond(
         &server,
-        "/v1/agents/status",
+        "/v1/worker/commands/current",
         500,
         serde_json::json!({"error": "internal server error"}),
     )
     .await;
     let client = RemoteClient::new(&server.uri(), None).unwrap();
-    let bad = client.send_command(&["exec", "workflow"], &[]).await;
+    let bad = client.get_command("rejected").await;
     assert!(
         matches!(bad, Err(EngineError::RemoteHttpStatus { status: 400, .. })),
         "{bad:?}"
     );
-    let failed = client.send_command(&["agents", "status"], &[]).await;
+    let failed = client.get_command("current").await;
     assert!(
         matches!(
             failed,
@@ -91,7 +88,7 @@ async fn a_refused_connection_maps_to_remote_connection_refused() {
     let addr = listener.local_addr().unwrap();
     drop(listener);
     let client = RemoteClient::new(&format!("http://{addr}"), None).unwrap();
-    let result = client.send_command(&["agents", "status"], &[]).await;
+    let result = client.get_command("current").await;
     assert!(
         matches!(result, Err(EngineError::RemoteConnectionRefused(_))),
         "{result:?}"

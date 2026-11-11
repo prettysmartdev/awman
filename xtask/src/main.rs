@@ -19,6 +19,7 @@ mod gates;
 mod lint;
 mod manifest;
 mod matrix;
+mod native_validation;
 mod release;
 mod test;
 
@@ -31,6 +32,7 @@ usage: cargo xtask <command> [args]
   fixtures fetch|verify|build  content-addressed test fixtures
   lint hygiene|shell|pins|...  repository lints that are not clippy
   matrix render|check          acceptance matrix
+  native-validation run|verify local Apple Silicon evidence packet
   ci <helper>                  helpers called by the GitHub workflows
   release <subcommand>         release operator and pipeline commands
 ";
@@ -49,6 +51,7 @@ fn main() -> ExitCode {
         "fixtures" => fixtures::run(&args),
         "lint" => lint::run(&args),
         "matrix" => matrix::run(&args),
+        "native-validation" => native_validation::run(&args),
         "ci" => ci::run(&args),
         "release" => release::run(&args),
         other => {

@@ -1,5 +1,7 @@
 # Work Item: Task
 
+> Testing policy update (WI144): test commands, harness paths and test counts in this historical record are superseded by [the current testing contract](/aspec/devops/testing.md). Use manifest suites and `make validate-native` for native acceptance. Removed test sources and raw evidence bundles are available only in Git history; they must not be restored as test patterns.
+
 Title: webapp v0 acceptance follow-ups
 Issue: issuelink
 
@@ -44,7 +46,7 @@ rely on the documented aggregate-only usage counts.
 ### 1. Engine-trace parity harness (deferred from 0159 §1 and Test Considerations)
 - Add a Rust-side trace capture for instances: a test-only hook or owner-only `awman daemon api` action that records, per instance, the ordered engine-side events already modelled in `src/command/instance/trace.rs` (submitted commands, state transitions, dialog requests and answers with their outcomes, terminal ownership changes, quit/cancel reasons). Expose it only on the owner socket and only in test builds or behind an explicit test-mode setting; never on network listeners.
 - Build a parity runner under `web/acceptance/` that reads `web/acceptance/action-matrix.json`, drives each `parity: engine_trace` row once through the daemon-backed TUI (existing PTY harness in `tests/`) and once through the browser (Playwright against the exported app), and diffs the two traces after normalising ids and timestamps. Rows with `parity: wire_frame` assert the exact outbound frame instead. `view_only` and `web_only` rows keep their component tests.
-- Docker-backed rows (workflow steps, parallel containers, squad attach, agent terminals) run under the existing `AWMAN_TEST_DOCKER=1` gate used by `make test-full`; they must not run in `make test-fast` or `make test-web`.
+- Docker-backed rows (workflow steps, parallel containers, squad attach, agent terminals) run under the existing manifest boundary tier with an explicit Docker capability grant; they must not run in `make test` or `make test-web`.
 - Report per-row PASS/FAIL into a generated artifact next to `action-matrix.md`; fail the run when any `required` row is missing from the report. The 64 rows the 0159 audit listed as "implemented and unit-tested, not trace-proven" are the first targets.
 
 ### 2. Deployed-origin browser verification (0159 Edge Cases, Test Considerations)
@@ -77,9 +79,9 @@ rely on the documented aggregate-only usage counts.
 - Docker-backed parity rows must skip cleanly, with a visible reason, when Docker is absent; they must not be reported as passed.
 
 ## Test Considerations:
-- The parity runner is the acceptance suite for this item: every `required` row produces a PASS, FAIL or SKIP(reason) entry; `make test-web` keeps running the non-Docker rows, `make test-full` runs the rest.
-- Deployed-origin checks are recorded per browser engine and version with the daemon build hash; they are manual or scheduled against the deployment, not part of `make test-fast`.
-- Cancellation-latency regressions run in `make test-fast` with clock injection, not wall-clock sleeps.
+- The parity runner is the acceptance suite for this item: every `required` row produces a PASS, FAIL or BLOCKED(reason) entry; `make test-web` keeps running the non-Docker rows, `make test-boundary` runs the rest.
+- Deployed-origin checks are recorded per browser engine and version with the daemon build hash; they are manual or scheduled against the deployment, not part of `make test`.
+- Cancellation-latency regressions run in `make test` with clock injection, not wall-clock sleeps.
 - Baseline regression check fails the release script when `web` values regress by more than the configured percentage against the recorded baseline.
 
 ## Codebase Integration:

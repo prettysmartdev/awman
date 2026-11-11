@@ -95,24 +95,21 @@ test-guest:
 test-artifact:
 	AWMAN_TEST_ARTIFACT="$(ARTIFACT)" cargo xtask test run --tier artifact
 
+# Native Apple Silicon acceptance, including preparation and a portable evidence
+# packet. See aspec/devops/testing.md for prerequisites and packet review.
+.PHONY: validate-native
+validate-native:
+	CARGO_TARGET_DIR=target/native-validation-tools cargo xtask native-validation run
+
 gates:
 	cargo xtask gates check
 
-# Legacy integration targets kept until their replacements have shadow
-# evidence (ci/gates.toml [[legacy_fallback]], aspec/devops/replacement-ledger.md).
-# They still rely on the tools/isolated-test.sh wrapper for isolation; each
-# target is deleted, with its row, when its cutover condition closes.
-# LEGACY_DOCKER=1 also runs their real-Docker cases (the CI Docker job).
-LEGACY_TEST_TMPROOT ?= /var/tmp/test-fixtures
-.PHONY: legacy-test
-legacy-test:
-	@AWMAN_TEST_DOCKER="$(LEGACY_DOCKER)" AWMAN_TEST_TMPROOT="$(LEGACY_TEST_TMPROOT)" bash tools/isolated-test.sh -- --quiet --skip real_network --skip builtin_hw --skip latency::
+# Tests are selected exclusively through the manifest tiers above.
 
 # CI runs the structural rules and the hygiene suite once each.
 .PHONY: architecture-rules
 architecture-rules:
 	@bash tools/architecture-lint.sh
-	@bash tools/test-architecture-lint.sh
 
 architecture-lint: architecture-rules
 	@cargo xtask lint hygiene
@@ -154,7 +151,7 @@ apple-silicon-prerelease:
 # release job's /opt/awman scripts are installed or refreshed and the Mac is
 # registered as a temporary GitHub Actions runner for the Apple Silicon
 # release job, then removed when the Release workflow finishes.
-# RELEASE_RUNNER=auto|local|none (see scripts/release.sh).
+# RELEASE_RUNNER=auto|local|none (see aspec/devops/release.md).
 RELEASE_RUNNER ?= auto
 release:
 	@if [ -z "$(VERSION)" ]; then \

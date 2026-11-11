@@ -80,38 +80,3 @@ pub(crate) fn probe(
     let _ = cache.put(key, result.clone());
     PhaseToolsStatus::Probed(result)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn probe_script_reports_tool_presence_uid_and_user() {
-        assert!(PHASE_TOOLS_SCRIPT.contains("command -v"));
-        assert!(PHASE_TOOLS_SCRIPT.contains("uid=$(id -u)"));
-        // The script reads tool names from its arguments; nothing is interpolated.
-        assert!(PHASE_TOOLS_SCRIPT.contains("\"$@\""));
-        assert!(PHASE_TOOLS_PROBE_TIMEOUT <= Duration::from_secs(10));
-    }
-
-    #[test]
-    fn probe_returns_unknown_under_isolation_without_docker_opt_in() {
-        // An instance snapshot under isolation without the docker opt-in.
-        let env =
-            crate::data::config::env::EnvSnapshot::with_overrides([("AWMAN_TEST_ISOLATION", "1")]);
-        assert!(env.test_isolation() && !env.test_docker());
-        let runtime = ContainerRuntime::docker_in(env);
-        let mut cache = PhaseToolsCache::in_memory();
-        let status = probe(&runtime, "any:image", &["git", "gh"], &mut cache);
-        assert_eq!(
-            status,
-            PhaseToolsStatus::Unknown {
-                reason: "test isolation".into()
-            }
-        );
-        // Not Missing, and nothing was cached.
-        assert!(cache.get("any:image").is_none());
-        let via_runtime = runtime.probe_phase_tools("any:image", &["git"]);
-        assert!(matches!(via_runtime, PhaseToolsStatus::Unknown { .. }));
-    }
-}

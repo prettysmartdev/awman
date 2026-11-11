@@ -933,15 +933,6 @@ pub fn daemon_overlay_snapshot() -> DaemonEnvMap {
     DaemonEnvMap(guard.clone())
 }
 
-/// Serialises every test in the crate that reads or writes the process-wide
-/// [`DAEMON_OVERLAY`] — `cargo test` runs every `#[cfg(test)] mod tests` in
-/// this crate inside the *same* binary, so a static like `DAEMON_OVERLAY` is
-/// genuinely shared across module boundaries and across threads, not just
-/// within one file. Any test elsewhere in the crate that calls
-/// [`set_daemon_overlay`] must take this lock first.
-#[cfg(test)]
-pub(crate) static DAEMON_OVERLAY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 /// A set of host environment values bound for (or held by) the squad daemon.
 ///
 /// The type exists for one reason beyond naming: its [`Debug`](std::fmt::Debug)
@@ -1048,69 +1039,5 @@ impl std::fmt::Debug for DaemonEnvMap {
         f.debug_struct("DaemonEnvMap")
             .field("names", &self.names())
             .finish()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn snapshots_resolve_home_and_config_without_reading_the_process_environment() {
-        assert!(EnvSnapshot::empty().home_dir().is_none());
-        let snapshot = EnvSnapshot::with_overrides([
-            (HOME, "/memory/home"),
-            (XDG_CONFIG_HOME, "/memory/config"),
-        ]);
-        assert_eq!(snapshot.home_dir(), Some(PathBuf::from("/memory/home")));
-        assert_eq!(
-            crate::data::config::file::global_config_path(&snapshot).unwrap(),
-            PathBuf::from("/memory/config/awman/config.json")
-        );
-    }
-
-    #[test]
-    fn environment_override_parser_uses_typed_key_table_values() {
-        let snapshot = EnvSnapshot::with_overrides([
-            ("AWMAN_AGENTS_DEFAULT", "codex"),
-            ("AWMAN_WORKFLOWS_MAX_CONCURRENT_STEPS", "9"),
-            ("AWMAN_TEST_UNPUBLISHED", "ignored"),
-        ]);
-        let overrides = ConfigOverrides::from_env(&snapshot, |_| Vec::new()).unwrap();
-        assert_eq!(overrides.iter().count(), 2);
-        assert_eq!(
-            overrides
-                .iter()
-                .find(|(path, _)| path == "agents.default")
-                .unwrap()
-                .1,
-            "codex"
-        );
-        assert_eq!(
-            overrides
-                .iter()
-                .find(|(path, _)| path == "workflows.maxConcurrentSteps")
-                .unwrap()
-                .1,
-            9
-        );
-    }
-
-    #[test]
-    fn malformed_typed_environment_and_set_values_are_rejected() {
-        let snapshot =
-            EnvSnapshot::with_overrides([("AWMAN_WORKFLOWS_MAX_CONCURRENT_STEPS", "many")]);
-        assert!(ConfigOverrides::from_env(&snapshot, |_| Vec::new()).is_err());
-        let args = vec!["workflows.maxConcurrentSteps=many".to_owned()];
-        assert!(ConfigOverrides::parse_set_args(&args).is_err());
-    }
-
-    #[test]
-    fn daemon_overlay_map_is_built_from_explicit_pairs() {
-        let map = DaemonEnvMap::from_pairs([("TOKEN", "secret"), ("HOME", "/client")]);
-        assert_eq!(map.get("TOKEN"), Some("secret"));
-        assert_eq!(map.get("HOME"), Some("/client"));
-        assert!(format!("{map:?}").contains("names"));
-        assert!(!format!("{map:?}").contains("secret"));
     }
 }

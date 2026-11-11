@@ -1,5 +1,0 @@
-item,location,current_state,disposition,suggested_target_tier
-test-support feature,Cargo.toml [features],declared feature and enabled by development dependency,pending,component
-[profile.test],Cargo.toml [profile.test],debug=0; incremental=false,pending,component
-doctests,documentation comments and rust code fences,Native rustdoc case lists pending; cargo now located and metadata resolved,pending,unit
-[[test]] / [[example]],Cargo.toml and crates/*/Cargo.toml,explicit test and example registration; see Cargo metadata,pending,component

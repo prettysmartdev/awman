@@ -2,10 +2,10 @@
   "main_deletion": false,
   "main_force_push": false,
   "merge_queue": true,
-  "pending_cutover": "P2: query actual repository protection before switching legacy statuses",
   "required_checks": [
     "gate"
   ],
   "schema": 1,
-  "settings_verified": false
+  "settings_verified": false,
+  "verification": "Expected policy only; query live repository rules before release admission"
 }

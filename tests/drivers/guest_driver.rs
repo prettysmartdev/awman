@@ -235,7 +235,7 @@ mod driver {
         }
     }
 
-    /// The mount tree of `tools/oci-runtime-spike/mount-probe.sh`, verbatim.
+    /// The mount contract exercised by the guest tier.
     struct Tree {
         overlays: Vec<OverlaySpec>,
         workspace: PathBuf,
@@ -300,7 +300,7 @@ mod driver {
             overlay(&d("claude"), "/agent-home/.claude", true),
             overlay(&d("gemini"), "/agent-home/.gemini", true),
             overlay(&d("extra"), "/extra", false),
-            overlay(scripts, "/spike", false),
+            overlay(scripts, "/contracts", false),
             overlay(&d("single-ro"), "/single-ro", false),
             overlay(&d("single-rw"), "/single-rw", true),
             overlay(&d("claude.json"), "/agent-home/.claude.json", true),
@@ -484,27 +484,27 @@ mod driver {
                 let refresh = refresher(&tree);
                 let mut o = options(tag, &name("mounts"));
                 o.overlays = tree.overlays.clone();
-                o.entrypoint = Some(Entrypoint::new(["/bin/sh", "/spike/guest-checks.sh"]));
+                o.entrypoint = Some(Entrypoint::new(["/bin/sh", "/contracts/guest-checks.sh"]));
                 o.working_dir = Some("/workspace".into());
                 o.env_literal = vec![
                     EnvLiteral {
-                        key: "SPIKE_LITERAL".into(),
+                        key: "AWMAN_GUEST_LITERAL".into(),
                         value: "literal with spaces".into(),
                     },
                     EnvLiteral {
-                        key: "SPIKE_SECRET".into(),
+                        key: "AWMAN_GUEST_SECRET".into(),
                         value: "fake-secret".into(),
                     },
                     EnvLiteral {
-                        key: "SPIKE_PROMPT_FILE".into(),
+                        key: "AWMAN_GUEST_PROMPT_FILE".into(),
                         value: "/prompt.md".into(),
                     },
                     EnvLiteral {
-                        key: "SPIKE_HOST_SECRET".into(),
+                        key: "AWMAN_GUEST_HOST_SECRET".into(),
                         value: tree.outside_secret.to_string_lossy().into(),
                     },
                     EnvLiteral {
-                        key: "SPIKE_FILES".into(),
+                        key: "AWMAN_GUEST_FILES".into(),
                         value: "1".into(),
                     },
                 ];

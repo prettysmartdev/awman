@@ -42,25 +42,9 @@ Rules that never change:
   infrastructure is at fault: runner, hypervisor, pins, credentials, service) or
   `FAILED:` (the product or evidence is at fault). Nothing is published on either.
 
-## Which path is active
+## Active path
 
-`release.operator_path` in `ci/gates.toml` selects the operator path.
-
-- `"pipeline"`: `make release` runs the flow below and starts `candidate.yml`.
-- `"legacy"` (the current value): `cargo xtask release run` replaces itself with
-  `scripts/release.sh`, which pushes the tag and lets the tag-triggered
-  `release.yml` build and publish. The pre-checks, prompts and runner handling
-  below are the same; the differences are that the tag is created and pushed by
-  the operator before the build, there is no draft, no candidate number, no
-  receipt, and `release-status` and `release-abandon` have nothing to report.
-  Recovery is `gh run rerun <run id> --failed` on the `Release` run, or re-running
-  `make release`.
-
-The switch to `"pipeline"` is a reviewed manifest change made once a rehearsal
-(`make apple-silicon-prerelease`, or the nightly `rehearsal` job) has passed on
-the release Mac and the repository settings in [cicd.md](cicd.md#required-checks-and-repository-settings)
-are in place, including the release GitHub App and tag ruleset. The rest of this
-document describes the pipeline path.
+`make release` invokes the manifest pipeline and starts `candidate.yml`. There is one release path; no tag-triggered fallback publisher exists. Candidate evidence and protected promotion remain mandatory. Native local acceptance is available through `make validate-native`; its packet cannot authorize a release.
 
 ## Prerequisites
 
@@ -99,7 +83,7 @@ capitals; answering *no* to a *Proceed* question prints `  Aborting.` and exits 
 | **Tests** | runs `make test` and records the result bound to the exact source tree, index, untracked build inputs, manifest, `Cargo.lock` and tool versions | on failure the output is copied to the clipboard (`pbcopy`, `xclip` or `xsel`); `Skip tests and continue the release anyway?` [y/N], then `Launch 'awman chat' to fix the failing tests?` [Y/n]. A skip is recorded as `skipped by operator` and authorises nothing. A record for an unchanged tree is reused: `Tests already passed for this source tree` |
 | **Commit** | commits exactly `docs/releases/vX.Y.Z.md`, `Cargo.toml`, `Cargo.lock` as `Add release notes for vX.Y.Z`; the commit tree must equal the tested tree | `Nothing to commit` when already committed |
 | **Tag** | creates the local tag `vX.Y.Z` (refuses a local tag on another commit). It is only a local marker: the public tag is created at publication | |
-| **Release runner** | when this Mac serves: provisions `/opt/awman` and the guest fixture, registers a temporary runner labelled `self-hosted, macOS, ARM64, awman-release` (token only in the environment), keeps the Mac awake with `caffeinate` | lists queued or running workflow runs that wait for a release runner: `Cancel them?` [Y/n]. A runner that cannot register stops the release before anything is pushed |
+| **Release runner** | when this Mac serves: fetches and verifies manifest fixtures in its private store, registers a temporary runner labelled `self-hosted, macOS, ARM64, awman-release` (token only in the environment), keeps the Mac awake with `caffeinate` | lists queued or running workflow runs that wait for a release runner: `Cancel them?` [Y/n]. A runner that cannot register stops the release before anything is pushed |
 | **Push** | pushes `main` only (never the tag) and starts the candidate: `gh workflow run candidate.yml --ref main -f version=… -f commit=… -f operator_record=…` | `Started the release candidate for vX.Y.Z; the tag is pushed when it is published` |
 | **Release workflow** | finds the run (up to 5 minutes) and watches it with `gh run watch … --exit-status` through candidate, validation, promotion and verification (up to 3 hours) | an earlier unsuccessful run: `Re-run its failed jobs on this Mac?` [Y/n]. Success requires state `verified`, the matching commit and the tag on origin; then `Release vX.Y.Z published!` |
 
@@ -329,9 +313,7 @@ and after any change to the release inputs.
 verify-archive | up <owner/repo> <tag> | down>` manages the temporary runner that
 `make release` uses; you rarely call it directly.
 
-- `provision` installs what the job expects in `/opt/awman` (creating it with
-  `sudo` the first time and handing it to the invoking user), including the guest
-  fixture, which it fetches by pinned digest into `~/.awman/release-runner/fixtures`.
+- `provision` fetches and verifies the manifest fixtures into `~/.awman/release-runner/fixtures`. It needs no global wrapper installation or sudo.
 - `up` downloads the latest `actions/runner` osx-arm64 archive, refuses it unless
   its SHA-256 matches the checksum in that runner release's notes, registers it
   with a registration token passed only in `ACTIONS_RUNNER_INPUT_TOKEN`
@@ -342,13 +324,9 @@ verify-archive | up <owner/repo> <tag> | down>` manages the temporary runner tha
   Unix socket paths at 103 bytes.
 - `down` is idempotent: it stops the process group, deregisters the runner, and
   retains repair state if deregistration fails so the next `down` can finish it.
-- Overrides: `AWMAN_RELEASE_RUNNER_HOME`, `AWMAN_RELEASE_OPT_DIR`,
+- Overrides: `AWMAN_RELEASE_RUNNER_HOME`,
   `AWMAN_RELEASE_RUNNER_WORK`, `AWMAN_RELEASE_RUNNER_ONLINE_TIMEOUT`.
-- The runner executes jobs as the invoking user and accepts any job whose labels
-  match while it is online. Require approval for fork pull-request workflows, and
-  do not approve fork runs during a release.
-- Legacy: `tools/release-runner.sh` (label `hypervisor`) serves the legacy
-  `release.yml` path until that path is retired.
+- The runner must belong to an organization group restricted to candidate.yml and promote.yml on protected main. Labels only route jobs; they do not authorize them.
 
 ## What users verify
 
@@ -362,28 +340,11 @@ gh attestation verify awman-macos-arm64 --repo prettysmartdev/awman \
   --signer-workflow prettysmartdev/awman/.github/workflows/candidate.yml
 ```
 
-Releases published on the legacy path carry `SHA256SUMS` but no build provenance
-attestation, so `gh attestation verify` finds nothing for them.
+Older published releases may lack attestations; never infer provenance from their filename.
 
-## Review hardening and cutover limits
+## Trust and fixture publication
 
-The retained publisher is dispatch-only. A tag created by promotion cannot
-start it. Fallback activation requires `AWMAN_LEGACY_RELEASE_ENABLED=true`, the
-protected `release` environment, and an explicit `release.yml` dispatch on main
-with `legacy_tag=vX.Y.Z`. Its checked-out tag must be an ancestor of main.
-Disable that variable before enabling production candidate promotion. The
-legacy operator now dispatches this workflow explicitly after pushing the tag;
-its publication and runner must remain mutually exclusive with the successor.
-
-Temporary runners require `AWMAN_RELEASE_RUNNER_GROUP_ID`. The successor queries
-that organization group's policy and requires exactly candidate.yml and
-promote.yml at `refs/heads/main`; the retained fallback requires a separate group
-restricted to release.yml at main. Repository-scoped registration is refused.
-The group must also be allocated to this repository and protected-main and
-release-environment settings must be API-verified by the administrator (P1/P6).
-The group identifier alone, a label, or a local hardware check proves none of
-those external settings. Runner-home paths are canonicalized; teardown retains
-state and fails when it cannot establish that the owned process is gone.
+Temporary runners require `AWMAN_RELEASE_RUNNER_GROUP_ID`. The runner queries the group policy and requires exactly candidate.yml and promote.yml at `refs/heads/main`; repository-scoped registration is refused. The group must also be allocated to this repository. Protected-main and release-environment settings are external prerequisites, not properties proven by a local test. Runner teardown retains state when ownership or deregistration cannot be established.
 
 Candidate fetch exports an absolute, hash-verified executable path. On Unix it
 restores owner execution and removes write permission before exporting that
@@ -398,17 +359,11 @@ The draft journal remains advisory. Policy is reread from the live protected
 main tip through authenticated API reads before tagging and publication, and a
 tip change during verification requires a retry.
 
-These checks do not finish cutover: exact compiled expected-set reconciliation
-and the real producer/controller evidence transport still require integration.
-Published recovery and receipts/harness retention beyond Actions artifact expiry
-also remain blockers. Do not perform the first real release until those code
-obligations and the administrator/native rehearsal rows in
-[replacement-ledger.md](replacement-ledger.md) are closed.
+Native acceptance remains open as recorded in WI144. Publication still requires the service-authenticated candidate gate, approved environment and immutable fixture pins; a local packet does not bypass them.
 
 The Fixtures dispatch is available on main under the `fixtures` environment. It
 accepts a reviewed HTTPS arm64 Docker-save archive and its SHA-256, builds the
 offline fixture using `fixtures build guest-oci-base`, and publishes a new
-`fixtures-*` release without replacing an existing tag. P7 remains open until a
-maintainer verifies the public fixture and previous-release assets, commits all
+`fixtures-*` release without replacing an existing tag. Before production guest validation, a maintainer verifies the public fixture and previous-release assets, commits all
 digests, and runs the native guest/artifact checks. Merely running the fixture
 builder does not establish that its guest boots.

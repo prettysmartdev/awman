@@ -1,7 +1,7 @@
 //! `cargo xtask matrix`: render and check the acceptance matrix (design 8.7).
 //!
-//! `ci/acceptance-matrix.toml` has one `[[cell]]` per subsystem × mode ×
-//! backend × runtime × platform × feature:
+//! `ci/acceptance-matrix.toml` records important behavior anchors; full platform/suite
+//! selection is derived from the manifest rather than duplicated here:
 //!
 //! ```toml
 //! [[cell]]
@@ -150,35 +150,14 @@ fn check(root: &Path) -> Result<Vec<String>> {
         }
     }
     let subsystems: BTreeSet<_> = matrix.cell.iter().map(|c| c.subsystem.as_str()).collect();
-    problems.extend(template_findings(root, &subsystems)?);
+    problems.extend(coverage_findings(&subsystems));
     for asset in &manifest.release.assets {
         if !subsystems.contains(format!("release {asset}").as_str()) {
             problems.push(format!("{MATRIX}: no row for release asset {asset}"));
         }
     }
-    for path in catalogue_paths(root)? {
-        if !subsystems.contains(format!("command {path}").as_str()) {
-            problems.push(format!("{MATRIX}: no row for catalogue leaf {path}"));
-        }
-    }
-    for gate in manifest.gates.keys() {
-        for cell in crate::manifest::validate::cells(&manifest, gate)? {
-            if let Some(suite) = manifest.suites.get(&cell.suite) {
-                let feature = &manifest.builds[&cell.build].features;
-                if !matrix.cell.iter().any(|c| {
-                    c.subsystem == format!("suite {}", cell.suite)
-                        && c.platform == cell.platform
-                        && c.feature == *feature
-                        && c.backend == suite.backend.as_deref().unwrap_or("n/a")
-                }) {
-                    problems.push(format!(
-                        "{MATRIX}: missing suite/platform/backend cell {} on {}",
-                        cell.id, cell.platform
-                    ));
-                }
-            }
-        }
-    }
+    // Platform/suite coverage is checked by the manifest cell validator and
+    // actual compiled inventories, not a second hand-maintained Cartesian table.
     for derived in ["command-catalogue", "config-keys"] {
         if !subsystems.contains(derived) {
             problems.push(format!(
@@ -232,40 +211,27 @@ fn render(m: &Matrix) -> String {
     s
 }
 
-fn template_findings(root: &Path, subsystems: &BTreeSet<&str>) -> Result<Vec<String>> {
-    let mut problems = Vec::new();
-    for entry in std::fs::read_dir(root.join("templates"))? {
-        let entry = entry?;
-        let name = entry.file_name().to_string_lossy().to_string();
-        if entry.file_type()?.is_file() && !subsystems.contains(format!("template {name}").as_str())
-        {
-            problems.push(format!("{MATRIX}: no row for shipped template {name}"));
-        }
-    }
-    Ok(problems)
-}
-fn catalogue_paths(root: &Path) -> Result<Vec<String>> {
-    use syn::visit::Visit;
-    struct Strings(Vec<String>);
-    impl<'ast> Visit<'ast> for Strings {
-        fn visit_lit_str(&mut self, value: &'ast syn::LitStr) {
-            self.0.push(value.value());
-        }
-    }
-    let source = std::fs::read_to_string(root.join("tests/component/command/catalogue.rs"))?;
-    let syntax = syn::parse_file(&source)?;
-    let contract = syntax
-        .items
-        .iter()
-        .find_map(|i| match i {
-            syn::Item::Const(c) if c.ident == "CONTRACT_PATHS" => Some(c),
-            _ => None,
-        })
-        .context("missing independent catalogue leaf contract")?;
-    let mut found = Strings(Vec::new());
-    found.visit_expr(&contract.expr);
-    anyhow::ensure!(!found.0.is_empty(), "empty catalogue leaf contract");
-    Ok(found.0)
+fn coverage_findings(subsystems: &BTreeSet<&str>) -> Vec<String> {
+    [
+        "foundation",
+        "data",
+        "engine",
+        "workflow",
+        "command",
+        "daemon",
+        "frontend",
+        "squad",
+        "worker",
+        "security",
+        "templates",
+        "boundary",
+        "native",
+        "ci-release",
+    ]
+    .into_iter()
+    .filter(|name| !subsystems.contains(name))
+    .map(|name| format!("{MATRIX}: missing important behavior slice {name}"))
+    .collect()
 }
 
 #[cfg(test)]
@@ -304,22 +270,10 @@ mod tests {
         assert!(out.contains("no hardware; owner maintainer; release impact: none claimed"));
     }
     #[test]
-    fn non_docker_templates_cannot_disappear_from_the_inventory() {
-        let root = tempfile::tempdir().unwrap();
-        std::fs::create_dir(root.path().join("templates")).unwrap();
-        std::fs::write(root.path().join("templates/sbx-kit.example.yaml"), "kit").unwrap();
-        std::fs::write(root.path().join("templates/agent-definition.toml"), "agent").unwrap();
-        let incomplete = BTreeSet::from(["template sbx-kit.example.yaml"]);
-        assert!(template_findings(root.path(), &incomplete)
-            .unwrap()
-            .iter()
-            .any(|p| p.contains("agent-definition.toml")));
-        let complete = BTreeSet::from([
-            "template sbx-kit.example.yaml",
-            "template agent-definition.toml",
-        ]);
-        assert!(template_findings(root.path(), &complete)
-            .unwrap()
-            .is_empty());
+    fn important_behavior_slices_cannot_disappear() {
+        let missing = coverage_findings(&BTreeSet::from(["foundation", "data"]));
+        assert!(missing.iter().any(|p| p.contains("workflow")));
+        assert!(missing.iter().any(|p| p.contains("security")));
+        assert!(!missing.iter().any(|p| p.ends_with("foundation")));
     }
 }

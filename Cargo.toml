@@ -121,7 +121,6 @@ name = "awman"
 path = "src/lib.rs"
 
 [features]
-test-support = []
 default = []
 builtin-runtime = ["dep:microsandbox", "dep:microsandbox-cli", "dep:microsandbox-image", "dep:microsandbox-network", "dep:sqlx", "dep:msb_krun", "msb_krun/static-krunfw", "dep:hyper-rustls"]
 
@@ -199,9 +198,6 @@ libc = { workspace = true }
 
 [dev-dependencies]
 awman-wsp = { workspace = true, features = ["mock"] }
-# Self dev-dependency: the worker_* integration tests drive the in-process
-# router (`build_router`), which is gated behind `test-support`.
-awman = { path = ".", features = ["test-support"] }
 tokio ={ workspace = true, features = ["test-util"] }
 reqwest = { workspace = true }
 wiremock = { workspace = true }
@@ -210,38 +206,3 @@ wiremock = { workspace = true }
 awman-test-support = { workspace = true }
 proptest = { workspace = true }
 insta = { workspace = true }
-
-# ── WI 0143 worker end-to-end tests ──────────────────────────────────────────
-# Registered on the library package (autotests = false above) so they link the
-# awman library with the awman-wsp mock: `cargo test -p awman --test worker_<x>`.
-[[test]]
-name = "worker_lease_git"
-path = "tests/worker_lease_git.rs"
-
-[[test]]
-name = "worker_push_retry"
-path = "tests/worker_push_retry.rs"
-
-[[test]]
-name = "worker_native"
-path = "tests/worker_native.rs"
-
-[[test]]
-name = "worker_pull_auto"
-path = "tests/worker_pull_auto.rs"
-
-[[test]]
-name = "worker_events"
-path = "tests/worker_events.rs"
-
-[[test]]
-name = "worker_lease_run"
-path = "tests/worker_lease_run.rs"
-
-[[test]]
-name = "worker_security"
-path = "tests/worker_security.rs"
-
-[[test]]
-name = "worker_mixed"
-path = "tests/worker_mixed.rs"

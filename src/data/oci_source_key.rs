@@ -54,29 +54,3 @@ impl OciSourceKey {
         )
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn legacy_spellings_keep_the_original_cache_key_text() {
-        let key = OciSourceKey {
-            kind: ImageSourceKind::DockerStore,
-            locator: "unix:///run/docker.sock".into(),
-            reference: "agent:latest".into(),
-            platform: OciPlatform::host_linux(),
-        };
-        assert_eq!(
-            key.canonical_key(),
-            format!(
-                "v1\ndocker-local\nunix:///run/docker.sock\nagent:latest\n{}",
-                key.platform
-            )
-        );
-        assert!(key.lookup_keys().contains(&format!(
-            "v1\ndocker-store\nunix:///run/docker.sock\nagent:latest\n{}",
-            key.platform
-        )));
-    }
-}

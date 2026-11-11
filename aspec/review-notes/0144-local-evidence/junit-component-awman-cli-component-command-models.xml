@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="nextest-run" tests="4" skipped="0" failures="0" errors="0" uuid="a36b9daf-c995-4abe-a009-d131aa4773ef" timestamp="2026-11-11T21:21:50.874+00:00" time="26.253">
+    <testsuite name="awman-cli::component" tests="4" skipped="0" errors="0" failures="0">
+        <testcase name="command::models::workflow_minimal_reproductions_reset_budget_and_keep_the_fourth_failure_terminal" classname="awman-cli::component" timestamp="2026-11-11T21:21:50.877+00:00" time="0.029"/>
+        <testcase name="command::models::workflow_repair_accept_restart_and_exhaustion_follow_the_reference_model" classname="awman-cli::component" timestamp="2026-11-11T21:21:50.877+00:00" time="0.285"/>
+        <testcase name="command::models::session_minimal_reproductions_preserve_closed_admission_and_cancelled_work" classname="awman-cli::component" timestamp="2026-11-11T21:21:50.877+00:00" time="2.081"/>
+        <testcase name="command::models::session_admission_close_and_reopen_follow_the_reference_model" classname="awman-cli::component" timestamp="2026-11-11T21:21:50.878+00:00" time="26.248"/>
+    </testsuite>
+</testsuites>

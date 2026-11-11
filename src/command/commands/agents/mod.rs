@@ -26,9 +26,6 @@ pub mod snapshot;
 pub mod status;
 pub mod tips;
 
-#[cfg(test)]
-pub(crate) mod test_support;
-
 pub use attach::{AgentsAttachCommand, AgentsAttachOutcome};
 pub use detail::{AgentsDetailCommand, AgentsDetailFlags, AgentsDetailOutcome};
 pub use kill::{AgentsKillCommand, AgentsKillFlags, AgentsKillOutcome, KillChoice};

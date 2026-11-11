@@ -388,30 +388,3 @@ impl LeasePush {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn push_failures_preserve_auth_cancellation_and_transport_classification() {
-        for (kind, stage, code) in [
-            (LeasePushFailureKind::Auth, "git_auth", "git_auth_failed"),
-            (
-                LeasePushFailureKind::Unreachable,
-                "push",
-                "push_unreachable",
-            ),
-            (LeasePushFailureKind::Cancelled, "push", "cancelled"),
-            (LeasePushFailureKind::Rejected, "push", "push_failed"),
-            (LeasePushFailureKind::LeaseLost, "push", "push_failed"),
-            (LeasePushFailureKind::LinkRevoked, "push", "push_failed"),
-        ] {
-            let failure = LeasePushFailure {
-                kind,
-                message: String::new(),
-                attempts: 1,
-            };
-            assert_eq!((failure.stage(), failure.code()), (stage, code));
-        }
-    }
-}

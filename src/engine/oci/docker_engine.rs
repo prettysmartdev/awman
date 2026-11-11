@@ -548,7 +548,3 @@ pub(super) fn export(
         fingerprint: None,
     })
 }
-
-#[cfg(test)]
-#[path = "docker_engine_tests.rs"]
-mod tests;

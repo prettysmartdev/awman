@@ -20,7 +20,7 @@
 #
 # Every scan distinguishes grep's "no match" (exit 1) from an execution error
 # (exit >= 2), uses only POSIX ERE (no `grep -P`, no `\b`), and is exercised on
-# fixture trees by tools/test-architecture-lint.sh. The scanned tree defaults
+# private fixture trees by tests/component/tools/architecture.rs. The scanned tree defaults
 # to the repository and can be redirected with ARCH_LINT_ROOT (used by the
 # fixtures).
 

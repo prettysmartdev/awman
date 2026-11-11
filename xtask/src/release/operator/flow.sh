@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Pipeline operator: terminal messages retained from scripts/release.sh.
-# Usage: scripts/release.sh v1.2.3
+# Pipeline operator: stable release operator prompts and resume behavior.
+# Usage: cargo xtask release run v1.2.3
 #
 # Each step detects whether it has already been completed, so the script can
 # be re-run after a failure without repeating work.

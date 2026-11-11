@@ -347,11 +347,6 @@ impl TabRelay {
         }
     }
 
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn feeds(&self) -> &TabCommandFeeds {
-        &self.feeds
-    }
-
     pub fn tab_id(&self) -> &TabId {
         &self.tab_id
     }
@@ -1134,77 +1129,5 @@ impl Drop for TabRelay {
         for slot in &mut self.slots {
             slot.finish(0);
         }
-    }
-}
-
-#[cfg(test)]
-mod log_tests {
-    use super::*;
-    use crate::data::instance_snapshot::{WorkflowStepKind, WorkflowStepView};
-
-    fn view(steps: &[(&str, StepViewStatus)]) -> WorkflowViewState {
-        WorkflowViewState {
-            steps: steps
-                .iter()
-                .map(|(name, status)| WorkflowStepView {
-                    name: name.to_string(),
-                    status: *status,
-                    agent: Some("claude".into()),
-                    model: None,
-                    depends_on: Vec::new(),
-                    kind: WorkflowStepKind::Agent,
-                })
-                .collect(),
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn pending_steps_and_unchanged_steps_are_not_logged() {
-        let first = view(&[
-            ("plan", StepViewStatus::Pending),
-            ("build", StepViewStatus::Pending),
-        ]);
-        assert!(workflow_step_changes(None, &first).is_empty());
-        let same = first.clone();
-        assert!(workflow_step_changes(Some(&first), &same).is_empty());
-    }
-
-    #[test]
-    fn each_real_transition_is_reported_once() {
-        let before = view(&[
-            ("plan", StepViewStatus::Running),
-            ("build", StepViewStatus::Pending),
-        ]);
-        let after = view(&[
-            ("plan", StepViewStatus::Done),
-            ("build", StepViewStatus::Running),
-        ]);
-        let changes = workflow_step_changes(Some(&before), &after);
-        assert_eq!(
-            changes,
-            vec![
-                StepChange {
-                    step: "plan",
-                    from: Some(StepViewStatus::Running),
-                    to: StepViewStatus::Done,
-                    agent: Some("claude"),
-                },
-                StepChange {
-                    step: "build",
-                    from: Some(StepViewStatus::Pending),
-                    to: StepViewStatus::Running,
-                    agent: Some("claude"),
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn a_step_first_seen_running_has_no_previous_status() {
-        let after = view(&[("plan", StepViewStatus::Running)]);
-        let changes = workflow_step_changes(None, &after);
-        assert_eq!(changes.len(), 1);
-        assert_eq!(changes[0].from, None);
     }
 }

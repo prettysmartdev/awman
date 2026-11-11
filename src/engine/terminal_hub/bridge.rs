@@ -71,58 +71,6 @@ impl TerminalHub {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::data::daemon_state::FeatureName;
-    use crate::data::ids::TabId;
-    use crate::data::terminal::{TerminalFrame, TerminalOwner, TerminalOwnerInfo, TerminalState};
-    use crate::engine::terminal_hub::TerminalHubConfig;
-
-    fn registration() -> TerminalRegistration {
-        TerminalRegistration {
-            owner: TerminalOwnerInfo {
-                owner: TerminalOwner::Tab(TabId::new()),
-                feature: FeatureName::Engine,
-                source: None,
-                attempt: 1,
-                allow_remote_input: false,
-            },
-            agent: "claude".into(),
-            model: None,
-            cols: 80,
-            rows: 24,
-        }
-    }
-
-    #[tokio::test]
-    async fn output_reaches_a_subscriber_and_input_and_resize_reach_the_agent() {
-        let hub = Arc::new(TerminalHub::new(TerminalHubConfig::default()));
-        let (stdout_tx, stdout_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (resize_tx, mut resize_rx) = tokio::sync::mpsc::unbounded_channel();
-        let bridged = hub.bridge_agent_channels(registration(), stdout_rx, stdin_tx, resize_tx);
-        let id = bridged.handle.id().clone();
-        let mut sub = hub.subscribe(&id).unwrap();
-        // The first frame is the snapshot.
-        let _ = sub.next().await;
-        stdout_tx.send(b"hello".to_vec()).unwrap();
-        match sub.next().await {
-            Some(TerminalFrame::Output { bytes }) => assert_eq!(bytes, b"hello"),
-            other => panic!("unexpected frame {other:?}"),
-        }
-        let grant = hub.take_control(&id).unwrap();
-        grant.send_input(b"ls\r".to_vec()).unwrap();
-        assert_eq!(stdin_rx.recv().await.unwrap(), b"ls\r");
-        grant.resize(100, 30).unwrap();
-        assert_eq!(resize_rx.recv().await.unwrap(), (100, 30));
-        drop(grant);
-        drop(stdout_tx);
-        bridged.task.await.unwrap();
-        assert_eq!(hub.get(&id).unwrap().state, TerminalState::Exited);
-    }
-}
-
 // ─── Host PTYs ─────────────────────────────────────────────────────────────
 //
 // A host-side interactive subprocess (`DialogRequest::TerminalRelease`, e.g.

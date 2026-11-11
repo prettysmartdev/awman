@@ -447,35 +447,3 @@ pub(crate) fn render_review(state: &ReviewState, area: Rect, frame: &mut Frame) 
     footer.extend(keys);
     frame.render_widget(Paragraph::new(footer), footer_area);
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn wrap_words_breaks_at_spaces_with_a_hanging_indent() {
-        let rows = wrap_words("alpha beta gamma delta", 12, "  • ", "    ");
-        assert_eq!(
-            rows,
-            vec!["  • alpha", "    beta", "    gamma", "    delta"]
-        );
-        for row in &rows {
-            assert!(row.width() <= 12, "{row:?}");
-        }
-    }
-
-    #[test]
-    fn wrap_words_hard_wraps_a_word_wider_than_the_row() {
-        let rows = wrap_words("x abcdefghijkl", 6, "", "");
-        assert_eq!(rows, vec!["x", "abcdef", "ghijkl"]);
-    }
-
-    #[test]
-    fn prose_rows_keep_each_lines_indentation_and_blank_lines() {
-        let rows = prose_rows("{\n  \"a\": 1\n}\n\nsome words here", 8);
-        assert_eq!(
-            rows,
-            vec!["{", "  \"a\": 1", "}", "", "some", "words", "here"]
-        );
-    }
-}

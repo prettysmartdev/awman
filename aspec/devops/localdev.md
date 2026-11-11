@@ -1,8 +1,6 @@
 # Local Development
 
-WI 0144 remains an incomplete shadow migration. Static checks passing do not
-certify a working production evidence chain or complete legacy replacement;
-see [replacement-ledger.md](replacement-ledger.md) for code blockers and cutover.
+The manifest test system is the only supported path. See [replacement-ledger.md](replacement-ledger.md) for coverage decisions and evidence. Native Apple Silicon acceptance remains open until the maintainer's packet is independently reviewed.
 
 Development: local
 Build tools: make, cargo, docker
@@ -63,8 +61,7 @@ and reproduce tests. Locally:
 | `make test-guest` | fetches the pinned guest fixtures, then the `guest` tier | Apple Silicon or KVM, verified payload (`make payloads`), Docker or Apple Containers for the fixtures |
 | `make test-artifact ARTIFACT=/abs/path/awman` | the `artifact` tier against a release executable | the executable |
 | `make gates` | `cargo xtask gates check`: manifest, generated files, Makefile contract and these documents | none |
-| `make architecture-lint` | the layering lint, its own test, and `cargo xtask lint hygiene` | none |
-| `make legacy-test` | the retained legacy integration targets through `tools/isolated-test.sh`; `LEGACY_DOCKER=1` adds their real-Docker cases | see the `[[legacy_fallback]]` rows |
+| `make architecture-lint` | the layering lint and `cargo xtask lint hygiene` | none |
 
 - `cargo-nextest` is required and pinned. `cargo xtask test install-runner`
   installs the pinned, SHA-256-verified release into `target/xtask-tools/`;
@@ -112,10 +109,7 @@ and reproduce tests. Locally:
 - On macOS, Hypervisor.framework refuses unsigned processes. `make build`
   ad-hoc signs the Apple Silicon release binary with
   `packaging/macos/awman.entitlements` (`tools/macos-sign.sh`); `make sign-macos
-  BIN=<path>` re-signs a copied or modified binary. The guest tier needs signed
-  test executables and drivers (`tools/macos-sign-test-artifacts.sh`, which also
-  signs cargo's `deps/` originals because cargo re-copies them on every build);
-  a missing entitlement is reported as `BLOCKED` with that instruction.
+  BIN=<path>` re-signs a copied or modified binary. `make validate-native` signs the native drivers and candidate and records signature verification in its evidence packet.
 - Guest scenarios (boot, exec, import, network, upgrade, builder, strategy) run
   only in the `guest` tier on a host that can boot a guest. A missing
   `/dev/kvm`, denied KVM access, missing Apple hypervisor entitlement,
@@ -123,14 +117,7 @@ and reproduce tests. Locally:
   with the concrete prerequisite recorded; it is never a passing boot test. The
   upgrade scenario needs the pinned previous release (`previous-release`);
   nobody builds an older awman by hand.
-- SQLite and native dependency changes are covered by the guest-tier tests, the
-  catalog compatibility check (`tools/test-msb-catalog-compat.sh`) and the
-  release artifact dependency scan (`artifact-deps-scan`). Inspect a final
-  feature artifact for dynamic dependencies and extracted-helper candidates with
-  `bash tools/release-artifact-check.sh` and
-  `bash tools/measure-release-artifact.sh`. The runtime must work offline with a
-  minimal executable search path after build; no production runtime path may
-  depend on `tools/` scripts, Cargo caches or temporary spike artifacts.
+- SQLite and native dependencies are exercised by persisted-state component contracts, the guest tier and `artifact-deps-scan`. Use `make test-artifact ARTIFACT=...` for a prepared candidate. Runtime execution must work offline with a minimal executable search path and cannot depend on build caches or tools scripts.
 - The builtin driver uses the vendored `build_lazy_isolated()` entry point on
   pinned `microsandbox 0.7.8`. It starts from independent defaults and
   awman-owned paths without merging installed SDK config.
@@ -142,13 +129,7 @@ and reproduce tests. Locally:
   In the final binary `krunfw_get_kernel` is visible to `nm` in debug and plain
   release builds but not after `strip` or under fat LTO, so artifact scans must
   not require the symbol name. `make payloads` fetches and checksum-verifies the
-  host's payload (`tools/msb-payloads/fetch.sh`); `make payloads-verify` is the
-  promotion path for a new payload pin and needs a clean native checkout. Do not
-  replace this with process-global environment mutation.
-- Known issue: `tools/msb-payloads/payloads-verify.sh` still drives its gate
-  through the retired `test-builtin` Make target, so `make payloads-verify` fails
-  at that step until the script moves to `cargo xtask test run --tier guest,artifact`.
-  Use `make test-guest` and `make test-artifact` directly meanwhile.
+  host's payload (`tools/msb-payloads/fetch.sh`); `make payloads-verify` verifies bytes against the reviewed payload record. A new payload status requires reviewed native evidence; the command does not automatically promote a record.
 
 ### Pinned tooling
 

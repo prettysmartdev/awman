@@ -32,7 +32,7 @@ fn run(id: &'static str, apple: bool) {
     );
     std::fs::write(
         repo.join("Dockerfile.dev"),
-        "FROM awman-hw/fixture:latest\nRUN printf 'v1\\n' > /etc/builder-marker\n",
+        "FROM awman-test/guest:fixture\nRUN printf 'v1\\n' > /etc/builder-marker\n",
     )
     .unwrap();
     let mut global: serde_json::Value =
@@ -55,7 +55,7 @@ fn run(id: &'static str, apple: bool) {
         std::fs::write(
             repo.join("Dockerfile.dev"),
             format!(
-                "FROM awman-hw/fixture:latest\nRUN printf '{version}\\n' > /etc/builder-marker\n"
+                "FROM awman-test/guest:fixture\nRUN printf '{version}\\n' > /etc/builder-marker\n"
             ),
         )
         .unwrap();

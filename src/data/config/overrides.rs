@@ -71,39 +71,3 @@ impl ConfigOverrides {
         self.0.iter()
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn remote_target_settings_are_never_forwardable() {
-        let args = [
-            "remote.targets.unrelated.apiKey=SECRET".to_string(),
-            "remote.targets.x.url=https://x".to_string(),
-            "workflows.maxConcurrentSteps=2".to_string(),
-        ];
-        assert_eq!(
-            forwardable_set_args(&args),
-            vec!["workflows.maxConcurrentSteps=2".to_string()]
-        );
-    }
-
-    #[test]
-    fn detached_argv_round_trips_the_override_layer() {
-        let input = [
-            "workflows.maxConcurrentSteps=2",
-            "agents.launchMode=acp",
-            "workflows.dynamic.guidance=one,two",
-            "runtime.builtin.network.hostPorts=80,443",
-            "workServers.test.labels=team=build,stage=test",
-            "agents.auth.refresh.enabled=false",
-            "agents.stuckTimeout=null",
-        ]
-        .map(str::to_string);
-        let settings = ConfigOverrides::parse_set_args(&input).unwrap();
-        assert_eq!(
-            ConfigOverrides::parse_set_args(&settings.set_args()).unwrap(),
-            settings
-        );
-    }
-}

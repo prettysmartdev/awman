@@ -462,15 +462,6 @@ impl RemoteClient {
     }
     // ─── Generic low-level helpers (crate-private) ───────────────────────────
 
-    #[cfg(any(test, feature = "test-support"))]
-    pub async fn send_command(
-        &self,
-        path: &[&str],
-        flags: &[(&str, serde_json::Value)],
-    ) -> Result<RemoteResponse, EngineError> {
-        self.core.post_command(path, flags, &[]).await
-    }
-
     /// Like `send_command` but also attaches request headers — used to set
     /// `x-awman-session` on `POST /v1/worker/commands` (the server reads the session
     /// from the header, not the body).
@@ -494,89 +485,4 @@ impl RemoteClient {
     pub fn map_reqwest_error(e: reqwest::Error) -> EngineError {
         HttpCore::map_reqwest_error(e)
     }
-}
-
-/// Canonicalize a URL for the default-addr comparison rule (§6.5):
-///   - lowercase scheme
-///   - lowercase host
-///   - elide default ports (80/http, 443/https)
-///   - normalize trailing slash
-#[cfg(test)]
-fn canonicalize_url(s: &str) -> String {
-    let s = s.trim();
-    let (scheme_part, rest) = match s.split_once("://") {
-        Some(t) => t,
-        None => return s.to_lowercase(),
-    };
-    let scheme = scheme_part.to_lowercase();
-    let (host_part, path_part) = match rest.split_once('/') {
-        Some((h, p)) => (h, format!("/{p}")),
-        None => (rest, "/".to_string()),
-    };
-    let (host, port) = match host_part.split_once(':') {
-        Some((h, p)) => (h.to_lowercase(), Some(p.to_string())),
-        None => (host_part.to_lowercase(), None),
-    };
-    let port_render = match (scheme.as_str(), port.as_deref()) {
-        ("http", Some("80")) | ("https", Some("443")) | (_, None) => String::new(),
-        (_, Some(p)) => format!(":{p}"),
-    };
-    let path_render = if path_part == "/" {
-        ""
-    } else {
-        path_part.as_str()
-    };
-    format!("{scheme}://{host}{port_render}{path_render}")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // ─── is_loopback_addr ─────────────────────────────────────────────────────
-
-    #[test]
-    fn loopback_addr_recognizes_ipv4_and_ipv6_and_localhost() {
-        assert!(RemoteClient::is_loopback_addr("https://127.0.0.1:9876"));
-        assert!(RemoteClient::is_loopback_addr("http://127.0.0.1:9876/"));
-        assert!(RemoteClient::is_loopback_addr("https://localhost"));
-        assert!(RemoteClient::is_loopback_addr("https://[::1]:9876"));
-    }
-
-    #[test]
-    fn loopback_addr_rejects_remote_hosts() {
-        assert!(!RemoteClient::is_loopback_addr("https://example.com:9876"));
-        assert!(!RemoteClient::is_loopback_addr("http://10.0.0.1"));
-        assert!(!RemoteClient::is_loopback_addr("https://my-host"));
-    }
-
-    // ─── URL canonicalize helpers ─────────────────────────────────────────────
-
-    #[test]
-    fn url_canonicalize_default_port_elided() {
-        assert_eq!(canonicalize_url("http://1.2.3.4:80/"), "http://1.2.3.4");
-        assert_eq!(
-            canonicalize_url("https://example.com:443/"),
-            "https://example.com"
-        );
-    }
-
-    #[test]
-    fn url_canonicalize_case_insensitive_scheme_and_host() {
-        assert_eq!(
-            canonicalize_url("HTTP://Example.COM/"),
-            "http://example.com"
-        );
-    }
-
-    #[test]
-    fn url_canonicalize_distinguishes_schemes() {
-        assert_ne!(
-            canonicalize_url("https://example.com/"),
-            canonicalize_url("http://example.com/"),
-        );
-    }
-
-    // `send_command` against a loopback server (status mapping, refused
-    // connection): tests/component/engine/remote.rs.
 }

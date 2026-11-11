@@ -30,7 +30,6 @@ pub struct Manifest {
     #[serde(default)]
     pub fakes: BTreeMap<String, ConformancePair>,
     pub release: Release,
-    pub legacy_fallback: Vec<LegacyFallback>,
     pub workflows: BTreeMap<String, Workflow>,
     #[serde(skip)]
     pub version: String,
@@ -261,12 +260,6 @@ pub struct Release {
     pub environment: String,
     pub ci_guest_labels: Vec<String>,
     pub release_labels: Vec<String>,
-}
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct LegacyFallback {
-    pub path: String,
-    pub remove_when: String,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

@@ -27,7 +27,6 @@ pub fn check(root: &Path, allow_placeholders: bool) -> Result<Report> {
     if !allow_placeholders {
         r.errors.extend(manifest::validate::pins_for_gate(&m, "pr"));
     }
-    r.errors.extend(legacy_fallback_findings(root, &m));
     r.errors.extend(scenario_findings(root, &m));
     r.errors.extend(super::render::workflows::verify(root, &m));
     for (path, expected) in super::render::outputs(&m)? {
@@ -86,49 +85,6 @@ pub fn check(root: &Path, allow_placeholders: bool) -> Result<Report> {
     r.errors.dedup();
     Ok(r)
 }
-/// `[[legacy_fallback]]` rows name legacy files kept on purpose until a
-/// cutover row (design 13.2) or a slice's shadow period closes. A row whose
-/// path no longer exists is stale and must be deleted with the file; a row
-/// without a recognised condition cannot be closed and is refused.
-pub fn legacy_fallback_findings(root: &Path, m: &manifest::Manifest) -> Vec<String> {
-    let mut errors = Vec::new();
-    for row in &m.legacy_fallback {
-        let known_condition = row
-            .remove_when
-            .strip_prefix('P')
-            .and_then(|n| n.parse::<u32>().ok())
-            .is_some_and(|n| (1..=11).contains(&n))
-            || row
-                .remove_when
-                .strip_prefix("shadow:")
-                .is_some_and(|s| !s.trim().is_empty());
-        if !known_condition {
-            errors.push(format!(
-                "legacy_fallback {}: remove_when `{}` is neither a cutover row P1-P11 nor shadow:<owner>",
-                row.path, row.remove_when
-            ));
-        }
-        if !root.join(row.path.trim_end_matches('/')).exists() {
-            errors.push(format!(
-                "legacy_fallback {}: path no longer exists; delete the row in the same change",
-                row.path
-            ));
-        }
-    }
-    errors
-}
-
-/// True when `path` (repository-relative) is inside a `[[legacy_fallback]]` row.
-pub fn is_legacy_fallback(m: &manifest::Manifest, path: &str) -> bool {
-    m.legacy_fallback.iter().any(|row| {
-        if row.path.ends_with('/') {
-            path.starts_with(&row.path)
-        } else {
-            path == row.path
-        }
-    })
-}
-
 pub fn make_findings(text: &str) -> Vec<String> {
     let mut errors = Vec::new();
     for (target, commands) in make_contract() {

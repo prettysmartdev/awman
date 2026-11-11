@@ -1,4 +1,4 @@
-//! Isolation for the retained inline harnesses while their sandbox migration completes.
+//! Private roots and credential isolation for every runner invocation.
 use anyhow::{ensure, Context, Result};
 use std::{
     collections::BTreeMap,
@@ -24,6 +24,17 @@ fn snapshot(root: &Path) -> Result<Snapshot> {
     let mut out = BTreeMap::new();
     walk(root, &mut out)?;
     Ok(out)
+}
+
+// Protect application state and Git configuration. The rest of the operator's
+// home belongs to unrelated applications (including the editor running tests).
+// Observing their logs, caches or databases cannot establish a test leak.
+fn protected_snapshot(home: &Path) -> Result<Snapshot> {
+    let mut result = Snapshot::new();
+    for relative in [".awman", ".gitconfig", ".config/git"] {
+        result.extend(snapshot(&home.join(relative))?);
+    }
+    Ok(result)
 }
 
 fn inherited_input(name: &str) -> bool {
@@ -75,7 +86,7 @@ impl Run {
         Self::for_home(home)
     }
     fn for_home(home: PathBuf) -> Result<Self> {
-        let before = snapshot(&home)?;
+        let before = protected_snapshot(&home)?;
         let root = tempfile::Builder::new().prefix("awman-run-").tempdir_in(
             std::env::var_os("AWMAN_TEST_TMPROOT")
                 .map(PathBuf::from)
@@ -135,7 +146,7 @@ impl Run {
     }
     pub fn finish(self) -> Result<()> {
         let leaks = cleanup_owned_processes(self.root.path());
-        let after = snapshot(&self.home)?;
+        let after = protected_snapshot(&self.home)?;
         let changed: std::collections::BTreeSet<_> = self
             .before
             .keys()
@@ -224,6 +235,26 @@ mod tests {
         assert_ne!(before, snapshot(d.path()).unwrap());
     }
     #[test]
+    fn unrelated_editor_writes_do_not_mask_or_create_application_leaks() {
+        let home = tempfile::tempdir().unwrap();
+        let run = Run::for_home(home.path().to_owned()).unwrap();
+        std::fs::create_dir(home.path().join(".editor")).unwrap();
+        std::fs::write(home.path().join(".editor/session.log"), "activity").unwrap();
+        run.finish().unwrap();
+
+        for path in [".gitconfig", ".awman/config.json", ".config/git/config"] {
+            let run = Run::for_home(home.path().to_owned()).unwrap();
+            let target = home.path().join(path);
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            std::fs::write(target, "test leaked into operator state").unwrap();
+            assert!(run
+                .finish()
+                .unwrap_err()
+                .to_string()
+                .contains("HOME canary"));
+        }
+    }
+    #[test]
     fn isolation_preserves_manifest_resource_inputs_and_ci_but_not_host_credentials() {
         let manifest = crate::manifest::load(&crate::gates::root()).unwrap();
         for key in [
@@ -256,6 +287,7 @@ mod tests {
     }
 
     #[test]
+    /// hygiene-allow(H2): Inspects a Command environment without executing it.
     fn child_environment_uses_private_roots_and_retains_toolchain_paths() {
         let home = tempfile::tempdir().unwrap();
         let run = Run::for_home(home.path().to_owned()).unwrap();
@@ -278,6 +310,7 @@ mod tests {
     }
     #[cfg(target_os = "linux")]
     #[test]
+    /// hygiene-allow(H2): Seeds an owned leaked child to test the runner's external sweep; explicitly reaps it even on assertion failure.
     fn run_sweep_reaps_only_its_own_leaked_child() {
         let home = tempfile::tempdir().unwrap();
         let run = Run::for_home(home.path().to_owned()).unwrap();

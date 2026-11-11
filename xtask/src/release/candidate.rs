@@ -124,7 +124,7 @@ fn now() -> DateTime<Utc> {
     Utc::now()
 }
 
-/// `version = "…"` of the workspace package, as `scripts/release.sh` reads it.
+/// `version = "…"` of the workspace package, as the release operator reads it.
 pub fn cargo_version(src: &Path) -> Result<String> {
     let text = std::fs::read_to_string(src.join("Cargo.toml")).context("reading Cargo.toml")?;
     text.lines()
@@ -134,7 +134,7 @@ pub fn cargo_version(src: &Path) -> Result<String> {
         .context("Cargo.toml has no version")
 }
 
-/// The notes placeholder `scripts/release.sh` writes into a new notes file.
+/// The notes placeholder the release operator writes into a new notes file.
 pub const NOTES_PLACEHOLDER: &str = "_Write release notes here._";
 
 // ── preflight ────────────────────────────────────────────────────────────────

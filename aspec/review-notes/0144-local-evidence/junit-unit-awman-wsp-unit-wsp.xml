@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="nextest-run" tests="1" skipped="0" failures="0" errors="0" uuid="97eee9e6-e1c9-4e70-85fa-a2cb4946597c" timestamp="2026-11-11T21:21:37.885+00:00" time="0.035">
+    <testsuite name="awman-wsp" tests="1" skipped="0" errors="0" failures="0">
+        <testcase name="mock::state_model::lease_state_model_exclusive_claim_expiry_completion_and_stale_epoch" classname="awman-wsp" timestamp="2026-11-11T21:21:37.886+00:00" time="0.033"/>
+    </testsuite>
+</testsuites>

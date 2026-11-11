@@ -120,28 +120,3 @@ fn copy(_: &Path, _: &Path) -> std::io::Result<()> {
         "secure Git metadata copying is unsupported on this platform",
     ))
 }
-
-#[cfg(all(test, unix))]
-mod tests {
-    use super::*;
-    #[test]
-    fn source_links_and_destination_links_cannot_escape_the_metadata_tree() {
-        use std::os::unix::fs::symlink;
-        let temp = tempfile::tempdir().unwrap();
-        let source = temp.path().join("source");
-        let dest = temp.path().join("dest");
-        std::fs::create_dir(&source).unwrap();
-        std::fs::create_dir(&dest).unwrap();
-        std::fs::write(source.join("ref"), "new").unwrap();
-        std::fs::write(temp.path().join("outside"), "untouched").unwrap();
-        symlink(temp.path().join("outside"), dest.join("ref")).unwrap();
-        assert!(GitMetadataCopy::copy(&source, &dest).is_err());
-        assert_eq!(
-            std::fs::read_to_string(temp.path().join("outside")).unwrap(),
-            "untouched"
-        );
-        std::fs::remove_file(dest.join("ref")).unwrap();
-        symlink(temp.path().join("outside"), source.join("link")).unwrap();
-        assert!(GitMetadataCopy::copy(&source, &dest).is_err());
-    }
-}

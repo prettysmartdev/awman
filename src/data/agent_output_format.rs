@@ -44,30 +44,3 @@ impl std::fmt::Display for AgentOutputFormat {
         f.write_str(self.as_str())
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn wire_spelling_round_trips_and_defaults_to_text() {
-        for (format, wire) in [
-            (AgentOutputFormat::Text, "\"text\""),
-            (
-                AgentOutputFormat::ClaudeStreamJson,
-                "\"claude_stream_json\"",
-            ),
-            (AgentOutputFormat::CodexJson, "\"codex_json\""),
-        ] {
-            assert_eq!(serde_json::to_string(&format).unwrap(), wire);
-            assert_eq!(
-                serde_json::from_str::<AgentOutputFormat>(wire).unwrap(),
-                format
-            );
-            assert_eq!(format!("\"{format}\""), wire);
-        }
-        assert_eq!(AgentOutputFormat::default(), AgentOutputFormat::Text);
-        assert!(!AgentOutputFormat::Text.is_structured());
-        assert!(AgentOutputFormat::ClaudeStreamJson.is_structured());
-    }
-}

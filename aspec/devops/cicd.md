@@ -1,8 +1,6 @@
 # Continuous Integration and Deployment
 
-WI 0144 remains an incomplete shadow migration. Static checks passing do not
-certify a working production evidence chain or complete legacy replacement;
-see [replacement-ledger.md](replacement-ledger.md) for code blockers and cutover.
+The manifest test system is the only supported path. See [replacement-ledger.md](replacement-ledger.md) for coverage decisions and evidence. Native Apple Silicon acceptance remains open until the maintainer's packet is independently reviewed.
 
 Platform: GitHub Actions
 
@@ -80,8 +78,6 @@ reported as passed because it was skipped.
 | `nightly.yml` (generated) | daily schedule, `workflow_dispatch` | the `nightly` gate and its modes |
 | `candidate.yml` | `workflow_dispatch` or `workflow_call` from `main` only | build once, validate those exact bytes, hand off to promotion |
 | `promote.yml` | called by `candidate.yml` | tag, publish the validated draft, verify the published bytes |
-| `test.yml` | pull request, push to `main` | status shim keeping the legacy required check names alive until the required check is `gate` |
-| `release.yml` | `v[0-9]+.[0-9]+.[0-9]+` tag push | the legacy tag-driven release, kept as the fallback until the pipeline is activated (see [release.md](release.md)) |
 
 ### `ci.yml` job graph
 
@@ -129,16 +125,6 @@ reported as passed because it was skipped.
 - `ci-trends`: p50/p95 per gate, queue time, flake rate and cache hit rate
   from the last 30 days of `timing-*` artifacts.
 
-### `test.yml` (status shim)
-
-Four jobs keep the legacy required check names until the required check is
-switched to `gate`: `fast` (`make check`, `make test`, `make legacy-test`),
-`full-linux-docker` (`make test-boundary` with the runner's Docker, and
-`make legacy-test LEGACY_DOCKER=1`), `web` (`make test-web`) and `build-macos`
-(`make architecture-lint` and a release build). They call the same Make targets
-as a developer and contain no logic of their own. The file and its
-`[[legacy_fallback]]` row are deleted at cutover.
-
 ## Pinned inputs
 
 - Toolchain: `rust-toolchain.toml` (1.94.0), repeated per platform in the manifest.
@@ -167,7 +153,6 @@ as a developer and contain no logic of their own. The file and its
 | hosted `ubuntu-24.04`, `ubuntu-24.04-arm`, `macos-15`, `windows-2025` | every hosted cell | GitHub |
 | `self-hosted, macOS, ARM64, awman-ci-guest` | the `guest` and Apple boundary cells of `main` and `nightly` | a long-lived CI Mac |
 | `self-hosted, macOS, ARM64, awman-release` | `candidate.yml` and the verify job of `promote.yml` | `make release`, for one release, or an already-online release runner |
-| `self-hosted, macOS, ARM64, hypervisor` | legacy `release.yml` only | the legacy runner script |
 
 The label sets are disjoint, so a CI job cannot take the release runner.
 
@@ -197,8 +182,7 @@ The required status for `main` is the single check `gate` from `ci.yml`, with
 the merge queue enabled; `ci.yml` triggers on `merge_group`. `main` may not be
 force-pushed or deleted, and creation, update and deletion of `v*` tags is
 restricted to the release promotion identity. The expected values are recorded in
-`ci/branch-protection.expected.json`. Until the cutover switches the required
-check from the four legacy `test.yml` contexts to `gate`, both run.
+`ci/branch-protection.expected.json`. The repository must require `gate`; deleted workflow names are not valid required statuses.
 
 `gates check` cannot read repository settings. Settings that must be applied by
 a maintainer and confirmed against the repository:
@@ -217,7 +201,7 @@ a maintainer and confirmed against the repository:
 
 - Semantic versioning. Major version bumps reserved for incompatible CLI or on-disk format changes.
 - The `Cargo.toml` `version` is the source of truth. The release tag is `v<Cargo version>`.
-- Release tags are plain `vX.Y.Z`. Pre-release suffixes (`v1.2.3-rc1`) are not supported: both `release.yml` and the release operator refuse any other version.
+- Release tags are plain `vX.Y.Z`. Pre-release suffixes (`v1.2.3-rc1`) are not supported: the release operator refuse any other version.
 - `docs/releases/v<version>.md` MUST exist before a release starts. The release workflow publishes it as the GitHub Release body.
 
 ## Publishing
@@ -236,8 +220,7 @@ a maintainer and confirmed against the repository:
 
 ## Required gates before merge
 
-- The `gate` check from `ci.yml` passes (and, until cutover, the legacy
-  `test.yml` checks). It covers lint, hygiene, `unit` and `component` on Linux,
+- The `gate` check from `ci.yml` passes . It covers lint, hygiene, `unit` and `component` on Linux,
   macOS and Windows, the Docker `boundary` tier and the static build smoke.
 - `make architecture-lint` is clean (enforced by the `lint` job).
 
@@ -250,17 +233,8 @@ your host, both backends, with the same pinned runner and profile CI uses). The
 [localdev.md](localdev.md). A CI failure is reproduced from its failure record,
 see [testing.md](testing.md#reproducing-a-ci-failure).
 
-## Known limitations and open work
+## Evidence limits
 
-- The generated workflows and the release pipeline have not yet run on GitHub.
-  Hardware cells depend on the CI guest Mac, and the pinned guest fixture and
-  previous-release digests are still `pending` in `ci/gates.toml`; until they are
-  published, the guest and artifact tiers report `BLOCKED` rather than pass. The
-  acceptance matrix ([acceptance-matrix.md](acceptance-matrix.md)) lists every
-  cell that is still blocked and its owner.
-- Some older integration targets remain until their replacements have shadow
-  evidence; they run through `make legacy-test` and are listed with their removal
-  conditions as `[[legacy_fallback]]` rows ([replacement-ledger.md](replacement-ledger.md)).
-- Coverage and mutation results are diagnostic; they do not block a gate.
-- `cargo deny check advisories` runs nightly and is expected to report current
-  advisories in the dependency tree until the lockfile is updated.
+Native Apple Silicon acceptance remains open in WI144. The maintainer runs `make validate-native` and returns its packet for independent review. No hosted-Mac compilation or Linux pass is native runtime proof. The global guest fixture remains pending until the reviewed archive is published and pinned. Required native gates stay blocked without those inputs and admitted hardware.
+
+Coverage and mutation results are diagnostics. Performance reports must distinguish cold builds, warm runs and queue time; a single run does not establish p95 or a flake rate. Dependency advisories are reviewed separately from the licenses, bans and sources gate.

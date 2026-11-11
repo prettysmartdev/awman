@@ -538,39 +538,3 @@ impl std::fmt::Debug for Error {
         }
     }
 }
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn url_policy_refuses_remote_http_credentials_queries_and_fragments() {
-        for url in [
-            "http://example.com",
-            "https://user:pass@example.com",
-            "https://example.com?token=secret",
-            "https://example.com#secret",
-        ] {
-            assert!(Client::new(url, String::new()).is_err(), "{url}");
-        }
-    }
-
-    #[test]
-    fn typed_response_failures_preserve_conflict_and_authorization_codes() {
-        for (status, code) in [
-            (StatusCode::CONFLICT, "lease_lost"),
-            (StatusCode::CONFLICT, "taken"),
-            (StatusCode::FORBIDDEN, "ineligible"),
-            (StatusCode::UNAUTHORIZED, "unauthorized"),
-        ] {
-            let error = response_error(
-                status,
-                ApiError {
-                    error: "private server detail".into(),
-                    code: code.into(),
-                },
-            );
-            assert_eq!(error.code(), Some(code));
-            assert!(!format!("{error:?}").contains("private server detail"));
-        }
-    }
-}

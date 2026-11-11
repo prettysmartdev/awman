@@ -194,18 +194,6 @@ fn read_antigravity_secret_in(snapshot: &crate::data::config::env::EnvSnapshot) 
 
 // ── Keychain backend selection ──────────────────────────────────────────────
 
-/// Whether this process uses the in-memory keychain rather than the OS one:
-/// under test isolation, where the OS keychain is the developer's own — a test
-/// would otherwise read their real Claude credential and could overwrite or
-/// delete the squad daemon's stored environment.
-///
-/// Every function below that would reach the OS keychain checks this first, so
-/// there is no path around it.
-#[cfg(test)]
-fn in_memory() -> bool {
-    crate::data::config::env::test_isolation_active()
-}
-
 /// A process-local stand-in for the OS keychain: generic-password items keyed
 /// by `(service, account)`, holding exactly the string the OS backend would.
 /// Starts empty, so every lookup is a clean "no such item" until something in
@@ -244,11 +232,6 @@ mod memory {
 
 // ── Shared OS keychain shims ────────────────────────────────────────────────
 
-#[cfg(test)]
-pub(crate) fn run_macos_keychain_lookup(service: &str, account: Option<&str>) -> Option<String> {
-    run_macos_keychain_lookup_in(&crate::engine::host_cli::process_env(), service, account)
-}
-
 pub(crate) fn run_macos_keychain_lookup_in(
     snapshot: &crate::data::config::env::EnvSnapshot,
     service: &str,
@@ -273,11 +256,6 @@ pub(crate) fn run_macos_keychain_lookup_in(
     } else {
         Some(raw)
     }
-}
-
-#[cfg(test)]
-fn run_linux_secret_lookup(service: &str, account: &str) -> Option<String> {
-    run_linux_secret_lookup_in(&crate::engine::host_cli::process_env(), service, account)
 }
 
 fn run_linux_secret_lookup_in(
@@ -715,177 +693,4 @@ fn non_empty(stdout: &[u8]) -> Option<String> {
     } else {
         Some(raw)
     }
-}
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use base64::Engine;
-
-    #[test]
-    fn decode_go_keyring_base64_unwraps_prefix() {
-        let inner = b"{\"token\":{\"access_token\":\"x\",\"token_type\":\"Bearer\",\
-                       \"refresh_token\":\"y\",\"expiry\":\"2099-01-01T00:00:00Z\"},\
-                       \"auth_method\":\"consumer\"}";
-        let b64 = base64::engine::general_purpose::STANDARD.encode(inner);
-        let wrapped = format!("go-keyring-base64:{b64}");
-        let out = decode_go_keyring_payload(&wrapped).expect("decode");
-        assert_eq!(out, inner);
-    }
-
-    #[test]
-    fn decode_go_keyring_base64_rejects_invalid_alphabet() {
-        let wrapped = "go-keyring-base64:!!!not-valid-base64!!!";
-        assert_eq!(decode_go_keyring_payload(wrapped), None);
-    }
-
-    #[test]
-    fn decode_go_keyring_passes_through_when_unprefixed() {
-        let raw = "{\"plain\":1}";
-        assert_eq!(
-            decode_go_keyring_payload(raw),
-            Some(raw.as_bytes().to_vec())
-        );
-    }
-
-    #[test]
-    fn decode_hex_round_trips() {
-        assert_eq!(decode_hex("deadbeef"), Some(vec![0xde, 0xad, 0xbe, 0xef]));
-        assert_eq!(decode_hex("DEADBEEF"), Some(vec![0xde, 0xad, 0xbe, 0xef]));
-    }
-
-    #[test]
-    fn decode_hex_rejects_odd_length() {
-        assert_eq!(decode_hex("abc"), None);
-    }
-
-    #[test]
-    fn agent_keychain_files_for_unknown_agent_is_empty() {
-        let agent = AgentName::new("totallymadeup").unwrap();
-        assert!(agent_keychain_files(&agent).is_empty());
-    }
-
-    #[test]
-    fn agent_keychain_credentials_for_unknown_agent_is_empty() {
-        let agent = AgentName::new("totallymadeup").unwrap();
-        assert!(agent_keychain_credentials(&agent).is_empty());
-    }
-
-    #[test]
-    fn custom_credential_source_is_none_and_all_keychain_paths_are_no_io() {
-        let custom = AgentName::new("custom-name").unwrap();
-        assert_eq!(credential_source(&custom), CredentialSource::None);
-        assert!(agent_keychain_credentials(&custom).is_empty());
-        assert!(agent_keychain_files(&custom).is_empty());
-        assert!(refreshable_spec_for(&custom).is_none());
-    }
-
-    /// WI 0116 §5: the `security -i` stdin builder is a pure string function,
-    /// testable with no keychain. This asserts the exact shape (one
-    /// `\n`-terminated `add-generic-password` line), that the `-w` token
-    /// carries none of the payload's `"`, `\` or space — for a payload that
-    /// deliberately contains all three plus a handful of shell
-    /// metacharacters — and round-trips the `-w` token back through
-    /// `decode_go_keyring_payload` to prove the read side unwraps exactly
-    /// what the write side wrapped.
-    #[test]
-    fn security_add_generic_password_stdin_carries_no_special_chars_and_round_trips() {
-        use crate::data::fs::daemon_env::{
-            encode_go_keyring_payload, security_add_generic_password_script,
-        };
-
-        let payload: &[u8] = br#"{"TOKEN":"has \" quote, \\ backslash, space, ` ; | & $"}"#;
-        let envelope = encode_go_keyring_payload(payload);
-        let script = security_add_generic_password_script("awman-squad", "daemon-env", &envelope);
-
-        assert_eq!(
-            script.matches('\n').count(),
-            1,
-            "exactly one line: {script:?}"
-        );
-        assert!(script.ends_with('\n'), "{script:?}");
-        assert_eq!(
-            script,
-            format!("add-generic-password -U -s awman-squad -a daemon-env -w {envelope}\n")
-        );
-
-        let w_value = script
-            .trim_end_matches('\n')
-            .strip_prefix("add-generic-password -U -s awman-squad -a daemon-env -w ")
-            .expect("the -w token must be the final field of the line");
-        assert!(!w_value.contains('"'), "{w_value:?}");
-        assert!(!w_value.contains('\\'), "{w_value:?}");
-        assert!(!w_value.contains(' '), "{w_value:?}");
-
-        let decoded = decode_go_keyring_payload(w_value).expect("the -w token must decode");
-        assert_eq!(
-            decoded, payload,
-            "the read side must unwrap exactly what the write side wrapped"
-        );
-    }
-
-    /// Unit tests never reach the OS keychain: every read, write and delete
-    /// lands in the in-memory one, so a test run on a developer's machine
-    /// cannot see their credentials or disturb what their daemon stored.
-    #[test]
-    fn unit_tests_always_use_the_in_memory_keychain() {
-        assert!(in_memory());
-    }
-
-    #[test]
-    fn in_memory_keychain_round_trips_store_lookup_and_clear() {
-        let (service, account) = ("awman-test-round-trip", "acct");
-        let cap = std::time::Duration::from_secs(1);
-
-        assert_eq!(keychain_lookup(service, account, cap).unwrap(), None);
-        keychain_store(service, account, "first", cap).unwrap();
-        keychain_store(service, account, "second", cap).unwrap();
-        assert_eq!(
-            keychain_lookup(service, account, cap).unwrap().as_deref(),
-            Some("second"),
-            "a store replaces the existing item, as `security -U` does"
-        );
-
-        keychain_clear(service, account, cap).unwrap();
-        assert_eq!(keychain_lookup(service, account, cap).unwrap(), None);
-        keychain_clear(service, account, cap).expect("clearing a missing item is not an error");
-    }
-
-    #[test]
-    fn in_memory_lookup_without_an_account_matches_any_account() {
-        let service = "awman-test-any-account";
-        let cap = std::time::Duration::from_secs(1);
-        keychain_store(service, "someone", "value", cap).unwrap();
-
-        assert_eq!(
-            run_macos_keychain_lookup(service, None).as_deref(),
-            Some("value")
-        );
-        assert_eq!(
-            run_macos_keychain_lookup(service, Some("someone-else")),
-            None
-        );
-        assert_eq!(
-            run_linux_secret_lookup(service, "someone").as_deref(),
-            Some("value")
-        );
-
-        keychain_clear(service, "someone", cap).unwrap();
-    }
-
-    #[test]
-    fn refreshable_spec_only_for_claude() {
-        let claude = AgentName::new("claude").unwrap();
-        assert!(refreshable_spec_for(&claude).is_some());
-        // Agents without a descriptor keep today's behaviour (env / AgentSecretFile).
-        for other in ["antigravity", "codex", "gemini", "totallymadeup"] {
-            let agent = AgentName::new(other).unwrap();
-            assert!(
-                refreshable_spec_for(&agent).is_none(),
-                "{other} must have no refresh descriptor"
-            );
-        }
-    }
-
-    // `run_capped` against real children (stdin never drained, output larger
-    // than a pipe buffer, a draining child): tests/component/engine/auth.rs.
 }

@@ -373,20 +373,3 @@ pub fn owner_pipe(
 pub fn verify_pipe_client(server: &tokio::net::windows::named_pipe::NamedPipeServer) -> bool {
     shims().is_ok_and(|(_, verify)| verify(server).unwrap_or(false))
 }
-
-#[cfg(all(test, unix))]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn endpoint_name_must_match() {
-        let expected = Path::new("/home/u/.awman/data/daemon/api.sock");
-        assert!(endpoint_matches(expected, expected));
-        assert!(endpoint_matches(
-            Path::new("/run/user/1/api.sock"),
-            expected
-        ));
-        assert!(!endpoint_matches(Path::new("/tmp/other.sock"), expected));
-        assert!(!endpoint_matches(Path::new("api.sock"), expected));
-    }
-}

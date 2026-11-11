@@ -151,6 +151,3 @@ impl PathRendering {
         }
     }
 }
-
-#[cfg(test)]
-mod tests;

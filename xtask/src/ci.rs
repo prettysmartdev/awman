@@ -13,7 +13,7 @@ mod digest;
 mod flake;
 mod lint_notice;
 mod lint_shell;
-mod plan_outputs;
+pub(crate) mod plan_outputs;
 mod preflight;
 mod seeded;
 mod summary;

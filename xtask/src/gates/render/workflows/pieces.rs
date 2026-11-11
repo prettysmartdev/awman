@@ -1,6 +1,6 @@
 //! Shared pieces of the rendered workflows: the action pins and the few YAML
 //! fragments that every job repeats. Pins are the ones already reviewed in the
-//! legacy workflows; `actions/cache/{restore,save}` live in the same repository
+//! the reviewed workflow producers; `actions/cache/{restore,save}` live in the same repository
 //! and commit as `actions/cache`, so they reuse its pin.
 
 pub const CHECKOUT: &str = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1";

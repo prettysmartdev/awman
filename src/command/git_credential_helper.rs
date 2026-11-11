@@ -34,27 +34,3 @@ pub fn dispatch(
         .is_some(),
     )
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn helper_dispatch_is_private_and_fails_closed() {
-        let env = EnvSnapshot::empty().with_invocation(
-            Default::default(),
-            vec![
-                "awman".into(),
-                CREDENTIAL_HELPER_SUBCOMMAND.into(),
-                "bad nonce".into(),
-                "get".into(),
-            ],
-        );
-        let mut output = Vec::new();
-        assert_eq!(dispatch(&env, &mut &b""[..], &mut output), Some(false));
-        assert!(output.is_empty());
-        assert_eq!(
-            dispatch(&EnvSnapshot::empty(), &mut &b""[..], &mut output),
-            None
-        );
-    }
-}

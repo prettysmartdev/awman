@@ -9,7 +9,7 @@ pub fn protection(m: &Manifest) -> Result<String> {
     Ok(format!(
         "{}\n",
         serde_json::to_string_pretty(
-            &serde_json::json!({"schema":1,"required_checks":[m.gates["pr"].required_check],"merge_queue":true,"main_force_push":false,"main_deletion":false,"settings_verified":false,"pending_cutover":"P2: query actual repository protection before switching legacy statuses"})
+            &serde_json::json!({"schema":1,"required_checks":[m.gates["pr"].required_check],"merge_queue":true,"main_force_push":false,"main_deletion":false,"settings_verified":false,"verification":"Expected policy only; query live repository rules before release admission"})
         )?
     ))
 }

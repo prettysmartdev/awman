@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="nextest-run" tests="9" skipped="0" failures="0" errors="0" uuid="fa6a6d40-bcd2-4d63-81b2-d7952c492d49" timestamp="2026-11-11T21:21:19.804+00:00" time="3.295">
+    <testsuite name="awman-cli::component" tests="9" skipped="0" errors="0" failures="0">
+        <testcase name="daemon::api::network_visibility_hides_unserved_features_and_malformed_routes_are_bounded" classname="awman-cli::component" timestamp="2026-11-11T21:21:19.807+00:00" time="1.022"/>
+        <testcase name="daemon::browser::browser_origin_never_authorizes_api_keys_or_caller_selected_scope" classname="awman-cli::component" timestamp="2026-11-11T21:21:19.807+00:00" time="1.050"/>
+        <testcase name="daemon::api::network_auth_is_required_keys_are_owner_only_and_revocation_is_immediate" classname="awman-cli::component" timestamp="2026-11-11T21:21:19.807+00:00" time="1.067"/>
+        <testcase name="daemon::browser::browser_pairing_is_one_use_origin_bound_and_owner_revocable" classname="awman-cli::component" timestamp="2026-11-11T21:21:19.807+00:00" time="1.135"/>
+        <testcase name="daemon::browser::removing_an_origin_ends_grant_watchers_and_pending_links_before_reload_returns" classname="awman-cli::component" timestamp="2026-11-11T21:21:20.830+00:00" time="1.012"/>
+        <testcase name="daemon::local_security::owner_endpoint_is_private_and_tampered_metadata_cannot_redirect_clients" classname="awman-cli::component" timestamp="2026-11-11T21:21:20.876+00:00" time="1.043"/>
+        <testcase name="daemon::reload::daemon_status_and_stop_keep_their_cli_and_json_contracts" classname="awman-cli::component" timestamp="2026-11-11T21:21:20.944+00:00" time="1.328"/>
+        <testcase name="daemon::lifecycle::regression_585680c3_f23e75a4_9eac9cda_two_ready_daemons_have_distinct_state" classname="awman-cli::component" timestamp="2026-11-11T21:21:20.859+00:00" time="2.010"/>
+        <testcase name="daemon::reload::reload_switches_admission_without_restarting_and_invalid_changes_are_atomic" classname="awman-cli::component" timestamp="2026-11-11T21:21:21.843+00:00" time="1.257"/>
+    </testsuite>
+</testsuites>

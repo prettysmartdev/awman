@@ -450,26 +450,3 @@ fn forward_attach_input(
     }
     writer.send(bytes.to_vec()).is_ok()
 }
-
-#[cfg(test)]
-mod attach_input_tests {
-    use super::*;
-    #[tokio::test]
-    async fn attach_ctrl_c_detaches_local_live_stub_without_forwarding_sigint() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let cancel = tokio_util::sync::CancellationToken::new();
-        assert!(forward_attach_input(&tx, b"hello", Some(&cancel)));
-        assert_eq!(rx.recv().await.unwrap(), b"hello");
-        assert!(!forward_attach_input(&tx, &[3], Some(&cancel)));
-        assert!(cancel.is_cancelled());
-        assert!(
-            rx.try_recv().is_err(),
-            "the target must never receive Ctrl-C"
-        );
-        assert!(
-            forward_attach_input(&tx, &[3], None),
-            "chat preserves Ctrl-C"
-        );
-        assert_eq!(rx.recv().await.unwrap(), [3]);
-    }
-}

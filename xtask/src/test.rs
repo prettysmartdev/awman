@@ -453,10 +453,65 @@ fn run_suites(root: &Path, o: &Options) -> Result<ExitCode> {
         if let Some(dir) = &o.evidence_dir {
             command.env(&m.test_env["evidence"], dir);
         }
+        let expected = if let Some(dir) = o
+            .evidence_dir
+            .as_ref()
+            .filter(|_| o.runner == Runner::Nextest)
+        {
+            let mut listing = Command::new(command.get_program());
+            listing.env_clear();
+            listing.current_dir(root);
+            for (key, value) in command.get_envs() {
+                if let Some(value) = value {
+                    listing.env(key, value);
+                } else {
+                    listing.env_remove(key);
+                }
+            }
+            let mut skip_value = false;
+            for arg in command.get_args() {
+                if skip_value {
+                    skip_value = false;
+                    continue;
+                }
+                if arg == "--no-tests" {
+                    skip_value = true;
+                    continue;
+                }
+                if arg == "--no-fail-fast" {
+                    continue;
+                }
+                listing.arg(if arg == "run" {
+                    std::ffi::OsStr::new("list")
+                } else {
+                    arg
+                });
+            }
+            listing.args(["--message-format", "json"]);
+            let result = listing
+                .output()
+                .context("enumerate selected tests before execution")?;
+            ensure!(
+                result.status.success(),
+                "test inventory failed: {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            let file = dir.join(format!("expected-{}.json", inv.suites.join("-")));
+            std::fs::write(&file, &result.stdout)?;
+            Some(file.file_name().unwrap().to_string_lossy().into_owned())
+        } else {
+            None
+        };
+        // A failed startup must not copy a previous invocation's JUnit as evidence.
+        let junit = target_dir(root).join(format!("nextest/{PROFILE}/junit.xml"));
+        if o.evidence_dir.is_some() && junit.exists() {
+            std::fs::remove_file(&junit)?;
+        }
         let code = execute(&mut command)?;
         records.push(serde_json::json!({
             "tier": inv.tier, "package": inv.package, "suites": inv.suites,
             "command": describe(&command), "exit": code,
+            "expected": expected,
         }));
         if let (Some(dir), Runner::Nextest) = (&o.evidence_dir, o.runner) {
             let junit = target_dir(root).join(format!("nextest/{PROFILE}/junit.xml"));
@@ -510,6 +565,13 @@ fn run_suites(root: &Path, o: &Options) -> Result<ExitCode> {
             "schema": 1, "build": build_id, "runner": format!("{:?}", o.runner).to_lowercase(),
             "shard": o.shard, "shuffle_seed": o.shuffle_seed, "manifest_version": m.version(),
             "invocations": records, "failed_suites": failed,
+            "host_target": host_triple()?,
+            "source": crate::evidence::actions::source(root)?,
+            "producer": {
+                "run_id": std::env::var("GITHUB_RUN_ID").ok(),
+                "attempt": std::env::var("GITHUB_RUN_ATTEMPT").ok(),
+                "job": std::env::var("GITHUB_JOB").ok(),
+            },
         });
         std::fs::write(dir.join("run.json"), serde_json::to_vec_pretty(&run)?)?;
     }

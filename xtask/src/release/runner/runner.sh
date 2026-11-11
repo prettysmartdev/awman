@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# tools/release-runner.sh — a temporary GitHub Actions runner for one release.
+# xtask release runner — a temporary GitHub Actions runner for one release.
 #
 # The candidate/promote chain needs an Apple Silicon Mac with
 # Hypervisor.framework (labels: self-hosted, macOS, ARM64, awman-release).
@@ -7,27 +7,24 @@
 # on as a runner for the length of the release and removes it afterwards.
 #
 # Usage:
-#   tools/release-runner.sh check [--hardware]  # can this host serve the release job?
-#   tools/release-runner.sh provision           # install the /opt/awman release scripts
-#   tools/release-runner.sh busy <repo>         # print online runners that already can
-#   tools/release-runner.sh verify-archive      # download and checksum-check the runner
-#   tools/release-runner.sh up <repo> <tag>     # download, register and start a runner
-#   tools/release-runner.sh down                # stop and deregister it (idempotent)
+#   xtask release runner check [--hardware]  # can this host serve the release job?
+#   xtask release runner provision           # fetch and verify manifest fixtures
+#   xtask release runner busy <repo>         # print online runners that already can
+#   xtask release runner verify-archive      # download and checksum-check the runner
+#   xtask release runner up <repo> <tag>     # download, register and start a runner
+#   xtask release runner down                # stop and deregister it (idempotent)
 #
 # State lives in $AWMAN_RELEASE_RUNNER_HOME (default ~/.awman/release-runner):
 # a cached, checksum-verified runner archive, the cached guest fixture and the
-# directory of the one runner currently registered. `provision` is the only
-# command that writes outside it: the release job's wrappers in /opt/awman.
+# directory of the one runner currently registered. Fixtures stay inside it.
 
 set -euo pipefail
 umask 077
 
-ROOT=$(cd "$(dirname "$0")/../../../.." && pwd -P)
 RUNNER_HOME="${AWMAN_RELEASE_RUNNER_HOME:-$HOME/.awman/release-runner}"
 mkdir -p "$RUNNER_HOME"
 RUNNER_HOME=$(cd "$RUNNER_HOME" && pwd -P)
 export AWMAN_RELEASE_RUNNER_HOME="$RUNNER_HOME"
-OPT_DIR="${AWMAN_RELEASE_OPT_DIR:-/opt/awman}"
 # The job's state directories hold Unix sockets, whose paths macOS caps at
 # 103 bytes, so jobs run under a short work directory rather than RUNNER_HOME.
 WORK_DIR="${AWMAN_RELEASE_RUNNER_WORK:-/tmp/awr}"
@@ -35,7 +32,6 @@ ONLINE_TIMEOUT="${AWMAN_RELEASE_RUNNER_ONLINE_TIMEOUT:-120}"
 STATE="$RUNNER_HOME/state"
 RUN_DIR="$RUNNER_HOME/run"
 LABEL=awman-release
-MARKER="Provisioned by tools/release-runner.sh"
 
 say() { echo "  $*"; }
 die() { echo "release-runner: $*" >&2; exit 1; }
@@ -53,9 +49,7 @@ cmd_check() {
   [ "$(uname -s)" = Darwin ] && [ "$(uname -m)" = arm64 ] || missing+=("an Apple Silicon Mac")
   [ "$(sysctl -n kern.hv_support 2>/dev/null || echo 0)" = 1 ] || missing+=("Hypervisor.framework (kern.hv_support=1)")
   if [ "${1:-}" != --hardware ]; then
-    [ -x "$OPT_DIR/release-offline-session.sh" ] || missing+=("$OPT_DIR/release-offline-session.sh")
-    [ -x "$OPT_DIR/release-workload.sh" ] || missing+=("$OPT_DIR/release-workload.sh")
-    [ -s "$OPT_DIR/fixture-oci.tar" ] || missing+=("$OPT_DIR/fixture-oci.tar")
+    cargo xtask fixtures verify --store "$RUNNER_HOME/fixtures" >/dev/null || missing+=("verified manifest fixtures (run provision)")
   fi
   if [ ${#missing[@]} -gt 0 ]; then
     printf 'missing: %s\n' "${missing[@]}" >&2
@@ -63,53 +57,13 @@ cmd_check() {
   fi
 }
 
-# Install one file into OPT_DIR when its content changed. A file there that
-# this script did not write is kept as <name>.bak rather than lost.
-install_opt() { # src name mode
-  local dest="$OPT_DIR/$2"
-  cmp -s "$1" "$dest" 2>/dev/null && return 0
-  if [ -f "$dest" ] && [ "$2" != fixture-oci.tar ] && ! grep -qF "$MARKER" "$dest"; then
-    mv "$dest" "$dest.bak"
-    say "Kept your existing $dest as $dest.bak"
-  fi
-  install -m "$3" "$1" "$dest"
-  say "Installed $dest"
-}
-
-# The release job runs both wrappers with a cleared environment (the session
-# one inside a sandbox that only lets listed binaries execute), so each is a
-# fixed command line: the repo's reference session script, copied here, with
-# the cached fixture's path baked in. The session script records guest RSS
-# when AWMAN_GUEST_RSS_OUTPUT is set, which is all the workload wrapper needs.
+# Prepare content-addressed fixtures in the runner-owned store. The pipeline
+# executes the manifest suites directly; no global wrappers or sudo are needed.
 cmd_provision() {
-  local fixture name
   cmd_check --hardware || die "this host cannot run the Apple Silicon release job"
-  mkdir -p "$RUNNER_HOME/fixtures"
-  cargo xtask fixtures fetch --fixture guest-oci-base --out "$RUNNER_HOME/fixtures" >&2 ||
-    die "could not fetch the pinned guest fixture; verify the manifest digest and registry access"
-  fixture="$RUNNER_HOME/fixtures/guest-oci-base.tar"
-  [ -s "$fixture" ] || die "pinned guest fixture is missing: $fixture"
-
-  if [ ! -d "$OPT_DIR" ] || [ ! -w "$OPT_DIR" ]; then
-    say "Creating $OPT_DIR for the release job's scripts (sudo, once)"
-    sudo install -d -m 755 "$OPT_DIR"
-    sudo chown "$(id -u):$(id -g)" "$OPT_DIR"
-  fi
-  mkdir -p "$OPT_DIR/lib"
-
-  # Not local: the EXIT trap removes it however provision ends.
-  stage=$(mktemp -d "${TMPDIR:-/tmp}/awman-provision.XXXXXX")
-  trap 'rm -rf "$stage"' EXIT
-  for name in release-offline-session release-workload; do
-    # generated wrappers expand their own arguments.
-    # shellcheck disable=SC2016
-    printf '#!/bin/bash\n# %s; re-run on every `make release`, so do not edit.\nexec /bin/bash %q --fixture %q "$@"\n' \
-      "$MARKER" "$OPT_DIR/lib/release-offline-session.sh" "$OPT_DIR/fixture-oci.tar" > "$stage/$name.sh"
-  done
-  install_opt "$ROOT/tools/release-offline-session.sh" lib/release-offline-session.sh 755
-  install_opt "$fixture" fixture-oci.tar 644
-  install_opt "$stage/release-offline-session.sh" release-offline-session.sh 755
-  install_opt "$stage/release-workload.sh" release-workload.sh 755
+  cargo xtask fixtures fetch --store "$RUNNER_HOME/fixtures" >&2 ||
+    die "could not fetch pinned fixtures; verify manifest digests and registry access"
+  cargo xtask fixtures verify --store "$RUNNER_HOME/fixtures" >&2
 }
 
 # Online runners in <repo> that carry the release-only label, excluding ours.

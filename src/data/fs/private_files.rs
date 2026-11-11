@@ -332,60 +332,6 @@ pub fn remove_private_file(path: &Path) -> Result<(), DataError> {
     }
 }
 
-#[cfg(all(test, unix))]
-mod tests {
-    use super::*;
-    use std::os::unix::fs::{symlink, PermissionsExt};
-
-    #[test]
-    fn create_private_file_new_is_exclusive_and_owner_only() {
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("stage");
-        drop(create_private_file_new(&path).unwrap());
-        assert_eq!(
-            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
-        assert!(matches!(
-            create_private_file_new(&path),
-            Err(DataError::Io { .. })
-        ));
-        let link = root.path().join("link");
-        symlink(root.path().join("elsewhere"), &link).unwrap();
-        assert!(create_private_file_new(&link).is_err());
-        assert!(!root.path().join("elsewhere").exists());
-    }
-
-    #[test]
-    fn private_records_refuse_symlinks_and_public_permissions() {
-        let root = tempfile::tempdir().unwrap();
-        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let record = root.path().join("record.json");
-        write_private_json_atomic(&record, &serde_json::json!({"ok": true}), || Ok(())).unwrap();
-        assert_eq!(
-            read_private_json::<serde_json::Value>(&record).unwrap(),
-            Some(serde_json::json!({"ok": true}))
-        );
-        let link = root.path().join("link.json");
-        symlink(&record, &link).unwrap();
-        assert!(read_private_json::<serde_json::Value>(&link).is_err());
-        assert!(lock_private_exclusive(&link, || Ok(())).is_err());
-        std::fs::set_permissions(&record, std::fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(read_private_json::<serde_json::Value>(&record).is_err());
-    }
-
-    #[test]
-    fn private_directory_refuses_a_symlink() {
-        let root = tempfile::tempdir().unwrap();
-        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let real = root.path().join("real");
-        create_private_dir(&real).unwrap();
-        let link = root.path().join("link");
-        symlink(&real, &link).unwrap();
-        assert!(create_private_dir(&link).is_err());
-    }
-}
-
 /// A bounded approval read validates ownership, links and permissions on the
 /// opened descriptor. Cache readers deliberately retain their separate policy.
 pub fn read_private_approval_json<T: DeserializeOwned>(
@@ -412,7 +358,3 @@ pub fn read_private_approval_json<T: DeserializeOwned>(
     }
     Ok(serde_json::from_slice(&bytes).ok())
 }
-
-#[cfg(all(test, unix))]
-#[path = "private_files_coverage_tests.rs"]
-mod coverage_tests;

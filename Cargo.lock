@@ -503,7 +503,6 @@ dependencies = [
  "anyhow",
  "arboard",
  "async-trait",
- "awman",
  "awman-test-support",
  "awman-wsp",
  "axum",
@@ -7699,6 +7698,7 @@ dependencies = [
  "sha2 0.11.1",
  "signal-hook",
  "syn 2.0.119",
+ "tar",
  "tempfile",
  "toml",
 ]

@@ -6,7 +6,11 @@ fn generic_registration_cannot_authorize_host_keychain_or_agent_names() {
     let parent = tempfile::tempdir().unwrap();
     for name in ["security", "pbcopy", "claude"] {
         let exe = parent.path().join(name);
-        std::fs::copy("/bin/true", &exe).unwrap();
+        // The supervisor must refuse the name before executing it. A fixture
+        // script avoids assumptions about GNU/BSD system executable locations.
+        std::fs::write(&exe, "#!/bin/sh\nexit 0\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
         let mut s = sandbox("security::registered_forbidden_tools");
         s.allow_tool(&exe);
         let text = expect_panic(|| {

@@ -1,5 +1,7 @@
 # Work Item: Task
 
+> Testing policy update (WI144): test commands, harness paths and test counts in this historical record are superseded by [the current testing contract](/aspec/devops/testing.md). Use manifest suites and `make validate-native` for native acceptance. Removed test sources and raw evidence bundles are available only in Git history; they must not be restored as test patterns.
+
 Title: Codebase simplicity, modularity, idiomatic Rust, duplication, and architecture conformance remediation
 Issue: Not linked
 Status: In progress — remediation integrated (2026-10-31) and the post-review gaps closed (2026-11-03, see "Post-review remediation"); all required Linux checks pass. Only the P1–P7 real-platform checks (macOS, Windows, Docker Desktop/Apple Containers, live terminals) remain, pending manual verification.

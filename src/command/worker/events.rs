@@ -4,61 +4,6 @@ use crate::data::execution_event::EventPayload;
 use crate::data::fs::api_command_log::CommandStateWriter;
 use crate::data::workflow_state::WorkflowState;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[tokio::test]
-    async fn foreground_structured_output_preserves_presentation_and_command_result() {
-        use crate::command::commands::api_server::event_bus::EventBus;
-        use crate::engine::agent_runtime::frontend::AgentIo;
-        let temp = tempfile::tempdir().unwrap();
-        let paths = crate::data::fs::api_paths::ApiPaths::from_root(temp.path());
-        let writer = CommandStateWriter::new(paths, "session", "command");
-        let bus = EventBus::new(100);
-        let recorder = ForegroundRecorder::new(bus.sender(), writer.clone(), true);
-        recorder
-            .output_format(crate::data::agent_output_format::AgentOutputFormat::ClaudeStreamJson);
-        let source = crate::data::execution_event::EventSource::step(
-            crate::data::execution_event::EventSourcePhase::Main,
-            "test-step",
-            1,
-        );
-        recorder.container_source(Some(std::sync::Arc::new(std::sync::Mutex::new(
-            source.clone(),
-        ))));
-        let (stdout, mut presented) = tokio::sync::mpsc::unbounded_channel();
-        let (stderr, _) = tokio::sync::mpsc::unbounded_channel();
-        let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel();
-        let io = recorder.io(AgentIo {
-            stdout,
-            stderr,
-            stdin_tx,
-            stdin_rx,
-            resize: None,
-            initial_size: None,
-        });
-        let mut events = bus.subscribe_ordered();
-        let bytes = format!("{}\n", serde_json::json!({"type":"result","subtype":"success","result":"Finished foreground work","padding":"x".repeat(150_000)})).into_bytes();
-        io.stdout.send(bytes.clone()).unwrap();
-        drop(io);
-        assert!(
-            bus.wait_output_drained(std::time::Duration::from_secs(2))
-                .await
-        );
-        assert_eq!(presented.recv().await.unwrap(), bytes);
-        assert_eq!(
-            writer.result_contributions().final_message.as_deref(),
-            Some("Finished foreground work")
-        );
-        let mut translated = Vec::new();
-        while let Ok(event) = events.try_recv() {
-            assert_eq!(event.source, Some(source.clone()));
-            translated.push(event.payload);
-        }
-        assert!(translated.iter().any(|event| matches!(event, EventPayload::StdoutLine(text) if text == "Finished foreground work")));
-    }
-}
-
 pub fn persist_workflow_snapshot(
     writer: &CommandStateWriter,
     events: &EventBusSender,

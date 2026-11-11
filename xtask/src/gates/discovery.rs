@@ -120,6 +120,9 @@ fn walk_file(
     for finding in crate::lint::hygiene::helper_findings(&syntax.items, test_code) {
         d.findings.push(format!("{}: {finding}", path.display()));
     }
+    for finding in crate::lint::resources::findings(&syntax.items, test_code, &path) {
+        d.findings.push(format!("{}: {finding}", path.display()));
+    }
     walk_items(
         &syntax.items,
         &path,
@@ -281,14 +284,6 @@ fn proptest_tests<T: std::fmt::Display>(tokens: &T) -> Vec<String> {
     }
     names
 }
-/// True when `path` lies inside a `[[legacy_fallback]]` row.
-fn is_legacy(root: &Path, m: &crate::manifest::Manifest, path: &Path) -> bool {
-    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    path.strip_prefix(&root).is_ok_and(|rel| {
-        super::check::is_legacy_fallback(m, &rel.to_string_lossy().replace('\\', "/"))
-    })
-}
 fn target_id(t: &Target) -> String {
     if t.kind.iter().any(|k| k == "lib") {
         "lib".into()
@@ -308,11 +303,6 @@ pub fn audit(root: &Path, m: &crate::manifest::Manifest, meta: &Metadata) -> Res
     {
         for t in &p.targets {
             targets.insert((p.name.clone(), target_id(t)));
-            // A legacy target kept as a documented fallback (`[[legacy_fallback]]`)
-            // is walked so its files count as reachable, but it is neither
-            // required to be in a suite nor held to the hygiene rules: it is
-            // deleted, not migrated, when its cutover row closes.
-            let legacy = is_legacy(root, m, &t.src_path);
             let tests_before = all.tests.len();
             let test_target = t.kind.iter().any(|k| k == "test");
             match walk_target(&t.src_path, &p.name, &t.name, test_target) {
@@ -320,19 +310,15 @@ pub fn audit(root: &Path, m: &crate::manifest::Manifest, meta: &Metadata) -> Res
                     all.reachable.extend(d.reachable);
                     all.tests.extend(d.tests);
                     all.functions.extend(d.functions);
-                    if !legacy {
-                        all.findings.extend(d.findings.into_iter().filter(|f| {
-                            !f.split_once(": ").is_some_and(|(file, message)| {
-                                is_legacy(root, m, Path::new(file))
-                                    || (message
-                                        == "unsupported include form needs explicit source metadata"
-                                        && m.discovery.allow.iter().any(|row| {
-                                            row.reason.starts_with("generated-constants-only:")
-                                                && root.join(&row.path) == Path::new(file)
-                                        }))
-                            })
-                        }));
-                    }
+                    all.findings.extend(d.findings.into_iter().filter(|f| {
+                        !f.split_once(": ").is_some_and(|(file, message)| {
+                            message == "unsupported include form needs explicit source metadata"
+                                && m.discovery.allow.iter().any(|row| {
+                                    row.reason.starts_with("generated-constants-only:")
+                                        && root.join(&row.path) == Path::new(file)
+                                })
+                        })
+                    }));
                 }
                 Err(e) => all.findings.push(format!(
                     "target {}::{} discovery incomplete: {e:#}",
@@ -351,11 +337,16 @@ pub fn audit(root: &Path, m: &crate::manifest::Manifest, meta: &Metadata) -> Res
                 }
                 continue;
             }
-            if !legacy
-                && !t
-                    .kind
-                    .iter()
-                    .any(|k| ["custom-build", "example"].contains(&k.as_str()))
+            // A library or executable with no tests is still compiled by its
+            // build cell and exercised by component/boundary/artifact suites.
+            // Do not invent an empty unit suite merely for a package count.
+            if !test_target && all.tests.len() == tests_before {
+                continue;
+            }
+            if !t
+                .kind
+                .iter()
+                .any(|k| ["custom-build", "example"].contains(&k.as_str()))
                 && !m.suites.values().any(|s| {
                     s.package.as_deref() == Some(&p.name)
                         && s.target.as_deref() == Some(&target_id(t))
@@ -390,7 +381,7 @@ pub fn audit(root: &Path, m: &crate::manifest::Manifest, meta: &Metadata) -> Res
     for r in roots {
         for path in files(&r)? {
             let canonical = path.canonicalize()?;
-            if !all.reachable.contains(&canonical) && !is_legacy(root, m, &path) {
+            if !all.reachable.contains(&canonical) {
                 all.findings.push(format!(
                     "unregistered test file {}: not reachable from any Cargo target",
                     path.display()

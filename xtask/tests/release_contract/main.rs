@@ -1,10 +1,10 @@
 //! WI 0144 §5.3: one executable contract per row, using private HOME, real
 //! scratch Git objects, fake transports, FakeCli tools and controlling PTYs.
 #![cfg(unix)]
+mod runner;
 use awman_test_support::{fakes::FakeCli, Exit, PtyChild, TestCase, TestSandbox};
 use std::{
     fs,
-    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -20,10 +20,6 @@ fn root() -> PathBuf {
 fn write(path: &Path, body: &str) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(path, body).unwrap();
-}
-fn executable(path: &Path, body: &str) {
-    write(path, body);
-    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
 }
 struct Fixture {
     s: TestSandbox,
@@ -307,7 +303,6 @@ fn row_03_steps_and_markers() {
 }
 #[test]
 fn row_04_resume_each_preparation_and_github_state() {
-    resume_after_interrupt_at_each_step();
     let changed = Fixture::new("release::row_04_changed_remote_source");
     changed.candidate("prepared");
     write(
@@ -696,10 +691,6 @@ fn row_18_queued_cancel_default_and_decline() {
     }
 }
 #[test]
-fn row_19_provisioning_and_pinned_fixture() {
-    runner_contract("release::row_19");
-}
-#[test]
 fn row_20_push_then_candidate_never_tag() {
     let f = Fixture::new("release::row_20");
     write(&f.s.work().join("docs/releases/v1.2.3.md"), "new notes\n");
@@ -798,7 +789,7 @@ fn row_23_teardown_success_failure_and_double_interrupt() {
     }
 }
 #[test]
-fn row_24_end_state_and_transcript_comparison() {
+fn row_24_end_state_matches_operator_contract() {
     let f = Fixture::new("release::row_24");
     let out = f.run();
     contains(&out, "Release v1.2.3 published!");
@@ -852,24 +843,6 @@ fn row_24_end_state_and_transcript_comparison() {
     assert_eq!(checksums, expected);
     assert!(!f.state().join("runner").exists());
 }
-#[test]
-fn row_25_runner_subcommands_and_overrides() {
-    runner_contract("release::row_25");
-}
-fn runner_contract(id: &'static str) {
-    let s = TestSandbox::for_test(TestCase::component(id));
-    let out = s
-        .command("bash")
-        .arg(root().join("xtask/tests/release_contract/runner-contract.sh"))
-        .deadline(Duration::from_secs(90))
-        .run();
-    assert!(
-        out.exit.success(),
-        "{}\n{}",
-        out.stdout_text(),
-        out.stderr_text()
-    );
-}
 fn strip(text: &str) -> String {
     let mut out = String::new();
     let mut chars = text.chars();
@@ -887,316 +860,110 @@ fn strip(text: &str) -> String {
     out
 }
 
-/// Also runnable alone through compare-transcripts.sh. The provenance is always
-/// printed: an unavailable worktree gitdir must never be presented as history.
-#[test]
-fn transcript_comparison() {
-    let history = TestSandbox::for_test(TestCase::component("release::transcript_history"));
-    let from_history = history
-        .command("git")
-        .args([
-            "-C",
-            root().to_str().unwrap(),
-            "show",
-            "e4cae907:scripts/release.sh",
-        ])
-        .run();
-    let (legacy, provenance) = if from_history.exit.success() {
-        (
-            from_history.stdout_text(),
-            "git history e4cae907:scripts/release.sh".to_owned(),
-        )
-    } else {
-        (
-            fs::read_to_string(root().join("scripts/release.sh")).unwrap(),
-            format!(
-                "RETAINED BASELINE ONLY; git history unavailable: {}",
-                from_history.stderr_text().trim()
-            ),
-        )
-    };
-    let mut report = format!("Release operator transcript comparison\nLegacy provenance: {provenance}\nAll transports are fake. No push/network command forwarded.\n\n");
-    for scenario in [
-        "success",
-        "off-main-default-no",
-        "divergence-default-no",
-        "dirty-default-no",
-        "notes-decline",
-        "tests-skip",
-        "unmanaged-none",
-        "unmanaged-online-auto",
-    ] {
-        let mut transcripts = Vec::new();
-        let mut ends = Vec::new();
-        for old in [true, false] {
-            let mut f = Fixture::new("release::transcript");
-            // The compatibility script is identical in both initial trees.
-            executable(
-                &f.s.work().join("tools/release-runner.sh"),
-                "#!/bin/bash\nexec \"$AWMAN_RELEASE_XTASK\" release runner \"$@\"\n",
+// Each interrupted phase is its own deadline and failure report.
+fn resume_after_interrupt_at_step(phase: usize) {
+    let mut f = Fixture::new("release::row_04_interrupt");
+    let mut held_tool = None;
+    match phase {
+        0 => f.env("HOLD_AT", "gh/auth"),
+        1 => {
+            write(
+                &f.s.work().join("Cargo.toml"),
+                &f.read("Cargo.toml").replacen("1.2.3", "1.0.0", 1),
             );
-            f.git(&["add", "tools/release-runner.sh"]);
-            f.git(&["commit", "-m", "runner transport fake"]);
-            f.git(&["update-ref", "refs/remotes/origin/main", "HEAD"]);
-            let path = if old {
-                let path = f.s.root().join("legacy-release.sh");
-                write(&path, &legacy);
-                path
-            } else {
-                root().join("xtask/src/release/operator/flow.sh")
-            };
-            let (needle, answer, exit) = match scenario {
-                "off-main-default-no" => {
-                    f.git(&["checkout", "-b", "topic"]);
-                    ("Proceed with release from 'topic'? [y/N]", "\n", 1)
-                }
-                "divergence-default-no" => {
-                    f.git(&["commit", "--allow-empty", "-m", "ahead"]);
-                    (
-                        "Proceed anyway (you may be ahead, or behind)? [y/N]",
-                        "\n",
-                        1,
-                    )
-                }
-                "dirty-default-no" => {
-                    write(&f.s.work().join("unrelated"), "dirty input\n");
-                    (
-                        "Proceed anyway? (consider committing or stashing these first) [y/N]",
-                        "\n",
-                        1,
-                    )
-                }
-                "notes-decline" => {
-                    fs::remove_file(f.s.work().join("docs/releases/v1.2.3.md")).unwrap();
-                    (
-                        "Launch 'awman chat' to write release notes now? [Y/n]",
-                        "n\n",
-                        1,
-                    )
-                }
-                "tests-skip" => {
-                    f.make.on(&["test"]).stdout("test failure\n").exit(1);
-                    (
-                        "Skip tests and continue the release anyway? [y/N]",
-                        "y\n",
-                        0,
-                    )
-                }
-                "unmanaged-none" => {
-                    f.env("RELEASE_RUNNER", "none");
-                    ("", "", 0)
-                }
-                "unmanaged-online-auto" => {
-                    f.env("RELEASE_RUNNER", "auto");
-                    f.put("online", "studio\n");
-                    ("", "", 0)
-                }
-                _ => ("", "", 0),
-            };
-            let mut child = f.start(&path, &["v1.2.3"]);
-            if !needle.is_empty() {
-                child.wait_for_output(needle, LIMIT);
-                child.write_all(answer.as_bytes());
-            }
-            assert_eq!(
-                child.wait(LIMIT),
-                Exit::Code(exit),
-                "{}",
-                child.output_so_far()
-            );
-            let raw = strip(&child.output_so_far());
-            if scenario.starts_with("unmanaged-") {
-                // Both commands deliberately return before publication. Model
-                // the automatically continuing workflow before comparing the
-                // eventual release end state; the different tag timing at
-                // command exit is the documented exception.
-                f.s.command("gh")
-                    .args(["run", "watch", "99", "--repo", "o/r", "--exit-status"])
-                    .run()
-                    .assert_success();
-            }
-            let meaningful: Vec<_> = raw
-                .lines()
-                .filter(|l| {
-                    l.starts_with("==>")
-                        || l.contains('✓')
-                        || l.contains('!')
-                        || l.contains("[Y/n]")
-                        || l.contains("[y/N]")
-                        || l.contains("Aborting.")
-                        || l.contains("Error:")
-                        || l.contains("Follow it with:")
-                        || l.contains("Release v1.2.3 published!")
-                })
-                .map(str::to_owned)
-                .collect();
-            transcripts.push(meaningful);
-            ends.push((
-                f.git(&["rev-parse", "HEAD^{tree}"]),
-                f.git(&["tag", "-l"]),
-                f.state().join("remote-tag").exists(),
-                f.state().join("runner").exists(),
-                if f.state().join("body").exists() {
-                    fs::read_to_string(f.state().join("body")).unwrap()
-                } else {
-                    String::new()
-                },
-                if f.state().join("assets/SHA256SUMS").exists() {
-                    fs::read_to_string(f.state().join("assets/SHA256SUMS")).unwrap()
-                } else {
-                    String::new()
-                },
-            ));
+            let cargo = f.cargo.clone();
+            cargo.on(&[]).stdout("fake tool 1.0\n");
+            cargo.on(&["update"]).hold_until_released();
+            held_tool = Some(cargo);
         }
-        report.push_str(&format!("Scenario: {scenario}\n"));
-        let canonical = |lines: &[String]| -> Vec<String> {
-            lines.iter().filter_map(|line| {
-            if line == "  ✓ Tag v1.2.3 already on origin" { return None; }
-            Some(line.replace("Pushed tag v1.2.3","REMOTE TAG: created by promotion").replace("Started the release candidate for v1.2.3; the tag is pushed when it is published","REMOTE TAG: created by promotion")
-                .replace("Tag pushed; the Release workflow", "Candidate started; the Release workflow")
-                .replace("--workflow release.yml", "--workflow candidate.yml"))
-        }).collect()
-        };
-        let old = history.tmp().join("legacy.txt");
-        let new = history.tmp().join("pipeline.txt");
-        write(&old, &(transcripts[0].join("\n") + "\n"));
-        write(&new, &(transcripts[1].join("\n") + "\n"));
-        let diff = history
-            .command("diff")
-            .args(["-u", "-L", "legacy", "-L", "pipeline"])
-            .arg(&old)
-            .arg(&new)
-            .run();
-        assert!(
-            matches!(diff.exit, Exit::Code(0 | 1)),
-            "{}",
-            diff.stderr_text()
-        );
-        report.push_str(&diff.stdout_text());
-        assert_eq!(
-            canonical(&transcripts[0]),
-            canonical(&transcripts[1]),
-            "{report}"
-        );
-        assert_eq!(
-            ends[0], ends[1],
-            "scratch Git, assets, checksums, body and runner end state differ"
-        );
-        report.push_str("Steps/prompts/results: identical after remote-tag timing mapping. End state: identical.\n\n");
-    }
-    report.push_str("No other transcript differences accepted.\nHistory provenance requires rerun in a checkout with the e4cae907 Git object before P4.\n");
-    println!("{report}");
-    // Optional artifact path supplied only to this test by its wrapper.
-    if let Ok(path) = std::env::var("AWMAN_RELEASE_TRANSCRIPT_OUT") {
-        fs::write(path, report).unwrap();
-    }
-}
-
-fn resume_after_interrupt_at_each_step() {
-    for phase in 0..9 {
-        let mut f = Fixture::new("release::row_04_interrupt");
-        let mut held_tool = None;
-        match phase {
-            0 => f.env("HOLD_AT", "gh/auth"),
-            1 => {
-                write(
-                    &f.s.work().join("Cargo.toml"),
-                    &f.read("Cargo.toml").replacen("1.2.3", "1.0.0", 1),
-                );
-                let cargo = f.cargo.clone();
-                cargo.on(&[]).stdout("fake tool 1.0\n");
-                cargo.on(&["update"]).hold_until_released();
-                held_tool = Some(cargo);
-            }
-            2 => {
-                write(
-                    &f.s.work().join("docs/releases/v1.2.3.md"),
-                    "_Write release notes here._\n",
-                );
-                f.awman.on(&["chat"]).hold_until_released();
-                held_tool = Some(f.awman.clone());
-            }
-            3 => {
-                f.make.on(&["test"]).hold_until_released();
-                held_tool = Some(f.make.clone());
-            }
-            4 => {
-                write(&f.s.work().join("docs/releases/v1.2.3.md"), "new notes\n");
-                f.env("HOLD_AT", "git/commit");
-            }
-            5 => f.env("HOLD_AT", "git/tag"),
-            6 => f.env("HOLD_AT", "runner/up"),
-            7 => {
-                write(&f.s.work().join("docs/releases/v1.2.3.md"), "new notes\n");
-                f.env("HOLD_AT", "git/push");
-            }
-            8 => f.env("WATCH_HOLD", "1"),
-            _ => unreachable!(),
-        }
-        let mut child = f.start(
-            &root().join("xtask/src/release/operator/flow.sh"),
-            &["v1.2.3"],
-        );
-        if phase == 2 {
-            child.wait_for_output("[Y/n]", LIMIT);
-            child.write_all(b"\n");
-        }
-        if let Some(fake) = &held_tool {
-            fake.wait_until_held(LIMIT);
-        } else {
-            if phase == 8 {
-                child.wait_for_output("WATCH_READY", LIMIT);
-            } else {
-                awman_test_support::wait_for_with(
-                    "held step",
-                    LIMIT,
-                    || f.state().join("held").exists().then_some(()),
-                    || child.output_so_far(),
-                );
-            }
-        }
-        nix::sys::signal::killpg(
-            nix::unistd::Pid::from_raw(child.pid() as i32),
-            nix::sys::signal::Signal::SIGINT,
-        )
-        .unwrap();
-        assert_eq!(
-            child.wait(LIMIT),
-            Exit::Code(130),
-            "step {phase}: {}",
-            child.output_so_far()
-        );
-        assert!(!f.state().join("runner").exists());
-        f.env("HOLD_AT", "");
-        f.env("WATCH_HOLD", "0");
-        if let Some(fake) = held_tool {
-            fake.on(&[]).stdout("fake tool 1.0\n");
-            fake.on(&["update"]);
-            fake.on(&["chat"]);
-            fake.on(&["test"]).stdout("suite output\n");
-        }
-        if phase == 2 {
+        2 => {
             write(
                 &f.s.work().join("docs/releases/v1.2.3.md"),
-                "written notes\n",
+                "_Write release notes here._\n",
             );
+            f.awman.on(&["chat"]).hold_until_released();
+            held_tool = Some(f.awman.clone());
         }
-        if f.git(&["rev-parse", "HEAD"]) != f.git(&["rev-parse", "origin/main"]) {
-            f.prompt(
-                "Proceed anyway (you may be ahead, or behind)? [y/N]",
-                "y\n",
-                0,
-            );
+        3 => {
+            f.make.on(&["test"]).hold_until_released();
+            held_tool = Some(f.make.clone());
+        }
+        4 => {
+            write(&f.s.work().join("docs/releases/v1.2.3.md"), "new notes\n");
+            f.env("HOLD_AT", "git/commit");
+        }
+        5 => f.env("HOLD_AT", "git/tag"),
+        6 => f.env("HOLD_AT", "runner/up"),
+        7 => {
+            write(&f.s.work().join("docs/releases/v1.2.3.md"), "new notes\n");
+            f.env("HOLD_AT", "git/push");
+        }
+        8 => f.env("WATCH_HOLD", "1"),
+        _ => unreachable!(),
+    }
+    let mut child = f.start(
+        &root().join("xtask/src/release/operator/flow.sh"),
+        &["v1.2.3"],
+    );
+    if phase == 2 {
+        child.wait_for_output("[Y/n]", LIMIT);
+        child.write_all(b"\n");
+    }
+    if let Some(fake) = &held_tool {
+        fake.wait_until_held(LIMIT);
+    } else {
+        if phase == 8 {
+            child.wait_for_output("WATCH_READY", LIMIT);
         } else {
-            f.run();
-        }
-        if phase >= 4 {
-            assert_eq!(
-                f.make.calls().len(),
-                1,
-                "step {phase} repeated finished local tests"
+            awman_test_support::wait_for_with(
+                "held step",
+                LIMIT,
+                || f.state().join("held").exists().then_some(()),
+                || child.output_so_far(),
             );
         }
+    }
+    nix::sys::signal::killpg(
+        nix::unistd::Pid::from_raw(child.pid() as i32),
+        nix::sys::signal::Signal::SIGINT,
+    )
+    .unwrap();
+    assert_eq!(
+        child.wait(LIMIT),
+        Exit::Code(130),
+        "step {phase}: {}",
+        child.output_so_far()
+    );
+    assert!(!f.state().join("runner").exists());
+    f.env("HOLD_AT", "");
+    f.env("WATCH_HOLD", "0");
+    if let Some(fake) = held_tool {
+        fake.on(&[]).stdout("fake tool 1.0\n");
+        fake.on(&["update"]);
+        fake.on(&["chat"]);
+        fake.on(&["test"]).stdout("suite output\n");
+    }
+    if phase == 2 {
+        write(
+            &f.s.work().join("docs/releases/v1.2.3.md"),
+            "written notes\n",
+        );
+    }
+    if f.git(&["rev-parse", "HEAD"]) != f.git(&["rev-parse", "origin/main"]) {
+        f.prompt(
+            "Proceed anyway (you may be ahead, or behind)? [y/N]",
+            "y\n",
+            0,
+        );
+    } else {
+        f.run();
+    }
+    if phase >= 4 {
+        assert_eq!(
+            f.make.calls().len(),
+            1,
+            "step {phase} repeated finished local tests"
+        );
     }
 }
 
@@ -1266,4 +1033,41 @@ fn source_change_during_tests_is_not_a_pass() {
     );
     assert_eq!(f.record()["local_tests"], "not run");
     assert!(!f.calls().contains("gh <workflow> <run>"));
+}
+
+#[test]
+fn resume_after_auth_interrupt() {
+    resume_after_interrupt_at_step(0);
+}
+#[test]
+fn resume_after_version_interrupt() {
+    resume_after_interrupt_at_step(1);
+}
+#[test]
+fn resume_after_notes_interrupt() {
+    resume_after_interrupt_at_step(2);
+}
+#[test]
+fn resume_after_tests_interrupt() {
+    resume_after_interrupt_at_step(3);
+}
+#[test]
+fn resume_after_commit_interrupt() {
+    resume_after_interrupt_at_step(4);
+}
+#[test]
+fn resume_after_tag_interrupt() {
+    resume_after_interrupt_at_step(5);
+}
+#[test]
+fn resume_after_runner_interrupt() {
+    resume_after_interrupt_at_step(6);
+}
+#[test]
+fn resume_after_push_interrupt() {
+    resume_after_interrupt_at_step(7);
+}
+#[test]
+fn resume_after_watch_interrupt() {
+    resume_after_interrupt_at_step(8);
 }

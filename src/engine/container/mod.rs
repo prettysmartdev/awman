@@ -29,13 +29,11 @@ pub mod phase_step;
 pub mod phase_tools;
 mod process;
 pub mod runtime;
-#[cfg(test)]
-pub(crate) mod test_support;
+
 pub mod timing;
 
 pub use background::BackgroundContainer;
-#[cfg(all(test, unix))]
-pub(crate) use builtin::{FakeBuiltin, LaunchedVm};
+
 pub use instance::ContainerId;
 pub use naming::generate_container_name;
 pub use options::{
@@ -45,15 +43,6 @@ pub use options::{
 };
 pub use phase_step::PhaseStepContainerSpec;
 pub use runtime::ContainerRuntime;
-
-/// The container-tier runtimes (Docker, Apple Containers, builtin) for the
-/// cross-runtime frontend-release check (`agent_runtime::conformance`).
-#[cfg(all(test, unix))]
-pub(crate) fn conformance_launchers() -> Vec<crate::engine::agent_runtime::conformance::Launcher> {
-    let mut launchers = process::conformance_launchers();
-    launchers.push(builtin::conformance_launcher());
-    launchers
-}
 
 /// Cancellation and deadline for one host build step. Part of the
 /// `image_prep::builder::LocalImageBuilder` seam, so it is public; it carries

@@ -215,32 +215,3 @@ impl LeaseApi for WspSession {
         )
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn session_revocation_state_model_is_monotonic_under_error_and_success_histories() {
-        let client = awman_wsp::Client::new("http://localhost", String::new()).unwrap();
-        for seed in 0..256 {
-            let session = WspSession {
-                client: client.clone(),
-                server: "model".into(),
-                revoked_flag: AtomicBool::new(false),
-                revoked: CancellationToken::new(),
-            };
-            let mut revoked = false;
-            for bit in 0..8 {
-                if seed & (1 << bit) != 0 {
-                    let _: Result<()> = session.map(Err(awman_wsp::Error::LinkRevoked));
-                    revoked = true;
-                } else {
-                    session.map(Ok(())).unwrap();
-                }
-                assert_eq!(session.is_revoked(), revoked, "seed {seed}, step {bit}");
-                assert_eq!(session.revoked().is_cancelled(), revoked);
-                assert_eq!(session.live().is_err(), revoked);
-            }
-        }
-    }
-}

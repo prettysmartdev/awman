@@ -734,6 +734,3 @@ async fn resolved_backend(session: &Session) -> String {
     };
     engine_handoff::describe(&selection)
 }
-
-#[cfg(test)]
-mod tests;

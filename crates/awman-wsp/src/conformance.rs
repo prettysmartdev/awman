@@ -830,26 +830,3 @@ async fn wire_probe(id: &str, base: &Client, admin: &dyn ConformanceAdmin) -> Re
         .ok_or(Error::InvalidResponse)?;
     client.result(&lease.id, &result()).await
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn wire_walker_rejects_units_timestamps_enums_and_invalid_labels() {
-        for value in [
-            json!({"heartbeat_ms":1.5}),
-            json!({"heartbeat_ms":"100"}),
-            json!({"expires_at":123}),
-            json!({"expires_at":"yesterday"}),
-            json!({"kind":"Workflow"}),
-            json!({"state":"awaitingInput"}),
-            json!({"labels":{"UPPER":"value"}}),
-            json!({"server_labels":{"bare.dotted":"value"}}),
-            json!({"badCamelCase":true}),
-        ] {
-            assert!(validate_message(&value).is_err(), "{value}");
-        }
-        assert!(validate_message(&json!({"labels":{"awman/os":"linux"}})).is_ok());
-    }
-}

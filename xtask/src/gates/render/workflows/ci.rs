@@ -428,6 +428,7 @@ const GATE: &str = r##"  gate:
     env:
       GATE: ${{ needs.plan.outputs.gate }}
       GH_TOKEN: ${{ github.token }}
+      GATE_MODE: ${{ inputs.mode }}
     steps:
 @@CHECKOUT@@
 @@RUST@@

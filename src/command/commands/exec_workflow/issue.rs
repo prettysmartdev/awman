@@ -55,12 +55,7 @@ pub(crate) struct IssueTempFile {
     pub(crate) path: PathBuf,
 }
 
-impl IssueTempFile {
-    #[cfg(test)]
-    pub(crate) fn path(&self) -> &std::path::Path {
-        &self.path
-    }
-}
+impl IssueTempFile {}
 
 impl Drop for IssueTempFile {
     fn drop(&mut self) {

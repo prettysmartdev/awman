@@ -1,5 +1,5 @@
 //! `ci.yml` and `nightly.yml` are rendered here from the manifest (`outputs`);
-//! `candidate.yml`, `promote.yml`, `fixtures.yml` and the legacy workflows belong to
+//! `candidate.yml`, `promote.yml`, `fixtures.yml` are declared in
 //! their own producers and are only verified. The verifier is deliberately
 //! conservative and is supplemented by pinned actionlint in the `lint` job.
 use crate::manifest::Manifest;
@@ -113,25 +113,16 @@ pub fn verify(root: &Path, m: &Manifest) -> Vec<String> {
             Err(_) => errors.push(format!("missing required workflow {path}")),
         }
     }
-    // A retained publisher or status shim is still executable workflow code.
-    // Its removal condition must not exempt it from security checks.
-    for (path, timeout_minutes) in [
-        (".github/workflows/release.yml", 180),
-        (".github/workflows/test.yml", 60),
-    ] {
-        if m.workflows.contains_key(path) {
-            continue;
-        }
-        if let Ok(text) = std::fs::read_to_string(root.join(path)) {
-            errors.extend(verify_text(
-                path,
-                &text,
-                &crate::manifest::Workflow {
-                    jobs: vec![],
-                    commands: vec![],
-                    timeout_minutes,
-                },
-            ));
+    if let Ok(entries) = std::fs::read_dir(root.join(".github/workflows")) {
+        for entry in entries.flatten() {
+            let path = format!(".github/workflows/{}", entry.file_name().to_string_lossy());
+            if matches!(
+                entry.path().extension().and_then(|x| x.to_str()),
+                Some("yml" | "yaml")
+            ) && !m.workflows.contains_key(&path)
+            {
+                errors.push(format!("unregistered workflow {path}"));
+            }
         }
     }
     errors
