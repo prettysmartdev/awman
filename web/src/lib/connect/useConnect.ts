@@ -3,12 +3,15 @@
 import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { ConnectController, type ConnectState } from './controller';
 
+const SERVER_SNAPSHOT: ConnectState = { phase: 'idle' };
+const getServerSnapshot = () => SERVER_SNAPSHOT;
+
 /** One ConnectController for the component's lifetime, started on mount. */
 export function useConnect(): { state: ConnectState; controller: ConnectController } {
   const [controller] = useState(() => new ConnectController());
   const started = useRef(false);
   const mount = useRef(0);
-  const state = useSyncExternalStore(controller.state.subscribe.bind(controller.state), controller.state.get.bind(controller.state), () => ({ phase: 'idle' }) as const);
+  const state = useSyncExternalStore(controller.state.subscribe.bind(controller.state), controller.state.get.bind(controller.state), getServerSnapshot);
   useEffect(() => {
     const currentMount = ++mount.current;
     if (!started.current) {

@@ -3,12 +3,12 @@
 Title: webapp v0 acceptance follow-ups
 Issue: issuelink
 
-Depends on: 0159 (webapp v0) merged, and a real Cloudflare deployment of the web app at https://awman.prettysmart.dev for the deployed-origin gates. This item collects the work that 0159's final acceptance audit deferred honestly: items that need the deployed origin, Docker-backed agents or a new harness, plus small refinements found during the audit. It changes no product behavior unless a deferred gate exposes a defect.
+Depends on: 0159 (webapp v0) and 0160 (webapp UX overhaul) merged, and a real Cloudflare deployment of the web app at https://awman.prettysmart.dev for the deployed-origin gates. This item collects the work that 0159's final acceptance audit deferred honestly: items that need the deployed origin, Docker-backed agents or a new harness, plus small refinements found during the audit. It changes no product behavior unless a deferred gate exposes a defect.
 
 ## Summary:
 - Prove, rather than infer, the parts of 0159 that were accepted on unit and localhost evidence: run the matrix as a real-daemon TUI-versus-web engine-trace parity suite, verify loopback access from the deployed HTTPS origin on Chromium and one other engine, drive a real agent PTY from a browser, exercise the installed service worker's offline and atomic update lifecycle, and record comparable web performance baselines.
 - Close the audit's small refinements: two unverified squad matrix rows, a cancellation-latency measurement for browser sockets during session start and blocked sends, and the owner-side deployment checklist steps that only a deployment can confirm.
-- Keep the 0159 security boundary unchanged. Nothing here widens listener binds, adds LAN or relay access, or weakens the CSP. Remote-machine browser access remains a separate, later design and review.
+- Preserve the browser security boundary established by 0159 and explicitly revised for reload continuity in 0160. Nothing here widens listener binds, adds LAN or relay access, or weakens the CSP. Remote-machine browser access remains a separate, later design and review.
 
 ## User Stories
 
