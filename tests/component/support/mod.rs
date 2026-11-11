@@ -28,6 +28,9 @@ pub fn fake_cli_exe() -> &'static Path {
 /// A component-tier sandbox for the test `id` (its module path, e.g.
 /// `"engine::git::clone_over_ssh"`), with `awman` and the fake CLI registered.
 pub fn sandbox(id: &'static str) -> TestSandbox {
+    // Match the binary's immutable native provider setup for in-process tests.
+    #[cfg(windows)]
+    awman_host_shims::install_metadata_publisher();
     let mut sandbox = TestSandbox::for_test(TestCase::component(id));
     sandbox.register_exe("awman", awman_exe());
     sandbox.register_exe("fake-cli", fake_cli_exe());

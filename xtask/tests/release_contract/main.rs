@@ -1,4 +1,4 @@
-//! WI 0144 §5.3: one executable contract per row, using private HOME, real
+//! WI 0144 §5.3: executable contracts for every row, using private HOME, real
 //! scratch Git objects, fake transports, FakeCli tools and controlling PTYs.
 #![cfg(unix)]
 mod runner;
@@ -615,8 +615,7 @@ fn row_14_local_pass_hash_and_reuse() {
         .exists());
 }
 #[test]
-fn row_15_fail_skip_clipboard_and_fix() {
-    clipboard_fallbacks();
+fn row_15_fail_skip_clipboard_and_remember_choice() {
     let f = Fixture::new("release::row_15");
     f.make.on(&["test"]).stdout("full failure\n").exit(1);
     let out = f.prompt(
@@ -631,17 +630,25 @@ fn row_15_fail_skip_clipboard_and_fix() {
     f.put("state", "none");
     f.run();
     assert_eq!(f.make.calls().len(), 1);
-    for answer in ["\nn\n", "\n\n"] {
-        let f = Fixture::new("release::row_15_fix");
-        f.make.on(&["test"]).exit(1);
-        let out = f.prompt(
-            "Skip tests and continue the release anyway? [y/N]",
-            answer,
-            1,
-        );
-        contains(&out, "Launch 'awman chat' to fix the failing tests? [Y/n]");
-        contains(&out.to_lowercase(), "re-run");
-    }
+}
+#[test]
+fn row_15_decline_fix() {
+    failure_fix_prompt("\nn\n");
+}
+#[test]
+fn row_15_accept_fix_by_default() {
+    failure_fix_prompt("\n\n");
+}
+fn failure_fix_prompt(answer: &str) {
+    let f = Fixture::new("release::row_15_fix");
+    f.make.on(&["test"]).exit(1);
+    let out = f.prompt(
+        "Skip tests and continue the release anyway? [y/N]",
+        answer,
+        1,
+    );
+    contains(&out, "Launch 'awman chat' to fix the failing tests? [Y/n]");
+    contains(&out.to_lowercase(), "re-run");
 }
 #[test]
 fn row_16_commit_only_release_paths() {
@@ -985,49 +992,61 @@ fn resume_after_interrupt_at_step(phase: usize) {
     }
 }
 
-fn clipboard_fallbacks() {
-    for persona in ["xclip", "xsel", "none"] {
-        let mut f = Fixture::new("release::row_15_clipboard");
-        // A private tool PATH prevents macOS from falling through to the real
-        // /usr/bin/pbcopy when a fake clipboard executable is deliberately absent.
-        for tool in [
-            "bash", "awk", "sed", "grep", "tee", "mktemp", "rm", "mkdir", "head", "seq",
-            "basename", "shasum", "mv", "cp", "cat", "wc", "tr", "touch",
-        ] {
-            let path = f.s.env().resolve(std::ffi::OsStr::new(tool)).unwrap();
-            std::os::unix::fs::symlink(path, f.s.bin().join(tool)).unwrap();
-        }
-        fs::remove_file(f.s.bin().join("pbcopy")).unwrap();
-        if persona != "xclip" {
-            fs::remove_file(f.s.bin().join("xclip")).unwrap();
-        }
-        if persona == "none" {
-            fs::remove_file(f.s.bin().join("xsel")).unwrap();
-        }
-        let bin = f.s.bin();
-        f.s.env_mut().set("PATH", bin);
-        f.make
-            .on(&["test"])
-            .stdout("entire failure output\n")
-            .exit(1);
-        let out = f.prompt(
-            "Skip tests and continue the release anyway? [y/N]",
-            "y\n",
-            0,
+// Each independent operator flow gets the normal component deadline. Bundling
+// all seven row-15 flows in one test exceeded it on slower macOS runners.
+#[test]
+fn row_15_clipboard_xclip() {
+    clipboard_fallback("xclip");
+}
+#[test]
+fn row_15_clipboard_xsel() {
+    clipboard_fallback("xsel");
+}
+#[test]
+fn row_15_clipboard_unavailable() {
+    clipboard_fallback("none");
+}
+fn clipboard_fallback(persona: &str) {
+    let mut f = Fixture::new("release::row_15_clipboard");
+    // A private tool PATH prevents macOS from falling through to the real
+    // /usr/bin/pbcopy when a fake clipboard executable is deliberately absent.
+    for tool in [
+        "bash", "awk", "sed", "grep", "tee", "mktemp", "rm", "mkdir", "head", "seq", "basename",
+        "shasum", "mv", "cp", "cat", "wc", "tr", "touch",
+    ] {
+        let path = f.s.env().resolve(std::ffi::OsStr::new(tool)).unwrap();
+        std::os::unix::fs::symlink(path, f.s.bin().join(tool)).unwrap();
+    }
+    fs::remove_file(f.s.bin().join("pbcopy")).unwrap();
+    if persona != "xclip" {
+        fs::remove_file(f.s.bin().join("xclip")).unwrap();
+    }
+    if persona == "none" {
+        fs::remove_file(f.s.bin().join("xsel")).unwrap();
+    }
+    let bin = f.s.bin();
+    f.s.env_mut().set("PATH", bin);
+    f.make
+        .on(&["test"])
+        .stdout("entire failure output\n")
+        .exit(1);
+    let out = f.prompt(
+        "Skip tests and continue the release anyway? [y/N]",
+        "y\n",
+        0,
+    );
+    if persona == "none" {
+        contains(
+            &out,
+            "Could not copy to clipboard (install pbcopy, xclip, or xsel).",
         );
-        if persona == "none" {
-            contains(
-                &out,
-                "Could not copy to clipboard (install pbcopy, xclip, or xsel).",
-            );
-        } else {
-            let calls = f.s.bin().join(".fake").join(persona).join("calls");
-            let call = fs::read_dir(calls).unwrap().next().unwrap().unwrap().path();
-            assert_eq!(
-                fs::read(call.join("stdin")).unwrap(),
-                b"entire failure output\n"
-            );
-        }
+    } else {
+        let calls = f.s.bin().join(".fake").join(persona).join("calls");
+        let call = fs::read_dir(calls).unwrap().next().unwrap().unwrap().path();
+        assert_eq!(
+            fs::read(call.join("stdin")).unwrap(),
+            b"entire failure output\n"
+        );
     }
 }
 

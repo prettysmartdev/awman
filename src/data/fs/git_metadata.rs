@@ -3,6 +3,15 @@ use std::path::Path;
 
 pub struct GitMetadataCopy;
 impl GitMetadataCopy {
+    /// Install the binary's native rename boundary, as for the owner pipe.
+    /// Library consumers fail closed when the native provider is absent.
+    #[cfg(windows)]
+    pub fn install_windows_publisher(
+        publisher: fn(&std::fs::File, &std::ffi::OsStr) -> std::io::Result<()>,
+    ) {
+        windows::install_publisher(publisher);
+    }
+
     pub fn copy(source: &Path, destination: &Path) -> std::io::Result<()> {
         copy(source, destination)
     }

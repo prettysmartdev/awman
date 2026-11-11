@@ -24,6 +24,8 @@ use awman::frontend::cli;
 use awman::frontend::tui;
 
 fn main() -> Result<ExitCode> {
+    #[cfg(windows)]
+    awman_host_shims::install_metadata_publisher();
     if let Some(success) = awman::command::git_credential_helper::dispatch(
         &Env::from_process(),
         &mut std::io::stdin().lock(),

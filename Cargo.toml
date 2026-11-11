@@ -197,7 +197,7 @@ nix = { workspace = true, features = ["signal", "process", "term", "fs", "dir", 
 libc = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { workspace = true, features = ["Wdk_Storage_FileSystem", "Win32_Storage_FileSystem", "Win32_System_IO"] }
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 awman-wsp = { workspace = true, features = ["mock"] }

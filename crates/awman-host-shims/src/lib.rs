@@ -30,3 +30,10 @@ pub use apple_xpc::NativeXpc;
 mod local_pipe;
 #[cfg(windows)]
 pub use local_pipe::{create as owner_pipe, verify_client};
+
+#[cfg(windows)]
+mod metadata;
+#[cfg(windows)]
+pub fn install_metadata_publisher() {
+    awman::data::fs::git_metadata::GitMetadataCopy::install_windows_publisher(metadata::publish);
+}
