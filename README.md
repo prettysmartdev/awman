@@ -8,26 +8,26 @@
 
 **Custom agent workflows for your hardest tasks, run safely in isolation.**
 
-awman is an "Agent Workflow Manager" that designs custom agent workflows and runs them on your laptop, server, cloud VM, or homelab. Give it a work item: a dynamic workflow is designed by a leader agent and then executed end-to-end inside isolated containers or microVMs. One run gets you from a spec to a reviewed and merge-able PR. Supports any code agent you prefer including Claude Code, Codex, OpenCode, and more.
-
-awman is the developer tool for code agent power users who need to build high-quality software faster.
+awman is an Agent Workflow Manager that turns agent best practices like clear specs, independent review, tests, and autoremediation into a repeatable workflow for developers. Give it a work item: awman's leader agent designs a custom workflow, then awman validates and runs it in isolated containers or microVMs on your laptop, server, cloud VM, or homelab. Shared context carries decisions between agents, and the run can finish with a PR and passing CI. Bring Claude Code, Codex, OpenCode, or your preferred code agent.
 
 ![Parallel agent workflow in the awman TUI](docs/blog/images/dynamic-workflows.png)
 
-## Let the task define the workflow
+## Make quality repeatable
 
-- **Let an agent build the workflow, or build your own.** [Dynamic mode](docs/06-dynamic-workflows.md) creates a custom workflow for a specific work item; [TOML or YAML workflows](docs/05-workflows.md) lets you design workflows yourself. awman validates either before execution.
-- **Continuous progress, automatically.** Workflow execution automatically advances after successful steps. Steps can run in parallel when independent. You can use different agents and models for implementation and adverserial review.
-- **Context follows the work.** Dynamic workflows share plans, decisions, and intermediate results between steps. Add [repo or global context](docs/08-overlays.md#context-overlays-in-depth) when knowledge should carry into future runs.
-- **Failures don't erase progress.** Problems are always recoverable. Retry a step, step back, or resume later from a named step instead of replaying the whole task.
+- **Give each task a process.** A work item sets the goal; [dynamic mode](docs/06-dynamic-workflows.md) designs a workflow for it, or you can [define it yourself](docs/05-workflows.md). awman validates the workflow before running its steps in isolation.
+- **Make review independent.** Put implementation, review, and verification in separate steps, with different agents or models if you choose. The change gets challenged before it reaches your PR.
+- **Keep decisions in the loop.** Dynamic workflows pass plans, notes, and intermediate results through shared [workflow context](docs/08-overlays.md#workflow-context). Later agents can build on earlier findings instead of rediscovering them.
+- **Fix the failing step.** Saved workflow state lets you retry, step back, or resume when things go sideways. Add [`on_failure` agents](docs/05-workflows.md#step-remediation-with-on_failure) to automatically diagnose and fix a failed test or CI check and retry it.
 
 ## Keep the run contained and reviewable
 
-- **Isolated by default.** Agents see the mounted project; [overlays](docs/08-overlays.md) grant extra directories, skills, or environment variables only where needed. Dynamic runs use a separate Git worktree, so the change is easy to inspect.
-- **Checks on the way to PR.** Workflow steps can run tests, commit, push, open a PR, and fix CI when it breaks.
-- **Routine work, off your plate.** [Squad](docs/12-squad.md) can watch for new issues or failing PRs and launch workflows on a schedule. The [daemon API](docs/09-api-and-remote-mode.md) supports scripts and remote workers.
+- **Isolation makes autonomy practical.** Agents see the mounted project; [overlays](docs/08-overlays.md) grant extra directories, skills, or environment variables only where needed. Local dynamic runs use a Git worktree, remote runs use an isolated clone.
+- **Carry checks through to PR.** Workflow steps can run required tests, commit and push changes, open a PR, and wait for CI. Failing checks can automatically trigger a fix agent.
+- **Apply the same bar to recurring work.** [Squad](docs/12-squad.md) can watch new issues or failing PRs and launch workflows on a schedule. The [daemon API](docs/09-api-and-remote-mode.md) supports scripts and remote workers.
 
-For exploratory work, launch Claude Code, Codex, OpenCode, Gemini, Copilot, Cline, Antigravity, or a [custom agent](docs/15-custom-agents.md) in a live session. The TUI keeps parallel sessions and their status in one place.
+## One engine, five ways to use it
+
+Use the [CLI](docs/14-command-reference.md) for scripts, the [TUI](docs/02-using-the-tui.md) for live oversight, the [API](docs/09-api-and-remote-mode.md) for integrations, the [web app](docs/20-webapp.md) for local browser control, or a [worker](docs/17-workers-and-work-servers.md) to claim jobs from a work server. Each path uses the same workflow engine and isolated agent execution.
 
 ## Get started
 
