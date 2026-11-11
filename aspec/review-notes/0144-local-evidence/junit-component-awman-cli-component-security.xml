@@ -1,10 +1,10 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<testsuites name="nextest-run" tests="5" skipped="0" failures="0" errors="0" uuid="874f8d0b-6df7-45ae-9754-fafc812d037d" timestamp="2026-11-11T21:22:18.460+00:00" time="0.146">
+<testsuites name="nextest-run" tests="5" skipped="0" failures="0" errors="0" uuid="ebd56592-7014-4a5d-bb20-7743dfc9279b" timestamp="2026-11-11T21:59:07.897+00:00" time="0.145">
     <testsuite name="awman-cli::component" tests="5" skipped="0" errors="0" failures="0">
-        <testcase name="security::mount_scope::remote_plans_reject_local_transport_and_option_injection_before_clone" classname="awman-cli::component" timestamp="2026-11-11T21:22:18.462+00:00" time="0.031"/>
-        <testcase name="security::mount_scope::widening_to_the_parent_git_root_requires_a_decision_and_dismissal_aborts" classname="awman-cli::component" timestamp="2026-11-11T21:22:18.462+00:00" time="0.046"/>
-        <testcase name="security::mount_scope::admission_allows_only_exact_mounts_or_independent_direct_child_repositories" classname="awman-cli::component" timestamp="2026-11-11T21:22:18.462+00:00" time="0.062"/>
-        <testcase name="security::mount_scope::symlink_escapes_and_linked_git_directories_cannot_expand_admission" classname="awman-cli::component" timestamp="2026-11-11T21:22:18.462+00:00" time="0.078"/>
-        <testcase name="security::trust::hostile_workflow_agent_definitions_are_refused_before_any_host_or_container_launch" classname="awman-cli::component" timestamp="2026-11-11T21:22:18.495+00:00" time="0.111"/>
+        <testcase name="security::mount_scope::remote_plans_reject_local_transport_and_option_injection_before_clone" classname="awman-cli::component" timestamp="2026-11-11T21:59:07.900+00:00" time="0.029"/>
+        <testcase name="security::mount_scope::widening_to_the_parent_git_root_requires_a_decision_and_dismissal_aborts" classname="awman-cli::component" timestamp="2026-11-11T21:59:07.900+00:00" time="0.053"/>
+        <testcase name="security::mount_scope::admission_allows_only_exact_mounts_or_independent_direct_child_repositories" classname="awman-cli::component" timestamp="2026-11-11T21:59:07.900+00:00" time="0.057"/>
+        <testcase name="security::mount_scope::symlink_escapes_and_linked_git_directories_cannot_expand_admission" classname="awman-cli::component" timestamp="2026-11-11T21:59:07.900+00:00" time="0.060"/>
+        <testcase name="security::trust::hostile_workflow_agent_definitions_are_refused_before_any_host_or_container_launch" classname="awman-cli::component" timestamp="2026-11-11T21:59:07.931+00:00" time="0.112"/>
     </testsuite>
 </testsuites>

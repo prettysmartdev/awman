@@ -126,7 +126,7 @@ fn remote_plans_reject_local_transport_and_option_injection_before_clone() {
     s.finish();
 }
 
-#[cfg_attr(not(unix), ignore = "not-applicable: needs Unix symlinks")]
+#[cfg(unix)]
 #[test]
 fn symlink_escapes_and_linked_git_directories_cannot_expand_admission() {
     #[cfg(unix)]

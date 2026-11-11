@@ -1,11 +1,11 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<testsuites name="nextest-run" tests="6" skipped="0" failures="0" errors="0" uuid="e616764f-89b7-4d02-be81-72295560f610" timestamp="2026-11-11T21:21:07.678+00:00" time="1.029">
+<testsuites name="nextest-run" tests="6" skipped="0" failures="0" errors="0" uuid="ed092b71-8162-4995-8817-91f9e67ca867" timestamp="2026-11-11T21:57:42.815+00:00" time="1.106">
     <testsuite name="awman-cli::component" tests="6" skipped="0" errors="0" failures="0">
-        <testcase name="squad::environment::env_sync_accepts_only_required_names_and_keeps_each_daemon_private" classname="awman-cli::component" timestamp="2026-11-11T21:21:07.680+00:00" time="0.029"/>
-        <testcase name="squad::refusal::sandbox_refusal_precedes_task_allocation_and_every_runtime_call" classname="awman-cli::component" timestamp="2026-11-11T21:21:07.680+00:00" time="0.030"/>
-        <testcase name="squad::scheduling::malformed_config_admits_nothing_then_recovers_without_restart" classname="awman-cli::component" timestamp="2026-11-11T21:21:07.711+00:00" time="0.318"/>
-        <testcase name="squad::scheduling::repair_exhaustion_records_failure_and_backoff_advances_only_with_clock" classname="awman-cli::component" timestamp="2026-11-11T21:21:07.711+00:00" time="0.399"/>
-        <testcase name="squad::scheduling::concurrent_ticks_share_capacity_and_cancelled_evaluations_leave_no_running_rows" classname="awman-cli::component" timestamp="2026-11-11T21:21:07.680+00:00" time="0.556"/>
-        <testcase name="squad::env_transport::child_shell_sync_rotates_only_declared_values_and_read_only_queries_do_not_push" classname="awman-cli::component" timestamp="2026-11-11T21:21:07.680+00:00" time="1.026"/>
+        <testcase name="squad::environment::env_sync_accepts_only_required_names_and_keeps_each_daemon_private" classname="awman-cli::component" timestamp="2026-11-11T21:57:42.818+00:00" time="0.029"/>
+        <testcase name="squad::refusal::sandbox_refusal_precedes_task_allocation_and_every_runtime_call" classname="awman-cli::component" timestamp="2026-11-11T21:57:42.818+00:00" time="0.031"/>
+        <testcase name="squad::scheduling::malformed_config_admits_nothing_then_recovers_without_restart" classname="awman-cli::component" timestamp="2026-11-11T21:57:42.849+00:00" time="0.333"/>
+        <testcase name="squad::scheduling::repair_exhaustion_records_failure_and_backoff_advances_only_with_clock" classname="awman-cli::component" timestamp="2026-11-11T21:57:42.850+00:00" time="0.426"/>
+        <testcase name="squad::scheduling::concurrent_ticks_share_capacity_and_cancelled_evaluations_leave_no_running_rows" classname="awman-cli::component" timestamp="2026-11-11T21:57:42.818+00:00" time="0.594"/>
+        <testcase name="squad::env_transport::child_shell_sync_rotates_only_declared_values_and_read_only_queries_do_not_push" classname="awman-cli::component" timestamp="2026-11-11T21:57:42.818+00:00" time="1.103"/>
     </testsuite>
 </testsuites>

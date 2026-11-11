@@ -52,7 +52,7 @@ fn engine_acquire(
     acquirer(state, EnvSnapshot::empty()).acquire(request, &mut |_| {})
 }
 
-#[cfg_attr(not(unix), ignore = "not-applicable: Engine double needs Unix sockets")]
+#[cfg(unix)]
 #[test]
 fn engine_export_is_validated_cached_and_reused_without_the_daemon() {
     let sandbox = support::sandbox(
@@ -85,7 +85,7 @@ fn engine_export_is_validated_cached_and_reused_without_the_daemon() {
     sandbox.finish();
 }
 
-#[cfg_attr(not(unix), ignore = "not-applicable: Engine double needs Unix sockets")]
+#[cfg(unix)]
 #[test]
 fn a_legacy_docker_cache_key_is_found_without_contacting_the_source() {
     let sandbox = support::sandbox(
@@ -131,7 +131,7 @@ fn a_legacy_docker_cache_key_is_found_without_contacting_the_source() {
     sandbox.finish();
 }
 
-#[cfg_attr(not(unix), ignore = "not-applicable: Engine double needs Unix sockets")]
+#[cfg(unix)]
 #[test]
 fn new_engines_export_the_native_platform_even_when_the_default_variant_differs() {
     let sandbox = support::sandbox(
@@ -165,7 +165,7 @@ fn new_engines_export_the_native_platform_even_when_the_default_variant_differs(
     sandbox.finish();
 }
 
-#[cfg_attr(not(unix), ignore = "not-applicable: Engine double needs Unix sockets")]
+#[cfg(unix)]
 #[test]
 fn an_old_engine_with_the_wrong_platform_is_refused_before_export() {
     let sandbox = support::sandbox(
@@ -194,7 +194,7 @@ fn an_old_engine_with_the_wrong_platform_is_refused_before_export() {
     sandbox.finish();
 }
 
-#[cfg_attr(not(unix), ignore = "not-applicable: Engine double needs Unix sockets")]
+#[cfg(unix)]
 #[test]
 fn a_missing_image_names_the_engine_endpoint() {
     let sandbox = support::sandbox("engine::oci::a_missing_image_names_the_engine_endpoint");
@@ -222,7 +222,7 @@ fn a_missing_image_names_the_engine_endpoint() {
     sandbox.finish();
 }
 
-#[cfg_attr(not(unix), ignore = "not-applicable: Engine double needs Unix sockets")]
+#[cfg(unix)]
 #[test]
 fn a_truncated_export_leaves_no_cache_state() {
     let sandbox = support::sandbox("engine::oci::a_truncated_export_leaves_no_cache_state");
@@ -253,7 +253,7 @@ fn a_truncated_export_leaves_no_cache_state() {
     sandbox.finish();
 }
 
-#[cfg_attr(not(unix), ignore = "not-applicable: Engine double needs Unix sockets")]
+#[cfg(unix)]
 #[test]
 fn an_unreachable_engine_is_a_network_error() {
     let sandbox = support::sandbox("engine::oci::an_unreachable_engine_is_a_network_error");

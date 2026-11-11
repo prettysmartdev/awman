@@ -1,8 +1,8 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<testsuites name="nextest-run" tests="3" skipped="0" failures="0" errors="0" uuid="e6892d1b-efc2-4111-8fba-414f8543d732" timestamp="2026-11-11T21:21:27.992+00:00" time="0.357">
+<testsuites name="nextest-run" tests="3" skipped="0" failures="0" errors="0" uuid="213aa502-47ff-4dc2-a200-0346d83ddfb2" timestamp="2026-11-11T21:58:32.149+00:00" time="0.450">
     <testsuite name="awman-cli::component" tests="3" skipped="0" errors="0" failures="0">
-        <testcase name="tools::signature_verification_preserves_exact_candidate_bytes" classname="awman-cli::component" timestamp="2026-11-11T21:21:27.995+00:00" time="0.045"/>
-        <testcase name="tools::entitlements_mismatch_fails_verification" classname="awman-cli::component" timestamp="2026-11-11T21:21:27.995+00:00" time="0.046"/>
-        <testcase name="tools::architecture::architecture_gate_detects_cross_layer_calls_and_scanner_failure" classname="awman-cli::component" timestamp="2026-11-11T21:21:27.995+00:00" time="0.354"/>
+        <testcase name="tools::signature_verification_preserves_exact_candidate_bytes" classname="awman-cli::component" timestamp="2026-11-11T21:58:32.152+00:00" time="0.035"/>
+        <testcase name="tools::entitlements_mismatch_fails_verification" classname="awman-cli::component" timestamp="2026-11-11T21:58:32.152+00:00" time="0.035"/>
+        <testcase name="tools::architecture::architecture_gate_detects_cross_layer_calls_and_scanner_failure" classname="awman-cli::component" timestamp="2026-11-11T21:58:32.152+00:00" time="0.447"/>
     </testsuite>
 </testsuites>

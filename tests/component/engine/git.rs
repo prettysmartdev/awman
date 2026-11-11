@@ -399,7 +399,7 @@ fn legacy_lookup_rejects_a_stale_registration_replaced_by_a_foreign_checkout() {
     sandbox.finish();
 }
 
-#[cfg_attr(not(unix), ignore = "not-applicable: needs Unix symlinks")]
+#[cfg(unix)]
 #[test]
 fn legacy_lookup_rejects_a_replacement_symlink() {
     let sandbox = sandbox("engine::git::legacy_lookup_rejects_a_replacement_symlink");
@@ -422,10 +422,7 @@ fn legacy_lookup_rejects_a_replacement_symlink() {
 }
 
 // APFS refuses file names that are not valid UTF-8.
-#[cfg_attr(
-    any(not(unix), target_os = "macos"),
-    ignore = "not-applicable: needs non-UTF-8 file names (Linux)"
-)]
+#[cfg(all(unix, not(target_os = "macos")))]
 #[test]
 fn legacy_lookup_preserves_tabs_newlines_and_native_path_bytes() {
     let sandbox =
@@ -516,7 +513,7 @@ fn hostile_repo<'a>(sandbox: &'a TestSandbox, sentinel: &Path) -> Repo<'a> {
     repo
 }
 
-#[cfg_attr(not(unix), ignore = "not-applicable: needs executable shell scripts")]
+#[cfg(unix)]
 #[test]
 fn host_git_never_runs_repository_hooks_filters_monitors_or_drivers() {
     let sandbox =
@@ -540,7 +537,7 @@ fn host_git_never_runs_repository_hooks_filters_monitors_or_drivers() {
     sandbox.finish();
 }
 
-#[cfg_attr(not(unix), ignore = "not-applicable: needs executable shell scripts")]
+#[cfg(unix)]
 #[test]
 fn hooks_do_not_run_on_the_host_during_fetch_or_tracking_worktree_add() {
     let sandbox =
@@ -1590,10 +1587,12 @@ fn a_malicious_head_ref_from_gh_is_rejected_by_branch_validation() {
     let sandbox =
         sandbox("engine::git::a_malicious_head_ref_from_gh_is_rejected_by_branch_validation");
     let marker = sandbox.work().join("pwned");
-    let body = format!(
-        r#"{{"headRefName":"--upload-pack=touch {}","isCrossRepository":true,"state":"OPEN"}}"#,
-        marker.display()
-    );
+    let body = serde_json::json!({
+        "headRefName": format!("--upload-pack=touch {}", marker.display()),
+        "isCrossRepository": true,
+        "state": "OPEN"
+    })
+    .to_string();
     let gh = fake_gh(&sandbox);
     let info = gh_view(&sandbox, &gh, &body);
     let repo = RepoBuilder::new(&sandbox, "repo").init();
@@ -1696,7 +1695,7 @@ fn env_of(command: &std::process::Command, key: &str) -> Option<String> {
         .and_then(|(_, v)| v.map(|v| v.to_string_lossy().into_owned()))
 }
 
-#[cfg_attr(not(unix), ignore = "not-applicable: shell credential helper")]
+#[cfg(unix)]
 #[test]
 fn lease_helper_is_invoked_by_real_git_with_global_config_isolated() {
     let sandbox =
@@ -1741,7 +1740,7 @@ fn lease_origin<'a>(sandbox: &'a TestSandbox) -> (Repo<'a>, PathBuf) {
     (seed, bare)
 }
 
-#[cfg_attr(not(unix), ignore = "not-applicable: shell credential helper")]
+#[cfg(unix)]
 #[test]
 fn lease_clone_fetch_ls_remote_and_push_leave_no_secret_in_git_config() {
     let sandbox =
@@ -2128,7 +2127,7 @@ fn pinned_workflow_metadata_ignores_rewritten_git_and_commondir_pointers() {
     sandbox.finish();
 }
 
-#[cfg_attr(not(unix), ignore = "not-applicable: needs Unix symlinks")]
+#[cfg(unix)]
 #[test]
 fn isolated_workflow_metadata_refuses_a_linked_config() {
     let sandbox = sandbox("engine::git::isolated_workflow_metadata_refuses_a_linked_config");

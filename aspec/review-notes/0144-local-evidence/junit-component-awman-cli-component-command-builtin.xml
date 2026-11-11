@@ -1,8 +1,8 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<testsuites name="nextest-run" tests="3" skipped="0" failures="0" errors="0" uuid="ceb84e87-b435-4839-97b9-11eff1856d46" timestamp="2026-11-11T21:21:24.379+00:00" time="0.924">
+<testsuites name="nextest-run" tests="3" skipped="0" failures="0" errors="0" uuid="32db534b-21e0-4c0d-8462-a6ce08be3928" timestamp="2026-11-11T21:59:28.996+00:00" time="0.995">
     <testsuite name="awman-cli::component" tests="3" skipped="0" errors="0" failures="0">
-        <testcase name="command::builtin::workflow_preflight_is_read_only_and_missing_work_is_typed" classname="awman-cli::component" timestamp="2026-11-11T21:21:24.382+00:00" time="0.119"/>
-        <testcase name="command::builtin::config_edits_are_durable_and_invalid_values_are_atomic" classname="awman-cli::component" timestamp="2026-11-11T21:21:24.382+00:00" time="0.164"/>
-        <testcase name="command::builtin::catalogue_explains_each_command_before_execution" classname="awman-cli::component" timestamp="2026-11-11T21:21:24.382+00:00" time="0.921"/>
+        <testcase name="command::builtin::workflow_preflight_is_read_only_and_missing_work_is_typed" classname="awman-cli::component" timestamp="2026-11-11T21:59:28.999+00:00" time="0.134"/>
+        <testcase name="command::builtin::config_edits_are_durable_and_invalid_values_are_atomic" classname="awman-cli::component" timestamp="2026-11-11T21:59:28.999+00:00" time="0.160"/>
+        <testcase name="command::builtin::catalogue_explains_each_command_before_execution" classname="awman-cli::component" timestamp="2026-11-11T21:59:28.999+00:00" time="0.991"/>
     </testsuite>
 </testsuites>

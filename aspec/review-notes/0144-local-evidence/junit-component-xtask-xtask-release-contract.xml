@@ -1,41 +1,48 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<testsuites name="nextest-run" tests="36" skipped="0" failures="0" errors="0" uuid="f07b837d-226f-4e7d-881c-3894ce50056b" timestamp="2026-11-11T21:21:09.744+00:00" time="5.555">
-    <testsuite name="xtask::release_contract" tests="36" skipped="0" errors="0" failures="0">
-        <testcase name="resume_after_auth_interrupt" classname="xtask::release_contract" timestamp="2026-11-11T21:21:09.746+00:00" time="0.433"/>
-        <testcase name="resume_after_commit_interrupt" classname="xtask::release_contract" timestamp="2026-11-11T21:21:09.746+00:00" time="0.484"/>
-        <testcase name="resume_after_notes_interrupt" classname="xtask::release_contract" timestamp="2026-11-11T21:21:09.746+00:00" time="0.487"/>
-        <testcase name="resume_after_push_interrupt" classname="xtask::release_contract" timestamp="2026-11-11T21:21:09.746+00:00" time="0.503"/>
-        <testcase name="resume_after_runner_interrupt" classname="xtask::release_contract" timestamp="2026-11-11T21:21:10.179+00:00" time="0.412"/>
-        <testcase name="resume_after_tag_interrupt" classname="xtask::release_contract" timestamp="2026-11-11T21:21:10.231+00:00" time="0.396"/>
-        <testcase name="resume_after_version_interrupt" classname="xtask::release_contract" timestamp="2026-11-11T21:21:10.249+00:00" time="0.427"/>
-        <testcase name="resume_after_tests_interrupt" classname="xtask::release_contract" timestamp="2026-11-11T21:21:10.235+00:00" time="0.496"/>
-        <testcase name="row_01_usage_and_runner_mode" classname="xtask::release_contract" timestamp="2026-11-11T21:21:10.637+00:00" time="0.281"/>
-        <testcase name="resume_after_watch_interrupt" classname="xtask::release_contract" timestamp="2026-11-11T21:21:10.593+00:00" time="0.366"/>
-        <testcase name="row_02_version_validation" classname="xtask::release_contract" timestamp="2026-11-11T21:21:10.678+00:00" time="0.346"/>
-        <testcase name="row_03_steps_and_markers" classname="xtask::release_contract" timestamp="2026-11-11T21:21:10.732+00:00" time="0.323"/>
-        <testcase name="row_06_authentication" classname="xtask::release_contract" timestamp="2026-11-11T21:21:11.025+00:00" time="0.067"/>
-        <testcase name="row_05_tty_defaults_and_no_tty" classname="xtask::release_contract" timestamp="2026-11-11T21:21:10.960+00:00" time="0.169"/>
-        <testcase name="row_08_divergence" classname="xtask::release_contract" timestamp="2026-11-11T21:21:11.095+00:00" time="0.268"/>
-        <testcase name="row_07_off_main" classname="xtask::release_contract" timestamp="2026-11-11T21:21:11.056+00:00" time="0.348"/>
-        <testcase name="row_09_dirty_files_and_evidence_mismatch" classname="xtask::release_contract" timestamp="2026-11-11T21:21:11.131+00:00" time="0.382"/>
-        <testcase name="row_10_remote_tag_and_published_resume" classname="xtask::release_contract" timestamp="2026-11-11T21:21:11.365+00:00" time="0.450"/>
-        <testcase name="row_12_portable_version_bump" classname="xtask::release_contract" timestamp="2026-11-11T21:21:11.516+00:00" time="0.328"/>
-        <testcase name="row_13_notes_template_and_chat" classname="xtask::release_contract" timestamp="2026-11-11T21:21:11.815+00:00" time="0.441"/>
-        <testcase name="row_11_runner_selection" classname="xtask::release_contract" timestamp="2026-11-11T21:21:11.406+00:00" time="1.140"/>
-        <testcase name="row_16_commit_only_release_paths" classname="xtask::release_contract" timestamp="2026-11-11T21:21:12.548+00:00" time="0.351"/>
-        <testcase name="row_14_local_pass_hash_and_reuse" classname="xtask::release_contract" timestamp="2026-11-11T21:21:11.846+00:00" time="1.081"/>
-        <testcase name="row_04_resume_each_preparation_and_github_state" classname="xtask::release_contract" timestamp="2026-11-11T21:21:10.919+00:00" time="2.416"/>
-        <testcase name="row_17_local_tag_create_reuse_and_mismatch" classname="xtask::release_contract" timestamp="2026-11-11T21:21:12.899+00:00" time="0.631"/>
-        <testcase name="row_20_push_then_candidate_never_tag" classname="xtask::release_contract" timestamp="2026-11-11T21:21:13.336+00:00" time="0.326"/>
-        <testcase name="row_21_unmanaged_follow_line" classname="xtask::release_contract" timestamp="2026-11-11T21:21:13.533+00:00" time="0.223"/>
-        <testcase name="row_15_fail_skip_clipboard_and_fix" classname="xtask::release_contract" timestamp="2026-11-11T21:21:12.257+00:00" time="1.553"/>
-        <testcase name="row_24_end_state_matches_operator_contract" classname="xtask::release_contract" timestamp="2026-11-11T21:21:13.812+00:00" time="0.363"/>
-        <testcase name="runner::deregistration_failure_retains_repair_state" classname="xtask::release_contract" timestamp="2026-11-11T21:21:14.176+00:00" time="0.058"/>
-        <testcase name="runner::failed_registration_releases_owned_state_and_keeps_existing_work" classname="xtask::release_contract" timestamp="2026-11-11T21:21:14.235+00:00" time="0.124"/>
-        <testcase name="row_18_queued_cancel_default_and_decline" classname="xtask::release_contract" timestamp="2026-11-11T21:21:12.928+00:00" time="1.450"/>
-        <testcase name="runner::missing_group_or_bad_archive_cannot_obtain_a_registration_token" classname="xtask::release_contract" timestamp="2026-11-11T21:21:14.360+00:00" time="0.060"/>
-        <testcase name="runner::provisioning_is_manifest_verified_and_failure_stops_before_registration" classname="xtask::release_contract" timestamp="2026-11-11T21:21:14.379+00:00" time="0.041"/>
-        <testcase name="row_23_teardown_success_failure_and_double_interrupt" classname="xtask::release_contract" timestamp="2026-11-11T21:21:13.757+00:00" time="0.716"/>
-        <testcase name="row_22_watch_rerun_and_verified_success" classname="xtask::release_contract" timestamp="2026-11-11T21:21:13.663+00:00" time="1.636"/>
+<testsuites name="nextest-run" tests="43" skipped="0" failures="0" errors="0" uuid="85785c70-e481-467b-a3d3-9a88e43afb00" timestamp="2026-11-11T21:59:22.269+00:00" time="5.421">
+    <testsuite name="xtask::release_contract" tests="43" skipped="0" errors="0" failures="0">
+        <testcase name="resume_after_auth_interrupt" classname="xtask::release_contract" timestamp="2026-11-11T21:59:22.270+00:00" time="0.371"/>
+        <testcase name="resume_after_push_interrupt" classname="xtask::release_contract" timestamp="2026-11-11T21:59:22.270+00:00" time="0.445"/>
+        <testcase name="resume_after_notes_interrupt" classname="xtask::release_contract" timestamp="2026-11-11T21:59:22.270+00:00" time="0.445"/>
+        <testcase name="resume_after_commit_interrupt" classname="xtask::release_contract" timestamp="2026-11-11T21:59:22.270+00:00" time="0.445"/>
+        <testcase name="resume_after_runner_interrupt" classname="xtask::release_contract" timestamp="2026-11-11T21:59:22.643+00:00" time="0.438"/>
+        <testcase name="resume_after_tag_interrupt" classname="xtask::release_contract" timestamp="2026-11-11T21:59:22.717+00:00" time="0.396"/>
+        <testcase name="resume_after_version_interrupt" classname="xtask::release_contract" timestamp="2026-11-11T21:59:22.717+00:00" time="0.413"/>
+        <testcase name="resume_after_tests_interrupt" classname="xtask::release_contract" timestamp="2026-11-11T21:59:22.717+00:00" time="0.418"/>
+        <testcase name="row_01_usage_and_runner_mode" classname="xtask::release_contract" timestamp="2026-11-11T21:59:23.114+00:00" time="0.292"/>
+        <testcase name="row_03_steps_and_markers" classname="xtask::release_contract" timestamp="2026-11-11T21:59:23.137+00:00" time="0.354"/>
+        <testcase name="resume_after_watch_interrupt" classname="xtask::release_contract" timestamp="2026-11-11T21:59:23.082+00:00" time="0.409"/>
+        <testcase name="row_02_version_validation" classname="xtask::release_contract" timestamp="2026-11-11T21:59:23.131+00:00" time="0.360"/>
+        <testcase name="row_04_resume_built" classname="xtask::release_contract" timestamp="2026-11-11T21:59:23.492+00:00" time="0.236"/>
+        <testcase name="row_04_resume_prepared" classname="xtask::release_contract" timestamp="2026-11-11T21:59:23.492+00:00" time="0.238"/>
+        <testcase name="row_04_changed_remote_source_is_prepared_again" classname="xtask::release_contract" timestamp="2026-11-11T21:59:23.408+00:00" time="0.376"/>
+        <testcase name="row_04_resume_commit_failure" classname="xtask::release_contract" timestamp="2026-11-11T21:59:23.492+00:00" time="0.405"/>
+        <testcase name="row_04_resume_promoted" classname="xtask::release_contract" timestamp="2026-11-11T21:59:23.729+00:00" time="0.221"/>
+        <testcase name="row_04_resume_validated" classname="xtask::release_contract" timestamp="2026-11-11T21:59:23.898+00:00" time="0.230"/>
+        <testcase name="row_05_tty_defaults_and_no_tty" classname="xtask::release_contract" timestamp="2026-11-11T21:59:23.951+00:00" time="0.177"/>
+        <testcase name="row_04_resume_push_failure" classname="xtask::release_contract" timestamp="2026-11-11T21:59:23.732+00:00" time="0.412"/>
+        <testcase name="row_06_authentication" classname="xtask::release_contract" timestamp="2026-11-11T21:59:24.129+00:00" time="0.066"/>
+        <testcase name="row_04_resume_tag_failure" classname="xtask::release_contract" timestamp="2026-11-11T21:59:23.785+00:00" time="0.416"/>
+        <testcase name="row_07_off_main" classname="xtask::release_contract" timestamp="2026-11-11T21:59:24.129+00:00" time="0.357"/>
+        <testcase name="row_08_divergence" classname="xtask::release_contract" timestamp="2026-11-11T21:59:24.146+00:00" time="0.383"/>
+        <testcase name="row_09_dirty_files_and_evidence_mismatch" classname="xtask::release_contract" timestamp="2026-11-11T21:59:24.197+00:00" time="0.417"/>
+        <testcase name="row_10_remote_tag_and_published_resume" classname="xtask::release_contract" timestamp="2026-11-11T21:59:24.203+00:00" time="0.500"/>
+        <testcase name="row_12_portable_version_bump" classname="xtask::release_contract" timestamp="2026-11-11T21:59:24.530+00:00" time="0.362"/>
+        <testcase name="row_13_notes_template_and_chat" classname="xtask::release_contract" timestamp="2026-11-11T21:59:24.615+00:00" time="0.549"/>
+        <testcase name="row_16_commit_only_release_paths" classname="xtask::release_contract" timestamp="2026-11-11T21:59:25.166+00:00" time="0.326"/>
+        <testcase name="row_11_runner_selection" classname="xtask::release_contract" timestamp="2026-11-11T21:59:24.488+00:00" time="1.306"/>
+        <testcase name="row_14_local_pass_hash_and_reuse" classname="xtask::release_contract" timestamp="2026-11-11T21:59:24.705+00:00" time="1.417"/>
+        <testcase name="row_17_local_tag_create_reuse_and_mismatch" classname="xtask::release_contract" timestamp="2026-11-11T21:59:25.493+00:00" time="0.843"/>
+        <testcase name="row_20_push_then_candidate_never_tag" classname="xtask::release_contract" timestamp="2026-11-11T21:59:26.123+00:00" time="0.322"/>
+        <testcase name="row_15_fail_skip_clipboard_and_fix" classname="xtask::release_contract" timestamp="2026-11-11T21:59:24.893+00:00" time="1.656"/>
+        <testcase name="row_21_unmanaged_follow_line" classname="xtask::release_contract" timestamp="2026-11-11T21:59:26.337+00:00" time="0.227"/>
+        <testcase name="row_24_end_state_matches_operator_contract" classname="xtask::release_contract" timestamp="2026-11-11T21:59:26.566+00:00" time="0.369"/>
+        <testcase name="runner::deregistration_failure_retains_repair_state" classname="xtask::release_contract" timestamp="2026-11-11T21:59:26.935+00:00" time="0.057"/>
+        <testcase name="runner::failed_registration_releases_owned_state_and_keeps_existing_work" classname="xtask::release_contract" timestamp="2026-11-11T21:59:26.995+00:00" time="0.150"/>
+        <testcase name="runner::missing_group_or_bad_archive_cannot_obtain_a_registration_token" classname="xtask::release_contract" timestamp="2026-11-11T21:59:27.147+00:00" time="0.095"/>
+        <testcase name="row_23_teardown_success_failure_and_double_interrupt" classname="xtask::release_contract" timestamp="2026-11-11T21:59:26.550+00:00" time="0.727"/>
+        <testcase name="runner::provisioning_is_manifest_verified_and_failure_stops_before_registration" classname="xtask::release_contract" timestamp="2026-11-11T21:59:27.243+00:00" time="0.047"/>
+        <testcase name="row_18_queued_cancel_default_and_decline" classname="xtask::release_contract" timestamp="2026-11-11T21:59:25.794+00:00" time="1.622"/>
+        <testcase name="row_22_watch_rerun_and_verified_success" classname="xtask::release_contract" timestamp="2026-11-11T21:59:26.447+00:00" time="1.243"/>
     </testsuite>
 </testsuites>

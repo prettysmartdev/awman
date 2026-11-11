@@ -302,7 +302,7 @@ fn row_03_steps_and_markers() {
     contains(&out, "✓");
 }
 #[test]
-fn row_04_resume_each_preparation_and_github_state() {
+fn row_04_changed_remote_source_is_prepared_again() {
     let changed = Fixture::new("release::row_04_changed_remote_source");
     changed.candidate("prepared");
     write(
@@ -312,36 +312,54 @@ fn row_04_resume_each_preparation_and_github_state() {
     changed.run();
     assert_eq!(changed.make.calls().len(), 1);
     contains(&changed.calls(), "gh <workflow> <run> <candidate.yml>");
-    for state in ["prepared", "candidate-built", "validated", "promoted"] {
-        let f = Fixture::new("release::row_04");
-        f.candidate(state);
-        let out = f.run();
-        contains(&out, "resuming");
-        assert!(f.make.calls().is_empty());
-        assert!(!f.calls().contains("gh <workflow> <run>"));
-    }
-    for stage in ["commit", "tag", "push"] {
-        let mut f = Fixture::new("release::row_04_failure");
-        f.env("FAIL_GIT", stage);
-        write(&f.s.work().join("docs/releases/v1.2.3.md"), "new notes\n");
-        let mut c = f.start(
-            &root().join("xtask/src/release/operator/flow.sh"),
-            &["v1.2.3"],
-        );
-        assert_ne!(c.wait(LIMIT), Exit::Code(0));
-        f.env("FAIL_GIT", "");
-        if f.git(&["rev-parse", "HEAD"]) != f.git(&["rev-parse", "origin/main"]) {
-            f.prompt(
-                "Proceed anyway (you may be ahead, or behind)? [y/N]",
-                "y\n",
-                0,
-            );
-        } else {
-            f.run();
-        }
-        assert_eq!(f.make.calls().len(), 1);
-    }
 }
+
+fn resume_state(state: &str) {
+    let f = Fixture::new("release::row_04");
+    f.candidate(state);
+    let out = f.run();
+    contains(&out, "resuming");
+    assert!(f.make.calls().is_empty());
+    assert!(!f.calls().contains("gh <workflow> <run>"));
+}
+
+fn resume_git_failure(stage: &str) {
+    let mut f = Fixture::new("release::row_04_failure");
+    f.env("FAIL_GIT", stage);
+    write(&f.s.work().join("docs/releases/v1.2.3.md"), "new notes\n");
+    let mut c = f.start(
+        &root().join("xtask/src/release/operator/flow.sh"),
+        &["v1.2.3"],
+    );
+    assert_ne!(c.wait(LIMIT), Exit::Code(0));
+    f.env("FAIL_GIT", "");
+    if f.git(&["rev-parse", "HEAD"]) != f.git(&["rev-parse", "origin/main"]) {
+        f.prompt(
+            "Proceed anyway (you may be ahead, or behind)? [y/N]",
+            "y\n",
+            0,
+        );
+    } else {
+        f.run();
+    }
+    assert_eq!(f.make.calls().len(), 1);
+}
+
+macro_rules! resume_case {
+    ($name:ident, $run:ident, $value:literal) => {
+        #[test]
+        fn $name() {
+            $run($value);
+        }
+    };
+}
+resume_case!(row_04_resume_prepared, resume_state, "prepared");
+resume_case!(row_04_resume_built, resume_state, "candidate-built");
+resume_case!(row_04_resume_validated, resume_state, "validated");
+resume_case!(row_04_resume_promoted, resume_state, "promoted");
+resume_case!(row_04_resume_commit_failure, resume_git_failure, "commit");
+resume_case!(row_04_resume_tag_failure, resume_git_failure, "tag");
+resume_case!(row_04_resume_push_failure, resume_git_failure, "push");
 #[test]
 fn row_05_tty_defaults_and_no_tty() {
     let f = Fixture::new("release::row_05");

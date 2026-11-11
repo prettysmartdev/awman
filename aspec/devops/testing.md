@@ -166,6 +166,17 @@ At the end of a test every owned process, port, socket and directory is checked.
 A survivor, an address still accepting connections, or a socket file left in
 `sock_dir` is reported as a `LEAK` and fails the test.
 
+Release database handles and other file owners before calling `finish()`. For
+ordinary scoped tests, declare the sandbox first and let its checked `Drop` run
+after the remaining locals; Unix allowing an open file to be unlinked is not
+proof that the same cleanup is correct on Windows.
+
+Compile platform-specific component contracts only on the platforms they test
+with `#[cfg(...)]`. Keep their applicable platforms covered by the manifest;
+an ignored test in a selected suite cannot satisfy the gate. Split independent
+protocol or release scenarios into separately scheduled cases when their combined
+runtime exceeds the tier deadline. Preserve the assertions and deadline.
+
 ### Ports, waiting and time
 
 - `sandbox.ports().tcp_listener()` binds `127.0.0.1:0`; `.unix_socket(name)`

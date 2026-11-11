@@ -594,7 +594,9 @@ pub fn render(m: &Manifest) -> Result<String> {
                 ("REQUIRED", &required),
                 ("NEEDS", &needs.join(", ")),
                 ("RUNS_ON", &hosted_runs_on),
-                ("CHECKOUT", &indent(&checkout(false), 6)),
+                // The controller independently recomputes the base/head diff.
+                // A depth-one merge checkout does not contain the base tree.
+                ("CHECKOUT", &indent(&checkout(true), 6)),
                 ("RUST", &indent(&rust(&linux.toolchain, &[]), 6)),
                 ("DOWNLOAD", DOWNLOAD),
                 ("UPLOAD", UPLOAD),

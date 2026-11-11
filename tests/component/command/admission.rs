@@ -28,7 +28,6 @@ async fn validation_and_authorization_leave_no_durable_work() {
         Err(AdmissionError::SessionCreation(_))
     ));
     assert!(f.store.list_sessions().unwrap().is_empty());
-    s.finish();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -77,7 +76,6 @@ async fn setup_and_closed_sessions_refuse_command_admission() {
             .await,
         Err(AdmissionError::Session(SessionCommandAdmission::Closed))
     ));
-    s.finish();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -114,7 +112,6 @@ async fn accepted_session_replays_after_dropped_response_without_duplication() {
         retry.begin("different").unwrap(),
         IdempotencyBegin::Mismatch
     );
-    s.finish();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -154,7 +151,6 @@ async fn write_failure_compensates_before_a_key_can_be_retried() {
             .status,
         SessionStatus::Active
     );
-    s.finish();
 }
 
 #[test]
@@ -188,7 +184,6 @@ fn reservations_are_scoped_and_only_the_owner_can_release_them() {
             body: "rejected".into()
         }
     );
-    s.finish();
 }
 
 #[test]
@@ -209,5 +204,4 @@ fn idempotency_key_boundaries_and_server_failure_release_are_explicit() {
         IdempotencyGate::open(&f.store, "route", "p", Some("visible!"), "body").unwrap(),
         IdempotencyGate::Fresh(_)
     ));
-    s.finish();
 }

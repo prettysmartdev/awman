@@ -1,12 +1,12 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<testsuites name="nextest-run" tests="7" skipped="0" failures="0" errors="0" uuid="1ff73037-df46-4c15-b0b5-4d66b2b4dd60" timestamp="2026-11-11T21:21:31.221+00:00" time="0.081">
+<testsuites name="nextest-run" tests="7" skipped="0" failures="0" errors="0" uuid="3b3523ca-37ec-40e5-9364-58ddbca2d5f2" timestamp="2026-11-11T21:57:27.385+00:00" time="0.102">
     <testsuite name="xtask::ci" tests="7" skipped="0" errors="0" failures="0">
-        <testcase name="actionlint_config_declares_every_self_hosted_label_once" classname="xtask::ci" timestamp="2026-11-11T21:21:31.222+00:00" time="0.042"/>
-        <testcase name="a_wrong_independent_digest_fails_even_when_the_record_matches" classname="xtask::ci" timestamp="2026-11-11T21:21:31.222+00:00" time="0.049"/>
-        <testcase name="a_tampered_archive_fails_digest_verification" classname="xtask::ci" timestamp="2026-11-11T21:21:31.222+00:00" time="0.050"/>
-        <testcase name="called_full_gate_and_candidate_main_have_disjoint_artifact_names" classname="xtask::ci" timestamp="2026-11-11T21:21:31.265+00:00" time="0.024"/>
-        <testcase name="cache_keys_are_stable_and_differ_by_build" classname="xtask::ci" timestamp="2026-11-11T21:21:31.222+00:00" time="0.070"/>
-        <testcase name="lint_job_executes_each_lint_once_while_legacy_shim_waits_for_protection_cutover" classname="xtask::ci" timestamp="2026-11-11T21:21:31.273+00:00" time="0.023"/>
-        <testcase name="unknown_helper_is_refused_with_usage" classname="xtask::ci" timestamp="2026-11-11T21:21:31.273+00:00" time="0.029"/>
+        <testcase name="actionlint_config_declares_every_self_hosted_label_once" classname="xtask::ci" timestamp="2026-11-11T21:57:27.386+00:00" time="0.025"/>
+        <testcase name="a_wrong_independent_digest_fails_even_when_the_record_matches" classname="xtask::ci" timestamp="2026-11-11T21:57:27.386+00:00" time="0.032"/>
+        <testcase name="a_tampered_archive_fails_digest_verification" classname="xtask::ci" timestamp="2026-11-11T21:57:27.386+00:00" time="0.047"/>
+        <testcase name="called_full_gate_and_candidate_main_have_disjoint_artifact_names" classname="xtask::ci" timestamp="2026-11-11T21:57:27.413+00:00" time="0.021"/>
+        <testcase name="lint_job_executes_each_lint_once_while_legacy_shim_waits_for_protection_cutover" classname="xtask::ci" timestamp="2026-11-11T21:57:27.420+00:00" time="0.024"/>
+        <testcase name="unknown_helper_is_refused_with_usage" classname="xtask::ci" timestamp="2026-11-11T21:57:27.435+00:00" time="0.052"/>
+        <testcase name="cache_keys_are_stable_and_differ_by_build" classname="xtask::ci" timestamp="2026-11-11T21:57:27.386+00:00" time="0.101"/>
     </testsuite>
 </testsuites>

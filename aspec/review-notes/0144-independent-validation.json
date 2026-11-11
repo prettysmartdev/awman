@@ -1,8 +1,9 @@
 {
    "assessment" : "Independent post-WI144 important-path coverage and execution validation",
    "ci" : {
+      "previous_run" : 43104202001,
       "pull_request" : "https://github.com/prettysmartdev/awman/pull/40",
-      "status" : "pending push and authenticated gate"
+      "status" : "fixes prepared after first hosted round"
    },
    "criteria" : [
       "Important success, failure, recovery, persistence and security paths reach production interfaces",
@@ -11,449 +12,9 @@
       "Native hardware proof cannot be inferred from hosted compilation or fake boundaries"
    ],
    "local" : {
-      "approximate_wall_seconds" : 102,
-      "command" : "cargo xtask test run --gate local --shuffle-seed 145",
+      "command" : "cargo xtask test run --gate local --shuffle-seed 146",
       "host" : "Linux aarch64",
       "invocations" : [
-         {
-            "exit" : 0,
-            "expected_tests" : [
-               "awman-cli::component parity::differential::config_results_agree_across_backends"
-            ],
-            "suites" : [
-               "component-parity-differential"
-            ]
-         },
-         {
-            "exit" : 0,
-            "expected_tests" : [
-               "awman-cli::component parity::builtin::config_mutations_are_durable_and_invalid_edits_are_atomic"
-            ],
-            "suites" : [
-               "component-parity-builtin"
-            ]
-         },
-         {
-            "exit" : 0,
-            "expected_tests" : [
-               "awman-cli::component command::daemon::catalogue_explains_each_command_before_execution",
-               "awman-cli::component command::daemon::config_edits_are_durable_and_invalid_values_are_atomic",
-               "awman-cli::component command::daemon::workflow_preflight_is_read_only_and_missing_work_is_typed"
-            ],
-            "suites" : [
-               "component-command-daemon"
-            ]
-         },
-         {
-            "exit" : 0,
-            "expected_tests" : [
-               "awman data::clock::tests::advancing_moves_both_clocks_and_wall_adjustment_is_independent",
-               "awman data::clock::tests::clones_share_one_clock_state",
-               "awman engine::conformance::tests::a_report_without_checks_is_not_a_success",
-               "awman engine::conformance::tests::one_failure_makes_the_report_fail_and_is_listed",
-               "awman engine::conformance::tests::skipped_checks_do_not_fail_a_report_with_passes",
-               "awman engine::issue::naming_tests::github_slugs_carry_the_provider_prefix_and_the_number",
-               "awman engine::issue::naming_tests::numeric_id_comes_from_the_last_url_segment",
-               "awman engine::issue::naming_tests::slugs_and_branches_are_safe_for_any_title",
-               "awman engine::workflow::contracts::cancellation_stops_the_running_agent_and_never_launches_dependents",
-               "awman engine::workflow::contracts::dependency_join_waits_for_every_parallel_predecessor",
-               "awman engine::workflow::contracts::failure_can_be_retried_before_dependents_run",
-               "awman engine::workflow::contracts::persisted_execution_resumes_without_repeating_completed_steps",
-               "awman engine::workflow::timing::tests::countdowns_are_the_documented_constants",
-               "awman frontend::api::error::constructor_tests::every_constructor_preserves_message_status_and_code",
-               "awman frontend::tui::contracts::command_edit_validation_and_resize_preserve_user_input",
-               "awman frontend::tui::contracts::tab_navigation_and_dialog_dismissal_keep_sessions_distinct"
-            ],
-            "suites" : [
-               "component-core-internals"
-            ]
-         },
-         {
-            "exit" : 0,
-            "expected_tests" : [
-               "awman-cli::component data::config::configuration_reference_key_table_matches_the_schema",
-               "awman-cli::component data::config::every_key_default_is_valid_and_round_trips_through_file_validation",
-               "awman-cli::component data::config::every_key_has_a_deterministic_default_and_key_table_validation_contract",
-               "awman-cli::component data::config::every_key_obeys_the_declared_global_repo_and_task_scope_order",
-               "awman-cli::component data::config::explicit_home_and_xdg_roots_resolve_independently_without_process_environment",
-               "awman-cli::component data::config::global_repo_environment_set_and_flag_layers_follow_declared_precedence",
-               "awman-cli::component data::config::integer_key_boundaries_and_wrong_shapes_are_rejected_by_the_schema",
-               "awman-cli::component data::config::invalid_config_is_rejected_before_save_and_sensitive_values_are_masked",
-               "awman-cli::component data::config::older_config_documents_keep_their_wire_values_when_rewritten",
-               "awman-cli::component data::config::unified_home_roots_every_store_and_removed_overrides_are_inert",
-               "awman-cli::component data::config_properties::additive_guidance_merge_is_ordered_and_deduplicates_trimmed_values",
-               "awman-cli::component data::config_properties::config_parse_serialize_round_trip_preserves_valid_agent_and_scrollback",
-               "awman-cli::component data::config_properties::identical_layers_are_idempotent_and_later_set_override_wins",
-               "awman-cli::component data::persistence::bounded_keychain_helper_returns_a_ready_result",
-               "awman-cli::component data::persistence::builtin_image_leases_isolate_mutation_per_image",
-               "awman-cli::component data::persistence::concurrent_builtin_state_resolution_returns_one_private_root",
-               "awman-cli::component data::persistence::concurrent_workflow_checkpoint_reads_never_observe_partial_json",
-               "awman-cli::component data::persistence::config_save_reload_and_corruption_recovery_are_confined_to_sandbox",
-               "awman-cli::component data::persistence::corrupt_database_is_reported_without_overwriting_the_original_bytes",
-               "awman-cli::component data::persistence::interrupted_database_migration_recovers_from_legacy_source_and_preserves_backup",
-               "awman-cli::component data::persistence::migration_preserves_real_sqlite_session_and_command_rows",
-               "awman-cli::component data::persistence::repo_config_save_refuses_a_symlinked_leaf_without_touching_its_target",
-               "awman-cli::component data::persistence::schema_one_database_keeps_session_and_command_rows_readable"
-            ],
-            "suites" : [
-               "component-data"
-            ]
-         },
-         {
-            "exit" : 0,
-            "expected_tests" : [
-               "xtask::gates frozen_dispatch_exposes_gate_help",
-               "xtask::gates missing_required_evidence_is_red"
-            ],
-            "suites" : [
-               "xtask-gates"
-            ]
-         },
-         {
-            "exit" : 0,
-            "expected_tests" : [
-               "xtask::pipeline abandon_keeps_evidence_and_refuses_promoted_versions",
-               "xtask::pipeline candidate_validates_promotes_and_verifies_the_same_bytes",
-               "xtask::pipeline changed_inputs_never_reuse_stale_evidence",
-               "xtask::pipeline commit_no_longer_an_ancestor_of_main_voids_the_candidate",
-               "xtask::pipeline concurrent_candidates_for_one_version_end_blocked_with_nothing_published",
-               "xtask::pipeline expired_evidence_is_refused",
-               "xtask::pipeline failed_commands_missing_shards_skipped_counts_and_empty_assertions_cannot_validate",
-               "xtask::pipeline failed_suite_reruns_against_the_same_artifacts_only",
-               "xtask::pipeline fetched_artifact_is_absolute_and_executable_from_another_directory",
-               "xtask::pipeline forged_or_stale_evidence_cannot_validate",
-               "xtask::pipeline interrupted_promotion_resumes_between_tag_and_publish",
-               "xtask::pipeline live_main_policy_wins_over_a_stale_checkout_before_tag_and_publish",
-               "xtask::pipeline mutable_draft_cannot_forge_or_replay_validation",
-               "xtask::pipeline mutable_journal_cannot_extend_authorization_or_invent_gate_runs",
-               "xtask::pipeline operator_journal_dispatch_records_and_allocates_nothing",
-               "xtask::pipeline override_on_a_not_overridable_cell_is_refused",
-               "xtask::pipeline partial_asset_upload_resumes_without_duplicates",
-               "xtask::pipeline pending_pins_block_preflight_before_any_build",
-               "xtask::pipeline preflight_refuses_bad_version_notes_and_triggers",
-               "xtask::pipeline promotion_with_a_missing_gate_is_refused",
-               "xtask::pipeline rehearsal_never_touches_production_and_cleans_up_its_own_draft",
-               "xtask::pipeline runner_lost_mid_validation_is_blocked",
-               "xtask::pipeline same_identity_resumes_without_rebuilding",
-               "xtask::pipeline status_is_read_only",
-               "xtask::pipeline tag_on_a_different_commit_fails_and_publishes_nothing",
-               "xtask::pipeline test_jobs_get_exact_bytes_from_run_artifacts_and_refuse_anything_else"
-            ],
-            "suites" : [
-               "xtask-pipeline"
-            ]
-         },
-         {
-            "exit" : 0,
-            "expected_tests" : [
-               "awman-cli::component squad::env_transport::child_shell_sync_rotates_only_declared_values_and_read_only_queries_do_not_push",
-               "awman-cli::component squad::environment::env_sync_accepts_only_required_names_and_keeps_each_daemon_private",
-               "awman-cli::component squad::refusal::sandbox_refusal_precedes_task_allocation_and_every_runtime_call",
-               "awman-cli::component squad::scheduling::concurrent_ticks_share_capacity_and_cancelled_evaluations_leave_no_running_rows",
-               "awman-cli::component squad::scheduling::malformed_config_admits_nothing_then_recovers_without_restart",
-               "awman-cli::component squad::scheduling::repair_exhaustion_records_failure_and_backoff_advances_only_with_clock"
-            ],
-            "suites" : [
-               "component-squad"
-            ]
-         },
-         {
-            "exit" : 0,
-            "expected_tests" : [
-               "xtask::release_contract resume_after_auth_interrupt",
-               "xtask::release_contract resume_after_commit_interrupt",
-               "xtask::release_contract resume_after_notes_interrupt",
-               "xtask::release_contract resume_after_push_interrupt",
-               "xtask::release_contract resume_after_runner_interrupt",
-               "xtask::release_contract resume_after_tag_interrupt",
-               "xtask::release_contract resume_after_tests_interrupt",
-               "xtask::release_contract resume_after_version_interrupt",
-               "xtask::release_contract resume_after_watch_interrupt",
-               "xtask::release_contract row_01_usage_and_runner_mode",
-               "xtask::release_contract row_02_version_validation",
-               "xtask::release_contract row_03_steps_and_markers",
-               "xtask::release_contract row_04_resume_each_preparation_and_github_state",
-               "xtask::release_contract row_05_tty_defaults_and_no_tty",
-               "xtask::release_contract row_06_authentication",
-               "xtask::release_contract row_07_off_main",
-               "xtask::release_contract row_08_divergence",
-               "xtask::release_contract row_09_dirty_files_and_evidence_mismatch",
-               "xtask::release_contract row_10_remote_tag_and_published_resume",
-               "xtask::release_contract row_11_runner_selection",
-               "xtask::release_contract row_12_portable_version_bump",
-               "xtask::release_contract row_13_notes_template_and_chat",
-               "xtask::release_contract row_14_local_pass_hash_and_reuse",
-               "xtask::release_contract row_15_fail_skip_clipboard_and_fix",
-               "xtask::release_contract row_16_commit_only_release_paths",
-               "xtask::release_contract row_17_local_tag_create_reuse_and_mismatch",
-               "xtask::release_contract row_18_queued_cancel_default_and_decline",
-               "xtask::release_contract row_20_push_then_candidate_never_tag",
-               "xtask::release_contract row_21_unmanaged_follow_line",
-               "xtask::release_contract row_22_watch_rerun_and_verified_success",
-               "xtask::release_contract row_23_teardown_success_failure_and_double_interrupt",
-               "xtask::release_contract row_24_end_state_matches_operator_contract",
-               "xtask::release_contract runner::deregistration_failure_retains_repair_state",
-               "xtask::release_contract runner::failed_registration_releases_owned_state_and_keeps_existing_work",
-               "xtask::release_contract runner::missing_group_or_bad_archive_cannot_obtain_a_registration_token",
-               "xtask::release_contract runner::provisioning_is_manifest_verified_and_failure_stops_before_registration"
-            ],
-            "suites" : [
-               "xtask-release-contract"
-            ]
-         },
-         {
-            "exit" : 0,
-            "expected_tests" : [
-               "awman-cli::component command::admission::accepted_session_replays_after_dropped_response_without_duplication",
-               "awman-cli::component command::admission::idempotency_key_boundaries_and_server_failure_release_are_explicit",
-               "awman-cli::component command::admission::reservations_are_scoped_and_only_the_owner_can_release_them",
-               "awman-cli::component command::admission::setup_and_closed_sessions_refuse_command_admission",
-               "awman-cli::component command::admission::validation_and_authorization_leave_no_durable_work",
-               "awman-cli::component command::admission::write_failure_compensates_before_a_key_can_be_retried",
-               "awman-cli::component command::catalogue::authorization_is_checked_for_every_leaf_and_alias",
-               "awman-cli::component command::catalogue::each_command_rejects_unknown_flags_before_execution",
-               "awman-cli::component command::catalogue::every_catalogue_leaf_has_a_reviewed_command_contract",
-               "awman-cli::component command::catalogue::generated_reference_covers_public_paths_and_hides_internal_commands",
-               "awman-cli::component command::catalogue::lookup_resolves_every_leaf_and_refuses_unknown_paths",
-               "awman-cli::component command::config::every_config_key_has_a_command_row_or_a_declared_map_container",
-               "awman-cli::component command::failures::execution_outcomes_preserve_nonzero_and_absent_agent_exit_codes",
-               "awman-cli::component command::failures::failures_keep_their_exit_http_and_machine_code_classification",
-               "awman-cli::component command::scaffolding::global_scaffolds_and_empty_pull_all_use_only_the_session_home",
-               "awman-cli::component command::workflow::cancellation_is_idempotent_and_never_fires_another_commands_token",
-               "awman-cli::component command::workflow::concurrent_idempotent_submissions_have_exactly_one_owner",
-               "awman-cli::component command::workflow::concurrent_workflow_events_have_one_order_and_done_fences_late_output",
-               "awman-cli::component command::workflow::crash_completion_is_finalized_before_cancellation_can_overwrite_it"
-            ],
-            "suites" : [
-               "component-command"
-            ]
-         },
-         {
-            "exit" : 0,
-            "expected_tests" : [
-               "awman-cli::component daemon::api::network_auth_is_required_keys_are_owner_only_and_revocation_is_immediate",
-               "awman-cli::component daemon::api::network_visibility_hides_unserved_features_and_malformed_routes_are_bounded",
-               "awman-cli::component daemon::browser::browser_origin_never_authorizes_api_keys_or_caller_selected_scope",
-               "awman-cli::component daemon::browser::browser_pairing_is_one_use_origin_bound_and_owner_revocable",
-               "awman-cli::component daemon::browser::removing_an_origin_ends_grant_watchers_and_pending_links_before_reload_returns",
-               "awman-cli::component daemon::lifecycle::regression_585680c3_f23e75a4_9eac9cda_two_ready_daemons_have_distinct_state",
-               "awman-cli::component daemon::local_security::owner_endpoint_is_private_and_tampered_metadata_cannot_redirect_clients",
-               "awman-cli::component daemon::reload::daemon_status_and_stop_keep_their_cli_and_json_contracts",
-               "awman-cli::component daemon::reload::reload_switches_admission_without_restarting_and_invalid_changes_are_atomic"
-            ],
-            "suites" : [
-               "component-daemon"
-            ]
-         },
-         {
-            "exit" : 0,
-            "expected_tests" : [
-               "awman-cli::component command::builtin::catalogue_explains_each_command_before_execution",
-               "awman-cli::component command::builtin::config_edits_are_durable_and_invalid_values_are_atomic",
-               "awman-cli::component command::builtin::workflow_preflight_is_read_only_and_missing_work_is_typed"
-            ],
-            "suites" : [
-               "component-command-builtin"
-            ]
-         },
-         {
-            "exit" : 0,
-            "expected_tests" : [
-               "awman-cli::component frontend::probe::help_and_version_are_successful_without_runtime_or_daemon_startup"
-            ],
-            "suites" : [
-               "component-frontend"
-            ]
-         },
-         {
-            "exit" : 0,
-            "expected_tests" : [
-               "awman-cli::component tools::architecture::architecture_gate_detects_cross_layer_calls_and_scanner_failure",
-               "awman-cli::component tools::entitlements_mismatch_fails_verification",
-               "awman-cli::component tools::signature_verification_preserves_exact_candidate_bytes"
-            ],
-            "suites" : [
-               "component-tools"
-            ]
-         },
-         {
-            "exit" : 0,
-            "expected_tests" : [
-               "awman-cli::component parity::daemon::config_mutations_are_durable_and_invalid_edits_are_atomic"
-            ],
-            "suites" : [
-               "component-parity-daemon"
-            ]
-         },
-         {
-            "exit" : 0,
-            "expected_tests" : [
-               "xtask::ci a_tampered_archive_fails_digest_verification",
-               "xtask::ci a_wrong_independent_digest_fails_even_when_the_record_matches",
-               "xtask::ci actionlint_config_declares_every_self_hosted_label_once",
-               "xtask::ci cache_keys_are_stable_and_differ_by_build",
-               "xtask::ci called_full_gate_and_candidate_main_have_disjoint_artifact_names",
-               "xtask::ci lint_job_executes_each_lint_once_while_legacy_shim_waits_for_protection_cutover",
-               "xtask::ci unknown_helper_is_refused_with_usage"
-            ],
-            "suites" : [
-               "xtask-ci"
-            ]
-         },
-         {
-            "exit" : 0,
-            "expected_tests" : [
-               "awman-test-support capability::tests::credentials_never_print",
-               "awman-test-support capability::tests::docker_grant_sets_the_engine_and_opt_in",
-               "awman-test-support capability::tests::guaranteed_and_present_is_granted",
-               "awman-test-support capability::tests::guaranteed_but_absent_is_blocked_not_skipped",
-               "awman-test-support capability::tests::implemented_ids_equal_the_manifest_ids",
-               "awman-test-support capability::tests::not_available_to_the_tier_is_misplaced",
-               "awman-test-support config::tests::builtin_defaults_cover_every_tier",
-               "awman-test-support config::tests::builtin_defaults_match_the_committed_manifest",
-               "awman-test-support config::tests::missing_workspace_manifest_falls_back_to_defaults",
-               "awman-test-support config::tests::parse_reads_tiers_capabilities_and_fixtures",
-               "awman-test-support config::tests::unreadable_explicit_config_blocks",
-               "awman-test-support conformance::tests::empty_report_does_not_conform",
-               "awman-test-support env::tests::iteration_is_sorted",
-               "awman-test-support env::tests::prepend_path_keeps_existing_entries",
-               "awman-test-support env::tests::resolve_uses_only_this_path",
-               "awman-test-support env::tests::set_get_remove",
-               "awman-test-support evidence::tests::file_stems_are_safe",
-               "awman-test-support evidence::tests::notes_are_per_thread_and_taken_once",
-               "awman-test-support evidence::tests::test_id_names_the_test_thread",
-               "awman-test-support evidence::tests::toolchain_and_target_are_known",
-               "awman-test-support evidence::tests::write_record_copies_process_output",
-               "awman-test-support exe::tests::cargo_bin_falls_back_to_the_compiled_path",
-               "awman-test-support exe::tests::cargo_bin_prefers_the_sibling_of_the_running_test_binary",
-               "awman-test-support exe::tests::content_addressed_copy_is_stable",
-               "awman-test-support exe::tests::install_as_links_and_refuses_duplicates",
-               "awman-test-support fakes::cli::tests::escaping_round_trips",
-               "awman-test-support fakes::cli::tests::rule_render_is_line_oriented",
-               "awman-test-support fakes::git_http::tests::cgi_status_headers_and_body",
-               "awman-test-support fakes::registry::tests::routes_nested_names",
-               "awman-test-support fixtures::config_tree::tests::writes_both_levels",
-               "awman-test-support fixtures::credentials::tests::writes_secrets_inside_home_and_redacts_them",
-               "awman-test-support fixtures::oci::tests::digests_are_deterministic_and_order_independent",
-               "awman-test-support fixtures::oci::tests::layout_and_archive_contain_every_blob",
-               "awman-test-support fixtures::oci::tests::manifest_references_config_and_layers",
-               "awman-test-support fixtures::tests::pending_or_digestless_pins_block_and_valid_pins_resolve",
-               "awman-test-support fixtures::tests::sha256_of_known_input",
-               "awman-test-support fixtures::tests::unpinned_fixture_blocks",
-               "awman-test-support fixtures::tests::verify_rejects_mismatch_missing_and_symlink",
-               "awman-test-support fixtures::work_item::tests::renders_the_template_sections",
-               "awman-test-support fixtures::workflow::tests::renders_parseable_steps",
-               "awman-test-support golden::tests::equal_passes_and_difference_shows_lines",
-               "awman-test-support golden::tests::missing_file_fails_unless_updating",
-               "awman-test-support golden::tests::never_updates_on_ci",
-               "awman-test-support http::tests::parses_content_length_and_chunked_bodies",
-               "awman-test-support http::tests::percent_decoding",
-               "awman-test-support leak::tests::displays_kind_and_detail",
-               "awman-test-support process::tests::exit_display_and_success",
-               "awman-test-support process::tests::line_prefix_matching",
-               "awman-test-support process::tests::tail_respects_char_boundaries",
-               "awman-test-support runtime_env::tests::empty_values_are_unset_and_ci_false_is_off",
-               "awman-test-support runtime_env::tests::host_resources_parse_names_and_values",
-               "awman-test-support runtime_env::tests::unknown_variables_are_ignored",
-               "awman-test-support runtime_env::tests::unset_means_no_host_resources",
-               "awman-test-support sandbox::tests::agent_programs_are_refused",
-               "awman-test-support sandbox::tests::default_env_is_complete_and_private",
-               "awman-test-support sandbox::tests::git_config_disables_hooks_helpers_and_signing",
-               "awman-test-support sandbox::tests::long_roots_get_a_short_private_socket_dir",
-               "awman-test-support sandbox::tests::short_roots_keep_sockets_inside",
-               "awman-test-support sandbox::tests::unit_sandbox_has_the_layout_and_cleans_up",
-               "awman-test-support sandbox::tests::unit_sandbox_refuses_processes_and_sockets",
-               "awman-test-support tier::tests::budgets_follow_the_manifest",
-               "awman-test-support tier::tests::constructors_set_the_tier",
-               "awman-test-support tier::tests::names_round_trip",
-               "awman-test-support tier::tests::only_unit_may_not_spawn",
-               "awman-test-support wait::tests::async_variant_waits_and_expires",
-               "awman-test-support wait::tests::expiry_panics_with_what_and_diagnostics",
-               "awman-test-support wait::tests::poll_gives_up_without_panicking",
-               "awman-test-support wait::tests::returns_the_first_some"
-            ],
-            "suites" : [
-               "unit-test-support"
-            ]
-         },
-         {
-            "exit" : 0,
-            "expected_tests" : [
-               "awman-test-support::component canary::children_never_see_or_change_the_real_home_or_git_config",
-               "awman-test-support::component canary::sandboxes_live_under_the_test_temp_root",
-               "awman-test-support::component capability::a_capability_outside_the_tier_is_misplaced",
-               "awman-test-support::component capability::a_guaranteed_but_absent_capability_blocks",
-               "awman-test-support::component capability::boundary_sandboxes_state_their_tier",
-               "awman-test-support::component capability::granting_adds_the_capability_environment",
-               "awman-test-support::component capability::guaranteed_capabilities_are_granted",
-               "awman-test-support::component evidence::a_panicking_test_writes_a_failure_record_and_keeps_the_sandbox",
-               "awman-test-support::component evidence::a_passing_test_leaves_nothing_behind",
-               "awman-test-support::component evidence::on_finish_probes_report_leaks",
-               "awman-test-support::component example::a_held_tool_is_observed_released_and_reaped",
-               "awman-test-support::component fake_cli::hold_blocks_until_released",
-               "awman-test-support::component fake_cli::the_longest_matching_prefix_wins",
-               "awman-test-support::component fake_cli::the_persona_comes_from_the_installed_name_not_the_environment",
-               "awman-test-support::component fake_cli::the_protocol_version_is_checked",
-               "awman-test-support::component fake_cli::touch_creates_files",
-               "awman-test-support::component fake_cli::unmatched_invocations_exit_127_and_are_recorded",
-               "awman-test-support::component fake_cli::values_with_newlines_tabs_and_percent_round_trip",
-               "awman-test-support::component fake_cli::without_a_scenario_the_fake_exits_127",
-               "awman-test-support::component fakes::a_fake_docker_without_rules_does_not_conform",
-               "awman-test-support::component fakes::fake_docker_cli_conforms_with_the_baseline_rules",
-               "awman-test-support::component fakes::fake_git_http_serves_clone_and_push",
-               "awman-test-support::component fakes::fake_registry_conforms",
-               "awman-test-support::component fakes::fake_registry_serves_inserted_images",
-               "awman-test-support::component fakes::fake_work_server_conforms",
-               "awman-test-support::component fixtures::branches_worktrees_and_bare_remotes",
-               "awman-test-support::component fixtures::git_runs_with_the_sandbox_identity_and_config",
-               "awman-test-support::component fixtures::repositories_have_deterministic_commit_ids",
-               "awman-test-support::component fixtures::text_fixtures_land_in_the_repository",
-               "awman-test-support::component ports::a_listener_still_open_at_the_end_is_a_leak",
-               "awman-test-support::component ports::listeners_are_loopback_port_zero_and_tracked",
-               "awman-test-support::component ports::socket_names_must_be_plain",
-               "awman-test-support::component ports::tcp_readiness_waits_for_accepting",
-               "awman-test-support::component ports::tracked_child_addresses_are_checked_too",
-               "awman-test-support::component ports::unix_sockets_live_in_the_short_dir_and_must_be_removed",
-               "awman-test-support::component process::agents_are_refused_directly_and_through_interpreters",
-               "awman-test-support::component process::child_environment_is_exactly_the_sandbox_map",
-               "awman-test-support::component process::children_inherit_only_stdio",
-               "awman-test-support::component process::deadline_kills_the_whole_tree",
-               "awman-test-support::component process::dropping_a_child_kills_its_tree",
-               "awman-test-support::component process::env_remove_and_current_dir_apply",
-               "awman-test-support::component process::file_readiness_detects_early_exit",
-               "awman-test-support::component process::interrupt_and_terminate_reach_the_child",
-               "awman-test-support::component process::large_output_is_bounded_and_marked",
-               "awman-test-support::component process::leader_exit_with_running_descendants_is_a_leak",
-               "awman-test-support::component process::many_concurrent_installs_and_spawns_never_hit_text_file_busy",
-               "awman-test-support::component process::output_is_drained_to_proc_files",
-               "awman-test-support::component process::piped_stdin_reaches_the_child",
-               "awman-test-support::component process::programs_must_be_on_the_sandbox_path",
-               "awman-test-support::component process::readiness_failure_panics_with_the_output",
-               "awman-test-support::component process::spawn_waits_for_a_ready_line",
-               "awman-test-support::component process::stdin_is_null_by_default_and_bytes_are_delivered",
-               "awman-test-support::component process::system_tools_run_with_the_sandbox_environment",
-               "awman-test-support::component process::unregistered_executables_inside_the_sandbox_are_refused",
-               "awman-test-support::component process::wait_expiry_kills_and_panics",
-               "awman-test-support::component pty::pty_child_sees_a_terminal_and_receives_input",
-               "awman-test-support::component pty::pty_deadline_kills_the_child",
-               "awman-test-support::component pty::wait_drains_final_output_before_returning_the_exit_status",
-               "awman-test-support::component security::descendants_cannot_create_new_sessions",
-               "awman-test-support::component security::generic_registration_cannot_authorize_host_keychain_or_agent_names",
-               "awman-test-support::component security::registered_interpreters_still_check_their_arguments"
-            ],
-            "suites" : [
-               "component-test-support"
-            ]
-         },
-         {
-            "exit" : 0,
-            "expected_tests" : [
-               "awman-wsp mock::state_model::lease_state_model_exclusive_claim_expiry_completion_and_stale_epoch"
-            ],
-            "suites" : [
-               "unit-wsp"
-            ]
-         },
          {
             "exit" : 0,
             "expected_tests" : [
@@ -562,6 +123,384 @@
          {
             "exit" : 0,
             "expected_tests" : [
+               "awman-cli::component parity::builtin::config_mutations_are_durable_and_invalid_edits_are_atomic"
+            ],
+            "suites" : [
+               "component-parity-builtin"
+            ]
+         },
+         {
+            "exit" : 0,
+            "expected_tests" : [
+               "awman-test-support::component canary::children_never_see_or_change_the_real_home_or_git_config",
+               "awman-test-support::component canary::sandboxes_live_under_the_test_temp_root",
+               "awman-test-support::component capability::a_capability_outside_the_tier_is_misplaced",
+               "awman-test-support::component capability::a_guaranteed_but_absent_capability_blocks",
+               "awman-test-support::component capability::boundary_sandboxes_state_their_tier",
+               "awman-test-support::component capability::granting_adds_the_capability_environment",
+               "awman-test-support::component capability::guaranteed_capabilities_are_granted",
+               "awman-test-support::component evidence::a_panicking_test_writes_a_failure_record_and_keeps_the_sandbox",
+               "awman-test-support::component evidence::a_passing_test_leaves_nothing_behind",
+               "awman-test-support::component evidence::on_finish_probes_report_leaks",
+               "awman-test-support::component example::a_held_tool_is_observed_released_and_reaped",
+               "awman-test-support::component fake_cli::hold_blocks_until_released",
+               "awman-test-support::component fake_cli::the_longest_matching_prefix_wins",
+               "awman-test-support::component fake_cli::the_persona_comes_from_the_installed_name_not_the_environment",
+               "awman-test-support::component fake_cli::the_protocol_version_is_checked",
+               "awman-test-support::component fake_cli::touch_creates_files",
+               "awman-test-support::component fake_cli::unmatched_invocations_exit_127_and_are_recorded",
+               "awman-test-support::component fake_cli::values_with_newlines_tabs_and_percent_round_trip",
+               "awman-test-support::component fake_cli::without_a_scenario_the_fake_exits_127",
+               "awman-test-support::component fakes::a_fake_docker_without_rules_does_not_conform",
+               "awman-test-support::component fakes::fake_docker_cli_conforms_with_the_baseline_rules",
+               "awman-test-support::component fakes::fake_git_http_serves_clone_and_push",
+               "awman-test-support::component fakes::fake_registry_conforms",
+               "awman-test-support::component fakes::fake_registry_serves_inserted_images",
+               "awman-test-support::component fakes::fake_work_server_conforms",
+               "awman-test-support::component fixtures::branches_worktrees_and_bare_remotes",
+               "awman-test-support::component fixtures::git_runs_with_the_sandbox_identity_and_config",
+               "awman-test-support::component fixtures::repositories_have_deterministic_commit_ids",
+               "awman-test-support::component fixtures::text_fixtures_land_in_the_repository",
+               "awman-test-support::component ports::a_listener_still_open_at_the_end_is_a_leak",
+               "awman-test-support::component ports::listeners_are_loopback_port_zero_and_tracked",
+               "awman-test-support::component ports::socket_names_must_be_plain",
+               "awman-test-support::component ports::tcp_readiness_waits_for_accepting",
+               "awman-test-support::component ports::tracked_child_addresses_are_checked_too",
+               "awman-test-support::component ports::unix_sockets_live_in_the_short_dir_and_must_be_removed",
+               "awman-test-support::component process::agents_are_refused_directly_and_through_interpreters",
+               "awman-test-support::component process::child_environment_is_exactly_the_sandbox_map",
+               "awman-test-support::component process::children_inherit_only_stdio",
+               "awman-test-support::component process::deadline_kills_the_whole_tree",
+               "awman-test-support::component process::dropping_a_child_kills_its_tree",
+               "awman-test-support::component process::env_remove_and_current_dir_apply",
+               "awman-test-support::component process::file_readiness_detects_early_exit",
+               "awman-test-support::component process::interrupt_and_terminate_reach_the_child",
+               "awman-test-support::component process::large_output_is_bounded_and_marked",
+               "awman-test-support::component process::leader_exit_with_running_descendants_is_a_leak",
+               "awman-test-support::component process::many_concurrent_installs_and_spawns_never_hit_text_file_busy",
+               "awman-test-support::component process::output_is_drained_to_proc_files",
+               "awman-test-support::component process::piped_stdin_reaches_the_child",
+               "awman-test-support::component process::programs_must_be_on_the_sandbox_path",
+               "awman-test-support::component process::readiness_failure_panics_with_the_output",
+               "awman-test-support::component process::spawn_waits_for_a_ready_line",
+               "awman-test-support::component process::stdin_is_null_by_default_and_bytes_are_delivered",
+               "awman-test-support::component process::system_tools_run_with_the_sandbox_environment",
+               "awman-test-support::component process::unregistered_executables_inside_the_sandbox_are_refused",
+               "awman-test-support::component process::wait_expiry_kills_and_panics",
+               "awman-test-support::component pty::pty_child_sees_a_terminal_and_receives_input",
+               "awman-test-support::component pty::pty_deadline_kills_the_child",
+               "awman-test-support::component pty::wait_drains_final_output_before_returning_the_exit_status",
+               "awman-test-support::component security::descendants_cannot_create_new_sessions",
+               "awman-test-support::component security::generic_registration_cannot_authorize_host_keychain_or_agent_names",
+               "awman-test-support::component security::registered_interpreters_still_check_their_arguments"
+            ],
+            "suites" : [
+               "component-test-support"
+            ]
+         },
+         {
+            "exit" : 0,
+            "expected_tests" : [
+               "xtask::ci a_tampered_archive_fails_digest_verification",
+               "xtask::ci a_wrong_independent_digest_fails_even_when_the_record_matches",
+               "xtask::ci actionlint_config_declares_every_self_hosted_label_once",
+               "xtask::ci cache_keys_are_stable_and_differ_by_build",
+               "xtask::ci called_full_gate_and_candidate_main_have_disjoint_artifact_names",
+               "xtask::ci lint_job_executes_each_lint_once_while_legacy_shim_waits_for_protection_cutover",
+               "xtask::ci unknown_helper_is_refused_with_usage"
+            ],
+            "suites" : [
+               "xtask-ci"
+            ]
+         },
+         {
+            "exit" : 0,
+            "expected_tests" : [
+               "awman-test-support capability::tests::credentials_never_print",
+               "awman-test-support capability::tests::docker_grant_sets_the_engine_and_opt_in",
+               "awman-test-support capability::tests::guaranteed_and_present_is_granted",
+               "awman-test-support capability::tests::guaranteed_but_absent_is_blocked_not_skipped",
+               "awman-test-support capability::tests::implemented_ids_equal_the_manifest_ids",
+               "awman-test-support capability::tests::not_available_to_the_tier_is_misplaced",
+               "awman-test-support config::tests::builtin_defaults_cover_every_tier",
+               "awman-test-support config::tests::builtin_defaults_match_the_committed_manifest",
+               "awman-test-support config::tests::missing_workspace_manifest_falls_back_to_defaults",
+               "awman-test-support config::tests::parse_reads_tiers_capabilities_and_fixtures",
+               "awman-test-support config::tests::unreadable_explicit_config_blocks",
+               "awman-test-support conformance::tests::empty_report_does_not_conform",
+               "awman-test-support env::tests::iteration_is_sorted",
+               "awman-test-support env::tests::prepend_path_keeps_existing_entries",
+               "awman-test-support env::tests::resolve_uses_only_this_path",
+               "awman-test-support env::tests::set_get_remove",
+               "awman-test-support evidence::tests::file_stems_are_safe",
+               "awman-test-support evidence::tests::notes_are_per_thread_and_taken_once",
+               "awman-test-support evidence::tests::test_id_names_the_test_thread",
+               "awman-test-support evidence::tests::toolchain_and_target_are_known",
+               "awman-test-support evidence::tests::write_record_copies_process_output",
+               "awman-test-support exe::tests::cargo_bin_falls_back_to_the_compiled_path",
+               "awman-test-support exe::tests::cargo_bin_prefers_the_sibling_of_the_running_test_binary",
+               "awman-test-support exe::tests::content_addressed_copy_is_stable",
+               "awman-test-support exe::tests::install_as_links_and_refuses_duplicates",
+               "awman-test-support fakes::cli::tests::escaping_round_trips",
+               "awman-test-support fakes::cli::tests::rule_render_is_line_oriented",
+               "awman-test-support fakes::git_http::tests::cgi_status_headers_and_body",
+               "awman-test-support fakes::registry::tests::routes_nested_names",
+               "awman-test-support fixtures::config_tree::tests::writes_both_levels",
+               "awman-test-support fixtures::credentials::tests::writes_secrets_inside_home_and_redacts_them",
+               "awman-test-support fixtures::oci::tests::digests_are_deterministic_and_order_independent",
+               "awman-test-support fixtures::oci::tests::layout_and_archive_contain_every_blob",
+               "awman-test-support fixtures::oci::tests::manifest_references_config_and_layers",
+               "awman-test-support fixtures::tests::pending_or_digestless_pins_block_and_valid_pins_resolve",
+               "awman-test-support fixtures::tests::sha256_of_known_input",
+               "awman-test-support fixtures::tests::unpinned_fixture_blocks",
+               "awman-test-support fixtures::tests::verify_rejects_mismatch_missing_and_symlink",
+               "awman-test-support fixtures::work_item::tests::renders_the_template_sections",
+               "awman-test-support fixtures::workflow::tests::renders_parseable_steps",
+               "awman-test-support golden::tests::equal_passes_and_difference_shows_lines",
+               "awman-test-support golden::tests::missing_file_fails_unless_updating",
+               "awman-test-support golden::tests::never_updates_on_ci",
+               "awman-test-support http::tests::parses_content_length_and_chunked_bodies",
+               "awman-test-support http::tests::percent_decoding",
+               "awman-test-support leak::tests::displays_kind_and_detail",
+               "awman-test-support process::tests::exit_display_and_success",
+               "awman-test-support process::tests::line_prefix_matching",
+               "awman-test-support process::tests::tail_respects_char_boundaries",
+               "awman-test-support runtime_env::tests::empty_values_are_unset_and_ci_false_is_off",
+               "awman-test-support runtime_env::tests::host_resources_parse_names_and_values",
+               "awman-test-support runtime_env::tests::unknown_variables_are_ignored",
+               "awman-test-support runtime_env::tests::unset_means_no_host_resources",
+               "awman-test-support sandbox::tests::agent_programs_are_refused",
+               "awman-test-support sandbox::tests::default_env_is_complete_and_private",
+               "awman-test-support sandbox::tests::git_config_disables_hooks_helpers_and_signing",
+               "awman-test-support sandbox::tests::long_roots_get_a_short_private_socket_dir",
+               "awman-test-support sandbox::tests::short_roots_keep_sockets_inside",
+               "awman-test-support sandbox::tests::unit_sandbox_has_the_layout_and_cleans_up",
+               "awman-test-support sandbox::tests::unit_sandbox_refuses_processes_and_sockets",
+               "awman-test-support tier::tests::budgets_follow_the_manifest",
+               "awman-test-support tier::tests::constructors_set_the_tier",
+               "awman-test-support tier::tests::names_round_trip",
+               "awman-test-support tier::tests::only_unit_may_not_spawn",
+               "awman-test-support wait::tests::async_variant_waits_and_expires",
+               "awman-test-support wait::tests::expiry_panics_with_what_and_diagnostics",
+               "awman-test-support wait::tests::poll_gives_up_without_panicking",
+               "awman-test-support wait::tests::returns_the_first_some"
+            ],
+            "suites" : [
+               "unit-test-support"
+            ]
+         },
+         {
+            "exit" : 0,
+            "expected_tests" : [
+               "awman-cli::component command::differential::command_traces_match_between_builtin_and_daemon"
+            ],
+            "suites" : [
+               "component-command-differential"
+            ]
+         },
+         {
+            "exit" : 0,
+            "expected_tests" : [
+               "awman-cli::component command::admission::accepted_session_replays_after_dropped_response_without_duplication",
+               "awman-cli::component command::admission::idempotency_key_boundaries_and_server_failure_release_are_explicit",
+               "awman-cli::component command::admission::reservations_are_scoped_and_only_the_owner_can_release_them",
+               "awman-cli::component command::admission::setup_and_closed_sessions_refuse_command_admission",
+               "awman-cli::component command::admission::validation_and_authorization_leave_no_durable_work",
+               "awman-cli::component command::admission::write_failure_compensates_before_a_key_can_be_retried",
+               "awman-cli::component command::catalogue::authorization_is_checked_for_every_leaf_and_alias",
+               "awman-cli::component command::catalogue::each_command_rejects_unknown_flags_before_execution",
+               "awman-cli::component command::catalogue::every_catalogue_leaf_has_a_reviewed_command_contract",
+               "awman-cli::component command::catalogue::generated_reference_covers_public_paths_and_hides_internal_commands",
+               "awman-cli::component command::catalogue::lookup_resolves_every_leaf_and_refuses_unknown_paths",
+               "awman-cli::component command::config::every_config_key_has_a_command_row_or_a_declared_map_container",
+               "awman-cli::component command::failures::execution_outcomes_preserve_nonzero_and_absent_agent_exit_codes",
+               "awman-cli::component command::failures::failures_keep_their_exit_http_and_machine_code_classification",
+               "awman-cli::component command::scaffolding::global_scaffolds_and_empty_pull_all_use_only_the_session_home",
+               "awman-cli::component command::workflow::cancellation_is_idempotent_and_never_fires_another_commands_token",
+               "awman-cli::component command::workflow::concurrent_idempotent_submissions_have_exactly_one_owner",
+               "awman-cli::component command::workflow::concurrent_workflow_events_have_one_order_and_done_fences_late_output",
+               "awman-cli::component command::workflow::crash_completion_is_finalized_before_cancellation_can_overwrite_it"
+            ],
+            "suites" : [
+               "component-command"
+            ]
+         },
+         {
+            "exit" : 0,
+            "expected_tests" : [
+               "xtask::pipeline abandon_keeps_evidence_and_refuses_promoted_versions",
+               "xtask::pipeline candidate_validates_promotes_and_verifies_the_same_bytes",
+               "xtask::pipeline changed_inputs_never_reuse_stale_evidence",
+               "xtask::pipeline commit_no_longer_an_ancestor_of_main_voids_the_candidate",
+               "xtask::pipeline concurrent_candidates_for_one_version_end_blocked_with_nothing_published",
+               "xtask::pipeline expired_evidence_is_refused",
+               "xtask::pipeline failed_commands_missing_shards_skipped_counts_and_empty_assertions_cannot_validate",
+               "xtask::pipeline failed_suite_reruns_against_the_same_artifacts_only",
+               "xtask::pipeline fetched_artifact_is_absolute_and_executable_from_another_directory",
+               "xtask::pipeline forged_or_stale_evidence_cannot_validate",
+               "xtask::pipeline interrupted_promotion_resumes_between_tag_and_publish",
+               "xtask::pipeline live_main_policy_wins_over_a_stale_checkout_before_tag_and_publish",
+               "xtask::pipeline mutable_draft_cannot_forge_or_replay_validation",
+               "xtask::pipeline mutable_journal_cannot_extend_authorization_or_invent_gate_runs",
+               "xtask::pipeline operator_journal_dispatch_records_and_allocates_nothing",
+               "xtask::pipeline override_on_a_not_overridable_cell_is_refused",
+               "xtask::pipeline partial_asset_upload_resumes_without_duplicates",
+               "xtask::pipeline pending_pins_block_preflight_before_any_build",
+               "xtask::pipeline preflight_refuses_bad_version_notes_and_triggers",
+               "xtask::pipeline promotion_with_a_missing_gate_is_refused",
+               "xtask::pipeline rehearsal_never_touches_production_and_cleans_up_its_own_draft",
+               "xtask::pipeline runner_lost_mid_validation_is_blocked",
+               "xtask::pipeline same_identity_resumes_without_rebuilding",
+               "xtask::pipeline status_is_read_only",
+               "xtask::pipeline tag_on_a_different_commit_fails_and_publishes_nothing",
+               "xtask::pipeline test_jobs_get_exact_bytes_from_run_artifacts_and_refuse_anything_else"
+            ],
+            "suites" : [
+               "xtask-pipeline"
+            ]
+         },
+         {
+            "exit" : 0,
+            "expected_tests" : [
+               "awman-cli::component frontend::probe::help_and_version_are_successful_without_runtime_or_daemon_startup"
+            ],
+            "suites" : [
+               "component-frontend"
+            ]
+         },
+         {
+            "exit" : 0,
+            "expected_tests" : [
+               "awman-cli::component squad::env_transport::child_shell_sync_rotates_only_declared_values_and_read_only_queries_do_not_push",
+               "awman-cli::component squad::environment::env_sync_accepts_only_required_names_and_keeps_each_daemon_private",
+               "awman-cli::component squad::refusal::sandbox_refusal_precedes_task_allocation_and_every_runtime_call",
+               "awman-cli::component squad::scheduling::concurrent_ticks_share_capacity_and_cancelled_evaluations_leave_no_running_rows",
+               "awman-cli::component squad::scheduling::malformed_config_admits_nothing_then_recovers_without_restart",
+               "awman-cli::component squad::scheduling::repair_exhaustion_records_failure_and_backoff_advances_only_with_clock"
+            ],
+            "suites" : [
+               "component-squad"
+            ]
+         },
+         {
+            "exit" : 0,
+            "expected_tests" : [
+               "awman-cli::component worker::checkout::checkout_merges_declared_refs_and_resumes_the_published_branch",
+               "awman-cli::component worker::checkout::checkout_refuses_tag_and_missing_merge_refs_after_owned_remote_lookup",
+               "awman-cli::component worker::client_transport::access_refresh_is_single_flight_and_revoked_or_twice_rejected_tokens_stop",
+               "awman-cli::component worker::client_transport::authenticated_requests_preserve_base_path_version_and_query",
+               "awman-cli::component worker::client_transport::link_denial_and_unsafe_identifiers_never_become_transport_requests",
+               "awman-cli::component worker::conformance_defects::client_counts_empty_event_acknowledgements_and_duplicate_posts_are_idempotent",
+               "awman-cli::component worker::conformance_defects::probes_detect_ignored_preferences_epochs_and_duplicate_event_storage",
+               "awman-cli::component worker::conformance_defects::wire_claims",
+               "awman-cli::component worker::conformance_defects::wire_credentials",
+               "awman-cli::component worker::conformance_defects::wire_error",
+               "awman-cli::component worker::conformance_defects::wire_events",
+               "awman-cli::component worker::conformance_defects::wire_heartbeat",
+               "awman-cli::component worker::conformance_defects::wire_link",
+               "awman-cli::component worker::conformance_defects::wire_queue",
+               "awman-cli::component worker::conformance_defects::wire_register",
+               "awman-cli::component worker::conformance_defects::wire_release",
+               "awman-cli::component worker::conformance_defects::wire_result",
+               "awman-cli::component worker::conformance_defects::wire_token",
+               "awman-cli::component worker::protocol::expired_access_refreshes_once_and_revoked_link_latches_session_cancellation",
+               "awman-cli::component worker::protocol::regression_3e8d7e6c_cancelled_lease_wakes_run_without_waiting_for_tick",
+               "awman-cli::component worker::protocol::regression_3e8d7e6c_reissued_lease_fences_every_old_epoch_call",
+               "awman-cli::component worker::protocol::regression_8cf45de1_immediate_producer_preserves_initial_and_final_events",
+               "awman-cli::component worker::protocol::terminal_relay_forwards_snapshot_then_output_and_stops_cleanly",
+               "awman-cli::component worker::protocol::wsp_conformance_covers_auth_affinity_events_epoch_and_wire",
+               "awman-cli::component worker::push::expiry_and_revoked_credentials_make_no_transport_request",
+               "awman-cli::component worker::push::fencing_during_remote_request_kills_git_and_never_reports_success",
+               "awman-cli::component worker::push::fencing_during_upload_kills_git_before_it_can_publish",
+               "awman-cli::component worker::push::publish_is_idempotent_and_rejection_never_retries",
+               "awman-cli::component worker::push::regression_3e8d7e6c_transport_retry_and_cancellation_are_bounded",
+               "awman-cli::component worker::push::remote_http_auth_and_server_refusals_never_enter_transport_retry",
+               "awman-cli::component worker::push::transient_http_push_failure_retries_same_commit_then_becomes_idempotent",
+               "awman-cli::component worker::security::private_lease_body_is_never_in_clone_and_active_owner_cannot_be_reaped",
+               "awman-cli::component worker::security::regression_e6a2d429_e6322996_f5b724fc_child_does_not_retain_lease_owner_lock",
+               "awman-cli::component worker::security::sandbox_refuses_read_only_lease_and_never_advertises_it"
+            ],
+            "suites" : [
+               "component-worker"
+            ]
+         },
+         {
+            "exit" : 0,
+            "expected_tests" : [
+               "awman data::clock::tests::advancing_moves_both_clocks_and_wall_adjustment_is_independent",
+               "awman data::clock::tests::clones_share_one_clock_state",
+               "awman engine::conformance::tests::a_report_without_checks_is_not_a_success",
+               "awman engine::conformance::tests::one_failure_makes_the_report_fail_and_is_listed",
+               "awman engine::conformance::tests::skipped_checks_do_not_fail_a_report_with_passes",
+               "awman engine::issue::naming_tests::github_slugs_carry_the_provider_prefix_and_the_number",
+               "awman engine::issue::naming_tests::numeric_id_comes_from_the_last_url_segment",
+               "awman engine::issue::naming_tests::slugs_and_branches_are_safe_for_any_title",
+               "awman engine::workflow::contracts::cancellation_stops_the_running_agent_and_never_launches_dependents",
+               "awman engine::workflow::contracts::dependency_join_waits_for_every_parallel_predecessor",
+               "awman engine::workflow::contracts::failure_can_be_retried_before_dependents_run",
+               "awman engine::workflow::contracts::persisted_execution_resumes_without_repeating_completed_steps",
+               "awman engine::workflow::timing::tests::countdowns_are_the_documented_constants",
+               "awman frontend::api::error::constructor_tests::every_constructor_preserves_message_status_and_code",
+               "awman frontend::tui::contracts::command_edit_validation_and_resize_preserve_user_input",
+               "awman frontend::tui::contracts::tab_navigation_and_dialog_dismissal_keep_sessions_distinct"
+            ],
+            "suites" : [
+               "component-core-internals"
+            ]
+         },
+         {
+            "exit" : 0,
+            "expected_tests" : [
+               "awman-wsp mock::state_model::lease_state_model_exclusive_claim_expiry_completion_and_stale_epoch"
+            ],
+            "suites" : [
+               "unit-wsp"
+            ]
+         },
+         {
+            "exit" : 0,
+            "expected_tests" : [
+               "awman-cli::component command::daemon::catalogue_explains_each_command_before_execution",
+               "awman-cli::component command::daemon::config_edits_are_durable_and_invalid_values_are_atomic",
+               "awman-cli::component command::daemon::workflow_preflight_is_read_only_and_missing_work_is_typed"
+            ],
+            "suites" : [
+               "component-command-daemon"
+            ]
+         },
+         {
+            "exit" : 0,
+            "expected_tests" : [
+               "awman-cli::component parity::differential::config_results_agree_across_backends"
+            ],
+            "suites" : [
+               "component-parity-differential"
+            ]
+         },
+         {
+            "exit" : 0,
+            "expected_tests" : [
+               "xtask::gates frozen_dispatch_exposes_gate_help",
+               "xtask::gates missing_required_evidence_is_red"
+            ],
+            "suites" : [
+               "xtask-gates"
+            ]
+         },
+         {
+            "exit" : 0,
+            "expected_tests" : [
+               "awman-cli::component tools::architecture::architecture_gate_detects_cross_layer_calls_and_scanner_failure",
+               "awman-cli::component tools::entitlements_mismatch_fails_verification",
+               "awman-cli::component tools::signature_verification_preserves_exact_candidate_bytes"
+            ],
+            "suites" : [
+               "component-tools"
+            ]
+         },
+         {
+            "exit" : 0,
+            "expected_tests" : [
                "awman command::commands::exec_workflow::contract_tests::minimal_recovery_traces_prioritize_failure_over_unfinished_work",
                "awman command::commands::exec_workflow::contract_tests::work_item_lookup_uses_session_scope_and_inline_content_without_executing_it",
                "awman command::commands::exec_workflow::contract_tests::work_item_numbers_reject_overflow_and_keep_hostile_text_as_data",
@@ -569,6 +508,40 @@
             ],
             "suites" : [
                "unit-awman"
+            ]
+         },
+         {
+            "exit" : 0,
+            "expected_tests" : [
+               "awman-cli::component command::models::session_admission_close_and_reopen_follow_the_reference_model",
+               "awman-cli::component command::models::session_minimal_reproductions_preserve_closed_admission_and_cancelled_work",
+               "awman-cli::component command::models::workflow_minimal_reproductions_reset_budget_and_keep_the_fourth_failure_terminal",
+               "awman-cli::component command::models::workflow_repair_accept_restart_and_exhaustion_follow_the_reference_model"
+            ],
+            "suites" : [
+               "component-command-models"
+            ]
+         },
+         {
+            "exit" : 0,
+            "expected_tests" : [
+               "awman-cli::component security::mount_scope::admission_allows_only_exact_mounts_or_independent_direct_child_repositories",
+               "awman-cli::component security::mount_scope::remote_plans_reject_local_transport_and_option_injection_before_clone",
+               "awman-cli::component security::mount_scope::symlink_escapes_and_linked_git_directories_cannot_expand_admission",
+               "awman-cli::component security::mount_scope::widening_to_the_parent_git_root_requires_a_decision_and_dismissal_aborts",
+               "awman-cli::component security::trust::hostile_workflow_agent_definitions_are_refused_before_any_host_or_container_launch"
+            ],
+            "suites" : [
+               "component-security"
+            ]
+         },
+         {
+            "exit" : 0,
+            "expected_tests" : [
+               "awman-cli::component parity::daemon::config_mutations_are_durable_and_invalid_edits_are_atomic"
+            ],
+            "suites" : [
+               "component-parity-daemon"
             ]
          },
          {
@@ -766,244 +739,288 @@
          {
             "exit" : 0,
             "expected_tests" : [
-               "awman-cli::component command::models::session_admission_close_and_reopen_follow_the_reference_model",
-               "awman-cli::component command::models::session_minimal_reproductions_preserve_closed_admission_and_cancelled_work",
-               "awman-cli::component command::models::workflow_minimal_reproductions_reset_budget_and_keep_the_fourth_failure_terminal",
-               "awman-cli::component command::models::workflow_repair_accept_restart_and_exhaustion_follow_the_reference_model"
+               "awman-cli::component daemon::api::network_auth_is_required_keys_are_owner_only_and_revocation_is_immediate",
+               "awman-cli::component daemon::api::network_visibility_hides_unserved_features_and_malformed_routes_are_bounded",
+               "awman-cli::component daemon::browser::browser_origin_never_authorizes_api_keys_or_caller_selected_scope",
+               "awman-cli::component daemon::browser::browser_pairing_is_one_use_origin_bound_and_owner_revocable",
+               "awman-cli::component daemon::browser::removing_an_origin_ends_grant_watchers_and_pending_links_before_reload_returns",
+               "awman-cli::component daemon::lifecycle::regression_585680c3_f23e75a4_9eac9cda_two_ready_daemons_have_distinct_state",
+               "awman-cli::component daemon::local_security::owner_endpoint_is_private_and_tampered_metadata_cannot_redirect_clients",
+               "awman-cli::component daemon::reload::daemon_status_and_stop_keep_their_cli_and_json_contracts",
+               "awman-cli::component daemon::reload::reload_switches_admission_without_restarting_and_invalid_changes_are_atomic"
             ],
             "suites" : [
-               "component-command-models"
+               "component-daemon"
             ]
          },
          {
             "exit" : 0,
             "expected_tests" : [
-               "awman-cli::component security::mount_scope::admission_allows_only_exact_mounts_or_independent_direct_child_repositories",
-               "awman-cli::component security::mount_scope::remote_plans_reject_local_transport_and_option_injection_before_clone",
-               "awman-cli::component security::mount_scope::symlink_escapes_and_linked_git_directories_cannot_expand_admission",
-               "awman-cli::component security::mount_scope::widening_to_the_parent_git_root_requires_a_decision_and_dismissal_aborts",
-               "awman-cli::component security::trust::hostile_workflow_agent_definitions_are_refused_before_any_host_or_container_launch"
+               "xtask::release_contract resume_after_auth_interrupt",
+               "xtask::release_contract resume_after_commit_interrupt",
+               "xtask::release_contract resume_after_notes_interrupt",
+               "xtask::release_contract resume_after_push_interrupt",
+               "xtask::release_contract resume_after_runner_interrupt",
+               "xtask::release_contract resume_after_tag_interrupt",
+               "xtask::release_contract resume_after_tests_interrupt",
+               "xtask::release_contract resume_after_version_interrupt",
+               "xtask::release_contract resume_after_watch_interrupt",
+               "xtask::release_contract row_01_usage_and_runner_mode",
+               "xtask::release_contract row_02_version_validation",
+               "xtask::release_contract row_03_steps_and_markers",
+               "xtask::release_contract row_04_changed_remote_source_is_prepared_again",
+               "xtask::release_contract row_04_resume_built",
+               "xtask::release_contract row_04_resume_commit_failure",
+               "xtask::release_contract row_04_resume_prepared",
+               "xtask::release_contract row_04_resume_promoted",
+               "xtask::release_contract row_04_resume_push_failure",
+               "xtask::release_contract row_04_resume_tag_failure",
+               "xtask::release_contract row_04_resume_validated",
+               "xtask::release_contract row_05_tty_defaults_and_no_tty",
+               "xtask::release_contract row_06_authentication",
+               "xtask::release_contract row_07_off_main",
+               "xtask::release_contract row_08_divergence",
+               "xtask::release_contract row_09_dirty_files_and_evidence_mismatch",
+               "xtask::release_contract row_10_remote_tag_and_published_resume",
+               "xtask::release_contract row_11_runner_selection",
+               "xtask::release_contract row_12_portable_version_bump",
+               "xtask::release_contract row_13_notes_template_and_chat",
+               "xtask::release_contract row_14_local_pass_hash_and_reuse",
+               "xtask::release_contract row_15_fail_skip_clipboard_and_fix",
+               "xtask::release_contract row_16_commit_only_release_paths",
+               "xtask::release_contract row_17_local_tag_create_reuse_and_mismatch",
+               "xtask::release_contract row_18_queued_cancel_default_and_decline",
+               "xtask::release_contract row_20_push_then_candidate_never_tag",
+               "xtask::release_contract row_21_unmanaged_follow_line",
+               "xtask::release_contract row_22_watch_rerun_and_verified_success",
+               "xtask::release_contract row_23_teardown_success_failure_and_double_interrupt",
+               "xtask::release_contract row_24_end_state_matches_operator_contract",
+               "xtask::release_contract runner::deregistration_failure_retains_repair_state",
+               "xtask::release_contract runner::failed_registration_releases_owned_state_and_keeps_existing_work",
+               "xtask::release_contract runner::missing_group_or_bad_archive_cannot_obtain_a_registration_token",
+               "xtask::release_contract runner::provisioning_is_manifest_verified_and_failure_stops_before_registration"
             ],
             "suites" : [
-               "component-security"
+               "xtask-release-contract"
             ]
          },
          {
             "exit" : 0,
             "expected_tests" : [
-               "awman-cli::component worker::checkout::checkout_merges_declared_refs_and_resumes_the_published_branch",
-               "awman-cli::component worker::checkout::checkout_refuses_tag_and_missing_merge_refs_after_owned_remote_lookup",
-               "awman-cli::component worker::client_transport::access_refresh_is_single_flight_and_revoked_or_twice_rejected_tokens_stop",
-               "awman-cli::component worker::client_transport::authenticated_requests_preserve_base_path_version_and_query",
-               "awman-cli::component worker::client_transport::link_denial_and_unsafe_identifiers_never_become_transport_requests",
-               "awman-cli::component worker::conformance_defects::client_counts_empty_event_acknowledgements_and_duplicate_posts_are_idempotent",
-               "awman-cli::component worker::conformance_defects::probes_detect_ignored_preferences_epochs_and_duplicate_event_storage",
-               "awman-cli::component worker::conformance_defects::wire_probe_detects_invalid_fields_on_every_protocol_response",
-               "awman-cli::component worker::protocol::expired_access_refreshes_once_and_revoked_link_latches_session_cancellation",
-               "awman-cli::component worker::protocol::regression_3e8d7e6c_cancelled_lease_wakes_run_without_waiting_for_tick",
-               "awman-cli::component worker::protocol::regression_3e8d7e6c_reissued_lease_fences_every_old_epoch_call",
-               "awman-cli::component worker::protocol::regression_8cf45de1_immediate_producer_preserves_initial_and_final_events",
-               "awman-cli::component worker::protocol::terminal_relay_forwards_snapshot_then_output_and_stops_cleanly",
-               "awman-cli::component worker::protocol::wsp_conformance_covers_auth_affinity_events_epoch_and_wire",
-               "awman-cli::component worker::push::expiry_and_revoked_credentials_make_no_transport_request",
-               "awman-cli::component worker::push::fencing_during_remote_request_kills_git_and_never_reports_success",
-               "awman-cli::component worker::push::fencing_during_upload_kills_git_before_it_can_publish",
-               "awman-cli::component worker::push::publish_is_idempotent_and_rejection_never_retries",
-               "awman-cli::component worker::push::regression_3e8d7e6c_transport_retry_and_cancellation_are_bounded",
-               "awman-cli::component worker::push::remote_http_auth_and_server_refusals_never_enter_transport_retry",
-               "awman-cli::component worker::push::transient_http_push_failure_retries_same_commit_then_becomes_idempotent",
-               "awman-cli::component worker::security::private_lease_body_is_never_in_clone_and_active_owner_cannot_be_reaped",
-               "awman-cli::component worker::security::regression_e6a2d429_e6322996_f5b724fc_child_does_not_retain_lease_owner_lock",
-               "awman-cli::component worker::security::sandbox_refuses_read_only_lease_and_never_advertises_it"
+               "awman-cli::component command::builtin::catalogue_explains_each_command_before_execution",
+               "awman-cli::component command::builtin::config_edits_are_durable_and_invalid_values_are_atomic",
+               "awman-cli::component command::builtin::workflow_preflight_is_read_only_and_missing_work_is_typed"
             ],
             "suites" : [
-               "component-worker"
+               "component-command-builtin"
             ]
          },
          {
             "exit" : 0,
             "expected_tests" : [
-               "awman-cli::component command::differential::command_traces_match_between_builtin_and_daemon"
+               "awman-cli::component data::config::configuration_reference_key_table_matches_the_schema",
+               "awman-cli::component data::config::every_key_default_is_valid_and_round_trips_through_file_validation",
+               "awman-cli::component data::config::every_key_has_a_deterministic_default_and_key_table_validation_contract",
+               "awman-cli::component data::config::every_key_obeys_the_declared_global_repo_and_task_scope_order",
+               "awman-cli::component data::config::explicit_home_and_xdg_roots_resolve_independently_without_process_environment",
+               "awman-cli::component data::config::global_repo_environment_set_and_flag_layers_follow_declared_precedence",
+               "awman-cli::component data::config::integer_key_boundaries_and_wrong_shapes_are_rejected_by_the_schema",
+               "awman-cli::component data::config::invalid_config_is_rejected_before_save_and_sensitive_values_are_masked",
+               "awman-cli::component data::config::older_config_documents_keep_their_wire_values_when_rewritten",
+               "awman-cli::component data::config::unified_home_roots_every_store_and_removed_overrides_are_inert",
+               "awman-cli::component data::config_properties::additive_guidance_merge_is_ordered_and_deduplicates_trimmed_values",
+               "awman-cli::component data::config_properties::config_parse_serialize_round_trip_preserves_valid_agent_and_scrollback",
+               "awman-cli::component data::config_properties::identical_layers_are_idempotent_and_later_set_override_wins",
+               "awman-cli::component data::persistence::bounded_keychain_helper_returns_a_ready_result",
+               "awman-cli::component data::persistence::builtin_image_leases_isolate_mutation_per_image",
+               "awman-cli::component data::persistence::concurrent_builtin_state_resolution_returns_one_private_root",
+               "awman-cli::component data::persistence::concurrent_workflow_checkpoint_reads_never_observe_partial_json",
+               "awman-cli::component data::persistence::config_save_reload_and_corruption_recovery_are_confined_to_sandbox",
+               "awman-cli::component data::persistence::corrupt_database_is_reported_without_overwriting_the_original_bytes",
+               "awman-cli::component data::persistence::interrupted_database_migration_recovers_from_legacy_source_and_preserves_backup",
+               "awman-cli::component data::persistence::migration_preserves_real_sqlite_session_and_command_rows",
+               "awman-cli::component data::persistence::repo_config_save_refuses_a_symlinked_leaf_without_touching_its_target",
+               "awman-cli::component data::persistence::schema_one_database_keeps_session_and_command_rows_readable"
             ],
             "suites" : [
-               "component-command-differential"
+               "component-data"
             ]
          }
       ],
       "reports" : [
          {
-            "execution_seconds" : 0.924,
+            "execution_seconds" : 0.995,
             "file" : "0144-local-evidence/junit-component-awman-cli-component-command-builtin.xml",
-            "sha256" : "6e5b0e252c00ca60310d002d12158e760f1d82cdd1c1ba986110ada0e6ffb6c7",
+            "sha256" : "6d2a124be8bf69036ab79f360ae0d77e49ed5f3b838612b05e121ab663d55e3a",
             "tests" : 3
          },
          {
-            "execution_seconds" : 1.43,
+            "execution_seconds" : 1.672,
             "file" : "0144-local-evidence/junit-component-awman-cli-component-command-daemon.xml",
-            "sha256" : "229c7088bebea590765feb9de6d0e20c2cf4526f2710c9429c9e7ca6671abf5b",
+            "sha256" : "03e412d7e07d1c96c56bef343dec6ae85001de457335e378fd3e2900954c7861",
             "tests" : 3
          },
          {
-            "execution_seconds" : 2.759,
+            "execution_seconds" : 2.808,
             "file" : "0144-local-evidence/junit-component-awman-cli-component-command-differential.xml",
-            "sha256" : "231c8f0fed8abac316a34a30abd05adcde96068ad0a7f5f209723e04358fa3f4",
+            "sha256" : "28407774fd5b4d2ba605fb111511f8ec6018c96821610f1949ff299fcac0195d",
             "tests" : 1
          },
          {
-            "execution_seconds" : 26.253,
+            "execution_seconds" : 26.098,
             "file" : "0144-local-evidence/junit-component-awman-cli-component-command-models.xml",
-            "sha256" : "07fb8e6c33a1d5aabe361287dabcece12b379fdb13f18998fe0c904afb0d815c",
+            "sha256" : "a3c738c72b4c9e8708b2a3e6691f6169a60e9ba057151e2239934180e5394035",
             "tests" : 4
          },
          {
-            "execution_seconds" : 1.969,
+            "execution_seconds" : 1.925,
             "file" : "0144-local-evidence/junit-component-awman-cli-component-command.xml",
-            "sha256" : "88a832af67e9dea4412b62ebd87db2f6720dc2895c62474449e36b66e6edb255",
+            "sha256" : "5728c09983b15c7ed62146347d29cfb32340c0c818953c14c6bb42dc87a09114",
             "tests" : 19
          },
          {
-            "execution_seconds" : 3.295,
+            "execution_seconds" : 3.226,
             "file" : "0144-local-evidence/junit-component-awman-cli-component-daemon.xml",
-            "sha256" : "307d1d8f4a995184eebca1f29d8203d1ad18f6c907ae8f49263a8a5b11eac57f",
+            "sha256" : "fbe40c4a865be11d9a71c52f848b8be84863ed15720f8f671e190bde11a073f2",
             "tests" : 9
          },
          {
-            "execution_seconds" : 1.138,
+            "execution_seconds" : 1.104,
             "file" : "0144-local-evidence/junit-component-awman-cli-component-data.xml",
-            "sha256" : "6469bf1a2b259154e515a12efc13671870c5b9f82da2ff7c1c1353d0d7ec335a",
+            "sha256" : "bf571982d1581b2ef4494c42b6d6601a599fdde9cb8b81be0e5fd9dedac16031",
             "tests" : 23
          },
          {
-            "execution_seconds" : 2.651,
+            "execution_seconds" : 2.728,
             "file" : "0144-local-evidence/junit-component-awman-cli-component-engine.xml",
-            "sha256" : "f6937a50696aa94482e42388b3afd889a8433f93c7cdef856fdf3bd22fc71f2d",
+            "sha256" : "6cfd0c53ab98149ff2dcd05f5a4c49a75f84f2ef386518273571097232368e81",
             "tests" : 97
          },
          {
-            "execution_seconds" : 0.108,
+            "execution_seconds" : 0.061,
             "file" : "0144-local-evidence/junit-component-awman-cli-component-frontend.xml",
-            "sha256" : "ed66e651b858d7987b345da67c98db79180fb8a7d9ae723cb2ea1f75a01c0bbe",
+            "sha256" : "72ebb2011fe36dfdd8e9235ba9333094630890bca52fa605c98c2d907b1d8f76",
             "tests" : 1
          },
          {
-            "execution_seconds" : 0.102,
+            "execution_seconds" : 0.119,
             "file" : "0144-local-evidence/junit-component-awman-cli-component-parity-builtin.xml",
-            "sha256" : "d106c57483b8cdac7766b15c752e918962bd9992b67afedc31232b15eed91762",
+            "sha256" : "701dcfe3df2f177cc72e5428a8d25fd004993c0648671d2f4d4a89d178beff23",
             "tests" : 1
          },
          {
-            "execution_seconds" : 0.644,
+            "execution_seconds" : 0.766,
             "file" : "0144-local-evidence/junit-component-awman-cli-component-parity-daemon.xml",
-            "sha256" : "058e77a57d0938921e120adab213552ec66bf1513a73fcf3b32244373dbf240d",
+            "sha256" : "88bfc0de441e0c0af4e327da465268347de2a7f032c37d5e6523f726781d9d3d",
             "tests" : 1
          },
          {
-            "execution_seconds" : 0.864,
+            "execution_seconds" : 0.866,
             "file" : "0144-local-evidence/junit-component-awman-cli-component-parity-differential.xml",
-            "sha256" : "28ed835f0e049fcbe450e3d9e14098c05520ec74e0803575ac186e768a487f88",
+            "sha256" : "7b64f642d8051eda1084aab492c6e2c6cd495669e063440282d7f8a660f62b0e",
             "tests" : 1
          },
          {
-            "execution_seconds" : 0.146,
+            "execution_seconds" : 0.145,
             "file" : "0144-local-evidence/junit-component-awman-cli-component-security.xml",
-            "sha256" : "d09d22dc02e461f5b65b22e8fa946d20ac546c0f84c20bf2ac1b0ca46ccb8f4b",
+            "sha256" : "31f5e11a5ab2cba98b45d9cd7bb66670b9d70a1e4060092f605be0f76e28554c",
             "tests" : 5
          },
          {
-            "execution_seconds" : 1.029,
+            "execution_seconds" : 1.106,
             "file" : "0144-local-evidence/junit-component-awman-cli-component-squad.xml",
-            "sha256" : "6a9f17072a82d56a0708cdb879a8808838f8f481e7c09df5f2acbe46a25cff1c",
+            "sha256" : "db0e564044a91458dd7d368eabaaa740c060aadc29b12d0aff50d2d2fd9b4b70",
             "tests" : 6
          },
          {
-            "execution_seconds" : 0.357,
+            "execution_seconds" : 0.45,
             "file" : "0144-local-evidence/junit-component-awman-cli-component-tools.xml",
-            "sha256" : "c5b646f7041d4db27e3a1ec6c663a3bb4a2c195a2f782dd880359d799b4ead83",
+            "sha256" : "06179d1ced47704a7fa6842474a8beb0e4e47fbab9b52c02a1f2f61a882502bb",
             "tests" : 3
          },
          {
-            "execution_seconds" : 7.111,
+            "execution_seconds" : 4.211,
             "file" : "0144-local-evidence/junit-component-awman-cli-component-worker.xml",
-            "sha256" : "42aadbdfa30d463953342cb68b4d8d8e19c30164ea250993def4a51d970e66f1",
-            "tests" : 24
+            "sha256" : "d1a581de9f679ef6ca594dd1b43223f1993e72d15b788f567cfccd4be2c56b40",
+            "tests" : 34
          },
          {
-            "execution_seconds" : 0.456,
+            "execution_seconds" : 0.486,
             "file" : "0144-local-evidence/junit-component-awman-component-core-internals.xml",
-            "sha256" : "8b04e56fd59f11ebc9ee56d4ed61ab25698125a9fddffdf83c024a3960611f86",
+            "sha256" : "ee9493cbbc5dca376ca6ee16a1246a0f66d3f11c34d541b6489f9a1a5c4c5952",
             "tests" : 16
          },
          {
-            "execution_seconds" : 3.392,
+            "execution_seconds" : 3.405,
             "file" : "0144-local-evidence/junit-component-awman-test-support-component-test-support.xml",
-            "sha256" : "f8455354fc9a450c0a4d3dc49ca3605daa7d943dd4f7b5a824baaf36b78d746b",
+            "sha256" : "963619e1db293596a53f823f062b627921229689820a967a2cfe719f10890010",
             "tests" : 61
          },
          {
-            "execution_seconds" : 1.338,
+            "execution_seconds" : 1.271,
             "file" : "0144-local-evidence/junit-component-xtask-unit-xtask.xml",
-            "sha256" : "9c09eb979b1922aefc3ce8c741fe037712bde6574df2f61c6b06fe64a54045f8",
+            "sha256" : "b6df7bd694be7ca1aac46b0909122b01b7af5324c779514fffa52831cdf983e7",
             "tests" : 184
          },
          {
-            "execution_seconds" : 0.081,
+            "execution_seconds" : 0.102,
             "file" : "0144-local-evidence/junit-component-xtask-xtask-ci.xml",
-            "sha256" : "ea5a45c4d25fd1b0fbd49ab2918fc9395e25244dd6e61679945aac918d041dba",
+            "sha256" : "0bf9a8a949425cab035e5ef73ec5afd97c2d5f12b0c36f6e69090811790ddf24",
             "tests" : 7
          },
          {
-            "execution_seconds" : 0.027,
+            "execution_seconds" : 0.025,
             "file" : "0144-local-evidence/junit-component-xtask-xtask-gates.xml",
-            "sha256" : "c507802dbbf31d3cd2b7886e6ab83802c9bf47e324f9058cfbda4091c03edb9e",
+            "sha256" : "e6c40837c13f74f4102c01655cd1ef178f052869e013cea7842df595b7c462a8",
             "tests" : 2
          },
          {
-            "execution_seconds" : 1.333,
+            "execution_seconds" : 1.182,
             "file" : "0144-local-evidence/junit-component-xtask-xtask-pipeline.xml",
-            "sha256" : "47f478f2bd4dbe92d0c4931133e887fed94c4277be9c5f668e144288f9c1ec44",
+            "sha256" : "df3cebc14d8cdd78e064a746da16c9ca0907a40d1558eec4d20dba64a7c24489",
             "tests" : 26
          },
          {
-            "execution_seconds" : 5.555,
+            "execution_seconds" : 5.421,
             "file" : "0144-local-evidence/junit-component-xtask-xtask-release-contract.xml",
-            "sha256" : "2ae7947df51110a88eed9daff8924f6e95ab998800b026f27754c480cccc698f",
-            "tests" : 36
+            "sha256" : "7b467df9cef631b40ffc45de8384e9449264abe07ffd658a97d483dcaee9be04",
+            "tests" : 43
          },
          {
-            "execution_seconds" : 0.341,
+            "execution_seconds" : 0.324,
             "file" : "0144-local-evidence/junit-unit-awman-test-support-unit-test-support.xml",
-            "sha256" : "aa4f59326fbbfb1b7f6559d922700036fedea0f6c69f8b7c5b3a84c9792f07d1",
+            "sha256" : "1e4ab3d7621c8ab985e9f0b0543d91d19f92c8f8e63c55c3ccff0e331ccfa4fc",
             "tests" : 68
          },
          {
-            "execution_seconds" : 0.066,
+            "execution_seconds" : 0.073,
             "file" : "0144-local-evidence/junit-unit-awman-unit-awman.xml",
-            "sha256" : "cc39a251022f3e9983f3a9bb72d8a62b048e2635a87cdf40959c1018ec179b37",
+            "sha256" : "e37b4380f0d616bf28a15aee643130af04d7e2f7dd890982935cc1f9229b38e9",
             "tests" : 4
          },
          {
             "execution_seconds" : 0.035,
             "file" : "0144-local-evidence/junit-unit-awman-wsp-unit-wsp.xml",
-            "sha256" : "83ea78751be3e560cae7deed8993ce5898def1ea12fbed700996dfbfa13c6e5e",
+            "sha256" : "a5dc629399169ccca7467f26b856beb957af351a078e4f70636608b1c9668050",
             "tests" : 1
          }
       ],
       "shuffle_scope" : "Suite invocation order only; nextest isolates individual tests in processes",
       "source" : {
          "clean" : false,
-         "commit" : "90a650d50976e99b0ee047908a95677e97554707",
+         "commit" : "1eec2dfbcdf1d59d5d50c84161b1651f1d10ce47",
          "inputs" : {
             ".config/nextest.toml" : "e61dff61132ad5dc2ff8f6bf704ad5feb3f64eefb6d02d16c052f10510629a8f",
             "Cargo.lock" : "d5724468475536cec4061ba8a79b2d0580487edf4ed68dfbe592489cb73a71f5",
             "ci/gates.toml" : "2d289a9b548d3196301f99bfe128c9c4fbff80015eccb0c08d81ef6e6eda7f84",
             "rust-toolchain.toml" : "b4cda633da2ab21937850415a73f2bb1cc8c006c950ed85837fd95098a0d11c4"
          },
-         "tree" : "0d76670663c64f70007b83eb105294d34c984c95"
+         "tree" : "9fe8989724911f63b8a93d1bd41ad96679788358"
       },
       "source_limit" : "Run against uncommitted implementation based on the recorded commit. Hosted CI validates the committed implementation independently.",
       "suites" : 26,
-      "test_execution_seconds" : 63.404,
-      "tests" : 606,
+      "test_execution_seconds" : 60.604,
+      "tests" : 623,
       "verdict" : "passed"
    },
    "native" : {
@@ -1018,5 +1035,29 @@
       "Timings are local ARM Linux, not native Mac candidate measurements"
    ],
    "schema" : 2,
-   "status" : "Local verification passed; hosted CI and native acceptance are recorded separately"
+   "status" : "Local verification passed; hosted CI and native acceptance are recorded separately",
+   "test_inventory" : {
+      "browser_configurations" : 4,
+      "browser_executions" : 40,
+      "browser_scenarios" : 10,
+      "distinct_cases" : 1290,
+      "edge_worker" : 107,
+      "limits" : "Inventory is not execution certification. Platform/feature repeats are not additional distinct cases. Lint/build commands are checks, not test cases. Native runtime acceptance remains unverified.",
+      "method" : [
+         "Compiler inventories: 623 local unit/component cases after splitting 7 release and 10 protocol scenarios out of bundled tests; platform source audit adds one Windows-only metadata-copy case and one macOS-only native export/cache case. Boundary/guest/artifact/soak counts unchanged.",
+         "cargo test --doc --workspace -- --list: 7 documentation cases",
+         "Vitest: 468 web cases passed after shortcut regression fix; 107 edge Worker cases enumerated",
+         "Playwright --list: 10 distinct scenarios across 4 projects"
+      ],
+      "rust" : {
+         "artifact" : 12,
+         "boundary" : 24,
+         "doctests" : 7,
+         "guest" : 33,
+         "soak" : 5,
+         "total" : 705,
+         "unit_component" : 624
+      },
+      "web_app" : 468
+   }
 }

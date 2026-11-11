@@ -114,7 +114,16 @@ fn copy(source: &Path, destination: &Path) -> std::io::Result<()> {
     tree(&src, &src_name, &dst, &dst_name)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+#[path = "git_metadata/windows.rs"]
+mod windows;
+
+#[cfg(windows)]
+fn copy(source: &Path, destination: &Path) -> std::io::Result<()> {
+    windows::copy(source, destination)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn copy(_: &Path, _: &Path) -> std::io::Result<()> {
     Err(std::io::Error::other(
         "secure Git metadata copying is unsupported on this platform",

@@ -52,7 +52,7 @@ fn tcp_readiness_waits_for_accepting() {
     drop(listener);
 }
 
-#[cfg_attr(not(unix), ignore = "not-applicable: needs Unix sockets")]
+#[cfg(unix)]
 #[test]
 fn unix_sockets_live_in_the_short_dir_and_must_be_removed() {
     let (_parent, sandbox) =

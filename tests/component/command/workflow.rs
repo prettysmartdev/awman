@@ -50,7 +50,6 @@ fn concurrent_idempotent_submissions_have_exactly_one_owner() {
             .count(),
         15
     );
-    s.finish();
 }
 
 #[test]
@@ -104,7 +103,6 @@ fn cancellation_is_idempotent_and_never_fires_another_commands_token() {
         CancelOutcome::AlreadyTerminal { .. }
     ));
     assert_eq!(f.store.get_command(&two_id).unwrap().unwrap(), terminal);
-    s.finish();
 }
 
 #[test]
@@ -157,7 +155,6 @@ fn crash_completion_is_finalized_before_cancellation_can_overwrite_it() {
         cancel.cancel(&id).unwrap(),
         CancelOutcome::AlreadyTerminal(_)
     ));
-    s.finish();
 }
 
 /// Guards: 8cf45de1 consumers subscribe before any producer can publish.

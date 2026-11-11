@@ -271,6 +271,18 @@ pub(crate) fn system_path_dirs() -> &'static [PathBuf] {
                 if !dirs.iter().any(|d| d == dir) {
                     dirs.push(dir.to_path_buf());
                 }
+                if cfg!(windows) && dir.file_name().is_some_and(|name| name == "cmd") {
+                    // Git for Windows ships the shell and POSIX tools in its
+                    // installation, outside cmd/. Never inherit the host PATH.
+                    if let Some(install) = dir.parent() {
+                        for relative in ["bin", "usr/bin"] {
+                            let tools = install.join(relative);
+                            if tools.is_dir() {
+                                dirs.push(tools);
+                            }
+                        }
+                    }
+                }
             }
         }
         dirs
@@ -776,7 +788,7 @@ impl Drop for TestSandbox {
 fn make_sock_dir(root: &Path) -> (PathBuf, Option<tempfile::TempDir>) {
     let local = root.join("s");
     // Room for "/<name>" with names up to 24 bytes.
-    if cfg!(windows) || local.as_os_str().len() + 25 <= crate::net::MAX_SOCKET_PATH {
+    if local.as_os_str().len() + 25 <= crate::net::MAX_SOCKET_PATH {
         std::fs::create_dir_all(&local)
             .unwrap_or_else(|e| panic!("BLOCKED[tempdir]: {}: {e}", local.display()));
         return (local, None);

@@ -4,7 +4,7 @@ use crate::sandbox;
 use awman_test_support::Exit;
 use std::time::Duration;
 
-#[cfg_attr(not(unix), ignore = "not-applicable: uses sh")]
+#[cfg(unix)]
 #[test]
 fn pty_child_sees_a_terminal_and_receives_input() {
     let sandbox = sandbox("pty::pty_child_sees_a_terminal_and_receives_input");
@@ -21,7 +21,7 @@ fn pty_child_sees_a_terminal_and_receives_input() {
     assert_eq!(child.wait(Duration::from_secs(10)), Exit::Code(0));
 }
 
-#[cfg_attr(not(unix), ignore = "not-applicable: uses sh")]
+#[cfg(unix)]
 #[test]
 fn pty_deadline_kills_the_child() {
     let sandbox = sandbox("pty::pty_deadline_kills_the_child");
@@ -35,10 +35,7 @@ fn pty_deadline_kills_the_child() {
 
 /// A process exit must include its final transcript bytes, without a separate
 /// wait_for_output that hides a race between waitpid and the capture reader.
-#[cfg_attr(
-    not(unix),
-    ignore = "not-applicable: Unix terminal EOF semantics; Windows ConPTY remains P9"
-)]
+#[cfg(unix)]
 #[test]
 fn wait_drains_final_output_before_returning_the_exit_status() {
     let sandbox = sandbox("pty::wait_drains_final_output_before_returning_the_exit_status");

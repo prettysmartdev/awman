@@ -28,7 +28,6 @@ fn config_save_reload_and_corruption_recovery_are_confined_to_sandbox() {
     assert!(ConfigFile::load(&path, FileKind::Repo).is_err());
     config.save(&path, FileKind::Repo).unwrap();
     assert_eq!(ConfigFile::load(&path, FileKind::Repo).unwrap(), config);
-    sandbox.finish();
 }
 
 #[cfg(unix)]
@@ -50,7 +49,6 @@ fn repo_config_save_refuses_a_symlinked_leaf_without_touching_its_target() {
         ConfigFile::from_value(json!({"agents":{"default":"codex"}}), FileKind::Repo).unwrap();
     assert!(config.save(&path, FileKind::Repo).is_err());
     assert_eq!(std::fs::read(&target).unwrap(), b"outside bytes");
-    sandbox.finish();
 }
 
 #[test]
@@ -82,7 +80,6 @@ fn interrupted_database_migration_recovers_from_legacy_source_and_preserves_back
         std::fs::read(legacy.join(format!("{DB_FILENAME}.pre-migration"))).unwrap(),
         b"older backup"
     );
-    sandbox.finish();
 }
 
 #[test]
@@ -95,7 +92,6 @@ fn corrupt_database_is_reported_without_overwriting_the_original_bytes() {
     std::fs::write(&path, corrupt).unwrap();
     assert!(SqliteSessionStore::open_at(&path).is_err());
     assert_eq!(std::fs::read(&path).unwrap(), corrupt);
-    sandbox.finish();
 }
 
 #[test]
@@ -126,7 +122,6 @@ fn concurrent_workflow_checkpoint_reads_never_observe_partial_json() {
     }
     done.store(true, Ordering::Release);
     reader.join().unwrap();
-    sandbox.finish();
 }
 
 #[test]
@@ -166,7 +161,6 @@ fn schema_one_database_keeps_session_and_command_rows_readable() {
     // The schema upgrade canonicalizes the old pending spelling to queued.
     assert_eq!(command.status.as_str(), "queued");
     assert_eq!(command.session_id, session.id);
-    sandbox.finish();
 }
 
 #[test]
@@ -194,7 +188,6 @@ fn builtin_image_leases_isolate_mutation_per_image() {
     assert!(state.image_lease("other:1", true).is_ok());
     drop(shared);
     assert!(state.image_lease("agent:1", true).is_ok());
-    sandbox.finish();
 }
 
 #[cfg(unix)]
@@ -213,7 +206,6 @@ fn concurrent_builtin_state_resolution_returns_one_private_root() {
         });
         assert_eq!(left.join().unwrap().home, right.join().unwrap().home);
     });
-    sandbox.finish();
 }
 
 #[test]
@@ -249,5 +241,39 @@ fn migration_preserves_real_sqlite_session_and_command_rows() {
     assert_eq!(migrated.get_session(session_id).unwrap().unwrap(), session);
     assert_eq!(migrated.get_command(command_id).unwrap().unwrap(), command);
     drop(migrated);
-    sandbox.finish();
+}
+
+#[cfg(windows)]
+#[test]
+fn git_metadata_copy_pins_ancestors_and_never_writes_through_links() {
+    use awman::data::fs::git_metadata::GitMetadataCopy;
+    use std::os::windows::fs::symlink_dir;
+    let s = support::sandbox(
+        "data::persistence::git_metadata_copy_pins_ancestors_and_never_writes_through_links",
+    );
+    let source = s.work().join("source");
+    let destination = s.work().join("destination");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::write(source.join("HEAD"), "ref: refs/heads/topic\n").unwrap();
+    GitMetadataCopy::copy(&source, &destination).unwrap();
+    assert_eq!(
+        std::fs::read(destination.join("HEAD")).unwrap(),
+        std::fs::read(source.join("HEAD")).unwrap()
+    );
+    let external = s.work().join("external");
+    std::fs::write(&external, "must stay unchanged").unwrap();
+    std::fs::remove_file(destination.join("HEAD")).unwrap();
+    std::fs::hard_link(&external, destination.join("HEAD")).unwrap();
+    GitMetadataCopy::copy(&source.join("HEAD"), &destination.join("HEAD")).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&external).unwrap(),
+        "must stay unchanged"
+    );
+    let alias = s.work().join("alias");
+    symlink_dir(&source, &alias).unwrap();
+    assert!(GitMetadataCopy::copy(&alias.join("HEAD"), &destination.join("HEAD")).is_err());
+    std::fs::remove_dir(&alias).unwrap();
+    symlink_dir(&destination, &alias).unwrap();
+    assert!(GitMetadataCopy::copy(&source.join("HEAD"), &alias.join("HEAD")).is_err());
+    std::fs::remove_dir(alias).unwrap();
 }

@@ -1,29 +1,39 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<testsuites name="nextest-run" tests="24" skipped="0" failures="0" errors="0" uuid="ac067485-bf01-4470-bfdd-d0bfb240c0ec" timestamp="2026-11-11T21:22:19.797+00:00" time="7.111">
-    <testsuite name="awman-cli::component" tests="24" skipped="0" errors="0" failures="0">
-        <testcase name="worker::client_transport::authenticated_requests_preserve_base_path_version_and_query" classname="awman-cli::component" timestamp="2026-11-11T21:22:19.800+00:00" time="0.040"/>
-        <testcase name="worker::client_transport::access_refresh_is_single_flight_and_revoked_or_twice_rejected_tokens_stop" classname="awman-cli::component" timestamp="2026-11-11T21:22:19.800+00:00" time="0.080"/>
-        <testcase name="worker::client_transport::link_denial_and_unsafe_identifiers_never_become_transport_requests" classname="awman-cli::component" timestamp="2026-11-11T21:22:19.841+00:00" time="0.041"/>
-        <testcase name="worker::conformance_defects::client_counts_empty_event_acknowledgements_and_duplicate_posts_are_idempotent" classname="awman-cli::component" timestamp="2026-11-11T21:22:19.882+00:00" time="0.055"/>
-        <testcase name="worker::checkout::checkout_refuses_tag_and_missing_merge_refs_after_owned_remote_lookup" classname="awman-cli::component" timestamp="2026-11-11T21:22:19.800+00:00" time="0.155"/>
-        <testcase name="worker::checkout::checkout_merges_declared_refs_and_resumes_the_published_branch" classname="awman-cli::component" timestamp="2026-11-11T21:22:19.800+00:00" time="0.190"/>
-        <testcase name="worker::protocol::expired_access_refreshes_once_and_revoked_link_latches_session_cancellation" classname="awman-cli::component" timestamp="2026-11-11T21:22:19.956+00:00" time="0.053"/>
-        <testcase name="worker::protocol::regression_3e8d7e6c_cancelled_lease_wakes_run_without_waiting_for_tick" classname="awman-cli::component" timestamp="2026-11-11T21:22:19.991+00:00" time="0.053"/>
-        <testcase name="worker::protocol::regression_3e8d7e6c_reissued_lease_fences_every_old_epoch_call" classname="awman-cli::component" timestamp="2026-11-11T21:22:20.010+00:00" time="0.047"/>
-        <testcase name="worker::protocol::regression_8cf45de1_immediate_producer_preserves_initial_and_final_events" classname="awman-cli::component" timestamp="2026-11-11T21:22:20.046+00:00" time="0.048"/>
-        <testcase name="worker::protocol::terminal_relay_forwards_snapshot_then_output_and_stops_cleanly" classname="awman-cli::component" timestamp="2026-11-11T21:22:20.059+00:00" time="0.154"/>
-        <testcase name="worker::push::expiry_and_revoked_credentials_make_no_transport_request" classname="awman-cli::component" timestamp="2026-11-11T21:22:20.215+00:00" time="0.154"/>
-        <testcase name="worker::push::fencing_during_remote_request_kills_git_and_never_reports_success" classname="awman-cli::component" timestamp="2026-11-11T21:22:20.370+00:00" time="0.120"/>
-        <testcase name="worker::push::fencing_during_upload_kills_git_before_it_can_publish" classname="awman-cli::component" timestamp="2026-11-11T21:22:20.491+00:00" time="0.192"/>
-        <testcase name="worker::protocol::wsp_conformance_covers_auth_affinity_events_epoch_and_wire" classname="awman-cli::component" timestamp="2026-11-11T21:22:20.096+00:00" time="0.784"/>
-        <testcase name="worker::push::publish_is_idempotent_and_rejection_never_retries" classname="awman-cli::component" timestamp="2026-11-11T21:22:20.685+00:00" time="0.529"/>
-        <testcase name="worker::push::regression_3e8d7e6c_transport_retry_and_cancellation_are_bounded" classname="awman-cli::component" timestamp="2026-11-11T21:22:20.881+00:00" time="0.335"/>
-        <testcase name="worker::push::remote_http_auth_and_server_refusals_never_enter_transport_retry" classname="awman-cli::component" timestamp="2026-11-11T21:22:21.214+00:00" time="0.277"/>
-        <testcase name="worker::security::private_lease_body_is_never_in_clone_and_active_owner_cannot_be_reaped" classname="awman-cli::component" timestamp="2026-11-11T21:22:21.493+00:00" time="0.033"/>
-        <testcase name="worker::security::regression_e6a2d429_e6322996_f5b724fc_child_does_not_retain_lease_owner_lock" classname="awman-cli::component" timestamp="2026-11-11T21:22:21.527+00:00" time="0.112"/>
-        <testcase name="worker::security::sandbox_refuses_read_only_lease_and_never_advertises_it" classname="awman-cli::component" timestamp="2026-11-11T21:22:21.640+00:00" time="0.022"/>
-        <testcase name="worker::conformance_defects::probes_detect_ignored_preferences_epochs_and_duplicate_event_storage" classname="awman-cli::component" timestamp="2026-11-11T21:22:19.882+00:00" time="1.934"/>
-        <testcase name="worker::push::transient_http_push_failure_retries_same_commit_then_becomes_idempotent" classname="awman-cli::component" timestamp="2026-11-11T21:22:21.218+00:00" time="0.680"/>
-        <testcase name="worker::conformance_defects::wire_probe_detects_invalid_fields_on_every_protocol_response" classname="awman-cli::component" timestamp="2026-11-11T21:22:19.938+00:00" time="6.969"/>
+<testsuites name="nextest-run" tests="34" skipped="0" failures="0" errors="0" uuid="943c69c3-5739-46f0-8745-594b3d27dcf7" timestamp="2026-11-11T21:57:45.128+00:00" time="4.211">
+    <testsuite name="awman-cli::component" tests="34" skipped="0" errors="0" failures="0">
+        <testcase name="worker::client_transport::authenticated_requests_preserve_base_path_version_and_query" classname="awman-cli::component" timestamp="2026-11-11T21:57:45.131+00:00" time="0.049"/>
+        <testcase name="worker::client_transport::access_refresh_is_single_flight_and_revoked_or_twice_rejected_tokens_stop" classname="awman-cli::component" timestamp="2026-11-11T21:57:45.131+00:00" time="0.068"/>
+        <testcase name="worker::client_transport::link_denial_and_unsafe_identifiers_never_become_transport_requests" classname="awman-cli::component" timestamp="2026-11-11T21:57:45.182+00:00" time="0.040"/>
+        <testcase name="worker::conformance_defects::client_counts_empty_event_acknowledgements_and_duplicate_posts_are_idempotent" classname="awman-cli::component" timestamp="2026-11-11T21:57:45.201+00:00" time="0.052"/>
+        <testcase name="worker::checkout::checkout_refuses_tag_and_missing_merge_refs_after_owned_remote_lookup" classname="awman-cli::component" timestamp="2026-11-11T21:57:45.132+00:00" time="0.145"/>
+        <testcase name="worker::checkout::checkout_merges_declared_refs_and_resumes_the_published_branch" classname="awman-cli::component" timestamp="2026-11-11T21:57:45.131+00:00" time="0.179"/>
+        <testcase name="worker::conformance_defects::wire_claims" classname="awman-cli::component" timestamp="2026-11-11T21:57:45.260+00:00" time="0.631"/>
+        <testcase name="worker::conformance_defects::wire_credentials" classname="awman-cli::component" timestamp="2026-11-11T21:57:45.278+00:00" time="0.646"/>
+        <testcase name="worker::conformance_defects::wire_error" classname="awman-cli::component" timestamp="2026-11-11T21:57:45.312+00:00" time="0.657"/>
+        <testcase name="worker::conformance_defects::wire_link" classname="awman-cli::component" timestamp="2026-11-11T21:57:45.970+00:00" time="0.521"/>
+        <testcase name="worker::conformance_defects::wire_events" classname="awman-cli::component" timestamp="2026-11-11T21:57:45.892+00:00" time="0.618"/>
+        <testcase name="worker::conformance_defects::wire_heartbeat" classname="awman-cli::component" timestamp="2026-11-11T21:57:45.926+00:00" time="0.599"/>
+        <testcase name="worker::conformance_defects::wire_register" classname="awman-cli::component" timestamp="2026-11-11T21:57:46.511+00:00" time="0.659"/>
+        <testcase name="worker::conformance_defects::wire_queue" classname="awman-cli::component" timestamp="2026-11-11T21:57:46.496+00:00" time="0.695"/>
+        <testcase name="worker::conformance_defects::wire_release" classname="awman-cli::component" timestamp="2026-11-11T21:57:46.525+00:00" time="0.755"/>
+        <testcase name="worker::protocol::expired_access_refreshes_once_and_revoked_link_latches_session_cancellation" classname="awman-cli::component" timestamp="2026-11-11T21:57:47.281+00:00" time="0.042"/>
+        <testcase name="worker::protocol::regression_3e8d7e6c_cancelled_lease_wakes_run_without_waiting_for_tick" classname="awman-cli::component" timestamp="2026-11-11T21:57:47.324+00:00" time="0.046"/>
+        <testcase name="worker::protocol::regression_3e8d7e6c_reissued_lease_fences_every_old_epoch_call" classname="awman-cli::component" timestamp="2026-11-11T21:57:47.370+00:00" time="0.048"/>
+        <testcase name="worker::protocol::regression_8cf45de1_immediate_producer_preserves_initial_and_final_events" classname="awman-cli::component" timestamp="2026-11-11T21:57:47.420+00:00" time="0.053"/>
+        <testcase name="worker::protocol::terminal_relay_forwards_snapshot_then_output_and_stops_cleanly" classname="awman-cli::component" timestamp="2026-11-11T21:57:47.474+00:00" time="0.103"/>
+        <testcase name="worker::conformance_defects::wire_token" classname="awman-cli::component" timestamp="2026-11-11T21:57:47.193+00:00" time="0.517"/>
+        <testcase name="worker::conformance_defects::wire_result" classname="awman-cli::component" timestamp="2026-11-11T21:57:47.172+00:00" time="0.646"/>
+        <testcase name="worker::push::expiry_and_revoked_credentials_make_no_transport_request" classname="awman-cli::component" timestamp="2026-11-11T21:57:47.712+00:00" time="0.133"/>
+        <testcase name="worker::push::fencing_during_remote_request_kills_git_and_never_reports_success" classname="awman-cli::component" timestamp="2026-11-11T21:57:47.819+00:00" time="0.134"/>
+        <testcase name="worker::push::fencing_during_upload_kills_git_before_it_can_publish" classname="awman-cli::component" timestamp="2026-11-11T21:57:47.846+00:00" time="0.214"/>
+        <testcase name="worker::push::regression_3e8d7e6c_transport_retry_and_cancellation_are_bounded" classname="awman-cli::component" timestamp="2026-11-11T21:57:48.062+00:00" time="0.238"/>
+        <testcase name="worker::push::publish_is_idempotent_and_rejection_never_retries" classname="awman-cli::component" timestamp="2026-11-11T21:57:47.954+00:00" time="0.370"/>
+        <testcase name="worker::conformance_defects::probes_detect_ignored_preferences_epochs_and_duplicate_event_storage" classname="awman-cli::component" timestamp="2026-11-11T21:57:45.223+00:00" time="3.105"/>
+        <testcase name="worker::protocol::wsp_conformance_covers_auth_affinity_events_epoch_and_wire" classname="awman-cli::component" timestamp="2026-11-11T21:57:47.578+00:00" time="0.765"/>
+        <testcase name="worker::security::private_lease_body_is_never_in_clone_and_active_owner_cannot_be_reaped" classname="awman-cli::component" timestamp="2026-11-11T21:57:48.330+00:00" time="0.031"/>
+        <testcase name="worker::security::sandbox_refuses_read_only_lease_and_never_advertises_it" classname="awman-cli::component" timestamp="2026-11-11T21:57:48.363+00:00" time="0.022"/>
+        <testcase name="worker::security::regression_e6a2d429_e6322996_f5b724fc_child_does_not_retain_lease_owner_lock" classname="awman-cli::component" timestamp="2026-11-11T21:57:48.344+00:00" time="0.058"/>
+        <testcase name="worker::push::remote_http_auth_and_server_refusals_never_enter_transport_retry" classname="awman-cli::component" timestamp="2026-11-11T21:57:48.300+00:00" time="0.291"/>
+        <testcase name="worker::push::transient_http_push_failure_retries_same_commit_then_becomes_idempotent" classname="awman-cli::component" timestamp="2026-11-11T21:57:48.326+00:00" time="1.013"/>
     </testsuite>
 </testsuites>

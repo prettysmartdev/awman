@@ -1,24 +1,24 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<testsuites name="nextest-run" tests="19" skipped="0" failures="0" errors="0" uuid="421c346c-dea9-4ecf-b147-2f6d0f060803" timestamp="2026-11-11T21:21:16.616+00:00" time="1.969">
+<testsuites name="nextest-run" tests="19" skipped="0" failures="0" errors="0" uuid="dc609386-b740-4893-bd41-20766fa463b2" timestamp="2026-11-11T21:57:35.300+00:00" time="1.925">
     <testsuite name="awman-cli::component" tests="19" skipped="0" errors="0" failures="0">
-        <testcase name="command::admission::reservations_are_scoped_and_only_the_owner_can_release_them" classname="awman-cli::component" timestamp="2026-11-11T21:21:16.619+00:00" time="0.746"/>
-        <testcase name="command::admission::idempotency_key_boundaries_and_server_failure_release_are_explicit" classname="awman-cli::component" timestamp="2026-11-11T21:21:16.619+00:00" time="0.746"/>
-        <testcase name="command::admission::setup_and_closed_sessions_refuse_command_admission" classname="awman-cli::component" timestamp="2026-11-11T21:21:16.619+00:00" time="0.770"/>
-        <testcase name="command::catalogue::authorization_is_checked_for_every_leaf_and_alias" classname="awman-cli::component" timestamp="2026-11-11T21:21:17.390+00:00" time="0.016"/>
-        <testcase name="command::catalogue::each_command_rejects_unknown_flags_before_execution" classname="awman-cli::component" timestamp="2026-11-11T21:21:17.408+00:00" time="0.016"/>
-        <testcase name="command::admission::accepted_session_replays_after_dropped_response_without_duplication" classname="awman-cli::component" timestamp="2026-11-11T21:21:16.619+00:00" time="0.811"/>
-        <testcase name="command::catalogue::every_catalogue_leaf_has_a_reviewed_command_contract" classname="awman-cli::component" timestamp="2026-11-11T21:21:17.425+00:00" time="0.018"/>
-        <testcase name="command::catalogue::generated_reference_covers_public_paths_and_hides_internal_commands" classname="awman-cli::component" timestamp="2026-11-11T21:21:17.432+00:00" time="0.017"/>
-        <testcase name="command::catalogue::lookup_resolves_every_leaf_and_refuses_unknown_paths" classname="awman-cli::component" timestamp="2026-11-11T21:21:17.445+00:00" time="0.019"/>
-        <testcase name="command::config::every_config_key_has_a_command_row_or_a_declared_map_container" classname="awman-cli::component" timestamp="2026-11-11T21:21:17.451+00:00" time="0.019"/>
-        <testcase name="command::failures::execution_outcomes_preserve_nonzero_and_absent_agent_exit_codes" classname="awman-cli::component" timestamp="2026-11-11T21:21:17.465+00:00" time="0.019"/>
-        <testcase name="command::failures::failures_keep_their_exit_http_and_machine_code_classification" classname="awman-cli::component" timestamp="2026-11-11T21:21:17.473+00:00" time="0.017"/>
-        <testcase name="command::scaffolding::global_scaffolds_and_empty_pull_all_use_only_the_session_home" classname="awman-cli::component" timestamp="2026-11-11T21:21:17.485+00:00" time="0.026"/>
-        <testcase name="command::admission::validation_and_authorization_leave_no_durable_work" classname="awman-cli::component" timestamp="2026-11-11T21:21:17.366+00:00" time="0.642"/>
-        <testcase name="command::workflow::concurrent_workflow_events_have_one_order_and_done_fences_late_output" classname="awman-cli::component" timestamp="2026-11-11T21:21:18.013+00:00" time="0.047"/>
-        <testcase name="command::workflow::concurrent_idempotent_submissions_have_exactly_one_owner" classname="awman-cli::component" timestamp="2026-11-11T21:21:17.513+00:00" time="0.742"/>
-        <testcase name="command::admission::write_failure_compensates_before_a_key_can_be_retried" classname="awman-cli::component" timestamp="2026-11-11T21:21:17.366+00:00" time="0.895"/>
-        <testcase name="command::workflow::cancellation_is_idempotent_and_never_fires_another_commands_token" classname="awman-cli::component" timestamp="2026-11-11T21:21:17.492+00:00" time="0.812"/>
-        <testcase name="command::workflow::crash_completion_is_finalized_before_cancellation_can_overwrite_it" classname="awman-cli::component" timestamp="2026-11-11T21:21:18.062+00:00" time="0.523"/>
+        <testcase name="command::admission::reservations_are_scoped_and_only_the_owner_can_release_them" classname="awman-cli::component" timestamp="2026-11-11T21:57:35.303+00:00" time="0.700"/>
+        <testcase name="command::admission::idempotency_key_boundaries_and_server_failure_release_are_explicit" classname="awman-cli::component" timestamp="2026-11-11T21:57:35.303+00:00" time="0.709"/>
+        <testcase name="command::admission::setup_and_closed_sessions_refuse_command_admission" classname="awman-cli::component" timestamp="2026-11-11T21:57:35.303+00:00" time="0.717"/>
+        <testcase name="command::catalogue::authorization_is_checked_for_every_leaf_and_alias" classname="awman-cli::component" timestamp="2026-11-11T21:57:36.022+00:00" time="0.019"/>
+        <testcase name="command::admission::accepted_session_replays_after_dropped_response_without_duplication" classname="awman-cli::component" timestamp="2026-11-11T21:57:35.303+00:00" time="0.742"/>
+        <testcase name="command::catalogue::every_catalogue_leaf_has_a_reviewed_command_contract" classname="awman-cli::component" timestamp="2026-11-11T21:57:36.047+00:00" time="0.016"/>
+        <testcase name="command::catalogue::each_command_rejects_unknown_flags_before_execution" classname="awman-cli::component" timestamp="2026-11-11T21:57:36.043+00:00" time="0.021"/>
+        <testcase name="command::catalogue::generated_reference_covers_public_paths_and_hides_internal_commands" classname="awman-cli::component" timestamp="2026-11-11T21:57:36.064+00:00" time="0.020"/>
+        <testcase name="command::catalogue::lookup_resolves_every_leaf_and_refuses_unknown_paths" classname="awman-cli::component" timestamp="2026-11-11T21:57:36.064+00:00" time="0.020"/>
+        <testcase name="command::failures::execution_outcomes_preserve_nonzero_and_absent_agent_exit_codes" classname="awman-cli::component" timestamp="2026-11-11T21:57:36.085+00:00" time="0.021"/>
+        <testcase name="command::config::every_config_key_has_a_command_row_or_a_declared_map_container" classname="awman-cli::component" timestamp="2026-11-11T21:57:36.085+00:00" time="0.022"/>
+        <testcase name="command::failures::failures_keep_their_exit_http_and_machine_code_classification" classname="awman-cli::component" timestamp="2026-11-11T21:57:36.108+00:00" time="0.018"/>
+        <testcase name="command::scaffolding::global_scaffolds_and_empty_pull_all_use_only_the_session_home" classname="awman-cli::component" timestamp="2026-11-11T21:57:36.108+00:00" time="0.028"/>
+        <testcase name="command::admission::validation_and_authorization_leave_no_durable_work" classname="awman-cli::component" timestamp="2026-11-11T21:57:36.004+00:00" time="0.686"/>
+        <testcase name="command::workflow::concurrent_workflow_events_have_one_order_and_done_fences_late_output" classname="awman-cli::component" timestamp="2026-11-11T21:57:36.694+00:00" time="0.045"/>
+        <testcase name="command::workflow::concurrent_idempotent_submissions_have_exactly_one_owner" classname="awman-cli::component" timestamp="2026-11-11T21:57:36.137+00:00" time="0.718"/>
+        <testcase name="command::workflow::cancellation_is_idempotent_and_never_fires_another_commands_token" classname="awman-cli::component" timestamp="2026-11-11T21:57:36.127+00:00" time="0.796"/>
+        <testcase name="command::admission::write_failure_compensates_before_a_key_can_be_retried" classname="awman-cli::component" timestamp="2026-11-11T21:57:36.014+00:00" time="0.917"/>
+        <testcase name="command::workflow::crash_completion_is_finalized_before_cancellation_can_overwrite_it" classname="awman-cli::component" timestamp="2026-11-11T21:57:36.741+00:00" time="0.483"/>
     </testsuite>
 </testsuites>

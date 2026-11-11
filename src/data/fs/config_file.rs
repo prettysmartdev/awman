@@ -185,9 +185,31 @@ pub fn write_config_file_atomically(path: &Path, content: &str) -> Result<(), Da
         .as_file()
         .sync_all()
         .map_err(|e| DataError::io(path, e))?;
+    #[cfg(not(windows))]
     temporary
         .persist(path)
         .map_err(|e| DataError::io(path, e.error))?;
+    #[cfg(windows)]
+    {
+        // MoveFileEx may transiently refuse replacement while another reader
+        // closes the old file. Retain the complete sibling and retry only the
+        // atomic rename, never truncate the visible checkpoint.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        loop {
+            match temporary.persist(path) {
+                Ok(_) => break,
+                Err(error) => {
+                    if !matches!(error.error.raw_os_error(), Some(5 | 32 | 33))
+                        || std::time::Instant::now() >= deadline
+                    {
+                        return Err(DataError::io(path, error.error));
+                    }
+                    temporary = error.file;
+                    std::thread::park_timeout(std::time::Duration::from_millis(1));
+                }
+            }
+        }
+    }
     // Make the rename itself durable.
     #[cfg(unix)]
     if let Ok(directory) = std::fs::File::open(parent) {

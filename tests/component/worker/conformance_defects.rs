@@ -108,28 +108,33 @@ async fn probes_detect_ignored_preferences_epochs_and_duplicate_event_storage() 
     sandbox.finish();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn wire_probe_detects_invalid_fields_on_every_protocol_response() {
+async fn wire_probe_detects_invalid_fields(endpoint: &'static str) {
     let sandbox = support::sandbox(
         "worker::conformance_defects::wire_probe_detects_invalid_fields_on_every_protocol_response",
     );
-    for endpoint in [
-        "link",
-        "token",
-        "register",
-        "queue",
-        "claims",
-        "heartbeat",
-        "events",
-        "credentials",
-        "result",
-        "release",
-        "error",
-    ] {
-        assert!(
-            rejects(&sandbox, "wire_conventions", MockFault::Wire(endpoint)).await,
-            "undetected field corruption: {endpoint}"
-        );
-    }
+    assert!(
+        rejects(&sandbox, "wire_conventions", MockFault::Wire(endpoint)).await,
+        "undetected field corruption: {endpoint}"
+    );
     sandbox.finish();
 }
+
+macro_rules! wire_case {
+    ($name:ident, $endpoint:literal) => {
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn $name() {
+            wire_probe_detects_invalid_fields($endpoint).await;
+        }
+    };
+}
+wire_case!(wire_link, "link");
+wire_case!(wire_token, "token");
+wire_case!(wire_register, "register");
+wire_case!(wire_queue, "queue");
+wire_case!(wire_claims, "claims");
+wire_case!(wire_heartbeat, "heartbeat");
+wire_case!(wire_events, "events");
+wire_case!(wire_credentials, "credentials");
+wire_case!(wire_result, "result");
+wire_case!(wire_release, "release");
+wire_case!(wire_error, "error");

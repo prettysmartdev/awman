@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<testsuites name="nextest-run" tests="1" skipped="0" failures="0" errors="0" uuid="3e2e2ed7-1ffe-4425-8f1d-9c71647c42a8" timestamp="2026-11-11T21:21:26.517+00:00" time="0.108">
+<testsuites name="nextest-run" tests="1" skipped="0" failures="0" errors="0" uuid="9b446e2f-ac79-4438-b118-4b5e3258a3f0" timestamp="2026-11-11T21:57:41.503+00:00" time="0.061">
     <testsuite name="awman-cli::component" tests="1" skipped="0" errors="0" failures="0">
-        <testcase name="frontend::probe::help_and_version_are_successful_without_runtime_or_daemon_startup" classname="awman-cli::component" timestamp="2026-11-11T21:21:26.520+00:00" time="0.104"/>
+        <testcase name="frontend::probe::help_and_version_are_successful_without_runtime_or_daemon_startup" classname="awman-cli::component" timestamp="2026-11-11T21:57:41.506+00:00" time="0.057"/>
     </testsuite>
 </testsuites>

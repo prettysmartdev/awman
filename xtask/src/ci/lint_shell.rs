@@ -189,7 +189,7 @@ mod tests {
         let found: Vec<_> = scripts(d.path())
             .unwrap()
             .into_iter()
-            .map(|(p, k)| (p.to_string_lossy().into_owned(), k))
+            .map(|(p, k)| (p.to_string_lossy().replace('\\', "/"), k))
             .collect();
         assert_eq!(
             found,

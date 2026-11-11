@@ -41,7 +41,13 @@ fn git_runs_with_the_sandbox_identity_and_config() {
         repo.git(&["log", "-1", "--format=%an <%ae> %at"]),
         "awman test <test@awman.invalid> 1767225600"
     );
-    let origin = repo.git(&["config", "--show-origin", "--get", "core.hooksPath"]);
+    let origin = repo.git(&[
+        "config",
+        "--null",
+        "--show-origin",
+        "--get",
+        "core.hooksPath",
+    ]);
     assert!(
         origin.contains(
             &sandbox

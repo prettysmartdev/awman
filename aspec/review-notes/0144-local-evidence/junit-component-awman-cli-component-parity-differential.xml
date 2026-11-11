@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<testsuites name="nextest-run" tests="1" skipped="0" failures="0" errors="0" uuid="fbc3a210-1838-4951-b9a5-4a46e6bf6fc8" timestamp="2026-11-11T21:20:50.925+00:00" time="0.864">
+<testsuites name="nextest-run" tests="1" skipped="0" failures="0" errors="0" uuid="73ca7bf3-85b7-4841-952a-99f0aa0a3e40" timestamp="2026-11-11T21:58:28.330+00:00" time="0.866">
     <testsuite name="awman-cli::component" tests="1" skipped="0" errors="0" failures="0">
-        <testcase name="parity::differential::config_results_agree_across_backends" classname="awman-cli::component" timestamp="2026-11-11T21:20:50.928+00:00" time="0.856"/>
+        <testcase name="parity::differential::config_results_agree_across_backends" classname="awman-cli::component" timestamp="2026-11-11T21:58:28.333+00:00" time="0.857"/>
     </testsuite>
 </testsuites>

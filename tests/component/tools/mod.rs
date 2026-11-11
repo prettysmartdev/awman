@@ -2,9 +2,18 @@
 mod architecture;
 use crate::support;
 fn root() -> std::path::PathBuf {
-    std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."))
+    let root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."))
         .canonicalize()
-        .unwrap()
+        .unwrap();
+    if cfg!(windows) {
+        // Git Bash accepts drive paths, not Rust's verbatim \\?\ spelling.
+        root.to_string_lossy()
+            .trim_start_matches("\\\\?\\")
+            .replace('\\', "/")
+            .into()
+    } else {
+        root
+    }
 }
 fn setup(
     s: &awman_test_support::TestSandbox,
@@ -34,7 +43,7 @@ fn signature_verification_preserves_exact_candidate_bytes() {
     let s = support::sandbox("tools::signature_verification_preserves_exact_candidate_bytes");
     let (codesign, _plutil, binary) = setup(&s);
     let out = s
-        .command("/bin/bash")
+        .command("bash")
         .arg(root().join("tools/macos-sign.sh"))
         .arg("--verify")
         .arg(&binary)
@@ -64,7 +73,7 @@ fn entitlements_mismatch_fails_verification() {
         ])
         .stdout("{\"com.apple.security.hypervisor\":true}\n");
     let out = s
-        .command("/bin/bash")
+        .command("bash")
         .arg(root().join("tools/macos-sign.sh"))
         .arg("--verify")
         .arg(&binary)

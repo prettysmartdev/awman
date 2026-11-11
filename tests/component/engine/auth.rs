@@ -10,7 +10,7 @@ use std::time::Duration;
 
 /// Remediation of review-security F4 / review-adversarial F8: the cap covers
 /// the stdin write. A child that never drains stdin must time out, not block.
-#[cfg_attr(not(unix), ignore = "not-applicable: needs a POSIX shell")]
+#[cfg(unix)]
 #[test]
 fn run_capped_times_out_on_a_child_that_never_reads_its_stdin() {
     let sandbox = support::sandbox(
@@ -32,7 +32,7 @@ fn run_capped_times_out_on_a_child_that_never_reads_its_stdin() {
 
 /// The cap covers the child's output too: output larger than a pipe buffer
 /// is drained while the child runs, so the call succeeds well within its cap.
-#[cfg_attr(not(unix), ignore = "not-applicable: needs a POSIX shell")]
+#[cfg(unix)]
 #[test]
 fn run_capped_reads_back_a_payload_larger_than_a_pipe_buffer() {
     let sandbox =
@@ -49,7 +49,7 @@ fn run_capped_reads_back_a_payload_larger_than_a_pipe_buffer() {
 }
 
 /// A draining child receives a payload larger than a pipe buffer intact.
-#[cfg_attr(not(unix), ignore = "not-applicable: needs a POSIX shell")]
+#[cfg(unix)]
 #[test]
 fn run_capped_feeds_a_draining_child_a_payload_larger_than_a_pipe_buffer() {
     let sandbox = support::sandbox(

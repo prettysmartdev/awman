@@ -113,7 +113,6 @@ async fn repair_exhaustion_records_failure_and_backoff_advances_only_with_clock(
         Some(clock.now_utc() + chrono::Duration::seconds(240))
     );
     assert_eq!(scheduler.status_handle().lock().unwrap().in_flight, 0);
-    sandbox.finish();
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn malformed_config_admits_nothing_then_recovers_without_restart() {
@@ -162,7 +161,6 @@ async fn malformed_config_admits_nothing_then_recovers_without_restart() {
         store.runs_for("recover", 10).unwrap()[0].status,
         RunStatus::NotTriggered
     );
-    sandbox.finish();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -263,5 +261,4 @@ async fn concurrent_ticks_share_capacity_and_cancelled_evaluations_leave_no_runn
     assert_eq!(status.in_flight, 0);
     assert!(status.cancellations.is_empty());
     drop(status);
-    sandbox.finish();
 }

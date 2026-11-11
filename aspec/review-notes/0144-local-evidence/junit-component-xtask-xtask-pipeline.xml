@@ -1,31 +1,31 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<testsuites name="nextest-run" tests="26" skipped="0" failures="0" errors="0" uuid="3e49b354-fdac-4b37-b1cb-a7f5664eb88b" timestamp="2026-11-11T21:21:05.059+00:00" time="1.333">
+<testsuites name="nextest-run" tests="26" skipped="0" failures="0" errors="0" uuid="806b491e-5833-4bb8-9b55-d367b5d2467e" timestamp="2026-11-11T21:57:39.049+00:00" time="1.182">
     <testsuite name="xtask::pipeline" tests="26" skipped="0" errors="0" failures="0">
-        <testcase name="commit_no_longer_an_ancestor_of_main_voids_the_candidate" classname="xtask::pipeline" timestamp="2026-11-11T21:21:05.061+00:00" time="0.222"/>
-        <testcase name="candidate_validates_promotes_and_verifies_the_same_bytes" classname="xtask::pipeline" timestamp="2026-11-11T21:21:05.061+00:00" time="0.300"/>
-        <testcase name="abandon_keeps_evidence_and_refuses_promoted_versions" classname="xtask::pipeline" timestamp="2026-11-11T21:21:05.061+00:00" time="0.354"/>
-        <testcase name="concurrent_candidates_for_one_version_end_blocked_with_nothing_published" classname="xtask::pipeline" timestamp="2026-11-11T21:21:05.284+00:00" time="0.184"/>
-        <testcase name="expired_evidence_is_refused" classname="xtask::pipeline" timestamp="2026-11-11T21:21:05.362+00:00" time="0.144"/>
-        <testcase name="failed_commands_missing_shards_skipped_counts_and_empty_assertions_cannot_validate" classname="xtask::pipeline" timestamp="2026-11-11T21:21:05.415+00:00" time="0.116"/>
-        <testcase name="failed_suite_reruns_against_the_same_artifacts_only" classname="xtask::pipeline" timestamp="2026-11-11T21:21:05.469+00:00" time="0.207"/>
-        <testcase name="fetched_artifact_is_absolute_and_executable_from_another_directory" classname="xtask::pipeline" timestamp="2026-11-11T21:21:05.507+00:00" time="0.191"/>
-        <testcase name="changed_inputs_never_reuse_stale_evidence" classname="xtask::pipeline" timestamp="2026-11-11T21:21:05.061+00:00" time="0.651"/>
-        <testcase name="forged_or_stale_evidence_cannot_validate" classname="xtask::pipeline" timestamp="2026-11-11T21:21:05.532+00:00" time="0.216"/>
-        <testcase name="live_main_policy_wins_over_a_stale_checkout_before_tag_and_publish" classname="xtask::pipeline" timestamp="2026-11-11T21:21:05.700+00:00" time="0.161"/>
-        <testcase name="operator_journal_dispatch_records_and_allocates_nothing" classname="xtask::pipeline" timestamp="2026-11-11T21:21:05.863+00:00" time="0.029"/>
-        <testcase name="interrupted_promotion_resumes_between_tag_and_publish" classname="xtask::pipeline" timestamp="2026-11-11T21:21:05.677+00:00" time="0.229"/>
-        <testcase name="mutable_draft_cannot_forge_or_replay_validation" classname="xtask::pipeline" timestamp="2026-11-11T21:21:05.713+00:00" time="0.194"/>
-        <testcase name="override_on_a_not_overridable_cell_is_refused" classname="xtask::pipeline" timestamp="2026-11-11T21:21:05.893+00:00" time="0.036"/>
-        <testcase name="pending_pins_block_preflight_before_any_build" classname="xtask::pipeline" timestamp="2026-11-11T21:21:05.907+00:00" time="0.038"/>
-        <testcase name="mutable_journal_cannot_extend_authorization_or_invent_gate_runs" classname="xtask::pipeline" timestamp="2026-11-11T21:21:05.750+00:00" time="0.252"/>
-        <testcase name="partial_asset_upload_resumes_without_duplicates" classname="xtask::pipeline" timestamp="2026-11-11T21:21:05.907+00:00" time="0.099"/>
-        <testcase name="preflight_refuses_bad_version_notes_and_triggers" classname="xtask::pipeline" timestamp="2026-11-11T21:21:05.930+00:00" time="0.086"/>
-        <testcase name="promotion_with_a_missing_gate_is_refused" classname="xtask::pipeline" timestamp="2026-11-11T21:21:05.947+00:00" time="0.173"/>
-        <testcase name="runner_lost_mid_validation_is_blocked" classname="xtask::pipeline" timestamp="2026-11-11T21:21:06.011+00:00" time="0.186"/>
-        <testcase name="same_identity_resumes_without_rebuilding" classname="xtask::pipeline" timestamp="2026-11-11T21:21:06.018+00:00" time="0.179"/>
-        <testcase name="status_is_read_only" classname="xtask::pipeline" timestamp="2026-11-11T21:21:06.130+00:00" time="0.149"/>
-        <testcase name="test_jobs_get_exact_bytes_from_run_artifacts_and_refuse_anything_else" classname="xtask::pipeline" timestamp="2026-11-11T21:21:06.199+00:00" time="0.091"/>
-        <testcase name="tag_on_a_different_commit_fails_and_publishes_nothing" classname="xtask::pipeline" timestamp="2026-11-11T21:21:06.199+00:00" time="0.192"/>
-        <testcase name="rehearsal_never_touches_production_and_cleans_up_its_own_draft" classname="xtask::pipeline" timestamp="2026-11-11T21:21:06.004+00:00" time="0.388"/>
+        <testcase name="commit_no_longer_an_ancestor_of_main_voids_the_candidate" classname="xtask::pipeline" timestamp="2026-11-11T21:57:39.050+00:00" time="0.183"/>
+        <testcase name="candidate_validates_promotes_and_verifies_the_same_bytes" classname="xtask::pipeline" timestamp="2026-11-11T21:57:39.050+00:00" time="0.241"/>
+        <testcase name="abandon_keeps_evidence_and_refuses_promoted_versions" classname="xtask::pipeline" timestamp="2026-11-11T21:57:39.050+00:00" time="0.312"/>
+        <testcase name="concurrent_candidates_for_one_version_end_blocked_with_nothing_published" classname="xtask::pipeline" timestamp="2026-11-11T21:57:39.234+00:00" time="0.193"/>
+        <testcase name="expired_evidence_is_refused" classname="xtask::pipeline" timestamp="2026-11-11T21:57:39.293+00:00" time="0.136"/>
+        <testcase name="failed_commands_missing_shards_skipped_counts_and_empty_assertions_cannot_validate" classname="xtask::pipeline" timestamp="2026-11-11T21:57:39.363+00:00" time="0.141"/>
+        <testcase name="fetched_artifact_is_absolute_and_executable_from_another_directory" classname="xtask::pipeline" timestamp="2026-11-11T21:57:39.429+00:00" time="0.131"/>
+        <testcase name="failed_suite_reruns_against_the_same_artifacts_only" classname="xtask::pipeline" timestamp="2026-11-11T21:57:39.428+00:00" time="0.175"/>
+        <testcase name="changed_inputs_never_reuse_stale_evidence" classname="xtask::pipeline" timestamp="2026-11-11T21:57:39.050+00:00" time="0.553"/>
+        <testcase name="forged_or_stale_evidence_cannot_validate" classname="xtask::pipeline" timestamp="2026-11-11T21:57:39.510+00:00" time="0.172"/>
+        <testcase name="live_main_policy_wins_over_a_stale_checkout_before_tag_and_publish" classname="xtask::pipeline" timestamp="2026-11-11T21:57:39.604+00:00" time="0.154"/>
+        <testcase name="operator_journal_dispatch_records_and_allocates_nothing" classname="xtask::pipeline" timestamp="2026-11-11T21:57:39.759+00:00" time="0.028"/>
+        <testcase name="interrupted_promotion_resumes_between_tag_and_publish" classname="xtask::pipeline" timestamp="2026-11-11T21:57:39.561+00:00" time="0.236"/>
+        <testcase name="mutable_draft_cannot_forge_or_replay_validation" classname="xtask::pipeline" timestamp="2026-11-11T21:57:39.604+00:00" time="0.199"/>
+        <testcase name="override_on_a_not_overridable_cell_is_refused" classname="xtask::pipeline" timestamp="2026-11-11T21:57:39.788+00:00" time="0.033"/>
+        <testcase name="pending_pins_block_preflight_before_any_build" classname="xtask::pipeline" timestamp="2026-11-11T21:57:39.805+00:00" time="0.031"/>
+        <testcase name="preflight_refuses_bad_version_notes_and_triggers" classname="xtask::pipeline" timestamp="2026-11-11T21:57:39.822+00:00" time="0.077"/>
+        <testcase name="partial_asset_upload_resumes_without_duplicates" classname="xtask::pipeline" timestamp="2026-11-11T21:57:39.798+00:00" time="0.105"/>
+        <testcase name="mutable_journal_cannot_extend_authorization_or_invent_gate_runs" classname="xtask::pipeline" timestamp="2026-11-11T21:57:39.684+00:00" time="0.269"/>
+        <testcase name="promotion_with_a_missing_gate_is_refused" classname="xtask::pipeline" timestamp="2026-11-11T21:57:39.837+00:00" time="0.173"/>
+        <testcase name="runner_lost_mid_validation_is_blocked" classname="xtask::pipeline" timestamp="2026-11-11T21:57:39.904+00:00" time="0.152"/>
+        <testcase name="same_identity_resumes_without_rebuilding" classname="xtask::pipeline" timestamp="2026-11-11T21:57:39.954+00:00" time="0.152"/>
+        <testcase name="status_is_read_only" classname="xtask::pipeline" timestamp="2026-11-11T21:57:40.011+00:00" time="0.135"/>
+        <testcase name="rehearsal_never_touches_production_and_cleans_up_its_own_draft" classname="xtask::pipeline" timestamp="2026-11-11T21:57:39.900+00:00" time="0.308"/>
+        <testcase name="test_jobs_get_exact_bytes_from_run_artifacts_and_refuse_anything_else" classname="xtask::pipeline" timestamp="2026-11-11T21:57:40.106+00:00" time="0.123"/>
+        <testcase name="tag_on_a_different_commit_fails_and_publishes_nothing" classname="xtask::pipeline" timestamp="2026-11-11T21:57:40.057+00:00" time="0.173"/>
     </testsuite>
 </testsuites>

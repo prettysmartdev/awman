@@ -213,7 +213,7 @@ fn leader_exit_with_running_descendants_is_a_leak() {
 }
 
 /// Guards: e6a2d429, e6322996, f5b724fc fork-inherited private-file and build locks.
-#[cfg_attr(not(unix), ignore = "not-applicable: descriptor listing uses /dev/fd")]
+#[cfg(unix)]
 #[test]
 fn children_inherit_only_stdio() {
     let sandbox = sandbox("process::children_inherit_only_stdio");
