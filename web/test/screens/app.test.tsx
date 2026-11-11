@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, expect, it, vi } from 'vitest';
 import { useSyncExternalStore } from 'react';
-import { act, cleanup, fireEvent, render, screen } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { Subject } from '@/lib/client/observable';
 import type { ConnectController, ConnectState } from '@/lib/connect/controller';
 import type { FrontendConnection } from '@/lib/client/frontendSocket';
@@ -28,5 +28,5 @@ it('revocation returns to connect with a notice and closes the active workspace 
   act(() => captured.revoked?.());
   expect(screen.getByText('Browser access revoked. Connect browser again to continue.')).toBeTruthy();
   expect(screen.getByRole('button', { name: 'Connect browser' })).toBeTruthy();
-  expect(h.connection.close).toHaveBeenCalledWith('navigation');
+  await waitFor(() => expect(h.connection.close).toHaveBeenCalledWith('navigation'));
 });

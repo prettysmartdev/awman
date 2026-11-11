@@ -1,11 +1,21 @@
 // @vitest-environment jsdom
 import { afterEach, expect, it, vi } from 'vitest';
+import { StrictMode } from 'react';
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 vi.mock('@/components/TerminalPanel', () => ({ TerminalPanel: () => <div data-key-context="terminal" tabIndex={0}>Contract terminal</div> }));
 import { Workspace } from '@/components/Workspace';
 import { harness, request } from './helpers';
 afterEach(() => { cleanup(); sessionStorage.clear(); });
 function show() { const h = harness(); h.s.tabs = [h.s.tabs[0]!]; h.s.tabs[0]!.workflow = null; h.store.applySnapshot(h.s); const reconnect = vi.fn(); render(<Workspace client={h.client} connection={h.connection} launchContext="lc_default" squadAvailable={true} reconnect={reconnect} />); return { ...h, reconnect }; }
+it('keeps the opening socket through Strict Mode effect replay and closes on unmount', async () => {
+  const h = harness();
+  const result = render(<StrictMode><Workspace client={h.client} connection={h.connection} launchContext="lc_default" squadAvailable={true} reconnect={vi.fn()} /></StrictMode>);
+  await act(async () => { await Promise.resolve(); });
+  expect(h.connection.close).not.toHaveBeenCalled();
+  result.unmount();
+  await act(async () => { await Promise.resolve(); });
+  expect(h.connection.close).toHaveBeenCalledExactlyOnceWith('navigation');
+});
 it('renders snapshot status and opens panels through visible controls', async () => { const h = show(); expect(screen.getByText(`CWD: ${h.s.tabs[0]!.session.cwd}`)).toBeTruthy(); fireEvent.click(screen.getAllByRole('button', { name: 'Git' })[0]!); expect(screen.getByRole('heading', { name: /Git/ })).toBeTruthy(); fireEvent.click(screen.getAllByRole('button', { name: 'Overview' })[0]!); expect(h.uiRequest).toHaveBeenCalledWith({ request: 'open_overview', tab_id: h.s.tabs[0]!.tab_id }); expect(h.uiRequest).toHaveBeenCalledWith({ request: 'focus_workflow_window', tab_id: h.s.tabs[0]!.tab_id }); fireEvent.click(screen.getAllByRole('button', { name: 'Config' })[0]!); await waitFor(() => expect(h.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'submit', input: { source: 'argv', args: ['config', 'show'] } }))); });
 it('new tab keeps errors visible and sends engine-owned startup frames', async () => { const h = show(); fireEvent.click(screen.getByRole('button', { name: 'New tab' })); await screen.findByRole('option', { name: /Project/ }); fireEvent.change(screen.getByLabelText('Path'), { target: { value: '/repo/sub' } }); fireEvent.click(screen.getByRole('button', { name: 'Open' })); expect(h.send).toHaveBeenCalledWith({ type: 'open_tab', dir: '/repo/sub', options: { kind: 'normal', annotations: {}, startup: 'ready' } }); act(() => h.emit({ type: 'notice', level: 'error', text: 'dir_outside_context' })); expect(screen.getAllByText('dir_outside_context').length).toBeGreaterThan(0); fireEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Dismiss' })); expect(screen.queryByRole('dialog')).toBeNull(); });
 it('preserves browser Ctrl+T and supports the map alternate Alt+T', async () => { show(); fireEvent.keyDown(document, { key: 't', ctrlKey: true }); expect(screen.queryByRole('dialog')).toBeNull(); fireEvent.keyDown(document, { key: 't', altKey: true }); expect(screen.getByRole('dialog')).toBeTruthy(); fireEvent.keyDown(document, { key: 'Escape' }); await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull()); });

@@ -108,7 +108,21 @@ export function Workspace({ client, connection, launchContext, squadAvailable, q
   }, [connection, queueAvailable, queue, state, queueTabId]);
   function openQueue() { setQueueBadge({ newItems: 0, forYou: 0 }); setQueue(true); }
   const dismissNewTab = useCallback(() => setNewTab(false), []);
-  useEffect(() => () => connection.close('navigation'), [connection]);
+  const connectionMount = useRef(0);
+  const mountedConnection = useRef(connection);
+  useEffect(() => {
+    const mount = ++connectionMount.current;
+    mountedConnection.current = connection;
+    return () => {
+      // Strict Mode replays effect cleanup during the initial mount. Defer the
+      // close so its next setup can keep the socket that is still connecting.
+      queueMicrotask(() => {
+        // The live ref is intentional: the next setup cancels this cleanup.
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+        if (connectionMount.current === mount || mountedConnection.current !== connection) connection.close('navigation');
+      });
+    };
+  }, [connection]);
   useEffect(() => {
     if (connection.id && view.snapshot && role === 'primary') writeResume({ instanceId: view.snapshot.instance_id, frontendId: connection.id, tabId: tab?.tab_id ?? null, launchContext });
   }, [connection, role, view.snapshot, tab?.tab_id, launchContext]);
